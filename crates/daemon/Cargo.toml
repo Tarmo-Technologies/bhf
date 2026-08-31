@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "bhf-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[package.metadata.dist]
+dist = true
+targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+include = ["../../INSTALL.md"]
+
+[package.metadata.dist.binaries]
+x86_64-unknown-linux-gnu = ["bhf-daemon"]
+aarch64-unknown-linux-gnu = ["bhf-daemon"]
+x86_64-apple-darwin = ["bhf-daemon"]
+aarch64-apple-darwin = ["bhf-daemon"]
+x86_64-pc-windows-msvc = ["bhf-daemon"]
+
+[dependencies]
+ada_parser = { path = "../ada_parser" }
+c_parser = { path = "../c_parser" }
+cli = { package = "bhf", path = "../cli" }
+cpp_parser = { path = "../cpp_parser" }
+bhf_report = { package = "report", path = "../report" }
+instrumenter = { path = "../instrumenter" }
+llm_harness_gen = { path = "../llm_harness_gen" }
+serde.workspace = true
+serde_json.workspace = true
+static_analysis = { path = "../static_analysis" }
+target_rank = { path = "../target_rank" }
+
+[lib]
+name = "daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bhf-daemon"
+path = "src/bin/bhf-daemon.rs"
+
+[[bin]]
+name = "daemon"
+path = "src/main.rs"

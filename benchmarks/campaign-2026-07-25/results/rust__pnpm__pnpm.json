@@ -1,0 +1,131 @@
+{
+ "lane": "rust",
+ "repo": "pnpm/pnpm",
+ "stars": 35874,
+ "wave": "SLOC",
+ "surfaces": {
+  "sloc": {
+   "cmd": "sloc /home/ubuntu/bhf-corpus-500/rust/pnpm__pnpm --json --out /home/ubuntu/bhf-sweep-work/rust__pnpm__pnpm.cwd/sloc.json",
+   "exit": 0,
+   "wall_s": 0.21,
+   "timed_out": false,
+   "panic": false,
+   "languages": 3,
+   "sloc_total": 652308,
+   "sloc_by_lang": {
+    "rust": 305441,
+    "javascript": 222652,
+    "config": 124215
+   }
+  },
+  "list_targets": {
+   "cmd": "list targets /home/ubuntu/bhf-corpus-500/rust/pnpm__pnpm --format json --top 100000",
+   "exit": 0,
+   "wall_s": 3.75,
+   "timed_out": false,
+   "panic": false,
+   "count": 2187,
+   "by_language": {
+    "rust": 2187
+   }
+  },
+  "static_scan": {
+   "cmd": "static-scan /home/ubuntu/bhf-corpus-500/rust/pnpm__pnpm --out /home/ubuntu/bhf-sweep-work/rust__pnpm__pnpm/static --sarif --sloc sloc-breakdown.json --jobs 2 --max-memory-mb 2500",
+   "exit": 0,
+   "wall_s": 130.85,
+   "timed_out": false,
+   "panic": false,
+   "sarif": true,
+   "count": 204,
+   "by_severity": {
+    "low": 173,
+    "high": 20,
+    "medium": 5,
+    "critical": 6
+   },
+   "top_rules": {
+    "BHF-553": 173,
+    "BHF-559": 10,
+    "BHF-423": 5,
+    "BHF-404": 5,
+    "BHF-505": 4,
+    "BHF-422": 3,
+    "BHF-436": 2,
+    "BHF-426": 1,
+    "BHF-429": 1
+   },
+   "gaps": 352
+  },
+  "sbom": {
+   "cmd": "sbom /home/ubuntu/bhf-corpus-500/rust/pnpm__pnpm --out /home/ubuntu/bhf-sweep-work/rust__pnpm__pnpm/sbom",
+   "exit": 1,
+   "wall_s": 0.31,
+   "timed_out": false,
+   "panic": false
+  },
+  "auto": {
+   "cmd": "auto /home/ubuntu/bhf-corpus-500/rust/pnpm__pnpm --work-dir /home/ubuntu/bhf-sweep-work/rust__pnpm__pnpm --campaign-time 90 --per-target-time 3 --max-attempts 10 --max-repair-rounds 4 --jobs 1 --profile external-tools --single-pass",
+   "exit": 1,
+   "wall_s": 218.38,
+   "timed_out": false,
+   "panic": false,
+   "summary": {
+    "discovered": 1,
+    "discovered_total": 1989,
+    "dropped_by_cap": 1988,
+    "built": 0,
+    "built_and_fuzzed": 0,
+    "fuzzed_stub_only": 0,
+    "failed_build": 1,
+    "unsupported_params": 0,
+    "unrecoverable_link": 0,
+    "unrecoverable_runtime": 0,
+    "findings": 0
+   },
+   "mode": "reporting",
+   "partial": false,
+   "needed_for_build": {
+    "synthesized_headers": 0,
+    "synthesized_types": 0,
+    "synthesized_macros": 0,
+    "stubbed_symbols_declared": 0,
+    "stubbed_symbols_blind": 0,
+    "stubbed_ada_units": 0,
+    "stubbed_ada_symbols": 0,
+    "missing_libraries": 0,
+    "missing_gpr_imports": 0,
+    "environment_variables_faked": 0,
+    "missing_files": 0,
+    "network_endpoints": 0,
+    "dlopen_failures": 0,
+    "missing_ada_units": 0
+   },
+   "targets": [
+    {
+     "name": "decode_package_files_index",
+     "source": "store_index.rs",
+     "outcome": "failed_build",
+     "retries": 0,
+     "repairs": 0,
+     "execs_per_sec": null,
+     "reason": null,
+     "stub_only": null,
+     "blind_stub_fraction": null
+    }
+   ],
+   "blockers": [
+    {
+     "category": "failed_build",
+     "count": 1,
+     "detail": "undefined symbol",
+     "language": "rust"
+    }
+   ],
+   "findings_detail": []
+  }
+ },
+ "sha": "b9df82e30815b8751d5b267a6c70eeeaf02d5fe5",
+ "clone_s": 3.5,
+ "lane_check": "rust: 1152 files / 367462 lines; top=rust(367462)",
+ "status": "done"
+}

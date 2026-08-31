@@ -1,0 +1,98 @@
+{
+ "lane": "c",
+ "repo": "sumatrapdfreader/sumatrapdf",
+ "stars": 17175,
+ "wave": "SLOC",
+ "surfaces": {
+  "sloc": {
+   "cmd": "sloc /home/ubuntu/bhf-corpus-500/c/sumatrapdfreader__sumatrapdf --json --out /home/ubuntu/bhf-sweep-work/c__sumatrapdfreader__sumatrapdf.cwd/sloc.json",
+   "exit": 0,
+   "wall_s": 0.47,
+   "timed_out": false,
+   "panic": false,
+   "languages": 11,
+   "sloc_total": 1954061,
+   "sloc_by_lang": {
+    "c": 1286854,
+    "cpp": 577530,
+    "javascript": 36759,
+    "python": 25490,
+    "java": 14714,
+    "csharp": 4360,
+    "lua": 2705,
+    "config": 2448,
+    "ada": 1681,
+    "go": 1141,
+    "perl": 379
+   }
+  },
+  "list_targets": {
+   "cmd": "list targets /home/ubuntu/bhf-corpus-500/c/sumatrapdfreader__sumatrapdf --format json --top 100000",
+   "exit": 0,
+   "wall_s": 135.74,
+   "timed_out": false,
+   "panic": false,
+   "count": 59185,
+   "by_language": {
+    "cpp": 24019,
+    "c": 34170,
+    "java": 825,
+    "ada": 171
+   }
+  },
+  "static_scan": {
+   "cmd": "static-scan /home/ubuntu/bhf-corpus-500/c/sumatrapdfreader__sumatrapdf --out /home/ubuntu/bhf-sweep-work/c__sumatrapdfreader__sumatrapdf/static --sarif --sloc sloc-breakdown.json --jobs 2 --max-memory-mb 2500",
+   "exit": 0,
+   "wall_s": 119.51,
+   "timed_out": false,
+   "panic": false,
+   "sarif": true,
+   "count": 1622,
+   "by_severity": {
+    "medium": 523,
+    "high": 1064,
+    "critical": 26,
+    "low": 9
+   },
+   "top_rules": {
+    "BHF-407": 299,
+    "BHF-401": 270,
+    "BHF-405": 231,
+    "BHF-425": 212,
+    "BHF-406": 143,
+    "BHF-403": 129,
+    "BHF-424": 117,
+    "BHF-408": 112,
+    "BHF-404": 23,
+    "BHF-422": 21,
+    "BHF-472": 14,
+    "BHF-436": 14,
+    "BHF-546": 9,
+    "BHF-500": 7,
+    "BHF-560": 4
+   },
+   "gaps": 874
+  },
+  "sbom": {
+   "cmd": "sbom /home/ubuntu/bhf-corpus-500/c/sumatrapdfreader__sumatrapdf --out /home/ubuntu/bhf-sweep-work/c__sumatrapdfreader__sumatrapdf/sbom",
+   "exit": 0,
+   "wall_s": 2.28,
+   "timed_out": false,
+   "panic": false,
+   "components": 103
+  },
+  "auto": {
+   "cmd": "auto /home/ubuntu/bhf-corpus-500/c/sumatrapdfreader__sumatrapdf --work-dir /home/ubuntu/bhf-sweep-work/c__sumatrapdfreader__sumatrapdf --campaign-time 90 --per-target-time 3 --max-attempts 10 --max-repair-rounds 4 --jobs 1 --profile external-tools --single-pass",
+   "exit": -9,
+   "wall_s": 334.29,
+   "timed_out": false,
+   "panic": false,
+   "stderr_tail": "bhf auto: checkpointing offline requirements to /home/ubuntu/bhf-sweep-work/c__sumatrapdfreader__sumatrapdf/auto/missing-deps.txt\nbhf auto: work-directory state: new\nbhf auto: skipping /home/ubuntu/bhf-corpus-500/c/sumatrapdfreader__sumatrapdf/packages/Microsoft.Web.WebView2.1.0.4022.49/WebView2.idl: expected ';' at line 12114, column 1\nbhf auto: discovering targets under /home/ubuntu/bhf-corpus-500/c/sumatrapdfreader__sumatrapdf\nbhf auto: discovery cache miss at /home/ubuntu/bhf-sweep-work/c__sumatrapdfreader__sumatrapdf/discovery-cache.json (no cache file yet); recomputing discovery (fingerprint bd22977c2d267fe8-pp:auto). Pass --no-discovery-cache to disable caching.\n",
+   "findings_detail": []
+  }
+ },
+ "sha": "bf5443efdcae8d483c3e50c7d85f8b2097facb4e",
+ "clone_s": 9.2,
+ "lane_check": "c: 1621 files / 1089354 lines; top=c(1089354)",
+ "status": "done"
+}

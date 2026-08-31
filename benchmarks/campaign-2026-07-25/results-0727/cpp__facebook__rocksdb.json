@@ -1,0 +1,92 @@
+{
+ "lane": "cpp",
+ "repo": "facebook/rocksdb",
+ "stars": 31906,
+ "wave": "FULL",
+ "surfaces": {
+  "sloc": {
+   "cmd": "sloc /home/ubuntu/bhf-corpus-500/cpp/facebook__rocksdb --json --out /home/ubuntu/bhf-sweep-work/cpp__facebook__rocksdb.cwd/sloc.json",
+   "exit": 0,
+   "wall_s": 0.18,
+   "timed_out": false,
+   "panic": false,
+   "languages": 6,
+   "sloc_total": 685543,
+   "sloc_by_lang": {
+    "cpp": 606379,
+    "java": 43394,
+    "c": 16508,
+    "python": 15088,
+    "config": 3512,
+    "javascript": 662
+   }
+  },
+  "list_targets": {
+   "cmd": "list targets /home/ubuntu/bhf-corpus-500/cpp/facebook__rocksdb --format json --top 100000",
+   "exit": 0,
+   "wall_s": 48.73,
+   "timed_out": false,
+   "panic": false,
+   "count": 30792,
+   "by_language": {
+    "cpp": 27184,
+    "java": 3446,
+    "c": 162
+   }
+  },
+  "static_scan": {
+   "cmd": "static-scan /home/ubuntu/bhf-corpus-500/cpp/facebook__rocksdb --out /home/ubuntu/bhf-sweep-work/cpp__facebook__rocksdb/static --sarif --sloc sloc-breakdown.json --jobs 2 --max-memory-mb 2500",
+   "exit": 0,
+   "wall_s": 26.22,
+   "timed_out": false,
+   "panic": false,
+   "sarif": true,
+   "count": 293,
+   "by_severity": {
+    "high": 83,
+    "medium": 179,
+    "low": 14,
+    "critical": 17
+   },
+   "top_rules": {
+    "BHF-424": 96,
+    "BHF-406": 43,
+    "BHF-497": 30,
+    "BHF-407": 27,
+    "BHF-405": 26,
+    "BHF-408": 15,
+    "BHF-546": 14,
+    "BHF-404": 12,
+    "BHF-472": 11,
+    "BHF-477": 4,
+    "BHF-420": 4,
+    "BHF-544": 3,
+    "BHF-550": 2,
+    "BHF-549": 2,
+    "BHF-401": 1
+   },
+   "gaps": 442
+  },
+  "sbom": {
+   "cmd": "sbom /home/ubuntu/bhf-corpus-500/cpp/facebook__rocksdb --out /home/ubuntu/bhf-sweep-work/cpp__facebook__rocksdb/sbom",
+   "exit": 0,
+   "wall_s": 0.49,
+   "timed_out": false,
+   "panic": false,
+   "components": 28
+  },
+  "auto": {
+   "cmd": "auto /home/ubuntu/bhf-corpus-500/cpp/facebook__rocksdb --work-dir /home/ubuntu/bhf-sweep-work/cpp__facebook__rocksdb --campaign-time 90 --per-target-time 3 --max-attempts 10 --max-repair-rounds 4 --jobs 1 --profile external-tools --single-pass",
+   "exit": -9,
+   "wall_s": 95.68,
+   "timed_out": false,
+   "panic": false,
+   "stderr_tail": "bhf auto: checkpointing offline requirements to /home/ubuntu/bhf-sweep-work/cpp__facebook__rocksdb/auto/missing-deps.txt\nbhf auto: work-directory state: new\nbhf auto: discovering targets under /home/ubuntu/bhf-corpus-500/cpp/facebook__rocksdb\nbhf auto: discovery cache miss at /home/ubuntu/bhf-sweep-work/cpp__facebook__rocksdb/discovery-cache.json (no cache file yet); recomputing discovery (fingerprint 4af2abc4d949efd4-pp:auto). Pass --no-discovery-cache to disable caching.\n",
+   "findings_detail": []
+  }
+ },
+ "sha": "a4645e864d42ab42566a5d21a01319c034ca7159",
+ "clone_s": 2.7,
+ "lane_check": "cpp: 751 files / 571950 lines; top=cpp(571950)",
+ "status": "done"
+}

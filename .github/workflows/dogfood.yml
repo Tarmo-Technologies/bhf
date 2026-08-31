@@ -1,0 +1,76 @@
+# SPDX-License-Identifier: Apache-2.0
+
+# Dogfood: run bhf on bhf's own fuzzable native code to catch regressions
+# in the parts that parse untrusted input (the C runtime decoders that every
+# harness links, and the Ada coverage runtime). Scheduled nightly + manual only —
+# not on push/PR — so it never slows the PR path, and because the shared runners
+# are currently billing-gated (it will start producing results once that clears).
+#
+# Extend `--path`/`--languages` below to fold in more lanes (e.g. the Rust parser
+# crates via `rustup toolchain install nightly` + `--languages rust`).
+
+name: dogfood
+
+on:
+  schedule:
+    - cron: '17 4 * * *' # 04:17 UTC nightly
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dogfood-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  self-fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+
+      - name: Install C toolchain
+        run: sudo apt-get update && sudo apt-get install -y clang make
+
+      - name: Build bhf
+        run: cargo build --release -p bhf
+
+      - name: Self-fuzz the C runtime decoders
+        run: |
+          ./target/release/bhf auto c_runtime \
+            --languages c,cpp \
+            --work-dir "$RUNNER_TEMP/dogfood_work" \
+            --per-target-time 45 \
+            --sarif "$RUNNER_TEMP/dogfood.sarif" || true
+          # Surface a compact summary in the job log.
+          if [ -f "$RUNNER_TEMP/dogfood_work/auto/summary.txt" ]; then
+            echo '## bhf self-fuzz summary' >> "$GITHUB_STEP_SUMMARY"
+            sed 's/^/    /' "$RUNNER_TEMP/dogfood_work/auto/summary.txt" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload findings
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dogfood-findings
+          path: |
+            ${{ runner.temp }}/dogfood.sarif
+            ${{ runner.temp }}/dogfood_work/auto/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Fail on a fuzz-confirmed finding
+        run: |
+          RUN_JSON="$RUNNER_TEMP/dogfood_work/auto/run.json"
+          if [ -f "$RUN_JSON" ] && grep -q '"classification": *"crash"' "$RUN_JSON"; then
+            echo "::error::bhf found a fuzz-confirmed crash in its own C runtime — see the dogfood-findings artifact."
+            exit 1
+          fi
+          echo "No fuzz-confirmed crash in the self-fuzz."

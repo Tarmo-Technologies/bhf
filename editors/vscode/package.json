@@ -1,0 +1,105 @@
+{
+  "name": "bhf-vscode",
+  "displayName": "BHF",
+  "description": "Thin VS Code client for BHF findings.",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "publisher": "tarmo-technologies",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Tarmo-Technologies/bhf.git",
+    "directory": "editors/vscode"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Linters",
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:bhf.refreshFindings",
+    "onCommand:bhf.replayFinding",
+    "onCommand:bhf.minimizeFinding",
+    "onCommand:bhf.openReproducer"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "ada",
+        "aliases": [
+          "Ada",
+          "ada"
+        ],
+        "extensions": [
+          ".adb",
+          ".ads",
+          ".ada"
+        ]
+      }
+    ],
+    "commands": [
+      {
+        "command": "bhf.refreshFindings",
+        "title": "BHF: Refresh Findings"
+      },
+      {
+        "command": "bhf.replayFinding",
+        "title": "BHF: Replay Finding"
+      },
+      {
+        "command": "bhf.minimizeFinding",
+        "title": "BHF: Minimize Finding"
+      },
+      {
+        "command": "bhf.openReproducer",
+        "title": "BHF: Open Reproducer"
+      }
+    ],
+    "configuration": {
+      "title": "BHF",
+      "properties": {
+        "bhf.daemonPath": {
+          "type": "string",
+          "default": "bhf-daemon",
+          "description": "Path to the BHF daemon executable."
+        },
+        "bhf.cliPath": {
+          "type": "string",
+          "default": "bhf",
+          "description": "Path to the BHF CLI executable."
+        },
+        "bhf.findingsDir": {
+          "type": "string",
+          "default": "findings",
+          "description": "Findings directory to load through the daemon."
+        },
+        "bhf.harnessPath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional harness path used by replay and minimize actions."
+        },
+        "bhf.minimizeStrategy": {
+          "type": "string",
+          "enum": [
+            "bytes",
+            "typed"
+          ],
+          "default": "bytes",
+          "description": "Minimization strategy used by the Minimize CodeLens action."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "test": "npm run compile && node --test out/test/*.test.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "@types/vscode": "1.90.0",
+    "typescript": "^5.5.4"
+  }
+}

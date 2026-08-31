@@ -1,0 +1,92 @@
+{
+ "lane": "cpp",
+ "repo": "notepad-plus-plus/notepad-plus-plus",
+ "stars": 28813,
+ "wave": "FULL",
+ "surfaces": {
+  "sloc": {
+   "cmd": "sloc /home/ubuntu/bhf-corpus-500/cpp/notepad-plus-plus__notepad-plus-plus --json --out /home/ubuntu/bhf-sweep-work/cpp__notepad-plus-plus__notepad-plus-plus.cwd/sloc.json",
+   "exit": 0,
+   "wall_s": 0.11,
+   "timed_out": false,
+   "panic": false,
+   "languages": 11,
+   "sloc_total": 335359,
+   "sloc_by_lang": {
+    "cpp": 320524,
+    "python": 6166,
+    "c": 6059,
+    "config": 1678,
+    "perl": 259,
+    "lua": 251,
+    "ruby": 235,
+    "php": 91,
+    "fortran": 41,
+    "rust": 37,
+    "cobol": 18
+   }
+  },
+  "list_targets": {
+   "cmd": "list targets /home/ubuntu/bhf-corpus-500/cpp/notepad-plus-plus__notepad-plus-plus --format json --top 100000",
+   "exit": 0,
+   "wall_s": 17.78,
+   "timed_out": false,
+   "panic": false,
+   "count": 11665,
+   "by_language": {
+    "cpp": 11656,
+    "c": 9
+   }
+  },
+  "static_scan": {
+   "cmd": "static-scan /home/ubuntu/bhf-corpus-500/cpp/notepad-plus-plus__notepad-plus-plus --out /home/ubuntu/bhf-sweep-work/cpp__notepad-plus-plus__notepad-plus-plus/static --sarif --sloc sloc-breakdown.json --jobs 2 --max-memory-mb 2500",
+   "exit": 0,
+   "wall_s": 8.55,
+   "timed_out": false,
+   "panic": false,
+   "sarif": true,
+   "count": 92,
+   "by_severity": {
+    "high": 86,
+    "medium": 2,
+    "critical": 1,
+    "low": 3
+   },
+   "top_rules": {
+    "BHF-407": 27,
+    "BHF-401": 22,
+    "BHF-403": 14,
+    "BHF-405": 12,
+    "BHF-472": 5,
+    "BHF-408": 5,
+    "BHF-546": 3,
+    "BHF-500": 1,
+    "BHF-422": 1,
+    "BHF-547": 1,
+    "BHF-404": 1
+   },
+   "gaps": 503
+  },
+  "sbom": {
+   "cmd": "sbom /home/ubuntu/bhf-corpus-500/cpp/notepad-plus-plus__notepad-plus-plus --out /home/ubuntu/bhf-sweep-work/cpp__notepad-plus-plus__notepad-plus-plus/sbom",
+   "exit": 0,
+   "wall_s": 0.21,
+   "timed_out": false,
+   "panic": false,
+   "components": 11
+  },
+  "auto": {
+   "cmd": "auto /home/ubuntu/bhf-corpus-500/cpp/notepad-plus-plus__notepad-plus-plus --work-dir /home/ubuntu/bhf-sweep-work/cpp__notepad-plus-plus__notepad-plus-plus --campaign-time 90 --per-target-time 3 --max-attempts 10 --max-repair-rounds 4 --jobs 1 --profile external-tools --single-pass",
+   "exit": -9,
+   "wall_s": 94.49,
+   "timed_out": false,
+   "panic": false,
+   "stderr_tail": "bhf auto: checkpointing offline requirements to /home/ubuntu/bhf-sweep-work/cpp__notepad-plus-plus__notepad-plus-plus/auto/missing-deps.txt\nbhf auto: work-directory state: new\nbhf auto: discovering targets under /home/ubuntu/bhf-corpus-500/cpp/notepad-plus-plus__notepad-plus-plus\nbhf auto: discovery cache miss at /home/ubuntu/bhf-sweep-work/cpp__notepad-plus-plus__notepad-plus-plus/discovery-cache.json (no cache file yet); recomputing discovery (fingerprint aae7ab6d36a94dcb-pp:auto). Pass --no-discovery-cache to disable caching.\n",
+   "findings_detail": []
+  }
+ },
+ "sha": "fa47a0a0e7409e2ac369b1a019c4d8acf63c0b39",
+ "clone_s": 2.8,
+ "lane_check": "cpp: 534 files / 328218 lines; top=cpp(328218)",
+ "status": "done"
+}

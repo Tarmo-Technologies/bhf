@@ -1,0 +1,92 @@
+{
+ "lane": "python",
+ "repo": "vllm-project/vllm",
+ "stars": 87160,
+ "wave": "SLOC",
+ "surfaces": {
+  "sloc": {
+   "cmd": "sloc /home/ubuntu/bhf-corpus-500/python/vllm-project__vllm --json --out /home/ubuntu/bhf-sweep-work/python__vllm-project__vllm.cwd/sloc.json",
+   "exit": 0,
+   "wall_s": 0.22,
+   "timed_out": false,
+   "panic": false,
+   "languages": 6,
+   "sloc_total": 1022974,
+   "sloc_by_lang": {
+    "python": 886960,
+    "rust": 81316,
+    "cpp": 37742,
+    "config": 16337,
+    "c": 497,
+    "javascript": 122
+   }
+  },
+  "list_targets": {
+   "cmd": "list targets /home/ubuntu/bhf-corpus-500/python/vllm-project__vllm --format json --top 100000",
+   "exit": 0,
+   "wall_s": 5.64,
+   "timed_out": false,
+   "panic": false,
+   "count": 1702,
+   "by_language": {
+    "cpp": 690,
+    "rust": 992,
+    "c": 20
+   }
+  },
+  "static_scan": {
+   "cmd": "static-scan /home/ubuntu/bhf-corpus-500/python/vllm-project__vllm --out /home/ubuntu/bhf-sweep-work/python__vllm-project__vllm/static --sarif --sloc sloc-breakdown.json --jobs 2 --max-memory-mb 2500",
+   "exit": 0,
+   "wall_s": 32.0,
+   "timed_out": false,
+   "panic": false,
+   "sarif": true,
+   "count": 364,
+   "by_severity": {
+    "low": 97,
+    "high": 96,
+    "medium": 70,
+    "critical": 101
+   },
+   "top_rules": {
+    "BHF-429": 97,
+    "BHF-546": 86,
+    "BHF-423": 40,
+    "BHF-428": 39,
+    "BHF-421": 28,
+    "BHF-424": 13,
+    "BHF-560": 12,
+    "BHF-553": 11,
+    "BHF-544": 6,
+    "BHF-426": 6,
+    "BHF-420": 4,
+    "BHF-405": 4,
+    "BHF-548": 3,
+    "BHF-422": 3,
+    "BHF-406": 2
+   },
+   "gaps": 2221
+  },
+  "sbom": {
+   "cmd": "sbom /home/ubuntu/bhf-corpus-500/python/vllm-project__vllm --out /home/ubuntu/bhf-sweep-work/python__vllm-project__vllm/sbom",
+   "exit": 0,
+   "wall_s": 0.27,
+   "timed_out": false,
+   "panic": false,
+   "components": 1087
+  },
+  "auto": {
+   "cmd": "auto /home/ubuntu/bhf-corpus-500/python/vllm-project__vllm --work-dir /home/ubuntu/bhf-sweep-work/python__vllm-project__vllm --campaign-time 90 --per-target-time 3 --max-attempts 10 --max-repair-rounds 4 --jobs 1 --profile external-tools --single-pass",
+   "exit": -9,
+   "wall_s": 33.3,
+   "timed_out": false,
+   "panic": false,
+   "stderr_tail": "bhf auto: checkpointing offline requirements to /home/ubuntu/bhf-sweep-work/python__vllm-project__vllm/auto/missing-deps.txt\nbhf auto: work-directory state: new\nbhf auto: discovering targets under /home/ubuntu/bhf-corpus-500/python/vllm-project__vllm\nbhf auto: discovery cache miss at /home/ubuntu/bhf-sweep-work/python__vllm-project__vllm/discovery-cache.json (no cache file yet); recomputing discovery (fingerprint 2cf72aaff89f6add-pp:auto). Pass --no-discovery-cache to disable caching.\n",
+   "findings_detail": []
+  }
+ },
+ "sha": "da3a252fd13f51c22657bfc8650936f2fbb5b6f3",
+ "clone_s": 5.8,
+ "lane_check": "python: 3835 files / 1077150 lines; top=python(1077150)",
+ "status": "done"
+}

@@ -1,0 +1,6251 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! `bhf auto <PATH>` — orchestrate `discover` + per-candidate
+//! `attempt` + final `write_reports` into a single subcommand.
+//! `--per-target-time` and `--no-stubs` are threaded through
+//! `AttemptOptions` so they actually take effect inside the loop.
+
+use crate::auto::attempt::AttemptOptions;
+use crate::auto::candidate::Lang;
+use crate::auto::decl_index::DeclarationIndex;
+use crate::auto::discovery::DirFilter;
+use crate::auto::report::{write_reports, write_reports_with_output_limit};
+use crate::target_filter::{path_matches_exclusion, ExcludeCategory};
+use anyhow::{Context, Result};
+use chrono::Utc;
+use std::cmp::Reverse;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+/// The one command that covers the usual job, shown at the end of
+/// `bhf auto --help`. Long-form help spells out how to size each flag; the
+/// same guidance lives in `docs/recommended-sweep.md` (shipped in a distribution
+/// as `RECOMMENDED-SWEEP.md`).
+const RECOMMENDED_SWEEP: &str = "\
+RECOMMENDED SWEEP:
+  bhf auto /path/to/source-tree \\
+    --work-dir bhf_work \\
+    --jobs 4 \\
+    --per-target-time 60 \\
+    --campaign-time 3600 \\
+    --max-targets 40 \\
+    --unsafe-search-and-run-build-commands \\
+    --force \\
+    --static \\
+    --sbom \\
+    --sloc sloc.txt \\
+    --debug
+
+  --work-dir   where everything lands; keep it OUTSIDE the scanned tree
+  --jobs       targets built+fuzzed at once; peak RAM is ~jobs x --rss-limit-mb
+  --per-target-time  fuzz seconds per target (libFuzzer -max_total_time parity)
+  --campaign-time    hard cap for the whole sweep, in seconds
+  --max-targets      stop once N targets actually FUZZED (failures don't count)
+  --unsafe-search-and-run-build-commands
+                     RUNS the tree's own build to recover real compile flags —
+                     trusted sources only; drop it otherwise
+  --force      retry what phase 1 could not fuzz, on fabricated inputs/stubs;
+               those findings are stamped low-confidence
+  --static     also analyze the whole tree statically, not just what fuzzed
+  --sbom       evidence-graded SBOM + VEX at campaign end
+  --sloc FILE  per-language SLOC breakdown (.json for JSON)
+  --debug      backtrace on a bhf-internal panic; enriches the bug report
+
+  Read bhf_work/FINDINGS.md first. Full guide: RECOMMENDED-SWEEP.md
+  (docs/recommended-sweep.md in the repository).";
+
+fn parse_positive_mib(value: &str) -> std::result::Result<usize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|parsed| *parsed > 0)
+        .ok_or_else(|| format!("expected a positive MiB value, got {value:?}"))
+}
+
+#[derive(Debug, clap::Args)]
+#[command(after_help = RECOMMENDED_SWEEP, after_long_help = RECOMMENDED_SWEEP)]
+pub struct AutoArgs {
+    /// Source root to sweep.
+    pub path: PathBuf,
+
+    /// Work directory. Default ./bhf_work/.
+    #[arg(long, default_value = "bhf_work")]
+    pub work_dir: PathBuf,
+
+    /// Stop starting new targets once the BHF work directory reaches this
+    /// allocated size in MiB. Completed and in-flight targets are preserved and
+    /// reported, so parallel jobs can overshoot by their final artifacts. Default
+    /// 4096 MiB; pass 0 to disable. Findings are never deleted to satisfy the cap.
+    #[arg(long = "max-work-dir-mb", default_value_t = crate::auto::storage::DEFAULT_MAX_WORK_DIR_MIB)]
+    pub max_work_dir_mb: u64,
+
+    /// Maximum retained coverage corpus per target, in MiB. This bounds both the
+    /// in-memory mutation pool and `corpus/<harness-id>/queue/` written to disk.
+    /// Findings/testcases are separate and are never discarded by this limit.
+    #[arg(long = "max-corpus-mb", default_value_t = 64, value_parser = parse_positive_mib)]
+    pub max_corpus_mb: usize,
+
+    /// Explicit discovery-cache file, overriding the default
+    /// `<work-dir>/discovery-cache.json`. Pin it to a stable absolute path so the
+    /// default-on cache is found regardless of the current directory or work dir
+    /// and can live on a known-good volume.
+    #[arg(long = "discovery-cache", value_name = "PATH")]
+    pub discovery_cache: Option<PathBuf>,
+
+    /// Load run options from a TOML config file. Persists common flags so a project's
+    /// runs are reproducible; CLI flags always override it. Without this, a
+    /// `.bhf.toml` in the scanned tree root is auto-loaded — but an auto-loaded
+    /// config honors only SAFE knobs (fields that EXECUTE the tree's own build, like
+    /// `build-command`, require this explicit flag). Keys are the flag names in
+    /// kebab-case (e.g. `per-target-time = 30`, `cxx-std = "gnu++14"`).
+    #[arg(long = "config", value_name = "PATH")]
+    pub config: Option<PathBuf>,
+
+    /// #91: operator override for the governing Ada project (`.gpr`). By default
+    /// `auto` selects the project that OWNS each target's source (the non-aggregate
+    /// component whose active Source_Dirs contain it); pass this to force a specific
+    /// project when a multi-project layout is ambiguous. The same project is used
+    /// for generation analysis, source staging, scenario exclusions, and the build.
+    /// Errors if the path is missing.
+    #[arg(long = "project", value_name = "PATH")]
+    pub project: Option<PathBuf>,
+
+    /// Path to a JSON grammar describing the target's input format for structure-aware
+    /// generation (a Nautilus-style grammar mutator), applied to every fuzzed target.
+    /// Each rule maps a non-terminal to production strings where `{NAME}` references
+    /// another rule; the start symbol is `START` or the first rule. See
+    /// `bhf fuzz --grammar`.
+    #[arg(long = "grammar", value_name = "PATH")]
+    pub grammar_file: Option<PathBuf>,
+
+    /// Maximum fuzz input length. `auto` (the default) grows the effective length
+    /// adaptively per target — free up to ~1 MiB, and beyond that only while longer
+    /// inputs keep finding new coverage — so a large-object target (image, archive,
+    /// firmware) is handled WITHOUT a seed corpus, and a small-format one is never
+    /// grown into huge inputs pointlessly. A positive integer sets a fixed cap instead.
+    #[arg(long = "max-len", default_value = "auto")]
+    pub max_len: String,
+
+    /// Per-execution timeout (e.g. `10s`, `500ms`); an input exceeding it is a
+    /// hang/timeout. Default: the engine's 10s.
+    #[arg(long = "timeout", value_parser = crate::fuzz::parse_duration)]
+    pub timeout: Option<std::time::Duration>,
+
+    /// Force the C++ standard for every harness build (e.g. `gnu++14`, `c++03`),
+    /// pinning the dialect for legacy C++. Without it, `auto` builds C++ at the modern
+    /// default and, on a dialect failure, automatically retries successively older
+    /// standards until one builds — so an explicit value is only needed to override
+    /// that search.
+    #[arg(long = "cxx-std", value_name = "STD")]
+    pub cxx_std: Option<String>,
+
+    /// TOTAL per-target fuzz wall-clock budget in seconds, split evenly across the
+    /// passes (`auto` runs empty / rng / fuzz-driven) under one shared deadline,
+    /// so the per-target wall ≈ this regardless of pass count. libFuzzer
+    /// `-max_total_time` / AFL `-V` / honggfuzz `--run_time` parity. For a
+    /// whole-RUN cap across all targets use `--campaign-time`.
+    #[arg(long, default_value_t = 60)]
+    pub per_target_time: u64,
+
+    /// DEPRECATED alias of `--per-target-time` (overrides it when set). Retained
+    /// so existing benchmark/parity invocations keep working; prefer
+    /// `--per-target-time`. Hidden from help.
+    #[arg(long, hide = true)]
+    pub total_time: Option<u64>,
+
+    /// Stop fuzzing a target as soon as it has produced this many DISTINCT
+    /// findings (crash signatures), or when its `--per-target-time` budget is
+    /// spent — whichever comes first. Checked mid-pass, so the target stops the
+    /// instant the Nth finding lands and remaining passes are skipped. `1` mimics
+    /// libFuzzer's stop-on-first-crash. Unset (default) = collect every finding
+    /// within the time budget (current behavior).
+    #[arg(long = "per-target-finding-count", value_name = "N")]
+    pub per_target_finding_count: Option<usize>,
+
+    /// Budget in seconds for the SWEEP across ALL targets, charged from the first
+    /// build attempt — discovery and preflight are not billed to it, so a large
+    /// tree whose indexing takes minutes still fuzzes (libFuzzer `-max_total_time`
+    /// / AFL `-V` semantics). Default mode: a hard OUTER wall-clock cap — once
+    /// exceeded, `auto` stops STARTING new (ranked) targets (the in-flight one
+    /// finishes) and reports how many of the N discovered were reached. With
+    /// `--min-target-time`, switches to SPLIT mode: this becomes the total fuzz
+    /// budget DIVIDED across the attempted targets. Unset (default) = run every
+    /// target with its own `--per-target-time`.
+    #[arg(long)]
+    pub campaign_time: Option<u64>,
+
+    /// SPLIT-mode floor (seconds), used only with `--campaign-time`: divide the
+    /// campaign budget across the N attempted targets, giving each
+    /// `max(min, campaign / N)` of fuzz time and attempting only the top
+    /// `floor(campaign / per_target)` ranked targets (the rest logged unfuzzed) —
+    /// never less than this floor per target. Requires `--campaign-time`;
+    /// overrides `--per-target-time`.
+    #[arg(
+        long = "min-target-time",
+        value_name = "SECS",
+        requires = "campaign_time"
+    )]
+    pub min_target_time: Option<u64>,
+
+    /// #94: cap on the number of targets that reach the FUZZ phase (successful
+    /// builds), NOT on candidates inspected. The sweep attempts ranked candidates
+    /// in order and stops once N of them fuzz; unsupported params and build
+    /// failures never consume the cap, so lower-ranked viable endpoints are
+    /// backfilled instead of being starved by a nonviable prefix. Stops at the cap,
+    /// the `--campaign-time` deadline, or candidate exhaustion. Unset (default) =
+    /// fuzz every viable target. Use `--max-attempts` to also bound inspection.
+    #[arg(long = "max-targets", value_name = "N")]
+    pub max_targets: Option<usize>,
+
+    /// #94: hard ceiling on the number of ranked candidates INSPECTED (built/
+    /// attempted), independent of how many fuzz. Bounds a huge legacy tree where
+    /// most candidates are nonviable so `--max-targets` backfill can't grind the
+    /// whole tree. Unset (default) = inspect as many as needed to reach the
+    /// `--max-targets` success cap (or all of them).
+    #[arg(long = "max-attempts", value_name = "N")]
+    pub max_attempts: Option<usize>,
+
+    /// Cap on build-fail -> repair -> retry rounds per target (default 16). Each
+    /// round only runs when the previous one applied a NEW repair (the no-progress
+    /// early-break is preserved), so this is a ceiling, not a fixed cost. A LOW
+    /// value (2-3) fails un-buildable targets fast — useful for a quick triage
+    /// sweep over a huge tree where deep multi-file dependency convergence isn't
+    /// worth the per-target build time.
+    #[arg(long = "max-repair-rounds", default_value_t = crate::auto::attempt::DEFAULT_MAX_REPAIR_ROUNDS)]
+    pub max_repair_rounds: usize,
+
+    /// Restrict the per-target fuzz cascade to a comma-separated subset of passes
+    /// instead of all three. Names: `empty`, `rng`, `fuzz` (alias for
+    /// `fuzz_driven`). E.g. `--passes fuzz` runs only the fuzz-driven pass — ~3x
+    /// the throughput of the default 3-pass cascade for a triage sweep. Order is
+    /// preserved as given. Unset (default) = all passes (empty, rng, fuzz_driven).
+    /// Ignored under `--deps-only` (which fuzzes nothing).
+    #[arg(long = "passes", value_name = "SET", conflicts_with = "single_pass")]
+    pub passes: Option<String>,
+
+    /// Convenience for `--passes fuzz`: run ONLY the fuzz-driven pass per target,
+    /// skipping the empty/rng passes. ~3x a triage sweep's throughput. Mutually
+    /// exclusive with `--passes`.
+    #[arg(long = "single-pass")]
+    pub single_pass: bool,
+
+    /// Number of candidates to build+fuzz CONCURRENTLY. Defaults to half the
+    /// host's parallelism (capped, minimum 1); pass `--jobs 1` for the historical
+    /// serial sweep. Up to N targets' build+fuzz run in parallel via a bounded
+    /// worker pool. MEMORY: each concurrent fuzz uses up to `--rss-limit-mb` of
+    /// RAM, so effective peak memory is roughly `jobs x rss-limit-mb` — size it to
+    /// the host (a too-high value OOM-kills, e.g. inside a cgroup MemoryMax slice),
+    /// which is why the default is half the cores rather than all of them.
+    /// Results are aggregated deterministically regardless of completion order.
+    /// Ada targets build serially regardless: they share the staged source tree.
+    #[arg(long = "jobs", short = 'j', default_value_t = default_auto_jobs(), value_name = "N")]
+    pub jobs: usize,
+
+    /// DEPRECATED no-op: discovery caching is now ON BY DEFAULT (this flag is
+    /// accepted for back-compat and does nothing). See `--no-discovery-cache` to
+    /// opt out and `--fresh-discovery` to force a re-discovery.
+    #[arg(long = "reuse-discovery", hide = true)]
+    pub reuse_discovery: bool,
+
+    /// Disable the discovery cache entirely: do not read or write
+    /// `<work-dir>/discovery-cache.json`; always run a fresh tree-sitter parse +
+    /// rank. (Discovery caching is on by default — a re-run over an unchanged
+    /// source tree reuses the prior ranked candidate list, skipping the dominant
+    /// cost of a big-tree re-run. A content fingerprint of the target source +
+    /// dir-filter guards every load, so any source/`--exclude-dir`/`--include-dir`
+    /// change auto-invalidates it; a stale cache is never used silently.)
+    #[arg(long = "no-discovery-cache")]
+    pub no_discovery_cache: bool,
+
+    /// Force a fresh discovery THIS run, ignoring any existing cache, then
+    /// overwrite the cache with the new result. Use when you deliberately want to
+    /// re-discover (the cache otherwise only re-runs discovery when the target
+    /// source or dir-filter actually changed). No effect with
+    /// `--no-discovery-cache`.
+    #[arg(long = "fresh-discovery")]
+    pub fresh_discovery: bool,
+
+    /// Resume a prior sweep over the SAME work-dir: skip targets that already
+    /// completed (a per-target `harnesses/<id>/result.json` marker is written the
+    /// moment each target's attempt finishes, so an INTERRUPTED run is resumable),
+    /// re-running only the not-yet-attempted ones. Requires the discovery cache to
+    /// hit (target source unchanged) — otherwise the prior per-target results may
+    /// be stale and every target is re-attempted. Each skipped target's prior
+    /// artifacts (`harnesses/<id>/`, `findings/`, `fuzz_runs/`) remain on disk; the new
+    /// run's report counts them as `resumed`.
+    #[arg(long = "resume")]
+    pub resume: bool,
+
+    /// Per-pass execution cap. Unset (or `0`) lets `--per-target-time` govern
+    /// depth; a positive value caps each fuzz pass (libFuzzer `-runs`). The old
+    /// hardcoded 1024 cap is retired — without this flag wall-clock governs.
+    #[arg(long)]
+    pub iterations: Option<usize>,
+
+    /// Per-harness resident-set memory cap in MB. A test case that allocates
+    /// past this is killed and reported as an OOM finding (BHF-209) instead of
+    /// OOM-killing the host. Mirrors libFuzzer's `-rss_limit_mb`; the default is
+    /// one quarter of available host/cgroup memory, clamped to 512..8192 MiB.
+    /// Pass an exact value (or 0 to disable) when the derived allowance is not
+    /// appropriate for the target.
+    #[arg(long = "rss-limit-mb", default_value_t = default_auto_rss_limit_mb())]
+    pub rss_limit_mb: usize,
+
+    /// Skip auto-stubbing entirely (diagnostics-only).
+    #[arg(long)]
+    pub no_stubs: bool,
+
+    /// Print the fake-resource plugin inventory and exit.
+    #[arg(long)]
+    pub list_fakes: bool,
+
+    /// Attempt only targets whose discovered name exactly matches this value.
+    /// Repeatable. Useful when a source drop contains vendored support code
+    /// but the sweep should exercise a known wrapper target.
+    #[arg(long = "target")]
+    pub targets: Vec<String>,
+
+    /// Attempt only targets whose stable harness id exactly matches this value.
+    /// Repeatable. Useful for rerunning a target printed by auto/run reports.
+    #[arg(long = "harness-id")]
+    pub harness_ids: Vec<String>,
+
+    /// Attempt only targets discovered in this source file. Accepts an absolute
+    /// path or a path relative to the sweep root. Repeatable.
+    #[arg(long = "target-file", value_name = "PATH")]
+    pub target_files: Vec<PathBuf>,
+
+    /// Exclude paths whose normalized relative path contains this text. Repeatable.
+    #[arg(long = "exclude-path")]
+    pub exclude_paths: Vec<String>,
+
+    /// Exclude common project areas. Accepts comma-separated values: tests, tools, examples.
+    #[arg(long = "exclude", value_enum, value_delimiter = ',')]
+    pub exclude: Vec<ExcludeCategory>,
+
+    /// Additional local directories of dependency source to put on the Ada
+    /// build path (offline: never fetched). Point at vendored/air-gapped
+    /// dependency crates so a project that `with`s an external library (e.g.
+    /// ada-util's `Util.Encoders`) can build. Repeatable. Locally-cached Alire
+    /// dependencies under the project are also picked up automatically.
+    #[arg(long = "ada-deps", value_name = "DIR")]
+    pub ada_deps: Vec<PathBuf>,
+
+    /// Seed input file whose bytes bootstrap every target's fuzz corpus.
+    /// Provide valid/structured examples (a real `.zip`, `.bz2`, a sample
+    /// document) so parser/decompressor targets reach deep code instead of
+    /// bouncing off the header check. Repeatable.
+    #[arg(long = "seed-file", value_name = "PATH")]
+    pub seed_files: Vec<PathBuf>,
+
+    /// Directory of seed inputs; each regular file's bytes become a seed.
+    /// Repeatable.
+    #[arg(long = "seed-dir", value_name = "DIR")]
+    pub seed_dirs: Vec<PathBuf>,
+
+    /// Actionability profile to optimize for.
+    #[arg(long, default_value_t = actionability::RunMode::Reporting)]
+    pub mode: actionability::RunMode,
+
+    /// Fuzz engine(s) for the per-target fuzz phase, comma-separated. `builtin`
+    /// (default) is the in-process coverage-guided engine. `afl++` drives AFL++
+    /// on the auto-recovered build (C/C++ targets only; needs `afl-fuzz` +
+    /// `afl-clang-fast` on PATH, else it falls back to builtin with a warning).
+    /// `--engine builtin,afl++` runs BOTH per target, splitting `--per-target-time`
+    /// evenly across them. For a non-C/C++ target an `afl++` selection falls back
+    /// to builtin (logged, never silently skipped).
+    #[arg(long = "engine", default_value = "builtin", value_name = "LIST")]
+    pub engine: String,
+
+    /// Print an extra indented line per target explaining the outcome:
+    /// why a target was skipped or failed, which repairs auto applied,
+    /// and per-pass execution/finding counts.
+    #[arg(short, long)]
+    pub verbose: bool,
+
+    /// Recover the project's real compile wiring by running its own build
+    /// (CMake configure + instrumented static-library targets, or `make` under a
+    /// compiler-interposing wrapper) once,
+    /// offline, before harnessing. Produces `<tree>/.bhf-build/
+    /// compile_commands.json`, generated headers, and compatible static archives
+    /// so each harness builds with the real translation-unit and link context.
+    ///
+    /// This EXECUTES the project's untrusted build scripts; it runs under
+    /// bhf's sandbox (bwrap/firejail) when one is available and degrades to a
+    /// direct run otherwise. Off by default.
+    #[arg(long = "probe-build")]
+    pub probe_build: bool,
+
+    /// Dependency-scan mode: discover, build each target as far as possible
+    /// (stubbing whatever is missing), and emit the missing-dependency manifest —
+    /// but SKIP fuzzing. The fast "what does this tree need?" pass: find every
+    /// missing dependency in one go (see `<work>/auto/missing-deps.txt`) so you
+    /// can bring them all to the offline machine at once, instead of
+    /// build-hit-copy-repeat. A normal `auto` run also writes the manifest; this
+    /// just gets it without paying for the fuzz phase.
+    #[arg(long = "deps-only")]
+    pub deps_only: bool,
+
+    /// Discovery dry-run: print the ranked fuzz targets the engine would harness
+    /// (highest score first, with file:line, language, and input-reachability) and
+    /// exit WITHOUT building or fuzzing anything. The fast way to see what `auto`
+    /// considers the best places to fuzz in a project — and to validate the
+    /// entry-point ranking on a new codebase before committing a full run.
+    #[arg(long = "list-targets")]
+    pub list_targets: bool,
+
+    /// Plan only: discover + rank targets, run the toolchain preflight, and report the
+    /// build-recovery plan, then EXIT without building or fuzzing. Validate scope,
+    /// config, and toolchains before committing to a long run.
+    #[arg(long = "dry-run")]
+    pub dry_run: bool,
+
+    /// Extra directory NAMES to skip during discovery, on top of the built-in
+    /// defaults (tests/examples/benchmarks/vendored deps/docs). Matched on the
+    /// exact path component, case-insensitively. Repeatable. Use it when a project
+    /// keeps non-library code under an unusual dir name.
+    #[arg(long = "exclude-dir", value_name = "NAME")]
+    pub exclude_dir: Vec<String>,
+
+    /// Directory NAMES to KEEP in discovery even though a built-in default would
+    /// skip them — e.g. `--include-dir samples` for a project whose real fuzzable
+    /// code lives under `samples/`. Repeatable; overrides the default exclusions.
+    #[arg(long = "include-dir", value_name = "NAME")]
+    pub include_dir: Vec<String>,
+
+    /// Restrict the sweep to a comma-separated subset of the sixteen source
+    /// languages listed under "possible values" below. Candidates in any other
+    /// language are dropped after discovery — before the build/fuzz sweep and
+    /// before `--list-targets`, so the ranked list reflects the filter too.
+    /// Common spellings are accepted (`c++`/`cxx`/`cc`→cpp, `rs`→rust,
+    /// `py`→python, `pl`→perl, `golang`→go); matching is case-insensitive.
+    /// Unset (default) = fuzz every language bhf can build in the tree. The
+    /// SBOM/SCA pass is unaffected — it always scans the whole tree across all
+    /// ecosystems regardless of this fuzzing-lane filter.
+    #[arg(
+        long = "languages",
+        visible_alias = "lang",
+        value_enum,
+        value_delimiter = ',',
+        ignore_case = true,
+        value_name = "LIST"
+    )]
+    pub languages: Vec<crate::auto::candidate::LangSelector>,
+
+    /// Run the CPP-lite preprocessor over C/C++ before parsing for discovery
+    /// (§27.6): resolve `#ifdef`/`#if` branches and expand object-like macros so a
+    /// function compiled out under the active config is not discovered, with a
+    /// preprocessed->original line map keeping reported locations accurate.
+    /// `auto` (default) preprocesses only files with heavy conditional compilation;
+    /// `always` forces it on every C/C++ file; `never` parses raw source.
+    #[arg(
+        long = "preprocess",
+        value_enum,
+        default_value = "auto",
+        value_name = "MODE"
+    )]
+    pub preprocess: crate::auto::discovery::PreprocessMode,
+
+    /// After the sweep, attempt to fetch the still-blocking dependencies from the
+    /// manifest using whatever package managers are present (apt-get for known
+    /// headers/libs, `alr get` for Ada units). Opt-in and ONLINE — the only part
+    /// of `auto` that touches the network. Nothing is fatal: a manager that's
+    /// absent or fails (no root for apt, offline, unknown package) is reported
+    /// with the command to run by hand. Re-run `auto` afterward to build against
+    /// the installed dependencies. Pairs well with `--deps-only` for a fast
+    /// scan-then-fetch.
+    #[arg(long = "install-deps")]
+    pub install_deps: bool,
+
+    /// Consent gate for running the project's own (untrusted) build/codegen to
+    /// materialize generated dependencies before harnessing — the umbrella for
+    /// `--probe-build` (CMake/Make configure+codegen) plus an Ada build probe
+    /// (`alr build` / `gprbuild`) that generates Alire config + codegen outputs.
+    /// Implies `--probe-build`. EXECUTES untrusted scripts; runs under bhf's
+    /// sandbox (bwrap/firejail) when one is available, degrading to a direct run
+    /// otherwise. Off by default — without it, bhf stubs generated deps and
+    /// records them in the manifest instead of running anything.
+    #[arg(long = "run-untrusted")]
+    pub run_untrusted: bool,
+
+    /// Recover compile flags from a CUSTOM build by running this exact command
+    /// (e.g. `--build-command ./build.sh`, `--build-command "bazel build //lib"`,
+    /// `--build-command scons`) under a compiler-intercepting shim: every
+    /// `cc`/`gcc`/`clang` — and named vendor compilers (Wind River Diab,
+    /// Green Hills, QNX, Keil/IAR, TI) plus cross-prefixed GNU/LLVM toolchains —
+    /// is logged into a `compile_commands.json`. The universal escape hatch for
+    /// build systems bhf doesn't natively probe (Bazel, SCons, Waf, a bare
+    /// `build.sh`, a vendor RTOS build). EXECUTES the command (via `sh -c`) and
+    /// runs under bhf's sandbox when one is available. Implies the build
+    /// probe; takes precedence over the auto-detected CMake/Meson/Make tier.
+    #[arg(long = "build-command", value_name = "CMD")]
+    pub build_command: Option<String>,
+
+    /// UNSAFE: search the tree for its own build entry point and EXECUTE it to recover
+    /// compile flags — the auto-run bhf otherwise gates behind explicit consent
+    /// (see `--build-command`). Detects a custom build (build.sh, autotools
+    /// bootstrap/autogen/configure, SCons, Waf, Bazel) and runs it under the
+    /// compiler-intercepting shim, and enables the `--probe-build` tiers
+    /// (CMake/Meson/Make) plus the Ada build probe. Runs under bhf's sandbox when
+    /// one is available, but you are running UNTRUSTED code from the scanned tree —
+    /// only use it on sources you trust. An explicit `--build-command` overrides the
+    /// search.
+    #[arg(long = "unsafe-search-and-run-build-commands")]
+    pub unsafe_search_and_run_build_commands: bool,
+
+    /// Extra include directories for C/C++ harness builds. Point at dependency
+    /// headers that live outside the swept tree — e.g. cFE's OSAL/PSP includes,
+    /// a vendored SDK's `include/` — so real struct layouts and typedefs compile
+    /// in. Seeded onto every harness `-I` path before the repair loop (so real
+    /// headers win over synthesized placeholders) and folded into cross-dir
+    /// header resolution. Read from local disk only; nothing is fetched.
+    /// Repeatable.
+    #[arg(long = "extra-include", value_name = "DIR")]
+    pub extra_includes: Vec<PathBuf>,
+
+    /// Additional C/C++ source files (`.c`/`.cpp`) to compile and link into the
+    /// harness. Use this for a multi-file library whose target function's
+    /// dependencies live in sibling translation units the auto-linker would
+    /// otherwise blind-stub (e.g. libACPI's `AMLParserProcessBuffer` calling
+    /// across `AMLRouter.c`/`AMLName.c`/…): pass the real sources so the symbols
+    /// resolve and nothing is stubbed. Read from local disk only; nothing is
+    /// fetched. Repeatable.
+    #[arg(long = "extra-source", value_name = "FILE")]
+    pub extra_sources: Vec<PathBuf>,
+
+    /// Enable laf-intel comparison-progress coverage (#421): the C/C++ driver
+    /// records, per compare site, how many LEADING bytes of each comparison an
+    /// input matched, and the engine rewards an input that matches more — a
+    /// gradient that defeats multi-byte magic / format gates (bzip2/lz4/libpng/
+    /// expat) which a whole-compare edge gives no signal on. Opt-in; composes
+    /// with cmplog, value-profile, ASan, and the #420 hit-count buckets.
+    #[arg(long = "comparison-progress", alias = "cmp-progress")]
+    pub comparison_progress: bool,
+
+    /// Sanitizer matrix to arm for the harnesses `auto` BUILDS and RUNS,
+    /// comma-separated (asan, ubsan, msan, tsan, lsan). Each C/C++ harness is
+    /// compiled+linked with exactly the requested `-fsanitize=` set (plus the
+    /// engine's coverage instrumentation) instead of the default `address,undefined`,
+    /// and every fuzz pass runs with the matching `<SAN>_OPTIONS`
+    /// (`abort_on_error=1:halt_on_error=1:detect_leaks=1`) so UBSan/LSan reports
+    /// become crashes the engine saves instead of silently-printed warnings — the
+    /// same arming `bhf fuzz --sanitizers` does, now for the auto pipeline.
+    /// Default (empty) leaves the build and run env unchanged. Compatible set is
+    /// `asan,ubsan,lsan`; `msan`/`tsan` are mutually exclusive with those and each
+    /// other. The special value `none` (standalone — not combinable with a
+    /// sanitizer) builds each native C/C++ harness with coverage but NO
+    /// `-fsanitize=`, i.e. crash-only fuzzing with zero ASan/UBSan false positives
+    /// — the escape hatch for shared-memory / custom-allocator / RTOS code that
+    /// FP-storms under ASan. This matrix controls native C/C++ only; every other
+    /// language lane owns its coverage/error instrumentation, and cross-compiled
+    /// qemu-user/wine paths omit host sanitizers.
+    ///
+    /// To tame (rather than disable) the FP storm, export the sanitizer's own
+    /// options before running — bhf MERGES your inherited `<SAN>_OPTIONS` and
+    /// keeps its required keys last, e.g.
+    /// `ASAN_OPTIONS=verify_asan_link_order=0:detect_container_overflow=0:suppressions=$PWD/asan.supp`
+    /// and `LSAN_OPTIONS=suppressions=$PWD/lsan.supp` (#435).
+    #[arg(long = "sanitizers", value_delimiter = ',')]
+    pub sanitizers: Vec<String>,
+
+    /// Emit an evidence-graded SBOM + VEX bundle at campaign end, into
+    /// `<work-dir>/sbom/`. The bundle is generated where `FuzzReached` evidence is
+    /// freshest: the scanned tree's components are enriched with the campaign's
+    /// own `auto/run.json` (and any produced binary inventories), so libraries a
+    /// harness actually drove are marked exercised. Off by default to keep `auto`
+    /// fast — turn it on for a supply-chain deliverable. Writes all artifacts
+    /// (sbom.json, cyclonedx.json, vulnerabilities.json, openvex.json, sbom.csv);
+    /// use the standalone `bhf sbom` for finer `--emit`/`--ecosystems` control.
+    #[arg(long = "sbom")]
+    pub sbom: bool,
+
+    /// Always run the static analyzer over the whole scanned tree, IN ADDITION to
+    /// fuzzing — not only when a target can't be built/fuzzed. Its findings
+    /// (classification `static_scan`) are merged into the unified report next to
+    /// the fuzz findings, so a target that built+fuzzed still gets static coverage
+    /// and files with no fuzzable subprogram are analyzed too. Same engine as the
+    /// standalone `bhf static-scan`.
+    #[arg(long = "static")]
+    pub static_scan: bool,
+
+    /// Also drive installed EXTERNAL static analyzers (gosec/Bandit/semgrep/
+    /// GNATcheck) as subprocesses and merge their findings into the report (so the
+    /// fuzz-confirmation join confirms them too). Each tool runs only if the active
+    /// license profile permits its subprocess — `strict-permissive` runs none, so
+    /// the default profile never invokes a GPL tool. Missing tools are skipped.
+    /// Implies `--static`.
+    #[arg(long = "external-tools")]
+    pub external_tools: bool,
+
+    /// Force-fuzz mode: a SECOND phase over the targets the normal (unforced) run
+    /// could not fuzz, so it can never lower the fuzzed count. Attempts a target
+    /// even when a parameter type can't be driven or a type/symbol is undefined —
+    /// synthesize a best-effort driver, stub whatever the compiler reports missing,
+    /// and never hard-fail (report-only is the floor). C/C++/Ada fabricate the
+    /// parameter and stub the missing symbol; Go drives an undrivable parameter as
+    /// its type's zero value and calls a method on a zero receiver; C# allocates a
+    /// receiver whose type has no accessible parameterless constructor without
+    /// running one. Findings from a forced/stub-heavy build are stamped
+    /// low-confidence with a caveat note — a fabricated value can crash on its own
+    /// account. Repair persistence honors `--max-repair-rounds`.
+    #[arg(long = "force", visible_alias = "force-fuzz")]
+    pub force: bool,
+
+    /// Two-compiler differential fuzzing (C/C++). Format `A:B`, e.g. `clang:gcc`:
+    /// after the normal run, rebuild each C/C++ harness under both compilers via a
+    /// portable build and replay the fuzz corpus through both, flagging any input
+    /// on which their exit/crash behavior diverges (a codegen- or UB-dependent bug
+    /// one compiler exposes and the other hides) as a BHF-301 finding.
+    #[arg(long, value_name = "A:B")]
+    pub differential: Option<String>,
+
+    /// Write an accurate per-language SLOC breakdown (LANGUAGE, FILES, TOTAL,
+    /// COMMENTS, BLANKS, SLOC) of the source tree, then continue the normal run. A
+    /// relative path lands beside the other run outputs in `<work-dir>/auto/`; an
+    /// absolute path is written as given. A `.json` extension emits JSON; anything
+    /// else emits an aligned text table. Uses the scanner's dependency/build-tree
+    /// pruning and language-aware comment stripping.
+    #[arg(long)]
+    pub sloc: Option<PathBuf>,
+
+    /// Run in static-dynamic mode: add a `scan_type` column to findings.csv
+    /// (`static-dynamic` for static-scan results, `dynamic` for fuzzed results).
+    #[arg(long = "static-dynamic")]
+    pub static_dynamic: bool,
+
+    /// Configurable C/C++ decoder synthesis caps (§27.11): `--max-decode-depth`,
+    /// `--max-array-elems`, `--max-decl-bytes` (C) and `--container-size-max`,
+    /// `--bitset-max-size`, `--array-max-size` (C++). Each unset flag keeps the
+    /// historical default, so omitting them all leaves harness emission unchanged.
+    #[command(flatten)]
+    pub decoder_limits: crate::generate_harness::DecoderLimitArgs,
+}
+
+/// Load user seed inputs: each `--seed-file`'s bytes, plus each regular file in
+/// every `--seed-dir`. Unreadable entries are warned and skipped (best-effort —
+/// a missing seed shouldn't abort the sweep).
+///
+/// Seeds are bounded to the run's explicit maximum, or to the adaptive auto
+/// mode's 1 MiB soft ceiling. The previous unconditional 4 KiB prefix corrupted
+/// otherwise-valid archives whose index/trailer lives at EOF (ZIP and related
+/// formats), defeating the entire point of mining expert test corpora. The
+/// engine presents only its current adaptive-length prefix to the mutator, so
+/// preserving a larger initial sample does not clone multi-megabyte inputs on
+/// every mutation. The cap still prevents one huge sample from collapsing a run.
+fn load_seed_inputs(seed_files: &[PathBuf], seed_dirs: &[PathBuf], cap: usize) -> Vec<Vec<u8>> {
+    let cap = cap.max(1);
+    let corpus_entry_limit = crate::fuzz::corpus_limits(cap).entries;
+    let mut seeds = Vec::new();
+    let mut dropped = 0usize;
+    let mut push_path = |path: &std::path::Path| {
+        if seeds.len() >= corpus_entry_limit {
+            dropped += 1;
+            return;
+        }
+        match crate::fuzz::read_seed_file_prefix(path, cap) {
+            Ok((bytes, original_len)) => {
+                if original_len > bytes.len() as u64 {
+                    bhfeprintln!(
+                        "bhf auto: seed '{}' is {original_len} bytes; using its first \
+                         {cap} bytes (bytes past the mutator seed cap only consume RAM)",
+                        path.display()
+                    );
+                }
+                seeds.push(bytes);
+            }
+            Err(error) => {
+                bhfeprintln!("bhf auto: skipping seed file '{}': {error}", path.display())
+            }
+        }
+    };
+    for file in seed_files {
+        push_path(file);
+    }
+    for dir in seed_dirs {
+        match std::fs::read_dir(dir) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() {
+                        push_path(&path);
+                    }
+                }
+            }
+            Err(error) => bhfeprintln!("bhf auto: skipping seed dir '{}': {error}", dir.display()),
+        }
+    }
+    if dropped > 0 {
+        bhfeprintln!(
+            "bhf auto: seed corpus capped at {} entries; skipped {dropped} additional seed(s)",
+            corpus_entry_limit
+        );
+    }
+    seeds
+}
+
+fn sanitizer_replay_enabled(
+    selection: &multicore_fuzz::SanitizerSelection,
+    sanitizer: multicore_fuzz::Sanitizer,
+) -> bool {
+    match selection {
+        // Preserve the historical default matrix when the operator did not
+        // select a sanitizer policy explicitly.
+        multicore_fuzz::SanitizerSelection::Default => true,
+        multicore_fuzz::SanitizerSelection::None => false,
+        multicore_fuzz::SanitizerSelection::Set(selected) => selected.contains(&sanitizer),
+    }
+}
+
+pub fn run(args: AutoArgs) -> i32 {
+    if args.list_fakes {
+        print!("{}", crate::list_fakes::render());
+        return 0;
+    }
+    // The auto sweep owns the terminal with a live progress line; silence the
+    // per-harness "Generated ... harness at ..." banners so they don't interleave
+    // with the in-place progress line and garble it (e.g.
+    // "generating harnessGenerated C++ harness"). Harness dirs stay in the report.
+    crate::generate_harness::silence_generation_banner(true);
+    // Discovery is not billed to `--campaign-time` (indexing a large tree should
+    // not eat the fuzz budget), but when the caller HAS declared a budget,
+    // discovery honours it as its own ceiling rather than running unbounded and
+    // being killed by the caller's outer timeout with nothing fuzzed. Proton
+    // indexed for 447s against a declared 240s campaign and produced nothing.
+    //
+    // HALF the campaign budget, not all of it: the caller's outer timeout has to
+    // cover discovery AND the campaign AND reporting, so letting indexing take as
+    // long as the fuzzing it enables still overruns. Half leaves the majority of
+    // the wall clock for the work the user actually asked for.
+    crate::auto::discovery::set_time_budget(
+        args.campaign_time
+            .map(|secs| std::time::Duration::from_secs((secs / 2).max(30))),
+    );
+    // Top-level guard: an internal panic that escaped every per-target/per-file
+    // `bug_report::catch` would otherwise abort the process before write_reports
+    // runs, leaving no bug report. Catch it here — the panic hook already recorded
+    // and flushed the report to the run's work dir — and exit cleanly.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_inner(args))) {
+        Ok(Ok(code)) => code,
+        Ok(Err(error)) => {
+            bhfeprintln!("error: {error:#}");
+            1
+        }
+        Err(_panic) => {
+            let n = crate::auto::bug_report::flush_after_panic();
+            bhfeprintln!(
+                "bhf: run aborted by an internal panic — {n} issue(s) recorded in the bug \
+                 report (path printed above)."
+            );
+            2
+        }
+    }
+}
+
+/// Plan a SPLIT-mode campaign: divide a total fuzz budget `total` across `n`
+/// ranked targets with a per-target floor `min`. Returns
+/// `(per_target_budget, targets_to_run)`.
+///
+/// When the even share `total / n` is at least `min`, every target runs that
+/// share (all `n` attempted). Otherwise each attempted target runs exactly
+/// `min` and only the top `floor(total / min)` targets are attempted — the
+/// lower-ranked remainder is dropped (the caller logs it as unfuzzed). This is
+/// the `--campaign-time` + `--min-target-time` behavior: it never gives a target
+/// less than the floor, trading target COUNT for per-target depth.
+fn plan_campaign_split(
+    total: std::time::Duration,
+    min: std::time::Duration,
+    n: usize,
+) -> (std::time::Duration, usize) {
+    if n == 0 {
+        return (min, 0);
+    }
+    let even = total / n as u32;
+    if even >= min {
+        return (even, n);
+    }
+    // The floor binds: fit as many whole `min` slices as the total allows,
+    // capped at the target count. A zero floor would divide-by-zero, so treat
+    // it as "no floor" and run every target.
+    let fit = if min.is_zero() {
+        n
+    } else {
+        (total.as_secs_f64() / min.as_secs_f64()).floor() as usize
+    };
+    (min, fit.min(n))
+}
+
+/// On Windows, `Path::canonicalize` returns an extended-length `\\?\` (or
+/// `\\?\UNC\`) verbatim prefix. The `?` is a make/shell metacharacter bhf's
+/// build-safety check rejects, and verbatim paths confuse `make`/clang recipes,
+/// so strip the prefix back to an ordinary path. No-op off Windows. Applied to
+/// the sweep root + work dir so every derived source/include path stays clean.
+#[cfg(windows)]
+pub(crate) fn strip_verbatim_prefix(p: std::path::PathBuf) -> std::path::PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        std::path::PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        std::path::PathBuf::from(rest)
+    } else {
+        p
+    }
+}
+#[cfg(not(windows))]
+pub(crate) fn strip_verbatim_prefix(p: std::path::PathBuf) -> std::path::PathBuf {
+    p
+}
+
+/// The license profile for gating external-tool subprocesses under `--external-tools`,
+/// from `BHF_PROFILE` (`strict-permissive` | `external-tools` | `research-lab`).
+/// An explicit `BHF_PROFILE` wins; otherwise the `--external-tools` flag itself
+/// opts into the `external-tools` profile so the flag does something useful without a
+/// second env var — mirroring `static-scan`. This resolver is only consulted after the
+/// operator has already opted in via the flag, so the default strict-permissive posture
+/// still holds for every run that does not pass `--external-tools`.
+fn resolve_license_profile() -> config::Profile {
+    std::env::var("BHF_PROFILE")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(config::Profile::ExternalTools)
+}
+
+/// Detect a CUSTOM build entry point in the tree root that bhf does NOT auto-probe
+/// (a bare build.sh, autotools, SCons, Waf, Bazel), returning `(marker, suggested
+/// --build-command value)`. CMake/Make/Meson are intentionally excluded — those are
+/// already auto-probed. Returns the first match; used only to hint after a failed build.
+fn detect_custom_build(root: &Path) -> Option<(String, String)> {
+    const CANDIDATES: &[(&str, &str)] = &[
+        ("build.sh", "./build.sh"),
+        ("bootstrap.sh", "./bootstrap.sh && make"),
+        ("autogen.sh", "./autogen.sh && ./configure && make"),
+        ("configure", "./configure && make"),
+        ("SConstruct", "scons"),
+        ("wscript", "./waf configure build"),
+        ("WORKSPACE", "bazel build //..."),
+        ("WORKSPACE.bazel", "bazel build //..."),
+    ];
+    CANDIDATES
+        .iter()
+        .find(|(name, _)| root.join(name).is_file())
+        .map(|(name, cmd)| ((*name).to_owned(), (*cmd).to_owned()))
+}
+
+fn run_inner(mut args: AutoArgs) -> Result<i32> {
+    let _tstart = std::time::Instant::now();
+    let started_at = Utc::now().to_rfc3339();
+    let run_start = std::time::Instant::now();
+    let path = strip_verbatim_prefix(
+        args.path
+            .canonicalize()
+            .with_context(|| format!("canonicalize sweep root {}", args.path.display()))?,
+    );
+    // Create the work dir up front so canonicalize() succeeds whether
+    // the caller passed a fresh relative path or a pre-existing tree.
+    std::fs::create_dir_all(&args.work_dir)
+        .with_context(|| format!("create work dir {}", args.work_dir.display()))?;
+    let work = strip_verbatim_prefix(
+        args.work_dir
+            .canonicalize()
+            .unwrap_or(args.work_dir.clone()),
+    );
+    // Register the report dir NOW so an uncaught panic anywhere below (discovery,
+    // IDL/CORBA scaffolding, ranking, report) can still flush the bug report.
+    crate::auto::bug_report::set_output_dir(work.join("auto"));
+
+    // Establish a valid checkpoint before configuration, build probing, or
+    // discovery. Later passes replace it with progressively richer evidence.
+    // Even an early error or OOM therefore leaves a stable file and terminal
+    // path instead of no handoff artifact at all.
+    let empty_dependency_seed = crate::auto::dep_manifest::DependencyManifest::new();
+    crate::auto::report::write_dependency_checkpoint(&path, &work, &empty_dependency_seed, &[])?;
+    bhfeprintln!(
+        "bhf auto: checkpointing offline requirements to {}",
+        work.join("auto/missing-deps.txt").display()
+    );
+    let mut dependency_pointer_guard = DependencyPointerGuard::new(&work);
+
+    // Project config (--config <PATH>, or an auto-loaded .bhf.toml in the tree):
+    // fill options the CLI left at their default. Applied BEFORE the env-publish and
+    // build-recovery blocks below, which read the resulting args.
+    for note in crate::auto::config::apply(&mut args, &path).map_err(|e| anyhow::anyhow!("{e}"))? {
+        bhfeprintln!("bhf auto: {note}");
+    }
+    if args.max_corpus_mb == 0 {
+        anyhow::bail!("--max-corpus-mb must be at least 1");
+    }
+    let work_state = crate::auto::work_state::prepare(&work, args.resume)
+        .with_context(|| format!("prepare generated state under {}", work.display()))?;
+    bhfeprintln!("bhf auto: work-directory state: {work_state}");
+    // Repair work directories produced by older releases that retained one
+    // private Cargo target tree per Rust harness. This preserves result.json,
+    // generated source, findings, corpora, and the final replayable executable.
+    let compacted = crate::auto::storage::compact_build_caches(&work)
+        .with_context(|| format!("compact transient build caches under {}", work.display()))?;
+    if compacted.reclaimed_bytes() > 0 {
+        bhfeprintln!(
+            "bhf auto: reclaimed {} from {} stale Rust build cache(s); replay binaries and findings preserved",
+            crate::auto::storage::human_bytes(compacted.reclaimed_bytes()),
+            compacted.removed_paths,
+        );
+    }
+    crate::fuzz::set_auto_corpus_limit_mib(args.max_corpus_mb);
+    let output_budget = crate::auto::storage::WorkDirBudget::new(&work, args.max_work_dir_mb)
+        .with_context(|| format!("measure work directory {}", work.display()))?;
+    if output_budget.exhausted() {
+        bhfeprintln!(
+            "bhf auto: work directory is already {} (limit {}); no new targets will start. \
+             Use `bhf clean {} --compact`, raise --max-work-dir-mb, or pass 0 to disable the cap.",
+            crate::auto::storage::human_bytes(output_budget.last_bytes()),
+            crate::auto::storage::human_bytes(output_budget.max_bytes()),
+            work.display(),
+        );
+    }
+    if let Err(error) = crate::support_report::write_auto_context(&work, &args, work_state) {
+        bhfeprintln!("warning: could not checkpoint privacy-safe support context: {error}");
+    }
+
+    // A `--grammar` applies to every target this run fuzzes. Validate it up front so a
+    // typo fails fast (not per-target), then publish it via BHF_GRAMMAR: the
+    // builtin engine's grammar load reads that env on the auto path, and multicore
+    // workers inherit it — no need to thread a path through every programmatic-run
+    // argument. Set before any worker thread/process spawns (edition 2021: safe).
+    if let Some(grammar) = &args.grammar_file {
+        crate::fuzz::load_grammar_for_run(Some(grammar)).map_err(|e| anyhow::anyhow!("{e}"))?;
+        std::env::set_var("BHF_GRAMMAR", grammar);
+    }
+
+    // --max-len / --timeout apply to every fuzzed target; publish via env for the
+    // builtin engine's programmatic path (multicore workers inherit it). Validate
+    // --max-len ("auto" or a positive integer) so a typo fails fast, not per-target.
+    {
+        let spec = args.max_len.trim();
+        if !spec.eq_ignore_ascii_case("auto")
+            && spec.parse::<usize>().ok().filter(|&v| v > 0).is_none()
+        {
+            anyhow::bail!("--max-len must be \"auto\" or a positive integer, got {spec:?}");
+        }
+        std::env::set_var("BHF_MAX_LEN", spec);
+    }
+    if let Some(timeout) = args.timeout {
+        std::env::set_var("BHF_EXEC_TIMEOUT", timeout.as_millis().to_string());
+    }
+    // --cxx-std pins the C++ dialect for every harness build (disabling the ladder).
+    // Validate the shape so a typo fails fast rather than every C++ build silently.
+    if let Some(std) = &args.cxx_std {
+        let s = std.trim();
+        if !(s.starts_with("c++") || s.starts_with("gnu++")) {
+            anyhow::bail!("--cxx-std must be a C++ standard like c++14 / gnu++03, got {s:?}");
+        }
+        std::env::set_var("BHF_CXX_STD", s);
+    }
+
+    // Parse once before the optional project build. Probe-built archives must
+    // carry the exact same sanitizer/coverage contract as the harnesses that
+    // will link them; parsing this only after the probe produced stale/default
+    // artifacts for `--sanitizers none|msan|tsan|...`.
+    let sanitizers = crate::fuzz::parse_sanitizer_args(&args.sanitizers)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    match &sanitizers {
+        multicore_fuzz::SanitizerSelection::Set(_) => bhfeprintln!(
+            "bhf auto: arming sanitizer matrix [{}] on each C/C++ harness build + run",
+            args.sanitizers.join(", ")
+        ),
+        multicore_fuzz::SanitizerSelection::None => bhfeprintln!(
+            "bhf auto: --sanitizers none — building each C/C++ harness with coverage but \
+             no -fsanitize= (native crash-only, zero ASan/UBSan false positives)"
+        ),
+        multicore_fuzz::SanitizerSelection::Default => {}
+    }
+
+    // --unsafe-search-and-run-build-commands: the explicit opt-in to auto-executing the
+    // project's own build to recover flags (the auto-run 1c gates behind consent). Find
+    // a custom build script and route it through the `--build-command` path, and enable
+    // the probe tiers (CMake/Meson/Make + Ada) that also execute the build. An explicit
+    // `--build-command` still wins.
+    if args.unsafe_search_and_run_build_commands {
+        if args.build_command.is_none() {
+            if let Some((marker, cmd)) = detect_custom_build(&path) {
+                bhfeprintln!(
+                    "bhf auto: --unsafe-search-and-run-build-commands — found {marker}, \
+                     executing to recover build flags: {cmd}"
+                );
+                args.build_command = Some(cmd);
+            } else {
+                bhfeprintln!(
+                    "bhf auto: --unsafe-search-and-run-build-commands — no custom build \
+                     script found; probing recognized build systems (CMake/Meson/Make/Ada)"
+                );
+            }
+        }
+        // Consent for the probe tiers + Ada build probe, which also EXECUTE the build.
+        args.run_untrusted = true;
+    }
+
+    // Project-declared requirements are knowable without executing the build or
+    // discovering targets. Persist them before the untrusted probe so a killed
+    // probe cannot erase `.gitmodules`, Alire, or generated-output evidence.
+    let early_dependency_seed = crate::auto::requirements::scan(
+        &path,
+        &[],
+        &crate::auto::preflight::PreflightReport { lanes: Vec::new() },
+        &args.ada_deps,
+        &work,
+        false,
+    );
+    crate::auto::report::write_dependency_checkpoint(&path, &work, &early_dependency_seed, &[])?;
+    let probe_requested = args.probe_build || args.run_untrusted || args.build_command.is_some();
+
+    // --sloc: write a per-language SLOC breakdown of the source tree up front,
+    // independent of build/fuzz outcomes. A failure here shouldn't abort the run.
+    // A relative path lands beside the other run outputs in `<work>/auto/`, not the
+    // caller's CWD; an absolute path is honored as given.
+    if let Some(sloc_path) = &args.sloc {
+        let resolved = if sloc_path.is_absolute() {
+            sloc_path.clone()
+        } else {
+            work.join("auto").join(sloc_path)
+        };
+        let _ = crate::static_scan::write_sloc_report(&path, &resolved);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    bhfeprintln!(
+        "bhf auto: runtime audit is Linux-only; running on this OS without \
+         LD_PRELOAD hooks. Build-time stubbing remains active."
+    );
+
+    // `--run-untrusted` is the umbrella consent gate: it implies `--probe-build`
+    // (CMake/Make) and additionally runs an Ada build probe (alr/gprbuild).
+    // `--build-command` is its own trigger: an explicit command to intercept.
+    if probe_requested {
+        let sandbox = crate::auto::build_probe::resolve_sandbox_program();
+        bhfeprintln!(
+            "bhf auto: running the project's build offline{} to recover compile flags / generated files",
+            match &sandbox {
+                Some(program) => format!(" under {}", program.display()),
+                None => " (no sandbox found; direct run)".to_owned(),
+            }
+        );
+        // An explicit `--build-command` takes precedence over the auto-detected
+        // tier: it intercepts compilers from whatever build the user names.
+        let recovered = if let Some(command) = &args.build_command {
+            bhfeprintln!(
+                "bhf auto: --build-command: intercepting `{command}` to recover compile flags"
+            );
+            crate::auto::build_probe::probe_build_command(
+                &path,
+                command,
+                sandbox.as_deref(),
+                &sanitizers,
+            )
+        } else {
+            crate::auto::build_probe::probe_build(&path, sandbox.as_deref(), &sanitizers)
+        };
+        match recovered {
+            Some(db) => bhfeprintln!("bhf auto: recovered compile database at {}", db.display()),
+            None => bhfeprintln!(
+                "bhf auto: no compile database produced; continuing with include auto-detection"
+            ),
+        }
+        // The Ada side: alr/gprbuild generate the Alire config package + any
+        // gpr-declared codegen. Only under --run-untrusted (executes the
+        // project's build); degrades gracefully when no Ada project or toolchain.
+        if args.run_untrusted {
+            crate::auto::build_probe::probe_ada_build(&path, sandbox.as_deref());
+        }
+    }
+
+    // A build probe can produce exact missing-package/tool diagnostics and can
+    // also satisfy generated-output declarations. Refresh and checkpoint both
+    // facts immediately, before discovery creates another OOM/interrupt window.
+    let project_dependency_seed = if probe_requested {
+        crate::auto::requirements::scan(
+            &path,
+            &[],
+            &crate::auto::preflight::PreflightReport { lanes: Vec::new() },
+            &args.ada_deps,
+            &work,
+            true,
+        )
+    } else {
+        early_dependency_seed.clone()
+    };
+    crate::auto::report::write_dependency_checkpoint(&path, &work, &project_dependency_seed, &[])?;
+
+    // Auto-generate CORBA/IDL scaffolding from any `.idl` files in the tree so an
+    // Ada CORBA project's harnesses build without a manual `fake-corba` step.
+    // bhf's own IDL parser — executes no project code — so it runs by default.
+    let idl_mapped = crate::fake_corba::auto_generate_from_tree(&path, &work, args.force);
+    if idl_mapped > 0 {
+        bhfeprintln!(
+            "bhf auto: generated CORBA scaffolding from {idl_mapped} in-tree .idl file(s)"
+        );
+    }
+
+    let vcs_recovery = crate::auto::vcs_recovery::materialize_deleted_tracked_files(&path, &work);
+    if let Some(recovery) = &vcs_recovery {
+        bhfeprintln!(
+            "bhf auto: recovered {} deleted tracked dependency file(s) from local Git HEAD into isolated work dir {}",
+            recovery.relative_paths.len(),
+            recovery.root.display()
+        );
+    }
+
+    // The console is created here, before the longest silent phase of the run, so
+    // discovery can show a clock; the sweep's dashboard reuses it later.
+    let console = std::sync::Arc::new(crate::auto::dashboard::Console::new());
+    // From here on every `bhfeprintln!` in the process — including the fuzz
+    // engine's and the build probes' — writes through this console, so nothing
+    // can land inside the sticky block.
+    crate::auto::dashboard::set_active(console.clone());
+    console.println(&format!(
+        "bhf auto: discovering targets under {}",
+        path.display()
+    ));
+    let discovery_ticker =
+        crate::auto::dashboard::PhaseTicker::start(console.clone(), "  discovering targets");
+    let dir_filter =
+        DirFilter::new(&args.exclude_dir, &args.include_dir).with_work_dir(&args.work_dir);
+    // Discovery caching is ON by default; `--no-discovery-cache` opts out and
+    // `--fresh-discovery` forces a re-discovery + cache rewrite. `--reuse-discovery`
+    // is a deprecated no-op (the behavior it enabled is now the default).
+    let _ = args.reuse_discovery;
+    let (mut candidates, discovery_cache_hit, source_unchanged) = discover_or_reuse(
+        &path,
+        &dir_filter,
+        &work,
+        !args.no_discovery_cache,
+        args.fresh_discovery,
+        args.discovery_cache.as_deref(),
+        args.preprocess,
+    )?;
+    if let Err(error) =
+        crate::support_report::checkpoint_discovery_cache_hit(&work, discovery_cache_hit)
+    {
+        bhfeprintln!("warning: could not checkpoint discovery-cache decision: {error}");
+    }
+    if !args.exclude_paths.is_empty() || !args.exclude.is_empty() {
+        candidates.retain(|candidate| {
+            !path_matches_exclusion(
+                &candidate.source_path,
+                &path,
+                &args.exclude_paths,
+                &args.exclude,
+            )
+        });
+    }
+    if !args.targets.is_empty() {
+        candidates.retain(|candidate| {
+            let case_insensitive =
+                matches!(candidate.lang, Lang::Ada | Lang::Fortran | Lang::Cobol);
+            args.targets.iter().any(|selected| {
+                target_name_filter_matches(&candidate.name, selected, case_insensitive)
+            })
+        });
+    }
+    if !args.harness_ids.is_empty() {
+        let selected: std::collections::HashSet<&str> =
+            args.harness_ids.iter().map(String::as_str).collect();
+        candidates.retain(|candidate| selected.contains(candidate.harness_id.as_str()));
+    }
+    if !args.target_files.is_empty() {
+        let selected: std::collections::HashSet<PathBuf> = args
+            .target_files
+            .iter()
+            .map(|target_file| normalize_target_file_filter(&path, target_file))
+            .collect();
+        candidates.retain(|candidate| {
+            let candidate_path = candidate
+                .source_path
+                .canonicalize()
+                .unwrap_or_else(|_| candidate.source_path.clone());
+            selected.contains(&candidate_path)
+        });
+    }
+    // Language filter (`--languages`): keep only the requested source-language
+    // lanes. Applied AFTER discovery (which is language-agnostic, so one
+    // discovery cache serves every language subset) and BEFORE `--list-targets`
+    // and any `--max-targets` truncation, so the ranked list and the top-N both
+    // reflect the filter. Empty = fuzz every language found.
+    if !args.languages.is_empty() {
+        let selected = selected_lang_set(&args.languages);
+        let (kept, dropped) = retain_languages(&mut candidates, &selected);
+        bhfeprintln!(
+            "  language filter [{}] kept {kept} candidate(s), dropped {dropped}",
+            render_selected_langs(&args.languages),
+        );
+    }
+    if args.mode == actionability::RunMode::Attacking {
+        sort_attacking_candidates(&mut candidates, |path| {
+            crate::source_text::read_source_text(path).unwrap_or_default()
+        });
+    }
+    // Discovery is done: stop the clock and give the line back before the
+    // candidate count is printed under it.
+    drop(discovery_ticker);
+    console.println(&format!("  discovered {} candidate(s)", candidates.len()));
+    // #102: if any files were dropped during discovery (read/decode/parse
+    // failures), say so on the console — bounded and grouped — so a parser
+    // regression on a large tree is visible immediately, not just in run.json.
+    {
+        let drops: Vec<_> = crate::auto::bug_report::snapshot()
+            .into_iter()
+            .filter(|i| i.category == crate::auto::bug_report::IssueCategory::DiscoveryDiagnostic)
+            .collect();
+        if !drops.is_empty() {
+            let total: usize = drops.iter().map(|i| i.occurrences).sum();
+            bhfeprintln!(
+                "  discovery: {total} file(s) dropped across {} read/parse failure class(es) \
+                 (see run.md Discovery Diagnostics)",
+                drops.len()
+            );
+            for i in drops.iter().take(5) {
+                bhfeprintln!("    - {} ({} file(s))", i.summary, i.occurrences);
+            }
+        }
+    }
+
+    // Toolchain preflight: which lanes are present and whether their toolchains exist,
+    // so a missing one is an explicit banner (not a silent skip that reads like a pass).
+    // Kept for the end-of-run triage.
+    let _tp = std::time::Instant::now();
+    crate::auto::discovery::bhfprof("auto:start_to_preflight", _tstart);
+    let preflight = crate::auto::preflight::run(&candidates);
+    crate::auto::discovery::bhfprof("auto:preflight", _tp);
+    bhfeprint!("{}", preflight.render());
+
+    // Seed and atomically persist the offline-requirements manifest before any
+    // target starts. If the parent is later OOM-killed, this declaration and
+    // toolchain analysis still survives; completed targets extend it below.
+    let mut dependency_seed = project_dependency_seed;
+    let _tr = std::time::Instant::now();
+    crate::auto::requirements::add_target_requirements(
+        &mut dependency_seed,
+        &candidates,
+        &preflight,
+    );
+    crate::auto::discovery::bhfprof("auto:requirements", _tr);
+    dependency_seed.mark_checkpoint(0, false);
+    let _tdc = std::time::Instant::now();
+    let mut dependency_checkpoint =
+        crate::auto::report::write_dependency_checkpoint(&path, &work, &dependency_seed, &[])?;
+    crate::auto::discovery::bhfprof("auto:dependency_checkpoint", _tdc);
+    let _tmid = std::time::Instant::now();
+
+    // Planning/listing modes have completed all the work they promised. Their
+    // requirement manifest used to retain `complete=false`, so even a clean
+    // `--list-targets` exit ended by claiming the checkpoint was "in progress".
+    if args.dry_run || args.list_targets {
+        // Finalize BEFORE writing potentially-piped stdout. If `head` has
+        // already closed the pipe, the BrokenPipe return below is still a clean,
+        // fully checkpointed exit.
+        crate::auto::report::finalize_dependency_checkpoint(&work, &mut dependency_checkpoint)?;
+    }
+
+    // --dry-run: show the plan (toolchains + ranked targets + build-recovery note) and
+    // exit without building or fuzzing, so a long run can be validated first.
+    // #94: the preview is bounded by --max-attempts (the actual inspection cap), NOT
+    // --max-targets — that is a runtime SUCCESS cap and viability is unknown at plan
+    // time, so the dry-run cannot know which of these will actually fuzz.
+    if args.dry_run {
+        let planned_count = capped_target_count(candidates.len(), args.max_attempts);
+        if planned_count < candidates.len() {
+            bhfeprintln!(
+                "bhf auto: --max-attempts {planned_count}: showing the top {planned_count} of {} ranked candidate(s) in the dry-run plan",
+                candidates.len()
+            );
+        }
+        if let Some(cap) = args.max_targets {
+            bhfeprintln!(
+                "bhf auto: --max-targets {cap}: the sweep will stop after {cap} of these reach the fuzz phase; which candidates are viable is unknown until build time (nonviable ones are backfilled)"
+            );
+        }
+        let planned_candidates = &candidates[..planned_count];
+        bhfeprintln!("\nbhf auto: --dry-run — plan only, nothing is built or fuzzed:");
+        if let Err(err) = print_ranked_targets(planned_candidates, &path) {
+            if err.kind() == std::io::ErrorKind::BrokenPipe {
+                finish_dependency_pointer(&work, &mut dependency_pointer_guard);
+                return Ok(0);
+            }
+            return Err(err.into());
+        }
+        if let Some((marker, cmd)) = detect_custom_build(&path) {
+            bhfeprintln!(
+                "  build recovery: this tree has its own build ({marker}); \
+                 pass --build-command {cmd:?} (or --unsafe-search-and-run-build-commands) if targets fail to build"
+            );
+        }
+        bhfeprintln!(
+            "  would fuzz {} target(s){}",
+            planned_candidates.len(),
+            if preflight.any_missing() {
+                " — but some toolchains are MISSING (see above); those lanes won't build"
+            } else {
+                ""
+            }
+        );
+        finish_dependency_pointer(&work, &mut dependency_pointer_guard);
+        return Ok(0);
+    }
+
+    if args.list_targets {
+        if let Err(err) = print_ranked_targets(&candidates, &path) {
+            // `bhf auto --list-targets | head` is an ordinary CLI workflow.
+            // Rust ignores SIGPIPE, and `println!` turns EPIPE into a panic; that
+            // used to emit a bogus internal-bug report after `head` closed the
+            // pipe. Treat the downstream consumer being done as clean success.
+            if err.kind() == std::io::ErrorKind::BrokenPipe {
+                finish_dependency_pointer(&work, &mut dependency_pointer_guard);
+                return Ok(0);
+            }
+            return Err(err.into());
+        }
+        finish_dependency_pointer(&work, &mut dependency_pointer_guard);
+        return Ok(0);
+    }
+    if candidates.is_empty() {
+        // --static is a whole-tree scan independent of fuzzable targets, so it
+        // must run even when discovery finds nothing to fuzz (config files,
+        // non-fuzzable code, an unbuildable tree still deserve static coverage).
+        if args.static_scan {
+            let n = crate::auto::report_only::emit_tree_static_findings(&path, &work);
+            bhfeprintln!(
+                "bhf auto: --static — static scan wrote {n} finding(s) (no fuzzable targets discovered)"
+            );
+        }
+        let finished_at = Utc::now().to_rfc3339();
+        write_reports(
+            &path,
+            &[],
+            &work,
+            &started_at,
+            &finished_at,
+            false,
+            args.mode,
+            0,
+            0,
+            args.static_dynamic,
+            args.force,
+            false,
+        )?;
+        // A --static scan that produced findings is a successful run (0), not the
+        // "nothing to do" code (2).
+        let had_static =
+            args.static_scan && !crate::auto::report::tree_static_finding_ids(&work).is_empty();
+        return Ok(if had_static { 0 } else { 2 });
+    }
+
+    // Resolve cross-dir headers from the whole project (nearest `.git` ancestor)
+    // even on a subdir run, so a `MissingHeader` finds the real header (PX4
+    // `lib/perf/perf_counter.h`). The header-path walk is parse-free; type/symbol
+    // parsing stays scoped to `path`, and discovery/attempts below stay scoped.
+    let header_root = crate::auto::decl_index::project_index_root(&path);
+    if header_root != path {
+        bhfeprintln!(
+            "bhf auto: resolving cross-dir headers from project root {}",
+            header_root.display()
+        );
+    }
+    let _tix = std::time::Instant::now();
+    let mut idx = DeclarationIndex::build_indexed(&path, &header_root)?;
+    crate::auto::discovery::bhfprof("auto:decl_index", _tix);
+    if let Some(recovery) = &vcs_recovery {
+        idx.add_vcs_recovery_root(&recovery.root)?;
+    }
+    // Extra C/C++ include dirs (`--extra-include`): dependency headers outside
+    // the swept tree (OSAL/PSP for cFE, a vendored SDK include/). Fold them into
+    // the cross-dir header index so type modeling resolves the real defs, and
+    // forward them to the harness build path below. Read from disk only.
+    let extra_include_dirs: Vec<PathBuf> = args
+        .extra_includes
+        .iter()
+        .filter_map(|dir| dir.canonicalize().ok())
+        .collect();
+    if !extra_include_dirs.is_empty() {
+        idx.add_header_search_roots(&extra_include_dirs)?;
+        // Also index the DEFINITION sources (`.c`/`.cpp`) under those roots so an
+        // undefined target-library symbol (cJSON's `cJSON_Parse`) is resolved by
+        // AddSource-ing its real defining translation unit rather than a blind
+        // `void` stub that returns a garbage register and crashes the harness in
+        // `free(garbage)` (#388).
+        idx.add_definition_search_roots(&extra_include_dirs)?;
+        bhfeprintln!(
+            "bhf auto: {} extra C/C++ include dir(s) on the harness build path",
+            extra_include_dirs.len()
+        );
+    }
+    // Extra C/C++ source files (`--extra-source`): real translation units to
+    // compile+link so a multi-file library's cross-file symbols resolve instead
+    // of being blind-stubbed. Seeded into the build's extra_sources before the
+    // first attempt.
+    let extra_source_files: Vec<PathBuf> = args
+        .extra_sources
+        .iter()
+        .filter_map(|file| file.canonicalize().ok())
+        .collect();
+    if !extra_source_files.is_empty() {
+        bhfeprintln!(
+            "bhf auto: {} extra C/C++ source file(s) linked into the harness build",
+            extra_source_files.len()
+        );
+    }
+    // Dependency source on the Ada build path: explicit --ada-deps plus any
+    // Alire dependency crates already cached locally under the project. All
+    // read from local disk; nothing is fetched, so offline use is unchanged.
+    let mut ada_dep_dirs: Vec<PathBuf> = args
+        .ada_deps
+        .iter()
+        .filter_map(|dir| dir.canonicalize().ok())
+        .collect();
+    for cached in discover_local_alire_dep_dirs(&path) {
+        if !ada_dep_dirs.contains(&cached) {
+            ada_dep_dirs.push(cached);
+        }
+    }
+    // `build` already adds this directory as a Source_Dir.  Harness generation
+    // must analyze the same types and constructors, otherwise it rejects a
+    // CORBA parameter as undeclared before the build ever gets that far.
+    let fake_corba_dir = work.join("fake_corba");
+    if fake_corba_dir.is_dir() && !ada_dep_dirs.contains(&fake_corba_dir) {
+        ada_dep_dirs.push(fake_corba_dir);
+    }
+    if !ada_dep_dirs.is_empty() {
+        bhfeprintln!(
+            "bhf auto: {} local Ada dependency dir(s) on the build path",
+            ada_dep_dirs.len()
+        );
+    }
+    // Say so when the tree ships its own harnesses. They are excluded from being
+    // TARGETS for good reason, but their existence is the only expert baseline
+    // there is — and a coverage number is far more meaningful measured against
+    // what the project's own maintainers wrote than in isolation.
+    let expert_harnesses = crate::auto::discovery::existing_harness_sources(&path);
+    if !expert_harnesses.is_empty() {
+        bhfeprintln!(
+            "bhf auto: this tree ships {} of its own fuzz harness(es) (e.g. {}); \
+             they are excluded as targets, but they are the baseline this run's coverage \
+             can be compared against",
+            expert_harnesses.len(),
+            expert_harnesses
+                .first()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        );
+    }
+    let seed_cap = if args.max_len.trim().eq_ignore_ascii_case("auto") {
+        crate::fuzz::AUTO_SOFT_CEILING
+    } else {
+        args.max_len
+            .trim()
+            .parse::<usize>()
+            .unwrap_or(crate::fuzz::DEFAULT_MAX_LEN)
+    };
+    let mut user_seeds = load_seed_inputs(&args.seed_files, &args.seed_dirs, seed_cap);
+    if !user_seeds.is_empty() {
+        bhfeprintln!(
+            "bhf auto: {} user seed input(s) added to each target's corpus",
+            user_seeds.len()
+        );
+    }
+    // No seeds given: harvest the project's own test-data files. A parser
+    // reached through random bytes spends its budget bouncing off the header
+    // check, while the same harness given one real archive or document starts
+    // INSIDE the format. Projects already ship those files next to their tests;
+    // bhf used to walk straight past them. Explicit `--seed-*` wins, so this
+    // can never override what an operator asked for.
+    if user_seeds.is_empty() {
+        let mined = crate::auto::recipe_mining::mine_seed_corpus(&path);
+        if !mined.is_empty() {
+            let mined_seeds = load_seed_inputs(&mined, &[], seed_cap);
+            if !mined_seeds.is_empty() {
+                bhfeprintln!(
+                    "bhf auto: {} seed input(s) mined from the tree's own test data \
+                     (pass --seed-dir to override)",
+                    mined_seeds.len()
+                );
+                user_seeds = mined_seeds;
+            }
+        }
+    }
+    // Dependency-scan mode builds each target (stubbing as it goes) but runs no
+    // fuzz passes — an empty pass list makes `attempt` return `Built`, and the
+    // manifest is emitted as usual.
+    if args.deps_only {
+        bhfeprintln!(
+            "bhf auto: --deps-only — building each target to surface missing dependencies; fuzzing skipped"
+        );
+    }
+    let passes = if args.deps_only {
+        Vec::new()
+    } else {
+        resolve_passes(args.single_pass, args.passes.as_deref())?
+    };
+    // Time-flag clarity (#auto-scaling): when BOTH a per-target total and a
+    // per-pass budget are given, --total-time wins and --per-target-time is
+    // ignored. Operators have been bitten by silently getting total/passes per
+    // pass; say so loudly. (Heuristic for "explicitly set": per_target_time
+    // differs from its default of 60 — the field always carries a value.)
+    if let (false, Some(total)) = (args.deps_only, args.total_time) {
+        if args.per_target_time != 60 {
+            let pass_count = passes.len().max(1) as u64;
+            bhfeprintln!(
+                "bhf auto: WARNING: both --total-time ({total}s) and --per-target-time \
+                 ({}s) are set — --total-time WINS and --per-target-time is IGNORED. \
+                 --total-time is a PER-TARGET budget apportioned across {pass_count} pass(es), \
+                 so each pass gets total / passes ≈ {}s. Pass only one of the two to silence this.",
+                args.per_target_time,
+                total / pass_count,
+            );
+        }
+    }
+    if !args.deps_only && (args.single_pass || args.passes.is_some()) {
+        bhfeprintln!(
+            "bhf auto: fuzzing {} of 3 pass(es) per target [{}]",
+            passes.len(),
+            passes
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    // --jobs > 1: parallel sweep. Each concurrent fuzz uses up to --rss-limit-mb,
+    // so warn the operator that effective peak memory scales with the job count
+    // (a too-high value OOM-kills, e.g. inside a cgroup MemoryMax slice).
+    let jobs = args.jobs.max(1);
+    if jobs > 1 {
+        bhfeprintln!(
+            "bhf auto: running up to {jobs} candidate(s) concurrently (--jobs {jobs}, \
+             default: half the host's cores); child RSS allowance = jobs x rss-limit-mb = {} MB, \
+             plus parent/index/build/report overhead — size the total to the host, or pass \
+             `--jobs 1` for a serial sweep",
+            jobs.saturating_mul(args.rss_limit_mb)
+        );
+        if candidates
+            .iter()
+            .any(|candidate| candidate.lang == crate::auto::candidate::Lang::Ada)
+        {
+            bhfeprintln!(
+                "bhf auto: Ada targets share the staged source layout and will build \
+                 serially; non-Ada targets still use --jobs {jobs}"
+            );
+        }
+    }
+    // `--engine builtin|afl++[,…]`: the per-target fuzz-engine preference list.
+    // Parsed once; an unknown name aborts the sweep with a precise error. AFL is
+    // gated to C/C++ targets per-candidate inside the attempt loop.
+    let requested_engines = crate::fuzz::parse_engine_list(&args.engine)
+        .map_err(|error| anyhow::anyhow!("--engine: {error}"))?;
+    // Probe the AFL toolchain ONCE for the whole run; if AFL was requested but
+    // `afl-fuzz`/`afl-clang-fast` are missing, warn once and fall back to builtin
+    // rather than failing every C/C++ target's afl build (mirrors the GNAT-less
+    // skip convention).
+    let afl_requested = requested_engines.contains(&crate::fuzz::FuzzEngine::AflPlusPlus);
+    let afl_available = crate::auto::attempt::afl_toolchain_available();
+    let engines =
+        crate::auto::attempt::prune_engines_for_toolchain(&requested_engines, afl_available);
+    if afl_requested && !afl_available {
+        bhfeprintln!(
+            "bhf auto: --engine afl++ requested but afl-fuzz/afl-clang-fast not on PATH — \
+             falling back to the builtin engine for this run"
+        );
+    }
+    // #91: an explicit `--project` must exist and be a `.gpr`; a missing or wrong
+    // override is a loud error, never a silent fall-through to auto-selection.
+    if let Some(project) = args.project.as_deref() {
+        if !project.is_file() {
+            anyhow::bail!(
+                "--project {}: no such project file (expected an existing .gpr)",
+                project.display()
+            );
+        }
+        if !project
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("gpr"))
+        {
+            anyhow::bail!(
+                "--project {}: not a GNAT project file (expected a .gpr)",
+                project.display()
+            );
+        }
+    }
+
+    let mut options = AttemptOptions {
+        per_target_time: std::time::Duration::from_secs(args.per_target_time),
+        total_time: args.total_time.map(std::time::Duration::from_secs),
+        per_target_finding_count: args.per_target_finding_count,
+        no_stubs: args.no_stubs,
+        passes,
+        source_root: Some(path.clone()),
+        project: args.project.clone(),
+        ada_dep_dirs,
+        mode: args.mode,
+        user_seeds,
+        extra_include_dirs,
+        extra_sources: extra_source_files,
+        iterations: args.iterations,
+        rss_limit_mb: args.rss_limit_mb,
+        max_repair_rounds: args.max_repair_rounds,
+        comparison_progress: args.comparison_progress,
+        sanitizers,
+        dir_filter: dir_filter.clone(),
+        engines,
+        // Ada project-Main units (declared `for Main use (...)` in a .gpr under the
+        // tree) are program entry points, not library subprograms — the attempt
+        // loop pre-skips them with a precise reason instead of failing their build.
+        ada_main_sources: crate::auto::discovery::gpr_main_sources(&path, &dir_filter),
+        // §27.11: CLI-configured C/C++ decoder caps, threaded to harness gen.
+        decoder_limits: args.decoder_limits.clone(),
+        force: args.force,
+    };
+    // #6: the fully-ranked candidate count BEFORE any --max-targets / campaign
+    // split cap, so the report can surface how many targets the cap dropped from
+    // the sweep instead of silently reporting only the swept count.
+    let discovered_total = candidates.len();
+    // #94: `--max-targets` is a cap on SUCCESSFUL fuzzes, not a pre-truncation of
+    // candidates. Do NOT drop lower-ranked candidates here — the sweep attempts
+    // them in rank order and stops once `success_cap` targets fuzz, so a nonviable
+    // top prefix (unsupported params / build failures) no longer starves the viable
+    // endpoints below it. `--max-attempts` is the only pre-sweep truncation: a hard
+    // ceiling on candidates INSPECTED so backfill can't grind a whole legacy tree.
+    let success_cap = args.max_targets;
+    if let Some(cap) = args.max_attempts {
+        if candidates.len() > cap {
+            bhfeprintln!(
+                "bhf auto: --max-attempts {cap}: inspecting at most {cap} of {} ranked candidate(s)",
+                candidates.len()
+            );
+            candidates = cap_candidates_across_languages(candidates, cap);
+        }
+    }
+    if let Some(cap) = success_cap {
+        bhfeprintln!(
+            "bhf auto: --max-targets {cap}: stopping after {cap} target(s) reach the fuzz phase (backfilling past nonviable candidates)"
+        );
+    }
+
+    // --campaign-time + --min-target-time: SPLIT mode. Divide the campaign fuzz
+    // budget across the (post-`--max-targets`) ranked candidates with a per-target
+    // floor — each attempted target gets `max(min, campaign / N)` of fuzz time and
+    // only the top `floor(campaign / per_target)` targets are attempted; the rest
+    // are dropped (logged, never silent). The split budget OVERRIDES
+    // `--per-target-time`, and the wall-clock guillotine is disabled because the
+    // attempted-target count × per-target budget already bounds the run.
+    let split_mode = match (args.campaign_time, args.min_target_time) {
+        (Some(campaign), Some(min)) => {
+            let n = candidates.len();
+            let (per_target, keep) = plan_campaign_split(
+                std::time::Duration::from_secs(campaign),
+                std::time::Duration::from_secs(min),
+                n,
+            );
+            bhfeprintln!(
+                "bhf auto: --campaign-time {campaign}s split across {n} target(s) \
+                 (--min-target-time {min}s floor): {per_target_secs}s/target, attempting the \
+                 top {keep}, dropping {dropped} below the floor",
+                per_target_secs = per_target.as_secs(),
+                dropped = n.saturating_sub(keep),
+            );
+            candidates.truncate(keep);
+            options.per_target_time = per_target;
+            options.total_time = None; // the split budget IS the per-target total
+            true
+        }
+        _ => false,
+    };
+
+    // #101: build-context identity, distinct from the source identity the
+    // discovery cache tracks. Editing a GPR, compile_commands.json, an IDL, or a
+    // harness-affecting option (selected project, decoder limits, stubbing policy,
+    // engines/passes, sanitizer mode) changes how targets BUILD, so prior completed
+    // results must be re-attempted even when the source (and discovery cache) is
+    // unchanged. The prior run's fingerprint is read here; the current one is
+    // written back below for the next --resume. Old work dirs without the file are
+    // conservatively treated as changed (re-attempt).
+    // `force` is deliberately NOT part of this fingerprint. It used to be, which
+    // meant `--resume --force` after a plain campaign saw a "changed build
+    // context" and re-attempted EVERY target, including the ones that had already
+    // fuzzed — the opposite of resuming. Whether a prior result survives is now a
+    // per-target question that `resume_should_reattempt` answers with the
+    // outcome and the prior run's force setting, which is strictly more
+    // information than one global bit.
+    let build_knobs = format!(
+        "project={:?}|no_stubs={}|sanitizers={:?}|decoder_limits={:?}|passes={}|engines={:?}",
+        options.project,
+        options.no_stubs,
+        options.sanitizers,
+        options.decoder_limits,
+        options.passes.len(),
+        options.engines,
+    );
+    let current_build_fp = crate::auto::discovery::build_context_fingerprint(&path, &build_knobs);
+    let build_ctx_file = crate::auto::layout::reports_dir(&work).join("build-context.fingerprint");
+    let prior_build_fp = std::fs::read_to_string(&build_ctx_file)
+        .ok()
+        .map(|text| text.trim().to_owned());
+    let build_context_unchanged = prior_build_fp.as_deref() == Some(current_build_fp.as_str());
+
+    // `--resume`: when discovery hit the cache (target source unchanged) AND the
+    // build context is unchanged, the per-target results from a prior sweep over
+    // this work-dir are still valid, so RELOAD targets that already completed (so
+    // they are fully re-integrated into this run's report — outcome buckets, repair
+    // bags, findings, pass detail) and re-run only the rest. If the source or the
+    // build context changed, prior results may be stale, so re-attempt everything.
+    let mut resumed_results: Vec<crate::auto::attempt::AttemptResult> = Vec::new();
+    // Targets whose prior UNFORCED attempt did not fuzz, on a run that has
+    // `--force`. Their unforced answer is already known, so re-running phase 1 for
+    // them would buy nothing: they skip straight to the forced phase, carrying
+    // their prior result so it still stands if forcing fails too.
+    let mut force_upgrade: Vec<(
+        crate::auto::candidate::Candidate,
+        crate::auto::attempt::AttemptResult,
+    )> = Vec::new();
+    let source_identical = discovery_cache_hit || source_unchanged;
+    // A work dir written by a DIFFERENT bhf build: its records are still
+    // worth keeping, but only where they succeeded. Reusing an old
+    // `failed_build` would let a stale "no" cap what the new binary can reach —
+    // the same hazard the closure memo is careful about — so those are
+    // re-attempted while everything that actually fuzzed is kept.
+    let prior_state_incompatible =
+        work_state == crate::auto::work_state::WorkStateDisposition::IncompatibleMigration;
+    if args.resume && prior_state_incompatible {
+        bhfeprintln!(
+            "bhf auto: --resume: this work-dir was written by a different bhf build; \
+             keeping targets that already fuzzed and re-attempting the rest"
+        );
+    }
+    if args.resume && build_context_unchanged {
+        let changed = crate::auto::resume_scope::changed_file_count();
+        if !source_identical && changed > 0 {
+            bhfeprintln!(
+                "bhf auto: --resume: {changed} source file(s) changed since the last run; \
+                 reusing results only for targets whose own file is unchanged"
+            );
+        }
+        candidates.retain(|c| {
+            // Per FILE, not per tree: a target is only stale if ITS source moved.
+            if !crate::auto::resume_scope::file_unchanged(&c.source_path) {
+                return true;
+            }
+            match crate::auto::report::load_resumed_result(&work, &c.harness_id) {
+                Some((prior, prior_forced)) => {
+                    let prior_fuzzed = reached_fuzz(&prior.outcome);
+                    if (prior_state_incompatible && !prior_fuzzed)
+                        || resume_should_reattempt(prior_fuzzed, prior_forced, options.force)
+                    {
+                        if !prior_forced && options.force && !prior_fuzzed {
+                            // The force-upgrade case: phase 2 only.
+                            force_upgrade.push((c.clone(), prior));
+                            return false;
+                        }
+                        return true; // re-attempt from scratch (unforced)
+                    }
+                    resumed_results.push(prior);
+                    false // remove from the to-attempt set
+                }
+                None => true,
+            }
+        });
+        let upgrade_to_forced = force_upgrade.len();
+        if resumed_results.is_empty() {
+            bhfeprintln!("bhf auto: --resume: no completed targets to reload");
+        } else {
+            bhfeprintln!(
+                "bhf auto: --resume: reloaded {} completed target(s); re-running {} remaining",
+                resumed_results.len(),
+                candidates.len()
+            );
+        }
+        if upgrade_to_forced > 0 {
+            bhfeprintln!(
+                "bhf auto: --resume --force: keeping {} target(s) that already fuzzed and \
+                 forcing only the {upgrade_to_forced} that did not",
+                resumed_results.len()
+            );
+        }
+    } else if args.resume && !build_context_unchanged {
+        bhfeprintln!(
+            "bhf auto: --resume: build context changed (GPR / compile_commands.json / IDL / config / options); re-attempting all targets to avoid stale results"
+        );
+    }
+    // #101: record this run's build-context fingerprint so the next --resume can
+    // tell whether the build context changed.
+    let _ = std::fs::create_dir_all(crate::auto::layout::reports_dir(&work));
+    let _ = crate::auto::report::atomic_write(&build_ctx_file, current_build_fp.as_bytes());
+    let resumed = resumed_results.len();
+    // #94: a resumed target that already fuzzed counts toward the success cap (so a
+    // resumed run doesn't re-fuzz past the cap), while a resumed unsupported/failed
+    // result does NOT block backfill of fresh candidates below it.
+    let resumed_successes = resumed_results
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.outcome,
+                crate::auto::attempt::Outcome::BuiltAndFuzzed { .. }
+            )
+        })
+        .count();
+    // Recovered prior results are already durable individually. Fold them into
+    // the new run's manifest before any remaining target starts.
+    if !resumed_results.is_empty() {
+        dependency_checkpoint = crate::auto::report::write_dependency_checkpoint(
+            &path,
+            &work,
+            &dependency_seed,
+            &resumed_results,
+        )?;
+    }
+
+    // Directed fuzzing (--static): run the whole-tree static scan UP FRONT and fuzz
+    // the candidates whose file carries a flagged sink FIRST. Under a `--campaign-time`
+    // / `--max-targets` cap this steers the budget at the sites that can be
+    // fuzz-CONFIRMED, instead of discovering them only after the budget is spent.
+    // Stable partition, so rank order is preserved within the sink-bearing and the
+    // rest. The post-loop static emit is then skipped (already written).
+    let mut static_emitted = false;
+    if args.static_scan {
+        let n = crate::auto::report_only::emit_tree_static_findings(&path, &work);
+        bhfeprintln!("bhf auto: --static — static scan wrote {n} finding(s) into the report");
+        static_emitted = true;
+        let sink_files = crate::auto::confirm::static_finding_files(&work);
+        if !sink_files.is_empty() {
+            let directed = candidates
+                .iter()
+                .filter(|c| {
+                    c.source_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| sink_files.contains(&n.to_ascii_lowercase()))
+                })
+                .count();
+            candidates.sort_by_key(|c| {
+                let hit = c
+                    .source_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| sink_files.contains(&n.to_ascii_lowercase()));
+                u8::from(!hit) // sink-bearing (false -> 0) sorts first; stable within groups
+            });
+            if directed > 0 {
+                bhfeprintln!(
+                    "bhf auto: directed fuzzing — {directed} candidate(s) carrying a static-finding sink fuzzed first"
+                );
+            }
+        }
+    }
+
+    let live_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    // --campaign-time alone: a whole-run wall-clock guillotine measured from
+    // `run_start` — once exceeded, stop STARTING new candidates (the in-flight one
+    // finishes). In SPLIT mode the per-target budgets already bound the run, so the
+    // guillotine is disabled (build/repair overhead must not cut off targets the
+    // split intended to fuzz).
+    // Charged from HERE — the start of the sweep — not from process start.
+    // Discovery on a large tree (gnatstudio: 8606 Ada candidates) can outlast the
+    // whole budget, and billing it to the campaign made the run attempt zero
+    // targets and report "0 discovered" for a tree it had just indexed. The
+    // budget is a fuzzing budget, as in libFuzzer's `-max_total_time` and AFL's
+    // `-V`; indexing is not fuzzing.
+    let sweep_start = std::time::Instant::now();
+    let campaign_deadline = if split_mode {
+        None
+    } else {
+        args.campaign_time
+            .map(|secs| sweep_start + std::time::Duration::from_secs(secs))
+    };
+    // The deadline stops new targets from STARTING, but a build step carries its
+    // own 30-minute timeout, so one slow target could run minutes past a small
+    // budget — a `--campaign-time 150` sweep taking ten minutes. Bound every
+    // subprocess by the budget plus a grace margin, so the in-flight target gets
+    // a fair chance to finish and the run still ends near when it was asked to.
+    if let Some(deadline) = campaign_deadline {
+        crate::command_output::set_campaign_deadline(
+            deadline,
+            args.campaign_time.map(std::time::Duration::from_secs),
+        );
+    }
+    if std::env::var_os("BHF_PROFILE").is_some() {
+        bhfeprintln!(
+            "[prof] campaign_deadline in {:?} (split_mode={split_mode})",
+            campaign_deadline.map(|d| d.saturating_duration_since(std::time::Instant::now()))
+        );
+    }
+
+    // Live run status: the shared state behind the sticky progress block, the
+    // `--jobs` control, and the clean-stop key. Created before the first sweep so
+    // both phases write into one run-level picture.
+    // A live `+` may not oversubscribe the box: past core count, more concurrent
+    // compilers make the sweep slower AND multiply the RSS budget that already
+    // OOM-kills runs inside a cgroup slice.
+    let jobs_ceiling = num_cpus::get().max(jobs);
+    let status = std::sync::Arc::new(crate::auto::run_status::RunStatus::new(jobs, jobs_ceiling));
+    status.set_cap(success_cap);
+    status.set_deadline(campaign_deadline);
+    status.seed_resumed(resumed_successes);
+    status.set_rss_budget_mb(jobs.saturating_mul(args.rss_limit_mb));
+    status.set_per_target_time(options.per_target_time);
+    // A --campaign-time split divides the campaign across the targets it kept, so
+    // the per-target budget is derived, not chosen: the control refuses to fight it.
+    status.set_budget_locked(split_mode);
+    status.set_verbose(args.verbose);
+    status.set_force(options.force);
+    // The run plan, printed once before the first target. What `auto` is about to
+    // do was previously spread over a dozen conditional one-liners issued minutes
+    // apart, so the two facts that decide how long to wait — how many passes there
+    // will be, and what actually ends the run — were never on screen together.
+    console.println(&run_plan(
+        candidates.len(),
+        if options.force { 2 } else { 1 },
+        success_cap,
+        args.campaign_time,
+        jobs,
+        jobs_ceiling,
+    ));
+    // Keyboard control needs a controlling terminal; a piped or CI run gets
+    // neither the keys nor the raw-mode switch.
+    let controls =
+        crate::auto::controls::Controls::start(status.clone(), console.clone()).inspect(|_| {
+            // Deliberately short and pointed at `[?]`: the full legend is a
+            // permanent line of the block below, so repeating it here would
+            // scroll away a second copy of what is already always on screen.
+            console.println(
+                "bhf auto: live controls are on — the key legend is pinned below the run; press [?] for what each one does",
+            );
+        });
+    // Both of these bring the block on screen, so they come last — set earlier,
+    // every `println` above would redraw an empty run underneath the text that
+    // explains what the run is about to do.
+    console.set_block_provider({
+        let status = status.clone();
+        Box::new(move || {
+            let (cols, rows) = crate::auto::dashboard::terminal_size();
+            crate::auto::run_status::fit_block(
+                crate::auto::run_status::render_block(&status.snapshot(), cols),
+                rows,
+            )
+        })
+    });
+    let dashboard =
+        crate::auto::dashboard::Dashboard::start(status.clone(), console.clone(), args.verbose);
+
+    // One sweep of one candidate set under one set of options, dispatching serial
+    // vs parallel exactly as before. Factored out because `--force` now runs as a
+    // SECOND sweep over what the first could not fuzz, instead of changing how
+    // every attempt in a single sweep behaves. Measured over 126 projects, forcing
+    // from the start cost 13 fuzzed targets and gained one finding: a forced
+    // attempt costs ~36% more, so inside a fixed --campaign-time fewer candidates
+    // were attempted at all and viable targets were never reached.
+    let sweep_phase =
+        |candidates: Vec<crate::auto::candidate::Candidate>,
+         phase_options: &AttemptOptions,
+         already_fuzzed: usize,
+         dependency_checkpoint: &mut crate::auto::dep_manifest::DependencyManifest|
+         -> Result<Vec<crate::auto::attempt::AttemptResult>> {
+            let forced_phase = phase_options.force;
+            // Per-PHASE denominator. Using the whole run's candidate count made the
+            // forced phase print `[1/0]`, because phase 2 sweeps a different (and
+            // smaller) set — and on a resumed force run phase 1 sweeps nothing.
+            let total = candidates.len();
+            status.begin_phase(if forced_phase { 2 } else { 1 }, forced_phase, total);
+            // The pool runs a `--jobs 1` sweep exactly as the serial loop does —
+            // one permit, candidates handed out in rank order — but its
+            // concurrency is a live value rather than a spawn-time constant. The
+            // serial loop is kept only for a host that could never run a second
+            // worker, where the pool would add threads and buy nothing.
+            let results = if jobs_ceiling <= 1 {
+                // --jobs 1 (default): the historical serial sweep, byte-identical when no
+                // --campaign-time is set (the deadline check is a no-op while None).
+                let mut results = Vec::new();
+                // #94: count targets that reach the fuzz phase; stop once `success_cap` do,
+                // seeded with resumed successes so a resumed run honours the same cap.
+                let mut fuzz_successes = already_fuzzed;
+                for (i, candidate) in candidates.into_iter().enumerate() {
+                    if output_budget.exhausted() {
+                        console.println(&format!(
+                            "bhf auto: --max-work-dir-mb reached at {}; stopping after {} of {total} target(s) and writing the report",
+                            crate::auto::storage::human_bytes(output_budget.last_bytes()),
+                            results.len(),
+                        ));
+                        break;
+                    }
+                    // The operator pressed `q`: stop handing out candidates. Every
+                    // target completed so far is already persisted, and the run
+                    // continues into reporting rather than dying with the process.
+                    if status.quitting() {
+                        console.println(&format!(
+                            "bhf auto: stopped by operator after {} of {total} target(s) \
+                             ({fuzz_successes} fuzzed); writing the report",
+                            results.len()
+                        ));
+                        break;
+                    }
+                    if let Some(deadline) = campaign_deadline {
+                        if std::time::Instant::now() >= deadline {
+                            console.println(&format!(
+                        "bhf auto: --campaign-time reached; stopping after {} of {total} target(s)",
+                        results.len()
+                    ));
+                            break;
+                        }
+                    }
+                    if let Some(cap) = status.cap() {
+                        if fuzz_successes >= cap {
+                            console.println(&format!(
+                        "bhf auto: --max-targets {cap} reached; stopping after {} attempt(s) ({fuzz_successes} fuzzed)",
+                        results.len()
+                    ));
+                            break;
+                        }
+                    }
+                    // [p]: hold here rather than take the next candidate. Polled so
+                    // a resume, a `q`, or the deadline is noticed without a second
+                    // wakeup path.
+                    while status.paused() && !status.quitting() {
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    }
+                    if status.quitting() {
+                        console.println(&format!(
+                            "bhf auto: stopped by operator after {} of {total} target(s) \
+                             ({fuzz_successes} fuzzed); writing the report",
+                            results.len()
+                        ));
+                        break;
+                    }
+                    let prefix = candidate_progress_prefix(
+                        i + 1,
+                        total,
+                        &candidate.harness_id,
+                        &candidate.name,
+                        fuzz_successes,
+                        status.cap(),
+                    );
+                    // On a TTY the dashboard owns the live view; piped output keeps
+                    // the historical static "… attempting" line so CI logs are
+                    // unchanged.
+                    if !live_tty {
+                        console.println(&format!("{prefix} … attempting"));
+                    }
+                    status.worker_begin(
+                        0,
+                        &candidate.harness_id,
+                        &candidate.name,
+                        crate::auto::candidate::lang_tag(candidate.lang),
+                    );
+                    let progress = crate::auto::progress::WorkerProgress::new(
+                        status.clone(),
+                        0,
+                        (!live_tty && args.verbose).then(|| {
+                            crate::auto::progress::TerminalProgress::new(
+                                prefix.clone(),
+                                args.verbose,
+                            )
+                        }),
+                    );
+                    // Catch a bhf-internal panic at the per-target boundary: record it
+                    // in the bug report and keep sweeping instead of aborting the whole run
+                    // on one malformed input. The panicked target is surfaced as a skip
+                    // whose reason points at bug-report.json.
+                    let attempt_ctx = crate::auto::bug_report::IssueContext {
+                        phase: "attempt".to_owned(),
+                        file: Some(
+                            candidate
+                                .source_path
+                                .strip_prefix(&path)
+                                .unwrap_or(&candidate.source_path)
+                                .display()
+                                .to_string(),
+                        ),
+                        target: Some(candidate.name.clone()),
+                        language: Some(format!("{:?}", candidate.lang)),
+                    };
+                    // Per-target budget is read HERE, not captured at startup, so
+                    // `[<]`/`[>]` apply from the next target onward.
+                    let mut target_options = phase_options.clone();
+                    target_options.per_target_time = status.per_target_time();
+                    let result = match crate::auto::bug_report::catch(attempt_ctx, || {
+                        crate::auto::attempt::attempt_with_progress(
+                            &candidate,
+                            &work,
+                            &idx,
+                            target_options.clone(),
+                            &progress,
+                        )
+                    }) {
+                        Ok(inner) => inner?,
+                        Err(reason) => crate::auto::attempt::AttemptResult {
+                            candidate: candidate.clone(),
+                            outcome: crate::auto::attempt::Outcome::UnsupportedParams { reason },
+                            harness_dir: crate::auto::layout::harness_dir(
+                                &work,
+                                &candidate.harness_id,
+                            ),
+                        },
+                    };
+                    crate::auto::progress::ProgressSink::clear(&progress);
+                    status.worker_finish(0, &result);
+                    // Count the completed outcome before rendering it so a success
+                    // visibly advances `[fuzzed N/CAP]` on its own result line. The
+                    // next target's live phase prefix then starts from that same N.
+                    if matches!(
+                        result.outcome,
+                        crate::auto::attempt::Outcome::BuiltAndFuzzed { .. }
+                    ) {
+                        fuzz_successes += 1;
+                    }
+                    let completed_prefix = candidate_progress_prefix(
+                        i + 1,
+                        total,
+                        &candidate.harness_id,
+                        &candidate.name,
+                        fuzz_successes,
+                        status.cap(),
+                    );
+                    console.println(&format!(
+                        "{completed_prefix} → {}",
+                        outcome_label(&result.outcome)
+                    ));
+                    if status.verbose() {
+                        for line in verbose_detail(&result.outcome) {
+                            console.println(&format!("    {line}"));
+                        }
+                    }
+                    // Persist the full result the moment this target finishes, so a
+                    // `--resume` run (or one after an interrupt mid-sweep) reloads it.
+                    crate::auto::report::persist_target_result(&work, &result, forced_phase);
+                    crate::auto::report::checkpoint_dependency_result(
+                        &path,
+                        &work,
+                        dependency_checkpoint,
+                        &result,
+                    )
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "could not checkpoint offline requirements after {}: {error:#}",
+                            result.candidate.harness_id
+                        )
+                    })?;
+                    results.push(result);
+                    if output_budget
+                        .checkpoint(&work)
+                        .with_context(|| format!("measure work directory {}", work.display()))?
+                    {
+                        console.println(&format!(
+                            "bhf auto: --max-work-dir-mb reached at {} (limit {}); \
+                             preserving this target and stopping before the next",
+                            crate::auto::storage::human_bytes(output_budget.last_bytes()),
+                            crate::auto::storage::human_bytes(output_budget.max_bytes()),
+                        ));
+                        break;
+                    }
+                }
+                results
+            } else {
+                run_parallel_sweep(
+                    candidates,
+                    total,
+                    &work,
+                    &idx,
+                    phase_options,
+                    campaign_deadline,
+                    already_fuzzed,
+                    &path,
+                    dependency_checkpoint,
+                    &status,
+                    &console,
+                    live_tty,
+                    &output_budget,
+                )?
+            };
+            Ok(results)
+        };
+
+    // Phase 1 is never forced, whatever `--force` says. This is what makes the
+    // flag unable to cost reach: the first pass is bit-for-bit the run you would
+    // have got without it, so no target that would have fuzzed can be starved by
+    // work spent forcing another one.
+    let mut unforced_options = options.clone();
+    unforced_options.force = false;
+    crate::auto::discovery::bhfprof("auto:checkpoint_to_sweep", _tmid);
+    let _tsw = std::time::Instant::now();
+    let mut results = sweep_phase(
+        candidates,
+        &unforced_options,
+        resumed_successes,
+        &mut dependency_checkpoint,
+    )?;
+    crate::auto::discovery::bhfprof("auto:sweep_phase1", _tsw);
+    let _tpost = std::time::Instant::now();
+
+    // Phase 2: force ONLY the targets phase 1 could not fuzz. A target that
+    // already fuzzed is never re-attempted — forcing cannot improve a success, and
+    // re-running it would spend budget to replace a real result with a stub-heavy
+    // one.
+    // A resumed target whose unforced attempt already failed joins the forced phase
+    // directly, carrying its prior result into the report. Moved in BEFORE the
+    // branching below so that a spent budget (or a met --max-targets) leaves the
+    // honest unforced diagnosis in the report rather than dropping the target from
+    // it entirely. Empty unless this run has --force.
+    for (_, prior) in force_upgrade.drain(..) {
+        results.push(prior);
+    }
+
+    // Read the LIVE force flag, not the startup one: `[f]` can add the forced pass
+    // to a run that did not ask for it (phase 1 yielded little), or drop the one it
+    // did ask for. The decision point is here, after phase 1, so a toggle any time
+    // during phase 1 is honoured.
+    if status.force() {
+        let retry: Vec<crate::auto::candidate::Candidate> = results
+            .iter()
+            .filter(|r| !reached_fuzz(&r.outcome))
+            .map(|r| r.candidate.clone())
+            .collect();
+        let fuzzed_in_phase_one =
+            resumed_successes + results.iter().filter(|r| reached_fuzz(&r.outcome)).count();
+        let budget_left = campaign_deadline.is_none_or(|d| std::time::Instant::now() < d);
+        let cap_left = status
+            .cap()
+            .map(|cap| cap.saturating_sub(fuzzed_in_phase_one));
+        // `options` carries the startup flag, which is false when forcing was
+        // turned on mid-run — phase 2 would then silently re-run every failure
+        // UNFORCED, spending the run's most expensive pass on a repeat of phase 1.
+        let mut forced_options = options.clone();
+        forced_options.force = true;
+        if status.quitting() {
+            // `q` during phase 1 means "end this run", not "end this pass": a
+            // forced retry of everything phase 1 could not fuzz is the most
+            // expensive part of the run, and starting it after a stop request
+            // would ignore the request for hours.
+            console.println(&format!(
+                "bhf auto: --force: skipping the forced pass over {} target(s) — \
+                 stopped by operator",
+                retry.len()
+            ));
+        } else if retry.is_empty() {
+            console.println(
+                "bhf auto: --force: nothing to retry — every attempted target already fuzzed",
+            );
+        } else if !budget_left {
+            console.println(&format!(
+                "bhf auto: --force: skipping the forced pass over {} target(s) — \
+                 --campaign-time is already spent. The unforced results stand; raise \
+                --campaign-time to give forcing its own budget.",
+                retry.len()
+            ));
+        } else if output_budget.exhausted() {
+            console.println(&format!(
+                "bhf auto: --force: skipping the forced pass over {} target(s) — \
+                 --max-work-dir-mb is already reached at {}",
+                retry.len(),
+                crate::auto::storage::human_bytes(output_budget.last_bytes()),
+            ));
+        } else if cap_left == Some(0) {
+            console.println(
+                "bhf auto: --force: skipping the forced pass — --max-targets is already met",
+            );
+        } else {
+            console.println(&format!(
+                "bhf auto: --force: phase 2 — retrying {} target(s) that did not fuzz, \
+                 forced (fabricated parameters, stubs for what the compiler reports \
+                 missing; findings are stamped low-confidence)",
+                retry.len()
+            ));
+            // `already_fuzzed` seeds the sweep's success counter, so the stop
+            // threshold remains the original absolute cap (not the remaining
+            // delta). This also keeps the live `fuzzed N/CAP` denominator stable
+            // across the unforced and forced phases.
+            let forced_results = sweep_phase(
+                retry,
+                &forced_options,
+                fuzzed_in_phase_one,
+                &mut dependency_checkpoint,
+            )?;
+            // Report why forcing FAILED, before folding the results away. The merge
+            // keeps phase 1's outcome when forcing did not fuzz — which is right,
+            // because an unforced `failed_build` names a real error where a forced
+            // `report_only` names nothing — but it means the run's residual-blocker
+            // table shows the UNFORCED reason. For a flag whose whole purpose is
+            // "make this target fuzz", the forced attempt's own reason is the
+            // actionable one, and without this it was invisible.
+            let unrescued: Vec<crate::auto::attempt::AttemptResult> = forced_results
+                .iter()
+                .filter(|r| !reached_fuzz(&r.outcome))
+                .map(|r| crate::auto::attempt::AttemptResult {
+                    candidate: r.candidate.clone(),
+                    outcome: r.outcome.clone(),
+                    harness_dir: r.harness_dir.clone(),
+                })
+                .collect();
+            let rescued = merge_forced_retry(&mut results, forced_results);
+            console.println(&format!(
+                "bhf auto: --force: phase 2 rescued {rescued} target(s) that phase 1 could not fuzz"
+            ));
+            if !unrescued.is_empty() {
+                let forced_blockers =
+                    crate::auto::blocker_histogram::BlockerHistogram::from_results(&unrescued);
+                if !forced_blockers.is_empty() {
+                    bhfeprintln!(
+                        "\nbhf auto: what stopped the FORCED retry ({} target(s) forcing could \
+                         not fuzz — these are the reasons to act on, not the unforced ones above)",
+                        unrescued.len()
+                    );
+                    bhfeprint!("{}", forced_blockers.render());
+                }
+            }
+        }
+    }
+
+    // The sweep is over: stop the renderer, erase the sticky block and give the
+    // terminal back BEFORE any end-of-run output. A summary printed underneath a
+    // live block gets overwritten by the next redraw, and a raw-mode terminal
+    // left behind outlives the process.
+    let stopped_by_operator = status.quitting();
+    drop(dashboard);
+    drop(controls);
+    console.stop_block();
+    if stopped_by_operator {
+        bhfeprintln!(
+            "bhf auto: stopped by operator — reporting on the {} target(s) completed so far",
+            results.len()
+        );
+    }
+
+    // Re-integrate `--resume`-reloaded targets into the report alongside the
+    // freshly-attempted ones, restoring discovery (score-descending) order so the
+    // combined report reads the same as a single uninterrupted run.
+    results.append(&mut resumed_results);
+    results.sort_by(|a, b| {
+        b.candidate
+            .score
+            .cmp(&a.candidate.score)
+            .then_with(|| a.candidate.harness_id.cmp(&b.candidate.harness_id))
+    });
+
+    // --static: run a whole-tree static scan alongside fuzzing, writing its
+    // findings BEFORE the report is generated so the loader renders them next to
+    // the fuzz findings. Runs regardless of per-target build/fuzz outcomes.
+    if (args.static_scan && !static_emitted) || args.external_tools {
+        let n = crate::auto::report_only::emit_tree_static_findings(&path, &work);
+        bhfeprintln!("bhf auto: --static — static scan wrote {n} finding(s) into the report");
+    }
+
+    // #486 Phase 3: external static-analysis adapters (gosec/Bandit/semgrep/
+    // GNATcheck), subprocess-only and gated by the license profile — strict-
+    // permissive (the default) runs none. Their findings merge into the report and
+    // the fuzz-confirmation join below.
+    if args.external_tools {
+        let profile = resolve_license_profile();
+        let n = crate::auto::external_tools::run_external_adapters(&path, &work, profile);
+        bhfeprintln!(
+            "bhf auto: --external-tools ({}) — external analyzers wrote {n} finding(s)",
+            profile.as_str()
+        );
+    }
+
+    // MemorySanitizer corpus replay (C): replay the ASan pass's corpus through a
+    // separate MSan build to surface uninitialized-memory reads (CWE-457) that
+    // ASan/UBSan miss — no second fuzz loop. Runs before the confirmation join so an
+    // MSan crash can also confirm a static finding at the same site.
+    let msan = if sanitizer_replay_enabled(&options.sanitizers, multicore_fuzz::Sanitizer::Msan) {
+        crate::auto::msan::run_msan_replay(&work)
+    } else {
+        0
+    };
+    if msan > 0 {
+        bhfeprintln!(
+            "bhf auto: MemorySanitizer — {msan} uninitialized-memory read(s) found by corpus replay"
+        );
+    }
+
+    // ThreadSanitizer corpus replay (C): replay the ASan pass's corpus through a
+    // separate TSan build to surface data races (CWE-362) that ASan/UBSan miss — no
+    // second fuzz loop. Only targets that spawn threads per input surface a race.
+    let tsan = if sanitizer_replay_enabled(&options.sanitizers, multicore_fuzz::Sanitizer::Tsan) {
+        crate::auto::tsan::run_tsan_replay(&work)
+    } else {
+        crate::auto::tsan::TsanReplay::default()
+    };
+    if tsan.findings > 0 {
+        bhfeprintln!(
+            "bhf auto: ThreadSanitizer — {} data race(s) found by corpus replay",
+            tsan.findings
+        );
+    }
+    // Say what was NOT measured. A replay that reports no races because its runs
+    // never completed has found nothing, and reporting only the finding count let
+    // that read as a clean result.
+    if tsan.unmeasured > 0 {
+        bhfeprintln!(
+            "bhf auto: ThreadSanitizer — {} corpus input(s) never completed a replay run \
+             (timeout); those inputs are UNMEASURED for data races, not clean",
+            tsan.unmeasured
+        );
+    }
+
+    // Memory-consumption profile (C/C++): replay the corpus in fresh processes and
+    // flag an input whose peak resident set is far above baseline and amplified vs its
+    // size — uncontrolled memory consumption (CWE-400) a crash-only fuzzer misses.
+    let memfindings = crate::auto::memprofile::run_mem_profile(&work);
+    if memfindings > 0 {
+        bhfeprintln!(
+            "bhf auto: memory profile — {memfindings} uncontrolled-consumption input(s) found by corpus replay"
+        );
+    }
+
+    // JVM sink-reachability oracle: the coverage agent records input-reachable
+    // dangerous sinks (deserialization / exec / eval / SQL / LDAP) into each Java
+    // harness's sink_report.txt; turn each reached sink into a behavioral finding.
+    let jsinks = crate::auto::sink_oracle::run_sink_oracle(&work);
+    if jsinks > 0 {
+        bhfeprintln!("bhf auto: JVM sink oracle — {jsinks} input-reachable sink(s) recorded");
+    }
+
+    // COBOL crash attribution: replay each COBOL crash to recover libcob's
+    // `<file>.cob:<line>: error: <what>` diagnostic and enrich the generic SIGSEGV
+    // finding with the COBOL source site + mapped CWE (out-of-bounds ref-mod →
+    // CWE-125, zero divide → CWE-369, size overflow → CWE-190, ...).
+    let cobol_attributed = crate::auto::cobol_oracle::run_cobol_attribution(&work);
+    if cobol_attributed > 0 {
+        bhfeprintln!(
+            "bhf auto: COBOL attribution — {cobol_attributed} crash(es) mapped to a COBOL runtime error + CWE"
+        );
+    }
+
+    // Build-recovery provenance (C): for a crash found on a stub-stitched build,
+    // rebuild a poisoned variant (`make prov`) in which every value-returning stub
+    // aborts on call, and replay the crash's min input. A stub on the crash path ->
+    // the crash needed a fabricated value -> `stub_artifact` (demoted to lab_only);
+    // the crash reproducing with none on its path -> `real_defect` (confidence
+    // raised). Cheap no-op for harnesses with no injected value stubs.
+    let prov = crate::auto::provenance::run_stub_provenance(&work, args.mode);
+    if prov.total() > 0 {
+        bhfeprintln!(
+            "bhf auto: build-recovery provenance — {} real defect(s) certified, {} crash(es) attributed to a stub artifact",
+            prov.real_defects, prov.stub_artifacts
+        );
+    }
+
+    // Fuzz-driven capability profiling: replay baseline (unstructured) inputs vs the
+    // coverage-guided corpus through the shim and diff the OS capabilities each
+    // exercised. A capability reached only under structured input is input-triggered
+    // attack surface (BHF-668) — a map of what an attacker who controls the input can
+    // make the program DO, which crash-only fuzzing never reports. Writes
+    // `auto/capabilities.json` and one clustered finding per (harness, kind).
+    let capabilities = crate::auto::capability::run_capability_profile(&work);
+    if capabilities > 0 {
+        bhfeprintln!(
+            "bhf auto: capability profiling — {capabilities} input-triggered capability finding(s) (BHF-668)"
+        );
+    }
+
+    // #484: fuzz-confirmation join. Match static findings (--static / report-only)
+    // against the run's runtime crashes + oracle hits by source site; upgrade the
+    // ones a fuzz input actually reached to `fuzz_confirmed`. Runs regardless of
+    // `--static` because report-only (F-RO-*) findings can be confirmed too. Cheap
+    // no-op when there are no static or no runtime findings.
+    let confirmed = crate::auto::confirm::confirm_static_findings(&work, args.mode).confirmed;
+    if confirmed > 0 {
+        bhfeprintln!(
+            "bhf auto: fuzz-confirmation — {confirmed} static finding(s) confirmed by a fuzz/oracle hit"
+        );
+    }
+
+    // #486 Phase 2 (reachability downgrade — the mirror of the join): demote a
+    // still-`static` finding to `lab_only` when it sits inside a function fuzzing
+    // PROVED is not attacker-reachable, so the report deprioritizes it. Built from
+    // the attempt results' candidate reachability (the CLI owns that signal).
+    let reachability_sites: Vec<crate::auto::confirm::ReachabilitySite> = results
+        .iter()
+        .filter_map(|result| {
+            let non_attacker_reachable = match result.candidate.input_reachability? {
+                target_rank::InputReachability::ReachabilityUnproven
+                | target_rank::InputReachability::OutputSerializer => true,
+                target_rank::InputReachability::AttackerReachable
+                | target_rank::InputReachability::IpcChannelReachable => false,
+            };
+            let basename = result
+                .candidate
+                .source_path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_ascii_lowercase())?;
+            Some(crate::auto::confirm::ReachabilitySite {
+                basename,
+                start_line: u64::from(result.candidate.line),
+                non_attacker_reachable,
+            })
+        })
+        .collect();
+    let demoted = crate::auto::confirm::downgrade_unreachable_static_findings(
+        &work,
+        &reachability_sites,
+        args.mode,
+    );
+    if demoted > 0 {
+        bhfeprintln!(
+            "bhf auto: reachability — {demoted} static finding(s) demoted to lab_only (not attacker-reachable)"
+        );
+    }
+
+    // Compiled-lane line coverage for negative confirmation: build a source-coverage
+    // variant of each C/C++ harness and replay the corpus to learn which lines the
+    // campaign executed (the interpreted lanes get this from their tracers directly).
+    let coverage = crate::auto::coverage_replay::run_coverage_replay(&work);
+    if coverage.harnesses > 0 {
+        // Report the fraction, not a bare popcount: "589 lines" is
+        // uninterpretable without knowing whether the target has 2,000 or
+        // 200,000.
+        match coverage.fraction() {
+            Some(fraction) => bhfeprintln!(
+                "bhf auto: line coverage {}/{} ({:.1}%) across {} harness(es) \
+                 (covered-lines.txt + coverage-summary.json per harness)",
+                coverage.covered_lines,
+                coverage.instrumented_lines,
+                fraction * 100.0,
+                coverage.harnesses
+            ),
+            None => bhfeprintln!(
+                "bhf auto: line coverage recorded for {} harness(es), but nothing was \
+                 instrumented — that is not 0% coverage, it is no measurement",
+                coverage.harnesses
+            ),
+        }
+    }
+    // Portable expert covered-line sidecars work for interpreted harnesses and
+    // do not require an LLVM coverage build, so oracle reporting cannot be
+    // nested under the compiled-lane measurement count.
+    if coverage.expert_oracles > 0 {
+        bhfeprintln!(
+            "bhf auto: expert-harness oracle — {} parity-or-better, {} with marginal \
+             expert coverage, {} expert build unavailable (expert-oracle.json per harness)",
+            coverage.expert_parity_or_better,
+            coverage.expert_marginal_gaps,
+            coverage.expert_build_unavailable
+        );
+    }
+
+    // Negative fuzz-confirmation: a static finding whose exact line the fuzzer
+    // EXECUTED (recorded in a covered-lines sidecar) yet never crashed/tripped an
+    // oracle is marked `fuzz_exercised` — exercised-and-survived, weak FP evidence.
+    let exercised = crate::auto::confirm::mark_fuzz_exercised_findings(&work, args.mode);
+    if exercised > 0 {
+        bhfeprintln!(
+            "bhf auto: negative confirmation — {exercised} static finding(s) marked fuzz_exercised (line executed, no crash/oracle)"
+        );
+    }
+
+    // Two-compiler differential (`--differential A:B`): rebuild each C/C++ harness
+    // under both compilers and replay the corpus through both, flagging inputs on
+    // which their exit/crash behavior diverges (BHF-301). Runs last so it sees the
+    // finalized corpus and its findings land before the report is written.
+    if let Some(spec_str) = args.differential.as_deref() {
+        match crate::auto::differential_post::parse_spec(spec_str) {
+            Ok(spec) => {
+                let diffs = crate::auto::differential_post::run_differential(&work, &spec);
+                if diffs > 0 {
+                    bhfeprintln!(
+                        "bhf auto: differential ({}:{}) — {diffs} cross-compiler divergence(s) found by corpus replay (BHF-301)",
+                        spec.cc_a, spec.cc_b
+                    );
+                }
+            }
+            Err(error) => bhfeprintln!("bhf auto: --differential ignored: {error}"),
+        }
+    }
+
+    let finished_at = Utc::now().to_rfc3339();
+    crate::auto::discovery::bhfprof("auto:post_sweep", _tpost);
+    let _twr = std::time::Instant::now();
+    write_reports_with_output_limit(
+        &path,
+        &results,
+        &work,
+        &started_at,
+        &finished_at,
+        false,
+        args.mode,
+        resumed,
+        discovered_total,
+        args.static_dynamic,
+        args.force,
+        stopped_by_operator,
+        output_budget.exhausted(),
+    )?;
+    crate::auto::discovery::bhfprof("auto:write_reports", _twr);
+
+    // --install-deps: read the just-written manifest and fetch what we can
+    // (online, opt-in). Re-run afterward to build against the real deps.
+    if args.install_deps {
+        let manifest_path = work.join("auto").join("missing-deps.json");
+        match std::fs::read_to_string(&manifest_path).ok().and_then(|s| {
+            serde_json::from_str::<crate::auto::dep_manifest::DependencyManifest>(&s).ok()
+        }) {
+            Some(manifest) if !manifest.is_empty() => {
+                bhfeprintln!("bhf auto: --install-deps — fetching missing dependencies (online)");
+                let report = crate::auto::install_deps::run_installs(&manifest);
+                bhfeprint!("{}", report.render());
+            }
+            _ => bhfeprintln!("bhf auto: --install-deps — no missing dependencies to fetch"),
+        }
+    }
+
+    let summary = AutoSummary::collect(
+        &path,
+        &work,
+        args.mode,
+        run_start.elapsed(),
+        &results,
+        resumed,
+        discovered_total,
+        stopped_by_operator,
+    );
+
+    let rendered = summary.render();
+    bhfeprintln!();
+    // Findings are the operator's primary deliverable: show the severe digest
+    // before campaign mechanics and blocker diagnostics.
+    bhfeprint!("{}", crate::auto::triage::render_top_findings(&work, 8));
+    bhfeprint!("{rendered}");
+    // Persist the same block next to the reports so it survives the
+    // scrollback and can be grepped/attached later.
+    let summary_path = work.join("auto").join("summary.txt");
+    if let Err(error) = std::fs::write(&summary_path, &rendered) {
+        bhfeprintln!(
+            "warning: could not write {}: {error}",
+            summary_path.display()
+        );
+    }
+
+    // Why each non-fuzzed target stopped, grouped per language and ordered by
+    // how many targets share the cause. The counts are the whole point: the top
+    // row is the next lever worth building, and re-running after building it is
+    // how that lever gets judged. Diagnostic only — nothing above depends on it.
+    // A build killed by the budget is not the same as a build that cannot work,
+    // and reading the histogram without knowing which is which wastes a fix
+    // round on a phantom blocker.
+    if crate::command_output::campaign_budget_exhausted() {
+        bhfeprintln!(
+            "bhf auto: the --campaign-time budget was exhausted; build steps still \
+             running were cut off, so some failures below are budget cut-offs rather \
+             than real blockers. Re-run with a larger --campaign-time to tell them apart."
+        );
+    }
+    let blockers = crate::auto::blocker_histogram::BlockerHistogram::from_results(&results);
+    if !blockers.is_empty() {
+        bhfeprint!("{}", blockers.render());
+        let blockers_path = work.join("auto").join("blockers.json");
+        match serde_json::to_vec_pretty(&blockers.to_json()) {
+            Ok(bytes) => {
+                if let Err(error) = std::fs::write(&blockers_path, &bytes) {
+                    bhfeprintln!(
+                        "warning: could not write {}: {error}",
+                        blockers_path.display()
+                    );
+                }
+            }
+            Err(error) => bhfeprintln!("warning: could not serialize residual blockers: {error}"),
+        }
+    }
+
+    // End-of-run UX: aggregate failure causes → the exact lever. The findings
+    // digest is intentionally printed before the summary above.
+    bhfeprint!(
+        "{}",
+        crate::auto::triage::render_triage(&crate::auto::triage::TriageInputs {
+            built_and_fuzzed: summary.built_and_fuzzed,
+            failed_build: summary.failed_build,
+            skipped: summary.skipped,
+            skipped_missing_package: summary.skipped_missing_package,
+            report_only: summary.report_only,
+            findings: summary.findings,
+            preflight: &preflight,
+            custom_build: detect_custom_build(&path),
+        })
+    );
+
+    // --sbom: emit the evidence-graded SBOM + VEX bundle at campaign end, where
+    // FuzzReached evidence is freshest. Over the scanned tree, enriched with this
+    // campaign's auto/run.json. Best-effort: a bundle failure must not fail the
+    // fuzz run (the campaign already succeeded), so it only warns.
+    if args.sbom {
+        emit_campaign_sbom(&path, &work);
+    }
+
+    // Normal completion performs the same evidence-preserving compaction offered
+    // by `bhf clean --compact`. Failed/interrupted runs can invoke that command
+    // later; findings, reports, corpora, checkpoints, source, and replay binaries
+    // are never part of this automatic cleanup.
+    match crate::auto::storage::compact_work_dir(&work) {
+        Ok(compacted) if compacted.reclaimed_bytes() > 0 => bhfeprintln!(
+            "bhf auto: final cleanup reclaimed {} from {} disposable path(s)",
+            crate::auto::storage::human_bytes(compacted.reclaimed_bytes()),
+            compacted.removed_paths,
+        ),
+        Ok(_) => {}
+        Err(error) => bhfeprintln!(
+            "warning: final work-directory cleanup failed for {}: {error}; run `bhf clean {} --compact` later",
+            work.display(),
+            work.display(),
+        ),
+    }
+
+    // Keep this as the final terminal feedback: it is the handoff list an
+    // offline operator needs after the campaign scrollback ends.
+    bhfeprintln!(
+        "bhf auto: requirements: {}",
+        crate::auto::report::dependency_manifest_pointer(&work)
+    );
+    dependency_pointer_guard.disarm();
+
+    // M22 (campaign fix): a 100%-legacy run produces only `report_only` outcomes
+    // (discovered + statically analyzed, not fuzzed) — that is a SUCCESSFUL scan,
+    // not a failure. Count report-only targets and any emitted finding toward
+    // success so CI does not treat every legacy-dialect scan as a hard failure.
+    Ok(
+        if summary.built + summary.built_and_fuzzed + summary.report_only > 0
+            || summary.findings > 0
+        {
+            0
+        } else {
+            1
+        },
+    )
+}
+
+/// Ensures ordinary errors, early returns, and unwindable panics still end with
+/// the durable requirements pointer. SIGKILL/OOM cannot run destructors, so the
+/// run-start checkpoint line remains the fallback for that case.
+struct DependencyPointerGuard {
+    work: PathBuf,
+    armed: bool,
+}
+
+impl DependencyPointerGuard {
+    fn new(work: &Path) -> Self {
+        Self {
+            work: work.to_path_buf(),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+fn finish_dependency_pointer(work: &Path, guard: &mut DependencyPointerGuard) {
+    bhfeprintln!(
+        "bhf auto: requirements: {}",
+        crate::auto::report::dependency_manifest_pointer(work)
+    );
+    guard.disarm();
+}
+
+impl Drop for DependencyPointerGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            bhfeprintln!(
+                "bhf auto: requirements: {}",
+                crate::auto::report::dependency_manifest_pointer(&self.work)
+            );
+        }
+    }
+}
+
+/// Emit the `--sbom` bundle for a finished campaign: the scanned tree's
+/// components, enriched with this campaign's `auto/run.json` so libraries a
+/// harness drove carry `FuzzReached`. Best-effort — warns instead of failing the
+/// (already-successful) fuzz run. Writes into `<work>/sbom/`.
+fn emit_campaign_sbom(root: &Path, work: &Path) {
+    let run_json = work.join("auto").join("run.json");
+    let options = governance::SbomOptions {
+        root: root.to_path_buf(),
+        out_dir: work.join("sbom"),
+        run_json: run_json.is_file().then_some(run_json),
+        ..Default::default()
+    };
+    match governance::write_sbom(&options) {
+        Ok(summary) => {
+            bhfeprintln!(
+                "bhf auto: --sbom wrote {} component(s), {} vulnerability match(es) to {}",
+                summary.components,
+                summary.matches,
+                options.out_dir.display()
+            );
+            // An empty SBOM is almost always "no dependency manifests in the
+            // scanned path", not a failure — the catalogers read declared
+            // dependencies (Cargo.toml, package.json, go.mod, pom.xml/build.gradle,
+            // requirements.txt/pyproject, composer.json, *.csproj, vcpkg.json,
+            // conanfile). A legacy C/C++/Ada tree with vendored sources declares
+            // none. Say so, and note the common footgun of scanning a subdirectory
+            // below where the manifests live.
+            if summary.components == 0 {
+                bhfeprintln!(
+                    "bhf auto: --sbom found no dependency manifests under {} \
+                     (Cargo.toml / package.json / go.mod / pom.xml / requirements.txt / …); \
+                     an SBOM catalogs DECLARED dependencies, so a manifest-less tree yields an \
+                     empty one. If the manifests live above the scanned path, point bhf at \
+                     the repository root.",
+                    root.display()
+                );
+            }
+        }
+        Err(error) => {
+            bhfeprintln!("bhf auto: --sbom bundle could not be written: {error:#}");
+        }
+    }
+}
+
+/// Discover candidates. Without `--reuse-discovery` this is exactly the prior
+/// behavior: a fresh `discover_with_dir_filter` with no cache I/O, no fingerprint
+/// walk, and no extra logging (byte-identical default). With `reuse` set, the
+/// discovery cache is consulted: on a fingerprint match the ranked list is loaded
+/// from `<work>/discovery-cache.json` (skipping the tree-sitter re-parse); on a
+/// miss (absent cache, changed tree, or changed dir-filter) discovery runs fresh
+/// and the cache is rewritten so the NEXT `--reuse-discovery` run hits. The
+/// fingerprint guards correctness — a stale cache is never used silently — and
+/// which path was taken is always logged.
+fn discover_or_reuse(
+    path: &Path,
+    dir_filter: &DirFilter,
+    work: &Path,
+    cache_enabled: bool,
+    fresh: bool,
+    cache_override: Option<&Path>,
+    preprocess: crate::auto::discovery::PreprocessMode,
+) -> Result<(Vec<crate::auto::candidate::Candidate>, bool, bool)> {
+    // `--no-discovery-cache`: never read or write a cache. (Second tuple element
+    // is `cache_hit` — whether the candidate list came from a validated cache, ie
+    // the source tree is unchanged; `--resume` only skips completed targets then.)
+    if !cache_enabled {
+        return Ok((
+            crate::auto::discovery::discover_with_options(path, dir_filter, preprocess)?,
+            false,
+            // `--no-discovery-cache` keeps no source identity, so `--resume`
+            // stays conservative and re-attempts, exactly as before.
+            false,
+        ));
+    }
+
+    use crate::auto::discovery::discover_with_options;
+    use crate::auto::discovery_cache::{self, DiscoveryCache};
+
+    // `--discovery-cache <path>` overrides the default `<work>/discovery-cache.json`.
+    let cache_file = discovery_cache::resolve_cache_path(work, cache_override);
+    // Fold the preprocess mode into the fingerprint: it changes WHICH functions are
+    // discovered (and their lines), so a cache built under a different mode must not
+    // be reused (§27.6). The base fingerprint stays the content+dir-filter digest.
+    let _tf = std::time::Instant::now();
+    let (tree_digest, current_files) =
+        crate::auto::discovery::source_fingerprint_with_files(path, dir_filter);
+    let fingerprint = format!("{tree_digest}-pp:{preprocess}");
+    crate::auto::discovery::bhfprof("auto:fingerprint", _tf);
+    // Persist the source identity SEPARATELY from the ranked-list cache, and do it
+    // before discovery runs.
+    //
+    // `--resume` used to treat "discovery cache hit" as its proof that the tree
+    // was unchanged. It is not the same thing: a run killed before it finished
+    // discovering leaves no cache at all, so the next `--resume` concluded "target
+    // source changed" — which was false — and re-attempted everything, throwing
+    // away good per-target records. That run then wrote the cache, so killing it
+    // and resuming again worked. Hence the "only works the second time" report.
+    //
+    // The fingerprint is the real signal and costs nothing to keep on its own.
+    let fingerprint_file = crate::auto::layout::reports_dir(work).join("source.fingerprint");
+    let source_unchanged = std::fs::read_to_string(&fingerprint_file)
+        .ok()
+        .is_some_and(|prior| prior.trim() == fingerprint);
+    let _ = crate::auto::report::atomic_write(&fingerprint_file, fingerprint.as_bytes());
+    // The same walk's per-file hashes, recorded before anything is fuzzed so they
+    // describe the tree as discovery saw it. One line per file, `<hex>\t<path>` —
+    // compact to write and to parse, and it is only read once per run.
+    let files_record = crate::auto::layout::reports_dir(work).join("source-files");
+    let prior_text = std::fs::read_to_string(&files_record).unwrap_or_default();
+    crate::auto::resume_scope::publish(path, &prior_text, &current_files);
+    let mut serialized = String::with_capacity(current_files.len() * 48);
+    for (rel, hash) in &current_files {
+        use std::fmt::Write;
+        let _ = writeln!(serialized, "{hash:016x}\t{rel}");
+    }
+    let _ = crate::auto::report::atomic_write(&files_record, serialized.as_bytes());
+    if fresh {
+        bhfeprintln!(
+            "bhf auto: --fresh-discovery: ignoring any cache at {} and recomputing discovery (fingerprint {fingerprint})",
+            cache_file.display()
+        );
+    } else if let Some(cached) = discovery_cache::load_if_valid(&cache_file, path, &fingerprint) {
+        bhfeprintln!(
+            "bhf auto: discovery loaded from cache {} ({} target(s); source tree unchanged, fingerprint {fingerprint})",
+            cache_file.display(),
+            cached.len()
+        );
+        return Ok((cached, true, source_unchanged));
+    } else {
+        // Distinguish WHY it missed so a surprising re-discovery is explainable
+        // (absent vs format-version vs fingerprint vs root mismatch).
+        let reason = discovery_cache::miss_reason(&cache_file, path, &fingerprint);
+        bhfeprintln!(
+            "bhf auto: discovery cache miss at {} ({reason}); recomputing discovery (fingerprint {fingerprint}). \
+             Pass --no-discovery-cache to disable caching.",
+            cache_file.display()
+        );
+    }
+    let _td = std::time::Instant::now();
+    let candidates = discover_with_options(path, dir_filter, preprocess)?;
+    crate::auto::discovery::bhfprof("auto:discover", _td);
+    let _tc = std::time::Instant::now();
+    // Persist the freshly ranked list for a later --reuse-discovery run. The cache
+    // is a re-run optimization, so a write failure is logged, never fatal.
+    let cache = DiscoveryCache::build(path, fingerprint, &candidates);
+    match discovery_cache::write(&cache_file, &cache) {
+        Ok(()) => bhfeprintln!(
+            "bhf auto: discovery computed ({} target(s)); cache written to {}",
+            candidates.len(),
+            cache_file.display()
+        ),
+        Err(error) => bhfeprintln!(
+            "bhf auto: discovery computed ({} target(s)); could not write discovery cache to {}: {error}",
+            candidates.len(),
+            cache_file.display()
+        ),
+    }
+    crate::auto::discovery::bhfprof("auto:cache_write", _tc);
+    Ok((candidates, false, source_unchanged))
+}
+
+/// Resolve the per-target fuzz pass set from `--single-pass` / `--passes`.
+/// Neither given → all three passes (`Pass::ALL`, unchanged default).
+/// `--single-pass` → only the fuzz-driven pass. `--passes empty,rng,fuzz` → the
+/// named subset in the given order (deduped); `fuzz` aliases `fuzz_driven`. An
+/// unknown name is a hard error so a typo can't silently run the wrong set.
+fn resolve_passes(single_pass: bool, passes: Option<&str>) -> Result<Vec<crate::auto::pass::Pass>> {
+    use crate::auto::pass::Pass;
+    if single_pass {
+        return Ok(vec![Pass::FuzzDriven]);
+    }
+    let Some(spec) = passes else {
+        return Ok(Pass::ALL.to_vec());
+    };
+    let mut out: Vec<Pass> = Vec::new();
+    for raw in spec.split(',') {
+        let name = raw.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let pass = match name.to_ascii_lowercase().as_str() {
+            "empty" => Pass::Empty,
+            "rng" => Pass::Rng,
+            "fuzz" | "fuzz_driven" | "fuzzdriven" | "fuzz-driven" => Pass::FuzzDriven,
+            other => anyhow::bail!(
+                "unknown --passes name '{other}' (valid: empty, rng, fuzz/fuzz_driven)"
+            ),
+        };
+        if !out.contains(&pass) {
+            out.push(pass);
+        }
+    }
+    if out.is_empty() {
+        anyhow::bail!("--passes parsed to an empty set; give a comma list like 'empty,rng,fuzz'");
+    }
+    Ok(out)
+}
+
+/// Run the cross-candidate sweep with up to `jobs` candidates built+fuzzed
+/// concurrently (used only for `--jobs > 1`; `--jobs 1` keeps the serial loop in
+/// `run_inner`). A bounded pool of `jobs` scoped threads pulls candidates off a
+/// shared atomic cursor; results land in position-indexed slots so aggregation
+/// is deterministic regardless of completion order. Per-candidate work is already
+/// isolated by `harness_id` (`<work>/harnesses/<id>/`, `<work>/corpus/<id>/`) and env
+/// is threaded per child `Command` (no process-global `set_var`), so the only
+/// shared state is the (immutable) declaration index and the stderr lock.
+///
+/// Parallel mode uses the no-op progress sink and static per-candidate lines:
+/// the in-place TTY progress rewrites a single owned line, which concurrent
+/// workers would corrupt. `campaign_deadline`, when set, stops handing out new
+/// candidates (in-flight ones finish).
+/// Whether a `--resume`-eligible prior result should be thrown away and the
+/// target attempted again, given what this run is willing to do.
+///
+/// Resuming is only useful if a reloaded result is still the best answer
+/// available. Two cases mean it is not:
+///
+/// - the prior attempt was NOT forced, did not fuzz, and this run has `--force`:
+///   forcing is exactly the thing that has not been tried yet. This is what makes
+///   `bhf auto --resume --force` over a finished campaign do the obvious
+///   thing — keep every target that fuzzed, spend the budget only on the ones
+///   that did not.
+/// - the prior attempt WAS forced and this run is not: a forced result is
+///   stub-heavy and its findings are low-confidence, so an unforced run must not
+///   inherit it and report it as its own.
+///
+/// Everything else reloads: a target that fuzzed cannot be improved by forcing,
+/// and a target that failed unforced will fail the same way unforced again.
+fn resume_should_reattempt(prior_fuzzed: bool, prior_forced: bool, now_force: bool) -> bool {
+    if prior_forced && !now_force {
+        return true;
+    }
+    if !prior_forced && now_force && !prior_fuzzed {
+        return true;
+    }
+    false
+}
+
+/// Human progress prefix for one ranked candidate. `position/total` describes
+/// how far bhf has searched through the ranked candidates; `fuzzed/cap`
+/// separately describes progress toward `--max-targets`. Keeping both prevents
+/// a line such as `713/26409` from being mistaken for 713 successful fuzz runs.
+fn candidate_progress_prefix(
+    position: usize,
+    total: usize,
+    harness_id: &str,
+    name: &str,
+    fuzzed: usize,
+    success_cap: Option<usize>,
+) -> String {
+    let candidate = format!("[{position:>4}/{total:>4}]");
+    match success_cap {
+        Some(cap) => format!(
+            "{candidate} [fuzzed {fuzzed:>width$}/{cap}] {harness_id} {name}",
+            width = cap.to_string().len()
+        ),
+        None => format!("{candidate} {harness_id} {name}"),
+    }
+}
+
+/// Whether an outcome means the target actually reached the fuzz phase. The one
+/// definition both `--force` phases and the success cap agree on.
+fn reached_fuzz(outcome: &crate::auto::attempt::Outcome) -> bool {
+    matches!(
+        outcome,
+        crate::auto::attempt::Outcome::BuiltAndFuzzed { .. }
+    )
+}
+
+/// Fold a forced retry's results back over the unforced ones. Returns how many
+/// targets the retry moved into the fuzz phase.
+///
+/// The forced outcome wins for every target that was retried. It is safe to let
+/// it win — and necessary. Safe, because only targets phase 1 could NOT fuzz are
+/// ever retried, so no fuzzed result can be replaced and `--force` cannot lower
+/// the fuzzed count. Necessary, because `--force` has a documented contract for
+/// the targets it cannot fuzz either: it bypasses the pre-skip gates so a target
+/// reaches the build path instead of `unsupported_params`, and report-only is its
+/// floor rather than `failed_build`.
+///
+/// An earlier version kept the unforced outcome unless forcing FUZZED, reasoning
+/// that a forced `report_only` says less than an unforced `failed_build` which
+/// names a real error. That reasoning is not wrong about diagnostics, but it is
+/// the wrong mechanism: it silently suppressed the forced result the operator
+/// explicitly asked for, and broke both of those contracts
+/// (`force_bypasses_cpp_only_class_pre_skip_gate`,
+/// `unbuildable_target_degrades_to_report_only_under_force`). The diagnostic
+/// concern is met instead by phase 2 printing its own blocker histogram, so the
+/// unforced reason is still on screen without overriding the operator.
+fn merge_forced_retry(
+    results: &mut [crate::auto::attempt::AttemptResult],
+    forced: Vec<crate::auto::attempt::AttemptResult>,
+) -> usize {
+    let mut rescued = 0;
+    for forced_result in forced {
+        let fuzzed = reached_fuzz(&forced_result.outcome);
+        if let Some(slot) = results
+            .iter_mut()
+            .find(|r| r.candidate.harness_id == forced_result.candidate.harness_id)
+        {
+            *slot = forced_result;
+            if fuzzed {
+                rescued += 1;
+            }
+        }
+    }
+    rescued
+}
+
+#[allow(clippy::too_many_arguments)]
+/// The one-block answer to "what is this run going to do, and what ends it".
+///
+/// Stop conditions are listed together because they compete: `--max-targets 50`
+/// on a 26k-candidate tree with a 30-minute budget ends on whichever binds
+/// first, and which one that is decides whether the operator should wait.
+fn run_plan(
+    candidates: usize,
+    phase_total: usize,
+    success_cap: Option<usize>,
+    campaign_time: Option<u64>,
+    jobs: usize,
+    jobs_ceiling: usize,
+) -> String {
+    let phases = if phase_total > 1 {
+        "1 unforced → 2 forced (--force)".to_owned()
+    } else {
+        "1 (add --force for a second, forced pass)".to_owned()
+    };
+    let mut stops = Vec::new();
+    if let Some(cap) = success_cap {
+        stops.push(format!("{cap} target(s) fuzzed (--max-targets)"));
+    }
+    if let Some(secs) = campaign_time {
+        stops.push(format!(
+            "{} elapsed (--campaign-time)",
+            crate::auto::run_status::human_duration(std::time::Duration::from_secs(secs))
+        ));
+    }
+    stops.push(format!("all {candidates} candidate(s) attempted"));
+    format!(
+        "\nbhf auto: run plan\n  \
+         candidates: {candidates} ranked\n  \
+         phases:     {phases}\n  \
+         stops at:   {}\n  \
+         jobs:       {jobs} (ceiling {jobs_ceiling})",
+        stops.join("  ·  "),
+    )
+}
+
+/// Whether a parked worker may take the next candidate.
+///
+/// The pool cannot wedge at zero admitted workers: `limit` is clamped to at least
+/// 1, so `current >= limit` implies some worker holds a permit and will release
+/// it. That is why no slot needs an exemption — an exemption would let the pool
+/// exceed the operator's `--jobs`, which is the one thing admission control is
+/// there to prevent.
+fn may_admit(current: usize, limit: usize) -> bool {
+    current < limit
+}
+
+/// Releases a worker's concurrency permit when its candidate finishes, however
+/// it finishes — including the `?`-free error paths and a panic caught further
+/// up. A leaked permit permanently lowers the sweep's effective `--jobs`.
+struct AdmissionGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl Drop for AdmissionGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_parallel_sweep(
+    candidates: Vec<crate::auto::candidate::Candidate>,
+    total: usize,
+    work: &Path,
+    idx: &DeclarationIndex,
+    options: &AttemptOptions,
+    campaign_deadline: Option<std::time::Instant>,
+    // #94: the cap on targets that reach the fuzz phase lives in `status` (it is
+    // operator-adjustable mid-run); workers stop handing out new candidates once
+    // it is reached and the in-flight ones finish. `initial_successes` seeds the
+    // counter with resumed successes.
+    initial_successes: usize,
+    source_root: &Path,
+    checkpoint_base: &crate::auto::dep_manifest::DependencyManifest,
+    // The concurrency level lives here rather than in a parameter: `+`/`-` retune
+    // it mid-sweep, so it is read per candidate, not once at spawn.
+    status: &std::sync::Arc<crate::auto::run_status::RunStatus>,
+    console: &crate::auto::dashboard::Console,
+    live_tty: bool,
+    output_budget: &crate::auto::storage::WorkDirBudget,
+) -> Result<Vec<crate::auto::attempt::AttemptResult>> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    let n = candidates.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    // Position-indexed slots: deterministic aggregation no matter which worker
+    // finishes first (report order matches the ranked order).
+    let slots: Mutex<Vec<Option<Result<crate::auto::attempt::AttemptResult>>>> =
+        Mutex::new((0..n).map(|_| None).collect());
+    let cursor = AtomicUsize::new(0);
+    let reached = AtomicUsize::new(0);
+    let stopped = AtomicBool::new(false);
+    // #94: targets that reached the fuzz phase (seeded with resumed successes). Once
+    // it reaches `success_cap`, workers stop handing out new candidates; the up-to
+    // `jobs-1` in-flight attempts still finish, so a parallel run can fuzz a few
+    // more than the cap — the rank-earliest `success_cap` successes are the same
+    // set the serial sweep selects.
+    let success_count = AtomicUsize::new(initial_successes);
+    let stderr_lock = Mutex::new(());
+    let dependency_checkpoint = Mutex::new(checkpoint_base.clone());
+    // Ada's build pipeline stages the target closure under the run-level
+    // `<work>/src_instrumented` directory. Two workers rebuilding that directory
+    // concurrently can delete units while the other compiler reads them (real
+    // campaign symptom: `gnat1: Cannot find: crypto.ads`). Serialize only Ada
+    // attempts; C/C++ and interpreted targets retain full `--jobs` parallelism.
+    let ada_attempt_lock = Mutex::new(());
+    // Spawn to the CEILING, not to `--jobs`: a thread that is not currently
+    // allowed to run parks in `admit` below. Raising concurrency at runtime then
+    // costs nothing but a permit — spawning new threads into a live
+    // `thread::scope` is not possible, so a pool sized to the initial `--jobs`
+    // could never grow.
+    let worker_count = status.jobs_ceiling().min(n);
+    // Workers currently holding a permit. Compared against the live `--jobs`
+    // value on every iteration, so lowering concurrency parks the surplus workers
+    // as they finish their current target rather than killing it mid-build.
+    let admitted = AtomicUsize::new(0);
+    // Admission control for one candidate. Returns false when the worker should
+    // park (over the current limit) — the caller retries after a short sleep, so
+    // a raise takes effect within one poll interval.
+    let admit = || -> bool {
+        // [p]: park every worker. Checked here so a pause costs nothing but a
+        // failed admission — in-flight targets are never interrupted.
+        if status.paused() {
+            return false;
+        }
+        let limit = status.jobs();
+        let mut current = admitted.load(Ordering::SeqCst);
+        loop {
+            if !may_admit(current, limit) {
+                return false;
+            }
+            match admitted.compare_exchange(
+                current,
+                current + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    };
+
+    // Shadow every shared value with a reference so the per-worker closure can be
+    // `move` — it must be, to take its own `slot` by value — while still sharing
+    // one cursor, one tally and one checkpoint across all workers.
+    let (
+        stopped,
+        cursor,
+        reached,
+        admitted,
+        candidates,
+        success_count,
+        stderr_lock,
+        ada_attempt_lock,
+        dependency_checkpoint,
+        slots,
+        admit,
+    ) = (
+        &stopped,
+        &cursor,
+        &reached,
+        &admitted,
+        &candidates,
+        &success_count,
+        &stderr_lock,
+        &ada_attempt_lock,
+        &dependency_checkpoint,
+        &slots,
+        &admit,
+    );
+    std::thread::scope(|scope| {
+        for slot in 0..worker_count {
+            scope.spawn(move || loop {
+                if stopped.load(Ordering::SeqCst) {
+                    break;
+                }
+                if output_budget.exhausted() {
+                    stopped.store(true, Ordering::SeqCst);
+                    break;
+                }
+                // `q`: finish what is in flight, start nothing new.
+                if status.quitting() {
+                    break;
+                }
+                if let Some(deadline) = campaign_deadline {
+                    if std::time::Instant::now() >= deadline {
+                        stopped.store(true, Ordering::SeqCst);
+                        if std::env::var_os("BHF_PROFILE").is_some() {
+                            bhfeprintln!("[prof] worker stopping: campaign deadline reached");
+                        }
+                        break;
+                    }
+                }
+                if !admit() {
+                    // Parked: over the current `--jobs`. Poll rather than block on
+                    // a condvar so a raise, a `q`, or the campaign deadline is
+                    // noticed without another wakeup path.
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    continue;
+                }
+                let _admission = AdmissionGuard(admitted);
+                let i = cursor.fetch_add(1, Ordering::SeqCst);
+                if i >= n {
+                    break;
+                }
+                let candidate = &candidates[i];
+                let prefix = candidate_progress_prefix(
+                    i + 1,
+                    total,
+                    &candidate.harness_id,
+                    &candidate.name,
+                    success_count.load(Ordering::SeqCst),
+                    status.cap(),
+                );
+                if !live_tty {
+                    let _g = stderr_lock.lock().unwrap();
+                    console.println(&format!("{prefix} … attempting"));
+                }
+                // Each worker owns one dashboard slot, so concurrent live progress
+                // no longer means concurrent rewrites of a single terminal line
+                // (which is why this path used to run blind, with `NoProgress`).
+                status.worker_begin(
+                    slot,
+                    &candidate.harness_id,
+                    &candidate.name,
+                    crate::auto::candidate::lang_tag(candidate.lang),
+                );
+                let progress = crate::auto::progress::WorkerProgress::new(
+                    std::sync::Arc::clone(status),
+                    slot,
+                    (!live_tty && status.verbose()).then(|| {
+                        crate::auto::progress::TerminalProgress::new(prefix.clone(), true)
+                    }),
+                );
+                // Catch a per-target bhf-internal panic (recorded in the bug
+                // report) so one bad input doesn't kill the whole parallel sweep.
+                let attempt_ctx = crate::auto::bug_report::IssueContext {
+                    phase: "attempt".to_owned(),
+                    file: Some(candidate.source_path.display().to_string()),
+                    target: Some(candidate.name.clone()),
+                    language: Some(format!("{:?}", candidate.lang)),
+                };
+                let synth_candidate = candidate.clone();
+                let _ada_guard = if candidate.lang == crate::auto::candidate::Lang::Ada {
+                    Some(ada_attempt_lock.lock().unwrap())
+                } else {
+                    None
+                };
+                let _ta = std::time::Instant::now();
+                // Read per candidate so `[<]`/`[>]` reach the next target rather
+                // than only the next run.
+                let mut target_options = options.clone();
+                target_options.per_target_time = status.per_target_time();
+                let mut result = match crate::auto::bug_report::catch(attempt_ctx, || {
+                    crate::auto::attempt::attempt_with_progress(
+                        candidate,
+                        work,
+                        idx,
+                        target_options.clone(),
+                        &progress,
+                    )
+                }) {
+                    Ok(inner) => inner,
+                    Err(reason) => Ok(crate::auto::attempt::AttemptResult {
+                        candidate: synth_candidate.clone(),
+                        outcome: crate::auto::attempt::Outcome::UnsupportedParams { reason },
+                        harness_dir: crate::auto::layout::harness_dir(
+                            work,
+                            &synth_candidate.harness_id,
+                        ),
+                    }),
+                };
+                crate::auto::discovery::bhfprof(
+                    &format!("attempt:{}", synth_candidate.harness_id),
+                    _ta,
+                );
+                // Advance the shared success count before printing the completion
+                // line, so the operator sees exactly which completion changed it.
+                // In-flight workers can finish past the cap by design.
+                let fuzzed = if matches!(
+                    &result,
+                    Ok(r) if matches!(
+                        r.outcome,
+                        crate::auto::attempt::Outcome::BuiltAndFuzzed { .. }
+                    )
+                ) {
+                    let fuzzed = success_count.fetch_add(1, Ordering::SeqCst) + 1;
+                    if let Some(cap) = status.cap() {
+                        if fuzzed >= cap {
+                            stopped.store(true, Ordering::SeqCst);
+                        }
+                    }
+                    fuzzed
+                } else {
+                    success_count.load(Ordering::SeqCst)
+                };
+                match &result {
+                    Ok(completed) => status.worker_finish(slot, completed),
+                    Err(_) => status.worker_failed(slot),
+                }
+                let completed_prefix = candidate_progress_prefix(
+                    i + 1,
+                    total,
+                    &candidate.harness_id,
+                    &candidate.name,
+                    fuzzed,
+                    status.cap(),
+                );
+                {
+                    let _g = stderr_lock.lock().unwrap();
+                    match &result {
+                        Ok(r) => {
+                            console.println(&format!(
+                                "{completed_prefix} → {}",
+                                outcome_label(&r.outcome)
+                            ));
+                            if status.verbose() {
+                                for line in verbose_detail(&r.outcome) {
+                                    console.println(&format!("    {line}"));
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            console.println(&format!("{completed_prefix} → error: {error:#}"))
+                        }
+                    }
+                }
+                // Persist and checkpoint inside the worker, before the result is
+                // handed back to the final collector. This is the difference
+                // between preserving completed parallel targets and losing the
+                // whole batch when the parent is killed before all workers join.
+                if result.is_ok() {
+                    let completed_id;
+                    let dependency_result;
+                    {
+                        let completed = result.as_ref().expect("checked Ok above");
+                        completed_id = completed.candidate.harness_id.clone();
+                        crate::auto::report::persist_target_result(work, completed, options.force);
+                        let mut checkpoint = dependency_checkpoint.lock().unwrap();
+                        dependency_result = crate::auto::report::checkpoint_dependency_result(
+                            source_root,
+                            work,
+                            &mut checkpoint,
+                            completed,
+                        );
+                    }
+                    if let Err(error) = dependency_result {
+                        let _g = stderr_lock.lock().unwrap();
+                        console.println(&format!(
+                            "warning: could not checkpoint offline requirements after {}: {error:#}",
+                            completed_id
+                        ));
+                        result = Err(anyhow::anyhow!(
+                            "could not checkpoint offline requirements after {}: {error:#}",
+                            completed_id
+                        ));
+                    }
+                    if result.is_ok() {
+                        let was_exhausted = output_budget.exhausted();
+                        match output_budget.checkpoint(work) {
+                            Ok(true) => {
+                                stopped.store(true, Ordering::SeqCst);
+                                if !was_exhausted {
+                                    let _g = stderr_lock.lock().unwrap();
+                                    console.println(&format!(
+                                        "bhf auto: --max-work-dir-mb reached at {} (limit {}); \
+                                         preserving in-flight targets and starting no new ones",
+                                        crate::auto::storage::human_bytes(output_budget.last_bytes()),
+                                        crate::auto::storage::human_bytes(output_budget.max_bytes()),
+                                    ));
+                                }
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                let _g = stderr_lock.lock().unwrap();
+                                console.println(&format!(
+                                    "warning: could not measure work directory after {}: {error}",
+                                    completed_id
+                                ));
+                                result = Err(anyhow::anyhow!(
+                                    "could not enforce --max-work-dir-mb after {}: {error}",
+                                    completed_id
+                                ));
+                            }
+                        }
+                    }
+                }
+                // The collector below returns the FIRST error and discards every
+                // later result, so sweeping on after one is spent effort. Stopping
+                // here is what gives the pool the serial loop's fail-fast.
+                if result.is_err() {
+                    stopped.store(true, Ordering::SeqCst);
+                }
+                reached.fetch_add(1, Ordering::SeqCst);
+                slots.lock().unwrap()[i] = Some(result);
+            });
+        }
+    });
+
+    let done = reached.load(Ordering::SeqCst);
+    if done < n {
+        let why = if status.quitting() {
+            "operator pressed q"
+        } else if output_budget.exhausted() {
+            "--max-work-dir-mb reached"
+        } else {
+            "--max-targets success cap or --campaign-time deadline reached"
+        };
+        console.println(&format!(
+            "bhf auto: stopped after {done} of {total} candidate(s) — {why}"
+        ));
+    }
+
+    // Collect in index order; propagate the first error (serial fail-fast parity).
+    let mut results = Vec::with_capacity(done);
+    for slot in std::mem::take(&mut *slots.lock().unwrap()) {
+        match slot {
+            Some(Ok(r)) => {
+                results.push(r);
+            }
+            Some(Err(error)) => return Err(error),
+            // Not reached (campaign-time cutoff): omit, like the serial break.
+            None => {}
+        }
+    }
+    Ok(results)
+}
+
+/// Aggregate end-of-run statistics for the human summary printed to the
+/// terminal and written to `<work>/auto/summary.txt`. `auto` otherwise
+/// ends on the last per-target line, leaving the run's shape (how long it
+/// took, what built, what languages, where the outputs are) invisible.
+struct AutoSummary {
+    source: PathBuf,
+    work: PathBuf,
+    mode: actionability::RunMode,
+    duration: std::time::Duration,
+    discovered: usize,
+    /// #6: total ranked candidates BEFORE any `--max-targets` / campaign-split
+    /// cap. Equals `discovered` for an uncapped run; larger when a cap dropped
+    /// lower-ranked targets from the sweep.
+    discovered_total: usize,
+    /// `--resume`: targets skipped because they completed in a prior sweep.
+    resumed: usize,
+    /// The operator pressed `q`. The unattempted remainder is then NOT "dropped
+    /// by cap" — reporting it that way would blame a flag for a decision the
+    /// person watching made.
+    stopped_by_operator: bool,
+    built_and_fuzzed: usize,
+    /// #417: of `built_and_fuzzed`, the FALSE-CLEAN subset whose harness fuzzed
+    /// only blind stubs and never the real library. Surfaced distinctly in the
+    /// terminal summary so the run's headline count isn't misread.
+    fuzzed_stub_only: usize,
+    built: usize,
+    /// #95: targets that built and ran fuzz passes but whose entry-instrumented
+    /// (C/C++/Ada) harness never observed the target-entry checkpoint — the run
+    /// exercised only decoding/blind stubs or bailed out, so it is NOT counted as
+    /// `built_and_fuzzed`. Surfaced distinctly so a stub-only/decode-rejected run
+    /// can never inflate the fuzz-success headline.
+    built_not_entered: usize,
+    skipped: usize,
+    /// Of `skipped`, the subset an interpreted lane could not LOAD because a
+    /// package is not installed. Same outcome, different remedy: these need the
+    /// package, not `--force`, so the triage has to tell them apart.
+    skipped_missing_package: usize,
+    failed_build: usize,
+    link_errors: usize,
+    runtime_errors: usize,
+    /// M22: targets discovered + statically analyzed but not fuzzed.
+    report_only: usize,
+    findings: usize,
+    /// Total built-in fuzz executions across every pass and target.
+    executions: usize,
+    /// #405: total measured fuzz wall (seconds) summed across every pass and
+    /// target — the denominator for the campaign-level exec/s figure. NOT the
+    /// run duration (which includes discovery/build/repair).
+    total_elapsed_secs: f64,
+    /// Peak edge coverage any target reached (#385); 0 when no harness carried a
+    /// coverage runtime.
+    coverage_edges: usize,
+    files_fuzzed: usize,
+    files_with_targets: usize,
+    /// (language, targets, built) in a stable order, languages with
+    /// zero discovered targets omitted.
+    per_language: Vec<(&'static str, usize, usize)>,
+}
+
+impl AutoSummary {
+    #[allow(clippy::too_many_arguments)]
+    fn collect(
+        source: &Path,
+        work: &Path,
+        mode: actionability::RunMode,
+        duration: std::time::Duration,
+        results: &[crate::auto::attempt::AttemptResult],
+        resumed: usize,
+        discovered_total: usize,
+        stopped_by_operator: bool,
+    ) -> Self {
+        use crate::auto::attempt::Outcome::*;
+        use crate::auto::candidate::Lang;
+        use std::collections::BTreeSet;
+
+        // #95: `BuiltNotEntered` genuinely produced a build (like `Built`), so it
+        // counts as built for the per-language build tally; it is NOT a fuzz
+        // success (tracked separately as `built_not_entered`).
+        let is_built = |o: &crate::auto::attempt::Outcome| {
+            matches!(
+                o,
+                Built { .. } | BuiltAndFuzzed { .. } | BuiltNotEntered { .. }
+            )
+        };
+
+        let mut built_and_fuzzed = 0;
+        let mut fuzzed_stub_only = 0;
+        let mut built = 0;
+        let mut built_not_entered = 0;
+        let mut skipped = 0;
+        let mut skipped_missing_package = 0;
+        let mut failed_build = 0;
+        let mut link_errors = 0;
+        let mut runtime_errors = 0;
+        let mut report_only = 0;
+        let mut findings = 0;
+        // Report-only findings are file-level: collect their ids so the
+        // headline counts each weakness once, however many targets saw it.
+        let mut report_only_finding_ids: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        let mut executions = 0;
+        let mut total_elapsed_secs = 0.0;
+        let mut coverage_edges = 0;
+        let mut files_with_targets: BTreeSet<&Path> = BTreeSet::new();
+        let mut files_fuzzed: BTreeSet<&Path> = BTreeSet::new();
+
+        for r in results {
+            files_with_targets.insert(r.candidate.source_path.as_path());
+            match &r.outcome {
+                BuiltAndFuzzed { passes, .. } => {
+                    built_and_fuzzed += 1;
+                    // #417: track the false-clean subset for the summary line.
+                    if r.outcome.stub_execution().is_some_and(|se| se.stub_only) {
+                        fuzzed_stub_only += 1;
+                    }
+                    findings += passes.iter().map(|p| p.findings.len()).sum::<usize>();
+                    executions += passes.iter().map(|p| p.executions).sum::<usize>();
+                    // #405: accumulate measured fuzz wall so the campaign exec/s
+                    // is executions ÷ Σelapsed (true throughput), not divided by
+                    // the wall budget that overstates available time.
+                    total_elapsed_secs += passes.iter().map(|p| p.elapsed_secs).sum::<f64>();
+                    // Coverage accumulates across a target's passes, so the
+                    // largest per-pass value is that target's total; take the peak
+                    // across all targets for the rollup.
+                    coverage_edges = coverage_edges
+                        .max(passes.iter().map(|p| p.coverage_edges).max().unwrap_or(0));
+                }
+                Built { .. } => built += 1,
+                BuiltNotEntered { passes, .. } => {
+                    built_not_entered += 1;
+                    // The passes ran and produced real throughput/coverage — count
+                    // them so exec/coverage totals stay honest — but do NOT fold
+                    // their findings into the fuzz-success headline: a crash without
+                    // target entry is a decode/stub artifact, not a target finding
+                    // (it stays in the per-target report + findings dir with its
+                    // reachability caveat).
+                    executions += passes.iter().map(|p| p.executions).sum::<usize>();
+                    total_elapsed_secs += passes.iter().map(|p| p.elapsed_secs).sum::<f64>();
+                    coverage_edges = coverage_edges
+                        .max(passes.iter().map(|p| p.coverage_edges).max().unwrap_or(0));
+                }
+                UnsupportedParams { reason } => {
+                    skipped += 1;
+                    // An interpreted target that could not LOAD because a package
+                    // is not installed shares this outcome, but not its remedy:
+                    // `--force` drives an undrivable parameter, and cannot install
+                    // a package. Count the two apart so the triage says which.
+                    if crate::auto::script_load_roots::is_missing_package_reason(reason) {
+                        skipped_missing_package += 1;
+                    }
+                }
+                FailedBuild { .. } => failed_build += 1,
+                UnrecoverableLink { .. } => link_errors += 1,
+                UnrecoverableRuntime { .. } => runtime_errors += 1,
+                ReportOnly { finding_ids, .. } => {
+                    report_only += 1;
+                    // M22 (campaign fix): report-only static findings are real
+                    // CWE-tagged findings — surface them in the headline count.
+                    // Counted by IDENTITY, not per target: a file's weaknesses
+                    // belong to the file, and every report-only target in one
+                    // translation unit reports the same set. Summing them turned
+                    // 24 findings into 120 on one Fortran project.
+                    report_only_finding_ids.extend(finding_ids.iter().cloned());
+                }
+            }
+            if is_built(&r.outcome) {
+                files_fuzzed.insert(r.candidate.source_path.as_path());
+            }
+        }
+        findings += report_only_finding_ids.len();
+        // `--static`: whole-tree static findings live in the findings dir (not on
+        // any result) — fold their count into the headline total shown on the CLI.
+        findings += crate::auto::report::tree_static_finding_ids(work).len();
+
+        let per_language = [(Lang::Ada, "Ada"), (Lang::C, "C"), (Lang::Cpp, "C++")]
+            .into_iter()
+            .filter_map(|(lang, name)| {
+                let targets = results.iter().filter(|r| r.candidate.lang == lang).count();
+                if targets == 0 {
+                    return None;
+                }
+                let built = results
+                    .iter()
+                    .filter(|r| r.candidate.lang == lang && is_built(&r.outcome))
+                    .count();
+                Some((name, targets, built))
+            })
+            .collect();
+
+        Self {
+            source: source.to_path_buf(),
+            work: work.to_path_buf(),
+            mode,
+            duration,
+            discovered: results.len(),
+            discovered_total: discovered_total.max(results.len()),
+            resumed,
+            stopped_by_operator,
+            executions,
+            total_elapsed_secs,
+            coverage_edges,
+            built_and_fuzzed,
+            fuzzed_stub_only,
+            built,
+            built_not_entered,
+            skipped,
+            skipped_missing_package,
+            failed_build,
+            link_errors,
+            runtime_errors,
+            report_only,
+            findings,
+            files_fuzzed: files_fuzzed.len(),
+            files_with_targets: files_with_targets.len(),
+            per_language,
+        }
+    }
+
+    /// The full human block, terminated by a newline. Used verbatim for
+    /// both the terminal print and `summary.txt`.
+    fn render(&self) -> String {
+        use std::fmt::Write;
+        let auto_dir = crate::auto::layout::reports_dir(&self.work);
+        let harness_root = crate::auto::layout::harness_root(&self.work);
+        let mut s = String::new();
+
+        let _ = writeln!(s, "BHF findings");
+        let _ = writeln!(s, "  Findings:     {}", self.findings);
+        let _ = writeln!(
+            s,
+            "  START HERE:   {}",
+            self.work.join("FINDINGS.md").display()
+        );
+        let _ = writeln!(
+            s,
+            "  CSV index:    {}",
+            self.work.join("findings.csv").display()
+        );
+        if self.findings > 0 {
+            let _ = writeln!(
+                s,
+                "  Evidence:     {}/",
+                self.work.join("findings").display()
+            );
+        }
+        let _ = writeln!(s);
+        let _ = writeln!(s, "BHF auto summary");
+        let _ = writeln!(s, "  Source:       {}", self.source.display());
+        let _ = writeln!(s, "  Mode:         {}", self.mode.as_str());
+        let _ = writeln!(s, "  Duration:     {}", fmt_duration(self.duration));
+
+        // Outcome breakdown — omit zero categories so the line stays short.
+        // #417: when some "built+fuzzed" targets were STUB-ONLY false cleans,
+        // annotate the count inline so the headline figure is never misread.
+        let mut outcomes = if self.fuzzed_stub_only > 0 {
+            vec![format!(
+                "{} built+fuzzed ({} STUB-ONLY)",
+                self.built_and_fuzzed, self.fuzzed_stub_only
+            )]
+        } else {
+            vec![format!("{} built+fuzzed", self.built_and_fuzzed)]
+        };
+        if self.built > 0 {
+            outcomes.push(format!("{} built", self.built));
+        }
+        // #95: built + ran but never entered the target — surfaced distinctly so
+        // it is never read as a fuzz success.
+        if self.built_not_entered > 0 {
+            outcomes.push(format!("{} built, NOT entered", self.built_not_entered));
+        }
+        if self.skipped > 0 {
+            outcomes.push(format!("{} skipped", self.skipped));
+        }
+        if self.failed_build > 0 {
+            outcomes.push(format!("{} failed build", self.failed_build));
+        }
+        if self.link_errors > 0 {
+            outcomes.push(format!("{} link error", self.link_errors));
+        }
+        if self.runtime_errors > 0 {
+            outcomes.push(format!("{} runtime error", self.runtime_errors));
+        }
+        if self.report_only > 0 {
+            outcomes.push(format!("{} static-only", self.report_only));
+        }
+        let resumed_note = if self.resumed > 0 {
+            format!(" ({} resumed, skipped)", self.resumed)
+        } else {
+            String::new()
+        };
+        // #6: when a cap dropped lower-ranked targets, annotate the discovered
+        // count so the swept figure is never read as the full discovered set.
+        let dropped_by_cap = self.discovered_total.saturating_sub(self.discovered);
+        let cap_note = if dropped_by_cap == 0 {
+            String::new()
+        } else if self.stopped_by_operator {
+            format!(
+                " (of {} ranked, {dropped_by_cap} not attempted — stopped by operator)",
+                self.discovered_total
+            )
+        } else {
+            format!(
+                " (of {} ranked, {dropped_by_cap} dropped by cap)",
+                self.discovered_total
+            )
+        };
+        let _ = writeln!(
+            s,
+            "  Targets:      {} discovered{cap_note}{resumed_note} — {}",
+            self.discovered,
+            outcomes.join(", ")
+        );
+        let _ = writeln!(
+            s,
+            "  Source files: {} fuzzed / {} with targets",
+            self.files_fuzzed, self.files_with_targets
+        );
+        let langs: Vec<String> = self
+            .per_language
+            .iter()
+            .map(|(name, targets, built)| format!("{name} {targets} ({built} built)"))
+            .collect();
+        if !langs.is_empty() {
+            let _ = writeln!(s, "  Languages:    {}", langs.join(", "));
+        }
+        let _ = writeln!(s, "  Executions:   {}", self.executions);
+        // #405: campaign throughput — executions ÷ measured fuzz wall. Shown
+        // only when some wall was measured (a no-fuzz reporting run has none).
+        if self.total_elapsed_secs > 0.0 {
+            let _ = writeln!(
+                s,
+                "  Throughput:   {:.0} exec/s",
+                self.executions as f64 / self.total_elapsed_secs
+            );
+        }
+        if self.coverage_edges > 0 {
+            let _ = writeln!(s, "  Coverage:     {} edges", self.coverage_edges);
+        }
+        // #417: loud false-clean warning. A stub-only target reports clean while
+        // having fuzzed only empty stubs, so call it out explicitly here.
+        if self.fuzzed_stub_only > 0 {
+            let _ = writeln!(
+                s,
+                "  ⚠ WARNING:    {} target(s) fuzzed STUB-ONLY (blind stubs, no real library \
+                 code) — a clean result there is a FALSE CLEAN; see run.md / run.json \
+                 stub_execution",
+                self.fuzzed_stub_only
+            );
+        }
+
+        let _ = writeln!(s);
+        let _ = writeln!(s, "Other output:");
+        let _ = writeln!(s, "  report:    {}", auto_dir.join("run.md").display());
+        let _ = writeln!(s, "             {}", auto_dir.join("run.json").display());
+        let _ = writeln!(
+            s,
+            "  requirements: {}",
+            crate::auto::report::dependency_manifest_pointer(&self.work)
+        );
+        let _ = writeln!(s, "  harnesses: {}/<harness-id>/", harness_root.display());
+        if self.findings > 0 {
+            let _ = writeln!(s, "  findings:  {}/", self.work.join("findings").display());
+        }
+        let _ = writeln!(s, "  summary:   {}", auto_dir.join("summary.txt").display());
+        s
+    }
+}
+
+/// `2m 14s` for a minute or more, `14.3s` below that.
+fn fmt_duration(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs >= 60 {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{:.1}s", d.as_secs_f64())
+    }
+}
+
+/// Print the ranked discovery candidates for `--list-targets`: what `auto` would
+/// harness, best-first, with the signals behind the ranking (language, whether the
+/// input is attacker-reachable, file:line) so the entry-point choice can be judged
+/// at a glance without building anything.
+fn print_ranked_targets(
+    candidates: &[crate::auto::candidate::Candidate],
+    root: &Path,
+) -> std::io::Result<()> {
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    write_ranked_targets(&mut out, candidates, root)
+}
+
+fn write_ranked_targets(
+    out: &mut impl std::io::Write,
+    candidates: &[crate::auto::candidate::Candidate],
+    root: &Path,
+) -> std::io::Result<()> {
+    use crate::auto::candidate::Lang;
+    use target_rank::InputReachability;
+    writeln!(
+        out,
+        "# bhf auto: {} ranked target(s) under {} (highest score first; no build)",
+        candidates.len(),
+        root.display()
+    )?;
+    writeln!(
+        out,
+        "{:>4}  {:>6}  {:<4}  {:<18}  {:<32}  file:line",
+        "rank", "score", "lang", "reachability", "target"
+    )?;
+    for (i, c) in candidates.iter().enumerate() {
+        let lang = match c.lang {
+            Lang::C => "C",
+            Lang::Cpp => "C++",
+            Lang::Ada => "Ada",
+            Lang::Rust => "Rust",
+            Lang::Java => "Java",
+            Lang::Python => "Py",
+            Lang::Perl => "Perl",
+            Lang::Go => "Go",
+            Lang::Cobol => "COBOL",
+            Lang::Fortran => "Fortran",
+            Lang::CSharp => "C#",
+            Lang::Js => "JS",
+            Lang::Ts => "TS",
+            Lang::Ruby => "Ruby",
+            Lang::Lua => "Lua",
+            Lang::Php => "PHP",
+        };
+        let reach = match c.input_reachability {
+            Some(InputReachability::AttackerReachable) => "attacker-reachable",
+            Some(InputReachability::OutputSerializer) => "output/serializer",
+            Some(InputReachability::ReachabilityUnproven) => "unproven",
+            // Dynamic (post-run) — never set at discovery, so --list-targets
+            // (a no-build listing) won't show it, but the match must be exhaustive.
+            Some(InputReachability::IpcChannelReachable) => "ipc-channel",
+            None => "-",
+        };
+        let rel = c.source_path.strip_prefix(root).unwrap_or(&c.source_path);
+        writeln!(
+            out,
+            "{:>4}  {:>6}  {:<4}  {:<18}  {:<32}  {}:{}",
+            i + 1,
+            c.score,
+            lang,
+            reach,
+            c.name,
+            rel.display(),
+            c.line
+        )?;
+    }
+    Ok(())
+}
+
+/// Number of ranked candidates selected by `--max-targets`. Kept in one helper so
+/// the dry-run plan and the real sweep cannot disagree about the cap.
+fn capped_target_count(total: usize, max_targets: Option<usize>) -> usize {
+    max_targets.map_or(total, |cap| total.min(cap))
+}
+
+/// Apply `--max-attempts` by taking candidates from every language and source
+/// file rather than the top of one flat ranking.
+///
+/// Scores are comparable within a language, not across them, so a flat prefix
+/// can be entirely one lane. scrcpy is a C project whose Android server is
+/// Java: the top 25 candidates were all Java, all of them needed an SDK that is
+/// not installed, all of them failed, and the 876 C targets underneath — the
+/// reason anyone fuzzes scrcpy — were never inspected. Round-robin by language,
+/// preserving rank order inside each, so a budget can never be spent entirely on
+/// one lane's doomed prefix. Within a lane, source-file round-robin prevents ten
+/// methods on one unloadable class (for example a Ruby CLI missing Thor) from
+/// consuming the whole cap before an independent parser/helper file is tried.
+fn cap_candidates_across_languages(
+    candidates: Vec<crate::auto::candidate::Candidate>,
+    cap: usize,
+) -> Vec<crate::auto::candidate::Candidate> {
+    use std::collections::BTreeMap;
+    if candidates.len() <= cap {
+        return candidates;
+    }
+    // Preserve overall rank as the tiebreak: remember where each candidate sat.
+    let mut by_language: BTreeMap<String, Vec<(usize, crate::auto::candidate::Candidate)>> =
+        BTreeMap::new();
+    for (rank, candidate) in candidates.into_iter().enumerate() {
+        by_language
+            .entry(format!("{:?}", candidate.lang))
+            .or_default()
+            .push((rank, candidate));
+    }
+    let mut queues: Vec<std::vec::IntoIter<(usize, crate::auto::candidate::Candidate)>> =
+        by_language
+            .into_values()
+            .map(diversify_candidates_across_sources)
+            .map(Vec::into_iter)
+            .collect();
+    // Start with the lane holding the overall top-ranked candidate so the single
+    // best target is still attempted first.
+    queues.sort_by_key(|q| {
+        q.as_slice()
+            .first()
+            .map(|(rank, _)| *rank)
+            .unwrap_or(usize::MAX)
+    });
+
+    let mut picked: Vec<(usize, crate::auto::candidate::Candidate)> = Vec::with_capacity(cap);
+    while picked.len() < cap {
+        let mut progressed = false;
+        for queue in &mut queues {
+            if picked.len() >= cap {
+                break;
+            }
+            if let Some(next) = queue.next() {
+                picked.push(next);
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    // Attempt them in the original ranked order; the round-robin decided WHICH
+    // candidates survive the cap, not the order they are tried in.
+    picked.sort_by_key(|(rank, _)| *rank);
+    picked.into_iter().map(|(_, candidate)| candidate).collect()
+}
+
+fn diversify_candidates_across_sources(
+    candidates: Vec<(usize, crate::auto::candidate::Candidate)>,
+) -> Vec<(usize, crate::auto::candidate::Candidate)> {
+    use std::collections::BTreeMap;
+    let mut by_source: BTreeMap<
+        std::path::PathBuf,
+        Vec<(usize, crate::auto::candidate::Candidate)>,
+    > = BTreeMap::new();
+    for candidate in candidates {
+        by_source
+            .entry(candidate.1.source_path.clone())
+            .or_default()
+            .push(candidate);
+    }
+    let mut queues: Vec<_> = by_source.into_values().map(Vec::into_iter).collect();
+    queues.sort_by_key(|queue| {
+        queue
+            .as_slice()
+            .first()
+            .map(|(rank, _)| *rank)
+            .unwrap_or(usize::MAX)
+    });
+    let mut diversified = Vec::new();
+    loop {
+        let mut progressed = false;
+        for queue in &mut queues {
+            if let Some(candidate) = queue.next() {
+                diversified.push(candidate);
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    diversified
+}
+
+/// Default candidate concurrency: half the host's parallelism, at least 1.
+///
+/// Half rather than all, because each concurrent fuzz is allowed up to
+/// `--rss-limit-mb` and the peak is roughly `jobs x rss-limit-mb` — a default
+/// that saturates the cores would OOM inside a constrained cgroup. Capped so a
+/// very large host does not silently pick a job count whose memory footprint
+/// nobody sized for. `BHF_DEFAULT_JOBS` overrides.
+pub(crate) fn default_auto_jobs() -> usize {
+    const MAX_DEFAULT_JOBS: usize = 8;
+    if let Some(raw) = std::env::var_os("BHF_DEFAULT_JOBS") {
+        if let Some(jobs) = raw.to_str().and_then(|value| value.trim().parse().ok()) {
+            if jobs > 0 {
+                return jobs;
+            }
+        }
+    }
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    (cores / 2).clamp(1, MAX_DEFAULT_JOBS)
+}
+
+pub(crate) fn default_auto_rss_limit_mb() -> usize {
+    crate::resource_limits::dynamic_bytes(
+        "BHF_DEFAULT_HARNESS_RSS_BYTES",
+        4,
+        512 * crate::resource_limits::MIB,
+        2048 * crate::resource_limits::MIB,
+        8192usize.saturating_mul(crate::resource_limits::MIB),
+    ) / crate::resource_limits::MIB
+}
+
+fn normalize_target_file_filter(root: &Path, target_file: &Path) -> PathBuf {
+    let path = if target_file.is_absolute() {
+        target_file.to_path_buf()
+    } else {
+        root.join(target_file)
+    };
+    path.canonicalize().unwrap_or(path)
+}
+
+/// Collect the `--languages` selectors into the internal [`Lang`] set used to
+/// filter candidates. Deduplicates (`--languages c,c` is one entry).
+fn selected_lang_set(
+    selectors: &[crate::auto::candidate::LangSelector],
+) -> std::collections::HashSet<crate::auto::candidate::Lang> {
+    selectors
+        .iter()
+        .map(|selector| selector.to_lang())
+        .collect()
+}
+
+/// Drop every candidate whose language is not in `selected`, in place. Returns
+/// `(kept, dropped)`. An empty `selected` is a no-op (the default: fuzz every
+/// language found) — but callers gate on `args.languages.is_empty()` first, so
+/// this is only reached with a non-empty set.
+fn retain_languages(
+    candidates: &mut Vec<crate::auto::candidate::Candidate>,
+    selected: &std::collections::HashSet<crate::auto::candidate::Lang>,
+) -> (usize, usize) {
+    if selected.is_empty() {
+        return (candidates.len(), 0);
+    }
+    let before = candidates.len();
+    candidates.retain(|candidate| selected.contains(&candidate.lang));
+    let kept = candidates.len();
+    (kept, before - kept)
+}
+
+/// Render the selected language canonical names for the filter log line, in the
+/// stable enum order (not the order given on the command line) and deduplicated,
+/// so the message reads the same regardless of how the operator spelled them.
+fn render_selected_langs(selectors: &[crate::auto::candidate::LangSelector]) -> String {
+    use crate::auto::candidate::Lang;
+    let selected = selected_lang_set(selectors);
+    const ORDER: &[(Lang, &str)] = &[
+        (Lang::Ada, "ada"),
+        (Lang::C, "c"),
+        (Lang::Cpp, "cpp"),
+        (Lang::Rust, "rust"),
+        (Lang::Java, "java"),
+        (Lang::Python, "python"),
+        (Lang::Perl, "perl"),
+        (Lang::Go, "go"),
+        (Lang::Cobol, "cobol"),
+        (Lang::Fortran, "fortran"),
+        (Lang::CSharp, "csharp"),
+        (Lang::Js, "javascript"),
+        (Lang::Ts, "typescript"),
+        (Lang::Ruby, "ruby"),
+        (Lang::Lua, "lua"),
+        (Lang::Php, "php"),
+    ];
+    ORDER
+        .iter()
+        .filter(|(lang, _)| selected.contains(lang))
+        .map(|(_, name)| *name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn target_name_filter_matches(
+    candidate_name: &str,
+    selected: &str,
+    case_insensitive: bool,
+) -> bool {
+    let equal = |left: &str, right: &str| {
+        if case_insensitive {
+            left.eq_ignore_ascii_case(right)
+        } else {
+            left == right
+        }
+    };
+    if equal(candidate_name, selected) {
+        return true;
+    }
+    // Strip the overload profile BEFORE locating the qualified leaf. Looking
+    // for the final `::` in the whole string mistakes a qualified parameter
+    // type (`Parse(const std::string&)`) for the function qualifier. Ada,
+    // Java, Python, and several other lanes use dotted qualification rather
+    // than C++'s `::`, so both separators are accepted.
+    let base = candidate_name
+        .split_once('(')
+        .map(|(head, _)| head)
+        .unwrap_or(candidate_name);
+    if equal(base, selected) {
+        return true;
+    }
+    let colon_leaf = base.rfind("::").map(|index| index + 2);
+    let dot_leaf = base.rfind('.').map(|index| index + 1);
+    let leaf_start = colon_leaf.into_iter().chain(dot_leaf).max().unwrap_or(0);
+    equal(&base[leaf_start..], selected)
+}
+
+fn sort_attacking_candidates(
+    candidates: &mut [crate::auto::candidate::Candidate],
+    mut read_source: impl FnMut(&Path) -> String,
+) {
+    // Compute compact scores one source file at a time. Caching every source
+    // String until sort completion made attacking mode retain essentially the
+    // whole checkout on large trees.
+    let mut indexes_by_path: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
+    for (index, candidate) in candidates.iter().enumerate() {
+        indexes_by_path
+            .entry(candidate.source_path.clone())
+            .or_default()
+            .push(index);
+    }
+    let mut scores = BTreeMap::new();
+    for (path, indexes) in indexes_by_path {
+        let source = read_source(&path);
+        for index in indexes {
+            let candidate = &candidates[index];
+            scores.insert(
+                candidate.harness_id.clone(),
+                actionability::attacking_target_score(candidate.score, &source, &candidate.name),
+            );
+        }
+    }
+    candidates.sort_by_cached_key(|candidate| {
+        (
+            Reverse(
+                scores
+                    .get(&candidate.harness_id)
+                    .copied()
+                    .unwrap_or_default(),
+            ),
+            candidate.name.clone(),
+            candidate.source_path.clone(),
+            candidate.line,
+            candidate.harness_id.clone(),
+        )
+    });
+}
+
+/// The single human-facing label for a target outcome, shared by the
+/// live progress line and `run.md` so the two never drift. The machine
+/// `run.json` `outcome` tag is separate (serde `rename_all = snake_case`)
+/// and stays stable for tooling — e.g. `unsupported_params` there vs.
+/// `skipped: could not auto-harness` here.
+pub(crate) fn outcome_label(o: &crate::auto::attempt::Outcome) -> &'static str {
+    use crate::auto::attempt::Outcome::*;
+    match o {
+        Built { .. } => "built",
+        // #417: a fuzz that only exercised blind stubs is a FALSE CLEAN — give it
+        // a distinct human label so the live progress line and run.md never read
+        // it as a real built+fuzzed campaign. (The machine `outcome` tag stays
+        // `built_and_fuzzed`; the structured signal is run.json `stub_execution`.)
+        BuiltAndFuzzed { .. } if o.stub_execution().is_some_and(|se| se.stub_only) => {
+            "built+fuzzed (STUB-ONLY)"
+        }
+        BuiltAndFuzzed { .. } => "built+fuzzed",
+        // #95: built + ran fuzz passes, but the target-entry probe never fired —
+        // NOT a fuzz success. Named by sub-reason so the progress line is honest.
+        BuiltNotEntered { entry_miss, .. } => match entry_miss.as_str() {
+            "stub_only" => "built, NOT entered (stub-only)",
+            "no_execution" => "built, NOT entered (no execution)",
+            _ => "built, NOT entered (target not reached)",
+        },
+        FailedBuild { .. } => "failed_build",
+        // A deliberate skip, not a missing feature or a bad input: auto
+        // could not synthesise a fuzz harness for this function's
+        // signature (e.g. a function-pointer or opaque-userdata param it
+        // can't drive from a byte buffer).
+        UnsupportedParams { .. } => "skipped: could not auto-harness",
+        UnrecoverableLink { .. } => "unrecoverable_link",
+        UnrecoverableRuntime { .. } => "unrecoverable_runtime",
+        // M22: discovered + statically analyzed, not fuzzed.
+        ReportOnly { .. } => "static-only (not fuzzed)",
+    }
+}
+
+/// Extra indented lines printed under `--verbose` for one target. Each
+/// returned string is one line, without the leading indent the caller
+/// adds. Surfaces the reason auto skipped or failed a target, the
+/// repairs it applied, and per-pass execution/finding counts — the
+/// "what just happened" a human watching the sweep wants.
+fn verbose_detail(outcome: &crate::auto::attempt::Outcome) -> Vec<String> {
+    use crate::auto::attempt::Outcome::*;
+    let mut lines = Vec::new();
+    match outcome {
+        BuiltAndFuzzed {
+            repairs, passes, ..
+        } => {
+            if let Some(summary) = summarize_repairs(repairs) {
+                lines.push(format!("repairs: {summary}"));
+            }
+            let passes = summarize_passes(passes);
+            if !passes.is_empty() {
+                lines.push(passes);
+            }
+        }
+        Built { repairs, .. } => {
+            if let Some(summary) = summarize_repairs(repairs) {
+                lines.push(format!("repairs: {summary}"));
+            }
+        }
+        BuiltNotEntered {
+            repairs,
+            passes,
+            reason,
+            ..
+        } => {
+            lines.push(format!("target NOT entered: {reason}"));
+            if let Some(summary) = summarize_repairs(repairs) {
+                lines.push(format!("repairs: {summary}"));
+            }
+            let passes = summarize_passes(passes);
+            if !passes.is_empty() {
+                lines.push(passes);
+            }
+        }
+        FailedBuild { last_errors, .. } => {
+            if let Some(err) = last_errors.last() {
+                lines.push(format!("last error: {}", build_error_brief(err)));
+            }
+        }
+        UnsupportedParams { reason } => lines.push(reason.clone()),
+        UnrecoverableLink { missing, .. } => {
+            if !missing.is_empty() {
+                lines.push(format!("missing libraries: {}", missing.join(", ")));
+            }
+        }
+        UnrecoverableRuntime {
+            reason,
+            consecutive_crashes,
+            ..
+        } => lines.push(format!(
+            "{reason} (after {consecutive_crashes} consecutive crash(es))"
+        )),
+        ReportOnly {
+            reason,
+            dialect,
+            static_findings,
+            ..
+        } => {
+            let dia = dialect
+                .as_deref()
+                .and_then(lang_profile::Dialect::from_str)
+                .map(|d| format!(" [{}]", d.label()))
+                .unwrap_or_default();
+            lines.push(format!("not fuzzed{dia}: {reason}"));
+            if *static_findings > 0 {
+                lines.push(format!("static findings: {static_findings}"));
+            }
+        }
+    }
+    lines
+}
+
+fn summarize_passes(passes: &[crate::auto::attempt::PassRun]) -> String {
+    passes
+        .iter()
+        .map(|pr| {
+            format!(
+                "{}={}ex/{}f",
+                pr.pass.as_str(),
+                pr.executions,
+                pr.findings.len()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Dependency-crate source directories that Alire has already cached on local
+/// disk for this project (from a prior `alr build`). Read-only filesystem
+/// discovery — nothing is fetched — so air-gapped/offline use is unaffected;
+/// when no cache exists this returns empty and behavior is unchanged. Walks up
+/// from the scanned root to a project that has an `alire/` tree.
+fn discover_local_alire_dep_dirs(scanned: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut dir = scanned;
+    let mut project_manifest: Option<PathBuf> = None;
+    for _ in 0..8 {
+        let manifest = dir.join("alire.toml");
+        if project_manifest.is_none() && manifest.is_file() {
+            project_manifest = Some(manifest);
+        }
+        // Alire vendors deps under alire/cache/dependencies/<crate>/ (and, in
+        // newer layouts, alire/build/<crate>/) when `alr build` ran in-tree.
+        for sub in ["alire/cache/dependencies", "alire/build"] {
+            let cache = dir.join(sub);
+            let Ok(entries) = std::fs::read_dir(&cache) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if let Ok(canon) = path.canonicalize() {
+                        if !out.contains(&canon) {
+                            out.push(canon);
+                        }
+                    }
+                }
+            }
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent,
+            None => break,
+        }
+    }
+
+    // Resolve the crates the project declares in its `alire.toml` (transitively)
+    // against the per-user global Alire cache, where `alr` materializes fetched
+    // crates shared across projects. This is the dominant real-world Ada blocker:
+    // a project that `with`s an external crate (usb_embedded's `hal`/`bbqueue`)
+    // builds only once those crate sources are on the path. Read-only discovery —
+    // nothing is fetched — so a machine that has run `alr` even once for any
+    // project, or has a populated cache, resolves the deps offline; with no cache
+    // this adds nothing and behavior is unchanged.
+    if let Some(manifest) = project_manifest {
+        let deps = parse_alire_dep_names(&manifest);
+        if !deps.is_empty() {
+            for resolved in resolve_deps_against_caches(&deps, &alire_global_cache_roots()) {
+                if !out.contains(&resolved) {
+                    out.push(resolved);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Crate names that are toolchains/build tools, not library dependencies to put
+/// on the source path (they have no fuzzable Ada source to add).
+fn is_alire_toolchain_crate(name: &str) -> bool {
+    matches!(
+        name,
+        "gnat" | "gnat_native" | "gnat_external" | "gprbuild" | "gnatcov" | "gnatprove"
+    )
+}
+
+/// Parse the library crate names a project depends on from its `alire.toml`
+/// `[[depends-on]]` / `[depends-on]` tables. Toolchain crates (gnat, gprbuild)
+/// are excluded — they are compilers, not source dependencies. Returns lowercase
+/// crate names. Read-only; an unreadable manifest yields an empty list.
+///
+/// A small hand scanner rather than a TOML parser: only the crate *keys* inside
+/// `depends-on` tables are needed, and pulling a TOML crate into the production
+/// dependency tree would require a license-matrix entry for no real gain.
+fn parse_alire_dep_names(alire_toml: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(alire_toml) else {
+        return Vec::new();
+    };
+    let mut names = std::collections::BTreeSet::new();
+    let mut in_depends = false;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            // `[depends-on]` and `[[depends-on]]` both reduce to "depends-on".
+            let header = line.trim_matches('[').trim_matches(']').trim();
+            in_depends = header == "depends-on";
+            continue;
+        }
+        if in_depends {
+            if let Some((key, _)) = line.split_once('=') {
+                let key = key.trim().trim_matches('"');
+                if !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    let lower = key.to_ascii_lowercase();
+                    if !is_alire_toolchain_crate(&lower) {
+                        names.insert(lower);
+                    }
+                }
+            }
+        }
+    }
+    names.into_iter().collect()
+}
+
+/// Whether a cache directory name (`hal_1.0.0_<hash>`, `hal_1.0.0`, or `hal`)
+/// belongs to crate `crate_name`. The version segment after `<crate>_` must
+/// start with a digit, so `hal_helper_1.0` is not mistaken for `hal`.
+fn alire_dir_is_crate(dir_name: &str, crate_name: &str) -> bool {
+    let dir = dir_name.to_ascii_lowercase();
+    if dir == crate_name {
+        return true;
+    }
+    dir.strip_prefix(crate_name)
+        .and_then(|rest| rest.strip_prefix('_'))
+        .is_some_and(|version| version.starts_with(|ch: char| ch.is_ascii_digit()))
+}
+
+/// Resolve the named crates (and, transitively, their own dependencies) to local
+/// crate source directories found in `cache_roots`. Read-only filesystem
+/// discovery — nothing is fetched. Each resolved crate's own `alire.toml` is read
+/// to follow transitive dependencies, so a single direct dependency pulls in its
+/// whole resolved closure when those crates are present in the cache.
+fn resolve_deps_against_caches(initial_deps: &[String], cache_roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut frontier: Vec<String> = initial_deps.to_vec();
+
+    // Bounded BFS over the dependency closure (guards against a cyclic manifest
+    // graph). Each round resolves the new crate names against every cache root,
+    // then enqueues the transitive dependencies declared by the crates found.
+    for _ in 0..16 {
+        frontier.retain(|name| seen.insert(name.clone()));
+        if frontier.is_empty() {
+            break;
+        }
+        let mut next: Vec<String> = Vec::new();
+        for root in cache_roots {
+            let Ok(entries) = std::fs::read_dir(root) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if !frontier
+                    .iter()
+                    .any(|crate_name| alire_dir_is_crate(dir_name, crate_name))
+                {
+                    continue;
+                }
+                let canon = path.canonicalize().unwrap_or(path);
+                if !out.contains(&canon) {
+                    out.push(canon.clone());
+                }
+                // Follow the resolved crate's own dependencies.
+                let manifest = canon.join("alire.toml");
+                if manifest.is_file() {
+                    next.extend(parse_alire_dep_names(&manifest));
+                }
+            }
+        }
+        frontier = next;
+    }
+    out
+}
+
+/// The per-user global Alire cache roots where `alr` materializes fetched crate
+/// sources shared across projects. Covers the `ALIRE_SETTINGS_DIR` override and
+/// the standard per-user locations, each in both the `cache/dependencies` (alr
+/// 1.x) and `builds` (alr 2.x) layouts.
+fn alire_global_cache_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mut add_base = |base: PathBuf| {
+        // alr 2.x materializes fetched crate *source* under cache/releases/ and
+        // build artifacts under cache/builds/; alr 1.x used cache/dependencies/
+        // and a top-level builds/. Search all so any installed alr version
+        // resolves.
+        let cache = base.join("cache");
+        roots.push(cache.join("releases"));
+        roots.push(cache.join("dependencies"));
+        roots.push(cache.join("builds"));
+        roots.push(base.join("builds"));
+    };
+    if let Some(dir) = std::env::var_os("ALIRE_SETTINGS_DIR") {
+        add_base(PathBuf::from(dir));
+    }
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        for sub in [
+            ".config/alire",
+            ".local/share/alire",
+            ".alire",
+            ".cache/alire",
+        ] {
+            add_base(home.join(sub));
+        }
+    }
+    roots
+}
+
+/// Count repairs by kind into a compact phrase, e.g.
+/// `synthesized 1 header, stubbed 2 symbols`. Returns `None` when no
+/// repairs were applied so the caller can omit the line entirely.
+fn summarize_repairs(repairs: &[crate::auto::repair::Repair]) -> Option<String> {
+    use crate::auto::repair::Repair::*;
+    if repairs.is_empty() {
+        return None;
+    }
+    let (
+        mut headers,
+        mut types,
+        mut macros,
+        mut declarations,
+        mut symbols,
+        mut sources,
+        mut envs,
+        mut ada,
+        mut incdirs,
+        mut platforms,
+    ) = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    for repair in repairs {
+        match repair {
+            HeaderPlaceholder { .. } | ConfigHeaderSynth { .. } => headers += 1,
+            HeaderForward { .. } | AddIncludeDir { .. } | IncludeTypeHeader { .. } => incdirs += 1,
+            TypePlaceholder { .. } | TypeAlias { .. } | ConfigTypeAlias { .. } => types += 1,
+            MacroDefine { .. } | ConfigGuardDefine { .. } | IncludeStdHeader { .. } => macros += 1,
+            DeclareFunction { .. } => declarations += 1,
+            StubDeclared { .. } | StubBlind { .. } => symbols += 1,
+            AddSource { .. } | AddAdaSource { .. } => sources += 1,
+            EnvVarInjection { .. } => envs += 1,
+            AdaPackageStub { .. }
+            | AdaPackageBodyStub { .. }
+            | OverrideAdaBodyStub { .. }
+            | StubGprImport { .. } => ada += 1,
+            PlatformStub { .. } | Win32Pack | ForcedSyntheticParams { .. } => platforms += 1,
+        }
+    }
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    let mut parts = Vec::new();
+    if headers > 0 {
+        parts.push(format!("synthesized {headers} header{}", plural(headers)));
+    }
+    if incdirs > 0 {
+        parts.push(format!("resolved {incdirs} header dir{}", plural(incdirs)));
+    }
+    if types > 0 {
+        parts.push(format!("synthesized {types} type{}", plural(types)));
+    }
+    if macros > 0 {
+        parts.push(format!("defined {macros} macro{}", plural(macros)));
+    }
+    if declarations > 0 {
+        parts.push(format!(
+            "restored {declarations} declaration{}",
+            plural(declarations)
+        ));
+    }
+    if symbols > 0 {
+        parts.push(format!("stubbed {symbols} symbol{}", plural(symbols)));
+    }
+    if sources > 0 {
+        parts.push(format!("added {sources} source{}", plural(sources)));
+    }
+    if envs > 0 {
+        parts.push(format!("injected {envs} env var{}", plural(envs)));
+    }
+    if ada > 0 {
+        parts.push(format!("stubbed {ada} Ada unit{}", plural(ada)));
+    }
+    if platforms > 0 {
+        parts.push(format!(
+            "stub-isolated {platforms} platform{}",
+            plural(platforms)
+        ));
+    }
+    Some(parts.join(", "))
+}
+
+fn build_error_brief(err: &build_classifier::BuildErrorKind) -> String {
+    use build_classifier::BuildErrorKind::*;
+    match err {
+        MissingHeader { path } => format!("missing header '{path}'"),
+        MissingType { name } => format!("unknown type '{name}'"),
+        IncompleteType { name } => format!("incomplete type '{name}' (definition unavailable)"),
+        MissingMacro { name, .. } => format!("undefined build-config macro '{name}'"),
+        UndefinedSymbol { name } => format!("undefined symbol '{name}'"),
+        UndeclaredFunction { name, file, line } => {
+            format!("undeclared function '{name}' at {file}:{line}")
+        }
+        MissingSharedLib { name } => format!("missing shared library '{name}'"),
+        MissingAdaWith { unit } => format!("missing Ada unit '{unit}'"),
+        MissingAdaSymbol { unit, symbol } => format!("missing Ada symbol '{unit}.{symbol}'"),
+        MissingAdaPackageBody { unit } => format!("missing Ada package body '{unit}'"),
+        UncompilableAdaBody { source } => format!("uncompilable Ada body '{source}'"),
+        MalformedFunctionDecl { file, line } => {
+            format!("malformed function declaration (body-less declarator) at {file}:{line}")
+        }
+        MissingGprImport { path } => format!("missing GPR import '{path}'"),
+        ConfigGuardError {
+            file,
+            line,
+            message,
+        } => format!("build-config #error at {file}:{line}: {message}"),
+        Other { tail } => {
+            // The tail is the last few lines of build output. GNAT prints
+            // warnings before the fatal error, so the first tail line is often
+            // a harmless warning (e.g. "unit X is not referenced") that masks
+            // the real cause. Prefer the first line that names an error.
+            let pick = tail
+                .lines()
+                .find(|line| {
+                    let l = line.to_ascii_lowercase();
+                    l.contains("error:") || l.contains("fatal error")
+                })
+                .or_else(|| tail.lines().next())
+                .unwrap_or("unclassified error");
+            pick.trim().to_owned()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_sanitizer_policy_controls_post_campaign_replays() {
+        use multicore_fuzz::{Sanitizer, SanitizerSelection};
+
+        assert!(sanitizer_replay_enabled(
+            &SanitizerSelection::Default,
+            Sanitizer::Tsan
+        ));
+        assert!(!sanitizer_replay_enabled(
+            &SanitizerSelection::None,
+            Sanitizer::Tsan
+        ));
+        let selected = SanitizerSelection::Set(vec![Sanitizer::Msan]);
+        assert!(sanitizer_replay_enabled(&selected, Sanitizer::Msan));
+        assert!(!sanitizer_replay_enabled(&selected, Sanitizer::Tsan));
+    }
+
+    #[test]
+    fn ranked_target_output_propagates_broken_pipe_without_panicking() {
+        struct BrokenPipe;
+        impl std::io::Write for BrokenPipe {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let err = write_ranked_targets(&mut BrokenPipe, &[], Path::new("/src"))
+            .expect_err("a closed list-targets pipe must be surfaced to the caller");
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+    use crate::auto::candidate::{Candidate, Lang};
+
+    #[test]
+    fn progress_prefix_separates_candidate_position_from_fuzz_success_cap() {
+        assert_eq!(
+            candidate_progress_prefix(713, 26_409, "H-C0713", "parse", 7, Some(100)),
+            "[ 713/26409] [fuzzed   7/100] H-C0713 parse"
+        );
+        assert_eq!(
+            candidate_progress_prefix(3, 191, "H-C0042", "inflate", 0, None),
+            "[   3/ 191] H-C0042 inflate"
+        );
+    }
+
+    #[test]
+    fn run_plan_lists_every_competing_stop_condition() {
+        let plan = run_plan(26_409, 2, Some(50), Some(1800), 3, 16);
+        // Both phases named up front: a `--force` run is two sweeps, and the
+        // second is the expensive one.
+        assert!(
+            plan.contains("phases:     1 unforced → 2 forced (--force)"),
+            "{plan}"
+        );
+        // All three stop conditions, because whichever binds first ends the run.
+        assert!(
+            plan.contains("50 target(s) fuzzed (--max-targets)"),
+            "{plan}"
+        );
+        assert!(plan.contains("30m00s elapsed (--campaign-time)"), "{plan}");
+        assert!(plan.contains("all 26409 candidate(s) attempted"), "{plan}");
+        assert!(plan.contains("jobs:       3 (ceiling 16)"), "{plan}");
+    }
+
+    #[test]
+    fn run_plan_without_limits_says_the_candidate_list_is_the_limit() {
+        let plan = run_plan(191, 1, None, None, 1, 8);
+        assert!(
+            plan.contains("stops at:   all 191 candidate(s) attempted"),
+            "{plan}"
+        );
+        assert!(!plan.contains("--max-targets"), "{plan}");
+        assert!(plan.contains("add --force for a second"), "{plan}");
+    }
+
+    #[test]
+    fn admission_respects_a_lowered_jobs_value_but_never_starves_the_pool() {
+        // Three permits already out, limit lowered to 2: surplus workers park as
+        // they finish rather than being killed mid-build.
+        assert!(!may_admit(3, 2));
+        assert!(may_admit(1, 2));
+        // At `--jobs 1` a second worker never joins, so a lowered run really does
+        // become serial rather than merely reporting that it has.
+        assert!(!may_admit(1, 1));
+        assert!(may_admit(0, 1));
+    }
+
+    #[test]
+    fn detect_custom_build_finds_scripts_and_skips_probed_systems() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Nothing custom, and CMake/Make are auto-probed (not hinted) -> None.
+        std::fs::write(root.join("CMakeLists.txt"), "").unwrap();
+        std::fs::write(root.join("Makefile"), "").unwrap();
+        assert!(detect_custom_build(root).is_none());
+        // A custom build.sh is the classic --build-command case.
+        std::fs::write(root.join("build.sh"), "#!/bin/sh\n").unwrap();
+        let (marker, cmd) = detect_custom_build(root).expect("build.sh detected");
+        assert_eq!(marker, "build.sh");
+        assert_eq!(cmd, "./build.sh");
+    }
+
+    #[test]
+    fn engine_flag_defaults_to_builtin_and_parses_list() {
+        use clap::Parser as _;
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            auto: AutoArgs,
+        }
+        let d = TestCli::try_parse_from(["bhf", "tree"]).unwrap().auto;
+        assert_eq!(d.engine, "builtin");
+        let both = TestCli::try_parse_from(["bhf", "tree", "--engine", "builtin,afl++"])
+            .unwrap()
+            .auto;
+        assert_eq!(both.engine, "builtin,afl++");
+        // The parsed list threads through parse_engine_list at run() time.
+        assert_eq!(
+            crate::fuzz::parse_engine_list(&both.engine).unwrap(),
+            vec![
+                crate::fuzz::FuzzEngine::Builtin,
+                crate::fuzz::FuzzEngine::AflPlusPlus
+            ]
+        );
+    }
+
+    fn mk_candidate(lang: Lang, name: &str) -> Candidate {
+        Candidate {
+            harness_id: format!("H-{name}"),
+            lang,
+            source_path: PathBuf::from(format!("/s/{name}")),
+            line: 1,
+            name: name.to_owned(),
+            score: 0,
+            is_static: false,
+            foreign_guard: None,
+            input_reachability: None,
+            dialect: None,
+        }
+    }
+
+    #[test]
+    fn languages_flag_parses_aliases_and_defaults_to_empty() {
+        use crate::auto::candidate::LangSelector;
+        use clap::Parser as _;
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            auto: AutoArgs,
+        }
+        // Unset (default) = empty = fuzz every language found.
+        let def = TestCli::try_parse_from(["bhf", "tree"]).expect("parses");
+        assert!(def.auto.languages.is_empty());
+
+        // Comma-separated canonical names, one flag.
+        let csv = TestCli::try_parse_from(["bhf", "tree", "--languages", "c,rust,go"])
+            .expect("parses")
+            .auto;
+        assert_eq!(
+            csv.languages,
+            vec![LangSelector::C, LangSelector::Rust, LangSelector::Go]
+        );
+
+        // Aliases (incl. the `--lang` flag alias) map onto the canonical lanes,
+        // case-insensitively.
+        let aliased = TestCli::try_parse_from(["bhf", "tree", "--lang", "C++,Py,RS,pl,golang"])
+            .expect("parses")
+            .auto;
+        assert_eq!(
+            aliased.languages,
+            vec![
+                LangSelector::Cpp,
+                LangSelector::Python,
+                LangSelector::Rust,
+                LangSelector::Perl,
+                LangSelector::Go,
+            ]
+        );
+
+        // The COBOL/Fortran/C# lanes and their aliases parse onto the canonical lanes.
+        let managed =
+            TestCli::try_parse_from(["bhf", "tree", "--languages", "cobol,f90,cs,c#,dotnet"])
+                .expect("parses")
+                .auto;
+        assert_eq!(
+            managed.languages,
+            vec![
+                LangSelector::Cobol,
+                LangSelector::Fortran,
+                LangSelector::CSharp,
+                LangSelector::CSharp,
+                LangSelector::CSharp,
+            ]
+        );
+
+        // The JS/TS lanes and their aliases parse onto the canonical lanes.
+        let web = TestCli::try_parse_from(["bhf", "tree", "--languages", "js,typescript,ts"])
+            .expect("parses")
+            .auto;
+        assert_eq!(
+            web.languages,
+            vec![LangSelector::Js, LangSelector::Ts, LangSelector::Ts]
+        );
+
+        // Unknown language is a hard parse error, not a silent skip.
+        assert!(
+            TestCli::try_parse_from(["bhf", "tree", "--languages", "haskell"]).is_err(),
+            "an unsupported language must error at parse time"
+        );
+    }
+
+    /// `--force` must never cost fuzz reach. Measured over 126 projects, applying
+    /// it from the start of the sweep lost 13 fuzzed targets and gained one
+    /// finding, because a forced attempt costs ~36% more and the campaign budget
+    /// ran out before the viable targets were reached. So phase 1 is unforced and
+    /// phase 2 only retries what phase 1 could not fuzz — and a retry may only
+    /// ever REPLACE a result by fuzzing it.
+    #[test]
+    fn a_forced_retry_can_only_improve_a_targets_outcome() {
+        use crate::auto::attempt::{AttemptResult, Outcome};
+        use crate::auto::candidate::{Candidate, Lang};
+
+        fn target(id: &str, outcome: Outcome) -> AttemptResult {
+            AttemptResult {
+                candidate: Candidate {
+                    harness_id: id.to_owned(),
+                    lang: Lang::C,
+                    source_path: std::path::PathBuf::from("lib.c"),
+                    line: 1,
+                    name: format!("fn_{id}"),
+                    score: 10,
+                    is_static: false,
+                    foreign_guard: None,
+                    input_reachability: None,
+                    dialect: None,
+                },
+                outcome,
+                harness_dir: std::path::PathBuf::from("/tmp/h"),
+            }
+        }
+        let fuzzed = || Outcome::BuiltAndFuzzed {
+            passes: Vec::new(),
+            repairs: Vec::new(),
+            retries: 0,
+            per_pass_budget_secs: 1,
+            total_wall_budget_secs: 1,
+            executions_per_sec: 0.0,
+            runtrace_events: Vec::new(),
+        };
+
+        let mut results = vec![
+            target("H-1", fuzzed()),
+            target(
+                "H-2",
+                Outcome::UnsupportedParams {
+                    reason: "opaque handle".to_owned(),
+                },
+            ),
+            target(
+                "H-3",
+                Outcome::FailedBuild {
+                    repairs: Vec::new(),
+                    retries: 1,
+                    last_errors: Vec::new(),
+                },
+            ),
+        ];
+
+        // The forced pass fuzzed H-2, and produced a WORSE answer for H-3 (a
+        // report-only scan says less than a build error that names the fault).
+        let rescued = merge_forced_retry(
+            &mut results,
+            vec![
+                target("H-2", fuzzed()),
+                target(
+                    "H-3",
+                    Outcome::ReportOnly {
+                        reason: "forced".to_owned(),
+                        dialect: None,
+                        static_findings: 0,
+                        finding_ids: Vec::new(),
+                    },
+                ),
+            ],
+        );
+
+        assert_eq!(
+            rescued, 1,
+            "`rescued` counts only targets forcing moved INTO the fuzz phase"
+        );
+        assert!(
+            reached_fuzz(&results[0].outcome),
+            "H-1 already fuzzed in phase 1, so it is never retried and never replaced"
+        );
+        assert!(reached_fuzz(&results[1].outcome), "H-2 upgraded by forcing");
+        // H-3's forced outcome wins even though it did not fuzz: the operator
+        // asked for forcing, and `--force` promises report-only as its floor
+        // rather than a bare failed_build. Suppressing it broke two contract
+        // tests. Phase 2's own blocker histogram still shows the unforced reason.
+        assert!(
+            matches!(results[2].outcome, Outcome::ReportOnly { .. }),
+            "the forced outcome must win for a target that was retried: {:?}",
+            results[2].outcome
+        );
+    }
+
+    /// `bhf auto --resume --force` over a finished campaign must keep what
+    /// fuzzed and force only what did not. Before this, `force` was part of the
+    /// build-context fingerprint, so adding it invalidated EVERY prior result and
+    /// re-attempted the whole tree — the opposite of resuming.
+    #[test]
+    fn resume_forces_only_the_targets_that_did_not_fuzz() {
+        // The case the user asked for: prior plain campaign, now resumed forced.
+        assert!(
+            !resume_should_reattempt(true, false, true),
+            "a target that already fuzzed must be kept, not re-forced"
+        );
+        assert!(
+            resume_should_reattempt(false, false, true),
+            "a target that did not fuzz is exactly what forcing is for"
+        );
+
+        // A plain resume changes nothing about either.
+        assert!(!resume_should_reattempt(true, false, false));
+        assert!(!resume_should_reattempt(false, false, false));
+
+        // An unforced run must not inherit a forced result: its findings are
+        // stub-heavy and low-confidence, and the report would present them as its
+        // own.
+        assert!(resume_should_reattempt(true, true, false));
+        assert!(resume_should_reattempt(false, true, false));
+
+        // Forced then forced again: nothing new to try either way.
+        assert!(!resume_should_reattempt(true, true, true));
+        assert!(!resume_should_reattempt(false, true, true));
+    }
+
+    #[test]
+    fn force_flag_and_alias_parse() {
+        use clap::Parser as _;
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            auto: AutoArgs,
+        }
+        // Default = off; every non-force path must stay unchanged.
+        let def = TestCli::try_parse_from(["bhf", "tree"]).expect("parses");
+        assert!(!def.auto.force);
+
+        // `--force` sets it.
+        let forced = TestCli::try_parse_from(["bhf", "tree", "--force"])
+            .expect("parses")
+            .auto;
+        assert!(forced.force);
+
+        // `--force-fuzz` alias sets it too.
+        let aliased = TestCli::try_parse_from(["bhf", "tree", "--force-fuzz"])
+            .expect("parses")
+            .auto;
+        assert!(aliased.force);
+    }
+
+    #[test]
+    fn output_limits_have_safe_defaults_and_parse_overrides() {
+        use clap::Parser as _;
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            auto: AutoArgs,
+        }
+        let defaults = TestCli::try_parse_from(["bhf", "tree"]).unwrap().auto;
+        assert_eq!(
+            defaults.max_work_dir_mb,
+            crate::auto::storage::DEFAULT_MAX_WORK_DIR_MIB
+        );
+        assert_eq!(defaults.max_corpus_mb, 64);
+
+        let set = TestCli::try_parse_from([
+            "bhf",
+            "tree",
+            "--max-work-dir-mb",
+            "1024",
+            "--max-corpus-mb",
+            "16",
+        ])
+        .unwrap()
+        .auto;
+        assert_eq!(set.max_work_dir_mb, 1024);
+        assert_eq!(set.max_corpus_mb, 16);
+        assert!(TestCli::try_parse_from(["bhf", "tree", "--max-corpus-mb", "0"]).is_err());
+    }
+
+    #[test]
+    fn lang_selector_maps_every_variant_to_its_lane() {
+        use crate::auto::candidate::LangSelector;
+        assert_eq!(LangSelector::Ada.to_lang(), Lang::Ada);
+        assert_eq!(LangSelector::C.to_lang(), Lang::C);
+        assert_eq!(LangSelector::Cpp.to_lang(), Lang::Cpp);
+        assert_eq!(LangSelector::Rust.to_lang(), Lang::Rust);
+        assert_eq!(LangSelector::Java.to_lang(), Lang::Java);
+        assert_eq!(LangSelector::Python.to_lang(), Lang::Python);
+        assert_eq!(LangSelector::Perl.to_lang(), Lang::Perl);
+        assert_eq!(LangSelector::Go.to_lang(), Lang::Go);
+    }
+
+    #[test]
+    fn retain_languages_keeps_only_selected_lanes() {
+        use crate::auto::candidate::LangSelector;
+        let mut candidates = vec![
+            mk_candidate(Lang::C, "c_fn"),
+            mk_candidate(Lang::Cpp, "cpp_fn"),
+            mk_candidate(Lang::Rust, "rust_fn"),
+            mk_candidate(Lang::Java, "java_fn"),
+            mk_candidate(Lang::Python, "py_fn"),
+        ];
+        let selected = selected_lang_set(&[LangSelector::C, LangSelector::Rust]);
+        let (kept, dropped) = retain_languages(&mut candidates, &selected);
+        assert_eq!((kept, dropped), (2, 3));
+        let names: Vec<&str> = candidates.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["c_fn", "rust_fn"]);
+    }
+
+    #[test]
+    fn retain_languages_empty_set_is_a_no_op() {
+        let mut candidates = vec![
+            mk_candidate(Lang::C, "c_fn"),
+            mk_candidate(Lang::Go, "go_fn"),
+        ];
+        let selected = selected_lang_set(&[]);
+        let (kept, dropped) = retain_languages(&mut candidates, &selected);
+        assert_eq!((kept, dropped), (2, 0));
+        assert_eq!(candidates.len(), 2);
+    }
+
+    #[test]
+    fn render_selected_langs_is_dedup_and_stable_order() {
+        use crate::auto::candidate::LangSelector;
+        // Given out of canonical order and duplicated, the log line is dedup'd
+        // and printed in the fixed enum order so it reads the same every run.
+        let rendered = render_selected_langs(&[
+            LangSelector::Go,
+            LangSelector::C,
+            LangSelector::C,
+            LangSelector::Ada,
+        ]);
+        assert_eq!(rendered, "ada, c, go");
+    }
+
+    #[test]
+    fn every_lang_selector_renders_a_non_empty_name() {
+        // Guard against the ORDER table drifting behind the enum: a new lane whose
+        // Lang is missing from `render_selected_langs` would silently render as `[]`
+        // in the filter log (the cobol/fortran/csharp/js/ts regression), making a
+        // working `--languages csharp` filter look broken. Every selectable language
+        // must map to a printed name.
+        use crate::auto::candidate::LangSelector;
+        use clap::ValueEnum as _;
+        for selector in LangSelector::value_variants() {
+            let rendered = render_selected_langs(std::slice::from_ref(selector));
+            assert!(
+                !rendered.is_empty(),
+                "LangSelector {selector:?} renders empty — add its Lang to \
+                 render_selected_langs ORDER"
+            );
+        }
+    }
+
+    #[test]
+    fn extra_source_flag_parses_into_repeatable_extra_sources() {
+        // `--extra-source` lets a multi-file library's real translation units be
+        // linked into the harness so cross-file symbols resolve instead of being
+        // blind-stubbed (libACPI's AML parser spans ~10 .c files).
+        use clap::Parser as _;
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            auto: AutoArgs,
+        }
+        let cli = TestCli::try_parse_from([
+            "bhf",
+            "tree",
+            "--extra-source",
+            "src/a.c",
+            "--extra-source",
+            "src/b.c",
+        ])
+        .expect("parses");
+        assert_eq!(
+            cli.auto.extra_sources,
+            vec![PathBuf::from("src/a.c"), PathBuf::from("src/b.c")]
+        );
+        // Default is empty when the flag is absent.
+        let none = TestCli::try_parse_from(["bhf", "tree"]).expect("parses");
+        assert!(none.auto.extra_sources.is_empty());
+    }
+
+    #[test]
+    fn the_default_job_count_stays_within_the_documented_bounds() {
+        let jobs = default_auto_jobs();
+        assert!(jobs >= 1, "must attempt at least one candidate");
+        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        assert!(
+            jobs <= cores.max(1),
+            "never more concurrent fuzzers than the host has cores: {jobs} > {cores}"
+        );
+        assert!(
+            jobs <= 8,
+            "peak memory is jobs x rss-limit-mb, so the default is capped: {jobs}"
+        );
+    }
+
+    #[test]
+    fn scaling_flags_parse_with_expected_defaults_and_values() {
+        use clap::Parser as _;
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            auto: AutoArgs,
+        }
+        // Defaults: host-sized concurrency, all repair rounds, no caps, no reuse.
+        let def = TestCli::try_parse_from(["bhf", "tree"]).expect("parses");
+        assert_eq!(
+            def.auto.jobs,
+            default_auto_jobs(),
+            "the default follows the host rather than pinning one core"
+        );
+        assert!(def.auto.jobs >= 1, "a zero job count would attempt nothing");
+        // Explicitly asking for the historical serial sweep still works.
+        let serial = TestCli::try_parse_from(["bhf", "tree", "--jobs", "1"]).expect("parses");
+        assert_eq!(serial.auto.jobs, 1);
+        assert_eq!(
+            def.auto.max_repair_rounds,
+            crate::auto::attempt::DEFAULT_MAX_REPAIR_ROUNDS
+        );
+        assert_eq!(def.auto.max_targets, None);
+        assert_eq!(def.auto.campaign_time, None);
+        assert!(!def.auto.reuse_discovery);
+        assert!(!def.auto.single_pass);
+        assert_eq!(def.auto.passes, None);
+        assert_eq!(def.auto.discovery_cache, None);
+        // --sbom is off by default so `auto` stays fast.
+        assert!(!def.auto.sbom);
+
+        // Explicit values thread through.
+        let set = TestCli::try_parse_from([
+            "bhf",
+            "tree",
+            "--max-targets",
+            "7",
+            "--max-repair-rounds",
+            "2",
+            "--passes",
+            "empty,fuzz",
+            "--jobs",
+            "4",
+            "--reuse-discovery",
+            "--campaign-time",
+            "900",
+            "--discovery-cache",
+            "/tmp/disc.json",
+            "--sbom",
+        ])
+        .expect("parses");
+        assert_eq!(set.auto.max_targets, Some(7));
+        assert_eq!(set.auto.max_repair_rounds, 2);
+        assert_eq!(set.auto.passes.as_deref(), Some("empty,fuzz"));
+        assert_eq!(set.auto.jobs, 4);
+        assert!(set.auto.reuse_discovery);
+        assert_eq!(set.auto.campaign_time, Some(900));
+        assert_eq!(
+            set.auto.discovery_cache,
+            Some(PathBuf::from("/tmp/disc.json"))
+        );
+        assert!(set.auto.sbom);
+
+        // --passes and --single-pass are mutually exclusive.
+        assert!(
+            TestCli::try_parse_from(["bhf", "tree", "--passes", "rng", "--single-pass",]).is_err()
+        );
+    }
+
+    #[test]
+    fn max_targets_caps_dry_run_and_sweep_consistently() {
+        assert_eq!(capped_target_count(12, None), 12);
+        assert_eq!(capped_target_count(12, Some(20)), 12);
+        assert_eq!(capped_target_count(12, Some(5)), 5);
+        assert_eq!(capped_target_count(12, Some(0)), 0);
+    }
+
+    #[test]
+    fn campaign_split_even_share_when_above_floor() {
+        use std::time::Duration;
+        // total/n >= min: every target runs the even share and all are attempted.
+        let (per_target, k) =
+            plan_campaign_split(Duration::from_secs(80), Duration::from_secs(2), 8);
+        assert_eq!(per_target, Duration::from_secs(10));
+        assert_eq!(k, 8);
+    }
+
+    #[test]
+    fn campaign_split_floors_to_min_and_caps_target_count() {
+        use std::time::Duration;
+        // Operator example: total=10s, min=2s, 8 targets. The even share (1.25s)
+        // is below the floor, so each attempted target runs the 2s floor and only
+        // floor(10/2)=5 targets are attempted; the bottom 3 are dropped.
+        let (per_target, k) =
+            plan_campaign_split(Duration::from_secs(10), Duration::from_secs(2), 8);
+        assert_eq!(per_target, Duration::from_secs(2));
+        assert_eq!(k, 5);
+    }
+
+    #[test]
+    fn campaign_split_drops_all_when_budget_below_one_floor_slice() {
+        use std::time::Duration;
+        // total < min: not even one full floor slice fits -> 0 targets fuzzed.
+        let (per_target, k) =
+            plan_campaign_split(Duration::from_secs(1), Duration::from_secs(2), 8);
+        assert_eq!(per_target, Duration::from_secs(2));
+        assert_eq!(k, 0);
+    }
+
+    #[test]
+    fn campaign_split_zero_targets_is_empty() {
+        use std::time::Duration;
+        let (_per_target, k) =
+            plan_campaign_split(Duration::from_secs(10), Duration::from_secs(2), 0);
+        assert_eq!(k, 0);
+    }
+
+    #[test]
+    fn budget_flags_parse_and_min_target_time_requires_campaign() {
+        use clap::Parser as _;
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            auto: AutoArgs,
+        }
+        let def = TestCli::try_parse_from(["bhf", "tree"]).expect("parses");
+        assert_eq!(def.auto.per_target_finding_count, None);
+        assert_eq!(def.auto.min_target_time, None);
+        assert_eq!(def.auto.per_target_time, 60);
+
+        let fc = TestCli::try_parse_from(["bhf", "tree", "--per-target-finding-count", "3"])
+            .expect("parses");
+        assert_eq!(fc.auto.per_target_finding_count, Some(3));
+
+        // --min-target-time REQUIRES --campaign-time.
+        assert!(
+            TestCli::try_parse_from(["bhf", "tree", "--min-target-time", "2"]).is_err(),
+            "--min-target-time without --campaign-time must error"
+        );
+        let split = TestCli::try_parse_from([
+            "bhf",
+            "tree",
+            "--campaign-time",
+            "10",
+            "--min-target-time",
+            "2",
+        ])
+        .expect("parses with campaign-time");
+        assert_eq!(split.auto.campaign_time, Some(10));
+        assert_eq!(split.auto.min_target_time, Some(2));
+
+        // --total-time still parses (deprecated alias, hidden from help).
+        let tt = TestCli::try_parse_from(["bhf", "tree", "--total-time", "90"]).expect("parses");
+        assert_eq!(tt.auto.total_time, Some(90));
+    }
+
+    #[test]
+    fn emit_campaign_sbom_writes_bundle_with_fuzz_reached_from_run_json() {
+        // The `auto --sbom` end-of-campaign hook: over the scanned tree, enriched
+        // with the work dir's auto/run.json. A dlopen failure in run.json creates a
+        // runtime component the FuzzReached pass annotates — proving the campaign's
+        // own run.json fed the bundle. No toolchain needed.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("tree");
+        let work = tmp.path().join("bhf_work");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/tls.c"),
+            "int parse_tls(const char*s){return 0;}\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(work.join("auto")).unwrap();
+        std::fs::write(
+            work.join("auto/run.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": "bhf.auto.v1",
+                "needed_for_build": {
+                    "dlopen_failures": [{
+                        "name": "libssl.so.1.1",
+                        "referenced_by_targets": ["H-SSL"]
+                    }]
+                },
+                "targets": [{
+                    "harness_id": "H-SSL",
+                    "source": root.join("src/tls.c"),
+                    "name": "parse_tls",
+                    "outcome": { "outcome": "built_and_fuzzed", "passes": [{ "executions": 42 }] }
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        emit_campaign_sbom(&root, &work);
+
+        let sbom_dir = work.join("sbom");
+        // Default emit = all four files.
+        for name in [
+            "sbom.json",
+            "cyclonedx.json",
+            "vulnerabilities.json",
+            "openvex.json",
+        ] {
+            assert!(sbom_dir.join(name).is_file(), "--sbom should write {name}");
+        }
+        let sbom: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(sbom_dir.join("sbom.json")).unwrap()).unwrap();
+        let reached = sbom["components"].as_array().unwrap().iter().any(|c| {
+            c["evidence"]
+                .as_str()
+                .is_some_and(|s| s.contains("fuzz_reached"))
+        });
+        assert!(
+            reached,
+            "campaign run.json should mark a component exercised: {sbom:#}"
+        );
+    }
+
+    #[test]
+    fn load_seed_inputs_reads_files_and_dir_entries_and_skips_missing() {
+        let base = std::env::temp_dir().join(format!("bhf-seeds-{}", std::process::id()));
+        let dir = base.join("seeds");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = base.join("one.bin");
+        std::fs::write(&file, b"AAA").unwrap();
+        std::fs::write(dir.join("a.bin"), b"BB").unwrap();
+        std::fs::write(dir.join("b.bin"), b"C").unwrap();
+
+        let seeds = load_seed_inputs(
+            &[file, base.join("missing.bin")],
+            std::slice::from_ref(&dir),
+            crate::fuzz::DEFAULT_MAX_LEN,
+        );
+
+        // 1 readable file (missing one skipped) + 2 dir entries.
+        assert_eq!(seeds.len(), 3);
+        assert!(seeds.contains(&b"AAA".to_vec()));
+        assert!(seeds.contains(&b"BB".to_vec()));
+        assert!(seeds.contains(&b"C".to_vec()));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn load_seed_inputs_truncates_oversized_seeds_to_max_len() {
+        let base = std::env::temp_dir().join(format!("bhf-bigseed-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        // A seed far larger than the mutator's max input length: keeping it whole
+        // would make every pass replay/mutate a huge buffer and collapse
+        // throughput, so it must be truncated to the cap (bytes past it are never
+        // generated). A small in-cap seed is kept verbatim.
+        let big = base.join("big.bin");
+        std::fs::write(&big, vec![0xABu8; crate::fuzz::DEFAULT_MAX_LEN * 4]).unwrap();
+        let small = base.join("small.bin");
+        std::fs::write(&small, b"hello").unwrap();
+
+        let seeds = load_seed_inputs(&[big, small], &[], crate::fuzz::DEFAULT_MAX_LEN);
+
+        assert_eq!(seeds.len(), 2);
+        // The oversized seed is capped, not dropped, and its prefix is preserved.
+        let truncated = seeds
+            .iter()
+            .find(|s| s.len() == crate::fuzz::DEFAULT_MAX_LEN);
+        assert!(
+            truncated.is_some_and(|s| s.iter().all(|&b| b == 0xAB)),
+            "oversized seed must be truncated to DEFAULT_MAX_LEN with its prefix intact"
+        );
+        assert!(
+            seeds.contains(&b"hello".to_vec()),
+            "in-cap seed kept verbatim"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn load_seed_inputs_preserves_complete_seed_up_to_adaptive_cap() {
+        let base = std::env::temp_dir().join(format!("bhf-adaptive-seed-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let archive = base.join("fixture.zip");
+        let mut bytes = vec![0x41; crate::fuzz::DEFAULT_MAX_LEN * 4];
+        bytes.extend_from_slice(b"PK\x05\x06"); // ZIP directory trailer at EOF.
+        std::fs::write(&archive, &bytes).unwrap();
+
+        let seeds = load_seed_inputs(&[archive], &[], crate::fuzz::AUTO_SOFT_CEILING);
+
+        assert_eq!(
+            seeds,
+            vec![bytes],
+            "auto mode must not discard an EOF index"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn alire_tmp(name: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("bhf-alire-{name}-{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn parse_alire_dep_names_reads_depends_on_excluding_toolchain() {
+        let root = alire_tmp("toml");
+        let toml = root.join("alire.toml");
+        std::fs::write(
+            &toml,
+            "name = \"usb_embedded\"\n\
+             [[depends-on]]\nhal = \"^1.0.0\"\nbbqueue = \"^1.0.0\"\n\
+             [[depends-on]]\ngnat = \">=11\"\n",
+        )
+        .unwrap();
+
+        let names = parse_alire_dep_names(&toml);
+
+        assert!(names.contains(&"hal".to_owned()), "{names:?}");
+        assert!(names.contains(&"bbqueue".to_owned()), "{names:?}");
+        assert!(
+            !names.contains(&"gnat".to_owned()),
+            "gnat is a toolchain, not a source dep: {names:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn alire_dir_is_crate_matches_versioned_dirs_only() {
+        assert!(alire_dir_is_crate("hal_1.0.0_abc123", "hal"));
+        assert!(alire_dir_is_crate("hal_1.0.0", "hal"));
+        assert!(alire_dir_is_crate("hal", "hal"));
+        // A different crate that merely shares a prefix is not a match.
+        assert!(!alire_dir_is_crate("hal_helper_1.0.0", "hal"));
+        assert!(!alire_dir_is_crate("unrelated_2.0.0", "hal"));
+    }
+
+    #[test]
+    fn resolve_deps_against_caches_finds_named_crates_transitively() {
+        let root = alire_tmp("cache");
+        let deps = root.join("cache").join("dependencies");
+        std::fs::create_dir_all(deps.join("hal_1.0.0_abc")).unwrap();
+        std::fs::create_dir_all(deps.join("bbqueue_1.2.0_def").join("src")).unwrap();
+        std::fs::create_dir_all(deps.join("unrelated_3.0.0")).unwrap();
+        // `hal` transitively depends on `bbqueue`; resolving `hal` must pull it
+        // in even though the project only names `hal`.
+        std::fs::write(
+            deps.join("hal_1.0.0_abc").join("alire.toml"),
+            "name = \"hal\"\n[[depends-on]]\nbbqueue = \"^1.0.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            deps.join("bbqueue_1.2.0_def").join("alire.toml"),
+            "name = \"bbqueue\"\n",
+        )
+        .unwrap();
+
+        let found = resolve_deps_against_caches(&["hal".to_owned()], std::slice::from_ref(&deps));
+        let names: Vec<String> = found
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_owned))
+            .collect();
+
+        assert!(names.iter().any(|n| n.starts_with("hal_")), "{names:?}");
+        assert!(
+            names.iter().any(|n| n.starts_with("bbqueue_")),
+            "transitive dep must be resolved: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with("unrelated")),
+            "only declared/transitive crates, not the whole cache: {names:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn candidate(source: &str, line: u32, harness_id: &str) -> Candidate {
+        Candidate {
+            harness_id: harness_id.to_owned(),
+            lang: Lang::C,
+            source_path: PathBuf::from(source),
+            line,
+            name: "parse".to_owned(),
+            score: 10,
+            is_static: false,
+            foreign_guard: None,
+            input_reachability: None,
+            dialect: None,
+        }
+    }
+
+    #[test]
+    fn the_attempt_cap_is_spread_across_languages_not_spent_on_one() {
+        // scrcpy: a C project whose Android server is Java. Java scored higher,
+        // so a flat prefix cap gave all 25 attempts to Java targets needing an
+        // SDK that is not installed — every one failed and the C targets, the
+        // reason to fuzz scrcpy at all, were never inspected.
+        let mut candidates = Vec::new();
+        for i in 0..40 {
+            let mut java = candidate("/p/server/Foo.java", i + 1, &format!("H-J{i:04}"));
+            java.lang = Lang::Java;
+            java.score = 900 - i as i32; // every Java target outranks every C one
+            candidates.push(java);
+        }
+        for i in 0..40 {
+            let mut c = candidate("/p/app/src/parse.c", i + 1, &format!("H-C{i:04}"));
+            c.score = 100 - i as i32;
+            candidates.push(c);
+        }
+
+        let capped = cap_candidates_across_languages(candidates.clone(), 10);
+        assert_eq!(capped.len(), 10);
+        let java = capped.iter().filter(|c| c.lang == Lang::Java).count();
+        let c = capped.iter().filter(|c| c.lang == Lang::C).count();
+        assert_eq!((java, c), (5, 5), "both lanes must get attempts");
+        // Rank order within a lane is preserved, and the sweep still attempts in
+        // overall rank order.
+        assert!(capped.windows(2).all(|w| w[0].score >= w[1].score));
+        assert_eq!(
+            capped[0].lang,
+            Lang::Java,
+            "the top-ranked target still leads"
+        );
+
+        // One language and one source file: identical to the old truncation.
+        let single: Vec<_> = candidates
+            .iter()
+            .filter(|c| c.lang == Lang::C)
+            .cloned()
+            .collect();
+        let capped = cap_candidates_across_languages(single.clone(), 7);
+        let ids = |cs: &[Candidate]| cs.iter().map(|c| c.harness_id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&capped), ids(&single[..7]));
+
+        // One language but several files: an unloadable class/file cannot spend
+        // every attempt before independent surfaces are inspected.
+        let mut ruby = Vec::new();
+        for i in 0..8 {
+            let mut item = candidate("/p/lib/cli.rb", i + 1, &format!("H-UCLI{i}"));
+            item.lang = Lang::Ruby;
+            item.score = 100 - i as i32;
+            ruby.push(item);
+        }
+        for (index, source) in ["/p/lib/pane.rb", "/p/lib/project.rb"].iter().enumerate() {
+            let mut item = candidate(source, 1, &format!("H-UOTHER{index}"));
+            item.lang = Lang::Ruby;
+            item.score = 80 - index as i32;
+            ruby.push(item);
+        }
+        let capped = cap_candidates_across_languages(ruby, 3);
+        let files = capped
+            .iter()
+            .map(|candidate| candidate.source_path.as_path())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(files.len(), 3, "attempt cap must diversify source files");
+
+        // A cap at or above the candidate count changes nothing.
+        assert_eq!(
+            cap_candidates_across_languages(single.clone(), 999).len(),
+            single.len()
+        );
+    }
+
+    #[test]
+    fn build_error_brief_prefers_error_line_over_leading_warning() {
+        // GNAT emits unreferenced-unit warnings before the fatal error. The
+        // brief for an unclassified failure must surface the real error, not
+        // the warning that happens to come first in the tail.
+        let err = build_classifier::BuildErrorKind::Other {
+            tail: "main.adb:11:09: warning: unit \"Ada.Text_IO\" is not referenced [-gnatwu]\n\
+                   main.adb:30:24: error: prefix must not be a generic package\n\
+                   gprbuild: *** compilation phase failed"
+                .to_owned(),
+        };
+        assert_eq!(
+            build_error_brief(&err),
+            "main.adb:30:24: error: prefix must not be a generic package"
+        );
+    }
+
+    #[test]
+    fn attacking_order_uses_deterministic_tiebreakers_after_score_and_name() {
+        let mut candidates = vec![
+            candidate("/src/b.c", 1, "H-C0002"),
+            candidate("/src/a.c", 9, "H-C0003"),
+            candidate("/src/a.c", 1, "H-C0002"),
+            candidate("/src/a.c", 1, "H-C0001"),
+        ];
+
+        sort_attacking_candidates(&mut candidates, |_| String::new());
+
+        let ordered = candidates
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.source_path.display().to_string(),
+                    candidate.line,
+                    candidate.harness_id.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            ordered,
+            vec![
+                ("/src/a.c".to_owned(), 1, "H-C0001"),
+                ("/src/a.c".to_owned(), 1, "H-C0002"),
+                ("/src/a.c".to_owned(), 9, "H-C0003"),
+                ("/src/b.c".to_owned(), 1, "H-C0002"),
+            ]
+        );
+    }
+
+    #[test]
+    fn target_name_filter_matches_cpp_qualified_overload_families() {
+        assert!(target_name_filter_matches(
+            "tinyxml2::XMLDocument::Parse(const char *, size_t)",
+            "tinyxml2::XMLDocument::Parse",
+            false,
+        ));
+        assert!(target_name_filter_matches(
+            "tinyxml2::XMLDocument::Parse(const char *, size_t)",
+            "Parse",
+            false,
+        ));
+        assert!(target_name_filter_matches("parse", "parse", false));
+        assert!(target_name_filter_matches(
+            "tinyxml2::XMLDocument::Parse(const std::string &)",
+            "Parse",
+            false,
+        ));
+        assert!(target_name_filter_matches(
+            "Bar_Impl.Compute",
+            "Compute",
+            true,
+        ));
+        assert!(target_name_filter_matches(
+            "Root.Bar_Impl.Compute(String)",
+            "Compute",
+            true,
+        ));
+        assert!(target_name_filter_matches("compute", "Compute", true));
+        assert!(!target_name_filter_matches("compute", "Compute", false));
+        assert!(!target_name_filter_matches(
+            "tinyxml2::XMLDocument::Parse(const char *, size_t)",
+            "Reset",
+            false,
+        ));
+    }
+
+    #[test]
+    fn attacking_order_reads_each_source_path_once_and_uses_cached_text_for_score() {
+        let mut candidates = vec![
+            candidate("/src/safe.c", 1, "H-C0001"),
+            candidate("/src/danger.adb", 1, "H-C0002"),
+            candidate("/src/danger.adb", 2, "H-C0003"),
+        ];
+        for candidate in &mut candidates {
+            candidate.name = "worker".to_owned();
+        }
+        let mut reads = std::collections::BTreeMap::<PathBuf, usize>::new();
+
+        sort_attacking_candidates(&mut candidates, |path| {
+            *reads.entry(path.to_path_buf()).or_default() += 1;
+            if path.ends_with("danger.adb") {
+                "procedure Run is begin GNAT.OS_Lib.Spawn (Cmd, Args); end Run;".to_owned()
+            } else {
+                String::new()
+            }
+        });
+
+        assert_eq!(candidates[0].source_path, PathBuf::from("/src/danger.adb"));
+        assert_eq!(candidates[1].source_path, PathBuf::from("/src/danger.adb"));
+        assert_eq!(candidates[2].source_path, PathBuf::from("/src/safe.c"));
+        assert_eq!(reads[&PathBuf::from("/src/danger.adb")], 1);
+        assert_eq!(reads[&PathBuf::from("/src/safe.c")], 1);
+    }
+
+    #[test]
+    fn resolve_passes_defaults_to_all_three_in_order() {
+        use crate::auto::pass::Pass;
+        assert_eq!(resolve_passes(false, None).unwrap(), Pass::ALL.to_vec());
+    }
+
+    #[test]
+    fn resolve_passes_single_pass_is_only_fuzz_driven() {
+        use crate::auto::pass::Pass;
+        assert_eq!(resolve_passes(true, None).unwrap(), vec![Pass::FuzzDriven]);
+    }
+
+    #[test]
+    fn resolve_passes_parses_named_subset_with_alias_and_dedup() {
+        use crate::auto::pass::Pass;
+        // Order preserved; `fuzz` aliases `fuzz_driven`; duplicates collapse.
+        assert_eq!(
+            resolve_passes(false, Some("rng,fuzz")).unwrap(),
+            vec![Pass::Rng, Pass::FuzzDriven]
+        );
+        assert_eq!(
+            resolve_passes(false, Some("empty, rng , fuzz_driven")).unwrap(),
+            vec![Pass::Empty, Pass::Rng, Pass::FuzzDriven]
+        );
+        assert_eq!(
+            resolve_passes(false, Some("fuzz,fuzz,fuzz")).unwrap(),
+            vec![Pass::FuzzDriven]
+        );
+    }
+
+    #[test]
+    fn resolve_passes_rejects_unknown_and_empty() {
+        assert!(resolve_passes(false, Some("nonsense")).is_err());
+        // Comma-only / whitespace parses to an empty set, which is an error rather
+        // than a silent no-pass run.
+        assert!(resolve_passes(false, Some(" , ")).is_err());
+    }
+
+    #[test]
+    fn unsupported_params_label_reads_as_a_deliberate_skip() {
+        use crate::auto::attempt::Outcome;
+        let outcome = Outcome::UnsupportedParams {
+            reason: "irrelevant".to_owned(),
+        };
+        assert_eq!(outcome_label(&outcome), "skipped: could not auto-harness");
+    }
+
+    #[test]
+    fn verbose_detail_surfaces_the_skip_reason() {
+        use crate::auto::attempt::Outcome;
+        let reason = "C parameter 'pUser' of type 'void *' is not yet supported \
+                      by the C harness emitter";
+        let outcome = Outcome::UnsupportedParams {
+            reason: reason.to_owned(),
+        };
+        assert_eq!(verbose_detail(&outcome), vec![reason.to_owned()]);
+    }
+
+    #[test]
+    fn verbose_detail_summarizes_repairs_and_passes_for_built_and_fuzzed() {
+        use crate::auto::attempt::{Outcome, PassRun};
+        use crate::auto::pass::Pass;
+        use crate::auto::repair::Repair;
+        let outcome = Outcome::BuiltAndFuzzed {
+            repairs: vec![
+                Repair::HeaderPlaceholder {
+                    virtual_path: "internal/log.h".to_owned(),
+                },
+                Repair::StubDeclared {
+                    symbol: "decoder_create".to_owned(),
+                    return_type: "int".to_owned(),
+                    provenance: "declared".to_owned(),
+                },
+                Repair::StubBlind {
+                    symbol: "decoder_free".to_owned(),
+                },
+            ],
+            retries: 1,
+            per_pass_budget_secs: 60,
+            total_wall_budget_secs: 180,
+            executions_per_sec: 119.5,
+            passes: vec![
+                PassRun {
+                    pass: Pass::Empty,
+                    engine: "builtin".to_owned(),
+                    executions: 127,
+                    target_entry_observed: false,
+                    coverage_edges: 0,
+                    elapsed_secs: 1.0,
+                    executions_per_sec: 127.0,
+                    findings: vec![],
+                },
+                PassRun {
+                    pass: Pass::Rng,
+                    engine: "builtin".to_owned(),
+                    executions: 112,
+                    target_entry_observed: false,
+                    coverage_edges: 0,
+                    elapsed_secs: 1.0,
+                    executions_per_sec: 112.0,
+                    findings: vec!["F-0001".to_owned()],
+                },
+            ],
+            runtrace_events: vec![],
+        };
+        assert_eq!(
+            verbose_detail(&outcome),
+            vec![
+                "repairs: synthesized 1 header, stubbed 2 symbols".to_owned(),
+                "empty=127ex/0f rng=112ex/1f".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn verbose_detail_reports_the_last_build_error() {
+        use crate::auto::attempt::Outcome;
+        use build_classifier::BuildErrorKind;
+        let outcome = Outcome::FailedBuild {
+            repairs: vec![],
+            retries: 2,
+            last_errors: vec![
+                BuildErrorKind::MissingHeader {
+                    path: "a.h".to_owned(),
+                },
+                BuildErrorKind::MissingType {
+                    name: "mz_alloc_func".to_owned(),
+                },
+            ],
+        };
+        assert_eq!(
+            verbose_detail(&outcome),
+            vec!["last error: unknown type 'mz_alloc_func'".to_owned()]
+        );
+    }
+
+    #[test]
+    fn summarize_repairs_is_none_when_no_repairs_applied() {
+        assert_eq!(summarize_repairs(&[]), None);
+    }
+
+    #[test]
+    fn fmt_duration_switches_units_at_a_minute() {
+        use std::time::Duration;
+        assert_eq!(fmt_duration(Duration::from_millis(14_300)), "14.3s");
+        assert_eq!(fmt_duration(Duration::from_secs(134)), "2m 14s");
+        assert_eq!(fmt_duration(Duration::from_secs(605)), "10m 05s");
+    }
+
+    #[test]
+    fn collect_counts_outcomes_files_and_languages() {
+        use crate::auto::attempt::{AttemptResult, Outcome, PassRun};
+        use crate::auto::candidate::{Candidate, Lang};
+        use crate::auto::pass::Pass;
+        let mk = |lang, src: &str, outcome| AttemptResult {
+            candidate: Candidate {
+                harness_id: "H".to_owned(),
+                lang,
+                source_path: PathBuf::from(src),
+                line: 1,
+                name: "f".to_owned(),
+                score: 0,
+                is_static: false,
+                foreign_guard: None,
+                input_reachability: None,
+                dialect: None,
+            },
+            outcome,
+            harness_dir: PathBuf::from("/h"),
+        };
+        let results = vec![
+            mk(
+                Lang::C,
+                "/s/a.c",
+                Outcome::BuiltAndFuzzed {
+                    repairs: vec![],
+                    retries: 0,
+                    per_pass_budget_secs: 60,
+                    total_wall_budget_secs: 180,
+                    executions_per_sec: 2.0,
+                    passes: vec![PassRun {
+                        pass: Pass::Rng,
+                        engine: "builtin".to_owned(),
+                        executions: 1,
+                        target_entry_observed: false,
+                        coverage_edges: 0,
+                        elapsed_secs: 0.5,
+                        executions_per_sec: 2.0,
+                        findings: vec!["F-0001".to_owned(), "F-0002".to_owned()],
+                    }],
+                    runtrace_events: vec![],
+                },
+            ),
+            mk(
+                Lang::C,
+                "/s/a.c",
+                Outcome::UnsupportedParams {
+                    reason: "x".to_owned(),
+                },
+            ),
+            mk(
+                Lang::Ada,
+                "/s/b.adb",
+                Outcome::FailedBuild {
+                    repairs: vec![],
+                    retries: 0,
+                    last_errors: vec![],
+                },
+            ),
+        ];
+        let summary = AutoSummary::collect(
+            Path::new("/s"),
+            Path::new("/w"),
+            actionability::RunMode::Reporting,
+            std::time::Duration::from_secs(1),
+            &results,
+            0,
+            0,
+            false,
+        );
+        assert_eq!(summary.discovered, 3);
+        // discovered_total clamps up to the swept count when no cap was passed.
+        assert_eq!(summary.discovered_total, 3);
+        assert_eq!(summary.built_and_fuzzed, 1);
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(summary.failed_build, 1);
+        assert_eq!(summary.findings, 2);
+        // a.c and b.adb have targets; only a.c produced a built target.
+        assert_eq!(summary.files_with_targets, 2);
+        assert_eq!(summary.files_fuzzed, 1);
+        assert_eq!(summary.per_language, vec![("Ada", 1, 0), ("C", 2, 1)]);
+        // #405: measured fuzz wall is summed across passes/targets (only the
+        // one built+fuzzed target's single 0.5s pass here).
+        assert_eq!(summary.total_elapsed_secs, 0.5);
+    }
+
+    #[test]
+    fn built_not_entered_is_counted_separately_never_as_fuzzed() {
+        use crate::auto::attempt::{AttemptResult, Outcome, PassRun};
+        use crate::auto::candidate::{Candidate, Lang};
+        use crate::auto::pass::Pass;
+        let result = AttemptResult {
+            candidate: Candidate {
+                harness_id: "H".to_owned(),
+                lang: Lang::C,
+                source_path: PathBuf::from("/s/a.c"),
+                line: 1,
+                name: "f".to_owned(),
+                score: 0,
+                is_static: false,
+                foreign_guard: None,
+                input_reachability: None,
+                dialect: None,
+            },
+            outcome: Outcome::BuiltNotEntered {
+                repairs: vec![],
+                retries: 0,
+                passes: vec![PassRun {
+                    pass: Pass::Rng,
+                    engine: "builtin".to_owned(),
+                    executions: 100,
+                    target_entry_observed: false,
+                    coverage_edges: 3,
+                    elapsed_secs: 0.5,
+                    executions_per_sec: 200.0,
+                    // A crash produced WITHOUT target entry — a decode/stub
+                    // artifact, not a target finding.
+                    findings: vec!["F-9".to_owned()],
+                }],
+                per_pass_budget_secs: 60,
+                total_wall_budget_secs: 60,
+                executions_per_sec: 200.0,
+                runtrace_events: vec![],
+                entry_miss: "decode_or_bailout".to_owned(),
+                reason: "never entered".to_owned(),
+            },
+            harness_dir: PathBuf::from("/h"),
+        };
+        let summary = AutoSummary::collect(
+            Path::new("/s"),
+            Path::new("/w"),
+            actionability::RunMode::Reporting,
+            std::time::Duration::from_secs(1),
+            std::slice::from_ref(&result),
+            0,
+            0,
+            false,
+        );
+        assert_eq!(summary.built_and_fuzzed, 0, "must NEVER count as fuzzed");
+        assert_eq!(summary.built_not_entered, 1);
+        // Real measurements (throughput/coverage) are still counted ...
+        assert_eq!(summary.executions, 100);
+        assert_eq!(summary.coverage_edges, 3);
+        // ... but a not-entered crash never inflates the finding headline.
+        assert_eq!(summary.findings, 0);
+        let rendered = summary.render();
+        assert!(rendered.contains("built, NOT entered"), "{rendered}");
+        assert!(rendered.contains("0 built+fuzzed"), "{rendered}");
+    }
+
+    #[test]
+    fn render_lists_stats_and_output_locations() {
+        let summary = AutoSummary {
+            stopped_by_operator: false,
+            source: PathBuf::from("/src"),
+            work: PathBuf::from("/w"),
+            mode: actionability::RunMode::Reporting,
+            duration: std::time::Duration::from_secs(134),
+            discovered: 191,
+            discovered_total: 191,
+            resumed: 0,
+            built_and_fuzzed: 12,
+            fuzzed_stub_only: 0,
+            built: 0,
+            built_not_entered: 0,
+            skipped: 171,
+            skipped_missing_package: 0,
+            failed_build: 8,
+            link_errors: 0,
+            runtime_errors: 0,
+            report_only: 0,
+            findings: 112,
+            executions: 9876,
+            total_elapsed_secs: 9.876,
+            coverage_edges: 0,
+            files_fuzzed: 1,
+            files_with_targets: 2,
+            per_language: vec![("C", 191, 12)],
+        };
+        let out = summary.render();
+        assert!(out.contains("Duration:     2m 14s"), "{out}");
+        // #405: campaign throughput = executions ÷ measured fuzz wall.
+        assert!(out.contains("Throughput:   1000 exec/s"), "{out}");
+        assert!(
+            out.contains(
+                "Targets:      191 discovered — 12 built+fuzzed, 171 skipped, 8 failed build"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("Source files: 1 fuzzed / 2 with targets"),
+            "{out}"
+        );
+        assert!(out.contains("Languages:    C 191 (12 built)"), "{out}");
+        assert!(out.contains("Findings:     112"), "{out}");
+        assert!(out.contains("report:    /w/auto/run.md"), "{out}");
+        assert!(
+            out.contains("requirements: /w/auto/missing-deps.txt"),
+            "{out}"
+        );
+        assert!(out.contains("findings:  /w/findings/"), "{out}");
+        assert!(out.contains("summary:   /w/auto/summary.txt"), "{out}");
+    }
+
+    #[test]
+    fn render_omits_findings_dir_when_no_findings() {
+        let summary = AutoSummary {
+            stopped_by_operator: false,
+            source: PathBuf::from("/src"),
+            work: PathBuf::from("/w"),
+            mode: actionability::RunMode::Reporting,
+            duration: std::time::Duration::from_secs(3),
+            discovered: 5,
+            discovered_total: 5,
+            resumed: 0,
+            built_and_fuzzed: 0,
+            fuzzed_stub_only: 0,
+            built: 0,
+            built_not_entered: 0,
+            skipped: 5,
+            skipped_missing_package: 0,
+            failed_build: 0,
+            link_errors: 0,
+            runtime_errors: 0,
+            report_only: 0,
+            findings: 0,
+            executions: 0,
+            total_elapsed_secs: 0.0,
+            coverage_edges: 0,
+            files_fuzzed: 0,
+            files_with_targets: 1,
+            per_language: vec![("C", 5, 0)],
+        };
+        let out = summary.render();
+        assert!(!out.contains("findings:  "), "{out}");
+        // No fuzz wall measured → no throughput line (guarded on > 0).
+        assert!(!out.contains("Throughput:"), "{out}");
+        assert!(out.contains("0 built+fuzzed, 5 skipped"), "{out}");
+    }
+
+    #[test]
+    fn render_annotates_targets_dropped_by_cap() {
+        // #6: when --max-targets / the campaign split dropped lower-ranked
+        // candidates, the console line surfaces the pre-cap total + dropped delta.
+        let summary = AutoSummary {
+            stopped_by_operator: false,
+            source: PathBuf::from("/src"),
+            work: PathBuf::from("/w"),
+            mode: actionability::RunMode::Reporting,
+            duration: std::time::Duration::from_secs(3),
+            discovered: 20,
+            discovered_total: 150,
+            resumed: 0,
+            built_and_fuzzed: 20,
+            fuzzed_stub_only: 0,
+            built: 0,
+            built_not_entered: 0,
+            skipped: 0,
+            skipped_missing_package: 0,
+            failed_build: 0,
+            link_errors: 0,
+            runtime_errors: 0,
+            report_only: 0,
+            findings: 0,
+            executions: 0,
+            total_elapsed_secs: 0.0,
+            coverage_edges: 0,
+            files_fuzzed: 20,
+            files_with_targets: 20,
+            per_language: vec![("C", 20, 20)],
+        };
+        let out = summary.render();
+        assert!(
+            out.contains("20 discovered (of 150 ranked, 130 dropped by cap)"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn render_blames_the_operator_not_a_cap_when_the_run_was_stopped_by_key() {
+        // Pressing `q` leaves the same shortfall a cap would, and attributing it
+        // to "dropped by cap" reports a flag the operator may not even have passed
+        // as the reason for their own decision.
+        let summary = AutoSummary {
+            stopped_by_operator: true,
+            source: PathBuf::from("/src"),
+            work: PathBuf::from("/w"),
+            mode: actionability::RunMode::Reporting,
+            duration: std::time::Duration::from_secs(3),
+            discovered: 2,
+            discovered_total: 5,
+            resumed: 0,
+            built_and_fuzzed: 2,
+            fuzzed_stub_only: 0,
+            built: 0,
+            built_not_entered: 0,
+            skipped: 0,
+            skipped_missing_package: 0,
+            failed_build: 0,
+            link_errors: 0,
+            runtime_errors: 0,
+            report_only: 0,
+            findings: 0,
+            executions: 0,
+            total_elapsed_secs: 0.0,
+            coverage_edges: 0,
+            files_fuzzed: 2,
+            files_with_targets: 2,
+            per_language: vec![("C", 2, 2)],
+        };
+        let out = summary.render();
+        assert!(
+            out.contains("2 discovered (of 5 ranked, 3 not attempted — stopped by operator)"),
+            "{out}"
+        );
+        assert!(!out.contains("dropped by cap"), "{out}");
+    }
+}

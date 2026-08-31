@@ -1,0 +1,149 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// A tree using a language PREVIEW feature is not an unbuildable tree. The
+// `java_preview` fixture uses an unnamed variable (`var _ = …`), preview on JDK
+// 21 and standard only from 22, so it fails at THREE points unless the flag is
+// carried through: the target compile, the harness compile (javac refuses to read
+// preview class files without it), and the JVM that loads them.
+//
+// RxJava and spring-framework failed exactly this way in the 500-project sweep —
+// 11 targets reporting "unnamed variables are a preview feature and are disabled
+// by default", which is javac naming the flag it wants.
+//
+// The planted BHF-201 is behind a byte gate, so finding it proves the harness
+// really ran rather than merely compiling.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+fn fixture() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/java_preview")
+        .canonicalize()
+        .expect("canonicalize java_preview fixture")
+}
+
+fn bhf_bin() -> PathBuf {
+    let mut dir = std::env::current_exe().expect("test exe path");
+    dir.pop();
+    if dir.ends_with("deps") {
+        dir.pop();
+    }
+    dir.join("bhf")
+}
+
+fn has_jdk() -> bool {
+    Command::new("javac").arg("-version").output().is_ok()
+        && Command::new("java").arg("-version").output().is_ok()
+}
+
+/// The JDK feature version of `javac` (`javac 21.0.11` -> 21).
+fn javac_major() -> Option<u32> {
+    let out = Command::new("javac").arg("-version").output().ok()?;
+    let text = if out.stdout.is_empty() {
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    } else {
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    text.split_whitespace()
+        .nth(1)?
+        .split('.')
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Whether this JDK actually needs the flag for the fixture. On JDK 22+ unnamed
+/// variables are standard, so the fixture compiles either way and the test has
+/// nothing to prove — it still must PASS there, just without exercising the
+/// retry, so assert the outcome rather than the flag.
+#[test]
+fn a_preview_language_feature_is_compiled_and_run_with_the_flag_it_asks_for() {
+    let bin = bhf_bin();
+    if !bin.exists() {
+        eprintln!("skip: bhf binary not built at {}", bin.display());
+        return;
+    }
+    if !has_jdk() {
+        eprintln!("skip: no JDK (native Java lane needs javac/java)");
+        return;
+    }
+    // Unnamed variables arrived in JDK 21 (preview) and became standard in 22.
+    // On an older JDK `var _ = …` is not a preview feature at all — javac says
+    // "as of release 9, '_' is a keyword", which `--enable-preview` cannot fix
+    // because there is nothing to enable. The fixture is then untestable rather
+    // than broken, so skip: the GNAT-less rule.
+    match javac_major() {
+        Some(major) if major >= 21 => {}
+        Some(major) => {
+            eprintln!("skip: JDK {major} predates unnamed variables (needs 21+)");
+            return;
+        }
+        None => {
+            eprintln!("skip: could not determine the javac version");
+            return;
+        }
+    }
+
+    let tmp = std::env::temp_dir().join(format!("bhf-java-preview-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let work = tmp.join("work");
+    let seeds = tmp.join("seeds");
+    std::fs::create_dir_all(&seeds).unwrap();
+    std::fs::write(seeds.join("trigger"), b"G\x00\x00\x00\x00\x00\x00\x00").unwrap();
+
+    let output = Command::new(&bin)
+        .args([
+            "auto",
+            fixture().to_str().unwrap(),
+            // 30s: JVM + Jazzer startup can consume most of a 10s budget on a
+            // loaded runner, so the seeded input never gets executed and the test
+            // reports "no finding" when it means "no time". Same exposure that
+            // made auto_java_builder flake on CI.
+            "--per-target-time",
+            "30",
+            "--max-targets",
+            "1",
+            "--seed-dir",
+            seeds.to_str().unwrap(),
+            "--work-dir",
+            work.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run bhf auto on java_preview fixture");
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        combined.contains("built+fuzzed"),
+        "a preview-using tree must build and fuzz, not report an unbuildable \
+         project, got:\n{combined}"
+    );
+    assert!(
+        !combined.contains("preview feature"),
+        "javac named the flag it needed; it must not survive as the reason:\n{combined}"
+    );
+
+    let findings = work.join("findings");
+    let mut found_bhf201 = false;
+    if let Ok(entries) = std::fs::read_dir(&findings) {
+        for entry in entries.flatten() {
+            if let Ok(fj) = std::fs::read_to_string(entry.path().join("finding.json")) {
+                if fj.contains("BHF-201") && fj.contains("ArrayIndexOutOfBounds") {
+                    found_bhf201 = true;
+                }
+            }
+        }
+    }
+    assert!(
+        found_bhf201,
+        "the gated crash proves the JVM LOADED the preview class files, which it \
+         refuses to do without the flag; none under {}, output:\n{combined}",
+        findings.display()
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}

@@ -1,0 +1,1351 @@
+// SPDX-License-Identifier: Apache-2.0
+// generated_harnesses/{{ harness_id }}/main.cpp
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+// Defensive C++ standard-library prelude (campaign: cpptoml). Header-only
+// libraries routinely use std::numeric_limits / std::size_t / std::string while
+// relying on a transitive standard include a normal consumer happens to have
+// pulled in first (e.g. cpptoml.h reaches for std::numeric_limits<long> at file
+// scope without its own <limits>). Emitting these cheap, header-only,
+// always-available standard headers BEFORE the target/library headers lets such
+// a header compile in our minimal translation unit. Order matters: stdlib
+// prelude first, then the bhf decode runtime, then the target headers.
+#include <limits>
+#include <cstdint>
+#include <cstddef>
+#include <cstdlib>
+#include <cstring>
+#include <stdio.h>
+#include <string>
+#include <string_view>
+#include <vector>
+#include <memory>
+#include <utility>
+{%- if uses_array %}
+#include <array>
+{%- endif %}
+{%- if uses_bitset %}
+#include <bitset>
+{%- endif %}
+{%- if uses_chrono %}
+#include <chrono>
+{%- endif %}
+{%- if uses_deque %}
+#include <deque>
+{%- endif %}
+{%- if uses_filesystem %}
+#include <filesystem>
+{%- endif %}
+{%- if uses_forward_list %}
+#include <forward_list>
+{%- endif %}
+{%- if uses_functional %}
+#include <functional>
+{%- endif %}
+{%- if uses_list %}
+#include <list>
+{%- endif %}
+{%- if uses_map %}
+#include <map>
+{%- endif %}
+{%- if uses_optional %}
+#include <optional>
+{%- endif %}
+{%- if uses_set %}
+#include <set>
+{%- endif %}
+{%- if uses_span %}
+#include <span>
+{%- endif %}
+{%- if uses_tuple %}
+#include <tuple>
+{%- endif %}
+{%- if uses_unordered_map %}
+#include <unordered_map>
+{%- endif %}
+{%- if uses_unordered_set %}
+#include <unordered_set>
+{%- endif %}
+{%- if uses_variant %}
+#include <variant>
+{%- endif %}
+#include "bhf_decode.h"
+{%- for header in target_includes %}
+#include "{{ header }}"
+{%- endfor %}
+
+// Keep target-header libc redirects out of the generated coverage/runtime
+// driver. For example, c-ares maps getenv to its restricted ares_getenv.
+#ifdef getenv
+#undef getenv
+#endif
+
+// Sanitizer-runtime callbacks (edge coverage + cmplog operand capture, #400)
+// must never be instrumented themselves: with `-fsanitize-coverage=trace-cmp`
+// on, an un-attributed compare inside one of these would recurse into the
+// trace-cmp callback and tank throughput on every edge. Mark them all NOCOV.
+#ifndef BHF_NOCOV
+#if defined(__has_attribute)
+#if defined(__clang__) && __has_attribute(no_sanitize)
+#define BHF_NOCOV __attribute__((no_sanitize("coverage")))
+#elif __has_attribute(no_sanitize_coverage)
+#define BHF_NOCOV __attribute__((no_sanitize_coverage))
+#elif __has_attribute(no_sanitize)
+#define BHF_NOCOV __attribute__((no_sanitize("coverage")))
+#endif
+#endif
+#endif
+#ifndef BHF_NOCOV
+#define BHF_NOCOV
+#endif
+
+// Keep a value-returning target call observable even when its result is not
+// otherwise consumed. Source-local/header-only targets are visible to the
+// optimizer; a plain `(void)R` lets it delete a pure parser call entirely.
+#if defined(__GNUC__) || defined(__clang__)
+#define BHF_KEEP_RESULT(value) \
+    __asm__ __volatile__("" : : "g"(std::addressof(value)) : "memory")
+#else
+#define BHF_KEEP_RESULT(value) ((void)(value))
+#endif
+
+{%- for ns in using_namespaces %}
+using namespace {{ ns }};
+{%- endfor %}
+
+{# Emit a forward declaration for a free function (class members can't be
+   forward-declared outside the class body). Normally an included project header
+   already brings the function into scope, so we skip the decl when one is
+   present. EXCEPTION: a namespace-qualified free function still gets the decl
+   even with a header, because the auto-included header (e.g. a precompiled
+   `StdAfx.h`) frequently does NOT declare this particular symbol — without the
+   decl the qualified call is an `undeclared identifier`. A namespace-scoped
+   redeclaration matching the real one is legal C++. #}
+{%- if not passthrough_libfuzzer_entrypoint and not target_is_method and (not has_target_header or forward_namespace) %}
+{% if forward_namespace %}namespace {{ forward_namespace }} {
+{% endif %}{{ forward_return_type }} {{ target_name }}({% for type in forward_param_types %}{{ type }}{% if not loop.last %}, {% endif %}{% endfor %});
+{% if forward_namespace %}}
+{% endif %}
+{%- endif %}
+
+// #93: forward-declare bhf's own generated entry points before their
+// definitions, so a recovered compile database's `-Wmissing-declarations`/
+// `-Wmissing-prototypes` policy (often with `-Werror`), which bhf applies to
+// this generated translation unit too, does not fail the harness build. The
+// project's own sources still receive the full recovered warning policy.
+extern "C" int bhf_run_one(const uint8_t *Data, size_t Size);
+{%- if not passthrough_libfuzzer_entrypoint %}
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size);
+{%- endif %}
+
+// Auto-injected by bhf: republish fuzz input to the Linux runtrace shim so
+// fuzz-driven mode can route the current iteration's bytes into fake fds /
+// socket peers / dlopen stubs. Windows has no preload shim and must not emit a
+// COFF weak reference: multiple weak defaults conflict under link.exe.
+#if defined(_WIN32)
+#define BHF_PUBLISH_INPUT(data, size) ((void)0)
+#else
+extern "C" void bhf_shim_set_fuzz_input(const uint8_t *data, size_t size) __attribute__((weak));
+#define BHF_PUBLISH_INPUT(data, size) do { \
+    if (bhf_shim_set_fuzz_input) bhf_shim_set_fuzz_input((data), (size)); \
+} while (0)
+#endif
+
+// The external native driver records a one-byte proof immediately before the
+// selected project endpoint. AFL/standalone builds currently have no shared
+// marker runtime, so they report entry as unobserved rather than fabricating it.
+#if defined(BHF_EXTERNAL_DRIVER)
+extern "C" void bhf_target_enter(void);
+#define BHF_TARGET_ENTER() bhf_target_enter()
+#else
+#define BHF_TARGET_ENTER() ((void)0)
+#endif
+
+{%- if passthrough_libfuzzer_entrypoint %}
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size);
+extern "C" int bhf_run_one(const uint8_t *Data, size_t Size) {
+    BHF_TARGET_ENTER();
+    return LLVMFuzzerTestOneInput(Data, Size);
+}
+{% raw %}#ifndef BHF_EXTERNAL_DRIVER
+/* bhf driver for a passthrough libFuzzer entrypoint (C++).
+ *
+ * The project already supplies `LLVMFuzzerTestOneInput`. Rather than linking
+ * libFuzzer's own `main` (`-fsanitize=fuzzer`) and then mis-driving it from the
+ * built-in engine — which on C++ amalgamations fabricated empty-testcase findings
+ * and yielded zero bhf coverage (#408, same family as the C-side #388) — we
+ * provide a lightweight `main` with NO libFuzzer runtime, plus the SanitizerCoverage
+ * edge-coverage + RedQueen/cmplog + value-profile runtime so the engine reports
+ * real coverage (#385/#398/#400). The Makefile compiles this with
+ * `-fsanitize-coverage=trace-pc-guard,trace-cmp` and WITHOUT `-fsanitize=fuzzer`.
+ * The runtime is the C driver's, wrapped in extern "C" so the sanitizer resolves
+ * the unmangled callback names; layout MUST stay in sync with direct_harness.c.tera
+ * and CmpShmReader in crates/cli/src/fuzz.rs. */
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <io.h>
+#include <fcntl.h>
+#define BHF_DEVNULL "NUL"
+#define bhf_read _read
+#define bhf_write _write
+#define bhf_dup _dup
+#define bhf_dup2 _dup2
+#define bhf_close _close
+#define bhf_open _open
+#else
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#define BHF_DEVNULL "/dev/null"
+#define bhf_read read
+#define bhf_write write
+#define bhf_dup dup
+#define bhf_dup2 dup2
+#define bhf_close close
+#define bhf_open open
+#endif
+
+/* Map a shared, file-backed region of `size` bytes at `path`, or 0 on failure.
+ * POSIX: open+ftruncate+mmap(MAP_SHARED). Windows: CreateFileMapping +
+ * MapViewOfFile, which writes through to the backing file so the engine reads the
+ * same bytes (under wine the host sees the same file). */
+BHF_NOCOV static void *bhf_map_shared(const char *path, size_t size) {
+#ifdef _WIN32
+    HANDLE fh = CreateFileA(path, GENERIC_READ | GENERIC_WRITE,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (fh == INVALID_HANDLE_VALUE) return NULL;
+    HANDLE mh = CreateFileMappingA(fh, NULL, PAGE_READWRITE,
+                                   (DWORD)(((uint64_t)size) >> 32),
+                                   (DWORD)(size & 0xffffffffu), NULL);
+    CloseHandle(fh);
+    if (!mh) return NULL;
+    return MapViewOfFile(mh, FILE_MAP_ALL_ACCESS, 0, 0, size);
+#else
+    int fd = bhf_open(path, O_RDWR | O_CREAT, 0600);
+    if (fd < 0) return NULL;
+    void *p = NULL;
+    if (ftruncate(fd, (off_t)size) == 0) {
+        void *m = mmap(0, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (m != MAP_FAILED) p = m;
+    }
+    bhf_close(fd);
+    return p;
+#endif
+}
+
+#ifdef _WIN32
+/* No ASan on mingw: a vectored exception handler converts a fatal fault into an
+ * immediate, distinctive exit so the engine detects a crash under wine instead
+ * of the process hanging in wine's debugger dialog — bhf's ASan substitute. */
+#define BHF_WIN_CRASH_EXIT 0x39
+BHF_NOCOV static LONG CALLBACK bhf_win_veh(EXCEPTION_POINTERS *info) {
+    DWORD code = info->ExceptionRecord->ExceptionCode;
+    switch (code) {
+    case EXCEPTION_ACCESS_VIOLATION:
+    case EXCEPTION_STACK_OVERFLOW:
+    case EXCEPTION_ILLEGAL_INSTRUCTION:
+    case EXCEPTION_INT_DIVIDE_BY_ZERO:
+    case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:
+    case EXCEPTION_DATATYPE_MISALIGNMENT:
+        fprintf(stderr, "BHF_CRASH code=0x%lx\n", (unsigned long)code);
+        fflush(stderr);
+        TerminateProcess(GetCurrentProcess(), BHF_WIN_CRASH_EXIT);
+        return EXCEPTION_CONTINUE_SEARCH;
+    default:
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+}
+BHF_NOCOV static void bhf_win_install_crash_handler(void) {
+    AddVectoredExceptionHandler(1, bhf_win_veh);
+}
+#endif
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size);
+extern "C" int LLVMFuzzerInitialize(int *argc, char ***argv) __attribute__((weak));
+
+#if !defined(BHF_AFL)
+extern "C" {
+/* Edge-coverage runtime: trace-pc-guard sets one bit per instrumented edge in a
+ * MAP_SHARED bitmap named by BHF_COV_SHM, so coverage accumulates across all
+ * per-spawn children (and within a persistent process) and the parent reads the
+ * popcount. A no-op when BHF_COV_SHM is unset. */
+#define BHF_COV_BITS (1u << 16)
+static unsigned char *bhf_cov_map = 0;
+static uint32_t bhf_cov_next = 0;
+BHF_NOCOV static void bhf_cov_open(void) {
+    const char *p = getenv("BHF_COV_SHM");
+    if (!p || !*p) return;
+    void *m = bhf_map_shared(p, BHF_COV_BITS);
+    if (m) bhf_cov_map = (unsigned char *)m;
+}
+/* AFL-style hit-count buckets (#420): a SECOND MAP_SHARED byte-map named by
+ * BHF_COV_CNT_SHM, the SAME BHF_COV_BITS size as the edge bitmap (one
+ * byte per edge). trace-pc-guard saturating-increments this edge's per-exec hit
+ * count IN ADDITION TO the unchanged presence bit; the engine zeroes it before
+ * every exec and buckets the per-exec count, so a loop run N+1 vs N registers as
+ * new coverage across an AFL bucket boundary that edge-presence cannot see. A
+ * no-op when BHF_COV_CNT_SHM is unset. Layout (size + per-edge byte) MUST
+ * stay in sync with direct_harness.c.tera and the CoverageTracker count reader
+ * in crates/cli/src/fuzz.rs. */
+static unsigned char *bhf_cov_cnt_map = 0;
+BHF_NOCOV static void bhf_cov_cnt_open(void) {
+    const char *p = getenv("BHF_COV_CNT_SHM");
+    if (!p || !*p) return;
+    void *m = bhf_map_shared(p, BHF_COV_BITS);
+    if (m) bhf_cov_cnt_map = (unsigned char *)m;
+}
+/* laf-intel comparison-progress (#421): a THIRD MAP_SHARED byte-map named by
+ * BHF_CMP_PROGRESS_SHM, one byte per hashed compare SITE. For every compare
+ * the trace-cmp callbacks already see, the driver records this exec's MAX number
+ * of matching LEADING bytes (1..7) at that site, so the engine can reward an
+ * input that gets one more byte of a multi-byte gate correct — laf-intel's
+ * gradient WITHOUT a clang split pass. The engine zeroes it before every exec and
+ * folds a newly-reached leading-match LEVEL into a virgin map exactly like the
+ * #420 hit-count buckets. A no-op when BHF_CMP_PROGRESS_SHM is unset (flag
+ * off / Ada / legacy). Layout (size + per-site byte) MUST stay in sync with the
+ * other direct_harness template and the CoverageTracker progress reader in
+ * crates/cli/src/fuzz.rs. */
+#define BHF_CMPP_BITS (1u << 16)
+static unsigned char *bhf_cmpp_map = 0;
+BHF_NOCOV static void bhf_cmpp_open(void) {
+    const char *p = getenv("BHF_CMP_PROGRESS_SHM");
+    if (!p || !*p) return;
+    void *m = bhf_map_shared(p, BHF_CMPP_BITS);
+    if (m) bhf_cmpp_map = (unsigned char *)m;
+}
+/* Hash a compare site (the return address captured in the trace-cmp callback)
+ * relative to an in-module reference so the key is ASLR-INVARIANT across the
+ * fork-server and per-spawn processes of one run. */
+BHF_NOCOV static unsigned bhf_cmpp_slot(const void *ra) {
+    uintptr_t rel = (uintptr_t)ra - (uintptr_t)&bhf_cmpp_open;
+    return (unsigned)(rel * 2654435761u) & (BHF_CMPP_BITS - 1);
+}
+/* Record an integer compare's leading-byte match (#421). `a == b` is a full match
+ * (the gate passes — real edges cover it) and carries no gradient, so it is
+ * skipped; otherwise count the contiguous matching LOW bytes and MAX-raise it. */
+BHF_NOCOV static void bhf_cmpp_int(uint64_t a, uint64_t b, unsigned width, const void *ra) {
+    unsigned m, i, slot;
+    unsigned char p;
+    if (!bhf_cmpp_map || a == b) return;
+    if (width > 8) width = 8;
+    m = 0;
+    for (i = 0; i < width; i++) {
+        if (((a >> (8 * i)) & 0xff) == ((b >> (8 * i)) & 0xff)) m++;
+        else break;
+    }
+    if (m == 0) return;
+    p = (unsigned char)(m > 7 ? 7 : m);
+    slot = bhf_cmpp_slot(ra);
+    if (bhf_cmpp_map[slot] < p) bhf_cmpp_map[slot] = p;
+}
+/* Record a buffer/string compare's common-prefix length (#421). `result == 0` is
+ * a full match (gate passes) -> skipped; otherwise the number of equal leading
+ * bytes is the gradient. `pc` is the real call site supplied by the ASan hook. */
+BHF_NOCOV static void bhf_cmpp_buf(const unsigned char *s1, const unsigned char *s2,
+                                        unsigned n, int result, const void *pc) {
+    unsigned m = 0, slot;
+    unsigned char p;
+    if (!bhf_cmpp_map || result == 0) return;
+    if (n > 8u) n = 8u; /* leading-match LEVEL saturates at 7; scan no further */
+    while (m < n && s1[m] == s2[m]) m++;
+    if (m == 0) return;
+    p = (unsigned char)(m > 7 ? 7 : m);
+    slot = bhf_cmpp_slot(pc);
+    if (bhf_cmpp_map[slot] < p) bhf_cmpp_map[slot] = p;
+}
+
+/* RedQueen/cmplog operand capture (#400). A per-exec ring of (operand_a,
+ * operand_b) comparison pairs in a MAP_SHARED region named by BHF_CMP_SHM.
+ * Layout MUST stay in sync with CmpShmReader in crates/cli/src/fuzz.rs:
+ *   [u32 armed][u32 count] then BHF_CMP_CAP records of
+ *   [u8 len_a][u8 len_b][u8 a[BHF_CMP_OPMAX]][u8 b[BHF_CMP_OPMAX]].
+ * No-op when BHF_CMP_SHM is unset. */
+#define BHF_CMP_CAP 2048u
+#define BHF_CMP_OPMAX 32u
+#define BHF_CMP_REC (2u + 2u * BHF_CMP_OPMAX)
+#define BHF_CMP_BYTES (8u + BHF_CMP_CAP * BHF_CMP_REC)
+static unsigned char *bhf_cmp_map = 0;
+BHF_NOCOV static void bhf_cmp_open(void) {
+    const char *p;
+    if (bhf_cmp_map) return;
+    p = getenv("BHF_CMP_SHM");
+    if (!p || !*p) return;
+    void *m = bhf_map_shared(p, BHF_CMP_BYTES);
+    if (m) bhf_cmp_map = (unsigned char *)m;
+}
+BHF_NOCOV static int bhf_cmp_armed(void) {
+    unsigned char *m = bhf_cmp_map;
+    if (!m) return 0;
+    return m[0] | m[1] | m[2] | m[3];
+}
+BHF_NOCOV static void bhf_cmp_push(const unsigned char *a, unsigned la,
+                                           const unsigned char *b, unsigned lb) {
+    unsigned char *m = bhf_cmp_map;
+    unsigned count, off, i;
+    if (!m) return;
+    if (la > BHF_CMP_OPMAX) la = BHF_CMP_OPMAX;
+    if (lb > BHF_CMP_OPMAX) lb = BHF_CMP_OPMAX;
+    count = (unsigned)m[4] | ((unsigned)m[5] << 8) | ((unsigned)m[6] << 16) | ((unsigned)m[7] << 24);
+    if (count >= BHF_CMP_CAP) return;
+    off = 8u + count * BHF_CMP_REC;
+    m[off] = (unsigned char)la;
+    m[off + 1] = (unsigned char)lb;
+    for (i = 0; i < la; i++) m[off + 2u + i] = a[i];
+    for (i = 0; i < lb; i++) m[off + 2u + BHF_CMP_OPMAX + i] = b[i];
+    count++;
+    m[4] = (unsigned char)count;
+    m[5] = (unsigned char)(count >> 8);
+    m[6] = (unsigned char)(count >> 16);
+    m[7] = (unsigned char)(count >> 24);
+}
+BHF_NOCOV static void bhf_cmp_int(uint64_t a, uint64_t b, unsigned width) {
+    unsigned char ab[8], bb[8];
+    unsigned i;
+    if (!bhf_cmp_armed()) return;
+    if (a == b || a == 0 || b == 0) return;
+    if (width > 8) width = 8;
+    for (i = 0; i < width; i++) {
+        ab[i] = (unsigned char)(a >> (8 * i));
+        bb[i] = (unsigned char)(b >> (8 * i));
+    }
+    bhf_cmp_push(ab, width, bb, width);
+}
+BHF_NOCOV static unsigned bhf_cmp_copy(unsigned char *dst, const unsigned char *src,
+                                               unsigned maxlen, int stop_at_nul) {
+    unsigned i;
+    for (i = 0; i < maxlen; i++) {
+        unsigned char c = src[i];
+        if (stop_at_nul && c == 0) break;
+        dst[i] = c;
+    }
+    return i;
+}
+BHF_NOCOV static void bhf_cmp_buf(const unsigned char *s1, const unsigned char *s2,
+                                          unsigned n, int stop_at_nul, int result) {
+    unsigned char a[BHF_CMP_OPMAX], b[BHF_CMP_OPMAX];
+    unsigned la, lb;
+    if (!bhf_cmp_armed() || result == 0) return; /* result==0: already equal, nothing to learn */
+    if (n > BHF_CMP_OPMAX) n = BHF_CMP_OPMAX;
+    la = bhf_cmp_copy(a, s1, n, stop_at_nul);
+    lb = bhf_cmp_copy(b, s2, n, stop_at_nul);
+    if (la == 0 && lb == 0) return;
+    bhf_cmp_push(a, la, b, lb);
+}
+
+/* Value-profile runtime (#398). Captures each comparison's constant operand into
+ * a MAP_SHARED token log at BHF_VP_SHM that the engine folds into the mutator
+ * dictionary. In-process dedup keeps the log small; a no-op when unset. */
+#define BHF_VP_BYTES (1u << 16)
+static unsigned char *bhf_vp_map = 0;
+static unsigned char bhf_vp_seen1[256];
+static uint64_t bhf_vp_seenN[4096];
+BHF_NOCOV static void bhf_vp_open(void) {
+    const char *p = getenv("BHF_VP_SHM");
+    if (!p || !*p) return;
+    void *m = bhf_map_shared(p, BHF_VP_BYTES);
+    if (m) bhf_vp_map = (unsigned char *)m;
+}
+BHF_NOCOV static void bhf_vp_add(const unsigned char *data, unsigned len) {
+    if (!bhf_vp_map || len == 0 || len > 8) return;
+    /* Skip all-zero operands (ubiquitous, useless) and dedup. */
+    unsigned z = 1;
+    for (unsigned i = 0; i < len; i++) if (data[i]) { z = 0; break; }
+    if (z) return;
+    if (len == 1) {
+        if (bhf_vp_seen1[data[0]]) return;
+        bhf_vp_seen1[data[0]] = 1;
+    } else {
+        uint64_t h = 1469598103934665603ull;
+        for (unsigned i = 0; i < len; i++) { h ^= data[i]; h *= 1099511628211ull; }
+        h ^= len;
+        uint64_t slot = h & 4095u;
+        if (bhf_vp_seenN[slot] == h) return;
+        bhf_vp_seenN[slot] = h;
+    }
+    uint32_t *cursor = (uint32_t *)bhf_vp_map;
+    uint32_t c = *cursor;
+    if ((size_t)c + 1u + len + 4u > BHF_VP_BYTES) return;
+    unsigned char *w = bhf_vp_map + 4 + c;
+    w[0] = (unsigned char)len;
+    for (unsigned i = 0; i < len; i++) w[1 + i] = data[i];
+    *cursor = c + 1 + len;
+}
+BHF_NOCOV void __sanitizer_cov_trace_pc_guard_init(uint32_t *start, uint32_t *stop) {
+    if (start == stop || *start) return;
+    for (uint32_t *x = start; x < stop; x++) *x = ++bhf_cov_next;
+    bhf_cov_open();
+    bhf_cov_cnt_open();
+    bhf_cmp_open();
+    bhf_cmpp_open();
+}
+BHF_NOCOV void __sanitizer_cov_trace_pc_guard(uint32_t *guard) {
+    if (!*guard || !bhf_cov_map) return;
+    bhf_cov_map[*guard & (BHF_COV_BITS - 1)] = 1;
+    /* #420: in addition to the unchanged presence bit, saturating-increment this
+     * edge's per-exec hit count so the engine can bucket loop/recursion depth. */
+    if (bhf_cov_cnt_map && bhf_cov_cnt_map[*guard & (BHF_COV_BITS - 1)] != 255)
+        bhf_cov_cnt_map[*guard & (BHF_COV_BITS - 1)]++;
+}
+/* Unified trace-cmp callbacks: feed BOTH the value-profile dictionary (#398) AND
+ * the per-input RedQueen ring (#400). */
+BHF_NOCOV void __sanitizer_cov_trace_const_cmp1(uint8_t a, uint8_t b) { bhf_vp_add(&a, 1); bhf_vp_add(&b, 1); bhf_cmp_int(a, b, 1); bhf_cmpp_int(a, b, 1, __builtin_return_address(0)); }
+#ifdef _WIN32
+/* mingw-w64 gcc has no `trace-pc-guard`; the Windows build instruments with
+ * `-fsanitize-coverage=trace-pc`, which calls this guard-less hook at each edge.
+ * Hash the return address into the SAME bitmap the guard path fills so the
+ * engine's coverage reader stays platform-agnostic. */
+BHF_NOCOV void __sanitizer_cov_trace_pc(void) {
+    if (!bhf_cov_map) return;
+    uintptr_t pc = (uintptr_t)__builtin_return_address(0);
+    uint32_t h = ((uint32_t)(pc * 2654435761u) >> 4) & (BHF_COV_BITS - 1);
+    bhf_cov_map[h] = 1;
+    if (bhf_cov_cnt_map && bhf_cov_cnt_map[h] != 255)
+        bhf_cov_cnt_map[h]++;
+}
+#endif
+BHF_NOCOV void __sanitizer_cov_trace_cmp1(uint8_t a, uint8_t b) { bhf_vp_add(&a, 1); bhf_vp_add(&b, 1); bhf_cmp_int(a, b, 1); bhf_cmpp_int(a, b, 1, __builtin_return_address(0)); }
+BHF_NOCOV void __sanitizer_cov_trace_const_cmp2(uint16_t a, uint16_t b) { bhf_vp_add((unsigned char *)&a, 2); bhf_vp_add((unsigned char *)&b, 2); bhf_cmp_int(a, b, 2); bhf_cmpp_int(a, b, 2, __builtin_return_address(0)); }
+BHF_NOCOV void __sanitizer_cov_trace_cmp2(uint16_t a, uint16_t b) { bhf_cmp_int(a, b, 2); bhf_cmpp_int(a, b, 2, __builtin_return_address(0)); }
+BHF_NOCOV void __sanitizer_cov_trace_const_cmp4(uint32_t a, uint32_t b) { bhf_vp_add((unsigned char *)&a, 4); bhf_vp_add((unsigned char *)&b, 4); bhf_cmp_int(a, b, 4); bhf_cmpp_int(a, b, 4, __builtin_return_address(0)); }
+BHF_NOCOV void __sanitizer_cov_trace_cmp4(uint32_t a, uint32_t b) { bhf_cmp_int(a, b, 4); bhf_cmpp_int(a, b, 4, __builtin_return_address(0)); }
+BHF_NOCOV void __sanitizer_cov_trace_const_cmp8(uint64_t a, uint64_t b) { bhf_vp_add((unsigned char *)&a, 8); bhf_vp_add((unsigned char *)&b, 8); bhf_cmp_int(a, b, 8); bhf_cmpp_int(a, b, 8, __builtin_return_address(0)); }
+BHF_NOCOV void __sanitizer_cov_trace_cmp8(uint64_t a, uint64_t b) { bhf_cmp_int(a, b, 8); bhf_cmpp_int(a, b, 8, __builtin_return_address(0)); }
+/* Float/double comparison hooks (Fortran numeric code + float-heavy C/C++ emit
+ * these under trace-cmp; missing them fails the link). Feed the bit patterns to
+ * the same cmplog so a magic float/double constant stays learnable. */
+BHF_NOCOV void __sanitizer_cov_trace_cmpf(float a, float b) { uint32_t ua, ub; __builtin_memcpy(&ua, &a, 4); __builtin_memcpy(&ub, &b, 4); bhf_cmp_int(ua, ub, 4); bhf_cmpp_int(ua, ub, 4, __builtin_return_address(0)); }
+BHF_NOCOV void __sanitizer_cov_trace_cmpd(double a, double b) { uint64_t ua, ub; __builtin_memcpy(&ua, &a, 8); __builtin_memcpy(&ub, &b, 8); bhf_cmp_int(ua, ub, 8); bhf_cmpp_int(ua, ub, 8, __builtin_return_address(0)); }
+#ifdef _WIN32
+/* mingw g++ has a builtin __sanitizer_cov_trace_switch(uint64_t, void*); match
+ * its pointer type so this definition does not "ambiguate the built-in
+ * declaration", then recover the uint64_t* view. (clang/gcc accept uint64_t*.) */
+BHF_NOCOV void __sanitizer_cov_trace_switch(uint64_t val, void *cases_v) {
+    uint64_t *cases = (uint64_t *)cases_v;
+#else
+BHF_NOCOV void __sanitizer_cov_trace_switch(uint64_t val, uint64_t *cases) {
+#endif
+    uint64_t n = cases[0], bits = cases[1];
+    unsigned len = (unsigned)(bits / 8);
+    uint64_t i;
+    if (len < 1) len = 1;
+    if (len > 8) len = 8;
+    for (i = 0; i < n; i++) {
+        uint64_t cv = cases[2 + i];
+        bhf_vp_add((unsigned char *)&cv, len);
+    }
+    if (bhf_cmp_armed()) {
+        for (i = 0; i < n && i < 64; i++) bhf_cmp_int(val, cases[2 + i], len);
+    }
+}
+/* ASan's str/mem-cmp interceptors call these weak hooks (even without libFuzzer
+ * linked), feeding multi-byte string/buffer gates into the RedQueen ring (#400). */
+BHF_NOCOV void __sanitizer_weak_hook_memcmp(void *pc, const void *s1, const void *s2, size_t n, int result) {
+    bhf_cmp_buf((const unsigned char *)s1, (const unsigned char *)s2, (unsigned)n, 0, result);
+    bhf_cmpp_buf((const unsigned char *)s1, (const unsigned char *)s2, (unsigned)n, result, pc);
+}
+BHF_NOCOV void __sanitizer_weak_hook_strncmp(void *pc, const char *s1, const char *s2, size_t n, int result) {
+    bhf_cmp_buf((const unsigned char *)s1, (const unsigned char *)s2, (unsigned)n, 1, result);
+    bhf_cmpp_buf((const unsigned char *)s1, (const unsigned char *)s2, (unsigned)n, result, pc);
+}
+BHF_NOCOV void __sanitizer_weak_hook_strcmp(void *pc, const char *s1, const char *s2, int result) {
+    bhf_cmp_buf((const unsigned char *)s1, (const unsigned char *)s2, BHF_CMP_OPMAX, 1, result);
+    bhf_cmpp_buf((const unsigned char *)s1, (const unsigned char *)s2, BHF_CMP_OPMAX, result, pc);
+}
+BHF_NOCOV void __sanitizer_weak_hook_strncasecmp(void *pc, const char *s1, const char *s2, size_t n, int result) {
+    bhf_cmp_buf((const unsigned char *)s1, (const unsigned char *)s2, (unsigned)n, 1, result);
+    bhf_cmpp_buf((const unsigned char *)s1, (const unsigned char *)s2, (unsigned)n, result, pc);
+}
+BHF_NOCOV void __sanitizer_weak_hook_strcasecmp(void *pc, const char *s1, const char *s2, int result) {
+    bhf_cmp_buf((const unsigned char *)s1, (const unsigned char *)s2, BHF_CMP_OPMAX, 1, result);
+    bhf_cmpp_buf((const unsigned char *)s1, (const unsigned char *)s2, BHF_CMP_OPMAX, result, pc);
+}
+} /* extern "C" */
+#else
+static void bhf_vp_open(void) {}
+#endif /* !BHF_AFL */
+
+BHF_NOCOV static void bhf_run_one_bytes(const uint8_t *data, size_t size) {
+    BHF_PUBLISH_INPUT(data, size);
+    LLVMFuzzerTestOneInput(data, size);
+}
+static void bhf_run_file(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    if (n < 0) n = 0;
+    rewind(f);
+    /* +1 + NUL so a C-string-API harness (`(const char *)Data`) can't strlen
+     * past an exact-size replay buffer (matches the over-allocated fuzz path). */
+    uint8_t *b = (uint8_t *)malloc((size_t)(n ? n : 1) + 1);
+    if (!b) { fclose(f); return; }
+    size_t r = fread(b, 1, (size_t)n, f);
+    b[r] = 0;
+    fclose(f);
+    bhf_run_one_bytes(b, r);
+    free(b);
+}
+static int bhf_read_n(int fd, void *buf, size_t n) {
+    size_t got = 0;
+    unsigned char *b = (unsigned char *)buf;
+    while (got < n) {
+        int r = (int)bhf_read(fd, b + got, (unsigned)(n - got));
+        if (r <= 0) return 0;
+        got += (size_t)r;
+    }
+    return 1;
+}
+int main(int argc, char **argv) {
+    if (LLVMFuzzerInitialize) LLVMFuzzerInitialize(&argc, &argv);
+    bhf_vp_open();
+    /* Persistent fork-server framed protocol (BHF_FRAMED=1): write a ready
+     * byte, then loop reading {u32 LE length, bytes} and replying one sync byte
+     * per input. */
+#ifdef _WIN32
+    /* Install the crash handler before any target code runs so a fault in either
+     * the framed loop or the argv re-isolation path becomes a detectable exit. */
+    bhf_win_install_crash_handler();
+#endif
+    if (getenv("BHF_FRAMED")) {
+        /* #427: the sync channel is the harness's original stdout (the pipe the
+         * engine reads sync bytes from). A target that writes to stdout shares it;
+         * its output fills the buffer the engine drains only one sync byte per
+         * input from, blocking the harness on write() and deadlocking the
+         * fork-server. Save the control fd, then point fd 1 at /dev/null so the
+         * target's stdout is discarded and only sync bytes reach the engine. */
+        int bhf_ctrl_fd = bhf_dup(1);
+        int bhf_devnull;
+        unsigned char ready = 1;
+        if (bhf_ctrl_fd < 0) return 1;
+#ifdef _WIN32
+        /* trace-pc has no guard-init to open the maps, so open them here; set
+         * stdin + the control fd to binary so the framed {u32 len, bytes}
+         * protocol is not CRLF/EOF-translated by the CRT. */
+        bhf_cov_open();
+        bhf_cov_cnt_open();
+        bhf_cmpp_open();
+        bhf_cmp_open();
+        _setmode(0, _O_BINARY);
+        _setmode(bhf_ctrl_fd, _O_BINARY);
+#endif
+        bhf_devnull = bhf_open(BHF_DEVNULL, O_WRONLY);
+        if (bhf_devnull >= 0) {
+            bhf_dup2(bhf_devnull, 1);
+            if (bhf_devnull != 1) bhf_close(bhf_devnull);
+        }
+        if (bhf_write(bhf_ctrl_fd, &ready, 1) != 1) return 1;
+        size_t cap = 1u << 20;
+        /* +1 so the input is always NUL-terminable for C-string-API harnesses. */
+        uint8_t *buf = (uint8_t *)malloc(cap + 1);
+        if (!buf) return 1;
+        for (;;) {
+            uint32_t len;
+            if (!bhf_read_n(0, &len, 4)) break;
+            if ((size_t)len > cap) len = (uint32_t)cap;
+            if (len && !bhf_read_n(0, buf, len)) break;
+            buf[len] = 0;
+            bhf_run_one_bytes(buf, len);
+            unsigned char sync = 1;
+            if (bhf_write(bhf_ctrl_fd, &sync, 1) != 1) break;
+        }
+        free(buf);
+        return 0;
+    }
+    if (argc < 2) return 0;
+    bhf_run_file(argv[1]);
+    return 0;
+}
+#endif /* !BHF_EXTERNAL_DRIVER */
+{% endraw %}
+{%- else %}
+{%- for p in params %}
+{%- if p.support %}
+{{ p.support }}
+{%- endif %}
+{%- endfor %}
+{%- for p in constructor_params %}
+{%- if p.support %}
+{{ p.support }}
+{%- endif %}
+{%- endfor %}
+{%- if factory %}
+{%- for p in factory.params %}
+{%- if p.support %}
+{{ p.support }}
+{%- endif %}
+{%- endfor %}
+{%- endif %}
+{%- for step in lifecycle_steps %}
+{%- for p in step.params %}
+{%- if p.support %}
+{{ p.support }}
+{%- endif %}
+{%- endfor %}
+{%- endfor %}
+{%- for step in protocol_steps %}
+{%- for p in step.params %}
+{%- if p.support %}
+{{ p.support }}
+{%- endif %}
+{%- endfor %}
+{%- endfor %}
+extern "C" int bhf_run_one(const uint8_t *Data, size_t Size) {
+    BHF_PUBLISH_INPUT(Data, Size);
+    // The body is wrapped in try/catch to swallow expected C++ exceptions from
+    // rejected input — but only when exceptions are actually enabled. A project
+    // whose build context disables them (basis_universal compiles with
+    // `-fno-exceptions`) would otherwise fail with "cannot use 'try' with
+    // exceptions disabled"; there the body simply runs unguarded.
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS)
+    try {
+#endif
+{%- if expert_re2_parse %}
+    /* Public RE2 parser lifecycle. Feed the complete testcase as the regex;
+     * parser flags are configuration, not a prefix stolen from the pattern. */
+    re2::RegexpStatus _bhf_status;
+    BHF_TARGET_ENTER();
+    re2::Regexp *R = re2::Regexp::Parse(
+        absl::string_view(reinterpret_cast<const char *>(Data), Size),
+        re2::Regexp::LikePerl, &_bhf_status);
+    BHF_KEEP_RESULT(R);
+    if (R) R->Decref();
+{%- else %}
+    bhf_cursor Cur = bhf_open(Data, Size);
+{%- for p in params %}
+    {{ p.decl }};
+{%- endfor %}
+{%- if factory %}
+    // Factory-based receiver: the owner is stack-allocated and kept in scope so
+    // the receiver's lifetime (which may be owned by the factory's owner) is safe.
+{%- for p in factory.params %}
+    {{ p.decl }};
+{%- endfor %}
+{%- if factory.owner_type and factory.owner_method_is_static %}
+    auto _bhf_receiver = {{ factory.owner_type }}::{{ factory.method }}({% for p in factory.params %}{{ p.arg }}{% if not loop.last %}, {% endif %}{% endfor %});
+{%- elif factory.owner_type %}
+    {{ factory.owner_type }} _bhf_owner;
+    auto _bhf_receiver = _bhf_owner.{{ factory.method }}({% for p in factory.params %}{{ p.arg }}{% if not loop.last %}, {% endif %}{% endfor %});
+{%- else %}
+    auto _bhf_receiver = {{ factory.method }}({% for p in factory.params %}{{ p.arg }}{% if not loop.last %}, {% endif %}{% endfor %});
+{%- endif %}
+{%- if factory.receiver_is_pointer %}
+{%- if return_type_present %}
+    {{ return_type }} R{};
+{%- endif %}
+    if (_bhf_receiver) {
+        BHF_TARGET_ENTER();
+{%- if return_type_present %}
+        R = _bhf_receiver->{{ target_name }}({% for p in params %}{{ p.arg }}{% if not loop.last %}, {% endif %}{% endfor %});
+{%- else %}
+        (void)_bhf_receiver->{{ target_name }}({% for p in params %}{{ p.arg }}{% if not loop.last %}, {% endif %}{% endfor %});
+{%- endif %}
+    }
+{%- else %}
+    BHF_TARGET_ENTER();
+    {% if return_type_present %}{{ return_type }} R = {% endif %}_bhf_receiver.{{ target_name }}({% for p in params %}{{ p.arg }}{% if not loop.last %}, {% endif %}{% endfor %});
+{%- endif %}
+{%- elif receiver_class %}
+{%- if target_is_constructor %}
+    // The target is itself a constructor: direct-initialize the instance from the
+    // decoded parameters. Naming a constructor as a member function is illegal C++.
+    BHF_TARGET_ENTER();
+    {{ receiver_class }} _bhf_receiver({% for p in params %}{{ p.arg }}{% if not loop.last %}, {% endif %}{% endfor %});
+    (void)_bhf_receiver;
+{%- else %}
+{%- for p in constructor_params %}
+    {{ p.decl }};
+{%- endfor %}
+    {{ receiver_class }} _bhf_receiver{% if constructor_params %}({% for p in constructor_params %}{{ p.arg }}{% if not loop.last %}, {% endif %}{% endfor %}){% endif %};
+{%- endif %}
+{%- if protocol_steps %}
+    // Project-mined expert protocol: declaration-checked calls run once in the
+    // observed order, retaining safe literals and coherent input/size bindings.
+{%- for step in protocol_steps %}
+{%- for p in step.params %}
+    {{ p.decl }};
+{%- endfor %}
+{%- if step.marks_target %}
+    BHF_TARGET_ENTER();
+{%- endif %}
+    {% if step.return_type_present %}{{ step.return_type }} {{ step.result_name }} = {% else %}(void){% endif %}_bhf_receiver.{{ step.name }}({% for p in step.params %}{{ p.arg }}{% if not loop.last %}, {% endif %}{% endfor %});
+{%- if step.return_type_present %}
+    (void){{ step.result_name }};
+{%- endif %}
+{%- for p in step.params %}
+{%- if p.free %}
+    {{ p.free }};
+{%- endif %}
+{%- endfor %}
+{%- endfor %}
+{%- endif %}
+{%- if lifecycle_steps %}
+    size_t _bhf_lifecycle_count = (size_t)(bhf_u8(&Cur) % ({{ lifecycle_step_count }} + 1));
+    for (size_t _bhf_lifecycle_index = 0; _bhf_lifecycle_index < _bhf_lifecycle_count; ++_bhf_lifecycle_index) {
+        switch (bhf_u8(&Cur) % {{ lifecycle_step_count }}) {
+{%- for step in lifecycle_steps %}
+        case {{ loop.index0 }}: {
+{%- for p in step.params %}
+            {{ p.decl }};
+{%- endfor %}
+            {% if step.return_type_present %}{{ step.return_type }} {{ step.result_name }} = {% endif %}_bhf_receiver.{{ step.name }}({% for p in step.params %}{{ p.arg }}{% if not loop.last %}, {% endif %}{% endfor %});
+{%- if step.return_type_present %}
+            (void){{ step.result_name }};
+{%- endif %}
+{%- for p in step.params %}
+{%- if p.free %}
+            {{ p.free }};
+{%- endif %}
+{%- endfor %}
+            break;
+        }
+{%- endfor %}
+        default:
+            break;
+        }
+    }
+    // RAII destructors run when _bhf_receiver leaves scope.
+{%- endif %}
+{%- if not target_is_constructor and not protocol_steps %}
+    BHF_TARGET_ENTER();
+    {% if return_type_present %}{{ return_type }} R = {% endif %}_bhf_receiver.{{ target_name }}({% for p in params %}{{ p.arg }}{% if not loop.last %}, {% endif %}{% endfor %});
+{%- endif %}
+{%- elif byte_stream %}
+    /* Byte-stream decoder: replay the whole fuzz input through the target one
+     * byte at a time so its stateful protocol machine is actually driven. The
+     * first parameter is the streamed untrusted byte; the rest are backed once. */
+    for (size_t _bhf_i = 0; _bhf_i < Size; ++_bhf_i) {
+        BHF_TARGET_ENTER();
+        (void){{ qualified_target_name }}((Data[_bhf_i]){% for p in params %}, {{ p.arg }}{% endfor %});
+    }
+{%- else %}
+    BHF_TARGET_ENTER();
+    {% if return_type_present %}{{ return_type }} R = {% endif %}{{ qualified_target_name }}{{ target_template_suffix }}({% for p in params %}{{ p.arg }}{% if not loop.last %}, {% endif %}{% endfor %});
+{%- endif %}
+    (void)Cur;
+{%- if return_type_present and not byte_stream and not protocol_steps %}
+    BHF_KEEP_RESULT(R);
+{%- endif %}
+{%- if result_cleanup and not byte_stream and not protocol_steps %}
+    {{ result_cleanup }};
+{%- endif %}
+{%- for p in params %}
+{%- if p.free %}
+    {{ p.free }};
+{%- endif %}
+{%- endfor %}
+{%- for p in constructor_params %}
+{%- if p.free %}
+    {{ p.free }};
+{%- endif %}
+{%- endfor %}
+{%- if factory %}
+{%- for p in factory.params %}
+{%- if p.free %}
+    {{ p.free }};
+{%- endif %}
+{%- endfor %}
+{%- endif %}
+{%- endif %}
+    return 0;
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS)
+    } catch (...) {
+        return 0;
+    }
+#endif
+}
+
+#if defined(BHF_AFL)
+// AFL++ persistent-mode entrypoint. Compiled with afl-clang-fast++.
+#include <unistd.h>
+#include <errno.h>
+
+#ifndef __AFL_FUZZ_INIT
+#define __AFL_FUZZ_INIT()
+#endif
+
+__AFL_FUZZ_INIT();
+
+#ifndef __AFL_FUZZ_TESTCASE_BUF
+#define __AFL_FUZZ_TESTCASE_BUF bhf_afl_buf
+static uint8_t bhf_afl_buf[1024 * 1024];
+#endif
+
+#ifndef __AFL_FUZZ_TESTCASE_LEN
+static size_t bhf_afl_read_stdin(uint8_t *buf, size_t cap) {
+    size_t total = 0;
+    while (total < cap) {
+        ssize_t n = read(0, buf + total, cap - total);
+        if (n == 0) break;
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        total += (size_t)n;
+    }
+    return total;
+}
+#define __AFL_FUZZ_TESTCASE_LEN bhf_afl_read_stdin(__AFL_FUZZ_TESTCASE_BUF, sizeof(bhf_afl_buf))
+#endif
+
+#ifndef __AFL_LOOP
+static int bhf_afl_loop_remaining = 1;
+#define __AFL_LOOP(_n) (bhf_afl_loop_remaining-- > 0)
+#endif
+
+#ifndef __AFL_INIT
+#define __AFL_INIT()
+#endif
+
+int main(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+#ifdef __AFL_HAVE_MANUAL_CONTROL
+    __AFL_INIT();
+#endif
+    uint8_t *buf = __AFL_FUZZ_TESTCASE_BUF;
+    while (__AFL_LOOP(10000)) {
+        size_t len = (size_t)__AFL_FUZZ_TESTCASE_LEN;
+        bhf_run_one(buf, len);
+    }
+    return 0;
+}
+#else
+{% raw %}#ifndef BHF_EXTERNAL_DRIVER
+/* bhf driver (default, non-AFL) for C++. No libFuzzer `main`: the built-in
+ * engine drives this in one persistent process via the framed fork-server protocol
+ * (#399) with a SanitizerCoverage edge-coverage + RedQueen/cmplog runtime (#385/#400).
+ * The Makefile compiles it WITHOUT `-fsanitize=fuzzer` and WITH
+ * `-fsanitize-coverage=trace-pc-guard,trace-cmp`. A crash still surfaces: ASan
+ * aborts the process, the parent sees the closed pipe and re-isolates that input
+ * via a fresh per-spawn run (argv path below). The runtime is the C driver's,
+ * wrapped in extern "C" so the sanitizer resolves the unmangled callback names;
+ * layout MUST stay in sync with direct_harness.c.tera and CmpShmReader in
+ * crates/cli/src/fuzz.rs. */
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <io.h>
+#include <fcntl.h>
+#define BHF_DEVNULL "NUL"
+#define bhf_read _read
+#define bhf_write _write
+#define bhf_dup _dup
+#define bhf_dup2 _dup2
+#define bhf_close _close
+#define bhf_open _open
+#else
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#define BHF_DEVNULL "/dev/null"
+#define bhf_read read
+#define bhf_write write
+#define bhf_dup dup
+#define bhf_dup2 dup2
+#define bhf_close close
+#define bhf_open open
+#endif
+
+/* Map a shared, file-backed region of `size` bytes at `path`, or 0 on failure.
+ * POSIX: open+ftruncate+mmap(MAP_SHARED). Windows: CreateFileMapping +
+ * MapViewOfFile, which writes through to the backing file so the engine reads the
+ * same bytes (under wine the host sees the same file). */
+BHF_NOCOV static void *bhf_map_shared(const char *path, size_t size) {
+#ifdef _WIN32
+    HANDLE fh = CreateFileA(path, GENERIC_READ | GENERIC_WRITE,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (fh == INVALID_HANDLE_VALUE) return NULL;
+    HANDLE mh = CreateFileMappingA(fh, NULL, PAGE_READWRITE,
+                                   (DWORD)(((uint64_t)size) >> 32),
+                                   (DWORD)(size & 0xffffffffu), NULL);
+    CloseHandle(fh);
+    if (!mh) return NULL;
+    return MapViewOfFile(mh, FILE_MAP_ALL_ACCESS, 0, 0, size);
+#else
+    int fd = bhf_open(path, O_RDWR | O_CREAT, 0600);
+    if (fd < 0) return NULL;
+    void *p = NULL;
+    if (ftruncate(fd, (off_t)size) == 0) {
+        void *m = mmap(0, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (m != MAP_FAILED) p = m;
+    }
+    bhf_close(fd);
+    return p;
+#endif
+}
+
+#ifdef _WIN32
+/* No ASan on mingw: a vectored exception handler converts a fatal fault into an
+ * immediate, distinctive exit so the engine detects a crash under wine instead
+ * of the process hanging in wine's debugger dialog — bhf's ASan substitute. */
+#define BHF_WIN_CRASH_EXIT 0x39
+BHF_NOCOV static LONG CALLBACK bhf_win_veh(EXCEPTION_POINTERS *info) {
+    DWORD code = info->ExceptionRecord->ExceptionCode;
+    switch (code) {
+    case EXCEPTION_ACCESS_VIOLATION:
+    case EXCEPTION_STACK_OVERFLOW:
+    case EXCEPTION_ILLEGAL_INSTRUCTION:
+    case EXCEPTION_INT_DIVIDE_BY_ZERO:
+    case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:
+    case EXCEPTION_DATATYPE_MISALIGNMENT:
+        fprintf(stderr, "BHF_CRASH code=0x%lx\n", (unsigned long)code);
+        fflush(stderr);
+        TerminateProcess(GetCurrentProcess(), BHF_WIN_CRASH_EXIT);
+        return EXCEPTION_CONTINUE_SEARCH;
+    default:
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+}
+BHF_NOCOV static void bhf_win_install_crash_handler(void) {
+    AddVectoredExceptionHandler(1, bhf_win_veh);
+}
+#endif
+
+extern "C" {
+/* Edge-coverage runtime: trace-pc-guard sets one bit per instrumented edge in a
+ * MAP_SHARED bitmap named by BHF_COV_SHM. No-op when unset. */
+#define BHF_COV_BITS (1u << 16)
+static unsigned char *bhf_cov_map = 0;
+static uint32_t bhf_cov_next = 0;
+BHF_NOCOV static void bhf_cov_open(void) {
+    const char *p = getenv("BHF_COV_SHM");
+    if (!p || !*p) return;
+    void *m = bhf_map_shared(p, BHF_COV_BITS);
+    if (m) bhf_cov_map = (unsigned char *)m;
+}
+/* AFL-style hit-count buckets (#420): a SECOND MAP_SHARED byte-map named by
+ * BHF_COV_CNT_SHM, the SAME BHF_COV_BITS size as the edge bitmap (one
+ * byte per edge). trace-pc-guard saturating-increments this edge's per-exec hit
+ * count IN ADDITION TO the unchanged presence bit; the engine zeroes it before
+ * every exec and buckets the per-exec count. No-op when BHF_COV_CNT_SHM is
+ * unset. Layout MUST stay in sync with direct_harness.c.tera and the
+ * CoverageTracker count reader in crates/cli/src/fuzz.rs. */
+static unsigned char *bhf_cov_cnt_map = 0;
+BHF_NOCOV static void bhf_cov_cnt_open(void) {
+    const char *p = getenv("BHF_COV_CNT_SHM");
+    if (!p || !*p) return;
+    void *m = bhf_map_shared(p, BHF_COV_BITS);
+    if (m) bhf_cov_cnt_map = (unsigned char *)m;
+}
+/* laf-intel comparison-progress (#421): a THIRD MAP_SHARED byte-map named by
+ * BHF_CMP_PROGRESS_SHM, one byte per hashed compare SITE. For every compare
+ * the trace-cmp callbacks already see, the driver records this exec's MAX number
+ * of matching LEADING bytes (1..7) at that site, so the engine can reward an
+ * input that gets one more byte of a multi-byte gate correct — laf-intel's
+ * gradient WITHOUT a clang split pass. The engine zeroes it before every exec and
+ * folds a newly-reached leading-match LEVEL into a virgin map exactly like the
+ * #420 hit-count buckets. A no-op when BHF_CMP_PROGRESS_SHM is unset (flag
+ * off / Ada / legacy). Layout (size + per-site byte) MUST stay in sync with the
+ * other direct_harness template and the CoverageTracker progress reader in
+ * crates/cli/src/fuzz.rs. */
+#define BHF_CMPP_BITS (1u << 16)
+static unsigned char *bhf_cmpp_map = 0;
+BHF_NOCOV static void bhf_cmpp_open(void) {
+    const char *p = getenv("BHF_CMP_PROGRESS_SHM");
+    if (!p || !*p) return;
+    void *m = bhf_map_shared(p, BHF_CMPP_BITS);
+    if (m) bhf_cmpp_map = (unsigned char *)m;
+}
+/* Hash a compare site (the return address captured in the trace-cmp callback)
+ * relative to an in-module reference so the key is ASLR-INVARIANT across the
+ * fork-server and per-spawn processes of one run. */
+BHF_NOCOV static unsigned bhf_cmpp_slot(const void *ra) {
+    uintptr_t rel = (uintptr_t)ra - (uintptr_t)&bhf_cmpp_open;
+    return (unsigned)(rel * 2654435761u) & (BHF_CMPP_BITS - 1);
+}
+/* Record an integer compare's leading-byte match (#421). `a == b` is a full match
+ * (the gate passes — real edges cover it) and carries no gradient, so it is
+ * skipped; otherwise count the contiguous matching LOW bytes and MAX-raise it. */
+BHF_NOCOV static void bhf_cmpp_int(uint64_t a, uint64_t b, unsigned width, const void *ra) {
+    unsigned m, i, slot;
+    unsigned char p;
+    if (!bhf_cmpp_map || a == b) return;
+    if (width > 8) width = 8;
+    m = 0;
+    for (i = 0; i < width; i++) {
+        if (((a >> (8 * i)) & 0xff) == ((b >> (8 * i)) & 0xff)) m++;
+        else break;
+    }
+    if (m == 0) return;
+    p = (unsigned char)(m > 7 ? 7 : m);
+    slot = bhf_cmpp_slot(ra);
+    if (bhf_cmpp_map[slot] < p) bhf_cmpp_map[slot] = p;
+}
+/* Record a buffer/string compare's common-prefix length (#421). `result == 0` is
+ * a full match (gate passes) -> skipped; otherwise the number of equal leading
+ * bytes is the gradient. `pc` is the real call site supplied by the ASan hook. */
+BHF_NOCOV static void bhf_cmpp_buf(const unsigned char *s1, const unsigned char *s2,
+                                        unsigned n, int result, const void *pc) {
+    unsigned m = 0, slot;
+    unsigned char p;
+    if (!bhf_cmpp_map || result == 0) return;
+    if (n > 8u) n = 8u; /* leading-match LEVEL saturates at 7; scan no further */
+    while (m < n && s1[m] == s2[m]) m++;
+    if (m == 0) return;
+    p = (unsigned char)(m > 7 ? 7 : m);
+    slot = bhf_cmpp_slot(pc);
+    if (bhf_cmpp_map[slot] < p) bhf_cmpp_map[slot] = p;
+}
+
+/* RedQueen/cmplog operand capture (#400). Layout MUST stay in sync with
+ * CmpShmReader in crates/cli/src/fuzz.rs:
+ *   [u32 armed][u32 count] then BHF_CMP_CAP records of
+ *   [u8 len_a][u8 len_b][u8 a[BHF_CMP_OPMAX]][u8 b[BHF_CMP_OPMAX]].
+ * No-op when BHF_CMP_SHM is unset. */
+#define BHF_CMP_CAP 2048u
+#define BHF_CMP_OPMAX 32u
+#define BHF_CMP_REC (2u + 2u * BHF_CMP_OPMAX)
+#define BHF_CMP_BYTES (8u + BHF_CMP_CAP * BHF_CMP_REC)
+static unsigned char *bhf_cmp_map = 0;
+BHF_NOCOV static void bhf_cmp_open(void) {
+    const char *p;
+    if (bhf_cmp_map) return;
+    p = getenv("BHF_CMP_SHM");
+    if (!p || !*p) return;
+    void *m = bhf_map_shared(p, BHF_CMP_BYTES);
+    if (m) bhf_cmp_map = (unsigned char *)m;
+}
+BHF_NOCOV static int bhf_cmp_armed(void) {
+    unsigned char *m = bhf_cmp_map;
+    if (!m) return 0;
+    return m[0] | m[1] | m[2] | m[3];
+}
+BHF_NOCOV static void bhf_cmp_push(const unsigned char *a, unsigned la,
+                                           const unsigned char *b, unsigned lb) {
+    unsigned char *m = bhf_cmp_map;
+    unsigned count, off, i;
+    if (!m) return;
+    if (la > BHF_CMP_OPMAX) la = BHF_CMP_OPMAX;
+    if (lb > BHF_CMP_OPMAX) lb = BHF_CMP_OPMAX;
+    count = (unsigned)m[4] | ((unsigned)m[5] << 8) | ((unsigned)m[6] << 16) | ((unsigned)m[7] << 24);
+    if (count >= BHF_CMP_CAP) return;
+    off = 8u + count * BHF_CMP_REC;
+    m[off] = (unsigned char)la;
+    m[off + 1] = (unsigned char)lb;
+    for (i = 0; i < la; i++) m[off + 2u + i] = a[i];
+    for (i = 0; i < lb; i++) m[off + 2u + BHF_CMP_OPMAX + i] = b[i];
+    count++;
+    m[4] = (unsigned char)count;
+    m[5] = (unsigned char)(count >> 8);
+    m[6] = (unsigned char)(count >> 16);
+    m[7] = (unsigned char)(count >> 24);
+}
+BHF_NOCOV static void bhf_cmp_int(uint64_t a, uint64_t b, unsigned width) {
+    unsigned char ab[8], bb[8];
+    unsigned i;
+    if (!bhf_cmp_armed()) return;
+    if (a == b || a == 0 || b == 0) return;
+    if (width > 8) width = 8;
+    for (i = 0; i < width; i++) {
+        ab[i] = (unsigned char)(a >> (8 * i));
+        bb[i] = (unsigned char)(b >> (8 * i));
+    }
+    bhf_cmp_push(ab, width, bb, width);
+}
+BHF_NOCOV static unsigned bhf_cmp_copy(unsigned char *dst, const unsigned char *src,
+                                               unsigned maxlen, int stop_at_nul) {
+    unsigned i;
+    for (i = 0; i < maxlen; i++) {
+        unsigned char c = src[i];
+        if (stop_at_nul && c == 0) break;
+        dst[i] = c;
+    }
+    return i;
+}
+BHF_NOCOV static void bhf_cmp_buf(const unsigned char *s1, const unsigned char *s2,
+                                          unsigned n, int stop_at_nul, int result) {
+    unsigned char a[BHF_CMP_OPMAX], b[BHF_CMP_OPMAX];
+    unsigned la, lb;
+    if (!bhf_cmp_armed() || result == 0) return; /* result==0: already equal, nothing to learn */
+    if (n > BHF_CMP_OPMAX) n = BHF_CMP_OPMAX;
+    la = bhf_cmp_copy(a, s1, n, stop_at_nul);
+    lb = bhf_cmp_copy(b, s2, n, stop_at_nul);
+    if (la == 0 && lb == 0) return;
+    bhf_cmp_push(a, la, b, lb);
+}
+BHF_NOCOV void __sanitizer_cov_trace_pc_guard_init(uint32_t *start, uint32_t *stop) {
+    if (start == stop || *start) return;
+    for (uint32_t *x = start; x < stop; x++) *x = ++bhf_cov_next;
+    bhf_cov_open();
+    bhf_cov_cnt_open();
+    bhf_cmp_open();
+    bhf_cmpp_open();
+}
+BHF_NOCOV void __sanitizer_cov_trace_pc_guard(uint32_t *guard) {
+    if (!*guard || !bhf_cov_map) return;
+    bhf_cov_map[*guard & (BHF_COV_BITS - 1)] = 1;
+    /* #420: in addition to the unchanged presence bit, saturating-increment this
+     * edge's per-exec hit count so the engine can bucket loop/recursion depth. */
+    if (bhf_cov_cnt_map && bhf_cov_cnt_map[*guard & (BHF_COV_BITS - 1)] != 255)
+        bhf_cov_cnt_map[*guard & (BHF_COV_BITS - 1)]++;
+}
+#ifdef _WIN32
+/* mingw-w64 gcc has no `trace-pc-guard`; the Windows build instruments with
+ * `-fsanitize-coverage=trace-pc`, which calls this guard-less hook at each edge.
+ * Hash the return address into the SAME bitmap the guard path fills so the
+ * engine's coverage reader stays platform-agnostic. */
+BHF_NOCOV void __sanitizer_cov_trace_pc(void) {
+    if (!bhf_cov_map) return;
+    uintptr_t pc = (uintptr_t)__builtin_return_address(0);
+    uint32_t h = ((uint32_t)(pc * 2654435761u) >> 4) & (BHF_COV_BITS - 1);
+    bhf_cov_map[h] = 1;
+    if (bhf_cov_cnt_map && bhf_cov_cnt_map[h] != 255)
+        bhf_cov_cnt_map[h]++;
+}
+#endif
+BHF_NOCOV void __sanitizer_cov_trace_cmp1(uint8_t a, uint8_t b) { bhf_cmp_int(a, b, 1); bhf_cmpp_int(a, b, 1, __builtin_return_address(0)); }
+BHF_NOCOV void __sanitizer_cov_trace_cmp2(uint16_t a, uint16_t b) { bhf_cmp_int(a, b, 2); bhf_cmpp_int(a, b, 2, __builtin_return_address(0)); }
+BHF_NOCOV void __sanitizer_cov_trace_cmp4(uint32_t a, uint32_t b) { bhf_cmp_int(a, b, 4); bhf_cmpp_int(a, b, 4, __builtin_return_address(0)); }
+BHF_NOCOV void __sanitizer_cov_trace_cmp8(uint64_t a, uint64_t b) { bhf_cmp_int(a, b, 8); bhf_cmpp_int(a, b, 8, __builtin_return_address(0)); }
+BHF_NOCOV void __sanitizer_cov_trace_const_cmp1(uint8_t a, uint8_t b) { bhf_cmp_int(a, b, 1); bhf_cmpp_int(a, b, 1, __builtin_return_address(0)); }
+BHF_NOCOV void __sanitizer_cov_trace_const_cmp2(uint16_t a, uint16_t b) { bhf_cmp_int(a, b, 2); bhf_cmpp_int(a, b, 2, __builtin_return_address(0)); }
+BHF_NOCOV void __sanitizer_cov_trace_const_cmp4(uint32_t a, uint32_t b) { bhf_cmp_int(a, b, 4); bhf_cmpp_int(a, b, 4, __builtin_return_address(0)); }
+BHF_NOCOV void __sanitizer_cov_trace_const_cmp8(uint64_t a, uint64_t b) { bhf_cmp_int(a, b, 8); bhf_cmpp_int(a, b, 8, __builtin_return_address(0)); }
+#ifdef _WIN32
+/* mingw g++ has a builtin __sanitizer_cov_trace_switch(uint64_t, void*); match
+ * its pointer type so this definition does not "ambiguate the built-in
+ * declaration", then recover the uint64_t* view. (clang/gcc accept uint64_t*.) */
+BHF_NOCOV void __sanitizer_cov_trace_switch(uint64_t val, void *cases_v) {
+    uint64_t *cases = (uint64_t *)cases_v;
+#else
+BHF_NOCOV void __sanitizer_cov_trace_switch(uint64_t val, uint64_t *cases) {
+#endif
+    uint64_t n = cases[0];
+    unsigned width = (unsigned)(cases[1] / 8);
+    uint64_t i;
+    if (!bhf_cmp_armed()) return;
+    if (width == 0 || width > 8) width = 8;
+    for (i = 0; i < n && i < 64; i++) bhf_cmp_int(val, cases[2 + i], width);
+}
+BHF_NOCOV void __sanitizer_weak_hook_memcmp(void *pc, const void *s1, const void *s2, size_t n, int result) {
+    bhf_cmp_buf((const unsigned char *)s1, (const unsigned char *)s2, (unsigned)n, 0, result);
+    bhf_cmpp_buf((const unsigned char *)s1, (const unsigned char *)s2, (unsigned)n, result, pc);
+}
+BHF_NOCOV void __sanitizer_weak_hook_strncmp(void *pc, const char *s1, const char *s2, size_t n, int result) {
+    bhf_cmp_buf((const unsigned char *)s1, (const unsigned char *)s2, (unsigned)n, 1, result);
+    bhf_cmpp_buf((const unsigned char *)s1, (const unsigned char *)s2, (unsigned)n, result, pc);
+}
+BHF_NOCOV void __sanitizer_weak_hook_strcmp(void *pc, const char *s1, const char *s2, int result) {
+    bhf_cmp_buf((const unsigned char *)s1, (const unsigned char *)s2, BHF_CMP_OPMAX, 1, result);
+    bhf_cmpp_buf((const unsigned char *)s1, (const unsigned char *)s2, BHF_CMP_OPMAX, result, pc);
+}
+BHF_NOCOV void __sanitizer_weak_hook_strncasecmp(void *pc, const char *s1, const char *s2, size_t n, int result) {
+    bhf_cmp_buf((const unsigned char *)s1, (const unsigned char *)s2, (unsigned)n, 1, result);
+    bhf_cmpp_buf((const unsigned char *)s1, (const unsigned char *)s2, (unsigned)n, result, pc);
+}
+BHF_NOCOV void __sanitizer_weak_hook_strcasecmp(void *pc, const char *s1, const char *s2, int result) {
+    bhf_cmp_buf((const unsigned char *)s1, (const unsigned char *)s2, BHF_CMP_OPMAX, 1, result);
+    bhf_cmpp_buf((const unsigned char *)s1, (const unsigned char *)s2, BHF_CMP_OPMAX, result, pc);
+}
+} /* extern "C" */
+
+/* The libFuzzer entrypoint is still defined (an external libFuzzer build could
+ * link it), but the default build does NOT pass -fsanitize=fuzzer, so there is
+ * no libFuzzer `main` to conflict with the bhf driver `main` below.
+ * Forward-declare it first so the definition is not the first prototype:
+ * projects that promote -Wmissing-prototypes to an error (e.g. harfbuzz's
+ * hb.hh) reject a bare non-static definition otherwise. */
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *, size_t);
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
+    return bhf_run_one(Data, Size);
+}
+
+static void bhf_run_file(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    if (n < 0) n = 0;
+    rewind(f);
+    /* +1 + NUL so a C-string-API harness (`(const char *)Data`) can't strlen
+     * past an exact-size replay buffer (matches the over-allocated fuzz path). */
+    uint8_t *b = (uint8_t *)malloc((size_t)(n ? n : 1) + 1);
+    if (!b) { fclose(f); return; }
+    size_t r = fread(b, 1, (size_t)n, f);
+    b[r] = 0;
+    fclose(f);
+    bhf_run_one(b, r);
+    free(b);
+}
+static int bhf_read_n(int fd, void *buf, size_t n) {
+    size_t got = 0;
+    unsigned char *b = (unsigned char *)buf;
+    while (got < n) {
+        int r = (int)bhf_read(fd, b + got, (unsigned)(n - got));
+        if (r <= 0) return 0;
+        got += (size_t)r;
+    }
+    return 1;
+}
+int main(int argc, char **argv) {
+    /* Persistent fork-server framed protocol (BHF_FRAMED=1): write a ready
+     * byte, then loop reading {u32 LE length, bytes} and replying one sync byte
+     * per input. */
+#ifdef _WIN32
+    /* Install the crash handler before any target code runs so a fault in either
+     * the framed loop or the argv re-isolation path becomes a detectable exit. */
+    bhf_win_install_crash_handler();
+#endif
+    if (getenv("BHF_FRAMED")) {
+        /* #427: the sync channel is the harness's original stdout (the pipe the
+         * engine reads sync bytes from). A target that writes to stdout shares it;
+         * its output fills the buffer the engine drains only one sync byte per
+         * input from, blocking the harness on write() and deadlocking the
+         * fork-server. Save the control fd, then point fd 1 at /dev/null so the
+         * target's stdout is discarded and only sync bytes reach the engine. */
+        int bhf_ctrl_fd = bhf_dup(1);
+        int bhf_devnull;
+        unsigned char ready = 1;
+        if (bhf_ctrl_fd < 0) return 1;
+#ifdef _WIN32
+        /* trace-pc has no guard-init to open the maps, so open them here; set
+         * stdin + the control fd to binary so the framed {u32 len, bytes}
+         * protocol is not CRLF/EOF-translated by the CRT. */
+        bhf_cov_open();
+        bhf_cov_cnt_open();
+        bhf_cmpp_open();
+        bhf_cmp_open();
+        _setmode(0, _O_BINARY);
+        _setmode(bhf_ctrl_fd, _O_BINARY);
+#endif
+        bhf_devnull = bhf_open(BHF_DEVNULL, O_WRONLY);
+        if (bhf_devnull >= 0) {
+            bhf_dup2(bhf_devnull, 1);
+            if (bhf_devnull != 1) bhf_close(bhf_devnull);
+        }
+        if (bhf_write(bhf_ctrl_fd, &ready, 1) != 1) return 1;
+        size_t cap = 1u << 20;
+        /* +1 so the input is always NUL-terminable for C-string-API harnesses. */
+        uint8_t *buf = (uint8_t *)malloc(cap + 1);
+        if (!buf) return 1;
+        for (;;) {
+            uint32_t len;
+            if (!bhf_read_n(0, &len, 4)) break;
+            if ((size_t)len > cap) len = (uint32_t)cap;
+            if (len && !bhf_read_n(0, buf, len)) break;
+            buf[len] = 0;
+            bhf_run_one(buf, len);
+            unsigned char sync = 1;
+            if (bhf_write(bhf_ctrl_fd, &sync, 1) != 1) break;
+        }
+        free(buf);
+        return 0;
+    }
+    if (argc < 2) return 0;
+    bhf_run_file(argv[1]);
+    return 0;
+}
+#endif /* !BHF_EXTERNAL_DRIVER */
+{% endraw %}
+#endif
+{%- endif %}

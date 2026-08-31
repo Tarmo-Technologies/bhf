@@ -1,0 +1,286 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! Native Lua fuzzing lane (M3.10): generate a bhf harness, copy the
+//! `lua_runtime` driver, and emit a `harnesses/<id>/main` launcher that runs the
+//! target under `lua` speaking the `BHF_FRAMED` fork-server protocol with a
+//! `debug.sethook` line-hook edge coverage into the shared map — the SAME
+//! builtin-engine execution path as the other interpreted lanes (Ruby/Perl/Python),
+//! no third-party fuzzer.
+//!
+//! Interpreted, like Ruby/Perl: there is no native binary. "Build" is a `luac -p`
+//! (or `lua` load) syntax gate plus a `dofile` smoke-test (so an un-loadable target —
+//! a missing module, a load-time error — is a clean skip, not a silent zero-exec
+//! run). The repair loop is a pass-through.
+
+use crate::auto::candidate::Candidate;
+use crate::auto::lua::{parse_lua, LuaFunction};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
+
+pub enum LuaBuildResult {
+    Built,
+    Failed { reason: String, skip: bool },
+}
+
+/// Locate a Lua interpreter (`lua`, then versioned fallbacks).
+fn probe_lua() -> Option<PathBuf> {
+    for name in ["lua", "lua5.4", "lua5.3", "luajit"] {
+        if let Ok(p) = which::which(name) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Locate the bundled `lua_runtime/` (the driver).
+fn locate_lua_runtime() -> Option<PathBuf> {
+    crate::runtime_assets::locate("lua_runtime", "bhf_driver.lua")
+}
+
+pub fn build_lua_harness(
+    candidate: &Candidate,
+    work_dir: &Path,
+    harness_id: &str,
+    source_root: &Path,
+) -> LuaBuildResult {
+    let Some(lua) = probe_lua() else {
+        return LuaBuildResult::Failed {
+            reason: "no `lua` interpreter found; install Lua 5.3+ to fuzz Lua \
+                     (the lane skips cleanly, like a GNAT-less Ada skip)"
+                .to_owned(),
+            skip: true,
+        };
+    };
+    let Some(runtime) = locate_lua_runtime() else {
+        return LuaBuildResult::Failed {
+            reason: "could not locate the bundled lua_runtime/ (driver)".to_owned(),
+            skip: false,
+        };
+    };
+
+    let (func, call) = match resolve_target(candidate) {
+        Ok(r) => r,
+        Err(reason) => return LuaBuildResult::Failed { reason, skip: true },
+    };
+
+    let target_abs = candidate
+        .source_path
+        .canonicalize()
+        .unwrap_or_else(|_| candidate.source_path.clone());
+    let target_dir = target_abs
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let auto_dir = crate::auto::layout::harness_dir(work_dir, harness_id);
+    if let Err(e) = std::fs::create_dir_all(&auto_dir) {
+        return LuaBuildResult::Failed {
+            reason: format!("create {}: {e}", auto_dir.display()),
+            skip: false,
+        };
+    }
+    if let Err(e) = std::fs::copy(
+        runtime.join("bhf_driver.lua"),
+        auto_dir.join("bhf_driver.lua"),
+    ) {
+        return LuaBuildResult::Failed {
+            reason: format!("copy driver: {e}"),
+            skip: false,
+        };
+    }
+
+    // In-project modules the target requires (`kong.db.schema`, a plugin's
+    // `lua/<name>/init.lua`) resolve only from their package root, which is
+    // rarely the file's own directory.
+    let load_roots = crate::auto::script_load_roots::module_load_roots(source_root, &target_dir);
+    let harness_src = generate_harness(&target_abs, &load_roots, &call);
+    let harness_path = auto_dir.join("bhfgen.lua");
+    if let Err(e) = std::fs::write(&harness_path, &harness_src) {
+        return LuaBuildResult::Failed {
+            reason: format!("write harness {}: {e}", harness_path.display()),
+            skip: false,
+        };
+    }
+
+    // Build gate: load the harness (a `dofile` of the target) so a syntax error or an
+    // un-loadable target (missing module, load-time error) is a CLEAN SKIP, not a
+    // silent zero-exec run. `-e "assert(loadfile(...))"` checks syntax; then actually
+    // running it loads the target.
+    let smoke = crate::command_output::output_with_timeout(
+        Command::new(&lua)
+            .arg("-e")
+            .arg(format!(
+                "local f=assert(loadfile('{}')); f()",
+                harness_path.display()
+            ))
+            .current_dir(&auto_dir),
+        Duration::from_secs(30),
+    );
+    match smoke {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            let reason = crate::auto::script_load_roots::unloadable_reason(
+                &candidate.name,
+                &String::from_utf8_lossy(&out.stderr),
+            );
+            return LuaBuildResult::Failed { reason, skip: true };
+        }
+        Err(e) => {
+            return LuaBuildResult::Failed {
+                reason: format!("could not run lua smoke-test: {e}"),
+                skip: false,
+            };
+        }
+    }
+
+    // Emit the launcher. Carries the BHF_FRAMED + BHF_LUA_LAUNCHER markers.
+    let main_path = auto_dir.join("main");
+    let driver = auto_dir.join("bhf_driver.lua");
+    let _ = &func;
+    let script = format!(
+        "#!/bin/sh\n\
+         # BHF_FRAMED BHF_LUA_LAUNCHER bhf Lua driver launcher (native Lua lane).\n\
+         # The engine sets BHF_FRAMED + BHF_COV_SHM; lua inherits them. A\n\
+         # debug.sethook line hook records edge coverage into the shared map.\n\
+         BHF_HARNESS=\"{harness}\" \\\n\
+         BHF_TRACE_PREFIX=\"{trace}\" \\\n\
+         BHF_COVERED_LINES=\"{covered}\" \\\n\
+         exec \"{lua}\" \"{driver}\" \"$@\"\n",
+        harness = harness_path.display(),
+        trace = source_root.display(),
+        covered = auto_dir.join("covered-lines.txt").display(),
+        lua = lua.display(),
+        driver = driver.display(),
+    );
+    if let Err(e) = std::fs::write(&main_path, script) {
+        return LuaBuildResult::Failed {
+            reason: format!("write launcher {}: {e}", main_path.display()),
+            skip: false,
+        };
+    }
+    if let Err(e) = make_executable(&main_path) {
+        return LuaBuildResult::Failed {
+            reason: format!("chmod +x {}: {e}", main_path.display()),
+            skip: false,
+        };
+    }
+    LuaBuildResult::Built
+}
+
+/// Resolve the target function + the Lua call expression against the dofile'd module
+/// (`mod`) or the global env (`_G`).
+fn resolve_target(candidate: &Candidate) -> Result<(LuaFunction, String), String> {
+    let source = crate::source_text::read_source_text(&candidate.source_path)
+        .map_err(|e| format!("read {}: {e}", candidate.source_path.display()))?;
+    let funcs = parse_lua(&source);
+    let f = funcs
+        .iter()
+        .find(|f| f.name == candidate.name && f.line == candidate.line)
+        .or_else(|| funcs.iter().find(|f| f.name == candidate.name))
+        .cloned()
+        .ok_or_else(|| format!("target `{}` no longer present in source", candidate.name))?;
+
+    let field = &f.field;
+    let call = if f.is_global {
+        // A global function the target defined; resolve from the global env, falling
+        // back to the returned module table.
+        format!("return (_G['{field}'] or (mod and mod['{field}']))(data)")
+    } else if f.is_method {
+        format!("return mod['{field}'](mod, data)")
+    } else {
+        format!("return mod['{field}'](data)")
+    };
+    Ok((f, call))
+}
+
+/// Emit `bhfgen.lua` returning a `run_one(data)` closure that `dofile`s the target
+/// and calls the function.
+fn generate_harness(target_abs: &Path, load_roots: &[std::path::PathBuf], call: &str) -> String {
+    // A Lua module names itself relative to a root (`kong.db.schema`), and a
+    // package's own root is often a `lua/` or `src/` subdirectory rather than
+    // the checkout, so every recovered root gets both the `?.lua` and the
+    // `?/init.lua` form. Nearest root first: it must win a name collision.
+    let search: String = load_roots
+        .iter()
+        .map(|root| {
+            let dir = root.display();
+            format!("{dir}/?.lua;{dir}/?/init.lua;")
+        })
+        .collect();
+    format!(
+        "-- SPDX-License-Identifier: Apache-2.0\n\
+         -- Generated by bhf (native Lua lane). Loads the target and passes the\n\
+         -- fuzz bytes as a string. Do not edit.\n\
+         package.path = '{search}' .. package.path\n\
+         local mod = dofile('{target}')\n\
+         local bhf_target_entered = false\n\
+         local function bhf_mark_target_entry()\n\
+         \x20 if bhf_target_entered then return end\n\
+         \x20 local path = os.getenv('BHF_TARGET_ENTRY_SHM')\n\
+         \x20 if not path then return end\n\
+         \x20 local entry = io.open(path, 'wb')\n\
+         \x20 if not entry then return end\n\
+         \x20 entry:write(string.char(1))\n\
+         \x20 entry:close()\n\
+         \x20 bhf_target_entered = true\n\
+         end\n\
+         return function(data)\n\
+         \x20 bhf_mark_target_entry()\n\
+         \x20 {call}\n\
+         end\n",
+        search = search,
+        target = target_abs.display(),
+        call = call,
+    )
+}
+
+#[cfg(unix)]
+fn make_executable(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path)?.permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(path, perms)
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn harness_returns_run_one_closure() {
+        let h = generate_harness(
+            Path::new("/proj/lib/toml.lua"),
+            &[
+                std::path::PathBuf::from("/proj/lib"),
+                std::path::PathBuf::from("/proj"),
+            ],
+            "return mod['parse'](data)",
+        );
+        assert!(h.contains("local mod = dofile('/proj/lib/toml.lua')"));
+        assert!(h.contains("return mod['parse'](data)"));
+        assert!(h.contains("return function(data)"));
+        assert!(
+            h.contains("  bhf_mark_target_entry()\n  return mod['parse'](data)"),
+            "entry checkpoint must immediately precede the selected call: {h}"
+        );
+        assert!(h.contains("package.path = '/proj/lib/?.lua"));
+        // A package laid out as `<root>/<name>/init.lua` must resolve too.
+        assert!(h.contains("/proj/lib/?/init.lua"));
+        // Nearest root first in the search string.
+        let lib_at = h.find("/proj/lib/?.lua").expect("package root in path");
+        let root_at = h.find("/proj/?.lua").expect("project root in path");
+        assert!(lib_at < root_at, "nearest root must be searched first");
+    }
+
+    #[test]
+    fn bundled_driver_is_locatable_in_tree() {
+        let runtime = locate_lua_runtime().expect("lua_runtime locatable in-tree");
+        assert!(runtime.join("bhf_driver.lua").is_file());
+    }
+}

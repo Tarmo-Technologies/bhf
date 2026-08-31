@@ -1,0 +1,695 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! Native Ruby fuzzing lane (M3.9): generate a bhf harness, copy the
+//! `ruby_runtime` driver, and emit a `harnesses/<id>/main` launcher that runs the
+//! target under `ruby` speaking the `BHF_FRAMED` fork-server protocol with
+//! `TracePoint` edge coverage into the shared map — the SAME builtin-engine
+//! execution path as the other interpreted lanes (Python/Perl), no third-party
+//! fuzzer.
+//!
+//! Interpreted, like Python/Perl: there is no native binary. "Build" is a `ruby -c`
+//! syntax gate plus a `require` smoke-test (so an un-loadable target — a missing gem,
+//! a load-time error — is a clean skip, not a silent zero-exec run). The repair loop
+//! is a pass-through.
+
+use crate::auto::candidate::Candidate;
+use crate::auto::ruby::{parse_ruby, RubyMethod};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
+
+pub enum RubyBuildResult {
+    Built,
+    Failed { reason: String, skip: bool },
+}
+
+fn probe_ruby() -> Option<PathBuf> {
+    which::which("ruby").ok()
+}
+
+/// `(major, minor)` of a Ruby interpreter from `RUBY_VERSION`, or `None`. The driver
+/// uses `TracePoint` (Ruby 2.0+); older interpreters skip with a clear reason.
+fn ruby_version(ruby: &Path) -> Option<(u32, u32)> {
+    let out = Command::new(ruby)
+        .arg("-e")
+        .arg("print RUBY_VERSION")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v = String::from_utf8_lossy(&out.stdout);
+    let mut it = v.trim().split('.');
+    let major: u32 = it.next()?.parse().ok()?;
+    let minor: u32 = it.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor))
+}
+
+/// Locate the bundled `ruby_runtime/` (the driver + coverage).
+fn locate_ruby_runtime() -> Option<PathBuf> {
+    crate::runtime_assets::locate("ruby_runtime", "bhf_driver.rb")
+}
+
+pub fn build_ruby_harness(
+    candidate: &Candidate,
+    work_dir: &Path,
+    harness_id: &str,
+    source_root: &Path,
+) -> RubyBuildResult {
+    let Some(ruby) = probe_ruby() else {
+        return RubyBuildResult::Failed {
+            reason: "no `ruby` interpreter found; install Ruby 2.0+ to fuzz Ruby \
+                     (the lane skips cleanly, like a GNAT-less Ada skip)"
+                .to_owned(),
+            skip: true,
+        };
+    };
+    if let Some((major, minor)) = ruby_version(&ruby) {
+        if (major, minor) < (2, 0) {
+            return RubyBuildResult::Failed {
+                reason: format!(
+                    "interpreter at {} is Ruby {major}.{minor}; the Ruby fuzzing lane \
+                     requires Ruby 2.0+ (TracePoint coverage)",
+                    ruby.display()
+                ),
+                skip: true,
+            };
+        }
+    }
+    let Some(runtime) = locate_ruby_runtime() else {
+        return RubyBuildResult::Failed {
+            reason: "could not locate the bundled ruby_runtime/ (driver)".to_owned(),
+            skip: false,
+        };
+    };
+
+    let (method, call, materialize_file) = match resolve_target(candidate) {
+        Ok(r) => r,
+        Err(reason) => return RubyBuildResult::Failed { reason, skip: true },
+    };
+
+    let target_abs = candidate
+        .source_path
+        .canonicalize()
+        .unwrap_or_else(|_| candidate.source_path.clone());
+    let target_dir = target_abs
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let auto_dir = crate::auto::layout::harness_dir(work_dir, harness_id);
+    if let Err(e) = std::fs::create_dir_all(&auto_dir) {
+        return RubyBuildResult::Failed {
+            reason: format!("create {}: {e}", auto_dir.display()),
+            skip: false,
+        };
+    }
+    if let Err(e) = std::fs::copy(
+        runtime.join("bhf_driver.rb"),
+        auto_dir.join("bhf_driver.rb"),
+    ) {
+        return RubyBuildResult::Failed {
+            reason: format!("copy driver: {e}"),
+            skip: false,
+        };
+    }
+
+    // The target's own `require_relative`/`require` resolve from its package root
+    // as well as its directory and the project root — rails' `actionpack/lib/...`
+    // requires `action_dispatch/...`, which needs `actionpack/lib` on the path,
+    // and reaches into the sibling `activesupport/lib`. All of it is in-project
+    // code sitting on disk, so a load failure there is a path problem, not a
+    // missing dependency. The roots go into `$LOAD_PATH` INSIDE the generated
+    // harness (see `generate_harness`) — after ruby startup, so the gem prelude
+    // never scans them. Used here only for the build-time `require` smoke test.
+    let roots = crate::auto::script_load_roots::module_load_roots(source_root, &target_dir);
+    let load_paths = crate::auto::script_load_roots::join_roots(&roots, ':');
+    let harness_src = generate_harness_for_shape(&target_abs, &roots, &call, &[], materialize_file);
+    let harness_path = auto_dir.join("bhfgen.rb");
+    if let Err(e) = std::fs::write(&harness_path, &harness_src) {
+        return RubyBuildResult::Failed {
+            reason: format!("write harness {}: {e}", harness_path.display()),
+            skip: false,
+        };
+    }
+
+    // Build gate 1: `ruby -c` syntax check of the generated harness (the `require`
+    // inside is a runtime op, so this does not execute the target).
+    match Command::new(&ruby).arg("-c").arg(&harness_path).output() {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            return RubyBuildResult::Failed {
+                reason: format!(
+                    "ruby -c of generated harness failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                        .lines()
+                        .last()
+                        .unwrap_or("")
+                ),
+                skip: false,
+            };
+        }
+        Err(e) => {
+            return RubyBuildResult::Failed {
+                reason: format!("could not run ruby -c: {e}"),
+                skip: false,
+            };
+        }
+    }
+
+    // Build gate 2: require smoke-test — actually load the harness (which requires
+    // the target) so an un-loadable target (missing gem, load-time error) is a CLEAN
+    // SKIP, not a silent zero-exec run.
+    //
+    // A Rails-shaped project resolves constants through an autoloader that only
+    // exists once the framework has booted, so loading one file directly stops
+    // at `uninitialized constant ActiveSupport::OrderedOptions` even with every
+    // load path right. The file that defines it is in the tree, under the name
+    // the autoloader would use, so each such constant is resolved to its file
+    // and pre-required, one layer per round.
+    const MAX_AUTOLOAD_ROUNDS: usize = 10;
+    let mut preludes: Vec<String> = Vec::new();
+    let mut smoke_result = None;
+    for _ in 0..=MAX_AUTOLOAD_ROUNDS {
+        let attempt = crate::command_output::output_with_timeout(
+            Command::new(&ruby)
+                .arg("-e")
+                .arg(format!("require '{}'", harness_path.display()))
+                .current_dir(&auto_dir)
+                .env("RUBYLIB", &load_paths),
+            Duration::from_secs(30),
+        );
+        let Ok(out) = attempt else {
+            smoke_result = Some(attempt);
+            break;
+        };
+        if out.status.success() {
+            smoke_result = Some(Ok(out));
+            break;
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        let Some(constant) = uninitialized_constant(&stderr) else {
+            smoke_result = Some(Ok(out));
+            break;
+        };
+        let Some(require_path) = resolve_constant_file(&constant, &roots) else {
+            smoke_result = Some(Ok(out));
+            break;
+        };
+        if preludes.contains(&require_path) {
+            // The file that defines the constant IS in the tree and was already
+            // required, so something inside it failed. Load it on its own to
+            // surface that cause — usually an uninstalled gem — instead of
+            // reporting the downstream NameError, which names nothing to fix.
+            let probe = crate::command_output::output_with_timeout(
+                Command::new(&ruby)
+                    .arg("-e")
+                    .arg(format!("require '{require_path}'"))
+                    .current_dir(&auto_dir)
+                    .env("RUBYLIB", &load_paths),
+                Duration::from_secs(30),
+            );
+            if let Ok(probe) = probe {
+                if !probe.status.success() {
+                    let probe_err = String::from_utf8_lossy(&probe.stderr);
+                    if let Some(module) =
+                        crate::auto::script_load_roots::missing_module_name(&probe_err)
+                    {
+                        return RubyBuildResult::Failed {
+                            reason: format!(
+                                "target `{}` is not loadable (skipped cleanly): missing module \
+                                 `{module}` (not in the project and not installed), needed by \
+                                 `{require_path}` which defines `{constant}`",
+                                candidate.name,
+                            ),
+                            skip: true,
+                        };
+                    }
+                }
+            }
+            smoke_result = Some(Ok(out));
+            break;
+        }
+        preludes.push(require_path);
+        let harness_src =
+            generate_harness_for_shape(&target_abs, &roots, &call, &preludes, materialize_file);
+        if let Err(e) = std::fs::write(&harness_path, &harness_src) {
+            return RubyBuildResult::Failed {
+                reason: format!("write harness {}: {e}", harness_path.display()),
+                skip: false,
+            };
+        }
+    }
+    let smoke = smoke_result.expect("the retry loop always records an outcome");
+    match smoke {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            // Name the gem when ruby named it: `missing gem "concurrent/map"` is
+            // an actionable requirement, a backtrace frame is not.
+            let reason = crate::auto::script_load_roots::unloadable_reason(
+                &candidate.name,
+                &String::from_utf8_lossy(&out.stderr),
+            );
+            return RubyBuildResult::Failed { reason, skip: true };
+        }
+        Err(e) => {
+            return RubyBuildResult::Failed {
+                reason: format!("could not run require smoke-test: {e}"),
+                skip: false,
+            };
+        }
+    }
+
+    // Loading a file proves only that constants resolve. An expert harness also
+    // verifies that its receiver can actually be created and that one decoded
+    // positional input satisfies the selected method's arity. Reflection does
+    // that without running constructors or mutating project state.
+    let receiver = if method.receiver_path.is_empty() {
+        "Object"
+    } else {
+        method.receiver_path.as_str()
+    };
+    let target_reflection = if method.needs_instance {
+        format!("klass.instance_method(:{})", method.method)
+    } else if method.receiver_path.is_empty() {
+        format!("Object.instance_method(:{})", method.method)
+    } else {
+        format!("klass.method(:{})", method.method)
+    };
+    let constructor_check = if method.needs_instance {
+        "ctor = klass.instance_method(:initialize); \
+         bad_ctor = ctor.parameters.any? { |kind, _| kind == :req || kind == :keyreq }; \
+         abort('receiver constructor requires arguments') if bad_ctor; "
+    } else {
+        ""
+    };
+    let reflection = format!(
+        "require '{}'; klass = {}; {} target = {}; \
+         params = target.parameters; \
+         required = params.count {{ |kind, _| kind == :req }}; \
+         required_keywords = params.any? {{ |kind, _| kind == :keyreq }}; \
+         positional = params.any? {{ |kind, _| [:req, :opt, :rest].include?(kind) }}; \
+         abort('method is not callable with one positional input') \
+           if required > 1 || required_keywords || !positional;",
+        harness_path.display(),
+        receiver,
+        constructor_check,
+        target_reflection,
+    );
+    match crate::command_output::output_with_timeout(
+        Command::new(&ruby)
+            .arg("--disable-gems")
+            .arg("-e")
+            .arg(reflection)
+            .current_dir(&auto_dir)
+            .env("RUBYLIB", &load_paths),
+        Duration::from_secs(30),
+    ) {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            return RubyBuildResult::Failed {
+                reason: format!(
+                    "target `{}` has no safe one-input call shape: {}",
+                    candidate.name,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ),
+                skip: true,
+            };
+        }
+        Err(error) => {
+            return RubyBuildResult::Failed {
+                reason: format!("could not inspect Ruby call shape: {error}"),
+                skip: false,
+            };
+        }
+    }
+
+    // Emit the launcher. Carries the BHF_FRAMED + BHF_RB_LAUNCHER markers the
+    // engine greps for.
+    let main_path = auto_dir.join("main");
+    let driver = auto_dir.join("bhf_driver.rb");
+    // The declared-rejection namespace: an exception whose class is defined in the
+    // target's own top module is that library's rejection, not a finding.
+    let top_module = method
+        .receiver_path
+        .split("::")
+        .next()
+        .unwrap_or("")
+        .to_owned();
+    // `--disable-gems` skips Ruby's gem_prelude, which `require 'rubygems'` at startup
+    // and `rb_check_realpath`s every $LOAD_PATH entry — a hard ENOENT under the fuzz
+    // sandbox that would abort ruby before the driver runs. RUBYLIB is likewise NOT set
+    // on the launcher (it feeds the prelude scan); the target's own $LOAD_PATH additions
+    // are made INSIDE the generated harness (after startup, see `generate_harness`), so
+    // they never reach the prelude. Pure parsers do not need rubygems.
+    let script = format!(
+        "#!/bin/sh\n\
+         # BHF_FRAMED BHF_RB_LAUNCHER bhf Ruby driver launcher (native Ruby lane).\n\
+         # The engine sets BHF_FRAMED + BHF_COV_SHM; ruby inherits them. TracePoint\n\
+         # records per-line edge coverage into the shared map.\n\
+         BHF_HARNESS=\"{harness}\" \\\n\
+         BHF_TARGET_MODULE=\"{module}\" \\\n\
+         BHF_TRACE_PREFIX=\"{trace}\" \\\n\
+         BHF_COVERED_LINES=\"{covered}\" \\\n\
+         exec \"{ruby}\" --disable-gems \"{driver}\" \"$@\"\n",
+        harness = harness_path.display(),
+        module = top_module,
+        trace = source_root.display(),
+        covered = auto_dir.join("covered-lines.txt").display(),
+        ruby = ruby.display(),
+        driver = driver.display(),
+    );
+    if let Err(e) = std::fs::write(&main_path, script) {
+        return RubyBuildResult::Failed {
+            reason: format!("write launcher {}: {e}", main_path.display()),
+            skip: false,
+        };
+    }
+    if let Err(e) = make_executable(&main_path) {
+        return RubyBuildResult::Failed {
+            reason: format!("chmod +x {}: {e}", main_path.display()),
+            skip: false,
+        };
+    }
+    RubyBuildResult::Built
+}
+
+/// Resolve the target method + the Ruby call expression. A top-level or module
+/// (`self.`) method is called directly; an instance method constructs a no-arg
+/// receiver (`Klass.new.method`).
+fn resolve_target(candidate: &Candidate) -> Result<(RubyMethod, String, bool), String> {
+    let source = crate::source_text::read_source_text(&candidate.source_path)
+        .map_err(|e| format!("read {}: {e}", candidate.source_path.display()))?;
+    let methods = parse_ruby(&source);
+    let m = methods
+        .iter()
+        .find(|m| m.name == candidate.name && m.line == candidate.line)
+        .or_else(|| methods.iter().find(|m| m.name == candidate.name))
+        .cloned()
+        .ok_or_else(|| format!("target `{}` no longer present in source", candidate.name))?;
+
+    let materialize_file = ruby_param_is_file_path(&m.first_param);
+    let argument = if materialize_file {
+        "file.path"
+    } else {
+        "data"
+    };
+    let call = if m.receiver_path.is_empty() {
+        // Top-level method (a private method on Object) — callable directly.
+        format!("{}({argument})", m.method)
+    } else if m.needs_instance {
+        format!("{}.new.{}({argument})", m.receiver_path, m.method)
+    } else {
+        format!("{}.{}({argument})", m.receiver_path, m.method)
+    };
+    Ok((m, call, materialize_file))
+}
+
+/// A Ruby parameter named as a path/file is a resource handle, not the file's
+/// contents. Expert harnesses materialize the fuzz bytes and pass a temporary
+/// path; passing the raw bytes as a pathname only explores ENOENT rejection.
+fn ruby_param_is_file_path(param: &str) -> bool {
+    let name = param.trim_start_matches(['*', '&']).to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "path" | "file" | "filename" | "filepath" | "file_path"
+    ) || name.ends_with("_path")
+        || name.ends_with("_file")
+}
+
+/// Emit `bhfgen.rb` defining a global `bhf_run_one(data)` that loads the
+/// target and passes the fuzz bytes as a `String`.
+/// The constant ruby said was missing, from `uninitialized constant A::B`.
+fn uninitialized_constant(stderr: &str) -> Option<String> {
+    let at = stderr.find("uninitialized constant ")?;
+    let rest = &stderr[at + "uninitialized constant ".len()..];
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':')
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
+/// `ActiveSupport::OrderedOptions` -> `active_support/ordered_options`, the path
+/// every Ruby autoloader (Zeitwerk and the classic convention before it) maps a
+/// constant to. Returns the first such file that exists under a load root.
+fn resolve_constant_file(constant: &str, roots: &[std::path::PathBuf]) -> Option<String> {
+    let relative: String = constant
+        .split("::")
+        .filter(|part| !part.is_empty())
+        .map(underscore)
+        .collect::<Vec<_>>()
+        .join("/");
+    if relative.is_empty() {
+        return None;
+    }
+    for root in roots {
+        let candidate = root.join(format!("{relative}.rb"));
+        if candidate.is_file() {
+            return Some(relative);
+        }
+    }
+    None
+}
+
+/// ActiveSupport's `underscore`: CamelCase to snake_case, acronym-aware
+/// (`HTTPResponse` -> `http_response`).
+fn underscore(name: &str) -> String {
+    let chars: Vec<char> = name.chars().collect();
+    let mut out = String::with_capacity(name.len() + 4);
+    for (index, ch) in chars.iter().enumerate() {
+        if ch.is_uppercase() && index > 0 {
+            let prev = chars[index - 1];
+            let next_is_lower = chars.get(index + 1).is_some_and(|c| c.is_lowercase());
+            if prev.is_lowercase()
+                || prev.is_ascii_digit()
+                || (prev.is_uppercase() && next_is_lower)
+            {
+                out.push('_');
+            }
+        }
+        out.extend(ch.to_lowercase());
+    }
+    out
+}
+
+#[cfg(test)]
+fn generate_harness(target_abs: &Path, load_roots: &[std::path::PathBuf], call: &str) -> String {
+    generate_harness_with_preludes(target_abs, load_roots, call, &[])
+}
+
+#[cfg(test)]
+fn generate_harness_with_preludes(
+    target_abs: &Path,
+    load_roots: &[std::path::PathBuf],
+    call: &str,
+    preludes: &[String],
+) -> String {
+    generate_harness_for_shape(target_abs, load_roots, call, preludes, false)
+}
+
+fn generate_harness_for_shape(
+    target_abs: &Path,
+    load_roots: &[std::path::PathBuf],
+    call: &str,
+    preludes: &[String],
+    materialize_file: bool,
+) -> String {
+    // Pushed in reverse so the FIRST root ends up first after the unshifts: the
+    // target's own package root must beat a sibling package that defines the
+    // same module name.
+    let path_setup: String = load_roots
+        .iter()
+        .rev()
+        .map(|root| {
+            let dir = root.display();
+            format!("$LOAD_PATH.unshift('{dir}') unless $LOAD_PATH.include?('{dir}')\n")
+        })
+        .collect();
+    // Constants the project's autoloader would have resolved, required up front
+    // because nothing booted that autoloader here. Best-effort: a file that
+    // fails on its own is not fatal, the target require below decides.
+    let prelude_setup: String = preludes
+        .iter()
+        .map(|path| format!("begin; require '{path}'; rescue Exception; end\n"))
+        .collect();
+    let tempfile_require = if materialize_file {
+        "require 'tempfile'\n"
+    } else {
+        ""
+    };
+    let run_body = if materialize_file {
+        format!(
+            "  Tempfile.create(['bhf-input', '.bin']) do |file|\n\
+             \x20   file.binmode\n\
+             \x20   file.write(data)\n\
+             \x20   file.flush\n\
+             \x20   bhf_mark_target_entry\n\
+             \x20   {call}\n\
+             \x20 end"
+        )
+    } else {
+        format!("  bhf_mark_target_entry\n  {call}")
+    };
+    format!(
+        "# SPDX-License-Identifier: Apache-2.0\n\
+         # Generated by bhf (native Ruby lane). Loads the target and passes the\n\
+         # fuzz bytes as a String. Do not edit.\n\
+         {path_setup}\
+         {prelude_setup}\
+         {tempfile_require}\
+         require '{target}'\n\
+         \n\
+         $bhf_target_entered = false\n\
+         def bhf_mark_target_entry\n\
+         \x20 return if $bhf_target_entered\n\
+         \x20 path = ENV['BHF_TARGET_ENTRY_SHM']\n\
+         \x20 return unless path\n\
+         \x20 File.binwrite(path, \"\\x01\")\n\
+         \x20 $bhf_target_entered = true\n\
+         rescue StandardError\n\
+         end\n\
+         \n\
+         def bhf_run_one(data)\n\
+         {run_body}\n\
+         end\n",
+        path_setup = path_setup,
+        prelude_setup = prelude_setup,
+        tempfile_require = tempfile_require,
+        target = target_abs.display(),
+        run_body = run_body,
+    )
+}
+
+#[cfg(unix)]
+fn make_executable(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path)?.permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(path, perms)
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn harness_loads_target_and_defines_run_one() {
+        let h = generate_harness(
+            Path::new("/proj/lib/toml.rb"),
+            &[
+                std::path::PathBuf::from("/proj/lib"),
+                std::path::PathBuf::from("/proj"),
+            ],
+            "Toml.parse(data)",
+        );
+        assert!(h.contains("require '/proj/lib/toml.rb'"));
+        assert!(h.contains("Toml.parse(data)"));
+        assert!(h.contains("def bhf_run_one(data)"));
+        assert!(
+            h.contains("  bhf_mark_target_entry\n  Toml.parse(data)"),
+            "entry checkpoint must immediately precede the selected call: {h}"
+        );
+        assert!(h.contains("$LOAD_PATH.unshift('/proj/lib')"));
+        assert!(h.contains("$LOAD_PATH.unshift('/proj')"));
+        // Nearest-first: the package root must be searched before the checkout.
+        let lib_at = h.find("unshift('/proj/lib')").expect("lib root present");
+        let root_at = h.find("unshift('/proj')").expect("project root present");
+        assert!(
+            lib_at > root_at,
+            "the package root must be unshifted last so it searches first"
+        );
+    }
+
+    #[test]
+    fn path_parameters_are_backed_by_a_materialized_tempfile() {
+        assert!(ruby_param_is_file_path("path"));
+        assert!(ruby_param_is_file_path("config_file"));
+        assert!(!ruby_param_is_file_path("text"));
+
+        let harness = generate_harness_for_shape(
+            Path::new("/proj/lib/project.rb"),
+            &[std::path::PathBuf::from("/proj/lib")],
+            "Project.load(file.path)",
+            &[],
+            true,
+        );
+        assert!(harness.contains("require 'tempfile'"));
+        assert!(harness.contains("file.binmode\n    file.write(data)\n    file.flush"));
+        assert!(
+            harness.contains("file.flush\n    bhf_mark_target_entry\n    Project.load(file.path)")
+        );
+    }
+
+    #[test]
+    fn an_autoloaded_constant_resolves_to_the_file_that_defines_it() {
+        // Rails resolves constants through an autoloader that is not running
+        // when one file is loaded directly, so the load stops at
+        // `uninitialized constant ActiveSupport::OrderedOptions` even though
+        // the file defining it is right there under the load root.
+        assert_eq!(
+            uninitialized_constant(
+                "x.rb:3:in `<main>': uninitialized constant ActiveSupport::OrderedOptions (NameError)"
+            )
+            .as_deref(),
+            Some("ActiveSupport::OrderedOptions")
+        );
+        assert_eq!(uninitialized_constant("some other failure"), None);
+
+        assert_eq!(underscore("ActiveSupport"), "active_support");
+        assert_eq!(underscore("OrderedOptions"), "ordered_options");
+        assert_eq!(underscore("HTTPResponse"), "http_response");
+        assert_eq!(underscore("Base64"), "base64");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("activesupport/lib");
+        std::fs::create_dir_all(root.join("active_support")).expect("mkdir");
+        std::fs::write(root.join("active_support/ordered_options.rb"), "").expect("write");
+        assert_eq!(
+            resolve_constant_file("ActiveSupport::OrderedOptions", std::slice::from_ref(&root))
+                .as_deref(),
+            Some("active_support/ordered_options")
+        );
+        // A constant with no matching file is not guessed at.
+        assert_eq!(resolve_constant_file("Nope::Missing", &[root]), None);
+    }
+
+    #[test]
+    fn preludes_are_required_before_the_target_and_never_abort_the_load() {
+        let h = generate_harness_with_preludes(
+            Path::new("/proj/lib/x.rb"),
+            &[std::path::PathBuf::from("/proj/lib")],
+            "X.parse(data)",
+            &["active_support/ordered_options".to_owned()],
+        );
+        let prelude_at = h
+            .find("require 'active_support/ordered_options'")
+            .expect("prelude present");
+        let target_at = h.find("require '/proj/lib/x.rb'").expect("target present");
+        assert!(prelude_at < target_at, "preludes come first: {h}");
+        assert!(
+            h.contains("begin; require 'active_support/ordered_options'; rescue Exception; end"),
+            "a prelude that fails must not abort the load: {h}"
+        );
+    }
+
+    #[test]
+    fn ruby_version_parses_installed_interpreter() {
+        let Some(ruby) = probe_ruby() else {
+            return; // no interpreter installed -> skip
+        };
+        let v = ruby_version(&ruby).expect("ruby_version should parse a real interpreter");
+        assert!(v.0 >= 2, "modern ruby is >= 2.x: {v:?}");
+    }
+
+    #[test]
+    fn bundled_driver_is_locatable_in_tree() {
+        let runtime = locate_ruby_runtime().expect("ruby_runtime locatable in-tree");
+        assert!(runtime.join("bhf_driver.rb").is_file());
+    }
+}

@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Automated dependency version updates. The github-actions updater keeps the
+# SHA-pinned actions in .github/workflows current (Dependabot bumps the pin and
+# the trailing version comment together); cargo and npm cover the Rust workspace
+# and the VS Code extension. Minor/patch bumps are grouped to reduce PR noise.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      cargo-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: npm
+    directory: "/editors/vscode"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      npm-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+    ignore:
+      # The extension host runs the Node that ships inside VS Code's Electron
+      # (engines.vscode ^1.90.0 -> Node 20.x), and CI pins node-version: 20.
+      # Hold @types/node on the matching major so the type checker keeps
+      # rejecting APIs the host does not actually provide.
+      - dependency-name: "@types/node"
+        update-types:
+          - version-update:semver-major
+      # @types/vscode declares the API surface the extension compiles against
+      # and must never exceed engines.vscode — `vsce package` rejects the
+      # manifest outright when it does. It is pinned exactly, in lockstep with
+      # engines.vscode, so raising the supported VS Code floor stays a
+      # deliberate edit rather than an automated bump.
+      - dependency-name: "@types/vscode"

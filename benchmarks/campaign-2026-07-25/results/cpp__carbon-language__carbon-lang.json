@@ -1,0 +1,82 @@
+{
+ "lane": "cpp",
+ "repo": "carbon-language/carbon-lang",
+ "stars": 33821,
+ "wave": "SLOC",
+ "surfaces": {
+  "sloc": {
+   "cmd": "sloc /home/ubuntu/bhf-corpus-500/cpp/carbon-language__carbon-lang --json --out /home/ubuntu/bhf-sweep-work/cpp__carbon-language__carbon-lang.cwd/sloc.json",
+   "exit": 0,
+   "wall_s": 0.05,
+   "timed_out": false,
+   "panic": false,
+   "languages": 6,
+   "sloc_total": 116038,
+   "sloc_by_lang": {
+    "cpp": 107796,
+    "python": 5407,
+    "config": 1531,
+    "javascript": 1129,
+    "c": 156,
+    "lua": 19
+   }
+  },
+  "list_targets": {
+   "cmd": "list targets /home/ubuntu/bhf-corpus-500/cpp/carbon-language__carbon-lang --format json --top 100000",
+   "exit": 0,
+   "wall_s": 12.72,
+   "timed_out": false,
+   "panic": false,
+   "count": 5052,
+   "by_language": {
+    "cpp": 5043,
+    "c": 9
+   }
+  },
+  "static_scan": {
+   "cmd": "static-scan /home/ubuntu/bhf-corpus-500/cpp/carbon-language__carbon-lang --out /home/ubuntu/bhf-sweep-work/cpp__carbon-language__carbon-lang/static --sarif --sloc sloc-breakdown.json --jobs 2 --max-memory-mb 2500",
+   "exit": 0,
+   "wall_s": 4.97,
+   "timed_out": false,
+   "panic": false,
+   "sarif": true,
+   "count": 40,
+   "by_severity": {
+    "high": 4,
+    "medium": 20,
+    "critical": 16
+   },
+   "top_rules": {
+    "BHF-429": 16,
+    "BHF-406": 14,
+    "BHF-424": 4,
+    "BHF-405": 2,
+    "BHF-422": 2,
+    "BHF-492": 1,
+    "BHF-401": 1
+   },
+   "gaps": 44
+  },
+  "sbom": {
+   "cmd": "sbom /home/ubuntu/bhf-corpus-500/cpp/carbon-language__carbon-lang --out /home/ubuntu/bhf-sweep-work/cpp__carbon-language__carbon-lang/sbom",
+   "exit": 0,
+   "wall_s": 0.28,
+   "timed_out": false,
+   "panic": false,
+   "components": 472
+  },
+  "auto": {
+   "cmd": "auto /home/ubuntu/bhf-corpus-500/cpp/carbon-language__carbon-lang --work-dir /home/ubuntu/bhf-sweep-work/cpp__carbon-language__carbon-lang --campaign-time 90 --per-target-time 3 --max-attempts 10 --max-repair-rounds 4 --jobs 1 --profile external-tools --single-pass",
+   "exit": -9,
+   "wall_s": 61.39,
+   "timed_out": false,
+   "panic": false,
+   "stderr_tail": "bhf auto: checkpointing offline requirements to /home/ubuntu/bhf-sweep-work/cpp__carbon-language__carbon-lang/auto/missing-deps.txt\nbhf auto: work-directory state: new\nbhf auto: discovering targets under /home/ubuntu/bhf-corpus-500/cpp/carbon-language__carbon-lang\nbhf auto: discovery cache miss at /home/ubuntu/bhf-sweep-work/cpp__carbon-language__carbon-lang/discovery-cache.json (no cache file yet); recomputing discovery (fingerprint aabb6459f06dbe91-pp:auto). Pass --no-discovery-cache to disable caching.\n",
+   "findings_detail": []
+  }
+ },
+ "sha": "39916ad2ca341ad4b999f0214874f9c4534160bc",
+ "clone_s": 4.0,
+ "lane_check": "cpp: 384 files / 97426 lines; top=cpp(97426)",
+ "status": "done"
+}

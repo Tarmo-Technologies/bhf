@@ -1,0 +1,95 @@
+{
+ "lane": "cpp",
+ "repo": "protocolbuffers/protobuf",
+ "stars": 71649,
+ "wave": "SLOC",
+ "surfaces": {
+  "sloc": {
+   "cmd": "sloc /home/ubuntu/bhf-corpus-500/cpp/protocolbuffers__protobuf --json --out /home/ubuntu/bhf-sweep-work/cpp__protocolbuffers__protobuf.cwd/sloc.json",
+   "exit": 0,
+   "wall_s": 0.23,
+   "timed_out": false,
+   "panic": false,
+   "languages": 11,
+   "sloc_total": 925483,
+   "sloc_by_lang": {
+    "cpp": 337907,
+    "java": 237087,
+    "csharp": 160283,
+    "c": 124349,
+    "python": 24334,
+    "php": 19108,
+    "rust": 11040,
+    "ruby": 7694,
+    "config": 2668,
+    "lua": 705,
+    "go": 308
+   }
+  },
+  "list_targets": {
+   "cmd": "list targets /home/ubuntu/bhf-corpus-500/cpp/protocolbuffers__protobuf --format json --top 100000",
+   "exit": 0,
+   "wall_s": 74.97,
+   "timed_out": false,
+   "panic": false,
+   "count": 43412,
+   "by_language": {
+    "cpp": 20627,
+    "rust": 558,
+    "java": 15458,
+    "c": 6769
+   }
+  },
+  "static_scan": {
+   "cmd": "static-scan /home/ubuntu/bhf-corpus-500/cpp/protocolbuffers__protobuf --out /home/ubuntu/bhf-sweep-work/cpp__protocolbuffers__protobuf/static --sarif --sloc sloc-breakdown.json --jobs 2 --max-memory-mb 2500",
+   "exit": 0,
+   "wall_s": 18.17,
+   "timed_out": false,
+   "panic": false,
+   "sarif": true,
+   "count": 258,
+   "by_severity": {
+    "high": 152,
+    "critical": 3,
+    "medium": 74,
+    "low": 29
+   },
+   "top_rules": {
+    "BHF-472": 108,
+    "BHF-424": 31,
+    "BHF-425": 30,
+    "BHF-546": 28,
+    "BHF-405": 24,
+    "BHF-406": 13,
+    "BHF-421": 11,
+    "BHF-403": 4,
+    "BHF-401": 4,
+    "BHF-404": 2,
+    "BHF-473": 1,
+    "BHF-420": 1,
+    "BHF-553": 1
+   },
+   "gaps": 303
+  },
+  "sbom": {
+   "cmd": "sbom /home/ubuntu/bhf-corpus-500/cpp/protocolbuffers__protobuf --out /home/ubuntu/bhf-sweep-work/cpp__protocolbuffers__protobuf/sbom",
+   "exit": 0,
+   "wall_s": 0.24,
+   "timed_out": false,
+   "panic": false,
+   "components": 66
+  },
+  "auto": {
+   "cmd": "auto /home/ubuntu/bhf-corpus-500/cpp/protocolbuffers__protobuf --work-dir /home/ubuntu/bhf-sweep-work/cpp__protocolbuffers__protobuf --campaign-time 90 --per-target-time 3 --max-attempts 10 --max-repair-rounds 4 --jobs 1 --profile external-tools --single-pass",
+   "exit": -9,
+   "wall_s": 510.11,
+   "timed_out": true,
+   "panic": false,
+   "findings_detail": []
+  }
+ },
+ "sha": "c4be7483cbb23b9836b2d9e599f37fa1f2c93bed",
+ "clone_s": 4.2,
+ "lane_check": "cpp: 532 files / 272936 lines; top=java(305810)",
+ "status": "done"
+}

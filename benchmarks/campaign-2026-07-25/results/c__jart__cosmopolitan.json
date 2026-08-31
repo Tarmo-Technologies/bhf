@@ -1,0 +1,220 @@
+{
+ "lane": "c",
+ "repo": "jart/cosmopolitan",
+ "stars": 21175,
+ "wave": "SLOC",
+ "surfaces": {
+  "sloc": {
+   "cmd": "sloc /home/ubuntu/bhf-corpus-500/c/jart__cosmopolitan --json --out /home/ubuntu/bhf-sweep-work/c__jart__cosmopolitan.cwd/sloc.json",
+   "exit": 0,
+   "wall_s": 0.08,
+   "timed_out": false,
+   "panic": false,
+   "languages": 5,
+   "sloc_total": 284219,
+   "sloc_by_lang": {
+    "c": 253750,
+    "cpp": 18761,
+    "lua": 10619,
+    "python": 580,
+    "config": 509
+   }
+  },
+  "list_targets": {
+   "cmd": "list targets /home/ubuntu/bhf-corpus-500/c/jart__cosmopolitan --format json --top 100000",
+   "exit": 0,
+   "wall_s": 296.59,
+   "timed_out": false,
+   "panic": false,
+   "count": 74098,
+   "by_language": {
+    "c": 57515,
+    "cpp": 16583
+   }
+  },
+  "static_scan": {
+   "cmd": "static-scan /home/ubuntu/bhf-corpus-500/c/jart__cosmopolitan --out /home/ubuntu/bhf-sweep-work/c__jart__cosmopolitan/static --sarif --sloc sloc-breakdown.json --jobs 2 --max-memory-mb 2500",
+   "exit": 0,
+   "wall_s": 12.64,
+   "timed_out": false,
+   "panic": false,
+   "sarif": true,
+   "count": 982,
+   "by_severity": {
+    "medium": 331,
+    "high": 632,
+    "critical": 19
+   },
+   "top_rules": {
+    "BHF-424": 203,
+    "BHF-405": 183,
+    "BHF-401": 163,
+    "BHF-407": 131,
+    "BHF-406": 94,
+    "BHF-403": 82,
+    "BHF-547": 48,
+    "BHF-408": 23,
+    "BHF-404": 19,
+    "BHF-436": 16,
+    "BHF-425": 8,
+    "BHF-422": 6,
+    "BHF-500": 2,
+    "BHF-550": 2,
+    "BHF-472": 1
+   },
+   "gaps": 509
+  },
+  "sbom": {
+   "cmd": "sbom /home/ubuntu/bhf-corpus-500/c/jart__cosmopolitan --out /home/ubuntu/bhf-sweep-work/c__jart__cosmopolitan/sbom",
+   "exit": 0,
+   "wall_s": 10.25,
+   "timed_out": false,
+   "panic": false,
+   "components": 30
+  },
+  "auto": {
+   "cmd": "auto /home/ubuntu/bhf-corpus-500/c/jart__cosmopolitan --work-dir /home/ubuntu/bhf-sweep-work/c__jart__cosmopolitan --campaign-time 90 --per-target-time 3 --max-attempts 10 --max-repair-rounds 4 --jobs 1 --profile external-tools --single-pass",
+   "exit": -9,
+   "wall_s": 510.08,
+   "timed_out": true,
+   "panic": false,
+   "findings_detail": [
+    {
+     "id": "F-RO-H-C04A5-A046422C-000",
+     "rule": "BHF-424",
+     "cwe": [
+      "CWE-457"
+     ],
+     "cwe_name": null,
+     "kind": null,
+     "severity": "medium",
+     "confidence": "medium",
+     "tier": null,
+     "harness": "H-C04A5-A046422C"
+    },
+    {
+     "id": "F-RO-H-C04A5-A046422C-001",
+     "rule": "BHF-403",
+     "cwe": [
+      "CWE-787"
+     ],
+     "cwe_name": null,
+     "kind": null,
+     "severity": "high",
+     "confidence": "medium",
+     "tier": null,
+     "harness": "H-C04A5-A046422C"
+    },
+    {
+     "id": "F-RO-H-C04A5-A046422C-002",
+     "rule": "BHF-405",
+     "cwe": [
+      "CWE-22"
+     ],
+     "cwe_name": null,
+     "kind": null,
+     "severity": "high",
+     "confidence": "medium",
+     "tier": null,
+     "harness": "H-C04A5-A046422C"
+    },
+    {
+     "id": "F-RO-H-C04A5-A046422C-003",
+     "rule": "BHF-407",
+     "cwe": [
+      "CWE-190"
+     ],
+     "cwe_name": null,
+     "kind": null,
+     "severity": "high",
+     "confidence": "medium",
+     "tier": null,
+     "harness": "H-C04A5-A046422C"
+    },
+    {
+     "id": "F-RO-H-C04A5-A046422C-004",
+     "rule": "BHF-407",
+     "cwe": [
+      "CWE-190"
+     ],
+     "cwe_name": null,
+     "kind": null,
+     "severity": "high",
+     "confidence": "medium",
+     "tier": null,
+     "harness": "H-C04A5-A046422C"
+    },
+    {
+     "id": "F-RO-H-C04A5-A046422C-005",
+     "rule": "BHF-407",
+     "cwe": [
+      "CWE-190"
+     ],
+     "cwe_name": null,
+     "kind": null,
+     "severity": "high",
+     "confidence": "medium",
+     "tier": null,
+     "harness": "H-C04A5-A046422C"
+    },
+    {
+     "id": "F-RO-H-C04A5-A046422C-006",
+     "rule": "BHF-401",
+     "cwe": [
+      "CWE-120"
+     ],
+     "cwe_name": null,
+     "kind": null,
+     "severity": "high",
+     "confidence": "medium",
+     "tier": null,
+     "harness": "H-C04A5-A046422C"
+    },
+    {
+     "id": "F-RO-H-C04A5-A046422C-007",
+     "rule": "BHF-405",
+     "cwe": [
+      "CWE-22"
+     ],
+     "cwe_name": null,
+     "kind": null,
+     "severity": "high",
+     "confidence": "medium",
+     "tier": null,
+     "harness": "H-C04A5-A046422C"
+    },
+    {
+     "id": "F-RO-H-C04A5-A046422C-008",
+     "rule": "BHF-405",
+     "cwe": [
+      "CWE-22"
+     ],
+     "cwe_name": null,
+     "kind": null,
+     "severity": "high",
+     "confidence": "medium",
+     "tier": null,
+     "harness": "H-C04A5-A046422C"
+    }
+   ]
+  },
+  "report": {
+   "cmd": "report --findings /home/ubuntu/bhf-sweep-work/c__jart__cosmopolitan/findings --out /home/ubuntu/bhf-sweep-work/c__jart__cosmopolitan/reports --sarif --junit --csv",
+   "exit": 0,
+   "wall_s": 0.02,
+   "timed_out": false,
+   "panic": false,
+   "emitted": [
+    ".csv",
+    ".json",
+    ".md",
+    ".sarif",
+    ".xml"
+   ]
+  }
+ },
+ "sha": "3293fad0a9eac7865c019be98fb993eeb933405e",
+ "clone_s": 8.6,
+ "lane_check": "c: 3010 files / 308052 lines; top=c(308052)",
+ "status": "done"
+}

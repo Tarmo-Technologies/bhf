@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "bhf_runtrace_shim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[package.metadata.dist]
+dist = true
+package-libraries = ["cdylib"]
+install-libraries = ["cdylib"]
+installers = ["shell"]
+targets = ["x86_64-unknown-linux-gnu"]
+include = ["../../INSTALL.md"]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+libc = "0.2"
+runtrace_manifest = { path = "../runtrace_manifest" }
+
+[build-dependencies]
+cc.workspace = true

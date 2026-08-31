@@ -1,0 +1,173 @@
+{
+  "$schema": "http://cyclonedx.org/schema/bom-1.6.schema.json",
+  "bomFormat": "CycloneDX",
+  "components": [
+    {
+      "bom-ref": "cargo:demo:0.1.0",
+      "licenses": [
+        {
+          "license": {
+            "id": "Apache-2.0"
+          }
+        }
+      ],
+      "name": "demo",
+      "properties": [
+        {
+          "name": "bhf:ecosystem",
+          "value": "cargo"
+        },
+        {
+          "name": "bhf:component_type",
+          "value": "source"
+        },
+        {
+          "name": "bhf:identity_confidence",
+          "value": "high"
+        },
+        {
+          "name": "bhf:matching_method",
+          "value": "cargo_manifest"
+        },
+        {
+          "name": "bhf:evidence",
+          "value": "Cargo.toml"
+        },
+        {
+          "name": "bhf:runtime_harnesses",
+          "value": ""
+        }
+      ],
+      "purl": "pkg:cargo/demo@0.1.0",
+      "supplier": {
+        "name": "unknown"
+      },
+      "type": "library",
+      "version": "0.1.0"
+    },
+    {
+      "bom-ref": "npm:demo-ui:2.0.0",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "demo-ui",
+      "properties": [
+        {
+          "name": "bhf:ecosystem",
+          "value": "npm"
+        },
+        {
+          "name": "bhf:component_type",
+          "value": "source"
+        },
+        {
+          "name": "bhf:identity_confidence",
+          "value": "high"
+        },
+        {
+          "name": "bhf:matching_method",
+          "value": "package_json"
+        },
+        {
+          "name": "bhf:evidence",
+          "value": "app/package.json"
+        },
+        {
+          "name": "bhf:runtime_harnesses",
+          "value": ""
+        }
+      ],
+      "purl": "pkg:npm/demo-ui@2.0.0",
+      "supplier": {
+        "name": "unknown"
+      },
+      "type": "library",
+      "version": "2.0.0"
+    }
+  ],
+  "dependencies": [
+    {
+      "dependsOn": [
+        "cargo:demo:0.1.0",
+        "npm:demo-ui:2.0.0"
+      ],
+      "ref": "bhf:scanned-root"
+    },
+    {
+      "dependsOn": [],
+      "ref": "cargo:demo:0.1.0"
+    },
+    {
+      "dependsOn": [],
+      "ref": "npm:demo-ui:2.0.0"
+    }
+  ],
+  "metadata": {
+    "component": {
+      "bom-ref": "bhf:scanned-root",
+      "licenses": [
+        {
+          "license": {
+            "id": "Apache-2.0"
+          }
+        }
+      ],
+      "name": "demo",
+      "properties": [
+        {
+          "name": "bhf:root",
+          "value": "<ROOT>"
+        }
+      ],
+      "purl": "pkg:cargo/demo@0.1.0",
+      "supplier": {
+        "name": "unknown"
+      },
+      "type": "application",
+      "version": "0.1.0"
+    },
+    "properties": [
+      {
+        "name": "bhf:generation_context",
+        "value": "offline-sbom"
+      }
+    ],
+    "supplier": {
+      "name": "Tarmo Technologies"
+    },
+    "timestamp": "1970-01-01T00:00:00Z",
+    "tools": {
+      "components": [
+        {
+          "bom-ref": "pkg:cargo/bhf@<BHF_VERSION>",
+          "licenses": [
+            {
+              "license": {
+                "id": "Apache-2.0"
+              }
+            }
+          ],
+          "name": "bhf",
+          "properties": [
+            {
+              "name": "bhf:component_role",
+              "value": "scanner"
+            }
+          ],
+          "purl": "pkg:cargo/bhf@<BHF_VERSION>",
+          "supplier": {
+            "name": "Tarmo Technologies"
+          },
+          "type": "application",
+          "version": "<BHF_VERSION>"
+        }
+      ]
+    }
+  },
+  "specVersion": "1.6",
+  "version": 1
+}

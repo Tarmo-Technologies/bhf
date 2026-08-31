@@ -1,0 +1,161 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+# Fuzzing JavaScript / Node.js with bhf
+
+bhf fuzzes JavaScript with **no harness to write** — point it at a Node source
+tree and it discovers exported functions, generates the harness, and fuzzes them
+coverage-guided with **real V8 block coverage**, on a warm Node process.
+
+```sh
+bhf auto path/to/js-src --languages javascript
+```
+
+## How it works
+
+An **exported** function taking at least one argument is the fuzzable unit. bhf:
+
+1. **Discovers** each exported function across both module systems — CommonJS
+   (`module.exports = { parse }`, `exports.parse = …`, `module.exports = fn`) and
+   ESM (`export function parse`, `export const parse = …`, `export default`) — plus
+   the **public instance methods of exported classes** (`class Parser { parse(x) }`;
+   the driver `new`s a no-argument-constructible class and calls the method). The
+   first argument is inferred as a `Buffer` or UTF-8 `string` from its name
+   (`buf`/`data`/`bytes` → Buffer; `str`/`text`/`source`/`html` → string).
+2. **"Builds"** it with a `node -c` syntax check (interpreted — there is no native
+   binary) and emits a launcher.
+3. **Fuzzes** it on bhf's builtin fork-server engine driving **one warm Node
+   process** over the framed protocol (amortizing interpreter + `require` startup).
+   Per input the driver records **real V8 precise block coverage** via the inspector
+   Profiler and folds it — keyed on `(script, block span, taken/not-taken)` — into
+   bhf's cumulative `BHF_COV_SHM` edge bitmap, so the engine gets genuine
+   branch feedback, not black-box guessing.
+
+### Oracle
+
+An **uncaught exception** that is not input rejection is the finding signal (the
+driver hard-halts with exit 86). The error is classified into a BHF rule + CWE:
+
+| Error | Rule | CWE |
+|---|---|---|
+| `RangeError: Maximum call stack size exceeded` | BHF-207 | CWE-674 (uncontrolled recursion) |
+| `RangeError: Invalid array/string length`, out-of-memory | BHF-209 | CWE-789 (resource exhaustion) |
+| `ReferenceError`, an explicit `throw new Error(...)`, and other ECMAScript built-in error types | BHF-210 | reachable crash |
+
+Errors whose `.name` is not an ECMAScript built-in — Node's `AssertionError`, a
+library's `ValidationError`, and similar — are treated as ordinary input
+rejection and suppressed, as are the `TypeError`/`SyntaxError` artifacts of the
+untyped lane synthesizing only the first argument, so they do not become BHF-210
+findings.
+
+Beyond uncaught exceptions, the driver runs **taint-confirmed bug detectors** (the
+JS analog of bhf's native oracles, and of Jazzer.js's bug detectors):
+
+- **Command injection** (**BHF-431 / CWE-78**) — it hooks
+  `child_process.exec`/`execSync` and reports when a shell-metacharacter-bearing
+  substring of the fuzz input reaches the command (the input controls shell
+  *syntax*, not just data). The command is **never executed** (a benign stub is
+  returned), so the fuzzer can't run arbitrary shell, and an input whose
+  metacharacters never reach a command is not flagged.
+- **Prototype pollution** (**BHF-509 / CWE-1321**) — the top JS injection class. The
+  driver snapshots `Object.prototype` / `Array.prototype` at startup and, after any
+  input carrying a `__proto__`/`constructor`/`prototype` vector, reports a new
+  own-property that appeared on them. Complete `{"__proto__":{…}}` payloads are
+  seeded into the dictionary so an unsafe `JSON.parse`+merge is reachable, and the
+  vector-token gate keeps benign `JSON.parse` (which never pollutes) from being
+  flagged.
+
+`TypeError`, `SyntaxError`, `URIError`, and a validating `RangeError` are treated as
+intended input rejection and swallowed. This mirrors the Python lane, which
+suppresses the exact analogs (`TypeError`/`AttributeError`): in an untyped lane
+bhf synthesizes only the *first* argument, so a `TypeError` ("Cannot read
+properties of undefined", "x is not a function") is dominated by us calling a
+function with a missing later argument or the wrong first shape — our fault, not a
+target defect. A 30-project campaign confirmed every `TypeError` was such an
+artifact, so suppressing the class is the key to a low false-positive rate. Real
+memory-safety / injection classes are caught by the behavioral oracles, not this
+exception policy.
+
+## Where bhf stands vs the field
+
+JavaScript has two notable fuzzers, both of which bhf's zero-harness,
+auto-discovery model improves on:
+
+- **[Jazzer.js](https://github.com/CodeIntelligenceTesting/jazzer.js)** (Code
+  Intelligence) — the strongest JS fuzzer. It instruments source with a Babel/hook
+  plug-in and drives libFuzzer, but you write a `fuzz(data)` entry per target, wire
+  it into a Jest/standalone runner, and manage the toolchain.
+- **[jsfuzz](https://github.com/fuzzitdev/jsfuzz)** — Istanbul-coverage,
+  coverage-guided, but likewise one hand-written `fuzz(buf)` function per target and
+  now largely unmaintained.
+
+On the static side, ESLint, SonarJS, and CodeQL flag candidate issues but don't
+confirm them with real input. Jazzer.js additionally ships *bug detectors*
+(command injection, path traversal, prototype pollution); bhf's JS driver
+carries taint-confirmed **command-injection** and **prototype-pollution** detectors
+(see the oracle section) in the same fuzz-confirming style as its native lanes.
+
+| | Jazzer.js / jsfuzz | **bhf `auto --languages javascript`** |
+|---|---|---|
+| Fuzz entry to write | one per target | **none — auto-discovered** |
+| Coverage | Babel/Istanbul instrumentation | **V8 precise block coverage (no source rewrite)** |
+| Multi-target sweep | scripted by hand | **one command over the whole tree** |
+| Warm process reuse | per-runner | **framed fork-server (one warm V8)** |
+| Findings → CWE / SARIF / CSV | — | built-in |
+
+bhf is the only tool that fuzzes JavaScript from source with **zero harness**,
+using the V8 engine's own coverage (no Babel/Istanbul source transform) folded into
+a shared edge map.
+
+## TypeScript
+
+`bhf auto --languages typescript` fuzzes `.ts`/`.tsx` the same way. Discovery
+runs directly on the TypeScript source — the name-extracting parser reads a
+signature like `parse(input: string, opts?: Options): Result` and keeps just the
+parameter names, so type annotations, `interface`/`type` declarations, and
+`private`/`protected`/`abstract` members are ignored. The target is then
+transpiled to CommonJS with [esbuild](https://esbuild.github.io/) (bundling local
+imports, leaving `node_modules` external) and driven by the identical warm-Node
+framed driver — same V8 block coverage, dictionary, exception oracle, and
+command-injection detector as the JavaScript lane.
+
+```sh
+bhf auto path/to/ts-src --languages typescript   # needs node + esbuild
+```
+
+Requirements: Node.js and `esbuild` (`npm i -g esbuild`); absent either, the lane
+skips cleanly. `.d.ts` declaration files (no runtime code) are not fuzzed.
+
+## Validation (campaign)
+
+A 30-project campaign over the most-depended-on npm libraries — express, lodash,
+axios, moment, validator.js, node-semver, marked, joi, qs, node-fetch, and more:
+
+- **2,018 JS files scanned, 531 fuzzable functions discovered, 0 bhf panics** —
+  discovery is robust across CommonJS and ESM, minified and hand-written code
+  (validator.js alone → 111 targets, moment → 162). The first-argument name filter
+  keeps internal array/options helpers (`multilineRegexp(parts)`) out of the fuzz
+  set.
+- **End-to-end** on a parser: real V8 branch coverage drove the engine to an
+  uncontrolled-recursion crash (`RangeError: Maximum call stack size exceeded`,
+  BHF-207 / CWE-674) with the V8 stack, from **zero hand-written harness** — and with
+  the `TypeError` suppression policy, **0 false positives** across the campaign's
+  built-and-fuzzed validators.
+
+## Requirements & licensing
+
+- **Node.js** on the host — no npm packages are installed for the lane itself; the
+  target is `require`d as-is. Absent `node`, the lane skips cleanly (the
+  GNAT-less rule).
+- The driver uses only Node built-ins (`inspector`, `fs`) — no third-party fuzzing
+  dependency, nothing linked into bhf.
+
+## Limits (honest)
+
+- The fuzzable surface is the **first argument** (Buffer/string); a function whose
+  behavior needs a second structured argument (an options object) is driven with
+  the first arg only, so bhf feeds the primitive it can and relies on the
+  rejection policy to suppress our-fault `TypeError`s.
+- CommonJS/ESM modules that require a bundler/transpile step (TypeScript source,
+  `import`-only ESM without a `.mjs`/`package.json type`) may not `require` as-is —
+  point bhf at the built/published `lib/` in that case.
+- One function is fuzzed at a time; the target's own `require`d dependencies load
+  but coverage is scoped to the module under test.

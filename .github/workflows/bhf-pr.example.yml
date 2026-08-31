@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copy this to `.github/workflows/bhf-pr.yml` to fuzz every PR's changed
+# code and annotate it inline. That is the entire setup — no config file.
+name: bhf PR
+on: pull_request
+permissions:
+  contents: read
+  pull-requests: write # sticky summary comment
+  security-events: write # SARIF upload → code-scanning annotations
+jobs:
+  bhf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0 # required so merge-base against the PR base resolves
+      - uses: Tarmo-Technologies/bhf/.github/actions/bhf-pr@main
+        with:
+          path: .
+          campaign-time: "180"
+          # The bhf repo dogfoods its own tip: the action tracks @main, so the
+          # binary must too (the latest release predates `ci --changed-since`).
+          # When copying this workflow to your repo, drop this line — the default
+          # release install is faster and is what the pinned action expects.
+          build-from-source: "true"
+          # languages: "c,cpp,rust"   # optional: restrict lanes
+          # pr-gate: "confirmed"      # confirmed | all | never (default: confirmed)

@@ -1,0 +1,95 @@
+{
+ "lane": "cpp",
+ "repo": "envoyproxy/envoy",
+ "stars": 28638,
+ "wave": "SLOC",
+ "surfaces": {
+  "sloc": {
+   "cmd": "sloc /home/ubuntu/bhf-corpus-500/cpp/envoyproxy__envoy --json --out /home/ubuntu/bhf-sweep-work/cpp__envoyproxy__envoy.cwd/sloc.json",
+   "exit": 0,
+   "wall_s": 0.35,
+   "timed_out": false,
+   "panic": false,
+   "languages": 8,
+   "sloc_total": 1431321,
+   "sloc_by_lang": {
+    "cpp": 1278998,
+    "config": 49350,
+    "rust": 34611,
+    "java": 24706,
+    "go": 16773,
+    "c": 13537,
+    "python": 11842,
+    "javascript": 1504
+   }
+  },
+  "list_targets": {
+   "cmd": "list targets /home/ubuntu/bhf-corpus-500/cpp/envoyproxy__envoy --format json --top 100000",
+   "exit": 0,
+   "wall_s": 149.41,
+   "timed_out": false,
+   "panic": false,
+   "count": 69480,
+   "by_language": {
+    "cpp": 64748,
+    "c": 1128,
+    "java": 1375,
+    "rust": 2229
+   }
+  },
+  "static_scan": {
+   "cmd": "static-scan /home/ubuntu/bhf-corpus-500/cpp/envoyproxy__envoy --out /home/ubuntu/bhf-sweep-work/cpp__envoyproxy__envoy/static --sarif --sloc sloc-breakdown.json --jobs 2 --max-memory-mb 2500",
+   "exit": 0,
+   "wall_s": 72.14,
+   "timed_out": false,
+   "panic": false,
+   "sarif": true,
+   "count": 468,
+   "by_severity": {
+    "medium": 187,
+    "high": 216,
+    "low": 16,
+    "critical": 49
+   },
+   "top_rules": {
+    "BHF-424": 111,
+    "BHF-405": 83,
+    "BHF-406": 57,
+    "BHF-549": 55,
+    "BHF-429": 46,
+    "BHF-403": 34,
+    "BHF-407": 19,
+    "BHF-546": 16,
+    "BHF-422": 15,
+    "BHF-408": 11,
+    "BHF-552": 4,
+    "BHF-404": 3,
+    "BHF-542": 3,
+    "BHF-401": 2,
+    "BHF-425": 2
+   },
+   "gaps": 1426
+  },
+  "sbom": {
+   "cmd": "sbom /home/ubuntu/bhf-corpus-500/cpp/envoyproxy__envoy --out /home/ubuntu/bhf-sweep-work/cpp__envoyproxy__envoy/sbom",
+   "exit": 0,
+   "wall_s": 1.97,
+   "timed_out": false,
+   "panic": false,
+   "components": 414
+  },
+  "auto": {
+   "cmd": "auto /home/ubuntu/bhf-corpus-500/cpp/envoyproxy__envoy --work-dir /home/ubuntu/bhf-sweep-work/cpp__envoyproxy__envoy --campaign-time 90 --per-target-time 3 --max-attempts 10 --max-repair-rounds 4 --jobs 1 --profile external-tools --single-pass",
+   "exit": -9,
+   "wall_s": 119.54,
+   "timed_out": false,
+   "panic": false,
+   "stderr_tail": "bhf auto: checkpointing offline requirements to /home/ubuntu/bhf-sweep-work/cpp__envoyproxy__envoy/auto/missing-deps.txt\nbhf auto: work-directory state: new\nbhf auto: discovering targets under /home/ubuntu/bhf-corpus-500/cpp/envoyproxy__envoy\nbhf auto: discovery cache miss at /home/ubuntu/bhf-sweep-work/cpp__envoyproxy__envoy/discovery-cache.json (no cache file yet); recomputing discovery (fingerprint 3cb416b9aed5e15c-pp:auto). Pass --no-discovery-cache to disable caching.\n",
+   "findings_detail": []
+  }
+ },
+ "sha": "295ef9d9d87c645e2f1cc344c05220f6794036b7",
+ "clone_s": 8.4,
+ "lane_check": "cpp: 4102 files / 1184448 lines; top=cpp(1184448)",
+ "status": "done"
+}
