@@ -486,6 +486,19 @@ mod tests {
     }
 
     #[test]
+    fn missing_header_gcc_form() {
+        let stderr = "mfc_command.cpp:6:10: fatal error: afxwin.h: No such file or directory\n";
+        let kinds = classify(stderr);
+        assert!(
+            kinds.iter().any(|kind| matches!(
+                kind,
+                BuildErrorKind::MissingHeader { path } if path == "afxwin.h"
+            )),
+            "got {kinds:?}"
+        );
+    }
+
+    #[test]
     fn missing_parent_header_clang_suggestion_form() {
         let stderr = "internal/stack.h:18:10: error: '../allocators.h' file not found, did you mean 'allocators.h'?\n";
         let kinds = classify(stderr);
