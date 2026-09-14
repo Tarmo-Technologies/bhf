@@ -165,7 +165,9 @@ fn minimize_c_engine(
             return Ok(None);
         }
         let stderr = String::from_utf8_lossy(&output.stderr);
-        Ok(corpus::parse_sanitizer_report(&stderr).map(|r| r.rule_id))
+        Ok(corpus::parse_sanitizer_report(&stderr)
+            .map(|r| r.rule_id)
+            .or_else(|| crate::fatal_signal::rule_id(&output.status, &stderr)))
     };
 
     let baseline = run_once(&original_input)?.ok_or_else(|| {
@@ -375,4 +377,49 @@ fn update_finding_record(finding_dir: &Path, result: &MinimizeOutput) -> anyhow:
     fs::write(&path, serde_json::to_vec_pretty(&value)?)
         .with_context(|| format!("write {}", path.display()))?;
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod silent_abort_tests {
+    use super::{minimize_c_engine, CEngineIo, MinimizeStrategy};
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use tempfile::tempdir;
+
+    #[test]
+    fn libfuzzer_minimizer_reduces_silent_abort_finding() {
+        let root = tempdir().expect("tempdir");
+        let finding = root.path().join("finding");
+        fs::create_dir(&finding).expect("finding dir");
+        fs::write(
+            finding.join("finding.json"),
+            r#"{"rule_id":"BHF-210","paths":{}}"#,
+        )
+        .expect("finding");
+        fs::write(finding.join("testcase.bin"), b"prefix-CRASH-suffix").expect("testcase");
+
+        let harness = root.path().join("abort-on-crash.sh");
+        fs::write(
+            &harness,
+            "#!/bin/sh\ncase \"$(cat \"$1\")\" in *CRASH*) kill -ABRT $$;; esac\n",
+        )
+        .expect("harness");
+        let mut permissions = fs::metadata(&harness).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&harness, permissions).expect("chmod");
+
+        let result = minimize_c_engine(
+            &finding,
+            &harness,
+            MinimizeStrategy::Bytes,
+            CEngineIo::ArgvFile,
+        )
+        .expect("minimize");
+
+        assert!(result.reduced);
+        assert_eq!(
+            fs::read(finding.join("min_testcase.bin")).unwrap(),
+            b"CRASH"
+        );
+    }
 }

@@ -891,85 +891,30 @@ struct HarnessRun {
 ///
 /// EXCEPTION — the Windows (mingw + wine) path: a guest hardware fault is NOT
 /// delivered as a POSIX signal; the driver's vectored exception handler reports it
-/// by exiting with [`BHF_WIN_CRASH_EXIT`]. That specific exit code is a genuine
+/// by exiting with [`crate::fatal_signal::BHF_WIN_CRASH_EXIT`]. That specific exit code is a genuine
 /// crash, not a rejection — any OTHER nonzero exit stays a rejection as before.
 ///
 /// The exit code the Windows (mingw) driver's vectored exception handler uses to
 /// report a fatal hardware fault when fuzzing under wine. MUST match
 /// `BHF_WIN_CRASH_EXIT` in `c_runtime/bhf_driver.c` and the
 /// `direct_harness.{c,cpp}.tera` templates.
-const BHF_WIN_CRASH_EXIT: i32 = 0x39;
-
-fn has_abort_rejection_diagnostic(stderr: &str) -> bool {
-    let lower = stderr.to_ascii_lowercase();
-    (lower.contains("assertion") && lower.contains("failed"))
-        || lower.contains("assert failed")
-        || lower.contains("panicked at")
-        || lower.contains("panic:")
-}
-
-#[cfg(unix)]
 fn is_input_rejection(status: &std::process::ExitStatus, stderr: &str) -> bool {
-    use std::os::unix::process::ExitStatusExt;
-    if status.code() == Some(BHF_WIN_CRASH_EXIT) {
-        return false;
-    }
-    const CRASH_SIGNALS: [i32; 5] = [4, 6, 7, 8, 11];
-    match status.signal() {
-        Some(6) => has_abort_rejection_diagnostic(stderr),
-        Some(signal) => !CRASH_SIGNALS.contains(&signal),
-        None => true,
-    }
-}
-
-#[cfg(not(unix))]
-fn is_input_rejection(status: &std::process::ExitStatus, _stderr: &str) -> bool {
-    status.code() != Some(BHF_WIN_CRASH_EXIT)
-}
-
-/// Human name for a fatal crash signal, for the BHF-210 finding message.
-#[cfg(unix)]
-fn fatal_signal_name(status: &std::process::ExitStatus) -> String {
-    use std::os::unix::process::ExitStatusExt;
-    if status.code() == Some(BHF_WIN_CRASH_EXIT) {
-        return "Windows exception (access violation / fault, via wine)".to_owned();
-    }
-    match status.signal() {
-        Some(4) => "SIGILL".to_owned(),
-        Some(6) => "SIGABRT".to_owned(),
-        Some(7) => "SIGBUS".to_owned(),
-        Some(8) => "SIGFPE".to_owned(),
-        Some(11) => "SIGSEGV".to_owned(),
-        Some(n) => format!("signal {n}"),
-        None => format!("exit {:?}", status.code()),
-    }
-}
-
-#[cfg(not(unix))]
-fn fatal_signal_name(status: &std::process::ExitStatus) -> String {
-    if status.code() == Some(BHF_WIN_CRASH_EXIT) {
-        return "Windows exception (access violation / fault)".to_owned();
-    }
-    format!("exit {:?}", status.code())
+    crate::fatal_signal::classify(status, stderr).is_none()
 }
 
 /// Synthesize the BHF-210 "reachable crash (fatal signal, no sanitizer report)"
-/// finding for a non-rejection crash on an input. Recording it as a finding —
-/// rather than returning a hard error — lets the crash SURFACE and the fuzz
-/// cascade keep exploring, instead of one early crash aborting the whole pass and
-/// leaving the target reported "built, not fuzzed" with the crash lost (e.g.
-/// cute_tiled, whose empty seed crashes before any real input is tried). The
-/// replay re-runs the input, hits the same signal, and re-synthesizes BHF-210, so
-/// the finding still confirms on replay-verify.
-fn fatal_signal_report(status: &std::process::ExitStatus) -> corpus::SanitizerReport {
+/// finding for a non-rejection crash on an input.
+fn fatal_signal_report(status: &std::process::ExitStatus, stderr: &str) -> corpus::SanitizerReport {
+    let crash = crate::fatal_signal::classify(status, stderr)
+        .expect("fatal_signal_report requires a classified fatal signal");
     corpus::SanitizerReport {
         sanitizer: corpus::Sanitizer::AddressSanitizer,
         kind: "fatal-signal".to_owned(),
-        rule_id: "BHF-210",
+        rule_id: crate::fatal_signal::RULE_ID,
         stack: Vec::new(),
         message: format!(
             "harness crashed with {} and no sanitizer report — a reachable crash",
-            fatal_signal_name(status)
+            crash.name
         ),
     }
 }
@@ -3876,7 +3821,7 @@ fn run_c_libfuzzer_single_input(
         return Ok(HarnessRun {
             events: Vec::new(),
             testcases: Vec::new(),
-            sanitizer: Some(fatal_signal_report(&output.status)),
+            sanitizer: Some(fatal_signal_report(&output.status, &stderr)),
             rejected: false,
         });
     }
@@ -4926,7 +4871,7 @@ fn run_harness(
         return Ok(HarnessRun {
             events: Vec::new(),
             testcases: Vec::new(),
-            sanitizer: Some(fatal_signal_report(&status)),
+            sanitizer: Some(fatal_signal_report(&status, &stderr)),
             rejected: false,
         });
     }
@@ -5502,6 +5447,7 @@ fn parse_worker_count(value: &str) -> Result<FuzzWorkerCount, String> {
 #[cfg(all(test, unix))]
 mod signal_classification_tests {
     use super::is_input_rejection;
+    use crate::fatal_signal::BHF_WIN_CRASH_EXIT;
     use std::os::unix::process::ExitStatusExt;
     use std::process::ExitStatus;
 
@@ -5570,8 +5516,8 @@ mod signal_classification_tests {
         // exception handler reports it via the BHF_WIN_CRASH_EXIT exit code.
         // That code must classify as a crash; any other nonzero exit stays a
         // rejection.
-        let crash = ExitStatus::from_raw(super::BHF_WIN_CRASH_EXIT << 8);
-        assert_eq!(crash.code(), Some(super::BHF_WIN_CRASH_EXIT));
+        let crash = ExitStatus::from_raw(BHF_WIN_CRASH_EXIT << 8);
+        assert_eq!(crash.code(), Some(BHF_WIN_CRASH_EXIT));
         assert!(
             !is_input_rejection(&crash, ""),
             "the Windows crash sentinel exit must be a crash, not a rejection",

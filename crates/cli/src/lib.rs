@@ -52,6 +52,7 @@ mod explain;
 mod export_bundle;
 mod extract_state_machines;
 mod fake_corba;
+mod fatal_signal;
 mod finding_arg;
 mod fuzz;
 mod generate_harness;
