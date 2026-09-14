@@ -860,7 +860,7 @@ struct HarnessRun {
     /// recognized in its stderr. The C/C++ fuzz path uses this to emit
     /// findings without an Ada event log.
     sanitizer: Option<corpus::SanitizerReport>,
-    /// #15: the target REJECTED this input (assert/abort or a non-zero error
+    /// #15: the target REJECTED this input (diagnosed assertion/panic or a non-zero error
     /// return on malformed bytes) — a clean no-finding run that the pass skips and
     /// continues past. Tracked so `run_builtin` can tell a target that rejected
     /// EVERY input (incl. the empty seed — a gate/seed/harness problem, reported as
@@ -870,11 +870,11 @@ struct HarnessRun {
 
 /// Classify a non-success harness exit (called only when `!status.success()` and
 /// NO sanitizer report was found): is it the target REJECTING this input, or a
-/// real crash? Only the genuine memory-safety crash signals — SIGSEGV, SIGBUS,
-/// SIGILL, SIGFPE — are NOT a rejection; without a sanitizer report they stay a
-/// hard error so a real crash on a non-instrumented harness isn't silently
+/// real crash? Genuine crash signals — silent SIGABRT, SIGSEGV, SIGBUS, SIGILL,
+/// SIGFPE — are NOT a rejection; without a sanitizer report they become BHF-210
+/// findings so a real crash on a non-instrumented harness isn't silently
 /// swallowed. Everything else is a rejection (#15: skip + continue):
-///   - SIGABRT — the `assert()`/`abort()` idiom (an input rejection),
+///   - SIGABRT accompanied by a recognizable assertion/panic diagnostic,
 ///   - a plain non-zero exit code — an error return,
 ///   - SIGPIPE (13) — benign plumbing: the harness wrote to a closed pipe (e.g.
 ///     a `--comparison-progress` / stats pipe whose reader went away). It is
@@ -886,7 +886,8 @@ struct HarnessRun {
 ///     handled by the timeout/hang path, not a code defect in the target.
 ///
 /// Use an allow-list of the real crash signals so any other signal a runtime may
-/// raise can never become a phantom finding.
+/// raise can never become a phantom finding. A silent SIGABRT is a crash because
+/// there is no evidence that the target intentionally rejected malformed input.
 ///
 /// EXCEPTION — the Windows (mingw + wine) path: a guest hardware fault is NOT
 /// delivered as a POSIX signal; the driver's vectored exception handler reports it
@@ -899,29 +900,30 @@ struct HarnessRun {
 /// `direct_harness.{c,cpp}.tera` templates.
 const BHF_WIN_CRASH_EXIT: i32 = 0x39;
 
+fn has_abort_rejection_diagnostic(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    (lower.contains("assertion") && lower.contains("failed"))
+        || lower.contains("assert failed")
+        || lower.contains("panicked at")
+        || lower.contains("panic:")
+}
+
 #[cfg(unix)]
-fn is_input_rejection(status: &std::process::ExitStatus) -> bool {
+fn is_input_rejection(status: &std::process::ExitStatus, stderr: &str) -> bool {
     use std::os::unix::process::ExitStatusExt;
-    // The Windows (mingw + wine) driver's vectored exception handler reports a
-    // guest hardware fault via this exit code — there is no POSIX signal for it —
-    // so it is a genuine crash, not a rejection.
     if status.code() == Some(BHF_WIN_CRASH_EXIT) {
         return false;
     }
-    // SIGILL=4, SIGBUS=7, SIGFPE=8, SIGSEGV=11 — the genuine crash signals.
-    const CRASH_SIGNALS: [i32; 4] = [4, 7, 8, 11];
+    const CRASH_SIGNALS: [i32; 5] = [4, 6, 7, 8, 11];
     match status.signal() {
+        Some(6) => has_abort_rejection_diagnostic(stderr),
         Some(signal) => !CRASH_SIGNALS.contains(&signal),
         None => true,
     }
 }
 
 #[cfg(not(unix))]
-fn is_input_rejection(status: &std::process::ExitStatus) -> bool {
-    // Off-Unix (native Windows) there are no POSIX signals: the harness driver's
-    // vectored exception handler reports a hardware fault via BHF_WIN_CRASH_EXIT.
-    // Treat that exact code as a genuine crash; any other nonzero exit is an input
-    // rejection (an error return on malformed input).
+fn is_input_rejection(status: &std::process::ExitStatus, _stderr: &str) -> bool {
     status.code() != Some(BHF_WIN_CRASH_EXIT)
 }
 
@@ -3851,12 +3853,12 @@ fn run_c_libfuzzer_single_input(
                 rejected: false,
             });
         }
-        // Hands-off robustness (#15): an `assert()`/`abort()` (SIGABRT) or a
+        // Hands-off robustness (#15): a diagnosed assertion/panic SIGABRT or a
         // non-zero error return with NO sanitizer report is the target REJECTING
         // this input (e.g. cute_aseprite's `assert(magic == 0xA5E0)`). Treat it
         // like a timeout — a clean no-finding run flagged `rejected` so the pass
         // keeps exploring past the bad input.
-        if is_input_rejection(&output.status) {
+        if is_input_rejection(&output.status, &stderr) {
             return Ok(HarnessRun {
                 events: Vec::new(),
                 testcases: Vec::new(),
@@ -3864,7 +3866,7 @@ fn run_c_libfuzzer_single_input(
                 rejected: true,
             });
         }
-        // A genuine crash SIGNAL (SIGSEGV/SIGBUS/SIGILL/SIGFPE) with no sanitizer
+        // A genuine crash SIGNAL (silent SIGABRT/SIGSEGV/SIGBUS/SIGILL/SIGFPE) with no sanitizer
         // report is still a reachable crash on THIS input — record it as a BHF-210
         // finding so it surfaces and the cascade keeps fuzzing, rather than a hard
         // error that aborts the whole pass (which left targets whose empty/early
@@ -4904,12 +4906,12 @@ fn run_harness(
                 rejected: false,
             });
         }
-        // Hands-off robustness (#15): an assert/abort (SIGABRT) or non-zero error
+        // Hands-off robustness (#15): a diagnosed assertion/panic SIGABRT or a
         // return with NO sanitizer report is the target REJECTING this input — a
         // clean no-event run flagged `rejected` so the pass CONTINUES exploring
         // past the bad input instead of aborting.
         let _ = fs::remove_file(&events_path);
-        if is_input_rejection(&status) {
+        if is_input_rejection(&status, &stderr) {
             return Ok(HarnessRun {
                 events: Vec::new(),
                 testcases: Vec::new(),
@@ -4917,7 +4919,7 @@ fn run_harness(
                 rejected: true,
             });
         }
-        // A genuine crash SIGNAL (SIGSEGV/SIGBUS/SIGILL/SIGFPE) with no report is a
+        // A genuine crash SIGNAL (silent SIGABRT/SIGSEGV/SIGBUS/SIGILL/SIGFPE) with no report is a
         // reachable crash on this input — record it as a BHF-210 finding (surfaces
         // it + keeps the cascade fuzzing) rather than a hard error that aborts the
         // whole pass. Precise ASan/UBSan bugs still classify via their report above.
@@ -5516,17 +5518,33 @@ mod signal_classification_tests {
             11, /*SEGV*/
         ] {
             assert!(
-                !is_input_rejection(&by_signal(sig)),
+                !is_input_rejection(&by_signal(sig), ""),
                 "signal {sig} is a genuine crash and must not be treated as a rejection",
             );
         }
 
-        // Benign / external / assert-idiom signals -> rejections (never a BHF-210).
+        // A silent SIGABRT gives no evidence of intentional rejection.
+        assert!(
+            !is_input_rejection(&by_signal(6), ""),
+            "silent SIGABRT must surface as BHF-210",
+        );
+        assert!(
+            is_input_rejection(
+                &by_signal(6),
+                "parser.c:12: parse: Assertion 'magic == expected' failed."
+            ),
+            "an assertion diagnostic identifies an intended rejection",
+        );
+        assert!(
+            is_input_rejection(&by_signal(6), "thread 'main' panicked at src/lib.rs:4:2"),
+            "a panic diagnostic identifies an intended rejection",
+        );
+
+        // Benign / external signals -> rejections (never a BHF-210).
         // SIGPIPE (13) is the regression under test: a closed progress/stats pipe
         // killed the harness, bhf reported a phantom high-severity "reachable
         // crash" on a valid glTF that exits 0 on replay.
         for sig in [
-            6,  // SIGABRT — assert()/abort() idiom
             13, // SIGPIPE — wrote to a closed pipe (plumbing, not a target bug)
             15, // SIGTERM — external termination
             2,  // SIGINT
@@ -5534,14 +5552,14 @@ mod signal_classification_tests {
             14, // SIGALRM — timeout path, not a code defect
         ] {
             assert!(
-                is_input_rejection(&by_signal(sig)),
+                is_input_rejection(&by_signal(sig), ""),
                 "signal {sig} is benign/external and must be a rejection, not a crash",
             );
         }
 
         // A plain non-zero exit code (error return on malformed input) -> rejection.
         assert!(
-            is_input_rejection(&ExitStatus::from_raw(1 << 8)),
+            is_input_rejection(&ExitStatus::from_raw(1 << 8), ""),
             "a non-signal error exit is an input rejection",
         );
     }
@@ -5555,11 +5573,11 @@ mod signal_classification_tests {
         let crash = ExitStatus::from_raw(super::BHF_WIN_CRASH_EXIT << 8);
         assert_eq!(crash.code(), Some(super::BHF_WIN_CRASH_EXIT));
         assert!(
-            !is_input_rejection(&crash),
+            !is_input_rejection(&crash, ""),
             "the Windows crash sentinel exit must be a crash, not a rejection",
         );
         assert!(
-            is_input_rejection(&ExitStatus::from_raw(2 << 8)),
+            is_input_rejection(&ExitStatus::from_raw(2 << 8), ""),
             "an ordinary nonzero exit remains an input rejection",
         );
     }
@@ -6527,10 +6545,14 @@ mod auto_path_tests {
 
     #[test]
     #[cfg(unix)]
-    fn fatal_abort_signal_without_sanitizer_is_input_rejection() {
-        // The cute_aseprite case: assert() -> abort() -> SIGABRT, no ASan report.
+    fn diagnosed_assertion_abort_without_sanitizer_is_input_rejection() {
+        // The cute_aseprite case: assert() writes a diagnostic, then SIGABRT.
         let work = tmpdir();
-        let h = write_script(&work, "reject_abort.sh", "#!/bin/sh\nkill -ABRT $$\n");
+        let h = write_script(
+            &work,
+            "reject_abort.sh",
+            "#!/bin/sh\n>&2 echo \"parser.c:12: parse: Assertion 'magic == expected' failed.\"\nkill -ABRT $$\n",
+        );
         let run = run_c_libfuzzer_single_input(
             &replay_min::HarnessRunner::direct(h),
             &work,
@@ -6539,9 +6561,29 @@ mod auto_path_tests {
             Duration::from_secs(5),
             0,
         )
-        .expect("an assert/abort on bad input must be a rejection, not a pass-aborting error");
+        .expect("a diagnosed assertion must be a rejection, not a pass-aborting error");
         assert!(run.sanitizer.is_none());
         assert!(run.rejected);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn silent_abort_without_sanitizer_is_a_bhf210_crash_finding() {
+        let work = tmpdir();
+        let h = write_script(&work, "silent_abort.sh", "#!/bin/sh\nkill -ABRT $$\n");
+        let run = run_c_libfuzzer_single_input(
+            &replay_min::HarnessRunner::direct(h),
+            &work,
+            b"crashing-seed",
+            &[],
+            Duration::from_secs(5),
+            0,
+        )
+        .expect("silent SIGABRT must become a finding");
+        let report = run.sanitizer.expect("BHF-210 report");
+        assert_eq!(report.rule_id, "BHF-210");
+        assert!(report.message.contains("SIGABRT"));
+        assert!(!run.rejected);
     }
 
     #[test]
@@ -6660,6 +6702,42 @@ mod auto_path_tests {
         assert!(
             err.contains("rejected all") && err.contains("cannot fuzz"),
             "built-not-fuzzed reason must be explicit: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn supplied_silent_abort_seed_becomes_a_finding() {
+        let root = tmpdir();
+        let work_dir = root.join("bhf_work");
+        write_c_libfuzzer_harness(
+            &work_dir,
+            "H-ABORT-SEED",
+            "#!/bin/sh\ninput=$(cat \"$1\")\nif [ \"$input\" = BOMB ]; then kill -ABRT $$; fi\nexit 0\n",
+        );
+        let summary = run_one_target_programmatic(
+            &work_dir,
+            "H-ABORT-SEED",
+            vec![b"clean".to_vec(), b"BOMB".to_vec()],
+            2,
+            None,
+            None,
+            0,
+            &[],
+            actionability::RunMode::Reporting,
+            None,
+            &[],
+            None,
+        )
+        .expect("the supplied abort seed must not fail the pass");
+        assert_eq!(
+            summary.executions, 2,
+            "both supplied seeds run before mutation"
+        );
+        assert_eq!(
+            summary.findings.len(),
+            1,
+            "the silent SIGABRT seed must emit one deduplicated finding"
         );
     }
 

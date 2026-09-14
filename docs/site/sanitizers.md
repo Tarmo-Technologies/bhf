@@ -31,6 +31,10 @@ the C/C++ `--sanitizers` matrix.
   RTOS builds — without paying the qemu-user cross-compile tax. `none` is
   standalone; combining it with a real sanitizer is rejected.
 
+A SIGABRT accompanied by a recognizable assertion or panic diagnostic remains an
+input rejection. A silent SIGABRT is saved as a crash because there is no evidence
+that the target intentionally rejected the input.
+
 `--sanitizers` is inert on every lane except native C/C++. Ada uses source
 instrumentation; Rust always applies ASan + sancov through lane-owned
 `RUSTFLAGS`; Java and the managed/interpreted lanes use their coverage and
