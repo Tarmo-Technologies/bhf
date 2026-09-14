@@ -160,12 +160,7 @@ pub fn build_java_harness(
     let (target_cp, target_needs_preview) = target_cp;
 
     // 4. Write + compile the harness against agent jar + target classpath.
-    let harness_file = harness_src
-        .join(harness_gen::java_generate::HARNESS_PACKAGE)
-        .join(format!(
-            "{}.java",
-            harness_gen::java_generate::HARNESS_CLASS
-        ));
+    let harness_file = java_harness_source_path(&harness_src, &generated.harness_class);
     if let Some(parent) = harness_file.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -246,6 +241,17 @@ pub fn build_java_harness(
         };
     }
     JavaBuildResult::Built
+}
+
+/// Map a generated Java binary/source class name to its source path.  This also
+/// handles the default-package harness, whose class name has no dot.
+fn java_harness_source_path(harness_src: &Path, harness_class: &str) -> PathBuf {
+    let mut path = harness_src.to_path_buf();
+    for component in harness_class.split('.') {
+        path.push(component);
+    }
+    path.set_extension("java");
+    path
 }
 
 /// What [`resolve_target`] extracts from a candidate's source for harness generation.
@@ -1080,6 +1086,19 @@ fn make_executable(_path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn harness_source_path_handles_named_and_default_packages() {
+        let root = Path::new("/tmp/harness-src");
+        assert_eq!(
+            java_harness_source_path(root, "bhfgen.Harness"),
+            root.join("bhfgen/Harness.java")
+        );
+        assert_eq!(
+            java_harness_source_path(root, "BhfHarness"),
+            root.join("BhfHarness.java")
+        );
+    }
 
     #[test]
     fn agent_cache_path_honours_env() {
