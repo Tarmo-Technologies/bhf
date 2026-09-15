@@ -2,6 +2,96 @@
 
 # Changelog
 
+## 0.2.32 - 2026-09-14
+
+**Security release. Two separate ways a scanned tree could execute commands on the
+host running `bhf auto`, both in default mode with no opt-in flag and no error
+surfaced.** Anyone running 0.2.31 against code they do not control should upgrade. A
+tree delivered for assurance review, fuzzed in CI, or cloned from a public
+repository carried the payload into whatever host held the secrets.
+
+Both live in the same trust boundary — the two files `bhf auto` reads straight out
+of the scanned tree by design, an auto-loaded `.bhf.toml` and the project's own
+`compile_commands.json` — but they are different defects with different fixes, and
+neither fix closes the other.
+
+**Command injection into the generated Makefile (GHSA-725h-95qg-44fv, CWE-78).**
+Values from both files were interpolated into the harness Makefile unescaped, and
+`make` hands those recipes to `/bin/sh`. Three sinks: `cxx-std` from `.bhf.toml` and
+a `-std=` recovered from the compile database both reach `CXX_STD ?= <value>`, which
+expands into `-std=$(CXX_STD)`; the compile database's compiler reaches `CXX =`,
+which heads every recipe line. The reported vector was the first. The second needs
+no `.bhf.toml` at all, so fixing only what was reported would have left an
+equivalent primitive in place.
+
+The root cause was one pattern rather than three bugs. `split_{c,cpp}_build_context_flags`
+pull values back out of the internal `@bhf-build-context-*` pseudo-flags and
+interpolate them with no escaping, while validation only ever inspected the
+*prefixed* form — where the single-quote relaxation that exists for legitimate CMake
+defines (`-DLLAMA_VERSIONS=>=3`) makes `@bhf-...=c++17; id` look acceptable. The
+`-std=` case compounds it: `encoded_flags` deliberately *removes* the flag from
+`compile_flags` so it can drive the single `CXX_STD` knob, which also removes it
+from the function that would have quoted it.
+
+Validation now happens at the emission boundary, where every producer converges.
+`--cxx-std` and any recovered dialect are held to a closed set (`c++`/`gnu++` plus a
+two-to-three character alphanumeric version starting with a digit) that accepts
+`c++17`, `gnu++20` and the draft forms `c++0x` / `c++2a` while admitting no
+separator — the previous check tested only the `c++` prefix, which `c++17; id`
+satisfies. `CC`/`CXX` are held to the strict bare-token rule. The `BUILD_CONTEXT_*`
+metadata is neutralised: not an active vector, but written as `NAME = <value>` where
+a newline would end the assignment and let the remainder parse as Makefile source.
+Ada `.gpr` projects get the same treatment adapted to their syntax — GPR is not a
+shell, so spaces and parentheses stay legal and only a quote, newline, or control
+character is refused.
+
+**Execution of an untrusted compiler from the scanned tree (CWE-829).** Separate
+from the above and not closed by it. bhf executes the compiler named by the tree's
+`compile_commands.json` — as `$(CC)`/`$(CXX)` under make, in the standalone-header
+preflight, and in the libstdc++ probe. The only check was that the token's file name
+*contained* `clang`, or equalled `gcc`/`g++`. The path was never verified to be a
+real toolchain. A tree that ships an executable beside its sources and points the
+database at it therefore ran its own program on the host. No metacharacter is
+involved — `./evilclang` is a well-formed path — so every rule added for the
+injection class passes it through untouched.
+
+The compile database may now influence *which* compiler is used, never *where it
+comes from*. The leaf must be a real driver name, matched exactly after stripping a
+version suffix (`gcc-12`) and a target-triple prefix (`aarch64-linux-gnu-gcc`). A
+bare name is left as written, since it carries no directory and the operator's PATH
+decides. An absolute path outside the scanned tree is honored, so a cross or custom
+toolchain keeps working. A relative path, or an absolute path inside the tree, is
+refused; `auto` publishes the canonical sweep root for this, and the working
+directory is always treated as untrusted, covering `cd repo && bhf auto .`.
+
+Across both fixes, a rejected value falls back to the built-in default rather than
+failing the run: the tree's build system is untrusted input, not an operator
+instruction, and a project whose compile database carries a malformed dialect should
+still get fuzzed. A malformed `--cxx-std` still errors, because that file claims to
+configure the run and a silent downgrade would hide it. Well-formed values from
+every affected source are honored exactly as before.
+
+**A killed Rust harness build is no longer reported as a compile error.** `classify`
+falls back to the tail of cargo's stderr, which is reached only when there is no
+error line at all — precisely what a build killed by a signal leaves behind. It
+reported whichever crate happened to be compiling, naming a crate that had not
+failed. The raw stderr was also discarded at both cargo failure sites, so any
+failure the classifier did not recognise was undebuggable. The stderr is now
+persisted to `<work>/harnesses/<id>/cargo-build-stderr.log`, progress lines never
+stand in for a diagnosis, and the exit status — including the signal — is reported.
+
+**ThreadSanitizer no longer reports a harness race-free when it saw a race it could
+not place.** A report whose frames carry no `file:line` is unreadable, not evidence
+of a scaffolding race, and was being dropped without being counted anywhere. It is
+now surfaced as `unattributed`. A report that *does* resolve to only the bhf driver
+or a system library is still dropped, as intended.
+
+Also in this release: `rustls` moves to 0.23.45 for RUSTSEC-2026-0285, which reaches
+the tree through `ureq` <- `llm_harness_gen`. rustls 0.23.42 accepted TLS 1.3
+handshake messages sent at the wrong encryption level when they followed a
+key-changing message in the same record. The handshake transcript stays
+authenticated, so this is not a handshake-forgery primitive.
+
 ## 0.2.31 - 2026-08-15
 
 **Large auto campaigns are now bounded, compactable, and findings-first.** The

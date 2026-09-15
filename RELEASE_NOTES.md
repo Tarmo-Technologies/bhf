@@ -1,107 +1,149 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# BHF v0.2.31 release notes
+# BHF v0.2.32 release notes
 
-Released 2026-08-15.
+Released 2026-09-14.
 
-This release makes automatic harnessing materially closer to an expert-written
-driver and makes large campaigns safe to leave running. It is grounded in a
-pinned 200-project audit across all sixteen supported languages, with one
-independently reviewed expert harness per lane, plus the existing blind
-30-project C/C++ line-coverage comparison.
+**This is a security release. Upgrade if you run bhf against code you do not
+control.** 0.2.31 had two separate ways for a scanned tree to execute commands on
+the host running `bhf auto` — both in default mode, with no opt-in flag required and
+no error surfaced. The run exits 0, prints a normal summary, and reports 0 findings.
 
-## Findings are now the front door
+There are no behavioral changes beyond the fixes. Well-formed build configuration
+from every affected source is honored exactly as before.
 
-Every `auto` run writes an impact-ordered `<work>/FINDINGS.md` at the work-
-directory root. It shows grouped root-cause issues, locations, confidence,
-evidence, remediation, and replay commands. `<work>/findings.csv` is the matching
-machine-readable grouped index, and `<work>/findings/` contains the complete
-evidence bundles. The historical `<work>/auto/findings.csv` remains as a
-compatibility alias; campaign mechanics and coverage stay under `<work>/auto/`.
+## The trust boundary
 
-The terminal summary now leads with the finding count and these paths before the
-coverage and blocker breakdown. A run with no findings still creates the indexes,
-so automation has one stable place to start.
+`bhf auto` reads two files straight out of the scanned tree, by design and without
+any flag: an auto-loaded `.bhf.toml`, and the project's own `compile_commands.json`.
+Both vulnerabilities live there. They are different defects with different fixes,
+and **neither fix closes the other**.
 
-## Bounded output and non-destructive cleanup
+## 1. Command injection into the generated Makefile
 
-BHF v0.2.27 could retain a private Cargo `target/` tree for every attempted
-Rust harness. A measured real tree was about 589 MiB per target; multiplied across
-roughly 70 candidates, that explains the reported 40+ GiB work directory. Those
-trees are compiler intermediates, not replay evidence.
+GHSA-725h-95qg-44fv · CWE-78
 
-Rust build caches are now removed on every build return path after the final
-replay harness has consumed them. `auto` also repairs old work directories at
-startup. For explicit maintenance:
+Values from those files were interpolated into the harness Makefile unescaped, and
+`make` hands its recipes to `/bin/sh`.
 
-```sh
-bhf clean bhf_work --compact
-```
+| | Source | Sink |
+|---|---|---|
+| V1 | `.bhf.toml` `cxx-std` | `CXX_STD ?=` → `-std=$(CXX_STD)` |
+| V2 | `compile_commands.json` `-std=` | `CXX_STD ?=` → `-std=$(CXX_STD)` |
+| V3 | `compile_commands.json` compiler | `CXX =` — heads every recipe line |
 
-Compaction removes disposable compiler caches and scratch data while preserving
-findings, reports, coverage corpora, result checkpoints, generated harness source,
-and final replay binaries.
+V1 is the reported vector. V2 and V3 were found while remediating it. **V2 needs no
+`.bhf.toml` at all** — an ordinary compile database is enough — so a fix aimed only
+at the reported vector would have left an equivalent primitive in place.
 
-Two defaults bound future campaigns:
+### Root cause
 
-- `--max-work-dir-mb 4096` stops admitting new targets once allocated work-
-  directory blocks reach 4 GiB. Findings are never deleted to meet the limit;
-  in-flight targets finish and the report records the cutoff. `0` disables it.
-- `--max-corpus-mb 64` bounds each target's active and persisted coverage corpus
-  at 64 MiB. Finding testcases are stored separately and never evicted.
+One pattern, not three bugs. `split_{c,cpp}_build_context_flags` pull values back
+out of the internal `@bhf-build-context-*` pseudo-flags and interpolate them with no
+escaping, while validation only ever inspected the **prefixed** form — where the
+single-quote relaxation that exists for legitimate CMake defines
+(`-DLLAMA_VERSIONS=>=3`) makes `@bhf-...=c++17; id` look acceptable.
 
-Both options are valid `.bhf.toml` keys. Parallel in-flight targets can
-produce a bounded final overshoot, so the work-directory limit is an admission
-ceiling rather than an unsafe hard-delete quota.
+The `-std=` path compounds it: `encoded_flags` deliberately *removes* the flag from
+`compile_flags` so it can drive the Makefile's single `CXX_STD` knob — which also
+removes it from `escape_makefile_recipe_flag`, the function that would have quoted
+it.
 
-## Expert-parity auto harnessing
+### The fix
 
-All sixteen generators now checkpoint immediately before the selected target
-call. Loading a module, decoding input, or completing setup no longer counts as a
-successful fuzz target entry.
+Validation moved to the emission boundary, where every producer converges.
 
-The audit drove these expert setup levers into the automatic lanes:
+- **C++ standard** — a closed set: `c++`/`gnu++` plus a two-to-three character
+  alphanumeric version beginning with a digit. Accepts every real selector including
+  the draft forms `c++0x`, `c++1y`, `c++2a`; admits no separator. The previous check
+  tested only the `c++` prefix, which `c++17; id` satisfies.
+- **`CC` / `CXX`** — held to the strict bare-token rule. The quoting relaxation for
+  compile flags must not reach a value that heads a recipe.
+- **Build-context metadata** — `BUILD_CONTEXT_PROVENANCE` and friends are
+  neutralised. Not an active vector, but written as `NAME = <value>`, where a
+  newline would end the assignment and let the remainder parse as Makefile source.
+- **Ada `.gpr` projects** — the same treatment adapted to GPR syntax. A `.gpr` is
+  not a shell, so spaces and parentheses stay legal — a Windows source directory
+  needs them — and only a quote, newline, or control character is refused.
 
-- identifier-token-aware ranking favors public parsers, decoders, whole-artifact
-  APIs, and stateful execution surfaces without substring false matches such as
-  `download` → `load` or `reload` → `load`;
-- JavaScript, Ruby, and COBOL materialize file/path inputs; JavaScript awaits
-  returned promises before deleting temporary resources;
-- Go mines a bounded feeder → terminal sequence (including Cobra `SetArgs` →
-  `Execute`) and retries exact-package instrumentation when unrelated packages
-  break module-wide coverage;
-- PHP resolves imported types and creates bounded scalar, array, enum, date, and
-  constructor graphs for typed parameters;
-- C++ recovers macro-declared class scope, defaulted arguments, common public
-  member-template instantiation, rvalue byte strings, and default-template aliases;
-- Fortran emits correct descriptors for assumed-shape character arrays;
-- C# builds a separate target library, instruments only project IL, handles
-  BOM-prefixed global usings, and avoids nested `obj/` duplicate attributes;
-- runtime smoke tests execute in the harness directory, while VMs with native
-  language coverage avoid incompatible native preload tracing.
+## 2. Execution of an untrusted compiler from the scanned tree
 
-The clean durable audit completed 200/200 rows, proved 118 selected calls entered,
-and dynamically covered 105 project bodies. Focused final-binary Go and C++
-reruns raise the explicitly labeled cross-run composite to 113/200. Against the
-independent expert set, the final binary entered and covered 16/16 selected
-endpoints and matched the expert's normalized semantic entrypoint in 13/16 lanes,
-up from 6/16. The three differences include two viable alternative target choices
-(COBOL and PHP) and one real residual capability gap (private in-package Rust).
+CWE-829 · reported against the retired `govfuzz` project as GHSA-2352-w7c6-wr67
 
-## Remaining manual-harness territory
+bhf executes the compiler named by the tree's compile database — as `$(CC)`/`$(CXX)`
+under make, in the standalone-header preflight, and in the libstdc++ probe. The only
+check was that the token's file name **contained** `clang`, or equalled `gcc`/`g++`.
+The path was never verified to be a real toolchain.
 
-The audit keeps the remaining gaps explicit: private Rust in-crate targets and
-resource recipes; generated/platform-specific full build graphs; framework hosts
-and unavailable package ecosystems; coherent scientific arrays with coupled
-dimensions; and longer constructor → feed → execute → cleanup protocols. These
-are documented in the published expert-parity audit and are not counted as clean
-or successful when BHF only reaches setup.
+A tree that ships an executable beside its sources and points the database at it ran
+its own program on the host. Because the shim can exec the real compiler after its
+payload, the build succeeds and the run looks entirely normal.
 
-## Release installation
+**No metacharacter is involved.** `./evilclang` is a well-formed path containing
+nothing a shell acts on, so every rule added for the injection class above passes it
+through untouched. Four deliveries were confirmed, including a tree binary named
+**exactly** `clang`, which defeats any name-based check.
 
-For offline or air-gapped Linux deployment, use the full
-`bhf-dist-0.2.31-x86_64-unknown-linux-gnu.tar.gz` asset and its SHA-256
-sidecar. It contains `install.sh`, `INSTALL.md`, the CLI and daemon, both preload
-shims, all harness runtimes, this release note, and the recommended sweep guide.
-Component archives and native Windows installers remain available for narrower
-installations.
+### The fix
+
+The compile database may influence *which* compiler is used, never *where it comes
+from*:
+
+- the leaf must be a real driver name, matched exactly after stripping a version
+  suffix (`gcc-12`) and a target-triple prefix (`aarch64-linux-gnu-gcc`).
+- a **bare name** is left as written — it carries no directory, so the operator's
+  PATH decides, and the generated Makefile stays readable for a hand rebuild.
+- an **absolute path outside the scanned tree** is honored, so a cross or custom
+  toolchain (`/opt/toolchain/bin/g++-12`) keeps working. That is ordinary for the
+  hard-to-build trees bhf targets, and the operator installed it.
+- a **relative path**, or an absolute path **inside the tree**, is refused. `auto`
+  publishes the canonical sweep root, and the working directory is always treated as
+  untrusted, covering `cd repo && bhf auto .`.
+
+## Both fixes: what a rejected value does
+
+It falls back to the built-in default rather than failing the run. The tree's build
+system is untrusted input, not an operator instruction, and a project whose compile
+database carries a malformed dialect should still get fuzzed. A malformed
+`--cxx-std` still errors, because that file claims to configure the run and a silent
+downgrade would hide it.
+
+## Diagnostics
+
+**A killed Rust harness build is no longer reported as a compile error.** cargo's
+stderr classifier falls back to the tail of the output, reached only when there is
+no error line at all — precisely what a build killed by a signal leaves behind. It
+reported whichever crate happened to be compiling, naming a crate that had not
+failed and could not be reproduced. Progress lines no longer stand in for a
+diagnosis, the exit status (including the signal) is reported, and the raw stderr —
+previously discarded at both cargo failure sites — is persisted to
+`<work>/harnesses/<id>/cargo-build-stderr.log`.
+
+**ThreadSanitizer no longer reports a harness race-free when it saw a race it could
+not place.** A report whose frames carry no `file:line` is unreadable, not evidence
+of a scaffolding race, and was dropped without being counted. It is now surfaced as
+`unattributed`. A report that *does* resolve to only the bhf driver or a system
+library is still dropped, as intended.
+
+## Dependencies
+
+`rustls` moves to 0.23.45 for RUSTSEC-2026-0285, reaching the tree through `ureq` <-
+`llm_harness_gen`. rustls 0.23.42 accepted TLS 1.3 handshake messages sent at the
+wrong encryption level when they followed a key-changing message in the same record,
+contrary to RFC 8446 §5.1. The handshake transcript remains authenticated, so this
+is not a handshake-forgery primitive.
+
+## Upgrading
+
+No configuration change is required.
+
+If you cannot upgrade immediately, remove `.bhf.toml` and `compile_commands.json`
+from a tree before scanning it. Neither is a substitute for upgrading — other build
+files feed the same context recovery.
+
+## Credit
+
+GHSA-725h-95qg-44fv was reported privately through GitHub Security Advisories with a
+complete reproducer and an accurate root-cause analysis; V2 and V3 were identified
+during remediation. The untrusted-compiler defect was reported against `govfuzz`,
+also with a complete reproducer.
