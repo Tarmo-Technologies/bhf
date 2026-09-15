@@ -107,6 +107,79 @@ runs:
         if [[ -f "$sarif" ]]; then echo "has_sarif=true" >> "$GITHUB_OUTPUT"; fi
         echo "bhf ci finished with exit code $code"
 
+    # A green check that fuzzed nothing and a green check that fuzzed everything
+    # clean are the same colour, which is how a job that could not build a single
+    # harness went unnoticed while "passing" on other PRs. Say which one happened.
+    - name: Report what was actually fuzzed
+      if: ${{ always() && steps.run.outputs.exit == '0' }}
+      shell: bash
+      run: |
+        set -uo pipefail
+        run_json="$RUNNER_TEMP/bhf_work/auto/run.json"
+        if [[ ! -f "$run_json" ]]; then
+          echo "bhf: no changed fuzzable files in scope — nothing was fuzzed."
+          echo "> **bhf**: no changed fuzzable files in scope — nothing was fuzzed." >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+        fi
+        discovered=$(jq -r '.summary.discovered // 0' "$run_json" 2>/dev/null || echo 0)
+        fuzzed=$(jq -r '.summary.built_and_fuzzed // 0' "$run_json" 2>/dev/null || echo 0)
+        failed=$(jq -r '.summary.failed_build // 0' "$run_json" 2>/dev/null || echo 0)
+        echo "bhf: $discovered target(s) discovered, $fuzzed built+fuzzed, $failed failed to build."
+        if [[ "$discovered" -gt 0 && "$fuzzed" -eq 0 ]]; then
+          echo "::warning title=bhf::this check passed without fuzzing anything — $discovered target(s) were discovered but 0 were built and fuzzed, so it provides no assurance about this diff"
+        fi
+        {
+          echo "### bhf"
+          echo ""
+          echo "- discovered: \`$discovered\`  ·  built+fuzzed: \`$fuzzed\`  ·  failed build: \`$failed\`"
+          if [[ "$discovered" -gt 0 && "$fuzzed" -eq 0 ]]; then
+            echo "- :warning: passed **without fuzzing anything** — this check provides no assurance about this diff."
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    # A tool/setup failure writes no ci-json, so without this the log carries the
+    # outcome ("3 failed build") but none of the evidence explaining it — which is
+    # why the 2026-09-14 runner failures could not be root-caused from CI alone.
+    # The work dir holds the dependency manifest, per-target reasons, and bug
+    # report; surface the small ones inline and keep the rest as an artifact.
+    - name: Diagnose a failed run
+      if: ${{ always() && steps.run.outputs.exit != '' && steps.run.outputs.exit != '0' }}
+      shell: bash
+      run: |
+        set -uo pipefail
+        work="$RUNNER_TEMP/bhf_work"
+        echo "::group::bhf work dir"
+        ls -R "$work/auto" 2>/dev/null | head -50 || echo "(no work dir at $work)"
+        echo "::endgroup::"
+        if [[ -s "$work/auto/missing-deps.txt" ]]; then
+          echo "::group::missing-deps.txt (external dependencies bhf could not satisfy)"
+          cat "$work/auto/missing-deps.txt"
+          echo "::endgroup::"
+        fi
+        if [[ -f "$work/auto/run.json" ]]; then
+          echo "::group::campaign summary"
+          jq -r '.summary // {} | to_entries[] | "\(.key): \(.value)"' "$work/auto/run.json" 2>/dev/null || true
+          echo "::endgroup::"
+          echo "::group::per-target outcome and reason"
+          jq -r '.targets // [] | .[] | "\(.harness_id // "?")  \(.name // "?")  \(.outcome.outcome // .outcome // "?")  \(.outcome.reason // "")"' \
+            "$work/auto/run.json" 2>/dev/null | head -50 || true
+          echo "::endgroup::"
+        fi
+        if [[ -s "$work/auto/bug-report.md" ]]; then
+          echo "::group::bug-report.md (cases bhf could not fully handle)"
+          head -80 "$work/auto/bug-report.md"
+          echo "::endgroup::"
+        fi
+
+    - name: Upload bhf work dir
+      if: ${{ always() && steps.run.outputs.exit != '' && steps.run.outputs.exit != '0' }}
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: bhf-work-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/bhf_work/auto
+        if-no-files-found: ignore
+        retention-days: 7
+
     - name: Upload SARIF (code-scanning annotations)
       if: ${{ inputs.upload-sarif == 'true' && steps.run.outputs.has_sarif == 'true' }}
       uses: github/codeql-action/upload-sarif@v3
