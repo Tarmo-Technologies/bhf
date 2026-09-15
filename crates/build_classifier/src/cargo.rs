@@ -124,21 +124,70 @@ pub fn classify(stderr: &str) -> Vec<RustBuildError> {
         }
         error_lines.truncate(8);
         let tail = if error_lines.is_empty() {
-            stderr
+            // Last resort: the tail of stderr. Cargo's PROGRESS lines must be
+            // excluded from it. A build killed by a signal — the OOM killer, or a
+            // budget cut-off — exits without emitting any diagnostic, so its last
+            // lines are whatever it happened to be compiling. Reporting those
+            // verbatim produced "cargo build failed: Compiling cpp_parser", which
+            // names a crate that did not fail and reads as a compile error, hiding
+            // that there was no compile error at all.
+            let meaningful = stderr
                 .lines()
-                .rev()
-                .take(8)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>()
-                .join("\n")
+                .filter(|line| !is_cargo_progress_line(line))
+                .collect::<Vec<_>>();
+            if meaningful.iter().all(|l| l.trim().is_empty()) {
+                NO_DIAGNOSTIC.to_owned()
+            } else {
+                meaningful
+                    .into_iter()
+                    .rev()
+                    .take(8)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
         } else {
             error_lines.join("\n")
         };
         hits.push(RustBuildError::Other { tail });
     }
     hits
+}
+
+/// What `classify` reports when cargo failed without emitting a single
+/// diagnostic line. Callers pair this with the process exit status, which is the
+/// only remaining evidence (a signal means killed, not a compile error).
+pub const NO_DIAGNOSTIC: &str = "cargo produced no diagnostic output";
+
+/// A cargo PROGRESS line — status, not diagnosis. These are the lines that
+/// survive when a build is killed mid-compile, and must never be presented as
+/// the reason a build failed.
+fn is_cargo_progress_line(line: &str) -> bool {
+    let l = line.trim();
+    if l.is_empty() {
+        return true;
+    }
+    // Cargo emits these left-padded and colourised; compare on the first word.
+    matches!(
+        l.split_whitespace().next(),
+        Some(
+            "Compiling"
+                | "Downloading"
+                | "Downloaded"
+                | "Updating"
+                | "Finished"
+                | "Fresh"
+                | "Building"
+                | "Locking"
+                | "Adding"
+                | "Removing"
+                | "Installing"
+                | "Blocking"
+                | "Waiting"
+        )
+    )
 }
 
 fn push_unresolved(rest: &str, hits: &mut Vec<RustBuildError>) {
@@ -160,6 +209,57 @@ fn push_unique(hits: &mut Vec<RustBuildError>, e: RustBuildError) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The regression: a build killed mid-compile emits no diagnostic, so the
+    /// last-resort tail used to return whatever cargo was compiling. That
+    /// produced "cargo build failed: Compiling cpp_parser", naming a crate that
+    /// did not fail and reading as a compile error — which is how 18 targets on
+    /// CI reported a per-crate build failure that could not be reproduced
+    /// anywhere, because there had never been a compile error to reproduce.
+    #[test]
+    fn a_killed_build_is_not_reported_as_a_compile_error() {
+        let stderr = "\
+   Compiling serde v1.0.229\n\
+   Compiling tree-sitter v0.26.13\n\
+   Compiling c_parser v0.2.31 (/w/crates/c_parser)\n\
+   Compiling cpp_parser v0.2.31 (/w/crates/cpp_parser)\n";
+        let hits = classify(stderr);
+        assert_eq!(hits.len(), 1);
+        match &hits[0] {
+            RustBuildError::Other { tail } => {
+                assert_eq!(
+                    tail, NO_DIAGNOSTIC,
+                    "progress lines must never be presented as the failure reason"
+                );
+                assert!(
+                    !tail.contains("Compiling"),
+                    "the reason must not name a crate that did not fail: {tail}"
+                );
+            }
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    /// The filter must not swallow a real diagnostic that happens to sit among
+    /// progress lines.
+    #[test]
+    fn a_real_error_still_survives_the_progress_filter() {
+        let stderr = "\
+   Compiling cpp_parser v0.2.31 (/w/crates/cpp_parser)\n\
+rustc: internal compiler error: unexpected panic\n\
+   Compiling serde v1.0.229\n";
+        let hits = classify(stderr);
+        match &hits[0] {
+            RustBuildError::Other { tail } => {
+                assert!(
+                    tail.contains("internal compiler error"),
+                    "the real diagnostic was filtered away: {tail}"
+                );
+                assert!(!tail.contains("Compiling"), "progress leaked in: {tail}");
+            }
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
 
     #[test]
     fn unresolved_import_e0432() {

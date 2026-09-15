@@ -90,6 +90,45 @@ fn probe_toolchain() -> Option<RustToolchain> {
     None
 }
 
+/// Describe HOW the process ended, when that is the only evidence there is.
+///
+/// A cargo build killed by a signal — the OOM killer on a memory-tight runner, or
+/// an external budget cut-off — exits without emitting a diagnostic. Reporting only
+/// the (empty) classification made such a failure indistinguishable from a real
+/// compile error, and the fallback tail then named whichever crate happened to be
+/// compiling, which reads as "that crate failed to build" and is simply untrue.
+fn exit_status_detail(status: &std::process::ExitStatus) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            let hint = match signal {
+                9 => " — killed (SIGKILL); on a memory-tight host this is usually the OOM killer",
+                15 => " — terminated (SIGTERM); usually an external timeout or budget cut-off",
+                _ => "",
+            };
+            return format!(" (killed by signal {signal}{hint})");
+        }
+    }
+    match status.code() {
+        Some(code) => format!(" (exit status {code})"),
+        None => " (no exit status)".to_owned(),
+    }
+}
+
+/// Persist the full cargo stderr next to the harness so a failure stays
+/// diagnosable after the run. Best effort: a failure to write must never mask
+/// the build failure being reported.
+fn persist_build_stderr(auto_dir: &Path, stderr: &str) -> Option<PathBuf> {
+    if stderr.trim().is_empty() {
+        return None;
+    }
+    let path = auto_dir.join("cargo-build-stderr.log");
+    std::fs::create_dir_all(auto_dir).ok()?;
+    std::fs::write(&path, stderr.as_bytes()).ok()?;
+    Some(path)
+}
+
 /// RUSTFLAGS arming SanitizerCoverage (trace-pc-guard + trace-compares) and ASan
 /// on the harness + target crates, matching the symbols the C driver provides.
 /// VERIFIED to emit `__sanitizer_cov_trace_pc_guard{,_init}` and the `trace_cmp*`
@@ -3217,8 +3256,18 @@ pub fn build_rust_harness(
                     | RustBuildError::SignatureMismatch { .. }
             )
         });
+        // Keep the raw stderr. Only the classified summary used to survive, so a
+        // build that failed for a reason the classifier does not recognise left
+        // nothing to debug with — on CI or anywhere else.
+        let log = persist_build_stderr(&auto_dir, &stderr);
         return RustBuildResult::Failed {
-            reason: format!("cargo build failed: {}", summarize(&kinds)),
+            reason: format!(
+                "cargo build failed: {}{}{}",
+                summarize(&kinds),
+                exit_status_detail(&build.status),
+                log.map(|p| format!(" [stderr: {}]", p.display()))
+                    .unwrap_or_default()
+            ),
             skip,
         };
     }
@@ -3461,8 +3510,18 @@ fn build_in_crate(
                     | RustBuildError::SignatureMismatch { .. }
             )
         });
+        // Same treatment as the staticlib path: keep the raw stderr and say how
+        // the process ended, so a build killed without a diagnostic is not
+        // reported as a compile error against whichever crate was in flight.
+        let log = persist_build_stderr(&auto_dir, &stderr);
         return RustBuildResult::Failed {
-            reason: format!("in-crate cargo build failed: {}", summarize(&kinds)),
+            reason: format!(
+                "in-crate cargo build failed: {}{}{}",
+                summarize(&kinds),
+                exit_status_detail(&build.status),
+                log.map(|p| format!(" [stderr: {}]", p.display()))
+                    .unwrap_or_default()
+            ),
             skip,
         };
     }
