@@ -1318,15 +1318,20 @@ pub fn attempt_with_progress(
     };
     // Remember an exhausted cascade so the next target in this source inherits
     // the verdict instead of rediscovering it. Only failures that describe the
-    // CLOSURE are recorded; the memo declines anything naming the generated
-    // harness, which is particular to this one target.
+    // unchanged CLOSURE are recorded; generated-harness errors and failures
+    // reached after target-local repairs say nothing reliable about a sibling.
     if let Outcome::FailedBuild {
+        repairs,
         last_errors,
         retries,
-        ..
     } = &result.outcome
     {
-        memo.record(&candidate.source_path, last_errors, *retries);
+        memo.record(
+            &candidate.source_path,
+            last_errors,
+            *retries,
+            !repairs.is_empty(),
+        );
         memo.save(work_dir);
     }
     // Graceful degradation: a build that failed ONLY because it references types
@@ -6210,21 +6215,48 @@ fn eject_unbuildable_added_source(
 ) -> Option<PathBuf> {
     // Only lines the compiler flagged as errors count. A file merely mentioned in
     // a note, an include trace, or a warning is not the one that failed.
-    let error_lines: Vec<&str> = build_output
-        .lines()
-        .filter(|line| line.contains("error:") || line.contains("error :"))
-        .collect();
+    let lines: Vec<&str> = build_output.lines().collect();
+    let error_line = |line: &str| line.contains("error:") || line.contains("error :");
     let blamed = |path: &Path| -> bool {
         let full = path.to_string_lossy().into_owned();
         let base = path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
-        error_lines.iter().any(|line| {
+        let mentions_path = |line: &str| {
             // Match the location prefix, so a path appearing later in a message
             // (as an argument, say) does not condemn the file.
             let location = line.split(": ").next().unwrap_or(line);
             location.contains(&full) || (!base.is_empty() && location.contains(&base))
+        };
+        lines.iter().enumerate().any(|(index, line)| {
+            if !error_line(line) {
+                return false;
+            }
+            if mentions_path(line) {
+                return true;
+            }
+
+            // A compiler attributes an error in an included header to that
+            // header, while the translation unit that introduced it appears in
+            // the immediately preceding include chain. This is common for
+            // header-only/amalgamated libraries: an auto-added example source
+            // includes the implementation header a second time and the header,
+            // rather than the added source, receives every redefinition error.
+            // Walk only this diagnostic's bounded include preamble so an older
+            // translation unit cannot be blamed for a later error.
+            lines[..index]
+                .iter()
+                .rev()
+                .take(32)
+                .take_while(|prior| {
+                    !prior.trim().is_empty() && !error_line(prior) && !prior.contains("warning:")
+                })
+                .any(|prior| {
+                    let trimmed = prior.trim_start();
+                    (trimmed.starts_with("In file included from ") || trimmed.starts_with("from "))
+                        && mentions_path(prior)
+                })
         })
     };
     // An archive is linked, never compiled, so a compile error can never be about
@@ -10978,6 +11010,38 @@ mod eject_unbuildable_added_source_tests {
             eject_unbuildable_added_source(output, &mut sources, &[]),
             Some(PathBuf::from("/proj/src/mission_helper.c"))
         );
+    }
+
+    #[test]
+    fn an_error_in_an_included_header_is_attributed_to_the_added_source() {
+        // Header-only implementations put the duplicate definition in the
+        // header, while the compiler's include preamble identifies the added
+        // translation unit that included it a second time.
+        let added = PathBuf::from("/proj/examples/gltfutil/main.cc");
+        let mut sources = vec![added.clone()];
+        let output = "In file included from /proj/examples/gltfutil/main.cc:9:\n\
+                      /proj/tiny_gltf.h:1642:21: error: redefinition of default argument\n";
+
+        assert_eq!(
+            eject_unbuildable_added_source(output, &mut sources, &[]),
+            Some(added)
+        );
+        assert!(sources.is_empty());
+    }
+
+    #[test]
+    fn an_include_chain_blames_only_its_translation_unit() {
+        let unrelated = PathBuf::from("/proj/examples/other.cc");
+        let blamed = PathBuf::from("/proj/examples/gltfutil/main.cc");
+        let mut sources = vec![unrelated.clone(), blamed.clone()];
+        let output = "In file included from /proj/examples/gltfutil/main.cc:9:\n\
+                      /proj/tiny_gltf.h:1642:21: error: redefinition of default argument\n";
+
+        assert_eq!(
+            eject_unbuildable_added_source(output, &mut sources, &[]),
+            Some(blamed)
+        );
+        assert_eq!(sources, vec![unrelated]);
     }
 
     #[test]
