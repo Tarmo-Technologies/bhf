@@ -173,6 +173,17 @@ runs:
             "$work/auto/run.json" 2>/dev/null | head -50 || true
           echo "::endgroup::"
         fi
+        # bhf persists the raw cargo stderr next to each harness when a Rust
+        # build fails. That output is the only evidence distinguishing a compile
+        # error from a process that was killed, so print it before anything else
+        # that might be truncated.
+        shopt -s nullglob
+        for log in "$work"/harnesses/*/cargo-build-stderr.log; do
+          echo "::group::cargo stderr — $(basename "$(dirname "$log")")"
+          tail -60 "$log"
+          echo "::endgroup::"
+        done
+        shopt -u nullglob
         if [[ -s "$work/auto/bug-report.md" ]]; then
           echo "::group::bug-report.md (cases bhf could not fully handle)"
           head -80 "$work/auto/bug-report.md"
@@ -190,7 +201,13 @@ runs:
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
         name: bhf-work-${{ github.run_id }}-${{ github.run_attempt }}
-        path: ${{ runner.temp }}/bhf_work/auto
+        # `auto/` holds the manifests and campaign report; the per-harness cargo
+        # stderr and result.json live under `harnesses/` and are the evidence for
+        # a build failure. Everything else there (binaries, corpora) is excluded.
+        path: |
+          ${{ runner.temp }}/bhf_work/auto
+          ${{ runner.temp }}/bhf_work/harnesses/*/cargo-build-stderr.log
+          ${{ runner.temp }}/bhf_work/harnesses/*/result.json
         if-no-files-found: ignore
         retention-days: 7
 
