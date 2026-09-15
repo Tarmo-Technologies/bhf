@@ -33,7 +33,12 @@ pub fn classify_into(stderr: &str, hits: &mut Vec<BuildErrorKind>) {
         }
         if let Some(caps) = missing_header().captures(line) {
             hits.push(BuildErrorKind::MissingHeader {
-                path: caps[1].to_owned(),
+                path: caps
+                    .get(1)
+                    .or_else(|| caps.get(2))
+                    .expect("missing-header regex has a path capture")
+                    .as_str()
+                    .to_owned(),
             });
             continue;
         }
@@ -283,7 +288,10 @@ fn type_specifier_missing() -> &'static Regex {
 fn missing_header() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
-        Regex::new(r#"(?:fatal )?error: ['"](.+?)['"] file not found"#).expect("regex")
+        Regex::new(
+            r#"(?:fatal )?error: (?:['"](.+?)['"] file not found|(.+?): No such file or directory)"#,
+        )
+        .expect("regex")
     })
 }
 
