@@ -933,7 +933,12 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     // Validate the shape so a typo fails fast rather than every C++ build silently.
     if let Some(std) = &args.cxx_std {
         let s = std.trim();
-        if !(s.starts_with("c++") || s.starts_with("gnu++")) {
+        // SECURITY: a closed set, not a prefix test. This value may come from a
+        // `.bhf.toml` auto-loaded out of the SCANNED (untrusted) tree, and it is
+        // spliced into the generated Makefile's `CXX_STD`, which expands into a
+        // `-std=$(CXX_STD)` recipe that make runs through /bin/sh. A prefix check
+        // accepts `c++17; id` and executes `id` on the operator's host.
+        if !harness_gen::build_safety::is_cxx_standard_token(s) {
             anyhow::bail!("--cxx-std must be a C++ standard like c++14 / gnu++03, got {s:?}");
         }
         std::env::set_var("BHF_CXX_STD", s);

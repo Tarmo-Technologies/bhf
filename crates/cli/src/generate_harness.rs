@@ -8828,7 +8828,15 @@ fn compile_command_compiler(args: &[String]) -> Option<String> {
             || leaf.starts_with("gcc-")
             || leaf == "g++"
             || leaf.starts_with("g++-");
-        return recognized.then(|| argument.clone());
+        // SECURITY: the recognition test above inspects only the LEAF file name, but the
+        // value returned is the WHOLE argument, and it becomes the generated Makefile's
+        // `CC`/`CXX` — the head of every recipe line. `clang++; id > /tmp/x; true` has a
+        // leaf of `clang++; id > /tmp/x; true` (or, with an absolute payload path, a leaf
+        // that still contains "clang"), so the leaf test alone is not a validation of what
+        // gets emitted. Refuse any compiler token carrying a shell/make metacharacter.
+        return recognized
+            .then(|| argument.clone())
+            .filter(|value| harness_gen::build_safety::is_compiler_token(value));
     }
     None
 }
@@ -11724,7 +11732,13 @@ impl CppBuildContext {
                 .strip_prefix("-std=")
                 .is_some_and(|standard| standard.contains("++"))
         });
-        if let Some(standard) = recovered_standard {
+        // SECURITY: the `-std=` was just REMOVED from `compile_flags`, so it no longer
+        // passes through `escape_makefile_recipe_flag`; it is spliced bare into the
+        // Makefile's `CXX_STD`. It came from the scanned tree's build system, so a value
+        // that is not a bare dialect name is dropped entirely rather than re-emitted.
+        if let Some(standard) =
+            recovered_standard.filter(|s| harness_gen::build_safety::is_cxx_standard_token(s))
+        {
             flags.push(format!("{BUILD_CONTEXT_CXX_STANDARD_PREFIX}{standard}"));
         }
         flags.push(format!(

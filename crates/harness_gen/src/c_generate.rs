@@ -3868,7 +3868,13 @@ fn split_c_compile_context(flags: &[String]) -> (Vec<String>, String, bool, Stri
         .iter()
         .filter_map(|flag| {
             if let Some(value) = flag.strip_prefix(BUILD_CONTEXT_COMPILER_PREFIX) {
-                compiler = Some(value.to_owned());
+                // SECURITY: `compiler` becomes the Makefile's `CC`, which heads every
+                // recipe line. It comes from the scanned tree's compile_commands.json.
+                // Validation upstream only saw the PREFIXED pseudo-flag, where the
+                // single-quote relaxation for compile flags makes a value carrying `;`
+                // look acceptable; stripping the prefix removes that cover.
+                compiler =
+                    Some(value.to_owned()).filter(|v| crate::build_safety::is_compiler_token(v));
                 None
             } else if let Some(value) = flag.strip_prefix(BUILD_CONTEXT_PROVENANCE_PREFIX) {
                 provenance = value.to_owned();
@@ -3897,8 +3903,10 @@ fn split_c_compile_context(flags: &[String]) -> (Vec<String>, String, bool, Stri
         compile_flags,
         compiler,
         compiler_is_gcc,
-        provenance,
-        dropped,
+        // Metadata lands in `NAME = <value>` assignments; a newline would end the
+        // assignment and let the remainder parse as Makefile source.
+        crate::build_safety::make_metadata_value(&provenance),
+        crate::build_safety::make_metadata_value(&dropped),
     )
 }
 
