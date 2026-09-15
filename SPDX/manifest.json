@@ -1555,6 +1555,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/fatal_signal.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/finding_arg.rs",
       "license": "Apache-2.0"
     },

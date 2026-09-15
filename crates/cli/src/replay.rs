@@ -269,7 +269,9 @@ fn replay_c_afl(finding_dir: &Path, harness: &Path) -> i32 {
         }
     };
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let actual_rule = corpus::parse_sanitizer_report(&stderr).map(|r| r.rule_id);
+    let actual_rule = corpus::parse_sanitizer_report(&stderr)
+        .map(|r| r.rule_id)
+        .or_else(|| crate::fatal_signal::rule_id(&output.status, &stderr));
     match actual_rule {
         Some(rule) if rule == recorded_rule => {
             println!("MATCH");
@@ -389,7 +391,9 @@ fn replay_c_libfuzzer(finding_dir: &Path, harness: &Path) -> i32 {
         }
     };
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let actual_rule = corpus::parse_sanitizer_report(&stderr).map(|r| r.rule_id);
+    let actual_rule = corpus::parse_sanitizer_report(&stderr)
+        .map(|r| r.rule_id)
+        .or_else(|| crate::fatal_signal::rule_id(&output.status, &stderr));
     match actual_rule {
         Some(rule) if rule == recorded_rule => {
             println!("MATCH");
@@ -446,4 +450,50 @@ fn transient_spawn_failure(error: &std::io::Error) -> bool {
         error.kind(),
         std::io::ErrorKind::ExecutableFileBusy | std::io::ErrorKind::WouldBlock
     )
+}
+
+#[cfg(all(test, unix))]
+mod silent_abort_tests {
+    use super::replay_c_libfuzzer;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use tempfile::tempdir;
+
+    #[test]
+    fn libfuzzer_replay_matches_silent_abort_finding() {
+        let root = tempdir().expect("tempdir");
+        let finding = root.path().join("finding");
+        fs::create_dir(&finding).expect("finding dir");
+        fs::write(finding.join("finding.json"), r#"{"rule_id":"BHF-210"}"#).expect("finding");
+        fs::write(finding.join("testcase.bin"), b"crash").expect("testcase");
+
+        let harness = root.path().join("abort.sh");
+        fs::write(&harness, "#!/bin/sh\nkill -ABRT $$\n").expect("harness");
+        let mut permissions = fs::metadata(&harness).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&harness, permissions).expect("chmod");
+
+        assert_eq!(replay_c_libfuzzer(&finding, &harness), 0);
+    }
+
+    #[test]
+    fn libfuzzer_replay_rejects_diagnosed_abort() {
+        let root = tempdir().expect("tempdir");
+        let finding = root.path().join("finding");
+        fs::create_dir(&finding).expect("finding dir");
+        fs::write(finding.join("finding.json"), r#"{"rule_id":"BHF-210"}"#).expect("finding");
+        fs::write(finding.join("testcase.bin"), b"reject").expect("testcase");
+
+        let harness = root.path().join("assert.sh");
+        fs::write(
+            &harness,
+            "#!/bin/sh\necho 'Assertion value failed.' >&2\nkill -ABRT $$\n",
+        )
+        .expect("harness");
+        let mut permissions = fs::metadata(&harness).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&harness, permissions).expect("chmod");
+
+        assert_eq!(replay_c_libfuzzer(&finding, &harness), 3);
+    }
 }
