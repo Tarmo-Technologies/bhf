@@ -2385,6 +2385,18 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
             tsan.unmeasured
         );
     }
+    // Same principle, different cause: here the run DID complete and TSan DID
+    // report a race — we just could not read where it was. Reporting only the
+    // finding count let that read as a clean result.
+    if tsan.unattributed > 0 {
+        bhfeprintln!(
+            "bhf auto: ThreadSanitizer — {} data race(s) were REPORTED but could not be \
+             attributed to any source location (unsymbolized report); those races are \
+             real and unlocated, not absent — install llvm-symbolizer or keep debug \
+             info to locate them",
+            tsan.unattributed
+        );
+    }
 
     // Memory-consumption profile (C/C++): replay the corpus in fresh processes and
     // flag an input whose peak resident set is far above baseline and amplified vs its

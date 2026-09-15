@@ -210,6 +210,22 @@ fn tsan_replay_writes_bhf556_for_target_source_data_race() {
             let _ = std::fs::remove_dir_all(&tmp);
             return;
         }
+        // `unattributed` counts the other way a replay can produce no finding
+        // without the harness being race-free: TSan DID report a race, the run DID
+        // complete, and no frame carried a `file:line` so bhf could not say where
+        // it was. bhf cannot write a located BHF-556 from an unsymbolized report,
+        // so on such a host this is an environment limitation like the two skips
+        // above — but it is reported, never silent, because the race is real.
+        if replay.unattributed > 0 {
+            eprintln!(
+                "skip: ThreadSanitizer reported {} data race(s) with no symbolized \
+                 frame (no usable llvm-symbolizer on this host); bhf counted them as \
+                 unattributed rather than reporting the harness clean",
+                replay.unattributed
+            );
+            let _ = std::fs::remove_dir_all(&tmp);
+            return;
+        }
         let postflight =
             tsan_fixture_report(&binary, &queue.join("seed"), &tmp.join("postflight.log"))
                 .unwrap_or_default();
@@ -222,12 +238,22 @@ fn tsan_replay_writes_bhf556_for_target_source_data_race() {
             postflight.contains(&race_c.to_string_lossy().into_owned()),
             "TSan emitted a race without a symbolized target frame:\n{postflight}"
         );
+        // Every known not-a-finding path is excluded and the race still reproduces
+        // out of band. Carry the postflight into the failure so a CI-only
+        // occurrence is diagnosable from the log alone — the absence of exactly
+        // this is why the 2026-09-14 failure could not be root-caused.
+        panic!(
+            "replay found no race, yet none of the not-measured paths explain it \
+             (unmeasured={}, unattributed={}) and a postflight run reproduced it \
+             with a symbolized target frame. TSan output was:\n{postflight}",
+            replay.unmeasured, replay.unattributed
+        );
     }
     assert_eq!(
         written, 1,
         "expected exactly one BHF-556 data-race finding, got {written} \
-         ({} input(s) unmeasured)",
-        replay.unmeasured
+         ({} unmeasured, {} unattributed)",
+        replay.unmeasured, replay.unattributed
     );
 
     let finding = work
