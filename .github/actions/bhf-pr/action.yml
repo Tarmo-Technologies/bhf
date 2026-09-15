@@ -181,6 +181,12 @@ runs:
 
     - name: Upload bhf work dir
       if: ${{ always() && steps.run.outputs.exit != '' && steps.run.outputs.exit != '0' }}
+      # Never let the diagnostics change the job's verdict. Artifact finalization
+      # on this repo's plan returns a non-retryable 403 often enough to have failed
+      # an otherwise-passing Windows job, and a failed upload of evidence about a
+      # failure must not become a second, more confusing failure. The inline dump
+      # above is the primary channel; this is the convenience copy.
+      continue-on-error: true
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
         name: bhf-work-${{ github.run_id }}-${{ github.run_attempt }}
