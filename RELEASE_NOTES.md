@@ -38,7 +38,7 @@ at the reported vector would have left an equivalent primitive in place.
 
 ### Root cause
 
-One pattern, not three bugs. `split_{c,cpp}_build_context_flags` pull values back
+One pattern, not three bugs. `split_cpp_build_context_flags` and `split_c_compile_context` pull values back
 out of the internal `@bhf-build-context-*` pseudo-flags and interpolate them with no
 escaping, while validation only ever inspected the **prefixed** form — where the
 single-quote relaxation that exists for legitimate CMake defines

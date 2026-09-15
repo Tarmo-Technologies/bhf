@@ -24,7 +24,7 @@ which heads every recipe line. The reported vector was the first. The second nee
 no `.bhf.toml` at all, so fixing only what was reported would have left an
 equivalent primitive in place.
 
-The root cause was one pattern rather than three bugs. `split_{c,cpp}_build_context_flags`
+The root cause was one pattern rather than three bugs. `split_cpp_build_context_flags` and `split_c_compile_context`
 pull values back out of the internal `@bhf-build-context-*` pseudo-flags and
 interpolate them with no escaping, while validation only ever inspected the
 *prefixed* form — where the single-quote relaxation that exists for legitimate CMake
