@@ -148,6 +148,14 @@ runs:
       run: |
         set -uo pipefail
         work="$RUNNER_TEMP/bhf_work"
+        # Disk first: two full builds of a large Rust workspace (the source
+        # install, then the harness build) is the leading explanation for a
+        # cargo failure that does not reproduce on a developer host, and an
+        # exhausted filesystem surfaces as an opaque "cargo build failed".
+        echo "::group::disk and build-tree sizes"
+        df -h / "$RUNNER_TEMP" 2>/dev/null || true
+        du -sh "$GITHUB_WORKSPACE/target" "${CARGO_HOME:-$HOME/.cargo}" "$work" 2>/dev/null || true
+        echo "::endgroup::"
         echo "::group::bhf work dir"
         ls -R "$work/auto" 2>/dev/null | head -50 || echo "(no work dir at $work)"
         echo "::endgroup::"
