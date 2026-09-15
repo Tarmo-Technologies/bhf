@@ -76,8 +76,20 @@ impl ClosureMemo {
     /// Declines anything that is not a property of the CLOSURE. An error in the
     /// generated harness itself says nothing about the next target in the same
     /// file, and memoizing it would write off targets that build perfectly well.
-    pub(crate) fn record(&mut self, source: &Path, errors: &[BuildErrorKind], rounds: usize) {
-        if errors.is_empty() || !errors_are_closure_scoped(errors) {
+    pub(crate) fn record(
+        &mut self,
+        source: &Path,
+        errors: &[BuildErrorKind],
+        rounds: usize,
+        had_target_repairs: bool,
+    ) {
+        // The fingerprint above covers project-level state only. A target's
+        // repair manifest is deliberately private to that harness, so a failure
+        // reached after applying one of those repairs is not evidence that a
+        // sibling target has the same build closure. In particular, an
+        // AddSource repair can introduce a duplicate implementation into one
+        // harness while another target in the same header builds cleanly.
+        if errors.is_empty() || had_target_repairs || !errors_are_closure_scoped(errors) {
             return;
         }
         self.entries.insert(
@@ -193,7 +205,7 @@ mod tests {
         let work = tmpdir("hit");
         let mut memo = ClosureMemo::load(&work, false);
         let source = Path::new("/proj/src/parse.c");
-        memo.record(source, &[missing_header("absent.h")], 4);
+        memo.record(source, &[missing_header("absent.h")], 4, false);
         memo.save(&work);
 
         let reloaded = ClosureMemo::load(&work, false);
@@ -209,7 +221,7 @@ mod tests {
         let work = tmpdir("invalidate");
         let mut memo = ClosureMemo::load(&work, false);
         let source = Path::new("/proj/src/parse.c");
-        memo.record(source, &[missing_header("absent.h")], 4);
+        memo.record(source, &[missing_header("absent.h")], 4, false);
         memo.save(&work);
 
         // The sweep learns more of the external library — exactly the case where
@@ -232,7 +244,7 @@ mod tests {
         let work = tmpdir("force");
         let mut memo = ClosureMemo::load(&work, false);
         let source = Path::new("/proj/src/parse.c");
-        memo.record(source, &[missing_header("absent.h")], 4);
+        memo.record(source, &[missing_header("absent.h")], 4, false);
         memo.save(&work);
 
         let forced = ClosureMemo::load(&work, true);
@@ -253,6 +265,7 @@ mod tests {
                 tail: "main.c:42:7: error: too few arguments to function call".to_owned(),
             }],
             4,
+            false,
         );
         assert!(
             memo.terminal_failure_for(source).is_none(),
@@ -266,7 +279,7 @@ mod tests {
         let work = tmpdir("empty");
         let mut memo = ClosureMemo::load(&work, false);
         let source = Path::new("/proj/src/parse.c");
-        memo.record(source, &[], 4);
+        memo.record(source, &[], 4, false);
         assert!(memo.terminal_failure_for(source).is_none());
     }
 
@@ -286,7 +299,27 @@ mod tests {
                 },
             ],
             4,
+            false,
         );
         assert!(memo.terminal_failure_for(source).is_none());
+    }
+
+    #[test]
+    fn a_failure_after_target_repairs_is_never_memoized() {
+        let work = tmpdir("target-repair");
+        let mut memo = ClosureMemo::load(&work, false);
+        let source = Path::new("/proj/include/amalgamation.hpp");
+        memo.record(
+            source,
+            &[BuildErrorKind::Other {
+                tail: "/proj/include/amalgamation.hpp:42: error: redefinition".to_owned(),
+            }],
+            3,
+            true,
+        );
+        assert!(
+            memo.terminal_failure_for(source).is_none(),
+            "a target-local repair can change the build closure and must not poison siblings"
+        );
     }
 }

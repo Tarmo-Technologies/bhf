@@ -3419,13 +3419,11 @@ fn foreign_platform_path_guard(path: &Path) -> Option<String> {
 /// MFC (`afxwin.h`/`afx.h`/`afx*.h`) or ATL (`atlbase.h`/`atlstr.h`/…) — is
 /// Windows-only with no portable build path, UNLIKE a bare `<windows.h>` which is
 /// routinely `#ifdef _WIN32`-guarded in cross-platform code (so we deliberately do
-/// NOT trigger on `windows.h`). Tag it with a `win32` foreign_guard so the attempt
-/// loop routes it to the Windows strategy: a mingw+wine cross-build, or a native
-/// fake-`windows.h` stub that resolves the Win32 scalar surface (`BOOL`/`DWORD`/…)
-/// so those params/types are no longer "unsupported". The MFC *class* library
-/// (`CString`/`CWnd`/`CDataExchange`) still isn't buildable offline, so a pure-MFC
-/// target then degrades to report-only — but pure Win32 logic + the scalar
-/// typedefs now type-check instead of failing the whole file natively.
+/// NOT trigger on `windows.h`). Tag it with an explicit MFC/ATL `win32`
+/// foreign_guard so the attempt loop selects the native compatibility stub.
+/// MinGW provides Win32 but not Microsoft's MFC/ATL headers or runtime; routing
+/// this marker through the ordinary mingw+wine preference would guarantee a
+/// missing framework header instead of fuzzing the portable application logic.
 fn cpp_windows_framework_guard(source: &str) -> Option<String> {
     fn is_mfc_atl_header(basename: &str) -> bool {
         let h = basename.trim().to_ascii_lowercase();
