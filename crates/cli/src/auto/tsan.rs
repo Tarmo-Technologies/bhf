@@ -65,6 +65,22 @@ pub struct TsanReplay {
     /// Corpus inputs whose TSan execution never completed (timeout or spawn
     /// failure), after retries.
     pub unmeasured: usize,
+    /// Inputs where ThreadSanitizer DID report a data race that could not be
+    /// attributed to any source location at all, because no frame in the report
+    /// carried a `file:line` locator (an unsymbolized report — no usable
+    /// `llvm-symbolizer`, a stripped binary, frames that are only
+    /// `module+0xoffset`).
+    ///
+    /// This is deliberately NOT the same as a race whose frames resolve but land
+    /// only in the bhf driver, the bundled C runtime, or a system library. That
+    /// one is *classified* — it is a race in the scaffolding, not in the target —
+    /// and dropping it is correct and intentional (see `first_target_frame`).
+    ///
+    /// An unsymbolized report is not classified, it is unreadable. Dropping it
+    /// silently reports the harness race-free on the strength of evidence that
+    /// says the opposite, which is the same false-clean `unmeasured` exists to
+    /// prevent.
+    pub unattributed: usize,
 }
 
 /// Replay every C harness's corpus through its TSan build, writing a BHF-556 finding
@@ -91,6 +107,7 @@ fn run_tsan_replay_with(work_dir: &Path, run_timeout: Duration) -> TsanReplay {
         let one = replay_one(work_dir, &hdir, &harness_id, &mut index, run_timeout);
         total.findings += one.findings;
         total.unmeasured += one.unmeasured;
+        total.unattributed += one.unattributed;
     }
     total
 }
@@ -126,6 +143,7 @@ fn replay_one(
     let mut replayed = 0usize;
     let mut consecutive_mapping_failures = 0usize;
     let mut unmeasured = 0usize;
+    let mut unattributed = 0usize;
     let mut harness_timeouts = 0usize;
     'inputs: for input in inputs.flatten() {
         if replayed >= MAX_INPUTS || harness_timeouts >= TSAN_TIMEOUT_LIMIT {
@@ -173,15 +191,30 @@ fn replay_one(
             let stderr = String::from_utf8_lossy(&out.stderr);
             if stderr.contains("data race") {
                 consecutive_mapping_failures = 0;
-                if let Some(site) = first_target_frame(&stderr, hdir) {
-                    sites.insert(site);
-                    break;
+                match classify_race(&stderr, hdir) {
+                    RaceAttribution::Target(file, line_no) => {
+                        sites.insert((file, line_no));
+                        break;
+                    }
+                    // Retry first: a report can come back unsymbolized once and
+                    // resolve on the next run, and a non-target classification can
+                    // change when a different thread interleaving is caught.
+                    _ if run_retries < TSAN_RUN_RETRIES => {
+                        run_retries += 1;
+                        continue;
+                    }
+                    // Readable, and it says the race is in bhf's own scaffolding
+                    // rather than the target. Dropping it is the intended
+                    // precision/recall trade.
+                    RaceAttribution::NonTarget => break,
+                    // Unreadable. TSan saw a race and we cannot say where — which
+                    // is not the same as "no race". Count it so the run cannot
+                    // report a clean result on evidence that says otherwise.
+                    RaceAttribution::Unresolved => {
+                        unattributed += 1;
+                        break;
+                    }
                 }
-                if run_retries >= TSAN_RUN_RETRIES {
-                    break;
-                }
-                run_retries += 1;
-                continue;
             }
             // No race report: a clean exit is a genuine no-race run (stop).
             if out.status.success() {
@@ -224,6 +257,7 @@ fn replay_one(
     TsanReplay {
         findings: written,
         unmeasured,
+        unattributed,
     }
 }
 
@@ -236,29 +270,46 @@ fn is_tsan_mapping_failure(stderr: &str) -> bool {
         || (lower.contains("threadsanitizer") && lower.contains("shadow memory"))
 }
 
-/// The first stack frame in a TSan report that lands in a TARGET source — not the
-/// bhf driver (`main.c` under the harness dir), the bundled C runtime, or a
-/// system library. That frame is the race's real site; if there is none, the report
-/// is dropped.
-fn first_target_frame(stderr: &str, hdir: &Path) -> Option<(String, u64)> {
+/// What a TSan data-race report could be pinned to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RaceAttribution {
+    /// A frame in the target's own source. The race's real site.
+    Target(String, u64),
+    /// Frames resolved to source locations, but every one of them is bhf's driver,
+    /// the bundled C runtime, or a system library. The report is readable and says
+    /// the race is in the scaffolding rather than the target, so it is dropped on
+    /// purpose.
+    NonTarget,
+    /// No frame carried a source locator at all. The report is unsymbolized, so
+    /// nothing can be concluded about WHERE the race is — including whether it is
+    /// in the target. Not the same as `NonTarget`, and must not be silent.
+    Unresolved,
+}
+
+/// Classify a TSan report, separating "we know this race is not in the target"
+/// from "we cannot read this report".
+fn classify_race(stderr: &str, hdir: &Path) -> RaceAttribution {
     let hdir_str = hdir.to_string_lossy();
+    let mut saw_locator = false;
     for line in stderr.lines() {
         let line = line.trim();
         if !line.starts_with('#') {
             continue;
         }
-        // Unlike MSan, a TSan frame ends with `(module+0xoffset)`, so the
-        // `file:line:col` locator is NOT the last token — scan every token for the
-        // first that parses as a source locator.
         let Some((file, line_no)) = line.split_whitespace().find_map(parse_locator) else {
             continue;
         };
+        saw_locator = true;
         if is_noise_frame(&file, &hdir_str) {
             continue;
         }
-        return Some((file, line_no));
+        return RaceAttribution::Target(file, line_no);
     }
-    None
+    if saw_locator {
+        RaceAttribution::NonTarget
+    } else {
+        RaceAttribution::Unresolved
+    }
 }
 
 /// Parse a `file:line:col` (or `file:line`) locator token, rejecting the
@@ -403,6 +454,66 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// End-to-end counterpart of `an_unsymbolized_report_is_unresolved_not_non_target`:
+    /// proves the counter survives the replay loop, not just the classifier.
+    ///
+    /// Before this, a TSan run reporting a race with no symbolized frame left
+    /// `sites` empty and incremented nothing, so the replay returned an all-zero
+    /// result — reporting the harness race-free on the strength of output that
+    /// says a race happened.
+    #[test]
+    #[cfg(unix)]
+    fn a_reported_race_with_no_symbolized_frame_is_counted_not_dropped() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bhf-tsan-unsym-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let work = tmp.join("work");
+        let hdir = work.join("harnesses").join("H-C0001");
+        let queue = work.join("corpus").join("H-C0001").join("queue");
+        std::fs::create_dir_all(&hdir).unwrap();
+        std::fs::create_dir_all(&queue).unwrap();
+        std::fs::write(queue.join("seed"), b"input").unwrap();
+        std::fs::write(hdir.join("Makefile"), "tsan:\n\tchmod +x main_tsan\n").unwrap();
+        // A real TSan race report whose frames carry only `module+0xoffset` — the
+        // shape produced when no usable llvm-symbolizer is present.
+        std::fs::write(
+            hdir.join("main_tsan"),
+            "#!/bin/sh\ncat >&2 <<'EOF'\n\
+==================\n\
+WARNING: ThreadSanitizer: data race (pid=1)\n\
+  Write of size 4 at 0x7b04 by thread T1:\n\
+    #0 <null> (main_tsan+0x4a1b2)\n\
+  Previous read of size 4 at 0x7b04 by main thread:\n\
+    #0 <null> (main_tsan+0x2000)\n\
+==================\n\
+EOF\nexit 86\n",
+        )
+        .unwrap();
+
+        let result = run_tsan_replay_with(&work, Duration::from_secs(30));
+        assert_eq!(
+            result.findings, 0,
+            "an unsymbolized report cannot yield a LOCATED BHF-556 finding"
+        );
+        assert_eq!(
+            result.unattributed, 1,
+            "the reported race must be counted as unattributed, not silently dropped"
+        );
+        assert_eq!(
+            result.unmeasured, 0,
+            "the run completed, so this is not an unmeasured input"
+        );
+        assert_ne!(
+            result,
+            TsanReplay::default(),
+            "an all-zero result is exactly the false-clean this prevents"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     #[cfg(unix)]
     fn an_input_whose_run_never_completes_is_unmeasured_not_clean() {
@@ -510,7 +621,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_first_target_frame_skipping_scaffolding_and_module_suffix() {
+    fn classifies_a_target_frame_skipping_scaffolding_and_module_suffix() {
         let hdir = "/w/harnesses/H-C0001";
         // TSan frames carry a trailing `(module+0xoffset)` the parser must skip.
         let report = "\
@@ -522,8 +633,8 @@ WARNING: ThreadSanitizer: data race (pid=1)\n\
   Previous read of size 4 at 0x7b04 by main thread:\n\
     #0 main /w/harnesses/H-C0001/main.c:531:5 (main_tsan+0x2000)\n";
         assert_eq!(
-            first_target_frame(report, Path::new(hdir)),
-            Some(("/proj/src/race.c".to_owned(), 12))
+            classify_race(report, Path::new(hdir)),
+            RaceAttribution::Target("/proj/src/race.c".to_owned(), 12)
         );
     }
 
@@ -534,7 +645,33 @@ WARNING: ThreadSanitizer: data race (pid=1)\n\
 WARNING: ThreadSanitizer: data race (pid=1)\n\
     #0 memcpy /usr/lib/x86_64-linux-gnu/libc.so (libc.so+0x99)\n\
     #1 bhf_run_one /w/harnesses/H-C0002/main.c:44:13 (main_tsan+0x1000)\n";
-        assert_eq!(first_target_frame(report, Path::new(hdir)), None);
+        // Readable and classified: the race is in scaffolding, not the target.
+        // This drop is the intended precision/recall trade, NOT the silent one.
+        assert_eq!(
+            classify_race(report, Path::new(hdir)),
+            RaceAttribution::NonTarget
+        );
+    }
+
+    /// The regression this fixes: a report whose frames carry no `file:line` at
+    /// all is unreadable, not evidence of a scaffolding race, and must be
+    /// distinguishable from the deliberate `NonTarget` drop.
+    #[test]
+    fn an_unsymbolized_report_is_unresolved_not_non_target() {
+        let hdir = "/w/harnesses/H-C0003";
+        let report = "\
+WARNING: ThreadSanitizer: data race (pid=1)\n\
+  Write of size 4 at 0x7b04 by thread T1:\n\
+    #0 <null> (main_tsan+0x4a1b2)\n\
+    #1 <null> (main_tsan+0x1000)\n\
+  Previous read of size 4 at 0x7b04 by main thread:\n\
+    #0 <null> (main_tsan+0x2000)\n";
+        assert_eq!(
+            classify_race(report, Path::new(hdir)),
+            RaceAttribution::Unresolved,
+            "frames with only module+offset carry no source locator, so nothing \
+             can be concluded about where the race is"
+        );
     }
 
     #[test]
