@@ -1995,6 +1995,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_java_default_package.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_java_discovery.rs",
       "license": "Apache-2.0"
     },
