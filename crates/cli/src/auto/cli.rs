@@ -839,6 +839,11 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
             .canonicalize()
             .with_context(|| format!("canonicalize sweep root {}", args.path.display()))?,
     );
+    // SECURITY: publish the canonical sweep root so the compile-database reader can
+    // tell a toolchain the OPERATOR installed from an executable the SCANNED TREE
+    // ships. Everything under this path is attacker-controlled by bhf's own threat
+    // model, and a compiler named there must never be spawned.
+    std::env::set_var("BHF_SCAN_ROOT", &path);
     // Create the work dir up front so canonicalize() succeeds whether
     // the caller passed a fresh relative path or a pre-existing tree.
     std::fs::create_dir_all(&args.work_dir)

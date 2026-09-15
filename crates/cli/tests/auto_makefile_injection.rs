@@ -11,6 +11,7 @@
 //   V1  `.bhf.toml` `cxx-std`            -> `CXX_STD ?= <value>` -> `-std=$(CXX_STD)`
 //   V2  compile_commands.json `-std=`    -> `CXX_STD ?= <value>` -> `-std=$(CXX_STD)`
 //   V3  compile_commands.json compiler   -> `CXX = <value>`      -> heads every recipe
+//   V4  compile_commands.json compiler   -> spawned directly     -> runs a tree binary
 //
 // V1 is the reported advisory. V2 reaches the same sink by a different route and is
 // NOT closed by validating the CLI flag, because the value never passes through it.
@@ -261,6 +262,71 @@ fn well_formed_build_context_values_are_still_honored() {
             makefile.contains("-DFOO=1"),
             "the recovered compile flag was dropped"
         );
+    }
+}
+
+/// V4 — a DIFFERENT bug from V3, and one the V3 fix does not close.
+///
+/// V3 was metacharacter injection: `clang++; id; true` breaks out of the recipe.
+/// V4 needs no metacharacters at all. The tree ships its own executable, names it
+/// so the leaf looks like a compiler, and points the compile database at it. bhf
+/// then SPAWNS it — as `$(CC)`/`$(CXX)` under make, in the standalone-header
+/// preflight, and in the libstdc++ probe — in default mode, with none of the
+/// build-executing flags SECURITY.md gates that behavior behind. CWE-829 rather
+/// than CWE-78, so every metacharacter rule passes it through untouched.
+///
+/// The control is that bhf resolves the compiler NAME on the operator's PATH and
+/// discards the tree's directory, so the case that matters most is a tree binary
+/// named EXACTLY `clang`: no name check can reject that, only refusing to use the
+/// tree's path can.
+#[test]
+fn compile_database_cannot_make_bhf_spawn_an_executable_from_the_tree() {
+    for (label, name, reference) in [
+        ("leaf merely contains 'clang'", "evilclang", "abs"),
+        ("leaf is exactly 'clang'", "clang", "abs"),
+        ("relative path against the cwd", "evilclang", "rel"),
+    ] {
+        let s = Scenario::new("v4");
+        let shim = s.root.join(name);
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\ntouch {}\nexec clang \"$@\"\n",
+                s.marker.to_str().unwrap()
+            ),
+        )
+        .expect("write shim");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod shim");
+        }
+        let compiler = match reference {
+            "rel" => format!("./{name}"),
+            _ => shim.to_str().unwrap().to_owned(),
+        };
+        s.write_compile_db(&compiler, "-DHARMLESS=1");
+        s.run();
+
+        assert!(
+            !s.marker.exists(),
+            "V4 ({label}): bhf spawned an executable supplied by the scanned tree — \
+             marker {} was created",
+            s.marker.display()
+        );
+        for makefile in s.makefiles() {
+            for line in makefile
+                .lines()
+                .filter(|l| l.starts_with("CC =") || l.starts_with("CXX ="))
+            {
+                let value = line.split_once('=').map(|(_, v)| v.trim()).unwrap_or("");
+                assert!(
+                    !value.starts_with('.') && !value.starts_with(s.root.to_str().unwrap()),
+                    "V4 ({label}): the Makefile names a compiler inside the scanned tree: {line}"
+                );
+            }
+        }
     }
 }
 
