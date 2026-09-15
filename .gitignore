@@ -20,3 +20,10 @@ crates/*/crash-*
 crates/*/timeout-*
 crates/*/oom-*
 crates/*/bhf_work/
+
+# Playwright MCP browser-automation artifacts (page snapshots, console logs).
+# Written into the repo root by the driving tool, not by the project. Note this
+# keeps them out of commits only: `spdx_check` walks the working tree and does
+# not consult .gitignore, so it still reports them as missing an SPDX header.
+# Delete the directory before running the license-audit gate.
+/.playwright-mcp/
