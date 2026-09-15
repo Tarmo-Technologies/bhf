@@ -8811,6 +8811,71 @@ fn dropped_compile_flag_families(args: &[String]) -> BTreeSet<&'static str> {
     families
 }
 
+/// Whether a compile-database compiler's LEAF NAME is a real toolchain name.
+///
+/// Deliberately an exact match against the known driver names, after stripping a
+/// version suffix (`gcc-12`) and a target-triple prefix (`aarch64-linux-gnu-gcc`).
+/// The previous test was `leaf.contains("clang")`, which accepts `evilclang` — any
+/// executable at all, as long as its name embeds the substring.
+fn is_toolchain_leaf_name(leaf: &str) -> bool {
+    // `gcc-12`, `clang-18.1` -> drop a trailing all-numeric version component.
+    let stem = match leaf.rsplit_once('-') {
+        Some((base, suffix))
+            if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit() || c == '.') =>
+        {
+            base
+        }
+        _ => leaf,
+    };
+    // `aarch64-linux-gnu-gcc` -> the driver name is the last component.
+    let base = stem.rsplit('-').next().unwrap_or(stem);
+    matches!(base, "clang" | "clang++" | "gcc" | "g++")
+}
+
+/// Whether `candidate` lives inside the scanned (untrusted) tree.
+///
+/// The sweep root is published by `auto` as `BHF_SCAN_ROOT`. The current working
+/// directory is treated as untrusted too: `cd repo && bhf auto .` is the common
+/// invocation, which makes cwd the tree, and a relative compiler path resolves
+/// against cwd when spawned.
+fn is_inside_untrusted_tree(candidate: &Path) -> bool {
+    let canonical = candidate
+        .canonicalize()
+        .unwrap_or_else(|_| candidate.to_path_buf());
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(root) = std::env::var_os("BHF_SCAN_ROOT") {
+        if let Ok(root) = PathBuf::from(root).canonicalize() {
+            roots.push(root);
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.push(cwd);
+    }
+    roots.iter().any(|root| canonical.starts_with(root))
+}
+
+/// The compiler named by a compile-database entry, if it is one bhf may execute.
+///
+/// SECURITY (CWE-829, untrusted search path): `compile_commands.json` comes from the
+/// scanned tree, and bhf executes whatever it names — as `$(CC)`/`$(CXX)` in the
+/// generated Makefile, in the standalone-header preflight, and in the libstdc++
+/// probe. A tree that ships an executable beside its sources and points the database
+/// at it therefore runs its own program on the operator's host in DEFAULT mode, with
+/// none of the build-executing flags SECURITY.md gates that behavior behind.
+///
+/// Rejecting shell metacharacters does not help — `./evilclang` has none. Two
+/// separate things must hold:
+///
+/// 1. the leaf must be a real driver name. The old test was `contains("clang")`,
+///    which accepts `evilclang`, i.e. any executable at all.
+/// 2. the path must not live inside the scanned tree (or the working directory).
+///    A tree binary named exactly `clang` satisfies (1), so only this rejects it.
+///
+/// A bare name carries no directory, so it is left alone — make resolves it on the
+/// operator's PATH. An
+/// absolute path OUTSIDE the tree is honored as-is, which keeps a cross or custom
+/// toolchain (`/opt/toolchain/bin/g++-12`) working — that is ordinary for the
+/// hard-to-build trees bhf targets, and the operator, not the tree, installed it.
 fn compile_command_compiler(args: &[String]) -> Option<String> {
     let mut index = 0;
     while let Some(argument) = args.get(index) {
@@ -8823,20 +8888,26 @@ fn compile_command_compiler(args: &[String]) -> Option<String> {
             index += 1;
             continue;
         }
-        let recognized = leaf.contains("clang")
-            || leaf == "gcc"
-            || leaf.starts_with("gcc-")
-            || leaf == "g++"
-            || leaf.starts_with("g++-");
-        // SECURITY: the recognition test above inspects only the LEAF file name, but the
-        // value returned is the WHOLE argument, and it becomes the generated Makefile's
-        // `CC`/`CXX` — the head of every recipe line. `clang++; id > /tmp/x; true` has a
-        // leaf of `clang++; id > /tmp/x; true` (or, with an absolute payload path, a leaf
-        // that still contains "clang"), so the leaf test alone is not a validation of what
-        // gets emitted. Refuse any compiler token carrying a shell/make metacharacter.
-        return recognized
-            .then(|| argument.clone())
-            .filter(|value| harness_gen::build_safety::is_compiler_token(value));
+        if !is_toolchain_leaf_name(&leaf) {
+            return None;
+        }
+        let path = Path::new(argument);
+        let resolved = if path.parent().is_none_or(|p| p.as_os_str().is_empty()) {
+            // A bare name carries no directory, so the tree cannot choose the binary:
+            // make and `Command::new` both resolve it on the operator's PATH. Left
+            // as written rather than pinned to an absolute path, because the
+            // generated Makefile is an artifact operators read and rebuild by hand.
+            argument.clone()
+        } else if path.is_absolute() && !is_inside_untrusted_tree(path) {
+            argument.clone()
+        } else {
+            // Relative (resolves against the working directory), or absolute into
+            // the scanned tree. Either way the tree chose the binary.
+            return None;
+        };
+        // The value is interpolated into the Makefile as well as spawned, so it
+        // still has to satisfy the recipe-safety rule.
+        return Some(resolved).filter(|value| harness_gen::build_safety::is_compiler_token(value));
     }
     None
 }
@@ -12673,6 +12744,96 @@ fn push_unique_string(values: &mut Vec<String>, value: String) {
 
 #[cfg(test)]
 mod tests {
+
+    /// GHSA-2352-w7c6-wr67 class (CWE-829): the old test was
+    /// `leaf.contains("clang")`, which accepts any executable whose name merely
+    /// embeds the substring — `evilclang` shipped inside the scanned tree.
+    #[test]
+    fn toolchain_leaf_names_are_matched_exactly_not_by_substring() {
+        for ok in [
+            "clang",
+            "clang++",
+            "gcc",
+            "g++",
+            "gcc-12",
+            "clang-18",
+            "clang-18.1",
+            "aarch64-linux-gnu-gcc",
+            "x86_64-linux-gnu-gcc-12",
+            "arm-none-eabi-g++",
+        ] {
+            assert!(
+                super::is_toolchain_leaf_name(ok),
+                "{ok:?} should be accepted"
+            );
+        }
+        for bad in [
+            "evilclang",
+            "clangevil",
+            "myclang++",
+            "notgcc",
+            "gccx",
+            "sh",
+            "python3",
+            "",
+        ] {
+            assert!(
+                !super::is_toolchain_leaf_name(bad),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
+
+    /// The tree may influence WHICH compiler is used, never WHERE it comes from.
+    ///
+    /// Uses the working directory as the untrusted root — it is always treated as
+    /// one, and unlike `BHF_SCAN_ROOT` it needs no env mutation, which would race
+    /// the other tests in this binary. The end-to-end behavior with a real sweep
+    /// root is covered by `auto_makefile_injection`.
+    #[test]
+    fn a_compile_database_compiler_from_the_tree_is_refused() {
+        let cwd = std::env::current_dir().expect("cwd");
+        // (1) a name that is not a driver at all — the `contains("clang")` hole.
+        assert_eq!(
+            super::compile_command_compiler(&[
+                cwd.join("evilclang").to_string_lossy().into_owned(),
+                "-c".to_owned()
+            ]),
+            None,
+            "an executable whose name merely embeds 'clang' must be refused"
+        );
+        // (2) named exactly `clang`, inside the tree. No name check can reject this;
+        // only refusing to use the tree's path does.
+        assert_eq!(
+            super::compile_command_compiler(&[
+                cwd.join("clang").to_string_lossy().into_owned(),
+                "-c".to_owned()
+            ]),
+            None,
+            "a binary named `clang` inside the scanned tree must never be spawned"
+        );
+        // (3) relative paths resolve against the working directory when spawned.
+        assert_eq!(
+            super::compile_command_compiler(&["./clang".to_owned(), "-c".to_owned()]),
+            None,
+            "a relative compiler path resolves against the tree and must be refused"
+        );
+        // (4) a bare name carries no directory: the operator's PATH decides.
+        assert_eq!(
+            super::compile_command_compiler(&["gcc".to_owned(), "-c".to_owned()]),
+            Some("gcc".to_owned())
+        );
+        // (5) an out-of-tree toolchain the OPERATOR installed stays honored, which
+        // is ordinary for the cross builds bhf exists to handle.
+        assert_eq!(
+            super::compile_command_compiler(&[
+                "/opt/toolchain/bin/g++-12".to_owned(),
+                "-c".to_owned()
+            ]),
+            Some("/opt/toolchain/bin/g++-12".to_owned())
+        );
+    }
+
     use super::c_step_role_of;
     use super::{
         auto_detect_c_headers, auto_detect_c_result_cleanup, auto_detect_project_includes,
