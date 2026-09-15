@@ -166,6 +166,103 @@ where
     Ok(())
 }
 
+/// Whether `value` is a well-formed C++ standard selector (`c++17`, `gnu++2a`).
+///
+/// SECURITY: a closed set, not a prefix test. This value is interpolated into the
+/// generated Makefile's `CXX_STD` and expanded into a `-std=$(CXX_STD)` recipe that
+/// `make` hands to `/bin/sh`, so "starts with `c++`" is not a validation: `c++17; id`
+/// starts with `c++` and runs `id`. Only a dialect name reaches the recipe.
+///
+/// The accepted shape is `c++`/`gnu++` followed by a 2-3 character alphanumeric
+/// version whose first character is a digit. That covers every real selector — the
+/// year forms (`c++03`, `c++17`, `gnu++20`, `c++23`) and the draft forms
+/// (`c++0x`, `c++1y`, `c++2a`, `gnu++2b`) — while admitting no separator, no
+/// whitespace and no metacharacter of any kind.
+pub fn is_cxx_standard_token(value: &str) -> bool {
+    let rest = value
+        .strip_prefix("c++")
+        .or_else(|| value.strip_prefix("gnu++"));
+    let Some(rest) = rest else {
+        return false;
+    };
+    (2..=3).contains(&rest.len())
+        && rest.starts_with(|c: char| c.is_ascii_digit())
+        && rest
+            .chars()
+            .all(|c| c.is_ascii_digit() || c.is_ascii_lowercase())
+}
+
+/// Whether `value` may be emitted as the generated Makefile's `CC`/`CXX`.
+///
+/// SECURITY: the compiler token heads every recipe line (`$(CXX) $(CXXFLAGS) …`), so
+/// it is the single most powerful injection point in the Makefile. It comes from the
+/// scanned tree's `compile_commands.json`, where a "compiler" of
+/// `clang++; id > /tmp/x; true` is recognised by a leaf-name check but executes as
+/// three shell commands. Hold it to the strict bare-token rule — a compiler path
+/// never legitimately needs a metacharacter, and the quoting relaxation that exists
+/// for compile FLAGS must not apply here, because `CC`/`CXX` are also expanded in
+/// contexts where surrounding quotes would break the command.
+pub fn is_compiler_token(value: &str) -> bool {
+    !value.trim().is_empty() && is_build_input_safe(value) && !value.starts_with('-')
+}
+
+/// Characters allowed in a build-context METADATA value (`BUILD_CONTEXT_PROVENANCE`
+/// and friends). These are bhf-generated identifiers reported back to the operator,
+/// never compiler arguments.
+fn is_metadata_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ',' | ':' | '+' | '/' | '=' | ' ')
+}
+
+/// Render a build-context metadata value for a Makefile variable assignment.
+///
+/// SECURITY: even a value that is never expanded into a recipe is written as
+/// `NAME = <value>`, so a newline in it ends the assignment and everything after it
+/// is parsed as Makefile source — enough to define a rule or override a later
+/// variable. These values are bhf-generated today; sanitising at the emission
+/// boundary means a future producer that forwards a tree-controlled string cannot
+/// silently turn that into Makefile injection.
+pub fn make_metadata_value(value: &str) -> String {
+    let cleaned: String = value
+        .chars()
+        .map(|c| if is_metadata_char(c) { c } else { '_' })
+        .collect();
+    if cleaned.trim().is_empty() {
+        "none".to_owned()
+    } else {
+        cleaned
+    }
+}
+
+/// Validate a value interpolated into a generated GNAT project (`.gpr`) file.
+///
+/// A `.gpr` is not a shell script, so the Makefile rules do not transfer: `gprbuild`
+/// parses it, and the values land INSIDE double-quoted GPR string literals
+/// (`for Source_Dirs use ("<dir>")`). Spaces and parentheses are therefore ordinary
+/// and must stay legal — a Windows path (`C:\Program Files (x86)\...`) is a normal
+/// Ada source dir. What must not get through is anything that ENDS the string
+/// literal and lets the remainder parse as GPR source: a double quote, a newline,
+/// or a control character.
+pub fn is_gpr_string_safe(value: &str) -> bool {
+    !value
+        .chars()
+        .any(|c| c == '"' || c == '\n' || c == '\r' || c.is_control())
+}
+
+/// Validate every GPR string value, naming the offending one.
+pub fn ensure_all_gpr_strings_safe<'a, I>(kind: &str, values: I) -> Result<(), HarnessGenError>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    for value in values {
+        if !is_gpr_string_safe(value) {
+            return Err(HarnessGenError::UnsafeBuildInput(format!(
+                "refusing to generate harness: {kind} {value:?} contains a quote or newline                  that would terminate its GPR string literal and inject project syntax"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Render a path for interpolation into a generated Makefile recipe / compile
 /// command. On Windows this strips the `\\?\` (and `\\?\UNC\`) verbatim prefix
 /// and converts `\` to `/`: GNU make runs recipes through `sh`, which eats
@@ -192,6 +289,91 @@ pub fn make_path(p: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cxx_standard_accepts_real_dialect_names() {
+        for ok in [
+            "c++03", "c++11", "c++14", "c++17", "c++20", "c++23", "c++26", "c++0x", "c++1y",
+            "c++1z", "c++2a", "c++2b", "gnu++03", "gnu++11", "gnu++17", "gnu++20", "gnu++2a",
+        ] {
+            assert!(is_cxx_standard_token(ok), "{ok:?} should be accepted");
+        }
+    }
+
+    /// GHSA-725h-95qg-44fv: the pre-fix check was `starts_with("c++")`, so every
+    /// payload below passed it and reached a `-std=$(CXX_STD)` recipe run by /bin/sh.
+    #[test]
+    fn cxx_standard_rejects_command_injection() {
+        for bad in [
+            "c++17; touch ./PWNED; true",
+            "c++17; id > ./PWNED.id 2>&1; true",
+            "gnu++20 && id",
+            "c++17`id`",
+            "c++17$(id)",
+            "c++17 -DFOO",
+            "c++17\nevil:\n\tid",
+            "c++",
+            "c++1",
+            "gnu++",
+            "",
+            "-std=c++17",
+            "clang++",
+        ] {
+            assert!(!is_cxx_standard_token(bad), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn compiler_token_accepts_ordinary_compilers() {
+        for ok in [
+            "clang++",
+            "/usr/bin/clang++",
+            "gcc",
+            "/usr/lib/ccache/g++",
+            "aarch64-linux-gnu-gcc-12",
+        ] {
+            assert!(is_compiler_token(ok), "{ok:?} should be accepted");
+        }
+    }
+
+    /// A compile_commands.json "compiler" heads every recipe line as `$(CXX)`.
+    /// The leaf-name recognition upstream accepts these; emission must not.
+    #[test]
+    fn compiler_token_rejects_command_injection() {
+        for bad in [
+            "clang++; id > PWNED.id; true",
+            "id > /tmp/PWNED.id; clang++",
+            "clang++ && id",
+            "clang++`id`",
+            "clang++$(id)",
+            "clang++\nevil:\n\tid",
+            "",
+            "   ",
+        ] {
+            assert!(!is_compiler_token(bad), "{bad:?} must be rejected");
+        }
+    }
+
+    /// Metadata is emitted as `NAME = <value>`; a newline would end the assignment
+    /// and let the remainder parse as Makefile source.
+    #[test]
+    fn metadata_value_neutralizes_makefile_structure() {
+        assert_eq!(
+            make_metadata_value("exact_tu_compile_database"),
+            "exact_tu_compile_database"
+        );
+        assert_eq!(
+            make_metadata_value("output_control,dep_gen"),
+            "output_control,dep_gen"
+        );
+        let injected = make_metadata_value("cmake\n\nevil:\n\tid\n");
+        assert!(!injected.contains('\n'), "newline survived: {injected:?}");
+        assert!(!injected.contains('\t'), "tab survived: {injected:?}");
+        // A space is harmless inside a `NAME = value` assignment and is kept; the
+        // make-expansion and command-substitution characters are what must not survive.
+        assert_eq!(make_metadata_value("$(shell id)"), "__shell id_");
+        assert_eq!(make_metadata_value(""), "none");
+    }
 
     #[test]
     fn accepts_ordinary_flags_and_paths() {

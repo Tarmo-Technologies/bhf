@@ -2027,6 +2027,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_makefile_injection.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_max_len_cli.rs",
       "license": "Apache-2.0"
     },

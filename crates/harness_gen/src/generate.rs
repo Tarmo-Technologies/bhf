@@ -3503,13 +3503,19 @@ fn project_import_paths(
     project_imports: &[PathBuf],
 ) -> Result<Vec<String>, HarnessGenError> {
     let output_dir = absolutize(output_dir)?;
-    project_imports
+    let rendered = project_imports
         .iter()
         .map(|project| {
             let abs_project = absolutize(project)?;
             Ok(path_string(&relative_path(&output_dir, &abs_project)))
         })
-        .collect()
+        .collect::<Result<Vec<String>, HarnessGenError>>()?;
+    // SECURITY: these land inside `with "<project>";` in the generated .gpr.
+    crate::build_safety::ensure_all_gpr_strings_safe(
+        "project import",
+        rendered.iter().map(String::as_str),
+    )?;
+    Ok(rendered)
 }
 
 fn project_source_dirs(
@@ -3549,6 +3555,13 @@ fn project_source_dirs(
             dirs.push(rendered);
         }
     }
+    // SECURITY: these land inside `for Source_Dirs use ("<dir>")` in the generated
+    // .gpr. A quote or newline would close the string literal and let the rest of
+    // the path parse as project syntax.
+    crate::build_safety::ensure_all_gpr_strings_safe(
+        "source dir",
+        dirs.iter().map(String::as_str),
+    )?;
     Ok(dirs)
 }
 

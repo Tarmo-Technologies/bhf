@@ -1251,11 +1251,18 @@ fn build_cpp_context_common(
     // The baked default is gnu++20; `--cxx-std` (published by `auto` as
     // BHF_CXX_STD) overrides it, and even without an override the Makefile's
     // CXX_STD is overridable at build time by the dialect ladder.
+    // SECURITY: `cxx_standard` is spliced into `CXX_STD ?= <value>` and expanded into
+    // the `-std=$(CXX_STD)` recipe that make runs through /bin/sh. BOTH sources here are
+    // attacker-reachable from a scanned tree — `BHF_CXX_STD` carries the auto-loaded
+    // `.bhf.toml`'s `cxx-std`, and `build_context.cxx_standard` carries a `-std=` recovered
+    // from the tree's own `compile_commands.json`. A value that is not a bare dialect name
+    // is dropped for the built-in default rather than trusted.
     let cxx_standard = std::env::var("BHF_CXX_STD")
         .ok()
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
         .or_else(|| build_context.cxx_standard.clone())
+        .filter(|s| crate::build_safety::is_cxx_standard_token(s))
         .unwrap_or_else(|| "gnu++20".to_owned());
 
     // Qualify unqualified std names in the result type too (the harness lacks
@@ -1637,9 +1644,14 @@ fn split_cpp_build_context_flags(flags: &[String]) -> CppBuildContextRender {
         } else if let Some(value) = flag.strip_prefix(BUILD_CONTEXT_LDFLAG_PREFIX) {
             link_flags.push(escape_makefile_recipe_flag(value));
         } else if let Some(value) = flag.strip_prefix(BUILD_CONTEXT_CXX_STANDARD_PREFIX) {
-            cxx_standard = Some(value.to_owned());
+            // Validated again at the emission boundary: these pseudo-flags are built from
+            // tree-controlled input, and `ensure_all_compile_flags_safe` only ever saw the
+            // PREFIXED form, where the single-quote relaxation makes `c++17; id` look
+            // acceptable. Stripping the prefix removes that protection.
+            cxx_standard =
+                Some(value.to_owned()).filter(|v| crate::build_safety::is_cxx_standard_token(v));
         } else if let Some(value) = flag.strip_prefix(BUILD_CONTEXT_COMPILER_PREFIX) {
-            compiler = Some(value.to_owned());
+            compiler = Some(value.to_owned()).filter(|v| crate::build_safety::is_compiler_token(v));
         } else {
             compile_flags.push(escape_makefile_recipe_flag(flag));
         }
@@ -1648,10 +1660,12 @@ fn split_cpp_build_context_flags(flags: &[String]) -> CppBuildContextRender {
     CppBuildContextRender {
         compile_flags,
         link_flags,
-        provenance,
-        confidence,
-        recovery,
-        dropped,
+        // Metadata lands in `NAME = <value>` assignments; a newline would end the
+        // assignment and let the remainder parse as Makefile source.
+        provenance: crate::build_safety::make_metadata_value(&provenance),
+        confidence: crate::build_safety::make_metadata_value(&confidence),
+        recovery: crate::build_safety::make_metadata_value(&recovery),
+        dropped: crate::build_safety::make_metadata_value(&dropped),
         cxx_standard,
         compiler,
     }
