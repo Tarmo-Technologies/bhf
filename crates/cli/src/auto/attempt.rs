@@ -1318,15 +1318,20 @@ pub fn attempt_with_progress(
     };
     // Remember an exhausted cascade so the next target in this source inherits
     // the verdict instead of rediscovering it. Only failures that describe the
-    // CLOSURE are recorded; the memo declines anything naming the generated
-    // harness, which is particular to this one target.
+    // unchanged CLOSURE are recorded; generated-harness errors and failures
+    // reached after target-local repairs say nothing reliable about a sibling.
     if let Outcome::FailedBuild {
+        repairs,
         last_errors,
         retries,
-        ..
     } = &result.outcome
     {
-        memo.record(&candidate.source_path, last_errors, *retries);
+        memo.record(
+            &candidate.source_path,
+            last_errors,
+            *retries,
+            !repairs.is_empty(),
+        );
         memo.save(work_dir);
     }
     // Graceful degradation: a build that failed ONLY because it references types
@@ -5469,7 +5474,7 @@ fn try_build_c(
         .filter(|s| !s.is_empty());
     let chosen_std = explicit_std.clone().or_else(|| cached_std.clone());
     let build_succeeded = |output: &std::process::Output| {
-        output.status.success() && harness_dir.join("main").is_file()
+        output.status.success() && c_harness_executable_exists(&harness_dir)
     };
 
     // From the first repair round on, ask the compiler to parse and analyse
@@ -5708,6 +5713,16 @@ fn try_build_c(
         }
     }
     BuildOutcome::Failed { errors }
+}
+
+/// Whether the C-family build produced the harness executable that the fuzz
+/// runner will consume. MinGW appends `.exe` even when the Makefile passes
+/// `-o main`; treating that successful build as a failure sends the target into
+/// an unrelated repair loop instead of running the PE through Wine.
+fn c_harness_executable_exists(harness_dir: &Path) -> bool {
+    ["main", "main.exe"]
+        .iter()
+        .any(|name| harness_dir.join(name).is_file())
 }
 
 fn cxx_dialect_cache_path(work_dir: &Path, harness_id: &str) -> PathBuf {
@@ -5954,13 +5969,11 @@ enum ForeignStrategy {
 ///
 /// PRECEDENCE IS INTENTIONAL — for an OS-platform guard (Windows) on a C/C++
 /// target we PREFER real Windows execution: cross-compile to a PE with mingw and
-/// fuzz under wine (`Cross`). The driver is now Windows-buildable (Win32 file
-/// mapping, `_setmode` binary stdio, `__sanitizer_cov_trace_pc` coverage, and a
-/// vectored exception handler for crash detection), so the mingw build links and
-/// runs — exercising the target's REAL Win32 behavior with coverage + cmplog.
-/// Only when that toolchain is ABSENT do we fall back to the reduced-fidelity
-/// native stub-isolated build (`_WIN32` defined + a fake `windows.h`), which
-/// fuzzes the portable logic with host ASan but fakes the platform surface.
+/// fuzz under wine (`Cross`). MFC/ATL is the exception: mingw-w64 does not ship
+/// Microsoft's framework headers or runtime, so a source tagged by discovery as
+/// MFC/ATL goes directly to the native compatibility stub. For ordinary Win32,
+/// only an absent toolchain falls back to the reduced-fidelity stub-isolated
+/// build (`_WIN32` defined + fake platform headers).
 ///
 /// Arch/SIMD guards never platform-stub; they always take cross-compile/emulation
 /// (#b), or skip with an actionable reason when no cross toolchain is installed.
@@ -5978,6 +5991,16 @@ fn resolve_foreign_strategy(
         crate::auto::candidate::Lang::C | crate::auto::candidate::Lang::Cpp
     ) {
         if let Some(stub) = crate::auto::cross_target::foreign_platform_stub(guard) {
+            // Discovery emits this explicit marker only for an MFC/ATL include.
+            // MinGW has the Win32 SDK but not Microsoft MFC/ATL, so selecting the
+            // cross path guarantees a missing afx*/atl* header. The compatibility
+            // stub is the only runnable offline strategy for this framework lane.
+            if guard
+                .to_ascii_lowercase()
+                .contains("mfc/atl framework header")
+            {
+                return Ok(ForeignStrategy::StubIsolated(stub));
+            }
             // Windows OS guard: prefer real PE-under-wine, fall back to the native
             // stub-isolated build only when mingw/wine is not installed here.
             return match resolve_foreign_candidate_target(candidate, guard) {
@@ -6210,21 +6233,48 @@ fn eject_unbuildable_added_source(
 ) -> Option<PathBuf> {
     // Only lines the compiler flagged as errors count. A file merely mentioned in
     // a note, an include trace, or a warning is not the one that failed.
-    let error_lines: Vec<&str> = build_output
-        .lines()
-        .filter(|line| line.contains("error:") || line.contains("error :"))
-        .collect();
+    let lines: Vec<&str> = build_output.lines().collect();
+    let error_line = |line: &str| line.contains("error:") || line.contains("error :");
     let blamed = |path: &Path| -> bool {
         let full = path.to_string_lossy().into_owned();
         let base = path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
-        error_lines.iter().any(|line| {
+        let mentions_path = |line: &str| {
             // Match the location prefix, so a path appearing later in a message
             // (as an argument, say) does not condemn the file.
             let location = line.split(": ").next().unwrap_or(line);
             location.contains(&full) || (!base.is_empty() && location.contains(&base))
+        };
+        lines.iter().enumerate().any(|(index, line)| {
+            if !error_line(line) {
+                return false;
+            }
+            if mentions_path(line) {
+                return true;
+            }
+
+            // A compiler attributes an error in an included header to that
+            // header, while the translation unit that introduced it appears in
+            // the immediately preceding include chain. This is common for
+            // header-only/amalgamated libraries: an auto-added example source
+            // includes the implementation header a second time and the header,
+            // rather than the added source, receives every redefinition error.
+            // Walk only this diagnostic's bounded include preamble so an older
+            // translation unit cannot be blamed for a later error.
+            lines[..index]
+                .iter()
+                .rev()
+                .take(32)
+                .take_while(|prior| {
+                    !prior.trim().is_empty() && !error_line(prior) && !prior.contains("warning:")
+                })
+                .any(|prior| {
+                    let trimmed = prior.trim_start();
+                    (trimmed.starts_with("In file included from ") || trimmed.starts_with("from "))
+                        && mentions_path(prior)
+                })
         })
     };
     // An archive is linked, never compiled, so a compile error can never be about
@@ -10374,6 +10424,14 @@ mod foreign_cross_target_tests {
     }
 
     #[test]
+    fn mingw_executable_is_a_completed_c_harness_build() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.exe"), b"PE").unwrap();
+
+        assert!(c_harness_executable_exists(dir.path()));
+    }
+
+    #[test]
     fn foreign_c_candidate_with_present_toolchain_is_not_skipped() {
         // The crux of (b): a foreign_guard'd candidate is no longer turned into
         // an unconditional UnsupportedParams skip. When the cross toolchain +
@@ -10552,6 +10610,17 @@ mod platform_stub_tests {
                 _ => panic!("without mingw+wine a Windows C guard must stub-isolate"),
             }
         }
+    }
+
+    #[test]
+    fn mfc_framework_guard_uses_compatibility_stub_even_with_mingw() {
+        let guard = "win32 (MFC/ATL framework header)";
+        let result = resolve_foreign_strategy(&cand(Lang::Cpp, guard), guard).expect("ok");
+
+        assert!(matches!(
+            result,
+            ForeignStrategy::StubIsolated(stub) if stub.platform == "windows"
+        ));
     }
 
     #[test]
@@ -10978,6 +11047,38 @@ mod eject_unbuildable_added_source_tests {
             eject_unbuildable_added_source(output, &mut sources, &[]),
             Some(PathBuf::from("/proj/src/mission_helper.c"))
         );
+    }
+
+    #[test]
+    fn an_error_in_an_included_header_is_attributed_to_the_added_source() {
+        // Header-only implementations put the duplicate definition in the
+        // header, while the compiler's include preamble identifies the added
+        // translation unit that included it a second time.
+        let added = PathBuf::from("/proj/examples/gltfutil/main.cc");
+        let mut sources = vec![added.clone()];
+        let output = "In file included from /proj/examples/gltfutil/main.cc:9:\n\
+                      /proj/tiny_gltf.h:1642:21: error: redefinition of default argument\n";
+
+        assert_eq!(
+            eject_unbuildable_added_source(output, &mut sources, &[]),
+            Some(added)
+        );
+        assert!(sources.is_empty());
+    }
+
+    #[test]
+    fn an_include_chain_blames_only_its_translation_unit() {
+        let unrelated = PathBuf::from("/proj/examples/other.cc");
+        let blamed = PathBuf::from("/proj/examples/gltfutil/main.cc");
+        let mut sources = vec![unrelated.clone(), blamed.clone()];
+        let output = "In file included from /proj/examples/gltfutil/main.cc:9:\n\
+                      /proj/tiny_gltf.h:1642:21: error: redefinition of default argument\n";
+
+        assert_eq!(
+            eject_unbuildable_added_source(output, &mut sources, &[]),
+            Some(blamed)
+        );
+        assert_eq!(sources, vec![unrelated]);
     }
 
     #[test]

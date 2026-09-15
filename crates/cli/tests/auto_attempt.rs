@@ -3249,7 +3249,11 @@ fn foreign_platform_guarded_target_builds_via_cross_or_platform_stub() {
         comparison_progress: false,
         max_repair_rounds: 48,
         sanitizers: Default::default(),
-        per_target_time: std::time::Duration::from_secs(1),
+        // Match the dedicated Windows cross fixtures: a cold Wine prefix can
+        // take several seconds to start when the workspace suite runs compiler
+        // integrations in parallel. One second made this environment-dependent
+        // and could expire before the first input reached the target.
+        per_target_time: std::time::Duration::from_secs(10),
         total_time: None,
         per_target_finding_count: None,
         no_stubs: false,

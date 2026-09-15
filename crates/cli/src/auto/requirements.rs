@@ -85,6 +85,18 @@ fn add_host_toolchains(manifest: &mut DependencyManifest, preflight: &PreflightR
 }
 
 fn add_cross_requirements(manifest: &mut DependencyManifest, candidates: &[Candidate]) {
+    add_cross_requirements_with(
+        manifest,
+        candidates,
+        crate::auto::cross_target::executable_on_path,
+    );
+}
+
+fn add_cross_requirements_with(
+    manifest: &mut DependencyManifest,
+    candidates: &[Candidate],
+    executable_on_path: impl Fn(&str) -> bool,
+) {
     for candidate in candidates {
         let Some(guard) = candidate.foreign_guard.as_deref() else {
             continue;
@@ -114,7 +126,7 @@ fn add_cross_requirements(manifest: &mut DependencyManifest, candidates: &[Candi
 
         if let Some(target) = crate::auto::cross_target::resolve_cross_target(guard) {
             let can_stub = crate::auto::cross_target::foreign_platform_stub(guard).is_some();
-            if !crate::auto::cross_target::executable_on_path(&target.cc) {
+            if !executable_on_path(&target.cc) {
                 manifest.push_merge_detailed(
                     DepKind::Toolchain,
                     target.cc.clone(),
@@ -131,9 +143,7 @@ fn add_cross_requirements(manifest: &mut DependencyManifest, candidates: &[Candi
                     )),
                 );
             }
-            if candidate.lang == Lang::Cpp
-                && !crate::auto::cross_target::executable_on_path(&target.cxx)
-            {
+            if candidate.lang == Lang::Cpp && !executable_on_path(&target.cxx) {
                 manifest.push_merge_detailed(
                     DepKind::Toolchain,
                     target.cxx.clone(),
@@ -147,7 +157,7 @@ fn add_cross_requirements(manifest: &mut DependencyManifest, candidates: &[Candi
                     )),
                 );
             }
-            if !crate::auto::cross_target::executable_on_path(target.runner.exe()) {
+            if !executable_on_path(target.runner.exe()) {
                 manifest.push_merge_detailed(
                     DepKind::Runtime,
                     target.runner.exe().to_owned(),
@@ -928,7 +938,7 @@ mod tests {
     }
 
     #[test]
-    fn foreign_candidate_names_missing_cross_runtime() {
+    fn foreign_candidate_reports_only_missing_cross_requirements() {
         let root = tmpdir();
         let candidate = Candidate {
             harness_id: "H-C0001".to_owned(),
@@ -942,18 +952,19 @@ mod tests {
             input_reachability: None,
             dialect: None,
         };
-        let manifest = scan(
-            &root,
-            &[candidate],
-            &PreflightReport { lanes: Vec::new() },
-            &[],
-            &root.join("work"),
-            false,
-        );
-        assert!(manifest
+        let mut missing = DependencyManifest::new();
+        add_cross_requirements_with(&mut missing, std::slice::from_ref(&candidate), |_| false);
+        assert!(missing
             .entries
             .iter()
             .any(|entry| { entry.kind == DepKind::Runtime && entry.name == "qemu-aarch64" }));
+
+        let mut available = DependencyManifest::new();
+        add_cross_requirements_with(&mut available, &[candidate], |_| true);
+        assert!(
+            available.entries.is_empty(),
+            "installed cross tools and runtimes must not be reported as missing"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
