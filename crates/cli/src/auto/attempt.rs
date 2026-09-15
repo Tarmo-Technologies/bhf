@@ -5474,7 +5474,7 @@ fn try_build_c(
         .filter(|s| !s.is_empty());
     let chosen_std = explicit_std.clone().or_else(|| cached_std.clone());
     let build_succeeded = |output: &std::process::Output| {
-        output.status.success() && harness_dir.join("main").is_file()
+        output.status.success() && c_harness_executable_exists(&harness_dir)
     };
 
     // From the first repair round on, ask the compiler to parse and analyse
@@ -5713,6 +5713,16 @@ fn try_build_c(
         }
     }
     BuildOutcome::Failed { errors }
+}
+
+/// Whether the C-family build produced the harness executable that the fuzz
+/// runner will consume. MinGW appends `.exe` even when the Makefile passes
+/// `-o main`; treating that successful build as a failure sends the target into
+/// an unrelated repair loop instead of running the PE through Wine.
+fn c_harness_executable_exists(harness_dir: &Path) -> bool {
+    ["main", "main.exe"]
+        .iter()
+        .any(|name| harness_dir.join(name).is_file())
 }
 
 fn cxx_dialect_cache_path(work_dir: &Path, harness_id: &str) -> PathBuf {
@@ -5959,13 +5969,11 @@ enum ForeignStrategy {
 ///
 /// PRECEDENCE IS INTENTIONAL — for an OS-platform guard (Windows) on a C/C++
 /// target we PREFER real Windows execution: cross-compile to a PE with mingw and
-/// fuzz under wine (`Cross`). The driver is now Windows-buildable (Win32 file
-/// mapping, `_setmode` binary stdio, `__sanitizer_cov_trace_pc` coverage, and a
-/// vectored exception handler for crash detection), so the mingw build links and
-/// runs — exercising the target's REAL Win32 behavior with coverage + cmplog.
-/// Only when that toolchain is ABSENT do we fall back to the reduced-fidelity
-/// native stub-isolated build (`_WIN32` defined + a fake `windows.h`), which
-/// fuzzes the portable logic with host ASan but fakes the platform surface.
+/// fuzz under wine (`Cross`). MFC/ATL is the exception: mingw-w64 does not ship
+/// Microsoft's framework headers or runtime, so a source tagged by discovery as
+/// MFC/ATL goes directly to the native compatibility stub. For ordinary Win32,
+/// only an absent toolchain falls back to the reduced-fidelity stub-isolated
+/// build (`_WIN32` defined + fake platform headers).
 ///
 /// Arch/SIMD guards never platform-stub; they always take cross-compile/emulation
 /// (#b), or skip with an actionable reason when no cross toolchain is installed.
@@ -5983,6 +5991,16 @@ fn resolve_foreign_strategy(
         crate::auto::candidate::Lang::C | crate::auto::candidate::Lang::Cpp
     ) {
         if let Some(stub) = crate::auto::cross_target::foreign_platform_stub(guard) {
+            // Discovery emits this explicit marker only for an MFC/ATL include.
+            // MinGW has the Win32 SDK but not Microsoft MFC/ATL, so selecting the
+            // cross path guarantees a missing afx*/atl* header. The compatibility
+            // stub is the only runnable offline strategy for this framework lane.
+            if guard
+                .to_ascii_lowercase()
+                .contains("mfc/atl framework header")
+            {
+                return Ok(ForeignStrategy::StubIsolated(stub));
+            }
             // Windows OS guard: prefer real PE-under-wine, fall back to the native
             // stub-isolated build only when mingw/wine is not installed here.
             return match resolve_foreign_candidate_target(candidate, guard) {
@@ -10406,6 +10424,14 @@ mod foreign_cross_target_tests {
     }
 
     #[test]
+    fn mingw_executable_is_a_completed_c_harness_build() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.exe"), b"PE").unwrap();
+
+        assert!(c_harness_executable_exists(dir.path()));
+    }
+
+    #[test]
     fn foreign_c_candidate_with_present_toolchain_is_not_skipped() {
         // The crux of (b): a foreign_guard'd candidate is no longer turned into
         // an unconditional UnsupportedParams skip. When the cross toolchain +
@@ -10584,6 +10610,17 @@ mod platform_stub_tests {
                 _ => panic!("without mingw+wine a Windows C guard must stub-isolate"),
             }
         }
+    }
+
+    #[test]
+    fn mfc_framework_guard_uses_compatibility_stub_even_with_mingw() {
+        let guard = "win32 (MFC/ATL framework header)";
+        let result = resolve_foreign_strategy(&cand(Lang::Cpp, guard), guard).expect("ok");
+
+        assert!(matches!(
+            result,
+            ForeignStrategy::StubIsolated(stub) if stub.platform == "windows"
+        ));
     }
 
     #[test]

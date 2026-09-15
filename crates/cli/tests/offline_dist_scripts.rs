@@ -579,8 +579,11 @@ fn offline_dist_installer_interactive_prompt_accepts_down_arrow_to_ok() {
 
     // Force the built-in arrow-key checklist (not the whiptail/dialog popup) so the
     // simulated Down-arrow + Enter keystrokes drive a deterministic fallback UI.
+    // `script` supplies the PTY; override an inherited `TERM=dumb` so the
+    // installer does not switch to its numbered text prompt and read the escape
+    // sequences as literal selection tags.
     let command = format!(
-        "cd {} && BHF_INSTALL_NO_GUI=1 bash {} --dry-run --no-apt --no-rustup --no-content --no-symlink --no-smoke --prefix {} --bin-dir {}",
+        "cd {} && TERM=xterm BHF_INSTALL_NO_GUI=1 bash {} --dry-run --no-apt --no-rustup --no-content --no-symlink --no-smoke --prefix {} --bin-dir {}",
         shell_quote(&bundle),
         shell_quote(&script),
         shell_quote(&bundle.join("install")),
