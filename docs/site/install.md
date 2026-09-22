@@ -221,7 +221,7 @@ IDE/MCP use. Windows users should ignore the two Linux-only shim assets.
 ### Complete Linux installation with the bundled `install.sh`
 
 ```sh
-VERSION=v0.2.21
+VERSION=0.2.32
 BASE="https://github.com/Tarmo-Technologies/bhf/releases/download/${VERSION}"
 ARCHIVE="bhf-dist-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 
@@ -303,7 +303,7 @@ Releases include `bhf-x86_64-pc-windows-msvc.zip`,
 PowerShell installers. For example:
 
 ```powershell
-$Version = "v0.2.21"
+$Version = "0.2.32"
 irm "https://github.com/Tarmo-Technologies/bhf/releases/download/$Version/bhf-installer.ps1" | iex
 bhf.exe --version
 ```
