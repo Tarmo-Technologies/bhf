@@ -86,6 +86,14 @@ impl ProbeInstrumentation {
             "-g".to_owned(),
             "-ffunction-sections".to_owned(),
             "-fdata-sections".to_owned(),
+            // The project's own flags are replayed to clang before ours, so a
+            // project built `-Werror` (with any clang warning the source or a
+            // recovered flag trips — e.g. `-fcx-fortran-rules` firing
+            // `-Woverriding-option`) would fail bhf's instrumented rebuild even
+            // though the untouched gcc build is clean. bhf is not the project's
+            // CI; neutralize warnings-as-errors on OUR compile. Appended after
+            // the project flags, so it wins.
+            "-Wno-error".to_owned(),
         ];
         if let Some(set) = selected {
             if !set.is_empty() {
@@ -132,6 +140,8 @@ impl ProbeInstrumentation {
             "-fdata-sections".to_owned(),
             "-fprofile-instr-generate".to_owned(),
             "-fcoverage-mapping".to_owned(),
+            // See for_selection: never let the project's -Werror fail OUR build.
+            "-Wno-error".to_owned(),
         ];
         let mut cxx_flags = common.clone();
         cxx_flags.push("-Wno-reserved-user-defined-literal".to_owned());

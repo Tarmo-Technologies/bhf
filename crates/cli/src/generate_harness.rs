@@ -8653,6 +8653,37 @@ fn expand_response_files(args: &[String], base_dir: &Path, depth: usize) -> Vec<
     out
 }
 
+/// Whether clang's driver ACCEPTS `flag` (an empty `-fsyntax-only` TU compiles
+/// cleanly, so a nonzero exit means the flag itself was rejected — `unknown
+/// argument`, `invalid value`, `unsupported option`). Cached per flag; a probe
+/// that cannot run (clang absent, spawn error) keeps the flag, so this never
+/// regresses a working build — it only drops flags proven bad. Used to filter
+/// gcc-only `-m*` machine flags out of a gcc-recovered compile database before
+/// they reach the harness `clang`.
+fn clang_accepts_flag(flag: &str) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(&accepted) = guard.get(flag) {
+            return accepted;
+        }
+    }
+    let accepted = std::process::Command::new("clang")
+        .args([flag, "-fsyntax-only", "-x", "c", "-"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(true);
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(flag.to_owned(), accepted);
+    }
+    accepted
+}
+
 fn extract_compile_database_flags(entry: &CompileCommandEntry, source_path: &Path) -> Vec<String> {
     let Some(raw_args) = compile_command_arguments(entry) else {
         return Vec::new();
@@ -8777,6 +8808,13 @@ fn extract_compile_database_flags(entry: &CompileCommandEntry, source_path: &Pat
     // through (e.g. a future allowlisted family that happens to overlap), so the
     // single-TU harness compile never sees `-fmodules-ts` and friends.
     flags.retain(|flag| !is_harness_incompatible_flag(flag));
+    // The `-m*` allowlist forwards machine flags broadly, but a gcc-only one
+    // (`-mindirect-branch=thunk`, `-mfunction-return=thunk`, …) makes the harness
+    // clang abort with a hard `unknown argument`/`invalid value` DRIVER error that
+    // `-Wno-error` cannot rescue. Probe each forwarded `-m` flag against clang once
+    // (cached) and drop the ones it rejects, so a gcc-recovered build still
+    // harnesses under clang instead of failing every target.
+    flags.retain(|flag| !flag.starts_with("-m") || clang_accepts_flag(flag));
     let dropped = dropped_compile_flag_families(&args);
     if !dropped.is_empty() {
         flags.push(format!(
@@ -8923,6 +8961,12 @@ fn compile_database_single_flag_is_safe(flag: &str) -> bool {
         || flag.starts_with("-Wl,")
         || flag.starts_with("-Xlinker")
         || flag.starts_with('@')
+        // Never inherit the project's warnings-as-errors onto bhf's own harness
+        // compile: a warning from the harness scaffolding or a recovered flag
+        // (e.g. `-fcx-fortran-rules` -> `-Woverriding-option`) would abort a
+        // build the untouched project compiles cleanly.
+        || flag == "-Werror"
+        || flag.starts_with("-Werror=")
     {
         return false;
     }
@@ -13154,6 +13198,82 @@ mod tests {
             "{db_flags:?}"
         );
         assert!(db_flags.contains(&"-DFOO=1".to_owned()), "{db_flags:?}");
+    }
+
+    #[test]
+    fn warnings_as_errors_are_not_forwarded_from_compile_db() {
+        // The project's -Werror / -Werror=<w> must never reach bhf's own harness
+        // compile: a warning from the scaffolding or a recovered flag (e.g.
+        // -fcx-fortran-rules -> -Woverriding-option) would abort a build the
+        // untouched project compiles cleanly. Plain -W warnings still pass.
+        let entry = CompileCommandEntry {
+            directory: PathBuf::from("."),
+            file: PathBuf::from("t.c"),
+            arguments: Some(
+                [
+                    "gcc",
+                    "-Werror",
+                    "-Werror=return-type",
+                    "-Wall",
+                    "-DKEEP=1",
+                    "-c",
+                    "t.c",
+                ]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            ),
+            command: None,
+        };
+        let flags = extract_compile_database_flags(&entry, Path::new("./t.c"));
+        assert!(
+            !flags.iter().any(|f| f == "-Werror" || f.starts_with("-Werror=")),
+            "warnings-as-errors must be dropped: {flags:?}"
+        );
+        assert!(
+            flags.contains(&"-Wall".to_owned()),
+            "plain -W warnings are kept: {flags:?}"
+        );
+        assert!(flags.contains(&"-DKEEP=1".to_owned()), "{flags:?}");
+    }
+
+    #[test]
+    fn gcc_only_machine_flag_clang_rejects_is_dropped() {
+        // A gcc-only `-m` flag clang can't take (`-mindirect-branch=thunk`) is a
+        // hard driver error `-Wno-error` cannot rescue; probe it out. A valid
+        // `-m` flag (`-mavx`) is kept. The probe needs clang, which the C/C++
+        // lane requires anyway; skip cleanly where it is absent.
+        if which::which("clang").is_err() {
+            return;
+        }
+        let entry = CompileCommandEntry {
+            directory: PathBuf::from("."),
+            file: PathBuf::from("t.c"),
+            arguments: Some(
+                [
+                    "gcc",
+                    "-mindirect-branch=thunk",
+                    "-mavx",
+                    "-DKEEP=1",
+                    "-c",
+                    "t.c",
+                ]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            ),
+            command: None,
+        };
+        let flags = extract_compile_database_flags(&entry, Path::new("./t.c"));
+        assert!(
+            !flags.iter().any(|f| f == "-mindirect-branch=thunk"),
+            "a clang-rejected gcc-only -m flag must be dropped: {flags:?}"
+        );
+        assert!(
+            flags.contains(&"-mavx".to_owned()),
+            "a clang-accepted -m flag must be kept: {flags:?}"
+        );
+        assert!(flags.contains(&"-DKEEP=1".to_owned()), "{flags:?}");
     }
 
     #[test]

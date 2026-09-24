@@ -157,6 +157,29 @@ The remaining two-LLVM footprint (clang-18 for the C/C++ lane, clang-17 pulled b
 AFL++) is the cost of the optional AFL++ engine; drop `afl++` from the Dockerfile
 for a further ~0.2 GB if you only use the built-in engine.
 
+### gcc-recovered flags no longer break the clang harness build
+
+bhf recovers a project's real compile flags but builds the harness (and the
+instrumented static libraries) with **clang** for SanitizerCoverage. Two classes
+of gcc flag leaked through and failed builds the untouched gcc build compiles
+cleanly:
+
+- **`-Werror` + a clang warning.** A project built `-Werror`, and a recovered
+  flag such as `-fcx-fortran-rules` trips clang's `-Woverriding-option`, so the
+  replay died with `clang++: error: overriding '' option with
+  '-fcx-fortran-rules' [-Werror,-Woverriding-option]`. Fix: the injected
+  instrumentation now appends `-Wno-error` (bhf is not the project's CI), and the
+  per-harness allowlist drops `-Werror`/`-Werror=*` (`build_probe.rs`,
+  `generate_harness.rs`).
+- **gcc-only `-m` machine flags.** The `-m*` allowlist forwarded flags like
+  `-mindirect-branch=thunk` that clang rejects with a hard `unknown argument`
+  that `-Wno-error` cannot rescue. Fix: each forwarded `-m` flag is probed
+  against clang once (cached) and dropped if rejected, keeping the valid ones
+  (`-mavx`, `-march=…`). Regression tests
+  `warnings_as_errors_are_not_forwarded_from_compile_db` and
+  `gcc_only_machine_flag_clang_rejects_is_dropped`; both reproductions verified to
+  build+fuzz with no sanitizing needed.
+
 ## Runtime notes confirmed
 
 - `--cap-add=SYS_PTRACE` is required for the ASan/LeakSanitizer stop-the-world; the C
