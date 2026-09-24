@@ -267,6 +267,28 @@ pub fn write_reports(options: ReportOptions) -> Result<ReportSummary, ReportErro
 /// home for it) and the on-disk `source_path` of the finding record (a bhf
 /// workspace path, not an attacker-input source — the `sink_*` columns carry
 /// the real defect location).
+/// Make a source/sink path relative to the document's source root for the
+/// human-facing CSV/Markdown reports (SARIF has its own `SRCROOT` handling).
+/// String-replace of the canonical root prefix, so `/abs/root/src/x.c` ->
+/// `src/x.c`; paths outside the root, or when no root is known, are unchanged.
+fn relativize_to_source_root(path: &str, source_root: Option<&str>) -> String {
+    if path.is_empty() {
+        return String::new();
+    }
+    let Some(root) = source_root.filter(|r| !r.is_empty()) else {
+        return path.to_owned();
+    };
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| PathBuf::from(root));
+    let mut needle = root.to_string_lossy().into_owned();
+    if needle.is_empty() {
+        return path.to_owned();
+    }
+    if !needle.ends_with(std::path::MAIN_SEPARATOR) {
+        needle.push(std::path::MAIN_SEPARATOR);
+    }
+    path.replace(&needle, "")
+}
+
 pub fn render_csv_report(document: &ReportDocument) -> String {
     let mut out = String::new();
     out.push_str(
@@ -334,7 +356,9 @@ pub fn render_csv_report(document: &ReportDocument) -> String {
         out.push_str(&row);
         out.push('\n');
     }
-    out
+    // Relativise any absolute source path (incl. the reproducers column) to the
+    // scanned tree; the prefix never contains a comma/quote, so CSV escaping holds.
+    relativize_to_source_root(&out, document.run.source_root.as_deref())
 }
 
 /// RFC 4180 field escaping: quote when the value contains a comma, quote, CR or
@@ -664,11 +688,16 @@ pub fn load_findings_with_model(
 }
 
 pub fn render_markdown_report(document: &ReportDocument) -> String {
-    render_markdown_inner(document, false)
+    let md = render_markdown_inner(document, false);
+    relativize_to_source_root(&md, document.run.source_root.as_deref())
 }
 
 pub fn render_markdown_report_with(document: &ReportDocument, options: &ReportOptions) -> String {
-    render_markdown_inner(document, options.collapse_clusters)
+    let md = render_markdown_inner(document, options.collapse_clusters);
+    // Final pass: strip the source-root prefix everywhere it appears (fix
+    // locations, remediation prose, stack frames, sink lines) so the whole report
+    // shows source/sink paths relative to the scanned tree, not absolute host paths.
+    relativize_to_source_root(&md, document.run.source_root.as_deref())
 }
 
 fn render_markdown_inner(document: &ReportDocument, collapse_clusters: bool) -> String {
@@ -1444,7 +1473,9 @@ pub fn render_junit_report(document: &ReportDocument) -> String {
     }
 
     out.push_str("</testsuite>\n");
-    out
+    // Relativise source/sink paths (fix locations, stack frames) to the scanned
+    // tree, consistent with the CSV/Markdown/SARIF reports.
+    relativize_to_source_root(&out, document.run.source_root.as_deref())
 }
 
 fn load_confidence_model(
@@ -3025,12 +3056,37 @@ fn md_code(value: &str) -> String {
 mod tests {
     use super::{
         build_report, is_xml_1_0_char, load_findings, load_findings_with_model,
-        render_junit_report, render_markdown_report, render_markdown_report_with,
-        render_sarif_report, rule_signature, rules, validate_sarif_report, write_reports,
-        ClusterQuality, ClusterReport, CountReport, FindingReport, ReportDocument, ReportOptions,
-        RunReport, REPORT_SCHEMA_VERSION,
+        relativize_to_source_root, render_junit_report, render_markdown_report,
+        render_markdown_report_with, render_sarif_report, rule_signature, rules,
+        validate_sarif_report, write_reports, ClusterQuality, ClusterReport, CountReport,
+        FindingReport, ReportDocument, ReportOptions, RunReport, REPORT_SCHEMA_VERSION,
     };
     use confidence_model::{ConfidenceLabel, TrainingSample};
+
+    #[test]
+    fn relativize_to_source_root_strips_prefix_everywhere() {
+        let dir = std::env::temp_dir().join(format!("bhf-relr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = std::fs::canonicalize(&dir).unwrap();
+        let rs = root.to_string_lossy().into_owned();
+        // a single absolute path -> tree-relative
+        assert_eq!(
+            relativize_to_source_root(&format!("{rs}/src/x.c:5"), Some(&rs)),
+            "src/x.c:5"
+        );
+        // every occurrence in a whole rendered report is relativised
+        let text = format!("- Sink: `{rs}/a.c:1`\n- Inspect {rs}/b.c as the fix\n");
+        assert_eq!(
+            relativize_to_source_root(&text, Some(&rs)),
+            "- Sink: `a.c:1`\n- Inspect b.c as the fix\n"
+        );
+        // no known root -> unchanged
+        assert_eq!(
+            relativize_to_source_root(&format!("{rs}/x.c"), None),
+            format!("{rs}/x.c")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use serde_json::{json, Value};
     use std::collections::BTreeMap;
     use std::fs;

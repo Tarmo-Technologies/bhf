@@ -1575,6 +1575,10 @@ fn load_csv_finding(
                 .unwrap_or_default();
         }
     }
+    // Report source/sink locations RELATIVE to the scanned tree (portable and
+    // diffable across machines) rather than as absolute host paths.
+    sink_file = relativize_report_field(&sink_file, source_root);
+
     // #1: the taint SOURCE `file:line`, when the finding recorded a source→sink
     // flow. Interprocedural taint rules carry `exception.source_file`/`source_line`;
     // a pure pattern rule (BHF-401 unsafe-copy) has none, so this stays empty rather
@@ -1604,6 +1608,10 @@ fn load_csv_finding(
         );
     }
 
+    // `source` may be a `file:line` (taint origin); relativise it before it feeds
+    // the constructed data-flow trace below.
+    source = relativize_report_field(&source, source_root);
+
     let mut data_flow = json_str(&raw, &["data_flow"]);
     if data_flow.is_empty() && !is_static {
         let entry = target_by_harness
@@ -1617,6 +1625,10 @@ fn load_csv_finding(
         };
         data_flow = format!("{source} -> entry:{entry} -> sink:{sink}");
     }
+    // A pre-existing `data_flow` (loaded from the finding record) can still carry
+    // absolute frame paths; relativise the whole trace. (The constructed branch
+    // above already used relative `source`/`sink_file`, so this is a no-op there.)
+    data_flow = relativize_report_field(&data_flow, source_root);
 
     let mut entity = json_str(&raw, &["entity"]);
     if entity.is_empty() {
@@ -1717,6 +1729,27 @@ fn absolute_candidate_path(source_root: &Path, path: &Path) -> String {
         .unwrap_or(absolute)
         .to_string_lossy()
         .into_owned()
+}
+
+/// Strip the canonical source-root prefix from any absolute paths in a report
+/// field, so source/sink locations render RELATIVE to the scanned tree
+/// (`/abs/root/src/x.c:5:f` -> `src/x.c:5:f`). Done by string replacement so it
+/// also relativises paths embedded in a `data_flow` trace. Paths OUTSIDE the tree
+/// (system headers, the work/harness dir) keep their absolute form, and a field
+/// with no path (`fuzz_input:testcase.bin`) is returned unchanged.
+fn relativize_report_field(field: &str, source_root: &Path) -> String {
+    if field.is_empty() {
+        return String::new();
+    }
+    let root = std::fs::canonicalize(source_root).unwrap_or_else(|_| source_root.to_path_buf());
+    let mut needle = root.to_string_lossy().into_owned();
+    if needle.is_empty() {
+        return field.to_owned();
+    }
+    if !needle.ends_with(std::path::MAIN_SEPARATOR) {
+        needle.push(std::path::MAIN_SEPARATOR);
+    }
+    field.replace(&needle, "")
 }
 
 fn is_sanitizer_diagnostic_label(function: &str) -> bool {
@@ -3580,6 +3613,38 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn report_paths_are_relative_to_the_source_root() {
+        let dir = std::env::temp_dir().join(format!("bhf-relq-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = std::fs::canonicalize(&dir).unwrap();
+        let rs = root.to_string_lossy();
+        // a bare sink path under the tree becomes tree-relative
+        assert_eq!(
+            relativize_report_field(&format!("{rs}/src/x.c:5:f"), &dir),
+            "src/x.c:5:f"
+        );
+        // paths embedded in a data-flow trace are relativised too
+        assert_eq!(
+            relativize_report_field(
+                &format!("fuzz_input:t.bin -> entry:g -> sink:{rs}/a.c:9:h"),
+                &dir
+            ),
+            "fuzz_input:t.bin -> entry:g -> sink:a.c:9:h"
+        );
+        // a path OUTSIDE the tree (system header) keeps its absolute form
+        assert_eq!(
+            relativize_report_field("/usr/include/stdio.h:1:x", &dir),
+            "/usr/include/stdio.h:1:x"
+        );
+        // a non-path field is unchanged
+        assert_eq!(
+            relativize_report_field("fuzz_input:testcase.bin", &dir),
+            "fuzz_input:testcase.bin"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn old_relative_static_sink_uses_exact_candidate_source_in_regenerated_csv() {
         let root = std::env::temp_dir().join(format!(
             "bhf-static-path-{}",
@@ -3778,9 +3843,12 @@ mod tests {
         assert!(!e.stubbed, "an unresolved header is STILL BLOCKING");
         assert!(e.referenced_by.contains(&"H-CARES".to_owned()));
         let hint = e.acquisition_hint.as_deref().unwrap_or("");
+        // The remediation for a generated header names the generator that
+        // produces it (configure/cmake/autogen) — generalised from the older
+        // literal "configure" wording — and points at a trusted build host.
         assert!(
-            hint.contains("configure"),
-            "remediation names configure: {hint}"
+            hint.contains("project generator") && hint.contains("build host"),
+            "remediation names the generator + build host: {hint}"
         );
         assert!(!hint.contains("apt-file"), "no dead-end apt hint: {hint}");
         assert!(!m.is_empty());
