@@ -800,6 +800,13 @@ pub fn probe_build(
         );
     }
     let probe_dir = build_root.join(PROBE_DIR);
+    // A user working offline (no buildable configure) may already have a valid
+    // compile_commands.json and place it at exactly the path our failure message
+    // names — PROBE_DIR/compile_commands.json. Capture it before the destructive
+    // wipe below so a failed regeneration RESTORES the DB the user supplied
+    // instead of silently deleting it (the reported "put it where bhf says it's
+    // looking and it's ignored" footgun).
+    let user_supplied_db = std::fs::read(probe_dir.join("compile_commands.json")).ok();
     // This directory is bhf-owned build output. Reusing a CMakeCache or an
     // archive from a prior sanitizer selection can make configuration lie about
     // its compiler and can link ASan objects into a `--sanitizers none` harness.
@@ -855,7 +862,30 @@ pub fn probe_build(
             record_probe_requirement(tree, requirement);
         }
     }
-    recovered
+    match recovered {
+        Some(path) => Some(path),
+        // Regeneration produced no DB. If the user had placed one at the probe
+        // path, restore and use it rather than leaving them worse off than
+        // before the probe ran.
+        None => {
+            let bytes = user_supplied_db?;
+            let db = probe_dir.join("compile_commands.json");
+            if std::fs::create_dir_all(&probe_dir).is_ok()
+                && std::fs::write(&db, &bytes).is_ok()
+            {
+                bhfeprintln!(
+                    "bhf auto: --probe-build: could not regenerate a compile database offline; \
+                     using the compile_commands.json already present at {}. (Tip: a \
+                     compile_commands.json in the project root or a build/ dir is used WITHOUT \
+                     --probe-build, which would not touch it.)",
+                    db.display()
+                );
+                Some(db)
+            } else {
+                None
+            }
+        }
+    }
 }
 
 fn request_cmake_file_api(probe_dir: &Path) {
@@ -3150,6 +3180,31 @@ mod tests {
         assert_eq!(detect_build_system(&root), BuildSystem::Make);
         let bare = tmpdir();
         assert_eq!(detect_build_system(&bare), BuildSystem::None);
+    }
+
+    #[test]
+    fn probe_build_restores_a_user_supplied_compile_db_when_regeneration_fails() {
+        // A tree with NO buildable configure but a user-placed compile_commands.json
+        // at the probe path (the exact path our failure message names). probe_build
+        // must NOT delete it: with nothing to regenerate, it restores and returns
+        // the user's DB rather than leaving the user worse off.
+        let root = tmpdir();
+        let probe = root.join(PROBE_DIR);
+        fs::create_dir_all(&probe).unwrap();
+        let db = probe.join("compile_commands.json");
+        let content =
+            br#"[{"directory":"/x","file":"/x/a.c","arguments":["clang","-c","a.c"]}]"#;
+        fs::write(&db, content).unwrap();
+
+        let recovered = probe_build(&root, None, &multicore_fuzz::SanitizerSelection::None)
+            .expect("a user-supplied compile_commands.json must be preserved and returned");
+        assert_eq!(recovered, db);
+        assert_eq!(
+            fs::read(&db).unwrap(),
+            content,
+            "the user's compile_commands.json content must survive the probe"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

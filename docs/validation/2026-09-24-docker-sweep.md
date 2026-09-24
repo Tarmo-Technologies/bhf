@@ -13,7 +13,7 @@ language (32 total)**.
 | Host | Linux 6.8, x86_64, 6 vCPU, 13.6 GiB RAM, cgroup v2 |
 | Docker | 29.1.3, overlay2, BuildKit |
 | Base image | `ubuntu:24.04` (digest-pinned) |
-| Image size | ~4.7 GB (all 16 toolchains + AFL++ + Rust nightly + .NET 8 + JDK/Maven/Gradle) |
+| Image size | 3.62 GB (1.25 GB as `docker save \| gzip`) — fits a single-layer DVD-5 |
 | bhf | 0.2.32 (built from source in the builder stage) |
 
 ## Method
@@ -38,39 +38,39 @@ language (32 total)**.
 
 | Language | Project | Result | Targets fuzzed | Executions | Edges | Findings |
 |---|---|:--:|--:|--:|--:|--:|
-| ada | json-ada | PASS | 2 | 210019 | 357 | 0 |
-| ada | ada-yaml | PASS | 2 | 240852 | 1195 | 0 |
-| c | cjson | PASS | 2 | 8803 | 283 | 0 |
-| c | inih | PASS | 2 | 21118 | 96 | 0 |
-| cpp | pugixml | PASS | 2 | 7482 | 446 | 6 |
-| cpp | cpp-httplib | PASS | 1 | 3558 | 8 | 0 |
-| rust | json-rust | PASS | 2 | 183420 | 647 | 0 |
-| rust | rust-csv | PASS | 2 | 7865 | 148 | 0 |
-| java | json-java | PASS | 2 | 346913 | 49 | 0 |
-| java | minimal-json | PASS | 2 | 223619 | 405 | 0 |
-| python | toml | PASS | 2 | 5249 | 746 | 2 |
-| python | html5lib | PASS | 1 | 3858 | 12 | 0 |
-| perl | json-pp | PASS | 2 | 202131 | 131 | 0 |
-| perl | uri | PASS | 2 | 168906 | 175 | 0 |
-| go | fastjson | PASS | 2 | 3167 | 81 | 2 |
-| go | jsonparser | PASS | 2 | 34977 | 18 | 0 |
-| fortran | json-fortran | PASS | 2 | 10381 | 1067 | 0 |
-| fortran | csv-fortran | PASS | 1 | 3730 | 1524 | 0 |
+| ada | json-ada | PASS | 2 | 190058 | 357 | 0 |
+| ada | ada-yaml | PASS | 2 | 226825 | 1192 | 0 |
+| c | cjson | PASS | 2 | 8097 | 283 | 0 |
+| c | inih | PASS | 2 | 20094 | 96 | 0 |
+| cpp | pugixml | PASS | 2 | 6382 | 446 | 4 |
+| cpp | cpp-httplib | PASS | 1 | 3584 | 8 | 0 |
+| rust | json-rust | PASS | 2 | 167602 | 692 | 0 |
+| rust | rust-csv | PASS | 2 | 7590 | 148 | 0 |
+| java | json-java | PASS | 2 | 329675 | 49 | 0 |
+| java | minimal-json | PASS | 2 | 210155 | 405 | 0 |
+| python | toml | PASS | 2 | 5266 | 746 | 2 |
+| python | html5lib | PASS | 1 | 3859 | 12 | 0 |
+| perl | json-pp | PASS | 2 | 194303 | 131 | 0 |
+| perl | uri | PASS | 2 | 166602 | 175 | 0 |
+| go | fastjson | PASS | 2 | 3197 | 81 | 2 |
+| go | jsonparser | PASS | 2 | 35556 | 18 | 0 |
+| fortran | json-fortran | PASS | 2 | 10162 | 968 | 0 |
+| fortran | csv-fortran | PASS | 1 | 5667 | 1210 | 0 |
 | cobol | carddemo | PASS | 1 | 328 | 80 | 0 |
-| cobol | cobolcraft | PASS | 2 | 642 | 88 | 0 |
-| csharp | sprache | PASS | 2 | 317946 | 33 | 0 |
-| csharp | superpower | PASS | 2 | 343161 | 4 | 0 |
-| javascript | bytes | PASS | 2 | 41864 | 17 | 0 |
-| javascript | marked | PASS | 2 | 17285 | 54 | 0 |
-| typescript | yaml | PASS | 2 | 25582 | 870 | 0 |
-| typescript | zod | PASS | 2 | 39302 | 457 | 0 |
-| ruby | csv | PASS | 2 | 20563 | 361 | 0 |
-| ruby | parser | PASS | 2 | 277195 | 2 | 0 |
-| lua | json-lua | PASS | 2 | 97936 | 133 | 0 |
-| lua | lunajson | PASS | 2 | 175259 | 0 | 0 |
-| php | php-parser | PASS | 2 | 640222 | 0 | 0 |
-| php | symfony-yaml | PASS | 2 | 160225 | 0 | 0 |
-| **Total** | **32 projects · 16 langs** | **32 PASS** | | **3,843,558** | | **10** |
+| cobol | cobolcraft | PASS | 2 | 649 | 88 | 0 |
+| csharp | sprache | PASS | 2 | 319543 | 33 | 0 |
+| csharp | superpower | PASS | 2 | 316780 | 4 | 0 |
+| javascript | bytes | PASS | 2 | 41634 | 17 | 0 |
+| javascript | marked | PASS | 2 | 17541 | 54 | 0 |
+| typescript | yaml | PASS | 2 | 25734 | 870 | 0 |
+| typescript | zod | PASS | 2 | 39426 | 457 | 0 |
+| ruby | csv | PASS | 2 | 20398 | 361 | 0 |
+| ruby | parser | PASS | 2 | 257620 | 2 | 0 |
+| lua | json-lua | PASS | 2 | 95649 | 133 | 0 |
+| lua | lunajson | PASS | 2 | 173811 | 0 | 0 |
+| php | php-parser | PASS | 2 | 603534 | 0 | 0 |
+| php | symfony-yaml | PASS | 2 | 158445 | 0 | 0 |
+| **Total** | **32 projects · 16 langs** | **32 PASS** | | **3,665,766** | | **8** |
 
 ## Defects found and fixed during validation
 
@@ -108,6 +108,54 @@ drive from bytes and whose symbols it can link; internal-only APIs, instance met
 without a constructible receiver, and (for now) Go targets with external module
 dependencies fall outside that envelope. The container reproduces bhf's real behavior
 faithfully in every case.
+
+## Follow-up: offline hardening, compile-DB fix, and size reduction
+
+A second pass hardened the image for air-gapped use, fixed a compile-database
+footgun, and cut the image to fit a DVD.
+
+### Offline / air-gap: staged bhf's own instrumentation deps
+
+On a disconnected host two lanes failed because bhf fetched its OWN
+instrumentation from the internet (the target's deps are separately
+operator-staged). Both are now staged at build time and verified with
+`--network none`:
+
+- **Java** — `java_runtime/build-agent.sh` curled `asm`/`asm-tree` from Maven
+  Central to shade into the JVM coverage agent; offline every Java target
+  failed with `could not build the bhf JVM agent jar: curl: Could not resolve
+  host: repo1.maven.org`. Fix: install `libasm-java` and set
+  `ASM_JAR_DIR=/usr/share/java`. Verified: `mvn -o clean compile` under
+  `--network none` → 2 built+fuzzed, 76 877 executions.
+- **C#** — the harness restores `SharpFuzz` from NuGet; the image now primes
+  the default NuGet cache with SharpFuzz 2.3.0. A target's own
+  `PackageReference`s still need staging into `NUGET_PACKAGES`, exactly like a
+  Maven target's `~/.m2`.
+
+### compile_commands.json: `--probe-build` no longer deletes a user database
+
+`probe_build` wiped `<tree>/.bhf-build/` before regenerating — the very path its
+own failure message names — so a user who placed their `compile_commands.json`
+there (even via symlink) had it silently deleted when regeneration failed
+offline. Fixed in `crates/cli/src/auto/build_probe.rs`: the pre-existing database
+is captured before the wipe and restored + used if regeneration produces none
+(regression test `probe_build_restores_a_user_supplied_compile_db_when_regeneration_fails`).
+Verified in-image: the user file is PRESERVED and the harness builds with its
+flags. (A `compile_commands.json` in the project root or a `build/` dir — real or
+symlinked — is already used without `--probe-build`; that path was confirmed
+working and was never the bug.)
+
+### Size: 5.01 GB → 3.62 GB (1.25 GB compressed)
+
+| Cut | Saved |
+|---|---|
+| Install the Rust toolchain as the `fuzzer` user instead of `chown -R` over it | ~0.94 GB (a duplicated layer) |
+| Headless JDK + drop Gradle (removes the AWT/Mesa + second-LLVM pull) | ~0.4 GB |
+| Drop the `rust-src` component (bhf instruments via SanitizerCoverage, not `-Zbuild-std`) | ~0.09 GB |
+
+The remaining two-LLVM footprint (clang-18 for the C/C++ lane, clang-17 pulled by
+AFL++) is the cost of the optional AFL++ engine; drop `afl++` from the Dockerfile
+for a further ~0.2 GB if you only use the built-in engine.
 
 ## Runtime notes confirmed
 

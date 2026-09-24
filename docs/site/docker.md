@@ -18,9 +18,12 @@ docker compose -f docker/compose.yaml build
 
 The build is multi-stage: a builder compiles the Rust workspace against Ubuntu
 24.04 glibc (so the preload shims match the runtime), and the runtime image
-installs the toolchains. The final image is large (all sixteen lanes + .NET SDK
-+ JDK/Maven/Gradle); scope it down by deleting unused `apt` lanes from the
-`Dockerfile` if you only fuzz a few languages — an absent toolchain simply skips.
+installs the toolchains. The runtime carries all sixteen lanes + .NET 8 SDK +
+a headless JDK + Maven; scope it down further by deleting unused `apt` lanes from
+the `Dockerfile` if you only fuzz a few languages — an absent toolchain simply
+skips. The Java lane uses Maven + `javac`; **Gradle is intentionally omitted** to
+keep the image small (it pulls a large GUI-adjacent dependency tree). Add
+`gradle` back to the `Dockerfile` if you need Gradle-project build recovery.
 
 ## Run
 
@@ -71,6 +74,54 @@ honoured. Budget at least `jobs × rss-limit-mb` for fuzz children plus headroom
 for discovery, compilers, and reports. On a memory-capped container prefer a
 serial sweep (`--jobs 1`) and set `--rss-limit-mb` explicitly. See
 [Resource Requirements](../../README.md#resource-requirements).
+
+## Air-gapped / offline use
+
+The image is built so that **bhf's own instrumentation dependencies are staged at
+build time** — no lane reaches the internet to fuzz on a disconnected host:
+
+- **Java** — the JVM coverage agent shades ASM. `build-agent.sh` would otherwise
+  fetch `asm`/`asm-tree` from Maven Central; the image installs them
+  (`libasm-java` → `/usr/share/java`) and sets `ASM_JAR_DIR=/usr/share/java`, so
+  the agent builds offline.
+- **C#** — the harness references `SharpFuzz`; the image primes the default NuGet
+  cache with it at build time.
+
+What the image **cannot** stage for you is your *target project's own* build
+dependencies. Air-gapped fuzzing of a real project means bringing those across
+the gap, exactly as you already do to build the project by hand:
+
+| Lane | Stage on the host (mount into the container) |
+|---|---|
+| Java (Maven) | your `~/.m2` repository; run `mvn -o` |
+| Java (Gradle) | your Gradle cache (and add `gradle` to the image) |
+| C# | the target's NuGet packages into `NUGET_PACKAGES` (SharpFuzz is already cached) |
+| Rust | `cargo vendor` output + a `.cargo/config.toml` pointing at it |
+| Go | a vendored module tree or a populated `GOMODCACHE` |
+| Node/TS | the target's `node_modules` |
+
+With those staged, run with `--network none` to prove the run is truly offline:
+
+```sh
+docker run --rm --network none --shm-size=2g --cap-add=SYS_PTRACE \
+  -v "$PWD":/src:ro -v "$HOME/.m2":/home/fuzzer/.m2 -v bhf_work:/work \
+  bhf:local auto /src --work-dir /work/run --build-command "mvn -o -B clean compile"
+```
+
+## Using a compile_commands.json
+
+For C/C++, a `compile_commands.json` (clang compilation database) gives bhf the
+real translation-unit flags. bhf uses it automatically — you do **not** need
+`--probe-build` when you already have one:
+
+- Put it in the **project root** or a **`build/` subdirectory**. A symlink at
+  either location is followed. bhf discovers it and builds each harness with the
+  recorded flags.
+- `--probe-build` is only for *regenerating* a database by running the project's
+  own build; it writes to `<tree>/.bhf-build/compile_commands.json`. If you place
+  your own database there and regeneration then fails (e.g. offline), bhf now
+  **keeps and uses your database** instead of discarding it — but the simplest
+  path is to drop it in the project root and run without `--probe-build`.
 
 ## The 32-project sweep
 

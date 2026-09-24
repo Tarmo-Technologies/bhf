@@ -9,7 +9,9 @@
 #   2. runtime  : Ubuntu 24.04 carrying every one of the sixteen language
 #                 toolchains bhf can build/harness/fuzz, plus AFL++ and a Rust
 #                 nightly for the Rust sanitizer lane. Runs as a non-root user
-#                 under tini.
+#                 under tini. Air-gap ready: bhf's own instrumentation deps
+#                 (the JVM coverage agent's ASM jars, the C# SharpFuzz package)
+#                 are staged at build time so no lane reaches the network to fuzz.
 #
 # Fuzzing needs a few runtime privileges the image cannot grant itself; grant
 # them at `docker run` time (see docker/compose.yaml and docs/site/docker.md):
@@ -61,6 +63,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # --- Base utilities + the sixteen language toolchains -----------------------
 # C/C++ (clang/llvm/make) is mandatory; the rest install cleanly and a target
 # whose toolchain is absent simply skips, so this image covers every lane.
+# NB: the JDK is headless (no AWT/X11 -> no mesa/second-LLVM pull) and Gradle is
+# omitted (Maven + javac cover the Java lane; a Gradle project's build recovery
+# is the one lane feature traded for a much smaller image). See docs/site/docker.md.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         # base / runtime plumbing
         ca-certificates curl xz-utils file git tini locales \
@@ -68,8 +73,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         make clang llvm lld libclang-rt-18-dev \
         # Ada
         gnat gprbuild \
-        # Java  (JDK + Maven + Gradle build recovery)
-        default-jdk maven gradle \
+        # Java  (headless JDK + Maven; libasm-java provides asm-9.7 + asm-tree-9.7
+        # at /usr/share/java for the offline JVM coverage-agent build — see ASM_JAR_DIR)
+        default-jdk-headless maven libasm-java \
         # Python  (3.12 -> sys.monitoring coverage)
         python3 python3-dev python3-venv python3-pip \
         # Perl
@@ -99,24 +105,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN npm install -g --no-fund --no-audit esbuild@0.28.2 \
     && npm cache clean --force || true
 
-ENV RUSTUP_HOME=/usr/local/rustup \
-    CARGO_HOME=/usr/local/cargo \
-    DOTNET_CLI_TELEMETRY_OPTOUT=1 \
+ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 \
     DOTNET_NOLOGO=1 \
-    DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1 \
-    PATH=/usr/local/cargo/bin:/usr/local/dotnet-tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-
-# --- Rust nightly for the Rust sanitizer/coverage fuzzing lane -------------
-# bhf instruments target Rust code with -Zsanitizer + SanitizerCoverage, which
-# needs nightly plus rust-src and llvm-tools. The bhf binary itself is already
-# compiled in the builder stage; this toolchain is only for building targets.
-# NB: kept as the rolling `nightly` channel on purpose — bhf's Rust lane probes
-# the plain `cargo +nightly` (crates/cli/src/auto/rust_build.rs) with no dated
-# fallback, so a date-pinned toolchain alone would make it skip the lane.
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --profile minimal --default-toolchain nightly \
-    && rustup component add --toolchain nightly rust-src llvm-tools-preview \
-    && rustc +nightly --version
+    DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1
 
 # --- C# instrumentation CLI (SharpFuzz) into a shared tools path ------------
 RUN dotnet tool install --tool-path /usr/local/dotnet-tools --version 2.3.0 SharpFuzz.CommandLine \
@@ -128,8 +119,19 @@ COPY --from=builder /out/bhf-daemon     /usr/local/bin/bhf-daemon
 COPY --from=builder /out/libbhf_runtrace_shim.so /usr/local/lib/bhf/libbhf_runtrace_shim.so
 COPY --from=builder /out/libbhf_cc_intercept.so  /usr/local/lib/bhf/libbhf_cc_intercept.so
 
+# --- Air-gap: stage bhf's own instrumentation dependencies -----------------
+# Java: build-agent.sh needs asm + asm-tree to shade into the JVM coverage agent.
+# It fetches them from Maven Central unless ASM_JAR_DIR/BHF_JVM_CACHE has them.
+# The maven/JDK packages already ship /usr/share/java/asm-9.7.jar + asm-tree-9.7.jar,
+# so pointing bhf there makes the Java lane build its agent fully offline.
+ENV ASM_JAR_DIR=/usr/share/java
+
+# Runtime env: shim paths, per-user Rust toolchain, C# tools + NuGet cache.
 ENV BHF_RUNTRACE_SHIM=/usr/local/lib/bhf/libbhf_runtrace_shim.so \
-    BHF_CC_INTERCEPT=/usr/local/lib/bhf/libbhf_cc_intercept.so
+    BHF_CC_INTERCEPT=/usr/local/lib/bhf/libbhf_cc_intercept.so \
+    RUSTUP_HOME=/home/fuzzer/.rustup \
+    CARGO_HOME=/home/fuzzer/.cargo \
+    PATH=/home/fuzzer/.cargo/bin:/usr/local/dotnet-tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # Sanitizer defaults tuned for containerised fuzzing. bhf sets the AFL/ASan
 # keys it strictly needs per-invocation; these are safe process-wide defaults.
@@ -145,12 +147,9 @@ ENV ASAN_OPTIONS=abort_on_error=1:handle_abort=1:allocator_may_return_null=1 \
 ENV GOFLAGS=-mod=mod \
     GOTOOLCHAIN=local
 
-# --- Non-root user + writable caches ---------------------------------------
-# The Rust/dotnet lanes update their caches while building targets, so the
-# unprivileged fuzzer must own the shared toolchain caches (not world-writable).
+# --- Non-root user -----------------------------------------------------------
 RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin fuzzer \
-    && mkdir -p /work \
-    && chown -R fuzzer:fuzzer /work /usr/local/cargo /usr/local/rustup
+    && mkdir -p /work && chown fuzzer:fuzzer /work
 
 COPY --chown=root:root docker/entrypoint.sh /usr/local/bin/bhf-entrypoint
 COPY --chown=root:root docker/bhf-sweep.sh  /usr/local/bin/bhf-sweep
@@ -158,7 +157,32 @@ COPY --chown=root:root docker/fetch-corpus.sh /usr/local/bin/bhf-fetch-corpus
 COPY --chown=root:root docker/sweep-manifest.tsv /usr/local/share/bhf/sweep-manifest.tsv
 RUN chmod 0755 /usr/local/bin/bhf-entrypoint /usr/local/bin/bhf-sweep /usr/local/bin/bhf-fetch-corpus
 
+# Everything below runs AS the unprivileged fuzzer so the Rust toolchain and the
+# NuGet cache land in $HOME already owned by fuzzer — no `chown -R` over a large
+# tree, which would otherwise duplicate ~900 MB of toolchain into its own layer.
 USER fuzzer
+WORKDIR /home/fuzzer
+
+# Rust nightly for the sanitizer/coverage lane. Kept as the ROLLING `nightly`
+# channel on purpose — bhf's Rust lane probes the plain `cargo +nightly`
+# (crates/cli/src/auto/rust_build.rs) with no dated fallback. rust-src is NOT
+# added: bhf instruments via SanitizerCoverage flags, not -Zbuild-std.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal --default-toolchain nightly \
+    && rustup component add --toolchain nightly llvm-tools-preview \
+    && rustc +nightly --version
+
+# C# air-gap: prime the fuzzer's default NuGet cache with SharpFuzz 2.3.0 (bhf's
+# own instrumentation dependency) plus the SDK build packages a net8.0 harness
+# restore pulls, so a self-contained C# target builds offline. A target with its
+# OWN NuGet PackageReferences still needs those staged into NUGET_PACKAGES by the
+# operator (see docs/site/docker.md), exactly like a Maven target's ~/.m2.
+RUN set -eux; d="$(mktemp -d)"; cd "$d"; \
+    printf '%s' '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net8.0</TargetFramework><LangVersion>latest</LangVersion></PropertyGroup><ItemGroup><PackageReference Include="SharpFuzz" Version="2.3.0" /></ItemGroup></Project>' > warm.csproj; \
+    echo 'class P{static void Main(){}}' > Program.cs; \
+    dotnet build -c Release -v quiet >/dev/null 2>&1 || true; \
+    cd /; rm -rf "$d"
+
 WORKDIR /work
 ENV BHF_SWEEP_MANIFEST=/usr/local/share/bhf/sweep-manifest.tsv
 
