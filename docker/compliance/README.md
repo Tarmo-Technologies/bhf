@@ -1,48 +1,40 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
-# License compliance for the bhf container image
+# Compliance & supply-chain artifacts for the bhf image
 
-The image aggregates independent programs on one medium. **bhf is Apache-2.0**
-and runs the bundled toolchains as **subprocesses** (mere aggregation, GPLv2 §2 /
-GPLv3 §5) — it does not link their GPL code, so bhf is not placed under the GPL.
-The only obligation redistributing the image creates is **making the GPL/LGPL
-corresponding source available**. These files make that turnkey.
+bhf is distributed as **source** (Apache-2.0). The project publishes **no
+prebuilt images**, so it distributes no GPL/LGPL binaries and carries no
+corresponding-source offer — you build the image yourself, and Ubuntu is the
+distributor of the toolchain packages it pulls. These files exist so the built
+image is **self-documenting** for supply-chain review / ATO, and so that anyone
+who chooses to *redistribute* the built image can meet the duty they take on.
 
-## In the built image, at `/usr/share/bhf/licenses/`
+## Generated into the image at build
 
-| File | Purpose |
-|---|---|
-| `THIRD_PARTY_NOTICES.md` | Every installed package → version → source → declared license(s). Generated from the exact package set at build. |
-| `COPYLEFT-SOURCES.txt` | `source=version` for just the GPL/LGPL packages — the source-obligation list. |
-| `WRITTEN-OFFER.md` | The written offer for corresponding source. **Add your contact before distributing.** |
-| `fetch-sources.sh` | Downloads the matching Ubuntu source for every package in `COPYLEFT-SOURCES.txt`. |
+| Path (in image) | From | Purpose |
+|---|---|---|
+| `/usr/share/bhf/licenses/THIRD_PARTY_NOTICES.md` | `generate-notices.sh` | every OS package → version → source → license |
+| `/usr/share/bhf/licenses/COPYLEFT-SOURCES.txt` | `generate-notices.sh` | GPL/LGPL `source=version` list |
+| `/usr/share/bhf/licenses/WRITTEN-OFFER.md` | `WRITTEN-OFFER.md` | redistribution + corresponding-source notice |
+| `/usr/share/bhf/licenses/fetch-sources.sh` | `fetch-sources.sh` | downloads matching Ubuntu source for the copyleft list |
+| `/usr/share/bhf/sbom/os.cyclonedx.json` | `generate-sbom.sh` | CycloneDX SBOM of the OS package layer (EO 14028) |
+| `/usr/share/doc/<pkg>/copyright` | apt | authoritative full per-package license text (retained) |
 
-Per-package **full** license text is retained in the image at
-`/usr/share/doc/<package>/copyright` (not deleted by the build).
+All generators are **offline / deterministic** (dpkg only) so they reproduce on
+an air-gapped host. bhf's own software composition (its Rust crates, with CVE +
+OpenVEX) comes from `bhf sbom <source-tree>` separately.
 
-## Fulfilling the source offer
+## Scripts (run outside the image build)
 
-```sh
-# On an Ubuntu 24.04 host/container with network, as root:
-docker run --rm -v "$PWD/src":/out ubuntu:24.04 bash -c '
-  apt-get update && apt-get install -y --no-install-recommends ca-certificates
-  ' # (or just run fetch-sources.sh from the image)
+- `fetch-sources.sh [manifest] [dest]` — fulfils the copyleft corresponding-
+  source duty (only relevant if you redistribute the built image). Run as root
+  on an Ubuntu 24.04 host with network.
+- `generate-sbom.sh [out.json]` / `generate-notices.sh [outdir]` — regenerate the
+  SBOM / notices from any running image or host.
 
-# Simplest: run the baked-in script from the image itself
-docker run --rm --user 0 -v "$PWD/corresponding-source":/out bhf:local \
-  bash /usr/share/bhf/licenses/fetch-sources.sh /usr/share/bhf/licenses/COPYLEFT-SOURCES.txt /out
-```
+## See also
 
-`fetch-sources.sh` enables `deb-src` for the image's Ubuntu suites and runs
-`apt-get source` for each pinned package. Because the packages are **unmodified**
-Ubuntu 24.04 packages, that source *is* the corresponding source.
+- Licensing summary & when the offer applies: `../../docs/site/docker.md#licensing--redistribution`
+- ATO / RMF control crosswalk, vuln posture, minimal-image guidance: `../../docs/site/ato.md`
 
-## Notes
-
-- `afl++` is predominantly Apache-2.0 but its Debian package includes a GPL-3+
-  file (the gcc instrumentation pass) and MPL-2.0 files — so it appears in
-  `COPYLEFT-SOURCES.txt`, correctly.
-- The GPL compilers/tools (`gcc`, `gnat`→`gcc-13`, `gprbuild`, `gnucobol`,
-  `make`, `openjdk`) and LGPL libs (`glibc`, `libcob`) carry the offer; their
-  runtime exceptions (GCC RLE, Classpath) keep bhf's *outputs* unencumbered.
-- To shed the GPLv3/GPLv2 **compilers**, drop the Ada, COBOL, and Fortran `apt`
-  lanes from the `Dockerfile` (you keep clang for C/C++); `make`/`glibc` remain.
+`afl++` appears in `COPYLEFT-SOURCES.txt` correctly — its Debian package ships a
+GPL-3+ gcc-pass file and MPL-2.0 files, though its main body is Apache-2.0.

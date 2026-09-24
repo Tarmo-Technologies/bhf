@@ -31,3 +31,4 @@ crates/*/bhf_work/
 # Docker sweep transient data (fetched corpus + run outputs)
 /docker/corpus/
 /docker/results/
+/docker/sbom/

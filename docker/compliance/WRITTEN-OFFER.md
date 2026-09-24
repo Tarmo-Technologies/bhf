@@ -1,46 +1,36 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
-# Written offer for corresponding source (GPL / LGPL)
+# Redistribution & corresponding-source notice (GPL / LGPL)
 
-This container image is a **mere aggregation** of independent programs on a
-single distribution medium. **bhf** itself is licensed under **Apache-2.0** and
-invokes the bundled GNU/Ubuntu toolchain packages as separate subprocesses — it
-does not statically or dynamically link their GPL code into its own binaries.
-Aggregating separate programs does not place bhf under the GPL (GPLv2 §2,
-GPLv3 §5).
+**bhf is distributed as source** (Apache-2.0, this repository). The project does
+**not** publish prebuilt container images, so the project itself distributes no
+GPL/LGPL binaries and carries no corresponding-source offer. When you run
+`docker build`, the GPL/LGPL packages (gcc, glibc, make, gnat, gprbuild,
+gnucobol, openjdk, afl++'s gcc-pass file, …) are delivered to *you* by Ubuntu at
+build time — Ubuntu is their distributor, and its published source is their
+corresponding source.
 
-Some of the aggregated Ubuntu packages are licensed under the **GNU GPL** (v2 or
-v3) or **LGPL** — principally the compilers and build tools (`gcc`, `g++`,
-`gfortran`, `gnat`, `gprbuild`, `make`, `gnucobol`), the OpenJDK runtime
-(GPLv2 with the Classpath Exception), and the GNU C Library (LGPL). For **every**
-such package this image distributes in binary form, we make the following offer,
-valid for **at least three (3) years** from the date you received this image:
+This file, and the manifests beside it, exist so that **if you choose to
+redistribute the built image** (push it to a registry, ship a `docker save`
+tarball to another party), you can meet the obligation you take on as its
+distributor. Building the image for your own use, or on an air-gapped host you
+control, is not distribution and triggers nothing.
 
-> We will provide, to any third party, the complete **corresponding source code**
-> for the GPL- and LGPL-licensed packages in this image, under the terms of the
-> respective license (GPLv2 §3(b), GPLv3 §6, and the LGPL). Request it at the
-> contact below.
+## If you redistribute the built image
 
-## What and how
+You become the distributor of its GPL/LGPL binaries and must make the
+**corresponding source** available (GPLv2 §3, GPLv3 §6, LGPL). Easiest paths:
 
-- The exact copyleft packages and their versions are listed in
-  **`COPYLEFT-SOURCES.txt`** (generated at build; baked into the image at
-  `/usr/share/bhf/licenses/`).
-- These are **unmodified** Ubuntu 24.04 packages, so the corresponding source is
-  the source Ubuntu/Canonical publishes for those exact versions. The digest-
-  pinned base image makes the versions deterministic.
-- **`fetch-sources.sh`** retrieves that source automatically via `apt-get source`
-  on an Ubuntu 24.04 host — this is how the offer above is fulfilled.
-- The **full, per-package license text** for the entire userland is retained in
-  the image at `/usr/share/doc/<package>/copyright`, and a summary manifest of
-  all packages is in **`THIRD_PARTY_NOTICES.md`**.
+1. **Accompany** the image with source (GPLv3 §6(a) / GPLv2 §3(a)): run
+   `fetch-sources.sh` once and ship its output next to the image. No ongoing
+   offer to maintain.
+2. **Offer** source (GPLv2 §3(b), 3 years / GPLv3 §6(c)): include a written offer
+   naming *your* contact, and archive the `fetch-sources.sh` output so you can
+   serve the exact versions later.
 
-## Contact
+The exact packages + versions are in `COPYLEFT-SOURCES.txt`; `fetch-sources.sh`
+downloads their source; full per-package license text is at
+`/usr/share/doc/<package>/copyright`; a whole-image inventory is in
+`THIRD_PARTY_NOTICES.md` and the SBOMs under `/usr/share/bhf/sbom/`.
 
-To request the corresponding source under this offer, contact:
-
-> **Lane Crawford**, Tarmo Technologies — lcrawford@tarmotechnologies.com
-
-If you redistribute this image (push to a registry, ship to a customer) you become
-a distributor of these GPL/LGPL binaries and inherit this obligation; either keep
-this contact, substitute your own, or ship the output of `fetch-sources.sh`
-alongside the image.
+> Redistributor contact (fill in if you choose the "offer" path):
+> _______________________________________________

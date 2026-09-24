@@ -148,10 +148,14 @@ Apache-2.0 and runs the bundled toolchains as **subprocesses** — it does not l
 their GPL code, so aggregating them does not place bhf under the GPL (mere
 aggregation, GPLv2 §2 / GPLv3 §5). AFL++ is predominantly Apache-2.0.
 
-The one duty that redistributing the image creates is **making the GPL/LGPL
-corresponding source available** (the GNU compilers/tools, OpenJDK, glibc, and
-AFL++'s gcc-pass file). The image is built to make that turnkey — under
-`/usr/share/bhf/licenses/`:
+bhf is distributed as **source** and publishes **no prebuilt images**, so the
+project distributes no GPL/LGPL binaries and owes no corresponding-source offer —
+you build the image, and Ubuntu is the distributor of the packages it pulls.
+The duty only arises **if you choose to redistribute the built image** (push it
+to a registry, ship a `docker save` tarball): then you make the GPL/LGPL
+corresponding source available (the GNU compilers/tools, OpenJDK, glibc, AFL++'s
+gcc-pass file). The image is built to make that turnkey — under
+`/usr/share/bhf/licenses/` (and an SBOM under `/usr/share/bhf/sbom/`):
 
 | File | Purpose |
 |---|---|
@@ -172,6 +176,11 @@ docker run --rm --user 0 -v "$PWD/corresponding-source":/out bhf:local \
 To shed the GPLv3/GPLv2 **compilers**, drop the Ada, COBOL, and Fortran `apt`
 lanes from the `Dockerfile` (you keep clang for C/C++); `make`/`glibc` remain.
 See `docker/compliance/README.md`.
+
+**Deploying to accredited/classified environments?** See
+[ATO / RMF posture](./ato.md) — control crosswalk (800-53/800-190), the air-gap
+proof, the honest vulnerability posture (scan the OS layer + bhf, not the
+build-toolchain caches), and how to build a minimal least-functionality image.
 
 ## Troubleshooting
 

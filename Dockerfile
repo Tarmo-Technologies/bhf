@@ -120,6 +120,7 @@ RUN dotnet tool install --tool-path /usr/local/dotnet-tools --version 2.3.0 Shar
 # text stays in /usr/share/doc/*/copyright. See docs/site/docker.md#licensing.
 COPY docker/compliance/ /usr/local/share/bhf/compliance/
 RUN bash /usr/local/share/bhf/compliance/generate-notices.sh /usr/share/bhf/licenses \
+    && bash /usr/local/share/bhf/compliance/generate-sbom.sh /usr/share/bhf/sbom/os.cyclonedx.json \
     && install -m 0644 /usr/local/share/bhf/compliance/WRITTEN-OFFER.md /usr/share/bhf/licenses/ \
     && install -m 0644 /usr/local/share/bhf/compliance/README.md        /usr/share/bhf/licenses/ \
     && install -m 0755 /usr/local/share/bhf/compliance/fetch-sources.sh /usr/share/bhf/licenses/
