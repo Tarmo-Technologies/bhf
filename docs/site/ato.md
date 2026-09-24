@@ -47,28 +47,43 @@ Air-gapped target-dependency staging (your project's `.m2`, NuGet, `cargo vendor
 Go modules) is covered in [docker.md](./docker.md#air-gapped--offline-use); bhf's
 own instrumentation deps are already baked in.
 
-## Vulnerability posture (RA-5) — read this before scanning
+## Vulnerability posture (RA-5, SI-2)
 
-A naïve `grype bhf:local` reports large counts (order 2,000+, tens Critical/High).
-**Those live almost entirely in the build-toolchain caches** — the rust-nightly
-vendored crates, the global npm prefix, the .NET SDK — which are development
-inputs, not bhf's runtime execution path, and not the OS attack surface. Scanning
-the whole kitchen-sink image is misleading.
+The image is actively remediated, not just documented. Full-image `grype` totals:
 
-Scan the layers that matter:
+| | Total | Critical | High | Notes |
+|---|--:|--:|--:|---|
+| Before remediation | 2,247 | 44 | 516 | dominated by old Go toolchain (1,050) + npm |
+| **After remediation** | **~870** | **0** | **0 exploitable** | see below |
 
-- **OS package layer** (the ~716 Ubuntu packages) — the real base surface.
-  Baseline at build: **0 Critical, 0 High**, ~293 Medium/Low, none with a fix yet
-  released upstream (Ubuntu's ordinary advisory backlog, not missed patches):
-  ```sh
-  grype "sbom:/usr/share/bhf/sbom/os.cyclonedx.json" --distro ubuntu:24.04
-  ```
-- **bhf itself** — its Rust dependency tree, via `bhf sbom <source> --emit
-  vulnerabilities,openvex` (deterministic, offline, with VEX to record
-  non-exploitable findings).
+What was fixed, at the source (not suppressed):
 
-For the language-toolchain caches, prefer **VEX** ("not reachable — build-time
-only") over remediation, or remove the lane entirely (next section).
+- **Go toolchain** — Ubuntu's `golang-go` (1.22.2) dragged ~1,050 CVE-flagged
+  stdlib/vendored modules. Replaced with **upstream Go (pinned + sha256-verified)**,
+  which ships the fixes → those ~1,050 (incl. 546 Critical/High) go to **0**.
+- **npm** — its Debian dependency tree (`node-handlebars`, `node-postcss`, …)
+  carried the npm-layer CVEs. npm is build-only (the lane needs `node` + `esbuild`
+  at runtime), so it is **purged after esbuild is installed**, removing ~357
+  packages and all npm CVEs.
+- **Base + apt packages** — `apt-get dist-upgrade` pulls the latest
+  `-security/-updates` patches over the pinned base.
+- **Ruby default gems** — `erb`/`net-imap` updated so the interpreter loads the
+  patched versions.
+
+The residue is Ubuntu's ordinary **Medium/Low advisory backlog** (mostly *no fix
+released upstream* — not missed patches) plus a few Ruby **bundled default-gem**
+specs that cannot be swapped in place without breaking the interpreter. bhf does
+not invoke those gems, so they are **not in its execution path** — the correct
+RMF treatment is **VEX `not_affected` (vulnerable_code_not_in_execute_path)**,
+which bhf emits (`bhf sbom --emit openvex`), not remediation.
+
+Re-scan offline anytime:
+```sh
+grype "sbom:/usr/share/bhf/sbom/os.cyclonedx.json" --distro ubuntu:24.04   # OS layer
+bhf sbom <source-tree> --emit vulnerabilities,openvex                       # bhf + VEX
+```
+
+Shrink the surface further by removing lanes you don't deploy (next section).
 
 ## Minimal image for deployment (CM-7 least functionality)
 

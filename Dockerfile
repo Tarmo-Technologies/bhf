@@ -66,7 +66,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # NB: the JDK is headless (no AWT/X11 -> no mesa/second-LLVM pull) and Gradle is
 # omitted (Maven + javac cover the Java lane; a Gradle project's build recovery
 # is the one lane feature traded for a much smaller image). See docs/site/docker.md.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# `dist-upgrade` first pulls the latest -security/-updates patches over the pinned
+# base layer (CVE remediation, RA-5/SI-2). Go is installed from the upstream
+# tarball below, NOT `golang-go` — Ubuntu's Go lags and drags ~1000 CVE-flagged
+# stdlib/vendored modules; upstream Go ships the fixes.
+RUN apt-get update && apt-get -y dist-upgrade && apt-get install -y --no-install-recommends \
         # base / runtime plumbing
         ca-certificates curl xz-utils file git tini locales \
         # C / C++  (required build+fuzz lane)
@@ -80,13 +84,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-dev python3-venv python3-pip \
         # Perl
         perl \
-        # Go
-        golang-go \
         # Fortran
         gfortran \
         # COBOL  (GnuCOBOL cobc)
         gnucobol \
-        # JavaScript / TypeScript  (TS via esbuild, installed below)
+        # JavaScript / TypeScript  (node runtime; npm is build-only, purged below)
         nodejs npm \
         # Ruby
         ruby ruby-dev \
@@ -101,9 +103,37 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && locale-gen C.UTF-8 || true
 
-# TypeScript bundler used by the JS/TS lane (pinned for reproducibility).
-RUN npm install -g --no-fund --no-audit esbuild@0.28.2 \
-    && npm cache clean --force || true
+# Go from upstream (pinned + checksum-verified) — current stdlib, CVEs fixed.
+ARG GO_VERSION=1.27.1
+ARG GO_SHA256=63d339f0da5ab53635a56f2490a7984dfe12dfcff22ad749f63edaf590168445
+RUN curl --proto '=https' --tlsv1.2 -fsSLo /tmp/go.tgz \
+        "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" \
+    && echo "${GO_SHA256}  /tmp/go.tgz" | sha256sum -c - \
+    && tar -C /usr/local -xzf /tmp/go.tgz \
+    && rm -f /tmp/go.tgz \
+    && /usr/local/go/bin/go version
+
+# TypeScript bundler for the JS/TS lane (pinned). npm is BUILD-ONLY: install
+# esbuild into /usr/local (survives npm removal), then purge npm and its
+# now-orphaned node-* deps — which carry the only npm-layer CVEs (handlebars,
+# nanoid/postcss, …). bhf's JS/TS lane needs only `node` + `esbuild` at runtime.
+RUN npm install -g --prefix /usr/local --no-fund --no-audit esbuild@0.28.2 \
+    && npm cache clean --force 2>/dev/null || true; \
+    apt-get purge -y npm && apt-get autoremove -y --purge \
+    && rm -rf /var/lib/apt/lists/* /root/.npm \
+    && esbuild --version && node --version
+
+# Ruby ships default gems that carry advisories (erb, net-imap, zlib). Update them
+# so the interpreter loads the patched versions, and for `erb` (self-contained,
+# pure-Ruby, the only High) remove the superseded bundled copy so nothing — runtime
+# or scanner — sees the old version. bhf's Ruby lane fuzzes target code and does not
+# invoke these gems, so any residual is not in its execution path (see ato.md).
+RUN gem update --no-document erb net-imap zlib 2>/dev/null || true; \
+    rubylib="$(ruby -e 'puts RbConfig::CONFIG["rubylibdir"]')"; \
+    defdir="$(ruby -e 'require "rubygems"; puts Gem.default_specifications_dir')"; \
+    rm -f "$rubylib/erb.rb" "$defdir"/erb-*.gemspec; rm -rf "$rubylib/erb" /root/.local/share/gem /root/.gem; \
+    ruby -e 'require "erb"; require "json"; abort("erb not patched") unless ERB.version.to_s >= "6"' \
+    && echo "erb runtime $(ruby -e 'require "erb"; puts ERB.version')"
 
 ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 \
     DOTNET_NOLOGO=1 \
@@ -143,7 +173,7 @@ ENV BHF_RUNTRACE_SHIM=/usr/local/lib/bhf/libbhf_runtrace_shim.so \
     BHF_CC_INTERCEPT=/usr/local/lib/bhf/libbhf_cc_intercept.so \
     RUSTUP_HOME=/home/fuzzer/.rustup \
     CARGO_HOME=/home/fuzzer/.cargo \
-    PATH=/home/fuzzer/.cargo/bin:/usr/local/dotnet-tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    PATH=/home/fuzzer/.cargo/bin:/usr/local/go/bin:/usr/local/dotnet-tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # Sanitizer defaults tuned for containerised fuzzing. bhf sets the AFL/ASan
 # keys it strictly needs per-invocation; these are safe process-wide defaults.
