@@ -36,9 +36,11 @@ valid for **at least three (3) years** from the date you received this image:
 
 ## Contact
 
-> **FILL IN before distributing:** the name / email / URL at which you will honour
-> this source offer, e.g. `oss-compliance@your-org.example` or a source-mirror URL.
+To request the corresponding source under this offer, contact:
 
-If you distribute this image (push to a registry, ship to a customer), you become
-a distributor of these GPL/LGPL binaries and take on this obligation; replace the
-contact above with your own, or ship `fetch-sources.sh` output alongside the image.
+> **Lane Crawford**, Tarmo Technologies — lcrawford@tarmotechnologies.com
+
+If you redistribute this image (push to a registry, ship to a customer) you become
+a distributor of these GPL/LGPL binaries and inherit this obligation; either keep
+this contact, substitute your own, or ship the output of `fetch-sources.sh`
+alongside the image.
