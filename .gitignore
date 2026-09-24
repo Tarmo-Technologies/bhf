@@ -27,3 +27,7 @@ crates/*/bhf_work/
 # not consult .gitignore, so it still reports them as missing an SPDX header.
 # Delete the directory before running the license-audit gate.
 /.playwright-mcp/
+
+# Docker sweep transient data (fetched corpus + run outputs)
+/docker/corpus/
+/docker/results/

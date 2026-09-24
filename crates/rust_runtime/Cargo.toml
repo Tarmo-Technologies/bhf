@@ -6,13 +6,18 @@
 # ours, dependency-free, so a generated harness staticlib can path-depend on it
 # without dragging a third-party fuzzer into the licensable artifact.
 
+# NOTE: this crate is staged standalone into a temp dir at fuzz time (see
+# crates/cli/src/runtime_assets.rs) and a generated harness path-depends on it
+# with NO workspace root present. Its package fields must therefore be concrete,
+# not `*.workspace = true` — otherwise cargo fails with "failed to find a
+# workspace root" and the whole Rust fuzzing lane cannot build a harness.
 [package]
 name = "rust_runtime"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-repository.workspace = true
+version = "0.2.32"
+edition = "2021"
+rust-version = "1.83"
+license = "Apache-2.0"
+repository = "https://github.com/Tarmo-Technologies/bhf"
 
 [dependencies]
 

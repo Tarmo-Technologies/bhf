@@ -46,6 +46,24 @@ build context (`compile_commands.json`, CMake/Meson/Ninja/Visual Studio, or any
 impact-ordered finding handoff at `bhf_work/FINDINGS.md`, its CSV index beside it,
 and campaign/coverage reports under `bhf_work/auto/`.
 
+### Or run it in Docker
+
+A hardened image ships every one of the sixteen language toolchains, so you can build,
+harness, and fuzz any lane without installing them on the host. Build recovery runs the
+target's own build system — a container is the right place to sandbox that.
+
+```sh
+docker build -t bhf:local -f Dockerfile .
+docker run --rm --shm-size=2g --cap-add=SYS_PTRACE \
+  -v "$PWD":/src:ro -v bhf_work:/work \
+  bhf:local auto /src --work-dir /work/run --per-target-time 60
+```
+
+Fuzzing needs exactly two extra runtime grants — `--cap-add=SYS_PTRACE` (LeakSanitizer)
+and `--shm-size=2g` (coverage/cmplog shared memory); the container otherwise runs
+unprivileged. Full guide, `compose.yaml`, and the reproducible 32-project validation
+sweep: **[docs/site/docker.md](docs/site/docker.md)**.
+
 ### The recommended sweep
 
 For a real run on a tree you control, this is the command to start from. Each flag is

@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: Apache-2.0
+# Keep the build context small and reproducible. The builder needs the Rust
+# workspace and every *_runtime harness source tree (the CLI embeds them), but
+# nothing generated, vendored-for-dev, or environment-specific.
+
+.git
+.github
+target/
+dist/
+bhf_work/
+**/bhf_work/
+.venv/
+**/__pycache__/
+**/*.pyc
+
+# Heavy, non-build artifacts — benchmark corpora/results and validation dumps
+# are not needed to compile bhf or run the image.
+benchmarks/results/
+benchmarks/campaign-*/
+benchmarks/seeds/
+docs/site/
+docs/validation/
+docs/superpowers/
+.playwright-mcp/
+
+# Editor / IDE build outputs
+editors/vscode/node_modules/
+editors/vscode/out/
+ada_runtime/lib/
+ada_runtime/obj/
+
+# The docker artifacts themselves and local sweep corpora
+docker/corpus/
+docker/results/

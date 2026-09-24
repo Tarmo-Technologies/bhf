@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: Apache-2.0
+# Convenience compose for running bhf in a container with exactly the runtime
+# privileges fuzzing needs — and nothing more.
+#
+#   docker compose -f docker/compose.yaml build
+#   docker compose -f docker/compose.yaml run --rm bhf auto /src --work-dir /work/run
+#   docker compose -f docker/compose.yaml run --rm sweep            # 32-project sweep
+#
+# Why each privilege:
+#   shm_size            coverage bitmaps + cmplog shared memory (64m default is too small)
+#   cap_add SYS_PTRACE  LeakSanitizer / ASan stop-the-world at exit
+#   security_opt        keep the default seccomp profile; SYS_PTRACE is enough
+# The container still runs as the unprivileged `fuzzer` user with no other caps.
+
+services:
+  bhf:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: bhf:local
+    shm_size: "2gb"
+    cap_add:
+      - SYS_PTRACE
+    # Drop every capability except the one fuzzing genuinely needs.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - bhf_work:/work
+      # mount source to scan read-only, e.g.:
+      # - ./my-project:/src:ro
+    working_dir: /work
+    # default command prints help; override on the CLI:
+    #   docker compose ... run --rm bhf auto /src --work-dir /work/run --per-target-time 30
+
+  sweep:
+    extends:
+      service: bhf
+    # Fetch the pinned corpus (needs network) then run the full 32-project sweep.
+    command: ["bhf-sweep", "--fetch"]
+
+volumes:
+  bhf_work:

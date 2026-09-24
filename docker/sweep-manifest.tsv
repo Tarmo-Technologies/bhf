@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: Apache-2.0
+# BHF containerised sweep corpus — 2 small, real, pinned projects per language.
+# Columns (TAB-separated): lang  id  git_url  rev  subpath  extra_bhf_flags
+# subpath / extra may be "-" for none. This is the DEFAULT manifest; override
+# with BHF_SWEEP_MANIFEST. Revs are pinned full commit SHAs for reproducibility.
+#
+# Targets are small, single-purpose parsers/decoders (prime fuzz targets) with a
+# PUBLIC, auto-harnessable entry point. Each project has been verified to build,
+# harness, and fuzz inside the container (see docs/validation).
+ada	json-ada	https://github.com/onox/json-ada.git	4a04b2106245a140b7999f14f520b9dd96dd5d7c	json/src	-
+ada	ada-yaml	https://github.com/yaml/AdaYaml.git	7fde22a1a564bbece3e97430f469717ac46e5842	src	-
+c	cjson	https://github.com/DaveGamble/cJSON.git	6d9f2443ab071f86e5d9b43025a40929ec41c46c	-	-
+c	inih	https://github.com/benhoyt/inih.git	577ae2dee1f0d9c2d11c7f10375c1715f3d6940c	-	-
+cpp	pugixml	https://github.com/zeux/pugixml.git	27b68329de32cf9c601ca8eb6c588fd639960c40	src	-
+cpp	cpp-httplib	https://github.com/yhirose/cpp-httplib.git	4f3f9ef19be83ae97a5d9a059432dc00e445b7ab	-	-
+rust	json-rust	https://github.com/maciejhirsz/json-rust.git	0775592d339002ab148185264970c2a6e30b5d37	-	-
+rust	rust-csv	https://github.com/BurntSushi/rust-csv.git	05612e87e6e92910d40d7214b70952b8434fef9b	-	-
+java	json-java	https://github.com/stleary/JSON-java.git	b55c69e65034e0531f643ae5670d645b15a1f721	-	-
+java	minimal-json	https://github.com/ralfstx/minimal-json.git	c091e6985620da04d5abcd902aafb6c9583c48ea	-	-
+python	toml	https://github.com/uiri/toml.git	3f637dba5f68db63d4b30967fedda51c82459471	-	-
+python	html5lib	https://github.com/html5lib/html5lib-python.git	fd4f032bc090d44fb11a84b352dad7cbee0a4745	-	-
+perl	json-pp	https://github.com/makamaka/JSON-PP.git	a8a5624cbf63519ac923934dcdb7d5255a47df3f	-	-
+perl	uri	https://github.com/libwww-perl/URI.git	1f9410f4de59857bd7589ff83e84d0ad836208d1	-	-
+go	fastjson	https://github.com/valyala/fastjson.git	d652a1b1909d3520389b2c287ca3cf3aa3791451	-	-
+go	jsonparser	https://github.com/buger/jsonparser.git	36a686d11807c62cd5a30d41b294d66969ea25d8	-	-
+fortran	json-fortran	https://github.com/jacobwilliams/json-fortran.git	d9ed2e4ee53745f4ed98d7536e17bee5198aa3b0	-	-
+fortran	csv-fortran	https://github.com/jacobwilliams/csv-fortran.git	7c6c04a3df1c44083ba1a2a0a96d2c0ff18ebef2	-	-
+cobol	carddemo	https://github.com/aws-samples/aws-mainframe-modernization-carddemo.git	59cc6c2fd7ebd7ef7925cad552a01a4b8b6e4d5e	app/cbl	-
+cobol	cobolcraft	https://github.com/meyfa/CobolCraft.git	e8c420df7a901b51b10c70bc08b56af7310d00f2	src	-
+csharp	sprache	https://github.com/sprache/Sprache.git	340a9ab7147cf7fde8b624ca54f081c9c6c95bc2	-	-
+csharp	superpower	https://github.com/datalust/superpower.git	bac1b4b94b4f04729bf9ef2a7118e373b80a099c	-	-
+javascript	bytes	https://github.com/visionmedia/bytes.js.git	9ddc13b6c66e0cb293616fba246e05db4b6cef4d	-	-
+javascript	marked	https://github.com/markedjs/marked.git	ef0704c58459e927c805b92a5cc7d0c629e6fe43	-	-
+typescript	yaml	https://github.com/eemeli/yaml.git	528ef30d6ded4bd9f2c3521b670eb2b29d503c5c	-	-
+typescript	zod	https://github.com/colinhacks/zod.git	2bf7b0630d5378033e90bcee82cb32b0fe04628e	-	-
+ruby	csv	https://github.com/ruby/csv.git	9255c5e4f916e37de4004b7549dd5ae9354008c1	-	-
+ruby	parser	https://github.com/whitequark/parser.git	aeeacaad6621774b38454d084b1374b7112492e4	-	-
+lua	json-lua	https://github.com/rxi/json.lua.git	dbf4b2dd2eb7c23be2773c89eb059dadd6436f94	-	-
+lua	lunajson	https://github.com/grafi-tt/lunajson.git	e3a9666eb1275741e887e29926b144f8daee3bef	-	-
+php	php-parser	https://github.com/nikic/PHP-Parser.git	5d907dc3c30e379b9168436286e9a2c2f699a2dd	-	-
+php	symfony-yaml	https://github.com/symfony/yaml.git	1cc7613297afc4da151658cf88fecca3f3c83fb0	-	-
