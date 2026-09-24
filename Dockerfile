@@ -113,6 +113,17 @@ ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 \
 RUN dotnet tool install --tool-path /usr/local/dotnet-tools --version 2.3.0 SharpFuzz.CommandLine \
     && chmod -R a+rX /usr/local/dotnet-tools
 
+# --- License compliance: third-party notices + GPL/LGPL corresponding-source offer ---
+# The image aggregates (does not link) these programs; bhf stays Apache-2.0. The
+# only duty redistribution creates is source availability for the GPL/LGPL
+# packages — captured here from the exact installed set. Per-package full license
+# text stays in /usr/share/doc/*/copyright. See docs/site/docker.md#licensing.
+COPY docker/compliance/ /usr/local/share/bhf/compliance/
+RUN bash /usr/local/share/bhf/compliance/generate-notices.sh /usr/share/bhf/licenses \
+    && install -m 0644 /usr/local/share/bhf/compliance/WRITTEN-OFFER.md /usr/share/bhf/licenses/ \
+    && install -m 0644 /usr/local/share/bhf/compliance/README.md        /usr/share/bhf/licenses/ \
+    && install -m 0755 /usr/local/share/bhf/compliance/fetch-sources.sh /usr/share/bhf/licenses/
+
 # --- bhf binaries + Linux shims from the builder ---------------------------
 COPY --from=builder /out/bhf            /usr/local/bin/bhf
 COPY --from=builder /out/bhf-daemon     /usr/local/bin/bhf-daemon

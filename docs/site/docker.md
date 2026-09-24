@@ -141,6 +141,38 @@ a per-project work dir. Tune the budget with `BHF_PER_TARGET_TIME`,
 `BHF_LANGS="c cpp rust"`. The corpus manifest is
 `/usr/local/share/bhf/sweep-manifest.tsv`; override with `BHF_SWEEP_MANIFEST`.
 
+## Licensing & redistribution
+
+The image **aggregates independent programs** on one medium. bhf itself is
+Apache-2.0 and runs the bundled toolchains as **subprocesses** — it does not link
+their GPL code, so aggregating them does not place bhf under the GPL (mere
+aggregation, GPLv2 §2 / GPLv3 §5). AFL++ is predominantly Apache-2.0.
+
+The one duty that redistributing the image creates is **making the GPL/LGPL
+corresponding source available** (the GNU compilers/tools, OpenJDK, glibc, and
+AFL++'s gcc-pass file). The image is built to make that turnkey — under
+`/usr/share/bhf/licenses/`:
+
+| File | Purpose |
+|---|---|
+| `THIRD_PARTY_NOTICES.md` | every package → version → source → declared license(s) |
+| `COPYLEFT-SOURCES.txt` | `source=version` for just the GPL/LGPL packages |
+| `WRITTEN-OFFER.md` | the written offer — **add your contact before distributing** |
+| `fetch-sources.sh` | downloads the matching Ubuntu source for those packages |
+
+Full per-package license text is retained at `/usr/share/doc/<pkg>/copyright`.
+To fulfil the offer:
+
+```sh
+docker run --rm --user 0 -v "$PWD/corresponding-source":/out bhf:local \
+  bash /usr/share/bhf/licenses/fetch-sources.sh \
+       /usr/share/bhf/licenses/COPYLEFT-SOURCES.txt /out
+```
+
+To shed the GPLv3/GPLv2 **compilers**, drop the Ada, COBOL, and Fortran `apt`
+lanes from the `Dockerfile` (you keep clang for C/C++); `make`/`glibc` remain.
+See `docker/compliance/README.md`.
+
 ## Troubleshooting
 
 - **`LeakSanitizer has encountered a fatal error`** — add `--cap-add=SYS_PTRACE`,
