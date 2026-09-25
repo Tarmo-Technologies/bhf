@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod cdr;
+pub mod dispatch;
+pub mod encode;
 pub mod giop;
 pub mod idl_args;
 

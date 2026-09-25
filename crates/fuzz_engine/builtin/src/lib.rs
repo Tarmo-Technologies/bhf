@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+pub mod binframe;
 pub mod coverage;
 pub mod dictionary;
 pub mod engine_feedback;
@@ -11,6 +12,10 @@ pub mod scheduler;
 pub mod symbolic_seed;
 pub mod typed;
 
+pub use binframe::{
+    crc16_ccitt, crc32, frame_seed_corpus, BinFrameError, ChecksumKind, EncodedMessage, Endian,
+    Field, IntWidth, Message,
+};
 pub use coverage::{
     CoverageFeedback, CoverageInput, CoverageProxy, CoverageSignature, CoverageSnapshot,
 };

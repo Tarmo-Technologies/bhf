@@ -16,6 +16,9 @@
 use serde::Serialize;
 use tree_sitter::Node;
 
+pub mod adapter;
+pub use adapter::{protocol_graphs, ProtocolEdge, ProtocolStateGraph, StateId};
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StateMachine {
     pub kind: MachineKind,
