@@ -4,8 +4,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, rtos-radar-fuzzing]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -18,14 +19,29 @@ jobs:
   changes:
     uses: ./.github/workflows/classify-ci-scope.yml
 
+  ci-policy:
+    name: CI policy regression tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Test fail-closed CI policy and path classification
+        run: python3 -m unittest discover -s scripts/ci/tests -v
+
   minimum-rust:
     name: Rust 1.88 source compatibility
     needs: changes
     if: needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install minimum supported Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
@@ -39,9 +55,12 @@ jobs:
     needs: changes
     if: needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -68,13 +87,13 @@ jobs:
         run: python3 -m unittest discover -s docker -p 'test_*.py'
 
       - name: Build workspace
-        run: cargo build --workspace
+        run: cargo build --locked --workspace
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --locked --workspace --all-targets
 
       - name: Test workspace
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
       # `cargo build/test --workspace` compiles default features only, so every
       # `#[cfg(feature = ...)]` block is invisible to the steps above. That
@@ -91,36 +110,39 @@ jobs:
           # outside these profiles, by design.
           BHF_PROFILE: external-tools
         run: |
-          cargo build -p fuzz_engine_libafl_adapter --features libafl-engine
-          cargo test -p fuzz_engine_libafl_adapter --features libafl-engine
-          cargo test -p fuzz_engine_nyx_adapter --features nyx-engine
-          cargo test -p probe_gnat_actions --features enabled
+          cargo build --locked -p fuzz_engine_libafl_adapter --features libafl-engine
+          cargo test --locked -p fuzz_engine_libafl_adapter --features libafl-engine
+          cargo test --locked -p fuzz_engine_nyx_adapter --features nyx-engine
+          cargo test --locked -p probe_gnat_actions --features enabled
 
       - name: Validate confidence model
-        run: cargo test -p confidence_model -- --nocapture
+        run: cargo test --locked -p confidence_model -- --nocapture
 
       - name: Validate learned confidence CLI
-        run: cargo test -p bhf model -- --nocapture
+        run: cargo test --locked -p bhf model -- --nocapture
 
       - name: Validate daemon RPC trait
-        run: cargo test -p bhf-daemon -- --nocapture
+        run: cargo test --locked -p bhf-daemon -- --nocapture
 
       - name: Validate SARIF emitter
-        run: cargo test -p report sarif -- --nocapture
+        run: cargo test --locked -p report sarif -- --nocapture
 
       - name: Validate JUnit emitter
-        run: cargo test -p report junit -- --nocapture
+        run: cargo test --locked -p report junit -- --nocapture
 
   rhel7-build:
     name: RHEL 7 compatible build
     needs: changes
     if: needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 90
     env:
       RHEL7_BUILD_IMAGE: quay.io/pypa/manylinux2014_x86_64@sha256:0d25b049964b2549b83384036abdff06789a8c0b1e9ff003ec80f0d531f79e50
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Build and test on the RHEL 7 ABI
         run: |
@@ -156,6 +178,7 @@ jobs:
     name: ${{ matrix.name }} release compatibility
     needs: rhel7-build
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -169,6 +192,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Download EL7-baseline release binaries
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -217,6 +242,7 @@ jobs:
     name: Ubuntu ${{ matrix.version }} release compatibility
     needs: rhel7-build
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -230,6 +256,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Download EL7-baseline release binaries
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -270,11 +298,14 @@ jobs:
     needs: changes
     if: needs.changes.outputs.heavy == 'true'
     runs-on: windows-2022
+    timeout-minutes: 60
     env:
       BHF_RELEASE_VERSION: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -285,8 +316,11 @@ jobs:
         shell: pwsh
         run: |
           cargo test --locked -p bhf-daemon --lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked -p bhf --lib windows
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked -p bhf --lib vcxproj
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build Windows release artifacts
         run: cargo build --locked --release -p bhf -p bhf-daemon -p bhf_runtrace_shim --target x86_64-pc-windows-msvc
@@ -314,9 +348,12 @@ jobs:
     name: Windows Server 2025 release compatibility
     needs: windows-build
     runs-on: windows-2025
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Download Windows Server 2022 release binaries
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -331,3 +368,43 @@ jobs:
       - name: Exercise Windows Server 2022 binaries on Windows Server 2025
         shell: pwsh
         run: scripts/ci/windows-release-smoke.ps1 -BinaryDir target/platform-release/bin
+
+  ci-acceptance:
+    # Make this the required check in branch protection. It is intentionally
+    # not skipped when an upstream job fails or a documentation job is skipped.
+    name: CI acceptance
+    if: ${{ always() }}
+    needs:
+      - changes
+      - ci-policy
+      - minimum-rust
+      - build-test
+      - rhel7-build
+      - rhel-family-smoke
+      - ubuntu-release-smoke
+      - windows-build
+      - windows-current-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout exact evaluated revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Require complete successful CI or an explicit documentation exemption
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 scripts/ci/check-ci-acceptance.py \
+            --commit "$GITHUB_SHA" --event "$EVENT_NAME" \
+            --output ci-acceptance.json
+      - name: Preserve acceptance or failure receipt
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-acceptance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-acceptance.json
+          if-no-files-found: error
+          retention-days: 30

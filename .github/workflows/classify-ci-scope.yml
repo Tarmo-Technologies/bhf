@@ -16,6 +16,7 @@ jobs:
   classify:
     name: Classify CI scope
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     outputs:
       heavy: ${{ steps.classify.outputs.heavy }}
     steps:
@@ -23,6 +24,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Test path classifier
         shell: bash
@@ -44,6 +46,12 @@ jobs:
         run: |
           set -euo pipefail
 
+          if [[ "$EVENT_NAME" == workflow_dispatch ]]; then
+            echo "heavy=true" >> "$GITHUB_OUTPUT"
+            echo "Manual acceptance runs always execute full CI." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
           if [[ -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]] ||
             ! git cat-file -e "${BASE_SHA}^{commit}" ||
             ! git cat-file -e "${HEAD_SHA}^{commit}"; then
@@ -52,11 +60,20 @@ jobs:
             exit 0
           fi
 
+          # A process-substitution failure is not propagated by mapfile.
+          # Capture the diff first; never classify a partial path list.
+          paths_file="$(mktemp)"
+          trap 'rm -f "$paths_file"' EXIT
+          comparison="${BASE_SHA}..${HEAD_SHA}"
           if [[ "$EVENT_NAME" == pull_request ]]; then
-            mapfile -d '' changed_files < <(git diff --name-only --no-renames -z "${BASE_SHA}...${HEAD_SHA}")
-          else
-            mapfile -d '' changed_files < <(git diff --name-only --no-renames -z "${BASE_SHA}..${HEAD_SHA}")
+            comparison="${BASE_SHA}...${HEAD_SHA}"
           fi
+          if ! git diff --name-only --no-renames -z "$comparison" > "$paths_file"; then
+            echo "heavy=true" >> "$GITHUB_OUTPUT"
+            echo "Path comparison failed; running full CI." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          mapfile -d '' changed_files < "$paths_file"
 
           heavy="$(scripts/ci/should-run-heavy-ci.sh "${changed_files[@]}")"
           echo "heavy=$heavy" >> "$GITHUB_OUTPUT"
