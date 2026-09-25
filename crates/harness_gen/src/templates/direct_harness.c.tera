@@ -69,6 +69,42 @@
 #define BHF_KEEP_RESULT(value) ((void)(value))
 #endif
 
+{#- HDF-5 environment/peripheral model: a fuzz-fed source of successive values,
+    plus the synthesized register/queue read accessors, emitted BEFORE the param
+    support blocks so a fuzz-driven callback trampoline can reference the source. #}
+{%- if environment %}
+/* HDF-5 environment/peripheral model: a fuzz-fed source of successive peripheral
+ * values. Each synthesized register/queue read draws the next 32-bit value from
+ * the fuzz input and advances a cursor, so a driver/ISR that polls a register or
+ * drains a queue N times sees a fuzz-controlled SEQUENCE across one input (not a
+ * single constant) — a value-gated branch on the Nth read is reachable. Zero is
+ * returned past end-of-input (a short input reads as zeros, never OOB). */
+static const uint8_t *_bhf_env_data = 0;
+static size_t _bhf_env_size = 0;
+static size_t _bhf_env_index = 0;
+static uint32_t _bhf_env_next_u32(void) {
+    uint32_t _v = 0;
+    int _i;
+    for (_i = 0; _i < 4; ++_i) {
+        if (_bhf_env_index < _bhf_env_size) {
+            _v |= (uint32_t)_bhf_env_data[_bhf_env_index++] << (_i * 8);
+        }
+    }
+    return _v;
+}
+{#- The read accessors have EXTERNAL linkage: the target that calls them is
+    frequently a separate translation unit (the BSP primitive is undefined at
+    harness-build time), so it must link against these definitions. #}
+{%- for r in environment.peripheral_readers %}
+{{ r.return_type }} {{ r.name }}({% if r.params %}{% for p in r.params %}{{ p.c_type }} {{ p.name }}{% if not loop.last %}, {% endif %}{% endfor %}{% else %}void{% endif %}) {
+{%- for p in r.params %}
+    (void){{ p.name }};
+{%- endfor %}
+    return ({{ r.return_type }})_bhf_env_next_u32();
+}
+{%- endfor %}
+{%- endif %}
+
 {#- support blocks (callback typedefs + trampolines) must precede the
     forward declaration that references the typedef names #}
 {%- if not passthrough_libfuzzer_entrypoint %}
@@ -644,6 +680,12 @@ int main(int argc, char **argv) {
 int bhf_run_one(const uint8_t *Data, size_t Size) {
     BHF_PUBLISH_INPUT(Data, Size);
     bhf_cursor Cur = bhf_open(Data, Size);
+{%- if environment %}
+    /* Arm the HDF-5 fuzz-fed environment source for this iteration's reads. */
+    _bhf_env_data = Data;
+    _bhf_env_size = Size;
+    _bhf_env_index = 0;
+{%- endif %}
 {%- for p in params %}
     {{ p.decl }};
 {%- endfor %}

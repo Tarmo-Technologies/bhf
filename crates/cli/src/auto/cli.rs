@@ -2481,8 +2481,13 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
             let non_attacker_reachable = match result.candidate.input_reachability? {
                 target_rank::InputReachability::ReachabilityUnproven
                 | target_rank::InputReachability::OutputSerializer => true,
+                // A registered entry point / channel consumer IS input-reachable
+                // (via the registration or channel), like the IPC channel case, so
+                // it must NOT be demoted to lab-only as "non-attacker-reachable".
                 target_rank::InputReachability::AttackerReachable
-                | target_rank::InputReachability::IpcChannelReachable => false,
+                | target_rank::InputReachability::IpcChannelReachable
+                | target_rank::InputReachability::RegisteredEntryPoint
+                | target_rank::InputReachability::ChannelConsumer => false,
             };
             let basename = result
                 .candidate
@@ -3967,6 +3972,9 @@ fn write_ranked_targets(
             // Dynamic (post-run) — never set at discovery, so --list-targets
             // (a no-build listing) won't show it, but the match must be exhaustive.
             Some(InputReachability::IpcChannelReachable) => "ipc-channel",
+            // HDF-5 rank-time provenance: shown in the no-build listing.
+            Some(InputReachability::RegisteredEntryPoint) => "registered-entry",
+            Some(InputReachability::ChannelConsumer) => "channel-consumer",
             None => "-",
         };
         let rel = c.source_path.strip_prefix(root).unwrap_or(&c.source_path);

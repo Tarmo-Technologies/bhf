@@ -475,6 +475,7 @@ pub fn build_cobol_harness(
     // sources, cob-config cflags let the driver see libcob headers.
     let gen_result = harness_gen::c_generate::generate_c_direct_harness(
         harness_gen::c_generate::GenerateCDirectArgs {
+            environment: None,
             harness_id: harness_id.to_owned(),
             output_dir: hdir.clone(),
             source_path: candidate.source_path.clone(),

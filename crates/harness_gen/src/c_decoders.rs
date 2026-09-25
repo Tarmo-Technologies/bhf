@@ -513,6 +513,7 @@ fn build_callback_trampoline(
     c_type: &str,
     name: &str,
     signature: &str,
+    fuzz_driven: bool,
 ) -> Result<(String, String), CDecoderError> {
     // An inline (anonymous) function-pointer — `void handle(int (*cb)(int, int))`
     // — carries its signature in `c_type` itself (`int (*)(int, int)`) with no
@@ -601,7 +602,22 @@ fn build_callback_trampoline(
             body.push_str(&format!("    free((void *){address});\n"));
         }
     } else if parsed.return_type.trim() != "void" {
-        body.push_str("    return 0;\n");
+        // HDF-5 deliverable 3: when the interesting logic is in a REGISTERED
+        // callback, drive it from fuzz input rather than nulling it — the
+        // trampoline's return value (which steers the caller's parse/dispatch
+        // loop: continue / stop / error) is drawn from the fuzz-fed environment
+        // source instead of a constant `0`. A pointer return stays NULL (a
+        // fuzz-fabricated pointer would be an invalid deref, not a real path).
+        // Requires the environment source to be present in the harness (the
+        // caller sets `fuzz_driven` only when it is).
+        if fuzz_driven && !pointer_return {
+            body.push_str(&format!(
+                "    return ({})_bhf_env_next_u32();\n",
+                parsed.return_type.trim()
+            ));
+        } else {
+            body.push_str("    return 0;\n");
+        }
     }
     // The generated main.c forward-declares the target instead of including
     // project headers, so the typedef behind the callback must be re-declared
@@ -634,12 +650,27 @@ fn build_callback_trampoline(
     Ok((support, trampoline))
 }
 
+/// HDF-5 deliverable 3: build a callback trampoline whose BODY is driven from the
+/// fuzz input instead of a no-op — its return value (the parse/dispatch decision
+/// the caller loops on) is drawn from the harness's fuzz-fed environment source
+/// (`_bhf_env_next_u32`, emitted when the environment model is present). Returns
+/// `(support_code, trampoline_name)` like [`build_callback_trampoline`]. The
+/// caller must ensure the environment source is emitted in the harness (i.e. the
+/// direct harness was generated with a `CEnvironmentModel`).
+pub fn fuzz_driven_callback_trampoline(
+    c_type: &str,
+    name: &str,
+    signature: &str,
+) -> Result<(String, String), CDecoderError> {
+    build_callback_trampoline(c_type, name, signature, true)
+}
+
 fn callback_trampoline(
     c_type: &str,
     name: &str,
     signature: &str,
 ) -> Result<CParamEmission, CDecoderError> {
-    let (support, trampoline) = build_callback_trampoline(c_type, name, signature)?;
+    let (support, trampoline) = build_callback_trampoline(c_type, name, signature, false)?;
     // An inline funcptr param uses the synthesized `_bhf_cb_<name>` typedef as its
     // type (matching the one `build_callback_trampoline` declared); a typedef'd
     // callback uses its existing type.
@@ -1678,7 +1709,8 @@ fn emit_lvalue_decode(
         // unresolvable signature can't be synthesised, so it stays zeroed.
         TypeShape::FuncPtr => match ctx.registry.function_pointer_signature(c_type) {
             Some(signature) => {
-                let (support, trampoline) = build_callback_trampoline(c_type, lvalue, &signature)?;
+                let (support, trampoline) =
+                    build_callback_trampoline(c_type, lvalue, &signature, false)?;
                 ctx.support.push(support);
                 ctx.push(format!("{lvalue} = {trampoline}"));
                 Ok(())
@@ -1776,7 +1808,7 @@ fn emit_array_decode(
         TypeShape::FuncPtr => {
             if let Some(signature) = ctx.registry.function_pointer_signature(elem_c_type) {
                 if let Ok((support, trampoline)) =
-                    build_callback_trampoline(elem_c_type, lvalue, &signature)
+                    build_callback_trampoline(elem_c_type, lvalue, &signature, false)
                 {
                     ctx.support.push(support);
                     ctx.push(format!(
@@ -4250,6 +4282,53 @@ mod tests {
             !support.contains("_bhf_arg4") && !support.to_lowercase().contains("lineno"),
             "must not invent a 5th parameter, got: {support}"
         );
+    }
+
+    /// HDF-5 deliverable 3: a fuzz-driven trampoline for a callback-driven parser
+    /// runs the callback body FROM the fuzz input — its return value (the parser's
+    /// continue/stop/error decision) is drawn from the fuzz-fed environment source,
+    /// not the no-op constant `0`. The default (no-op) path is unchanged, so the
+    /// two must differ exactly at the return.
+    #[test]
+    fn fuzz_driven_trampoline_returns_a_fuzz_controlled_decision_not_a_noop() {
+        // A SAX-style element callback the parser loops on: returning nonzero stops
+        // or errors the parse, so driving the return from fuzz explores both paths.
+        let sig = "int (*)(void *ctx, const char *tok, int len)";
+
+        let (noop, _) = build_callback_trampoline(sig, "on_token", sig, false).unwrap();
+        assert!(
+            noop.contains("return 0;"),
+            "the default trampoline must stay a no-op return: {noop}"
+        );
+        assert!(
+            !noop.contains("_bhf_env_next_u32"),
+            "the default trampoline must not draw from fuzz: {noop}"
+        );
+
+        let (driven, name) = fuzz_driven_callback_trampoline(sig, "on_token", sig).unwrap();
+        assert!(
+            driven.contains("return (int)_bhf_env_next_u32();"),
+            "the fuzz-driven trampoline must return a fuzz-controlled decision: {driven}"
+        );
+        assert!(
+            !driven.contains("return 0;"),
+            "the fuzz-driven trampoline must not fall back to the no-op return: {driven}"
+        );
+        // Its arguments are still bound (the callback body observes them) and the
+        // trampoline keeps its stable name.
+        assert_eq!(name, "_bhf_on_token_trampoline");
+        assert!(driven.contains("(void)ctx;") && driven.contains("(void)tok;"));
+    }
+
+    /// A pointer-returning callback stays NULL even when fuzz-driven — a
+    /// fuzz-fabricated pointer would be an invalid deref (a harness artifact), not
+    /// a real code path.
+    #[test]
+    fn fuzz_driven_pointer_returning_trampoline_stays_null() {
+        let sig = "void *(*)(void *pool, unsigned n)";
+        let (driven, _) = fuzz_driven_callback_trampoline(sig, "alloc_cb", sig).unwrap();
+        assert!(driven.contains("return 0;"), "{driven}");
+        assert!(!driven.contains("_bhf_env_next_u32"), "{driven}");
     }
 
     #[test]

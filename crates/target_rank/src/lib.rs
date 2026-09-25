@@ -14,8 +14,9 @@ pub mod rust_rank;
 pub mod score;
 
 pub use c_rank::{
-    classify_input_reachability, cpp_target_name, rank_c_targets, rank_cpp_targets,
-    CScoreBreakdown, CTarget, InputReachability,
+    classify_input_reachability, cpp_target_name, detect_entry_point_provenance, rank_c_targets,
+    rank_c_targets_with_provenance, rank_cpp_targets, CScoreBreakdown, CTarget,
+    EntryPointProvenance, InputReachability,
 };
 pub use go_rank::{rank_go_targets, GoScoreBreakdown, GoTarget};
 pub use java_rank::{

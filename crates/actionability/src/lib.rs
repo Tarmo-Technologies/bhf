@@ -749,6 +749,11 @@ fn attacker_reachable_signal(raw: &Value) -> Option<bool> {
         // trust boundary, so we don't assert Some(true) either. None lets the
         // verdict land on likely_reachable (a real, input-driven failure).
         "ipc_channel_reachable" => None,
+        // HDF-5 rank-time provenance — a registered ISR/task entry, or a
+        // message-queue/pub-sub/MMIO consumer. Same treatment as the IPC channel:
+        // input-reachable via the registration/channel, but attacker-control is
+        // trust-boundary-dependent, so neither downgrade nor assert.
+        "registered_entry_point" | "channel_consumer" => None,
         _ => None,
     }
 }
