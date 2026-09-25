@@ -168,62 +168,24 @@ jobs:
               scripts/check-linux-release-abi.sh "$release_dir"
             '
           echo "dist ran successfully"
-      - name: Build and exercise all-in-one Linux installer bundle
+      - id: linux-release-dir
+        name: Locate raw Linux release binaries for protected signing job
         if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
           release_dir=target/x86_64-unknown-linux-gnu/dist
           [[ -d "$release_dir" ]] || release_dir=target/dist
-          version="${RELEASE_TAG:-$(git describe --tags --always)}"
-          safe_version="$(printf '%s' "$version" | sed -E 's/[^A-Za-z0-9._-]+/-/g; s/^-+//; s/-+$//')"
-          bundle_name="bhf-dist-${safe_version}-x86_64-unknown-linux-gnu"
-
-          scripts/package-offline-dist.sh \
-            --artifact-dir "$release_dir" \
-            --out target/distrib \
-            --version "$version" \
-            --target-triple x86_64-unknown-linux-gnu
-
-          archive="target/distrib/${bundle_name}.tar.gz"
-          sidecar="${archive}.sha256"
-          test -f "$archive"
-          test -f "$sidecar"
-          (cd target/distrib && sha256sum -c "${bundle_name}.tar.gz.sha256")
-
-          verify_root="$(mktemp -d)"
-          install_root="$(mktemp -d)"
-          tar -xzf "$archive" -C "$verify_root"
-          bundle_root="$verify_root/$bundle_name"
-          # #106: the full distribution archive is mandatory for every release and
-          # MUST ship install.sh + these documents at its root. `set -euo pipefail`
-          # makes a missing file fail the job, blocking the release.
-          test -x "$bundle_root/install.sh"
-          for document in INSTALL.md LICENSE README.md RELEASE_NOTES.md; do
-            test -f "$bundle_root/$document"
-          done
-          test -x "$bundle_root/tool/bhf"
-          test -x "$bundle_root/tool/bhf-daemon"
-          test -x "$bundle_root/tool/bhf-bug-report"
-          test -f "$bundle_root/tool/libbhf_runtrace_shim.so"
-          test -f "$bundle_root/tool/libbhf_cc_intercept.so"
-
-          "$bundle_root/install.sh" \
-            --non-interactive \
-            --prefix "$install_root/prefix" \
-            --bin-dir "$install_root/bin" \
-            --languages c \
-            --targets native \
-            --fuzzers builtin \
-            --extras none \
-            --no-system-packages \
-            --no-rustup \
-            --no-content \
-            --no-symlink
-          "$install_root/prefix/bhf" --version
-          test -x "$install_root/prefix/bhf-bug-report"
-          test -f "$install_root/prefix/libbhf_runtrace_shim.so"
-          test -f "$install_root/prefix/libbhf_cc_intercept.so"
+          test -x "$release_dir/bhf"
+          test -x "$release_dir/bhf-daemon"
+          echo "path=$release_dir" >> "$GITHUB_OUTPUT"
+      - name: Transfer raw Linux binaries to protected signing job
+        if: runner.os == 'Linux' && needs.plan.outputs.publishing == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux-release-raw
+          path: ${{ steps.linux-release-dir.outputs.path }}/
+          if-no-files-found: error
       - name: Build Windows artifacts
         if: runner.os == 'Windows'
         shell: bash
@@ -313,11 +275,6 @@ jobs:
           # Parse out what we just built and upload it to scratch storage
           echo "paths<<EOF" >> "$GITHUB_OUTPUT"
           dist print-upload-files-from-manifest --manifest dist-manifest.json >> "$GITHUB_OUTPUT"
-          if [[ "$RUNNER_OS" == Linux ]]; then
-            printf '%s\n' \
-              target/distrib/bhf-dist-*.tar.gz \
-              target/distrib/bhf-dist-*.tar.gz.sha256 >> "$GITHUB_OUTPUT"
-          fi
           echo "EOF" >> "$GITHUB_OUTPUT"
 
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
@@ -329,11 +286,117 @@ jobs:
             ${{ steps.cargo-dist.outputs.paths }}
             ${{ env.BUILD_MANIFEST_NAME }}
 
+  # Only tagged releases can enter the protected signing environment. PR jobs
+  # still build their ordinary unsigned platform artifacts without secret access.
+  sign-linux-bundle:
+    needs:
+      - plan
+      - build-local-artifacts
+    if: ${{ needs.plan.outputs.publishing == 'true' && needs.build-local-artifacts.result == 'success' }}
+    runs-on: ubuntu-22.04
+    environment: production-release
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download raw Linux release binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: linux-release-raw
+          path: target/release-raw
+      - name: Sign, verify, and exercise the complete Linux bundle
+        shell: bash
+        env:
+          BHF_RELEASE_SIGNING_KEY_PKCS8_B64: ${{ secrets.BHF_RELEASE_SIGNING_KEY_PKCS8_B64 }}
+          BHF_RELEASE_KEY_ID: ${{ vars.BHF_RELEASE_KEY_ID }}
+          BHF_RELEASE_PUBLIC_KEY_HEX: ${{ vars.BHF_RELEASE_PUBLIC_KEY_HEX }}
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          [[ -n "$BHF_RELEASE_SIGNING_KEY_PKCS8_B64" ]] || { echo 'missing protected release signing key' >&2; exit 1; }
+          [[ "$BHF_RELEASE_KEY_ID" =~ ^[A-Za-z0-9._-]+$ ]] || { echo 'missing or malformed release key ID' >&2; exit 1; }
+          [[ "$BHF_RELEASE_PUBLIC_KEY_HEX" =~ ^[0-9a-f]{64}$ ]] || { echo 'missing or malformed release public key' >&2; exit 1; }
+          signing_dir="$(mktemp -d "$RUNNER_TEMP/bhf-release-signing.XXXXXX")"
+          trap 'rm -f -- "$signing_dir/private.der" "$signing_dir/public.hex" "$signing_dir/policy.json"; rmdir -- "$signing_dir"' EXIT
+          umask 077
+          printf '%s' "$BHF_RELEASE_SIGNING_KEY_PKCS8_B64" | base64 --decode > "$signing_dir/private.der"
+          test -s "$signing_dir/private.der"
+          printf '%s\n' "$BHF_RELEASE_PUBLIC_KEY_HEX" > "$signing_dir/public.hex"
+          printf '{"schema_version":"bhf.policy.v1","policy_id":"release-smoke","update_packs":{"require_signature":true,"trusted_public_keys":{"%s":"%s"}}}\n' \
+            "$BHF_RELEASE_KEY_ID" "$BHF_RELEASE_PUBLIC_KEY_HEX" > "$signing_dir/policy.json"
+
+          chmod +x target/release-raw/bhf target/release-raw/bhf-daemon
+          version="$RELEASE_TAG"
+          safe_version="$(printf '%s' "$version" | sed -E 's/[^A-Za-z0-9._-]+/-/g; s/^-+//; s/-+$//')"
+          bundle_name="bhf-dist-${safe_version}-x86_64-unknown-linux-gnu"
+          scripts/package-offline-dist.sh \
+            --artifact-dir target/release-raw \
+            --out target/distrib \
+            --version "$version" \
+            --target-triple x86_64-unknown-linux-gnu \
+            --signing-key "$signing_dir/private.der" \
+            --key-id "$BHF_RELEASE_KEY_ID" \
+            --trusted-public-key "$signing_dir/public.hex"
+
+          archive="target/distrib/${bundle_name}.tar.gz"
+          signature="${archive}.sig"
+          test -s "$archive"
+          test "$(wc -c < "$signature")" -eq 64
+          (cd target/distrib && sha256sum -c "${bundle_name}.tar.gz.sha256")
+          (cd target/distrib && sha256sum -c "${bundle_name}.tar.gz.sig.sha256")
+          bash scripts/verify-offline-dist.sh --archive "$archive" \
+            --signature "$signature" --trusted-public-key "$signing_dir/public.hex"
+
+          verify_root="$(mktemp -d)"
+          install_root="$(mktemp -d)"
+          tar -xzf "$archive" -C "$verify_root"
+          bundle_root="$verify_root/$bundle_name"
+          test -x "$bundle_root/install.sh"
+          for document in INSTALL.md LICENSE README.md RELEASE_NOTES.md; do
+            test -f "$bundle_root/$document"
+          done
+          test -x "$bundle_root/tool/bhf"
+          test -x "$bundle_root/tool/bhf-daemon"
+          test -x "$bundle_root/tool/bhf-bug-report"
+          test -f "$bundle_root/tool/libbhf_runtrace_shim.so"
+          test -f "$bundle_root/tool/libbhf_cc_intercept.so"
+          "$bundle_root/install.sh" \
+            --non-interactive \
+            --trust-policy "$signing_dir/policy.json" \
+            --prefix "$install_root/prefix" \
+            --bin-dir "$install_root/bin" \
+            --languages c \
+            --targets native \
+            --fuzzers builtin \
+            --extras none \
+            --no-system-packages \
+            --no-rustup \
+            --no-symlink
+          "$install_root/prefix/bhf" --version
+          test -x "$install_root/prefix/bhf-bug-report"
+          test -f "$install_root/prefix/libbhf_runtrace_shim.so"
+          test -f "$install_root/prefix/libbhf_cc_intercept.so"
+          test -f "$install_root/prefix/packs/bhf-content-${safe_version}/install.json"
+      - name: Upload authenticated Linux bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: artifacts-signed-linux-bundle
+          path: |
+            target/distrib/bhf-dist-*.tar.gz
+            target/distrib/bhf-dist-*.tar.gz.sha256
+            target/distrib/bhf-dist-*.tar.gz.sig
+            target/distrib/bhf-dist-*.tar.gz.sig.sha256
+          if-no-files-found: error
+
   # Build and package all the platform-agnostic(ish) things
   build-global-artifacts:
     needs:
       - plan
       - build-local-artifacts
+      - sign-linux-bundle
+    if: ${{ always() && needs.plan.result == 'success' && needs.build-local-artifacts.result == 'success' && (needs.plan.outputs.publishing != 'true' || needs.sign-linux-bundle.result == 'success') }}
     runs-on: "ubuntu-22.04"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -391,7 +454,7 @@ jobs:
             target/distrib/bhf-daemon-installer.ps1
           echo "dist ran successfully"
 
-          for sidecar in target/distrib/bhf-dist-*.tar.gz.sha256; do
+          for sidecar in target/distrib/bhf-dist-*.tar.gz.sha256 target/distrib/bhf-dist-*.tar.gz.sig.sha256; do
             [[ -f "$sidecar" ]] || continue
             cat "$sidecar" >> target/distrib/sha256.sum
           done
@@ -415,9 +478,10 @@ jobs:
     needs:
       - plan
       - build-local-artifacts
+      - sign-linux-bundle
       - build-global-artifacts
     # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
-    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && needs.sign-linux-bundle.result == 'success' && needs.build-global-artifacts.result == 'success' && needs.build-local-artifacts.result == 'success' }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     runs-on: "ubuntu-22.04"

@@ -11,6 +11,8 @@ NO_SYSTEM_PACKAGES=0
 PACKAGE_MANAGER="auto"
 NO_RUSTUP=0
 NO_CONTENT=0
+TRUST_POLICY=""
+ALLOW_LEGACY_INTEGRITY_ONLY=0
 NO_SYMLINK=0
 NO_SMOKE=0
 INSTALL_SEEDS=0
@@ -53,10 +55,13 @@ Options:
   --no-system-packages    Skip system package installation
   --no-apt                Compatibility alias for --no-system-packages
   --no-rustup             Skip rustup installation and nightly toolchain setup
-  --no-content            Skip signed content pack verify/install
+  --trust-policy FILE     Operator-supplied external policy with trusted public keys;
+                          required for authenticated content installation
+  --allow-legacy-integrity-only  Explicitly allow unauthenticated checksum-only packs
+  --no-content            Skip content pack verify/install entirely
   --no-symlink            Do not create bhf symlinks in --bin-dir
-  --no-smoke              Skip the post-install bhf auto smoke test
-  --smoke-work-dir DIR    Work directory for the post-install smoke test
+  --no-smoke              Skip the pre-activation bhf auto smoke test
+  --smoke-work-dir DIR    Work directory for the pre-activation smoke test
   --dry-run               Print commands without executing them
   -h, --help              Show this help
 EOF
@@ -113,6 +118,18 @@ run_with_optional_prefix() {
   else
     run "$@"
   fi
+}
+
+capture_with_optional_prefix() {
+  local prefix=$1
+  shift
+  local -a command=("$@")
+  if [[ -n "$prefix" ]]; then
+    command=("$prefix" "$@")
+  fi
+  printf '+ ' >&2
+  quote_cmd "${command[@]}" >&2
+  "${command[@]}"
 }
 
 path_writable_for_create() {
@@ -552,6 +569,15 @@ while [[ $# -gt 0 ]]; do
       NO_CONTENT=1
       shift
       ;;
+    --trust-policy)
+      [[ $# -ge 2 ]] || die "--trust-policy requires a file"
+      TRUST_POLICY="$2"
+      shift 2
+      ;;
+    --allow-legacy-integrity-only)
+      ALLOW_LEGACY_INTEGRITY_ONLY=1
+      shift
+      ;;
     --no-symlink)
       NO_SYMLINK=1
       shift
@@ -585,8 +611,61 @@ TOOL_DIR="$BUNDLE_ROOT/tool"
 CONTENT_ROOT="$BUNDLE_ROOT/content"
 PACK_ROOT="$CONTENT_ROOT/packs/current"
 PACK_MANIFEST="$PACK_ROOT/update-pack.json"
-POLICY_FILE="$CONTENT_ROOT/bhf-policy.json"
 SMOKE_ROOT="$BUNDLE_ROOT/smoke/c"
+
+[[ -z "$TRUST_POLICY" || "$ALLOW_LEGACY_INTEGRITY_ONLY" -eq 0 ]] \
+  || die "--trust-policy and --allow-legacy-integrity-only are mutually exclusive"
+if [[ "$NO_CONTENT" -eq 1 && ( -n "$TRUST_POLICY" || "$ALLOW_LEGACY_INTEGRITY_ONLY" -eq 1 ) ]]; then
+  die "--no-content cannot be combined with content authentication or legacy-content options"
+fi
+if [[ "$NO_CONTENT" -eq 0 ]]; then
+  [[ -f "$PACK_MANIFEST" ]] || die "missing content pack manifest: $PACK_MANIFEST (use --no-content to skip)"
+  [[ -n "$TRUST_POLICY" || "$ALLOW_LEGACY_INTEGRITY_ONLY" -eq 1 ]] \
+    || die "content install requires --trust-policy FILE or explicit --allow-legacy-integrity-only"
+fi
+if [[ -n "$TRUST_POLICY" ]]; then
+  [[ -f "$TRUST_POLICY" ]] || die "trust policy file not found: $TRUST_POLICY"
+  command -v readlink >/dev/null 2>&1 || die "readlink is required to validate --trust-policy"
+  TRUST_POLICY_CANONICAL="$(readlink -f -- "$TRUST_POLICY")"
+  case "$TRUST_POLICY_CANONICAL" in
+    "$BUNDLE_ROOT"|"$BUNDLE_ROOT"/*) die "--trust-policy must be supplied outside the distribution bundle" ;;
+  esac
+fi
+
+while [[ "$PREFIX" == */ && "$PREFIX" != "/" ]]; do
+  PREFIX="${PREFIX%/}"
+done
+
+# The prefix is replaced as a whole during updates. Refuse ambiguous paths and
+# broad roots before any package-manager or installation side effect.
+case "$PREFIX" in
+  /*) ;;
+  *) die "--prefix must be an absolute directory" ;;
+esac
+command -v readlink >/dev/null 2>&1 || die "readlink is required to validate --prefix"
+PREFIX_CANONICAL="$(readlink -m -- "$PREFIX")"
+if [[ "$PREFIX" =~ (^|/)\.\.?(/|$) ]] \
+  || [[ -L "$PREFIX" ]] \
+  || [[ "$PREFIX_CANONICAL" == "$(readlink -f -- "$HOME")" ]] \
+  || [[ "$PREFIX_CANONICAL" == "$(readlink -f -- "$PWD")" ]] \
+  || [[ "$PREFIX_CANONICAL" == "$(readlink -f -- "$BUNDLE_ROOT")" ]]; then
+  die "unsafe install prefix: $PREFIX"
+fi
+case "$PREFIX_CANONICAL" in
+  /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/run|/sbin|/sys|/tmp|/usr|/var)
+    die "unsafe install prefix: $PREFIX" ;;
+esac
+
+# Authenticate content before any package-manager or prefix side effect. The
+# bundle's own policy is not a trust anchor; only an external operator policy is.
+if [[ "$NO_CONTENT" -eq 0 ]]; then
+  [[ -f "$TOOL_DIR/bhf" ]] || die "missing BHF binary: $TOOL_DIR/bhf"
+  PACK_VERIFY=("$TOOL_DIR/bhf" pack verify "$PACK_MANIFEST" --root "$PACK_ROOT")
+  if [[ -n "$TRUST_POLICY" ]]; then
+    PACK_VERIFY+=(--policy "$TRUST_POLICY" --require-authenticated)
+  fi
+  run "${PACK_VERIFY[@]}"
+fi
 
 if [[ "$NON_INTERACTIVE" -eq 0 ]]; then
   LANGUAGES="${LANGUAGES:-$DEFAULT_LANGUAGES}"
@@ -937,9 +1016,15 @@ SUDO_INSTALL_WORD="$(sudo_prefix_for_path "$PREFIX")"
 TIMESTAMP="$(date +%Y%m%d%H%M%S)"
 NEW_PREFIX="${PREFIX}.new.$$"
 BACKUP_PREFIX="${PREFIX}.backup.${TIMESTAMP}"
+backup_suffix=1
+while [[ -e "$BACKUP_PREFIX" || -L "$BACKUP_PREFIX" ]]; do
+  BACKUP_PREFIX="${PREFIX}.backup.${TIMESTAMP}.${backup_suffix}"
+  backup_suffix=$((backup_suffix + 1))
+done
 
-run_with_optional_prefix "$SUDO_INSTALL_WORD" rm -rf "$NEW_PREFIX"
-run_with_optional_prefix "$SUDO_INSTALL_WORD" mkdir -p "$NEW_PREFIX"
+[[ ! -e "$NEW_PREFIX" && ! -L "$NEW_PREFIX" ]] || die "stage path already exists: $NEW_PREFIX"
+run_with_optional_prefix "$SUDO_INSTALL_WORD" mkdir -p "$(dirname "$NEW_PREFIX")"
+run_with_optional_prefix "$SUDO_INSTALL_WORD" mkdir "$NEW_PREFIX"
 run_with_optional_prefix "$SUDO_INSTALL_WORD" cp -a "$TOOL_DIR/." "$NEW_PREFIX/"
 
 if [[ -d "$PREFIX/packs" ]]; then
@@ -951,12 +1036,171 @@ if [[ -d "$PREFIX/corpora" ]]; then
   run_with_optional_prefix "$SUDO_INSTALL_WORD" cp -a "$PREFIX/corpora" "$NEW_PREFIX/corpora"
 fi
 
+if [[ "$NO_CONTENT" -eq 0 ]]; then
+  PACK_INSTALL=("$NEW_PREFIX/bhf" pack install "$PACK_MANIFEST" --root "$PACK_ROOT" --install-dir "$NEW_PREFIX/packs")
+  if [[ -n "$TRUST_POLICY" ]]; then
+    PACK_INSTALL+=(--policy "$TRUST_POLICY" --require-authenticated)
+  fi
+  PACK_INSTALL+=(--reported-install-dir "$PREFIX/packs")
+  PACK_INSTALL_RESULT="$NEW_PREFIX/pack-install-result.json"
+  PACK_INSTALL+=(--out "$PACK_INSTALL_RESULT")
+  run_with_optional_prefix "$SUDO_INSTALL_WORD" mkdir -p "$NEW_PREFIX/packs"
+  run_with_optional_prefix "$SUDO_INSTALL_WORD" "${PACK_INSTALL[@]}"
+else
+  printf 'Skipping content pack installation.\n'
+fi
+
+SEED_TAR="$PACK_ROOT/corpus/seeds.tar.gz"
+if [[ "$INSTALL_SEEDS" -eq 1 && "$NO_CONTENT" -eq 0 && "$DRY_RUN" -eq 0 ]]; then
+  command -v python3 >/dev/null 2>&1 || die "--install-seeds requires python3 for safe archive validation"
+  PACK_ID="$(capture_with_optional_prefix "$SUDO_INSTALL_WORD" python3 - "$PACK_INSTALL_RESULT" <<'PY'
+import json
+import re
+import sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    result = json.load(handle)
+pack_id = result.get("pack_id")
+if result.get("valid") is not True or not isinstance(pack_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", pack_id):
+    raise SystemExit("invalid installed pack result for seed extraction")
+print(pack_id)
+PY
+)"
+  run_with_optional_prefix "$SUDO_INSTALL_WORD" rm -f "$PACK_INSTALL_RESULT"
+  SEED_TAR="$NEW_PREFIX/packs/$PACK_ID/corpus/seeds.tar.gz"
+  [[ -f "$SEED_TAR" && ! -L "$SEED_TAR" ]] || die "authenticated installed pack is missing seed archive: $SEED_TAR"
+fi
+if [[ "$INSTALL_SEEDS" -eq 1 && -f "$SEED_TAR" ]]; then
+  command -v python3 >/dev/null 2>&1 || die "--install-seeds requires python3 for safe archive validation"
+  SEED_SNAPSHOT="$NEW_PREFIX/.seeds-archive.$$"
+  [[ ! -e "$SEED_SNAPSHOT" && ! -L "$SEED_SNAPSHOT" ]] || die "seed snapshot path already exists: $SEED_SNAPSHOT"
+  run_with_optional_prefix "$SUDO_INSTALL_WORD" python3 - "$SEED_TAR" "$SEED_SNAPSHOT" <<'PY'
+import os
+import stat
+import sys
+
+source, destination = sys.argv[1:]
+flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+input_fd = os.open(source, flags)
+try:
+    source_stat = os.fstat(input_fd)
+    if not stat.S_ISREG(source_stat.st_mode):
+        raise SystemExit("seed archive must be a regular file")
+    if source_stat.st_size > 2 * 1024 ** 3:
+        raise SystemExit("seed archive exceeds 2 GiB compressed")
+    output_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        total = 0
+        while True:
+            chunk = os.read(input_fd, 64 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > 2 * 1024 ** 3:
+                raise SystemExit("seed archive exceeds 2 GiB compressed")
+            view = memoryview(chunk)
+            while view:
+                written = os.write(output_fd, view)
+                if written <= 0:
+                    raise SystemExit("could not write seed archive snapshot")
+                view = view[written:]
+        os.fsync(output_fd)
+    finally:
+        os.close(output_fd)
+finally:
+    os.close(input_fd)
+PY
+  run_with_optional_prefix "$SUDO_INSTALL_WORD" python3 - "$SEED_SNAPSHOT" <<'PY'
+import sys
+import tarfile
+
+archive = sys.argv[1]
+count = 0
+total = 0
+with tarfile.open(archive, "r:gz") as members:
+    for member in members:
+        count += 1
+        name = member.name
+        parts = name.split("/")
+        if (count > 100000 or name.startswith("/") or ".." in parts
+                or any(ord(char) < 32 for char in name)
+                or not (member.isfile() or member.isdir())):
+            raise SystemExit("unsafe seed archive member")
+        if member.isfile():
+            if member.size > 2 * 1024 ** 3:
+                raise SystemExit("seed archive member exceeds 2 GiB")
+            total += member.size
+            if total > 20 * 1024 ** 3:
+                raise SystemExit("seed archive exceeds 20 GiB uncompressed")
+PY
+  [[ ! -L "$NEW_PREFIX/corpora" ]] || die "refusing symlinked staged corpora directory"
+  run_with_optional_prefix "$SUDO_INSTALL_WORD" mkdir -p "$NEW_PREFIX/corpora"
+  SEED_STAGE="$NEW_PREFIX/.seeds-stage.$$"
+  [[ ! -e "$SEED_STAGE" && ! -L "$SEED_STAGE" ]] || die "seed stage path already exists: $SEED_STAGE"
+  run_with_optional_prefix "$SUDO_INSTALL_WORD" mkdir "$SEED_STAGE"
+  run_with_optional_prefix "$SUDO_INSTALL_WORD" tar --no-same-owner --no-same-permissions \
+    -C "$SEED_STAGE" -xzf "$SEED_SNAPSHOT"
+  run_with_optional_prefix "$SUDO_INSTALL_WORD" rm -f "$SEED_SNAPSHOT"
+  if [[ -e "$NEW_PREFIX/corpora/seeds" || -L "$NEW_PREFIX/corpora/seeds" ]]; then
+    SEED_PREVIOUS="$NEW_PREFIX/corpora/seeds.previous.$TIMESTAMP"
+    seed_backup_suffix=1
+    while [[ -e "$SEED_PREVIOUS" || -L "$SEED_PREVIOUS" ]]; do
+      SEED_PREVIOUS="$NEW_PREFIX/corpora/seeds.previous.$TIMESTAMP.$seed_backup_suffix"
+      seed_backup_suffix=$((seed_backup_suffix + 1))
+    done
+    run_with_optional_prefix "$SUDO_INSTALL_WORD" mv -T "$NEW_PREFIX/corpora/seeds" "$SEED_PREVIOUS"
+    printf 'Previous seed corpus retained at %s\n' "$SEED_PREVIOUS"
+  fi
+  run_with_optional_prefix "$SUDO_INSTALL_WORD" mv -T "$SEED_STAGE" "$NEW_PREFIX/corpora/seeds"
+fi
+
+printf '+ '
+quote_cmd "$NEW_PREFIX/bhf" --help
+if [[ "$DRY_RUN" -eq 0 ]]; then
+  "$NEW_PREFIX/bhf" --help >/dev/null
+fi
+
+if [[ "$NO_SMOKE" -eq 0 ]]; then
+  [[ -d "$SMOKE_ROOT" ]] || die "missing pre-activation smoke fixture: $SMOKE_ROOT"
+  if [[ "$DRY_RUN" -eq 0 ]]; then
+    command -v clang >/dev/null 2>&1 || die "pre-activation smoke requires clang; install clang or rerun with --no-smoke"
+    command -v make >/dev/null 2>&1 || die "pre-activation smoke requires make; install make or rerun with --no-smoke"
+  fi
+  if [[ -z "$SMOKE_WORK_DIR" ]]; then
+    SMOKE_WORK_DIR="${TMPDIR:-/tmp}/bhf-smoke.$$"
+  fi
+  run "$NEW_PREFIX/bhf" auto "$SMOKE_ROOT" \
+    --work-dir "$SMOKE_WORK_DIR" \
+    --languages c \
+    --max-targets 1 \
+    --per-target-time 1 \
+    --iterations 8 \
+    --single-pass \
+    --no-discovery-cache
+  printf 'Post-install smoke report: %s\n' "$SMOKE_WORK_DIR/auto/run.md"
+else
+  printf 'Skipping pre-activation bhf auto smoke test.\n'
+fi
+
+# All bundle-dependent operations have succeeded. The only mutable transition
+# now is renaming the old prefix to a unique backup and activating this stage.
+# Keep the stage on failure so an operator can inspect or retry it.
+HAD_PREVIOUS=0
 if [[ -e "$PREFIX" ]]; then
-  run_with_optional_prefix "$SUDO_INSTALL_WORD" rm -rf "$BACKUP_PREFIX"
-  run_with_optional_prefix "$SUDO_INSTALL_WORD" mv "$PREFIX" "$BACKUP_PREFIX"
+  run_with_optional_prefix "$SUDO_INSTALL_WORD" mv -T "$PREFIX" "$BACKUP_PREFIX"
+  HAD_PREVIOUS=1
+fi
+if ! run_with_optional_prefix "$SUDO_INSTALL_WORD" mv -T "$NEW_PREFIX" "$PREFIX"; then
+  if [[ "$HAD_PREVIOUS" -eq 1 ]]; then
+    if run_with_optional_prefix "$SUDO_INSTALL_WORD" mv -T "$BACKUP_PREFIX" "$PREFIX"; then
+      die "activation failed; previous install restored; staged files remain at $NEW_PREFIX"
+    fi
+    die "activation and restore failed; previous install is at $BACKUP_PREFIX and staged files are at $NEW_PREFIX"
+  fi
+  die "activation failed; staged files remain at $NEW_PREFIX"
+fi
+if [[ "$HAD_PREVIOUS" -eq 1 ]]; then
   printf 'Previous install moved to %s\n' "$BACKUP_PREFIX"
 fi
-run_with_optional_prefix "$SUDO_INSTALL_WORD" mv "$NEW_PREFIX" "$PREFIX"
 
 if [[ "$NO_SYMLINK" -eq 0 ]]; then
   SUDO_BIN_WORD="$(sudo_prefix_for_path "$BIN_DIR")"
@@ -968,55 +1212,6 @@ if [[ "$NO_SYMLINK" -eq 0 ]]; then
   if [[ -f "$PREFIX/bhf-bug-report" ]]; then
     run_with_optional_prefix "$SUDO_BIN_WORD" ln -sfn "$PREFIX/bhf-bug-report" "$BIN_DIR/bhf-bug-report"
   fi
-fi
-
-if [[ "$NO_CONTENT" -eq 0 && -f "$PACK_MANIFEST" ]]; then
-  PACK_VERIFY=("$PREFIX/bhf" pack verify "$PACK_MANIFEST" --root "$PACK_ROOT")
-  PACK_INSTALL=("$PREFIX/bhf" pack install "$PACK_MANIFEST" --root "$PACK_ROOT" --install-dir "$PREFIX/packs")
-  if [[ -f "$POLICY_FILE" ]]; then
-    PACK_VERIFY+=(--policy "$POLICY_FILE")
-    PACK_INSTALL+=(--policy "$POLICY_FILE")
-  fi
-  run "${PACK_VERIFY[@]}"
-  run_with_optional_prefix "$SUDO_INSTALL_WORD" mkdir -p "$PREFIX/packs"
-  run_with_optional_prefix "$SUDO_INSTALL_WORD" "${PACK_INSTALL[@]}"
-else
-  printf 'Skipping signed content pack installation.\n'
-fi
-
-SEED_TAR="$PACK_ROOT/corpus/seeds.tar.gz"
-if [[ "$INSTALL_SEEDS" -eq 1 && -f "$SEED_TAR" ]]; then
-  run_with_optional_prefix "$SUDO_INSTALL_WORD" mkdir -p "$PREFIX/corpora/seeds"
-  run_with_optional_prefix "$SUDO_INSTALL_WORD" tar -C "$PREFIX/corpora/seeds" -xzf "$SEED_TAR"
-fi
-
-printf '+ '
-quote_cmd "$PREFIX/bhf" --help
-if [[ "$DRY_RUN" -eq 0 ]]; then
-  "$PREFIX/bhf" --help >/dev/null
-fi
-
-if [[ "$NO_SMOKE" -eq 0 ]]; then
-  [[ -d "$SMOKE_ROOT" ]] || die "missing post-install smoke fixture: $SMOKE_ROOT"
-  if [[ "$DRY_RUN" -eq 0 ]]; then
-    command -v clang >/dev/null 2>&1 || die "post-install smoke requires clang; install clang or rerun with --no-smoke"
-    command -v make >/dev/null 2>&1 || die "post-install smoke requires make; install make or rerun with --no-smoke"
-  fi
-  if [[ -z "$SMOKE_WORK_DIR" ]]; then
-    SMOKE_WORK_DIR="${TMPDIR:-/tmp}/bhf-smoke.$$"
-  fi
-  run rm -rf "$SMOKE_WORK_DIR"
-  run "$PREFIX/bhf" auto "$SMOKE_ROOT" \
-    --work-dir "$SMOKE_WORK_DIR" \
-    --languages c \
-    --max-targets 1 \
-    --per-target-time 1 \
-    --iterations 8 \
-    --single-pass \
-    --no-discovery-cache
-  printf 'Post-install smoke report: %s\n' "$SMOKE_WORK_DIR/auto/run.md"
-else
-  printf 'Skipping post-install bhf auto smoke test.\n'
 fi
 
 printf 'BHF installed at %s\n' "$PREFIX"

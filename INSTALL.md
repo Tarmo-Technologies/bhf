@@ -4,7 +4,9 @@
 
 Linux releases provide two complete installation choices. Use the all-in-one
 bundle when you want `install.sh` to install the CLI, daemon, both Linux shims,
-harness runtimes, and the signed content pack together. Use the component
+harness runtimes, and the checksum-verified content pack together. The pack's
+SHA-256 digests detect accidental changes but do not authenticate its publisher.
+Use the component
 archives when you want to choose and place the files yourself.
 
 Every all-in-one bundle also carries `INSTALL.md`, `LICENSE`, `README.md`, and
@@ -21,9 +23,11 @@ Download `bhf-dist-<version>-x86_64-unknown-linux-gnu.tar.gz` and its
 
 ```sh
 sha256sum -c bhf-dist-*.tar.gz.sha256
+# Authenticate the whole archive with a separately trusted verifier and
+# publisher public key before extracting or executing bundle code.
 tar xzf bhf-dist-*.tar.gz
 cd bhf-dist-*-x86_64-unknown-linux-gnu
-./install.sh
+./install.sh --trust-policy /trusted/operator-policy.json
 ```
 
 The interactive installer selects language toolchains, targets, fuzzers, and
@@ -35,7 +39,7 @@ For automation or an offline host whose system dependencies were staged
 separately:
 
 ```sh
-./install.sh --non-interactive \
+./install.sh --non-interactive --trust-policy /trusted/operator-policy.json \
   --languages c,cpp,rust \
   --targets native \
   --fuzzers builtin \
@@ -47,6 +51,11 @@ separately:
 
 Run `./install.sh --help` for custom prefixes, dependency controls, seed
 installation, smoke-test controls, and every available language profile.
+The policy must independently pin a publisher public key under
+`update_packs.trusted_public_keys` and set `require_signature: true`.
+Checksum-only legacy content requires explicit `--allow-legacy-integrity-only`
+instead; neither it nor a same-channel `.sha256` sidecar authenticates the
+publisher or the unverified installer.
 
 ## Choice 2: manually co-locate component archives
 

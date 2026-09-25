@@ -21,9 +21,12 @@ fn release_workflow_disables_unavailable_github_attestations() {
 #[test]
 fn release_packaging_docs_explain_supported_integrity_verification() {
     let docs = read(repo_root().join("docs/release-packaging.md"));
+    let words = docs.split_whitespace().collect::<Vec<_>>().join(" ");
 
     assert!(docs.contains("sha256sum -c <asset>.sha256"));
-    assert!(docs.contains("signed content pack"));
+    assert!(words.contains("content-pack digests"));
+    assert!(words.contains("do not authenticate its publisher"));
+    assert!(!words.contains("signed content pack"));
     assert!(docs.contains("GitHub Artifact Attestations are disabled"));
     assert!(docs.contains("github-attestations = true"));
 }
@@ -236,7 +239,13 @@ fn release_shell_installers_check_for_xz() {
 fn ci_enforces_the_current_supported_os_matrix() {
     let root = repo_root();
     let ci = read(root.join(".github/workflows/ci.yml"));
+    let release = read(root.join(".github/workflows/release.yml"));
     let windows_smoke = read(root.join("scripts/ci/windows-release-smoke.ps1"));
+    let workspace: toml::Value =
+        toml::from_str(&read(root.join("Cargo.toml"))).expect("parse workspace manifest");
+    let version = workspace["workspace"]["package"]["version"]
+        .as_str()
+        .expect("workspace package version");
     let readme = read(root.join("README.md"));
     let install = read(root.join("docs/site/install.md"));
     let windows = read(root.join("docs/site/windows.md"));
@@ -263,6 +272,12 @@ fn ci_enforces_the_current_supported_os_matrix() {
     assert!(windows_smoke.contains("Expected '$expectedVersion', got '$actualVersion'"));
     assert!(windows_smoke.contains("GetEnvironmentVariable(\"Path\", \"Machine\")"));
     assert!(windows_smoke.contains("GetEnvironmentVariable(\"Path\", \"User\")"));
+    assert!(windows_smoke
+        .contains("$expectedVersion = \"bhf v$($workspaceVersion.Matches[0].Groups[1].Value)\""));
+    assert!(windows_smoke.contains("$actualVersion = (& $bhf --version).Trim()"));
+    assert!(release.contains("RELEASE_TAG: ${{ needs.plan.outputs.tag }}"));
+    assert!(release.contains("version=\"$RELEASE_TAG\""));
+    assert!(release.contains("safe_version=\"$(printf '%s' \"$version\""));
     let supported_docs = format!("{readme}\n{install}\n{windows}");
     for required in [
         "RHEL 10",
@@ -277,8 +292,7 @@ fn ci_enforces_the_current_supported_os_matrix() {
             "support documentation omitted {required}"
         );
     }
-    assert!(windows.contains("$Version = \"v0.2.19\""));
-    assert!(!windows.contains("$Version = \"v0.2.16\""));
+    assert!(windows.contains(&format!("$Version = \"{version}\"")));
 }
 
 #[cfg(unix)]

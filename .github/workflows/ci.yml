@@ -18,6 +18,23 @@ jobs:
   changes:
     uses: ./.github/workflows/classify-ci-scope.yml
 
+  minimum-rust:
+    name: Rust 1.88 source compatibility
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install minimum supported Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: 1.88.0
+
+      - name: Check all workspace targets at the declared minimum
+        run: cargo +1.88.0 check --locked --workspace --all-targets
+
   build-test:
     needs: changes
     if: needs.changes.outputs.heavy == 'true'
@@ -47,6 +64,9 @@ jobs:
       - name: Test GNAT Studio plugin helpers
         run: python3 -m unittest discover -s editors/gnatstudio/tests
 
+      - name: Test container validation contracts
+        run: python3 -m unittest discover -s docker -p 'test_*.py'
+
       - name: Build workspace
         run: cargo build --workspace
 
@@ -63,9 +83,8 @@ jobs:
       # bindings would merge on a fully green CI run. Dependabot proposed
       # exactly that (libafl 0.13 -> 0.16, four compile errors behind the flag).
       #
-      # `nyx-engine` is deliberately excluded: it is an unfinished placeholder
-      # whose entry point is `unreachable!()` until the real libnyx integration
-      # lands, so enabling it is *supposed* to fail.
+      # `nyx-engine` currently reports NotImplemented until the real libnyx
+      # integration lands; keep that feature compiling and its fallback tested.
       - name: Build and test optional features
         env:
           # probe_gnat_actions' build script rejects the `enabled` feature
@@ -74,6 +93,7 @@ jobs:
         run: |
           cargo build -p fuzz_engine_libafl_adapter --features libafl-engine
           cargo test -p fuzz_engine_libafl_adapter --features libafl-engine
+          cargo test -p fuzz_engine_nyx_adapter --features nyx-engine
           cargo test -p probe_gnat_actions --features enabled
 
       - name: Validate confidence model
