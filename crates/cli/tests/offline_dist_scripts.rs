@@ -1389,14 +1389,46 @@ fn assert_success(output: std::process::Output, context: &str) {
     );
 }
 
-fn temp_dir(prefix: &str) -> PathBuf {
+/// RAII temporary working directory: created on construction and recursively
+/// removed on drop (including panic/assert unwind), so these dist tests — one of
+/// which copies the multi-hundred-MB `bhf` binary — do not leak ~GB directories
+/// under `/tmp` on every run. Derefs to `Path` and implements `AsRef<Path>` so
+/// existing `dir.join(..)` / `&dir` call sites keep compiling unchanged.
+struct TempWork(PathBuf);
+
+impl std::ops::Deref for TempWork {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for TempWork {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for TempWork {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.0.as_os_str()
+    }
+}
+
+impl Drop for TempWork {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn temp_dir(prefix: &str) -> TempWork {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
     let dir = std::env::temp_dir().join(format!("bhf-{prefix}-{nonce}"));
     fs::create_dir_all(&dir).unwrap();
-    dir
+    TempWork(dir)
 }
 
 fn create_minimal_bundle(root: &Path) {
