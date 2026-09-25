@@ -281,3 +281,15 @@ fn align_offset(offset: usize, alignment: usize, alignment_base: usize) -> Optio
     let aligned_absolute = absolute.checked_add(mask)? & !mask;
     aligned_absolute.checked_sub(alignment_base)
 }
+
+/// Number of pad bytes required to align `offset` to `alignment`, given the CDR
+/// stream's `alignment_base` (the absolute position of `offset == 0`). This is
+/// the write-side counterpart to the reader's internal alignment rule: a
+/// `CdrWriter` inserts exactly this many zero bytes where a `CdrReader` skips
+/// them, so an encoded stream and its decode stay in lockstep.
+pub fn align_padding(offset: usize, alignment: usize, alignment_base: usize) -> usize {
+    match align_offset(offset, alignment, alignment_base) {
+        Some(aligned) => aligned - offset,
+        None => 0,
+    }
+}
