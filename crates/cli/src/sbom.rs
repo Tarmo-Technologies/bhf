@@ -14,8 +14,8 @@ pub struct SbomArgs {
     pub out: PathBuf,
 
     /// Comma-separated subset of artifacts to emit: `cyclonedx`, `sbom`,
-    /// `vulnerabilities`, `openvex`, `csv`, `cyclonedx-vex`. Default emits all of
-    /// them (the VEX outputs are on by default). An unknown name is rejected.
+    /// `vulnerabilities`, `openvex`, `vex-review`, `csv`, `cyclonedx-vex`, `spdx-json`. Default emits all except
+    /// `spdx-json` (which is opt-in). An unknown name is rejected.
     #[arg(long, value_name = "LIST")]
     pub emit: Option<String>,
 
@@ -55,6 +55,12 @@ pub struct SbomArgs {
     /// Exit non-zero when a matched vulnerability meets or exceeds this severity.
     #[arg(long, value_enum)]
     pub fail_on: Option<FailOnSeverity>,
+
+    /// Exit non-zero for matched CVEs requiring vulnerability-specific review.
+    /// Requires an explicit advisory database and always writes vex-review.json.
+    /// Zero pending matches is not a declaration that the product is safe.
+    #[arg(long, requires = "vuln_db")]
+    pub fail_on_unreviewed: bool,
 }
 
 impl SbomArgs {
@@ -82,6 +88,9 @@ impl SbomArgs {
         if self.vex {
             set = set.with_vex();
         }
+        if self.fail_on_unreviewed {
+            set = set.with_kinds([governance::EmitKind::VexReview]);
+        }
         Ok(set)
     }
 
@@ -105,6 +114,7 @@ pub fn run(args: SbomArgs) -> i32 {
         }
     };
     let ecosystems = args.ecosystem_filter();
+    let fail_on_unreviewed = args.fail_on_unreviewed;
     let options = governance::SbomOptions {
         root: args.path,
         out_dir: args.out,
@@ -126,7 +136,12 @@ pub fn run(args: SbomArgs) -> i32 {
             for path in &summary.written {
                 println!("sbom: wrote {}", path.display());
             }
-            if summary.gate_failed {
+            println!("sbom: {} matched vulnerabilities require review", summary.unreviewed_matches);
+            let review_blocked = fail_on_unreviewed && summary.unreviewed_matches > 0;
+            if review_blocked {
+                bhfeprintln!("sbom: review gate blocked; inspect {}", summary.vex_review_path.display());
+            }
+            if summary.gate_failed || review_blocked {
                 1
             } else {
                 0
@@ -193,6 +208,7 @@ mod tests {
             EmitKind::Cyclonedx,
             EmitKind::Vulnerabilities,
             EmitKind::Openvex,
+            EmitKind::VexReview,
             EmitKind::Csv,
             EmitKind::CyclonedxVex,
         ] {
@@ -251,6 +267,26 @@ mod tests {
         let args = parse(&["--run-json", "/tmp/run.json"]);
         assert_eq!(args.run_json, Some(PathBuf::from("/tmp/run.json")));
         assert_eq!(parse(&[]).run_json, None);
+    }
+
+    #[test]
+    fn review_gate_requires_explicit_database() {
+        assert!(TestCli::try_parse_from(["bhf", "tree", "--fail-on-unreviewed"]).is_err());
+    }
+
+    #[test]
+    fn review_gate_preserves_diagnostics_under_narrow_emit_selection() {
+        let args = parse(&["--emit", "sbom", "--vuln-db", "db.json", "--fail-on-unreviewed"]);
+        assert!(args.fail_on_unreviewed);
+        assert!(args.emit_set().unwrap().contains(EmitKind::VexReview));
+        assert!(!parse(&[]).fail_on_unreviewed);
+    }
+
+    #[test]
+    fn review_queue_is_selectable_independently() {
+        let set = parse(&["--emit", "vex-review"]).emit_set().unwrap();
+        assert!(set.contains(EmitKind::VexReview));
+        assert!(!set.contains(EmitKind::Sbom));
     }
 
     #[test]

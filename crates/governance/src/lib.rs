@@ -580,6 +580,8 @@ pub enum EmitKind {
     Vulnerabilities,
     /// `openvex.json` — the OpenVEX assessment document.
     Openvex,
+    /// `vex-review.json` — unresolved advisory matches requiring analyst review.
+    VexReview,
     /// CSV outputs for spreadsheet / procurement / vuln-triage ingestion:
     /// `sbom.csv` (a flat one-row-per-component inventory) AND
     /// `vulnerabilities.csv` (one row per CVE match, carrying the `cwe` column).
@@ -600,6 +602,7 @@ impl EmitKind {
             EmitKind::Cyclonedx => "cyclonedx",
             EmitKind::Vulnerabilities => "vulnerabilities",
             EmitKind::Openvex => "openvex",
+            EmitKind::VexReview => "vex-review",
             EmitKind::Csv => "csv",
             EmitKind::CyclonedxVex => "cyclonedx-vex",
             EmitKind::SpdxJson => "spdx-json",
@@ -613,13 +616,14 @@ impl EmitKind {
             "cyclonedx" => Ok(EmitKind::Cyclonedx),
             "vulnerabilities" => Ok(EmitKind::Vulnerabilities),
             "openvex" => Ok(EmitKind::Openvex),
+            "vex-review" => Ok(EmitKind::VexReview),
             "csv" => Ok(EmitKind::Csv),
             "cyclonedx-vex" => Ok(EmitKind::CyclonedxVex),
             "spdx-json" => Ok(EmitKind::SpdxJson),
             other => Err(GovernanceError::InvalidInput {
                 message: format!(
                     "unknown --emit value '{other}' (expected one of: \
-                     cyclonedx, sbom, vulnerabilities, openvex, csv, cyclonedx-vex, spdx-json)"
+                     cyclonedx, sbom, vulnerabilities, openvex, vex-review, csv, cyclonedx-vex, spdx-json)"
                 ),
             }),
         }
@@ -641,6 +645,7 @@ impl EmitSet {
                 EmitKind::Cyclonedx,
                 EmitKind::Vulnerabilities,
                 EmitKind::Openvex,
+                EmitKind::VexReview,
                 EmitKind::Csv,
                 EmitKind::CyclonedxVex,
             ]
@@ -705,6 +710,8 @@ pub struct SbomSummary {
     pub cyclonedx_path: PathBuf,
     pub vulnerability_path: PathBuf,
     pub openvex_path: PathBuf,
+    pub vex_review_path: PathBuf,
+    pub unreviewed_matches: usize,
     pub csv_path: PathBuf,
     /// `vulnerabilities.csv` — the CVE matches as flat CSV (with a `cwe` column),
     /// written alongside `sbom.csv` under the `csv` emit kind.
@@ -2362,12 +2369,15 @@ pub fn write_sbom(options: &SbomOptions) -> Result<SbomSummary, GovernanceError>
         }
     }
     let openvex = render_openvex_document(&vulnerabilities);
+    let vex_review = vex::review_queue(&vulnerabilities);
+    let unreviewed_matches = vex_review["entries"].as_array().map_or(0, Vec::len);
 
     fs::create_dir_all(&options.out_dir)?;
     let sbom_path = options.out_dir.join("sbom.json");
     let cyclonedx_path = options.out_dir.join("cyclonedx.json");
     let vulnerability_path = options.out_dir.join("vulnerabilities.json");
     let openvex_path = options.out_dir.join("openvex.json");
+    let vex_review_path = options.out_dir.join("vex-review.json");
     let csv_path = options.out_dir.join("sbom.csv");
     let vulnerability_csv_path = options.out_dir.join("vulnerabilities.csv");
     let spdx_path = options.out_dir.join("sbom.spdx.json");
@@ -2392,6 +2402,10 @@ pub fn write_sbom(options: &SbomOptions) -> Result<SbomSummary, GovernanceError>
         fs::write(&openvex_path, serde_json::to_vec_pretty(&openvex)?)?;
         written.push(openvex_path.clone());
     }
+    if emit.contains(EmitKind::VexReview) {
+        fs::write(&vex_review_path, serde_json::to_vec_pretty(&vex_review)?)?;
+        written.push(vex_review_path.clone());
+    }
     if emit.contains(EmitKind::Csv) {
         // The `csv` kind emits BOTH the component inventory and the CVE matches as
         // flat CSV, so a spreadsheet / SCA pipeline gets the vulnerabilities (with
@@ -2415,6 +2429,8 @@ pub fn write_sbom(options: &SbomOptions) -> Result<SbomSummary, GovernanceError>
         cyclonedx_path,
         vulnerability_path,
         openvex_path,
+        vex_review_path,
+        unreviewed_matches,
         csv_path,
         vulnerability_csv_path,
         spdx_path,
@@ -4298,12 +4314,12 @@ fn match_vulnerabilities(
     let mut matches = Vec::new();
     if let Some(vuln_db) = &options.vuln_db {
         let db = read_json(vuln_db)?;
-        for vuln in db
-            .get("vulnerabilities")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
+        let advisories = db.get("vulnerabilities").and_then(Value::as_array)
+            .ok_or_else(|| GovernanceError::InvalidInput {
+                message: "advisory database requires a vulnerabilities array".to_owned(),
+            })?;
+        for (index, vuln) in advisories.iter().enumerate() {
+            validate_advisory(vuln, index)?;
             let package = vuln.get("package").unwrap_or(&Value::Null);
             let ecosystem = package
                 .get("ecosystem")
@@ -4476,6 +4492,27 @@ fn cpe_fields(raw: &str) -> Option<Vec<String>> {
     )
 }
 
+/// Refuse malformed advisory records rather than silently producing a clean gate.
+fn validate_advisory(vuln: &Value, index: usize) -> Result<(), GovernanceError> {
+    let nonempty = |value: Option<&Value>| value.and_then(Value::as_str)
+        .is_some_and(|text| !text.trim().is_empty());
+    let package = vuln.get("package").unwrap_or(&Value::Null);
+    let named = nonempty(package.get("name")) && nonempty(package.get("ecosystem"));
+    let identified = vulnerability_cpe(vuln, package).is_some_and(|s| !s.trim().is_empty())
+        || vulnerability_purl(vuln, package).is_some_and(|s| !s.trim().is_empty());
+    let versions_valid = match vuln.get("affected_versions") {
+        None | Some(Value::Null) => true,
+        Some(Value::Array(values)) => values.iter().all(|value| nonempty(Some(value))),
+        _ => false,
+    };
+    if !vuln.is_object() || !nonempty(vuln.get("id")) || !(named || identified) || !versions_valid {
+        return Err(GovernanceError::InvalidInput {
+            message: format!("malformed advisory record {index}: require a nonempty id, package identity and string-array affected_versions when supplied"),
+        });
+    }
+    Ok(())
+}
+
 fn vulnerability_cpe<'a>(vuln: &'a Value, package: &'a Value) -> Option<&'a str> {
     package
         .get("cpe")
@@ -4571,9 +4608,8 @@ fn vulnerability_match(
 }
 
 /// Compute the conservative VEX assessment for this `(vuln, component)` match
-/// and serialize it. Driven by the matched component's top usage rung, whether
-/// a campaign ran (validated reachability present), and whether the vuln's
-/// fixed version is at or below the resolved version.
+/// and serialize it. Usage observations and advisory fixed-version hints are
+/// retained for review, never promoted to vulnerability-specific proof.
 fn vex_assessment(
     vuln: &Value,
     component: &Component,
@@ -4590,10 +4626,7 @@ fn vex_assessment(
         }));
     }
 
-    // Fixed-version dominance: only when the vuln pins a fixed/patched version
-    // at or below the component's resolved version (conservative comparison).
-    let (fixed_applies, fixed_version) =
-        vulnerability_fixed_state(vuln, component.version.as_deref());
+    let advisory_fixed_versions = vulnerability_fixed_version_hints(vuln);
 
     let harnesses: Vec<String> = reachability
         .iter()
@@ -4609,8 +4642,7 @@ fn vex_assessment(
     let ctx = vex::AssessmentContext {
         top_rung,
         campaign_ran,
-        fixed_applies,
-        fixed_version: fixed_version.as_deref(),
+        advisory_fixed_versions: &advisory_fixed_versions,
         resolved_version: component.version.as_deref(),
         product_id,
         evidence_summary: &evidence_summary,
@@ -4620,6 +4652,9 @@ fn vex_assessment(
     let cve = vuln.get("id").and_then(Value::as_str).unwrap_or("unknown");
     json!({
         "status": assessment.status.openvex(),
+        "review_required": true,
+        "decision_basis": "component_observation_only",
+        "advisory_fixed_versions": advisory_fixed_versions,
         "justification": assessment.justification,
         "impact_statement": assessment.impact_statement,
         "product_id": product_id,
@@ -4628,28 +4663,19 @@ fn vex_assessment(
     })
 }
 
-/// Extract the vuln's fixed/patched version (if any) and decide whether the
-/// resolved component version is at or above it. Recognizes `fixed_versions`
-/// (array) and `fixed_version` / `patched_version` (string). Never panics.
-fn vulnerability_fixed_state(vuln: &Value, resolved: Option<&str>) -> (bool, Option<String>) {
-    let mut fixed_versions = string_array(vuln.get("fixed_versions"));
+/// Preserve advisory remediation hints without interpreting cross-ecosystem
+/// version ordering or choosing a potentially unrelated patched release branch.
+fn vulnerability_fixed_version_hints(vuln: &Value) -> Vec<String> {
+    let mut versions = string_array(vuln.get("fixed_versions"));
     for key in ["fixed_version", "patched_version"] {
         if let Some(value) = vuln.get(key).and_then(Value::as_str) {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                fixed_versions.push(trimmed.to_owned());
-            }
+            versions.push(value.to_owned());
         }
     }
-    let Some(resolved) = resolved else {
-        return (false, None);
-    };
-    for fixed in &fixed_versions {
-        if vex::resolved_at_or_above_fixed(resolved, fixed) {
-            return (true, Some(fixed.clone()));
-        }
-    }
-    (false, None)
+    versions.into_iter().map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter().collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4678,7 +4704,7 @@ struct SbomReachability {
 
 impl SbomReachability {
     /// A fuzz campaign "ran" for this SBOM iff the validated reachability map is
-    /// non-empty. This single signal gates the dynamic VEX `not_affected`.
+    /// non-empty. It records an observation, not CVE absence or exploitability.
     fn campaign_ran(&self) -> bool {
         !self.hits.is_empty()
     }
@@ -7448,7 +7474,7 @@ mod vex_e2e_tests {
     }
 
     #[test]
-    fn declared_only_component_yields_not_affected_vex() {
+    fn declared_only_component_requires_vulnerability_review() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("project");
         let out = tmp.path().join("sbom");
@@ -7483,20 +7509,20 @@ mod vex_e2e_tests {
         assert_eq!(openvex["author"], "bhf");
         assert_eq!(openvex["timestamp"], SBOM_TIMESTAMP);
         let stmt = openvex_statement_for(&openvex, "CVE-2026-DECL");
-        assert_eq!(stmt["status"], "not_affected");
-        assert_eq!(stmt["justification"], "vulnerable_code_not_in_execute_path");
+        assert_eq!(stmt["status"], "under_investigation");
+        assert!(stmt.get("justification").is_none());
         assert_eq!(stmt["products"][0]["@id"], "pkg:npm/leftpad@1.0.0");
         assert!(!stmt["impact_statement"].as_str().unwrap().is_empty());
 
         let cyclonedx = read_json(&out.join("cyclonedx.json")).unwrap();
         let analysis = &cyclonedx_vuln_for(&cyclonedx, "CVE-2026-DECL")["analysis"];
-        assert_eq!(analysis["state"], "not_affected");
-        assert_eq!(analysis["justification"], "code_not_reachable");
+        assert_eq!(analysis["state"], "in_triage");
+        assert!(analysis.get("justification").is_none());
         assert!(!analysis["detail"].as_str().unwrap().is_empty());
     }
 
     #[test]
-    fn linked_with_campaign_and_not_reached_yields_not_affected_citing_campaign() {
+    fn disjoint_campaign_does_not_prove_linked_component_unreachable() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("project");
         let out = tmp.path().join("sbom");
@@ -7530,19 +7556,19 @@ mod vex_e2e_tests {
 
         let openvex = read_json(&out.join("openvex.json")).unwrap();
         let stmt = openvex_statement_for(&openvex, "CVE-2026-LINK");
-        assert_eq!(stmt["status"], "not_affected");
-        assert_eq!(stmt["justification"], "vulnerable_code_not_in_execute_path");
-        // The dynamic claim MUST cite the campaign as its backing evidence.
+        assert_eq!(stmt["status"], "under_investigation");
+        assert!(stmt.get("justification").is_none());
+        // Keep campaign evidence without using a disjoint run as non-impact proof.
         let impact = stmt["impact_statement"].as_str().unwrap();
         assert!(
-            impact.contains("fuzz campaign ran"),
-            "dynamic not_affected must cite the campaign: {impact}"
+            impact.contains("validated campaign evidence is present"),
+            "review notes must retain campaign observations: {impact}"
         );
 
         let cyclonedx = read_json(&out.join("cyclonedx.json")).unwrap();
         let analysis = &cyclonedx_vuln_for(&cyclonedx, "CVE-2026-LINK")["analysis"];
-        assert_eq!(analysis["state"], "not_affected");
-        assert_eq!(analysis["justification"], "code_not_reachable");
+        assert_eq!(analysis["state"], "in_triage");
+        assert!(analysis.get("justification").is_none());
     }
 
     #[test]
@@ -7586,7 +7612,7 @@ mod vex_e2e_tests {
         assert_ne!(stmt["status"], "not_affected");
         assert!(stmt.get("justification").is_none());
         let impact = stmt["impact_statement"].as_str().unwrap();
-        assert!(impact.contains("no fuzz campaign ran"), "{impact}");
+        assert!(impact.contains("no validated campaign evidence"), "{impact}");
 
         let cyclonedx = read_json(&out.join("cyclonedx.json")).unwrap();
         let analysis = &cyclonedx_vuln_for(&cyclonedx, "CVE-2026-NOCAMP")["analysis"];
@@ -7595,7 +7621,7 @@ mod vex_e2e_tests {
     }
 
     #[test]
-    fn reached_component_yields_affected_vex() {
+    fn component_reachability_does_not_prove_specific_cve_exploitability() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("project");
         let out = tmp.path().join("sbom");
@@ -7638,19 +7664,19 @@ mod vex_e2e_tests {
 
         let openvex = read_json(&out.join("openvex.json")).unwrap();
         let stmt = openvex_statement_for(&openvex, "CVE-2026-REACH");
-        assert_eq!(stmt["status"], "affected");
+        assert_eq!(stmt["status"], "under_investigation");
         assert!(stmt.get("justification").is_none());
         let impact = stmt["impact_statement"].as_str().unwrap();
-        assert!(impact.contains("executed under fuzzing"), "{impact}");
+        assert!(impact.contains("vulnerability-specific evidence is required"), "{impact}");
 
         let cyclonedx = read_json(&out.join("cyclonedx.json")).unwrap();
         let analysis = &cyclonedx_vuln_for(&cyclonedx, "CVE-2026-REACH")["analysis"];
-        assert_eq!(analysis["state"], "exploitable");
+        assert_eq!(analysis["state"], "in_triage");
         assert!(analysis.get("justification").is_none());
     }
 
     #[test]
-    fn patched_resolved_version_yields_fixed_vex() {
+    fn numeric_ordering_of_advisory_fix_hint_does_not_prove_fixed() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("project");
         let out = tmp.path().join("sbom");
@@ -7682,14 +7708,14 @@ mod vex_e2e_tests {
 
         let openvex = read_json(&out.join("openvex.json")).unwrap();
         let stmt = openvex_statement_for(&openvex, "CVE-2026-FIXED");
-        assert_eq!(stmt["status"], "fixed");
+        assert_eq!(stmt["status"], "under_investigation");
         assert!(stmt.get("justification").is_none());
         let impact = stmt["impact_statement"].as_str().unwrap();
-        assert!(impact.contains("patched version 3.0.13"), "{impact}");
+        assert!(impact.contains("advisory fixed-version hints: 3.0.13"), "{impact}");
 
         let cyclonedx = read_json(&out.join("cyclonedx.json")).unwrap();
         let analysis = &cyclonedx_vuln_for(&cyclonedx, "CVE-2026-FIXED")["analysis"];
-        assert_eq!(analysis["state"], "resolved");
+        assert_eq!(analysis["state"], "in_triage");
     }
 
     #[test]
@@ -7780,7 +7806,9 @@ mod vex_e2e_tests {
         ] {
             assert!(out.join(name).is_file(), "default emit should write {name}");
         }
-        assert_eq!(summary.written.len(), 6);
+        assert_eq!(summary.written.len(), 7);
+        assert_eq!(summary.unreviewed_matches, 1);
+        assert!(out.join("vex-review.json").is_file());
         // CycloneDX-VEX is on by default: the analysis is embedded.
         let cyclonedx = read_json(&out.join("cyclonedx.json")).unwrap();
         assert!(cyclonedx_vuln_for(&cyclonedx, "CVE-2026-EMIT")
