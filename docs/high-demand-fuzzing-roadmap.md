@@ -298,6 +298,37 @@ software replay). No `qemu-system`/Renode/avatar2/Unicorn anywhere.
 - Gated: a `qemu-system-arm` image with a planted vulnerable handler is fuzzed
   to a crash with coverage feedback and snapshot reset.
 
+**Progress (2026-09-25).** Deliverable 1 landed: `FullSystemTransport` in
+`crates/target_transport/src/fullsystem.rs`, a `TargetTransport` over
+`qemu-system-*` composed from a new `QmpClient` (QMP handshake, `stop`/`cont`,
+and `savevm`/`loadvm` via `human-monitor-command`) plus the existing `GdbClient`
+(input delivery + coverage-ring readback via `MemoryBufferReader`). The
+snapshot/reset state machine — `arm()` = QMP `stop` + `savevm <baseline>`;
+`run_input()` = QMP `stop` + `loadvm <baseline>` (the per-iteration reset,
+replacing gdb's unreliable `R`) + gdb input write + gdb `c` + ring read — is
+unit-tested against the scripted `MockQmpServer` + `MockGdbStub`
+(`crates/target_transport/src/testsupport.rs`): handshake and per-iteration
+`loadvm`/input-write are asserted, coverage reconstructs the expected edges,
+determinism (same input ⇒ same outcome) holds, and malformed/oversized QMP
+messages and short memory reads are bounded, descriptive errors. All QMP reads
+are capped (`QmpLimits`) against allocation/spin bombs. The live `qemu-system`
+run remains **gated** (emulator + lawful image; unproven until run).
+
+*Deliverable 2 (Renode)* is a documented follow-up (see the `fullsystem` module
+docs): a Renode `.resc` board exposes a GDB server, so the same `GdbClient` +
+`MemoryBufferReader` reconstruct coverage and Renode `Save`/`Load` play the
+snapshot role; only a small monitor adapter (Renode's telnet CLI, not QMP) is
+needed in place of `QmpClient`. It is deferred rather than shipped untested
+because there is no Renode instance in-tree to validate against.
+
+*Deliverable 3 (Nyx)* resolves roadmap **CC-2** for nyx by **retiring** the
+`nyx_adapter` stub: it has no consumers, does not implement the transport seam,
+and its software replay collects zero coverage (strictly weaker than
+`HostChildTransport`). Rather than route a misleading zero-coverage backend
+through the seam, its crate docs now mark it as scaffolding superseded by
+`FullSystemTransport`, and `NyxError::NotImplemented` names `FullSystemTransport`
+(HDF-4) as the replacement (asserted by a test). No coverage is fabricated.
+
 ## HDF-5 — Non-buffer entry-point discovery and environment/peripheral harness synthesis
 
 **Goal.** Recognize and harness the entry points that carry attacker-influenced

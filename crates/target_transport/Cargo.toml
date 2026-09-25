@@ -16,4 +16,8 @@ path = "src/lib.rs"
 # BHF_EVENTS tag-length coverage channel (semihosting + memory-buffer probes),
 # so the coverage readers reuse it rather than re-implementing decoding.
 event_log = { path = "../event_log" }
+# QMP (QEMU Machine Protocol) is line-delimited JSON over a socket; the
+# FullSystemTransport's QMP client (HDF-4) parses it with serde_json, already a
+# workspace dependency, rather than hand-rolling a JSON reader.
+serde_json.workspace = true
 thiserror.workspace = true

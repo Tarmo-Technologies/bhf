@@ -1,24 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Nyx / what-the-fuzz snapshot-fuzzing adapter.
+//! Nyx / what-the-fuzz snapshot-fuzzing adapter — **scaffolding, superseded**.
 //!
-//! Two backends:
+//! **Status (HDF-4 / roadmap CC-2).** This crate is early scaffolding whose
+//! full-system snapshot role has been taken over by
+//! [`target_transport::fullsystem::FullSystemTransport`], the real
+//! `qemu-system-*` snapshot/reset backend (QMP `savevm`/`loadvm` + a gdbstub for
+//! input delivery and coverage-ring readback). Nothing in the tree consumes this
+//! adapter, and it does not implement the [`target_transport::TargetTransport`]
+//! seam. It is retained only so dependents can probe the `nyx-engine` feature
+//! flag at build time; new full-system work belongs in `FullSystemTransport`.
 //!
-//! - **Software replay** (default): the snapshot_dir contains a
-//!   `target` binary that gets spawned per input, mimicking the
-//!   one-shot semantics of a snapshot restore. Useful for the
-//!   Nyx-API consumer story when libnyx isn't available
-//!   (hardware support / CI envs / dev machines).
-//! - **Real Nyx** (`nyx-engine` feature): libnyx FFI + QEMU
-//!   snapshot restore. Tracked separately because the FFI
-//!   bindings depend on host hardware and a real QEMU install.
+//! It exposes two backends, neither of which is production coverage:
 //!
-//! Architecture note: snapshot fuzzing (Nyx, kAFL, what-the-fuzz)
-//! is the production version of state virtualization — see the
-//! sibling `bhf_runtrace_shim` crate for the dependency-faking
-//! variant bhf ships today. The strategic story is that bhf
-//! supports both — fake the dependencies (shim) OR fake the process
-//! state (this adapter) — and users pick per target.
+//! - **Software replay** (default): the `snapshot_dir` contains a `target`
+//!   binary spawned once per input, mimicking the one-shot semantics of a
+//!   snapshot restore. It collects **no coverage** (`coverage_edges` is always
+//!   empty) — it is a process-lifecycle stand-in, not a coverage-guided backend,
+//!   and is strictly weaker than `target_transport::host::HostChildTransport`.
+//!   No coverage is fabricated here.
+//! - **Real Nyx** (`nyx-engine` feature): libnyx FFI + QEMU snapshot restore.
+//!   Not implemented; the feature-gated path returns
+//!   [`NyxError::NotImplemented`], whose message names
+//!   `FullSystemTransport` (HDF-4) as the supported replacement.
+//!
+//! Architecture note: snapshot fuzzing (Nyx, kAFL, what-the-fuzz) is the
+//! production form of state virtualization — see the sibling `bhf_runtrace_shim`
+//! crate for the dependency-faking variant BHF ships today, and
+//! `FullSystemTransport` for the process/machine-state variant. This adapter
+//! predates both and is kept only as a probe point.
 
 use std::path::PathBuf;
 
@@ -44,7 +54,9 @@ pub enum CoverageStrategy {
 #[derive(Debug, thiserror::Error)]
 pub enum NyxError {
     #[error(
-        "Nyx adapter built without the `nyx-engine` feature; rebuild with `--features nyx-engine` once the real backend lands"
+        "Nyx real-backend snapshot fuzzing is not implemented; this adapter is scaffolding \
+         superseded by target_transport::fullsystem::FullSystemTransport (roadmap HDF-4), the \
+         qemu-system snapshot/reset backend — use it for full-system snapshot fuzzing"
     )]
     NotImplemented,
     #[error("snapshot dir does not exist: {0}")]
@@ -258,5 +270,45 @@ mod tests {
         let a = CoverageStrategy::IntelPt;
         let b = a;
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn not_implemented_error_names_the_full_system_replacement() {
+        // CC-2 / HDF-4 disposition: this adapter is retired in favor of the real
+        // qemu-system snapshot backend, and its unimplemented error must send
+        // callers there rather than promise a Nyx backend that is not coming.
+        let message = NyxError::NotImplemented.to_string();
+        assert!(
+            message.contains("FullSystemTransport"),
+            "error must name the replacement transport: {message}"
+        );
+        assert!(
+            message.contains("HDF-4"),
+            "error must name the tracking track: {message}"
+        );
+    }
+
+    #[test]
+    fn software_replay_documents_zero_coverage_and_never_fabricates_edges() {
+        // The software-replay backend is a lifecycle stand-in, not coverage
+        // guided: a successful run must report an empty edge set, never a faked
+        // one. (Gated by unix + no nyx-engine, matching the replay path.)
+        #[cfg(all(unix, not(feature = "nyx-engine")))]
+        {
+            use std::os::unix::fs::symlink;
+            let dir = tempdir("zero-cov");
+            symlink("/bin/true", dir.join("target")).unwrap();
+            let config = NyxAdapterConfig {
+                snapshot_dir: dir,
+                coverage: CoverageStrategy::SanCov,
+                timeout_ms: 5000,
+            };
+            let outcome = run_snapshot_once(&config, b"hello").unwrap();
+            assert_eq!(outcome.exit_kind, ExitKind::Ok);
+            assert!(
+                outcome.coverage_edges.is_empty(),
+                "software replay must not fabricate coverage"
+            );
+        }
     }
 }
