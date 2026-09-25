@@ -2108,6 +2108,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "target_transport"
+version = "0.2.32"
+dependencies = [
+ "event_log",
+ "thiserror",
+]
+
+[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
