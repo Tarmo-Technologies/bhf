@@ -19,4 +19,5 @@ pub mod mqueue;
 pub mod net;
 pub mod proc;
 pub mod rtos;
+pub mod sched;
 pub mod sql;

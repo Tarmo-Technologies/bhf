@@ -459,6 +459,28 @@ pub const RULES: &[Rule] = &[
         iso_tr_24772_ada: &[],
     },
     Rule {
+        id: "BHF-555",
+        slug: "bhf.timing/response-deadline-exceeded",
+        name: "Response deadline exceeded (real-time timing oracle)",
+        description: "A fuzz input drove the target past a configured per-input response deadline D — the \"must respond within D\" budget an RTOS/radar task, watchdog, or request handler is required to meet — as opposed to the coarse hang-kill backstop that merely discards a slow unit. The oracle records the input, the deadline, and the observed wall-clock time, whether the run completed slowly (algorithmic-complexity / excessive-iteration input) or never returned within the budget (deadlock / infinite loop killed at the backstop). A missed deadline is an attacker-reachable timing / availability failure: in a real-time system a task that overruns its budget is a functional fault (a dropped radar dwell, a missed control loop), and for any request handler an input that consumes the whole time budget is a denial-of-service. Bound the input-derived work (validate sizes, cap iterations, add a computation budget) or fix the deadlock/liveness bug on the path this input reaches.",
+        cwe: "CWE-400",
+        cwe_top_25: None,
+        default_severity: Severity::High,
+        default_confidence: Confidence::High,
+        security_severity: 6.5,
+        references: &[
+            "https://cwe.mitre.org/data/definitions/400.html",
+            "https://cwe.mitre.org/data/definitions/833.html",
+            "https://cwe.mitre.org/data/definitions/835.html",
+        ],
+        owasp_top_10: None,
+        cert_c: None,
+        cert_cpp: None,
+        misra_c: None,
+        misra_cpp: None,
+        iso_tr_24772_ada: &[],
+    },
+    Rule {
         id: "BHF-556",
         slug: "bhf.c/data-race",
         name: "Data race (ThreadSanitizer)",
@@ -4336,6 +4358,22 @@ mod tests {
             derive_rule_id(Some("unhandled"), Some("STORAGE_ERROR")),
             Some("BHF-101")
         );
+    }
+
+    #[test]
+    fn deadline_rule_bhf_555_is_registered_as_a_timing_finding() {
+        // The deadline oracle (fuzz.rs) tags a missed-response finding BHF-555, so it
+        // must resolve to a real catalog rule mapped to a time/availability CWE — not
+        // an unmapped "timeout" tag, and distinct from the memory OOM rule (BHF-209)
+        // and the data-race rule (BHF-556).
+        let rule = by_id("BHF-555").expect("BHF-555 deadline rule must exist");
+        assert_eq!(rule.cwe, "CWE-400");
+        assert_eq!(rule.slug, "bhf.timing/response-deadline-exceeded");
+        // The deadlock and infinite-loop sub-cases are named as contributing
+        // mechanisms so a consumer can see why a deadline was missed.
+        assert!(rule.references.iter().any(|r| r.contains("833.html")));
+        assert!(rule.references.iter().any(|r| r.contains("835.html")));
+        assert_ne!(rule.cwe, by_id("BHF-209").unwrap().cwe);
     }
 
     #[test]
