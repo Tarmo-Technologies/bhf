@@ -76,10 +76,11 @@ pub fn run(args: CapsuleArgs) -> i32 {
             "bhf capsule: no reproducible C crash findings in {} (need a runtime finding with a testcase.bin)",
             args.work_dir.display()
         );
-        return 0;
+        return if args.finding_id.is_some() { 1 } else { 0 };
     }
     let mut made = 0usize;
     let mut reproduced = 0usize;
+    let mut failed = 0usize;
     for f in findings {
         match build_capsule(&args.work_dir, &f, &out_root, args.tar) {
             Ok(report) => {
@@ -103,9 +104,8 @@ pub fn run(args: CapsuleArgs) -> i32 {
                 }
             }
             Err(e) => {
-                if args.verbose {
-                    bhfeprintln!("  {} skipped: {e}", f.finding_id);
-                }
+                failed += 1;
+                bhfeprintln!("  {} failed: {e}", f.finding_id);
             }
         }
     }
@@ -113,7 +113,11 @@ pub fn run(args: CapsuleArgs) -> i32 {
         "bhf capsule: {made} capsule(s) written to {} ({reproduced} verified to reproduce)",
         out_root.display()
     );
-    0
+    if failed > 0 {
+        1
+    } else {
+        0
+    }
 }
 
 /// A finding selected for packaging.
@@ -192,13 +196,17 @@ fn build_capsule(
     out_root: &Path,
     tar: bool,
 ) -> anyhow::Result<CapsuleReport> {
+    validate_capsule_id(&f.finding_id, "finding")?;
+    validate_capsule_id(&f.harness_id, "harness")?;
     let hdir = crate::auto::layout::harness_dir(work_dir, &f.harness_id);
     let makefile = hdir.join("Makefile");
     let recipe = parse_makefile(&makefile)
         .ok_or_else(|| anyhow::anyhow!("cannot parse harness Makefile {}", makefile.display()))?;
 
     let cap = out_root.join(format!("capsule_{}", f.finding_id));
-    let _ = std::fs::remove_dir_all(&cap);
+    if cap.exists() {
+        std::fs::remove_dir_all(&cap)?;
+    }
     for sub in ["harness", "sources", "stubs", "runtime", "input"] {
         std::fs::create_dir_all(cap.join(sub))?;
     }
@@ -269,7 +277,7 @@ fn build_capsule(
     std::fs::write(cap.join("README.md"), readme(&f.finding_id, &signature))?;
 
     if tar {
-        make_tarball(out_root, &cap);
+        make_tarball(out_root, &cap)?;
     }
     Ok(CapsuleReport {
         finding_id: f.finding_id.clone(),
@@ -277,6 +285,19 @@ fn build_capsule(
         reproduced,
         signature,
     })
+}
+
+fn validate_capsule_id(value: &str, label: &str) -> anyhow::Result<()> {
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        anyhow::bail!("invalid {label} ID: {value:?}");
+    }
+    Ok(())
 }
 
 /// Parse a harness Makefile for the `main:` recipe's explicit target sources and the
@@ -571,7 +592,7 @@ fn signature_matches(expected: &str, observed: &str) -> bool {
 /// Resolve a capsule argument to a usable directory root. A directory is used
 /// in place; an archive is extracted to a scratch dir (returned so the caller keeps
 /// it alive). The scratch guard is `Some` only for the archive case.
-fn resolve_capsule(arg: &Path) -> anyhow::Result<(PathBuf, Option<ScratchDir>)> {
+fn resolve_capsule(arg: &Path) -> anyhow::Result<(PathBuf, Option<tempfile::TempDir>)> {
     if arg.is_dir() {
         return Ok((arg.to_path_buf(), None));
     }
@@ -582,19 +603,21 @@ fn resolve_capsule(arg: &Path) -> anyhow::Result<(PathBuf, Option<ScratchDir>)> 
             arg.display()
         );
     }
-    let scratch = ScratchDir::new()?;
+    let scratch = tempfile::Builder::new()
+        .prefix("bhf-verify-poc-")
+        .tempdir()?;
     let status = Command::new("tar")
         .arg("xf")
         .arg(arg)
         .arg("-C")
-        .arg(&scratch.0)
+        .arg(scratch.path())
         .status()
         .map_err(|e| anyhow::anyhow!("cannot run tar to extract capsule: {e}"))?;
     if !status.success() {
         anyhow::bail!("tar failed to extract {}", arg.display());
     }
     // The tarball holds a single `capsule_*` dir; descend into it if present.
-    let root = single_subdir(&scratch.0).unwrap_or_else(|| scratch.0.clone());
+    let root = single_subdir(scratch.path()).unwrap_or_else(|| scratch.path().to_path_buf());
     Ok((root, Some(scratch)))
 }
 
@@ -613,35 +636,22 @@ fn single_subdir(dir: &Path) -> Option<PathBuf> {
     }
 }
 
-/// A scratch directory removed on drop.
-struct ScratchDir(PathBuf);
-
-impl ScratchDir {
-    fn new() -> anyhow::Result<Self> {
-        let base = std::env::temp_dir().join(format!("bhf-verify-poc-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base)?;
-        Ok(ScratchDir(base))
-    }
-}
-
-impl Drop for ScratchDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-fn make_tarball(out_root: &Path, cap: &Path) {
+fn make_tarball(out_root: &Path, cap: &Path) -> anyhow::Result<()> {
     let name = basename(cap);
-    let _ = Command::new("tar")
+    let status = Command::new("tar")
         .arg("czf")
         .arg(out_root.join(format!("{name}.tar.gz")))
         .arg("-C")
         .arg(out_root)
         .arg(&name)
-        .status();
+        .status()
+        .map_err(|error| anyhow::anyhow!("cannot run tar for capsule {name}: {error}"))?;
+    if !status.success() {
+        anyhow::bail!("tar failed for capsule {name}: {status}");
+    }
+    Ok(())
 }
 
 fn copy(src: &Path, dest: &Path) -> anyhow::Result<()> {
@@ -778,6 +788,60 @@ mod tests {
             "AddressSanitizer:heap-use-after-free",
             "AddressSanitizer:stack-buffer-overflow"
         ));
+    }
+
+    #[test]
+    fn capsule_rejects_hostile_ids_before_touching_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        let out = temp.path().join("out");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        let harness = crate::auto::layout::harness_dir(&work, "H-C-1");
+        std::fs::create_dir_all(&harness).unwrap();
+        std::fs::write(harness.join("Makefile"), b"").unwrap();
+        std::fs::create_dir(out.join("capsule_x")).unwrap();
+        let sentinel = temp.path().join("sentinel");
+        std::fs::create_dir(&sentinel).unwrap();
+        std::fs::write(sentinel.join("keep"), b"keep").unwrap();
+        let finding = FindingRef {
+            finding_id: "x/../../sentinel".to_owned(),
+            finding_dir: work.join("findings/x"),
+            harness_id: "H-C-1".to_owned(),
+            raw: json!({}),
+        };
+        assert!(build_capsule(&work, &finding, &out, false).is_err());
+        assert_eq!(std::fs::read(sentinel.join("keep")).unwrap(), b"keep");
+        assert!(validate_capsule_id("H-C\\..\\outside", "harness").is_err());
+        assert!(validate_capsule_id("C:outside", "harness").is_err());
+    }
+
+    #[test]
+    fn capsule_reports_requested_packaging_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        let finding_dir = work.join("findings/F-1");
+        std::fs::create_dir_all(&finding_dir).unwrap();
+        std::fs::write(finding_dir.join("testcase.bin"), b"input").unwrap();
+        std::fs::write(
+            finding_dir.join("finding.json"),
+            br#"{"id":"F-1","classification":"unhandled","harness_id":"H-C-1"}"#,
+        )
+        .unwrap();
+        let code = run(CapsuleArgs {
+            work_dir: work,
+            finding_id: Some("F-1".to_owned()),
+            out: Some(temp.path().join("out")),
+            tar: false,
+            verbose: false,
+        });
+        assert_eq!(code, 1, "missing harness Makefile must fail packaging");
+    }
+
+    #[test]
+    fn tarball_command_failure_is_reported() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(make_tarball(temp.path(), &temp.path().join("missing-capsule")).is_err());
     }
 
     #[test]

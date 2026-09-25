@@ -4,12 +4,501 @@
 
 mod vex;
 
+use ring::{
+    rand::SystemRandom,
+    signature::{self, KeyPair},
+};
 use sbom_ingest::{Component, Evidence, EvidenceKind};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+
+const PACK_SIGN_DOMAIN: &[u8] = b"BHF.UPDATE_PACK.ED25519.V1\0";
+const DIST_SIGN_DOMAIN: &[u8] = b"BHF.DIST.TARBALL.ED25519.V1\0";
+const MAX_PACK_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_PACK_ITEMS: usize = 10_000;
+const MAX_PACK_ITEM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_PACK_TOTAL_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SignedPackManifest {
+    schema_version: String,
+    pack_id: String,
+    version: String,
+    root: String,
+    items: Vec<SignedPackItem>,
+    signature: SignedPackSignature,
+}
+
+#[cfg(test)]
+mod authenticated_pack_tests {
+    use super::*;
+
+    fn write_policy(path: &Path, keys: Value, revoked: Value) {
+        write_json(
+            path,
+            &json!({"update_packs": {
+                "require_signature": true,
+                "trusted_public_keys": keys,
+                "revoked_keys": revoked
+            }}),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rfc8032_ed25519_known_vector_verifies() {
+        // RFC 8032 section 7.1, test 1: independent public key/signature for empty message.
+        let public = hex_decode(
+            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+            32,
+        )
+        .unwrap();
+        let signature = hex_decode("e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b", 64).unwrap();
+        assert!(
+            signature::UnparsedPublicKey::new(&signature::ED25519, public)
+                .verify(b"", &signature)
+                .is_ok()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonregular_fifo_inputs_are_rejected_without_blocking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("pipe");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        assert!(read_private_signing_key(&fifo).is_err());
+        assert!(sha256_file_streamed(&fifo).is_err());
+    }
+
+    #[test]
+    fn signed_pack_trust_tamper_rotation_revocation_and_downgrade() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("payload");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("rules.json"), b"rules-v1").unwrap();
+        let private = tmp.path().join("key.der");
+        let public = tmp.path().join("key.pub");
+        let public_hex = generate_update_pack_keypair(&private, &public).unwrap();
+        assert_eq!(fs::read_to_string(&public).unwrap().trim(), public_hex);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&private).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert!(generate_update_pack_keypair(&private, &tmp.path().join("other.pub")).is_err());
+        let manifest = tmp.path().join("pack.json");
+        let original = create_authenticated_update_pack_file(
+            &root,
+            "release-1",
+            Some("1"),
+            &["rules:rules.json".to_owned()],
+            Some("Apache-2.0"),
+            &["clang".to_owned()],
+            &private,
+            "publisher-a",
+            &manifest,
+        )
+        .unwrap();
+        let policy = tmp.path().join("policy.json");
+        write_policy(&policy, json!({"publisher-a": public_hex}), json!([]));
+        let verify =
+            || verify_update_pack_file_with_policy(&manifest, &root, Some(&policy)).unwrap();
+        assert_eq!(verify()["signature"]["status"], "authenticated");
+        let installed = install_update_pack_file(
+            &manifest,
+            &root,
+            &tmp.path().join("installed"),
+            Some(&policy),
+        )
+        .unwrap();
+        assert_eq!(
+            installed["publisher_authentication"]["key_id"],
+            "publisher-a"
+        );
+        assert_eq!(installed["publisher_authentication"]["authenticated"], true);
+        let receipt = read_json(&tmp.path().join("installed/release-1/install.json")).unwrap();
+        assert_eq!(
+            receipt["publisher_authentication"]["public_key_sha256"],
+            sha256_hex(&hex_decode(&public_hex, 32).unwrap())
+        );
+
+        let mut tampered = original.clone();
+        tampered["version"] = json!("2");
+        write_json(&manifest, &tampered).unwrap();
+        assert_eq!(verify()["signature"]["status"], "invalid_signature");
+        for (pointer, replacement) in [
+            ("/pack_id", json!("different")),
+            ("/items/0/license", json!("GPL-3.0")),
+            ("/items/0/required_tools", json!(["gcc"])),
+            ("/root", json!("/different")),
+        ] {
+            let mut value = original.clone();
+            *value.pointer_mut(pointer).unwrap() = replacement;
+            write_json(&manifest, &value).unwrap();
+            assert_eq!(
+                verify()["signature"]["status"],
+                "invalid_signature",
+                "{pointer}"
+            );
+        }
+        write_json(&manifest, &original).unwrap();
+        fs::write(root.join("rules.json"), b"rules-v2").unwrap();
+        assert_eq!(verify()["valid"], false);
+        fs::write(root.join("rules.json"), b"rules-v1").unwrap();
+
+        let mut forged = original.clone();
+        forged["signature"]["key_id"] = json!("publisher-b");
+        write_json(&manifest, &forged).unwrap();
+        assert_eq!(verify()["signature"]["status"], "unknown_key");
+        write_policy(
+            &policy,
+            json!({"publisher-b": public_hex}),
+            json!(["publisher-a"]),
+        );
+        assert_eq!(verify()["signature"]["status"], "invalid_signature");
+        let second_public_hex = generate_update_pack_keypair(
+            &tmp.path().join("second-key.der"),
+            &tmp.path().join("second-key.pub"),
+        )
+        .unwrap();
+        write_policy(
+            &policy,
+            json!({"publisher-b": second_public_hex}),
+            json!([]),
+        );
+        assert_eq!(verify()["signature"]["status"], "invalid_signature");
+        write_json(&manifest, &original).unwrap();
+        write_policy(&policy, json!({"publisher-b": public_hex}), json!([]));
+        assert_eq!(verify()["signature"]["status"], "unknown_key");
+        write_policy(
+            &policy,
+            json!({"publisher-a": public_hex, "publisher-b": public_hex}),
+            json!([]),
+        );
+        assert_eq!(verify()["valid"], true);
+        write_policy(
+            &policy,
+            json!({"publisher-a": public_hex, "publisher-b": public_hex}),
+            json!(["publisher-a"]),
+        );
+        assert_eq!(verify()["signature"]["status"], "revoked_key");
+        assert_eq!(
+            install_update_pack_file(&manifest, &root, &tmp.path().join("denied"), Some(&policy))
+                .unwrap()["valid"],
+            false
+        );
+        assert!(!tmp.path().join("denied").exists());
+        write_policy(&policy, json!({"publisher-a": "not-hex"}), json!([]));
+        assert!(verify_update_pack_file_with_policy(&manifest, &root, Some(&policy)).is_err());
+        write_policy(&policy, json!({"publisher-a": public_hex}), json!([]));
+
+        let legacy = tmp.path().join("legacy.json");
+        create_update_pack_file(
+            &root,
+            "legacy",
+            None,
+            &["rules:rules.json".to_owned()],
+            None,
+            &[],
+            Some("publisher-a"),
+            &legacy,
+        )
+        .unwrap();
+        assert_eq!(
+            verify_update_pack_file_with_policy(&legacy, &root, Some(&policy)).unwrap()["valid"],
+            false
+        );
+        assert_eq!(
+            verify_update_pack_file(&legacy, &root).unwrap()["valid"],
+            true
+        );
+        write_json(
+            &policy,
+            &json!({"update_packs": {"trusted_public_keys": {"publisher-a": public_hex}}}),
+        )
+        .unwrap();
+        assert_eq!(
+            verify_update_pack_file_with_policy(&legacy, &root, Some(&policy)).unwrap()["valid"],
+            false
+        );
+        let unsigned = tmp.path().join("unsigned.json");
+        create_update_pack_file(
+            &root,
+            "unsigned",
+            None,
+            &["rules:rules.json".to_owned()],
+            None,
+            &[],
+            None,
+            &unsigned,
+        )
+        .unwrap();
+        assert_eq!(
+            verify_update_pack_file_with_policy(&unsigned, &root, Some(&policy)).unwrap()["valid"],
+            false
+        );
+    }
+
+    #[test]
+    fn malformed_signed_metadata_duplicate_and_unknown_fields_fail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("payload");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("a"), b"a").unwrap();
+        let private = tmp.path().join("key.der");
+        let public = tmp.path().join("key.pub");
+        let public_hex = generate_update_pack_keypair(&private, &public).unwrap();
+        let manifest = tmp.path().join("pack.json");
+        let original = create_authenticated_update_pack_file(
+            &root,
+            "pack",
+            None,
+            &["rules:a".to_owned()],
+            None,
+            &[],
+            &private,
+            "k",
+            &manifest,
+        )
+        .unwrap();
+        let policy = tmp.path().join("policy.json");
+        write_policy(&policy, json!({"k": public_hex}), json!([]));
+        let mut extra = original.clone();
+        extra["items"][0]["unexpected"] = json!("ignored?");
+        write_json(&manifest, &extra).unwrap();
+        assert_eq!(
+            verify_update_pack_file_with_policy(&manifest, &root, Some(&policy)).unwrap()
+                ["signature"]["status"],
+            "malformed_manifest"
+        );
+        let mut null_optional = original.clone();
+        null_optional["items"][0]["license"] = Value::Null;
+        write_json(&manifest, &null_optional).unwrap();
+        assert_eq!(
+            verify_update_pack_file_with_policy(&manifest, &root, Some(&policy)).unwrap()
+                ["signature"]["status"],
+            "malformed_manifest"
+        );
+        let raw = serde_json::to_string(&original).unwrap();
+        let duplicate = raw.replacen(
+            "\"pack_id\":\"pack\"",
+            "\"pack_id\":\"pack\",\"pack_id\":\"pack\"",
+            1,
+        );
+        assert_ne!(raw, duplicate);
+        fs::write(&manifest, duplicate).unwrap();
+        assert_eq!(
+            verify_update_pack_file_with_policy(&manifest, &root, Some(&policy)).unwrap()
+                ["signature"]["status"],
+            "malformed_manifest"
+        );
+    }
+
+    #[test]
+    fn install_publishes_only_the_verified_owned_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("source");
+        fs::create_dir(&root).unwrap();
+        let payload = root.join("rules.json");
+        fs::write(&payload, b"trusted bytes").unwrap();
+        let private = tmp.path().join("private.der");
+        let public = tmp.path().join("public.hex");
+        let public_hex = generate_update_pack_keypair(&private, &public).unwrap();
+        let manifest = tmp.path().join("pack.json");
+        create_authenticated_update_pack_file(
+            &root,
+            "rules-v1",
+            Some("1"),
+            &["rules:rules.json".to_owned()],
+            None,
+            &[],
+            &private,
+            "publisher",
+            &manifest,
+        )
+        .unwrap();
+        let policy = tmp.path().join("policy.json");
+        write_policy(&policy, json!({"publisher": public_hex}), json!([]));
+
+        let rejected_dir = tmp.path().join("rejected");
+        let rejected = install_update_pack_file_after_verify(
+            &manifest,
+            &root,
+            &rejected_dir,
+            Some(&policy),
+            true,
+            None,
+            || fs::write(&payload, b"changed before copy").unwrap(),
+            || {},
+        )
+        .unwrap();
+        assert_eq!(rejected["valid"], false);
+        assert!(!rejected_dir.join("rules-v1").exists());
+
+        fs::write(&payload, b"trusted bytes").unwrap();
+        let installed_dir = tmp.path().join("installed");
+        let installed = install_update_pack_file_after_verify(
+            &manifest,
+            &root,
+            &installed_dir,
+            Some(&policy),
+            true,
+            None,
+            || {},
+            || fs::write(&payload, b"changed after copy").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(installed["valid"], true);
+        assert_eq!(
+            fs::read(installed_dir.join("rules-v1/rules.json")).unwrap(),
+            b"trusted bytes"
+        );
+        assert_eq!(fs::read(&payload).unwrap(), b"changed after copy");
+        fs::write(&payload, b"trusted bytes").unwrap();
+        assert!(
+            install_update_pack_file(&manifest, &root, &installed_dir, Some(&policy),).is_err()
+        );
+    }
+
+    #[test]
+    fn snapshot_copy_enforces_its_byte_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        fs::write(&source, b"four").unwrap();
+        let mut remaining = 3;
+        let result =
+            copy_regular_snapshot_file(&source, &tmp.path().join("copy"), 3, &mut remaining);
+        assert!(result.is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn simultaneous_pack_installers_publish_once_without_overwrite() {
+        use std::sync::{Arc, Barrier};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("source");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("rules"), b"trusted").unwrap();
+        let manifest = tmp.path().join("pack.json");
+        create_update_pack_file(
+            &root,
+            "pack",
+            None,
+            &["rules:rules".to_owned()],
+            None,
+            &[],
+            None,
+            &manifest,
+        )
+        .unwrap();
+        let install_dir = tmp.path().join("installed");
+        let barrier = Arc::new(Barrier::new(2));
+        let outcomes = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let barrier = Arc::clone(&barrier);
+                    let manifest = manifest.clone();
+                    let root = root.clone();
+                    let install_dir = install_dir.clone();
+                    scope.spawn(move || {
+                        install_update_pack_file_after_verify(
+                            &manifest,
+                            &root,
+                            &install_dir,
+                            None,
+                            false,
+                            None,
+                            || {
+                                barrier.wait();
+                            },
+                            || {},
+                        )
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+        assert_eq!(
+            fs::read(install_dir.join("pack/rules")).unwrap(),
+            b"trusted"
+        );
+        assert_eq!(
+            fs::read_dir(&install_dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .count(),
+            1,
+            "failed installer must remove its temporary stage"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_refuses_preexisting_symlink_destination() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("source");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("rules"), b"trusted").unwrap();
+        let manifest = tmp.path().join("pack.json");
+        create_update_pack_file(
+            &root,
+            "pack",
+            None,
+            &["rules:rules".to_owned()],
+            None,
+            &[],
+            None,
+            &manifest,
+        )
+        .unwrap();
+        let outside = tmp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("sentinel"), b"keep").unwrap();
+        let install_dir = tmp.path().join("installed");
+        fs::create_dir(&install_dir).unwrap();
+        symlink(&outside, install_dir.join("pack")).unwrap();
+        assert!(install_update_pack_file(&manifest, &root, &install_dir, None).is_err());
+        assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"keep");
+        assert!(!outside.join("rules").exists());
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SignedPackItem {
+    kind: String,
+    path: String,
+    sha256: String,
+    license: Option<String>,
+    required_tools: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SignedPackSignature {
+    algorithm: String,
+    key_id: String,
+    signature: String,
+}
 
 pub const POLICY_VALIDATION_SCHEMA_VERSION: &str = "bhf.policy.validation.v1";
 pub const RUNNERS_VALIDATION_SCHEMA_VERSION: &str = "bhf.runners.validation.v1";
@@ -261,6 +750,11 @@ impl From<sbom_ingest::CatalogError> for GovernanceError {
 
 pub fn validate_policy_file(path: &Path) -> Result<Value, GovernanceError> {
     let value = read_json(path)?;
+    if !pack_auth_policy_schema_valid(&value) {
+        return Err(GovernanceError::InvalidInput {
+            message: "malformed update-pack authentication policy".to_owned(),
+        });
+    }
     let policy_id = string_field(&value, "policy_id")
         .ok_or_else(|| missing(path, "policy_id"))?
         .to_owned();
@@ -278,6 +772,12 @@ pub fn validate_policy_file(path: &Path) -> Result<Value, GovernanceError> {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let trusted_pack_keys = string_array(value.pointer("/update_packs/trusted_keys"));
+    let trusted_public_key_ids = value
+        .pointer("/update_packs/trusted_public_keys")
+        .and_then(Value::as_object)
+        .map(|map| map.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let revoked_pack_keys = string_array(value.pointer("/update_packs/revoked_keys"));
     let fail_on_severity = value
         .pointer("/ci/fail_on_severity")
         .and_then(Value::as_str)
@@ -328,7 +828,9 @@ pub fn validate_policy_file(path: &Path) -> Result<Value, GovernanceError> {
         "update_packs": {
             "allowed_kinds": allowed_pack_kinds,
             "require_signature": require_pack_signature,
-            "trusted_keys": trusted_pack_keys
+            "trusted_keys": trusted_pack_keys,
+            "trusted_public_key_ids": trusted_public_key_ids,
+            "revoked_keys": revoked_pack_keys
         }
     }))
 }
@@ -794,6 +1296,316 @@ pub fn create_update_pack_file(
     sign_key: Option<&str>,
     out: &Path,
 ) -> Result<Value, GovernanceError> {
+    let manifest = build_update_pack(
+        root,
+        pack_id,
+        version,
+        item_specs,
+        license,
+        required_tools,
+        sign_key,
+    )?;
+    write_json(out, &manifest)?;
+    Ok(manifest)
+}
+
+pub fn create_authenticated_update_pack_file(
+    root: &Path,
+    pack_id: &str,
+    version: Option<&str>,
+    item_specs: &[String],
+    license: Option<&str>,
+    required_tools: &[String],
+    signing_key: &Path,
+    key_id: &str,
+    out: &Path,
+) -> Result<Value, GovernanceError> {
+    if key_id.is_empty()
+        || !key_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    {
+        return Err(GovernanceError::InvalidInput {
+            message: "key id must contain only ASCII letters, digits, dot, underscore, or hyphen"
+                .to_owned(),
+        });
+    }
+    let mut manifest = build_update_pack(
+        root,
+        pack_id,
+        version,
+        item_specs,
+        license,
+        required_tools,
+        None,
+    )?;
+    let key_bytes = read_private_signing_key(signing_key)?;
+    let key = signature::Ed25519KeyPair::from_pkcs8(&key_bytes).map_err(|_| {
+        GovernanceError::InvalidInput {
+            message: "signing key is not a valid Ed25519 PKCS#8 v2 private key".to_owned(),
+        }
+    })?;
+    manifest["signature"] = json!({
+        "algorithm": "ed25519-json-v1",
+        "key_id": key_id,
+    });
+    let message = signed_pack_bytes(&manifest)?;
+    manifest["signature"]["signature"] = json!(hex_encode(key.sign(&message).as_ref()));
+    write_json(out, &manifest)?;
+    Ok(manifest)
+}
+
+/// Generate a new Ed25519 PKCS#8 v2 private key and raw-hex public key.
+/// Both outputs must be new files; the private file is mode 0600 on Unix.
+pub fn generate_update_pack_keypair(
+    private_path: &Path,
+    public_path: &Path,
+) -> Result<String, GovernanceError> {
+    if private_path == public_path {
+        return Err(GovernanceError::InvalidInput {
+            message: "private and public key paths must differ".to_owned(),
+        });
+    }
+    let rng = SystemRandom::new();
+    let document = signature::Ed25519KeyPair::generate_pkcs8(&rng).map_err(|_| {
+        GovernanceError::InvalidInput {
+            message: "could not generate Ed25519 key".to_owned(),
+        }
+    })?;
+    let key = signature::Ed25519KeyPair::from_pkcs8(document.as_ref()).map_err(|_| {
+        GovernanceError::InvalidInput {
+            message: "generated Ed25519 key was invalid".to_owned(),
+        }
+    })?;
+    let public_hex = hex_encode(key.public_key().as_ref());
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut private = options.open(private_path)?;
+    private.write_all(document.as_ref())?;
+    private.sync_all()?;
+    let mut public = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(public_path)?;
+    writeln!(public, "{public_hex}")?;
+    public.sync_all()?;
+    Ok(public_hex)
+}
+
+/// Sign the SHA-256 digest of exact distribution archive bytes with the pack
+/// publisher key. The detached result is a raw 64-byte Ed25519 signature.
+pub fn sign_distribution_archive(
+    archive: &Path,
+    signing_key: &Path,
+    signature_out: &Path,
+) -> Result<String, GovernanceError> {
+    let metadata = fs::symlink_metadata(archive)?;
+    if !metadata.file_type().is_file() {
+        return Err(GovernanceError::InvalidInput {
+            message: "distribution archive must be a regular, non-symlink file".to_owned(),
+        });
+    }
+    let key_bytes = read_private_signing_key(signing_key)?;
+    let key = signature::Ed25519KeyPair::from_pkcs8(&key_bytes).map_err(|_| {
+        GovernanceError::InvalidInput {
+            message: "signing key is not a valid Ed25519 PKCS#8 v2 private key".to_owned(),
+        }
+    })?;
+    let mut archive_file = open_regular_nofollow(archive)?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = archive_file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+    }
+    let digest = hash.finalize();
+    let mut message = DIST_SIGN_DOMAIN.to_vec();
+    message.extend_from_slice(&digest);
+    fs::write(signature_out, key.sign(&message).as_ref())?;
+    Ok(hex_encode(&digest))
+}
+
+fn read_private_signing_key(path: &Path) -> Result<Vec<u8>, GovernanceError> {
+    let path_metadata = fs::symlink_metadata(path)?;
+    if !path_metadata.file_type().is_file() {
+        return Err(GovernanceError::InvalidInput {
+            message: "signing key must be a regular file, not a symlink".to_owned(),
+        });
+    }
+    let file = open_regular_nofollow(path)?;
+    let file_metadata = file.metadata()?;
+    if !file_metadata.file_type().is_file() {
+        return Err(GovernanceError::InvalidInput {
+            message: "signing key must be a regular file, not a symlink".to_owned(),
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if path_metadata.dev() != file_metadata.dev() || path_metadata.ino() != file_metadata.ino()
+        {
+            return Err(GovernanceError::InvalidInput {
+                message: "signing key changed while opening".to_owned(),
+            });
+        }
+        if file_metadata.permissions().mode() & 0o077 != 0 {
+            return Err(GovernanceError::InvalidInput {
+                message: "signing key permissions must be owner-only (0600)".to_owned(),
+            });
+        }
+    }
+    let mut bytes = Vec::new();
+    file.take(1024 * 1024).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn open_regular_nofollow(path: &Path) -> Result<fs::File, GovernanceError> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(GovernanceError::InvalidInput {
+            message: "pack input must be a regular file".to_owned(),
+        });
+    }
+    Ok(file)
+}
+
+#[cfg(test)]
+fn sha256_file_streamed(path: &Path) -> Result<String, GovernanceError> {
+    let mut file = open_regular_nofollow(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hex_encode(&hasher.finalize()))
+}
+
+fn sha256_pack_item_limited(
+    path: &Path,
+    remaining_total: &mut u64,
+) -> Result<String, GovernanceError> {
+    let mut file = open_regular_nofollow(path)?;
+    let mut hasher = Sha256::new();
+    let mut item_bytes = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        let count = count as u64;
+        if item_bytes.saturating_add(count) > MAX_PACK_ITEM_BYTES || count > *remaining_total {
+            return Err(GovernanceError::InvalidInput {
+                message: "update-pack payload exceeds its byte budget".to_owned(),
+            });
+        }
+        hasher.update(&buffer[..count as usize]);
+        item_bytes += count;
+        *remaining_total -= count;
+    }
+    Ok(hex_encode(&hasher.finalize()))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut result = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        result.push(HEX[(byte >> 4) as usize] as char);
+        result.push(HEX[(byte & 15) as usize] as char);
+    }
+    result
+}
+
+fn hex_decode(value: &str, bytes: usize) -> Option<Vec<u8>> {
+    if value.len() != bytes * 2
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return None;
+    }
+    (0..value.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&value[index..index + 2], 16).ok())
+        .collect()
+}
+
+fn signed_pack_bytes(manifest: &Value) -> Result<Vec<u8>, GovernanceError> {
+    let mut unsigned = manifest.clone();
+    let signature = unsigned
+        .as_object_mut()
+        .ok_or_else(|| GovernanceError::InvalidInput {
+            message: "pack manifest must be an object".to_owned(),
+        })?
+        .get_mut("signature")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| GovernanceError::InvalidInput {
+            message: "pack signature must be an object".to_owned(),
+        })?;
+    signature.remove("signature");
+    let mut bytes = PACK_SIGN_DOMAIN.to_vec();
+    canonical_json(&unsigned, &mut bytes)?;
+    Ok(bytes)
+}
+
+fn canonical_json(value: &Value, out: &mut Vec<u8>) -> Result<(), GovernanceError> {
+    match value {
+        Value::Object(map) => {
+            out.push(b'{');
+            let sorted: BTreeMap<_, _> = map.iter().collect();
+            for (index, (key, value)) in sorted.into_iter().enumerate() {
+                if index > 0 {
+                    out.push(b',');
+                }
+                out.extend(serde_json::to_vec(key)?);
+                out.push(b':');
+                canonical_json(value, out)?;
+            }
+            out.push(b'}');
+        }
+        Value::Array(values) => {
+            out.push(b'[');
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    out.push(b',');
+                }
+                canonical_json(value, out)?;
+            }
+            out.push(b']');
+        }
+        _ => out.extend(serde_json::to_vec(value)?),
+    }
+    Ok(())
+}
+
+fn build_update_pack(
+    root: &Path,
+    pack_id: &str,
+    version: Option<&str>,
+    item_specs: &[String],
+    license: Option<&str>,
+    required_tools: &[String],
+    sign_key: Option<&str>,
+) -> Result<Value, GovernanceError> {
     if pack_id.trim().is_empty() {
         return Err(GovernanceError::InvalidInput {
             message: "pack id must not be empty".to_owned(),
@@ -804,18 +1616,26 @@ pub fn create_update_pack_file(
             message: "at least one --item kind:path entry is required".to_owned(),
         });
     }
+    if item_specs.len() > MAX_PACK_ITEMS {
+        return Err(GovernanceError::InvalidInput {
+            message: format!("update pack exceeds {MAX_PACK_ITEMS} items"),
+        });
+    }
 
     let mut items = Vec::new();
+    let mut payload_budget = MAX_PACK_TOTAL_BYTES;
     for spec in item_specs {
         let (kind, rel_path) = parse_pack_item_spec(spec)?;
         let absolute = root.join(&rel_path);
-        let bytes = fs::read(&absolute).map_err(|error| GovernanceError::InvalidInput {
-            message: format!("pack item '{}' could not be read: {error}", rel_path),
+        let hash = sha256_pack_item_limited(&absolute, &mut payload_budget).map_err(|error| {
+            GovernanceError::InvalidInput {
+                message: format!("pack item '{}' could not be read: {error}", rel_path),
+            }
         })?;
         let mut item = json!({
             "kind": kind,
             "path": rel_path,
-            "sha256": sha256_hex(&bytes)
+            "sha256": hash
         });
         if let Some(license) = license {
             item["license"] = json!(license);
@@ -843,6 +1663,7 @@ pub fn create_update_pack_file(
         "root": path_string(root),
         "items": items
     });
+    // Legacy --sign-key is a digest label, not a cryptographic signing key.
     if let Some(sign_key) = sign_key {
         let digest = pack_items_signature_digest(
             manifest
@@ -857,7 +1678,6 @@ pub fn create_update_pack_file(
             "digest": digest
         });
     }
-    write_json(out, &manifest)?;
     Ok(manifest)
 }
 
@@ -870,7 +1690,25 @@ pub fn verify_update_pack_file_with_policy(
     root: &Path,
     policy: Option<&Path>,
 ) -> Result<Value, GovernanceError> {
-    let value = read_json(manifest)?;
+    let mut raw_manifest = Vec::new();
+    open_regular_nofollow(manifest)?
+        .take(MAX_PACK_MANIFEST_BYTES + 1)
+        .read_to_end(&mut raw_manifest)?;
+    if raw_manifest.len() as u64 > MAX_PACK_MANIFEST_BYTES {
+        return Err(GovernanceError::InvalidInput {
+            message: "update-pack manifest exceeds 64 MiB".to_owned(),
+        });
+    }
+    let value: Value = serde_json::from_slice(&raw_manifest)?;
+    if value
+        .get("items")
+        .and_then(Value::as_array)
+        .is_some_and(|items| items.len() > MAX_PACK_ITEMS)
+    {
+        return Err(GovernanceError::InvalidInput {
+            message: format!("update pack exceeds {MAX_PACK_ITEMS} items"),
+        });
+    }
     let pack_id = string_field(&value, "pack_id")
         .ok_or_else(|| missing(manifest, "pack_id"))?
         .to_owned();
@@ -879,8 +1717,34 @@ pub fn verify_update_pack_file_with_policy(
         .to_owned();
     let mut valid = true;
     let policy_value = policy.map(read_json).transpose()?;
+    if policy_value
+        .as_ref()
+        .is_some_and(|value| !pack_auth_policy_schema_valid(value))
+    {
+        return Err(GovernanceError::InvalidInput {
+            message: "malformed update-pack authentication policy".to_owned(),
+        });
+    }
+    let (signature, mut diagnostics, signature_valid) =
+        update_pack_signature_summary(&value, policy_value.as_ref(), Some(&raw_manifest));
+    if !signature_valid {
+        // Reject unauthenticated/malformed manifests before opening any payload.
+        return Ok(json!({
+            "schema_version": UPDATE_PACK_VERIFICATION_SCHEMA_VERSION,
+            "valid": false,
+            "pack_id": pack_id,
+            "version": version,
+            "manifest": path_string(manifest),
+            "root": path_string(root),
+            "policy": policy.map(path_string),
+            "signature": signature,
+            "items": [],
+            "diagnostics": diagnostics
+        }));
+    }
     let mut items = Vec::new();
-    let mut diagnostics = Vec::new();
+    let canonical_root = fs::canonicalize(root).ok();
+    let mut payload_budget = MAX_PACK_TOTAL_BYTES;
 
     for item in value
         .get("items")
@@ -894,10 +1758,27 @@ pub fn verify_update_pack_file_with_policy(
             .unwrap_or("unknown");
         let rel_path = item.get("path").and_then(Value::as_str).unwrap_or("");
         let expected = item.get("sha256").and_then(Value::as_str).unwrap_or("");
+        if rel_path.is_empty() || path_escapes_root(rel_path) {
+            return Err(GovernanceError::InvalidInput {
+                message: format!(
+                    "update-pack item path '{rel_path}' must be relative to the pack root"
+                ),
+            });
+        }
         let absolute = root.join(rel_path);
-        let (status, actual) = match fs::read(&absolute) {
-            Ok(bytes) => {
-                let actual = sha256_hex(&bytes);
+        if let (Some(canonical_root), Ok(canonical_item)) =
+            (&canonical_root, fs::canonicalize(&absolute))
+        {
+            if !canonical_item.starts_with(canonical_root) {
+                return Err(GovernanceError::InvalidInput {
+                    message: format!(
+                        "update-pack item path '{rel_path}' resolves outside the pack root"
+                    ),
+                });
+            }
+        }
+        let (status, actual) = match sha256_pack_item_limited(&absolute, &mut payload_budget) {
+            Ok(actual) => {
                 if actual == expected {
                     ("verified", actual)
                 } else {
@@ -905,6 +1786,7 @@ pub fn verify_update_pack_file_with_policy(
                     ("mismatch", actual)
                 }
             }
+            Err(error @ GovernanceError::InvalidInput { .. }) => return Err(error),
             Err(_) => {
                 valid = false;
                 ("missing", String::new())
@@ -932,13 +1814,6 @@ pub fn verify_update_pack_file_with_policy(
             "policy_decisions": policy_decisions
         }));
     }
-    let (signature, signature_diagnostics, signature_valid) =
-        update_pack_signature_summary(&value, policy_value.as_ref());
-    if !signature_valid {
-        valid = false;
-    }
-    diagnostics.extend(signature_diagnostics);
-
     Ok(json!({
         "schema_version": UPDATE_PACK_VERIFICATION_SCHEMA_VERSION,
         "valid": valid,
@@ -987,32 +1862,74 @@ pub fn install_update_pack_file(
     install_dir: &Path,
     policy: Option<&Path>,
 ) -> Result<Value, GovernanceError> {
+    install_update_pack_file_with_options(manifest, root, install_dir, policy, false, None)
+}
+
+pub fn install_update_pack_file_with_options(
+    manifest: &Path,
+    root: &Path,
+    install_dir: &Path,
+    policy: Option<&Path>,
+    require_authenticated: bool,
+    reported_install_dir: Option<&Path>,
+) -> Result<Value, GovernanceError> {
+    install_update_pack_file_after_verify(
+        manifest,
+        root,
+        install_dir,
+        policy,
+        require_authenticated,
+        reported_install_dir,
+        || {},
+        || {},
+    )
+}
+
+fn install_update_pack_file_after_verify<F: FnOnce(), G: FnOnce()>(
+    manifest: &Path,
+    root: &Path,
+    install_dir: &Path,
+    policy: Option<&Path>,
+    require_authenticated: bool,
+    reported_install_dir: Option<&Path>,
+    after_verify: F,
+    after_snapshot: G,
+) -> Result<Value, GovernanceError> {
     let verified = verify_update_pack_file_with_policy(manifest, root, policy)?;
-    if verified.get("valid").and_then(Value::as_bool) != Some(true) {
+    if verified.get("valid").and_then(Value::as_bool) != Some(true)
+        || (require_authenticated
+            && verified
+                .pointer("/signature/authenticated")
+                .and_then(Value::as_bool)
+                != Some(true))
+    {
         return Ok(json!({
             "schema_version": UPDATE_PACK_INSTALL_SCHEMA_VERSION,
             "valid": false,
             "verified": verified
         }));
     }
-    let pack_id = verified
-        .get("pack_id")
-        .and_then(Value::as_str)
-        .unwrap_or("pack");
-    // pack_id and every item path come from the untrusted manifest.
-    // Reject any that could escape install_dir (absolute, root,
-    // prefix, or `..`) so a hostile pack cannot zip-slip arbitrary
-    // file writes outside the install directory.
-    if path_escapes_root(pack_id) {
-        return Err(GovernanceError::InvalidInput {
-            message: format!(
-                "update-pack pack_id '{pack_id}' must be a relative path under the install dir"
-            ),
-        });
-    }
-    let target = install_dir.join(pack_id);
-    fs::create_dir_all(&target)?;
-    fs::copy(manifest, target.join("pack.json"))?;
+    // This hook makes the verify/copy race deterministic in the regression test.
+    // The production entrypoint supplies a no-op. The owned stage is verified
+    // again after this point, so source mutation cannot change published bytes.
+    after_verify();
+    reject_symlink_ancestors(install_dir)?;
+    fs::create_dir_all(install_dir)?;
+    reject_symlink_ancestors(install_dir)?;
+    let stage = tempfile::Builder::new()
+        .prefix(".bhf-pack-stage-")
+        .tempdir_in(install_dir)?;
+    let stage_manifest = stage.path().join("pack.json");
+    let mut manifest_budget = MAX_PACK_MANIFEST_BYTES;
+    copy_regular_snapshot_file(
+        manifest,
+        &stage_manifest,
+        MAX_PACK_MANIFEST_BYTES,
+        &mut manifest_budget,
+    )?;
+    let mut seen_paths = BTreeSet::new();
+    let mut payload_budget = MAX_PACK_TOTAL_BYTES;
+    let canonical_root = fs::canonicalize(root)?;
     for item in verified
         .get("items")
         .and_then(Value::as_array)
@@ -1020,33 +1937,205 @@ pub fn install_update_pack_file(
         .flatten()
     {
         let rel = item.get("path").and_then(Value::as_str).unwrap_or("");
-        if rel.is_empty() {
-            continue;
-        }
-        if path_escapes_root(rel) {
+        if !safe_pack_relative_path(rel, false)
+            || matches!(rel, "pack.json" | "install.json")
+            || !seen_paths.insert(rel.to_owned())
+        {
             return Err(GovernanceError::InvalidInput {
-                message: format!("update-pack item path '{rel}' must be relative to the pack root"),
+                message: format!("unsafe or duplicate update-pack item path '{rel}'"),
             });
         }
         let src = root.join(rel);
-        let dst = target.join(rel);
+        let resolved = fs::canonicalize(&src)?;
+        if !resolved.starts_with(&canonical_root) {
+            return Err(GovernanceError::InvalidInput {
+                message: format!("update-pack item path '{rel}' resolves outside the pack root"),
+            });
+        }
+        let dst = stage.path().join(rel);
         if let Some(parent) = dst.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::copy(src, dst)?;
+        copy_regular_snapshot_file(&src, &dst, MAX_PACK_ITEM_BYTES, &mut payload_budget)?;
     }
+    after_snapshot();
+    let staged_verified =
+        verify_update_pack_file_with_policy(&stage_manifest, stage.path(), policy)?;
+    if staged_verified.get("valid").and_then(Value::as_bool) != Some(true)
+        || (require_authenticated
+            && staged_verified
+                .pointer("/signature/authenticated")
+                .and_then(Value::as_bool)
+                != Some(true))
+    {
+        return Ok(json!({
+            "schema_version": UPDATE_PACK_INSTALL_SCHEMA_VERSION,
+            "valid": false,
+            "verified": staged_verified
+        }));
+    }
+    // The source may change after the first verification. Even if another
+    // independently valid pack appears there, do not silently install a
+    // different identity, signature, or item set than the caller inspected.
+    if staged_verified["pack_id"] != verified["pack_id"]
+        || staged_verified["version"] != verified["version"]
+        || staged_verified["signature"] != verified["signature"]
+        || staged_verified["items"] != verified["items"]
+    {
+        return Err(GovernanceError::InvalidInput {
+            message: "update-pack source or authentication changed during installation".to_owned(),
+        });
+    }
+    let mut verified = staged_verified;
+    let pack_id = verified
+        .get("pack_id")
+        .and_then(Value::as_str)
+        .unwrap_or("pack")
+        .to_owned();
+    // A single component permits one atomic publish below. Nested pack IDs
+    // would require creating untrusted intermediate destination directories.
+    if !safe_pack_relative_path(&pack_id, true) {
+        return Err(GovernanceError::InvalidInput {
+            message: format!("update-pack pack_id '{pack_id}' must be one safe directory name"),
+        });
+    }
+    let target = install_dir.join(&pack_id);
+    if fs::symlink_metadata(&target).is_ok() {
+        return Err(GovernanceError::InvalidInput {
+            message: format!(
+                "update-pack destination '{}' already exists",
+                target.display()
+            ),
+        });
+    }
+    let reported_target = reported_install_dir.unwrap_or(install_dir).join(&pack_id);
+    verified["manifest"] = json!(path_string(&reported_target.join("pack.json")));
+    verified["root"] = json!(path_string(&reported_target));
     let installed = json!({
         "schema_version": UPDATE_PACK_INSTALL_SCHEMA_VERSION,
         "valid": true,
         "pack_id": pack_id,
-        "install_dir": path_string(&target),
+        "install_dir": path_string(&reported_target),
+        "publisher_authentication": {
+            "authenticated": verified.pointer("/signature/authenticated").and_then(Value::as_bool).unwrap_or(false),
+            "algorithm": verified.pointer("/signature/algorithm"),
+            "key_id": verified.pointer("/signature/key_id"),
+            "public_key_sha256": verified.pointer("/signature/public_key_sha256")
+        },
         "verified": verified
     });
     fs::write(
-        target.join("install.json"),
+        stage.path().join("install.json"),
         serde_json::to_vec_pretty(&installed)?,
     )?;
+    publish_pack_stage(stage.path(), &target)?;
+    let _ = stage.keep();
     Ok(installed)
+}
+
+fn publish_pack_stage(stage: &Path, target: &Path) -> Result<(), GovernanceError> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let source = CString::new(stage.as_os_str().as_bytes()).map_err(|_| {
+            GovernanceError::InvalidInput {
+                message: "update-pack stage path contains NUL".to_owned(),
+            }
+        })?;
+        let destination = CString::new(target.as_os_str().as_bytes()).map_err(|_| {
+            GovernanceError::InvalidInput {
+                message: "update-pack destination path contains NUL".to_owned(),
+            }
+        })?;
+        let status = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                source.as_ptr(),
+                libc::AT_FDCWD,
+                destination.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if status != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    fs::rename(stage, target)?;
+    Ok(())
+}
+
+fn safe_pack_relative_path(path: &str, single_component: bool) -> bool {
+    if path.is_empty()
+        || path.contains(['\\', ':'])
+        || path.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return false;
+    }
+    let mut components = Path::new(path).components();
+    let Some(std::path::Component::Normal(_)) = components.next() else {
+        return false;
+    };
+    let mut count = 1;
+    for component in components {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return false;
+        }
+        count += 1;
+    }
+    !single_component || count == 1
+}
+
+fn reject_symlink_ancestors(path: &Path) -> Result<(), GovernanceError> {
+    for ancestor in path.ancestors() {
+        match fs::symlink_metadata(ancestor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(GovernanceError::InvalidInput {
+                    message: format!(
+                        "update-pack destination '{}' has a symlink ancestor",
+                        path.display()
+                    ),
+                });
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn copy_regular_snapshot_file(
+    source: &Path,
+    destination: &Path,
+    item_limit: u64,
+    remaining_total: &mut u64,
+) -> Result<(), GovernanceError> {
+    let mut input = open_regular_nofollow(source)?;
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    let mut copied = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = input.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        let count = count as u64;
+        if copied.saturating_add(count) > item_limit || count > *remaining_total {
+            return Err(GovernanceError::InvalidInput {
+                message: "update-pack snapshot exceeds its byte budget".to_owned(),
+            });
+        }
+        output.write_all(&buffer[..count as usize])?;
+        copied += count;
+        *remaining_total -= count;
+    }
+    output.sync_all()?;
+    Ok(())
 }
 
 pub fn write_export_manifest(options: &ExportOptions) -> Result<Value, GovernanceError> {
@@ -1202,7 +2291,7 @@ fn export_governance_summary(options: &ExportOptions) -> Result<Value, Governanc
     let mut update_packs = Vec::new();
     for pack in &options.update_packs {
         let value = read_json(pack)?;
-        let (signature, _, _) = update_pack_signature_summary(&value, policy_value.as_ref());
+        let (signature, _, _) = update_pack_signature_summary(&value, policy_value.as_ref(), None);
         update_packs.push(json!({
             "path": path_string(pack),
             "pack_id": value.get("pack_id").and_then(Value::as_str).unwrap_or("unknown"),
@@ -4360,13 +5449,21 @@ fn runner_plan_budget_summary(path: &Path) -> Result<Value, GovernanceError> {
 fn update_pack_signature_summary(
     manifest: &Value,
     policy: Option<&Value>,
+    raw_manifest: Option<&[u8]>,
 ) -> (Value, Vec<Value>, bool) {
     let require_signature = policy
         .and_then(|value| value.pointer("/update_packs/require_signature"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let trusted_keys =
-        string_array(policy.and_then(|value| value.pointer("/update_packs/trusted_keys")));
+    let authentication_required = require_signature
+        || policy.is_some_and(|value| {
+            ["trusted_keys", "trusted_public_keys", "revoked_keys"]
+                .iter()
+                .any(|key| value.pointer(&format!("/update_packs/{key}")).is_some())
+                || value
+                    .pointer("/update_packs/require_signature")
+                    .is_some_and(|field| !field.is_boolean())
+        });
     let items = manifest
         .get("items")
         .and_then(Value::as_array)
@@ -4376,11 +5473,11 @@ fn update_pack_signature_summary(
     let mut diagnostics = Vec::new();
 
     let Some(signature) = manifest.get("signature") else {
-        if require_signature {
+        if authentication_required {
             diagnostics.push(json!({
-                "decision": "require_signature",
+                "decision": "require_authentication",
                 "allowed": false,
-                "message": "update pack signature is required by policy"
+                "message": "policy requires authenticated update packs, which this format cannot verify"
             }));
         }
         return (
@@ -4390,11 +5487,12 @@ fn update_pack_signature_summary(
                 "algorithm": Value::Null,
                 "key_id": Value::Null,
                 "trusted": false,
+                "authenticated": false,
                 "digest_match": false,
                 "expected_digest": expected_digest
             }),
             diagnostics,
-            !require_signature,
+            !authentication_required,
         );
     };
 
@@ -4402,6 +5500,14 @@ fn update_pack_signature_summary(
         .get("algorithm")
         .and_then(Value::as_str)
         .unwrap_or("");
+    if algorithm == "ed25519-json-v1" {
+        return authenticated_pack_signature_summary(
+            manifest,
+            policy,
+            raw_manifest,
+            require_signature,
+        );
+    }
     let key_id = signature
         .get("key_id")
         .and_then(Value::as_str)
@@ -4412,23 +5518,26 @@ fn update_pack_signature_summary(
         .unwrap_or("");
     let algorithm_ok = algorithm == "sha256-items-v1";
     let digest_match = digest == expected_digest;
-    let trusted = !key_id.is_empty()
-        && (trusted_keys.is_empty() || trusted_keys.iter().any(|trusted| trusted == key_id));
     let status = if !algorithm_ok {
         "unsupported_algorithm"
     } else if !digest_match {
         "mismatch"
-    } else if !trusted {
-        "untrusted"
     } else {
-        "verified"
+        "integrity_only"
     };
-    if status != "verified" {
+    if !algorithm_ok || !digest_match {
         diagnostics.push(json!({
-            "decision": "verify_signature",
+            "decision": "verify_digest",
             "allowed": false,
             "status": status,
-            "message": "update pack signature could not be verified against policy"
+            "message": "update pack digest could not be verified"
+        }));
+    }
+    if authentication_required {
+        diagnostics.push(json!({
+            "decision": "require_authentication",
+            "allowed": false,
+            "message": "sha256-items-v1 is an unkeyed integrity digest; key_id does not authenticate a publisher"
         }));
     }
 
@@ -4438,14 +5547,182 @@ fn update_pack_signature_summary(
             "status": status,
             "algorithm": algorithm,
             "key_id": key_id,
-            "trusted": trusted,
+            "trusted": false,
+            "authenticated": false,
             "digest": digest,
             "expected_digest": expected_digest,
             "digest_match": digest_match
         }),
         diagnostics,
-        status == "verified",
+        algorithm_ok && digest_match && !authentication_required,
     )
+}
+
+fn authenticated_pack_signature_summary(
+    manifest: &Value,
+    policy: Option<&Value>,
+    raw_manifest: Option<&[u8]>,
+    required: bool,
+) -> (Value, Vec<Value>, bool) {
+    let signature = &manifest["signature"];
+    let key_id = signature
+        .get("key_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let mut status = "malformed_manifest";
+    let mut fingerprint: Option<String> = None;
+    let mut valid = false;
+
+    let schema = raw_manifest.map_or_else(
+        || serde_json::from_value::<SignedPackManifest>(manifest.clone()),
+        |bytes| serde_json::from_slice::<SignedPackManifest>(bytes),
+    );
+    if let Ok(schema) = schema {
+        if signed_pack_schema_valid(&schema) && signed_pack_optional_types_valid(manifest) {
+            status = "unknown_key";
+            if let Some(pack_policy) = policy.and_then(|p| p.get("update_packs")) {
+                let trust = pack_policy
+                    .get("trusted_public_keys")
+                    .and_then(Value::as_object);
+                let revoked = pack_policy.get("revoked_keys").and_then(Value::as_array);
+                let policy_valid = policy.is_some_and(pack_auth_policy_schema_valid);
+                if !policy_valid {
+                    status = "malformed_policy";
+                } else if revoked
+                    .is_some_and(|keys| keys.iter().any(|value| value.as_str() == Some(key_id)))
+                {
+                    status = "revoked_key";
+                } else if let Some(public_key) = trust
+                    .and_then(|map| map.get(key_id))
+                    .and_then(Value::as_str)
+                    .and_then(|hex| hex_decode(hex, 32))
+                {
+                    fingerprint = Some(sha256_hex(&public_key));
+                    let signature_bytes = hex_decode(&schema.signature.signature, 64);
+                    if let Some(signature_bytes) = signature_bytes {
+                        match signed_pack_bytes(manifest) {
+                            Ok(message)
+                                if signature::UnparsedPublicKey::new(
+                                    &signature::ED25519,
+                                    &public_key,
+                                )
+                                .verify(&message, &signature_bytes)
+                                .is_ok() =>
+                            {
+                                status = "authenticated";
+                                valid = true;
+                            }
+                            _ => status = "invalid_signature",
+                        }
+                    } else {
+                        status = "malformed_manifest";
+                    }
+                }
+            }
+        }
+    }
+    let diagnostics = if valid {
+        Vec::new()
+    } else {
+        vec![json!({
+            "decision": "verify_authentication",
+            "allowed": false,
+            "status": status,
+            "message": "update pack authentication failed"
+        })]
+    };
+    (
+        json!({
+            "required": required,
+            "status": status,
+            "algorithm": "ed25519-json-v1",
+            "key_id": key_id,
+            "trusted": valid,
+            "authenticated": valid,
+            "public_key_sha256": fingerprint
+        }),
+        diagnostics,
+        valid,
+    )
+}
+
+fn valid_key_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+}
+
+fn pack_auth_policy_schema_valid(policy: &Value) -> bool {
+    let Some(pack_policy) = policy.get("update_packs") else {
+        return true;
+    };
+    let Some(pack_policy) = pack_policy.as_object() else {
+        return false;
+    };
+    pack_policy
+        .get("require_signature")
+        .is_none_or(Value::is_boolean)
+        && pack_policy.get("trusted_keys").is_none_or(|value| {
+            value
+                .as_array()
+                .is_some_and(|keys| keys.iter().all(Value::is_string))
+        })
+        && pack_policy.get("trusted_public_keys").is_none_or(|value| {
+            value.as_object().is_some_and(|map| {
+                map.iter().all(|(id, value)| {
+                    valid_key_id(id) && value.as_str().and_then(|hex| hex_decode(hex, 32)).is_some()
+                })
+            })
+        })
+        && pack_policy.get("revoked_keys").is_none_or(|value| {
+            value.as_array().is_some_and(|keys| {
+                keys.iter()
+                    .all(|value| value.as_str().is_some_and(valid_key_id))
+            })
+        })
+}
+
+fn signed_pack_schema_valid(pack: &SignedPackManifest) -> bool {
+    pack.schema_version == "bhf.update_pack.v1"
+        && !pack.pack_id.is_empty()
+        && !path_escapes_root(&pack.pack_id)
+        && !pack.version.is_empty()
+        && !pack.root.is_empty()
+        && !pack.items.is_empty()
+        && pack.signature.algorithm == "ed25519-json-v1"
+        && valid_key_id(&pack.signature.key_id)
+        && hex_decode(&pack.signature.signature, 64).is_some()
+        && pack.items.iter().all(|item| {
+            !item.kind.is_empty()
+                && !item.path.is_empty()
+                && !path_escapes_root(&item.path)
+                && hex_decode(&item.sha256, 32).is_some()
+                && item
+                    .license
+                    .as_ref()
+                    .is_none_or(|license| !license.is_empty())
+                && item
+                    .required_tools
+                    .as_ref()
+                    .is_none_or(|tools| tools.iter().all(|tool| !tool.is_empty()))
+        })
+}
+
+fn signed_pack_optional_types_valid(manifest: &Value) -> bool {
+    manifest
+        .get("items")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().all(|item| {
+                item.get("license").is_none_or(Value::is_string)
+                    && item.get("required_tools").is_none_or(|tools| {
+                        tools
+                            .as_array()
+                            .is_some_and(|tools| tools.iter().all(Value::is_string))
+                    })
+            })
+        })
 }
 
 fn pack_items_signature_digest(items: &[Value]) -> String {
@@ -5675,6 +6952,89 @@ mod install_security_tests {
         let installed = install_update_pack_file(&manifest, &root, &install_dir, None).unwrap();
         assert_eq!(installed["valid"], json!(true));
         assert!(install_dir.join("rules-2026/rules.json").is_file());
+    }
+
+    #[test]
+    fn legacy_pack_digest_is_integrity_only_and_strict_auth_policy_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        write(&root.join("rules.json"), "{\"rule\":1}");
+        let manifest = tmp.path().join("pack.json");
+        create_update_pack_file(
+            &root,
+            "legacy-pack",
+            Some("1"),
+            &["rules:rules.json".to_owned()],
+            None,
+            &[],
+            Some("forged-trusted-key"),
+            &manifest,
+        )
+        .unwrap();
+
+        let strict_policy = tmp.path().join("strict-policy.json");
+        write_json(
+            &strict_policy,
+            &json!({"update_packs": {"require_signature": true, "trusted_keys": ["forged-trusted-key"]}}),
+        )
+        .unwrap();
+        let strict =
+            verify_update_pack_file_with_policy(&manifest, &root, Some(&strict_policy)).unwrap();
+        assert_eq!(strict["valid"], false);
+        assert_eq!(strict["signature"]["status"], "integrity_only");
+        assert_eq!(strict["signature"]["authenticated"], false);
+        assert_eq!(strict["signature"]["trusted"], false);
+        let strict_install = tmp.path().join("strict-install");
+        assert_eq!(
+            install_update_pack_file(&manifest, &root, &strict_install, Some(&strict_policy))
+                .unwrap()["valid"],
+            false
+        );
+        assert!(!strict_install.exists());
+
+        write_json(
+            &strict_policy,
+            &json!({"update_packs": {"trusted_keys": ["forged-trusted-key"]}}),
+        )
+        .unwrap();
+        assert_eq!(
+            verify_update_pack_file_with_policy(&manifest, &root, Some(&strict_policy)).unwrap()
+                ["valid"],
+            false
+        );
+
+        let integrity_policy = tmp.path().join("integrity-policy.json");
+        write_json(
+            &integrity_policy,
+            &json!({"update_packs": {"require_signature": false}}),
+        )
+        .unwrap();
+        let integrity =
+            verify_update_pack_file_with_policy(&manifest, &root, Some(&integrity_policy)).unwrap();
+        assert_eq!(integrity["valid"], true);
+        assert_eq!(integrity["signature"]["digest_match"], true);
+        let integrity_install = tmp.path().join("integrity-install");
+        assert_eq!(
+            install_update_pack_file(
+                &manifest,
+                &root,
+                &integrity_install,
+                Some(&integrity_policy)
+            )
+            .unwrap()["valid"],
+            true
+        );
+        assert!(integrity_install.join("legacy-pack/rules.json").is_file());
+
+        let mut forged_manifest = read_json(&manifest).unwrap();
+        forged_manifest["signature"]["digest"] = json!("0".repeat(64));
+        write_json(&manifest, &forged_manifest).unwrap();
+        assert_eq!(
+            verify_update_pack_file_with_policy(&manifest, &root, Some(&integrity_policy)).unwrap()
+                ["valid"],
+            false
+        );
     }
 
     // ------------------------------------------------------------------

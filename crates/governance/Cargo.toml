@@ -13,8 +13,12 @@ path = "src/lib.rs"
 
 [dependencies]
 sbom_ingest = { path = "../sbom_ingest" }
+libc = "0.2"
+ring = "0.17.14"
+serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
