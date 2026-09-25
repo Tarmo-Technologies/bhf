@@ -38,10 +38,11 @@ for path in "$ARCHIVE" "$SIGNATURE" "$TRUSTED_PUBLIC_KEY"; do
   [[ -f "$path" && ! -L "$path" ]] || die "input must be a regular, non-symlink file: $path"
 done
 [[ "$(wc -c <"$SIGNATURE")" -eq 64 ]] || die "detached Ed25519 signature must be exactly 64 bytes"
-for command in openssl xxd mktemp; do
+for command in openssl mktemp; do
   command -v "$command" >/dev/null 2>&1 || die "$command is required"
 done
 
+[[ "$(wc -c <"$TRUSTED_PUBLIC_KEY")" -le 66 ]] || die "trusted public key file exceeds 66 bytes"
 PUBLIC_HEX="$(tr -d '\r\n' <"$TRUSTED_PUBLIC_KEY")"
 [[ "$PUBLIC_HEX" =~ ^[0-9a-f]{64}$ ]] || die "trusted public key must contain 64 lowercase hex characters"
 
@@ -53,7 +54,12 @@ cleanup() {
 trap cleanup EXIT
 
 # RFC 8410 Ed25519 SubjectPublicKeyInfo prefix followed by the raw 32-byte key.
-printf '302a300506032b6570032100%s' "$PUBLIC_HEX" | xxd -r -p >"$VERIFY_TMP/public.der"
+# The key was validated as exactly 32 bytes of lowercase hex above. Decode
+# using Bash builtins so minimal offline hosts do not need an xxd package.
+PUBLIC_DER_HEX="302a300506032b6570032100${PUBLIC_HEX}"
+for ((offset = 0; offset < ${#PUBLIC_DER_HEX}; offset += 2)); do
+  printf '%b' "\\x${PUBLIC_DER_HEX:offset:2}"
+done >"$VERIFY_TMP/public.der"
 {
   printf 'BHF.DIST.TARBALL.ED25519.V1\0'
   openssl dgst -sha256 -binary "$ARCHIVE"

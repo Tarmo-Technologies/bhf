@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "kind": "focused_inventory_assurance_validation_observation",
+  "date": "2026-09-25",
+  "base_commit": "566435a3da71037e971d611b939a1fe48fe115fe",
+  "validation_run_id": 36197319598,
+  "validation_setup_commit": "588a1e25211c9735bafb96ae54b172de71e5620a",
+  "tested_source_commit": "f3660679d15dcb355784ca0d993af5f29c58c702",
+  "tested_source_commit_note": "Source-only staging commit; the tested permanent CI workflow is recorded separately by its blob hash below.",
+  "workflow_conclusion": "success",
+  "publisher_job_id": 108277015054,
+  "source_blobs": {
+    "crates/governance/src/lib.rs": "e37bde2bfcca2932a95b0171ea2aba28c0f8d8e6",
+    "crates/governance/src/vex.rs": "2cf7394a6992c8bd1a0ab7b7c156dc90925d2635",
+    "crates/cli/src/sbom.rs": "ab1255476ea72fd7b6c605fdc060ecb8964554e3",
+    "crates/cli/tests/sbom_assurance_cli.rs": "61966d08060938a7ec3587764f50e1f53e8a1969",
+    "scripts/verify-offline-dist.sh": "49b7083bf5ec99a7b8bfb931865693990a3d1625",
+    "scripts/tests/test_offline_verifier.py": "93b23d7e8d9734a4d3cf60db598b94c7042e6bdb",
+    ".github/workflows/ci.yml": "10f318b382f8509811ddfc7bb1d76845a9859cb7",
+    "scripts/ci/build-test-openssl.sh": "d21c8441ec913574725bbb6247bdd211d04d59d0"
+  },
+  "source_parity": "Ubuntu and Windows recorded identical hashes for all seven recorded product/test/CI files; all match the locally reviewed files.",
+  "results": [
+    {"platform": "ubuntu-24.04", "job_id": 108276020357, "suite": "governance --lib", "passed": 74, "failed": 0},
+    {"platform": "ubuntu-24.04", "job_id": 108276020357, "suite": "bhf --lib sbom::tests", "passed": 13, "failed": 0},
+    {"platform": "ubuntu-24.04", "job_id": 108276020357, "suite": "sbom_assurance_cli", "passed": 10, "failed": 0},
+    {"platform": "ubuntu-24.04", "job_id": 108276020357, "suite": "offline_dist_scripts", "passed": 29, "failed": 0},
+    {"platform": "ubuntu-24.04", "job_id": 108276020357, "suite": "offline verifier signatures", "passed": 8, "failed": 0},
+    {"platform": "ubuntu-24.04", "job_id": 108276020357, "suite": "CI policy and workflow contracts", "passed": 50, "failed": 0},
+    {"platform": "windows-2022", "job_id": 108276020498, "suite": "governance --lib", "passed": 63, "failed": 0},
+    {"platform": "windows-2022", "job_id": 108276020498, "suite": "bhf --lib sbom::tests", "passed": 13, "failed": 0},
+    {"platform": "windows-2022", "job_id": 108276020498, "suite": "sbom_assurance_cli", "passed": 10, "failed": 0},
+    {"platform": "EL7-compatible glibc 2.17 container", "job_id": 108276020095, "suite": "governance --lib", "passed": 74, "failed": 0},
+    {"platform": "EL7-compatible glibc 2.17 container", "job_id": 108276020095, "suite": "sbom_assurance_cli", "passed": 10, "failed": 0},
+    {"platform": "EL7-compatible glibc 2.17 container", "job_id": 108276020095, "suite": "offline_dist_scripts", "passed": 29, "failed": 0},
+    {"platform": "EL7-compatible glibc 2.17 container", "job_id": 108276020095, "suite": "offline verifier signatures", "passed": 8, "failed": 0}
+  ],
+  "scope_note": "Focused SBOM unit filtering is intentional, not a full CLI library run. Native suites reported zero ignored tests. Windows does not run Unix shell installer/signature tests. EL7 uses the hosted kernel, not a physical legacy kernel.",
+  "downloaded_artifacts": [
+    {"id": 10890791028, "filename": "bhf-enterprise-ubuntu-final.zip", "sha256": "f144bbc97e08b990c9a82f3e16fad64c760ba5d01f9af926802f8e830e09a04c", "github_digest_verified": true},
+    {"id": 10890895116, "filename": "bhf-enterprise-windows-final.zip", "sha256": "01f5a094ef6e7a689fdd6e918c1598be91a33a52116604954052824c21ef4c42", "github_digest_verified": true},
+    {"id": 10890479407, "filename": "bhf-enterprise-el7-final.zip", "sha256": "93c55732051b3fd41cdf1695f88a3263841bdab749e916389e8f2b1ecd26bbc6", "github_digest_verified": true}
+  ],
+  "earlier_validation_runs": [
+    {"id": 36196568098, "conclusion": "failure", "reason": "Windows checkout CRLF mismatch stopped staging before native tests; EL7 lacked Ed25519-capable OpenSSL. Ubuntu focused tests passed."},
+    {"id": 36196761368, "conclusion": "failure", "reason": "Windows staging normalization fixed; native Windows and Ubuntu jobs passed; EL7 retained the old OpenSSL prerequisite failure."},
+    {"id": 36197161741, "conclusion": "failure", "reason": "OpenSSL source checksum matched, but Configure required the missing Perl IPC::Cmd module. The final run installed the distro Perl core prerequisite in the disposable container."}
+  ],
+  "ci_prerequisites": {
+    "python": "/opt/python/cp312-cp312/bin/python3",
+    "openssl_version": "3.5.8",
+    "openssl_source_sha256": "a8f84a39918ec6415ce765d9b429d313ba97b8143169c172e734b9514464f5b2",
+    "openssl_scope": "Separately prefixed test CLI built inside the EL7 container, no system OpenSSL replacement, no FIPS validation claim. Connected CI may install the distro Perl core package; this is not a hermetic build or an offline-deployment bootstrap."
+  },
+  "local_checks": {"python_ci_policy_passed": 50, "python_verifier_passed": 8, "native_toolchain_available": false},
+  "full_ci_passed": false,
+  "full_ci_note": "Not established by the focused validation workflow. Check the full development-branch CI for the exact published revision.",
+  "release_approved": false,
+  "main_merged": false,
+  "hardware_validated": false,
+  "enterprise_certification": "not_assessed",
+  "known_boundaries": [
+    "Matched advisories only; an empty queue is not proof of software safety or database completeness.",
+    "No signed adjudication importer, waiver or reviewer identity store.",
+    "Existing OpenVEX publisher metadata is unchanged and is not a signed attestation.",
+    "No atomic multi-report publication or multi-writer guarantee; use per-run output directories and check exit status.",
+    "Release publication acceptance enforcement and branch protection are unchanged."
+  ]
+}

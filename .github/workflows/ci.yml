@@ -86,6 +86,9 @@ jobs:
       - name: Test container validation contracts
         run: python3 -m unittest discover -s docker -p 'test_*.py'
 
+      - name: Test offline signature verifier
+        run: python3 -m unittest discover -s scripts/tests -p 'test_offline_verifier.py' -v
+
       - name: Build workspace
         run: cargo build --locked --workspace
 
@@ -157,6 +160,12 @@ jobs:
               set -euo pipefail
               curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
               export PATH="$CARGO_HOME/bin:$PATH"
+              test -x /opt/python/cp312-cp312/bin/python3
+              export PATH="/opt/python/cp312-cp312/bin:$PATH"
+              python3 --version
+              bash scripts/ci/build-test-openssl.sh /tmp/bhf-ci-openssl
+              export PATH="/tmp/bhf-ci-openssl/bin:$PATH"
+              openssl version
               cargo test --locked -p governance --lib
               cargo test --locked -p bhf --test offline_dist_scripts -- --nocapture
               cargo build --locked --release --workspace
