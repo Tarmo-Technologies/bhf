@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: Apache-2.0
+# Read-only staging validation; never publishes source or releases.
+name: Scheduler reliability validation
+on:
+  push:
+    branches: [maintenance/enterprise-scheduler-566435]
+permissions:
+  contents: read
+jobs:
+  baseline:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+      - name: Retain exact source inputs and existing test output
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p scheduler-evidence/source
+          git rev-parse HEAD > scheduler-evidence/revision.txt
+          rustc --version --verbose > scheduler-evidence/toolchain.txt
+          tar -cf scheduler-evidence/source/inputs.tar \
+            crates/continuous_daemon crates/daemon/src/lib.rs \
+            scripts/ci .github/workflows/ci.yml Cargo.toml Cargo.lock \
+            docs/enterprise-readiness-program.md
+          cargo test --locked -p continuous_daemon --lib 2>&1 | tee scheduler-evidence/baseline.log
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: ${{ always() }}
+        with:
+          name: scheduler-baseline
+          path: scheduler-evidence/
+          if-no-files-found: error
+          retention-days: 14
