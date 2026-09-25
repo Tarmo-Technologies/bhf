@@ -1,0 +1,213 @@
+--- a/crates/continuous_daemon/src/lib.rs
++++ b/crates/continuous_daemon/src/lib.rs
+@@ -16,6 +16,11 @@
+ //! into via the `Scheduler::submit` / `Scheduler::list_jobs`
+ //! surface.
+ 
++mod health;
++mod storage_lock;
++
++pub use health::{PersistencePhase, SchedulerHealth, StorageFault};
++
+ use serde::{Deserialize, Serialize};
+ use std::collections::{HashSet, VecDeque};
+ use std::io::{Read, Write};
+@@ -95,6 +100,8 @@
+ pub enum DaemonError {
+     #[error("data dir does not exist: {0}")]
+     DataDirMissing(PathBuf),
++    #[error("scheduler data directory is already owned by another instance: {0}")]
++    DataDirInUse(PathBuf),
+     #[error("bhf binary not found: {0}")]
+     BinMissing(PathBuf),
+     #[error("scheduler already shut down")]
+@@ -134,6 +141,8 @@
+     data_dir: PathBuf,
+     job_wall_grace: Duration,
+     limits: SchedulerLimits,
++    // Retained until Drop has joined every worker. The pathname is never removed.
++    _storage_lease: storage_lock::StorageLease,
+ }
+ 
+ struct SharedState {
+@@ -147,6 +156,7 @@
+     shutdown: bool,
+     next_id: u64,
+     snapshot_bytes_reserved: usize,
++    storage_fault: Option<StorageFault>,
+ }
+ 
+ impl Scheduler {
+@@ -201,6 +211,8 @@
+         if !config.bhf_bin.is_file() {
+             return Err(DaemonError::BinMissing(config.bhf_bin.clone()));
+         }
++        // Lock before inspecting/recovering history, not merely before writing it.
++        let storage_lease = storage_lock::acquire(&config.data_dir)?;
+         let state = Arc::new(SharedState {
+             inner: Mutex::new(InnerState {
+                 queue: VecDeque::new(),
+@@ -208,15 +220,16 @@
+                 shutdown: false,
+                 next_id: 0,
+                 snapshot_bytes_reserved: 0,
++                storage_fault: None,
+             }),
+             cv: Condvar::new(),
+         });
+ 
+         // Restore from disk if the previous run persisted any jobs.
+         let jobs_path = config.data_dir.join("jobs.jsonl");
+-        if jobs_path.is_file() {
++        if let Some(snapshot) = storage_lock::open_snapshot(&jobs_path)? {
+             let mut bytes = Vec::new();
+-            std::fs::File::open(&jobs_path)?
++            snapshot
+                 .take(limits.max_snapshot_bytes.saturating_add(1) as u64)
+                 .read_to_end(&mut bytes)?;
+             if bytes.len() > limits.max_snapshot_bytes {
+@@ -291,7 +304,7 @@
+             let bin = config.bhf_bin.clone();
+             let poll = config.poll_interval;
+             let webhook = config.webhook_url.clone();
+-            workers.push(std::thread::spawn(move || {
++            let worker = std::thread::Builder::new().spawn(move || {
+                 worker_loop(
+                     state_ref,
+                     data_dir,
+@@ -301,7 +314,21 @@
+                     shutdown_timeout,
+                     job_wall_grace,
+                 );
+-            }));
++            });
++            match worker {
++                Ok(handle) => workers.push(handle),
++                Err(error) => {
++                    {
++                        let mut guard = state.inner.lock().unwrap_or_else(|p| p.into_inner());
++                        guard.shutdown = true;
++                        state.cv.notify_all();
++                    }
++                    for handle in workers {
++                        let _ = handle.join();
++                    }
++                    return Err(DaemonError::Io(error));
++                }
++            }
+         }
+         Ok(Self {
+             state,
+@@ -309,6 +336,7 @@
+             data_dir: config.data_dir.clone(),
+             job_wall_grace,
+             limits,
++            _storage_lease: storage_lease,
+         })
+     }
+ 
+@@ -374,10 +402,12 @@
+         }
+         guard.seen.push(job.clone());
+         if let Err(failure) = persist(&self.data_dir, &guard.seen) {
++            health::latch_storage_fault(
++                &self.state, &mut guard, PersistencePhase::Admission, &job_id, &failure,
++            );
+             if failure.installed {
+                 guard.next_id = next_id;
+-                guard.shutdown = true;
+-                self.state.cv.notify_all();
++                guard.snapshot_bytes_reserved += reserved;
+                 return Err(DaemonError::DurabilityUncertain {
+                     job_id,
+                     source: failure.error,
+@@ -419,11 +449,7 @@
+ 
+ impl Drop for Scheduler {
+     fn drop(&mut self) {
+-        {
+-            let mut guard = self.state.inner.lock().unwrap_or_else(|p| p.into_inner());
+-            guard.shutdown = true;
+-            self.state.cv.notify_all();
+-        }
++        self.request_shutdown();
+         for handle in self.workers.drain(..) {
+             let _ = handle.join();
+         }
+@@ -446,15 +472,13 @@
+                 if guard.shutdown {
+                     return;
+                 }
+-                if let Some(job) = guard.queue.pop_front() {
+-                    let job_id = job.job_id.clone();
+-                    for seen in guard.seen.iter_mut() {
+-                        if seen.job_id == job_id {
+-                            seen.state = JobState::Running;
+-                            break;
+-                        }
++                if !guard.queue.is_empty() {
++                    // Persist Running while holding the state mutex. No worker may
++                    // dispatch an uncommitted transition or race its publication.
++                    match health::claim_job(&data_dir, &state, &mut guard, persist_jobs) {
++                        Some(job) => break job,
++                        None => return,
+                     }
+-                    break job;
+                 }
+                 guard = match state.cv.wait_timeout(guard, poll) {
+                     Ok((g, _)) => g,
+@@ -462,25 +486,15 @@
+                 };
+             }
+         };
+-        if let Err(error) = persist_locked(&data_dir, &state) {
+-            eprintln!("persist running fuzz job: {error}");
+-        }
+         let outcome = run_one_job(&bin, &job, &state, shutdown_timeout, job_wall_grace);
+         let final_state = match outcome {
+             JobOutcome::Finished(state) => state,
+             JobOutcome::Interrupted => JobState::Queued,
+         };
+-        {
+-            let mut guard = state.inner.lock().unwrap_or_else(|p| p.into_inner());
+-            for seen in guard.seen.iter_mut() {
+-                if seen.job_id == job.job_id {
+-                    seen.state = final_state;
+-                    break;
+-                }
+-            }
+-        }
+-        if let Err(error) = persist_locked(&data_dir, &state) {
+-            eprintln!("persist completed fuzz job: {error}");
++        if !health::finish_job(&data_dir, &state, &job.job_id, final_state, persist_jobs) {
++            // Do not notify completion, dispatch again, or overwrite the first
++            // uncertain snapshot after a storage fault. Recovery is explicit.
++            return;
+         }
+         if matches!(outcome, JobOutcome::Interrupted) {
+             return;
+@@ -823,12 +837,6 @@
+     let _http = tokens.next()?;
+     let status = std::str::from_utf8(tokens.next()?).ok()?;
+     status.trim().parse().ok()
+-}
+-
+-fn persist_locked(data_dir: &Path, state: &SharedState) -> Result<(), DaemonError> {
+-    let guard = state.inner.lock().unwrap_or_else(|p| p.into_inner());
+-    persist_jobs(data_dir, &guard.seen).map_err(|failure| DaemonError::Io(failure.error))?;
+-    Ok(())
+ }
+ 
+ struct PersistFailure {
+@@ -1302,9 +1310,10 @@
+     #[test]
+     fn submit_does_not_acknowledge_job_if_persistence_fails() {
+         let dir = tempdir("persist-error");
+-        std::fs::create_dir(dir.join("jobs.jsonl")).unwrap();
+         let scheduler =
+             Scheduler::start(&ok_config(dir.clone(), PathBuf::from("/bin/true"))).unwrap();
++        // Corrupt the destination after startup; startup now rejects non-files.
++        std::fs::create_dir(dir.join("jobs.jsonl")).unwrap();
+         assert!(matches!(
+             scheduler.submit(dir, "new".to_owned(), Duration::ZERO),
+             Err(DaemonError::Io(_))
