@@ -221,6 +221,7 @@ dependencies = [
  "target_rank",
  "target_transport",
  "tempfile",
+ "thiserror",
  "toml",
  "tree-sitter",
  "type_model",

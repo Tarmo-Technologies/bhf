@@ -87,6 +87,7 @@ mod stub;
 mod support_report;
 mod target_filter;
 pub mod transport_fault;
+mod transport_fuzz;
 
 #[derive(Debug, Parser)]
 #[command(name = "bhf")]

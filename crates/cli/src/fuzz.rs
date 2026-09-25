@@ -380,6 +380,26 @@ pub struct FuzzArgs {
     /// Not a standalone CLI flag.
     #[arg(skip)]
     pub stop_after_findings: Option<usize>,
+
+    /// Fuzz an off-host / on-target backend through the `target_transport` seam
+    /// (HDF-1b) instead of the host libFuzzer/AFL lane. Additive: when this is
+    /// absent the default host path runs byte-for-byte as before. Spec forms:
+    /// `agent:tcp:HOST:PORT`, `agent:serial:/dev/ttyX` (on-target agent),
+    /// `gdb:HOST:PORT` (debug-probe/emulator gdbstub; needs
+    /// `--transport-coverage-map`), and
+    /// `qemu-system:qmp=HOST:PORT,gdb=HOST:PORT[,snapshot=TAG]` (full-system;
+    /// needs `--transport-coverage-map`). Live agent/gdb/qemu backends are
+    /// hardware/emulator-gated; a malformed spec is a descriptive error.
+    #[arg(long = "target-transport", value_name = "SPEC")]
+    pub target_transport: Option<String>,
+
+    /// Locate the on-target coverage ring for the memory-read transports (`gdb`,
+    /// `qemu-system`) as
+    /// `input=<addr>,ring=<addr>,write=<addr>,wrapped=<addr>,cap=<n>` (each
+    /// `<addr>` is decimal or `0x`-hex). The `agent` transport carries coverage
+    /// over its protocol and rejects this option.
+    #[arg(long = "transport-coverage-map", value_name = "SPEC")]
+    pub transport_coverage_map: Option<String>,
 }
 
 impl FuzzArgs {
@@ -940,6 +960,13 @@ fn fatal_signal_report(status: &std::process::ExitStatus, stderr: &str) -> corpu
 }
 
 pub fn run(args: FuzzArgs) -> i32 {
+    // HDF-1b: when a target transport is requested, drive the additive
+    // transport-fuzz path (a separate loop over the `target_transport` seam) and
+    // leave the host libFuzzer/AFL path below untouched.
+    if crate::transport_fuzz::should_use_transport(&args) {
+        return crate::transport_fuzz::run(args);
+    }
+
     if multicore_requested(&args) {
         return run_multicore_campaign(args);
     }
@@ -1092,6 +1119,8 @@ pub(crate) fn run_one_target_programmatic_with_runner(
         structured_inputs: StructuredInputMode::Auto,
         bhf_bin: None,
         stop_after_findings,
+        target_transport: None,
+        transport_coverage_map: None,
     };
     let mut prepared = prepare(args)?;
     // A caller-supplied cross runner overrides the direct/host runner `prepare`
@@ -1158,6 +1187,8 @@ pub(crate) fn run_afl_plus_plus_programmatic(
         structured_inputs: StructuredInputMode::Auto,
         bhf_bin: None,
         stop_after_findings: None,
+        target_transport: None,
+        transport_coverage_map: None,
     };
     let prepared = prepare(args)?;
     run_afl_plus_plus(prepared)
@@ -8007,6 +8038,8 @@ mod auto_path_tests {
             structured_inputs,
             bhf_bin: None,
             stop_after_findings: None,
+            target_transport: None,
+            transport_coverage_map: None,
         }
     }
 }
