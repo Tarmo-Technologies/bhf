@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Staging-only validation. Native test jobs cannot write to the repository.
+# Staging-only, read-only validation. No source or release publication.
 name: Scheduler reliability validation
 on:
   push:
@@ -22,24 +22,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
           toolchain: stable
-          components: rustfmt
-      - name: Apply the exact reviewed source patch
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD:crates/continuous_daemon/src/lib.rs)" = d8d5f7ce1221806ffaaae87592e00626504347e5
-          git -c core.autocrlf=false checkout-index -f -- crates/continuous_daemon/src/lib.rs crates/continuous_daemon/src/health.rs crates/continuous_daemon/src/health_tests.rs crates/continuous_daemon/src/storage_lock.rs scripts/maintenance/scheduler-storage.patch
-          echo '317e76b80f3a95928ad74532fd5009ab5872dca7e365c1c7fe83ee693942a7f6  scripts/maintenance/scheduler-storage.patch' | sha256sum -c -
-          git apply --check scripts/maintenance/scheduler-storage.patch
-          git apply scripts/maintenance/scheduler-storage.patch
-          rustfmt --edition 2021 crates/continuous_daemon/src/health.rs crates/continuous_daemon/src/storage_lock.rs
-      - name: Test scheduler behavior and retain evidence
+      - name: Test the exact committed source
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p scheduler-evidence/source
           cp crates/continuous_daemon/src/{lib,health,health_tests,storage_lock}.rs scheduler-evidence/source/
-          git diff --binary > scheduler-evidence/tested.patch
+          git rev-parse HEAD > scheduler-evidence/revision.txt
           rustc --version --verbose > scheduler-evidence/toolchain.txt
           if [[ "$RUNNER_OS" == Windows ]]; then
             cargo test --locked -p continuous_daemon --lib health::tests 2>&1 | tee scheduler-evidence/runtime.log
@@ -55,61 +44,48 @@ jobs:
           path: scheduler-evidence/
           if-no-files-found: error
           retention-days: 14
-  minimum-rust:
+  legacy:
+    name: EL7 scheduler, installer, and release ABI
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
-        with:
-          toolchain: 1.88.0
-      - run: |
-          test "$(git rev-parse HEAD:crates/continuous_daemon/src/lib.rs)" = d8d5f7ce1221806ffaaae87592e00626504347e5
-          git apply --check scripts/maintenance/scheduler-storage.patch
-          git apply scripts/maintenance/scheduler-storage.patch
-          cargo +1.88.0 check --locked -p continuous_daemon --all-targets
-  publish-reviewed-source:
-    name: Save source only after native checks pass
-    needs: [native, minimum-rust]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
-        with:
-          toolchain: stable
-          components: rustfmt
-      - name: Materialize only the identical tested source edits
+      - name: Exercise actual old userspace without skipping installer checks
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD:crates/continuous_daemon/src/lib.rs)" = d8d5f7ce1221806ffaaae87592e00626504347e5
-          echo '317e76b80f3a95928ad74532fd5009ab5872dca7e365c1c7fe83ee693942a7f6  scripts/maintenance/scheduler-storage.patch' | sha256sum -c -
-          git apply --check scripts/maintenance/scheduler-storage.patch
-          git apply scripts/maintenance/scheduler-storage.patch
-          rustfmt --edition 2021 crates/continuous_daemon/src/health.rs crates/continuous_daemon/src/storage_lock.rs
-          git add crates/continuous_daemon/src/lib.rs crates/continuous_daemon/src/health.rs crates/continuous_daemon/src/health_tests.rs crates/continuous_daemon/src/storage_lock.rs
-          git diff --cached --check
-          git config user.name crook3dfingers
-          git config user.email 58201909+crook3dfingers@users.noreply.github.com
-          git commit -m 'fix(scheduler): lock storage, stop on persistence faults, and expose health' -m "Native Linux/Windows scheduler checks and Rust 1.88 compatibility passed in run $GITHUB_RUN_ID. Only the reviewed scheduler source is changed by this commit. Full workspace/release acceptance is separate."
-          git rev-parse HEAD
-      - name: Fast-forward staging source without overwriting concurrent changes
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          test "$GITHUB_REF" = refs/heads/maintenance/enterprise-scheduler-566435
-          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
-          echo "::add-mask::$auth"
-          remote="$(git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" ls-remote origin "$GITHUB_REF" | cut -f1)"
-          test "$remote" = "$GITHUB_SHA"
-          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" push origin "HEAD:$GITHUB_REF"
+          mkdir -p scheduler-evidence
+          git rev-parse HEAD > scheduler-evidence/revision.txt
+          docker run --rm --volume "$GITHUB_WORKSPACE:/io" --workdir /io \
+            --env CARGO_HOME=/tmp/cargo --env RUSTUP_HOME=/tmp/rustup \
+            --env CARGO_TARGET_DIR=/io/target/scheduler-el7 \
+            quay.io/pypa/manylinux2014_x86_64@sha256:0d25b049964b2549b83384036abdff06789a8c0b1e9ff003ec80f0d531f79e50 \
+            bash -lc '
+              set -euo pipefail
+              # The pinned manylinux image installs CPython outside default PATH.
+              test -x /opt/python/cp311-cp311/bin/python3
+              export PATH="/opt/python/cp311-cp311/bin:$PATH"
+              # xxd is required by the independent archive-signature verifier.
+              yum -y install vim-common
+              command -v python3
+              python3 --version
+              command -v xxd
+              ldd --version
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+              export PATH="$CARGO_HOME/bin:$PATH"
+              rustc --version --verbose
+              cargo test --locked -p continuous_daemon --lib
+              cargo test --locked -p governance --lib
+              cargo test --locked -p bhf --test offline_dist_scripts -- --nocapture
+              cargo build --locked --release --workspace
+              scripts/check-linux-release-abi.sh "$CARGO_TARGET_DIR/release"
+            ' 2>&1 | tee scheduler-evidence/el7.log
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: ${{ always() }}
+        with:
+          name: scheduler-el7
+          path: scheduler-evidence/
+          if-no-files-found: error
+          retention-days: 14
