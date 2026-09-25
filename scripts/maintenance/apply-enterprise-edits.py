@@ -34,5 +34,15 @@ for path, text in payload['files'].items():
         raise SystemExit('new file already exists: ' + path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(text.encode('utf-8'))
+# Follow-up to the observed EL7 OpenSSL 1.0.2 prerequisite failure. The product
+# source payload is unchanged; the permanent CI uses the same pinned bootstrap
+# as this temporary validation workflow.
+ci = Path('.github/workflows/ci.yml')
+text = ci.read_text(encoding='utf-8')
+old = '              python3 --version\n              openssl version\n              cargo test --locked -p governance --lib'
+new = '              python3 --version\n              bash scripts/ci/build-test-openssl.sh /tmp/bhf-ci-openssl\n              export PATH="/tmp/bhf-ci-openssl/bin:$PATH"\n              openssl version\n              cargo test --locked -p governance --lib'
+if text.count(old) != 1:
+    raise SystemExit('unexpected EL7 prerequisite context')
+ci.write_bytes(text.replace(old, new).encode('utf-8'))
 subprocess.run(['git', 'diff', '--check'], check=True)
 print('Applied reviewed source, test, verifier and CI edits to exact original blobs.')

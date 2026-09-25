@@ -7,6 +7,7 @@ on:
       - .github/workflows/enterprise-hardening-validation.yml
       - scripts/maintenance/apply-enterprise-edits.py
       - scripts/maintenance/enterprise-edits.json.gz
+      - scripts/ci/build-test-openssl.sh
 permissions:
   contents: read
 jobs:
@@ -95,8 +96,9 @@ jobs:
               test -x /opt/python/cp312-cp312/bin/python3
               export PATH="/opt/python/cp312-cp312/bin:$PATH"
               python3 --version
+              bash scripts/ci/build-test-openssl.sh /tmp/bhf-ci-openssl
+              export PATH="/tmp/bhf-ci-openssl/bin:$PATH"
               openssl version
-              find /opt /usr/local -type f -name openssl -print
               curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
               export PATH="$CARGO_HOME/bin:$PATH"
               cargo test --locked -p governance --lib
