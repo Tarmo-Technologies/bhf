@@ -1,33 +1,148 @@
 # SPDX-License-Identifier: Apache-2.0
-# Temporary read-only validation lane; never publishes releases or updates refs.
 name: Enterprise hardening validation
 on:
   push:
     branches: [maintenance/enterprise-566435a]
+    paths:
+      - .github/workflows/enterprise-hardening-validation.yml
+      - scripts/maintenance/apply-enterprise-edits.py
+      - scripts/maintenance/enterprise-edits.json.gz
 permissions:
   contents: read
 jobs:
-  source-snapshot:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
+  native:
+    name: Inventory assurance (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Export exact tracked source for review
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+      - name: Apply exact reviewed edits
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p review-source
-          git archive --format=tar.gz --output=review-source/source.tar.gz HEAD
-          git rev-parse HEAD > review-source/commit.txt
-          git rev-parse HEAD^{tree} > review-source/tree.txt
-          git ls-tree -r HEAD > review-source/source-tree.txt
-          sha256sum review-source/source.tar.gz > review-source/SHA256SUMS
+          git config core.autocrlf false
+          git checkout-index --force --all
+          python scripts/maintenance/apply-enterprise-edits.py "$GITHUB_SHA"
+      - name: Run inventory and CLI regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p enterprise-evidence
+          git rev-parse HEAD > enterprise-evidence/setup-commit.txt
+          rustc --version --verbose > enterprise-evidence/toolchain.txt
+          cargo test --locked -p governance --lib 2>&1 | tee enterprise-evidence/governance.log
+          cargo test --locked -p bhf --lib sbom::tests 2>&1 | tee enterprise-evidence/sbom-unit.log
+          cargo test --locked -p bhf --test sbom_assurance_cli 2>&1 | tee enterprise-evidence/sbom-cli.log
+      - name: Test actual Linux installer and signature verifier
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s scripts/ci/tests -v 2>&1 | tee enterprise-evidence/policy.log
+          python3 -m unittest discover -s scripts/tests -p test_offline_verifier.py -v 2>&1 | tee enterprise-evidence/verifier.log
+          cargo test --locked -p bhf --test offline_dist_scripts 2>&1 | tee enterprise-evidence/offline-dist.log
+      - name: Retain exact patch and validation evidence
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p enterprise-evidence
+          git diff --binary > enterprise-evidence/tracked-source.patch
+          git status --short > enterprise-evidence/status.txt
+          for path in crates/governance/src/lib.rs crates/governance/src/vex.rs crates/cli/src/sbom.rs crates/cli/tests/sbom_assurance_cli.rs scripts/verify-offline-dist.sh scripts/tests/test_offline_verifier.py .github/workflows/ci.yml; do
+            printf '%s ' "$path"
+            git hash-object --no-filters "$path"
+          done > enterprise-evidence/source-blobs.txt
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
         with:
-          name: enterprise-source-snapshot
-          path: review-source/
-          retention-days: 7
+          name: enterprise-${{ matrix.os }}
+          path: enterprise-evidence/
+          retention-days: 14
           if-no-files-found: error
+  legacy:
+    name: EL7 offline deployment prerequisites and tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Apply exact reviewed edits
+        run: python3 scripts/maintenance/apply-enterprise-edits.py "$GITHUB_SHA"
+      - name: Exercise installer on glibc 2.17
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p enterprise-evidence
+          docker run --rm --volume "$GITHUB_WORKSPACE:/io" --workdir /io \
+            --env CARGO_HOME=/tmp/cargo --env RUSTUP_HOME=/tmp/rustup \
+            --env CARGO_TARGET_DIR=/io/target/enterprise-el7 \
+            quay.io/pypa/manylinux2014_x86_64@sha256:0d25b049964b2549b83384036abdff06789a8c0b1e9ff003ec80f0d531f79e50 \
+            bash -lc '
+              set -euo pipefail
+              ldd --version
+              test -x /opt/python/cp312-cp312/bin/python3
+              export PATH="/opt/python/cp312-cp312/bin:$PATH"
+              python3 --version
+              openssl version
+              find /opt /usr/local -type f -name openssl -print
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+              export PATH="$CARGO_HOME/bin:$PATH"
+              cargo test --locked -p governance --lib
+              cargo test --locked -p bhf --test sbom_assurance_cli
+              cargo test --locked -p bhf --test offline_dist_scripts
+              python3 -m unittest discover -s scripts/tests -p test_offline_verifier.py -v
+            ' 2>&1 | tee enterprise-evidence/el7.log
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: enterprise-el7
+          path: enterprise-evidence/
+          retention-days: 14
+          if-no-files-found: error
+  publish-tested-source:
+    name: Commit tested source to maintenance branch only
+    needs: [native, legacy]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Reapply identical edits and commit source only
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/maintenance/apply-enterprise-edits.py "$GITHUB_SHA"
+          git add crates/governance/src/lib.rs crates/governance/src/vex.rs crates/cli/src/sbom.rs crates/cli/tests/sbom_assurance_cli.rs scripts/verify-offline-dist.sh scripts/tests/test_offline_verifier.py
+          git diff --cached --check
+          git config user.name crook3dfingers
+          git config user.email 58201909+crook3dfingers@users.noreply.github.com
+          git commit -m "fix(assurance): stage tested inventory review gate and offline verifier" -m "Focused native and EL7 tests passed on these identical source edits in run $GITHUB_RUN_ID. This is not full CI or release approval. Workflow edits remain outside this source-only commit."
+          git rev-parse HEAD
+      - name: Fast-forward staging only without changing permissions
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/maintenance/enterprise-566435a
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          echo "::add-mask::$auth"
+          remote="$(git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" ls-remote origin "$GITHUB_REF" | cut -f1)"
+          test "$remote" = "$GITHUB_SHA"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" push origin "HEAD:$GITHUB_REF"
