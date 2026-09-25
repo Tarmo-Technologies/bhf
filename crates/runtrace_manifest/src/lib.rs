@@ -202,6 +202,31 @@ pub const MANIFEST: &[ManifestEntry] = &[
         &[b"ioctl\0"],
         "answer device capability ioctls so a driver reaches the virtualized register window",
     ),
+    ManifestEntry::always_on(
+        "rtos",
+        &[
+            b"msgQCreate\0",
+            b"msgQReceive\0",
+            b"msgQSend\0",
+            b"msgQDelete\0",
+            b"semBCreate\0",
+            b"semMCreate\0",
+            b"semCCreate\0",
+            b"semTake\0",
+            b"semGive\0",
+            b"semDelete\0",
+            b"xQueueCreate\0",
+            b"xQueueGenericCreate\0",
+            b"xQueueReceive\0",
+            b"xQueueGenericReceive\0",
+            b"xQueueGenericSend\0",
+            b"CFE_SB_CreatePipe\0",
+            b"CFE_SB_RcvMsg\0",
+            b"CFE_SB_ReceiveBuffer\0",
+            b"bhf_shim_mmio_fill\0",
+        ],
+        "deliver fuzz input through vendor-RTOS receive channels (VxWorks msgQReceive/semTake, FreeRTOS xQueueReceive, cFS CFE_SB_RcvMsg) and map fuzz-controlled fixed-address MMIO",
+    ),
 ];
 
 #[cfg(test)]

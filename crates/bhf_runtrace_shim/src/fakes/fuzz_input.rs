@@ -214,6 +214,46 @@ pub fn read_keyed(key: u64, out: &mut [u8]) -> usize {
     out.len()
 }
 
+/// HDF-6 deliverable 1: fuzz-driven stub return value.
+///
+/// A fuzz-driven weak stub (emitted by `c_stub_gen`/`stub_gen` in fuzz-driven
+/// mode) calls this to draw its scalar return value from the live fuzz input,
+/// keyed by its own symbol name so each stubbed dependency is an INDEPENDENT
+/// channel — exactly the per-resource keying the mqueue / file / MMIO fakes use
+/// via [`crate::fakes::data::fill_bytes`]. `read_sensor()` and `read_status()`
+/// therefore see distinct, deterministic windows of the corpus, and the fuzzer's
+/// coverage feedback learns a stable input-byte → return-value mapping.
+///
+/// Mode dispatch matches every other fake:
+/// * Audit / Empty → 0 (so a fuzz-driven-stub binary run under audit is
+///   byte-for-byte the constant stub, and a shim-less run — where the weak
+///   symbol resolves to NULL and the stub's own `?:` falls back to 0 — matches).
+/// * Rng → a per-symbol pseudo-random 64-bit value.
+/// * FuzzDriven → the symbol's keyed window of the live fuzz input.
+///
+/// # Safety
+///
+/// `symbol` must be NULL or a valid NUL-terminated C string valid for read for
+/// the duration of the call. The bytes are copied before returning.
+#[no_mangle]
+pub unsafe extern "C" fn bhf_shim_fuzz_stub_value(symbol: *const libc::c_char) -> u64 {
+    let name: &[u8] = if symbol.is_null() {
+        b"stub"
+    } else {
+        std::ffi::CStr::from_ptr(symbol).to_bytes()
+    };
+    let mut buf = [0u8; 8];
+    // `fill_bytes` returns 0 written for Audit/Empty (buf stays zero -> 0), the
+    // per-symbol RNG stream for Rng, and the symbol's keyed fuzz window for
+    // FuzzDriven. It also honours env-capsule record/replay, so a fuzz-driven
+    // stub's return reproduces deterministically in a pinned world.
+    let n = crate::fakes::data::fill_bytes(name, &mut buf);
+    if n == 0 {
+        return 0;
+    }
+    u64::from_le_bytes(buf)
+}
+
 pub fn contains_bytes(needle: &[u8]) -> bool {
     taint_span(needle, needle.len()).is_some()
 }
@@ -375,6 +415,22 @@ mod tests {
         assert_eq!(read_into(&mut sequential), 0);
         assert_eq!(read_keyed(7, &mut keyed), 0);
         assert!(taint_span(b"previous", 4).is_none());
+        reset();
+    }
+
+    #[test]
+    fn fuzz_stub_value_is_zero_without_a_fuzzing_pass() {
+        // HDF-6 D1: in the default (audit) pass, `fill_bytes` writes nothing, so a
+        // fuzz-driven stub's return falls back to the constant 0 — the byte-for-byte
+        // constant-stub guarantee for a shim-less / audit run. Also exercises the
+        // null-symbol path.
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset();
+        unsafe {
+            assert_eq!(bhf_shim_fuzz_stub_value(std::ptr::null()), 0);
+            let sym = c"read_sensor";
+            assert_eq!(bhf_shim_fuzz_stub_value(sym.as_ptr()), 0);
+        }
         reset();
     }
 

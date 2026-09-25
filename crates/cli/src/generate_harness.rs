@@ -113,6 +113,15 @@ pub struct GenerateHarnessArgs {
     /// duplicate definitions.
     #[arg(skip)]
     pub archive_backed: bool,
+
+    /// HDF-6 deliverable 4: the HDF-5 environment/peripheral model to attach to a
+    /// C *direct* harness. Populated by the `auto` loop only for a discovered
+    /// `ChannelConsumer`/`RegisteredEntryPoint` target (fuzz-fed peripheral read
+    /// accessors and/or fuzz-driven callbacks); `None` (the default, and the only
+    /// value for standalone `generate-harness` CLI use) leaves emission
+    /// byte-for-byte unchanged.
+    #[arg(skip)]
+    pub environment: Option<harness_gen::c_generate::CEnvironmentModel>,
 }
 
 /// CLI overrides for the C and C++ harness decoder synthesis caps (§27.11),
@@ -304,6 +313,7 @@ pub fn generate_for_path(
         tree_type_defs,
         decoder_limits,
         force,
+        None,
     )
 }
 
@@ -321,6 +331,7 @@ pub fn generate_for_path_with_kind(
     tree_type_defs: Option<TreeTypeDefs>,
     decoder_limits: DecoderLimitArgs,
     force: bool,
+    environment: Option<harness_gen::c_generate::CEnvironmentModel>,
 ) -> Result<()> {
     generate_for_path_with_kind_and_linkage(
         source,
@@ -336,6 +347,7 @@ pub fn generate_for_path_with_kind(
         decoder_limits,
         force,
         false,
+        environment,
     )
 }
 
@@ -356,6 +368,7 @@ pub(crate) fn generate_for_path_with_kind_archive_backed(
     tree_type_defs: Option<TreeTypeDefs>,
     decoder_limits: DecoderLimitArgs,
     force: bool,
+    environment: Option<harness_gen::c_generate::CEnvironmentModel>,
 ) -> Result<()> {
     generate_for_path_with_kind_and_linkage(
         source,
@@ -371,6 +384,7 @@ pub(crate) fn generate_for_path_with_kind_archive_backed(
         decoder_limits,
         force,
         true,
+        environment,
     )
 }
 
@@ -389,6 +403,7 @@ fn generate_for_path_with_kind_and_linkage(
     decoder_limits: DecoderLimitArgs,
     force: bool,
     archive_backed: bool,
+    environment: Option<harness_gen::c_generate::CEnvironmentModel>,
 ) -> Result<()> {
     let args = GenerateHarnessArgs {
         source: source.to_path_buf(),
@@ -419,6 +434,7 @@ fn generate_for_path_with_kind_and_linkage(
         decoder_limits,
         force,
         archive_backed,
+        environment,
     };
     run(args)
 }
@@ -2948,7 +2964,7 @@ fn run_c_direct(args: &GenerateHarnessArgs) -> Result<()> {
         };
         harness_gen::c_generate::generate_c_direct_harness(
             harness_gen::c_generate::GenerateCDirectArgs {
-                environment: None,
+                environment: args.environment.clone(),
                 harness_id: id,
                 output_dir: output_dir.clone(),
                 source_path: source_path.clone(),
@@ -16195,12 +16211,84 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         };
         run(args).unwrap();
         let main_c = fs::read_to_string(out.join("H-CUSTOM/main.c")).unwrap();
         assert!(
             main_c.contains("custom_handle_free(R)"),
             "expected --cleanup expression in generated harness: {main_c}"
+        );
+    }
+
+    /// HDF-6 D4 (CLI plumbing): a `GenerateHarnessArgs.environment` threads through
+    /// `run` -> `run_c_direct` -> `GenerateCDirectArgs.environment` so the emitted C
+    /// direct harness fabricates the fuzz-fed peripheral read accessor and arms the
+    /// fuzz-fed environment source. (Derivation from a discovered ChannelConsumer is
+    /// unit-tested in `auto::attempt`.)
+    #[test]
+    fn environment_model_threads_through_run_to_the_c_harness() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("bhf-env-plumb-{nonce}"));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("periph.c");
+        fs::write(
+            &source,
+            "#include <stdint.h>\n\
+             extern uint32_t mmio_read32(uintptr_t addr);\n\
+             int poll_reg(void) {\n\
+             \x20   uint32_t v = mmio_read32(0x40000000);\n\
+             \x20   if (v == 0xCAFE) return 1;\n\
+             \x20   return 0;\n}\n",
+        )
+        .unwrap();
+        let out = root.join("generated_harnesses");
+        let args = GenerateHarnessArgs {
+            source: source.clone(),
+            target: Some("poll_reg".to_owned()),
+            target_line: None,
+            output: out.clone(),
+            id: Some("H-ENVP".to_owned()),
+            kind: "direct".to_owned(),
+            source_roots: Vec::new(),
+            project: None,
+            source_trees: Vec::new(),
+            extra_sources: Vec::new(),
+            extra_includes: Vec::new(),
+            cleanup: None,
+            template_instantiate: Vec::new(),
+            tree_type_defs: None,
+            decoder_limits: Default::default(),
+            force: false,
+            archive_backed: false,
+            environment: Some(harness_gen::c_generate::CEnvironmentModel {
+                peripheral_readers: vec![harness_gen::c_generate::CPeripheralReader {
+                    return_type: "uint32_t".to_owned(),
+                    name: "mmio_read32".to_owned(),
+                    params: vec![harness_gen::c_generate::CPeripheralParam {
+                        c_type: "uintptr_t".to_owned(),
+                        name: "bhf_arg0".to_owned(),
+                    }],
+                }],
+                fuzz_driven_callbacks: true,
+            }),
+        };
+        run(args).unwrap();
+        let main_c = fs::read_to_string(out.join("H-ENVP/main.c")).unwrap();
+        assert!(
+            main_c.contains("uint32_t mmio_read32(uintptr_t bhf_arg0)"),
+            "the environment's peripheral accessor must be synthesized: {main_c}"
+        );
+        assert!(
+            main_c.contains("return (uint32_t)_bhf_env_next_u32();"),
+            "the accessor must draw the next fuzz value: {main_c}"
+        );
+        assert!(
+            main_c.contains("_bhf_env_data = Data;"),
+            "the fuzz-fed source must be armed from the input: {main_c}"
         );
     }
 
@@ -16245,6 +16333,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: DecoderLimitArgs::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         };
 
         // Default cap (16): the historical container element-count bound.
@@ -16361,6 +16450,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         };
         let err = run(args).expect_err("generic-package target must be refused");
         assert!(
@@ -16406,6 +16496,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         };
         run(args).expect("private-child direct target must use a child harness, not be refused");
         // No public bridge; a private-child-subprogram harness spec + body. Ada is
@@ -16465,6 +16556,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         };
         run(args).expect("private-type-sig private-child target must use a child harness");
         // No bridge; instead a private-child-subprogram harness spec + body.
@@ -16516,6 +16608,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         };
         let err = run(args).expect_err("non-direct private child must still be refused");
         assert!(
@@ -16577,6 +16670,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         };
         run(args).expect("generic codec package must be instantiated, not skipped");
         let main_adb = fs::read_to_string(out.join("H-CODEC/main.adb")).unwrap();
@@ -16643,6 +16737,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         };
         run(args)
             .expect("generic-package op with a synthesizable record param must not be skipped");
@@ -16708,6 +16803,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         };
         run(args).expect("out param of a private type must be declared bare, not skipped");
         let main_adb = fs::read_to_string(out.join("H-OUTPRIV/main.adb")).unwrap();
@@ -16761,6 +16857,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         };
         run(args).expect("generic encoder subprogram must be instantiated");
         let main_adb = fs::read_to_string(out.join("H-ENC/main.adb")).unwrap();
@@ -16812,6 +16909,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         };
         let err = run(args).expect_err("generic subprogram target must be refused");
         assert!(
@@ -17055,6 +17153,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         };
 
         let error = run(args).unwrap_err();
@@ -17088,6 +17187,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         };
 
         run(args).unwrap();
@@ -17143,6 +17243,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         };
 
         run(args).unwrap();
@@ -17193,6 +17294,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap();
 
@@ -17245,6 +17347,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         };
 
         run(args).unwrap();
@@ -17311,6 +17414,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         };
 
         run(args).unwrap();
@@ -17378,6 +17482,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         };
 
         run(args).unwrap();
@@ -17443,6 +17548,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         };
 
         run(args).unwrap();
@@ -17510,6 +17616,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         };
 
         run(args).unwrap();
@@ -17566,6 +17673,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         };
 
         run(args).unwrap();
@@ -17621,6 +17729,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         };
 
         run(args).unwrap();
@@ -17674,6 +17783,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         };
 
         run(args).expect("harness generation finds the dependency constructor");
@@ -17728,6 +17838,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         };
 
         run(args).unwrap();
@@ -17772,6 +17883,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         };
 
         run(args).unwrap();
@@ -17823,6 +17935,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap();
 
@@ -17897,6 +18010,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap();
 
@@ -17940,6 +18054,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap();
 
@@ -18011,6 +18126,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap();
 
@@ -18075,6 +18191,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap();
 
@@ -18183,6 +18300,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap();
 
@@ -18258,6 +18376,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap();
 
@@ -18322,6 +18441,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap();
 
@@ -18374,6 +18494,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap();
 
@@ -18435,6 +18556,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap();
 
@@ -18521,6 +18643,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap();
 
@@ -18638,6 +18761,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap();
 
@@ -18700,6 +18824,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap();
 
@@ -18780,6 +18905,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .expect("the owner TU supplies the header's missing context");
 
@@ -18838,6 +18964,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap_err()
         .to_string();
@@ -18896,6 +19023,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap();
 
@@ -19392,6 +19520,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap();
 
@@ -19438,6 +19567,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap();
 
@@ -19487,6 +19617,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap();
 
@@ -19525,6 +19656,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         };
 
         run(args).unwrap();
@@ -19570,6 +19702,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap();
 
@@ -19619,6 +19752,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap();
 
@@ -19716,6 +19850,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap();
 
@@ -19755,6 +19890,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap();
 
@@ -19838,6 +19974,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
                 decoder_limits: Default::default(),
                 force: false,
                 archive_backed: false,
+                environment: None,
             })
             .expect_err("non-synthesizable class parameter must stop before build");
             assert!(
@@ -19881,6 +20018,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap();
 
@@ -19971,6 +20109,7 @@ class basic_json
                 decoder_limits: Default::default(),
                 force: false,
                 archive_backed: false,
+                environment: None,
             })?;
             Ok(fs::read_to_string(temp.join(format!("out/H-X-P99-{tag}/main.cpp"))).unwrap())
         }
@@ -20095,6 +20234,7 @@ class basic_json
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap();
 
@@ -20186,6 +20326,7 @@ class basic_json
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap();
 
@@ -20242,6 +20383,7 @@ class basic_json
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap();
 
@@ -20289,6 +20431,7 @@ class basic_json
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap();
 
@@ -20337,6 +20480,7 @@ class basic_json
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .expect("Latin-1 comments must not block C++ harness generation");
 
@@ -20375,6 +20519,7 @@ class basic_json
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         };
 
         run(args).unwrap();
@@ -20422,6 +20567,7 @@ class basic_json
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap();
 
@@ -20471,6 +20617,7 @@ class basic_json
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         };
 
         run(args).unwrap();
@@ -20516,6 +20663,7 @@ class basic_json
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         };
 
         run(args).unwrap();
@@ -20714,6 +20862,7 @@ class basic_json
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap();
 
@@ -20756,6 +20905,7 @@ class basic_json
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap();
 
@@ -20807,6 +20957,7 @@ class basic_json
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         };
 
         run(args).unwrap();
@@ -20869,6 +21020,7 @@ class basic_json
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap();
 
@@ -20944,6 +21096,7 @@ class basic_json
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap();
 
@@ -20991,6 +21144,7 @@ class basic_json
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .expect_err("an empty lifecycle must route auto to the direct fallback");
         assert!(error
@@ -21036,6 +21190,7 @@ class basic_json
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap();
         let main = fs::read_to_string(temp.join("out/H-X-CTOR/main.cpp")).unwrap();
@@ -21083,6 +21238,7 @@ class basic_json
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap_err();
         let message = error.to_string();
@@ -21129,6 +21285,7 @@ class basic_json
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap_err();
         assert!(error.to_string().contains("cannot construct"), "{error}");
@@ -21177,6 +21334,7 @@ class basic_json
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap_err();
         let message = error.to_string();
@@ -21224,6 +21382,7 @@ class basic_json
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap();
         let main = fs::read_to_string(temp.join("out/H-X-BLOCKED/main.cpp")).unwrap();
@@ -21290,6 +21449,7 @@ class basic_json
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap();
 
@@ -21383,6 +21543,7 @@ class basic_json
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap();
 
@@ -21454,6 +21615,7 @@ class basic_json
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap();
 
@@ -21517,6 +21679,7 @@ class basic_json
             decoder_limits: Default::default(),
             force: false,
             archive_backed: false,
+            environment: None,
         })
         .unwrap_err();
 

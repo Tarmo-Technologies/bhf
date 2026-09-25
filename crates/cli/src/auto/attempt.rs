@@ -4323,6 +4323,188 @@ fn run_fuzz_with_runtrace(
     Ok((summary, events))
 }
 
+/// HDF-6 deliverable 4: build the HDF-5 environment/peripheral model for a
+/// discovered non-buffer entry point, or `None` for an ordinary target (which
+/// keeps its emission byte-for-byte unchanged).
+///
+/// Conservative + gated. Only a C `ChannelConsumer` (a body that drains a channel)
+/// or `RegisteredEntryPoint` (an ISR/task/callback registered via `intConnect`/
+/// `taskSpawn`/…) is eligible. A peripheral read accessor is synthesized ONLY for
+/// an UNDEFINED callee whose declaration BHF can read exactly (so the fabricated
+/// definition can never conflict with the target's prototype) and whose name
+/// matches a bare-metal register-read idiom — message-queue consume primitives
+/// (`msgQReceive`, `CFE_SB_RcvMsg`, …) are delivered by the runtrace shim, not
+/// synthesized here. A `RegisteredEntryPoint` additionally drives any callback
+/// parameter from the fuzz input (`fuzz_driven_callbacks`); a `ChannelConsumer`
+/// gets an environment only when at least one accessor was derivable, so a plain
+/// message-queue consumer (fully served by the shim) is left untouched.
+fn hdf6_environment_model(c: &Candidate) -> Option<harness_gen::c_generate::CEnvironmentModel> {
+    use crate::auto::candidate::Lang;
+    use target_rank::InputReachability::{ChannelConsumer, RegisteredEntryPoint};
+    if c.lang != Lang::C {
+        return None;
+    }
+    let reach = c.input_reachability?;
+    if !matches!(reach, ChannelConsumer | RegisteredEntryPoint) {
+        return None;
+    }
+    let source = std::fs::read_to_string(&c.source_path).ok()?;
+    let peripheral_readers = derive_peripheral_readers(&source, &c.name);
+    match reach {
+        RegisteredEntryPoint => Some(harness_gen::c_generate::CEnvironmentModel {
+            peripheral_readers,
+            fuzz_driven_callbacks: true,
+        }),
+        ChannelConsumer if !peripheral_readers.is_empty() => {
+            Some(harness_gen::c_generate::CEnvironmentModel {
+                peripheral_readers,
+                fuzz_driven_callbacks: true,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Find the target's undefined register-read accessor callees and fabricate a
+/// signature-matching [`CPeripheralReader`] for each, so the harness defines them
+/// to return a fuzz-controlled SEQUENCE instead of leaving inert stubs.
+fn derive_peripheral_readers(
+    source: &str,
+    target: &str,
+) -> Vec<harness_gen::c_generate::CPeripheralReader> {
+    let Ok(graph) = c_parser::analyze_call_graph(source) else {
+        return Vec::new();
+    };
+    let target_callees: BTreeSet<&str> = graph
+        .functions
+        .iter()
+        .filter(|f| f.name == target)
+        .flat_map(|f| f.callees.iter().map(String::as_str))
+        .collect();
+    if target_callees.is_empty() {
+        return Vec::new();
+    }
+    let defined: BTreeSet<&str> = graph.functions.iter().map(|f| f.name.as_str()).collect();
+    let decls = c_parser::parse_c_declarations(source).unwrap_or_default();
+    let mut readers = Vec::new();
+    let mut seen = BTreeSet::new();
+    for decl in &decls {
+        let name = decl.name.as_str();
+        if !target_callees.contains(name)
+            || defined.contains(name)
+            || !looks_like_mmio_read_accessor(name)
+            || !is_scalar_integer_return(&decl.return_type)
+        {
+            continue;
+        }
+        // A `(void)` / empty parameter list becomes no params; reject any parameter
+        // whose type carries a declarator we cannot name in place (arrays, function
+        // pointers) so the fabricated definition is always valid C.
+        let types: Vec<&str> = decl
+            .param_types
+            .iter()
+            .map(|t| t.trim())
+            .filter(|t| !t.is_empty() && *t != "void")
+            .collect();
+        if types.iter().any(|t| t.contains(['[', ']', '(', ')'])) {
+            continue;
+        }
+        if !seen.insert(name.to_owned()) {
+            continue;
+        }
+        readers.push(harness_gen::c_generate::CPeripheralReader {
+            return_type: decl.return_type.trim().to_owned(),
+            name: name.to_owned(),
+            params: types
+                .iter()
+                .enumerate()
+                .map(|(i, ty)| harness_gen::c_generate::CPeripheralParam {
+                    c_type: (*ty).to_owned(),
+                    name: format!("bhf_arg{i}"),
+                })
+                .collect(),
+        });
+    }
+    readers
+}
+
+/// A bare-metal register-read accessor name (BHF-authored scaffolding). Excludes
+/// message-queue / software-bus consume primitives, which the runtrace shim
+/// delivers directly.
+fn looks_like_mmio_read_accessor(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    const KNOWN: &[&str] = &[
+        "sysinlong",
+        "sysinword",
+        "sysinbyte",
+        "sysinchar",
+        "ioread8",
+        "ioread16",
+        "ioread32",
+        "ioread64",
+        "readb",
+        "readw",
+        "readl",
+        "readq",
+        "inb",
+        "inw",
+        "inl",
+    ];
+    if KNOWN.contains(&n.as_str()) {
+        return true;
+    }
+    (n.contains("mmio") && n.contains("read"))
+        || (n.contains("reg") && n.contains("read"))
+        || (n.contains("read") && n.contains("register"))
+}
+
+/// A scalar-integer return the accessor body can cast a fuzz word into. Strict
+/// (a known integer spelling) so a struct/union/float/pointer/typedef return is
+/// never fabricated into an invalid cast.
+fn is_scalar_integer_return(rt: &str) -> bool {
+    let t = rt.trim().trim_start_matches("const ").trim();
+    matches!(
+        t,
+        "int"
+            | "unsigned"
+            | "unsigned int"
+            | "signed int"
+            | "short"
+            | "unsigned short"
+            | "long"
+            | "unsigned long"
+            | "long long"
+            | "unsigned long long"
+            | "char"
+            | "signed char"
+            | "unsigned char"
+            | "size_t"
+            | "ssize_t"
+            | "uintptr_t"
+            | "intptr_t"
+            | "int8_t"
+            | "int16_t"
+            | "int32_t"
+            | "int64_t"
+            | "uint8_t"
+            | "uint16_t"
+            | "uint32_t"
+            | "uint64_t"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "UINT"
+            | "UINT8"
+            | "UINT16"
+            | "UINT32"
+            | "UINT64"
+            | "word_t"
+            | "BOOL"
+            | "STATUS"
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn generate_harness_for(
     c: &Candidate,
@@ -4352,6 +4534,10 @@ fn generate_harness_for(
                 .map(|tree| tree.c_lifecycle.as_slice())
                 .unwrap_or_default(),
         );
+    // HDF-6 D4: attach the fuzz-fed environment/peripheral model for a discovered
+    // non-buffer entry point (ChannelConsumer/RegisteredEntryPoint). `None` for an
+    // ordinary target leaves the C direct harness byte-for-byte unchanged.
+    let environment = hdf6_environment_model(c);
     let generate = |kind: &str, tree_type_defs| {
         if archive_backed {
             crate::generate_harness::generate_for_path_with_kind_archive_backed(
@@ -4367,6 +4553,7 @@ fn generate_harness_for(
                 tree_type_defs,
                 decoder_limits.clone(),
                 force,
+                environment.clone(),
             )
         } else {
             crate::generate_harness::generate_for_path_with_kind(
@@ -4382,6 +4569,7 @@ fn generate_harness_for(
                 tree_type_defs,
                 decoder_limits.clone(),
                 force,
+                environment.clone(),
             )
         }
     };
@@ -4544,6 +4732,129 @@ mod generation_outcome_tests {
         };
 
         assert!(ada_auto_servant_candidate(&candidate));
+    }
+}
+
+#[cfg(test)]
+mod hdf6_environment_tests {
+    use super::{derive_peripheral_readers, hdf6_environment_model};
+    use crate::auto::candidate::{Candidate, Lang};
+    use target_rank::InputReachability;
+
+    fn c_candidate(
+        path: std::path::PathBuf,
+        name: &str,
+        reach: Option<InputReachability>,
+    ) -> Candidate {
+        Candidate {
+            harness_id: format!("H-C{name}"),
+            lang: Lang::C,
+            source_path: path,
+            line: 1,
+            name: name.to_owned(),
+            score: 1,
+            is_static: false,
+            foreign_guard: None,
+            input_reachability: reach,
+            dialect: None,
+        }
+    }
+
+    fn write_src(tag: &str, body: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("bhf-hdf6-env-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("t.c");
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    // A ChannelConsumer that reads an UNDEFINED, register-read-shaped accessor gets
+    // a signature-matching peripheral reader in its environment model.
+    #[test]
+    fn channel_consumer_with_undefined_mmio_accessor_gets_peripheral_reader() {
+        let src = write_src(
+            "mmio",
+            "#include <stdint.h>\n\
+             extern uint32_t mmio_read32(uintptr_t addr);\n\
+             int poll_status(void) {\n\
+             \x20   uint32_t s = mmio_read32(0x40000000);\n\
+             \x20   if (s == 0xBEEF) return 1;\n\
+             \x20   return 0;\n}\n",
+        );
+        let c = c_candidate(src, "poll_status", Some(InputReachability::ChannelConsumer));
+        let model =
+            hdf6_environment_model(&c).expect("channel consumer with accessor gets a model");
+        assert_eq!(model.peripheral_readers.len(), 1);
+        let r = &model.peripheral_readers[0];
+        assert_eq!(r.name, "mmio_read32");
+        assert_eq!(r.return_type, "uint32_t");
+        assert_eq!(r.params.len(), 1);
+        assert_eq!(r.params[0].c_type, "uintptr_t");
+        assert!(model.fuzz_driven_callbacks);
+    }
+
+    // A RegisteredEntryPoint (ISR/callback) enables fuzz-driven callbacks even with
+    // no register accessor to synthesize.
+    #[test]
+    fn registered_entry_point_enables_fuzz_driven_callbacks() {
+        let src = write_src("isr", "void radar_isr(void *arg) { (void)arg; }\n");
+        let c = c_candidate(
+            src,
+            "radar_isr",
+            Some(InputReachability::RegisteredEntryPoint),
+        );
+        let model = hdf6_environment_model(&c).expect("registered entry point gets a model");
+        assert!(model.fuzz_driven_callbacks);
+        assert!(model.peripheral_readers.is_empty());
+    }
+
+    // An ordinary attacker-reachable target is untouched (byte-for-byte unchanged).
+    #[test]
+    fn ordinary_target_gets_no_environment() {
+        let src = write_src(
+            "plain",
+            "#include <stddef.h>\nint parse(const char *d, size_t n){ (void)n; return d[0]; }\n",
+        );
+        let c = c_candidate(src, "parse", Some(InputReachability::AttackerReachable));
+        assert!(hdf6_environment_model(&c).is_none());
+        // And a target with no reachability verdict at all.
+        let c2 = c_candidate(c.source_path.clone(), "parse", None);
+        assert!(hdf6_environment_model(&c2).is_none());
+    }
+
+    // A message-queue ChannelConsumer is served by the runtrace shim, not a
+    // synthesized accessor — so no peripheral reader is derived and (with no
+    // accessor) the consumer gets no environment.
+    #[test]
+    fn message_queue_consumer_is_left_to_the_shim() {
+        let src = write_src(
+            "msgq",
+            "extern int msgQReceive(void *q, char *buf, unsigned max, int to);\n\
+             int drain(void *q) { char b[64]; return msgQReceive(q, b, sizeof b, -1); }\n",
+        );
+        assert!(
+            derive_peripheral_readers(&std::fs::read_to_string(&src).unwrap(), "drain").is_empty()
+        );
+        let c = c_candidate(src, "drain", Some(InputReachability::ChannelConsumer));
+        assert!(hdf6_environment_model(&c).is_none());
+    }
+
+    // An accessor DEFINED in the TU must never be re-synthesized (would duplicate).
+    #[test]
+    fn defined_accessor_is_not_synthesized() {
+        let src = "#include <stdint.h>\n\
+             uint32_t reg_read(uintptr_t a) { return *(volatile uint32_t *)a; }\n\
+             int poll(void) { return reg_read(0x1000) == 7; }\n";
+        assert!(derive_peripheral_readers(src, "poll").is_empty());
+    }
+
+    // A non-C target is never given a C environment model.
+    #[test]
+    fn non_c_target_gets_no_environment() {
+        let src = write_src("ada", "-- ada\n");
+        let mut c = c_candidate(src, "x", Some(InputReachability::ChannelConsumer));
+        c.lang = Lang::Ada;
+        assert!(hdf6_environment_model(&c).is_none());
     }
 }
 

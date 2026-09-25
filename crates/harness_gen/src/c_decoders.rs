@@ -1,9 +1,46 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use serde::Serialize;
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::fmt;
 use type_model::{Field, ScalarKind, TypeRegistry, TypeShape};
+
+thread_local! {
+    /// HDF-6 D4: when set, a synthesized callback trampoline draws its return
+    /// (the parse/dispatch decision the caller loops on) from the harness's
+    /// fuzz-fed environment source instead of a no-op `return 0;`. Scoped by
+    /// [`FuzzDrivenCallbacksGuard`] around the param-decoder pass in
+    /// `build_c_context`, so it is a build-time flag with no cross-target leakage
+    /// (each target is built synchronously on one thread). Default `false` keeps
+    /// emission byte-for-byte unchanged.
+    static FUZZ_DRIVEN_CALLBACKS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Set the fuzz-driven-callback flag for the duration of the guard, restoring the
+/// prior value on drop. Only enabled when the harness also emits the fuzz-fed
+/// environment source (`environment: Some(..)` with `fuzz_driven_callbacks`), so a
+/// driven trampoline never references an undefined `_bhf_env_next_u32`.
+#[must_use]
+pub fn scoped_fuzz_driven_callbacks(enabled: bool) -> FuzzDrivenCallbacksGuard {
+    let previous = FUZZ_DRIVEN_CALLBACKS.with(|c| c.replace(enabled));
+    FuzzDrivenCallbacksGuard { previous }
+}
+
+/// RAII restore for [`scoped_fuzz_driven_callbacks`].
+pub struct FuzzDrivenCallbacksGuard {
+    previous: bool,
+}
+
+impl Drop for FuzzDrivenCallbacksGuard {
+    fn drop(&mut self) {
+        FUZZ_DRIVEN_CALLBACKS.with(|c| c.set(self.previous));
+    }
+}
+
+fn fuzz_driven_callbacks_enabled() -> bool {
+    FUZZ_DRIVEN_CALLBACKS.with(|c| c.get())
+}
 
 /// Default recursion depth for nested struct/union/array field synthesis.
 const MAX_DECODE_DEPTH: usize = 4;
@@ -670,7 +707,12 @@ fn callback_trampoline(
     name: &str,
     signature: &str,
 ) -> Result<CParamEmission, CDecoderError> {
-    let (support, trampoline) = build_callback_trampoline(c_type, name, signature, false)?;
+    // HDF-6 D4: honour the ambient fuzz-driven-callback flag so a registered
+    // callback the target requires is steered by fuzz input (its return value)
+    // rather than nulled to `return 0;`, when the harness carries the fuzz-fed
+    // environment source. Off by default (unchanged emission).
+    let (support, trampoline) =
+        build_callback_trampoline(c_type, name, signature, fuzz_driven_callbacks_enabled())?;
     // An inline funcptr param uses the synthesized `_bhf_cb_<name>` typedef as its
     // type (matching the one `build_callback_trampoline` declared); a typedef'd
     // callback uses its existing type.

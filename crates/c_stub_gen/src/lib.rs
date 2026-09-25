@@ -527,7 +527,27 @@ fn clean_stub_param_type(ty: &str) -> String {
 /// declaration. Returns `None` when the return type isn't safely
 /// stubbable (struct/union by value).
 pub fn synth_c_stub<D: DeclarationView>(decl: &D) -> Option<String> {
-    synth_c_stub_impl(decl, None, false)
+    synth_c_stub_impl(decl, None, false, false)
+}
+
+/// HDF-6 deliverable 1: like [`synth_c_stub`], but a stubbed dependency with a
+/// scalar-integer return draws that return value from the LIVE FUZZ INPUT (keyed
+/// by its own symbol name) instead of the constant `return 0;`. A hardware-read
+/// accessor (`int read_sensor(void)`) whose result gates a downstream branch is
+/// then fuzz-reachable: the constant stub can only ever return 0, so the branch
+/// is dead; the fuzz-driven stub lets the fuzzer's coverage feedback learn to
+/// steer the input byte that controls it.
+///
+/// Only a scalar-integer return (`stub_body_for_return_type` -> `return 0;`) is
+/// driven; pointer / float / aggregate / `void` returns keep their constant
+/// neutral body (a fuzz-fabricated pointer would be an invalid deref, not a real
+/// path), and every allocator-preserving special-case body is untouched. The
+/// value is fetched via the runtrace shim's weak export `bhf_shim_fuzz_stub_value`
+/// — so when the shim is not `LD_PRELOAD`ed the symbol is NULL and the stub falls
+/// back to `0`, making a shim-less run byte-for-byte the constant stub. This is
+/// strictly opt-in: [`synth_c_stub`] is byte-for-byte unchanged.
+pub fn synth_c_stub_fuzz_driven<D: DeclarationView>(decl: &D) -> Option<String> {
+    synth_c_stub_impl(decl, None, false, true)
 }
 
 /// Render a weak C definition while preserving the exact declaration spelling.
@@ -538,13 +558,25 @@ pub fn synth_header_backed_c_stub<D: DeclarationView>(
     decl: &D,
     resolved_return_type: &str,
 ) -> Option<String> {
-    synth_c_stub_impl(decl, Some(resolved_return_type), true)
+    synth_c_stub_impl(decl, Some(resolved_return_type), true, false)
+}
+
+/// HDF-6 deliverable 1: the header-backed counterpart of
+/// [`synth_c_stub_fuzz_driven`]. Same rules — only a scalar-integer return is
+/// drawn from the fuzz input; every other shape keeps its exact-signature
+/// constant body.
+pub fn synth_header_backed_c_stub_fuzz_driven<D: DeclarationView>(
+    decl: &D,
+    resolved_return_type: &str,
+) -> Option<String> {
+    synth_c_stub_impl(decl, Some(resolved_return_type), true, true)
 }
 
 fn synth_c_stub_impl<D: DeclarationView>(
     decl: &D,
     body_return_type: Option<&str>,
     exact_signature: bool,
+    fuzz_driven: bool,
 ) -> Option<String> {
     // Unwrap an export-macro return type (`CJSON_PUBLIC(void *)` -> `void *`) so
     // both the body choice and the emitted return type are valid C.
@@ -625,6 +657,30 @@ fn synth_c_stub_impl<D: DeclarationView>(
     } else {
         stub_return_type(rt_unwrapped.trim())
     };
+    // HDF-6 D1: a plain scalar-integer stub (whose constant body is exactly
+    // `return 0;`) draws its return from the live fuzz input keyed by symbol. Only
+    // that shape is eligible: an allocator-preserving special case, a pointer
+    // (`return NULL;`), a float, a `void`, or an aggregate all produce a different
+    // body and are left constant. Qualified C++ is excluded (the string-literal key
+    // would carry `::`, and the C++ return paths are handled above). The weak
+    // extern makes a shim-less link fall back to the constant `0`.
+    if fuzz_driven && !is_qualified_cpp && body == "return 0;" {
+        let expr = format!(
+            "return ({rt})(bhf_shim_fuzz_stub_value ? bhf_shim_fuzz_stub_value(\"{name}\") : 0);",
+            rt = rt,
+            name = decl.name(),
+        );
+        return Some(format!(
+            "extern unsigned long long bhf_shim_fuzz_stub_value(const char *bhf_symbol) \
+             __attribute__((weak));\n\
+             __attribute__((weak)) {rt} {name}({params}){suffix} {{\n    {expr}\n}}\n",
+            rt = rt,
+            name = decl.name(),
+            params = params,
+            suffix = suffix,
+            expr = expr,
+        ));
+    }
     Some(format!(
         "__attribute__((weak)) {rt} {name}({params}){suffix} {{\n    {body}\n}}\n",
         rt = rt,
@@ -2410,6 +2466,204 @@ mod synth_tests {
         assert!(
             pstub.contains("enum CborError * cbor_last_error("),
             "enum pointer return untouched: {pstub}"
+        );
+    }
+
+    // ---- HDF-6 D1: fuzz-driven stub mode -------------------------------------
+
+    #[test]
+    fn constant_stub_is_byte_for_byte_unchanged() {
+        // Regression: the default (constant) path must not change. A fuzz-driven
+        // build is strictly opt-in.
+        let decl = FakeDecl {
+            name: "read_sensor",
+            return_type: "int",
+            params: vec!["void".to_owned()],
+        };
+        assert_eq!(
+            synth_c_stub(&decl).unwrap(),
+            "__attribute__((weak)) int read_sensor(void) {\n    return 0;\n}\n"
+        );
+    }
+
+    #[test]
+    fn fuzz_driven_integral_stub_draws_return_from_shim_keyed_by_symbol() {
+        let decl = FakeDecl {
+            name: "read_sensor",
+            return_type: "int",
+            params: vec!["void".to_owned()],
+        };
+        let stub = synth_c_stub_fuzz_driven(&decl).expect("scalar-int stub is fuzz-drivable");
+        // Declares the shim's weak reader and casts its per-symbol value to the
+        // return type, falling back to 0 when the shim is not preloaded.
+        assert!(
+            stub.contains(
+                "extern unsigned long long bhf_shim_fuzz_stub_value(const char *bhf_symbol) \
+                 __attribute__((weak));"
+            ),
+            "{stub}"
+        );
+        assert!(
+            stub.contains(
+                "return (int)(bhf_shim_fuzz_stub_value ? \
+                 bhf_shim_fuzz_stub_value(\"read_sensor\") : 0);"
+            ),
+            "{stub}"
+        );
+        assert!(
+            !stub.contains("return 0;\n}"),
+            "constant body must be gone: {stub}"
+        );
+    }
+
+    #[test]
+    fn fuzz_driven_pointer_and_float_and_void_stubs_stay_constant() {
+        // A fuzz-fabricated pointer would be an invalid deref, a float gate is rare,
+        // and a void has nothing to return — all keep their constant neutral body
+        // even in fuzz-driven mode, and never reference the shim reader.
+        for (rt, expect) in [
+            ("void *", "return NULL;"),
+            ("double", "return 0.0;"),
+            ("void", "return;"),
+        ] {
+            let decl = FakeDecl {
+                name: "dep",
+                return_type: rt,
+                params: vec!["void".to_owned()],
+            };
+            let stub = synth_c_stub_fuzz_driven(&decl).unwrap();
+            assert!(stub.contains(expect), "{rt}: {stub}");
+            assert!(
+                !stub.contains("bhf_shim_fuzz_stub_value"),
+                "{rt} must not be fuzz-driven: {stub}"
+            );
+        }
+    }
+
+    #[test]
+    fn fuzz_driven_mode_does_not_clobber_allocator_special_case_body() {
+        // A pointer-preserving/allocator body carries real semantics and its body is
+        // not the plain `return 0;`, so fuzz-driven mode leaves it exactly as the
+        // constant path produces it.
+        let decl = FakeDecl {
+            name: "xyz_alloc",
+            return_type: "void*",
+            params: vec!["size_t".to_owned(), "my_allocator *".to_owned()],
+        };
+        let constant = synth_c_stub(&decl).unwrap();
+        let driven = synth_c_stub_fuzz_driven(&decl).unwrap();
+        assert!(constant.contains("malloc("), "{constant}");
+        assert_eq!(
+            constant, driven,
+            "allocator body unchanged in fuzz-driven mode"
+        );
+    }
+
+    #[test]
+    fn fuzz_driven_header_backed_scalar_draws_from_shim() {
+        let decl = FakeDecl {
+            name: "hw_status",
+            return_type: "uint32_t",
+            params: vec!["void".to_owned()],
+        };
+        let stub = synth_header_backed_c_stub_fuzz_driven(&decl, "uint32_t")
+            .expect("scalar header-backed stub is fuzz-drivable");
+        assert!(
+            stub.contains(
+                "return (uint32_t)(bhf_shim_fuzz_stub_value ? \
+                 bhf_shim_fuzz_stub_value(\"hw_status\") : 0);"
+            ),
+            "{stub}"
+        );
+    }
+
+    /// HDF-6 D1 acceptance: a fixture reading a stubbed `read_sensor()` reaches a
+    /// branch gated on its return value ONLY when the stub is fuzz-driven. Built
+    /// twice — constant stub (cannot reach) vs fuzz-driven stub (can reach) — and
+    /// run under the runtrace shim. Self-skips when clang or the shim .so is absent.
+    #[test]
+    fn fuzz_driven_stub_reaches_a_return_value_gated_branch_e2e() {
+        use std::process::Command;
+        if Command::new("clang").arg("--version").output().is_err() {
+            eprintln!("clang unavailable; skipping fuzz-driven-stub e2e");
+            return;
+        }
+        let shim = {
+            let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(|p| p.parent())
+                .map(|root| root.join("target"))
+                .expect("workspace target dir");
+            ["debug", "release"]
+                .into_iter()
+                .map(|p| base.join(p).join("libbhf_runtrace_shim.so"))
+                .find(|p| p.is_file())
+        };
+        let Some(shim) = shim else {
+            eprintln!("shim .so not built; skipping fuzz-driven-stub e2e");
+            return;
+        };
+
+        let decl = FakeDecl {
+            name: "read_sensor",
+            return_type: "int",
+            params: vec!["void".to_owned()],
+        };
+        let const_stub = synth_c_stub(&decl).unwrap();
+        let fuzz_stub = synth_c_stub_fuzz_driven(&decl).unwrap();
+
+        // The fixture branches on the stubbed sensor value; 0x41414141 is reachable
+        // only when the return is drawn from a 0x41-filled fuzz input.
+        let fixture = "#include <stdint.h>\n#include <string.h>\n\
+             extern int read_sensor(void);\n\
+             extern void bhf_shim_set_fuzz_input(const uint8_t *, size_t) __attribute__((weak));\n\
+             int main(void) {\n\
+             \x20   if (bhf_shim_set_fuzz_input) { uint8_t in[8]; memset(in, 0x41, 8); \
+             bhf_shim_set_fuzz_input(in, 8); }\n\
+             \x20   if (read_sensor() == 0x41414141) return 42;\n\
+             \x20   return 0;\n}\n";
+
+        let dir = std::env::temp_dir().join(format!("bhf_fuzzstub_e2e_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("fixture.c"), fixture).unwrap();
+        std::fs::write(dir.join("stub_const.c"), &const_stub).unwrap();
+        std::fs::write(dir.join("stub_fuzz.c"), &fuzz_stub).unwrap();
+
+        let build = |stub: &str, bin: &str| -> bool {
+            Command::new("clang")
+                .arg(dir.join("fixture.c"))
+                .arg(dir.join(stub))
+                .arg("-o")
+                .arg(dir.join(bin))
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        assert!(build("stub_const.c", "const_bin"), "constant build failed");
+        assert!(build("stub_fuzz.c", "fuzz_bin"), "fuzz-driven build failed");
+
+        let run = |bin: &str| -> Option<i32> {
+            Command::new(dir.join(bin))
+                .env("LD_PRELOAD", &shim)
+                .env("BHF_RUNTRACE_MODE", "fuzz_driven")
+                .env("BHF_RUNTRACE_LOG", dir.join("rt.jsonl"))
+                .status()
+                .expect("run fixture")
+                .code()
+        };
+        let const_code = run("const_bin");
+        let fuzz_code = run("fuzz_bin");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_ne!(
+            const_code,
+            Some(42),
+            "constant stub returns 0 forever — the gated branch must be UNREACHABLE"
+        );
+        assert_eq!(
+            fuzz_code,
+            Some(42),
+            "fuzz-driven stub must draw the sensor value from the input and REACH the branch"
         );
     }
 

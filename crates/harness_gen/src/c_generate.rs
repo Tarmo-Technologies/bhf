@@ -2788,6 +2788,16 @@ fn build_c_context(args: &GenerateCDirectArgs) -> Result<CTemplateContext, Harne
     // #468: NUL-terminate a const input buffer only when the function exposes a
     // NUL-terminated-mode enum flag (checked over the FULL param list).
     let nul_terminate = function_selects_nul_terminated_mode(&args.params, &args.type_defs);
+    // HDF-6 D4: when the HDF-5 environment model requests fuzz-driven callbacks AND
+    // is present (so `_bhf_env_next_u32` is emitted), drive any synthesized callback
+    // trampoline's return from the fuzz input for the duration of the decoder pass.
+    // The guard restores the prior (default-off) state on drop, so an ordinary
+    // target's emission is byte-for-byte unchanged.
+    let _fuzz_cb_guard = crate::c_decoders::scoped_fuzz_driven_callbacks(
+        args.environment
+            .as_ref()
+            .is_some_and(|env| env.fuzz_driven_callbacks),
+    );
     let mut params = build_param_decoders(
         decoder_params,
         &registry,
@@ -4914,6 +4924,50 @@ mod tests {
         assert!(
             main.contains("_bhf_env_data = Data;") && main.contains("_bhf_env_index = 0;"),
             "the source must be armed from the current fuzz input: {main}"
+        );
+    }
+
+    /// HDF-6 D4: with `fuzz_driven_callbacks` set on the environment model, a
+    /// synthesized callback trampoline draws its return (the parse/dispatch decision
+    /// the caller loops on) from the fuzz-fed source instead of a no-op `return 0;`.
+    /// Without the flag the same target emits the constant trampoline.
+    #[test]
+    fn environment_model_fuzz_drives_the_callback_trampoline() {
+        let cb_target = |fuzz_driven_callbacks: bool, tag: &str| -> String {
+            let out = temp_dir(tag);
+            let mut args = direct_args("dispatch_with_cb", out);
+            args.params = vec![CParameter {
+                name: "cb".to_owned(),
+                c_type: "int (*)(void *)".to_owned(),
+            }];
+            args.environment = Some(CEnvironmentModel {
+                // A peripheral reader keeps `_bhf_env_next_u32` referenced regardless
+                // of the callback wiring under test.
+                peripheral_readers: vec![CPeripheralReader {
+                    return_type: "uint32_t".to_owned(),
+                    name: "poll_reg".to_owned(),
+                    params: Vec::new(),
+                }],
+                fuzz_driven_callbacks,
+            });
+            let result = generate_c_direct_harness(args).unwrap();
+            fs::read_to_string(&result.main_c).unwrap()
+        };
+
+        let driven = cb_target(true, "cb_driven");
+        assert!(
+            driven.contains("return (int)_bhf_env_next_u32();"),
+            "fuzz-driven callback trampoline must draw its return from the fuzz source: {driven}"
+        );
+
+        let constant = cb_target(false, "cb_const");
+        assert!(
+            constant.contains("return 0;"),
+            "without the flag the trampoline keeps its constant return: {constant}"
+        );
+        assert!(
+            !constant.contains("return (int)_bhf_env_next_u32();"),
+            "the flag is off by default: {constant}"
         );
     }
 
