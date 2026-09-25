@@ -45,7 +45,10 @@ pub use symbolic_seed::{
 pub use typed::{typed_candidates, typed_candidates_for_abi, TypedSpan, TypedValueKind};
 // Re-export the target-ABI model so engine consumers can select a foreign
 // target's byte order/layout without a separate `type_model` dependency.
-pub use type_model::{Endian, TargetAbi};
+// `binframe::Endian` (byte order of a framed field) and `type_model::Endian`
+// (target-ABI endianness) are distinct types; re-export the ABI one under a
+// disambiguated name so both are reachable from the crate root.
+pub use type_model::{Endian as TargetEndian, TargetAbi};
 
 pub fn crate_name() -> &'static str {
     "fuzz_engine_builtin"
