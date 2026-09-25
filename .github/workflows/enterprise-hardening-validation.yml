@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: Apache-2.0
+# Temporary read-only validation lane; never publishes releases or updates refs.
+name: Enterprise hardening validation
+on:
+  push:
+    branches: [maintenance/enterprise-566435a]
+permissions:
+  contents: read
+jobs:
+  source-snapshot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Export exact tracked source for review
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p review-source
+          git archive --format=tar.gz --output=review-source/source.tar.gz HEAD
+          git rev-parse HEAD > review-source/commit.txt
+          git rev-parse HEAD^{tree} > review-source/tree.txt
+          git ls-tree -r HEAD > review-source/source-tree.txt
+          sha256sum review-source/source.tar.gz > review-source/SHA256SUMS
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: enterprise-source-snapshot
+          path: review-source/
+          retention-days: 7
+          if-no-files-found: error
