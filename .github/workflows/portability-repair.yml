@@ -1,0 +1,128 @@
+# SPDX-License-Identifier: Apache-2.0
+# One-shot source repair: removed from the result after read-only validation.
+name: Portability repair validation
+on:
+  push:
+    branches: [maintenance/portability-30ee685]
+    paths:
+      - .github/workflows/portability-repair.yml
+      - scripts/maintenance/apply-portability-fixes.py
+      - crates/governance/src/publication_tests.rs
+permissions:
+  contents: read
+concurrency:
+  group: portability-repair-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  native:
+    name: Focused validation (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+      - name: Apply reviewed edits to exact source blobs
+        shell: bash
+        run: python scripts/maintenance/apply-portability-fixes.py --expected-head "$GITHUB_SHA"
+      - name: Validate affected crates and CI policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p portability-evidence
+          rustc --version --verbose | tee portability-evidence/toolchain.txt
+          git diff --binary > portability-evidence/source.patch
+          cargo test --locked -p governance --lib 2>&1 | tee portability-evidence/governance.log
+          cargo test --locked -p bhf-daemon --lib 2>&1 | tee portability-evidence/daemon.log
+          python -m unittest discover -s scripts/ci/tests -v 2>&1 | tee portability-evidence/policy.log
+      - name: Retain validation logs and tested patch
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: portability-${{ matrix.os }}
+          path: portability-evidence/
+          if-no-files-found: error
+          retention-days: 14
+  legacy:
+    name: Governance on the EL7 glibc baseline
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Apply reviewed edits to exact source blobs
+        run: python3 scripts/maintenance/apply-portability-fixes.py --expected-head "$GITHUB_SHA"
+      - name: Build and execute the actual installer tests against old glibc
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p portability-evidence
+          docker run --rm --volume "$GITHUB_WORKSPACE:/io" --workdir /io \
+            --env CARGO_HOME=/tmp/cargo --env RUSTUP_HOME=/tmp/rustup \
+            --env CARGO_TARGET_DIR=/io/target/portability-el7 \
+            quay.io/pypa/manylinux2014_x86_64@sha256:0d25b049964b2549b83384036abdff06789a8c0b1e9ff003ec80f0d531f79e50 \
+            bash -lc '
+              set -euo pipefail
+              ldd --version
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+              export PATH="$CARGO_HOME/bin:$PATH"
+              rustc --version --verbose
+              cargo test --locked -p governance --lib
+            ' 2>&1 | tee portability-evidence/el7-governance.log
+      - name: Retain old-glibc validation log
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: portability-el7
+          path: portability-evidence/
+          if-no-files-found: error
+          retention-days: 14
+  publish-tested-source:
+    name: Commit only after all focused checks pass
+    needs: [native, legacy]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Reapply the identical hash-pinned source edits
+        run: python3 scripts/maintenance/apply-portability-fixes.py --expected-head "$GITHUB_SHA"
+      - name: Commit source fixes and remove the one-shot repair machinery
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add crates/governance/src/lib.rs crates/daemon/src/lib.rs .github/workflows/ci.yml
+          git rm .github/workflows/portability-repair.yml scripts/maintenance/apply-portability-fixes.py
+          git diff --cached --check
+          git config user.name crook3dfingers
+          git config user.email 58201909+crook3dfingers@users.noreply.github.com
+          git commit -m "fix(portability): preserve atomic installs on old glibc and harden daemon framing" \
+            -m "Use SYS_renameat2 without a glibc wrapper and retain fail-closed no-replace semantics. Add eight production-helper filesystem tests, remove path-length dependence from the daemon compact-error test, add exact-limit/over-limit checks, and reject duplicate or non-decimal Content-Length headers. Run governance tests on the EL7 CI baseline." \
+            -m "Focused Linux, Windows, and EL7 validation passed on these identical hash-pinned source edits in Actions run $GITHUB_RUN_ID. Full workspace/release acceptance remains a separate gate. Temporary repair workflow and script removed."
+          git rev-parse HEAD
+      - name: Fast-forward staging branch only, never overwrite concurrent work
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/maintenance/portability-30ee685
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          echo "::add-mask::$auth"
+          remote="$(git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" ls-remote origin "$GITHUB_REF" | cut -f1)"
+          test "$remote" = "$GITHUB_SHA"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" push origin "HEAD:$GITHUB_REF"
