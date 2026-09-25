@@ -4,14 +4,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import math
 import os
+import queue
 import re
-import shlex
+import signal
 import subprocess
+import threading
 from typing import Any, BinaryIO, Iterable
 
 
 JsonObject = dict[str, Any]
+MAX_FRAME_BYTES = 64 * 1024 * 1024
+MAX_HEADER_BYTES = 8192
+DEFAULT_DAEMON_TIMEOUT_SECS = 30.0
 
 
 @dataclass(frozen=True)
@@ -22,6 +28,7 @@ class BhfConfig:
     harness_path: str = ""
     minimize_strategy: str = "bytes"
     workspace_root: str = "."
+    daemon_timeout_secs: float = DEFAULT_DAEMON_TIMEOUT_SECS
 
     @property
     def resolved_findings_dir(self) -> str:
@@ -56,17 +63,38 @@ class JsonRpcError(RuntimeError):
 
 
 class StdioJsonRpcClient:
-    def __init__(self, daemon_path: str, cwd: str | None = None):
+    def __init__(
+        self,
+        daemon_path: str,
+        cwd: str | None = None,
+        timeout_secs: float = DEFAULT_DAEMON_TIMEOUT_SECS,
+        args: list[str] | None = None,
+    ):
+        if not math.isfinite(timeout_secs) or timeout_secs <= 0:
+            raise ValueError("daemon timeout must be a positive finite number")
+        process_options = (
+            {"start_new_session": True}
+            if os.name == "posix"
+            else {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        )
         self.process = subprocess.Popen(
-            [daemon_path],
+            [daemon_path, *(args or [])],
             cwd=cwd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            **process_options,
         )
         self.next_id = 1
+        self.timeout_secs = timeout_secs
+        self._closed = False
+        self._reader: threading.Thread | None = None
 
     def request(self, method: str, params: JsonObject | None = None) -> Any:
+        if self._closed:
+            raise JsonRpcError("daemon client is closed")
+        if self._reader is not None and self._reader.is_alive():
+            raise JsonRpcError("daemon request already in progress")
         if self.process.stdin is None or self.process.stdout is None:
             raise JsonRpcError("daemon stdio is unavailable")
 
@@ -80,9 +108,29 @@ class StdioJsonRpcClient:
         if params is not None:
             request["params"] = params
 
-        self.process.stdin.write(encode_frame(request))
-        self.process.stdin.flush()
-        response = read_frame(self.process.stdout)
+        results: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+
+        def exchange() -> None:
+            try:
+                assert self.process.stdin is not None
+                assert self.process.stdout is not None
+                self.process.stdin.write(encode_frame(request))
+                self.process.stdin.flush()
+                results.put((True, read_frame(self.process.stdout)))
+            except Exception as error:
+                results.put((False, error))
+
+        self._reader = threading.Thread(target=exchange, name="bhf-daemon-response", daemon=True)
+        self._reader.start()
+        try:
+            ok, result = results.get(timeout=self.timeout_secs)
+        except queue.Empty as error:
+            self.close()
+            raise TimeoutError(f"BHF daemon request exceeded {self.timeout_secs:g} seconds") from error
+        if not ok:
+            self.close()
+            raise result
+        response = result
         if response.get("id") != request_id:
             raise JsonRpcError("daemon returned a response with an unexpected id")
         if "error" in response:
@@ -97,8 +145,40 @@ class StdioJsonRpcClient:
         return response.get("result")
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if os.name == "posix":
+            try:
+                os.killpg(self.process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        elif self.process.poll() is None:
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(self.process.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=1,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                pass
         if self.process.poll() is None:
-            self.process.terminate()
+            try:
+                self.process.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                self.process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+        if self._reader is not None:
+            self._reader.join(timeout=1)
+        if self._reader is None or not self._reader.is_alive():
+            for stream in (self.process.stdin, self.process.stdout):
+                if stream is not None:
+                    stream.close()
 
 
 def encode_frame(message: JsonObject) -> bytes:
@@ -109,10 +189,16 @@ def encode_frame(message: JsonObject) -> bytes:
 
 def read_frame(stream: BinaryIO) -> JsonObject:
     headers: list[bytes] = []
+    header_bytes = 0
     while True:
-        line = stream.readline()
+        line = stream.readline(MAX_HEADER_BYTES - header_bytes + 1)
         if line == b"":
             raise EOFError("unexpected EOF while reading JSON-RPC headers")
+        header_bytes += len(line)
+        if header_bytes > MAX_HEADER_BYTES:
+            raise ValueError("JSON-RPC header exceeds the maximum size")
+        if not line.endswith(b"\n"):
+            raise ValueError("JSON-RPC header line is incomplete")
         if line in (b"\r\n", b"\n"):
             break
         headers.append(line)
@@ -125,6 +211,8 @@ def read_frame(stream: BinaryIO) -> JsonObject:
             break
     if content_length is None:
         raise ValueError("JSON-RPC frame is missing Content-Length")
+    if content_length < 0 or content_length > MAX_FRAME_BYTES:
+        raise ValueError("JSON-RPC body exceeds the maximum size")
 
     body = stream.read(content_length)
     if len(body) != content_length:
@@ -136,7 +224,11 @@ def read_frame(stream: BinaryIO) -> JsonObject:
 
 
 def load_findings(config: BhfConfig) -> list[JsonObject]:
-    client = StdioJsonRpcClient(config.daemon_path, cwd=config.workspace_root)
+    client = StdioJsonRpcClient(
+        config.daemon_path,
+        cwd=config.workspace_root,
+        timeout_secs=config.daemon_timeout_secs,
+    )
     try:
         result = client.request("findings", {"findings": config.resolved_findings_dir})
     finally:
@@ -226,12 +318,6 @@ def importance_for_severity(severity: Any) -> str:
 
 
 def build_replay_args(finding: JsonObject, config: BhfConfig) -> list[str]:
-    if not config.harness_path.strip():
-        replay = finding.get("replay")
-        command = replay.get("command") if isinstance(replay, dict) else None
-        if isinstance(command, str) and command.strip():
-            return shlex.split(command)
-
     args = [config.cli_path, "replay", "--finding", finding_path(finding, config)]
     if config.harness_path.strip():
         args.extend(["--harness", config.harness_path])
@@ -257,7 +343,15 @@ def resolve_reproducer_path(finding: JsonObject, config: BhfConfig) -> str | Non
 
 
 def finding_path(finding: JsonObject, config: BhfConfig) -> str:
-    return os.path.normpath(os.path.join(config.resolved_findings_dir, finding_id(finding)))
+    identifier = finding_id(finding)
+    if (
+        identifier in (".", "..")
+        or "\\" in identifier
+        or ":" in identifier
+        or os.path.basename(identifier) != identifier
+    ):
+        raise ValueError("BHF finding has an invalid ID")
+    return os.path.normpath(os.path.join(config.resolved_findings_dir, identifier))
 
 
 def action_name(action: str, finding: str) -> str:

@@ -6,10 +6,11 @@ import path from "node:path";
 import * as vscode from "vscode";
 
 import {
-  buildMinimizeCommand,
-  buildReplayCommand,
+  buildMinimizeProcess,
+  buildReplayProcess,
   resolveReproducerPath,
   type CommandConfig,
+  type ProcessCommand,
 } from "./commands";
 import {
   codeLensDescriptors,
@@ -47,10 +48,10 @@ export function activate(context: vscode.ExtensionContext): void {
       refreshFindings(false),
     ),
     vscode.commands.registerCommand("bhf.replayFinding", (findingId: string) =>
-      runTerminalAction(findingId, buildReplayCommand),
+      runProcessAction(findingId, "Replay", buildReplayProcess),
     ),
     vscode.commands.registerCommand("bhf.minimizeFinding", (findingId: string) =>
-      runTerminalAction(findingId, buildMinimizeCommand),
+      runProcessAction(findingId, "Minimize", buildMinimizeProcess),
     ),
     vscode.commands.registerCommand("bhf.openReproducer", openReproducer),
     vscode.languages.registerCodeLensProvider(
@@ -137,10 +138,11 @@ function applyDiagnostics(findings: BhfFinding[], workspaceRootPath: string): vo
   }
 }
 
-function runTerminalAction(
+async function runProcessAction(
   findingId: string,
-  buildCommand: (finding: BhfFinding, config: CommandConfig) => string,
-): void {
+  action: string,
+  buildCommand: (finding: BhfFinding, config: CommandConfig) => ProcessCommand,
+): Promise<void> {
   const config = readConfig(true);
   if (!config) {
     return;
@@ -151,12 +153,26 @@ function runTerminalAction(
     return;
   }
 
-  const terminal = vscode.window.createTerminal({
-    name: "BHF",
-    cwd: config.workspaceRoot,
-  });
-  terminal.show();
-  terminal.sendText(buildCommand(finding, config), true);
+  try {
+    const command = buildCommand(finding, config);
+    const execution = new vscode.ProcessExecution(command.executable, command.args, {
+      cwd: config.workspaceRoot,
+    });
+    const task = new vscode.Task(
+      { type: "bhf", action: action.toLowerCase(), findingId },
+      vscode.TaskScope.Workspace,
+      `BHF ${action} ${findingId}`,
+      "BHF",
+      execution,
+    );
+    task.presentationOptions = {
+      reveal: vscode.TaskRevealKind.Always,
+      panel: vscode.TaskPanelKind.New,
+    };
+    await vscode.tasks.executeTask(task);
+  } catch (error) {
+    vscode.window.showErrorMessage(`BHF action failed: ${errorMessage(error)}`);
+  }
 }
 
 async function openReproducer(findingId: string): Promise<void> {

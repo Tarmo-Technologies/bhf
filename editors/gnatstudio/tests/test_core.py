@@ -2,7 +2,10 @@
 
 import io
 import os
+import subprocess
 import sys
+import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -10,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from bhf_gnatstudio_core import (
     BhfConfig,
+    StdioJsonRpcClient,
     action_name,
     build_minimize_args,
     build_replay_args,
@@ -54,6 +58,73 @@ class CoreTests(unittest.TestCase):
             read_frame(io.BytesIO(frame)),
             {"jsonrpc": "2.0", "id": 1, "result": {"ok": True}},
         )
+
+    def test_read_frame_rejects_oversized_header_and_body(self):
+        with self.assertRaisesRegex(ValueError, "header exceeds"):
+            read_frame(io.BytesIO(b"X: " + b"a" * 8192))
+        with self.assertRaisesRegex(ValueError, "body exceeds"):
+            read_frame(io.BytesIO(b"Content-Length: 67108865\r\n\r\n"))
+
+    def test_daemon_client_reads_response_and_reaps_child(self):
+        program = (
+            "import sys; "
+            "body=b'{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"findings\":[]}}'; "
+            "sys.stdout.buffer.write(b'Content-Length: '+str(len(body)).encode()+b'\\r\\n\\r\\n'+body); "
+            "sys.stdout.buffer.flush()"
+        )
+        client = StdioJsonRpcClient(sys.executable, timeout_secs=1, args=["-c", program])
+        try:
+            self.assertEqual(client.request("findings"), {"findings": []})
+        finally:
+            client.close()
+        self.assertIsNotNone(client.process.poll())
+        self.assertFalse(client._reader.is_alive())
+
+    def test_daemon_client_times_out_on_silent_or_partial_response(self):
+        programs = (
+            "import time; time.sleep(30)",
+            "import sys,time; sys.stdout.buffer.write(b'Content-Length: 100\\r\\n\\r\\n{}'); sys.stdout.buffer.flush(); time.sleep(30)",
+        )
+        for program in programs:
+            with self.subTest(program=program):
+                client = StdioJsonRpcClient(sys.executable, timeout_secs=0.1, args=["-c", program])
+                started = time.monotonic()
+                with self.assertRaisesRegex(TimeoutError, "exceeded"):
+                    client.request("findings")
+                self.assertLess(time.monotonic() - started, 2.5)
+                self.assertIsNotNone(client.process.poll())
+                self.assertFalse(client._reader.is_alive())
+
+    def test_daemon_client_reaps_child_that_exits_before_response(self):
+        client = StdioJsonRpcClient(sys.executable, timeout_secs=1, args=["-c", "import sys; sys.exit(3)"])
+        with self.assertRaises((EOFError, BrokenPipeError)):
+            client.request("findings")
+        self.assertIsNotNone(client.process.poll())
+        self.assertFalse(client._reader.is_alive())
+
+    @unittest.skipUnless(os.name == "posix", "process group test requires POSIX")
+    def test_daemon_client_timeout_stops_owned_grandchild(self):
+        with tempfile.TemporaryDirectory() as temp:
+            pid_file = Path(temp) / "grandchild.pid"
+            program = (
+                "import subprocess,sys,time; "
+                "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']); "
+                "open(sys.argv[1],'w').write(str(child.pid)); time.sleep(30)"
+            )
+            client = StdioJsonRpcClient(
+                sys.executable,
+                timeout_secs=0.2,
+                args=["-c", program, str(pid_file)],
+            )
+            with self.assertRaises(TimeoutError):
+                client.request("findings")
+            self.assertIsNotNone(client.process.poll())
+            self.assertFalse(client._reader.is_alive())
+            if pid_file.exists():
+                grandchild_pid = int(pid_file.read_text())
+                status = Path(f"/proc/{grandchild_pid}/stat")
+                if status.exists():
+                    self.assertEqual(status.read_text().split()[2], "Z")
 
     def test_diagnostic_records_map_finding_to_gnatstudio_message(self):
         records = diagnostic_records([FINDING], "/work/project")
@@ -151,13 +222,18 @@ class CoreTests(unittest.TestCase):
             ],
         )
 
-    def test_build_replay_args_use_finding_command_without_harness_override(self):
+    def test_build_replay_args_ignore_finding_command_without_harness_override(self):
         config = BhfConfig(workspace_root="/work/project")
 
         self.assertEqual(
-            build_replay_args(FINDING, config),
-            ["bhf", "replay", "--finding", "F-0001-alpha"],
+            build_replay_args({**FINDING, "replay": {"command": "evil-command"}}, config),
+            ["bhf", "replay", "--finding", "/work/project/findings/F-0001-alpha"],
         )
+
+    def test_build_replay_args_reject_path_escape_id(self):
+        config = BhfConfig(workspace_root="/work/project")
+        with self.assertRaisesRegex(ValueError, "invalid ID"):
+            build_replay_args({**FINDING, "id": "../../outside"}, config)
 
     def test_build_minimize_args_include_strategy_and_harness(self):
         config = BhfConfig(

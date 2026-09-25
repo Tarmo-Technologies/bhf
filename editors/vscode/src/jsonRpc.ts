@@ -36,20 +36,34 @@ export function encodeFrame(message: unknown): Buffer {
 
 export class FrameDecoder {
   private buffer = Buffer.alloc(0);
+  private static readonly MAX_FRAME_BYTES = 64 * 1024 * 1024;
+  private static readonly MAX_HEADER_BYTES = 8192;
 
   constructor(private readonly onMessage: (message: unknown) => void) {}
 
   push(chunk: Buffer): void {
+    if (this.buffer.length + chunk.length > FrameDecoder.MAX_FRAME_BYTES + FrameDecoder.MAX_HEADER_BYTES) {
+      throw new Error("BHF JSON-RPC frame exceeds the maximum size");
+    }
     this.buffer = Buffer.concat([this.buffer, chunk]);
 
     for (;;) {
       const headerEnd = this.buffer.indexOf("\r\n\r\n");
       if (headerEnd < 0) {
+        if (this.buffer.length > FrameDecoder.MAX_HEADER_BYTES) {
+          throw new Error("BHF JSON-RPC header exceeds the maximum size");
+        }
         return;
+      }
+      if (headerEnd > FrameDecoder.MAX_HEADER_BYTES) {
+        throw new Error("BHF JSON-RPC header exceeds the maximum size");
       }
 
       const header = this.buffer.subarray(0, headerEnd).toString("utf8");
       const contentLength = parseContentLength(header);
+      if (contentLength > FrameDecoder.MAX_FRAME_BYTES) {
+        throw new Error("BHF JSON-RPC body exceeds the maximum size");
+      }
       const bodyStart = headerEnd + 4;
       const bodyEnd = bodyStart + contentLength;
       if (this.buffer.length < bodyEnd) {
@@ -76,11 +90,18 @@ export class StdioJsonRpcClient {
       cwd,
       stdio: "pipe",
     });
-    this.child.stdout.on("data", (chunk: Buffer) => this.decoder.push(chunk));
-    this.child.on("error", (error) => this.rejectAll(error));
+    this.child.stdout.on("data", (chunk: Buffer) => {
+      try {
+        this.decoder.push(chunk);
+      } catch (error) {
+        this.fail(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+    this.child.stderr.resume();
+    this.child.on("error", (error) => this.fail(error));
     this.child.on("exit", (code, signal) => {
       if (!this.disposed) {
-        this.rejectAll(
+        this.fail(
           new Error(`BHF daemon exited code=${code ?? "null"} signal=${signal ?? "null"}`),
         );
       }
@@ -159,6 +180,12 @@ export class StdioJsonRpcClient {
     }
     this.pending.clear();
   }
+
+  private fail(error: Error): void {
+    this.disposed = true;
+    this.rejectAll(error);
+    this.child.kill();
+  }
 }
 
 function parseContentLength(header: string): number {
@@ -166,7 +193,11 @@ function parseContentLength(header: string): number {
   if (!match) {
     throw new Error("JSON-RPC frame is missing Content-Length");
   }
-  return Number.parseInt(match[1], 10);
+  const length = Number.parseInt(match[1], 10);
+  if (!Number.isSafeInteger(length)) {
+    throw new Error("JSON-RPC Content-Length is not a safe integer");
+  }
+  return length;
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {

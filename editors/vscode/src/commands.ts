@@ -12,16 +12,16 @@ export interface CommandConfig {
   workspaceRoot: string;
 }
 
-export function buildReplayCommand(
+export interface ProcessCommand {
+  executable: string;
+  args: string[];
+}
+
+export function buildReplayProcess(
   finding: BhfFinding,
   config: CommandConfig,
-): string {
-  if (!config.harnessPath.trim() && finding.replay?.command?.trim()) {
-    return finding.replay.command;
-  }
-
+): ProcessCommand {
   const args = [
-    config.cliPath,
     "replay",
     "--finding",
     findingPath(finding, config),
@@ -29,15 +29,14 @@ export function buildReplayCommand(
   if (config.harnessPath.trim()) {
     args.push("--harness", config.harnessPath);
   }
-  return shellCommand(args);
+  return { executable: config.cliPath, args };
 }
 
-export function buildMinimizeCommand(
+export function buildMinimizeProcess(
   finding: BhfFinding,
   config: CommandConfig,
-): string {
+): ProcessCommand {
   const args = [
-    config.cliPath,
     "minimize",
     "--finding",
     findingPath(finding, config),
@@ -46,7 +45,7 @@ export function buildMinimizeCommand(
     args.push("--harness", config.harnessPath);
   }
   args.push("--strategy", config.minimizeStrategy);
-  return shellCommand(args);
+  return { executable: config.cliPath, args };
 }
 
 export function resolveReproducerPath(
@@ -67,20 +66,19 @@ export function resolveReproducerPath(
   return path.normalize(path.resolve(findingsRoot, artifact));
 }
 
-export function shellCommand(args: string[]): string {
-  return args.map(quoteShellArg).join(" ");
-}
-
 function findingPath(finding: BhfFinding, config: CommandConfig): string {
   const findingsRoot = path.isAbsolute(config.findingsDir)
     ? config.findingsDir
     : path.resolve(config.workspaceRoot, config.findingsDir);
-  return path.normalize(path.resolve(findingsRoot, finding.id));
-}
-
-export function quoteShellArg(arg: string): string {
-  if (/^[A-Za-z0-9_./:=@+-]+$/.test(arg)) {
-    return arg;
+  if (
+    !finding.id ||
+    finding.id === "." ||
+    finding.id === ".." ||
+    finding.id.includes("\\") ||
+    finding.id.includes(":") ||
+    path.basename(finding.id) !== finding.id
+  ) {
+    throw new Error("BHF finding has an invalid ID");
   }
-  return `'${arg.replaceAll("'", "'\\''")}'`;
+  return path.normalize(path.resolve(findingsRoot, finding.id));
 }

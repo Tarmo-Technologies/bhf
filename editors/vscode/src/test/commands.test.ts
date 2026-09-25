@@ -4,8 +4,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  buildMinimizeCommand,
-  buildReplayCommand,
+  buildMinimizeProcess,
+  buildReplayProcess,
   resolveReproducerPath,
   type CommandConfig,
 } from "../commands";
@@ -28,46 +28,82 @@ const finding: BhfFinding = {
   },
 };
 
-test("buildReplayCommand adds configured harness path", () => {
-  assert.equal(
-    buildReplayCommand(finding, config),
-    "bhf replay --finding /work/project/findings/F-0001-alpha --harness 'build/H 1/main'",
+test("buildReplayProcess adds configured harness path as an argument", () => {
+  assert.deepEqual(
+    buildReplayProcess(finding, config),
+    {
+      executable: "bhf",
+      args: ["replay", "--finding", "/work/project/findings/F-0001-alpha", "--harness", "build/H 1/main"],
+    },
   );
 });
 
-test("buildReplayCommand uses configured findings directory with harness override", () => {
-  assert.equal(
-    buildReplayCommand(finding, {
+test("buildReplayProcess uses configured findings directory with harness override", () => {
+  assert.deepEqual(
+    buildReplayProcess(finding, {
       ...config,
       findingsDir: "custom/findings",
       harnessPath: "build/H 1/main",
     }),
-    "bhf replay --finding /work/project/custom/findings/F-0001-alpha --harness 'build/H 1/main'",
+    {
+      executable: "bhf",
+      args: ["replay", "--finding", "/work/project/custom/findings/F-0001-alpha", "--harness", "build/H 1/main"],
+    },
   );
 });
 
-test("buildReplayCommand uses finding replay command when no harness overrides it", () => {
-  assert.equal(
-    buildReplayCommand(finding, { ...config, harnessPath: "" }),
-    "bhf replay --finding F-0001-alpha",
+test("buildReplayProcess ignores stored shell command when no harness is configured", () => {
+  assert.deepEqual(
+    buildReplayProcess({ ...finding, replay: { command: "bhf replay; touch /tmp/owned" } }, { ...config, harnessPath: "" }),
+    {
+      executable: "bhf",
+      args: ["replay", "--finding", "/work/project/findings/F-0001-alpha"],
+    },
   );
 });
 
-test("buildMinimizeCommand includes strategy and harness when configured", () => {
-  assert.equal(
-    buildMinimizeCommand(finding, config),
-    "bhf minimize --finding /work/project/findings/F-0001-alpha --harness 'build/H 1/main' --strategy typed",
+test("buildReplayProcess keeps metacharacters literal in executable and arguments", () => {
+  assert.deepEqual(
+    buildReplayProcess(
+      { ...finding, id: "F-1 & echo owned" },
+      { ...config, cliPath: "C:\\Program Files\\BHF\\bhf.exe", harnessPath: "build/H 1/main; echo owned" },
+    ),
+    {
+      executable: "C:\\Program Files\\BHF\\bhf.exe",
+      args: ["replay", "--finding", "/work/project/findings/F-1 & echo owned", "--harness", "build/H 1/main; echo owned"],
+    },
   );
 });
 
-test("buildMinimizeCommand uses configured findings directory", () => {
-  assert.equal(
-    buildMinimizeCommand(finding, {
+test("buildReplayProcess rejects finding IDs that escape the findings directory", () => {
+  assert.throws(
+    () => buildReplayProcess({ ...finding, id: "../../outside" }, config),
+    /invalid ID/,
+  );
+  assert.throws(() => buildReplayProcess({ ...finding, id: "..\\outside" }, config), /invalid ID/);
+});
+
+test("buildMinimizeProcess includes strategy and harness as arguments", () => {
+  assert.deepEqual(
+    buildMinimizeProcess(finding, config),
+    {
+      executable: "bhf",
+      args: ["minimize", "--finding", "/work/project/findings/F-0001-alpha", "--harness", "build/H 1/main", "--strategy", "typed"],
+    },
+  );
+});
+
+test("buildMinimizeProcess uses configured findings directory", () => {
+  assert.deepEqual(
+    buildMinimizeProcess(finding, {
       ...config,
       findingsDir: "/tmp/bhf-findings",
       harnessPath: "",
     }),
-    "bhf minimize --finding /tmp/bhf-findings/F-0001-alpha --strategy typed",
+    {
+      executable: "bhf",
+      args: ["minimize", "--finding", "/tmp/bhf-findings/F-0001-alpha", "--strategy", "typed"],
+    },
   );
 });
 

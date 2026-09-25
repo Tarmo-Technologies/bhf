@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import os
+import math
 
 try:
     import GPS  # type: ignore[import-not-found]
@@ -30,6 +31,7 @@ PREF_CLI = "BHF/cli-path"
 PREF_FINDINGS = "BHF/findings-dir"
 PREF_HARNESS = "BHF/harness-path"
 PREF_STRATEGY = "BHF/minimize-strategy"
+PREF_DAEMON_TIMEOUT = "BHF/daemon-timeout-seconds"
 
 
 class PluginState:
@@ -95,6 +97,13 @@ def create_preferences() -> None:
         "bytes",
         "typed",
     )
+    create_preference(
+        PREF_DAEMON_TIMEOUT,
+        "Daemon request timeout (seconds)",
+        "string",
+        "Finite deadline for a findings refresh; defaults to 30 seconds.",
+        "30",
+    )
 
 
 def create_preference(name: str, label: str, kind: str, doc: str, default, *args) -> None:
@@ -155,12 +164,15 @@ def register_finding_actions(finding, config: BhfConfig) -> None:
 
 
 def run_finding_action(action: str, finding, config: BhfConfig, finding_id: str) -> None:
-    if action == "replay":
-        run_process(build_replay_args(finding, config), config, f"Replay {finding_id}")
-    elif action == "minimize":
-        run_process(build_minimize_args(finding, config), config, f"Minimize {finding_id}")
-    elif action == "open-repro":
-        open_reproducer(finding, config)
+    try:
+        if action == "replay":
+            run_process(build_replay_args(finding, config), config, f"Replay {finding_id}")
+        elif action == "minimize":
+            run_process(build_minimize_args(finding, config), config, f"Minimize {finding_id}")
+        elif action == "open-repro":
+            open_reproducer(finding, config)
+    except ValueError as error:
+        console_write(f"BHF action failed: {error}\n")
 
 
 def register_action(name: str, menu_path: str, description: str, callback) -> None:
@@ -213,6 +225,7 @@ def current_config() -> BhfConfig:
         harness_path=string_preference(PREF_HARNESS, ""),
         minimize_strategy=strategy_preference(),
         workspace_root=workspace_root(),
+        daemon_timeout_secs=daemon_timeout_preference(),
     )
 
 
@@ -234,6 +247,15 @@ def strategy_preference() -> str:
     if value == "typed":
         return "typed"
     return "bytes"
+
+
+def daemon_timeout_preference() -> float:
+    value = string_preference(PREF_DAEMON_TIMEOUT, "30")
+    try:
+        timeout = float(value)
+    except ValueError:
+        return 30.0
+    return timeout if math.isfinite(timeout) and timeout > 0 else 30.0
 
 
 def workspace_root() -> str:

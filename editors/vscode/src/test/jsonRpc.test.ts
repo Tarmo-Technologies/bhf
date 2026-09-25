@@ -41,3 +41,24 @@ test("FrameDecoder handles multiple frames in one chunk", () => {
     { jsonrpc: "2.0", id: 2, result: "second" },
   ]);
 });
+
+test("FrameDecoder rejects oversized headers and bodies", () => {
+  const decoder = new FrameDecoder(() => {});
+  assert.throws(() => decoder.push(Buffer.alloc(8193, 65)), /header exceeds/);
+  const bodyDecoder = new FrameDecoder(() => {});
+  assert.throws(
+    () => bodyDecoder.push(Buffer.from("Content-Length: 67108865\r\n\r\n")),
+    /body exceeds/,
+  );
+});
+
+test("FrameDecoder rejects noninteger and unsafe content lengths", () => {
+  assert.throws(
+    () => new FrameDecoder(() => {}).push(Buffer.from("Content-Length: nope\r\n\r\n")),
+    /missing Content-Length/,
+  );
+  assert.throws(
+    () => new FrameDecoder(() => {}).push(Buffer.from("Content-Length: 99999999999999999999\r\n\r\n")),
+    /safe integer/,
+  );
+});
