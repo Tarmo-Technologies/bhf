@@ -52,6 +52,54 @@ describes the underlying fields.
 
 ---
 
+## `fidelity` — what was and was NOT exercised (CC-1)
+
+A structured record of which execution dimensions this finding actually
+exercised, so a finding from BHF's host stub-isolation lane (VxWorks / INTEGRITY
+/ QNX / Windows code fuzzed on the x86-64 host with the platform faked) is never
+mistaken for target assurance. This is a safety requirement for
+DO-178/safety-critical users. It replaces the old coarse per-target
+"reduced-fidelity" text caveat; that caveat is now *derived* from this record
+(`fidelity_caveat`, below) so the two can never disagree.
+
+Every finding carries a `fidelity` object with six dimensions —
+`arch`, `endianness`, `rtos_runtime`, `hardware_peripherals`, `concurrency`,
+`sanitizers` — each a `{status, reason}` pair:
+
+| `status` | Meaning |
+|---|---|
+| `exercised` | Genuinely exercised against the real thing (e.g. the code ran on the host ISA and the host **is** the target, or a sanitizer was armed and active). |
+| `not_exercised` | The dimension exists for this target but was faked, stubbed, or never explored — a real fidelity gap. Findings do **not** speak to it. |
+| `not_applicable` | The dimension does not apply (e.g. a plain host process has no RTOS runtime). Not a gap. |
+
+`reason` is a short human string explaining the verdict (e.g. `"vxworks runtime
+stubbed with inert handles; RTOS scheduling/IPC not modeled"`).
+
+How the dimensions are populated:
+
+- **Host stub-isolated target** (`platform_stub` set — VxWorks/INTEGRITY/QNX/Windows):
+  `arch` = `not_exercised` (ran on the host ISA, not the target's),
+  `endianness` = `not_exercised` (target byte order not verified),
+  `rtos_runtime` = `not_exercised` (inert stub handles),
+  `hardware_peripherals` = `not_exercised` (device access faked). The build is
+  otherwise a normal native host build, so `sanitizers` = `exercised` and
+  `concurrency` follows the TSan rule below.
+- **Plain native host target**: `arch`/`endianness` = `exercised` (the host is
+  the target), `rtos_runtime`/`hardware_peripherals` = `not_applicable`.
+- **`concurrency`** = `exercised` **only** when a ThreadSanitizer pass ran
+  (C only); otherwise `not_exercised` — interleavings were not explored.
+- **`sanitizers`** = `exercised` when at least one sanitizer was armed
+  (`asan`/`ubsan` by default; empty under `--sanitizers none` → `not_exercised`).
+
+| Field | Meaning |
+|---|---|
+| `fidelity_caveat` | The one-line human caveat **derived** from `fidelity`. Present **only** for a reduced-fidelity (host-stub) result, enumerating every un-exercised dimension and stating the findings are host-stub evidence, not target assurance. **Absent** on a fully-native target — it never carries a spurious caveat. |
+
+A static-analysis finding (no dynamic execution) carries an all-`not_applicable`
+`fidelity` block and no `fidelity_caveat`.
+
+---
+
 ## `actionability` — is it worth your time, and where to fix it
 
 This object is bhf's triage verdict. It exists to answer "should I look at this,
@@ -167,6 +215,8 @@ Beyond the per-finding list:
 | Targets discovered / built+fuzzed / skipped | Discovery found N fuzzable subprograms (ranked by score); of those, how many built+fuzzed vs were skipped (un-buildable / un-harnessable). With `--max-targets N`, the line shows "keeping the top N of M ranked target(s)". |
 | `needed_for_build` (dependency manifest) | Headers / libraries / Ada units that were missing and had to be stubbed or are still blocking a build — the "bring these to the offline machine" list (`<work>/auto/missing-deps.txt`). `stubbed_*` = resolved by auto-stubbing; `missing_*` = still blocking. |
 | Discovery cache line | Caching is on by default: "discovery loaded from cache (… source tree unchanged)" on a hit, or "discovery cache miss (… reason)" naming why it recomputed (no cache file yet / source fingerprint changed / format version bump / different root). `--fresh-discovery` forces a recompute; `--no-discovery-cache` disables it. |
+| `summary.fidelity` (CC-1) | The campaign-level fidelity rollup. `reduced_fidelity_targets` = how many fuzzed targets were host-stub (not target assurance); `stubbed_platforms` = the foreign platforms stub-isolated this run (e.g. `["vxworks"]`); `dimensions` = the worst-case per-dimension [`fidelity`](#fidelity--what-was-and-was-not-exercised-cc-1) across all fuzzed targets (a single stubbed target flags the run); `caveat` = the derived one-line caveat, present iff any fuzzed target was reduced-fidelity. A fully-native sweep reports `reduced_fidelity_targets: 0` and no `caveat`. |
+| `targets[].fidelity` (CC-1) | The per-target `fidelity` record (same shape as the per-finding block), present for every built+fuzzed target. `run.md`'s per-target line appends the derived caveat for a reduced-fidelity target and nothing for a native one. |
 
 ---
 

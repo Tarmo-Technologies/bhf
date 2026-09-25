@@ -14,6 +14,7 @@ use crate::auto::attempt::{
 use crate::auto::candidate::{Candidate, Lang};
 use crate::auto::repair::Repair;
 use anyhow::Result;
+use multicore_fuzz::{Sanitizer, SanitizerSelection};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::Write as _;
@@ -106,6 +107,32 @@ struct Summary {
     /// tree visible instead of indistinguishable from "no fuzzable endpoints".
     #[serde(skip_serializing_if = "Vec::is_empty")]
     discovery_diagnostics: Vec<DiscoveryDiagnosticRow>,
+    /// CC-1: the campaign-level fidelity rollup — which execution dimensions
+    /// (arch, endianness, RTOS runtime, hardware, concurrency, sanitizers) were
+    /// exercised vs not across the fuzzed targets, plus the derived caveat. So a
+    /// sweep that host-stubbed a VxWorks target is never read as target
+    /// assurance, and a fully-native sweep carries no caveat.
+    fidelity: FidelitySummary,
+}
+
+/// CC-1: campaign-level fidelity rollup for `run.json`'s summary. `dimensions`
+/// is the worst case per dimension across every fuzzed target, so a single
+/// host-stub target flags the run; `caveat` is `None` for a fully-native sweep.
+#[derive(Debug, Default, Serialize)]
+struct FidelitySummary {
+    /// Fuzzed targets whose findings are host-stub evidence, not target
+    /// assurance (their platform ISA / RTOS / hardware was faked).
+    reduced_fidelity_targets: usize,
+    /// The foreign platforms stub-isolated on the host this run (sorted, deduped).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    stubbed_platforms: Vec<String>,
+    /// Worst-case per-dimension fidelity across all fuzzed targets. `None` when
+    /// nothing was fuzzed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dimensions: Option<actionability::Fidelity>,
+    /// The derived human caveat, present iff any fuzzed target was reduced-fidelity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    caveat: Option<String>,
 }
 
 /// #102: one grouped discovery-drop row for `run.json` — a (language, stage,
@@ -223,10 +250,143 @@ struct TargetEntry<'a> {
     /// ran but the platform behavior was stubbed, not real.
     #[serde(skip_serializing_if = "Option::is_none")]
     platform_stub: Option<String>,
+    /// CC-1: the structured fidelity record for this target — which execution
+    /// dimensions were exercised vs faked/unexplored. `None` (omitted) for a
+    /// target that never fuzzed (a failed build has nothing to characterize).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fidelity: Option<actionability::Fidelity>,
 }
 
 fn is_zero(n: &usize) -> bool {
     *n == 0
+}
+
+/// CC-1: the sanitizers the run armed for the native/host-stub build lane, as
+/// short labels. `Default` bakes ASan+UBSan into the harness Makefile; `None`
+/// arms none; `Set` is exactly the operator's selection.
+fn effective_sanitizer_names(sel: &SanitizerSelection) -> Vec<String> {
+    fn label(s: Sanitizer) -> &'static str {
+        match s {
+            Sanitizer::Asan => "asan",
+            Sanitizer::Msan => "msan",
+            Sanitizer::Ubsan => "ubsan",
+            Sanitizer::Tsan => "tsan",
+            Sanitizer::Lsan => "lsan",
+        }
+    }
+    match sel {
+        SanitizerSelection::Default => vec!["asan".to_owned(), "ubsan".to_owned()],
+        SanitizerSelection::None => Vec::new(),
+        SanitizerSelection::Set(set) => set.iter().map(|s| label(*s).to_owned()).collect(),
+    }
+}
+
+/// CC-1: whether the ThreadSanitizer corpus-replay lane runs for this selection —
+/// mirrors [`crate::auto::cli`]'s replay gate (Default runs the historical
+/// matrix; `Set` runs it only when TSan is selected). The replay is C-only, so
+/// callers additionally gate on dialect.
+fn tsan_replay_runs(sel: &SanitizerSelection) -> bool {
+    match sel {
+        SanitizerSelection::Default => true,
+        SanitizerSelection::None => false,
+        SanitizerSelection::Set(set) => set.contains(&Sanitizer::Tsan),
+    }
+}
+
+/// CC-1: derive a target's structured [`actionability::Fidelity`] from facts the
+/// report already holds. `None` for a target that never fuzzed — there is no
+/// execution to characterize. The host stub-isolation lane is a NATIVE build (it
+/// keeps host sanitizers), so its sanitizer/concurrency facts come from the run
+/// selection just like a plain native target; only its platform ISA / RTOS /
+/// hardware are faked, which `platform_stub` carries.
+fn target_fidelity(
+    r: &AttemptResult,
+    sanitizers: &SanitizerSelection,
+) -> Option<actionability::Fidelity> {
+    if !matches!(
+        r.outcome,
+        Outcome::BuiltAndFuzzed { .. } | Outcome::BuiltNotEntered { .. }
+    ) {
+        return None;
+    }
+    let mut facts = actionability::FidelityFacts::host();
+    facts.platform_stub = r.outcome.platform_stub();
+    // The TSan replay is C-only (the C++ Makefile has no `tsan` target); other
+    // dialects never exercise concurrency, so gate on both the run selection and
+    // the target dialect.
+    let tsan_ran = tsan_replay_runs(sanitizers) && matches!(r.candidate.lang, Lang::C);
+    let mut names = effective_sanitizer_names(sanitizers);
+    if tsan_ran && !names.iter().any(|n| n == "tsan") {
+        names.push("tsan".to_owned());
+    }
+    facts.sanitizers = names;
+    facts.tsan_ran = tsan_ran;
+    Some(actionability::Fidelity::from_facts(&facts))
+}
+
+/// CC-1: write the per-finding fidelity block onto every `finding.json` on disk.
+/// A finding produced by a fuzzed target inherits that target's record (keyed by
+/// `harness_id`); a static / no-harness finding gets an all-`NotApplicable`
+/// "nothing executed" record so every finding carries the block without claiming
+/// a spurious caveat. Best-effort: an unreadable or malformed sidecar is skipped,
+/// never aborting the report.
+fn annotate_findings_with_fidelity(
+    work_dir: &Path,
+    results: &[AttemptResult],
+    fidelities: &[Option<actionability::Fidelity>],
+) {
+    let mut by_harness: BTreeMap<&str, &actionability::Fidelity> = BTreeMap::new();
+    for (r, fid) in results.iter().zip(fidelities) {
+        if let Some(f) = fid {
+            by_harness.insert(r.candidate.harness_id.as_str(), f);
+        }
+    }
+    let findings_root = work_dir.join("findings");
+    let Ok(entries) = std::fs::read_dir(&findings_root) else {
+        return;
+    };
+    let static_record =
+        actionability::Fidelity::not_executed("static analysis finding; nothing was executed");
+    for entry in entries.flatten() {
+        let path = entry.path().join("finding.json");
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(mut raw) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        let Some(obj) = raw.as_object_mut() else {
+            continue;
+        };
+        let harness_id = obj
+            .get("harness_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let fidelity = by_harness
+            .get(harness_id)
+            .copied()
+            .unwrap_or(&static_record);
+        let Ok(value) = serde_json::to_value(fidelity) else {
+            continue;
+        };
+        obj.insert("fidelity".to_owned(), value);
+        // Keep a one-line derived caveat next to the block for tools that read a
+        // single string; drop any stale one when the target is full-fidelity.
+        match fidelity.caveat() {
+            Some(caveat) => {
+                obj.insert(
+                    "fidelity_caveat".to_owned(),
+                    serde_json::Value::String(caveat),
+                );
+            }
+            None => {
+                obj.remove("fidelity_caveat");
+            }
+        }
+        if let Ok(serialized) = serde_json::to_vec_pretty(&raw) {
+            let _ = std::fs::write(&path, serialized);
+        }
+    }
 }
 
 /// A round-trippable persisted copy of one target's full attempt result, written
@@ -558,6 +718,7 @@ pub fn write_reports(
         force,
         stopped_by_operator,
         false,
+        &SanitizerSelection::Default,
     )
 }
 
@@ -576,6 +737,10 @@ pub fn write_reports_with_output_limit(
     force: bool,
     stopped_by_operator: bool,
     output_limit_reached: bool,
+    // CC-1: the run's sanitizer selection, so each target's fidelity record
+    // reports which sanitizers were actually armed and whether a TSan
+    // (concurrency) pass ran.
+    sanitizers: &SanitizerSelection,
 ) -> Result<()> {
     let auto_dir = work_dir.join("auto");
     std::fs::create_dir_all(&auto_dir)?;
@@ -872,6 +1037,41 @@ pub fn write_reports_with_output_limit(
     // so a parser regression is visible in run.json, not just bug-report.json.
     summary.discovery_diagnostics = collect_discovery_diagnostics();
 
+    // CC-1: derive each target's structured fidelity once (reused for the
+    // per-target run.json entry, the campaign rollup, and the per-finding block).
+    let target_fidelities: Vec<Option<actionability::Fidelity>> = results
+        .iter()
+        .map(|r| target_fidelity(r, sanitizers))
+        .collect();
+    // Campaign rollup: worst case per dimension across every fuzzed target, plus
+    // the count of reduced-fidelity targets and the platforms stubbed this run.
+    {
+        let present: Vec<&actionability::Fidelity> = target_fidelities.iter().flatten().collect();
+        let dimensions = actionability::Fidelity::rollup(present.iter().copied());
+        let reduced_fidelity_targets = present.iter().filter(|f| f.is_reduced_fidelity()).count();
+        let mut stubbed_platforms: Vec<String> = results
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.outcome,
+                    Outcome::BuiltAndFuzzed { .. } | Outcome::BuiltNotEntered { .. }
+                )
+            })
+            .filter_map(|r| r.outcome.platform_stub())
+            .collect();
+        stubbed_platforms.sort();
+        stubbed_platforms.dedup();
+        let caveat = dimensions
+            .as_ref()
+            .and_then(actionability::Fidelity::caveat);
+        summary.fidelity = FidelitySummary {
+            reduced_fidelity_targets,
+            stubbed_platforms,
+            dimensions,
+            caveat,
+        };
+    }
+
     needed.synthesized_headers = drain_bag(bag_headers);
     needed.synthesized_types = drain_bag(bag_types);
     needed.synthesized_macros = drain_bag(bag_macros);
@@ -890,7 +1090,8 @@ pub fn write_reports_with_output_limit(
 
     let targets: Vec<TargetEntry> = results
         .iter()
-        .map(|r| TargetEntry {
+        .zip(&target_fidelities)
+        .map(|(r, fidelity)| TargetEntry {
             harness_id: &r.candidate.harness_id,
             source: &r.candidate.source_path,
             name: &r.candidate.name,
@@ -901,8 +1102,12 @@ pub fn write_reports_with_output_limit(
             stub_execution: r.outcome.stub_execution(),
             input_reachability: r.candidate.input_reachability,
             platform_stub: r.outcome.platform_stub(),
+            fidelity: fidelity.clone(),
         })
         .collect();
+
+    // CC-1: stamp every finding.json with its target's structured fidelity block.
+    annotate_findings_with_fidelity(work_dir, results, &target_fidelities);
 
     let run_json = RunJson {
         schema_version: 1,
@@ -3602,6 +3807,16 @@ fn render_target_md_line(t: &TargetEntry<'_>) -> String {
             }
         }
     }
+    // CC-1: the reduced-fidelity caveat, DERIVED from the structured record so it
+    // can never disagree with it. A fully-native target returns `None` here, so it
+    // carries no spurious caveat.
+    if let Some(caveat) = t
+        .fidelity
+        .as_ref()
+        .and_then(actionability::Fidelity::caveat)
+    {
+        line.push_str(&format!("  [!] {caveat}"));
+    }
     line
 }
 
@@ -4188,6 +4403,151 @@ mod tests {
         }
     }
 
+    /// CC-1: a fuzzed target's structured fidelity must land on both `run.json`
+    /// (per-target + campaign rollup) and every one of that target's
+    /// `finding.json` sidecars — a stubbed target's findings read as host-stub
+    /// evidence (arch/RTOS/hardware `not_exercised` + a derived caveat), while a
+    /// native target's carry no spurious caveat.
+    #[test]
+    fn fidelity_lands_on_run_json_and_each_finding_json() {
+        use crate::auto::attempt::{AttemptResult, Outcome, PassRun};
+        use crate::auto::pass::Pass;
+        use crate::auto::repair::Repair;
+
+        let work = std::env::temp_dir().join(format!(
+            "bhf-report-fidelity-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(work.join("findings")).unwrap();
+
+        // One finding from a host-stubbed VxWorks target, one from a plain native
+        // target, each written to disk exactly as the cascade would.
+        let write_finding = |id: &str, harness: &str| {
+            let dir = work.join("findings").join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("finding.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "id": id,
+                    "harness_id": harness,
+                    "rule_id": "BHF-210",
+                    "classification": "runtime_crash",
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        };
+        write_finding("F-0000-stub", "H-STUB-VX");
+        write_finding("F-0001-native", "H-NATIVE");
+
+        let built = |harness: &str, finding: &str, repairs: Vec<Repair>| {
+            let mut c = cand(harness);
+            c.name = harness.to_owned();
+            AttemptResult {
+                candidate: c,
+                outcome: Outcome::BuiltAndFuzzed {
+                    repairs,
+                    retries: 0,
+                    per_pass_budget_secs: 60,
+                    total_wall_budget_secs: 60,
+                    executions_per_sec: 9.0,
+                    passes: vec![PassRun {
+                        pass: Pass::Empty,
+                        engine: "builtin".to_owned(),
+                        executions: 9,
+                        target_entry_observed: true,
+                        coverage_edges: 80,
+                        elapsed_secs: 1.0,
+                        executions_per_sec: 9.0,
+                        findings: vec![finding.to_owned()],
+                    }],
+                    runtrace_events: vec![],
+                },
+                harness_dir: work.join("harnesses").join(harness),
+            }
+        };
+
+        let results = vec![
+            built(
+                "H-STUB-VX",
+                "F-0000-stub",
+                vec![Repair::PlatformStub {
+                    platform: "vxworks".to_owned(),
+                }],
+            ),
+            built("H-NATIVE", "F-0001-native", vec![]),
+        ];
+
+        write_reports(
+            std::path::Path::new("/tmp"),
+            &results,
+            &work,
+            "T0",
+            "T1",
+            false,
+            actionability::RunMode::Reporting,
+            0,
+            0,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        // --- per-finding blocks on disk ---
+        let read_finding = |id: &str| -> serde_json::Value {
+            serde_json::from_slice(
+                &std::fs::read(work.join("findings").join(id).join("finding.json")).unwrap(),
+            )
+            .unwrap()
+        };
+        let stub = read_finding("F-0000-stub");
+        assert_eq!(
+            stub["fidelity"]["arch"]["status"], "not_exercised",
+            "stub finding arch must be not_exercised: {stub}"
+        );
+        assert_eq!(stub["fidelity"]["rtos_runtime"]["status"], "not_exercised");
+        assert_eq!(
+            stub["fidelity"]["hardware_peripherals"]["status"],
+            "not_exercised"
+        );
+        assert!(
+            stub["fidelity_caveat"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not target assurance"),
+            "stub finding must carry a derived caveat: {stub}"
+        );
+
+        let native = read_finding("F-0001-native");
+        assert_eq!(
+            native["fidelity"]["arch"]["status"], "exercised",
+            "native finding arch must be exercised: {native}"
+        );
+        assert_eq!(
+            native["fidelity"]["rtos_runtime"]["status"],
+            "not_applicable"
+        );
+        assert!(
+            native.get("fidelity_caveat").is_none(),
+            "native finding must NOT carry a spurious caveat: {native}"
+        );
+
+        // --- campaign rollup on run.json ---
+        let run: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(work.join("auto/run.json")).unwrap()).unwrap();
+        let sf = &run["summary"]["fidelity"];
+        assert_eq!(sf["reduced_fidelity_targets"], 1, "run={run}");
+        assert_eq!(sf["stubbed_platforms"], serde_json::json!(["vxworks"]));
+        assert_eq!(sf["dimensions"]["arch"]["status"], "not_exercised");
+        assert!(sf["caveat"].as_str().unwrap_or_default().contains("arch"));
+
+        std::fs::remove_dir_all(&work).ok();
+    }
+
     /// Regression: a finding a post-pass DELETED from disk (COBOL crash
     /// attribution dropping a harness-artifact crash) must also leave the
     /// in-memory pass record, so the headline count, run.json and findings.csv all
@@ -4282,7 +4642,11 @@ mod tests {
         // findings.csv carries exactly the one surviving row — count and evidence
         // agree, the invariant the COBOL reconciliation gate requires.
         let csv = std::fs::read_to_string(work.join("findings.csv")).unwrap();
-        let data_rows: Vec<&str> = csv.lines().skip(1).filter(|l| !l.trim().is_empty()).collect();
+        let data_rows: Vec<&str> = csv
+            .lines()
+            .skip(1)
+            .filter(|l| !l.trim().is_empty())
+            .collect();
         assert_eq!(data_rows.len(), 1, "csv: {csv}");
         assert!(
             data_rows[0].starts_with(survivor),
@@ -4655,6 +5019,7 @@ mod tests {
             false,
             false,
             true,
+            &SanitizerSelection::Default,
         )
         .unwrap();
         let json: serde_json::Value =

@@ -2580,7 +2580,8 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     // the headline count, run.json and run.md still carried the id, so the count
     // reported a finding with no evidence bundle. Drop those phantom ids so every
     // finding surface agrees before the report is written.
-    let phantom_findings = crate::auto::report::reconcile_pass_findings_with_disk(&mut results, &work);
+    let phantom_findings =
+        crate::auto::report::reconcile_pass_findings_with_disk(&mut results, &work);
     if phantom_findings > 0 {
         bhfeprintln!(
             "bhf auto: reconciled {phantom_findings} finding id(s) removed by a post-pass oracle out of the headline count"
@@ -2604,6 +2605,7 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         args.force,
         stopped_by_operator,
         output_budget.exhausted(),
+        &options.sanitizers,
     )?;
     crate::auto::discovery::bhfprof("auto:write_reports", _twr);
 

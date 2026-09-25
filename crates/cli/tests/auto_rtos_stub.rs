@@ -193,3 +193,219 @@ fn guarded_vxworks_branch_is_made_visible_and_fuzzed_stub_isolated() {
         "must report the stub-isolated vxworks build; stderr:\n{stderr}"
     );
 }
+
+/// CC-1: a stub-isolated VxWorks target's report must carry a STRUCTURED fidelity
+/// record — enumerating the un-exercised dimensions, not just a coarse text
+/// caveat — on both the per-target `run.json` entry and the campaign summary.
+#[test]
+fn stub_isolated_target_carries_structured_fidelity_record() {
+    if !toolchain_available() {
+        return;
+    }
+    let tmp = tempfile::Builder::new()
+        .prefix("bhf-rtos-fidelity-")
+        .tempdir()
+        .expect("tempdir");
+    let root = tmp.path();
+    write_guarded_fixture(root);
+    let work = root.join("gw");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bhf"))
+        .arg("auto")
+        .arg(root)
+        .arg("--work-dir")
+        .arg(&work)
+        .arg("--per-target-time")
+        .arg("1")
+        .output()
+        .expect("spawn bhf auto");
+
+    let run: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(work.join("auto/run.json")).unwrap_or_else(|e| {
+            panic!(
+                "read run.json: {e}; exit={:?}\nstderr:\n{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        }),
+    )
+    .expect("parse run.json");
+
+    // Per-target fidelity block: the VxWorks target ran host-stubbed, so its ISA,
+    // RTOS runtime, and hardware were NOT exercised, each with a reason.
+    let target = run["targets"]
+        .as_array()
+        .expect("targets array")
+        .iter()
+        .find(|t| t["name"].as_str() == Some("sonar_decode"))
+        .unwrap_or_else(|| panic!("sonar_decode target missing; run={run:#?}"));
+    let fidelity = &target["fidelity"];
+    assert_eq!(
+        fidelity["arch"]["status"].as_str(),
+        Some("not_exercised"),
+        "target ISA must read not_exercised for a host stub; fidelity={fidelity:#?}"
+    );
+    assert_eq!(
+        fidelity["rtos_runtime"]["status"].as_str(),
+        Some("not_exercised"),
+        "RTOS runtime must read not_exercised; fidelity={fidelity:#?}"
+    );
+    assert_eq!(
+        fidelity["hardware_peripherals"]["status"].as_str(),
+        Some("not_exercised"),
+        "hardware must read not_exercised; fidelity={fidelity:#?}"
+    );
+    // Reasons must be present and name the platform / the missing surface.
+    assert!(
+        fidelity["arch"]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("vxworks"),
+        "arch reason must name the platform; fidelity={fidelity:#?}"
+    );
+    assert!(
+        !fidelity["rtos_runtime"]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty(),
+        "rtos_runtime must carry a reason; fidelity={fidelity:#?}"
+    );
+
+    // Campaign rollup: at least one reduced-fidelity target, vxworks listed, and a
+    // derived caveat that refuses to read as target assurance.
+    let summary_fidelity = &run["summary"]["fidelity"];
+    assert!(
+        summary_fidelity["reduced_fidelity_targets"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1,
+        "summary must count the reduced-fidelity target; summary={summary_fidelity:#?}"
+    );
+    let platforms = summary_fidelity["stubbed_platforms"]
+        .as_array()
+        .expect("stubbed_platforms array");
+    assert!(
+        platforms.iter().any(|p| p.as_str() == Some("vxworks")),
+        "summary must list the stubbed platform; summary={summary_fidelity:#?}"
+    );
+    let caveat = summary_fidelity["caveat"].as_str().unwrap_or_default();
+    assert!(
+        caveat.contains("RTOS runtime") && caveat.contains("not target assurance"),
+        "summary caveat must enumerate gaps and refuse assurance; caveat={caveat:?}"
+    );
+}
+
+/// A plain host C translation unit with no foreign platform header. bhf builds
+/// and fuzzes it natively, so it is the host target — CC-1 must NOT stamp it with
+/// a spurious reduced-fidelity caveat.
+fn write_native_fixture(root: &Path) {
+    std::fs::write(
+        root.join("frame_len.c"),
+        "#include <stddef.h>\n\
+         \n\
+         /* A plain portable parser: no RTOS, no platform header. */\n\
+         int parse_frame(const unsigned char *buf, unsigned len)\n\
+         {\n\
+         \x20   unsigned i, acc = 0;\n\
+         \x20   if (len < 2) return -1;\n\
+         \x20   for (i = 0; i < len; i++) {\n\
+         \x20       acc += buf[i];\n\
+         \x20       if (buf[i] == 0x7E && i + 1 < len && buf[i + 1] == 0x7F)\n\
+         \x20           return (int)(acc & 0x3ff);\n\
+         \x20   }\n\
+         \x20   return (int)(acc & 0x7f);\n\
+         }\n",
+    )
+    .unwrap();
+}
+
+/// CC-1: a fully-native host target must carry a fidelity record that reads as
+/// full-fidelity — arch/endianness `exercised`, RTOS/hardware `not_applicable` —
+/// and NO caveat, so it is never confused with a host-stub result.
+#[test]
+fn native_host_target_carries_full_fidelity_without_caveat() {
+    if !toolchain_available() {
+        return;
+    }
+    let tmp = tempfile::Builder::new()
+        .prefix("bhf-native-fidelity-")
+        .tempdir()
+        .expect("tempdir");
+    let root = tmp.path();
+    write_native_fixture(root);
+    let work = root.join("gw");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bhf"))
+        .arg("auto")
+        .arg(root)
+        .arg("--work-dir")
+        .arg(&work)
+        .arg("--per-target-time")
+        .arg("1")
+        .output()
+        .expect("spawn bhf auto");
+
+    let run: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(work.join("auto/run.json")).unwrap_or_else(|e| {
+            panic!(
+                "read run.json: {e}; exit={:?}\nstderr:\n{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        }),
+    )
+    .expect("parse run.json");
+
+    let target = run["targets"]
+        .as_array()
+        .expect("targets array")
+        .iter()
+        .find(|t| t["name"].as_str() == Some("parse_frame"))
+        .unwrap_or_else(|| {
+            panic!(
+                "parse_frame target missing; run={run:#?}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+
+    // No platform stub: the host IS the target.
+    assert!(
+        target.get("platform_stub").is_none() || target["platform_stub"].is_null(),
+        "native target must not be platform-stubbed; target={target:#?}"
+    );
+    let fidelity = &target["fidelity"];
+    assert_eq!(
+        fidelity["arch"]["status"].as_str(),
+        Some("exercised"),
+        "native arch must read exercised; fidelity={fidelity:#?}"
+    );
+    assert_eq!(
+        fidelity["endianness"]["status"].as_str(),
+        Some("exercised"),
+        "native endianness must read exercised; fidelity={fidelity:#?}"
+    );
+    assert_eq!(
+        fidelity["rtos_runtime"]["status"].as_str(),
+        Some("not_applicable"),
+        "native has no RTOS runtime; fidelity={fidelity:#?}"
+    );
+    assert_eq!(
+        fidelity["hardware_peripherals"]["status"].as_str(),
+        Some("not_applicable"),
+        "native has no hardware; fidelity={fidelity:#?}"
+    );
+
+    // No spurious campaign caveat, and no reduced-fidelity target counted.
+    let summary_fidelity = &run["summary"]["fidelity"];
+    assert_eq!(
+        summary_fidelity["reduced_fidelity_targets"]
+            .as_u64()
+            .unwrap_or(0),
+        0,
+        "native sweep must count zero reduced-fidelity targets; summary={summary_fidelity:#?}"
+    );
+    assert!(
+        summary_fidelity.get("caveat").is_none() || summary_fidelity["caveat"].is_null(),
+        "native sweep must carry no caveat; summary={summary_fidelity:#?}"
+    );
+}

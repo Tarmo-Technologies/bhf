@@ -7,6 +7,9 @@ use std::fmt;
 use std::path::Path;
 use std::str::FromStr;
 
+pub mod fidelity;
+pub use fidelity::{Endianness, Fidelity, FidelityDimension, FidelityFacts, FidelityStatus};
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunMode {
