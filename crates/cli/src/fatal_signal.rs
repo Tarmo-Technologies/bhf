@@ -84,6 +84,23 @@ mod tests {
     }
 
     #[test]
+    fn host_signal_path_still_maps_sigsegv_and_sigabrt_to_bhf210() {
+        // Regression (HDF-2): generalizing the crash taxonomy for transport faults
+        // must not move the host `ExitStatus::signal()` path. A silent SIGSEGV and
+        // a silent SIGABRT stay classified crashes on rule BHF-210, exactly as
+        // before the transport-fault lane was added.
+        let segv = classify(&by_signal(11), "").expect("SIGSEGV is a crash");
+        assert_eq!(segv.name, "SIGSEGV");
+        assert_eq!(rule_id(&by_signal(11), ""), Some(RULE_ID));
+
+        let abrt = classify(&by_signal(6), "").expect("silent SIGABRT is a crash");
+        assert_eq!(abrt.name, "SIGABRT");
+        assert_eq!(rule_id(&by_signal(6), ""), Some(RULE_ID));
+
+        assert_eq!(RULE_ID, "BHF-210");
+    }
+
+    #[test]
     fn only_hardware_fault_signals_are_classified() {
         for signal in [4, 7, 8, 11] {
             assert!(classify(&by_signal(signal), "").is_some());

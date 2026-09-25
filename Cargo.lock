@@ -219,6 +219,7 @@ dependencies = [
  "static_analysis",
  "stub_gen",
  "target_rank",
+ "target_transport",
  "tempfile",
  "toml",
  "tree-sitter",
