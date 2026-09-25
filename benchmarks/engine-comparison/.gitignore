@@ -2,3 +2,8 @@
 # Per-trial binaries, generated corpora, and engine artifact trees are local
 # experiment output; keep small JSON summaries and hand-curated reports visible.
 /results/*-runs/
+# Transient artifacts written to the CWD by libFuzzer/honggfuzz during a run.
+/crash-*
+/HF.sanitizer.log.*
+/leak-*
+/timeout-*

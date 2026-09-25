@@ -133,3 +133,52 @@ but should not be added as a default CI job: full real-code campaigns are
 resource intensive. A small deterministic smoke can remain in CI for protocol
 and adapter regressions, while statistically powered runs are scheduled and
 publish their immutable evidence separately.
+
+## Multi-engine trade study (4 engines) — 2026-09-25
+
+`benchmarks/engine-comparison/trade_study.py` extends the smoke runner into a
+statistically powered head-to-head across **four** engines — BHF's builtin
+engine, AFL++ (pinned 5.03c), libFuzzer, and honggfuzz (source build) — over the
+controlled `engine_parity` fixtures (`magic_byte`, `const_gate`, `len_field`,
+`redqueen_int`), with 10 independent trials per (engine, target) at a fixed
+per-trial wall budget. It reuses the reviewed helpers in `run.py` and adds three
+things the smoke runner lacked:
+
+1. **honggfuzz and an explicit pinned-AFL++ toolchain.** honggfuzz builds the
+   same `LLVMFuzzerTestOneInput` harness via `hfuzz-cc`/`libhfuzz`; AFL++ uses the
+   pinned 5.03c `afl-cc` with a separate CMPLOG binary.
+2. **Engine-neutral coverage.** Every engine's FINAL corpus is merged through ONE
+   shared libFuzzer-sancov binary (`-merge=1`, crash-robust), so `edges`/
+   `features` use identical instrumentation and are directly comparable rather
+   than trusting each engine's own counter.
+3. **Engine-neutral crash oracle.** Each engine's native crash artifact AND its
+   final corpus are replayed through one independent ASan+UBSan binary; only
+   oracle-confirmed crashes count. This is required because honggfuzz's
+   persistent+ASan loop keeps a coverage-increasing crasher in its corpus without
+   flagging it as a crash — the corpus backstop still records bug reachability
+   (its precise time-to-first-crash is reported as null, since no native artifact
+   is written).
+
+Build/setup time is separated from campaign time; native exec/s is recorded but
+flagged not cross-engine comparable. Raw per-trial rows, the aggregated summary,
+tool versions, and source/oracle/coverage-binary hashes are written to
+`results/trade-study-4engine-<date>.json`; `analyze_trade_study.py` renders the
+Markdown report `results/trade-study-report-<date>.md`.
+
+```sh
+cargo build --release -p bhf
+python3 -B benchmarks/engine-comparison/trade_study.py \
+  --trials 10 --budget 30 \
+  --afl-path <pinned-aflpp-5.03c>/src --honggfuzz-dir <honggfuzz-build> \
+  --output benchmarks/engine-comparison/results/trade-study-4engine-<date>.json
+python3 -B benchmarks/engine-comparison/analyze_trade_study.py \
+  --input  benchmarks/engine-comparison/results/trade-study-4engine-<date>.json \
+  --output benchmarks/engine-comparison/results/trade-study-report-<date>.md
+```
+
+These fixtures are controlled coverage-gated micro-bugs: they isolate mutator
+reach and magic-value solving (the `redqueen_int` gate specifically probes
+cmplog/redqueen/value-profile), not whole-program throughput on production code.
+They complement — they do not replace — the real-code reach study in
+`benchmarks/harness-parity-20/` (bhf-generated vs expert harness). No Mayhem
+comparison is included (no licensed environment).
