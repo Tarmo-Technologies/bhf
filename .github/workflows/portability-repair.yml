@@ -42,7 +42,14 @@ jobs:
           git diff --binary > portability-evidence/source.patch
           cargo test --locked -p governance --lib 2>&1 | tee portability-evidence/governance.log
           cargo test --locked -p bhf-daemon --lib 2>&1 | tee portability-evidence/daemon.log
-          python -m unittest discover -s scripts/ci/tests -v 2>&1 | tee portability-evidence/policy.log
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            # The permanent CI policy/scope jobs run on Ubuntu. Linux shell
+            # fixtures assume POSIX paths and mock executables, not WSL/MSYS.
+            # Also exercise the platform-neutral acceptance policy on Windows.
+            python -m unittest discover -s scripts/ci/tests -p test_ci_acceptance.py -v 2>&1 | tee portability-evidence/policy.log
+          else
+            python -m unittest discover -s scripts/ci/tests -v 2>&1 | tee portability-evidence/policy.log
+          fi
       - name: Retain validation logs and tested patch
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
