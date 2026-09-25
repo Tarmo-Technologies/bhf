@@ -930,7 +930,18 @@ fn read_frame_with_limit<R: BufRead>(
 
         if let Some((name, value)) = header.split_once(':') {
             if name.eq_ignore_ascii_case("Content-Length") {
-                content_length = Some(value.trim().parse::<usize>().map_err(|error| {
+                if content_length.is_some() {
+                    return Err(JsonRpcServerError::InvalidFrame(
+                        "duplicate Content-Length header".to_owned(),
+                    ));
+                }
+                let digits = value.trim();
+                if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Err(JsonRpcServerError::InvalidFrame(
+                        "invalid Content-Length: expected unsigned decimal digits".to_owned(),
+                    ));
+                }
+                content_length = Some(digits.parse::<usize>().map_err(|error| {
                     JsonRpcServerError::InvalidFrame(format!("invalid Content-Length: {error}"))
                 })?);
             }
@@ -2864,18 +2875,24 @@ mod tests {
 
     #[test]
     fn oversized_request_id_uses_compact_error_without_losing_frame_alignment() {
-        let source = temp_dir("large-request-id").join("many.c");
-        let functions = (0..30)
-            .map(|index| format!("int f{index}(int x) {{ return x; }}\n"))
-            .collect::<String>();
-        fs::write(&source, functions).unwrap();
-        let id = "x".repeat(380);
+        // Keep this framing test independent of temporary-directory lengths,
+        // Windows path escaping, source discovery, and compiler availability.
+        // The request must fit; both the normal and ID-preserving error
+        // responses must exceed the same budget to exercise the compact path.
+        let limit = 512;
+        let id = "x".repeat(450);
+        let request = serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": "missingMethod"
+        });
+        assert!(serde_json::to_vec(&request).unwrap().len() <= limit);
+        let normal = super::error_response(
+            request["id"].clone(),
+            super::RpcFailure::method_not_found(),
+        );
+        assert!(serde_json::to_vec(&normal).unwrap().len() > limit);
         let input = format!(
             "{}{}",
-            frame(serde_json::json!({
-                "jsonrpc": "2.0", "id": id, "method": "listTargets",
-                "params": { "path": source }
-            })),
+            frame(request),
             frame(serde_json::json!({
                 "jsonrpc": "2.0", "id": 2, "method": "missingMethod"
             }))
@@ -2885,14 +2902,81 @@ mod tests {
             BufReader::new(input.as_bytes()),
             &mut output,
             super::DaemonSecurityConfig::local_single_user(),
-            512,
+            limit,
         )
         .unwrap();
         let responses = parse_frames(&output);
         assert_eq!(responses.len(), 2);
         assert!(responses[0]["id"].is_null());
         assert_eq!(responses[0]["error"]["code"], -32000);
+        assert_eq!(responses[0]["error"]["message"], "response exceeds byte limit");
         assert_eq!(responses[1]["id"], 2);
+        assert_eq!(responses[1]["error"]["code"], -32601);
+        let mut reader = BufReader::new(output.as_slice());
+        assert!(super::read_frame_with_limit(&mut reader, limit).unwrap().is_some());
+        assert!(super::read_frame_with_limit(&mut reader, limit).unwrap().is_some());
+        assert!(super::read_frame_with_limit(&mut reader, limit).unwrap().is_none());
+    }
+
+    #[test]
+    fn json_rpc_reader_accepts_exact_body_limit_and_preserves_next_frame() {
+        let limit = 512;
+        let mut request = serde_json::json!({
+            "jsonrpc": "2.0", "id": "", "method": "missingMethod"
+        });
+        let overhead = serde_json::to_vec(&request).unwrap().len();
+        request["id"] = serde_json::json!("x".repeat(limit - overhead));
+        let body = serde_json::to_vec(&request).unwrap();
+        assert_eq!(body.len(), limit);
+        let next = serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "missingMethod"});
+        let stream = format!("{}{}", frame(request), frame(next.clone()));
+        let mut reader = BufReader::new(stream.as_bytes());
+        assert_eq!(super::read_frame_with_limit(&mut reader, limit).unwrap(), Some(body));
+        assert_eq!(super::read_frame_with_limit(&mut reader, limit).unwrap(),
+            Some(serde_json::to_vec(&next).unwrap()));
+        assert!(super::read_frame_with_limit(&mut reader, limit).unwrap().is_none());
+    }
+
+    #[test]
+    fn json_rpc_reader_rejects_body_one_byte_above_limit() {
+        let limit = 512;
+        let mut request = serde_json::json!({
+            "jsonrpc": "2.0", "id": "", "method": "missingMethod"
+        });
+        let overhead = serde_json::to_vec(&request).unwrap().len();
+        request["id"] = serde_json::json!("x".repeat(limit + 1 - overhead));
+        assert_eq!(serde_json::to_vec(&request).unwrap().len(), limit + 1);
+        let stream = frame(request);
+        let error = super::read_frame_with_limit(
+            &mut BufReader::new(stream.as_bytes()), limit,
+        ).unwrap_err();
+        assert!(error.to_string().contains("frame exceeds"), "{error}");
+    }
+
+    #[test]
+    fn json_rpc_reader_rejects_duplicate_content_lengths() {
+        for (second_name, second_length) in [
+            ("Content-Length", "2"),
+            ("content-length", "2"),
+            ("CONTENT-LENGTH", "3"),
+        ] {
+            let input = format!("Content-Length: 2\r\n{second_name}: {second_length}\r\n\r\n{{}}");
+            let error = super::read_frame_with_limit(
+                &mut BufReader::new(input.as_bytes()), 512,
+            ).unwrap_err();
+            assert!(error.to_string().contains("duplicate Content-Length"), "{error}");
+        }
+    }
+
+    #[test]
+    fn json_rpc_reader_requires_unsigned_decimal_content_length() {
+        for length in ["", "+2", "-2", "2.0", "0x2", "\u{0662}"] {
+            let input = format!("Content-Length: {length}\r\n\r\n{{}}");
+            let error = super::read_frame_with_limit(
+                &mut BufReader::new(input.as_bytes()), 512,
+            ).unwrap_err();
+            assert!(error.to_string().contains("invalid Content-Length"), "{error}");
+        }
     }
 
     #[test]
