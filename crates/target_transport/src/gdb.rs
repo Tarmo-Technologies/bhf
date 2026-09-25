@@ -10,14 +10,19 @@
 //! with [`crate::coverage::MemoryBufferReader`] to read the on-target coverage
 //! ring back out of memory.
 //!
-//! The live-hardware / live-`qemu-system` path is gated (HDF-1 acceptance) and
-//! not run in unit tests; the client logic here is exercised against the
-//! in-crate mock gdbstub ([`crate::testsupport::MockGdbStub`]).
+//! The client logic here is exercised against the in-crate mock gdbstub
+//! ([`crate::testsupport::MockGdbStub`]) in unit tests, and against a REAL
+//! `qemu-<arch>` / `qemu-system-arm` gdbstub in the gated live integration
+//! tests (`crates/target_transport/tests/live_gdb.rs`,
+//! `crates/target_transport/tests/live_fullsystem.rs`) that only run when the
+//! emulator + cross toolchains are present.
 //!
-//! Run-length-encoded responses (which real qemu/gdbserver emit for large
-//! register/memory dumps) are detected and rejected with a descriptive error
-//! rather than silently mis-decoded; expanding them is the HDF-4 live-path
-//! follow-up.
+//! Run-length-encoded responses (which real gdbserver / OpenOCD — and QEMU for
+//! some dumps — emit to compress repeated bytes) are **expanded** per the RSP
+//! rule (`<byte>*<count>` repeats the preceding byte `count - 29` more times;
+//! this was the HDF-4 live-path follow-up and is now implemented). The expansion
+//! is bounded by [`MAX_PACKET_BYTES`] so a hostile run-length header cannot drive
+//! an unbounded allocation.
 
 use crate::coverage::MemoryBufferReader;
 use crate::error::{Result, TransportError};
@@ -77,8 +82,18 @@ pub fn decode_packet(frame: &[u8]) -> Result<Vec<u8>> {
     unescape(data)
 }
 
-/// Un-escape RSP `}`-escaped data; reject run-length encoding.
+/// Un-escape RSP `}`-escaped data and expand run-length-encoded runs.
+///
+/// RSP compresses a run of identical bytes as `<byte>*<count>`, where the byte to
+/// repeat has already been emitted and `count` is the character *following* the
+/// `*`; the preceding byte is repeated `count - 29` **additional** times (gdb's
+/// `repeat = c - ' ' + 3`). Real gdbserver / OpenOCD (and QEMU, for some dumps)
+/// emit this for large register/memory reads, so the live path must expand it.
+/// The expansion is bounded by [`MAX_PACKET_BYTES`] so a malicious run-length
+/// header cannot drive an unbounded allocation.
 fn unescape(data: &[u8]) -> Result<Vec<u8>> {
+    /// RSP run-length count offset: a count character `c` encodes `c - 29`.
+    const RLE_OFFSET: i32 = 29;
     let mut out = Vec::with_capacity(data.len());
     let mut iter = data.iter().copied();
     while let Some(byte) = iter.next() {
@@ -90,9 +105,25 @@ fn unescape(data: &[u8]) -> Result<Vec<u8>> {
                 out.push(escaped ^ 0x20);
             }
             RUN_LENGTH => {
-                return Err(TransportError::gdb(
-                    "run-length-encoded response not supported yet (HDF-4 live path)",
-                ));
+                let count_char = iter.next().ok_or_else(|| {
+                    TransportError::gdb("dangling '*' run-length marker at end of packet")
+                })?;
+                let &last = out.last().ok_or_else(|| {
+                    TransportError::gdb("run-length '*' with no preceding byte to repeat")
+                })?;
+                let repeat = count_char as i32 - RLE_OFFSET;
+                if repeat < 0 {
+                    return Err(TransportError::gdb(format!(
+                        "invalid run-length count byte {count_char:#04x} (decodes to {repeat})"
+                    )));
+                }
+                let repeat = repeat as usize;
+                if out.len() + repeat > MAX_PACKET_BYTES {
+                    return Err(TransportError::gdb(format!(
+                        "run-length expansion would exceed the {MAX_PACKET_BYTES} byte cap"
+                    )));
+                }
+                out.extend(std::iter::repeat_n(last, repeat));
             }
             other => out.push(other),
         }
@@ -397,6 +428,28 @@ impl<C: Read + Write> GdbClient<C> {
         // response packet, only the framing ack that send_packet consumes.
         self.connection.send_packet(b"R00")
     }
+
+    /// Insert a software breakpoint at `address` via `Z0,addr,kind`.
+    ///
+    /// `kind` is the RSP breakpoint "kind" — for ARM Thumb it is the instruction
+    /// size in bytes (`2`), for ARM (A32) `4`. On a full-system Cortex-M target a
+    /// harness cannot self-halt back to the debugger with a `bkpt` instruction:
+    /// with halting-debug disabled (the default under a QEMU gdbstub), `bkpt`
+    /// escalates to a HardFault instead of stopping to the debugger. The host
+    /// therefore plants a breakpoint at the harness "done" symbol so that
+    /// [`GdbClient::cont`] returns a real stop reply when the run completes. QEMU
+    /// implements `Z0`/`z0` as gdbstub-side breakpoints that survive a snapshot
+    /// restore (`loadvm`), so a single insert covers every iteration.
+    pub fn insert_sw_breakpoint(&mut self, address: u64, kind: u32) -> Result<()> {
+        let response = self.command(format!("Z0,{address:x},{kind:x}").as_bytes())?;
+        self.expect_ok(&response, "insert software breakpoint")
+    }
+
+    /// Remove a software breakpoint at `address` via `z0,addr,kind`.
+    pub fn remove_sw_breakpoint(&mut self, address: u64, kind: u32) -> Result<()> {
+        let response = self.command(format!("z0,{address:x},{kind:x}").as_bytes())?;
+        self.expect_ok(&response, "remove software breakpoint")
+    }
 }
 
 /// Target memory layout the [`GdbRemoteTransport`] uses to inject input and
@@ -547,11 +600,29 @@ mod tests {
     }
 
     #[test]
-    fn decode_rejects_run_length_encoding() {
+    fn decode_expands_run_length_encoding() {
+        // RSP: `<byte>*<count>` repeats the preceding byte `count - 29` more
+        // times. Space (0x20) => 0x20 - 29 = 3, so `0* ` is `0` + 3 more = four
+        // `0` bytes — the canonical example from the gdb RSP documentation.
         let frame = encode_packet(&[b'0', RUN_LENGTH, b' ']);
+        assert_eq!(decode_packet(&frame).unwrap(), vec![b'0', b'0', b'0', b'0']);
+
+        // A memory-style hex payload with a longer zero run: `00` then `*` then
+        // '2' (0x32 => 21 more) reconstructs 22 `0` chars = 11 zero bytes.
+        let mut data = vec![b'0', b'0', RUN_LENGTH, b'2'];
+        data.extend_from_slice(b"ff");
+        let expanded = decode_packet(&encode_packet(&data)).unwrap();
+        assert_eq!(expanded.len(), 2 + 21 + 2);
+        assert!(expanded[..23].iter().all(|&b| b == b'0'));
+        assert_eq!(&expanded[23..], b"ff");
+    }
+
+    #[test]
+    fn decode_rejects_run_length_marker_with_no_preceding_byte() {
+        let frame = encode_packet(&[RUN_LENGTH, b' ']);
         let error = decode_packet(&frame).unwrap_err();
         assert!(
-            error.to_string().contains("run-length"),
+            error.to_string().contains("no preceding byte"),
             "unexpected error: {error}"
         );
     }
@@ -596,6 +667,32 @@ mod tests {
         assert!(log.iter().any(|p| p == "R00"), "log missing 'R00': {log:?}");
         // '?' from attach precedes the reset packets.
         assert!(log.iter().any(|p| p == "?"), "log missing '?': {log:?}");
+    }
+
+    #[test]
+    fn client_inserts_and_removes_software_breakpoint() {
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (client_end, stub_end) = duplex();
+        let stub = MockGdbStub::new(stub_end, Arc::clone(&log));
+        let handle = thread::spawn(move || stub.serve());
+
+        let mut client = GdbClient::new(client_end);
+        client.attach().unwrap();
+        // Thumb breakpoint (kind 2) at the harness "done" symbol.
+        client.insert_sw_breakpoint(0x0000_00a8, 2).unwrap();
+        client.remove_sw_breakpoint(0x0000_00a8, 2).unwrap();
+        drop(client);
+        handle.join().unwrap().unwrap();
+
+        let log = log.lock().unwrap();
+        assert!(
+            log.iter().any(|p| p == "Z0,a8,2"),
+            "log missing Z0 insert: {log:?}"
+        );
+        assert!(
+            log.iter().any(|p| p == "z0,a8,2"),
+            "log missing z0 remove: {log:?}"
+        );
     }
 
     #[test]

@@ -1,0 +1,69 @@
+# SPDX-License-Identifier: Apache-2.0
+
+# Emulator-in-the-loop (HIL-emu) validation lane.
+#
+# Runs the REAL (live-QEMU) transport validations — RV-1 (cross-endian fidelity),
+# RV-2 (live gdb-remote), RV-3 (live full-system snapshot on emulated Cortex-M) —
+# via scripts/hil-emu.sh. The script hard-fails if the qemu / cross toolchains are
+# missing and runs the gated tests with BHF_HIL_REQUIRE=1, so the emulator
+# validations CANNOT silently skip in CI. The physical-board lane
+# (crates/target_transport/tests/hil_board.rs) is not run here (no hardware); see
+# docs/hil-bringup.md.
+
+name: HIL-emu
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "crates/target_transport/**"
+      - "crates/event_log/**"
+      - "crates/cli/src/auto/cross_target.rs"
+      - "scripts/hil-emu.sh"
+      - ".github/workflows/hil-emu.yml"
+  schedule:
+    # Nightly, so a toolchain/qemu regression surfaces even without a code change.
+    - cron: "37 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hil-emu-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hil-emu:
+    name: Live-QEMU transport validation (RV-1/RV-2/RV-3)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install QEMU + cross toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-user \
+            qemu-system-arm \
+            qemu-utils \
+            gcc-arm-none-eabi \
+            gcc-arm-linux-gnueabihf \
+            gcc-powerpc64-linux-gnu \
+            binutils \
+            build-essential
+          # Sanity: the exact binaries scripts/hil-emu.sh requires.
+          for tool in qemu-arm qemu-ppc64 qemu-system-arm qemu-img \
+                      arm-none-eabi-gcc arm-linux-gnueabihf-gcc powerpc64-linux-gnu-gcc nm cc; do
+            command -v "$tool" >/dev/null || { echo "missing $tool after install" >&2; exit 1; }
+          done
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+
+      - name: Run the emulator-in-the-loop validations
+        run: scripts/hil-emu.sh
