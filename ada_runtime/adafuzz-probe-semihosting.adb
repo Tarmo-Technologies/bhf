@@ -1,4 +1,20 @@
 --  SPDX-License-Identifier: Apache-2.0
+--
+--  Embedded coverage emitter: SEMIHOSTING backend.
+--
+--  Writes the BHF_EVENTS tag-length edge/event stream to the ARM/RISC-V
+--  semihosting host channel (fd 2). This is a coverage *emitter* only; it does
+--  not itself decode or transport coverage.
+--
+--  Consumer (roadmap CC-2 / HDF-1, HDF-1b): the host-side reader that consumes
+--  this channel is target_transport::coverage::SemihostingReader
+--  (crates/target_transport/src/coverage.rs), and HDF-1b's transport fuzz loop
+--  (crates/cli/src/transport_fuzz.rs, `bhf fuzz --target-transport`) drives it
+--  through the TargetTransport seam. This emitter is therefore no longer a
+--  dead-end: it is the target half of a wired reader path. The *live* channel is
+--  DEPENDENCY-gated on a backend that surfaces the semihosting sink (a debug
+--  probe / emulator); in-tree the reader is proven against captured / scripted
+--  event streams.
 pragma Ada_95;
 with Ada.Streams;
 with Interfaces; use Interfaces;
