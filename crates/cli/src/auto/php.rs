@@ -87,6 +87,49 @@ fn supported_input_type(ty: &str) -> bool {
     })
 }
 
+/// Ranking bonus for a first parameter that IS the byte input channel
+/// (`string`/`mixed`/untyped): fuzz bytes map straight to it and the target
+/// reliably enters.
+pub const DIRECT_INPUT_AFFINITY: i32 = 20;
+/// Ranking penalty for a first parameter that is a class/object: it must be
+/// synthesized from bytes, which usually fails to construct a valid instance and
+/// leaves the target `built_not_entered`.
+pub const OBJECT_INPUT_DEMOTION: i32 = -20;
+
+/// How directly fuzz bytes reach a first-parameter type, as a ranking delta.
+/// `string`/`mixed`/untyped is the input channel itself (+); a class/object type
+/// needs construction from bytes and often never enters (−); other scalars
+/// (`int`/`bool`/`float`/`array`) are a neutral coercion (0). This is why
+/// nikic/php-parser's `Lexer#tokenize(string $code)` must outrank
+/// `ConstExprEvaluator#evaluate(Expr $expr)`, whose `Expr` cannot be built from
+/// raw bytes so the harness bails before the endpoint. A union that includes a
+/// string (`string|Expr`) is still driven as a string, so it counts as direct.
+pub fn first_param_fuzz_affinity(ty: &str) -> i32 {
+    let norm = ty.trim().trim_start_matches('?');
+    if norm.is_empty() {
+        return DIRECT_INPUT_AFFINITY;
+    }
+    let parts = || norm.split('|').map(str::trim);
+    let is_scalar = |p: &str| {
+        matches!(
+            p.to_ascii_lowercase().as_str(),
+            "int" | "integer" | "bool" | "boolean" | "float" | "double" | "array"
+        )
+    };
+    if parts().any(|p| p.eq_ignore_ascii_case("string") || p.eq_ignore_ascii_case("mixed")) {
+        DIRECT_INPUT_AFFINITY
+    } else if parts().all(is_scalar) {
+        // `array` and friends satisfy `php_class_type`, so short-circuit the known
+        // scalar keywords here: they coerce cleanly from bytes (neutral), never
+        // needing object construction.
+        0
+    } else if parts().any(php_class_type) {
+        OBJECT_INPUT_DEMOTION
+    } else {
+        0
+    }
+}
+
 fn php_class_type(ty: &str) -> bool {
     let bare = ty.trim_start_matches('\\');
     !bare.is_empty()
@@ -497,6 +540,33 @@ pub fn extract_php_dictionary_tokens(source: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_param_affinity_prefers_byte_channels_over_object_synthesis() {
+        // Direct byte channels: string / mixed / untyped.
+        assert_eq!(first_param_fuzz_affinity("string"), DIRECT_INPUT_AFFINITY);
+        assert_eq!(first_param_fuzz_affinity("?string"), DIRECT_INPUT_AFFINITY);
+        assert_eq!(first_param_fuzz_affinity("mixed"), DIRECT_INPUT_AFFINITY);
+        assert_eq!(first_param_fuzz_affinity(""), DIRECT_INPUT_AFFINITY);
+        // A union that includes a string is still driven as a string.
+        assert_eq!(
+            first_param_fuzz_affinity("string|PhpParser\\Node\\Expr"),
+            DIRECT_INPUT_AFFINITY
+        );
+        // Class/object types must be synthesized and usually never enter.
+        assert_eq!(
+            first_param_fuzz_affinity("PhpParser\\Node\\Expr"),
+            OBJECT_INPUT_DEMOTION
+        );
+        assert_eq!(first_param_fuzz_affinity("\\Closure"), OBJECT_INPUT_DEMOTION);
+        // Other scalars coerce cleanly: neutral.
+        assert_eq!(first_param_fuzz_affinity("int"), 0);
+        assert_eq!(first_param_fuzz_affinity("array"), 0);
+        // The concrete php-parser regression: a string tokenizer must outrank the
+        // Expr evaluator once the name score (equal at the `parse`/`evaluate` stem
+        // bonus) is combined with the affinity.
+        assert!(DIRECT_INPUT_AFFINITY > OBJECT_INPUT_DEMOTION);
+    }
 
     #[test]
     fn free_function() {

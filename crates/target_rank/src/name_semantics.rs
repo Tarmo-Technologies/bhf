@@ -71,6 +71,21 @@ pub fn has_token_sequence(name: &str, sequence: &[&str]) -> bool {
         })
 }
 
+/// Whether the identifier's LEADING token is a field accessor, mutator, or
+/// predicate verb (`set`/`get`/`is`/`has`/`with`). A method's semantic action is
+/// its first token, so `setParsedFile`, `getSnippet`, `isHash` and `withFlags`
+/// expose or mutate state — they are never parser entry points, even when the
+/// object noun that follows incidentally carries an action stem (`set` + `Parsed`
+/// would otherwise score as a `parse` target). Token-based, so a method actually
+/// named `isolate` or `settle` (a single token that merely starts with `is`/`set`)
+/// is NOT treated as an accessor.
+pub fn is_accessor_or_mutator(name: &str) -> bool {
+    matches!(
+        identifier_tokens(name).first().map(String::as_str),
+        Some("set" | "get" | "is" | "has" | "with")
+    )
+}
+
 /// Clear infrastructure/output helpers that should not outrank a parser solely
 /// because they accept a string or byte slice.
 pub fn is_low_value_helper(name: &str) -> bool {
@@ -118,5 +133,31 @@ mod tests {
         assert!(!has_action_stem("isReady", &parser_stems));
         assert!(has_token_sequence("readObject", &["read", "object"]));
         assert!(!has_token_sequence("downloadObject", &["load", "object"]));
+    }
+
+    #[test]
+    fn accessors_and_mutators_detected_by_leading_token_only() {
+        // Setters/getters/predicates/fluent-builders — the leading token is the
+        // accessor verb, even when the object noun carries an action stem.
+        assert!(is_accessor_or_mutator("setParsedFile"));
+        assert!(is_accessor_or_mutator("setParsedLine"));
+        assert!(is_accessor_or_mutator("getSnippet"));
+        assert!(is_accessor_or_mutator("isHash"));
+        assert!(is_accessor_or_mutator("hasParent"));
+        assert!(is_accessor_or_mutator("withFlags"));
+        // Leaf-scoped, like `has_action_stem`: callers pass the method leaf, not
+        // the fully-qualified name (whose leading token is the namespace).
+        assert!(!is_accessor_or_mutator(
+            "Symfony\\Component\\Yaml\\Exception\\ParseException#setParsedFile"
+        ));
+        // A real parse/decode entry is not an accessor.
+        assert!(!is_accessor_or_mutator("parse"));
+        assert!(!is_accessor_or_mutator("Yaml::parse"));
+        assert!(!is_accessor_or_mutator("decodeMessage"));
+        // Single tokens that merely start with the accessor spelling are safe:
+        // `isolate`/`settle`/`history` tokenize as ONE token, not `is`/`set`/`has`.
+        assert!(!is_accessor_or_mutator("isolate"));
+        assert!(!is_accessor_or_mutator("settle"));
+        assert!(!is_accessor_or_mutator("history"));
     }
 }

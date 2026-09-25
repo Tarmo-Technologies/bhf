@@ -154,6 +154,109 @@ pub fn parse_lua(source: &str) -> Vec<LuaFunction> {
             }
         }
     }
+    // Public fields of a module-level `return { ... }` table. A library may expose
+    // its real entry as a runtime value rather than a named function — lunajson's
+    // `decode = newdecoder()` is the closure a factory produced, invisible to the
+    // `function`-header scan above — and the harness already calls
+    // `dofile(module)['field'](data)`, so such a field is directly fuzzable.
+    for f in parse_module_table_fields(&lines) {
+        if f.is_fuzzable() && seen.insert(f.name.clone()) {
+            out.push(f);
+        }
+    }
+    out
+}
+
+/// Whether `key = value` inside a module `return { ... }` names a directly
+/// fuzzable entry, returning the synthetic first-parameter (input channel) name.
+/// A factory call (`newdecoder()`) yields a configured closure whose first
+/// argument is the input; an inline `function(s)` literal exposes its own first
+/// parameter. A bare reference (`sax.newparser`) is skipped — a reference is
+/// usually itself a factory needing construction arguments, not a one-input entry.
+fn factory_or_inline_input(value: &str) -> Option<String> {
+    let v = value.trim();
+    if let Some(rest) = v.strip_prefix("function") {
+        // Inline closure: `function(s) ...`. Its own first parameter is the input.
+        let after = rest.trim_start();
+        if after.starts_with('(') {
+            return parse_params(after).into_iter().next();
+        }
+        return None;
+    }
+    // Factory call: an identifier chain (`newdecoder`, `sax.newparser`) immediately
+    // applied — `<ident[.ident]*>(...)`. The `(` must follow the callee directly so a
+    // bare reference (no call) is rejected.
+    let paren = v.find('(')?;
+    let callee = v[..paren].trim();
+    if callee.is_empty() {
+        return None;
+    }
+    let is_ident_chain = callee
+        .split('.')
+        .all(|seg| !seg.is_empty() && seg.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') && seg.chars().all(is_ident_char));
+    if !is_ident_chain || !v.trim_end().ends_with(')') {
+        return None;
+    }
+    // The factory's returned closure takes the fuzz input as its first argument.
+    Some("data".to_owned())
+}
+
+/// Extract the public fields of a module-level `return { ... }` table literal
+/// (see [`factory_or_inline_input`]). Only a `return {` at column 0 is treated as
+/// the module surface; a `return {` nested inside a function is indented and
+/// ignored. Entries are read at the table's top level (depth 1), so a nested
+/// table value contributes no spurious candidates.
+fn parse_module_table_fields(lines: &[String]) -> Vec<LuaFunction> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    for (idx, line) in lines.iter().enumerate() {
+        if depth == 0 {
+            // Module-level `return {` — no leading indentation.
+            let opener = line.trim_end();
+            if line.starts_with("return") && (opener == "return {" || opener == "return{") {
+                depth = 1;
+            }
+            continue;
+        }
+        // At the table's top level: read a `key = value` entry before this line's
+        // own braces change the depth.
+        if depth == 1 {
+            let entry = line.trim().trim_end_matches(',').trim();
+            if let Some(eq) = entry.find('=') {
+                let is_comparison = entry.as_bytes().get(eq + 1) == Some(&b'=')
+                    || entry[..eq].trim_end().ends_with(['<', '>', '~', '=']);
+                if !is_comparison {
+                    let key = entry[..eq].trim();
+                    let value = entry[eq + 1..].trim();
+                    let valid_key = !key.is_empty()
+                        && key.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                        && key.chars().all(is_ident_char);
+                    if valid_key {
+                        if let Some(first_param) = factory_or_inline_input(value) {
+                            out.push(LuaFunction {
+                                name: key.to_owned(),
+                                field: key.to_owned(),
+                                is_method: false,
+                                is_global: false,
+                                line: (idx + 1) as u32,
+                                first_param,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        for &b in line.as_bytes() {
+            match b {
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                _ => {}
+            }
+        }
+        if depth <= 0 {
+            break;
+        }
+    }
     out
 }
 
@@ -364,5 +467,46 @@ end
     fn dictionary_tokens_mined() {
         let toks = extract_lua_dictionary_tokens("if s == 'MAGIC' then end\n");
         assert!(toks.contains(&"MAGIC".to_owned()));
+    }
+
+    #[test]
+    fn module_return_table_factory_fields_are_discovered() {
+        // The lunajson pattern: the module's real entry `decode` is a closure a
+        // factory produced, exposed only as a `return { ... }` field — invisible
+        // to a `function`-header scan. Factory-call and inline-function fields are
+        // discovered; a bare reference (itself a multi-arg factory) is not.
+        let src = "local newdecoder = require 'lunajson.decoder'\n\
+                   local sax = require 'lunajson.sax'\n\
+                   return {\n\
+                   \tdecode = newdecoder(),\n\
+                   \tencode = newencoder(),\n\
+                   \tinline = function(s) return s end,\n\
+                   \tnewparser = sax.newparser,\n\
+                   \tconst = 42,\n\
+                   }\n";
+        let discovered = parse_lua(src);
+        let names: Vec<&str> = discovered.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"decode"), "decode (factory call): {names:?}");
+        assert!(names.contains(&"encode"), "encode (factory call): {names:?}");
+        assert!(names.contains(&"inline"), "inline function: {names:?}");
+        assert!(
+            !names.contains(&"newparser"),
+            "bare reference must be skipped: {names:?}"
+        );
+        assert!(!names.contains(&"const"), "non-callable literal: {names:?}");
+        // The harness resolves a discovered field as `mod['decode'](data)`, so it
+        // must be a plain (non-global, non-method) field with an input channel.
+        let decode = parse_lua(src).into_iter().find(|f| f.name == "decode").unwrap();
+        assert!(!decode.is_global && !decode.is_method && decode.is_fuzzable());
+    }
+
+    #[test]
+    fn nested_return_table_inside_function_is_not_a_module_surface() {
+        // A `return {` indented inside a function is not the module's public table.
+        let src = "local function make()\n  return {\n    decode = newx(),\n  }\nend\n";
+        assert!(
+            parse_lua(src).iter().all(|f| f.name != "decode"),
+            "indented nested return table must be ignored"
+        );
     }
 }

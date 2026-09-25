@@ -232,6 +232,10 @@ fn subprogram_is_instantiation(source: &str, subprogram: &ada_parser::ast::Subpr
 const GENERIC_DEMOTION: i32 = 1_000_000;
 const CONCURRENCY_DEMOTION: i32 = 1_000_000;
 const KNOWN_UNBUILDABLE_SIGNATURE_DEMOTION: i32 = 1_000_000;
+/// Rank a field accessor/mutator/predicate below every normally-ranked dynamic
+/// target (base 50) without removing it from backfill. Applied in
+/// [`dynamic_target_score`].
+const ACCESSOR_DEMOTION: i32 = 30;
 
 fn ada_unit_has_concurrency(path: &Path, source: &str) -> bool {
     if crate::generate_harness::ada_concurrency_block_summary(source).is_some() {
@@ -2505,7 +2509,13 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
             // input-channel argument is a candidate, driven via the PHP framed driver
             // (see `crate::auto::php` / `php_build`).
             for f in crate::auto::php::parse_php(&source) {
-                let score = dynamic_target_score(&f.name);
+                // Prefer a first parameter that IS the byte channel (string/mixed)
+                // over one needing object synthesis (an AST `Expr`), which usually
+                // never enters. Without this, php-parser picked
+                // `ConstExprEvaluator#evaluate(Expr)` (built_not_entered, 0 edges)
+                // over `Lexer#tokenize(string)`.
+                let score = dynamic_target_score(&f.name)
+                    + crate::auto::php::first_param_fuzz_affinity(&f.first_param_type);
                 out.push(Candidate {
                     harness_id: stable_harness_id("H-W", path, f.line, &f.name),
                     lang: Lang::Php,
@@ -2538,7 +2548,22 @@ fn dynamic_target_score(name: &str) -> i32 {
         .find(|part| !part.is_empty())
         .unwrap_or(name);
     let leaf = leaf_name.to_ascii_lowercase();
-    let mut score = 50;
+    let mut score: i32 = 50;
+    // A magic/meta method (`__index`/`__newindex`/`__call` in Lua, `__construct`/
+    // `__toString`/`__invoke` in PHP, `__init__`/`__repr__` in Python) is dispatched
+    // by the runtime, never a parse entry — fuzzing it wastes the campaign
+    // (lunajson's single-target sweep landed on `encoder.lua#__index`). A field
+    // accessor/mutator/predicate (`setParsedFile`, `getSnippet`, `isHash`) is not a
+    // parser either, and its object noun can spuriously carry an action stem ("set"
+    // + "Parsed" scored as a `parse` target, tying an exception-class setter with
+    // `Yaml::parse` so the sweep picked the setter and reported `unsupported_params`
+    // with zero edges). Sink both below every normally-ranked target. Ordering only:
+    // backfill still reaches them uncapped.
+    if leaf_name.starts_with("__")
+        || target_rank::name_semantics::is_accessor_or_mutator(leaf_name)
+    {
+        return score.saturating_sub(ACCESSOR_DEMOTION);
+    }
     if target_rank::name_semantics::has_action_stem(
         leaf_name,
         &[
@@ -3693,6 +3718,51 @@ mod tests {
         );
         assert!(dynamic_target_score("parse_audio") > dynamic_target_score("debug"));
     }
+
+    #[test]
+    fn exception_class_setter_ranks_below_real_parse_entries() {
+        // symfony-yaml regression: `ParseException#setParsedFile` matched the
+        // `parse` action stem via its "Parsed" object noun and tied at the top
+        // with `Yaml::parse`, so a single-target sweep picked the exception
+        // setter, hit `unsupported_params`, and reported zero edges. The setter
+        // (and its sibling accessors) must now rank strictly below every real
+        // parse/decode entry in the tree.
+        let setter = dynamic_target_score(
+            "Symfony\\Component\\Yaml\\Exception\\ParseException#setParsedFile",
+        );
+        for entry in [
+            "Symfony\\Component\\Yaml\\Yaml::parse",
+            "Symfony\\Component\\Yaml\\Parser#parse",
+            "Symfony\\Component\\Yaml\\Inline::parse",
+        ] {
+            assert!(
+                dynamic_target_score(entry) > setter,
+                "{entry} ({}) must outrank the exception setter ({setter})",
+                dynamic_target_score(entry)
+            );
+        }
+        // Sibling accessors on the exception class collapse to the same demoted
+        // score, below the base-50 plain method.
+        assert_eq!(
+            dynamic_target_score("ParseException#setParsedLine"),
+            dynamic_target_score("ParseException#setParsedFile"),
+        );
+        assert!(setter < dynamic_target_score("Dumper#plainMethod"));
+
+        // Magic/meta methods are runtime-dispatched, never parse entries, and are
+        // demoted the same way (lunajson's `encoder.lua#__index`, PHP `__construct`,
+        // Python `__init__`). A real method that merely contains a double underscore
+        // mid-name is unaffected.
+        let plain = dynamic_target_score("Dumper#plainMethod");
+        for magic in ["encoder#__index", "Foo#__construct", "mod.__call", "Obj#__init__"] {
+            assert!(
+                dynamic_target_score(magic) < plain,
+                "{magic} ({}) must rank below a plain method ({plain})",
+                dynamic_target_score(magic)
+            );
+        }
+    }
+
     use std::fs;
     use std::path::PathBuf;
 
