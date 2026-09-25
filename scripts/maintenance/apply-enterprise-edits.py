@@ -16,9 +16,11 @@ if hashlib.sha256(blob).hexdigest() != '43503be4fcc41e3eabc0d7d6ddd6f37a425c0726
     raise SystemExit('maintenance payload digest mismatch')
 payload = json.loads(gzip.decompress(blob))
 for path, expected_blob in payload['original_blobs'].items():
-    actual = subprocess.check_output(['git', 'hash-object', '--no-filters', path], text=True).strip()
-    if actual != expected_blob:
+    original = subprocess.check_output(['git', 'cat-file', 'blob', expected_blob])
+    actual = Path(path).read_bytes()
+    if actual != original and actual.replace(b'\r\n', b'\n') != original:
         raise SystemExit('source blob mismatch: ' + path)
+    Path(path).write_bytes(original)
 allowed = {'crates/governance/src/vex.rs', 'crates/cli/tests/sbom_assurance_cli.rs', 'scripts/tests/test_offline_verifier.py'}
 if set(payload['files']) != allowed:
     raise SystemExit('unexpected replacement file')
