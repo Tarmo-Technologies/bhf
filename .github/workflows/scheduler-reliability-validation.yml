@@ -64,14 +64,18 @@ jobs:
             quay.io/pypa/manylinux2014_x86_64@sha256:0d25b049964b2549b83384036abdff06789a8c0b1e9ff003ec80f0d531f79e50 \
             bash -lc '
               set -euo pipefail
-              # The pinned manylinux image installs CPython outside default PATH.
+              # Use dependencies already supplied by the pinned image, not a
+              # system OpenSSL too old for Ed25519 raw-message verification.
               test -x /opt/python/cp311-cp311/bin/python3
-              export PATH="/opt/python/cp311-cp311/bin:$PATH"
-              # xxd is required by the independent archive-signature verifier.
+              openssl_bins=(/opt/_internal/openssl-3*/bin)
+              test "${#openssl_bins[@]}" -eq 1
+              test -x "${openssl_bins[0]}/openssl"
+              export PATH="${openssl_bins[0]}:/opt/python/cp311-cp311/bin:$PATH"
               yum -y install vim-common
               command -v python3
               python3 --version
               command -v xxd
+              openssl version
               ldd --version
               curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
               export PATH="$CARGO_HOME/bin:$PATH"
