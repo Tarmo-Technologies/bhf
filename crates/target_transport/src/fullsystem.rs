@@ -336,6 +336,7 @@ pub struct FullSystemTransport<FQ, FG> {
     connect_gdb: FG,
     map: GdbMemoryMap,
     snapshot_tag: String,
+    harness_breakpoint: Option<(u64, u32)>,
 }
 
 impl<FQ, FG> FullSystemTransport<FQ, FG> {
@@ -354,7 +355,25 @@ impl<FQ, FG> FullSystemTransport<FQ, FG> {
             connect_gdb,
             map,
             snapshot_tag,
+            harness_breakpoint: None,
         })
+    }
+
+    /// Plant a gdbstub software breakpoint at `address` (RSP `kind`, e.g. `2` for
+    /// ARM Thumb) at [`TargetTransport::arm`] time, right after the GDB attach.
+    ///
+    /// This is required for full-system Cortex-M targets: the harness cannot
+    /// self-halt to the debugger with a `bkpt` instruction (with halting-debug
+    /// disabled under the QEMU gdbstub, `bkpt` escalates to a HardFault rather
+    /// than stopping), so the run-control loop's `c` would never return. Planting
+    /// a breakpoint at the harness "done" symbol makes each
+    /// [`TargetSession::run_input`] `c` stop with a real stop reply. QEMU keeps
+    /// gdbstub breakpoints across a snapshot restore, so one insert on `arm`
+    /// covers every iteration. Leave it unset (the default) for targets whose
+    /// harness already traps back to the debugger.
+    pub fn with_harness_breakpoint(mut self, address: u64, kind: u32) -> Self {
+        self.harness_breakpoint = Some((address, kind));
+        self
     }
 }
 
@@ -371,6 +390,13 @@ where
 
         let mut gdb = GdbClient::new((self.connect_gdb)()?);
         gdb.attach()?;
+
+        // Plant the harness "done" breakpoint before the baseline snapshot so it
+        // is in place for the very first iteration (QEMU keeps gdbstub
+        // breakpoints across `loadvm`, so one insert covers the whole session).
+        if let Some((address, kind)) = self.harness_breakpoint {
+            gdb.insert_sw_breakpoint(address, kind)?;
+        }
 
         // Quiesce the vCPUs, then snapshot the clean baseline every iteration
         // restores to.

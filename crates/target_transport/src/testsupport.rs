@@ -270,8 +270,8 @@ impl MemRegion {
 }
 
 /// A minimal gdbstub speaking the target side of the RSP: acks packets, answers
-/// `!`/`?`/`g`/`m`/`M`/`c`, and records a per-iteration `R` reset. Serves memory
-/// reads/writes against scripted regions.
+/// `!`/`?`/`g`/`m`/`M`/`c`/`Z`/`z`, and records a per-iteration `R` reset. Serves
+/// memory reads/writes against scripted regions.
 pub struct MockGdbStub<C: Read + Write> {
     connection: GdbConnection<C>,
     regions: Vec<MemRegion>,
@@ -371,7 +371,8 @@ impl<C: Read + Write> MockGdbStub<C> {
                     self.connection.send_packet(&reply)?;
                 }
                 b'R' => { /* restart: RSP defines no reply for `R`. */ }
-                _ => self.connection.send_packet(b"")?, // unsupported
+                b'Z' | b'z' => self.connection.send_packet(b"OK")?, // (in|re)move breakpoint
+                _ => self.connection.send_packet(b"")?,             // unsupported
             }
         }
         Ok(())
