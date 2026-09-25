@@ -61,10 +61,42 @@ fn synth_package_spec(unit_name: &str, decls: &[String], output_root: &Path) -> 
 }
 
 fn synth_package_body(unit_name: &str, ops: &[StubOp], output_root: &Path) -> StubFile {
+    synth_package_body_with_mode(unit_name, ops, output_root, false)
+}
+
+/// HDF-6 deliverable 1 (Ada): the fuzz-driven counterpart of [`synth_package_body`].
+/// A stubbed `Integer`/`Natural`-returning function draws its result from the LIVE
+/// FUZZ INPUT — keyed by its own symbol name — via the runtrace shim's C export
+/// `bhf_shim_fuzz_stub_value`, instead of the constant `0`. Every other shape
+/// (procedures, `Boolean`/`String`/record returns, `Positive` which cannot take a
+/// masked-to-zero value) keeps its constant neutral body. Strictly opt-in:
+/// [`synth_package_body`]/[`synth_all`] are byte-for-byte unchanged, mirroring how
+/// the C fuzz-driven stub mode is a separate entry point.
+pub fn synth_fuzz_driven_package_body(
+    unit_name: &str,
+    ops: &[StubOp],
+    output_root: &Path,
+) -> StubFile {
+    synth_package_body_with_mode(unit_name, ops, output_root, true)
+}
+
+fn synth_package_body_with_mode(
+    unit_name: &str,
+    ops: &[StubOp],
+    output_root: &Path,
+    fuzz_driven: bool,
+) -> StubFile {
     let mut content = String::new();
     content.push_str("--  SPDX-License-Identifier: Apache-2.0\n");
     content.push_str("--  Auto-stubbed by bhf from compiler diagnostics.\n");
-    let context_units = ada_context_units_for_ops(unit_name, ops);
+    let mut context_units = ada_context_units_for_ops(unit_name, ops);
+    // A fuzz-driven body imports the shim reader and builds its per-symbol key, so
+    // it always needs Interfaces / Interfaces.C / System regardless of the profile.
+    if fuzz_driven && ops.iter().any(op_is_fuzz_drivable) {
+        context_units.insert("Interfaces".to_owned());
+        context_units.insert("Interfaces.C".to_owned());
+        context_units.insert("System".to_owned());
+    }
     for context_unit in &context_units {
         content.push_str(&format!("with {context_unit};\n"));
     }
@@ -75,6 +107,9 @@ fn synth_package_body(unit_name: &str, ops: &[StubOp], output_root: &Path) -> St
     for op in ops {
         match op.kind {
             crate::StubOpKind::Procedure => push_procedure_body(&mut content, op),
+            crate::StubOpKind::Function if fuzz_driven && op_is_fuzz_drivable(op) => {
+                push_fuzz_driven_function_body(&mut content, op)
+            }
             crate::StubOpKind::Function => push_function_body(&mut content, op),
         }
     }
@@ -84,6 +119,40 @@ fn synth_package_body(unit_name: &str, ops: &[StubOp], output_root: &Path) -> St
         path: output_root.join(format!("{}.adb", unit_file_stem(unit_name))),
         content,
     }
+}
+
+/// Whether an op is a function whose return type can safely take a fuzz-driven,
+/// masked-nonnegative value: `Integer` or `Natural` (both admit 0). `Positive`
+/// (min 1), `Boolean`, `String`, and record/access returns are excluded.
+fn op_is_fuzz_drivable(op: &StubOp) -> bool {
+    matches!(op.kind, crate::StubOpKind::Function)
+        && op
+            .return_type
+            .as_deref()
+            .is_some_and(|rt| matches_ada_name(rt, &["Integer", "Natural"]))
+}
+
+fn push_fuzz_driven_function_body(content: &mut String, op: &StubOp) {
+    let return_type = op.return_type.as_deref().unwrap_or("Integer");
+    let profile = render_profile(&op.params);
+    // Ada symbol names are case-insensitive; the shim keys on the exact bytes it is
+    // handed, so pass the operation's own name as the channel key.
+    content.push_str(&format!(
+        "   function {name}{profile} return {return_type} is\n\
+         \x20     function Bhf_Fuzz_Stub_Value (Sym : System.Address) \
+         return Interfaces.Unsigned_64;\n\
+         \x20     pragma Import (C, Bhf_Fuzz_Stub_Value, \"bhf_shim_fuzz_stub_value\");\n\
+         \x20     Bhf_Sym : constant Interfaces.C.char_array := \
+         Interfaces.C.To_C (\"{name}\");\n\
+         \x20  begin\n\
+         \x20     return {return_type}\n\
+         \x20       (Bhf_Fuzz_Stub_Value (Bhf_Sym'Address)\n\
+         \x20        and Interfaces.Unsigned_64 (Integer'Last));  -- fuzz-driven return\n\
+         \x20  end {name};\n\n",
+        name = op.name,
+        profile = profile,
+        return_type = return_type,
+    ));
 }
 
 pub fn ada_context_units_for_ops(unit_name: &str, ops: &[StubOp]) -> BTreeSet<String> {
@@ -527,6 +596,89 @@ mod tests {
     fn synth_package_body_output_parses_via_ada_parser() {
         let stub = synth_stub(&package_body_need(), Path::new("/tmp/stubs"));
 
+        ada_parser::reconcile::build_structural_ast(&stub.content, None, &stub.path)
+            .expect("generated package body parses");
+    }
+
+    // ---- HDF-6 D1 (Ada): fuzz-driven function bodies -------------------------
+
+    #[test]
+    fn fuzz_driven_integer_function_draws_return_from_shim() {
+        let stub = super::synth_fuzz_driven_package_body(
+            "External_Lib",
+            &[StubOp {
+                name: "Read_Sensor".to_owned(),
+                kind: StubOpKind::Function,
+                return_type: Some("Integer".to_owned()),
+                params: Vec::new(),
+            }],
+            Path::new("/tmp/stubs"),
+        );
+        // Imports the shim reader, keys it by the op name, and masks to a
+        // nonnegative Integer.
+        assert!(
+            stub.content
+                .contains("pragma Import (C, Bhf_Fuzz_Stub_Value, \"bhf_shim_fuzz_stub_value\");"),
+            "{}",
+            stub.content
+        );
+        assert!(
+            stub.content.contains("Interfaces.C.To_C (\"Read_Sensor\")"),
+            "{}",
+            stub.content
+        );
+        assert!(
+            stub.content
+                .contains("and Interfaces.Unsigned_64 (Integer'Last)"),
+            "{}",
+            stub.content
+        );
+        // Needs the C-interfacing context units.
+        assert!(
+            stub.content.contains("with Interfaces.C;"),
+            "{}",
+            stub.content
+        );
+        assert!(stub.content.contains("with System;"), "{}", stub.content);
+        // And the whole unit is valid Ada.
+        ada_parser::reconcile::build_structural_ast(&stub.content, None, &stub.path)
+            .expect("generated fuzz-driven package body parses");
+    }
+
+    #[test]
+    fn fuzz_driven_mode_keeps_constant_body_for_non_integer_returns() {
+        // Boolean/Positive/record returns cannot safely take a masked-to-zero value,
+        // so fuzz-driven mode leaves their constant neutral body untouched and does
+        // not import the shim reader.
+        let stub = super::synth_fuzz_driven_package_body(
+            "External_Lib",
+            &[
+                StubOp {
+                    name: "Is_Ready".to_owned(),
+                    kind: StubOpKind::Function,
+                    return_type: Some("Boolean".to_owned()),
+                    params: Vec::new(),
+                },
+                StubOp {
+                    name: "Reset".to_owned(),
+                    kind: StubOpKind::Procedure,
+                    return_type: None,
+                    params: Vec::new(),
+                },
+            ],
+            Path::new("/tmp/stubs"),
+        );
+        assert!(stub.content.contains("return False;"), "{}", stub.content);
+        assert!(
+            stub.content.contains("null;  -- auto-stubbed"),
+            "{}",
+            stub.content
+        );
+        assert!(
+            !stub.content.contains("bhf_shim_fuzz_stub_value"),
+            "no fuzz-driven body for these shapes: {}",
+            stub.content
+        );
         ada_parser::reconcile::build_structural_ast(&stub.content, None, &stub.path)
             .expect("generated package body parses");
     }

@@ -82,6 +82,13 @@
 static const uint8_t *_bhf_env_data = 0;
 static size_t _bhf_env_size = 0;
 static size_t _bhf_env_index = 0;
+/* `unused`-tolerant: the source is referenced by the peripheral read accessors
+ * and/or the fuzz-driven callback trampolines, but an environment model may carry
+ * only one of those (HDF-6 D4 can enable fuzz-driven callbacks without any
+ * peripheral reader), so keep a -Wunused-function/-Werror build clean either way. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((unused))
+#endif
 static uint32_t _bhf_env_next_u32(void) {
     uint32_t _v = 0;
     int _i;
