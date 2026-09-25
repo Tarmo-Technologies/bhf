@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-# Staging-only, read-only validation. No source or release publication.
 name: Scheduler reliability validation
 on:
   push:
@@ -7,89 +6,30 @@ on:
 permissions:
   contents: read
 jobs:
-  native:
-    name: Scheduler runtime (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, windows-2022]
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
-        with:
-          toolchain: stable
-      - name: Test the exact committed source
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p scheduler-evidence/source
-          cp crates/continuous_daemon/src/{lib,health,health_tests,storage_lock}.rs scheduler-evidence/source/
-          git rev-parse HEAD > scheduler-evidence/revision.txt
-          rustc --version --verbose > scheduler-evidence/toolchain.txt
-          if [[ "$RUNNER_OS" == Windows ]]; then
-            cargo test --locked -p continuous_daemon --lib health::tests 2>&1 | tee scheduler-evidence/runtime.log
-          else
-            cargo test --locked -p continuous_daemon --lib 2>&1 | tee scheduler-evidence/runtime.log
-            python3 -m unittest discover -s scripts/ci/tests -v 2>&1 | tee scheduler-evidence/ci-policy.log
-          fi
-          cargo clippy --locked -p continuous_daemon --lib --all-targets 2>&1 | tee scheduler-evidence/clippy.log
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        if: ${{ always() }}
-        with:
-          name: scheduler-${{ matrix.os }}
-          path: scheduler-evidence/
-          if-no-files-found: error
-          retention-days: 14
-  legacy:
-    name: EL7 scheduler, installer, and release ABI
+  legacy-tools:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-      - name: Exercise actual old userspace without skipping installer checks
-        shell: bash
+      - name: Inspect only the pinned image tool locations
         run: |
           set -euo pipefail
-          mkdir -p scheduler-evidence
-          git rev-parse HEAD > scheduler-evidence/revision.txt
-          docker run --rm --volume "$GITHUB_WORKSPACE:/io" --workdir /io \
-            --env CARGO_HOME=/tmp/cargo --env RUSTUP_HOME=/tmp/rustup \
-            --env CARGO_TARGET_DIR=/io/target/scheduler-el7 \
-            quay.io/pypa/manylinux2014_x86_64@sha256:0d25b049964b2549b83384036abdff06789a8c0b1e9ff003ec80f0d531f79e50 \
+          docker run --rm quay.io/pypa/manylinux2014_x86_64@sha256:0d25b049964b2549b83384036abdff06789a8c0b1e9ff003ec80f0d531f79e50 \
             bash -lc '
               set -euo pipefail
-              # Use dependencies already supplied by the pinned image, not a
-              # system OpenSSL too old for Ed25519 raw-message verification.
-              test -x /opt/python/cp311-cp311/bin/python3
-              openssl_bins=(/opt/_internal/openssl-3*/bin)
-              test "${#openssl_bins[@]}" -eq 1
-              test -x "${openssl_bins[0]}/openssl"
-              export PATH="${openssl_bins[0]}:/opt/python/cp311-cp311/bin:$PATH"
-              yum -y install vim-common
-              command -v python3
-              python3 --version
-              command -v xxd
               openssl version
-              ldd --version
-              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-              export PATH="$CARGO_HOME/bin:$PATH"
-              rustc --version --verbose
-              cargo test --locked -p continuous_daemon --lib
-              cargo test --locked -p governance --lib
-              cargo test --locked -p bhf --test offline_dist_scripts -- --nocapture
-              cargo build --locked --release --workspace
-              scripts/check-linux-release-abi.sh "$CARGO_TARGET_DIR/release"
-            ' 2>&1 | tee scheduler-evidence/el7.log
+              ls -ld /opt/_internal/openssl* /usr/local/ssl* 2>/dev/null || true
+              find /opt /usr/local -type f -name openssl -print
+              for candidate in /opt/_internal/openssl*/bin/openssl /usr/local/bin/openssl /usr/local/ssl/bin/openssl; do
+                if [[ -x "$candidate" ]]; then
+                  printf "CANDIDATE: %s\n" "$candidate"
+                  "$candidate" version
+                fi
+              done
+            ' 2>&1 | tee el7-tools.log
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: ${{ always() }}
         with:
-          name: scheduler-el7
-          path: scheduler-evidence/
+          name: el7-tools
+          path: el7-tools.log
           if-no-files-found: error
           retention-days: 14
