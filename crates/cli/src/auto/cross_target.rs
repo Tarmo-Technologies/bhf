@@ -79,6 +79,15 @@ impl CrossTarget {
             self.runner.exe()
         )
     }
+
+    /// The target's ABI (byte order + pointer width), so the typed-input
+    /// generator and struct-layout model produce inputs in the TARGET's byte
+    /// order and data model rather than the host's (HDF-3). Every triple this
+    /// module resolves is described by [`type_model::TargetAbi::from_triple`];
+    /// an unrecognized triple falls back to the host ABI.
+    pub fn target_abi(&self) -> type_model::TargetAbi {
+        type_model::TargetAbi::from_triple(&self.triple).unwrap_or_default()
+    }
 }
 
 /// Resolve a foreign-platform discovery guard to the cross toolchain bhf can
@@ -122,6 +131,80 @@ pub fn resolve_cross_target(foreign_guard: &str) -> Option<CrossTarget> {
             cxx: "arm-linux-gnueabihf-g++".to_owned(),
             runner: CrossRunner::QemuUser {
                 exe: "qemu-arm".to_owned(),
+            },
+        });
+    }
+    // Big-endian-first multi-arch targets that dominate fielded RTOS/radar
+    // systems (HDF-3): PowerPC, MIPS, SPARC. As with the arm64-before-arm rule
+    // above, order is longest/most-specific substring FIRST so a little-endian
+    // guard never falls into a big-endian branch: `powerpc64le`/`ppc64le` before
+    // `powerpc64`/`ppc64` before `powerpc`/`ppc`, and `mipsel` before `mips`.
+    // Both the `powerpc*` (GCC/triple) and the `ppc*` (Debian/arch-dir/macro)
+    // spellings are accepted since discovery emits guards from all three sources.
+    //
+    // PowerPC 64-bit little-endian (POWER8+ radar/server class).
+    if contains_any(&guard, &["powerpc64le", "ppc64le"]) {
+        return Some(CrossTarget {
+            triple: "powerpc64le-linux-gnu".to_owned(),
+            cc: "powerpc64le-linux-gnu-gcc".to_owned(),
+            cxx: "powerpc64le-linux-gnu-g++".to_owned(),
+            runner: CrossRunner::QemuUser {
+                exe: "qemu-ppc64le".to_owned(),
+            },
+        });
+    }
+    // PowerPC 64-bit big-endian.
+    if contains_any(&guard, &["powerpc64", "ppc64"]) {
+        return Some(CrossTarget {
+            triple: "powerpc64-linux-gnu".to_owned(),
+            cc: "powerpc64-linux-gnu-gcc".to_owned(),
+            cxx: "powerpc64-linux-gnu-g++".to_owned(),
+            runner: CrossRunner::QemuUser {
+                exe: "qemu-ppc64".to_owned(),
+            },
+        });
+    }
+    // PowerPC 32-bit big-endian.
+    if contains_any(&guard, &["powerpc", "ppc"]) {
+        return Some(CrossTarget {
+            triple: "powerpc-linux-gnu".to_owned(),
+            cc: "powerpc-linux-gnu-gcc".to_owned(),
+            cxx: "powerpc-linux-gnu-g++".to_owned(),
+            runner: CrossRunner::QemuUser {
+                exe: "qemu-ppc".to_owned(),
+            },
+        });
+    }
+    // MIPS 32-bit little-endian.
+    if contains_any(&guard, &["mipsel"]) {
+        return Some(CrossTarget {
+            triple: "mipsel-linux-gnu".to_owned(),
+            cc: "mipsel-linux-gnu-gcc".to_owned(),
+            cxx: "mipsel-linux-gnu-g++".to_owned(),
+            runner: CrossRunner::QemuUser {
+                exe: "qemu-mipsel".to_owned(),
+            },
+        });
+    }
+    // MIPS 32-bit big-endian.
+    if contains_any(&guard, &["mips"]) {
+        return Some(CrossTarget {
+            triple: "mips-linux-gnu".to_owned(),
+            cc: "mips-linux-gnu-gcc".to_owned(),
+            cxx: "mips-linux-gnu-g++".to_owned(),
+            runner: CrossRunner::QemuUser {
+                exe: "qemu-mips".to_owned(),
+            },
+        });
+    }
+    // SPARC 64-bit big-endian.
+    if contains_any(&guard, &["sparc64", "sparc"]) {
+        return Some(CrossTarget {
+            triple: "sparc64-linux-gnu".to_owned(),
+            cc: "sparc64-linux-gnu-gcc".to_owned(),
+            cxx: "sparc64-linux-gnu-g++".to_owned(),
+            runner: CrossRunner::QemuUser {
+                exe: "qemu-sparc64".to_owned(),
             },
         });
     }
@@ -945,15 +1028,223 @@ mod tests {
 
     #[test]
     fn unknown_guard_is_unmapped() {
-        // Foreign targets we have no cross toolchain mapping for: macOS, and the
-        // non-ARM/non-Windows architectures discovery can also tag.
-        for guard in ["darwin", "macos", "__APPLE__", "ppc64", "riscv64", "s390x"] {
+        // Foreign targets we still have no cross toolchain mapping for: macOS, and
+        // the architectures discovery can tag that HDF-3 did not add (RISC-V,
+        // s390x). `ppc64` moved to the PowerPC branch — see
+        // `resolves_powerpc_mips_sparc_guards`.
+        for guard in ["darwin", "macos", "__APPLE__", "riscv64", "riscv", "s390x"] {
             assert_eq!(
                 resolve_cross_target(guard),
                 None,
                 "{guard} should be unmapped"
             );
         }
+    }
+
+    #[test]
+    fn resolves_powerpc_mips_sparc_guards() {
+        // HDF-3: big-endian-first multi-arch targets. Each guard form (GCC
+        // `powerpc*`, Debian/arch-dir/macro `ppc*`, and the case discovery emits)
+        // must resolve to the right triple, cross gcc/g++, and qemu emulator, and
+        // the toolchain_hint must name exactly what to install.
+        struct Case {
+            guards: &'static [&'static str],
+            triple: &'static str,
+            qemu: &'static str,
+        }
+        let cases = [
+            Case {
+                // Little-endian 64-bit must NOT fall into the big-endian branch.
+                guards: &["powerpc64le", "ppc64le", "PPC64LE"],
+                triple: "powerpc64le-linux-gnu",
+                qemu: "qemu-ppc64le",
+            },
+            Case {
+                guards: &["powerpc64", "ppc64", "__powerpc64__"],
+                triple: "powerpc64-linux-gnu",
+                qemu: "qemu-ppc64",
+            },
+            Case {
+                guards: &["powerpc", "ppc", "__powerpc__", "__PPC__"],
+                triple: "powerpc-linux-gnu",
+                qemu: "qemu-ppc",
+            },
+            Case {
+                guards: &["mipsel", "MIPSEL", "__mipsel__"],
+                triple: "mipsel-linux-gnu",
+                qemu: "qemu-mipsel",
+            },
+            Case {
+                guards: &["mips", "__mips__"],
+                triple: "mips-linux-gnu",
+                qemu: "qemu-mips",
+            },
+            Case {
+                guards: &["sparc64", "sparc", "__sparc__"],
+                triple: "sparc64-linux-gnu",
+                qemu: "qemu-sparc64",
+            },
+        ];
+        for case in cases {
+            for guard in case.guards {
+                let target =
+                    resolve_cross_target(guard).unwrap_or_else(|| panic!("{guard} resolves"));
+                assert_eq!(target.triple, case.triple, "{guard} triple");
+                assert_eq!(target.cc, format!("{}-gcc", case.triple), "{guard} cc");
+                assert_eq!(target.cxx, format!("{}-g++", case.triple), "{guard} cxx");
+                assert_eq!(
+                    target.runner,
+                    CrossRunner::QemuUser {
+                        exe: case.qemu.to_owned()
+                    },
+                    "{guard} runner"
+                );
+                // The actionable skip reason names the triple, both compilers, and
+                // the emulator to install.
+                let hint = target.toolchain_hint();
+                assert!(hint.contains(case.triple), "{guard} hint triple: {hint}");
+                assert!(hint.contains(case.qemu), "{guard} hint qemu: {hint}");
+                assert!(
+                    hint.contains(&format!("{}-gcc", case.triple)),
+                    "{guard} hint gcc: {hint}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cross_targets_carry_the_target_abi() {
+        use type_model::{Endian, TargetAbi};
+        // The resolved cross target exposes the byte order + pointer width the
+        // typed-input generator must use for a faithful input.
+        for (guard, endian, width) in [
+            ("powerpc64le", Endian::Little, 8),
+            ("powerpc64", Endian::Big, 8),
+            ("powerpc", Endian::Big, 4),
+            ("mipsel", Endian::Little, 4),
+            ("mips", Endian::Big, 4),
+            ("sparc64", Endian::Big, 8),
+            ("aarch64", Endian::Little, 8),
+            ("arm", Endian::Little, 4),
+        ] {
+            let abi = resolve_cross_target(guard)
+                .unwrap_or_else(|| panic!("{guard} resolves"))
+                .target_abi();
+            assert_eq!(abi, TargetAbi::new(endian, width), "{guard} abi");
+        }
+    }
+
+    #[test]
+    fn big_endian_input_reaches_a_native_endian_branch_only_on_the_target() {
+        use std::process::Command;
+        use type_model::TargetAbi;
+
+        // (1) Always-run: the ABI model serializes the SAME 32-bit value into
+        // different bytes for a big-endian vs a little-endian target.
+        let be = TargetAbi::from_triple("powerpc64-linux-gnu").expect("ppc64 abi");
+        let le = TargetAbi::from_triple("powerpc64le-linux-gnu").expect("ppc64le abi");
+        let magic = 0xDEAD_BEEF_u64;
+        let be_bytes = be.encode_uint(magic, 4);
+        let le_bytes = le.encode_uint(magic, 4);
+        assert_eq!(be_bytes, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(le_bytes, vec![0xEF, 0xBE, 0xAD, 0xDE]);
+        assert_ne!(be_bytes, le_bytes);
+
+        // A fixture that reads a NATIVE-endian 32-bit magic and branches on
+        // 0xDEADBEEF. The SAME big-endian input bytes reach the planted branch on
+        // a big-endian target (native BE read == 0xDEADBEEF) but NOT on the
+        // little-endian host (native LE read == 0xEFBEADDE) — the fidelity gain.
+        const FIXTURE: &str = r#"#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+int main(int argc, char **argv) {
+    if (argc < 2) return 2;
+    FILE *f = fopen(argv[1], "rb");
+    if (!f) return 3;
+    unsigned char buf[4] = {0};
+    size_t n = fread(buf, 1, 4, f);
+    fclose(f);
+    if (n != 4) return 4;
+    uint32_t magic;
+    memcpy(&magic, buf, 4);           /* native-endian read — the whole point */
+    return (magic == 0xDEADBEEFu) ? 42 : 7;
+}
+"#;
+        let dir = std::env::temp_dir().join(format!("bhf-hdf3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("be_parse.c");
+        std::fs::write(&src, FIXTURE).unwrap();
+        let input = dir.join("input.bin");
+        std::fs::write(&input, &be_bytes).unwrap();
+
+        // (2) Host (little-endian): compile natively and run the big-endian input;
+        // the native LE read must MISS the branch (exit 7). Self-skip without a C
+        // compiler on PATH.
+        let host_cc = ["cc", "gcc", "clang"]
+            .into_iter()
+            .find(|cc| executable_on_path(cc));
+        if let Some(cc) = host_cc {
+            let host_bin = dir.join("be_parse_host");
+            let built = Command::new(cc)
+                .args(["-O0", "-o"])
+                .arg(&host_bin)
+                .arg(&src)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if built {
+                let code = Command::new(&host_bin)
+                    .arg(&input)
+                    .status()
+                    .ok()
+                    .and_then(|s| s.code());
+                assert_eq!(
+                    code,
+                    Some(7),
+                    "little-endian host must NOT reach the branch with target-order bytes"
+                );
+            } else {
+                bhfeprintln!("skipping HDF-3 host native run: {cc} failed to build the fixture");
+            }
+        } else {
+            bhfeprintln!("skipping HDF-3 host native run: no C compiler on PATH");
+        }
+
+        // (3) Gated: cross-compile for big-endian ppc64 and run the SAME bytes
+        // under qemu-ppc64; the native BE read MUST reach the branch (exit 42).
+        // Self-skip when the cross gcc / qemu-ppc64 are absent (repo convention).
+        let target = resolve_cross_target("powerpc64").expect("ppc64 resolves");
+        if target.available() {
+            let cross_bin = dir.join("be_parse_ppc64");
+            let built = Command::new(&target.cc)
+                .args(["-O0", "-static", "-o"])
+                .arg(&cross_bin)
+                .arg(&src)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if built {
+                let code = Command::new(target.runner.exe())
+                    .arg(&cross_bin)
+                    .arg(&input)
+                    .status()
+                    .ok()
+                    .and_then(|s| s.code());
+                assert_eq!(
+                    code,
+                    Some(42),
+                    "big-endian ppc64 must reach the branch with target-order bytes"
+                );
+            } else {
+                bhfeprintln!("skipping qemu-ppc64 run: cross compile failed");
+            }
+        } else {
+            bhfeprintln!(
+                "skipping qemu-ppc64 run: missing {}",
+                target.toolchain_hint()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

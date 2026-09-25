@@ -12,6 +12,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+mod abi;
+pub use abi::{scalar_size, AbiLayoutError, Endian, FieldLayout, RecordLayout, TargetAbi};
+
 pub fn crate_name() -> &'static str {
     "type_model"
 }
