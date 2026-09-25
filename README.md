@@ -4,7 +4,7 @@
   <em><strong>THE POINT-AND-CLICK FUZZER.</strong></em>
   <br><br>
   <a href="https://github.com/Tarmo-Technologies/bhf/security/code-scanning"><img src="https://github.com/Tarmo-Technologies/bhf/actions/workflows/github-code-scanning/codeql/badge.svg" alt="CodeQL"></a>
-  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-1.83%2B-blue" alt="Rust 1.83+"></a>
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-1.88%2B-blue" alt="Rust 1.88+"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-green" alt="License: Apache-2.0"></a>
 </div>
 
@@ -27,7 +27,7 @@ harnesses, recovers the build, and fuzzes — no test harness and no working bui
 
 ## Quick Start
 
-Build from source (Rust 1.83+, plus `make` + `clang` for the C/C++ lane):
+Build from source (Rust 1.88+, plus `make` + `clang` for the C/C++ lane):
 
 ```sh
 git clone https://github.com/Tarmo-Technologies/bhf.git && cd bhf
@@ -238,7 +238,7 @@ toolchains, offline/air-gapped install, and Windows.
 
 Linux has two complete installation styles. The all-in-one `bhf-dist-*.tar.gz`
 contains `install.sh`, the CLI, daemon, both Linux shims, harness runtimes, and a
-signed content pack. Every full bundle also contains `INSTALL.md`, `LICENSE`,
+checksum-verified content pack. Every full bundle also contains `INSTALL.md`, `LICENSE`,
 `README.md`, `RELEASE_NOTES.md`, `RUN-BHF.md`, `RECOMMENDED-SWEEP.md` (the
 command to start with and how to size every flag), and
 `AUTO-OFFLINE-RUNBOOK.md`. The component installers/archives let you
@@ -341,7 +341,7 @@ sudo yum install -y curl tar xz gcc gcc-c++ make \
 ```
 
 Then use the all-in-one bundle above. It installs the CLI, daemon, both shims,
-harness runtimes, and signed content together. The separate component
+harness runtimes, and checksum-verified content together. The separate component
 installers remain available when you deliberately want a smaller install:
 
 ```sh

@@ -70,14 +70,14 @@ The package contains:
   `tool/python_runtime`, `tool/perl_runtime`, `tool/crates/rust_runtime`,
   `tool/csharp_runtime`, `tool/js_runtime`, `tool/ruby_runtime`,
   `tool/lua_runtime`, and `tool/php_runtime`
-- `content/packs/current/update-pack.json`, a signed content pack
-- `content/bhf-policy.json`, requiring the configured content-pack key
+- `content/packs/current/update-pack.json`, a signed content pack when signing inputs are supplied
+- `content/bhf-policy.json`, non-trust content policy metadata (not a publisher trust anchor)
 - `smoke/c/bhf_smoke.c`, a tiny post-install `bhf auto` fixture
 - `install.sh`, the interactive/update-safe installer
 - `README-DIST.md`, `INSTALL.md`, and `RUN-BHF.md`, the install choices and
   post-install run guides
 
-The signed content pack currently carries these pack kinds:
+The content pack currently carries these pack kinds:
 
 | Pack kind | Files | Purpose |
 |---|---|---|
@@ -103,11 +103,17 @@ sudo apt-get install -y gnat gprbuild default-jdk maven gradle python3 perl gola
   qemu-user gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 rustup toolchain install nightly
 
-# From the BHF source checkout. Omitted CVE DB and seed inputs are generated
-# under dist/content-inputs/ and then packaged.
-scripts/package-offline-dist.sh
+# From the BHF source checkout. Generate a publisher key once and provision
+# its public half through an independent trusted channel to receiving hosts.
+mkdir -m 700 keys
+cargo run --release -p bhf -- pack keygen \
+  --private-key keys/publisher.der --public-key keys/publisher.pub
+# Omitted CVE DB and seed inputs are generated under dist/content-inputs/.
+scripts/package-offline-dist.sh \
+  --signing-key keys/publisher.der --key-id publisher-v1 \
+  --trusted-public-key keys/publisher.pub
 
-# Transfer both files:
+# Transfer the archive, detached .sig, and .sha256 sidecar:
 sha256sum -c dist/bhf-dist-*.tar.gz.sha256
 ```
 
@@ -121,21 +127,34 @@ dist/content-inputs/seeds/
 
 The generated CVE DBs are valid empty defaults, so SBOM and binary-CVE workflows
 still execute but produce no CVE matches. Replace those files with your real
-feed data and rerun `scripts/package-offline-dist.sh` when you need CVE matching
+feed data and rerun `scripts/package-offline-dist.sh` with the same signing
+inputs when you need CVE matching
 in the packaged content.
+
+The private key must stay outside the distribution output. For a deliberate
+checksum-only package, pass `--legacy-integrity-only`; it does not authenticate
+the publisher and the destination must explicitly opt in to that mode.
 
 On the **destination machine**:
 
 ```sh
+# A checksum sidecar from the same channel is not publisher authentication.
+# Authenticate the whole tarball and installer/verifier out of band before
+# executing bundle code; separately provision operator-policy.json with
+# update_packs.require_signature=true and a trusted_public_keys map.
 sha256sum -c bhf-dist-*.tar.gz.sha256
+bash /trusted/verify-offline-dist.sh \
+  --archive bhf-dist-<version>-<triple>.tar.gz \
+  --signature bhf-dist-<version>-<triple>.tar.gz.sig \
+  --trusted-public-key /trusted/publisher.pub
 tar xzf bhf-dist-*.tar.gz
 cd bhf-dist-*
 
 # Interactive arrow-key install:
-./install.sh
+./install.sh --trust-policy /trusted/operator-policy.json
 
 # Or install/update everything non-interactively:
-./install.sh --non-interactive \
+./install.sh --non-interactive --trust-policy /trusted/operator-policy.json \
   --languages all \
   --targets native,windows,aarch64 \
   --fuzzers builtin,afl \
@@ -145,7 +164,7 @@ cd bhf-dist-*
 The installer defaults to `/opt/bhf` and symlinks `bhf` into
 `/usr/local/bin`. It backs up an existing install to
 `/opt/bhf.backup.<timestamp>`, preserves existing `packs/` and `corpora/`,
-verifies the signed content pack, and installs it under
+authenticates the content pack against the external policy, and installs it under
 `/opt/bhf/packs/<pack_id>`. It then runs a tiny C `bhf auto` smoke test
 from the bundled `smoke/c` fixture to prove discovery, harness generation,
 build, fuzz execution, and reporting work after install. Use `./install.sh
@@ -161,8 +180,8 @@ as a compatibility alias.
 ### A1. Use the published all-in-one bundle (preferred)
 
 The release publishes `bhf-dist-<version>-x86_64-unknown-linux-gnu.tar.gz`
-with its `.sha256` sidecar. It contains `install.sh`, the CLI, daemon, runtrace
-shim, compiler-interception shim, harness runtimes, signed content pack, and
+with its detached `.sig` and `.sha256` sidecars. It contains `install.sh`, the CLI, daemon, runtrace
+shim, compiler-interception shim, harness runtimes, content pack, and
 smoke fixture. No source checkout or component assembly is required.
 
 On the **connected** host:
@@ -171,17 +190,26 @@ On the **connected** host:
 gh release download vX.Y.Z --repo Tarmo-Technologies/bhf \
   --pattern 'bhf-dist-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz*'
 
+# Authenticate the complete archive and verifier via a trusted release channel.
 sha256sum -c bhf-dist-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz.sha256
+bash /trusted/verify-offline-dist.sh \
+  --archive bhf-dist-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz \
+  --signature bhf-dist-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz.sig \
+  --trusted-public-key /trusted/publisher.pub
 ```
 
 Transfer both files, then on the **offline** host:
 
 ```sh
 sha256sum -c bhf-dist-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz.sha256
+bash /trusted/verify-offline-dist.sh \
+  --archive bhf-dist-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz \
+  --signature bhf-dist-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz.sig \
+  --trusted-public-key /trusted/publisher.pub
 tar xzf bhf-dist-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz
 cd bhf-dist-vX.Y.Z-x86_64-unknown-linux-gnu
 
-./install.sh --non-interactive \
+./install.sh --non-interactive --trust-policy /trusted/operator-policy.json \
   --languages all \
   --targets native \
   --fuzzers builtin \
@@ -192,7 +220,9 @@ cd bhf-dist-vX.Y.Z-x86_64-unknown-linux-gnu
 
 Omit `--no-system-packages` and `--no-rustup` on a connected destination when
 the installer should prepare those dependencies. The content pack is already
-inside the bundle and remains enabled unless `--no-content` is passed.
+inside the bundle and remains enabled unless `--no-content` is passed. Older
+checksum-only bundles require explicit `--allow-legacy-integrity-only` instead
+of `--trust-policy`; that mode is not publisher-authenticated.
 
 ### A2. Manually co-locate published component archives
 
@@ -236,13 +266,13 @@ sha256sum -c bhf_cc_intercept-*.tar.xz.sha256
 sha256sum -c bhf-daemon-x86_64-unknown-linux-gnu.tar.xz.sha256
 
 # GitHub Artifact Attestations are not published for current private releases;
-# verify checksums here and rely on signed content-pack verification during
-# install.
+# verify checksums here; content-pack digest verification during install does
+# not authenticate the publisher.
 ```
 
 The `sha256sum -c` check works fully offline and is your archive-integrity gate
 on the air-gapped side — copy the `.sha256` sidecars across with the archives.
-The installer also verifies the signed content pack before installing it.
+The installer also checks content-pack digests before installing it.
 
 Transfer the archives (e.g. via approved removable media), then on the
 **offline** host:
@@ -529,7 +559,8 @@ from it — to get the defect fixed; it carries everything needed to reproduce.
 
 Updating the *tool* (above) is separate from updating the *content* it consults
 (static-analysis rules, the CVE/SCA database, seed corpora). Content ships as
-signed **update packs** — local JSON manifests with deterministic hashes — so it
+checksum-verified **update packs** — local JSON manifests with deterministic
+hashes and optional Ed25519 publisher authentication — so it
 can move across the air gap independently of a BHF release.
 
 The full binary-only package flow in [A0](#a0-build-a-binary-only-distribution-package-from-source)
@@ -539,15 +570,23 @@ when you are publishing a content-only update.
 On the **connected** host:
 
 ```sh
+bhf pack keygen --private-key keys/offline-root.der --public-key keys/offline-root.pub
 bhf pack create --root packs/current \
   --pack-id rules-2026-06 --version 2026.06 \
   --item rules:rules/static.json \
   --item cve:cve/sbom-cves.json \
   --item cve:cve/binary-cves.json \
   --item corpus:corpus/seeds.tar.gz \
-  --sign-key offline-root \
+  --signing-key keys/offline-root.der --key-id offline-root \
   --out packs/current/update-pack.json
 ```
+
+Keep the private key outside the transferred pack. Configure the offline
+host's policy independently with `update_packs.require_signature: true` and
+`update_packs.trusted_public_keys: {"offline-root": "<contents of keys/offline-root.pub>"}`.
+An optional `revoked_keys` array denies retired IDs even if still in the
+trust map. The deprecated `--sign-key` is only an unkeyed digest label and
+cannot satisfy authentication policy.
 
 Transfer `packs/current/`, then on the **offline** host verify before use:
 

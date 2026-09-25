@@ -100,7 +100,9 @@ source checkout but the destination machine should receive an installable
 tarball instead of the BHF application source tree:
 
 ```sh
-scripts/package-offline-dist.sh
+scripts/package-offline-dist.sh \
+  --signing-key keys/publisher.der --key-id publisher-v1 \
+  --trusted-public-key keys/publisher.pub
 ```
 
 When CVE DBs or seeds are not provided, the script creates and packages:
@@ -116,8 +118,9 @@ data and rerun the same command when you need SBOM or binary-CVE matching.
 
 The script runs `cargo build --release --workspace`, stages the release binaries,
 both Linux shims, harness runtime support files, a tiny `bhf auto` smoke
-fixture, and a signed content pack, then produces
-`dist/bhf-dist-<version>-<triple>.tar.gz` plus a `.sha256` sidecar. Every
+fixture, and an authenticated content pack, then produces
+`dist/bhf-dist-<version>-<triple>.tar.gz` plus a `.sha256` sidecar and detached
+`.tar.gz.sig` signature. Every
 tagged release must publish this full bundle; it is not an optional supplement
 to the component artifacts. The tarball includes `install.sh`,
 `bhf-bug-report`, `INSTALL.md`, `LICENSE`, `README.md`,
@@ -138,12 +141,18 @@ dependencies for all sixteen lanes; the default checklist keeps the original
 eight core lanes selected and offers the newer lanes as opt-ins.
 
 ```sh
-./install.sh --non-interactive \
+./install.sh --non-interactive --trust-policy /trusted/operator-policy.json \
   --languages all \
   --targets native,windows,aarch64 \
   --fuzzers builtin,afl \
   --extras build-recovery,sandbox,archives
 ```
+
+Provision the trust policy and public key independently of the bundle, and
+verify the detached archive signature with a separately trusted OpenSSL-based
+verifier before extraction or execution. The release workflow must fail closed
+when protected signing inputs are absent; `--legacy-integrity-only` is an
+explicit unauthenticated compatibility mode, not a release fallback.
 
 The installer runs the smoke fixture by default after install; use `--no-smoke`
 only when the C toolchain is intentionally absent.
@@ -174,8 +183,9 @@ GitHub Artifact Attestations are disabled in the generated workflow because
 GitHub currently rejects attestation persistence for this private
 Tarmo-Technologies organization/repository plan. Until org/repo support is
 available, release integrity is verified with SHA-256 sidecars, and the
-offline distribution verifies its signed content pack during package creation
-and install.
+offline distribution checks its content-pack digests during package creation
+and install. These checks detect changes relative to the manifest but do not
+authenticate its publisher.
 
 When GitHub attestation support is available for the repository, re-enable it by
 setting `github-attestations = true` and adding
@@ -192,7 +202,7 @@ then verify the checksum first:
 sha256sum -c <asset>.sha256
 ```
 
-For binary-only distribution tarballs, also verify the signed content pack after
+For binary-only distribution tarballs, also check the content-pack digests after
 extracting or installing the archive. The installer runs this by default; a
 manual verification looks like:
 

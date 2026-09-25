@@ -315,7 +315,8 @@ BHF provides offline governance commands for enclaves and CI systems:
 bhf policy validate bhf-policy.json --out bhf_work/policy-summary.json
 bhf runners validate runners.json --out bhf_work/runner-summary.json
 bhf runners plan runners.json --queue runner-queue.json --policy bhf-policy.json --out bhf_work/runner-plan.json
-bhf pack create --root packs/current --pack-id rules-2026-06 --item rules:rules/static.json --sign-key offline-root --out packs/current/update-pack.json
+bhf pack keygen --private-key keys/offline-root.der --public-key keys/offline-root.pub
+bhf pack create --root packs/current --pack-id rules-2026-06 --item rules:rules/static.json --signing-key keys/offline-root.der --key-id offline-root --out packs/current/update-pack.json
 bhf pack verify update-pack.json --root packs/current --out bhf_work/pack-verify.json
 bhf sbom path/to/src --out bhf_work/sbom --vuln-db packs/current/cve-db.json --policy bhf-policy.json
 bhf ci . --work-dir bhf_work --policy bhf-policy.json --runner-plan bhf_work/runner-plan.json --dashboard-out bhf_work/ci-dashboard.json
@@ -337,10 +338,17 @@ by policy or capacity remain in `unassigned` with diagnostics, and the command
 exits non-zero unless every job is assigned.
 
 `pack create` builds a deterministic air-gapped update pack manifest from
-`kind:path` items under `--root`, computes item SHA-256 hashes, and can add a
-`sha256-items-v1` offline signature digest via `--sign-key`. `pack verify`
-recomputes hashes under `--root` and enforces update-pack policy constraints.
+`kind:path` items under `--root` and computes item SHA-256 hashes. Use
+`pack keygen` and `--signing-key` with `--key-id` to authenticate the whole
+manifest with Ed25519. The verifying policy must independently supply the
+matching public key in `update_packs.trusted_public_keys`; it can revoke an
+ID through `update_packs.revoked_keys`. The deprecated `--sign-key` option
+only adds a `sha256-items-v1` integrity digest and never authenticates a
+publisher. `pack verify` recomputes hashes under `--root` and enforces
+update-pack policy constraints, including publisher authentication.
 Tampered or missing items make verification exit non-zero.
+The source-tree document `docs/enterprise-pack-authentication.md` specifies
+canonical bytes and key rotation.
 
 `sbom` writes `sbom.json`, `cyclonedx.json`, `vulnerabilities.json`,
 `openvex.json`, and — under the `csv` kind — both a flat one-row-per-component

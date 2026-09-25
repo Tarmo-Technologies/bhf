@@ -37,6 +37,9 @@ Each finding with a source location gets CodeLens actions:
 - `Minimize`
 - `Open repro.adb`
 
-Replay and minimize open a `BHF` terminal in the workspace root. `Open
+Replay and minimize run as process tasks with visible `BHF` task terminals
+and exit status. They use the configured CLI, workspace root, and finding
+under the configured findings directory; the extension does not execute
+command text stored in finding JSON. `Open
 repro.adb` resolves `generated_repro_ada` under the configured findings root
 unless the finding already stores an absolute path.

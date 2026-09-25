@@ -47,6 +47,7 @@ BHF fuzzes sixteen languages — **Ada, C, C++, Rust, Java, Python, Perl, Go, CO
 | nom / chumsky | Parser combinators (IDL) | MIT/Apache-2.0 | **Not used** | Low | The IDL subset parser (`crates/idl_parser`) is hand-rolled; neither crate is linked. |
 | zstd / lz4 | Corpus compression | BSD-3 / BSD-2 | **Candidate** (not in `Cargo.lock`) | Low | Pre-cleared; corpus storage is currently uncompressed. |
 | sha2 | Hashing | MIT/Apache-2.0 | **Core** | Low | Allow. `blake3` is pre-cleared (BSD/CC0/Apache-2.0) but not currently linked. |
+| ring (Rust) | Ed25519 signing and verification for authenticated packs and release artifacts | Apache-2.0 AND ISC | **Core** | Low | Allow. Verify the resolved version and retain its license notices in distribution review. |
 | regex | Diagnostic parsing | MIT/Apache-2.0 | **Core** | Low | Allow. |
 | num_cpus (Rust) | Detect host CPU count for `bhf auto` worker pool | MIT/Apache-2.0 | **Core** | Low | Allow. |
 | rayon (Rust) | Data-parallel static-scan file pipeline (10M-SLOC scale) | MIT/Apache-2.0 | **Core** | Low | Allow. Work-stealing pool bounded to cores-1; deterministic order-preserving collect. |

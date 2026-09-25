@@ -77,7 +77,7 @@ source-generated harnesses and a permissively licensed core.
   bounded agent assistance.
 - [Licensing](./licensing/) — policy profiles, SPDX metadata, and audits.
 - [Release Packaging](./release-packaging/) — distributed archives,
-  checksums, and signed content packs.
+  checksums, and checksum-verified content packs.
 - [Release Checklist](./release-checklist/) — the mandatory full-distribution
   archive contents and resume-documentation gates for every release.
 - [Offline / Air-Gapped Deployment](./offline-deployment/) — installing and

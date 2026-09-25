@@ -30,6 +30,8 @@ Then restart GNAT Studio and use `/Tools/BHF/Refresh Findings`.
 The plugin creates preferences under the `BHF` page:
 
 - `daemon-path`: daemon executable path. Defaults to `bhf-daemon`.
+- `daemon-timeout-seconds`: finite deadline for a findings refresh. Defaults
+  to `30`; the plugin terminates its daemon process on timeout.
 - `cli-path`: BHF CLI executable path. Defaults to `bhf`.
 - `findings-dir`: findings directory loaded through the daemon. Defaults to
   `findings`.
@@ -55,6 +57,9 @@ per-finding menus under `/Tools/BHF/Findings/<id>/` for:
 - Replay this finding
 - Minimize
 - Open repro.adb
+
+Replay invokes the configured CLI with the finding under the configured
+findings directory. Command text stored in finding JSON is not executed.
 
 GNAT Studio supports one action icon per message, so replay gets the inline
 message action and the rest are exposed through menus for this phase. The VS

@@ -1,0 +1,339 @@
+{
+  "bhf_binary_sha256": "2b5e4029fe11f9a3ae586db4231b537d6a8c5f7eab059c2dfa7a7f87e09c75b2",
+  "created_at_utc": "2026-09-24T23:09:32.966198+00:00",
+  "derived_source_hashes_sha256": {
+    "magic_byte": "9d43b19b9ad1faf694cdb7fbe5133075b9d8220f97a3ac50b13c9e8dcf98ebce"
+  },
+  "experiment_id": "smoke-valid-20260924-01",
+  "git_commit": "5528a41df1968e7ec7efb843b9dac12cbe377c8c",
+  "host": {
+    "affinity": "0",
+    "cpu_model": "13th Gen Intel(R) Core(TM) i9-13900H",
+    "logical_cpus_visible": 6,
+    "platform": "Linux-6.8.0-139-generic-x86_64-with-glibc2.39"
+  },
+  "protocol": {
+    "budget_s": 3,
+    "instrumentation": {
+      "afl++": "afl-clang-fast persistent harness + CMPLOG binary (-c)",
+      "builtin": "BHF generated C harness, builtin engine; explicit supplied corpus and RNG seed",
+      "libfuzzer": "clang libFuzzer harness + -use_value_profile=1"
+    },
+    "max_len": 64,
+    "note": "AFL++ and libFuzzer use hand-written ABI adapters around the exact same target_one_input callback; BHF discovers and generates its wrapper. Each engine starts with a byte-identical seed corpus. Per-input timeout is rounded up to whole seconds for BHF/libFuzzer because their interfaces are second-granular. Native execution counters are retained but not compared across engines because counter semantics differ. Candidate crashes are replayed through an independent ASan oracle and counted only for the fixture's expected stack-buffer-overflow. This short smoke runner is not a substitute for a statistically powered real-code benchmark.",
+    "per_input_timeout_ms": 1000,
+    "seed_corpus_shared_bytes": "one 8-byte all-zero seed copied byte-for-byte to every engine/trial corpus",
+    "seed_hex": "0000000000000000",
+    "seed_sha256": "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc",
+    "trials_per_case_engine": 1
+  },
+  "records": [
+    {
+      "artifact_observed_wall_s": null,
+      "artifact_replay": null,
+      "budget_s": 3,
+      "build_commands": [
+        [
+          "/home/ubuntu/github/tarmo/bhf/target/release/bhf",
+          "generate-harness",
+          "/home/ubuntu/github/tarmo/bhf/benchmarks/engine-comparison/results/smoke-valid-20260924-01-runs/magic_byte/trial-1/source/magic_byte.c",
+          "--target",
+          "target_one_input",
+          "--output",
+          "/home/ubuntu/github/tarmo/bhf/benchmarks/engine-comparison/results/smoke-valid-20260924-01-runs/magic_byte/trial-1/builtin/work/generated_harnesses"
+        ],
+        [
+          "/home/ubuntu/github/tarmo/bhf/target/release/bhf",
+          "build",
+          "/home/ubuntu/github/tarmo/bhf/benchmarks/engine-comparison/results/smoke-valid-20260924-01-runs/magic_byte/trial-1/builtin/work",
+          "--harness",
+          "H-C0017"
+        ]
+      ],
+      "build_logs": [
+        "/home/ubuntu/github/tarmo/bhf/benchmarks/engine-comparison/results/smoke-valid-20260924-01-runs/magic_byte/trial-1/builtin/build-generate.log",
+        "/home/ubuntu/github/tarmo/bhf/benchmarks/engine-comparison/results/smoke-valid-20260924-01-runs/magic_byte/trial-1/builtin/build-native.log"
+      ],
+      "build_returncode": 0,
+      "build_timed_out": false,
+      "build_wall_s": 0.7989324470036081,
+      "case": "magic_byte",
+      "command": [
+        "/home/ubuntu/github/tarmo/bhf/target/release/bhf",
+        "fuzz",
+        "/home/ubuntu/github/tarmo/bhf/benchmarks/engine-comparison/results/smoke-valid-20260924-01-runs/magic_byte/trial-1/builtin/work",
+        "--harness",
+        "H-C0017",
+        "--engine",
+        "builtin",
+        "--time",
+        "3s",
+        "--seed-file",
+        "/home/ubuntu/github/tarmo/bhf/benchmarks/engine-comparison/results/smoke-valid-20260924-01-runs/magic_byte/trial-1/builtin/corpus/seed-zero-8",
+        "--rng-seed",
+        "1",
+        "--max-len",
+        "64",
+        "--len-control",
+        "0",
+        "--timeout",
+        "1s",
+        "--workers",
+        "1",
+        "--sandbox",
+        "none",
+        "--print-final-stats"
+      ],
+      "cpu_affinity": "0",
+      "derived_source_sha256": "9d43b19b9ad1faf694cdb7fbe5133075b9d8220f97a3ac50b13c9e8dcf98ebce",
+      "effective_timeout_ms": 1000,
+      "engine": "builtin",
+      "engine_binary_sha256": "866003464dd64db24dc8b5ee59758012a04d48f4b46c01694113bda228e88040",
+      "executions_comparable_across_tools": false,
+      "fuzz_process_wall_s": 3.062341696000658,
+      "fuzz_start_after_process_s": 0.0,
+      "max_len": 64,
+      "native_exec_counter": 125,
+      "native_exec_counter_name": "BHF final-stats executions",
+      "native_metrics": {
+        "coverage_edges": null,
+        "engine_fuzz_s": null,
+        "executions_native": 125,
+        "finding_count": 0,
+        "run_json": null
+      },
+      "outcome": "censored_no_crash",
+      "replay_oracle_binary_sha256": "79b5c591add76a0972f4f60fd5f38bca35c0069708d505b6cff40ee1f9db1f6d",
+      "replay_oracle_build_command": [
+        "clang",
+        "-O1",
+        "-g",
+        "-fno-omit-frame-pointer",
+        "-fsanitize=address,undefined",
+        "/home/ubuntu/github/tarmo/bhf/benchmarks/harnesses/replay_stdin.c",
+        "/home/ubuntu/github/tarmo/bhf/benchmarks/engine-comparison/results/smoke-valid-20260924-01-runs/magic_byte/trial-1/source/magic_byte.c",
+        "-o",
+        "/home/ubuntu/github/tarmo/bhf/benchmarks/engine-comparison/results/smoke-valid-20260924-01-runs/magic_byte/trial-1/replay-oracle"
+      ],
+      "replay_oracle_build_wall_s": 0.27403144699928816,
+      "requested_fuzz_budget_s": 3,
+      "returncode": 0,
+      "right_censor_s": 3.062341696000658,
+      "run_log": "/home/ubuntu/github/tarmo/bhf/benchmarks/engine-comparison/results/smoke-valid-20260924-01-runs/magic_byte/trial-1/builtin/run.log",
+      "secondary_binary_sha256": null,
+      "seed_bytes": 8,
+      "seed_sha256": "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc",
+      "solved": false,
+      "target_callback": "parse_frame",
+      "target_source_sha256": "22570f8d2b67d0e2770b509eb81ae1ba65e6c250e96c8dcb796e88db062a477b",
+      "timeout_ms": 1000,
+      "trial_seed": 1,
+      "ttfc_observation": "poll-detected crash artifact, independently replayed under ASan; 10 ms poll resolution",
+      "ttfc_s": null,
+      "ttfc_source_to_crash_s": null
+    },
+    {
+      "artifact_observed_wall_s": 0.3177001290023327,
+      "artifact_replay": {
+        "error": "Command '['/home/ubuntu/github/tarmo/bhf/benchmarks/engine-comparison/results/smoke-valid-20260924-01-runs/magic_byte/trial-1/replay-oracle']' timed out after 5 seconds",
+        "expected_sanitizer_crash": false,
+        "returncode": null
+      },
+      "budget_s": 3,
+      "build_commands": [
+        [
+          "afl-clang-fast",
+          "-O1",
+          "-g",
+          "-fsanitize=address,undefined",
+          "/home/ubuntu/github/tarmo/bhf/benchmarks/harnesses/afl_persistent.c",
+          "/home/ubuntu/github/tarmo/bhf/benchmarks/engine-comparison/results/smoke-valid-20260924-01-runs/magic_byte/trial-1/source/magic_byte.c",
+          "-o",
+          "/home/ubuntu/github/tarmo/bhf/benchmarks/engine-comparison/results/smoke-valid-20260924-01-runs/magic_byte/trial-1/aflpp/target"
+        ],
+        [
+          "afl-clang-fast",
+          "-O1",
+          "-g",
+          "-fsanitize=address,undefined",
+          "/home/ubuntu/github/tarmo/bhf/benchmarks/harnesses/afl_persistent.c",
+          "/home/ubuntu/github/tarmo/bhf/benchmarks/engine-comparison/results/smoke-valid-20260924-01-runs/magic_byte/trial-1/source/magic_byte.c",
+          "-o",
+          "/home/ubuntu/github/tarmo/bhf/benchmarks/engine-comparison/results/smoke-valid-20260924-01-runs/magic_byte/trial-1/aflpp/target.cmplog"
+        ]
+      ],
+      "build_logs": [
+        "/home/ubuntu/github/tarmo/bhf/benchmarks/engine-comparison/results/smoke-valid-20260924-01-runs/magic_byte/trial-1/aflpp/build-primary.log",
+        "/home/ubuntu/github/tarmo/bhf/benchmarks/engine-comparison/results/smoke-valid-20260924-01-runs/magic_byte/trial-1/aflpp/build-cmplog.log"
+      ],
+      "build_returncode": 0,
+      "build_timed_out": false,
+      "build_wall_s": 0.5794827589998022,
+      "case": "magic_byte",
+      "command": [
+        "afl-fuzz",
+        "-i",
+        "/home/ubuntu/github/tarmo/bhf/benchmarks/engine-comparison/results/smoke-valid-20260924-01-runs/magic_byte/trial-1/aflpp/corpus",
+        "-o",
+        "/home/ubuntu/github/tarmo/bhf/benchmarks/engine-comparison/results/smoke-valid-20260924-01-runs/magic_byte/trial-1/aflpp/afl-output",
+        "-V",
+        "3",
+        "-t",
+        "1000",
+        "-m",
+        "none",
+        "-s",
+        "1",
+        "-G",
+        "64",
+        "-c",
+        "/home/ubuntu/github/tarmo/bhf/benchmarks/engine-comparison/results/smoke-valid-20260924-01-runs/magic_byte/trial-1/aflpp/target.cmplog",
+        "--",
+        "/home/ubuntu/github/tarmo/bhf/benchmarks/engine-comparison/results/smoke-valid-20260924-01-runs/magic_byte/trial-1/aflpp/target"
+      ],
+      "cpu_affinity": "0",
+      "derived_source_sha256": "9d43b19b9ad1faf694cdb7fbe5133075b9d8220f97a3ac50b13c9e8dcf98ebce",
+      "effective_timeout_ms": 1000,
+      "engine": "afl++",
+      "engine_binary_sha256": "f4720176d2e82c73685cc1b0150c77b65855391ecc0e0910c57d276260c020a7",
+      "executions_comparable_across_tools": false,
+      "fuzz_process_wall_s": 3.3163282750028884,
+      "fuzz_start_after_process_s": 0.0,
+      "max_len": 64,
+      "native_exec_counter": 6015,
+      "native_exec_counter_name": "AFL++ fuzzer_stats execs_done",
+      "native_metrics": {
+        "afl_version": "++4.09c",
+        "execs_per_sec_native": 1867.43,
+        "executions_native": 6015,
+        "saved_crashes": 1,
+        "stats_path": "/home/ubuntu/github/tarmo/bhf/benchmarks/engine-comparison/results/smoke-valid-20260924-01-runs/magic_byte/trial-1/aflpp/afl-output/default/fuzzer_stats"
+      },
+      "outcome": "unconfirmed_crash_artifact",
+      "replay_oracle_binary_sha256": "79b5c591add76a0972f4f60fd5f38bca35c0069708d505b6cff40ee1f9db1f6d",
+      "replay_oracle_build_command": [
+        "clang",
+        "-O1",
+        "-g",
+        "-fno-omit-frame-pointer",
+        "-fsanitize=address,undefined",
+        "/home/ubuntu/github/tarmo/bhf/benchmarks/harnesses/replay_stdin.c",
+        "/home/ubuntu/github/tarmo/bhf/benchmarks/engine-comparison/results/smoke-valid-20260924-01-runs/magic_byte/trial-1/source/magic_byte.c",
+        "-o",
+        "/home/ubuntu/github/tarmo/bhf/benchmarks/engine-comparison/results/smoke-valid-20260924-01-runs/magic_byte/trial-1/replay-oracle"
+      ],
+      "replay_oracle_build_wall_s": 0.27403144699928816,
+      "requested_fuzz_budget_s": 3,
+      "returncode": 0,
+      "right_censor_s": null,
+      "run_log": "/home/ubuntu/github/tarmo/bhf/benchmarks/engine-comparison/results/smoke-valid-20260924-01-runs/magic_byte/trial-1/aflpp/run.log",
+      "secondary_binary_sha256": "b1ad4fbfc38e531143d421c56dd93e2a28639542dbff9b144ddc82a1a09d0aab",
+      "seed_bytes": 8,
+      "seed_sha256": "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc",
+      "solved": false,
+      "target_callback": "parse_frame",
+      "target_source_sha256": "22570f8d2b67d0e2770b509eb81ae1ba65e6c250e96c8dcb796e88db062a477b",
+      "timeout_ms": 1000,
+      "trial_seed": 1,
+      "ttfc_observation": "poll-detected crash artifact, independently replayed under ASan; 10 ms poll resolution",
+      "ttfc_s": null,
+      "ttfc_source_to_crash_s": null
+    },
+    {
+      "artifact_observed_wall_s": 6.574413006004761,
+      "artifact_replay": {
+        "error": "Command '['/home/ubuntu/github/tarmo/bhf/benchmarks/engine-comparison/results/smoke-valid-20260924-01-runs/magic_byte/trial-1/replay-oracle']' timed out after 5 seconds",
+        "expected_sanitizer_crash": false,
+        "returncode": null
+      },
+      "budget_s": 3,
+      "build_commands": [
+        [
+          "clang",
+          "-O1",
+          "-g",
+          "-fno-omit-frame-pointer",
+          "-fsanitize=fuzzer,address,undefined",
+          "-L",
+          "/usr/lib/gcc/x86_64-linux-gnu/13",
+          "/home/ubuntu/github/tarmo/bhf/benchmarks/harnesses/libfuzzer.c",
+          "/home/ubuntu/github/tarmo/bhf/benchmarks/engine-comparison/results/smoke-valid-20260924-01-runs/magic_byte/trial-1/source/magic_byte.c",
+          "-o",
+          "/home/ubuntu/github/tarmo/bhf/benchmarks/engine-comparison/results/smoke-valid-20260924-01-runs/magic_byte/trial-1/libfuzzer/target"
+        ]
+      ],
+      "build_logs": [
+        "/home/ubuntu/github/tarmo/bhf/benchmarks/engine-comparison/results/smoke-valid-20260924-01-runs/magic_byte/trial-1/libfuzzer/build.log"
+      ],
+      "build_returncode": 0,
+      "build_timed_out": false,
+      "build_wall_s": 0.21464038999693003,
+      "case": "magic_byte",
+      "command": [
+        "/home/ubuntu/github/tarmo/bhf/benchmarks/engine-comparison/results/smoke-valid-20260924-01-runs/magic_byte/trial-1/libfuzzer/target",
+        "/home/ubuntu/github/tarmo/bhf/benchmarks/engine-comparison/results/smoke-valid-20260924-01-runs/magic_byte/trial-1/libfuzzer/corpus",
+        "-max_total_time=3",
+        "-timeout=1",
+        "-max_len=64",
+        "-seed=1",
+        "-use_value_profile=1",
+        "-print_final_stats=1",
+        "-artifact_prefix=/home/ubuntu/github/tarmo/bhf/benchmarks/engine-comparison/results/smoke-valid-20260924-01-runs/magic_byte/trial-1/libfuzzer/artifacts/"
+      ],
+      "cpu_affinity": "0",
+      "derived_source_sha256": "9d43b19b9ad1faf694cdb7fbe5133075b9d8220f97a3ac50b13c9e8dcf98ebce",
+      "effective_timeout_ms": 1000,
+      "engine": "libfuzzer",
+      "engine_binary_sha256": "e28526e66ec634f02a190e4330a56413ad782d02057d08f76a3ddefe0f58c8fc",
+      "executions_comparable_across_tools": false,
+      "fuzz_process_wall_s": 6.574420592005481,
+      "fuzz_start_after_process_s": 0.0,
+      "max_len": 64,
+      "native_exec_counter": 7904,
+      "native_exec_counter_name": "libFuzzer stat::number_of_executed_units",
+      "native_metrics": {
+        "executions_native": 7904
+      },
+      "outcome": "unconfirmed_crash_artifact",
+      "replay_oracle_binary_sha256": "79b5c591add76a0972f4f60fd5f38bca35c0069708d505b6cff40ee1f9db1f6d",
+      "replay_oracle_build_command": [
+        "clang",
+        "-O1",
+        "-g",
+        "-fno-omit-frame-pointer",
+        "-fsanitize=address,undefined",
+        "/home/ubuntu/github/tarmo/bhf/benchmarks/harnesses/replay_stdin.c",
+        "/home/ubuntu/github/tarmo/bhf/benchmarks/engine-comparison/results/smoke-valid-20260924-01-runs/magic_byte/trial-1/source/magic_byte.c",
+        "-o",
+        "/home/ubuntu/github/tarmo/bhf/benchmarks/engine-comparison/results/smoke-valid-20260924-01-runs/magic_byte/trial-1/replay-oracle"
+      ],
+      "replay_oracle_build_wall_s": 0.27403144699928816,
+      "requested_fuzz_budget_s": 3,
+      "returncode": 1,
+      "right_censor_s": null,
+      "run_log": "/home/ubuntu/github/tarmo/bhf/benchmarks/engine-comparison/results/smoke-valid-20260924-01-runs/magic_byte/trial-1/libfuzzer/run.log",
+      "secondary_binary_sha256": null,
+      "seed_bytes": 8,
+      "seed_sha256": "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc",
+      "solved": false,
+      "target_callback": "parse_frame",
+      "target_source_sha256": "22570f8d2b67d0e2770b509eb81ae1ba65e6c250e96c8dcb796e88db062a477b",
+      "timeout_ms": 1000,
+      "trial_seed": 1,
+      "ttfc_observation": "poll-detected crash artifact, independently replayed under ASan; 10 ms poll resolution",
+      "ttfc_s": null,
+      "ttfc_source_to_crash_s": null
+    }
+  ],
+  "schema_version": 1,
+  "source_hashes_sha256": {
+    "magic_byte": "22570f8d2b67d0e2770b509eb81ae1ba65e6c250e96c8dcb796e88db062a477b"
+  },
+  "tool_versions": {
+    "afl_clang_fast": "Ubuntu clang version 17.0.6 (9ubuntu1)",
+    "afl_fuzz": "afl-fuzz++4.09c based on afl by Michal Zalewski and a large online community",
+    "bhf": "bhf 0.2.32-15-g5528a41-dirty",
+    "clang": "Ubuntu clang version 18.1.3 (1ubuntu1)",
+    "rustc": "rustc 1.94.0 (4a4ef493e 2026-03-02)"
+  }
+}

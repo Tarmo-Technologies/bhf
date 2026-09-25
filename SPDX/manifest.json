@@ -283,6 +283,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "benchmarks/harnesses/replay_stdin.c",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "benchmarks/static/corpus/ada/fp_guards.adb",
       "license": "Apache-2.0"
     },
@@ -2303,6 +2307,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/manual_c_protocol_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/model_cli.rs",
       "license": "Apache-2.0"
     },
@@ -2312,6 +2320,10 @@
     },
     {
       "path": "crates/cli/tests/output_sink.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/pack_auth_cli.rs",
       "license": "Apache-2.0"
     },
     {
@@ -3467,6 +3479,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "docker/compose.yaml",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "docs/cross-compilation.md",
       "license": "Apache-2.0"
     },
@@ -3476,6 +3492,38 @@
     },
     {
       "path": "docs/differential-fuzzing.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/enterprise-container-validation.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/enterprise-daemon-reliability.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/enterprise-engine-benchmark.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/enterprise-harness-gap-plan.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/enterprise-harness-protocol.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/enterprise-pack-authentication.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/enterprise-readiness-program.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/enterprise-service-soak-plan.md",
       "license": "Apache-2.0"
     },
     {
@@ -3511,6 +3559,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "docs/production-readiness-review.md",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "docs/recommended-sweep.md",
       "license": "Apache-2.0"
     },
@@ -3519,7 +3571,23 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "docs/review-daemon-editors.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/review-feature-completeness.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/review-release-ci.md",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "docs/site/architecture.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/site/ato.md",
       "license": "Apache-2.0"
     },
     {
@@ -3560,6 +3628,10 @@
     },
     {
       "path": "docs/site/daemon.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/site/docker.md",
       "license": "Apache-2.0"
     },
     {
@@ -3748,6 +3820,10 @@
     },
     {
       "path": "docs/validation/2026-07-23-zero-fuzz-remediation.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/validation/2026-09-24-docker-sweep.md",
       "license": "Apache-2.0"
     },
     {

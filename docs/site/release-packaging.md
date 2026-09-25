@@ -56,7 +56,7 @@ or `posix_spawn` compiler launches.
 
 | Component prefix | Purpose | Required for |
 |---|---|---|
-| `bhf-dist-*` | All-in-one Linux bundle with `install.sh`, CLI, daemon, both shims, runtimes, signed content, and smoke fixture | Simplest complete Linux or air-gapped install |
+| `bhf-dist-*` | All-in-one Linux bundle with `install.sh`, CLI, daemon, both shims, runtimes, content pack, and smoke fixture | Complete Linux or air-gapped install after external signature verification |
 | `bhf-*` | Main CLI | All CLI workflows |
 | `bhf_runtrace_shim-*` | Runtime virtualisation `LD_PRELOAD` shim | Full `bhf auto` runtime audit/fake-resource support |
 | `bhf_cc_intercept-*` | Build-time compiler interception `LD_PRELOAD` shim | C/C++ `--probe-build` / `--build-command` recovery when builds invoke compilers by absolute path or via `posix_spawn` |
@@ -72,8 +72,10 @@ compiler-interception shim must be directly beside the CLI or explicitly
 configured. Every component archive includes `INSTALL.md` with exact commands.
 For component-installer installs, run each installer you need; installing
 `bhf` alone installs only the CLI. Each archive has a SHA-256 checksum
-sidecar, and the all-in-one distribution carries a signed content pack that is
-verified during package creation and install.
+sidecar, and the all-in-one distribution carries a content pack whose SHA-256
+digests and Ed25519 publisher signature are checked during package creation
+and install when the operator supplies an external trust policy. The checksum
+sidecars alone do not authenticate a publisher.
 
 The release workflow post-processes the main Unix `bhf-installer.sh` so
 RHEL and CentOS 7 users see the required repository, compiler-package, and
@@ -98,7 +100,9 @@ For customer or enclave installs where the build host has source but the
 destination host should receive only an installable package, use:
 
 ```sh
-scripts/package-offline-dist.sh
+scripts/package-offline-dist.sh \
+  --signing-key keys/publisher.der --key-id publisher-v1 \
+  --trusted-public-key keys/publisher.pub
 ```
 
 When CVE DBs or seeds are not provided, the script creates and packages:
@@ -115,8 +119,9 @@ data and rerun the same command when you need SBOM or binary-CVE matching.
 The script builds `cargo build --release --workspace`, stages the CLI, daemon,
 runtrace shim, compiler-interception shim, harness runtime support files, a tiny
 `bhf auto` smoke fixture, the `bhf-bug-report` privacy-scrubbing support
-collector, a signed content pack, and `install.sh`, then writes
-`dist/bhf-dist-<version>-<triple>.tar.gz` plus a SHA-256 sidecar. The
+collector, an Ed25519-signed content pack, and `install.sh`, then writes
+`dist/bhf-dist-<version>-<triple>.tar.gz` plus a SHA-256 sidecar and detached
+`.tar.gz.sig` Ed25519 signature. The
 package does not include the BHF application source tree; it does include
 runtime support files needed to compile generated harnesses on the destination.
 It also includes `README-DIST.md` for package context, `INSTALL.md` for both the
@@ -136,12 +141,20 @@ and the OK/Cancel rows, Space toggles options, and Enter accepts the highlighted
 action. Non-interactive all-features install:
 
 ```sh
-./install.sh --non-interactive \
+./install.sh --non-interactive --trust-policy /trusted/operator-policy.json \
   --languages all \
   --targets native,windows,aarch64 \
   --fuzzers builtin,afl \
   --extras build-recovery,sandbox,archives
 ```
+
+The installer requires an independently provisioned policy pinning the
+publisher public key. The archive, verifier, and key must themselves be
+authenticated out of band before extraction or execution; a same-channel
+checksum sidecar alone cannot establish publisher identity. Check the detached
+signature with a separately trusted `scripts/verify-offline-dist.sh` and the
+publisher public key before extraction. An explicitly produced checksum-only
+pack requires `--allow-legacy-integrity-only` instead; it is not authenticated.
 
 The installer runs the bundled smoke fixture by default after install; pass
 `--no-smoke` only for constrained installs where the C toolchain is intentionally
@@ -185,10 +198,12 @@ uploads the verified artifacts to the GitHub Release.
 ## Air-Gapped Packs
 
 Update packs are local JSON manifests for rules, CVE databases, corpora, and
-other offline content. Create one with deterministic hashes and an optional
-offline signature digest:
+other offline content. Create one with deterministic hashes and an Ed25519
+publisher signature. The legacy `--sign-key` option labels an unkeyed digest
+and does not authenticate the pack:
 
 ```sh
+bhf pack keygen --private-key keys/offline-root.der --public-key keys/offline-root.pub
 bhf pack create --root packs/current \
   --pack-id rules-2026-06 \
   --version 2026.06 \
@@ -196,10 +211,16 @@ bhf pack create --root packs/current \
   --item cve:cve/sbom-cves.json \
   --item cve:cve/binary-cves.json \
   --item corpus:corpus/seeds.tar.gz \
-  --sign-key offline-root \
+  --signing-key keys/offline-root.der --key-id offline-root \
   --out packs/current/update-pack.json
 
 bhf pack verify packs/current/update-pack.json \
   --root packs/current \
   --policy bhf-policy.json
 ```
+
+The verifying host must independently configure
+`update_packs.trusted_public_keys: {"offline-root": "<64-character public key hex>"}`
+and `require_signature: true`. The private key must not be transferred with
+the pack. The source-tree document `docs/enterprise-pack-authentication.md`
+specifies canonical bytes, rotation, revocation, and legacy behavior.

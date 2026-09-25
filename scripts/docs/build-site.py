@@ -10,6 +10,7 @@ from pathlib import Path
 
 
 DEFAULT_BASE_URL = "https://docs.buildharnessfuzz.dev"
+REPO_README_URL = "https://github.com/Tarmo-Technologies/bhf/blob/main/README.md"
 
 
 @dataclass(frozen=True)
@@ -22,6 +23,7 @@ class Page:
 PAGES = [
     Page("index", "index.md", "Overview"),
     Page("install", "install.md", "Install"),
+    Page("docker", "docker.md", "Docker"),
     Page("architecture", "architecture.md", "Architecture"),
     Page("cli", "cli.md", "CLI"),
     Page("auto", "auto.md", "Auto"),
@@ -55,6 +57,7 @@ PAGES = [
     Page("windows", "windows.md", "Windows"),
     Page("daemon", "daemon.md", "Daemon"),
     Page("licensing", "licensing.md", "Licensing"),
+    Page("ato", "ato.md", "ATO / RMF"),
     Page("release-packaging", "release-packaging.md", "Release Packaging"),
     Page("release-checklist", "release-checklist.md", "Release Checklist"),
     Page("offline-deployment", "offline-deployment.md", "Offline Deployment"),
@@ -118,6 +121,9 @@ def rewrite_source_links(markdown: str, page: Page) -> str:
     def replace(match: re.Match) -> str:
         label, target = match.group(1), match.group(2)
         path, marker, fragment = target.partition("#")
+        if path == "../../README.md":
+            suffix = f"#{fragment}" if marker else ""
+            return f"[{label}]({REPO_README_URL}{suffix})"
         source_name = path.removeprefix("./")
         slug = routes.get(source_name)
         if slug is None:

@@ -10,8 +10,8 @@ interception shim (`libbhf_cc_intercept.so`) next to the binaries, where
 
 Prerequisites:
 
-- **Rust** stable toolchain, 1.83 or newer (pinned via `rust-toolchain.toml`, so
-  `rustup` selects it for you).
+- **Rust** stable toolchain, 1.88 or newer (`rust-toolchain.toml` selects the
+  current stable channel, so `rustup` selects it for you).
 - **`make`** and **`clang`/`clang++`** with SanitizerCoverage plus ASan/UBSan
   support — required to build and fuzz C/C++ with the built-in engine.
 
@@ -189,7 +189,7 @@ same individual component.
 
 | Task | Required assets | Optional additions |
 |---|---|---|
-| Complete Linux install with one installer | `bhf-dist-<version>-x86_64-unknown-linux-gnu.tar.gz` and its `.sha256` sidecar; extract it and run `./install.sh` | None; the CLI, daemon, both shims, runtimes, and signed content are included |
+| Complete Linux install with one installer | `bhf-dist-<version>-x86_64-unknown-linux-gnu.tar.gz` and its `.sha256` sidecar; extract it and run `./install.sh` | None; the CLI, daemon, both shims, runtimes, and checksum-verified content are included |
 | Windows CLI | `bhf-installer.ps1`, or `bhf-x86_64-pc-windows-msvc.zip` and its sidecar | `bhf-daemon-installer.ps1` or the daemon ZIP only for IDE/JSON-RPC/MCP use |
 | Basic Linux CLI, scan, build, and fuzz | `bhf-installer.sh`, or `bhf-x86_64-unknown-linux-gnu.tar.xz` and its sidecar | Add the two Linux shims below for full runtime behavior and complex C/C++ build recovery |
 | Full Linux `bhf auto` | The Linux CLI plus `bhf_runtrace_shim-installer.sh` (or its archive and sidecar) | Add `bhf_cc_intercept` when testing C/C++ projects with real build systems |
@@ -331,7 +331,7 @@ bhf runs with no network access and never auto-updates. To install or update
 on a disconnected machine, build a binary-only offline tarball
 (`scripts/package-offline-dist.sh`), transfer published/source-built binaries, or
 transfer the source and build on the offline host — plus stage the harness
-build/fuzz toolchains and signed content packs.
+build/fuzz toolchains and checksum-verified content packs.
 [offline-deployment.md](./offline-deployment.md) is the full operational guide:
 the binary-only package flow, the build-vs-transfer decision, exactly which
 artifacts to move, glibc/arch matching for the runtrace shim, the `cargo vendor`

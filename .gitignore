@@ -32,3 +32,4 @@ crates/*/bhf_work/
 /docker/corpus/
 /docker/results/
 /docker/sbom/
+Authorization.md

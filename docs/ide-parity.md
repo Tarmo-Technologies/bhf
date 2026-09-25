@@ -10,11 +10,11 @@ use `bhf-daemon` and the `bhf` CLI.
 | Configure daemon path | `bhf.daemonPath` | `BHF/daemon-path` | Defaults to `bhf-daemon`. |
 | Configure CLI path | `bhf.cliPath` | `BHF/cli-path` | Defaults to `bhf`. |
 | Configure findings directory | `bhf.findingsDir` | `BHF/findings-dir` | Relative paths resolve from the workspace/project root. |
-| Configure harness override | `bhf.harnessPath` | `BHF/harness-path` | Optional; replay can use finding-provided command when unset. |
+| Configure harness override | `bhf.harnessPath` | `BHF/harness-path` | Optional; both editors build replay arguments from the configured CLI and finding ID, ignoring command text stored in a finding. |
 | Configure minimize strategy | `bhf.minimizeStrategy` | `BHF/minimize-strategy` | Supports `bytes` and `typed`. |
 | Refresh findings | Command palette action | `/Tools/BHF/Refresh Findings` | Both call daemon `findings`. |
 | Finding source display | Diagnostics | Locations/messages | Both use handler, then last breadcrumb, then explicit raise. |
-| Replay finding | CodeLens and command | Message action and menu action | Both shell out to `bhf replay`. |
+| Replay finding | CodeLens and command | Message action and menu action | VS Code uses a process task; GNAT Studio uses `GPS.Process`. Both pass arguments to `bhf replay`. |
 | Minimize finding | CodeLens and command | Menu action | GNAT Studio exposes replay as the single inline message action; minimize is under the finding menu. |
 | Open `repro.adb` | CodeLens and command when generated | Menu action when generated | Both hide the action when `generated_repro_ada` is absent. |
 | Daemon lifecycle | Long-lived stdio client restarted on config change | One daemon subprocess per refresh | GNAT Studio's Python integration keeps the lifecycle simpler and avoids background process state. |

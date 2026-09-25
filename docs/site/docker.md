@@ -126,8 +126,10 @@ real translation-unit flags. bhf uses it automatically — you do **not** need
 ## The 32-project sweep
 
 The image bakes a reproducible validation sweep: two small, pinned, real
-projects per language (32 total). It proves every lane can build, harness, and
-fuzz inside the container.
+projects per language (32 total). A passing sweep demonstrates observed entry
+into at least one non-stub target in every selected project. It does not prove
+complete API coverage, useful coverage feedback in every lane, or competitive
+fuzzing effectiveness.
 
 ```sh
 docker run --rm --shm-size=2g --cap-add=SYS_PTRACE \
@@ -140,6 +142,21 @@ a per-project work dir. Tune the budget with `BHF_PER_TARGET_TIME`,
 `BHF_MAX_TARGETS`, `BHF_CAMPAIGN_TIME`, `BHF_JOBS`, and filter languages with
 `BHF_LANGS="c cpp rust"`. The corpus manifest is
 `/usr/local/share/bhf/sweep-manifest.tsv`; override with `BHF_SWEEP_MANIFEST`.
+Results must be a new or empty directory: reruns refuse to overwrite evidence.
+Choose a new `BHF_SWEEP_RESULTS` for each run. Empty selections, partial or
+malformed JSON reports, missing/dirty/unpinned checkouts, stub-only campaigns,
+unentered targets and timeouts fail the gate. The machine-readable `auto/run.json`
+is authoritative, not text-summary keyword matching. Reported edges sum each
+entered target's peak counter (not a global union); findings count per-pass
+observations, not unique bugs. Zero feedback remains visible in the report.
+
+Corpus fetching verifies existing clones against the full manifest commit and
+rejects modified or extra inputs rather than deleting them. Build recovery may
+modify a checkout, so repeated validation may require a fresh `BHF_CORPUS` as
+well. Custom manifests require six tab-separated columns, unique safe identifiers,
+full lowercase commit hashes and relative in-tree source paths; use `-` for
+unused source paths or flags. These checks do not sandbox target build commands:
+run untrusted projects only inside an appropriately isolated container.
 
 ## Licensing & redistribution
 

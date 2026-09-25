@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
+# Per-trial binaries, generated corpora, and engine artifact trees are local
+# experiment output; keep small JSON summaries and hand-curated reports visible.
+/results/*-runs/
