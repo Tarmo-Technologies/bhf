@@ -171,6 +171,8 @@ The native Rust lane (Phase 1) emits a `fuzz/` cargo-fuzz crate whose generated 
 
 **Non-goals**: no paid Ada compiler, no GNATfuzz/GNATcoverage/PolyORB requirement, no full-build requirement, no live ORB, crashes are not the only bug class, raw IIOP fuzzing is not first-class.
 
+> **Update (HDF-7, 2026-09-25).** "Raw IIOP fuzzing is not first-class" still holds as a product non-goal, but it is no longer *absent*: the `iiop` crate now has a library-level GIOP request **encode → decode → servant dispatch** round-trip (`crates/iiop/src/{encode,dispatch}.rs`, proven by `dispatch::tests::encoded_request_roundtrips_and_dispatches_to_servant`). This is an in-process, pure-function path a harness can call — there is still **no live ORB, no IIOP-over-TCP driver, and no wired `bhf` subcommand** that feeds it corpus bytes. Wiring it to the engine's binary-framed input model is the tracked HDF-7 follow-up (see `docs/high-demand-fuzzing-roadmap.md`).
+
 ---
 
 ## 3. High-level architecture
@@ -1964,7 +1966,7 @@ end Main;
 ## 24. Open items for v1.1+
 
 1. Raw IIOP mode (research-lab graduation).
-   - Foundation started: `iiop` crate for GIOP message headers, whole-message framing, service contexts, GIOP 1.2 request headers, and CDR primitive/string decoding. This does not add live ORB or network fuzzing yet.
+   - Foundation started: `iiop` crate for GIOP message headers, whole-message framing, service contexts, GIOP 1.2 request headers, and CDR primitive/string decoding. **Extended (HDF-7):** a CDR/GIOP **encoder** (`encode.rs`) and an in-process request **dispatch to a fake servant** (`dispatch.rs`) now close the encode → decode → dispatch loop as a library capability. This still does not add a live ORB, an IIOP-over-TCP transport, or a wired `bhf` subcommand — those remain the graduation work.
 2. Daemon multi-tenant authentication and RBAC.
 3. GNAT Studio plug-in feature parity with VS Code plug-in.
 4. Container/sandbox harness execution (firejail/bwrap) by default.

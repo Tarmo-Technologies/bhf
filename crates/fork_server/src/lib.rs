@@ -1,27 +1,43 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! AFL fork-server wire-protocol implementation.
+//! AFL fork-server wire-protocol — **unused reference implementation**.
 //!
-//! The fork-server protocol is how AFL drives a target without
-//! re-execing the whole binary per input: the parent (fuzzer)
-//! and child (target) communicate over two pipes — a "control"
-//! pipe (parent -> child) and a "status" pipe (child -> parent).
-//! Each iteration the parent writes a 4-byte ping to the control
-//! pipe; the child forks a worker, reads the input, runs one
-//! iteration, and writes the worker pid + exit status back to the
-//! status pipe.
+//! **Status (roadmap CC-2).** This crate has **no consumers** anywhere in the
+//! workspace: nothing depends on it in `Cargo.toml` and no crate `use`s it. It
+//! is a self-contained, tested reference for the classic AFL fd-198/199
+//! fork-server handshake, kept for documentation value; it is **not** on any
+//! live fuzzing path.
 //!
-//! AFL hard-codes fds 198 (control read by child) and 199 (status
-//! write by child) so the target's child process can rely on them
-//! without negotiation. bhf's parent-side allocator follows
-//! the same convention by default but `Server::new_with_fds`
-//! accepts arbitrary fds for testing.
+//! The two mechanisms that actually drive a persistent target one input at a
+//! time in BHF today, and which supersede this crate, are:
 //!
-//! Tracks issue #293. The C harness template needs to call
-//! `child_handshake` + `child_loop` for this to be useful end-to-end;
-//! that template change is intentionally out of scope for this
-//! crate (it ships under harness_gen + a follow-up linker hook
-//! in fuzz_engine_builtin).
+//! * **The engine's `BHF_FRAMED` loop** — the builtin engine's own persistent
+//!   driver (`crates/cli/src/fuzz.rs`, the `ForkServer` struct), which speaks a
+//!   framed `{len, bytes}` protocol over the harness's stdin/stdout rather than
+//!   the AFL control/status pipes. This is the path every native lane (C, Ada,
+//!   Go, Java, Python, Lua, ...) uses.
+//! * **`target_transport::AgentTransport`** (HDF-1) — the off-host equivalent:
+//!   the same framed `{u32 len, bytes}` request → `{status, edge-delta, fault}`
+//!   contract carried over any `Read + Write` channel (TCP / serial / stdio) to
+//!   an on-target agent.
+//!
+//! Both use a length-framed stream, not raw fds 198/199, so this AFL-native
+//! implementation was never wired in. It is retained as a reference for AFL
+//! wire-format interop rather than removed, but it advertises **no** end-to-end
+//! capability of its own.
+//!
+//! ## Protocol (for reference)
+//!
+//! AFL drives a target without re-execing the whole binary per input: the parent
+//! (fuzzer) and child (target) communicate over two pipes — a "control" pipe
+//! (parent -> child) and a "status" pipe (child -> parent). Each iteration the
+//! parent writes a 4-byte ping to the control pipe; the child forks a worker,
+//! reads the input, runs one iteration, and writes the worker pid + exit status
+//! back to the status pipe. AFL hard-codes fds 198 (control read by child) and
+//! 199 (status write by child) so the target's child process can rely on them
+//! without negotiation ([`DEFAULT_CTRL_FD`] / [`DEFAULT_STATUS_FD`]); the
+//! [`Parent`] / [`Child`] handles here are generic over any [`Read`]/[`Write`]
+//! channel so the handshake can be unit-tested without those fixed fds.
 
 use std::io::{Read, Write};
 

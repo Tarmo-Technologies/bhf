@@ -2,11 +2,24 @@
 
 //! Ada state-machine inference.
 //!
-//! Walks Ada source via tree-sitter and extracts a `StateMachine`
+//! Walks Ada source via tree-sitter and extracts a [`StateMachine`]
 //! per `protected type` and `task type` declaration. Entries
 //! become transition keys; barrier expressions become per-entry
-//! guards. Used by stateful fuzzing (#302) to feed an AFLNet-style
-//! state vector to the engine.
+//! guards.
+//!
+//! # Reachability (honest status, roadmap CC-2 / HDF-7)
+//!
+//! * **Wired today:** the inferred [`StateMachine`] is CLI-reachable through the
+//!   `bhf extract-state-machines` subcommand (`crates/cli/src/extract_state_machines.rs`),
+//!   which prints it as JSON via [`infer_from_source`]. That is the only live
+//!   consumer.
+//! * **Typed API available, engine integration is a noted follow-up:** the
+//!   [`adapter::ProtocolStateGraph`] projection (HDF-7, deliverable 3) exposes
+//!   states/transitions in the shape an AFLNet-style input scheduler would
+//!   consume, but it is **not** wired into the engine's input scheduler — no
+//!   engine code orders inputs by this graph yet. It is the seam that
+//!   integration would consume, not a live stateful-fuzzing path. See
+//!   [`adapter`] for details.
 //!
 //! Strategic note: Ada protected types and task types declare
 //! state machines syntactically. No other mainstream fuzzer can

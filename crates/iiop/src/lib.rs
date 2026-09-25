@@ -1,5 +1,46 @@
 // SPDX-License-Identifier: Apache-2.0
 
+//! GIOP/CDR/IIOP codec with an in-process request-dispatch path (HDF-7).
+//!
+//! # Capability
+//!
+//! This crate provides an **in-process GIOP request encode → decode → servant
+//! dispatch** round-trip, entirely as pure functions over byte slices (no
+//! sockets, no live ORB):
+//!
+//! * [`cdr`] — CDR primitive/string reader ([`cdr::CdrReader`]) with
+//!   GIOP-message-relative alignment.
+//! * [`giop`] — GIOP 1.0/1.1/1.2 message/header framing, service contexts, IORs,
+//!   request/reply/locate/fragment bodies.
+//! * [`idl_args`] — decode a request body into IDL-typed argument values against
+//!   an [`idl_args::IdlOperationCatalog`].
+//! * [`encode`] (HDF-7) — the previously-missing inverse: [`encode::CdrWriter`]
+//!   and [`encode::encode_request_1_2`] turn structured values into a well-formed
+//!   GIOP 1.2 `Request` frame that decodes back byte-for-byte.
+//! * [`dispatch`] (HDF-7) — [`dispatch::Dispatcher`] wires decode → IDL-typed
+//!   args → a [`dispatch::Servant`] call ([`dispatch::Dispatcher::handle_frame`]),
+//!   so raw fuzz bytes that form a valid GIOP request reach a servant operation.
+//!   [`dispatch::InMemoryTransport`] models a queue of pending frames for the
+//!   stateful case, in memory.
+//!
+//! Proof of the end-to-end round trip is the in-crate test
+//! `dispatch::tests::encoded_request_roundtrips_and_dispatches_to_servant` (and
+//! its big-endian sibling `big_endian_string_request_roundtrips`): a request the
+//! encoder builds decodes through [`giop::read_request_1_2`] and dispatches to a
+//! fake servant with the expected IDL-typed arguments.
+//!
+//! # What this is NOT (honest scope)
+//!
+//! * **Library capability only — not CLI-reachable.** No `bhf` subcommand
+//!   consumes this crate; it is not listed as a dependency of any other crate
+//!   (verified: only `crates/iiop/Cargo.toml` names it). A fuzz harness can call
+//!   [`dispatch::Dispatcher::handle_frame`] directly, but there is no wired
+//!   `bhf fuzz`/discovery path that feeds it corpus bytes yet. Wiring it to the
+//!   engine's binary-framed input model is the remaining HDF-7 follow-up.
+//! * **No live ORB and no network transport.** The "transport" is an in-memory
+//!   frame queue; there is no socket/IIOP-over-TCP driver here. Marshalling
+//!   fidelity is bounded to what [`cdr`]/[`giop`] implement, not a full ORB.
+
 pub mod cdr;
 pub mod dispatch;
 pub mod encode;

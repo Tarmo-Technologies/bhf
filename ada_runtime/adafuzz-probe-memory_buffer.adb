@@ -1,4 +1,22 @@
 --  SPDX-License-Identifier: Apache-2.0
+--
+--  Embedded coverage emitter: MEMORY_BUFFER backend.
+--
+--  Fills a fixed 64 KiB in-RAM ring (adafuzz_probe_memory_buffer, with the
+--  companion _write / _wrapped / _capacity symbols) with the BHF_EVENTS
+--  tag-length edge/event stream. This is a coverage *emitter* only; it has no
+--  filesystem or host channel of its own.
+--
+--  Consumer (roadmap CC-2 / HDF-1, HDF-1b): the host-side reader that
+--  reconstructs the in-order stream out of target memory is
+--  target_transport::coverage::MemoryBufferReader
+--  (crates/target_transport/src/coverage.rs), honoring the _wrapped flag; the
+--  gdb / qemu-system memory-read backends of HDF-1b's transport fuzz loop
+--  (crates/cli/src/transport_fuzz.rs, `bhf fuzz --target-transport ...
+--  --transport-coverage-map`) drive it through the TargetTransport seam. This
+--  emitter is therefore no longer a dead-end. The *live* readback is
+--  DEPENDENCY-gated on a debug-probe / emulator memory API; in-tree the reader
+--  and its wrap case are proven against captured ring images.
 pragma Ada_95;
 with Ada.Streams;
 with Interfaces; use Interfaces;

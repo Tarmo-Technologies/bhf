@@ -74,6 +74,47 @@ The consequence: as shipped, a target must run as a **host Linux child
 process** (natively, sandboxed, or under qemu-user/wine) to be fuzzed with
 feedback. A VxWorks image, a Cortex-M board, or a `qemu-system` guest cannot be.
 
+## 1a. Delivered status (branch `rtos-radar-fuzzing`, 2026-09-25)
+
+This reconciles the plan below to what is **actually built on this branch**. A
+track is **software-complete** when its in-tree acceptance criteria pass under
+`cargo test` (against mocks/fixtures, no external resources); its **gated
+validation** — the step that needs real hardware, a live emulator, or a
+proprietary toolchain — is listed separately and is *unproven until run* against
+that resource, with evidence to be recorded under `docs/validation/` (see §5,
+§6). Software-complete is **never** a claim of validated on-target capability.
+Where a track has a purely *library* capability that is not yet reachable from a
+`bhf` command, that is called out explicitly rather than counted as a live
+feature.
+
+| Track | Commit | Software-complete (in-tree) | Evidence — crate · representative test | Gated / follow-up (unproven until run) |
+|---|---|---|---|---|
+| CC-1 | `a0ca452` | yes | `crates/actionability/src/fidelity.rs`; JSON schema `docs/finding-report-fields.md` (`fidelity` block) | — (in-tree only) |
+| HDF-1 | `80d5df3` | yes | `crates/target_transport` — `agent::tests::agent_session_delivers_input_and_surfaces_monotonic_edges_and_fault`; `coverage.rs` Semihosting/MemoryBuffer readers (incl. wrap case); `host::HostChildTransport` | real board / debug probe via `GdbRemoteTransport` driving live coverage |
+| HDF-1b | `307a42e` | yes | `crates/cli/src/transport_fuzz.rs` — `transport_path_is_off_by_default_and_opt_in` + spec-parser tests, driven over `target_transport::testsupport` mocks | live agent (TCP/serial) / gdbstub / `qemu-system` backends dialed by `--target-transport` |
+| HDF-2 | `229105a` | yes | `crates/cli/src/transport_fault.rs` — backend-neutral `Fault`→finding mapping; cross-build compiler guards | on-emulator Cortex-M exception-vector hook reporting a hard-fault |
+| HDF-3 | `dbebbf7` | yes | `crates/type_model/src/abi.rs` — `struct_image_is_emitted_in_target_byte_order`, `host_abi_matches_the_x86_64_lab_host`; `crates/cli/src/auto/cross_target.rs` PPC/MIPS/SPARC triples | BE-only bug found under `qemu-ppc64` but not on the LE host (needs cross toolchain + emulator) |
+| HDF-4 | `89b9fb8` | yes | `crates/target_transport/src/fullsystem.rs` — `arm_performs_qmp_handshake_gdb_attach_and_baseline_snapshot`, `run_input_loads_snapshot_delivers_input_and_reads_ring_coverage`, `same_input_twice_is_deterministic` (scripted QMP + gdbstub mocks) | live `qemu-system-*` image with a planted handler. Renode = documented follow-up; Nyx stub **retired** (`nyx_adapter` — `not_implemented_error_names_the_full_system_replacement`) |
+| HDF-5 | `d31a824` | yes | `crates/target_rank/src/c_rank.rs` — `intconnect_isr_and_msgqueue_consumer_ranked_reachable_not_unproven`, `mmio_polled_register_reader_is_a_channel_consumer`; `crates/harness_gen/src/c_generate.rs` — `peripheral_reader_harness_drives_a_fuzz_controlled_read_sequence` | — (in-tree only) |
+| HDF-6 | `94ad2c4` | yes | `crates/c_stub_gen/src/lib.rs` — `fuzz_driven_stub_reaches_a_return_value_gated_branch_e2e`; `crates/bhf_runtrace_shim/src/{fakes/fuzz_input.rs,hooks/rtos.rs}` (fuzz-driven RTOS channels + MMIO fill) | bare-metal MMIO interception on a real cross build (the host stub-isolation lane is in-tree) |
+| HDF-7 | `dc47e31` | yes (library) | `crates/fuzz_engine/builtin/src/binframe.rs` — `fixup_reaches_past_crc_gate_but_naive_mutation_does_not`, `length_and_crc_are_computed_on_encode`; `crates/iiop/src/dispatch.rs` — `encoded_request_roundtrips_and_dispatches_to_servant`; `crates/ada_state_machine/src/adapter.rs` — `graph_exposes_states_and_transitions_for_a_protected_type` | **follow-up (unbuilt, not hardware-gated):** IIOP dispatch + `ProtocolStateGraph` are library APIs, not wired into any `bhf` subcommand / engine input-scheduler; live socket/DDS transport not built |
+| HDF-8 | `86aa8e6` | yes | `crates/cli/src/fuzz.rs` — `deadline_oracle_reports_a_slow_input_as_a_bhf555_finding_but_not_a_fast_one` (BHF-555); `crates/bhf_runtrace_shim/src/hooks/sched.rs` + `crates/bhf_runtrace_shim/tests/schedule_perturbation.rs` (cooperative perturbation + pinned replay) | exhaustive interleaving is intractable — claims bounded to "found within budget" (§5) |
+| CC-2 | this branch (uncommitted) | yes | Honesty audit: `crates/fork_server/src/lib.rs` documented as an unused reference impl (superseded by `AgentTransport` + the engine `BHF_FRAMED` loop); `crates/iiop/src/lib.rs` + `crates/ada_state_machine/src/lib.rs` crate docs state library-vs-CLI reachability honestly; `ada_runtime/adafuzz-probe-{semihosting,memory_buffer}.adb` documented as reader-consumed; `ROADMAP.md` IIOP note reconciled; this table | — (documentation reconciliation; no new capability) |
+
+**Honest carve-outs.**
+
+- **HDF-7 is library-complete, not CLI-wired.** The computed-field binary
+  framing (`binframe`) is consumed by the builtin engine, but the `iiop`
+  encode/dispatch path and `ada_state_machine::ProtocolStateGraph` are typed
+  APIs a caller invokes directly; no `bhf` subcommand or engine input-scheduler
+  feeds them yet. This is a follow-up, not a validated end-to-end capability.
+- **HDF-1 / 1b / 2 / 3 / 4 live backends are DEPENDENCY-gated.** The transports
+  build and are mock-proven end-to-end in-tree; dialing a real board, probe, or
+  `qemu-system` guest is unproven until run against that resource (§5, §6).
+- **HDF-4 Nyx is retired, not finished.** `nyx_adapter` is scaffolding
+  superseded by `FullSystemTransport`; it collects zero coverage and is on no
+  live path (CC-2).
+
 ## 2. Design principles and non-goals
 
 **Principles.**
@@ -493,6 +534,39 @@ users and the roadmap are not misled.
 **Acceptance criteria.** In-tree: no crate advertises an end-to-end capability
 it does not have; each formerly-dead component is either wired (with a test
 proving reachability) or documented as scaffolding with the tracking track named.
+
+**Delivered (2026-09-25).** Each of the five is resolved by the honest,
+low-risk option — three are now genuinely wired (with a reachability test), two
+are documented as scaffolding naming the completing track:
+
+- **`iiop`** — *wired (library).* HDF-7 added an encoder + servant dispatch, so
+  the decoder is reachable: fuzz bytes → GIOP request → decode → servant call,
+  proven by `iiop::dispatch::tests::encoded_request_roundtrips_and_dispatches_to_servant`.
+  Its crate docs (`crates/iiop/src/lib.rs`) now state this is a **library**
+  capability with **no** `bhf` subcommand feeding it, and no live ORB/network —
+  CLI wiring is the named HDF-7 follow-up.
+- **Semihosting / memory-buffer emitters** — *wired.* HDF-1's
+  `target_transport::coverage::{SemihostingReader, MemoryBufferReader}` consume
+  them, and HDF-1b's `--target-transport` loop drives that end-to-end
+  (`crates/target_transport/src/coverage.rs`; the wrap case is tested). Each
+  `.adb` now documents its consumer; the *live* channel is DEPENDENCY-gated.
+- **Nyx `nyx-engine` stub** — *retired* in favor of `FullSystemTransport`
+  (HDF-4): `nyx_adapter` crate docs mark it superseded scaffolding, and
+  `NyxError::NotImplemented` names the replacement
+  (`not_implemented_error_names_the_full_system_replacement`).
+- **`fork_server` crate** — *documented as scaffolding.* Confirmed to have **no**
+  consumers (no `Cargo.toml` dep, no `use fork_server`; the CLI's own
+  `ForkServer` in `crates/cli/src/fuzz.rs` is a separate framed-stdin
+  implementation). Superseded by `target_transport::AgentTransport` (framed) and
+  the engine's `BHF_FRAMED` loop; its `lib.rs` now says so and advertises no
+  end-to-end capability. Kept as an AFL wire-format reference rather than removed.
+- **`ada_state_machine` extractor** — *typed API + honest doc.* HDF-7 added the
+  `ProtocolStateGraph` adapter (tested projection); the crate docs
+  (`crates/ada_state_machine/src/lib.rs`, `adapter.rs`) state that only the
+  `bhf extract-state-machines` JSON subcommand consumes inference today and that
+  engine-scheduler integration of the graph is the named follow-up.
+
+See §1a for the full per-track delivered-status table.
 
 ---
 
