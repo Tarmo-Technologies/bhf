@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Temporary read-only validation of the actual legacy CI entry point.
 name: Scheduler reliability validation
 on:
   push:
@@ -6,30 +7,29 @@ on:
 permissions:
   contents: read
 jobs:
-  legacy-tools:
+  legacy:
+    name: EL7 scheduler, signed installer, and release ABI
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 90
     steps:
-      - name: Inspect only the pinned image tool locations
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Validate with explicitly provisioned crypto and archive tools
+        shell: bash
         run: |
           set -euo pipefail
-          docker run --rm quay.io/pypa/manylinux2014_x86_64@sha256:0d25b049964b2549b83384036abdff06789a8c0b1e9ff003ec80f0d531f79e50 \
-            bash -lc '
-              set -euo pipefail
-              openssl version
-              ls -ld /opt/_internal/openssl* /usr/local/ssl* 2>/dev/null || true
-              find /opt /usr/local -type f -name openssl -print
-              for candidate in /opt/_internal/openssl*/bin/openssl /usr/local/bin/openssl /usr/local/ssl/bin/openssl; do
-                if [[ -x "$candidate" ]]; then
-                  printf "CANDIDATE: %s\n" "$candidate"
-                  "$candidate" version
-                fi
-              done
-            ' 2>&1 | tee el7-tools.log
+          mkdir -p scheduler-evidence
+          git rev-parse HEAD > scheduler-evidence/revision.txt
+          docker run --rm --volume "$GITHUB_WORKSPACE:/io" --workdir /io \
+            --env CARGO_HOME=/tmp/cargo --env RUSTUP_HOME=/tmp/rustup \
+            --env CARGO_TARGET_DIR=/io/target/rhel7 \
+            quay.io/pypa/manylinux2014_x86_64@sha256:0d25b049964b2549b83384036abdff06789a8c0b1e9ff003ec80f0d531f79e50 \
+            bash scripts/ci/run-el7-validation.sh 2>&1 | tee scheduler-evidence/el7.log
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: ${{ always() }}
         with:
-          name: el7-tools
-          path: el7-tools.log
+          name: scheduler-el7
+          path: scheduler-evidence/
           if-no-files-found: error
           retention-days: 14
