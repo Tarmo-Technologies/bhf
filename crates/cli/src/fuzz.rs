@@ -261,6 +261,19 @@ pub struct FuzzArgs {
     #[arg(long = "timeout", value_parser = parse_duration)]
     pub timeout: Option<Duration>,
 
+    /// Real-time response deadline (the timing oracle, off by default). Distinct
+    /// from `--timeout`, which is the coarse hang-kill backstop that DISCARDS a
+    /// slow unit: `--deadline` is a "must respond within D" budget, and any input
+    /// whose host-side wall-clock execution exceeds it is recorded as a *finding*
+    /// (BHF-555, a CWE-400 timing/availability failure) rather than silently
+    /// skipped. Use it for watchdog / RTOS / radar targets where overrunning a
+    /// budget is a fault, not just "it hung". When unset, hang handling is
+    /// byte-for-byte unchanged. Accepts the same duration spec as `--time`
+    /// (e.g. 250ms is not accepted — use whole seconds like `1s`, or set the
+    /// `BHF_DEADLINE_MS` env for sub-second budgets).
+    #[arg(long = "deadline", value_parser = parse_duration)]
+    pub deadline: Option<Duration>,
+
     /// Print a final-stats line at the end of the run (libFuzzer's
     /// `-print_final_stats`): executions, exec/s, new vs duplicate corpus
     /// signatures, findings, and elapsed time.
@@ -851,6 +864,10 @@ struct PreparedFuzzRun {
     max_len: usize,
     len_control: usize,
     per_input_timeout: Duration,
+    /// Real-time response deadline (the timing oracle). `None` (default) leaves
+    /// hang handling unchanged; `Some(d)` records any host-side execution longer
+    /// than `d` as a BHF-555 finding instead of discarding it as a slow unit.
+    deadline: Option<Duration>,
     print_final_stats: bool,
     rss_limit_mb: usize,
 }
@@ -1045,6 +1062,7 @@ pub(crate) fn run_one_target_programmatic_with_runner(
         iterations: Some(iterations),
         time: time_budget,
         timeout: resolve_env_timeout(),
+        deadline: resolve_env_deadline(),
         max_len: resolve_env_max_len(largest_seed),
         len_control: DEFAULT_LEN_CONTROL,
         print_final_stats: false,
@@ -1112,6 +1130,7 @@ pub(crate) fn run_afl_plus_plus_programmatic(
         iterations: Some(0),
         time: time_budget,
         timeout: None,
+        deadline: None,
         max_len: DEFAULT_MAX_LEN,
         len_control: DEFAULT_LEN_CONTROL,
         print_final_stats: false,
@@ -1427,6 +1446,7 @@ fn prepare(args: FuzzArgs) -> Result<PreparedFuzzRun, String> {
         max_len: args.max_len.max(1),
         len_control: args.len_control,
         per_input_timeout: args.timeout.unwrap_or(PER_INPUT_TIMEOUT),
+        deadline: args.deadline,
         print_final_stats: args.print_final_stats,
         rss_limit_mb: args.rss_limit_mb,
     })
@@ -2400,6 +2420,7 @@ fn run_builtin_with_progress(
                         prepared.per_input_timeout,
                         prepared.rss_limit_mb,
                         protocol,
+                        prepared.deadline,
                     )?;
                     fork_server = ForkServer::spawn(
                         &prepared.runner,
@@ -2421,6 +2442,7 @@ fn run_builtin_with_progress(
                 prepared.per_input_timeout,
                 prepared.rss_limit_mb,
                 protocol,
+                prepared.deadline,
             )?
         };
         executions += 1;
@@ -2531,6 +2553,7 @@ fn run_builtin_with_progress(
                 &prepared.extra_env,
                 prepared.per_input_timeout,
                 prepared.rss_limit_mb,
+                prepared.deadline,
             )?;
             run.sanitizer = fresh.sanitizer;
         }
@@ -2672,6 +2695,7 @@ fn run_builtin_with_progress(
                         &prepared.extra_env,
                         prepared.per_input_timeout,
                         prepared.rss_limit_mb,
+                        prepared.deadline,
                     )
                 {
                     let id = emitter
@@ -3777,6 +3801,7 @@ fn run_c_libfuzzer_single_input(
     extra_env: &[(String, String)],
     per_input_timeout: Duration,
     rss_limit_mb: usize,
+    deadline: Option<Duration>,
 ) -> Result<HarnessRun, String> {
     let tmp_dir = work_dir.join("fuzz_inputs");
     fs::create_dir_all(&tmp_dir)
@@ -3789,6 +3814,11 @@ fn run_c_libfuzzer_single_input(
     fs::write(&input_path, input)
         .map_err(|error| format!("write fuzz input '{}': {error}", input_path.display()))?;
 
+    // Measure the host-side wall clock for the deadline oracle (deliverable 1).
+    // `run_with_timeout` already enforces `per_input_timeout` as the hang-kill
+    // backstop; the deadline oracle is a *finer* "must respond within D" budget
+    // (D <= per_input_timeout) whose overrun is a finding rather than a discard.
+    let exec_start = Instant::now();
     let output = run_with_timeout(
         runner.harness_path(),
         &input_path,
@@ -3798,9 +3828,45 @@ fn run_c_libfuzzer_single_input(
         rss_limit_mb,
         runner.qemu_prefix(),
     )?;
+    let elapsed = exec_start.elapsed();
     let _ = fs::remove_file(&input_path);
 
     let stderr = String::from_utf8_lossy(&output.stderr);
+    // Deadline oracle (opt-in; unchanged when `deadline` is None). A run that
+    // overran the response budget D is a real BHF-555 timing finding, NOT the
+    // silent kill-and-skip the hang backstop applies. This fires whether the run
+    // completed slowly (status success, past the `!success()` branch below) or was
+    // killed at the hang backstop (which also means it overran D, since
+    // D <= per_input_timeout). A genuine sanitizer crash keeps priority: a real
+    // memory-safety report is higher-fidelity than "it was slow", so the deadline
+    // finding is only synthesized when there is no sanitizer report to surface.
+    if let Some(deadline) = deadline {
+        if elapsed > deadline && corpus::parse_sanitizer_report(&stderr).is_none() {
+            bhfeprintln!(
+                "bhf: input exceeded the response deadline of {:?} (took {:?}) - recording BHF-555 finding",
+                deadline,
+                elapsed
+            );
+            return Ok(HarnessRun {
+                events: Vec::new(),
+                testcases: Vec::new(),
+                sanitizer: Some(corpus::SanitizerReport {
+                    // Synthesized like the RSS-limit OOM report: the rule_id is what
+                    // classifies it, and there is no real sanitizer stack to attach.
+                    sanitizer: corpus::Sanitizer::AddressSanitizer,
+                    kind: "response-deadline-exceeded".to_owned(),
+                    // A real catalog rule (CWE-400 timing/availability) so it dedups,
+                    // replays, and reports like any other finding.
+                    rule_id: "BHF-555",
+                    stack: Vec::new(),
+                    message: format!(
+                        "harness exceeded the response deadline of {deadline:?} (took {elapsed:?})"
+                    ),
+                }),
+                rejected: false,
+            });
+        }
+    }
     if !output.status.success() {
         if let Some(report) = corpus::parse_sanitizer_report(&stderr) {
             return Ok(HarnessRun {
@@ -4758,6 +4824,7 @@ fn existing_finding_dedup_keys(work_dir: &Path, harness_id: &str) -> (Vec<String
     (clusters, oracles)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_harness(
     runner: &replay_min::HarnessRunner,
     work_dir: &Path,
@@ -4765,6 +4832,7 @@ fn run_harness(
     extra_env: &[(String, String)],
     per_input_timeout: Duration,
     rss_limit_mb: usize,
+    deadline: Option<Duration>,
 ) -> Result<HarnessRun, String> {
     let protocol = resolve_harness_protocol(runner, work_dir);
     run_harness_with_protocol(
@@ -4775,6 +4843,7 @@ fn run_harness(
         per_input_timeout,
         rss_limit_mb,
         protocol,
+        deadline,
     )
 }
 
@@ -4787,6 +4856,7 @@ fn run_harness_with_protocol(
     per_input_timeout: Duration,
     rss_limit_mb: usize,
     protocol: HarnessProtocol,
+    deadline: Option<Duration>,
 ) -> Result<HarnessRun, String> {
     // The external BHF driver also accepts one input by filename when it is
     // spawned outside its framed loop. In particular, a fork-server crash must
@@ -4803,6 +4873,7 @@ fn run_harness_with_protocol(
             extra_env,
             per_input_timeout,
             rss_limit_mb,
+            deadline,
         );
     }
     let events_path = temp_event_path(work_dir)?;
@@ -5004,7 +5075,7 @@ pub(crate) fn replay_input_testcases(
     work_dir: &Path,
     input: &[u8],
 ) -> Result<Vec<Testcase>, String> {
-    let run = run_harness(runner, work_dir, input, &[], PER_INPUT_TIMEOUT, 0)?;
+    let run = run_harness(runner, work_dir, input, &[], PER_INPUT_TIMEOUT, 0, None)?;
     Ok(run.testcases)
 }
 
@@ -5013,6 +5084,7 @@ pub(crate) fn replay_input_testcases(
 /// A passthrough libFuzzer harness can corrupt allocator state across inputs
 /// and crash in driver glue even on empty input; those faults do not reproduce
 /// and must not be reported (libFuzzer/AFL find zero on that class).
+#[allow(clippy::too_many_arguments)]
 fn sanitizer_crash_reproduces(
     runner: &replay_min::HarnessRunner,
     work_dir: &Path,
@@ -5021,12 +5093,15 @@ fn sanitizer_crash_reproduces(
     extra_env: &[(String, String)],
     per_input_timeout: Duration,
     rss_limit_mb: usize,
+    deadline: Option<Duration>,
 ) -> bool {
     // Replay-verify MUST reconstruct the same environment the crash occurred
     // under — the runtrace shim's LD_PRELOAD + BHF_RUNTRACE_MODE that inject
     // env vars / fake resources. Re-running with an empty env spuriously fails to
     // reproduce env-triggered crashes (e.g. getenv-gated faults) and drops real
-    // findings.
+    // findings. The deadline is threaded through so a BHF-555 timing finding
+    // replays under the same budget it was recorded with (else its re-run, seeing
+    // no crash, would spuriously fail to reproduce and be dropped).
     match run_c_libfuzzer_single_input(
         runner,
         work_dir,
@@ -5034,6 +5109,7 @@ fn sanitizer_crash_reproduces(
         extra_env,
         per_input_timeout,
         rss_limit_mb,
+        deadline,
     ) {
         Ok(rerun) => rerun
             .sanitizer
@@ -5060,6 +5136,7 @@ fn finding_reproduces_per_spawn(
         &prepared.extra_env,
         prepared.per_input_timeout,
         prepared.rss_limit_mb,
+        prepared.deadline,
     )?;
     if run.sanitizer.is_some() {
         return Ok(true);
@@ -5483,6 +5560,19 @@ pub(crate) fn resolve_env_timeout() -> Option<Duration> {
     std::env::var("BHF_EXEC_TIMEOUT")
         .ok()
         .and_then(|ms| ms.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+}
+
+/// Resolve the real-time response deadline (the timing oracle) for the `auto`
+/// path from the `BHF_DEADLINE_MS` env (milliseconds) it sets; `None` (the
+/// default, and every current caller) leaves the oracle OFF so hang handling is
+/// unchanged. Milliseconds so a sub-second watchdog budget is expressible, and a
+/// `0`/unparsable value disables it rather than flagging every input.
+pub(crate) fn resolve_env_deadline() -> Option<Duration> {
+    std::env::var("BHF_DEADLINE_MS")
+        .ok()
+        .and_then(|ms| ms.trim().parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
         .map(Duration::from_millis)
 }
 
@@ -6516,6 +6606,7 @@ mod auto_path_tests {
             &[],
             Duration::from_secs(5),
             0,
+            None,
         ));
 
         let clean_runner = replay_min::HarnessRunner::direct(clean);
@@ -6527,6 +6618,7 @@ mod auto_path_tests {
             &[],
             Duration::from_secs(5),
             0,
+            None,
         ));
     }
 
@@ -6555,6 +6647,7 @@ mod auto_path_tests {
             &[],
             Duration::from_secs(5),
             0,
+            None,
         )
         .expect("a non-zero exit must be a rejection (Ok), not a hard error (Err)");
         assert!(run.sanitizer.is_none(), "rejection must not be a finding");
@@ -6579,6 +6672,7 @@ mod auto_path_tests {
             &[],
             Duration::from_secs(5),
             0,
+            None,
         )
         .expect("a diagnosed assertion must be a rejection, not a pass-aborting error");
         assert!(run.sanitizer.is_none());
@@ -6597,6 +6691,7 @@ mod auto_path_tests {
             &[],
             Duration::from_secs(5),
             0,
+            None,
         )
         .expect("silent SIGABRT must become a finding");
         let report = run.sanitizer.expect("BHF-210 report");
@@ -6621,6 +6716,7 @@ mod auto_path_tests {
             &[],
             Duration::from_secs(5),
             0,
+            None,
         )
         .expect("a fatal signal must be a finding (Ok), not a pass-aborting Err");
         let report = run
@@ -6642,9 +6738,96 @@ mod auto_path_tests {
             &[],
             Duration::from_secs(5),
             0,
+            None,
         )
         .expect("SIGILL must be a finding too");
         assert_eq!(run2.sanitizer.expect("report").rule_id, "BHF-210");
+    }
+
+    // HDF-8 deliverable 1: the deadline oracle. A "must respond within D" budget
+    // turns a slow-but-completing input into a real BHF-555 finding instead of the
+    // silent kill-and-skip the hang backstop applies — and a fast input under the
+    // same D is NOT flagged.
+    #[test]
+    #[cfg(unix)]
+    fn deadline_oracle_reports_a_slow_input_as_a_bhf555_finding_but_not_a_fast_one() {
+        let work = tmpdir();
+        // The backstop (per_input_timeout) is generous (5s) so the slow target
+        // COMPLETES; the deadline (400ms) is the finer budget it overruns. `sleep 1`
+        // is ~2.5x the deadline and ~1/5 the backstop, so the classification is
+        // unambiguous and the test is non-flaky under load.
+        let deadline = Some(Duration::from_millis(400));
+        let backstop = Duration::from_secs(5);
+
+        let slow = write_script(&work, "slow.sh", "#!/bin/sh\nsleep 1\nexit 0\n");
+        let run = run_c_libfuzzer_single_input(
+            &replay_min::HarnessRunner::direct(slow),
+            &work,
+            b"slow-input",
+            &[],
+            backstop,
+            0,
+            deadline,
+        )
+        .expect("a slow-but-completing input under a deadline is a finding, not an error");
+        let report = run
+            .sanitizer
+            .expect("an over-deadline input must be recorded as a finding");
+        assert_eq!(
+            report.rule_id, "BHF-555",
+            "a missed response deadline is the BHF-555 timing finding"
+        );
+        assert!(
+            report.message.contains("deadline"),
+            "the finding names the deadline it missed: {}",
+            report.message
+        );
+        assert!(
+            !run.rejected,
+            "a deadline violation is a finding, not a rejection"
+        );
+
+        // A fast target under the SAME deadline must NOT be flagged.
+        let fast = write_script(&work, "fast.sh", "#!/bin/sh\nexit 0\n");
+        let fast_run = run_c_libfuzzer_single_input(
+            &replay_min::HarnessRunner::direct(fast),
+            &work,
+            b"fast-input",
+            &[],
+            backstop,
+            0,
+            deadline,
+        )
+        .expect("a fast input is a clean run");
+        assert!(
+            fast_run.sanitizer.is_none(),
+            "a target that answered within the deadline must not be a finding"
+        );
+    }
+
+    // Regression guard: with NO deadline (the default) a slow input keeps the
+    // historical kill-and-skip behavior — no finding — so enabling the oracle is
+    // purely additive.
+    #[test]
+    #[cfg(unix)]
+    fn without_a_deadline_a_slow_input_is_not_a_finding() {
+        let work = tmpdir();
+        let slow = write_script(&work, "slow_nodl.sh", "#!/bin/sh\nsleep 1\nexit 0\n");
+        let run = run_c_libfuzzer_single_input(
+            &replay_min::HarnessRunner::direct(slow),
+            &work,
+            b"slow-input",
+            &[],
+            Duration::from_secs(5),
+            0,
+            None,
+        )
+        .expect("clean run");
+        assert!(
+            run.sanitizer.is_none(),
+            "no deadline set: a slow input must NOT be flagged (default behavior unchanged)"
+        );
+        assert!(!run.rejected);
     }
 
     #[test]
@@ -6660,6 +6843,7 @@ mod auto_path_tests {
             &[],
             Duration::from_secs(5),
             0,
+            None,
         )
         .expect("run_harness must treat a non-zero exit without a sanitizer report as a rejection");
         assert!(run.sanitizer.is_none());
@@ -6685,6 +6869,7 @@ mod auto_path_tests {
             &[],
             Duration::from_secs(5),
             0,
+            None,
         )
         .expect("ok");
         assert!(
@@ -6874,8 +7059,16 @@ mod auto_path_tests {
         let runner = replay_min::HarnessRunner::direct(hang);
 
         let started = Instant::now();
-        let run = run_harness(&runner, &work, b"input", &[], Duration::from_secs(1), 0)
-            .expect("a hung harness must be reaped and return a clean run, not block or error");
+        let run = run_harness(
+            &runner,
+            &work,
+            b"input",
+            &[],
+            Duration::from_secs(1),
+            0,
+            None,
+        )
+        .expect("a hung harness must be reaped and return a clean run, not block or error");
         let elapsed = started.elapsed();
 
         // With the fix this returns in ~1s; without it the test would hang for
@@ -7792,6 +7985,7 @@ mod auto_path_tests {
             iterations: Some(1),
             time: None,
             timeout: None,
+            deadline: None,
             max_len: DEFAULT_MAX_LEN,
             len_control: DEFAULT_LEN_CONTROL,
             print_final_stats: false,

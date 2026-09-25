@@ -227,6 +227,16 @@ pub const MANIFEST: &[ManifestEntry] = &[
         ],
         "deliver fuzz input through vendor-RTOS receive channels (VxWorks msgQReceive/semTake, FreeRTOS xQueueReceive, cFS CFE_SB_RcvMsg) and map fuzz-controlled fixed-address MMIO",
     ),
+    ManifestEntry::gated(
+        "sched",
+        &[
+            b"pthread_create\0",
+            b"pthread_join\0",
+            b"bhf_sched_yield\0",
+        ],
+        "BHF_SCHED",
+        "cooperative schedule-perturbation: drive thread interleavings from the fuzz input (or a pinned BHF_SCHED_SEQUENCE) via pthread_create/join gates and bhf_sched_yield, so a race reachable only under one ordering is searchable and replayable",
+    ),
 ];
 
 #[cfg(test)]

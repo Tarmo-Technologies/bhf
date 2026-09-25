@@ -105,6 +105,11 @@ pub unsafe extern "C" fn bhf_shim_set_fuzz_input(data: *const u8, size: libc::si
         // testcase in a persistent process but starts from the seed in standalone
         // replay, violating the determinism contract.
         crate::hooks::determinism::reset_for_input(&[]);
+        // HDF-8: a fresh input begins a fresh schedule — clear the cooperative
+        // scheduler's per-input registry/decision counter so a persistent-harness
+        // iteration explores (and replays) the schedule of THIS input, not one left
+        // by the previous testcase. No-op unless BHF_SCHED is active.
+        crate::hooks::sched::reset_for_input();
         if let Ok(mut guard) = LIVE_INPUT.lock() {
             *guard = Some(LiveInput { bytes: Vec::new() });
         }
@@ -119,6 +124,7 @@ pub unsafe extern "C" fn bhf_shim_set_fuzz_input(data: *const u8, size: libc::si
     // state from THIS input before target execution so a saved testcase replays
     // independently of the corpus prefix that happened to precede it.
     crate::hooks::determinism::reset_for_input(slice);
+    crate::hooks::sched::reset_for_input();
     let mut guard = match LIVE_INPUT.lock() {
         Ok(g) => g,
         Err(_) => return,
