@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "kind": "scheduler_runtime_validation_observation",
+  "source_validation_base_commit": "566435a3da71037e971d611b939a1fe48fe115fe",
+  "integration_base_commit": "eb7a787f9114e47d2bdee69de071b2b3d6cb0fc0",
+  "initial_validation_run_id": 36197948658,
+  "initial_validation_setup_commit": "e3cb1ad5b09b02b3b408da1ad3bbffa5269466ea",
+  "tested_source_commit": "d9bd289422833adaf073235e53fedd55a4196e51",
+  "source_blobs": {
+    "crates/continuous_daemon/src/storage_lock.rs": "76c699542fd15c92918c4862f3a35f20e6a90ec7",
+    "crates/continuous_daemon/src/health.rs": "591e68e2c40f06c01b70af07a2f31c3c99314b50",
+    "crates/continuous_daemon/src/health_tests.rs": "6be0056b5f331d57b2967de85725f1a7e8ab7d53",
+    "crates/continuous_daemon/src/lib.rs": "6c77a3c75344972a8e6b27c11442ae1f599634c6"
+  },
+  "results": [
+    {"platform": "ubuntu-24.04", "suite": "continuous_daemon --lib", "job_id": 108277982599, "passed": 50, "failed": 0, "ignored": 0, "filtered_out": 0},
+    {"platform": "windows-2022", "suite": "continuous_daemon --lib health::tests", "job_id": 108277982654, "passed": 18, "failed": 0, "ignored": 0, "filtered_out": 25},
+    {"platform": "ubuntu-24.04", "suite": "CI policy", "job_id": 108277982599, "passed": 50, "failed": 0},
+    {"platform": "ubuntu-24.04", "suite": "Rust 1.88 check continuous_daemon --all-targets", "job_id": 108277982578, "result": "passed"},
+    {"platform": "ubuntu-24.04 and windows-2022", "suite": "continuous_daemon Clippy --lib --all-targets", "result": "passed", "warnings_observed": 0},
+    {"platform": "EL7-compatible glibc 2.17 container", "suite": "continuous_daemon --lib", "run_id": 36198207877, "job_id": 108278779526, "passed": 50, "failed": 0, "ignored": 0},
+    {"platform": "EL7-compatible glibc 2.17 container", "suite": "governance --lib", "run_id": 36198207877, "job_id": 108278779526, "passed": 80, "failed": 0, "ignored": 0},
+    {"platform": "local Python 3.13", "suite": "final merged CI policy and scheduler workflow contract", "passed": 53, "failed": 0}
+  ],
+  "test_count_note": "22 new Rust test entries: 21 regression tests and one subprocess fixture entry; the Windows run filters older Unix-executable fixtures. Counts across platforms overlap, not unique totals.",
+  "native_source_parity": "Linux and Windows downloaded source files match after newline normalization; Git blob IDs match the materialized source commit.",
+  "downloaded_artifacts": [
+    {"id": 10890589702, "name": "scheduler-ubuntu-24.04", "sha256": "a0f36cf5cfeaedf35468e05f2763ad61cc9cf64ae9a4d524888be0243a5e93f6", "hash_verified": true},
+    {"id": 10891500099, "name": "scheduler-windows-2022", "sha256": "0fa02d6c03719236e6b0b305796b5e98a89c0dfceedababeb0e721afdef50a03", "hash_verified": true},
+    {"id": 10891815252, "name": "scheduler-el7-first", "sha256": "813c01efba00747f0b72a7105c148147578f0200af31e8bb4bada2cdce5d51d6", "hash_verified": true},
+    {"id": 10891645747, "name": "el7-tools", "sha256": "912a081b57ec8e20ca1f07896904ef34e64885faaab5d0acc4ddedc558452d4d", "hash_verified": true}
+  ],
+  "prior_validation_failures": [
+    {"run_id": 36198207877, "phase": "EL7 signed offline-distribution test", "passed": 28, "failed": 1, "note": "Scheduler 50 and governance 80 passed; archive signature verification failed using the system OpenSSL. No signature check was disabled."},
+    {"run_id": 36198496585, "phase": "EL7 prerequisites", "note": "Rejected an absent modern OpenSSL executable before running EL7 tests; runtime source unchanged. Follow-up image inspection confirmed OpenSSL 1.0.2k-fips on PATH and no modern openssl executable under /opt or /usr/local."}
+  ],
+  "concurrent_update_preserved": {
+    "commit": "eb7a787f9114e47d2bdee69de071b2b3d6cb0fc0",
+    "note": "Preserve all prior VEX/assurance, independent-verifier and EL7 bootstrap changes. Scheduler source, Cargo.toml and Cargo.lock unchanged by that concurrent update. Only add required scheduler test steps to its CI workflow."
+  },
+  "el7_ci_bootstrap": {
+    "validation_run_id": 36199018221,
+    "validation_setup_commit": "a57194870d8164ec51ea36fa19b6b26de402088a",
+    "status": "superseded_on_integration",
+    "entrypoint": "scripts/ci/run-el7-validation.sh",
+    "entrypoint_blob": "c26fe6140c88b2e406fa0ef26bc729c2add4c97e",
+    "openssl_source_version": "3.5.8",
+    "openssl_source_sha256_pin": "a8f84a39918ec6415ce765d9b429d313ba97b8143169c172e734b9514464f5b2",
+    "source_of_pin": "Official openssl/openssl release asset metadata for openssl-3.5.8, independently retrieved before the run",
+    "note": "This independent staging-only experiment is not installed in the final branch. Preserve the already landed build-test-openssl.sh from eb7a787, and do not restore xxd or duplicate the crypto bootstrap. Its result is not evidence for the integrated revision."
+  },
+  "full_ci_passed": false,
+  "release_approved": false,
+  "enterprise_readiness": "not_assessed",
+  "boundaries": [
+    "Cooperative trusted local storage, not distributed leadership or tenant isolation",
+    "At-least-once recovery; not exactly-once processing",
+    "Health and shutdown methods are library APIs, not new CLI/network endpoints",
+    "Shutdown does not bound blocking filesystem I/O or synchronous DNS",
+    "No physical hardware qualification or comparative fuzzing benchmark"
+  ]
+}

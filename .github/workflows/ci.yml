@@ -95,6 +95,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets
 
+      - name: Test scheduler runtime reliability
+        run: cargo test --locked -p continuous_daemon --lib
+
       - name: Test workspace
         run: cargo test --locked --workspace
 
@@ -166,6 +169,7 @@ jobs:
               bash scripts/ci/build-test-openssl.sh /tmp/bhf-ci-openssl
               export PATH="/tmp/bhf-ci-openssl/bin:$PATH"
               openssl version
+              cargo test --locked -p continuous_daemon --lib
               cargo test --locked -p governance --lib
               cargo test --locked -p bhf --test offline_dist_scripts -- --nocapture
               cargo build --locked --release --workspace
@@ -331,6 +335,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked -p bhf --lib vcxproj
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Test portable scheduler runtime reliability
+        run: cargo test --locked -p continuous_daemon --lib health::tests
 
       - name: Build Windows release artifacts
         run: cargo build --locked --release -p bhf -p bhf-daemon -p bhf_runtrace_shim --target x86_64-pc-windows-msvc
