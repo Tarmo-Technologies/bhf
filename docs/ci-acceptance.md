@@ -44,11 +44,19 @@ persist credentials.
 
 ## Running and consuming the checks
 
-Run the policy and shell-behavior regression suite without Rust or network
-access (Python 3.10+ and Bash are required):
+Run the complete policy and shell-behavior regression suite on Linux without
+Rust or network access (Python 3.10+ and Bash are required):
 
 ```sh
 python3 -m unittest discover -s scripts/ci/tests -v
+```
+
+The shell/workflow fixtures model the Ubuntu CI jobs and use POSIX paths and
+mock executables; they are not Windows/WSL integration tests. The standalone
+acceptance-policy tests can also be run with native Windows Python:
+
+```sh
+python -m unittest discover -s scripts/ci/tests -p test_ci_acceptance.py -v
 ```
 
 For an exported **same-run** `needs` observation, the policy can be evaluated
@@ -84,12 +92,17 @@ repository rules, and it does not wire this policy into the separate release
 publishing workflow. Release publication still needs its own exact-revision and
 artifact-verification acceptance controls.
 
-At the inspected base `e3ccadbea4c9e1b2ebc63dc9e5d36c0d3f8a803b`, the installer
-still directly calls `libc::renameat2` in `crates/governance/src/lib.rs`. That
-legacy-Linux compatibility issue is **not fixed by this change set**. Its
-resolution must preserve atomic no-overwrite behavior and pass the real legacy
-ABI build; weakening installer safety or skipping the failed lane is not an
-acceptable substitute.
+Historical scope of the initial CI-only change: at its inspected base
+`e3ccadbea4c9e1b2ebc63dc9e5d36c0d3f8a803b`, the installer directly called
+`libc::renameat2` in `crates/governance/src/lib.rs`. Commit `30ee685` did not
+correct that compatibility issue.
+
+The subsequent portability repair removes that glibc wrapper dependency while
+retaining atomic no-overwrite behavior, adds production-helper regressions, and
+runs the governance tests in the permanent EL7 build lane. See
+[the dated portability validation record](portability-hardening-2026-09-25.md)
+for the observed native results and the limits of container-based ABI evidence.
+This is not a claim that the whole release matrix has passed.
 
 This gate deliberately does not assess separate workflows, held-out harness
 quality, comparative engine effectiveness, long-duration operation, publisher
@@ -97,14 +110,15 @@ key custody, physical hardware validation, or deployment authorization. Passing
 it is one release-engineering condition, not evidence for universal embedded
 compatibility or a best-in-class claim.
 
-## Validation record: 2026-09-25
+## Initial validation record: 2026-09-25
 
-The change set's 50 stdlib regression tests passed locally on Python 3.13.5.
-They include executions of the actual Bash classifier step with failed/partial
-diffs, missing refs, NUL-delimited filenames, and manual-run selection. Both
-modified workflow files also parsed as YAML in the editing environment.
+The initial CI-only change set's 50 stdlib regression tests passed locally on
+Python 3.13.5. They include executions of the actual Bash classifier step with
+failed/partial diffs, missing refs, NUL-delimited filenames, and manual-run
+selection. Both modified workflow files also parsed as YAML in that environment.
 
-The editing environment had no Rust toolchain and could not clone the repository
+That editing environment had no Rust toolchain and could not clone the repository
 over its network connection. No native workspace, RHEL ABI, Windows execution,
-or hardware success is claimed from that local run. Hosted CI results must be
-checked separately for the published commit.
+or hardware success is claimed from that local run. Subsequent hosted validation
+is recorded separately in the dated portability record; full CI results must
+still be checked for the exact published commit.

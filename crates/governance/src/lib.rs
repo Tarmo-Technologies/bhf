@@ -2048,8 +2048,15 @@ fn publish_pack_stage(stage: &Path, target: &Path) -> Result<(), GovernanceError
                 message: "update-pack destination path contains NUL".to_owned(),
             }
         })?;
+        // Call the kernel interface without requiring glibc's renameat2
+        // wrapper (introduced in glibc 2.28). Keep RENAME_NOREPLACE:
+        // unsupported kernels/filesystems must fail, never fall back
+        // to a check-then-rename sequence that can overwrite a winner.
+        // SAFETY: both CString pointers remain valid through this call;
+        // the syscall number and arguments match Linux renameat2(2).
         let status = unsafe {
-            libc::renameat2(
+            libc::syscall(
+                libc::SYS_renameat2,
                 libc::AT_FDCWD,
                 source.as_ptr(),
                 libc::AT_FDCWD,
@@ -8154,3 +8161,6 @@ mod vex_e2e_tests {
         );
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod publication_tests;

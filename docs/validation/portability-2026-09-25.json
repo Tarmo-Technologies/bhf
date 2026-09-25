@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "kind": "focused_native_validation_observation",
+  "base_commit": "30ee685cfe94138dd6d3626d3dee09b24796589f",
+  "validation_run_id": 36192874457,
+  "validation_setup_commit": "0f4a3043f0aef6b98c63c4660d1627e08289449b",
+  "tested_source_tree": "1f0b542592abe021ffb5cb04c832391e73e20c8f",
+  "tested_source_commit": "22467267adeb99c6c69867bdef8dcac5c8bb77b2",
+  "native_validation_jobs": "passed",
+  "helper_workflow_conclusion": "failure",
+  "helper_failure": "The final staging-ref update was rejected because the Actions token lacked workflows permission; all focused validation jobs passed.",
+  "source_patch_parity": "Linux and Windows patches identical after newline normalization; unchanged from first validation run.",
+  "source_blobs": {
+    "crates/governance/src/lib.rs": "00d31a3cc9836595fe7e754f171b081aea1d5829",
+    "crates/daemon/src/lib.rs": "20c2add6cad6683b41e5307afa536d78948824aa",
+    "crates/governance/src/publication_tests.rs": "de06e1ce8e06c770a09dc3b236cf64c1c6f614a8"
+  },
+  "results": [
+    {"platform": "ubuntu-24.04", "job_id": 108261894319, "suite": "governance --lib", "passed": 80, "failed": 0, "ignored": 0},
+    {"platform": "ubuntu-24.04", "job_id": 108261894319, "suite": "bhf-daemon --lib", "passed": 28, "failed": 0, "ignored": 0},
+    {"platform": "ubuntu-24.04", "job_id": 108261894319, "suite": "CI policy, shell behavior, workflow contracts", "passed": 50, "failed": 0},
+    {"platform": "windows-2022", "job_id": 108261894601, "suite": "governance --lib", "passed": 69, "failed": 0, "ignored": 0},
+    {"platform": "windows-2022", "job_id": 108261894601, "suite": "bhf-daemon --lib", "passed": 27, "failed": 0, "ignored": 0},
+    {"platform": "windows-2022", "job_id": 108261894601, "suite": "platform-neutral CI acceptance policy", "passed": 27, "failed": 0},
+    {"platform": "EL7-compatible glibc 2.17 container on hosted Linux kernel", "job_id": 108261894042, "suite": "governance --lib", "passed": 80, "failed": 0, "ignored": 0}
+  ],
+  "downloaded_artifacts": [
+    {"id": 10888663008, "name": "portability-ubuntu-24.04", "sha256": "0ee75ea998ad9b0682abeb62dfa8ecf017a41773f48c63cae1a847baafd1257c", "download_hash_verified": true},
+    {"id": 10888882434, "name": "portability-windows-2022", "sha256": "cd52aefa79e6bb48377a6089d3946d842cef3a9109838f152702e1b2c689699a", "download_hash_verified": true},
+    {"id": 10888228558, "name": "portability-el7", "sha256": "d9b10e958d61475590ac84e3136b661f363db466e41be216aaa52652a65fe934", "download_hash_verified": true}
+  ],
+  "prior_run": {
+    "id": 36192503518,
+    "conclusion": "failure",
+    "native_tests": "passed",
+    "failure": "Linux-specific Bash CI fixtures were invoked from native Windows Python; corrected the helper validation matrix without disabling native Rust tests or the complete Linux policy suite."
+  },
+  "full_ci_passed": false,
+  "full_ci_note": "Not established by these focused test jobs; check the development-branch CI run for the exact published revision.",
+  "release_approved": false,
+  "hardware_validated": false,
+  "enterprise_readiness": "not_assessed"
+}

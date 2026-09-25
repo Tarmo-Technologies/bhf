@@ -157,6 +157,7 @@ jobs:
               set -euo pipefail
               curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
               export PATH="$CARGO_HOME/bin:$PATH"
+              cargo test --locked -p governance --lib
               cargo test --locked -p bhf --test offline_dist_scripts -- --nocapture
               cargo build --locked --release --workspace
               scripts/check-linux-release-abi.sh "$CARGO_TARGET_DIR/release"
