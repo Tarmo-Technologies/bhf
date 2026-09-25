@@ -127,16 +127,29 @@ where
     let job = guard.queue.front()?.clone();
     let Some(index) = guard.seen.iter().position(|seen| seen.job_id == job.job_id) else {
         let failure = PersistFailure::before(std::io::Error::new(
-            std::io::ErrorKind::InvalidData, "queued job missing from scheduler history",
+            std::io::ErrorKind::InvalidData,
+            "queued job missing from scheduler history",
         ));
-        latch_storage_fault(shared, guard, PersistencePhase::Start, &job.job_id, &failure);
+        latch_storage_fault(
+            shared,
+            guard,
+            PersistencePhase::Start,
+            &job.job_id,
+            &failure,
+        );
         return None;
     };
     guard.seen[index].state = JobState::Running;
     if let Err(failure) = persist(data_dir, &guard.seen) {
         // No child was dispatched. Recovery also requeues an installed Running row.
         guard.seen[index].state = JobState::Queued;
-        latch_storage_fault(shared, guard, PersistencePhase::Start, &job.job_id, &failure);
+        latch_storage_fault(
+            shared,
+            guard,
+            PersistencePhase::Start,
+            &job.job_id,
+            &failure,
+        );
         return None;
     }
     guard.queue.pop_front()
@@ -162,7 +175,13 @@ where
         return false;
     }
     if let Err(failure) = persist(data_dir, &guard.seen) {
-        latch_storage_fault(shared, &mut guard, PersistencePhase::Completion, job_id, &failure);
+        latch_storage_fault(
+            shared,
+            &mut guard,
+            PersistencePhase::Completion,
+            job_id,
+            &failure,
+        );
         return false;
     }
     true

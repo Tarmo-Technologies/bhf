@@ -20,11 +20,17 @@ fn regular_file(file: &File) -> io::Result<()> {
         use std::os::windows::fs::MetadataExt;
         // FILE_ATTRIBUTE_REPARSE_POINT. Reject links opened without following.
         if metadata.file_attributes() & 0x400 != 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "scheduler storage must not be a reparse point"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "scheduler storage must not be a reparse point",
+            ));
         }
     }
     if !metadata.is_file() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "scheduler storage must be a regular file"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "scheduler storage must be a regular file",
+        ));
     }
     Ok(())
 }
@@ -49,7 +55,11 @@ fn no_follow(options: &mut OpenOptions) {
 
 pub(super) fn acquire(data_dir: &Path) -> Result<StorageLease, DaemonError> {
     #[cfg(not(any(unix, windows)))]
-    return Err(io::Error::new(io::ErrorKind::Unsupported, "scheduler storage locking is unsupported on this platform").into());
+    return Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "scheduler storage locking is unsupported on this platform",
+    )
+    .into());
 
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
@@ -67,7 +77,8 @@ pub(super) fn acquire(data_dir: &Path) -> Result<StorageLease, DaemonError> {
     }
     let file = options.open(data_dir.join(LOCK_NAME)).map_err(|error| {
         #[cfg(windows)]
-        if error.raw_os_error() == Some(32) { // ERROR_SHARING_VIOLATION
+        if error.raw_os_error() == Some(32) {
+            // ERROR_SHARING_VIOLATION
             return DaemonError::DataDirInUse(data_dir.to_owned());
         }
         DaemonError::Io(error)
