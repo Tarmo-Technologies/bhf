@@ -15,6 +15,7 @@ path = "src/lib.rs"
 ada_parser = { path = "../../ada_parser" }
 cmplog = { path = "../../cmplog" }
 event_log = { path = "../../event_log" }
+type_model = { path = "../../type_model" }
 
 [dev-dependencies]
 serde_json.workspace = true

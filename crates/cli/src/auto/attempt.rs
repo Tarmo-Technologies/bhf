@@ -10877,8 +10877,10 @@ mod foreign_cross_target_tests {
 
     #[test]
     fn foreign_candidate_unknown_guard_skips_with_mapping_reason() {
+        // `s390x` has no cross toolchain mapping (HDF-3 added PowerPC/MIPS/SPARC,
+        // not s390x); an unmapped guard still skips with the mapping reason.
         let result =
-            resolve_foreign_candidate_target(&foreign_candidate(Lang::C, "ppc64"), "ppc64");
+            resolve_foreign_candidate_target(&foreign_candidate(Lang::C, "s390x"), "s390x");
         let reason = result.expect_err("unmapped guard skips");
         assert!(reason.contains("no cross toolchain mapping"), "{reason}");
     }

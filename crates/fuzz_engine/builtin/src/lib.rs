@@ -42,7 +42,10 @@ pub use scheduler::{PowerScheduleConfig, PowerScheduler, ScheduleFeedback, Sched
 pub use symbolic_seed::{
     generate_symbolic_seeds, SymbolicSeed, SymbolicSeedKind, SymbolicSeedSource,
 };
-pub use typed::{typed_candidates, TypedSpan, TypedValueKind};
+pub use typed::{typed_candidates, typed_candidates_for_abi, TypedSpan, TypedValueKind};
+// Re-export the target-ABI model so engine consumers can select a foreign
+// target's byte order/layout without a separate `type_model` dependency.
+pub use type_model::{Endian, TargetAbi};
 
 pub fn crate_name() -> &'static str {
     "fuzz_engine_builtin"
