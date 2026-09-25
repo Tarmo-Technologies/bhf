@@ -2573,6 +2573,20 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         }
     }
 
+    // Reconcile the in-memory pass records against the on-disk findings/ dir now
+    // that every post-pass has run. A post-pass (COBOL crash attribution) deletes
+    // a finding it proves a harness artifact, but only disk-derived outputs
+    // (findings.csv, FINDINGS.md) saw that removal — the pass records that feed
+    // the headline count, run.json and run.md still carried the id, so the count
+    // reported a finding with no evidence bundle. Drop those phantom ids so every
+    // finding surface agrees before the report is written.
+    let phantom_findings = crate::auto::report::reconcile_pass_findings_with_disk(&mut results, &work);
+    if phantom_findings > 0 {
+        bhfeprintln!(
+            "bhf auto: reconciled {phantom_findings} finding id(s) removed by a post-pass oracle out of the headline count"
+        );
+    }
+
     let finished_at = Utc::now().to_rfc3339();
     crate::auto::discovery::bhfprof("auto:post_sweep", _tpost);
     let _twr = std::time::Instant::now();

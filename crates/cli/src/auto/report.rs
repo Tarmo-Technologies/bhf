@@ -482,6 +482,53 @@ fn collapse_uninitializable_param_reason(reason: &str) -> String {
     reason.to_owned()
 }
 
+/// Reconcile in-memory per-pass finding ids against the on-disk `findings/`
+/// directory, dropping any id whose `finding.json` a post-pass removed. Returns
+/// the number of phantom ids dropped.
+///
+/// Result-linked fuzz findings (`F-NNNN-*`) are emitted to
+/// `findings/<id>/finding.json` during the cascade and recorded in
+/// [`PassRun::findings`]. Post-pass oracles then run and may DELETE a finding
+/// they prove false: COBOL crash attribution
+/// ([`crate::auto::cobol_oracle::run_cobol_attribution`]) removes a crash whose
+/// libcob diagnostic is a harness artifact (a dynamic `CALL` to a sibling
+/// program not linked into the single-program harness). Such a removal reaches
+/// `findings.csv` and `FINDINGS.md` (both derived from disk) but NOT the
+/// in-memory pass records that feed `summary.findings`, `run.json` and `run.md`
+/// — so the headline count would report a finding with no evidence bundle (a
+/// phantom: exactly the two COBOL `built_and_fuzzed` targets whose count read 1
+/// while their CSV/`findings/` held nothing).
+///
+/// Called once after every post-pass and immediately before [`write_reports`],
+/// this makes the pass records agree with disk: the count, `run.json` and
+/// `run.md` reflect exactly the findings that still have an evidence bundle.
+/// Disk-folded families (`F-STATIC-*` / `F-MSAN-*` / `F-CAP-*`) live only on
+/// disk and never in a pass record, so they are unaffected; the report-only
+/// path carries its ids in `Outcome::ReportOnly::finding_ids`, which no post-pass
+/// removes, so it is left as-is.
+pub(crate) fn reconcile_pass_findings_with_disk(
+    results: &mut [AttemptResult],
+    work_dir: &Path,
+) -> usize {
+    let findings_root = work_dir.join("findings");
+    let mut dropped = 0usize;
+    for r in results.iter_mut() {
+        let passes = match &mut r.outcome {
+            Outcome::BuiltAndFuzzed { passes, .. } | Outcome::BuiltNotEntered { passes, .. } => {
+                passes
+            }
+            _ => continue,
+        };
+        for pass in passes.iter_mut() {
+            let before = pass.findings.len();
+            pass.findings
+                .retain(|fid| findings_root.join(fid).join("finding.json").is_file());
+            dropped += before - pass.findings.len();
+        }
+    }
+    dropped
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn write_reports(
     source_root: &Path,
@@ -3825,15 +3872,17 @@ mod tests {
         // header with a configure-oriented remediation — not vanish behind an
         // opaque `failed_build`.
         use build_classifier::BuildErrorKind;
+        let temp = tempfile::tempdir().unwrap();
         let needed = NeededForBuild::default();
-        let mut m = build_dependency_manifest(&needed, &PathBuf::from("/tmp"), "");
+        let project_root = temp.path();
+        let mut m = build_dependency_manifest(&needed, project_root, "");
         let failed = vec![(
             "H-CARES".to_owned(),
             vec![BuildErrorKind::MissingHeader {
                 path: "ares_build.h".to_owned(),
             }],
         )];
-        record_failed_build_blockers(&mut m, &failed, &PathBuf::from("/tmp"));
+        record_failed_build_blockers(&mut m, &failed, project_root);
         let e = m
             .entries
             .iter()
@@ -4137,6 +4186,111 @@ mod tests {
             input_reachability: None,
             dialect: None,
         }
+    }
+
+    /// Regression: a finding a post-pass DELETED from disk (COBOL crash
+    /// attribution dropping a harness-artifact crash) must also leave the
+    /// in-memory pass record, so the headline count, run.json and findings.csv all
+    /// agree with the evidence on disk. Before the reconcile the two COBOL targets
+    /// read `findings: 1` while their CSV / `findings/` held nothing.
+    #[test]
+    fn phantom_finding_removed_by_post_pass_is_reconciled_out_of_count() {
+        use crate::auto::attempt::{AttemptResult, Outcome, PassRun};
+        use crate::auto::pass::Pass;
+
+        let work = std::env::temp_dir().join(format!(
+            "bhf-report-phantom-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(work.join("findings")).unwrap();
+
+        // The empty pass emitted two crashes; attribution proved F-0000-dead a
+        // harness artifact and removed its dir, leaving only F-0001-live on disk.
+        let survivor = "F-0001-live";
+        let phantom = "F-0000-dead";
+        let survivor_dir = work.join("findings").join(survivor);
+        std::fs::create_dir_all(&survivor_dir).unwrap();
+        std::fs::write(
+            survivor_dir.join("finding.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "id": survivor,
+                "harness_id": "H-B0014",
+                "rule_id": "BHF-210",
+                "classification": "runtime_crash",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let outcome = Outcome::BuiltAndFuzzed {
+            repairs: vec![],
+            retries: 0,
+            per_pass_budget_secs: 60,
+            total_wall_budget_secs: 60,
+            executions_per_sec: 9.0,
+            passes: vec![PassRun {
+                pass: Pass::Empty,
+                engine: "builtin".to_owned(),
+                executions: 9,
+                target_entry_observed: true,
+                coverage_edges: 80,
+                elapsed_secs: 1.0,
+                executions_per_sec: 9.0,
+                // Order matters: the phantom precedes the survivor.
+                findings: vec![phantom.to_owned(), survivor.to_owned()],
+            }],
+            runtrace_events: vec![],
+        };
+        let mut results = vec![AttemptResult {
+            candidate: cand("H-B0014"),
+            outcome,
+            harness_dir: work.join("harnesses/H-B0014"),
+        }];
+
+        let dropped = reconcile_pass_findings_with_disk(&mut results, &work);
+        assert_eq!(dropped, 1, "exactly the phantom id should be dropped");
+
+        write_reports(
+            std::path::Path::new("/tmp"),
+            &results,
+            &work,
+            "T0",
+            "T1",
+            false,
+            actionability::RunMode::Reporting,
+            0,
+            0,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(work.join("auto/run.json")).unwrap()).unwrap();
+        // Headline count now equals the single on-disk evidence bundle.
+        assert_eq!(json["summary"]["findings"], 1, "{json}");
+        // run.json's pass no longer serializes the phantom id.
+        assert_eq!(
+            json["targets"][0]["outcome"]["passes"][0]["findings"],
+            serde_json::json!([survivor]),
+            "{json}"
+        );
+        // findings.csv carries exactly the one surviving row — count and evidence
+        // agree, the invariant the COBOL reconciliation gate requires.
+        let csv = std::fs::read_to_string(work.join("findings.csv")).unwrap();
+        let data_rows: Vec<&str> = csv.lines().skip(1).filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(data_rows.len(), 1, "csv: {csv}");
+        assert!(
+            data_rows[0].starts_with(survivor),
+            "csv row: {}",
+            data_rows[0]
+        );
+
+        let _ = std::fs::remove_dir_all(&work);
     }
 
     #[test]
