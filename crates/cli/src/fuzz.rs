@@ -909,16 +909,17 @@ fn is_input_rejection(status: &std::process::ExitStatus, stderr: &str) -> bool {
 fn fatal_signal_report(status: &std::process::ExitStatus, stderr: &str) -> corpus::SanitizerReport {
     let crash = crate::fatal_signal::classify(status, stderr)
         .expect("fatal_signal_report requires a classified fatal signal");
-    corpus::SanitizerReport {
-        sanitizer: corpus::Sanitizer::AddressSanitizer,
-        kind: "fatal-signal".to_owned(),
-        rule_id: crate::fatal_signal::RULE_ID,
-        stack: Vec::new(),
-        message: format!(
+    // Funnel through the shared crash-report builder so the host-signal lane and
+    // the HDF-2 transport-fault lane produce one finding shape with a catalog
+    // `rule_id` (see `crate::transport_fault`).
+    crate::transport_fault::crash_report(
+        crate::fatal_signal::RULE_ID,
+        "fatal-signal".to_owned(),
+        format!(
             "harness crashed with {} and no sanitizer report — a reachable crash",
             crash.name
         ),
-    }
+    )
 }
 
 pub fn run(args: FuzzArgs) -> i32 {

@@ -6131,12 +6131,113 @@ fn cross_compiler_override(target: &CrossTarget) -> crate::build::CFamilyCompile
         cflags.push("-static".to_owned());
         cxxflags.push("-static".to_owned());
     }
+    // HDF-2: opt-in compiler-assisted guards for a cross/embedded build where the
+    // full ASan runtime cannot cross-compile/link. Each guard is trap-based, so a
+    // violation becomes a CPU trap the HDF-1 transport reports as a fault and
+    // `crate::transport_fault` classifies (BHF-210 family) — no ASan shadow and no
+    // on-target POSIX signal required. Only applied to the cross/foreign lane, so
+    // host builds are unaffected; unsupported flags are probed away so a minimal
+    // toolchain still builds.
+    if cross_guards_opt_in() {
+        let cc = target.cc.clone();
+        let guards = cross_guard_flags(&target.triple, |flag| compiler_accepts_flag(&cc, flag));
+        cflags.extend(guards.iter().cloned());
+        cxxflags.extend(guards);
+    }
+
     crate::build::CFamilyCompilerOverride {
         cc: target.cc.clone(),
         cxx: target.cxx.clone(),
         cflags,
         cxxflags,
     }
+}
+
+/// Environment opt-in for the HDF-2 cross/embedded compiler-assisted guards. Off
+/// by default (the guards change codegen and, for bare-metal, require the BSP to
+/// provide `__stack_chk_fail` / a reserved SCS register), so a user arms them
+/// deliberately with `BHF_CROSS_GUARDS=1` (also accepts `on`/`true`/`yes`).
+fn cross_guards_opt_in() -> bool {
+    guard_opt_in_value(std::env::var("BHF_CROSS_GUARDS").ok().as_deref())
+}
+
+/// Pure parse of the `BHF_CROSS_GUARDS` opt-in value: on for `1`/`on`/`true`/`yes`
+/// (case-insensitive, trimmed), off for anything else or when unset.
+fn guard_opt_in_value(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "on" | "true" | "yes")
+    )
+}
+
+/// The compiler-assisted memory-safety guard flags for a cross/embedded build,
+/// filtered to those the toolchain actually accepts (`supports`).
+///
+/// * `-fsanitize=bounds` in trap mode — a bounded array access traps instead of
+///   silently corrupting; trap mode needs no UBSan runtime, so it links on a bare
+///   target. The trap spelling degrades: clang / modern GCC take
+///   `-fsanitize-trap=bounds`; older GCC only `-fsanitize-undefined-trap-on-error`.
+/// * `-fstack-protector-strong` — a stack canary turns a return-address smash into
+///   an abort (via the BSP's `__stack_chk_fail`) instead of a silent hijack.
+/// * `-fsanitize=shadow-call-stack` — protects the return address on aarch64 only,
+///   and needs a reserved platform register (`-ffixed-x18`). It is gated on both
+///   the arch and a live probe; most GCC cross toolchains here do not advertise it,
+///   so it honestly degrades to absent.
+///
+/// A toolchain that supports none of them yields an empty vector — the build still
+/// proceeds exactly as the plain `-O1 -g` cross build did ("degrade gracefully").
+pub(crate) fn cross_guard_flags(triple: &str, supports: impl Fn(&str) -> bool) -> Vec<String> {
+    let mut flags = Vec::new();
+
+    if supports("-fsanitize=bounds") {
+        flags.push("-fsanitize=bounds".to_owned());
+        // A bounds violation must trap (no runtime) rather than call the absent
+        // UBSan diagnostic runtime. Prefer the modern per-check spelling.
+        if supports("-fsanitize-trap=bounds") {
+            flags.push("-fsanitize-trap=bounds".to_owned());
+        } else if supports("-fsanitize-undefined-trap-on-error") {
+            flags.push("-fsanitize-undefined-trap-on-error".to_owned());
+        }
+    }
+
+    if supports("-fstack-protector-strong") {
+        flags.push("-fstack-protector-strong".to_owned());
+    }
+
+    // Shadow-call-stack is aarch64-only and needs x18 reserved for the shadow
+    // stack; gate on the arch AND a probe so an unsupported toolchain drops it.
+    if triple.starts_with("aarch64") && supports("-fsanitize=shadow-call-stack") {
+        flags.push("-fsanitize=shadow-call-stack".to_owned());
+        if supports("-ffixed-x18") {
+            flags.push("-ffixed-x18".to_owned());
+        }
+    }
+
+    flags
+}
+
+/// Whether `cc` accepts `flag`: compile a trivial translation unit from stdin
+/// with the flag and no output; success means the flag is understood. Any spawn
+/// failure (compiler absent) degrades to "unsupported" rather than an error, so a
+/// missing cross toolchain never aborts flag selection.
+fn compiler_accepts_flag(cc: &str, flag: &str) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    let Ok(mut child) = Command::new(cc)
+        .args([flag, "-x", "c", "-c", "-o", null, "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(b"int bhf_probe;\n");
+    }
+    child.wait().map(|status| status.success()).unwrap_or(false)
 }
 
 /// clang `-fsanitize=` name for a sanitizer (the compile-time spelling, distinct
@@ -10689,6 +10790,177 @@ mod platform_stub_tests {
         } else {
             assert!(result.is_err());
         }
+    }
+
+    #[test]
+    fn cross_guard_flags_arm_bounds_trap_and_stack_protector_when_supported() {
+        // A modern toolchain that accepts every probed flag: bounds in trap mode
+        // (per-check spelling), stack canary, and — for aarch64 — shadow-call-stack
+        // with its reserved register.
+        let flags = super::cross_guard_flags("aarch64-linux-gnu", |_flag| true);
+        assert!(flags.contains(&"-fsanitize=bounds".to_owned()), "{flags:?}");
+        assert!(
+            flags.contains(&"-fsanitize-trap=bounds".to_owned()),
+            "a bounds violation must trap, not call the absent UBSan runtime: {flags:?}"
+        );
+        assert!(
+            flags.contains(&"-fstack-protector-strong".to_owned()),
+            "{flags:?}"
+        );
+        assert!(
+            flags.contains(&"-fsanitize=shadow-call-stack".to_owned())
+                && flags.contains(&"-ffixed-x18".to_owned()),
+            "aarch64 with SCS support gets shadow-call-stack + x18: {flags:?}"
+        );
+    }
+
+    #[test]
+    fn cross_guard_flags_degrade_gracefully_on_a_minimal_toolchain() {
+        // A toolchain that accepts none of the guard flags yields nothing — the
+        // build proceeds exactly as the plain `-O1 -g` cross build did.
+        let flags = super::cross_guard_flags("arm-linux-gnueabihf", |_flag| false);
+        assert!(flags.is_empty(), "{flags:?}");
+    }
+
+    #[test]
+    fn cross_guard_flags_fall_back_to_legacy_trap_spelling() {
+        // Older GCC: `-fsanitize=bounds` yes, per-check trap spelling no — fall back
+        // to `-fsanitize-undefined-trap-on-error` so the violation still traps.
+        let flags =
+            super::cross_guard_flags("powerpc-linux-gnu", |flag| flag != "-fsanitize-trap=bounds");
+        assert!(flags.contains(&"-fsanitize=bounds".to_owned()), "{flags:?}");
+        assert!(
+            flags.contains(&"-fsanitize-undefined-trap-on-error".to_owned()),
+            "{flags:?}"
+        );
+        assert!(
+            !flags.contains(&"-fsanitize-trap=bounds".to_owned()),
+            "{flags:?}"
+        );
+    }
+
+    #[test]
+    fn cross_guard_flags_gate_shadow_call_stack_on_aarch64_only() {
+        // SCS is aarch64-only even when the (fake) probe would accept it elsewhere.
+        let non_aarch64 = super::cross_guard_flags("powerpc64-linux-gnu", |_flag| true);
+        assert!(
+            !non_aarch64.contains(&"-fsanitize=shadow-call-stack".to_owned()),
+            "SCS must not be armed off-aarch64: {non_aarch64:?}"
+        );
+        assert!(
+            !non_aarch64.contains(&"-ffixed-x18".to_owned()),
+            "{non_aarch64:?}"
+        );
+    }
+
+    #[test]
+    fn guard_opt_in_value_reads_common_truthy_spellings() {
+        for on in ["1", "on", "true", "yes", "  TRUE  ", "Yes"] {
+            assert!(super::guard_opt_in_value(Some(on)), "{on:?} is on");
+        }
+        for off in ["0", "off", "false", "no", "", "bogus"] {
+            assert!(!super::guard_opt_in_value(Some(off)), "{off:?} is off");
+        }
+        assert!(!super::guard_opt_in_value(None), "unset is off");
+    }
+
+    #[test]
+    fn bounds_guard_traps_a_planted_overflow_and_classifies_through_the_fault_lane() {
+        // HDF-2 deliverable 3: the compiler-assisted guards that `cross_guard_flags`
+        // emits actually trap a planted out-of-bounds access, and that trap is
+        // classified through the HDF-2 fault lane — no ASan, no textual UBSan report.
+        // Gate on clang; self-skip when absent (repo convention on missing tools).
+        if std::process::Command::new("clang")
+            .arg("--version")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            bhfeprintln!("skipping bounds-guard trap test: clang not on PATH");
+            return;
+        }
+
+        // Take the bounds-trap flags exactly as the cross/embedded build would, from
+        // an all-supported host clang.
+        let cc = "clang";
+        let guards = super::cross_guard_flags("x86_64-linux-gnu", |flag| {
+            super::compiler_accepts_flag(cc, flag)
+        });
+        assert!(
+            guards.contains(&"-fsanitize=bounds".to_owned())
+                && guards.iter().any(|f| f.contains("trap")),
+            "host clang must arm a bounds trap for this test: {guards:?}"
+        );
+
+        let dir = std::env::temp_dir().join(format!("bhf-bounds-guard-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("oob.c");
+        // A runtime index (derived from argc) the compiler cannot fold away, driven
+        // out of bounds so `-fsanitize=bounds` fires at the store.
+        std::fs::write(
+            &src,
+            "int main(int argc, char **argv){ (void)argv;\n\
+             \x20 int a[4] = {1,2,3,4};\n\
+             \x20 int i = argc + 8;\n\
+             \x20 a[i] = 99;\n\
+             \x20 return a[argc & 3];\n\
+             }\n",
+        )
+        .unwrap();
+        let bin = dir.join("oob");
+        let mut compile = std::process::Command::new(cc);
+        compile
+            .args(["-O0", "-g"])
+            .args(&guards)
+            .arg("-o")
+            .arg(&bin)
+            .arg(&src);
+        let built = compile.output().expect("spawn clang");
+        assert!(
+            built.status.success(),
+            "bounds-guarded fixture must compile:\n{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+
+        let run = std::process::Command::new(&bin)
+            .output()
+            .expect("run bounds fixture");
+        assert!(
+            !run.status.success(),
+            "the planted out-of-bounds store must trap, not exit cleanly"
+        );
+
+        // On the host the trap manifests as a fatal signal (SIGILL from the trap
+        // instruction); the existing host lane classifies it to BHF-210, unchanged.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert!(
+                run.status.signal().is_some(),
+                "a trap is delivered as a signal on the host: {:?}",
+                run.status
+            );
+            assert_eq!(
+                crate::fatal_signal::rule_id(&run.status, ""),
+                Some("BHF-210"),
+                "host lane classifies the guard trap as a reachable crash"
+            );
+        }
+
+        // The same trap, as an on-target transport would surface it (a CPU
+        // exception with no host signal), classifies through the HDF-2 fault lane to
+        // the same finding rule — closing the loop between the compiler guards and
+        // the fault->finding mapping.
+        let fault = target_transport::Fault {
+            kind: target_transport::FaultKind::CpuException,
+            address: None,
+            detail: "bounds-check trap".to_owned(),
+        };
+        let report = crate::transport_fault::fault_report(&fault);
+        assert_eq!(report.rule_id, "BHF-210");
+        assert_eq!(finding_rules::by_id(report.rule_id).unwrap().cwe, "CWE-119");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
