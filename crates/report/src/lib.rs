@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 pub const REPORT_SCHEMA_VERSION: &str = "bhf.report.v2";
@@ -188,6 +189,10 @@ pub enum ReportError {
     MissingFindingsDir { path: PathBuf },
     #[error("finding record must be a JSON object: {}", path.display())]
     FindingRecordNotObject { path: PathBuf },
+    #[error("unsafe finding input {}: {reason}", path.display())]
+    UnsafeFindingInput { path: PathBuf, reason: String },
+    #[error("finding load budget exceeded at {}: {reason}", path.display())]
+    FindingBudgetExceeded { path: PathBuf, reason: String },
     #[error("invalid confidence model {}: {source}", path.display())]
     ConfidenceModel {
         path: PathBuf,
@@ -652,6 +657,197 @@ pub fn load_findings(findings_dir: &Path) -> Result<Vec<FindingReport>, ReportEr
     load_findings_with_model(findings_dir, None)
 }
 
+/// Limits for read-only findings loading by services that must bound memory.
+#[derive(Debug, Clone, Copy)]
+pub struct FindingLoadBudget {
+    pub max_entries: usize,
+    pub max_findings: usize,
+    pub max_raw_bytes: usize,
+    pub max_normalized_bytes: usize,
+}
+
+/// Load findings without generating reproducers or reading their testcase
+/// bodies. Each regular `finding.json` is read from a no-follow file descriptor
+/// through a byte-limited stream; normalized records are charged to a separate
+/// serialized-byte budget before being retained in the collection.
+pub fn load_findings_bounded(
+    findings_dir: &Path,
+    budget: FindingLoadBudget,
+) -> Result<Vec<FindingReport>, ReportError> {
+    let root_meta = fs::symlink_metadata(findings_dir).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            ReportError::MissingFindingsDir {
+                path: findings_dir.to_path_buf(),
+            }
+        } else {
+            ReportError::Io(error)
+        }
+    })?;
+    if root_meta.file_type().is_symlink() || !root_meta.is_dir() {
+        return Err(ReportError::UnsafeFindingInput {
+            path: findings_dir.to_path_buf(),
+            reason: "findings root must be a real directory".to_owned(),
+        });
+    }
+
+    let mut findings = Vec::new();
+    let mut entries_seen = 0usize;
+    let mut raw_bytes = 0usize;
+    let mut normalized_bytes = 0usize;
+    for entry in fs::read_dir(findings_dir)? {
+        let entry = entry?;
+        entries_seen = entries_seen.saturating_add(1);
+        if entries_seen > budget.max_entries {
+            return Err(ReportError::FindingBudgetExceeded {
+                path: findings_dir.to_path_buf(),
+                reason: format!("more than {} directory entries", budget.max_entries),
+            });
+        }
+        let finding_dir = entry.path();
+        let kind = entry.file_type()?;
+        if kind.is_symlink() {
+            return Err(ReportError::UnsafeFindingInput {
+                path: finding_dir,
+                reason: "symlinked finding directory".to_owned(),
+            });
+        }
+        if !kind.is_dir() {
+            continue;
+        }
+        let finding_path = finding_dir.join("finding.json");
+        let kind = match fs::symlink_metadata(&finding_path) {
+            Ok(meta) => meta.file_type(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(ReportError::Io(error)),
+        };
+        if kind.is_symlink() || !kind.is_file() {
+            return Err(ReportError::UnsafeFindingInput {
+                path: finding_path,
+                reason: "finding.json must be a regular file".to_owned(),
+            });
+        }
+        if findings.len() >= budget.max_findings {
+            return Err(ReportError::FindingBudgetExceeded {
+                path: findings_dir.to_path_buf(),
+                reason: format!("more than {} finding records", budget.max_findings),
+            });
+        }
+        let mut file = open_regular_finding(&finding_dir, &finding_path)?;
+        let remaining = budget.max_raw_bytes.saturating_sub(raw_bytes);
+        let bytes =
+            read_bounded_finding(&mut file, remaining, budget.max_raw_bytes, &finding_path)?;
+        raw_bytes = raw_bytes.saturating_add(bytes.len());
+        let raw: Value = serde_json::from_slice(&bytes)?;
+        let finding = normalize_finding(&finding_dir, &finding_path, raw, None, false)?;
+        let remaining = budget.max_normalized_bytes.saturating_sub(normalized_bytes);
+        let mut counter = ByteCounter {
+            remaining,
+            written: 0,
+        };
+        match serde_json::to_writer(&mut counter, &finding) {
+            Ok(()) => normalized_bytes = normalized_bytes.saturating_add(counter.written),
+            Err(error) if error.is_io() => {
+                return Err(ReportError::FindingBudgetExceeded {
+                    path: finding_path,
+                    reason: format!(
+                        "normalized findings exceed {} bytes",
+                        budget.max_normalized_bytes
+                    ),
+                });
+            }
+            Err(error) => return Err(ReportError::Json(error)),
+        }
+        findings.push(finding);
+    }
+    sort_findings(&mut findings);
+    Ok(findings)
+}
+
+fn read_bounded_finding(
+    file: &mut fs::File,
+    remaining: usize,
+    total_budget: usize,
+    path: &Path,
+) -> Result<Vec<u8>, ReportError> {
+    let mut bytes = Vec::new();
+    file.take(
+        u64::try_from(remaining)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1),
+    )
+    .read_to_end(&mut bytes)?;
+    if bytes.len() > remaining {
+        return Err(ReportError::FindingBudgetExceeded {
+            path: path.to_path_buf(),
+            reason: format!("raw finding JSON exceeds {total_budget} bytes"),
+        });
+    }
+    Ok(bytes)
+}
+
+struct ByteCounter {
+    remaining: usize,
+    written: usize,
+}
+
+impl Write for ByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > self.remaining {
+            return Err(io::Error::other("normalized finding budget exceeded"));
+        }
+        self.remaining -= bytes.len();
+        self.written += bytes.len();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn open_regular_finding(finding_dir: &Path, finding_path: &Path) -> Result<fs::File, ReportError> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(finding_dir)?;
+    let name = CString::new("finding.json").expect("literal has no NUL");
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        return Err(ReportError::Io(io::Error::last_os_error()));
+    }
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    if !file.metadata()?.is_file() {
+        return Err(ReportError::UnsafeFindingInput {
+            path: finding_path.to_path_buf(),
+            reason: "opened finding.json is not a regular file".to_owned(),
+        });
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_regular_finding(_finding_dir: &Path, finding_path: &Path) -> Result<fs::File, ReportError> {
+    let file = fs::File::open(finding_path)?;
+    if !file.metadata()?.is_file() {
+        return Err(ReportError::UnsafeFindingInput {
+            path: finding_path.to_path_buf(),
+            reason: "opened finding.json is not a regular file".to_owned(),
+        });
+    }
+    Ok(file)
+}
+
 pub fn load_findings_with_model(
     findings_dir: &Path,
     confidence_model: Option<&confidence_model::LearnedConfidenceModel>,
@@ -678,13 +874,17 @@ pub fn load_findings_with_model(
         findings.push(load_finding(&finding_dir, &finding_path, confidence_model)?);
     }
 
+    sort_findings(&mut findings);
+    Ok(findings)
+}
+
+fn sort_findings(findings: &mut [FindingReport]) {
     findings.sort_by(|left, right| {
         actionability::finding_sort_key(&left.actionability)
             .cmp(&actionability::finding_sort_key(&right.actionability))
             .then_with(|| left.id.cmp(&right.id))
             .then_with(|| left.source_path.cmp(&right.source_path))
     });
-    Ok(findings)
 }
 
 pub fn render_markdown_report(document: &ReportDocument) -> String {
@@ -1498,6 +1698,16 @@ fn load_finding(
     confidence_model: Option<&confidence_model::LearnedConfidenceModel>,
 ) -> Result<FindingReport, ReportError> {
     let raw: Value = serde_json::from_slice(&fs::read(finding_path)?)?;
+    normalize_finding(finding_dir, finding_path, raw, confidence_model, true)
+}
+
+fn normalize_finding(
+    finding_dir: &Path,
+    finding_path: &Path,
+    raw: Value,
+    confidence_model: Option<&confidence_model::LearnedConfidenceModel>,
+    generate_reproducers: bool,
+) -> Result<FindingReport, ReportError> {
     if !raw.is_object() {
         return Err(ReportError::FindingRecordNotObject {
             path: finding_path.to_path_buf(),
@@ -1514,8 +1724,18 @@ fn load_finding(
     let minimal_reproducer = string_at(&raw, &["minimal_reproducer"])
         .or_else(|| string_at(&raw, &["paths", "minimized"]));
     let raw_generated_repro_ada = string_at(&raw, &["generated_repro_ada"]);
-    let (generated_repro_ada, repro_ada_omitted_reason) =
-        repro_ada_status(finding_dir, &id, raw_generated_repro_ada.as_deref());
+    let (generated_repro_ada, repro_ada_omitted_reason) = if generate_reproducers {
+        repro_ada_status(finding_dir, &id, raw_generated_repro_ada.as_deref())
+    } else if finding_dir.join("repro.adb").is_file() {
+        (Some(finding_artifact_path(&id, "repro.adb")), None)
+    } else {
+        (
+            raw_generated_repro_ada
+                .as_deref()
+                .map(|path| finding_artifact_path(&id, path)),
+            None,
+        )
+    };
 
     let classification = string_at(&raw, &["classification"])
         .or_else(|| string_at(&raw, &["exception", "classification"]))
@@ -1553,7 +1773,13 @@ fn load_finding(
     ensure_finding_cwe(&mut actionability, &raw, rule_id.as_deref());
     // Standalone Python reproducer for EVERY finding (C/C++/Ada/unknown): runs the
     // built harness on the recorded testcase with the sanitizer env.
-    let generated_repro_py = repro_py_status(finding_dir, &id, &raw, &actionability);
+    let generated_repro_py = if generate_reproducers {
+        repro_py_status(finding_dir, &id, &raw, &actionability)
+    } else if finding_dir.join("replay.py").is_file() {
+        Some(finding_artifact_path(&id, "replay.py"))
+    } else {
+        None
+    };
 
     Ok(FindingReport {
         id: id.clone(),
@@ -3055,11 +3281,12 @@ fn md_code(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_report, is_xml_1_0_char, load_findings, load_findings_with_model,
-        relativize_to_source_root, render_junit_report, render_markdown_report,
-        render_markdown_report_with, render_sarif_report, rule_signature, rules,
-        validate_sarif_report, write_reports, ClusterQuality, ClusterReport, CountReport,
-        FindingReport, ReportDocument, ReportOptions, RunReport, REPORT_SCHEMA_VERSION,
+        build_report, is_xml_1_0_char, load_findings, load_findings_bounded,
+        load_findings_with_model, read_bounded_finding, relativize_to_source_root,
+        render_junit_report, render_markdown_report, render_markdown_report_with,
+        render_sarif_report, rule_signature, rules, validate_sarif_report, write_reports,
+        ClusterQuality, ClusterReport, CountReport, FindingLoadBudget, FindingReport,
+        ReportDocument, ReportError, ReportOptions, RunReport, REPORT_SCHEMA_VERSION,
     };
     use confidence_model::{ConfidenceLabel, TrainingSample};
 
@@ -3090,8 +3317,91 @@ mod tests {
     use serde_json::{json, Value};
     use std::collections::BTreeMap;
     use std::fs;
+    use std::io::Write as _;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn bounded_budget() -> FindingLoadBudget {
+        FindingLoadBudget {
+            max_entries: 10,
+            max_findings: 4,
+            max_raw_bytes: 4096,
+            max_normalized_bytes: 8192,
+        }
+    }
+
+    #[test]
+    fn bounded_loader_does_not_read_or_generate_large_auxiliary_reproducer() {
+        let root = temp_dir("bounded-readonly");
+        let finding_dir = root.join("F-1");
+        write_finding(
+            &finding_dir,
+            json!({"id": "F-1", "classification": "unhandled"}),
+        );
+        fs::write(finding_dir.join("testcase.bin"), vec![0u8; 1024 * 1024]).unwrap();
+
+        let findings = load_findings_bounded(&root, bounded_budget()).unwrap();
+
+        assert_eq!(findings.len(), 1);
+        assert!(!finding_dir.join("repro.adb").exists());
+        assert!(!finding_dir.join("replay.py").exists());
+    }
+
+    #[test]
+    fn bounded_reader_rejects_growth_after_file_is_opened() {
+        let root = temp_dir("bounded-growth");
+        let path = root.join("finding.json");
+        fs::write(&path, br#"{"id":"F-1"}"#).unwrap();
+        let mut file = fs::File::open(&path).unwrap();
+        assert!(file.metadata().unwrap().len() < 128);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&vec![b'x'; 4096])
+            .unwrap();
+
+        let error = read_bounded_finding(&mut file, 128, 128, &path).unwrap_err();
+        assert!(matches!(error, ReportError::FindingBudgetExceeded { .. }));
+    }
+
+    #[test]
+    fn bounded_loader_caps_normalized_expansion() {
+        let root = temp_dir("bounded-normalized");
+        write_finding(&root.join("F-1"), json!({"id": "F-1"}));
+        let mut budget = bounded_budget();
+        budget.max_normalized_bytes = 32;
+        let error = load_findings_bounded(&root, budget).unwrap_err();
+        assert!(matches!(error, ReportError::FindingBudgetExceeded { .. }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_loader_rejects_symlinked_finding_inputs() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("bounded-symlink");
+        let outside = temp_dir("bounded-symlink-outside");
+        write_finding(&outside.join("F-out"), json!({"id": "F-out"}));
+        symlink(outside.join("F-out"), root.join("F-link")).unwrap();
+        assert!(matches!(
+            load_findings_bounded(&root, bounded_budget()),
+            Err(ReportError::UnsafeFindingInput { .. })
+        ));
+
+        let root = temp_dir("bounded-file-symlink");
+        let finding_dir = root.join("F-1");
+        fs::create_dir(&finding_dir).unwrap();
+        symlink(
+            outside.join("F-out/finding.json"),
+            finding_dir.join("finding.json"),
+        )
+        .unwrap();
+        assert!(matches!(
+            load_findings_bounded(&root, bounded_budget()),
+            Err(ReportError::UnsafeFindingInput { .. })
+        ));
+    }
 
     #[test]
     fn write_reports_emits_sorted_json_and_markdown() {

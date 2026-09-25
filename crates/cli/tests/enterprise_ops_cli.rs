@@ -291,7 +291,7 @@ fn pack_verify_checks_air_gapped_item_hashes() {
 }
 
 #[test]
-fn pack_create_builds_deterministic_signed_update_pack_manifest() {
+fn pack_create_builds_deterministic_integrity_digest_manifest() {
     let root = temp_dir("pack-create");
     fs::create_dir_all(root.join("rules")).unwrap();
     fs::create_dir_all(root.join("cve")).unwrap();
@@ -351,8 +351,7 @@ fn pack_create_builds_deterministic_signed_update_pack_manifest() {
             "policy_id": "pack-create-policy",
             "update_packs": {
                 "allowed_kinds": ["rules", "cve"],
-                "require_signature": true,
-                "trusted_keys": ["offline-root"]
+                "require_signature": false
             }
         }))
         .unwrap(),
@@ -375,7 +374,7 @@ fn pack_create_builds_deterministic_signed_update_pack_manifest() {
             .output()
             .unwrap(),
     );
-    assert_eq!(read_json(&verify)["signature"]["status"], "verified");
+    assert_eq!(read_json(&verify)["signature"]["status"], "integrity_only");
 }
 
 #[test]
@@ -1322,6 +1321,17 @@ fn enterprise_ops_support_runners_packs_policy_ci_audit_and_dashboard() {
     assert_eq!(read_json(&pack_inspect)["counts"]["items"], 1);
 
     let pack_verify = root.join("pack-verify.json");
+    let integrity_policy = root.join("pack-integrity-policy.json");
+    fs::write(
+        &integrity_policy,
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": "bhf.policy.v1",
+            "policy_id": "pack-integrity",
+            "update_packs": {"allowed_kinds": ["rules", "cve", "corpus"], "require_signature": false}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     assert_success(
         Command::new(bhf_bin())
             .args([
@@ -1331,7 +1341,7 @@ fn enterprise_ops_support_runners_packs_policy_ci_audit_and_dashboard() {
                 "--root",
                 pack_root.to_str().unwrap(),
                 "--policy",
-                policy.to_str().unwrap(),
+                integrity_policy.to_str().unwrap(),
                 "--out",
                 pack_verify.to_str().unwrap(),
             ])
@@ -1339,7 +1349,7 @@ fn enterprise_ops_support_runners_packs_policy_ci_audit_and_dashboard() {
             .unwrap(),
     );
     let pack_verify_json = read_json(&pack_verify);
-    assert_eq!(pack_verify_json["signature"]["status"], "verified");
+    assert_eq!(pack_verify_json["signature"]["status"], "integrity_only");
     assert_eq!(pack_verify_json["signature"]["key_id"], "offline-root");
 
     let installed = root.join("installed-packs");
@@ -1354,7 +1364,7 @@ fn enterprise_ops_support_runners_packs_policy_ci_audit_and_dashboard() {
                 "--install-dir",
                 installed.to_str().unwrap(),
                 "--policy",
-                policy.to_str().unwrap(),
+                integrity_policy.to_str().unwrap(),
             ])
             .output()
             .unwrap(),
@@ -1570,7 +1580,7 @@ fn enterprise_ops_support_runners_packs_policy_ci_audit_and_dashboard() {
     );
     assert_eq!(
         exported["governance"]["update_packs"][0]["signature"]["status"],
-        "verified"
+        "integrity_only"
     );
     assert_eq!(
         exported["required_artifacts"]["missing"]

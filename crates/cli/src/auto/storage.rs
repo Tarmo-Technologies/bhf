@@ -86,18 +86,27 @@ pub(crate) fn compact_build_caches(work_dir: &Path) -> std::io::Result<CompactRe
     let before_bytes = work_dir_size_bytes(work_dir)?;
     let mut removed_paths = 0;
     for harness_root in [work_dir.join("harnesses"), work_dir.join("auto")] {
+        // The selected work directory may itself be a user-chosen symlink
+        // alias. Never follow a symlink below that boundary while discovering
+        // owned harness directories.
+        if !is_real_directory(&harness_root) {
+            continue;
+        }
         let Ok(entries) = std::fs::read_dir(harness_root) else {
             continue;
         };
         for entry in entries.flatten() {
             let harness = entry.path();
-            if !harness.is_dir() {
+            if !is_real_directory(&harness) {
                 continue;
             }
             for target in [
                 harness.join("rust_harness").join("target"),
                 harness.join("incrate").join("target"),
             ] {
+                if !is_real_directory(target.parent().expect("target has a parent")) {
+                    continue;
+                }
                 if remove_directory_if_owned(&target)? {
                     removed_paths += 1;
                 }
@@ -110,6 +119,12 @@ pub(crate) fn compact_build_caches(work_dir: &Path) -> std::io::Result<CompactRe
         after_bytes,
         removed_paths,
     })
+}
+
+fn is_real_directory(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        .unwrap_or(false)
 }
 
 /// User-requested compaction additionally clears scratch space. It deliberately
@@ -248,5 +263,83 @@ mod tests {
         assert!(!disabled.checkpoint(temp.path()).unwrap());
         let bounded = WorkDirBudget::new(temp.path(), 1).unwrap();
         assert!(bounded.exhausted());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compaction_does_not_follow_symlinked_ancestors_and_unlinks_leaf_alias() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(outside.join("H/incrate/target")).unwrap();
+        std::fs::write(outside.join("H/incrate/target/sentinel"), "keep").unwrap();
+        std::fs::create_dir_all(work.join("harnesses")).unwrap();
+        symlink(&outside, work.join("auto")).unwrap();
+        symlink(outside.join("H"), work.join("harnesses/H")).unwrap();
+
+        // A user-selected work root alias is accepted; only symlinks below it
+        // are treated as boundaries during discovery.
+        let work_alias = temp.path().join("work-alias");
+        symlink(&work, &work_alias).unwrap();
+        compact_build_caches(&work_alias).unwrap();
+        assert_eq!(
+            std::fs::read(outside.join("H/incrate/target/sentinel")).unwrap(),
+            b"keep"
+        );
+
+        let outside_roots = temp.path().join("outside-roots");
+        std::fs::create_dir_all(outside_roots.join("incrate/target")).unwrap();
+        std::fs::create_dir_all(outside_roots.join("rust_harness/target")).unwrap();
+        std::fs::write(outside_roots.join("incrate/target/sentinel"), "keep").unwrap();
+        std::fs::write(outside_roots.join("rust_harness/target/sentinel"), "keep").unwrap();
+        let rust_harness = work.join("harnesses/RUST/rust_harness");
+        std::fs::create_dir_all(rust_harness.parent().unwrap()).unwrap();
+        symlink(outside_roots.join("rust_harness"), &rust_harness).unwrap();
+        let incrate = work.join("harnesses/INCRATE/incrate");
+        std::fs::create_dir_all(incrate.parent().unwrap()).unwrap();
+        symlink(outside_roots.join("incrate"), &incrate).unwrap();
+        compact_build_caches(&work).unwrap();
+        assert_eq!(
+            std::fs::read(outside_roots.join("incrate/target/sentinel")).unwrap(),
+            b"keep"
+        );
+        assert_eq!(
+            std::fs::read(outside_roots.join("rust_harness/target/sentinel")).unwrap(),
+            b"keep"
+        );
+
+        let outside_harnesses = temp.path().join("outside-harnesses");
+        std::fs::create_dir_all(outside_harnesses.join("H/incrate/target")).unwrap();
+        std::fs::write(outside_harnesses.join("H/incrate/target/sentinel"), "keep").unwrap();
+        let root_alias_work = temp.path().join("root-alias-work");
+        std::fs::create_dir_all(&root_alias_work).unwrap();
+        symlink(&outside_harnesses, root_alias_work.join("harnesses")).unwrap();
+        compact_build_caches(&root_alias_work).unwrap();
+        assert_eq!(
+            std::fs::read(outside_harnesses.join("H/incrate/target/sentinel")).unwrap(),
+            b"keep"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compaction_unlinks_a_symlinked_cache_leaf_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        let outside = temp.path().join("outside-target");
+        let cache = work.join("harnesses/H/incrate/target");
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("sentinel"), "keep").unwrap();
+        symlink(&outside, &cache).unwrap();
+
+        assert_eq!(compact_build_caches(&work).unwrap().removed_paths, 1);
+        assert!(!cache.exists());
+        assert_eq!(std::fs::read(outside.join("sentinel")).unwrap(), b"keep");
     }
 }

@@ -2890,6 +2890,10 @@ fn run_attempt(
                 // examples rather than only empty/`A` bytes.
                 let mut seeds = vec![b"".to_vec(), b"A".to_vec(), b"AAAAAAAA".to_vec()];
                 seeds.extend(options.user_seeds.iter().cloned());
+                seeds.extend(
+                    crate::auto::go_build::load_structured_seed_inputs(&harness_dir)
+                        .map_err(anyhow::Error::msg)?,
+                );
                 crate::fuzz::expand_sequence_portfolio_seeds(&harness_dir, &mut seeds);
                 // Start each target's edge-coverage bitmap empty; passes then
                 // accumulate into it (#385).

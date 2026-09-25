@@ -16,6 +16,7 @@ finding_rules = { path = "../finding_rules" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+libc = "0.2"
 
 [lib]
 path = "src/lib.rs"

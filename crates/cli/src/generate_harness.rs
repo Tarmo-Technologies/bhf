@@ -13227,7 +13227,9 @@ mod tests {
         };
         let flags = extract_compile_database_flags(&entry, Path::new("./t.c"));
         assert!(
-            !flags.iter().any(|f| f == "-Werror" || f.starts_with("-Werror=")),
+            !flags
+                .iter()
+                .any(|f| f == "-Werror" || f.starts_with("-Werror=")),
             "warnings-as-errors must be dropped: {flags:?}"
         );
         assert!(

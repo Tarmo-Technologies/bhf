@@ -68,9 +68,8 @@ pub fn run_snapshot_once(config: &NyxAdapterConfig, input: &[u8]) -> Result<RunO
     }
     #[cfg(feature = "nyx-engine")]
     {
-        unreachable!(
-            "nyx-engine feature is set but the real libnyx integration has not landed yet; remove the feature flag to suppress this build until then"
-        );
+        let _ = input;
+        Err(NyxError::NotImplemented)
     }
     #[cfg(not(feature = "nyx-engine"))]
     {
@@ -84,21 +83,18 @@ fn run_software_replay(config: &NyxAdapterConfig, input: &[u8]) -> Result<RunOut
     if !target.is_file() {
         return Err(NyxError::SnapshotMissing(target));
     }
-    let input_file = config.snapshot_dir.join(format!(
-        "input-{}.bin",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    std::fs::write(&input_file, input)?;
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let mut input_file = tempfile::NamedTempFile::new_in(&config.snapshot_dir)?;
+    input_file.write_all(input)?;
+    let mut captured_stdout = tempfile::tempfile()?;
+    let child_stdout = captured_stdout.try_clone()?;
 
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
     let mut child = Command::new(&target)
-        .arg(&input_file)
+        .arg(input_file.path())
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
+        .stdout(Stdio::from(child_stdout))
         .stderr(Stdio::null())
         .spawn()?;
     let timeout = Duration::from_millis(config.timeout_ms);
@@ -118,11 +114,9 @@ fn run_software_replay(config: &NyxAdapterConfig, input: &[u8]) -> Result<RunOut
             }
         }
     }
+    captured_stdout.seek(SeekFrom::Start(0))?;
     let mut stdout = Vec::new();
-    if let Some(mut s) = child.stdout.take() {
-        use std::io::Read;
-        let _ = s.read_to_end(&mut stdout);
-    }
+    captured_stdout.take(1024 * 1024).read_to_end(&mut stdout)?;
     let exit_kind = if timed_out {
         ExitKind::Timeout
     } else {
@@ -133,7 +127,6 @@ fn run_software_replay(config: &NyxAdapterConfig, input: &[u8]) -> Result<RunOut
             ExitKind::Crash
         }
     };
-    let _ = std::fs::remove_file(&input_file);
     Ok(RunOutcome {
         exit_kind,
         coverage_edges: Vec::new(),
@@ -170,6 +163,7 @@ mod tests {
         dir
     }
 
+    #[cfg(not(feature = "nyx-engine"))]
     #[test]
     fn run_snapshot_once_returns_snapshot_missing_when_target_absent() {
         let dir = tempdir("no-target");
@@ -182,7 +176,7 @@ mod tests {
         assert!(matches!(result, Err(NyxError::SnapshotMissing(_))));
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(feature = "nyx-engine")))]
     #[test]
     fn run_snapshot_once_software_replay_against_bin_true() {
         use std::os::unix::fs::symlink;
@@ -197,7 +191,7 @@ mod tests {
         assert_eq!(outcome.exit_kind, ExitKind::Ok);
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(feature = "nyx-engine")))]
     #[test]
     fn run_snapshot_once_software_replay_against_bin_false() {
         use std::os::unix::fs::symlink;
@@ -212,6 +206,27 @@ mod tests {
         assert_eq!(outcome.exit_kind, ExitKind::Crash);
     }
 
+    #[cfg(all(unix, not(feature = "nyx-engine")))]
+    #[test]
+    fn software_replay_drains_large_stdout_before_waiting() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir("large-stdout");
+        let target = dir.join("target");
+        std::fs::write(&target, "#!/bin/sh\nhead -c 2097152 /dev/zero\n").unwrap();
+        let mut permissions = std::fs::metadata(&target).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&target, permissions).unwrap();
+        let config = NyxAdapterConfig {
+            snapshot_dir: dir.clone(),
+            coverage: CoverageStrategy::SanCov,
+            timeout_ms: 5000,
+        };
+        let outcome = run_snapshot_once(&config, b"hello").unwrap();
+        assert_eq!(outcome.exit_kind, ExitKind::Ok);
+        assert_eq!(outcome.stdout.len(), 1024 * 1024);
+        assert_eq!(std::fs::read_dir(dir).unwrap().count(), 1);
+    }
+
     #[test]
     fn run_snapshot_once_rejects_missing_snapshot_dir() {
         let config = NyxAdapterConfig {
@@ -221,6 +236,21 @@ mod tests {
         };
         let result = run_snapshot_once(&config, b"input");
         assert!(matches!(result, Err(NyxError::SnapshotMissing(_))));
+    }
+
+    #[cfg(feature = "nyx-engine")]
+    #[test]
+    fn enabled_but_unimplemented_engine_returns_error_instead_of_panicking() {
+        let dir = tempdir("feature-not-implemented");
+        let config = NyxAdapterConfig {
+            snapshot_dir: dir,
+            coverage: CoverageStrategy::IntelPt,
+            timeout_ms: 1000,
+        };
+        assert!(matches!(
+            run_snapshot_once(&config, b"input"),
+            Err(NyxError::NotImplemented)
+        ));
     }
 
     #[test]

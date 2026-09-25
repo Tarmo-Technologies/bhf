@@ -1,14 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// `auto --force` on the Go lane. Both fixture targets are undrivable by the
-// type-directed generator — one is a METHOD (needs a receiver), one takes a MAP
-// (no byte decoder) — so without the flag they are a clean `unsupported_params`
-// skip, which is the residual blocker on 116 Go targets in the sweep.
+// `auto --force` on the Go lane. Feed needs a receiver and skips without the
+// flag. Render takes raw bytes plus a data-only map and is now driven by a
+// length-prefixed raw field followed by a JSON field without force.
 //
-// Forced, each is called on a synthesized zero value and reaches its planted
-// out-of-bounds read. Because the value is fabricated, the run must ALSO mark the
-// target `forced` and floor its findings to `low`: a nil map or zero receiver can
-// panic on its own account, and such a crash may never read as a confirmed defect.
+// Forced Feed is called on a synthesized zero receiver. Its findings must be
+// marked `forced` and floored to `low`; Render stays an unforced campaign.
 //
 // Skips cleanly when no `go` toolchain is installed (the GNAT-less rule).
 
@@ -78,25 +75,38 @@ fn run(tag: &str, force: bool) -> (PathBuf, serde_json::Value) {
 }
 
 #[test]
-fn unforced_go_method_and_undrivable_param_skip_cleanly() {
+fn unforced_go_method_skips_while_data_map_fuzzes() {
     if !have_go() {
         eprintln!("skipping: no go toolchain on PATH (GNAT-less rule)");
         return;
     }
     let (work, json) = run("plain", false);
     assert_eq!(
-        json["summary"]["unsupported_params"], 2,
-        "both targets are undrivable without --force: {json}"
+        json["summary"]["unsupported_params"], 1,
+        "only the receiver still needs --force: {json}"
     );
-    assert_eq!(json["summary"]["built_and_fuzzed"], 0);
+    assert_eq!(json["summary"]["built_and_fuzzed"], 1);
     let reasons = json["targets"].to_string();
     assert!(
         reasons.contains("needs a receiver value"),
         "the method must say what is missing: {reasons}"
     );
+    let render = json["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|target| target["name"] == "Render")
+        .unwrap();
+    assert_eq!(render["outcome"]["outcome"], "built_and_fuzzed");
     assert!(
-        reasons.contains("unsupported Go parameter type"),
-        "the map parameter must say what is missing: {reasons}"
+        render["outcome"]["passes"][0]["coverage_edges"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0
+    );
+    assert_eq!(
+        render["outcome"]["passes"][0]["target_entry_observed"],
+        true
     );
     let _ = std::fs::remove_dir_all(&work);
 }
@@ -112,9 +122,8 @@ fn forced_go_targets_build_fuzz_and_are_marked_forced() {
         json["summary"]["built_and_fuzzed"], 2,
         "both targets fuzz once forced: {json}"
     );
-    // Every forced target is counted as such, so N forced targets are never read
-    // as N confirmed campaigns.
-    assert_eq!(json["summary"]["forced"], 2, "{json}");
+    // Only Feed used a synthesized receiver; Render's map came from input.
+    assert_eq!(json["summary"]["forced"], 1, "{json}");
 
     // The synthesized value is recorded on the target, naming what was fabricated.
     let targets = json["targets"].to_string();
@@ -127,14 +136,17 @@ fn forced_go_targets_build_fuzz_and_are_marked_forced() {
         "the receiver synthesis must name the type: {targets}"
     );
 
-    // The planted CWE-125 reads are found, and every row is floored to `low` with
-    // the forced caveat — the fabricated value makes any crash a maybe.
+    // The planted CWE-125 read in Feed is found. Its row is floored to `low`
+    // with the forced caveat; an unforced Render finding need not be floored.
     let csv = std::fs::read_to_string(work.join("auto/findings.csv")).expect("findings.csv");
     let header: Vec<&str> = csv.lines().next().expect("header").split(',').collect();
     let confidence = header.iter().position(|c| *c == "confidence").unwrap();
-    let mut rows = 0usize;
+    let mut forced_rows = 0usize;
     for row in csv.lines().skip(1) {
-        rows += 1;
+        if !row.contains("entry:Feed") {
+            continue;
+        }
+        forced_rows += 1;
         let cells: Vec<&str> = row.split(',').collect();
         assert_eq!(
             cells[confidence], "low",
@@ -145,7 +157,10 @@ fn forced_go_targets_build_fuzz_and_are_marked_forced() {
             "a forced finding must carry the caveat note: {row}"
         );
     }
-    assert!(rows > 0, "the planted panics must be found:\n{csv}");
+    assert!(
+        forced_rows > 0,
+        "the forced Feed panic must be found:\n{csv}"
+    );
     assert!(
         csv.contains(",125;") || csv.contains(",125,"),
         "expected a CWE-125 index-out-of-bounds finding:\n{csv}"

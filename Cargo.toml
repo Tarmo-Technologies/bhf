@@ -67,7 +67,7 @@ lto = "thin"
 [workspace.package]
 version = "0.2.32"
 edition = "2021"
-rust-version = "1.83"
+rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/Tarmo-Technologies/bhf"
 
@@ -89,9 +89,9 @@ targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 # Checksums to generate for each App
 checksum = "sha256"
 # GitHub Artifact Attestations are disabled because GitHub currently rejects
-# attestation persistence for this private org/repo plan. Release integrity is
-# covered by SHA-256 sidecars and signed content packs until org/repo support is
-# available.
+# attestation persistence for this private org/repo plan. SHA-256 sidecars and
+# content-pack digests detect changes relative to their manifests but do not
+# authenticate the publisher; trusted release delivery remains a separate gate.
 github-attestations = false
 # Which actions to run on pull requests
 pr-run-mode = "plan"

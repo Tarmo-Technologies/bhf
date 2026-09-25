@@ -880,9 +880,7 @@ pub fn probe_build(
         None => {
             let bytes = user_supplied_db?;
             let db = probe_dir.join("compile_commands.json");
-            if std::fs::create_dir_all(&probe_dir).is_ok()
-                && std::fs::write(&db, &bytes).is_ok()
-            {
+            if std::fs::create_dir_all(&probe_dir).is_ok() && std::fs::write(&db, &bytes).is_ok() {
                 bhfeprintln!(
                     "bhf auto: --probe-build: could not regenerate a compile database offline; \
                      using the compile_commands.json already present at {}. (Tip: a \
@@ -3202,8 +3200,7 @@ mod tests {
         let probe = root.join(PROBE_DIR);
         fs::create_dir_all(&probe).unwrap();
         let db = probe.join("compile_commands.json");
-        let content =
-            br#"[{"directory":"/x","file":"/x/a.c","arguments":["clang","-c","a.c"]}]"#;
+        let content = br#"[{"directory":"/x","file":"/x/a.c","arguments":["clang","-c","a.c"]}]"#;
         fs::write(&db, content).unwrap();
 
         let recovered = probe_build(&root, None, &multicore_fuzz::SanitizerSelection::None)

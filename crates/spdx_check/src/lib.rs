@@ -101,9 +101,10 @@ fn collect_auditable_files(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) ->
             // source. They may exist in a developer checkout but not in CI, so
             // including them would make the checked-in manifest nondeterministic.
             if matches!(file_name.as_ref(), ".git" | "target" | "bhf_work" | "dist")
-                || path
-                    .strip_prefix(root)
-                    .is_ok_and(|relative| relative == Path::new("docs/superpowers"))
+                || path.strip_prefix(root).is_ok_and(|relative| {
+                    relative == Path::new("docs/superpowers")
+                        || relative == Path::new("benchmarks/engine-comparison/results")
+                })
             {
                 continue;
             }
@@ -318,6 +319,32 @@ mod tests {
 
         assert_eq!(manifest.files.len(), 1);
         assert_eq!(manifest.files[0].path, "src/lib.rs");
+    }
+
+    #[test]
+    fn manifest_skips_generated_engine_comparison_runs() {
+        let root = test_root("manifest-engine-comparison-results");
+        fs::create_dir_all(root.join("benchmarks/engine-comparison/results/run-runs/source"))
+            .unwrap();
+        fs::create_dir_all(root.join("benchmarks/engine-comparison")).unwrap();
+        fs::write(
+            root.join("benchmarks/engine-comparison/source.c"),
+            "// SPDX-License-Identifier: Apache-2.0\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("benchmarks/engine-comparison/results/run-runs/source/generated.c"),
+            "int generated(void) { return 1; }\n",
+        )
+        .unwrap();
+
+        let manifest = build_manifest(&root).unwrap();
+        assert_eq!(manifest.files.len(), 1);
+        assert_eq!(
+            manifest.files[0].path,
+            "benchmarks/engine-comparison/source.c"
+        );
+        check(&root).unwrap();
     }
 
     #[test]

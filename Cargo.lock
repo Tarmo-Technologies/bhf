@@ -517,8 +517,10 @@ dependencies = [
 name = "continuous_daemon"
 version = "0.2.32"
 dependencies = [
+ "libc",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
 ]
 
@@ -849,6 +851,7 @@ dependencies = [
  "corpus",
  "event_log",
  "fuzz_engine_builtin",
+ "tempfile",
  "thiserror",
 ]
 
@@ -903,7 +906,10 @@ dependencies = [
 name = "governance"
 version = "0.2.32"
 dependencies = [
+ "libc",
+ "ring",
  "sbom_ingest",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",
@@ -1713,6 +1719,7 @@ dependencies = [
  "confidence_model",
  "corpus",
  "finding_rules",
+ "libc",
  "serde",
  "serde_json",
  "thiserror",

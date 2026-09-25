@@ -840,6 +840,8 @@ struct PreparedFuzzRun {
     engine: FuzzEngine,
     mode: actionability::RunMode,
     extra_env: Vec<(String, String)>,
+    /// Keeps the standalone builtin driver's coverage bitmap alive for the run.
+    _local_coverage_map: Option<tempfile::TempPath>,
     cmplog_log: Option<PathBuf>,
     grammar_file: Option<PathBuf>,
     structured_inputs: StructuredInputMode,
@@ -1375,10 +1377,31 @@ fn prepare(args: FuzzArgs) -> Result<PreparedFuzzRun, String> {
             .into_iter()
             .map(|seed| seed.bytes),
     );
+    seeds.extend(crate::auto::go_build::load_structured_seed_inputs(
+        &crate::auto::layout::harness_dir(&work_dir, &args.harness),
+    )?);
     bound_seed_corpus(&mut seeds, args.max_len.max(1));
     let mut extra_env = args.extra_env;
     extra_env.extend(sanitizer_env.clone());
     apply_fuzz_child_env_overrides(&mut extra_env);
+    let local_coverage_map = if args.engine == FuzzEngine::Builtin
+        && resolve_harness_protocol(&runner, &work_dir) == HarnessProtocol::BhfFramed
+        && !extra_env.iter().any(|(key, _)| key == "BHF_COV_SHM")
+    {
+        let file = tempfile::NamedTempFile::new_in(&work_dir)
+            .map_err(|error| format!("create harness coverage map: {error}"))?;
+        file.as_file()
+            .set_len(BHF_COV_BITS as u64)
+            .map_err(|error| format!("size harness coverage map: {error}"))?;
+        let path = file.into_temp_path();
+        extra_env.push((
+            "BHF_COV_SHM".to_owned(),
+            path.to_string_lossy().into_owned(),
+        ));
+        Some(path)
+    } else {
+        None
+    };
 
     Ok(PreparedFuzzRun {
         work_dir,
@@ -1393,6 +1416,7 @@ fn prepare(args: FuzzArgs) -> Result<PreparedFuzzRun, String> {
         engine: args.engine,
         mode: args.mode,
         extra_env,
+        _local_coverage_map: local_coverage_map,
         cmplog_log: args.cmplog_log,
         grammar_file: args.grammar_file,
         structured_inputs: args.structured_inputs,
@@ -2083,7 +2107,7 @@ fn run_builtin_with_progress(
     // file activity the shim traces; there the resource-leak oracle is taint-gated
     // to avoid flagging the interpreter's fixed env/stdlib opens as target leaks.
     // Detected once from the launcher `main` marker.
-    let interpreted_lane = std::fs::read_to_string(&prepared.harness_path)
+    let interpreted_lane = read_bounded_marker_text(&prepared.harness_path, true)
         .map(|s| {
             s.contains("BHF_PY_LAUNCHER")
                 || s.contains("BHF_PL_LAUNCHER")
@@ -2186,7 +2210,8 @@ fn run_builtin_with_progress(
     // Replay-verify + driver-glue filtering only apply to passthrough C/C++
     // libFuzzer harnesses (the class that crashes in driver glue); the Ada
     // event-log lane validates findings separately via per-spawn replay.
-    let c_libfuzzer_harness = is_c_libfuzzer_harness(&prepared.runner, &prepared.work_dir);
+    let protocol = resolve_harness_protocol(&prepared.runner, &prepared.work_dir);
+    let c_libfuzzer_harness = protocol == HarnessProtocol::LibFuzzerSingleInput;
     // #416: crash inputs (this run's, plus any recorded by an earlier pass) are
     // excluded from the persisted corpus so a crashing input is never left in the
     // clean coverage queue. Seeded from the durable findings dir for cross-pass
@@ -2241,10 +2266,8 @@ fn run_builtin_with_progress(
     // `-fsanitize=fuzzer` C harness does not speak it and stays per-spawn. The
     // ForkServer::spawn handshake is the backstop — it returns Err -> None for
     // anything that doesn't complete the protocol.
-    let driver_harness = is_bhf_driver_harness(&prepared.runner);
-    let mut fork_server = if prepared.fork_server
-        && (driver_harness || !is_c_libfuzzer_harness(&prepared.runner, &prepared.work_dir))
-    {
+    let driver_harness = protocol == HarnessProtocol::BhfFramed;
+    let mut fork_server = if prepared.fork_server && !c_libfuzzer_harness {
         ForkServer::spawn(
             &prepared.runner,
             &prepared.work_dir,
@@ -2255,6 +2278,7 @@ fn run_builtin_with_progress(
     } else {
         None
     };
+    let mut forkserver_started = fork_server.is_some();
 
     // Coverage-guided corpus (#398, #412): a SanitizerCoverage edge bitmap is
     // shared via BHF_COV_SHM by the C/C++ bhf driver (trace-pc-guard) AND,
@@ -2367,13 +2391,14 @@ fn run_builtin_with_progress(
                     // Drop (kill/reap) the dead server, isolate the crash via the
                     // proven per-spawn path, then respawn for subsequent inputs.
                     drop(fork_server.take());
-                    let run = run_harness(
+                    let run = run_harness_with_protocol(
                         &prepared.runner,
                         &prepared.work_dir,
                         &input,
                         &prepared.extra_env,
                         prepared.per_input_timeout,
                         prepared.rss_limit_mb,
+                        protocol,
                     )?;
                     fork_server = ForkServer::spawn(
                         &prepared.runner,
@@ -2382,17 +2407,19 @@ fn run_builtin_with_progress(
                         prepared.rss_limit_mb,
                     )
                     .ok();
+                    forkserver_started |= fork_server.is_some();
                     run
                 }
             }
         } else {
-            run_harness(
+            run_harness_with_protocol(
                 &prepared.runner,
                 &prepared.work_dir,
                 &input,
                 &prepared.extra_env,
                 prepared.per_input_timeout,
                 prepared.rss_limit_mb,
+                protocol,
             )?
         };
         executions += 1;
@@ -2492,7 +2519,7 @@ fn run_builtin_with_progress(
         // dedup / replay-verify emission path below exactly like a per-spawn crash.
         if from_fork_server
             && made_progress
-            && c_libfuzzer_harness
+            && driver_harness
             && run.sanitizer.is_none()
             && !input.is_empty()
         {
@@ -2869,7 +2896,7 @@ fn run_builtin_with_progress(
         corpus_new,
         corpus_duplicates,
         corpus_persisted,
-        execution: builtin_execution_summary(&prepared.runner, &prepared.work_dir),
+        execution: builtin_execution_summary(protocol, forkserver_started),
         cmplog: cmplog_summary,
         sanitizers: sanitizer_summary(&prepared.sanitizers, &prepared.sanitizer_env, false),
         coverage: coverage_from_env(&prepared.extra_env),
@@ -3433,68 +3460,84 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
     Ok(summary)
 }
 
-/// Detect a libFuzzer-built C/C++ harness by looking for a sibling
-/// `main.c` or `main.cpp` in the generated_harnesses tree. libFuzzer
-/// binaries run their own fuzz engine when invoked without args - which
-/// hangs the builtin engine's "stream stdin + wait" loop. For these
-/// harnesses we'll write the input to a temp file and pass it as argv[1]
-/// to run a single iteration.
-fn is_c_libfuzzer_harness(runner: &replay_min::HarnessRunner, work_dir: &Path) -> bool {
-    let harness_path = runner.harness_path();
-    // Sibling layout: bhf auto writes to <work>/harnesses/<id>/main +
-    // <work>/harnesses/<id>/main.c. Detect the C source next to the binary.
-    if let Some(dir) = harness_path.parent() {
-        if dir.join("main.c").is_file() || dir.join("main.cpp").is_file() {
-            return true;
-        }
-    }
-    // Legacy layout: <work>/generated_harnesses/<id>/main.c. Kept so
-    // standalone `bhf fuzz` against a hand-built generated tree
-    // still detects the libFuzzer single-input shape.
-    let harness_id = harness_path
-        .parent()
-        .and_then(|p| p.file_name())
-        .and_then(|n| n.to_str());
-    let Some(id) = harness_id else { return false };
-    let candidate_c = work_dir.join("generated_harnesses").join(id).join("main.c");
-    let candidate_cpp = work_dir
-        .join("generated_harnesses")
-        .join(id)
-        .join("main.cpp");
-    candidate_c.is_file() || candidate_cpp.is_file()
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HarnessProtocol {
+    BhfFramed,
+    LibFuzzerSingleInput,
+    StdinEventLog,
 }
 
-/// A passthrough harness built with the bhf driver speaks the persistent
-/// framed fork-server protocol (its `main.c` carries the `BHF_FRAMED` loop),
-/// so the engine can drive it in one long-lived process at fork-server rates
-/// instead of paying an ASan-instrumented per-spawn startup for every input — the
-/// difference between thousands and millions of execs in a 60s budget. Detected
-/// by the marker in the sibling source. A crash still surfaces: ASan aborts the
-/// whole process, the parent sees the closed pipe (`ForkOutcome::Died`) and
-/// re-isolates that input via the per-spawn path that captures the report.
-fn is_bhf_driver_harness(runner: &replay_min::HarnessRunner) -> bool {
-    let harness_path = runner.harness_path();
-    let Some(dir) = harness_path.parent() else {
-        return false;
-    };
-    // C/C++/Rust ship a sibling main.c/main.cpp with the marker; the native Java
-    // lane's `main` is itself a launcher script carrying it (reading a real ELF
-    // binary as text fails on the non-UTF-8 bytes and is ignored).
-    let harness_name = harness_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
-    for name in ["main.c", "main.cpp", harness_name] {
-        if name.is_empty() {
-            continue;
+const MAX_HARNESS_MARKER_TEXT_BYTES: u64 = 1024 * 1024;
+
+/// Inspect only bounded text. The executable probe rejects binary-looking
+/// prefixes before decoding, so a large ELF is never loaded as a UTF-8 string.
+fn read_bounded_marker_text(path: &Path, executable: bool) -> Option<String> {
+    let metadata = fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_HARNESS_MARKER_TEXT_BYTES {
+        return None;
+    }
+    let mut file = fs::File::open(path).ok()?;
+    if executable {
+        let mut prefix = [0u8; 4096];
+        let read = file.read(&mut prefix).ok()?;
+        if prefix[..read].contains(&0) || std::str::from_utf8(&prefix[..read]).is_err() {
+            return None;
         }
-        if let Ok(src) = std::fs::read_to_string(dir.join(name)) {
-            if src.contains("BHF_FRAMED") {
-                return true;
+        file.seek(SeekFrom::Start(0)).ok()?;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_HARNESS_MARKER_TEXT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_HARNESS_MARKER_TEXT_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// Resolve the protocol from the source matching any supported work layout.
+/// BHF's generated C source defines `LLVMFuzzerTestOneInput` *and* its own
+/// `BHF_FRAMED` main, so source existence alone must never override the marker.
+fn resolve_harness_protocol(
+    runner: &replay_min::HarnessRunner,
+    work_dir: &Path,
+) -> HarnessProtocol {
+    let harness_path = runner.harness_path();
+    if read_bounded_marker_text(harness_path, true).is_some_and(|text| text.contains("BHF_FRAMED"))
+    {
+        return HarnessProtocol::BhfFramed;
+    }
+    let mut dirs = Vec::new();
+    if let Some(parent) = harness_path.parent() {
+        dirs.push(parent.to_path_buf());
+        let id_dir = if parent.file_name().is_some_and(|name| name == "obj") {
+            parent.parent()
+        } else {
+            Some(parent)
+        };
+        if let Some(id) = id_dir.and_then(Path::file_name) {
+            for root in ["generated_harnesses", "harnesses", "auto"] {
+                dirs.push(work_dir.join(root).join(id));
             }
         }
     }
-    false
+    let mut readable_c_source = false;
+    for dir in dirs {
+        for name in ["main.c", "main.cpp"] {
+            let path = dir.join(name);
+            if let Some(text) = read_bounded_marker_text(&path, false) {
+                if text.contains("BHF_FRAMED") {
+                    return HarnessProtocol::BhfFramed;
+                }
+                readable_c_source = true;
+            }
+        }
+    }
+    if readable_c_source {
+        HarnessProtocol::LibFuzzerSingleInput
+    } else {
+        HarnessProtocol::StdinEventLog
+    }
 }
 
 /// Whether this is an Ada harness whose target+harness compile was instrumented
@@ -3891,18 +3934,18 @@ fn load_cmplog_for_run(
 }
 
 fn builtin_execution_summary(
-    runner: &replay_min::HarnessRunner,
-    work_dir: &Path,
+    protocol: HarnessProtocol,
+    forkserver_started: bool,
 ) -> ExecutionRunSummary {
-    let harness_protocol = if is_c_libfuzzer_harness(runner, work_dir) {
-        "libfuzzer_single_input"
-    } else {
-        "stdin_event_log"
+    let harness_protocol = match protocol {
+        HarnessProtocol::BhfFramed => "bhf_framed",
+        HarnessProtocol::LibFuzzerSingleInput => "libfuzzer_single_input",
+        HarnessProtocol::StdinEventLog => "stdin_event_log",
     };
     ExecutionRunSummary {
         harness_protocol: harness_protocol.to_owned(),
-        forkserver: false,
-        persistent: false,
+        forkserver: forkserver_started,
+        persistent: forkserver_started,
         persistent_iterations: None,
     }
 }
@@ -4722,7 +4765,36 @@ fn run_harness(
     per_input_timeout: Duration,
     rss_limit_mb: usize,
 ) -> Result<HarnessRun, String> {
-    if is_c_libfuzzer_harness(runner, work_dir) {
+    let protocol = resolve_harness_protocol(runner, work_dir);
+    run_harness_with_protocol(
+        runner,
+        work_dir,
+        input,
+        extra_env,
+        per_input_timeout,
+        rss_limit_mb,
+        protocol,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_harness_with_protocol(
+    runner: &replay_min::HarnessRunner,
+    work_dir: &Path,
+    input: &[u8],
+    extra_env: &[(String, String)],
+    per_input_timeout: Duration,
+    rss_limit_mb: usize,
+    protocol: HarnessProtocol,
+) -> Result<HarnessRun, String> {
+    // The external BHF driver also accepts one input by filename when it is
+    // spawned outside its framed loop. In particular, a fork-server crash must
+    // be isolated through that argv path; raw stdin makes the driver exit
+    // without ever calling the target.
+    if protocol == HarnessProtocol::LibFuzzerSingleInput
+        || (protocol == HarnessProtocol::BhfFramed
+            && read_bounded_marker_text(runner.harness_path(), true).is_none())
+    {
         return run_c_libfuzzer_single_input(
             runner,
             work_dir,
@@ -7294,6 +7366,85 @@ mod auto_path_tests {
         fs::write(&harness, script).unwrap();
         fs::set_permissions(&harness, fs::Permissions::from_mode(0o755)).unwrap();
         harness
+    }
+
+    #[test]
+    fn protocol_resolution_prefers_framed_marker_across_build_and_generated_layouts() {
+        let work = tmpdir();
+        let id = "H-PROTOCOL";
+        let build = work.join("build").join(id);
+        let generated = work.join("generated_harnesses").join(id);
+        fs::create_dir_all(&build).unwrap();
+        fs::create_dir_all(&generated).unwrap();
+        let binary = build.join("main");
+        fs::write(&binary, b"\x7fELF\0not textual BHF_FRAMED").unwrap();
+        fs::write(build.join("main.c"), "// stale libFuzzer source\n").unwrap();
+        fs::write(
+            generated.join("main.c"),
+            "int LLVMFuzzerTestOneInput(void); // BHF_FRAMED loop\n",
+        )
+        .unwrap();
+        let runner = replay_min::HarnessRunner::direct(binary.clone());
+
+        assert!(read_bounded_marker_text(&binary, true).is_none());
+        assert_eq!(
+            resolve_harness_protocol(&runner, &work),
+            HarnessProtocol::BhfFramed
+        );
+        assert_eq!(
+            builtin_execution_summary(HarnessProtocol::BhfFramed, true).harness_protocol,
+            "bhf_framed"
+        );
+    }
+
+    #[test]
+    fn protocol_resolution_preserves_auto_scripts_libfuzzer_and_stdin_layouts() {
+        let work = tmpdir();
+        let auto_dir = work.join("harnesses/H-AUTO");
+        fs::create_dir_all(&auto_dir).unwrap();
+        let auto_binary = auto_dir.join("main");
+        fs::write(&auto_binary, b"\x7fELF\0").unwrap();
+        fs::write(auto_dir.join("main.cpp"), "// BHF_FRAMED driver\n").unwrap();
+        assert_eq!(
+            resolve_harness_protocol(&replay_min::HarnessRunner::direct(auto_binary), &work),
+            HarnessProtocol::BhfFramed
+        );
+
+        let script_dir = work.join("auto/H-SCRIPT");
+        fs::create_dir_all(&script_dir).unwrap();
+        let script = script_dir.join("main");
+        fs::write(&script, "#!/bin/sh\n# BHF_FRAMED launcher\n").unwrap();
+        assert_eq!(
+            resolve_harness_protocol(&replay_min::HarnessRunner::direct(script), &work),
+            HarnessProtocol::BhfFramed
+        );
+
+        let lib_dir = work.join("build/H-LIB");
+        fs::create_dir_all(&lib_dir).unwrap();
+        let lib_binary = lib_dir.join("main");
+        fs::write(&lib_binary, b"\x7fELF\0").unwrap();
+        fs::write(
+            lib_dir.join("main.c"),
+            "int LLVMFuzzerTestOneInput(const unsigned char *, unsigned long);\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_harness_protocol(&replay_min::HarnessRunner::direct(lib_binary), &work),
+            HarnessProtocol::LibFuzzerSingleInput
+        );
+
+        let plain = work.join("build/H-PLAIN/main");
+        fs::create_dir_all(plain.parent().unwrap()).unwrap();
+        fs::write(
+            &plain,
+            vec![0u8; MAX_HARNESS_MARKER_TEXT_BYTES as usize + 1],
+        )
+        .unwrap();
+        assert!(read_bounded_marker_text(&plain, true).is_none());
+        assert_eq!(
+            resolve_harness_protocol(&replay_min::HarnessRunner::direct(plain), &work),
+            HarnessProtocol::StdinEventLog
+        );
     }
 
     #[test]

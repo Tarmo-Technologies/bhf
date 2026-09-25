@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-// Fixture for the Go `--force` path: both targets here are UNDRIVABLE by the
-// type-directed generator and must be skipped cleanly without --force.
+// Fixture for the Go `--force` path: Feed still needs a synthesized receiver,
+// while Render's plain-data map is driven from a JSON field without force.
 //   * Feed is a method, so it needs a receiver value.
-//   * Render takes a map, for which there is no byte decoder.
+//   * Render takes raw bytes and a JSON-decodable map.
 // Each carries a planted out-of-bounds read (CWE-125) reachable from the input
-// bytes alone, so a forced build that really executes the target produces a
-// finding rather than an empty pass.
+// bytes alone, so a harness that really executes the target can find it.
 package forcelib
 
-// Option is an exported type used only to make Render's map parameter name a
-// TARGET-package type, which the forced driver has to qualify as `tgt.Option`.
+// Option is an exported data-only type used in Render's map parameter.
 type Option struct {
 	Name string
 }
@@ -32,7 +30,7 @@ func (d *Decoder) Feed(data []byte) int {
 	return len(data)
 }
 
-// Render takes an undrivable map parameter alongside the fuzz bytes. Planted bug:
+// Render takes a JSON-decodable map alongside the fuzz bytes. Planted bug:
 // on tag 'R' it indexes past the slice.
 func Render(data []byte, opts map[string]Option) int {
 	if len(data) == 0 {

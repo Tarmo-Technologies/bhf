@@ -64,7 +64,7 @@ pub fn run(args: CleanArgs) -> i32 {
 
     for relative in targets {
         let path = args.work_dir.join(relative);
-        match remove_owned_path(&path) {
+        match remove_owned_path(&args.work_dir, relative) {
             Ok(RemoveOutcome::Removed) => println!("removed {}", path.display()),
             Ok(RemoveOutcome::Missing) => {}
             Err(error) => {
@@ -136,8 +136,28 @@ enum RemoveOutcome {
     Missing,
 }
 
-fn remove_owned_path(path: &Path) -> std::io::Result<RemoveOutcome> {
-    let metadata = match fs::symlink_metadata(path) {
+fn remove_owned_path(work_dir: &Path, relative: &str) -> std::io::Result<RemoveOutcome> {
+    let relative_path = Path::new(relative);
+    let mut ancestor = work_dir.to_path_buf();
+    let components = relative_path.components().collect::<Vec<_>>();
+    for component in components.iter().take(components.len().saturating_sub(1)) {
+        ancestor.push(component.as_os_str());
+        let metadata = match fs::symlink_metadata(&ancestor) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(RemoveOutcome::Missing);
+            }
+            Err(error) => return Err(error),
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            // The selected work directory itself may be an explicit symlink
+            // alias, but no path component beneath it may redirect cleanup.
+            return Ok(RemoveOutcome::Missing);
+        }
+    }
+
+    let path = work_dir.join(relative_path);
+    let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(RemoveOutcome::Missing);
@@ -276,5 +296,73 @@ mod tests {
         assert!(!work.join("findings.csv").exists());
         assert!(!work.join("auto/findings.csv").exists());
         assert!(work.join("auto/run.json").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn findings_cleanup_does_not_follow_auto_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("findings.csv"), "external sentinel").unwrap();
+        symlink(&outside, work.join("auto")).unwrap();
+
+        assert_eq!(
+            run(CleanArgs {
+                work_dir: work,
+                build: false,
+                compact: false,
+                corpus: false,
+                reports: false,
+                findings: true,
+                all: false,
+            }),
+            0
+        );
+        assert_eq!(
+            std::fs::read(outside.join("findings.csv")).unwrap(),
+            b"external sentinel"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn findings_cleanup_accepts_explicit_work_root_alias() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        let alias = temp.path().join("work-alias");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join("findings.csv"), "id\n").unwrap();
+        symlink(&work, &alias).unwrap();
+
+        assert!(matches!(
+            remove_owned_path(&alias, "findings.csv").unwrap(),
+            RemoveOutcome::Removed
+        ));
+        assert!(!work.join("findings.csv").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn all_unlinks_leaf_symlink_without_removing_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("sentinel"), "keep").unwrap();
+        symlink(&outside, work.join("auto")).unwrap();
+
+        assert_eq!(run(all_args(work.clone())), 0);
+        assert!(!work.join("auto").exists());
+        assert_eq!(std::fs::read(outside.join("sentinel")).unwrap(), b"keep");
     }
 }

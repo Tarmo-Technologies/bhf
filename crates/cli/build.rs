@@ -34,21 +34,6 @@ fn main() {
     // unpacked source tarball with no git leaves BHF_GIT_COMMIT unset and the
     // report shows "unknown".
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
-    // Refresh the version/commit stamp when the commit OR tags move. A build
-    // script that emits ANY `rerun-if-changed` (the shim, above) otherwise reruns
-    // ONLY for those inputs — so `git describe` / the commit would go stale across
-    // a re-tag (this made a freshly-tagged release ship a previous version's
-    // stamp). Watching the ref files/dirs forces a re-stamp. Absent in a no-git
-    // source tarball; the `.exists()` guard keeps cargo from warning then.
-    for rel in [
-        "../../.git/HEAD",
-        "../../.git/packed-refs",
-        "../../.git/refs/tags",
-    ] {
-        if std::path::Path::new(&manifest_dir).join(rel).exists() {
-            println!("cargo:rerun-if-changed={rel}");
-        }
-    }
     let git = |args: &[&str]| -> Option<String> {
         std::process::Command::new("git")
             .args(args)
@@ -60,6 +45,39 @@ fn main() {
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty())
     };
+    // Refresh the version/commit stamp when HEAD, its current branch ref, or
+    // tags move. Resolve these paths through Git so linked worktrees and a
+    // .git file pointing elsewhere work as well as a normal .git directory.
+    // Watching only HEAD misses commits because symbolic HEAD usually continues
+    // to contain the same `ref: refs/heads/<branch>` text as the branch moves.
+    let watch_git_path = |path: &str| {
+        let path = std::path::Path::new(path);
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::path::Path::new(&manifest_dir).join(path)
+        };
+        let mut watched = path.as_path();
+        while !watched.exists() {
+            let Some(parent) = watched.parent() else {
+                return;
+            };
+            watched = parent;
+        }
+        // Watching the nearest existing parent also detects a newly created
+        // loose ref when the current branch is stored only in packed-refs.
+        println!("cargo:rerun-if-changed={}", watched.display());
+    };
+    for git_path in ["HEAD", "packed-refs", "refs/tags"] {
+        if let Some(path) = git(&["rev-parse", "--git-path", git_path]) {
+            watch_git_path(&path);
+        }
+    }
+    if let Some(reference) = git(&["symbolic-ref", "-q", "HEAD"]) {
+        if let Some(path) = git(&["rev-parse", "--git-path", &reference]) {
+            watch_git_path(&path);
+        }
+    }
     if let Some(commit) = git(&["rev-parse", "--short", "HEAD"]) {
         println!("cargo:rustc-env=BHF_GIT_COMMIT={commit}");
     }

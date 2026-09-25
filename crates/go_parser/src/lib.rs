@@ -44,6 +44,28 @@ pub struct GoFunc {
     pub returns: Option<String>,
 }
 
+/// A Go type declaration's syntax relevant to a conservative JSON decoder.
+/// `fields` is present only for a struct whose fields are all explicit and
+/// parsed successfully; embedded fields and non-struct underlying types are
+/// represented without a field list and need separate treatment.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GoDataType {
+    pub name: String,
+    pub underlying_type: String,
+    pub fields: Option<Vec<GoDataField>>,
+}
+
+/// One explicitly named struct field. Visibility is retained so callers can
+/// reject structs encoding/json cannot safely populate from another package.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GoDataField {
+    pub name: String,
+    pub ty: String,
+    pub is_exported: bool,
+    /// Key accepted by encoding/json; an unsupported tag rejects the struct.
+    pub json_name: String,
+}
+
 #[derive(Debug, Error)]
 pub enum GoParseError {
     #[error("failed to load the Go grammar")]
@@ -74,6 +96,143 @@ pub fn parse_go_functions(source: &str) -> Result<Vec<GoFunc>, GoParseError> {
     let mut out = Vec::new();
     collect(tree.root_node(), bytes, &package, 0, &mut out);
     Ok(out)
+}
+
+/// Return the package clause so multi-file inspection cannot mix declarations
+/// from a different package in the same directory.
+pub fn parse_go_package(source: &str) -> Result<String, GoParseError> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_go::LANGUAGE.into())
+        .map_err(|_| GoParseError::Grammar)?;
+    let tree = parser.parse(source, None).ok_or(GoParseError::Parse)?;
+    find_package(tree.root_node(), source.as_bytes()).ok_or(GoParseError::Parse)
+}
+
+/// Parse package-local type declarations, retaining only syntax and never
+/// resolving imports or guessing runtime behavior. This deliberately does not
+/// assert that a type is safe for a harness; callers must recursively validate
+/// each field and reject methods/lifecycle-bearing types as appropriate.
+pub fn parse_go_data_types(source: &str) -> Result<Vec<GoDataType>, GoParseError> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_go::LANGUAGE.into())
+        .map_err(|_| GoParseError::Grammar)?;
+    let tree = parser.parse(source, None).ok_or(GoParseError::Parse)?;
+    let bytes = source.as_bytes();
+    let mut out = Vec::new();
+    collect_data_types(tree.root_node(), bytes, 0, &mut out);
+    Ok(out)
+}
+
+fn collect_data_types(
+    node: tree_sitter::Node<'_>,
+    bytes: &[u8],
+    depth: usize,
+    out: &mut Vec<GoDataType>,
+) {
+    if depth > MAX_DEPTH {
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "type_spec" {
+            if let Some(name_node) = child.child_by_field_name("name") {
+                if let Some(type_node) = child.child_by_field_name("type") {
+                    let name = node_text(name_node, bytes).to_owned();
+                    let underlying_type = collapse_ws(node_text(type_node, bytes));
+                    let fields = (type_node.kind() == "struct_type")
+                        .then(|| parse_struct_fields(type_node, bytes))
+                        .flatten();
+                    out.push(GoDataType {
+                        name,
+                        underlying_type,
+                        fields,
+                    });
+                }
+            }
+        }
+        collect_data_types(child, bytes, depth + 1, out);
+    }
+}
+
+fn parse_struct_fields(
+    struct_node: tree_sitter::Node<'_>,
+    bytes: &[u8],
+) -> Option<Vec<GoDataField>> {
+    let fields_node = struct_node
+        .children(&mut struct_node.walk())
+        .find(|child| child.kind() == "field_declaration_list")?;
+    let mut fields = Vec::new();
+    let mut cursor = fields_node.walk();
+    for declaration in fields_node.children(&mut cursor) {
+        if declaration.kind() != "field_declaration" {
+            continue;
+        }
+        let field_type = declaration.child_by_field_name("type")?;
+        let ty = collapse_ws(node_text(field_type, bytes));
+        let names: Vec<_> = declaration
+            .children(&mut declaration.walk())
+            .filter(|child| child.kind() == "field_identifier")
+            .collect();
+        // Embedded fields have no explicit field_identifier and can bring in
+        // promoted methods or unexported state. Fail closed for this struct.
+        if names.is_empty() {
+            return None;
+        }
+        for name_node in names {
+            let name = node_text(name_node, bytes).to_owned();
+            let is_exported = name.chars().next().is_some_and(char::is_uppercase);
+            let json_name = match declaration.child_by_field_name("tag") {
+                Some(tag) => parse_json_field_name(node_text(tag, bytes), &name)?,
+                None => default_json_field_name(&name),
+            };
+            fields.push(GoDataField {
+                name,
+                ty: ty.clone(),
+                is_exported,
+                json_name,
+            });
+        }
+    }
+    Some(fields)
+}
+
+fn default_json_field_name(name: &str) -> String {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}", first.to_ascii_lowercase(), chars.as_str()),
+        None => String::new(),
+    }
+}
+
+fn parse_json_field_name(tag: &str, field_name: &str) -> Option<String> {
+    // Go's reflect.StructTag format permits multiple space-separated keys. The
+    // generated decoder only needs the JSON key, and rejects options that
+    // change the expected value shape (notably `,string`).
+    let raw = tag.strip_prefix('`')?.strip_suffix('`')?;
+    let Some(json) = raw
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix("json:"))
+    else {
+        return Some(default_json_field_name(field_name));
+    };
+    let value = json.strip_prefix('"')?.strip_suffix('"')?;
+    let mut parts = value.split(',');
+    let name = parts.next()?;
+    if name == "-" || name.contains('\\') || name.chars().any(char::is_control) {
+        return None;
+    }
+    for option in parts {
+        if !matches!(option, "omitempty" | "omitzero") {
+            return None;
+        }
+    }
+    Some(if name.is_empty() {
+        default_json_field_name(field_name)
+    } else {
+        name.to_owned()
+    })
 }
 
 fn find_package(root: tree_sitter::Node<'_>, bytes: &[u8]) -> Option<String> {
@@ -450,6 +609,49 @@ mod tests {
                 .unwrap()
                 .is_exported
         );
+    }
+
+    #[test]
+    fn extracts_explicit_struct_fields_and_fails_closed_on_embedding() {
+        let source = r#"
+package parser
+type Header struct {
+    Magic string `json:"magic"`
+    Count int
+    hidden bool
+}
+type Embedded struct { Header }
+type Alias Header
+"#;
+        let types = parse_go_data_types(source).expect("parse types");
+        let header = types.iter().find(|ty| ty.name == "Header").unwrap();
+        let fields = header.fields.as_ref().expect("named fields parsed");
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0].name, "Magic");
+        assert_eq!(fields[0].ty, "string");
+        assert_eq!(fields[0].json_name, "magic");
+        assert!(fields[0].is_exported);
+        assert!(!fields[2].is_exported);
+        let embedded = types.iter().find(|ty| ty.name == "Embedded").unwrap();
+        assert!(embedded.fields.is_none(), "embedding must fail closed");
+        let alias = types.iter().find(|ty| ty.name == "Alias").unwrap();
+        assert!(
+            alias.fields.is_none(),
+            "aliases are not flattened by guesswork"
+        );
+    }
+
+    #[test]
+    fn json_field_tags_keep_seed_keys_in_sync_with_go_decoder() {
+        let types = parse_go_data_types(
+            "package p\ntype Good struct { Code int `json:\"wire_code,omitempty\"` }\n\
+             type Hidden struct { Code int `json:\"-\"` }\n\
+             type Quoted struct { Code int `json:\"code,string\"` }\n",
+        )
+        .unwrap();
+        assert_eq!(types[0].fields.as_ref().unwrap()[0].json_name, "wire_code");
+        assert!(types[1].fields.is_none());
+        assert!(types[2].fields.is_none());
     }
 
     #[test]

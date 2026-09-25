@@ -165,9 +165,93 @@ fn go_coverage_instruments_the_target_module_not_just_the_harness() {
         "the target module's files are absent from the coverage metadata, so \
          -coverpkg did not reach it and the lane is measuring only the harness"
     );
+    let run: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(work.join("auto/run.json")).expect("read Go auto run summary"),
+    )
+    .expect("parse Go auto run summary");
+    let edges = run["targets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|target| target["outcome"]["passes"].as_array().into_iter().flatten())
+        .filter_map(|pass| pass["coverage_edges"].as_u64())
+        .max()
+        .unwrap_or(0);
+    assert!(
+        edges > 0,
+        "instrumented Go run produced no edge feedback: {run}"
+    );
 
     let _ = std::fs::remove_dir_all(&src);
     let _ = std::fs::remove_dir_all(&work);
+}
+
+#[test]
+fn auto_structured_go_seed_populates_nested_fields_and_reaches_target() {
+    if !have_go() {
+        eprintln!("skipping: no go toolchain on PATH");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let src = root.path().join("source");
+    let work = root.path().join("work");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("go.mod"),
+        "module example.test/structured\n\ngo 1.21\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("parser.go"),
+        r#"package structured
+type Child struct { Code int `json:"code"` }
+type Request struct {
+    Magic string `json:"magic"`
+    Child *Child `json:"child"`
+    Values []int `json:"values"`
+    Labels map[string]string `json:"labels"`
+}
+func ParseRequest(req *Request) {
+    if req != nil && req.Magic == "A" && req.Child != nil &&
+       req.Child.Code == 1 && len(req.Values) == 1 && req.Values[0] == 1 &&
+       req.Labels["k"] == "A" {
+        panic("planted structured reachability")
+    }
+}
+"#,
+    )
+    .unwrap();
+    let out = Command::new(bhf_bin())
+        .args([
+            "auto",
+            "--per-target-time",
+            "8",
+            "--max-targets",
+            "1",
+            "--single-pass",
+            "--work-dir",
+            work.to_str().unwrap(),
+            src.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run bhf auto on structured Go fixture");
+    assert!(
+        out.status.success(),
+        "Go auto failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let seeds: Vec<_> = std::fs::read_dir(work.join("harnesses"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("structured-seeds.json"))
+        .filter(|path| path.is_file())
+        .collect();
+    assert_eq!(seeds.len(), 1, "expected one built structured Go harness");
+    let csv = std::fs::read_to_string(work.join("auto/findings.csv")).unwrap_or_default();
+    assert!(
+        csv.contains("ParseRequest") && csv.contains("planted structured reachability"),
+        "valid JSON seed did not reach the planted branch: {csv}"
+    );
 }
 
 fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {

@@ -717,6 +717,9 @@ extern "C" int bhf_run_one(const uint8_t *Data, size_t Size) {
     if (R) R->Decref();
 {%- else %}
     bhf_cursor Cur = bhf_open(Data, Size);
+{%- if pugi_retained_buffers %}
+    std::vector<void *> _bhf_retained_buffers;
+{%- endif %}
 {%- for p in params %}
     {{ p.decl }};
 {%- endfor %}
@@ -850,6 +853,10 @@ extern "C" int bhf_run_one(const uint8_t *Data, size_t Size) {
     {{ p.free }};
 {%- endif %}
 {%- endfor %}
+{%- endif %}
+{%- if pugi_retained_buffers %}
+    _bhf_receiver.reset();
+    for (void *_bhf_retained : _bhf_retained_buffers) free(_bhf_retained);
 {%- endif %}
 {%- endif %}
     return 0;

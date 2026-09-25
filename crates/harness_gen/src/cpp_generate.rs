@@ -355,6 +355,8 @@ struct CppTemplateContext {
     compiler_is_gcc: bool,
     c_runtime_include: String,
     params: Vec<CParamEmission>,
+    /// A borrowed Pugixml in-place buffer must outlive the document's parse tree.
+    pugi_retained_buffers: bool,
     return_type: String,
     return_type_present: bool,
     constructor_params: Vec<CParamEmission>,
@@ -896,10 +898,18 @@ fn build_cpp_sequence_context(
     let registry = TypeRegistry::from_defs(args.type_defs.iter())
         .with_cpp_lookup_scopes(cpp_lexical_lookup_scopes(&args.target))
         .with_default_constructible_classes(args.default_constructible_classes.iter().cloned());
-    let lifecycle_steps =
-        build_lifecycle_step_emissions(&args.lifecycle_steps, &registry, args.decoder_limits)?;
-    let protocol_steps =
-        build_cpp_protocol_emissions(&args.protocol_steps, &registry, args.decoder_limits)?;
+    let lifecycle_steps = build_lifecycle_step_emissions(
+        &args.lifecycle_steps,
+        &args.target.qualifier_path,
+        &registry,
+        args.decoder_limits,
+    )?;
+    let protocol_steps = build_cpp_protocol_emissions(
+        &args.protocol_steps,
+        &args.target.qualifier_path,
+        &registry,
+        args.decoder_limits,
+    )?;
     build_cpp_context_common(CppContextInput {
         harness_id: &args.harness_id,
         source_path: &args.source_path,
@@ -1141,7 +1151,7 @@ fn build_cpp_context_common(
         && input.protocol_steps.is_empty()
         && is_cpp_byte_stream_decoder(&input.target.name, effective_params);
     let literal_operator = is_cpp_literal_operator(&input.target.name);
-    let params = if byte_stream {
+    let mut params = if byte_stream {
         build_cpp_param_decoders(
             effective_params.get(1..).unwrap_or(&[]),
             &registry,
@@ -1160,6 +1170,12 @@ fn build_cpp_context_common(
             literal_operator,
         )?
     };
+    apply_pugixml_buffer_cleanup(
+        &input.target.qualifier_path,
+        &input.target.name,
+        effective_params,
+        &mut params,
+    );
     let constructor_params = build_constructor_param_emissions(
         input.constructor_params,
         &registry,
@@ -1324,6 +1340,16 @@ fn build_cpp_context_common(
     } else {
         None
     };
+    let pugi_retained_buffers = receiver_class.is_some()
+        && params
+            .iter()
+            .chain(lifecycle_steps.iter().flat_map(|step| step.params.iter()))
+            .chain(protocol_steps.iter().flat_map(|step| step.params.iter()))
+            .any(|p| {
+                p.free
+                    .as_deref()
+                    .is_some_and(|cleanup| cleanup.starts_with("_bhf_retained_buffers.push_back("))
+            });
     let target_is_constructor = receiver_class.is_some() && input.target.api.is_constructor;
     let include_source_for_receiver = receiver_class.is_some()
         && input.target_includes.is_empty()
@@ -1445,6 +1471,7 @@ fn build_cpp_context_common(
         compiler_is_gcc,
         c_runtime_include: crate::build_safety::make_path(input.c_runtime_include),
         params,
+        pugi_retained_buffers,
         return_type: if return_type_present {
             return_type
         } else {
@@ -1673,6 +1700,7 @@ fn split_cpp_build_context_flags(flags: &[String]) -> CppBuildContextRender {
 
 fn build_lifecycle_step_emissions(
     steps: &[CppLifecycleStep],
+    owner: &[String],
     registry: &TypeRegistry,
     limits: CppDecoderLimits,
 ) -> Result<Vec<CppLifecycleStepEmission>, HarnessGenError> {
@@ -1702,8 +1730,9 @@ fn build_lifecycle_step_emissions(
                     cpp_type: param.cpp_type.clone(),
                 })
                 .collect::<Vec<_>>();
-            let params =
+            let mut params =
                 build_cpp_param_decoders(&renamed_params, registry, &[], &limits, false, false)?;
+            apply_pugixml_buffer_cleanup(owner, &step.name, &step.params, &mut params);
             let return_type = step.return_type.trim().to_owned();
             let return_type_present = !return_type.is_empty() && return_type != "void";
             Ok(CppLifecycleStepEmission {
@@ -1723,6 +1752,7 @@ fn build_lifecycle_step_emissions(
 
 fn build_cpp_protocol_emissions(
     steps: &[CppProtocolStep],
+    owner: &[String],
     registry: &TypeRegistry,
     limits: CppDecoderLimits,
 ) -> Result<Vec<CppProtocolStepEmission>, HarnessGenError> {
@@ -1800,6 +1830,12 @@ fn build_cpp_protocol_emissions(
                     }
                 }
             }
+            apply_pugixml_buffer_cleanup(
+                owner,
+                &observed.step.name,
+                &observed.step.params,
+                &mut params,
+            );
             let return_type = observed.step.return_type.trim().to_owned();
             let return_type_present = !return_type.is_empty() && return_type != "void";
             Ok(CppProtocolStepEmission {
@@ -1816,6 +1852,32 @@ fn build_cpp_protocol_emissions(
             })
         })
         .collect()
+}
+
+/// `load_buffer_inplace_own` takes ownership even on failure. The non-owning
+/// variant retains views into the caller's buffer until the document is reset;
+/// its cleanup is deferred until that reset at the end of the generated call.
+fn apply_pugixml_buffer_cleanup(
+    owner: &[String],
+    method: &str,
+    parameters: &[CppParameter],
+    emissions: &mut [CParamEmission],
+) {
+    if owner.len() == 2
+        && owner[0] == "pugi"
+        && owner[1] == "xml_document"
+        && parameters
+            .first()
+            .is_some_and(|p| p.cpp_type.replace(' ', "") == "void*")
+    {
+        if let Some(first) = emissions.first_mut() {
+            if method == "load_buffer_inplace_own" {
+                first.free = None;
+            } else if method == "load_buffer_inplace" && first.free.is_some() {
+                first.free = Some(format!("_bhf_retained_buffers.push_back({})", first.arg));
+            }
+        }
+    }
 }
 
 fn safe_cpp_protocol_literal(value: &str) -> bool {
@@ -5736,6 +5798,83 @@ mod tests {
         assert!(!cpp_return_type_emittable("namespace"));
         assert!(!cpp_return_type_emittable("template"));
         assert!(!cpp_return_type_emittable("using"));
+    }
+
+    #[test]
+    fn pugixml_owned_buffer_is_not_freed_by_sequence_harness() {
+        let out = temp_dir("cpp-pugixml-owned-buffer");
+        let mut target = cppfunction("load_buffer_inplace_own");
+        target.qualifier_path = vec!["pugi".to_owned(), "xml_document".to_owned()];
+        target.api.class_name = Some("xml_document".to_owned());
+        target.api.namespace_path = vec!["pugi".to_owned()];
+        target.api.is_method = true;
+        let buffer = CppParameter {
+            name: "contents".to_owned(),
+            cpp_type: "void *".to_owned(),
+        };
+        let size = CppParameter {
+            name: "size".to_owned(),
+            cpp_type: "size_t".to_owned(),
+        };
+        let args = GenerateCppSequenceArgs {
+            decoder_limits: Default::default(),
+            harness_id: "H-PUGI-OWN".to_owned(),
+            output_dir: out,
+            source_path: PathBuf::from("/tmp/pugixml.cpp"),
+            target,
+            params: vec![buffer.clone(), size.clone()],
+            return_type: "xml_parse_result".to_owned(),
+            target_includes: vec!["pugixml.hpp".to_owned()],
+            target_includes_dirs: Vec::new(),
+            target_sources: vec![PathBuf::from("/tmp/pugixml.cpp")],
+            compile_flags: Vec::new(),
+            c_runtime_include: PathBuf::from("/tmp/c_runtime"),
+            using_namespaces: Vec::new(),
+            result_cleanup: None,
+            constructor_params: Vec::new(),
+            lifecycle_steps: vec![
+                CppLifecycleStep {
+                    name: "load_buffer_inplace_own".to_owned(),
+                    params: vec![buffer.clone(), size.clone()],
+                    return_type: "xml_parse_result".to_owned(),
+                },
+                CppLifecycleStep {
+                    name: "load_buffer_inplace".to_owned(),
+                    params: vec![buffer.clone(), size.clone()],
+                    return_type: "xml_parse_result".to_owned(),
+                },
+            ],
+            protocol_steps: vec![CppProtocolStep {
+                step: CppLifecycleStep {
+                    name: "load_buffer_inplace_own".to_owned(),
+                    params: vec![buffer, size],
+                    return_type: "xml_parse_result".to_owned(),
+                },
+                args: vec![CppProtocolArg::Decode, CppProtocolArg::Decode],
+                marks_target: true,
+            }],
+            type_defs: Vec::new(),
+            default_constructible_classes: Vec::new(),
+            parameter_constructions: Vec::new(),
+            receiver_class_override: None,
+            factory_plan: None,
+        };
+        let result = generate_cpp_sequence_harness(args).unwrap();
+        let main = fs::read_to_string(&result.main_cpp).unwrap();
+        assert!(main.contains("_bhf_receiver.load_buffer_inplace_own("));
+        assert!(!main.contains("free(_bhf_step0_contents)"), "{main}");
+        assert!(!main.contains("free(_bhf_protocol0_contents)"), "{main}");
+        assert!(!main.contains("free(contents)"), "{main}");
+        assert!(!main.contains("free(_bhf_step1_contents)"), "{main}");
+        assert!(
+            main.contains("_bhf_retained_buffers.push_back(_bhf_step1_contents)"),
+            "{main}"
+        );
+        assert!(main.contains("_bhf_receiver.reset();"), "{main}");
+        assert!(
+            main.contains("for (void *_bhf_retained : _bhf_retained_buffers) free(_bhf_retained)"),
+            "{main}"
+        );
     }
 
     /// ROBUSTNESS (campaign: tinyobjloader): a lifecycle harness must DROP a step

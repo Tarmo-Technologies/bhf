@@ -22,7 +22,8 @@
 //! parameter type skips cleanly (the GNAT-less rule).
 
 use crate::auto::candidate::Candidate;
-use go_parser::{parse_go_functions, GoFunc};
+use go_parser::{parse_go_data_types, parse_go_functions, parse_go_package, GoDataType, GoFunc};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -62,7 +63,7 @@ pub fn build_go_harness(
         };
     };
 
-    let (func, siblings) = match resolve_target(candidate) {
+    let (func, siblings, data_types) = match resolve_target(candidate) {
         Ok(pair) => pair,
         Err(reason) => return GoBuildResult::Failed { reason, skip: true },
     };
@@ -95,7 +96,14 @@ pub fn build_go_harness(
 
     // Build the decode/call body; an unsupported required param type skips cleanly
     // (unforced) or is synthesized as its zero value (forced).
-    let call = match generate_call(&func, receiver.as_ref(), state_feeder, force) {
+    let call = match generate_call_with_data_types(
+        &func,
+        receiver.as_ref(),
+        state_feeder,
+        &data_types,
+        &siblings,
+        force,
+    ) {
         Ok(c) => c,
         Err(reason) => return GoBuildResult::Failed { reason, skip: true },
     };
@@ -114,6 +122,18 @@ pub fn build_go_harness(
     if let Err(e) = std::fs::write(auto_dir.join("bhf_harness.go"), &main_go) {
         return GoBuildResult::Failed {
             reason: format!("write harness: {e}"),
+            skip: false,
+        };
+    }
+    if let Err(error) = append_json_seed_dictionary(&auto_dir, &call.json_seed_tokens) {
+        return GoBuildResult::Failed {
+            reason: format!("write structured Go seed dictionary: {error}"),
+            skip: false,
+        };
+    }
+    if let Err(error) = write_structured_seed_inputs(&auto_dir, &call.structured_seed_inputs) {
+        return GoBuildResult::Failed {
+            reason: format!("write structured Go starting inputs: {error}"),
             skip: false,
         };
     }
@@ -162,8 +182,9 @@ pub fn build_go_harness(
             // here is just the generated harness `main` — the target library
             // arrives as a dependency through the module `replace` and would be
             // left uninstrumented, so the lane's "real edge coverage" would
-            // measure the harness fuzzing itself. `-coverpkg` widens
-            // instrumentation to the target module.
+            // measure the harness fuzzing itself. `-coverpkg` includes both
+            // the target scope and generated main package; Go's coverage API
+            // needs the latter to initialize its counter mode.
             cmd.arg(format!("-coverpkg={pattern}"));
         }
         if let Some(overlay) = overlay {
@@ -252,18 +273,57 @@ pub fn build_go_harness(
 
 /// The target plus every function parsed from its file — the siblings a receiver
 /// constructor is looked for among.
-fn resolve_target(candidate: &Candidate) -> Result<(GoFunc, Vec<GoFunc>), String> {
+fn resolve_target(candidate: &Candidate) -> Result<(GoFunc, Vec<GoFunc>, Vec<GoDataType>), String> {
     let source = crate::source_text::read_source_text(&candidate.source_path)
         .map_err(|e| format!("read {}: {e}", candidate.source_path.display()))?;
-    let functions =
-        parse_go_functions(&source).map_err(|_| "failed to parse Go source".to_owned())?;
-    let target = functions
+    let target_functions =
+        parse_go_functions(&source).map_err(|_| "failed to parse Go target source".to_owned())?;
+    let target = target_functions
         .iter()
-        .find(|f| f.name == candidate.name && f.line == candidate.line)
-        .or_else(|| functions.iter().find(|f| f.name == candidate.name))
+        .find(|func| func.name == candidate.name && func.line == candidate.line)
         .cloned()
         .ok_or_else(|| format!("target `{}` no longer present in source", candidate.name))?;
-    Ok((target, functions))
+    let mut functions = Vec::new();
+    let mut data_types = Vec::new();
+    let package_dir = candidate
+        .source_path
+        .parent()
+        .ok_or_else(|| "Go target source has no package directory".to_owned())?;
+    let entries = std::fs::read_dir(package_dir)
+        .map_err(|error| format!("read Go package '{}': {error}", package_dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("read Go package entry: {error}"))?;
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "go")
+            || path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().ends_with("_test.go"))
+        {
+            continue;
+        }
+        let package_source = if path == candidate.source_path {
+            source.clone()
+        } else {
+            crate::source_text::read_source_text(&path)
+                .map_err(|error| format!("read Go package '{}': {error}", path.display()))?
+        };
+        let package = parse_go_package(&package_source)
+            .map_err(|_| format!("parse Go package clause '{}': invalid", path.display()))?;
+        if package != target.package {
+            continue;
+        }
+        let file_functions = parse_go_functions(&package_source)
+            .map_err(|_| format!("parse Go package '{}': functions", path.display()))?;
+        functions.extend(file_functions);
+        data_types.extend(
+            parse_go_data_types(&package_source)
+                .map_err(|_| format!("parse Go package '{}': types", path.display()))?,
+        );
+    }
+    if functions.is_empty() {
+        functions = target_functions;
+    }
+    Ok((target, functions, data_types))
 }
 
 /// Local Go toolchain language version as `MAJOR.MINOR` ("1.22"), from
@@ -386,14 +446,17 @@ fn harness_module_path(module_path: &str) -> String {
     format!("{base}/bhfharness")
 }
 
-/// Coverage scopes in preference order. The module-wide pattern captures calls
-/// through sibling packages; the exact target package is the robust fallback
-/// when unrelated platform/generated packages make `{module}/...` unbuildable.
+/// Coverage scopes in preference order. The generated main package must be in
+/// `-coverpkg` too: without it Go may link target coverage metadata but leave
+/// runtime/coverage's counter mode invalid, so WriteCounters reports no edges.
+/// The module-wide target pattern captures sibling calls; the exact package is
+/// the fallback when unrelated packages make `{module}/...` unbuildable.
 fn coverage_package_patterns(module_path: &str, import_path: &str) -> Vec<String> {
     let module = format!("{}/...", module_path.trim_end_matches('/'));
-    let mut patterns = vec![module];
-    if patterns[0] != import_path {
-        patterns.push(import_path.to_owned());
+    let harness = harness_module_path(module_path);
+    let mut patterns = vec![format!("{module},{harness}")];
+    if module != import_path {
+        patterns.push(format!("{import_path},{harness}"));
     }
     patterns
 }
@@ -442,6 +505,12 @@ struct GoCall {
     /// `Some(detail)` when at least one parameter or the receiver is a forced zero
     /// value rather than a decode of the fuzz bytes.
     forced_detail: Option<String>,
+    /// Complete JSON values usable by the builtin mutation dictionary to seed
+    /// structurally valid input for data-only parameter types.
+    json_seed_tokens: Vec<String>,
+    /// Complete starting inputs, including the length-prefixed byte argument
+    /// when a data-only JSON argument follows it.
+    structured_seed_inputs: Vec<String>,
 }
 
 /// How the harness obtains the receiver for a method target.
@@ -565,16 +634,30 @@ fn find_go_constructor<'a>(bare: &str, siblings: &'a [GoFunc]) -> Option<&'a GoF
 
 /// Build the decode lines + the call statement for the target's params. Returns an
 /// error (clean skip) if a required parameter type can't be synthesized.
+#[cfg(test)]
 fn generate_call(
     func: &GoFunc,
     receiver: Option<&GoReceiver>,
     state_feeder: Option<&GoFunc>,
     force: bool,
 ) -> Result<GoCall, String> {
+    generate_call_with_data_types(func, receiver, state_feeder, &[], &[], force)
+}
+
+fn generate_call_with_data_types(
+    func: &GoFunc,
+    receiver: Option<&GoReceiver>,
+    state_feeder: Option<&GoFunc>,
+    data_types: &[GoDataType],
+    methods: &[GoFunc],
+    force: bool,
+) -> Result<GoCall, String> {
     let n = func.params.len();
     let mut lines = String::new();
     let mut args = Vec::new();
     let mut forced: Vec<String> = Vec::new();
+    let mut json_seed_tokens = Vec::new();
+    let mut structured_seed_inputs = Vec::new();
     if let Some(receiver) = receiver {
         lines.push_str(&receiver.setup);
         if let Some(detail) = &receiver.forced {
@@ -604,6 +687,41 @@ fn generate_call(
         let last = i + 1 == n;
         let expr = match decode_for_param(func, i, last) {
             Some(expr) => expr,
+            None if !force
+                && harness_visible_go_type(&p.ty).is_some()
+                && is_plain_json_parameter(&p.ty, data_types, methods, &mut Vec::new()) =>
+            {
+                let visible_type = harness_visible_go_type(&p.ty).expect("checked above");
+                let json_example = go_json_example(&p.ty, data_types, &mut Vec::new())
+                    .ok_or_else(|| format!("cannot construct JSON seed for Go type `{}`", p.ty))?;
+                lines.push_str(&format!("\tvar a{i} {visible_type}\n"));
+                let paired_bytes = n == 2 && i == 1 && func.params[0].ty.trim() == "[]byte";
+                let json_source = if paired_bytes { "c.rest()" } else { "data" };
+                lines.push_str(&format!(
+                    "\tif err := json.Unmarshal({json_source}, &a{i}); err != nil {{ return }}\n"
+                ));
+                args.push(format!("a{i}"));
+                let example = json_example.to_string();
+                if paired_bytes {
+                    // The first byte sizes c.bytesField(), then the remaining
+                    // bytes form an independent JSON document. A seed that
+                    // repeats a short JSON example in both slots lets parser
+                    // targets exercise their raw bytes and option fields.
+                    if example.len() <= 127 {
+                        structured_seed_inputs.push(format!(
+                            "{}{}{}",
+                            char::from(example.len() as u8),
+                            example,
+                            example
+                        ));
+                    }
+                    structured_seed_inputs.push(format!("\x01A{example}"));
+                } else {
+                    structured_seed_inputs.push(example.clone());
+                }
+                json_seed_tokens.push(example);
+                continue;
+            }
             None if force => {
                 // No decoder for this type. The Go zero value exists for EVERY type,
                 // so declaring one always compiles as long as the type is nameable
@@ -640,6 +758,259 @@ fn generate_call(
         body: lines,
         forced_detail: (!forced.is_empty())
             .then(|| format!("go: synthesized zero value for {}", forced.join(", "))),
+        json_seed_tokens,
+        structured_seed_inputs,
+    })
+}
+
+fn append_json_seed_dictionary(output_dir: &Path, tokens: &[String]) -> std::io::Result<()> {
+    if tokens.is_empty() {
+        return Ok(());
+    }
+    let path = output_dir.join("dictionary.txt");
+    let mut contents = std::fs::read_to_string(&path).unwrap_or_default();
+    for token in tokens {
+        let escaped = escape_afl_dictionary_token(token.as_bytes());
+        let entry = format!("\"{escaped}\"\n");
+        if !contents.lines().any(|line| line.trim() == entry.trim()) {
+            if !contents.is_empty() && !contents.ends_with('\n') {
+                contents.push('\n');
+            }
+            contents.push_str(&entry);
+        }
+    }
+    std::fs::write(path, contents)
+}
+
+const STRUCTURED_SEEDS_FILE: &str = "structured-seeds.json";
+const MAX_STRUCTURED_SEEDS_BYTES: u64 = 64 * 1024;
+const MAX_STRUCTURED_SEEDS: usize = 16;
+
+fn write_structured_seed_inputs(output_dir: &Path, tokens: &[String]) -> std::io::Result<()> {
+    let path = output_dir.join(STRUCTURED_SEEDS_FILE);
+    if tokens.is_empty() {
+        if let Err(error) = std::fs::remove_file(path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error);
+            }
+        }
+        return Ok(());
+    }
+    let bytes = serde_json::to_vec(tokens).map_err(std::io::Error::other)?;
+    if tokens.len() > MAX_STRUCTURED_SEEDS || bytes.len() as u64 > MAX_STRUCTURED_SEEDS_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "generated structured seeds exceed the input budget",
+        ));
+    }
+    std::fs::write(path, bytes)
+}
+
+/// Start from complete JSON documents. Dictionary tokens alone are only used
+/// during mutation, so they cannot establish reachability for a Go data type.
+pub(crate) fn load_structured_seed_inputs(output_dir: &Path) -> Result<Vec<Vec<u8>>, String> {
+    let path = output_dir.join(STRUCTURED_SEEDS_FILE);
+    let metadata = match std::fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("read '{}': {error}", path.display())),
+    };
+    if !metadata.is_file() || metadata.len() > MAX_STRUCTURED_SEEDS_BYTES {
+        return Err(format!(
+            "structured seed file '{}' exceeds its budget",
+            path.display()
+        ));
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(&path)
+        .map_err(|error| format!("read '{}': {error}", path.display()))?
+        .take(MAX_STRUCTURED_SEEDS_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read '{}': {error}", path.display()))?;
+    if bytes.len() as u64 > MAX_STRUCTURED_SEEDS_BYTES {
+        return Err(format!(
+            "structured seed file '{}' exceeds its budget",
+            path.display()
+        ));
+    }
+    let tokens: Vec<String> = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("parse '{}': {error}", path.display()))?;
+    if tokens.len() > MAX_STRUCTURED_SEEDS {
+        return Err(format!(
+            "structured seed file '{}' has too many inputs",
+            path.display()
+        ));
+    }
+    Ok(tokens.into_iter().map(String::into_bytes).collect())
+}
+
+fn escape_afl_dictionary_token(token: &[u8]) -> String {
+    let mut out = String::new();
+    for byte in token {
+        match *byte {
+            b'\\' => out.push_str("\\\\"),
+            b'\"' => out.push_str("\\\""),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            b' '..=b'~' => out.push(*byte as char),
+            other => out.push_str(&format!("\\x{other:02x}")),
+        }
+    }
+    out
+}
+
+fn is_plain_json_parameter(
+    ty: &str,
+    types: &[GoDataType],
+    methods: &[GoFunc],
+    visiting: &mut Vec<String>,
+) -> bool {
+    let ty = ty.trim();
+    if matches!(
+        ty,
+        "bool"
+            | "string"
+            | "byte"
+            | "uint8"
+            | "int"
+            | "int8"
+            | "int16"
+            | "int32"
+            | "int64"
+            | "rune"
+            | "uint"
+            | "uint16"
+            | "uint32"
+            | "uint64"
+            | "float32"
+            | "float64"
+    ) {
+        return true;
+    }
+    if let Some(inner) = ty.strip_prefix('*') {
+        return is_plain_json_parameter(inner, types, methods, visiting);
+    }
+    if let Some(inner) = ty.strip_prefix("[]") {
+        return is_plain_json_parameter(inner, types, methods, visiting);
+    }
+    if ty.starts_with('[') {
+        let Some(close) = ty.find(']') else {
+            return false;
+        };
+        let size = &ty[1..close];
+        if size.is_empty()
+            || !size.chars().all(|c| c.is_ascii_digit())
+            || size.parse::<usize>().ok().is_none_or(|count| count > 1024)
+        {
+            return false;
+        }
+        return is_plain_json_parameter(ty[close + 1..].trim(), types, methods, visiting);
+    }
+    if let Some(rest) = ty.strip_prefix("map[") {
+        let Some(close) = rest.find(']') else {
+            return false;
+        };
+        let key = rest[..close].trim();
+        return key == "string"
+            && is_plain_json_parameter(rest[close + 1..].trim(), types, methods, visiting);
+    }
+    if ty.contains('.') || ty.contains('[') || ty.contains(']') {
+        return false;
+    }
+    let matches: Vec<_> = types
+        .iter()
+        .filter(|candidate| candidate.name == ty)
+        .collect();
+    if matches.len() != 1 {
+        return false;
+    }
+    let definition = matches[0];
+    if visiting.iter().any(|seen| seen == ty) {
+        return true;
+    }
+    // A method-bearing type can carry custom decoding or lifecycle invariants
+    // that syntax alone cannot establish as safe. Keep this first slice to
+    // passive data records, including nested records.
+    if methods.iter().any(|method| {
+        method.is_method
+            && method
+                .receiver_type
+                .as_deref()
+                .unwrap_or_default()
+                .trim_start_matches('*')
+                == ty
+    }) {
+        return false;
+    }
+    let Some(fields) = definition.fields.as_ref() else {
+        return false;
+    };
+    if fields.is_empty() || fields.iter().any(|field| !field.is_exported) {
+        return false;
+    }
+    visiting.push(ty.to_owned());
+    let safe = fields
+        .iter()
+        .all(|field| is_plain_json_parameter(&field.ty, types, methods, visiting));
+    visiting.pop();
+    safe
+}
+
+fn go_json_example(
+    ty: &str,
+    types: &[GoDataType],
+    visiting: &mut Vec<String>,
+) -> Option<serde_json::Value> {
+    let ty = ty.trim();
+    Some(match ty {
+        "bool" => serde_json::Value::Bool(true),
+        "string" => serde_json::Value::String("A".to_owned()),
+        "byte" | "uint8" => serde_json::Value::from(65),
+        "int" | "int8" | "int16" | "int32" | "int64" | "rune" | "uint" | "uint16" | "uint32"
+        | "uint64" => serde_json::Value::from(1),
+        "float32" | "float64" => serde_json::json!(1.0),
+        _ if ty.starts_with("*") => go_json_example(&ty[1..], types, visiting)?,
+        _ if ty.starts_with("[]") => {
+            let inner = &ty[2..];
+            if matches!(inner, "byte" | "uint8") {
+                serde_json::Value::String("QQ==".to_owned())
+            } else {
+                serde_json::Value::Array(vec![go_json_example(inner, types, visiting)?])
+            }
+        }
+        _ if ty.starts_with('[') => {
+            let close = ty.find(']')?;
+            let inner = ty[close + 1..].trim();
+            serde_json::Value::Array(vec![go_json_example(inner, types, visiting)?])
+        }
+        _ if ty.starts_with("map[") => {
+            let close = ty.find(']')?;
+            let inner = ty[close + 1..].trim();
+            let mut object = serde_json::Map::new();
+            object.insert("k".to_owned(), go_json_example(inner, types, visiting)?);
+            serde_json::Value::Object(object)
+        }
+        _ => {
+            let matching: Vec<_> = types
+                .iter()
+                .filter(|candidate| candidate.name == ty)
+                .collect();
+            if matching.len() != 1 || visiting.iter().any(|seen| seen == ty) {
+                return Some(serde_json::Value::Null);
+            }
+            let fields = matching[0].fields.as_ref()?;
+            visiting.push(ty.to_owned());
+            let mut object = serde_json::Map::new();
+            for field in fields {
+                object.insert(
+                    field.json_name.clone(),
+                    go_json_example(&field.ty, types, visiting)?,
+                );
+            }
+            visiting.pop();
+            serde_json::Value::Object(object)
+        }
     })
 }
 
@@ -844,6 +1215,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math"
@@ -1033,6 +1405,7 @@ func (c *cur) ctx() context.Context {{ return context.Background() }}
 
 // reader keeps the io import referenced even when no io.Reader param is decoded.
 var _ = io.EOF
+var _ = json.Unmarshal
 
 var bhfTargetEntered bool
 
@@ -1059,6 +1432,7 @@ func runOne(data []byte) {{
 		}}
 	}}()
 	c := &cur{{d: data}}
+	_ = c // JSON-only data arguments do not consume the byte cursor.
 	_ = bytes.MinRead
 {body}}}
 
@@ -1163,9 +1537,161 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_param_type_is_skip() {
-        let e = plain(&func("F", &[("m", "map[string]int")], false));
-        assert!(e.is_err(), "map param -> clean skip");
+    fn plain_map_parameter_is_json_driven() {
+        let call = plain(&func("F", &[("m", "map[string]int")], false)).unwrap();
+        assert!(call.body.contains("json.Unmarshal(data, &a0)"));
+        assert_eq!(call.json_seed_tokens, vec![r#"{"k":1}"#]);
+        assert_eq!(call.structured_seed_inputs, vec![r#"{"k":1}"#]);
+    }
+
+    #[test]
+    fn raw_bytes_and_json_map_get_independent_seed_fields() {
+        let call = plain(&func(
+            "Render",
+            &[("data", "[]byte"), ("opts", "map[string]int")],
+            false,
+        ))
+        .unwrap();
+        assert!(call.body.contains("a0 := c.bytesField()"));
+        assert!(call.body.contains("json.Unmarshal(c.rest(), &a1)"));
+        for seed in &call.structured_seed_inputs {
+            let bytes = seed.as_bytes();
+            let raw_len = bytes[0] as usize;
+            let json = &bytes[1 + raw_len..];
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(json).unwrap(),
+                serde_json::json!({"k": 1})
+            );
+        }
+        assert!(call
+            .structured_seed_inputs
+            .iter()
+            .any(|seed| seed.as_bytes()[1] == b'{'));
+    }
+
+    #[test]
+    fn plain_exported_struct_is_json_driven_with_a_valid_dictionary_seed() {
+        let source = r#"
+package parser
+type Child struct { Name string }
+type Request struct {
+    Magic string
+    Count int
+    Child *Child
+    Values []int
+    Labels map[string]string
+}
+func ParseRequest(req *Request) {}
+"#;
+        let types = parse_go_data_types(source).unwrap();
+        let methods = parse_go_functions(source).unwrap();
+        let target = methods
+            .iter()
+            .find(|method| method.name == "ParseRequest")
+            .unwrap();
+        let call = generate_call_with_data_types(target, None, None, &types, &methods, false)
+            .expect("simple data structs have a safe JSON decoder");
+        assert!(call.body.contains("var a0 *tgt.Request"), "{}", call.body);
+        assert!(
+            call.body
+                .contains("json.Unmarshal(data, &a0); err != nil { return }"),
+            "malformed JSON must return before calling the target: {}",
+            call.body
+        );
+        assert!(
+            call.body.find("json.Unmarshal").unwrap() < call.body.find("tgt.ParseRequest").unwrap()
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&call.json_seed_tokens[0]).unwrap(),
+            serde_json::json!({
+                "magic": "A", "count": 1, "child": {"name": "A"},
+                "values": [1], "labels": {"k": "A"}
+            })
+        );
+        assert!(call.forced_detail.is_none());
+    }
+
+    #[test]
+    fn structured_go_examples_are_loaded_as_starting_inputs() {
+        let output = tempfile::tempdir().unwrap();
+        let examples = vec![r#"{"wire_code":1}"#.to_owned()];
+        write_structured_seed_inputs(output.path(), &examples).unwrap();
+        assert_eq!(
+            load_structured_seed_inputs(output.path()).unwrap(),
+            vec![br#"{"wire_code":1}"#.to_vec()]
+        );
+        write_structured_seed_inputs(output.path(), &[]).unwrap();
+        assert!(load_structured_seed_inputs(output.path())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn data_struct_decoder_rejects_private_state_custom_json_and_unknown_handles() {
+        let private_source = "package p\ntype Request struct { Name string; hidden int }\n";
+        let private_types = parse_go_data_types(private_source).unwrap();
+        let target = func("Parse", &[("request", "*Request")], false);
+        assert!(
+            generate_call_with_data_types(&target, None, None, &private_types, &[], false).is_err()
+        );
+
+        let custom_source = "package p\ntype Request struct { Name string }\nfunc (r *Request) UnmarshalJSON([]byte) error { return nil }\n";
+        let custom_types = parse_go_data_types(custom_source).unwrap();
+        let custom_methods = parse_go_functions(custom_source).unwrap();
+        assert!(generate_call_with_data_types(
+            &target,
+            None,
+            None,
+            &custom_types,
+            &custom_methods,
+            false,
+        )
+        .is_err());
+
+        let logger = func("Parse", &[("logger", "*zap.Logger")], false);
+        assert!(generate_call_with_data_types(&logger, None, None, &[], &[], false).is_err());
+
+        let text_source = "package p\ntype Request struct { Name string }\nfunc (r *Request) UnmarshalText([]byte) error { return nil }\n";
+        let text_types = parse_go_data_types(text_source).unwrap();
+        let text_methods = parse_go_functions(text_source).unwrap();
+        assert!(generate_call_with_data_types(
+            &target,
+            None,
+            None,
+            &text_types,
+            &text_methods,
+            false,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn data_decoder_allows_only_plain_recursively_proven_field_types() {
+        let safe = parse_go_data_types(
+            "package p\ntype Child struct { Name string }\ntype Request struct { Child *Child; Labels map[string][]int }\n",
+        )
+        .unwrap();
+        assert!(is_plain_json_parameter(
+            "*Request",
+            &safe,
+            &[],
+            &mut Vec::new()
+        ));
+
+        for unsafe_type in [
+            "type Request struct { Value interface{} }",
+            "type Request struct { Value chan int }",
+            "type Request struct { Value func() }",
+            "type Request struct { Value map[int]string }",
+            "type Request struct { Child }",
+        ] {
+            let source = format!("package p\n{unsafe_type}\n");
+            let types = parse_go_data_types(&source).unwrap();
+            assert!(
+                !is_plain_json_parameter("Request", &types, &[], &mut Vec::new()),
+                "unsafe shape unexpectedly accepted: {unsafe_type}"
+            );
+        }
     }
 
     #[test]
@@ -1379,15 +1905,16 @@ mod tests {
                 "github.com/example/project/internal/parser"
             ),
             vec![
-                "github.com/example/project/...".to_owned(),
-                "github.com/example/project/internal/parser".to_owned(),
+                "github.com/example/project/...,github.com/example/project/bhfharness".to_owned(),
+                "github.com/example/project/internal/parser,github.com/example/project/bhfharness"
+                    .to_owned(),
             ]
         );
         assert_eq!(
             coverage_package_patterns("github.com/example/project", "github.com/example/project"),
             vec![
-                "github.com/example/project/...".to_owned(),
-                "github.com/example/project".to_owned(),
+                "github.com/example/project/...,github.com/example/project/bhfharness".to_owned(),
+                "github.com/example/project,github.com/example/project/bhfharness".to_owned(),
             ]
         );
     }
