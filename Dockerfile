@@ -40,18 +40,19 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 
 WORKDIR /src
 COPY . .
+ARG CARGO_BUILD_JOBS=2
 
 # Build the whole workspace. Cache the registry and target dir across rebuilds,
 # then lift just the artifacts out of the cache mount into a real layer.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/target,sharing=locked \
-    cargo build --release --workspace \
+    cargo build --locked --release --workspace --jobs "${CARGO_BUILD_JOBS}" \
     && mkdir -p /out \
     && cp target/release/bhf            /out/bhf \
     && cp target/release/bhf-daemon     /out/bhf-daemon \
     && cp target/release/libbhf_runtrace_shim.so /out/libbhf_runtrace_shim.so \
     && cp target/release/libbhf_cc_intercept.so  /out/libbhf_cc_intercept.so \
-    && strip /out/bhf /out/bhf-daemon /out/*.so || true
+    && strip /out/bhf /out/bhf-daemon /out/*.so
 
 ########################################  runtime  ########################################
 FROM ubuntu:24.04@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3 AS runtime
@@ -101,7 +102,7 @@ RUN apt-get update && apt-get -y dist-upgrade && apt-get install -y --no-install
         # AFL++ engine (optional C/C++ adapter)
         afl++ \
     && rm -rf /var/lib/apt/lists/* \
-    && locale-gen C.UTF-8 || true
+    && locale-gen C.UTF-8
 
 # Go from upstream (pinned + checksum-verified) — current stdlib, CVEs fixed.
 ARG GO_VERSION=1.27.1
@@ -118,8 +119,8 @@ RUN curl --proto '=https' --tlsv1.2 -fsSLo /tmp/go.tgz \
 # now-orphaned node-* deps — which carry the only npm-layer CVEs (handlebars,
 # nanoid/postcss, …). bhf's JS/TS lane needs only `node` + `esbuild` at runtime.
 RUN npm install -g --prefix /usr/local --no-fund --no-audit esbuild@0.28.2 \
-    && npm cache clean --force 2>/dev/null || true; \
-    apt-get purge -y npm && apt-get autoremove -y --purge \
+    && npm cache clean --force \
+    && apt-get purge -y npm && apt-get autoremove -y --purge \
     && rm -rf /var/lib/apt/lists/* /root/.npm \
     && esbuild --version && node --version
 
@@ -128,11 +129,11 @@ RUN npm install -g --prefix /usr/local --no-fund --no-audit esbuild@0.28.2 \
 # pure-Ruby, the only High) remove the superseded bundled copy so nothing — runtime
 # or scanner — sees the old version. bhf's Ruby lane fuzzes target code and does not
 # invoke these gems, so any residual is not in its execution path (see ato.md).
-RUN gem update --no-document erb net-imap zlib 2>/dev/null || true; \
+RUN set -eu; gem update --no-document erb net-imap zlib; \
     rubylib="$(ruby -e 'puts RbConfig::CONFIG["rubylibdir"]')"; \
     defdir="$(ruby -e 'require "rubygems"; puts Gem.default_specifications_dir')"; \
     rm -f "$rubylib/erb.rb" "$defdir"/erb-*.gemspec; rm -rf "$rubylib/erb" /root/.local/share/gem /root/.gem; \
-    ruby -e 'require "erb"; require "json"; abort("erb not patched") unless ERB.version.to_s >= "6"' \
+    ruby -e 'require "erb"; require "json"; require "net/imap"; require "zlib"; abort("erb not patched") unless Gem::Version.new(ERB.version) >= Gem::Version.new("6")' \
     && echo "erb runtime $(ruby -e 'require "erb"; puts ERB.version')"
 
 ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 \
@@ -197,6 +198,7 @@ COPY --chown=root:root docker/entrypoint.sh /usr/local/bin/bhf-entrypoint
 COPY --chown=root:root docker/bhf-sweep.sh  /usr/local/bin/bhf-sweep
 COPY --chown=root:root docker/fetch-corpus.sh /usr/local/bin/bhf-fetch-corpus
 COPY --chown=root:root docker/sweep-manifest.tsv /usr/local/share/bhf/sweep-manifest.tsv
+COPY --chown=root:root docker/sweep_contract.py /usr/local/bin/sweep_contract.py
 RUN chmod 0755 /usr/local/bin/bhf-entrypoint /usr/local/bin/bhf-sweep /usr/local/bin/bhf-fetch-corpus
 
 # Everything below runs AS the unprivileged fuzzer so the Rust toolchain and the
@@ -222,7 +224,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 RUN set -eux; d="$(mktemp -d)"; cd "$d"; \
     printf '%s' '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net8.0</TargetFramework><LangVersion>latest</LangVersion></PropertyGroup><ItemGroup><PackageReference Include="SharpFuzz" Version="2.3.0" /></ItemGroup></Project>' > warm.csproj; \
     echo 'class P{static void Main(){}}' > Program.cs; \
-    dotnet build -c Release -v quiet >/dev/null 2>&1 || true; \
+    dotnet build -c Release -v quiet; \
     cd /; rm -rf "$d"
 
 WORKDIR /work
@@ -234,6 +236,7 @@ ENV BHF_SWEEP_MANIFEST=/usr/local/share/bhf/sweep-manifest.tsv
 ARG BHF_VERSION=0.2.32
 ARG VCS_REF=unknown
 ARG BUILD_DATE=unknown
+ARG BHF_SOURCE_SHA256=unknown
 LABEL org.opencontainers.image.title="bhf" \
       org.opencontainers.image.description="BHF (Build Harness Fuzz) — offline sixteen-language automated fuzzer and harness generator" \
       org.opencontainers.image.source="https://github.com/Tarmo-Technologies/bhf" \
@@ -242,6 +245,7 @@ LABEL org.opencontainers.image.title="bhf" \
       org.opencontainers.image.version="${BHF_VERSION}" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.created="${BUILD_DATE}"
+LABEL io.tarmo.bhf.source-archive-sha256="${BHF_SOURCE_SHA256}"
 
 HEALTHCHECK --interval=1m --timeout=10s --retries=3 CMD ["bhf","--version"]
 

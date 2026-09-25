@@ -16,7 +16,8 @@
 #   BHF_CAMPAIGN_TIME     hard cap per project  (default: 240)
 #   BHF_JOBS              concurrent targets    (default: 1)
 #   BHF_LANGS             space list to filter  (default: all)
-set -uo pipefail
+set -euo pipefail
+set -f
 
 FETCH=0
 [ "${1:-}" = "--fetch" ] && { FETCH=1; shift; }
@@ -29,14 +30,19 @@ MAXT="${BHF_MAX_TARGETS:-3}"
 CAMP="${BHF_CAMPAIGN_TIME:-240}"
 JOBS="${BHF_JOBS:-1}"
 FILTER="${BHF_LANGS:-}"
+CONTRACT="$(dirname "$(readlink -f "$0")")/sweep_contract.py"
 
 [ -f "$MANIFEST" ] || { echo "manifest not found: $MANIFEST" >&2; exit 2; }
-mkdir -p "$RESULTS"
+ROWS=$(python3 "$CONTRACT" rows "$MANIFEST")
+for value in "$PTT" "$MAXT" "$CAMP" "$JOBS"; do
+    [[ "$value" =~ ^[1-9][0-9]{0,7}$ ]] || { echo "budgets must be positive bounded integers" >&2; exit 2; }
+done
+python3 "$CONTRACT" prepare "$RESULTS"
 REPORT_MD="$RESULTS/sweep-report.md"
 REPORT_TSV="$RESULTS/sweep-report.tsv"
 
 if [ "$FETCH" = 1 ]; then
-    BHF_SWEEP_MANIFEST="$MANIFEST" BHF_CORPUS="$CORPUS" bhf-fetch-corpus || true
+    BHF_SWEEP_MANIFEST="$MANIFEST" BHF_CORPUS="$CORPUS" bhf-fetch-corpus
 fi
 
 started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -53,22 +59,17 @@ started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 : > "$REPORT_TSV"
 
 # outcome tallies
-declare -i n_pass=0 n_stub=0 n_notargets=0 n_toolgap=0 n_error=0 n_missing=0
-
-# Extract an integer that follows a label in summary.txt (commas stripped).
-field() { grep -oiE "$2[^0-9]*[0-9][0-9,]*" "$1" 2>/dev/null | grep -oE '[0-9][0-9,]*' | head -1 | tr -d ',' ; }
-# Number that PRECEDES a phrase, e.g. "2 built+fuzzed".
-before() { grep -oiE "[0-9][0-9,]*[[:space:]]*$2" "$1" 2>/dev/null | grep -oE '[0-9][0-9,]*' | head -1 | tr -d ',' ; }
+declare -i n_pass=0 n_stub=0 n_notargets=0 n_error=0 n_missing=0 n_selected=0
 
 run_one() {
-    local lang="$1" id="$2" subpath="$3" extra="$4"
+    local lang="$1" id="$2" subpath="$3" extra="$4" revision="$5"
     local src="$CORPUS/${lang}__${id}"
     [ -n "$subpath" ] && [ "$subpath" != "-" ] && src="$src/$subpath"
     local wd="$RESULTS/${lang}__${id}"
     local status execs edges finds targets secs
     execs=0; edges=0; finds=0; targets=0
 
-    if [ ! -d "$src" ]; then
+    if ! python3 "$CONTRACT" checkout "$CORPUS/${lang}__${id}" "$revision" "$subpath"; then
         status="MISSING"; n_missing+=1
         printf '%s\t%s\t%s\t0\t0\t0\t0\t0\n' "$lang" "$id" "$status" >> "$REPORT_TSV"
         printf '| %s | %s | ⚠ %s | 0 | 0 | 0 | 0 | 0 |\n' "$lang" "$id" "$status" >> "$REPORT_MD"
@@ -76,7 +77,7 @@ run_one() {
         return
     fi
 
-    rm -rf "$wd"; mkdir -p "$wd"
+    mkdir "$wd"
     [ "$extra" = "-" ] && extra=""
     local t0 t1; t0=$(date +%s)
     # Build recovery executes the tree's own build system to recover real compile
@@ -85,7 +86,8 @@ run_one() {
     # NB: </dev/null keeps bhf and any build subprocess from consuming the manifest
     # that the outer loop reads (the loop uses FD 3, but this is belt-and-suspenders).
     # shellcheck disable=SC2086
-    timeout $((CAMP + 600)) bhf --profile external-tools auto "$src" \
+    local rc=0
+    timeout --kill-after=10 $((CAMP + 600)) bhf --profile external-tools auto "$src" \
         --work-dir "$wd" \
         --jobs "$JOBS" \
         --per-target-time "$PTT" \
@@ -93,34 +95,26 @@ run_one() {
         --campaign-time "$CAMP" \
         --unsafe-search-and-run-build-commands \
         --force \
-        $extra > "$wd/sweep-stdout.log" 2>&1 </dev/null
-    local rc=$?
+        $extra > "$wd/sweep-stdout.log" 2>&1 </dev/null || rc=$?
     t1=$(date +%s); secs=$((t1 - t0))
 
-    local summ="$wd/auto/summary.txt"
-    if [ -f "$summ" ]; then
-        execs=$(field "$summ" 'Executions:');   execs=${execs:-0}
-        edges=$(field "$summ" 'Coverage:');      edges=${edges:-0}
-        finds=$(field "$summ" 'Findings:');      finds=${finds:-0}
-        targets=$(before "$summ" 'built\+fuzzed'); targets=${targets:-0}
-    fi
-    # findings.csv is the authoritative finding index
-    if [ -f "$wd/findings.csv" ]; then
-        local fc; fc=$(( $(wc -l < "$wd/findings.csv") - 1 )); [ "$fc" -ge 0 ] && finds=$fc
+    local stats report_status="ERROR(no-valid-report)"
+    if stats=$(python3 "$CONTRACT" stats "$wd/auto/run.json"); then
+        IFS=$'\t' read -r report_status targets execs edges finds <<< "$stats"
     fi
 
     if [ "$rc" -eq 124 ]; then
         status="TIMEOUT"; n_error+=1
     elif [ "$rc" -ne 0 ]; then
         status="ERROR($rc)"; n_error+=1
-    elif grep -qiE 'STUB-ONLY|stub-only' "$summ" 2>/dev/null; then
-        status="STUB-ONLY"; n_stub+=1
-    elif [ "${execs:-0}" -gt 0 ] 2>/dev/null; then
-        status="PASS"; n_pass+=1
-    elif [ -f "$summ" ]; then
-        status="NO-TARGETS"; n_notargets+=1
     else
-        status="ERROR(no-summary)"; n_error+=1
+        status="$report_status"
+        case "$status" in
+            PASS) n_pass+=1;;
+            STUB-ONLY) n_stub+=1;;
+            NO-TARGETS|NOT-ENTERED) n_notargets+=1;;
+            *) n_error+=1;;
+        esac
     fi
 
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
@@ -135,8 +129,9 @@ run_one() {
 while IFS=$'\t' read -r lang id url rev subpath extra <&3 || [ -n "${lang:-}" ]; do
     case "$lang" in ''|'#'*) continue;; esac
     if [ -n "$FILTER" ]; then case " $FILTER " in *" $lang "*) : ;; *) continue;; esac; fi
-    run_one "$lang" "$id" "${subpath:-}" "${extra:-}"
-done 3< "$MANIFEST"
+    n_selected+=1
+    run_one "$lang" "$id" "${subpath:-}" "${extra:-}" "$rev"
+done 3<<< "$ROWS"
 
 {
     echo
@@ -147,6 +142,8 @@ done 3< "$MANIFEST"
     echo "- NO-TARGETS (no fuzzable entry found): $n_notargets"
     echo "- MISSING (corpus not fetched): $n_missing"
     echo "- ERROR / TIMEOUT: $n_error"
+    echo "- Edges: sum of per-target peak feedback counters; not a global edge union."
+    echo "- Findings: per-pass observations on entered real targets, not unique bugs."
     echo
     echo "- finished: \`$(date -u +%Y-%m-%dT%H:%M:%SZ)\`"
 } >> "$REPORT_MD"
@@ -157,5 +154,5 @@ echo "PASS=$n_pass STUB-ONLY=$n_stub NO-TARGETS=$n_notargets MISSING=$n_missing 
 echo "report: $REPORT_MD"
 echo "====================================================="
 
-# Nonzero if anything hard-errored or the corpus was incomplete.
-[ "$n_error" -eq 0 ] && [ "$n_missing" -eq 0 ]
+# Every selected project needs positive real-target execution evidence.
+[ "$n_selected" -gt 0 ] && [ "$n_pass" -eq "$n_selected" ]
