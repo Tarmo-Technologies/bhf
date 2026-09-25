@@ -2114,6 +2114,7 @@ name = "target_transport"
 version = "0.2.32"
 dependencies = [
  "event_log",
+ "serde_json",
  "thiserror",
 ]
 

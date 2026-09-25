@@ -446,28 +446,34 @@ where
     }
 }
 
+/// Read the coverage ring control words and image out of target memory and
+/// reconstruct the coverage edges.
+///
+/// Reads `adafuzz_probe_memory_buffer_write` (little-endian `u32`),
+/// `_wrapped` (`u8`), and the ring image, then hands them to
+/// [`MemoryBufferReader`] which honors the wrap. Shared by [`GdbSession`] and by
+/// the HDF-4 [`crate::fullsystem::FullSystemTransport`] so the coverage read is
+/// defined once. Every read is length-bounded by [`GdbClient::read_memory`].
+pub fn read_coverage_ring<C: Read + Write>(
+    client: &mut GdbClient<C>,
+    map: &GdbMemoryMap,
+) -> Result<Vec<u32>> {
+    let write_bytes = client.read_memory(map.ring_write_address, 4)?;
+    let write = u32::from_le_bytes([
+        write_bytes[0],
+        write_bytes[1],
+        write_bytes[2],
+        write_bytes[3],
+    ]);
+    let wrapped = client.read_memory(map.ring_wrapped_address, 1)?[0] != 0;
+    let image = client.read_memory(map.ring_address, map.ring_capacity)?;
+    MemoryBufferReader::new(image, write, wrapped)?.read_edges()
+}
+
 /// A live GDB-driven session.
 pub struct GdbSession<C> {
     client: GdbClient<C>,
     map: GdbMemoryMap,
-}
-
-impl<C: Read + Write> GdbSession<C> {
-    /// Read the ring control words and image, and reconstruct coverage edges.
-    fn read_coverage(&mut self) -> Result<Vec<u32>> {
-        let write_bytes = self.client.read_memory(self.map.ring_write_address, 4)?;
-        let write = u32::from_le_bytes([
-            write_bytes[0],
-            write_bytes[1],
-            write_bytes[2],
-            write_bytes[3],
-        ]);
-        let wrapped = self.client.read_memory(self.map.ring_wrapped_address, 1)?[0] != 0;
-        let image = self
-            .client
-            .read_memory(self.map.ring_address, self.map.ring_capacity)?;
-        MemoryBufferReader::new(image, write, wrapped)?.read_edges()
-    }
 }
 
 impl<C: Read + Write> TargetSession for GdbSession<C> {
@@ -475,7 +481,7 @@ impl<C: Read + Write> TargetSession for GdbSession<C> {
         self.client.reset()?;
         self.client.write_memory(self.map.input_address, input)?;
         let stop = self.client.cont()?;
-        let coverage_edges = self.read_coverage()?;
+        let coverage_edges = read_coverage_ring(&mut self.client, &self.map)?;
         Ok(RunOutcome {
             exit: stop.to_exit_kind(),
             coverage_edges,

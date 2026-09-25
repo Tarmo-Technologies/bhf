@@ -10,14 +10,17 @@
 //! * [`MockAgent`] — speaks the target side of the [`crate::agent`] protocol,
 //!   emitting a scripted edge set and fault per input.
 //! * [`MockGdbStub`] — a minimal gdbstub speaking the target side of RSP.
+//! * [`MockQmpServer`] — a minimal QMP monitor: greeting, capability
+//!   negotiation, `stop`/`cont`, and `savevm`/`loadvm` via `human-monitor-command`.
 //! * [`encode_event_stream`] / [`simulate_ring`] — build `BHF_EVENTS` byte
 //!   streams and simulate the Ada ring buffer for the coverage-reader tests.
 
 use crate::agent::{encode_response, read_input_frame, AgentLimits};
-use crate::error::Result;
+use crate::error::{Result, TransportError};
 use crate::gdb::GdbConnection;
 use crate::outcome::{ExitKind, Fault, RunOutcome};
 use event_log::Event;
+use serde_json::Value;
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::sync::{Arc, Condvar, Mutex};
@@ -401,6 +404,104 @@ fn unhex(bytes: &[u8]) -> Option<Vec<u8>> {
         .step_by(2)
         .map(|i| u8::from_str_radix(&text[i..i + 2], 16).ok())
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Mock QMP monitor
+// ---------------------------------------------------------------------------
+
+/// A minimal QMP (QEMU Machine Protocol) server for driving [`crate::fullsystem`]
+/// tests without a real `qemu-system`.
+///
+/// It sends the opening greeting, then for each request logs the executed
+/// command and answers:
+///
+/// * `human-monitor-command` — logged as `hmp:<command-line>`; answered with
+///   `{"return": ""}` (an empty HMP output, i.e. `savevm`/`loadvm` success).
+/// * any other command (`qmp_capabilities`, `stop`, `cont`, …) — logged by its
+///   `execute` name; answered with `{"return": {}}`.
+///
+/// A request without an `execute` field is answered with a QMP `error` object.
+pub struct MockQmpServer<C: Read + Write> {
+    channel: C,
+    log: Arc<Mutex<Vec<String>>>,
+}
+
+impl<C: Read + Write> MockQmpServer<C> {
+    /// Build a server over `channel`; `log` records each executed command.
+    pub fn new(channel: C, log: Arc<Mutex<Vec<String>>>) -> Self {
+        Self { channel, log }
+    }
+
+    fn read_byte(&mut self) -> Result<Option<u8>> {
+        let mut buf = [0_u8; 1];
+        match self.channel.read(&mut buf)? {
+            0 => Ok(None),
+            _ => Ok(Some(buf[0])),
+        }
+    }
+
+    /// Read one `\n`-terminated line; `Ok(None)` on a clean EOF between messages.
+    fn read_line(&mut self) -> Result<Option<Vec<u8>>> {
+        let mut line = Vec::new();
+        loop {
+            match self.read_byte()? {
+                None if line.is_empty() => return Ok(None),
+                None => {
+                    return Err(TransportError::protocol(
+                        "mock QMP client closed mid-message",
+                    ))
+                }
+                Some(b'\n') => {
+                    if line.last() == Some(&b'\r') {
+                        line.pop();
+                    }
+                    return Ok(Some(line));
+                }
+                Some(byte) => line.push(byte),
+            }
+        }
+    }
+
+    fn send_line(&mut self, bytes: &[u8]) -> Result<()> {
+        self.channel.write_all(bytes)?;
+        self.channel.write_all(b"\n")?;
+        self.channel.flush()?;
+        Ok(())
+    }
+
+    /// Serve until the client closes the link.
+    pub fn serve(mut self) -> Result<()> {
+        self.send_line(
+            br#"{"QMP":{"version":{"qemu":{"major":8,"minor":2,"micro":0},"package":""},"capabilities":[]}}"#,
+        )?;
+        while let Some(line) = self.read_line()? {
+            let request: Value = serde_json::from_slice(&line).map_err(|error| {
+                TransportError::protocol(format!("mock QMP received invalid JSON: {error}"))
+            })?;
+            match request.get("execute").and_then(Value::as_str) {
+                Some("human-monitor-command") => {
+                    let command_line = request
+                        .get("arguments")
+                        .and_then(|args| args.get("command-line"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    self.log.lock().unwrap().push(format!("hmp:{command_line}"));
+                    self.send_line(br#"{"return":""}"#)?;
+                }
+                Some(command) => {
+                    self.log.lock().unwrap().push(command.to_string());
+                    self.send_line(br#"{"return":{}}"#)?;
+                }
+                None => {
+                    self.send_line(
+                        br#"{"error":{"class":"GenericError","desc":"request has no execute field"}}"#,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

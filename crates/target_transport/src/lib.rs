@@ -23,6 +23,10 @@
 //! * [`gdb::GdbRemoteTransport`] — a GDB remote serial protocol client for a
 //!   debug probe / emulator gdbstub, reading the coverage ring back out of
 //!   target memory.
+//! * [`fullsystem::FullSystemTransport`] (HDF-4) — a full-system / snapshot
+//!   backend over `qemu-system-*`: a [`fullsystem::QmpClient`] drives the
+//!   snapshot lifecycle (`qmp_capabilities`, `stop`, `savevm`/`loadvm`) while
+//!   the [`gdb::GdbClient`] delivers input, runs, and reads the coverage ring.
 //! * [`host::HostChildTransport`] (Unix) — a self-contained reference host
 //!   backend (spawn child, feed stdin, map exit/signal). It collects no
 //!   coverage; adopting the production `mmap`/fork-server coverage path is a
@@ -44,6 +48,7 @@
 pub mod agent;
 pub mod coverage;
 pub mod error;
+pub mod fullsystem;
 pub mod gdb;
 pub mod outcome;
 pub mod testsupport;
@@ -56,7 +61,11 @@ pub mod host;
 pub use agent::{AgentLimits, AgentSession, AgentTransport};
 pub use coverage::{edges_from_events, MemoryBufferReader, SemihostingReader};
 pub use error::{Result, TransportError};
-pub use gdb::{GdbClient, GdbConnection, GdbMemoryMap, GdbRemoteTransport, GdbSession, StopReply};
+pub use fullsystem::{FullSystemSession, FullSystemTransport, QmpClient, QmpLimits};
+pub use gdb::{
+    read_coverage_ring, GdbClient, GdbConnection, GdbMemoryMap, GdbRemoteTransport, GdbSession,
+    StopReply,
+};
 pub use outcome::{ExitKind, Fault, FaultKind, RunOutcome};
 pub use transport::{TargetSession, TargetTransport};
 
