@@ -57,6 +57,7 @@ members = [
     "crates/static_analysis",
     "crates/stub_gen",
     "crates/target_rank",
+    "crates/target_transport",
     "crates/type_model",
 ]
 

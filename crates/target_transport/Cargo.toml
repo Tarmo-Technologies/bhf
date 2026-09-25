@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "target_transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# The event stream reader is the wire-format source of truth for the
+# BHF_EVENTS tag-length coverage channel (semihosting + memory-buffer probes),
+# so the coverage readers reuse it rather than re-implementing decoding.
+event_log = { path = "../event_log" }
+thiserror.workspace = true
