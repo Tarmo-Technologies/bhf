@@ -69,6 +69,52 @@ pub struct GenerateCDirectArgs {
     /// whole target as `unsupported_params`. Default `false` leaves the emission
     /// byte-for-byte unchanged.
     pub force: bool,
+    /// HDF-5 environment/peripheral model. When `Some`, the harness fabricates a
+    /// fuzz-fed source of successive peripheral values and defines the register /
+    /// queue read accessors the driver/ISR calls, so a polled-register reader
+    /// sees a fuzz-controlled SEQUENCE across one input (a value-gated branch on
+    /// the Nth read becomes reachable) and, optionally, registered callbacks are
+    /// driven from fuzz input instead of no-op trampolines. `None` (the default)
+    /// leaves the emission byte-for-byte unchanged.
+    pub environment: Option<CEnvironmentModel>,
+}
+
+/// HDF-5 environment/peripheral harness model: the device/peripheral read
+/// accessors a driver/ISR needs, fabricated so their SUCCESSIVE reads return
+/// successive fuzz-controlled values across one input. BHF-authored scaffolding,
+/// not vendor code.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct CEnvironmentModel {
+    /// Peripheral register / queue read accessors the target invokes (e.g.
+    /// `mmio_read32`, `msgQReceive`). Each is defined to draw the next value from
+    /// the fuzz input, so a polling loop observes a changing sequence.
+    pub peripheral_readers: Vec<CPeripheralReader>,
+    /// When true, a registered callback the target requires is driven from the
+    /// same fuzz-fed source (its trampoline returns fuzz-controlled values that
+    /// steer the driver) rather than a no-op `return 0;`.
+    pub fuzz_driven_callbacks: bool,
+}
+
+/// One fuzz-fed peripheral read accessor to synthesize. Its signature must match
+/// the (otherwise BSP-provided, undefined-at-harness-build-time) primitive the
+/// target calls; the generated body ignores the arguments and returns the next
+/// fuzz value.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct CPeripheralReader {
+    /// Scalar return type spelled exactly as the primitive declares it
+    /// (`uint32_t`, `int`, `unsigned int`, ...).
+    pub return_type: String,
+    /// The accessor's name (`mmio_read32`, `sysInLong`, `read_reg`, ...).
+    pub name: String,
+    /// The accessor's parameters. Empty means a `(void)` parameter list.
+    pub params: Vec<CPeripheralParam>,
+}
+
+/// One parameter of a synthesized peripheral read accessor.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct CPeripheralParam {
+    pub c_type: String,
+    pub name: String,
 }
 
 /// A constructor drive-loop plan: after `H *R = create(Data, Size, …)`, pump
@@ -468,6 +514,11 @@ struct CTemplateContext {
     drive_destroy: Option<String>,
     /// Per-pump iteration cap so a malformed stream can't spin forever.
     drive_cap: usize,
+    /// HDF-5 environment/peripheral model: fuzz-fed register/queue read accessors
+    /// (and whether registered callbacks are fuzz-driven). `None` leaves the
+    /// harness byte-for-byte unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    environment: Option<CEnvironmentModel>,
 }
 
 /// Upper bound on drive-loop pump iterations per input. A pointer-returning
@@ -2932,6 +2983,7 @@ fn build_c_context(args: &GenerateCDirectArgs) -> Result<CTemplateContext, Harne
         drive_steps,
         drive_destroy,
         drive_cap: DRIVE_LOOP_CAP,
+        environment: args.environment.clone(),
     })
 }
 
@@ -4788,6 +4840,106 @@ mod tests {
         }
     }
 
+    /// A minimal `GenerateCDirectArgs` for `<name>` with no params; caller tweaks.
+    fn direct_args(name: &str, out: PathBuf) -> GenerateCDirectArgs {
+        GenerateCDirectArgs {
+            harness_id: format!("H-{name}"),
+            output_dir: out,
+            source_path: PathBuf::from(format!("/tmp/{name}.c")),
+            target: cfunction(name),
+            params: Vec::new(),
+            return_type: "int".to_owned(),
+            target_includes: Vec::new(),
+            target_includes_dirs: Vec::new(),
+            target_sources: vec![PathBuf::from(format!("/tmp/{name}.c"))],
+            compile_flags: Vec::new(),
+            target_declared_in_header: false,
+            c_runtime_include: PathBuf::from("/tmp/c_runtime"),
+            type_defs: Vec::new(),
+            result_cleanup: None,
+            lifecycle: Vec::new(),
+            drive_plan: None,
+            decoder_limits: Default::default(),
+            force: false,
+            environment: None,
+        }
+    }
+
+    /// HDF-5 deliverable 2: a polled-register reader harness must fabricate the
+    /// peripheral read accessor(s) and drive a fuzz-controlled SEQUENCE of reads —
+    /// each call draws the NEXT value from the fuzz input — so a value-gated branch
+    /// on the Nth read is reachable. The emitted source must carry the sequence
+    /// drive (an advancing fuzz cursor feeding the accessor), not a constant.
+    #[test]
+    fn peripheral_reader_harness_drives_a_fuzz_controlled_read_sequence() {
+        let out = temp_dir("periph_seq");
+        let mut args = direct_args("radar_status_poll", out.clone());
+        args.return_type = "int".to_owned();
+        args.environment = Some(CEnvironmentModel {
+            peripheral_readers: vec![CPeripheralReader {
+                return_type: "uint32_t".to_owned(),
+                name: "mmio_read32".to_owned(),
+                params: vec![CPeripheralParam {
+                    c_type: "volatile uint32_t *".to_owned(),
+                    name: "reg".to_owned(),
+                }],
+            }],
+            fuzz_driven_callbacks: false,
+        });
+        let result = generate_c_direct_harness(args).unwrap();
+        let main = fs::read_to_string(&result.main_c).unwrap();
+
+        // The accessor is synthesized with the exact BSP signature and EXTERNAL
+        // linkage (the target that calls it is often a separate TU).
+        assert!(
+            main.contains("\nuint32_t mmio_read32(volatile uint32_t * reg)"),
+            "must synthesize the peripheral read accessor with external linkage: {main}"
+        );
+        // Its unused argument is void-cast (survives -Wunused-parameter -Werror).
+        assert!(
+            main.contains("(void)reg;"),
+            "accessor must void its arg: {main}"
+        );
+        // Each read draws the NEXT fuzz value (a SEQUENCE, not a constant).
+        assert!(
+            main.contains("return (uint32_t)_bhf_env_next_u32();"),
+            "each read must draw the next fuzz value: {main}"
+        );
+        // The fuzz-fed source advances an index across successive reads.
+        assert!(
+            main.contains("_bhf_env_data[_bhf_env_index++]"),
+            "the source must advance across successive reads: {main}"
+        );
+        // And it is armed from THIS iteration's input.
+        assert!(
+            main.contains("_bhf_env_data = Data;") && main.contains("_bhf_env_index = 0;"),
+            "the source must be armed from the current fuzz input: {main}"
+        );
+    }
+
+    /// The environment model is strictly opt-in: with `environment: None` the
+    /// harness carries none of the fuzz-fed-source machinery (byte-for-byte
+    /// unchanged from before HDF-5).
+    #[test]
+    fn no_environment_model_emits_no_peripheral_machinery() {
+        let out = temp_dir("periph_none");
+        let mut args = direct_args("plain_target", out);
+        args.params = vec![CParameter {
+            name: "data".to_owned(),
+            c_type: "const char *".to_owned(),
+        }];
+        let result = generate_c_direct_harness(args).unwrap();
+        let main = fs::read_to_string(&result.main_c).unwrap();
+        assert!(
+            !main.contains("_bhf_env_next_u32"),
+            "no env source when opt-out"
+        );
+        assert!(
+            !main.contains("_bhf_env_data = Data;"),
+            "no env arming when opt-out"
+        );
+    }
+
     #[test]
     fn variadic_format_param_uses_neutralised_decoder() {
         // A custom variadic logger whose format param is NOT named fmt/format
@@ -4798,6 +4950,7 @@ mod tests {
         // harness format/argument mismatch FALSE POSITIVE).
         let out = temp_dir("vararg_fmt");
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -4846,6 +4999,7 @@ mod tests {
         // the file's CONTENT is the fuzz input.
         let out = temp_dir("loadfile_path");
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -4890,6 +5044,7 @@ mod tests {
         // pinned to 0 (the caller's seed), not a fuzzed value.
         let out = temp_dir("idx_ptr");
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -4940,6 +5095,7 @@ mod tests {
         // destructor and SUPPRESS the consumed param's free.
         let out = temp_dir("sds_builder");
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: vec![CHandleLifecycle {
@@ -5003,6 +5159,7 @@ mod tests {
         // existing sds param, dropping R leaks on every successful input.
         let out = temp_dir("sds_ctor_return");
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: vec![CHandleLifecycle {
@@ -5070,6 +5227,7 @@ mod tests {
             }],
         }];
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -5124,6 +5282,7 @@ mod tests {
             }],
         }];
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -5159,6 +5318,7 @@ mod tests {
         // the variadic-format heuristic).
         let out = temp_dir("plain_str");
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -5200,6 +5360,7 @@ mod tests {
         // independently-fuzzed count (which over-reads strings[1..count]).
         let out = temp_dir("strarr");
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -5339,6 +5500,7 @@ mod tests {
                 });
             }
             GenerateCDirectArgs {
+                environment: None,
                 decoder_limits: Default::default(),
                 force: false,
                 lifecycle: Vec::new(),
@@ -5396,6 +5558,7 @@ mod tests {
         // wrapped so the TU's `main` is renamed; a plain .h include is not.
         let out = temp_dir("tu-main");
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -5448,6 +5611,7 @@ mod tests {
     fn rejects_command_injection_in_compile_flags() {
         let out = temp_dir("inject-flag");
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -5620,6 +5784,7 @@ mod tests {
             c_parser::parse_c_type_defs("typedef struct { void *code; int flags; } regex_t;")
                 .unwrap();
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: vec![CHandleLifecycle {
@@ -5699,6 +5864,7 @@ mod tests {
         // exercised, then destroy — all under one `if (R)` guard.
         let out = temp_dir("drive");
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -5783,6 +5949,7 @@ mod tests {
         // the whole input one byte at a time, not make a single fuzzed call.
         let out = temp_dir("bytestream");
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -5840,6 +6007,7 @@ mod tests {
     fn rejects_command_injection_in_source_path() {
         let out = temp_dir("inject-src");
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -5871,6 +6039,7 @@ mod tests {
     fn generate_c_direct_harness_emits_main_and_makefile() {
         let out = temp_dir("emit");
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -5987,6 +6156,7 @@ mod tests {
         // system header of the same name still wins (no shadowing).
         let out = temp_dir("iquote");
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -6039,6 +6209,7 @@ mod tests {
     fn generate_c_direct_harness_handles_void_return() {
         let out = temp_dir("emit-void");
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -6072,6 +6243,7 @@ mod tests {
     fn existing_libfuzzer_entrypoint_is_not_wrapped_recursively() {
         let out = temp_dir("c-existing-libfuzzer");
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -6151,6 +6323,7 @@ mod tests {
     fn buffer_length_pair_emits_coherent_data_size_decoder() {
         let out = temp_dir("emit-pair");
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -6213,6 +6386,7 @@ mod tests {
         // reports as a heap-buffer-overflow in correct library code.
         let out = temp_dir("emit-begin-end");
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -6276,6 +6450,7 @@ mod tests {
         // NUL-terminating `bhf_c_string` decoder and `error` an out-param scratch.
         let out = temp_dir("emit-cstring-outparam");
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -6338,6 +6513,7 @@ mod tests {
         // must use the standalone NUL-terminating string + scalar decoders.
         let out = temp_dir("emit-file-line-nopair");
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -6402,6 +6578,7 @@ mod tests {
         // name-gate must not over-correct and break real pairs).
         let out = temp_dir("emit-src-srclen-pair");
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -6450,6 +6627,7 @@ mod tests {
         // past the real buffer — a spurious OOB (id3tag read 16k from a 23-byte input).
         let out = temp_dir("emit-east-const");
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -6499,6 +6677,7 @@ mod tests {
         // tinfl_decompress (the harness lied about the source length).
         let out = temp_dir("emit-inbuf-lenptr");
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -6550,6 +6729,7 @@ mod tests {
         // manufacture an overread or overwrite in the harness itself.
         let out = temp_dir("emit-stream-cursors");
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -6630,6 +6810,7 @@ mod tests {
         "#;
         let defs = c_parser::parse_c_type_defs(header_source).unwrap();
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -6692,6 +6873,7 @@ mod tests {
         "#;
         let defs = c_parser::parse_c_type_defs(header_source).unwrap();
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -6764,6 +6946,7 @@ mod tests {
         "#;
         let defs = c_parser::parse_c_type_defs(header_source).unwrap();
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -6830,6 +7013,7 @@ mod tests {
         "#;
         let defs = c_parser::parse_c_type_defs(header_source).unwrap();
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: vec![CHandleLifecycle {
@@ -6891,6 +7075,7 @@ mod tests {
         // registry resolves it to a non-byte scalar without a struct def.)
         let out = temp_dir("emit-typed-array");
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -7111,6 +7296,7 @@ mod tests {
         // standalone decoders.
         let out = temp_dir("emit-no-mispair");
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -7155,6 +7341,7 @@ mod tests {
         // gets a writable, fuzz-seeded allocation that is freed.
         let out = temp_dir("emit-out-buf");
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -7213,6 +7400,7 @@ mod tests {
     fn buffer_with_non_length_neighbor_falls_back_to_individual_decoders() {
         let out = temp_dir("emit-no-pair");
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -7258,6 +7446,7 @@ mod tests {
     fn zlib_style_output_and_input_buffers_are_supported() {
         let out = temp_dir("emit-zlib-compress");
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -7332,6 +7521,7 @@ mod tests {
     fn reverse_size_buffer_pairs_match_brotli_one_shot_contract() {
         let out = temp_dir("emit-brotli-decompress");
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -7400,6 +7590,7 @@ mod tests {
     fn scalar_output_capacity_does_not_consume_input_buffer_pair() {
         let out = temp_dir("emit-output-capacity-and-input-pair");
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -7508,6 +7699,7 @@ mod tests {
         let defs = c_parser::parse_c_type_defs(header_source).unwrap();
         let out = work.join("harness");
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -7582,6 +7774,7 @@ mod tests {
             .canonicalize()
             .unwrap();
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -7655,6 +7848,7 @@ mod tests {
             .canonicalize()
             .unwrap();
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -7728,6 +7922,7 @@ mod tests {
             .canonicalize()
             .unwrap();
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -7869,6 +8064,7 @@ mod tests {
             .canonicalize()
             .unwrap();
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -7955,6 +8151,7 @@ mod tests {
             .canonicalize()
             .unwrap();
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -8049,6 +8246,7 @@ mod tests {
             .canonicalize()
             .unwrap();
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -8196,6 +8394,7 @@ mod tests {
             .canonicalize()
             .unwrap();
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -8306,6 +8505,7 @@ mod tests {
     fn generate_c_direct_harness_rejects_unsupported_param_type() {
         let out = temp_dir("emit-unsupported");
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),
@@ -8341,6 +8541,7 @@ mod tests {
         // erroring out `unsupported_params`.
         let out = temp_dir("emit-force-opaque");
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: true,
             lifecycle: Vec::new(),
@@ -8385,6 +8586,7 @@ mod tests {
         // of emitting un-compilable code that fails the build.
         let out = temp_dir("emit-lifecycle-incomplete");
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: vec![CHandleLifecycle {
@@ -8456,6 +8658,7 @@ mod tests {
             .canonicalize()
             .unwrap();
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: vec![CHandleLifecycle {
@@ -8543,6 +8746,7 @@ mod tests {
             .canonicalize()
             .unwrap();
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: vec![CHandleLifecycle {
@@ -8655,6 +8859,7 @@ mod tests {
             .canonicalize()
             .unwrap();
         let args = GenerateCDirectArgs {
+            environment: None,
             decoder_limits: Default::default(),
             force: false,
             lifecycle: Vec::new(),

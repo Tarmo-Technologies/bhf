@@ -2081,7 +2081,14 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
                 fns.iter().map(|f| ((f.name.as_str(), f.line), f)).collect();
             // Loop-invariant: depends only on the path. Same hoist as the C++ arm.
             let path_guard = foreign_platform_path_guard(path);
-            for tgt in target_rank::rank_c_targets(&fns) {
+            // HDF-5: recognise non-buffer RTOS/radar entry points over the TU's
+            // call graph — an ISR/task registered via intConnect/taskSpawn, or a
+            // function whose body drains a message queue / pub-sub / MMIO channel.
+            // These carry attacker-influenced data but take no byte buffer, so the
+            // signature ranker would sink them to `ReachabilityUnproven`; the
+            // provenance map instead marks them the event-driven attack surface.
+            let entry_provenance = target_rank::detect_entry_point_provenance(&source);
+            for tgt in target_rank::rank_c_targets_with_provenance(&fns, &entry_provenance) {
                 let target_dialect = if knr_names.contains(&tgt.name) {
                     lang_profile::Dialect::CKAndR
                 } else {
@@ -2559,8 +2566,7 @@ fn dynamic_target_score(name: &str) -> i32 {
     // `Yaml::parse` so the sweep picked the setter and reported `unsupported_params`
     // with zero edges). Sink both below every normally-ranked target. Ordering only:
     // backfill still reaches them uncapped.
-    if leaf_name.starts_with("__")
-        || target_rank::name_semantics::is_accessor_or_mutator(leaf_name)
+    if leaf_name.starts_with("__") || target_rank::name_semantics::is_accessor_or_mutator(leaf_name)
     {
         return score.saturating_sub(ACCESSOR_DEMOTION);
     }
@@ -3754,7 +3760,12 @@ mod tests {
         // Python `__init__`). A real method that merely contains a double underscore
         // mid-name is unaffected.
         let plain = dynamic_target_score("Dumper#plainMethod");
-        for magic in ["encoder#__index", "Foo#__construct", "mod.__call", "Obj#__init__"] {
+        for magic in [
+            "encoder#__index",
+            "Foo#__construct",
+            "mod.__call",
+            "Obj#__init__",
+        ] {
             assert!(
                 dynamic_target_score(magic) < plain,
                 "{magic} ({}) must rank below a plain method ({plain})",
@@ -3825,11 +3836,15 @@ mod tests {
             R::AttackerReachable
         );
         // Other verdicts are untouched in both directions — this tempers the
-        // positive claim only, it does not invent one.
+        // positive claim only, it does not invent one. A static registered ISR /
+        // channel consumer stays reachable (the RTOS/channel still drives it,
+        // internal linkage or not), so those pass through unchanged too.
         for verdict in [
             R::ReachabilityUnproven,
             R::OutputSerializer,
             R::IpcChannelReachable,
+            R::RegisteredEntryPoint,
+            R::ChannelConsumer,
         ] {
             assert_eq!(reachability_for_linkage(verdict, true), verdict);
             assert_eq!(reachability_for_linkage(verdict, false), verdict);
@@ -4585,6 +4600,72 @@ mod tests {
                 cands.iter().map(|c| (&c.name, c.score)).collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn hdf5_non_buffer_isr_and_queue_consumer_are_discovered_reachable() {
+        // HDF-5: a radar TU that registers an ISR via `intConnect` and defines a
+        // message-queue consumer looping on `msgQReceive`. Neither takes a byte
+        // buffer, so the signature ranker alone sinks them to
+        // `ReachabilityUnproven`; the call-graph recogniser must surface them as
+        // the event-driven attack surface with a positive score, out-ranking a
+        // plain no-input helper in the same file.
+        let root = tmpdir();
+        fs::write(
+            root.join("radar_bsp.c"),
+            "typedef void (*VOIDFUNCPTR)(int);\n\
+             void radar_rx_isr(int vector) {\n\
+             \x20  volatile unsigned int *fifo = (volatile unsigned int *)0x40002000u;\n\
+             \x20  (void)vector; (void)*fifo;\n\
+             }\n\
+             int track_queue_consumer(int q) {\n\
+             \x20  unsigned char frame[256];\n\
+             \x20  while (msgQReceive(q, frame, sizeof frame, -1) > 0) {\n\
+             \x20    if (frame[0] == 0xA5) return -1;\n\
+             \x20  }\n\
+             \x20  return 0;\n\
+             }\n\
+             int add_scalars(int a, int b) { return a + b; }\n\
+             void radar_install(void) {\n\
+             \x20  intConnect((void *)0x30, (VOIDFUNCPTR)radar_rx_isr, 0);\n\
+             }\n",
+        )
+        .unwrap();
+        let cands = discover(&root).unwrap();
+        let find = |name: &str| cands.iter().find(|c| c.name == name);
+
+        let isr = find("radar_rx_isr").expect("ISR handler must be discovered");
+        assert_eq!(
+            isr.input_reachability,
+            Some(target_rank::InputReachability::RegisteredEntryPoint),
+            "intConnect handler must be a registered entry point, not unproven: {isr:?}"
+        );
+        assert!(isr.score > 0, "registered ISR must score positive: {isr:?}");
+
+        let consumer = find("track_queue_consumer").expect("queue consumer must be discovered");
+        assert_eq!(
+            consumer.input_reachability,
+            Some(target_rank::InputReachability::ChannelConsumer),
+            "msgQReceive loop must be a channel consumer: {consumer:?}"
+        );
+        assert!(
+            consumer.score > 0,
+            "queue consumer must score positive: {consumer:?}"
+        );
+
+        let helper = find("add_scalars").expect("helper discovered");
+        assert_ne!(
+            helper.input_reachability,
+            Some(target_rank::InputReachability::RegisteredEntryPoint)
+        );
+        assert!(
+            isr.score > helper.score && consumer.score > helper.score,
+            "non-buffer entry points must out-rank the no-input helper: {:?}",
+            cands
+                .iter()
+                .map(|c| (&c.name, c.score, c.input_reachability))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

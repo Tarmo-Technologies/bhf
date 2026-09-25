@@ -687,6 +687,229 @@ fn collect_call_targets(
     }
 }
 
+/// One call expression's callee plus the identifier leaves found in its
+/// arguments. On RTOS/driver code the interesting fuzz entry point is often the
+/// function *registered* through a call — the ISR handler passed to
+/// `intConnect`, the task entry passed to `taskSpawn` — whose own signature
+/// carries no byte buffer. Recording the argument identifiers (with casts,
+/// address-of and parentheses peeled, since a `type_identifier` in
+/// `(VOIDFUNCPTR)my_isr` is not an `identifier` leaf and `&my_isr` still yields
+/// `my_isr`) lets the ranker mark that registered callee as reachable. The
+/// policy of which callees are "registrars" lives in the ranker, so this stays
+/// language-generic.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CallSite {
+    /// The callee identifier (`intConnect`, `taskSpawn`, `pthread_create`, ...).
+    pub registrar: String,
+    /// Identifier leaves appearing anywhere in the call's argument list.
+    pub argument_idents: Vec<String>,
+}
+
+/// One function definition together with the callees observed in its body.
+/// Recognises a CONSUMER whose body drains an attacker-influenced channel — a
+/// message-queue / pub-sub reader (`msgQReceive`, `mq_receive`,
+/// `CFE_SB_RcvMsg`, a DDS `take`/`read`) or a memory-mapped register — so the
+/// ranker can mark it a fuzz entry point regardless of its parameter signature.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FunctionCallees {
+    pub name: String,
+    pub line: u32,
+    /// Plain-identifier callees invoked in the body (`msgQReceive(...)`).
+    pub callees: Vec<String>,
+    /// Leaf names of method-style callees (`reader.take(...)`, `r->read(...)`),
+    /// kept apart from plain calls so a DDS `take`/`read` method is not confused
+    /// with a POSIX `read(fd, ...)` free-function call.
+    pub method_calls: Vec<String>,
+    /// The body reads through a `volatile`-qualified pointer (`*(volatile
+    /// uint32_t *)REG`, or a declared `volatile ... *reg`) — the tell of a
+    /// memory-mapped I/O register reader.
+    pub reads_mmio_register: bool,
+}
+
+/// The translation unit's call sites and per-function callee sets, extracted in
+/// a single parse. See [`CallSite`] and [`FunctionCallees`]. Consumed by the
+/// C ranker to recognise non-buffer entry points (ISR/task registration,
+/// channel consumers, MMIO readers) that a signature-shape ranker misses.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CCallGraph {
+    pub call_sites: Vec<CallSite>,
+    pub functions: Vec<FunctionCallees>,
+}
+
+/// Extract every call site (callee + argument identifiers) and, per function
+/// definition, the callees invoked in its body plus whether it reads a
+/// memory-mapped register. Errors describe the failure (grammar load / parse)
+/// rather than returning an empty graph, so a caller can distinguish "no
+/// registration idioms" from "could not parse".
+pub fn analyze_call_graph(source: &str) -> Result<CCallGraph, CParseError> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_c::LANGUAGE.into())
+        .map_err(|_| CParseError::Grammar)?;
+    let tree = parser.parse(source, None).ok_or(CParseError::Parse)?;
+    let bytes = source.as_bytes();
+    let mut graph = CCallGraph::default();
+    collect_call_sites(tree.root_node(), bytes, &mut graph.call_sites);
+    collect_function_callees(tree.root_node(), bytes, &mut graph.functions);
+    Ok(graph)
+}
+
+/// Collect the identifier leaves under `node` (skipping C keywords). Used to
+/// pull the function name out of a registration call's arguments through casts,
+/// address-of and parentheses.
+fn collect_ident_leaves(node: tree_sitter::Node<'_>, source: &[u8], out: &mut Vec<String>) {
+    let Some(_depth_guard) = AstDepthGuard::enter() else {
+        return;
+    };
+    if node.kind() == "identifier" {
+        if let Ok(text) = node.utf8_text(source) {
+            if !is_c_keyword(text) {
+                out.push(text.to_owned());
+            }
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_ident_leaves(child, source, out);
+    }
+}
+
+fn collect_call_sites(node: tree_sitter::Node<'_>, source: &[u8], out: &mut Vec<CallSite>) {
+    let Some(_depth_guard) = AstDepthGuard::enter() else {
+        return;
+    };
+    if node.kind() == "call_expression" {
+        if let Some(func) = node.child_by_field_name("function") {
+            if func.kind() == "identifier" {
+                if let Ok(callee) = func.utf8_text(source) {
+                    if !is_c_keyword(callee) {
+                        let mut argument_idents = Vec::new();
+                        if let Some(args) = node.child_by_field_name("arguments") {
+                            collect_ident_leaves(args, source, &mut argument_idents);
+                        }
+                        out.push(CallSite {
+                            registrar: callee.to_owned(),
+                            argument_idents,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_call_sites(child, source, out);
+    }
+}
+
+fn collect_function_callees(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    out: &mut Vec<FunctionCallees>,
+) {
+    let Some(_depth_guard) = AstDepthGuard::enter() else {
+        return;
+    };
+    if node.kind() == "function_definition" {
+        if let Some(declarator) = node.child_by_field_name("declarator") {
+            if let Some(id) = function_identifier(declarator) {
+                if let Ok(name) = id.utf8_text(source) {
+                    if !is_c_keyword(name) {
+                        let mut callees = std::collections::BTreeSet::new();
+                        let mut method_calls = std::collections::BTreeSet::new();
+                        let mut reads_mmio_register = false;
+                        if let Some(body) = node.child_by_field_name("body") {
+                            walk_body_calls(
+                                body,
+                                source,
+                                &mut callees,
+                                &mut method_calls,
+                                &mut reads_mmio_register,
+                            );
+                        }
+                        out.push(FunctionCallees {
+                            name: name.to_owned(),
+                            line: id.start_position().row as u32 + 1,
+                            callees: callees.into_iter().collect(),
+                            method_calls: method_calls.into_iter().collect(),
+                            reads_mmio_register,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_function_callees(child, source, out);
+    }
+}
+
+/// Walk one function body, accumulating plain-identifier callees, method-call
+/// leaf names, and whether a `volatile` pointer is read (MMIO).
+fn walk_body_calls(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    callees: &mut std::collections::BTreeSet<String>,
+    method_calls: &mut std::collections::BTreeSet<String>,
+    reads_mmio_register: &mut bool,
+) {
+    let Some(_depth_guard) = AstDepthGuard::enter() else {
+        return;
+    };
+    match node.kind() {
+        "call_expression" => {
+            if let Some(func) = node.child_by_field_name("function") {
+                match func.kind() {
+                    "identifier" => {
+                        if let Ok(text) = func.utf8_text(source) {
+                            if !is_c_keyword(text) {
+                                callees.insert(text.to_owned());
+                            }
+                        }
+                    }
+                    "field_expression" => {
+                        if let Some(field) = func.child_by_field_name("field") {
+                            if let Ok(text) = field.utf8_text(source) {
+                                method_calls.insert(text.to_owned());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // `*(volatile uint32_t *)REG` — the bare-metal MMIO read idiom shows up
+        // as a cast whose type spelling carries both `volatile` and a pointer.
+        "cast_expression" => {
+            if let Some(ty) = node.child_by_field_name("type") {
+                if let Ok(text) = ty.utf8_text(source) {
+                    if text.contains("volatile") && text.contains('*') {
+                        *reads_mmio_register = true;
+                    }
+                }
+            }
+        }
+        // `volatile uint32_t *reg = ...;` — a declared volatile register
+        // pointer. Only the declarator side (before `=`) is inspected so an
+        // ordinary multiplication in an initializer cannot trip the heuristic.
+        "declaration" => {
+            if let Ok(text) = node.utf8_text(source) {
+                let declarator = text.split('=').next().unwrap_or(text);
+                if declarator.contains("volatile") && declarator.contains('*') {
+                    *reads_mmio_register = true;
+                }
+            }
+        }
+        _ => {}
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_body_calls(child, source, callees, method_calls, reads_mmio_register);
+    }
+}
+
 /// One field-access chain observed on a value whose root variable is declared
 /// with a given type — e.g. `MsgPtr->CCSDS.Pri.StreamId[0]` yields components
 /// `["CCSDS", "Pri", "StreamId"]`, `leaf_indexed = true`, `max_index = 0`.
@@ -2950,6 +3173,113 @@ fn split_declarator(raw: &str) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn call_graph_records_registration_arg_idents_through_cast_and_addr_of() {
+        // VxWorks: intConnect wires an ISR handler (behind a cast), taskSpawn
+        // wires a task entry (behind address-of). Both must surface the wired
+        // function name from the arguments so the ranker can mark it an entry.
+        let src = "\
+            typedef void (*VOIDFUNCPTR)(int);\n\
+            void radar_isr(int unit) { (void)unit; }\n\
+            int radar_task(int a, int b) { return a + b; }\n\
+            void install(void) {\n\
+            \x20   intConnect((void *)0x10, (VOIDFUNCPTR)radar_isr, 7);\n\
+            \x20   taskSpawn(\"t\", 100, 0, 4096, (int (*)())&radar_task, 0);\n\
+            }\n";
+        let graph = analyze_call_graph(src).expect("parse");
+        let int_connect = graph
+            .call_sites
+            .iter()
+            .find(|c| c.registrar == "intConnect")
+            .expect("intConnect call site");
+        assert!(
+            int_connect.argument_idents.iter().any(|i| i == "radar_isr"),
+            "intConnect must surface the cast handler arg: {int_connect:?}"
+        );
+        // The `VOIDFUNCPTR` cast type is a type_identifier, not an identifier leaf.
+        assert!(
+            !int_connect
+                .argument_idents
+                .iter()
+                .any(|i| i == "VOIDFUNCPTR"),
+            "cast type identifiers must not be collected: {int_connect:?}"
+        );
+        let task_spawn = graph
+            .call_sites
+            .iter()
+            .find(|c| c.registrar == "taskSpawn")
+            .expect("taskSpawn call site");
+        assert!(
+            task_spawn.argument_idents.iter().any(|i| i == "radar_task"),
+            "taskSpawn must surface the address-of task entry: {task_spawn:?}"
+        );
+    }
+
+    #[test]
+    fn call_graph_records_consumer_callees_and_method_calls() {
+        let src = "\
+            int drain(void) {\n\
+            \x20   char buf[64];\n\
+            \x20   int q = 3;\n\
+            \x20   msgQReceive(q, buf, sizeof buf, 0);\n\
+            \x20   return buf[0];\n\
+            }\n\
+            int dds_loop(void *reader) {\n\
+            \x20   return reader->take(reader, 0);\n\
+            }\n";
+        let graph = analyze_call_graph(src).expect("parse");
+        let drain = graph
+            .functions
+            .iter()
+            .find(|f| f.name == "drain")
+            .expect("drain fn");
+        assert!(
+            drain.callees.iter().any(|c| c == "msgQReceive"),
+            "queue consumer must record msgQReceive callee: {drain:?}"
+        );
+        let dds = graph
+            .functions
+            .iter()
+            .find(|f| f.name == "dds_loop")
+            .expect("dds_loop fn");
+        assert!(
+            dds.method_calls.iter().any(|m| m == "take"),
+            "a DDS reader->take() must be recorded as a method call: {dds:?}"
+        );
+    }
+
+    #[test]
+    fn call_graph_flags_volatile_register_reader_but_not_plain_math() {
+        let src = "\
+            int poll_status(void) {\n\
+            \x20   volatile unsigned int *reg = (volatile unsigned int *)0x40001000u;\n\
+            \x20   return (int)*reg;\n\
+            }\n\
+            int plain(int a, int b) {\n\
+            \x20   volatile int spin = a * b;\n\
+            \x20   return spin;\n\
+            }\n";
+        let graph = analyze_call_graph(src).expect("parse");
+        let poll = graph
+            .functions
+            .iter()
+            .find(|f| f.name == "poll_status")
+            .expect("poll_status fn");
+        assert!(
+            poll.reads_mmio_register,
+            "a volatile-pointer register read must be flagged MMIO"
+        );
+        let plain = graph
+            .functions
+            .iter()
+            .find(|f| f.name == "plain")
+            .expect("plain fn");
+        assert!(
+            !plain.reads_mmio_register,
+            "a non-pointer volatile local with `*` in its initializer must not be flagged MMIO"
+        );
+    }
 
     /// A pathologically deep source must not stack-overflow (abort the process)
     /// in our recursive walkers before the build (#407). tree-sitter parses the

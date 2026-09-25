@@ -455,6 +455,9 @@ fn attacker_reachable_of(raw: &Value) -> Option<bool> {
     match label {
         "attacker_reachable" => Some(true),
         "reachability_unproven" | "output_serializer" => Some(false),
+        // `ipc_channel_reachable` / `registered_entry_point` / `channel_consumer`
+        // are input-reachable but trust-boundary-dependent — not asserted true,
+        // not downgraded to lab-only (None keeps the likely_reachable verdict).
         _ => None,
     }
 }

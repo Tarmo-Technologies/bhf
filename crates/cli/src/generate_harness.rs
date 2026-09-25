@@ -2948,6 +2948,7 @@ fn run_c_direct(args: &GenerateHarnessArgs) -> Result<()> {
         };
         harness_gen::c_generate::generate_c_direct_harness(
             harness_gen::c_generate::GenerateCDirectArgs {
+                environment: None,
                 harness_id: id,
                 output_dir: output_dir.clone(),
                 source_path: source_path.clone(),

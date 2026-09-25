@@ -473,6 +473,8 @@ fn reach_tag(r: target_rank::InputReachability) -> &'static str {
         OutputSerializer => "output_serializer",
         ReachabilityUnproven => "reachability_unproven",
         IpcChannelReachable => "ipc_channel_reachable",
+        RegisteredEntryPoint => "registered_entry_point",
+        ChannelConsumer => "channel_consumer",
     }
 }
 fn reach_from_tag(s: &str) -> Option<target_rank::InputReachability> {
@@ -482,6 +484,8 @@ fn reach_from_tag(s: &str) -> Option<target_rank::InputReachability> {
         "output_serializer" => OutputSerializer,
         "reachability_unproven" => ReachabilityUnproven,
         "ipc_channel_reachable" => IpcChannelReachable,
+        "registered_entry_point" => RegisteredEntryPoint,
+        "channel_consumer" => ChannelConsumer,
         _ => return None,
     })
 }

@@ -70,6 +70,23 @@ pub enum InputReachability {
     /// trust boundary, so this sits between `AttackerReachable` and
     /// `ReachabilityUnproven`.
     IpcChannelReachable,
+    /// The function takes no untrusted-input buffer parameter, BUT the call graph
+    /// shows it *registered* as an entry point that fires on attacker/environment
+    /// events — an ISR handler passed to `intConnect`, a task entry passed to
+    /// `taskSpawn`/`pthread_create`, a DMA/completion callback. The RTOS or
+    /// hardware — not the caller — supplies its arguments, so its body runs on
+    /// data the harness must drive, regardless of its parameter shape. Assigned
+    /// at RANK time from the TU's registration idioms (distinct from the
+    /// post-run [`InputReachability::IpcChannelReachable`] relabel). Whether the
+    /// data is attacker-controlled depends on the deployment's trust boundary.
+    RegisteredEntryPoint,
+    /// The function takes no untrusted-input buffer parameter, BUT its body
+    /// *consumes* an attacker-influenced channel — it reads a message queue /
+    /// pub-sub topic (`msgQReceive`, `mq_receive`, `CFE_SB_RcvMsg`, a DDS
+    /// `take`/`read`) or a memory-mapped register. The consumed bytes, not the
+    /// parameters, are the fuzz surface. Assigned at RANK time from the TU's
+    /// call graph. Attacker-controlled if the channel crosses a trust boundary.
+    ChannelConsumer,
 }
 
 impl InputReachability {
@@ -96,12 +113,180 @@ impl InputReachability {
                  channel crosses a trust boundary (a less-trusted partition, a network-fed bus, or \
                  an untrusted peripheral)"
             }
+            InputReachability::RegisteredEntryPoint => {
+                "REGISTERED ENTRY POINT: no buffer parameter, but the call graph shows this \
+                 function registered as an event-driven entry (ISR via intConnect, task via \
+                 taskSpawn/pthread_create, a DMA/completion callback) — the RTOS/hardware supplies \
+                 its arguments, so it IS an input-reachable entry point; attacker-controlled if the \
+                 triggering event crosses a trust boundary (an interrupt line, a bus, a peripheral)"
+            }
+            InputReachability::ChannelConsumer => {
+                "CHANNEL CONSUMER: no buffer parameter, but the body reads an attacker-influenced \
+                 channel (message queue / pub-sub / MMIO register: msgQReceive / mq_receive / \
+                 CFE_SB_RcvMsg / DDS take|read / a volatile register) — the consumed data is the \
+                 fuzz surface, and attacker-controlled if that channel crosses a trust boundary"
+            }
         }
     }
 
     pub fn is_attacker_reachable(self) -> bool {
         matches!(self, InputReachability::AttackerReachable)
     }
+
+    /// Whether a crash on this function is driven by input the fuzzer controls —
+    /// a proven attacker buffer, or a rank-/run-time channel/registration
+    /// provenance. Unlike [`is_attacker_reachable`], this includes the
+    /// environment-driven classes whose trust boundary is deployment-dependent,
+    /// so it must not be used to assert a vulnerability, only that the crash was
+    /// input-driven rather than a harness artifact.
+    pub fn is_input_reachable(self) -> bool {
+        matches!(
+            self,
+            InputReachability::AttackerReachable
+                | InputReachability::IpcChannelReachable
+                | InputReachability::RegisteredEntryPoint
+                | InputReachability::ChannelConsumer
+        )
+    }
+}
+
+/// Rank-time provenance proven by a translation unit's call graph, for a
+/// function that carries attacker-influenced data but takes no byte-buffer
+/// argument. Maps onto the corresponding [`InputReachability`] variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryPointProvenance {
+    /// Registered as an ISR/task/callback entry (`intConnect`, `taskSpawn`, ...).
+    RegisteredEntryPoint,
+    /// Body consumes a message-queue / pub-sub / MMIO channel.
+    ChannelConsumer,
+}
+
+impl EntryPointProvenance {
+    fn to_reachability(self) -> InputReachability {
+        match self {
+            EntryPointProvenance::RegisteredEntryPoint => InputReachability::RegisteredEntryPoint,
+            EntryPointProvenance::ChannelConsumer => InputReachability::ChannelConsumer,
+        }
+    }
+}
+
+/// Registrar primitives whose function-typed argument is the real fuzz entry
+/// point: the callee named here does not itself parse input, but the function
+/// it is *handed* (an ISR handler, a task entry, a DMA/completion callback) runs
+/// on RTOS/hardware-supplied data. VxWorks (`intConnect`/`taskSpawn`/…), POSIX
+/// threads/signals, FreeRTOS (`xTaskCreate`), cFS/OSAL (`OS_TaskCreate`,
+/// `CFE_ES_CreateChildTask`), RTEMS, and the generic `*_register_callback`
+/// idiom. BHF-authored scaffolding, not vendor code.
+const ENTRY_REGISTRARS: &[&str] = &[
+    "intConnect",
+    "sysIntConnect",
+    "pciIntConnect",
+    "taskSpawn",
+    "taskInit",
+    "taskCreate",
+    "pthread_create",
+    "signal",
+    "sigaction",
+    "bsp_interrupt_vector_enable",
+    "rtems_interrupt_handler_install",
+    "rtems_interrupt_catch",
+    "rtems_task_start",
+    "xTaskCreate",
+    "xTaskCreateStatic",
+    "OS_TaskCreate",
+    "CFE_ES_CreateChildTask",
+    "CFE_EVS_Register",
+    "request_irq",
+    "devm_request_irq",
+];
+
+/// Plain-identifier consume primitives: a function whose body calls one drains
+/// an attacker-influenced channel. Message queues (`msgQReceive`/`mq_receive`),
+/// FreeRTOS/OSAL queues, cFS software bus, and the DDS C reader entry points.
+const CONSUME_IDENTS: &[&str] = &[
+    "msgQReceive",
+    "mq_receive",
+    "mq_timedreceive",
+    "xQueueReceive",
+    "xQueueReceiveFromISR",
+    "OS_QueueGet",
+    "rtems_message_queue_receive",
+    "k_msgq_get",
+    "CFE_SB_RcvMsg",
+    "CFE_SB_ReceiveBuffer",
+    "dds_take",
+    "dds_read",
+    "DDS_DataReader_take",
+    "DDS_DataReader_read",
+];
+
+/// Method-call leaf names that mark a channel consumer only when invoked as a
+/// method (`reader.take(...)` / `reader->read(...)`) — kept apart from the
+/// identifier set so a POSIX `read(fd, ...)` free-function call is never
+/// mistaken for a DDS `take`/`read`.
+const CONSUME_METHODS: &[&str] = &[
+    "take",
+    "read",
+    "take_next_sample",
+    "read_next_sample",
+    "receive",
+    "recv",
+];
+
+/// Detect, over the translation unit's call graph, which defined functions are
+/// RTOS/radar non-buffer entry points: a function *registered* through a
+/// registrar primitive (ISR/task/callback), or a function whose body *consumes*
+/// an attacker-influenced channel (message queue / pub-sub / MMIO register).
+///
+/// Recognition is over call sites and function bodies (via
+/// [`c_parser::analyze_call_graph`]), never a function's own signature, so a
+/// handler with a bare `void *arg` or an `int` unit number is still surfaced.
+/// A malformed / unparseable TU yields an empty map (the ranker then falls back
+/// to signature-shape scoring), never an error.
+pub fn detect_entry_point_provenance(
+    source: &str,
+) -> std::collections::BTreeMap<String, EntryPointProvenance> {
+    let mut provenance = std::collections::BTreeMap::new();
+    let Ok(graph) = c_parser::analyze_call_graph(source) else {
+        return provenance;
+    };
+    let defined: std::collections::BTreeSet<&str> =
+        graph.functions.iter().map(|f| f.name.as_str()).collect();
+
+    // A function handed to a registrar primitive is a registered entry point.
+    for site in &graph.call_sites {
+        if !ENTRY_REGISTRARS.contains(&site.registrar.as_str()) {
+            continue;
+        }
+        for arg in &site.argument_idents {
+            if defined.contains(arg.as_str()) {
+                provenance
+                    .entry(arg.clone())
+                    .or_insert(EntryPointProvenance::RegisteredEntryPoint);
+            }
+        }
+    }
+
+    // A function whose body drains a channel is a consumer. Registration wins on
+    // a tie (it is the stronger, event-driven provenance), so only insert where
+    // no registration provenance was recorded.
+    for func in &graph.functions {
+        let consumes = func.reads_mmio_register
+            || func
+                .callees
+                .iter()
+                .any(|c| CONSUME_IDENTS.contains(&c.as_str()))
+            || func
+                .method_calls
+                .iter()
+                .any(|m| CONSUME_METHODS.contains(&m.as_str()));
+        if consumes {
+            provenance
+                .entry(func.name.clone())
+                .or_insert(EntryPointProvenance::ChannelConsumer);
+        }
+    }
+    provenance
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize)]
@@ -144,15 +329,38 @@ pub struct CScoreBreakdown {
     /// exercises dispatch plus every supported sub-format and is the surface an
     /// expert normally chooses first.
     pub general_format_entry: i32,
+    /// Bonus for a non-buffer RTOS/radar entry point proven by the TU's call
+    /// graph — a registered ISR/task/callback ([`InputReachability::RegisteredEntryPoint`])
+    /// or a message-queue/pub-sub/MMIO consumer ([`InputReachability::ChannelConsumer`]).
+    /// These carry attacker-influenced data but take no byte-buffer argument, so
+    /// the signature-shape ranker sinks them to `ReachabilityUnproven` (`-20`);
+    /// this bonus (with that penalty lifted) restores them to the ranking as the
+    /// real event-driven attack surface. Sized like `buffer_param` so an ISR
+    /// entry out-ranks a plain no-input helper.
+    pub registered_or_consumer_entry: i32,
     pub total: i32,
 }
 
 pub fn rank_c_targets(functions: &[c_parser::CFunction]) -> Vec<CTarget> {
+    rank_c_targets_with_provenance(functions, &std::collections::BTreeMap::new())
+}
+
+/// As [`rank_c_targets`], but with call-graph provenance for the TU (from
+/// [`detect_entry_point_provenance`]). A function whose name carries provenance
+/// is scored as a non-buffer RTOS/radar entry point — its `-20` no-attacker-input
+/// penalty is lifted and it earns a positive entry-point bonus — so an ISR
+/// handler / task entry / channel consumer that a signature-shape ranker sinks
+/// to `ReachabilityUnproven` is surfaced instead of found by accident.
+pub fn rank_c_targets_with_provenance(
+    functions: &[c_parser::CFunction],
+    provenance: &std::collections::BTreeMap<String, EntryPointProvenance>,
+) -> Vec<CTarget> {
     let mut targets: Vec<CTarget> = functions
         .iter()
         .filter(|f| !is_allocator_free_primitive(&f.name))
         .map(|f| {
-            let (breakdown, input_reachability) = score_c_function(f);
+            let (breakdown, input_reachability) =
+                score_c_function(f, provenance.get(&f.name).copied());
             CTarget {
                 name: f.name.clone(),
                 line: f.line,
@@ -195,13 +403,26 @@ fn sort_targets(targets: &mut [CTarget]) {
     });
 }
 
-fn score_c_function(f: &c_parser::CFunction) -> (CScoreBreakdown, InputReachability) {
+fn score_c_function(
+    f: &c_parser::CFunction,
+    provenance: Option<EntryPointProvenance>,
+) -> (CScoreBreakdown, InputReachability) {
     let params: Vec<(&str, &str)> = f
         .params
         .iter()
         .map(|p| (p.name.as_str(), p.c_type.as_str()))
         .collect();
-    let (mut b, reach) = score_from_signature(&f.name, &f.return_type, &params);
+    let (mut b, reach) = score_from_signature(&f.name, &f.return_type, &params, provenance);
+    // A call-graph-proven entry point (registered ISR/task/callback, or a
+    // channel consumer) is fuzzable AS AN ENTRY regardless of its parameter
+    // shape, so the signature-based demotions below — which assume the fuzzed
+    // args are caller-fabricated garbage — must NOT apply. An ISR handler's bare
+    // `void *arg` or `int unit` is supplied by the RTOS, not the harness, so the
+    // opaque-`void *` and static-helper penalties would wrongly bury a real
+    // entry point. Skip them when provenance is present.
+    if provenance.is_some() {
+        return (b, reach);
+    }
     // Internal-linkage (`static`) functions are not the library's attack surface:
     // they are helpers reached THROUGH the public API, and fuzzing one in isolation
     // forces the harness to fabricate its typed inputs (e.g. cJSON's static
@@ -284,7 +505,9 @@ fn score_cpp_function(f: &cpp_parser::CppFunction) -> (CScoreBreakdown, InputRea
     } else {
         format!("{}::{}", f.qualifier_path.join("::"), f.name)
     };
-    score_from_signature(&name, &f.return_type, &params)
+    // C++ has no call-graph provenance wired through this path (HDF-5 targets the
+    // C/RTOS lane); pass `None` so behavior is unchanged.
+    score_from_signature(&name, &f.return_type, &params, None)
 }
 
 fn cpp_api_is_unsupported_target(f: &cpp_parser::CppFunction) -> bool {
@@ -334,9 +557,16 @@ fn score_from_signature(
     name: &str,
     return_type: &str,
     params: &[(&str, &str)],
+    provenance: Option<EntryPointProvenance>,
 ) -> (CScoreBreakdown, InputReachability) {
     let mut b = CScoreBreakdown::default();
-    let reachability = classify_input_reachability(name, params);
+    // Call-graph provenance (a registered ISR/task/callback, or a channel
+    // consumer) overrides the signature-shape verdict: the function IS reachable
+    // via the registration/channel even though its parameters carry no buffer.
+    let reachability = match provenance {
+        Some(p) => p.to_reachability(),
+        None => classify_input_reachability(name, params),
+    };
     let lower_name = name.to_ascii_lowercase();
 
     // Only a read-only *untrusted-input* buffer earns the buffer bonus. A
@@ -425,6 +655,14 @@ fn score_from_signature(
         // run, never by static ranking, so it cannot reach this match; treat it
         // like a no-buffer-param function for the (unreachable) exhaustive arm.
         InputReachability::ReachabilityUnproven | InputReachability::IpcChannelReachable => -20,
+        // A call-graph-proven RTOS/radar entry point (registered ISR/task, or a
+        // channel consumer): it takes no buffer arg, but IS the event-driven
+        // attack surface, so it carries no no-attacker-input penalty and earns
+        // the entry-point bonus below.
+        InputReachability::RegisteredEntryPoint | InputReachability::ChannelConsumer => {
+            b.registered_or_consumer_entry = 30;
+            0
+        }
     };
 
     // Demote a mid-layer parser that consumes raw bytes BUT also requires a
@@ -465,7 +703,8 @@ fn score_from_signature(
         + b.needs_prebuilt_context
         + b.compressor_name
         + b.end_to_end_raw_input
-        + b.general_format_entry;
+        + b.general_format_entry
+        + b.registered_or_consumer_entry;
     (b, reachability)
 }
 
@@ -1050,6 +1289,214 @@ mod tests {
         assert!(!InputReachability::IpcChannelReachable.is_attacker_reachable());
     }
 
+    /// The mandatory HDF-5 case: a translation unit registering an ISR via
+    /// `intConnect` and defining a message-queue consumer that loops on
+    /// `msgQReceive`. Neither takes a byte-buffer parameter, so the
+    /// signature-shape ranker sinks both to `ReachabilityUnproven` (`-20`); the
+    /// call-graph provenance must instead mark them the event-driven attack
+    /// surface (a distinct rank-time class) with a POSITIVE score, out-ranking a
+    /// plain no-input helper.
+    #[test]
+    fn intconnect_isr_and_msgqueue_consumer_ranked_reachable_not_unproven() {
+        let src = "\
+            typedef void (*VOIDFUNCPTR)(int);\n\
+            /* ISR handler: RTOS supplies its argument, no buffer param. */\n\
+            void radar_isr(int vector) { (void)vector; }\n\
+            /* Message-queue consumer: reads the queue in a loop, no buffer param. */\n\
+            int track_consumer(int q) {\n\
+            \x20   char frame[128];\n\
+            \x20   while (msgQReceive(q, frame, sizeof frame, 0) > 0) {\n\
+            \x20       if (frame[0] == 0x7f) return -1;\n\
+            \x20   }\n\
+            \x20   return 0;\n\
+            }\n\
+            int add(int a, int b) { return a + b; }\n\
+            void install(void) {\n\
+            \x20   intConnect((void *)0x40, (VOIDFUNCPTR)radar_isr, 0);\n\
+            }\n";
+        let provenance = detect_entry_point_provenance(src);
+        assert_eq!(
+            provenance.get("radar_isr").copied(),
+            Some(EntryPointProvenance::RegisteredEntryPoint),
+            "intConnect handler must be a registered entry point: {provenance:?}"
+        );
+        assert_eq!(
+            provenance.get("track_consumer").copied(),
+            Some(EntryPointProvenance::ChannelConsumer),
+            "msgQReceive loop must be a channel consumer: {provenance:?}"
+        );
+        assert!(
+            !provenance.contains_key("add"),
+            "a plain arithmetic helper must carry no entry provenance"
+        );
+
+        let fns = c_parser::parse_c_functions(src).expect("parse");
+        let ranked = rank_c_targets_with_provenance(&fns, &provenance);
+        let isr = ranked
+            .iter()
+            .find(|t| t.name == "radar_isr")
+            .expect("radar_isr ranked");
+        assert_eq!(
+            isr.input_reachability,
+            InputReachability::RegisteredEntryPoint
+        );
+        assert_ne!(
+            isr.input_reachability,
+            InputReachability::ReachabilityUnproven
+        );
+        assert!(isr.score > 0, "ISR entry must score positive: {isr:?}");
+        assert_eq!(isr.breakdown.registered_or_consumer_entry, 30);
+        assert_eq!(isr.breakdown.no_attacker_input, 0);
+
+        let consumer = ranked
+            .iter()
+            .find(|t| t.name == "track_consumer")
+            .expect("track_consumer ranked");
+        assert_eq!(
+            consumer.input_reachability,
+            InputReachability::ChannelConsumer
+        );
+        assert!(
+            consumer.score > 0,
+            "queue consumer must score positive: {consumer:?}"
+        );
+
+        let helper = ranked.iter().find(|t| t.name == "add").expect("add ranked");
+        assert!(
+            isr.score > helper.score && consumer.score > helper.score,
+            "both non-buffer entry points must out-rank the no-input helper: \
+             isr={} consumer={} helper={}",
+            isr.score,
+            consumer.score,
+            helper.score
+        );
+    }
+
+    /// The SAME functions, ranked WITHOUT provenance (the plain [`rank_c_targets`]
+    /// path), fall back to the signature-shape verdict: `ReachabilityUnproven`,
+    /// carrying the `-20` no-attacker-input penalty and no entry bonus. The
+    /// call-graph recognition is exactly what flips the verdict and lifts the
+    /// score by `+30` (penalty lifted `+20`, entry bonus `+30`, minus the `-20`
+    /// that was there = a net `+50` swing on the total).
+    #[test]
+    fn provenance_flips_verdict_and_lifts_score_over_signature_only() {
+        let src = "\
+            void radar_isr(int vector) { (void)vector; }\n\
+            int poll_gpio(int pin) {\n\
+            \x20   volatile int *reg = (volatile int *)0x50000000;\n\
+            \x20   return (pin & 1) ? *reg : 0;\n\
+            }\n\
+            void wire(void) { intConnect((void *)0x40, radar_isr, 0); }\n";
+        let fns = c_parser::parse_c_functions(src).expect("parse");
+        let baseline = rank_c_targets(&fns);
+        let provenance = detect_entry_point_provenance(src);
+        let lifted = rank_c_targets_with_provenance(&fns, &provenance);
+        for (name, expected) in [
+            ("radar_isr", InputReachability::RegisteredEntryPoint),
+            ("poll_gpio", InputReachability::ChannelConsumer),
+        ] {
+            let base = baseline.iter().find(|t| t.name == name).unwrap();
+            assert_eq!(
+                base.input_reachability,
+                InputReachability::ReachabilityUnproven,
+                "{name} without provenance must be unproven"
+            );
+            assert_eq!(base.breakdown.no_attacker_input, -20);
+            assert_eq!(base.breakdown.registered_or_consumer_entry, 0);
+
+            let up = lifted.iter().find(|t| t.name == name).unwrap();
+            assert_eq!(up.input_reachability, expected, "{name} provenance verdict");
+            assert_eq!(up.breakdown.no_attacker_input, 0);
+            assert_eq!(up.breakdown.registered_or_consumer_entry, 30);
+            assert_eq!(
+                up.score,
+                base.score + 50,
+                "{name}: provenance must swing the score by +50 (lift the -20 \
+                 penalty and add the +30 entry bonus): base={base:?} up={up:?}"
+            );
+            assert!(up.score > 0, "{name} lifted score must be positive: {up:?}");
+        }
+    }
+
+    /// An MMIO polled-register reader (a `volatile`-pointer read, no buffer arg)
+    /// is a channel consumer, ranked positive.
+    #[test]
+    fn mmio_polled_register_reader_is_a_channel_consumer() {
+        let src = "\
+            int radar_status_poll(void) {\n\
+            \x20   volatile unsigned int *status = (volatile unsigned int *)0x40001000u;\n\
+            \x20   unsigned int a = *status;\n\
+            \x20   unsigned int b = *status;\n\
+            \x20   if (a == 1u && b == 2u) return -1;\n\
+            \x20   return 0;\n\
+            }\n";
+        let provenance = detect_entry_point_provenance(src);
+        assert_eq!(
+            provenance.get("radar_status_poll").copied(),
+            Some(EntryPointProvenance::ChannelConsumer)
+        );
+        let fns = c_parser::parse_c_functions(src).expect("parse");
+        let ranked = rank_c_targets_with_provenance(&fns, &provenance);
+        let poll = ranked
+            .iter()
+            .find(|t| t.name == "radar_status_poll")
+            .unwrap();
+        assert_eq!(poll.input_reachability, InputReachability::ChannelConsumer);
+        assert!(poll.score > 0, "{poll:?}");
+    }
+
+    /// A registered entry point with an opaque `void *arg` (the classic VxWorks
+    /// ISR shape) must NOT be buried by the opaque-`void *` demotion — the
+    /// registration proves it is a real entry point supplied by the RTOS.
+    #[test]
+    fn registered_void_ptr_handler_escapes_opaque_pointer_demotion() {
+        let src = "\
+            void dma_done(void *arg) { (void)arg; }\n\
+            void wire(void) { taskSpawn(\"dma\", 100, 0, 8192, dma_done, 0); }\n";
+        let provenance = detect_entry_point_provenance(src);
+        assert_eq!(
+            provenance.get("dma_done").copied(),
+            Some(EntryPointProvenance::RegisteredEntryPoint)
+        );
+        let fns = c_parser::parse_c_functions(src).expect("parse");
+        let ranked = rank_c_targets_with_provenance(&fns, &provenance);
+        let handler = ranked.iter().find(|t| t.name == "dma_done").unwrap();
+        assert_eq!(
+            handler.input_reachability,
+            InputReachability::RegisteredEntryPoint
+        );
+        assert!(
+            handler.score > 0,
+            "registration must override the opaque-void* demotion: {handler:?}"
+        );
+    }
+
+    #[test]
+    fn new_provenance_report_notes_read_as_input_reachable() {
+        for reach in [
+            InputReachability::RegisteredEntryPoint,
+            InputReachability::ChannelConsumer,
+        ] {
+            let note = reach.report_note();
+            assert!(
+                note.contains("trust boundary"),
+                "must state the caveat: {note}"
+            );
+            assert!(
+                !note.contains("UNPROVEN"),
+                "must not read as unproven: {note}"
+            );
+            assert!(
+                reach.is_input_reachable(),
+                "{reach:?} must be input-reachable"
+            );
+            assert!(
+                !reach.is_attacker_reachable(),
+                "{reach:?} is not a proven attacker buffer"
+            );
+        }
+    }
+
     /// Bare types → (name, type) params, for reachability/score assertions that
     /// only exercise type-based signals (param names left empty on purpose).
     fn tp<'a>(types: &[&'a str]) -> Vec<(&'a str, &'a str)> {
@@ -1186,6 +1633,7 @@ mod tests {
             "basic_json::parse",
             "basic_json",
             &[("input", "std::string &&")],
+            None,
         );
         assert_eq!(reachability, InputReachability::AttackerReachable);
         assert_eq!(score.buffer_param, 30);
@@ -1371,6 +1819,7 @@ mod tests {
             "write_uint24_t",
             "void",
             &tp(&["uint8_t *", "int &", "int"]),
+            None,
         );
         assert_eq!(
             b.buffer_param, 0,
@@ -1478,6 +1927,7 @@ mod tests {
                 ("source", "const Bytef *"),
                 ("sourceLen", "uLong"),
             ],
+            None,
         );
         assert_eq!(reach, InputReachability::AttackerReachable);
         assert_eq!(
@@ -1499,6 +1949,7 @@ mod tests {
             "img_decode",
             "int",
             &[("data", "const uint8_t *"), ("data_len", "img_size_t")],
+            None,
         );
         assert_eq!(
             b.length_param_with_buffer, 15,
@@ -1573,6 +2024,7 @@ mod tests {
                 ("size", "cgltf_size"),
                 ("out_data", "cgltf_data **"),
             ],
+            None,
         );
         assert_eq!(reach, InputReachability::AttackerReachable);
         assert_eq!(
@@ -1590,6 +2042,7 @@ mod tests {
                 ("json_chunk", "const uint8_t *"),
                 ("out_material", "cgltf_material *"),
             ],
+            None,
         );
         assert_eq!(
             internal.needs_prebuilt_context, -60,
@@ -1619,6 +2072,7 @@ mod tests {
                 ("totalFrameCountOut", "drwav_uint64 *"),
                 ("pAllocationCallbacks", "const drwav_allocation_callbacks *"),
             ],
+            None,
         );
         assert_eq!(
             b.needs_prebuilt_context, 0,
@@ -1632,6 +2086,7 @@ mod tests {
                 ("opts", "const decode_options *"),
                 ("data", "const uint8_t *"),
             ],
+            None,
         );
         assert_eq!(b2.needs_prebuilt_context, 0, "const options pointer exempt");
     }
@@ -1651,6 +2106,7 @@ mod tests {
                 ("err", "std::string *"),
                 ("token", "const std::string &"),
             ],
+            None,
         );
         assert_eq!(
             sub.needs_prebuilt_context, -60,
@@ -1667,6 +2123,7 @@ mod tests {
                 ("mtl_text", "const std::string &"),
                 ("config", "const ObjReaderConfig &"),
             ],
+            None,
         );
         assert_eq!(
             entry.needs_prebuilt_context, 0,
@@ -1694,6 +2151,7 @@ mod tests {
                 ("srcSize", "int"),
                 ("dstCapacity", "int"),
             ],
+            None,
         );
         let (decomp, _) = score_from_signature(
             "LZ4_decompress_safe",
@@ -1704,6 +2162,7 @@ mod tests {
                 ("compressedSize", "int"),
                 ("dstCapacity", "int"),
             ],
+            None,
         );
         assert_eq!(comp.compressor_name, -25, "compressor demoted");
         assert_eq!(decomp.compressor_name, 0, "decompressor not demoted");
@@ -1715,11 +2174,19 @@ mod tests {
         );
         // The `deflate`/`inflate` pair must split correctly despite the shared
         // `*flate` shape: deflate is compression, inflate is decompression.
-        let (deflate, _) =
-            score_from_signature("deflate", "int", &[("strm", "z_streamp"), ("flush", "int")]);
+        let (deflate, _) = score_from_signature(
+            "deflate",
+            "int",
+            &[("strm", "z_streamp"), ("flush", "int")],
+            None,
+        );
         assert_eq!(deflate.compressor_name, -25, "deflate is compression");
-        let (inflate, _) =
-            score_from_signature("inflate", "int", &[("strm", "z_streamp"), ("flush", "int")]);
+        let (inflate, _) = score_from_signature(
+            "inflate",
+            "int",
+            &[("strm", "z_streamp"), ("flush", "int")],
+            None,
+        );
         assert_eq!(inflate.compressor_name, 0, "inflate is decompression");
     }
 
@@ -1736,12 +2203,14 @@ mod tests {
             "h2load::main",
             "int",
             &[("argc", "int"), ("argv", "char **")],
+            None,
         );
         assert_eq!(main_b.helper_or_static_name, -20, "qualified main demoted");
         let (cli_b, _) = score_from_signature(
             "parse_switches",
             "void",
             &[("ci", "cjpeg_info *"), ("argc", "int"), ("argv", "char **")],
+            None,
         );
         assert_eq!(cli_b.helper_or_static_name, -20, "CLI arg parser demoted");
         // A real parser keeps its full score.
@@ -1749,6 +2218,7 @@ mod tests {
             "json_parse",
             "int",
             &[("data", "const char *"), ("len", "size_t")],
+            None,
         );
         assert_eq!(parse_b.helper_or_static_name, 0, "real parser not demoted");
     }
@@ -1763,8 +2233,8 @@ mod tests {
         let public = cf("parse_value", "int", &[("data", "const char *")]);
         let mut internal = cf("parse_value", "int", &[("data", "const char *")]);
         internal.is_static = true;
-        let (pub_b, _) = score_c_function(&public);
-        let (int_b, _) = score_c_function(&internal);
+        let (pub_b, _) = score_c_function(&public, None);
+        let (int_b, _) = score_c_function(&internal, None);
         assert_eq!(pub_b.helper_or_static_name, 0, "public not demoted");
         assert_eq!(int_b.helper_or_static_name, -20, "static linkage demoted");
         assert_eq!(int_b.total, pub_b.total - 20);
@@ -1772,7 +2242,7 @@ mod tests {
         // The static linkage penalty does not stack on top of a name-based marker.
         let mut static_helper = cf("alloc_buffer_helper", "void *", &[("n", "size_t")]);
         static_helper.is_static = true;
-        let (h_b, _) = score_c_function(&static_helper);
+        let (h_b, _) = score_c_function(&static_helper, None);
         assert_eq!(
             h_b.helper_or_static_name, -20,
             "name marker + static linkage is a single -20, not -40"
@@ -1796,7 +2266,7 @@ mod tests {
                 name_has_helper_marker(internal),
                 "{internal} should be marked internal/reserved"
             );
-            let (b, _) = score_from_signature(internal, "int", &[("data", "const char *")]);
+            let (b, _) = score_from_signature(internal, "int", &[("data", "const char *")], None);
             assert_eq!(
                 b.helper_or_static_name, -20,
                 "{internal} must be demoted by the internal-name marker"
@@ -1937,7 +2407,7 @@ mod tests {
             "int",
             &[("data", "const void *"), ("size", "cgltf_size")],
         );
-        let (b, _) = score_c_function(&f);
+        let (b, _) = score_c_function(&f, None);
         assert_eq!(
             b.helper_or_static_name, 0,
             "a (const void*, size) data channel must not be demoted as an opaque handle"
@@ -1957,6 +2427,7 @@ mod tests {
                 ("argv", "char **"),
                 ("shortopts", "const char *"),
             ],
+            None,
         );
         assert_eq!(go_b.helper_or_static_name, -20, "getopt demoted");
         // Config / parameter setters take an option-NAME key (matched against a
@@ -1968,12 +2439,14 @@ mod tests {
             "config_parameters::set_int",
             "bool",
             &[("param", "const char *"), ("value", "int")],
+            None,
         );
         assert_eq!(set_b.helper_or_static_name, -20, "config setter demoted");
         let (setp_b, _) = score_from_signature(
             "de265_error::en265_set_parameter_int",
             "void",
             &[("name", "const char *"), ("value", "int")],
+            None,
         );
         assert_eq!(setp_b.helper_or_static_name, -20, "set_parameter demoted");
         // Guard against over-demotion: a real parser taking a char* is NOT a setter.
@@ -1981,6 +2454,7 @@ mod tests {
             "toml_parse",
             "int",
             &[("conf", "char *"), ("errbuf", "char *"), ("errsz", "int")],
+            None,
         );
         assert_eq!(
             parse_b.helper_or_static_name, 0,

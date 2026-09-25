@@ -8309,6 +8309,8 @@ fn reachability_label(
         target_rank::InputReachability::OutputSerializer => "output_serializer",
         target_rank::InputReachability::ReachabilityUnproven => "reachability_unproven",
         target_rank::InputReachability::IpcChannelReachable => "ipc_channel_reachable",
+        target_rank::InputReachability::RegisteredEntryPoint => "registered_entry_point",
+        target_rank::InputReachability::ChannelConsumer => "channel_consumer",
     })
 }
 

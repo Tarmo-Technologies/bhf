@@ -130,6 +130,11 @@ fn reach_to_str(r: InputReachability) -> &'static str {
         // Assigned dynamically post-run, not at discovery, so the discovery cache
         // never actually stores it; mapped here for an exhaustive round-trip.
         InputReachability::IpcChannelReachable => "ipc_channel_reachable",
+        // HDF-5 rank-time provenance: a registered ISR/task entry, or a
+        // message-queue/pub-sub/MMIO channel consumer. These DO come from
+        // discovery, so the cache round-trips them.
+        InputReachability::RegisteredEntryPoint => "registered_entry_point",
+        InputReachability::ChannelConsumer => "channel_consumer",
     }
 }
 
@@ -139,6 +144,8 @@ fn reach_from_str(s: &str) -> Option<InputReachability> {
         "output_serializer" => Some(InputReachability::OutputSerializer),
         "reachability_unproven" => Some(InputReachability::ReachabilityUnproven),
         "ipc_channel_reachable" => Some(InputReachability::IpcChannelReachable),
+        "registered_entry_point" => Some(InputReachability::RegisteredEntryPoint),
+        "channel_consumer" => Some(InputReachability::ChannelConsumer),
         _ => None,
     }
 }
