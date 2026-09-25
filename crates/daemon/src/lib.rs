@@ -20,13 +20,23 @@ pub fn run_json_rpc<R: BufRead, W: Write>(reader: R, writer: W) -> Result<(), Js
 }
 
 pub fn run_json_rpc_with_security<R: BufRead, W: Write>(
+    reader: R,
+    writer: W,
+    security: DaemonSecurityConfig,
+) -> Result<(), JsonRpcServerError> {
+    let limit = llm_harness_gen::memory_aware_byte_limit("BHF_DAEMON_MAX_MESSAGE_BYTES");
+    run_json_rpc_with_limit(reader, writer, security, limit)
+}
+
+fn run_json_rpc_with_limit<R: BufRead, W: Write>(
     mut reader: R,
     mut writer: W,
     security: DaemonSecurityConfig,
+    limit: usize,
 ) -> Result<(), JsonRpcServerError> {
-    while let Some(frame) = read_frame(&mut reader)? {
+    while let Some(frame) = read_frame_with_limit(&mut reader, limit)? {
         let response = match serde_json::from_slice::<JsonRpcRequest>(&frame) {
-            Ok(request) => handle_json_rpc_request(request, &security),
+            Ok(request) => handle_json_rpc_request(request, &security, limit),
             Err(error) => Some(error_response(
                 Value::Null,
                 RpcFailure::invalid_request(format!("invalid JSON-RPC request: {error}")),
@@ -34,11 +44,80 @@ pub fn run_json_rpc_with_security<R: BufRead, W: Write>(
         };
 
         if let Some(response) = response {
-            write_frame(&mut writer, &serde_json::to_vec(&response)?)?;
+            write_frame(
+                &mut writer,
+                &serialize_response_limited(&response, limit, "BHF_DAEMON_MAX_MESSAGE_BYTES")?,
+            )?;
         }
     }
 
     Ok(())
+}
+
+struct LimitedVec {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl Write for LimitedVec {
+    fn write(&mut self, chunk: &[u8]) -> Result<usize, std::io::Error> {
+        if self.bytes.len().saturating_add(chunk.len()) > self.limit {
+            return Err(std::io::Error::other(
+                "JSON-RPC response exceeds byte limit",
+            ));
+        }
+        self.bytes.extend_from_slice(chunk);
+        Ok(chunk.len())
+    }
+
+    fn flush(&mut self) -> Result<(), std::io::Error> {
+        Ok(())
+    }
+}
+
+fn serialize_response_limited(
+    response: &Value,
+    limit: usize,
+    env_name: &str,
+) -> Result<Vec<u8>, JsonRpcServerError> {
+    if let Some(bytes) = serialize_value_with_limit(response, limit)? {
+        return Ok(bytes);
+    }
+    let id = response.get("id").cloned().unwrap_or(Value::Null);
+    let fallback = error_response(
+        id,
+        RpcFailure::server_error(format!(
+            "response exceeds the memory-aware {limit}-byte limit; narrow the request or set {env_name}"
+        )),
+    );
+    if let Some(bytes) = serialize_value_with_limit(&fallback, limit)? {
+        return Ok(bytes);
+    }
+    let compact = error_response(
+        Value::Null,
+        RpcFailure::server_error("response exceeds byte limit"),
+    );
+    if let Some(bytes) = serialize_value_with_limit(&compact, limit)? {
+        return Ok(bytes);
+    }
+    Err(JsonRpcServerError::InvalidFrame(format!(
+        "response and error frame exceed the {limit}-byte limit"
+    )))
+}
+
+fn serialize_value_with_limit(
+    value: &Value,
+    limit: usize,
+) -> Result<Option<Vec<u8>>, JsonRpcServerError> {
+    let mut buffer = LimitedVec {
+        bytes: Vec::new(),
+        limit,
+    };
+    match serde_json::to_writer(&mut buffer, value) {
+        Ok(()) => Ok(Some(buffer.bytes)),
+        Err(error) if error.is_io() => Ok(None),
+        Err(error) => Err(JsonRpcServerError::Json(error)),
+    }
 }
 
 /// Run a Model Context Protocol server over newline-delimited stdio. In this
@@ -269,10 +348,14 @@ struct McpFindingsParams {
 
 fn call_mcp_tool(params: Option<Value>) -> Result<Value, RpcFailure> {
     let params = parse_params::<McpCallParams>(params)?;
+    let limit = llm_harness_gen::memory_aware_byte_limit("BHF_MCP_MAX_MESSAGE_BYTES");
     let result = match params.name.as_str() {
-        "bhf_scan" => {
-            dispatch_json_rpc_method("scan", Some(params.arguments), &AuthorizedIdentity::Local)
-        }
+        "bhf_scan" => dispatch_json_rpc_method(
+            "scan",
+            Some(params.arguments),
+            &AuthorizedIdentity::Local,
+            limit,
+        ),
         "bhf_list_targets" => {
             let mut parsed: ListTargetsRpcParams = serde_json::from_value(params.arguments)
                 .map_err(|error| RpcFailure::invalid_params(error.to_string()))?;
@@ -285,6 +368,7 @@ fn call_mcp_tool(params: Option<Value>) -> Result<Value, RpcFailure> {
             to_result(load_findings_limited(
                 parsed.findings,
                 parsed.top.unwrap_or_else(mcp_default_findings_limit),
+                limit,
             ))
         }
         "bhf_prepare_assistance" => {
@@ -349,8 +433,21 @@ fn call_mcp_tool(params: Option<Value>) -> Result<Value, RpcFailure> {
 }
 
 fn mcp_tool_result(value: Value, is_error: bool) -> Value {
-    let text = serde_json::to_string_pretty(&value)
-        .unwrap_or_else(|error| format!("serialize BHF MCP result: {error}"));
+    let limit = llm_harness_gen::memory_aware_byte_limit("BHF_MCP_MAX_MESSAGE_BYTES") / 2;
+    let mut buffer = LimitedVec {
+        bytes: Vec::new(),
+        limit,
+    };
+    let (text, is_error) = match serde_json::to_writer_pretty(&mut buffer, &value) {
+        Ok(()) => (
+            String::from_utf8(buffer.bytes).unwrap_or_default(),
+            is_error,
+        ),
+        Err(_) => (
+            format!("BHF MCP tool result exceeds the {limit}-byte text budget"),
+            true,
+        ),
+    };
     json!({
         "content": [{"type": "text", "text": text}],
         "isError": is_error
@@ -395,12 +492,7 @@ fn write_mcp_message<W: Write>(
     response: &Value,
     limit: usize,
 ) -> Result<(), JsonRpcServerError> {
-    let bytes = serde_json::to_vec(response)?;
-    if bytes.len() > limit {
-        return Err(JsonRpcServerError::InvalidFrame(format!(
-            "MCP response exceeds the memory-aware {limit}-byte limit; narrow the request or set BHF_MCP_MAX_MESSAGE_BYTES"
-        )));
-    }
+    let bytes = serialize_response_limited(response, limit, "BHF_MCP_MAX_MESSAGE_BYTES")?;
     writer.write_all(&bytes)?;
     writer.write_all(b"\n")?;
     writer.flush()?;
@@ -582,11 +674,12 @@ impl RpcFailure {
 fn handle_json_rpc_request(
     request: JsonRpcRequest,
     security: &DaemonSecurityConfig,
+    limit: usize,
 ) -> Option<Value> {
     let id = request.id;
     let Some(response_id) = id.clone() else {
         let _ = authorize_request(security, request.auth.as_ref()).and_then(|identity| {
-            dispatch_json_rpc_method(&request.method, request.params, &identity)
+            dispatch_json_rpc_method(&request.method, request.params, &identity, limit)
         });
         return None;
     };
@@ -600,7 +693,7 @@ fn handle_json_rpc_request(
 
     Some(
         match authorize_request(security, request.auth.as_ref()).and_then(|identity| {
-            dispatch_json_rpc_method(&request.method, request.params, &identity)
+            dispatch_json_rpc_method(&request.method, request.params, &identity, limit)
                 .map(|result| (result, identity))
         }) {
             Ok((result, identity)) => {
@@ -624,6 +717,7 @@ fn dispatch_json_rpc_method(
     method: &str,
     params: Option<Value>,
     identity: &AuthorizedIdentity,
+    limit: usize,
 ) -> Result<Value, RpcFailure> {
     match method {
         "scan" => {
@@ -642,7 +736,7 @@ fn dispatch_json_rpc_method(
             let params = parse_params::<FindingsParams>(params)?;
             authorize_method(identity, MethodAccess::ReadWorkspace)?;
             authorize_path(identity, &params.findings)?;
-            to_result(load_findings(params.findings))
+            to_result(load_findings(params.findings, limit))
         }
         "rankAt" => {
             let params = parse_params::<RankAtParams>(params)?;
@@ -657,16 +751,21 @@ fn dispatch_json_rpc_method(
             to_result(instrument_preview(params.path))
         }
         "staticScan" => {
-            let params = parse_params::<StaticScanParams>(params)?;
+            let mut params = parse_params::<StaticScanParams>(params)?;
             authorize_method(identity, MethodAccess::OperateWorkspace)?;
             authorize_path(identity, &params.path)?;
             authorize_optional_path(identity, params.suppressions.as_deref())?;
             authorize_optional_path(identity, params.baseline.as_deref())?;
             authorize_optional_path(identity, params.policy.as_deref())?;
+            if params.out.is_none() {
+                if let AuthorizedIdentity::Tenant(tenant) = identity {
+                    params.out = Some(tenant.workspace_root.join("bhf_work/static"));
+                }
+            }
             if let Some(out) = params.out.as_deref() {
                 authorize_output_path(identity, out)?;
             }
-            to_result(static_scan(params))
+            to_result(static_scan(params, limit))
         }
         _ => Err(RpcFailure::method_not_found()),
     }
@@ -794,11 +893,6 @@ fn error_response(id: Value, error: RpcFailure) -> Value {
     })
 }
 
-fn read_frame<R: BufRead>(reader: &mut R) -> Result<Option<Vec<u8>>, JsonRpcServerError> {
-    let limit = llm_harness_gen::memory_aware_byte_limit("BHF_DAEMON_MAX_MESSAGE_BYTES");
-    read_frame_with_limit(reader, limit)
-}
-
 fn read_frame_with_limit<R: BufRead>(
     reader: &mut R,
     limit: usize,
@@ -806,15 +900,17 @@ fn read_frame_with_limit<R: BufRead>(
     let mut content_length = None;
     let mut saw_header = false;
     let mut line = String::new();
+    let mut header_bytes = 0usize;
 
     loop {
         line.clear();
         let bytes = reader
             .take(u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1))
             .read_line(&mut line)?;
-        if bytes > limit || (bytes > 0 && !line.ends_with('\n')) {
+        header_bytes = header_bytes.saturating_add(bytes);
+        if header_bytes > limit || (bytes > 0 && !line.ends_with('\n')) {
             return Err(JsonRpcServerError::InvalidFrame(format!(
-                "JSON-RPC header line exceeds the memory-aware {limit}-byte limit; set BHF_DAEMON_MAX_MESSAGE_BYTES to override"
+                "JSON-RPC headers exceed the memory-aware {limit}-byte limit; set BHF_DAEMON_MAX_MESSAGE_BYTES to override"
             )));
         }
         if bytes == 0 {
@@ -999,7 +1095,7 @@ struct InstrumentPreviewResult {
     breadcrumbs: Vec<instrumenter::Breadcrumb>,
 }
 
-fn static_scan(params: StaticScanParams) -> Result<Value, String> {
+fn static_scan(params: StaticScanParams, limit: usize) -> Result<Value, String> {
     let out_dir = params
         .out
         .clone()
@@ -1017,6 +1113,14 @@ fn static_scan(params: StaticScanParams) -> Result<Value, String> {
     let fail_on = params.fail_on;
     let summary = static_analysis::write_static_scan(&options)
         .map_err(|error| format!("static scan: {error:#}"))?;
+    let report_size = fs::metadata(&summary.json_path)
+        .map_err(|error| format!("stat {}: {error}", summary.json_path.display()))?
+        .len();
+    if report_size > u64::try_from(limit).unwrap_or(u64::MAX) {
+        return Err(format!(
+            "static report exceeds the memory-aware {limit}-byte response limit"
+        ));
+    }
     let report: Value = serde_json::from_slice(
         &fs::read(&summary.json_path)
             .map_err(|error| format!("read {}: {error}", summary.json_path.display()))?,
@@ -1158,8 +1262,16 @@ fn sort_rpc_targets(targets: &mut [RpcTarget]) {
     });
 }
 
-fn load_findings(findings: PathBuf) -> Result<FindingsResult, String> {
-    let findings = bhf_report::load_findings(&findings).map_err(|error| error.to_string())?;
+fn load_findings(findings: PathBuf, limit: usize) -> Result<FindingsResult, String> {
+    let max_findings = (limit / (16 * 1024)).clamp(1, 4096);
+    let budget = bhf_report::FindingLoadBudget {
+        max_entries: max_findings.saturating_mul(8).saturating_add(1024),
+        max_findings,
+        max_raw_bytes: limit.saturating_div(2).max(1),
+        max_normalized_bytes: limit,
+    };
+    let findings =
+        bhf_report::load_findings_bounded(&findings, budget).map_err(|error| error.to_string())?;
     let total_findings = findings.len();
     Ok(FindingsResult {
         findings,
@@ -1168,8 +1280,12 @@ fn load_findings(findings: PathBuf) -> Result<FindingsResult, String> {
     })
 }
 
-fn load_findings_limited(findings: PathBuf, top: usize) -> Result<FindingsResult, String> {
-    let mut result = load_findings(findings)?;
+fn load_findings_limited(
+    findings: PathBuf,
+    top: usize,
+    limit: usize,
+) -> Result<FindingsResult, String> {
+    let mut result = load_findings(findings, limit)?;
     result.findings.truncate(top);
     result.truncated = result.total_findings > top;
     Ok(result)
@@ -2652,6 +2768,36 @@ mod tests {
     }
 
     #[test]
+    fn tenant_static_scan_default_output_stays_in_workspace() {
+        let workspace = temp_dir("tenant-default-static-output");
+        let source = workspace.join("legacy.c");
+        fs::write(&source, "void f(void) {}\n").unwrap();
+        let security = super::DaemonSecurityConfig::workspace_shared(super::TenantConfig {
+            tenant: "alpha".to_owned(),
+            token: "token-alpha".to_owned(),
+            workspace_root: workspace.clone(),
+            role: super::DaemonRole::WorkspaceAdmin,
+        });
+        let request_stream = frame(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "staticScan",
+            "auth": { "tenant": "alpha", "token": "token-alpha" },
+            "params": { "path": source }
+        }));
+        let mut output = Vec::new();
+        super::run_json_rpc_with_security(
+            BufReader::new(request_stream.as_bytes()),
+            &mut output,
+            security,
+        )
+        .unwrap();
+        let responses = parse_frames(&output);
+        assert!(responses[0].get("result").is_some(), "{responses:?}");
+        assert!(workspace
+            .join("bhf_work/static/static-report.json")
+            .is_file());
+    }
+
+    #[test]
     fn write_frame_flushes_after_response_body() {
         let mut output = RecordingWriter::default();
 
@@ -2668,7 +2814,174 @@ mod tests {
         let input = format!("X-Test: {}\n", "x".repeat(64));
         let error =
             super::read_frame_with_limit(&mut BufReader::new(input.as_bytes()), 32).unwrap_err();
-        assert!(error.to_string().contains("header line exceeds"));
+        assert!(error.to_string().contains("headers exceed"));
+    }
+
+    #[test]
+    fn json_rpc_reader_rejects_many_small_headers_over_limit() {
+        let input = "X: a\n".repeat(12) + "\n";
+        let error =
+            super::read_frame_with_limit(&mut BufReader::new(input.as_bytes()), 32).unwrap_err();
+        assert!(error.to_string().contains("headers exceed"));
+    }
+
+    #[test]
+    fn oversized_response_is_an_error_frame_and_next_request_stays_aligned() {
+        let source = temp_dir("oversized-response").join("many.c");
+        let functions = (0..30)
+            .map(|index| format!("int f{index}(int x) {{ return x; }}\n"))
+            .collect::<String>();
+        fs::write(&source, functions).unwrap();
+        let input = format!(
+            "{}{}",
+            frame(serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "listTargets",
+                "params": { "path": source }
+            })),
+            frame(serde_json::json!({
+                "jsonrpc": "2.0", "id": 2, "method": "missingMethod"
+            }))
+        );
+        let mut output = Vec::new();
+        super::run_json_rpc_with_limit(
+            BufReader::new(input.as_bytes()),
+            &mut output,
+            super::DaemonSecurityConfig::local_single_user(),
+            512,
+        )
+        .unwrap();
+        let responses = parse_frames(&output);
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["id"], 1);
+        assert_eq!(responses[0]["error"]["code"], -32000);
+        assert!(responses[0]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("response exceeds"));
+        assert_eq!(responses[1]["id"], 2);
+        assert_eq!(responses[1]["error"]["code"], -32601);
+    }
+
+    #[test]
+    fn oversized_request_id_uses_compact_error_without_losing_frame_alignment() {
+        let source = temp_dir("large-request-id").join("many.c");
+        let functions = (0..30)
+            .map(|index| format!("int f{index}(int x) {{ return x; }}\n"))
+            .collect::<String>();
+        fs::write(&source, functions).unwrap();
+        let id = "x".repeat(380);
+        let input = format!(
+            "{}{}",
+            frame(serde_json::json!({
+                "jsonrpc": "2.0", "id": id, "method": "listTargets",
+                "params": { "path": source }
+            })),
+            frame(serde_json::json!({
+                "jsonrpc": "2.0", "id": 2, "method": "missingMethod"
+            }))
+        );
+        let mut output = Vec::new();
+        super::run_json_rpc_with_limit(
+            BufReader::new(input.as_bytes()),
+            &mut output,
+            super::DaemonSecurityConfig::local_single_user(),
+            512,
+        )
+        .unwrap();
+        let responses = parse_frames(&output);
+        assert_eq!(responses.len(), 2);
+        assert!(responses[0]["id"].is_null());
+        assert_eq!(responses[0]["error"]["code"], -32000);
+        assert_eq!(responses[1]["id"], 2);
+    }
+
+    #[test]
+    fn bounded_findings_reader_rejects_large_file_and_many_records() {
+        let large = temp_dir("oversized-finding-file");
+        write_finding(
+            &large.join("F-large"),
+            serde_json::json!({"id": "F-large", "padding": "x".repeat(2048)}),
+        );
+        let error = super::load_findings(large.clone(), 512).unwrap_err();
+        assert!(error.contains("raw finding JSON exceeds"), "{error}");
+
+        let many = temp_dir("too-many-findings");
+        write_finding(&many.join("F-1"), serde_json::json!({"id": "F-1"}));
+        write_finding(&many.join("F-2"), serde_json::json!({"id": "F-2"}));
+        let error = super::load_findings(many, 8192).unwrap_err();
+        assert!(error.contains("more than 1 finding records"), "{error}");
+
+        let input = format!(
+            "{}{}",
+            frame(serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "findings",
+                "params": { "findings": large }
+            })),
+            frame(serde_json::json!({
+                "jsonrpc": "2.0", "id": 2, "method": "missingMethod"
+            }))
+        );
+        let mut output = Vec::new();
+        super::run_json_rpc_with_limit(
+            BufReader::new(input.as_bytes()),
+            &mut output,
+            super::DaemonSecurityConfig::local_single_user(),
+            512,
+        )
+        .unwrap();
+        let responses = parse_frames(&output);
+        assert_eq!(responses.len(), 2);
+        assert!(responses[0]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("raw finding JSON exceeds"));
+        assert_eq!(responses[1]["error"]["code"], -32601);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tenant_findings_reject_symlinked_record_outside_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = temp_dir("tenant-finding-symlink");
+        let outside = temp_dir("tenant-finding-symlink-outside");
+        let findings = workspace.join("findings");
+        let record = findings.join("F-1");
+        fs::create_dir_all(&record).unwrap();
+        write_finding(
+            &outside.join("F-out"),
+            serde_json::json!({"id": "outside-secret"}),
+        );
+        symlink(
+            outside.join("F-out/finding.json"),
+            record.join("finding.json"),
+        )
+        .unwrap();
+        let security = super::DaemonSecurityConfig::workspace_shared(super::TenantConfig {
+            tenant: "alpha".to_owned(),
+            token: "token-alpha".to_owned(),
+            workspace_root: workspace,
+            role: super::DaemonRole::WorkspaceAdmin,
+        });
+        let request = frame(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "findings",
+            "auth": { "tenant": "alpha", "token": "token-alpha" },
+            "params": { "findings": findings }
+        }));
+        let mut output = Vec::new();
+        super::run_json_rpc_with_security(
+            BufReader::new(request.as_bytes()),
+            &mut output,
+            security,
+        )
+        .unwrap();
+        let responses = parse_frames(&output);
+        assert_eq!(responses[0]["error"]["code"], -32000);
+        assert!(responses[0]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unsafe finding input"));
+        assert!(!String::from_utf8_lossy(&output).contains("outside-secret"));
     }
 
     #[test]

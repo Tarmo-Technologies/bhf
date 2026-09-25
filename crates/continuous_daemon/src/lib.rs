@@ -17,12 +17,52 @@
 //! surface.
 
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const DEFAULT_JOB_WALL_GRACE: Duration = Duration::from_secs(30);
+const MAX_WEBHOOK_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_CONCURRENT_WORKERS: u32 = 64;
+
+/// Bounds on in-memory history, waiting work, and the persisted JSONL snapshot.
+/// Completed jobs are retained; reaching the history cap requires an explicit
+/// export/rotation operation rather than silently deleting audit history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchedulerLimits {
+    pub max_jobs: usize,
+    pub max_queued_jobs: usize,
+    pub max_snapshot_bytes: usize,
+    pub max_job_bytes: usize,
+    pub max_list_page: usize,
+}
+
+impl Default for SchedulerLimits {
+    fn default() -> Self {
+        Self {
+            max_jobs: 10_000,
+            max_queued_jobs: 1_024,
+            max_snapshot_bytes: 64 * 1024 * 1024,
+            max_job_bytes: 64 * 1024,
+            max_list_page: 1_000,
+        }
+    }
+}
+
+impl SchedulerLimits {
+    fn valid(self) -> bool {
+        self.max_jobs > 0
+            && self.max_queued_jobs > 0
+            && self.max_snapshot_bytes > 0
+            && self.max_job_bytes > 0
+            && self.max_list_page > 0
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FuzzJob {
@@ -59,6 +99,26 @@ pub enum DaemonError {
     BinMissing(PathBuf),
     #[error("scheduler already shut down")]
     Shutdown,
+    #[error("job ID space exhausted")]
+    IdExhausted,
+    #[error("invalid job time budget: {0}")]
+    InvalidBudget(String),
+    #[error("invalid scheduler limits")]
+    InvalidLimits,
+    #[error("scheduler capacity exceeded: {0}")]
+    Capacity(&'static str),
+    #[error("invalid jobs snapshot {} at line {line}: {reason}", path.display())]
+    CorruptJobs {
+        path: PathBuf,
+        line: usize,
+        reason: String,
+    },
+    #[error("durability of job {job_id} is uncertain after replacing jobs snapshot: {source}; restart the scheduler before submitting again")]
+    DurabilityUncertain {
+        job_id: String,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("JSON error: {0}")]
@@ -72,6 +132,8 @@ pub struct Scheduler {
     state: Arc<SharedState>,
     workers: Vec<JoinHandle<()>>,
     data_dir: PathBuf,
+    job_wall_grace: Duration,
+    limits: SchedulerLimits,
 }
 
 struct SharedState {
@@ -84,10 +146,55 @@ struct InnerState {
     seen: Vec<FuzzJob>,
     shutdown: bool,
     next_id: u64,
+    snapshot_bytes_reserved: usize,
 }
 
 impl Scheduler {
     pub fn start(config: &DaemonConfig) -> Result<Self, DaemonError> {
+        Self::start_with_shutdown_timeout(config, DEFAULT_SHUTDOWN_TIMEOUT)
+    }
+
+    /// Start a scheduler with a bound on waiting for an interrupted fuzz child
+    /// to exit after its process tree is killed. The normal `start` path uses
+    /// a two-second bound.
+    pub fn start_with_shutdown_timeout(
+        config: &DaemonConfig,
+        shutdown_timeout: Duration,
+    ) -> Result<Self, DaemonError> {
+        Self::start_with_limits(config, shutdown_timeout, DEFAULT_JOB_WALL_GRACE)
+    }
+
+    /// As `start_with_shutdown_timeout`, with an explicit allowance beyond a
+    /// positive job's requested fuzz time for build/setup and child cleanup.
+    /// A zero job budget remains unlimited until shutdown.
+    pub fn start_with_limits(
+        config: &DaemonConfig,
+        shutdown_timeout: Duration,
+        job_wall_grace: Duration,
+    ) -> Result<Self, DaemonError> {
+        Self::start_with_resource_limits(
+            config,
+            shutdown_timeout,
+            job_wall_grace,
+            SchedulerLimits::default(),
+        )
+    }
+
+    pub fn start_with_resource_limits(
+        config: &DaemonConfig,
+        shutdown_timeout: Duration,
+        job_wall_grace: Duration,
+        limits: SchedulerLimits,
+    ) -> Result<Self, DaemonError> {
+        if !limits.valid() {
+            return Err(DaemonError::InvalidLimits);
+        }
+        if config.max_concurrent_jobs > MAX_CONCURRENT_WORKERS {
+            return Err(DaemonError::Capacity("worker threads"));
+        }
+        if config.poll_interval.is_zero() {
+            return Err(DaemonError::InvalidLimits);
+        }
         if !config.data_dir.is_dir() {
             return Err(DaemonError::DataDirMissing(config.data_dir.clone()));
         }
@@ -100,6 +207,7 @@ impl Scheduler {
                 seen: Vec::new(),
                 shutdown: false,
                 next_id: 0,
+                snapshot_bytes_reserved: 0,
             }),
             cv: Condvar::new(),
         });
@@ -107,19 +215,68 @@ impl Scheduler {
         // Restore from disk if the previous run persisted any jobs.
         let jobs_path = config.data_dir.join("jobs.jsonl");
         if jobs_path.is_file() {
-            let bytes = std::fs::read(&jobs_path).unwrap_or_default();
+            let mut bytes = Vec::new();
+            std::fs::File::open(&jobs_path)?
+                .take(limits.max_snapshot_bytes.saturating_add(1) as u64)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > limits.max_snapshot_bytes {
+                return Err(DaemonError::Capacity("jobs snapshot bytes"));
+            }
             let mut guard = state.inner.lock().unwrap_or_else(|p| p.into_inner());
-            for line in bytes.split(|b| *b == b'\n') {
-                if line.is_empty() {
+            let mut seen_ids = HashSet::new();
+            let line_count = bytes.split(|b| *b == b'\n').count();
+            for (index, line) in bytes.split(|b| *b == b'\n').enumerate() {
+                if line.is_empty() && index + 1 == line_count {
                     continue;
                 }
-                let Ok(mut job) = serde_json::from_slice::<FuzzJob>(line) else {
-                    continue;
+                let line_number = index + 1;
+                let corrupt = |reason: String| DaemonError::CorruptJobs {
+                    path: jobs_path.clone(),
+                    line: line_number,
+                    reason,
                 };
+                if line.len() > limits.max_job_bytes {
+                    return Err(DaemonError::Capacity("job record bytes"));
+                }
+                if guard.seen.len() >= limits.max_jobs {
+                    return Err(DaemonError::Capacity("retained jobs"));
+                }
+                let mut job = serde_json::from_slice::<FuzzJob>(line)
+                    .map_err(|error| corrupt(error.to_string()))?;
+                let number = job
+                    .job_id
+                    .strip_prefix("J-")
+                    .filter(|value| {
+                        !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .ok_or_else(|| corrupt(format!("invalid job ID {:?}", job.job_id)))?;
+                if !seen_ids.insert(number) {
+                    return Err(corrupt(format!(
+                        "duplicate numeric job ID {:?}",
+                        job.job_id
+                    )));
+                }
+                guard.next_id = guard.next_id.max(number.checked_add(1).ok_or_else(|| {
+                    corrupt(format!("job ID {:?} exhausts ID space", job.job_id))
+                })?);
+                validate_wall_budget(job.time_budget_secs, job_wall_grace)
+                    .map_err(|error| corrupt(error.to_string()))?;
                 if matches!(job.state, JobState::Running) {
                     job.state = JobState::Queued;
                 }
                 let needs_requeue = matches!(job.state, JobState::Queued);
+                let reserved = reserved_job_bytes(&job)?;
+                if reserved > limits.max_job_bytes
+                    || guard.snapshot_bytes_reserved.saturating_add(reserved)
+                        > limits.max_snapshot_bytes
+                {
+                    return Err(DaemonError::Capacity("jobs snapshot bytes"));
+                }
+                if needs_requeue && guard.queue.len() >= limits.max_queued_jobs {
+                    return Err(DaemonError::Capacity("queued jobs"));
+                }
+                guard.snapshot_bytes_reserved += reserved;
                 guard.seen.push(job.clone());
                 if needs_requeue {
                     guard.queue.push_back(job);
@@ -135,13 +292,23 @@ impl Scheduler {
             let poll = config.poll_interval;
             let webhook = config.webhook_url.clone();
             workers.push(std::thread::spawn(move || {
-                worker_loop(state_ref, data_dir, bin, poll, webhook);
+                worker_loop(
+                    state_ref,
+                    data_dir,
+                    bin,
+                    poll,
+                    webhook,
+                    shutdown_timeout,
+                    job_wall_grace,
+                );
             }));
         }
         Ok(Self {
             state,
             workers,
             data_dir: config.data_dir.clone(),
+            job_wall_grace,
+            limits,
         })
     }
 
@@ -153,24 +320,76 @@ impl Scheduler {
         harness_id: String,
         time_budget: Duration,
     ) -> Result<String, DaemonError> {
+        self.submit_with_persistence(project_dir, harness_id, time_budget, persist_jobs)
+    }
+
+    fn submit_with_persistence<F>(
+        &self,
+        project_dir: PathBuf,
+        harness_id: String,
+        time_budget: Duration,
+        persist: F,
+    ) -> Result<String, DaemonError>
+    where
+        F: FnOnce(&Path, &[FuzzJob]) -> Result<(), PersistFailure>,
+    {
         let mut guard = self.state.inner.lock().unwrap_or_else(|p| p.into_inner());
         if guard.shutdown {
             return Err(DaemonError::Shutdown);
         }
+        if guard.seen.len() >= self.limits.max_jobs {
+            return Err(DaemonError::Capacity("retained jobs"));
+        }
+        if guard.queue.len() >= self.limits.max_queued_jobs {
+            return Err(DaemonError::Capacity("queued jobs"));
+        }
+        if project_dir
+            .as_os_str()
+            .len()
+            .saturating_add(harness_id.len())
+            > self.limits.max_job_bytes
+        {
+            return Err(DaemonError::Capacity("job record bytes"));
+        }
+        let budget_secs = rounded_budget_secs(time_budget)?;
+        validate_wall_budget(budget_secs, self.job_wall_grace)?;
+        let next_id = guard
+            .next_id
+            .checked_add(1)
+            .ok_or(DaemonError::IdExhausted)?;
         let job_id = format!("J-{:06}", guard.next_id);
-        guard.next_id += 1;
         let job = FuzzJob {
             job_id: job_id.clone(),
             project_dir,
             harness_id,
-            time_budget_secs: time_budget.as_secs(),
+            time_budget_secs: budget_secs,
             state: JobState::Queued,
         };
-        guard.queue.push_back(job.clone());
-        guard.seen.push(job);
+        let reserved = reserved_job_bytes(&job)?;
+        if reserved > self.limits.max_job_bytes {
+            return Err(DaemonError::Capacity("job record bytes"));
+        }
+        if guard.snapshot_bytes_reserved.saturating_add(reserved) > self.limits.max_snapshot_bytes {
+            return Err(DaemonError::Capacity("jobs snapshot bytes"));
+        }
+        guard.seen.push(job.clone());
+        if let Err(failure) = persist(&self.data_dir, &guard.seen) {
+            if failure.installed {
+                guard.next_id = next_id;
+                guard.shutdown = true;
+                self.state.cv.notify_all();
+                return Err(DaemonError::DurabilityUncertain {
+                    job_id,
+                    source: failure.error,
+                });
+            }
+            guard.seen.pop();
+            return Err(DaemonError::Io(failure.error));
+        }
+        guard.next_id = next_id;
+        guard.snapshot_bytes_reserved += reserved;
+        guard.queue.push_back(job);
         self.state.cv.notify_one();
-        drop(guard);
-        self.persist();
         Ok(job_id)
     }
 
@@ -179,17 +398,23 @@ impl Scheduler {
         Ok(guard.seen.clone())
     }
 
-    fn persist(&self) {
+    /// Return at most one configured page of retained jobs in submission order.
+    pub fn list_jobs_page(&self, offset: usize, limit: usize) -> Result<Vec<FuzzJob>, DaemonError> {
         let guard = self.state.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let mut out = String::new();
-        for job in &guard.seen {
-            if let Ok(line) = serde_json::to_string(job) {
-                out.push_str(&line);
-                out.push('\n');
-            }
-        }
-        let _ = std::fs::write(self.data_dir.join("jobs.jsonl"), out);
+        Ok(guard
+            .seen
+            .iter()
+            .skip(offset)
+            .take(limit.min(self.limits.max_list_page))
+            .cloned()
+            .collect())
     }
+}
+
+fn reserved_job_bytes(job: &FuzzJob) -> Result<usize, DaemonError> {
+    let mut worst = job.clone();
+    worst.state = JobState::Complete;
+    Ok(serde_json::to_vec(&worst)?.len().saturating_add(1))
 }
 
 impl Drop for Scheduler {
@@ -211,6 +436,8 @@ fn worker_loop(
     bin: PathBuf,
     poll: Duration,
     webhook: Option<String>,
+    shutdown_timeout: Duration,
+    job_wall_grace: Duration,
 ) {
     loop {
         let job = {
@@ -235,8 +462,14 @@ fn worker_loop(
                 };
             }
         };
-        persist_locked(&data_dir, &state);
-        let final_state = run_one_job(&bin, &job);
+        if let Err(error) = persist_locked(&data_dir, &state) {
+            eprintln!("persist running fuzz job: {error}");
+        }
+        let outcome = run_one_job(&bin, &job, &state, shutdown_timeout, job_wall_grace);
+        let final_state = match outcome {
+            JobOutcome::Finished(state) => state,
+            JobOutcome::Interrupted => JobState::Queued,
+        };
         {
             let mut guard = state.inner.lock().unwrap_or_else(|p| p.into_inner());
             for seen in guard.seen.iter_mut() {
@@ -246,7 +479,20 @@ fn worker_loop(
                 }
             }
         }
-        persist_locked(&data_dir, &state);
+        if let Err(error) = persist_locked(&data_dir, &state) {
+            eprintln!("persist completed fuzz job: {error}");
+        }
+        if matches!(outcome, JobOutcome::Interrupted) {
+            return;
+        }
+        if state
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .shutdown
+        {
+            return;
+        }
         if let Some(url) = &webhook {
             let payload = serde_json::json!({
                 "job_id": job.job_id,
@@ -258,7 +504,50 @@ fn worker_loop(
     }
 }
 
-fn run_one_job(bin: &Path, job: &FuzzJob) -> JobState {
+#[derive(Clone, Copy)]
+enum JobOutcome {
+    Finished(JobState),
+    Interrupted,
+}
+
+fn rounded_budget_secs(budget: Duration) -> Result<u64, DaemonError> {
+    budget
+        .as_secs()
+        .checked_add(u64::from(budget.subsec_nanos() > 0))
+        .ok_or_else(|| DaemonError::InvalidBudget("seconds exceed u64 range".to_owned()))
+}
+
+fn validate_wall_budget(budget_secs: u64, grace: Duration) -> Result<(), DaemonError> {
+    if budget_secs == 0 {
+        return Ok(());
+    }
+    let wall = Duration::from_secs(budget_secs)
+        .checked_add(grace)
+        .ok_or_else(|| DaemonError::InvalidBudget("budget plus grace overflows".to_owned()))?;
+    Instant::now()
+        .checked_add(wall)
+        .ok_or_else(|| DaemonError::InvalidBudget("monotonic deadline overflows".to_owned()))?;
+    Ok(())
+}
+
+fn is_shutting_down(state: &SharedState) -> bool {
+    state
+        .inner
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .shutdown
+}
+
+fn run_one_job(
+    bin: &Path,
+    job: &FuzzJob,
+    state: &SharedState,
+    shutdown_timeout: Duration,
+    job_wall_grace: Duration,
+) -> JobOutcome {
+    if is_shutting_down(state) {
+        return JobOutcome::Interrupted;
+    }
     let mut cmd = Command::new(bin);
     cmd.arg("fuzz")
         .arg(&job.project_dir)
@@ -267,9 +556,131 @@ fn run_one_job(bin: &Path, job: &FuzzJob) -> JobState {
     if job.time_budget_secs > 0 {
         cmd.arg("--time").arg(format!("{}s", job.time_budget_secs));
     }
-    match cmd.status() {
-        Ok(status) if status.success() => JobState::Complete,
-        _ => JobState::Failed,
+    prepare_owned_child(&mut cmd);
+    let Ok(mut child) = cmd.spawn() else {
+        return JobOutcome::Finished(JobState::Failed);
+    };
+    let deadline = if job.time_budget_secs == 0 {
+        None
+    } else {
+        Duration::from_secs(job.time_budget_secs)
+            .checked_add(job_wall_grace)
+            .and_then(|wall| Instant::now().checked_add(wall))
+    };
+    if job.time_budget_secs > 0 && deadline.is_none() {
+        kill_owned_tree(&mut child, shutdown_timeout);
+        reap_after_kill(&mut child, shutdown_timeout);
+        return JobOutcome::Finished(JobState::Failed);
+    }
+    loop {
+        if is_shutting_down(state) {
+            kill_owned_tree(&mut child, shutdown_timeout);
+            reap_after_kill(&mut child, shutdown_timeout);
+            return JobOutcome::Interrupted;
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // The direct child can exit while helpers it spawned remain.
+                kill_owned_tree(&mut child, shutdown_timeout);
+                return JobOutcome::Finished(if status.success() {
+                    JobState::Complete
+                } else {
+                    JobState::Failed
+                });
+            }
+            Ok(None) => {
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    eprintln!(
+                        "fuzz job {} exceeded {}s plus {:?} wall grace",
+                        job.job_id, job.time_budget_secs, job_wall_grace
+                    );
+                    kill_owned_tree(&mut child, shutdown_timeout);
+                    reap_after_kill(&mut child, shutdown_timeout);
+                    return if is_shutting_down(state) {
+                        JobOutcome::Interrupted
+                    } else {
+                        JobOutcome::Finished(JobState::Failed)
+                    };
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => {
+                eprintln!("wait for fuzz job {}: {error}", job.job_id);
+                kill_owned_tree(&mut child, shutdown_timeout);
+                reap_after_kill(&mut child, shutdown_timeout);
+                return JobOutcome::Finished(JobState::Failed);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn prepare_owned_child(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn prepare_owned_child(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn kill_owned_tree(child: &mut Child, _timeout: Duration) {
+    if let Ok(pid) = i32::try_from(child.id()) {
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
+    }
+    let _ = child.kill();
+}
+
+#[cfg(windows)]
+fn kill_owned_tree(child: &mut Child, timeout: Duration) {
+    use std::process::Stdio;
+    if let Ok(mut killer) = Command::new("taskkill")
+        .args(["/PID", &child.id().to_string(), "/T", "/F"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        let deadline = Instant::now() + timeout.min(Duration::from_secs(1));
+        loop {
+            match killer.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                _ => {
+                    let _ = killer.kill();
+                    let _ = killer.wait();
+                    break;
+                }
+            }
+        }
+    }
+    let _ = child.kill();
+}
+
+#[cfg(not(any(unix, windows)))]
+fn kill_owned_tree(child: &mut Child, _timeout: Duration) {
+    let _ = child.kill();
+}
+
+fn reap_after_kill(child: &mut Child, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                eprintln!(
+                    "fuzz child {} did not exit within shutdown timeout",
+                    child.id()
+                );
+                return;
+            }
+            Err(error) => {
+                eprintln!("reap fuzz child {}: {error}", child.id());
+                return;
+            }
+        }
     }
 }
 
@@ -280,16 +691,15 @@ fn run_one_job(bin: &Path, job: &FuzzJob) -> JobState {
 /// — the v0.1 audience is on-prem (likely plain HTTP webhook to a
 /// chatops bot or local notification proxy).
 ///
-/// All socket operations (connect, write, read) carry a 10-second
-/// timeout so a misbehaving webhook server can't stall the worker
-/// thread that called us.
+/// Socket work has a 10-second overall deadline and a 64 KiB response cap.
+/// Synchronous DNS resolution happens before this deadline and remains an
+/// unbounded platform operation for hostnames.
 pub fn post_webhook(url: &str, payload: &str) -> Result<(), DaemonError> {
     post_webhook_with_timeout(url, payload, Duration::from_secs(10))
 }
 
-/// As [`post_webhook`] but with a caller-supplied per-operation
-/// socket timeout. Mainly exposed for tests that need a tight
-/// timeout to keep the suite fast.
+/// As [`post_webhook`] but with a caller-supplied overall socket deadline.
+/// DNS resolution for a hostname is not covered by this deadline.
 pub fn post_webhook_with_timeout(
     url: &str,
     payload: &str,
@@ -318,9 +728,13 @@ pub fn post_webhook_with_timeout(
             format!("could not resolve {}:{}", parsed.host, parsed.port),
         ))
     })?;
-    let mut stream = std::net::TcpStream::connect_timeout(addr, timeout)?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
+    let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+        DaemonError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "webhook deadline overflows",
+        ))
+    })?;
+    let mut stream = std::net::TcpStream::connect_timeout(addr, remaining_webhook_time(deadline)?)?;
     let request = format!(
         "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         parsed.path,
@@ -328,9 +742,31 @@ pub fn post_webhook_with_timeout(
         payload.len(),
         payload
     );
-    stream.write_all(request.as_bytes())?;
+    let mut request_bytes = request.as_bytes();
+    while !request_bytes.is_empty() {
+        stream.set_write_timeout(Some(remaining_webhook_time(deadline)?))?;
+        let count = stream.write(request_bytes)?;
+        if count == 0 {
+            return Err(DaemonError::Io(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "webhook request write returned zero",
+            )));
+        }
+        request_bytes = &request_bytes[count..];
+    }
     let mut buf = Vec::new();
-    stream.read_to_end(&mut buf)?;
+    let mut chunk = [0_u8; 4096];
+    loop {
+        stream.set_read_timeout(Some(remaining_webhook_time(deadline)?))?;
+        let count = stream.read(&mut chunk)?;
+        if count == 0 {
+            break;
+        }
+        if buf.len().saturating_add(count) > MAX_WEBHOOK_RESPONSE_BYTES {
+            return Err(DaemonError::Capacity("webhook response bytes"));
+        }
+        buf.extend_from_slice(&chunk[..count]);
+    }
     let status = parse_http_status(&buf)
         .ok_or_else(|| DaemonError::Io(std::io::Error::other("malformed webhook response")))?;
     if !(200..300).contains(&status) {
@@ -339,6 +775,17 @@ pub fn post_webhook_with_timeout(
         ))));
     }
     Ok(())
+}
+
+fn remaining_webhook_time(deadline: Instant) -> Result<Duration, DaemonError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(DaemonError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "webhook overall deadline exceeded",
+        )));
+    }
+    Ok(remaining)
 }
 
 #[derive(Debug)]
@@ -378,16 +825,72 @@ fn parse_http_status(response: &[u8]) -> Option<u16> {
     status.trim().parse().ok()
 }
 
-fn persist_locked(data_dir: &Path, state: &SharedState) {
+fn persist_locked(data_dir: &Path, state: &SharedState) -> Result<(), DaemonError> {
     let guard = state.inner.lock().unwrap_or_else(|p| p.into_inner());
-    let mut out = String::new();
-    for job in &guard.seen {
-        if let Ok(line) = serde_json::to_string(job) {
-            out.push_str(&line);
-            out.push('\n');
+    persist_jobs(data_dir, &guard.seen).map_err(|failure| DaemonError::Io(failure.error))?;
+    Ok(())
+}
+
+struct PersistFailure {
+    error: std::io::Error,
+    /// The new snapshot replaced the old one, but directory sync failed.
+    installed: bool,
+}
+
+impl PersistFailure {
+    fn before(error: std::io::Error) -> Self {
+        Self {
+            error,
+            installed: false,
         }
     }
-    let _ = std::fs::write(data_dir.join("jobs.jsonl"), out);
+
+    fn after(error: std::io::Error) -> Self {
+        Self {
+            error,
+            installed: true,
+        }
+    }
+}
+
+fn persist_jobs(data_dir: &Path, jobs: &[FuzzJob]) -> Result<(), PersistFailure> {
+    persist_jobs_with_sync(data_dir, jobs, sync_parent_directory)
+}
+
+fn persist_jobs_with_sync<F>(
+    data_dir: &Path,
+    jobs: &[FuzzJob],
+    sync_directory: F,
+) -> Result<(), PersistFailure>
+where
+    F: FnOnce(&Path) -> std::io::Result<()>,
+{
+    let mut out = String::new();
+    for job in jobs {
+        let line = serde_json::to_string(job)
+            .map_err(std::io::Error::other)
+            .map_err(PersistFailure::before)?;
+        out.push_str(&line);
+        out.push('\n');
+    }
+    let mut temp = tempfile::NamedTempFile::new_in(data_dir).map_err(PersistFailure::before)?;
+    temp.write_all(out.as_bytes())
+        .map_err(PersistFailure::before)?;
+    temp.as_file().sync_all().map_err(PersistFailure::before)?;
+    temp.persist(data_dir.join("jobs.jsonl"))
+        .map_err(|error| PersistFailure::before(error.error))?;
+    sync_directory(data_dir).map_err(PersistFailure::after)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(data_dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(data_dir)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_data_dir: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -443,6 +946,23 @@ mod tests {
         assert!(matches!(
             Scheduler::start(&config),
             Err(DaemonError::BinMissing(_))
+        ));
+    }
+
+    #[test]
+    fn start_rejects_excessive_worker_count_and_zero_poll_interval() {
+        let dir = tempdir("worker-capacity");
+        let mut config = ok_config(dir, PathBuf::from("/bin/true"));
+        config.max_concurrent_jobs = MAX_CONCURRENT_WORKERS + 1;
+        assert!(matches!(
+            Scheduler::start(&config),
+            Err(DaemonError::Capacity("worker threads"))
+        ));
+        config.max_concurrent_jobs = 1;
+        config.poll_interval = Duration::ZERO;
+        assert!(matches!(
+            Scheduler::start(&config),
+            Err(DaemonError::InvalidLimits)
         ));
     }
 
@@ -574,6 +1094,71 @@ mod tests {
     }
 
     #[test]
+    fn webhook_deadline_stops_trickle_and_response_cap_stops_large_body() {
+        use std::io::Write as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let trickler = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            for byte in b"HTTP/1.1 200 OK\r\n\r\n".iter().cycle().take(100) {
+                if stream.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let started = Instant::now();
+        let result = post_webhook_with_timeout(
+            &format!("http://127.0.0.1:{port}/hook"),
+            "{}",
+            Duration::from_millis(150),
+        );
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        trickler.join().unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let sender = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let body = vec![b'x'; MAX_WEBHOOK_RESPONSE_BYTES + 1];
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n");
+            let _ = stream.write_all(&body);
+        });
+        assert!(matches!(
+            post_webhook_with_timeout(
+                &format!("http://127.0.0.1:{port}/hook"),
+                "{}",
+                Duration::from_secs(1),
+            ),
+            Err(DaemonError::Capacity("webhook response bytes"))
+        ));
+        sender.join().unwrap();
+    }
+
+    #[test]
+    fn webhook_small_success_response_is_accepted() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let sender = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+        post_webhook_with_timeout(
+            &format!("http://127.0.0.1:{port}/hook"),
+            "{}",
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        sender.join().unwrap();
+    }
+
+    #[test]
     fn restart_recovers_queued_jobs_from_disk() {
         let dir = tempdir("restart");
         {
@@ -593,5 +1178,488 @@ mod tests {
         let scheduler = Scheduler::start(&ok_config(dir, PathBuf::from("/bin/true"))).unwrap();
         let jobs = scheduler.list_jobs().unwrap();
         assert!(!jobs.is_empty());
+    }
+
+    #[test]
+    fn restart_assigns_distinct_id_after_restored_job() {
+        let dir = tempdir("restart-id");
+        let old = FuzzJob {
+            job_id: "J-000007".to_owned(),
+            project_dir: dir.clone(),
+            harness_id: "old".to_owned(),
+            time_budget_secs: 0,
+            state: JobState::Complete,
+        };
+        std::fs::write(
+            dir.join("jobs.jsonl"),
+            format!("{}\n", serde_json::to_string(&old).unwrap()),
+        )
+        .unwrap();
+        let scheduler =
+            Scheduler::start(&ok_config(dir.clone(), PathBuf::from("/bin/true"))).unwrap();
+        let id = scheduler
+            .submit(dir, "new".to_owned(), Duration::ZERO)
+            .unwrap();
+        assert_eq!(id, "J-000008");
+        assert_eq!(scheduler.list_jobs().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn startup_rejects_corrupt_or_duplicate_snapshot_without_changing_it() {
+        let old = FuzzJob {
+            job_id: "J-000007".to_owned(),
+            project_dir: PathBuf::from("/tmp/fixture"),
+            harness_id: "H".to_owned(),
+            time_budget_secs: 0,
+            state: JobState::Complete,
+        };
+        let valid = serde_json::to_string(&old).unwrap();
+        let alias = serde_json::to_string(&FuzzJob {
+            job_id: "J-7".to_owned(),
+            ..old.clone()
+        })
+        .unwrap();
+        let invalid_id = serde_json::to_string(&FuzzJob {
+            job_id: "J-not-a-number".to_owned(),
+            ..old.clone()
+        })
+        .unwrap();
+        let exhausted_id = serde_json::to_string(&FuzzJob {
+            job_id: format!("J-{}", u64::MAX),
+            ..old.clone()
+        })
+        .unwrap();
+        let invalid_budget = serde_json::to_string(&FuzzJob {
+            time_budget_secs: u64::MAX,
+            ..old.clone()
+        })
+        .unwrap();
+        let cases = [
+            ("truncated", format!("{valid}\n{{\"job_id\":"), 2, "EOF"),
+            ("middle-empty", format!("{valid}\n\n{valid}\n"), 2, "EOF"),
+            ("duplicate", format!("{valid}\n{valid}\n"), 2, "duplicate"),
+            (
+                "numeric-alias",
+                format!("{valid}\n{alias}\n"),
+                2,
+                "duplicate",
+            ),
+            ("invalid-id", format!("{invalid_id}\n"), 1, "invalid job ID"),
+            (
+                "id-overflow",
+                format!("{exhausted_id}\n"),
+                1,
+                "exhausts ID space",
+            ),
+            (
+                "budget-overflow",
+                format!("{invalid_budget}\n"),
+                1,
+                "invalid job time budget",
+            ),
+        ];
+        for (name, snapshot, line, reason) in cases {
+            let dir = tempdir(name);
+            let path = dir.join("jobs.jsonl");
+            std::fs::write(&path, snapshot.as_bytes()).unwrap();
+            let error = match Scheduler::start(&ok_config(dir, PathBuf::from("/bin/true"))) {
+                Ok(_) => panic!("{name} snapshot unexpectedly accepted"),
+                Err(error) => error,
+            };
+            assert!(matches!(error, DaemonError::CorruptJobs { .. }));
+            let message = error.to_string();
+            assert!(message.contains(&format!("line {line}")), "{message}");
+            assert!(message.contains(reason), "{message}");
+            assert_eq!(std::fs::read(path).unwrap(), snapshot.as_bytes());
+        }
+    }
+
+    #[test]
+    fn startup_accepts_legacy_unpadded_numeric_id() {
+        let dir = tempdir("legacy-id");
+        let old = FuzzJob {
+            job_id: "J-7".to_owned(),
+            project_dir: dir.clone(),
+            harness_id: "H".to_owned(),
+            time_budget_secs: 0,
+            state: JobState::Complete,
+        };
+        std::fs::write(
+            dir.join("jobs.jsonl"),
+            format!("{}\n", serde_json::to_string(&old).unwrap()),
+        )
+        .unwrap();
+        let scheduler =
+            Scheduler::start(&ok_config(dir.clone(), PathBuf::from("/bin/true"))).unwrap();
+        assert_eq!(
+            scheduler
+                .submit(dir, "next".to_owned(), Duration::ZERO)
+                .unwrap(),
+            "J-000008"
+        );
+    }
+
+    #[test]
+    fn submit_does_not_acknowledge_job_if_persistence_fails() {
+        let dir = tempdir("persist-error");
+        std::fs::create_dir(dir.join("jobs.jsonl")).unwrap();
+        let scheduler =
+            Scheduler::start(&ok_config(dir.clone(), PathBuf::from("/bin/true"))).unwrap();
+        assert!(matches!(
+            scheduler.submit(dir, "new".to_owned(), Duration::ZERO),
+            Err(DaemonError::Io(_))
+        ));
+        assert!(scheduler.list_jobs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn post_replace_sync_failure_preserves_id_and_stops_submissions() {
+        let dir = tempdir("dir-sync-failure");
+        let scheduler =
+            Scheduler::start(&ok_config(dir.clone(), PathBuf::from("/bin/true"))).unwrap();
+        let error = scheduler
+            .submit_with_persistence(dir.clone(), "H".to_owned(), Duration::ZERO, |dir, jobs| {
+                persist_jobs_with_sync(dir, jobs, |_| {
+                    Err(std::io::Error::other(
+                        "injected parent directory sync error",
+                    ))
+                })
+            })
+            .unwrap_err();
+        assert!(matches!(error, DaemonError::DurabilityUncertain { .. }));
+        assert!(error.to_string().contains("J-000000"));
+        assert!(matches!(
+            scheduler.submit(dir.clone(), "next".to_owned(), Duration::ZERO),
+            Err(DaemonError::Shutdown)
+        ));
+        let jobs = scheduler.list_jobs().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].job_id, "J-000000");
+        assert_eq!(jobs[0].state, JobState::Queued);
+        let saved: FuzzJob =
+            serde_json::from_slice(std::fs::read(dir.join("jobs.jsonl")).unwrap().trim_ascii())
+                .unwrap();
+        assert_eq!(saved.job_id, "J-000000");
+        drop(scheduler);
+        let restarted =
+            Scheduler::start(&ok_config(dir.clone(), PathBuf::from("/bin/true"))).unwrap();
+        assert_eq!(
+            restarted
+                .submit(dir, "new".to_owned(), Duration::ZERO)
+                .unwrap(),
+            "J-000001"
+        );
+    }
+
+    #[test]
+    fn persistence_keeps_unrelated_temp_name_sentinel() {
+        let dir = tempdir("persist-sentinel");
+        let sentinel = dir.join(format!(".jobs.jsonl.{}.0.tmp", std::process::id()));
+        std::fs::write(&sentinel, b"keep").unwrap();
+        let scheduler =
+            Scheduler::start(&ok_config(dir.clone(), PathBuf::from("/bin/true"))).unwrap();
+        scheduler
+            .submit(dir, "new".to_owned(), Duration::ZERO)
+            .unwrap();
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn positive_subsecond_budget_rounds_up_and_overflow_is_rejected() {
+        assert_eq!(rounded_budget_secs(Duration::from_millis(1)).unwrap(), 1);
+        assert_eq!(rounded_budget_secs(Duration::ZERO).unwrap(), 0);
+        assert!(matches!(
+            rounded_budget_secs(Duration::new(u64::MAX, 1)),
+            Err(DaemonError::InvalidBudget(_))
+        ));
+        assert!(matches!(
+            validate_wall_budget(u64::MAX, Duration::from_secs(30)),
+            Err(DaemonError::InvalidBudget(_))
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ignored_child_time_budget_is_killed_and_persisted_failed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir("wall-budget-tree");
+        let pid_file = dir.join("grandchild.pid");
+        let script = dir.join("ignore-time.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ntrap '' TERM\nsleep 30 &\nprintf '%s' \"$!\" > '{}'\nwait\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
+        let scheduler = Scheduler::start_with_limits(
+            &ok_config(dir.clone(), script),
+            Duration::from_secs(1),
+            Duration::ZERO,
+        )
+        .unwrap();
+        let id = scheduler
+            .submit(dir.clone(), "H".to_owned(), Duration::from_millis(1))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while !pid_file.is_file() {
+            assert!(Instant::now() < deadline, "fuzz child did not start");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let grandchild_pid: u32 = std::fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+        loop {
+            let job = scheduler
+                .list_jobs()
+                .unwrap()
+                .into_iter()
+                .find(|job| job.job_id == id)
+                .unwrap();
+            if job.state == JobState::Failed {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "job did not reach Failed: {job:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(scheduler);
+        let saved: FuzzJob =
+            serde_json::from_slice(std::fs::read(dir.join("jobs.jsonl")).unwrap().trim_ascii())
+                .unwrap();
+        assert_eq!(saved.state, JobState::Failed);
+        assert_eq!(saved.time_budget_secs, 1);
+        let grandchild_status = PathBuf::from(format!("/proc/{grandchild_pid}/stat"));
+        let gone_deadline = Instant::now() + Duration::from_secs(1);
+        while grandchild_status.is_file() {
+            let status = std::fs::read_to_string(&grandchild_status).unwrap();
+            if status.split_whitespace().nth(2) == Some("Z") {
+                break;
+            }
+            assert!(
+                Instant::now() < gone_deadline,
+                "grandchild remained running"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shutdown_kills_owned_process_tree_and_requeues_job_for_restart() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir("shutdown-tree");
+        let pid_file = dir.join("grandchild.pid");
+        let script = dir.join("ignore-time.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ntrap '' TERM\nsleep 30 &\nprintf '%s' \"$!\" > '{}'\nwait\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
+        let scheduler = Scheduler::start_with_shutdown_timeout(
+            &ok_config(dir.clone(), script),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let id = scheduler
+            .submit(dir.clone(), "H".to_owned(), Duration::from_secs(1))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !pid_file.is_file() {
+            assert!(Instant::now() < deadline, "fuzz child did not start");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let grandchild_pid: u32 = std::fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+
+        let started = Instant::now();
+        drop(scheduler);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "scheduler shutdown hung"
+        );
+        let saved: FuzzJob =
+            serde_json::from_slice(std::fs::read(dir.join("jobs.jsonl")).unwrap().trim_ascii())
+                .unwrap();
+        assert_eq!(saved.job_id, id);
+        assert_eq!(saved.state, JobState::Queued);
+
+        let grandchild_status = PathBuf::from(format!("/proc/{grandchild_pid}/stat"));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while grandchild_status.is_file() {
+            let status = std::fs::read_to_string(&grandchild_status).unwrap();
+            if status.split_whitespace().nth(2) == Some("Z") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "grandchild remained running");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let restarted =
+            Scheduler::start(&ok_config(dir.clone(), PathBuf::from("/bin/true"))).unwrap();
+        let next = restarted
+            .submit(dir, "H-new".to_owned(), Duration::ZERO)
+            .unwrap();
+        assert_eq!(next, "J-000001");
+    }
+
+    #[test]
+    fn retained_capacity_rejects_without_changing_acknowledged_snapshot() {
+        let dir = tempdir("capacity-retained");
+        let limits = SchedulerLimits {
+            max_jobs: 1,
+            max_list_page: 1,
+            ..SchedulerLimits::default()
+        };
+        let scheduler = Scheduler::start_with_resource_limits(
+            &ok_config(dir.clone(), PathBuf::from("/bin/true")),
+            Duration::from_secs(1),
+            DEFAULT_JOB_WALL_GRACE,
+            limits,
+        )
+        .unwrap();
+        assert_eq!(
+            scheduler
+                .submit(dir.clone(), "H".into(), Duration::ZERO)
+                .unwrap(),
+            "J-000000"
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !std::fs::read_to_string(dir.join("jobs.jsonl"))
+            .unwrap()
+            .contains("\"complete\"")
+        {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let before = std::fs::read(dir.join("jobs.jsonl")).unwrap();
+        assert!(matches!(
+            scheduler.submit(dir.clone(), "H2".into(), Duration::ZERO),
+            Err(DaemonError::Capacity("retained jobs"))
+        ));
+        assert_eq!(std::fs::read(dir.join("jobs.jsonl")).unwrap(), before);
+        assert_eq!(scheduler.list_jobs_page(0, usize::MAX).unwrap().len(), 1);
+        assert!(scheduler.list_jobs_page(1, usize::MAX).unwrap().is_empty());
+    }
+
+    #[test]
+    fn startup_enforces_byte_record_and_job_caps_without_rewriting_input() {
+        let dir = tempdir("capacity-recovery");
+        let config = ok_config(dir.clone(), PathBuf::from("/bin/true"));
+        let path = dir.join("jobs.jsonl");
+        let job = FuzzJob {
+            job_id: "J-000000".into(),
+            project_dir: dir.clone(),
+            harness_id: "H".into(),
+            time_budget_secs: 0,
+            state: JobState::Complete,
+        };
+        let line = format!("{}\n", serde_json::to_string(&job).unwrap());
+        std::fs::write(&path, line.as_bytes()).unwrap();
+        for limits in [
+            SchedulerLimits {
+                max_snapshot_bytes: line.len() - 1,
+                ..SchedulerLimits::default()
+            },
+            SchedulerLimits {
+                max_job_bytes: line.len() - 2,
+                ..SchedulerLimits::default()
+            },
+        ] {
+            assert!(matches!(
+                Scheduler::start_with_resource_limits(
+                    &config,
+                    Duration::from_secs(1),
+                    DEFAULT_JOB_WALL_GRACE,
+                    limits,
+                ),
+                Err(DaemonError::Capacity(_))
+            ));
+            assert_eq!(std::fs::read(&path).unwrap(), line.as_bytes());
+        }
+        std::fs::write(&path, format!("{line}{line}")).unwrap();
+        let limits = SchedulerLimits {
+            max_jobs: 1,
+            ..SchedulerLimits::default()
+        };
+        assert!(matches!(
+            Scheduler::start_with_resource_limits(
+                &config,
+                Duration::from_secs(1),
+                DEFAULT_JOB_WALL_GRACE,
+                limits,
+            ),
+            Err(DaemonError::CorruptJobs { .. }) | Err(DaemonError::Capacity(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn queued_capacity_rejects_before_id_or_snapshot_change() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir("capacity-queue");
+        let entered = dir.join("entered");
+        let release = dir.join("release");
+        let script = dir.join("wait.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ntouch '{}'\nwhile [ ! -e '{}' ]; do sleep 0.01; done\n",
+                entered.display(),
+                release.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        let limits = SchedulerLimits {
+            max_queued_jobs: 1,
+            ..SchedulerLimits::default()
+        };
+        let mut config = ok_config(dir.clone(), script);
+        config.max_concurrent_jobs = 1;
+        let scheduler = Scheduler::start_with_resource_limits(
+            &config,
+            Duration::from_secs(1),
+            DEFAULT_JOB_WALL_GRACE,
+            limits,
+        )
+        .unwrap();
+        scheduler
+            .submit(dir.clone(), "first".into(), Duration::ZERO)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !entered.exists() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            scheduler
+                .submit(dir.clone(), "waiting".into(), Duration::ZERO)
+                .unwrap(),
+            "J-000001"
+        );
+        let before = std::fs::read(dir.join("jobs.jsonl")).unwrap();
+        assert!(matches!(
+            scheduler.submit(dir.clone(), "rejected".into(), Duration::ZERO),
+            Err(DaemonError::Capacity("queued jobs"))
+        ));
+        assert_eq!(std::fs::read(dir.join("jobs.jsonl")).unwrap(), before);
+        std::fs::write(&release, b"").unwrap();
+        drop(scheduler);
     }
 }
