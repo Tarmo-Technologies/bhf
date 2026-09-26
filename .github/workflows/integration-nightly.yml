@@ -60,11 +60,15 @@ jobs:
     needs: gate
     if: needs.gate.outputs.changed == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    # Generous: the heavy compile+fuzz tests are slow on CI's shared vCPUs and the
+    # hash split balances test COUNT, not duration, so one shard can draw more of
+    # the slow tests. 6 shards keeps the makespan down; the timeout guarantees
+    # completion even for the heaviest shard. This is a non-blocking nightly.
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5, 6]
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -82,9 +86,9 @@ jobs:
       # RAYON_NUM_THREADS=1 keeps each bhf invocation's Rust work single-threaded;
       # the heavy-bhf concurrency cap (.config/nextest.toml) limits concurrent
       # compile+fuzz tests so the C compiler doesn't thrash the runner.
-      # `--partition hash:N/4` splits the bhf integration tests evenly across
-      # 4 shards. --no-fail-fast matches `cargo test`.
-      - name: Integration tests (shard ${{ matrix.shard }}/4)
+      # `--partition hash:N/6` splits the bhf integration tests across 6 shards.
+      # --no-fail-fast matches `cargo test`.
+      - name: Integration tests (shard ${{ matrix.shard }}/6)
         env:
           RAYON_NUM_THREADS: "1"
-        run: cargo nextest run --locked --workspace --no-fail-fast -E 'package(bhf) & kind(test)' --partition hash:${{ matrix.shard }}/4
+        run: cargo nextest run --locked --workspace --no-fail-fast -E 'package(bhf) & kind(test)' --partition hash:${{ matrix.shard }}/6
