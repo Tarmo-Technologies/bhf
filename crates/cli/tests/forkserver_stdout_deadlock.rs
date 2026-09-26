@@ -112,9 +112,12 @@ fn stdout_spamming_target_does_not_deadlock_fork_server() {
     std::fs::create_dir_all(&src).unwrap();
     std::fs::write(src.join("spam.c"), STDOUT_SPAMMER).unwrap();
 
-    // Generous deadline: post-fix the run finishes in well under this (the
-    // spam goes to /dev/null); pre-fix it hangs forever and trips it.
-    let outcome = run_auto_bounded(&root, "4", Duration::from_secs(120));
+    // This is a deadlock detector, so the deadline is a ceiling, not a perf
+    // budget: post-fix the run finishes fast (the spam goes to /dev/null) and
+    // passes immediately; pre-fix it hangs forever and only then trips this.
+    // Kept well above worst-case contended CI runtime (seen ~190s on a shared,
+    // sharded runner) so a merely-slow-under-load run is never a false "hang".
+    let outcome = run_auto_bounded(&root, "4", Duration::from_secs(600));
     assert!(
         outcome.is_some(),
         "bhf auto HUNG on a stdout-writing target — the fork-server stdout/sync \
