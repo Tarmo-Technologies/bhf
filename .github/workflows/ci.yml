@@ -128,19 +128,18 @@ jobs:
       # slow integration suites past the job timeout (58min+). nextest brings the
       # same suite to well under 10min. Doctests (which nextest does not run) are
       # covered by the dedicated `--doc` step below.
-      # Fast lane: everything EXCEPT the heavy bhf integration tests (auto_*,
-      # build_recovery, fuzz_cli, forkserver_*, ...), which each compile a C/C++/Ada
-      # target and run a fuzz campaign. Those ~110 binaries are the wall-clock cost
-      # (they exceeded the job timeout on a single runner) and run sharded in the
-      # `integration-tests` job instead. This lane keeps build-test a fast (<20min)
-      # blocking gate over the ~5700 unit tests + light integration tests.
-      # RAYON_NUM_THREADS=1 keeps the few bhf-launching lib tests from
-      # oversubscribing; --no-fail-fast matches `cargo test` (nextest is fail-fast
-      # by default).
-      - name: Test workspace (nextest, fast lane)
+      # Per-PR gate = the ~5700 fast unit/light tests PLUS a small smoke subset of
+      # the heavy build+fuzz integration tests (one representative per language +
+      # build-recovery + the runtime-oracle capability path). The FULL heavy suite
+      # (~110 build+fuzz tests, ~40min) runs in integration-nightly.yml — running
+      # all of it on every PR is what pushed this job past its timeout.
+      # RAYON_NUM_THREADS=1 + the heavy-bhf concurrency cap (.config/nextest.toml)
+      # keep the smoke tests from oversubscribing; --no-fail-fast matches
+      # `cargo test` (nextest is fail-fast by default).
+      - name: Test workspace (nextest — fast tests + integration smoke)
         env:
           RAYON_NUM_THREADS: "1"
-        run: cargo nextest run --locked --workspace --no-fail-fast -E 'not (package(bhf) & kind(test))'
+        run: cargo nextest run --locked --workspace --no-fail-fast -E 'not (package(bhf) & kind(test)) | binary(=auto_c_common_cli) | binary(=auto_cpp_amalgamation) | binary(=auto_ada_access_lifecycle) | binary(=auto_cobol) | binary(=auto_go_force) | binary(=auto_rust_discovery) | binary(=build_recovery) | binary(=capability_cli)'
 
       - name: Test doctests
         run: cargo test --locked --workspace --doc
@@ -164,48 +163,6 @@ jobs:
           cargo test --locked -p fuzz_engine_libafl_adapter --features libafl-engine
           cargo test --locked -p fuzz_engine_nyx_adapter --features nyx-engine
           cargo test --locked -p probe_gnat_actions --features enabled
-
-  integration-tests:
-    # The heavy bhf integration tests (auto_*, build_recovery, fuzz_cli,
-    # forkserver_*, ...) each compile a C/C++/Ada target and run a fuzz campaign.
-    # There are ~110 of them and together they exceeded a single runner's budget
-    # (~25min). Split out of build-test and sharded so each leg finishes well
-    # under 20min while keeping full coverage. This is a required check via
-    # `integration-tests` in the acceptance gate (its aggregate result covers all
-    # shards).
-    name: Integration tests (bhf)
-    needs: changes
-    if: needs.changes.outputs.heavy == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2, 3, 4]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-        with:
-          toolchain: stable
-
-      - name: Install cargo-nextest
-        run: curl -LsSf https://get.nexte.st/0.9.146/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
-
-      # RAYON_NUM_THREADS=1 keeps each bhf invocation's Rust work single-threaded;
-      # the heavy-bhf test-group cap in .config/nextest.toml limits concurrent
-      # compile+fuzz tests so the C compiler doesn't thrash the runner.
-      # `--partition hash:N/4` splits the bhf integration tests evenly across 4
-      # shards (hash distributes per-test; `count` bucketed by binary and skewed
-      # the shards 255/170/104). --no-fail-fast matches `cargo test`.
-      - name: Integration tests (shard ${{ matrix.shard }}/4)
-        env:
-          RAYON_NUM_THREADS: "1"
-        run: cargo nextest run --locked --workspace --no-fail-fast -E 'package(bhf) & kind(test)' --partition hash:${{ matrix.shard }}/4
 
   rhel7-build:
     name: RHEL 7 compatible build
@@ -472,7 +429,6 @@ jobs:
       - ci-policy
       - minimum-rust
       - build-test
-      - integration-tests
       - rhel7-build
       - rhel-family-smoke
       - ubuntu-release-smoke
