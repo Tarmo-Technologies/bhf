@@ -87,14 +87,32 @@ pub(super) fn acquire(data_dir: &Path) -> Result<StorageLease, DaemonError> {
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;
-        // SAFETY: file owns a live fd; flock borrows it and uses no pointers.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        // flock is bound to the open file description, which fork() duplicates
+        // into every child until it exec()s (O_CLOEXEC closes at exec, not at
+        // fork). While this process is concurrently spawning `bhf fuzz`
+        // children, a fork can briefly hold a copy of a *just-released* lock fd,
+        // so a genuinely-free directory can momentarily report EWOULDBLOCK.
+        // Retry for a short bounded window to ride out that race. A real
+        // concurrent owner keeps the lock for its whole lifetime — far longer
+        // than this budget — so true contention is still reported as
+        // DataDirInUse.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            // SAFETY: file owns a live fd; flock borrows it and uses no pointers.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                break;
+            }
             let error = io::Error::last_os_error();
-            return Err(if error.kind() == io::ErrorKind::WouldBlock {
-                DaemonError::DataDirInUse(data_dir.to_owned())
-            } else {
-                DaemonError::Io(error)
-            });
+            match error.kind() {
+                io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(DaemonError::DataDirInUse(data_dir.to_owned()));
+                    }
+                }
+                io::ErrorKind::Interrupted => {}
+                _ => return Err(DaemonError::Io(error)),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
     Ok(StorageLease { _file: file })
