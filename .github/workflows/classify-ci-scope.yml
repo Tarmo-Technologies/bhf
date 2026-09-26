@@ -4,6 +4,11 @@ name: Classify CI Scope
 
 on:
   workflow_call:
+    inputs:
+      force_full:
+        description: Force full validation for a release caller
+        type: boolean
+        default: false
     outputs:
       heavy:
         description: Whether a path requiring heavy CI changed
@@ -41,14 +46,18 @@ jobs:
         shell: bash
         env:
           EVENT_NAME: ${{ github.event_name }}
+          FORCE_FULL_CI: ${{ inputs.force_full || false }}
+          REF_TYPE: ${{ github.ref_type }}
           BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
           HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
 
-          if [[ "$EVENT_NAME" == workflow_dispatch ]]; then
+          # Missing env is compatible with direct shell tests; malformed
+          # non-false values cannot authorize a documentation-only exemption.
+          if [[ "$EVENT_NAME" == workflow_dispatch || "${FORCE_FULL_CI-false}" != false || "${REF_TYPE:-}" == tag ]]; then
             echo "heavy=true" >> "$GITHUB_OUTPUT"
-            echo "Manual acceptance runs always execute full CI." >> "$GITHUB_STEP_SUMMARY"
+            echo "Manual, forced, and tag acceptance runs always execute full CI." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 

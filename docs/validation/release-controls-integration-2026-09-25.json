@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "kind": "release_control_local_validation",
+  "base_commit": "87151dbf26220b7fb10215af4a6c09ee0b7954ba",
+  "publication": "not_pushed",
+  "date": "2026-09-25",
+  "tests": {
+    "existing_committed": 103,
+    "previously_proposed_release": 64,
+    "new_pipeline": 14,
+    "combined_passed": 181,
+    "failed": 0,
+    "skipped": 0
+  },
+  "environment": {
+    "os": "Linux",
+    "python": "3.13.5",
+    "openssl": "3.5.5"
+  },
+  "executed": [
+    "policy CLIs",
+    "workflow shell fragments with fixture observations",
+    "real Ed25519 signing and verification",
+    "verified-copy publication and tar extraction",
+    "combined policy regression suite"
+  ],
+  "static_checks": {
+    "yaml_workflows": 3,
+    "bash_blocks": 47
+  },
+  "limits": [
+    "Reference source subset, not a full clone.",
+    "No native Rust, Windows, or EL7 execution of this patch.",
+    "No hosted CI run or release approval for this patch.",
+    "GitHub event and job observations are fixtures in the integration tests.",
+    "Python -S is used for stdlib-only integration subprocess startup.",
+    "Artifact byte identity across independent builds is not established."
+  ],
+  "logs": {
+    "combined-policy-tests.log": "53dfe954d9b39d5cea84f55e15544d22c6c4447a13fde87ecec24fde2753155a",
+    "pipeline-tests.log": "13a31d6b8da6ae392bfa960355146ad0b7e30e7e15399c4dbab186598ac556bf",
+    "workflow-validation.log": "20a0098e6c615a1d3af0f0a0666fa4c465ecff41ead65caf187b0d5961470b34"
+  },
+  "earlier_attempts": [
+    "Two integration invocations exceeded the outer command time limit during local interpreter startup; no result is claimed from them."
+  ]
+}
