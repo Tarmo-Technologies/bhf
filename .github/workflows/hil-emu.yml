@@ -52,6 +52,8 @@ jobs:
             gcc-arm-none-eabi \
             gcc-arm-linux-gnueabihf \
             gcc-powerpc64-linux-gnu \
+            libc6-dev-armhf-cross \
+            libc6-dev-ppc64-cross \
             binutils \
             build-essential
           # Sanity: the exact binaries scripts/hil-emu.sh requires.
