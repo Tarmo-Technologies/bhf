@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The heavy bhf integration tests each launch bhf to compile a C/C++/Ada target
+# and run a short fuzz campaign. Compilation is CPU-heavy and the C compiler is
+# not governed by RAYON_NUM_THREADS, so running many of these at once (nextest's
+# default = one per core) oversubscribes the CPUs and each balloons to minutes.
+# Cap how many run concurrently so each gets enough of the machine; the light
+# unit tests are unaffected (they are excluded from build-test's fast lane and
+# this group only matches bhf integration tests).
+[test-groups]
+heavy-bhf = { max-threads = 2 }
+
+[[profile.default.overrides]]
+filter = 'package(bhf) & kind(test)'
+test-group = 'heavy-bhf'
