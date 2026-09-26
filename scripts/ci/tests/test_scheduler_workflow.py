@@ -18,7 +18,7 @@ class SchedulerWorkflowTests(unittest.TestCase):
         source = job("build-test")
         command = "run: cargo test --locked -p continuous_daemon --lib\n"
         self.assertIn(command, source)
-        self.assertLess(source.index(command), source.index("run: cargo test --locked --workspace"))
+        self.assertLess(source.index(command), source.index("run: cargo nextest run --locked --workspace"))
         step = source.split("      - name: Test scheduler runtime reliability\n", 1)[1].split("      - name:", 1)[0]
         self.assertNotIn("if:", step)
         self.assertNotIn("continue-on-error", step)
