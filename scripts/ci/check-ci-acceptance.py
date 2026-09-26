@@ -21,6 +21,7 @@ from typing import Any
 HEAVY_JOBS = (
     "minimum-rust",
     "build-test",
+    "integration-tests",
     "rhel7-build",
     "rhel-family-smoke",
     "ubuntu-release-smoke",

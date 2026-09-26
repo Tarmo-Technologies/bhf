@@ -22,7 +22,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[3]
 SHA = "a" * 40
-JOBS = ("changes", "ci-policy", "minimum-rust", "build-test", "rhel7-build",
+JOBS = ("changes", "ci-policy", "minimum-rust", "build-test", "integration-tests", "rhel7-build",
         "rhel-family-smoke", "ubuntu-release-smoke", "windows-build", "windows-current-build")
 
 
