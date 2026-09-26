@@ -22,10 +22,10 @@
 //! corpus, or a non-native harness all skip cleanly.
 
 use crate::auto::runtrace::{self, RuntraceEvent};
-use serde_json::json;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -46,6 +46,12 @@ pub fn run_capability_profile(work_dir: &Path) -> usize {
     let Ok(harnesses) = std::fs::read_dir(work_dir.join("harnesses")) else {
         return 0;
     };
+    // #22: the runtrace event carries no call-site location, so a capability
+    // finding would take the fuzz target's DECLARATION line (from result.json).
+    // Run bhf's own static analyzer over the candidate sources once so each finding
+    // can adopt the real call line the analyzer resolves for the same function +
+    // sink class (the sink surfaces at runtime only as a line-less oracle hit).
+    let static_sinks = scan_candidate_sinks(work_dir);
     let mut profiles = Vec::new();
     let mut written = 0usize;
     let mut index = 0usize;
@@ -58,7 +64,14 @@ pub fn run_capability_profile(work_dir: &Path) -> usize {
         else {
             continue;
         };
-        if let Some(profile) = profile_one(work_dir, &hdir, &harness_id, &ld_preload, &mut index) {
+        if let Some(profile) = profile_one(
+            work_dir,
+            &hdir,
+            &harness_id,
+            &ld_preload,
+            &static_sinks,
+            &mut index,
+        ) {
             written += profile.findings_written;
             profiles.push(profile.json);
         }
@@ -95,6 +108,7 @@ fn profile_one(
     hdir: &Path,
     harness_id: &str,
     ld_preload: &str,
+    static_sinks: &[StaticSink],
     index: &mut usize,
 ) -> Option<HarnessProfile> {
     let bin = hdir.join("main");
@@ -164,7 +178,7 @@ fn profile_one(
         }
         let id = format!("F-CAP-{:04}", *index);
         *index += 1;
-        if write_capability_finding(work_dir, &id, hdir, harness_id, kind, caps) {
+        if write_capability_finding(work_dir, &id, hdir, harness_id, kind, caps, static_sinks) {
             findings_written += 1;
         }
     }
@@ -369,12 +383,30 @@ fn write_capability_finding(
     harness_id: &str,
     kind: &str,
     caps: &[&Capability],
+    static_sinks: &[StaticSink],
 ) -> bool {
     let dir = work.join("findings").join(id);
     if std::fs::create_dir_all(&dir).is_err() {
         return false;
     }
-    let (name, source_path, line) = candidate_site(hdir);
+    let (name, source_path, decl_line) = candidate_site(hdir);
+    // #22: `decl_line` is the fuzz target function's DECLARATION line (from
+    // result.json), not the sink call site the shim intercepted. Adopt the real
+    // call line bhf's own static scan flagged for the same function + sink class
+    // when it exists, so the finding lands on the call site and merges with the
+    // SAST row for it; keep the enclosing function name in the sink location.
+    let basename = Path::new(&source_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    let (line, function) = resolve_call_site(static_sinks, &basename, &name, kind, decl_line)
+        .unwrap_or((decl_line, name.clone()));
+    let source_value = if function.trim().is_empty() {
+        format!("{source_path}:{line}")
+    } else {
+        format!("{source_path}:{line}:{function}")
+    };
     let cwe = cwe_for(kind);
     let tainted = caps.iter().any(|c| c.tainted);
     let mut operands: Vec<String> = caps.iter().map(|c| c.operand.clone()).collect();
@@ -409,7 +441,7 @@ fn write_capability_finding(
             "operand_count": operands.len(),
             "examples": examples,
         },
-        "oracle": { "evidence": [ { "key": "source", "value": format!("{source_path}:{line}") } ] },
+        "oracle": { "evidence": [ { "key": "source", "value": source_value } ] },
         "analysis": { "engine": "bhf.dynamic.capability.diff" },
         "actionability": {
             "cwe": [cwe],
@@ -449,6 +481,156 @@ fn candidate_site(hdir: &Path) -> (String, String, u64) {
         .to_owned();
     let line = raw.get("line").and_then(|v| v.as_u64()).unwrap_or(0);
     (name, source_path, line)
+}
+
+/// A sink bhf's own static scan already flagged. A capability finding borrows its
+/// line so it reports the call site, not the fuzz target's declaration line (#22).
+#[derive(Debug, Clone)]
+struct StaticSink {
+    /// Lowercased basename of the flagged source file.
+    basename: String,
+    /// Enclosing function the analyzer resolved (empty when it recorded only
+    /// `file:line`).
+    function: String,
+    /// The finding's CWE (e.g. `CWE-78`), matched against the capability kind's
+    /// class via [`cwe_family_for_kind`].
+    cwe: String,
+    /// The flagged sink's source line — the call site.
+    line: u64,
+}
+
+/// Build the sink index by running bhf's static analyzer over each distinct
+/// native-candidate source file (#22). The runtrace shim records no call-site
+/// location, and at runtime the sink surfaces only as a line-less oracle hit, so the
+/// analyzer — which resolves `system(...)` / `open(...)` / … to its call line and
+/// enclosing function — is the reliable source of the real line. Best-effort: a
+/// scan error contributes nothing, and the caller then keeps the declaration line,
+/// so this is purely additive. Bounded by the (few) native candidate files; one
+/// `scan()` per file, which returns its report without writing any output.
+fn scan_candidate_sinks(work_dir: &Path) -> Vec<StaticSink> {
+    let Ok(harnesses) = std::fs::read_dir(work_dir.join("harnesses")) else {
+        return Vec::new();
+    };
+    // Distinct native-candidate sources (one scan per file, not per harness).
+    let mut sources: BTreeSet<PathBuf> = BTreeSet::new();
+    for entry in harnesses.flatten() {
+        let hdir = entry.path();
+        let harness_id = hdir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if !is_native_harness(&hdir, harness_id) {
+            continue;
+        }
+        if let Some(raw) = read_json(&hdir.join("result.json")) {
+            if let Some(src) = raw.get("source_path").and_then(Value::as_str) {
+                let path = PathBuf::from(src);
+                if path.is_file() {
+                    sources.insert(path);
+                }
+            }
+        }
+    }
+    let mut sinks = Vec::new();
+    for source in sources {
+        collect_sinks_from(&source, &mut sinks);
+    }
+    sinks
+}
+
+/// Scan one source file with the static analyzer and append its sinks. `scan()`
+/// reads `root` and returns the report without writing, so `out_dir` is inert here.
+fn collect_sinks_from(source: &Path, out: &mut Vec<StaticSink>) {
+    let options = static_analysis::StaticScanOptions {
+        root: source.to_path_buf(),
+        out_dir: source
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf(),
+        suppressions_path: None,
+        baseline_path: None,
+        policy_path: None,
+        enabled_rules: BTreeSet::new(),
+        disabled_rules: BTreeSet::new(),
+        emit_sarif: false,
+    };
+    let Ok(report) = static_analysis::scan(&options) else {
+        return;
+    };
+    for f in report.findings {
+        let Some(basename) = Path::new(&f.location.path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_ascii_lowercase)
+        else {
+            continue;
+        };
+        out.push(StaticSink {
+            basename,
+            function: f.analysis.enclosing_function.unwrap_or_default(),
+            cwe: f.cwe,
+            line: u64::from(f.location.line),
+        });
+    }
+}
+
+/// The CWE identifiers a static sink may carry to be treated as the same defect
+/// class as a capability `kind`. A capability's per-kind CWE (see [`cwe_for`]) and
+/// the static rule's CWE differ — process exec is CWE-77 as a capability but the
+/// static command-injection rules (BHF-304/404) report CWE-78 — so match on the
+/// class, not the exact id. An empty slice disables relocation for that kind.
+fn cwe_family_for_kind(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "process-exec" => &["CWE-77", "CWE-78"],
+        "filesystem-path" => &["CWE-22", "CWE-73", "CWE-59"],
+        "filesystem-delete" => &["CWE-22", "CWE-73"],
+        "network-connect" => &["CWE-668", "CWE-918"],
+        "dynamic-load" => &["CWE-114", "CWE-427"],
+        "format-string" => &["CWE-134"],
+        "insecure-temp" => &["CWE-377", "CWE-59"],
+        _ => &[],
+    }
+}
+
+/// Relocate a capability finding onto its real call site (#22). Returns
+/// `(call_line, enclosing_function)` of the matching static sink, or `None` when
+/// there is no confident match (the caller then keeps the declaration line). A
+/// match requires the same file basename and a CWE in the kind's class, plus either
+/// the same enclosing function as the fuzzed candidate or — when the static scan
+/// did not resolve a function — a call at or below the declaration line. Ties break
+/// to the lowest line for determinism.
+fn resolve_call_site(
+    sinks: &[StaticSink],
+    basename: &str,
+    candidate_fn: &str,
+    kind: &str,
+    decl_line: u64,
+) -> Option<(u64, String)> {
+    let family = cwe_family_for_kind(kind);
+    if family.is_empty() || basename.is_empty() {
+        return None;
+    }
+    sinks
+        .iter()
+        .filter(|s| s.basename == basename && family.contains(&s.cwe.as_str()))
+        .filter(|s| {
+            if s.function.is_empty() {
+                // Function unresolved: a call at or below the declaration line.
+                s.line >= decl_line
+            } else {
+                // Same enclosing function as the fuzzed candidate.
+                !candidate_fn.is_empty() && s.function == candidate_fn
+            }
+        })
+        .min_by_key(|s| s.line)
+        .map(|s| {
+            let function = if s.function.is_empty() {
+                candidate_fn.to_owned()
+            } else {
+                s.function.clone()
+            };
+            (s.line, function)
+        })
 }
 
 /// Native lanes carry the runtrace shim; the JVM lane and interpreted lanes do not.
@@ -610,7 +792,8 @@ mod tests {
             &hdir,
             "H-C0001",
             "process-exec",
-            &[&cap]
+            &[&cap],
+            &[],
         ));
         let raw = read_json(&work.join("findings/F-CAP-0000/finding.json")).unwrap();
         assert_eq!(raw["rule_id"], "BHF-668");
@@ -621,6 +804,131 @@ mod tests {
             "must not carry a sink"
         );
         assert_eq!(raw["capability"]["kind"], "process-exec");
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    fn sink(basename: &str, function: &str, cwe: &str, line: u64) -> StaticSink {
+        StaticSink {
+            basename: basename.to_owned(),
+            function: function.to_owned(),
+            cwe: cwe.to_owned(),
+            line,
+        }
+    }
+
+    #[test]
+    fn resolve_call_site_prefers_static_sink_line_in_same_function() {
+        // The static command-injection sink (BHF-304/404, CWE-78) sits at the call
+        // line (4) inside run_cmd; the capability's declaration line is 3.
+        let sinks = [sink("cmd.c", "run_cmd", "CWE-78", 4)];
+        assert_eq!(
+            resolve_call_site(&sinks, "cmd.c", "run_cmd", "process-exec", 3),
+            Some((4, "run_cmd".to_owned())),
+        );
+    }
+
+    #[test]
+    fn resolve_call_site_matches_cwe_class_not_exact_id() {
+        // process-exec is CWE-77 as a capability but the static rule reports CWE-78;
+        // the class family bridges them.
+        let sinks = [sink("x.c", "f", "CWE-78", 9)];
+        assert_eq!(
+            resolve_call_site(&sinks, "x.c", "f", "process-exec", 2).map(|(l, _)| l),
+            Some(9),
+        );
+    }
+
+    #[test]
+    fn resolve_call_site_ignores_wrong_function_and_wrong_class() {
+        let sinks = [
+            sink("cmd.c", "other_fn", "CWE-78", 4), // right class, wrong function
+            sink("cmd.c", "run_cmd", "CWE-22", 5),  // right function, wrong class
+        ];
+        assert_eq!(
+            resolve_call_site(&sinks, "cmd.c", "run_cmd", "process-exec", 3),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_call_site_uses_line_when_function_unresolved() {
+        // Analyzer recorded only file:line (no function): take the nearest sink at
+        // or below the declaration line, lowest wins.
+        let sinks = [
+            sink("cmd.c", "", "CWE-78", 2), // above the declaration — ignored
+            sink("cmd.c", "", "CWE-78", 7),
+            sink("cmd.c", "", "CWE-78", 5),
+        ];
+        assert_eq!(
+            resolve_call_site(&sinks, "cmd.c", "run_cmd", "process-exec", 3),
+            Some((5, "run_cmd".to_owned())),
+        );
+    }
+
+    #[test]
+    fn resolve_call_site_none_without_a_match() {
+        assert_eq!(
+            resolve_call_site(&[], "cmd.c", "run_cmd", "process-exec", 3),
+            None
+        );
+        // env-read has no static sink class -> never relocated.
+        let sinks = [sink("cmd.c", "run_cmd", "CWE-78", 4)];
+        assert_eq!(
+            resolve_call_site(&sinks, "cmd.c", "run_cmd", "env-read", 3),
+            None
+        );
+    }
+
+    #[test]
+    fn capability_finding_reports_sink_call_line_not_decl_line() {
+        // #22 regression for the emit + actionability chain: given the analyzer's
+        // sink at the system() CALL line (4) in run_cmd, a BHF-668 process-exec
+        // finding must land on line 4 — the line the SAST scan reports — not
+        // run_cmd's declaration line (3, from result.json).
+        let work = std::env::temp_dir().join(format!("bhf-cap-callsite-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        let hdir = work.join("harnesses").join("H-C0001");
+        std::fs::create_dir_all(&hdir).unwrap();
+        // The fuzz target run_cmd is DECLARED at line 3 (result.json).
+        std::fs::write(
+            hdir.join("result.json"),
+            serde_json::to_vec(
+                &json!({ "name": "run_cmd", "source_path": "csrc/cmd.c", "line": 3 }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        // The analyzer resolved the system() sink to line 4 in run_cmd (CWE-78).
+        let static_sinks = vec![StaticSink {
+            basename: "cmd.c".to_owned(),
+            function: "run_cmd".to_owned(),
+            cwe: "CWE-78".to_owned(),
+            line: 4,
+        }];
+        let cap = Capability {
+            kind: "process-exec",
+            operand: "sh -c ${input}".into(),
+            tainted: true,
+        };
+        assert!(write_capability_finding(
+            &work,
+            "F-CAP-0000",
+            &hdir,
+            "H-C0001",
+            "process-exec",
+            &[&cap],
+            &static_sinks,
+        ));
+        let raw = read_json(&work.join("findings/F-CAP-0000/finding.json")).unwrap();
+        assert_eq!(
+            raw.pointer("/oracle/evidence/0/value").unwrap(),
+            "csrc/cmd.c:4:run_cmd",
+            "sink source must be the call line + enclosing function"
+        );
+        // The whole chain: actionability resolves the primary fix location (the SARIF
+        // startLine consumers read) from that source evidence.
+        let fix = actionability::select_fix_location(&raw, None).expect("a fix location");
+        assert_eq!(fix.line, Some(4), "SARIF startLine must be the call site");
         let _ = std::fs::remove_dir_all(&work);
     }
 }

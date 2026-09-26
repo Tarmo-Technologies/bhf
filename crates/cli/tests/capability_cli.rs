@@ -65,22 +65,58 @@ fn input_triggered_command_exec_is_profiled_as_capability() {
     );
 
     // A BHF-668 process-exec capability finding, input-triggered (never on baseline).
-    let (found_exec, baseline_empty) = scan_capability_findings(&work);
-    assert!(
-        found_exec,
-        "expected an input-triggered process-exec (CWE-77) BHF-668 finding; stderr:\n{stderr}"
-    );
+    let (exec_source, baseline_empty) = scan_capability_findings(&work);
+    let exec_source = exec_source.unwrap_or_else(|| {
+        panic!(
+            "expected an input-triggered process-exec (CWE-77) BHF-668 finding; stderr:\n{stderr}"
+        )
+    });
     assert!(
         baseline_empty,
         "the exec capability must NOT be present in the baseline set (it is gated \
          behind the RUN magic); stderr:\n{stderr}"
     );
+
+    // #22 regression: the finding's sink location must be the system() CALL line, not
+    // process_cmd's declaration line. The source evidence is `file:line[:function]`;
+    // the pointed-at source line must be the exec call itself.
+    let (sink_file, sink_line) = parse_source_location(&exec_source)
+        .unwrap_or_else(|| panic!("exec finding source is not file:line: {exec_source}"));
+    let sink_src = std::fs::read_to_string(&sink_file)
+        .unwrap_or_else(|e| panic!("read sink source {sink_file}: {e}"));
+    let line_text = sink_src
+        .lines()
+        .nth(sink_line.saturating_sub(1))
+        .unwrap_or("");
+    assert!(
+        line_text.contains("system("),
+        "#22: capability finding must point at the system() call site, not the \
+         function declaration; line {sink_line} of {sink_file} is: {line_text:?}\n\
+         source evidence: {exec_source}"
+    );
     let _ = std::fs::remove_dir_all(&work);
 }
 
-/// Returns `(found_input_triggered_exec, baseline_has_no_exec)`.
-fn scan_capability_findings(work: &Path) -> (bool, bool) {
-    let mut found_exec = false;
+/// Split a `file:line[:function]` source-evidence value into `(file, line)`. The
+/// line is the first purely-numeric colon-delimited component (so a Windows drive
+/// prefix is not mistaken for it).
+fn parse_source_location(source: &str) -> Option<(String, usize)> {
+    let parts: Vec<&str> = source.split(':').collect();
+    let idx = parts
+        .iter()
+        .position(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))?;
+    if idx == 0 {
+        return None;
+    }
+    let file = parts[..idx].join(":");
+    let line = parts[idx].parse::<usize>().ok()?;
+    Some((file, line))
+}
+
+/// Returns `(exec_finding_source, baseline_has_no_exec)` — the input-triggered
+/// process-exec finding's `file:line:function` source evidence, if present.
+fn scan_capability_findings(work: &Path) -> (Option<String>, bool) {
+    let mut exec_source = None;
     if let Ok(entries) = std::fs::read_dir(work.join("findings")) {
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
@@ -92,7 +128,10 @@ fn scan_capability_findings(work: &Path) -> (bool, bool) {
                     let kind = v.pointer("/capability/kind").and_then(|x| x.as_str());
                     let cwe = v.pointer("/actionability/cwe/0").and_then(|x| x.as_str());
                     if kind == Some("process-exec") && cwe == Some("CWE-77") {
-                        found_exec = true;
+                        exec_source = v
+                            .pointer("/oracle/evidence/0/value")
+                            .and_then(|x| x.as_str())
+                            .map(ToOwned::to_owned);
                     }
                 }
             }
@@ -120,5 +159,5 @@ fn scan_capability_findings(work: &Path) -> (bool, bool) {
                 .unwrap_or(true)
         })
         .unwrap_or(false);
-    (found_exec, baseline_no_exec)
+    (exec_source, baseline_no_exec)
 }
