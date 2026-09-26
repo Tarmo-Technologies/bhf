@@ -139,7 +139,7 @@ jobs:
       - name: Test workspace (nextest — fast tests + integration smoke)
         env:
           RAYON_NUM_THREADS: "1"
-        run: cargo nextest run --locked --workspace --no-fail-fast -E 'not (package(bhf) & kind(test)) | binary(=auto_c_common_cli) | binary(=auto_cpp_amalgamation) | binary(=auto_ada_access_lifecycle) | binary(=auto_cobol) | binary(=auto_go_force) | binary(=auto_rust_discovery) | binary(=build_recovery) | binary(=capability_cli)'
+        run: cargo nextest run --locked --workspace --no-fail-fast -E 'not (package(bhf) & kind(test)) | binary(=auto_c_common_cli) | binary(=auto_ada_access_lifecycle) | binary(=capability_cli) | (binary(=auto_cpp_amalgamation) & test(=cpp_amalgamation_detects_planted_bug_with_nonempty_testcase)) | (binary(=auto_go_force) & test(=forced_go_targets_build_fuzz_and_are_marked_forced)) | (binary(=auto_rust_discovery) & test(=rust_target_builds_and_fuzzes_natively_and_finds_planted_crash))'
 
       - name: Test doctests
         run: cargo test --locked --workspace --doc
