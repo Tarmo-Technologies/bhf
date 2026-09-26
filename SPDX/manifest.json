@@ -3,6 +3,10 @@
   "version": 1,
   "files": [
     {
+      "path": ".config/nextest.toml",
+      "license": "Apache-2.0"
+    },
+    {
       "path": ".github/actions/bhf-pr/action.yml",
       "license": "Apache-2.0"
     },
@@ -36,6 +40,10 @@
     },
     {
       "path": ".github/workflows/hil-emu.yml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": ".github/workflows/integration-nightly.yml",
       "license": "Apache-2.0"
     },
     {
