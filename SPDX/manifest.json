@@ -35,6 +35,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": ".github/workflows/hil-emu.yml",
+      "license": "Apache-2.0"
+    },
+    {
       "path": ".github/workflows/license-audit.yml",
       "license": "Apache-2.0"
     },
@@ -45,6 +49,10 @@
     {
       "path": ".github/workflows/release.yml",
       "license": "MIT or Apache-2.0"
+    },
+    {
+      "path": ".github/workflows/report-comparison.yml",
+      "license": "Apache-2.0"
     },
     {
       "path": ".github/workflows/sbom.yml",
@@ -384,6 +392,10 @@
     },
     {
       "path": "crates/actionability/Cargo.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/actionability/src/fidelity.rs",
       "license": "Apache-2.0"
     },
     {
@@ -939,6 +951,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/ada_state_machine/src/adapter.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/ada_state_machine/src/lib.rs",
       "license": "Apache-2.0"
     },
@@ -1059,6 +1075,14 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/bhf_runtrace_shim/src/hooks/rtos.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/bhf_runtrace_shim/src/hooks/sched.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/bhf_runtrace_shim/src/hooks/sql.rs",
       "license": "Apache-2.0"
     },
@@ -1108,6 +1132,14 @@
     },
     {
       "path": "crates/bhf_runtrace_shim/tests/portable_syscalls.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/bhf_runtrace_shim/tests/rtos_virtualization.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/bhf_runtrace_shim/tests/schedule_perturbation.rs",
       "license": "Apache-2.0"
     },
     {
@@ -1647,6 +1679,14 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/report_comparison.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/src/report_comparison_tests.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/resource_limits.rs",
       "license": "Apache-2.0"
     },
@@ -1700,6 +1740,14 @@
     },
     {
       "path": "crates/cli/src/target_filter.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/src/transport_fault.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/src/transport_fuzz.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2063,6 +2111,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_peripheral_sequence.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_perl_lane.rs",
       "license": "Apache-2.0"
     },
@@ -2351,6 +2403,14 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/report_comparison_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/sbom_assurance_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/single_file_tool_main.rs",
       "license": "Apache-2.0"
     },
@@ -2443,7 +2503,19 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/continuous_daemon/src/health.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/continuous_daemon/src/health_tests.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/continuous_daemon/src/lib.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/continuous_daemon/src/storage_lock.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2615,6 +2687,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/fuzz_engine/builtin/src/binframe.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/fuzz_engine/builtin/src/coverage.rs",
       "license": "Apache-2.0"
     },
@@ -2708,6 +2784,10 @@
     },
     {
       "path": "crates/governance/src/lib.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/governance/src/publication_tests.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2936,6 +3016,14 @@
     },
     {
       "path": "crates/iiop/src/cdr.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/iiop/src/dispatch.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/iiop/src/encode.rs",
       "license": "Apache-2.0"
     },
     {
@@ -3463,7 +3551,75 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/target_transport/Cargo.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/target_transport/src/agent.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/target_transport/src/coverage.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/target_transport/src/error.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/target_transport/src/fullsystem.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/target_transport/src/gdb.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/target_transport/src/host.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/target_transport/src/lib.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/target_transport/src/outcome.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/target_transport/src/testsupport.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/target_transport/src/transport.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/target_transport/src/wire.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/target_transport/tests/common/mod.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/target_transport/tests/hil_board.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/target_transport/tests/live_fullsystem.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/target_transport/tests/live_gdb.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/type_model/Cargo.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/type_model/src/abi.rs",
       "license": "Apache-2.0"
     },
     {
@@ -3480,6 +3636,10 @@
     },
     {
       "path": "docker/compose.yaml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/ci-acceptance.md",
       "license": "Apache-2.0"
     },
     {
@@ -3523,6 +3683,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "docs/enterprise-release-controls.md",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "docs/enterprise-service-soak-plan.md",
       "license": "Apache-2.0"
     },
@@ -3543,6 +3707,14 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "docs/high-demand-fuzzing-roadmap.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/hil-bringup.md",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "docs/ide-parity.md",
       "license": "Apache-2.0"
     },
@@ -3559,6 +3731,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "docs/portability-hardening-2026-09-25.md",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "docs/production-readiness-review.md",
       "license": "Apache-2.0"
     },
@@ -3571,6 +3747,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "docs/report-comparison.md",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "docs/review-daemon-editors.md",
       "license": "Apache-2.0"
     },
@@ -3580,6 +3760,10 @@
     },
     {
       "path": "docs/review-release-ci.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/scheduler-reliability.md",
       "license": "Apache-2.0"
     },
     {
@@ -3664,6 +3848,10 @@
     },
     {
       "path": "docs/site/instrumentation.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/site/inventory-assurance.md",
       "license": "Apache-2.0"
     },
     {
@@ -3824,6 +4012,10 @@
     },
     {
       "path": "docs/validation/2026-09-24-docker-sweep.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/verified-distribution-handoff.md",
       "license": "Apache-2.0"
     },
     {
