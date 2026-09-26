@@ -128,8 +128,17 @@ jobs:
       # slow integration suites past the job timeout (58min+). nextest brings the
       # same suite to well under 10min. Doctests (which nextest does not run) are
       # covered by the dedicated `--doc` step below.
+      # RAYON_NUM_THREADS=1: bhf's auto pipeline (discovery/listing) builds rayon
+      # pools sized to the core count. With nextest running many bhf-launching
+      # tests concurrently that is N x N threads and thrashes the runner (tests
+      # ballooned to 240s+). One rayon thread per invocation keeps each test light
+      # so nextest's process-level parallelism does the work.
+      # --no-fail-fast matches `cargo test`'s behaviour (run every test, don't
+      # stop at the first failure); nextest defaults to fail-fast.
       - name: Test workspace (nextest)
-        run: cargo nextest run --locked --workspace
+        env:
+          RAYON_NUM_THREADS: "1"
+        run: cargo nextest run --locked --workspace --no-fail-fast
 
       - name: Test doctests
         run: cargo test --locked --workspace --doc
