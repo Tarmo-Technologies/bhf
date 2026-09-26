@@ -83,7 +83,7 @@ and unused bundled gems. Those observations are not sufficient to establish
 non-impact or prescribe a `not_affected` VEX disposition. As corrected on
 2026-09-25, BHF leaves automatic matches `under_investigation` until
 vulnerability-specific evidence supports a reviewed decision. See
-[inventory assurance and review gates](../inventory-assurance.md). Historical
+[inventory assurance and review gates](./inventory-assurance.md). Historical
 scan counts do not establish current remediation or authorization status.
 
 Re-scan offline anytime:

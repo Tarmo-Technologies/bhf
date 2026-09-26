@@ -58,6 +58,7 @@ PAGES = [
     Page("daemon", "daemon.md", "Daemon"),
     Page("licensing", "licensing.md", "Licensing"),
     Page("ato", "ato.md", "ATO / RMF"),
+    Page("inventory-assurance", "inventory-assurance.md", "Inventory Assurance"),
     Page("release-packaging", "release-packaging.md", "Release Packaging"),
     Page("release-checklist", "release-checklist.md", "Release Checklist"),
     Page("offline-deployment", "offline-deployment.md", "Offline Deployment"),
