@@ -45,7 +45,8 @@ persist credentials.
 ## Running and consuming the checks
 
 Run the complete policy and shell-behavior regression suite on Linux without
-Rust or network access (Python 3.10+ and Bash are required):
+Rust or network access (Python 3.10+, Bash, tar, and OpenSSL with Ed25519
+support are required for the combined policy/distribution suite):
 
 ```sh
 python3 -m unittest discover -s scripts/ci/tests -v
@@ -87,10 +88,14 @@ release or merge the development branch.
 
 A repository administrator should make **`CI acceptance`** a required status
 check, retaining any other independently required workflows. Merely defining
-the job does not change branch protection. This change set does not alter
-repository rules, and it does not wire this policy into the separate release
-publishing workflow. Release publication still needs its own exact-revision and
-artifact-verification acceptance controls.
+the job does not change branch protection. Repository rules remain an
+administrative setting. The release workflow now calls CI with full validation
+forced and requires an exact-revision, same-run acceptance export before
+release creation, signing, or publishing. The Linux installation smoke test
+extracts a separately authenticated archive copy. See
+[enterprise release controls](enterprise-release-controls.md) for the workflow,
+trust boundaries, retry behavior, and distinction between source validation
+and authentication of a rebuilt release artifact.
 
 Historical scope of the initial CI-only change: at its inspected base
 `e3ccadbea4c9e1b2ebc63dc9e5d36c0d3f8a803b`, the installer directly called
