@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: Apache-2.0
+name: Report comparison functionality
+on:
+  push:
+    branches: [main, rtos-radar-fuzzing]
+    paths:
+      - 'crates/cli/src/report*.rs'
+      - 'crates/cli/tests/report_comparison_cli.rs'
+      - 'crates/report/**'
+      - '.github/workflows/report-comparison.yml'
+  pull_request:
+    paths:
+      - 'crates/cli/src/report*.rs'
+      - 'crates/cli/tests/report_comparison_cli.rs'
+      - 'crates/report/**'
+      - '.github/workflows/report-comparison.yml'
+permissions:
+  contents: read
+jobs:
+  report-comparison:
+    name: Native report comparison (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+      - name: Test comparison model, identity, and rendering
+        run: cargo test --locked -p bhf --lib report::comparison -- --nocapture
+      - name: Test the native report command and backward-compatible exports
+        run: cargo test --locked -p bhf --test report_comparison_cli -- --nocapture
