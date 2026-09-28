@@ -244,6 +244,18 @@ jobs:
           echo "artifacts_matrix_nonempty=[${{ needs.plan.outputs.artifacts_matrix != '' }}]"
           echo "GATE=[${{ needs.plan.outputs.has_artifacts == 'true' && (needs.plan.outputs.publishing == 'true' || needs.plan.outputs.pr_run_mode == 'upload') }}]"
 
+  # TEMP diagnostic (read-only) — probe whether the artifacts_matrix expands.
+  debug-matrix:
+    needs: [plan]
+    if: ${{ always() }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.artifacts_matrix) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - run: echo "MATRIX_ENTRY host=[${{ matrix.host }}] runner=[${{ matrix.runner }}] targets=[${{ join(matrix.targets, ',') }}]"
+
   # Build and packages all the platform-specific things
   build-local-artifacts:
     timeout-minutes: 90
