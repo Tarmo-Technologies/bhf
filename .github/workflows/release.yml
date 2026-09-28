@@ -233,6 +233,31 @@ jobs:
             echo 'artifacts_matrix={"include":[]}' >> "$GITHUB_OUTPUT"
           fi
 
+  # TEMP diagnostic (read-only) — does matrix-from-needs expand on the TAG path?
+  debug-matrix-fixed:
+    needs: [plan]
+    if: ${{ always() }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.artifacts_matrix) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - run: echo "FIXED expanded host=[${{ matrix.host }}] runner=[${{ matrix.runner }}]"
+
+  # TEMP diagnostic (read-only) — mirrors build-local-artifacts's header exactly
+  # (runs-on: matrix.runner, matrix-referencing name, no if) to isolate its skip.
+  debug-matrix-runner:
+    name: debug-matrix-runner (${{ join(matrix.targets, ', ') }})
+    needs: [plan]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.artifacts_matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 5
+    steps:
+      - run: echo "RUNNER expanded host=[${{ matrix.host }}] runner=[${{ matrix.runner }}]"
+
   # Build and packages all the platform-specific things
   build-local-artifacts:
     timeout-minutes: 90
