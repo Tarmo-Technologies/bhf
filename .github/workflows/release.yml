@@ -233,48 +233,15 @@ jobs:
             echo 'artifacts_matrix={"include":[]}' >> "$GITHUB_OUTPUT"
           fi
 
-  # TEMP isolation probe A (read-only): FIXED runs-on + matrix-referencing NAME.
-  # If this SKIPS, the matrix-referencing job `name` prevents expansion.
-  probe-name:
-    name: probe-name (${{ join(matrix.targets, ', ') }})
-    needs: [plan]
-    if: ${{ always() }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-22.04
-            targets: ["x86_64-unknown-linux-gnu"]
-          - runner: windows-2022
-            targets: ["x86_64-pc-windows-msvc"]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - run: echo "probe-name entry targets=[${{ join(matrix.targets, ',') }}]"
-
-  # TEMP isolation probe B (read-only): runs-on matrix.runner + DEFAULT name.
-  # If this SKIPS, `runs-on: ${{ matrix.runner }}` prevents expansion.
-  probe-runner:
-    needs: [plan]
-    if: ${{ always() }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-22.04
-            targets: ["x86_64-unknown-linux-gnu"]
-          - runner: windows-2022
-            targets: ["x86_64-pc-windows-msvc"]
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 5
-    steps:
-      - run: echo "probe-runner entry runner=[${{ matrix.runner }}]"
-
   # Build and packages all the platform-specific things
   build-local-artifacts:
     timeout-minutes: 90
-    name: build-local-artifacts (${{ join(matrix.targets, ', ') }})
-    # Let the initial task tell us to not run (currently very blunt)
+    # NOTE: no custom `name:`. An explicit matrix-referencing job name
+    # (`${{ join(matrix.targets, ', ') }}`) COMBINED with `runs-on: ${{ matrix.runner }}`
+    # makes this matrix job silently fail to expand (skip) on the tag/push path
+    # (isolation probes: matrix.runner + default name expanded; a matrix name +
+    # fixed runs-on expanded; the two together did not). The default GitHub job
+    # name already includes the matrix combination.
     needs:
       - plan
     # Gate on the `github` context, NOT `needs.plan.outputs.*`. A matrix job's
