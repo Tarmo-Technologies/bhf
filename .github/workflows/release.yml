@@ -233,31 +233,6 @@ jobs:
             echo 'artifacts_matrix={"include":[]}' >> "$GITHUB_OUTPUT"
           fi
 
-  # TEMP diagnostic (read-only) — does matrix-from-needs expand on the TAG path?
-  debug-matrix-fixed:
-    needs: [plan]
-    if: ${{ always() }}
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJson(needs.plan.outputs.artifacts_matrix) }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - run: echo "FIXED expanded host=[${{ matrix.host }}] runner=[${{ matrix.runner }}]"
-
-  # TEMP diagnostic (read-only) — mirrors build-local-artifacts's header exactly
-  # (runs-on: matrix.runner, matrix-referencing name, no if) to isolate its skip.
-  debug-matrix-runner:
-    name: debug-matrix-runner (${{ join(matrix.targets, ', ') }})
-    needs: [plan]
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJson(needs.plan.outputs.artifacts_matrix) }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 5
-    steps:
-      - run: echo "RUNNER expanded host=[${{ matrix.host }}] runner=[${{ matrix.runner }}]"
-
   # Build and packages all the platform-specific things
   build-local-artifacts:
     timeout-minutes: 90
@@ -265,22 +240,38 @@ jobs:
     # Let the initial task tell us to not run (currently very blunt)
     needs:
       - plan
-    # No job-level `if`: gating is done via the matrix (empty => zero jobs =>
-    # skipped), emitted by the `plan` job. A needs-based `if` on this matrix job
-    # skips it even when the condition is true, so the matrix carries the gate.
+    # Gate: build local artifacts only when publishing a tag (or a PR in
+    # `upload` run-mode). Safe as a job-level `if` now that the matrix is static.
+    if: ${{ needs.plan.outputs.publishing == 'true' || needs.plan.outputs.pr_run_mode == 'upload' }}
     strategy:
       fail-fast: false
-      # Target platforms/runners are computed by dist in create-release.
-      # Each member of the matrix has the following arguments:
-      #
-      # - runner: the github runner
-      # - dist-args: cli flags to pass to dist
-      # - install-dist: expression to run to install dist on the runner
-      #
-      # Typically there will be:
-      # - 1 "global" task that builds universal installers
-      # - N "local" tasks that build each platform's binaries and platform-specific installers
-      matrix: ${{ fromJson(needs.plan.outputs.artifacts_matrix) }}
+      # STATIC matrix — NOT `fromJson(needs.plan.outputs...)`. With a dynamic,
+      # needs-derived matrix, `runs-on: ${{ matrix.runner }}` fails to resolve on
+      # this workflow's tag/push job graph and the whole job silently skips
+      # (proven: an identical probe with a FIXED runs-on expanded to jobs, while
+      # one with `runs-on: matrix.runner` + the dynamic matrix skipped). Our dist
+      # targets are fixed in Cargo.toml (`x86_64-unknown-linux-gnu`,
+      # `x86_64-pc-windows-msvc`), so the matrix is enumerated here to keep
+      # `matrix.runner` resolvable at parse time. Keep in sync with the
+      # `[workspace.metadata.dist] targets` list.
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            host: x86_64-unknown-linux-gnu
+            targets: ["x86_64-unknown-linux-gnu"]
+            dist_args: "--artifacts=local --target=x86_64-unknown-linux-gnu"
+            install_dist:
+              shell: sh
+              run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh | sh"
+            cache_provider: github
+          - runner: windows-2022
+            host: x86_64-pc-windows-msvc
+            targets: ["x86_64-pc-windows-msvc"]
+            dist_args: "--artifacts=local --target=x86_64-pc-windows-msvc"
+            install_dist:
+              shell: pwsh
+              run: "irm https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.ps1 | iex"
+            cache_provider: github
     runs-on: ${{ matrix.runner }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
