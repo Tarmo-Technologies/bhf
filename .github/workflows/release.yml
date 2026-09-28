@@ -191,14 +191,18 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
-      # Emit `val` from this job's OWN step (reading the uploaded manifest),
-      # rather than re-exporting `needs.<event-plan>.outputs.val`. Round-tripping
-      # the ~27KB dist manifest through a second job-output hop drops it, so
-      # downstream `fromJson(needs.plan.outputs.val)` sees empty and every
-      # build/publish job silently skips (green run, no release). release-plan
-      # and pull-request-plan already upload the manifest as
-      # `artifacts-plan-dist-manifest`; read it back here so consumers get a
-      # single-hop, step-sourced value — matching the upstream dist pattern.
+      # Expose SMALL, expression-safe outputs for the build gate. The full dist
+      # manifest is ~21KB for this workspace (2 apps x 2 targets + a long
+      # changelog/announcement body), and embedding it in `build-local-artifacts`'s
+      # `if`/`matrix` via `fromJson(needs.plan.outputs.val)` (referenced twice)
+      # makes that gate evaluate false — every build/publish job then silently
+      # skips (a green release run that builds and publishes nothing). Extract
+      # just the artifacts matrix (~700B), a boolean, and the PR-run mode from the
+      # manifest file release-plan/pull-request-plan upload as
+      # `artifacts-plan-dist-manifest`, and gate on those instead.
+      artifacts_matrix: ${{ steps.plan.outputs.artifacts_matrix }}
+      has_artifacts: ${{ steps.plan.outputs.has_artifacts }}
+      pr_run_mode: ${{ steps.plan.outputs.pr_run_mode }}
       val: ${{ steps.plan.outputs.manifest }}
       tag: ${{ needs.release-plan.outputs.tag }}
       tag-flag: ${{ needs.release-plan.outputs.tag-flag }}
@@ -212,6 +216,13 @@ jobs:
         run: |
           set -euo pipefail
           echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
+          echo "artifacts_matrix=$(jq -c '.ci.github.artifacts_matrix' plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
+          echo "pr_run_mode=$(jq -r '.ci.github.pr_run_mode // ""' plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
+          if jq -e '(.ci.github.artifacts_matrix.include // []) | length > 0' plan-dist-manifest.json >/dev/null; then
+            echo "has_artifacts=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_artifacts=false" >> "$GITHUB_OUTPUT"
+          fi
 
   # Build and packages all the platform-specific things
   build-local-artifacts:
@@ -220,7 +231,7 @@ jobs:
     # Let the initial task tell us to not run (currently very blunt)
     needs:
       - plan
-    if: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null && (needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload') }}
+    if: ${{ needs.plan.outputs.has_artifacts == 'true' && (needs.plan.outputs.publishing == 'true' || needs.plan.outputs.pr_run_mode == 'upload') }}
     strategy:
       fail-fast: false
       # Target platforms/runners are computed by dist in create-release.
@@ -233,7 +244,7 @@ jobs:
       # Typically there will be:
       # - 1 "global" task that builds universal installers
       # - N "local" tasks that build each platform's binaries and platform-specific installers
-      matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}
+      matrix: ${{ fromJson(needs.plan.outputs.artifacts_matrix) }}
     runs-on: ${{ matrix.runner }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
