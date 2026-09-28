@@ -2,6 +2,32 @@
 
 # Changelog
 
+## 0.2.33 - 2026-09-28
+
+The built-in `bhf fuzz` engine now arms its in-campaign input-to-state feedback
+by default. Previously only `bhf auto` wired the RedQueen cmplog (`BHF_CMP_SHM`,
+#400) and value-profile (`BHF_VP_SHM`, #398) shared-memory channels; the raw
+`fuzz` command ran blind against integer / magic-value comparison gates and
+could clear them only by chance (~2^-32). `prepare()` now arms both for
+builtin/BhfFramed harnesses, with `BHF_DISABLE_REDQUEEN=1` as the kill-switch,
+at no throughput cost on the exploration path (60.3k/s armed vs 60.6k/s off on a
+non-crashing target). On the `redqueen_int` engine-parity fixture this moves the
+built-in engine from 0/10 to 10/10 (0.43s median time-to-first-crash), matching
+the AFL++ cmplog and libFuzzer value-profile lanes; BHF now solves all four
+parity cases. A regression test drives the `bhf fuzz` path cold (the prior gate
+only exercised `bhf auto`, which is why the gap went unnoticed).
+
+Documentation: a new **On-Target & Embedded** guide documents the RTOS / radar /
+firmware lane end to end — cross-build and probe backends, the three
+`--target-transport` backends (on-device agent, gdb-remote debug probe, and
+full-system `qemu-system` snapshot) with the coverage-map spec, the `--deadline`
+timing oracle (BHF-555), big-endian fidelity, HIL boards, and the
+emulator-in-the-loop validation lane. `--deadline`, `--target-transport`, and
+`--transport-coverage-map` are now documented in the CLI reference (previously
+`--help` only). The emulator lane — RV-1 (big-endian ppc64), RV-2 (live qemu-arm
+gdbstub), RV-3 (`qemu-system` Cortex-M snapshot + planted fault) — was validated
+live on QEMU 8.2.2, and the RTOS roadmap's status was reconciled to match.
+
 ## 0.2.32 - 2026-09-14
 
 **Security release. Two separate ways a scanned tree could execute commands on the

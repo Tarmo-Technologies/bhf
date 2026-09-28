@@ -1,149 +1,69 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# BHF v0.2.32 release notes
+# BHF v0.2.33 release notes
 
-Released 2026-09-14.
+Released 2026-09-28.
 
-**This is a security release. Upgrade if you run bhf against code you do not
-control.** 0.2.31 had two separate ways for a scanned tree to execute commands on
-the host running `bhf auto` — both in default mode, with no opt-in flag required and
-no error surfaced. The run exits 0, prints a normal summary, and reports 0 findings.
+This release makes the built-in fuzzing engine solve comparison gates on its
+own, and ships the first user-facing documentation for the on-target / embedded
+(RTOS / radar / firmware) lane. There are no breaking changes; a run that does
+not hit an integer/magic-value gate behaves as before.
 
-There are no behavioral changes beyond the fixes. Well-formed build configuration
-from every affected source is honored exactly as before.
+## Built-in `bhf fuzz` solves comparison gates by default
 
-## The trust boundary
+The built-in coverage-guided engine already carried a RedQueen-style cmplog
+mutator and a value-profile channel, but only `bhf auto` armed them. The raw
+`bhf fuzz` command never wired the in-campaign input-to-state shared-memory
+channels — `BHF_CMP_SHM` (per-input comparison operands, #400) and `BHF_VP_SHM`
+(value profile, #398) — so it ran **blind** against an integer or magic-value
+comparison gate and could only clear one by chance (~2⁻³² for a 32-bit compare).
 
-`bhf auto` reads two files straight out of the scanned tree, by design and without
-any flag: an auto-loaded `.bhf.toml`, and the project's own `compile_commands.json`.
-Both vulnerabilities live there. They are different defects with different fixes,
-and **neither fix closes the other**.
+`prepare()` now arms both channels by default for built-in / BhfFramed
+harnesses, exactly as `bhf auto` does, with `BHF_DISABLE_REDQUEEN=1` as the
+kill-switch. There is no throughput cost on the exploration path (measured
+60.3k exec/s armed vs 60.6k off on a non-crashing target); the engine colorizes
+and captures operands once per corpus base and biases that base's children
+toward the offset-aware splice.
 
-## 1. Command injection into the generated Makefile
+On the `redqueen_int` engine-parity fixture — a crash gated behind a 32-bit
+comparison against a length-derived magic — the built-in engine moves from
+**0/10 to 10/10**, at a 0.43s median time-to-first-crash. That matches the
+AFL++ cmplog and libFuzzer value-profile lanes it is benchmarked against; BHF
+now solves all four parity fixtures (`magic_byte`, `const_gate`, `len_field`,
+`redqueen_int`). A regression test now drives the `bhf fuzz` path cold — the
+prior gate only exercised `bhf auto`, which is why the gap went unnoticed.
 
-GHSA-725h-95qg-44fv · CWE-78
+## On-target / embedded documentation and validation
 
-Values from those files were interpolated into the harness Makefile unescaped, and
-`make` hands its recipes to `/bin/sh`.
+A new **On-Target & Embedded** guide documents the RTOS / radar / firmware lane
+end to end — what each feature is and the exact commands to set it up and run
+it:
 
-| | Source | Sink |
-|---|---|---|
-| V1 | `.bhf.toml` `cxx-std` | `CXX_STD ?=` → `-std=$(CXX_STD)` |
-| V2 | `compile_commands.json` `-std=` | `CXX_STD ?=` → `-std=$(CXX_STD)` |
-| V3 | `compile_commands.json` compiler | `CXX =` — heads every recipe line |
+- cross-build (`--target` / `--runtime` / `--toolchain`) and the coverage
+  probe backends (`--probe-backend`);
+- vendor RTOS builds via `--build-command` (Wind River Diab, Green Hills, QNX,
+  Keil/IAR, TI), `--extra-include`, and `--sanitizers none`;
+- the three `--target-transport` backends — on-device agent (`agent:tcp` /
+  `agent:serial`), gdb-remote debug probe (`gdb:`), and full-system
+  `qemu-system` snapshot — with the `--transport-coverage-map` spec;
+- on-target faults → findings and the `--deadline` real-time timing oracle
+  (BHF-555);
+- big-endian / non-x86 fidelity, comparison-progress, HIL boards, and the
+  emulator-in-the-loop validation lane.
 
-V1 is the reported vector. V2 and V3 were found while remediating it. **V2 needs no
-`.bhf.toml` at all** — an ordinary compile database is enough — so a fix aimed only
-at the reported vector would have left an equivalent primitive in place.
+`--deadline`, `--target-transport`, and `--transport-coverage-map` are now in
+the CLI reference (previously documented only in `--help`).
 
-### Root cause
-
-One pattern, not three bugs. `split_cpp_build_context_flags` and `split_c_compile_context` pull values back
-out of the internal `@bhf-build-context-*` pseudo-flags and interpolate them with no
-escaping, while validation only ever inspected the **prefixed** form — where the
-single-quote relaxation that exists for legitimate CMake defines
-(`-DLLAMA_VERSIONS=>=3`) makes `@bhf-...=c++17; id` look acceptable.
-
-The `-std=` path compounds it: `encoded_flags` deliberately *removes* the flag from
-`compile_flags` so it can drive the Makefile's single `CXX_STD` knob — which also
-removes it from `escape_makefile_recipe_flag`, the function that would have quoted
-it.
-
-### The fix
-
-Validation moved to the emission boundary, where every producer converges.
-
-- **C++ standard** — a closed set: `c++`/`gnu++` plus a two-to-three character
-  alphanumeric version beginning with a digit. Accepts every real selector including
-  the draft forms `c++0x`, `c++1y`, `c++2a`; admits no separator. The previous check
-  tested only the `c++` prefix, which `c++17; id` satisfies.
-- **`CC` / `CXX`** — held to the strict bare-token rule. The quoting relaxation for
-  compile flags must not reach a value that heads a recipe.
-- **Build-context metadata** — `BUILD_CONTEXT_PROVENANCE` and friends are
-  neutralised. Not an active vector, but written as `NAME = <value>`, where a
-  newline would end the assignment and let the remainder parse as Makefile source.
-- **Ada `.gpr` projects** — the same treatment adapted to GPR syntax. A `.gpr` is
-  not a shell, so spaces and parentheses stay legal — a Windows source directory
-  needs them — and only a quote, newline, or control character is refused.
-
-## 2. Execution of an untrusted compiler from the scanned tree
-
-CWE-829 · reported against the retired `govfuzz` project as GHSA-2352-w7c6-wr67
-
-bhf executes the compiler named by the tree's compile database — as `$(CC)`/`$(CXX)`
-under make, in the standalone-header preflight, and in the libstdc++ probe. The only
-check was that the token's file name **contained** `clang`, or equalled `gcc`/`g++`.
-The path was never verified to be a real toolchain.
-
-A tree that ships an executable beside its sources and points the database at it ran
-its own program on the host. Because the shim can exec the real compiler after its
-payload, the build succeeds and the run looks entirely normal.
-
-**No metacharacter is involved.** `./evilclang` is a well-formed path containing
-nothing a shell acts on, so every rule added for the injection class above passes it
-through untouched. Four deliveries were confirmed, including a tree binary named
-**exactly** `clang`, which defeats any name-based check.
-
-### The fix
-
-The compile database may influence *which* compiler is used, never *where it comes
-from*:
-
-- the leaf must be a real driver name, matched exactly after stripping a version
-  suffix (`gcc-12`) and a target-triple prefix (`aarch64-linux-gnu-gcc`).
-- a **bare name** is left as written — it carries no directory, so the operator's
-  PATH decides, and the generated Makefile stays readable for a hand rebuild.
-- an **absolute path outside the scanned tree** is honored, so a cross or custom
-  toolchain (`/opt/toolchain/bin/g++-12`) keeps working. That is ordinary for the
-  hard-to-build trees bhf targets, and the operator installed it.
-- a **relative path**, or an absolute path **inside the tree**, is refused. `auto`
-  publishes the canonical sweep root, and the working directory is always treated as
-  untrusted, covering `cd repo && bhf auto .`.
-
-## Both fixes: what a rejected value does
-
-It falls back to the built-in default rather than failing the run. The tree's build
-system is untrusted input, not an operator instruction, and a project whose compile
-database carries a malformed dialect should still get fuzzed. A malformed
-`--cxx-std` still errors, because that file claims to configure the run and a silent
-downgrade would hide it.
-
-## Diagnostics
-
-**A killed Rust harness build is no longer reported as a compile error.** cargo's
-stderr classifier falls back to the tail of the output, reached only when there is
-no error line at all — precisely what a build killed by a signal leaves behind. It
-reported whichever crate happened to be compiling, naming a crate that had not
-failed and could not be reproduced. Progress lines no longer stand in for a
-diagnosis, the exit status (including the signal) is reported, and the raw stderr —
-previously discarded at both cargo failure sites — is persisted to
-`<work>/harnesses/<id>/cargo-build-stderr.log`.
-
-**ThreadSanitizer no longer reports a harness race-free when it saw a race it could
-not place.** A report whose frames carry no `file:line` is unreadable, not evidence
-of a scaffolding race, and was dropped without being counted. It is now surfaced as
-`unattributed`. A report that *does* resolve to only the bhf driver or a system
-library is still dropped, as intended.
-
-## Dependencies
-
-`rustls` moves to 0.23.45 for RUSTSEC-2026-0285, reaching the tree through `ureq` <-
-`llm_harness_gen`. rustls 0.23.42 accepted TLS 1.3 handshake messages sent at the
-wrong encryption level when they followed a key-changing message in the same record,
-contrary to RFC 8446 §5.1. The handshake transcript remains authenticated, so this
-is not a handshake-forgery primitive.
+The emulator-in-the-loop lane was **validated live on QEMU 8.2.2** — RV-1
+(big-endian ppc64 fidelity under `qemu-ppc64`), RV-2 (the gdb-remote client
+against a live `qemu-arm` gdbstub), and RV-3 (`FullSystemTransport` on
+`qemu-system-arm`: savevm/loadvm snapshot reset + coverage-ring readback + a
+planted HardFault). Evidence is recorded under `docs/validation/`, and the RTOS
+roadmap's status language was reconciled to match. Genuinely resource-gated
+paths — real silicon, the TCP/serial agent transport, proprietary RTOS images,
+and Renode — remain honestly gated.
 
 ## Upgrading
 
-No configuration change is required.
-
-If you cannot upgrade immediately, remove `.bhf.toml` and `compile_commands.json`
-from a tree before scanning it. Neither is a substitute for upgrading — other build
-files feed the same context recovery.
-
-## Credit
-
-GHSA-725h-95qg-44fv was reported privately through GitHub Security Advisories with a
-complete reproducer and an accurate root-cause analysis; V2 and V3 were identified
-during remediation. The untrusted-compiler defect was reported against `govfuzz`,
-also with a complete reproducer.
+No configuration change is required. If you drive `bhf fuzz` directly and rely
+on the previous blind-mutation behavior, `BHF_DISABLE_REDQUEEN=1` restores it.
