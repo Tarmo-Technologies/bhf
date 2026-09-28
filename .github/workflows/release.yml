@@ -240,9 +240,13 @@ jobs:
     # Let the initial task tell us to not run (currently very blunt)
     needs:
       - plan
-    # Gate: build local artifacts only when publishing a tag (or a PR in
-    # `upload` run-mode). Safe as a job-level `if` now that the matrix is static.
-    if: ${{ needs.plan.outputs.publishing == 'true' || needs.plan.outputs.pr_run_mode == 'upload' }}
+    # Gate on the `github` context, NOT `needs.plan.outputs.*`. A matrix job's
+    # `if` is evaluated at matrix-expansion time, before `needs` outputs are
+    # available, so a needs-based `if` here resolves empty/false and the job
+    # skips even on a tag (a non-matrix job sees the same output as true).
+    # `github.*` is available at expansion time; `push`+tag is exactly what
+    # plan.outputs.publishing is derived from. (PR `upload` run-mode is unused.)
+    if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
     strategy:
       fail-fast: false
       # STATIC matrix — NOT `fromJson(needs.plan.outputs...)`. With a dynamic,
