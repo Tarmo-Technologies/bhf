@@ -73,6 +73,10 @@ source-generated harnesses and a permissively licensed core.
 - [Fake-CORBA](./fake-corba/) — IDL scaffolding for legacy Ada servants.
 - [Cross-Compilation](./cross-compilation/) — target toolchains, probe
   backends, qemu-user replay, and sandboxing.
+- [On-Target & Embedded](./on-target-fuzzing/) — RTOS / radar / firmware: the
+  `--target-transport` seam (on-device agent, gdb-remote probe, full-system
+  `qemu-system` snapshot), coverage-map setup, big-endian fidelity, HIL boards,
+  and the emulator validation lane.
 - [Daemon](./daemon/) — IDE JSON-RPC plus the five read-only MCP tools for
   bounded agent assistance.
 - [Licensing](./licensing/) — policy profiles, SPDX metadata, and audits.

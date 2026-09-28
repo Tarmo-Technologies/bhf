@@ -124,6 +124,12 @@ it cross-compile + emulate the target under wine (the section above). See
 - `semihosting` writes through an imported semihosting support hook.
 - `stub` preserves testcase result status without emitting an event stream.
 
+To *run* a cross-built harness on a device or full-system emulator and read the
+`memory_buffer`/`semihosting` coverage back — the on-device agent, gdb-remote
+debug-probe, and `qemu-system` snapshot transports — see
+[On-Target & Embedded](../on-target-fuzzing/). This page covers the build and
+`qemu-user` replay; that page covers the on-target execution seam.
+
 ## qemu-user Replay
 
 ```sh

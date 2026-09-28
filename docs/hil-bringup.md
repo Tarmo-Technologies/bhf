@@ -17,6 +17,12 @@ The same `GdbClient` / `GdbRemoteTransport` RSP code drives all three. The board
 lane needs no new code: attach a board, start OpenOCD, set `BHF_HIL_GDB`, and
 `tests/hil_board.rs` runs the real-hardware path.
 
+> The same board is also drivable from the shipped CLI —
+> `bhf fuzz … --target-transport gdb:HOST:PORT --transport-coverage-map …` — over
+> the identical RSP path. See the published **On-Target & Embedded** guide
+> (`docs/site/on-target-fuzzing.md`) for the flag-driven workflow; this runbook
+> is the hardware bring-up detail (BOM, wiring, firmware contract) behind it.
+
 ## BOM
 
 | Item | ~Price | Why |
