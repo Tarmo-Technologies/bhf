@@ -224,6 +224,26 @@ jobs:
             echo "has_artifacts=false" >> "$GITHUB_OUTPUT"
           fi
 
+  # TEMP diagnostic (read-only) — echoes the exact values the build gate sees so
+  # we can pinpoint why build-local-artifacts skips. Remove after diagnosis.
+  debug-gate:
+    needs: [plan]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Dump build-gate inputs
+        run: |
+          echo "event_name=[${{ github.event_name }}]"
+          echo "ref_type=[${{ github.ref_type }}]"
+          echo "ref=[${{ github.ref }}]"
+          echo "plan_result=[${{ needs.plan.result }}]"
+          echo "has_artifacts=[${{ needs.plan.outputs.has_artifacts }}]"
+          echo "publishing=[${{ needs.plan.outputs.publishing }}]"
+          echo "pr_run_mode=[${{ needs.plan.outputs.pr_run_mode }}]"
+          echo "artifacts_matrix_nonempty=[${{ needs.plan.outputs.artifacts_matrix != '' }}]"
+          echo "GATE=[${{ needs.plan.outputs.has_artifacts == 'true' && (needs.plan.outputs.publishing == 'true' || needs.plan.outputs.pr_run_mode == 'upload') }}]"
+
   # Build and packages all the platform-specific things
   build-local-artifacts:
     timeout-minutes: 90
