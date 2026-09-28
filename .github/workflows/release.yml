@@ -466,6 +466,20 @@ jobs:
             ${{ steps.cargo-dist.outputs.paths }}
             ${{ env.BUILD_MANIFEST_NAME }}
 
+  # TEMP diagnostic (read-only) — confirms which of sign's conditions was false.
+  debug-sign:
+    needs: [release-acceptance, plan, build-local-artifacts]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - run: |
+          echo "release_acceptance_result=[${{ needs.release-acceptance.result }}]"
+          echo "plan_result=[${{ needs.plan.result }}]"
+          echo "publishing=[${{ needs.plan.outputs.publishing }}]"
+          echo "build_local_result=[${{ needs.build-local-artifacts.result }}]"
+          echo "SIGN_IF=[${{ needs.release-acceptance.result == 'success' && needs.plan.outputs.publishing == 'true' && needs.build-local-artifacts.result == 'success' }}]"
+
   # Only tagged releases can enter the protected signing environment. PR jobs
   # still build their ordinary unsigned platform artifacts without secret access.
   sign-linux-bundle:
@@ -474,7 +488,11 @@ jobs:
       - release-acceptance
       - plan
       - build-local-artifacts
-    if: ${{ needs.release-acceptance.result == 'success' && needs.plan.outputs.publishing == 'true' && needs.build-local-artifacts.result == 'success' }}
+    # Begin with always() (like host/announce): this job needs build-local-artifacts,
+    # which uses `if: always()`. Without always() here the default dependency
+    # gating skips this job. The `&& <conditions>` still gate it to a successful
+    # tag build.
+    if: ${{ always() && needs.release-acceptance.result == 'success' && needs.plan.outputs.publishing == 'true' && needs.build-local-artifacts.result == 'success' }}
     runs-on: ubuntu-22.04
     environment: production-release
     permissions:
