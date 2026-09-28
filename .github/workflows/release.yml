@@ -191,15 +191,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
-      # Expose SMALL, expression-safe outputs for the build gate. The full dist
-      # manifest is ~21KB for this workspace (2 apps x 2 targets + a long
-      # changelog/announcement body), and embedding it in `build-local-artifacts`'s
-      # `if`/`matrix` via `fromJson(needs.plan.outputs.val)` (referenced twice)
-      # makes that gate evaluate false — every build/publish job then silently
-      # skips (a green release run that builds and publishes nothing). Extract
-      # just the artifacts matrix (~700B), a boolean, and the PR-run mode from the
-      # manifest file release-plan/pull-request-plan upload as
-      # `artifacts-plan-dist-manifest`, and gate on those instead.
+      # `artifacts_matrix` is the small (~700B) build matrix extracted from the
+      # dist manifest, and is EMPTY when this run should not build local
+      # artifacts. build-local-artifacts gates on the matrix (empty => zero
+      # combinations => job skipped) instead of a job-level `if`, because a
+      # needs-based `if` on that matrix job skips it even when the condition is
+      # true (a matrix-job evaluation quirk confirmed in release history: an
+      # identical `if: always()` probe with this same matrix expanded, while the
+      # gated job skipped). `has_artifacts`/`val` are kept for compatibility.
       artifacts_matrix: ${{ steps.plan.outputs.artifacts_matrix }}
       has_artifacts: ${{ steps.plan.outputs.has_artifacts }}
       pr_run_mode: ${{ steps.plan.outputs.pr_run_mode }}
@@ -216,33 +215,23 @@ jobs:
         run: |
           set -euo pipefail
           echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
-          echo "artifacts_matrix=$(jq -c '.ci.github.artifacts_matrix' plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
-          echo "pr_run_mode=$(jq -r '.ci.github.pr_run_mode // ""' plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
+          pr_run_mode="$(jq -r '.ci.github.pr_run_mode // ""' plan-dist-manifest.json)"
+          echo "pr_run_mode=${pr_run_mode}" >> "$GITHUB_OUTPUT"
           if jq -e '(.ci.github.artifacts_matrix.include // []) | length > 0' plan-dist-manifest.json >/dev/null; then
             echo "has_artifacts=true" >> "$GITHUB_OUTPUT"
           else
             echo "has_artifacts=false" >> "$GITHUB_OUTPUT"
           fi
-
-  # TEMP diagnostic (read-only) — echoes the exact values the build gate sees so
-  # we can pinpoint why build-local-artifacts skips. Remove after diagnosis.
-  debug-gate:
-    needs: [plan]
-    if: ${{ always() }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - name: Dump build-gate inputs
-        run: |
-          echo "event_name=[${{ github.event_name }}]"
-          echo "ref_type=[${{ github.ref_type }}]"
-          echo "ref=[${{ github.ref }}]"
-          echo "plan_result=[${{ needs.plan.result }}]"
-          echo "has_artifacts=[${{ needs.plan.outputs.has_artifacts }}]"
-          echo "publishing=[${{ needs.plan.outputs.publishing }}]"
-          echo "pr_run_mode=[${{ needs.plan.outputs.pr_run_mode }}]"
-          echo "artifacts_matrix_nonempty=[${{ needs.plan.outputs.artifacts_matrix != '' }}]"
-          echo "GATE=[${{ needs.plan.outputs.has_artifacts == 'true' && (needs.plan.outputs.publishing == 'true' || needs.plan.outputs.pr_run_mode == 'upload') }}]"
+          # Gate build-local-artifacts through the MATRIX, not a job-level `if`.
+          # Emit the real matrix only when this run should build local artifacts
+          # (a tag publish, or a PR in `upload` run-mode); otherwise an empty
+          # matrix so the job expands to zero combinations and skips cleanly.
+          publishing="${{ github.event_name == 'push' && github.ref_type == 'tag' }}"
+          if [ "${publishing}" = "true" ] || [ "${pr_run_mode}" = "upload" ]; then
+            echo "artifacts_matrix=$(jq -c '.ci.github.artifacts_matrix' plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
+          else
+            echo 'artifacts_matrix={"include":[]}' >> "$GITHUB_OUTPUT"
+          fi
 
   # Build and packages all the platform-specific things
   build-local-artifacts:
@@ -251,7 +240,9 @@ jobs:
     # Let the initial task tell us to not run (currently very blunt)
     needs:
       - plan
-    if: ${{ needs.plan.outputs.has_artifacts == 'true' && (needs.plan.outputs.publishing == 'true' || needs.plan.outputs.pr_run_mode == 'upload') }}
+    # No job-level `if`: gating is done via the matrix (empty => zero jobs =>
+    # skipped), emitted by the `plan` job. A needs-based `if` on this matrix job
+    # skips it even when the condition is true, so the matrix carries the gate.
     strategy:
       fail-fast: false
       # Target platforms/runners are computed by dist in create-release.
