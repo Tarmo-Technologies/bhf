@@ -875,6 +875,10 @@ struct PreparedFuzzRun {
     extra_env: Vec<(String, String)>,
     /// Keeps the standalone builtin driver's coverage bitmap alive for the run.
     _local_coverage_map: Option<tempfile::TempPath>,
+    /// Keeps the RedQueen (#400) per-input cmplog operand map alive for the run.
+    _local_cmp_map: Option<tempfile::TempPath>,
+    /// Keeps the value-profile (#398) map alive for the run.
+    _local_vp_map: Option<tempfile::TempPath>,
     cmplog_log: Option<PathBuf>,
     grammar_file: Option<PathBuf>,
     structured_inputs: StructuredInputMode,
@@ -1348,6 +1352,21 @@ fn structured_input_mode_arg_name(mode: StructuredInputMode) -> &'static str {
     }
 }
 
+/// Create a zero-filled, `bytes`-sized temp file inside `work_dir` to back a
+/// harness shared-memory channel, returning the RAII lifetime handle and its
+/// path string (for the child's `*_SHM` env var). The file is unlinked when the
+/// returned `TempPath` drops, so it lives exactly as long as the prepared run.
+fn arm_shared_map(work_dir: &Path, bytes: usize) -> Result<(tempfile::TempPath, String), String> {
+    let file = tempfile::NamedTempFile::new_in(work_dir)
+        .map_err(|error| format!("create harness shared map: {error}"))?;
+    file.as_file()
+        .set_len(bytes as u64)
+        .map_err(|error| format!("size harness shared map: {error}"))?;
+    let path = file.into_temp_path();
+    let value = path.to_string_lossy().into_owned();
+    Ok((path, value))
+}
+
 fn prepare(args: FuzzArgs) -> Result<PreparedFuzzRun, String> {
     match args.engine {
         FuzzEngine::Builtin | FuzzEngine::AflPlusPlus => {}
@@ -1435,24 +1454,56 @@ fn prepare(args: FuzzArgs) -> Result<PreparedFuzzRun, String> {
     let mut extra_env = args.extra_env;
     extra_env.extend(sanitizer_env.clone());
     apply_fuzz_child_env_overrides(&mut extra_env);
-    let local_coverage_map = if args.engine == FuzzEngine::Builtin
-        && resolve_harness_protocol(&runner, &work_dir) == HarnessProtocol::BhfFramed
-        && !extra_env.iter().any(|(key, _)| key == "BHF_COV_SHM")
-    {
-        let file = tempfile::NamedTempFile::new_in(&work_dir)
-            .map_err(|error| format!("create harness coverage map: {error}"))?;
-        file.as_file()
-            .set_len(BHF_COV_BITS as u64)
-            .map_err(|error| format!("size harness coverage map: {error}"))?;
-        let path = file.into_temp_path();
-        extra_env.push((
-            "BHF_COV_SHM".to_owned(),
-            path.to_string_lossy().into_owned(),
-        ));
+    // Only the standalone bhf-framed C/C++ driver carries the runtime that
+    // writes these shared-memory channels; other engines/protocols ignore them.
+    let builtin_framed = args.engine == FuzzEngine::Builtin
+        && resolve_harness_protocol(&runner, &work_dir) == HarnessProtocol::BhfFramed;
+
+    // Edge-coverage bitmap (#385). Armed unless a caller (e.g. `bhf auto`)
+    // already provided one.
+    let local_coverage_map =
+        if builtin_framed && !extra_env.iter().any(|(key, _)| key == "BHF_COV_SHM") {
+            let (path, value) = arm_shared_map(&work_dir, BHF_COV_BITS)?;
+            extra_env.push(("BHF_COV_SHM".to_owned(), value));
+            Some(path)
+        } else {
+            None
+        };
+
+    // In-campaign input-to-state channels — armed BY DEFAULT for the raw
+    // `bhf fuzz` path so the built-in engine solves magic-value / integer
+    // comparison gates out of the box, matching what `bhf auto` already wires
+    // (crates/cli/src/auto/attempt.rs) and the AFL++ cmplog / libFuzzer
+    // value-profile lanes it is benchmarked against. Without this the engine
+    // ran blind against `redqueen_int`-style integer gates (2^-32 by chance).
+    //
+    // #398 value profile: the driver mines comparison operands the engine folds
+    // into the mutator dictionary. Ignored by harnesses without the runtime.
+    let local_vp_map = if builtin_framed && !extra_env.iter().any(|(key, _)| key == "BHF_VP_SHM") {
+        let (path, value) = arm_shared_map(&work_dir, BHF_VP_BYTES)?;
+        extra_env.push(("BHF_VP_SHM".to_owned(), value));
         Some(path)
     } else {
         None
     };
+
+    // #400 RedQueen per-input operand capture (offset-aware splice), gated on the
+    // same `BHF_DISABLE_REDQUEEN=1` kill-switch `auto` honors. Only wired on the
+    // platforms whose `CmpShmReader` is a live mmap (linux/windows); a no-op stub
+    // elsewhere, so arming it there would be inert.
+    #[cfg(any(target_os = "linux", windows))]
+    let local_cmp_map = if builtin_framed
+        && !extra_env.iter().any(|(key, _)| key == "BHF_CMP_SHM")
+        && std::env::var("BHF_DISABLE_REDQUEEN").as_deref() != Ok("1")
+    {
+        let (path, value) = arm_shared_map(&work_dir, BHF_CMP_BYTES)?;
+        extra_env.push(("BHF_CMP_SHM".to_owned(), value));
+        Some(path)
+    } else {
+        None
+    };
+    #[cfg(not(any(target_os = "linux", windows)))]
+    let local_cmp_map: Option<tempfile::TempPath> = None;
 
     Ok(PreparedFuzzRun {
         work_dir,
@@ -1468,6 +1519,8 @@ fn prepare(args: FuzzArgs) -> Result<PreparedFuzzRun, String> {
         mode: args.mode,
         extra_env,
         _local_coverage_map: local_coverage_map,
+        _local_cmp_map: local_cmp_map,
+        _local_vp_map: local_vp_map,
         cmplog_log: args.cmplog_log,
         grammar_file: args.grammar_file,
         structured_inputs: args.structured_inputs,
