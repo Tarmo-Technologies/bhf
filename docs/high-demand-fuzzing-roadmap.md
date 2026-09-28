@@ -29,6 +29,13 @@ harness generation, engines).
 
 ## 1. Where BHF stands today (evidence)
 
+> **Superseded (2026-09-27).** The "back half missing" baseline in this section
+> is the pre-`rtos-radar-fuzzing` starting point, kept for context. The back
+> half is now built (§1a) **and** its emulator-in-the-loop lane was run live on
+> QEMU 8.2.2 — RV-1/RV-2/RV-3 all passed
+> (`docs/validation/2026-09-27-hil-emu-live-qemu.md`). Read §1 as history, not
+> as current capability.
+
 BHF's embedded/RTOS support today is a **host-side stub-isolation lane**: for a
 target guarded by (or including) a vendor platform header, BHF defines the
 platform guard, drops declaration-only fake headers, and fuzzes the *portable
@@ -80,21 +87,25 @@ This reconciles the plan below to what is **actually built on this branch**. A
 track is **software-complete** when its in-tree acceptance criteria pass under
 `cargo test` (against mocks/fixtures, no external resources); its **gated
 validation** — the step that needs real hardware, a live emulator, or a
-proprietary toolchain — is listed separately and is *unproven until run* against
-that resource, with evidence to be recorded under `docs/validation/` (see §5,
-§6). Software-complete is **never** a claim of validated on-target capability.
+proprietary toolchain — is listed separately, with the evidence recorded under
+`docs/validation/` (see §5, §6). The emulator-in-the-loop lane was run live on
+2026-09-27 — RV-1/RV-2/RV-3 passed on QEMU 8.2.2
+(`docs/validation/2026-09-27-hil-emu-live-qemu.md`); the steps still *unproven
+until run* are real silicon, proprietary RTOS images, the TCP/serial agent
+transport, and Renode. Software-complete is **never** a claim of validated
+on-target capability.
 Where a track has a purely *library* capability that is not yet reachable from a
 `bhf` command, that is called out explicitly rather than counted as a live
 feature.
 
-| Track | Commit | Software-complete (in-tree) | Evidence — crate · representative test | Gated / follow-up (unproven until run) |
+| Track | Commit | Software-complete (in-tree) | Evidence — crate · representative test | Gated / follow-up (emulator lane validated 2026-09-27; real HW / images still gated) |
 |---|---|---|---|---|
 | CC-1 | `a0ca452` | yes | `crates/actionability/src/fidelity.rs`; JSON schema `docs/finding-report-fields.md` (`fidelity` block) | — (in-tree only) |
-| HDF-1 | `80d5df3` | yes | `crates/target_transport` — `agent::tests::agent_session_delivers_input_and_surfaces_monotonic_edges_and_fault`; `coverage.rs` Semihosting/MemoryBuffer readers (incl. wrap case); `host::HostChildTransport` | real board / debug probe via `GdbRemoteTransport` driving live coverage |
-| HDF-1b | `307a42e` | yes | `crates/cli/src/transport_fuzz.rs` — `transport_path_is_off_by_default_and_opt_in` + spec-parser tests, driven over `target_transport::testsupport` mocks | live agent (TCP/serial) / gdbstub / `qemu-system` backends dialed by `--target-transport` |
-| HDF-2 | `229105a` | yes | `crates/cli/src/transport_fault.rs` — backend-neutral `Fault`→finding mapping; cross-build compiler guards | on-emulator Cortex-M exception-vector hook reporting a hard-fault |
-| HDF-3 | `dbebbf7` | yes | `crates/type_model/src/abi.rs` — `struct_image_is_emitted_in_target_byte_order`, `host_abi_matches_the_x86_64_lab_host`; `crates/cli/src/auto/cross_target.rs` PPC/MIPS/SPARC triples | BE-only bug found under `qemu-ppc64` but not on the LE host (needs cross toolchain + emulator) |
-| HDF-4 | `89b9fb8` | yes | `crates/target_transport/src/fullsystem.rs` — `arm_performs_qmp_handshake_gdb_attach_and_baseline_snapshot`, `run_input_loads_snapshot_delivers_input_and_reads_ring_coverage`, `same_input_twice_is_deterministic` (scripted QMP + gdbstub mocks) | live `qemu-system-*` image with a planted handler. Renode = documented follow-up; Nyx stub **retired** (`nyx_adapter` — `not_implemented_error_names_the_full_system_replacement`) |
+| HDF-1 | `80d5df3` | yes | `crates/target_transport` — `agent::tests::agent_session_delivers_input_and_surfaces_monotonic_edges_and_fault`; `coverage.rs` Semihosting/MemoryBuffer readers (incl. wrap case); `host::HostChildTransport` | real board via `GdbRemoteTransport` still gated (`hil_board.rs` / `BHF_HIL_GDB`); the live-gdbstub coverage path **validated 2026-09-27** (RV-2 `live_gdb`, qemu-arm) |
+| HDF-1b | `307a42e` | yes | `crates/cli/src/transport_fuzz.rs` — `transport_path_is_off_by_default_and_opt_in` + spec-parser tests, driven over `target_transport::testsupport` mocks | TCP/serial agent backend still gated; the gdbstub and `qemu-system` backends **validated 2026-09-27** (RV-2 `live_gdb`, RV-3 `live_fullsystem`). Driving the live backends through the `--target-transport` CLI flag end-to-end is the remaining follow-up |
+| HDF-2 | `229105a` | yes | `crates/cli/src/transport_fault.rs` — backend-neutral `Fault`→finding mapping; cross-build compiler guards | on-emulator Cortex-M hard-fault reporting **validated 2026-09-27** (RV-3 `live_fullsystem`: input `0xF7` → `udf` → `HardFault_Handler`, distinct fault breadcrumb); on-silicon vectors still gated |
+| HDF-3 | `dbebbf7` | yes | `crates/type_model/src/abi.rs` — `struct_image_is_emitted_in_target_byte_order`, `host_abi_matches_the_x86_64_lab_host`; `crates/cli/src/auto/cross_target.rs` PPC/MIPS/SPARC triples | BE-only branch reached under `qemu-ppc64` but not on the LE host **validated 2026-09-27** (RV-1, `powerpc64-linux-gnu-gcc` + qemu-ppc64) |
+| HDF-4 | `89b9fb8` | yes | `crates/target_transport/src/fullsystem.rs` — `arm_performs_qmp_handshake_gdb_attach_and_baseline_snapshot`, `run_input_loads_snapshot_delivers_input_and_reads_ring_coverage`, `same_input_twice_is_deterministic` (scripted QMP + gdbstub mocks) | live `qemu-system-*` (BHF-authored image) **validated 2026-09-27** (RV-3 `live_fullsystem`, `qemu-system-arm -M mps2-an385`: savevm/loadvm reset + coverage-ring readback + planted HardFault). Proprietary RTOS images and Renode = documented follow-ups; Nyx stub **retired** (`nyx_adapter` — `not_implemented_error_names_the_full_system_replacement`) |
 | HDF-5 | `d31a824` | yes | `crates/target_rank/src/c_rank.rs` — `intconnect_isr_and_msgqueue_consumer_ranked_reachable_not_unproven`, `mmio_polled_register_reader_is_a_channel_consumer`; `crates/harness_gen/src/c_generate.rs` — `peripheral_reader_harness_drives_a_fuzz_controlled_read_sequence` | — (in-tree only) |
 | HDF-6 | `94ad2c4` | yes | `crates/c_stub_gen/src/lib.rs` — `fuzz_driven_stub_reaches_a_return_value_gated_branch_e2e`; `crates/bhf_runtrace_shim/src/{fakes/fuzz_input.rs,hooks/rtos.rs}` (fuzz-driven RTOS channels + MMIO fill) | bare-metal MMIO interception on a real cross build (the host stub-isolation lane is in-tree) |
 | HDF-7 | `dc47e31` | yes (library) | `crates/fuzz_engine/builtin/src/binframe.rs` — `fixup_reaches_past_crc_gate_but_naive_mutation_does_not`, `length_and_crc_are_computed_on_encode`; `crates/iiop/src/dispatch.rs` — `encoded_request_roundtrips_and_dispatches_to_servant`; `crates/ada_state_machine/src/adapter.rs` — `graph_exposes_states_and_transitions_for_a_protected_type` | **follow-up (unbuilt, not hardware-gated):** IIOP dispatch + `ProtocolStateGraph` are library APIs, not wired into any `bhf` subcommand / engine input-scheduler; live socket/DDS transport not built |
@@ -108,9 +119,14 @@ feature.
   encode/dispatch path and `ada_state_machine::ProtocolStateGraph` are typed
   APIs a caller invokes directly; no `bhf` subcommand or engine input-scheduler
   feeds them yet. This is a follow-up, not a validated end-to-end capability.
-- **HDF-1 / 1b / 2 / 3 / 4 live backends are DEPENDENCY-gated.** The transports
-  build and are mock-proven end-to-end in-tree; dialing a real board, probe, or
-  `qemu-system` guest is unproven until run against that resource (§5, §6).
+- **HDF-1 / 1b / 2 / 3 / 4 emulator lane validated; real HW still gated.** The
+  transports build and are mock-proven in-tree, and their emulator-in-the-loop
+  lane was run live on 2026-09-27 — RV-1 (big-endian ppc64), RV-2 (qemu-arm
+  gdbstub), RV-3 (`qemu-system-arm` full-system) all passed
+  (`docs/validation/2026-09-27-hil-emu-live-qemu.md`). Still unproven until run
+  against their resource (§5, §6): a real board/probe (`hil_board.rs` /
+  `BHF_HIL_GDB`), proprietary RTOS images, the TCP/serial agent transport, and
+  Renode.
 - **HDF-4 Nyx is retired, not finished.** `nyx_adapter` is scaffolding
   superseded by `FullSystemTransport`; it collects zero coverage and is on no
   live path (CC-2).
@@ -353,7 +369,10 @@ unit-tested against the scripted `MockQmpServer` + `MockGdbStub`
 determinism (same input ⇒ same outcome) holds, and malformed/oversized QMP
 messages and short memory reads are bounded, descriptive errors. All QMP reads
 are capped (`QmpLimits`) against allocation/spin bombs. The live `qemu-system`
-run remains **gated** (emulator + lawful image; unproven until run).
+run was **validated 2026-09-27** against a BHF-authored image (RV-3
+`live_fullsystem`, `qemu-system-arm -M mps2-an385`;
+`docs/validation/2026-09-27-hil-emu-live-qemu.md`); a lawfully-obtained
+proprietary RTOS image remains a gated follow-up.
 
 *Deliverable 2 (Renode)* is a documented follow-up (see the `fullsystem` module
 docs): a Renode `.resc` board exposes a GDB server, so the same `GdbClient` +
@@ -574,11 +593,13 @@ See §1a for the full per-track delivered-status table.
 
 - **Hardware/emulator/toolchain dependence.** HDF-1 (probe/agent), HDF-3
   (PPC/MIPS/SPARC toolchains + emulators), and HDF-4 (qemu-system/Renode/images)
-  have validation steps this repository cannot run without external resources.
-  The software is built and tested behind mocks in-tree; those gated steps are
-  recorded as **unproven** until run in an environment that has the resource.
-  Completion of a track's *software* is not a claim of validated on-target
-  capability.
+  have validation steps that need external resources. The emulator/cross-toolchain
+  steps were run on 2026-09-27 (QEMU 8.2.2 + `arm-none-eabi` / `powerpc64` /
+  `armhf` cross gcc) and passed — RV-1/RV-2/RV-3
+  (`docs/validation/2026-09-27-hil-emu-live-qemu.md`). Still unproven until run
+  against their resource: a real board (`hil_board.rs` / `BHF_HIL_GDB`), the
+  TCP/serial agent transport, proprietary RTOS images, and Renode. Completion of
+  a track's *software* is not a claim of validated on-target capability.
 - **Proprietary RTOS fidelity.** BHF's vendor-API models are scaffolding; they
   make code build and fuzz on the host, they do not reproduce Wind River /
   Green Hills runtime semantics. HDF-4 (real images under emulation) is the only

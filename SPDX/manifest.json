@@ -3887,6 +3887,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "docs/site/on-target-fuzzing.md",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "docs/site/release-checklist.md",
       "license": "Apache-2.0"
     },
@@ -4020,6 +4024,10 @@
     },
     {
       "path": "docs/validation/2026-09-24-docker-sweep.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/validation/2026-09-27-hil-emu-live-qemu.md",
       "license": "Apache-2.0"
     },
     {

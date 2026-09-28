@@ -54,6 +54,7 @@ PAGES = [
     Page("fake-corba", "fake-corba.md", "Fake-CORBA"),
     Page("fake-resource-sdk", "fake-resource-sdk.md", "Fake Resource SDK"),
     Page("cross-compilation", "cross-compilation.md", "Cross-Compilation"),
+    Page("on-target-fuzzing", "on-target-fuzzing.md", "On-Target & Embedded"),
     Page("windows", "windows.md", "Windows"),
     Page("daemon", "daemon.md", "Daemon"),
     Page("licensing", "licensing.md", "Licensing"),
