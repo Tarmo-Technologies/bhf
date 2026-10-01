@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
 pub const BINARY_SCHEMA_VERSION: &str = "bhf.binary.v1";
@@ -434,7 +434,7 @@ fn scan_disk_file(
     };
 
     scan_bytes(
-        options, path, path_label, &bytes, None, None, cve_db, binaries, skipped, containers,
+        options, path, path_label, &bytes, None, None, 0, cve_db, binaries, skipped, containers,
     );
     Ok(())
 }
@@ -447,12 +447,30 @@ fn scan_bytes(
     bytes: &[u8],
     container_path: Option<String>,
     member_name: Option<String>,
+    depth: usize,
     cve_db: &CveDatabase,
     binaries: &mut Vec<BinaryRecord>,
     skipped: &mut Vec<SkippedBinary>,
     containers: &mut Vec<ContainerRecord>,
 ) {
-    if container_path.is_none() && is_ar_archive(bytes) {
+    // Bound nested-container recursion so a crafted archive (e.g. a tarball that
+    // decompresses to another container) cannot drive unbounded recursion.
+    if depth >= MAX_CONTAINER_DEPTH
+        && (is_ar_archive(bytes) || detect_compression(bytes).is_some() || is_tar_archive(bytes))
+    {
+        skipped.push(skipped_binary(
+            &path_label,
+            "max_container_depth",
+            "nested container exceeds maximum traversal depth",
+            Some(bytes.len() as u64),
+            Some(sha256_hex(bytes)),
+        ));
+        return;
+    }
+
+    // `ar` archives: Debian `.deb` packages and static `.a` libraries. Handled
+    // at any depth so a static library nested inside a tarball is also traversed.
+    if is_ar_archive(bytes) {
         match parse_ar_archive(bytes) {
             Ok(members) => {
                 containers.push(ContainerRecord {
@@ -481,6 +499,7 @@ fn scan_bytes(
                         &member.data,
                         Some(path_label.clone()),
                         Some(member.name),
+                        depth + 1,
                         cve_db,
                         binaries,
                         skipped,
@@ -496,6 +515,56 @@ fn scan_bytes(
                 Some(sha256_hex(bytes)),
             )),
         }
+        return;
+    }
+
+    // Compressed streams (gzip/xz/zstd): a `.deb`'s `data.tar.*` member is
+    // compressed. Decompress under a size cap, then rescan the payload under the
+    // same label so an inner tar — or a bare compressed binary — is traversed.
+    if let Some(compression) = detect_compression(bytes) {
+        let cap = options.max_bytes.unwrap_or(DEFAULT_DECOMPRESS_CAP);
+        match decompress(compression, bytes, cap) {
+            Ok(inner) => scan_bytes(
+                options,
+                physical_path,
+                path_label,
+                &inner,
+                container_path,
+                member_name,
+                depth + 1,
+                cve_db,
+                binaries,
+                skipped,
+                containers,
+            ),
+            Err(error) => skipped.push(skipped_binary(
+                &path_label,
+                "decompress_failed",
+                &format!(
+                    "{} stream could not be decompressed: {error}",
+                    compression.label()
+                ),
+                Some(bytes.len() as u64),
+                Some(sha256_hex(bytes)),
+            )),
+        }
+        return;
+    }
+
+    // tar archives: the decompressed `data.tar`/`control.tar` of a `.deb`, or a
+    // plain tarball. Inventory each regular-file member.
+    if is_tar_archive(bytes) {
+        scan_tar(
+            options,
+            physical_path,
+            path_label,
+            bytes,
+            depth,
+            cve_db,
+            binaries,
+            skipped,
+            containers,
+        );
         return;
     }
 
@@ -3392,6 +3461,225 @@ fn parse_ar_archive(bytes: &[u8]) -> Result<Vec<ArchiveMember>, String> {
     Ok(members)
 }
 
+/// Maximum nested-container depth (`.deb` → `data.tar.*` → tar → … ) traversed
+/// before a member is recorded as skipped, guarding against crafted recursion.
+const MAX_CONTAINER_DEPTH: usize = 16;
+
+/// Hard ceiling on a single decompressed stream when the scan has no explicit
+/// `max_bytes`, bounding memory against decompression bombs (1 GiB).
+const DEFAULT_DECOMPRESS_CAP: u64 = 1 << 30;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Compression {
+    Gzip,
+    Xz,
+    Zstd,
+}
+
+impl Compression {
+    fn label(self) -> &'static str {
+        match self {
+            Compression::Gzip => "gzip",
+            Compression::Xz => "xz",
+            Compression::Zstd => "zstd",
+        }
+    }
+}
+
+/// Detect a supported compression wrapper by magic bytes.
+fn detect_compression(bytes: &[u8]) -> Option<Compression> {
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        Some(Compression::Gzip)
+    } else if bytes.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) {
+        Some(Compression::Xz)
+    } else if bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        Some(Compression::Zstd)
+    } else {
+        None
+    }
+}
+
+/// POSIX `ustar`, PAX, and GNU tar archives all carry the `ustar` magic at
+/// offset 257 of the first header block.
+fn is_tar_archive(bytes: &[u8]) -> bool {
+    bytes.len() >= 263 && &bytes[257..262] == b"ustar"
+}
+
+/// A `Write` sink that collects output until `cap` bytes, then errors — bounding
+/// memory use when decompressing untrusted input.
+struct CappedBuffer {
+    buf: Vec<u8>,
+    cap: u64,
+}
+
+impl CappedBuffer {
+    fn new(cap: u64) -> Self {
+        Self {
+            buf: Vec::new(),
+            cap,
+        }
+    }
+}
+
+impl Write for CappedBuffer {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.buf.len() as u64 + data.len() as u64 > self.cap {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "decompressed output exceeds size cap",
+            ));
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Decompress a gzip/xz/zstd stream into a size-capped buffer.
+fn decompress(kind: Compression, bytes: &[u8], cap: u64) -> Result<Vec<u8>, String> {
+    let mut sink = CappedBuffer::new(cap);
+    match kind {
+        Compression::Gzip => {
+            let mut decoder = flate2::read::MultiGzDecoder::new(bytes);
+            copy_capped(&mut decoder, &mut sink)?;
+        }
+        Compression::Zstd => {
+            let mut decoder = ruzstd::decoding::StreamingDecoder::new(bytes)
+                .map_err(|error| error.to_string())?;
+            copy_capped(&mut decoder, &mut sink)?;
+        }
+        Compression::Xz => {
+            let mut reader = std::io::BufReader::new(bytes);
+            lzma_rs::xz_decompress(&mut reader, &mut sink).map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(sink.buf)
+}
+
+/// Stream `reader` into the capped `sink`, surfacing the cap breach as an error.
+fn copy_capped<R: Read>(reader: &mut R, sink: &mut CappedBuffer) -> Result<(), String> {
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => return Ok(()),
+            Ok(read) => sink
+                .write_all(&chunk[..read])
+                .map_err(|error| error.to_string())?,
+            Err(ref error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+}
+
+/// Strip the leading `./` that `dpkg-deb` writes on every `data.tar` entry.
+fn normalize_tar_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    text.strip_prefix("./").unwrap_or(&text).to_owned()
+}
+
+/// Inventory each regular-file member of a tar archive, recursing so an ELF
+/// inside a `.deb`'s `data.tar` is recorded with nested-container provenance.
+#[allow(clippy::too_many_arguments)]
+fn scan_tar(
+    options: &BinaryScanOptions,
+    physical_path: &Path,
+    path_label: String,
+    bytes: &[u8],
+    depth: usize,
+    cve_db: &CveDatabase,
+    binaries: &mut Vec<BinaryRecord>,
+    skipped: &mut Vec<SkippedBinary>,
+    containers: &mut Vec<ContainerRecord>,
+) {
+    let mut archive = tar::Archive::new(bytes);
+    let entries = match archive.entries() {
+        Ok(entries) => entries,
+        Err(error) => {
+            skipped.push(skipped_binary(
+                &path_label,
+                "malformed_archive",
+                &format!("tar archive could not be read: {error}"),
+                Some(bytes.len() as u64),
+                Some(sha256_hex(bytes)),
+            ));
+            return;
+        }
+    };
+
+    let mut members = 0usize;
+    for entry in entries {
+        let mut entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                // The reader offset is unreliable after a member error; stop here.
+                skipped.push(skipped_binary(
+                    &path_label,
+                    "malformed_archive",
+                    &format!("tar member could not be read: {error}"),
+                    None,
+                    None,
+                ));
+                break;
+            }
+        };
+        members += 1;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let name = entry
+            .path()
+            .map(|path| normalize_tar_path(&path))
+            .unwrap_or_else(|_| "<non-utf8>".to_owned());
+        let member_path = format!("{path_label}!{name}");
+        let size = entry.size();
+        if size_exceeds(options.max_bytes, size) {
+            skipped.push(skipped_binary(
+                &member_path,
+                "size_limit",
+                "archive member exceeds configured maximum byte size",
+                Some(size),
+                None,
+            ));
+            continue;
+        }
+        let mut data = Vec::new();
+        if let Err(error) = entry.read_to_end(&mut data) {
+            skipped.push(skipped_binary(
+                &member_path,
+                "malformed_archive",
+                &format!("tar member body could not be read: {error}"),
+                Some(size),
+                None,
+            ));
+            continue;
+        }
+        scan_bytes(
+            options,
+            physical_path,
+            member_path,
+            &data,
+            Some(path_label.clone()),
+            Some(name),
+            depth + 1,
+            cve_db,
+            binaries,
+            skipped,
+            containers,
+        );
+    }
+
+    containers.push(ContainerRecord {
+        path: path_label,
+        format: "tar".to_owned(),
+        members,
+        bytes: bytes.len() as u64,
+        sha256: sha256_hex(bytes),
+    });
+}
+
 fn firmware_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -3527,4 +3815,215 @@ fn bytes_to_lower_hex(bytes: &[u8]) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect::<Vec<_>>()
         .join("")
+}
+
+#[cfg(test)]
+mod deb_scan_tests {
+    //! Regression tests for issue #43: `bhf binary scan` must recurse through a
+    //! Debian `.deb`'s compressed `data.tar.*` member and inventory the ELF
+    //! inside it, retaining nested-container provenance. Fixtures are built in
+    //! pure Rust (same decoder crates, encode side) so the tests need no system
+    //! `dpkg-deb`/`tar` and run identically on every CI target.
+
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[derive(Clone, Copy)]
+    enum Codec {
+        None,
+        Gzip,
+        Xz,
+        Zstd,
+    }
+
+    fn temp_root(tag: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nonce = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "bhf-deb-scan-{tag}-{}-{nanos}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A minimal but well-formed 64-bit little-endian x86-64 ELF header.
+    fn minimal_elf64() -> Vec<u8> {
+        let mut elf = vec![0u8; 64];
+        elf[0..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2; // ELFCLASS64
+        elf[5] = 1; // ELFDATA2LSB (little-endian)
+        elf[6] = 1; // EV_CURRENT
+        elf[16] = 2; // e_type = ET_EXEC
+        elf[18] = 0x3e; // e_machine = EM_X86_64 (0x003e LE)
+        elf
+    }
+
+    /// Build a `data.tar` carrying one ELF at `./usr/bin/bhf-deb-repro`.
+    fn build_data_tar(elf: &[u8]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_path("./usr/bin/bhf-deb-repro").unwrap();
+        header.set_size(elf.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        builder.append(&header, elf).unwrap();
+        builder.into_inner().unwrap()
+    }
+
+    fn compress(codec: Codec, data: &[u8]) -> Vec<u8> {
+        match codec {
+            Codec::None => data.to_vec(),
+            Codec::Gzip => {
+                let mut encoder =
+                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                encoder.write_all(data).unwrap();
+                encoder.finish().unwrap()
+            }
+            Codec::Xz => {
+                let mut out = Vec::new();
+                lzma_rs::xz_compress(&mut std::io::BufReader::new(data), &mut out).unwrap();
+                out
+            }
+            Codec::Zstd => {
+                ruzstd::encoding::compress_to_vec(data, ruzstd::encoding::CompressionLevel::Fastest)
+            }
+        }
+    }
+
+    fn ar_member_header(name: &str, size: usize) -> Vec<u8> {
+        let mut header = vec![b' '; 60];
+        let name_field = format!("{name}/"); // GNU short-name terminator
+        header[0..name_field.len()].copy_from_slice(name_field.as_bytes());
+        header[16] = b'0'; // mtime
+        header[28] = b'0'; // uid
+        header[34] = b'0'; // gid
+        header[40..46].copy_from_slice(b"100644"); // mode
+        let size_text = size.to_string();
+        header[48..48 + size_text.len()].copy_from_slice(size_text.as_bytes());
+        header[58] = b'`';
+        header[59] = b'\n';
+        header
+    }
+
+    /// Assemble a `.deb` (an `ar` archive of `debian-binary`, an empty
+    /// `control.tar`, and the compressed `data` member).
+    fn build_deb(data_member: &str, data_bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"!<arch>\n");
+        let members: [(&str, Vec<u8>); 3] = [
+            ("debian-binary", b"2.0\n".to_vec()),
+            ("control.tar", Vec::new()),
+            (data_member, data_bytes.to_vec()),
+        ];
+        for (name, data) in members {
+            out.extend_from_slice(&ar_member_header(name, data.len()));
+            out.extend_from_slice(&data);
+            if data.len() % 2 == 1 {
+                out.push(b'\n'); // ar members are 2-byte aligned
+            }
+        }
+        out
+    }
+
+    fn run_case(codec: Codec, data_member: &str) {
+        let tar = build_data_tar(&minimal_elf64());
+        let deb = build_deb(data_member, &compress(codec, &tar));
+
+        let root = temp_root(&data_member.replace('.', "_"));
+        fs::write(root.join("pkg.deb"), &deb).unwrap();
+        let options = BinaryScanOptions {
+            root: root.clone(),
+            out_dir: root.join("out"),
+            max_bytes: None,
+            cve_db_path: None,
+        };
+
+        let report = scan(&options).unwrap();
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(
+            report.counts.files, 1,
+            "member {data_member}: expected one inventoried ELF, got {:?}",
+            report.binaries
+        );
+        let binary = &report.binaries[0];
+        assert_eq!(binary.format, "elf", "member {data_member}");
+        assert_eq!(binary.architecture, "x86_64", "member {data_member}");
+        assert!(
+            binary.path.contains(data_member) && binary.path.contains("usr/bin/bhf-deb-repro"),
+            "member {data_member}: nested provenance missing in path `{}`",
+            binary.path
+        );
+        assert_eq!(
+            binary.member_name.as_deref(),
+            Some("usr/bin/bhf-deb-repro"),
+            "member {data_member}"
+        );
+        let formats: Vec<&str> = report
+            .containers
+            .iter()
+            .map(|container| container.format.as_str())
+            .collect();
+        assert!(
+            formats.contains(&"ar") && formats.contains(&"tar"),
+            "member {data_member}: expected ar+tar containers, got {formats:?}"
+        );
+    }
+
+    #[test]
+    fn binary_scan_recurses_into_uncompressed_deb_data_tar() {
+        run_case(Codec::None, "data.tar");
+    }
+
+    #[test]
+    fn binary_scan_recurses_into_gzip_deb_data_tar() {
+        run_case(Codec::Gzip, "data.tar.gz");
+    }
+
+    #[test]
+    fn binary_scan_recurses_into_xz_deb_data_tar() {
+        run_case(Codec::Xz, "data.tar.xz");
+    }
+
+    #[test]
+    fn binary_scan_recurses_into_zstd_deb_data_tar() {
+        run_case(Codec::Zstd, "data.tar.zst");
+    }
+
+    #[test]
+    fn binary_scan_caps_decompression_bomb() {
+        // 2 MiB of zeros compresses to a tiny gzip stream; with a 64 KiB cap the
+        // decompression must fail closed (skipped), never inventory a binary.
+        let payload = vec![0u8; 2 * 1024 * 1024];
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&payload).unwrap();
+        let gz = encoder.finish().unwrap();
+
+        let root = temp_root("bomb");
+        fs::write(root.join("payload.gz"), &gz).unwrap();
+        let options = BinaryScanOptions {
+            root: root.clone(),
+            out_dir: root.join("out"),
+            max_bytes: Some(64 * 1024),
+            cve_db_path: None,
+        };
+
+        let report = scan(&options).unwrap();
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(report.counts.files, 0, "bomb must not be inventoried");
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|entry| entry.reason == "decompress_failed"),
+            "expected a decompress_failed skip, got {:?}",
+            report.skipped
+        );
+    }
 }

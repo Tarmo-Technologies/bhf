@@ -136,3 +136,14 @@ tree-sitter-perl = "1.1.2"
 tree-sitter-go = "0.25.0"
 cc = "1"
 which = "8"
+# Container decoders for `bhf binary scan` DEB/tarball recursion (issue #43).
+# All four are pure-Rust (no `-sys`/C libs) so the RHEL 7, Windows MSVC, and
+# cross matrices stay green. Licenses are strict-permissive clean:
+#   tar      MIT OR Apache-2.0
+#   flate2   MIT OR Apache-2.0 (rust_backend/miniz_oxide only — no libz-sys)
+#   lzma-rs  MIT
+#   ruzstd   MIT
+tar = "0.4"
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+lzma-rs = "0.3"
+ruzstd = "0.9"
