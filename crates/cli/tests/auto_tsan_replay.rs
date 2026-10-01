@@ -267,6 +267,8 @@ fn tsan_replay_writes_bhf556_for_target_source_data_race() {
         json.contains("BHF-556"),
         "finding must carry BHF-556:\n{json}"
     );
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed["finding_kind"], "runtime");
     assert!(
         json.contains("CWE-362"),
         "finding must carry CWE-362:\n{json}"

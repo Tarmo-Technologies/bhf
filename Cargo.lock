@@ -561,6 +561,7 @@ name = "corpus"
 version = "0.2.34"
 dependencies = [
  "actionability",
+ "chrono",
  "event_log",
  "finding_rules",
  "report",

@@ -169,7 +169,8 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
             fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
             fs::write(dir.join("testcase.bin"), seed)
                 .with_context(|| format!("write {}", dir.join("testcase.bin").display()))?;
-            let finding = render_finding(&id, &args, seed, &env, &run)?;
+            let mut finding = render_finding(&id, &args, seed, &env, &run)?;
+            corpus::finding::stamp_v1(&mut finding, corpus::finding::finding_kind::BINARY);
             fs::write(
                 dir.join("finding.json"),
                 serde_json::to_vec_pretty(&finding)?,
@@ -479,7 +480,8 @@ fn run_afl_qemu(
             let dir = findings_dir.join(&id);
             fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
             fs::write(dir.join("testcase.bin"), &input)?;
-            let finding = render_finding(&id, args, &input, env, &run)?;
+            let mut finding = render_finding(&id, args, &input, env, &run)?;
+            corpus::finding::stamp_v1(&mut finding, corpus::finding::finding_kind::BINARY);
             fs::write(
                 dir.join("finding.json"),
                 serde_json::to_vec_pretty(&finding)?,
@@ -824,6 +826,11 @@ fn update_binary_finding_minimized(
         "removed_bytes": removed_bytes,
         "reduced": removed_bytes > 0
     });
+    corpus::finding::append_history(
+        &mut value,
+        "minimize",
+        &["paths.minimized", "minimal_reproducer", "minimization"],
+    );
     fs::write(&path, serde_json::to_vec_pretty(&value)?)?;
     Ok(())
 }

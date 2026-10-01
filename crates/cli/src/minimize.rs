@@ -374,6 +374,11 @@ fn update_finding_record(finding_dir: &Path, result: &MinimizeOutput) -> anyhow:
     object.insert("minimal_reproducer".to_owned(), json!("min_testcase.bin"));
     object.insert("minimization".to_owned(), result.metadata.clone());
 
+    corpus::finding::append_history(
+        &mut value,
+        "minimize",
+        &["paths.minimized", "minimal_reproducer", "minimization"],
+    );
     fs::write(&path, serde_json::to_vec_pretty(&value)?)
         .with_context(|| format!("write {}", path.display()))?;
     Ok(())

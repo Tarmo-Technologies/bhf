@@ -340,7 +340,7 @@ fn write_finding(
     let finding_dir = findings_root.join(&id);
     fs::create_dir_all(&finding_dir)?;
     fs::write(finding_dir.join("testcase.bin"), input_bytes)?;
-    let record = json!({
+    let mut record = json!({
         "id": id,
         "signature": signature_hex,
         "rule_id": "BHF-301",
@@ -371,6 +371,7 @@ fn write_finding(
             "finding": "finding.json",
         },
     });
+    corpus::finding::stamp_v1(&mut record, corpus::finding::finding_kind::DIFFERENTIAL);
     fs::write(
         finding_dir.join("finding.json"),
         serde_json::to_vec_pretty(&record)?,
@@ -406,7 +407,7 @@ fn write_metamorphic_finding(
         finding_dir.join("testcase_transformed.bin"),
         transformed_bytes,
     )?;
-    let record = json!({
+    let mut record = json!({
         "id": id,
         "signature": signature_hex,
         "rule_id": "BHF-307",
@@ -438,6 +439,7 @@ fn write_metamorphic_finding(
             "finding": "finding.json",
         },
     });
+    corpus::finding::stamp_v1(&mut record, corpus::finding::finding_kind::DIFFERENTIAL);
     fs::write(
         finding_dir.join("finding.json"),
         serde_json::to_vec_pretty(&record)?,

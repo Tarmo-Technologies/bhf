@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Tarmo-Technologies/bhf/schemas/bhf.finding.v1.schema.json",
+  "title": "bhf.finding.v1",
+  "description": "Envelope every <work>/results/findings/<id>/finding.json carries. Producer-specific fields are open; bhf.findings.v1 is the normalized view.",
+  "type": "object",
+  "required": ["schema_version", "id", "finding_kind", "created_at"],
+  "properties": {
+    "schema_version": { "const": "bhf.finding.v1" },
+    "id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+    "finding_kind": { "$ref": "bhf.findings.v1.schema.json#/$defs/kind" },
+    "created_at": { "type": "string", "format": "date-time" },
+    "last_seen": { "type": "string", "format": "date-time" },
+    "forced": { "type": "boolean" },
+    "forced_note": { "type": "string" },
+    "history": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["at", "command", "fields"],
+        "properties": {
+          "at": { "type": "string", "format": "date-time" },
+          "command": { "type": "string" },
+          "fields": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    }
+  }
+}

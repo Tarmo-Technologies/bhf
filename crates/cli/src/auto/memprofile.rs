@@ -213,7 +213,7 @@ fn write_mem_finding(
     // Persist the reproducer so `auto` can minimize / attest it.
     let repro = dir.join("testcase.bin");
     let _ = std::fs::copy(&sample.input, &repro);
-    let record = json!({
+    let mut record = json!({
         "id": id,
         "rule_id": "BHF-558",
         "severity": "high",
@@ -236,6 +236,7 @@ fn write_mem_finding(
         "analysis": { "engine": "bhf.dynamic.memprofile.replay" },
         "actionability": { "cwe": ["CWE-400"], "verdict": "likely_reachable", "confidence": "high" },
     });
+    corpus::finding::stamp_v1(&mut record, corpus::finding::finding_kind::RUNTIME);
     std::fs::write(
         dir.join("finding.json"),
         serde_json::to_vec_pretty(&record).unwrap_or_default(),

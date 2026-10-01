@@ -425,7 +425,7 @@ fn write_capability_finding(
         "Attacker input can make {name} {} — this capability is exercised by the fuzz corpus but by no baseline input, so it is input-triggered attack surface.{taint_note}",
         human_kind(kind)
     );
-    let record = json!({
+    let mut record = json!({
         "id": id,
         "rule_id": "BHF-668",
         "classification": "capability",
@@ -449,6 +449,7 @@ fn write_capability_finding(
             "confidence": if tainted { "high" } else { "medium" }
         },
     });
+    corpus::finding::stamp_v1(&mut record, corpus::finding::finding_kind::RUNTIME);
     std::fs::write(
         dir.join("finding.json"),
         serde_json::to_vec_pretty(&record).unwrap_or_default(),

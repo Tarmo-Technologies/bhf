@@ -96,7 +96,7 @@ fn write_sink_finding(
     let cluster_key_full = hex(&Sha256::digest(
         format!("{rule_id}:{harness_id}").as_bytes(),
     ));
-    let record = json!({
+    let mut record = json!({
         "id": id,
         "rule_id": rule_id,
         "confirmation": "fuzz_confirmed",
@@ -111,6 +111,7 @@ fn write_sink_finding(
         "analysis": { "engine": "bhf.dynamic.jvm.sink" },
         "actionability": { "cwe": [cwe], "verdict": "likely_reachable", "confidence": "high" },
     });
+    corpus::finding::stamp_v1(&mut record, corpus::finding::finding_kind::RUNTIME);
     std::fs::write(
         dir.join("finding.json"),
         serde_json::to_vec_pretty(&record).unwrap_or_default(),

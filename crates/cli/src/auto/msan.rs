@@ -169,7 +169,7 @@ fn write_msan_finding(work: &Path, id: &str, harness_id: &str, file: &str, line:
     // One issue per distinct uninitialized-read site (rule + file:line), as a stable
     // 64-hex cluster key so the report collapses repeat inputs into one row.
     let cluster_key_full = hex(&Sha256::digest(format!("BHF-212:{file}:{line}").as_bytes()));
-    let record = json!({
+    let mut record = json!({
         "id": id,
         "rule_id": "BHF-212",
         "classification": "unhandled",
@@ -186,6 +186,7 @@ fn write_msan_finding(work: &Path, id: &str, harness_id: &str, file: &str, line:
         "analysis": { "engine": "bhf.dynamic.msan.replay" },
         "actionability": { "cwe": ["CWE-457"], "verdict": "likely_reachable", "confidence": "high" },
     });
+    corpus::finding::stamp_v1(&mut record, corpus::finding::finding_kind::RUNTIME);
     std::fs::write(
         dir.join("finding.json"),
         serde_json::to_vec_pretty(&record).unwrap_or_default(),

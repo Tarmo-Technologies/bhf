@@ -86,7 +86,7 @@ fn write_static_findings(candidate: &Candidate, findings_root: &Path) -> Option<
             .unwrap_or(source)
             .to_string_lossy()
             .into_owned();
-        let record = static_finding_record(
+        let mut record = static_finding_record(
             &id,
             &candidate.harness_id,
             &candidate.name,
@@ -94,6 +94,7 @@ fn write_static_findings(candidate: &Candidate, findings_root: &Path) -> Option<
             candidate.dialect.map(|d| d.as_str()),
             f,
         );
+        corpus::finding::stamp_v1(&mut record, corpus::finding::finding_kind::STATIC);
         if std::fs::write(
             dir.join("finding.json"),
             serde_json::to_vec_pretty(&record).ok()?,
@@ -263,8 +264,9 @@ pub fn emit_tree_static_findings(root: &Path, work: &Path) -> usize {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "static-scan".to_owned());
         let full_source_path = absolute_reported_path(root, &f.location.path);
-        let record =
+        let mut record =
             static_finding_record(&id, "static-scan", &target_name, &full_source_path, None, f);
+        corpus::finding::stamp_v1(&mut record, corpus::finding::finding_kind::STATIC);
         if std::fs::write(
             dir.join("finding.json"),
             serde_json::to_vec_pretty(&record).unwrap_or_default(),

@@ -118,6 +118,7 @@ fn divergent_harnesses_emit_findings_and_nonzero_exit() {
             .unwrap();
     assert_eq!(finding_json["rule_id"], "BHF-301");
     assert_eq!(finding_json["classification"], "divergence");
+    assert_eq!(finding_json["finding_kind"], "differential");
     assert_eq!(
         finding_json["oracle"]["name"],
         "differential-output-runtime"
@@ -173,6 +174,7 @@ fn metamorphic_transform_emits_oracle_finding() {
             .unwrap();
     assert_eq!(finding_json["rule_id"], "BHF-307");
     assert_eq!(finding_json["classification"], "metamorphic_violation");
+    assert_eq!(finding_json["finding_kind"], "differential");
     assert_eq!(
         finding_json["oracle"]["name"],
         "metamorphic-relation-runtime"

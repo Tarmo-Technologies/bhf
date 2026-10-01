@@ -3,7 +3,10 @@
 //! normalization from every producer, the renderers, and the rebuild that
 //! keeps the derived index in sync with the evidence on disk.
 
+pub mod confirmation;
 pub mod migrate;
+pub mod model;
+pub mod severity;
 
 pub use corpus::layout;
 

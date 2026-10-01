@@ -3267,11 +3267,23 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/results/src/confirmation.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/results/src/lib.rs",
       "license": "Apache-2.0"
     },
     {
       "path": "crates/results/src/migrate.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/results/src/model.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/results/src/severity.rs",
       "license": "Apache-2.0"
     },
     {

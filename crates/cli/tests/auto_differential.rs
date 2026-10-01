@@ -96,6 +96,7 @@ fn auto_differential_flags_cross_compiler_divergence() {
     );
     // The finding names both compilers and preserves the reproducing input.
     let f = diff[0];
+    assert_eq!(f["finding_kind"], "differential");
     assert_eq!(f["differential"]["compiler_a"], "clang");
     assert_eq!(f["differential"]["compiler_b"], "gcc");
 }

@@ -90,6 +90,8 @@ fn mem_profile_flags_amplified_allocation_input() {
         json.contains("BHF-558"),
         "finding must carry BHF-558:\n{json}"
     );
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed["finding_kind"], "runtime");
     assert!(
         json.contains("CWE-400"),
         "finding must carry CWE-400:\n{json}"

@@ -8734,6 +8734,11 @@ fn stamp_runtime_mode(
         )
     })?;
     obj.insert("actionability".to_owned(), recomputed);
+    corpus::finding::append_history(
+        &mut value,
+        "auto",
+        &["runtime_mode", "input_reachability", "actionability"],
+    );
     let pretty = serde_json::to_vec_pretty(&value)?;
     std::fs::write(finding_path, pretty)
 }
@@ -9811,6 +9816,8 @@ mod stamp_tests {
             parsed["runtime_mode"]["env_injected"]["ACME_HOME"],
             "/tmp/bhf/fake_env/ACME_HOME"
         );
+        assert_eq!(parsed["history"][0]["command"], "auto");
+        assert_eq!(parsed["history"][0]["fields"][0], "runtime_mode");
         // Pre-existing fields untouched.
         assert_eq!(parsed["id"], "F-0001-abc");
         assert_eq!(parsed["exception"]["name"], "ASAN_HEAP_BUFFER_OVERFLOW");

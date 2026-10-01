@@ -66,6 +66,13 @@ fn static_flag_runs_tree_scan_and_merges_findings() {
         serde_json::from_slice(&std::fs::read(&first).expect("read finding.json"))
             .expect("parse finding.json");
     assert_eq!(record["classification"].as_str(), Some("static_scan"));
+    assert_eq!(record["finding_kind"], "static");
+    // The v1 envelope's birth timestamp is valid RFC 3339.
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(record["created_at"].as_str().unwrap()).is_ok(),
+        "created_at must be RFC 3339: {}",
+        record["created_at"]
+    );
     assert!(
         record["actionability"]["cwe"]
             .as_array()

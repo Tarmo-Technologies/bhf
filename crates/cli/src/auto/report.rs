@@ -355,6 +355,10 @@ fn annotate_findings_with_fidelity(
         let Ok(mut raw) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
             continue;
         };
+        // Snapshot before mutating: results/ is preserved across runs and resumes,
+        // so re-running must not append a redundant history entry or rewrite a file
+        // whose fidelity block is already correct.
+        let before = raw.clone();
         let Some(obj) = raw.as_object_mut() else {
             continue;
         };
@@ -383,8 +387,91 @@ fn annotate_findings_with_fidelity(
                 obj.remove("fidelity_caveat");
             }
         }
-        if let Ok(serialized) = serde_json::to_vec_pretty(&raw) {
-            let _ = std::fs::write(&path, serialized);
+        if raw == before {
+            continue;
+        }
+        corpus::finding::append_history(&mut raw, "auto", &["fidelity", "fidelity_caveat"]);
+        match serde_json::to_vec_pretty(&raw) {
+            Ok(serialized) => {
+                if let Err(error) = atomic_write(&path, &serialized) {
+                    bhfeprintln!(
+                        "warning: failed to annotate fidelity on {}: {error}",
+                        path.display()
+                    );
+                }
+            }
+            Err(error) => {
+                bhfeprintln!(
+                    "warning: failed to serialize fidelity for {}: {error}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+/// force-fuzz Phase 2, persisted: findings from a forced-and-stub-heavy target
+/// carry `forced: true` + the caveat on disk, so every renderer (and importer)
+/// floors them the same way instead of only the in-memory CSV path. The note is
+/// the single shared [`confidence_model::FORCED_STUB_NOTE`].
+///
+/// `forced` is a fact fixed at the finding's birth (it was produced by a forced,
+/// stub-heavy build). A later non-forced run never clears it: this pass only ever
+/// sets it, and only for the harnesses in `forced_harness_ids`.
+fn annotate_forced_findings(
+    work_dir: &Path,
+    forced_harness_ids: &std::collections::BTreeSet<String>,
+) {
+    if forced_harness_ids.is_empty() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(corpus::layout::findings_dir(work_dir)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path().join("finding.json");
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(mut raw) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        let harness = raw
+            .get("harness_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if !forced_harness_ids.contains(harness) {
+            continue;
+        }
+        // results/ is preserved across runs; skip an already-flagged record so a
+        // re-run neither appends a redundant history entry nor rewrites the file.
+        let before = raw.clone();
+        if let Some(obj) = raw.as_object_mut() {
+            obj.insert("forced".to_owned(), serde_json::Value::Bool(true));
+            obj.insert(
+                "forced_note".to_owned(),
+                serde_json::json!(confidence_model::FORCED_STUB_NOTE),
+            );
+        }
+        if raw == before {
+            continue;
+        }
+        corpus::finding::append_history(&mut raw, "auto", &["forced", "forced_note"]);
+        match serde_json::to_vec_pretty(&raw) {
+            Ok(serialized) => {
+                if let Err(error) = atomic_write(&path, &serialized) {
+                    bhfeprintln!(
+                        "warning: failed to annotate forced floor on {}: {error}",
+                        path.display()
+                    );
+                }
+            }
+            Err(error) => {
+                bhfeprintln!(
+                    "warning: failed to serialize forced floor for {}: {error}",
+                    path.display()
+                );
+            }
         }
     }
 }
@@ -1112,6 +1199,10 @@ pub fn write_reports_with_output_limit(
 
     // CC-1: stamp every finding.json with its target's structured fidelity block.
     annotate_findings_with_fidelity(work_dir, results, &target_fidelities);
+    // force-fuzz Phase 2: persist the forced floor onto each forced target's
+    // findings so every renderer and importer floors them the same way the CSV
+    // path does in memory.
+    annotate_forced_findings(work_dir, &forced_harness_ids);
 
     let run_json = RunJson {
         schema_version: 1,
@@ -3877,6 +3968,72 @@ mod tests {
     use crate::auto::dep_manifest::DepKind;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn annotate_forced_findings_floors_only_forced_harnesses() {
+        let work = tempfile::tempdir().unwrap();
+        let findings = corpus::layout::findings_dir(work.path());
+        for (id, harness) in [("F-0001", "H1"), ("F-0002", "H2")] {
+            let dir = findings.join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("finding.json"),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "id": id,
+                    "harness_id": harness,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        let forced: std::collections::BTreeSet<String> = ["H1".to_owned()].into_iter().collect();
+        annotate_forced_findings(work.path(), &forced);
+        // Second run (results/ is preserved): must not append a second history entry.
+        annotate_forced_findings(work.path(), &forced);
+
+        let read = |id: &str| -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(findings.join(id).join("finding.json")).unwrap())
+                .unwrap()
+        };
+        let forced_record = read("F-0001");
+        assert_eq!(forced_record["forced"], serde_json::Value::Bool(true));
+        assert_eq!(
+            forced_record["forced_note"],
+            confidence_model::FORCED_STUB_NOTE
+        );
+        let history = forced_record["history"].as_array().expect("history");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0]["command"], "auto");
+        assert_eq!(history[0]["fields"][0], "forced");
+
+        let unforced_record = read("F-0002");
+        assert!(unforced_record.get("forced").is_none());
+        assert!(unforced_record.get("history").is_none());
+    }
+
+    #[test]
+    fn annotate_findings_with_fidelity_is_idempotent() {
+        let work = tempfile::tempdir().unwrap();
+        let findings = corpus::layout::findings_dir(work.path());
+        let dir = findings.join("F-0001");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("finding.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({ "id": "F-0001", "harness_id": "H1" }))
+                .unwrap(),
+        )
+        .unwrap();
+        // Empty results -> every finding gets the "nothing executed" fidelity record.
+        annotate_findings_with_fidelity(work.path(), &[], &[]);
+        annotate_findings_with_fidelity(work.path(), &[], &[]);
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("finding.json")).unwrap()).unwrap();
+        assert!(raw.get("fidelity").is_some());
+        let history = raw["history"].as_array().expect("history");
+        assert_eq!(history.len(), 1, "fidelity annotation must be idempotent");
+        assert_eq!(history[0]["command"], "auto");
+        assert_eq!(history[0]["fields"][0], "fidelity");
+    }
 
     #[test]
     fn report_paths_are_relative_to_the_source_root() {

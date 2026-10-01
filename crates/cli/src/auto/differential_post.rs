@@ -301,7 +301,7 @@ fn write_finding(
     let cluster_key_full = hex(&Sha256::digest(
         format!("BHF-301:{harness_id}:{exit_a}:{to_a}:{exit_b}:{to_b}").as_bytes(),
     ));
-    let record = json!({
+    let mut record = json!({
         "id": id,
         "rule_id": "BHF-301",
         "classification": "divergence",
@@ -325,6 +325,7 @@ fn write_finding(
         "analysis": { "engine": "bhf.dynamic.differential.replay" },
         "actionability": { "cwe": ["CWE-758"], "verdict": "likely_reachable", "confidence": "medium" },
     });
+    corpus::finding::stamp_v1(&mut record, corpus::finding::finding_kind::DIFFERENTIAL);
     std::fs::write(
         dir.join("finding.json"),
         serde_json::to_vec_pretty(&record).unwrap_or_default(),

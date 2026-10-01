@@ -15,6 +15,57 @@ pub struct FindingEmitter {
     line_maps: crate::line_remap::SourceLineMaps,
 }
 
+/// `finding_kind` values of the `bhf.finding.v1` envelope. `results::model::Kind`
+/// serializes to exactly these strings.
+pub mod finding_kind {
+    pub const FUZZ: &str = "fuzz";
+    pub const RUNTIME: &str = "runtime";
+    pub const STATIC: &str = "static";
+    pub const BINARY: &str = "binary";
+    pub const DIFFERENTIAL: &str = "differential";
+    pub const SCA: &str = "sca";
+}
+
+pub const FINDING_SCHEMA_VERSION: &str = "bhf.finding.v1";
+
+/// Current UTC time as an RFC 3339 string with millisecond precision and a `Z`
+/// suffix. Every finding timestamp uses this one format, so they also order
+/// correctly as plain strings; compare against other formats only after parsing.
+pub fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+/// Stamp a new per-finding record with the `bhf.finding.v1` envelope. Keeps an
+/// existing `created_at` so re-writes never move a finding's birth time.
+pub fn stamp_v1(record: &mut serde_json::Value, kind: &str) {
+    if let Some(obj) = record.as_object_mut() {
+        obj.insert("schema_version".to_owned(), json!(FINDING_SCHEMA_VERSION));
+        obj.insert("finding_kind".to_owned(), json!(kind));
+        obj.entry("created_at")
+            .or_insert_with(|| json!(now_rfc3339()));
+    }
+}
+
+/// Record that `command` rewrote `fields` of this record. Enrichment steps edit
+/// `finding.json` in place; this keeps the edits traceable.
+pub fn append_history(record: &mut serde_json::Value, command: &str, fields: &[&str]) {
+    let Some(obj) = record.as_object_mut() else {
+        return;
+    };
+    let entry = json!({ "at": now_rfc3339(), "command": command, "fields": fields });
+    match obj
+        .get_mut("history")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        Some(history) => history.push(entry),
+        // No `history` yet, or a malformed non-array one: start a fresh array
+        // (a non-array value is replaced rather than preserved).
+        None => {
+            obj.insert("history".to_owned(), json!([entry]));
+        }
+    }
+}
+
 impl FindingEmitter {
     pub fn new(root: PathBuf) -> Self {
         Self {
@@ -152,6 +203,7 @@ impl FindingEmitter {
             Some(&finding_dir.join("finding.json")),
         );
 
+        stamp_v1(&mut record, finding_kind::FUZZ);
         fs::write(
             finding_dir.join("finding.json"),
             serde_json::to_vec_pretty(&record)?,
@@ -270,6 +322,7 @@ impl FindingEmitter {
             Some(&finding_dir.join("finding.json")),
         );
 
+        stamp_v1(&mut record, finding_kind::FUZZ);
         fs::write(
             finding_dir.join("finding.json"),
             serde_json::to_vec_pretty(&record)?,
@@ -345,6 +398,7 @@ impl FindingEmitter {
             &record,
             Some(&finding_dir.join("finding.json")),
         );
+        stamp_v1(&mut record, finding_kind::FUZZ);
         fs::write(
             finding_dir.join("finding.json"),
             serde_json::to_vec_pretty(&record)?,
@@ -525,6 +579,7 @@ fn oracle_exception_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::FindingEmitter;
+    use super::{append_history, finding_kind, stamp_v1};
     use crate::compute_signature;
     use event_log::{HandlerEvent, Testcase};
     use std::fs;
@@ -615,6 +670,7 @@ mod tests {
 
         assert_eq!(value["signature"], expected);
         assert_eq!(value["classification"], "swallowed_predefined");
+        assert_eq!(value["finding_kind"], "fuzz");
         assert_eq!(value["handler"]["handler_line"], 9);
     }
 
@@ -970,6 +1026,7 @@ mod tests {
 
         assert_eq!(value["rule_id"], "BHF-101");
         assert_eq!(value["classification"], "oracle_hit");
+        assert_eq!(value["finding_kind"], "fuzz");
         assert_eq!(value["harness_id"], "H-path");
         assert_eq!(value["oracle"]["name"], "path-traversal-ada");
         assert_eq!(value["oracle"]["category"], "logic-bug");
@@ -1128,5 +1185,50 @@ mod tests {
         assert_eq!(v["cluster_fallback"], true);
         let signature = v["signature"].as_str().unwrap();
         assert_eq!(v["cluster_key"], signature[..16]);
+    }
+
+    #[test]
+    fn new_records_carry_the_v1_envelope() {
+        let root = temp_dir("v1-envelope");
+        let emitter = FindingEmitter::new(root.clone());
+        let report = crate::sanitizer::SanitizerReport {
+            sanitizer: crate::sanitizer::Sanitizer::AddressSanitizer,
+            kind: "heap-buffer-overflow".to_owned(),
+            rule_id: "BHF-201",
+            stack: Vec::new(),
+            message: "heap-buffer-overflow".to_owned(),
+        };
+        let id = emitter.emit_sanitizer_crash(b"in", &report).unwrap();
+        let raw: serde_json::Value = serde_json::from_slice(
+            &fs::read(crate::layout::finding_dir(&root, &id.0).join("finding.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(raw["schema_version"], "bhf.finding.v1");
+        assert_eq!(raw["finding_kind"], "fuzz");
+        let created = raw["created_at"].as_str().unwrap();
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(created).is_ok(),
+            "{created}"
+        );
+    }
+
+    #[test]
+    fn stamp_keeps_an_existing_created_at() {
+        let mut v = serde_json::json!({"id": "x", "created_at": "2020-01-01T00:00:00Z"});
+        stamp_v1(&mut v, finding_kind::STATIC);
+        assert_eq!(v["created_at"], "2020-01-01T00:00:00Z");
+        assert_eq!(v["finding_kind"], "static");
+    }
+
+    #[test]
+    fn append_history_records_command_and_fields() {
+        let mut v = serde_json::json!({"id": "x"});
+        append_history(&mut v, "minimize", &["minimal_reproducer"]);
+        append_history(&mut v, "cartography", &["primitive"]);
+        let history = v["history"].as_array().unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0]["command"], "minimize");
+        assert_eq!(history[1]["fields"][0], "primitive");
+        assert!(chrono::DateTime::parse_from_rfc3339(history[0]["at"].as_str().unwrap()).is_ok());
     }
 }

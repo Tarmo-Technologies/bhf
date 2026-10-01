@@ -372,7 +372,7 @@ fn write_tsan_finding(work: &Path, id: &str, harness_id: &str, file: &str, line:
     // One issue per distinct data-race site (rule + file:line), as a stable 64-hex
     // cluster key so the report collapses repeat inputs into one row.
     let cluster_key_full = hex(&Sha256::digest(format!("BHF-556:{file}:{line}").as_bytes()));
-    let record = json!({
+    let mut record = json!({
         "id": id,
         "rule_id": "BHF-556",
         "classification": "unhandled",
@@ -389,6 +389,7 @@ fn write_tsan_finding(work: &Path, id: &str, harness_id: &str, file: &str, line:
         "analysis": { "engine": "bhf.dynamic.tsan.replay" },
         "actionability": { "cwe": ["CWE-362"], "verdict": "likely_reachable", "confidence": "high" },
     });
+    corpus::finding::stamp_v1(&mut record, corpus::finding::finding_kind::RUNTIME);
     std::fs::write(
         dir.join("finding.json"),
         serde_json::to_vec_pretty(&record).unwrap_or_default(),

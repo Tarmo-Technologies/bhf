@@ -61,6 +61,11 @@ pub fn run_cobol_attribution(work_dir: &Path) -> usize {
             continue;
         }
         if enrich(&mut value, &diag) {
+            corpus::finding::append_history(
+                &mut value,
+                "auto",
+                &["exception", "actionability.cwe", "cobol_source", "analysis"],
+            );
             if let Ok(bytes) = serde_json::to_vec_pretty(&value) {
                 if std::fs::write(&finding_json, bytes).is_ok() {
                     enriched += 1;
@@ -156,6 +161,9 @@ fn classify(what: &str) -> (&'static str, &'static str) {
 /// Returns true when the finding was changed.
 fn enrich(value: &mut Value, diag: &LibcobDiag) -> bool {
     let (cwe, kind) = classify(&diag.what);
+    // Snapshot so a re-run over preserved results/ that recovers the same diagnostic
+    // reports "unchanged" and the caller skips both the rewrite and the history entry.
+    let before = value.clone();
     let Some(obj) = value.as_object_mut() else {
         return false;
     };
@@ -199,7 +207,7 @@ fn enrich(value: &mut Value, diag: &LibcobDiag) -> bool {
         "analysis".to_owned(),
         serde_json::json!({ "engine": "bhf.cobol.attribution" }),
     );
-    true
+    *value != before
 }
 
 #[cfg(test)]
@@ -263,5 +271,8 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("parseit.cob:11"));
+        // Idempotent: re-enriching the same record with the same diagnostic changes
+        // nothing, so the caller appends no second history entry and skips the write.
+        assert!(!enrich(&mut v, &diag));
     }
 }

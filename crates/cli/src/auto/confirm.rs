@@ -133,6 +133,17 @@ pub fn confirm_static_findings(work: &Path, mode: RunMode) -> ConfirmStats {
         }
 
         upgrade_to_confirmed(&mut raw, &confirming, &record);
+        corpus::finding::append_history(
+            &mut raw,
+            "auto",
+            &[
+                "confirmation",
+                "confirmed_by",
+                "cluster_key",
+                "cluster_key_full",
+                "actionability",
+            ],
+        );
         if let Ok(bytes) = serde_json::to_vec_pretty(&raw) {
             if std::fs::write(&finding_json, bytes).is_ok() {
                 stats.confirmed += 1;
@@ -205,6 +216,19 @@ pub fn downgrade_unreachable_static_findings(
         // fuzz-confirmed one already carries a reachability-aware verdict).
         if !is_static_finding(&raw)
             || raw.get("confirmation").and_then(Value::as_str) != Some("static")
+        {
+            continue;
+        }
+        // Already demoted on a prior run (results/ is preserved): a downgrade sets
+        // input_reachability=reachability_unproven and the verdict to lab_only but
+        // never touches `confirmation`, so without this guard every run would
+        // re-demote the same finding, re-inflate `demoted`, and append a redundant
+        // history entry.
+        if raw.get("input_reachability").and_then(Value::as_str) == Some("reachability_unproven")
+            && raw
+                .pointer("/actionability/verdict")
+                .and_then(Value::as_str)
+                == Some("lab_only")
         {
             continue;
         }
@@ -317,6 +341,11 @@ fn mark_exercised(raw: &mut Value, finding_json: &Path, mode: RunMode) -> bool {
     if let Ok(value) = serde_json::to_value(&record) {
         obj.insert("actionability".to_owned(), value);
     }
+    corpus::finding::append_history(
+        raw,
+        "auto",
+        &["confirmation", "fuzz_exercised_note", "actionability"],
+    );
     match serde_json::to_vec_pretty(raw) {
         Ok(bytes) => std::fs::write(finding_json, bytes).is_ok(),
         Err(_) => false,
@@ -362,6 +391,7 @@ fn static_finding_site(raw: &Value) -> Option<(String, u64)> {
 /// Stamp `input_reachability` and persist a `lab_only` verdict on a static finding
 /// (full valid record, like the upgrade path, so the demotion survives the loader).
 fn downgrade_to_lab_only(raw: &mut Value, finding_json: &Path, mode: RunMode) -> bool {
+    let before = raw.clone();
     let record = actionability::existing_actionability_or_backfill(mode, raw, Some(finding_json));
     let Some(obj) = raw.as_object_mut() else {
         return false;
@@ -375,6 +405,10 @@ fn downgrade_to_lab_only(raw: &mut Value, finding_json: &Path, mode: RunMode) ->
     if let Ok(value) = serde_json::to_value(&demoted) {
         obj.insert("actionability".to_owned(), value);
     }
+    if *raw == before {
+        return false; // nothing changed: no history entry, no rewrite
+    }
+    corpus::finding::append_history(raw, "auto", &["input_reachability", "actionability"]);
     match serde_json::to_vec_pretty(raw) {
         Ok(bytes) => std::fs::write(finding_json, bytes).is_ok(),
         Err(_) => false,
@@ -673,6 +707,11 @@ mod tests {
             0
         );
         assert_eq!(count_fuzz_confirmed(&work), 1);
+        // The confirmed static finding carries exactly one history entry (the
+        // second confirm run is a no-op and must not append another).
+        let confirmed = read_finding(&work, "F-STATIC-0200");
+        assert_eq!(confirmed["history"].as_array().expect("history").len(), 1);
+        assert_eq!(confirmed["history"][0]["command"], "auto");
     }
 
     /// No runtime findings at all -> nothing to confirm, static findings untouched.
@@ -736,6 +775,14 @@ mod tests {
         let reachable = read_finding(&work, "F-STATIC-0601");
         assert!(reachable.get("input_reachability").is_none());
         assert_ne!(reachable["actionability"]["verdict"], "lab_only");
+
+        // Idempotent: a second run re-demotes nothing and appends no history entry.
+        assert_eq!(
+            downgrade_unreachable_static_findings(&work, &sites, RunMode::Reporting),
+            0
+        );
+        let twice = read_finding(&work, "F-STATIC-0600");
+        assert_eq!(twice["history"].as_array().expect("history").len(), 1);
     }
 
     /// A confirmed static finding adopts the confirming crash's cluster so the
