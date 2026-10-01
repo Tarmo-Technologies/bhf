@@ -254,7 +254,7 @@ fn install_fake_harness(work_dir: &Path, harness_id: &str) -> PathBuf {
 }
 
 fn only_finding_dir(work_dir: &Path) -> PathBuf {
-    let findings_root = work_dir.join("findings");
+    let findings_root = work_dir.join("results").join("findings");
     let findings = fs::read_dir(&findings_root)
         .expect("findings directory is readable")
         .map(|entry| entry.expect("finding entry is readable").path())

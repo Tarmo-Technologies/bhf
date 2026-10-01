@@ -288,7 +288,7 @@ fn harness_findings_with_input(
     harness_id: &str,
 ) -> Vec<(std::path::PathBuf, std::path::PathBuf)> {
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(work_dir.join("findings")) else {
+    let Ok(entries) = std::fs::read_dir(corpus::layout::findings_dir(work_dir)) else {
         return out;
     };
     for entry in entries.flatten() {

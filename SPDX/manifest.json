@@ -1759,6 +1759,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/workdir.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/actionability_cli.rs",
       "license": "Apache-2.0"
     },
@@ -2547,6 +2551,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/corpus/src/layout.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/corpus/src/lib.rs",
       "license": "Apache-2.0"
     },
@@ -3252,6 +3260,18 @@
     },
     {
       "path": "crates/report/src/main.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/results/Cargo.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/results/src/lib.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/results/src/migrate.rs",
       "license": "Apache-2.0"
     },
     {

@@ -140,12 +140,24 @@ mod linux {
         assert!(!findings.is_empty(), "expected planted crash: {summary}");
         let first = findings[0].as_str().unwrap();
         let finding: serde_json::Value = serde_json::from_slice(
-            &fs::read(work.join("findings").join(first).join("finding.json")).unwrap(),
+            &fs::read(
+                work.join("results")
+                    .join("findings")
+                    .join(first)
+                    .join("finding.json"),
+            )
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(finding["exception"]["sanitizer"], "asan");
         assert_eq!(
-            fs::read(work.join("findings").join(first).join("testcase.bin")).unwrap(),
+            fs::read(
+                work.join("results")
+                    .join("findings")
+                    .join(first)
+                    .join("testcase.bin")
+            )
+            .unwrap(),
             b"X"
         );
 

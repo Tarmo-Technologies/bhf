@@ -1058,6 +1058,10 @@ fn fatal_signal_report(status: &std::process::ExitStatus, stderr: &str) -> corpu
 }
 
 pub fn run(args: FuzzArgs) -> i32 {
+    if let Err(error) = crate::workdir::prepare(&args.work_dir) {
+        bhfeprintln!("error: {error:#}");
+        return 1;
+    }
     // HDF-1b: when a target transport is requested, drive the additive
     // transport-fuzz path (a separate loop over the `target_transport` seam) and
     // leave the host libFuzzer/AFL path below untouched.
@@ -4930,7 +4934,7 @@ fn existing_crash_testcases(work_dir: &Path, harness_id: &str, max_len: usize) -
     let finding_record_limit = max_finding_record_bytes();
     let dedup_limit = max_finding_dedup_keys();
     let mut set = HashSet::new();
-    let Ok(entries) = fs::read_dir(work_dir.join("findings")) else {
+    let Ok(entries) = fs::read_dir(corpus::layout::findings_dir(work_dir)) else {
         return set;
     };
     for entry in entries.flatten() {
@@ -5002,7 +5006,7 @@ fn existing_finding_dedup_keys(work_dir: &Path, harness_id: &str) -> (Vec<String
     let dedup_limit = max_finding_dedup_keys();
     let mut clusters = Vec::new();
     let mut oracles = Vec::new();
-    let Ok(entries) = fs::read_dir(work_dir.join("findings")) else {
+    let Ok(entries) = fs::read_dir(corpus::layout::findings_dir(work_dir)) else {
         return (clusters, oracles);
     };
     for entry in entries.flatten() {
@@ -6078,7 +6082,7 @@ mod dedup_seed_tests {
         // #35: a later cascade pass must reconstruct the dedup keys of findings a
         // prior pass already wrote, so it does not re-emit byte-identical findings.
         let work = tempfile::tempdir().unwrap();
-        let findings = work.path().join("findings");
+        let findings = work.path().join("results").join("findings");
         // A sanitizer-crash finding (clustered).
         let c = findings.join("F-0001-aaaa");
         std::fs::create_dir_all(&c).unwrap();
@@ -7817,7 +7821,10 @@ mod auto_path_tests {
              starvation should not persist): {:?}",
             summary.findings
         );
-        let finding_dir = work_dir.join("findings").join(&summary.findings[0]);
+        let finding_dir = work_dir
+            .join("results")
+            .join("findings")
+            .join(&summary.findings[0]);
         let finding: serde_json::Value =
             serde_json::from_slice(&fs::read(finding_dir.join("finding.json")).unwrap()).unwrap();
         assert_eq!(finding["classification"], "oracle_hit");

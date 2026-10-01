@@ -65,7 +65,7 @@ fn run_snippet(src: &str, work: &Path) -> String {
 
 /// Read every finding's `provenance` label for a work dir.
 fn provenances(work: &Path) -> Vec<String> {
-    let dir = work.join("findings");
+    let dir = work.join("results").join("findings");
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
     };

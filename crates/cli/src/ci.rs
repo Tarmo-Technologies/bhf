@@ -272,6 +272,10 @@ fn auto_args_from_ci(args: &CiArgs, scoped_files: &[PathBuf]) -> AutoArgs {
 
 pub fn run(args: CiArgs) -> i32 {
     let work_dir = args.work_dir.clone();
+    if let Err(error) = crate::workdir::prepare(&work_dir) {
+        bhfeprintln!("error: {error:#}");
+        return 1;
+    }
 
     // PR-native scoping. Resolve the changed-file list (from a file, or via
     // git merge-base) and keep only fuzzable sources under the sweep root. An
@@ -530,7 +534,7 @@ fn build_ci_json(
 /// crate. Returns the final SARIF path string (for the CI JSON) or `None`.
 fn maybe_emit_sarif(args: &CiArgs, work_dir: &Path) -> Option<String> {
     let requested = args.sarif.as_ref()?;
-    let findings_dir = work_dir.join("findings");
+    let findings_dir = corpus::layout::findings_dir(work_dir);
     let out_dir = work_dir.join("reports");
     let options = bhf_report::ReportOptions::new(&findings_dir, &out_dir)
         .with_run_id("last")
@@ -568,7 +572,7 @@ fn summary_path_resolution(flag: Option<&Path>) -> Option<PathBuf> {
 }
 
 fn bucket_findings(work_dir: &Path) -> anyhow::Result<BTreeMap<String, usize>> {
-    let findings_dir = work_dir.join("findings");
+    let findings_dir = corpus::layout::findings_dir(work_dir);
     let mut buckets: BTreeMap<String, usize> = BTreeMap::new();
     if !findings_dir.is_dir() {
         return Ok(buckets);
@@ -631,7 +635,7 @@ pub fn exit_code_from_actionability_for_test(
 }
 
 fn bucket_actionability(work_dir: &Path) -> anyhow::Result<ActionabilityBuckets> {
-    let findings_dir = work_dir.join("findings");
+    let findings_dir = corpus::layout::findings_dir(work_dir);
     let mut buckets = ActionabilityBuckets::default();
     if !findings_dir.is_dir() {
         return Ok(buckets);
@@ -866,7 +870,7 @@ mod tests {
     }
 
     fn write_finding(work_dir: &Path, id: &str, rule_id: &str, severity: &str) {
-        let dir = work_dir.join("findings").join(id);
+        let dir = work_dir.join("results").join("findings").join(id);
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("finding.json"),
@@ -998,7 +1002,7 @@ mod tests {
         // the whole gate report zero findings and pass.
         let work = tempdir("malformed");
         write_finding(&work, "F-0001-aaaa", "BHF-201", "high");
-        let bad = work.join("findings/F-0002-bbbb");
+        let bad = work.join("results/findings/F-0002-bbbb");
         fs::create_dir_all(&bad).unwrap();
         fs::write(bad.join("finding.json"), b"{ this is not json").unwrap();
 
@@ -1018,7 +1022,7 @@ mod tests {
     #[test]
     fn bucket_findings_uses_rule_default_severity_when_field_missing() {
         let work = tempdir("rule-default");
-        let dir = work.join("findings/F-0001");
+        let dir = work.join("results/findings/F-0001");
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("finding.json"),
@@ -1067,7 +1071,7 @@ mod tests {
     #[test]
     fn render_summary_includes_actionability_counts_when_present() {
         let work = tempdir("summary-actionability");
-        let dir = work.join("findings/F-0001");
+        let dir = work.join("results/findings/F-0001");
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("finding.json"),

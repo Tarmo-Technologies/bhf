@@ -26,3 +26,4 @@ path = "src/main.rs"
 
 [dev-dependencies]
 report = { path = "../report" }
+tempfile.workspace = true

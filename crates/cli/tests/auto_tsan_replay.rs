@@ -257,6 +257,7 @@ fn tsan_replay_writes_bhf556_for_target_source_data_race() {
     );
 
     let finding = work
+        .join("results")
         .join("findings")
         .join("F-TSAN-0000")
         .join("finding.json");

@@ -19,7 +19,7 @@ use std::time::Duration;
 /// Replay every COBOL (`H-B*`) crash finding to recover libcob's diagnostic and
 /// enrich the finding record. Returns the number of findings enriched.
 pub fn run_cobol_attribution(work_dir: &Path) -> usize {
-    let findings_dir = work_dir.join("findings");
+    let findings_dir = corpus::layout::findings_dir(work_dir);
     let Ok(entries) = std::fs::read_dir(&findings_dir) else {
         return 0;
     };

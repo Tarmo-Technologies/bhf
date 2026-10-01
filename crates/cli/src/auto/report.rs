@@ -341,7 +341,7 @@ fn annotate_findings_with_fidelity(
             by_harness.insert(r.candidate.harness_id.as_str(), f);
         }
     }
-    let findings_root = work_dir.join("findings");
+    let findings_root = corpus::layout::findings_dir(work_dir);
     let Ok(entries) = std::fs::read_dir(&findings_root) else {
         return;
     };
@@ -646,12 +646,12 @@ fn collapse_uninitializable_param_reason(reason: &str) -> String {
     reason.to_owned()
 }
 
-/// Reconcile in-memory per-pass finding ids against the on-disk `findings/`
+/// Reconcile in-memory per-pass finding ids against the on-disk `results/findings/`
 /// directory, dropping any id whose `finding.json` a post-pass removed. Returns
 /// the number of phantom ids dropped.
 ///
 /// Result-linked fuzz findings (`F-NNNN-*`) are emitted to
-/// `findings/<id>/finding.json` during the cascade and recorded in
+/// `results/findings/<id>/finding.json` during the cascade and recorded in
 /// [`PassRun::findings`]. Post-pass oracles then run and may DELETE a finding
 /// they prove false: COBOL crash attribution
 /// ([`crate::auto::cobol_oracle::run_cobol_attribution`]) removes a crash whose
@@ -661,7 +661,7 @@ fn collapse_uninitializable_param_reason(reason: &str) -> String {
 /// in-memory pass records that feed `summary.findings`, `run.json` and `run.md`
 /// — so the headline count would report a finding with no evidence bundle (a
 /// phantom: exactly the two COBOL `built_and_fuzzed` targets whose count read 1
-/// while their CSV/`findings/` held nothing).
+/// while their CSV/`results/findings/` held nothing).
 ///
 /// Called once after every post-pass and immediately before [`write_reports`],
 /// this makes the pass records agree with disk: the count, `run.json` and
@@ -674,7 +674,7 @@ pub(crate) fn reconcile_pass_findings_with_disk(
     results: &mut [AttemptResult],
     work_dir: &Path,
 ) -> usize {
-    let findings_root = work_dir.join("findings");
+    let findings_root = corpus::layout::findings_dir(work_dir);
     let mut dropped = 0usize;
     for r in results.iter_mut() {
         let passes = match &mut r.outcome {
@@ -1448,7 +1448,7 @@ fn csv_impact_rank(impact: actionability::Impact) -> u8 {
 /// result-linked fuzz/report-only findings. Empty when `--static` wasn't used
 /// (no such dirs exist).
 pub(crate) fn tree_static_finding_ids(work_dir: &Path) -> Vec<String> {
-    let dir = work_dir.join("findings");
+    let dir = corpus::layout::findings_dir(work_dir);
     let mut ids: Vec<String> = match std::fs::read_dir(&dir) {
         Ok(entries) => entries
             .flatten()
@@ -1479,7 +1479,7 @@ fn write_findings_csv(
     static_dynamic: bool,
     forced_harness_ids: &std::collections::BTreeSet<String>,
 ) -> Result<()> {
-    let findings_root = work_dir.join("findings");
+    let findings_root = corpus::layout::findings_dir(work_dir);
     // Both extra columns are appended at the END so existing column indices are
     // unchanged when the flags are off: `--static-dynamic` adds `scan_type`, and
     // `--force` adds a `forced` note column (present only when any target ran
@@ -1730,7 +1730,7 @@ fn render_findings_markdown(groups: &[Vec<CsvFinding>], work_dir: &Path) -> Stri
                 markdown_single_line(&representative.remediation)
             );
         }
-        let finding_dir = work_dir.join("findings").join(&representative.id);
+        let finding_dir = corpus::layout::finding_dir(work_dir, &representative.id);
         let _ = writeln!(
             out,
             "- Evidence bundle: [`findings/{0}/`](findings/{0}/)",
@@ -4021,7 +4021,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let findings = tmp.join("findings");
+        let findings = tmp.join("results").join("findings");
         for id in [
             "F-STATIC-0000",
             "F-STATIC-0001",
@@ -4425,12 +4425,12 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        std::fs::create_dir_all(work.join("findings")).unwrap();
+        std::fs::create_dir_all(work.join("results").join("findings")).unwrap();
 
         // One finding from a host-stubbed VxWorks target, one from a plain native
         // target, each written to disk exactly as the cascade would.
         let write_finding = |id: &str, harness: &str| {
-            let dir = work.join("findings").join(id);
+            let dir = work.join("results").join("findings").join(id);
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(
                 dir.join("finding.json"),
@@ -4504,7 +4504,13 @@ mod tests {
         // --- per-finding blocks on disk ---
         let read_finding = |id: &str| -> serde_json::Value {
             serde_json::from_slice(
-                &std::fs::read(work.join("findings").join(id).join("finding.json")).unwrap(),
+                &std::fs::read(
+                    work.join("results")
+                        .join("findings")
+                        .join(id)
+                        .join("finding.json"),
+                )
+                .unwrap(),
             )
             .unwrap()
         };
@@ -4569,13 +4575,13 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        std::fs::create_dir_all(work.join("findings")).unwrap();
+        std::fs::create_dir_all(work.join("results").join("findings")).unwrap();
 
         // The empty pass emitted two crashes; attribution proved F-0000-dead a
         // harness artifact and removed its dir, leaving only F-0001-live on disk.
         let survivor = "F-0001-live";
         let phantom = "F-0000-dead";
-        let survivor_dir = work.join("findings").join(survivor);
+        let survivor_dir = work.join("results").join("findings").join(survivor);
         std::fs::create_dir_all(&survivor_dir).unwrap();
         std::fs::write(
             survivor_dir.join("finding.json"),
@@ -5468,7 +5474,7 @@ mod tests {
                 .as_nanos()
         ));
         let fid = "F-0000-1028b5d3";
-        let finding_dir = work.join("findings").join(fid);
+        let finding_dir = work.join("results").join("findings").join(fid);
         std::fs::create_dir_all(&finding_dir).unwrap();
         // A real C LeakSanitizer finding shape, written WITHOUT an actionability
         // block so the CSV writer exercises the backfill path.
@@ -5740,7 +5746,7 @@ mod tests {
         let cluster = "ab".repeat(32);
         let ids = ["F-0001-aaaa", "F-0002-bbbb"];
         for fid in ids {
-            let dir = work.join("findings").join(fid);
+            let dir = work.join("results").join("findings").join(fid);
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(
                 dir.join("finding.json"),
@@ -5918,7 +5924,7 @@ mod tests {
         });
         for f in [&confirmed, &plain] {
             let id = f["id"].as_str().unwrap();
-            let dir = work.join("findings").join(id);
+            let dir = work.join("results").join("findings").join(id);
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(
                 dir.join("finding.json"),
@@ -6127,7 +6133,7 @@ mod tests {
                 .as_nanos()
         ));
         let fid = "F-FORCED-0001";
-        let finding_dir = work.join("findings").join(fid);
+        let finding_dir = work.join("results").join("findings").join(fid);
         std::fs::create_dir_all(&finding_dir).unwrap();
         // A finding whose EMITTED confidence is high — the forced flooring must
         // override it, not merely leave a low value alone.

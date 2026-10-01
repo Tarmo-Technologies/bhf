@@ -631,7 +631,7 @@ pub enum Outcome {
         /// Count of static (report-only) findings emitted for this target.
         #[serde(default)]
         static_findings: usize,
-        /// Finding ids (under `<work>/findings/<id>/`) emitted by the report-only
+        /// Finding ids (under `<work>/results/findings/<id>/`) emitted by the report-only
         /// static scan, so the report aggregators (findings.csv, run.md) surface
         /// them with their CWE like any other finding.
         #[serde(default)]
@@ -3116,7 +3116,8 @@ fn run_attempt(
                         ipc_channel_observed,
                     );
                     for fid in &summary.findings {
-                        let finding_path = work_dir.join("findings").join(fid).join("finding.json");
+                        let finding_path =
+                            corpus::layout::finding_dir(work_dir, fid).join("finding.json");
                         if let Err(error) =
                             stamp_runtime_mode(&finding_path, *pass, &env_injected, reach_label)
                         {
@@ -3199,8 +3200,8 @@ fn run_attempt(
                                     ipc_channel_observed,
                                 );
                                 for fid in &summary.findings {
-                                    let finding_path =
-                                        work_dir.join("findings").join(fid).join("finding.json");
+                                    let finding_path = corpus::layout::finding_dir(work_dir, fid)
+                                        .join("finding.json");
                                     if let Err(error) = stamp_runtime_mode(
                                         &finding_path,
                                         crate::auto::pass::Pass::FuzzDriven,

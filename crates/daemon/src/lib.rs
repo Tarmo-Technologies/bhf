@@ -1035,7 +1035,9 @@ struct RankAtParams {
 }
 
 fn default_findings_dir() -> PathBuf {
-    PathBuf::from("findings")
+    // <work>/results/findings under the default work dir; see corpus::layout
+    // (daemon has no corpus dependency, so the path is spelled out).
+    PathBuf::from("bhf_work/results/findings")
 }
 
 #[derive(Debug, Serialize)]
@@ -2564,7 +2566,7 @@ mod tests {
             "package body Pkg is\n   procedure Parse is\n   begin\n      raise Constraint_Error;\n   exception\n      when Constraint_Error => null;\n   end Parse;\nend Pkg;\n",
         )
         .unwrap();
-        let findings = root.join("findings");
+        let findings = root.join("results").join("findings");
         write_finding(
             &findings.join("F-0001-alpha"),
             serde_json::json!({
@@ -2617,7 +2619,7 @@ mod tests {
     #[test]
     fn json_rpc_findings_backfills_actionability_for_older_records() {
         let root = temp_dir("json-rpc-actionability");
-        let findings = root.join("findings");
+        let findings = root.join("results").join("findings");
         write_finding(
             &findings.join("F-0001-old"),
             serde_json::json!({
@@ -3029,7 +3031,7 @@ mod tests {
 
         let workspace = temp_dir("tenant-finding-symlink");
         let outside = temp_dir("tenant-finding-symlink-outside");
-        let findings = workspace.join("findings");
+        let findings = workspace.join("results").join("findings");
         let record = findings.join("F-1");
         fs::create_dir_all(&record).unwrap();
         write_finding(

@@ -201,7 +201,7 @@ fn write_mem_finding(
     sample: &Sample,
     baseline_kb: u64,
 ) -> bool {
-    let dir = work.join("findings").join(id);
+    let dir = corpus::layout::finding_dir(work, id);
     if std::fs::create_dir_all(&dir).is_err() {
         return false;
     }

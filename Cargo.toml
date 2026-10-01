@@ -48,6 +48,7 @@ members = [
     "crates/python_parser",
     "crates/replay_min",
     "crates/report",
+    "crates/results",
     "crates/runtrace_manifest",
     "crates/rust_parser",
     "crates/rust_runtime",

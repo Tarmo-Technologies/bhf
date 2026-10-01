@@ -109,7 +109,7 @@ impl FindingEmitter {
             ordinal = self.next_ordinal()?,
             short = signature_hex.chars().take(8).collect::<String>()
         ));
-        let finding_dir = self.root.join("findings").join(&id.0);
+        let finding_dir = crate::layout::finding_dir(&self.root, &id.0);
         fs::create_dir_all(&finding_dir)?;
 
         fs::write(finding_dir.join("testcase.bin"), input)?;
@@ -217,7 +217,7 @@ impl FindingEmitter {
             ordinal = self.next_ordinal()?,
             short = signature_hex.chars().take(8).collect::<String>()
         ));
-        let finding_dir = self.root.join("findings").join(&id.0);
+        let finding_dir = crate::layout::finding_dir(&self.root, &id.0);
         fs::create_dir_all(&finding_dir)?;
 
         fs::write(finding_dir.join("testcase.bin"), input)?;
@@ -319,7 +319,7 @@ impl FindingEmitter {
             ordinal = self.next_ordinal()?,
             short = signature_hex.chars().take(8).collect::<String>()
         ));
-        let finding_dir = self.root.join("findings").join(&id.0);
+        let finding_dir = crate::layout::finding_dir(&self.root, &id.0);
         fs::create_dir_all(&finding_dir)?;
 
         fs::write(finding_dir.join("testcase.bin"), input)?;
@@ -379,7 +379,7 @@ impl FindingEmitter {
     }
 
     fn next_ordinal(&self) -> Result<u32, CorpusError> {
-        let findings_root = self.root.join("findings");
+        let findings_root = crate::layout::findings_dir(&self.root);
         fs::create_dir_all(&findings_root)?;
         let mut next = 0_u32;
         for entry in fs::read_dir(findings_root)? {
@@ -538,7 +538,7 @@ mod tests {
 
         let id = emitter.emit(b"input", &testcase(), 0).unwrap();
 
-        assert!(root.join("findings").join(id.0).is_dir());
+        assert!(crate::layout::findings_dir(&root).join(id.0).is_dir());
     }
 
     #[test]
@@ -549,7 +549,12 @@ mod tests {
         let id = emitter.emit(b"\x00\x01bad", &testcase(), 0).unwrap();
 
         assert_eq!(
-            fs::read(root.join("findings").join(id.0).join("testcase.bin")).unwrap(),
+            fs::read(
+                crate::layout::findings_dir(&root)
+                    .join(id.0)
+                    .join("testcase.bin")
+            )
+            .unwrap(),
             b"\x00\x01bad"
         );
     }
@@ -560,8 +565,12 @@ mod tests {
         let emitter = FindingEmitter::new(root.clone());
 
         let id = emitter.emit(b"abcdef", &testcase(), 0).unwrap();
-        let decoded =
-            fs::read_to_string(root.join("findings").join(id.0).join("decoded.json")).unwrap();
+        let decoded = fs::read_to_string(
+            crate::layout::findings_dir(&root)
+                .join(id.0)
+                .join("decoded.json"),
+        )
+        .unwrap();
         let value: serde_json::Value = serde_json::from_str(&decoded).unwrap();
 
         assert_eq!(value["input_size"], 6);
@@ -575,8 +584,12 @@ mod tests {
         let input = b"\x00\x01bad";
 
         let id = emitter.emit(input, &testcase(), 0).unwrap();
-        let decoded =
-            fs::read_to_string(root.join("findings").join(id.0).join("decoded.json")).unwrap();
+        let decoded = fs::read_to_string(
+            crate::layout::findings_dir(&root)
+                .join(id.0)
+                .join("decoded.json"),
+        )
+        .unwrap();
         let value: serde_json::Value = serde_json::from_str(&decoded).unwrap();
 
         assert_eq!(value["provenance"][0]["kind"], "raw_bytes");
@@ -592,8 +605,12 @@ mod tests {
         let expected = compute_signature(&testcase, &testcase.handlers[0]).hex();
 
         let id = emitter.emit(b"input", &testcase, 0).unwrap();
-        let finding =
-            fs::read_to_string(root.join("findings").join(id.0).join("finding.json")).unwrap();
+        let finding = fs::read_to_string(
+            crate::layout::findings_dir(&root)
+                .join(id.0)
+                .join("finding.json"),
+        )
+        .unwrap();
         let value: serde_json::Value = serde_json::from_str(&finding).unwrap();
 
         assert_eq!(value["signature"], expected);
@@ -608,8 +625,12 @@ mod tests {
         let testcase = testcase();
 
         let id = emitter.emit(b"input", &testcase, 0).unwrap();
-        let finding =
-            fs::read_to_string(root.join("findings").join(id.0).join("finding.json")).unwrap();
+        let finding = fs::read_to_string(
+            crate::layout::findings_dir(&root)
+                .join(id.0)
+                .join("finding.json"),
+        )
+        .unwrap();
         let value: serde_json::Value = serde_json::from_str(&finding).unwrap();
 
         assert_eq!(value["rule_id"], "BHF-102");
@@ -628,8 +649,12 @@ mod tests {
         }];
 
         let id = emitter.emit(b"input", &testcase, 0).unwrap();
-        let finding =
-            fs::read_to_string(root.join("findings").join(id.0).join("finding.json")).unwrap();
+        let finding = fs::read_to_string(
+            crate::layout::findings_dir(&root)
+                .join(id.0)
+                .join("finding.json"),
+        )
+        .unwrap();
         let value: serde_json::Value = serde_json::from_str(&finding).unwrap();
 
         assert_eq!(value["mocks"][0]["symbol"], "Missing_Service");
@@ -643,7 +668,12 @@ mod tests {
         let emitter = FindingEmitter::new(root.clone());
         let id = emitter.emit(b"input", &testcase(), 0).unwrap();
         let value: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(root.join("findings").join(id.0).join("finding.json")).unwrap(),
+            &fs::read_to_string(
+                crate::layout::findings_dir(&root)
+                    .join(id.0)
+                    .join("finding.json"),
+            )
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(value["tier"], "swallowed_check");
@@ -666,7 +696,12 @@ mod tests {
             .emit(b"input", &testcase, crate::UNHANDLED_HANDLER_INDEX)
             .unwrap();
         let value: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(root.join("findings").join(id.0).join("finding.json")).unwrap(),
+            &fs::read_to_string(
+                crate::layout::findings_dir(&root)
+                    .join(id.0)
+                    .join("finding.json"),
+            )
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(value["tier"], "real_fault");
@@ -749,7 +784,12 @@ mod tests {
             )
             .unwrap();
         let finding: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(root.join("findings").join(&id.0).join("finding.json")).unwrap(),
+            &fs::read_to_string(
+                crate::layout::findings_dir(&root)
+                    .join(&id.0)
+                    .join("finding.json"),
+            )
+            .unwrap(),
         )
         .unwrap();
 
@@ -776,7 +816,12 @@ mod tests {
             )
             .unwrap();
         let finding: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(root.join("findings").join(&id.0).join("finding.json")).unwrap(),
+            &fs::read_to_string(
+                crate::layout::findings_dir(&root)
+                    .join(&id.0)
+                    .join("finding.json"),
+            )
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(
@@ -816,7 +861,12 @@ mod tests {
         };
         let id = emitter.emit_sanitizer_crash(b"in", &report).unwrap();
         let v: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(root.join("findings").join(id.0).join("finding.json")).unwrap(),
+            &fs::read_to_string(
+                crate::layout::findings_dir(&root)
+                    .join(id.0)
+                    .join("finding.json"),
+            )
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(v["cluster_normalized_frames"][0], "real_parse");
@@ -824,6 +874,31 @@ mod tests {
         assert_eq!(short.len(), 16);
         assert_eq!(v["cluster_fallback"], false);
         assert_eq!(v["cluster_key_full"].as_str().unwrap().len(), 64);
+    }
+
+    #[test]
+    fn sanitizer_crash_lands_under_results_findings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let emitter = FindingEmitter::new(root.clone());
+        let report = crate::sanitizer::SanitizerReport {
+            sanitizer: crate::sanitizer::Sanitizer::AddressSanitizer,
+            kind: "heap-buffer-overflow".to_owned(),
+            rule_id: "BHF-201",
+            stack: Vec::new(),
+            message: "heap-buffer-overflow".to_owned(),
+        };
+        let id = emitter.emit_sanitizer_crash(b"in", &report).unwrap();
+        let dir = crate::layout::finding_dir(&root, &id.0);
+        assert!(
+            dir.join("finding.json").is_file(),
+            "missing {}",
+            dir.display()
+        );
+        assert!(
+            !root.join("findings").exists(),
+            "legacy dir must not be created"
+        );
     }
 
     #[test]
@@ -845,8 +920,12 @@ mod tests {
         };
 
         let id = emitter.emit_sanitizer_crash(b"in", &report).unwrap();
-        let finding =
-            fs::read_to_string(root.join("findings").join(id.0).join("finding.json")).unwrap();
+        let finding = fs::read_to_string(
+            crate::layout::findings_dir(&root)
+                .join(id.0)
+                .join("finding.json"),
+        )
+        .unwrap();
         let value: serde_json::Value = serde_json::from_str(&finding).unwrap();
 
         assert_eq!(value["actionability"]["mode"], "attacking");
@@ -881,8 +960,12 @@ mod tests {
         };
 
         let id = emitter.emit_oracle_hit(b"../../etc/passwd", &hit).unwrap();
-        let finding =
-            fs::read_to_string(root.join("findings").join(id.0).join("finding.json")).unwrap();
+        let finding = fs::read_to_string(
+            crate::layout::findings_dir(&root)
+                .join(id.0)
+                .join("finding.json"),
+        )
+        .unwrap();
         let value: serde_json::Value = serde_json::from_str(&finding).unwrap();
 
         assert_eq!(value["rule_id"], "BHF-101");
@@ -894,7 +977,7 @@ mod tests {
         assert_eq!(value["oracle"]["evidence"][0]["value"], "../../etc/passwd");
         assert_eq!(
             fs::read(
-                root.join("findings")
+                crate::layout::findings_dir(&root)
                     .join(value["id"].as_str().unwrap())
                     .join("testcase.bin")
             )
@@ -937,8 +1020,12 @@ mod tests {
 
         let read = |id: &super::FindingId| -> serde_json::Value {
             serde_json::from_str(
-                &fs::read_to_string(root.join("findings").join(&id.0).join("finding.json"))
-                    .unwrap(),
+                &fs::read_to_string(
+                    crate::layout::findings_dir(&root)
+                        .join(&id.0)
+                        .join("finding.json"),
+                )
+                .unwrap(),
             )
             .unwrap()
         };
@@ -980,8 +1067,12 @@ mod tests {
             .unwrap();
         let read = |id: &super::FindingId| -> serde_json::Value {
             serde_json::from_str(
-                &fs::read_to_string(root.join("findings").join(&id.0).join("finding.json"))
-                    .unwrap(),
+                &fs::read_to_string(
+                    crate::layout::findings_dir(&root)
+                        .join(&id.0)
+                        .join("finding.json"),
+                )
+                .unwrap(),
             )
             .unwrap()
         };
@@ -994,7 +1085,12 @@ mod tests {
         let emitter = super::FindingEmitter::new(root.clone());
         let id = emitter.emit(b"input", &testcase(), 0).unwrap();
         let v: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(root.join("findings").join(id.0).join("finding.json")).unwrap(),
+            &fs::read_to_string(
+                crate::layout::findings_dir(&root)
+                    .join(id.0)
+                    .join("finding.json"),
+            )
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(v["cluster_normalized_frames"][0], "CONSTRAINT_ERROR");
@@ -1021,7 +1117,12 @@ mod tests {
         };
         let id = emitter.emit_sanitizer_crash(b"x", &report).unwrap();
         let v: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(root.join("findings").join(id.0).join("finding.json")).unwrap(),
+            &fs::read_to_string(
+                crate::layout::findings_dir(&root)
+                    .join(id.0)
+                    .join("finding.json"),
+            )
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(v["cluster_fallback"], true);

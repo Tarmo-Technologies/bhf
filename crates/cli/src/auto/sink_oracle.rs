@@ -88,7 +88,7 @@ fn write_sink_finding(
     cwe: &str,
     label: &str,
 ) -> bool {
-    let dir = work.join("findings").join(id);
+    let dir = corpus::layout::finding_dir(work, id);
     if std::fs::create_dir_all(&dir).is_err() {
         return false;
     }
@@ -168,7 +168,7 @@ mod tests {
         let written = run_sink_oracle(&tmp);
         assert_eq!(written, 2, "one finding per distinct reached sink kind");
 
-        let findings: Vec<String> = std::fs::read_dir(tmp.join("findings"))
+        let findings: Vec<String> = std::fs::read_dir(tmp.join("results").join("findings"))
             .unwrap()
             .flatten()
             .filter_map(|e| std::fs::read_to_string(e.path().join("finding.json")).ok())

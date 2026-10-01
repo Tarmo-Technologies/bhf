@@ -43,7 +43,7 @@ fn binary_fuzz_finds_replayable_stdin_and_file_crashes() {
             .output()
             .unwrap(),
     );
-    let stdin_finding_dir = work.join("findings/BF-0001");
+    let stdin_finding_dir = work.join("results/findings/BF-0001");
     let stdin_finding = read_json(&stdin_finding_dir.join("finding.json"));
     assert_eq!(stdin_finding["kind"], "binary_crash");
     assert_eq!(stdin_finding["input"]["mode"], "stdin");
@@ -96,7 +96,7 @@ fn binary_fuzz_finds_replayable_stdin_and_file_crashes() {
             .output()
             .unwrap(),
     );
-    let file_finding = read_json(&work.join("findings/BF-0002/finding.json"));
+    let file_finding = read_json(&work.join("results/findings/BF-0002/finding.json"));
     assert_eq!(file_finding["input"]["mode"], "file");
     assert_eq!(file_finding["crash"]["exit_code"], 43);
 }
@@ -105,7 +105,7 @@ fn binary_fuzz_finds_replayable_stdin_and_file_crashes() {
 fn ci_fails_on_binary_crash_findings() {
     let root = temp_dir("ci");
     let work = root.join("work");
-    let finding = work.join("findings/BF-0001");
+    let finding = work.join("results/findings/BF-0001");
     fs::create_dir_all(&finding).unwrap();
     fs::write(
         finding.join("finding.json"),

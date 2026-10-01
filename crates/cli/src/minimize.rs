@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, clap::Args)]
 pub struct MinimizeArgs {
-    /// Finding directory, or finding ID under ./findings.
+    /// Finding directory, or finding ID under bhf_work/results/findings.
     #[arg(
         value_name = "FINDING_DIR",
         required_unless_present = "finding",
@@ -18,7 +18,7 @@ pub struct MinimizeArgs {
     )]
     pub finding_dir: Option<PathBuf>,
 
-    /// Finding directory, or finding ID under ./findings.
+    /// Finding directory, or finding ID under bhf_work/results/findings.
     #[arg(long, value_name = "ID_OR_DIR")]
     pub finding: Option<PathBuf>,
 

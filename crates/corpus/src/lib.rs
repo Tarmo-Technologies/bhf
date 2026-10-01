@@ -4,6 +4,7 @@ pub mod bridge;
 pub mod classify;
 pub mod cluster;
 pub mod finding;
+pub mod layout;
 pub mod line_remap;
 pub mod manager;
 pub mod sanitizer;

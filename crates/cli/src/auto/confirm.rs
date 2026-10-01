@@ -57,7 +57,7 @@ struct RuntimeSite {
 /// runtime sink. Returns how many were upgraded. Best-effort: unreadable or
 /// mis-shaped sidecars are skipped, never fatal.
 pub fn confirm_static_findings(work: &Path, mode: RunMode) -> ConfirmStats {
-    let findings_dir = work.join("findings");
+    let findings_dir = corpus::layout::findings_dir(work);
     let Ok(entries) = std::fs::read_dir(&findings_dir) else {
         return ConfirmStats::default();
     };
@@ -147,7 +147,7 @@ pub fn confirm_static_findings(work: &Path, mode: RunMode) -> ConfirmStats {
 /// the join's return value through the whole report path — so `--resume` reloads
 /// see the same number).
 pub fn count_fuzz_confirmed(work: &Path) -> usize {
-    let findings_dir = work.join("findings");
+    let findings_dir = corpus::layout::findings_dir(work);
     let Ok(entries) = std::fs::read_dir(&findings_dir) else {
         return 0;
     };
@@ -191,7 +191,7 @@ pub fn downgrade_unreachable_static_findings(
     if sites.is_empty() {
         return 0;
     }
-    let findings_dir = work.join("findings");
+    let findings_dir = corpus::layout::findings_dir(work);
     let Ok(entries) = std::fs::read_dir(&findings_dir) else {
         return 0;
     };
@@ -242,7 +242,7 @@ pub fn mark_fuzz_exercised_findings(work: &Path, mode: RunMode) -> usize {
     if covered.is_empty() {
         return 0;
     }
-    let findings_dir = work.join("findings");
+    let findings_dir = corpus::layout::findings_dir(work);
     let Ok(entries) = std::fs::read_dir(&findings_dir) else {
         return 0;
     };
@@ -329,7 +329,7 @@ fn mark_exercised(raw: &mut Value, finding_json: &Path, mode: RunMode) -> bool {
 /// budget runs out). Read from the `F-STATIC-*` finding sidecars on disk.
 pub fn static_finding_files(work: &Path) -> std::collections::BTreeSet<String> {
     let mut files = std::collections::BTreeSet::new();
-    let Ok(entries) = std::fs::read_dir(work.join("findings")) else {
+    let Ok(entries) = std::fs::read_dir(corpus::layout::findings_dir(work)) else {
         return files;
     };
     for entry in entries.flatten() {
@@ -500,7 +500,7 @@ mod tests {
     use super::*;
 
     fn write_finding(dir: &Path, id: &str, body: Value) {
-        let d = dir.join("findings").join(id);
+        let d = dir.join("results").join("findings").join(id);
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(
             d.join("finding.json"),
@@ -510,7 +510,11 @@ mod tests {
     }
 
     fn read_finding(dir: &Path, id: &str) -> Value {
-        let p = dir.join("findings").join(id).join("finding.json");
+        let p = dir
+            .join("results")
+            .join("findings")
+            .join(id)
+            .join("finding.json");
         serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap()
     }
 

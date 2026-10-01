@@ -56,6 +56,10 @@ pub struct VerifyPocArgs {
 }
 
 pub fn run(args: CapsuleArgs) -> i32 {
+    if let Err(error) = crate::workdir::prepare(&args.work_dir) {
+        bhfeprintln!("error: {error:#}");
+        return 1;
+    }
     let out_root = args
         .out
         .clone()
@@ -130,7 +134,7 @@ struct FindingRef {
 
 /// Collect runtime C crash findings (with a min input) from the work dir.
 fn collect_findings(work_dir: &Path, only: Option<&str>) -> anyhow::Result<Vec<FindingRef>> {
-    let dir = work_dir.join("findings");
+    let dir = corpus::layout::findings_dir(work_dir);
     let entries = std::fs::read_dir(&dir)
         .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", dir.display()))?;
     let mut out = Vec::new();
@@ -288,13 +292,9 @@ fn build_capsule(
 }
 
 fn validate_capsule_id(value: &str, label: &str) -> anyhow::Result<()> {
-    if value.is_empty()
-        || value == "."
-        || value == ".."
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-    {
+    // Defence in depth lives in corpus::layout::is_valid_finding_id (shared with
+    // resolve_finding_id): single safe path segment, no traversal.
+    if !corpus::layout::is_valid_finding_id(value) {
         anyhow::bail!("invalid {label} ID: {value:?}");
     }
     Ok(())
@@ -806,7 +806,7 @@ mod tests {
         std::fs::write(sentinel.join("keep"), b"keep").unwrap();
         let finding = FindingRef {
             finding_id: "x/../../sentinel".to_owned(),
-            finding_dir: work.join("findings/x"),
+            finding_dir: work.join("results/findings/x"),
             harness_id: "H-C-1".to_owned(),
             raw: json!({}),
         };
@@ -820,7 +820,7 @@ mod tests {
     fn capsule_reports_requested_packaging_failure() {
         let temp = tempfile::tempdir().unwrap();
         let work = temp.path().join("work");
-        let finding_dir = work.join("findings/F-1");
+        let finding_dir = work.join("results/findings/F-1");
         std::fs::create_dir_all(&finding_dir).unwrap();
         std::fs::write(finding_dir.join("testcase.bin"), b"input").unwrap();
         std::fs::write(

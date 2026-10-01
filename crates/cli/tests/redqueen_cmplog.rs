@@ -38,7 +38,7 @@ fn tmpdir(tag: &str) -> PathBuf {
 /// Count findings that are real crashes (sanitizer/unhandled faults), excluding
 /// oracle hits — only a genuine memory-safety crash means the gate was cleared.
 fn count_crash_findings(work: &std::path::Path) -> usize {
-    let findings_dir = work.join("bhf_work/findings");
+    let findings_dir = work.join("bhf_work/results/findings");
     let Ok(entries) = std::fs::read_dir(&findings_dir) else {
         return 0;
     };
@@ -84,7 +84,7 @@ fn run(tag: &str, redqueen: bool, budget_secs: &str) -> usize {
 /// Count crash findings under a raw `bhf fuzz` work dir (`<work>/findings/*`),
 /// excluding oracle hits — only a genuine memory-safety crash clears the gate.
 fn count_fuzz_crash_findings(work: &std::path::Path) -> usize {
-    let findings_dir = work.join("findings");
+    let findings_dir = work.join("results").join("findings");
     let Ok(entries) = std::fs::read_dir(&findings_dir) else {
         return 0;
     };

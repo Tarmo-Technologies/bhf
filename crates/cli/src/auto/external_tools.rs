@@ -354,7 +354,7 @@ fn sarif_level_to_severity(level: &str) -> String {
 /// `static_scan`, so the fuzz-confirmation join and report treat it like any other
 /// static hit), tagged with the originating tool.
 fn write_finding(work: &Path, id: &str, tool: &str, finding: &ExtFinding) -> bool {
-    let dir = work.join("findings").join(id);
+    let dir = corpus::layout::finding_dir(work, id);
     if std::fs::create_dir_all(&dir).is_err() {
         return false;
     }
@@ -529,7 +529,7 @@ mod tests {
         };
         assert!(write_finding(&work, "F-EXT-0000", "gosec", &finding));
         let v: Value = serde_json::from_slice(
-            &std::fs::read(work.join("findings/F-EXT-0000/finding.json")).unwrap(),
+            &std::fs::read(work.join("results/findings/F-EXT-0000/finding.json")).unwrap(),
         )
         .unwrap();
         assert_eq!(v["classification"], "static_scan");

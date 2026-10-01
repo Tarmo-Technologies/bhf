@@ -231,7 +231,7 @@ fn rust_target_builds_and_fuzzes_natively_and_finds_planted_crash() {
 
     // The crash is the planted index-out-of-bounds panic (BHF-201), and a crashing
     // testcase reproduces deterministically against the built harness.
-    let findings_dir = tmp.join("findings");
+    let findings_dir = tmp.join("results").join("findings");
     let mut found_bhf201 = false;
     let mut a_reproducing_testcase = None;
     if let Ok(entries) = std::fs::read_dir(&findings_dir) {

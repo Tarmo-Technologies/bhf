@@ -1279,7 +1279,11 @@ fn attempt_rss_limit_classifies_oom_as_bhf209() {
     // The synthesized OOM is classified BHF-209.
     let mut saw_bhf209 = false;
     for id in &finding_ids {
-        let fj = work.join("findings").join(id).join("finding.json");
+        let fj = work
+            .join("results")
+            .join("findings")
+            .join(id)
+            .join("finding.json");
         let text = fs::read_to_string(&fj).unwrap_or_default();
         if text.contains("BHF-209") {
             saw_bhf209 = true;

@@ -74,6 +74,7 @@ python_parser = { path = "../python_parser" }
 regex.workspace = true
 replay_min = { path = "../replay_min" }
 bhf_report = { package = "report", path = "../report" }
+results = { path = "../results" }
 runtrace_manifest = { path = "../runtrace_manifest" }
 rust_parser = { path = "../rust_parser" }
 serde.workspace = true

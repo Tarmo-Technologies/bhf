@@ -75,7 +75,7 @@ fn pre_cpp98_report_only_emits_cwe_finding() {
     assert!(count >= 1, "BHF-401 strcpy must produce a static finding");
 
     let mut saw_cwe = false;
-    for entry in fs::read_dir(work.join("findings")).unwrap() {
+    for entry in fs::read_dir(work.join("results").join("findings")).unwrap() {
         let fj = entry.unwrap().path().join("finding.json");
         if !fj.exists() {
             continue;

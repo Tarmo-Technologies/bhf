@@ -658,7 +658,7 @@ impl SanitizerSelection {
 }
 
 fn count_findings(worker_dir: &Path) -> usize {
-    let findings_dir = worker_dir.join("findings");
+    let findings_dir = corpus::layout::findings_dir(worker_dir);
     let Ok(entries) = std::fs::read_dir(findings_dir) else {
         return 0;
     };
@@ -669,7 +669,7 @@ fn unique_finding_count(per_worker: &[WorkerReport]) -> usize {
     use std::collections::HashSet;
     let mut seen: HashSet<String> = HashSet::new();
     for report in per_worker {
-        let findings_dir = report.work_dir.join("findings");
+        let findings_dir = corpus::layout::findings_dir(&report.work_dir);
         let Ok(entries) = std::fs::read_dir(&findings_dir) else {
             continue;
         };
@@ -968,7 +968,7 @@ mod tests {
     #[test]
     fn count_findings_counts_finding_subdirectories() {
         let dir = tempdir("count");
-        let findings = dir.join("findings");
+        let findings = dir.join("results").join("findings");
         std::fs::create_dir_all(findings.join("F-0001")).unwrap();
         std::fs::create_dir_all(findings.join("F-0002")).unwrap();
         assert_eq!(count_findings(&dir), 2);
@@ -979,7 +979,7 @@ mod tests {
         let dir = tempdir("uniq");
         for worker in 0..2 {
             let worker_dir = dir.join(format!("worker-{worker}"));
-            let findings_dir = worker_dir.join("findings");
+            let findings_dir = worker_dir.join("results").join("findings");
             let f = findings_dir.join(format!("F-{worker:04}"));
             std::fs::create_dir_all(&f).unwrap();
             std::fs::write(

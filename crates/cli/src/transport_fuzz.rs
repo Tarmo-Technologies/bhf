@@ -1206,6 +1206,7 @@ mod tests {
         );
         let finding_id = &summary.findings[0];
         let finding_json = work_dir
+            .join("results")
             .join("findings")
             .join(finding_id)
             .join("finding.json");

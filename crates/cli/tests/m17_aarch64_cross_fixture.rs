@@ -245,7 +245,7 @@ fn emit_finding(root: &Path, input: &[u8], testcase: &Testcase) -> (PathBuf, ser
     let id = emitter
         .emit(input, testcase, 0)
         .expect("finding is emitted");
-    let finding_dir = root.join("findings").join(id.0);
+    let finding_dir = root.join("results").join("findings").join(id.0);
     let finding =
         serde_json::from_slice(&fs::read(finding_dir.join("finding.json")).unwrap()).unwrap();
     (finding_dir, finding)

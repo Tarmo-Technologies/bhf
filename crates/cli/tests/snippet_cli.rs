@@ -105,7 +105,7 @@ fn snippet_from_stdin_detects_language() {
 
 /// Count `findings/*/finding.json` written under a snippet work dir.
 fn finding_count(work: &Path) -> usize {
-    let dir = work.join("findings");
+    let dir = work.join("results").join("findings");
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return 0;
     };

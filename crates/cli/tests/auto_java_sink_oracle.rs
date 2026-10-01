@@ -140,7 +140,7 @@ fn agent_records_deserialization_sink_and_oracle_emits_finding() {
     std::fs::copy(&report, hdir.join("sink_report.txt")).unwrap();
     let written = run_sink_oracle(&work);
     assert_eq!(written, 1, "one BHF-421 deserialization finding expected");
-    let finding = std::fs::read_dir(work.join("findings"))
+    let finding = std::fs::read_dir(work.join("results").join("findings"))
         .unwrap()
         .flatten()
         .find_map(|e| std::fs::read_to_string(e.path().join("finding.json")).ok())

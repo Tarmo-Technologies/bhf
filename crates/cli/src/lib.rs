@@ -88,6 +88,7 @@ mod support_report;
 mod target_filter;
 pub mod transport_fault;
 mod transport_fuzz;
+pub mod workdir;
 
 #[derive(Debug, Parser)]
 #[command(name = "bhf")]

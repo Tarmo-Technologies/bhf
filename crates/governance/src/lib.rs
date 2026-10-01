@@ -1012,7 +1012,7 @@ pub fn runner_handoff_file(
     let selected = runner_select_file(manifest, runner_id)?;
     let runner = selected.get("runner").cloned().unwrap_or(Value::Null);
     let mut artifacts = Vec::new();
-    collect_artifacts_by_prefix(work_dir, "findings", "finding", &mut artifacts)?;
+    collect_artifacts_by_prefix(work_dir, findings_rel(work_dir), "finding", &mut artifacts)?;
     collect_artifacts_by_prefix(work_dir, "reports", "report", &mut artifacts)?;
     artifacts.sort_by(|left, right| {
         left.get("path")
@@ -2217,7 +2217,7 @@ pub fn write_export_manifest(options: &ExportOptions) -> Result<Value, Governanc
     )?;
     collect_artifacts_by_name(
         &options.work_dir,
-        "findings",
+        findings_rel(&options.work_dir),
         "testcase.bin",
         "replay_input",
         &mut artifacts,
@@ -2811,8 +2811,24 @@ fn audit_next_sequence(log: &Path) -> Result<u64, GovernanceError> {
         + 1)
 }
 
+/// The findings path relative to a work dir: the canonical results layout
+/// (`corpus::layout::findings_dir`, spelled out because governance has no corpus
+/// dependency) when present, else the legacy `findings` so old work dirs resolve.
+fn findings_rel(work_dir: &Path) -> &'static str {
+    if work_dir.join("results").join("findings").is_dir() {
+        "results/findings"
+    } else {
+        "findings"
+    }
+}
+
+/// The findings directory for a work dir, via [`findings_rel`].
+fn findings_dir(work_dir: &Path) -> PathBuf {
+    work_dir.join(findings_rel(work_dir))
+}
+
 fn count_finding_json(work_dir: &Path) -> Result<usize, GovernanceError> {
-    let findings = work_dir.join("findings");
+    let findings = findings_dir(work_dir);
     if !findings.is_dir() {
         return Ok(0);
     }
@@ -2823,7 +2839,7 @@ fn count_finding_json(work_dir: &Path) -> Result<usize, GovernanceError> {
 }
 
 fn finding_records(work_dir: &Path) -> Result<Vec<Value>, GovernanceError> {
-    let findings = work_dir.join("findings");
+    let findings = findings_dir(work_dir);
     if !findings.is_dir() {
         return Ok(Vec::new());
     }
@@ -2887,7 +2903,7 @@ fn missing_required_work_artifacts(
     )?;
     collect_artifacts_by_name(
         work_dir,
-        "findings",
+        findings_rel(work_dir),
         "testcase.bin",
         "replay_input",
         &mut artifacts,
@@ -8192,3 +8208,129 @@ mod vex_e2e_tests {
 
 #[cfg(all(test, target_os = "linux"))]
 mod publication_tests;
+
+#[cfg(test)]
+mod findings_reader_tests {
+    use super::*;
+
+    fn seed_finding(dir: &Path) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(
+            dir.join("finding.json"),
+            r#"{"id":"F-1","severity":"high"}"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn readers_prefer_results_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path();
+        seed_finding(&work.join("results").join("findings").join("F-1"));
+        assert_eq!(count_finding_json(work).unwrap(), 1);
+        let records = finding_records(work).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["id"], "F-1");
+    }
+
+    #[test]
+    fn readers_fall_back_to_legacy_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path();
+        seed_finding(&work.join("findings").join("F-1"));
+        assert_eq!(count_finding_json(work).unwrap(), 1);
+        assert_eq!(finding_records(work).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn readers_return_empty_when_no_findings_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(count_finding_json(tmp.path()).unwrap(), 0);
+        assert!(finding_records(tmp.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn readers_prefer_results_even_when_legacy_also_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path();
+        seed_finding(&work.join("results").join("findings").join("F-new"));
+        seed_finding(&work.join("findings").join("F-old"));
+        // results/ exists, so only its finding is seen; the legacy one is ignored.
+        assert_eq!(count_finding_json(work).unwrap(), 1);
+        assert_eq!(finding_records(work).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn runner_handoff_collects_findings_from_results_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        seed_finding(&work.join("results").join("findings").join("F-1"));
+        let manifest = tmp.path().join("runners.json");
+        fs::write(&manifest, r#"{"runners":[]}"#).unwrap();
+        let out = tmp.path().join("handoff.json");
+        let handoff = runner_handoff_file(&manifest, "r1", &work, &out).unwrap();
+        let artifacts = handoff["artifacts"].as_array().unwrap();
+        assert!(
+            artifacts.iter().any(|a| a["kind"] == "finding"
+                && a["path"]
+                    .as_str()
+                    .is_some_and(|path| path.contains("results/findings/F-1"))),
+            "handoff did not collect the results-layout finding: {handoff}"
+        );
+    }
+
+    fn seed_replay_input(finding_dir: &Path) {
+        seed_finding(finding_dir);
+        fs::write(finding_dir.join("testcase.bin"), b"replay").unwrap();
+    }
+
+    #[test]
+    fn ci_evidence_finds_replay_input_in_results_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path();
+        seed_replay_input(&work.join("results").join("findings").join("F-1"));
+        let missing = missing_required_work_artifacts(work, &["replay_input".to_owned()]).unwrap();
+        assert!(
+            missing.is_empty(),
+            "replay_input reported missing: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn ci_evidence_finds_replay_input_in_legacy_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path();
+        seed_replay_input(&work.join("findings").join("F-1"));
+        let missing = missing_required_work_artifacts(work, &["replay_input".to_owned()]).unwrap();
+        assert!(
+            missing.is_empty(),
+            "replay_input reported missing: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn export_collects_replay_input_from_results_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        seed_replay_input(&work.join("results").join("findings").join("F-1"));
+        let manifest = write_export_manifest(&ExportOptions {
+            work_dir: work,
+            out: tmp.path().join("export.json"),
+            bundle_dir: None,
+            policy: None,
+            update_packs: Vec::new(),
+            audit_log: None,
+            runner_manifest: None,
+            runner_plan: None,
+            required_artifacts: vec!["replay_input".to_owned()],
+        })
+        .unwrap();
+        assert!(
+            manifest["artifacts"].as_array().unwrap().iter().any(|a| {
+                a["kind"] == "replay_input" && a["path"] == "results/findings/F-1/testcase.bin"
+            }),
+            "export did not collect the results-layout replay input: {manifest}"
+        );
+        assert_eq!(manifest["required_artifacts"]["missing"], json!([]));
+    }
+}

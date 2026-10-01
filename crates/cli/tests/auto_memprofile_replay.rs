@@ -80,6 +80,7 @@ fn mem_profile_flags_amplified_allocation_input() {
     );
 
     let finding = work
+        .join("results")
         .join("findings")
         .join("F-MEM-0000")
         .join("finding.json");
@@ -95,6 +96,7 @@ fn mem_profile_flags_amplified_allocation_input() {
     );
     // The reproducer is the large input (first byte 200).
     let repro = work
+        .join("results")
         .join("findings")
         .join("F-MEM-0000")
         .join("testcase.bin");

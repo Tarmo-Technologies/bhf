@@ -31,10 +31,10 @@ fn tempdir(name: &str) -> std::path::PathBuf {
     dir
 }
 
-/// Read every finding.json under `<work>/findings/` and return the parsed values.
+/// Read every finding.json under `<work>/results/findings/` and return the parsed values.
 fn read_findings(work: &Path) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(work.join("findings")) else {
+    let Ok(entries) = std::fs::read_dir(work.join("results").join("findings")) else {
         return out;
     };
     for entry in entries.flatten() {

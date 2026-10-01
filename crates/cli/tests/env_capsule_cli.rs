@@ -113,7 +113,7 @@ fn env_capsule_replays_environment_driven_crash() {
 }
 
 fn has_crash_finding(work: &Path) -> bool {
-    std::fs::read_dir(work.join("findings"))
+    std::fs::read_dir(work.join("results").join("findings"))
         .map(|d| {
             d.flatten().any(|e| {
                 e.file_name().to_string_lossy().starts_with("F-0000")

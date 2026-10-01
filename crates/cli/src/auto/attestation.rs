@@ -85,10 +85,10 @@ pub(crate) fn write_attestation(
     tally.values().sum()
 }
 
-/// Read every `<work>/findings/*/finding.json` into an [`Evidence`] record.
+/// Read every `<work>/results/findings/*/finding.json` into an [`Evidence`] record.
 fn collect_evidence(work_dir: &Path) -> Vec<Evidence> {
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(work_dir.join("findings")) else {
+    let Ok(entries) = std::fs::read_dir(corpus::layout::findings_dir(work_dir)) else {
         return out;
     };
     for entry in entries.flatten() {
@@ -229,7 +229,7 @@ mod tests {
     use super::*;
 
     fn write_finding(dir: &Path, id: &str, body: Value) {
-        let d = dir.join("findings").join(id);
+        let d = dir.join("results").join("findings").join(id);
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join("finding.json"), serde_json::to_vec(&body).unwrap()).unwrap();
     }

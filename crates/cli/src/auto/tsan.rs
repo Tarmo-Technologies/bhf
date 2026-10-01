@@ -361,7 +361,7 @@ fn is_noise_frame(file: &str, hdir: &str) -> bool {
 /// Persist one TSan finding as a runtime crash (`classification: unhandled`) so the
 /// confirmation join + attestation treat it like any other fuzz-found defect.
 fn write_tsan_finding(work: &Path, id: &str, harness_id: &str, file: &str, line: u64) -> bool {
-    let dir = work.join("findings").join(id);
+    let dir = corpus::layout::finding_dir(work, id);
     if std::fs::create_dir_all(&dir).is_err() {
         return false;
     }
@@ -447,7 +447,8 @@ mod tests {
             "21"
         );
         let finding =
-            std::fs::read_to_string(work.join("findings/F-TSAN-0000/finding.json")).unwrap();
+            std::fs::read_to_string(work.join("results/findings/F-TSAN-0000/finding.json"))
+                .unwrap();
         assert!(finding.contains("BHF-556"));
         assert!(finding.contains("race.c"));
 

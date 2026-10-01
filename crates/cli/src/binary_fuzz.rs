@@ -105,6 +105,10 @@ pub(crate) struct BinaryMinimizeSummary {
 }
 
 pub fn run(args: BinaryFuzzArgs) -> i32 {
+    if let Err(error) = crate::workdir::prepare(&args.work_dir) {
+        bhfeprintln!("error: {error:#}");
+        return 1;
+    }
     match run_inner(args) {
         Ok(summary) => {
             println!(
@@ -131,7 +135,7 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
     } else {
         seeds
     };
-    let findings_dir = args.work_dir.join("findings");
+    let findings_dir = corpus::layout::findings_dir(&args.work_dir);
     fs::create_dir_all(&findings_dir)
         .with_context(|| format!("create {}", findings_dir.display()))?;
 

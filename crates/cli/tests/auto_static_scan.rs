@@ -48,7 +48,7 @@ fn static_flag_runs_tree_scan_and_merges_findings() {
 
     // The static scan must have produced at least one F-STATIC finding, written
     // straight into the findings dir alongside any fuzz findings.
-    let findings_dir = work_dir.join("findings");
+    let findings_dir = work_dir.join("results").join("findings");
     let static_findings: Vec<_> = std::fs::read_dir(&findings_dir)
         .expect("findings dir exists")
         .flatten()

@@ -408,13 +408,26 @@ pub fn build_report(options: &ReportOptions) -> Result<ReportDocument, ReportErr
 /// degrades to non-relativised paths) when no run ledger is reachable — never
 /// fails the report.
 fn discover_source_root(findings_dir: &Path) -> Option<String> {
-    let candidates = [
-        findings_dir.parent().map(|p| p.join("auto/run.json")),
-        Some(findings_dir.join("auto/run.json")),
-    ];
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    // Results layout: <work>/results/findings -> <work>/auto/run.json. Only when
+    // the parent segment is literally `results`, so a legacy <work>/findings dir
+    // does not reach up to <parent-of-work>/auto/run.json.
+    if findings_dir
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == corpus::layout::RESULTS_DIR)
+    {
+        if let Some(grandparent) = findings_dir.parent().and_then(Path::parent) {
+            candidates.push(grandparent.join("auto/run.json"));
+        }
+    }
+    // legacy <work>/findings -> <work>/auto/run.json
+    if let Some(parent) = findings_dir.parent() {
+        candidates.push(parent.join("auto/run.json"));
+    }
+    candidates.push(findings_dir.join("auto/run.json"));
     candidates
         .into_iter()
-        .flatten()
         .find_map(|path| read_source_root_from_run_json(&path))
 }
 
@@ -2161,12 +2174,26 @@ def candidate_harnesses(finding):
     for fixture in (finding.get("fixture_path"), FIXTURE_PATH):
         if fixture:
             yield Path(fixture)
-    # 3) <work>/auto/<harness_id>/<leaf> relative to this finding dir
+    # 3) <work>/{harnesses,auto,generated_harnesses}/<harness_id>/<leaf>. Derive
+    #    the work dir name-awarely (mirrors corpus::layout::work_dir_for_finding):
+    #    results layout is <work>/results/findings/<id>, legacy is <work>/findings/<id>.
+    #    Search the work dir first, then the finding's parent as a flat-layout
+    #    fallback; never probe above the work dir.
     hid = finding.get("harness_id") or HARNESS_ID
     if hid:
-        for root in (HERE.parent.parent, HERE.parent):
-            for leaf in ("main", "main_afl", "main.exe", "main_afl.exe"):
-                yield root / "auto" / hid / leaf
+        if HERE.parent.name == "findings" and HERE.parent.parent.name == "results":
+            work = HERE.parent.parent.parent
+        elif HERE.parent.name == "findings":
+            work = HERE.parent.parent
+        else:
+            work = HERE.parent
+        roots = [work]
+        if HERE.parent != work:
+            roots.append(HERE.parent)
+        for root in roots:
+            for sub in ("harnesses", "auto", "generated_harnesses"):
+                for leaf in ("main", "main_afl", "main.exe", "main_afl.exe"):
+                    yield root / sub / hid / leaf
 
 
 def resolve_harness(finding):
@@ -3289,6 +3316,108 @@ mod tests {
         ReportDocument, ReportError, ReportOptions, RunReport, REPORT_SCHEMA_VERSION,
     };
     use confidence_model::{ConfidenceLabel, TrainingSample};
+
+    #[test]
+    fn source_root_found_from_results_findings_depth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path();
+        std::fs::create_dir_all(work.join("auto")).unwrap();
+        std::fs::create_dir_all(work.join("results/findings")).unwrap();
+        std::fs::write(work.join("auto/run.json"), r#"{"source_root":"/src"}"#).unwrap();
+        assert_eq!(
+            super::discover_source_root(&work.join("results/findings")).as_deref(),
+            Some("/src")
+        );
+    }
+
+    #[test]
+    fn source_root_legacy_depth_prefers_work_over_parent_decoy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = tmp.path();
+        let work = outer.join("work");
+        std::fs::create_dir_all(work.join("findings")).unwrap();
+        std::fs::create_dir_all(work.join("auto")).unwrap();
+        std::fs::create_dir_all(outer.join("auto")).unwrap();
+        // Decoy one level above the work dir must NOT win for a legacy <work>/findings.
+        std::fs::write(outer.join("auto/run.json"), r#"{"source_root":"/decoy"}"#).unwrap();
+        std::fs::write(work.join("auto/run.json"), r#"{"source_root":"/real"}"#).unwrap();
+        assert_eq!(
+            super::discover_source_root(&work.join("findings")).as_deref(),
+            Some("/real")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repro_py_runs_harness_from_work_dir_not_above() {
+        use std::os::unix::fs::PermissionsExt;
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("SKIP repro_py_runs_harness_from_work_dir_not_above: python3 not found");
+            return;
+        }
+
+        let script = super::render_repro_py(
+            "testcase.bin",
+            "",
+            "h1",
+            "detect_leaks=0",
+            "print_stacktrace=1",
+            &serde_json::Map::new(),
+            &[],
+        );
+
+        let plant_stub = |path: &std::path::Path| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            // Writes a `RAN` marker next to itself when executed.
+            std::fs::write(path, "#!/bin/sh\n: > \"$(dirname \"$0\")/RAN\"\nexit 0\n").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+
+        // Run the script inside each work dir's finding directory and assert the
+        // work-dir harness ran while the decoy one level above the work dir did not.
+        for finding_rel in ["work/results/findings/F-1", "work2/findings/F-1"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let outer = tmp.path();
+            let finding = outer.join(finding_rel);
+            std::fs::create_dir_all(&finding).unwrap();
+            std::fs::write(finding.join("replay.py"), &script).unwrap();
+            std::fs::write(finding.join("finding.json"), r#"{"harness_id":"h1"}"#).unwrap();
+            std::fs::write(finding.join("testcase.bin"), b"x").unwrap();
+
+            // work dir = everything above results/findings or findings.
+            let work = if finding_rel.contains("results/findings") {
+                finding
+                    .parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+            } else {
+                finding.parent().unwrap().parent().unwrap()
+            };
+            plant_stub(&work.join("harnesses/h1/main"));
+            plant_stub(&outer.join("harnesses/h1/main")); // decoy above the work dir
+
+            let status = std::process::Command::new("python3")
+                .arg(finding.join("replay.py"))
+                .status()
+                .unwrap();
+            assert!(status.success(), "replay.py failed for {finding_rel}");
+            assert!(
+                work.join("harnesses/h1/RAN").is_file(),
+                "work-dir harness did not run for {finding_rel}"
+            );
+            assert!(
+                !outer.join("harnesses/h1/RAN").is_file(),
+                "decoy above the work dir ran for {finding_rel}"
+            );
+        }
+    }
 
     #[test]
     fn relativize_to_source_root_strips_prefix_everywhere() {

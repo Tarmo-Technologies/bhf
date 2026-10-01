@@ -24,7 +24,7 @@ use std::path::Path;
 /// and the number of findings emitted.
 ///
 /// `findings_root` is the same directory the fuzz path's `FindingEmitter` uses;
-/// findings land at `findings_root/findings/<id>/finding.json`.
+/// findings land at `findings_root/results/findings/<id>/finding.json`.
 pub fn emit_report_only(candidate: &Candidate, reason: String, findings_root: &Path) -> Outcome {
     let dialect = candidate.dialect.map(|d| d.as_str().to_owned());
     let finding_ids = write_static_findings(candidate, findings_root).unwrap_or_default();
@@ -59,7 +59,7 @@ fn write_static_findings(candidate: &Candidate, findings_root: &Path) -> Option<
     let report = static_analysis::scan(&options).ok()?;
 
     let source_canon = std::fs::canonicalize(source).ok();
-    let findings_dir = findings_root.join("findings");
+    let findings_dir = corpus::layout::findings_dir(findings_root);
     let mut written: Vec<String> = Vec::new();
     for f in report
         .findings
@@ -244,7 +244,7 @@ pub fn emit_tree_static_findings(root: &Path, work: &Path) -> usize {
     // on `main.c`, never the user's code. Drop every finding under the work-dir so
     // `--static` reports the target tree, not bhf's scaffolding.
     let work_canon = std::fs::canonicalize(work).unwrap_or_else(|_| work.to_path_buf());
-    let findings_dir = work.join("findings");
+    let findings_dir = corpus::layout::findings_dir(work);
     let mut written = 0usize;
     let mut next_index = 0usize;
     for f in report.findings.iter() {
@@ -378,7 +378,7 @@ mod tests {
         assert!(written >= 1, "the user's app.c weakness must be reported");
 
         // Every emitted finding must be on app.c, never the work-dir harness.
-        let findings_dir = work.join("findings");
+        let findings_dir = work.join("results").join("findings");
         for entry in std::fs::read_dir(&findings_dir).unwrap().flatten() {
             let fj = entry.path().join("finding.json");
             if !fj.exists() {
@@ -431,7 +431,7 @@ mod tests {
         let written = emit_tree_static_findings(&root, &work);
         assert!(written >= 2, "expected the taint + pattern findings");
 
-        let findings_dir = work.join("findings");
+        let findings_dir = work.join("results").join("findings");
         let mut saw_taint = false;
         let mut saw_pattern = false;
         for entry in std::fs::read_dir(&findings_dir).unwrap().flatten() {
@@ -536,7 +536,7 @@ mod tests {
         assert!(count >= 1, "expected >=1 static finding, got {count}");
 
         // Every emitted finding.json carries a non-empty CWE.
-        let findings_dir = work.join("findings");
+        let findings_dir = work.join("results").join("findings");
         let mut saw_cwe = false;
         for entry in std::fs::read_dir(&findings_dir).unwrap() {
             let fj = entry.unwrap().path().join("finding.json");

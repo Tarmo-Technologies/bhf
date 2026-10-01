@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[test]
 fn report_subcommand_writes_json_and_markdown_reports() {
     let root = temp_dir("write");
-    let findings = root.join("findings");
+    let findings = root.join("results").join("findings");
     let out = root.join("reports");
     write_finding(
         &findings.join("F-0001-report"),
@@ -59,7 +59,7 @@ fn report_subcommand_writes_json_and_markdown_reports() {
 #[test]
 fn report_subcommand_writes_sarif_when_requested() {
     let root = temp_dir("sarif");
-    let findings = root.join("findings");
+    let findings = root.join("results").join("findings");
     let out = root.join("reports");
     write_finding(
         &findings.join("F-0001-sarif"),
@@ -101,7 +101,7 @@ fn report_subcommand_writes_sarif_when_requested() {
 #[test]
 fn report_subcommand_generates_repro_adb_for_finding_testcase() {
     let root = temp_dir("repro-adb");
-    let findings = root.join("findings");
+    let findings = root.join("results").join("findings");
     let out = root.join("reports");
     let finding_dir = findings.join("F-0001-repro");
     write_finding(
@@ -159,7 +159,7 @@ fn report_subcommand_generates_replay_py_for_every_finding() {
     // A C/C++ sanitizer finding (lsan leak) — no Ada anywhere — still gets a
     // standalone, syntactically-valid replay.py surfaced in the writeup + JSON.
     let root = temp_dir("replay-py");
-    let findings = root.join("findings");
+    let findings = root.join("results").join("findings");
     let out = root.join("reports");
     let finding_dir = findings.join("F-0002-py");
     write_finding(
@@ -247,7 +247,7 @@ fn report_subcommand_generates_replay_py_for_every_finding() {
 #[test]
 fn report_subcommand_writes_junit_when_requested() {
     let root = temp_dir("junit");
-    let findings = root.join("findings");
+    let findings = root.join("results").join("findings");
     let out = root.join("reports");
     write_finding(
         &findings.join("F-0001-junit"),

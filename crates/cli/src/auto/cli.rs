@@ -853,6 +853,7 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
             .canonicalize()
             .unwrap_or(args.work_dir.clone()),
     );
+    crate::workdir::prepare(&work)?;
     // Register the report dir NOW so an uncaught panic anywhere below (discovery,
     // IDL/CORBA scaffolding, ranking, report) can still flush the bug report.
     crate::auto::bug_report::set_output_dir(work.join("auto"));
@@ -3779,7 +3780,7 @@ impl AutoSummary {
             let _ = writeln!(
                 s,
                 "  Evidence:     {}/",
-                self.work.join("findings").display()
+                corpus::layout::findings_dir(&self.work).display()
             );
         }
         let _ = writeln!(s);
@@ -3898,7 +3899,11 @@ impl AutoSummary {
         );
         let _ = writeln!(s, "  harnesses: {}/<harness-id>/", harness_root.display());
         if self.findings > 0 {
-            let _ = writeln!(s, "  findings:  {}/", self.work.join("findings").display());
+            let _ = writeln!(
+                s,
+                "  findings:  {}/",
+                corpus::layout::findings_dir(&self.work).display()
+            );
         }
         let _ = writeln!(s, "  summary:   {}", auto_dir.join("summary.txt").display());
         s
@@ -6177,7 +6182,7 @@ mod tests {
             out.contains("requirements: /w/auto/missing-deps.txt"),
             "{out}"
         );
-        assert!(out.contains("findings:  /w/findings/"), "{out}");
+        assert!(out.contains("findings:  /w/results/findings/"), "{out}");
         assert!(out.contains("summary:   /w/auto/summary.txt"), "{out}");
     }
 
