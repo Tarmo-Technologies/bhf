@@ -163,7 +163,14 @@ Deeper CFG precision, richer taint modeling, and larger rule packs remain
 ongoing hardening work.
 
 `bhf binary scan <PATH>` writes `binary-inventory.json` with offline binary
-metadata for ELF, PE, Mach-O, ar archives, and raw firmware-style blobs. The
+metadata for ELF, PE, Mach-O, `ar` archives (static `.a` libraries and Debian
+`.deb` packages), and raw firmware-style blobs. Containers are traversed
+recursively: a `.deb`'s `data.tar.*` / `control.tar.*` members are decompressed
+(gzip, xz, or zstd — all pure-Rust, no external tools) and walked as tar
+archives, so each contained binary is inventoried with nested-container
+provenance in its path (e.g. `pkg.deb!data.tar.zst!usr/bin/foo`). Decompression
+is size-capped (`--max-bytes`, else 1 GiB) and nesting is depth-bounded, so a
+decompression or recursion bomb is skipped rather than exhausting memory. The
 inventory records format, architecture, bitness, endianness, size, SHA-256,
 ELF note build IDs, producer/toolchain provenance (GCC/clang/Go/Rust version from
 embedded strings), the Go module dependency tree extracted from a static Go
@@ -215,6 +222,17 @@ under `<work-dir>/findings/BF-NNNN/` as `kind: binary_crash` findings with the
 command, input mode, testcase, environment, binary SHA-256, stderr excerpt, and
 exit/timeout signature. Existing `bhf replay`, `bhf minimize`, and
 `bhf ci --fail-on ...` understand these binary findings.
+
+`--engine builtin|afl-qemu|auto` selects the execution engine: `builtin`
+replays the seeds and detects crashes (no mutation/coverage); `afl-qemu` drives
+coverage-guided mutation on a binary-only / foreign-arch target via AFL++'s QEMU
+mode (`afl-fuzz -Q`); `auto` (the default) uses `afl-qemu` when its toolchain is
+present and otherwise falls back to `builtin`. Under `afl-qemu`, `--timeout-ms`
+is passed to `afl-fuzz` as the per-execution timeout (`-t`) so the mutation
+campaign and the crash-replay oracle share one policy, and `--mem-mb <MiB|none>`
+sets the child memory limit (`afl-fuzz -m`); it defaults to `none` because QEMU
+mode maps a large virtual address space and a tight cap aborts the campaign.
+Both effective limits are recorded in the run-provenance JSON.
 
 `bhf differential --harness-a <A> --harness-b <B> --inputs <DIR>` replays
 each input through two implementations and emits BHF-301 output-divergence
@@ -430,6 +448,9 @@ distinguish sandboxed and unsandboxed executions.
 `bhf fuzz` flags (libFuzzer-parity knobs and engine controls):
 
 - `--engine <builtin|afl++>` — engine to run. Default `builtin`.
+- `--afl-mode <native|qemu|frida>` — AFL++ execution mode for `--engine afl++`. `native` (default) uses compile-time instrumentation; `qemu` (`afl-fuzz -Q`) and `frida` (`afl-fuzz -O`) add coverage inside a stripped, source-less dependency the harness loads, without rebuilding it. Ignored by the builtin engine.
+- `--afl-path <DIR>` — AFL++ install directory. Sets `AFL_PATH` and locates `afl-fuzz`, so QEMU/Frida mode finds `afl-qemu-trace` / `afl-frida-trace.so` from a build that is not on `PATH`.
+- `--afl-inst-range <RANGE>` — scope binary-only instrumentation to a module or address range (e.g. `target.so` or `0x555000-0x556000`). Repeatable; joined into `AFL_QEMU_INST_RANGES` (`--afl-mode qemu`) or `AFL_FRIDA_INST_RANGES` (`--afl-mode frida`). Requires a binary-only `--afl-mode`.
 - `--iterations <N>` — execution cap. Defaults to `256` when neither this nor `--time` is set; with `--time` set and this omitted, the run is bounded only by the time budget.
 - `--time <DURATION>` — whole-campaign wall-clock budget (e.g. `30s`, `5m`, `1h`).
 - `--max-len <BYTES>` — maximum generated input length (libFuzzer `-max_len`). Default `4096`. With adaptive length control on this is the ceiling.
@@ -485,6 +506,16 @@ For AFL++ on a generated C/C++ harness:
 ```sh
 bhf build bhf_work --harness H-CPP000A --c-engine afl++
 bhf fuzz bhf_work --harness H-CPP000A --engine afl++ --time 30s --seed-input smoke
+```
+
+To add coverage inside a stripped, source-less library the harness loads, run
+AFL++ in QEMU (or Frida) binary-only mode and scope instrumentation to that
+module so the campaign sees edges in the dependency, not just the harness:
+
+```sh
+bhf build bhf_work --harness H-CPP000A --c-engine afl++
+bhf fuzz bhf_work --harness H-CPP000A --engine afl++ \
+  --afl-mode qemu --afl-inst-range libtarget.so --time 30s --seed-input smoke
 ```
 
 `bhf clean` is conservative when no scope is selected. Use `--compact` to
