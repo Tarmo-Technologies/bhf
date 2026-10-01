@@ -232,9 +232,35 @@ runs:
       if: ${{ steps.run.outputs.exit != '' && steps.run.outputs.exit != '0' }}
       shell: bash
       run: |
-        if [[ -f "${{ steps.run.outputs.ci_json }}" ]]; then
+        set -uo pipefail
+        ci_json="${{ steps.run.outputs.ci_json }}"
+        work="$RUNNER_TEMP/bhf_work"
+        run_json="$work/auto/run.json"
+        bug_json="$work/auto/bug-report.json"
+        if [[ -f "$ci_json" ]]; then
           echo "::error title=bhf::gate failed (exit ${{ steps.run.outputs.exit }}) — a fuzz-confirmed finding was introduced in this PR's changed code."
-        else
-          echo "::error title=bhf::bhf ci errored (exit ${{ steps.run.outputs.exit }}) before producing a result — see the 'Run bhf' step log; this is a tool/setup failure, not a finding."
+          exit 1
         fi
+        # No ci-json means bhf produced no fuzz RESULT. That is only a real failure
+        # when something actually broke: a harness failed to build/link/run, an
+        # internal panic/codegen-bug, or a confirmed finding. When every discovered
+        # target was simply not auto-harnessable (an unsupported parameter type, a
+        # &self method with no no-arg constructor, ...) there was nothing to fuzz —
+        # a bhf capability gap, NOT a defect in this PR — so pass with a notice
+        # rather than a red check. run.json's summary is the structured signal.
+        if [[ -f "$run_json" ]]; then
+          hard=$(jq -r '[.summary.failed_build, .summary.unrecoverable_link, .summary.unrecoverable_runtime, .summary.findings, .summary.built_and_fuzzed] | map(. // 0) | add' "$run_json" 2>/dev/null || echo 1)
+          panics=$(jq -r '[.issues[]? | select(.category == "panic" or .category == "codegen-bug")] | length' "$bug_json" 2>/dev/null || echo 0)
+          discovered=$(jq -r '.summary.discovered // 0' "$run_json" 2>/dev/null || echo 0)
+          if [[ "$hard" == "0" && "$panics" == "0" ]]; then
+            echo "::notice title=bhf::no auto-harnessable targets in this PR's changed code (${discovered} discovered, 0 fuzzable — unsupported parameter types / no byte decoder). Nothing to fuzz, so this is a pass, not a failure. The unsupported-type rows in the bhf bug report are tool-capability gaps worth sending to the maintainer."
+            {
+              echo "### bhf"
+              echo ""
+              echo "- no auto-harnessable targets in the changed code (\`${discovered}\` discovered, \`0\` fuzzable) — nothing to fuzz, **not a failure**."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+        fi
+        echo "::error title=bhf::bhf ci errored (exit ${{ steps.run.outputs.exit }}) before producing a result — see the 'Run bhf' step log; this is a tool/setup failure, not a finding."
         exit 1
