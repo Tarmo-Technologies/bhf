@@ -2,6 +2,47 @@
 
 # Changelog
 
+## 0.2.34 - 2026-10-01
+
+`bhf binary scan` now recurses into Debian `.deb` packages and tar archives.
+Previously a `.deb` was recognized as an `ar` container but its compressed
+`data.tar.*` member was never decoded, so a package holding one ELF reported
+`0 files inventoried`. The scan now decompresses `data.tar.*` / `control.tar.*`
+members — gzip, xz, and zstd via pure-Rust decoders (`flate2`, `lzma-rs`,
+`ruzstd`), so no external `tar`/`dpkg` is needed and the RHEL 7 / Windows MSVC /
+cross build matrices stay C-toolchain-free — walks the tar, and inventories each
+contained binary with nested-container provenance in its path (e.g.
+`pkg.deb!data.tar.zst!usr/bin/foo`). Decompression is size-capped (`--max-bytes`,
+else 1 GiB) and nesting is depth-bounded, so a decompression or recursion bomb is
+skipped rather than exhausting memory. (#43)
+
+`bhf binary fuzz --engine afl-qemu` now applies `--timeout-ms` to the mutation
+campaign. It documented `--timeout-ms` as the per-execution timeout but never
+passed it to `afl-fuzz`, so the campaign auto-calibrated its own timeout while
+only the crash-replay oracle honored the flag; it is now threaded through as
+`afl-fuzz -t` so both use one policy. A new `--mem-mb <MiB|none>` flag sets the
+AFL child memory limit (`afl-fuzz -m`); it defaults to `none` because QEMU mode
+maps a large virtual address space and a tight cap aborts the campaign. Both
+effective limits are recorded in the run-provenance JSON. (#44)
+
+`bhf fuzz --engine afl++` gains AFL++ binary-only modes so a stripped,
+source-less dependency the harness loads can still be covered. `--afl-mode
+native|qemu|frida` selects compile-time instrumentation (the default,
+byte-for-byte unchanged), QEMU mode (`afl-fuzz -Q`), or Frida mode (`-O`);
+`--afl-path DIR` points at a non-`PATH` AFL++ install (sets `AFL_PATH`, locates
+`afl-fuzz`); and the repeatable `--afl-inst-range` scopes instrumentation to a
+module or address range via `AFL_QEMU_INST_RANGES` / `AFL_FRIDA_INST_RANGES`. The
+effective mode, path, and ranges are recorded in `run.json`. (#45)
+
+All three are documented in the CLI reference (`docs/site/cli.md`); `--help`
+already carried the flags.
+
+Maintenance: the `bhf_runtrace_shim` LD_PRELOAD interposer now compiles under
+rustc 1.99 (which made `invalid_runtime_symbol_definitions` deny-by-default); the
+`bhf PR` dogfood gate treats "no auto-harnessable changed targets" as a pass
+rather than a tool/setup failure; and the `cargo-minor-and-patch` dependency
+group was bumped (including `thiserror` 2.0.21).
+
 ## 0.2.33 - 2026-09-28
 
 The built-in `bhf fuzz` engine now arms its in-campaign input-to-state feedback
