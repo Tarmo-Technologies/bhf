@@ -13,6 +13,14 @@
 //! the hooked process may already be inside its own allocator on the
 //! path we're being called from.
 
+// This crate is an LD_PRELOAD interposer: it intentionally defines `#[no_mangle]
+// extern "C"` symbols (e.g. `open(path, flags, mode_t)`) that shadow libc at load
+// time. rustc 1.99 added `invalid_runtime_symbol_definitions` (deny-by-default),
+// which flags `open` because libc's canonical declaration is variadic
+// (`..., ...`). The fixed-arity interposer signature is the standard, ABI-safe
+// idiom for overriding `open`, so allow it crate-wide.
+#![allow(invalid_runtime_symbol_definitions)]
+
 #[cfg(target_os = "linux")]
 pub mod dlsym;
 #[cfg(target_os = "linux")]
