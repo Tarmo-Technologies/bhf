@@ -225,6 +225,27 @@ pub struct FuzzArgs {
     #[arg(long, value_enum, default_value_t = FuzzEngine::Builtin)]
     pub engine: FuzzEngine,
 
+    /// AFL++ execution mode for `--engine afl++`: `native` (default, compile-time
+    /// instrumentation), `qemu` (`afl-fuzz -Q`), or `frida` (`afl-fuzz -O`).
+    /// QEMU/Frida add coverage inside a stripped, source-less dependency the
+    /// harness loads; the harness itself is still built as usual. Ignored by the
+    /// builtin engine.
+    #[arg(long = "afl-mode", value_enum, default_value_t = AflMode::Native)]
+    pub afl_mode: AflMode,
+
+    /// Directory of the AFL++ installation. Sets `AFL_PATH` and locates
+    /// `afl-fuzz`, so QEMU/Frida mode finds `afl-qemu-trace` / `afl-frida-trace.so`
+    /// from a build that is not on `PATH`.
+    #[arg(long = "afl-path", value_name = "DIR")]
+    pub afl_path: Option<PathBuf>,
+
+    /// Scope binary-only instrumentation to a module or address range, e.g.
+    /// `target.so` or `0x555000-0x556000`. Repeatable; joined into
+    /// `AFL_QEMU_INST_RANGES` (`--afl-mode qemu`) or `AFL_FRIDA_INST_RANGES`
+    /// (`--afl-mode frida`). Requires a binary-only `--afl-mode`.
+    #[arg(long = "afl-inst-range", value_name = "RANGE")]
+    pub afl_inst_ranges: Vec<String>,
+
     /// Run multiple fuzz workers. Use a number or `auto`.
     #[arg(long, value_parser = parse_worker_count)]
     pub workers: Option<FuzzWorkerCount>,
@@ -585,6 +606,57 @@ pub enum FuzzEngine {
     AflPlusPlus,
 }
 
+/// AFL++ execution mode for `--engine afl++` (issue #45). `native` uses
+/// compile-time instrumentation (the historical behavior); `qemu`/`frida` add
+/// AFL++'s binary-only modes so coverage is collected inside a stripped,
+/// source-less dependency the harness loads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AflMode {
+    Native,
+    Qemu,
+    Frida,
+}
+
+impl AflMode {
+    /// The afl-fuzz flag that selects this binary-only mode, or `None` for the
+    /// default compile-time-instrumented (`native`) run.
+    fn flag(self) -> Option<&'static str> {
+        match self {
+            AflMode::Native => None,
+            AflMode::Qemu => Some("-Q"),
+            AflMode::Frida => Some("-O"),
+        }
+    }
+
+    /// The AFL env var that scopes binary-only instrumentation to a module/range,
+    /// or `None` for `native` (ranges do not apply without a binary-only mode).
+    fn inst_ranges_env(self) -> Option<&'static str> {
+        match self {
+            AflMode::Native => None,
+            AflMode::Qemu => Some("AFL_QEMU_INST_RANGES"),
+            AflMode::Frida => Some("AFL_FRIDA_INST_RANGES"),
+        }
+    }
+
+    /// Resolve `--afl-inst-range` values into the `(env_key, value)` pair to set
+    /// on afl-fuzz, or `None` when there is nothing to scope (no ranges, or
+    /// `native` mode).
+    fn inst_ranges_env_value(self, ranges: &[String]) -> Option<(&'static str, String)> {
+        if ranges.is_empty() {
+            return None;
+        }
+        self.inst_ranges_env().map(|key| (key, ranges.join(",")))
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            AflMode::Native => "native",
+            AflMode::Qemu => "qemu",
+            AflMode::Frida => "frida",
+        }
+    }
+}
+
 /// Parse a comma-separated engine list (`auto --engine builtin,afl++`) into an
 /// ordered, de-duplicated `Vec<FuzzEngine>`. Order is preserved as written; the
 /// first occurrence of each engine wins. Whitespace around names is tolerated.
@@ -738,6 +810,22 @@ pub(crate) struct FuzzRunSummary {
     /// its real throughput is in AFL's own `fuzzer_stats`).
     #[serde(default)]
     pub(crate) executions_per_sec: f64,
+    /// AFL++ binary-only run provenance (issue #45): the effective `--afl-mode`,
+    /// `--afl-path`, and instrumentation ranges. `None` for the builtin engine
+    /// and omitted from `run.json` for a plain `native` afl++ run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) afl: Option<AflRunProvenance>,
+}
+
+/// AFL++ binary-only settings recorded in `run.json` so a run is reproducible
+/// (issue #45). Serialized only when non-default.
+#[derive(Debug, Serialize)]
+pub(crate) struct AflRunProvenance {
+    pub(crate) mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) afl_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) inst_ranges: Vec<String>,
 }
 
 /// Throughput in executions/sec, guarding the zero-elapsed case (returns 0.0
@@ -871,6 +959,12 @@ struct PreparedFuzzRun {
     stop_after_findings: Option<usize>,
     rng_seed: u64,
     engine: FuzzEngine,
+    /// AFL++ binary-only mode (issue #45); `Native` for the default source run.
+    afl_mode: AflMode,
+    /// Explicit AFL++ install directory (`--afl-path`), or `None` for `PATH`.
+    afl_path: Option<PathBuf>,
+    /// Instrumentation ranges for `--afl-mode qemu|frida`.
+    afl_inst_ranges: Vec<String>,
     mode: actionability::RunMode,
     extra_env: Vec<(String, String)>,
     /// Keeps the standalone builtin driver's coverage bitmap alive for the run.
@@ -1089,6 +1183,9 @@ pub(crate) fn run_one_target_programmatic_with_runner(
         work_dir: work_dir.to_path_buf(),
         harness: harness_id.to_owned(),
         engine: FuzzEngine::Builtin,
+        afl_mode: AflMode::Native,
+        afl_path: None,
+        afl_inst_ranges: Vec::new(),
         workers: None,
         iterations: Some(iterations),
         time: time_budget,
@@ -1159,6 +1256,9 @@ pub(crate) fn run_afl_plus_plus_programmatic(
         work_dir: work_dir.to_path_buf(),
         harness: harness_id.to_owned(),
         engine: FuzzEngine::AflPlusPlus,
+        afl_mode: AflMode::Native,
+        afl_path: None,
+        afl_inst_ranges: Vec::new(),
         workers: None,
         iterations: Some(0),
         time: time_budget,
@@ -1516,6 +1616,9 @@ fn prepare(args: FuzzArgs) -> Result<PreparedFuzzRun, String> {
         stop_after_findings: args.stop_after_findings,
         rng_seed: args.rng_seed,
         engine: args.engine,
+        afl_mode: args.afl_mode,
+        afl_path: args.afl_path,
+        afl_inst_ranges: args.afl_inst_ranges,
         mode: args.mode,
         extra_env,
         _local_coverage_map: local_coverage_map,
@@ -3012,6 +3115,7 @@ fn run_builtin_with_progress(
         findings: finding_ids,
         elapsed_secs,
         executions_per_sec: executions_per_sec(executions, elapsed_secs),
+        afl: None,
     };
     if prepared.print_final_stats {
         bhfeprintln!(
@@ -3183,8 +3287,11 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
     use std::time::Instant;
 
     reset_target_entry(&prepared.extra_env);
+    if !prepared.afl_inst_ranges.is_empty() && prepared.afl_mode.inst_ranges_env().is_none() {
+        return Err("--afl-inst-range requires --afl-mode qemu or frida".to_owned());
+    }
     let (_, cmplog_summary) = load_cmplog_for_run(prepared.cmplog_log.as_deref(), &prepared.seeds);
-    let afl_fuzz = which_executable("afl-fuzz")?;
+    let afl_fuzz = resolve_afl_fuzz(prepared.afl_path.as_deref())?;
     let generated_dictionary = find_generated_dictionary(&prepared.work_dir, &prepared.harness_id);
     // find_harness_executable already preferred main_afl for the AFL
     // engine. If we landed on a libFuzzer `main` because main_afl was
@@ -3261,6 +3368,11 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
         // lenient (a slow seed is skipped, not treated as a fatal hang).
         .arg("-t")
         .arg("1000+");
+    // Issue #45: binary-only modes add `-Q` (QEMU) or `-O` (Frida) so a stripped,
+    // source-less dependency still gets coverage. `native` adds nothing.
+    if let Some(mode_flag) = prepared.afl_mode.flag() {
+        afl_cmd.arg(mode_flag);
+    }
     if let Some(dictionary) = &generated_dictionary {
         afl_cmd.arg("-x").arg(dictionary);
     }
@@ -3340,6 +3452,17 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
             key,
             multicore_fuzz::merge_sanitizer_options(inherited.as_deref(), "symbolize=0"),
         );
+    }
+    // Issue #45: point `-Q`/`-O` at a non-PATH AFL++ build and scope binary-only
+    // instrumentation to the module/ranges of interest.
+    if let Some(dir) = &prepared.afl_path {
+        afl_cmd.env("AFL_PATH", dir);
+    }
+    if let Some((env_key, value)) = prepared
+        .afl_mode
+        .inst_ranges_env_value(&prepared.afl_inst_ranges)
+    {
+        afl_cmd.env(env_key, value);
     }
     apply_runaway_rlimits(&mut afl_cmd);
     // Run afl-fuzz in its own process group so a hard-deadline kill can take down
@@ -3564,6 +3687,11 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
         // `out/default/fuzzer_stats` (`execs_per_sec`). 0.0 only when afl-fuzz
         // wrote no stats.
         executions_per_sec: afl_execs_per_sec.unwrap_or(0.0),
+        afl: Some(AflRunProvenance {
+            mode: prepared.afl_mode.as_str().to_owned(),
+            afl_path: prepared.afl_path.clone(),
+            inst_ranges: prepared.afl_inst_ranges.clone(),
+        }),
     };
     write_run_summary(&prepared.work_dir, &summary)?;
     Ok(summary)
@@ -4226,6 +4354,20 @@ fn sanitizer_name(sanitizer: multicore_fuzz::Sanitizer) -> &'static str {
         multicore_fuzz::Sanitizer::Tsan => "tsan",
         multicore_fuzz::Sanitizer::Lsan => "lsan",
     }
+}
+
+/// Locate `afl-fuzz`, preferring an explicit `--afl-path` install directory
+/// (issue #45) before falling back to a `PATH` search.
+fn resolve_afl_fuzz(afl_path: Option<&Path>) -> Result<PathBuf, String> {
+    if let Some(dir) = afl_path {
+        for name in ["afl-fuzz", "afl-fuzz.exe"] {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+    which_executable("afl-fuzz")
 }
 
 fn which_executable(name: &str) -> Result<PathBuf, String> {
@@ -5778,7 +5920,10 @@ mod signal_classification_tests {
 
 #[cfg(test)]
 mod engine_list_tests {
-    use super::{parse_engine_list, read_bounded_head_tail, read_seed_file_prefix, FuzzEngine};
+    use super::{
+        parse_engine_list, read_bounded_head_tail, read_seed_file_prefix, resolve_afl_fuzz,
+        AflMode, FuzzEngine,
+    };
 
     #[test]
     fn diagnostic_capture_keeps_both_ends_under_a_fixed_bound() {
@@ -5829,6 +5974,59 @@ mod engine_list_tests {
         );
         assert!(parse_engine_list("").is_err());
         assert!(parse_engine_list("honggfuzz").is_err());
+    }
+
+    #[test]
+    fn afl_mode_maps_to_binary_only_fuzz_flags() {
+        // Issue #45: native adds nothing; qemu/frida select AFL's binary-only modes.
+        assert_eq!(AflMode::Native.flag(), None);
+        assert_eq!(AflMode::Qemu.flag(), Some("-Q"));
+        assert_eq!(AflMode::Frida.flag(), Some("-O"));
+    }
+
+    #[test]
+    fn afl_inst_ranges_use_mode_specific_env() {
+        let ranges = vec!["target.so".to_owned(), "0x1000-0x2000".to_owned()];
+        assert_eq!(
+            AflMode::Qemu.inst_ranges_env_value(&ranges),
+            Some(("AFL_QEMU_INST_RANGES", "target.so,0x1000-0x2000".to_owned()))
+        );
+        assert_eq!(
+            AflMode::Frida.inst_ranges_env_value(&ranges),
+            Some((
+                "AFL_FRIDA_INST_RANGES",
+                "target.so,0x1000-0x2000".to_owned()
+            ))
+        );
+        // No ranges, or native mode, never sets an env var.
+        assert_eq!(AflMode::Qemu.inst_ranges_env_value(&[]), None);
+        assert_eq!(AflMode::Native.inst_ranges_env_value(&ranges), None);
+    }
+
+    #[test]
+    fn resolve_afl_fuzz_prefers_afl_path_then_falls_back() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("bhf-aflpath-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join(if cfg!(windows) {
+            "afl-fuzz.exe"
+        } else {
+            "afl-fuzz"
+        });
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        assert_eq!(resolve_afl_fuzz(Some(&dir)).unwrap(), bin);
+        // A directory without afl-fuzz falls through to the PATH search (which may
+        // or may not find one — either way it must not return the missing path).
+        let empty = dir.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_ne!(
+            resolve_afl_fuzz(Some(&empty)).ok(),
+            Some(empty.join("afl-fuzz"))
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -8065,6 +8263,9 @@ mod auto_path_tests {
             work_dir: tmpdir(),
             harness: "H-X".to_owned(),
             engine: FuzzEngine::Builtin,
+            afl_mode: AflMode::Native,
+            afl_path: None,
+            afl_inst_ranges: Vec::new(),
             workers: None,
             iterations: Some(1),
             time: None,
