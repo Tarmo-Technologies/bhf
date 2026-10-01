@@ -54,6 +54,10 @@ BHF fuzzes sixteen languages — **Ada, C, C++, Rust, Java, Python, Perl, Go, CO
 | chrono (Rust) | RFC3339 timestamps in `bhf auto` reports | MIT/Apache-2.0 | **Core** | Low | `default-features = false` + `clock` only; no serde / windows-bindings pull-in. |
 | which (Rust) | Compiler binary discovery on PATH | MIT | **Core** | Low | Allow. |
 | libc (Rust) | Unix `prctl` / `setrlimit` safety rails on spawned fuzz harnesses | MIT/Apache-2.0 | **Core** | Low | Allow. |
+| tar (Rust) | `data.tar` member extraction for `binary scan` DEB/tarball recursion | MIT/Apache-2.0 | **Core** | Low | Allow. Pure-Rust (no `-sys`); keeps RHEL 7 / Windows MSVC / cross builds C-toolchain-free. |
+| flate2 (Rust) | gzip (`data.tar.gz`) decoding for `binary scan` container recursion | MIT/Apache-2.0 | **Core** | Low | Allow. `default-features = false` + `rust_backend` (miniz_oxide) only — no `libz-sys`. |
+| lzma-rs (Rust) | xz (`data.tar.xz`) decoding for `binary scan` container recursion | MIT | **Core** | Low | Allow. Pure-Rust; no `liblzma-sys`/C linkage. |
+| ruzstd (Rust) | zstd (`data.tar.zst`) decoding for `binary scan` container recursion | MIT | **Core** | Low | Allow. Pure-Rust zstd (distinct from the C `zstd` candidate above); no `zstd-sys`. |
 | ureq + rustls/webpki roots (Rust) | Bounded synchronous HTTPS for optional OpenAI/Anthropic LLM providers | MIT/Apache-2.0; certificate trust-anchor data is CDLA-Permissive-2.0 | **Core (optional network path at runtime)** | Remote data disclosure if explicitly selected; certificate data has a permissive attribution license | No request occurs by default. API keys are environment-only, response sizes/timeouts are bounded, and local/MCP modes remain token-free. |
 | criterion | Bench (dev-only) | Apache-2.0/MIT | **Candidate** dev (not in `Cargo.lock`) | Low | Pre-cleared for benchmarking; not currently a dev-dependency. |
 | toml (Rust) | Golden-file manifest parsing in tests | MIT/Apache-2.0 | **Core dev** | Low | Dev-only dependency for hand-written corpus manifests. |
