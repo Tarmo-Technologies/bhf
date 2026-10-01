@@ -509,7 +509,9 @@ annotations, posts a sticky summary comment, and fails only on a fuzz-confirmed 
 - **SBOM / SCA** — multi-language SBOMs across 12 ecosystems (CycloneDX + OpenVEX) with
   offline CVE/VEX correlation.
 - **Binary triage** — `bhf binary scan` / `binary fuzz` over ELF, PE, Mach-O, and raw
-  firmware blobs, with source-unavailable crash replay.
+  firmware blobs — recursing into `ar` / Debian `.deb` packages and their compressed
+  (`gzip`/`xz`/`zstd`) tar members — with source-unavailable crash replay, including
+  AFL++ QEMU/Frida binary-only coverage.
 
 Behavioral / taint oracles (path control, command injection, insecure temp, sensitive env) run
 under the Linux runtime virtualisation shim on native C/C++/Ada/Rust/Go/COBOL/Fortran
@@ -528,8 +530,8 @@ off for Java, C#, JavaScript/TypeScript, and cross/emulated targets.
 | `bhf ci <src> --changed-since <ref>` | PR-native: fuzz only the diff, emit SARIF, gate on confirmed findings |
 | `bhf static-scan <src> --sarif` | Offline SAST only (JSON/Markdown/SARIF) |
 | `bhf sbom <src> --vuln-db <db>` | SBOM + offline CVE/VEX correlation |
-| `bhf binary scan <bin>` | Inventory + hardening triage for ELF/PE/Mach-O/firmware |
-| `bhf binary fuzz <bin>` | Fuzz a source-unavailable executable |
+| `bhf binary scan <bin>` | Inventory + hardening triage for ELF/PE/Mach-O/firmware; recurses into `ar`/`.deb` + tar archives |
+| `bhf binary fuzz <bin>` | Fuzz a source-unavailable executable (builtin, or AFL++ QEMU mode) |
 | `bhf sloc <src>` | Fast per-language SLOC count |
 | `bhf generate-harness <file> --target <fn>` | Generate one harness by hand |
 | `bhf llm status\|test\|prompt\|assist` | Optional bounded LLM assistance; MCP is served by `bhf-daemon --mcp` |
