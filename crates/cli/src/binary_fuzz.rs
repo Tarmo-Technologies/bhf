@@ -38,9 +38,17 @@ pub struct BinaryFuzzArgs {
     #[arg(long = "seed-file")]
     pub seed_files: Vec<PathBuf>,
 
-    /// Per-execution timeout in milliseconds.
+    /// Per-execution timeout in milliseconds. Applied to the afl-qemu mutation
+    /// campaign (`afl-fuzz -t`) as well as the crash-replay oracle, so both use
+    /// the same policy.
     #[arg(long, default_value_t = 10_000)]
     pub timeout_ms: u64,
+
+    /// Child-process memory limit in MiB for the afl-qemu engine (`afl-fuzz -m`).
+    /// Accepts an integer or `none`; defaults to `none` because QEMU mode maps a
+    /// large virtual address space and a tight cap aborts the campaign.
+    #[arg(long = "mem-mb", default_value = "none")]
+    pub mem_mb: String,
 
     /// Environment variable passed as KEY=VALUE. Repeatable.
     #[arg(long = "env")]
@@ -277,12 +285,15 @@ fn which_on_path(name: &str) -> Option<PathBuf> {
 
 /// Build the `afl-fuzz -Q` argv for a binary-only target. File-input mode appends
 /// `@@` (AFL substitutes the testcase path); stdin mode omits it (AFL feeds the
-/// testcase on stdin). Kept pure for unit testing.
+/// testcase on stdin). `-t` sets the per-exec timeout (ms) and `-m` the child
+/// memory limit so the campaign matches the replay oracle. Kept pure for testing.
 fn afl_qemu_argv(
     binary: &Path,
     seeds_dir: &Path,
     out_dir: &Path,
     secs: u64,
+    timeout_ms: u64,
+    mem: &str,
     mode: BinaryInputMode,
 ) -> Vec<String> {
     let mut argv = vec![
@@ -293,6 +304,10 @@ fn afl_qemu_argv(
         out_dir.display().to_string(),
         "-V".to_owned(),
         secs.to_string(),
+        "-t".to_owned(),
+        timeout_ms.to_string(),
+        "-m".to_owned(),
+        mem.to_owned(),
         "--".to_owned(),
         binary.display().to_string(),
     ];
@@ -300,6 +315,20 @@ fn afl_qemu_argv(
         argv.push("@@".to_owned());
     }
     argv
+}
+
+/// Resolve the `--mem-mb` value into the afl-fuzz `-m` argument plus the value to
+/// record in run provenance. `none`/`0` map to AFL's unlimited `none`; any other
+/// value must be a MiB integer.
+fn afl_mem_arg(mem_mb: &str) -> anyhow::Result<(String, Value)> {
+    let trimmed = mem_mb.trim();
+    if trimmed.eq_ignore_ascii_case("none") || trimmed == "0" {
+        return Ok(("none".to_owned(), Value::String("none".to_owned())));
+    }
+    let mib: u64 = trimmed
+        .parse()
+        .map_err(|_| anyhow!("--mem-mb must be a MiB integer or 'none', got '{mem_mb}'"))?;
+    Ok((mib.to_string(), json!(mib)))
 }
 
 /// The afl-fuzz `-V` wall-clock budget in seconds: `--time` if given, else
@@ -365,7 +394,16 @@ fn run_afl_qemu(
     }
 
     let secs = afl_qemu_budget_secs(args.time.as_deref(), args.iterations);
-    let argv = afl_qemu_argv(&args.binary, &seeds_dir, &out_dir, secs, args.input_mode);
+    let (mem_arg, mem_provenance) = afl_mem_arg(&args.mem_mb)?;
+    let argv = afl_qemu_argv(
+        &args.binary,
+        &seeds_dir,
+        &out_dir,
+        secs,
+        args.timeout_ms,
+        &mem_arg,
+        args.input_mode,
+    );
     let afl_trace_dir = aq
         .afl_qemu_trace
         .parent()
@@ -454,6 +492,8 @@ fn run_afl_qemu(
         "engine": "afl-qemu",
         "afl_qemu_trace": aq.afl_qemu_trace,
         "time_secs": secs,
+        "timeout_ms": args.timeout_ms,
+        "mem_limit_mb": mem_provenance,
         "findings": finding_ids
     }))
 }
@@ -904,11 +944,27 @@ mod afl_qemu_tests {
             Path::new("/s"),
             Path::new("/o"),
             7,
+            1000,
+            "none",
             BinaryInputMode::Stdin,
         );
         assert_eq!(
             argv,
-            vec!["-Q", "-i", "/s", "-o", "/o", "-V", "7", "--", "/b/target"]
+            vec![
+                "-Q",
+                "-i",
+                "/s",
+                "-o",
+                "/o",
+                "-V",
+                "7",
+                "-t",
+                "1000",
+                "-m",
+                "none",
+                "--",
+                "/b/target"
+            ]
         );
     }
 
@@ -919,10 +975,53 @@ mod afl_qemu_tests {
             Path::new("/s"),
             Path::new("/o"),
             7,
+            1000,
+            "none",
             BinaryInputMode::File,
         );
         assert_eq!(argv.last().map(String::as_str), Some("@@"));
         assert_eq!(argv.iter().filter(|a| *a == "-Q").count(), 1);
+    }
+
+    #[test]
+    fn argv_carries_timeout_and_memory_limits() {
+        // Issue #44: `--timeout-ms` must reach afl-fuzz as `-t`, and `--mem-mb`
+        // as `-m`, so the mutation campaign and the replay oracle agree.
+        let argv = afl_qemu_argv(
+            Path::new("/b/target"),
+            Path::new("/s"),
+            Path::new("/o"),
+            7,
+            2500,
+            "1024",
+            BinaryInputMode::Stdin,
+        );
+        let t = argv.iter().position(|a| a == "-t").expect("-t present");
+        assert_eq!(argv[t + 1], "2500");
+        let m = argv.iter().position(|a| a == "-m").expect("-m present");
+        assert_eq!(argv[m + 1], "1024");
+    }
+
+    #[test]
+    fn mem_arg_defaults_to_unlimited_and_parses_mib() {
+        // QEMU mode needs an unlimited memory ceiling by default.
+        assert_eq!(
+            afl_mem_arg("none").unwrap(),
+            ("none".to_owned(), json!("none"))
+        );
+        assert_eq!(
+            afl_mem_arg("NONE").unwrap(),
+            ("none".to_owned(), json!("none"))
+        );
+        assert_eq!(
+            afl_mem_arg("0").unwrap(),
+            ("none".to_owned(), json!("none"))
+        );
+        assert_eq!(
+            afl_mem_arg("512").unwrap(),
+            ("512".to_owned(), json!(512u64))
+        );
+        assert!(afl_mem_arg("garbage").is_err());
     }
 
     #[test]
