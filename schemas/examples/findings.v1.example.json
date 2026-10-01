@@ -72,7 +72,7 @@
       "raw_ref": "findings/F-0000-1a2b3c4d/finding.json"
     },
     {
-      "id": "F-SCA-5e6f7a8b",
+      "id": "F-SCA-203b6b399c3b3dac",
       "kind": "sca",
       "producer": "sbom",
       "rule": { "id": "CVE-2026-0001", "slug": null, "name": null },
@@ -120,7 +120,7 @@
   ],
   "groups": [
     { "key": "c0ffee00c0ffee00c0ffee00c0ffee00", "representative": "F-0000-1a2b3c4d", "members": ["F-0000-1a2b3c4d"] },
-    { "key": "CVE-2026-0001|pkg:npm/example", "representative": "F-SCA-5e6f7a8b", "members": ["F-SCA-5e6f7a8b"] }
+    { "key": "CVE-2026-0001|pkg:npm/example", "representative": "F-SCA-203b6b399c3b3dac", "members": ["F-SCA-203b6b399c3b3dac"] }
   ],
   "errors": []
 }

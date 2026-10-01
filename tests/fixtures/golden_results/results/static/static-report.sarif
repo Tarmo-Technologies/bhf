@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [
+    {
+      "originalUriBaseIds": {
+        "SRCROOT": {
+          "uri": "file:///src/demo/"
+        }
+      },
+      "properties": {
+        "bhfStaticSchemaVersion": "bhf.static.v1",
+        "findingKind": "static"
+      },
+      "results": [
+        {
+          "help": {
+            "text": "Use a bounded copy."
+          },
+          "kind": "fail",
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "weak.c",
+                  "uriBaseId": "SRCROOT"
+                },
+                "region": {
+                  "startColumn": 5,
+                  "startLine": 9
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "strcpy into fixed buffer"
+          },
+          "partialFingerprints": {
+            "bhfStaticFingerprint": "fp-weak-9"
+          },
+          "properties": {
+            "baselineStatus": "new",
+            "confidence": "medium",
+            "cwe": "CWE-120",
+            "findingKind": "static",
+            "fingerprint": "fp-weak-9",
+            "language": "c"
+          },
+          "ruleId": "BHF-401"
+        }
+      ],
+      "tool": {
+        "driver": {
+          "informationUri": "https://github.com/Tarmo-Technologies/bhf",
+          "name": "BHF",
+          "rules": [
+            {
+              "id": "BHF-401",
+              "name": "bhf.static/unsafe-string-copy",
+              "shortDescription": {
+                "text": "Unsafe string copy call in source"
+              }
+            }
+          ],
+          "semanticVersion": "0.3.0",
+          "version": "0.3.0"
+        }
+      }
+    }
+  ],
+  "version": "2.1.0"
+}

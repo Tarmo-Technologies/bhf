@@ -1,0 +1,14 @@
+{
+  "classification": "unhandled",
+  "created_at": "2026-10-01T11:30:00Z",
+  "exception": {
+    "message": "data race",
+    "name": "TSAN_DATA_RACE",
+    "sanitizer": "tsan"
+  },
+  "finding_kind": "runtime",
+  "harness_id": "H-C-parse",
+  "id": "F-TSAN-0000",
+  "rule_id": "BHF-556",
+  "schema_version": "bhf.finding.v1"
+}

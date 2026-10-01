@@ -1,0 +1,20 @@
+{
+  "binary": {
+    "path": "/bin/demo",
+    "sha256": "3333333333333333333333333333333333333333333333333333333333333333"
+  },
+  "confidence": "high",
+  "crash": {
+    "exit_code": null,
+    "signature": "signal:11:x",
+    "timeout": false
+  },
+  "created_at": "2026-10-01T11:50:00Z",
+  "finding_kind": "binary",
+  "id": "BF-0001",
+  "kind": "binary_crash",
+  "message": "Binary crashed under BHF binary-fuzz",
+  "rule_id": "BHF-501",
+  "schema_version": "bhf.finding.v1",
+  "severity": "high"
+}

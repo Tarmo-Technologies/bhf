@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """bhf results documents validate against the checked-in JSON Schemas."""
 
+import hashlib
 import json
 import unittest
 from pathlib import Path
@@ -85,6 +86,35 @@ class SchemaFilesTest(unittest.TestCase):
         bad = json.loads(json.dumps(doc))
         bad["producers"][0]["status"] = "failed"
         self.assertNotEqual(_errors(validator, bad), [])
+
+    def test_golden_results_validate(self):
+        results = GOLDEN / "results"
+        doc = json.loads((results / "findings.json").read_text())
+        self.assertEqual(_errors(_validator("bhf.findings.v1.schema.json"), doc), [])
+        manifest = json.loads((results / "manifest.json").read_text())
+        self.assertEqual(_errors(_validator("bhf.results-manifest.v1.schema.json"), manifest), [])
+        finding_validator = _validator("bhf.finding.v1.schema.json")
+        records = sorted((results / "findings").glob("*/finding.json"))
+        self.assertNotEqual(records, [])
+        for path in records:
+            with self.subTest(path.parent.name):
+                self.assertEqual(_errors(finding_validator, json.loads(path.read_text())), [])
+
+    def test_golden_attestation_digests_match_the_files(self):
+        results = GOLDEN / "results"
+        statement = json.loads((results / "attestation.json").read_text())
+        subjects = statement["subject"]
+        self.assertNotEqual(subjects, [])
+        for subject in subjects:
+            with self.subTest(subject["name"]):
+                path = results / subject["name"]
+                self.assertTrue(path.is_file(), path)
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                self.assertEqual(digest, subject["digest"]["sha256"])
+
+    def test_golden_covers_every_kind(self):
+        doc = json.loads((GOLDEN / "results" / "findings.json").read_text())
+        self.assertEqual({f["kind"] for f in doc["findings"]}, KINDS)
 
 
 if __name__ == "__main__":

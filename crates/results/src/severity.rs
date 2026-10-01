@@ -40,6 +40,16 @@ pub fn resolve(
     }
 }
 
+/// The single severity -> SARIF `level` mapping; every renderer that emits
+/// SARIF uses this instead of keeping its own table.
+pub fn sarif_level(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Critical | Severity::High => "error",
+        Severity::Medium => "warning",
+        Severity::Low | Severity::Info => "note",
+    }
+}
+
 /// Resolve straight from an on-disk `finding.json` (used by `ci`).
 pub fn resolve_raw(raw: &Value, finding_path: Option<&Path>) -> Severity {
     let record = actionability::existing_actionability_or_backfill(
@@ -81,6 +91,15 @@ mod tests {
                 "{impact:?} {record:?} {rule:?} {forced}"
             );
         }
+    }
+
+    #[test]
+    fn sarif_level_maps_every_severity() {
+        assert_eq!(sarif_level(Critical), "error");
+        assert_eq!(sarif_level(High), "error");
+        assert_eq!(sarif_level(Medium), "warning");
+        assert_eq!(sarif_level(Low), "note");
+        assert_eq!(sarif_level(Info), "note");
     }
 
     #[test]

@@ -3275,6 +3275,14 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/results/src/lock.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/results/src/manifest.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/results/src/migrate.rs",
       "license": "Apache-2.0"
     },
@@ -3283,7 +3291,35 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/results/src/normalize.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/results/src/rebuild.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/results/src/render/csv.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/results/src/render/index_md.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/results/src/render/mod.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/results/src/render/sarif.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/results/src/severity.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/results/tests/golden.rs",
       "license": "Apache-2.0"
     },
     {

@@ -79,6 +79,12 @@ fn static_flag_runs_tree_scan_and_merges_findings() {
             .is_some_and(|c| !c.is_empty()),
         "static finding must carry a CWE: {record}"
     );
+    assert!(
+        record["static_fingerprint"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "static finding must carry its static-scan fingerprint: {record}"
+    );
 
     // #484 (fuzz-confirmation join): the `strcpy(buf, name)` at weak.c:9 is a
     // static CWE-120 finding AND a trivially fuzz-reachable stack overflow. The

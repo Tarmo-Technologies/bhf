@@ -1,0 +1,586 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [
+    {
+      "originalUriBaseIds": {
+        "SRCROOT": {
+          "uri": "file:///src/demo/"
+        }
+      },
+      "properties": {
+        "bhfFindingsSchemaVersion": "bhf.findings.v1",
+        "bhfReportSchemaVersion": "bhf.report.v2",
+        "bhfRunId": "last"
+      },
+      "results": [
+        {
+          "kind": "fail",
+          "level": "error",
+          "locations": [
+            {
+              "message": {
+                "text": "Actionability fix location: sanitizer_top_non_runtime_frame"
+              },
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/parse.c",
+                  "uriBaseId": "SRCROOT"
+                },
+                "region": {
+                  "startLine": 42
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "unhandled in H-C-parse: ASAN_HEAP_BUFFER_OVERFLOW: heap-buffer-overflow on address 0x602000000010"
+          },
+          "partialFingerprints": {
+            "bhfClusterKey": "c0ffee00",
+            "bhfClusterKeyFull": "c0ffee00c0ffee00",
+            "bhfExceptionSignature": "aa11bb22",
+            "bhfIssueKey": "c0ffee00c0ffee00",
+            "bhfPrimary": "c0ffee00c0ffee00",
+            "bhfRuleSignature": "9e863260e2589254"
+          },
+          "properties": {
+            "actionabilityConfidence": "medium",
+            "actionabilityEntryPath": {
+              "kind": "harness",
+              "source": "testcase.bin",
+              "target": "H-C-parse"
+            },
+            "actionabilityFixLocation": {
+              "line": 42,
+              "path": "src/parse.c",
+              "reason": "sanitizer_top_non_runtime_frame"
+            },
+            "actionabilityImpact": "critical",
+            "actionabilityNextSteps": [
+              "Inspect src/parse.c as the primary fix location."
+            ],
+            "actionabilityPatchHints": [
+              {
+                "guidance": "Bounds-check the index/length before the access at `src/parse.c:42` (`parse_header`): validate it against the buffer size before reading or writing.",
+                "rule_id": "BHF-201",
+                "title": "Bounds-check before the access"
+              }
+            ],
+            "actionabilityProsthetics": {
+              "used": false
+            },
+            "actionabilityReplayStatus": null,
+            "actionabilityVerdict": "likely_reachable",
+            "bhf.rule_slug": "bhf.c/heap-buffer-overflow",
+            "bhfExceptionSignature": "aa11bb22",
+            "bhfFindingId": "F-0000-1a2b3c4d",
+            "classification": "unhandled",
+            "clusterFallback": false,
+            "clusterKey": "c0ffee00",
+            "clusterQuality": {
+              "frame_count": 1,
+              "signal": "stack_root",
+              "stability": "stable"
+            },
+            "clusterRepresentative": "F-0000-1a2b3c4d",
+            "clusterSize": 1,
+            "confirmation": "fuzz",
+            "cwe": "CWE-787",
+            "cwe_top_25": 2,
+            "cwes": [
+              "CWE-122"
+            ],
+            "generatedReproAda": null,
+            "generatedReproPy": null,
+            "precision": "high",
+            "replayCommand": "bhf replay --finding F-0000-1a2b3c4d",
+            "reproAdaOmittedReason": null,
+            "sandbox": null,
+            "security-severity": "9.5",
+            "severity": "critical",
+            "tags": [
+              "CWE-787",
+              "cwe-top-25-2",
+              "cwe-top-25",
+              "bhf.slug:bhf.c/heap-buffer-overflow"
+            ]
+          },
+          "relatedLocations": [],
+          "ruleId": "BHF-201",
+          "stacks": [
+            {
+              "frames": [
+                {
+                  "location": {
+                    "logicalLocations": [
+                      {
+                        "kind": "function",
+                        "name": "parse_header"
+                      }
+                    ],
+                    "message": {
+                      "text": "Sanitizer stack frame"
+                    },
+                    "physicalLocation": {
+                      "artifactLocation": {
+                        "uri": "src/parse.c",
+                        "uriBaseId": "SRCROOT"
+                      },
+                      "region": {
+                        "startLine": 42
+                      }
+                    }
+                  }
+                }
+              ],
+              "message": {
+                "text": "asan stack trace"
+              }
+            }
+          ]
+        },
+        {
+          "kind": "fail",
+          "level": "error",
+          "locations": [],
+          "message": {
+            "text": "unhandled in H-C-parse: TSAN_DATA_RACE: data race"
+          },
+          "partialFingerprints": {
+            "bhfExceptionSignature": "unknown",
+            "bhfIssueKey": "F-TSAN-0000",
+            "bhfPrimary": "F-TSAN-0000",
+            "bhfRuleSignature": "bbae8822fa629228"
+          },
+          "properties": {
+            "actionabilityConfidence": "low",
+            "actionabilityEntryPath": {
+              "kind": "harness",
+              "source": "testcase.bin",
+              "target": "H-C-parse"
+            },
+            "actionabilityFixLocation": null,
+            "actionabilityImpact": "high",
+            "actionabilityNextSteps": [],
+            "actionabilityPatchHints": [],
+            "actionabilityProsthetics": {
+              "used": false
+            },
+            "actionabilityReplayStatus": null,
+            "actionabilityVerdict": "likely_reachable",
+            "bhf.rule_slug": "bhf.c/data-race",
+            "bhfExceptionSignature": "unknown",
+            "bhfFindingId": "F-TSAN-0000",
+            "classification": "unhandled",
+            "confirmation": "fuzz",
+            "cwe": "CWE-362",
+            "cwe_top_25": null,
+            "cwes": [
+              "CWE-362"
+            ],
+            "generatedReproAda": null,
+            "generatedReproPy": null,
+            "precision": "high",
+            "replayCommand": "bhf replay --finding F-TSAN-0000",
+            "reproAdaOmittedReason": null,
+            "sandbox": null,
+            "security-severity": "6.5",
+            "severity": "high",
+            "tags": [
+              "CWE-362",
+              "bhf.slug:bhf.c/data-race"
+            ]
+          },
+          "relatedLocations": [],
+          "ruleId": "BHF-556"
+        },
+        {
+          "kind": "fail",
+          "level": "error",
+          "locations": [],
+          "message": {
+            "text": "unknown in unknown"
+          },
+          "partialFingerprints": {
+            "bhfExceptionSignature": "unknown",
+            "bhfIssueKey": "BF-0001",
+            "bhfPrimary": "BHF-501:demo:signal:11:x",
+            "bhfRuleSignature": "7c59e2d8539b6a02"
+          },
+          "properties": {
+            "actionabilityConfidence": "high",
+            "actionabilityEntryPath": null,
+            "actionabilityFixLocation": null,
+            "actionabilityImpact": "high",
+            "actionabilityNextSteps": [
+              "Replay the testcase and collect source-location evidence before using this as a security gate."
+            ],
+            "actionabilityPatchHints": [],
+            "actionabilityProsthetics": {
+              "used": false
+            },
+            "actionabilityReplayStatus": null,
+            "actionabilityVerdict": "unknown",
+            "bhf.rule_slug": "bhf.binary/abnormal-exit-or-timeout",
+            "bhfExceptionSignature": "unknown",
+            "bhfFindingId": "BF-0001",
+            "classification": "unknown",
+            "confirmation": "fuzz",
+            "cwe": "CWE-754",
+            "cwe_top_25": null,
+            "cwes": [
+              "CWE-754"
+            ],
+            "generatedReproAda": null,
+            "generatedReproPy": null,
+            "precision": "high",
+            "replayCommand": "bhf replay --finding BF-0001",
+            "reproAdaOmittedReason": null,
+            "sandbox": null,
+            "security-severity": "7.0",
+            "severity": "high",
+            "tags": [
+              "CWE-754",
+              "bhf.slug:bhf.binary/abnormal-exit-or-timeout"
+            ]
+          },
+          "relatedLocations": [],
+          "ruleId": "BHF-501"
+        },
+        {
+          "kind": "fail",
+          "level": "error",
+          "locations": [
+            {
+              "message": {
+                "text": "Actionability fix location: target_entry"
+              },
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "lib/parse.c",
+                  "uriBaseId": "SRCROOT"
+                },
+                "region": {
+                  "startLine": 6
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "static_scan in unknown"
+          },
+          "partialFingerprints": {
+            "bhfExceptionSignature": "unknown",
+            "bhfIssueKey": "F-RO-BHF-401-0000ABCD",
+            "bhfPrimary": "BHF-401:lib/parse.c:6",
+            "bhfRuleSignature": "b597bd5167588db7"
+          },
+          "properties": {
+            "actionabilityConfidence": "medium",
+            "actionabilityEntryPath": null,
+            "actionabilityFixLocation": {
+              "line": 6,
+              "path": "lib/parse.c",
+              "reason": "target_entry"
+            },
+            "actionabilityImpact": "high",
+            "actionabilityNextSteps": [
+              "Replay the testcase and collect source-location evidence before using this as a security gate."
+            ],
+            "actionabilityPatchHints": [],
+            "actionabilityProsthetics": {
+              "used": false
+            },
+            "actionabilityReplayStatus": null,
+            "actionabilityVerdict": "unknown",
+            "bhf.rule_slug": "bhf.static/unsafe-string-copy",
+            "bhfExceptionSignature": "unknown",
+            "bhfFindingId": "F-RO-BHF-401-0000ABCD",
+            "classification": "static_scan",
+            "confirmation": "static",
+            "cwe": "CWE-120",
+            "cwe_top_25": null,
+            "cwes": [
+              "CWE-120"
+            ],
+            "generatedReproAda": null,
+            "generatedReproPy": null,
+            "precision": "medium",
+            "replayCommand": "bhf replay --finding F-RO-BHF-401-0000ABCD",
+            "reproAdaOmittedReason": null,
+            "sandbox": null,
+            "security-severity": "7.0",
+            "severity": "high",
+            "tags": [
+              "CWE-120",
+              "bhf.slug:bhf.static/unsafe-string-copy"
+            ]
+          },
+          "relatedLocations": [],
+          "ruleId": "BHF-401"
+        },
+        {
+          "kind": "fail",
+          "level": "warning",
+          "locations": [],
+          "message": {
+            "text": "divergence in unknown: OUTPUT_DIVERGENCE: stdout bytes differ"
+          },
+          "partialFingerprints": {
+            "bhfExceptionSignature": "dd",
+            "bhfIssueKey": "F-DIFF-0000",
+            "bhfPrimary": "dd",
+            "bhfRuleSignature": "3bda69d55476867d"
+          },
+          "properties": {
+            "actionabilityConfidence": "low",
+            "actionabilityEntryPath": null,
+            "actionabilityFixLocation": null,
+            "actionabilityImpact": "medium",
+            "actionabilityNextSteps": [
+              "Replay the testcase and collect source-location evidence before using this as a security gate."
+            ],
+            "actionabilityPatchHints": [],
+            "actionabilityProsthetics": {
+              "used": false
+            },
+            "actionabilityReplayStatus": null,
+            "actionabilityVerdict": "unknown",
+            "bhf.rule_slug": "bhf.differential/output-divergence",
+            "bhfExceptionSignature": "dd",
+            "bhfFindingId": "F-DIFF-0000",
+            "classification": "divergence",
+            "confirmation": "fuzz",
+            "cwe": "CWE-754",
+            "cwe_top_25": null,
+            "cwes": [
+              "CWE-754"
+            ],
+            "generatedReproAda": null,
+            "generatedReproPy": null,
+            "precision": "medium",
+            "replayCommand": "bhf replay --finding F-DIFF-0000",
+            "reproAdaOmittedReason": null,
+            "sandbox": null,
+            "security-severity": "5.0",
+            "severity": "medium",
+            "tags": [
+              "CWE-754",
+              "bhf.slug:bhf.differential/output-divergence"
+            ]
+          },
+          "relatedLocations": [],
+          "ruleId": "BHF-301"
+        },
+        {
+          "help": {
+            "text": "Use a bounded copy."
+          },
+          "kind": "fail",
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "weak.c",
+                  "uriBaseId": "SRCROOT"
+                },
+                "region": {
+                  "startColumn": 5,
+                  "startLine": 9
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "strcpy into fixed buffer"
+          },
+          "partialFingerprints": {
+            "bhfPrimary": "fp-weak-9",
+            "bhfStaticFingerprint": "fp-weak-9"
+          },
+          "properties": {
+            "baselineStatus": "new",
+            "bhfFindingId": "S-0001",
+            "confidence": "medium",
+            "cwe": "CWE-120",
+            "findingKind": "static",
+            "fingerprint": "fp-weak-9",
+            "language": "c"
+          },
+          "ruleId": "BHF-401"
+        }
+      ],
+      "tool": {
+        "driver": {
+          "informationUri": "https://github.com/Tarmo-Technologies/bhf",
+          "name": "BHF",
+          "rules": [
+            {
+              "defaultConfiguration": {
+                "level": "error"
+              },
+              "fullDescription": {
+                "text": "AddressSanitizer reported a heap-buffer-overflow at a fuzz-reachable site. Out-of-bounds writes lead to remote code execution and out-of-bounds reads to information disclosure."
+              },
+              "help": {
+                "markdown": "AddressSanitizer reported a heap-buffer-overflow at a fuzz-reachable site. Out-of-bounds writes lead to remote code execution and out-of-bounds reads to information disclosure.\n\n**References:**\n\n- https://cwe.mitre.org/data/definitions/787.html\n- https://cwe.mitre.org/top25/\n- https://cwe.mitre.org/top25/archive/2024/2024_cwe_top25.html\n- https://github.com/google/sanitizers/wiki/AddressSanitizer\n",
+                "text": "AddressSanitizer reported a heap-buffer-overflow at a fuzz-reachable site. Out-of-bounds writes lead to remote code execution and out-of-bounds reads to information disclosure.\n\nReferences:\n- https://cwe.mitre.org/data/definitions/787.html\n- https://cwe.mitre.org/top25/\n- https://cwe.mitre.org/top25/archive/2024/2024_cwe_top25.html\n- https://github.com/google/sanitizers/wiki/AddressSanitizer\n"
+              },
+              "helpUri": "https://cwe.mitre.org/data/definitions/787.html",
+              "id": "BHF-201",
+              "name": "bhf.c/heap-buffer-overflow",
+              "properties": {
+                "bhf.slug": "bhf.c/heap-buffer-overflow",
+                "cwe": "CWE-787",
+                "cwe_top_25": 2,
+                "precision": "high",
+                "security-severity": "9.5",
+                "tags": [
+                  "security",
+                  "CWE-787",
+                  "cwe-top-25-2",
+                  "cwe-top-25",
+                  "cert-c:ARR30-C",
+                  "cert-cpp:CTR50-CPP",
+                  "misra-c:Rule 18.1",
+                  "bhf.slug:bhf.c/heap-buffer-overflow"
+                ]
+              },
+              "shortDescription": {
+                "text": "Heap buffer overflow (AddressSanitizer)"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "error"
+              },
+              "fullDescription": {
+                "text": "ThreadSanitizer observed a data race reached by a fuzz corpus input — two threads accessed the same memory without synchronization and at least one wrote, a bug class ASan and UBSan do not detect. A data race is undefined behavior: it causes torn reads/writes, lost updates, and nondeterministic crashes, and a check-then-act race is a TOCTOU security boundary. bhf replays the ASan pass's corpus through a separate TSan-instrumented build to find these without a second fuzz loop; a race only surfaces when the target spawns threads while processing one input. Synchronize the shared access with a mutex or atomics, or remove the sharing."
+              },
+              "help": {
+                "markdown": "ThreadSanitizer observed a data race reached by a fuzz corpus input — two threads accessed the same memory without synchronization and at least one wrote, a bug class ASan and UBSan do not detect. A data race is undefined behavior: it causes torn reads/writes, lost updates, and nondeterministic crashes, and a check-then-act race is a TOCTOU security boundary. bhf replays the ASan pass's corpus through a separate TSan-instrumented build to find these without a second fuzz loop; a race only surfaces when the target spawns threads while processing one input. Synchronize the shared access with a mutex or atomics, or remove the sharing.\n\n**References:**\n\n- https://cwe.mitre.org/data/definitions/362.html\n- https://clang.llvm.org/docs/ThreadSanitizer.html\n",
+                "text": "ThreadSanitizer observed a data race reached by a fuzz corpus input — two threads accessed the same memory without synchronization and at least one wrote, a bug class ASan and UBSan do not detect. A data race is undefined behavior: it causes torn reads/writes, lost updates, and nondeterministic crashes, and a check-then-act race is a TOCTOU security boundary. bhf replays the ASan pass's corpus through a separate TSan-instrumented build to find these without a second fuzz loop; a race only surfaces when the target spawns threads while processing one input. Synchronize the shared access with a mutex or atomics, or remove the sharing.\n\nReferences:\n- https://cwe.mitre.org/data/definitions/362.html\n- https://clang.llvm.org/docs/ThreadSanitizer.html\n"
+              },
+              "helpUri": "https://cwe.mitre.org/data/definitions/362.html",
+              "id": "BHF-556",
+              "name": "bhf.c/data-race",
+              "properties": {
+                "bhf.slug": "bhf.c/data-race",
+                "cwe": "CWE-362",
+                "cwe_top_25": null,
+                "precision": "high",
+                "security-severity": "6.5",
+                "tags": [
+                  "security",
+                  "CWE-362",
+                  "cert-c:CON43-C",
+                  "bhf.slug:bhf.c/data-race"
+                ]
+              },
+              "shortDescription": {
+                "text": "Data race (ThreadSanitizer)"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "error"
+              },
+              "fullDescription": {
+                "text": "A binary-only fuzz run produced a replayable non-zero exit, signal-like abnormal termination, or timeout. The finding records the executable hash, input delivery mode, environment, timeout, and crash signature for offline replay."
+              },
+              "help": {
+                "markdown": "A binary-only fuzz run produced a replayable non-zero exit, signal-like abnormal termination, or timeout. The finding records the executable hash, input delivery mode, environment, timeout, and crash signature for offline replay.\n\n**References:**\n\n- https://cwe.mitre.org/data/definitions/754.html\n",
+                "text": "A binary-only fuzz run produced a replayable non-zero exit, signal-like abnormal termination, or timeout. The finding records the executable hash, input delivery mode, environment, timeout, and crash signature for offline replay.\n\nReferences:\n- https://cwe.mitre.org/data/definitions/754.html\n"
+              },
+              "helpUri": "https://cwe.mitre.org/data/definitions/754.html",
+              "id": "BHF-501",
+              "name": "bhf.binary/abnormal-exit-or-timeout",
+              "properties": {
+                "bhf.slug": "bhf.binary/abnormal-exit-or-timeout",
+                "cwe": "CWE-754",
+                "cwe_top_25": null,
+                "precision": "high",
+                "security-severity": "7.0",
+                "tags": [
+                  "security",
+                  "CWE-754",
+                  "bhf.slug:bhf.binary/abnormal-exit-or-timeout"
+                ]
+              },
+              "shortDescription": {
+                "text": "Binary crash, abnormal exit, or timeout"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "error"
+              },
+              "fullDescription": {
+                "text": "A static source scan found a strcpy/strcat/gets-style call without an evident bound. The call should be replaced by length-aware parsing or bounded copy logic before deeper taint analysis can prove reachability."
+              },
+              "help": {
+                "markdown": "A static source scan found a strcpy/strcat/gets-style call without an evident bound. The call should be replaced by length-aware parsing or bounded copy logic before deeper taint analysis can prove reachability.\n\n**References:**\n\n- https://cwe.mitre.org/data/definitions/120.html\n- https://wiki.sei.cmu.edu/confluence/display/c/STR31-C.+Guarantee+that+storage+for+strings+has+sufficient+space+for+character+data+and+the+null+terminator\n",
+                "text": "A static source scan found a strcpy/strcat/gets-style call without an evident bound. The call should be replaced by length-aware parsing or bounded copy logic before deeper taint analysis can prove reachability.\n\nReferences:\n- https://cwe.mitre.org/data/definitions/120.html\n- https://wiki.sei.cmu.edu/confluence/display/c/STR31-C.+Guarantee+that+storage+for+strings+has+sufficient+space+for+character+data+and+the+null+terminator\n"
+              },
+              "helpUri": "https://cwe.mitre.org/data/definitions/120.html",
+              "id": "BHF-401",
+              "name": "bhf.static/unsafe-string-copy",
+              "properties": {
+                "bhf.slug": "bhf.static/unsafe-string-copy",
+                "cwe": "CWE-120",
+                "cwe_top_25": null,
+                "precision": "medium",
+                "security-severity": "7.0",
+                "tags": [
+                  "security",
+                  "CWE-120",
+                  "cert-c:STR31-C",
+                  "cert-cpp:STR50-CPP",
+                  "misra-c:Rule 21.6",
+                  "bhf.slug:bhf.static/unsafe-string-copy"
+                ]
+              },
+              "shortDescription": {
+                "text": "Unsafe string copy call in source"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "fullDescription": {
+                "text": "Two implementations of the same spec produced different outputs for the same input, indicating a semantic bug in at least one of them. Stderr is excluded from the divergence predicate to avoid sanitizer-cookie flakes."
+              },
+              "help": {
+                "markdown": "Two implementations of the same spec produced different outputs for the same input, indicating a semantic bug in at least one of them. Stderr is excluded from the divergence predicate to avoid sanitizer-cookie flakes.\n\n**References:**\n\n- https://cwe.mitre.org/data/definitions/754.html\n",
+                "text": "Two implementations of the same spec produced different outputs for the same input, indicating a semantic bug in at least one of them. Stderr is excluded from the divergence predicate to avoid sanitizer-cookie flakes.\n\nReferences:\n- https://cwe.mitre.org/data/definitions/754.html\n"
+              },
+              "helpUri": "https://cwe.mitre.org/data/definitions/754.html",
+              "id": "BHF-301",
+              "name": "bhf.differential/output-divergence",
+              "properties": {
+                "bhf.slug": "bhf.differential/output-divergence",
+                "cwe": "CWE-754",
+                "cwe_top_25": null,
+                "precision": "medium",
+                "security-severity": "5.0",
+                "tags": [
+                  "security",
+                  "CWE-754",
+                  "bhf.slug:bhf.differential/output-divergence"
+                ]
+              },
+              "shortDescription": {
+                "text": "Output divergence between implementations"
+              }
+            }
+          ],
+          "semanticVersion": "0.3.0",
+          "version": "0.3.0"
+        }
+      }
+    }
+  ],
+  "version": "2.1.0"
+}

@@ -1,0 +1,719 @@
+{
+  "schema_version": "bhf.findings.v1",
+  "generated_at": "2026-10-01T12:00:00Z",
+  "tool": {
+    "name": "bhf",
+    "version": "0.3.0",
+    "build": "0.3.0"
+  },
+  "source": {
+    "root": "/src/demo",
+    "vcs": null
+  },
+  "producers": [],
+  "counts": {
+    "total": 7,
+    "by_kind": {
+      "binary": 1,
+      "differential": 1,
+      "fuzz": 1,
+      "runtime": 1,
+      "sca": 1,
+      "static": 2
+    },
+    "by_severity": {
+      "critical": 1,
+      "high": 5,
+      "medium": 1
+    },
+    "by_confirmation": {
+      "advisory": 1,
+      "crash_lead": 2,
+      "runtime_oracle": 1,
+      "sanitizer_crash": 1,
+      "static": 2
+    }
+  },
+  "findings": [
+    {
+      "id": "F-0000-1a2b3c4d",
+      "kind": "fuzz",
+      "producer": "fuzz",
+      "rule": {
+        "id": "BHF-201",
+        "slug": "bhf.c/heap-buffer-overflow",
+        "name": "Heap buffer overflow (AddressSanitizer)"
+      },
+      "title": "Heap-based Buffer Overflow in parse_header",
+      "message": "heap-buffer-overflow on address 0x…",
+      "explanation": "This is a buffer overflow: while processing a crafted input, `parse_header` read or wrote past the end of a memory buffer. Out-of-bounds access can corrupt memory, leak data, crash the program, and in some cases be steered into running attacker code. Triggered by the attached test input (`testcase.bin`).",
+      "severity": "critical",
+      "impact": "critical",
+      "confidence": {
+        "level": "medium",
+        "score": 1.0
+      },
+      "cwe": [
+        122
+      ],
+      "confirmation": {
+        "level": "sanitizer_crash",
+        "detail": null
+      },
+      "verdict": "likely_reachable",
+      "location": {
+        "file": "src/parse.c",
+        "line": 42,
+        "column": null,
+        "function": "parse_header"
+      },
+      "fix_location": {
+        "file": "src/parse.c",
+        "line": 42,
+        "column": null,
+        "function": null
+      },
+      "stack": [
+        {
+          "function": "parse_header",
+          "file": "src/parse.c",
+          "line": 42
+        }
+      ],
+      "trace": [],
+      "fingerprint": {
+        "primary": "c0ffee00c0ffee00",
+        "signature": "aa11bb22"
+      },
+      "group": "c0ffee00c0ffee00",
+      "occurrences": 1,
+      "first_seen": "2026-10-01T11:20:00Z",
+      "last_seen": "2026-10-01T11:20:00Z",
+      "reachability": {
+        "kind": "harness",
+        "source": "testcase.bin",
+        "target": "H-C-parse"
+      },
+      "fidelity": {
+        "stubs_used": false,
+        "forced": false,
+        "caveats": []
+      },
+      "remediation": "Bounds-check the index/length before the access at `src/parse.c:42` (`parse_header`): validate it against the buffer size before reading or writing.",
+      "patch_hints": [
+        {
+          "title": "Bounds-check before the access",
+          "guidance": "Bounds-check the index/length before the access at `src/parse.c:42` (`parse_header`): validate it against the buffer size before reading or writing."
+        }
+      ],
+      "reproduce": {
+        "harness_id": "H-C-parse",
+        "command": null,
+        "build": {
+          "sanitizers": [
+            "asan"
+          ],
+          "binary_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+          "build_id": "abcdef01"
+        }
+      },
+      "evidence": {
+        "dir": "findings/F-0000-1a2b3c4d",
+        "files": [
+          {
+            "role": "finding",
+            "path": "findings/F-0000-1a2b3c4d/finding.json",
+            "sha256": "a36cb214534ea62f8ca91f0b0b08a02be791e6af8584e1b1e67a154e044a0b3c",
+            "size": 862
+          },
+          {
+            "role": "testcase",
+            "path": "findings/F-0000-1a2b3c4d/testcase.bin",
+            "sha256": "63c1dd951ffedf6f7fd968ad4efa39b8ed584f162f46e715114ee184f8de9201",
+            "size": 4
+          },
+          {
+            "role": "testcase_minimized",
+            "path": "findings/F-0000-1a2b3c4d/min_testcase.bin",
+            "sha256": "559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd",
+            "size": 1
+          },
+          {
+            "role": "sanitizer_log",
+            "path": "findings/F-0000-1a2b3c4d/sanitizer.log",
+            "sha256": "d70bcf7c257c14037f1840700c456dc7e873a1cad6b67f344d95d85d4c15dcfd",
+            "size": 51
+          }
+        ]
+      },
+      "fuzz": {
+        "exception": {
+          "name": "ASAN_HEAP_BUFFER_OVERFLOW",
+          "message": "heap-buffer-overflow on address 0x…",
+          "sanitizer": "asan"
+        },
+        "classification": "unhandled",
+        "harness_id": "H-C-parse",
+        "dialect": "c11",
+        "oracle": null
+      },
+      "static": null,
+      "sca": null,
+      "binary": null,
+      "raw_ref": "findings/F-0000-1a2b3c4d/finding.json"
+    },
+    {
+      "id": "BF-0001",
+      "kind": "binary",
+      "producer": "binary fuzz",
+      "rule": {
+        "id": "BHF-501",
+        "slug": "bhf.binary/abnormal-exit-or-timeout",
+        "name": "Binary crash, abnormal exit, or timeout"
+      },
+      "title": "Binary crash, abnormal exit, or timeout",
+      "message": "Binary crashed under BHF binary-fuzz",
+      "explanation": "While processing a crafted input, the program hit a fault in the affected code and stopped. At minimum this lets an attacker who can supply this input crash the program; the underlying defect should be reviewed. Triggered by the attached test input (`testcase.bin`).",
+      "severity": "high",
+      "impact": "high",
+      "confidence": {
+        "level": "high",
+        "score": null
+      },
+      "cwe": [
+        754
+      ],
+      "confirmation": {
+        "level": "crash_lead",
+        "detail": null
+      },
+      "verdict": "unknown",
+      "location": null,
+      "fix_location": null,
+      "stack": [],
+      "trace": [],
+      "fingerprint": {
+        "primary": "BHF-501:demo:signal:11:x",
+        "signature": "signal:11:x"
+      },
+      "group": "BHF-501:demo:signal:11:x",
+      "occurrences": 1,
+      "first_seen": "2026-10-01T11:50:00Z",
+      "last_seen": "2026-10-01T11:50:00Z",
+      "reachability": null,
+      "fidelity": {
+        "stubs_used": false,
+        "forced": false,
+        "caveats": []
+      },
+      "remediation": null,
+      "patch_hints": [],
+      "reproduce": {
+        "harness_id": null,
+        "command": null,
+        "build": {
+          "sanitizers": [],
+          "binary_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+          "build_id": null
+        }
+      },
+      "evidence": {
+        "dir": "findings/BF-0001",
+        "files": [
+          {
+            "role": "finding",
+            "path": "findings/BF-0001/finding.json",
+            "sha256": "dca80604bea31e187355ba7fbd7a21661955ef850c95a2d97f6c4cf3cad1efab",
+            "size": 495
+          },
+          {
+            "role": "testcase",
+            "path": "findings/BF-0001/testcase.bin",
+            "sha256": "3f39d5c348e5b79d06e842c114e6cc571583bbf44e4b0ebfda1a01ec05745d43",
+            "size": 1
+          }
+        ]
+      },
+      "fuzz": null,
+      "static": null,
+      "sca": null,
+      "binary": {
+        "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+        "build_id": null,
+        "arch": null,
+        "crash": {
+          "exit_code": null,
+          "signature": "signal:11:x",
+          "timeout": false
+        }
+      },
+      "raw_ref": "findings/BF-0001/finding.json"
+    },
+    {
+      "id": "F-RO-BHF-401-0000ABCD",
+      "kind": "static",
+      "producer": "auto",
+      "rule": {
+        "id": "BHF-401",
+        "slug": "bhf.static/unsafe-string-copy",
+        "name": "Unsafe string copy call in source"
+      },
+      "title": "Unsafe string copy call in source (copy_name)",
+      "message": "Unbounded string copy (strcpy/strcat/gets) with no length limit",
+      "explanation": "While processing a crafted input, the program hit a fault in `copy_name` and stopped. At minimum this lets an attacker who can supply this input crash the program; the underlying defect should be reviewed. Triggered by the attached test input (`testcase.bin`).",
+      "severity": "high",
+      "impact": "high",
+      "confidence": {
+        "level": "medium",
+        "score": 0.95
+      },
+      "cwe": [
+        120
+      ],
+      "confirmation": {
+        "level": "static",
+        "detail": "static"
+      },
+      "verdict": "unknown",
+      "location": {
+        "file": "lib/parse.c",
+        "line": 6,
+        "column": null,
+        "function": "copy_name"
+      },
+      "fix_location": {
+        "file": "lib/parse.c",
+        "line": 6,
+        "column": null,
+        "function": null
+      },
+      "stack": [],
+      "trace": [],
+      "fingerprint": {
+        "primary": "BHF-401:lib/parse.c:6",
+        "signature": null
+      },
+      "group": "BHF-401:lib/parse.c:6",
+      "occurrences": 1,
+      "first_seen": "2026-10-01T11:10:00Z",
+      "last_seen": "2026-10-01T11:10:00Z",
+      "reachability": null,
+      "fidelity": {
+        "stubs_used": false,
+        "forced": false,
+        "caveats": []
+      },
+      "remediation": null,
+      "patch_hints": [],
+      "reproduce": null,
+      "evidence": {
+        "dir": "findings/F-RO-BHF-401-0000ABCD",
+        "files": [
+          {
+            "role": "finding",
+            "path": "findings/F-RO-BHF-401-0000ABCD/finding.json",
+            "sha256": "0941b8b64f8bde95ecb10ca37a0800af818bd7979a5c3d66e69de8dcef68326b",
+            "size": 739
+          }
+        ]
+      },
+      "fuzz": null,
+      "static": {
+        "engine": "bhf-static",
+        "precision": null,
+        "snippet": null,
+        "baseline_status": null,
+        "triage_state": null
+      },
+      "sca": null,
+      "binary": null,
+      "raw_ref": "findings/F-RO-BHF-401-0000ABCD/finding.json"
+    },
+    {
+      "id": "F-SCA-203b6b399c3b3dac",
+      "kind": "sca",
+      "producer": "sbom",
+      "rule": {
+        "id": "CVE-2026-0001",
+        "slug": null,
+        "name": null
+      },
+      "title": "CVE-2026-0001 in example 2.4.2",
+      "message": "test advisory",
+      "explanation": null,
+      "severity": "high",
+      "impact": null,
+      "confidence": {
+        "level": "high",
+        "score": null
+      },
+      "cwe": [
+        1395
+      ],
+      "confirmation": {
+        "level": "advisory",
+        "detail": null
+      },
+      "verdict": null,
+      "location": null,
+      "fix_location": null,
+      "stack": [],
+      "trace": [],
+      "fingerprint": {
+        "primary": "CVE-2026-0001|pkg:npm/example",
+        "signature": null
+      },
+      "group": "CVE-2026-0001|pkg:npm/example",
+      "occurrences": 1,
+      "first_seen": null,
+      "last_seen": null,
+      "reachability": {
+        "source": "auto_run",
+        "status": "not_observed"
+      },
+      "fidelity": {
+        "stubs_used": false,
+        "forced": false,
+        "caveats": []
+      },
+      "remediation": "Upgrade example to 2.4.3 or later.",
+      "patch_hints": [],
+      "reproduce": null,
+      "evidence": null,
+      "fuzz": null,
+      "static": null,
+      "sca": {
+        "vuln_id": "CVE-2026-0001",
+        "aliases": [],
+        "component": {
+          "name": "example",
+          "version": "2.4.2",
+          "ecosystem": "npm",
+          "purl": "pkg:npm/example@2.4.2",
+          "cpe": null
+        },
+        "fixed_versions": [
+          "2.4.3"
+        ],
+        "cvss": null,
+        "kev": null,
+        "references": [],
+        "match_confidence": "high",
+        "matching_method": "purl",
+        "vex": {
+          "advisory_fixed_versions": [
+            "2.4.3"
+          ]
+        }
+      },
+      "binary": null,
+      "raw_ref": "sbom/vulnerabilities.json"
+    },
+    {
+      "id": "F-TSAN-0000",
+      "kind": "runtime",
+      "producer": "auto",
+      "rule": {
+        "id": "BHF-556",
+        "slug": "bhf.c/data-race",
+        "name": "Data race (ThreadSanitizer)"
+      },
+      "title": "Data race (ThreadSanitizer)",
+      "message": "data race",
+      "explanation": "While processing a crafted input, the program hit a fault in the affected code and stopped. At minimum this lets an attacker who can supply this input crash the program; the underlying defect should be reviewed. Triggered by the attached test input (`testcase.bin`).",
+      "severity": "high",
+      "impact": "high",
+      "confidence": {
+        "level": "low",
+        "score": 1.0
+      },
+      "cwe": [
+        362
+      ],
+      "confirmation": {
+        "level": "crash_lead",
+        "detail": null
+      },
+      "verdict": "likely_reachable",
+      "location": null,
+      "fix_location": null,
+      "stack": [],
+      "trace": [],
+      "fingerprint": {
+        "primary": "F-TSAN-0000",
+        "signature": null
+      },
+      "group": "F-TSAN-0000",
+      "occurrences": 1,
+      "first_seen": "2026-10-01T11:30:00Z",
+      "last_seen": "2026-10-01T11:30:00Z",
+      "reachability": {
+        "kind": "harness",
+        "source": "testcase.bin",
+        "target": "H-C-parse"
+      },
+      "fidelity": {
+        "stubs_used": false,
+        "forced": false,
+        "caveats": []
+      },
+      "remediation": null,
+      "patch_hints": [],
+      "reproduce": {
+        "harness_id": "H-C-parse",
+        "command": null,
+        "build": {
+          "sanitizers": [
+            "tsan"
+          ],
+          "binary_sha256": null,
+          "build_id": null
+        }
+      },
+      "evidence": {
+        "dir": "findings/F-TSAN-0000",
+        "files": [
+          {
+            "role": "finding",
+            "path": "findings/F-TSAN-0000/finding.json",
+            "sha256": "1de517f9b902df0ca7e86b644dbeb9c0fbb5f4fde9813fbb87733d41153f7540",
+            "size": 322
+          },
+          {
+            "role": "testcase",
+            "path": "findings/F-TSAN-0000/testcase.bin",
+            "sha256": "df7e70e5021544f4834bbee64a9e3789febc4be81470df629cad6ddb03320a5c",
+            "size": 1
+          }
+        ]
+      },
+      "fuzz": {
+        "exception": {
+          "name": "TSAN_DATA_RACE",
+          "message": "data race",
+          "sanitizer": "tsan"
+        },
+        "classification": "unhandled",
+        "harness_id": "H-C-parse",
+        "dialect": null,
+        "oracle": null
+      },
+      "static": null,
+      "sca": null,
+      "binary": null,
+      "raw_ref": "findings/F-TSAN-0000/finding.json"
+    },
+    {
+      "id": "S-0001",
+      "kind": "static",
+      "producer": "static-scan",
+      "rule": {
+        "id": "BHF-401",
+        "slug": "bhf.static/unsafe-string-copy",
+        "name": "Unsafe string copy call in source"
+      },
+      "title": "Unsafe string copy call in source (greet)",
+      "message": "strcpy into fixed buffer",
+      "explanation": null,
+      "severity": "high",
+      "impact": null,
+      "confidence": {
+        "level": "medium",
+        "score": null
+      },
+      "cwe": [
+        120
+      ],
+      "confirmation": {
+        "level": "static",
+        "detail": null
+      },
+      "verdict": null,
+      "location": {
+        "file": "weak.c",
+        "line": 9,
+        "column": 5,
+        "function": "greet"
+      },
+      "fix_location": null,
+      "stack": [],
+      "trace": [
+        {
+          "file": "weak.c",
+          "line": 3,
+          "function": "greet",
+          "note": "source"
+        }
+      ],
+      "fingerprint": {
+        "primary": "fp-weak-9",
+        "signature": "id-weak"
+      },
+      "group": "issue-weak",
+      "occurrences": 1,
+      "first_seen": null,
+      "last_seen": null,
+      "reachability": null,
+      "fidelity": {
+        "stubs_used": false,
+        "forced": false,
+        "caveats": []
+      },
+      "remediation": "Use a bounded copy.",
+      "patch_hints": [],
+      "reproduce": null,
+      "evidence": null,
+      "fuzz": null,
+      "static": {
+        "engine": "taint",
+        "precision": null,
+        "snippet": "strcpy(buf, name);",
+        "baseline_status": "new",
+        "triage_state": "open"
+      },
+      "sca": null,
+      "binary": null,
+      "raw_ref": "static/static-report.json"
+    },
+    {
+      "id": "F-DIFF-0000",
+      "kind": "differential",
+      "producer": "differential",
+      "rule": {
+        "id": "BHF-301",
+        "slug": "bhf.differential/output-divergence",
+        "name": "Output divergence between implementations"
+      },
+      "title": "Output divergence between implementations",
+      "message": "stdout bytes differ",
+      "explanation": "While processing a crafted input, the program hit a fault in the affected code and stopped. At minimum this lets an attacker who can supply this input crash the program; the underlying defect should be reviewed. Triggered by the attached test input (`testcase.bin`).",
+      "severity": "medium",
+      "impact": "medium",
+      "confidence": {
+        "level": "low",
+        "score": 0.95
+      },
+      "cwe": [
+        754
+      ],
+      "confirmation": {
+        "level": "runtime_oracle",
+        "detail": null
+      },
+      "verdict": "unknown",
+      "location": null,
+      "fix_location": null,
+      "stack": [],
+      "trace": [],
+      "fingerprint": {
+        "primary": "dd",
+        "signature": "dd"
+      },
+      "group": "dd",
+      "occurrences": 1,
+      "first_seen": "2026-10-01T11:40:00Z",
+      "last_seen": "2026-10-01T11:40:00Z",
+      "reachability": null,
+      "fidelity": {
+        "stubs_used": false,
+        "forced": false,
+        "caveats": []
+      },
+      "remediation": null,
+      "patch_hints": [],
+      "reproduce": {
+        "harness_id": null,
+        "command": null,
+        "build": {
+          "sanitizers": [],
+          "binary_sha256": null,
+          "build_id": null
+        }
+      },
+      "evidence": {
+        "dir": "findings/F-DIFF-0000",
+        "files": [
+          {
+            "role": "finding",
+            "path": "findings/F-DIFF-0000/finding.json",
+            "sha256": "6463ed033bd192cec93246bb3e349d1b9dd7a128fa53111d5d5487ae5962175f",
+            "size": 308
+          },
+          {
+            "role": "testcase",
+            "path": "findings/F-DIFF-0000/testcase.bin",
+            "sha256": "6b23c0d5f35d1b11f9b683f0b0a617355deb11277d91ae091d399c655b87940d",
+            "size": 1
+          }
+        ]
+      },
+      "fuzz": {
+        "exception": {
+          "name": "OUTPUT_DIVERGENCE",
+          "message": "stdout bytes differ",
+          "sanitizer": null
+        },
+        "classification": "divergence",
+        "harness_id": null,
+        "dialect": null,
+        "oracle": null
+      },
+      "static": null,
+      "sca": null,
+      "binary": null,
+      "raw_ref": "findings/F-DIFF-0000/finding.json"
+    }
+  ],
+  "groups": [
+    {
+      "key": "c0ffee00c0ffee00",
+      "representative": "F-0000-1a2b3c4d",
+      "members": [
+        "F-0000-1a2b3c4d"
+      ]
+    },
+    {
+      "key": "BHF-501:demo:signal:11:x",
+      "representative": "BF-0001",
+      "members": [
+        "BF-0001"
+      ]
+    },
+    {
+      "key": "BHF-401:lib/parse.c:6",
+      "representative": "F-RO-BHF-401-0000ABCD",
+      "members": [
+        "F-RO-BHF-401-0000ABCD"
+      ]
+    },
+    {
+      "key": "CVE-2026-0001|pkg:npm/example",
+      "representative": "F-SCA-203b6b399c3b3dac",
+      "members": [
+        "F-SCA-203b6b399c3b3dac"
+      ]
+    },
+    {
+      "key": "F-TSAN-0000",
+      "representative": "F-TSAN-0000",
+      "members": [
+        "F-TSAN-0000"
+      ]
+    },
+    {
+      "key": "issue-weak",
+      "representative": "S-0001",
+      "members": [
+        "S-0001"
+      ]
+    },
+    {
+      "key": "dd",
+      "representative": "F-DIFF-0000",
+      "members": [
+        "F-DIFF-0000"
+      ]
+    }
+  ],
+  "errors": []
+}

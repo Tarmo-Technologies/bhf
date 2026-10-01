@@ -1,0 +1,132 @@
+{
+  "_type": "https://in-toto.io/Statement/v1",
+  "predicate": {
+    "max_entries": 1000000,
+    "schema_version": "bhf.findings.v1",
+    "skipped": [],
+    "skipped_total": 0,
+    "tool": {
+      "build": "0.3.0",
+      "name": "bhf",
+      "version": "0.3.0"
+    },
+    "truncated": false
+  },
+  "predicateType": "https://github.com/Tarmo-Technologies/bhf/results/v1",
+  "subject": [
+    {
+      "digest": {
+        "sha256": "66cb138c12cd1b6e4dc0921daf555777eb2829dba0c0654ed8d08f3a6b980c32"
+      },
+      "name": "INDEX.md"
+    },
+    {
+      "digest": {
+        "sha256": "11ca28e1381f67f72e4cba23a5c41eafff1f09f0a96840e4dbcb9ce2172059c3"
+      },
+      "name": "findings.csv"
+    },
+    {
+      "digest": {
+        "sha256": "c39723f23cd2e111dcab914f9270ee7d10d13c6bc5899b8006588c9d43ee53f8"
+      },
+      "name": "findings.json"
+    },
+    {
+      "digest": {
+        "sha256": "3477afec50cad0b0bc897636f2c1ca6f32cd9f5e0ef5c6685d9fc771da935be6"
+      },
+      "name": "findings.sarif"
+    },
+    {
+      "digest": {
+        "sha256": "dca80604bea31e187355ba7fbd7a21661955ef850c95a2d97f6c4cf3cad1efab"
+      },
+      "name": "findings/BF-0001/finding.json"
+    },
+    {
+      "digest": {
+        "sha256": "3f39d5c348e5b79d06e842c114e6cc571583bbf44e4b0ebfda1a01ec05745d43"
+      },
+      "name": "findings/BF-0001/testcase.bin"
+    },
+    {
+      "digest": {
+        "sha256": "a36cb214534ea62f8ca91f0b0b08a02be791e6af8584e1b1e67a154e044a0b3c"
+      },
+      "name": "findings/F-0000-1a2b3c4d/finding.json"
+    },
+    {
+      "digest": {
+        "sha256": "559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd"
+      },
+      "name": "findings/F-0000-1a2b3c4d/min_testcase.bin"
+    },
+    {
+      "digest": {
+        "sha256": "d70bcf7c257c14037f1840700c456dc7e873a1cad6b67f344d95d85d4c15dcfd"
+      },
+      "name": "findings/F-0000-1a2b3c4d/sanitizer.log"
+    },
+    {
+      "digest": {
+        "sha256": "63c1dd951ffedf6f7fd968ad4efa39b8ed584f162f46e715114ee184f8de9201"
+      },
+      "name": "findings/F-0000-1a2b3c4d/testcase.bin"
+    },
+    {
+      "digest": {
+        "sha256": "6463ed033bd192cec93246bb3e349d1b9dd7a128fa53111d5d5487ae5962175f"
+      },
+      "name": "findings/F-DIFF-0000/finding.json"
+    },
+    {
+      "digest": {
+        "sha256": "6b23c0d5f35d1b11f9b683f0b0a617355deb11277d91ae091d399c655b87940d"
+      },
+      "name": "findings/F-DIFF-0000/testcase.bin"
+    },
+    {
+      "digest": {
+        "sha256": "0941b8b64f8bde95ecb10ca37a0800af818bd7979a5c3d66e69de8dcef68326b"
+      },
+      "name": "findings/F-RO-BHF-401-0000ABCD/finding.json"
+    },
+    {
+      "digest": {
+        "sha256": "1de517f9b902df0ca7e86b644dbeb9c0fbb5f4fde9813fbb87733d41153f7540"
+      },
+      "name": "findings/F-TSAN-0000/finding.json"
+    },
+    {
+      "digest": {
+        "sha256": "df7e70e5021544f4834bbee64a9e3789febc4be81470df629cad6ddb03320a5c"
+      },
+      "name": "findings/F-TSAN-0000/testcase.bin"
+    },
+    {
+      "digest": {
+        "sha256": "9a94503d3a18063a3651c8c8a2ac7d46c345e2b0031566fe6ce1a9c0d418f08f"
+      },
+      "name": "manifest.json"
+    },
+    {
+      "digest": {
+        "sha256": "8b49d5b54c291430a48f8288bd75219f4618e1b9480e55a39518febf48f64bf8"
+      },
+      "name": "sbom/vulnerabilities.json"
+    },
+    {
+      "digest": {
+        "sha256": "14219f5ab35bef81de7ae406d58e6caa27d277c74188cfc8ff4d2a2ef63768a7"
+      },
+      "name": "static/static-report.json"
+    },
+    {
+      "digest": {
+        "sha256": "91c0ef3e2492a7b9613c346de40606f74bf1bd0bec2b2cc28c88471f1083c442"
+      },
+      "name": "static/static-report.sarif"
+    }
+  ]
+}

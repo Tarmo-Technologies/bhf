@@ -4,11 +4,21 @@
 //! keeps the derived index in sync with the evidence on disk.
 
 pub mod confirmation;
+pub mod lock;
+pub mod manifest;
 pub mod migrate;
 pub mod model;
+pub mod normalize;
+pub mod rebuild;
+pub mod render;
 pub mod severity;
 
 pub use corpus::layout;
+pub use rebuild::{rebuild, ProducerRun, RebuildOptions, RebuildSummary};
+
+/// Fidelity caveat on a finding whose reproducer was not minimized within
+/// the auto time budget; `INDEX.md` counts the groups that carry it.
+pub const UNMINIMIZED_CAVEAT: &str = "not minimized within the auto time budget";
 
 use std::path::{Path, PathBuf};
 

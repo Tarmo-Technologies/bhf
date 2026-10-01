@@ -266,6 +266,11 @@ pub fn emit_tree_static_findings(root: &Path, work: &Path) -> usize {
         let full_source_path = absolute_reported_path(root, &f.location.path);
         let mut record =
             static_finding_record(&id, "static-scan", &target_name, &full_source_path, None, f);
+        // This scan is rooted at the project, like `bhf static-scan`, so its
+        // fingerprint lets the results index fold the matching
+        // `static-report.json` entry into this record. (Report-only rows scan
+        // one candidate's directory, so theirs would never match.)
+        record["static_fingerprint"] = serde_json::json!(f.fingerprint);
         corpus::finding::stamp_v1(&mut record, corpus::finding::finding_kind::STATIC);
         if std::fs::write(
             dir.join("finding.json"),
@@ -550,6 +555,12 @@ mod tests {
             let cwe = v["actionability"]["cwe"].as_array().unwrap();
             assert!(!cwe.is_empty(), "report-only finding must carry a CWE");
             assert!(cwe[0].as_str().unwrap().starts_with("CWE-"));
+            // The per-candidate scan is rooted at the source file's directory,
+            // so its fingerprint would never match a project-rooted scan.
+            assert!(
+                v.get("static_fingerprint").is_none(),
+                "report-only finding must not carry a candidate-rooted fingerprint: {v}"
+            );
             saw_cwe = true;
         }
         assert!(saw_cwe, "expected at least one finding.json on disk");
