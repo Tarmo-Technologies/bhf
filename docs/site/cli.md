@@ -223,6 +223,24 @@ command, input mode, testcase, environment, binary SHA-256, stderr excerpt, and
 exit/timeout signature. Existing `bhf replay`, `bhf minimize`, and
 `bhf ci --fail-on ...` understand these binary findings.
 
+A manually authored binary-only harness can name a runner and fixed target
+arguments: `--runner <PROG>` launches the target under an emulator/loader (e.g.
+`wine`, `qemu-x86_64`) with repeatable `--runner-arg`, and repeatable
+`--target-arg` passes fixed arguments to the target before the fuzz input. A
+literal `@@` among the target args marks where the input-file path goes (file
+mode); without one, file-mode input is appended last. So a Wine/PE harness that
+loads a stock vendor DLL is expressed as:
+
+```sh
+bhf binary fuzz ./stock_dll_harness.exe --runner wine \
+  --target-arg --mode --target-arg fuzz --input-mode file
+```
+
+The runner, runner args, target args, and the full `@@`-marked argv are recorded
+in the finding, so `bhf replay` and `bhf minimize` reproduce the exact launch.
+`--runner` is builtin-engine only (afl-qemu provides its own `-Q` runner);
+`--target-arg` applies to both engines.
+
 `--engine builtin|afl-qemu|auto` selects the execution engine: `builtin`
 replays the seeds and detects crashes (no mutation/coverage); `afl-qemu` drives
 coverage-guided mutation on a binary-only / foreign-arch target via AFL++'s QEMU

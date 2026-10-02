@@ -2,6 +2,17 @@
 
 # Changelog
 
+## Unreleased
+
+### Added
+- `bhf binary fuzz` can express a manually authored binary-only harness that needs
+  an emulator/loader and fixed arguments: `--runner <PROG>` (e.g. `wine`,
+  `qemu-x86_64`) with repeatable `--runner-arg`, and repeatable `--target-arg`
+  (a `@@` token marks the input-file position, else file-mode input is appended).
+  The runner, target args, and full argv are recorded in the finding so
+  `bhf replay`/`bhf minimize` reproduce the launch. `--runner` is builtin-engine
+  only; `--target-arg` applies to the afl-qemu engine too (#47).
+
 ## 0.2.34 - 2026-10-01
 
 `bhf binary scan` now recurses into Debian `.deb` packages and tar archives.

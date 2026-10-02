@@ -54,6 +54,24 @@ pub struct BinaryFuzzArgs {
     #[arg(long = "env")]
     pub env: Vec<String>,
 
+    /// Runner/emulator to launch the target under, e.g. `wine` or `qemu-x86_64`.
+    /// The target binary and its `--target-arg`s follow. Builtin engine only
+    /// (afl-qemu provides its own `-Q` runner).
+    #[arg(long = "runner")]
+    pub runner: Option<String>,
+
+    /// Argument for the `--runner` prefix, placed before the target binary.
+    /// Repeatable. Requires `--runner`.
+    #[arg(long = "runner-arg")]
+    pub runner_args: Vec<String>,
+
+    /// Fixed argument passed to the target before the fuzz input. Repeatable. A
+    /// literal `@@` token is replaced by the input-file path (file mode); with no
+    /// `@@`, file-mode input is appended last. Lets a manual binary-only harness
+    /// express `wine ./harness.exe --mode fuzz @@`.
+    #[arg(long = "target-arg")]
+    pub target_args: Vec<String>,
+
     /// Sandbox mode recorded in finding provenance.
     #[arg(long, value_enum, default_value_t = SandboxModeArg::Auto)]
     pub sandbox: SandboxModeArg,
@@ -93,6 +111,104 @@ impl BinaryInputMode {
             Self::Stdin => "stdin",
             Self::File => "file",
         }
+    }
+}
+
+/// How one target execution is launched (#47): an optional runner/emulator
+/// prefix (e.g. `wine`, `qemu-x86_64`) with its own args, the target binary, and
+/// fixed target arguments. A literal `@@` token among the target args marks where
+/// the fuzz input file goes (file mode); without one, file-mode input is appended
+/// last. Captured in the finding so replay/minimize reproduce the exact command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TargetInvocation {
+    pub(crate) binary: PathBuf,
+    pub(crate) runner: Option<String>,
+    pub(crate) runner_args: Vec<String>,
+    pub(crate) target_args: Vec<String>,
+}
+
+/// The `@@` input-file placeholder token (AFL's convention, reused here).
+const INPUT_PLACEHOLDER: &str = "@@";
+
+impl TargetInvocation {
+    fn from_args(args: &BinaryFuzzArgs) -> Self {
+        Self {
+            binary: args.binary.clone(),
+            runner: args.runner.clone(),
+            runner_args: args.runner_args.clone(),
+            target_args: args.target_args.clone(),
+        }
+    }
+
+    /// Reject invocations that cannot be launched coherently, with an actionable
+    /// message. Pure over the fields so it is unit-testable.
+    fn validate(&self, mode: BinaryInputMode, engine_is_afl_qemu: bool) -> anyhow::Result<()> {
+        if self.runner.is_none() && !self.runner_args.is_empty() {
+            return Err(anyhow!(
+                "--runner-arg requires --runner (the program to pass the args to)"
+            ));
+        }
+        if mode == BinaryInputMode::Stdin && self.target_args.iter().any(|a| a == INPUT_PLACEHOLDER)
+        {
+            return Err(anyhow!(
+                "a '@@' target-arg has nothing to substitute in stdin input mode; \
+                 use --input-mode file, or drop the '@@'"
+            ));
+        }
+        if engine_is_afl_qemu && self.runner.is_some() {
+            return Err(anyhow!(
+                "--runner is not supported with the afl-qemu engine (afl-fuzz -Q provides its \
+                 own QEMU runner); use --engine builtin to run under a custom runner, or drop \
+                 --runner"
+            ));
+        }
+        Ok(())
+    }
+
+    /// The `(program, argv)` to spawn for one execution. `input_path` is the fuzz
+    /// testcase file for file mode, `None` for stdin. A `@@` target-arg is
+    /// replaced by the input path; in file mode with no `@@`, the input path is
+    /// appended last. Pure (no FS/spawn) so the argv is unit-testable.
+    fn command_for(&self, input_path: Option<&Path>) -> (PathBuf, Vec<String>) {
+        let (program, mut argv) = match &self.runner {
+            Some(runner) => {
+                let mut argv = self.runner_args.clone();
+                argv.push(self.binary.display().to_string());
+                (PathBuf::from(runner), argv)
+            }
+            None => (self.binary.clone(), Vec::new()),
+        };
+        let mut substituted = false;
+        for arg in &self.target_args {
+            if arg == INPUT_PLACEHOLDER {
+                if let Some(path) = input_path {
+                    argv.push(path.display().to_string());
+                    substituted = true;
+                }
+                // stdin mode: a stray `@@` is rejected by validate(), so this is
+                // unreachable there; skip defensively rather than emit the token.
+            } else {
+                argv.push(arg.clone());
+            }
+        }
+        if let Some(path) = input_path {
+            if !substituted {
+                argv.push(path.display().to_string());
+            }
+        }
+        (program, argv)
+    }
+
+    /// The argv rendered for provenance, with `@@` marking the input position (so
+    /// the recorded command is replayable and human-readable regardless of the
+    /// concrete per-run testcase path).
+    fn provenance_argv(&self, mode: BinaryInputMode) -> Vec<String> {
+        let placeholder = PathBuf::from(INPUT_PLACEHOLDER);
+        let input = (mode == BinaryInputMode::File).then_some(placeholder);
+        let (program, args) = self.command_for(input.as_deref());
+        let mut argv = vec![program.display().to_string()];
+        argv.extend(args);
+        argv
     }
 }
 
@@ -137,7 +253,13 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
 
     // Engine dispatch. afl-qemu gives coverage-guided mutation for binary-only /
     // foreign-arch targets via QEMU DBT; builtin just replays the seeds.
-    match resolve_binary_engine(args.engine)? {
+    let engine = resolve_binary_engine(args.engine)?;
+    let invocation = TargetInvocation::from_args(&args);
+    invocation.validate(
+        args.input_mode,
+        matches!(engine, ResolvedEngine::AflQemu(_)),
+    )?;
+    match engine {
         ResolvedEngine::AflQemu(aq) => {
             return run_afl_qemu(&args, &aq, &seeds, &env, &findings_dir);
         }
@@ -152,7 +274,7 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
     for seed in seeds.iter().cycle().take(args.iterations.min(seeds.len())) {
         executions += 1;
         let run = run_binary_once(
-            &args.binary,
+            &invocation,
             args.input_mode,
             seed,
             &env,
@@ -287,6 +409,9 @@ fn which_on_path(name: &str) -> Option<PathBuf> {
 /// `@@` (AFL substitutes the testcase path); stdin mode omits it (AFL feeds the
 /// testcase on stdin). `-t` sets the per-exec timeout (ms) and `-m` the child
 /// memory limit so the campaign matches the replay oracle. Kept pure for testing.
+// A flat flag-bundle builder: the inputs are distinct afl-fuzz knobs, and a
+// struct would only scatter the same fields without clarifying the one argv.
+#[allow(clippy::too_many_arguments)]
 fn afl_qemu_argv(
     binary: &Path,
     seeds_dir: &Path,
@@ -295,6 +420,7 @@ fn afl_qemu_argv(
     timeout_ms: u64,
     mem: &str,
     mode: BinaryInputMode,
+    target_args: &[String],
 ) -> Vec<String> {
     let mut argv = vec![
         "-Q".to_owned(),
@@ -311,8 +437,12 @@ fn afl_qemu_argv(
         "--".to_owned(),
         binary.display().to_string(),
     ];
-    if mode == BinaryInputMode::File {
-        argv.push("@@".to_owned());
+    // Fixed target args follow the binary; AFL substitutes a `@@` among them with
+    // the testcase path. If file mode has no explicit `@@`, append one so AFL
+    // still passes the testcase as a file argument (its default is stdin).
+    argv.extend(target_args.iter().cloned());
+    if mode == BinaryInputMode::File && !target_args.iter().any(|a| a == INPUT_PLACEHOLDER) {
+        argv.push(INPUT_PLACEHOLDER.to_owned());
     }
     argv
 }
@@ -403,6 +533,7 @@ fn run_afl_qemu(
         args.timeout_ms,
         &mem_arg,
         args.input_mode,
+        &args.target_args,
     );
     let afl_trace_dir = aq
         .afl_qemu_trace
@@ -451,6 +582,9 @@ fn run_afl_qemu(
     fs::create_dir_all(&tmp_dir)?;
     let mut finding_ids = Vec::new();
     let mut seen_signatures = std::collections::HashSet::new();
+    // Confirm with the same target args AFL used (runner is forbidden for
+    // afl-qemu, so it is always a bare/target-arg invocation here).
+    let invocation = TargetInvocation::from_args(args);
     if crashes_dir.is_dir() {
         let mut entries: Vec<PathBuf> = fs::read_dir(&crashes_dir)?
             .filter_map(Result::ok)
@@ -461,7 +595,7 @@ fn run_afl_qemu(
         for crash in entries {
             let input = fs::read(&crash)?;
             let run = run_binary_once(
-                &args.binary,
+                &invocation,
                 args.input_mode,
                 &input,
                 env,
@@ -540,10 +674,11 @@ pub(crate) fn minimize_binary_finding(
     let expected = finding_signature(&finding)?;
     let original = fs::read(finding_dir.join("testcase.bin"))
         .with_context(|| format!("read {}", finding_dir.join("testcase.bin").display()))?;
+    let invocation = finding_invocation(&finding, binary);
     let tmp_dir = finding_dir.join("binary_minimize_tmp");
     fs::create_dir_all(&tmp_dir).with_context(|| format!("create {}", tmp_dir.display()))?;
     let result = replay_min::ddmin_bytes(&original, |candidate| -> anyhow::Result<bool> {
-        let run = run_binary_once(binary, mode, candidate, &env, timeout, &tmp_dir)?;
+        let run = run_binary_once(&invocation, mode, candidate, &env, timeout, &tmp_dir)?;
         Ok(run.signature == expected)
     })?;
     let _ = fs::remove_dir_all(&tmp_dir);
@@ -570,8 +705,9 @@ fn replay_binary_finding_inner(finding_dir: &Path, binary: &Path) -> anyhow::Res
         .with_context(|| format!("read {}", finding_dir.join("testcase.bin").display()))?;
     let tmp_dir = finding_dir.join("binary_replay_tmp");
     fs::create_dir_all(&tmp_dir).with_context(|| format!("create {}", tmp_dir.display()))?;
+    let invocation = finding_invocation(&finding, binary);
     let run = run_binary_once(
-        binary,
+        &invocation,
         finding_input_mode(&finding)?,
         &input,
         &finding_env(&finding),
@@ -615,33 +751,41 @@ fn termination_signal(_status: &std::process::ExitStatus) -> Option<i32> {
 }
 
 fn run_binary_once(
-    binary: &Path,
+    inv: &TargetInvocation,
     mode: BinaryInputMode,
     input: &[u8],
     env: &BTreeMap<String, String>,
     timeout: Duration,
     tmp_dir: &Path,
 ) -> anyhow::Result<BinaryRun> {
-    let mut cmd = Command::new(binary);
+    // Materialize the file-mode testcase first so the invocation can place its
+    // path (at a `@@` token or appended); stdin mode delivers it on the pipe.
+    let input_file = match mode {
+        BinaryInputMode::Stdin => None,
+        BinaryInputMode::File => {
+            let path = tmp_dir.join(format!("input-{}.bin", nonce()));
+            fs::write(&path, input).with_context(|| format!("write {}", path.display()))?;
+            Some(path)
+        }
+    };
+    let (program, argv) = inv.command_for(input_file.as_deref());
+    let mut cmd = Command::new(&program);
+    cmd.args(&argv);
     cmd.stdout(Stdio::null()).stderr(Stdio::piped());
     for (key, value) in env {
         cmd.env(key, value);
     }
-    let input_file = match mode {
+    match mode {
         BinaryInputMode::Stdin => {
             cmd.stdin(Stdio::piped());
-            None
         }
         BinaryInputMode::File => {
-            let path = tmp_dir.join(format!("input-{}.bin", nonce()));
-            fs::write(&path, input).with_context(|| format!("write {}", path.display()))?;
-            cmd.arg(&path).stdin(Stdio::null());
-            Some(path)
+            cmd.stdin(Stdio::null());
         }
-    };
+    }
     let mut child = cmd
         .spawn()
-        .with_context(|| format!("spawn {}", binary.display()))?;
+        .with_context(|| format!("spawn {}", program.display()))?;
     if mode == BinaryInputMode::Stdin {
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(input);
@@ -710,7 +854,10 @@ fn render_finding(
             "sha256": sha256_hex(&fs::read(&args.binary).with_context(|| format!("read {}", args.binary.display()))?)
         },
         "command": {
-            "argv": [args.binary.to_string_lossy()],
+            "argv": TargetInvocation::from_args(args).provenance_argv(args.input_mode),
+            "runner": args.runner,
+            "runner_args": args.runner_args,
+            "target_args": args.target_args,
             "timeout_ms": args.timeout_ms,
             "sandbox": format!("{:?}", args.sandbox).to_ascii_lowercase()
         },
@@ -784,6 +931,38 @@ fn finding_env(finding: &Value) -> BTreeMap<String, String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// String array at a JSON pointer in a finding (e.g. recorded runner/target
+/// args), or empty when absent/malformed.
+fn finding_str_array(finding: &Value, pointer: &str) -> Vec<String> {
+    finding
+        .pointer(pointer)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Rebuild the [`TargetInvocation`] from a finding for replay/minimize, using
+/// `binary` as the target path (the caller supplies it; it may be re-pathed) and
+/// the recorded runner + args so the launch reproduces the original command. A
+/// finding from before #47 has no runner/target args and replays as a bare
+/// binary invocation, unchanged.
+fn finding_invocation(finding: &Value, binary: &Path) -> TargetInvocation {
+    TargetInvocation {
+        binary: binary.to_path_buf(),
+        runner: finding
+            .pointer("/command/runner")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        runner_args: finding_str_array(finding, "/command/runner_args"),
+        target_args: finding_str_array(finding, "/command/target_args"),
+    }
 }
 
 fn finding_timeout(finding: &Value) -> Duration {
@@ -912,8 +1091,14 @@ mod tests {
             f.set_permissions(fs::Permissions::from_mode(0o755))
                 .unwrap();
         }
+        let invocation = TargetInvocation {
+            binary: script.clone(),
+            runner: None,
+            runner_args: Vec::new(),
+            target_args: Vec::new(),
+        };
         let run = run_binary_once(
-            &script,
+            &invocation,
             BinaryInputMode::Stdin,
             b"",
             &BTreeMap::new(),
@@ -931,6 +1116,159 @@ mod tests {
             run.signature
         );
     }
+
+    // --- #47: runner prefix + target arguments ---
+
+    fn inv(runner: Option<&str>, runner_args: &[&str], target_args: &[&str]) -> TargetInvocation {
+        TargetInvocation {
+            binary: PathBuf::from("/b/target"),
+            runner: runner.map(str::to_owned),
+            runner_args: runner_args.iter().map(|s| s.to_string()).collect(),
+            target_args: target_args.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn command_for_bare_stdin_is_just_the_binary() {
+        let (prog, argv) = inv(None, &[], &[]).command_for(None);
+        assert_eq!(prog, PathBuf::from("/b/target"));
+        assert!(argv.is_empty());
+    }
+
+    #[test]
+    fn command_for_file_mode_appends_input_when_no_placeholder() {
+        let (prog, argv) =
+            inv(None, &[], &["--mode", "fuzz"]).command_for(Some(Path::new("/t/in.bin")));
+        assert_eq!(prog, PathBuf::from("/b/target"));
+        assert_eq!(argv, vec!["--mode", "fuzz", "/t/in.bin"]);
+    }
+
+    #[test]
+    fn command_for_substitutes_the_placeholder_in_place() {
+        let (_, argv) =
+            inv(None, &[], &["--in", "@@", "--verbose"]).command_for(Some(Path::new("/t/in.bin")));
+        assert_eq!(argv, vec!["--in", "/t/in.bin", "--verbose"]);
+    }
+
+    #[test]
+    fn command_for_runner_prefixes_binary_then_target_args() {
+        let (prog, argv) = inv(Some("wine"), &[], &["--mode", "fuzz", "@@"])
+            .command_for(Some(Path::new("/t/in.bin")));
+        assert_eq!(prog, PathBuf::from("wine"));
+        assert_eq!(argv, vec!["/b/target", "--mode", "fuzz", "/t/in.bin"]);
+    }
+
+    #[test]
+    fn command_for_runner_with_runner_args() {
+        let (prog, argv) = inv(Some("qemu-x86_64"), &["-L", "/sysroot"], &[]).command_for(None);
+        assert_eq!(prog, PathBuf::from("qemu-x86_64"));
+        assert_eq!(argv, vec!["-L", "/sysroot", "/b/target"]);
+    }
+
+    #[test]
+    fn validate_rejects_runner_arg_without_runner() {
+        assert!(inv(None, &["-L", "/x"], &[])
+            .validate(BinaryInputMode::File, false)
+            .is_err());
+    }
+
+    #[test]
+    fn validate_rejects_placeholder_in_stdin_mode_but_allows_it_for_file() {
+        assert!(inv(None, &[], &["@@"])
+            .validate(BinaryInputMode::Stdin, false)
+            .is_err());
+        assert!(inv(None, &[], &["@@"])
+            .validate(BinaryInputMode::File, false)
+            .is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_runner_with_afl_qemu_engine() {
+        assert!(inv(Some("wine"), &[], &[])
+            .validate(BinaryInputMode::File, true)
+            .is_err());
+        assert!(inv(Some("wine"), &[], &[])
+            .validate(BinaryInputMode::File, false)
+            .is_ok());
+    }
+
+    #[test]
+    fn provenance_argv_marks_the_input_position() {
+        let file = inv(None, &[], &["--in", "@@"]).provenance_argv(BinaryInputMode::File);
+        assert_eq!(file, vec!["/b/target", "--in", "@@"]);
+        let stdin =
+            inv(Some("wine"), &[], &["--mode", "fuzz"]).provenance_argv(BinaryInputMode::Stdin);
+        assert_eq!(stdin, vec!["wine", "/b/target", "--mode", "fuzz"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn end_to_end_runner_and_target_arg_launched_recorded_and_replayable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("bhf-binfuzz-runner-{}", nonce()));
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("probe.sh");
+        // Crash (SIGSEGV) only when launched with a "boom" argument.
+        fs::write(
+            &script,
+            b"#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = boom ] && kill -SEGV $$; done\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let work = dir.join("work");
+
+        let mk = |target_args: Vec<String>| BinaryFuzzArgs {
+            binary: script.clone(),
+            work_dir: work.clone(),
+            input_mode: BinaryInputMode::Stdin,
+            iterations: 4,
+            seed_inputs: vec!["x".to_owned()],
+            seed_files: Vec::new(),
+            timeout_ms: 5000,
+            mem_mb: "none".to_owned(),
+            env: Vec::new(),
+            runner: Some("/bin/sh".to_owned()),
+            runner_args: Vec::new(),
+            target_args,
+            sandbox: SandboxModeArg::Auto,
+            engine: BinaryFuzzEngine::Builtin,
+            time: None,
+        };
+
+        // Without the triggering arg the target exits 0 — no finding.
+        let clean = run_inner(mk(Vec::new())).unwrap();
+        assert_eq!(clean["findings"].as_array().unwrap().len(), 0, "{clean}");
+
+        // With it: one finding, recorded with the runner + target arg, replayable.
+        let _ = fs::remove_dir_all(&work);
+        let found = run_inner(mk(vec!["boom".to_owned()])).unwrap();
+        let ids = found["findings"].as_array().unwrap();
+        assert_eq!(ids.len(), 1, "{found}");
+        let id = ids[0].as_str().unwrap();
+        let fdir = work.join("findings").join(id);
+        let finding: Value =
+            serde_json::from_slice(&fs::read(fdir.join("finding.json")).unwrap()).unwrap();
+        assert_eq!(finding.pointer("/command/runner").unwrap(), "/bin/sh");
+        assert_eq!(
+            finding.pointer("/command/target_args").unwrap(),
+            &json!(["boom"])
+        );
+        let argv = finding
+            .pointer("/command/argv")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert!(argv.iter().any(|a| a.as_str() == Some("boom")), "{found}");
+        assert!(
+            argv.iter().any(|a| a.as_str() == Some("/bin/sh")),
+            "{found}"
+        );
+
+        // Replay reproduces the crash using the recorded invocation.
+        assert_eq!(replay_binary_finding(&fdir, &script), 0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
@@ -947,6 +1285,7 @@ mod afl_qemu_tests {
             1000,
             "none",
             BinaryInputMode::Stdin,
+            &[],
         );
         assert_eq!(
             argv,
@@ -978,6 +1317,7 @@ mod afl_qemu_tests {
             1000,
             "none",
             BinaryInputMode::File,
+            &[],
         );
         assert_eq!(argv.last().map(String::as_str), Some("@@"));
         assert_eq!(argv.iter().filter(|a| *a == "-Q").count(), 1);
@@ -995,6 +1335,7 @@ mod afl_qemu_tests {
             2500,
             "1024",
             BinaryInputMode::Stdin,
+            &[],
         );
         let t = argv.iter().position(|a| a == "-t").expect("-t present");
         assert_eq!(argv[t + 1], "2500");
