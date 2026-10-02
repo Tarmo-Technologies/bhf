@@ -152,14 +152,23 @@ fn static_flag_runs_tree_scan_and_merges_findings() {
             .is_some_and(|f| f.ends_with("weak.c")),
         "{merged}"
     );
-    let crash_group = findings
+    let crash = findings
         .iter()
         .find(|f| f["kind"] == "fuzz")
-        .map(|f| f["group"].clone())
         .expect("a fuzz crash");
+    let crash_group = crash["group"].clone();
     assert_eq!(
         merged["group"], crash_group,
         "confirmed static finding clusters under its crash"
+    );
+    // Bounded auto minimization (`--no-minimize` to opt out) runs after the
+    // report is written, so the crash's representative gets a small reproducer.
+    let crash_id = crash["id"].as_str().expect("crash finding id");
+    let crash_dir = findings_dir.join(crash_id);
+    assert!(
+        crash_dir.join("min_testcase.bin").is_file(),
+        "auto must minimize the crash representative: {}",
+        crash_dir.display()
     );
     let index = std::fs::read_to_string(results.join("INDEX.md")).unwrap();
     assert!(

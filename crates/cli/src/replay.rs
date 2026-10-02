@@ -87,6 +87,7 @@ pub fn run(args: ReplayArgs) -> i32 {
     );
     match replay_min::replay_with_runner(&finding_dir, &runner) {
         Ok(replay_min::ReplayResult::Match) => {
+            let _ = corpus::finding::touch_last_seen(&finding_dir, "replay");
             println!("MATCH");
             0
         }
@@ -282,6 +283,7 @@ fn replay_c_afl(finding_dir: &Path, harness: &Path) -> i32 {
         .or_else(|| crate::fatal_signal::rule_id(&output.status, &stderr));
     match actual_rule {
         Some(rule) if rule == recorded_rule => {
+            let _ = corpus::finding::touch_last_seen(finding_dir, "replay");
             println!("MATCH");
             0
         }
@@ -404,6 +406,7 @@ fn replay_c_libfuzzer(finding_dir: &Path, harness: &Path) -> i32 {
         .or_else(|| crate::fatal_signal::rule_id(&output.status, &stderr));
     match actual_rule {
         Some(rule) if rule == recorded_rule => {
+            let _ = corpus::finding::touch_last_seen(finding_dir, "replay");
             println!("MATCH");
             0
         }

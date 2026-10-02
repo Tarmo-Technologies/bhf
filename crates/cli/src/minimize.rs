@@ -72,12 +72,12 @@ impl MinimizeStrategy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct MinimizeSummary {
+pub(crate) struct MinimizeSummary {
     strategy: MinimizeStrategy,
     original_len: usize,
     minimized_len: usize,
     removed_bytes: usize,
-    reduced: bool,
+    pub(crate) reduced: bool,
 }
 
 /// How a candidate input is delivered to the harness's main().
@@ -99,6 +99,20 @@ fn minimize_c_engine(
     harness: &Path,
     strategy: MinimizeStrategy,
     io: CEngineIo,
+) -> anyhow::Result<MinimizeSummary> {
+    minimize_c_engine_until(finding_dir, harness, strategy, io, None)
+}
+
+/// Like [`minimize_c_engine`], but stops accepting further reductions once
+/// `deadline` has passed (the baseline reproduction check still runs once,
+/// unconditionally: an unreproducible testcase must still error). Used by the
+/// bounded `auto` minimization pass to cap wall-clock time per finding.
+fn minimize_c_engine_until(
+    finding_dir: &Path,
+    harness: &Path,
+    strategy: MinimizeStrategy,
+    io: CEngineIo,
+    deadline: Option<std::time::Instant>,
 ) -> anyhow::Result<MinimizeSummary> {
     use std::io::Write;
     use std::process::{Command, Stdio};
@@ -179,6 +193,9 @@ fn minimize_c_engine(
     })?;
 
     let result = replay_min::ddmin_bytes(&original_input, |candidate| -> anyhow::Result<bool> {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Ok(false); // budget spent: reject further reductions, keep best-so-far
+        }
         Ok(run_once(candidate)?.map(|r| r == baseline).unwrap_or(false))
     })?;
 
@@ -228,6 +245,28 @@ pub fn work_dir_hint(args: &MinimizeArgs) -> Option<std::path::PathBuf> {
     // Strict: only a real results-layout work dir, never a lexical guess,
     // because the dispatcher writes (migrate, manifest, rebuild) to it.
     corpus::layout::results_work_dir_for_finding(&dir)
+}
+
+/// Minimize a C/C++ harness finding within `deadline`. Ada/stdin harnesses are
+/// out of scope for the auto pass (returns `Ok(None)`).
+pub(crate) fn minimize_for_auto(
+    finding_dir: &Path,
+    harness: &Path,
+    deadline: std::time::Instant,
+) -> anyhow::Result<Option<MinimizeSummary>> {
+    let io = match detect_harness_engine(harness) {
+        HarnessEngine::CAfl => CEngineIo::Stdin,
+        HarnessEngine::CLibFuzzer => CEngineIo::ArgvFile,
+        HarnessEngine::AdaStdin => return Ok(None),
+    };
+    minimize_c_engine_until(
+        finding_dir,
+        harness,
+        MinimizeStrategy::Bytes,
+        io,
+        Some(deadline),
+    )
+    .map(Some)
 }
 
 pub fn run(args: MinimizeArgs) -> i32 {
@@ -395,10 +434,24 @@ fn update_finding_record(finding_dir: &Path, result: &MinimizeOutput) -> anyhow:
 
 #[cfg(all(test, unix))]
 mod silent_abort_tests {
-    use super::{minimize_c_engine, CEngineIo, MinimizeStrategy};
+    use super::{minimize_c_engine, minimize_c_engine_until, CEngineIo, MinimizeStrategy};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
     use tempfile::tempdir;
+
+    fn write_silent_abort_harness(dir: &Path) -> PathBuf {
+        let harness = dir.join("abort-on-crash.sh");
+        fs::write(
+            &harness,
+            "#!/bin/sh\ncase \"$(cat \"$1\")\" in *CRASH*) kill -ABRT $$;; esac\n",
+        )
+        .expect("harness");
+        let mut permissions = fs::metadata(&harness).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&harness, permissions).expect("chmod");
+        harness
+    }
 
     #[test]
     fn libfuzzer_minimizer_reduces_silent_abort_finding() {
@@ -412,15 +465,7 @@ mod silent_abort_tests {
         .expect("finding");
         fs::write(finding.join("testcase.bin"), b"prefix-CRASH-suffix").expect("testcase");
 
-        let harness = root.path().join("abort-on-crash.sh");
-        fs::write(
-            &harness,
-            "#!/bin/sh\ncase \"$(cat \"$1\")\" in *CRASH*) kill -ABRT $$;; esac\n",
-        )
-        .expect("harness");
-        let mut permissions = fs::metadata(&harness).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&harness, permissions).expect("chmod");
+        let harness = write_silent_abort_harness(root.path());
 
         let result = minimize_c_engine(
             &finding,
@@ -435,5 +480,35 @@ mod silent_abort_tests {
             fs::read(finding.join("min_testcase.bin")).unwrap(),
             b"CRASH"
         );
+    }
+
+    #[test]
+    fn expired_deadline_stops_reduction_but_keeps_a_valid_result() {
+        let root = tempdir().expect("tempdir");
+        let finding = root.path().join("finding");
+        fs::create_dir(&finding).expect("finding dir");
+        fs::write(
+            finding.join("finding.json"),
+            r#"{"rule_id":"BHF-210","paths":{}}"#,
+        )
+        .expect("finding");
+        fs::write(finding.join("testcase.bin"), b"prefix-CRASH-suffix").expect("testcase");
+        let harness = write_silent_abort_harness(root.path());
+        let past = std::time::Instant::now();
+
+        let summary = minimize_c_engine_until(
+            &finding,
+            &harness,
+            MinimizeStrategy::Bytes,
+            CEngineIo::ArgvFile,
+            Some(past),
+        )
+        .expect("minimize");
+
+        assert!(
+            !summary.reduced,
+            "an already-expired deadline must not reduce"
+        );
+        assert!(finding.join("min_testcase.bin").is_file());
     }
 }

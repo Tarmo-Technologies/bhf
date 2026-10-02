@@ -46,6 +46,21 @@ pub fn stamp_v1(record: &mut serde_json::Value, kind: &str) {
     }
 }
 
+/// Cap for `sanitizer.log`; the first MiB holds the report and stacks, the rest is noise.
+pub const SANITIZER_LOG_MAX: u64 = 1024 * 1024;
+
+/// Write the captured stderr of the crashing execution, truncated to
+/// [`SANITIZER_LOG_MAX`] with a trailing marker naming the dropped byte count.
+pub fn write_sanitizer_log(finding_dir: &std::path::Path, log: &[u8]) -> std::io::Result<()> {
+    let max = SANITIZER_LOG_MAX as usize;
+    if log.len() <= max {
+        return fs::write(finding_dir.join("sanitizer.log"), log);
+    }
+    let mut bytes = log[..max].to_vec();
+    bytes.extend_from_slice(format!("\n[truncated {} bytes]\n", log.len() - max).as_bytes());
+    fs::write(finding_dir.join("sanitizer.log"), bytes)
+}
+
 /// Record that `command` rewrote `fields` of this record. Enrichment steps edit
 /// `finding.json` in place; this keeps the edits traceable.
 pub fn append_history(record: &mut serde_json::Value, command: &str, fields: &[&str]) {
@@ -153,6 +168,7 @@ impl FindingEmitter {
                 fixture_path,
                 sandbox: None,
                 mode: actionability::RunMode::Reporting,
+                build_binary: None,
             },
             line_maps: crate::line_remap::SourceLineMaps::default(),
         }
@@ -173,6 +189,7 @@ impl FindingEmitter {
                 fixture_path,
                 sandbox: Some(sandbox),
                 mode: actionability::RunMode::Reporting,
+                build_binary: None,
             },
             line_maps: crate::line_remap::SourceLineMaps::default(),
         }
@@ -183,6 +200,14 @@ impl FindingEmitter {
         self
     }
 
+    /// Attach the harness/target binary's identity (sha256 + GNU build-id),
+    /// serialized as JSON. Merged into `record["build"]["binary"]` by every
+    /// emitter so a finding pins to the exact binary bytes that produced it.
+    pub fn with_build_binary(mut self, identity: serde_json::Value) -> Self {
+        self.metadata.build_binary = Some(identity);
+        self
+    }
+
     /// Emit a finding for a libFuzzer/AFL++ C/C++ crash captured via stderr.
     /// Unlike `emit`, there's no event log and no Ada Testcase; the sanitizer
     /// report already carries everything we need.
@@ -190,6 +215,18 @@ impl FindingEmitter {
         &self,
         input: &[u8],
         report: &crate::sanitizer::SanitizerReport,
+    ) -> Result<FindingId, CorpusError> {
+        self.emit_sanitizer_crash_with_log(input, report, None)
+    }
+
+    /// Like [`Self::emit_sanitizer_crash`], additionally writing the raw
+    /// captured stderr of the crashing execution as `sanitizer.log` next to
+    /// the finding, when `log` is non-empty.
+    pub fn emit_sanitizer_crash_with_log(
+        &self,
+        input: &[u8],
+        report: &crate::sanitizer::SanitizerReport,
+        log: Option<&[u8]>,
     ) -> Result<FindingId, CorpusError> {
         use sha2::Digest;
         let mut hasher = sha2::Sha256::new();
@@ -224,6 +261,10 @@ impl FindingEmitter {
             finding_dir.join("decoded.json"),
             serde_json::to_vec_pretty(&decoded_placeholder(input))?,
         )?;
+        let log_written = log.filter(|l| !l.is_empty());
+        if let Some(log) = log_written {
+            write_sanitizer_log(&finding_dir, log)?;
+        }
 
         let mut record = json!({
             "id": id.0,
@@ -249,10 +290,14 @@ impl FindingEmitter {
                 "finding": "finding.json",
             },
         });
+        if log_written.is_some() {
+            record["paths"]["sanitizer_log"] = json!("sanitizer.log");
+        }
         if let Some(sandbox) = &self.metadata.sandbox {
             record["sandbox"] = sandbox.clone();
             record["build"] = json!({ "sandbox": sandbox });
         }
+        merge_build_binary(&mut record, &self.metadata);
         record["actionability"] = actionability::value_for_finding(
             self.metadata.mode,
             &record,
@@ -372,6 +417,7 @@ impl FindingEmitter {
             record["sandbox"] = sandbox.clone();
             record["build"] = json!({ "sandbox": sandbox });
         }
+        merge_build_binary(&mut record, &self.metadata);
         record["actionability"] = actionability::value_for_finding(
             self.metadata.mode,
             &record,
@@ -521,6 +567,10 @@ struct FindingMetadata {
     fixture_path: String,
     sandbox: Option<serde_json::Value>,
     mode: actionability::RunMode,
+    /// The harness/target binary's identity (sha256 + GNU build-id), as JSON
+    /// (`corpus` does not depend on `binary_analysis`): merged into
+    /// `record["build"]["binary"]` by every emitter.
+    build_binary: Option<serde_json::Value>,
 }
 
 impl Default for FindingMetadata {
@@ -531,6 +581,56 @@ impl Default for FindingMetadata {
             fixture_path: String::new(),
             sandbox: None,
             mode: actionability::RunMode::Reporting,
+            build_binary: None,
+        }
+    }
+}
+
+/// A later run reproduced this finding: stamp `last_seen` (and history).
+/// A caller replaying against a possibly read-only evidence tree should
+/// `let _ =` the result rather than fail the replay on it.
+///
+/// Idempotent across repeated reproductions: `last_seen` is updated every
+/// call, but a finding replayed N times keeps a single trailing
+/// `command`/`[last_seen]` history entry (its timestamp refreshed) rather than
+/// growing `history` by one entry per replay.
+pub fn touch_last_seen(finding_dir: &std::path::Path, command: &str) -> std::io::Result<()> {
+    let path = finding_dir.join("finding.json");
+    let mut raw: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    if !raw.is_object() {
+        return Ok(());
+    }
+    raw["last_seen"] = json!(now_rfc3339());
+    let refreshed = raw
+        .get_mut("history")
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|history| history.last_mut())
+        .filter(|last| {
+            last.get("command").and_then(serde_json::Value::as_str) == Some(command)
+                && last.get("fields") == Some(&json!(["last_seen"]))
+        })
+        .map(|last| {
+            last["at"] = json!(now_rfc3339());
+        });
+    if refreshed.is_none() {
+        append_history(&mut raw, command, &["last_seen"]);
+    }
+    fs::write(&path, serde_json::to_vec_pretty(&raw)?)
+}
+
+/// Merge the harness/target binary's identity into `record["build"]["binary"]`,
+/// creating `build` as an object first if no sandbox metadata already put one
+/// there. No-op when `metadata` carries no build identity.
+fn merge_build_binary(record: &mut serde_json::Value, metadata: &FindingMetadata) {
+    if let Some(binary) = &metadata.build_binary {
+        let build = record
+            .as_object_mut()
+            .expect("record is an object")
+            .entry("build")
+            .or_insert_with(|| json!({}));
+        if let Some(build) = build.as_object_mut() {
+            build.insert("binary".to_owned(), binary.clone());
         }
     }
 }
@@ -598,6 +698,7 @@ fn finding_record(
         record["sandbox"] = sandbox.clone();
         record["build"] = json!({ "sandbox": sandbox });
     }
+    merge_build_binary(&mut record, metadata);
     record
 }
 
@@ -1333,6 +1434,108 @@ mod tests {
             None
         );
         assert_eq!(run_dedupe_key(&json!({"signature": "abc"})), None);
+    }
+
+    #[test]
+    fn sanitizer_log_is_written_and_capped() {
+        use super::{write_sanitizer_log, SANITIZER_LOG_MAX};
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        write_sanitizer_log(dir, b"==1==ERROR: AddressSanitizer\n").unwrap();
+        assert_eq!(
+            fs::read(dir.join("sanitizer.log")).unwrap(),
+            b"==1==ERROR: AddressSanitizer\n"
+        );
+        let big = vec![b'a'; (SANITIZER_LOG_MAX + 10) as usize];
+        write_sanitizer_log(dir, &big).unwrap();
+        let written = fs::read_to_string(dir.join("sanitizer.log")).unwrap();
+        assert!(
+            written.ends_with("\n[truncated 10 bytes]\n"),
+            "{}",
+            &written[written.len() - 40..]
+        );
+        assert!(written.len() < big.len() + 40);
+    }
+
+    #[test]
+    fn emit_with_log_writes_sanitizer_log_next_to_finding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let emitter = FindingEmitter::new(root.clone());
+        let report = crate::sanitizer::SanitizerReport {
+            sanitizer: crate::sanitizer::Sanitizer::AddressSanitizer,
+            kind: "heap-buffer-overflow".to_owned(),
+            rule_id: "BHF-201",
+            stack: Vec::new(),
+            message: "heap-buffer-overflow".to_owned(),
+        };
+        let id = emitter
+            .emit_sanitizer_crash_with_log(b"in", &report, Some(b"full log"))
+            .unwrap();
+        let dir = crate::layout::finding_dir(&root, &id.0);
+        assert_eq!(fs::read(dir.join("sanitizer.log")).unwrap(), b"full log");
+        let raw: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join("finding.json")).unwrap()).unwrap();
+        assert_eq!(raw["paths"]["sanitizer_log"], "sanitizer.log");
+    }
+
+    #[test]
+    fn build_binary_identity_lands_in_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let emitter = FindingEmitter::new(root.clone())
+            .with_build_binary(serde_json::json!({"sha256": "ab", "build_id": "cd"}));
+        let report = crate::sanitizer::SanitizerReport {
+            sanitizer: crate::sanitizer::Sanitizer::AddressSanitizer,
+            kind: "heap-buffer-overflow".to_owned(),
+            rule_id: "BHF-201",
+            stack: Vec::new(),
+            message: "m".to_owned(),
+        };
+        let id = emitter.emit_sanitizer_crash(b"in", &report).unwrap();
+        let raw: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(crate::layout::finding_dir(&root, &id.0).join("finding.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(raw["build"]["binary"]["build_id"], "cd");
+    }
+
+    #[test]
+    fn touch_last_seen_updates_and_records_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("finding.json"),
+            r#"{"id":"F-1","created_at":"2020-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        super::touch_last_seen(tmp.path(), "replay").unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(tmp.path().join("finding.json")).unwrap())
+                .unwrap();
+        assert!(raw["last_seen"].as_str().unwrap() > "2020-01-01T00:00:00Z");
+        assert_eq!(raw["history"][0]["fields"][0], "last_seen");
+        assert_eq!(raw["created_at"], "2020-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn touch_last_seen_does_not_grow_history_across_replays() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("finding.json");
+        std::fs::write(&path, r#"{"id":"F-1"}"#).unwrap();
+        super::touch_last_seen(tmp.path(), "replay").unwrap();
+        super::touch_last_seen(tmp.path(), "replay").unwrap();
+        super::touch_last_seen(tmp.path(), "replay").unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        // Three replays leave one trailing last_seen entry, not three.
+        assert_eq!(
+            raw["history"].as_array().unwrap().len(),
+            1,
+            "repeated replays must not grow history: {}",
+            raw["history"]
+        );
+        assert_eq!(raw["history"][0]["command"], "replay");
+        assert!(raw["last_seen"].as_str().is_some());
     }
 
     #[test]

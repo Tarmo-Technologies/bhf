@@ -140,6 +140,9 @@ pub fn from_finding_report(
             caveats.push(text);
         }
     }
+    if str_at(raw, &["minimization_skipped"]).as_deref() == Some("time_budget") {
+        caveats.push(crate::UNMINIMIZED_CAVEAT.to_owned());
+    }
 
     // A binary crash keeps its signature under `crash` (exit/signal + stderr
     // digest); it is the only per-crash identity such a record has.
@@ -1603,6 +1606,27 @@ mod tests {
         assert!(f.fidelity.forced);
         assert_eq!(f.confirmation.level, ConfirmationLevel::CrashLead);
         assert!(f.fidelity.caveats.iter().any(|c| c == "forced stub build"));
+    }
+
+    #[test]
+    fn time_budget_skip_becomes_a_caveat() {
+        let mut raw = asan_record();
+        raw["minimization_skipped"] = json!("time_budget");
+        let (tmp, report) = load_one(raw, &[]);
+        let results = tmp.path().join("results");
+        let f = from_finding_report(
+            &report,
+            &NormalizeContext {
+                source_root: None,
+                results_dir: &results,
+            },
+        )
+        .unwrap();
+        assert!(f
+            .fidelity
+            .caveats
+            .iter()
+            .any(|c| c == crate::UNMINIMIZED_CAVEAT));
     }
 
     #[test]

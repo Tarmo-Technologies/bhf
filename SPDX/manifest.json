@@ -1399,6 +1399,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/auto/minimize_pass.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/auto/mod.rs",
       "license": "Apache-2.0"
     },

@@ -997,6 +997,8 @@ struct HarnessRun {
     /// recognized in its stderr. The C/C++ fuzz path uses this to emit
     /// findings without an Ada event log.
     sanitizer: Option<corpus::SanitizerReport>,
+    /// Raw stderr of the run that produced `sanitizer`, for `sanitizer.log`.
+    stderr: Option<String>,
     /// #15: the target REJECTED this input (diagnosed assertion/panic or a non-zero error
     /// return on malformed bytes) — a clean no-finding run that the pass skips and
     /// continues past. Tracked so `run_builtin` can tell a target that rejected
@@ -2371,7 +2373,9 @@ fn run_builtin_with_progress(
         })
         .unwrap_or(false);
     let sandbox_metadata = prepared.runner.sandbox_metadata();
-    let emitter = FindingEmitter::with_metadata_and_sandbox(
+    let build_binary_identity = binary_analysis::build_identity(&prepared.harness_path)
+        .and_then(|identity| serde_json::to_value(identity).ok());
+    let mut emitter = FindingEmitter::with_metadata_and_sandbox(
         prepared.work_dir.clone(),
         prepared.harness_id.clone(),
         "unknown".to_owned(),
@@ -2381,6 +2385,9 @@ fn run_builtin_with_progress(
     )
     .with_mode(prepared.mode)
     .with_line_maps_dir(&prepared.work_dir.join("src_instrumented"));
+    if let Some(identity) = build_binary_identity {
+        emitter = emitter.with_build_binary(identity);
+    }
     let mut rng = MutationRng::new(prepared.rng_seed);
     // The mutation pool. Each entry carries its #382 entropic energy + selection
     // count (selection favors high-novelty, under-explored seeds) and its #400
@@ -2932,7 +2939,11 @@ fn run_builtin_with_progress(
                     )
                 {
                     let id = emitter
-                        .emit_sanitizer_crash(&input, report)
+                        .emit_sanitizer_crash_with_log(
+                            &input,
+                            report,
+                            run.stderr.as_deref().map(str::as_bytes),
+                        )
                         .map_err(|error| format!("emit sanitizer finding: {error}"))?;
                     finding_ids.push(id.0);
                 } else {
@@ -3626,7 +3637,9 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
 
     let crashes_dir = out_dir.join("default").join("crashes");
     let sandbox_metadata = prepared.runner.sandbox_metadata();
-    let emitter = FindingEmitter::with_metadata_and_sandbox(
+    let build_binary_identity = binary_analysis::build_identity(&prepared.harness_path)
+        .and_then(|identity| serde_json::to_value(identity).ok());
+    let mut emitter = FindingEmitter::with_metadata_and_sandbox(
         prepared.work_dir.clone(),
         prepared.harness_id.clone(),
         "unknown".to_owned(),
@@ -3636,6 +3649,9 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
     )
     .with_mode(prepared.mode)
     .with_line_maps_dir(&prepared.work_dir.join("src_instrumented"));
+    if let Some(identity) = build_binary_identity {
+        emitter = emitter.with_build_binary(identity);
+    }
 
     let mut finding_ids = Vec::new();
     let mut seen_rule_sigs = HashSet::<String>::new();
@@ -3696,7 +3712,7 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
                 continue;
             }
             let id = emitter
-                .emit_sanitizer_crash(&input, &report)
+                .emit_sanitizer_crash_with_log(&input, &report, Some(stderr.as_bytes()))
                 .map_err(|error| format!("emit AFL finding: {error}"))?;
             finding_ids.push(id.0);
         }
@@ -4121,6 +4137,7 @@ fn run_c_libfuzzer_single_input(
                         "harness exceeded the response deadline of {deadline:?} (took {elapsed:?})"
                     ),
                 }),
+                stderr: None,
                 rejected: false,
             });
         }
@@ -4131,6 +4148,7 @@ fn run_c_libfuzzer_single_input(
                 events: Vec::new(),
                 testcases: Vec::new(),
                 sanitizer: Some(report),
+                stderr: Some(stderr.to_string()),
                 rejected: false,
             });
         }
@@ -4154,6 +4172,7 @@ fn run_c_libfuzzer_single_input(
                     message: "harness exceeded the configured RSS limit (--rss-limit-mb)"
                         .to_owned(),
                 }),
+                stderr: None,
                 rejected: false,
             });
         }
@@ -4163,6 +4182,7 @@ fn run_c_libfuzzer_single_input(
                 events: Vec::new(),
                 testcases: Vec::new(),
                 sanitizer: None,
+                stderr: None,
                 rejected: false,
             });
         }
@@ -4176,6 +4196,7 @@ fn run_c_libfuzzer_single_input(
                 events: Vec::new(),
                 testcases: Vec::new(),
                 sanitizer: None,
+                stderr: None,
                 rejected: true,
             });
         }
@@ -4190,6 +4211,7 @@ fn run_c_libfuzzer_single_input(
             events: Vec::new(),
             testcases: Vec::new(),
             sanitizer: Some(fatal_signal_report(&output.status, &stderr)),
+            stderr: Some(stderr.to_string()),
             rejected: false,
         });
     }
@@ -4197,6 +4219,7 @@ fn run_c_libfuzzer_single_input(
         events: Vec::new(),
         testcases: Vec::new(),
         sanitizer: None,
+        stderr: None,
         rejected: false,
     })
 }
@@ -5233,6 +5256,7 @@ fn run_harness_with_protocol(
             events: Vec::new(),
             testcases: Vec::new(),
             sanitizer: None,
+            stderr: None,
             rejected: false,
         });
     };
@@ -5248,6 +5272,7 @@ fn run_harness_with_protocol(
                 events: Vec::new(),
                 testcases: Vec::new(),
                 sanitizer: Some(report),
+                stderr: Some(stderr.to_string()),
                 rejected: false,
             });
         }
@@ -5261,6 +5286,7 @@ fn run_harness_with_protocol(
                 events: Vec::new(),
                 testcases: Vec::new(),
                 sanitizer: None,
+                stderr: None,
                 rejected: true,
             });
         }
@@ -5272,6 +5298,7 @@ fn run_harness_with_protocol(
             events: Vec::new(),
             testcases: Vec::new(),
             sanitizer: Some(fatal_signal_report(&status, &stderr)),
+            stderr: Some(stderr.to_string()),
             rejected: false,
         });
     }
@@ -5296,6 +5323,7 @@ fn run_harness_with_protocol(
                 events: Vec::new(),
                 testcases: Vec::new(),
                 sanitizer: None,
+                stderr: None,
                 rejected: false,
             });
         }
@@ -5318,6 +5346,7 @@ fn run_harness_with_protocol(
         events,
         testcases,
         sanitizer: None,
+        stderr: None,
         rejected: false,
     })
 }
@@ -5632,6 +5661,7 @@ impl ForkServer {
                 events: Vec::new(),
                 testcases: Vec::new(),
                 sanitizer: None,
+                stderr: None,
                 rejected: false,
             });
         }
@@ -5660,6 +5690,7 @@ impl ForkServer {
             events,
             testcases,
             sanitizer: None,
+            stderr: None,
             rejected: false,
         })
     }
@@ -7255,6 +7286,49 @@ mod auto_path_tests {
             1,
             "the silent SIGABRT seed must emit one deduplicated finding"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sanitizer_crash_writes_sanitizer_log_next_to_the_finding() {
+        // Task 25: the full captured stderr of a real sanitizer crash must land
+        // as `sanitizer.log` next to `finding.json`, not just the truncated
+        // excerpt that was already in the record.
+        let root = tmpdir();
+        let work_dir = root.join("bhf_work");
+        write_c_libfuzzer_harness(
+            &work_dir,
+            "H-SANLOG",
+            "#!/bin/sh\n>&2 echo 'ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1'\n\
+             >&2 echo '    #0 0x1 in real_parse /src/p.c:9'\nexit 1\n",
+        );
+        let summary = run_one_target_programmatic(
+            &work_dir,
+            "H-SANLOG",
+            vec![b"seed".to_vec()],
+            1,
+            None,
+            None,
+            0,
+            &[],
+            actionability::RunMode::Reporting,
+            None,
+            &[],
+            None,
+        )
+        .expect("a crash on every input is signal, not an all-reject failure");
+        assert_eq!(summary.findings.len(), 1);
+        let finding_dir = corpus::layout::finding_dir(&work_dir, &summary.findings[0]);
+        let log = fs::read_to_string(finding_dir.join("sanitizer.log"))
+            .expect("sanitizer.log must be written next to the finding");
+        assert!(
+            log.contains("AddressSanitizer: heap-buffer-overflow"),
+            "{log}"
+        );
+        assert!(log.contains("real_parse /src/p.c:9"), "{log}");
+        let finding: serde_json::Value =
+            serde_json::from_slice(&fs::read(finding_dir.join("finding.json")).unwrap()).unwrap();
+        assert_eq!(finding["paths"]["sanitizer_log"], "sanitizer.log");
     }
 
     #[test]

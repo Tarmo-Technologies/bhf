@@ -648,6 +648,28 @@ fn scan_bytes(
     }
 }
 
+/// sha256 of a harness/target binary plus its GNU build-id (ELF only), used to
+/// pin a finding to the exact binary bytes that produced it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BuildIdentity {
+    pub sha256: String,
+    pub build_id: Option<String>,
+}
+
+/// sha256 of a harness/target binary plus its GNU build-id (ELF only).
+/// `None` when `path` cannot be read.
+pub fn build_identity(path: &Path) -> Option<BuildIdentity> {
+    let bytes = fs::read(path).ok()?;
+    let build_id = match identify(path, &bytes) {
+        Identification::Binary(kind) => binary_build_id(kind, &bytes),
+        _ => None,
+    };
+    Some(BuildIdentity {
+        sha256: sha256_hex(&bytes),
+        build_id,
+    })
+}
+
 fn identify(path: &Path, bytes: &[u8]) -> Identification {
     if bytes.starts_with(b"\x7fELF") {
         return match identify_elf(bytes) {
@@ -4025,5 +4047,50 @@ mod deb_scan_tests {
             "expected a decompress_failed skip, got {:?}",
             report.skipped
         );
+    }
+}
+
+#[cfg(test)]
+mod build_identity_tests {
+    use super::build_identity;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nonce = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "bhf-build-identity-{tag}-{}-{nanos}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn build_identity_hashes_any_file_and_reads_elf_build_id() {
+        let tmp = temp_dir("plain");
+        let plain = tmp.join("plain");
+        std::fs::write(&plain, b"abc").unwrap();
+        let id = build_identity(&plain).unwrap();
+        assert_eq!(
+            id.sha256,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(id.build_id, None);
+        // The test binary itself is an ELF with a GNU build-id on Linux toolchains.
+        #[cfg(target_os = "linux")]
+        {
+            let exe = std::env::current_exe().unwrap();
+            let id = build_identity(&exe).unwrap();
+            assert!(
+                id.build_id.as_deref().is_some_and(|b| b.len() >= 16),
+                "{id:?}"
+            );
+        }
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }

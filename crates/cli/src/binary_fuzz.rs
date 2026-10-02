@@ -165,6 +165,7 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
             fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
             fs::write(dir.join("testcase.bin"), seed)
                 .with_context(|| format!("write {}", dir.join("testcase.bin").display()))?;
+            corpus::finding::write_sanitizer_log(&dir, run.stderr.as_bytes())?;
             let mut finding = render_finding(&id, &args, seed, &env, &run)?;
             corpus::finding::stamp_v1(&mut finding, corpus::finding::finding_kind::BINARY);
             fs::write(
@@ -476,6 +477,7 @@ fn run_afl_qemu(
             let dir = findings_dir.join(&id);
             fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
             fs::write(dir.join("testcase.bin"), &input)?;
+            corpus::finding::write_sanitizer_log(&dir, run.stderr.as_bytes())?;
             let mut finding = render_finding(&id, args, &input, env, &run)?;
             corpus::finding::stamp_v1(&mut finding, corpus::finding::finding_kind::BINARY);
             fs::write(
@@ -511,6 +513,7 @@ pub(crate) fn is_binary_finding(finding_dir: &Path) -> bool {
 pub(crate) fn replay_binary_finding(finding_dir: &Path, binary: &Path) -> i32 {
     match replay_binary_finding_inner(finding_dir, binary) {
         Ok(true) => {
+            let _ = corpus::finding::touch_last_seen(finding_dir, "replay");
             println!("MATCH");
             0
         }
@@ -770,6 +773,8 @@ fn render_finding(
     env: &BTreeMap<String, String>,
     run: &BinaryRun,
 ) -> anyhow::Result<Value> {
+    let build_identity = binary_analysis::build_identity(&args.binary);
+    let build_id = build_identity.as_ref().and_then(|id| id.build_id.clone());
     Ok(json!({
         "id": id,
         "kind": "binary_crash",
@@ -779,7 +784,11 @@ fn render_finding(
         "message": "Binary crashed under BHF binary-fuzz",
         "binary": {
             "path": args.binary,
-            "sha256": sha256_hex(&fs::read(&args.binary).with_context(|| format!("read {}", args.binary.display()))?)
+            "sha256": sha256_hex(&fs::read(&args.binary).with_context(|| format!("read {}", args.binary.display()))?),
+            "build_id": build_id
+        },
+        "build": {
+            "binary": build_identity
         },
         "command": {
             "argv": [args.binary.to_string_lossy()],
@@ -799,7 +808,8 @@ fn render_finding(
             "stderr_excerpt": stderr_excerpt(&run.stderr)
         },
         "paths": {
-            "testcase": "testcase.bin"
+            "testcase": "testcase.bin",
+            "sanitizer_log": "sanitizer.log"
         },
         "triage": {
             "replay": format!("bhf replay --harness {} {}", args.binary.display(), id)

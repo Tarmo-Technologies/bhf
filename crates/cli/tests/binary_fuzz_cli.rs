@@ -79,7 +79,14 @@ fn binary_fuzz_finds_replayable_stdin_and_file_crashes() {
     );
     let minimized = read_json(&stdin_finding_dir.join("finding.json"));
     assert_eq!(minimized["minimal_reproducer"], "min_testcase.bin");
-    assert_eq!(minimized["history"][0]["command"], "minimize");
+    // `replay` stamped last_seen (one history entry) before `minimize` ran, so
+    // minimize is the latest history entry rather than the first.
+    let history = minimized["history"].as_array().expect("history array");
+    assert_eq!(history.last().unwrap()["command"], "minimize");
+    assert!(
+        history.iter().any(|h| h["command"] == "replay"),
+        "replay should have recorded last_seen in history: {history:?}"
+    );
 
     assert_success(
         Command::new(bhf_bin())

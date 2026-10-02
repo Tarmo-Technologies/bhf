@@ -264,6 +264,7 @@ fn auto_args_from_ci(args: &CiArgs, scoped_files: &[PathBuf]) -> AutoArgs {
         external_tools: false,
         sloc: None,
         static_dynamic: false,
+        no_minimize: false,
         decoder_limits: Default::default(),
         force: false,
         differential: None,

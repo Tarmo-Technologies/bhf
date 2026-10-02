@@ -47,6 +47,7 @@ pub mod load;
 pub mod lua;
 pub mod lua_build;
 pub mod memprofile;
+pub mod minimize_pass;
 pub mod msan;
 pub mod pass;
 pub mod perl_build;

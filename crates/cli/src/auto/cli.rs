@@ -612,6 +612,10 @@ pub struct AutoArgs {
     #[arg(long = "static-dynamic")]
     pub static_dynamic: bool,
 
+    /// Skip minimizing each root-cause representative after fuzzing (bounded to 30 s per group, 5 min total).
+    #[arg(long = "no-minimize")]
+    pub no_minimize: bool,
+
     /// Configurable C/C++ decoder synthesis caps (§27.11): `--max-decode-depth`,
     /// `--max-array-elems`, `--max-decl-bytes` (C) and `--container-size-max`,
     /// `--bitset-max-size`, `--array-max-size` (C++). Each unset flag keeps the
@@ -2613,6 +2617,15 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         &options.sanitizers,
     )?;
     crate::auto::discovery::bhfprof("auto:write_reports", _twr);
+
+    if !args.no_minimize {
+        let (minimized, skipped) = crate::auto::minimize_pass::run(&work);
+        if minimized + skipped > 0 {
+            bhfeprintln!(
+                "bhf: minimized {minimized} representative(s); {skipped} left for `bhf minimize` (time budget)"
+            );
+        }
+    }
 
     // --install-deps: read the just-written manifest and fetch what we can
     // (online, opt-in). Re-run afterward to build against the real deps.
