@@ -133,11 +133,39 @@ pub fn generate_direct_harness(
         fs::write(args.output_dir.join("bhf_callbacks.adb"), body)?;
     }
 
+    write_ada_portability_artifacts(&args.output_dir, &args.harness_id)?;
+
     Ok(GeneratedFiles {
         main_adb: main_path,
         gpr: gpr_path,
         harness_id: args.harness_id,
     })
+}
+
+/// Emit the Mayhemfile + PORTABILITY.md beside a generated Ada harness (#64).
+/// The GNAT binary (`main`) reads the whole of stdin as one input and runs once,
+/// matching Mayhem's base-executable stdin mode. The Mayhemfile sets
+/// `BHF_CRASH_ON_FINDING=1` so a caught top-level exception (a finding) aborts the
+/// process and an external crash-keying engine detects it. Ada has no libFuzzer /
+/// AFL binary, so those sections are omitted.
+fn write_ada_portability_artifacts(
+    output_dir: &std::path::Path,
+    harness_id: &str,
+) -> Result<(), HarnessGenError> {
+    crate::portability::write_artifacts(
+        output_dir,
+        &crate::portability::PortabilitySpec {
+            harness_id: harness_id.to_owned(),
+            lane: crate::portability::Lane::Ada,
+            binary: "main".to_owned(),
+            input: crate::portability::InputDelivery::Stdin,
+            sanitizer: false,
+            libfuzzer_binary: None,
+            afl_binary: None,
+            crash_on_finding_env: true,
+        },
+    )?;
+    Ok(())
 }
 
 pub fn generate_sequence_harness(
@@ -164,6 +192,7 @@ pub fn generate_sequence_harness(
         .join(format!("{}.gpr", context.harness_id_underscore));
     fs::write(&main_path, main_adb)?;
     fs::write(&gpr_path, gpr)?;
+    write_ada_portability_artifacts(&args.output_dir, &args.harness_id)?;
 
     Ok(GeneratedFiles {
         main_adb: main_path,
@@ -196,6 +225,7 @@ pub fn generate_servant_direct_harness(
         .join(format!("{}.gpr", context.harness_id_underscore));
     fs::write(&main_path, main_adb)?;
     fs::write(&gpr_path, gpr)?;
+    write_ada_portability_artifacts(&args.output_dir, &args.harness_id)?;
 
     Ok(GeneratedFiles {
         main_adb: main_path,
