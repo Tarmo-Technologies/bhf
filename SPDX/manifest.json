@@ -2887,6 +2887,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/harness_gen/src/portability.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/harness_gen/src/registry.rs",
       "license": "Apache-2.0"
     },
@@ -2940,6 +2944,10 @@
     },
     {
       "path": "crates/harness_gen/src/templates/servant_direct_harness.adb.tera",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/harness_gen/tests/ada_crash_on_finding.rs",
       "license": "Apache-2.0"
     },
     {
