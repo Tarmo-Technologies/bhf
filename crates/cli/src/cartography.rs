@@ -43,10 +43,6 @@ pub struct CartographyArgs {
 }
 
 pub fn run(args: CartographyArgs) -> i32 {
-    if let Err(error) = crate::workdir::prepare(&args.work_dir) {
-        bhfeprintln!("error: {error:#}");
-        return 1;
-    }
     let findings = match collect(&args.work_dir, args.finding_id.as_deref()) {
         Ok(f) => f,
         Err(e) => {

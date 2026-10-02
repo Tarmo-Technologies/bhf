@@ -534,32 +534,22 @@ fn build_ci_json(
 /// crate. Returns the final SARIF path string (for the CI JSON) or `None`.
 fn maybe_emit_sarif(args: &CiArgs, work_dir: &Path) -> Option<String> {
     let requested = args.sarif.as_ref()?;
-    let findings_dir = corpus::layout::findings_dir(work_dir);
-    let out_dir = work_dir.join("reports");
-    let options = bhf_report::ReportOptions::new(&findings_dir, &out_dir)
-        .with_run_id("last")
-        .with_sarif(true);
-    match bhf_report::write_reports(options) {
-        Ok(summary) => {
-            let produced = summary.sarif_path?;
-            if produced == *requested {
-                return Some(produced.to_string_lossy().into_owned());
-            }
-            if let Some(parent) = requested.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            if let Err(error) = fs::copy(&produced, requested) {
-                bhfeprintln!(
-                    "warning: could not copy SARIF to {}: {error}",
-                    requested.display()
-                );
-                return Some(produced.to_string_lossy().into_owned());
-            }
-            Some(requested.to_string_lossy().into_owned())
-        }
+    if let Err(error) = results::rebuild(work_dir, &results::RebuildOptions::default()) {
+        bhfeprintln!("warning: could not rebuild results for SARIF: {error}");
+        return None;
+    }
+    let produced = corpus::layout::results_dir(work_dir).join("findings.sarif");
+    if let Some(parent) = requested.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    match fs::copy(&produced, requested) {
+        Ok(_) => Some(requested.to_string_lossy().into_owned()),
         Err(error) => {
-            bhfeprintln!("warning: could not emit SARIF: {error}");
-            None
+            bhfeprintln!(
+                "warning: could not copy SARIF to {}: {error}",
+                requested.display()
+            );
+            Some(produced.to_string_lossy().into_owned())
         }
     }
 }
@@ -693,17 +683,12 @@ fn bucket_actionability(work_dir: &Path) -> anyhow::Result<ActionabilityBuckets>
 }
 
 fn finding_severity(value: &serde_json::Value) -> String {
-    // Prefer the explicit severity field on the record; fall back
-    // to the rule's default via rule_id.
-    if let Some(severity) = value.get("severity").and_then(|v| v.as_str()) {
-        return severity.to_owned();
-    }
-    if let Some(rule_id) = value.get("rule_id").and_then(|v| v.as_str()) {
-        if let Some(rule) = finding_rules::by_id(rule_id) {
-            return rule.default_severity.as_str().to_owned();
-        }
-    }
-    "unknown".to_owned()
+    // The single resolver every renderer, importer and this gate share:
+    // actionability impact outranks the record's own severity, which outranks
+    // the rule catalog default.
+    results::severity::resolve_raw(value, None)
+        .as_str()
+        .to_owned()
 }
 
 fn render_summary(work_dir: &Path, total: usize, buckets: &BTreeMap<String, usize>) -> String {
@@ -722,7 +707,7 @@ fn render_summary(work_dir: &Path, total: usize, buckets: &BTreeMap<String, usiz
     }
     out.push_str(&format!("- Work dir: `{}`\n", work_dir.display()));
     out.push_str(&format!(
-        "- Report: `{}/reports/run-last.md`\n",
+        "- Results: `{}/results/INDEX.md`\n",
         work_dir.display()
     ));
     out
@@ -1095,6 +1080,25 @@ mod tests {
         let summary = render_summary(&work, 1, &buckets);
 
         assert!(summary.contains("Actionability: real_reachable 1"));
+    }
+
+    #[test]
+    fn ci_severity_uses_the_unified_resolver() {
+        // impact (from actionability) outranks the record's own severity
+        let raw = serde_json::json!({
+            "rule_id": "BHF-201", "severity": "low",
+            "actionability": {"mode": "reporting", "verdict": "real_reachable", "impact": "critical",
+                              "confidence": "high", "cwe": ["CWE-122"], "prosthetics": {"used": false}}
+        });
+        assert_eq!(finding_severity(&raw), "critical");
+    }
+
+    #[test]
+    fn ci_summary_points_at_results_index() {
+        let tmp = tempdir("summary-results-index");
+        let summary = render_summary(&tmp, 0, &Default::default());
+        assert!(summary.contains("results/INDEX.md"), "{summary}");
+        assert!(!summary.contains("reports/run-last.md"));
     }
 
     #[test]

@@ -10,6 +10,11 @@ pub const FINDINGS_DIR: &str = "findings";
 pub const STATIC_DIR: &str = "static";
 pub const SBOM_DIR: &str = "sbom";
 
+/// Set to `1` by orchestrators (multicore workers, the continuous daemon) on
+/// the `bhf` children they spawn: the child runs its command but leaves the
+/// producer record and the results/ rebuild to the parent.
+pub const RESULTS_DEFER_ENV: &str = "BHF_RESULTS_DEFER";
+
 pub fn results_dir(work_dir: &Path) -> PathBuf {
     work_dir.join(RESULTS_DIR)
 }
@@ -83,6 +88,101 @@ pub fn results_work_dir_for_finding(finding_dir: &Path) -> Option<PathBuf> {
     };
     let has_marker = results.join("manifest.json").is_file() || work.join("auto").is_dir();
     has_marker.then(|| work.to_path_buf())
+}
+
+/// Hands out `<prefix>NNNN` finding directories under one findings dir.
+/// Producers that share a family (standalone `differential` and auto's
+/// post-pass, or two runs on one work dir) each hold their own allocator; the
+/// leaf is made with `create_dir`, so among allocator users a name is unique
+/// and exclusive: an id another writer already took is skipped, never reused.
+/// The single-core fuzz emitter's `next_ordinal` is not an allocator user: it
+/// picks the next `F-` ordinal by scanning and writes with `create_dir_all`,
+/// so its names are not exclusive against a concurrent writer.
+pub struct FamilyAllocator {
+    dir: PathBuf,
+    prefix: String,
+    next: u64,
+}
+
+impl FamilyAllocator {
+    /// Scan `findings_dir` once and start one past the highest ordinal for
+    /// `prefix` (every leading digit, so `F-DIFF-10000` reads as 10000). A
+    /// missing dir starts at 0; nothing is created until [`Self::create`].
+    pub fn new(findings_dir: &Path, prefix: &str) -> std::io::Result<Self> {
+        let entries = match std::fs::read_dir(findings_dir) {
+            Ok(entries) => Some(entries),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        let mut highest: Option<u64> = None;
+        for entry in entries.into_iter().flatten() {
+            let name = entry?.file_name();
+            if let Some(ordinal) = name.to_str().and_then(|name| family_ordinal(name, prefix)) {
+                highest = highest.max(Some(ordinal));
+            }
+        }
+        Ok(Self {
+            dir: findings_dir.to_path_buf(),
+            prefix: prefix.to_owned(),
+            next: highest.map_or(0, |highest| highest.saturating_add(1)),
+        })
+    }
+
+    /// Create the next free `<prefix>NNNN` directory and return its id and path.
+    pub fn create(&mut self) -> std::io::Result<(String, PathBuf)> {
+        self.create_named(None)
+    }
+
+    /// As [`Self::create`], named `<prefix>NNNN-<suffix>`: with prefix `F-`
+    /// and an 8-char signature, the fuzz emitter's `F-0001-1a2b3c4d`.
+    pub fn create_with_suffix(&mut self, suffix: &str) -> std::io::Result<(String, PathBuf)> {
+        self.create_named(Some(suffix))
+    }
+
+    /// The dir of `id` when `id` is one of this family's names and exists here
+    /// as a real directory: a reservation an interrupted writer can resume
+    /// into. Whether it is still unfinished is the caller's call.
+    pub fn reserved_dir(&self, id: &str) -> Option<PathBuf> {
+        if !is_valid_finding_id(id) || family_ordinal(id, &self.prefix).is_none() {
+            return None;
+        }
+        let dir = self.dir.join(id);
+        std::fs::symlink_metadata(&dir)
+            .is_ok_and(|meta| meta.is_dir())
+            .then_some(dir)
+    }
+
+    fn create_named(&mut self, suffix: Option<&str>) -> std::io::Result<(String, PathBuf)> {
+        if suffix.is_some_and(|suffix| !is_valid_finding_id(suffix)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("unsafe finding id suffix {suffix:?}"),
+            ));
+        }
+        std::fs::create_dir_all(&self.dir)?;
+        loop {
+            let id = match suffix {
+                Some(suffix) => format!("{}{:04}-{suffix}", self.prefix, self.next),
+                None => format!("{}{:04}", self.prefix, self.next),
+            };
+            self.next = self.next.checked_add(1).ok_or_else(|| {
+                std::io::Error::other(format!("{} ordinals exhausted", self.prefix))
+            })?;
+            let path = self.dir.join(&id);
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok((id, path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+/// The ordinal in `<prefix><digits>...`, or `None` for another family.
+fn family_ordinal(name: &str, prefix: &str) -> Option<u64> {
+    let rest = name.strip_prefix(prefix)?;
+    let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    rest[..digits].parse().ok()
 }
 
 /// Whether `id` is a safe single-segment finding id: `[A-Za-z0-9]` then up to
@@ -222,6 +322,152 @@ mod tests {
             Some(PathBuf::from("."))
         );
         assert_eq!(work_dir_for_finding(Path::new("/w/other/F-1")), None);
+    }
+
+    fn create_id(allocator: &mut FamilyAllocator) -> String {
+        let (id, dir) = allocator.create().unwrap();
+        assert!(dir.is_dir(), "{} not created", dir.display());
+        assert_eq!(dir.file_name().unwrap(), id.as_str());
+        id
+    }
+
+    #[test]
+    fn family_allocator_counts_up_from_zero_in_a_missing_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let findings = tmp.path().join("results/findings");
+        let mut allocator = FamilyAllocator::new(&findings, "F-DIFF-").unwrap();
+        assert!(!findings.exists(), "new() only scans");
+        assert_eq!(create_id(&mut allocator), "F-DIFF-0000");
+        assert_eq!(create_id(&mut allocator), "F-DIFF-0001");
+    }
+
+    #[test]
+    fn family_allocator_continues_after_the_highest_for_its_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["F-DIFF-0000", "F-DIFF-0007", "F-0003-abcd", "F-DIFF-x"] {
+            std::fs::create_dir_all(tmp.path().join(name)).unwrap();
+        }
+        let mut allocator = FamilyAllocator::new(tmp.path(), "F-DIFF-").unwrap();
+        assert_eq!(create_id(&mut allocator), "F-DIFF-0008");
+    }
+
+    #[test]
+    fn family_allocator_reads_every_leading_digit() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("F-DIFF-9999")).unwrap();
+        let mut allocator = FamilyAllocator::new(tmp.path(), "F-DIFF-").unwrap();
+        assert_eq!(create_id(&mut allocator), "F-DIFF-10000");
+        assert_eq!(create_id(&mut allocator), "F-DIFF-10001");
+        // A second allocator sees the five-digit ordinal, not "1000".
+        let mut again = FamilyAllocator::new(tmp.path(), "F-DIFF-").unwrap();
+        assert_eq!(create_id(&mut again), "F-DIFF-10002");
+    }
+
+    #[test]
+    fn suffixed_ids_follow_the_emitter_format_and_ignore_other_families() {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in [
+            "F-0003-abcd1234",
+            "F-DIFF-0009",
+            "F-STATIC-0042-x",
+            "F-SCA-7",
+            "H-0099",
+        ] {
+            std::fs::create_dir_all(tmp.path().join(name)).unwrap();
+        }
+        let mut allocator = FamilyAllocator::new(tmp.path(), "F-").unwrap();
+        let (id, dir) = allocator.create_with_suffix("1a2b3c4d").unwrap();
+        assert_eq!(id, "F-0004-1a2b3c4d");
+        assert!(dir.is_dir());
+        assert_eq!(
+            allocator.create_with_suffix("1a2b3c4d").unwrap().0,
+            "F-0005-1a2b3c4d"
+        );
+    }
+
+    #[test]
+    fn suffixed_ids_skip_a_name_another_writer_took() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut allocator = FamilyAllocator::new(tmp.path(), "F-").unwrap();
+        std::fs::create_dir(tmp.path().join("F-0000-cafe")).unwrap();
+        assert_eq!(
+            allocator.create_with_suffix("cafe").unwrap().0,
+            "F-0001-cafe"
+        );
+    }
+
+    #[test]
+    fn unsafe_suffixes_are_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut allocator = FamilyAllocator::new(tmp.path(), "F-").unwrap();
+        for suffix in ["../x", "a/b", ""] {
+            let error = allocator.create_with_suffix(suffix).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{suffix:?}");
+        }
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn family_allocator_skips_an_id_another_writer_took() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut allocator = FamilyAllocator::new(tmp.path(), "F-DIFF-").unwrap();
+        std::fs::create_dir(tmp.path().join("F-DIFF-0000")).unwrap();
+        assert_eq!(create_id(&mut allocator), "F-DIFF-0001");
+    }
+
+    #[test]
+    fn reserved_dir_names_only_real_dirs_of_the_family() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut allocator = FamilyAllocator::new(tmp.path(), "F-").unwrap();
+        let (id, dir) = allocator.create_with_suffix("cafe").unwrap();
+        assert_eq!(allocator.reserved_dir(&id), Some(dir));
+        std::fs::create_dir(tmp.path().join("F-DIFF-0000")).unwrap();
+        for other in [
+            "F-DIFF-0000",
+            "F-0009-none",
+            "../F-0000-cafe",
+            "F-0000-cafe/x",
+        ] {
+            assert_eq!(allocator.reserved_dir(other), None, "{other}");
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(tmp.path(), tmp.path().join("F-0001-link")).unwrap();
+            assert_eq!(allocator.reserved_dir("F-0001-link"), None, "a symlink");
+        }
+    }
+
+    #[test]
+    fn family_allocator_propagates_unreadable_findings_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("findings");
+        std::fs::write(&file, "not a dir").unwrap();
+        assert!(FamilyAllocator::new(&file, "F-DIFF-").is_err());
+    }
+
+    #[test]
+    fn concurrent_family_allocators_never_share_an_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let findings = tmp.path().join("findings");
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let findings = findings.clone();
+                std::thread::spawn(move || {
+                    let mut allocator = FamilyAllocator::new(&findings, "F-DIFF-").unwrap();
+                    (0..50)
+                        .map(|_| allocator.create().unwrap().0)
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let ids: Vec<String> = threads
+            .into_iter()
+            .flat_map(|t| t.join().unwrap())
+            .collect();
+        let unique: std::collections::BTreeSet<&String> = ids.iter().collect();
+        assert_eq!(ids.len(), 400);
+        assert_eq!(unique.len(), 400, "an id was handed out twice");
+        assert_eq!(std::fs::read_dir(&findings).unwrap().count(), 400);
     }
 
     #[test]

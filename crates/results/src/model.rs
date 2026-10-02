@@ -19,6 +19,7 @@ pub struct FindingsDocument {
     pub generated_at: String,
     pub tool: ToolInfo,
     pub source: SourceInfo,
+    /// The most recent producers, oldest first (manifest.json keeps more).
     pub producers: Vec<ProducerRecord>,
     pub counts: Counts,
     pub findings: Vec<Finding>,
@@ -403,6 +404,7 @@ pub struct Manifest {
     pub schema_version: String,
     pub tool: ToolInfo,
     pub source: SourceInfo,
+    /// Producer history, oldest first, bounded; the oldest records drop first.
     pub producers: Vec<ProducerRecord>,
 }
 

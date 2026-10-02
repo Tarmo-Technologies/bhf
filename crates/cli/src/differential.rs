@@ -36,13 +36,36 @@ pub struct DifferentialArgs {
     #[arg(long, value_name = "DIR")]
     pub inputs: PathBuf,
 
-    /// Findings output directory.
-    #[arg(long, value_name = "DIR", default_value = "findings_differential")]
-    pub out: PathBuf,
+    /// Work directory; findings go to <work-dir>/results/findings/F-DIFF-*.
+    #[arg(long = "work-dir", value_name = "DIR", default_value = "bhf_work")]
+    pub work_dir: PathBuf,
+
+    /// Deprecated spelling of --work-dir.
+    #[arg(
+        long = "out",
+        value_name = "DIR",
+        hide = true,
+        conflicts_with = "work_dir"
+    )]
+    pub out: Option<PathBuf>,
 
     /// Per-side timeout in seconds.
     #[arg(long, default_value_t = 5)]
     pub timeout_secs: u64,
+}
+
+impl DifferentialArgs {
+    /// Fold the deprecated `--out` into `work_dir`, saying where findings land now.
+    pub fn resolve_deprecated_out(mut self) -> Self {
+        if let Some(out) = self.out.take() {
+            bhfeprintln!(
+                "note: --out is deprecated for differential; treated as --work-dir; findings are in {}",
+                corpus::layout::findings_dir(&out).display()
+            );
+            self.work_dir = out;
+        }
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -155,14 +178,6 @@ pub fn run(args: DifferentialArgs) -> i32 {
 
 fn run_inner(args: DifferentialArgs) -> Result<i32, std::io::Error> {
     let mode = RunMode::from_args(&args)?;
-    fs::create_dir_all(&args.out)?;
-    let findings_root = args.out.join("findings");
-    fs::create_dir_all(&findings_root)?;
-    let transformed_root = args.out.join("metamorphic_inputs");
-    if matches!(mode, RunMode::Metamorphic { .. }) {
-        fs::create_dir_all(&transformed_root)?;
-    }
-
     let mut inputs: Vec<PathBuf> = Vec::new();
     for entry in fs::read_dir(&args.inputs)? {
         let entry = entry?;
@@ -172,9 +187,20 @@ fn run_inner(args: DifferentialArgs) -> Result<i32, std::io::Error> {
     }
     inputs.sort();
 
+    // Only a validated run touches the work dir.
+    let findings_root = corpus::layout::findings_dir(&args.work_dir);
+    fs::create_dir_all(&findings_root)?;
+    let mut ids = corpus::layout::FamilyAllocator::new(&findings_root, "F-DIFF-")?;
+    let transformed_root = args
+        .work_dir
+        .join("differential")
+        .join("metamorphic_inputs");
+    if matches!(mode, RunMode::Metamorphic { .. }) {
+        fs::create_dir_all(&transformed_root)?;
+    }
+
     let timeout = Duration::from_secs(args.timeout_secs);
     let mut divergences = 0usize;
-    let mut ordinal = 0u32;
 
     for (input_index, input_path) in inputs.iter().enumerate() {
         let input_bytes = fs::read(input_path)?;
@@ -187,15 +213,7 @@ fn run_inner(args: DifferentialArgs) -> Result<i32, std::io::Error> {
                 let out_b = run_harness(harness_b, input_path, timeout);
                 if let Some(div) = compare_outputs(&out_a, &out_b) {
                     divergences += 1;
-                    write_finding(
-                        &findings_root,
-                        ordinal,
-                        &input_bytes,
-                        harness_a,
-                        harness_b,
-                        &div,
-                    )?;
-                    ordinal += 1;
+                    write_finding(&mut ids, &input_bytes, harness_a, harness_b, &div)?;
                 }
             }
             RunMode::Metamorphic { harness, transform } => {
@@ -207,15 +225,13 @@ fn run_inner(args: DifferentialArgs) -> Result<i32, std::io::Error> {
                 if let Some(div) = compare_outputs(&original, &transformed) {
                     divergences += 1;
                     write_metamorphic_finding(
-                        &findings_root,
-                        ordinal,
+                        &mut ids,
                         &input_bytes,
                         &transformed_bytes,
                         harness,
                         *transform,
                         &div,
                     )?;
-                    ordinal += 1;
                 }
             }
         }
@@ -319,8 +335,7 @@ pub(crate) fn truncate_preview(bytes: &[u8], max: usize) -> String {
 }
 
 fn write_finding(
-    findings_root: &Path,
-    ordinal: u32,
+    ids: &mut corpus::layout::FamilyAllocator,
     input_bytes: &[u8],
     harness_a: &Path,
     harness_b: &Path,
@@ -335,10 +350,7 @@ fn write_finding(
             "differential oracle did not match a divergent output pair",
         )
     })?;
-    let short = signature_hex.chars().take(8).collect::<String>();
-    let id = format!("F-{ordinal:04}-{short}");
-    let finding_dir = findings_root.join(&id);
-    fs::create_dir_all(&finding_dir)?;
+    let (id, finding_dir) = ids.create()?;
     fs::write(finding_dir.join("testcase.bin"), input_bytes)?;
     let mut record = json!({
         "id": id,
@@ -380,8 +392,7 @@ fn write_finding(
 }
 
 fn write_metamorphic_finding(
-    findings_root: &Path,
-    ordinal: u32,
+    ids: &mut corpus::layout::FamilyAllocator,
     input_bytes: &[u8],
     transformed_bytes: &[u8],
     harness: &Path,
@@ -398,10 +409,7 @@ fn write_metamorphic_finding(
                 "metamorphic oracle did not match a relation violation",
             )
         })?;
-    let short = signature_hex.chars().take(8).collect::<String>();
-    let id = format!("F-{ordinal:04}-{short}");
-    let finding_dir = findings_root.join(&id);
-    fs::create_dir_all(&finding_dir)?;
+    let (id, finding_dir) = ids.create()?;
     fs::write(finding_dir.join("testcase.bin"), input_bytes)?;
     fs::write(
         finding_dir.join("testcase_transformed.bin"),

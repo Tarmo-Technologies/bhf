@@ -163,7 +163,7 @@ fn static_finding_record(
     // strcpy) flags a call site with an EMPTY trace, so these stay empty for it
     // (correct — we do not fabricate a flow). The FIRST trace step is the taint
     // SOURCE: surface its file/line via `exception.source_file`/`source_line` so
-    // load_csv_finding's `source` column populates, and join every step as
+    // the finding records where the taint enters, and join every step as
     // `path:line` (deduped consecutive) into `data_flow` for the full path.
     let (source_file, source_line_num, data_flow) = if let Some(first) = f.analysis.trace.first() {
         let mut steps: Vec<String> = Vec::with_capacity(f.analysis.trace.len());
@@ -204,8 +204,8 @@ fn static_finding_record(
         "oracle": {
             "evidence": [ { "key": "source", "value": source_line } ]
         },
-        // #1: taint SOURCE file:line (first trace step) — populates the CSV `source`
-        // column via load_csv_finding. Empty for pattern rules with no trace.
+        // #1: taint SOURCE file:line (first trace step). Empty for pattern rules
+        // with no trace.
         "exception": {
             "message": f.message,
             "source_file": source_file,

@@ -318,3 +318,100 @@ fn temp_dir(name: &str) -> PathBuf {
     fs::create_dir_all(&dir).unwrap();
     dir
 }
+
+#[test]
+fn report_with_no_flags_rebuilds_default_work_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let finding = tmp.path().join("bhf_work/results/findings/F-0000-aaaaaaaa");
+    std::fs::create_dir_all(&finding).unwrap();
+    std::fs::write(
+        finding.join("finding.json"),
+        r#"{"id":"F-0000-aaaaaaaa","rule_id":"BHF-201","classification":"unhandled"}"#,
+    )
+    .unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_bhf"))
+        .arg("report")
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(tmp.path().join("bhf_work/results/findings.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(doc["counts"]["total"], 1);
+}
+
+#[test]
+fn report_migrates_a_legacy_work_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let legacy = tmp.path().join("w/findings/F-0000-aaaaaaaa");
+    std::fs::create_dir_all(&legacy).unwrap();
+    std::fs::write(
+        legacy.join("finding.json"),
+        r#"{"id":"F-0000-aaaaaaaa","rule_id":"BHF-201","classification":"unhandled"}"#,
+    )
+    .unwrap();
+    std::fs::write(tmp.path().join("w/FINDINGS.md"), "old").unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_bhf"))
+        .args(["report", "--work-dir"])
+        .arg(tmp.path().join("w"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(tmp
+        .path()
+        .join("w/results/findings/F-0000-aaaaaaaa/finding.json")
+        .is_file());
+    assert!(!tmp.path().join("w/FINDINGS.md").exists());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("migrated legacy"));
+}
+
+#[test]
+fn report_baseline_writes_v2_snapshot_and_comparison_under_results_report() {
+    let tmp = tempfile::tempdir().unwrap();
+    let finding = tmp.path().join("w/results/findings/F-0000-aaaaaaaa");
+    std::fs::create_dir_all(&finding).unwrap();
+    std::fs::write(
+        finding.join("finding.json"),
+        r#"{"id":"F-0000-aaaaaaaa","rule_id":"BHF-201","classification":"unhandled"}"#,
+    )
+    .unwrap();
+    let w = tmp.path().join("w");
+    let first = std::process::Command::new(env!("CARGO_BIN_EXE_bhf"))
+        .args(["report", "--junit", "--work-dir"])
+        .arg(&w)
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let snapshot = w.join("results/report/run-last.json");
+    assert!(snapshot.is_file());
+    assert!(w.join("results/report/run-last.junit.xml").is_file());
+    let baseline = tmp.path().join("baseline.json");
+    std::fs::copy(&snapshot, &baseline).unwrap();
+    let second = std::process::Command::new(env!("CARGO_BIN_EXE_bhf"))
+        .args(["report", "--work-dir"])
+        .arg(&w)
+        .arg("--baseline")
+        .arg(&baseline)
+        .output()
+        .unwrap();
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(w.join("results/report/run-last.comparison.json").is_file());
+}

@@ -66,6 +66,62 @@ pub fn append_history(record: &mut serde_json::Value, command: &str, fields: &[&
     }
 }
 
+/// The key a fuzz run dedupes an emitted finding on, by the set it lives in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunDedupeKey {
+    /// `rule_id|oracle.name|oracle.api`: one finding per defect, not per input.
+    Oracle(String),
+    /// `cluster_key_full`, or `rule:<rule_id>` for a fallback cluster.
+    Cluster(String),
+}
+
+/// The fuzz run's dedupe key for a written `finding.json`, rebuilt from the
+/// record: what the run computed when it emitted the finding. Oracle keys are
+/// kept verbatim, empty parts included, as the run builds them; an empty
+/// cluster key or rule id yields nothing, since no run computes one and a
+/// shared empty key would make unrelated records one crash.
+pub fn run_dedupe_key(record: &serde_json::Value) -> Option<RunDedupeKey> {
+    let rule_id = record.get("rule_id").and_then(serde_json::Value::as_str);
+    if let (Some(rule_id), Some(oracle)) = (rule_id, record.get("oracle")) {
+        if let (Some(name), Some(api)) = (
+            oracle.get("name").and_then(serde_json::Value::as_str),
+            oracle.get("api").and_then(serde_json::Value::as_str),
+        ) {
+            return Some(RunDedupeKey::Oracle(format!("{rule_id}|{name}|{api}")));
+        }
+    }
+    let fallback = record
+        .get("cluster_fallback")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if fallback {
+        rule_id
+            .filter(|rule_id| !rule_id.is_empty())
+            .map(|rule_id| RunDedupeKey::Cluster(format!("rule:{rule_id}")))
+    } else {
+        record
+            .get("cluster_key_full")
+            .and_then(serde_json::Value::as_str)
+            .filter(|full| !full.is_empty())
+            .map(|full| RunDedupeKey::Cluster(full.to_owned()))
+    }
+}
+
+/// Every key that names `record`'s crash: its [`run_dedupe_key`] and its
+/// `signature` (as `signature:<hex>`). Two findings of one harness that share
+/// any key are the same crash; a record with no key matches nothing.
+pub fn dedupe_keys(record: &serde_json::Value) -> Vec<String> {
+    let run = run_dedupe_key(record).map(|key| match key {
+        RunDedupeKey::Oracle(key) | RunDedupeKey::Cluster(key) => key,
+    });
+    let signature = record
+        .get("signature")
+        .and_then(serde_json::Value::as_str)
+        .filter(|signature| !signature.is_empty())
+        .map(|signature| format!("signature:{signature}"));
+    run.into_iter().chain(signature).collect()
+}
+
 impl FindingEmitter {
     pub fn new(root: PathBuf) -> Self {
         Self {
@@ -1230,5 +1286,72 @@ mod tests {
         assert_eq!(history[0]["command"], "minimize");
         assert_eq!(history[1]["fields"][0], "primitive");
         assert!(chrono::DateTime::parse_from_rfc3339(history[0]["at"].as_str().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn run_dedupe_key_mirrors_the_fuzz_run_keys() {
+        use super::{run_dedupe_key, RunDedupeKey};
+        use serde_json::json;
+        let oracle = json!({
+            "rule_id": "BHF-405",
+            "oracle": {"name": "path-traversal", "api": "open"},
+            "cluster_key_full": "c0ffee",
+        });
+        assert_eq!(
+            run_dedupe_key(&oracle),
+            Some(RunDedupeKey::Oracle(
+                "BHF-405|path-traversal|open".to_owned()
+            ))
+        );
+        let fallback =
+            json!({"rule_id": "BHF-210", "cluster_fallback": true, "cluster_key_full": "x"});
+        assert_eq!(
+            run_dedupe_key(&fallback),
+            Some(RunDedupeKey::Cluster("rule:BHF-210".to_owned()))
+        );
+        let clustered = json!({"rule_id": "BHF-201", "cluster_fallback": false, "cluster_key_full": "deadbeef"});
+        assert_eq!(
+            run_dedupe_key(&clustered),
+            Some(RunDedupeKey::Cluster("deadbeef".to_owned()))
+        );
+        // An oracle block without an api falls back to the cluster key.
+        let partial_oracle =
+            json!({"rule_id": "BHF-405", "oracle": {"name": "n"}, "cluster_key_full": "beef"});
+        assert_eq!(
+            run_dedupe_key(&partial_oracle),
+            Some(RunDedupeKey::Cluster("beef".to_owned()))
+        );
+        // The run keys an oracle hit with an empty api exactly so.
+        let empty_api = json!({"rule_id": "BHF-405", "oracle": {"name": "n", "api": ""}});
+        assert_eq!(
+            run_dedupe_key(&empty_api),
+            Some(RunDedupeKey::Oracle("BHF-405|n|".to_owned()))
+        );
+        assert_eq!(run_dedupe_key(&json!({"cluster_key_full": ""})), None);
+        assert_eq!(
+            run_dedupe_key(&json!({"rule_id": "", "cluster_fallback": true})),
+            None
+        );
+        assert_eq!(run_dedupe_key(&json!({"signature": "abc"})), None);
+    }
+
+    #[test]
+    fn dedupe_keys_lists_the_run_key_and_the_signature() {
+        use super::dedupe_keys;
+        use serde_json::json;
+        assert_eq!(
+            dedupe_keys(&json!({"cluster_key_full": "deadbeef", "signature": "abc123"})),
+            ["deadbeef", "signature:abc123"]
+        );
+        assert_eq!(
+            dedupe_keys(&json!({"rule_id": "R", "oracle": {"name": "n", "api": "a"}})),
+            ["R|n|a"]
+        );
+        assert_eq!(
+            dedupe_keys(&json!({"signature": "abc123"})),
+            ["signature:abc123"]
+        );
+        assert!(dedupe_keys(&json!({"id": "F-0000-x", "signature": ""})).is_empty());
+        assert!(dedupe_keys(&json!("not an object")).is_empty());
     }
 }

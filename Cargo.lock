@@ -530,7 +530,9 @@ dependencies = [
 name = "continuous_daemon"
 version = "0.2.34"
 dependencies = [
+ "corpus",
  "libc",
+ "results",
  "serde",
  "serde_json",
  "tempfile",
@@ -1498,8 +1500,11 @@ name = "multicore_fuzz"
 version = "0.2.34"
 dependencies = [
  "corpus",
+ "libc",
+ "report",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
 ]
 

@@ -300,8 +300,8 @@ fn rust_target_builds_and_fuzzes_natively_and_finds_planted_crash() {
             harness.display()
         );
     }
-    assert!(tmp.join("FINDINGS.md").is_file());
-    assert!(tmp.join("findings.csv").is_file());
+    assert!(tmp.join("results/INDEX.md").is_file());
+    assert!(tmp.join("results/findings.csv").is_file());
 
     let _ = std::fs::remove_dir_all(&tmp);
 }

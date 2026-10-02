@@ -744,7 +744,7 @@ fn collapse_uninitializable_param_reason(reason: &str) -> String {
 /// ([`crate::auto::cobol_oracle::run_cobol_attribution`]) removes a crash whose
 /// libcob diagnostic is a harness artifact (a dynamic `CALL` to a sibling
 /// program not linked into the single-program harness). Such a removal reaches
-/// `findings.csv` and `FINDINGS.md` (both derived from disk) but NOT the
+/// the `results/` index (derived from disk) but NOT the
 /// in-memory pass records that feed `summary.findings`, `run.json` and `run.md`
 /// — so the headline count would report a finding with no evidence bundle (a
 /// phantom: exactly the two COBOL `built_and_fuzzed` targets whose count read 1
@@ -753,8 +753,8 @@ fn collapse_uninitializable_param_reason(reason: &str) -> String {
 /// Called once after every post-pass and immediately before [`write_reports`],
 /// this makes the pass records agree with disk: the count, `run.json` and
 /// `run.md` reflect exactly the findings that still have an evidence bundle.
-/// Disk-folded families (`F-STATIC-*` / `F-MSAN-*` / `F-CAP-*`) live only on
-/// disk and never in a pass record, so they are unaffected; the report-only
+/// Disk-folded families ([`DISK_ONLY_PREFIXES`]) live only on disk and never
+/// in a pass record, so they are unaffected; the report-only
 /// path carries its ids in `Outcome::ReportOnly::finding_ids`, which no post-pass
 /// removes, so it is left as-is.
 pub(crate) fn reconcile_pass_findings_with_disk(
@@ -824,7 +824,9 @@ pub fn write_reports_with_output_limit(
     mode: actionability::RunMode,
     resumed: usize,
     discovered_total: usize,
-    static_dynamic: bool,
+    // Deprecated `--static-dynamic`: no effect, `results/findings.csv` always
+    // carries a `kind` column.
+    _static_dynamic: bool,
     force: bool,
     stopped_by_operator: bool,
     output_limit_reached: bool,
@@ -1117,10 +1119,11 @@ pub fn write_reports_with_output_limit(
             }
         }
     }
-    // `--static`: whole-tree static findings are written straight to the findings
-    // dir (not linked to any result), so fold their count in here alongside the
-    // result-linked fuzz/report-only findings. Zero when `--static` wasn't used.
-    summary.findings += tree_static_finding_ids(work_dir).len();
+    // Disk-only findings (`--static` whole-tree scan, sanitizer/profiling replays,
+    // capability profiling, external tools, sink oracle, differential) are written
+    // straight to the findings dir (not linked to any result), so fold their count
+    // in here alongside the result-linked fuzz/report-only findings.
+    summary.findings += disk_only_finding_ids(work_dir).len();
     // #484: how many of those static findings a fuzz/oracle hit confirmed (read
     // from disk so a `--resume` reload reports the same number the join set).
     summary.fuzz_confirmed = crate::auto::confirm::count_fuzz_confirmed(work_dir);
@@ -1219,18 +1222,6 @@ pub fn write_reports_with_output_limit(
     std::fs::write(&json_path, serde_json::to_vec_pretty(&run_json)?)?;
     let md_path = auto_dir.join("run.md");
     std::fs::write(&md_path, render_md(&run_json))?;
-
-    // Fuzz-assurance evidence ledger: an in-toto attestation of every finding's
-    // tier (fuzz_confirmed / reachable / static / lab_only), self-anchored by a
-    // sha256 of the evidence — an auditable, signable SLSA/CISA-workflow artifact.
-    crate::auto::attestation::write_attestation(
-        &auto_dir,
-        work_dir,
-        source_root,
-        started_at,
-        finished_at,
-        mode.as_str(),
-    );
 
     // bhf self-diagnostics: consolidate everything bhf could NOT fully
     // handle — internal panics caught during the sweep + codegen artifacts (its own
@@ -1364,17 +1355,6 @@ pub fn write_reports_with_output_limit(
         );
     }
 
-    // Always emit a machine-readable per-finding index alongside run.md/run.json.
-    write_findings_csv(
-        &auto_dir,
-        work_dir,
-        source_root,
-        results,
-        mode,
-        static_dynamic,
-        &forced_harness_ids,
-    )?;
-
     // Consolidated missing-dependency manifest for the offline-transfer workflow:
     // every external dependency a target needed but the tree didn't provide, each
     // marked stubbed (build continued) or still-blocking, with an acquisition
@@ -1416,142 +1396,31 @@ pub fn write_reports_with_output_limit(
     Ok(())
 }
 
-/// Column header for `findings.csv`. ONE ROW PER ROOT-CAUSE ISSUE (findings are
-/// grouped by `cluster_key_full`); see [`write_findings_csv`]. `count` is the
-/// number of collapsed member findings and `member_finding_ids` lists them.
-/// Column header for `findings.csv`.
-///
-/// The four `stub_*` columns answer "how much of this finding is real?". A
-/// forced or build-recovered harness reaches its target through stubs, and a
-/// crash on a fabricated value is a different claim from a crash on real library
-/// code — but until now that was a per-RUN caveat, not a per-FINDING fact, so a
-/// consumer reading one row could not tell. `stub_blind` is the number that
-/// matters most: an invented empty body with no declaration behind it is the
-/// most likely to fabricate a crash, whereas `stub_declared` at least has the
-/// real signature, and `linked_real` executed genuine dependency code. They are
-/// appended at the END so existing column indices are unchanged.
-///
-/// The optional `scan_type` (`--static-dynamic`) and `forced` (`--force`) columns
-/// are inserted BETWEEN the base columns and the stub block, because that is the
-/// order [`render_issue_row`] writes them. Compose the header from the two halves
-/// — never by appending a flag column to this constant, which would leave the
-/// header and the rows disagreeing about where the stub block starts.
-const FINDINGS_CSV_BASE_HEADER: &str = "id,count,harness_id,rule_id,message,exception_name,sanitizer,classification,confirmation,impact,confidence,verdict,cwe,source,data_flow,sink_file,sink_line,sink_function,entity,remediation,signature,member_finding_ids";
-const FINDINGS_CSV_STUB_HEADER: &str = "stub_total,stub_blind,stub_declared,linked_real";
-/// The header with neither optional column — the shape a plain `auto` run writes.
-const FINDINGS_CSV_HEADER: &str = "id,count,harness_id,rule_id,message,exception_name,sanitizer,classification,confirmation,impact,confidence,verdict,cwe,source,data_flow,sink_file,sink_line,sink_function,entity,remediation,signature,member_finding_ids,stub_total,stub_blind,stub_declared,linked_real\n";
+/// Findings written straight to disk rather than linked to a per-target result:
+/// whole-tree static scan, sanitizer/profiling replays, capability profiling,
+/// external tools, JS sink oracle, and the differential post-pass.
+const DISK_ONLY_PREFIXES: [&str; 8] = [
+    "F-STATIC-",
+    "F-MSAN-",
+    "F-CAP-",
+    "F-TSAN-",
+    "F-MEM-",
+    "F-JSINK-",
+    "F-EXT-",
+    "F-DIFF-",
+];
 
-/// One parsed finding plus its backfilled actionability, ready to project into a
-/// `findings.csv` row.
-struct CsvFinding {
-    id: String,
-    /// Root-cause grouping key: `cluster_key_full` when present, else the id (so a
-    /// fallback / unclustered finding stays its own issue).
-    group_key: String,
-    harness_id: String,
-    /// The finding-rule id that fired (`BHF-401` unsafe-copy, `BHF-405` tainted-open,
-    /// …). For a static finding this is the primary "what check flagged this" key —
-    /// the analog of a fuzz finding's crash `signature`, which is blank here.
-    rule_id: String,
-    /// Human-readable one-line description of the defect ("Command execution with a
-    /// non-literal argument"). Without it a static row carried only a CWE number,
-    /// which doesn't say what the issue actually is.
-    message: String,
-    exception_name: String,
-    sanitizer: String,
-    classification: String,
-    /// #484: provenance of the finding — `static` (scanner-only), `fuzz` (a
-    /// runtime crash / oracle hit), or `fuzz_confirmed` (a static finding a fuzz
-    /// input reached at the same site). The column that lets a reader trust a
-    /// static row: `fuzz_confirmed` is not a maybe.
-    confirmation: String,
-    impact: actionability::Impact,
-    confidence: actionability::ActionabilityConfidence,
-    verdict: actionability::Verdict,
-    cwe: Vec<String>,
-    /// Input origin. For a taint finding this is the traced `file:line`; for a
-    /// runtime finding it is the saved fuzz input that drove the target.
-    source: String,
-    /// Best available source→sink path. Static taint rules carry their traced
-    /// `path:line` steps; runtime findings carry input → entry → sink.
-    data_flow: String,
-    sink_file: String,
-    sink_line: String,
-    sink_function: String,
-    /// #6: the tainted variable / sink expression this finding is about (the
-    /// "entity" commercial SAST tables show). Empty when the rule resolved no
-    /// sink expression or tainted parameter.
-    entity: String,
-    /// Actionable one-line fix for the rule (not a location) — see
-    /// [`static_analysis::remediation_for`].
-    remediation: String,
-    signature: String,
-    /// force-fuzz Phase 2: this finding belongs to a forced-and-stub-heavy target
-    /// (`--force` + a stub-only build). Its `confidence` has been floored to `Low`
-    /// and `note` carries the stub-artifact caveat. `false` for every non-forced
-    /// finding (the default path).
-    forced: bool,
-    /// Provenance note surfaced in the report. Currently only the forced/stub
-    /// caveat ([`confidence_model::FORCED_STUB_NOTE`]); empty otherwise.
-    note: String,
-}
-
-/// Provenance strength for an issue row's `confirmation` column (higher wins):
-/// a fuzz-confirmed static finding outranks a plain fuzz crash, which outranks a
-/// scanner-only static hit.
-fn confirmation_rank(confirmation: &str) -> u8 {
-    match confirmation {
-        // Dynamically confirmed: a static finding a fuzz/oracle hit reached
-        // (#484), or an oracle hit that graduated a static candidate at runtime
-        // (#422). Both mean "observed", not "flagged".
-        "fuzz_confirmed" | "runtime" => 3,
-        "fuzz" | "oracle" => 2,
-        _ => 1, // "static" and anything unrecognized.
-    }
-}
-
-/// Severity rank for picking an issue's representative + its max severity (lower
-/// is more severe), mirroring `actionability`'s internal impact ordering.
-fn csv_impact_rank(impact: actionability::Impact) -> u8 {
-    match impact {
-        actionability::Impact::Critical => 0,
-        actionability::Impact::High => 1,
-        actionability::Impact::Medium => 2,
-        actionability::Impact::Low => 3,
-        actionability::Impact::Info => 4,
-        actionability::Impact::Unknown => 5,
-    }
-}
-
-/// Always emit `<work>/auto/findings.csv` — a machine-readable, ROOT-CAUSE-grouped
-/// issue index next to run.md / run.json. Findings are grouped by
-/// `cluster_key_full` (one row per issue, not one per crashing input), so the auto
-/// path matches the report crate's `render_csv_report` instead of inflating the
-/// CSV with the cascade's per-pass duplicates. Each row projects the issue's
-/// most-severe (representative) member, with `count` + `member_finding_ids`
-/// preserving the collapsed set and `cwe` the union across members. (There is
-/// deliberately no `source` column: it only ever named the synthetic bhf
-/// harness entry — the sink columns carry the real defect location.) When the run
-/// produced no findings the file is written header-only.
-/// Finding ids from a `--static` whole-tree scan (`F-STATIC-*`). These are
-/// written straight into the findings dir rather than linked to a per-target
-/// result, so the report reads them from disk to fold them in alongside the
-/// result-linked fuzz/report-only findings. Empty when `--static` wasn't used
-/// (no such dirs exist).
-pub(crate) fn tree_static_finding_ids(work_dir: &Path) -> Vec<String> {
+/// Ids of the [`DISK_ONLY_PREFIXES`] findings in the findings dir. The report
+/// reads them from disk to fold them in alongside the result-linked
+/// fuzz/report-only findings. Empty when no such dirs exist.
+pub(crate) fn disk_only_finding_ids(work_dir: &Path) -> Vec<String> {
     let dir = corpus::layout::findings_dir(work_dir);
     let mut ids: Vec<String> = match std::fs::read_dir(&dir) {
         Ok(entries) => entries
             .flatten()
             .filter_map(|e| e.file_name().into_string().ok())
             .filter(|name| {
-                // Disk-written findings not linked to a per-target result: the
-                // `--static` whole-tree scan (`F-STATIC-*`), the MSan corpus replay
-                // (`F-MSAN-*`), and fuzz-driven capability profiling (`F-CAP-*`).
-                // All are folded into the report from disk.
-                (name.starts_with("F-STATIC-")
-                    || name.starts_with("F-MSAN-")
-                    || name.starts_with("F-CAP-"))
+                DISK_ONLY_PREFIXES.iter().any(|p| name.starts_with(p))
                     && dir.join(name).join("finding.json").is_file()
             })
             .collect(),
@@ -1559,733 +1428,6 @@ pub(crate) fn tree_static_finding_ids(work_dir: &Path) -> Vec<String> {
     };
     ids.sort();
     ids
-}
-
-fn write_findings_csv(
-    auto_dir: &Path,
-    work_dir: &Path,
-    source_root: &Path,
-    results: &[AttemptResult],
-    mode: actionability::RunMode,
-    static_dynamic: bool,
-    forced_harness_ids: &std::collections::BTreeSet<String>,
-) -> Result<()> {
-    let findings_root = corpus::layout::findings_dir(work_dir);
-    // Both extra columns are appended at the END so existing column indices are
-    // unchanged when the flags are off: `--static-dynamic` adds `scan_type`, and
-    // `--force` adds a `forced` note column (present only when any target ran
-    // forced-and-stub-heavy).
-    let force = !forced_harness_ids.is_empty();
-    // Per-target stub accounting, keyed by harness so each finding row can carry
-    // how much stubbing stood between the fuzzer and real code. Only a target
-    // that actually fuzzed has this; a report-only finding legitimately has none.
-    let stub_by_harness: std::collections::BTreeMap<String, crate::auto::attempt::StubExecution> =
-        results
-            .iter()
-            .filter_map(|r| {
-                r.outcome
-                    .stub_execution()
-                    .map(|s| (r.candidate.harness_id.clone(), s))
-            })
-            .collect();
-    let source_by_harness: std::collections::BTreeMap<String, PathBuf> = results
-        .iter()
-        .map(|result| {
-            (
-                result.candidate.harness_id.clone(),
-                result.candidate.source_path.clone(),
-            )
-        })
-        .collect();
-    let target_by_harness: std::collections::BTreeMap<String, String> = results
-        .iter()
-        .map(|result| {
-            (
-                result.candidate.harness_id.clone(),
-                result.candidate.name.clone(),
-            )
-        })
-        .collect();
-    let line_by_harness: std::collections::BTreeMap<String, u32> = results
-        .iter()
-        .map(|result| (result.candidate.harness_id.clone(), result.candidate.line))
-        .collect();
-    // Build the header in the ORDER `render_issue_row` writes the row: the optional
-    // flag columns come before the stub-accounting block, not after it. Appending
-    // them to the end of the full header instead shifted every stub column by one
-    // under `--force`/`--static-dynamic`, so `forced` read as `linked_real`'s value.
-    let mut out = String::from(FINDINGS_CSV_BASE_HEADER);
-    if static_dynamic {
-        out.push_str(",scan_type");
-    }
-    if force {
-        out.push_str(",forced");
-    }
-    out.push(',');
-    out.push_str(FINDINGS_CSV_STUB_HEADER);
-    out.push('\n');
-    debug_assert_eq!(
-        (!static_dynamic && !force).then_some(out.as_str()),
-        (!static_dynamic && !force).then_some(FINDINGS_CSV_HEADER),
-        "with both flags off the header must be byte-identical to the fixed one"
-    );
-
-    // Collect unique finding ids in result order.
-    let mut seen = std::collections::BTreeSet::new();
-    let mut fids: Vec<String> = Vec::new();
-    for result in results {
-        // M22 (campaign fix): report-only static findings (F-RO-*) carry a CWE and
-        // must appear in findings.csv like any other finding. Collect fuzz pass
-        // findings AND the report-only finding ids.
-        let result_fids: Vec<&String> = match &result.outcome {
-            Outcome::BuiltAndFuzzed { passes, .. } => {
-                passes.iter().flat_map(|p| &p.findings).collect()
-            }
-            Outcome::ReportOnly { finding_ids, .. } => finding_ids.iter().collect(),
-            _ => Vec::new(),
-        };
-        for fid in result_fids {
-            if seen.insert(fid.clone()) {
-                fids.push(fid.clone());
-            }
-        }
-    }
-    // `--static` whole-tree findings aren't linked to a result — pull them from
-    // disk so they render as rows too (deduped against the result-linked set).
-    for fid in tree_static_finding_ids(work_dir) {
-        if seen.insert(fid.clone()) {
-            fids.push(fid);
-        }
-    }
-
-    // Group by root-cause key, preserving first-seen order.
-    let mut groups: Vec<Vec<CsvFinding>> = Vec::new();
-    let mut index_by_key: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    for fid in &fids {
-        let finding_path = findings_root.join(fid).join("finding.json");
-        let Some(finding) = load_csv_finding(
-            &finding_path,
-            fid,
-            mode,
-            forced_harness_ids,
-            source_root,
-            &source_by_harness,
-            &target_by_harness,
-            &line_by_harness,
-        ) else {
-            continue;
-        };
-        match index_by_key.get(&finding.group_key) {
-            Some(&idx) => groups[idx].push(finding),
-            None => {
-                index_by_key.insert(finding.group_key.clone(), groups.len());
-                groups.push(vec![finding]);
-            }
-        }
-    }
-
-    for group in &groups {
-        // A clustered issue can span harnesses; attribute the stub counts to the
-        // representative (first) member, which is the row's `harness_id`.
-        let stub = group
-            .first()
-            .and_then(|f| stub_by_harness.get(&f.harness_id));
-        out.push_str(&render_issue_row(group, static_dynamic, force, stub));
-    }
-    // Keep the historical auto/findings.csv path for integrations, while making
-    // findings a first-class top-level output for humans and automation.
-    std::fs::write(auto_dir.join("findings.csv"), &out)?;
-    std::fs::write(work_dir.join("findings.csv"), &out)?;
-    std::fs::write(
-        work_dir.join("FINDINGS.md"),
-        render_findings_markdown(&groups, work_dir),
-    )?;
-    Ok(())
-}
-
-fn render_findings_markdown(groups: &[Vec<CsvFinding>], work_dir: &Path) -> String {
-    use std::fmt::Write;
-
-    let observations: usize = groups.iter().map(Vec::len).sum();
-    let mut out = String::from("# BHF findings\n\n");
-    if groups.is_empty() {
-        out.push_str(
-            "No findings were emitted in this run. This is not a coverage guarantee; review \
-             `auto/run.md` for targets that were skipped, failed to build, or were not entered.\n",
-        );
-        return out;
-    }
-
-    let _ = writeln!(
-        out,
-        "**{} root-cause issue(s)** from {} finding observation(s), ordered by impact.\n",
-        groups.len(),
-        observations,
-    );
-    out.push_str(
-        "The CSV index is [`findings.csv`](findings.csv); complete evidence bundles are under \
-         [`findings/`](findings/). The full campaign and coverage caveats are in \
-         [`auto/run.md`](auto/run.md).\n\n",
-    );
-
-    let mut ordered: Vec<&Vec<CsvFinding>> = groups.iter().collect();
-    ordered.sort_by_key(|group| {
-        group
-            .iter()
-            .map(|finding| csv_impact_rank(finding.impact))
-            .min()
-            .unwrap_or(u8::MAX)
-    });
-    for (index, group) in ordered.into_iter().enumerate() {
-        let representative = group
-            .iter()
-            .min_by_key(|finding| csv_impact_rank(finding.impact))
-            .unwrap_or(&group[0]);
-        let title = if !representative.message.trim().is_empty() {
-            markdown_single_line(&representative.message)
-        } else if !representative.rule_id.trim().is_empty() {
-            representative.rule_id.clone()
-        } else if !representative.exception_name.trim().is_empty() {
-            markdown_single_line(&representative.exception_name)
-        } else {
-            representative.id.clone()
-        };
-        let confirmation = group
-            .iter()
-            .map(|finding| finding.confirmation.as_str())
-            .max_by_key(|value| confirmation_rank(value))
-            .unwrap_or("static");
-        let mut cwes = Vec::new();
-        for finding in group {
-            for cwe in &finding.cwe {
-                if !cwes.contains(cwe) {
-                    cwes.push(cwe.clone());
-                }
-            }
-        }
-        let _ = writeln!(
-            out,
-            "## {}. [{}] {}\n",
-            index + 1,
-            representative.impact.as_str().to_ascii_uppercase(),
-            title,
-        );
-        let _ = writeln!(out, "- Finding: `{}`", representative.id);
-        if !representative.rule_id.is_empty() {
-            let _ = writeln!(out, "- Rule: `{}`", representative.rule_id);
-        }
-        let _ = writeln!(
-            out,
-            "- Evidence: {} · confidence {} · verdict {}",
-            confirmation,
-            representative.confidence.as_str(),
-            representative.verdict.as_str(),
-        );
-        if !cwes.is_empty() {
-            let _ = writeln!(
-                out,
-                "- CWE: {}",
-                cwes.iter()
-                    .map(|id| format!("CWE-{id}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
-        if !representative.sink_file.is_empty() {
-            let line = if representative.sink_line.is_empty() {
-                String::new()
-            } else {
-                format!(":{}", representative.sink_line)
-            };
-            let function = if representative.sink_function.is_empty() {
-                String::new()
-            } else {
-                format!(" in `{}`", representative.sink_function)
-            };
-            let _ = writeln!(
-                out,
-                "- Location: `{}`{}{}",
-                markdown_single_line(&representative.sink_file),
-                line,
-                function,
-            );
-        }
-        if group.len() > 1 {
-            let _ = writeln!(out, "- Collapsed observations: {}", group.len());
-        }
-        if !representative.remediation.is_empty() {
-            let _ = writeln!(
-                out,
-                "- Suggested fix: {}",
-                markdown_single_line(&representative.remediation)
-            );
-        }
-        let finding_dir = corpus::layout::finding_dir(work_dir, &representative.id);
-        let _ = writeln!(
-            out,
-            "- Evidence bundle: [`findings/{0}/`](findings/{0}/)",
-            representative.id
-        );
-        let _ = writeln!(
-            out,
-            "- Reproduce: `bhf replay --finding {}`\n",
-            finding_dir.display()
-        );
-    }
-    out
-}
-
-fn markdown_single_line(value: &str) -> String {
-    value
-        .replace(['\r', '\n'], " ")
-        .replace('`', "'")
-        .trim()
-        .to_owned()
-}
-
-/// Load + backfill one finding into a [`CsvFinding`]. Returns `None` when the file
-/// is missing or unparseable (the finding is still counted in the run summary; a
-/// malformed sidecar must not abort the whole report).
-#[allow(clippy::too_many_arguments)]
-fn load_csv_finding(
-    path: &Path,
-    fid: &str,
-    mode: actionability::RunMode,
-    forced_harness_ids: &std::collections::BTreeSet<String>,
-    source_root: &Path,
-    source_by_harness: &std::collections::BTreeMap<String, PathBuf>,
-    target_by_harness: &std::collections::BTreeMap<String, String>,
-    line_by_harness: &std::collections::BTreeMap<String, u32>,
-) -> Option<CsvFinding> {
-    let raw: serde_json::Value = std::fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())?;
-    // Reuse / backfill so source / sink / verdict / fix_location are populated
-    // even for findings whose on-disk actionability predates those fields.
-    let action = actionability::existing_actionability_or_backfill(mode, &raw, Some(path));
-
-    let id = raw
-        .get("id")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or(fid)
-        .to_owned();
-    let group_key = raw
-        .get("cluster_key_full")
-        .and_then(serde_json::Value::as_str)
-        .filter(|key| !key.trim().is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| id.clone());
-    let classification = json_str(&raw, &["classification"]);
-    let is_static = classification == "static_scan";
-    let raw_harness_id = json_str(&raw, &["harness_id"]);
-    let (mut sink_file, mut sink_line, mut sink_function) = match &action.sink {
-        Some(sink) => (
-            sink.file.clone().unwrap_or_default(),
-            sink.line.map(|line| line.to_string()).unwrap_or_default(),
-            sink.function.clone(),
-        ),
-        None => (String::new(), String::new(), String::new()),
-    };
-    let exception_name = json_str(&raw, &["exception", "name"]);
-    if is_static && !sink_file.is_empty() {
-        sink_file = full_static_sink_path(
-            &raw,
-            &sink_file,
-            &raw_harness_id,
-            source_root,
-            source_by_harness,
-        );
-    } else if !is_static {
-        // Stackless OOMs and some older UBSan records have no structured frame.
-        // The result ledger still supplies a concrete target source/line, which
-        // is preferable to an entirely blank sink and is clearly the fuzz entry
-        // fallback rather than a fabricated internal frame.
-        if sink_file.is_empty() {
-            if let Some(path) = source_by_harness.get(&raw_harness_id) {
-                sink_file = absolute_candidate_path(source_root, path);
-            }
-        }
-        if sink_line.is_empty() {
-            sink_line = line_by_harness
-                .get(&raw_harness_id)
-                .map(ToString::to_string)
-                .unwrap_or_default();
-        }
-        if sink_function.is_empty()
-            || sink_function.eq_ignore_ascii_case(&exception_name)
-            || is_sanitizer_diagnostic_label(&sink_function)
-        {
-            sink_function = target_by_harness
-                .get(&raw_harness_id)
-                .cloned()
-                .unwrap_or_default();
-        }
-    }
-    // Report source/sink locations RELATIVE to the scanned tree (portable and
-    // diffable across machines) rather than as absolute host paths.
-    sink_file = relativize_report_field(&sink_file, source_root);
-
-    // #1: the taint SOURCE `file:line`, when the finding recorded a source→sink
-    // flow. Interprocedural taint rules carry `exception.source_file`/`source_line`;
-    // a pure pattern rule (BHF-401 unsafe-copy) has none, so this stays empty rather
-    // than duplicating the sink.
-    let mut source = {
-        let file = json_str(&raw, &["exception", "source_file"]);
-        let line = json_str(&raw, &["exception", "source_line"]);
-        match (file.is_empty(), line.is_empty()) {
-            (false, false) => format!("{file}:{line}"),
-            (false, true) => file,
-            _ => String::new(),
-        }
-    };
-
-    // Runtime findings are driven by an actual saved input even when they do not
-    // carry a static taint trace. Surface that origin rather than leaving every
-    // fuzz row blank in `source`.
-    if source.is_empty() && !is_static {
-        let testcase = json_str(&raw, &["paths", "testcase"]);
-        source = format!(
-            "fuzz_input:{}",
-            if testcase.is_empty() {
-                "testcase.bin"
-            } else {
-                &testcase
-            }
-        );
-    }
-
-    // `source` may be a `file:line` (taint origin); relativise it before it feeds
-    // the constructed data-flow trace below.
-    source = relativize_report_field(&source, source_root);
-
-    let mut data_flow = json_str(&raw, &["data_flow"]);
-    if data_flow.is_empty() && !is_static {
-        let entry = target_by_harness
-            .get(&raw_harness_id)
-            .cloned()
-            .unwrap_or_else(|| raw_harness_id.clone());
-        let sink = match (sink_file.is_empty(), sink_line.is_empty()) {
-            (false, false) => format!("{}:{}:{}", sink_file, sink_line, sink_function),
-            (false, true) => format!("{}:{}", sink_file, sink_function),
-            _ => sink_function.clone(),
-        };
-        data_flow = format!("{source} -> entry:{entry} -> sink:{sink}");
-    }
-    // A pre-existing `data_flow` (loaded from the finding record) can still carry
-    // absolute frame paths; relativise the whole trace. (The constructed branch
-    // above already used relative `source`/`sink_file`, so this is a no-op there.)
-    data_flow = relativize_report_field(&data_flow, source_root);
-
-    let mut entity = json_str(&raw, &["entity"]);
-    if entity.is_empty() {
-        entity = if !sink_function.is_empty() {
-            sink_function.clone()
-        } else {
-            target_by_harness
-                .get(&raw_harness_id)
-                .cloned()
-                .or_else(|| {
-                    let target = json_str(&raw, &["target", "name"]);
-                    (!target.is_empty()).then_some(target)
-                })
-                .unwrap_or_else(|| exception_name.clone())
-        };
-    }
-
-    // #484: provenance. An explicit `confirmation` (set by the join, or "static"
-    // on a static finding) wins; a finding without one is a runtime hit, so
-    // default it to "fuzz".
-    let confirmation = match json_str(&raw, &["confirmation"]).as_str() {
-        "" if is_static => "static".to_owned(),
-        "" => "fuzz".to_owned(),
-        other => other.to_owned(),
-    };
-    // A static finding has no harness — its `harness_id` is the sentinel
-    // "static-scan", which merely duplicates the `classification` column. Blank it
-    // so the column carries a real harness id only when one exists (fuzz findings).
-    let harness_id = if is_static {
-        String::new()
-    } else {
-        json_str(&raw, &["harness_id"])
-    };
-    // Prefer the confidence the finding was EMITTED with (persisted in its
-    // `actionability` record) over the report-time backfill, which recomputes a
-    // generic value and flattens an emit-time `high` (e.g. an unsafe-copy sink) to
-    // `medium`. Fall back to the backfilled value for records that predate it.
-    let confidence = json_str(&raw, &["actionability", "confidence"]);
-    let mut confidence = actionability::ActionabilityConfidence::from_label(&confidence)
-        .unwrap_or(action.confidence);
-
-    // force-fuzz Phase 2: a finding whose target ran forced-and-stub-heavy is
-    // low-confidence by construction — the forced build fuzzed synthesized stubs,
-    // so a crash may be a stub artifact. Floor its confidence to `Low` (the label
-    // floor, matching `confidence_model::forced_floor`) and attach the caveat note.
-    // Keyed off the finding's real (raw) harness id so the static-scan blanking of
-    // `harness_id` below doesn't hide the match.
-    let forced = forced_harness_ids.contains(&raw_harness_id);
-    if forced {
-        confidence = actionability::ActionabilityConfidence::Low;
-    }
-    let note = if forced {
-        confidence_model::FORCED_STUB_NOTE.to_owned()
-    } else {
-        String::new()
-    };
-
-    Some(CsvFinding {
-        id,
-        group_key,
-        harness_id,
-        rule_id: json_str(&raw, &["rule_id"]),
-        message: json_str(&raw, &["exception", "message"]),
-        exception_name,
-        sanitizer: json_str(&raw, &["exception", "sanitizer"]),
-        classification,
-        confirmation,
-        impact: action.impact,
-        confidence,
-        verdict: action.verdict,
-        // #8: bare CWE numbers — strip the `CWE-` prefix so the column is `120`,
-        // not `CWE-120`.
-        cwe: action
-            .cwe
-            .iter()
-            .map(|id| id.strip_prefix("CWE-").unwrap_or(id).to_owned())
-            .collect(),
-        source,
-        data_flow,
-        sink_file,
-        sink_line,
-        sink_function,
-        entity,
-        remediation: static_analysis::remediation_for(&json_str(&raw, &["rule_id"])).to_owned(),
-        signature: json_str(&raw, &["signature"]),
-        forced,
-        note,
-    })
-}
-
-fn absolute_candidate_path(source_root: &Path, path: &Path) -> String {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        source_root.join(path)
-    };
-    std::fs::canonicalize(&absolute)
-        .unwrap_or(absolute)
-        .to_string_lossy()
-        .into_owned()
-}
-
-/// Strip the canonical source-root prefix from any absolute paths in a report
-/// field, so source/sink locations render RELATIVE to the scanned tree
-/// (`/abs/root/src/x.c:5:f` -> `src/x.c:5:f`). Done by string replacement so it
-/// also relativises paths embedded in a `data_flow` trace. Paths OUTSIDE the tree
-/// (system headers, the work/harness dir) keep their absolute form, and a field
-/// with no path (`fuzz_input:testcase.bin`) is returned unchanged.
-fn relativize_report_field(field: &str, source_root: &Path) -> String {
-    if field.is_empty() {
-        return String::new();
-    }
-    let root = std::fs::canonicalize(source_root).unwrap_or_else(|_| source_root.to_path_buf());
-    let mut needle = root.to_string_lossy().into_owned();
-    if needle.is_empty() {
-        return field.to_owned();
-    }
-    if !needle.ends_with(std::path::MAIN_SEPARATOR) {
-        needle.push(std::path::MAIN_SEPARATOR);
-    }
-    field.replace(&needle, "")
-}
-
-fn is_sanitizer_diagnostic_label(function: &str) -> bool {
-    let upper = function.trim().to_ascii_uppercase();
-    ["ASAN_", "UBSAN_", "LSAN_", "MSAN_", "TSAN_"]
-        .iter()
-        .any(|prefix| upper.starts_with(prefix))
-}
-
-/// Static scanners historically stored a relative path (sometimes only a
-/// basename) in finding.json. Resolve it while rendering so regenerated CSVs
-/// also repair older findings. Report-only rows can use the exact candidate
-/// source keyed by harness; whole-tree rows resolve against the scan root.
-fn full_static_sink_path(
-    raw: &serde_json::Value,
-    sink_file: &str,
-    harness_id: &str,
-    source_root: &Path,
-    source_by_harness: &std::collections::BTreeMap<String, PathBuf>,
-) -> String {
-    let reported = source_by_harness
-        .get(harness_id)
-        .cloned()
-        .or_else(|| {
-            let target_path = json_str(raw, &["target", "source_path"]);
-            (!target_path.is_empty()).then(|| PathBuf::from(target_path))
-        })
-        .unwrap_or_else(|| PathBuf::from(sink_file));
-    let absolute = if reported.is_absolute() {
-        reported
-    } else {
-        source_root.join(reported)
-    };
-    std::fs::canonicalize(&absolute)
-        .unwrap_or(absolute)
-        .to_string_lossy()
-        .into_owned()
-}
-
-/// Render one `findings.csv` row for a root-cause group: the most-severe member is
-/// the representative whose columns are projected; `count` + `member_finding_ids`
-/// preserve the collapsed set; `cwe` is the union across members (representative
-/// first). `group` is non-empty by construction.
-fn render_issue_row(
-    group: &[CsvFinding],
-    static_dynamic: bool,
-    force: bool,
-    stub: Option<&crate::auto::attempt::StubExecution>,
-) -> String {
-    let representative = group
-        .iter()
-        .min_by_key(|f| csv_impact_rank(f.impact))
-        .unwrap_or(&group[0]);
-    // Union the CWEs (representative first, then any genuinely different member CWE).
-    let mut cwe: Vec<String> = Vec::new();
-    for member in std::iter::once(representative).chain(group.iter()) {
-        for id in &member.cwe {
-            if !cwe.contains(id) {
-                cwe.push(id.clone());
-            }
-        }
-    }
-    // #4: `id` is the representative; `member_finding_ids` lists the collapsed set.
-    // They differ only when a group collapsed >1 finding — leave the column blank
-    // for a singleton so it doesn't just echo `id`.
-    let member_ids = if group.len() > 1 {
-        group
-            .iter()
-            .map(|f| f.id.as_str())
-            .collect::<Vec<_>>()
-            .join(";")
-    } else {
-        String::new()
-    };
-    // Confirmation is orthogonal to severity, so a group's row shows its STRONGEST
-    // provenance (fuzz_confirmed > fuzz > static), not just the representative's.
-    let confirmation = group
-        .iter()
-        .map(|f| f.confirmation.as_str())
-        .max_by_key(|c| confirmation_rank(c))
-        .unwrap_or("static")
-        .to_owned();
-
-    // force-fuzz Phase 2: a group is forced when ANY member ran forced-and-stub-heavy
-    // (findings share a root-cause key; a forced member pins the whole issue Low with
-    // the stub-artifact note).
-    let group_forced = group.iter().any(|f| f.forced);
-    let confidence = if group_forced {
-        actionability::ActionabilityConfidence::Low
-    } else {
-        representative.confidence
-    };
-    let forced_note = group
-        .iter()
-        .find(|f| f.forced)
-        .map(|f| f.note.clone())
-        .unwrap_or_default();
-
-    let fields = [
-        representative.id.clone(),
-        group.len().to_string(),
-        representative.harness_id.clone(),
-        representative.rule_id.clone(),
-        representative.message.clone(),
-        representative.exception_name.clone(),
-        representative.sanitizer.clone(),
-        representative.classification.clone(),
-        confirmation,
-        representative.impact.as_str().to_owned(),
-        confidence.as_str().to_owned(),
-        representative.verdict.as_str().to_owned(),
-        cwe.join(";"),
-        representative.source.clone(),
-        representative.data_flow.clone(),
-        representative.sink_file.clone(),
-        representative.sink_line.clone(),
-        representative.sink_function.clone(),
-        representative.entity.clone(),
-        representative.remediation.clone(),
-        representative.signature.clone(),
-        member_ids,
-    ];
-    let mut row = String::new();
-    for (index, field) in fields.iter().enumerate() {
-        if index > 0 {
-            row.push(',');
-        }
-        row.push_str(&csv_field(field));
-    }
-    if static_dynamic {
-        // scan_type: `static-dynamic` when ANY member of the root-cause group is a
-        // static-scan finding (bhf's static + fuzz-confirmation pipeline — this
-        // covers a static finding a fuzz input confirmed, where the crash is the
-        // cluster representative), else `dynamic` for a purely fuzzed result.
-        let scan_type = if group.iter().any(|f| f.classification == "static_scan") {
-            "static-dynamic"
-        } else {
-            "dynamic"
-        };
-        row.push(',');
-        row.push_str(scan_type);
-    }
-    if force {
-        // force-fuzz Phase 2: `forced` column carries the stub-artifact caveat note
-        // for a forced-and-stub-heavy issue (empty for a genuinely-built one).
-        row.push(',');
-        row.push_str(&csv_field(&forced_note));
-    }
-    // How much stubbing stood between the fuzzer and real code for this finding.
-    // Blank rather than zero when the harness resolved no external symbols at all
-    // (a self-contained target, or a report-only finding that never built): "no
-    // stubs were needed" and "we don't know" are different claims and a reader
-    // should not have to guess which a `0` means.
-    match stub {
-        Some(stub) => {
-            row.push_str(&format!(
-                ",{},{},{},{}",
-                stub.resolved_called_symbols,
-                stub.blind_stubbed_symbols,
-                stub.declared_stubbed_symbols,
-                stub.real_linked_symbols
-            ));
-        }
-        None => row.push_str(",,,,"),
-    }
-    row.push('\n');
-    row
-}
-
-/// Read a nested string field, returning an empty string when absent / non-string.
-fn json_str(value: &serde_json::Value, path: &[&str]) -> String {
-    let mut current = value;
-    for component in path {
-        match current.get(*component) {
-            Some(next) => current = next,
-            None => return String::new(),
-        }
-    }
-    current.as_str().unwrap_or_default().to_owned()
-}
-
-/// RFC-4180 CSV field escaping: quote when the value contains a comma, quote,
-/// CR, or LF, doubling any embedded quotes.
-fn csv_field(field: &str) -> String {
-    if field.contains([',', '"', '\n', '\r']) {
-        format!("\"{}\"", field.replace('"', "\"\""))
-    } else {
-        field.to_owned()
-    }
 }
 
 /// Fold the per-category `NeededForBuild` ledger into the one flat dependency
@@ -3586,12 +2728,12 @@ fn render_md(r: &RunJson<'_>) -> String {
     if r.summary.findings > 0 {
         let _ = writeln!(
             s,
-            "**{} finding observation(s). Start with [`FINDINGS.md`](../FINDINGS.md).**",
+            "**{} finding observation(s). Start with [`results/INDEX.md`](../results/INDEX.md).**",
             r.summary.findings
         );
         let _ = writeln!(
             s,
-            "Machine-readable root-cause index: [`findings.csv`](../findings.csv). Complete evidence bundles: [`findings/`](../findings/)."
+            "Machine-readable: [`results/findings.json`](../results/findings.json) · [`results/findings.csv`](../results/findings.csv). Evidence bundles: [`results/findings/`](../results/findings/)."
         );
     } else {
         let _ = writeln!(
@@ -3969,6 +3111,18 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    /// Rebuild `results/` the way the command's results bracket does after
+    /// `write_reports`, and return `results/findings.json`.
+    fn rebuild_results(work: &Path) -> serde_json::Value {
+        let options = results::RebuildOptions {
+            generate_reproducers: false,
+            ..Default::default()
+        };
+        results::rebuild(work, &options).expect("rebuild results/");
+        serde_json::from_slice(&std::fs::read(work.join("results/findings.json")).unwrap())
+            .expect("parse findings.json")
+    }
+
     #[test]
     fn annotate_forced_findings_floors_only_forced_harnesses() {
         let work = tempfile::tempdir().unwrap();
@@ -4036,141 +3190,7 @@ mod tests {
     }
 
     #[test]
-    fn report_paths_are_relative_to_the_source_root() {
-        let dir = std::env::temp_dir().join(format!("bhf-relq-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let root = std::fs::canonicalize(&dir).unwrap();
-        let rs = root.to_string_lossy();
-        // a bare sink path under the tree becomes tree-relative
-        assert_eq!(
-            relativize_report_field(&format!("{rs}/src/x.c:5:f"), &dir),
-            "src/x.c:5:f"
-        );
-        // paths embedded in a data-flow trace are relativised too
-        assert_eq!(
-            relativize_report_field(
-                &format!("fuzz_input:t.bin -> entry:g -> sink:{rs}/a.c:9:h"),
-                &dir
-            ),
-            "fuzz_input:t.bin -> entry:g -> sink:a.c:9:h"
-        );
-        // a path OUTSIDE the tree (system header) keeps its absolute form
-        assert_eq!(
-            relativize_report_field("/usr/include/stdio.h:1:x", &dir),
-            "/usr/include/stdio.h:1:x"
-        );
-        // a non-path field is unchanged
-        assert_eq!(
-            relativize_report_field("fuzz_input:testcase.bin", &dir),
-            "fuzz_input:testcase.bin"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn old_relative_static_sink_uses_exact_candidate_source_in_regenerated_csv() {
-        let root = std::env::temp_dir().join(format!(
-            "bhf-static-path-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let source = root.join("nested").join("weak.c");
-        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
-        std::fs::write(&source, "int weak(void) { return 0; }").unwrap();
-        let mut sources = std::collections::BTreeMap::new();
-        sources.insert("H-static".to_owned(), source.clone());
-        let raw = serde_json::json!({
-            "classification": "static_scan",
-            "harness_id": "H-static",
-            "target": { "source_path": "weak.c" }
-        });
-
-        let resolved = full_static_sink_path(&raw, "weak.c", "H-static", &root, &sources);
-        assert_eq!(
-            PathBuf::from(resolved),
-            std::fs::canonicalize(&source).unwrap()
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn stackless_runtime_rows_use_message_or_candidate_location_and_fill_flow() {
-        let root = std::env::temp_dir().join(format!(
-            "bhf-runtime-csv-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let candidate_source = root.join("src").join("target.c");
-        std::fs::create_dir_all(candidate_source.parent().unwrap()).unwrap();
-        std::fs::write(&candidate_source, "int decode(void) { return 0; }").unwrap();
-
-        let harness = "H-CSTACKLESS";
-        let sources = BTreeMap::from([(harness.to_owned(), candidate_source.clone())]);
-        let targets = BTreeMap::from([(harness.to_owned(), "decode".to_owned())]);
-        let lines = BTreeMap::from([(harness.to_owned(), 9_u32)]);
-        let forced = std::collections::BTreeSet::new();
-
-        let cases = [
-            serde_json::json!({
-                "id": "F-UBSAN",
-                "rule_id": "BHF-201",
-                "classification": "unhandled",
-                "harness_id": harness,
-                "paths": { "testcase": "crash-ubsan.bin" },
-                "exception": {
-                    "name": "UBSAN_OUT_OF_BOUNDS_ACCESS",
-                    "message": "/project/parser.c:73:5: runtime error: index -2 out of bounds for type 'char[6]'"
-                }
-            }),
-            serde_json::json!({
-                "id": "F-OOM",
-                "rule_id": "BHF-209",
-                "classification": "unhandled",
-                "harness_id": harness,
-                "paths": { "testcase": "crash-oom.bin" },
-                "exception": {
-                    "name": "ASAN_OUT_OF_MEMORY",
-                    "message": "AddressSanitizer failed to allocate memory"
-                },
-                "oracle": {
-                    "evidence": [{ "key": "source", "value": "ASAN_OUT_OF_MEMORY" }]
-                }
-            }),
-        ];
-
-        for raw in cases {
-            let id = raw["id"].as_str().unwrap();
-            let path = root.join(format!("{id}.json"));
-            std::fs::write(&path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
-            let row = load_csv_finding(
-                &path,
-                id,
-                actionability::RunMode::Reporting,
-                &forced,
-                &root,
-                &sources,
-                &targets,
-                &lines,
-            )
-            .expect("CSV finding");
-            assert!(!row.sink_file.is_empty(), "{id} sink_file");
-            assert!(!row.sink_line.is_empty(), "{id} sink_line");
-            assert_eq!(row.sink_function, "decode", "{id} sink_function");
-            assert_eq!(row.entity, "decode", "{id} entity");
-            assert!(row.source.starts_with("fuzz_input:"), "{id} source");
-            assert!(row.data_flow.contains("entry:decode"), "{id} data_flow");
-        }
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn tree_static_finding_ids_lists_only_f_static_dirs() {
+    fn disk_only_finding_ids_lists_every_disk_family() {
         let tmp = std::env::temp_dir().join(format!(
             "bhf-tsf-{}",
             SystemTime::now()
@@ -4184,6 +3204,11 @@ mod tests {
             "F-STATIC-0001",
             "F-MSAN-0000",
             "F-CAP-0000",
+            "F-TSAN-0000",
+            "F-MEM-0000",
+            "F-JSINK-0000",
+            "F-EXT-0000",
+            "F-DIFF-0000",
             "F-0000-abcd",
             "F-RO-H1-000",
         ] {
@@ -4193,21 +3218,28 @@ mod tests {
         // A F-STATIC dir with no finding.json must be ignored (incomplete write).
         std::fs::create_dir_all(findings.join("F-STATIC-9999")).unwrap();
 
-        // Disk-folded finding families: --static (F-STATIC-*), MSan replay
-        // (F-MSAN-*), and capability profiling (F-CAP-*). Result-linked fuzz
-        // (F-0000-*) and report-only (F-RO-*) rows are NOT re-read here.
-        let ids = tree_static_finding_ids(&tmp);
+        // Disk-folded finding families: --static (F-STATIC-*), MSan/TSan replay
+        // (F-MSAN-* / F-TSAN-*), memory profiling (F-MEM-*), capability profiling
+        // (F-CAP-*), the JVM sink oracle (F-JSINK-*), external tools (F-EXT-*) and
+        // the differential post-pass (F-DIFF-*). Result-linked fuzz (F-0000-*) and
+        // report-only (F-RO-*) findings are NOT re-read here.
+        let ids = disk_only_finding_ids(&tmp);
         assert_eq!(
             ids,
             vec![
                 "F-CAP-0000",
+                "F-DIFF-0000",
+                "F-EXT-0000",
+                "F-JSINK-0000",
+                "F-MEM-0000",
                 "F-MSAN-0000",
                 "F-STATIC-0000",
-                "F-STATIC-0001"
+                "F-STATIC-0001",
+                "F-TSAN-0000",
             ]
         );
         // No findings dir at all -> empty, not a panic.
-        assert!(tree_static_finding_ids(tmp.parent().unwrap().join("nope").as_path()).is_empty());
+        assert!(disk_only_finding_ids(tmp.parent().unwrap().join("nope").as_path()).is_empty());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -4717,9 +3749,9 @@ mod tests {
 
     /// Regression: a finding a post-pass DELETED from disk (COBOL crash
     /// attribution dropping a harness-artifact crash) must also leave the
-    /// in-memory pass record, so the headline count, run.json and findings.csv all
-    /// agree with the evidence on disk. Before the reconcile the two COBOL targets
-    /// read `findings: 1` while their CSV / `findings/` held nothing.
+    /// in-memory pass record, so the headline count, run.json and the results/
+    /// index all agree with the evidence on disk. Before the reconcile the two
+    /// COBOL targets read `findings: 1` while their index / `findings/` held nothing.
     #[test]
     fn phantom_finding_removed_by_post_pass_is_reconciled_out_of_count() {
         use crate::auto::attempt::{AttemptResult, Outcome, PassRun};
@@ -4806,20 +3838,16 @@ mod tests {
             serde_json::json!([survivor]),
             "{json}"
         );
-        // findings.csv carries exactly the one surviving row — count and evidence
-        // agree, the invariant the COBOL reconciliation gate requires.
-        let csv = std::fs::read_to_string(work.join("findings.csv")).unwrap();
-        let data_rows: Vec<&str> = csv
-            .lines()
-            .skip(1)
-            .filter(|l| !l.trim().is_empty())
+        // The results/ index carries exactly the one surviving finding — count and
+        // evidence agree, the invariant the COBOL reconciliation gate requires.
+        let doc = rebuild_results(&work);
+        let ids: Vec<&str> = doc["findings"]
+            .as_array()
+            .expect("findings array")
+            .iter()
+            .filter_map(|f| f["id"].as_str())
             .collect();
-        assert_eq!(data_rows.len(), 1, "csv: {csv}");
-        assert!(
-            data_rows[0].starts_with(survivor),
-            "csv row: {}",
-            data_rows[0]
-        );
+        assert_eq!(ids, vec![survivor], "{doc}");
 
         let _ = std::fs::remove_dir_all(&work);
     }
@@ -5618,148 +4646,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn write_reports_emits_findings_csv_with_populated_row() {
-        use crate::auto::attempt::PassRun;
-        use crate::auto::pass::Pass;
-
-        let work = std::env::temp_dir().join(format!(
-            "bhf-report-csv-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let fid = "F-0000-1028b5d3";
-        let finding_dir = work.join("results").join("findings").join(fid);
-        std::fs::create_dir_all(&finding_dir).unwrap();
-        // A real C LeakSanitizer finding shape, written WITHOUT an actionability
-        // block so the CSV writer exercises the backfill path.
-        std::fs::write(
-            finding_dir.join("finding.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "id": fid,
-                "signature": "1028b5d3e132c794",
-                "rule_id": "BHF-208",
-                "classification": "unhandled",
-                "harness_id": "H-X0C65-56DA8C32",
-                "dialect": "unknown",
-                "paths": { "testcase": "testcase.bin" },
-                "exception": {
-                    "name": "LSAN_MEMORY_LEAK",
-                    "message": "==1==ERROR: LeakSanitizer: detected memory leaks",
-                    "sanitizer": "lsan",
-                    "stack": [
-                        { "function": "malloc" },
-                        { "function": "nsvg__createParser()", "file": "/src/nanosvg.h", "line": 646 },
-                        { "function": "nsvgParse", "file": "/src/nanosvg.h", "line": 3178 },
-                        { "function": "bhf_run_one(unsigned char const*, unsigned long)", "file": "/work/auto/H/main.cpp", "line": 39 }
-                    ]
-                }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        let result = AttemptResult {
-            candidate: cand("H-X0C65-56DA8C32"),
-            outcome: Outcome::BuiltAndFuzzed {
-                repairs: vec![],
-                retries: 0,
-                per_pass_budget_secs: 60,
-                total_wall_budget_secs: 180,
-                passes: vec![PassRun {
-                    pass: Pass::Rng,
-                    engine: "builtin".to_owned(),
-                    executions: 10,
-                    target_entry_observed: false,
-                    coverage_edges: 1,
-                    elapsed_secs: 1.0,
-                    executions_per_sec: 10.0,
-                    findings: vec![fid.to_owned()],
-                }],
-                executions_per_sec: 10.0,
-                runtrace_events: vec![],
-            },
-            harness_dir: PathBuf::from("/tmp"),
-        };
-
-        write_reports(
-            std::path::Path::new("/tmp"),
-            std::slice::from_ref(&result),
-            &work,
-            "T0",
-            "T1",
-            false,
-            actionability::RunMode::Reporting,
-            0,
-            0,
-            false,
-            false,
-            false,
-        )
-        .unwrap();
-
-        let csv = std::fs::read_to_string(work.join("auto/findings.csv")).unwrap();
-        let mut lines = csv.lines();
-        assert_eq!(
-            lines.next().unwrap(),
-            "id,count,harness_id,rule_id,message,exception_name,sanitizer,classification,confirmation,impact,confidence,verdict,cwe,source,data_flow,sink_file,sink_line,sink_function,entity,remediation,signature,member_finding_ids,stub_total,stub_blind,stub_declared,linked_real"
-        );
-        let row = lines.next().expect("one finding row");
-        assert!(
-            lines.next().is_none(),
-            "exactly one finding row, got: {csv}"
-        );
-        let cells: Vec<&str> = row.split(',').collect();
-        assert_eq!(cells[0], fid);
-        assert_eq!(cells[1], "1", "count for a single-finding issue");
-        assert_eq!(cells[2], "H-X0C65-56DA8C32");
-        // rule_id + message (cells[3..5]): a fuzz crash carries no finding-rule id;
-        // the message is the crash label. Both may be empty for a bare LSAN leak.
-        assert_eq!(cells[5], "LSAN_MEMORY_LEAK");
-        assert_eq!(cells[6], "lsan");
-        assert_eq!(cells[7], "unhandled");
-        // #484: a runtime crash with no static counterpart is provenance "fuzz".
-        assert_eq!(cells[8], "fuzz");
-        // verdict column populated.
-        assert!(!cells[11].is_empty(), "verdict empty in row: {row}");
-        // cwe: bare number, no `CWE-` prefix (lsan leak -> 401).
-        assert_eq!(cells[12], "401");
-        // Runtime source/data-flow: saved fuzz input -> discovered entry -> sink.
-        assert_eq!(cells[13], "fuzz_input:testcase.bin");
-        assert_eq!(
-            cells[14],
-            "fuzz_input:testcase.bin -> entry:f -> sink:/src/nanosvg.h:646:nsvg__createParser"
-        );
-        // sink = top resolved project frame (allocator + harness skipped).
-        assert_eq!(cells[15], "/src/nanosvg.h");
-        assert_eq!(cells[16], "646");
-        assert_eq!(cells[17], "nsvg__createParser");
-        // entity (18): the most specific resolved faulting callable.
-        assert_eq!(cells[18], "nsvg__createParser");
-        // remediation (19): a one-line fix; a rule-less crash gets the fallback.
-        assert!(!cells[19].is_empty(), "remediation empty in row: {row}");
-        assert!(
-            !cells[19].contains("finding.json"),
-            "remediation is guidance, not a path: {}",
-            cells[19]
-        );
-        assert_eq!(cells[20], "1028b5d3e132c794");
-        // #4: member_finding_ids is BLANK for a singleton issue (it would only echo id).
-        assert_eq!(cells[21], "");
-
-        std::fs::remove_dir_all(&work).ok();
-    }
-
-    /// The stub columns must carry the real per-target accounting, not just
-    /// exist. A crash reached through fabricated values is a different claim
-    /// from a crash in real library code, and until these columns landed that
-    /// distinction was a per-RUN caveat a single CSV row could not express.
-    /// `stub_blind` is the one that matters most — an invented body with no
+    /// The per-target stub accounting must carry the real counts. A crash reached
+    /// through fabricated values is a different claim from a crash in real library
+    /// code. `stub_blind` is the one that matters most — an invented body with no
     /// declaration behind it is the most likely to manufacture a crash.
     #[test]
-    fn findings_csv_reports_how_much_stubbing_stood_behind_each_finding() {
+    fn stub_execution_summary_counts_blind_declared_and_real_symbols() {
         use crate::auto::attempt::stub_execution_summary;
         use crate::auto::repair::Repair;
 
@@ -5786,224 +4678,14 @@ mod tests {
         assert_eq!(stub.declared_stubbed_symbols, 1);
         assert_eq!(stub.real_linked_symbols, 1);
         assert_eq!(stub.resolved_called_symbols, 4, "the denominator");
-
-        // Those four numbers are exactly what a row must carry, in header order
-        // stub_total,stub_blind,stub_declared,linked_real.
-        let header: Vec<&str> = FINDINGS_CSV_HEADER.trim_end().split(',').collect();
-        let tail = &header[header.len() - 4..];
-        assert_eq!(
-            tail,
-            ["stub_total", "stub_blind", "stub_declared", "linked_real"],
-            "stub columns must be the LAST four, so existing column indices are \
-             unchanged for anything already parsing this file"
-        );
     }
 
+    /// The legacy work-dir indexes are retired: `results/` (rebuilt by the
+    /// command's results bracket) is the only findings index.
     #[test]
-    fn optional_columns_keep_the_header_aligned_with_the_row() {
-        // The `forced` / `scan_type` columns are written by `render_issue_row`
-        // BEFORE the stub block. Appending them to the end of the fixed header
-        // instead put every stub value one column left of its name, so a forced
-        // run's `forced` column read out as `linked_real`.
-        let finding = CsvFinding {
-            id: "F-0001".to_owned(),
-            group_key: "g".to_owned(),
-            harness_id: "H-G0001-AAAA".to_owned(),
-            rule_id: "BHF-201".to_owned(),
-            message: "Go panic: index out of range".to_owned(),
-            exception_name: "ASAN_GO_INDEX_OUT_OF_BOUNDS".to_owned(),
-            sanitizer: "asan".to_owned(),
-            classification: "unhandled".to_owned(),
-            confirmation: "fuzz".to_owned(),
-            impact: actionability::Impact::Critical,
-            confidence: actionability::ActionabilityConfidence::High,
-            verdict: actionability::Verdict::LikelyReachable,
-            cwe: vec!["125".to_owned()],
-            source: String::new(),
-            data_flow: String::new(),
-            sink_file: "forcelib.go".to_owned(),
-            sink_line: "42".to_owned(),
-            sink_function: "Render".to_owned(),
-            entity: String::new(),
-            remediation: String::new(),
-            signature: String::new(),
-            forced: true,
-            note: confidence_model::FORCED_STUB_NOTE.to_owned(),
-        };
-        let stub = stub_execution_summary(&[]);
-        for (static_dynamic, force) in [(false, true), (true, false), (true, true)] {
-            let mut header = String::from(FINDINGS_CSV_BASE_HEADER);
-            if static_dynamic {
-                header.push_str(",scan_type");
-            }
-            if force {
-                header.push_str(",forced");
-            }
-            header.push(',');
-            header.push_str(FINDINGS_CSV_STUB_HEADER);
-
-            let row = render_issue_row(
-                std::slice::from_ref(&finding),
-                static_dynamic,
-                force,
-                Some(&stub),
-            );
-            // Split on unquoted commas only — the forced note contains one.
-            let mut cells = Vec::new();
-            let mut cell = String::new();
-            let mut quoted = false;
-            for ch in row.trim_end().chars() {
-                match ch {
-                    '"' => quoted = !quoted,
-                    ',' if !quoted => cells.push(std::mem::take(&mut cell)),
-                    _ => cell.push(ch),
-                }
-            }
-            cells.push(cell);
-            let names: Vec<&str> = header.split(',').collect();
-            assert_eq!(
-                names.len(),
-                cells.len(),
-                "static_dynamic={static_dynamic} force={force}: header {names:?} vs row {cells:?}"
-            );
-            let column = |name: &str| {
-                names
-                    .iter()
-                    .position(|n| *n == name)
-                    .map(|index| cells[index].as_str())
-                    .unwrap_or_else(|| panic!("no {name} column"))
-            };
-            assert_eq!(column("stub_total"), "0");
-            assert_eq!(column("linked_real"), "0");
-            if force {
-                assert_eq!(column("forced"), confidence_model::FORCED_STUB_NOTE);
-            }
-            if static_dynamic {
-                assert_eq!(column("scan_type"), "dynamic");
-            }
-        }
-    }
-
-    #[test]
-    fn write_reports_groups_findings_csv_by_cluster_key_full() {
-        // #36: two findings that share a cluster_key_full (the cascade re-emitting
-        // the same root cause across passes) must collapse to ONE issue row with
-        // count=2 and both member ids — matching the report crate's grouped CSV,
-        // not one row per finding.
-        use crate::auto::attempt::PassRun;
-        use crate::auto::pass::Pass;
-
+    fn write_reports_writes_no_legacy_findings_index() {
         let work = std::env::temp_dir().join(format!(
-            "bhf-report-csv-group-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let cluster = "ab".repeat(32);
-        let ids = ["F-0001-aaaa", "F-0002-bbbb"];
-        for fid in ids {
-            let dir = work.join("results").join("findings").join(fid);
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(
-                dir.join("finding.json"),
-                serde_json::to_vec_pretty(&serde_json::json!({
-                    "id": fid,
-                    "signature": fid,
-                    "cluster_key_full": cluster,
-                    "rule_id": "BHF-201",
-                    "classification": "unhandled",
-                    "harness_id": "H-DUP",
-                    "exception": {
-                        "name": "ASAN_HEAP_BUFFER_OVERFLOW",
-                        "sanitizer": "asan",
-                        "stack": [ { "function": "parse_rec", "file": "/src/p.c", "line": 12 } ]
-                    }
-                }))
-                .unwrap(),
-            )
-            .unwrap();
-        }
-
-        let result = AttemptResult {
-            candidate: cand("H-DUP"),
-            outcome: Outcome::BuiltAndFuzzed {
-                repairs: vec![],
-                retries: 0,
-                per_pass_budget_secs: 60,
-                total_wall_budget_secs: 180,
-                passes: vec![
-                    PassRun {
-                        pass: Pass::Empty,
-                        engine: "builtin".to_owned(),
-                        executions: 1,
-                        target_entry_observed: false,
-                        coverage_edges: 1,
-                        elapsed_secs: 1.0,
-                        executions_per_sec: 1.0,
-                        findings: vec![ids[0].to_owned()],
-                    },
-                    PassRun {
-                        pass: Pass::Rng,
-                        engine: "builtin".to_owned(),
-                        executions: 1,
-                        target_entry_observed: false,
-                        coverage_edges: 1,
-                        elapsed_secs: 1.0,
-                        executions_per_sec: 1.0,
-                        findings: vec![ids[1].to_owned()],
-                    },
-                ],
-                executions_per_sec: 1.0,
-                runtrace_events: vec![],
-            },
-            harness_dir: PathBuf::from("/tmp"),
-        };
-
-        write_reports(
-            std::path::Path::new("/tmp"),
-            std::slice::from_ref(&result),
-            &work,
-            "T0",
-            "T1",
-            false,
-            actionability::RunMode::Reporting,
-            0,
-            0,
-            false,
-            false,
-            false,
-        )
-        .unwrap();
-
-        let csv = std::fs::read_to_string(work.join("auto/findings.csv")).unwrap();
-        let rows: Vec<&str> = csv.lines().skip(1).collect();
-        assert_eq!(rows.len(), 1, "two findings, one cluster -> one row: {csv}");
-        let cells: Vec<&str> = rows[0].split(',').collect();
-        assert_eq!(cells[1], "2", "count collapses both members");
-        assert_eq!(cells[21], "F-0001-aaaa;F-0002-bbbb", "member ids preserved");
-        assert_eq!(
-            std::fs::read_to_string(work.join("findings.csv")).unwrap(),
-            csv,
-            "top-level findings.csv is the canonical convenience alias"
-        );
-        let findings_md = std::fs::read_to_string(work.join("FINDINGS.md")).unwrap();
-        assert!(
-            findings_md.contains("1 root-cause issue(s)"),
-            "{findings_md}"
-        );
-        assert!(
-            findings_md.contains("bhf replay --finding"),
-            "{findings_md}"
-        );
-
-        std::fs::remove_dir_all(&work).ok();
-    }
-
-    #[test]
-    fn write_reports_emits_header_only_findings_csv_when_no_findings() {
-        let work = std::env::temp_dir().join(format!(
-            "bhf-report-csv-empty-{}",
+            "bhf-report-no-legacy-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -6025,21 +4707,24 @@ mod tests {
             false,
         )
         .unwrap();
-        let csv = std::fs::read_to_string(work.join("auto/findings.csv")).unwrap();
-        assert_eq!(csv, FINDINGS_CSV_HEADER);
-        assert_eq!(
-            std::fs::read_to_string(work.join("findings.csv")).unwrap(),
-            FINDINGS_CSV_HEADER
-        );
-        let md = std::fs::read_to_string(work.join("FINDINGS.md")).unwrap();
+        assert!(work.join("auto/run.json").is_file());
+        for legacy in [
+            "FINDINGS.md",
+            "findings.csv",
+            "auto/findings.csv",
+            "auto/attestation.json",
+        ] {
+            assert!(!work.join(legacy).exists(), "{legacy} must not be written");
+        }
+        let md = std::fs::read_to_string(work.join("auto/run.md")).unwrap();
         assert!(md.contains("No findings were emitted"), "{md}");
         std::fs::remove_dir_all(&work).ok();
     }
 
     /// #484: a `--static` finding that the fuzz-confirmation join upgraded to
-    /// `fuzz_confirmed` on disk must render its provenance in the findings.csv
-    /// `confirmation` column and count in the run.json `fuzz_confirmed` summary.
-    /// A sibling static finding with no runtime match stays `static`.
+    /// `fuzz_confirmed` on disk must count in the run.json `fuzz_confirmed`
+    /// summary and index as `static_confirmed` in results/findings.json. A
+    /// sibling static finding with no runtime match stays `static`.
     #[test]
     fn write_reports_surfaces_fuzz_confirmed_static_finding() {
         let work = std::env::temp_dir().join(format!(
@@ -6051,7 +4736,7 @@ mod tests {
         ));
         // A confirmed static finding (as the join would have rewritten it) and a
         // plain static finding, both written straight to the findings dir the way
-        // `emit_tree_static_findings` does (picked up via `tree_static_finding_ids`).
+        // `emit_tree_static_findings` does (picked up via `disk_only_finding_ids`).
         let confirmed = serde_json::json!({
             "id": "F-STATIC-0000",
             "rule_id": "BHF-420",
@@ -6106,19 +4791,19 @@ mod tests {
         )
         .unwrap();
 
-        let csv = std::fs::read_to_string(work.join("auto/findings.csv")).unwrap();
-        let confirmation_col = |id: &str| -> String {
-            csv.lines()
-                .find(|l| l.starts_with(&format!("{id},")))
-                .map(|l| l.split(',').nth(8).unwrap_or("").to_owned())
+        let doc = rebuild_results(&work);
+        let level = |id: &str| -> String {
+            doc["findings"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|f| f["id"] == id)
+                .and_then(|f| f["confirmation"]["level"].as_str())
                 .unwrap_or_default()
+                .to_owned()
         };
-        assert_eq!(
-            confirmation_col("F-STATIC-0000"),
-            "fuzz_confirmed",
-            "csv: {csv}"
-        );
-        assert_eq!(confirmation_col("F-STATIC-0001"), "static", "csv: {csv}");
+        assert_eq!(level("F-STATIC-0000"), "static_confirmed", "{doc}");
+        assert_eq!(level("F-STATIC-0001"), "static", "{doc}");
 
         let json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(work.join("auto/run.json")).unwrap())
@@ -6273,9 +4958,9 @@ mod tests {
 
     /// force-fuzz Phase 2: a finding from a target that ran forced-and-stub-heavy
     /// (`--force` + a stub-only build) must be honestly LOW confidence: the summary
-    /// counts it under `forced`, run.md surfaces the forced/stub caveat, and its
-    /// findings.csv row shows `low` confidence with the stub-artifact note in the
-    /// trailing `forced` column — so a forced crash is never read as a confirmed bug.
+    /// counts it under `forced`, run.md surfaces the forced/stub caveat, and the
+    /// finding indexes as forced with `low` severity and confidence and the
+    /// stub-artifact caveat — so a forced crash is never read as a confirmed bug.
     #[test]
     fn forced_stub_heavy_target_floors_findings_to_low_and_counts_forced() {
         use crate::auto::attempt::{Outcome, PassRun};
@@ -6375,21 +5060,26 @@ mod tests {
             "md missing forced summary: {md}"
         );
 
-        // findings.csv: `low` confidence + the `forced` note column, which sits
-        // immediately before the stub block because that is where the row writes it.
-        let csv = std::fs::read_to_string(work.join("auto/findings.csv")).unwrap();
-        let header = csv.lines().next().unwrap();
+        // The forced floor is persisted on the finding, so the results/ index
+        // reads it from disk: forced, `low` severity and confidence, plus the
+        // stub-artifact caveat.
+        let doc = rebuild_results(&work);
+        let finding = doc["findings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|f| f["id"] == fid)
+            .unwrap_or_else(|| panic!("indexed forced finding: {doc}"));
+        assert_eq!(finding["fidelity"]["forced"], true, "{finding}");
+        assert_eq!(finding["severity"], "low", "{finding}");
+        assert_eq!(finding["confidence"]["level"], "low", "{finding}");
         assert!(
-            header.contains(",forced,stub_total,"),
-            "the forced column must precede the stub block: {header}"
-        );
-        let confidence_idx = header.split(',').position(|c| c == "confidence").unwrap();
-        let row = csv.lines().nth(1).expect("one finding row");
-        let cells: Vec<&str> = row.split(',').collect();
-        assert_eq!(cells[confidence_idx], "low", "row: {row}");
-        assert!(
-            row.contains("stub artifact"),
-            "forced note missing in row: {row}"
+            finding["fidelity"]["caveats"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|c| c.as_str().is_some_and(|c| c.contains("stub artifact"))),
+            "forced caveat missing: {finding}"
         );
 
         std::fs::remove_dir_all(&work).ok();

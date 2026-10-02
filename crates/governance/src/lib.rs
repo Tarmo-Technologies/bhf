@@ -2154,55 +2154,25 @@ fn copy_regular_snapshot_file(
 
 pub fn write_export_manifest(options: &ExportOptions) -> Result<Value, GovernanceError> {
     let mut artifacts = Vec::new();
-    collect_work_artifact(
-        &options.work_dir,
-        "reports/run-last.json",
-        "report_json",
-        &mut artifacts,
-    )?;
-    collect_work_artifact(
-        &options.work_dir,
-        "reports/run-last.md",
-        "report_markdown",
-        &mut artifacts,
-    )?;
-    collect_work_artifact(
-        &options.work_dir,
-        "reports/run-last.sarif",
-        "sarif",
-        &mut artifacts,
-    )?;
-    collect_work_artifact(
-        &options.work_dir,
-        "reports/run-last.junit.xml",
-        "junit",
-        &mut artifacts,
-    )?;
-    collect_work_artifact(
-        &options.work_dir,
-        "static/static-report.json",
-        "static_report",
-        &mut artifacts,
-    )?;
-    collect_work_artifact(
-        &options.work_dir,
-        "static/static-report.sarif",
-        "static_sarif",
-        &mut artifacts,
-    )?;
-    collect_work_artifact(&options.work_dir, "sbom/sbom.json", "sbom", &mut artifacts)?;
-    collect_work_artifact(
-        &options.work_dir,
-        "sbom/cyclonedx.json",
-        "cyclonedx_sbom",
-        &mut artifacts,
-    )?;
-    collect_work_artifact(
-        &options.work_dir,
-        "sbom/vulnerabilities.json",
-        "vulnerability_report",
-        &mut artifacts,
-    )?;
+    for (rel, kind) in [
+        ("results/INDEX.md", "results_index"),
+        ("results/findings.json", "findings_json"),
+        ("results/findings.csv", "findings_csv"),
+        ("results/findings.sarif", "sarif"),
+        ("results/manifest.json", "results_manifest"),
+        ("results/attestation.json", "attestation"),
+        ("results/report/run-last.json", "report_json"),
+        ("results/report/run-last.junit.xml", "junit"),
+        ("results/static/static-report.json", "static_report"),
+        ("results/static/static-report.sarif", "static_sarif"),
+        ("results/sbom/sbom.json", "sbom"),
+        ("results/sbom/cyclonedx.json", "cyclonedx_sbom"),
+        ("results/sbom/sbom.spdx.json", "spdx_sbom"),
+        ("results/sbom/vulnerabilities.json", "vulnerability_report"),
+        ("results/sbom/openvex.json", "openvex"),
+    ] {
+        collect_work_artifact(&options.work_dir, rel, kind, &mut artifacts)?;
+    }
     collect_work_artifact(
         &options.work_dir,
         "auto/run.json",
@@ -2215,13 +2185,20 @@ pub fn write_export_manifest(options: &ExportOptions) -> Result<Value, Governanc
         "auto_markdown",
         &mut artifacts,
     )?;
-    collect_artifacts_by_name(
-        &options.work_dir,
-        findings_rel(&options.work_dir),
-        "testcase.bin",
-        "replay_input",
-        &mut artifacts,
-    )?;
+    for (file, kind) in [
+        ("finding.json", "finding_record"),
+        ("testcase.bin", "replay_input"),
+        ("min_testcase.bin", "replay_input_minimized"),
+        ("sanitizer.log", "sanitizer_log"),
+    ] {
+        collect_artifacts_by_name(
+            &options.work_dir,
+            findings_rel(&options.work_dir),
+            file,
+            kind,
+            &mut artifacts,
+        )?;
+    }
     collect_artifacts_by_prefix(
         &options.work_dir,
         "evidence",
@@ -2857,57 +2834,33 @@ fn missing_required_work_artifacts(
     required: &[String],
 ) -> Result<Vec<String>, GovernanceError> {
     let mut artifacts = Vec::new();
-    collect_work_artifact(
-        work_dir,
-        "reports/run-last.json",
-        "report_json",
-        &mut artifacts,
-    )?;
-    collect_work_artifact(
-        work_dir,
-        "reports/run-last.md",
-        "report_markdown",
-        &mut artifacts,
-    )?;
-    collect_work_artifact(work_dir, "reports/run-last.sarif", "sarif", &mut artifacts)?;
-    collect_work_artifact(
-        work_dir,
-        "reports/run-last.junit.xml",
-        "junit",
-        &mut artifacts,
-    )?;
-    collect_work_artifact(
-        work_dir,
-        "static/static-report.json",
-        "static_report",
-        &mut artifacts,
-    )?;
-    collect_work_artifact(
-        work_dir,
-        "static/static-report.sarif",
-        "static_sarif",
-        &mut artifacts,
-    )?;
-    collect_work_artifact(work_dir, "sbom/sbom.json", "sbom", &mut artifacts)?;
-    collect_work_artifact(
-        work_dir,
-        "sbom/cyclonedx.json",
-        "cyclonedx_sbom",
-        &mut artifacts,
-    )?;
-    collect_work_artifact(
-        work_dir,
-        "sbom/vulnerabilities.json",
-        "vulnerability_report",
-        &mut artifacts,
-    )?;
-    collect_artifacts_by_name(
-        work_dir,
-        findings_rel(work_dir),
-        "testcase.bin",
-        "replay_input",
-        &mut artifacts,
-    )?;
+    for (rel, kind) in [
+        ("results/INDEX.md", "results_index"),
+        ("results/findings.json", "findings_json"),
+        ("results/findings.csv", "findings_csv"),
+        ("results/findings.sarif", "sarif"),
+        ("results/manifest.json", "results_manifest"),
+        ("results/attestation.json", "attestation"),
+        ("results/report/run-last.json", "report_json"),
+        ("results/report/run-last.junit.xml", "junit"),
+        ("results/static/static-report.json", "static_report"),
+        ("results/static/static-report.sarif", "static_sarif"),
+        ("results/sbom/sbom.json", "sbom"),
+        ("results/sbom/cyclonedx.json", "cyclonedx_sbom"),
+        ("results/sbom/sbom.spdx.json", "spdx_sbom"),
+        ("results/sbom/vulnerabilities.json", "vulnerability_report"),
+        ("results/sbom/openvex.json", "openvex"),
+    ] {
+        collect_work_artifact(work_dir, rel, kind, &mut artifacts)?;
+    }
+    for (file, kind) in [
+        ("finding.json", "finding_record"),
+        ("testcase.bin", "replay_input"),
+        ("min_testcase.bin", "replay_input_minimized"),
+        ("sanitizer.log", "sanitizer_log"),
+    ] {
+        collect_artifacts_by_name(work_dir, findings_rel(work_dir), file, kind, &mut artifacts)?;
+    }
     collect_artifacts_by_prefix(work_dir, "evidence", "validation_evidence", &mut artifacts)?;
     Ok(missing_required_artifacts(&artifacts, required))
 }
@@ -8332,5 +8285,53 @@ mod findings_reader_tests {
             "export did not collect the results-layout replay input: {manifest}"
         );
         assert_eq!(manifest["required_artifacts"]["missing"], json!([]));
+    }
+
+    #[test]
+    fn export_collects_results_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path();
+        for rel in [
+            "results/INDEX.md",
+            "results/findings.json",
+            "results/findings.sarif",
+            "results/findings.csv",
+            "results/manifest.json",
+            "results/attestation.json",
+            "results/findings/F-0000-aaaaaaaa/finding.json",
+            "results/findings/F-0000-aaaaaaaa/testcase.bin",
+            "results/findings/F-0000-aaaaaaaa/sanitizer.log",
+        ] {
+            let p = work.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"x").unwrap();
+        }
+        let manifest = write_export_manifest(&ExportOptions {
+            work_dir: work.to_path_buf(),
+            out: tmp.path().join("export.json"),
+            bundle_dir: None,
+            policy: None,
+            update_packs: Vec::new(),
+            audit_log: None,
+            runner_manifest: None,
+            runner_plan: None,
+            required_artifacts: Vec::new(),
+        })
+        .unwrap();
+        let paths: Vec<String> = manifest["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["path"].as_str().unwrap().to_owned())
+            .collect();
+        for want in [
+            "results/findings.json",
+            "results/findings.sarif",
+            "results/findings/F-0000-aaaaaaaa/testcase.bin",
+            "results/findings/F-0000-aaaaaaaa/finding.json",
+            "results/findings/F-0000-aaaaaaaa/sanitizer.log",
+        ] {
+            assert!(paths.iter().any(|p| p == want), "missing {want}: {paths:?}");
+        }
     }
 }

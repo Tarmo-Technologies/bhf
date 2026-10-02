@@ -9,7 +9,6 @@ pub mod ada_external_stub;
 pub mod ada_generic_stub;
 pub mod alire_config;
 pub mod attempt;
-pub mod attestation;
 pub mod blocker_histogram;
 pub mod bug_report;
 pub mod build_probe;

@@ -7,11 +7,16 @@ pub struct SbomArgs {
     /// Source tree, work directory, or component manifest to inventory.
     pub path: PathBuf,
 
-    /// Output directory for the emitted artifacts (sbom.json, cyclonedx.json,
+    /// Work directory; without --out, output goes to <work-dir>/results/sbom
+    /// and results/ is rebuilt.
+    #[arg(long = "work-dir", default_value = "bhf_work")]
+    pub work_dir: PathBuf,
+
+    /// Write the emitted artifacts (sbom.json, cyclonedx.json,
     /// vulnerabilities.json, openvex.json, sbom.csv — see `--emit` to select a
-    /// subset).
-    #[arg(long, default_value = "bhf_work/sbom")]
-    pub out: PathBuf,
+    /// subset) here instead, and do not update results/.
+    #[arg(long)]
+    pub out: Option<PathBuf>,
 
     /// Comma-separated subset of artifacts to emit: `cyclonedx`, `sbom`,
     /// `vulnerabilities`, `openvex`, `vex-review`, `csv`, `cyclonedx-vex`, `spdx-json`. Default emits all except
@@ -94,6 +99,14 @@ impl SbomArgs {
         Ok(set)
     }
 
+    /// (output dir, whether this run feeds results/)
+    pub fn output_target(&self) -> (PathBuf, bool) {
+        match &self.out {
+            Some(out) => (out.clone(), false),
+            None => (corpus::layout::sbom_dir(&self.work_dir), true),
+        }
+    }
+
     fn ecosystem_filter(&self) -> Option<Vec<String>> {
         self.ecosystems.as_ref().map(|list| {
             list.split(',')
@@ -106,6 +119,10 @@ impl SbomArgs {
 }
 
 pub fn run(args: SbomArgs) -> i32 {
+    let (out_dir, into_results) = args.output_target();
+    if !into_results {
+        bhfeprintln!("note: --out given; results/ was not updated");
+    }
     let emit = match args.emit_set() {
         Ok(emit) => emit,
         Err(error) => {
@@ -117,7 +134,7 @@ pub fn run(args: SbomArgs) -> i32 {
     let fail_on_unreviewed = args.fail_on_unreviewed;
     let options = governance::SbomOptions {
         root: args.path,
-        out_dir: args.out,
+        out_dir,
         vuln_db: args.vuln_db,
         policy: args.policy,
         binary_inventories: args.binary_inventories,
@@ -136,10 +153,16 @@ pub fn run(args: SbomArgs) -> i32 {
             for path in &summary.written {
                 println!("sbom: wrote {}", path.display());
             }
-            println!("sbom: {} matched vulnerabilities require review", summary.unreviewed_matches);
+            println!(
+                "sbom: {} matched vulnerabilities require review",
+                summary.unreviewed_matches
+            );
             let review_blocked = fail_on_unreviewed && summary.unreviewed_matches > 0;
             if review_blocked {
-                bhfeprintln!("sbom: review gate blocked; inspect {}", summary.vex_review_path.display());
+                bhfeprintln!(
+                    "sbom: review gate blocked; inspect {}",
+                    summary.vex_review_path.display()
+                );
             }
             if summary.gate_failed || review_blocked {
                 1
@@ -276,7 +299,13 @@ mod tests {
 
     #[test]
     fn review_gate_preserves_diagnostics_under_narrow_emit_selection() {
-        let args = parse(&["--emit", "sbom", "--vuln-db", "db.json", "--fail-on-unreviewed"]);
+        let args = parse(&[
+            "--emit",
+            "sbom",
+            "--vuln-db",
+            "db.json",
+            "--fail-on-unreviewed",
+        ]);
         assert!(args.fail_on_unreviewed);
         assert!(args.emit_set().unwrap().contains(EmitKind::VexReview));
         assert!(!parse(&[]).fail_on_unreviewed);
@@ -301,7 +330,7 @@ mod tests {
             "--fail-on",
             "high",
         ]);
-        assert_eq!(args.out, PathBuf::from("/tmp/out"));
+        assert_eq!(args.out, Some(PathBuf::from("/tmp/out")));
         assert_eq!(args.vuln_db, Some(PathBuf::from("/tmp/vulns.json")));
         assert_eq!(
             args.binary_inventories,

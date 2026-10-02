@@ -7,9 +7,14 @@ pub struct StaticScanArgs {
     /// Source or project root to scan.
     pub path: PathBuf,
 
-    /// Output directory for static-report.json and optional SARIF.
-    #[arg(long, default_value = "bhf_work/static")]
-    pub out: PathBuf,
+    /// Work directory; without --out, output goes to <work-dir>/results/static
+    /// and results/ is rebuilt.
+    #[arg(long = "work-dir", default_value = "bhf_work")]
+    pub work_dir: PathBuf,
+
+    /// Write native reports here instead, and do not update results/.
+    #[arg(long)]
+    pub out: Option<PathBuf>,
 
     /// JSON suppression file with exact rule/path/line suppressions.
     #[arg(long)]
@@ -75,7 +80,21 @@ pub struct StaticScanArgs {
     pub external_tools: bool,
 }
 
+impl StaticScanArgs {
+    /// (output dir, whether this run feeds results/)
+    pub fn output_target(&self) -> (PathBuf, bool) {
+        match &self.out {
+            Some(out) => (out.clone(), false),
+            None => (corpus::layout::static_dir(&self.work_dir), true),
+        }
+    }
+}
+
 pub fn run(args: StaticScanArgs) -> i32 {
+    let (out_dir, into_results) = args.output_target();
+    if !into_results {
+        bhfeprintln!("note: --out given; results/ was not updated");
+    }
     let fail_on = args.fail_on;
     // Plumb the incremental `--since <rev>` scope to the engine (which restricts
     // the file walk to the git diff). Env-carried to avoid threading it through
@@ -95,7 +114,7 @@ pub fn run(args: StaticScanArgs) -> i32 {
         let resolved = if sloc_path.is_absolute() {
             sloc_path.clone()
         } else {
-            args.out.join(sloc_path)
+            out_dir.join(sloc_path)
         };
         if let Err(code) = write_sloc_report(&args.path, &resolved) {
             return code;
@@ -103,16 +122,17 @@ pub fn run(args: StaticScanArgs) -> i32 {
     }
     let external_tools = args.external_tools;
     let external_root = args.path.clone();
-    let external_out = args.out.clone();
+    let external_out = out_dir.clone();
     let options = static_analysis::StaticScanOptions {
         root: args.path,
-        out_dir: args.out,
+        out_dir,
         suppressions_path: args.suppressions,
         baseline_path: args.baseline,
         policy_path: args.policy,
         enabled_rules: args.enabled_rules.into_iter().collect(),
         disabled_rules: args.disabled_rules.into_iter().collect(),
-        emit_sarif: args.sarif,
+        // In results mode SARIF always feeds the aggregated results/ SARIF.
+        emit_sarif: args.sarif || into_results,
     };
 
     match static_analysis::write_static_scan(&options) {

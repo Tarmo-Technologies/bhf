@@ -1058,10 +1058,6 @@ fn fatal_signal_report(status: &std::process::ExitStatus, stderr: &str) -> corpu
 }
 
 pub fn run(args: FuzzArgs) -> i32 {
-    if let Err(error) = crate::workdir::prepare(&args.work_dir) {
-        bhfeprintln!("error: {error:#}");
-        return 1;
-    }
     // HDF-1b: when a target transport is requested, drive the additive
     // transport-fuzz path (a separate loop over the `target_transport` seam) and
     // leave the host libFuzzer/AFL path below untouched.
@@ -1358,7 +1354,7 @@ fn run_multicore_campaign(args: FuzzArgs) -> i32 {
                     return 1;
                 }
             }
-            0
+            merge_worker_findings(&config.work_dir, &summary)
         }
         Err(error) => {
             bhfeprintln!("{error}");
@@ -1368,6 +1364,52 @@ fn run_multicore_campaign(args: FuzzArgs) -> i32 {
                 | multicore_fuzz::MulticoreError::InvalidWorkerCount => 3,
                 _ => 1,
             }
+        }
+    }
+}
+
+/// Move the workers' findings into the campaign's own results/findings, so
+/// the results bracket around this command indexes them.
+fn merge_worker_findings(work_dir: &Path, summary: &multicore_fuzz::MulticoreSummary) -> i32 {
+    let workers: Vec<PathBuf> = summary
+        .per_worker
+        .iter()
+        .map(|worker| worker.work_dir.clone())
+        .collect();
+    match multicore_fuzz::merge_worker_findings(work_dir, &workers) {
+        Ok(merge) => {
+            if !merge.merged.is_empty() || merge.duplicates > 0 {
+                bhfeprintln!(
+                    "bhf fuzz: merged {} worker finding(s) into {} ({} duplicate(s) left in worker dirs)",
+                    merge.merged.len(),
+                    corpus::layout::findings_dir(work_dir).display(),
+                    merge.duplicates
+                );
+            }
+            if merge.unreadable > 0 {
+                bhfeprintln!(
+                    "warning: {} worker finding(s) without a readable finding.json were not merged",
+                    merge.unreadable
+                );
+            }
+            if merge.failed == 0 {
+                return 0;
+            }
+            bhfeprintln!(
+                "error: {} worker finding(s) could not be merged; they stay in their worker dirs and the next merge resumes them",
+                merge.failed
+            );
+            for error in &merge.errors {
+                bhfeprintln!("  {error}");
+            }
+            1
+        }
+        Err(error) => {
+            bhfeprintln!(
+                "error: worker findings not merged into {}: {error}",
+                work_dir.display()
+            );
+            1
         }
     }
 }
@@ -5026,29 +5068,13 @@ fn existing_finding_dedup_keys(work_dir: &Path, harness_id: &str) -> (Vec<String
         if record.get("harness_id").and_then(|value| value.as_str()) != Some(harness_id) {
             continue;
         }
-        let rule_id = record.get("rule_id").and_then(|v| v.as_str());
-        // Oracle-hit finding: key = rule_id|oracle_name|api (oracle_hit_dedupe_key).
-        if let (Some(rule_id), Some(oracle)) = (rule_id, record.get("oracle")) {
-            if let (Some(name), Some(api)) = (
-                oracle.get("name").and_then(|v| v.as_str()),
-                oracle.get("api").and_then(|v| v.as_str()),
-            ) {
-                oracles.push(format!("{rule_id}|{name}|{api}"));
-                continue;
-            }
-        }
-        // Sanitizer-crash finding: key = cluster_key_full, or rule:<id> on fallback
-        // (matches first_of_sanitizer_cluster).
-        let fallback = record
-            .get("cluster_fallback")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        if fallback {
-            if let Some(rule_id) = rule_id {
-                clusters.push(format!("rule:{rule_id}"));
-            }
-        } else if let Some(full) = record.get("cluster_key_full").and_then(|v| v.as_str()) {
-            clusters.push(full.to_owned());
+        // Oracle hits key on rule_id|oracle_name|api (oracle_hit_dedupe_key),
+        // sanitizer crashes on cluster_key_full or rule:<id> on fallback
+        // (first_of_sanitizer_cluster).
+        match corpus::finding::run_dedupe_key(&record) {
+            Some(corpus::finding::RunDedupeKey::Oracle(key)) => oracles.push(key),
+            Some(corpus::finding::RunDedupeKey::Cluster(key)) => clusters.push(key),
+            None => {}
         }
     }
     (clusters, oracles)

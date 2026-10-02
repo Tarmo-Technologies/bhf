@@ -16,6 +16,10 @@
 //!
 //! Tracks issue #292.
 
+mod merge;
+
+pub use merge::{merge_worker_findings, MergeReport};
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -132,6 +136,8 @@ pub enum MulticoreError {
     Io(#[from] std::io::Error),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("refusing to merge worker findings into {}: it is {reason}", path.display())]
+    UnsafeFindingsDir { path: PathBuf, reason: &'static str },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,6 +220,9 @@ pub fn run_multicore(config: &MulticoreConfig) -> Result<MulticoreSummary, Multi
             .env("BHF_WORKER_ID", worker_id.to_string())
             .env("BHF_SHARED_CORPUS_DIR", &shared_queue)
             .env("BHF_CAMPAIGN_DIR", &campaign_dir)
+            // The orchestrating `bhf fuzz` records the campaign and rebuilds
+            // results/ once; workers must not each do it.
+            .env(corpus::layout::RESULTS_DEFER_ENV, "1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
@@ -665,33 +674,10 @@ fn count_findings(worker_dir: &Path) -> usize {
     entries.filter_map(|e| e.ok()).count()
 }
 
+/// Distinct crashes across the workers, by the rule the merge into the parent
+/// uses: harness-scoped, any shared dedupe key is the same crash.
 fn unique_finding_count(per_worker: &[WorkerReport]) -> usize {
-    use std::collections::HashSet;
-    let mut seen: HashSet<String> = HashSet::new();
-    for report in per_worker {
-        let findings_dir = corpus::layout::findings_dir(&report.work_dir);
-        let Ok(entries) = std::fs::read_dir(&findings_dir) else {
-            continue;
-        };
-        for entry in entries.filter_map(|e| e.ok()) {
-            let finding_json = entry.path().join("finding.json");
-            let Ok(bytes) = std::fs::read(&finding_json) else {
-                continue;
-            };
-            let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-                continue;
-            };
-            let key = value
-                .get("cluster_key")
-                .and_then(|v| v.as_str())
-                .or_else(|| value.get("signature").and_then(|v| v.as_str()))
-                .map(str::to_owned);
-            if let Some(key) = key {
-                seen.insert(key);
-            }
-        }
-    }
-    seen.len()
+    merge::count_unique(per_worker.iter().map(|report| report.work_dir.as_path()))
 }
 
 #[cfg(test)]
@@ -901,6 +887,36 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn workers_defer_the_results_rebuild_to_the_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // argv is `fuzz <worker_dir> ...`; record what the worker saw.
+        let work = tempdir("defer");
+        let script = work.join("record-env.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s' \"${BHF_RESULTS_DEFER-unset}\" > \"$2/defer\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = MulticoreConfig {
+            work_dir: work.clone(),
+            harness_id: "H-DEFER".to_owned(),
+            workers: WorkerCount::Fixed(1),
+            per_worker_iterations: None,
+            time_budget: Duration::from_secs(0),
+            bhf_bin: script,
+            per_worker_env: Vec::new(),
+            extra_worker_args: Vec::new(),
+            kill_grace: None,
+        };
+        let summary = run_multicore(&config).expect("campaign completes");
+        let seen = std::fs::read_to_string(summary.per_worker[0].work_dir.join("defer")).unwrap();
+        assert_eq!(seen, "1");
+    }
+
+    #[test]
     fn run_multicore_rejects_missing_work_dir() {
         let config = MulticoreConfig {
             work_dir: PathBuf::from("/nonexistent/work"),
@@ -985,8 +1001,8 @@ mod tests {
             std::fs::write(
                 f.join("finding.json"),
                 serde_json::json!({
-                    "cluster_key": "shared-cluster-key",
-                    "signature": "irrelevant"
+                    "cluster_key_full": "shared-cluster-key",
+                    "signature": format!("signature-{worker}")
                 })
                 .to_string(),
             )
@@ -1010,6 +1026,93 @@ mod tests {
         ];
         // Two workers, one shared cluster_key → 1 unique.
         assert_eq!(unique_finding_count(&reports), 1);
+    }
+
+    fn report_for(worker_id: u32, work_dir: PathBuf) -> WorkerReport {
+        WorkerReport {
+            worker_id,
+            work_dir,
+            exit_code: Some(0),
+            findings_count: 0,
+            env_keys: Vec::new(),
+        }
+    }
+
+    fn put_finding(work_dir: &Path, id: &str, record: serde_json::Value) {
+        let dir = corpus::layout::finding_dir(work_dir, id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("finding.json"), record.to_string()).unwrap();
+    }
+
+    #[test]
+    fn unique_finding_count_agrees_with_the_merge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().to_path_buf();
+        let finding = |harness: &str, cluster: Option<&str>, signature: Option<&str>| {
+            let mut record = serde_json::json!({"harness_id": harness, "rule_id": "BHF-201"});
+            if let Some(cluster) = cluster {
+                record["cluster_key_full"] = cluster.into();
+            }
+            if let Some(signature) = signature {
+                record["signature"] = signature.into();
+            }
+            record
+        };
+        put_finding(
+            &work,
+            "F-0000-aaaaaaaa",
+            finding("H-A", Some("K1"), Some("aaaaaaaa")),
+        );
+        let w0 = work.join("worker-H-0");
+        let w1 = work.join("worker-H-1");
+        // Already in the parent.
+        put_finding(
+            &w0,
+            "F-0000-aaaaaaaa",
+            finding("H-A", Some("K1"), Some("aaaaaaaa")),
+        );
+        put_finding(
+            &w0,
+            "F-0001-bbbbbbbb",
+            finding("H-A", Some("K2"), Some("bbbbbbbb")),
+        );
+        // Another harness's K1: a finding of its own.
+        put_finding(
+            &w1,
+            "F-0000-aaaaaaaa",
+            finding("H-B", Some("K1"), Some("aaaaaaaa")),
+        );
+        // Worker 0's K2 again, under another signature.
+        put_finding(
+            &w1,
+            "F-0001-cccccccc",
+            finding("H-A", Some("K2"), Some("cccccccc")),
+        );
+        // Worker 1's own K3, matched only by worker 0's signature: a duplicate.
+        put_finding(
+            &w1,
+            "F-0002-bbbbbbbb",
+            finding("H-A", Some("K3"), Some("bbbbbbbb")),
+        );
+        put_finding(&w1, "F-0003-dddddddd", finding("H-A", None, None));
+        let workers = [report_for(0, w0.clone()), report_for(1, w1.clone())];
+        let with_parent = [
+            report_for(0, work.clone()),
+            workers[0].clone(),
+            workers[1].clone(),
+        ];
+        let unique_workers = unique_finding_count(&workers);
+        let unique_with_parent = unique_finding_count(&with_parent);
+
+        let merge = merge_worker_findings(&work, &[w0, w1]).unwrap();
+        assert_eq!(merge.merged.len(), 3, "{merge:?}");
+        assert_eq!(merge.duplicates, 3, "{merge:?}");
+        assert_eq!(unique_with_parent, 1 + merge.merged.len());
+        assert_eq!(
+            unique_workers,
+            merge.merged.len() + 1,
+            "the workers' own count also holds the parent's K1"
+        );
     }
 
     #[test]

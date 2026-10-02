@@ -248,7 +248,7 @@ both.
 
 | What you want to do | Install or download |
 |---|---|
-| Install complete BHF on Linux with one `install.sh` | `bhf-dist-0.2.32-x86_64-unknown-linux-gnu.tar.gz` plus its `.sha256` file |
+| Install complete BHF on Linux with one `install.sh` | `bhf-dist-0.2.34-x86_64-unknown-linux-gnu.tar.gz` plus its `.sha256` file |
 | Run the CLI on Windows | `bhf-installer.ps1`, or `bhf-x86_64-pc-windows-msvc.zip` plus its `.sha256` file for a manual/offline install |
 | Run basic CLI workflows on Linux | `bhf-installer.sh`, or `bhf-x86_64-unknown-linux-gnu.tar.xz` plus its `.sha256` file |
 | Get the full Linux `bhf auto` runtime audit and fake-resource support | Add `bhf_runtrace_shim-installer.sh`, or its matching `bhf_runtrace_shim-*.tar.xz` archive |
@@ -268,7 +268,7 @@ manual co-location commands.
 #### Complete Linux install with `install.sh`
 
 ```sh
-VERSION=0.2.32
+VERSION=0.2.34
 BASE="https://github.com/Tarmo-Technologies/bhf/releases/download/${VERSION}"
 ARCHIVE="bhf-dist-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 
@@ -345,7 +345,7 @@ harness runtimes, and checksum-verified content together. The separate component
 installers remain available when you deliberately want a smaller install:
 
 ```sh
-VERSION=0.2.32
+VERSION=0.2.34
 BASE="https://github.com/Tarmo-Technologies/bhf/releases/download/${VERSION}"
 
 curl --proto '=https' --tlsv1.2 -LsSf "$BASE/bhf-installer.sh" | sh
@@ -369,7 +369,7 @@ an elevated PowerShell. One Chocolatey-based setup is:
 choco install llvm make visualstudio2022buildtools `
   visualstudio2022-workload-vctools -y
 
-$Version = "0.2.32"
+$Version = "0.2.34"
 $Base = "https://github.com/Tarmo-Technologies/bhf/releases/download/$Version"
 irm "$Base/bhf-installer.ps1" | iex
 irm "$Base/bhf-daemon-installer.ps1" | iex       # optional: RPC/MCP service

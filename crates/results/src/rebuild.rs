@@ -71,6 +71,10 @@ const RENAME_RETRIES: u32 = 3;
 const RENAME_RETRY_DELAY: Duration = Duration::from_millis(50);
 /// A `write_atomic` temp file older than this was left by a crashed writer.
 const STALE_TEMP_AGE: Duration = Duration::from_secs(3600);
+/// Producer history kept in manifest.json; the oldest records drop first.
+const MAX_MANIFEST_PRODUCERS: usize = 1000;
+/// The most recent producers copied into findings.json.
+const FINDINGS_PRODUCERS: usize = 50;
 
 pub fn rebuild(work_dir: &Path, options: &RebuildOptions) -> Result<RebuildSummary, ResultsError> {
     let results = layout::results_dir(work_dir);
@@ -266,7 +270,9 @@ fn rebuild_locked_with(
             .unwrap_or_else(corpus::finding::now_rfc3339),
         tool,
         source: manifest.source.clone(),
-        producers: manifest.producers.clone(),
+        producers: manifest.producers
+            [manifest.producers.len().saturating_sub(FINDINGS_PRODUCERS)..]
+            .to_vec(),
         counts,
         findings,
         groups,
@@ -303,9 +309,10 @@ fn rebuild_locked_with(
     })
 }
 
-/// Append the producer that just finished (if any) with its `findings_total`
-/// and save the manifest. Runs before any derived file is written: the
-/// producer history is the one thing in results/ a rerun cannot rebuild.
+/// Append the producer that just finished (if any) with its `findings_total`,
+/// keep the last [`MAX_MANIFEST_PRODUCERS`], and save the manifest. Runs
+/// before any derived file is written: the producer history is the one thing
+/// in results/ a rerun cannot rebuild.
 fn record_producer(
     results: &Path,
     manifest: &mut Manifest,
@@ -316,6 +323,11 @@ fn record_producer(
         record.findings_total = findings_total;
         manifest.producers.push(record);
     }
+    let excess = manifest
+        .producers
+        .len()
+        .saturating_sub(MAX_MANIFEST_PRODUCERS);
+    manifest.producers.drain(..excess);
     manifest::save(results, manifest)?;
     sync_dir(results);
     Ok(())
@@ -1347,6 +1359,91 @@ mod tests {
         );
         assert_eq!(manifest.source.root.as_deref(), Some("/src/demo"));
         assert_eq!(read_doc(tmp.path()).producers, manifest.producers);
+    }
+
+    fn seed_producers(results: &Path, n: usize) {
+        std::fs::create_dir_all(results).unwrap();
+        let mut manifest = crate::manifest::load(results).unwrap();
+        manifest.producers = (0..n)
+            .map(|i| ProducerRecord {
+                command: format!("p{i}"),
+                argv: vec!["bhf".into()],
+                started_at: "2026-10-01T12:00:00Z".into(),
+                finished_at: "2026-10-01T12:00:00Z".into(),
+                status: ProducerStatus::Complete,
+                exit_code: 0,
+                findings_total: 0,
+            })
+            .collect();
+        crate::manifest::save(results, &manifest).unwrap();
+    }
+
+    #[test]
+    fn producer_history_keeps_the_last_1000_and_findings_json_the_last_50() {
+        let tmp = tempfile::tempdir().unwrap();
+        let results = tmp.path().join("results");
+        seed_producers(&results, 1000);
+        ProducerRun::begin(tmp.path(), "fuzz", vec!["bhf".into(), "fuzz".into()])
+            .complete_with(0, ProducerStatus::Complete, &opts())
+            .unwrap();
+        let manifest = crate::manifest::load(&results).unwrap();
+        assert_eq!(manifest.producers.len(), 1000);
+        assert_eq!(manifest.producers[0].command, "p1", "the oldest is dropped");
+        assert_eq!(manifest.producers[999].command, "fuzz");
+        let doc = read_doc(tmp.path());
+        assert_eq!(doc.producers.len(), 50);
+        assert_eq!(doc.producers[..], manifest.producers[950..]);
+    }
+
+    #[test]
+    fn plain_rebuild_trims_an_oversized_producer_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let results = tmp.path().join("results");
+        seed_producers(&results, 1200);
+        rebuild(tmp.path(), &opts()).unwrap();
+        let manifest = crate::manifest::load(&results).unwrap();
+        assert_eq!(manifest.producers.len(), 1000);
+        assert_eq!(manifest.producers[0].command, "p200");
+        assert_eq!(read_doc(tmp.path()).producers[49].command, "p1199");
+    }
+
+    #[test]
+    fn concurrent_producers_on_one_work_dir_all_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().to_path_buf();
+        write(
+            &work.join("results/sbom/vulnerabilities.json"),
+            json!({"matches": [sca_match("CVE-2026-0001")]}),
+        );
+        let threads: Vec<_> =
+            (0..8)
+                .map(|i| {
+                    let work = work.clone();
+                    std::thread::spawn(move || {
+                        let options = RebuildOptions {
+                            lock_timeout: Duration::from_secs(120),
+                            ..opts()
+                        };
+                        ProducerRun::begin(&work, &format!("p{i}"), vec!["bhf".into()])
+                            .complete_with(0, ProducerStatus::Complete, &options)
+                    })
+                })
+                .collect();
+        for thread in threads {
+            thread.join().unwrap().expect("every producer completes");
+        }
+        let manifest = crate::manifest::load(&work.join("results")).unwrap();
+        let mut commands: Vec<&str> = manifest
+            .producers
+            .iter()
+            .map(|p| p.command.as_str())
+            .collect();
+        commands.sort();
+        assert_eq!(commands, ["p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7"]);
+        let doc = read_doc(&work);
+        assert_eq!(doc.producers.len(), 8);
+        assert_eq!(doc.counts.total, 1);
+        assert!(manifest.producers.iter().all(|p| p.findings_total == 1));
     }
 
     #[test]

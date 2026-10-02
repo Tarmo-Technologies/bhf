@@ -105,10 +105,6 @@ pub(crate) struct BinaryMinimizeSummary {
 }
 
 pub fn run(args: BinaryFuzzArgs) -> i32 {
-    if let Err(error) = crate::workdir::prepare(&args.work_dir) {
-        bhfeprintln!("error: {error:#}");
-        return 1;
-    }
     match run_inner(args) {
         Ok(summary) => {
             println!(

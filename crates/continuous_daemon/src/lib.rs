@@ -17,10 +17,12 @@
 //! surface.
 
 mod health;
+mod results_refresh;
 mod storage_lock;
 
 pub use health::{PersistencePhase, SchedulerHealth, StorageFault};
 
+use results_refresh::ResultsRefresh;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 use std::io::{Read, Write};
@@ -138,6 +140,8 @@ pub enum DaemonError {
 pub struct Scheduler {
     state: Arc<SharedState>,
     workers: Vec<JoinHandle<()>>,
+    refresh: Arc<ResultsRefresh>,
+    refresher: Option<JoinHandle<()>>,
     data_dir: PathBuf,
     job_wall_grace: Duration,
     limits: SchedulerLimits,
@@ -297,9 +301,18 @@ impl Scheduler {
             }
         }
 
+        let refresh = Arc::new(ResultsRefresh::default());
+        let refresher = {
+            let state_ref = Arc::clone(&state);
+            let refresh_ref = Arc::clone(&refresh);
+            std::thread::Builder::new()
+                .name("bhf-results-refresh".to_owned())
+                .spawn(move || refresh_loop(&state_ref, &refresh_ref))?
+        };
         let mut workers = Vec::new();
         for _ in 0..config.max_concurrent_jobs.max(1) {
             let state_ref = Arc::clone(&state);
+            let refresh_ref = Arc::clone(&refresh);
             let data_dir = config.data_dir.clone();
             let bin = config.bhf_bin.clone();
             let poll = config.poll_interval;
@@ -307,6 +320,7 @@ impl Scheduler {
             let worker = std::thread::Builder::new().spawn(move || {
                 worker_loop(
                     state_ref,
+                    refresh_ref,
                     data_dir,
                     bin,
                     poll,
@@ -326,6 +340,7 @@ impl Scheduler {
                     for handle in workers {
                         let _ = handle.join();
                     }
+                    stop_refresher(&refresh, refresher);
                     return Err(DaemonError::Io(error));
                 }
             }
@@ -333,6 +348,8 @@ impl Scheduler {
         Ok(Self {
             state,
             workers,
+            refresh,
+            refresher: Some(refresher),
             data_dir: config.data_dir.clone(),
             job_wall_grace,
             limits,
@@ -403,7 +420,11 @@ impl Scheduler {
         guard.seen.push(job.clone());
         if let Err(failure) = persist(&self.data_dir, &guard.seen) {
             health::latch_storage_fault(
-                &self.state, &mut guard, PersistencePhase::Admission, &job_id, &failure,
+                &self.state,
+                &mut guard,
+                PersistencePhase::Admission,
+                &job_id,
+                &failure,
             );
             if failure.installed {
                 guard.next_id = next_id;
@@ -453,11 +474,61 @@ impl Drop for Scheduler {
         for handle in self.workers.drain(..) {
             let _ = handle.join();
         }
+        if let Some(refresher) = self.refresher.take() {
+            stop_refresher(&self.refresh, refresher);
+        }
     }
 }
 
+/// Stop the refresh thread once every worker has stopped; it records what
+/// ran since each project's last results/ rebuild before it exits.
+fn stop_refresher(refresh: &ResultsRefresh, refresher: JoinHandle<()>) {
+    refresh.request_shutdown();
+    if refresher.join().is_err() {
+        eprintln!(
+            "results refresh thread panicked: results/ may not cover the last jobs; \
+             run 'bhf report --work-dir <project>' to rebuild"
+        );
+    }
+}
+
+/// The results refresh thread: rebuild due projects whenever a job finishes
+/// and whenever the next one falls due, checking at least every
+/// [`results_refresh::REBUILD_INTERVAL`]; at shutdown, record whatever is
+/// outstanding.
+fn refresh_loop(state: &SharedState, refresh: &ResultsRefresh) {
+    let mut wait = results_refresh::REBUILD_INTERVAL;
+    while refresh.wait_for_work(wait) {
+        let next = rebuild_due_projects(state, refresh);
+        wait = results_refresh::refresh_wait(next, Instant::now());
+    }
+    results_refresh::rebuild_all(refresh.take_all());
+}
+
+/// Rebuild results/ for every project that is due; see
+/// [`ResultsRefresh::take_due`]. Runs on the refresh thread, without the
+/// scheduler lock held. Returns when the next project falls due.
+fn rebuild_due_projects(state: &SharedState, refresh: &ResultsRefresh) -> Option<Instant> {
+    if !refresh.has_pending() {
+        return None;
+    }
+    let queued: HashSet<PathBuf> = {
+        let guard = state.inner.lock().unwrap_or_else(|p| p.into_inner());
+        guard
+            .queue
+            .iter()
+            .map(|job| job.project_dir.clone())
+            .collect()
+    };
+    let due = refresh.take_due(Instant::now(), &queued);
+    results_refresh::rebuild_all(due.brackets);
+    due.next
+}
+
+#[allow(clippy::too_many_arguments)]
 fn worker_loop(
     state: Arc<SharedState>,
+    refresh: Arc<ResultsRefresh>,
     data_dir: PathBuf,
     bin: PathBuf,
     poll: Duration,
@@ -476,7 +547,10 @@ fn worker_loop(
                     // Persist Running while holding the state mutex. No worker may
                     // dispatch an uncommitted transition or race its publication.
                     match health::claim_job(&data_dir, &state, &mut guard, persist_jobs) {
-                        Some(job) => break job,
+                        Some(job) => {
+                            refresh.job_started(&job.project_dir, Instant::now());
+                            break job;
+                        }
                         None => return,
                     }
                 }
@@ -487,6 +561,7 @@ fn worker_loop(
             }
         };
         let outcome = run_one_job(&bin, &job, &state, shutdown_timeout, job_wall_grace);
+        refresh.job_finished(&job.project_dir, outcome);
         let final_state = match outcome {
             JobOutcome::Finished(state) => state,
             JobOutcome::Interrupted => JobState::Queued,
@@ -507,6 +582,9 @@ fn worker_loop(
         {
             return;
         }
+        // The webhook can fire before results/ covers this job: the refresh
+        // thread records it up to REBUILD_INTERVAL (60 s) after the project
+        // goes idle, or BUSY_REBUILD_INTERVAL (300 s) while it stays busy.
         if let Some(url) = &webhook {
             let payload = serde_json::json!({
                 "job_id": job.job_id,
@@ -566,7 +644,9 @@ fn run_one_job(
     cmd.arg("fuzz")
         .arg(&job.project_dir)
         .arg("--harness")
-        .arg(&job.harness_id);
+        .arg(&job.harness_id)
+        // The daemon records and rebuilds results/ itself; see results_refresh.
+        .env(corpus::layout::RESULTS_DEFER_ENV, "1");
     if job.time_budget_secs > 0 {
         cmd.arg("--time").arg(format!("{}s", job.time_budget_secs));
     }
@@ -1008,6 +1088,125 @@ mod tests {
                 panic!("job did not finish within 3s: {job:?}");
             }
         }
+    }
+
+    /// A fake `bhf`: argv is `fuzz <project> --harness <id>`. It records the
+    /// deferral switch it saw and fails for harness `bad`.
+    #[cfg(unix)]
+    fn recording_bin(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("fake-bhf.sh");
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\nprintf '%s' \"${BHF_RESULTS_DEFER-unset}\" > \"$2/defer\"\n[ \"$4\" != bad ]\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    fn wait_for_state(scheduler: &Scheduler, id: &str, want: JobState) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let jobs = scheduler.list_jobs().unwrap();
+            let job = jobs.iter().find(|j| j.job_id == id).expect("job present");
+            if job.state == want {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "job never reached {want:?}: {job:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn producers(project: &Path) -> Vec<serde_json::Value> {
+        std::fs::read(project.join("results/manifest.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|manifest| manifest["producers"].as_array().cloned())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn fuzz_children_defer_and_the_daemon_rebuilds_results_once_idle() {
+        let dir = tempdir("results-refresh");
+        let project = tempdir("results-refresh-project");
+        let scheduler = Scheduler::start(&ok_config(dir.clone(), recording_bin(&dir))).unwrap();
+        let id = scheduler
+            .submit(project.clone(), "H".to_owned(), Duration::ZERO)
+            .unwrap();
+        wait_for_state(&scheduler, &id, JobState::Complete);
+        assert_eq!(std::fs::read_to_string(project.join("defer")).unwrap(), "1");
+
+        // manifest.json is written first and INDEX.md after it.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !project.join("results/INDEX.md").is_file() {
+            assert!(Instant::now() < deadline, "idle project never rebuilt");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let first = producers(&project);
+        assert_eq!(first.len(), 1, "one record per rebuild: {first:?}");
+        assert_eq!(first[0]["command"], "daemon fuzz");
+        assert_eq!(first[0]["exit_code"], 0);
+
+        // A second job inside the interval is debounced until shutdown.
+        let id = scheduler
+            .submit(project.clone(), "bad".to_owned(), Duration::ZERO)
+            .unwrap();
+        wait_for_state(&scheduler, &id, JobState::Failed);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(producers(&project).len(), 1, "rebuilt inside the interval");
+        drop(scheduler);
+        let all = producers(&project);
+        assert_eq!(all.len(), 2, "shutdown records the debounced job: {all:?}");
+        assert_eq!(all[1]["command"], "daemon fuzz");
+        assert_eq!(all[1]["exit_code"], 1, "a failed job marks the record");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_blocked_rebuild_never_stalls_job_claiming() {
+        let dir = tempdir("refresh-stall");
+        let project = tempdir("refresh-stall-project");
+        let results_dir = project.join("results");
+        std::fs::create_dir_all(&results_dir).unwrap();
+        // Hold the project's results lock, so any rebuild of it blocks.
+        let held =
+            results::lock::ResultsLock::acquire(&results_dir, Duration::from_secs(1)).unwrap();
+        let mut config = ok_config(dir.clone(), recording_bin(&dir));
+        config.max_concurrent_jobs = 1;
+        let scheduler = Scheduler::start(&config).unwrap();
+        let first = scheduler
+            .submit(project.clone(), "H".to_owned(), Duration::ZERO)
+            .unwrap();
+        wait_for_state(&scheduler, &first, JobState::Complete);
+        // The refresh thread has taken the first job's bracket: its rebuild
+        // is now blocked on the held lock.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while scheduler.refresh.has_pending() {
+            assert!(Instant::now() < deadline, "the bracket was never taken");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The only worker must still be free to claim the next job.
+        let second = scheduler
+            .submit(project.clone(), "H".to_owned(), Duration::ZERO)
+            .unwrap();
+        wait_for_state(&scheduler, &second, JobState::Complete);
+        drop(held);
+        drop(scheduler);
+        let records = producers(&project);
+        assert_eq!(
+            records.len(),
+            2,
+            "the blocked rebuild, then the second job at shutdown: {records:?}"
+        );
+        assert!(
+            records.iter().all(|r| r["command"] == "daemon fuzz"),
+            "{records:?}"
+        );
     }
 
     #[test]

@@ -221,6 +221,15 @@ fn minimize_c_engine(
     })
 }
 
+/// The work dir that owns the finding being minimized, when it lives in a
+/// results layout (so the dispatcher can rebuild results/ afterwards).
+pub fn work_dir_hint(args: &MinimizeArgs) -> Option<std::path::PathBuf> {
+    let dir = resolve_finding_arg(args.finding_dir.clone(), args.finding.clone());
+    // Strict: only a real results-layout work dir, never a lexical guess,
+    // because the dispatcher writes (migrate, manifest, rebuild) to it.
+    corpus::layout::results_work_dir_for_finding(&dir)
+}
+
 pub fn run(args: MinimizeArgs) -> i32 {
     match run_inner(args) {
         Ok(summary) => {

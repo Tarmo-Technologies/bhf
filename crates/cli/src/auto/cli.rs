@@ -51,7 +51,7 @@ RECOMMENDED SWEEP:
   --sloc FILE  per-language SLOC breakdown (.json for JSON)
   --debug      backtrace on a bhf-internal panic; enriches the bug report
 
-  Read bhf_work/FINDINGS.md first. Full guide: RECOMMENDED-SWEEP.md
+  Read bhf_work/results/INDEX.md first. Full guide: RECOMMENDED-SWEEP.md
   (docs/recommended-sweep.md in the repository).";
 
 fn parse_positive_mib(value: &str) -> std::result::Result<usize, String> {
@@ -608,8 +608,7 @@ pub struct AutoArgs {
     #[arg(long)]
     pub sloc: Option<PathBuf>,
 
-    /// Run in static-dynamic mode: add a `scan_type` column to findings.csv
-    /// (`static-dynamic` for static-scan results, `dynamic` for fuzzed results).
+    /// Deprecated, no effect: results/findings.csv always has a kind column.
     #[arg(long = "static-dynamic")]
     pub static_dynamic: bool,
 
@@ -1342,7 +1341,7 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         // A --static scan that produced findings is a successful run (0), not the
         // "nothing to do" code (2).
         let had_static =
-            args.static_scan && !crate::auto::report::tree_static_finding_ids(&work).is_empty();
+            args.static_scan && !crate::auto::report::disk_only_finding_ids(&work).is_empty();
         return Ok(if had_static { 0 } else { 2 });
     }
 
@@ -2582,7 +2581,7 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     // Reconcile the in-memory pass records against the on-disk findings/ dir now
     // that every post-pass has run. A post-pass (COBOL crash attribution) deletes
     // a finding it proves a harness artifact, but only disk-derived outputs
-    // (findings.csv, FINDINGS.md) saw that removal — the pass records that feed
+    // (the results/ index) saw that removal — the pass records that feed
     // the headline count, run.json and run.md still carried the id, so the count
     // reported a finding with no evidence bundle. Drop those phantom ids so every
     // finding surface agrees before the report is written.
@@ -3708,9 +3707,10 @@ impl AutoSummary {
             }
         }
         findings += report_only_finding_ids.len();
-        // `--static`: whole-tree static findings live in the findings dir (not on
-        // any result) — fold their count into the headline total shown on the CLI.
-        findings += crate::auto::report::tree_static_finding_ids(work).len();
+        // Disk-only findings (`--static`, replays, profiling, external tools,
+        // differential) live in the findings dir (not on any result) — fold their
+        // count into the headline total shown on the CLI.
+        findings += crate::auto::report::disk_only_finding_ids(work).len();
 
         let per_language = [(Lang::Ada, "Ada"), (Lang::C, "C"), (Lang::Cpp, "C++")]
             .into_iter()
@@ -3764,17 +3764,19 @@ impl AutoSummary {
         let harness_root = crate::auto::layout::harness_root(&self.work);
         let mut s = String::new();
 
+        let results_dir = corpus::layout::results_dir(&self.work);
         let _ = writeln!(s, "BHF findings");
         let _ = writeln!(s, "  Findings:     {}", self.findings);
         let _ = writeln!(
             s,
             "  START HERE:   {}",
-            self.work.join("FINDINGS.md").display()
+            results_dir.join("INDEX.md").display()
         );
         let _ = writeln!(
             s,
-            "  CSV index:    {}",
-            self.work.join("findings.csv").display()
+            "  JSON / CSV:   {} · {}",
+            results_dir.join("findings.json").display(),
+            results_dir.join("findings.csv").display()
         );
         if self.findings > 0 {
             let _ = writeln!(

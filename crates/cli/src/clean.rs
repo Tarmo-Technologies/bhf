@@ -26,7 +26,7 @@ pub struct CleanArgs {
     #[arg(long)]
     pub reports: bool,
 
-    /// Remove findings. Findings are preserved unless this flag or --all is used.
+    /// Remove results/ (findings, indexes, static/ and sbom/ reports) and legacy findings paths.
     #[arg(long)]
     pub findings: bool,
 
@@ -90,6 +90,7 @@ fn clean_targets(args: &CleanArgs) -> Vec<&'static str> {
             "generated_stubs",
             "fake_corba",
             "src_instrumented",
+            "results",
             "findings",
             "FINDINGS.md",
             "findings.csv",
@@ -121,8 +122,10 @@ fn clean_targets(args: &CleanArgs) -> Vec<&'static str> {
     }
     if args.reports {
         targets.push("reports");
+        targets.push("results/report");
     }
     if args.findings {
+        targets.push("results");
         targets.push("findings");
         targets.push("FINDINGS.md");
         targets.push("findings.csv");
@@ -364,5 +367,25 @@ mod tests {
         assert_eq!(run(all_args(work.clone())), 0);
         assert!(!work.join("auto").exists());
         assert_eq!(std::fs::read(outside.join("sentinel")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn findings_flag_removes_results_and_legacy_names() {
+        let mut args = all_args(PathBuf::from("/w"));
+        args.all = false;
+        args.findings = true;
+        let targets = clean_targets(&args);
+        assert!(targets.contains(&"results"));
+        assert!(targets.contains(&"findings") && targets.contains(&"FINDINGS.md"));
+    }
+
+    #[test]
+    fn reports_flag_removes_results_report_but_not_results() {
+        let mut args = all_args(PathBuf::from("/w"));
+        args.all = false;
+        args.reports = true;
+        let targets = clean_targets(&args);
+        assert!(targets.contains(&"results/report"));
+        assert!(!targets.contains(&"results"));
     }
 }
