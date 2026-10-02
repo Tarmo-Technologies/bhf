@@ -19668,9 +19668,24 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         assert!(main.contains("BHF_FRAMED"));
         assert!(main.contains("int main("));
         let makefile = fs::read_to_string(temp.join("out/H-C001/Makefile")).unwrap();
-        // Driver flags: trace-pc-guard coverage, and NOT libFuzzer's main.
+        // Driver flags: trace-pc-guard coverage. The DEFAULT build does not link
+        // libFuzzer's main; libFuzzer is a separate opt-in target (`make
+        // libfuzzer`) for external drivers, so `-fsanitize=fuzzer` appears only
+        // there, never in the default CFLAGS.
         assert!(makefile.contains("-fsanitize-coverage=trace-pc-guard"));
-        assert!(!makefile.contains("fsanitize=fuzzer"));
+        let cflags_line = makefile
+            .lines()
+            .find(|l| l.trim_start().starts_with("CFLAGS ?="))
+            .unwrap_or("");
+        assert!(
+            !cflags_line.contains("fuzzer"),
+            "default CFLAGS must not enable libFuzzer:\n{makefile}"
+        );
+        assert!(
+            makefile.contains("libfuzzer: main_libfuzzer")
+                && makefile.contains("-fsanitize=fuzzer,address,undefined"),
+            "opt-in libFuzzer target must exist:\n{makefile}"
+        );
     }
 
     #[test]
