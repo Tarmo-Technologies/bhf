@@ -28,6 +28,12 @@
 - Per-finding `sanitizer.log`, harness sha256 + GNU build-id, `created_at`/`last_seen`,
   `history[]`, and a minimized reproducer for each root-cause group (`--no-minimize`).
 - SBOM vulnerability matches appear as `sca` findings.
+- Portable harness export: each generated C/C++/Rust/Ada harness dir now carries a
+  `Mayhemfile` and a `PORTABILITY.md` with exact commands for Mayhem, libFuzzer, AFL++,
+  and honggfuzz. C/C++ gain a `make libfuzzer` target; Rust gains a `build-libfuzzer.sh`
+  (a separate instrumented build, since libFuzzer cannot consume bhf's trace-pc-guard
+  staticlib); both use a generated `bhf_libfuzzer.c` shim. `BHF_CRASH_ON_FINDING=1` makes an
+  Ada finding abort the process (SIGABRT) so a crash-keying external engine detects it.
 
 ### Changed
 - With no `--findings`/`--out`, `bhf report` rebuilds `bhf_work/results/`. `--junit`/

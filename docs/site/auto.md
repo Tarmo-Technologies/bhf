@@ -297,6 +297,40 @@ column/property with the provenance (`static` | `fuzz` | `runtime` |
 `fuzz_confirmed` finding is not a maybe — it is a defect a fuzzer walked into at
 the exact line the scanner flagged.
 
+## Running a harness under another fuzzer
+
+The generated native harnesses (C, C++, Rust, Ada) are self-contained: the
+default binary reads one input per run and executes the target once — the
+black-box contract an external fuzzer expects. To make that portability
+discoverable and drivable, each C/C++/Rust/Ada harness dir
+(`<work>/harnesses/<id>/`) also carries:
+
+- a **`Mayhemfile`** — run `mayhem run .` from the harness dir. C/C++/Rust take
+  the input as a file (`@@`, ASan-instrumented, `sanitizer: true`); Ada reads
+  stdin (Mayhem's base-executable mode, the only mode it supports for Ada).
+- a **`PORTABILITY.md`** — the exact build/run commands for Mayhem, libFuzzer,
+  AFL++, and honggfuzz for that lane.
+
+| Lane | Black-box (Mayhem base-exe / AFL file) | libFuzzer | AFL++ persistent |
+|---|---|---|---|
+| C / C++ | `make` → `./main <file>` | `make libfuzzer` → `./main_libfuzzer` | `make afl` → `./main_afl` |
+| Rust | `./main <file>` (built by default) | `./build-libfuzzer.sh` → `./main_libfuzzer` | — |
+| Ada | `./main < input` (stdin) | — | — |
+
+The libFuzzer binaries use a generated `bhf_libfuzzer.c` shim that forwards
+libFuzzer's `LLVMFuzzerTestOneInput` to bhf's `bhf_run_one`. For Rust it is a
+separate instrumented build (`build-libfuzzer.sh`), because modern libFuzzer
+cannot consume bhf's default `trace-pc-guard` staticlib.
+
+**Ada caveat:** a caught top-level Ada exception is a finding but does not crash
+the process, so a crash-keying engine would miss it. Set
+`BHF_CRASH_ON_FINDING=1` (the generated Ada Mayhemfile already does) to abort the
+process with `SIGABRT` when a finding is reported.
+
+Interpreted lanes (Python, JS/TS, Java, C#, Ruby, Lua, PHP, Perl) are driven
+through bhf's own interpreter driver, not a single portable binary, so no
+Mayhemfile is emitted for them.
+
 ## Exit Codes
 
 | Code | Meaning |
