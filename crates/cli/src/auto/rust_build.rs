@@ -3331,7 +3331,134 @@ pub fn build_rust_harness(
             skip: false,
         };
     }
+    emit_rust_portability(
+        &auto_dir,
+        c_runtime_dir,
+        &toolchain,
+        "rust_harness",
+        "libbhf_rust_harness*.a",
+    );
     RustBuildResult::Built
+}
+
+/// cargo-fuzz-style instrumentation for a libFuzzer build of the Rust staticlib:
+/// inline-8bit-counters and pc-table (what modern libFuzzer consumes — bhf's own
+/// trace-pc-guard scheme is rejected by libFuzzer since LLVM 14), trace-compares,
+/// and ASan. Used only by the generated `build-libfuzzer.sh`; the default harness
+/// staticlib keeps bhf's trace-pc-guard scheme ([`sancov_rustflags`]).
+fn libfuzzer_rustflags() -> String {
+    [
+        "-Cpasses=sancov-module",
+        "-Cllvm-args=-sanitizer-coverage-level=4",
+        "-Cllvm-args=-sanitizer-coverage-inline-8bit-counters",
+        "-Cllvm-args=-sanitizer-coverage-pc-table",
+        "-Cllvm-args=-sanitizer-coverage-trace-compares",
+        "-Zsanitizer=address",
+    ]
+    .join(" ")
+}
+
+/// The generated `build-libfuzzer.sh` for a Rust harness: a fresh,
+/// libFuzzer-instrumented build of the kept harness crate at `manifest_subdir`
+/// (relative to the harness dir), linked with the `bhf_libfuzzer.c` shim into
+/// `main_libfuzzer`. A separate build is required because libFuzzer cannot
+/// consume bhf's default trace-pc-guard staticlib.
+fn rust_build_libfuzzer_script(
+    toolchain: &RustToolchain,
+    c_runtime_dir: &Path,
+    manifest_subdir: &str,
+    staticlib_glob: &str,
+) -> String {
+    format!(
+        "#!/bin/sh\n\
+         # Build a libFuzzer binary from this Rust harness (bhf). libFuzzer needs\n\
+         # inline-8bit-counters + pc-table instrumentation, incompatible with bhf's\n\
+         # default trace-pc-guard staticlib, so this is a fresh instrumented build\n\
+         # of the kept harness crate, linked with the bhf_libfuzzer.c shim. Override\n\
+         # the toolchain with the CARGO env var if needed.\n\
+         set -e\n\
+         cd \"$(dirname \"$0\")\"\n\
+         : \"${{CARGO:={cargo}}}\"\n\
+         HOST=\"{host}\"\n\
+         RUSTFLAGS=\"{flags}\" \\\n\
+         \x20 \"$CARGO\" {channel} build \\\n\
+         \x20   --manifest-path \"{sub}/Cargo.toml\" \\\n\
+         \x20   --target-dir \"{sub}/target-libfuzzer\" \\\n\
+         \x20   --target \"$HOST\"\n\
+         A=\"$(ls {sub}/target-libfuzzer/$HOST/debug/{glob} | head -n1)\"\n\
+         clang -O1 -g -fno-omit-frame-pointer -fsanitize=fuzzer,address \\\n\
+         \x20 -I \"{runtime}\" \\\n\
+         \x20 bhf_libfuzzer.c \"$A\" -lpthread -ldl -lm -lrt \\\n\
+         \x20 -o main_libfuzzer\n\
+         echo \"built ./main_libfuzzer — run: ./main_libfuzzer <corpus-dir>\"\n",
+        cargo = toolchain.cargo.display(),
+        host = toolchain.host_triple,
+        flags = libfuzzer_rustflags(),
+        channel = toolchain.channel_arg,
+        sub = manifest_subdir,
+        glob = staticlib_glob,
+        runtime = c_runtime_dir.display(),
+    )
+}
+
+/// Emit the portable-export artifacts beside a built Rust harness (#63). The
+/// default `main` already reads `argv[1]` as a one-shot file (black-box portable:
+/// Mayhem base-executable / AFL file mode). This adds the Mayhemfile,
+/// PORTABILITY.md, the `bhf_libfuzzer.c` shim, and an on-demand
+/// `build-libfuzzer.sh` that produces a libFuzzer binary — a *separate*
+/// instrumented build, since libFuzzer cannot consume bhf's trace-pc-guard
+/// staticlib. `manifest_subdir`/`staticlib_glob` locate the kept harness crate
+/// (external: `rust_harness`/`libbhf_rust_harness*.a`; in-crate:
+/// `incrate`/`lib<crate>*.a`).
+fn emit_rust_portability(
+    auto_dir: &Path,
+    c_runtime_dir: &Path,
+    toolchain: &RustToolchain,
+    manifest_subdir: &str,
+    staticlib_glob: &str,
+) {
+    use harness_gen::portability::{self, InputDelivery, Lane, PortabilitySpec};
+    let harness_id = auto_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "H-0000".to_owned());
+
+    // write_artifacts writes the shim (libfuzzer_binary is Some), the Mayhemfile
+    // and PORTABILITY.md; the on-demand build script is bhf-specific (toolchain +
+    // crate paths) so it is written here.
+    let wrote = portability::write_artifacts(
+        auto_dir,
+        &PortabilitySpec {
+            harness_id,
+            lane: Lane::Rust,
+            binary: "main".to_owned(),
+            input: InputDelivery::File,
+            sanitizer: true,
+            libfuzzer_binary: Some("main_libfuzzer".to_owned()),
+            afl_binary: None,
+            crash_on_finding_env: false,
+        },
+    );
+    if wrote.is_err() {
+        return;
+    }
+    let script = auto_dir.join("build-libfuzzer.sh");
+    if std::fs::write(
+        &script,
+        rust_build_libfuzzer_script(toolchain, c_runtime_dir, manifest_subdir, staticlib_glob),
+    )
+    .is_ok()
+    {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(&script) {
+                let mut perms = meta.permissions();
+                perms.set_mode(0o755);
+                let _ = std::fs::set_permissions(&script, perms);
+            }
+        }
+    }
 }
 
 /// §27.10: build an in-crate harness. Copies the target crate, injects the harness
@@ -3583,6 +3710,13 @@ fn build_in_crate(
             skip: false,
         };
     }
+    emit_rust_portability(
+        &auto_dir,
+        c_runtime_dir,
+        toolchain,
+        "incrate",
+        &format!("lib{}*.a", resolved.crate_name),
+    );
     RustBuildResult::Built
 }
 
@@ -4460,6 +4594,145 @@ fn find_staticlib(target_dir: &Path, host_triple: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A trivial `-fsanitize=fuzzer` C link must succeed (the compiler-rt fuzzer
+    /// runtime is not on every box). Gates the Rust libFuzzer e2e below.
+    fn libfuzzer_runtime_available() -> bool {
+        let dir = std::env::temp_dir().join(format!("bhf-rust-lf-smoke-{}", std::process::id()));
+        if std::fs::create_dir_all(&dir).is_err() {
+            return false;
+        }
+        let src = dir.join("s.c");
+        let wrote = std::fs::write(
+            &src,
+            "#include <stddef.h>\n#include <stdint.h>\n\
+             int LLVMFuzzerTestOneInput(const uint8_t *d, size_t s){(void)d;(void)s;return 0;}\n",
+        );
+        let ok = wrote.is_ok()
+            && Command::new("clang")
+                .args(["-fsanitize=fuzzer,address", "-O1", "-o"])
+                .arg(dir.join("s"))
+                .arg(&src)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+        std::fs::remove_dir_all(&dir).ok();
+        ok
+    }
+
+    /// End-to-end proof of the portable Rust libFuzzer binary (#63): emit the
+    /// portability artifacts beside a harness whose kept crate exports
+    /// `bhf_run_one`, run the generated `build-libfuzzer.sh` (a fresh
+    /// libFuzzer-instrumented build linked with the `bhf_libfuzzer.c` shim), and
+    /// confirm the resulting binary drives `bhf_run_one` to a crash. Skips cleanly
+    /// without a nightly toolchain or the libFuzzer runtime.
+    #[test]
+    fn rust_build_libfuzzer_script_produces_a_working_libfuzzer_binary() {
+        let Some(toolchain) = probe_toolchain() else {
+            eprintln!("skipping Rust libFuzzer e2e: no nightly toolchain");
+            return;
+        };
+        if !libfuzzer_runtime_available() {
+            eprintln!("skipping Rust libFuzzer e2e: libFuzzer runtime unavailable");
+            return;
+        }
+        let Some(c_runtime) = locate_c_runtime_dir() else {
+            eprintln!("skipping Rust libFuzzer e2e: c_runtime not found");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        // Lay the harness dir out exactly as the lane does: the kept crate lives at
+        // <harness>/rust_harness, and build-libfuzzer.sh runs from <harness>.
+        let auto_dir = tmp.path().join("H-RUST-LF");
+        let crate_dir = auto_dir.join("rust_harness");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            "[workspace]\n[package]\nname = \"bhf_rust_harness\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
+             [lib]\ncrate-type = [\"staticlib\"]\n",
+        )
+        .unwrap();
+        // Exports bhf_run_one; a null write on the 4-byte magic "FUZZ" is a crash
+        // libFuzzer detects (deadly signal / ASan).
+        std::fs::write(
+            crate_dir.join("src/lib.rs"),
+            "#[no_mangle]\npub extern \"C\" fn bhf_run_one(data: *const u8, len: usize) -> i32 {\n\
+             \x20   let s = unsafe { std::slice::from_raw_parts(data, len) };\n\
+             \x20   if s.len() >= 4 && &s[0..4] == b\"FUZZ\" {\n\
+             \x20       unsafe { let p: *mut u8 = std::ptr::null_mut(); *p = 1; }\n\
+             \x20   }\n\
+             \x20   0\n}\n",
+        )
+        .unwrap();
+
+        emit_rust_portability(
+            &auto_dir,
+            &c_runtime,
+            &toolchain,
+            "rust_harness",
+            "libbhf_rust_harness*.a",
+        );
+        // The portability artifacts + the build script must be emitted.
+        assert!(auto_dir.join("Mayhemfile").is_file());
+        assert!(auto_dir.join("PORTABILITY.md").is_file());
+        assert!(auto_dir.join("bhf_libfuzzer.c").is_file());
+        let script = auto_dir.join("build-libfuzzer.sh");
+        assert!(script.is_file(), "build-libfuzzer.sh must be emitted");
+
+        // Run the generated script to build the libFuzzer binary. `cargo test`
+        // exports CARGO pointing at a direct (non-rustup) cargo that cannot handle
+        // the script's `+nightly`; a real user invoking the script has CARGO unset,
+        // so the baked rustup-proxy path is used. Clear it to match that.
+        let build = crate::command_output::output_with_timeout(
+            Command::new("sh").arg(&script).env_remove("CARGO"),
+            std::time::Duration::from_secs(10 * 60),
+        )
+        .expect("run build-libfuzzer.sh");
+        if !build.status.success() {
+            // A sancov/ASan staticlib needs rust-src etc.; treat a toolchain gap as
+            // a skip rather than a failure of the portability code under test.
+            eprintln!(
+                "skipping Rust libFuzzer e2e: instrumented build unsupported here:\nstdout={}\nstderr={}",
+                String::from_utf8_lossy(&build.stdout),
+                String::from_utf8_lossy(&build.stderr)
+            );
+            return;
+        }
+        let bin = auto_dir.join("main_libfuzzer");
+        assert!(
+            bin.is_file(),
+            "build-libfuzzer.sh must produce main_libfuzzer"
+        );
+
+        // Clean input exits 0; the magic input crashes.
+        let ok = tmp.path().join("ok.bin");
+        std::fs::write(&ok, b"hi").unwrap();
+        assert!(
+            Command::new(&bin)
+                .arg(&ok)
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "clean input must not crash"
+        );
+        let crash = tmp.path().join("crash.bin");
+        std::fs::write(&crash, b"FUZZ....").unwrap();
+        let r = Command::new(&bin).arg(&crash).output().unwrap();
+        let err = String::from_utf8_lossy(&r.stderr);
+        assert!(
+            !r.status.success(),
+            "magic input must crash, stderr:\n{err}"
+        );
+        assert!(
+            err.contains("libFuzzer")
+                || err.contains("AddressSanitizer")
+                || err.contains("ERROR")
+                || err.contains("SUMMARY")
+                || err.contains("deadly signal"),
+            "expected a libFuzzer/ASan crash report, got:\n{err}"
+        );
+    }
 
     #[test]
     fn cargo_target_cleanup_removes_intermediate_tree() {

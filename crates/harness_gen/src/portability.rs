@@ -237,7 +237,9 @@ process when a finding is reported:\n\n",
             }
             Lane::Rust => {
                 s.push_str(&format!(
-                    "```sh\n./build-libfuzzer.sh    # links the staticlib into ./{lf} with -fsanitize=fuzzer\n./{lf} corpus/          # coverage-guided run\n```\n\n"
+                    "libFuzzer needs its own instrumentation (inline-8bit-counters + pc-table), \
+so `./build-libfuzzer.sh` does a fresh, libFuzzer-instrumented build of the Rust \
+staticlib and links it into `./{lf}`:\n\n```sh\n./build-libfuzzer.sh    # -> ./{lf}\n./{lf} corpus/          # coverage-guided run\n```\n\n"
                 ));
             }
             Lane::Ada => {}
@@ -376,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn rust_doc_uses_the_build_script_not_make() {
+    fn rust_doc_describes_prebuilt_libfuzzer_binary_not_make() {
         let spec = PortabilitySpec {
             harness_id: "H-0003".to_owned(),
             lane: Lane::Rust,
@@ -388,7 +390,9 @@ mod tests {
             crash_on_finding_env: false,
         };
         let d = portability_md(&spec);
+        // Rust's libFuzzer binary comes from a fresh instrumented build script.
         assert!(d.contains("./build-libfuzzer.sh"), "{d}");
+        assert!(d.contains("./main_libfuzzer"), "{d}");
         assert!(!d.contains("make libfuzzer"), "{d}");
         // No AFL section when the lane offers no AFL binary.
         assert!(!d.contains("## AFL++"), "{d}");
