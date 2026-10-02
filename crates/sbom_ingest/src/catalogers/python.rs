@@ -355,10 +355,8 @@ fn parse_include_directive(line: &str) -> Option<String> {
                 rest
             } else if let Some(rest) = flag.strip_prefix("-r").filter(|r| !r.is_empty()) {
                 rest
-            } else if let Some(rest) = flag.strip_prefix("-c").filter(|r| !r.is_empty()) {
-                rest
             } else {
-                return None;
+                flag.strip_prefix("-c").filter(|r| !r.is_empty())?
             }
         }
     };

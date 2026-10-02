@@ -1108,6 +1108,7 @@ mod tests {
     /// Build an [`AgentTransport`] over an in-memory `duplex()` whose target end
     /// is served by a `MockAgent` running the given script. Returns the transport
     /// and the shared `received` log of delivered inputs.
+    #[allow(clippy::type_complexity)]
     fn mock_agent_transport(
         script: Vec<ScriptedResponse>,
     ) -> (Box<dyn TargetTransport>, Arc<Mutex<Vec<Vec<u8>>>>) {

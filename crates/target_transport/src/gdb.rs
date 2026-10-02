@@ -150,6 +150,9 @@ fn parse_hex_byte(pair: &[u8]) -> Result<u8> {
         .map_err(|error| TransportError::gdb(format!("invalid hex byte {text:?}: {error}")))
 }
 
+// `as_chunks::<2>()` would avoid the remainder check but is not stable at our
+// MSRV; `chunks_exact(2)` is equivalent and clear here.
+#[allow(clippy::chunks_exact_to_as_chunks)]
 fn from_hex(bytes: &[u8]) -> Result<Vec<u8>> {
     if !bytes.len().is_multiple_of(2) {
         return Err(TransportError::gdb(format!(

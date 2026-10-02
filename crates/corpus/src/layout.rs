@@ -95,9 +95,9 @@ pub fn results_work_dir_for_finding(finding_dir: &Path) -> Option<PathBuf> {
 /// post-pass, or two runs on one work dir) each hold their own allocator; the
 /// leaf is made with `create_dir`, so among allocator users a name is unique
 /// and exclusive: an id another writer already took is skipped, never reused.
-/// The single-core fuzz emitter's `next_ordinal` is not an allocator user: it
-/// picks the next `F-` ordinal by scanning and writes with `create_dir_all`,
-/// so its names are not exclusive against a concurrent writer.
+/// The single-core fuzz emitter allocates through this type too
+/// (`FindingEmitter::allocate_finding`), so its `F-NNNN-<sig>` names are
+/// exclusive against a concurrent writer sharing the work dir.
 pub struct FamilyAllocator {
     dir: PathBuf,
     prefix: String,

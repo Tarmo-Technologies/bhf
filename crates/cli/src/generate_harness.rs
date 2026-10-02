@@ -5824,7 +5824,7 @@ pub(crate) fn c_lifecycle_handle_key(
         if token.is_empty() {
             continue;
         }
-        if let Some(key) = accept(registry.pointer_base_spelling(token)).map(&finalize) {
+        if let Some(key) = accept(registry.pointer_base_spelling(token)).map(finalize) {
             match &found {
                 Some(existing) if *existing != key => return None,
                 _ => found = Some(key),

@@ -1153,14 +1153,41 @@ pub fn from_sca_value(m: &Value) -> Option<Finding> {
     Some(finding)
 }
 
-/// Drop the `@version` segment of a purl, keeping qualifiers and subpath.
+/// Canonical versionless identity of a purl, used for the SCA fingerprint so
+/// the same component fingerprints identically no matter how a scanner spelled
+/// it: the `@version` segment is dropped and the qualifiers are sorted by key
+/// (purl qualifier order is not significant). The subpath is preserved. Keeps
+/// qualifiers' values, so a genuinely distinct artifact (e.g. a different
+/// `?type=`) still fingerprints apart.
 pub(crate) fn purl_without_version(purl: &str) -> String {
-    let tail_start = purl.find(['?', '#']).unwrap_or(purl.len());
-    let (head, tail) = purl.split_at(tail_start);
-    match head.rfind('@') {
-        Some(at) if at > head.rfind('/').unwrap_or(0) => format!("{}{}", &head[..at], tail),
-        _ => purl.to_owned(),
+    // Peel off subpath (`#...`) then qualifiers (`?...`) from the coordinate.
+    let (before_subpath, subpath) = match purl.split_once('#') {
+        Some((head, sub)) => (head, Some(sub)),
+        None => (purl, None),
+    };
+    let (coord, qualifiers) = match before_subpath.split_once('?') {
+        Some((head, qual)) => (head, Some(qual)),
+        None => (before_subpath, None),
+    };
+    // Drop `@version`: only an `@` after the last path separator is a version.
+    let coord = match coord.rfind('@') {
+        Some(at) if at > coord.rfind('/').unwrap_or(0) => &coord[..at],
+        _ => coord,
+    };
+    let mut out = coord.to_owned();
+    if let Some(qualifiers) = qualifiers {
+        let mut pairs: Vec<&str> = qualifiers.split('&').filter(|p| !p.is_empty()).collect();
+        pairs.sort_unstable();
+        if !pairs.is_empty() {
+            out.push('?');
+            out.push_str(&pairs.join("&"));
+        }
     }
+    if let Some(subpath) = subpath {
+        out.push('#');
+        out.push_str(subpath);
+    }
+    out
 }
 
 fn level_word(value: Option<&str>) -> String {
@@ -1830,6 +1857,39 @@ mod tests {
             "pkg:golang/a/b#sub"
         );
         assert_eq!(purl_without_version("pkg:cargo/serde"), "pkg:cargo/serde");
+        // Qualifier order is not significant: the same component fingerprints
+        // identically no matter how a scanner ordered its qualifiers, and a
+        // version bump does not change identity.
+        assert_eq!(
+            purl_without_version("pkg:npm/x@2.0?b=2&a=1"),
+            "pkg:npm/x?a=1&b=2"
+        );
+        assert_eq!(
+            purl_without_version("pkg:npm/x@2.1?a=1&b=2"),
+            purl_without_version("pkg:npm/x@2.0?b=2&a=1"),
+        );
+        assert_eq!(
+            purl_without_version("pkg:deb/debian/curl@7.0?distro=buster&arch=amd64#usr/bin"),
+            "pkg:deb/debian/curl?arch=amd64&distro=buster#usr/bin"
+        );
+    }
+
+    #[test]
+    fn sca_identity_is_stable_across_qualifier_order() {
+        let a = from_sca_value(&json!({
+            "id": "CVE-2026-1", "summary": "x",
+            "component": {"name": "x", "version": "2.0", "ecosystem": "npm",
+                          "purl": "pkg:npm/x@2.0?b=2&a=1"},
+        }))
+        .unwrap();
+        let b = from_sca_value(&json!({
+            "id": "CVE-2026-1", "summary": "x",
+            "component": {"name": "x", "version": "2.1", "ecosystem": "npm",
+                          "purl": "pkg:npm/x@2.1?a=1&b=2"},
+        }))
+        .unwrap();
+        assert_eq!(a.id, b.id, "same component, reordered qualifiers → one id");
+        assert_eq!(a.fingerprint.primary, b.fingerprint.primary);
     }
 
     /// The schema requires each kind's block; nothing in the types enforces it.

@@ -719,11 +719,7 @@ fn jaccard_percent_4gram(left: &[u8], right: &[u8]) -> u8 {
         .filter(|gram| right_grams.binary_search(gram).is_ok())
         .count();
     let union = left_grams.len() + right_grams.len() - intersection;
-    if union == 0 {
-        0
-    } else {
-        ((intersection * 100) / union) as u8
-    }
+    (intersection * 100).checked_div(union).unwrap_or(0) as u8
 }
 
 fn grams_4(value: &[u8]) -> Vec<[u8; 4]> {

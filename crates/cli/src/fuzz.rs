@@ -2716,7 +2716,7 @@ fn run_builtin_with_progress(
         // Fold newly-mined value-profile operands into the dictionary every 2048
         // execs so the mutator can splice magic bytes it just observed (#398).
         if let Some(vp) = &vp_path {
-            if executions % 2048 == 0 {
+            if executions.is_multiple_of(2048) {
                 let mut added = false;
                 for token in read_vp_tokens(vp) {
                     if dictionary_token_set.insert(token.clone()) {
@@ -3897,10 +3897,7 @@ fn read_bounded_head_tail(mut reader: impl Read, cap: usize) -> Vec<u8> {
     let mut tail: VecDeque<u8> = VecDeque::with_capacity(tail_cap);
     let mut truncated = false;
     let mut chunk = [0_u8; 64 * 1024];
-    loop {
-        let Ok(read) = reader.read(&mut chunk) else {
-            break;
-        };
+    while let Ok(read) = reader.read(&mut chunk) {
         if read == 0 {
             break;
         }
@@ -8620,7 +8617,7 @@ mod sequence_layout_tests {
         for (step, expected) in harness_selected.iter().enumerate() {
             let span = &layout.steps[step].op_index_range;
             let selector = input[span.start];
-            let decoded = if selector % 4 == 0 {
+            let decoded = if selector.is_multiple_of(4) {
                 let raw: u32 = match selector % 6 {
                     0 => 0,
                     1 => 1,

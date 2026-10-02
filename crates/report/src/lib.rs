@@ -219,7 +219,11 @@ pub fn write_reports(options: ReportOptions) -> Result<ReportSummary, ReportErro
         .emit_csv
         .then(|| options.out_dir.join(format!("{stem}.csv")));
 
-    fs::write(&json_path, serde_json::to_vec_pretty(&document)?)?;
+    // Stream the two large documents straight to their files rather than
+    // serializing each into a multi-GB `Vec<u8>` first: at ~20k findings the
+    // intermediate byte buffer was a major contributor to peak RSS. Output is
+    // byte-for-byte identical to the previous `to_vec_pretty` + `fs::write`.
+    write_json_pretty(&json_path, &document)?;
     fs::write(
         &markdown_path,
         render_markdown_report_with(&document, &options),
@@ -227,7 +231,7 @@ pub fn write_reports(options: ReportOptions) -> Result<ReportSummary, ReportErro
     if let Some(path) = &sarif_path {
         let sarif = render_sarif_report(&document);
         validate_sarif_report(&sarif)?;
-        fs::write(path, serde_json::to_vec_pretty(&sarif)?)?;
+        write_json_pretty(path, &sarif)?;
     }
     if let Some(path) = &junit_path {
         fs::write(path, render_junit_report(&document))?;
@@ -245,6 +249,17 @@ pub fn write_reports(options: ReportOptions) -> Result<ReportSummary, ReportErro
         junit_path,
         csv_path,
     })
+}
+
+/// Serialize `value` as pretty JSON straight to `path` through a buffered
+/// writer, so the whole serialized document is streamed to disk instead of
+/// first being collected into a `Vec<u8>`. Output is identical to
+/// `fs::write(path, serde_json::to_vec_pretty(value)?)`.
+fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<(), ReportError> {
+    let mut writer = std::io::BufWriter::new(fs::File::create(path)?);
+    serde_json::to_writer_pretty(&mut writer, value)?;
+    writer.flush()?;
+    Ok(())
 }
 
 /// Render the findings as RFC 4180 CSV, **one row per root-cause issue** (not per

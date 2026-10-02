@@ -1816,7 +1816,7 @@ fn decode_bounded_range(
     }
 
     let selector = bytes[range.start];
-    if selector % 4 == 0 {
+    if selector.is_multiple_of(4) {
         return Some(selector_bounded_value(selector, min, max));
     }
 

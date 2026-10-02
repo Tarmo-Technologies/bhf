@@ -176,7 +176,7 @@ pub fn render_top_findings(work_dir: &Path, max: usize) -> String {
         return String::new();
     }
     // Most severe first; stable within a severity.
-    rows.sort_by(|a, b| b.severity_rank.cmp(&a.severity_rank));
+    rows.sort_by_key(|r| std::cmp::Reverse(r.severity_rank));
     let shown = rows.len().min(max);
     let mut out = format!(
         "\nbhf auto: top findings ({} shown of {})\n",

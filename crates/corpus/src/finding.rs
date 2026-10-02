@@ -248,13 +248,7 @@ impl FindingEmitter {
         } else {
             (cluster.short.clone(), cluster.full.clone(), false)
         };
-        let id = FindingId(format!(
-            "F-{ordinal:04}-{short}",
-            ordinal = self.next_ordinal()?,
-            short = signature_hex.chars().take(8).collect::<String>()
-        ));
-        let finding_dir = crate::layout::finding_dir(&self.root, &id.0);
-        fs::create_dir_all(&finding_dir)?;
+        let (id, finding_dir) = self.allocate_finding(&signature_hex)?;
 
         fs::write(finding_dir.join("testcase.bin"), input)?;
         fs::write(
@@ -365,13 +359,7 @@ impl FindingEmitter {
         }
         let cluster_full = format!("{:x}", cluster_hasher.finalize());
         let cluster_short = cluster_full.chars().take(16).collect::<String>();
-        let id = FindingId(format!(
-            "F-{ordinal:04}-{short}",
-            ordinal = self.next_ordinal()?,
-            short = signature_hex.chars().take(8).collect::<String>()
-        ));
-        let finding_dir = crate::layout::finding_dir(&self.root, &id.0);
-        fs::create_dir_all(&finding_dir)?;
+        let (id, finding_dir) = self.allocate_finding(&signature_hex)?;
 
         fs::write(finding_dir.join("testcase.bin"), input)?;
         fs::write(
@@ -469,13 +457,7 @@ impl FindingEmitter {
             (cluster.short.clone(), cluster.full.clone(), false)
         };
         let cluster_frames = cluster.frames.clone();
-        let id = FindingId(format!(
-            "F-{ordinal:04}-{short}",
-            ordinal = self.next_ordinal()?,
-            short = signature_hex.chars().take(8).collect::<String>()
-        ));
-        let finding_dir = crate::layout::finding_dir(&self.root, &id.0);
-        fs::create_dir_all(&finding_dir)?;
+        let (id, finding_dir) = self.allocate_finding(&signature_hex)?;
 
         fs::write(finding_dir.join("testcase.bin"), input)?;
         fs::write(
@@ -534,26 +516,19 @@ impl FindingEmitter {
         }
     }
 
-    fn next_ordinal(&self) -> Result<u32, CorpusError> {
+    /// Atomically reserve a fresh `F-NNNN-<sig8>` finding directory, retrying
+    /// on an ordinal a concurrent writer already took. Replaces the old
+    /// scan-then-`create_dir_all`, which could hand two writers sharing a work
+    /// dir (multiple processes, or the daemon's concurrent jobs) the same id.
+    fn allocate_finding(
+        &self,
+        signature_hex: &str,
+    ) -> Result<(FindingId, std::path::PathBuf), CorpusError> {
         let findings_root = crate::layout::findings_dir(&self.root);
-        fs::create_dir_all(&findings_root)?;
-        let mut next = 0_u32;
-        for entry in fs::read_dir(findings_root)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                continue;
-            };
-            let Some(rest) = name.strip_prefix("F-") else {
-                continue;
-            };
-            let digits = rest.chars().take(4).collect::<String>();
-            let Some(ordinal) = digits.parse::<u32>().ok() else {
-                continue;
-            };
-            next = next.max(ordinal.saturating_add(1));
-        }
-        Ok(next)
+        let short: String = signature_hex.chars().take(8).collect();
+        let mut allocator = crate::layout::FamilyAllocator::new(&findings_root, "F-")?;
+        let (id, dir) = allocator.create_with_suffix(&short)?;
+        Ok((FindingId(id), dir))
     }
 }
 
@@ -933,6 +908,29 @@ mod tests {
         let id = emitter.emit(b"input", &testcase, 0).unwrap();
 
         assert_eq!(id.0, format!("F-0000-{}", &signature[..8]));
+    }
+
+    #[test]
+    fn emit_allocates_exclusively_and_never_overwrites_a_taken_ordinal() {
+        let root = temp_dir("alloc");
+        let emitter = FindingEmitter::new(root.clone());
+        let testcase = testcase();
+        let signature = compute_signature(&testcase, &testcase.handlers[0]).hex();
+
+        // A concurrent writer sharing the work dir already holds F-0000 with
+        // its own data; the emit must skip it, not scan-then-overwrite it.
+        let taken = crate::layout::findings_dir(&root).join(format!("F-0000-{}", &signature[..8]));
+        std::fs::create_dir_all(&taken).unwrap();
+        std::fs::write(taken.join("sentinel"), b"keep").unwrap();
+
+        let id = emitter.emit(b"input", &testcase, 0).unwrap();
+
+        assert!(id.0.starts_with("F-0001-"), "got {}", id.0);
+        assert_eq!(
+            std::fs::read(taken.join("sentinel")).unwrap(),
+            b"keep",
+            "the already-taken finding dir must be left intact"
+        );
     }
 
     fn testcase() -> Testcase {

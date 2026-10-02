@@ -2533,13 +2533,12 @@ fn value_ref(node: tree_sitter::Node, bytes: &[u8], pkg_lower: &BTreeSet<String>
         | "parameter_specification"
         | "subtype_indication"
         | "derived_type_definition"
-        | "subtype_declaration" => {
+        | "subtype_declaration"
             // The type mark is the first `selected_component` child; a later one
             // (an initializer value) still seeds as a value.
-            if first_selected_component(parent).map(|c| c.id()) == Some(node.id()) {
+            if first_selected_component(parent).map(|c| c.id()) == Some(node.id()) => {
                 return None;
             }
-        }
         _ => {}
     }
     let (package, entity) = qualified_name(node, bytes)?;

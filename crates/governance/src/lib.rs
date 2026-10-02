@@ -1316,6 +1316,8 @@ pub fn create_update_pack_file(
     Ok(manifest)
 }
 
+// Argument count is inherent to the signed-pack file contract (pre-existing API).
+#[allow(clippy::too_many_arguments)]
 pub fn create_authenticated_update_pack_file(
     root: &Path,
     pack_id: &str,
@@ -1892,6 +1894,8 @@ pub fn install_update_pack_file_with_options(
     )
 }
 
+// Verify-then-install threads every pack path plus two callbacks (pre-existing).
+#[allow(clippy::too_many_arguments)]
 fn install_update_pack_file_after_verify<F: FnOnce(), G: FnOnce()>(
     manifest: &Path,
     root: &Path,
@@ -4283,7 +4287,9 @@ fn match_vulnerabilities(
     let mut matches = Vec::new();
     if let Some(vuln_db) = &options.vuln_db {
         let db = read_json(vuln_db)?;
-        let advisories = db.get("vulnerabilities").and_then(Value::as_array)
+        let advisories = db
+            .get("vulnerabilities")
+            .and_then(Value::as_array)
             .ok_or_else(|| GovernanceError::InvalidInput {
                 message: "advisory database requires a vulnerabilities array".to_owned(),
             })?;
@@ -4463,8 +4469,11 @@ fn cpe_fields(raw: &str) -> Option<Vec<String>> {
 
 /// Refuse malformed advisory records rather than silently producing a clean gate.
 fn validate_advisory(vuln: &Value, index: usize) -> Result<(), GovernanceError> {
-    let nonempty = |value: Option<&Value>| value.and_then(Value::as_str)
-        .is_some_and(|text| !text.trim().is_empty());
+    let nonempty = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.trim().is_empty())
+    };
     let package = vuln.get("package").unwrap_or(&Value::Null);
     let named = nonempty(package.get("name")) && nonempty(package.get("ecosystem"));
     let identified = vulnerability_cpe(vuln, package).is_some_and(|s| !s.trim().is_empty())
@@ -4641,10 +4650,13 @@ fn vulnerability_fixed_version_hints(vuln: &Value) -> Vec<String> {
             versions.push(value.to_owned());
         }
     }
-    versions.into_iter().map(|value| value.trim().to_owned())
+    versions
+        .into_iter()
+        .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
         .collect::<std::collections::BTreeSet<_>>()
-        .into_iter().collect()
+        .into_iter()
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5577,7 +5589,7 @@ fn authenticated_pack_signature_summary(
 
     let schema = raw_manifest.map_or_else(
         || serde_json::from_value::<SignedPackManifest>(manifest.clone()),
-        |bytes| serde_json::from_slice::<SignedPackManifest>(bytes),
+        serde_json::from_slice::<SignedPackManifest>,
     );
     if let Ok(schema) = schema {
         if signed_pack_schema_valid(&schema) && signed_pack_optional_types_valid(manifest) {
@@ -7581,7 +7593,10 @@ mod vex_e2e_tests {
         assert_ne!(stmt["status"], "not_affected");
         assert!(stmt.get("justification").is_none());
         let impact = stmt["impact_statement"].as_str().unwrap();
-        assert!(impact.contains("no validated campaign evidence"), "{impact}");
+        assert!(
+            impact.contains("no validated campaign evidence"),
+            "{impact}"
+        );
 
         let cyclonedx = read_json(&out.join("cyclonedx.json")).unwrap();
         let analysis = &cyclonedx_vuln_for(&cyclonedx, "CVE-2026-NOCAMP")["analysis"];
@@ -7636,7 +7651,10 @@ mod vex_e2e_tests {
         assert_eq!(stmt["status"], "under_investigation");
         assert!(stmt.get("justification").is_none());
         let impact = stmt["impact_statement"].as_str().unwrap();
-        assert!(impact.contains("vulnerability-specific evidence is required"), "{impact}");
+        assert!(
+            impact.contains("vulnerability-specific evidence is required"),
+            "{impact}"
+        );
 
         let cyclonedx = read_json(&out.join("cyclonedx.json")).unwrap();
         let analysis = &cyclonedx_vuln_for(&cyclonedx, "CVE-2026-REACH")["analysis"];
@@ -7680,7 +7698,10 @@ mod vex_e2e_tests {
         assert_eq!(stmt["status"], "under_investigation");
         assert!(stmt.get("justification").is_none());
         let impact = stmt["impact_statement"].as_str().unwrap();
-        assert!(impact.contains("advisory fixed-version hints: 3.0.13"), "{impact}");
+        assert!(
+            impact.contains("advisory fixed-version hints: 3.0.13"),
+            "{impact}"
+        );
 
         let cyclonedx = read_json(&out.join("cyclonedx.json")).unwrap();
         let analysis = &cyclonedx_vuln_for(&cyclonedx, "CVE-2026-FIXED")["analysis"];

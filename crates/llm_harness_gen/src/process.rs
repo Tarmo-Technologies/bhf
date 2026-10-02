@@ -92,10 +92,7 @@ fn read_head_tail(mut reader: impl Read, cap: usize) -> (Vec<u8>, bool) {
     let mut tail: VecDeque<u8> = VecDeque::with_capacity(tail_cap);
     let mut truncated = false;
     let mut chunk = [0_u8; 64 * 1024];
-    loop {
-        let Ok(read) = reader.read(&mut chunk) else {
-            break;
-        };
+    while let Ok(read) = reader.read(&mut chunk) {
         if read == 0 {
             break;
         }

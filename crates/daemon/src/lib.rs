@@ -469,7 +469,7 @@ fn read_mcp_line<R: BufRead>(
             };
         }
         let newline = available.iter().position(|byte| *byte == b'\n');
-        let take = newline.map_or(available.len(), |index| index);
+        let take = newline.unwrap_or(available.len());
         if line.len().saturating_add(take) > limit {
             return Err(JsonRpcServerError::InvalidFrame(format!(
                 "MCP message exceeds the memory-aware {limit}-byte limit; set BHF_MCP_MAX_MESSAGE_BYTES to override"
@@ -2887,10 +2887,8 @@ mod tests {
             "jsonrpc": "2.0", "id": id, "method": "missingMethod"
         });
         assert!(serde_json::to_vec(&request).unwrap().len() <= limit);
-        let normal = super::error_response(
-            request["id"].clone(),
-            super::RpcFailure::method_not_found(),
-        );
+        let normal =
+            super::error_response(request["id"].clone(), super::RpcFailure::method_not_found());
         assert!(serde_json::to_vec(&normal).unwrap().len() > limit);
         let input = format!(
             "{}{}",
@@ -2911,13 +2909,22 @@ mod tests {
         assert_eq!(responses.len(), 2);
         assert!(responses[0]["id"].is_null());
         assert_eq!(responses[0]["error"]["code"], -32000);
-        assert_eq!(responses[0]["error"]["message"], "response exceeds byte limit");
+        assert_eq!(
+            responses[0]["error"]["message"],
+            "response exceeds byte limit"
+        );
         assert_eq!(responses[1]["id"], 2);
         assert_eq!(responses[1]["error"]["code"], -32601);
         let mut reader = BufReader::new(output.as_slice());
-        assert!(super::read_frame_with_limit(&mut reader, limit).unwrap().is_some());
-        assert!(super::read_frame_with_limit(&mut reader, limit).unwrap().is_some());
-        assert!(super::read_frame_with_limit(&mut reader, limit).unwrap().is_none());
+        assert!(super::read_frame_with_limit(&mut reader, limit)
+            .unwrap()
+            .is_some());
+        assert!(super::read_frame_with_limit(&mut reader, limit)
+            .unwrap()
+            .is_some());
+        assert!(super::read_frame_with_limit(&mut reader, limit)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -2933,10 +2940,17 @@ mod tests {
         let next = serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "missingMethod"});
         let stream = format!("{}{}", frame(request), frame(next.clone()));
         let mut reader = BufReader::new(stream.as_bytes());
-        assert_eq!(super::read_frame_with_limit(&mut reader, limit).unwrap(), Some(body));
-        assert_eq!(super::read_frame_with_limit(&mut reader, limit).unwrap(),
-            Some(serde_json::to_vec(&next).unwrap()));
-        assert!(super::read_frame_with_limit(&mut reader, limit).unwrap().is_none());
+        assert_eq!(
+            super::read_frame_with_limit(&mut reader, limit).unwrap(),
+            Some(body)
+        );
+        assert_eq!(
+            super::read_frame_with_limit(&mut reader, limit).unwrap(),
+            Some(serde_json::to_vec(&next).unwrap())
+        );
+        assert!(super::read_frame_with_limit(&mut reader, limit)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -2949,9 +2963,8 @@ mod tests {
         request["id"] = serde_json::json!("x".repeat(limit + 1 - overhead));
         assert_eq!(serde_json::to_vec(&request).unwrap().len(), limit + 1);
         let stream = frame(request);
-        let error = super::read_frame_with_limit(
-            &mut BufReader::new(stream.as_bytes()), limit,
-        ).unwrap_err();
+        let error = super::read_frame_with_limit(&mut BufReader::new(stream.as_bytes()), limit)
+            .unwrap_err();
         assert!(error.to_string().contains("frame exceeds"), "{error}");
     }
 
@@ -2963,10 +2976,12 @@ mod tests {
             ("CONTENT-LENGTH", "3"),
         ] {
             let input = format!("Content-Length: 2\r\n{second_name}: {second_length}\r\n\r\n{{}}");
-            let error = super::read_frame_with_limit(
-                &mut BufReader::new(input.as_bytes()), 512,
-            ).unwrap_err();
-            assert!(error.to_string().contains("duplicate Content-Length"), "{error}");
+            let error = super::read_frame_with_limit(&mut BufReader::new(input.as_bytes()), 512)
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("duplicate Content-Length"),
+                "{error}"
+            );
         }
     }
 
@@ -2974,10 +2989,12 @@ mod tests {
     fn json_rpc_reader_requires_unsigned_decimal_content_length() {
         for length in ["", "+2", "-2", "2.0", "0x2", "\u{0662}"] {
             let input = format!("Content-Length: {length}\r\n\r\n{{}}");
-            let error = super::read_frame_with_limit(
-                &mut BufReader::new(input.as_bytes()), 512,
-            ).unwrap_err();
-            assert!(error.to_string().contains("invalid Content-Length"), "{error}");
+            let error = super::read_frame_with_limit(&mut BufReader::new(input.as_bytes()), 512)
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("invalid Content-Length"),
+                "{error}"
+            );
         }
     }
 

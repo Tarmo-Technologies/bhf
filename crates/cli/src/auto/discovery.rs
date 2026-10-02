@@ -3634,10 +3634,7 @@ fn gpr_attribute_string_list(text: &str, attr: &str) -> Vec<String> {
 fn extract_quoted_strings(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = s;
-    loop {
-        let Some(qpos) = rest.find(['"', '\'']) else {
-            break;
-        };
+    while let Some(qpos) = rest.find(['"', '\'']) {
         let quote = rest.as_bytes()[qpos] as char;
         let after = &rest[qpos + 1..];
         let Some(epos) = after.find(quote) else {
