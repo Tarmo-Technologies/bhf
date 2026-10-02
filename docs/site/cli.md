@@ -266,6 +266,22 @@ re-confirming the oracle rather than a crash signature. (Interpreted-language
 runtime oracles and QEMU/Wine are out of scope for this flag — it is the native
 Linux layer `bhf auto` already uses.)
 
+`bhf binary fuzz` also accepts **user-defined postcondition oracles** with
+per-case fixture hooks: `--setup-command` runs before each testcase (prepare a
+fresh fixture), `--oracle-command` runs after it to check a security invariant,
+and `--reset-command` restores state afterwards. Each case gets a fresh
+`BHF_CASE_DIR`; the hooks (and the target) receive `BHF_CASE_DIR`/`BHF_TESTCASE`
+in the environment, and the oracle additionally gets `BHF_TARGET_EXIT`,
+`BHF_TARGET_SIGNAL`, `BHF_TARGET_TIMEOUT`, and `BHF_TARGET_STDERR`, plus the
+testcase path as `$1`. The oracle's exit code is the contract: `0` = clean,
+`1` = finding (its first stdout line is the stable signature/classification), any
+other code = infrastructure error (not a target defect). A violation is written
+as a `kind: binary_postcondition` finding (BHF-502) even when the target exited
+zero, and `bhf replay`/`minimize` re-run setup → target → oracle to re-confirm
+the signature. This expresses application-specific policy — "this input must not
+make the target write outside the allowed root / launch an unlisted process /
+perform an unauthorized operation" — that the built-in sink oracles cannot.
+
 `bhf differential --harness-a <A> --harness-b <B> --inputs <DIR>` replays
 each input through two implementations and emits BHF-301 output-divergence
 findings when stdout, exit status, or timeout behavior differs. Differential

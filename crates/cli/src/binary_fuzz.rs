@@ -99,6 +99,29 @@ pub struct BinaryFuzzArgs {
     /// otherwise; `on` requires them (errors if unavailable). Builtin engine only.
     #[arg(long = "runtime-oracles", value_enum, default_value_t = crate::runtime_oracles::RuntimeOracleMode::Off)]
     pub runtime_oracles: crate::runtime_oracles::RuntimeOracleMode,
+
+    /// Shell command run BEFORE each testcase to prepare a fresh fixture (#55).
+    /// Receives the testcase path as `$1` and `BHF_TESTCASE`/`BHF_CASE_DIR` in the
+    /// environment. A non-zero exit is an infrastructure error (the case is
+    /// skipped, not a finding).
+    #[arg(long = "setup-command")]
+    pub setup_command: Option<String>,
+
+    /// Shell command run AFTER each testcase to check a user-defined security
+    /// postcondition (#55) — e.g. "no file escaped the allowed root", "no
+    /// unexpected child process". Receives the testcase path as `$1` plus
+    /// `BHF_TESTCASE`, `BHF_CASE_DIR`, `BHF_TARGET_EXIT`, `BHF_TARGET_SIGNAL`,
+    /// `BHF_TARGET_TIMEOUT`, and `BHF_TARGET_STDERR` (a file). Exit 0 = clean,
+    /// exit 1 = finding (its first stdout line is the classification/signature),
+    /// any other exit = infrastructure error. Fires even when the target exits 0.
+    #[arg(long = "oracle-command")]
+    pub oracle_command: Option<String>,
+
+    /// Shell command run AFTER the oracle to reset state between testcases (#55),
+    /// so filesystem/process/session effects do not leak across mutations.
+    /// Receives the same `BHF_TESTCASE`/`BHF_CASE_DIR` context.
+    #[arg(long = "reset-command")]
+    pub reset_command: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -269,6 +292,14 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
         args.input_mode,
         matches!(engine, ResolvedEngine::AflQemu(_)),
     )?;
+    // #55: user postconditions are a builtin-engine capability; the afl-qemu
+    // adapter path is out of scope here.
+    if args.oracle_command.is_some() && matches!(engine, ResolvedEngine::AflQemu(_)) {
+        return Err(anyhow!(
+            "--oracle-command (user postcondition oracles) is supported only with \
+             --engine builtin; drop --oracle-command or pass --engine builtin"
+        ));
+    }
     match engine {
         ResolvedEngine::AflQemu(aq) => {
             return run_afl_qemu(&args, &aq, &seeds, &env, &findings_dir);
@@ -287,16 +318,54 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
     // (oracle hit, representative testcase) pairs; deduped at emission.
     let mut semantic_hits: Vec<(finding_rules::oracle_sdk::OracleHit, Vec<u8>)> = Vec::new();
 
+    // #55: user-defined postcondition oracle + per-case fixture hooks.
+    let postcondition = Postcondition::from_args(&args);
+    let case_dir = tmp_dir.join("case");
+    let mut seen_postcondition = std::collections::HashSet::new();
+
     let mut finding_ids = Vec::new();
     let mut executions = 0usize;
     for seed in seeds.iter().cycle().take(args.iterations.min(seeds.len())) {
         executions += 1;
+        // #55: prepare a fresh fixture directory and run the setup hook before the
+        // target, so filesystem/process state does not leak across testcases.
+        let case_testcase = if let Some(pc) = &postcondition {
+            let _ = fs::remove_dir_all(&case_dir);
+            fs::create_dir_all(&case_dir)
+                .with_context(|| format!("create {}", case_dir.display()))?;
+            let testcase_path = case_dir.join("testcase.bin");
+            fs::write(&testcase_path, seed)
+                .with_context(|| format!("write {}", testcase_path.display()))?;
+            if let Some(detail) = pc.run_setup(&case_dir, &testcase_path) {
+                bhfeprintln!("bhf binary-fuzz: skipping case (setup failed): {detail}");
+                continue;
+            }
+            Some(testcase_path)
+        } else {
+            None
+        };
         let oracle_arg = oracles.as_ref().map(|o| (o, oracle_log.as_path()));
+        // When a postcondition is active the target also sees the per-case dir and
+        // testcase path, so it can operate inside the fixture the oracle inspects
+        // (keeping fuzz and replay consistent). Otherwise the user env is passed
+        // unchanged.
+        let run_env = match &case_testcase {
+            Some(testcase_path) => {
+                let mut e = env.clone();
+                e.insert("BHF_CASE_DIR".to_owned(), case_dir.display().to_string());
+                e.insert(
+                    "BHF_TESTCASE".to_owned(),
+                    testcase_path.display().to_string(),
+                );
+                e
+            }
+            None => env.clone(),
+        };
         let run = run_binary_once(
             &invocation,
             args.input_mode,
             seed,
-            &env,
+            &run_env,
             Duration::from_millis(args.timeout_ms),
             &tmp_dir,
             oracle_arg,
@@ -310,6 +379,37 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
                 semantic_hits.push((hit, seed.clone()));
             }
             tracker.observe(&run.oracle_events, seed);
+        }
+        // #55: evaluate the user postcondition against the finished run; a finding
+        // fires even on a clean target exit. Reset state afterwards.
+        if let (Some(pc), Some(testcase_path)) = (&postcondition, &case_testcase) {
+            match pc.evaluate(&case_dir, testcase_path, &run) {
+                PostconditionVerdict::Clean => {}
+                PostconditionVerdict::Infrastructure { detail } => {
+                    bhfeprintln!("bhf binary-fuzz: postcondition oracle error: {detail}");
+                }
+                PostconditionVerdict::Finding { signature, detail } => {
+                    if seen_postcondition.insert(signature.clone()) {
+                        let id = next_binary_finding_id(&findings_dir)?;
+                        let dir = findings_dir.join(&id);
+                        fs::create_dir_all(&dir)
+                            .with_context(|| format!("create {}", dir.display()))?;
+                        fs::write(dir.join("testcase.bin"), seed).with_context(|| {
+                            format!("write {}", dir.join("testcase.bin").display())
+                        })?;
+                        let finding = render_postcondition_finding(
+                            &id, &args, seed, &env, &signature, &detail, &run,
+                        )?;
+                        fs::write(
+                            dir.join("finding.json"),
+                            serde_json::to_vec_pretty(&finding)?,
+                        )
+                        .with_context(|| format!("write {}", dir.join("finding.json").display()))?;
+                        finding_ids.push(id);
+                    }
+                }
+            }
+            pc.run_reset(&case_dir, testcase_path);
         }
         if run.crashed() {
             let id = next_binary_finding_id(&findings_dir)?;
@@ -754,16 +854,87 @@ pub(crate) fn minimize_binary_finding(
     let mode = finding_input_mode(&finding)?;
     let env = finding_env(&finding);
     let timeout = finding_timeout(&finding);
-    let expected = finding_signature(&finding)?;
     let original = fs::read(finding_dir.join("testcase.bin"))
         .with_context(|| format!("read {}", finding_dir.join("testcase.bin").display()))?;
     let invocation = finding_invocation(&finding, binary);
     let tmp_dir = finding_dir.join("binary_minimize_tmp");
     fs::create_dir_all(&tmp_dir).with_context(|| format!("create {}", tmp_dir.display()))?;
-    let result = replay_min::ddmin_bytes(&original, |candidate| -> anyhow::Result<bool> {
-        let run = run_binary_once(&invocation, mode, candidate, &env, timeout, &tmp_dir, None)?;
-        Ok(run.signature == expected)
-    })?;
+    // Reduce against the finding's OWN oracle: a crash signature, a runtime-oracle
+    // signature (#59), or a user postcondition signature (#55).
+    let result = match finding.get("kind").and_then(Value::as_str) {
+        Some("binary_postcondition") => {
+            let want = finding
+                .pointer("/postcondition/signature")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("postcondition finding is missing postcondition.signature"))?
+                .to_owned();
+            let pc = finding_postcondition(&finding)
+                .ok_or_else(|| anyhow!("postcondition finding is missing oracle_command"))?;
+            let case_dir = tmp_dir.join("case");
+            replay_min::ddmin_bytes(&original, |candidate| -> anyhow::Result<bool> {
+                let _ = fs::remove_dir_all(&case_dir);
+                fs::create_dir_all(&case_dir)?;
+                let testcase_path = case_dir.join("testcase.bin");
+                fs::write(&testcase_path, candidate)?;
+                if pc.run_setup(&case_dir, &testcase_path).is_some() {
+                    return Ok(false);
+                }
+                let mut run_env = env.clone();
+                run_env.insert("BHF_CASE_DIR".to_owned(), case_dir.display().to_string());
+                run_env.insert(
+                    "BHF_TESTCASE".to_owned(),
+                    testcase_path.display().to_string(),
+                );
+                let run = run_binary_once(
+                    &invocation,
+                    mode,
+                    candidate,
+                    &run_env,
+                    timeout,
+                    &tmp_dir,
+                    None,
+                )?;
+                let verdict = pc.evaluate(&case_dir, &testcase_path, &run);
+                pc.run_reset(&case_dir, &testcase_path);
+                Ok(
+                    matches!(verdict, PostconditionVerdict::Finding { ref signature, .. } if *signature == want),
+                )
+            })?
+        }
+        Some("binary_semantic") => {
+            let want = finding
+                .pointer("/oracle/signature")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("semantic finding is missing oracle.signature"))?
+                .to_owned();
+            let oracles = RuntimeOracles::resolve(
+                crate::runtime_oracles::RuntimeOracleMode::On,
+                "reporting",
+            )?
+            .ok_or_else(|| anyhow!("runtime oracles unavailable for semantic minimization"))?;
+            let log = tmp_dir.join("runtrace.jsonl");
+            replay_min::ddmin_bytes(&original, |candidate| -> anyhow::Result<bool> {
+                let run = run_binary_once(
+                    &invocation,
+                    mode,
+                    candidate,
+                    &env,
+                    timeout,
+                    &tmp_dir,
+                    Some((&oracles, log.as_path())),
+                )?;
+                Ok(replay_oracle_signatures(&run.oracle_events, candidate).contains(&want))
+            })?
+        }
+        _ => {
+            let expected = finding_signature(&finding)?;
+            replay_min::ddmin_bytes(&original, |candidate| -> anyhow::Result<bool> {
+                let run =
+                    run_binary_once(&invocation, mode, candidate, &env, timeout, &tmp_dir, None)?;
+                Ok(run.signature == expected)
+            })?
+        }
+    };
     let _ = fs::remove_dir_all(&tmp_dir);
     fs::write(finding_dir.join("min_testcase.bin"), &result.minimized)
         .with_context(|| format!("write {}", finding_dir.join("min_testcase.bin").display()))?;
@@ -821,6 +992,35 @@ fn replay_binary_finding_inner(finding_dir: &Path, binary: &Path) -> anyhow::Res
         replay_oracle_signatures(&run.oracle_events, &input)
             .iter()
             .any(|s| s == want)
+    } else if finding.get("kind").and_then(Value::as_str) == Some("binary_postcondition") {
+        // #55: reproduce by re-running setup -> target -> oracle and confirming
+        // the same postcondition signature fires.
+        let want = finding
+            .pointer("/postcondition/signature")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("postcondition finding is missing postcondition.signature"))?;
+        let pc = finding_postcondition(&finding).ok_or_else(|| {
+            anyhow!("postcondition finding is missing postcondition.oracle_command")
+        })?;
+        let case_dir = tmp_dir.join("case");
+        fs::create_dir_all(&case_dir).with_context(|| format!("create {}", case_dir.display()))?;
+        let testcase_path = case_dir.join("testcase.bin");
+        fs::write(&testcase_path, &input)
+            .with_context(|| format!("write {}", testcase_path.display()))?;
+        if let Some(detail) = pc.run_setup(&case_dir, &testcase_path) {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return Err(anyhow!("postcondition replay setup failed: {detail}"));
+        }
+        let mut run_env = env.clone();
+        run_env.insert("BHF_CASE_DIR".to_owned(), case_dir.display().to_string());
+        run_env.insert(
+            "BHF_TESTCASE".to_owned(),
+            testcase_path.display().to_string(),
+        );
+        let run = run_binary_once(&invocation, mode, &input, &run_env, timeout, &tmp_dir, None)?;
+        let verdict = pc.evaluate(&case_dir, &testcase_path, &run);
+        pc.run_reset(&case_dir, &testcase_path);
+        matches!(verdict, PostconditionVerdict::Finding { ref signature, .. } if signature == want)
     } else {
         let run = run_binary_once(&invocation, mode, &input, &env, timeout, &tmp_dir, None)?;
         run.signature == finding_signature(&finding)?
@@ -1045,6 +1245,142 @@ fn run_binary_once(
     })
 }
 
+/// A user-defined postcondition oracle plus fixture hooks for binary fuzz (#55):
+/// a `setup` run before each testcase, an `oracle` run after it (whose exit code
+/// classifies the outcome), and a `reset` run afterwards. Lets a source-
+/// unavailable target be judged against a security invariant it can violate while
+/// still exiting 0 (a file escaping an allowed root, an unexpected child process,
+/// an unauthorized operation).
+#[derive(Debug, Clone)]
+struct Postcondition {
+    setup: Option<String>,
+    oracle: String,
+    reset: Option<String>,
+}
+
+/// The classification of one testcase's postcondition evaluation, from the
+/// oracle command's exit code: 0 = clean, 1 = finding (first stdout line is the
+/// signature/classification), anything else = infrastructure error (not a target
+/// defect — the oracle itself failed).
+enum PostconditionVerdict {
+    Clean,
+    Finding { signature: String, detail: String },
+    Infrastructure { detail: String },
+}
+
+impl Postcondition {
+    fn from_args(args: &BinaryFuzzArgs) -> Option<Self> {
+        args.oracle_command.as_ref().map(|oracle| Self {
+            setup: args.setup_command.clone(),
+            oracle: oracle.clone(),
+            reset: args.reset_command.clone(),
+        })
+    }
+
+    /// Prepare the fixture. `Some(detail)` is an infrastructure failure (skip the
+    /// case); `None` means setup is absent or succeeded.
+    fn run_setup(&self, case_dir: &Path, testcase: &Path) -> Option<String> {
+        let cmd = self.setup.as_deref()?;
+        match run_shell_hook(cmd, case_dir, testcase, &[]) {
+            Ok(out) if out.status.success() => None,
+            Ok(out) => Some(format!("setup-command exited {}", exit_label(&out.status))),
+            Err(e) => Some(format!("setup-command failed to spawn: {e}")),
+        }
+    }
+
+    /// Evaluate the postcondition against a finished target run.
+    fn evaluate(&self, case_dir: &Path, testcase: &Path, run: &BinaryRun) -> PostconditionVerdict {
+        let stderr_path = case_dir.join("target.stderr");
+        let _ = fs::write(&stderr_path, run.stderr.as_bytes());
+        let extra = [
+            (
+                "BHF_TARGET_EXIT",
+                run.exit_code.map(|c| c.to_string()).unwrap_or_default(),
+            ),
+            (
+                "BHF_TARGET_SIGNAL",
+                run.signal.map(|s| s.to_string()).unwrap_or_default(),
+            ),
+            (
+                "BHF_TARGET_TIMEOUT",
+                if run.timeout { "1" } else { "0" }.to_owned(),
+            ),
+            ("BHF_TARGET_STDERR", stderr_path.display().to_string()),
+        ];
+        let out = match run_shell_hook(&self.oracle, case_dir, testcase, &extra) {
+            Ok(out) => out,
+            Err(e) => {
+                return PostconditionVerdict::Infrastructure {
+                    detail: format!("oracle-command failed to spawn: {e}"),
+                }
+            }
+        };
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        match out.status.code() {
+            Some(0) => PostconditionVerdict::Clean,
+            Some(1) => {
+                let signature = stdout
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty())
+                    .unwrap_or("postcondition-violation")
+                    .to_owned();
+                PostconditionVerdict::Finding {
+                    signature,
+                    detail: stdout,
+                }
+            }
+            other => PostconditionVerdict::Infrastructure {
+                detail: format!(
+                    "oracle-command exited {} (expected 0=clean, 1=finding)",
+                    other
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| exit_label(&out.status))
+                ),
+            },
+        }
+    }
+
+    fn run_reset(&self, case_dir: &Path, testcase: &Path) {
+        if let Some(cmd) = self.reset.as_deref() {
+            let _ = run_shell_hook(cmd, case_dir, testcase, &[]);
+        }
+    }
+}
+
+/// Run a user hook as `sh -c <cmd> sh <testcase>` (so the hook sees the testcase
+/// path as `$1`), in `case_dir`, with the fixture/target context in the
+/// environment. stdin is closed; stdout/stderr are captured for classification.
+fn run_shell_hook(
+    cmd: &str,
+    case_dir: &Path,
+    testcase: &Path,
+    extra_env: &[(&str, String)],
+) -> std::io::Result<std::process::Output> {
+    let mut c = Command::new("sh");
+    c.arg("-c")
+        .arg(cmd)
+        .arg("sh")
+        .arg(testcase)
+        .current_dir(case_dir)
+        .env("BHF_TESTCASE", testcase)
+        .env("BHF_CASE_DIR", case_dir)
+        .stdin(Stdio::null());
+    for (key, value) in extra_env {
+        c.env(key, value);
+    }
+    c.output()
+}
+
+/// A short human label for a process exit (signal or code), for diagnostics.
+fn exit_label(status: &std::process::ExitStatus) -> String {
+    if let Some(sig) = termination_signal(status) {
+        format!("signal {sig}")
+    } else {
+        format!("code {}", status.code().unwrap_or(-1))
+    }
+}
+
 fn render_finding(
     id: &str,
     args: &BinaryFuzzArgs,
@@ -1155,6 +1491,67 @@ fn render_semantic_finding(
     }))
 }
 
+/// Render a `binary_postcondition` finding (#55): a user-defined security
+/// invariant the `--oracle-command` reported violated, even if the target exited
+/// cleanly. Records the hook commands + signature so `bhf replay`/`minimize`
+/// re-evaluate the postcondition rather than a crash signature.
+fn render_postcondition_finding(
+    id: &str,
+    args: &BinaryFuzzArgs,
+    input: &[u8],
+    env: &BTreeMap<String, String>,
+    signature: &str,
+    detail: &str,
+    run: &BinaryRun,
+) -> anyhow::Result<Value> {
+    Ok(json!({
+        "id": id,
+        "kind": "binary_postcondition",
+        "rule_id": "BHF-502",
+        "classification": "postcondition_violation",
+        "confirmation": "runtime",
+        "severity": "high",
+        "confidence": "high",
+        "message": format!("user postcondition violated: {signature}"),
+        "binary": {
+            "path": args.binary,
+            "sha256": sha256_hex(&fs::read(&args.binary).with_context(|| format!("read {}", args.binary.display()))?)
+        },
+        "command": {
+            "argv": TargetInvocation::from_args(args).provenance_argv(args.input_mode),
+            "runner": args.runner,
+            "runner_args": args.runner_args,
+            "target_args": args.target_args,
+            "timeout_ms": args.timeout_ms,
+            "sandbox": format!("{:?}", args.sandbox).to_ascii_lowercase()
+        },
+        "postcondition": {
+            "setup_command": args.setup_command,
+            "oracle_command": args.oracle_command,
+            "reset_command": args.reset_command,
+            "signature": signature,
+            "detail_excerpt": stderr_excerpt(detail)
+        },
+        "input": {
+            "mode": args.input_mode.as_str(),
+            "bytes": input.len(),
+            "testcase": "testcase.bin"
+        },
+        "env": env,
+        "target_status": {
+            "exit_code": run.exit_code,
+            "signal": run.signal,
+            "timeout": run.timeout
+        },
+        "paths": {
+            "testcase": "testcase.bin"
+        },
+        "triage": {
+            "replay": format!("bhf replay --harness {} {}", args.binary.display(), id)
+        }
+    }))
+}
+
 fn collect_seeds(seed_inputs: &[String], seed_files: &[PathBuf]) -> anyhow::Result<Vec<Vec<u8>>> {
     let mut seeds = seed_inputs
         .iter()
@@ -1236,6 +1633,26 @@ fn finding_invocation(finding: &Value, binary: &Path) -> TargetInvocation {
         runner_args: finding_str_array(finding, "/command/runner_args"),
         target_args: finding_str_array(finding, "/command/target_args"),
     }
+}
+
+/// Rebuild the user postcondition hooks from a `binary_postcondition` finding for
+/// replay/minimize. `None` when no oracle command was recorded.
+fn finding_postcondition(finding: &Value) -> Option<Postcondition> {
+    let oracle = finding
+        .pointer("/postcondition/oracle_command")?
+        .as_str()?
+        .to_owned();
+    let hook = |ptr: &str| {
+        finding
+            .pointer(ptr)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    Some(Postcondition {
+        setup: hook("/postcondition/setup_command"),
+        oracle,
+        reset: hook("/postcondition/reset_command"),
+    })
 }
 
 fn finding_timeout(finding: &Value) -> Duration {
@@ -1509,6 +1926,9 @@ mod tests {
             engine: BinaryFuzzEngine::Builtin,
             time: None,
             runtime_oracles: crate::runtime_oracles::RuntimeOracleMode::Off,
+            setup_command: None,
+            oracle_command: None,
+            reset_command: None,
         };
 
         // Without the triggering arg the target exits 0 — no finding.
@@ -1807,6 +2227,9 @@ mod afl_qemu_tests {
             engine: BinaryFuzzEngine::Builtin,
             time: None,
             runtime_oracles: crate::runtime_oracles::RuntimeOracleMode::On,
+            setup_command: None,
+            oracle_command: None,
+            reset_command: None,
         };
         let summary = run_inner(args).expect("binary fuzz run");
         let ids = summary["findings"].as_array().expect("findings array");
@@ -1845,6 +2268,94 @@ mod afl_qemu_tests {
             replay_binary_finding(&fdir, &bin),
             0,
             "semantic finding must replay to a match"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// End-to-end proof of user postcondition oracles (#55): a target that writes
+    /// a path-traversal file outside its allowed root exits 0, yet the
+    /// `--oracle-command` must flag it as a `binary_postcondition` finding — which
+    /// then replays to a match by re-running setup -> target -> oracle.
+    #[cfg(unix)]
+    #[test]
+    fn binary_fuzz_postcondition_flags_clean_exit_path_escape() {
+        use std::os::unix::fs::PermissionsExt;
+        if !Command::new("sh")
+            .arg("-c")
+            .arg("true")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            eprintln!("skipping postcondition e2e: no POSIX sh");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("bhf-binfuzz-postc-{}", nonce()));
+        fs::create_dir_all(&dir).unwrap();
+        // Target: writes a file named by its input UNDER $BHF_CASE_DIR/share. With
+        // a "../escaped" input it escapes the allowed root — and exits 0.
+        let target = dir.join("writer.sh");
+        fs::write(
+            &target,
+            b"#!/bin/sh\nname=$(cat \"$1\")\nmkdir -p \"$BHF_CASE_DIR/share\"\n: > \"$BHF_CASE_DIR/share/$name\"\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let work = dir.join("work");
+        fs::create_dir_all(&work).unwrap();
+        let args = BinaryFuzzArgs {
+            binary: target.clone(),
+            work_dir: work.clone(),
+            input_mode: BinaryInputMode::File,
+            iterations: 2,
+            seed_inputs: vec!["../escaped".to_owned()],
+            seed_files: Vec::new(),
+            timeout_ms: 10_000,
+            mem_mb: "none".to_owned(),
+            env: Vec::new(),
+            runner: None,
+            runner_args: Vec::new(),
+            target_args: Vec::new(),
+            sandbox: SandboxModeArg::Auto,
+            engine: BinaryFuzzEngine::Builtin,
+            time: None,
+            runtime_oracles: crate::runtime_oracles::RuntimeOracleMode::Off,
+            setup_command: Some("mkdir -p \"$BHF_CASE_DIR/share\"".to_owned()),
+            // Stable signature ("path-escape") so replay matches regardless of the
+            // per-run case directory path.
+            oracle_command: Some(
+                "[ -e \"$BHF_CASE_DIR/escaped\" ] && { echo path-escape; exit 1; }; exit 0"
+                    .to_owned(),
+            ),
+            reset_command: None,
+        };
+        let summary = run_inner(args).expect("binary fuzz run");
+        let ids = summary["findings"].as_array().expect("findings array");
+        let mut found: Option<PathBuf> = None;
+        for id in ids {
+            let fdir = work.join("findings").join(id.as_str().unwrap());
+            let f: Value =
+                serde_json::from_slice(&fs::read(fdir.join("finding.json")).unwrap()).unwrap();
+            if f.get("kind").and_then(Value::as_str) == Some("binary_postcondition") {
+                assert_eq!(f.get("rule_id").and_then(Value::as_str), Some("BHF-502"));
+                assert_eq!(
+                    f.pointer("/postcondition/signature")
+                        .and_then(Value::as_str),
+                    Some("path-escape")
+                );
+                found = Some(fdir);
+                break;
+            }
+        }
+        let fdir = found
+            .unwrap_or_else(|| panic!("expected a binary_postcondition finding, got {summary}"));
+
+        assert_eq!(
+            replay_binary_finding(&fdir, &target),
+            0,
+            "postcondition finding must replay to a match"
         );
 
         let _ = fs::remove_dir_all(&dir);

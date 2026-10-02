@@ -21,6 +21,15 @@
   fuzz` publishes each input to the shim through an inherited fd so a black-box
   target gets byte-origin taint, emits `binary_semantic` findings, and replays
   them by re-confirming the oracle. Off by default (opt-in); Linux-only (#59).
+- `bhf binary fuzz` user-defined postcondition oracles with per-case fixture
+  hooks: `--setup-command` / `--oracle-command` / `--reset-command`. Each case
+  runs in a fresh `BHF_CASE_DIR` (passed to the hooks and the target); the oracle
+  gets the target status + stderr and signals clean (exit 0) / finding (exit 1,
+  first stdout line = signature) / infrastructure error (any other exit). A
+  violation becomes a `binary_postcondition` finding (BHF-502) even on a clean
+  target exit, and `bhf replay`/`minimize` re-evaluate the oracle rather than a
+  crash signature — expressing application-specific security policy the built-in
+  sink oracles cannot (#55).
 
 ## 0.2.34 - 2026-10-01
 
