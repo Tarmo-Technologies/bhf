@@ -2,6 +2,7 @@
 
 use crate::minimize::MinimizeStrategy;
 use crate::runner::SandboxModeArg;
+use crate::runtime_oracles::RuntimeOracles;
 use anyhow::{anyhow, Context};
 use clap::ValueEnum;
 use serde_json::{json, Value};
@@ -89,6 +90,15 @@ pub struct BinaryFuzzArgs {
     /// builtin engine. Defaults to ~100ms per `--iterations`, clamped to [1s,30s].
     #[arg(long = "time")]
     pub time: Option<String>,
+
+    /// Load the runtime sink oracles via the LD_PRELOAD runtrace shim (#59) so a
+    /// clean-exit semantic violation — a fuzz-controlled command execution, path
+    /// escape, dlopen, network egress, or SQL query — becomes a `binary_semantic`
+    /// finding even when the target exits zero. `off` (default) is crash-only;
+    /// `auto` enables them when the shim and platform (Linux) support it and skips
+    /// otherwise; `on` requires them (errors if unavailable). Builtin engine only.
+    #[arg(long = "runtime-oracles", value_enum, default_value_t = crate::runtime_oracles::RuntimeOracleMode::Off)]
+    pub runtime_oracles: crate::runtime_oracles::RuntimeOracleMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -269,10 +279,19 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
     let tmp_dir = args.work_dir.join("binary_fuzz/tmp");
     fs::create_dir_all(&tmp_dir).with_context(|| format!("create {}", tmp_dir.display()))?;
 
+    // #59: resolve the runtime sink oracles for the builtin seed-replay engine.
+    // `on` errors if the shim/platform is unavailable; `auto` quietly stays off.
+    let oracles = RuntimeOracles::resolve(args.runtime_oracles, "reporting")?;
+    let oracle_log = tmp_dir.join("runtrace.jsonl");
+    let mut tracker = crate::auto::runtrace::SinkTaintTracker::default();
+    // (oracle hit, representative testcase) pairs; deduped at emission.
+    let mut semantic_hits: Vec<(finding_rules::oracle_sdk::OracleHit, Vec<u8>)> = Vec::new();
+
     let mut finding_ids = Vec::new();
     let mut executions = 0usize;
     for seed in seeds.iter().cycle().take(args.iterations.min(seeds.len())) {
         executions += 1;
+        let oracle_arg = oracles.as_ref().map(|o| (o, oracle_log.as_path()));
         let run = run_binary_once(
             &invocation,
             args.input_mode,
@@ -280,7 +299,18 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
             &env,
             Duration::from_millis(args.timeout_ms),
             &tmp_dir,
+            oracle_arg,
         )?;
+        if oracles.is_some() {
+            // Per-run oracle classes (TOCTOU, insecure perms, resource leak,
+            // network egress, format string) fire on a single execution's events;
+            // the taint-confirmed classes (command exec, path escape, dlopen, SQL)
+            // are accumulated in the tracker and confirmed after the campaign.
+            for hit in crate::auto::runtrace::oracle_hits_from_events(&run.oracle_events) {
+                semantic_hits.push((hit, seed.clone()));
+            }
+            tracker.observe(&run.oracle_events, seed);
+        }
         if run.crashed() {
             let id = next_binary_finding_id(&findings_dir)?;
             let dir = findings_dir.join(&id);
@@ -298,13 +328,65 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
         }
     }
 
+    // #59: emit semantic findings for every distinct oracle violation — these fire
+    // even when the target exited zero on every input.
+    if oracles.is_some() {
+        for confirmed in tracker.into_confirmed() {
+            if let Some(hit) = crate::auto::runtrace::confirmed_sink_hit(&confirmed) {
+                semantic_hits.push((hit, confirmed.input.clone()));
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        for (hit, input) in &semantic_hits {
+            let signature = crate::runtime_oracles::oracle_signature(hit);
+            if !seen.insert(signature.clone()) {
+                continue;
+            }
+            let id = next_binary_finding_id(&findings_dir)?;
+            let dir = findings_dir.join(&id);
+            fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+            fs::write(dir.join("testcase.bin"), input)
+                .with_context(|| format!("write {}", dir.join("testcase.bin").display()))?;
+            let finding = render_semantic_finding(
+                &id,
+                &args,
+                input,
+                &env,
+                hit,
+                &signature,
+                oracles.as_ref(),
+            )?;
+            fs::write(
+                dir.join("finding.json"),
+                serde_json::to_vec_pretty(&finding)?,
+            )
+            .with_context(|| format!("write {}", dir.join("finding.json").display()))?;
+            finding_ids.push(id);
+        }
+    }
+
     Ok(json!({
         "schema_version": "bhf.binary_fuzz.run.v1",
         "binary": args.binary,
         "input_mode": args.input_mode.as_str(),
         "executions": executions,
+        "runtime_oracles": runtime_oracle_provenance(args.runtime_oracles, oracles.as_ref()),
         "findings": finding_ids
     }))
+}
+
+/// Run-provenance for the runtime-oracle layer (#59): the requested mode, whether
+/// it is active, and the shim hash when it is — so a crash-only run (shim/platform
+/// unavailable) is distinguishable from one that evaluated the oracles.
+fn runtime_oracle_provenance(
+    mode: crate::runtime_oracles::RuntimeOracleMode,
+    oracles: Option<&RuntimeOracles>,
+) -> Value {
+    json!({
+        "mode": format!("{mode:?}").to_ascii_lowercase(),
+        "active": oracles.is_some(),
+        "shim_sha256": oracles.map(RuntimeOracles::shim_sha256),
+    })
 }
 
 /// The concrete engine a binary-fuzz run resolved to.
@@ -601,6 +683,7 @@ fn run_afl_qemu(
                 env,
                 Duration::from_millis(args.timeout_ms),
                 &tmp_dir,
+                None,
             )?;
             if !run.crashed() || !seen_signatures.insert(run.signature.clone()) {
                 continue;
@@ -678,7 +761,7 @@ pub(crate) fn minimize_binary_finding(
     let tmp_dir = finding_dir.join("binary_minimize_tmp");
     fs::create_dir_all(&tmp_dir).with_context(|| format!("create {}", tmp_dir.display()))?;
     let result = replay_min::ddmin_bytes(&original, |candidate| -> anyhow::Result<bool> {
-        let run = run_binary_once(&invocation, mode, candidate, &env, timeout, &tmp_dir)?;
+        let run = run_binary_once(&invocation, mode, candidate, &env, timeout, &tmp_dir, None)?;
         Ok(run.signature == expected)
     })?;
     let _ = fs::remove_dir_all(&tmp_dir);
@@ -706,16 +789,67 @@ fn replay_binary_finding_inner(finding_dir: &Path, binary: &Path) -> anyhow::Res
     let tmp_dir = finding_dir.join("binary_replay_tmp");
     fs::create_dir_all(&tmp_dir).with_context(|| format!("create {}", tmp_dir.display()))?;
     let invocation = finding_invocation(&finding, binary);
-    let run = run_binary_once(
-        &invocation,
-        finding_input_mode(&finding)?,
-        &input,
-        &finding_env(&finding),
-        finding_timeout(&finding),
-        &tmp_dir,
-    )?;
+    let mode = finding_input_mode(&finding)?;
+    let env = finding_env(&finding);
+    let timeout = finding_timeout(&finding);
+
+    let matched = if finding.get("kind").and_then(Value::as_str) == Some("binary_semantic") {
+        // #59: a semantic finding is reproduced by re-running under the runtime
+        // oracles and confirming the SAME oracle signature fires — not a crash.
+        let want = finding
+            .pointer("/oracle/signature")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("semantic finding is missing oracle.signature"))?;
+        let oracles =
+            RuntimeOracles::resolve(crate::runtime_oracles::RuntimeOracleMode::On, "reporting")
+                .with_context(|| {
+                    "runtime oracles are required to replay a binary_semantic finding"
+                })?
+                .ok_or_else(|| {
+                    anyhow!("runtime oracles unavailable (shim/platform) for semantic replay")
+                })?;
+        let log = tmp_dir.join("runtrace.jsonl");
+        let run = run_binary_once(
+            &invocation,
+            mode,
+            &input,
+            &env,
+            timeout,
+            &tmp_dir,
+            Some((&oracles, log.as_path())),
+        )?;
+        replay_oracle_signatures(&run.oracle_events, &input)
+            .iter()
+            .any(|s| s == want)
+    } else {
+        let run = run_binary_once(&invocation, mode, &input, &env, timeout, &tmp_dir, None)?;
+        run.signature == finding_signature(&finding)?
+    };
     let _ = fs::remove_dir_all(&tmp_dir);
-    Ok(run.signature == finding_signature(&finding)?)
+    Ok(matched)
+}
+
+/// Every oracle signature one execution's events yield — the per-run oracle
+/// classes plus the taint-confirmed sinks (confirmed from this single execution's
+/// taint, which is sufficient to reproduce a recorded violation). Used by
+/// semantic replay/minimize to match a finding's recorded `oracle.signature`.
+fn replay_oracle_signatures(
+    events: &[crate::auto::runtrace::RuntraceEvent],
+    input: &[u8],
+) -> Vec<String> {
+    use crate::auto::runtrace;
+    let mut sigs: Vec<String> = runtrace::oracle_hits_from_events(events)
+        .iter()
+        .map(crate::runtime_oracles::oracle_signature)
+        .collect();
+    let mut tracker = runtrace::SinkTaintTracker::default();
+    tracker.observe(events, input);
+    for confirmed in tracker.into_confirmed() {
+        if let Some(hit) = runtrace::confirmed_sink_hit(&confirmed) {
+            sigs.push(crate::runtime_oracles::oracle_signature(&hit));
+        }
+    }
+    sigs
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -727,6 +861,10 @@ struct BinaryRun {
     timeout: bool,
     stderr: String,
     signature: String,
+    /// Runtrace events captured this execution when runtime oracles were armed
+    /// (#59); empty otherwise. Fed to the per-run oracle registry and the
+    /// cross-execution taint tracker by the caller.
+    oracle_events: Vec<crate::auto::runtrace::RuntraceEvent>,
 }
 
 impl BinaryRun {
@@ -750,6 +888,33 @@ fn termination_signal(_status: &std::process::ExitStatus) -> Option<i32> {
     None
 }
 
+/// Open `path` read-only as an fd the spawned child will INHERIT (no close-on-exec)
+/// so the runtrace shim can `mmap` it as the published fuzz input (#59). Returns
+/// `None` off Unix or on error.
+#[cfg(unix)]
+fn open_inheritable_ro(path: &Path) -> Option<i32> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // O_RDONLY with no O_CLOEXEC — the fd survives fork+exec into the child.
+    let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY) };
+    (fd >= 0).then_some(fd)
+}
+
+#[cfg(not(unix))]
+fn open_inheritable_ro(_path: &Path) -> Option<i32> {
+    None
+}
+
+#[cfg(unix)]
+fn close_fd(fd: i32) {
+    unsafe {
+        libc::close(fd);
+    }
+}
+
+#[cfg(not(unix))]
+fn close_fd(_fd: i32) {}
+
 fn run_binary_once(
     inv: &TargetInvocation,
     mode: BinaryInputMode,
@@ -757,6 +922,7 @@ fn run_binary_once(
     env: &BTreeMap<String, String>,
     timeout: Duration,
     tmp_dir: &Path,
+    oracle: Option<(&RuntimeOracles, &Path)>,
 ) -> anyhow::Result<BinaryRun> {
     // Materialize the file-mode testcase first so the invocation can place its
     // path (at a `@@` token or appended); stdin mode delivers it on the pipe.
@@ -783,9 +949,41 @@ fn run_binary_once(
             cmd.stdin(Stdio::null());
         }
     }
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("spawn {}", program.display()))?;
+
+    // #59: arm the runtime sink oracles for this execution — truncate the per-exec
+    // audit log, set LD_PRELOAD/BHF_RUNTRACE_*, and publish the input bytes to the
+    // shim through an inherited, mmap-able fd (BHF_FUZZ_INPUT_FD/LEN) so byte-origin
+    // taint confirmation stays valid for a black-box target that never calls
+    // `bhf_shim_set_fuzz_input` itself.
+    let mut published_fd: Option<i32> = None;
+    let mut fuzz_input_file: Option<PathBuf> = None;
+    if let Some((oracles, log)) = oracle {
+        let _ = fs::write(log, b"");
+        oracles.apply(&mut cmd, log);
+        if !input.is_empty() {
+            let fuzz_path = match &input_file {
+                Some(path) => path.clone(),
+                None => {
+                    let path = tmp_dir.join(format!("fuzzinput-{}.bin", nonce()));
+                    fs::write(&path, input).with_context(|| format!("write {}", path.display()))?;
+                    fuzz_input_file = Some(path.clone());
+                    path
+                }
+            };
+            if let Some(fd) = open_inheritable_ro(&fuzz_path) {
+                cmd.env("BHF_FUZZ_INPUT_FD", fd.to_string());
+                cmd.env("BHF_FUZZ_INPUT_LEN", input.len().to_string());
+                published_fd = Some(fd);
+            }
+        }
+    }
+
+    let spawned = cmd.spawn();
+    // The child has forked with its own copy of the fd; drop the parent's.
+    if let Some(fd) = published_fd {
+        close_fd(fd);
+    }
+    let mut child = spawned.with_context(|| format!("spawn {}", program.display()))?;
     if mode == BinaryInputMode::Stdin {
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(input);
@@ -810,6 +1008,9 @@ fn run_binary_once(
     if let Some(path) = input_file {
         let _ = fs::remove_file(path);
     }
+    if let Some(path) = fuzz_input_file {
+        let _ = fs::remove_file(path);
+    }
     let exit_code = output.status.code();
     let signal = termination_signal(&output.status);
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -826,12 +1027,21 @@ fn run_binary_once(
             sha256_hex(stderr.as_bytes())
         )
     };
+    let oracle_events = match oracle {
+        Some((_, log)) => {
+            let mut events = crate::auto::runtrace::parse_log(log).unwrap_or_default();
+            crate::auto::runtrace::dedupe_in_place(&mut events);
+            events
+        }
+        None => Vec::new(),
+    };
     Ok(BinaryRun {
         exit_code,
         signal,
         timeout: timed_out,
         stderr,
         signature,
+        oracle_events,
     })
 }
 
@@ -873,6 +1083,69 @@ fn render_finding(
             "signature": run.signature,
             "stderr_excerpt": stderr_excerpt(&run.stderr)
         },
+        "paths": {
+            "testcase": "testcase.bin"
+        },
+        "triage": {
+            "replay": format!("bhf replay --harness {} {}", args.binary.display(), id)
+        }
+    }))
+}
+
+/// Render a `binary_semantic` finding (#59) for a runtime sink-oracle violation —
+/// a clean-exit defect the crash oracle cannot see. Mirrors the crash finding's
+/// command/input/binary provenance and adds the oracle rule, evidence, and the
+/// `oracle_signature` that `bhf replay`/`minimize` match on.
+fn render_semantic_finding(
+    id: &str,
+    args: &BinaryFuzzArgs,
+    input: &[u8],
+    env: &BTreeMap<String, String>,
+    hit: &finding_rules::oracle_sdk::OracleHit,
+    signature: &str,
+    oracles: Option<&RuntimeOracles>,
+) -> anyhow::Result<Value> {
+    let evidence: serde_json::Map<String, Value> = hit
+        .evidence
+        .iter()
+        .map(|e| (e.key.clone(), Value::String(e.value.clone())))
+        .collect();
+    Ok(json!({
+        "id": id,
+        "kind": "binary_semantic",
+        "rule_id": hit.rule_id,
+        "classification": "oracle_hit",
+        "confirmation": "runtime",
+        "severity": "high",
+        "confidence": "high",
+        "message": hit.message,
+        "binary": {
+            "path": args.binary,
+            "sha256": sha256_hex(&fs::read(&args.binary).with_context(|| format!("read {}", args.binary.display()))?)
+        },
+        "command": {
+            "argv": TargetInvocation::from_args(args).provenance_argv(args.input_mode),
+            "runner": args.runner,
+            "runner_args": args.runner_args,
+            "target_args": args.target_args,
+            "timeout_ms": args.timeout_ms,
+            "sandbox": format!("{:?}", args.sandbox).to_ascii_lowercase()
+        },
+        "input": {
+            "mode": args.input_mode.as_str(),
+            "bytes": input.len(),
+            "testcase": "testcase.bin"
+        },
+        "env": env,
+        "oracle": {
+            "name": hit.oracle_name,
+            "category": hit.category,
+            "api": hit.api,
+            "message": hit.message,
+            "evidence": evidence,
+            "signature": signature
+        },
+        "runtime_oracles": runtime_oracle_provenance(args.runtime_oracles, oracles),
         "paths": {
             "testcase": "testcase.bin"
         },
@@ -1051,6 +1324,7 @@ mod tests {
             timeout,
             stderr: String::new(),
             signature: String::new(),
+            oracle_events: Vec::new(),
         }
     }
 
@@ -1104,6 +1378,7 @@ mod tests {
             &BTreeMap::new(),
             Duration::from_secs(5),
             &dir,
+            None,
         )
         .expect("spawn crasher");
         let _ = fs::remove_dir_all(&dir);
@@ -1233,6 +1508,7 @@ mod tests {
             sandbox: SandboxModeArg::Auto,
             engine: BinaryFuzzEngine::Builtin,
             time: None,
+            runtime_oracles: crate::runtime_oracles::RuntimeOracleMode::Off,
         };
 
         // Without the triggering arg the target exits 0 — no finding.
@@ -1451,5 +1727,126 @@ mod afl_qemu_tests {
             );
             assert!(matches!(auto.unwrap(), ResolvedEngine::Builtin));
         }
+    }
+
+    // --- #59: runtime sink oracles in binary fuzz ---
+
+    /// Runtime oracles need Linux, the runtrace shim built, and `cc` to build the
+    /// C fixture. Returns false (skip) when any is missing.
+    #[cfg(unix)]
+    fn runtime_oracle_e2e_ready() -> bool {
+        cfg!(target_os = "linux")
+            && crate::auto::shim_path::locate().is_some()
+            && Command::new("cc")
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+    }
+
+    /// End-to-end proof of binary-fuzz runtime sink oracles (#59): a C target that
+    /// passes its fuzz-controlled input into `system()` exits 0, yet must produce a
+    /// `binary_semantic` command-execution finding (BHF-431) — and that finding
+    /// must replay to a match under the oracles.
+    #[cfg(unix)]
+    #[test]
+    fn binary_fuzz_runtime_oracle_flags_clean_exit_command_injection() {
+        use std::os::unix::fs::PermissionsExt;
+        if !runtime_oracle_e2e_ready() {
+            eprintln!("skipping binary-fuzz runtime-oracle e2e: shim/cc/Linux unavailable");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("bhf-binfuzz-oracle-{}", nonce()));
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("sink.c");
+        // Reads the input file (file mode) and passes it, unsanitized, into
+        // system() — a clean-exit command injection the crash oracle cannot see.
+        fs::write(
+            &src,
+            b"#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\
+              int main(int argc, char **argv){\n\
+              \x20 char buf[256]; buf[0]=0;\n\
+              \x20 if(argc>1){ FILE*f=fopen(argv[1],\"rb\"); if(f){ size_t n=fread(buf,1,255,f); buf[n]=0; fclose(f);} }\n\
+              \x20 char cmd[512]; snprintf(cmd,sizeof cmd,\"/bin/echo %s\", buf);\n\
+              \x20 system(cmd);\n\
+              \x20 return 0;\n }\n",
+        )
+        .unwrap();
+        let bin = dir.join("sink");
+        let built = Command::new("cc")
+            .arg("-O0")
+            .arg(&src)
+            .arg("-o")
+            .arg(&bin)
+            .output()
+            .expect("cc");
+        assert!(
+            built.status.success(),
+            "cc failed: {}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        let _ = fs::set_permissions(&bin, fs::Permissions::from_mode(0o755));
+
+        let work = dir.join("work");
+        fs::create_dir_all(&work).unwrap();
+        let args = BinaryFuzzArgs {
+            binary: bin.clone(),
+            work_dir: work.clone(),
+            input_mode: BinaryInputMode::File,
+            iterations: 2,
+            // A >=4-byte contiguous run so the shim's taint sees it in the command.
+            seed_inputs: vec!["AAAACCCC".to_owned()],
+            seed_files: Vec::new(),
+            timeout_ms: 10_000,
+            mem_mb: "none".to_owned(),
+            env: Vec::new(),
+            runner: None,
+            runner_args: Vec::new(),
+            target_args: Vec::new(),
+            sandbox: SandboxModeArg::Auto,
+            engine: BinaryFuzzEngine::Builtin,
+            time: None,
+            runtime_oracles: crate::runtime_oracles::RuntimeOracleMode::On,
+        };
+        let summary = run_inner(args).expect("binary fuzz run");
+        let ids = summary["findings"].as_array().expect("findings array");
+        assert!(
+            summary.pointer("/runtime_oracles/active") == Some(&json!(true)),
+            "oracles must be active: {summary}"
+        );
+
+        // Find a binary_semantic command-execution finding.
+        let findings_dir = work.join("findings");
+        let mut semantic: Option<PathBuf> = None;
+        for id in ids {
+            let fdir = findings_dir.join(id.as_str().unwrap());
+            let f: Value =
+                serde_json::from_slice(&fs::read(fdir.join("finding.json")).unwrap()).unwrap();
+            if f.get("kind").and_then(Value::as_str) == Some("binary_semantic")
+                && f.get("rule_id").and_then(Value::as_str) == Some("BHF-431")
+            {
+                // The fuzz input reached a shell-execution API on a clean exit.
+                assert_eq!(
+                    f.pointer("/oracle/evidence/controlled")
+                        .and_then(Value::as_str),
+                    Some("true"),
+                    "the command-exec finding must be taint-confirmed: {f}"
+                );
+                semantic = Some(fdir);
+                break;
+            }
+        }
+        let fdir = semantic.unwrap_or_else(|| {
+            panic!("expected a binary_semantic BHF-431 command-exec finding, got {summary}")
+        });
+
+        // The finding replays to a match under the oracles.
+        assert_eq!(
+            replay_binary_finding(&fdir, &bin),
+            0,
+            "semantic finding must replay to a match"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

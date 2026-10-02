@@ -1715,6 +1715,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/runtime_oracles.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/sbom.rs",
       "license": "Apache-2.0"
     },

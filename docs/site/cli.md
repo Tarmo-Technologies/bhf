@@ -252,6 +252,20 @@ sets the child memory limit (`afl-fuzz -m`); it defaults to `none` because QEMU
 mode maps a large virtual address space and a tight cap aborts the campaign.
 Both effective limits are recorded in the run-provenance JSON.
 
+`--runtime-oracles auto|on|off` (on `bhf fuzz` and `bhf binary fuzz`) loads the
+runtrace sink oracles via the `LD_PRELOAD` shim so a **clean-exit** semantic
+violation — a fuzz-controlled command execution, path escape, `dlopen`, network
+egress, or SQL query — is reported even when the target exits zero, not only on a
+crash. `off` is the default (crash-only, prior behaviour); `auto` enables the
+oracles when the shim and platform (Linux) support it and skips otherwise; `on`
+requires them and errors if unavailable. `bhf binary fuzz` publishes each input
+to the shim through an inherited file descriptor so a black-box target still gets
+byte-origin taint; its oracle findings are written as `kind: binary_semantic`
+(with the oracle rule, API, taint evidence, and shim hash) and replay by
+re-confirming the oracle rather than a crash signature. (Interpreted-language
+runtime oracles and QEMU/Wine are out of scope for this flag — it is the native
+Linux layer `bhf auto` already uses.)
+
 `bhf differential --harness-a <A> --harness-b <B> --inputs <DIR>` replays
 each input through two implementations and emits BHF-301 output-divergence
 findings when stdout, exit status, or timeout behavior differs. Differential

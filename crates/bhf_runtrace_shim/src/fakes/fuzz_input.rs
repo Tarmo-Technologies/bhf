@@ -315,11 +315,31 @@ pub fn input_derived_run(haystack: &[u8], min_len: usize) -> Option<(usize, usiz
     if min_len == 0 || haystack.len() < min_len {
         return None;
     }
-    // try_lock, not lock: reachable from sink hooks in a signal handler; skip
-    // (None) on contention rather than deadlock (see taint_span).
-    let guard = LIVE_INPUT.try_lock().ok()?;
-    let live = guard.as_ref()?;
-    let input = &live.bytes;
+    // Prefer the live buffer (`bhf_shim_set_fuzz_input`, the per-iteration channel
+    // a cooperating harness publishes). try_lock, not lock: reachable from sink
+    // hooks in a signal handler; skip rather than deadlock (see taint_span).
+    if let Ok(guard) = LIVE_INPUT.try_lock() {
+        if let Some(live) = guard.as_ref() {
+            // Some(empty) is an explicit empty current input, not "no publication":
+            // never fall through to a stale shared buffer (mirrors `read_into`).
+            if live.bytes.is_empty() {
+                return None;
+            }
+            return input_run_in(haystack, &live.bytes, min_len);
+        }
+    }
+    // Fallback: the mmap'd shared memfd (`BHF_FUZZ_INPUT_FD`). A black-box target
+    // that never calls `bhf_shim_set_fuzz_input` — e.g. one driven by
+    // `bhf binary fuzz` — still gets byte-origin taint from the parent-published
+    // input, exactly as `read_into` already serves it to faked resources.
+    let shared = load()?;
+    let input = unsafe { std::slice::from_raw_parts(shared.ptr, shared.len) };
+    input_run_in(haystack, input, min_len)
+}
+
+/// Find the first `>= min_len` contiguous run of `haystack` that also appears in
+/// `input`, extended forward while the two agree; `(input_offset, run_len)`.
+fn input_run_in(haystack: &[u8], input: &[u8], min_len: usize) -> Option<(usize, usize)> {
     if input.len() < min_len {
         return None;
     }

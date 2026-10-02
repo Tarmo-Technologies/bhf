@@ -12,6 +12,15 @@
   The runner, target args, and full argv are recorded in the finding so
   `bhf replay`/`bhf minimize` reproduce the launch. `--runner` is builtin-engine
   only; `--target-arg` applies to the afl-qemu engine too (#47).
+- `--runtime-oracles auto|on|off` on `bhf fuzz` and `bhf binary fuzz` loads the
+  runtrace sink oracles via the `LD_PRELOAD` shim, so a clean-exit semantic
+  violation (fuzz-controlled command execution, path escape, dlopen, network
+  egress, SQL) becomes a finding even when the target exits zero — not just a
+  crash. `bhf fuzz` reuses the builtin loop's existing oracle + cross-execution
+  taint machinery (previously reachable only through `bhf auto`); `bhf binary
+  fuzz` publishes each input to the shim through an inherited fd so a black-box
+  target gets byte-origin taint, emits `binary_semantic` findings, and replays
+  them by re-confirming the oracle. Off by default (opt-in); Linux-only (#59).
 
 ## 0.2.34 - 2026-10-01
 

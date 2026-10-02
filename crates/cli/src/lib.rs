@@ -70,6 +70,7 @@ mod pack;
 mod policy;
 mod probe_backend;
 mod readiness;
+mod runtime_oracles;
 mod replay;
 mod report;
 mod resource_limits;
