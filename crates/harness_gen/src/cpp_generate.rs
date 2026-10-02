@@ -309,6 +309,22 @@ fn render_cpp_harness(
     let makefile_path = output_dir.join("Makefile");
     fs::write(&main_path, main_cpp)?;
     fs::write(&makefile_path, makefile)?;
+    // Portable-harness export (Mayhem / libFuzzer / AFL++ / honggfuzz). The C++
+    // default binary (`main`) reads argv[1] as a file; the Makefile offers
+    // `make libfuzzer` / `make afl`.
+    crate::portability::write_artifacts(
+        output_dir,
+        &crate::portability::PortabilitySpec {
+            harness_id: harness_id.to_owned(),
+            lane: crate::portability::Lane::Cpp,
+            binary: "main".to_owned(),
+            input: crate::portability::InputDelivery::File,
+            sanitizer: true,
+            libfuzzer_binary: Some("main_libfuzzer".to_owned()),
+            afl_binary: Some("main_afl".to_owned()),
+            crash_on_finding_env: false,
+        },
+    )?;
 
     Ok(GeneratedCppFiles {
         main_cpp: main_path,
@@ -2291,9 +2307,21 @@ mod tests {
             mk.contains("-fsanitize-coverage=trace-pc-guard,trace-cmp"),
             "C++ default recipe missing coverage instrumentation:\n{mk}"
         );
+        // The default recipe carries no libFuzzer; it is a separate opt-in target
+        // (`make libfuzzer`) for external drivers, so `-fsanitize=fuzzer` appears
+        // only in the dedicated LIBFUZZER_CXXFLAGS/main_libfuzzer target.
+        let cxxflags_line = mk
+            .lines()
+            .find(|l| l.trim_start().starts_with("CXXFLAGS ?="))
+            .unwrap_or("");
         assert!(
-            !mk.contains("-fsanitize=fuzzer,address,undefined"),
+            !cxxflags_line.contains("fuzzer"),
             "C++ default recipe must not link libFuzzer's main:\n{mk}"
+        );
+        assert!(
+            mk.contains("libfuzzer: main_libfuzzer")
+                && mk.contains("-fsanitize=fuzzer,address,undefined"),
+            "C++ opt-in libFuzzer target must exist:\n{mk}"
         );
         // The FP-prone UBSan checks are subtracted so callback/vptr-heavy C++
         // libraries fuzz instead of aborting on every input under halt_on_error.
@@ -3365,9 +3393,11 @@ mod tests {
         assert!(main.contains("int LLVMFuzzerTestOneInput"));
         assert!(makefile.contains("ifeq ($(origin CXX), default)"));
         assert!(makefile.contains("CXX = clang++"));
-        assert!(makefile.contains(".PHONY: all afl cov diff syntaxcheck clean"));
+        assert!(makefile.contains(".PHONY: all afl libfuzzer cov diff syntaxcheck clean"));
         assert!(makefile.contains("AFLPP_CXX ?= afl-clang-fast++"));
         assert!(makefile.contains("afl: main_afl"));
+        assert!(makefile.contains("libfuzzer: main_libfuzzer"));
+        assert!(makefile.contains("LIBFUZZER_CXX ?= clang++"));
         assert!(makefile.contains("cov: main_cov"));
         assert!(makefile.contains("COV_CXX ?= clang++"));
         // The two-compiler differential build target.
@@ -5038,6 +5068,141 @@ mod tests {
         assert!(makefile.contains("CXX_STD ?= gnu++20"));
     }
 
+    /// Plain clang++ (no `--gcc-install-dir` plumbing) can link a trivial
+    /// `-fsanitize=fuzzer` C++ program. Gates the C++ libFuzzer e2e so a box
+    /// without the fuzzer runtime (or needing gcc-install-dir flags) skips it.
+    fn cpp_libfuzzer_toolchain_available() -> bool {
+        if clangxx_compile_flags("libfuzzer-probe") != Some(Vec::new()) {
+            return false;
+        }
+        let smoke = std::env::temp_dir().join(format!("bhf-cpp-lf-smoke-{}", std::process::id()));
+        if fs::create_dir_all(&smoke).is_err() {
+            return false;
+        }
+        let src = smoke.join("s.cpp");
+        let wrote = fs::write(
+            &src,
+            "#include <cstddef>\n#include <cstdint>\n\
+             extern \"C\" int LLVMFuzzerTestOneInput(const uint8_t *d, size_t s){(void)d;(void)s;return 0;}\n",
+        );
+        let ok = wrote.is_ok()
+            && Command::new("clang++")
+                .args(["-fsanitize=fuzzer,address", "-O1", "-std=c++17", "-o"])
+                .arg(smoke.join("s"))
+                .arg(&src)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+        fs::remove_dir_all(&smoke).ok();
+        ok
+    }
+
+    /// End-to-end proof of the portable C++ libFuzzer target (#62): the C++
+    /// recipe compiles the C shim `-x c` into its own object and links it (with
+    /// `extern "C"` `bhf_run_one`) into a real libFuzzer binary that ASan-crashes
+    /// on a bad input, without bhf's fork-server driver.
+    #[test]
+    fn make_libfuzzer_builds_a_working_cpp_libfuzzer_binary() {
+        if !cpp_libfuzzer_toolchain_available() {
+            eprintln!("skipping C++ make_libfuzzer e2e: clang++/libFuzzer unavailable");
+            return;
+        }
+        let out = temp_dir("cpp-libfuzzer-e2e");
+        let runtime = runtime_dir();
+        let target_cpp = out.join("target.cpp");
+        fs::write(
+            &target_cpp,
+            "#include <stddef.h>\n#include <stdint.h>\n\
+             int parse(const uint8_t *data, size_t size) {\n\
+             \x20   if (size >= 4 && data[0]=='F' && data[1]=='U' && data[2]=='Z' && data[3]=='Z') {\n\
+             \x20       volatile int *p = nullptr; *p = 1;\n\
+             \x20   }\n\
+             \x20   return 0;\n\
+             }\n",
+        )
+        .unwrap();
+        fs::write(
+            out.join("target.hpp"),
+            "#include <stddef.h>\n#include <stdint.h>\nint parse(const uint8_t *, size_t);\n",
+        )
+        .unwrap();
+        let args = GenerateCppDirectArgs {
+            decoder_limits: Default::default(),
+            force: false,
+            harness_id: "H-CPP-LF-E2E".to_owned(),
+            output_dir: out.clone(),
+            source_path: out.join("target.hpp"),
+            target: cppfunction("parse"),
+            params: vec![
+                CppParameter {
+                    name: "data".to_owned(),
+                    cpp_type: "const uint8_t *".to_owned(),
+                },
+                CppParameter {
+                    name: "size".to_owned(),
+                    cpp_type: "size_t".to_owned(),
+                },
+            ],
+            return_type: "int".to_owned(),
+            target_includes: vec!["target.hpp".to_owned()],
+            target_includes_dirs: vec![out.clone()],
+            target_sources: vec![target_cpp.clone()],
+            compile_flags: Vec::new(),
+            c_runtime_include: runtime,
+            using_namespaces: Vec::new(),
+            result_cleanup: None,
+            constructor_params: Vec::new(),
+            type_defs: Vec::new(),
+            default_constructible_classes: Vec::new(),
+            parameter_constructions: Vec::new(),
+            receiver_class_override: None,
+            factory_plan: None,
+        };
+        generate_cpp_direct_harness(args).unwrap();
+        assert!(out.join("bhf_libfuzzer.c").is_file());
+        assert!(out.join("Mayhemfile").is_file());
+        assert!(out.join("PORTABILITY.md").is_file());
+
+        let build = Command::new("make")
+            .arg("libfuzzer")
+            .current_dir(&out)
+            .output()
+            .expect("run make");
+        assert!(
+            build.status.success(),
+            "make libfuzzer failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr)
+        );
+        let bin = out.join("main_libfuzzer");
+        assert!(bin.is_file(), "main_libfuzzer not produced");
+
+        let ok = out.join("ok.bin");
+        fs::write(&ok, b"hi").unwrap();
+        assert!(
+            Command::new(&bin)
+                .arg(&ok)
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "clean input must not crash"
+        );
+        let crash = out.join("crash.bin");
+        fs::write(&crash, b"FUZZ....").unwrap();
+        let r = Command::new(&bin).arg(&crash).output().unwrap();
+        let err = String::from_utf8_lossy(&r.stderr);
+        assert!(
+            !r.status.success(),
+            "magic input must crash, stderr:\n{err}"
+        );
+        assert!(
+            err.contains("AddressSanitizer") || err.contains("ERROR") || err.contains("SUMMARY"),
+            "expected an ASan/libFuzzer crash report, got:\n{err}"
+        );
+        fs::remove_dir_all(&out).ok();
+    }
+
     #[test]
     fn generate_cpp_direct_harness_decodes_variant_monostate_alternative() {
         let out = temp_dir("cpp-emit-variant-monostate");
@@ -5474,9 +5639,20 @@ mod tests {
             makefile.contains("-fsanitize-coverage=trace-pc-guard,trace-cmp"),
             "passthrough makefile must instrument coverage: {makefile}"
         );
+        // The default build drops libFuzzer's main; libFuzzer is a separate opt-in
+        // target for external drivers, so `-fsanitize=fuzzer` is only in it.
+        let cxxflags_line = makefile
+            .lines()
+            .find(|l| l.trim_start().starts_with("CXXFLAGS ?="))
+            .unwrap_or("");
         assert!(
-            !makefile.contains("-fsanitize=fuzzer,address,undefined"),
-            "passthrough makefile must drop libFuzzer's main: {makefile}"
+            !cxxflags_line.contains("fuzzer"),
+            "passthrough makefile default recipe must drop libFuzzer's main: {makefile}"
+        );
+        assert!(
+            makefile.contains("libfuzzer: main_libfuzzer")
+                && makefile.contains("-fsanitize=fuzzer,address,undefined"),
+            "a dedicated opt-in libFuzzer target must exist: {makefile}"
         );
         assert!(
             makefile.contains("-fsanitize=address,undefined -fno-sanitize=function,vptr,alignment"),

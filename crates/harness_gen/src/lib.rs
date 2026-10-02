@@ -16,6 +16,7 @@ pub mod error;
 pub mod generate;
 pub mod generic_instance;
 pub mod java_generate;
+pub mod portability;
 pub mod registry;
 pub mod rust_decoders;
 pub mod rust_generate;

@@ -71,6 +71,15 @@ FEATURE_TEST_FLAGS ?= -D_GNU_SOURCE -D_DEFAULT_SOURCE
 # build knobs use the AFLPP_ prefix to avoid colliding with it.
 AFLPP_CC ?= afl-clang-fast
 AFLPP_CFLAGS ?= -O1 -g -fsanitize=address,undefined -fno-sanitize=function,vptr,alignment -DBHF_AFL
+# libFuzzer build: a portable, coverage-guided binary for external drivers
+# (libFuzzer itself, Mayhem's coverage-guided mode, honggfuzz's hfuzz-cc). It
+# reuses the harness's stable `bhf_run_one` via the generated `bhf_libfuzzer.c`
+# shim (which supplies `LLVMFuzzerTestOneInput` and a no-op `bhf_target_enter`)
+# and is linked WITHOUT bhf's own fork-server driver (`bhf_driver.o`) so that
+# `-fsanitize=fuzzer` provides `main` and the coverage runtime. clang only —
+# gcc has no libFuzzer — so this stays clang regardless of the project default.
+LIBFUZZER_CC ?= clang
+LIBFUZZER_CFLAGS ?= -O1 -g -fno-omit-frame-pointer -fsanitize=fuzzer,address,undefined -fno-sanitize=function,vptr,alignment
 # MemorySanitizer build: finds reads of UNINITIALIZED memory (CWE-457/908) — a
 # whole bug class ASan/UBSan miss. MSan is mutually exclusive with ASan, so it is a
 # separate binary that `auto` replays the ASan pass's corpus through (no new fuzz
@@ -128,7 +137,7 @@ ifdef BHF_CONTEXT_PREPARE_FAILED
 $(error $(BHF_CONTEXT_PREPARE_FAILED))
 endif
 
-.PHONY: all afl msan tsan cov prov diff syntaxcheck clean
+.PHONY: all afl libfuzzer msan tsan cov prov diff syntaxcheck clean
 all: main
 
 # Target sources stay OUT of the prerequisites and live only in the recipe: an
@@ -157,6 +166,16 @@ afl: main_afl
 
 main_afl: main.c $(CONTEXT_AFL_OBJECTS) $(REPAIR_CONTEXT_AFL_OBJECTS)
 	$(AFLPP_CC) $(AFLPP_CFLAGS) $(SECTION_FLAGS) $(C_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(C_STD_FLAG) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) -o $@ main.c{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_AFL_OBJECTS) $(REPAIR_CONTEXT_AFL_OBJECTS) $(AUTO_EXTRA_SOURCES) $(SECTION_LDFLAGS) $(AUTO_EXTRA_LDFLAGS)
+
+# Portable libFuzzer binary (also drivable by Mayhem coverage-guided / honggfuzz).
+# Compiled with -DBHF_EXTERNAL_DRIVER so main.c emits only `bhf_run_one` (no bhf
+# `main`, no bhf coverage runtime); bhf_libfuzzer.c adds `LLVMFuzzerTestOneInput`
+# and a no-op `bhf_target_enter`; `-fsanitize=fuzzer` supplies `main` + coverage.
+# bhf_driver.o is intentionally NOT linked. See PORTABILITY.md.
+libfuzzer: main_libfuzzer
+
+main_libfuzzer: main.c bhf_libfuzzer.c $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS)
+	$(LIBFUZZER_CC) $(LIBFUZZER_CFLAGS) $(SECTION_FLAGS) $(C_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(C_STD_FLAG) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) -DBHF_EXTERNAL_DRIVER -o $@ main.c bhf_libfuzzer.c{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS) $(AUTO_EXTRA_SOURCES) $(SECTION_LDFLAGS) $(AUTO_EXTRA_LDFLAGS)
 
 msan: main_msan
 
@@ -190,5 +209,5 @@ main_prov: main.c bhf_driver.o $(CONTEXT_PROV_OBJECTS) $(REPAIR_CONTEXT_PROV_OBJ
 	$(CC) $(CFLAGS) $(SECTION_FLAGS) $(C_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(C_STD_FLAG) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) -DBHF_EXTERNAL_DRIVER -o $@ main.c{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_PROV_OBJECTS) $(REPAIR_CONTEXT_PROV_OBJECTS) $(AUTO_PROV_SOURCES) bhf_driver.o $(SECTION_LDFLAGS) $(AUTO_EXTRA_LDFLAGS)
 
 clean:
-	rm -f main main_afl main_msan main_tsan main_cov main_prov main_diff bhf_driver.o
+	rm -f main main_afl main_libfuzzer main_msan main_tsan main_cov main_prov main_diff bhf_driver.o
 	rm -rf context_objs repair_context_objs

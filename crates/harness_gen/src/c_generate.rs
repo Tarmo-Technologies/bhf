@@ -389,12 +389,37 @@ pub fn generate_c_direct_harness(
     let makefile_path = args.output_dir.join("Makefile");
     fs::write(&main_path, main_c)?;
     fs::write(&makefile_path, makefile)?;
+    write_c_portability_artifacts(&args.output_dir, &args.harness_id)?;
 
     Ok(GeneratedCFiles {
         main_c: main_path,
         makefile: makefile_path,
         harness_id: args.harness_id,
     })
+}
+
+/// Emit the Mayhemfile, PORTABILITY.md, and libFuzzer shim beside a generated C
+/// harness so it can be driven by Mayhem, libFuzzer, AFL++, or honggfuzz. The C
+/// default binary (`main`) reads `argv[1]` as a file (ASan-instrumented), and the
+/// Makefile offers `make libfuzzer`/`make afl`.
+fn write_c_portability_artifacts(
+    output_dir: &std::path::Path,
+    harness_id: &str,
+) -> Result<(), HarnessGenError> {
+    crate::portability::write_artifacts(
+        output_dir,
+        &crate::portability::PortabilitySpec {
+            harness_id: harness_id.to_owned(),
+            lane: crate::portability::Lane::C,
+            binary: "main".to_owned(),
+            input: crate::portability::InputDelivery::File,
+            sanitizer: true,
+            libfuzzer_binary: Some("main_libfuzzer".to_owned()),
+            afl_binary: Some("main_afl".to_owned()),
+            crash_on_finding_env: false,
+        },
+    )?;
+    Ok(())
 }
 
 /// Sidecar naming the op program's geometry, written next to the generated
@@ -422,6 +447,7 @@ pub fn generate_c_sequence_harness(
     let makefile_path = args.output_dir.join("Makefile");
     fs::write(&main_path, main_c)?;
     fs::write(&makefile_path, makefile)?;
+    write_c_portability_artifacts(&args.output_dir, &args.harness_id)?;
     // Describe the op program's geometry so the engine can build a
     // structure-aware mutation layout for an input of any length. Without it
     // the sequence mutator has nothing to describe, and every op program is
@@ -4875,6 +4901,139 @@ mod tests {
         }
     }
 
+    /// A working clang + libFuzzer runtime + GNU make. The libFuzzer runtime
+    /// (compiler-rt `fuzzer`) is not present on every box, so the e2e test below
+    /// skips cleanly when a trivial `-fsanitize=fuzzer` link fails.
+    fn libfuzzer_toolchain_available() -> bool {
+        let smoke = std::env::temp_dir().join(format!("bhf-lf-smoke-{}", std::process::id()));
+        if fs::create_dir_all(&smoke).is_err() {
+            return false;
+        }
+        let src = smoke.join("s.c");
+        let wrote = fs::write(
+            &src,
+            "#include <stddef.h>\n#include <stdint.h>\n\
+             int LLVMFuzzerTestOneInput(const uint8_t *d, size_t s){(void)d;(void)s;return 0;}\n",
+        );
+        let make_ok = std::process::Command::new("make")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        let clang_ok = wrote.is_ok()
+            && std::process::Command::new("clang")
+                .args(["-fsanitize=fuzzer,address", "-O1", "-o"])
+                .arg(smoke.join("s"))
+                .arg(&src)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+        fs::remove_dir_all(&smoke).ok();
+        make_ok && clang_ok
+    }
+
+    /// End-to-end proof of the portable libFuzzer target (#62): a generated C
+    /// harness built with `make libfuzzer` is a real libFuzzer binary that drives
+    /// the target through bhf's `bhf_run_one` (via the emitted `bhf_libfuzzer.c`
+    /// shim) and crashes under ASan on a bad input — with bhf's own fork-server
+    /// driver intentionally not linked.
+    #[test]
+    fn make_libfuzzer_builds_a_working_libfuzzer_binary() {
+        if !libfuzzer_toolchain_available() {
+            eprintln!("skipping make_libfuzzer e2e: clang+libFuzzer+make unavailable");
+            return;
+        }
+        let out = temp_dir("libfuzzer_e2e");
+        let c_runtime = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../c_runtime")
+            .canonicalize()
+            .expect("c_runtime dir");
+        // A real target with a planted ASan crash on the 4-byte magic "FUZZ".
+        let target_c = out.join("target.c");
+        fs::write(
+            &target_c,
+            "#include <stddef.h>\n#include <stdint.h>\n\
+             int parse(const uint8_t *data, size_t size) {\n\
+             \x20   if (size >= 4 && data[0]=='F' && data[1]=='U' && data[2]=='Z' && data[3]=='Z') {\n\
+             \x20       volatile int *p = 0; *p = 1; /* null deref -> ASan */\n\
+             \x20   }\n\
+             \x20   return 0;\n\
+             }\n",
+        )
+        .unwrap();
+        fs::write(
+            out.join("target.h"),
+            "#include <stddef.h>\n#include <stdint.h>\nint parse(const uint8_t *, size_t);\n",
+        )
+        .unwrap();
+
+        let mut args = direct_args("libfuzzer_e2e", out.clone());
+        args.target = cfunction("parse");
+        args.params = vec![
+            CParameter {
+                name: "data".to_owned(),
+                c_type: "const uint8_t *".to_owned(),
+            },
+            CParameter {
+                name: "size".to_owned(),
+                c_type: "size_t".to_owned(),
+            },
+        ];
+        args.target_includes = vec!["target.h".to_owned()];
+        args.target_includes_dirs = vec![out.clone()];
+        args.target_sources = vec![target_c.clone()];
+        args.c_runtime_include = c_runtime;
+        generate_c_direct_harness(args).unwrap();
+
+        // The portability artifacts are emitted beside the harness.
+        assert!(out.join("bhf_libfuzzer.c").is_file());
+        assert!(out.join("Mayhemfile").is_file());
+        assert!(out.join("PORTABILITY.md").is_file());
+
+        let build = std::process::Command::new("make")
+            .arg("libfuzzer")
+            .current_dir(&out)
+            .output()
+            .expect("run make");
+        assert!(
+            build.status.success(),
+            "make libfuzzer failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr)
+        );
+        let bin = out.join("main_libfuzzer");
+        assert!(bin.is_file(), "main_libfuzzer not produced");
+
+        // A clean input runs the target once and exits 0.
+        let ok = out.join("ok.bin");
+        fs::write(&ok, b"hi").unwrap();
+        let r = std::process::Command::new(&bin).arg(&ok).output().unwrap();
+        assert!(
+            r.status.success(),
+            "clean input must not crash: {}",
+            String::from_utf8_lossy(&r.stderr)
+        );
+
+        // The magic input crashes under ASan — libFuzzer really drove bhf_run_one.
+        let crash = out.join("crash.bin");
+        fs::write(&crash, b"FUZZ....").unwrap();
+        let r = std::process::Command::new(&bin)
+            .arg(&crash)
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&r.stderr);
+        assert!(
+            !r.status.success(),
+            "magic input must crash, stderr:\n{err}"
+        );
+        assert!(
+            err.contains("AddressSanitizer") || err.contains("ERROR") || err.contains("SUMMARY"),
+            "expected an ASan/libFuzzer crash report, got:\n{err}"
+        );
+
+        fs::remove_dir_all(&out).ok();
+    }
+
     /// HDF-5 deliverable 2: a polled-register reader harness must fabricate the
     /// peripheral read accessor(s) and drive a fuzz-controlled SEQUENCE of reads —
     /// each call draws the NEXT value from the fuzz input — so a value-gated branch
@@ -6152,7 +6311,25 @@ mod tests {
         // #399: the harness ships its own driver main; the default build uses
         // trace-pc-guard coverage and does NOT link libFuzzer's own main.
         assert!(mk.contains("-fsanitize-coverage=trace-pc-guard"));
-        assert!(!mk.contains("fsanitize=fuzzer"));
+        // The DEFAULT build's compile flags carry no libFuzzer; libFuzzer is a
+        // separate opt-in target (`make libfuzzer`) for external drivers
+        // (Mayhem/libFuzzer/honggfuzz), so `-fsanitize=fuzzer` appears only there.
+        let cflags_line = mk
+            .lines()
+            .find(|l| l.trim_start().starts_with("CFLAGS ?="))
+            .unwrap_or("");
+        assert!(
+            !cflags_line.contains("fuzzer"),
+            "default CFLAGS must not enable libFuzzer:\n{mk}"
+        );
+        assert!(
+            mk.contains("libfuzzer: main_libfuzzer"),
+            "opt-in libFuzzer target must exist:\n{mk}"
+        );
+        assert!(
+            mk.contains("-fsanitize=fuzzer,address,undefined"),
+            "libFuzzer target must link libFuzzer:\n{mk}"
+        );
         // UBSan runs with halt_on_error under the engine, so the type/alignment
         // checks that fire on legitimate-but-UB code (typed callbacks called
         // through a generic fn-pointer, unaligned binary-parser reads) abort on
@@ -6357,11 +6534,20 @@ mod tests {
             main.find("#undef getenv") < main.find("getenv(\"BHF_COV_SHM\")"),
             "target-header getenv redirects must be cleared before the coverage runtime: {main}"
         );
-        // The driver build must NOT link libFuzzer's own main, and must enable the
-        // coverage instrumentation the runtime consumes.
+        // The DEFAULT driver build must NOT link libFuzzer's own main (it ships its
+        // own driver); libFuzzer is a separate opt-in target for external drivers.
+        let cflags_line = makefile
+            .lines()
+            .find(|l| l.trim_start().starts_with("CFLAGS ?="))
+            .unwrap_or("");
         assert!(
-            !makefile.contains("-fsanitize=fuzzer,"),
-            "passthrough build must drop the -fsanitize=fuzzer link flag: {makefile}"
+            !cflags_line.contains("fuzzer"),
+            "default CFLAGS must not enable libFuzzer: {makefile}"
+        );
+        assert!(
+            makefile.contains("libfuzzer: main_libfuzzer")
+                && makefile.contains("-fsanitize=fuzzer,address,undefined"),
+            "a dedicated opt-in libFuzzer target must exist: {makefile}"
         );
         assert!(
             makefile.contains("-fsanitize-coverage=trace-pc-guard"),
