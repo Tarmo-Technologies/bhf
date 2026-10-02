@@ -42,9 +42,9 @@ Point `auto` at a source tree — including code that does not build:
 
 That discovers and ranks fuzzable functions, generates typed harnesses and stubs, recovers the
 build context (`compile_commands.json`, CMake/Meson/Ninja/Visual Studio, or any
-`--build-command`), fuzzes each target with a coverage-guided engine, and writes the
-impact-ordered finding handoff at `bhf_work/FINDINGS.md`, its CSV index beside it,
-and campaign/coverage reports under `bhf_work/auto/`.
+`--build-command`), fuzzes each target with a coverage-guided engine, and writes
+every finding into `bhf_work/results/` (see below), with campaign/coverage
+reports under `bhf_work/auto/`.
 
 ### Or run it in Docker
 
@@ -98,9 +98,25 @@ bhf auto /path/to/source-tree \
 | `--sloc sloc.txt` | Per-language SLOC breakdown (`.json` for JSON). |
 | `--debug` | Backtrace on a bhf-internal panic; enriches the bug report. |
 
-Read `bhf_work/FINDINGS.md` first. It puts the impact-ordered findings,
+### Where results go
+
+Every command that finds something writes into one directory, `<work-dir>/results/`
+(default `bhf_work/results/`), and rebuilds its index when it finishes:
+
+| Path | What |
+|---|---|
+| `results/INDEX.md` | Start here: summary, then every finding grouped by root cause |
+| `results/findings.json` | Everything, machine-readable (`bhf.findings.v1`, schema in `schemas/`) |
+| `results/findings.csv` / `findings.sarif` | Spreadsheet / code-scanning views |
+| `results/findings/<ID>/` | Evidence: `finding.json`, `testcase.bin`, `min_testcase.bin`, `sanitizer.log`, `replay.py` |
+| `results/static/`, `results/sbom/` | Native `static-scan` and `sbom` reports |
+
+`bhf report` rebuilds the index on demand. Work dirs from bhf ≤ 0.2.x are migrated
+automatically the first time a command opens them.
+
+Read `results/INDEX.md` first. It puts the impact-ordered findings,
 locations, confidence, evidence links, suggested fixes, and replay commands in one
-place; `findings.csv` is the top-level machine-readable index. Then read
+place; `results/findings.csv` is the machine-readable index. Then read
 `auto/summary.txt` for **built+fuzzed**, **static-only**, **skipped**, and
 **forced** coverage caveats.
 

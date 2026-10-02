@@ -2427,6 +2427,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/results_e2e.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/sbom_assurance_cli.rs",
       "license": "Apache-2.0"
     },
