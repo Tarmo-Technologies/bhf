@@ -1675,6 +1675,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/project.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/readiness.rs",
       "license": "Apache-2.0"
     },
@@ -2291,6 +2295,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/fixtures/project_min/manifest.toml",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/fork_server.rs",
       "license": "Apache-2.0"
     },
@@ -2396,6 +2404,10 @@
     },
     {
       "path": "crates/cli/tests/pack_auth_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/project_cli.rs",
       "license": "Apache-2.0"
     },
     {
@@ -3216,6 +3228,62 @@
     },
     {
       "path": "crates/probe_gnat_actions/src/main.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/project_profile/Cargo.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/project_profile/src/dictionary.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/project_profile/src/error.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/project_profile/src/hash.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/project_profile/src/interpolate.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/project_profile/src/lib.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/project_profile/src/lower.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/project_profile/src/paths.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/project_profile/src/provenance.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/project_profile/src/schema.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/project_profile/src/validate.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/project_profile/src/version_req.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/project_profile/src/warning.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/project_profile/tests/manifest.rs",
       "license": "Apache-2.0"
     },
     {

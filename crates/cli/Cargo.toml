@@ -69,6 +69,7 @@ multicore_fuzz = { path = "../multicore_fuzz" }
 num_cpus = "1"
 go_parser = { path = "../go_parser" }
 perl_parser = { path = "../perl_parser" }
+project_profile = { path = "../project_profile" }
 project_synth = { path = "../project_synth" }
 python_parser = { path = "../python_parser" }
 regex.workspace = true

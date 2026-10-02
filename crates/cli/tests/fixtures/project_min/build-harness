@@ -1,0 +1,7 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# Portable, toolchain-free "build": prove the trusted build command ran by
+# dropping a sentinel next to the manifest. The harness binary itself is the
+# prebuilt executable the manifest's `binary` points at (staged by the test), so
+# no compiler is needed on the default CI runner.
+: > .build-sentinel

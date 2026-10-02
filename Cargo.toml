@@ -44,6 +44,7 @@ members = [
     "crates/go_parser",
     "crates/perl_parser",
     "crates/probe_gnat_actions",
+    "crates/project_profile",
     "crates/project_synth",
     "crates/python_parser",
     "crates/replay_min",

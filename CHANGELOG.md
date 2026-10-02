@@ -59,6 +59,27 @@
   target exit, and `bhf replay`/`minimize` re-evaluate the oracle rather than a
   crash signature — expressing application-specific security policy the built-in
   sink oracles cannot (#55).
+- `bhf project <validate|list|run>`: a versioned, explicitly-loaded external
+  project/target-profile manifest (`bhf.project.v1`, TOML) kept outside the bhf
+  source tree. One manifest composes a private harness (source or prebuilt
+  binary) with its corpora, layered dictionaries (merged in declared order, not
+  first-match), grammar, and per-target launch settings under stable target ids.
+  `validate` resolves and hashes every asset and type-checks each target (missing
+  assets, duplicate ids, unsupported schema/bhf version, invalid relative paths,
+  unsafe secret interpolation) without running a campaign or the build command;
+  `run` materializes an isolated work dir and reuses the existing
+  `builtin`/`afl++` (`fuzz`) and `binary` (`binary fuzz`) engines, records
+  provenance (`results/project.json`: project id/version/schema, manifest
+  SHA-256, resolved+redacted launch, and every asset's SHA-256), and stamps a
+  `project-provenance.json` sidecar onto each finding and the native run-summary
+  dir so findings/replay/minimization retain project/target identity. Paths
+  resolve relative to the manifest dir (`--allow-external-paths` to opt out of
+  the `..`/absolute guard); `${env:NAME}`/`${secret:NAME}` env handles resolve at
+  launch with only the handle recorded in provenance. Explicit `--manifest` is
+  the trust boundary (no auto-discovery; `--skip-build` reuses a prebuilt
+  binary). Forward-looking fields (`runner`, `runner-args`, `target-args`,
+  `arguments`, `runtime-oracles`, `postcondition`) are parsed but rejected
+  fail-closed with a "requires feature #NN" diagnostic (#56).
 
 ### Changed
 - With no `--findings`/`--out`, `bhf report` rebuilds `bhf_work/results/`. `--junit`/

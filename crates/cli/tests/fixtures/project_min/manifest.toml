@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: Apache-2.0
+# A minimal, consumer-agnostic bhf.project.v1 manifest with two builtin targets
+# that have DISTINCT corpora and DISTINCT (layered) dictionaries. The harness is
+# a prebuilt executable staged by the test at `prebuilt/harness`; the trusted
+# build command is a portable, toolchain-free sentinel drop (no compiler).
+schema = "bhf.project.v1"
+
+[project]
+id = "demo-fuzz"
+version = "1.0.0"
+requires-bhf = ">=0.2.0"
+
+[[target]]
+id = "alpha"
+engine = "builtin"
+binary = "prebuilt/harness"
+build-command = ["sh", "build-harness"]
+seeds = ["corpus/alpha"]
+dictionaries = ["dict/base.dict", "dict/overlay.dict"]
+grammar = "grammar/a.json"
+
+[[target]]
+id = "beta"
+engine = "builtin"
+binary = "prebuilt/harness"
+build-command = ["sh", "build-harness"]
+seeds = ["corpus/beta"]
+dictionaries = ["dict/beta.dict"]

@@ -100,12 +100,13 @@ fn collect_auditable_files(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) ->
             // Generated output and ignored internal design notes are not repo
             // source. They may exist in a developer checkout but not in CI, so
             // including them would make the checked-in manifest nondeterministic.
-            if matches!(file_name.as_ref(), ".git" | "target" | "bhf_work" | "dist")
-                || path.strip_prefix(root).is_ok_and(|relative| {
-                    relative == Path::new("docs/superpowers")
-                        || relative == Path::new("benchmarks/engine-comparison/results")
-                })
-            {
+            if matches!(
+                file_name.as_ref(),
+                ".git" | ".claude" | "target" | "bhf_work" | "dist"
+            ) || path.strip_prefix(root).is_ok_and(|relative| {
+                relative == Path::new("docs/superpowers")
+                    || relative == Path::new("benchmarks/engine-comparison/results")
+            }) {
                 continue;
             }
             collect_auditable_files(root, &path, files)?;

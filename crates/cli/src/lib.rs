@@ -69,6 +69,7 @@ mod model;
 mod pack;
 mod policy;
 mod probe_backend;
+mod project;
 mod readiness;
 mod runtime_oracles;
 mod replay;
@@ -204,6 +205,10 @@ enum Command {
     // ── Binaries: no-source / firmware analysis ─────────────────────────────
     /// No-source analysis of compiled binaries & firmware: scan, adapter, fuzz (CVE/SBOM, Rizin/Ghidra/angr, black-box)
     Binary(BinaryArgs),
+
+    // ── External project/target profiles ────────────────────────────────────
+    /// Define, validate, and run an external project/target-profile manifest (bhf.project.v1) kept outside the source tree: validate, list, run
+    Project(project::ProjectArgs),
 
     // ── Supply chain & static analysis ──────────────────────────────────────
     /// Generate an SBOM from source/manifest/binaries with CVE matching and vulnerability gating
@@ -372,6 +377,10 @@ where
                 )
             }
         },
+        // `bhf project` manages its own isolated work dir, provenance, and
+        // results layout (via `project::run`), so it is NOT wrapped in the
+        // `with_results` producer bracket.
+        Some(Command::Project(project_args)) => project::run(project_args),
         Some(Command::List(list)) => match list.command {
             ListCommand::Targets(args) => match list_targets::run(args) {
                 Ok(()) => 0,

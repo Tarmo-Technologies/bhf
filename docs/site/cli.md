@@ -14,6 +14,7 @@ checks.
 | Build and instrumentation support | `stub`, `instrument`, `fake-corba` |
 | Corpus and crash triage | `corpus`, `minimize`, `replay`, `capsule`, `verify-poc`, `env-capsule`, `differential`, `cmplog`, `explain`, `cartography` |
 | Source-unavailable binaries | `binary` (`scan`, `adapter`, `fuzz`) |
+| External project profiles | `project` (`validate`, `list`, `run`) |
 | Static and supply chain | `static-scan`, `sloc`, `sbom`, `license-audit`, `extract-state-machines` |
 | Rules and governance | `rules`, `policy`, `audit`, `pack`, `export` |
 | Optional assistance | `llm` (`status`, `test`, `prompt`, `assist`) |
@@ -769,6 +770,81 @@ probe and any subprocess, including GPL research tooling (Libadalang, GnatFuzz,
 GNATcoverage, PolyORB) on top of the `external-tools` set. Use it only in a lab
 where running arbitrary external analysis tools is acceptable; it never relaxes
 the link-license allow-list (linked code still must be Apache-2.0/MIT/BSD).
+
+## External Project Profiles
+
+`bhf project` defines, validates, and runs an external project/target-profile
+manifest (`bhf.project.v1`, TOML) kept entirely **outside** the bhf source tree.
+One manifest composes a private harness (source or prebuilt binary) with its
+corpora, layered dictionaries, grammar, and launch settings under one or more
+stable target ids, so a private campaign is reproducible without vendoring it
+into bhf. `run` reuses the existing engines — `builtin`/`afl++` go through the
+`bhf fuzz` lane, `binary` through the `bhf binary fuzz` lane — and adds no new
+execution path.
+
+```sh
+# Type-check every target: resolve + hash each asset, catch missing assets,
+# duplicate ids, unsupported schema/bhf version, invalid relative paths, and
+# unsafe secret interpolation — without running a campaign or the build command.
+bhf project validate --manifest path/to/bhf-project.toml
+
+# List the declared targets with their engine, input mode, and asset summary.
+bhf project list --manifest path/to/bhf-project.toml
+
+# Materialize an isolated work dir, resolve + hash assets, write provenance, and
+# run one target. The build command runs by default (explicit load = trusted);
+# --skip-build reuses a prebuilt binary.
+bhf project run --manifest path/to/bhf-project.toml --target alpha
+```
+
+Every path in the manifest is resolved relative to the manifest's own directory.
+By default a path may not escape that directory (`..`) or be absolute; pass
+`--allow-external-paths` to opt in. `--json` emits a machine-readable
+validation/provenance report on any of the three subcommands.
+
+**Trust boundary.** The manifest is only ever loaded through an explicit
+`--manifest` path — there is no auto-discovery. `validate` and `list` never
+execute a target's `build-command`; only `run` does, because naming the manifest
+is the operator's act of trust. `--skip-build` reuses a prebuilt binary and runs
+nothing.
+
+**Provenance.** `run` writes `results/project.json` (the project id, version,
+schema, manifest SHA-256, resolved+redacted launch, and every asset's SHA-256)
+and stamps a `project-provenance.json` sidecar onto each finding and the native
+run-summary directory, so findings, replay, and minimization retain
+project/target identity for importers (SARIF / vulnerability-management tools).
+Secret env values are resolved from `${secret:NAME}` → `BHF_SECRET_<NAME>` and
+`${env:NAME}` → the process environment; only the **handle** is ever recorded —
+the resolved value never appears in provenance.
+
+**Example manifest.**
+
+```toml
+schema = "bhf.project.v1"
+
+[project]
+id = "my-project"
+version = "1.0.0"
+requires-bhf = ">=0.2.0"
+
+[[target]]
+id = "parser"
+engine = "builtin"                       # builtin | afl++ | binary
+binary = "prebuilt/harness"              # resolved relative to this manifest
+build-command = ["make", "harness"]      # trusted; run only by `bhf project run`
+seeds = ["corpus/parser"]                # files and/or directories
+dictionaries = ["dict/base.dict", "dict/parser.dict"]  # layered, merged in order
+grammar = "grammar/parser.json"
+
+[target.env]
+PROFILE = "release"
+TOKEN = "${secret:API_TOKEN}"            # resolved from BHF_SECRET_API_TOKEN, redacted
+```
+
+Forward-looking fields that belong to engine features not yet available
+(`runner`, `runner-args`, `target-args`, `arguments`, `runtime-oracles`,
+`postcondition`) parse but are **rejected** with a "requires feature #NN"
+diagnostic (fail-closed), so a manifest stays stable as those features land.
 
 ## Release Commands
 

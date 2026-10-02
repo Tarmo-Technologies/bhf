@@ -205,6 +205,7 @@ dependencies = [
  "multicore_fuzz",
  "num_cpus",
  "perl_parser",
+ "project_profile",
  "project_synth",
  "python_parser",
  "rayon",
@@ -1690,6 +1691,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "project_profile"
+version = "0.2.34"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "toml",
 ]
 
 [[package]]
