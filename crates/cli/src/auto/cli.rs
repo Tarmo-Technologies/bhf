@@ -1198,6 +1198,18 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     // candidate count is printed under it.
     drop(discovery_ticker);
     console.println(&format!("  discovered {} candidate(s)", candidates.len()));
+    // A large tree analyzes and fuzzes every candidate by default, with no outer
+    // wall-clock cap and a minutes-long, mostly silent indexing phase — so point
+    // the operator at the knobs that bound the run before they think it hung.
+    if candidates.len() > 150 && args.max_targets.is_none() && args.campaign_time.is_none() {
+        bhfeprintln!(
+            "bhf auto: {} candidates discovered; by default every one is analyzed and fuzzed with \
+             no outer time cap, which can take several minutes on a large tree. Bound it with \
+             --max-targets N (inspect at most N) and/or --campaign-time SECONDS (total fuzz \
+             budget); raise --jobs for more build+fuzz concurrency.",
+            candidates.len()
+        );
+    }
     // #102: if any files were dropped during discovery (read/decode/parse
     // failures), say so on the console — bounded and grouped — so a parser
     // regression on a large tree is visible immediately, not just in run.json.
@@ -1358,6 +1370,15 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         bhfeprintln!(
             "bhf auto: resolving cross-dir headers from project root {}",
             header_root.display()
+        );
+    }
+    // decl_index over a large tree is the longest silent phase (tens of seconds
+    // on a big single-header C/C++ project); announce it so the run doesn't look
+    // wedged while it indexes.
+    if candidates.len() > 150 {
+        bhfeprintln!(
+            "bhf auto: indexing declarations across {} candidate(s) (large tree; this can take a minute)…",
+            candidates.len()
         );
     }
     let _tix = std::time::Instant::now();

@@ -174,6 +174,19 @@ gaps rather than silently fabricated successes.
 
 ### Scaling to large trees
 
+Even a modestly sized project can discover hundreds of candidates — a single
+large header (a header-only C/C++ library is the common case) expands into
+hundreds of fuzzable signatures. The default sweep analyzes and fuzzes **every**
+discovered candidate with **no** outer wall-clock cap, and its declaration-index
+phase can run for tens of seconds with little output, so a large run can look
+stuck when it is simply working. `auto` prints a hint naming the bounding flags
+once a tree exceeds a few hundred candidates; reach for them interactively, not
+only in CI:
+
+- `--max-targets N` — inspect only the top-N ranked candidates.
+- `--campaign-time SECONDS` — cap total sweep wall-clock (add `--min-target-time` to split the budget evenly instead of a hard cutoff).
+- `--jobs N` — build and fuzz N candidates concurrently.
+
 The default sweep — every discovered target, the full three-pass cascade, one
 target at a time — is the wrong shape for a tree with tens of thousands of
 candidates. The flags above compose into a bounded triage sweep:
@@ -536,6 +549,17 @@ restarting from the tiny built-in seeds.
 
 ## Limitations
 
+- **Targets bhf can't drive are skipped, not errors.** A candidate whose input
+  type has no byte-buffer decoder (an opaque nested array, an in-crate
+  trait-impl method, a type needing an offline-unavailable external SDK), whose
+  generated harness does not compile, or whose own build fails is logged and
+  skipped while the sweep continues. Run with `--debug` to capture these in
+  `<work>/auto/bug-report.json` — `issue_count` plus a per-issue `category`
+  (`unsupported-type`, `codegen-defect`, `failed-build`, `target-not-reached`, …).
+  A non-zero `issue_count` is **informational**: it counts candidates bhf could
+  not fully drive, not a run failure. `--debug` also sets `RUST_BACKTRACE` and
+  keeps going past a file that would otherwise crash bhf itself, enriching the
+  report so the bug can be fixed offline.
 - **Stub soundness.** A blind `void log_warn(void)` stub compiles but the
   call site may pass arguments the stub ignores. Fine for fuzzing, not for
   verification. When *every* symbol the harness calls is blind-stubbed the run
