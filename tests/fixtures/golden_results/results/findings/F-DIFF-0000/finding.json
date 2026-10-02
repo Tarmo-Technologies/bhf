@@ -1,0 +1,13 @@
+{
+  "classification": "divergence",
+  "created_at": "2026-10-01T11:40:00Z",
+  "exception": {
+    "message": "stdout bytes differ",
+    "name": "OUTPUT_DIVERGENCE"
+  },
+  "finding_kind": "differential",
+  "id": "F-DIFF-0000",
+  "rule_id": "BHF-301",
+  "schema_version": "bhf.finding.v1",
+  "signature": "dd"
+}

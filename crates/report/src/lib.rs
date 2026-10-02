@@ -181,9 +181,9 @@ pub struct FindingReport {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReportError {
-    #[error("I/O error during report generation")]
+    #[error("I/O error during report generation: {0}")]
     Io(#[from] std::io::Error),
-    #[error("JSON error during report generation")]
+    #[error("JSON error during report generation: {0}")]
     Json(#[from] serde_json::Error),
     #[error("findings directory does not exist: {}", path.display())]
     MissingFindingsDir { path: PathBuf },
@@ -219,7 +219,11 @@ pub fn write_reports(options: ReportOptions) -> Result<ReportSummary, ReportErro
         .emit_csv
         .then(|| options.out_dir.join(format!("{stem}.csv")));
 
-    fs::write(&json_path, serde_json::to_vec_pretty(&document)?)?;
+    // Stream the two large documents straight to their files rather than
+    // serializing each into a multi-GB `Vec<u8>` first: at ~20k findings the
+    // intermediate byte buffer was a major contributor to peak RSS. Output is
+    // byte-for-byte identical to the previous `to_vec_pretty` + `fs::write`.
+    write_json_pretty(&json_path, &document)?;
     fs::write(
         &markdown_path,
         render_markdown_report_with(&document, &options),
@@ -227,7 +231,7 @@ pub fn write_reports(options: ReportOptions) -> Result<ReportSummary, ReportErro
     if let Some(path) = &sarif_path {
         let sarif = render_sarif_report(&document);
         validate_sarif_report(&sarif)?;
-        fs::write(path, serde_json::to_vec_pretty(&sarif)?)?;
+        write_json_pretty(path, &sarif)?;
     }
     if let Some(path) = &junit_path {
         fs::write(path, render_junit_report(&document))?;
@@ -245,6 +249,17 @@ pub fn write_reports(options: ReportOptions) -> Result<ReportSummary, ReportErro
         junit_path,
         csv_path,
     })
+}
+
+/// Serialize `value` as pretty JSON straight to `path` through a buffered
+/// writer, so the whole serialized document is streamed to disk instead of
+/// first being collected into a `Vec<u8>`. Output is identical to
+/// `fs::write(path, serde_json::to_vec_pretty(value)?)`.
+fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<(), ReportError> {
+    let mut writer = std::io::BufWriter::new(fs::File::create(path)?);
+    serde_json::to_writer_pretty(&mut writer, value)?;
+    writer.flush()?;
+    Ok(())
 }
 
 /// Render the findings as RFC 4180 CSV, **one row per root-cause issue** (not per
@@ -379,6 +394,20 @@ fn csv_escape(field: &str) -> String {
 pub fn build_report(options: &ReportOptions) -> Result<ReportDocument, ReportError> {
     let confidence_model = load_confidence_model(options.confidence_model_path.as_deref())?;
     let findings = load_findings_with_model(&options.findings_dir, confidence_model.as_ref())?;
+    Ok(document_from_findings(
+        &options.run_id,
+        &options.findings_dir,
+        findings,
+    ))
+}
+
+/// Assemble a [`ReportDocument`] from already-loaded findings (shared by
+/// [`build_report`] and the results rebuild).
+pub fn document_from_findings(
+    run_id: &str,
+    findings_dir: &Path,
+    findings: Vec<FindingReport>,
+) -> ReportDocument {
     let actionability_counts =
         actionability::aggregate_counts(findings.iter().map(|finding| &finding.actionability));
     let counts = CountReport {
@@ -388,18 +417,17 @@ pub fn build_report(options: &ReportOptions) -> Result<ReportDocument, ReportErr
         by_impact: actionability_counts.by_impact,
     };
     let clusters = aggregate_clusters(&findings);
-
-    Ok(ReportDocument {
+    ReportDocument {
         schema_version: REPORT_SCHEMA_VERSION.to_owned(),
         run: RunReport {
-            id: normalized_run_id(&options.run_id),
-            findings_dir: path_string(&options.findings_dir),
-            source_root: discover_source_root(&options.findings_dir),
+            id: normalized_run_id(run_id),
+            findings_dir: path_string(findings_dir),
+            source_root: discover_source_root(findings_dir),
         },
         counts,
         findings,
         clusters,
-    })
+    }
 }
 
 /// Recover the scan source root from the conventional `auto/run.json` that the
@@ -408,13 +436,26 @@ pub fn build_report(options: &ReportOptions) -> Result<ReportDocument, ReportErr
 /// degrades to non-relativised paths) when no run ledger is reachable — never
 /// fails the report.
 fn discover_source_root(findings_dir: &Path) -> Option<String> {
-    let candidates = [
-        findings_dir.parent().map(|p| p.join("auto/run.json")),
-        Some(findings_dir.join("auto/run.json")),
-    ];
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    // Results layout: <work>/results/findings -> <work>/auto/run.json. Only when
+    // the parent segment is literally `results`, so a legacy <work>/findings dir
+    // does not reach up to <parent-of-work>/auto/run.json.
+    if findings_dir
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == corpus::layout::RESULTS_DIR)
+    {
+        if let Some(grandparent) = findings_dir.parent().and_then(Path::parent) {
+            candidates.push(grandparent.join("auto/run.json"));
+        }
+    }
+    // legacy <work>/findings -> <work>/auto/run.json
+    if let Some(parent) = findings_dir.parent() {
+        candidates.push(parent.join("auto/run.json"));
+    }
+    candidates.push(findings_dir.join("auto/run.json"));
     candidates
         .into_iter()
-        .flatten()
         .find_map(|path| read_source_root_from_run_json(&path))
 }
 
@@ -598,7 +639,7 @@ fn finding_reproducer(finding: &FindingReport) -> Option<&str> {
 /// The root-cause issue key for a finding: its full cluster key, else its short
 /// cluster key, else its own id (a singleton issue). Mirrors the SARIF
 /// `bhfIssueKey` fingerprint so every format groups by the same key.
-fn issue_key(finding: &FindingReport) -> String {
+pub fn issue_key(finding: &FindingReport) -> String {
     finding
         .cluster_key_full
         .clone()
@@ -838,6 +879,12 @@ fn open_regular_finding(finding_dir: &Path, finding_path: &Path) -> Result<fs::F
 
 #[cfg(not(unix))]
 fn open_regular_finding(_finding_dir: &Path, finding_path: &Path) -> Result<fs::File, ReportError> {
+    if fs::symlink_metadata(finding_path)?.file_type().is_symlink() {
+        return Err(ReportError::UnsafeFindingInput {
+            path: finding_path.to_path_buf(),
+            reason: "finding.json is a symlink; not followed".to_owned(),
+        });
+    }
     let file = fs::File::open(finding_path)?;
     if !file.metadata()?.is_file() {
         return Err(ReportError::UnsafeFindingInput {
@@ -846,6 +893,157 @@ fn open_regular_finding(_finding_dir: &Path, finding_path: &Path) -> Result<fs::
         });
     }
     Ok(file)
+}
+
+/// Per-record size ceiling for [`load_findings_tolerant`]; a finding record
+/// is metadata, so anything larger is treated as corrupt.
+pub const MAX_TOLERANT_FINDING_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Directory entries [`load_findings_tolerant`] visits before it stops and
+/// records one failure for the rest.
+pub const MAX_TOLERANT_FINDING_ENTRIES: usize = 100_000;
+
+/// One `finding.json` that could not be loaded; the rest still load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FindingLoadFailure {
+    pub path: PathBuf,
+    pub reason: String,
+}
+
+/// Load every `<dir>/<id>/finding.json`, collecting failures instead of
+/// aborting on the first bad record. A missing directory is empty; a
+/// symlinked or non-directory root is an error. Symlinked finding
+/// directories and records are reported as failures (never followed), and
+/// each record is read through a no-follow descriptor with a size cap.
+pub fn load_findings_tolerant(
+    findings_dir: &Path,
+    confidence_model: Option<&confidence_model::LearnedConfidenceModel>,
+    generate_reproducers: bool,
+) -> Result<(Vec<FindingReport>, Vec<FindingLoadFailure>), ReportError> {
+    load_findings_tolerant_capped(
+        findings_dir,
+        confidence_model,
+        generate_reproducers,
+        MAX_TOLERANT_FINDING_ENTRIES,
+    )
+}
+
+fn load_findings_tolerant_capped(
+    findings_dir: &Path,
+    confidence_model: Option<&confidence_model::LearnedConfidenceModel>,
+    generate_reproducers: bool,
+    max_entries: usize,
+) -> Result<(Vec<FindingReport>, Vec<FindingLoadFailure>), ReportError> {
+    let mut findings = Vec::new();
+    let mut failures = Vec::new();
+    match fs::symlink_metadata(findings_dir) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => {
+            return Err(ReportError::UnsafeFindingInput {
+                path: findings_dir.to_path_buf(),
+                reason: "findings root must be a real directory".to_owned(),
+            })
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok((findings, failures)),
+        Err(error) => return Err(error.into()),
+    }
+    for (index, entry) in fs::read_dir(findings_dir)?.enumerate() {
+        if index >= max_entries {
+            failures.push(FindingLoadFailure {
+                path: findings_dir.to_path_buf(),
+                reason: format!("more than {max_entries} entries; the rest were not loaded"),
+            });
+            break;
+        }
+        let entry = entry?;
+        let finding_dir = entry.path();
+        let finding_path = finding_dir.join("finding.json");
+        let fail = |reason: String| FindingLoadFailure {
+            path: finding_path.clone(),
+            reason,
+        };
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => {}
+            Ok(kind) if kind.is_symlink() => {
+                failures.push(fail("finding directory is a symlink".to_owned()));
+                continue;
+            }
+            Ok(_) => continue,
+            Err(error) => {
+                failures.push(fail(error.to_string()));
+                continue;
+            }
+        }
+        let mut file = match open_regular_finding(&finding_dir, &finding_path) {
+            Ok(file) => file,
+            Err(ReportError::Io(error)) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(ReportError::Io(error)) if is_symlink_refusal(&error) => {
+                failures.push(fail("finding.json is a symlink; not followed".to_owned()));
+                continue;
+            }
+            Err(error) => {
+                failures.push(fail(error.to_string()));
+                continue;
+            }
+        };
+        let cap = usize::try_from(MAX_TOLERANT_FINDING_BYTES).unwrap_or(usize::MAX);
+        let raw: Value = match read_bounded_finding(&mut file, cap, cap, &finding_path)
+            .map_err(|error| error.to_string())
+            .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|error| error.to_string()))
+        {
+            Ok(raw) => raw,
+            Err(reason) => {
+                failures.push(fail(reason));
+                continue;
+            }
+        };
+        // The record's `id` is untrusted input: it later becomes a path
+        // component (evidence lookups, links). It must be a valid finding id
+        // and equal its directory name.
+        let dir_name = finding_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if let Some(raw_id) = raw.get("id").and_then(Value::as_str) {
+            if raw_id != dir_name || !corpus::layout::is_valid_finding_id(raw_id) {
+                failures.push(fail(format!(
+                    "id {raw_id:?} does not match its directory {dir_name:?}"
+                )));
+                continue;
+            }
+        } else if !corpus::layout::is_valid_finding_id(dir_name) {
+            failures.push(fail(format!(
+                "directory name {dir_name:?} is not a valid finding id"
+            )));
+            continue;
+        }
+        match normalize_finding(
+            &finding_dir,
+            &finding_path,
+            raw,
+            confidence_model,
+            generate_reproducers,
+        ) {
+            Ok(finding) => findings.push(finding),
+            Err(error) => failures.push(fail(error.to_string())),
+        }
+    }
+    sort_findings(&mut findings);
+    failures.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok((findings, failures))
+}
+
+/// `O_NOFOLLOW` refuses a symlink with `ELOOP`.
+fn is_symlink_refusal(error: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::ELOOP)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        false
+    }
 }
 
 pub fn load_findings_with_model(
@@ -1960,11 +2158,9 @@ fn ensure_repro_ada(finding_dir: &Path) -> Result<(), String> {
         return Err("missing testcase.bin".to_owned());
     }
 
-    let testcase = fs::read(&testcase_path)
-        .map_err(|error| format!("read {}: {error}", testcase_path.display()))?;
+    let testcase = read_regular_no_follow(&testcase_path)?;
     let repro_path = finding_dir.join("repro.adb");
-    fs::write(&repro_path, render_repro_ada(&testcase))
-        .map_err(|error| format!("write {}: {error}", repro_path.display()))
+    write_regular_no_follow(&repro_path, render_repro_ada(&testcase).as_bytes(), None)
 }
 
 fn render_repro_ada(testcase: &[u8]) -> String {
@@ -2048,17 +2244,148 @@ fn ensure_repro_py(
         &header_lines,
     );
     let path = finding_dir.join("replay.py");
-    fs::write(&path, script).map_err(|error| format!("write {}: {error}", path.display()))?;
+    write_regular_no_follow(&path, script.as_bytes(), Some(0o755))
+}
+
+/// Read a regular file of at most [`MAX_TOLERANT_FINDING_BYTES`] without
+/// following a symlink at `path`.
+fn read_regular_no_follow(path: &Path) -> Result<Vec<u8>, String> {
+    let fail = |error: io::Error| format!("read {}: {error}", path.display());
+    let over = |len: u64| {
+        format!(
+            "{} is {len} bytes, over the {MAX_TOLERANT_FINDING_BYTES} byte limit",
+            path.display()
+        )
+    };
+    let file = open_no_follow(path, fs::OpenOptions::new().read(true)).map_err(fail)?;
+    let meta = file.metadata().map_err(fail)?;
+    if !meta.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    if meta.len() > MAX_TOLERANT_FINDING_BYTES {
+        return Err(over(meta.len()));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_TOLERANT_FINDING_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(fail)?;
+    if bytes.len() as u64 > MAX_TOLERANT_FINDING_BYTES {
+        return Err(over(bytes.len() as u64));
+    }
+    Ok(bytes)
+}
+
+/// Largest generated artifact [`already_current`] reads back to compare.
+const MAX_UNCHANGED_COMPARE_BYTES: u64 = 1024 * 1024;
+
+/// Replace a generated artifact in a finding directory. Finding directories
+/// can be imported, so a symlink, a non-regular file or a hard link at `path`
+/// is left alone (an error) instead of being written through; `mode` is set
+/// on the open descriptor, never by path. A file that already holds exactly
+/// `bytes` is not touched at all (mode and mtime included), so a rebuild
+/// over unchanged evidence writes nothing here.
+fn write_regular_no_follow(path: &Path, bytes: &[u8], mode: Option<u32>) -> Result<(), String> {
+    let fail = |error: io::Error| format!("write {}: {error}", path.display());
+    let not_regular = || format!("{} is not a regular file; not overwritten", path.display());
+    match fs::symlink_metadata(path) {
+        Ok(meta) if !meta.is_file() => return Err(not_regular()),
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(fail(error)),
+    }
+    if already_current(path, bytes, mode) {
+        return Ok(());
+    }
+    // No O_TRUNC: the descriptor is checked before anything is changed.
+    let mut file =
+        open_no_follow(path, fs::OpenOptions::new().write(true).create(true)).map_err(|error| {
+            if is_symlink_refusal(&error) {
+                not_regular()
+            } else {
+                fail(error)
+            }
+        })?;
+    let meta = file.metadata().map_err(fail)?;
+    if !meta.is_file() || hard_linked(&meta) {
+        return Err(not_regular());
+    }
+    file.set_len(0).map_err(fail)?;
+    file.write_all(bytes).map_err(fail)?;
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(mode))
+            .map_err(fail)?;
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    Ok(())
+}
+
+/// `path` is a regular, non-hard-linked file of at most
+/// [`MAX_UNCHANGED_COMPARE_BYTES`] whose content equals `bytes` and, on unix,
+/// whose permission bits equal `mode` when one is wanted; read through a
+/// no-follow descriptor. Anything else (including any read error) is
+/// `false`, and the caller's checked write path decides (and chmods).
+fn already_current(path: &Path, bytes: &[u8], mode: Option<u32>) -> bool {
+    let len = bytes.len() as u64;
+    if len > MAX_UNCHANGED_COMPARE_BYTES {
+        return false;
+    }
+    let Ok(file) = open_no_follow(path, fs::OpenOptions::new().read(true)) else {
+        return false;
+    };
+    match file.metadata() {
+        Ok(meta)
+            if meta.is_file()
+                && !hard_linked(&meta)
+                && meta.len() == len
+                && mode_matches(&meta, mode) => {}
+        _ => return false,
+    }
+    let mut current = Vec::with_capacity(bytes.len());
+    file.take(len + 1).read_to_end(&mut current).is_ok() && current == bytes
+}
+
+#[cfg(unix)]
+fn mode_matches(meta: &fs::Metadata, wanted: Option<u32>) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    wanted.is_none_or(|wanted| meta.permissions().mode() & 0o777 == wanted)
+}
+
+#[cfg(not(unix))]
+fn mode_matches(_meta: &fs::Metadata, _wanted: Option<u32>) -> bool {
+    true
+}
+
+#[cfg(unix)]
+fn hard_linked(meta: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    meta.nlink() > 1
+}
+
+#[cfg(not(unix))]
+fn hard_linked(_meta: &fs::Metadata) -> bool {
+    false
+}
+
+/// Open `path` refusing a symlink as its last component (`O_NOFOLLOW`; a
+/// FIFO does not block the open). Non-unix: refuse a symlink found by lstat.
+fn open_no_follow(path: &Path, options: &mut fs::OpenOptions) -> io::Result<fs::File> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = fs::metadata(&path) {
-            let mut perms = meta.permissions();
-            perms.set_mode(0o755);
-            let _ = fs::set_permissions(&path, perms);
-        }
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)
     }
-    Ok(())
+    #[cfg(not(unix))]
+    {
+        if fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return Err(io::Error::other("symlink; not followed"));
+        }
+        options.open(path)
+    }
 }
 
 /// The default `ASAN_OPTIONS` for a finding's reproducer. Leak findings (LSan)
@@ -2161,12 +2488,26 @@ def candidate_harnesses(finding):
     for fixture in (finding.get("fixture_path"), FIXTURE_PATH):
         if fixture:
             yield Path(fixture)
-    # 3) <work>/auto/<harness_id>/<leaf> relative to this finding dir
+    # 3) <work>/{harnesses,auto,generated_harnesses}/<harness_id>/<leaf>. Derive
+    #    the work dir name-awarely (mirrors corpus::layout::work_dir_for_finding):
+    #    results layout is <work>/results/findings/<id>, legacy is <work>/findings/<id>.
+    #    Search the work dir first, then the finding's parent as a flat-layout
+    #    fallback; never probe above the work dir.
     hid = finding.get("harness_id") or HARNESS_ID
     if hid:
-        for root in (HERE.parent.parent, HERE.parent):
-            for leaf in ("main", "main_afl", "main.exe", "main_afl.exe"):
-                yield root / "auto" / hid / leaf
+        if HERE.parent.name == "findings" and HERE.parent.parent.name == "results":
+            work = HERE.parent.parent.parent
+        elif HERE.parent.name == "findings":
+            work = HERE.parent.parent
+        else:
+            work = HERE.parent
+        roots = [work]
+        if HERE.parent != work:
+            roots.append(HERE.parent)
+        for root in roots:
+            for sub in ("harnesses", "auto", "generated_harnesses"):
+                for leaf in ("main", "main_afl", "main.exe", "main_afl.exe"):
+                    yield root / sub / hid / leaf
 
 
 def resolve_harness(finding):
@@ -3281,14 +3622,558 @@ fn md_code(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_report, is_xml_1_0_char, load_findings, load_findings_bounded,
-        load_findings_with_model, read_bounded_finding, relativize_to_source_root,
-        render_junit_report, render_markdown_report, render_markdown_report_with,
-        render_sarif_report, rule_signature, rules, validate_sarif_report, write_reports,
-        ClusterQuality, ClusterReport, CountReport, FindingLoadBudget, FindingReport,
-        ReportDocument, ReportError, ReportOptions, RunReport, REPORT_SCHEMA_VERSION,
+        build_report, document_from_findings, is_xml_1_0_char, load_findings,
+        load_findings_bounded, load_findings_tolerant, load_findings_with_model,
+        read_bounded_finding, relativize_to_source_root, render_junit_report,
+        render_markdown_report, render_markdown_report_with, render_sarif_report, rule_signature,
+        rules, validate_sarif_report, write_reports, ClusterQuality, ClusterReport, CountReport,
+        FindingLoadBudget, FindingReport, ReportDocument, ReportError, ReportOptions, RunReport,
+        MAX_TOLERANT_FINDING_BYTES, REPORT_SCHEMA_VERSION,
     };
     use confidence_model::{ConfidenceLabel, TrainingSample};
+
+    #[test]
+    fn tolerant_loader_reports_bad_records_and_keeps_good_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("F-0000-aaaaaaaa")).unwrap();
+        std::fs::write(
+            dir.join("F-0000-aaaaaaaa/finding.json"),
+            r#"{"id":"F-0000-aaaaaaaa","rule_id":"BHF-201","classification":"unhandled"}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("F-0001-bbbbbbbb")).unwrap();
+        std::fs::write(dir.join("F-0001-bbbbbbbb/finding.json"), "{not json").unwrap();
+        std::fs::create_dir_all(dir.join("F-0002-cccccccc")).unwrap();
+        std::fs::write(dir.join("F-0002-cccccccc/finding.json"), "[1,2]").unwrap();
+
+        let (found, failed) = load_findings_tolerant(dir, None, false).unwrap();
+        assert_eq!(
+            found.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(),
+            ["F-0000-aaaaaaaa"]
+        );
+        assert_eq!(failed.len(), 2);
+        assert!(failed
+            .iter()
+            .any(|f| f.path.ends_with("F-0001-bbbbbbbb/finding.json")));
+        assert!(failed
+            .iter()
+            .any(|f| f.path.ends_with("F-0002-cccccccc/finding.json")));
+    }
+
+    #[test]
+    fn tolerant_loader_rejects_an_id_that_does_not_match_its_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("F-0000-aaaaaaaa");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("finding.json"), r#"{"id":"../../etc"}"#).unwrap();
+        let (found, failed) = load_findings_tolerant(tmp.path(), None, false).unwrap();
+        assert!(found.is_empty());
+        assert!(
+            failed[0].reason.contains("does not match"),
+            "{}",
+            failed[0].reason
+        );
+    }
+
+    #[test]
+    fn tolerant_loader_rejects_an_idless_record_in_an_invalid_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".hidden");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("finding.json"), r#"{"rule_id":"BHF-201"}"#).unwrap();
+        let (found, failed) = load_findings_tolerant(tmp.path(), None, false).unwrap();
+        assert!(found.is_empty());
+        assert!(
+            failed[0].reason.contains("not a valid finding id"),
+            "{}",
+            failed[0].reason
+        );
+    }
+
+    #[test]
+    fn tolerant_loader_treats_missing_dir_as_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (found, failed) =
+            load_findings_tolerant(&tmp.path().join("nope"), None, false).unwrap();
+        assert!(found.is_empty() && failed.is_empty());
+    }
+
+    #[test]
+    fn tolerant_loader_rejects_oversized_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("F-0000-aaaaaaaa");
+        std::fs::create_dir_all(&dir).unwrap();
+        let big = format!(
+            r#"{{"id":"F-0000-aaaaaaaa","pad":"{}"}}"#,
+            "x".repeat(MAX_TOLERANT_FINDING_BYTES as usize)
+        );
+        std::fs::write(dir.join("finding.json"), big).unwrap();
+        let (found, failed) = load_findings_tolerant(tmp.path(), None, false).unwrap();
+        assert!(found.is_empty());
+        assert!(failed[0].reason.contains("exceeds"), "{}", failed[0].reason);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tolerant_loader_never_follows_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("finding.json"), r#"{"id":"F-0000-aaaaaaaa"}"#).unwrap();
+        let findings = tmp.path().join("findings");
+        std::fs::create_dir_all(findings.join("F-0001-bbbbbbbb")).unwrap();
+        std::os::unix::fs::symlink(&outside, findings.join("F-0000-aaaaaaaa")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.join("finding.json"),
+            findings.join("F-0001-bbbbbbbb/finding.json"),
+        )
+        .unwrap();
+        let (found, failed) = load_findings_tolerant(&findings, None, false).unwrap();
+        assert!(found.is_empty(), "{found:?}");
+        assert_eq!(failed.len(), 2, "{failed:?}");
+        let reason_for = |dir: &str| {
+            failed
+                .iter()
+                .find(|f| f.path.starts_with(findings.join(dir)))
+                .map(|f| f.reason.clone())
+                .unwrap()
+        };
+        assert!(
+            reason_for("F-0000-aaaaaaaa").contains("directory is a symlink"),
+            "{failed:?}"
+        );
+        assert!(
+            reason_for("F-0001-bbbbbbbb").contains("symlink"),
+            "{failed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tolerant_loader_rejects_a_symlinked_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(real.join("F-0000-aaaaaaaa")).unwrap();
+        std::fs::write(
+            real.join("F-0000-aaaaaaaa/finding.json"),
+            r#"{"id":"F-0000-aaaaaaaa"}"#,
+        )
+        .unwrap();
+        let link = tmp.path().join("findings");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let error = load_findings_tolerant(&link, None, false).unwrap_err();
+        assert!(
+            matches!(error, ReportError::UnsafeFindingInput { .. }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn tolerant_loader_stops_at_the_entry_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..4 {
+            let id = format!("F-000{i}-aaaaaaaa");
+            std::fs::create_dir_all(tmp.path().join(&id)).unwrap();
+            std::fs::write(
+                tmp.path().join(&id).join("finding.json"),
+                format!(r#"{{"id":"{id}"}}"#),
+            )
+            .unwrap();
+        }
+        let (found, failed) =
+            super::load_findings_tolerant_capped(tmp.path(), None, false, 2).unwrap();
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert_eq!(failed[0].path, tmp.path());
+        assert!(failed[0].reason.contains("more than 2"), "{failed:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reproducer_writes_never_follow_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        for name in ["victim.py", "victim.adb"] {
+            std::fs::write(outside.join(name), "original").unwrap();
+            std::fs::set_permissions(outside.join(name), std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+        let findings = tmp.path().join("findings");
+        let dir = findings.join("F-0000-aaaaaaaa");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("finding.json"),
+            r#"{"id":"F-0000-aaaaaaaa","dialect":"ada2012","classification":"unhandled"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("testcase.bin"), b"AAAA").unwrap();
+        std::os::unix::fs::symlink(outside.join("victim.py"), dir.join("replay.py")).unwrap();
+        std::os::unix::fs::symlink(outside.join("victim.adb"), dir.join("repro.adb")).unwrap();
+
+        let (found, failed) = load_findings_tolerant(&findings, None, true).unwrap();
+        assert!(failed.is_empty(), "{failed:?}");
+        for name in ["victim.py", "victim.adb"] {
+            let path = outside.join(name);
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "original",
+                "{name}"
+            );
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{name} must not be chmod'ed");
+        }
+        assert!(found[0].generated_repro_py.is_none());
+        assert!(found[0].generated_repro_ada.is_none());
+        assert!(
+            found[0]
+                .repro_ada_omitted_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("not a regular file")),
+            "{:?}",
+            found[0].repro_ada_omitted_reason
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reproducer_writes_never_go_through_hard_links() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        for name in ["victim.py", "victim.adb"] {
+            std::fs::write(outside.join(name), "original").unwrap();
+            std::fs::set_permissions(outside.join(name), std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+        let findings = tmp.path().join("findings");
+        let dir = findings.join("F-0000-aaaaaaaa");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("finding.json"),
+            r#"{"id":"F-0000-aaaaaaaa","dialect":"ada2012","classification":"unhandled"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("testcase.bin"), b"AAAA").unwrap();
+        std::fs::hard_link(outside.join("victim.py"), dir.join("replay.py")).unwrap();
+        std::fs::hard_link(outside.join("victim.adb"), dir.join("repro.adb")).unwrap();
+
+        let (found, failed) = load_findings_tolerant(&findings, None, true).unwrap();
+        assert!(failed.is_empty(), "{failed:?}");
+        for name in ["victim.py", "victim.adb"] {
+            let path = outside.join(name);
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "original",
+                "{name}"
+            );
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{name} must not be chmod'ed");
+        }
+        assert!(found[0].generated_repro_py.is_none());
+        assert!(found[0].generated_repro_ada.is_none());
+        assert!(
+            found[0]
+                .repro_ada_omitted_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("not a regular file")),
+            "{:?}",
+            found[0].repro_ada_omitted_reason
+        );
+    }
+
+    #[test]
+    fn oversized_testcase_skips_the_ada_reproducer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("F-0000-aaaaaaaa");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("finding.json"),
+            r#"{"id":"F-0000-aaaaaaaa","dialect":"ada2012","classification":"unhandled"}"#,
+        )
+        .unwrap();
+        std::fs::File::create(dir.join("testcase.bin"))
+            .unwrap()
+            .set_len(MAX_TOLERANT_FINDING_BYTES + 1)
+            .unwrap();
+        let (found, failed) = load_findings_tolerant(tmp.path(), None, true).unwrap();
+        assert!(failed.is_empty(), "{failed:?}");
+        assert!(found[0].generated_repro_ada.is_none());
+        assert!(!dir.join("repro.adb").exists());
+        assert!(
+            found[0]
+                .repro_ada_omitted_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("byte limit")),
+            "{:?}",
+            found[0].repro_ada_omitted_reason
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reproducers_are_written_with_their_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("F-0000-aaaaaaaa");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("finding.json"),
+            r#"{"id":"F-0000-aaaaaaaa","dialect":"ada2012","classification":"unhandled"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("testcase.bin"), b"AAAA").unwrap();
+        std::fs::write(dir.join("replay.py"), "stale stale stale stale").unwrap();
+        let (found, _) = load_findings_tolerant(tmp.path(), None, true).unwrap();
+        assert!(found[0].generated_repro_py.is_some());
+        assert!(found[0].generated_repro_ada.is_some());
+        let script = std::fs::read_to_string(dir.join("replay.py")).unwrap();
+        assert!(!script.contains("stale"), "rewritten, not appended");
+        let mode = std::fs::metadata(dir.join("replay.py"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unchanged_reproducers_are_not_rewritten() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("F-0000-aaaaaaaa");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("finding.json"),
+            r#"{"id":"F-0000-aaaaaaaa","dialect":"ada2012","classification":"unhandled"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("testcase.bin"), b"AAAA").unwrap();
+        load_findings_tolerant(tmp.path(), None, true).unwrap();
+        // Backdate both reproducers: a rewrite, even of identical bytes,
+        // would move the mtime to now.
+        let past = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        let mut before = Vec::new();
+        for name in ["replay.py", "repro.adb"] {
+            let path = dir.join(name);
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(past)
+                .unwrap();
+            let meta = std::fs::metadata(&path).unwrap();
+            before.push((meta.ino(), meta.mtime(), meta.mode()));
+        }
+
+        let (found, failed) = load_findings_tolerant(tmp.path(), None, true).unwrap();
+        assert!(failed.is_empty(), "{failed:?}");
+        assert!(found[0].generated_repro_py.is_some());
+        assert!(found[0].generated_repro_ada.is_some());
+        for (name, before) in ["replay.py", "repro.adb"].iter().zip(before) {
+            let meta = std::fs::metadata(dir.join(name)).unwrap();
+            assert_eq!(
+                (meta.ino(), meta.mtime(), meta.mode()),
+                before,
+                "{name} rewritten although its content was current"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_reproducer_with_the_wrong_mode_is_made_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("F-0000-aaaaaaaa");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("finding.json"),
+            r#"{"id":"F-0000-aaaaaaaa","classification":"unhandled"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("testcase.bin"), b"AAAA").unwrap();
+        load_findings_tolerant(tmp.path(), None, true).unwrap();
+        let replay = dir.join("replay.py");
+        let script = std::fs::read(&replay).unwrap();
+        std::fs::set_permissions(&replay, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        load_findings_tolerant(tmp.path(), None, true).unwrap();
+        let mode = std::fs::metadata(&replay).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "content was current, mode was not");
+        assert_eq!(std::fs::read(&replay).unwrap(), script);
+    }
+
+    #[test]
+    fn changed_reproducers_are_rewritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("F-0000-aaaaaaaa");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("finding.json"),
+            r#"{"id":"F-0000-aaaaaaaa","dialect":"ada2012","classification":"unhandled"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("testcase.bin"), b"AAAA").unwrap();
+        load_findings_tolerant(tmp.path(), None, true).unwrap();
+        let current: Vec<Vec<u8>> = ["replay.py", "repro.adb"]
+            .iter()
+            .map(|name| std::fs::read(dir.join(name)).unwrap())
+            .collect();
+        // An older template: same length, different bytes, then a shorter one.
+        for (name, bytes) in ["replay.py", "repro.adb"].iter().zip(&current) {
+            let mut older = bytes.clone();
+            older[0] ^= 0x20;
+            std::fs::write(dir.join(name), &older).unwrap();
+        }
+        load_findings_tolerant(tmp.path(), None, true).unwrap();
+        for (name, bytes) in ["replay.py", "repro.adb"].iter().zip(&current) {
+            assert_eq!(&std::fs::read(dir.join(name)).unwrap(), bytes, "{name}");
+            std::fs::write(dir.join(name), "old").unwrap();
+        }
+        load_findings_tolerant(tmp.path(), None, true).unwrap();
+        for (name, bytes) in ["replay.py", "repro.adb"].iter().zip(&current) {
+            assert_eq!(&std::fs::read(dir.join(name)).unwrap(), bytes, "{name}");
+        }
+    }
+
+    #[test]
+    fn report_errors_carry_their_cause() {
+        let io = ReportError::Io(std::io::Error::other("disk on fire"));
+        assert!(io.to_string().contains("disk on fire"), "{io}");
+        let json = ReportError::Json(serde_json::from_str::<serde_json::Value>("{").unwrap_err());
+        assert!(json.to_string().contains("EOF"), "{json}");
+    }
+
+    #[test]
+    fn document_from_findings_matches_build_report() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("F-0000-aaaaaaaa");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("finding.json"),
+            r#"{"id":"F-0000-aaaaaaaa","rule_id":"BHF-201","classification":"unhandled"}"#,
+        )
+        .unwrap();
+        let (found, failed) = load_findings_tolerant(tmp.path(), None, false).unwrap();
+        assert!(failed.is_empty(), "{failed:?}");
+        let document = document_from_findings("run-1", tmp.path(), found);
+        assert_eq!(document.schema_version, REPORT_SCHEMA_VERSION);
+        assert_eq!(document.run.id, "run-1");
+        assert_eq!(document.counts.findings, 1);
+        assert_eq!(document.findings[0].id, "F-0000-aaaaaaaa");
+        let built = build_report(
+            &ReportOptions::new(tmp.path(), tmp.path().join("out")).with_run_id("run-1"),
+        )
+        .unwrap();
+        assert_eq!(built.counts, document.counts);
+        assert_eq!(built.run, document.run);
+    }
+
+    #[test]
+    fn source_root_found_from_results_findings_depth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path();
+        std::fs::create_dir_all(work.join("auto")).unwrap();
+        std::fs::create_dir_all(work.join("results/findings")).unwrap();
+        std::fs::write(work.join("auto/run.json"), r#"{"source_root":"/src"}"#).unwrap();
+        assert_eq!(
+            super::discover_source_root(&work.join("results/findings")).as_deref(),
+            Some("/src")
+        );
+    }
+
+    #[test]
+    fn source_root_legacy_depth_prefers_work_over_parent_decoy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = tmp.path();
+        let work = outer.join("work");
+        std::fs::create_dir_all(work.join("findings")).unwrap();
+        std::fs::create_dir_all(work.join("auto")).unwrap();
+        std::fs::create_dir_all(outer.join("auto")).unwrap();
+        // Decoy one level above the work dir must NOT win for a legacy <work>/findings.
+        std::fs::write(outer.join("auto/run.json"), r#"{"source_root":"/decoy"}"#).unwrap();
+        std::fs::write(work.join("auto/run.json"), r#"{"source_root":"/real"}"#).unwrap();
+        assert_eq!(
+            super::discover_source_root(&work.join("findings")).as_deref(),
+            Some("/real")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repro_py_runs_harness_from_work_dir_not_above() {
+        use std::os::unix::fs::PermissionsExt;
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("SKIP repro_py_runs_harness_from_work_dir_not_above: python3 not found");
+            return;
+        }
+
+        let script = super::render_repro_py(
+            "testcase.bin",
+            "",
+            "h1",
+            "detect_leaks=0",
+            "print_stacktrace=1",
+            &serde_json::Map::new(),
+            &[],
+        );
+
+        let plant_stub = |path: &std::path::Path| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            // Writes a `RAN` marker next to itself when executed.
+            std::fs::write(path, "#!/bin/sh\n: > \"$(dirname \"$0\")/RAN\"\nexit 0\n").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+
+        // Run the script inside each work dir's finding directory and assert the
+        // work-dir harness ran while the decoy one level above the work dir did not.
+        for finding_rel in ["work/results/findings/F-1", "work2/findings/F-1"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let outer = tmp.path();
+            let finding = outer.join(finding_rel);
+            std::fs::create_dir_all(&finding).unwrap();
+            std::fs::write(finding.join("replay.py"), &script).unwrap();
+            std::fs::write(finding.join("finding.json"), r#"{"harness_id":"h1"}"#).unwrap();
+            std::fs::write(finding.join("testcase.bin"), b"x").unwrap();
+
+            // work dir = everything above results/findings or findings.
+            let work = if finding_rel.contains("results/findings") {
+                finding
+                    .parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+            } else {
+                finding.parent().unwrap().parent().unwrap()
+            };
+            plant_stub(&work.join("harnesses/h1/main"));
+            plant_stub(&outer.join("harnesses/h1/main")); // decoy above the work dir
+
+            let status = std::process::Command::new("python3")
+                .arg(finding.join("replay.py"))
+                .status()
+                .unwrap();
+            assert!(status.success(), "replay.py failed for {finding_rel}");
+            assert!(
+                work.join("harnesses/h1/RAN").is_file(),
+                "work-dir harness did not run for {finding_rel}"
+            );
+            assert!(
+                !outer.join("harnesses/h1/RAN").is_file(),
+                "decoy above the work dir ran for {finding_rel}"
+            );
+        }
+    }
 
     #[test]
     fn relativize_to_source_root_strips_prefix_everywhere() {

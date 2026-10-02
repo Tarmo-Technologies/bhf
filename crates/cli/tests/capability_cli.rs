@@ -117,7 +117,7 @@ fn parse_source_location(source: &str) -> Option<(String, usize)> {
 /// process-exec finding's `file:line:function` source evidence, if present.
 fn scan_capability_findings(work: &Path) -> (Option<String>, bool) {
     let mut exec_source = None;
-    if let Ok(entries) = std::fs::read_dir(work.join("findings")) {
+    if let Ok(entries) = std::fs::read_dir(work.join("results").join("findings")) {
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
             if !name.starts_with("F-CAP-") {

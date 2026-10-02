@@ -90,7 +90,7 @@ fn java_builder_only_class_synthesises_receiver_and_finds_crash() {
 
     // The planted BHF-201 ArrayIndexOutOfBoundsException was found through the
     // builder-constructed receiver.
-    let findings = work.join("findings");
+    let findings = work.join("results").join("findings");
     let mut found_bhf201 = false;
     if let Ok(entries) = std::fs::read_dir(&findings) {
         for entry in entries.flatten() {

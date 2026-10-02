@@ -1,0 +1,13 @@
+{
+  "schema_version": "bhf.results-manifest.v1",
+  "tool": {
+    "name": "bhf",
+    "version": "0.3.0",
+    "build": "0.3.0"
+  },
+  "source": {
+    "root": "/src/demo",
+    "vcs": null
+  },
+  "producers": []
+}

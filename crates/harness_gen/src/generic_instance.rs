@@ -297,6 +297,7 @@ pub fn generic_package_is_synthesizable(source: &str, package_name: &str) -> boo
     }
 }
 
+#[allow(clippy::some_filter)]
 fn classify_formal(formal: &str) -> Option<Formal> {
     let lower = formal.to_ascii_lowercase();
     if lower.starts_with("type ") {

@@ -131,7 +131,7 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
     } else {
         seeds
     };
-    let findings_dir = args.work_dir.join("findings");
+    let findings_dir = corpus::layout::findings_dir(&args.work_dir);
     fs::create_dir_all(&findings_dir)
         .with_context(|| format!("create {}", findings_dir.display()))?;
 
@@ -165,7 +165,9 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
             fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
             fs::write(dir.join("testcase.bin"), seed)
                 .with_context(|| format!("write {}", dir.join("testcase.bin").display()))?;
-            let finding = render_finding(&id, &args, seed, &env, &run)?;
+            corpus::finding::write_sanitizer_log(&dir, run.stderr.as_bytes())?;
+            let mut finding = render_finding(&id, &args, seed, &env, &run)?;
+            corpus::finding::stamp_v1(&mut finding, corpus::finding::finding_kind::BINARY);
             fs::write(
                 dir.join("finding.json"),
                 serde_json::to_vec_pretty(&finding)?,
@@ -475,7 +477,9 @@ fn run_afl_qemu(
             let dir = findings_dir.join(&id);
             fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
             fs::write(dir.join("testcase.bin"), &input)?;
-            let finding = render_finding(&id, args, &input, env, &run)?;
+            corpus::finding::write_sanitizer_log(&dir, run.stderr.as_bytes())?;
+            let mut finding = render_finding(&id, args, &input, env, &run)?;
+            corpus::finding::stamp_v1(&mut finding, corpus::finding::finding_kind::BINARY);
             fs::write(
                 dir.join("finding.json"),
                 serde_json::to_vec_pretty(&finding)?,
@@ -509,6 +513,7 @@ pub(crate) fn is_binary_finding(finding_dir: &Path) -> bool {
 pub(crate) fn replay_binary_finding(finding_dir: &Path, binary: &Path) -> i32 {
     match replay_binary_finding_inner(finding_dir, binary) {
         Ok(true) => {
+            let _ = corpus::finding::touch_last_seen(finding_dir, "replay");
             println!("MATCH");
             0
         }
@@ -544,7 +549,7 @@ pub(crate) fn minimize_binary_finding(
     fs::create_dir_all(&tmp_dir).with_context(|| format!("create {}", tmp_dir.display()))?;
     let result = replay_min::ddmin_bytes(&original, |candidate| -> anyhow::Result<bool> {
         let run = run_binary_once(binary, mode, candidate, &env, timeout, &tmp_dir)?;
-        Ok(run.signature == expected)
+        Ok(signature_matches(&run, &expected))
     })?;
     let _ = fs::remove_dir_all(&tmp_dir);
     fs::write(finding_dir.join("min_testcase.bin"), &result.minimized)
@@ -579,7 +584,14 @@ fn replay_binary_finding_inner(finding_dir: &Path, binary: &Path) -> anyhow::Res
         &tmp_dir,
     )?;
     let _ = fs::remove_dir_all(&tmp_dir);
-    Ok(run.signature == finding_signature(&finding)?)
+    Ok(signature_matches(&run, &finding_signature(&finding)?))
+}
+
+/// Whether a replayed run reproduces a stored crash signature, in its
+/// current (normalized) form or the legacy raw-stderr form.
+fn signature_matches(run: &BinaryRun, expected: &str) -> bool {
+    run.signature == expected
+        || legacy_crash_signature(run.timeout, run.signal, run.exit_code, &run.stderr) == expected
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -663,25 +675,16 @@ fn run_binary_once(
         }
     }
     let output = child.wait_with_output()?;
+    let input_path = input_file
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned());
     if let Some(path) = input_file {
         let _ = fs::remove_file(path);
     }
     let exit_code = output.status.code();
     let signal = termination_signal(&output.status);
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    let signature = if timed_out {
-        "timeout".to_owned()
-    } else if let Some(sig) = signal {
-        // Distinguish crash signals (SIGSEGV vs SIGABRT ...) instead of
-        // collapsing every signal into exit:-1.
-        format!("signal:{}:{}", sig, sha256_hex(stderr.as_bytes()))
-    } else {
-        format!(
-            "exit:{}:{}",
-            exit_code.unwrap_or(-1),
-            sha256_hex(stderr.as_bytes())
-        )
-    };
+    let signature = crash_signature(timed_out, signal, exit_code, &stderr, input_path.as_deref());
     Ok(BinaryRun {
         exit_code,
         signal,
@@ -691,6 +694,78 @@ fn run_binary_once(
     })
 }
 
+/// `timeout`, `signal:<n>:<digest>` or `exit:<code>:<digest>`, where the
+/// digest is over stderr with run-specific noise removed, so the same crash
+/// keeps its signature across runs (replay matching, cross-run identity).
+fn crash_signature(
+    timed_out: bool,
+    signal: Option<i32>,
+    exit_code: Option<i32>,
+    stderr: &str,
+    input_path: Option<&str>,
+) -> String {
+    let digest = sha256_hex(signature_stderr(stderr, input_path).as_bytes());
+    if timed_out {
+        "timeout".to_owned()
+    } else if let Some(sig) = signal {
+        // Distinguish crash signals (SIGSEGV vs SIGABRT ...) instead of
+        // collapsing every signal into exit:-1.
+        format!("signal:{sig}:{digest}")
+    } else {
+        format!("exit:{}:{digest}", exit_code.unwrap_or(-1))
+    }
+}
+
+/// The signature format before stderr was normalized: the digest of the raw
+/// stderr. Binary findings recorded then still store it, so replay and
+/// minimization accept it too; never written for new findings.
+fn legacy_crash_signature(
+    timed_out: bool,
+    signal: Option<i32>,
+    exit_code: Option<i32>,
+    stderr: &str,
+) -> String {
+    let digest = sha256_hex(stderr.as_bytes());
+    if timed_out {
+        "timeout".to_owned()
+    } else if let Some(sig) = signal {
+        format!("signal:{sig}:{digest}")
+    } else {
+        format!("exit:{}:{digest}", exit_code.unwrap_or(-1))
+    }
+}
+
+/// Stderr as hashed into a crash signature: the run's own input file (a
+/// fresh `input-<nanos>.bin` per run, which targets often echo) becomes
+/// `<input>`, sanitizer `==<pid>==` markers are removed, and absolute
+/// pc/heap/stack addresses are replaced, since all of these change per run.
+/// Module offsets (`(/bin/target+0x1a2b3c)`) are kept: they are stable, and
+/// in a stripped binary they are the only crash-site identity.
+fn signature_stderr(stderr: &str, input_path: Option<&str>) -> String {
+    let mut text = stderr.to_owned();
+    if let Some(path) = input_path.filter(|path| !path.is_empty()) {
+        text = text.replace(path, "<input>");
+        if let Some(name) = Path::new(path).file_name().and_then(|name| name.to_str()) {
+            text = text.replace(name, "<input>");
+        }
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text.as_str();
+    while let Some(at) = rest.find("==") {
+        let after = &rest[at + 2..];
+        let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0 && after[digits..].starts_with("==") {
+            out.push_str(&rest[..at]);
+            rest = &after[digits + 2..];
+        } else {
+            out.push_str(&rest[..at + 2]);
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    results::normalize::strip_addresses_keep_offsets(&out)
+}
+
 fn render_finding(
     id: &str,
     args: &BinaryFuzzArgs,
@@ -698,6 +773,8 @@ fn render_finding(
     env: &BTreeMap<String, String>,
     run: &BinaryRun,
 ) -> anyhow::Result<Value> {
+    let build_identity = binary_analysis::build_identity(&args.binary);
+    let build_id = build_identity.as_ref().and_then(|id| id.build_id.clone());
     Ok(json!({
         "id": id,
         "kind": "binary_crash",
@@ -707,7 +784,11 @@ fn render_finding(
         "message": "Binary crashed under BHF binary-fuzz",
         "binary": {
             "path": args.binary,
-            "sha256": sha256_hex(&fs::read(&args.binary).with_context(|| format!("read {}", args.binary.display()))?)
+            "sha256": sha256_hex(&fs::read(&args.binary).with_context(|| format!("read {}", args.binary.display()))?),
+            "build_id": build_id
+        },
+        "build": {
+            "binary": build_identity
         },
         "command": {
             "argv": [args.binary.to_string_lossy()],
@@ -727,7 +808,8 @@ fn render_finding(
             "stderr_excerpt": stderr_excerpt(&run.stderr)
         },
         "paths": {
-            "testcase": "testcase.bin"
+            "testcase": "testcase.bin",
+            "sanitizer_log": "sanitizer.log"
         },
         "triage": {
             "replay": format!("bhf replay --harness {} {}", args.binary.display(), id)
@@ -820,6 +902,11 @@ fn update_binary_finding_minimized(
         "removed_bytes": removed_bytes,
         "reduced": removed_bytes > 0
     });
+    corpus::finding::append_history(
+        &mut value,
+        "minimize",
+        &["paths.minimized", "minimal_reproducer", "minimization"],
+    );
     fs::write(&path, serde_json::to_vec_pretty(&value)?)?;
     Ok(())
 }
@@ -873,6 +960,118 @@ mod tests {
             stderr: String::new(),
             signature: String::new(),
         }
+    }
+
+    #[test]
+    fn crash_signature_ignores_pids_and_addresses() {
+        let first = "==12345==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x602000000010 at pc 0x55d4c3a1b2c3\n    #0 0x55d4c3a1b2c3 in parse /src/p.c:9\n==12345==ABORTING\n";
+        let second = "==999==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x603000000a20 at pc 0x561234abcdef\n    #0 0x561234abcdef in parse /src/p.c:9\n==999==ABORTING\n";
+        assert_eq!(
+            crash_signature(false, Some(6), None, first, None),
+            crash_signature(false, Some(6), None, second, None)
+        );
+        assert_ne!(
+            crash_signature(false, Some(6), None, first, None),
+            crash_signature(false, Some(6), None, &first.replace("parse", "other"), None),
+            "a different crash site is a different signature"
+        );
+        assert!(crash_signature(false, Some(11), None, first, None).starts_with("signal:11:"));
+        assert!(crash_signature(false, None, Some(1), first, None).starts_with("exit:1:"));
+        assert_eq!(crash_signature(true, Some(9), None, first, None), "timeout");
+    }
+
+    #[test]
+    fn replay_matches_legacy_and_normalized_signatures() {
+        let stderr = "==12345==ERROR: AddressSanitizer: SEGV on unknown address 0x602000000010\n==12345==ABORTING\n";
+        let run = BinaryRun {
+            exit_code: None,
+            signal: Some(6),
+            timeout: false,
+            stderr: stderr.to_owned(),
+            signature: crash_signature(false, Some(6), None, stderr, None),
+        };
+        // Pre-normalization findings stored the digest of the raw stderr.
+        let legacy = format!("signal:6:{}", sha256_hex(stderr.as_bytes()));
+        assert!(signature_matches(&run, &legacy), "identical raw stderr");
+
+        let earlier = stderr
+            .replace("12345", "999")
+            .replace("0x602000000010", "0x603000000a20");
+        assert!(
+            signature_matches(&run, &crash_signature(false, Some(6), None, &earlier, None)),
+            "normalized form ignores PIDs and addresses"
+        );
+        assert!(
+            !signature_matches(
+                &run,
+                &format!("signal:6:{}", sha256_hex(earlier.as_bytes()))
+            ),
+            "the legacy form still needs identical raw stderr"
+        );
+        assert!(!signature_matches(
+            &run,
+            &format!("signal:11:{}", sha256_hex(stderr.as_bytes()))
+        ));
+    }
+
+    #[test]
+    fn crash_signature_keeps_module_offsets() {
+        // An unsymbolized frame: the absolute pc moves per run (ASLR), the
+        // module offset is the crash site.
+        let first = "==1==ERROR: AddressSanitizer: SEGV on unknown address 0x000000000000 (pc 0x55d4c3a1b2c3 bp 0x7ffd5e8c1234 sp 0x7ffd5e8c1200 T0)\n    #0 0x55d4c3a1b2c3  (/bin/target+0x1a2b3c)\n";
+        let other_site = first.replace("+0x1a2b3c", "+0x1a2f00");
+        assert_ne!(
+            crash_signature(false, Some(11), None, first, None),
+            crash_signature(false, Some(11), None, &other_site, None),
+            "a different module offset is a different crash"
+        );
+        let rerun = first
+            .replace("==1==", "==4242==")
+            .replace("0x55d4c3a1b2c3", "0x561234abcdef")
+            .replace("0x7ffd5e8c1234", "0x7fff00001234")
+            .replace("0x7ffd5e8c1200", "0x7fff00001200");
+        assert_eq!(
+            crash_signature(false, Some(11), None, first, None),
+            crash_signature(false, Some(11), None, &rerun, None),
+            "pid and absolute addresses are run noise"
+        );
+    }
+
+    #[test]
+    fn signature_stderr_keeps_offsets_after_plus() {
+        assert_eq!(
+            signature_stderr("#0 0x55d4c3a1b2c3 (/bin/t+0x1a2b3c)", None),
+            "#0 0x… (/bin/t+0x1a2b3c)"
+        );
+        assert_eq!(
+            signature_stderr("+0xdeadbeef00 0xdeadbeef00", None),
+            "+0xdeadbeef00 0x…"
+        );
+    }
+
+    #[test]
+    fn crash_signature_ignores_the_per_run_input_path() {
+        let run = |nanos: &str| {
+            let path = format!("/w/binary_fuzz/tmp/input-{nanos}.bin");
+            let stderr = format!(
+                "{path}: bad magic\nopen(input-{nanos}.bin) ok\n==7==ERROR: SEGV in parse\n"
+            );
+            crash_signature(false, Some(11), None, &stderr, Some(&path))
+        };
+        assert_eq!(run("111"), run("222"));
+        assert_eq!(
+            signature_stderr("x /t/input-1.bin y input-1.bin", Some("/t/input-1.bin")),
+            "x <input> y <input>"
+        );
+    }
+
+    #[test]
+    fn signature_stderr_drops_only_pid_markers() {
+        assert_eq!(signature_stderr("==42==ERROR: boom", None), "ERROR: boom");
+        assert_eq!(signature_stderr("x ==7== y ==7==", None), "x  y ");
+        assert_eq!(signature_stderr("a == 3 == b", None), "a == 3 == b");
+        assert_eq!(signature_stderr("==ab== ====", None), "==ab== ====");
+        assert_eq!(signature_stderr("ptr 0xdeadbeef00", None), "ptr 0x…");
     }
 
     #[test]

@@ -74,7 +74,7 @@ fn jvm_cmplog_solves_a_string_magic_gate_without_a_seed() {
 
     // The crashing input must carry the spliced magic — proof cmplog (not luck)
     // solved the gate.
-    let findings = work.join("findings");
+    let findings = work.join("results").join("findings");
     let mut solved = false;
     if let Ok(entries) = std::fs::read_dir(&findings) {
         for entry in entries.flatten() {

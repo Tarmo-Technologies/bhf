@@ -288,7 +288,7 @@ fn harness_findings_with_input(
     harness_id: &str,
 ) -> Vec<(std::path::PathBuf, std::path::PathBuf)> {
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(work_dir.join("findings")) else {
+    let Ok(entries) = std::fs::read_dir(corpus::layout::findings_dir(work_dir)) else {
         return out;
     };
     for entry in entries.flatten() {
@@ -340,6 +340,11 @@ fn reclassify(finding_json: &Path, mode: RunMode, verdict: Verdict, stubs: &[Str
     if let Ok(value) = serde_json::to_value(&record) {
         obj.insert("actionability".to_owned(), value);
     }
+    corpus::finding::append_history(
+        &mut raw,
+        "auto",
+        &["provenance", "stub_provenance", "actionability"],
+    );
     write_json(finding_json, &raw)
 }
 
@@ -368,6 +373,11 @@ fn certify_real(finding_json: &Path, mode: RunMode) -> bool {
     if let Ok(value) = serde_json::to_value(&record) {
         obj.insert("actionability".to_owned(), value);
     }
+    corpus::finding::append_history(
+        &mut raw,
+        "auto",
+        &["provenance", "stub_provenance", "actionability"],
+    );
     write_json(finding_json, &raw)
 }
 
@@ -548,6 +558,8 @@ __attribute__((weak)) int compute_len(const char * _bhf_p0) {
         assert_eq!(raw["stub_provenance"]["fired_stubs"][0], "acquire_scratch");
         assert_eq!(raw["actionability"]["verdict"], "lab_only");
         assert_eq!(raw["actionability"]["confidence"], "low");
+        assert_eq!(raw["history"][0]["command"], "auto");
+        assert_eq!(raw["history"][0]["fields"][0], "provenance");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -570,6 +582,8 @@ __attribute__((weak)) int compute_len(const char * _bhf_p0) {
         let raw = read_json(&fj).unwrap();
         assert_eq!(raw["provenance"], "real_defect");
         assert_eq!(raw["actionability"]["confidence"], "high");
+        assert_eq!(raw["history"][0]["command"], "auto");
+        assert_eq!(raw["history"][0]["fields"][0], "provenance");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

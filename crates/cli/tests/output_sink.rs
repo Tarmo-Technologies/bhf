@@ -29,7 +29,7 @@ fn temp_dir(name: &str) -> PathBuf {
 /// `(exception_name, "<file>:<line>")` for every finding under `work_dir`.
 fn findings(work_dir: &Path) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    let Ok(entries) = fs::read_dir(work_dir.join("findings")) else {
+    let Ok(entries) = fs::read_dir(work_dir.join("results").join("findings")) else {
         return out;
     };
     for entry in entries.flatten() {

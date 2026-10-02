@@ -86,7 +86,7 @@ fn java_target_builds_and_fuzzes_natively_and_finds_planted_crash() {
 
     // A BHF-201 ArrayIndexOutOfBoundsException finding was recorded, with the
     // 'G'-prefixed crash input.
-    let findings = work.join("findings");
+    let findings = work.join("results").join("findings");
     let mut found_bhf201 = false;
     let mut crash_starts_with_g = false;
     if let Ok(entries) = std::fs::read_dir(&findings) {

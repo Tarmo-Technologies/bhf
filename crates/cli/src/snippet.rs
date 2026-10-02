@@ -258,7 +258,7 @@ pub fn detect_language(source: &str) -> Option<LangSelector> {
     }
     scores.push((LangSelector::Ada, ada));
 
-    scores.sort_by(|a, b| b.1.cmp(&a.1));
+    scores.sort_by_key(|s| std::cmp::Reverse(s.1));
     let (best, best_score) = scores[0];
     let (_, second_score) = scores[1];
     // Need a real signal and a clear winner — a tie is "ambiguous, ask the user".

@@ -35,7 +35,7 @@ fn copy_ada_sources(fixture: &Path, dest: &Path) {
 }
 
 fn findings_contain_rule(work_dir: &Path, rule_id: &str) -> bool {
-    let findings = work_dir.join("findings");
+    let findings = work_dir.join("results").join("findings");
     let Ok(entries) = std::fs::read_dir(&findings) else {
         return false;
     };
@@ -80,7 +80,7 @@ fn ada_contract_violation_reports_bhf557() {
     assert!(
         findings_contain_rule(&work_dir, "BHF-557"),
         "expected a BHF-557 Ada contract-violation finding under {}; bhf auto exit={:?}\nstderr=\n{}",
-        work_dir.join("findings").display(),
+        work_dir.join("results").join("findings").display(),
         output.status.code(),
         String::from_utf8_lossy(&output.stderr),
     );

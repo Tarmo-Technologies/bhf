@@ -13,6 +13,11 @@ path = "src/lib.rs"
 
 [dependencies]
 corpus = { path = "../corpus" }
+libc = "0.2"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+report = { path = "../report" }
+tempfile.workspace = true

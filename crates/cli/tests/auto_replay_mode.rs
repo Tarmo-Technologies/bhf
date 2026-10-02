@@ -100,7 +100,7 @@ fn replay_reproduces_env_triggered_crash_via_runtime_mode_stamp() {
 
     // Phase 2: read finding.json, verify the stamp.
     let finding_path = root
-        .join("bhf_work/findings")
+        .join("bhf_work/results/findings")
         .join(&finding_id)
         .join("finding.json");
     let finding_dir = finding_path.parent().expect("finding path has parent");

@@ -24,7 +24,7 @@ use std::path::Path;
 /// and the number of findings emitted.
 ///
 /// `findings_root` is the same directory the fuzz path's `FindingEmitter` uses;
-/// findings land at `findings_root/findings/<id>/finding.json`.
+/// findings land at `findings_root/results/findings/<id>/finding.json`.
 pub fn emit_report_only(candidate: &Candidate, reason: String, findings_root: &Path) -> Outcome {
     let dialect = candidate.dialect.map(|d| d.as_str().to_owned());
     let finding_ids = write_static_findings(candidate, findings_root).unwrap_or_default();
@@ -59,7 +59,7 @@ fn write_static_findings(candidate: &Candidate, findings_root: &Path) -> Option<
     let report = static_analysis::scan(&options).ok()?;
 
     let source_canon = std::fs::canonicalize(source).ok();
-    let findings_dir = findings_root.join("findings");
+    let findings_dir = corpus::layout::findings_dir(findings_root);
     let mut written: Vec<String> = Vec::new();
     for f in report
         .findings
@@ -86,7 +86,7 @@ fn write_static_findings(candidate: &Candidate, findings_root: &Path) -> Option<
             .unwrap_or(source)
             .to_string_lossy()
             .into_owned();
-        let record = static_finding_record(
+        let mut record = static_finding_record(
             &id,
             &candidate.harness_id,
             &candidate.name,
@@ -94,6 +94,7 @@ fn write_static_findings(candidate: &Candidate, findings_root: &Path) -> Option<
             candidate.dialect.map(|d| d.as_str()),
             f,
         );
+        corpus::finding::stamp_v1(&mut record, corpus::finding::finding_kind::STATIC);
         if std::fs::write(
             dir.join("finding.json"),
             serde_json::to_vec_pretty(&record).ok()?,
@@ -162,7 +163,7 @@ fn static_finding_record(
     // strcpy) flags a call site with an EMPTY trace, so these stay empty for it
     // (correct — we do not fabricate a flow). The FIRST trace step is the taint
     // SOURCE: surface its file/line via `exception.source_file`/`source_line` so
-    // load_csv_finding's `source` column populates, and join every step as
+    // the finding records where the taint enters, and join every step as
     // `path:line` (deduped consecutive) into `data_flow` for the full path.
     let (source_file, source_line_num, data_flow) = if let Some(first) = f.analysis.trace.first() {
         let mut steps: Vec<String> = Vec::with_capacity(f.analysis.trace.len());
@@ -203,8 +204,8 @@ fn static_finding_record(
         "oracle": {
             "evidence": [ { "key": "source", "value": source_line } ]
         },
-        // #1: taint SOURCE file:line (first trace step) — populates the CSV `source`
-        // column via load_csv_finding. Empty for pattern rules with no trace.
+        // #1: taint SOURCE file:line (first trace step). Empty for pattern rules
+        // with no trace.
         "exception": {
             "message": f.message,
             "source_file": source_file,
@@ -244,7 +245,7 @@ pub fn emit_tree_static_findings(root: &Path, work: &Path) -> usize {
     // on `main.c`, never the user's code. Drop every finding under the work-dir so
     // `--static` reports the target tree, not bhf's scaffolding.
     let work_canon = std::fs::canonicalize(work).unwrap_or_else(|_| work.to_path_buf());
-    let findings_dir = work.join("findings");
+    let findings_dir = corpus::layout::findings_dir(work);
     let mut written = 0usize;
     let mut next_index = 0usize;
     for f in report.findings.iter() {
@@ -263,8 +264,14 @@ pub fn emit_tree_static_findings(root: &Path, work: &Path) -> usize {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "static-scan".to_owned());
         let full_source_path = absolute_reported_path(root, &f.location.path);
-        let record =
+        let mut record =
             static_finding_record(&id, "static-scan", &target_name, &full_source_path, None, f);
+        // This scan is rooted at the project, like `bhf static-scan`, so its
+        // fingerprint lets the results index fold the matching
+        // `static-report.json` entry into this record. (Report-only rows scan
+        // one candidate's directory, so theirs would never match.)
+        record["static_fingerprint"] = serde_json::json!(f.fingerprint);
+        corpus::finding::stamp_v1(&mut record, corpus::finding::finding_kind::STATIC);
         if std::fs::write(
             dir.join("finding.json"),
             serde_json::to_vec_pretty(&record).unwrap_or_default(),
@@ -378,7 +385,7 @@ mod tests {
         assert!(written >= 1, "the user's app.c weakness must be reported");
 
         // Every emitted finding must be on app.c, never the work-dir harness.
-        let findings_dir = work.join("findings");
+        let findings_dir = work.join("results").join("findings");
         for entry in std::fs::read_dir(&findings_dir).unwrap().flatten() {
             let fj = entry.path().join("finding.json");
             if !fj.exists() {
@@ -431,7 +438,7 @@ mod tests {
         let written = emit_tree_static_findings(&root, &work);
         assert!(written >= 2, "expected the taint + pattern findings");
 
-        let findings_dir = work.join("findings");
+        let findings_dir = work.join("results").join("findings");
         let mut saw_taint = false;
         let mut saw_pattern = false;
         for entry in std::fs::read_dir(&findings_dir).unwrap().flatten() {
@@ -536,7 +543,7 @@ mod tests {
         assert!(count >= 1, "expected >=1 static finding, got {count}");
 
         // Every emitted finding.json carries a non-empty CWE.
-        let findings_dir = work.join("findings");
+        let findings_dir = work.join("results").join("findings");
         let mut saw_cwe = false;
         for entry in std::fs::read_dir(&findings_dir).unwrap() {
             let fj = entry.unwrap().path().join("finding.json");
@@ -548,6 +555,12 @@ mod tests {
             let cwe = v["actionability"]["cwe"].as_array().unwrap();
             assert!(!cwe.is_empty(), "report-only finding must carry a CWE");
             assert!(cwe[0].as_str().unwrap().starts_with("CWE-"));
+            // The per-candidate scan is rooted at the source file's directory,
+            // so its fingerprint would never match a project-rooted scan.
+            assert!(
+                v.get("static_fingerprint").is_none(),
+                "report-only finding must not carry a candidate-rooted fingerprint: {v}"
+            );
             saw_cwe = true;
         }
         assert!(saw_cwe, "expected at least one finding.json on disk");

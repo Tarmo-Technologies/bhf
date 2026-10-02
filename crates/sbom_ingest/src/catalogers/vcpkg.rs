@@ -152,7 +152,8 @@ fn parse_dep_entry(
     let (name, constraint) = if let Some(s) = dep.as_str() {
         // Bare string: port name only.
         (s.to_ascii_lowercase(), None::<String>)
-    } else if let Some(obj) = dep.as_object() {
+    } else {
+        let obj = dep.as_object()?;
         let name = obj
             .get("name")
             .and_then(|v| v.as_str())?
@@ -163,8 +164,6 @@ fn parse_dep_entry(
             .and_then(|v| v.as_str())
             .map(|s| s.to_owned());
         (name, constraint)
-    } else {
-        return None;
     };
 
     if name.is_empty() {

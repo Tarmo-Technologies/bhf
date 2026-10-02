@@ -31,7 +31,7 @@ fn report_json(out: &Path) -> PathBuf {
 fn read(path: &Path) -> Value { serde_json::from_slice(&fs::read(path).unwrap()).unwrap() }
 fn comparison(out: &Path) -> Value { read(&report_json(out).with_extension("comparison.json")) }
 fn baseline(root: &Path) -> (PathBuf, PathBuf) {
-    let findings=root.join("findings");fs::create_dir_all(&findings).unwrap();
+    let findings=root.join("results").join("findings");fs::create_dir_all(&findings).unwrap();
     raw(&findings,"before","stable-fixture-signature","high");
     let out=root.join("baseline-report");succeeds(&cli(&findings,&out,&[]));
     (findings,report_json(&out))

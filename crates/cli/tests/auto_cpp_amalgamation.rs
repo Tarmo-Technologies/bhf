@@ -233,7 +233,7 @@ fn cpp_amalgamation_detects_planted_bug_with_nonempty_testcase() {
     // #408 AC4 (the real intent): a genuine crash must carry a NON-EMPTY
     // reproducing testcase — never the empty-testcase artifact the broken driver
     // used to fabricate. Every emitted finding's testcase must be non-empty.
-    let findings_dir = root.join("bhf_work/findings");
+    let findings_dir = root.join("bhf_work/results/findings");
     let mut checked = 0usize;
     for entry in fs::read_dir(&findings_dir).expect("findings dir exists once a bug is found") {
         let tc = entry.unwrap().path().join("testcase.bin");
@@ -353,7 +353,7 @@ fn fork_server_state_masked_crash_is_caught_by_fresh_reverify() {
     );
 
     // AC2: every crash finding carries a real, non-empty reproducing testcase.
-    let findings_dir = root.join("bhf_work/findings");
+    let findings_dir = root.join("bhf_work/results/findings");
     let mut crash_inputs: Vec<Vec<u8>> = Vec::new();
     for entry in fs::read_dir(&findings_dir).expect("findings dir exists once a crash is found") {
         let tc = entry.unwrap().path().join("testcase.bin");

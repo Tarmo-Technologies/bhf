@@ -136,34 +136,48 @@ fn forced_go_targets_build_fuzz_and_are_marked_forced() {
         "the receiver synthesis must name the type: {targets}"
     );
 
-    // The planted CWE-125 read in Feed is found. Its row is floored to `low`
-    // with the forced caveat; an unforced Render finding need not be floored.
-    let csv = std::fs::read_to_string(work.join("auto/findings.csv")).expect("findings.csv");
-    let header: Vec<&str> = csv.lines().next().expect("header").split(',').collect();
-    let confidence = header.iter().position(|c| *c == "confidence").unwrap();
-    let mut forced_rows = 0usize;
-    for row in csv.lines().skip(1) {
-        if !row.contains("entry:Feed") {
+    // The planted CWE-125 read in Feed is found. Its finding is flagged forced
+    // and floored to `low` with the forced caveat; an unforced Render finding
+    // need not be floored. A finding names its harness, not the target, so map
+    // Feed to its harness through run.json.
+    let feed_harness = json["targets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|target| target["name"] == "Feed")
+        .and_then(|target| target["harness_id"].as_str())
+        .unwrap_or_else(|| panic!("run.json must list the Feed target: {json}"));
+    let doc = results_doc(&work);
+    let mut forced_findings = 0usize;
+    for finding in doc["findings"].as_array().into_iter().flatten() {
+        if finding["fuzz"]["harness_id"] != feed_harness {
             continue;
         }
-        forced_rows += 1;
-        let cells: Vec<&str> = row.split(',').collect();
+        forced_findings += 1;
         assert_eq!(
-            cells[confidence], "low",
-            "a forced finding must be low-confidence: {row}"
+            finding["fidelity"]["forced"], true,
+            "a forced finding must be flagged forced: {finding}"
+        );
+        assert_eq!(
+            finding["severity"], "low",
+            "a forced finding must be low-severity: {finding}"
+        );
+        assert_eq!(
+            finding["confidence"]["level"], "low",
+            "a forced finding must be low-confidence: {finding}"
         );
         assert!(
-            row.contains("stub artifact"),
-            "a forced finding must carry the caveat note: {row}"
+            finding.to_string().contains("stub artifact"),
+            "a forced finding must carry the caveat note: {finding}"
         );
     }
     assert!(
-        forced_rows > 0,
-        "the forced Feed panic must be found:\n{csv}"
+        forced_findings > 0,
+        "the forced Feed panic must be found:\n{doc:#}"
     );
     assert!(
-        csv.contains(",125;") || csv.contains(",125,"),
-        "expected a CWE-125 index-out-of-bounds finding:\n{csv}"
+        has_cwe(&doc, 125),
+        "expected a CWE-125 index-out-of-bounds finding:\n{doc:#}"
     );
     let _ = std::fs::remove_dir_all(&work);
 }
@@ -180,4 +194,19 @@ fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn results_doc(work: &std::path::Path) -> serde_json::Value {
+    let bytes = std::fs::read(work.join("results/findings.json")).unwrap_or_default();
+    serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+}
+
+fn has_cwe(doc: &serde_json::Value, cwe: u64) -> bool {
+    doc["findings"].as_array().into_iter().flatten().any(|f| {
+        f["cwe"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|c| c.as_u64() == Some(cwe))
+    })
 }

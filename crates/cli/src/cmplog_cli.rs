@@ -92,6 +92,9 @@ fn hex_encode(bytes: &[u8]) -> String {
 fn base64_encode(bytes: &[u8]) -> String {
     const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    // base64-style 3-byte groups with an explicit remainder tail below;
+    // `chunks_exact` + `remainder()` is the clearest spelling here.
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     let mut chunks = bytes.chunks_exact(3);
     for chunk in &mut chunks {
         let b = ((chunk[0] as u32) << 16) | ((chunk[1] as u32) << 8) | chunk[2] as u32;

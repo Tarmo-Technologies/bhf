@@ -12,6 +12,8 @@ repository.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+corpus = { path = "../corpus" }
+results = { path = "../results" }
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true

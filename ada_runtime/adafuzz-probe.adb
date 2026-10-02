@@ -52,6 +52,36 @@ package body AdaFuzz.Probe is
          return "/tmp/bhf-events.bin";
    end Get_Event_Path;
 
+   --  Portability (#64): when BHF_CRASH_ON_FINDING is set to a value other than
+   --  "0"/"false"/"", a reported finding aborts the process (SIGABRT) instead of
+   --  being swallowed by the harness's top-level handler, so an EXTERNAL
+   --  crash-keying fuzzer (Mayhem base-executable, AFL) detects it as a crash.
+   --  Unset (the default) leaves bhf's own event-reporting path unchanged.
+   function Crash_On_Finding return Boolean is
+      use Ada.Environment_Variables;
+   begin
+      if not Exists ("BHF_CRASH_ON_FINDING") then
+         return False;
+      end if;
+      declare
+         V : constant String := Value ("BHF_CRASH_ON_FINDING");
+      begin
+         return V /= "" and then V /= "0" and then V /= "false";
+      end;
+   exception
+      when others =>
+         return False;
+   end Crash_On_Finding;
+
+   --  Force a crash an external fuzzer detects as a fault (SIGABRT). Defined in
+   --  adafuzz_cov.c: it resets SIGABRT to the default disposition before abort()
+   --  so the GNAT runtime cannot convert the signal into a catchable Ada
+   --  exception (which the harness's top-level `when others` would swallow).
+   --  Pragma form (not an aspect): this body is `pragma Ada_2005`.
+   procedure Crash_Now;
+   pragma Import (C, Crash_Now, "adafuzz_crash_now");
+   pragma No_Return (Crash_Now);
+
    procedure Open_If_Needed is
    begin
       if not Buf_Open then
@@ -373,6 +403,13 @@ package body AdaFuzz.Probe is
       Write_Top_Level_Event
         (Exception_Name    => Exception_Name,
          Exception_Message => Exception_Message);
+      --  For external crash-keying fuzzers: persist the event, then abort so the
+      --  finding surfaces as a process crash (SIGABRT) rather than a swallowed,
+      --  reported-and-continue exception. No-op unless BHF_CRASH_ON_FINDING is set.
+      if Crash_On_Finding then
+         Flush;
+         Crash_Now;
+      end if;
    exception
       when others =>
          null;

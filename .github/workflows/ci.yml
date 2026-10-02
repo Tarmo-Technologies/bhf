@@ -50,6 +50,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Install schema validator
+        # ubuntu-24.04 system Python is externally managed (PEP 668); --user keeps it out of /usr.
+        run: python3 -m pip install --user --break-system-packages "jsonschema==4.25.1"
       - name: Test fail-closed CI policy and path classification
         run: python3 -m unittest discover -s scripts/ci/tests -v
 

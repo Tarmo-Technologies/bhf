@@ -43,9 +43,10 @@ fn binary_fuzz_finds_replayable_stdin_and_file_crashes() {
             .output()
             .unwrap(),
     );
-    let stdin_finding_dir = work.join("findings/BF-0001");
+    let stdin_finding_dir = work.join("results/findings/BF-0001");
     let stdin_finding = read_json(&stdin_finding_dir.join("finding.json"));
     assert_eq!(stdin_finding["kind"], "binary_crash");
+    assert_eq!(stdin_finding["finding_kind"], "binary");
     assert_eq!(stdin_finding["input"]["mode"], "stdin");
     assert_eq!(stdin_finding["crash"]["exit_code"], 42);
     assert_eq!(stdin_finding["env"]["BHF_TEST_ENV"], "1");
@@ -78,6 +79,14 @@ fn binary_fuzz_finds_replayable_stdin_and_file_crashes() {
     );
     let minimized = read_json(&stdin_finding_dir.join("finding.json"));
     assert_eq!(minimized["minimal_reproducer"], "min_testcase.bin");
+    // `replay` stamped last_seen (one history entry) before `minimize` ran, so
+    // minimize is the latest history entry rather than the first.
+    let history = minimized["history"].as_array().expect("history array");
+    assert_eq!(history.last().unwrap()["command"], "minimize");
+    assert!(
+        history.iter().any(|h| h["command"] == "replay"),
+        "replay should have recorded last_seen in history: {history:?}"
+    );
 
     assert_success(
         Command::new(bhf_bin())
@@ -96,7 +105,7 @@ fn binary_fuzz_finds_replayable_stdin_and_file_crashes() {
             .output()
             .unwrap(),
     );
-    let file_finding = read_json(&work.join("findings/BF-0002/finding.json"));
+    let file_finding = read_json(&work.join("results/findings/BF-0002/finding.json"));
     assert_eq!(file_finding["input"]["mode"], "file");
     assert_eq!(file_finding["crash"]["exit_code"], 43);
 }
@@ -105,7 +114,7 @@ fn binary_fuzz_finds_replayable_stdin_and_file_crashes() {
 fn ci_fails_on_binary_crash_findings() {
     let root = temp_dir("ci");
     let work = root.join("work");
-    let finding = work.join("findings/BF-0001");
+    let finding = work.join("results/findings/BF-0001");
     fs::create_dir_all(&finding).unwrap();
     fs::write(
         finding.join("finding.json"),

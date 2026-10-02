@@ -354,7 +354,7 @@ fn sarif_level_to_severity(level: &str) -> String {
 /// `static_scan`, so the fuzz-confirmation join and report treat it like any other
 /// static hit), tagged with the originating tool.
 fn write_finding(work: &Path, id: &str, tool: &str, finding: &ExtFinding) -> bool {
-    let dir = work.join("findings").join(id);
+    let dir = corpus::layout::finding_dir(work, id);
     if std::fs::create_dir_all(&dir).is_err() {
         return false;
     }
@@ -364,7 +364,7 @@ fn write_finding(work: &Path, id: &str, tool: &str, finding: &ExtFinding) -> boo
         .unwrap_or_else(|| "external".to_owned());
     let source_line = format!("{}:{}", finding.path, finding.line);
     let cwe: Vec<String> = finding.cwe.iter().cloned().collect();
-    let record = json!({
+    let mut record = json!({
         "id": id,
         "rule_id": finding.rule,
         "classification": "static_scan",
@@ -384,6 +384,7 @@ fn write_finding(work: &Path, id: &str, tool: &str, finding: &ExtFinding) -> boo
         "analysis": { "engine": format!("bhf.static.external.{tool}") },
         "actionability": { "cwe": cwe, "verdict": "static_only", "confidence": "medium" },
     });
+    corpus::finding::stamp_v1(&mut record, corpus::finding::finding_kind::STATIC);
     std::fs::write(
         dir.join("finding.json"),
         serde_json::to_vec_pretty(&record).unwrap_or_default(),
@@ -529,10 +530,11 @@ mod tests {
         };
         assert!(write_finding(&work, "F-EXT-0000", "gosec", &finding));
         let v: Value = serde_json::from_slice(
-            &std::fs::read(work.join("findings/F-EXT-0000/finding.json")).unwrap(),
+            &std::fs::read(work.join("results/findings/F-EXT-0000/finding.json")).unwrap(),
         )
         .unwrap();
         assert_eq!(v["classification"], "static_scan");
+        assert_eq!(v["finding_kind"], "static");
         assert_eq!(v["external_tool"], "gosec");
         assert_eq!(v["confirmation"], "static");
         assert_eq!(v["actionability"]["cwe"][0], "CWE-78");

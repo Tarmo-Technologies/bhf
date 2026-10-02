@@ -1,229 +1,203 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# bhf finding & report field reference
+# bhf results reference
 
-Every field `bhf auto` emits for a finding, what it means, and how to read it.
+Every command that produces or changes findings writes into one self-contained
+directory, `<work-dir>/results/` (default `bhf_work/results/`), and rebuilds its
+index when it finishes. This doc describes that layout, the `bhf.findings.v1` /
+`bhf.finding.v1` contracts, the CSV columns, and what changed from bhf ≤ 0.2.x.
 
-## Where the data lives
+## Layout
 
-A run puts findings at the work-directory root and campaign mechanics under
-`<work-dir>/auto/`:
-
-| Artifact | What it is |
+| Path | What it is |
 |---|---|
-| `FINDINGS.md` | Primary impact-ordered human finding digest, with evidence links and replay commands. |
-| `findings.csv` | Top-level root-cause index (one row per grouped issue) — see [findings.csv](#findingscsv). `auto/findings.csv` is retained as a compatibility alias. |
-| `findings/F-NNNN-<sig>/finding.json` | The full per-finding record (all fields below). |
-| `findings/F-NNNN-<sig>/testcase.bin` | The crashing input (the reproducer). |
-| `findings/F-NNNN-<sig>/replay.py` | Standalone replay script (runs the harness on the testcase). |
-| `auto/run.md` | Human-readable campaign summary (targets built/fuzzed/skipped and missing build deps). |
-| `auto/run.json` | The same, machine-readable. |
+| `results/INDEX.md` | Start here: summary, then every finding grouped by root cause |
+| `results/findings.json` | Everything, machine-readable (`bhf.findings.v1`). Normative schema: `schemas/bhf.findings.v1.schema.json` |
+| `results/findings.csv` | One row per finding — see [findings.csv](#findingscsv) |
+| `results/findings.sarif` | SARIF 2.1.0, one run, every finding kind except `sca` |
+| `results/manifest.json` | `bhf.results-manifest.v1`: tool, source, full producer history |
+| `results/attestation.json` | in-toto Statement v1 over every file under `results/` |
+| `results/findings/<ID>/` | Evidence for findings that have files: `finding.json`, `testcase.bin`, `min_testcase.bin` (when minimized), `sanitizer.log`, `decoded.json`, `replay.py` / `repro.adb` |
+| `results/static/` | Native `static-scan` output (`static-report.{json,md,sarif}`) |
+| `results/sbom/` | Native `sbom` output (`cyclonedx.json`, `sbom.spdx.json`, `openvex.json`, `vulnerabilities.json`, ...) |
 
-The per-finding writeup in `run.md` is a rendering of `finding.json`; this doc
-describes the underlying fields.
+`static-scan` (`S-*`) and SCA (`F-SCA-*`) findings carry no evidence
+directory — their evidence (a location, or a component) is inline in
+`findings.json`. The static findings `auto` writes as directories
+(`F-STATIC-*`, `F-RO-*`, `F-EXT-*`) keep them, same as any dynamic finding.
 
----
+### ID family → `kind`
 
-## Identity & deduplication
+| IDs | `kind` |
+|---|---|
+| `F-NNNN-<sig8>` | `fuzz` (sanitizer crash, unhandled exception, or oracle hit during fuzzing) |
+| `F-MSAN-*`, `F-TSAN-*`, `F-MEM-*`, `F-JSINK-*`, `F-CAP-*` | `runtime` (replay/profiling passes over the corpus) |
+| `F-DIFF-*` | `differential` |
+| `BF-*` | `binary` |
+| `F-STATIC-*`, `F-RO-*`, `F-EXT-*`, `S-*` | `static` |
+| `F-SCA-*` | `sca` |
+
+`bhf report` rebuilds `results/` on demand. A work dir from bhf ≤ 0.2.x (with
+`findings/` at the top) is migrated into the `results/` layout automatically
+the first time any command opens it; see [Migration from 0.2.x](#migration-from-02x).
+
+## `findings.json` (`bhf.findings.v1`)
+
+`schemas/bhf.findings.v1.schema.json` is the normative definition; this is a
+field summary. `findings.json` always starts with `schema_version`, then
+`generated_at`, `tool`, so an importer can detect the format from the first
+few bytes. Every key is present (`null` where a value does not apply — never
+omitted), and unknown keys are rejected.
+
+Document-level fields: `schema_version`, `generated_at`, `tool` (`{name,
+version, build}`), `source` (`{root, vcs}`), `producers[]` (the last 50
+producer-history entries; `manifest.json` keeps the last 1000), `counts`
+(`{total, by_kind, by_severity, by_confirmation}`), `findings[]`, `groups[]`
+(`{key, representative, members}`), and `errors[]` (`{path, reason}` for
+records that failed to load — a bad record never aborts the rebuild).
+
+### Finding fields
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | string | unique within `results/` |
+| `kind` | enum | `fuzz`, `runtime`, `static`, `binary`, `differential`, `sca` |
+| `producer` | string | command that wrote it, inferred from the ID family |
+| `rule` | `{id, slug, name}`, each nullable | `id` is `BHF-NNNN`, the static rule id, or `null` when no catalog rule matches |
+| `title` | string | one line, for lists |
+| `message` | string | tool message (addresses stripped) |
+| `explanation` | string \| null | plain-English summary |
+| `severity` | enum | `critical`/`high`/`medium`/`low`/`info` — see [Severity](#severity) |
+| `impact` | enum \| null | raw `actionability.impact` |
+| `confidence` | `{level, score}` | level from `high`/`medium`/`low`/`unknown`; score 0–1 or null |
+| `cwe` | int[] | at least one |
+| `confirmation` | `{level, detail}` | see [Confirmation levels](#confirmation-levels) |
+| `verdict` | enum \| null | `real_reachable`, `likely_reachable`, `lab_only`, `blocked`, `unknown` |
+| `location` | `{file, line, column, function}` \| null | repo-relative POSIX path, 1-based |
+| `fix_location` | same shape \| null | the single best place to start a fix |
+| `stack` | `[{function, file, line}]` | project frames only, at most 32 |
+| `trace` | `[{file, line, function, note}]` | static data-flow trace; empty for other kinds |
+| `fingerprint` | `{primary, signature}` | `primary` is the stable cross-run identity |
+| `group` | string \| null | root-cause group key |
+| `occurrences` | int | members in the group this finding represents |
+| `first_seen`, `last_seen` | RFC 3339 \| null | `last_seen` updates when a later run reproduces the same `fingerprint.primary` |
+| `reachability` | object \| null | entry path for fuzz; fuzz reachability for SCA |
+| `fidelity` | `{stubs_used, forced, caveats[]}` | `forced` when the target ran forced-and-stub-heavy under `--force` |
+| `remediation` | string \| null | |
+| `patch_hints` | `[{title, guidance}]` | advisory, not a literal diff |
+| `reproduce` | `{harness_id, command, build}` \| null | `build`: `{sanitizers[], binary_sha256, build_id}`; `command` is relative to `results/` |
+| `evidence` | `{dir, files[]}` \| null | each file: `{role, path, sha256, size}` — roles: `finding`, `testcase`, `testcase_minimized`, `sanitizer_log`, `decoded`, `replay_script`, `repro_ada`, `byte_control` |
+| `fuzz` | `{exception, classification, harness_id, dialect, oracle}` \| null | `exception`: `{name, message, sanitizer}` |
+| `static` | `{engine, precision, snippet, baseline_status, triage_state}` \| null | |
+| `sca` | object \| null | `{vuln_id, aliases[], component, fixed_versions[], cvss, kev, references[], match_confidence, matching_method, vex}` |
+| `binary` | `{sha256, build_id, arch, crash}` \| null | |
+| `raw_ref` | string \| null | path of the source record, relative to `results/` |
+
+### Severity
+
+One `severity` per finding, chosen by the first rule that applies:
+
+1. `impact` (`actionability.impact`), unless it is `unknown`.
+2. The record's own `severity` (static, binary, SCA).
+3. The rule catalog's `default_severity`.
+4. `medium`.
+
+A finding with `fidelity.forced: true` is floored to `low`. `ci --fail-on`
+gating, SARIF `level`, CSV and `INDEX.md` ordering all read this resolved
+`severity`, not the raw `impact`.
+
+### Confirmation levels
+
+`confirmation.level` is a normalized evidence strength; bhf owns these
+semantics so importers don't have to re-derive them from raw fields. The
+first row that matches wins:
+
+| Level | Rule |
+|---|---|
+| `capability` | classification `capability` |
+| `intended_rejection` | classification `intended_rejection` |
+| `crash_lead` | prosthetics/stubs were used, or a sanitizer/unhandled crash with low confidence |
+| `runtime_oracle` | classification `oracle_hit`, confirmation `runtime`, or a differential divergence |
+| `sanitizer_crash` | sanitizer or unhandled crash |
+| `static_confirmed` | static finding confirmed by a fuzz run (`fuzz_confirmed` / `fuzz_exercised`) |
+| `static` | static finding, otherwise |
+| `advisory` | SCA match |
+
+`confirmation.detail` keeps the raw `confirmation` string the record carried.
+
+## `finding.json` (`bhf.finding.v1`)
+
+Every per-finding evidence record (`results/findings/<ID>/finding.json`)
+carries the envelope below, in addition to its producer-specific fields
+(documented inline above per block — `fuzz`, `static`, `sca`, `binary`):
 
 | Field | Meaning |
 |---|---|
-| `id` | The finding id, `F-NNNN-<short-signature>` (e.g. `F-0000-1028b5d3`). Stable within a run; the suffix is the first 8 hex of `signature`. |
-| `signature` | Full SHA-256 of the dedup key (the matched `rule_id` + the normalized crash stack). Two findings with the same `signature` are the same bug. |
-| `cluster_key` | Short (8-hex) crash cluster id — groups findings whose **normalized** stacks match, so 50 mutated inputs that hit the same bug collapse to one cluster. Use this to count *distinct* bugs. |
-| `cluster_key_full` | The full cluster hash (`cluster_key` is its prefix). |
-| `cluster_normalized_frames` | The normalized stack frames (allocator/runtime/harness frames stripped, addresses/templating removed) used to compute the cluster. This is the "shape" of the crash. |
-| `cluster_fallback` | `true` when normal clustering couldn't be computed (e.g. no usable stack) and bhf fell back to the full signature as the cluster key (then `cluster_key` is 16-hex, not 8). A `true` here means "couldn't cluster confidently — may over-split duplicates." |
+| `schema_version` | `"bhf.finding.v1"` |
+| `finding_kind` | one of the `kind` values above (not called `kind`: binary-fuzz records already use `kind: "binary_crash"`) |
+| `created_at` | RFC 3339, set when the finding was first emitted |
+| `last_seen` | RFC 3339, updated when a later run reproduces the same `fingerprint.primary` |
+| `forced` | `true` when the finding came from a forced/stub-heavy build under `--force` |
+| `history[]` | `{at, command, fields[]}` — one entry per enrichment pass (`minimize`, `cartography`, `confirm`, fidelity) that edited this record in place |
+| `minimization_skipped` | `true` when `auto`'s minimization pass ran out of budget before reaching this finding's group |
 
----
+## Producer history
 
-## What crashed
+Every command that writes into `results/` appends one entry to
+`manifest.json` `producers[]`: `{command, argv, started_at, finished_at,
+status, exit_code, findings_total}`. `manifest.json` keeps the last 1000
+entries; `findings.json` `producers[]` shows only the most recent 50 of
+those.
 
-| Field | Meaning |
-|---|---|
-| `exception.name` | The crash class, normalized (e.g. `ASAN_HEAP_BUFFER_OVERFLOW`, `LSAN_MEMORY_LEAK`, `SIGSEGV`, `UBSAN_*`). |
-| `exception.sanitizer` | Which sanitizer reported it: `asan`, `ubsan`, `lsan`, `msan`, `tsan`, or none for a raw signal. |
-| `exception.message` | The first line of the sanitizer/runtime error message, verbatim. |
-| `exception.stack[]` | The crash stack: `{file, function, line}` per frame (top frame first). Frames without source info show only `function`. For Ada findings, `exception.source_file`/`source_line` are remapped to the developer's original (pre-instrumentation) lines. |
-| `classification` | How the fault surfaced relative to the target's own error handling: <br>• `unhandled` — the exception/crash escaped the target up to the harness top level → treat as a **real fault** (crash / DoS). <br>• `swallowed_predefined` — a built-in runtime check (sanitizer, bounds, assert) caught it inside the target → a **masked** memory-safety/DoS bug; review whether it's exploitable with checks suppressed or in a C/C++ port. <br>• `swallowed_user` — the target's *own* code caught it (a user handler). Often intended handling, sometimes a masked bug. |
-| `rule_id` | The bhf finding **rule** that matched, `BHF-NNN` (e.g. `BHF-101`). Stable id you can grep; identifies the detector that fired (a sanitizer class, an OOM rule BHF-209, etc.). |
-| `dialect` | The language of the crashing code: `c`, `cpp`, `ada`, `rust`, `java`, or `unknown`. Drives language-specific rendering (e.g. the Ada reproducer only renders for `ada`). |
-| `runtime_mode` | The execution mode that produced the finding (e.g. `reporting`). |
+Children spawned by multicore fuzz workers and the continuous daemon's job
+workers run with the hidden env var `BHF_RESULTS_DEFER=1`, which skips their
+own per-job rebuild and producer record entirely — the parent process (the
+multicore coordinator, or the daemon's results-refresh thread) merges their
+findings and owns the single record for the batch.
 
----
+## `findings.csv`
 
-## `fidelity` — what was and was NOT exercised (CC-1)
+One row per finding. Columns, from `CSV_HEADER`:
 
-A structured record of which execution dimensions this finding actually
-exercised, so a finding from BHF's host stub-isolation lane (VxWorks / INTEGRITY
-/ QNX / Windows code fuzzed on the x86-64 host with the platform faked) is never
-mistaken for target assurance. This is a safety requirement for
-DO-178/safety-critical users. It replaces the old coarse per-target
-"reduced-fidelity" text caveat; that caveat is now *derived* from this record
-(`fidelity_caveat`, below) so the two can never disagree.
-
-Every finding carries a `fidelity` object with six dimensions —
-`arch`, `endianness`, `rtos_runtime`, `hardware_peripherals`, `concurrency`,
-`sanitizers` — each a `{status, reason}` pair:
-
-| `status` | Meaning |
-|---|---|
-| `exercised` | Genuinely exercised against the real thing (e.g. the code ran on the host ISA and the host **is** the target, or a sanitizer was armed and active). |
-| `not_exercised` | The dimension exists for this target but was faked, stubbed, or never explored — a real fidelity gap. Findings do **not** speak to it. |
-| `not_applicable` | The dimension does not apply (e.g. a plain host process has no RTOS runtime). Not a gap. |
-
-`reason` is a short human string explaining the verdict (e.g. `"vxworks runtime
-stubbed with inert handles; RTOS scheduling/IPC not modeled"`).
-
-How the dimensions are populated:
-
-- **Host stub-isolated target** (`platform_stub` set — VxWorks/INTEGRITY/QNX/Windows):
-  `arch` = `not_exercised` (ran on the host ISA, not the target's),
-  `endianness` = `not_exercised` (target byte order not verified),
-  `rtos_runtime` = `not_exercised` (inert stub handles),
-  `hardware_peripherals` = `not_exercised` (device access faked). The build is
-  otherwise a normal native host build, so `sanitizers` = `exercised` and
-  `concurrency` follows the TSan rule below.
-- **Plain native host target**: `arch`/`endianness` = `exercised` (the host is
-  the target), `rtos_runtime`/`hardware_peripherals` = `not_applicable`.
-- **`concurrency`** = `exercised` **only** when a ThreadSanitizer pass ran
-  (C only); otherwise `not_exercised` — interleavings were not explored.
-- **`sanitizers`** = `exercised` when at least one sanitizer was armed
-  (`asan`/`ubsan` by default; empty under `--sanitizers none` → `not_exercised`).
-
-| Field | Meaning |
-|---|---|
-| `fidelity_caveat` | The one-line human caveat **derived** from `fidelity`. Present **only** for a reduced-fidelity (host-stub) result, enumerating every un-exercised dimension and stating the findings are host-stub evidence, not target assurance. **Absent** on a fully-native target — it never carries a spurious caveat. |
-
-A static-analysis finding (no dynamic execution) carries an all-`not_applicable`
-`fidelity` block and no `fidelity_caveat`.
-
----
-
-## `actionability` — is it worth your time, and where to fix it
-
-This object is bhf's triage verdict. It exists to answer "should I look at this,
-and where?" before you open the stack.
-
-| Field | Meaning |
-|---|---|
-| `verdict` | Reachability assessment: <br>• `real_reachable` — confirmed reachable from attacker-controlled input. <br>• `likely_reachable` — reachable through the public/fuzzed entry, not independently re-confirmed. <br>• `lab_only` — only reproduced under the lab harness / with stubs; not shown reachable in a real build. <br>• `blocked` — a validator/gate is believed to block it. <br>• `unknown` — undetermined. |
-| `impact` | Severity estimate: `critical` / `high` / `medium` / `low` / `info` / `unknown`. `info` = **not a defect** (e.g. the target rejecting malformed input via its own declared exception), shown for visibility; distinct from `low` (a minor *real* defect) and `unknown` (undetermined). |
-| `confidence` | The **categorical** triage confidence: `high` / `medium` / `low`. Lowered when the finding leans on synthetic scaffolding (see `prosthetics`) or an unresolved fix location. **Not** the severity — it's confidence in the *assessment*. This is the coarse bucket; there is also a separate **numeric** model confidence — see [Two confidences](#two-confidences). The `findings.csv` `confidence` column is this categorical value. |
-| `entry_path` | How attacker input reaches the bug: `{kind, source, target}` — e.g. `kind: "harness"`, `source: "testcase.bin"` (the input that drives it), `target: <harness_id>`. |
-| `input_reachability` | How the fuzz input reaches the crashing code: `attacker_reachable` (a read-only untrusted-input buffer parameter), `output_serializer` / `reachability_unproven` (the fuzzed args are caller-controlled — a crash is a harness artifact unless separately proven), or `ipc_channel_reachable`. The last means the function has no input-buffer parameter but the run drove the crash with fuzz data read from a **virtualized IPC channel** (POSIX/System V shared memory, a POSIX message queue, or MMIO `/dev/mem`) — so it *is* input-reachable (and `verdict` is `likely_reachable`, not downgraded), attacker-controlled if that channel crosses a trust boundary. This is the common shape for RTOS / partitioned targets fuzzed through their IPC. |
-| `source` | Where attacker input **enters** — the fuzzed entry point that the testcase drives. (Distinct from `sink` and `fix_location`.) |
-| `sink` | Where it **goes wrong** — the top *resolved project* stack frame (allocator, sanitizer-runtime and bhf-harness frames are skipped): `{file, line, function}`. This is the faulting site. |
-| `fix_location` | The single best place to start a fix: `{path, line, reason}`. `reason` is how it was chosen: <br>• `sanitizer_top_non_runtime_frame` — the top project frame from the sanitizer stack (the normal case). <br>• `sink_frame_no_source` — only a function name was resolvable (no source file); `path` is the function name. <br>If nothing resolves, `fix_location` is absent and the writeup/CSV say "no source location resolved" — it never points at the generated `finding.json`. |
-| `explanation` | Plain-English ("In plain English") summary: what the bug is, what input triggers it, and the impact — written for a non-specialist. |
-| `patch_hints` | Bug-class-specific "Suggested fix" guidance that references the sink (e.g. "bounds-check the index before the access at `<sink>`", "free the allocation on every exit path"). Advisory — not a literal diff. |
-| `cwe` / `cwe_name` | The mapped CWE id(s) + name for the bug class (e.g. `CWE-416` Use After Free, `CWE-401` Missing Release of Memory). |
-| `next_steps[]` | Concrete recommended actions (e.g. "Inspect `<sink>` as the primary fix location", or how to re-run under a real build). |
-| `prosthetics.used` | `true` if bhf auto-stubbed missing dependencies / used fake resources to get the harness to build. When `true`, the finding ran against partly-synthetic code — `confidence` is lowered and you should re-confirm against a real build. |
-| `mode` | The actionability profile: `reporting` (default — report what's found) or `attacking`. |
-
-### Two confidences
-
-There are **two** confidence ratings, and they are different things:
-
-1. **`actionability.confidence`** (above) — a coarse `high`/`medium`/`low` bucket. This
-   is what the `findings.csv` `confidence` column shows.
-2. **The model confidence** — a **numeric 0.00–1.00** score from the `confidence_model`
-   crate. This is what the per-finding writeup's `- Confidence:` line shows, e.g.
-   `Confidence: 1.00 blend` (1.00 is maximal confidence — *not* an artifact). It has
-   three components (in the finding's `confidence` object):
-   - `calibrated` — the rule-based score: a weighted sum over features of the finding.
-   - `learned` — an optional ML-learned score, present only when a trained model is
-     loaded (`--confidence-model <path>`).
-   - `blend` — `calibrated` blended with `learned` (≈ `calibrated` when no learned
-     model is loaded). The writeup prints `"<blend> blend"`, or `"<calibrated> calibrated"`
-     if there is no blend.
-
-   Features feeding the score (`confidence.features` / `confidence.terms`): how much was
-   stubbed (`stub_count`, `calls_through_stub`, `stubbed_call_depth` — more stubbing
-   lowers it), `fake_corba_used`, `breadcrumb_density` (how well the source→sink path was
-   traced), `target_score` (the discovery rank), `handler_kind` / `return_class`,
-   `signature_age`, `param_shape_complexity`. `terms[]` lists each feature's
-   `value`/`weight`/`contribution`, so you can see *why* the number is what it is.
-
-So a finding can read e.g. `confidence: medium` (categorical) **and** `Confidence: 1.00 blend`
-(numeric) at once — the first is the quick bucket, the second is the calibrated model.
-
----
-
-## Provenance & artifacts
-
-| Field | Meaning |
-|---|---|
-| `harness_id` | The stable id of the harness that produced the finding (e.g. `H-X0C65-56DA8C32`). Re-run just this one with `bhf auto … --harness-id <id>`. |
-| `fixture_path` | The source file / fixture the harness was generated from. |
-| `paths` | Artifact filenames inside the finding dir: `finding` (`finding.json`), `testcase` (`testcase.bin`, the reproducer input), `decoded` (`decoded.json`, a decoded view of the input when available). |
-| `build.sandbox` | How the harness was executed: `{mode, strict}` — `mode: "none"` = ran directly; otherwise the sandbox wrapper (bwrap/firejail) and whether strict mode was on. |
-
----
-
-## Reproducing a finding
-
-```sh
-# auto-resolves the harness from the finding's harness_id + work-dir:
-bhf replay --finding F-NNNN-<sig>
-# or run the standalone script:
-python3 <finding-dir>/replay.py
+```
+id,kind,severity,confidence,confirmation,rule_id,cwe,title,file,line,function,group,occurrences,verdict,vuln_id,purl,first_seen,evidence_dir
 ```
 
-`replay.py` is emitted for every finding and runs the built harness on `testcase.bin`
-with the sanitizer env set, reproducing the crash.
+`cwe` is written `CWE-120`; multiple values are `;`-separated.
 
----
+## Migration from 0.2.x
 
-## findings.csv
+bhf 0.3.0 unified every command's output under `results/`. If you have tooling
+reading the old layout directly:
 
-One row per root-cause issue, grouped by `cluster_key_full` (header always
-present; header-only when there are no findings). The most severe observation is
-the representative row; `count` and `member_finding_ids` preserve everything
-collapsed into it. `FINDINGS.md` presents the same groups in impact order.
-
-| Column | Meaning / source |
-|---|---|
-| `id` | Representative finding `id` |
-| `count` | Number of observations collapsed into this root-cause row |
-| `harness_id` | Representative `harness_id` |
-| `rule_id` / `message` | Detector id and one-line defect description |
-| `exception_name` / `sanitizer` | Representative `exception.name` and `exception.sanitizer` (blank for non-crash findings) |
-| `classification` | Representative `classification` |
-| `confirmation` | Strongest evidence in the group: fuzz-confirmed, fuzz, reachable, or static |
-| `impact` / `confidence` / `verdict` | Representative actionability fields; forced/stub-heavy groups are confidence-floored to low |
-| `cwe` | Union of the group's CWE ids, separated by semicolons |
-| `source` / `data_flow` | Input origin and the source-to-sink path when available |
-| `sink_file` / `sink_line` / `sink_function` | Representative `actionability.sink` |
-| `entity` | Affected program entity or symbol |
-| `remediation` | Suggested fix / patch guidance |
-| `signature` | Representative finding signature |
-| `member_finding_ids` | Semicolon-separated member ids when `count > 1`; blank for a singleton |
-| `stub_total` / `stub_blind` / `stub_declared` / `linked_real` | How much generated scaffolding stood between the harness and real dependency code; blank means not measured, not zero |
-| `scan_type` | Optional with `--static-dynamic`: `static-dynamic` when any grouped member came from static analysis, otherwise `dynamic` |
-| `forced` | Optional with `--force`: the forced/stub-artifact caveat for the group |
-
----
-
-## Run-level summary (`run.md` / `run.json`)
-
-Beyond the per-finding list:
-
-| Field | Meaning |
-|---|---|
-| Targets discovered / built+fuzzed / skipped | Discovery found N fuzzable subprograms (ranked by score); of those, how many built+fuzzed vs were skipped (un-buildable / un-harnessable). With `--max-targets N`, the line shows "keeping the top N of M ranked target(s)". |
-| `needed_for_build` (dependency manifest) | Headers / libraries / Ada units that were missing and had to be stubbed or are still blocking a build — the "bring these to the offline machine" list (`<work>/auto/missing-deps.txt`). `stubbed_*` = resolved by auto-stubbing; `missing_*` = still blocking. |
-| Discovery cache line | Caching is on by default: "discovery loaded from cache (… source tree unchanged)" on a hit, or "discovery cache miss (… reason)" naming why it recomputed (no cache file yet / source fingerprint changed / format version bump / different root). `--fresh-discovery` forces a recompute; `--no-discovery-cache` disables it. |
-| `summary.fidelity` (CC-1) | The campaign-level fidelity rollup. `reduced_fidelity_targets` = how many fuzzed targets were host-stub (not target assurance); `stubbed_platforms` = the foreign platforms stub-isolated this run (e.g. `["vxworks"]`); `dimensions` = the worst-case per-dimension [`fidelity`](#fidelity--what-was-and-was-not-exercised-cc-1) across all fuzzed targets (a single stubbed target flags the run); `caveat` = the derived one-line caveat, present iff any fuzzed target was reduced-fidelity. A fully-native sweep reports `reduced_fidelity_targets: 0` and no `caveat`. |
-| `targets[].fidelity` (CC-1) | The per-target `fidelity` record (same shape as the per-finding block), present for every built+fuzzed target. `run.md`'s per-target line appends the derived caveat for a reduced-fidelity target and nothing for a native one. |
-
----
+- `FINDINGS.md`, `findings.csv` / `auto/findings.csv` at the work-dir top,
+  `auto/attestation.json`, and `reports/run-last.*` are gone. Use
+  `results/INDEX.md`, `results/findings.{json,csv,sarif}`, and
+  `results/attestation.json`.
+- The per-finding writeup used to live in `run.md`; it no longer does.
+  `run.md`/`run.json` keep campaign mechanics only (targets built/fuzzed/
+  skipped, missing build deps) — read findings from `results/` instead.
+- `findings.csv` has the single column set above. The per-harness stub
+  accounting (`stub_total`, `stub_blind`, `stub_declared`, `linked_real`) moved
+  to `auto/run.json` `targets[]`; `--static-dynamic` is a no-op.
+- `runtime_mode` is not written anywhere in the new contract.
+- An old-layout work dir (`<work>/findings/` at the top) is migrated
+  automatically — `findings/` is renamed to `results/findings/`, the legacy
+  index files are deleted, and `results/` is rebuilt — the first time any
+  command opens it. `replay`, `minimize`, `capsule`, and `--resume` keep
+  working against a migrated work dir.
+- Tools that read `bhf_work/findings.csv` or `bhf_work/findings/` directly
+  must switch to `results/findings.json` (schema in `schemas/`, reference
+  fixture in `tests/fixtures/golden_results/`).
 
 ## Quick reading guide
 
-- **Distinct bugs?** count unique `cluster_key`.
-- **Is it real / worth triaging?** `classification: unhandled` + `verdict: likely_reachable`/`real_reachable` + `prosthetics.used: false`. Treat `impact: info` and `classification: intended_rejection` as non-defects.
-- **How bad?** `impact` (severity) + `cwe`. `confidence` qualifies the *verdict*, not the severity.
-- **Where to fix?** `sink` (where it faults) and `fix_location` (where to start) — and read `explanation` + `patch_hints` first.
-- **Reproduce?** `replay.py` or `bhf replay --finding <id>`.
+- **Distinct bugs?** count unique `fingerprint.primary` (or `group`).
+- **Is it real / worth triaging?** `confirmation.level` of `sanitizer_crash` or
+  stronger, plus `verdict` of `likely_reachable`/`real_reachable`. Treat
+  `impact: info` and `confirmation.level: intended_rejection` as non-defects.
+- **How bad?** `severity` + `cwe`.
+- **Where to fix?** `location` (where it faults) and `fix_location` (where to
+  start) — read `explanation` + `patch_hints` first.
+- **Reproduce?** `evidence.files[role=replay_script]`, or
+  `bhf replay --finding <id>`.

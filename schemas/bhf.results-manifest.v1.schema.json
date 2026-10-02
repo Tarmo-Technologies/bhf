@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Tarmo-Technologies/bhf/schemas/bhf.results-manifest.v1.schema.json",
+  "title": "bhf.results-manifest.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "tool", "source", "producers"],
+  "properties": {
+    "schema_version": { "const": "bhf.results-manifest.v1" },
+    "tool": { "$ref": "bhf.findings.v1.schema.json#/$defs/tool" },
+    "source": { "$ref": "bhf.findings.v1.schema.json#/$defs/source" },
+    "producers": { "type": "array", "items": { "$ref": "bhf.findings.v1.schema.json#/$defs/producer" } }
+  }
+}

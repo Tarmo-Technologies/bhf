@@ -41,6 +41,10 @@ pub struct EnvCapsuleArgs {
 }
 
 pub fn run(args: EnvCapsuleArgs) -> i32 {
+    if let Err(error) = crate::workdir::prepare(&args.work_dir) {
+        bhfeprintln!("error: {error:#}");
+        return 1;
+    }
     let Some(shim) = crate::auto::shim_path::locate() else {
         bhfeprintln!(
             "bhf env-capsule: the runtrace shim (libbhf_runtrace.so) was not found; \
@@ -110,7 +114,7 @@ struct FindingRef {
 }
 
 fn collect(work_dir: &Path, only: Option<&str>) -> anyhow::Result<Vec<FindingRef>> {
-    let dir = work_dir.join("findings");
+    let dir = corpus::layout::findings_dir(work_dir);
     let entries = std::fs::read_dir(&dir)
         .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", dir.display()))?;
     let mut out = Vec::new();

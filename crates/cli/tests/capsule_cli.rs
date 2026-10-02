@@ -53,7 +53,7 @@ fn snippet_into(src: &str, work: &Path) {
         .expect("run bhf snippet");
     let _ = std::fs::remove_file(&tmp);
     assert!(
-        work.join("findings").is_dir(),
+        work.join("results").join("findings").is_dir(),
         "snippet produced no findings: {}",
         String::from_utf8_lossy(&out.stderr)
     );

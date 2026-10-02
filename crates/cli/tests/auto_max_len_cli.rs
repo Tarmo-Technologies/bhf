@@ -51,7 +51,7 @@ fn write_fixture(dir: &Path) {
 /// Largest reproducer byte-length across all findings, or 0 if none.
 fn largest_repro(work: &Path) -> usize {
     let mut largest = 0;
-    if let Ok(entries) = std::fs::read_dir(work.join("findings")) {
+    if let Ok(entries) = std::fs::read_dir(work.join("results").join("findings")) {
         for entry in entries.flatten() {
             if let Ok(tc) = std::fs::read(entry.path().join("testcase.bin")) {
                 largest = largest.max(tc.len());

@@ -381,27 +381,31 @@ fn pack_create_builds_deterministic_integrity_digest_manifest() {
 fn export_bundle_writes_manifest_for_reports_static_policy_and_pack() {
     let root = temp_dir("export");
     let work = root.join("bhf_work");
-    fs::create_dir_all(work.join("reports")).unwrap();
-    fs::create_dir_all(work.join("static")).unwrap();
-    fs::create_dir_all(work.join("sbom")).unwrap();
-    fs::write(work.join("reports/run-last.json"), b"{\"run\":\"last\"}\n").unwrap();
+    fs::create_dir_all(work.join("results/report")).unwrap();
+    fs::create_dir_all(work.join("results/static")).unwrap();
+    fs::create_dir_all(work.join("results/sbom")).unwrap();
     fs::write(
-        work.join("static/static-report.json"),
+        work.join("results/report/run-last.json"),
+        b"{\"run\":\"last\"}\n",
+    )
+    .unwrap();
+    fs::write(
+        work.join("results/static/static-report.json"),
         b"{\"schema_version\":\"bhf.static.v1\"}\n",
     )
     .unwrap();
     fs::write(
-        work.join("sbom/sbom.json"),
+        work.join("results/sbom/sbom.json"),
         b"{\"schema_version\":\"bhf.sbom.v1\"}\n",
     )
     .unwrap();
     fs::write(
-        work.join("sbom/cyclonedx.json"),
+        work.join("results/sbom/cyclonedx.json"),
         b"{\"bomFormat\":\"CycloneDX\",\"specVersion\":\"1.6\"}\n",
     )
     .unwrap();
     fs::write(
-        work.join("sbom/vulnerabilities.json"),
+        work.join("results/sbom/vulnerabilities.json"),
         b"{\"schema_version\":\"bhf.vulnerabilities.v1\"}\n",
     )
     .unwrap();
@@ -431,14 +435,19 @@ fn export_bundle_writes_manifest_for_reports_static_policy_and_pack() {
     let manifest: serde_json::Value = read_json(&out);
     assert_eq!(manifest["schema_version"], "bhf.export.v1");
     assert_eq!(manifest["counts"]["artifacts"], 7);
-    assert!(artifact(&manifest, "report_json", "reports/run-last.json").is_some());
-    assert!(artifact(&manifest, "static_report", "static/static-report.json").is_some());
-    assert!(artifact(&manifest, "sbom", "sbom/sbom.json").is_some());
-    assert!(artifact(&manifest, "cyclonedx_sbom", "sbom/cyclonedx.json").is_some());
+    assert!(artifact(&manifest, "report_json", "results/report/run-last.json").is_some());
+    assert!(artifact(
+        &manifest,
+        "static_report",
+        "results/static/static-report.json"
+    )
+    .is_some());
+    assert!(artifact(&manifest, "sbom", "results/sbom/sbom.json").is_some());
+    assert!(artifact(&manifest, "cyclonedx_sbom", "results/sbom/cyclonedx.json").is_some());
     assert!(artifact(
         &manifest,
         "vulnerability_report",
-        "sbom/vulnerabilities.json"
+        "results/sbom/vulnerabilities.json"
     )
     .is_some());
     assert!(artifact(&manifest, "policy", "policy.json").is_some());
@@ -449,10 +458,14 @@ fn export_bundle_writes_manifest_for_reports_static_policy_and_pack() {
 fn export_bundle_materializes_artifacts_for_air_gapped_handoff() {
     let root = temp_dir("export-materialized");
     let work = root.join("bhf_work");
-    fs::create_dir_all(work.join("reports")).unwrap();
-    fs::create_dir_all(work.join("findings/F-1")).unwrap();
-    fs::write(work.join("reports/run-last.json"), b"{\"run\":\"last\"}\n").unwrap();
-    fs::write(work.join("findings/F-1/testcase.bin"), b"replay").unwrap();
+    fs::create_dir_all(work.join("results/report")).unwrap();
+    fs::create_dir_all(work.join("results/findings/F-1")).unwrap();
+    fs::write(
+        work.join("results/report/run-last.json"),
+        b"{\"run\":\"last\"}\n",
+    )
+    .unwrap();
+    fs::write(work.join("results/findings/F-1/testcase.bin"), b"replay").unwrap();
     let policy = root.join("policy.json");
     fs::write(&policy, b"{\"schema_version\":\"bhf.policy.v1\"}\n").unwrap();
 
@@ -481,8 +494,13 @@ fn export_bundle_materializes_artifacts_for_air_gapped_handoff() {
         manifest["bundle"]["path"].as_str().unwrap(),
         bundle_dir.to_string_lossy()
     );
-    let report = artifact(&manifest, "report_json", "reports/run-last.json").unwrap();
-    let replay = artifact(&manifest, "replay_input", "findings/F-1/testcase.bin").unwrap();
+    let report = artifact(&manifest, "report_json", "results/report/run-last.json").unwrap();
+    let replay = artifact(
+        &manifest,
+        "replay_input",
+        "results/findings/F-1/testcase.bin",
+    )
+    .unwrap();
     let policy_artifact = artifact(&manifest, "policy", "policy.json").unwrap();
     for copied in [report, replay, policy_artifact] {
         let bundle_path = copied["bundle_path"].as_str().unwrap();
@@ -1478,8 +1496,9 @@ fn enterprise_ops_support_runners_packs_policy_ci_audit_and_dashboard() {
     );
     assert_eq!(ci_json["budget"]["strategy"], "deterministic-risk");
 
+    fs::create_dir_all(work.join("results/report")).unwrap();
     fs::write(
-        work.join("reports/run-last.junit.xml"),
+        work.join("results/report/run-last.junit.xml"),
         b"<?xml version=\"1.0\"?><testsuite tests=\"1\" failures=\"0\"/>\n",
     )
     .unwrap();

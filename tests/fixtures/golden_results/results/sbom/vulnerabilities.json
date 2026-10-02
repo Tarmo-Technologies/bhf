@@ -1,0 +1,30 @@
+{
+  "matches": [
+    {
+      "component": {
+        "cpe": null,
+        "ecosystem": "npm",
+        "name": "example",
+        "purl": "pkg:npm/example@2.4.2",
+        "version": "2.4.2"
+      },
+      "cwe": [
+        "CWE-1395"
+      ],
+      "id": "CVE-2026-0001",
+      "match_confidence": "high",
+      "matching_method": "purl",
+      "reachability": {
+        "source": "auto_run",
+        "status": "not_observed"
+      },
+      "severity": "high",
+      "summary": "test advisory",
+      "vex": {
+        "advisory_fixed_versions": [
+          "2.4.3"
+        ]
+      }
+    }
+  ]
+}

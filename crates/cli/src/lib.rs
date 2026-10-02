@@ -88,6 +88,7 @@ mod support_report;
 mod target_filter;
 pub mod transport_fault;
 mod transport_fuzz;
+pub mod workdir;
 
 #[derive(Debug, Parser)]
 #[command(name = "bhf")]
@@ -339,14 +340,32 @@ where
     match args.command {
         Some(Command::Auto(auto_args)) => {
             build::activate_compatible_clang();
-            auto::cli::run(auto_args)
+            // Info and plan modes produce no findings: no producer record and
+            // no results/ (`--list-fakes` never touches the work dir at all).
+            if auto_args.list_fakes || auto_args.list_targets || auto_args.dry_run {
+                auto::cli::run(auto_args)
+            } else {
+                let work = auto_args.work_dir.clone();
+                with_results(&work, "auto", None, workdir::auto_status, || {
+                    auto::cli::run(auto_args)
+                })
+            }
         }
         // Nested parents. The flat BinaryScan/.../ListOracles arms below are
         // retained for the hidden back-compat aliases.
         Some(Command::Binary(binary)) => match binary.command {
             BinaryCommand::Scan(args) => binary_scan::run(args),
             BinaryCommand::Adapter(args) => binary_adapter::run(args, profile),
-            BinaryCommand::Fuzz(args) => binary_fuzz::run(args),
+            BinaryCommand::Fuzz(args) => {
+                let work = args.work_dir.clone();
+                with_results(
+                    &work,
+                    "binary fuzz",
+                    None,
+                    |_| results::model::ProducerStatus::Complete,
+                    || binary_fuzz::run(args),
+                )
+            }
         },
         Some(Command::List(list)) => match list.command {
             ListCommand::Targets(args) => match list_targets::run(args) {
@@ -361,7 +380,16 @@ where
         Some(Command::Audit(args)) => audit::run(args),
         Some(Command::Benchmark(args)) => benchmark::run(args),
         Some(Command::BinaryAdapter(args)) => binary_adapter::run(args, profile),
-        Some(Command::BinaryFuzz(args)) => binary_fuzz::run(args),
+        Some(Command::BinaryFuzz(args)) => {
+            let work = args.work_dir.clone();
+            with_results(
+                &work,
+                "binary fuzz",
+                None,
+                |_| results::model::ProducerStatus::Complete,
+                || binary_fuzz::run(args),
+            )
+        }
         Some(Command::BinaryScan(args)) => binary_scan::run(args),
         Some(Command::BugReport(args)) => support_report::run(args),
         Some(Command::Build(build_args)) => {
@@ -371,18 +399,49 @@ where
         Some(Command::Capsule(args)) => capsule::run(args),
         Some(Command::VerifyPoc(args)) => capsule::run_verify(args),
         Some(Command::EnvCapsule(args)) => env_capsule::run(args),
-        Some(Command::Ci(ci_args)) => ci::run(ci_args),
+        Some(Command::Ci(ci_args)) => {
+            let work = ci_args.work_dir.clone();
+            with_results(&work, "ci", None, workdir::auto_status, || ci::run(ci_args))
+        }
         Some(Command::Clean(clean_args)) => clean::run(clean_args),
         Some(Command::Cmplog(args)) => cmplog_cli::run(args),
         Some(Command::Corpus(corpus_args)) => corpus::run(corpus_args),
         Some(Command::Dashboard(args)) => dashboard::run(args),
-        Some(Command::Differential(diff_args)) => differential::run(diff_args),
+        Some(Command::Differential(diff_args)) => {
+            let diff_args = diff_args.resolve_deprecated_out();
+            let work = diff_args.work_dir.clone();
+            with_results(
+                &work,
+                "differential",
+                None,
+                |_| results::model::ProducerStatus::Complete,
+                || differential::run(diff_args),
+            )
+        }
         Some(Command::Explain(args)) => explain::run(args),
-        Some(Command::Cartography(args)) => cartography::run(args),
+        Some(Command::Cartography(args)) => {
+            let work = args.work_dir.clone();
+            with_results(
+                &work,
+                "cartography",
+                None,
+                |_| results::model::ProducerStatus::Complete,
+                || cartography::run(args),
+            )
+        }
         Some(Command::ExtractStateMachines(args)) => extract_state_machines::run(args),
         Some(Command::FakeCorba(fake_corba_args)) => fake_corba::run(fake_corba_args),
         Some(Command::Export(args)) => export_bundle::run(args),
-        Some(Command::Fuzz(fuzz_args)) => fuzz::run(fuzz_args),
+        Some(Command::Fuzz(fuzz_args)) => {
+            let work = fuzz_args.work_dir.clone();
+            with_results(
+                &work,
+                "fuzz",
+                None,
+                |_| results::model::ProducerStatus::Complete,
+                || fuzz::run(fuzz_args),
+            )
+        }
         Some(Command::LicenseAudit(license_audit_args)) => {
             license_audit::run(license_audit_args, profile)
         }
@@ -417,11 +476,43 @@ where
                 1
             }
         },
-        Some(Command::Minimize(minimize_args)) => minimize::run(minimize_args),
+        Some(Command::Minimize(minimize_args)) => match minimize::work_dir_hint(&minimize_args) {
+            Some(work) => with_results(
+                &work,
+                "minimize",
+                None,
+                |_| results::model::ProducerStatus::Complete,
+                || minimize::run(minimize_args),
+            ),
+            None => minimize::run(minimize_args),
+        },
         Some(Command::Model(model_args)) => model::run(model_args),
         Some(Command::Pack(args)) => pack::run(args),
         Some(Command::Policy(args)) => policy::run(args),
         Some(Command::Readiness(args)) => readiness::run(args),
+        Some(Command::Report(report_args))
+            if report_args.findings.is_none() && report_args.out.is_none() =>
+        {
+            // `report` is not a producer: no manifest record. It rebuilds the
+            // index directly, and must exit non-zero when the rebuild fails.
+            let work = report_args.work_dir.clone();
+            if let Err(error) = workdir::prepare(&work) {
+                bhfeprintln!("error: {error:#}");
+                return 1;
+            }
+            match results::rebuild(&work, &results::RebuildOptions::default()) {
+                Ok(summary) => bhfeprintln!(
+                    "Results: {} ({} findings)",
+                    summary.index_path.display(),
+                    summary.findings
+                ),
+                Err(error) => {
+                    bhfeprintln!("error: results index not rebuilt: {error}");
+                    return 1;
+                }
+            }
+            report::run(report_args)
+        }
         Some(Command::Report(report_args)) => report::run(report_args),
         Some(Command::Replay(replay_args)) => replay::run(replay_args),
         Some(Command::Rules(rules_args)) => rules::run(rules_args),
@@ -429,14 +520,92 @@ where
         Some(Command::Scan(scan_args)) => scan::run(scan_args),
         Some(Command::Snippet(snippet_args)) => {
             build::activate_compatible_clang();
-            snippet::run(snippet_args)
+            let work = snippet_args.work_dir.clone();
+            with_results(&work, "snippet", None, workdir::auto_status, || {
+                snippet::run(snippet_args)
+            })
         }
-        Some(Command::Sbom(args)) => sbom::run(args),
-        Some(Command::StaticScan(args)) => static_scan::run(args),
+        Some(Command::Sbom(args)) => {
+            let (_, into_results) = args.output_target();
+            if into_results {
+                let work = args.work_dir.clone();
+                let root = args.path.clone();
+                // `sbom` also accepts a manifest file; only a dir is a source root.
+                with_results(
+                    &work,
+                    "sbom",
+                    root.is_dir().then_some(root.as_path()),
+                    |_| results::model::ProducerStatus::Complete,
+                    || sbom::run(args),
+                )
+            } else {
+                sbom::run(args)
+            }
+        }
+        Some(Command::StaticScan(args)) => {
+            let (_, into_results) = args.output_target();
+            if into_results {
+                let work = args.work_dir.clone();
+                let root = args.path.clone();
+                with_results(
+                    &work,
+                    "static-scan",
+                    Some(&root),
+                    |_| results::model::ProducerStatus::Complete,
+                    || static_scan::run(args),
+                )
+            } else {
+                static_scan::run(args)
+            }
+        }
         Some(Command::Sloc(args)) => sloc::run(args),
         Some(Command::Stub(stub_args)) => stub::run(stub_args),
         None => 0,
     }
+}
+
+/// Run a findings-producing command inside a results bracket: migrate a legacy
+/// work dir, run, then append to results/manifest.json and rebuild results/.
+/// `prepare` is idempotent, so commands that also call it themselves are fine.
+/// `source_root` is the scanned tree, for commands that know it directly.
+fn with_results(
+    work_dir: &std::path::Path,
+    command: &str,
+    source_root: Option<&std::path::Path>,
+    status: impl FnOnce(&std::path::Path) -> results::model::ProducerStatus,
+    run: impl FnOnce() -> i32,
+) -> i32 {
+    let defer = std::env::var_os(::corpus::layout::RESULTS_DEFER_ENV).is_some_and(|v| v == "1");
+    with_results_in(work_dir, command, source_root, defer, status, run)
+}
+
+/// [`with_results`] with the [`::corpus::layout::RESULTS_DEFER_ENV`] switch
+/// passed in. A deferred run (a child an orchestrator spawned) leaves the
+/// producer record and the rebuild to its parent; a run whose work dir does
+/// not exist afterwards (a missing or mistyped path) records nothing, so the
+/// bracket never creates one.
+fn with_results_in(
+    work_dir: &std::path::Path,
+    command: &str,
+    source_root: Option<&std::path::Path>,
+    defer: bool,
+    status: impl FnOnce(&std::path::Path) -> results::model::ProducerStatus,
+    run: impl FnOnce() -> i32,
+) -> i32 {
+    if let Err(error) = workdir::prepare(work_dir) {
+        bhfeprintln!("error: {error:#}");
+        return 1;
+    }
+    let mut producer = results::ProducerRun::begin(work_dir, command, std::env::args().collect());
+    if let Some(root) = source_root {
+        producer = producer.source_root(&workdir::plain_canonical(root));
+    }
+    let code = run();
+    if defer || !work_dir.is_dir() {
+        return code;
+    }
+    workdir::finish(producer, code, status(work_dir));
+    code
 }
 
 fn parse_profile(value: &str) -> Result<Profile, String> {
@@ -453,6 +622,55 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static PATH_LOCK: Mutex<()> = Mutex::new(());
+
+    fn complete(_: &Path) -> results::model::ProducerStatus {
+        results::model::ProducerStatus::Complete
+    }
+
+    #[test]
+    fn deferred_bracket_runs_the_command_but_records_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ran = false;
+        let code = super::with_results_in(tmp.path(), "fuzz", None, true, complete, || {
+            ran = true;
+            3
+        });
+        assert_eq!((code, ran), (3, true));
+        assert!(
+            !tmp.path().join("results").exists(),
+            "no record, no rebuild"
+        );
+
+        let code = super::with_results_in(tmp.path(), "fuzz", None, false, complete, || 0);
+        assert_eq!(code, 0);
+        assert!(tmp.path().join("results/manifest.json").is_file());
+    }
+
+    #[test]
+    fn bracket_never_creates_a_missing_work_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("typo");
+        let code = super::with_results_in(&missing, "fuzz", None, false, complete, || 3);
+        assert_eq!(code, 3);
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn bracket_records_the_canonical_source_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("sub")).unwrap();
+        let work = tmp.path().join("work");
+        fs::create_dir_all(&work).unwrap();
+        let dotted = src.join("sub/..");
+        super::with_results_in(&work, "static-scan", Some(&dotted), false, complete, || 0);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(work.join("results/manifest.json")).unwrap()).unwrap();
+        assert_eq!(
+            manifest["source"]["root"].as_str(),
+            Some(src.canonicalize().unwrap().to_str().unwrap())
+        );
+    }
 
     #[test]
     fn every_subcommand_has_a_description() {

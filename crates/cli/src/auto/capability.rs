@@ -385,7 +385,7 @@ fn write_capability_finding(
     caps: &[&Capability],
     static_sinks: &[StaticSink],
 ) -> bool {
-    let dir = work.join("findings").join(id);
+    let dir = corpus::layout::finding_dir(work, id);
     if std::fs::create_dir_all(&dir).is_err() {
         return false;
     }
@@ -425,7 +425,7 @@ fn write_capability_finding(
         "Attacker input can make {name} {} — this capability is exercised by the fuzz corpus but by no baseline input, so it is input-triggered attack surface.{taint_note}",
         human_kind(kind)
     );
-    let record = json!({
+    let mut record = json!({
         "id": id,
         "rule_id": "BHF-668",
         "classification": "capability",
@@ -449,6 +449,7 @@ fn write_capability_finding(
             "confidence": if tainted { "high" } else { "medium" }
         },
     });
+    corpus::finding::stamp_v1(&mut record, corpus::finding::finding_kind::RUNTIME);
     std::fs::write(
         dir.join("finding.json"),
         serde_json::to_vec_pretty(&record).unwrap_or_default(),
@@ -795,7 +796,7 @@ mod tests {
             &[&cap],
             &[],
         ));
-        let raw = read_json(&work.join("findings/F-CAP-0000/finding.json")).unwrap();
+        let raw = read_json(&work.join("results/findings/F-CAP-0000/finding.json")).unwrap();
         assert_eq!(raw["rule_id"], "BHF-668");
         assert_eq!(raw["actionability"]["cwe"][0], "CWE-77");
         assert_eq!(raw["severity"], "high"); // tainted -> high
@@ -919,7 +920,7 @@ mod tests {
             &[&cap],
             &static_sinks,
         ));
-        let raw = read_json(&work.join("findings/F-CAP-0000/finding.json")).unwrap();
+        let raw = read_json(&work.join("results/findings/F-CAP-0000/finding.json")).unwrap();
         assert_eq!(
             raw.pointer("/oracle/evidence/0/value").unwrap(),
             "csrc/cmd.c:4:run_cmd",

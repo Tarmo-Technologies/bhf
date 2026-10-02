@@ -1,0 +1,382 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Tarmo-Technologies/bhf/schemas/bhf.findings.v1.schema.json",
+  "title": "bhf.findings.v1",
+  "description": "Every finding from every bhf producer in one work dir. Written to <work>/results/findings.json by `results::rebuild`.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "generated_at", "tool", "source", "producers", "counts", "findings", "groups", "errors"],
+  "properties": {
+    "schema_version": { "const": "bhf.findings.v1" },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "tool": { "$ref": "#/$defs/tool" },
+    "source": { "$ref": "#/$defs/source" },
+    "producers": { "type": "array", "items": { "$ref": "#/$defs/producer" } },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["total", "by_kind", "by_severity", "by_confirmation"],
+      "properties": {
+        "total": { "type": "integer", "minimum": 0 },
+        "by_kind": { "$ref": "#/$defs/count_map" },
+        "by_severity": { "$ref": "#/$defs/count_map" },
+        "by_confirmation": { "$ref": "#/$defs/count_map" }
+      }
+    },
+    "findings": { "type": "array", "items": { "$ref": "#/$defs/finding" } },
+    "groups": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["key", "representative", "members"],
+        "properties": {
+          "key": { "type": "string", "minLength": 1 },
+          "representative": { "type": "string", "minLength": 1 },
+          "members": { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+        }
+      }
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "reason"],
+        "properties": { "path": { "type": "string" }, "reason": { "type": "string" } }
+      }
+    }
+  },
+  "$defs": {
+    "count_map": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } },
+    "nullable_string": { "type": ["string", "null"] },
+    "tool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "build"],
+      "properties": {
+        "name": { "const": "bhf" },
+        "version": { "type": "string", "minLength": 1 },
+        "build": { "type": "string", "minLength": 1 }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["root", "vcs"],
+      "properties": {
+        "root": { "$ref": "#/$defs/nullable_string" },
+        "vcs": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind", "commit", "branch", "dirty"],
+              "properties": {
+                "kind": { "const": "git" },
+                "commit": { "type": "string", "pattern": "^[0-9a-f]{40,64}$" },
+                "branch": { "$ref": "#/$defs/nullable_string" },
+                "dirty": { "type": ["boolean", "null"] }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "producer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command", "argv", "started_at", "finished_at", "status", "exit_code", "findings_total"],
+      "properties": {
+        "command": { "type": "string", "minLength": 1 },
+        "argv": { "type": "array", "items": { "type": "string" } },
+        "started_at": { "type": "string", "format": "date-time" },
+        "finished_at": { "type": "string", "format": "date-time" },
+        "status": { "enum": ["complete", "partial"] },
+        "exit_code": { "type": "integer" },
+        "findings_total": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "kind": { "enum": ["fuzz", "runtime", "static", "binary", "differential", "sca"] },
+    "severity": { "enum": ["critical", "high", "medium", "low", "info"] },
+    "confirmation_level": {
+      "enum": ["sanitizer_crash", "runtime_oracle", "capability", "crash_lead", "intended_rejection", "static_confirmed", "static", "advisory"]
+    },
+    "location": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file", "line", "column", "function"],
+      "properties": {
+        "file": { "type": "string", "minLength": 1 },
+        "line": { "type": ["integer", "null"], "minimum": 1 },
+        "column": { "type": ["integer", "null"], "minimum": 1 },
+        "function": { "$ref": "#/$defs/nullable_string" }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id", "kind", "producer", "rule", "title", "message", "explanation", "severity", "impact",
+        "confidence", "cwe", "confirmation", "verdict", "location", "fix_location", "stack", "trace",
+        "fingerprint", "group", "occurrences", "first_seen", "last_seen", "reachability", "fidelity",
+        "remediation", "patch_hints", "reproduce", "evidence", "fuzz", "static", "sca", "binary", "raw_ref"
+      ],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+        "kind": { "$ref": "#/$defs/kind" },
+        "producer": { "enum": ["auto", "fuzz", "static-scan", "binary fuzz", "differential", "sbom"] },
+        "rule": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id", "slug", "name"],
+          "properties": {
+            "id": { "$ref": "#/$defs/nullable_string" },
+            "slug": { "$ref": "#/$defs/nullable_string" },
+            "name": { "$ref": "#/$defs/nullable_string" }
+          }
+        },
+        "title": { "type": "string", "minLength": 1 },
+        "message": { "type": "string" },
+        "explanation": { "$ref": "#/$defs/nullable_string" },
+        "severity": { "$ref": "#/$defs/severity" },
+        "impact": { "$ref": "#/$defs/nullable_string" },
+        "confidence": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["level", "score"],
+          "properties": {
+            "level": { "enum": ["high", "medium", "low", "unknown"] },
+            "score": { "type": ["number", "null"], "minimum": 0, "maximum": 1 }
+          }
+        },
+        "cwe": { "type": "array", "items": { "type": "integer", "minimum": 1 }, "minItems": 1 },
+        "confirmation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["level", "detail"],
+          "properties": {
+            "level": { "$ref": "#/$defs/confirmation_level" },
+            "detail": { "$ref": "#/$defs/nullable_string" }
+          }
+        },
+        "verdict": { "$ref": "#/$defs/nullable_string" },
+        "location": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/location" }] },
+        "fix_location": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/location" }] },
+        "stack": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["function", "file", "line"],
+            "properties": {
+              "function": { "$ref": "#/$defs/nullable_string" },
+              "file": { "$ref": "#/$defs/nullable_string" },
+              "line": { "type": ["integer", "null"], "minimum": 1 }
+            }
+          }
+        },
+        "trace": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["file", "line", "function", "note"],
+            "properties": {
+              "file": { "type": "string" },
+              "line": { "type": ["integer", "null"], "minimum": 1 },
+              "function": { "$ref": "#/$defs/nullable_string" },
+              "note": { "$ref": "#/$defs/nullable_string" }
+            }
+          }
+        },
+        "fingerprint": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["primary", "signature"],
+          "properties": {
+            "primary": { "type": "string", "minLength": 1 },
+            "signature": { "$ref": "#/$defs/nullable_string" }
+          }
+        },
+        "group": { "$ref": "#/$defs/nullable_string" },
+        "occurrences": { "type": "integer", "minimum": 1 },
+        "first_seen": { "type": ["string", "null"], "format": "date-time" },
+        "last_seen": { "type": ["string", "null"], "format": "date-time" },
+        "reachability": { "type": ["object", "null"] },
+        "fidelity": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["stubs_used", "forced", "caveats"],
+          "properties": {
+            "stubs_used": { "type": "boolean" },
+            "forced": { "type": "boolean" },
+            "caveats": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "remediation": { "$ref": "#/$defs/nullable_string" },
+        "patch_hints": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["title", "guidance"],
+            "properties": { "title": { "type": "string" }, "guidance": { "type": "string" } }
+          }
+        },
+        "reproduce": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["harness_id", "command", "build"],
+              "properties": {
+                "harness_id": { "$ref": "#/$defs/nullable_string" },
+                "command": { "$ref": "#/$defs/nullable_string" },
+                "build": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["sanitizers", "binary_sha256", "build_id"],
+                  "properties": {
+                    "sanitizers": { "type": "array", "items": { "type": "string" } },
+                    "binary_sha256": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" },
+                    "build_id": { "type": ["string", "null"], "pattern": "^[0-9a-f]+$" }
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "evidence": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["dir", "files"],
+              "properties": {
+                "dir": { "type": "string", "pattern": "^findings/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+                "files": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["role", "path", "sha256", "size"],
+                    "properties": {
+                      "role": { "enum": ["finding", "testcase", "testcase_minimized", "sanitizer_log", "decoded", "replay_script", "repro_ada", "byte_control"] },
+                      "path": { "type": "string", "pattern": "^findings/" },
+                      "sha256": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" },
+                      "size": { "type": "integer", "minimum": 0 }
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "fuzz": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["exception", "classification", "harness_id", "dialect", "oracle"],
+              "properties": {
+                "exception": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["name", "message", "sanitizer"],
+                  "properties": {
+                    "name": { "$ref": "#/$defs/nullable_string" },
+                    "message": { "$ref": "#/$defs/nullable_string" },
+                    "sanitizer": { "$ref": "#/$defs/nullable_string" }
+                  }
+                },
+                "classification": { "$ref": "#/$defs/nullable_string" },
+                "harness_id": { "$ref": "#/$defs/nullable_string" },
+                "dialect": { "$ref": "#/$defs/nullable_string" },
+                "oracle": { "type": ["object", "null"] }
+              }
+            }
+          ]
+        },
+        "static": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["engine", "precision", "snippet", "baseline_status", "triage_state"],
+              "properties": {
+                "engine": { "$ref": "#/$defs/nullable_string" },
+                "precision": {},
+                "snippet": { "$ref": "#/$defs/nullable_string" },
+                "baseline_status": { "$ref": "#/$defs/nullable_string" },
+                "triage_state": { "$ref": "#/$defs/nullable_string" }
+              }
+            }
+          ]
+        },
+        "sca": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["vuln_id", "aliases", "component", "fixed_versions", "cvss", "kev", "references", "match_confidence", "matching_method", "vex"],
+              "properties": {
+                "vuln_id": { "type": "string", "minLength": 1 },
+                "aliases": { "type": "array", "items": { "type": "string" } },
+                "component": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["name", "version", "ecosystem", "purl", "cpe"],
+                  "properties": {
+                    "name": { "type": "string", "minLength": 1 },
+                    "version": { "$ref": "#/$defs/nullable_string" },
+                    "ecosystem": { "$ref": "#/$defs/nullable_string" },
+                    "purl": { "$ref": "#/$defs/nullable_string" },
+                    "cpe": { "$ref": "#/$defs/nullable_string" }
+                  }
+                },
+                "fixed_versions": { "type": "array", "items": { "type": "string" } },
+                "cvss": { "type": ["object", "null"] },
+                "kev": {},
+                "references": { "type": "array" },
+                "match_confidence": { "$ref": "#/$defs/nullable_string" },
+                "matching_method": { "$ref": "#/$defs/nullable_string" },
+                "vex": { "type": ["object", "null"] }
+              }
+            }
+          ]
+        },
+        "binary": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["sha256", "build_id", "arch", "crash"],
+              "properties": {
+                "sha256": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" },
+                "build_id": { "$ref": "#/$defs/nullable_string" },
+                "arch": { "$ref": "#/$defs/nullable_string" },
+                "crash": { "type": ["object", "null"] }
+              }
+            }
+          ]
+        },
+        "raw_ref": { "$ref": "#/$defs/nullable_string" }
+      },
+      "allOf": [
+        { "if": { "properties": { "kind": { "const": "sca" } } }, "then": { "properties": { "sca": { "type": "object" } } } },
+        { "if": { "properties": { "kind": { "const": "static" } } }, "then": { "properties": { "static": { "type": "object" } } } },
+        { "if": { "properties": { "kind": { "enum": ["fuzz", "runtime", "differential"] } } }, "then": { "properties": { "fuzz": { "type": "object" } } } },
+        { "if": { "properties": { "kind": { "const": "binary" } } }, "then": { "properties": { "binary": { "type": "object" } } } }
+      ]
+    }
+  }
+}

@@ -18,6 +18,9 @@ serde_json.workspace = true
 thiserror.workspace = true
 libc = "0.2"
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lib]
 path = "src/lib.rs"
 

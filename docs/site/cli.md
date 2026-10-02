@@ -44,6 +44,17 @@ bhf introspect path/to/src --work-dir bhf_work
 bhf clean bhf_work --build --corpus --reports
 ```
 
+`bhf report` has two modes. With no `--findings`/`--out`, it defaults to
+`--work-dir bhf_work` and rebuilds `<work-dir>/results/` in place (the same
+rebuild every other command triggers) — this is the normal post-hoc way to
+refresh the index. Pass `--findings <DIR>` and/or `--out <DIR>` for the
+explicit mode shown above, which reports over an arbitrary findings directory
+and writes a standalone Markdown/JSON/SARIF/CSV report to `--out` instead of
+touching `results/`; `--sarif`/`--csv` are no-ops in work-dir mode (always
+written). `--junit <PATH>`, `--baseline <PATH>`, and `--model <PATH>` write
+into `<work-dir>/results/report/` (the `bhf.report.v2` snapshot baseline
+comparisons need).
+
 ## Actionability Modes
 
 `bhf auto` and `bhf fuzz` accept `--mode reporting|attacking`. The
@@ -92,13 +103,24 @@ writes `bhf_work/scan_index.json`, prints the same JSON summary to stdout,
 records skipped source files with diagnostics, and exits `1` only when no
 supported source file was scanned.
 
-`bhf static-scan <PATH>` writes `static-report.json` and
-`static-report.md` to `bhf_work/static/` by default. Use `--sarif` to also
+`bhf static-scan <PATH>` takes `--work-dir <DIR>` (default `bhf_work`) and
+writes `static-report.json` and `static-report.md` to
+`<work-dir>/results/static/` by default, then rebuilds `results/`. Pass
+`--out <DIR>` to write elsewhere instead; that opts out of `results/` and
+prints a note that it was not updated. Use `--sarif` to also
 write `static-report.sarif`, `--suppressions <JSON>` for exact
 rule/path/line suppressions, `--baseline <static-report.json>` to mark findings
 as `new`, `unchanged`, or `resolved`, `--policy <JSON>` / `--enable-rule` /
 `--disable-rule` to apply policy-as-code rule filters, and `--fail-on
 low|medium|high|critical` for CI-style static gates.
+
+`--since <rev>` restricts the scan to files changed since that git revision;
+in work-dir mode this *replaces* `results/static/static-report.json` with the
+diff-scoped subset, so `results/` then holds only those static findings —
+run a full `static-scan` (no `--since`) afterwards to get everything back. An
+explicit `--out <work>/results/static` writes into `results/` without
+rebuilding the index; follow it with `bhf report` to fold the new static
+report back into `findings.json`/`INDEX.md`.
 
 Use `--jobs <N>` to bound parallel file workers and `--max-memory-mb <MB>` to
 set the static process RSS ceiling. At the ceiling the Linux scanner stops
@@ -236,7 +258,10 @@ Both effective limits are recorded in the run-provenance JSON.
 
 `bhf differential --harness-a <A> --harness-b <B> --inputs <DIR>` replays
 each input through two implementations and emits BHF-301 output-divergence
-findings when stdout, exit status, or timeout behavior differs. Differential
+findings when stdout, exit status, or timeout behavior differs. Findings land
+under `<work-dir>/results/findings/F-DIFF-NNNN/` (default `--work-dir
+bhf_work`; the old `--out DIR` spelling is a deprecated alias for it) and
+`results/` is rebuilt. Differential
 findings carry `oracle.name = "differential-output-runtime"` evidence from the
 same executable-oracle registry used by runtime runtrace findings.
 `bhf differential --harness <H> --metamorphic-transform append-newline
@@ -368,6 +393,10 @@ Tampered or missing items make verification exit non-zero.
 The source-tree document `docs/enterprise-pack-authentication.md` specifies
 canonical bytes and key rotation.
 
+`sbom` takes `--work-dir <DIR>` (default `bhf_work`); without `--out` it
+writes under `<work-dir>/results/sbom/` and rebuilds `results/` (each
+vulnerability match becomes an `sca` finding in `findings.json`). Pass
+`--out <DIR>` to write elsewhere instead, which opts out of `results/`.
 `sbom` writes `sbom.json`, `cyclonedx.json`, `vulnerabilities.json`,
 `openvex.json`, and — under the `csv` kind — both a flat one-row-per-component
 `sbom.csv` inventory and a one-row-per-CVE-match `vulnerabilities.csv`
@@ -420,6 +449,10 @@ the `auto` budget knobs so a CI run can be bounded the same way: `--per-target-t
 N distinct findings; `1` ≈ stop-on-first-crash), and `--campaign-time` (whole-run
 cap, or an even split across targets when paired with `--min-target-time`).
 
+`export` bundles `results/` (`INDEX.md`, `findings.{json,csv,sarif}`,
+`manifest.json`, `attestation.json`, `static/`, `sbom/`) alongside the other
+handoff artifacts it already collects.
+
 `export` writes a deterministic manifest for handoff artifacts already present
 under the work directory, including report JSON/Markdown/SARIF/JUnit/CSV, static
 reports, SPDX-style SBOM, CycloneDX SBOM, vulnerability reports, `auto` run
@@ -459,7 +492,7 @@ distinguish sandboxed and unsandboxed executions.
 - `--deadline <DURATION>` — real-time response deadline, the **timing oracle** (off by default). Unlike `--timeout` (which discards a slow unit), any input whose wall-clock execution exceeds the deadline is recorded as a *finding* (BHF-555, a CWE-400 timing/availability failure). For watchdog / RTOS / radar targets where overrunning a budget is a fault, not just a hang. Whole-second spec (e.g. `1s`); use `BHF_DEADLINE_MS` for sub-second budgets. See [On-Target & Embedded](./on-target-fuzzing.md).
 - `--rss-limit-mb <MB>` — per-execution resident-memory ceiling for a C/C++ harness (libFuzzer `-rss_limit_mb`); an execution over budget is killed and reported as an OOM finding. `0` (default) disables it.
 - `--print-final-stats` — print a final-stats line (libFuzzer `-print_final_stats`): executions, exec/s, new vs duplicate corpus signatures, findings, elapsed time.
-- `--workers <N|auto>` — run multiple fuzz workers.
+- `--workers <N|auto>` — run multiple fuzz workers. When the campaign ends, their findings move into `<work-dir>/results/findings` under fresh ids, one per crash cluster; duplicates stay in the worker dirs.
 - `--fork-server` / `--no-fork-server` — persistent framed execution is the default for the builtin engine. Native drivers and the Java, Python, Perl, Go, C#, JavaScript/TypeScript, Ruby, Lua, and PHP launchers each keep one target runtime alive and feed it inputs over the same protocol. Every finding is replay-validated in a fresh process so a global-state artifact never escapes (#416). `--no-fork-server` runs a fresh process per input — use it for a target that intentionally carries fuzz-relevant global state across calls.
 - `--cmplog-log <PATH>` — replay a runtrace audit log captured with `BHF_CMPLOG=1`; recovered cmplog operands seed both the mutator dictionary and an offset-aware RedQueen-style splice that replaces `operand_a` with `operand_b` at the offset it appears in the current input (#400).
 - `--sanitizers <asan,msan,ubsan,tsan,lsan|none>` — native C/C++ sanitizer campaign matrix; other lanes own their instrumentation.
@@ -522,7 +555,10 @@ bhf fuzz bhf_work --harness H-CPP000A --engine afl++ \
 remove disposable compiler caches and scratch files while preserving findings,
 reports, corpora, checkpoints, generated source, and replay binaries. Use
 `--build`, `--corpus`, `--reports`, `--findings`, or `--all` for explicit deletion
-scopes under the work directory.
+scopes under the work directory. `--findings` removes `results/` (findings,
+indexes, `static/` and `sbom/` reports) plus any legacy `findings/`/
+`FINDINGS.md`/`findings.csv` paths; `--reports` removes only `results/report/`
+(the `bhf report` snapshots), leaving the rest of `results/` intact.
 
 ## Auto
 
@@ -534,11 +570,11 @@ auto-stubs missing headers and undefined symbols so previously-unbuildable code
 builds, runs a three-pass fuzz cascade against each built harness with the
 runtime virtualisation shim loaded on supported Linux targets (not
 Java/C#/JavaScript/TypeScript or cross/emulated targets), and writes a
-persistent fuzz lab. Findings take the top level: start with
-`<work>/FINDINGS.md`, use `<work>/findings.csv` for a grouped machine-readable
-index, and inspect `<work>/findings/` for evidence bundles. Campaign mechanics,
-coverage, and the `needed_for_build` ledger remain under `<work>/auto/` in
-`run.md` and `run.json`.
+persistent fuzz lab. Findings go into `<work>/results/`: start with
+`results/INDEX.md`, use `results/findings.csv` / `findings.json` for the
+machine-readable index, and inspect `results/findings/` for evidence bundles.
+Campaign mechanics, coverage, and the `needed_for_build` ledger remain under
+`<work>/auto/` in `run.md` and `run.json`.
 
 ```sh
 bhf auto path/to/src --work-dir bhf_work --per-target-time 60
@@ -591,6 +627,7 @@ Flags:
 - `--static` — run the static analyzer over the WHOLE tree in addition to fuzzing (not only as a build/fuzz fallback). Findings (`static_scan`, ids `F-STATIC-*`) merge into the unified report next to the fuzz findings. Same engine as `bhf static-scan`.
 - `--force` / `--force-fuzz` — force-fuzz mode: attempt EVERY discovered C/C++/Ada function even when a parameter can't be driven or a symbol is undefined, stubbing until the harness builds. Findings from a forced/stub-heavy build are floored to **Low** confidence with a `forced` note and counted separately.
 - `--differential <A:B>` — two-compiler differential fuzzing for C/C++ (e.g. `clang:gcc`): after the run, rebuild each C/C++ harness under both compilers, replay the corpus through both, and flag any input whose exit/crash behavior diverges as a BHF-301 finding.
+- `--no-minimize` — skip the post-fuzz minimization pass (default: `auto` minimizes the representative finding of each root-cause group into `min_testcase.bin`, bounded at 30s per group / 5min total; groups not reached within budget are listed in `results/INDEX.md`).
 - `--list-fakes` — print the fake-resource plugin inventory and exit.
 - `--verbose` / `-v` — print an extra indented line per target: skip/fail reason, repairs applied, and per-pass execution/finding counts.
 

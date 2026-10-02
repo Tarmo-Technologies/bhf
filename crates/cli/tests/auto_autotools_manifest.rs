@@ -197,7 +197,12 @@ fn autotools_failed_build_has_actionable_manifest_not_opaque() {
         "the offline handoff section must be first-class:\n{text}"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let last = stderr.lines().last().unwrap_or_default();
+    // The results bracket's `Results:` line follows auto's own output.
+    let last = stderr
+        .lines()
+        .rev()
+        .find(|line| !line.starts_with("Results: "))
+        .unwrap_or_default();
     assert!(
         last.contains("bhf auto: requirements:")
             && last.contains("auto/missing-deps.txt")

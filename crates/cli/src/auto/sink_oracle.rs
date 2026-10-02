@@ -88,7 +88,7 @@ fn write_sink_finding(
     cwe: &str,
     label: &str,
 ) -> bool {
-    let dir = work.join("findings").join(id);
+    let dir = corpus::layout::finding_dir(work, id);
     if std::fs::create_dir_all(&dir).is_err() {
         return false;
     }
@@ -96,7 +96,7 @@ fn write_sink_finding(
     let cluster_key_full = hex(&Sha256::digest(
         format!("{rule_id}:{harness_id}").as_bytes(),
     ));
-    let record = json!({
+    let mut record = json!({
         "id": id,
         "rule_id": rule_id,
         "confirmation": "fuzz_confirmed",
@@ -111,6 +111,7 @@ fn write_sink_finding(
         "analysis": { "engine": "bhf.dynamic.jvm.sink" },
         "actionability": { "cwe": [cwe], "verdict": "likely_reachable", "confidence": "high" },
     });
+    corpus::finding::stamp_v1(&mut record, corpus::finding::finding_kind::RUNTIME);
     std::fs::write(
         dir.join("finding.json"),
         serde_json::to_vec_pretty(&record).unwrap_or_default(),
@@ -168,7 +169,7 @@ mod tests {
         let written = run_sink_oracle(&tmp);
         assert_eq!(written, 2, "one finding per distinct reached sink kind");
 
-        let findings: Vec<String> = std::fs::read_dir(tmp.join("findings"))
+        let findings: Vec<String> = std::fs::read_dir(tmp.join("results").join("findings"))
             .unwrap()
             .flatten()
             .filter_map(|e| std::fs::read_to_string(e.path().join("finding.json")).ok())

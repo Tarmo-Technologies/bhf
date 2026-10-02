@@ -54,6 +54,22 @@ fn assert_exit(output: &Output, expected: i32) {
 }
 
 #[test]
+fn sbom_without_out_lands_in_results_as_sca_findings() {
+    let f = Fixture::new("2.4.2", "high");
+    let work = f.root.parent().unwrap().join("bhf_work");
+    let output = Command::new(env!("CARGO_BIN_EXE_bhf"))
+        .arg("sbom").arg(&f.root).arg("--work-dir").arg(&work).arg("--vuln-db").arg(&f.db)
+        .output().unwrap();
+    assert_exit(&output, 0);
+    assert!(work.join("results/sbom/vulnerabilities.json").is_file());
+    let doc: Value = serde_json::from_slice(&fs::read(work.join("results/findings.json")).unwrap()).unwrap();
+    let sca: Vec<&Value> = doc["findings"].as_array().unwrap().iter().filter(|f| f["kind"] == "sca").collect();
+    assert_eq!(sca.len(), 1, "{doc}");
+    assert_eq!(sca[0]["sca"]["vuln_id"], "CVE-2026-TEST");
+    assert_eq!(sca[0]["sca"]["fixed_versions"][0], "1.5.9");
+}
+
+#[test]
 fn default_reports_preserve_advisory_matches_without_unsupported_clearance() {
     let f = Fixture::new("2.4.2", "high");
     assert_exit(&f.run(&[]), 0);

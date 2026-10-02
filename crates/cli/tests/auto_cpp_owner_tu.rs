@@ -90,10 +90,10 @@ fn a_target_in_a_non_self_contained_header_builds_via_its_owner_tu() {
     // The planted out-of-bounds read sits behind a byte gate inside the header's
     // function, so finding it proves the header was really compiled and driven —
     // not merely that something linked.
-    let csv = std::fs::read_to_string(work.join("auto/findings.csv")).unwrap_or_default();
+    let json = std::fs::read_to_string(work.join("results/findings.json")).unwrap_or_default();
     assert!(
-        csv.contains("BHF-201"),
-        "the out-of-bounds read in the header target must be found:\n{csv}\n{combined}"
+        json.contains("BHF-201"),
+        "the out-of-bounds read in the header target must be found:\n{json}\n{combined}"
     );
 
     // The enumerator veto. `scan_twice` does not build here — its harness includes

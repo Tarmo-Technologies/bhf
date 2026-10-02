@@ -2,6 +2,50 @@
 
 # Changelog
 
+## Unreleased
+
+### Breaking
+- All findings, indexes and native reports live under `<work-dir>/results/`. `FINDINGS.md`,
+  `findings.csv` and `auto/findings.csv` at the work-dir top, `auto/attestation.json`, and
+  `reports/run-last.*` (written by `ci --sarif`) are gone. Use `results/INDEX.md`,
+  `results/findings.{json,csv,sarif}` and `results/attestation.json`.
+- `findings.csv` has a new, single column set (see docs/finding-report-fields.md). The
+  per-harness stub columns moved to `auto/run.json` `targets[]`; `--static-dynamic` is a no-op.
+- `static-scan` and `sbom` default to `<work-dir>/results/{static,sbom}`; `--out` still
+  writes elsewhere (and then does not update `results/`).
+- `differential --out` is now `--work-dir` (alias kept); findings are `F-DIFF-NNNN`.
+- `bhf report` with no flags rebuilds `bhf_work/results/`; `--findings/--out` keep the old behaviour.
+- Severity is unified: impact, then record severity, then rule default; `--force` stub
+  findings are floored to low on disk. `ci --fail-on` uses the same resolver. A finding with
+  no impact, severity, or rule (the resolver's `medium` default) now trips `--fail-on
+  medium`/`low` instead of being bucketed `unknown`, which is fail-closed; an unreadable
+  record is still counted as `unknown`.
+- Tools that read `bhf_work/findings.csv` or `bhf_work/findings/` directly must switch to
+  `results/findings.json` (schema in `schemas/`, reference fixture in `tests/fixtures/golden_results/`).
+
+### Added
+- `results/findings.json` (`bhf.findings.v1`) with JSON Schemas in `schemas/`.
+- Per-finding `sanitizer.log`, harness sha256 + GNU build-id, `created_at`/`last_seen`,
+  `history[]`, and a minimized reproducer for each root-cause group (`--no-minimize`).
+- SBOM vulnerability matches appear as `sca` findings.
+- Portable harness export: each generated C/C++/Rust/Ada harness dir now carries a
+  `Mayhemfile` and a `PORTABILITY.md` with exact commands for Mayhem, libFuzzer, AFL++,
+  and honggfuzz. C/C++ gain a `make libfuzzer` target; Rust gains a `build-libfuzzer.sh`
+  (a separate instrumented build, since libFuzzer cannot consume bhf's trace-pc-guard
+  staticlib); both use a generated `bhf_libfuzzer.c` shim. `BHF_CRASH_ON_FINDING=1` makes an
+  Ada finding abort the process (SIGABRT) so a crash-keying external engine detects it.
+
+### Changed
+- With no `--findings`/`--out`, `bhf report` rebuilds `bhf_work/results/`. `--junit`/
+  `--baseline`/`--model` write to `results/report/` (with the `bhf.report.v2` snapshot).
+  `export` bundles `results/`. `clean --findings` removes `results/`, and `clean --reports`
+  removes `results/report/`.
+
+### Fixed
+- `F-TSAN`, `F-MEM`, `F-JSINK`, `F-EXT` and `F-DIFF` findings were missing from the auto index.
+- `bhf report` with default flags after `bhf auto` found nothing.
+- `replay.py` harness discovery looked in the pre-`harnesses/` location.
+
 ## 0.2.34 - 2026-10-01
 
 `bhf binary scan` now recurses into Debian `.deb` packages and tar archives.

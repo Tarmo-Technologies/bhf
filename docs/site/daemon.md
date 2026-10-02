@@ -78,3 +78,15 @@ all jobs with their current state (`Queued`, `Running`, `Complete`, or
 `Failed`). When a `webhook_url` is configured, the scheduler POSTs a
 notification to it once a job reaches a terminal state (`Complete` or `Failed`)
 (HTTP only in v0.1; front a `https://` endpoint with a TLS-terminating proxy).
+
+### Results refresh
+
+Fuzz jobs run with `BHF_RESULTS_DEFER=1`, so they never rebuild `results/`
+themselves. A dedicated refresh thread records each finished job as one
+`daemon fuzz` producer entry and rebuilds `<project>/results/` instead:
+within 60s once that project goes idle (nothing running or queued for it), or
+every 300s while it stays continuously busy. Whatever is still outstanding at
+shutdown is recorded and rebuilt then. Because the webhook fires as soon as a
+job reaches a terminal state, it can fire *before* `<project>/results/`
+reflects that job — poll `results/manifest.json`'s producer history, or wait
+for the next debounced rebuild, if you need the index itself to be current.

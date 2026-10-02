@@ -115,7 +115,7 @@ fn explain_joins_input_gates_faked_env_and_dataflow() {
 }
 
 fn finding_dir_nonempty(work: &Path) -> bool {
-    std::fs::read_dir(work.join("findings"))
+    std::fs::read_dir(work.join("results").join("findings"))
         .map(|mut d| d.next().is_some())
         .unwrap_or(false)
 }

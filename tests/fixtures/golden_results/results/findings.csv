@@ -1,0 +1,8 @@
+id,kind,severity,confidence,confirmation,rule_id,cwe,title,file,line,function,group,occurrences,verdict,vuln_id,purl,first_seen,evidence_dir
+F-0000-1a2b3c4d,fuzz,critical,medium,sanitizer_crash,BHF-201,CWE-122,Heap-based Buffer Overflow in parse_header,src/parse.c,42,parse_header,c0ffee00c0ffee00,1,likely_reachable,,,2026-10-01T11:20:00Z,findings/F-0000-1a2b3c4d
+BF-0001,binary,high,high,crash_lead,BHF-501,CWE-754,"Binary crash, abnormal exit, or timeout",,,,BHF-501:demo:signal:11:x,1,unknown,,,2026-10-01T11:50:00Z,findings/BF-0001
+F-RO-BHF-401-0000ABCD,static,high,medium,static,BHF-401,CWE-120,Unsafe string copy call in source (copy_name),lib/parse.c,6,copy_name,BHF-401:lib/parse.c:6,1,unknown,,,2026-10-01T11:10:00Z,findings/F-RO-BHF-401-0000ABCD
+F-SCA-203b6b399c3b3dac,sca,high,high,advisory,CVE-2026-0001,CWE-1395,CVE-2026-0001 in example 2.4.2,,,,CVE-2026-0001|pkg:npm/example,1,,CVE-2026-0001,pkg:npm/example@2.4.2,,
+F-TSAN-0000,runtime,high,low,crash_lead,BHF-556,CWE-362,Data race (ThreadSanitizer),,,,F-TSAN-0000,1,likely_reachable,,,2026-10-01T11:30:00Z,findings/F-TSAN-0000
+S-0001,static,high,medium,static,BHF-401,CWE-120,Unsafe string copy call in source (greet),weak.c,9,greet,issue-weak,1,,,,,
+F-DIFF-0000,differential,medium,low,runtime_oracle,BHF-301,CWE-754,Output divergence between implementations,,,,dd,1,unknown,,,2026-10-01T11:40:00Z,findings/F-DIFF-0000

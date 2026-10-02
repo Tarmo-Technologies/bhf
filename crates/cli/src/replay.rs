@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, clap::Args)]
 pub struct ReplayArgs {
-    /// Finding directory, or finding ID under ./findings.
+    /// Finding directory, or finding ID under bhf_work/results/findings.
     #[arg(
         value_name = "FINDING_DIR",
         required_unless_present = "finding",
@@ -14,7 +14,7 @@ pub struct ReplayArgs {
     )]
     pub finding_dir: Option<PathBuf>,
 
-    /// Finding directory, or finding ID under ./findings.
+    /// Finding directory, or finding ID under bhf_work/results/findings.
     #[arg(long, value_name = "ID_OR_DIR")]
     pub finding: Option<PathBuf>,
 
@@ -87,6 +87,7 @@ pub fn run(args: ReplayArgs) -> i32 {
     );
     match replay_min::replay_with_runner(&finding_dir, &runner) {
         Ok(replay_min::ReplayResult::Match) => {
+            let _ = corpus::finding::touch_last_seen(&finding_dir, "replay");
             println!("MATCH");
             0
         }
@@ -139,9 +140,10 @@ fn resolve_harness(finding_dir: &Path, explicit: Option<PathBuf>) -> Result<Path
     }
 
     // 2) `harness_id` against `<work>/harnesses/<harness_id>/<leaf>` for a couple of
-    // plausible work roots relative to the finding dir (standard layout is
-    // `<work>/findings/<F-...>/`, so the work root is the finding dir's
-    // grandparent; also try the parent in case findings sit directly under work).
+    // plausible work roots relative to the finding dir (results layout is
+    // `<work>/results/findings/<F-...>/`, recovered via
+    // `corpus::layout::work_dir_for_finding`; the finding dir's grandparent and
+    // parent are tried too for the legacy and flat layouts).
     if let Some(harness_id) = raw.get("harness_id").and_then(|v| v.as_str()) {
         for work in harness_work_roots(finding_dir) {
             for harness_dir in crate::auto::layout::harness_dir_candidates(&work, harness_id) {
@@ -173,18 +175,25 @@ fn resolve_harness(finding_dir: &Path, explicit: Option<PathBuf>) -> Result<Path
 }
 
 /// Candidate fuzz-work roots for a finding directory, most-likely first. The
-/// standard layout nests findings as `<work>/findings/<F-...>/`, so the work
-/// root is the finding dir's grandparent; the parent is offered as a fallback
-/// for flatter layouts.
+/// results layout nests findings as `<work>/results/findings/<F-...>/`, so the
+/// work root comes from [`corpus::layout::work_dir_for_finding`]; the finding
+/// dir's grandparent and parent are offered as fallbacks for the legacy and
+/// flatter layouts.
 fn harness_work_roots(finding_dir: &Path) -> Vec<PathBuf> {
     let mut roots = Vec::new();
+    let mut push = |p: PathBuf| {
+        if !roots.contains(&p) {
+            roots.push(p);
+        }
+    };
+    if let Some(work) = corpus::layout::work_dir_for_finding(finding_dir) {
+        push(work);
+    }
     if let Some(grandparent) = finding_dir.parent().and_then(Path::parent) {
-        roots.push(grandparent.to_path_buf());
+        push(grandparent.to_path_buf());
     }
     if let Some(parent) = finding_dir.parent() {
-        if !roots.iter().any(|root| root == parent) {
-            roots.push(parent.to_path_buf());
-        }
+        push(parent.to_path_buf());
     }
     roots
 }
@@ -274,6 +283,7 @@ fn replay_c_afl(finding_dir: &Path, harness: &Path) -> i32 {
         .or_else(|| crate::fatal_signal::rule_id(&output.status, &stderr));
     match actual_rule {
         Some(rule) if rule == recorded_rule => {
+            let _ = corpus::finding::touch_last_seen(finding_dir, "replay");
             println!("MATCH");
             0
         }
@@ -396,6 +406,7 @@ fn replay_c_libfuzzer(finding_dir: &Path, harness: &Path) -> i32 {
         .or_else(|| crate::fatal_signal::rule_id(&output.status, &stderr));
     match actual_rule {
         Some(rule) if rule == recorded_rule => {
+            let _ = corpus::finding::touch_last_seen(finding_dir, "replay");
             println!("MATCH");
             0
         }
@@ -495,5 +506,34 @@ mod silent_abort_tests {
         fs::set_permissions(&harness, permissions).expect("chmod");
 
         assert_eq!(replay_c_libfuzzer(&finding, &harness), 3);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn harness_roots_start_at_the_work_dir_for_results_layout() {
+        let roots = super::harness_work_roots(std::path::Path::new("/w/results/findings/F-1"));
+        assert_eq!(roots[0], std::path::PathBuf::from("/w"));
+    }
+
+    #[test]
+    fn harness_roots_handle_legacy_depth() {
+        let roots = super::harness_work_roots(std::path::Path::new("/w/findings/F-1"));
+        assert_eq!(roots[0], std::path::PathBuf::from("/w"));
+    }
+
+    #[test]
+    fn harness_roots_dedupe_overlapping_candidates() {
+        // For the legacy depth, work_dir_for_finding and the grandparent both
+        // yield /w; it must appear once, followed by the finding's parent.
+        let roots = super::harness_work_roots(std::path::Path::new("/w/findings/F-1"));
+        assert_eq!(
+            roots,
+            vec![
+                std::path::PathBuf::from("/w"),
+                std::path::PathBuf::from("/w/findings"),
+            ]
+        );
     }
 }

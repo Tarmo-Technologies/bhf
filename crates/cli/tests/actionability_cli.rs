@@ -128,7 +128,7 @@ fn auto_empty_candidate_report_records_mode() {
 fn ci_actionability_threshold_counts_real_and_likely_only() {
     let temp = temp_dir("ci-actionability");
     let work_dir = temp.join("bhf_work");
-    let findings = work_dir.join("findings");
+    let findings = work_dir.join("results").join("findings");
     write_actionability_finding(&findings.join("F-0001-lab"), "lab_only", "high");
     write_actionability_finding(&findings.join("F-0002-real"), "real_reachable", "high");
 
@@ -150,7 +150,7 @@ fn ci_actionability_threshold_counts_real_and_likely_only() {
 fn ci_actionability_threshold_ignores_low_confidence_when_min_high() {
     let temp = temp_dir("ci-confidence");
     let work_dir = temp.join("bhf_work");
-    let findings = work_dir.join("findings");
+    let findings = work_dir.join("results").join("findings");
     write_actionability_finding(&findings.join("F-0001-real"), "real_reachable", "low");
 
     let buckets = cli::ci::bucket_actionability_for_test(&work_dir).unwrap();
@@ -169,7 +169,7 @@ fn ci_actionability_threshold_ignores_low_confidence_when_min_high() {
 fn ci_actionability_threshold_includes_low_confidence_when_min_low() {
     let temp = temp_dir("ci-low-confidence");
     let work_dir = temp.join("bhf_work");
-    let findings = work_dir.join("findings");
+    let findings = work_dir.join("results").join("findings");
     write_actionability_finding(&findings.join("F-0001-real"), "real_reachable", "low");
 
     let buckets = cli::ci::bucket_actionability_for_test(&work_dir).unwrap();
@@ -188,7 +188,7 @@ fn ci_actionability_threshold_includes_low_confidence_when_min_low() {
 fn ci_actionability_threshold_likely_reachable_trips_likely_gate() {
     let temp = temp_dir("ci-likely-threshold");
     let work_dir = temp.join("bhf_work");
-    let findings = work_dir.join("findings");
+    let findings = work_dir.join("results").join("findings");
     write_actionability_finding(
         &findings.join("F-0001-likely"),
         "likely_reachable",
@@ -211,7 +211,7 @@ fn ci_actionability_threshold_likely_reachable_trips_likely_gate() {
 fn ci_actionability_threshold_any_includes_blocked_and_unknown() {
     let temp = temp_dir("ci-any-threshold");
     let work_dir = temp.join("bhf_work");
-    let findings = work_dir.join("findings");
+    let findings = work_dir.join("results").join("findings");
     write_actionability_finding(&findings.join("F-0001-blocked"), "blocked", "medium");
     write_actionability_finding(&findings.join("F-0002-unknown"), "unknown", "low");
 
@@ -239,7 +239,7 @@ fn ci_actionability_threshold_any_includes_blocked_and_unknown() {
 fn ci_actionability_buckets_old_findings_through_backfill() {
     let temp = temp_dir("ci-backfill");
     let work_dir = temp.join("bhf_work");
-    let findings = work_dir.join("findings");
+    let findings = work_dir.join("results").join("findings");
     write_legacy_likely_finding(&findings.join("F-0001-legacy-likely"));
 
     let buckets = cli::ci::bucket_actionability_for_test(&work_dir).unwrap();
@@ -263,7 +263,7 @@ fn ci_actionability_buckets_old_findings_through_backfill() {
 fn ci_actionability_threshold_does_not_treat_lab_as_real_or_likely() {
     let temp = temp_dir("ci-lab-honesty");
     let work_dir = temp.join("bhf_work");
-    let findings = work_dir.join("findings");
+    let findings = work_dir.join("results").join("findings");
     write_actionability_finding(&findings.join("F-0001-lab"), "lab_only", "high");
 
     let buckets = cli::ci::bucket_actionability_for_test(&work_dir).unwrap();
@@ -325,7 +325,7 @@ fn ci_actionability_forwards_mode_to_auto() {
 fn report_and_ci_do_not_count_stale_prosthetic_real_as_real() {
     let temp = temp_dir("stale-real-prosthetic");
     let work_dir = temp.join("bhf_work");
-    let findings = work_dir.join("findings");
+    let findings = work_dir.join("results").join("findings");
     let reports = work_dir.join("reports");
     write_stale_real_with_stubbed_dependency(&findings.join("F-0001-stale-real"));
 
@@ -388,7 +388,7 @@ fn install_fake_harness(work_dir: &Path, harness_id: &str) -> PathBuf {
 }
 
 fn only_finding_dir(work_dir: &Path) -> PathBuf {
-    let findings = fs::read_dir(work_dir.join("findings"))
+    let findings = fs::read_dir(work_dir.join("results").join("findings"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .collect::<Vec<_>>();

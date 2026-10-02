@@ -63,7 +63,11 @@ fn three_findings_across_two_target_frames_produce_two_clusters() {
         .unwrap();
 
     let out_dir = tempdir("two-clusters-out");
-    let document = build_report(&ReportOptions::new(root.join("findings"), out_dir)).unwrap();
+    let document = build_report(&ReportOptions::new(
+        root.join("results").join("findings"),
+        out_dir,
+    ))
+    .unwrap();
 
     assert_eq!(document.findings.len(), 3);
     assert_eq!(document.clusters.len(), 2);

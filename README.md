@@ -42,9 +42,9 @@ Point `auto` at a source tree — including code that does not build:
 
 That discovers and ranks fuzzable functions, generates typed harnesses and stubs, recovers the
 build context (`compile_commands.json`, CMake/Meson/Ninja/Visual Studio, or any
-`--build-command`), fuzzes each target with a coverage-guided engine, and writes the
-impact-ordered finding handoff at `bhf_work/FINDINGS.md`, its CSV index beside it,
-and campaign/coverage reports under `bhf_work/auto/`.
+`--build-command`), fuzzes each target with a coverage-guided engine, and writes
+every finding into `bhf_work/results/` (see below), with campaign/coverage
+reports under `bhf_work/auto/`.
 
 ### Or run it in Docker
 
@@ -98,9 +98,25 @@ bhf auto /path/to/source-tree \
 | `--sloc sloc.txt` | Per-language SLOC breakdown (`.json` for JSON). |
 | `--debug` | Backtrace on a bhf-internal panic; enriches the bug report. |
 
-Read `bhf_work/FINDINGS.md` first. It puts the impact-ordered findings,
+### Where results go
+
+Every command that finds something writes into one directory, `<work-dir>/results/`
+(default `bhf_work/results/`), and rebuilds its index when it finishes:
+
+| Path | What |
+|---|---|
+| `results/INDEX.md` | Start here: summary, then every finding grouped by root cause |
+| `results/findings.json` | Everything, machine-readable (`bhf.findings.v1`, schema in `schemas/`) |
+| `results/findings.csv` / `findings.sarif` | Spreadsheet / code-scanning views |
+| `results/findings/<ID>/` | Evidence: `finding.json`, `testcase.bin`, `min_testcase.bin`, `sanitizer.log`, `replay.py` |
+| `results/static/`, `results/sbom/` | Native `static-scan` and `sbom` reports |
+
+`bhf report` rebuilds the index on demand. Work dirs from bhf ≤ 0.2.x are migrated
+automatically the first time a command opens them.
+
+Read `results/INDEX.md` first. It puts the impact-ordered findings,
 locations, confidence, evidence links, suggested fixes, and replay commands in one
-place; `findings.csv` is the top-level machine-readable index. Then read
+place; `results/findings.csv` is the machine-readable index. Then read
 `auto/summary.txt` for **built+fuzzed**, **static-only**, **skipped**, and
 **forced** coverage caveats.
 
@@ -248,7 +264,7 @@ both.
 
 | What you want to do | Install or download |
 |---|---|
-| Install complete BHF on Linux with one `install.sh` | `bhf-dist-0.2.32-x86_64-unknown-linux-gnu.tar.gz` plus its `.sha256` file |
+| Install complete BHF on Linux with one `install.sh` | `bhf-dist-0.2.34-x86_64-unknown-linux-gnu.tar.gz` plus its `.sha256` file |
 | Run the CLI on Windows | `bhf-installer.ps1`, or `bhf-x86_64-pc-windows-msvc.zip` plus its `.sha256` file for a manual/offline install |
 | Run basic CLI workflows on Linux | `bhf-installer.sh`, or `bhf-x86_64-unknown-linux-gnu.tar.xz` plus its `.sha256` file |
 | Get the full Linux `bhf auto` runtime audit and fake-resource support | Add `bhf_runtrace_shim-installer.sh`, or its matching `bhf_runtrace_shim-*.tar.xz` archive |
@@ -268,7 +284,7 @@ manual co-location commands.
 #### Complete Linux install with `install.sh`
 
 ```sh
-VERSION=0.2.32
+VERSION=0.2.34
 BASE="https://github.com/Tarmo-Technologies/bhf/releases/download/${VERSION}"
 ARCHIVE="bhf-dist-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 
@@ -345,7 +361,7 @@ harness runtimes, and checksum-verified content together. The separate component
 installers remain available when you deliberately want a smaller install:
 
 ```sh
-VERSION=0.2.32
+VERSION=0.2.34
 BASE="https://github.com/Tarmo-Technologies/bhf/releases/download/${VERSION}"
 
 curl --proto '=https' --tlsv1.2 -LsSf "$BASE/bhf-installer.sh" | sh
@@ -369,7 +385,7 @@ an elevated PowerShell. One Chocolatey-based setup is:
 choco install llvm make visualstudio2022buildtools `
   visualstudio2022-workload-vctools -y
 
-$Version = "0.2.32"
+$Version = "0.2.34"
 $Base = "https://github.com/Tarmo-Technologies/bhf/releases/download/$Version"
 irm "$Base/bhf-installer.ps1" | iex
 irm "$Base/bhf-daemon-installer.ps1" | iex       # optional: RPC/MCP service

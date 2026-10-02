@@ -1247,10 +1247,6 @@
       "license": "Apache-2.0"
     },
     {
-      "path": "crates/cli/src/auto/attestation.rs",
-      "license": "Apache-2.0"
-    },
-    {
       "path": "crates/cli/src/auto/blocker_histogram.rs",
       "license": "Apache-2.0"
     },
@@ -1400,6 +1396,10 @@
     },
     {
       "path": "crates/cli/src/auto/memprofile.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/src/auto/minimize_pass.rs",
       "license": "Apache-2.0"
     },
     {
@@ -1756,6 +1756,10 @@
     },
     {
       "path": "crates/cli/src/transport_fuzz.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/src/workdir.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2251,6 +2255,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/differential_results.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/discovery_memory_ceiling.rs",
       "license": "Apache-2.0"
     },
@@ -2415,6 +2423,14 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/results_bracket.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/results_e2e.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/sbom_assurance_cli.rs",
       "license": "Apache-2.0"
     },
@@ -2432,6 +2448,10 @@
     },
     {
       "path": "crates/cli/tests/static_scan_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/static_scan_results.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2523,6 +2543,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/continuous_daemon/src/results_refresh.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/continuous_daemon/src/storage_lock.rs",
       "license": "Apache-2.0"
     },
@@ -2544,6 +2568,10 @@
     },
     {
       "path": "crates/corpus/src/finding.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/corpus/src/layout.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2859,6 +2887,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/harness_gen/src/portability.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/harness_gen/src/registry.rs",
       "license": "Apache-2.0"
     },
@@ -2912,6 +2944,10 @@
     },
     {
       "path": "crates/harness_gen/src/templates/servant_direct_harness.adb.tera",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/harness_gen/tests/ada_crash_on_finding.rs",
       "license": "Apache-2.0"
     },
     {
@@ -3151,6 +3187,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/multicore_fuzz/src/merge.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/perl_parser/Cargo.toml",
       "license": "Apache-2.0"
     },
@@ -3252,6 +3292,66 @@
     },
     {
       "path": "crates/report/src/main.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/results/Cargo.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/results/src/confirmation.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/results/src/lib.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/results/src/lock.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/results/src/manifest.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/results/src/migrate.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/results/src/model.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/results/src/normalize.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/results/src/rebuild.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/results/src/render/csv.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/results/src/render/index_md.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/results/src/render/mod.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/results/src/render/sarif.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/results/src/severity.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/results/tests/golden.rs",
       "license": "Apache-2.0"
     },
     {

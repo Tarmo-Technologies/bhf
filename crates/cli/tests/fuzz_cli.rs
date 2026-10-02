@@ -239,6 +239,119 @@ printf "cli-worker-%s" "$BHF_WORKER_ID" > "$worker_dir/corpus/$harness/queue/cli
     assert_eq!(summary["per_worker"][1]["env_keys"][0], "UBSAN_OPTIONS");
 }
 
+#[cfg(unix)]
+#[test]
+fn fuzz_multicore_merges_worker_findings_into_the_parent_index() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = temp_dir("multicore-merge");
+    let work_dir = temp.join("bhf_work");
+    fs::create_dir_all(work_dir.join("build/H-MULTI")).unwrap();
+    fs::create_dir_all(work_dir.join("corpus/H-MULTI/queue")).unwrap();
+
+    // What each worker "finds": worker 0 crash X; worker 1 crash X again
+    // (same cluster, other signature) and crash Y.
+    let crash = |signature: &str, cluster: &str, function: &str| {
+        serde_json::json!({
+            "id": format!("F-0000-{}", &signature[..8]),
+            "signature": signature,
+            "cluster_key": &cluster[..8],
+            "cluster_key_full": cluster,
+            "rule_id": "BHF-201",
+            "classification": "unhandled",
+            "harness_id": "H-MULTI",
+            "exception": {
+                "name": "ASAN_HEAP_BUFFER_OVERFLOW",
+                "message": "heap-buffer-overflow READ of size 4",
+                "sanitizer": "asan",
+                "stack": [{"function": function, "file": "/src/demo/parse.c", "line": 42}]
+            },
+            "paths": {"testcase": "testcase.bin", "finding": "finding.json"}
+        })
+    };
+    let templates = temp.join("templates");
+    for (worker, name, record) in [
+        (
+            "0",
+            "F-0000-aaaaaaaa",
+            crash("aaaaaaaa11", "c1c1c1c1c1c1c1c1", "parse_header"),
+        ),
+        (
+            "1",
+            "F-0000-bbbbbbbb",
+            crash("bbbbbbbb22", "c1c1c1c1c1c1c1c1", "parse_header"),
+        ),
+        (
+            "1",
+            "F-0001-cccccccc",
+            crash("cccccccc33", "c2c2c2c2c2c2c2c2", "parse_body"),
+        ),
+    ] {
+        let dir = templates.join(worker).join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("finding.json"),
+            serde_json::to_vec_pretty(&record).unwrap(),
+        )
+        .unwrap();
+        fs::write(dir.join("testcase.bin"), name.as_bytes()).unwrap();
+    }
+    let script = temp.join("fake-bhf.sh");
+    fs::write(
+        &script,
+        "#!/bin/sh\nset -eu\nmkdir -p \"$2/results/findings\"\n\
+         cp -R \"$BHF_TEST_TEMPLATES/$BHF_WORKER_ID/.\" \"$2/results/findings/\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bhf"))
+        .arg("fuzz")
+        .arg(&work_dir)
+        .args([
+            "--harness",
+            "H-MULTI",
+            "--iterations",
+            "1",
+            "--workers",
+            "2",
+        ])
+        .arg("--bhf-bin")
+        .arg(&script)
+        .env("BHF_TEST_TEMPLATES", &templates)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+
+    let parent = work_dir.join("results/findings");
+    let mut ids: Vec<String> = fs::read_dir(&parent)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    ids.sort();
+    assert_eq!(ids, ["F-0000-aaaaaaaa", "F-0001-cccccccc"], "{stderr}");
+    for id in &ids {
+        let record: serde_json::Value =
+            serde_json::from_slice(&fs::read(parent.join(id).join("finding.json")).unwrap())
+                .unwrap();
+        assert_eq!(record["id"], id.as_str(), "id matches the parent dir");
+    }
+    let index: serde_json::Value =
+        serde_json::from_slice(&fs::read(work_dir.join("results/findings.json")).unwrap()).unwrap();
+    let indexed: Vec<&str> = index["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        indexed.contains(&"F-0000-aaaaaaaa") && indexed.contains(&"F-0001-cccccccc"),
+        "{index}"
+    );
+    assert!(stderr.contains("(2 findings"), "{stderr}");
+}
+
 fn install_fake_harness(work_dir: &Path, harness_id: &str) -> PathBuf {
     let harness = PathBuf::from(env!("CARGO_BIN_EXE_cli_fake_harness"));
     let target = work_dir
@@ -254,7 +367,7 @@ fn install_fake_harness(work_dir: &Path, harness_id: &str) -> PathBuf {
 }
 
 fn only_finding_dir(work_dir: &Path) -> PathBuf {
-    let findings_root = work_dir.join("findings");
+    let findings_root = work_dir.join("results").join("findings");
     let findings = fs::read_dir(&findings_root)
         .expect("findings directory is readable")
         .map(|entry| entry.expect("finding entry is readable").path())

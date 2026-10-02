@@ -997,6 +997,8 @@ struct HarnessRun {
     /// recognized in its stderr. The C/C++ fuzz path uses this to emit
     /// findings without an Ada event log.
     sanitizer: Option<corpus::SanitizerReport>,
+    /// Raw stderr of the run that produced `sanitizer`, for `sanitizer.log`.
+    stderr: Option<String>,
     /// #15: the target REJECTED this input (diagnosed assertion/panic or a non-zero error
     /// return on malformed bytes) — a clean no-finding run that the pass skips and
     /// continues past. Tracked so `run_builtin` can tell a target that rejected
@@ -1354,7 +1356,7 @@ fn run_multicore_campaign(args: FuzzArgs) -> i32 {
                     return 1;
                 }
             }
-            0
+            merge_worker_findings(&config.work_dir, &summary)
         }
         Err(error) => {
             bhfeprintln!("{error}");
@@ -1364,6 +1366,52 @@ fn run_multicore_campaign(args: FuzzArgs) -> i32 {
                 | multicore_fuzz::MulticoreError::InvalidWorkerCount => 3,
                 _ => 1,
             }
+        }
+    }
+}
+
+/// Move the workers' findings into the campaign's own results/findings, so
+/// the results bracket around this command indexes them.
+fn merge_worker_findings(work_dir: &Path, summary: &multicore_fuzz::MulticoreSummary) -> i32 {
+    let workers: Vec<PathBuf> = summary
+        .per_worker
+        .iter()
+        .map(|worker| worker.work_dir.clone())
+        .collect();
+    match multicore_fuzz::merge_worker_findings(work_dir, &workers) {
+        Ok(merge) => {
+            if !merge.merged.is_empty() || merge.duplicates > 0 {
+                bhfeprintln!(
+                    "bhf fuzz: merged {} worker finding(s) into {} ({} duplicate(s) left in worker dirs)",
+                    merge.merged.len(),
+                    corpus::layout::findings_dir(work_dir).display(),
+                    merge.duplicates
+                );
+            }
+            if merge.unreadable > 0 {
+                bhfeprintln!(
+                    "warning: {} worker finding(s) without a readable finding.json were not merged",
+                    merge.unreadable
+                );
+            }
+            if merge.failed == 0 {
+                return 0;
+            }
+            bhfeprintln!(
+                "error: {} worker finding(s) could not be merged; they stay in their worker dirs and the next merge resumes them",
+                merge.failed
+            );
+            for error in &merge.errors {
+                bhfeprintln!("  {error}");
+            }
+            1
+        }
+        Err(error) => {
+            bhfeprintln!(
+                "error: worker findings not merged into {}: {error}",
+                work_dir.display()
+            );
+            1
         }
     }
 }
@@ -2325,7 +2373,9 @@ fn run_builtin_with_progress(
         })
         .unwrap_or(false);
     let sandbox_metadata = prepared.runner.sandbox_metadata();
-    let emitter = FindingEmitter::with_metadata_and_sandbox(
+    let build_binary_identity = binary_analysis::build_identity(&prepared.harness_path)
+        .and_then(|identity| serde_json::to_value(identity).ok());
+    let mut emitter = FindingEmitter::with_metadata_and_sandbox(
         prepared.work_dir.clone(),
         prepared.harness_id.clone(),
         "unknown".to_owned(),
@@ -2335,6 +2385,9 @@ fn run_builtin_with_progress(
     )
     .with_mode(prepared.mode)
     .with_line_maps_dir(&prepared.work_dir.join("src_instrumented"));
+    if let Some(identity) = build_binary_identity {
+        emitter = emitter.with_build_binary(identity);
+    }
     let mut rng = MutationRng::new(prepared.rng_seed);
     // The mutation pool. Each entry carries its #382 entropic energy + selection
     // count (selection favors high-novelty, under-explored seeds) and its #400
@@ -2663,7 +2716,7 @@ fn run_builtin_with_progress(
         // Fold newly-mined value-profile operands into the dictionary every 2048
         // execs so the mutator can splice magic bytes it just observed (#398).
         if let Some(vp) = &vp_path {
-            if executions % 2048 == 0 {
+            if executions.is_multiple_of(2048) {
                 let mut added = false;
                 for token in read_vp_tokens(vp) {
                     if dictionary_token_set.insert(token.clone()) {
@@ -2886,7 +2939,11 @@ fn run_builtin_with_progress(
                     )
                 {
                     let id = emitter
-                        .emit_sanitizer_crash(&input, report)
+                        .emit_sanitizer_crash_with_log(
+                            &input,
+                            report,
+                            run.stderr.as_deref().map(str::as_bytes),
+                        )
                         .map_err(|error| format!("emit sanitizer finding: {error}"))?;
                     finding_ids.push(id.0);
                 } else {
@@ -3580,7 +3637,9 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
 
     let crashes_dir = out_dir.join("default").join("crashes");
     let sandbox_metadata = prepared.runner.sandbox_metadata();
-    let emitter = FindingEmitter::with_metadata_and_sandbox(
+    let build_binary_identity = binary_analysis::build_identity(&prepared.harness_path)
+        .and_then(|identity| serde_json::to_value(identity).ok());
+    let mut emitter = FindingEmitter::with_metadata_and_sandbox(
         prepared.work_dir.clone(),
         prepared.harness_id.clone(),
         "unknown".to_owned(),
@@ -3590,6 +3649,9 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
     )
     .with_mode(prepared.mode)
     .with_line_maps_dir(&prepared.work_dir.join("src_instrumented"));
+    if let Some(identity) = build_binary_identity {
+        emitter = emitter.with_build_binary(identity);
+    }
 
     let mut finding_ids = Vec::new();
     let mut seen_rule_sigs = HashSet::<String>::new();
@@ -3650,7 +3712,7 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
                 continue;
             }
             let id = emitter
-                .emit_sanitizer_crash(&input, &report)
+                .emit_sanitizer_crash_with_log(&input, &report, Some(stderr.as_bytes()))
                 .map_err(|error| format!("emit AFL finding: {error}"))?;
             finding_ids.push(id.0);
         }
@@ -3835,10 +3897,7 @@ fn read_bounded_head_tail(mut reader: impl Read, cap: usize) -> Vec<u8> {
     let mut tail: VecDeque<u8> = VecDeque::with_capacity(tail_cap);
     let mut truncated = false;
     let mut chunk = [0_u8; 64 * 1024];
-    loop {
-        let Ok(read) = reader.read(&mut chunk) else {
-            break;
-        };
+    while let Ok(read) = reader.read(&mut chunk) {
         if read == 0 {
             break;
         }
@@ -4075,6 +4134,7 @@ fn run_c_libfuzzer_single_input(
                         "harness exceeded the response deadline of {deadline:?} (took {elapsed:?})"
                     ),
                 }),
+                stderr: None,
                 rejected: false,
             });
         }
@@ -4085,6 +4145,7 @@ fn run_c_libfuzzer_single_input(
                 events: Vec::new(),
                 testcases: Vec::new(),
                 sanitizer: Some(report),
+                stderr: Some(stderr.to_string()),
                 rejected: false,
             });
         }
@@ -4108,6 +4169,7 @@ fn run_c_libfuzzer_single_input(
                     message: "harness exceeded the configured RSS limit (--rss-limit-mb)"
                         .to_owned(),
                 }),
+                stderr: None,
                 rejected: false,
             });
         }
@@ -4117,6 +4179,7 @@ fn run_c_libfuzzer_single_input(
                 events: Vec::new(),
                 testcases: Vec::new(),
                 sanitizer: None,
+                stderr: None,
                 rejected: false,
             });
         }
@@ -4130,6 +4193,7 @@ fn run_c_libfuzzer_single_input(
                 events: Vec::new(),
                 testcases: Vec::new(),
                 sanitizer: None,
+                stderr: None,
                 rejected: true,
             });
         }
@@ -4144,6 +4208,7 @@ fn run_c_libfuzzer_single_input(
             events: Vec::new(),
             testcases: Vec::new(),
             sanitizer: Some(fatal_signal_report(&output.status, &stderr)),
+            stderr: Some(stderr.to_string()),
             rejected: false,
         });
     }
@@ -4151,6 +4216,7 @@ fn run_c_libfuzzer_single_input(
         events: Vec::new(),
         testcases: Vec::new(),
         sanitizer: None,
+        stderr: None,
         rejected: false,
     })
 }
@@ -4930,7 +4996,7 @@ fn existing_crash_testcases(work_dir: &Path, harness_id: &str, max_len: usize) -
     let finding_record_limit = max_finding_record_bytes();
     let dedup_limit = max_finding_dedup_keys();
     let mut set = HashSet::new();
-    let Ok(entries) = fs::read_dir(work_dir.join("findings")) else {
+    let Ok(entries) = fs::read_dir(corpus::layout::findings_dir(work_dir)) else {
         return set;
     };
     for entry in entries.flatten() {
@@ -5002,7 +5068,7 @@ fn existing_finding_dedup_keys(work_dir: &Path, harness_id: &str) -> (Vec<String
     let dedup_limit = max_finding_dedup_keys();
     let mut clusters = Vec::new();
     let mut oracles = Vec::new();
-    let Ok(entries) = fs::read_dir(work_dir.join("findings")) else {
+    let Ok(entries) = fs::read_dir(corpus::layout::findings_dir(work_dir)) else {
         return (clusters, oracles);
     };
     for entry in entries.flatten() {
@@ -5022,29 +5088,13 @@ fn existing_finding_dedup_keys(work_dir: &Path, harness_id: &str) -> (Vec<String
         if record.get("harness_id").and_then(|value| value.as_str()) != Some(harness_id) {
             continue;
         }
-        let rule_id = record.get("rule_id").and_then(|v| v.as_str());
-        // Oracle-hit finding: key = rule_id|oracle_name|api (oracle_hit_dedupe_key).
-        if let (Some(rule_id), Some(oracle)) = (rule_id, record.get("oracle")) {
-            if let (Some(name), Some(api)) = (
-                oracle.get("name").and_then(|v| v.as_str()),
-                oracle.get("api").and_then(|v| v.as_str()),
-            ) {
-                oracles.push(format!("{rule_id}|{name}|{api}"));
-                continue;
-            }
-        }
-        // Sanitizer-crash finding: key = cluster_key_full, or rule:<id> on fallback
-        // (matches first_of_sanitizer_cluster).
-        let fallback = record
-            .get("cluster_fallback")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        if fallback {
-            if let Some(rule_id) = rule_id {
-                clusters.push(format!("rule:{rule_id}"));
-            }
-        } else if let Some(full) = record.get("cluster_key_full").and_then(|v| v.as_str()) {
-            clusters.push(full.to_owned());
+        // Oracle hits key on rule_id|oracle_name|api (oracle_hit_dedupe_key),
+        // sanitizer crashes on cluster_key_full or rule:<id> on fallback
+        // (first_of_sanitizer_cluster).
+        match corpus::finding::run_dedupe_key(&record) {
+            Some(corpus::finding::RunDedupeKey::Oracle(key)) => oracles.push(key),
+            Some(corpus::finding::RunDedupeKey::Cluster(key)) => clusters.push(key),
+            None => {}
         }
     }
     (clusters, oracles)
@@ -5203,6 +5253,7 @@ fn run_harness_with_protocol(
             events: Vec::new(),
             testcases: Vec::new(),
             sanitizer: None,
+            stderr: None,
             rejected: false,
         });
     };
@@ -5218,6 +5269,7 @@ fn run_harness_with_protocol(
                 events: Vec::new(),
                 testcases: Vec::new(),
                 sanitizer: Some(report),
+                stderr: Some(stderr.to_string()),
                 rejected: false,
             });
         }
@@ -5231,6 +5283,7 @@ fn run_harness_with_protocol(
                 events: Vec::new(),
                 testcases: Vec::new(),
                 sanitizer: None,
+                stderr: None,
                 rejected: true,
             });
         }
@@ -5242,6 +5295,7 @@ fn run_harness_with_protocol(
             events: Vec::new(),
             testcases: Vec::new(),
             sanitizer: Some(fatal_signal_report(&status, &stderr)),
+            stderr: Some(stderr.to_string()),
             rejected: false,
         });
     }
@@ -5266,6 +5320,7 @@ fn run_harness_with_protocol(
                 events: Vec::new(),
                 testcases: Vec::new(),
                 sanitizer: None,
+                stderr: None,
                 rejected: false,
             });
         }
@@ -5288,6 +5343,7 @@ fn run_harness_with_protocol(
         events,
         testcases,
         sanitizer: None,
+        stderr: None,
         rejected: false,
     })
 }
@@ -5602,6 +5658,7 @@ impl ForkServer {
                 events: Vec::new(),
                 testcases: Vec::new(),
                 sanitizer: None,
+                stderr: None,
                 rejected: false,
             });
         }
@@ -5630,6 +5687,7 @@ impl ForkServer {
             events,
             testcases,
             sanitizer: None,
+            stderr: None,
             rejected: false,
         })
     }
@@ -6078,7 +6136,7 @@ mod dedup_seed_tests {
         // #35: a later cascade pass must reconstruct the dedup keys of findings a
         // prior pass already wrote, so it does not re-emit byte-identical findings.
         let work = tempfile::tempdir().unwrap();
-        let findings = work.path().join("findings");
+        let findings = work.path().join("results").join("findings");
         // A sanitizer-crash finding (clustered).
         let c = findings.join("F-0001-aaaa");
         std::fs::create_dir_all(&c).unwrap();
@@ -7229,6 +7287,49 @@ mod auto_path_tests {
 
     #[test]
     #[cfg(unix)]
+    fn sanitizer_crash_writes_sanitizer_log_next_to_the_finding() {
+        // Task 25: the full captured stderr of a real sanitizer crash must land
+        // as `sanitizer.log` next to `finding.json`, not just the truncated
+        // excerpt that was already in the record.
+        let root = tmpdir();
+        let work_dir = root.join("bhf_work");
+        write_c_libfuzzer_harness(
+            &work_dir,
+            "H-SANLOG",
+            "#!/bin/sh\n>&2 echo 'ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1'\n\
+             >&2 echo '    #0 0x1 in real_parse /src/p.c:9'\nexit 1\n",
+        );
+        let summary = run_one_target_programmatic(
+            &work_dir,
+            "H-SANLOG",
+            vec![b"seed".to_vec()],
+            1,
+            None,
+            None,
+            0,
+            &[],
+            actionability::RunMode::Reporting,
+            None,
+            &[],
+            None,
+        )
+        .expect("a crash on every input is signal, not an all-reject failure");
+        assert_eq!(summary.findings.len(), 1);
+        let finding_dir = corpus::layout::finding_dir(&work_dir, &summary.findings[0]);
+        let log = fs::read_to_string(finding_dir.join("sanitizer.log"))
+            .expect("sanitizer.log must be written next to the finding");
+        assert!(
+            log.contains("AddressSanitizer: heap-buffer-overflow"),
+            "{log}"
+        );
+        assert!(log.contains("real_parse /src/p.c:9"), "{log}");
+        let finding: serde_json::Value =
+            serde_json::from_slice(&fs::read(finding_dir.join("finding.json")).unwrap()).unwrap();
+        assert_eq!(finding["paths"]["sanitizer_log"], "sanitizer.log");
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn harness_that_crashes_on_every_input_keeps_its_findings() {
         // #477: a target where EVERY input crashes (a callback struct cast from raw
         // bytes; a parser that aborts on malformed input) rejects all executions AND
@@ -7817,7 +7918,10 @@ mod auto_path_tests {
              starvation should not persist): {:?}",
             summary.findings
         );
-        let finding_dir = work_dir.join("findings").join(&summary.findings[0]);
+        let finding_dir = work_dir
+            .join("results")
+            .join("findings")
+            .join(&summary.findings[0]);
         let finding: serde_json::Value =
             serde_json::from_slice(&fs::read(finding_dir.join("finding.json")).unwrap()).unwrap();
         assert_eq!(finding["classification"], "oracle_hit");
@@ -8513,7 +8617,7 @@ mod sequence_layout_tests {
         for (step, expected) in harness_selected.iter().enumerate() {
             let span = &layout.steps[step].op_index_range;
             let selector = input[span.start];
-            let decoded = if selector % 4 == 0 {
+            let decoded = if selector.is_multiple_of(4) {
                 let raw: u32 = match selector % 6 {
                     0 => 0,
                     1 => 1,

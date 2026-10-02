@@ -15,6 +15,128 @@ pub struct FindingEmitter {
     line_maps: crate::line_remap::SourceLineMaps,
 }
 
+/// `finding_kind` values of the `bhf.finding.v1` envelope. `results::model::Kind`
+/// serializes to exactly these strings.
+pub mod finding_kind {
+    pub const FUZZ: &str = "fuzz";
+    pub const RUNTIME: &str = "runtime";
+    pub const STATIC: &str = "static";
+    pub const BINARY: &str = "binary";
+    pub const DIFFERENTIAL: &str = "differential";
+    pub const SCA: &str = "sca";
+}
+
+pub const FINDING_SCHEMA_VERSION: &str = "bhf.finding.v1";
+
+/// Current UTC time as an RFC 3339 string with millisecond precision and a `Z`
+/// suffix. Every finding timestamp uses this one format, so they also order
+/// correctly as plain strings; compare against other formats only after parsing.
+pub fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+/// Stamp a new per-finding record with the `bhf.finding.v1` envelope. Keeps an
+/// existing `created_at` so re-writes never move a finding's birth time.
+pub fn stamp_v1(record: &mut serde_json::Value, kind: &str) {
+    if let Some(obj) = record.as_object_mut() {
+        obj.insert("schema_version".to_owned(), json!(FINDING_SCHEMA_VERSION));
+        obj.insert("finding_kind".to_owned(), json!(kind));
+        obj.entry("created_at")
+            .or_insert_with(|| json!(now_rfc3339()));
+    }
+}
+
+/// Cap for `sanitizer.log`; the first MiB holds the report and stacks, the rest is noise.
+pub const SANITIZER_LOG_MAX: u64 = 1024 * 1024;
+
+/// Write the captured stderr of the crashing execution, truncated to
+/// [`SANITIZER_LOG_MAX`] with a trailing marker naming the dropped byte count.
+pub fn write_sanitizer_log(finding_dir: &std::path::Path, log: &[u8]) -> std::io::Result<()> {
+    let max = SANITIZER_LOG_MAX as usize;
+    if log.len() <= max {
+        return fs::write(finding_dir.join("sanitizer.log"), log);
+    }
+    let mut bytes = log[..max].to_vec();
+    bytes.extend_from_slice(format!("\n[truncated {} bytes]\n", log.len() - max).as_bytes());
+    fs::write(finding_dir.join("sanitizer.log"), bytes)
+}
+
+/// Record that `command` rewrote `fields` of this record. Enrichment steps edit
+/// `finding.json` in place; this keeps the edits traceable.
+pub fn append_history(record: &mut serde_json::Value, command: &str, fields: &[&str]) {
+    let Some(obj) = record.as_object_mut() else {
+        return;
+    };
+    let entry = json!({ "at": now_rfc3339(), "command": command, "fields": fields });
+    match obj
+        .get_mut("history")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        Some(history) => history.push(entry),
+        // No `history` yet, or a malformed non-array one: start a fresh array
+        // (a non-array value is replaced rather than preserved).
+        None => {
+            obj.insert("history".to_owned(), json!([entry]));
+        }
+    }
+}
+
+/// The key a fuzz run dedupes an emitted finding on, by the set it lives in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunDedupeKey {
+    /// `rule_id|oracle.name|oracle.api`: one finding per defect, not per input.
+    Oracle(String),
+    /// `cluster_key_full`, or `rule:<rule_id>` for a fallback cluster.
+    Cluster(String),
+}
+
+/// The fuzz run's dedupe key for a written `finding.json`, rebuilt from the
+/// record: what the run computed when it emitted the finding. Oracle keys are
+/// kept verbatim, empty parts included, as the run builds them; an empty
+/// cluster key or rule id yields nothing, since no run computes one and a
+/// shared empty key would make unrelated records one crash.
+pub fn run_dedupe_key(record: &serde_json::Value) -> Option<RunDedupeKey> {
+    let rule_id = record.get("rule_id").and_then(serde_json::Value::as_str);
+    if let (Some(rule_id), Some(oracle)) = (rule_id, record.get("oracle")) {
+        if let (Some(name), Some(api)) = (
+            oracle.get("name").and_then(serde_json::Value::as_str),
+            oracle.get("api").and_then(serde_json::Value::as_str),
+        ) {
+            return Some(RunDedupeKey::Oracle(format!("{rule_id}|{name}|{api}")));
+        }
+    }
+    let fallback = record
+        .get("cluster_fallback")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if fallback {
+        rule_id
+            .filter(|rule_id| !rule_id.is_empty())
+            .map(|rule_id| RunDedupeKey::Cluster(format!("rule:{rule_id}")))
+    } else {
+        record
+            .get("cluster_key_full")
+            .and_then(serde_json::Value::as_str)
+            .filter(|full| !full.is_empty())
+            .map(|full| RunDedupeKey::Cluster(full.to_owned()))
+    }
+}
+
+/// Every key that names `record`'s crash: its [`run_dedupe_key`] and its
+/// `signature` (as `signature:<hex>`). Two findings of one harness that share
+/// any key are the same crash; a record with no key matches nothing.
+pub fn dedupe_keys(record: &serde_json::Value) -> Vec<String> {
+    let run = run_dedupe_key(record).map(|key| match key {
+        RunDedupeKey::Oracle(key) | RunDedupeKey::Cluster(key) => key,
+    });
+    let signature = record
+        .get("signature")
+        .and_then(serde_json::Value::as_str)
+        .filter(|signature| !signature.is_empty())
+        .map(|signature| format!("signature:{signature}"));
+    run.into_iter().chain(signature).collect()
+}
+
 impl FindingEmitter {
     pub fn new(root: PathBuf) -> Self {
         Self {
@@ -46,6 +168,7 @@ impl FindingEmitter {
                 fixture_path,
                 sandbox: None,
                 mode: actionability::RunMode::Reporting,
+                build_binary: None,
             },
             line_maps: crate::line_remap::SourceLineMaps::default(),
         }
@@ -66,6 +189,7 @@ impl FindingEmitter {
                 fixture_path,
                 sandbox: Some(sandbox),
                 mode: actionability::RunMode::Reporting,
+                build_binary: None,
             },
             line_maps: crate::line_remap::SourceLineMaps::default(),
         }
@@ -76,6 +200,14 @@ impl FindingEmitter {
         self
     }
 
+    /// Attach the harness/target binary's identity (sha256 + GNU build-id),
+    /// serialized as JSON. Merged into `record["build"]["binary"]` by every
+    /// emitter so a finding pins to the exact binary bytes that produced it.
+    pub fn with_build_binary(mut self, identity: serde_json::Value) -> Self {
+        self.metadata.build_binary = Some(identity);
+        self
+    }
+
     /// Emit a finding for a libFuzzer/AFL++ C/C++ crash captured via stderr.
     /// Unlike `emit`, there's no event log and no Ada Testcase; the sanitizer
     /// report already carries everything we need.
@@ -83,6 +215,18 @@ impl FindingEmitter {
         &self,
         input: &[u8],
         report: &crate::sanitizer::SanitizerReport,
+    ) -> Result<FindingId, CorpusError> {
+        self.emit_sanitizer_crash_with_log(input, report, None)
+    }
+
+    /// Like [`Self::emit_sanitizer_crash`], additionally writing the raw
+    /// captured stderr of the crashing execution as `sanitizer.log` next to
+    /// the finding, when `log` is non-empty.
+    pub fn emit_sanitizer_crash_with_log(
+        &self,
+        input: &[u8],
+        report: &crate::sanitizer::SanitizerReport,
+        log: Option<&[u8]>,
     ) -> Result<FindingId, CorpusError> {
         use sha2::Digest;
         let mut hasher = sha2::Sha256::new();
@@ -104,19 +248,17 @@ impl FindingEmitter {
         } else {
             (cluster.short.clone(), cluster.full.clone(), false)
         };
-        let id = FindingId(format!(
-            "F-{ordinal:04}-{short}",
-            ordinal = self.next_ordinal()?,
-            short = signature_hex.chars().take(8).collect::<String>()
-        ));
-        let finding_dir = self.root.join("findings").join(&id.0);
-        fs::create_dir_all(&finding_dir)?;
+        let (id, finding_dir) = self.allocate_finding(&signature_hex)?;
 
         fs::write(finding_dir.join("testcase.bin"), input)?;
         fs::write(
             finding_dir.join("decoded.json"),
             serde_json::to_vec_pretty(&decoded_placeholder(input))?,
         )?;
+        let log_written = log.filter(|l| !l.is_empty());
+        if let Some(log) = log_written {
+            write_sanitizer_log(&finding_dir, log)?;
+        }
 
         let mut record = json!({
             "id": id.0,
@@ -142,16 +284,21 @@ impl FindingEmitter {
                 "finding": "finding.json",
             },
         });
+        if log_written.is_some() {
+            record["paths"]["sanitizer_log"] = json!("sanitizer.log");
+        }
         if let Some(sandbox) = &self.metadata.sandbox {
             record["sandbox"] = sandbox.clone();
             record["build"] = json!({ "sandbox": sandbox });
         }
+        merge_build_binary(&mut record, &self.metadata);
         record["actionability"] = actionability::value_for_finding(
             self.metadata.mode,
             &record,
             Some(&finding_dir.join("finding.json")),
         );
 
+        stamp_v1(&mut record, finding_kind::FUZZ);
         fs::write(
             finding_dir.join("finding.json"),
             serde_json::to_vec_pretty(&record)?,
@@ -212,13 +359,7 @@ impl FindingEmitter {
         }
         let cluster_full = format!("{:x}", cluster_hasher.finalize());
         let cluster_short = cluster_full.chars().take(16).collect::<String>();
-        let id = FindingId(format!(
-            "F-{ordinal:04}-{short}",
-            ordinal = self.next_ordinal()?,
-            short = signature_hex.chars().take(8).collect::<String>()
-        ));
-        let finding_dir = self.root.join("findings").join(&id.0);
-        fs::create_dir_all(&finding_dir)?;
+        let (id, finding_dir) = self.allocate_finding(&signature_hex)?;
 
         fs::write(finding_dir.join("testcase.bin"), input)?;
         fs::write(
@@ -264,12 +405,14 @@ impl FindingEmitter {
             record["sandbox"] = sandbox.clone();
             record["build"] = json!({ "sandbox": sandbox });
         }
+        merge_build_binary(&mut record, &self.metadata);
         record["actionability"] = actionability::value_for_finding(
             self.metadata.mode,
             &record,
             Some(&finding_dir.join("finding.json")),
         );
 
+        stamp_v1(&mut record, finding_kind::FUZZ);
         fs::write(
             finding_dir.join("finding.json"),
             serde_json::to_vec_pretty(&record)?,
@@ -314,13 +457,7 @@ impl FindingEmitter {
             (cluster.short.clone(), cluster.full.clone(), false)
         };
         let cluster_frames = cluster.frames.clone();
-        let id = FindingId(format!(
-            "F-{ordinal:04}-{short}",
-            ordinal = self.next_ordinal()?,
-            short = signature_hex.chars().take(8).collect::<String>()
-        ));
-        let finding_dir = self.root.join("findings").join(&id.0);
-        fs::create_dir_all(&finding_dir)?;
+        let (id, finding_dir) = self.allocate_finding(&signature_hex)?;
 
         fs::write(finding_dir.join("testcase.bin"), input)?;
         fs::write(
@@ -345,6 +482,7 @@ impl FindingEmitter {
             &record,
             Some(&finding_dir.join("finding.json")),
         );
+        stamp_v1(&mut record, finding_kind::FUZZ);
         fs::write(
             finding_dir.join("finding.json"),
             serde_json::to_vec_pretty(&record)?,
@@ -378,26 +516,19 @@ impl FindingEmitter {
         }
     }
 
-    fn next_ordinal(&self) -> Result<u32, CorpusError> {
-        let findings_root = self.root.join("findings");
-        fs::create_dir_all(&findings_root)?;
-        let mut next = 0_u32;
-        for entry in fs::read_dir(findings_root)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                continue;
-            };
-            let Some(rest) = name.strip_prefix("F-") else {
-                continue;
-            };
-            let digits = rest.chars().take(4).collect::<String>();
-            let Some(ordinal) = digits.parse::<u32>().ok() else {
-                continue;
-            };
-            next = next.max(ordinal.saturating_add(1));
-        }
-        Ok(next)
+    /// Atomically reserve a fresh `F-NNNN-<sig8>` finding directory, retrying
+    /// on an ordinal a concurrent writer already took. Replaces the old
+    /// scan-then-`create_dir_all`, which could hand two writers sharing a work
+    /// dir (multiple processes, or the daemon's concurrent jobs) the same id.
+    fn allocate_finding(
+        &self,
+        signature_hex: &str,
+    ) -> Result<(FindingId, std::path::PathBuf), CorpusError> {
+        let findings_root = crate::layout::findings_dir(&self.root);
+        let short: String = signature_hex.chars().take(8).collect();
+        let mut allocator = crate::layout::FamilyAllocator::new(&findings_root, "F-")?;
+        let (id, dir) = allocator.create_with_suffix(&short)?;
+        Ok((FindingId(id), dir))
     }
 }
 
@@ -411,6 +542,10 @@ struct FindingMetadata {
     fixture_path: String,
     sandbox: Option<serde_json::Value>,
     mode: actionability::RunMode,
+    /// The harness/target binary's identity (sha256 + GNU build-id), as JSON
+    /// (`corpus` does not depend on `binary_analysis`): merged into
+    /// `record["build"]["binary"]` by every emitter.
+    build_binary: Option<serde_json::Value>,
 }
 
 impl Default for FindingMetadata {
@@ -421,6 +556,56 @@ impl Default for FindingMetadata {
             fixture_path: String::new(),
             sandbox: None,
             mode: actionability::RunMode::Reporting,
+            build_binary: None,
+        }
+    }
+}
+
+/// A later run reproduced this finding: stamp `last_seen` (and history).
+/// A caller replaying against a possibly read-only evidence tree should
+/// `let _ =` the result rather than fail the replay on it.
+///
+/// Idempotent across repeated reproductions: `last_seen` is updated every
+/// call, but a finding replayed N times keeps a single trailing
+/// `command`/`[last_seen]` history entry (its timestamp refreshed) rather than
+/// growing `history` by one entry per replay.
+pub fn touch_last_seen(finding_dir: &std::path::Path, command: &str) -> std::io::Result<()> {
+    let path = finding_dir.join("finding.json");
+    let mut raw: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    if !raw.is_object() {
+        return Ok(());
+    }
+    raw["last_seen"] = json!(now_rfc3339());
+    let refreshed = raw
+        .get_mut("history")
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|history| history.last_mut())
+        .filter(|last| {
+            last.get("command").and_then(serde_json::Value::as_str) == Some(command)
+                && last.get("fields") == Some(&json!(["last_seen"]))
+        })
+        .map(|last| {
+            last["at"] = json!(now_rfc3339());
+        });
+    if refreshed.is_none() {
+        append_history(&mut raw, command, &["last_seen"]);
+    }
+    fs::write(&path, serde_json::to_vec_pretty(&raw)?)
+}
+
+/// Merge the harness/target binary's identity into `record["build"]["binary"]`,
+/// creating `build` as an object first if no sandbox metadata already put one
+/// there. No-op when `metadata` carries no build identity.
+fn merge_build_binary(record: &mut serde_json::Value, metadata: &FindingMetadata) {
+    if let Some(binary) = &metadata.build_binary {
+        let build = record
+            .as_object_mut()
+            .expect("record is an object")
+            .entry("build")
+            .or_insert_with(|| json!({}));
+        if let Some(build) = build.as_object_mut() {
+            build.insert("binary".to_owned(), binary.clone());
         }
     }
 }
@@ -488,6 +673,7 @@ fn finding_record(
         record["sandbox"] = sandbox.clone();
         record["build"] = json!({ "sandbox": sandbox });
     }
+    merge_build_binary(&mut record, metadata);
     record
 }
 
@@ -525,6 +711,7 @@ fn oracle_exception_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::FindingEmitter;
+    use super::{append_history, finding_kind, stamp_v1};
     use crate::compute_signature;
     use event_log::{HandlerEvent, Testcase};
     use std::fs;
@@ -538,7 +725,7 @@ mod tests {
 
         let id = emitter.emit(b"input", &testcase(), 0).unwrap();
 
-        assert!(root.join("findings").join(id.0).is_dir());
+        assert!(crate::layout::findings_dir(&root).join(id.0).is_dir());
     }
 
     #[test]
@@ -549,7 +736,12 @@ mod tests {
         let id = emitter.emit(b"\x00\x01bad", &testcase(), 0).unwrap();
 
         assert_eq!(
-            fs::read(root.join("findings").join(id.0).join("testcase.bin")).unwrap(),
+            fs::read(
+                crate::layout::findings_dir(&root)
+                    .join(id.0)
+                    .join("testcase.bin")
+            )
+            .unwrap(),
             b"\x00\x01bad"
         );
     }
@@ -560,8 +752,12 @@ mod tests {
         let emitter = FindingEmitter::new(root.clone());
 
         let id = emitter.emit(b"abcdef", &testcase(), 0).unwrap();
-        let decoded =
-            fs::read_to_string(root.join("findings").join(id.0).join("decoded.json")).unwrap();
+        let decoded = fs::read_to_string(
+            crate::layout::findings_dir(&root)
+                .join(id.0)
+                .join("decoded.json"),
+        )
+        .unwrap();
         let value: serde_json::Value = serde_json::from_str(&decoded).unwrap();
 
         assert_eq!(value["input_size"], 6);
@@ -575,8 +771,12 @@ mod tests {
         let input = b"\x00\x01bad";
 
         let id = emitter.emit(input, &testcase(), 0).unwrap();
-        let decoded =
-            fs::read_to_string(root.join("findings").join(id.0).join("decoded.json")).unwrap();
+        let decoded = fs::read_to_string(
+            crate::layout::findings_dir(&root)
+                .join(id.0)
+                .join("decoded.json"),
+        )
+        .unwrap();
         let value: serde_json::Value = serde_json::from_str(&decoded).unwrap();
 
         assert_eq!(value["provenance"][0]["kind"], "raw_bytes");
@@ -592,12 +792,17 @@ mod tests {
         let expected = compute_signature(&testcase, &testcase.handlers[0]).hex();
 
         let id = emitter.emit(b"input", &testcase, 0).unwrap();
-        let finding =
-            fs::read_to_string(root.join("findings").join(id.0).join("finding.json")).unwrap();
+        let finding = fs::read_to_string(
+            crate::layout::findings_dir(&root)
+                .join(id.0)
+                .join("finding.json"),
+        )
+        .unwrap();
         let value: serde_json::Value = serde_json::from_str(&finding).unwrap();
 
         assert_eq!(value["signature"], expected);
         assert_eq!(value["classification"], "swallowed_predefined");
+        assert_eq!(value["finding_kind"], "fuzz");
         assert_eq!(value["handler"]["handler_line"], 9);
     }
 
@@ -608,8 +813,12 @@ mod tests {
         let testcase = testcase();
 
         let id = emitter.emit(b"input", &testcase, 0).unwrap();
-        let finding =
-            fs::read_to_string(root.join("findings").join(id.0).join("finding.json")).unwrap();
+        let finding = fs::read_to_string(
+            crate::layout::findings_dir(&root)
+                .join(id.0)
+                .join("finding.json"),
+        )
+        .unwrap();
         let value: serde_json::Value = serde_json::from_str(&finding).unwrap();
 
         assert_eq!(value["rule_id"], "BHF-102");
@@ -628,8 +837,12 @@ mod tests {
         }];
 
         let id = emitter.emit(b"input", &testcase, 0).unwrap();
-        let finding =
-            fs::read_to_string(root.join("findings").join(id.0).join("finding.json")).unwrap();
+        let finding = fs::read_to_string(
+            crate::layout::findings_dir(&root)
+                .join(id.0)
+                .join("finding.json"),
+        )
+        .unwrap();
         let value: serde_json::Value = serde_json::from_str(&finding).unwrap();
 
         assert_eq!(value["mocks"][0]["symbol"], "Missing_Service");
@@ -643,7 +856,12 @@ mod tests {
         let emitter = FindingEmitter::new(root.clone());
         let id = emitter.emit(b"input", &testcase(), 0).unwrap();
         let value: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(root.join("findings").join(id.0).join("finding.json")).unwrap(),
+            &fs::read_to_string(
+                crate::layout::findings_dir(&root)
+                    .join(id.0)
+                    .join("finding.json"),
+            )
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(value["tier"], "swallowed_check");
@@ -666,7 +884,12 @@ mod tests {
             .emit(b"input", &testcase, crate::UNHANDLED_HANDLER_INDEX)
             .unwrap();
         let value: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(root.join("findings").join(id.0).join("finding.json")).unwrap(),
+            &fs::read_to_string(
+                crate::layout::findings_dir(&root)
+                    .join(id.0)
+                    .join("finding.json"),
+            )
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(value["tier"], "real_fault");
@@ -685,6 +908,29 @@ mod tests {
         let id = emitter.emit(b"input", &testcase, 0).unwrap();
 
         assert_eq!(id.0, format!("F-0000-{}", &signature[..8]));
+    }
+
+    #[test]
+    fn emit_allocates_exclusively_and_never_overwrites_a_taken_ordinal() {
+        let root = temp_dir("alloc");
+        let emitter = FindingEmitter::new(root.clone());
+        let testcase = testcase();
+        let signature = compute_signature(&testcase, &testcase.handlers[0]).hex();
+
+        // A concurrent writer sharing the work dir already holds F-0000 with
+        // its own data; the emit must skip it, not scan-then-overwrite it.
+        let taken = crate::layout::findings_dir(&root).join(format!("F-0000-{}", &signature[..8]));
+        std::fs::create_dir_all(&taken).unwrap();
+        std::fs::write(taken.join("sentinel"), b"keep").unwrap();
+
+        let id = emitter.emit(b"input", &testcase, 0).unwrap();
+
+        assert!(id.0.starts_with("F-0001-"), "got {}", id.0);
+        assert_eq!(
+            std::fs::read(taken.join("sentinel")).unwrap(),
+            b"keep",
+            "the already-taken finding dir must be left intact"
+        );
     }
 
     fn testcase() -> Testcase {
@@ -749,7 +995,12 @@ mod tests {
             )
             .unwrap();
         let finding: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(root.join("findings").join(&id.0).join("finding.json")).unwrap(),
+            &fs::read_to_string(
+                crate::layout::findings_dir(&root)
+                    .join(&id.0)
+                    .join("finding.json"),
+            )
+            .unwrap(),
         )
         .unwrap();
 
@@ -776,7 +1027,12 @@ mod tests {
             )
             .unwrap();
         let finding: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(root.join("findings").join(&id.0).join("finding.json")).unwrap(),
+            &fs::read_to_string(
+                crate::layout::findings_dir(&root)
+                    .join(&id.0)
+                    .join("finding.json"),
+            )
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(
@@ -816,7 +1072,12 @@ mod tests {
         };
         let id = emitter.emit_sanitizer_crash(b"in", &report).unwrap();
         let v: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(root.join("findings").join(id.0).join("finding.json")).unwrap(),
+            &fs::read_to_string(
+                crate::layout::findings_dir(&root)
+                    .join(id.0)
+                    .join("finding.json"),
+            )
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(v["cluster_normalized_frames"][0], "real_parse");
@@ -824,6 +1085,31 @@ mod tests {
         assert_eq!(short.len(), 16);
         assert_eq!(v["cluster_fallback"], false);
         assert_eq!(v["cluster_key_full"].as_str().unwrap().len(), 64);
+    }
+
+    #[test]
+    fn sanitizer_crash_lands_under_results_findings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let emitter = FindingEmitter::new(root.clone());
+        let report = crate::sanitizer::SanitizerReport {
+            sanitizer: crate::sanitizer::Sanitizer::AddressSanitizer,
+            kind: "heap-buffer-overflow".to_owned(),
+            rule_id: "BHF-201",
+            stack: Vec::new(),
+            message: "heap-buffer-overflow".to_owned(),
+        };
+        let id = emitter.emit_sanitizer_crash(b"in", &report).unwrap();
+        let dir = crate::layout::finding_dir(&root, &id.0);
+        assert!(
+            dir.join("finding.json").is_file(),
+            "missing {}",
+            dir.display()
+        );
+        assert!(
+            !root.join("findings").exists(),
+            "legacy dir must not be created"
+        );
     }
 
     #[test]
@@ -845,8 +1131,12 @@ mod tests {
         };
 
         let id = emitter.emit_sanitizer_crash(b"in", &report).unwrap();
-        let finding =
-            fs::read_to_string(root.join("findings").join(id.0).join("finding.json")).unwrap();
+        let finding = fs::read_to_string(
+            crate::layout::findings_dir(&root)
+                .join(id.0)
+                .join("finding.json"),
+        )
+        .unwrap();
         let value: serde_json::Value = serde_json::from_str(&finding).unwrap();
 
         assert_eq!(value["actionability"]["mode"], "attacking");
@@ -881,12 +1171,17 @@ mod tests {
         };
 
         let id = emitter.emit_oracle_hit(b"../../etc/passwd", &hit).unwrap();
-        let finding =
-            fs::read_to_string(root.join("findings").join(id.0).join("finding.json")).unwrap();
+        let finding = fs::read_to_string(
+            crate::layout::findings_dir(&root)
+                .join(id.0)
+                .join("finding.json"),
+        )
+        .unwrap();
         let value: serde_json::Value = serde_json::from_str(&finding).unwrap();
 
         assert_eq!(value["rule_id"], "BHF-101");
         assert_eq!(value["classification"], "oracle_hit");
+        assert_eq!(value["finding_kind"], "fuzz");
         assert_eq!(value["harness_id"], "H-path");
         assert_eq!(value["oracle"]["name"], "path-traversal-ada");
         assert_eq!(value["oracle"]["category"], "logic-bug");
@@ -894,7 +1189,7 @@ mod tests {
         assert_eq!(value["oracle"]["evidence"][0]["value"], "../../etc/passwd");
         assert_eq!(
             fs::read(
-                root.join("findings")
+                crate::layout::findings_dir(&root)
                     .join(value["id"].as_str().unwrap())
                     .join("testcase.bin")
             )
@@ -937,8 +1232,12 @@ mod tests {
 
         let read = |id: &super::FindingId| -> serde_json::Value {
             serde_json::from_str(
-                &fs::read_to_string(root.join("findings").join(&id.0).join("finding.json"))
-                    .unwrap(),
+                &fs::read_to_string(
+                    crate::layout::findings_dir(&root)
+                        .join(&id.0)
+                        .join("finding.json"),
+                )
+                .unwrap(),
             )
             .unwrap()
         };
@@ -980,8 +1279,12 @@ mod tests {
             .unwrap();
         let read = |id: &super::FindingId| -> serde_json::Value {
             serde_json::from_str(
-                &fs::read_to_string(root.join("findings").join(&id.0).join("finding.json"))
-                    .unwrap(),
+                &fs::read_to_string(
+                    crate::layout::findings_dir(&root)
+                        .join(&id.0)
+                        .join("finding.json"),
+                )
+                .unwrap(),
             )
             .unwrap()
         };
@@ -994,7 +1297,12 @@ mod tests {
         let emitter = super::FindingEmitter::new(root.clone());
         let id = emitter.emit(b"input", &testcase(), 0).unwrap();
         let v: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(root.join("findings").join(id.0).join("finding.json")).unwrap(),
+            &fs::read_to_string(
+                crate::layout::findings_dir(&root)
+                    .join(id.0)
+                    .join("finding.json"),
+            )
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(v["cluster_normalized_frames"][0], "CONSTRAINT_ERROR");
@@ -1021,11 +1329,230 @@ mod tests {
         };
         let id = emitter.emit_sanitizer_crash(b"x", &report).unwrap();
         let v: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(root.join("findings").join(id.0).join("finding.json")).unwrap(),
+            &fs::read_to_string(
+                crate::layout::findings_dir(&root)
+                    .join(id.0)
+                    .join("finding.json"),
+            )
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(v["cluster_fallback"], true);
         let signature = v["signature"].as_str().unwrap();
         assert_eq!(v["cluster_key"], signature[..16]);
+    }
+
+    #[test]
+    fn new_records_carry_the_v1_envelope() {
+        let root = temp_dir("v1-envelope");
+        let emitter = FindingEmitter::new(root.clone());
+        let report = crate::sanitizer::SanitizerReport {
+            sanitizer: crate::sanitizer::Sanitizer::AddressSanitizer,
+            kind: "heap-buffer-overflow".to_owned(),
+            rule_id: "BHF-201",
+            stack: Vec::new(),
+            message: "heap-buffer-overflow".to_owned(),
+        };
+        let id = emitter.emit_sanitizer_crash(b"in", &report).unwrap();
+        let raw: serde_json::Value = serde_json::from_slice(
+            &fs::read(crate::layout::finding_dir(&root, &id.0).join("finding.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(raw["schema_version"], "bhf.finding.v1");
+        assert_eq!(raw["finding_kind"], "fuzz");
+        let created = raw["created_at"].as_str().unwrap();
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(created).is_ok(),
+            "{created}"
+        );
+    }
+
+    #[test]
+    fn stamp_keeps_an_existing_created_at() {
+        let mut v = serde_json::json!({"id": "x", "created_at": "2020-01-01T00:00:00Z"});
+        stamp_v1(&mut v, finding_kind::STATIC);
+        assert_eq!(v["created_at"], "2020-01-01T00:00:00Z");
+        assert_eq!(v["finding_kind"], "static");
+    }
+
+    #[test]
+    fn append_history_records_command_and_fields() {
+        let mut v = serde_json::json!({"id": "x"});
+        append_history(&mut v, "minimize", &["minimal_reproducer"]);
+        append_history(&mut v, "cartography", &["primitive"]);
+        let history = v["history"].as_array().unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0]["command"], "minimize");
+        assert_eq!(history[1]["fields"][0], "primitive");
+        assert!(chrono::DateTime::parse_from_rfc3339(history[0]["at"].as_str().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn run_dedupe_key_mirrors_the_fuzz_run_keys() {
+        use super::{run_dedupe_key, RunDedupeKey};
+        use serde_json::json;
+        let oracle = json!({
+            "rule_id": "BHF-405",
+            "oracle": {"name": "path-traversal", "api": "open"},
+            "cluster_key_full": "c0ffee",
+        });
+        assert_eq!(
+            run_dedupe_key(&oracle),
+            Some(RunDedupeKey::Oracle(
+                "BHF-405|path-traversal|open".to_owned()
+            ))
+        );
+        let fallback =
+            json!({"rule_id": "BHF-210", "cluster_fallback": true, "cluster_key_full": "x"});
+        assert_eq!(
+            run_dedupe_key(&fallback),
+            Some(RunDedupeKey::Cluster("rule:BHF-210".to_owned()))
+        );
+        let clustered = json!({"rule_id": "BHF-201", "cluster_fallback": false, "cluster_key_full": "deadbeef"});
+        assert_eq!(
+            run_dedupe_key(&clustered),
+            Some(RunDedupeKey::Cluster("deadbeef".to_owned()))
+        );
+        // An oracle block without an api falls back to the cluster key.
+        let partial_oracle =
+            json!({"rule_id": "BHF-405", "oracle": {"name": "n"}, "cluster_key_full": "beef"});
+        assert_eq!(
+            run_dedupe_key(&partial_oracle),
+            Some(RunDedupeKey::Cluster("beef".to_owned()))
+        );
+        // The run keys an oracle hit with an empty api exactly so.
+        let empty_api = json!({"rule_id": "BHF-405", "oracle": {"name": "n", "api": ""}});
+        assert_eq!(
+            run_dedupe_key(&empty_api),
+            Some(RunDedupeKey::Oracle("BHF-405|n|".to_owned()))
+        );
+        assert_eq!(run_dedupe_key(&json!({"cluster_key_full": ""})), None);
+        assert_eq!(
+            run_dedupe_key(&json!({"rule_id": "", "cluster_fallback": true})),
+            None
+        );
+        assert_eq!(run_dedupe_key(&json!({"signature": "abc"})), None);
+    }
+
+    #[test]
+    fn sanitizer_log_is_written_and_capped() {
+        use super::{write_sanitizer_log, SANITIZER_LOG_MAX};
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        write_sanitizer_log(dir, b"==1==ERROR: AddressSanitizer\n").unwrap();
+        assert_eq!(
+            fs::read(dir.join("sanitizer.log")).unwrap(),
+            b"==1==ERROR: AddressSanitizer\n"
+        );
+        let big = vec![b'a'; (SANITIZER_LOG_MAX + 10) as usize];
+        write_sanitizer_log(dir, &big).unwrap();
+        let written = fs::read_to_string(dir.join("sanitizer.log")).unwrap();
+        assert!(
+            written.ends_with("\n[truncated 10 bytes]\n"),
+            "{}",
+            &written[written.len() - 40..]
+        );
+        assert!(written.len() < big.len() + 40);
+    }
+
+    #[test]
+    fn emit_with_log_writes_sanitizer_log_next_to_finding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let emitter = FindingEmitter::new(root.clone());
+        let report = crate::sanitizer::SanitizerReport {
+            sanitizer: crate::sanitizer::Sanitizer::AddressSanitizer,
+            kind: "heap-buffer-overflow".to_owned(),
+            rule_id: "BHF-201",
+            stack: Vec::new(),
+            message: "heap-buffer-overflow".to_owned(),
+        };
+        let id = emitter
+            .emit_sanitizer_crash_with_log(b"in", &report, Some(b"full log"))
+            .unwrap();
+        let dir = crate::layout::finding_dir(&root, &id.0);
+        assert_eq!(fs::read(dir.join("sanitizer.log")).unwrap(), b"full log");
+        let raw: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join("finding.json")).unwrap()).unwrap();
+        assert_eq!(raw["paths"]["sanitizer_log"], "sanitizer.log");
+    }
+
+    #[test]
+    fn build_binary_identity_lands_in_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let emitter = FindingEmitter::new(root.clone())
+            .with_build_binary(serde_json::json!({"sha256": "ab", "build_id": "cd"}));
+        let report = crate::sanitizer::SanitizerReport {
+            sanitizer: crate::sanitizer::Sanitizer::AddressSanitizer,
+            kind: "heap-buffer-overflow".to_owned(),
+            rule_id: "BHF-201",
+            stack: Vec::new(),
+            message: "m".to_owned(),
+        };
+        let id = emitter.emit_sanitizer_crash(b"in", &report).unwrap();
+        let raw: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(crate::layout::finding_dir(&root, &id.0).join("finding.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(raw["build"]["binary"]["build_id"], "cd");
+    }
+
+    #[test]
+    fn touch_last_seen_updates_and_records_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("finding.json"),
+            r#"{"id":"F-1","created_at":"2020-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        super::touch_last_seen(tmp.path(), "replay").unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(tmp.path().join("finding.json")).unwrap())
+                .unwrap();
+        assert!(raw["last_seen"].as_str().unwrap() > "2020-01-01T00:00:00Z");
+        assert_eq!(raw["history"][0]["fields"][0], "last_seen");
+        assert_eq!(raw["created_at"], "2020-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn touch_last_seen_does_not_grow_history_across_replays() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("finding.json");
+        std::fs::write(&path, r#"{"id":"F-1"}"#).unwrap();
+        super::touch_last_seen(tmp.path(), "replay").unwrap();
+        super::touch_last_seen(tmp.path(), "replay").unwrap();
+        super::touch_last_seen(tmp.path(), "replay").unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        // Three replays leave one trailing last_seen entry, not three.
+        assert_eq!(
+            raw["history"].as_array().unwrap().len(),
+            1,
+            "repeated replays must not grow history: {}",
+            raw["history"]
+        );
+        assert_eq!(raw["history"][0]["command"], "replay");
+        assert!(raw["last_seen"].as_str().is_some());
+    }
+
+    #[test]
+    fn dedupe_keys_lists_the_run_key_and_the_signature() {
+        use super::dedupe_keys;
+        use serde_json::json;
+        assert_eq!(
+            dedupe_keys(&json!({"cluster_key_full": "deadbeef", "signature": "abc123"})),
+            ["deadbeef", "signature:abc123"]
+        );
+        assert_eq!(
+            dedupe_keys(&json!({"rule_id": "R", "oracle": {"name": "n", "api": "a"}})),
+            ["R|n|a"]
+        );
+        assert_eq!(
+            dedupe_keys(&json!({"signature": "abc123"})),
+            ["signature:abc123"]
+        );
+        assert!(dedupe_keys(&json!({"id": "F-0000-x", "signature": ""})).is_empty());
+        assert!(dedupe_keys(&json!("not an object")).is_empty());
     }
 }
