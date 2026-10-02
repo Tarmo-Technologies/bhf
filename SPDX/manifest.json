@@ -3659,6 +3659,30 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "docs/designs/2026-10-02-extension-protocol.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/designs/2026-10-02-external-project-profiles.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/designs/2026-10-02-private-target-integration-index.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/designs/2026-10-02-relational-policy-fuzzing.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/designs/2026-10-02-runtime-event-collector.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/designs/2026-10-02-stateful-protocol-sessions.md",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "docs/differential-fuzzing.md",
       "license": "Apache-2.0"
     },
