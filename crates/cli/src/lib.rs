@@ -70,6 +70,7 @@ mod pack;
 mod policy;
 mod probe_backend;
 mod readiness;
+mod runtime_oracles;
 mod replay;
 mod report;
 mod resource_limits;
@@ -286,6 +287,10 @@ struct BinaryArgs {
 }
 
 #[derive(Debug, Subcommand)]
+// `Fuzz` carries the feature-rich `BinaryFuzzArgs` (runner/target-args, runtime
+// oracles, postcondition hooks); boxing it is not an option because clap's derive
+// needs the variant to hold the `Args` type directly, not `Box<Args>`.
+#[allow(clippy::large_enum_variant)]
 enum BinaryCommand {
     /// Inventory binaries and firmware, extract archives, match CVE components for SBOM/SCA
     Scan(binary_scan::BinaryScanArgs),

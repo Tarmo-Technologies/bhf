@@ -34,6 +34,31 @@
   (a separate instrumented build, since libFuzzer cannot consume bhf's trace-pc-guard
   staticlib); both use a generated `bhf_libfuzzer.c` shim. `BHF_CRASH_ON_FINDING=1` makes an
   Ada finding abort the process (SIGABRT) so a crash-keying external engine detects it.
+- `bhf binary fuzz` can express a manually authored binary-only harness that needs
+  an emulator/loader and fixed arguments: `--runner <PROG>` (e.g. `wine`,
+  `qemu-x86_64`) with repeatable `--runner-arg`, and repeatable `--target-arg`
+  (a `@@` token marks the input-file position, else file-mode input is appended).
+  The runner, target args, and full argv are recorded in the finding so
+  `bhf replay`/`bhf minimize` reproduce the launch. `--runner` is builtin-engine
+  only; `--target-arg` applies to the afl-qemu engine too (#47).
+- `--runtime-oracles auto|on|off` on `bhf fuzz` and `bhf binary fuzz` loads the
+  runtrace sink oracles via the `LD_PRELOAD` shim, so a clean-exit semantic
+  violation (fuzz-controlled command execution, path escape, dlopen, network
+  egress, SQL) becomes a finding even when the target exits zero — not just a
+  crash. `bhf fuzz` reuses the builtin loop's existing oracle + cross-execution
+  taint machinery (previously reachable only through `bhf auto`); `bhf binary
+  fuzz` publishes each input to the shim through an inherited fd so a black-box
+  target gets byte-origin taint, emits `binary_semantic` findings, and replays
+  them by re-confirming the oracle. Off by default (opt-in); Linux-only (#59).
+- `bhf binary fuzz` user-defined postcondition oracles with per-case fixture
+  hooks: `--setup-command` / `--oracle-command` / `--reset-command`. Each case
+  runs in a fresh `BHF_CASE_DIR` (passed to the hooks and the target); the oracle
+  gets the target status + stderr and signals clean (exit 0) / finding (exit 1,
+  first stdout line = signature) / infrastructure error (any other exit). A
+  violation becomes a `binary_postcondition` finding (BHF-502) even on a clean
+  target exit, and `bhf replay`/`minimize` re-evaluate the oracle rather than a
+  crash signature — expressing application-specific security policy the built-in
+  sink oracles cannot (#55).
 
 ### Changed
 - With no `--findings`/`--out`, `bhf report` rebuilds `bhf_work/results/`. `--junit`/

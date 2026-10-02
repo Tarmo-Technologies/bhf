@@ -245,6 +245,24 @@ command, input mode, testcase, environment, binary SHA-256, stderr excerpt, and
 exit/timeout signature. Existing `bhf replay`, `bhf minimize`, and
 `bhf ci --fail-on ...` understand these binary findings.
 
+A manually authored binary-only harness can name a runner and fixed target
+arguments: `--runner <PROG>` launches the target under an emulator/loader (e.g.
+`wine`, `qemu-x86_64`) with repeatable `--runner-arg`, and repeatable
+`--target-arg` passes fixed arguments to the target before the fuzz input. A
+literal `@@` among the target args marks where the input-file path goes (file
+mode); without one, file-mode input is appended last. So a Wine/PE harness that
+loads a stock vendor DLL is expressed as:
+
+```sh
+bhf binary fuzz ./stock_dll_harness.exe --runner wine \
+  --target-arg --mode --target-arg fuzz --input-mode file
+```
+
+The runner, runner args, target args, and the full `@@`-marked argv are recorded
+in the finding, so `bhf replay` and `bhf minimize` reproduce the exact launch.
+`--runner` is builtin-engine only (afl-qemu provides its own `-Q` runner);
+`--target-arg` applies to both engines.
+
 `--engine builtin|afl-qemu|auto` selects the execution engine: `builtin`
 replays the seeds and detects crashes (no mutation/coverage); `afl-qemu` drives
 coverage-guided mutation on a binary-only / foreign-arch target via AFL++'s QEMU
@@ -255,6 +273,36 @@ campaign and the crash-replay oracle share one policy, and `--mem-mb <MiB|none>`
 sets the child memory limit (`afl-fuzz -m`); it defaults to `none` because QEMU
 mode maps a large virtual address space and a tight cap aborts the campaign.
 Both effective limits are recorded in the run-provenance JSON.
+
+`--runtime-oracles auto|on|off` (on `bhf fuzz` and `bhf binary fuzz`) loads the
+runtrace sink oracles via the `LD_PRELOAD` shim so a **clean-exit** semantic
+violation — a fuzz-controlled command execution, path escape, `dlopen`, network
+egress, or SQL query — is reported even when the target exits zero, not only on a
+crash. `off` is the default (crash-only, prior behaviour); `auto` enables the
+oracles when the shim and platform (Linux) support it and skips otherwise; `on`
+requires them and errors if unavailable. `bhf binary fuzz` publishes each input
+to the shim through an inherited file descriptor so a black-box target still gets
+byte-origin taint; its oracle findings are written as `kind: binary_semantic`
+(with the oracle rule, API, taint evidence, and shim hash) and replay by
+re-confirming the oracle rather than a crash signature. (Interpreted-language
+runtime oracles and QEMU/Wine are out of scope for this flag — it is the native
+Linux layer `bhf auto` already uses.)
+
+`bhf binary fuzz` also accepts **user-defined postcondition oracles** with
+per-case fixture hooks: `--setup-command` runs before each testcase (prepare a
+fresh fixture), `--oracle-command` runs after it to check a security invariant,
+and `--reset-command` restores state afterwards. Each case gets a fresh
+`BHF_CASE_DIR`; the hooks (and the target) receive `BHF_CASE_DIR`/`BHF_TESTCASE`
+in the environment, and the oracle additionally gets `BHF_TARGET_EXIT`,
+`BHF_TARGET_SIGNAL`, `BHF_TARGET_TIMEOUT`, and `BHF_TARGET_STDERR`, plus the
+testcase path as `$1`. The oracle's exit code is the contract: `0` = clean,
+`1` = finding (its first stdout line is the stable signature/classification), any
+other code = infrastructure error (not a target defect). A violation is written
+as a `kind: binary_postcondition` finding (BHF-502) even when the target exited
+zero, and `bhf replay`/`minimize` re-run setup → target → oracle to re-confirm
+the signature. This expresses application-specific policy — "this input must not
+make the target write outside the allowed root / launch an unlisted process /
+perform an unauthorized operation" — that the built-in sink oracles cannot.
 
 `bhf differential --harness-a <A> --harness-b <B> --inputs <DIR>` replays
 each input through two implementations and emits BHF-301 output-divergence

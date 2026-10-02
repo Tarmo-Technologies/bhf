@@ -370,6 +370,16 @@ pub struct FuzzArgs {
     #[arg(skip)]
     pub extra_env: Vec<(String, String)>,
 
+    /// Load the runtime sink oracles via the LD_PRELOAD runtrace shim (#59), so a
+    /// clean-exit semantic violation — a fuzz-controlled command execution, path
+    /// escape, dlopen, network egress, or SQL query — becomes a finding even when
+    /// the target exits zero. `off` (default) is crash-only, preserving existing
+    /// behaviour; `auto` enables them when the shim and platform (Linux) support
+    /// it and skips otherwise; `on` requires them (errors if unavailable). A no-op
+    /// when `bhf auto` already armed the shim through `extra_env`.
+    #[arg(long = "runtime-oracles", value_enum, default_value_t = crate::runtime_oracles::RuntimeOracleMode::Off)]
+    pub runtime_oracles: crate::runtime_oracles::RuntimeOracleMode,
+
     /// Path to a previously captured runtrace audit log produced
     /// with `BHF_CMPLOG=1`. When set, recovered cmplog operands
     /// seed both the mutator dictionary (positional-info-free token
@@ -1217,6 +1227,7 @@ pub(crate) fn run_one_target_programmatic_with_runner(
         sandbox_tool: None,
         sandbox_strict: false,
         extra_env: extra_env.to_vec(),
+        runtime_oracles: crate::runtime_oracles::RuntimeOracleMode::Off,
         cmplog_log,
         grammar_file: None,
         structured_inputs: StructuredInputMode::Auto,
@@ -1288,6 +1299,7 @@ pub(crate) fn run_afl_plus_plus_programmatic(
         sandbox_tool: None,
         sandbox_strict: false,
         extra_env: extra_env.to_vec(),
+        runtime_oracles: crate::runtime_oracles::RuntimeOracleMode::Off,
         cmplog_log: None,
         grammar_file: None,
         structured_inputs: StructuredInputMode::Auto,
@@ -1602,6 +1614,23 @@ fn prepare(args: FuzzArgs) -> Result<PreparedFuzzRun, String> {
     let mut extra_env = args.extra_env;
     extra_env.extend(sanitizer_env.clone());
     apply_fuzz_child_env_overrides(&mut extra_env);
+    // #59: arm the runtime sink oracles on the manual path. `bhf auto` already
+    // threads LD_PRELOAD + BHF_RUNTRACE_LOG through `extra_env`, so this only
+    // fires for a direct `bhf fuzz` invocation (guarded: skip when already armed).
+    // The builtin loop already reads BHF_RUNTRACE_LOG, evaluates the oracle
+    // registry + cross-execution taint tracker, and emits oracle findings — we
+    // only supply the env that was missing on this path.
+    if !extra_env.iter().any(|(k, _)| k == "BHF_RUNTRACE_LOG") {
+        let mode_label = args.mode.to_string().to_ascii_lowercase();
+        if let Some(oracles) =
+            crate::runtime_oracles::RuntimeOracles::resolve(args.runtime_oracles, &mode_label)
+                .map_err(|e| e.to_string())?
+        {
+            let oracle_log = work_dir.join("runtrace.jsonl");
+            let _ = std::fs::write(&oracle_log, b"");
+            extra_env.extend(oracles.env_pairs(&oracle_log));
+        }
+    }
     // Only the standalone bhf-framed C/C++ driver carries the runtime that
     // writes these shared-memory channels; other engines/protocols ignore them.
     let builtin_framed = args.engine == FuzzEngine::Builtin
@@ -8391,6 +8420,7 @@ mod auto_path_tests {
             sandbox_tool: None,
             sandbox_strict: false,
             extra_env: Vec::new(),
+            runtime_oracles: crate::runtime_oracles::RuntimeOracleMode::Off,
             cmplog_log: None,
             grammar_file: None,
             structured_inputs,
