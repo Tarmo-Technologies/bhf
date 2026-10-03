@@ -496,16 +496,46 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
             None => collector_run::inactive_run_provenance(&args.collector),
             Some(resolved) => {
                 let representative = seeds.first().cloned().unwrap_or_default();
-                let params = collector_run::CollectorRunParams {
-                    testcase: "binary-fuzz".to_owned(),
-                    worker: 0,
-                    root: args.work_dir.display().to_string(),
-                    root_pid: 0,
-                    root_image: args.binary.display().to_string(),
-                    input: &representative,
-                    tmp_dir: tmp_dir.join("collector"),
+                let outcome = if let Some(shim) = resolved.runtrace_shim() {
+                    // Linux built-in provider: a dedicated observation pass runs the
+                    // target once under the LD_PRELOAD runtrace shim and re-expresses
+                    // its process/file/library effects as `bhf.collector-event.v1`
+                    // via the runtrace→collector adapter. This pass is separate from
+                    // the crash-detection loop, so `--runtime-oracles` behaviour is
+                    // unchanged; it is an additional, collector-shaped view.
+                    let col_log = tmp_dir.join("collector_runtrace.jsonl");
+                    let run = run_binary_once(
+                        &invocation,
+                        args.input_mode,
+                        &representative,
+                        &env,
+                        Duration::from_millis(args.timeout_ms),
+                        &tmp_dir,
+                        Some((shim, col_log.as_path())),
+                    )?;
+                    let adapter_ctx = crate::auto::runtrace::CollectorAdapterCtx {
+                        testcase: "binary-fuzz".to_owned(),
+                        worker: 0,
+                        root_pid: 1,
+                    };
+                    let jsonl = crate::auto::runtrace::collector_jsonl_from_events(
+                        &run.oracle_events,
+                        &adapter_ctx,
+                        &args.binary.display().to_string(),
+                    );
+                    resolved.evaluate_jsonl(&jsonl, &args.work_dir.display().to_string())
+                } else {
+                    let params = collector_run::CollectorRunParams {
+                        testcase: "binary-fuzz".to_owned(),
+                        worker: 0,
+                        root: args.work_dir.display().to_string(),
+                        root_pid: 0,
+                        root_image: args.binary.display().to_string(),
+                        input: &representative,
+                        tmp_dir: tmp_dir.join("collector"),
+                    };
+                    resolved.run_once(&params)?
                 };
-                let outcome = resolved.run_once(&params)?;
                 let target = collector_target(&args)?;
                 for finding in &outcome.findings {
                     let id = collector_run::next_collector_finding_id(&findings_dir)?;
@@ -2585,6 +2615,178 @@ mod afl_qemu_tests {
             0,
             "semantic finding must replay to a match"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// End-to-end proof of the Linux `--collector auto` built-in provider (#60): a
+    /// clean-exit C target whose fuzz-controlled input flows into `system()`, a
+    /// destructive filesystem op (`remove`) and `dlopen()` must, with
+    /// `--collector auto` (and `--runtime-oracles off`), produce three
+    /// collector-sourced `binary_semantic` findings — process-exec (BHF-431),
+    /// path-control (BHF-440, a fuzz-controlled path reaching a destructive FS API)
+    /// and controlled-library-load (BHF-435) — through the runtrace→collector
+    /// adapter, with no crash. A fixed-constant variant must produce none of them.
+    /// This mirrors the mock-collector contract test on the real shim.
+    ///
+    /// Note: the file-open path oracle (BHF-405) taints via the shim's
+    /// whole-value `taint_span`, which only consults a harness-published
+    /// `LIVE_INPUT`; a black-box `bhf binary fuzz` target publishes its input
+    /// through the shared memfd instead, which backs the `input_derived_run`
+    /// (embedded-run) sinks — command, library, network, SQL and destructive-FS.
+    /// So the taint-confirmed path-control class a black-box binary demonstrates is
+    /// BHF-440, not BHF-405 (which the mock exercises directly).
+    #[cfg(unix)]
+    #[test]
+    fn binary_fuzz_collector_auto_flags_three_clean_exit_classes_on_linux() {
+        use std::os::unix::fs::PermissionsExt;
+        if !runtime_oracle_e2e_ready() {
+            eprintln!("skipping collector-auto e2e: shim/cc/Linux unavailable");
+            return;
+        }
+
+        // Collector rule ids -> COL findings for a given target + seed.
+        fn collector_rule_ids(bin: &Path, seed: &str, work: &Path) -> Vec<String> {
+            let args = BinaryFuzzArgs {
+                binary: bin.to_path_buf(),
+                work_dir: work.to_path_buf(),
+                input_mode: BinaryInputMode::File,
+                iterations: 1,
+                seed_inputs: vec![seed.to_owned()],
+                seed_files: Vec::new(),
+                timeout_ms: 10_000,
+                mem_mb: "none".to_owned(),
+                env: Vec::new(),
+                runner: None,
+                runner_args: Vec::new(),
+                target_args: Vec::new(),
+                sandbox: SandboxModeArg::Auto,
+                engine: BinaryFuzzEngine::Builtin,
+                time: None,
+                // Runtime oracles OFF: the collector is an independent view.
+                runtime_oracles: crate::runtime_oracles::RuntimeOracleMode::Off,
+                setup_command: None,
+                oracle_command: None,
+                reset_command: None,
+                collector: crate::collector_run::CollectorSpec::Auto,
+                collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
+            };
+            let summary = run_inner(args).expect("binary fuzz run");
+            assert_eq!(
+                summary.pointer("/collector/active"),
+                Some(&json!(true)),
+                "the Linux built-in collector must be active: {summary}"
+            );
+            assert_eq!(
+                summary.pointer("/collector/mode"),
+                Some(&json!("runtrace")),
+                "auto must resolve to the runtrace backend on Linux: {summary}"
+            );
+            // #59 oracle findings must stay off (runtime-oracles off).
+            assert_eq!(
+                summary.pointer("/runtime_oracles/active"),
+                Some(&json!(false)),
+                "runtime oracles must be inactive: {summary}"
+            );
+            let findings_dir = corpus::layout::findings_dir(work);
+            let ids = summary["findings"].as_array().expect("findings array");
+            let mut rules = Vec::new();
+            for id in ids {
+                let id = id.as_str().unwrap();
+                let fdir = findings_dir.join(id);
+                let f: Value =
+                    serde_json::from_slice(&fs::read(fdir.join("finding.json")).unwrap()).unwrap();
+                // Only collector-sourced semantic findings carry the `collector`
+                // provenance block.
+                if f.get("kind").and_then(Value::as_str) == Some("binary_semantic")
+                    && f.get("collector").is_some()
+                {
+                    if let Some(rule) = f.get("rule_id").and_then(Value::as_str) {
+                        rules.push(rule.to_owned());
+                    }
+                }
+            }
+            rules
+        }
+
+        let dir = std::env::temp_dir().join(format!("bhf-binfuzz-collector-{}", nonce()));
+        fs::create_dir_all(&dir).unwrap();
+
+        // Positive target: fuzz-controlled input reaches exec / open / dlopen.
+        let src = dir.join("sinks.c");
+        fs::write(
+            &src,
+            b"#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\
+              #include <fcntl.h>\n#include <unistd.h>\n#include <dlfcn.h>\n\
+              int main(int argc, char **argv){\n\
+              \x20 char buf[256]; buf[0]=0;\n\
+              \x20 if(argc>1){ FILE*f=fopen(argv[1],\"rb\"); if(f){ size_t n=fread(buf,1,255,f); buf[n]=0; fclose(f);} }\n\
+              \x20 size_t L=strlen(buf); while(L>0 && (buf[L-1]=='\\n'||buf[L-1]=='\\r')) buf[--L]=0;\n\
+              \x20 char cmd[512]; snprintf(cmd,sizeof cmd,\"/bin/echo %s\", buf); system(cmd);\n\
+              \x20 char p[512]; snprintf(p,sizeof p,\"/tmp/bhf-col-%s\", buf); remove(p);\n\
+              \x20 char lb[512]; snprintf(lb,sizeof lb,\"/tmp/%s.so\", buf); void*h=dlopen(lb,RTLD_NOW); if(h) dlclose(h);\n\
+              \x20 return 0;\n }\n",
+        )
+        .unwrap();
+        let bin = dir.join("sinks");
+        let built = Command::new("cc")
+            .arg("-O0")
+            .arg(&src)
+            .arg("-o")
+            .arg(&bin)
+            .arg("-ldl")
+            .output()
+            .expect("cc");
+        assert!(
+            built.status.success(),
+            "cc failed: {}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        let _ = fs::set_permissions(&bin, fs::Permissions::from_mode(0o755));
+
+        let work = dir.join("work");
+        fs::create_dir_all(&work).unwrap();
+        let rules = collector_rule_ids(&bin, "AAAACCCCDDDD", &work);
+        for want in ["BHF-431", "BHF-440", "BHF-435"] {
+            assert!(
+                rules.iter().any(|r| r == want),
+                "expected a collector {want} finding; got {rules:?}"
+            );
+        }
+
+        // Negative control: the SAME sink shapes with fixed constants (no input in
+        // the sink arguments) must not become taint-confirmed collector findings.
+        let nsrc = dir.join("fixed.c");
+        fs::write(
+            &nsrc,
+            b"#include <stdio.h>\n#include <stdlib.h>\n#include <dlfcn.h>\n\
+              int main(int argc, char **argv){ (void)argc; (void)argv;\n\
+              \x20 system(\"/bin/echo constant\");\n\
+              \x20 remove(\"/tmp/bhf-col-fixed-constant\");\n\
+              \x20 void*h=dlopen(\"libm.so.6\",RTLD_NOW); if(h) dlclose(h);\n\
+              \x20 return 0; }\n",
+        )
+        .unwrap();
+        let nbin = dir.join("fixed");
+        let built = Command::new("cc")
+            .arg("-O0")
+            .arg(&nsrc)
+            .arg("-o")
+            .arg(&nbin)
+            .arg("-ldl")
+            .output()
+            .expect("cc");
+        assert!(built.status.success(), "cc failed (fixed)");
+        let _ = fs::set_permissions(&nbin, fs::Permissions::from_mode(0o755));
+        let nwork = dir.join("nwork");
+        fs::create_dir_all(&nwork).unwrap();
+        let neg = collector_rule_ids(&nbin, "AAAACCCCDDDD", &nwork);
+        for taint_rule in ["BHF-431", "BHF-440", "BHF-435"] {
+            assert!(
+                !neg.iter().any(|r| r == taint_rule),
+                "fixed constants must not produce a taint-confirmed {taint_rule}; got {neg:?}"
+            );
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }

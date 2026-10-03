@@ -19,8 +19,10 @@
 //! resolved paths, `LoadLibrary*`/image-load, and the descendant process tree.
 
 pub mod win_core;
+pub mod win_etw_decode;
 
 #[cfg(windows)]
 pub mod etw;
 
 pub use win_core::{WinCoreBuilder, WinFileOp, WinRawRecord};
+pub use win_etw_decode::{EtwDecoder, EtwGuid, EtwProvider, PointerSize, RawEtwEvent};

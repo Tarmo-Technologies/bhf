@@ -995,6 +995,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/bhf_collector_win/src/win_etw_decode.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/bhf_collector_win/tests/live_windows.rs",
       "license": "Apache-2.0"
     },

@@ -93,9 +93,17 @@
   registry, so a controlled process execution, a path escaping the allowed root, or a
   controlled library load becomes a `binary_semantic` finding with no crash. The
   contract is a versioned JSONL wire format (`bhf.collector-event.v1`, JSON Schema in
-  `schemas/`) that an out-of-repo provider can target: `auto` selects the native
-  Windows ETW provider (`bhf-collector-win`), a PATH runs an external sidecar, and
-  `none` (default) leaves behaviour unchanged. Findings store their raw collector
+  `schemas/`) that an out-of-repo provider can target: `--collector auto` selects the
+  built-in provider for the platform — on Windows the native `bhf-collector-win` ETW
+  provider, which starts the NT Kernel Logger real-time session and decodes live
+  `EVENT_RECORD`s for the process / file-I/O / image-load kernel providers (complete
+  pointer-size- and version-aware MOF decode: `CreateProcess*`/descendants,
+  file create/open/write/rename/delete with resolved paths, `LoadLibrary*`/image-load);
+  on Linux the in-process `LD_PRELOAD` runtrace adapter, a collector-shaped view over
+  the same shim events that leaves `--runtime-oracles` unchanged. A PATH runs an
+  external sidecar, and `none` (default) leaves behaviour unchanged. The Windows decode
+  logic is unit-tested on every platform against synthetic ETW-shaped records; the live
+  ETW run is validated on the Windows CI runner (`BHF_WIN_LIVE=1`). Findings store their raw collector
   session as evidence so `bhf replay` reproduces the semantic finding deterministically
   and a reviewer can audit the attribution; collection loss, unsupported APIs, or a
   permission denial are recorded as fidelity limitations and refuse a false "clean"

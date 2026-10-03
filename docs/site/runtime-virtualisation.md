@@ -50,6 +50,24 @@ Each event is appended as one JSONL line to the path in
 `needed_for_build` Layer C and, during built-in fuzzing, to evaluate
 executable oracles against only the events appended by the current input.
 
+### Collector-shaped view (`--collector auto` on Linux, #60)
+
+The same shim events also back the platform-neutral runtime-event collector on
+Linux. `--collector auto` resolves to a **runtrace → collector adapter** that
+re-expresses these effect events as the versioned `bhf.collector-event.v1`
+contract (`crate::auto::runtrace::to_collector_event` /
+`collector_jsonl_from_events`): `exec`/`system`/`popen` → `process_create`,
+`lib_load`/`dlopen` → `module_load`, `open`/`openat`/`fs_destroy` → the file
+families, `net_egress`/`connect` → `network`, carrying the byte-origin
+`taint_offset` through so a fuzz-controlled sink maps to the `Tainted*` oracle
+variant. On `bhf binary fuzz` the collector runs the target once under the shim
+as a **dedicated observation pass** (separate from the crash-detection loop, so
+`--runtime-oracles` behaviour is unchanged); on `bhf fuzz` it re-reads the loop's
+own `runtrace.jsonl`. The result feeds the same oracle registry and stored-
+evidence replay as the native Windows ETW provider — it is an additional view,
+not a second source. `--collector auto` stays inactive only when the runtrace
+shim is unavailable (never fabricating a clean run).
+
 ## Allocation Discipline
 
 Every hook formats its event into a stack buffer and writes through `libc::write`.

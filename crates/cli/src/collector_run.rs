@@ -15,9 +15,14 @@
 //!
 //! Providers are decoupled from this host by the JSONL wire format: a native
 //! Windows ETW provider, an out-of-tree sidecar, or the dependency-free mock all
-//! satisfy the same contract. On a platform with no built-in provider, `auto`
-//! stays inactive rather than fabricating a clean observation; an external
-//! provider is always available through `--collector <PATH>`.
+//! satisfy the same contract. `--collector auto` resolves to the native
+//! `bhf-collector-win` ETW sidecar on Windows and to the in-process LD_PRELOAD
+//! runtrace adapter on Linux (the `runtrace → collector` seam in
+//! `crate::auto::runtrace`), so a clean-exit semantic violation becomes a
+//! `binary_semantic` finding on either platform. Where no built-in provider
+//! exists (no shim on a non-Windows host), `auto` stays inactive rather than
+//! fabricating a clean observation; an external provider is always available
+//! through `--collector <PATH>`.
 
 use anyhow::{anyhow, Context};
 use finding_rules::oracle_registry::ORACLE_REGISTRY;
@@ -56,16 +61,34 @@ pub fn parse_collector_spec(value: &str) -> Result<CollectorSpec, String> {
     }
 }
 
+/// How a resolved collector actually observes a testcase.
+#[derive(Debug, Clone)]
+enum CollectorSource {
+    /// An external sidecar executable spawned per observation (Windows ETW
+    /// `bhf-collector-win`, or any `--collector <PATH>` provider).
+    Sidecar(PathBuf),
+    /// The Linux built-in provider: the LD_PRELOAD runtrace shim. The host runs
+    /// the target under this shim and feeds the captured events to the collector
+    /// through the `runtrace → collector` adapter, so `--collector auto` works on
+    /// Linux without a native sidecar. Carries the resolved shim so the host can
+    /// arm a target execution with it.
+    Runtrace(crate::runtime_oracles::RuntimeOracles),
+}
+
 /// A resolved, runnable collector provider.
 #[derive(Debug, Clone)]
 pub struct ResolvedCollector {
-    sidecar: PathBuf,
+    source: CollectorSource,
     window_ms: u64,
     backend: BackendInfo,
 }
 
 /// Locate the native Windows collector sidecar next to the running `bhf`
-/// executable, honoring the `BHF_COLLECTOR_WIN` override first.
+/// executable, honoring the `BHF_COLLECTOR_WIN` override first. Only consulted on
+/// Windows (see [`resolve_auto`]): on a non-Windows host the built-in provider is
+/// the runtrace adapter, and a Linux-built `bhf-collector-win` cannot observe
+/// anyway (it exits non-zero), so `auto` never selects it there — an explicit
+/// `--collector <PATH>` is the escape hatch for a custom non-Windows sidecar.
 fn locate_windows_sidecar() -> Option<PathBuf> {
     if let Some(explicit) = std::env::var_os("BHF_COLLECTOR_WIN") {
         let p = PathBuf::from(explicit);
@@ -87,30 +110,16 @@ fn locate_windows_sidecar() -> Option<PathBuf> {
 /// Resolve `spec` into a runnable provider, or `None` when the collector is off
 /// or no built-in provider exists for this platform.
 ///
-/// `auto` on Windows resolves to the native `bhf-collector-win` ETW sidecar; on
-/// any other platform it stays inactive (no fabricated clean run) — a Linux or
-/// cross target gets runtime coverage through the `--runtime-oracles` LD_PRELOAD
-/// path (#59) or an explicit `--collector <PATH>` sidecar. An explicit sidecar
-/// path hard-errors if it is not an executable file.
+/// `auto` resolves to the native `bhf-collector-win` ETW sidecar on Windows and
+/// to the in-process LD_PRELOAD runtrace adapter on Linux (the built-in provider
+/// for each platform). On a non-Windows host where the runtrace shim is
+/// unavailable it stays inactive (no fabricated clean run); an explicit
+/// `--collector <PATH>` sidecar is always available and hard-errors if the path
+/// is not an executable file.
 pub fn resolve(spec: &CollectorSpec, window_ms: u64) -> anyhow::Result<Option<ResolvedCollector>> {
     match spec {
         CollectorSpec::Off => Ok(None),
-        CollectorSpec::Auto => match locate_windows_sidecar() {
-            Some(path) => Ok(Some(resolved_for(path, window_ms)?)),
-            None => {
-                if cfg!(windows) {
-                    Err(anyhow!(
-                        "--collector auto: the native Windows collector (bhf-collector-win) \
-                         was not found next to bhf; build it (`cargo build -p bhf_collector_win`) \
-                         or set BHF_COLLECTOR_WIN to its path"
-                    ))
-                } else {
-                    // No built-in native provider on this platform. Stay inactive
-                    // rather than pretend to have observed a clean run.
-                    Ok(None)
-                }
-            }
-        },
+        CollectorSpec::Auto => resolve_auto(window_ms),
         CollectorSpec::Sidecar(path) => {
             if !path.is_file() {
                 return Err(anyhow!(
@@ -119,6 +128,34 @@ pub fn resolve(spec: &CollectorSpec, window_ms: u64) -> anyhow::Result<Option<Re
                 ));
             }
             Ok(Some(resolved_for(path.clone(), window_ms)?))
+        }
+    }
+}
+
+/// Resolve `--collector auto` to the built-in provider for this platform: the
+/// native Windows ETW sidecar on Windows, the LD_PRELOAD runtrace adapter on a
+/// non-Windows host (inactive when its shim is unavailable). The `cfg!(windows)`
+/// branch keeps both paths compiled on every platform (so neither helper is
+/// platform-dead) while selecting the right one at runtime.
+fn resolve_auto(window_ms: u64) -> anyhow::Result<Option<ResolvedCollector>> {
+    if cfg!(windows) {
+        match locate_windows_sidecar() {
+            Some(path) => Ok(Some(resolved_for(path, window_ms)?)),
+            None => Err(anyhow!(
+                "--collector auto: the native Windows collector (bhf-collector-win) \
+                 was not found next to bhf; build it (`cargo build -p bhf_collector_win`) \
+                 or set BHF_COLLECTOR_WIN to its path"
+            )),
+        }
+    } else {
+        match crate::runtime_oracles::RuntimeOracles::resolve(
+            crate::runtime_oracles::RuntimeOracleMode::Auto,
+            "reporting",
+        )? {
+            Some(shim) => Ok(Some(resolved_runtrace(shim, window_ms))),
+            // No runtrace shim on this host: stay inactive rather than fabricate a
+            // clean run.
+            None => Ok(None),
         }
     }
 }
@@ -133,10 +170,28 @@ fn resolved_for(sidecar: PathBuf, window_ms: u64) -> anyhow::Result<ResolvedColl
         .to_owned();
     let backend = BackendInfo::new(name, "sidecar", format!("{:x}", Sha256::digest(&bytes)));
     Ok(ResolvedCollector {
-        sidecar,
+        source: CollectorSource::Sidecar(sidecar),
         window_ms,
         backend,
     })
+}
+
+/// Build the Linux built-in (runtrace-backed) collector. The backend hash is the
+/// shim's own SHA-256, so a collector finding audits back to the exact shim.
+fn resolved_runtrace(
+    shim: crate::runtime_oracles::RuntimeOracles,
+    window_ms: u64,
+) -> ResolvedCollector {
+    let backend = BackendInfo::new(
+        "runtrace",
+        env!("CARGO_PKG_VERSION"),
+        shim.shim_sha256().to_owned(),
+    );
+    ResolvedCollector {
+        source: CollectorSource::Runtrace(shim),
+        window_ms,
+        backend,
+    }
 }
 
 /// What a lane hands the collector for one observation.
@@ -174,8 +229,44 @@ impl ResolvedCollector {
         &self.backend
     }
 
+    /// The run-manifest `mode` label for this provider's source.
+    fn source_label(&self) -> &'static str {
+        match &self.source {
+            CollectorSource::Sidecar(_) => "sidecar",
+            CollectorSource::Runtrace(_) => "runtrace",
+        }
+    }
+
+    /// The resolved runtrace shim when this is the Linux built-in provider, else
+    /// `None` (a sidecar provider). The host uses it to arm a target execution so
+    /// the collector can observe the run's effects through the shim.
+    pub fn runtrace_shim(&self) -> Option<&crate::runtime_oracles::RuntimeOracles> {
+        match &self.source {
+            CollectorSource::Runtrace(shim) => Some(shim),
+            CollectorSource::Sidecar(_) => None,
+        }
+    }
+
+    /// Evaluate a raw `bhf.collector-event.v1` JSONL stream (for example the one
+    /// the `runtrace → collector` adapter produced from a run's shim events) and
+    /// return the deduplicated findings plus run provenance — the same evaluation
+    /// the sidecar path performs on the sink it reads.
+    pub fn evaluate_jsonl(&self, jsonl: &str, root: &str) -> CollectorOutcome {
+        let set = CollectorSessionSet::from_jsonl(jsonl);
+        self.evaluate(&set, root)
+    }
+
     /// Run the sidecar for one testcase and return the raw JSONL sink it wrote.
     fn observe(&self, params: &CollectorRunParams<'_>) -> anyhow::Result<String> {
+        let sidecar = match &self.source {
+            CollectorSource::Sidecar(path) => path,
+            CollectorSource::Runtrace(_) => {
+                return Err(anyhow!(
+                    "the runtrace-backed collector is driven by the host (it observes the \
+                     target under the LD_PRELOAD shim), not spawned as a sidecar"
+                ));
+            }
+        };
         std::fs::create_dir_all(&params.tmp_dir)
             .with_context(|| format!("create {}", params.tmp_dir.display()))?;
         let sink = params.tmp_dir.join("collector.jsonl");
@@ -186,7 +277,7 @@ impl ResolvedCollector {
         // prior clean run.
         let _ = std::fs::remove_file(&sink);
 
-        let status = Command::new(&self.sidecar)
+        let status = Command::new(sidecar)
             .env("BHF_COLLECTOR_TESTCASE", &params.testcase)
             .env("BHF_COLLECTOR_WORKER", params.worker.to_string())
             .env("BHF_COLLECTOR_ROOT", &params.root)
@@ -196,12 +287,12 @@ impl ResolvedCollector {
             .env("BHF_COLLECTOR_INPUT", &input_path)
             .env("BHF_COLLECTOR_LOG", &sink)
             .status()
-            .with_context(|| format!("spawn collector sidecar {}", self.sidecar.display()))?;
+            .with_context(|| format!("spawn collector sidecar {}", sidecar.display()))?;
         if !status.success() {
             return Err(anyhow!(
                 "collector sidecar {} exited with {} (it could not observe; refusing to treat \
                  this as a clean run)",
-                self.sidecar.display(),
+                sidecar.display(),
                 status
                     .code()
                     .map(|c| c.to_string())
@@ -270,7 +361,7 @@ impl ResolvedCollector {
         }
 
         let run_provenance = json!({
-            "mode": "sidecar",
+            "mode": self.source_label(),
             "active": true,
             "backend": {
                 "name": self.backend.name,
@@ -587,7 +678,7 @@ mod tests {
 
     fn mock_resolved(window_ms: u64) -> ResolvedCollector {
         ResolvedCollector {
-            sidecar: PathBuf::from("mock"),
+            source: CollectorSource::Sidecar(PathBuf::from("mock")),
             window_ms,
             backend: BackendInfo::new("mock", "test", "deadbeef"),
         }

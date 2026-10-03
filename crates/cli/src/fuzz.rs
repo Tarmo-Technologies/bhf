@@ -1236,16 +1236,41 @@ fn run_collector_for_fuzz(
     let findings_dir = corpus::layout::findings_dir(work_dir);
     std::fs::create_dir_all(&findings_dir)
         .with_context(|| format!("create {}", findings_dir.display()))?;
-    let params = crate::collector_run::CollectorRunParams {
-        testcase: "fuzz".to_owned(),
-        worker: 0,
-        root: work_dir.display().to_string(),
-        root_pid: 0,
-        root_image: harness_id.to_owned(),
-        input: &[],
-        tmp_dir: work_dir.join("collector_tmp"),
+    let outcome = if resolved.runtrace_shim().is_some() {
+        // Linux built-in provider: re-express the LD_PRELOAD shim events the builtin
+        // fuzz loop already captured (`work_dir/runtrace.jsonl`) as collector events.
+        // The loop writes that log when the runtrace shim is armed (for example with
+        // `--runtime-oracles`), so `--collector auto` layers a collector-shaped view
+        // over the SAME shim events without changing the runtime-oracle behaviour or
+        // re-running the harness.
+        let log = work_dir.join("runtrace.jsonl");
+        let events = if log.is_file() {
+            let mut events = crate::auto::runtrace::parse_log(&log).unwrap_or_default();
+            crate::auto::runtrace::dedupe_in_place(&mut events);
+            events
+        } else {
+            Vec::new()
+        };
+        let adapter_ctx = crate::auto::runtrace::CollectorAdapterCtx {
+            testcase: "fuzz".to_owned(),
+            worker: 0,
+            root_pid: 1,
+        };
+        let jsonl =
+            crate::auto::runtrace::collector_jsonl_from_events(&events, &adapter_ctx, harness_id);
+        resolved.evaluate_jsonl(&jsonl, &work_dir.display().to_string())
+    } else {
+        let params = crate::collector_run::CollectorRunParams {
+            testcase: "fuzz".to_owned(),
+            worker: 0,
+            root: work_dir.display().to_string(),
+            root_pid: 0,
+            root_image: harness_id.to_owned(),
+            input: &[],
+            tmp_dir: work_dir.join("collector_tmp"),
+        };
+        resolved.run_once(&params)?
     };
-    let outcome = resolved.run_once(&params)?;
     let target = serde_json::json!({ "kind": "harness", "harness": harness_id });
     let mut ids = Vec::new();
     for finding in &outcome.findings {
