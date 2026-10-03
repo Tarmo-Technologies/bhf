@@ -1,0 +1,10 @@
+{
+  "protocol": "bhf.extension.v1",
+  "case": {
+    "campaign": "demo-campaign",
+    "worker": "worker-0",
+    "testcase": "tc-000125"
+  },
+  "result": "ok",
+  "unexpected_field": "a well-formed response never carries unknown keys"
+}

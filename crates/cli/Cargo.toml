@@ -55,6 +55,7 @@ cpp_parser = { path = "../cpp_parser" }
 confidence_model = { path = "../confidence_model" }
 corpus = { path = "../corpus" }
 event_log = { path = "../event_log" }
+extension_host = { path = "../extension_host" }
 fake_corba = { path = "../fake_corba" }
 finding_rules = { path = "../finding_rules" }
 fuzz_engine_builtin = { path = "../fuzz_engine/builtin" }
@@ -120,6 +121,17 @@ path = "tests/fixtures/fake_harness.rs"
 [[bin]]
 name = "mock_collector"
 path = "tests/fixtures/mock_collector.rs"
+
+# Test-only mock bhf.extension.v1 extension for the CLI integration tests
+# (#57). Links only std + serde_json (NO bhf internals), selecting a behaviour by
+# `--mode` so `extension_cli.rs` can drive `bhf extension`/`bhf fuzz --extension`
+# and every bounded fault (crash/hang/malformed/unsupported/tamper-case) end to
+# end. A fixture binary (like cli_fake_harness / mock_collector), never shipped.
+[[bin]]
+name = "bhf_ext_mock"
+path = "tests/fixtures/ext_mock.rs"
+test = false
+doc = false
 
 [dev-dependencies]
 serde.workspace = true

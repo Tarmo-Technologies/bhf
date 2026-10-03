@@ -333,6 +333,17 @@ pub struct FuzzArgs {
     #[arg(long = "seed-file")]
     pub seed_files: Vec<PathBuf>,
 
+    /// Path to an explicitly-trusted extension manifest (`bhf.extension-manifest.v1`,
+    /// TOML). When set, after the campaign the retained corpus is driven through
+    /// the extension's out-of-process `oracle.evaluate` so a clean-exit semantic
+    /// violation becomes a finding. Explicit load is the trust boundary; an
+    /// extension is never auto-discovered. An extension crash/timeout/malformed
+    /// reply is a bounded infrastructure result that never aborts the campaign nor
+    /// becomes a target finding. (Evaluation runs post-run on retained inputs, not
+    /// in the hot mutation loop; supported by the builtin engine.)
+    #[arg(long = "extension", value_name = "MANIFEST")]
+    pub extension: Option<PathBuf>,
+
     /// Sanitizer campaign matrix to arm, comma-separated (asan, msan, ubsan, tsan,
     /// lsan), or the standalone value `none` (build coverage-only with no
     /// `-fsanitize=` — crash-only fuzzing without ASan/UBSan false positives).
@@ -871,6 +882,14 @@ pub(crate) struct FuzzRunSummary {
     /// and omitted from `run.json` for a plain `native` afl++ run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) afl: Option<AflRunProvenance>,
+    /// #57: out-of-process extension `oracle.evaluate` provenance for a
+    /// `--extension` run — the negotiated protocol/capabilities, the extension's
+    /// executable/config hashes, how many retained inputs were evaluated, how many
+    /// semantic findings were emitted, and any bounded infrastructure errors. An
+    /// additive, optional field: `schema_version` is unchanged, and it is omitted
+    /// from `run.json` when no `--extension` was given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) extension: Option<serde_json::Value>,
 }
 
 /// AFL++ binary-only settings recorded in `run.json` so a run is reproducible
@@ -1044,6 +1063,10 @@ struct PreparedFuzzRun {
     deadline: Option<Duration>,
     print_final_stats: bool,
     rss_limit_mb: usize,
+    /// Explicitly-trusted extension manifest (`--extension`). When set, the
+    /// builtin engine drives `oracle.evaluate` over the retained corpus after the
+    /// run. `None` leaves fuzzing byte-for-byte unchanged.
+    extension_manifest: Option<PathBuf>,
 }
 
 struct HarnessRun {
@@ -1365,6 +1388,7 @@ pub(crate) fn run_one_target_programmatic_with_runner(
         max_session_messages: 64,
         collector: crate::collector_run::CollectorSpec::Off,
         collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
+        extension: None,
     };
     let mut prepared = prepare(args)?;
     // A caller-supplied cross runner overrides the direct/host runner `prepare`
@@ -1443,6 +1467,7 @@ pub(crate) fn run_afl_plus_plus_programmatic(
         max_session_messages: 64,
         collector: crate::collector_run::CollectorSpec::Off,
         collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
+        extension: None,
     };
     let prepared = prepare(args)?;
     run_afl_plus_plus(prepared)
@@ -1849,6 +1874,7 @@ fn prepare(args: FuzzArgs) -> Result<PreparedFuzzRun, String> {
         deadline: args.deadline,
         print_final_stats: args.print_final_stats,
         rss_limit_mb: args.rss_limit_mb,
+        extension_manifest: args.extension,
     })
 }
 
@@ -3316,6 +3342,24 @@ fn run_builtin_with_progress(
         ));
     }
 
+    // ── #57: extension oracle.evaluate post-run pass (fenced) ───────────────
+    // When `--extension <manifest>` is set, drive the just-retained corpus
+    // through the explicitly-trusted extension's out-of-process
+    // `oracle.evaluate`. Runs AFTER the campaign (never in the hot mutation
+    // loop); an extension fault is bounded infrastructure that never aborts the
+    // run nor becomes a target finding. Reuses the run's finding emitter so an
+    // extension finding carries the harness identity.
+    let extension_block = prepared.extension_manifest.as_deref().map(|manifest| {
+        crate::extension::drive_fuzz_extension(
+            manifest,
+            &emitter,
+            &prepared.harness_id,
+            pool.iter()
+                .map(|entry| entry.bytes.as_slice())
+                .filter(|bytes| !crashing_inputs.contains(&crash_input_key(bytes))),
+        )
+    });
+
     let elapsed_secs = start.elapsed().as_secs_f64();
     let summary = FuzzRunSummary {
         schema_version: 1,
@@ -3338,6 +3382,7 @@ fn run_builtin_with_progress(
         elapsed_secs,
         executions_per_sec: executions_per_sec(executions, elapsed_secs),
         afl: None,
+        extension: extension_block,
     };
     if prepared.print_final_stats {
         bhfeprintln!(
@@ -3919,6 +3964,10 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
             afl_path: prepared.afl_path.clone(),
             inst_ranges: prepared.afl_inst_ranges.clone(),
         }),
+        // The extension `oracle.evaluate` pass is a builtin-engine feature
+        // (it iterates the builtin pool's retained corpus); AFL++ owns its own
+        // on-disk queue, so `--extension` is not driven here.
+        extension: None,
     };
     write_run_summary(&prepared.work_dir, &summary)?;
     Ok(summary)
@@ -8605,6 +8654,7 @@ mod auto_path_tests {
             max_session_messages: 64,
             collector: crate::collector_run::CollectorSpec::Off,
             collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
+            extension: None,
         }
     }
 }

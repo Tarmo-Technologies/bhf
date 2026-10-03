@@ -189,6 +189,7 @@ dependencies = [
  "corpus",
  "cpp_parser",
  "event_log",
+ "extension_host",
  "fake_corba",
  "finding_rules",
  "fuzz_engine_builtin",
@@ -758,6 +759,20 @@ dependencies = [
  "rustversion",
  "windows",
  "windows-core",
+]
+
+[[package]]
+name = "extension_host"
+version = "0.2.34"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "toml",
+ "which",
 ]
 
 [[package]]

@@ -15,6 +15,7 @@ checks.
 | Corpus and crash triage | `corpus`, `minimize`, `replay`, `capsule`, `verify-poc`, `env-capsule`, `differential`, `cmplog`, `explain`, `cartography` |
 | Source-unavailable binaries | `binary` (`scan`, `adapter`, `fuzz`) |
 | External project profiles | `project` (`validate`, `list`, `run`) |
+| Out-of-process extensions | `extension` (`validate`, `evaluate`), and `fuzz --extension` |
 | Static and supply chain | `static-scan`, `sloc`, `sbom`, `license-audit`, `extract-state-machines` |
 | Rules and governance | `rules`, `policy`, `audit`, `pack`, `export` |
 | Optional assistance | `llm` (`status`, `test`, `prompt`, `assist`) |
@@ -931,6 +932,84 @@ Forward-looking fields that belong to engine features not yet available
 (`runner`, `runner-args`, `target-args`, `arguments`, `runtime-oracles`,
 `postcondition`) parse but are **rejected** with a "requires feature #NN"
 diagnostic (fail-closed), so a manifest stays stable as those features land.
+
+## Out-of-Process Extensions
+
+`bhf extension` drives an explicitly-trusted, **out-of-process** extension that
+speaks the versioned `bhf.extension.v1` protocol (length-framed JSON over
+stdin/stdout). An extension lets a *private* semantic oracle judge whether a
+clean-exiting input violates a contract a crash-only fuzzer cannot see — without
+vendoring that oracle into bhf and in any language (see
+[`docs/extension-protocol.md`](../extension-protocol.md) and the Python
+reference extension under `crates/extension_host/tests/fixtures/`).
+
+```sh
+# Spawn the extension, negotiate the protocol + capabilities, and print the
+# negotiated protocol version, required/negotiated capabilities, and the
+# executable/config SHA-256 — without driving any case.
+bhf extension validate --manifest path/to/extension.toml
+
+# Drive oracle.evaluate over one input: a clean-exit semantic violation becomes a
+# replayable finding under <work>/results/findings/; a crash/timeout/oversized/
+# malformed/unsupported reply is a bounded infrastructure result, never a finding.
+bhf extension evaluate --manifest path/to/extension.toml --input case.bin --work bhf_work
+
+# Drive the just-retained corpus of a fuzz campaign through the extension oracle
+# after the run (not in the hot mutation loop). An extension fault never aborts
+# the campaign nor becomes a target finding.
+bhf fuzz bhf_work --harness H-0001 --extension path/to/extension.toml
+```
+
+`bhf extension evaluate` exits `0` for a benign input, `1` when a semantic
+finding is emitted, `2` for a manifest/usage error, and `4` for a bounded
+extension-side infrastructure failure (so a fault is never confused with a clean
+run or a finding). `--json` emits a machine-readable report.
+
+**Trust boundary.** The manifest is only ever loaded through an explicit
+`--manifest` path — there is no auto-discovery, and naming the manifest is the
+operator's act of trust. The child runs with a cleared, explicitly allow-listed
+environment (only the **names** of passed/dropped variables are recorded), and on
+unix with `setrlimit(RLIMIT_AS/RLIMIT_CPU)` caps.
+
+**Bounded by construction.** Every extension crash, per-call timeout, oversized
+or malformed response, mismatched case identity, or `unsupported` reply is mapped
+to a bounded **infrastructure** result that can never masquerade as a target
+vulnerability; a crash/timeout triggers the restart policy, and an exhausted
+restart budget is recorded as a terminal loss event.
+
+**Provenance.** A finding carries an `extension` block (the extension
+executable/config SHA-256, the negotiated protocol version, and the negotiated
+capabilities), and `evaluate` writes a run-level `extension.json` so a consumer
+can audit which trusted extension produced a result. `bhf fuzz --extension`
+attaches an additive `extension` block to the run summary (the summary
+`schema_version` is unchanged).
+
+**Example manifest.**
+
+```toml
+schema = "bhf.extension-manifest.v1"
+id = "path-oracle"
+executable = "./path-oracle"             # resolved relative to this manifest
+args = ["--serve"]
+required-capabilities = ["oracle.evaluate"]
+env-passthrough = ["ACME_MODE"]          # only these host vars reach the child
+
+[limits]
+call-timeout-ms = 5000
+max-frame-bytes = 1048576
+max-restarts = 1
+address-space-bytes = 1073741824         # RLIMIT_AS (unix)
+cpu-seconds = 30                          # RLIMIT_CPU (unix)
+```
+
+By default the `executable` may not be absolute or escape the manifest directory
+(`..`); set `allow-external-paths = true` to opt in. A `requires-bhf = ">=X.Y[.Z]"`
+bound fails closed on an older bhf.
+
+This slice ships the `oracle.evaluate` capability. The `codec.*`,
+`mutator.mutate`, `scenario.*`, and `lifecycle.*` capabilities, CBOR wire
+encoding, and a project-profile `[[extension]]` section (converging onto
+`bhf.project.v1`) are negotiated-but-deferred follow-ups.
 
 ## Release Commands
 

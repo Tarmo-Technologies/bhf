@@ -24,6 +24,29 @@
   `results/findings.json` (schema in `schemas/`, reference fixture in `tests/fixtures/golden_results/`).
 
 ### Added
+- Versioned **out-of-process extension protocol** (`bhf.extension.v1`): bhf can start an
+  explicitly-trusted extension executable, negotiate a protocol version + capabilities
+  before any work, and drive length-framed JSON request/response envelopes that each
+  carry campaign/worker/testcase identity (#57). The shipped capability is
+  `oracle.evaluate`: a private semantic oracle can judge whether a **clean-exiting**
+  input violates a contract a crash-only fuzzer cannot see, becoming a stable,
+  replayable `extension_oracle` finding (`confirmation: "extension"`). New `bhf extension
+  validate` (spawn + negotiate, print protocol/caps/hashes) and `bhf extension evaluate`
+  (drive one input, emit a finding + run provenance) subcommands, plus `bhf fuzz
+  --extension <manifest>` which drives the retained corpus through the oracle after the
+  run (not in the hot mutation loop) and attaches an additive `extension` block to the
+  run summary. Every extension crash, per-call timeout, oversized/malformed response,
+  mismatched case identity, or `unsupported` reply is a **bounded infrastructure result**
+  that can never masquerade as a target vulnerability; findings and run metadata record
+  the extension executable/config SHA-256, negotiated capabilities, protocol version, and
+  restart/loss events. The manifest (`bhf.extension-manifest.v1`, TOML) is only ever
+  loaded through an explicit `--manifest` path — that is the trust boundary; there is no
+  auto-discovery. The wire contract is externally implementable (JSON Schemas in
+  `schemas/`, operator docs in `docs/extension-protocol.md`, and a dependency-free Python
+  reference extension), so an out-of-tree extension in any language interoperates with
+  the host. The `codec.*`, `mutator.mutate`, `scenario.*`, and `lifecycle.*`
+  capabilities, CBOR wire encoding, and a project-profile (`bhf.project.v1`)
+  `[[extension]]` section are negotiated-but-deferred follow-ups.
 - `bhf fuzz` / `bhf binary-fuzz` gain a platform-neutral **runtime-event collector**
   (`--collector <auto|none|PATH>`, `--collector-window-ms <MS>`) that observes the
   process, filesystem, and module-load effects a target performs even when it exits

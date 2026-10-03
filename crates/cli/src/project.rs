@@ -574,6 +574,10 @@ fn plan_to_fuzz_args(
         max_session_messages: 64,
         collector: crate::collector_run::CollectorSpec::Off,
         collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
+        // A project profile cannot yet declare an extension; the `[[extension]]`
+        // convergence onto `bhf.project.v1` is a tracked follow-up (#57). Use
+        // `bhf fuzz --extension` / `bhf extension` for extension-backed oracles.
+        extension: None,
     })
 }
 

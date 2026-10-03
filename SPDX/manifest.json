@@ -1619,6 +1619,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/extension.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/extract_state_machines.rs",
       "license": "Apache-2.0"
     },
@@ -2327,6 +2331,14 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/extension_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/fixtures/ext_mock.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/fixtures/fake_harness.rs",
       "license": "Apache-2.0"
     },
@@ -2720,6 +2732,66 @@
     },
     {
       "path": "crates/event_log/src/testcase.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/extension_host/Cargo.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/extension_host/src/b64.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/extension_host/src/client.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/extension_host/src/envelope.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/extension_host/src/handshake.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/extension_host/src/lib.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/extension_host/src/limits.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/extension_host/src/manifest.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/extension_host/src/oracle.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/extension_host/src/provenance.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/extension_host/src/restart.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/extension_host/src/wire.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/extension_host/tests/fixtures/mock_extension.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/extension_host/tests/schema_fixtures.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/extension_host/tests/subprocess.rs",
       "license": "Apache-2.0"
     },
     {
@@ -4036,6 +4108,10 @@
     },
     {
       "path": "docs/expected-gaps.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/extension-protocol.md",
       "license": "Apache-2.0"
     },
     {

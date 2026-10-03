@@ -137,6 +137,30 @@ pub fn dedupe_keys(record: &serde_json::Value) -> Vec<String> {
     run.into_iter().chain(signature).collect()
 }
 
+/// A stable, replayable semantic finding produced by an explicitly-trusted,
+/// out-of-process extension oracle (`oracle.evaluate`). The host passes plain
+/// fields so `corpus` needs no dependency on the extension host crate.
+#[derive(Debug, Clone)]
+pub struct ExtensionFinding {
+    /// The rule identifier the extension's oracle fired.
+    pub rule: String,
+    /// The finding classification (e.g. `extension_oracle`).
+    pub classification: String,
+    /// The ordered signature inputs. Hashed **in order** so the signature
+    /// reproduces byte-for-byte on replay/minimize/re-evaluate regardless of
+    /// host-side iteration order — this is what makes the finding identity
+    /// stable across runs.
+    pub signature_inputs: Vec<String>,
+    /// Supporting evidence as ordered `(key, value)` pairs.
+    pub evidence: Vec<(String, String)>,
+    /// An optional minimization-predicate identifier the extension exposes.
+    pub min_predicate: Option<String>,
+    /// The provenance block stamped under `record["extension"]`: the extension
+    /// executable/config sha256, protocol version, and negotiated capabilities
+    /// (built by the host from `ExtensionProvenance::finding_block`).
+    pub provenance: serde_json::Value,
+}
+
 impl FindingEmitter {
     pub fn new(root: PathBuf) -> Self {
         Self {
@@ -401,6 +425,114 @@ impl FindingEmitter {
                 "finding": "finding.json",
             },
         });
+        if let Some(sandbox) = &self.metadata.sandbox {
+            record["sandbox"] = sandbox.clone();
+            record["build"] = json!({ "sandbox": sandbox });
+        }
+        merge_build_binary(&mut record, &self.metadata);
+        record["actionability"] = actionability::value_for_finding(
+            self.metadata.mode,
+            &record,
+            Some(&finding_dir.join("finding.json")),
+        );
+
+        stamp_v1(&mut record, finding_kind::FUZZ);
+        fs::write(
+            finding_dir.join("finding.json"),
+            serde_json::to_vec_pretty(&record)?,
+        )?;
+
+        Ok(id)
+    }
+
+    /// Emit a finding for a semantic violation reported by an out-of-process
+    /// extension oracle (`oracle.evaluate`). These are not crashes: the oracle
+    /// judged a clean-exiting input to violate a private semantic contract.
+    ///
+    /// The `signature` is the sha256 of the extension's ordered
+    /// `signature_inputs`, so an identical violation reproduces the identical
+    /// signature on replay/minimize/re-evaluate. The `cluster_key` is
+    /// DEFECT-level (`rule | classification`) and EXCLUDES the per-input
+    /// signature inputs/evidence, so repeated hits of one defect collapse into a
+    /// single cluster for report dedup (mirroring [`Self::emit_oracle_hit`]). The
+    /// record carries `confirmation: "extension"` and an `extension` provenance
+    /// block so a consumer can audit which explicitly-trusted extension produced
+    /// it.
+    pub fn emit_extension_finding(
+        &self,
+        input: &[u8],
+        finding: &ExtensionFinding,
+    ) -> Result<FindingId, CorpusError> {
+        use sha2::Digest;
+        // Signature: the extension's ORDERED signature inputs, separated by a
+        // byte that cannot appear in the (textual) inputs, so distinct input
+        // lists can never collide by concatenation.
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"extension");
+        for part in &finding.signature_inputs {
+            hasher.update(b"\x1f");
+            hasher.update(part.as_bytes());
+        }
+        let signature_hex = format!("{:x}", hasher.finalize());
+        // Cluster key: DEFECT-level (rule | classification), excluding per-input
+        // evidence so one defect re-triggered on many inputs stays one cluster.
+        let mut cluster_hasher = sha2::Sha256::new();
+        cluster_hasher.update(finding.rule.as_bytes());
+        cluster_hasher.update(b"|");
+        cluster_hasher.update(finding.classification.as_bytes());
+        let cluster_full = format!("{:x}", cluster_hasher.finalize());
+        let cluster_short = cluster_full.chars().take(16).collect::<String>();
+        let cluster_frames = vec![finding.rule.clone(), finding.classification.clone()];
+
+        let (id, finding_dir) = self.allocate_finding(&signature_hex)?;
+        fs::write(finding_dir.join("testcase.bin"), input)?;
+        fs::write(
+            finding_dir.join("decoded.json"),
+            serde_json::to_vec_pretty(&decoded_placeholder(input))?,
+        )?;
+
+        let evidence: Vec<serde_json::Value> = finding
+            .evidence
+            .iter()
+            .map(|(key, value)| json!({ "key": key, "value": value }))
+            .collect();
+        let message = finding
+            .evidence
+            .iter()
+            .find(|(key, _)| key == "reason" || key == "message")
+            .map(|(_, value)| value.clone())
+            .unwrap_or_else(|| format!("extension oracle rule {} fired", finding.rule));
+
+        let mut record = json!({
+            "id": id.0,
+            "signature": signature_hex,
+            "cluster_key": cluster_short,
+            "cluster_key_full": cluster_full,
+            "cluster_normalized_frames": cluster_frames,
+            "cluster_fallback": false,
+            "rule_id": finding.rule,
+            "classification": finding.classification,
+            // A semantic violation confirmed by an out-of-process extension
+            // oracle — distinct from `static`, `runtime`, and `fuzz_confirmed`.
+            "confirmation": "extension",
+            "harness_id": self.metadata.harness_id,
+            "dialect": self.metadata.dialect,
+            "fixture_path": self.metadata.fixture_path,
+            "extension": finding.provenance,
+            "evidence": evidence,
+            "exception": {
+                "name": oracle_exception_name(&finding.rule),
+                "message": message,
+            },
+            "paths": {
+                "testcase": "testcase.bin",
+                "decoded": "decoded.json",
+                "finding": "finding.json",
+            },
+        });
+        if let Some(predicate) = &finding.min_predicate {
+            record["min_predicate"] = json!(predicate);
+        }
         if let Some(sandbox) = &self.metadata.sandbox {
             record["sandbox"] = sandbox.clone();
             record["build"] = json!({ "sandbox": sandbox });
@@ -1289,6 +1421,130 @@ mod tests {
             .unwrap()
         };
         assert_eq!(read(&id_a)["cluster_key"], read(&id_b)["cluster_key"]);
+    }
+
+    fn extension_finding(rule: &str, path: &str) -> super::ExtensionFinding {
+        super::ExtensionFinding {
+            rule: rule.to_owned(),
+            classification: "extension_oracle".to_owned(),
+            signature_inputs: vec![rule.to_owned(), path.to_owned()],
+            evidence: vec![
+                ("path".to_owned(), path.to_owned()),
+                ("reason".to_owned(), "escapes sandbox root".to_owned()),
+            ],
+            min_predicate: Some("path-contains-dotdot".to_owned()),
+            provenance: serde_json::json!({
+                "executable_sha256": "a".repeat(64),
+                "config_sha256": "b".repeat(64),
+                "protocol_version": "bhf.extension.v1",
+                "negotiated_caps": ["oracle.evaluate"],
+            }),
+        }
+    }
+
+    fn read_finding(root: &std::path::Path, id: &super::FindingId) -> serde_json::Value {
+        serde_json::from_str(
+            &fs::read_to_string(
+                crate::layout::findings_dir(root)
+                    .join(&id.0)
+                    .join("finding.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn emit_extension_finding_writes_confirmation_extension() {
+        let root = temp_dir("ext-confirmation");
+        let emitter = super::FindingEmitter::with_metadata(
+            root.clone(),
+            "H-ext".to_owned(),
+            "c".to_owned(),
+            "/tmp/harness/main.c".to_owned(),
+        );
+        let id = emitter
+            .emit_extension_finding(
+                b"../etc/passwd",
+                &extension_finding("oracle.path-escape", "../etc/passwd"),
+            )
+            .unwrap();
+        let v = read_finding(&root, &id);
+        assert_eq!(v["confirmation"], "extension");
+        assert_eq!(v["classification"], "extension_oracle");
+        assert_eq!(v["rule_id"], "oracle.path-escape");
+        assert_eq!(v["finding_kind"], "fuzz");
+        assert_eq!(v["evidence"][0]["key"], "path");
+        assert_eq!(v["evidence"][0]["value"], "../etc/passwd");
+        assert_eq!(v["min_predicate"], "path-contains-dotdot");
+        assert_eq!(
+            fs::read(
+                crate::layout::findings_dir(&root)
+                    .join(&id.0)
+                    .join("testcase.bin")
+            )
+            .unwrap(),
+            b"../etc/passwd"
+        );
+    }
+
+    #[test]
+    fn emit_extension_finding_signature_is_stable_across_identical_violations() {
+        let root = temp_dir("ext-stable-sig");
+        let emitter = super::FindingEmitter::new(root.clone());
+        let finding = extension_finding("oracle.path-escape", "../etc/passwd");
+        let id_a = emitter
+            .emit_extension_finding(b"../etc/passwd", &finding)
+            .unwrap();
+        let id_b = emitter
+            .emit_extension_finding(b"../etc/passwd", &finding)
+            .unwrap();
+        let a = read_finding(&root, &id_a);
+        let b = read_finding(&root, &id_b);
+        // Identical violation content → identical signature AND cluster key, so a
+        // replay/minimize reproduces the same stable identity.
+        assert_eq!(a["signature"], b["signature"]);
+        assert_eq!(a["cluster_key"], b["cluster_key"]);
+        assert_eq!(a["cluster_key_full"], b["cluster_key_full"]);
+    }
+
+    #[test]
+    fn emit_extension_finding_stamps_executable_config_hashes_and_caps() {
+        let root = temp_dir("ext-provenance");
+        let emitter = super::FindingEmitter::new(root.clone());
+        let id = emitter
+            .emit_extension_finding(
+                b"../etc/passwd",
+                &extension_finding("oracle.path-escape", "../etc/passwd"),
+            )
+            .unwrap();
+        let v = read_finding(&root, &id);
+        assert_eq!(v["extension"]["executable_sha256"], "a".repeat(64));
+        assert_eq!(v["extension"]["config_sha256"], "b".repeat(64));
+        assert_eq!(v["extension"]["protocol_version"], "bhf.extension.v1");
+        assert_eq!(v["extension"]["negotiated_caps"][0], "oracle.evaluate");
+    }
+
+    #[test]
+    fn emit_extension_finding_distinct_sites_cluster_separately() {
+        let root = temp_dir("ext-distinct-sites");
+        let emitter = super::FindingEmitter::new(root.clone());
+        let id_a = emitter
+            .emit_extension_finding(b"a", &extension_finding("oracle.path-escape", "../a"))
+            .unwrap();
+        let id_b = emitter
+            .emit_extension_finding(
+                b"b",
+                &extension_finding("oracle.secret-exfil", "/etc/shadow"),
+            )
+            .unwrap();
+        let a = read_finding(&root, &id_a);
+        let b = read_finding(&root, &id_b);
+        // Two different rules → two distinct clusters (no over-merge) and distinct
+        // signatures.
+        assert_ne!(a["cluster_key"], b["cluster_key"]);
+        assert_ne!(a["cluster_key_full"], b["cluster_key_full"]);
+        assert_ne!(a["signature"], b["signature"]);
     }
 
     #[test]

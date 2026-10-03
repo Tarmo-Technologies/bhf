@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Tarmo-Technologies/bhf/schemas/bhf.extension.v1.request.schema.json",
+  "title": "bhf.extension.v1 request",
+  "description": "A request envelope bhf drives to an explicitly-trusted, out-of-process extension. Transported as a length-framed message: {u32 little-endian length}{UTF-8 JSON payload}. Every request carries the full campaign/worker/testcase identity so a response can be matched to its request and two workers can never mix test-case identity. This is the externally-implementable wire contract; the authoritative parser is the host's serde envelope (deny_unknown_fields), and the committed fixtures validate against both.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol", "capability", "case", "payload"],
+  "properties": {
+    "protocol": { "const": "bhf.extension.v1" },
+    "capability": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The capability being invoked (e.g. \"oracle.evaluate\")."
+    },
+    "case": { "$ref": "#/$defs/case" },
+    "payload": {
+      "type": "object",
+      "description": "Capability-specific payload, opaque to the envelope layer. For oracle.evaluate it carries {\"input_b64\": <standard base64 of the raw input bytes>}."
+    }
+  },
+  "$defs": {
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["campaign", "worker", "testcase"],
+      "properties": {
+        "campaign": { "type": "string" },
+        "worker": { "type": "string" },
+        "testcase": { "type": "string" }
+      }
+    }
+  }
+}

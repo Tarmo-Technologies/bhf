@@ -21,6 +21,7 @@ members = [
     "crates/daemon",
     "crates/discovery",
     "crates/event_log",
+    "crates/extension_host",
     "crates/fake_corba",
     "crates/finding_rules",
     "crates/fork_server",

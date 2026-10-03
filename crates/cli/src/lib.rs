@@ -51,6 +51,7 @@ mod differential;
 mod env_capsule;
 mod explain;
 mod export_bundle;
+mod extension;
 mod extract_state_machines;
 mod fake_corba;
 mod fatal_signal;
@@ -211,6 +212,10 @@ enum Command {
     // ── External project/target profiles ────────────────────────────────────
     /// Define, validate, and run an external project/target-profile manifest (bhf.project.v1) kept outside the source tree: validate, list, run
     Project(project::ProjectArgs),
+
+    // ── Out-of-process extensions (bhf.extension.v1) ─────────────────────────
+    /// Drive an explicitly-trusted, out-of-process extension (bhf.extension.v1): validate/negotiate its protocol + capabilities, or evaluate an input through its semantic oracle (validate, evaluate)
+    Extension(extension::ExtensionArgs),
 
     // ── Supply chain & static analysis ──────────────────────────────────────
     /// Generate an SBOM from source/manifest/binaries with CVE matching and vulnerability gating
@@ -383,6 +388,10 @@ where
         // results layout (via `project::run`), so it is NOT wrapped in the
         // `with_results` producer bracket.
         Some(Command::Project(project_args)) => project::run(project_args),
+        // `bhf extension` manages its own work dir, findings, and run provenance
+        // (via `extension::run`), so it is NOT wrapped in the `with_results`
+        // producer bracket (mirroring `bhf project`).
+        Some(Command::Extension(extension_args)) => extension::run(extension_args),
         Some(Command::List(list)) => match list.command {
             ListCommand::Targets(args) => match list_targets::run(args) {
                 Ok(()) => 0,
