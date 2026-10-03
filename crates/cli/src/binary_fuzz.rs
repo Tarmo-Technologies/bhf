@@ -515,10 +515,10 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
                 let representative = seeds.first().cloned().unwrap_or_default();
                 let outcome = if let Some(shim) = resolved.runtrace_shim() {
                     // Linux built-in provider: a dedicated observation pass runs the
-                    // target once under the LD_PRELOAD runtrace shim and re-expresses
-                    // its process/file/library effects as `bhf.collector-event.v1`
-                    // via the runtrace→collector adapter. This pass is separate from
-                    // the crash-detection loop, so `--runtime-oracles` behaviour is
+                    // target under the LD_PRELOAD runtrace shim and re-expresses its
+                    // process/file/library effects as `bhf.collector-event.v1` via the
+                    // runtrace→collector adapter. This pass is separate from the
+                    // crash-detection loop, so `--runtime-oracles` behaviour is
                     // unchanged; it is an additional, collector-shaped view.
                     let col_log = tmp_dir.join("collector_runtrace.jsonl");
                     let run = run_binary_once(
@@ -530,14 +530,42 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
                         &tmp_dir,
                         Some((shim, col_log.as_path())),
                     )?;
-                    // #60: route sink confirmation through the SAME cross-execution
-                    // correlation #59 uses — never a single run's raw taint_offset.
-                    // Start from the campaign's accumulated evidence (so a sink the
-                    // campaign saw untainted elsewhere stays suppressed here) and fold
-                    // in this observation pass; with runtime oracles off the campaign
-                    // snapshot is empty, so the gate is this pass's own correlation.
+                    // #60: a sink is taint-confirmed ONLY from cross-execution
+                    // correlation (the SAME #59 gate), never one run's raw
+                    // taint_offset. Start from the campaign's accumulated evidence and
+                    // fold in this observation pass.
                     let mut gate_tracker = campaign_gate_tracker.clone();
                     gate_tracker.observe(&run.oracle_events, &representative);
+                    // When runtime oracles are off the campaign never ran under the
+                    // shim, so `campaign_gate_tracker` is empty and the pass above is
+                    // the ONLY observation — which would confirm any sink it saw
+                    // tainted, reopening the constant-echo false positive: a program
+                    // constant the target reaches regardless of input (e.g.
+                    // `open("/etc/app.conf")`) is byte-present taint-matched, and thus
+                    // "confirmed", whenever the seed happens to contain its bytes, with
+                    // no untainted observation to refute it. Supply the missing
+                    // cross-execution evidence with a second observation on a
+                    // deliberately byte-disjoint contrast input: a genuine constant is
+                    // reached identically (same subject) but now UNTAINTED on the
+                    // contrast, so #59's never-untainted clause suppresses it; a
+                    // fuzz-controlled sink yields a different subject each run and stays
+                    // confirmed. With oracles on the campaign already carries this
+                    // evidence, so the extra pass is skipped (that path is unchanged).
+                    if oracles.is_none() {
+                        if let Some(contrast) = contrast_input(&representative) {
+                            let contrast_log = tmp_dir.join("collector_runtrace_contrast.jsonl");
+                            let contrast_run = run_binary_once(
+                                &invocation,
+                                args.input_mode,
+                                &contrast,
+                                &env,
+                                Duration::from_millis(args.timeout_ms),
+                                &tmp_dir,
+                                Some((shim, contrast_log.as_path())),
+                            )?;
+                            gate_tracker.observe(&contrast_run.oracle_events, &contrast);
+                        }
+                    }
                     let gate = gate_tracker.collector_gate();
                     let adapter_ctx = crate::auto::runtrace::CollectorAdapterCtx {
                         testcase: "binary-fuzz".to_owned(),
@@ -1259,6 +1287,28 @@ fn close_fd(fd: i32) {
 
 #[cfg(not(unix))]
 fn close_fd(_fd: i32) {}
+
+/// Build a byte-disjoint contrast to `seed` for the #60 collector observation
+/// pass (the preferred, cross-execution fix for the oracles-off path): the
+/// bitwise complement of each byte. Sink subjects that matter here — paths,
+/// commands, library names — are printable ASCII, so none of their bytes appear
+/// in the complement (all `>= 0x80`). A program constant the target reaches
+/// regardless of input is therefore seen UNTAINTED on this contrast even when the
+/// real seed echoed its bytes, which is exactly the cross-execution evidence the
+/// #59 never-untainted clause needs to suppress it; a fuzz-controlled subject
+/// instead tracks the contrast bytes and stays confirmable.
+///
+/// Returns `None` for an input shorter than the shim's 4-byte taint window
+/// ([`input_derived_run`]), since no sink can be byte-origin taint-confirmed from
+/// such a seed anyway — the degenerate empty/tiny-seed case needs no extra pass.
+fn contrast_input(seed: &[u8]) -> Option<Vec<u8>> {
+    // Matches the shim's minimum contiguous taint run (fuzz_input::input_run_in).
+    const MIN_TAINT_WINDOW: usize = 4;
+    if seed.len() < MIN_TAINT_WINDOW {
+        return None;
+    }
+    Some(seed.iter().map(|b| !b).collect())
+}
 
 fn run_binary_once(
     inv: &TargetInvocation,
@@ -2709,6 +2759,76 @@ mod afl_qemu_tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Run `bhf binary fuzz --collector auto --runtime-oracles off` on `bin` with a
+    /// single `seed` and return the rule ids of the collector-sourced
+    /// `binary_semantic` (taint-confirmed) findings it produced. Asserts the Linux
+    /// built-in runtrace collector was active and the #59 runtime oracles stayed off,
+    /// so a returned rule id is unambiguously a taint-confirmed collector finding.
+    #[cfg(unix)]
+    fn collector_rule_ids(bin: &Path, seed: &str, work: &Path) -> Vec<String> {
+        let args = BinaryFuzzArgs {
+            binary: bin.to_path_buf(),
+            work_dir: work.to_path_buf(),
+            input_mode: BinaryInputMode::File,
+            iterations: 1,
+            seed_inputs: vec![seed.to_owned()],
+            seed_files: Vec::new(),
+            timeout_ms: 10_000,
+            mem_mb: "none".to_owned(),
+            env: Vec::new(),
+            env_redaction: BTreeMap::new(),
+            runner: None,
+            runner_args: Vec::new(),
+            target_args: Vec::new(),
+            sandbox: SandboxModeArg::Auto,
+            engine: BinaryFuzzEngine::Builtin,
+            time: None,
+            // Runtime oracles OFF: the collector is an independent view.
+            runtime_oracles: crate::runtime_oracles::RuntimeOracleMode::Off,
+            setup_command: None,
+            oracle_command: None,
+            reset_command: None,
+            collector: crate::collector_run::CollectorSpec::Auto,
+            collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
+        };
+        let summary = run_inner(args).expect("binary fuzz run");
+        assert_eq!(
+            summary.pointer("/collector/active"),
+            Some(&json!(true)),
+            "the Linux built-in collector must be active: {summary}"
+        );
+        assert_eq!(
+            summary.pointer("/collector/mode"),
+            Some(&json!("runtrace")),
+            "auto must resolve to the runtrace backend on Linux: {summary}"
+        );
+        // #59 oracle findings must stay off (runtime-oracles off).
+        assert_eq!(
+            summary.pointer("/runtime_oracles/active"),
+            Some(&json!(false)),
+            "runtime oracles must be inactive: {summary}"
+        );
+        let findings_dir = corpus::layout::findings_dir(work);
+        let ids = summary["findings"].as_array().expect("findings array");
+        let mut rules = Vec::new();
+        for id in ids {
+            let id = id.as_str().unwrap();
+            let fdir = findings_dir.join(id);
+            let f: Value =
+                serde_json::from_slice(&fs::read(fdir.join("finding.json")).unwrap()).unwrap();
+            // Only collector-sourced semantic findings carry the `collector`
+            // provenance block.
+            if f.get("kind").and_then(Value::as_str) == Some("binary_semantic")
+                && f.get("collector").is_some()
+            {
+                if let Some(rule) = f.get("rule_id").and_then(Value::as_str) {
+                    rules.push(rule.to_owned());
+                }
+            }
+        }
+        rules
+    }
+
     /// End-to-end proof of the Linux `--collector auto` built-in provider (#60): a
     /// clean-exit C target whose fuzz-controlled input flows into `system()`, a
     /// destructive filesystem op (`remove`) and `dlopen()` must, with
@@ -2733,71 +2853,6 @@ mod afl_qemu_tests {
         if !runtime_oracle_e2e_ready() {
             eprintln!("skipping collector-auto e2e: shim/cc/Linux unavailable");
             return;
-        }
-
-        // Collector rule ids -> COL findings for a given target + seed.
-        fn collector_rule_ids(bin: &Path, seed: &str, work: &Path) -> Vec<String> {
-            let args = BinaryFuzzArgs {
-                binary: bin.to_path_buf(),
-                work_dir: work.to_path_buf(),
-                input_mode: BinaryInputMode::File,
-                iterations: 1,
-                seed_inputs: vec![seed.to_owned()],
-                seed_files: Vec::new(),
-                timeout_ms: 10_000,
-                mem_mb: "none".to_owned(),
-                env: Vec::new(),
-                env_redaction: BTreeMap::new(),
-                runner: None,
-                runner_args: Vec::new(),
-                target_args: Vec::new(),
-                sandbox: SandboxModeArg::Auto,
-                engine: BinaryFuzzEngine::Builtin,
-                time: None,
-                // Runtime oracles OFF: the collector is an independent view.
-                runtime_oracles: crate::runtime_oracles::RuntimeOracleMode::Off,
-                setup_command: None,
-                oracle_command: None,
-                reset_command: None,
-                collector: crate::collector_run::CollectorSpec::Auto,
-                collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
-            };
-            let summary = run_inner(args).expect("binary fuzz run");
-            assert_eq!(
-                summary.pointer("/collector/active"),
-                Some(&json!(true)),
-                "the Linux built-in collector must be active: {summary}"
-            );
-            assert_eq!(
-                summary.pointer("/collector/mode"),
-                Some(&json!("runtrace")),
-                "auto must resolve to the runtrace backend on Linux: {summary}"
-            );
-            // #59 oracle findings must stay off (runtime-oracles off).
-            assert_eq!(
-                summary.pointer("/runtime_oracles/active"),
-                Some(&json!(false)),
-                "runtime oracles must be inactive: {summary}"
-            );
-            let findings_dir = corpus::layout::findings_dir(work);
-            let ids = summary["findings"].as_array().expect("findings array");
-            let mut rules = Vec::new();
-            for id in ids {
-                let id = id.as_str().unwrap();
-                let fdir = findings_dir.join(id);
-                let f: Value =
-                    serde_json::from_slice(&fs::read(fdir.join("finding.json")).unwrap()).unwrap();
-                // Only collector-sourced semantic findings carry the `collector`
-                // provenance block.
-                if f.get("kind").and_then(Value::as_str) == Some("binary_semantic")
-                    && f.get("collector").is_some()
-                {
-                    if let Some(rule) = f.get("rule_id").and_then(Value::as_str) {
-                        rules.push(rule.to_owned());
-                    }
-                }
-            }
-            rules
         }
 
         let dir = std::env::temp_dir().join(format!("bhf-binfuzz-collector-{}", nonce()));
@@ -2878,6 +2933,93 @@ mod afl_qemu_tests {
                 "fixed constants must not produce a taint-confirmed {taint_rule}; got {neg:?}"
             );
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #60 residual regression (PRODUCTION PATH): the existing negative control above
+    /// uses constants whose bytes are *absent* from the seed, so a single observation
+    /// already sees them untainted. The dangerous case the prior fix missed is a
+    /// program CONSTANT whose bytes the seed *does* contain — it byte-matches as
+    /// tainted on the lone `--runtime-oracles off` observation pass and, with no
+    /// untainted observation to refute it, is wrongly taint-confirmed.
+    ///
+    /// This drives the real `bhf binary fuzz --collector auto --runtime-oracles off`
+    /// pipeline on a clean-exit target that (a) `dlopen`s a FIXED library path
+    /// (`/tmp/CONSTECHO.so`, independent of input) whose token is echoed into the
+    /// seed, and (b) `remove`s a path that genuinely tracks the input. The fix must
+    /// SUPPRESS the constant library load (no BHF-435) while STILL confirming the
+    /// fuzz-controlled destructive op (BHF-440) — proving the cross-execution gate is
+    /// supplied on this path, not that confirmation was simply disabled.
+    ///
+    /// Pre-fix (gate built from the single observation pass) this test FAILS: the
+    /// constant library load is taint-confirmed and BHF-435 appears.
+    #[cfg(unix)]
+    #[test]
+    fn binary_fuzz_collector_auto_constant_echoed_into_seed_is_not_confirmed() {
+        use std::os::unix::fs::PermissionsExt;
+        if !runtime_oracle_e2e_ready() {
+            eprintln!("skipping collector-auto constant-echo e2e: shim/cc/Linux unavailable");
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("bhf-binfuzz-constecho-{}", nonce()));
+        fs::create_dir_all(&dir).unwrap();
+
+        // The library path is a FIXED constant: it never varies with the input. The
+        // destructive `remove` path is genuinely fuzz-controlled (it embeds the seed).
+        let src = dir.join("constecho.c");
+        fs::write(
+            &src,
+            b"#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\
+              #include <dlfcn.h>\n\
+              int main(int argc, char **argv){\n\
+              \x20 char buf[256]; buf[0]=0;\n\
+              \x20 if(argc>1){ FILE*f=fopen(argv[1],\"rb\"); if(f){ size_t n=fread(buf,1,255,f); buf[n]=0; fclose(f);} }\n\
+              \x20 size_t L=strlen(buf); while(L>0 && (buf[L-1]=='\\n'||buf[L-1]=='\\r')) buf[--L]=0;\n\
+              \x20 /* CONSTANT library load: path is fixed, independent of input. */\n\
+              \x20 void*h=dlopen(\"/tmp/CONSTECHO.so\",RTLD_NOW); if(h) dlclose(h);\n\
+              \x20 /* FUZZ-CONTROLLED destructive op: path tracks the input. */\n\
+              \x20 char p[512]; snprintf(p,sizeof p,\"/tmp/bhf-col-%s\", buf); remove(p);\n\
+              \x20 return 0;\n }\n",
+        )
+        .unwrap();
+        let bin = dir.join("constecho");
+        let built = Command::new("cc")
+            .arg("-O0")
+            .arg(&src)
+            .arg("-o")
+            .arg(&bin)
+            .arg("-ldl")
+            .output()
+            .expect("cc");
+        assert!(
+            built.status.success(),
+            "cc failed: {}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        let _ = fs::set_permissions(&bin, fs::Permissions::from_mode(0o755));
+
+        let work = dir.join("work");
+        fs::create_dir_all(&work).unwrap();
+        // The seed echoes the constant library's token ("CONSTECHO") AND drives the
+        // fuzz-controlled destructive path (`/tmp/bhf-col-CONSTECHO`).
+        let rules = collector_rule_ids(&bin, "CONSTECHO", &work);
+
+        // The fix: the constant library load, byte-matched only because the seed
+        // happened to contain its token, must NOT be taint-confirmed.
+        assert!(
+            !rules.iter().any(|r| r == "BHF-435"),
+            "a constant library path echoed into the seed must not be taint-confirmed \
+             (BHF-435); got {rules:?}"
+        );
+        // Soundness check that the fix did not merely disable confirmation: a sink
+        // that genuinely tracks the input must still be confirmed on this same path.
+        assert!(
+            rules.iter().any(|r| r == "BHF-440"),
+            "a genuinely fuzz-controlled destructive op must still be taint-confirmed \
+             (BHF-440); got {rules:?}"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
