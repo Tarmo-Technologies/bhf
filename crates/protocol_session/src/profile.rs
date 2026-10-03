@@ -77,6 +77,12 @@ pub struct FieldDef {
     /// Symbol -> integer code map for an `enum` field.
     #[serde(default)]
     pub variants: Option<BTreeMap<String, u64>>,
+    /// Explicit wire width (`u8`/`u16`/`u32`) for an `enum` field. When absent,
+    /// the width is inferred from the largest variant code. Set it to make an
+    /// enum occupy a field wider than its codes imply, so it does not under-size
+    /// and shift the fields that follow it on the wire.
+    #[serde(default)]
+    pub width: Option<FieldType>,
     /// Tag value for a `tlv` field.
     #[serde(default)]
     pub tag: Option<u64>,
@@ -101,6 +107,12 @@ pub struct CaptureDef {
     /// Symbol -> integer code map for an `enum` capture.
     #[serde(default)]
     pub variants: Option<BTreeMap<String, u64>>,
+    /// Explicit wire width (`u8`/`u16`/`u32`) for an `enum` capture. When
+    /// absent, the width is inferred from the largest variant code. Set it when
+    /// the reply encodes the enum in a field wider than its codes imply, so the
+    /// captures that follow it are read at the right offset.
+    #[serde(default)]
+    pub width: Option<FieldType>,
 }
 
 /// The response specification attached to a message.

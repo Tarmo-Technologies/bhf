@@ -856,11 +856,41 @@ pub(crate) fn replay_session_finding(finding_dir: &Path) -> i32 {
 fn replay_session_inner(finding_dir: &Path) -> Result<bool, String> {
     let (testcase, model, meta) = load_session_finding(finding_dir)?;
     let mut transport = build_live_transport(&meta)?;
-    let runner = SessionRunner::new(&model);
+    replay_reproduces(&model, &testcase, &meta, &mut transport)
+}
+
+/// Whether `verdict` reproduces the SAME oracle finding that the metadata
+/// recorded, by both oracle name and `rule_id`.
+///
+/// Replay and minimize must not accept *any* oracle firing as a reproduction:
+/// under a multi-oracle profile (`[[oracle]]` is a list) a session recorded for
+/// oracle `O1` can re-drive into a finding for a different oracle `O2`, which
+/// would falsely "confirm" `O1` — or, in minimize, let delta-debugging shrink
+/// away the very structure that triggered `O1` because a smaller sequence still
+/// trips `O2`. Gating on the recorded oracle keeps each finding honest to the
+/// oracle it was emitted for.
+fn verdict_reproduces(verdict: &SessionVerdict, meta: &SessionArtifactMeta) -> bool {
+    match verdict {
+        SessionVerdict::Finding {
+            oracle, rule_id, ..
+        } => *oracle == meta.oracle && *rule_id == meta.rule_id,
+        SessionVerdict::Clean => false,
+    }
+}
+
+/// Re-drive `testcase` against `transport` and report whether it reproduces the
+/// recorded oracle finding (not merely *some* finding).
+fn replay_reproduces(
+    model: &ProtocolModel,
+    testcase: &SessionTestcase,
+    meta: &SessionArtifactMeta,
+    transport: &mut dyn SessionTransport,
+) -> Result<bool, String> {
+    let runner = SessionRunner::new(model);
     let run = runner
-        .replay(&testcase, &mut transport)
+        .replay(testcase, transport)
         .map_err(|e| format!("replay session: {e}"))?;
-    Ok(run.verdict.is_finding())
+    Ok(verdict_reproduces(&run.verdict, meta))
 }
 
 /// `bhf minimize` of a session finding: shrink the message sequence and the
@@ -885,43 +915,9 @@ pub(crate) fn minimize_session_finding(finding_dir: &Path) -> i32 {
 
 fn minimize_session_inner(finding_dir: &Path) -> Result<(usize, usize, bool), String> {
     let (testcase, model, meta) = load_session_finding(finding_dir)?;
-    let runner = SessionRunner::new(&model);
-    let original_len = testcase.messages.len();
-
-    // Baseline: the recorded session must still reproduce before we minimize it.
-    {
-        let mut transport = build_live_transport(&meta)?;
-        let run = runner
-            .replay(&testcase, &mut transport)
-            .map_err(|e| format!("baseline replay: {e}"))?;
-        if !run.verdict.is_finding() {
-            return Err(
-                "the recorded session no longer reproduces; refusing to minimize".to_owned(),
-            );
-        }
-    }
-
-    // Each predicate candidate re-drives on a fresh transport (fresh handle), so
-    // the dynamic binding is re-resolved and the computed fields re-repaired.
-    let predicate = |candidate: &SessionTestcase| -> bool {
-        let Ok(mut transport) = build_live_transport(&meta) else {
-            return false;
-        };
-        runner
-            .replay(candidate, &mut transport)
-            .map(|run| run.verdict.is_finding())
-            .unwrap_or(false)
-    };
-    let minimized = runner.minimize(&testcase, predicate);
-    let minimized_len = minimized.messages.len();
-
-    // Re-drive the minimized testcase once to capture its fresh evidence, and
-    // persist that as the new, smaller session artifact.
-    let mut transport = build_live_transport(&meta)?;
-    let run = runner
-        .replay(&minimized, &mut transport)
-        .map_err(|e| format!("drive minimized session: {e}"))?;
-    let reproduces = run.verdict.is_finding();
+    let (original_len, run, reproduces) =
+        minimize_session_core(&model, &testcase, &meta, || build_live_transport(&meta))?;
+    let minimized_len = run.testcase.messages.len();
 
     let serialized = run
         .testcase
@@ -938,6 +934,65 @@ fn minimize_session_inner(finding_dir: &Path) -> Result<(usize, usize, bool), St
     }
 
     Ok((original_len, minimized_len, reproduces))
+}
+
+/// Shrink `testcase` while it keeps reproducing the recorded oracle finding,
+/// then drive the minimized sequence once more for fresh evidence. Returns the
+/// original message count, that final [`SessionRun`], and whether the minimized
+/// sequence still reproduces the recorded oracle.
+///
+/// `make_transport` yields a *freshly reset* transport per drive, so the
+/// dynamic binding is re-resolved and the computed fields re-repaired on every
+/// candidate. Factoring the transport out keeps the oracle-gating logic
+/// testable against an in-memory transport instead of a live socket.
+fn minimize_session_core<T, F>(
+    model: &ProtocolModel,
+    testcase: &SessionTestcase,
+    meta: &SessionArtifactMeta,
+    mut make_transport: F,
+) -> Result<(usize, SessionRun, bool), String>
+where
+    T: SessionTransport,
+    F: FnMut() -> Result<T, String>,
+{
+    let runner = SessionRunner::new(model);
+    let original_len = testcase.messages.len();
+
+    // Baseline: the recorded session must still reproduce the SAME recorded
+    // oracle before we minimize it.
+    {
+        let mut transport = make_transport()?;
+        let run = runner
+            .replay(testcase, &mut transport)
+            .map_err(|e| format!("baseline replay: {e}"))?;
+        if !verdict_reproduces(&run.verdict, meta) {
+            return Err(
+                "the recorded session no longer reproduces; refusing to minimize".to_owned(),
+            );
+        }
+    }
+
+    // Each predicate candidate re-drives on a fresh transport (fresh handle),
+    // and only a finding for the RECORDED oracle counts as still reproducing —
+    // a smaller sequence that trips a different oracle must not be accepted.
+    let predicate = |candidate: &SessionTestcase| -> bool {
+        let Ok(mut transport) = make_transport() else {
+            return false;
+        };
+        runner
+            .replay(candidate, &mut transport)
+            .map(|run| verdict_reproduces(&run.verdict, meta))
+            .unwrap_or(false)
+    };
+    let minimized = runner.minimize(testcase, predicate);
+
+    // Re-drive the minimized testcase once to capture its fresh evidence.
+    let mut transport = make_transport()?;
+    let run = runner
+        .replay(&minimized, &mut transport)
+        .map_err(|e| format!("drive minimized session: {e}"))?;
+    let reproduces = verdict_reproduces(&run.verdict, meta);
+    Ok((original_len, run, reproduces))
 }
 
 // ---------------------------------------------------------------------------
@@ -1384,5 +1439,224 @@ mod tests {
         assert!(Profile::from_toml(&meta.profile_toml).is_ok());
 
         std::fs::remove_dir_all(&work_dir).ok();
+    }
+
+    // --- multi-oracle replay/minimize must honor the RECORDED oracle ---------
+    //
+    // A profile with two oracles over the same WRITE reply: O1 (status 0xE1) is
+    // the real bug and only fires when a BUMP sits between OPEN and WRITE; O2
+    // (status 0xE2) fires on a bare OPEN,WRITE. Replay/minimize of an O1 finding
+    // must not treat an O2 firing as a reproduction.
+    const MULTI_ORACLE: &str = r#"
+schema = "bhf.protocol.v1"
+start = "start"
+transport = "tcp:127.0.0.1:0"
+
+[[message]]
+name = "OPEN"
+[[message.field]]
+name = "op"
+type = "u8"
+value = 1
+[message.response]
+[[message.response.capture]]
+name = "ostatus"
+type = "u8"
+at = 0
+
+[[message]]
+name = "BUMP"
+[[message.field]]
+name = "op"
+type = "u8"
+value = 2
+[message.response]
+[[message.response.capture]]
+name = "bstatus"
+type = "u8"
+at = 0
+
+[[message]]
+name = "WRITE"
+[[message.field]]
+name = "op"
+type = "u8"
+value = 3
+[message.response]
+[[message.response.capture]]
+name = "wstatus"
+type = "u8"
+at = 0
+
+[[transition]]
+from = "start"
+send = "OPEN"
+to = "opened"
+[[transition]]
+from = "opened"
+send = "BUMP"
+to = "opened"
+[[transition]]
+from = "opened"
+send = "WRITE"
+to = "opened"
+
+[[oracle]]
+name = "O1"
+rule_id = "R1"
+message = "WRITE"
+response_field = "wstatus"
+equals = 225
+
+[[oracle]]
+name = "O2"
+rule_id = "R2"
+message = "WRITE"
+response_field = "wstatus"
+equals = 226
+"#;
+
+    /// An in-memory service for the multi-oracle profile. A WRITE returns the
+    /// O1 status (0xE1) only when a BUMP preceded it this session; otherwise it
+    /// returns the O2 status (0xE2). OPEN/BUMP return non-oracle status bytes.
+    struct MultiOracleService {
+        bumped: bool,
+    }
+
+    impl MultiOracleService {
+        fn new() -> Self {
+            Self { bumped: false }
+        }
+    }
+
+    impl SessionTransport for MultiOracleService {
+        fn send_request(&mut self, req: &[u8]) -> Result<Vec<u8>, TransportError> {
+            match req.first().copied() {
+                Some(1) => Ok(vec![0x10]),
+                Some(2) => {
+                    self.bumped = true;
+                    Ok(vec![0x20])
+                }
+                Some(3) => Ok(vec![if self.bumped { 0xE1 } else { 0xE2 }]),
+                _ => Ok(vec![0x01]),
+            }
+        }
+
+        fn reset(&mut self) -> Result<(), TransportError> {
+            self.bumped = false;
+            Ok(())
+        }
+    }
+
+    fn multi_oracle_model() -> ProtocolModel {
+        ProtocolModel::from_profile(&Profile::from_toml(MULTI_ORACLE).expect("parse"))
+            .expect("compile")
+    }
+
+    fn multi_oracle_meta(
+        model: &ProtocolModel,
+        oracle: &str,
+        rule_id: &str,
+    ) -> SessionArtifactMeta {
+        SessionArtifactMeta {
+            schema: SESSION_ARTIFACT_SCHEMA.to_owned(),
+            profile_sha256: model.profile_sha256().to_owned(),
+            profile_toml: MULTI_ORACLE.to_owned(),
+            transport: "scripted".to_owned(),
+            transport_kind: "scripted".to_owned(),
+            reset: "reconnect".to_owned(),
+            reset_fidelity: "scripted;reset=reconnect".to_owned(),
+            rule_id: Some(rule_id.to_owned()),
+            oracle: oracle.to_owned(),
+        }
+    }
+
+    fn instance(model: &ProtocolModel, name: &str) -> protocol_session::MessageInstance {
+        protocol_session::MessageInstance::from_seed(model.message(name).expect(name))
+    }
+
+    fn session_of(model: &ProtocolModel, names: &[&str]) -> SessionTestcase {
+        SessionTestcase::from_messages(
+            model.profile_sha256(),
+            names.iter().map(|n| instance(model, n)).collect(),
+        )
+    }
+
+    #[test]
+    fn replay_requires_the_recorded_oracle_not_just_any_finding() {
+        let model = multi_oracle_model();
+        let meta = multi_oracle_meta(&model, "O1", "R1");
+
+        // Recorded as O1, but re-driven without the BUMP the WRITE trips O2.
+        // A different oracle firing must NOT count as reproducing the O1 finding.
+        let drifted = session_of(&model, &["OPEN", "WRITE"]);
+        let mut svc = MultiOracleService::new();
+        assert!(
+            !replay_reproduces(&model, &drifted, &meta, &mut svc).unwrap(),
+            "O2 firing must not falsely confirm an O1 finding"
+        );
+
+        // Control: the O1-triggering sequence does still reproduce O1.
+        let faithful = session_of(&model, &["OPEN", "BUMP", "WRITE"]);
+        let mut svc = MultiOracleService::new();
+        assert!(
+            replay_reproduces(&model, &faithful, &meta, &mut svc).unwrap(),
+            "the recorded O1 sequence must still reproduce O1"
+        );
+
+        // And if the recorded oracle really were O2, the drifted sequence is a
+        // faithful reproduction — the gate is on identity, not strictness.
+        let meta_o2 = multi_oracle_meta(&model, "O2", "R2");
+        let mut svc = MultiOracleService::new();
+        assert!(
+            replay_reproduces(&model, &drifted, &meta_o2, &mut svc).unwrap(),
+            "OPEN,WRITE legitimately reproduces an O2 finding"
+        );
+    }
+
+    #[test]
+    fn minimize_preserves_the_recorded_oracles_structure() {
+        let model = multi_oracle_model();
+        let meta = multi_oracle_meta(&model, "O1", "R1");
+
+        // The O1 repro depends on the BUMP between OPEN and WRITE. Dropping it
+        // leaves OPEN,WRITE, which trips O2 — an any-finding predicate would
+        // happily shrink the BUMP away. Gating on the recorded oracle keeps it.
+        let recorded = session_of(&model, &["OPEN", "BUMP", "WRITE"]);
+
+        let (original_len, run, reproduces) =
+            minimize_session_core(&model, &recorded, &meta, || {
+                Ok::<_, String>(MultiOracleService::new())
+            })
+            .unwrap();
+
+        assert_eq!(original_len, 3);
+        assert!(reproduces, "the minimized sequence still reproduces O1");
+        assert_eq!(
+            run.testcase.message_names(),
+            vec!["OPEN", "BUMP", "WRITE"],
+            "minimize must keep the BUMP O1 depends on, not collapse to the O2 sequence"
+        );
+        assert!(
+            matches!(&run.verdict, SessionVerdict::Finding { oracle, .. } if oracle == "O1"),
+            "the preserved reproduction must be O1, got {:?}",
+            run.verdict
+        );
+    }
+
+    #[test]
+    fn minimize_refuses_when_the_recorded_oracle_no_longer_reproduces() {
+        let model = multi_oracle_model();
+        // Recorded as O1, but the only sequence we hand minimize reproduces O2.
+        let meta = multi_oracle_meta(&model, "O1", "R1");
+        let drifted = session_of(&model, &["OPEN", "WRITE"]);
+        let err = minimize_session_core(&model, &drifted, &meta, || {
+            Ok::<_, String>(MultiOracleService::new())
+        })
+        .unwrap_err();
+        assert!(
+            err.contains("no longer reproduces"),
+            "baseline must refuse to minimize a non-reproducing O1 finding, got {err:?}"
+        );
     }
 }

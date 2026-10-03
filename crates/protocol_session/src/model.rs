@@ -439,8 +439,9 @@ fn compile_data_spec(
                     field: def.name.clone(),
                 });
             }
+            let width = enum_width(message, &def.name, def.width, &variants)?;
             DataSpec::Enum {
-                width: width_for_codes(variants.values().copied()),
+                width,
                 endian,
                 variants,
             }
@@ -578,8 +579,9 @@ fn compile_capture(
                     message: message.to_owned(),
                     field: def.name.clone(),
                 })?;
+            let width = enum_width(message, &def.name, def.width, &variants)?;
             CaptureSpec::Enum {
-                width: width_for_codes(variants.values().copied()),
+                width,
                 endian,
                 variants,
             }
@@ -704,6 +706,12 @@ fn lower_data_field(name: &str, spec: &DataSpec, value: &FieldValue) -> Result<F
                     field: name.to_owned(),
                     symbol: symbol.clone(),
                 })?;
+            if code > width_max(*width) {
+                return Err(EncodeError::ValueTooWide {
+                    field: name.to_owned(),
+                    value: code,
+                });
+            }
             Ok(Field::bytes(name, encode_uint(*width, *endian, code)))
         }
         (
@@ -865,6 +873,28 @@ pub(crate) fn width_for_codes(codes: impl Iterator<Item = u64>) -> IntWidth {
         IntWidth::U16
     } else {
         IntWidth::U32
+    }
+}
+
+/// Resolve an enum field/capture's wire width: an explicit profile `width`
+/// override (restricted to `u8`/`u16`/`u32`) when present, else the width
+/// inferred from the largest variant code. The override lets an enum occupy a
+/// field wider than its codes imply without shifting the fields that follow;
+/// a too-large variant code is still rejected at encode time by the Enum arm's
+/// `ValueTooWide` guard, exactly as for a plain integer field.
+fn enum_width(
+    message: &str,
+    field: &str,
+    override_ty: Option<FieldType>,
+    variants: &BTreeMap<String, u64>,
+) -> Result<IntWidth, ModelError> {
+    match override_ty {
+        Some(ty) => int_width(ty).ok_or_else(|| ModelError::IllegalFieldType {
+            message: message.to_owned(),
+            field: field.to_owned(),
+            reason: "enum width override must be u8, u16, or u32".to_owned(),
+        }),
+        None => Ok(width_for_codes(variants.values().copied())),
     }
 }
 
@@ -1114,6 +1144,124 @@ to = "ready"
         assert!(
             matches!(err, ModelError::ReservedStateName { .. }),
             "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn enum_width_override_widens_the_wire_field() {
+        // The codes fit in a single byte (0, 1) — the inferred width would be
+        // u8 — but the profile pins the wire width to u32, so the enum occupies
+        // four bytes instead of under-sizing and shifting the fields after it.
+        let src = r#"
+schema = "bhf.protocol.v1"
+start = "s"
+[[message]]
+name = "M"
+[[message.field]]
+name = "mode"
+type = "enum"
+width = "u32"
+variants = { read = 0, write = 1 }
+"#;
+        let model =
+            ProtocolModel::from_profile(&Profile::from_toml(src).expect("parse")).expect("compile");
+        let m = model.message("M").expect("M");
+        let frame = m
+            .build_frame(&m.seed_values(), &Bindings::new())
+            .expect("encode M");
+        let span = frame.span("mode").expect("mode span");
+        assert_eq!(
+            span.len(),
+            4,
+            "explicit width=u32 pins the enum to four wire bytes, not the one its code implies"
+        );
+        // The seed picks the lowest-code variant ("read" = 0) => four zero bytes.
+        assert_eq!(&frame.bytes()[span], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn inferred_enum_width_still_tracks_the_largest_code() {
+        // Without an override, a code needing two bytes infers u16.
+        let src = r#"
+schema = "bhf.protocol.v1"
+start = "s"
+[[message]]
+name = "M"
+[[message.field]]
+name = "mode"
+type = "enum"
+variants = { a = 0, b = 256 }
+"#;
+        let model =
+            ProtocolModel::from_profile(&Profile::from_toml(src).expect("parse")).expect("compile");
+        let m = model.message("M").expect("M");
+        let mut values = m.seed_values();
+        values.insert(
+            "mode".to_owned(),
+            FieldValue::Enum {
+                symbol: "b".to_owned(),
+            },
+        );
+        let frame = m.build_frame(&values, &Bindings::new()).expect("encode M");
+        let span = frame.span("mode").expect("mode span");
+        assert_eq!(span.len(), 2, "code 256 infers a u16 wire field");
+        assert_eq!(&frame.bytes()[span], &256u16.to_be_bytes());
+    }
+
+    #[test]
+    fn enum_width_override_rejects_a_non_integer_width() {
+        let src = r#"
+schema = "bhf.protocol.v1"
+start = "s"
+[[message]]
+name = "M"
+[[message.field]]
+name = "mode"
+type = "enum"
+width = "bytes"
+variants = { read = 0 }
+"#;
+        let err =
+            ProtocolModel::from_profile(&Profile::from_toml(src).expect("parse")).unwrap_err();
+        assert!(
+            matches!(err, ModelError::IllegalFieldType { ref field, .. } if field == "mode"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn enum_variant_code_wider_than_u32_is_rejected_not_truncated() {
+        // The widest wire field is u32; a variant code above u32::MAX cannot be
+        // represented. The Enum encode arm must error (as the Int arm does)
+        // rather than silently truncating 0x1_0000_0000 down to 0.
+        let src = r#"
+schema = "bhf.protocol.v1"
+start = "s"
+[[message]]
+name = "M"
+[[message.field]]
+name = "mode"
+type = "enum"
+variants = { ok = 0, huge = 4294967296 }
+"#;
+        let model =
+            ProtocolModel::from_profile(&Profile::from_toml(src).expect("parse")).expect("compile");
+        let m = model.message("M").expect("M");
+        let mut values = m.seed_values();
+        values.insert(
+            "mode".to_owned(),
+            FieldValue::Enum {
+                symbol: "huge".to_owned(),
+            },
+        );
+        let err = m.build_frame(&values, &Bindings::new()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EncodeError::ValueTooWide { ref field, value }
+                    if field == "mode" && value == 4_294_967_296
+            ),
+            "the oversized variant code must surface as ValueTooWide, got {err:?}"
         );
     }
 }

@@ -222,6 +222,18 @@
   removes `results/report/`.
 
 ### Fixed
+- **Protocol-session replay/minimize honor the recorded oracle** (`bhf replay`/`bhf minimize`,
+  #58): under a multi-oracle profile (`[[oracle]]` is a list) a session recorded for oracle
+  `O1` could be "reproduced" — or minimized — via a *different* oracle `O2` firing, falsely
+  confirming `O1` and letting delta-debugging shrink away the very structure `O1` depends on.
+  Replay and minimize now require the re-driven session to fire the SAME recorded oracle (by
+  name and `rule_id`), not merely *some* finding.
+- **Explicit enum wire width + overflow guard** (`bhf.protocol.v1`, #58): an `enum` field (and
+  response capture) may now set an explicit `width = "u8"|"u16"|"u32"`; when absent the width is
+  still inferred from the largest variant code, but an enum that must occupy a wider wire field
+  than its codes imply no longer under-sizes and shifts the fields after it. A variant code that
+  exceeds the resolved width now errors with `ValueTooWide` at encode time (mirroring the integer
+  arm) instead of silently truncating.
 - **Relational executor robustness** (`bhf relational`, #61): the per-profile spawn now
   feeds stdin and drains stdout/stderr on dedicated threads concurrently with the wait
   loop, so a target that streams more than a pipe buffer of output — or never reads its
