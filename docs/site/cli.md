@@ -1154,13 +1154,35 @@ require = { kind = "subset", set = "viewer.spawned", of = "viewer.allowlist" }
 Predicate relations: `status_relation` (a profile's derived status must match),
 `subset` (an observed target set must be within a declared allowlist),
 `equal` / `differ` (selector values across profiles must be equal / must differ),
-and `external` (an out-of-process comparator seam — until one is wired it reports
-*inconclusive* rather than fabricating a verdict). Selectors read `profile.field`
-where field is one of `spawned`, `allowlist`, `status`, `response`, `edges`.
+and `external` (a trusted out-of-process comparator decides the relation over the
+whole cross-profile observation bundle). Selectors read `profile.field` where
+field is one of `spawned`, `allowlist`, `status`, `response`, `edges`.
+
+**External comparator.** An `external` predicate names a comparator by the path of
+a `bhf.extension-manifest.v1` manifest — the same explicit-load trust boundary as
+`bhf extension` and `bhf project` (there is no auto-discovery):
+
+```toml
+[[predicates]]
+rule = "a trusted comparator decides the cross-profile relation"
+require = { kind = "external", comparator = "comparators/authz.toml" }
+```
+
+The driver spawns and negotiates the comparator up front (a manifest that does not
+load fails the run), then for each testcase serializes the **secret-redacted**
+cross-profile observation bundle and drives `oracle.evaluate` over the `bhf.extension.v1`
+protocol. The comparator's verdict maps to a real outcome: `ok → compliant`,
+`finding → violation` (a `BHF-312` finding that carries the comparator's own
+signature and classification plus the comparator executable/config SHA-256 and
+protocol version as provenance), and `unsupported` / `reject` / any bounded
+infrastructure fault → `policy_unknown` — never a fabricated verdict, and always
+distinct from a setup/auth/missing-observation outcome. Resolved secrets are
+scrubbed before the bundle is sent and never appear in a finding or replay bundle.
 
 **What a finding records.** Each violation becomes a finding
 (`BHF-308` unexpected authorization, `BHF-309` allowlist escape,
-`BHF-310` unexpected equivalence, `BHF-311` unexpected divergence) carrying the
+`BHF-310` unexpected equivalence, `BHF-311` unexpected divergence,
+`BHF-312` external-comparator violation) carrying the
 violated relation, the involved profiles, each profile's normalized observation,
 the testcase, the evidence event(s), and the policy + per-profile hashes. The
 persisted shape mirrors every other finding kind, so SARIF /

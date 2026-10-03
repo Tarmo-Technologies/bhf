@@ -39,9 +39,15 @@ use serde_json::json;
 
 use relational::redact::{self, SecretResolution};
 use relational::{
-    minimize as rel_minimize, replay as rel_replay, run_campaign, sha256_hex, CampaignOptions,
-    CollectorKind, EffectEvent, EffectKind, EnvValue, ExecError, Profile, ProfileExecutor,
-    ProfileRun, RelationFinding, RelationalConfig, RunState, SemanticHit, SemanticVerdict,
+    minimize_with as rel_minimize, replay_with as rel_replay, run_campaign_with, sha256_hex,
+    CampaignOptions, CollectorKind, ComparatorVerdict, EffectEvent, EffectKind, EnvValue,
+    ExecError, ExternalComparator, ExternalFinding, ExternalProvenance, Observation, Profile,
+    ProfileExecutor, ProfileRun, RelationFinding, RelationalConfig, Require, RunState, SemanticHit,
+    SemanticVerdict,
+};
+
+use extension_host::{
+    CaseId, EvaluateOutcome, ExtensionClient, ExtensionManifest, FindingResult, InfraFailure,
 };
 
 use crate::auto::runtrace::{self, RuntraceEvent};
@@ -193,6 +199,12 @@ fn run_campaign_cmd(a: RunArgs) -> Result<i32> {
         Duration::from_secs(a.timeout_secs),
         config.secret_prefix.clone(),
     );
+    // The External-predicate comparator: spawn + negotiate every trusted
+    // comparator extension up front so a bad manifest fails the run here (the
+    // explicit-load trust boundary), then reuse the live clients across cases.
+    let mut comparator = ExtensionComparator::new(&config, campaign_name(&work_dir));
+    comparator.preflight(&config)?;
+
     let opts = CampaignOptions {
         max_execs: a.max_execs,
         max_len: a.max_len,
@@ -202,7 +214,7 @@ fn run_campaign_cmd(a: RunArgs) -> Result<i32> {
 
     let producer = results::ProducerRun::begin(&work_dir, "relational", std::env::args().collect());
 
-    let report = run_campaign(&config, &seeds, &mut executor, &opts)
+    let report = run_campaign_with(&config, &seeds, &mut executor, &mut comparator, &opts)
         .map_err(|error| anyhow!("relational campaign failed: {error}"))?;
 
     let resolution = executor.secret_resolution();
@@ -210,7 +222,7 @@ fn run_campaign_cmd(a: RunArgs) -> Result<i32> {
 
     let o = &report.outcomes;
     crate::bhfeprintln!(
-        "relational: {} execs, {} corpus, {} findings | outcomes setup={} auth={} missing={} unknown={} compliant={} violation={} inconclusive={}",
+        "relational: {} execs, {} corpus, {} findings | outcomes setup={} auth={} missing={} unknown={} compliant={} violation={}",
         report.execs,
         report.corpus_size,
         written,
@@ -220,7 +232,6 @@ fn run_campaign_cmd(a: RunArgs) -> Result<i32> {
         o.policy_unknown,
         o.compliant,
         o.violation,
-        o.inconclusive,
     );
 
     let exit_code = i32::from(written > 0);
@@ -288,8 +299,18 @@ fn replay_cmd(a: ReplayArgs) -> Result<i32> {
         Duration::from_secs(a.timeout_secs),
         config.secret_prefix.clone(),
     );
-    let result = rel_replay(&loaded.finding, &config, &loaded.input, &mut executor)
-        .map_err(|error| anyhow!("relational replay failed: {error}"))?;
+    // Lazily reuses any trusted comparator the finding's relation references; a
+    // comparator that no longer loads yields a bounded Unknown (not reproduced),
+    // never a fabricated verdict.
+    let mut comparator = ExtensionComparator::new(&config, campaign_name(&loaded.dir));
+    let result = rel_replay(
+        &loaded.finding,
+        &config,
+        &loaded.input,
+        &mut executor,
+        &mut comparator,
+    )
+    .map_err(|error| anyhow!("relational replay failed: {error}"))?;
 
     // Build a redacted replay bundle (no resolved secret ever persisted).
     let resolution = executor.secret_resolution();
@@ -333,8 +354,15 @@ fn minimize_cmd(a: MinimizeArgs) -> Result<i32> {
         Duration::from_secs(a.timeout_secs),
         config.secret_prefix.clone(),
     );
-    let result = rel_minimize(&loaded.finding, &config, &loaded.input, &mut executor)
-        .map_err(|error| anyhow!("relational minimize failed: {error}"))?;
+    let mut comparator = ExtensionComparator::new(&config, campaign_name(&loaded.dir));
+    let result = rel_minimize(
+        &loaded.finding,
+        &config,
+        &loaded.input,
+        &mut executor,
+        &mut comparator,
+    )
+    .map_err(|error| anyhow!("relational minimize failed: {error}"))?;
 
     fs::write(loaded.dir.join("testcase.min.bin"), &result.input)
         .context("write minimized testcase")?;
@@ -448,6 +476,253 @@ fn scratch_under(finding_dir: &Path, tag: &str) -> PathBuf {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     finding_dir.join(format!(".relational-{tag}-{nonce}"))
+}
+
+// ---------------------------------------------------------------------------
+// The real External-predicate comparator (trusted extension over the bundle)
+// ---------------------------------------------------------------------------
+
+/// A stable campaign id for a relational run (the work/finding dir's name).
+fn campaign_name(dir: &Path) -> String {
+    dir.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "relational".to_string())
+}
+
+/// The driver-side [`ExternalComparator`]. For an `External` predicate whose
+/// `comparator` names a trusted `bhf.extension-manifest.v1` manifest, it spawns
+/// and negotiates the extension (explicit load = the trust boundary) and drives
+/// `oracle.evaluate` with the serialized, secret-redacted cross-profile
+/// observation bundle. `ok → Clean`, `finding → Finding`, and
+/// `reject`/`unsupported`/bounded-infrastructure → `Unknown`. The comparator exe
+/// + config hashes and the protocol version are recorded in the finding.
+struct ExtensionComparator {
+    campaign: String,
+    /// Resolved secret values, used ONLY to redact the bundle before it is sent;
+    /// never persisted and never transmitted.
+    secrets: SecretResolution,
+    /// One supervised extension per distinct comparator manifest path, spawned on
+    /// first use and reused across cases. `Err` caches a spawn/handshake failure
+    /// so a broken comparator yields a bounded `Unknown`, not repeated spawns.
+    clients: BTreeMap<String, Result<ExtensionClient, String>>,
+    case_counter: u64,
+}
+
+impl ExtensionComparator {
+    fn new(config: &RelationalConfig, campaign: String) -> Self {
+        // Resolve the declared secret refs once from the local lab source so the
+        // bundle can be scrubbed before it is handed to the comparator. This is a
+        // read-only redaction aid: resolved values are never sent or persisted.
+        let mut secrets = SecretResolution::new();
+        for profile in &config.profiles {
+            for value in profile.env.values() {
+                if let EnvValue::SecretRef(reference) = value {
+                    if let Some(resolved) = resolve_secret(reference, &config.secret_prefix) {
+                        secrets.insert(reference.clone(), resolved);
+                    }
+                }
+            }
+        }
+        Self {
+            campaign,
+            secrets,
+            clients: BTreeMap::new(),
+            case_counter: 0,
+        }
+    }
+
+    /// The distinct comparator manifest paths the config's External predicates name.
+    fn comparator_paths(config: &RelationalConfig) -> Vec<String> {
+        let mut set = std::collections::BTreeSet::new();
+        for pred in &config.predicates {
+            if let Require::External { comparator } = &pred.require {
+                set.insert(comparator.clone());
+            }
+        }
+        set.into_iter().collect()
+    }
+
+    /// Eagerly load + spawn every comparator the config references so a bad
+    /// manifest fails the command up front (the explicit-load trust boundary).
+    fn preflight(&mut self, config: &RelationalConfig) -> Result<()> {
+        for path in Self::comparator_paths(config) {
+            self.client_for(&path)
+                .map_err(|reason| anyhow!("load external comparator {path:?}: {reason}"))?;
+        }
+        Ok(())
+    }
+
+    /// Get-or-spawn the supervised client for `comparator`. Caches success and
+    /// failure alike.
+    fn client_for(
+        &mut self,
+        comparator: &str,
+    ) -> std::result::Result<&mut ExtensionClient, String> {
+        if !self.clients.contains_key(comparator) {
+            let spawned = spawn_comparator(comparator).map_err(|e| e.to_string());
+            self.clients.insert(comparator.to_string(), spawned);
+        }
+        match self.clients.get_mut(comparator).expect("inserted above") {
+            Ok(client) => Ok(client),
+            Err(reason) => Err(reason.clone()),
+        }
+    }
+}
+
+impl ExternalComparator for ExtensionComparator {
+    fn compare(
+        &mut self,
+        comparator: &str,
+        bundle: &BTreeMap<String, Observation>,
+    ) -> ComparatorVerdict {
+        // Redact every resolved secret from the bundle before it leaves bhf.
+        let input = match redacted_bundle_bytes(bundle, &self.secrets) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return ComparatorVerdict::Unknown {
+                    reason: format!("serialize observation bundle: {error}"),
+                };
+            }
+        };
+        let digest: String = sha256_hex(&input).chars().take(16).collect();
+        let case = CaseId::new(
+            self.campaign.clone(),
+            "relational",
+            format!("{:010}-{digest}", self.case_counter),
+        );
+        self.case_counter += 1;
+
+        let client = match self.client_for(comparator) {
+            Ok(client) => client,
+            Err(reason) => {
+                return ComparatorVerdict::Unknown {
+                    reason: format!("external comparator {comparator:?} unavailable: {reason}"),
+                };
+            }
+        };
+        // Capture provenance (exe/config hash + protocol version) before the call.
+        let provenance = external_provenance(client);
+        let outcome = match client.evaluate(&case, &input) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return ComparatorVerdict::Unknown {
+                    reason: format!("external comparator transport error: {error}"),
+                };
+            }
+        };
+        match outcome {
+            EvaluateOutcome::Ok => ComparatorVerdict::Clean,
+            EvaluateOutcome::Finding(finding) => {
+                ComparatorVerdict::Finding(external_finding_from(comparator, &finding, provenance))
+            }
+            EvaluateOutcome::Reject { detail } => ComparatorVerdict::Unknown {
+                reason: format!(
+                    "comparator rejected the bundle: {}",
+                    detail.unwrap_or_default()
+                ),
+            },
+            EvaluateOutcome::Unsupported { detail } => ComparatorVerdict::Unknown {
+                reason: format!("comparator unsupported: {}", detail.unwrap_or_default()),
+            },
+            EvaluateOutcome::Infrastructure(failure) => ComparatorVerdict::Unknown {
+                reason: format!(
+                    "comparator infrastructure fault: {}",
+                    infra_reason(&failure)
+                ),
+            },
+        }
+    }
+}
+
+/// Load the named comparator manifest (explicit-load trust boundary) and spawn +
+/// handshake the extension.
+fn spawn_comparator(comparator: &str) -> extension_host::Result<ExtensionClient> {
+    let manifest_path = Path::new(comparator);
+    let manifest = ExtensionManifest::load(manifest_path)?;
+    ExtensionClient::from_manifest(&manifest, manifest_path)
+}
+
+/// Snapshot the comparator extension's provenance for the relational finding.
+fn external_provenance(client: &ExtensionClient) -> ExternalProvenance {
+    let p = client.provenance();
+    ExternalProvenance {
+        executable_sha256: p.executable_sha256.clone(),
+        config_sha256: p.config_sha256.clone(),
+        protocol_version: p.protocol_version.clone(),
+        negotiated_caps: p.negotiated_caps.clone(),
+    }
+}
+
+/// Fold an extension `FindingResult` into the relational [`ExternalFinding`]. The
+/// comparator signature mirrors the host's stable extension-finding signature
+/// (sha256 over the ordered `signature_inputs`, 0x1f-separated, "extension"-tagged)
+/// so an identical comparator verdict reproduces the identical signature.
+fn external_finding_from(
+    comparator: &str,
+    finding: &FindingResult,
+    provenance: ExternalProvenance,
+) -> ExternalFinding {
+    let mut buf = b"extension".to_vec();
+    for part in &finding.signature_inputs {
+        buf.push(0x1f);
+        buf.extend_from_slice(part.as_bytes());
+    }
+    let detail = finding
+        .evidence
+        .iter()
+        .find(|e| e.key == "reason")
+        .map(|e| e.value.clone())
+        .or_else(|| {
+            finding
+                .evidence
+                .first()
+                .map(|e| format!("{}={}", e.key, e.value))
+        });
+    ExternalFinding {
+        comparator: comparator.to_string(),
+        signature: sha256_hex(&buf),
+        classification: finding.classification.clone(),
+        detail,
+        provenance: Some(provenance),
+    }
+}
+
+/// Serialize the cross-profile observation bundle with every resolved secret
+/// scrubbed first, so nothing sensitive is ever handed to the comparator.
+fn redacted_bundle_bytes(
+    bundle: &BTreeMap<String, Observation>,
+    secrets: &SecretResolution,
+) -> Result<Vec<u8>> {
+    let mut redacted = bundle.clone();
+    for obs in redacted.values_mut() {
+        redact::redact_events(&mut obs.events, secrets);
+        if let Some(digest) = &obs.response_digest {
+            obs.response_digest = Some(redact::redact_text(digest, secrets));
+        }
+        for hit in &mut obs.semantic_hits {
+            hit.detail = redact::redact_text(&hit.detail, secrets);
+        }
+    }
+    Ok(serde_json::to_vec(&redacted)?)
+}
+
+/// A compact human reason for a bounded extension infrastructure fault.
+fn infra_reason(failure: &InfraFailure) -> String {
+    match failure {
+        InfraFailure::Timeout { after } => format!("timeout after {after:?}"),
+        InfraFailure::Crashed { status, signal } => {
+            format!("extension crashed (status={status:?}, signal={signal:?})")
+        }
+        InfraFailure::FrameTooLarge { declared, cap } => {
+            format!("oversized frame (declared={declared}, cap={cap})")
+        }
+        InfraFailure::Protocol { detail } => format!("protocol: {detail}"),
+        InfraFailure::CaseMismatch { .. } => "response case identity mismatch".to_string(),
+        InfraFailure::ExtensionReported { detail } => detail
+            .clone()
+            .unwrap_or_else(|| "extension-reported error".to_string()),
+    }
 }
 
 // ---------------------------------------------------------------------------

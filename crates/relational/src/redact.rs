@@ -134,6 +134,14 @@ pub fn redact_finding(finding: &mut RelationFinding, resolution: &SecretResoluti
     for obs in finding.observations.values_mut() {
         redact_observation(obs, resolution);
     }
+    // An external-comparator finding's human detail could echo bundle content;
+    // scrub any resolved secret from it too (the comparator is sent only the
+    // already-redacted bundle, so this is defence in depth).
+    if let Some(external) = &mut finding.external {
+        if let Some(detail) = &external.detail {
+            external.detail = Some(redact_text(detail, resolution));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -206,6 +214,7 @@ require = { kind = "subset", set = "viewer.spawned", of = "viewer.allowlist" }
             profiles: vec!["viewer".to_string()],
             evidence: vec![EffectEvent::process_exec("execve", "launch s3cr3t helper")],
             predicate: cfg.predicates[0].clone(),
+            external: None,
         };
         let mut finding = RelationFinding::from_violation(1, &v, &cfg, &obs, "abc");
 

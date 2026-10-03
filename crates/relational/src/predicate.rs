@@ -15,30 +15,69 @@
 //!   undecidable (e.g. a status that could not be classified);
 //! * [`RelationOutcome::Compliant`] when the relation holds (or its guard is not
 //!   met);
-//! * [`RelationOutcome::Violation`] when the relation is broken;
-//! * [`RelationOutcome::Inconclusive`] for the external-comparator seam.
+//! * [`RelationOutcome::Violation`] when the relation is broken.
 //!
 //! The six run/eval outcomes stay mutually distinct (acceptance: setup / auth /
 //! missing-observation / policy-unknown / compliance / violation).
+//!
+//! The [`Require::External`] relation is decided by an injected
+//! [`ExternalComparator`]: its [`ComparatorVerdict`] maps `Clean → Compliant`,
+//! `Finding → Violation` (carrying the comparator's signature/classification into
+//! the finding) and `Unknown → PolicyUnknown`. The crate is pure; the real,
+//! process-spawning comparator lives in the driver and is passed in at the seam.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use crate::finding::FindingKind;
-use crate::observation::{EffectEvent, Observation, ProfileStatus, Stream};
+use crate::finding::{ExternalFinding, FindingKind};
+use crate::observation::{EffectEvent, Observation, ProfileStatus, RunState, Stream};
 use crate::schema::{Cond, Field, Predicate, RelationalConfig, Require, Selector};
 
-/// A tri-state the external comparator seam would return once wired. Until then
-/// [`Require::External`] evaluates to [`RelationOutcome::Inconclusive`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExternalVerdict {
-    /// The comparator found no violation.
+/// The verdict a [`ExternalComparator`] returns for one relation's cross-profile
+/// observation bundle. `Finding` carries the comparator's own stable identity so
+/// it can be folded into the relational finding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComparatorVerdict {
+    /// The comparator found no violation → [`RelationOutcome::Compliant`].
     Clean,
-    /// The comparator found a violation.
-    Finding,
-    /// The comparator could not decide.
-    Unknown,
+    /// The comparator found a violation → [`RelationOutcome::Violation`].
+    Finding(ExternalFinding),
+    /// The comparator could not decide → [`RelationOutcome::PolicyUnknown`].
+    Unknown {
+        /// Why the comparator could not decide (e.g. an unsupported/bounded
+        /// infrastructure result from the extension).
+        reason: String,
+    },
+}
+
+/// Decides the [`Require::External`] relation over a cross-profile observation
+/// bundle. Implemented by the driver with a real (process-spawning) extension;
+/// the crate stays pure and never performs I/O itself.
+pub trait ExternalComparator {
+    /// Compare the full cross-profile observation `bundle` for an `External`
+    /// predicate whose named `comparator` selects the trusted comparator.
+    fn compare(
+        &mut self,
+        comparator: &str,
+        bundle: &BTreeMap<String, Observation>,
+    ) -> ComparatorVerdict;
+}
+
+/// A comparator for when none is wired: every `External` predicate is undecidable
+/// ([`RelationOutcome::PolicyUnknown`]) rather than silently compliant. Used by
+/// the no-comparator [`evaluate`]/[`evaluate_one`] convenience entry points.
+pub struct NoComparator;
+
+impl ExternalComparator for NoComparator {
+    fn compare(
+        &mut self,
+        comparator: &str,
+        _bundle: &BTreeMap<String, Observation>,
+    ) -> ComparatorVerdict {
+        ComparatorVerdict::Unknown {
+            reason: format!("no external comparator wired for {comparator:?}"),
+        }
+    }
 }
 
 /// A violated relation, with everything needed to build a finding.
@@ -51,10 +90,15 @@ pub struct Violation {
     /// The involved profile names.
     pub profiles: Vec<String>,
     /// The evidence events proving the violation (may be empty for value-only
-    /// divergence/equivalence violations).
+    /// divergence/equivalence violations, and for an external-comparator finding
+    /// it is the involved profiles' events as context).
     pub evidence: Vec<EffectEvent>,
     /// The violated predicate.
     pub predicate: Predicate,
+    /// For a [`Require::External`] violation, the comparator's verdict payload
+    /// (signature, classification, trusted-extension provenance). `None` for
+    /// every built-in relation kind.
+    pub external: Option<ExternalFinding>,
 }
 
 /// The outcome of evaluating one predicate for one testcase.
@@ -85,13 +129,10 @@ pub enum RelationOutcome {
     },
     /// The relation holds (or its guard is not met).
     Compliant,
-    /// The relation is broken.
-    Violation(Violation),
-    /// The external comparator seam is not yet wired.
-    Inconclusive {
-        /// The extension/comparator awaited.
-        awaiting_extension: String,
-    },
+    /// The relation is broken. Boxed so the large payload (which embeds the
+    /// violated predicate and, for an external finding, the comparator verdict)
+    /// does not bloat the whole enum.
+    Violation(Box<Violation>),
 }
 
 impl RelationOutcome {
@@ -105,7 +146,6 @@ impl RelationOutcome {
             RelationOutcome::PolicyUnknown { .. } => "policy_unknown",
             RelationOutcome::Compliant => "compliant",
             RelationOutcome::Violation(_) => "violation",
-            RelationOutcome::Inconclusive { .. } => "inconclusive",
         }
     }
 
@@ -113,7 +153,7 @@ impl RelationOutcome {
     #[must_use]
     pub fn as_violation(&self) -> Option<&Violation> {
         match self {
-            RelationOutcome::Violation(v) => Some(v),
+            RelationOutcome::Violation(v) => Some(&**v),
             _ => None,
         }
     }
@@ -130,11 +170,23 @@ pub struct Evaluation {
     pub outcome: RelationOutcome,
 }
 
-/// Evaluate every predicate in `config` against `observations`.
+/// Evaluate every predicate in `config` against `observations`, with no external
+/// comparator wired (every [`Require::External`] predicate is undecidable).
 #[must_use]
 pub fn evaluate(
     config: &RelationalConfig,
     observations: &BTreeMap<String, Observation>,
+) -> Vec<Evaluation> {
+    evaluate_with(config, observations, &mut NoComparator)
+}
+
+/// Evaluate every predicate in `config` against `observations`, deciding any
+/// [`Require::External`] predicate with `comparator`.
+#[must_use]
+pub fn evaluate_with(
+    config: &RelationalConfig,
+    observations: &BTreeMap<String, Observation>,
+    comparator: &mut dyn ExternalComparator,
 ) -> Vec<Evaluation> {
     config
         .predicates
@@ -143,17 +195,30 @@ pub fn evaluate(
         .map(|(i, pred)| Evaluation {
             predicate_index: i,
             rule_label: pred.rule.clone(),
-            outcome: evaluate_one(config, pred, observations),
+            outcome: evaluate_one_with(config, pred, observations, comparator),
         })
         .collect()
 }
 
-/// Evaluate a single predicate against `observations`.
+/// Evaluate a single predicate against `observations`, with no external
+/// comparator wired (an [`Require::External`] predicate is undecidable).
 #[must_use]
 pub fn evaluate_one(
     config: &RelationalConfig,
     predicate: &Predicate,
     observations: &BTreeMap<String, Observation>,
+) -> RelationOutcome {
+    evaluate_one_with(config, predicate, observations, &mut NoComparator)
+}
+
+/// Evaluate a single predicate against `observations`, deciding a
+/// [`Require::External`] predicate with `comparator`.
+#[must_use]
+pub fn evaluate_one_with(
+    config: &RelationalConfig,
+    predicate: &Predicate,
+    observations: &BTreeMap<String, Observation>,
+    comparator: &mut dyn ExternalComparator,
 ) -> RelationOutcome {
     // 1. Run-state gating: any involved profile that never produced a usable
     //    observation short-circuits to its distinct run-level outcome.
@@ -196,9 +261,9 @@ pub fn evaluate_one(
         Require::Differ { selectors } => {
             eval_equal_differ(config, predicate, selectors, false, observations)
         }
-        Require::External { comparator } => RelationOutcome::Inconclusive {
-            awaiting_extension: comparator.clone(),
-        },
+        Require::External { comparator: name } => {
+            eval_external(predicate, name, observations, comparator)
+        }
     }
 }
 
@@ -238,13 +303,70 @@ fn eval_status_relation(
     }
     // A definite status that contradicts the policy requirement.
     let kind = predicate.kind.unwrap_or(FindingKind::UnexpectedAllow);
-    RelationOutcome::Violation(Violation {
+    RelationOutcome::Violation(Box::new(Violation {
         kind,
         rule_label: predicate.rule.clone(),
         profiles: predicate.involved_profiles(),
         evidence: obs.events.clone(),
         predicate: predicate.clone(),
-    })
+        external: None,
+    }))
+}
+
+/// Decide an [`Require::External`] predicate via the injected comparator.
+///
+/// A profile in the bundle that never produced a usable observation
+/// (setup/auth failure) short-circuits to that distinct run-level outcome first —
+/// a context that never launched cannot participate in a cross-profile
+/// comparison. Otherwise the comparator's [`ComparatorVerdict`] maps to real
+/// outcomes: `Clean → Compliant`, `Unknown → PolicyUnknown`, and `Finding →
+/// Violation` carrying the comparator's signature/classification/provenance. The
+/// finding's involved profiles are every profile in the bundle (the comparator
+/// sees the whole cross-profile bundle), so replay re-runs them all.
+fn eval_external(
+    predicate: &Predicate,
+    comparator_name: &str,
+    observations: &BTreeMap<String, Observation>,
+    comparator: &mut dyn ExternalComparator,
+) -> RelationOutcome {
+    // Gate run-level failures (sorted, deterministic) before asking the
+    // comparator, keeping setup/auth failures distinct from a policy verdict.
+    for (name, obs) in observations {
+        match obs.run_state {
+            RunState::SetupFailure => {
+                return RelationOutcome::SetupFailure {
+                    profile: name.clone(),
+                };
+            }
+            RunState::AuthFailure => {
+                return RelationOutcome::AuthFailure {
+                    profile: name.clone(),
+                };
+            }
+            RunState::Ready => {}
+        }
+    }
+
+    match comparator.compare(comparator_name, observations) {
+        ComparatorVerdict::Clean => RelationOutcome::Compliant,
+        ComparatorVerdict::Unknown { reason } => RelationOutcome::PolicyUnknown { reason },
+        ComparatorVerdict::Finding(external) => {
+            let kind = predicate.kind.unwrap_or(FindingKind::ExternalComparator);
+            let profiles: Vec<String> = observations.keys().cloned().collect();
+            let evidence: Vec<EffectEvent> = observations
+                .values()
+                .flat_map(|o| o.events.iter().cloned())
+                .collect();
+            RelationOutcome::Violation(Box::new(Violation {
+                kind,
+                rule_label: predicate.rule.clone(),
+                profiles,
+                evidence,
+                predicate: predicate.clone(),
+                external: Some(external),
+            }))
+        }
+    }
 }
 
 fn eval_subset(
@@ -276,13 +398,14 @@ fn eval_subset(
         .filter(|e| escapes.contains(&e.target))
         .collect();
     let kind = predicate.kind.unwrap_or(FindingKind::AllowlistEscape);
-    RelationOutcome::Violation(Violation {
+    RelationOutcome::Violation(Box::new(Violation {
         kind,
         rule_label: predicate.rule.clone(),
         profiles: predicate.involved_profiles(),
         evidence,
         predicate: predicate.clone(),
-    })
+        external: None,
+    }))
 }
 
 fn eval_equal_differ(
@@ -317,13 +440,14 @@ fn eval_equal_differ(
             evidence.extend(o.events.iter().cloned());
         }
     }
-    RelationOutcome::Violation(Violation {
+    RelationOutcome::Violation(Box::new(Violation {
         kind,
         rule_label: predicate.rule.clone(),
         profiles: predicate.involved_profiles(),
         evidence,
         predicate: predicate.clone(),
-    })
+        external: None,
+    }))
 }
 
 /// A selector-resolution failure. Deliberately small (never carries a
@@ -637,24 +761,140 @@ require = { kind = "differ", selectors = ["a.response", "b.response"] }
         );
     }
 
-    #[test]
-    fn external_comparator_is_inconclusive() {
+    /// A mock comparator scripted with a fixed verdict, recording the comparator
+    /// name and bundle size it was asked about.
+    struct MockComparator {
+        verdict: ComparatorVerdict,
+        saw_comparator: Option<String>,
+        saw_profiles: usize,
+    }
+
+    impl MockComparator {
+        fn new(verdict: ComparatorVerdict) -> Self {
+            Self {
+                verdict,
+                saw_comparator: None,
+                saw_profiles: 0,
+            }
+        }
+    }
+
+    impl ExternalComparator for MockComparator {
+        fn compare(
+            &mut self,
+            comparator: &str,
+            bundle: &BTreeMap<String, Observation>,
+        ) -> ComparatorVerdict {
+            self.saw_comparator = Some(comparator.to_string());
+            self.saw_profiles = bundle.len();
+            self.verdict.clone()
+        }
+    }
+
+    fn cfg_external() -> RelationalConfig {
         let src = r#"
 schema = "bhf.relational.v1"
 [[profiles]]
-name = "a"
+name = "admin"
+[[profiles]]
+name = "viewer"
 [[predicates]]
-rule = "external check"
-require = { kind = "external", comparator = "diff-tool" }
+rule = "external comparator decides the cross-profile relation"
+require = { kind = "external", comparator = "ext/diff.toml" }
 "#;
-        let cfg = RelationalConfig::parse(src).unwrap();
-        let obs = obs_set(vec![Observation::ready("a", ProfileStatus::Allowed)]);
-        let out = evaluate_one(&cfg, &cfg.predicates[0], &obs);
+        RelationalConfig::parse(src).unwrap()
+    }
+
+    fn external_finding() -> ExternalFinding {
+        ExternalFinding {
+            comparator: "ext/diff.toml".to_string(),
+            signature: "f00dcafe".to_string(),
+            classification: "relational_external".to_string(),
+            detail: Some("viewer diverged from admin".to_string()),
+            provenance: None,
+        }
+    }
+
+    /// Clean → Compliant, Finding → Violation (carrying the comparator's
+    /// signature/classification), Unknown → PolicyUnknown — all distinct, and the
+    /// comparator is handed the whole cross-profile bundle.
+    #[test]
+    fn external_comparator_maps_each_verdict_to_a_distinct_outcome() {
+        let cfg = cfg_external();
+        let obs = obs_set(vec![
+            Observation::ready("admin", ProfileStatus::Allowed),
+            Observation::ready("viewer", ProfileStatus::Allowed),
+        ]);
+
+        // Clean → Compliant.
+        let mut clean = MockComparator::new(ComparatorVerdict::Clean);
         assert_eq!(
-            out,
-            RelationOutcome::Inconclusive {
-                awaiting_extension: "diff-tool".to_string()
-            }
+            evaluate_one_with(&cfg, &cfg.predicates[0], &obs, &mut clean),
+            RelationOutcome::Compliant
         );
+        assert_eq!(clean.saw_comparator.as_deref(), Some("ext/diff.toml"));
+        assert_eq!(clean.saw_profiles, 2, "comparator sees the whole bundle");
+
+        // Finding → Violation carrying the comparator's identity.
+        let mut finder = MockComparator::new(ComparatorVerdict::Finding(external_finding()));
+        let out = evaluate_one_with(&cfg, &cfg.predicates[0], &obs, &mut finder);
+        let v = out.as_violation().expect("violation");
+        assert_eq!(v.kind, FindingKind::ExternalComparator);
+        let ext = v.external.as_ref().expect("external payload carried");
+        assert_eq!(ext.signature, "f00dcafe");
+        assert_eq!(ext.classification, "relational_external");
+        // Both profiles are recorded as involved (replay re-runs the whole bundle).
+        assert_eq!(v.profiles, vec!["admin".to_string(), "viewer".to_string()]);
+
+        // Unknown → PolicyUnknown (never compliant, never a finding).
+        let mut unknown = MockComparator::new(ComparatorVerdict::Unknown {
+            reason: "comparator could not decide".to_string(),
+        });
+        let out = evaluate_one_with(&cfg, &cfg.predicates[0], &obs, &mut unknown);
+        assert_eq!(out.label(), "policy_unknown");
+        assert_ne!(out, RelationOutcome::Compliant);
+        assert!(out.as_violation().is_none());
+
+        // The three outcomes are mutually distinct.
+        assert_ne!(
+            evaluate_one_with(
+                &cfg,
+                &cfg.predicates[0],
+                &obs,
+                &mut MockComparator::new(ComparatorVerdict::Clean)
+            )
+            .label(),
+            "policy_unknown"
+        );
+    }
+
+    /// An external finding stays distinct from the run-level setup/auth outcomes:
+    /// a profile that never launched short-circuits before the comparator runs.
+    #[test]
+    fn external_profile_setup_failure_short_circuits_before_comparator() {
+        let cfg = cfg_external();
+        let obs = obs_set(vec![
+            Observation::ready("admin", ProfileStatus::Allowed),
+            Observation::failed("viewer", RunState::SetupFailure),
+        ]);
+        // Even a comparator that would "find" is never consulted.
+        let mut finder = MockComparator::new(ComparatorVerdict::Finding(external_finding()));
+        let out = evaluate_one_with(&cfg, &cfg.predicates[0], &obs, &mut finder);
+        assert_eq!(out.label(), "setup_failure");
+        assert!(finder.saw_comparator.is_none(), "comparator must not run");
+    }
+
+    /// With no comparator wired, an External predicate is undecidable
+    /// (PolicyUnknown), never silently compliant.
+    #[test]
+    fn external_without_comparator_is_policy_unknown() {
+        let cfg = cfg_external();
+        let obs = obs_set(vec![
+            Observation::ready("admin", ProfileStatus::Allowed),
+            Observation::ready("viewer", ProfileStatus::Allowed),
+        ]);
+        let out = evaluate_one(&cfg, &cfg.predicates[0], &obs);
+        assert_eq!(out.label(), "policy_unknown");
+        assert_ne!(out, RelationOutcome::Compliant);
     }
 }

@@ -264,10 +264,13 @@ pub enum Require {
         /// The selectors that must differ.
         selectors: Vec<Selector>,
     },
-    /// An external comparator decides (seam). Evaluates to inconclusive until a
-    /// comparator is wired, rather than fabricating a verdict.
+    /// A trusted out-of-process comparator decides the relation over the whole
+    /// cross-profile observation bundle. `comparator` names the comparator — a
+    /// `bhf.extension-manifest.v1` manifest path; explicit load is the trust
+    /// boundary. The driver negotiates and calls it; its clean/finding/unknown
+    /// verdict maps to compliant/violation/policy-unknown.
     External {
-        /// The named external comparator.
+        /// The comparator extension manifest path (resolved by the driver).
         comparator: String,
     },
 }

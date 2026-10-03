@@ -2363,6 +2363,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/fixtures/relational_comparator_ext.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/fork_server.rs",
       "license": "Apache-2.0"
     },
@@ -2488,6 +2492,10 @@
     },
     {
       "path": "crates/cli/tests/relational_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/relational_external_cli.rs",
       "license": "Apache-2.0"
     },
     {

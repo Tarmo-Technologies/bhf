@@ -218,7 +218,14 @@ fn persist_scrubs_resolved_secret_and_writes_results_layout() {
         seed: 1,
         max_findings: 8,
     };
-    let report = run_campaign(&config, &[vec![0xAAu8]], &mut exec, &opts).unwrap();
+    let report = run_campaign_with(
+        &config,
+        &[vec![0xAAu8]],
+        &mut exec,
+        &mut relational::NoComparator,
+        &opts,
+    )
+    .unwrap();
     assert_eq!(
         report.findings.len(),
         1,
@@ -262,4 +269,40 @@ fn persist_scrubs_resolved_secret_and_writes_results_layout() {
 fn ready_observation_keeps_profile_status() {
     let obs = relational::Observation::ready("viewer", ProfileStatus::Denied);
     assert_eq!(obs.status, ProfileStatus::Denied);
+}
+
+/// The External comparator must never receive a resolved secret: a secret value
+/// riding along in an effect-event target is scrubbed to its stable reference id
+/// before the cross-profile observation bundle is serialized and sent.
+#[test]
+fn comparator_bundle_bytes_scrub_resolved_secrets_before_sending() {
+    let mut bundle = std::collections::BTreeMap::new();
+    bundle.insert(
+        "viewer".to_string(),
+        relational::Observation::ready("viewer", ProfileStatus::Allowed).with_events(vec![
+            EffectEvent {
+                api: "system".into(),
+                kind: EffectKind::CommandExec,
+                target: "login --token s3cr3t".into(),
+            },
+        ]),
+    );
+    let mut secrets = SecretResolution::new();
+    secrets.insert("lab:viewer-token", "s3cr3t");
+
+    let bytes = redacted_bundle_bytes(&bundle, &secrets).unwrap();
+    let text = String::from_utf8(bytes).unwrap();
+    assert!(
+        !text.contains("s3cr3t"),
+        "a resolved secret must never reach the comparator: {text}"
+    );
+    assert!(
+        text.contains("<secret:lab:viewer-token>"),
+        "the stable reference id survives for correlation: {text}"
+    );
+    // The rest of the command shape still reaches the comparator.
+    assert!(
+        text.contains("login --token"),
+        "non-secret content survives: {text}"
+    );
 }

@@ -22,7 +22,9 @@ use crate::executor::{ExecError, ProfileExecutor, ProfileRun};
 use crate::finding::RelationFinding;
 use crate::mutate::{ByteMutator, Mutator};
 use crate::observation::Observation;
-use crate::predicate::{evaluate, evaluate_one, RelationOutcome};
+use crate::predicate::{
+    evaluate_one_with, evaluate_with, ExternalComparator, NoComparator, RelationOutcome,
+};
 use crate::schema::RelationalConfig;
 
 /// Budget and determinism knobs for a campaign.
@@ -65,8 +67,6 @@ pub struct OutcomeTally {
     pub compliant: usize,
     /// Count of violation outcomes.
     pub violation: usize,
-    /// Count of inconclusive (external-seam) outcomes.
-    pub inconclusive: usize,
 }
 
 impl OutcomeTally {
@@ -78,7 +78,6 @@ impl OutcomeTally {
             RelationOutcome::PolicyUnknown { .. } => self.policy_unknown += 1,
             RelationOutcome::Compliant => self.compliant += 1,
             RelationOutcome::Violation(_) => self.violation += 1,
-            RelationOutcome::Inconclusive { .. } => self.inconclusive += 1,
         }
     }
 }
@@ -96,7 +95,8 @@ pub struct CampaignReport {
     pub corpus_size: usize,
 }
 
-/// Run a coverage-guided relational campaign.
+/// Run a coverage-guided relational campaign with no external comparator wired
+/// (any [`crate::schema::Require::External`] predicate is undecidable).
 ///
 /// # Errors
 /// Propagates any [`ExecError`] from the executor.
@@ -104,6 +104,21 @@ pub fn run_campaign<E: ProfileExecutor>(
     config: &RelationalConfig,
     seeds: &[Vec<u8>],
     executor: &mut E,
+    opts: &CampaignOptions,
+) -> Result<CampaignReport, ExecError> {
+    run_campaign_with(config, seeds, executor, &mut NoComparator, opts)
+}
+
+/// Run a coverage-guided relational campaign, deciding any
+/// [`crate::schema::Require::External`] predicate with `comparator`.
+///
+/// # Errors
+/// Propagates any [`ExecError`] from the executor.
+pub fn run_campaign_with<E: ProfileExecutor>(
+    config: &RelationalConfig,
+    seeds: &[Vec<u8>],
+    executor: &mut E,
+    comparator: &mut dyn ExternalComparator,
     opts: &CampaignOptions,
 ) -> Result<CampaignReport, ExecError> {
     let mut corpus: Vec<Vec<u8>> = if seeds.is_empty() {
@@ -163,7 +178,7 @@ pub fn run_campaign<E: ProfileExecutor>(
         }
 
         let testcase_sha = crate::sha256_hex(&input);
-        for eval in evaluate(config, &observations) {
+        for eval in evaluate_with(config, &observations, comparator) {
             tally.record(&eval.outcome);
             if let Some(violation) = eval.outcome.as_violation() {
                 let ordinal = findings.len() as u32 + 1;
@@ -205,7 +220,8 @@ pub struct ReplayResult {
     pub outcome: RelationOutcome,
 }
 
-/// Re-run every profile a finding requires and re-confirm the violated relation.
+/// Re-run every profile a finding requires and re-confirm the violated relation
+/// (no external comparator wired).
 ///
 /// # Errors
 /// Propagates any [`ExecError`] from the executor.
@@ -215,8 +231,23 @@ pub fn replay<E: ProfileExecutor>(
     input: &[u8],
     executor: &mut E,
 ) -> Result<ReplayResult, ExecError> {
+    replay_with(finding, config, input, executor, &mut NoComparator)
+}
+
+/// Re-run every profile a finding requires and re-confirm the violated relation,
+/// deciding an external relation with `comparator`.
+///
+/// # Errors
+/// Propagates any [`ExecError`] from the executor.
+pub fn replay_with<E: ProfileExecutor>(
+    finding: &RelationFinding,
+    config: &RelationalConfig,
+    input: &[u8],
+    executor: &mut E,
+    comparator: &mut dyn ExternalComparator,
+) -> Result<ReplayResult, ExecError> {
     let observations = observe_profiles(config, input, &finding.profiles, executor)?;
-    let outcome = evaluate_one(config, &finding.relation, &observations);
+    let outcome = evaluate_one_with(config, &finding.relation, &observations, comparator);
     let reproduced = outcome
         .as_violation()
         .is_some_and(|v| v.kind == finding.kind);
@@ -240,7 +271,8 @@ pub struct MinimizeResult {
 }
 
 /// Shrink a finding's testcase while the violated relation still holds, then
-/// reduce the required profile set to the minimum that still proves it.
+/// reduce the required profile set to the minimum that still proves it (no
+/// external comparator wired).
 ///
 /// # Errors
 /// Propagates any [`ExecError`] from the executor.
@@ -250,12 +282,28 @@ pub fn minimize<E: ProfileExecutor>(
     input: &[u8],
     executor: &mut E,
 ) -> Result<MinimizeResult, ExecError> {
+    minimize_with(finding, config, input, executor, &mut NoComparator)
+}
+
+/// Shrink a finding's testcase while the violated relation still holds, then
+/// reduce the required profile set to the minimum that still proves it, deciding
+/// an external relation with `comparator`.
+///
+/// # Errors
+/// Propagates any [`ExecError`] from the executor.
+pub fn minimize_with<E: ProfileExecutor>(
+    finding: &RelationFinding,
+    config: &RelationalConfig,
+    input: &[u8],
+    executor: &mut E,
+    comparator: &mut dyn ExternalComparator,
+) -> Result<MinimizeResult, ExecError> {
     // Reduce over the full executed profile set so that unneeded profiles can be
     // dropped; the oracle is "the recorded violation still reproduces".
     let full_set: Vec<String> = config.profiles.iter().map(|p| p.name.clone()).collect();
 
     let (minimized, predicate_runs) = ddmin_bytes(input, |candidate| {
-        still_violates(finding, config, candidate, &full_set, executor)
+        still_violates(finding, config, candidate, &full_set, executor, comparator)
     })?;
 
     // Profile-set reduction: greedily drop profiles while the relation still
@@ -266,7 +314,7 @@ pub fn minimize<E: ProfileExecutor>(
             break;
         }
         let trial: Vec<String> = required.iter().filter(|n| *n != name).cloned().collect();
-        if still_violates(finding, config, &minimized, &trial, executor)? {
+        if still_violates(finding, config, &minimized, &trial, executor, comparator)? {
             required = trial;
         }
     }
@@ -285,9 +333,10 @@ fn still_violates<E: ProfileExecutor>(
     input: &[u8],
     profile_set: &[String],
     executor: &mut E,
+    comparator: &mut dyn ExternalComparator,
 ) -> Result<bool, ExecError> {
     let observations = observe_profiles(config, input, profile_set, executor)?;
-    let outcome = evaluate_one(config, &finding.relation, &observations);
+    let outcome = evaluate_one_with(config, &finding.relation, &observations, comparator);
     Ok(outcome
         .as_violation()
         .is_some_and(|v| v.kind == finding.kind))

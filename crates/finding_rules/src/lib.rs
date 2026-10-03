@@ -874,6 +874,24 @@ pub const RULES: &[Rule] = &[
         iso_tr_24772_ada: &[],
     },
     Rule {
+        id: "BHF-312",
+        slug: "bhf.relational/external-comparator",
+        name: "External comparator reported a cross-profile policy violation",
+        description: "A trusted out-of-process comparator extension, handed the serialized cross-profile observation bundle for a relational campaign, reported a policy violation — a relation whose verdict is decided outside the built-in predicate set. The relational finding carries the comparator's own signature and classification plus the trusted-extension provenance.",
+        cwe: "CWE-285",
+        cwe_top_25: None,
+        default_severity: Severity::Medium,
+        default_confidence: Confidence::Medium,
+        security_severity: 5.0,
+        references: &["https://cwe.mitre.org/data/definitions/285.html"],
+        owasp_top_10: Some("A01:2021-Broken Access Control"),
+        cert_c: None,
+        cert_cpp: None,
+        misra_c: None,
+        misra_cpp: None,
+        iso_tr_24772_ada: &[],
+    },
+    Rule {
         id: "BHF-401",
         slug: "bhf.static/unsafe-string-copy",
         name: "Unsafe string copy call in source",
@@ -4451,7 +4469,7 @@ mod tests {
     #[test]
     fn relational_rule_ids_are_registered() {
         // The relational campaign (`bhf relational`) emits findings tagged
-        // BHF-308..311; each must resolve to a real catalog rule with the agreed
+        // BHF-308..312; each must resolve to a real catalog rule with the agreed
         // CWE so SARIF / vulnerability-management importers can look them up. The
         // ids here must stay in sync with `relational::rule_id_for_kind`.
         for (id, cwe, slug) in [
@@ -4467,6 +4485,7 @@ mod tests {
                 "bhf.relational/unexpected-equivalence",
             ),
             ("BHF-311", "CWE-754", "bhf.relational/unexpected-divergence"),
+            ("BHF-312", "CWE-285", "bhf.relational/external-comparator"),
         ] {
             let rule = by_id(id).unwrap_or_else(|| panic!("{id} relational rule must exist"));
             assert_eq!(rule.cwe, cwe, "{id} has unexpected cwe");

@@ -25,9 +25,13 @@
 //!   [`EffectEvent`] at the seam.
 //! * `semantic_hits` and `auth_decisions` are optional, empty-by-default seams:
 //!   they are populated by downstream semantic/authorization collectors when
-//!   those land. The [`Require::External`] predicate is the external-comparator
-//!   seam and evaluates to [`RelationOutcome::Inconclusive`] until a comparator
-//!   is wired, rather than fabricating a verdict.
+//!   those land. The [`Require::External`] predicate is decided by an injected
+//!   [`ExternalComparator`] over the cross-profile observation bundle: its
+//!   [`ComparatorVerdict`] maps clean → compliant, finding → violation (carrying
+//!   the comparator's signature/classification), and unknown → policy-unknown.
+//!   The crate never spawns the comparator itself; the driver passes a real one
+//!   in at the seam, and a [`NoComparator`] default leaves external predicates
+//!   undecidable rather than fabricating a verdict.
 //!
 //! Downstream consumers (importers / SARIF / vulnerability-management tooling)
 //! are referred to only generically; no product name appears anywhere.
@@ -43,19 +47,23 @@ pub mod redact;
 pub mod schema;
 
 pub use campaign::{
-    minimize, replay, run_campaign, CampaignOptions, CampaignReport, MinimizeResult, OutcomeTally,
-    ReplayResult,
+    minimize, minimize_with, replay, replay_with, run_campaign, run_campaign_with, CampaignOptions,
+    CampaignReport, MinimizeResult, OutcomeTally, ReplayResult,
 };
 pub use coverage::{popcount, UnionBitmap};
 pub use executor::{ExecError, FnExecutor, ProfileExecutor, ProfileRun};
-pub use finding::{rule_id_for_kind, FindingKind, FindingPaths, RelationFinding};
+pub use finding::{
+    rule_id_for_kind, ExternalFinding, ExternalProvenance, FindingKind, FindingPaths,
+    RelationFinding,
+};
 pub use mutate::{ByteMutator, Rng};
 pub use observation::{
     AuthDecision, AuthResult, EffectEvent, EffectKind, Observation, ProfileStatus, RunState,
     SemanticHit, SemanticVerdict, Stream,
 };
 pub use predicate::{
-    evaluate, evaluate_one, Evaluation, ExternalVerdict, RelationOutcome, Violation,
+    evaluate, evaluate_one, evaluate_one_with, evaluate_with, ComparatorVerdict, Evaluation,
+    ExternalComparator, NoComparator, RelationOutcome, Violation,
 };
 pub use schema::{
     CollectorKind, Cond, EnvValue, Field, Predicate, Profile, RelationalConfig, Require,

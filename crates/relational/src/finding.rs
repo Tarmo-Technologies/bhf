@@ -36,6 +36,9 @@ pub enum FindingKind {
     UnexpectedEquivalence,
     /// Selectors that policy required equal were observed to differ.
     UnexpectedDivergence,
+    /// A trusted external comparator reported a cross-profile policy violation
+    /// over the serialized observation bundle.
+    ExternalComparator,
 }
 
 impl FindingKind {
@@ -53,13 +56,14 @@ impl FindingKind {
             FindingKind::AllowlistEscape => "allowlist_escape",
             FindingKind::UnexpectedEquivalence => "unexpected_equivalence",
             FindingKind::UnexpectedDivergence => "unexpected_divergence",
+            FindingKind::ExternalComparator => "external_comparator",
         }
     }
 }
 
-/// The `kind → rule_id` table. These ids (`BHF-308..311`) are reconciled with
-/// the finding-rules `RULES` table on a separate change; this crate only needs a
-/// stable, total mapping so every emitted finding carries a rule id.
+/// The `kind → rule_id` table. These ids (`BHF-308..312`) are reconciled with
+/// the finding-rules `RULES` table; this crate needs a stable, total mapping so
+/// every emitted finding carries a catalog-resolvable rule id.
 #[must_use]
 pub fn rule_id_for_kind(kind: FindingKind) -> &'static str {
     match kind {
@@ -67,7 +71,45 @@ pub fn rule_id_for_kind(kind: FindingKind) -> &'static str {
         FindingKind::AllowlistEscape => "BHF-309",
         FindingKind::UnexpectedEquivalence => "BHF-310",
         FindingKind::UnexpectedDivergence => "BHF-311",
+        FindingKind::ExternalComparator => "BHF-312",
     }
+}
+
+/// Provenance for an external-comparator finding: which trusted extension
+/// decided it. Mirrors the extension host's finding-provenance block but is a
+/// pure relational type (so this crate stays free of any extension dependency),
+/// carried verbatim into the persisted relational finding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalProvenance {
+    /// SHA-256 of the comparator extension executable.
+    pub executable_sha256: String,
+    /// SHA-256 of the comparator extension manifest/config, if one was used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_sha256: Option<String>,
+    /// The negotiated extension protocol version.
+    pub protocol_version: String,
+    /// The capabilities negotiated with the comparator extension.
+    #[serde(default)]
+    pub negotiated_caps: Vec<String>,
+}
+
+/// The comparator's verdict payload for a cross-profile external finding. Its
+/// `signature` and `classification` are the comparator's own stable identity;
+/// `provenance` records the trusted extension that produced it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalFinding {
+    /// The named comparator (an extension manifest path) that decided the relation.
+    pub comparator: String,
+    /// The comparator's stable, dedupable signature for this finding.
+    pub signature: String,
+    /// The comparator's classification label.
+    pub classification: String,
+    /// Optional human-readable detail from the comparator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// The trusted-extension provenance of the comparator that decided this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<ExternalProvenance>,
 }
 
 /// The persisted file paths of a finding bundle.
@@ -117,6 +159,11 @@ pub struct RelationFinding {
     pub policy_hash: String,
     /// Per-profile hashes for the involved profiles.
     pub profile_hashes: BTreeMap<String, String>,
+    /// For an external-comparator violation, the comparator's verdict payload
+    /// (its signature, classification and trusted-extension provenance). `None`
+    /// for every built-in relation kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external: Option<ExternalFinding>,
     /// The persisted file paths.
     pub paths: FindingPaths,
 }
@@ -149,12 +196,14 @@ impl RelationFinding {
             }
         }
 
+        let external_signature = violation.external.as_ref().map(|e| e.signature.as_str());
         let signature = signature(
             violation.kind,
             &profiles,
             &policy_hash,
             &violation.predicate,
             testcase_sha,
+            external_signature,
         );
         let short: String = signature.chars().take(8).collect();
         let id = format!("F-{ordinal:04}-{short}");
@@ -173,12 +222,17 @@ impl RelationFinding {
             evidence_events: violation.evidence.clone(),
             policy_hash,
             profile_hashes,
+            external: violation.external.clone(),
             paths: FindingPaths::default(),
         }
     }
 }
 
 /// Compute a stable, dedupable finding signature.
+///
+/// `external_signature` is the comparator's own signature for an
+/// external-comparator finding; it is folded in only when present, so every
+/// built-in relation kind hashes exactly as before (the key is absent).
 #[must_use]
 pub fn signature(
     kind: FindingKind,
@@ -186,17 +240,22 @@ pub fn signature(
     policy_hash: &str,
     relation: &Predicate,
     testcase_sha: &str,
+    external_signature: Option<&str>,
 ) -> String {
     // Canonicalize the relation via JSON so logically-equal relations hash equal.
     let relation_json = serde_json::to_string(relation).expect("relation serializes");
-    let canonical = serde_json::json!({
-        "kind": kind.slug(),
-        "profiles": sorted_profiles,
-        "policy_hash": policy_hash,
-        "relation": relation_json,
-        "testcase_sha": testcase_sha,
-    });
-    crate::sha256_hex(canonical.to_string().as_bytes())
+    let mut canonical = serde_json::Map::new();
+    canonical.insert("kind".to_string(), kind.slug().into());
+    canonical.insert("profiles".to_string(), sorted_profiles.into());
+    canonical.insert("policy_hash".to_string(), policy_hash.into());
+    canonical.insert("relation".to_string(), relation_json.into());
+    canonical.insert("testcase_sha".to_string(), testcase_sha.into());
+    // Two distinct comparator verdicts on the same relation+testcase must not
+    // collide, so fold the comparator signature in when the relation is external.
+    if let Some(sig) = external_signature {
+        canonical.insert("external".to_string(), sig.into());
+    }
+    crate::sha256_hex(serde_json::Value::Object(canonical).to_string().as_bytes())
 }
 
 #[cfg(test)]
@@ -231,6 +290,7 @@ require = { kind = "subset", set = "viewer.spawned", of = "viewer.allowlist" }
             profiles: vec!["viewer".to_string()],
             evidence: vec![EffectEvent::process_exec("execve", "administrator-helper")],
             predicate: cfg.predicates[0].clone(),
+            external: None,
         }
     }
 
@@ -298,12 +358,84 @@ require = { kind = "subset", set = "viewer.spawned", of = "viewer.allowlist" }
     }
 
     #[test]
+    fn external_comparator_finding_carries_signature_classification_and_provenance() {
+        // An external-comparator violation carries the comparator's own signature,
+        // classification and trusted-extension provenance into the relational
+        // finding, and the comparator signature is folded into the relational
+        // signature so two distinct verdicts on the same relation do not collide.
+        let src = r#"
+schema = "bhf.relational.v1"
+[[profiles]]
+name = "viewer"
+[[profiles]]
+name = "admin"
+[[predicates]]
+rule = "external comparator decides"
+require = { kind = "external", comparator = "ext/comparator.toml" }
+"#;
+        let cfg = RelationalConfig::parse(src).unwrap();
+        let ext = crate::finding::ExternalFinding {
+            comparator: "ext/comparator.toml".to_string(),
+            signature: "c0ffee".to_string(),
+            classification: "relational_external".to_string(),
+            detail: Some("viewer escaped under admin equivalence".to_string()),
+            provenance: Some(crate::finding::ExternalProvenance {
+                executable_sha256: "a".repeat(64),
+                config_sha256: Some("b".repeat(64)),
+                protocol_version: "bhf.extension.v1".to_string(),
+                negotiated_caps: vec!["oracle.evaluate".to_string()],
+            }),
+        };
+        let v = Violation {
+            kind: FindingKind::ExternalComparator,
+            rule_label: "external comparator decides".to_string(),
+            profiles: vec!["admin".to_string(), "viewer".to_string()],
+            evidence: Vec::new(),
+            predicate: cfg.predicates[0].clone(),
+            external: Some(ext.clone()),
+        };
+        let obs = BTreeMap::new();
+        let f = RelationFinding::from_violation(1, &v, &cfg, &obs, "tc-sha");
+        assert_eq!(f.rule_id, "BHF-312");
+        assert_eq!(f.kind, FindingKind::ExternalComparator);
+        let carried = f.external.as_ref().expect("external block carried");
+        assert_eq!(carried.signature, "c0ffee");
+        assert_eq!(carried.classification, "relational_external");
+        assert_eq!(
+            carried.provenance.as_ref().unwrap().protocol_version,
+            "bhf.extension.v1"
+        );
+
+        // Folding the comparator signature in disambiguates distinct verdicts.
+        let mut v2 = v.clone();
+        v2.external = Some(ExternalFinding {
+            signature: "d1ffff".to_string(),
+            ..ext.clone()
+        });
+        let f2 = RelationFinding::from_violation(1, &v2, &cfg, &obs, "tc-sha");
+        assert_ne!(
+            f.signature, f2.signature,
+            "different comparator signatures must not collide"
+        );
+
+        // The persisted JSON carries the comparator block (importer-facing).
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
+        assert_eq!(json["external"]["signature"], "c0ffee");
+        assert_eq!(
+            json["external"]["provenance"]["protocol_version"],
+            "bhf.extension.v1"
+        );
+    }
+
+    #[test]
     fn every_kind_maps_to_a_distinct_rule_id() {
         let kinds = [
             FindingKind::UnexpectedAllow,
             FindingKind::AllowlistEscape,
             FindingKind::UnexpectedEquivalence,
             FindingKind::UnexpectedDivergence,
+            FindingKind::ExternalComparator,
         ];
         let mut ids: Vec<&str> = kinds.iter().map(|k| k.rule_id()).collect();
         for id in &ids {

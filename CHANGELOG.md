@@ -28,14 +28,23 @@
   testcase across several named launch/session **profiles** (differing in runner, args,
   environment, declared target allowlist and secret references) and evaluate declarative
   relational **predicates** (`status_relation`, `subset`/allowlist, `equal`, `differ`, and
-  an `external`-comparator seam) over each profile's observed behaviour, catching both
+  an `external` comparator decided by a trusted out-of-process extension) over each
+  profile's observed behaviour, catching both
   unexpected *divergence* and unexpected *equivalence* against an explicit policy — an
   authorization bug class a crash-only or single-harness output-diff oracle cannot see,
   because the offending runs can exit `0` with byte-identical stdout (#61). The campaign
   retains inputs that reach new code in any profile, a new cross-profile outcome vector, or
   a new effect-event shape, and emits a finding per violated relation: `BHF-308`
   (unexpected authorization, CWE-863), `BHF-309` (allowlist escape, CWE-862), `BHF-310`
-  (unexpected equivalence, CWE-285) and `BHF-311` (unexpected divergence, CWE-754). Each
+  (unexpected equivalence, CWE-285), `BHF-311` (unexpected divergence, CWE-754) and
+  `BHF-312` (external-comparator violation, CWE-285). An `external` predicate names a
+  trusted `bhf.extension-manifest.v1` comparator by path (explicit load is the trust
+  boundary); the driver spawns + negotiates it and drives `oracle.evaluate` (#57's
+  `bhf.extension.v1`) over the secret-redacted cross-profile observation bundle, mapping
+  `ok → compliant`, `finding → violation` (carrying the comparator's signature,
+  classification and executable/config-hash + protocol-version provenance into the
+  relational finding) and `unsupported`/bounded-infrastructure → `policy_unknown` — never a
+  fabricated verdict, and kept distinct from setup/auth/missing-observation outcomes. Each
   profile runs with a **distinct** coverage-shm file, runtime-trace log and scratch dir, so
   one profile's coverage or effect events can never contaminate another's, and per-case
   novelty is bucketed per profile. Effect events come from the runtime-trace collector,

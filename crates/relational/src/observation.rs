@@ -383,9 +383,21 @@ mod tests {
                 reason: "guard inconclusive".into(),
             },
             RelationOutcome::Compliant,
-            RelationOutcome::Inconclusive {
-                awaiting_extension: "ext".into(),
-            },
+            RelationOutcome::Violation(Box::new(crate::predicate::Violation {
+                kind: crate::finding::FindingKind::ExternalComparator,
+                rule_label: "r".into(),
+                profiles: vec!["p".into()],
+                evidence: Vec::new(),
+                predicate: crate::schema::Predicate {
+                    rule: "r".into(),
+                    when: None,
+                    require: crate::schema::Require::External {
+                        comparator: "c".into(),
+                    },
+                    kind: None,
+                },
+                external: None,
+            })),
         ];
         // All six labels distinct.
         let mut labels: Vec<&str> = outcomes.iter().map(RelationOutcome::label).collect();

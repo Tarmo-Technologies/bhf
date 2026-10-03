@@ -134,6 +134,18 @@ path = "tests/fixtures/ext_mock.rs"
 test = false
 doc = false
 
+# Test-only reference bhf.extension.v1 comparator for the relational
+# external-predicate e2e (#61). Links only std + serde_json (NO bhf internals):
+# it advertises `oracle.evaluate` and decides a cross-profile observation bundle
+# (finding / unknown / clean), so `relational_external_cli.rs` drives
+# `bhf relational run` with a real External predicate end to end. A fixture
+# binary (like bhf_ext_mock), never shipped.
+[[bin]]
+name = "bhf_relational_comparator_ext"
+path = "tests/fixtures/relational_comparator_ext.rs"
+test = false
+doc = false
+
 [dev-dependencies]
 serde.workspace = true
 serde_json.workspace = true
