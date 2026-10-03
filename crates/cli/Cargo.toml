@@ -71,6 +71,7 @@ go_parser = { path = "../go_parser" }
 perl_parser = { path = "../perl_parser" }
 project_profile = { path = "../project_profile" }
 project_synth = { path = "../project_synth" }
+protocol_session = { path = "../protocol_session" }
 python_parser = { path = "../python_parser" }
 regex.workspace = true
 replay_min = { path = "../replay_min" }
@@ -113,5 +114,11 @@ path = "tests/fixtures/fake_harness.rs"
 
 [dev-dependencies]
 serde.workspace = true
+serde_json.workspace = true
 toml.workspace = true
 which.workspace = true
+# HDF-7 session-lane e2e: the toy TCP OPEN/WRITE service verifies frames with the
+# same CRC-32 the encoder uses, and the minimize test crafts a padded session
+# artifact from the real session types. Both are internal workspace crates.
+protocol_session = { path = "../protocol_session" }
+fuzz_engine_builtin = { path = "../fuzz_engine/builtin" }

@@ -568,6 +568,10 @@ fn plan_to_fuzz_args(
         stop_after_findings: None,
         target_transport: None,
         transport_coverage_map: None,
+        protocol_profile: None,
+        session_transport: None,
+        session_reset: crate::session_fuzz::SessionResetMode::Reconnect,
+        max_session_messages: 64,
     })
 }
 

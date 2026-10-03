@@ -108,17 +108,21 @@ feature.
 | HDF-4 | `89b9fb8` | yes | `crates/target_transport/src/fullsystem.rs` — `arm_performs_qmp_handshake_gdb_attach_and_baseline_snapshot`, `run_input_loads_snapshot_delivers_input_and_reads_ring_coverage`, `same_input_twice_is_deterministic` (scripted QMP + gdbstub mocks) | live `qemu-system-*` (BHF-authored image) **validated 2026-09-27** (RV-3 `live_fullsystem`, `qemu-system-arm -M mps2-an385`: savevm/loadvm reset + coverage-ring readback + planted HardFault). Proprietary RTOS images and Renode = documented follow-ups; Nyx stub **retired** (`nyx_adapter` — `not_implemented_error_names_the_full_system_replacement`) |
 | HDF-5 | `d31a824` | yes | `crates/target_rank/src/c_rank.rs` — `intconnect_isr_and_msgqueue_consumer_ranked_reachable_not_unproven`, `mmio_polled_register_reader_is_a_channel_consumer`; `crates/harness_gen/src/c_generate.rs` — `peripheral_reader_harness_drives_a_fuzz_controlled_read_sequence` | — (in-tree only) |
 | HDF-6 | `94ad2c4` | yes | `crates/c_stub_gen/src/lib.rs` — `fuzz_driven_stub_reaches_a_return_value_gated_branch_e2e`; `crates/bhf_runtrace_shim/src/{fakes/fuzz_input.rs,hooks/rtos.rs}` (fuzz-driven RTOS channels + MMIO fill) | bare-metal MMIO interception on a real cross build (the host stub-isolation lane is in-tree) |
-| HDF-7 | `dc47e31` | yes (library) | `crates/fuzz_engine/builtin/src/binframe.rs` — `fixup_reaches_past_crc_gate_but_naive_mutation_does_not`, `length_and_crc_are_computed_on_encode`; `crates/iiop/src/dispatch.rs` — `encoded_request_roundtrips_and_dispatches_to_servant`; `crates/ada_state_machine/src/adapter.rs` — `graph_exposes_states_and_transitions_for_a_protected_type` | **follow-up (unbuilt, not hardware-gated):** IIOP dispatch + `ProtocolStateGraph` are library APIs, not wired into any `bhf` subcommand / engine input-scheduler; live socket/DDS transport not built |
+| HDF-7 | `dc47e31` / #58 | yes | `crates/fuzz_engine/builtin/src/binframe.rs` — `fixup_reaches_past_crc_gate_but_naive_mutation_does_not`, `length_and_crc_are_computed_on_encode`; `crates/protocol_session/` — profile parse / model compile / encode+repair+ref-resolution / graph-gated mutation / drive+replay+minimize (38 tests); `crates/cli/tests/session_fuzz_cli.rs` — `bhf fuzz --protocol-profile` drives a live-TCP toy `OPEN`/`WRITE` service to the clean-exit boundary, then replays after a fresh reset and minimizes | **CLI-wired (#58):** `bhf fuzz --protocol-profile` drives a response-dependent multi-message session over a TCP `SessionTransport`, with separate code vs state/transition novelty, a `session.json` finding artifact, and replay/minimize. IIOP/GIOP dispatch and a live DDS transport remain documented follow-ups |
 | HDF-8 | `86aa8e6` | yes | `crates/cli/src/fuzz.rs` — `deadline_oracle_reports_a_slow_input_as_a_bhf555_finding_but_not_a_fast_one` (BHF-555); `crates/bhf_runtrace_shim/src/hooks/sched.rs` + `crates/bhf_runtrace_shim/tests/schedule_perturbation.rs` (cooperative perturbation + pinned replay) | exhaustive interleaving is intractable — claims bounded to "found within budget" (§5) |
 | CC-2 | this branch (uncommitted) | yes | Honesty audit: `crates/fork_server/src/lib.rs` documented as an unused reference impl (superseded by `AgentTransport` + the engine `BHF_FRAMED` loop); `crates/iiop/src/lib.rs` + `crates/ada_state_machine/src/lib.rs` crate docs state library-vs-CLI reachability honestly; `ada_runtime/adafuzz-probe-{semihosting,memory_buffer}.adb` documented as reader-consumed; `ROADMAP.md` IIOP note reconciled; this table | — (documentation reconciliation; no new capability) |
 
 **Honest carve-outs.**
 
-- **HDF-7 is library-complete, not CLI-wired.** The computed-field binary
-  framing (`binframe`) is consumed by the builtin engine, but the `iiop`
-  encode/dispatch path and `ada_state_machine::ProtocolStateGraph` are typed
-  APIs a caller invokes directly; no `bhf` subcommand or engine input-scheduler
-  feeds them yet. This is a follow-up, not a validated end-to-end capability.
+- **HDF-7 is CLI-wired (#58).** The computed-field binary framing (`binframe`)
+  and `ada_state_machine::ProtocolStateGraph` are now driven end-to-end by
+  `bhf fuzz --protocol-profile`: the `protocol_session` crate lowers a versioned
+  profile onto both and drives / replays / minimizes a response-dependent,
+  multi-message session over a `SessionTransport`, with a live TCP backend in the
+  `bhf` crate (`crates/cli/src/session_fuzz.rs`) proven against a toy `OPEN`/
+  `WRITE` service by `crates/cli/tests/session_fuzz_cli.rs`. The `iiop`
+  encode/dispatch path (a second profile backend) and a live socket/DDS ORB
+  transport remain the named follow-ups, not blockers of the shipped capability.
 - **HDF-1 / 1b / 2 / 3 / 4 emulator lane validated; real HW still gated.** The
   transports build and are mock-proven in-tree, and their emulator-in-the-loop
   lane was run live on 2026-09-27 — RV-1 (big-endian ppc64), RV-2 (qemu-arm
@@ -172,7 +176,7 @@ fixable here; **DEPENDENCY** = needs an external resource not in the tree
 | HDF-4 | No full-system / snapshot fuzzing (Nyx stub; no qemu-system/Renode) | P0 | GAP (seam) + DEPENDENCY (emulator/images) |
 | HDF-5 | No discovery/harness synthesis for non-buffer entry points (ISR/DMA/MMIO/queue) | P1 | GAP |
 | HDF-6 | Fuzz-driven dependency model is POSIX-libc only | P1 | GAP |
-| HDF-7 | No binary-framed (TLV/length/CRC) or on-the-wire stateful protocol input | P1 | GAP |
+| HDF-7 | Binary-framed (TLV/length/CRC) and on-the-wire stateful protocol input | P1 | CLI-WIRED (#58); IIOP/DDS backend follow-up |
 | HDF-8 | No concurrency-schedule exploration or real-time/timing oracles | P2 | GAP |
 | CC-1 | Reduced-fidelity findings under-labeled (false-assurance risk) | P1 | GAP |
 | CC-2 | Dead/unwired capabilities (fork_server, iiop, ada_state_machine, nyx, embedded emitters) | P2 | GAP |
@@ -558,12 +562,13 @@ proving reachability) or documented as scaffolding with the tracking track named
 low-risk option — three are now genuinely wired (with a reachability test), two
 are documented as scaffolding naming the completing track:
 
-- **`iiop`** — *wired (library).* HDF-7 added an encoder + servant dispatch, so
-  the decoder is reachable: fuzz bytes → GIOP request → decode → servant call,
-  proven by `iiop::dispatch::tests::encoded_request_roundtrips_and_dispatches_to_servant`.
-  Its crate docs (`crates/iiop/src/lib.rs`) now state this is a **library**
-  capability with **no** `bhf` subcommand feeding it, and no live ORB/network —
-  CLI wiring is the named HDF-7 follow-up.
+- **`iiop`** — *wired (library); a candidate second session backend.* HDF-7 added
+  an encoder + servant dispatch, so the decoder is reachable: fuzz bytes → GIOP
+  request → decode → servant call, proven by
+  `iiop::dispatch::tests::encoded_request_roundtrips_and_dispatches_to_servant`.
+  The generic HDF-7 session lane is now CLI-wired (#58) via the `protocol_session`
+  profile model rather than `iiop`; wiring `iiop` as a second profile backend (and
+  a live ORB/network transport) is the named follow-up, no longer a blocker.
 - **Semihosting / memory-buffer emitters** — *wired.* HDF-1's
   `target_transport::coverage::{SemihostingReader, MemoryBufferReader}` consume
   them, and HDF-1b's `--target-transport` loop drives that end-to-end
@@ -579,11 +584,13 @@ are documented as scaffolding naming the completing track:
   implementation). Superseded by `target_transport::AgentTransport` (framed) and
   the engine's `BHF_FRAMED` loop; its `lib.rs` now says so and advertises no
   end-to-end capability. Kept as an AFL wire-format reference rather than removed.
-- **`ada_state_machine` extractor** — *typed API + honest doc.* HDF-7 added the
-  `ProtocolStateGraph` adapter (tested projection); the crate docs
-  (`crates/ada_state_machine/src/lib.rs`, `adapter.rs`) state that only the
-  `bhf extract-state-machines` JSON subcommand consumes inference today and that
-  engine-scheduler integration of the graph is the named follow-up.
+- **`ada_state_machine` extractor** — *typed API, now engine-consumed.* HDF-7
+  added the `ProtocolStateGraph` adapter (tested projection); the
+  `bhf extract-state-machines` JSON subcommand consumes inference, and as of #58
+  the graph is also consumed by the `bhf fuzz --protocol-profile` session lane —
+  `protocol_session` projects a profile onto `ProtocolStateGraph` and gates its
+  sequence mutation and state/transition novelty off it. Engine-scheduler
+  integration of the graph is no longer a follow-up.
 
 See §1a for the full per-track delivered-status table.
 

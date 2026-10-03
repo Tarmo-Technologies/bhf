@@ -1,0 +1,145 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Toy OPEN/WRITE protocol profile (bhf.protocol.v1).
+#
+# A response-dependent two-message session: OPEN(path) returns a per-session
+# handle; a later WRITE must echo that handle (a back-reference to a captured
+# response value) before the service accepts it. Both messages carry a computed
+# length prefix and a CRC-32 that must be recomputed after any field mutation.
+# When an OPEN path escapes its sandbox (contains ".."), a WRITE presenting the
+# matching handle trips a boundary response the oracle flags as a finding --
+# a security violation that exits cleanly, with no crash.
+#
+# Generic by construction: no consumer-specific names appear here; importers and
+# vulnerability-management tools read the emitted finding, not this profile.
+
+schema = "bhf.protocol.v1"
+transport = "tcp"
+max_messages = 64
+start = "start"
+
+# ---------------------------------------------------------------------------
+# OPEN: establish a handle for a path.
+# ---------------------------------------------------------------------------
+[[message]]
+name = "OPEN"
+max_len = 1024
+
+[[message.field]]
+name = "op"
+type = "u8"
+value = 1
+
+[[message.field]]
+name = "mode"
+type = "enum"
+variants = { read = 0, write = 1, append = 2 }
+value = "read"
+
+[[message.field]]
+name = "len"
+type = "u16"
+endian = "big"
+computed = "length(path)"
+
+[[message.field]]
+name = "path"
+type = "bytes"
+max = 256
+value = "track"
+
+[[message.field]]
+name = "crc"
+type = "u32"
+endian = "big"
+computed = "crc32(op,mode,len,path)"
+
+[message.response]
+[[message.response.capture]]
+name = "handle"
+type = "u32"
+at = 0
+endian = "big"
+
+# ---------------------------------------------------------------------------
+# WRITE: write through a handle obtained from a prior OPEN.
+# ---------------------------------------------------------------------------
+[[message]]
+name = "WRITE"
+max_len = 1024
+
+[[message.field]]
+name = "op"
+type = "u8"
+value = 2
+
+[[message.field]]
+name = "handle"
+type = "u32"
+endian = "big"
+ref = "OPEN.response.handle"
+
+[[message.field]]
+name = "len"
+type = "u16"
+endian = "big"
+computed = "length(data)"
+
+[[message.field]]
+name = "data"
+type = "bytes"
+max = 256
+value = "payload"
+
+[[message.field]]
+name = "crc"
+type = "u32"
+endian = "big"
+computed = "crc32(op,handle,len,data)"
+
+# An optional trailing flag byte, not covered by the CRC.
+[[message.field]]
+name = "flags"
+type = "u8"
+optional = true
+value = 0
+
+[message.response]
+[[message.response.capture]]
+name = "status"
+type = "u8"
+at = 0
+
+# ---------------------------------------------------------------------------
+# Legal message ordering.
+# ---------------------------------------------------------------------------
+[[transition]]
+from = "start"
+send = "OPEN"
+to = "opened"
+
+[[transition]]
+from = "opened"
+send = "OPEN"
+to = "opened"
+
+[[transition]]
+from = "opened"
+send = "WRITE"
+to = "opened"
+
+# ---------------------------------------------------------------------------
+# Session lifecycle: a fresh connection resets per-session state (new handle).
+# ---------------------------------------------------------------------------
+[session]
+reset = "reconnect"
+
+# ---------------------------------------------------------------------------
+# Oracle: a WRITE whose reply carries the boundary status (0xEF) is a finding.
+# ---------------------------------------------------------------------------
+[[oracle]]
+name = "path-traversal-write"
+rule_id = "HDF7-PATHTRAV"
+message = "WRITE"
+response_field = "status"
+equals = 0xEF

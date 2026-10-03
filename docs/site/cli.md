@@ -547,6 +547,10 @@ distinguish sandboxed and unsandboxed executions.
 - `--sanitizers <asan,msan,ubsan,tsan,lsan|none>` — native C/C++ sanitizer campaign matrix; other lanes own their instrumentation.
 - `--target-transport <SPEC>` — run the loop against an off-host / on-target backend instead of the host lane (additive; absent = host path unchanged). Spec forms: `agent:tcp:HOST:PORT`, `agent:serial:/dev/ttyX`, `gdb:HOST:PORT`, `qemu-system:qmp=…,gdb=…[,snapshot=TAG]`. On-device agent, debug-probe/emulator gdbstub, or full-system `qemu-system` snapshot. See [On-Target & Embedded](./on-target-fuzzing.md).
 - `--transport-coverage-map <SPEC>` — for the memory-read transports (`gdb`, `qemu-system`), locate the on-target coverage ring: `input=<addr>,ring=<addr>,write=<addr>,wrapped=<addr>,cap=<n>` (decimal or `0x`-hex). The `agent` transport carries coverage over its protocol and rejects this.
+- `--protocol-profile <PATH>` — load a versioned protocol profile (TOML, `bhf.protocol.v1`) and fuzz the target as a **response-dependent, multi-message session** instead of single opaque inputs (additive; absent = the paths above are unchanged). Presence routes to the session lane, which needs `--session-transport`. See [Stateful protocol sessions](#stateful-protocol-sessions-hdf-7) below.
+- `--session-transport <SPEC>` — request/response backend for the session lane. `tcp:HOST:PORT` connects a socket per session. Required with `--protocol-profile`.
+- `--session-reset <reconnect|none>` — how a session is reset between testcases: `reconnect` (default; a fresh connection gives fresh per-session target state, so a new handle/id/nonce is captured each run) or `none` (keep one connection). Recorded as the run's reset fidelity.
+- `--max-session-messages <N>` — bounded cap on messages per session (default `64`); a sequence mutation that would exceed it fails with a diagnostic rather than growing unbounded.
 - `--rng-seed <N>` — deterministic RNG seed for built-in mutation.
 
 `bhf fuzz --engine` accepts only `builtin` (the default) and `afl++`;
@@ -562,6 +566,60 @@ Ada/LLVM/libFuzzer toolchain.
 Replay, minimize, and built-in fuzzing accept `--sandbox none|auto|firejail|bubblewrap`.
 Use `--sandbox-tool` to point at a specific wrapper and `--sandbox-strict` to
 fail instead of falling back when the requested wrapper is missing.
+
+### Stateful protocol sessions (HDF-7)
+
+`bhf fuzz --protocol-profile <PATH>` drives the target through a
+**response-dependent, multi-message session** rather than single opaque inputs: a
+later message echoes a per-session value (a handle / id / nonce) that an earlier
+message's reply returned, while both messages carry computed length/CRC fields.
+A testcase is a *sequence* of structured messages; mutation edits field values
+AND sequence structure, then a repair pass recomputes the derived fields and
+re-resolves the response back-references before each frame is sent. The security
+violation it looks for **exits cleanly** (no crash) — it is flagged by a
+profile-declared oracle (a sentinel response field, or arrival in a declared
+violation state).
+
+The profile (TOML, `schema = "bhf.protocol.v1"`) declares the message types and
+their typed fields (byte order / width / enums / bounded variable-length data /
+optional fields), the computed fields (`length(..)`, `crc32(..)`/`crc16(..)`/
+`sum8(..)`/`xor8(..)`, `offset(..)`, TLV) and response back-references
+(`ref = "OPEN.response.handle"`), the legal message ordering as transitions, the
+response captures a reply exposes, the session `reset`, and the `[[oracle]]`
+that marks the clean-exit finding. The seed session is synthesized from the
+profile (a legal, reference-satisfying walk).
+
+```sh
+bhf fuzz bhf_work --harness H-PROTO \
+  --protocol-profile profiles/toy-open-write.toml \
+  --session-transport tcp:127.0.0.1:9000 \
+  --session-reset reconnect --iterations 2000
+```
+
+The run reports the two novelty channels **separately** — code-coverage novelty
+(`coverage_edges` / `coverage_blocks`) and protocol-state/transition novelty
+(`states_covered` / `transitions_covered`) are distinct fields, never merged. A
+plain request/response transport reports no code edges, so the code channel is
+honestly zero on such targets while the state channel carries the novelty;
+richer code coverage arrives when a backend supplies edges. The run and every
+finding record the profile SHA-256 and the effective transport/reset fidelity
+(e.g. `tcp;reset=reconnect`).
+
+A finding is written through the usual `results/` layout for importers / SARIF /
+vulnerability-management tools, with a `session.json` artifact (the structured
+message sequence, the state path, the per-step captured replies, and the
+response-derived bindings) plus a self-contained `session_meta.json` sidecar
+(the profile inline + the transport spec). `bhf replay <finding>` and
+`bhf minimize <finding>` detect that artifact automatically: replay re-drives the
+recorded session against a **fresh reset** (re-capturing a different handle and
+re-resolving the reference, so it still reproduces), and minimize shrinks the
+sequence and bytes fields while re-repairing the computed fields and keeping the
+dynamic bindings live.
+
+Every bound is explicit and surfaced as a bounded diagnostic rather than a panic
+or an unbounded loop: a malformed profile or an unresolved reference, a truncated
+response, an excessive message count (`--max-session-messages`), and an oversized
+frame each fail with a descriptive, named error.
 
 For real project layouts where the target body depends on parent package specs
 outside its directory, pass each additional source root to harness generation:

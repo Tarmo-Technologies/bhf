@@ -207,6 +207,7 @@ dependencies = [
  "perl_parser",
  "project_profile",
  "project_synth",
+ "protocol_session",
  "python_parser",
  "rayon",
  "regex",
@@ -1713,6 +1714,19 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "protocol_session"
+version = "0.2.34"
+dependencies = [
+ "ada_state_machine",
+ "fuzz_engine_builtin",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "toml",
 ]
 
 [[package]]

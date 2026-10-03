@@ -22,9 +22,11 @@ pub struct MinimizeArgs {
     #[arg(long, value_name = "ID_OR_DIR")]
     pub finding: Option<PathBuf>,
 
-    /// Harness binary path. Required for minimization.
+    /// Harness binary path. Required for minimizing a crash/opaque-input finding;
+    /// omitted for a session finding (HDF-7), which minimizes by re-driving the
+    /// recorded multi-message session rather than re-running a harness binary.
     #[arg(long)]
-    pub harness: PathBuf,
+    pub harness: Option<PathBuf>,
 
     /// qemu-user executable for ELF-Linux cross-target minimization.
     #[arg(long, value_name = "QEMU")]
@@ -270,6 +272,13 @@ pub(crate) fn minimize_for_auto(
 }
 
 pub fn run(args: MinimizeArgs) -> i32 {
+    let finding_dir = resolve_finding_arg(args.finding_dir.clone(), args.finding.clone());
+    // HDF-7: a session finding minimizes by shrinking the recorded multi-message
+    // session (re-repairing computed fields / re-resolving bindings each
+    // candidate), not by delta-debugging a flat testcase against a harness.
+    if crate::session_fuzz::is_session_finding(&finding_dir) {
+        return crate::session_fuzz::minimize_session_finding(&finding_dir);
+    }
     match run_inner(args) {
         Ok(summary) => {
             println!(
@@ -291,12 +300,12 @@ pub fn run(args: MinimizeArgs) -> i32 {
 
 fn run_inner(args: MinimizeArgs) -> anyhow::Result<MinimizeSummary> {
     let finding_dir = resolve_finding_arg(args.finding_dir, args.finding);
+    let harness = args.harness.ok_or_else(|| {
+        anyhow!("minimize requires --harness <path> for a crash/opaque-input finding")
+    })?;
     if crate::binary_fuzz::is_binary_finding(&finding_dir) {
-        let result = crate::binary_fuzz::minimize_binary_finding(
-            &finding_dir,
-            &args.harness,
-            args.strategy,
-        )?;
+        let result =
+            crate::binary_fuzz::minimize_binary_finding(&finding_dir, &harness, args.strategy)?;
         return Ok(MinimizeSummary {
             strategy: args.strategy,
             original_len: result.original_len,
@@ -309,22 +318,17 @@ fn run_inner(args: MinimizeArgs) -> anyhow::Result<MinimizeSummary> {
     // skeleton but differ in how a candidate input reaches main():
     // libFuzzer takes argv[1], AFL persistent-mode reads stdin (the
     // generated template falls back to `bhf_afl_read_stdin`).
-    match detect_harness_engine(&args.harness) {
+    match detect_harness_engine(&harness) {
         HarnessEngine::CAfl => {
-            return minimize_c_engine(&finding_dir, &args.harness, args.strategy, CEngineIo::Stdin);
+            return minimize_c_engine(&finding_dir, &harness, args.strategy, CEngineIo::Stdin);
         }
         HarnessEngine::CLibFuzzer => {
-            return minimize_c_engine(
-                &finding_dir,
-                &args.harness,
-                args.strategy,
-                CEngineIo::ArgvFile,
-            );
+            return minimize_c_engine(&finding_dir, &harness, args.strategy, CEngineIo::ArgvFile);
         }
         HarnessEngine::AdaStdin => {}
     }
     let runner = harness_runner(
-        args.harness,
+        harness,
         args.qemu_user,
         args.qemu_args,
         args.sandbox,

@@ -24,6 +24,19 @@
   `results/findings.json` (schema in `schemas/`, reference fixture in `tests/fixtures/golden_results/`).
 
 ### Added
+- `bhf fuzz --protocol-profile <PATH>` drives a response-dependent, multi-message
+  **protocol session** (HDF-7): a versioned profile (`bhf.protocol.v1`, TOML)
+  declares typed messages, computed length/CRC/offset/TLV fields, response
+  captures and back-references, legal message ordering, session reset, and a
+  clean-exit oracle. Mutation edits field values and sequence structure, a repair
+  pass recomputes derived fields and re-resolves references before send, and
+  scheduling reports code-coverage novelty and protocol-state/transition novelty
+  separately. `--session-transport tcp:HOST:PORT`, `--session-reset`, and
+  `--max-session-messages` control the live TCP backend; a finding carries a
+  `session.json` artifact, and `bhf replay`/`bhf minimize` re-drive and shrink it
+  against a fresh reset. The run and finding record the profile hash and
+  transport/reset fidelity, for importers / SARIF / vulnerability-management
+  tools. (#58)
 - `results/findings.json` (`bhf.findings.v1`) with JSON Schemas in `schemas/`.
 - Per-finding `sanitizer.log`, harness sha256 + GNU build-id, `created_at`/`last_seen`,
   `history[]`, and a minimized reproducer for each root-cause group (`--no-minimize`).

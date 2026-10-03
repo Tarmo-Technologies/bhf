@@ -52,6 +52,12 @@ pub struct ReplayArgs {
 
 pub fn run(args: ReplayArgs) -> i32 {
     let finding_dir = resolve_finding_arg(args.finding_dir, args.finding);
+    // HDF-7: a finding carrying a session artifact replays by re-driving the
+    // recorded multi-message session against a freshly reset transport (which
+    // re-captures a fresh handle), not by re-running a harness binary.
+    if crate::session_fuzz::is_session_finding(&finding_dir) {
+        return crate::session_fuzz::replay_session_finding(&finding_dir);
+    }
     // The finding already records where its harness was built; resolve it so the
     // user does not have to repeat `--harness`. An explicit `--harness` always wins.
     let harness = match resolve_harness(&finding_dir, args.harness) {

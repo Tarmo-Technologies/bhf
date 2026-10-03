@@ -1731,6 +1731,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/session_fuzz.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/sloc.rs",
       "license": "Apache-2.0"
     },
@@ -2448,6 +2452,10 @@
     },
     {
       "path": "crates/cli/tests/sbom_assurance_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/session_fuzz_cli.rs",
       "license": "Apache-2.0"
     },
     {
@@ -3308,6 +3316,54 @@
     },
     {
       "path": "crates/project_synth/src/writer.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/protocol_session/Cargo.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/protocol_session/src/binding.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/protocol_session/src/lib.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/protocol_session/src/model.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/protocol_session/src/mutate.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/protocol_session/src/novelty.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/protocol_session/src/profile.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/protocol_session/src/response.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/protocol_session/src/runner.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/protocol_session/src/testcase.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/protocol_session/tests/fixtures/toy-open-write.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/protocol_session/tests/session.rs",
       "license": "Apache-2.0"
     },
     {

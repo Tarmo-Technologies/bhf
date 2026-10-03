@@ -431,6 +431,36 @@ pub struct FuzzArgs {
     /// over its protocol and rejects this option.
     #[arg(long = "transport-coverage-map", value_name = "SPEC")]
     pub transport_coverage_map: Option<String>,
+
+    /// Load a versioned protocol profile (TOML, `bhf.protocol.v1`) and fuzz the
+    /// target as a response-dependent, multi-message session (HDF-7) instead of
+    /// single opaque inputs. Additive: when this is absent the default host /
+    /// transport paths run byte-for-byte as before. Presence routes to the
+    /// session lane, which needs `--session-transport`. A testcase is a sequence
+    /// of structured messages; mutation edits field values AND sequence structure
+    /// and a repair pass recomputes derived length/CRC fields and re-resolves
+    /// response back-references before send. Findings (a clean-exit protocol
+    /// violation, no crash) are written through the usual `results/` layout for
+    /// importers / SARIF / vulnerability-management tools.
+    #[arg(long = "protocol-profile", value_name = "PATH")]
+    pub protocol_profile: Option<PathBuf>,
+
+    /// Request/response backend for the session lane. `tcp:HOST:PORT` connects a
+    /// socket per session. Required when `--protocol-profile` is set.
+    #[arg(long = "session-transport", value_name = "SPEC")]
+    pub session_transport: Option<String>,
+
+    /// How a session is reset between testcases: `reconnect` (default; a fresh
+    /// connection gives fresh per-session target state, so a new handle / id /
+    /// nonce is captured each run) or `none`. Recorded as the run's reset
+    /// fidelity.
+    #[arg(long = "session-reset", value_enum, default_value_t = crate::session_fuzz::SessionResetMode::Reconnect)]
+    pub session_reset: crate::session_fuzz::SessionResetMode,
+
+    /// Bounded cap on messages per session (default 64); a sequence mutation that
+    /// would exceed it fails with a diagnostic rather than growing unbounded.
+    #[arg(long = "max-session-messages", default_value_t = 64)]
+    pub max_session_messages: usize,
 }
 
 impl FuzzArgs {
@@ -1077,6 +1107,13 @@ pub fn run(args: FuzzArgs) -> i32 {
         return crate::transport_fuzz::run(args);
     }
 
+    // HDF-7: when a protocol profile is supplied, drive the additive session lane
+    // (a separate response-dependent, multi-message loop) and leave the host
+    // libFuzzer/AFL path below untouched.
+    if crate::session_fuzz::should_use_session(&args) {
+        return crate::session_fuzz::run(args);
+    }
+
     if multicore_requested(&args) {
         return run_multicore_campaign(args);
     }
@@ -1235,6 +1272,10 @@ pub(crate) fn run_one_target_programmatic_with_runner(
         stop_after_findings,
         target_transport: None,
         transport_coverage_map: None,
+        protocol_profile: None,
+        session_transport: None,
+        session_reset: crate::session_fuzz::SessionResetMode::Reconnect,
+        max_session_messages: 64,
     };
     let mut prepared = prepare(args)?;
     // A caller-supplied cross runner overrides the direct/host runner `prepare`
@@ -1307,6 +1348,10 @@ pub(crate) fn run_afl_plus_plus_programmatic(
         stop_after_findings: None,
         target_transport: None,
         transport_coverage_map: None,
+        protocol_profile: None,
+        session_transport: None,
+        session_reset: crate::session_fuzz::SessionResetMode::Reconnect,
+        max_session_messages: 64,
     };
     let prepared = prepare(args)?;
     run_afl_plus_plus(prepared)
@@ -8428,6 +8473,10 @@ mod auto_path_tests {
             stop_after_findings: None,
             target_transport: None,
             transport_coverage_map: None,
+            protocol_profile: None,
+            session_transport: None,
+            session_reset: crate::session_fuzz::SessionResetMode::Reconnect,
+            max_session_messages: 64,
         }
     }
 }
