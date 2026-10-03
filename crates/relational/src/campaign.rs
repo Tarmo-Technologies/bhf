@@ -4,9 +4,10 @@
 //!
 //! [`run_campaign`] mutates a shared testcase, runs it under every profile
 //! through a [`ProfileExecutor`], and retains any input that reaches new code in
-//! *any* profile, produces a new cross-profile outcome vector, or a new
-//! effect-event shape. For each case it evaluates the relational predicates and
-//! emits a deduplicated [`RelationFinding`] per violated relation.
+//! *any* profile, produces a new semantic observation, a new cross-profile
+//! outcome vector, or a new effect-event shape. For each case it evaluates the
+//! relational predicates and emits a deduplicated [`RelationFinding`] per
+//! violated relation.
 //!
 //! [`replay`] re-runs every profile a finding requires and re-confirms the
 //! relation. [`minimize`] shrinks the testcase while the relation still holds and
@@ -130,6 +131,7 @@ pub fn run_campaign_with<E: ProfileExecutor>(
     let mut unions: BTreeMap<String, UnionBitmap> = BTreeMap::new();
     let mut seen_outcome_vectors: BTreeSet<String> = BTreeSet::new();
     let mut seen_event_shapes: BTreeSet<String> = BTreeSet::new();
+    let mut seen_semantic_shapes: BTreeSet<String> = BTreeSet::new();
     let mut seen_signatures: BTreeSet<String> = BTreeSet::new();
 
     let mut findings: Vec<RelationFinding> = Vec::new();
@@ -165,12 +167,16 @@ pub fn run_campaign_with<E: ProfileExecutor>(
 
         let observations = observe_runs(config, &runs);
 
-        // Outcome-vector and effect-shape novelty retain inputs even with no new
-        // edges (e.g. a shell mock emits no coverage bitmap).
+        // Outcome-vector, effect-shape and semantic-observation novelty retain
+        // inputs even with no new edges (e.g. a shell mock emits no coverage
+        // bitmap, or a postcondition fires with identical coverage/outcome/effects).
         if seen_outcome_vectors.insert(outcome_vector_key(&observations)) {
             novel = true;
         }
         if seen_event_shapes.insert(event_shape_key(&observations)) {
+            novel = true;
+        }
+        if seen_semantic_shapes.insert(semantic_shape_key(&observations)) {
             novel = true;
         }
         if novel {
@@ -404,6 +410,29 @@ fn event_shape_key(observations: &BTreeMap<String, Observation>) -> String {
         .join("|")
 }
 
+/// Novelty key for the *semantic-observation* dimension: per profile, the sorted,
+/// deduped set of `(rule, verdict)` over its `semantic_hits`. Folding this into
+/// the retention key means an input that produces a **new semantic observation**
+/// — a new postcondition / runtime-oracle result — is retained even when its
+/// coverage, cross-profile outcome vector and effect-event shape are all already
+/// seen (issue #61: retain inputs that produce "a new semantic observation").
+fn semantic_shape_key(observations: &BTreeMap<String, Observation>) -> String {
+    observations
+        .iter()
+        .map(|(name, o)| {
+            let mut hits: Vec<String> = o
+                .semantic_hits
+                .iter()
+                .map(|hit| format!("{}={:?}", hit.rule, hit.verdict))
+                .collect();
+            hits.sort();
+            hits.dedup();
+            format!("{name}:{}", hits.join(","))
+        })
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
 /// Self-contained delta-debugging byte minimizer. Mirrors the standard ddmin:
 /// shrink by removing chunks while `predicate` still holds, then try keeping each
 /// chunk alone. Returns the minimized bytes and the number of predicate runs.
@@ -491,7 +520,7 @@ mod tests {
     use super::*;
     use crate::executor::FnExecutor;
     use crate::finding::{FindingKind, RelationFinding};
-    use crate::observation::{EffectEvent, Observation, ProfileStatus};
+    use crate::observation::{EffectEvent, Observation, ProfileStatus, SemanticHit, SemanticVerdict};
     use crate::predicate::{evaluate_one, Violation};
     use crate::schema::Profile;
 
@@ -768,5 +797,97 @@ when = { kind = "status_is", profile = "admin", status = "allowed" }
             .events
             .iter()
             .any(|e| e.target == "administrator-helper"));
+    }
+
+    /// Issue #61 retention: an input producing a NEW semantic observation — with
+    /// the same coverage, same cross-profile outcome vector and same effect-event
+    /// shape as one already seen — must still be retained. The semantic-hit set is
+    /// the ONLY dimension that differs here, so retention rests solely on the
+    /// semantic-observation novelty key. Without it the input would be dropped.
+    #[test]
+    fn new_semantic_observation_is_retained() {
+        // One profile. Coverage, status and events are constant for every input;
+        // a leading 0xBB byte makes the (mock) runtime oracle fire, producing a
+        // semantic hit that nothing else reflects.
+        let src = r#"
+schema = "bhf.relational.v1"
+[[profiles]]
+name = "viewer"
+"#;
+        let config = RelationalConfig::parse(src).unwrap();
+        let mut exec = FnExecutor::new(|_p: &Profile, input: &[u8]| {
+            let run = ProfileRun::ready("viewer", 0)
+                .with_coverage(vec![1u8]) // constant => no edge novelty after case 1
+                .with_events(vec![EffectEvent::process_exec("execve", "viewer-helper")]);
+            if input.first() == Some(&0xBB) {
+                run.with_semantic_hits(vec![SemanticHit {
+                    rule: "postcondition.leaked-handle".into(),
+                    verdict: SemanticVerdict::Finding,
+                    detail: "handle left open".into(),
+                }])
+            } else {
+                run
+            }
+        });
+        let opts = CampaignOptions {
+            max_execs: 2,
+            max_len: 4,
+            seed: 7,
+            max_findings: 8,
+        };
+        // Two seeds, both executed verbatim: a plain one (first-seen on every
+        // dimension) then a semantically-novel one that is identical on coverage,
+        // outcome vector and effect shape.
+        let seeds = vec![vec![0x01u8], vec![0xBBu8]];
+        let report = run_campaign(&config, &seeds, &mut exec, &opts).unwrap();
+
+        assert_eq!(report.execs, 2);
+        // corpus = 2 seeds + both retained: seed 0 is novel on every dimension,
+        // seed 1 is novel ONLY on the semantic dimension. Drop the semantic key
+        // and seed 1 is not novel, so corpus_size would be 3.
+        assert_eq!(
+            report.corpus_size, 4,
+            "the semantically-novel input must be retained on its semantic observation alone"
+        );
+    }
+
+    /// The semantic-observation key distinguishes a new rule, a new verdict, and
+    /// the empty/no-hit case, while an identical semantic shape collapses.
+    #[test]
+    fn semantic_shape_key_separates_rule_and_verdict() {
+        let none = {
+            let mut m = BTreeMap::new();
+            m.insert("v".to_string(), Observation::ready("v", ProfileStatus::Allowed));
+            m
+        };
+        let finding = {
+            let mut m = BTreeMap::new();
+            let mut o = Observation::ready("v", ProfileStatus::Allowed);
+            o.semantic_hits = vec![SemanticHit {
+                rule: "r1".into(),
+                verdict: SemanticVerdict::Finding,
+                detail: "d".into(),
+            }];
+            m.insert("v".to_string(), o);
+            m
+        };
+        let clean = {
+            let mut m = BTreeMap::new();
+            let mut o = Observation::ready("v", ProfileStatus::Allowed);
+            o.semantic_hits = vec![SemanticHit {
+                rule: "r1".into(),
+                verdict: SemanticVerdict::Clean,
+                detail: "d".into(),
+            }];
+            m.insert("v".to_string(), o);
+            m
+        };
+        let a = semantic_shape_key(&none);
+        let b = semantic_shape_key(&finding);
+        let c = semantic_shape_key(&clean);
+        assert_ne!(a, b, "a semantic hit must differ from no hit");
+        assert_ne!(b, c, "the same rule with a different verdict must differ");
+        // The key ignores the human-readable detail and is stable/dedup-order-free.
+        assert_eq!(b, semantic_shape_key(&finding));
     }
 }

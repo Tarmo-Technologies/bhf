@@ -5,9 +5,10 @@
 //! (differing in runner, args, environment, declared target allowlist and secret
 //! references) and a set of declarative relational **predicates** is evaluated
 //! over each profile's observed behaviour. The campaign retains any input that
-//! reaches new code in any profile, produces a new cross-profile outcome vector,
-//! or a new effect-event shape, and emits a finding when a policy relation is
-//! violated — catching both unexpected *divergence* and unexpected *equivalence*.
+//! reaches new code in any profile, produces a new semantic observation, a new
+//! cross-profile outcome vector, or a new effect-event shape, and emits a finding
+//! when a policy relation is violated — catching both unexpected *divergence* and
+//! unexpected *equivalence*.
 //!
 //! The campaign engine, mutator, coverage novelty, predicate evaluator, finding
 //! model, replay and minimize all live in the pure `relational` crate behind the
@@ -193,6 +194,12 @@ fn run_campaign_cmd(a: RunArgs) -> Result<i32> {
     let scratch = work_dir.join(".relational-scratch");
     let _ = fs::remove_dir_all(&scratch);
     fs::create_dir_all(&scratch).context("create relational scratch dir")?;
+    // Remove the campaign scratch root on every exit — success, a propagated
+    // campaign error, or an unwinding panic — so an errored/interrupted run does
+    // not leave it behind. Per-case scratch is cleaned promptly inside each run
+    // (see `ScratchGuard` in `SpawnExecutor::run`), so this root is normally empty
+    // by the time the guard fires.
+    let _scratch_guard = ScratchGuard::new(scratch.clone());
 
     let mut executor = SpawnExecutor::new(
         &scratch,
@@ -240,7 +247,7 @@ fn run_campaign_cmd(a: RunArgs) -> Result<i32> {
         exit_code,
         results::model::ProducerStatus::Complete,
     );
-    let _ = fs::remove_dir_all(&scratch);
+    // `_scratch_guard` removes the scratch root here as it drops.
     Ok(exit_code)
 }
 
@@ -294,6 +301,7 @@ fn replay_cmd(a: ReplayArgs) -> Result<i32> {
     let config = load_config_for_finding(a.config.as_deref(), &loaded.dir)?;
 
     let scratch = scratch_under(&loaded.dir, "replay");
+    let _scratch_guard = ScratchGuard::new(scratch.clone());
     let mut executor = SpawnExecutor::new(
         &scratch,
         Duration::from_secs(a.timeout_secs),
@@ -329,7 +337,7 @@ fn replay_cmd(a: ReplayArgs) -> Result<i32> {
         serde_json::to_vec_pretty(&bundle)?,
     )
     .context("write replay.json")?;
-    let _ = fs::remove_dir_all(&scratch);
+    // `_scratch_guard` removes the replay scratch here (and on any error above).
 
     crate::bhfeprintln!(
         "relational replay: profiles={:?} reproduced={} outcome={}",
@@ -349,6 +357,7 @@ fn minimize_cmd(a: MinimizeArgs) -> Result<i32> {
     let config = load_config_for_finding(a.config.as_deref(), &loaded.dir)?;
 
     let scratch = scratch_under(&loaded.dir, "minimize");
+    let _scratch_guard = ScratchGuard::new(scratch.clone());
     let mut executor = SpawnExecutor::new(
         &scratch,
         Duration::from_secs(a.timeout_secs),
@@ -377,7 +386,7 @@ fn minimize_cmd(a: MinimizeArgs) -> Result<i32> {
         serde_json::to_vec_pretty(&summary)?,
     )
     .context("write minimize.json")?;
-    let _ = fs::remove_dir_all(&scratch);
+    // `_scratch_guard` removes the minimize scratch here (and on any error above).
 
     crate::bhfeprintln!(
         "relational minimize: {} -> {} bytes, required profiles={:?}",
@@ -736,6 +745,29 @@ trait TestcaseBytes {
     fn testcase_for(&self, sha: &str) -> Option<Vec<u8>>;
 }
 
+/// Removes a scratch directory when it drops. Used for both the per-(profile,
+/// case) scratch and a command's scratch root, so neither a long campaign (which
+/// would otherwise accumulate a dir per run) nor an error / interrupt that unwinds
+/// through a run leaves scratch behind. Every byte a finding needs is folded into
+/// the returned [`ProfileRun`] before the per-case guard drops, so nothing a
+/// finding references lives under a guarded dir. Cleanup is best-effort: a failed
+/// removal is ignored rather than masking the real result.
+struct ScratchGuard {
+    dir: PathBuf,
+}
+
+impl ScratchGuard {
+    fn new(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+}
+
+impl Drop for ScratchGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
 /// A [`relational::ProfileExecutor`] that spawns each profile in isolation.
 struct SpawnExecutor {
     scratch: PathBuf,
@@ -785,6 +817,14 @@ impl ProfileExecutor for SpawnExecutor {
         let case_dir = self
             .scratch
             .join(format!("{case:010}-{}", sanitize(&profile.name)));
+        // Clean this case's scratch (input.bin + cov.shm + runtrace.jsonl +
+        // collector.jsonl) as soon as the run returns — on success, a setup
+        // failure, an error or a panic — so a long campaign never accumulates
+        // per-case dirs and an interrupt leaks at most the one in flight. Declared
+        // before the dir is created so even a bail during setup is covered; the
+        // coverage/events/stdout it reads are all folded into the `ProfileRun`
+        // before this drops.
+        let _scratch = ScratchGuard::new(case_dir.clone());
         fs::create_dir_all(&case_dir).map_err(|e| failed(profile, format!("scratch dir: {e}")))?;
         let input_path = case_dir.join("input.bin");
         fs::write(&input_path, input).map_err(|e| failed(profile, format!("write input: {e}")))?;
@@ -882,18 +922,55 @@ struct RunOutcome {
 /// Spawn `cmd`, feed `input` on stdin, enforce `timeout`, and capture stdout +
 /// exit code. Returns `None` when the process could not be spawned at all (a
 /// setup failure). A timeout yields `exit_code: None`.
+///
+/// stdin is fed and stdout/stderr are drained on dedicated threads that run
+/// concurrently with the wait loop, so the child can never deadlock the parent
+/// against a full pipe: a target that streams more than a pipe buffer of output,
+/// or that never reads its stdin, keeps making progress instead of blocking until
+/// `timeout`. On timeout (or a wait error) the child is killed; closing its pipe
+/// ends unblocks the feed/drain threads, which are then joined so no per-case
+/// thread lingers. Per-(profile, case) isolation is unchanged — each call owns its
+/// own child and its own pipes.
 fn spawn_capture(mut cmd: Command, input: &[u8], timeout: Duration) -> Option<RunOutcome> {
     let mut child = cmd.spawn().ok()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(input);
-        // Dropping stdin here closes it so a reader sees EOF.
-    }
+
+    // Hand each stdio end to its own thread *before* the wait loop, so writing a
+    // large stdin and draining a large stdout/stderr happen in parallel with the
+    // child's own progress — the sequential "write all stdin, then poll, then read
+    // stdout" shape deadlocked whenever either pipe filled.
+    let stdin_feeder = child.stdin.take().map(|mut stdin| {
+        let payload = input.to_vec();
+        std::thread::spawn(move || {
+            // A target that ignores or short-circuits stdin makes this fail with
+            // EPIPE once its read end closes; that is expected, not an error.
+            let _ = stdin.write_all(&payload);
+            // Dropping `stdin` here closes it so the child sees EOF.
+        })
+    });
+    let stdout_drain = child.stdout.take().map(|mut out| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = out.read_to_end(&mut buf);
+            buf
+        })
+    });
+    let stderr_drain = child.stderr.take().map(|mut err| {
+        std::thread::spawn(move || {
+            let mut sink = Vec::new();
+            let _ = err.read_to_end(&mut sink);
+        })
+    });
 
     let start = Instant::now();
     let mut timed_out = false;
+    let mut errored = false;
+    let mut exit_status = None;
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => {
+                exit_status = Some(status);
+                break;
+            }
             Ok(None) => {
                 if start.elapsed() >= timeout {
                     let _ = child.kill();
@@ -906,26 +983,29 @@ fn spawn_capture(mut cmd: Command, input: &[u8], timeout: Duration) -> Option<Ru
             Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Some(RunOutcome {
-                    exit_code: None,
-                    stdout: Vec::new(),
-                });
+                errored = true;
+                break;
             }
         }
     }
 
-    let mut stdout = Vec::new();
-    if let Some(mut out) = child.stdout.take() {
-        let _ = out.read_to_end(&mut stdout);
+    // The child has exited or been killed, so every pipe end is now closed: the
+    // feed/drain threads observe EOF/EPIPE and finish. Join them to collect the
+    // captured stdout and to guarantee no per-case thread outlives the run.
+    if let Some(feeder) = stdin_feeder {
+        let _ = feeder.join();
     }
-    if let Some(mut err) = child.stderr.take() {
-        let mut sink = Vec::new();
-        let _ = err.read_to_end(&mut sink);
+    let stdout = stdout_drain
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
+    if let Some(drain) = stderr_drain {
+        let _ = drain.join();
     }
-    let exit_code = if timed_out {
+
+    let exit_code = if timed_out || errored {
         None
     } else {
-        child.wait().ok().and_then(|status| status.code())
+        exit_status.and_then(|status| status.code())
     };
     Some(RunOutcome { exit_code, stdout })
 }

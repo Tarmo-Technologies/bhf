@@ -109,6 +109,13 @@ impl ProfileRun {
         self.events = None;
         self
     }
+
+    /// Builder: set the semantic/postcondition results.
+    #[must_use]
+    pub fn with_semantic_hits(mut self, hits: Vec<SemanticHit>) -> Self {
+        self.semantic_hits = hits;
+        self
+    }
 }
 
 /// Runs a testcase under a profile. Implemented in-process for tests and with

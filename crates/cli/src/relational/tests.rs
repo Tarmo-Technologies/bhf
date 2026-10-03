@@ -306,3 +306,135 @@ fn comparator_bundle_bytes_scrub_resolved_secrets_before_sending() {
         "non-secret content survives: {text}"
     );
 }
+
+/// Finding #1 (stdio deadlock): a child that streams far more than a pipe buffer
+/// to stdout while ignoring a large stdin must NOT deadlock — the concurrent
+/// drain/feed completes in milliseconds and captures the full output. The pre-fix
+/// sequential path (write all stdin, poll to exit, THEN read stdout) blocked on
+/// either full pipe until the timeout. The call runs on a worker thread held to a
+/// tight wall-clock budget so a regression fails the test instead of hanging.
+#[cfg(unix)]
+#[test]
+fn spawn_capture_drains_large_output_without_deadlock() {
+    const BYTES: usize = 1 << 20; // 1 MiB, far above the ~64 KiB pipe buffer
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
+        .arg(format!("head -c {BYTES} /dev/zero"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let big_stdin = vec![b'A'; BYTES];
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let start = Instant::now();
+        // A generous spawn timeout: if the deadlock regressed, spawn_capture would
+        // only return after this elapses — but the recv_timeout below fires first.
+        let outcome = spawn_capture(cmd, &big_stdin, Duration::from_secs(30));
+        let _ = tx.send((outcome, start.elapsed()));
+    });
+    let (outcome, elapsed) = rx
+        .recv_timeout(Duration::from_secs(15))
+        .expect("spawn_capture must return well within budget (no stdio deadlock)");
+    worker.join().unwrap();
+
+    let outcome = outcome.expect("child spawns");
+    assert_eq!(
+        outcome.exit_code,
+        Some(0),
+        "child must exit cleanly, not be killed by the timeout"
+    );
+    assert_eq!(
+        outcome.stdout.len(),
+        BYTES,
+        "the full streamed stdout must be captured, not a pipe buffer's worth"
+    );
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "draining concurrently must finish fast, not wait out the timeout: {elapsed:?}"
+    );
+}
+
+/// Finding #2 (scratch-dir leak): `ScratchGuard` removes its directory on drop,
+/// and dropping a guard for an already-absent dir is a harmless no-op.
+#[test]
+fn scratch_guard_removes_dir_on_drop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("0000000001-viewer");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("input.bin"), b"x").unwrap();
+    std::fs::write(dir.join("cov.shm"), b"").unwrap();
+    assert!(dir.exists());
+    {
+        let _guard = ScratchGuard::new(dir.clone());
+    } // guard drops here
+    assert!(
+        !dir.exists(),
+        "the per-case scratch dir must be removed when the guard drops"
+    );
+    // Dropping a guard for an already-absent dir must not panic.
+    drop(ScratchGuard::new(dir));
+}
+
+/// Finding #2 (scratch-dir leak): every per-(profile, case) scratch dir is cleaned
+/// as soon as the run returns — on a normal run AND on a mid-run setup failure —
+/// so the scratch root never accumulates dirs over a long (or interrupted)
+/// campaign.
+#[cfg(unix)]
+#[test]
+fn run_cleans_per_case_scratch_promptly() {
+    use relational::ProfileExecutor;
+
+    let prev = std::env::var("BHF_RUNTRACE_SHIM").ok();
+    // Keep the test hermetic: no LD_PRELOAD shim regardless of the host.
+    std::env::set_var("BHF_RUNTRACE_SHIM", "off");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let scratch = tmp.path().join("scratch");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let mut exec = SpawnExecutor::new(&scratch, Duration::from_secs(10), "lab:".into());
+
+    let runnable = Profile {
+        name: "runner".into(),
+        runner: None,
+        args: vec!["/bin/true".into()],
+        env: Default::default(),
+        allowlist: Vec::new(),
+        collector: CollectorKind::None,
+    };
+    let unspawnable = Profile {
+        name: "broken".into(),
+        runner: None,
+        args: Vec::new(), // no program => setup failure after scratch is created
+        env: Default::default(),
+        allowlist: Vec::new(),
+        collector: CollectorKind::None,
+    };
+
+    // Several successful cases, each must leave the scratch root empty (no
+    // accumulation across a long campaign).
+    for _ in 0..3 {
+        let run = exec.run(&runnable, b"input").unwrap();
+        assert_eq!(run.run_state, RunState::Ready);
+        assert_eq!(
+            std::fs::read_dir(&scratch).unwrap().count(),
+            0,
+            "a completed case must leave no scratch behind"
+        );
+    }
+
+    // A setup failure is a mid-run abort: its scratch (input.bin/cov.shm/…) was
+    // created, then the run bailed — the guard must still have removed it.
+    let broken = exec.run(&unspawnable, b"input").unwrap();
+    assert_eq!(broken.run_state, RunState::SetupFailure);
+    assert_eq!(
+        std::fs::read_dir(&scratch).unwrap().count(),
+        0,
+        "a setup-failure case must not leak its scratch dir"
+    );
+
+    match prev {
+        Some(value) => std::env::set_var("BHF_RUNTRACE_SHIM", value),
+        None => std::env::remove_var("BHF_RUNTRACE_SHIM"),
+    }
+}

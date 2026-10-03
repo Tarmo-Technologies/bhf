@@ -33,8 +33,9 @@
   unexpected *divergence* and unexpected *equivalence* against an explicit policy — an
   authorization bug class a crash-only or single-harness output-diff oracle cannot see,
   because the offending runs can exit `0` with byte-identical stdout (#61). The campaign
-  retains inputs that reach new code in any profile, a new cross-profile outcome vector, or
-  a new effect-event shape, and emits a finding per violated relation: `BHF-308`
+  retains inputs that reach new code in any profile, a new semantic observation
+  (postcondition / runtime-oracle result), a new cross-profile outcome vector, or a new
+  effect-event shape, and emits a finding per violated relation: `BHF-308`
   (unexpected authorization, CWE-863), `BHF-309` (allowlist escape, CWE-862), `BHF-310`
   (unexpected equivalence, CWE-285), `BHF-311` (unexpected divergence, CWE-754) and
   `BHF-312` (external-comparator violation, CWE-285). An `external` predicate names a
@@ -211,6 +212,16 @@
   removes `results/report/`.
 
 ### Fixed
+- **Relational executor robustness** (`bhf relational`, #61): the per-profile spawn now
+  feeds stdin and drains stdout/stderr on dedicated threads concurrently with the wait
+  loop, so a target that streams more than a pipe buffer of output — or never reads its
+  stdin — no longer deadlocks the parent until `--timeout-secs`; the timeout/kill behaviour
+  is unchanged. Each per-(profile,case) scratch dir (`input.bin` + `cov.shm` +
+  `runtrace.jsonl` + `collector.jsonl`) is now removed as soon as its run returns (via an
+  RAII guard), and the campaign/replay/minimize scratch roots are removed on any exit
+  including a propagated error, so a long or interrupted campaign no longer accumulates or
+  leaks scratch. Retention now also folds in a **new semantic observation** (postcondition /
+  runtime-oracle result), matching the documented behaviour.
 - **Secret redaction in binary-lane findings** (`bhf project run`, #56): a resolved
   `${secret:NAME}` / `${env:NAME}` env value no longer leaks in plaintext into
   `results/findings/<id>/finding.json` (nor anything `bhf replay`/`minimize` reads back).
