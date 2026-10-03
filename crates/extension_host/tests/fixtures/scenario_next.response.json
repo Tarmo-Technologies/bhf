@@ -1,0 +1,13 @@
+{
+  "protocol": "bhf.extension.v1",
+  "case": {
+    "campaign": "demo-campaign",
+    "worker": "worker-0",
+    "testcase": "tc-000201"
+  },
+  "result": "ok",
+  "value": {
+    "message_b64": "AA9PUEVOIGxvZ3MvYS50eHQvW8fA",
+    "label": "OPEN"
+  }
+}

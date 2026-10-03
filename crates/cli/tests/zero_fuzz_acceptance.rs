@@ -641,7 +641,9 @@ fn incompatible_resume_and_clean_all_cannot_reuse_stale_generated_state() {
         );
     }
     assert!(work.join("corpus/KEEP/seed.bin").is_file());
-    assert!(work.join("findings/KEEP/record").is_file());
+    // The auto bracket migrates legacy `findings/` into the results layout.
+    assert!(work.join("results/findings/KEEP/record").is_file());
+    assert!(!work.join("findings/KEEP/record").exists());
     let refreshed_cache: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&cache_path).unwrap()).unwrap();
     assert_ne!(refreshed_cache["producer_version"], "obsolete-release");

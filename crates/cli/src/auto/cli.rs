@@ -51,7 +51,7 @@ RECOMMENDED SWEEP:
   --sloc FILE  per-language SLOC breakdown (.json for JSON)
   --debug      backtrace on a bhf-internal panic; enriches the bug report
 
-  Read bhf_work/FINDINGS.md first. Full guide: RECOMMENDED-SWEEP.md
+  Read bhf_work/results/INDEX.md first. Full guide: RECOMMENDED-SWEEP.md
   (docs/recommended-sweep.md in the repository).";
 
 fn parse_positive_mib(value: &str) -> std::result::Result<usize, String> {
@@ -608,10 +608,13 @@ pub struct AutoArgs {
     #[arg(long)]
     pub sloc: Option<PathBuf>,
 
-    /// Run in static-dynamic mode: add a `scan_type` column to findings.csv
-    /// (`static-dynamic` for static-scan results, `dynamic` for fuzzed results).
+    /// Deprecated, no effect: results/findings.csv always has a kind column.
     #[arg(long = "static-dynamic")]
     pub static_dynamic: bool,
+
+    /// Skip minimizing each root-cause representative after fuzzing (bounded to 30 s per group, 5 min total).
+    #[arg(long = "no-minimize")]
+    pub no_minimize: bool,
 
     /// Configurable C/C++ decoder synthesis caps (§27.11): `--max-decode-depth`,
     /// `--max-array-elems`, `--max-decl-bytes` (C) and `--container-size-max`,
@@ -853,6 +856,7 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
             .canonicalize()
             .unwrap_or(args.work_dir.clone()),
     );
+    crate::workdir::prepare(&work)?;
     // Register the report dir NOW so an uncaught panic anywhere below (discovery,
     // IDL/CORBA scaffolding, ranking, report) can still flush the bug report.
     crate::auto::bug_report::set_output_dir(work.join("auto"));
@@ -1194,6 +1198,18 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     // candidate count is printed under it.
     drop(discovery_ticker);
     console.println(&format!("  discovered {} candidate(s)", candidates.len()));
+    // A large tree analyzes and fuzzes every candidate by default, with no outer
+    // wall-clock cap and a minutes-long, mostly silent indexing phase — so point
+    // the operator at the knobs that bound the run before they think it hung.
+    if candidates.len() > 150 && args.max_targets.is_none() && args.campaign_time.is_none() {
+        bhfeprintln!(
+            "bhf auto: {} candidates discovered; by default every one is analyzed and fuzzed with \
+             no outer time cap, which can take several minutes on a large tree. Bound it with \
+             --max-targets N (inspect at most N) and/or --campaign-time SECONDS (total fuzz \
+             budget); raise --jobs for more build+fuzz concurrency.",
+            candidates.len()
+        );
+    }
     // #102: if any files were dropped during discovery (read/decode/parse
     // failures), say so on the console — bounded and grouped — so a parser
     // regression on a large tree is visible immediately, not just in run.json.
@@ -1341,7 +1357,7 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         // A --static scan that produced findings is a successful run (0), not the
         // "nothing to do" code (2).
         let had_static =
-            args.static_scan && !crate::auto::report::tree_static_finding_ids(&work).is_empty();
+            args.static_scan && !crate::auto::report::disk_only_finding_ids(&work).is_empty();
         return Ok(if had_static { 0 } else { 2 });
     }
 
@@ -1354,6 +1370,15 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         bhfeprintln!(
             "bhf auto: resolving cross-dir headers from project root {}",
             header_root.display()
+        );
+    }
+    // decl_index over a large tree is the longest silent phase (tens of seconds
+    // on a big single-header C/C++ project); announce it so the run doesn't look
+    // wedged while it indexes.
+    if candidates.len() > 150 {
+        bhfeprintln!(
+            "bhf auto: indexing declarations across {} candidate(s) (large tree; this can take a minute)…",
+            candidates.len()
         );
     }
     let _tix = std::time::Instant::now();
@@ -2581,7 +2606,7 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     // Reconcile the in-memory pass records against the on-disk findings/ dir now
     // that every post-pass has run. A post-pass (COBOL crash attribution) deletes
     // a finding it proves a harness artifact, but only disk-derived outputs
-    // (findings.csv, FINDINGS.md) saw that removal — the pass records that feed
+    // (the results/ index) saw that removal — the pass records that feed
     // the headline count, run.json and run.md still carried the id, so the count
     // reported a finding with no evidence bundle. Drop those phantom ids so every
     // finding surface agrees before the report is written.
@@ -2613,6 +2638,15 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         &options.sanitizers,
     )?;
     crate::auto::discovery::bhfprof("auto:write_reports", _twr);
+
+    if !args.no_minimize {
+        let (minimized, skipped) = crate::auto::minimize_pass::run(&work);
+        if minimized + skipped > 0 {
+            bhfeprintln!(
+                "bhf: minimized {minimized} representative(s); {skipped} left for `bhf minimize` (time budget)"
+            );
+        }
+    }
 
     // --install-deps: read the just-written manifest and fetch what we can
     // (online, opt-in). Re-run afterward to build against the real deps.
@@ -3707,9 +3741,10 @@ impl AutoSummary {
             }
         }
         findings += report_only_finding_ids.len();
-        // `--static`: whole-tree static findings live in the findings dir (not on
-        // any result) — fold their count into the headline total shown on the CLI.
-        findings += crate::auto::report::tree_static_finding_ids(work).len();
+        // Disk-only findings (`--static`, replays, profiling, external tools,
+        // differential) live in the findings dir (not on any result) — fold their
+        // count into the headline total shown on the CLI.
+        findings += crate::auto::report::disk_only_finding_ids(work).len();
 
         let per_language = [(Lang::Ada, "Ada"), (Lang::C, "C"), (Lang::Cpp, "C++")]
             .into_iter()
@@ -3763,23 +3798,25 @@ impl AutoSummary {
         let harness_root = crate::auto::layout::harness_root(&self.work);
         let mut s = String::new();
 
+        let results_dir = corpus::layout::results_dir(&self.work);
         let _ = writeln!(s, "BHF findings");
         let _ = writeln!(s, "  Findings:     {}", self.findings);
         let _ = writeln!(
             s,
             "  START HERE:   {}",
-            self.work.join("FINDINGS.md").display()
+            results_dir.join("INDEX.md").display()
         );
         let _ = writeln!(
             s,
-            "  CSV index:    {}",
-            self.work.join("findings.csv").display()
+            "  JSON / CSV:   {} · {}",
+            results_dir.join("findings.json").display(),
+            results_dir.join("findings.csv").display()
         );
         if self.findings > 0 {
             let _ = writeln!(
                 s,
                 "  Evidence:     {}/",
-                self.work.join("findings").display()
+                corpus::layout::findings_dir(&self.work).display()
             );
         }
         let _ = writeln!(s);
@@ -3898,7 +3935,11 @@ impl AutoSummary {
         );
         let _ = writeln!(s, "  harnesses: {}/<harness-id>/", harness_root.display());
         if self.findings > 0 {
-            let _ = writeln!(s, "  findings:  {}/", self.work.join("findings").display());
+            let _ = writeln!(
+                s,
+                "  findings:  {}/",
+                corpus::layout::findings_dir(&self.work).display()
+            );
         }
         let _ = writeln!(s, "  summary:   {}", auto_dir.join("summary.txt").display());
         s
@@ -6177,7 +6218,7 @@ mod tests {
             out.contains("requirements: /w/auto/missing-deps.txt"),
             "{out}"
         );
-        assert!(out.contains("findings:  /w/findings/"), "{out}");
+        assert!(out.contains("findings:  /w/results/findings/"), "{out}");
         assert!(out.contains("summary:   /w/auto/summary.txt"), "{out}");
     }
 

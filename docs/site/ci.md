@@ -46,7 +46,8 @@ fuzz-confirmed finding.
    but only the changed files' targets are built and fuzzed, and the discovery
    cache is reused across runs so repeat PR runs are fast.
 4. **Uploads SARIF** to code-scanning for inline annotations.
-5. **Posts a sticky summary comment** (one comment, updated in place).
+5. **Posts a sticky summary comment** (one comment, updated in place), which
+   links `results/INDEX.md` for the full findings index.
 6. **Enforces the gate** — see below.
 
 ## Inputs
@@ -112,9 +113,10 @@ bhf ci . \
 - `--changed-since <ref>` scopes to the diff (`<merge-base>..HEAD`).
 - `--changed-paths-from <file>` uses a precomputed newline-separated file list
   instead of asking git.
-- `--sarif <path>` writes a SARIF 2.1.0 report; `--ci-json <path>` writes a compact
-  machine-readable result (counts by severity/verdict, confirmed count, scoped
-  file count) for your own reporting.
+- `--sarif <path>` copies `results/findings.sarif` (SARIF 2.1.0) to `<path>`;
+  `--ci-json <path>` writes a compact machine-readable result (counts by
+  severity/verdict, confirmed count, scoped file count) for your own
+  reporting.
 - Exit code is `0` unless the gate fails.
 
 ## LLM and agent use in CI

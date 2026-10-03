@@ -169,7 +169,7 @@ fn fake_corba_servant_produces_finding_when_gnat_available() {
     let id = emitter
         .emit(&input, testcase, handler_idx)
         .expect("finding is emitted");
-    let finding_dir = temp.join("findings").join(&id.0);
+    let finding_dir = temp.join("results").join("findings").join(&id.0);
     let finding: serde_json::Value =
         serde_json::from_slice(&fs::read(finding_dir.join("finding.json")).unwrap()).unwrap();
 

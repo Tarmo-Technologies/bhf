@@ -1,0 +1,126 @@
+{
+  "schema_version": "bhf.findings.v1",
+  "generated_at": "2026-10-01T12:00:00Z",
+  "tool": { "name": "bhf", "version": "0.3.0", "build": "0.3.0" },
+  "source": {
+    "root": "/src/demo",
+    "vcs": { "kind": "git", "commit": "0123456789abcdef0123456789abcdef01234567", "branch": "main", "dirty": false }
+  },
+  "producers": [
+    { "command": "auto", "argv": ["bhf", "auto", "/src/demo"], "started_at": "2026-10-01T11:00:00Z", "finished_at": "2026-10-01T11:58:00Z", "status": "complete", "exit_code": 0, "findings_total": 1 },
+    { "command": "sbom", "argv": ["bhf", "sbom", "/src/demo"], "started_at": "2026-10-01T11:58:10Z", "finished_at": "2026-10-01T11:58:20Z", "status": "complete", "exit_code": 0, "findings_total": 2 }
+  ],
+  "counts": {
+    "total": 2,
+    "by_kind": { "fuzz": 1, "sca": 1 },
+    "by_severity": { "high": 2 },
+    "by_confirmation": { "sanitizer_crash": 1, "advisory": 1 }
+  },
+  "findings": [
+    {
+      "id": "F-0000-1a2b3c4d",
+      "kind": "fuzz",
+      "producer": "fuzz",
+      "rule": { "id": "BHF-201", "slug": "heap-buffer-overflow", "name": "Heap buffer overflow" },
+      "title": "heap-buffer-overflow READ of size 4 in parse_header",
+      "message": "heap-buffer-overflow READ of size 4 at 0x… in parse_header",
+      "explanation": "Untrusted bytes reach parse_header without a length check.",
+      "severity": "high",
+      "impact": "high",
+      "confidence": { "level": "high", "score": 0.91 },
+      "cwe": [122],
+      "confirmation": { "level": "sanitizer_crash", "detail": null },
+      "verdict": "real_reachable",
+      "location": { "file": "src/parse.c", "line": 42, "column": null, "function": "parse_header" },
+      "fix_location": { "file": "src/parse.c", "line": 40, "column": null, "function": null },
+      "stack": [
+        { "function": "parse_header", "file": "src/parse.c", "line": 42 },
+        { "function": "parse", "file": "src/parse.c", "line": 88 }
+      ],
+      "trace": [],
+      "fingerprint": { "primary": "c0ffee00c0ffee00c0ffee00c0ffee00", "signature": "aa11bb22" },
+      "group": "c0ffee00c0ffee00c0ffee00c0ffee00",
+      "occurrences": 1,
+      "first_seen": "2026-10-01T11:20:00Z",
+      "last_seen": "2026-10-01T11:20:00Z",
+      "reachability": { "kind": "harness", "source": "argv", "target": "parse", "attacker_reachable": true },
+      "fidelity": { "stubs_used": false, "forced": false, "caveats": [] },
+      "remediation": "Check len against the buffer size before reading.",
+      "patch_hints": [{ "title": "Bound the read", "guidance": "Check len against the buffer size before reading." }],
+      "reproduce": {
+        "harness_id": "H-C-parse",
+        "command": "python3 findings/F-0000-1a2b3c4d/replay.py",
+        "build": { "sanitizers": ["asan"], "binary_sha256": null, "build_id": null }
+      },
+      "evidence": {
+        "dir": "findings/F-0000-1a2b3c4d",
+        "files": [
+          { "role": "finding", "path": "findings/F-0000-1a2b3c4d/finding.json", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "size": 2048 },
+          { "role": "testcase", "path": "findings/F-0000-1a2b3c4d/testcase.bin", "sha256": "1111111111111111111111111111111111111111111111111111111111111111", "size": 12 }
+        ]
+      },
+      "fuzz": {
+        "exception": { "name": "ASAN_HEAP_BUFFER_OVERFLOW", "message": "heap-buffer-overflow READ of size 4", "sanitizer": "asan" },
+        "classification": "unhandled",
+        "harness_id": "H-C-parse",
+        "dialect": "c11",
+        "oracle": null
+      },
+      "static": null,
+      "sca": null,
+      "binary": null,
+      "raw_ref": "findings/F-0000-1a2b3c4d/finding.json"
+    },
+    {
+      "id": "F-SCA-203b6b399c3b3dac",
+      "kind": "sca",
+      "producer": "sbom",
+      "rule": { "id": "CVE-2026-0001", "slug": null, "name": null },
+      "title": "CVE-2026-0001 in example 2.4.2",
+      "message": "test advisory",
+      "explanation": null,
+      "severity": "high",
+      "impact": null,
+      "confidence": { "level": "high", "score": null },
+      "cwe": [1395],
+      "confirmation": { "level": "advisory", "detail": null },
+      "verdict": null,
+      "location": null,
+      "fix_location": null,
+      "stack": [],
+      "trace": [],
+      "fingerprint": { "primary": "CVE-2026-0001|pkg:npm/example", "signature": null },
+      "group": "CVE-2026-0001|pkg:npm/example",
+      "occurrences": 1,
+      "first_seen": null,
+      "last_seen": null,
+      "reachability": { "status": "not_observed", "source": "auto_run" },
+      "fidelity": { "stubs_used": false, "forced": false, "caveats": [] },
+      "remediation": "Upgrade example to 2.4.3 or later.",
+      "patch_hints": [],
+      "reproduce": null,
+      "evidence": null,
+      "fuzz": null,
+      "static": null,
+      "sca": {
+        "vuln_id": "CVE-2026-0001",
+        "aliases": [],
+        "component": { "name": "example", "version": "2.4.2", "ecosystem": "npm", "purl": "pkg:npm/example@2.4.2", "cpe": null },
+        "fixed_versions": ["2.4.3"],
+        "cvss": null,
+        "kev": null,
+        "references": [],
+        "match_confidence": "high",
+        "matching_method": "purl",
+        "vex": null
+      },
+      "binary": null,
+      "raw_ref": "sbom/vulnerabilities.json"
+    }
+  ],
+  "groups": [
+    { "key": "c0ffee00c0ffee00c0ffee00c0ffee00", "representative": "F-0000-1a2b3c4d", "members": ["F-0000-1a2b3c4d"] },
+    { "key": "CVE-2026-0001|pkg:npm/example", "representative": "F-SCA-203b6b399c3b3dac", "members": ["F-SCA-203b6b399c3b3dac"] }
+  ],
+  "errors": []
+}

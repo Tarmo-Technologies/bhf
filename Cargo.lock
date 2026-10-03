@@ -189,6 +189,7 @@ dependencies = [
  "corpus",
  "cpp_parser",
  "event_log",
+ "extension_host",
  "fake_corba",
  "finding_rules",
  "fuzz_engine_builtin",
@@ -205,12 +206,17 @@ dependencies = [
  "multicore_fuzz",
  "num_cpus",
  "perl_parser",
+ "project_profile",
  "project_synth",
+ "protocol_session",
  "python_parser",
  "rayon",
  "regex",
+ "relational",
  "replay_min",
  "report",
+ "results",
+ "runtime_collector",
  "runtrace_manifest",
  "rust_parser",
  "serde",
@@ -250,6 +256,15 @@ name = "bhf_cc_intercept"
 version = "0.2.34"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "bhf_collector_win"
+version = "0.2.34"
+dependencies = [
+ "runtime_collector",
+ "serde_json",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -529,7 +544,9 @@ dependencies = [
 name = "continuous_daemon"
 version = "0.2.34"
 dependencies = [
+ "corpus",
  "libc",
+ "results",
  "serde",
  "serde_json",
  "tempfile",
@@ -560,12 +577,14 @@ name = "corpus"
 version = "0.2.34"
 dependencies = [
  "actionability",
+ "chrono",
  "event_log",
  "finding_rules",
  "report",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror",
 ]
 
@@ -741,6 +760,20 @@ dependencies = [
  "rustversion",
  "windows",
  "windows-core",
+]
+
+[[package]]
+name = "extension_host"
+version = "0.2.34"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "toml",
+ "which",
 ]
 
 [[package]]
@@ -1495,8 +1528,11 @@ name = "multicore_fuzz"
 version = "0.2.34"
 dependencies = [
  "corpus",
+ "libc",
+ "report",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
 ]
 
@@ -1685,6 +1721,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "project_profile"
+version = "0.2.34"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
 name = "project_synth"
 version = "0.2.34"
 dependencies = [
@@ -1692,6 +1740,19 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "protocol_session"
+version = "0.2.34"
+dependencies = [
+ "ada_state_machine",
+ "fuzz_engine_builtin",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "toml",
 ]
 
 [[package]]
@@ -1777,6 +1838,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "relational"
+version = "0.2.34"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
 name = "replay_min"
 version = "0.2.34"
 dependencies = [
@@ -1799,6 +1871,24 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "results"
+version = "0.2.34"
+dependencies = [
+ "actionability",
+ "chrono",
+ "corpus",
+ "finding_rules",
+ "libc",
+ "report",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
  "thiserror",
 ]
 
@@ -1814,6 +1904,15 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "runtime_collector"
+version = "0.2.34"
+dependencies = [
+ "finding_rules",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -87,7 +87,7 @@ fn java_file_parameter_is_driven_through_a_temp_file_and_finds_the_planted_crash
         "the File parameter must no longer be reported unsupported:\n{combined}"
     );
 
-    let findings = work.join("findings");
+    let findings = work.join("results").join("findings");
     let mut found_bhf201 = false;
     if let Ok(entries) = std::fs::read_dir(&findings) {
         for entry in entries.flatten() {

@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "extension_host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Host for the bhf.extension.v1 versioned out-of-process extension protocol."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+
+# Pure-Rust binding (no -sys/C build) used only on unix for child-side
+# setrlimit(RLIMIT_AS/RLIMIT_CPU) hardening. Matches the `bhf` crate's own
+# `[target.'cfg(unix)'.dependencies] libc = "0.2"` declaration; already present
+# in the workspace lockfile.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true
+which.workspace = true
+
+# Test-only mock extension exercising the real subprocess + fault paths. It links
+# only std + serde_json (NO bhf internals) and is NOT built by `cargo build -p bhf`.
+[[bin]]
+name = "bhf_mock_extension"
+path = "tests/fixtures/mock_extension.rs"
+test = false
+doc = false

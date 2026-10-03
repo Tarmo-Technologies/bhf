@@ -55,6 +55,7 @@ cpp_parser = { path = "../cpp_parser" }
 confidence_model = { path = "../confidence_model" }
 corpus = { path = "../corpus" }
 event_log = { path = "../event_log" }
+extension_host = { path = "../extension_host" }
 fake_corba = { path = "../fake_corba" }
 finding_rules = { path = "../finding_rules" }
 fuzz_engine_builtin = { path = "../fuzz_engine/builtin" }
@@ -69,12 +70,17 @@ multicore_fuzz = { path = "../multicore_fuzz" }
 num_cpus = "1"
 go_parser = { path = "../go_parser" }
 perl_parser = { path = "../perl_parser" }
+project_profile = { path = "../project_profile" }
 project_synth = { path = "../project_synth" }
+protocol_session = { path = "../protocol_session" }
 python_parser = { path = "../python_parser" }
 regex.workspace = true
+relational = { path = "../relational" }
 replay_min = { path = "../replay_min" }
 bhf_report = { package = "report", path = "../report" }
+results = { path = "../results" }
 runtrace_manifest = { path = "../runtrace_manifest" }
+runtime_collector = { path = "../runtime_collector" }
 rust_parser = { path = "../rust_parser" }
 serde.workspace = true
 serde_json.workspace = true
@@ -109,7 +115,44 @@ path = "src/main.rs"
 name = "cli_fake_harness"
 path = "tests/fixtures/fake_harness.rs"
 
+# Test-only mock runtime-event collector sidecar (#60). Speaks the
+# bhf.collector-event.v1 JSONL protocol via runtime_collector::mock::MockCollector
+# so the Linux CLI integration test can drive `--collector <PATH>` end-to-end
+# without a live OS tracer. A fixture binary (like cli_fake_harness), never shipped.
+[[bin]]
+name = "mock_collector"
+path = "tests/fixtures/mock_collector.rs"
+
+# Test-only mock bhf.extension.v1 extension for the CLI integration tests
+# (#57). Links only std + serde_json (NO bhf internals), selecting a behaviour by
+# `--mode` so `extension_cli.rs` can drive `bhf extension`/`bhf fuzz --extension`
+# and every bounded fault (crash/hang/malformed/unsupported/tamper-case) end to
+# end. A fixture binary (like cli_fake_harness / mock_collector), never shipped.
+[[bin]]
+name = "bhf_ext_mock"
+path = "tests/fixtures/ext_mock.rs"
+test = false
+doc = false
+
+# Test-only reference bhf.extension.v1 comparator for the relational
+# external-predicate e2e (#61). Links only std + serde_json (NO bhf internals):
+# it advertises `oracle.evaluate` and decides a cross-profile observation bundle
+# (finding / unknown / clean), so `relational_external_cli.rs` drives
+# `bhf relational run` with a real External predicate end to end. A fixture
+# binary (like bhf_ext_mock), never shipped.
+[[bin]]
+name = "bhf_relational_comparator_ext"
+path = "tests/fixtures/relational_comparator_ext.rs"
+test = false
+doc = false
+
 [dev-dependencies]
 serde.workspace = true
+serde_json.workspace = true
 toml.workspace = true
 which.workspace = true
+# HDF-7 session-lane e2e: the toy TCP OPEN/WRITE service verifies frames with the
+# same CRC-32 the encoder uses, and the minimize test crafts a padded session
+# artifact from the real session types. Both are internal workspace crates.
+protocol_session = { path = "../protocol_session" }
+fuzz_engine_builtin = { path = "../fuzz_engine/builtin" }

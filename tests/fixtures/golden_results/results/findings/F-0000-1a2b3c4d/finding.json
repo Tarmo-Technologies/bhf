@@ -1,0 +1,35 @@
+{
+  "build": {
+    "binary": {
+      "build_id": "abcdef01",
+      "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+    }
+  },
+  "classification": "unhandled",
+  "cluster_fallback": false,
+  "cluster_key": "c0ffee00",
+  "cluster_key_full": "c0ffee00c0ffee00",
+  "cluster_normalized_frames": [
+    "parse_header"
+  ],
+  "created_at": "2026-10-01T11:20:00Z",
+  "dialect": "c11",
+  "exception": {
+    "message": "heap-buffer-overflow on address 0x602000000010",
+    "name": "ASAN_HEAP_BUFFER_OVERFLOW",
+    "sanitizer": "asan",
+    "stack": [
+      {
+        "file": "/src/demo/src/parse.c",
+        "function": "parse_header",
+        "line": 42
+      }
+    ]
+  },
+  "finding_kind": "fuzz",
+  "harness_id": "H-C-parse",
+  "id": "F-0000-1a2b3c4d",
+  "rule_id": "BHF-201",
+  "schema_version": "bhf.finding.v1",
+  "signature": "aa11bb22"
+}

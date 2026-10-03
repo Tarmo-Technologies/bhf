@@ -58,6 +58,19 @@ fn snippet_from_file_fuzzes_a_bare_c_function() {
         finding_count(&work) >= 1,
         "snippet should surface the overflow; stderr:\n{stderr}"
     );
+    // The results manifest records the run under its own command, not `auto`.
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(work.join("results/manifest.json")).expect("read results/manifest.json"),
+    )
+    .expect("parse results/manifest.json");
+    assert!(
+        manifest["producers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|p| p["command"] == "snippet"),
+        "manifest must record a `snippet` producer: {manifest}"
+    );
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
@@ -105,7 +118,7 @@ fn snippet_from_stdin_detects_language() {
 
 /// Count `findings/*/finding.json` written under a snippet work dir.
 fn finding_count(work: &Path) -> usize {
-    let dir = work.join("findings");
+    let dir = work.join("results").join("findings");
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return 0;
     };

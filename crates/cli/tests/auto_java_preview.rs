@@ -127,7 +127,7 @@ fn a_preview_language_feature_is_compiled_and_run_with_the_flag_it_asks_for() {
         "javac named the flag it needed; it must not survive as the reason:\n{combined}"
     );
 
-    let findings = work.join("findings");
+    let findings = work.join("results").join("findings");
     let mut found_bhf201 = false;
     if let Ok(entries) = std::fs::read_dir(&findings) {
         for entry in entries.flatten() {

@@ -67,6 +67,37 @@ fn replay_subcommand_resolves_bare_finding_id_under_findings_root() {
     );
 }
 
+#[test]
+fn replay_subcommand_resolves_bare_finding_id_under_results_findings() {
+    // Mirrors the legacy test for the results layout: run from inside the work
+    // dir, the bare id resolves via `./results/findings/<id>`.
+    let root = temp_dir("bare-id-results");
+    let finding_id = "F-0000-test";
+    write_finding_at(
+        &root.join("results").join("findings").join(finding_id),
+        "match",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cli"))
+        .current_dir(&root)
+        .args([
+            "replay",
+            "--finding",
+            finding_id,
+            "--harness",
+            fake_harness().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn replay_subcommand_qemu_user_wraps_harness() {

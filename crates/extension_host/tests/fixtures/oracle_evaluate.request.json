@@ -1,0 +1,12 @@
+{
+  "protocol": "bhf.extension.v1",
+  "capability": "oracle.evaluate",
+  "case": {
+    "campaign": "demo-campaign",
+    "worker": "worker-0",
+    "testcase": "tc-000123"
+  },
+  "payload": {
+    "input_b64": "Li4vZXRjL3Bhc3N3ZA=="
+  }
+}

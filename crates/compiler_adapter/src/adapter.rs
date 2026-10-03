@@ -236,7 +236,7 @@ impl CompilerAdapter {
 
         let output = run_bounded(&mut command)?;
         let duration_ms = millis_u64(start.elapsed().as_millis());
-        let exit_code = output.status.code().map_or(-1, |code| code);
+        let exit_code = output.status.code().unwrap_or(-1);
 
         Ok(BuildResult {
             mode,

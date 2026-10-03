@@ -43,7 +43,7 @@ use std::io::{Read, Write};
 
 pub const DEFAULT_CTRL_FD: i32 = 198;
 pub const DEFAULT_STATUS_FD: i32 = 199;
-pub const HELLO: [u8; 4] = [b'F', b'O', b'R', b'K'];
+pub const HELLO: [u8; 4] = *b"FORK";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ForkServerError {

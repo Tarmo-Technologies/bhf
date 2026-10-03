@@ -382,12 +382,7 @@ fn parse_go_stack_frames(stderr: &str) -> Vec<StackFrame> {
         let is_func =
             func_line.contains('(') && !func_line.starts_with('\t') && !func_line.is_empty();
         if is_func && is_loc {
-            let function = func_line
-                .split('(')
-                .next()
-                .unwrap_or(func_line)
-                .trim()
-                .to_owned();
+            let function = go_frame_function(func_line).to_owned();
             // `<file>:<line> +0xNN`
             let loc_no_off = loc.split(" +").next().unwrap_or(loc);
             let (file, line) = match loc_no_off.rsplit_once(':') {
@@ -413,6 +408,38 @@ fn parse_go_stack_frames(stderr: &str) -> Vec<StackFrame> {
         }
     }
     frames
+}
+
+/// The function name in a Go runtime frame `qualified(args)`. A method frame's
+/// `qualified` already contains a parenthesized receiver group, e.g.
+/// `bhf.example/forcelib/forcelib.(*Decoder).Feed`, so the name is everything
+/// before the *trailing* argument list — found by balancing parens from the
+/// right. Splitting on the first `(` (the receiver) would truncate the method
+/// name away, leaving a dangling `…forcelib.`.
+fn go_frame_function(func_line: &str) -> &str {
+    let s = func_line.trim();
+    let bytes = s.as_bytes();
+    if bytes.last() != Some(&b')') {
+        return s; // no trailing arg list; take the whole frame
+    }
+    let mut depth: i32 = 0;
+    let mut i = bytes.len();
+    while i > 0 {
+        i -= 1;
+        match bytes[i] {
+            b')' => depth += 1,
+            b'(' => {
+                depth -= 1;
+                if depth == 0 {
+                    // `i` is the arg-list opener; the receiver group (if any)
+                    // sits to its left and is kept.
+                    return s[..i].trim_end();
+                }
+            }
+            _ => {}
+        }
+    }
+    s // unbalanced parens; fall back to the whole frame
 }
 
 /// Parse a bhf Perl finding out of stderr. The driver prints
@@ -1345,6 +1372,30 @@ java.lang.ArrayIndexOutOfBoundsException: Index 8 out of bounds for length 1
             Some("/proj/recordparser/parser.go")
         );
         assert_eq!(r.stack[0].line, Some(17));
+    }
+
+    #[test]
+    fn go_method_frame_keeps_the_receiver_and_method_name() {
+        // Regression: a Go method frame's first `(` is its receiver group, not
+        // the argument list. Splitting on the first `(` truncated the method
+        // name, leaving `bhf.example/forcelib/forcelib.`. The whole qualified
+        // method name must survive into the frame.
+        let stderr = "== bhf go finding: runtime error: index out of range [4] with length 1\n\
+                      goroutine 1 [running]:\n\
+                      panic({0x4a0,0xc1})\n\
+                      \t/usr/local/go/src/runtime/panic.go:770 +0x132\n\
+                      bhf.example/forcelib/forcelib.(*Decoder).Feed(0xc00001c030, {0x5a1b40, 0x5, 0x5})\n\
+                      \t/proj/forcelib/forcelib.go:27 +0x1d0\n";
+        let r = parse_sanitizer_report(stderr).expect("go finding");
+        assert_eq!(
+            r.stack[0].function,
+            "bhf.example/forcelib/forcelib.(*Decoder).Feed"
+        );
+        assert_eq!(
+            r.stack[0].file.as_deref(),
+            Some("/proj/forcelib/forcelib.go")
+        );
+        assert_eq!(r.stack[0].line, Some(27));
     }
 
     #[test]

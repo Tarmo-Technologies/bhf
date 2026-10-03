@@ -1,0 +1,19 @@
+{
+  "protocol": "bhf.extension.v1",
+  "case": {
+    "campaign": "demo-campaign",
+    "worker": "worker-0",
+    "testcase": "tc-000123"
+  },
+  "result": "finding",
+  "finding": {
+    "rule": "oracle.path-escape",
+    "classification": "extension_oracle",
+    "signature_inputs": ["oracle.path-escape", "../etc/passwd"],
+    "evidence": [
+      { "key": "path", "value": "../etc/passwd" },
+      { "key": "reason", "value": "escapes sandbox root" }
+    ],
+    "min_predicate": "path-contains-dotdot"
+  }
+}

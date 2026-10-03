@@ -1046,10 +1046,7 @@ impl Parser<'_> {
         min_precedence: u8,
     ) -> Result<ConstExpression, IdlParseError> {
         let mut left = self.parse_const_unary()?;
-        loop {
-            let Some(operator) = self.peek_const_operator() else {
-                break;
-            };
+        while let Some(operator) = self.peek_const_operator() {
             let precedence = const_operator_precedence(operator);
             if precedence < min_precedence {
                 break;

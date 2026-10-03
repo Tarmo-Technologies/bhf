@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/mman.h>
 
 /* MUST match BHF_COV_BITS in crates/cli/src/fuzz.rs and
@@ -77,4 +78,16 @@ ADAFUZZ_NOCOV void __sanitizer_cov_trace_pc(void) {
     }
     uintptr_t pc = (uintptr_t)__builtin_return_address(0);
     adafuzz_cov_map[(pc ^ (pc >> 3)) & (BHF_COV_BITS - 1)] = 1;
+}
+
+/* Portability (#64): force a process crash an EXTERNAL fuzzer (Mayhem
+ * base-executable, AFL) detects as a fault. A plain abort() is not enough: the
+ * GNAT runtime installs a SIGABRT handler that converts the signal into a
+ * catchable Ada exception, which the harness's top-level `when others` handler
+ * then swallows. Resetting SIGABRT to its default disposition first means abort()
+ * terminates the process with SIGABRT (signal 6) instead. Called from
+ * AdaFuzz.Probe.On_Top_Level_Catch only when BHF_CRASH_ON_FINDING is set. */
+ADAFUZZ_NOCOV void adafuzz_crash_now(void) {
+    signal(SIGABRT, SIG_DFL);
+    abort();
 }

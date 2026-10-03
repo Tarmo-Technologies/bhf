@@ -1,0 +1,58 @@
+{
+  "findings": [
+    {
+      "analysis": {
+        "enclosing_function": "greet",
+        "engine": "taint",
+        "trace": [
+          {
+            "callee": "greet",
+            "caller": "main",
+            "kind": "source",
+            "line": 3,
+            "path": "/src/demo/weak.c",
+            "snippet": ""
+          }
+        ]
+      },
+      "baseline_status": "new",
+      "confidence": "medium",
+      "cwe": "CWE-120",
+      "evidence": [
+        {
+          "detail": "strcpy",
+          "kind": "sink",
+          "snippet": "strcpy(buf, name);"
+        }
+      ],
+      "fingerprint": "fp-weak-9",
+      "id": "S-0001",
+      "identity": "id-weak",
+      "language": "c",
+      "location": {
+        "column": 5,
+        "line": 9,
+        "path": "/src/demo/weak.c"
+      },
+      "message": "strcpy into fixed buffer",
+      "remediation": "Use a bounded copy.",
+      "rule_id": "BHF-401",
+      "rule_slug": "bhf.static/unsafe-string-copy",
+      "severity": "high",
+      "triage": {
+        "note": "",
+        "state": "open"
+      }
+    }
+  ],
+  "issues": [
+    {
+      "finding_ids": [
+        "S-0001"
+      ],
+      "issue_key": "issue-weak"
+    }
+  ],
+  "root": "/src/demo",
+  "schema_version": "bhf.static.v1"
+}

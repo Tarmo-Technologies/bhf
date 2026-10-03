@@ -50,6 +50,32 @@ Each event is appended as one JSONL line to the path in
 `needed_for_build` Layer C and, during built-in fuzzing, to evaluate
 executable oracles against only the events appended by the current input.
 
+### Collector-shaped view (`--collector auto` on Linux, #60)
+
+The same shim events also back the platform-neutral runtime-event collector on
+Linux. `--collector auto` resolves to a **runtrace → collector adapter** that
+re-expresses these effect events as the versioned `bhf.collector-event.v1`
+contract (`crate::auto::runtrace::to_collector_event` /
+`collector_jsonl_from_events`): `exec`/`system`/`popen` → `process_create`,
+`lib_load`/`dlopen` → `module_load`, `open`/`openat`/`fs_destroy` → the file
+families, `net_egress`/`connect` → `network`. A sink family is marked
+taint-confirmed in the collector stream **only** when a `CollectorTaintGate`
+confirms it through the SAME cross-execution correlation / constant-suppression
+the runtime oracles use — never from a single run's `taint_offset` — so a program
+constant echoed into one input is not presented as a taint-confirmed finding. On
+`bhf binary fuzz` the collector runs the target once under the shim as a
+**dedicated observation pass** (separate from the crash-detection loop, so
+`--runtime-oracles` behaviour is unchanged) and the gate reuses the campaign's
+accumulated taint evidence; on `bhf fuzz` it re-reads the loop's own
+`runtrace.jsonl` and correlates across every execution it contains. The result
+feeds the same oracle registry and stored-evidence replay as the native Windows
+ETW provider — it is an additional view, not a second source. `--collector auto`
+stays inactive when the runtrace shim is unavailable, and when the shim exists but
+was **not armed** (e.g. the default `--runtime-oracles off`, so the loop wrote no
+`runtrace.jsonl`) the run is recorded as a degraded, **not-observed** run —
+`observed: false`, never `clean_assurance: true` — rather than fabricating a clean
+observation over coverage it never had.
+
 ## Allocation Discipline
 
 Every hook formats its event into a stack buffer and writes through `libc::write`.
@@ -191,6 +217,31 @@ a `taint_path` evidence value describing the source→sink flow:
 `fuzz_input[offset..] → open(path)` for BHF-405, `fuzz_input → printf(format)`
 for BHF-408. Static-scan findings carry no `confirmation` marker, so consumers
 use the field to separate runtime-confirmed hits from static candidates.
+
+### Platform-neutral collector (`--collector`)
+
+The `LD_PRELOAD` runtrace shim above is the in-process Linux provider. The
+`--collector` flag (`bhf fuzz` / `bhf binary fuzz`, #60) adds a **decoupled**
+provider addressed by a versioned JSONL wire contract
+(`bhf.collector-event.v1`, JSON Schema in `schemas/`) instead of linking into the
+target: it observes the same families of effects — process execution, filesystem
+operations with resolved paths, and module loads — but from a separate provider
+(the native Windows ETW provider `bhf-collector-win`, or any external sidecar that
+speaks the protocol). The host attributes the observed events to the testcase's
+descendant process tree within a bounded post-exit window and maps them through the
+**same executable-oracle registry**, so a controlled process execution, path escape,
+or controlled library load becomes a `binary_semantic` finding with no crash — the
+`CollectorEvent`'s `input_derived`/`taint_offset` carries byte-origin taint forward
+so a fixed program constant (not input-derived) is never taint-confirmed, exactly as
+the shim's cross-execution correlation does.
+
+Fidelity is first-class: dropped events, platform-unsupported APIs, and permission
+denials are recorded on the stream and refuse a false "clean" assurance rather than
+silently vanishing. Each run and finding records collector provenance (backend
+name/version/hash, process-tree scope, observation window, the backend's declared
+supported event classes kept distinct from the classes observed firing this run,
+fidelity), and a collector finding stores its raw `CollectorSession` evidence so
+replay reproduces the finding deterministically and the attribution can be audited.
 
 ## Audit-Only Fallback
 

@@ -104,7 +104,7 @@ fn divergent_harnesses_emit_findings_and_nonzero_exit() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let findings_dir = out_dir.join("findings");
+    let findings_dir = out_dir.join("results/findings");
     let count = fs::read_dir(&findings_dir).unwrap().count();
     assert!(count >= 1, "expected at least one finding directory");
 
@@ -118,6 +118,7 @@ fn divergent_harnesses_emit_findings_and_nonzero_exit() {
             .unwrap();
     assert_eq!(finding_json["rule_id"], "BHF-301");
     assert_eq!(finding_json["classification"], "divergence");
+    assert_eq!(finding_json["finding_kind"], "differential");
     assert_eq!(
         finding_json["oracle"]["name"],
         "differential-output-runtime"
@@ -159,7 +160,7 @@ fn metamorphic_transform_emits_oracle_finding() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let findings_dir = out_dir.join("findings");
+    let findings_dir = out_dir.join("results/findings");
     let count = fs::read_dir(&findings_dir).unwrap().count();
     assert_eq!(count, 1, "expected exactly one metamorphic finding");
 
@@ -173,6 +174,7 @@ fn metamorphic_transform_emits_oracle_finding() {
             .unwrap();
     assert_eq!(finding_json["rule_id"], "BHF-307");
     assert_eq!(finding_json["classification"], "metamorphic_violation");
+    assert_eq!(finding_json["finding_kind"], "differential");
     assert_eq!(
         finding_json["oracle"]["name"],
         "metamorphic-relation-runtime"

@@ -22,7 +22,7 @@ fn temp_dir(name: &str) -> PathBuf {
 /// The exception name + remapped source line of every finding under `work_dir`.
 fn finding_signatures(work_dir: &Path) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    let findings = work_dir.join("findings");
+    let findings = work_dir.join("results").join("findings");
     let Ok(entries) = fs::read_dir(&findings) else {
         return out;
     };
@@ -96,7 +96,7 @@ fn fork_server_finds_the_same_fault_as_per_spawn() {
         .expect("a harness was built");
 
     let fuzz = |mode_flag: &str| -> Vec<(String, String)> {
-        let _ = fs::remove_dir_all(work.join("findings"));
+        let _ = fs::remove_dir_all(work.join("results").join("findings"));
         let _ = fs::remove_dir_all(work.join("corpus"));
         let mut argv = vec![
             "bhf",

@@ -39,7 +39,7 @@ fn report_subcommand_uses_requested_confidence_model() {
     let root = temp_dir("report-model");
     let labels = root.join("labels.json");
     let model_path = root.join("tenant-model.bin");
-    let findings = root.join("findings");
+    let findings = root.join("results").join("findings");
     let out = root.join("reports");
     write_inline_labels(&labels, 100);
 

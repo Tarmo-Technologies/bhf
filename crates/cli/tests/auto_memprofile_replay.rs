@@ -80,6 +80,7 @@ fn mem_profile_flags_amplified_allocation_input() {
     );
 
     let finding = work
+        .join("results")
         .join("findings")
         .join("F-MEM-0000")
         .join("finding.json");
@@ -89,12 +90,15 @@ fn mem_profile_flags_amplified_allocation_input() {
         json.contains("BHF-558"),
         "finding must carry BHF-558:\n{json}"
     );
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed["finding_kind"], "runtime");
     assert!(
         json.contains("CWE-400"),
         "finding must carry CWE-400:\n{json}"
     );
     // The reproducer is the large input (first byte 200).
     let repro = work
+        .join("results")
         .join("findings")
         .join("F-MEM-0000")
         .join("testcase.bin");

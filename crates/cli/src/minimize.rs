@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, clap::Args)]
 pub struct MinimizeArgs {
-    /// Finding directory, or finding ID under ./findings.
+    /// Finding directory, or finding ID under bhf_work/results/findings.
     #[arg(
         value_name = "FINDING_DIR",
         required_unless_present = "finding",
@@ -18,13 +18,15 @@ pub struct MinimizeArgs {
     )]
     pub finding_dir: Option<PathBuf>,
 
-    /// Finding directory, or finding ID under ./findings.
+    /// Finding directory, or finding ID under bhf_work/results/findings.
     #[arg(long, value_name = "ID_OR_DIR")]
     pub finding: Option<PathBuf>,
 
-    /// Harness binary path. Required for minimization.
+    /// Harness binary path. Required for minimizing a crash/opaque-input finding;
+    /// omitted for a session finding (HDF-7), which minimizes by re-driving the
+    /// recorded multi-message session rather than re-running a harness binary.
     #[arg(long)]
-    pub harness: PathBuf,
+    pub harness: Option<PathBuf>,
 
     /// qemu-user executable for ELF-Linux cross-target minimization.
     #[arg(long, value_name = "QEMU")]
@@ -72,12 +74,12 @@ impl MinimizeStrategy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct MinimizeSummary {
+pub(crate) struct MinimizeSummary {
     strategy: MinimizeStrategy,
     original_len: usize,
     minimized_len: usize,
     removed_bytes: usize,
-    reduced: bool,
+    pub(crate) reduced: bool,
 }
 
 /// How a candidate input is delivered to the harness's main().
@@ -99,6 +101,20 @@ fn minimize_c_engine(
     harness: &Path,
     strategy: MinimizeStrategy,
     io: CEngineIo,
+) -> anyhow::Result<MinimizeSummary> {
+    minimize_c_engine_until(finding_dir, harness, strategy, io, None)
+}
+
+/// Like [`minimize_c_engine`], but stops accepting further reductions once
+/// `deadline` has passed (the baseline reproduction check still runs once,
+/// unconditionally: an unreproducible testcase must still error). Used by the
+/// bounded `auto` minimization pass to cap wall-clock time per finding.
+fn minimize_c_engine_until(
+    finding_dir: &Path,
+    harness: &Path,
+    strategy: MinimizeStrategy,
+    io: CEngineIo,
+    deadline: Option<std::time::Instant>,
 ) -> anyhow::Result<MinimizeSummary> {
     use std::io::Write;
     use std::process::{Command, Stdio};
@@ -179,6 +195,9 @@ fn minimize_c_engine(
     })?;
 
     let result = replay_min::ddmin_bytes(&original_input, |candidate| -> anyhow::Result<bool> {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Ok(false); // budget spent: reject further reductions, keep best-so-far
+        }
         Ok(run_once(candidate)?.map(|r| r == baseline).unwrap_or(false))
     })?;
 
@@ -221,7 +240,45 @@ fn minimize_c_engine(
     })
 }
 
+/// The work dir that owns the finding being minimized, when it lives in a
+/// results layout (so the dispatcher can rebuild results/ afterwards).
+pub fn work_dir_hint(args: &MinimizeArgs) -> Option<std::path::PathBuf> {
+    let dir = resolve_finding_arg(args.finding_dir.clone(), args.finding.clone());
+    // Strict: only a real results-layout work dir, never a lexical guess,
+    // because the dispatcher writes (migrate, manifest, rebuild) to it.
+    corpus::layout::results_work_dir_for_finding(&dir)
+}
+
+/// Minimize a C/C++ harness finding within `deadline`. Ada/stdin harnesses are
+/// out of scope for the auto pass (returns `Ok(None)`).
+pub(crate) fn minimize_for_auto(
+    finding_dir: &Path,
+    harness: &Path,
+    deadline: std::time::Instant,
+) -> anyhow::Result<Option<MinimizeSummary>> {
+    let io = match detect_harness_engine(harness) {
+        HarnessEngine::CAfl => CEngineIo::Stdin,
+        HarnessEngine::CLibFuzzer => CEngineIo::ArgvFile,
+        HarnessEngine::AdaStdin => return Ok(None),
+    };
+    minimize_c_engine_until(
+        finding_dir,
+        harness,
+        MinimizeStrategy::Bytes,
+        io,
+        Some(deadline),
+    )
+    .map(Some)
+}
+
 pub fn run(args: MinimizeArgs) -> i32 {
+    let finding_dir = resolve_finding_arg(args.finding_dir.clone(), args.finding.clone());
+    // HDF-7: a session finding minimizes by shrinking the recorded multi-message
+    // session (re-repairing computed fields / re-resolving bindings each
+    // candidate), not by delta-debugging a flat testcase against a harness.
+    if crate::session_fuzz::is_session_finding(&finding_dir) {
+        return crate::session_fuzz::minimize_session_finding(&finding_dir);
+    }
     match run_inner(args) {
         Ok(summary) => {
             println!(
@@ -243,12 +300,26 @@ pub fn run(args: MinimizeArgs) -> i32 {
 
 fn run_inner(args: MinimizeArgs) -> anyhow::Result<MinimizeSummary> {
     let finding_dir = resolve_finding_arg(args.finding_dir, args.finding);
+    // #60: a collector-sourced finding is reproduced from provider-captured
+    // evidence that does not vary with the testcase bytes, so there is nothing to
+    // delta-debug under deterministic replay. Re-confirm it reproduces and report
+    // an honest no-op; this needs no harness, so it dispatches first.
+    if crate::collector_run::is_collector_finding(&finding_dir) {
+        let result = crate::collector_run::minimize_collector_finding(&finding_dir)?;
+        return Ok(MinimizeSummary {
+            strategy: args.strategy,
+            original_len: result.original_len,
+            minimized_len: result.original_len,
+            removed_bytes: 0,
+            reduced: result.reduced,
+        });
+    }
+    let harness = args.harness.ok_or_else(|| {
+        anyhow!("minimize requires --harness <path> for a crash/opaque-input finding")
+    })?;
     if crate::binary_fuzz::is_binary_finding(&finding_dir) {
-        let result = crate::binary_fuzz::minimize_binary_finding(
-            &finding_dir,
-            &args.harness,
-            args.strategy,
-        )?;
+        let result =
+            crate::binary_fuzz::minimize_binary_finding(&finding_dir, &harness, args.strategy)?;
         return Ok(MinimizeSummary {
             strategy: args.strategy,
             original_len: result.original_len,
@@ -261,22 +332,17 @@ fn run_inner(args: MinimizeArgs) -> anyhow::Result<MinimizeSummary> {
     // skeleton but differ in how a candidate input reaches main():
     // libFuzzer takes argv[1], AFL persistent-mode reads stdin (the
     // generated template falls back to `bhf_afl_read_stdin`).
-    match detect_harness_engine(&args.harness) {
+    match detect_harness_engine(&harness) {
         HarnessEngine::CAfl => {
-            return minimize_c_engine(&finding_dir, &args.harness, args.strategy, CEngineIo::Stdin);
+            return minimize_c_engine(&finding_dir, &harness, args.strategy, CEngineIo::Stdin);
         }
         HarnessEngine::CLibFuzzer => {
-            return minimize_c_engine(
-                &finding_dir,
-                &args.harness,
-                args.strategy,
-                CEngineIo::ArgvFile,
-            );
+            return minimize_c_engine(&finding_dir, &harness, args.strategy, CEngineIo::ArgvFile);
         }
         HarnessEngine::AdaStdin => {}
     }
     let runner = harness_runner(
-        args.harness,
+        harness,
         args.qemu_user,
         args.qemu_args,
         args.sandbox,
@@ -374,6 +440,11 @@ fn update_finding_record(finding_dir: &Path, result: &MinimizeOutput) -> anyhow:
     object.insert("minimal_reproducer".to_owned(), json!("min_testcase.bin"));
     object.insert("minimization".to_owned(), result.metadata.clone());
 
+    corpus::finding::append_history(
+        &mut value,
+        "minimize",
+        &["paths.minimized", "minimal_reproducer", "minimization"],
+    );
     fs::write(&path, serde_json::to_vec_pretty(&value)?)
         .with_context(|| format!("write {}", path.display()))?;
     Ok(())
@@ -381,10 +452,24 @@ fn update_finding_record(finding_dir: &Path, result: &MinimizeOutput) -> anyhow:
 
 #[cfg(all(test, unix))]
 mod silent_abort_tests {
-    use super::{minimize_c_engine, CEngineIo, MinimizeStrategy};
+    use super::{minimize_c_engine, minimize_c_engine_until, CEngineIo, MinimizeStrategy};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
     use tempfile::tempdir;
+
+    fn write_silent_abort_harness(dir: &Path) -> PathBuf {
+        let harness = dir.join("abort-on-crash.sh");
+        fs::write(
+            &harness,
+            "#!/bin/sh\ncase \"$(cat \"$1\")\" in *CRASH*) kill -ABRT $$;; esac\n",
+        )
+        .expect("harness");
+        let mut permissions = fs::metadata(&harness).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&harness, permissions).expect("chmod");
+        harness
+    }
 
     #[test]
     fn libfuzzer_minimizer_reduces_silent_abort_finding() {
@@ -398,15 +483,7 @@ mod silent_abort_tests {
         .expect("finding");
         fs::write(finding.join("testcase.bin"), b"prefix-CRASH-suffix").expect("testcase");
 
-        let harness = root.path().join("abort-on-crash.sh");
-        fs::write(
-            &harness,
-            "#!/bin/sh\ncase \"$(cat \"$1\")\" in *CRASH*) kill -ABRT $$;; esac\n",
-        )
-        .expect("harness");
-        let mut permissions = fs::metadata(&harness).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&harness, permissions).expect("chmod");
+        let harness = write_silent_abort_harness(root.path());
 
         let result = minimize_c_engine(
             &finding,
@@ -421,5 +498,35 @@ mod silent_abort_tests {
             fs::read(finding.join("min_testcase.bin")).unwrap(),
             b"CRASH"
         );
+    }
+
+    #[test]
+    fn expired_deadline_stops_reduction_but_keeps_a_valid_result() {
+        let root = tempdir().expect("tempdir");
+        let finding = root.path().join("finding");
+        fs::create_dir(&finding).expect("finding dir");
+        fs::write(
+            finding.join("finding.json"),
+            r#"{"rule_id":"BHF-210","paths":{}}"#,
+        )
+        .expect("finding");
+        fs::write(finding.join("testcase.bin"), b"prefix-CRASH-suffix").expect("testcase");
+        let harness = write_silent_abort_harness(root.path());
+        let past = std::time::Instant::now();
+
+        let summary = minimize_c_engine_until(
+            &finding,
+            &harness,
+            MinimizeStrategy::Bytes,
+            CEngineIo::ArgvFile,
+            Some(past),
+        )
+        .expect("minimize");
+
+        assert!(
+            !summary.reduced,
+            "an already-expired deadline must not reduce"
+        );
+        assert!(finding.join("min_testcase.bin").is_file());
     }
 }

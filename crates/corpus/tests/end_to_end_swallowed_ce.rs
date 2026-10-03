@@ -86,7 +86,7 @@ fn run_dialect(dialect: &str) {
         "examples/swallowed_constraint_error/pkg.adb".to_owned(),
     );
     let id = emitter.emit(input, &testcases[0], 0).unwrap();
-    let finding_dir = root.join("findings").join(id.0);
+    let finding_dir = root.join("results").join("findings").join(id.0);
     let finding_json = fs::read_to_string(finding_dir.join("finding.json")).unwrap();
     let finding: serde_json::Value = serde_json::from_str(&finding_json).unwrap();
 

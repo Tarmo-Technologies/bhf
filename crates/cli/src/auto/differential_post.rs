@@ -81,8 +81,18 @@ pub fn run_differential(work_dir: &Path, spec: &DifferentialSpec) -> usize {
     let Ok(harnesses) = std::fs::read_dir(work_dir.join("harnesses")) else {
         return 0;
     };
+    let findings = corpus::layout::findings_dir(work_dir);
+    let mut ids = match corpus::layout::FamilyAllocator::new(&findings, "F-DIFF-") {
+        Ok(ids) => ids,
+        Err(error) => {
+            bhfeprintln!(
+                "bhf auto: differential — cannot read {}: {error}; skipping",
+                findings.display()
+            );
+            return 0;
+        }
+    };
     let mut written = 0usize;
-    let mut index = 0usize;
     for entry in harnesses.flatten() {
         let hdir = entry.path();
         let Some(harness_id) = hdir
@@ -92,7 +102,7 @@ pub fn run_differential(work_dir: &Path, spec: &DifferentialSpec) -> usize {
         else {
             continue;
         };
-        written += differential_one(work_dir, &hdir, &harness_id, spec, &mut index);
+        written += differential_one(work_dir, &hdir, &harness_id, spec, &mut ids);
     }
     written
 }
@@ -102,7 +112,7 @@ fn differential_one(
     hdir: &Path,
     harness_id: &str,
     spec: &DifferentialSpec,
-    index: &mut usize,
+    ids: &mut corpus::layout::FamilyAllocator,
 ) -> usize {
     if !hdir.join("Makefile").is_file() {
         return 0;
@@ -162,12 +172,17 @@ fn differential_one(
 
     let mut written = 0usize;
     for ((exit_a, to_a, exit_b, to_b), input) in divergences {
-        let id = format!("F-DIFF-{:04}", *index);
-        *index += 1;
+        let (id, dir) = match ids.create() {
+            Ok(created) => created,
+            Err(error) => {
+                bhfeprintln!("bhf auto: differential — {harness_id}: no finding dir: {error}");
+                break;
+            }
+        };
         let side_a = if is_cpp { &spec.cxx_a } else { &spec.cc_a };
         let side_b = if is_cpp { &spec.cxx_b } else { &spec.cc_b };
         if write_finding(
-            work_dir, &id, harness_id, side_a, side_b, exit_a, to_a, exit_b, to_b, &input,
+            &dir, &id, harness_id, side_a, side_b, exit_a, to_a, exit_b, to_b, &input,
         ) {
             written += 1;
         }
@@ -274,7 +289,7 @@ fn exit_code(status: &std::process::ExitStatus) -> i32 {
 
 #[allow(clippy::too_many_arguments)]
 fn write_finding(
-    work: &Path,
+    dir: &Path,
     id: &str,
     harness_id: &str,
     side_a: &str,
@@ -285,10 +300,6 @@ fn write_finding(
     to_b: bool,
     input: &Path,
 ) -> bool {
-    let dir = work.join("findings").join(id);
-    if std::fs::create_dir_all(&dir).is_err() {
-        return false;
-    }
     // Preserve the reproducing input alongside the finding.
     if let Ok(bytes) = std::fs::read(input) {
         let _ = std::fs::write(dir.join("testcase.bin"), &bytes);
@@ -301,7 +312,7 @@ fn write_finding(
     let cluster_key_full = hex(&Sha256::digest(
         format!("BHF-301:{harness_id}:{exit_a}:{to_a}:{exit_b}:{to_b}").as_bytes(),
     ));
-    let record = json!({
+    let mut record = json!({
         "id": id,
         "rule_id": "BHF-301",
         "classification": "divergence",
@@ -325,6 +336,7 @@ fn write_finding(
         "analysis": { "engine": "bhf.dynamic.differential.replay" },
         "actionability": { "cwe": ["CWE-758"], "verdict": "likely_reachable", "confidence": "medium" },
     });
+    corpus::finding::stamp_v1(&mut record, corpus::finding::finding_kind::DIFFERENTIAL);
     std::fs::write(
         dir.join("finding.json"),
         serde_json::to_vec_pretty(&record).unwrap_or_default(),

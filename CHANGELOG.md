@@ -2,6 +2,279 @@
 
 # Changelog
 
+## Unreleased
+
+### Breaking
+- All findings, indexes and native reports live under `<work-dir>/results/`. `FINDINGS.md`,
+  `findings.csv` and `auto/findings.csv` at the work-dir top, `auto/attestation.json`, and
+  `reports/run-last.*` (written by `ci --sarif`) are gone. Use `results/INDEX.md`,
+  `results/findings.{json,csv,sarif}` and `results/attestation.json`.
+- `findings.csv` has a new, single column set (see docs/finding-report-fields.md). The
+  per-harness stub columns moved to `auto/run.json` `targets[]`; `--static-dynamic` is a no-op.
+- `static-scan` and `sbom` default to `<work-dir>/results/{static,sbom}`; `--out` still
+  writes elsewhere (and then does not update `results/`).
+- `differential --out` is now `--work-dir` (alias kept); findings are `F-DIFF-NNNN`.
+- `bhf report` with no flags rebuilds `bhf_work/results/`; `--findings/--out` keep the old behaviour.
+- Severity is unified: impact, then record severity, then rule default; `--force` stub
+  findings are floored to low on disk. `ci --fail-on` uses the same resolver. A finding with
+  no impact, severity, or rule (the resolver's `medium` default) now trips `--fail-on
+  medium`/`low` instead of being bucketed `unknown`, which is fail-closed; an unreadable
+  record is still counted as `unknown`.
+- Tools that read `bhf_work/findings.csv` or `bhf_work/findings/` directly must switch to
+  `results/findings.json` (schema in `schemas/`, reference fixture in `tests/fixtures/golden_results/`).
+
+### Added
+- **Coverage-guided relational policy fuzzing** (`bhf relational`): run one generated
+  testcase across several named launch/session **profiles** (differing in runner, args,
+  environment, declared target allowlist and secret references) and evaluate declarative
+  relational **predicates** (`status_relation`, `subset`/allowlist, `equal`, `differ`, and
+  an `external` comparator decided by a trusted out-of-process extension) over each
+  profile's observed behaviour, catching both
+  unexpected *divergence* and unexpected *equivalence* against an explicit policy — an
+  authorization bug class a crash-only or single-harness output-diff oracle cannot see,
+  because the offending runs can exit `0` with byte-identical stdout (#61). The campaign
+  retains inputs that reach new code in any profile, a new semantic observation
+  (postcondition / runtime-oracle result), a new cross-profile outcome vector, or a new
+  effect-event shape, and emits a finding per violated relation: `BHF-308`
+  (unexpected authorization, CWE-863), `BHF-309` (allowlist escape, CWE-862), `BHF-310`
+  (unexpected equivalence, CWE-285), `BHF-311` (unexpected divergence, CWE-754) and
+  `BHF-312` (external-comparator violation, CWE-285). An `external` predicate names a
+  trusted `bhf.extension-manifest.v1` comparator by path (explicit load is the trust
+  boundary); the driver spawns + negotiates it and drives `oracle.evaluate` (#57's
+  `bhf.extension.v1`) over the secret-redacted cross-profile observation bundle, mapping
+  `ok → compliant`, `finding → violation` (carrying the comparator's signature,
+  classification and executable/config-hash + protocol-version provenance into the
+  relational finding) and `unsupported`/bounded-infrastructure → `policy_unknown` — never a
+  fabricated verdict, and kept distinct from setup/auth/missing-observation outcomes. Each
+  profile runs with a **distinct** coverage-shm file, runtime-trace log and scratch dir, so
+  one profile's coverage or effect events can never contaminate another's, and per-case
+  novelty is bucketed per profile. Effect events come from the runtime-trace collector,
+  with the platform-neutral `bhf.collector-event.v1` source feeding the same seam where it
+  is active. Secret references (`lab:` prefix) are resolved locally and in-process only and
+  redacted out of every finding and replay bundle — only the stable reference id survives.
+  New `bhf relational run` (campaign), `bhf relational replay` (re-run every required
+  profile and re-confirm the relation) and `bhf relational minimize` (shrink the testcase
+  and reduce the required profile set) subcommands; the policy is a TOML file
+  (`bhf.relational.v1`). Findings persist through the unified `results/` layout
+  (`results/findings/F-REL-*`) so importers / SARIF / vulnerability-management tools read
+  them with the same reader as every other finding kind.
+- Versioned **out-of-process extension protocol** (`bhf.extension.v1`): bhf can start an
+  explicitly-trusted extension executable, negotiate a protocol version + capabilities
+  before any work, and drive length-framed JSON request/response envelopes that each
+  carry campaign/worker/testcase identity (#57). The shipped capability is
+  `oracle.evaluate`: a private semantic oracle can judge whether a **clean-exiting**
+  input violates a contract a crash-only fuzzer cannot see, becoming a stable,
+  replayable `extension_oracle` finding (`confirmation: "extension"`). New `bhf extension
+  validate` (spawn + negotiate, print protocol/caps/hashes) and `bhf extension evaluate`
+  (drive one input, emit a finding + run provenance) subcommands, plus `bhf fuzz
+  --extension <manifest>` which drives the retained corpus through the oracle after the
+  run (not in the hot mutation loop) and attaches an additive `extension` block to the
+  run summary. Every extension crash, per-call timeout, oversized/malformed response,
+  mismatched case identity, or `unsupported` reply is a **bounded infrastructure result**
+  that can never masquerade as a target vulnerability; findings and run metadata record
+  the extension executable/config SHA-256, negotiated capabilities, protocol version, and
+  restart/loss events. The manifest (`bhf.extension-manifest.v1`, TOML) is only ever
+  loaded through an explicit `--manifest` path — that is the trust boundary; there is no
+  auto-discovery. The wire contract is externally implementable (JSON Schemas in
+  `schemas/`, operator docs in `docs/extension-protocol.md`, and a dependency-free Python
+  reference extension), so an out-of-tree extension in any language interoperates with
+  the host. The **full capability set** is now implemented: `codec.decode` /
+  `codec.encode` / `codec.repair` (decode a raw frame to a structured value, encode it
+  back, and repair computed fields like length/CRC after a mutation), `mutator.mutate`
+  (reproducible structure-aware mutation), `scenario.next` / `scenario.observe-response`
+  (drive a multi-message session, binding a response-derived handle/nonce into a later
+  message), and `lifecycle.setup` / `lifecycle.reset` / `lifecycle.teardown` (per-case
+  state with a fresh temp root between cases). A new `bhf extension session` composes
+  them end to end against a target (a mutated frame is codec-repaired before it reaches
+  the target; the OPEN handle is bound into the WRITE; a clean-exit escape is a finding),
+  and `bhf fuzz --extension` repairs a recognized retained frame before the oracle sees
+  it. A `bhf.project.v1` profile can declare the extension inline via an `[[extension]]`
+  section, which `bhf project run` materializes as a trusted `bhf.extension-manifest.v1`
+  and loads. Capability negotiation advertises the whole set, and an extension that
+  declares only a subset still works; CBOR wire encoding remains an optional,
+  negotiated-but-unused format (the host speaks JSON only). The minimal reproduction (a
+  toy `[u16 length][payload][u32 crc]` protocol with `OPEN`/`WRITE`) is implemented once
+  outside the tree in the Python reference extension, which is now also exercised by a
+  release-build integration test (not just the debug run). The reference extension's
+  `codec.decode`/`codec.repair` reject any input that is not a recognized toy frame, so an
+  unrecognized raw corpus entry is evaluated **verbatim** instead of being rebuilt — the
+  host stays codec-agnostic over arbitrary corpora. A crash/timeout whose restart-time
+  re-handshake fails (restart budget exhausted) is now classified as a bounded
+  infrastructure result — `EXIT_INFRA` (4) with run provenance (loss recorded) — rather
+  than a usage error with no provenance. New `bhf extension minimize` delta-debugs an
+  emitted extension-oracle finding by re-driving `oracle.evaluate`, accepting a candidate
+  only when it reproduces the **same stable signature**, so a finding is emitted, replayed,
+  and minimized with an unchanged signature (#57).
+- `bhf fuzz` / `bhf binary-fuzz` gain a platform-neutral **runtime-event collector**
+  (`--collector <auto|none|PATH>`, `--collector-window-ms <MS>`) that observes the
+  process, filesystem, and module-load effects a target performs even when it exits
+  cleanly (#60). Observed effects are attributed to the testcase's descendant process
+  tree within a bounded post-exit window and fed through the shared bug-oracle
+  registry, so a controlled process execution, a path escaping the allowed root, or a
+  controlled library load becomes a `binary_semantic` finding with no crash. The
+  contract is a versioned JSONL wire format (`bhf.collector-event.v1`, JSON Schema in
+  `schemas/`) that an out-of-repo provider can target: `--collector auto` selects the
+  built-in provider for the platform — on Windows the native `bhf-collector-win` ETW
+  provider, which starts the NT Kernel Logger real-time session and decodes live
+  `EVENT_RECORD`s for the process / file-I/O / image-load kernel providers (complete
+  pointer-size- and version-aware MOF decode: `CreateProcess*`/descendants,
+  file create/open/write/rename/delete with resolved paths, `LoadLibrary*`/image-load);
+  on Linux the in-process `LD_PRELOAD` runtrace adapter, a collector-shaped view over
+  the same shim events that leaves `--runtime-oracles` unchanged. On Linux the adapter
+  reuses the fuzz loop's shim log, so `bhf fuzz --collector auto` with the shim not armed
+  (the default `--runtime-oracles off`) records a degraded, *not-observed* run rather
+  than claiming a clean assurance over coverage it never had, and the adapter confirms a
+  sink only through the SAME cross-execution correlation / constant-suppression the
+  runtime oracles use — never from a single run's taint. A PATH runs an
+  external sidecar, and `none` (default) leaves behaviour unchanged. The Windows decode
+  logic is unit-tested on every platform against synthetic ETW-shaped records (including
+  version-guarded v2/v3 `FileIo_Create` payloads); the live
+  ETW run is validated on the Windows CI runner (`BHF_WIN_LIVE=1`). Findings store their raw collector
+  session as evidence so `bhf replay` reproduces the semantic finding deterministically
+  and a reviewer can audit the attribution; collection loss, unsupported APIs, or a
+  permission denial are recorded as fidelity limitations and refuse a false "clean"
+  assurance. Provenance records the backend name/version/hash, process-tree scope,
+  observation window, the backend's *declared* supported event classes kept distinct
+  from the classes actually *observed* this run, and fidelity, for importers /
+  SARIF / vulnerability-management tools. (#60)
+- `bhf fuzz --protocol-profile <PATH>` drives a response-dependent, multi-message
+  **protocol session** (HDF-7): a versioned profile (`bhf.protocol.v1`, TOML)
+  declares typed messages, computed length/CRC/offset/TLV fields, response
+  captures and back-references, legal message ordering, session reset, and a
+  clean-exit oracle. Mutation edits field values and sequence structure, a repair
+  pass recomputes derived fields and re-resolves references before send, and
+  scheduling reports code-coverage novelty and protocol-state/transition novelty
+  separately. `--session-transport tcp:HOST:PORT`, `--session-reset`, and
+  `--max-session-messages` control the live TCP backend; a finding carries a
+  `session.json` artifact, and `bhf replay`/`bhf minimize` re-drive and shrink it
+  against a fresh reset. The run and finding record the profile hash and
+  transport/reset fidelity, for importers / SARIF / vulnerability-management
+  tools. (#58)
+- `results/findings.json` (`bhf.findings.v1`) with JSON Schemas in `schemas/`.
+- Per-finding `sanitizer.log`, harness sha256 + GNU build-id, `created_at`/`last_seen`,
+  `history[]`, and a minimized reproducer for each root-cause group (`--no-minimize`).
+- SBOM vulnerability matches appear as `sca` findings.
+- Portable harness export: each generated C/C++/Rust/Ada harness dir now carries a
+  `Mayhemfile` and a `PORTABILITY.md` with exact commands for Mayhem, libFuzzer, AFL++,
+  and honggfuzz. C/C++ gain a `make libfuzzer` target; Rust gains a `build-libfuzzer.sh`
+  (a separate instrumented build, since libFuzzer cannot consume bhf's trace-pc-guard
+  staticlib); both use a generated `bhf_libfuzzer.c` shim. `BHF_CRASH_ON_FINDING=1` makes an
+  Ada finding abort the process (SIGABRT) so a crash-keying external engine detects it.
+- `bhf binary fuzz` can express a manually authored binary-only harness that needs
+  an emulator/loader and fixed arguments: `--runner <PROG>` (e.g. `wine`,
+  `qemu-x86_64`) with repeatable `--runner-arg`, and repeatable `--target-arg`
+  (a `@@` token marks the input-file position, else file-mode input is appended).
+  The runner, target args, and full argv are recorded in the finding so
+  `bhf replay`/`bhf minimize` reproduce the launch. `--runner` is builtin-engine
+  only; `--target-arg` applies to the afl-qemu engine too (#47).
+- `--runtime-oracles auto|on|off` on `bhf fuzz` and `bhf binary fuzz` loads the
+  runtrace sink oracles via the `LD_PRELOAD` shim, so a clean-exit semantic
+  violation (fuzz-controlled command execution, path escape, dlopen, network
+  egress, SQL) becomes a finding even when the target exits zero — not just a
+  crash. `bhf fuzz` reuses the builtin loop's existing oracle + cross-execution
+  taint machinery (previously reachable only through `bhf auto`); `bhf binary
+  fuzz` publishes each input to the shim through an inherited fd so a black-box
+  target gets byte-origin taint, emits `binary_semantic` findings, and replays
+  them by re-confirming the oracle. Off by default (opt-in); Linux-only (#59).
+- `bhf binary fuzz` user-defined postcondition oracles with per-case fixture
+  hooks: `--setup-command` / `--oracle-command` / `--reset-command`. Each case
+  runs in a fresh `BHF_CASE_DIR` (passed to the hooks and the target); the oracle
+  gets the target status + stderr and signals clean (exit 0) / finding (exit 1,
+  first stdout line = signature) / infrastructure error (any other exit). A
+  violation becomes a `binary_postcondition` finding (BHF-502) even on a clean
+  target exit, and `bhf replay`/`minimize` re-evaluate the oracle rather than a
+  crash signature — expressing application-specific security policy the built-in
+  sink oracles cannot (#55).
+- `bhf project <validate|list|run>`: a versioned, explicitly-loaded external
+  project/target-profile manifest (`bhf.project.v1`, TOML) kept outside the bhf
+  source tree. One manifest composes a private harness (source or prebuilt
+  binary) with its corpora, layered dictionaries (merged in declared order, not
+  first-match), grammar, and per-target launch settings under stable target ids.
+  `validate` resolves and hashes every asset and type-checks each target (missing
+  assets, duplicate ids, unsupported schema/bhf version, invalid relative paths,
+  unsafe secret interpolation) without running a campaign or the build command;
+  `run` materializes an isolated work dir and reuses the existing
+  `builtin`/`afl++` (`fuzz`) and `binary` (`binary fuzz`) engines, records
+  provenance (`results/project.json`: project id/version/schema, manifest
+  SHA-256, resolved+redacted launch, and every asset's SHA-256), and stamps a
+  `project-provenance.json` sidecar onto each finding and the native run-summary
+  dir so findings/replay/minimization retain project/target identity. Paths
+  resolve relative to the manifest dir (`--allow-external-paths` to opt out of
+  the `..`/absolute guard); `${env:NAME}`/`${secret:NAME}` env handles resolve at
+  launch with only the handle recorded in provenance. Explicit `--manifest` is
+  the trust boundary (no auto-discovery; `--skip-build` reuses a prebuilt
+  binary). A target composes the engines' launch features: `runner` /
+  `runner-args` / `target-args` (with `arguments` as an alias) launch a binary
+  target under a runner/emulator with fixed `@@`-marked argv (#47, binary engine
+  only); `runtime-oracles` (`auto`/`on`/`off`) arms the clean-exit sink oracles
+  on both lanes (#59); and a `[target.postcondition]` with required
+  `oracle-command` plus optional `setup-command`/`reset-command` runs a
+  user-defined security postcondition around each testcase (#55, binary builtin
+  engine). Malformed compositions fail closed at `validate` (an unknown field, a
+  `runner-args` without `runner`, a `target-args`/`arguments` conflict, a
+  postcondition with no oracle, an invalid `runtime-oracles` mode, or a
+  binary-only wrapper on a native target) (#56).
+
+### Changed
+- With no `--findings`/`--out`, `bhf report` rebuilds `bhf_work/results/`. `--junit`/
+  `--baseline`/`--model` write to `results/report/` (with the `bhf.report.v2` snapshot).
+  `export` bundles `results/`. `clean --findings` removes `results/`, and `clean --reports`
+  removes `results/report/`.
+
+### Fixed
+- **Protocol-session replay/minimize honor the recorded oracle** (`bhf replay`/`bhf minimize`,
+  #58): under a multi-oracle profile (`[[oracle]]` is a list) a session recorded for oracle
+  `O1` could be "reproduced" — or minimized — via a *different* oracle `O2` firing, falsely
+  confirming `O1` and letting delta-debugging shrink away the very structure `O1` depends on.
+  Replay and minimize now require the re-driven session to fire the SAME recorded oracle (by
+  name and `rule_id`), not merely *some* finding.
+- **Explicit enum wire width + overflow guard** (`bhf.protocol.v1`, #58): an `enum` field (and
+  response capture) may now set an explicit `width = "u8"|"u16"|"u32"`; when absent the width is
+  still inferred from the largest variant code, but an enum that must occupy a wider wire field
+  than its codes imply no longer under-sizes and shifts the fields after it. A variant code that
+  exceeds the resolved width now errors with `ValueTooWide` at encode time (mirroring the integer
+  arm) instead of silently truncating.
+- **Extension re-handshake failure no longer leaks children** (`bhf extension`/`bhf fuzz
+  --extension`, #57): a supervised extension whose restart-time re-handshake fails persistently
+  now ends the pass after a single failed respawn instead of re-attempting one for every
+  remaining restart slot, and the host reaps every spawned child. Previously each failed
+  re-handshake dropped its freshly-spawned child's session via `?` without killing/reaping it
+  (`std::process::Child` neither kills nor waits on drop), leaking up to `max_restarts` zombie
+  processes across the evaluate loop. A failed respawn/re-handshake is now terminal (at most one
+  extra child), and a `Session` reaps its child on drop on every path. The bounded outcome is
+  unchanged: `EXIT_INFRA` (4) with `extension.json` provenance for `evaluate`/`session`, and the
+  fuzz pass still ends cleanly without a target finding.
+- **Extension teardown cannot hang on a double-forked grandchild** (`bhf extension`/`bhf fuzz
+  --extension`, #57 follow-up): the `Session` drop that reaps the child now waits for its
+  stdout frame-reader thread only up to a short bound before detaching it. If the extension
+  double-forked a grandchild that inherited the child's stdout (fd 1), that grandchild keeps the
+  pipe's write-end open after the direct child is killed+reaped, so the reader's blocking `read`
+  never sees EOF; the previous unconditional `join()` on drop would then block teardown/restart
+  forever. The child is still killed+reaped (no zombie) and the normal path still joins the
+  reader cleanly at EOF — only a reader left blocked on a grandchild-held pipe is abandoned. The
+  bounded outcome (`EXIT_INFRA` (4) with `extension.json`) is unchanged.
+- **Relational executor robustness** (`bhf relational`, #61): the per-profile spawn now
+  feeds stdin and drains stdout/stderr on dedicated threads concurrently with the wait
+  loop, so a target that streams more than a pipe buffer of output — or never reads its
+  stdin — no longer deadlocks the parent until `--timeout-secs`; the timeout/kill behaviour
+  is unchanged. Each per-(profile,case) scratch dir (`input.bin` + `cov.shm` +
+  `runtrace.jsonl` + `collector.jsonl`) is now removed as soon as its run returns (via an
+  RAII guard), and the campaign/replay/minimize scratch roots are removed on any exit
+  including a propagated error, so a long or interrupted campaign no longer accumulates or
+  leaks scratch. Retention now also folds in a **new semantic observation** (postcondition /
+  runtime-oracle result), matching the documented behaviour.
+- **Secret redaction in binary-lane findings** (`bhf project run`, #56): a resolved
+  `${secret:NAME}` / `${env:NAME}` env value no longer leaks in plaintext into
+  `results/findings/<id>/finding.json` (nor anything `bhf replay`/`minimize` reads back).
+  The spawned target still receives the real resolved value, but the finding records only
+  the handle; `bhf replay`/`minimize` re-resolve it from the environment (the same
+  `BHF_SECRET_<NAME>` mechanism `project run` uses), erroring if it is unset rather than
+  reproducing with a missing secret. Standalone `bhf binary fuzz` env is unchanged
+  (recorded verbatim; it has no secret handles).
+- `F-TSAN`, `F-MEM`, `F-JSINK`, `F-EXT` and `F-DIFF` findings were missing from the auto index.
+- `bhf report` with default flags after `bhf auto` found nothing.
+- `replay.py` harness discovery looked in the pre-`harnesses/` location.
+
 ## 0.2.34 - 2026-10-01
 
 `bhf binary scan` now recurses into Debian `.deb` packages and tar archives.

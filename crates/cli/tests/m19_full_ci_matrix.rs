@@ -561,7 +561,7 @@ fn emit_finding(
     let id = emitter
         .emit(input, testcase, handler_idx)
         .expect("finding is emitted");
-    let finding_dir = root.join("findings").join(id.0);
+    let finding_dir = root.join("results").join("findings").join(id.0);
     serde_json::from_slice(&fs::read(finding_dir.join("finding.json")).unwrap()).unwrap()
 }
 

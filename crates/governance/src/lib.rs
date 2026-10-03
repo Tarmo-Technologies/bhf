@@ -1012,7 +1012,7 @@ pub fn runner_handoff_file(
     let selected = runner_select_file(manifest, runner_id)?;
     let runner = selected.get("runner").cloned().unwrap_or(Value::Null);
     let mut artifacts = Vec::new();
-    collect_artifacts_by_prefix(work_dir, "findings", "finding", &mut artifacts)?;
+    collect_artifacts_by_prefix(work_dir, findings_rel(work_dir), "finding", &mut artifacts)?;
     collect_artifacts_by_prefix(work_dir, "reports", "report", &mut artifacts)?;
     artifacts.sort_by(|left, right| {
         left.get("path")
@@ -1316,6 +1316,8 @@ pub fn create_update_pack_file(
     Ok(manifest)
 }
 
+// Argument count is inherent to the signed-pack file contract (pre-existing API).
+#[allow(clippy::too_many_arguments)]
 pub fn create_authenticated_update_pack_file(
     root: &Path,
     pack_id: &str,
@@ -1892,6 +1894,8 @@ pub fn install_update_pack_file_with_options(
     )
 }
 
+// Verify-then-install threads every pack path plus two callbacks (pre-existing).
+#[allow(clippy::too_many_arguments)]
 fn install_update_pack_file_after_verify<F: FnOnce(), G: FnOnce()>(
     manifest: &Path,
     root: &Path,
@@ -2154,55 +2158,25 @@ fn copy_regular_snapshot_file(
 
 pub fn write_export_manifest(options: &ExportOptions) -> Result<Value, GovernanceError> {
     let mut artifacts = Vec::new();
-    collect_work_artifact(
-        &options.work_dir,
-        "reports/run-last.json",
-        "report_json",
-        &mut artifacts,
-    )?;
-    collect_work_artifact(
-        &options.work_dir,
-        "reports/run-last.md",
-        "report_markdown",
-        &mut artifacts,
-    )?;
-    collect_work_artifact(
-        &options.work_dir,
-        "reports/run-last.sarif",
-        "sarif",
-        &mut artifacts,
-    )?;
-    collect_work_artifact(
-        &options.work_dir,
-        "reports/run-last.junit.xml",
-        "junit",
-        &mut artifacts,
-    )?;
-    collect_work_artifact(
-        &options.work_dir,
-        "static/static-report.json",
-        "static_report",
-        &mut artifacts,
-    )?;
-    collect_work_artifact(
-        &options.work_dir,
-        "static/static-report.sarif",
-        "static_sarif",
-        &mut artifacts,
-    )?;
-    collect_work_artifact(&options.work_dir, "sbom/sbom.json", "sbom", &mut artifacts)?;
-    collect_work_artifact(
-        &options.work_dir,
-        "sbom/cyclonedx.json",
-        "cyclonedx_sbom",
-        &mut artifacts,
-    )?;
-    collect_work_artifact(
-        &options.work_dir,
-        "sbom/vulnerabilities.json",
-        "vulnerability_report",
-        &mut artifacts,
-    )?;
+    for (rel, kind) in [
+        ("results/INDEX.md", "results_index"),
+        ("results/findings.json", "findings_json"),
+        ("results/findings.csv", "findings_csv"),
+        ("results/findings.sarif", "sarif"),
+        ("results/manifest.json", "results_manifest"),
+        ("results/attestation.json", "attestation"),
+        ("results/report/run-last.json", "report_json"),
+        ("results/report/run-last.junit.xml", "junit"),
+        ("results/static/static-report.json", "static_report"),
+        ("results/static/static-report.sarif", "static_sarif"),
+        ("results/sbom/sbom.json", "sbom"),
+        ("results/sbom/cyclonedx.json", "cyclonedx_sbom"),
+        ("results/sbom/sbom.spdx.json", "spdx_sbom"),
+        ("results/sbom/vulnerabilities.json", "vulnerability_report"),
+        ("results/sbom/openvex.json", "openvex"),
+    ] {
+        collect_work_artifact(&options.work_dir, rel, kind, &mut artifacts)?;
+    }
     collect_work_artifact(
         &options.work_dir,
         "auto/run.json",
@@ -2215,13 +2189,20 @@ pub fn write_export_manifest(options: &ExportOptions) -> Result<Value, Governanc
         "auto_markdown",
         &mut artifacts,
     )?;
-    collect_artifacts_by_name(
-        &options.work_dir,
-        "findings",
-        "testcase.bin",
-        "replay_input",
-        &mut artifacts,
-    )?;
+    for (file, kind) in [
+        ("finding.json", "finding_record"),
+        ("testcase.bin", "replay_input"),
+        ("min_testcase.bin", "replay_input_minimized"),
+        ("sanitizer.log", "sanitizer_log"),
+    ] {
+        collect_artifacts_by_name(
+            &options.work_dir,
+            findings_rel(&options.work_dir),
+            file,
+            kind,
+            &mut artifacts,
+        )?;
+    }
     collect_artifacts_by_prefix(
         &options.work_dir,
         "evidence",
@@ -2811,8 +2792,24 @@ fn audit_next_sequence(log: &Path) -> Result<u64, GovernanceError> {
         + 1)
 }
 
+/// The findings path relative to a work dir: the canonical results layout
+/// (`corpus::layout::findings_dir`, spelled out because governance has no corpus
+/// dependency) when present, else the legacy `findings` so old work dirs resolve.
+fn findings_rel(work_dir: &Path) -> &'static str {
+    if work_dir.join("results").join("findings").is_dir() {
+        "results/findings"
+    } else {
+        "findings"
+    }
+}
+
+/// The findings directory for a work dir, via [`findings_rel`].
+fn findings_dir(work_dir: &Path) -> PathBuf {
+    work_dir.join(findings_rel(work_dir))
+}
+
 fn count_finding_json(work_dir: &Path) -> Result<usize, GovernanceError> {
-    let findings = work_dir.join("findings");
+    let findings = findings_dir(work_dir);
     if !findings.is_dir() {
         return Ok(0);
     }
@@ -2823,7 +2820,7 @@ fn count_finding_json(work_dir: &Path) -> Result<usize, GovernanceError> {
 }
 
 fn finding_records(work_dir: &Path) -> Result<Vec<Value>, GovernanceError> {
-    let findings = work_dir.join("findings");
+    let findings = findings_dir(work_dir);
     if !findings.is_dir() {
         return Ok(Vec::new());
     }
@@ -2841,57 +2838,33 @@ fn missing_required_work_artifacts(
     required: &[String],
 ) -> Result<Vec<String>, GovernanceError> {
     let mut artifacts = Vec::new();
-    collect_work_artifact(
-        work_dir,
-        "reports/run-last.json",
-        "report_json",
-        &mut artifacts,
-    )?;
-    collect_work_artifact(
-        work_dir,
-        "reports/run-last.md",
-        "report_markdown",
-        &mut artifacts,
-    )?;
-    collect_work_artifact(work_dir, "reports/run-last.sarif", "sarif", &mut artifacts)?;
-    collect_work_artifact(
-        work_dir,
-        "reports/run-last.junit.xml",
-        "junit",
-        &mut artifacts,
-    )?;
-    collect_work_artifact(
-        work_dir,
-        "static/static-report.json",
-        "static_report",
-        &mut artifacts,
-    )?;
-    collect_work_artifact(
-        work_dir,
-        "static/static-report.sarif",
-        "static_sarif",
-        &mut artifacts,
-    )?;
-    collect_work_artifact(work_dir, "sbom/sbom.json", "sbom", &mut artifacts)?;
-    collect_work_artifact(
-        work_dir,
-        "sbom/cyclonedx.json",
-        "cyclonedx_sbom",
-        &mut artifacts,
-    )?;
-    collect_work_artifact(
-        work_dir,
-        "sbom/vulnerabilities.json",
-        "vulnerability_report",
-        &mut artifacts,
-    )?;
-    collect_artifacts_by_name(
-        work_dir,
-        "findings",
-        "testcase.bin",
-        "replay_input",
-        &mut artifacts,
-    )?;
+    for (rel, kind) in [
+        ("results/INDEX.md", "results_index"),
+        ("results/findings.json", "findings_json"),
+        ("results/findings.csv", "findings_csv"),
+        ("results/findings.sarif", "sarif"),
+        ("results/manifest.json", "results_manifest"),
+        ("results/attestation.json", "attestation"),
+        ("results/report/run-last.json", "report_json"),
+        ("results/report/run-last.junit.xml", "junit"),
+        ("results/static/static-report.json", "static_report"),
+        ("results/static/static-report.sarif", "static_sarif"),
+        ("results/sbom/sbom.json", "sbom"),
+        ("results/sbom/cyclonedx.json", "cyclonedx_sbom"),
+        ("results/sbom/sbom.spdx.json", "spdx_sbom"),
+        ("results/sbom/vulnerabilities.json", "vulnerability_report"),
+        ("results/sbom/openvex.json", "openvex"),
+    ] {
+        collect_work_artifact(work_dir, rel, kind, &mut artifacts)?;
+    }
+    for (file, kind) in [
+        ("finding.json", "finding_record"),
+        ("testcase.bin", "replay_input"),
+        ("min_testcase.bin", "replay_input_minimized"),
+        ("sanitizer.log", "sanitizer_log"),
+    ] {
+        collect_artifacts_by_name(work_dir, findings_rel(work_dir), file, kind, &mut artifacts)?;
+    }
     collect_artifacts_by_prefix(work_dir, "evidence", "validation_evidence", &mut artifacts)?;
     Ok(missing_required_artifacts(&artifacts, required))
 }
@@ -4314,7 +4287,9 @@ fn match_vulnerabilities(
     let mut matches = Vec::new();
     if let Some(vuln_db) = &options.vuln_db {
         let db = read_json(vuln_db)?;
-        let advisories = db.get("vulnerabilities").and_then(Value::as_array)
+        let advisories = db
+            .get("vulnerabilities")
+            .and_then(Value::as_array)
             .ok_or_else(|| GovernanceError::InvalidInput {
                 message: "advisory database requires a vulnerabilities array".to_owned(),
             })?;
@@ -4494,8 +4469,11 @@ fn cpe_fields(raw: &str) -> Option<Vec<String>> {
 
 /// Refuse malformed advisory records rather than silently producing a clean gate.
 fn validate_advisory(vuln: &Value, index: usize) -> Result<(), GovernanceError> {
-    let nonempty = |value: Option<&Value>| value.and_then(Value::as_str)
-        .is_some_and(|text| !text.trim().is_empty());
+    let nonempty = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.trim().is_empty())
+    };
     let package = vuln.get("package").unwrap_or(&Value::Null);
     let named = nonempty(package.get("name")) && nonempty(package.get("ecosystem"));
     let identified = vulnerability_cpe(vuln, package).is_some_and(|s| !s.trim().is_empty())
@@ -4672,10 +4650,13 @@ fn vulnerability_fixed_version_hints(vuln: &Value) -> Vec<String> {
             versions.push(value.to_owned());
         }
     }
-    versions.into_iter().map(|value| value.trim().to_owned())
+    versions
+        .into_iter()
+        .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
         .collect::<std::collections::BTreeSet<_>>()
-        .into_iter().collect()
+        .into_iter()
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5608,7 +5589,7 @@ fn authenticated_pack_signature_summary(
 
     let schema = raw_manifest.map_or_else(
         || serde_json::from_value::<SignedPackManifest>(manifest.clone()),
-        |bytes| serde_json::from_slice::<SignedPackManifest>(bytes),
+        serde_json::from_slice::<SignedPackManifest>,
     );
     if let Ok(schema) = schema {
         if signed_pack_schema_valid(&schema) && signed_pack_optional_types_valid(manifest) {
@@ -7612,7 +7593,10 @@ mod vex_e2e_tests {
         assert_ne!(stmt["status"], "not_affected");
         assert!(stmt.get("justification").is_none());
         let impact = stmt["impact_statement"].as_str().unwrap();
-        assert!(impact.contains("no validated campaign evidence"), "{impact}");
+        assert!(
+            impact.contains("no validated campaign evidence"),
+            "{impact}"
+        );
 
         let cyclonedx = read_json(&out.join("cyclonedx.json")).unwrap();
         let analysis = &cyclonedx_vuln_for(&cyclonedx, "CVE-2026-NOCAMP")["analysis"];
@@ -7667,7 +7651,10 @@ mod vex_e2e_tests {
         assert_eq!(stmt["status"], "under_investigation");
         assert!(stmt.get("justification").is_none());
         let impact = stmt["impact_statement"].as_str().unwrap();
-        assert!(impact.contains("vulnerability-specific evidence is required"), "{impact}");
+        assert!(
+            impact.contains("vulnerability-specific evidence is required"),
+            "{impact}"
+        );
 
         let cyclonedx = read_json(&out.join("cyclonedx.json")).unwrap();
         let analysis = &cyclonedx_vuln_for(&cyclonedx, "CVE-2026-REACH")["analysis"];
@@ -7711,7 +7698,10 @@ mod vex_e2e_tests {
         assert_eq!(stmt["status"], "under_investigation");
         assert!(stmt.get("justification").is_none());
         let impact = stmt["impact_statement"].as_str().unwrap();
-        assert!(impact.contains("advisory fixed-version hints: 3.0.13"), "{impact}");
+        assert!(
+            impact.contains("advisory fixed-version hints: 3.0.13"),
+            "{impact}"
+        );
 
         let cyclonedx = read_json(&out.join("cyclonedx.json")).unwrap();
         let analysis = &cyclonedx_vuln_for(&cyclonedx, "CVE-2026-FIXED")["analysis"];
@@ -8192,3 +8182,177 @@ mod vex_e2e_tests {
 
 #[cfg(all(test, target_os = "linux"))]
 mod publication_tests;
+
+#[cfg(test)]
+mod findings_reader_tests {
+    use super::*;
+
+    fn seed_finding(dir: &Path) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(
+            dir.join("finding.json"),
+            r#"{"id":"F-1","severity":"high"}"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn readers_prefer_results_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path();
+        seed_finding(&work.join("results").join("findings").join("F-1"));
+        assert_eq!(count_finding_json(work).unwrap(), 1);
+        let records = finding_records(work).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["id"], "F-1");
+    }
+
+    #[test]
+    fn readers_fall_back_to_legacy_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path();
+        seed_finding(&work.join("findings").join("F-1"));
+        assert_eq!(count_finding_json(work).unwrap(), 1);
+        assert_eq!(finding_records(work).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn readers_return_empty_when_no_findings_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(count_finding_json(tmp.path()).unwrap(), 0);
+        assert!(finding_records(tmp.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn readers_prefer_results_even_when_legacy_also_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path();
+        seed_finding(&work.join("results").join("findings").join("F-new"));
+        seed_finding(&work.join("findings").join("F-old"));
+        // results/ exists, so only its finding is seen; the legacy one is ignored.
+        assert_eq!(count_finding_json(work).unwrap(), 1);
+        assert_eq!(finding_records(work).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn runner_handoff_collects_findings_from_results_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        seed_finding(&work.join("results").join("findings").join("F-1"));
+        let manifest = tmp.path().join("runners.json");
+        fs::write(&manifest, r#"{"runners":[]}"#).unwrap();
+        let out = tmp.path().join("handoff.json");
+        let handoff = runner_handoff_file(&manifest, "r1", &work, &out).unwrap();
+        let artifacts = handoff["artifacts"].as_array().unwrap();
+        assert!(
+            artifacts.iter().any(|a| a["kind"] == "finding"
+                && a["path"]
+                    .as_str()
+                    .is_some_and(|path| path.contains("results/findings/F-1"))),
+            "handoff did not collect the results-layout finding: {handoff}"
+        );
+    }
+
+    fn seed_replay_input(finding_dir: &Path) {
+        seed_finding(finding_dir);
+        fs::write(finding_dir.join("testcase.bin"), b"replay").unwrap();
+    }
+
+    #[test]
+    fn ci_evidence_finds_replay_input_in_results_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path();
+        seed_replay_input(&work.join("results").join("findings").join("F-1"));
+        let missing = missing_required_work_artifacts(work, &["replay_input".to_owned()]).unwrap();
+        assert!(
+            missing.is_empty(),
+            "replay_input reported missing: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn ci_evidence_finds_replay_input_in_legacy_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path();
+        seed_replay_input(&work.join("findings").join("F-1"));
+        let missing = missing_required_work_artifacts(work, &["replay_input".to_owned()]).unwrap();
+        assert!(
+            missing.is_empty(),
+            "replay_input reported missing: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn export_collects_replay_input_from_results_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        seed_replay_input(&work.join("results").join("findings").join("F-1"));
+        let manifest = write_export_manifest(&ExportOptions {
+            work_dir: work,
+            out: tmp.path().join("export.json"),
+            bundle_dir: None,
+            policy: None,
+            update_packs: Vec::new(),
+            audit_log: None,
+            runner_manifest: None,
+            runner_plan: None,
+            required_artifacts: vec!["replay_input".to_owned()],
+        })
+        .unwrap();
+        assert!(
+            manifest["artifacts"].as_array().unwrap().iter().any(|a| {
+                a["kind"] == "replay_input" && a["path"] == "results/findings/F-1/testcase.bin"
+            }),
+            "export did not collect the results-layout replay input: {manifest}"
+        );
+        assert_eq!(manifest["required_artifacts"]["missing"], json!([]));
+    }
+
+    #[test]
+    fn export_collects_results_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path();
+        for rel in [
+            "results/INDEX.md",
+            "results/findings.json",
+            "results/findings.sarif",
+            "results/findings.csv",
+            "results/manifest.json",
+            "results/attestation.json",
+            "results/findings/F-0000-aaaaaaaa/finding.json",
+            "results/findings/F-0000-aaaaaaaa/testcase.bin",
+            "results/findings/F-0000-aaaaaaaa/sanitizer.log",
+        ] {
+            let p = work.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"x").unwrap();
+        }
+        let manifest = write_export_manifest(&ExportOptions {
+            work_dir: work.to_path_buf(),
+            out: tmp.path().join("export.json"),
+            bundle_dir: None,
+            policy: None,
+            update_packs: Vec::new(),
+            audit_log: None,
+            runner_manifest: None,
+            runner_plan: None,
+            required_artifacts: Vec::new(),
+        })
+        .unwrap();
+        let paths: Vec<String> = manifest["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["path"].as_str().unwrap().to_owned())
+            .collect();
+        for want in [
+            "results/findings.json",
+            "results/findings.sarif",
+            "results/findings/F-0000-aaaaaaaa/testcase.bin",
+            "results/findings/F-0000-aaaaaaaa/finding.json",
+            "results/findings/F-0000-aaaaaaaa/sanitizer.log",
+        ] {
+            assert!(paths.iter().any(|p| p == want), "missing {want}: {paths:?}");
+        }
+    }
+}

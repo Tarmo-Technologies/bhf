@@ -86,7 +86,7 @@ fn cartography_maps_byte_to_controlled_read_offset() {
 }
 
 fn find_finding(work: &std::path::Path) -> Option<std::path::PathBuf> {
-    std::fs::read_dir(work.join("findings"))
+    std::fs::read_dir(work.join("results").join("findings"))
         .ok()?
         .flatten()
         .map(|e| e.path())

@@ -333,6 +333,17 @@ pub struct FuzzArgs {
     #[arg(long = "seed-file")]
     pub seed_files: Vec<PathBuf>,
 
+    /// Path to an explicitly-trusted extension manifest (`bhf.extension-manifest.v1`,
+    /// TOML). When set, after the campaign the retained corpus is driven through
+    /// the extension's out-of-process `oracle.evaluate` so a clean-exit semantic
+    /// violation becomes a finding. Explicit load is the trust boundary; an
+    /// extension is never auto-discovered. An extension crash/timeout/malformed
+    /// reply is a bounded infrastructure result that never aborts the campaign nor
+    /// becomes a target finding. (Evaluation runs post-run on retained inputs, not
+    /// in the hot mutation loop; supported by the builtin engine.)
+    #[arg(long = "extension", value_name = "MANIFEST")]
+    pub extension: Option<PathBuf>,
+
     /// Sanitizer campaign matrix to arm, comma-separated (asan, msan, ubsan, tsan,
     /// lsan), or the standalone value `none` (build coverage-only with no
     /// `-fsanitize=` — crash-only fuzzing without ASan/UBSan false positives).
@@ -369,6 +380,16 @@ pub struct FuzzArgs {
     /// the parent process env. Always empty for the CLI path.
     #[arg(skip)]
     pub extra_env: Vec<(String, String)>,
+
+    /// Load the runtime sink oracles via the LD_PRELOAD runtrace shim (#59), so a
+    /// clean-exit semantic violation — a fuzz-controlled command execution, path
+    /// escape, dlopen, network egress, or SQL query — becomes a finding even when
+    /// the target exits zero. `off` (default) is crash-only, preserving existing
+    /// behaviour; `auto` enables them when the shim and platform (Linux) support
+    /// it and skips otherwise; `on` requires them (errors if unavailable). A no-op
+    /// when `bhf auto` already armed the shim through `extra_env`.
+    #[arg(long = "runtime-oracles", value_enum, default_value_t = crate::runtime_oracles::RuntimeOracleMode::Off)]
+    pub runtime_oracles: crate::runtime_oracles::RuntimeOracleMode,
 
     /// Path to a previously captured runtrace audit log produced
     /// with `BHF_CMPLOG=1`. When set, recovered cmplog operands
@@ -421,6 +442,52 @@ pub struct FuzzArgs {
     /// over its protocol and rejects this option.
     #[arg(long = "transport-coverage-map", value_name = "SPEC")]
     pub transport_coverage_map: Option<String>,
+
+    /// Load a versioned protocol profile (TOML, `bhf.protocol.v1`) and fuzz the
+    /// target as a response-dependent, multi-message session (HDF-7) instead of
+    /// single opaque inputs. Additive: when this is absent the default host /
+    /// transport paths run byte-for-byte as before. Presence routes to the
+    /// session lane, which needs `--session-transport`. A testcase is a sequence
+    /// of structured messages; mutation edits field values AND sequence structure
+    /// and a repair pass recomputes derived length/CRC fields and re-resolves
+    /// response back-references before send. Findings (a clean-exit protocol
+    /// violation, no crash) are written through the usual `results/` layout for
+    /// importers / SARIF / vulnerability-management tools.
+    #[arg(long = "protocol-profile", value_name = "PATH")]
+    pub protocol_profile: Option<PathBuf>,
+
+    /// Request/response backend for the session lane. `tcp:HOST:PORT` connects a
+    /// socket per session. Required when `--protocol-profile` is set.
+    #[arg(long = "session-transport", value_name = "SPEC")]
+    pub session_transport: Option<String>,
+
+    /// How a session is reset between testcases: `reconnect` (default; a fresh
+    /// connection gives fresh per-session target state, so a new handle / id /
+    /// nonce is captured each run) or `none`. Recorded as the run's reset
+    /// fidelity.
+    #[arg(long = "session-reset", value_enum, default_value_t = crate::session_fuzz::SessionResetMode::Reconnect)]
+    pub session_reset: crate::session_fuzz::SessionResetMode,
+
+    /// Bounded cap on messages per session (default 64); a sequence mutation that
+    /// would exceed it fails with a diagnostic rather than growing unbounded.
+    #[arg(long = "max-session-messages", default_value_t = 64)]
+    pub max_session_messages: usize,
+
+    /// Runtime-event collector that observes process, filesystem, and module-load
+    /// effects the harness performs even on a clean exit (#60). `auto` picks the
+    /// built-in provider for this platform (native Windows ETW; inactive on
+    /// Linux); a PATH runs an external sidecar that speaks the
+    /// bhf.collector-event.v1 JSONL protocol; `none` (default) disables it. A
+    /// collected semantic violation becomes a `binary_semantic` finding (no crash
+    /// needed), with the raw collector session stored for deterministic replay.
+    #[arg(long = "collector", value_parser = crate::collector_run::parse_collector_spec, default_value = "none")]
+    pub collector: crate::collector_run::CollectorSpec,
+
+    /// How long, in milliseconds, to keep observing descendant-process effects
+    /// after the testcase process exits — the bounded post-exit observation
+    /// window (#60).
+    #[arg(long = "collector-window-ms", default_value_t = crate::collector_run::DEFAULT_WINDOW_MS)]
+    pub collector_window_ms: u64,
 }
 
 impl FuzzArgs {
@@ -815,6 +882,14 @@ pub(crate) struct FuzzRunSummary {
     /// and omitted from `run.json` for a plain `native` afl++ run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) afl: Option<AflRunProvenance>,
+    /// #57: out-of-process extension `oracle.evaluate` provenance for a
+    /// `--extension` run — the negotiated protocol/capabilities, the extension's
+    /// executable/config hashes, how many retained inputs were evaluated, how many
+    /// semantic findings were emitted, and any bounded infrastructure errors. An
+    /// additive, optional field: `schema_version` is unchanged, and it is omitted
+    /// from `run.json` when no `--extension` was given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) extension: Option<serde_json::Value>,
 }
 
 /// AFL++ binary-only settings recorded in `run.json` so a run is reproducible
@@ -988,6 +1063,10 @@ struct PreparedFuzzRun {
     deadline: Option<Duration>,
     print_final_stats: bool,
     rss_limit_mb: usize,
+    /// Explicitly-trusted extension manifest (`--extension`). When set, the
+    /// builtin engine drives `oracle.evaluate` over the retained corpus after the
+    /// run. `None` leaves fuzzing byte-for-byte unchanged.
+    extension_manifest: Option<PathBuf>,
 }
 
 struct HarnessRun {
@@ -997,6 +1076,8 @@ struct HarnessRun {
     /// recognized in its stderr. The C/C++ fuzz path uses this to emit
     /// findings without an Ada event log.
     sanitizer: Option<corpus::SanitizerReport>,
+    /// Raw stderr of the run that produced `sanitizer`, for `sanitizer.log`.
+    stderr: Option<String>,
     /// #15: the target REJECTED this input (diagnosed assertion/panic or a non-zero error
     /// return on malformed bytes) — a clean no-finding run that the pass skips and
     /// continues past. Tracked so `run_builtin` can tell a target that rejected
@@ -1065,9 +1146,23 @@ pub fn run(args: FuzzArgs) -> i32 {
         return crate::transport_fuzz::run(args);
     }
 
+    // HDF-7: when a protocol profile is supplied, drive the additive session lane
+    // (a separate response-dependent, multi-message loop) and leave the host
+    // libFuzzer/AFL path below untouched.
+    if crate::session_fuzz::should_use_session(&args) {
+        return crate::session_fuzz::run(args);
+    }
+
     if multicore_requested(&args) {
         return run_multicore_campaign(args);
     }
+
+    // #60: capture the collector spec before `prepare` consumes `args`, so a
+    // collected clean-exit semantic violation can be emitted after the fuzz run.
+    let collector_spec = args.collector.clone();
+    let collector_window_ms = args.collector_window_ms;
+    let collector_work_dir = args.work_dir.clone();
+    let collector_harness = args.harness.clone();
 
     let prepared = match prepare(args) {
         Ok(prepared) => prepared,
@@ -1084,7 +1179,30 @@ pub fn run(args: FuzzArgs) -> i32 {
 
     match result {
         Ok(summary) => {
-            match serde_json::to_string_pretty(&summary) {
+            let mut value = match serde_json::to_value(&summary) {
+                Ok(value) => value,
+                Err(error) => {
+                    bhfeprintln!("failed to render fuzz summary: {error}");
+                    return 1;
+                }
+            };
+            // #60: run the platform-neutral collector (inactive by default, leaving
+            // behaviour unchanged) and attach its provenance + any findings.
+            match run_collector_for_fuzz(
+                &collector_spec,
+                collector_window_ms,
+                &collector_work_dir,
+                &collector_harness,
+            ) {
+                Ok(provenance) => {
+                    value["collector"] = provenance;
+                }
+                Err(error) => {
+                    bhfeprintln!("collector: {error:#}");
+                    return 1;
+                }
+            }
+            match serde_json::to_string_pretty(&value) {
                 Ok(json) => println!("{json}"),
                 Err(error) => {
                     bhfeprintln!("failed to render fuzz summary: {error}");
@@ -1098,6 +1216,84 @@ pub fn run(args: FuzzArgs) -> i32 {
             1
         }
     }
+}
+
+/// Run the platform-neutral runtime-event collector (#60) for a `bhf fuzz`
+/// invocation and return its run-manifest provenance (including the ids of any
+/// collector-sourced `binary_semantic` findings written to the results tree).
+/// Inactive (the default, or no built-in provider on this platform) is a no-op
+/// that returns inactive provenance, so the historical behaviour is unchanged.
+fn run_collector_for_fuzz(
+    spec: &crate::collector_run::CollectorSpec,
+    window_ms: u64,
+    work_dir: &Path,
+    harness_id: &str,
+) -> anyhow::Result<serde_json::Value> {
+    use anyhow::Context;
+    let Some(resolved) = crate::collector_run::resolve(spec, window_ms)? else {
+        return Ok(crate::collector_run::inactive_run_provenance(spec));
+    };
+    let findings_dir = corpus::layout::findings_dir(work_dir);
+    std::fs::create_dir_all(&findings_dir)
+        .with_context(|| format!("create {}", findings_dir.display()))?;
+    let outcome = if resolved.runtrace_shim().is_some() {
+        // Linux built-in provider: re-express the LD_PRELOAD shim events the builtin
+        // fuzz loop already captured (`work_dir/runtrace.jsonl`) as collector events.
+        // The loop writes that log ONLY when the runtrace shim is armed (for example
+        // with `--runtime-oracles`), so `--collector auto` layers a collector-shaped
+        // view over the SAME shim events without changing the runtime-oracle
+        // behaviour or re-running the harness.
+        let log = work_dir.join("runtrace.jsonl");
+        if !log.is_file() {
+            // #60 AC6: the shim was NOT armed (e.g. the default `--runtime-oracles
+            // off`), so the collector observed nothing this run. Record a degraded,
+            // not-observed run rather than evaluating an empty stream and claiming a
+            // clean collector assurance over coverage it never had.
+            resolved.not_observed("runtime_shim_not_armed")
+        } else {
+            let mut events = crate::auto::runtrace::parse_log(&log).unwrap_or_default();
+            crate::auto::runtrace::dedupe_in_place(&mut events);
+            // Route sink confirmation through the SAME cross-execution correlation
+            // #59 uses: the aggregated log spans every execution, so the gate's
+            // never-untainted / constant-suppression applies across the whole run
+            // and no sink is single-run taint-confirmed.
+            let gate = crate::auto::runtrace::CollectorTaintGate::from_events(&events);
+            let adapter_ctx = crate::auto::runtrace::CollectorAdapterCtx {
+                testcase: "fuzz".to_owned(),
+                worker: 0,
+                root_pid: 1,
+            };
+            let jsonl = crate::auto::runtrace::collector_jsonl_from_events(
+                &events,
+                &adapter_ctx,
+                harness_id,
+                &gate,
+            );
+            resolved.evaluate_jsonl(&jsonl, &work_dir.display().to_string())
+        }
+    } else {
+        let params = crate::collector_run::CollectorRunParams {
+            testcase: "fuzz".to_owned(),
+            worker: 0,
+            root: work_dir.display().to_string(),
+            root_pid: 0,
+            root_image: harness_id.to_owned(),
+            input: &[],
+            tmp_dir: work_dir.join("collector_tmp"),
+        };
+        resolved.run_once(&params)?
+    };
+    let target = serde_json::json!({ "kind": "harness", "harness": harness_id });
+    let mut ids = Vec::new();
+    for finding in &outcome.findings {
+        let id = crate::collector_run::next_collector_finding_id(&findings_dir)?;
+        let dir = findings_dir.join(&id);
+        crate::collector_run::write_finding(&dir, &id, target.clone(), finding, &[])?;
+        ids.push(id);
+    }
+    let mut provenance = outcome.run_provenance;
+    provenance["findings"] = serde_json::json!(ids);
+    Ok(provenance)
 }
 
 /// Programmatic fuzz entry used by `bhf auto`. Builds a
@@ -1215,6 +1411,7 @@ pub(crate) fn run_one_target_programmatic_with_runner(
         sandbox_tool: None,
         sandbox_strict: false,
         extra_env: extra_env.to_vec(),
+        runtime_oracles: crate::runtime_oracles::RuntimeOracleMode::Off,
         cmplog_log,
         grammar_file: None,
         structured_inputs: StructuredInputMode::Auto,
@@ -1222,6 +1419,13 @@ pub(crate) fn run_one_target_programmatic_with_runner(
         stop_after_findings,
         target_transport: None,
         transport_coverage_map: None,
+        protocol_profile: None,
+        session_transport: None,
+        session_reset: crate::session_fuzz::SessionResetMode::Reconnect,
+        max_session_messages: 64,
+        collector: crate::collector_run::CollectorSpec::Off,
+        collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
+        extension: None,
     };
     let mut prepared = prepare(args)?;
     // A caller-supplied cross runner overrides the direct/host runner `prepare`
@@ -1286,6 +1490,7 @@ pub(crate) fn run_afl_plus_plus_programmatic(
         sandbox_tool: None,
         sandbox_strict: false,
         extra_env: extra_env.to_vec(),
+        runtime_oracles: crate::runtime_oracles::RuntimeOracleMode::Off,
         cmplog_log: None,
         grammar_file: None,
         structured_inputs: StructuredInputMode::Auto,
@@ -1293,6 +1498,13 @@ pub(crate) fn run_afl_plus_plus_programmatic(
         stop_after_findings: None,
         target_transport: None,
         transport_coverage_map: None,
+        protocol_profile: None,
+        session_transport: None,
+        session_reset: crate::session_fuzz::SessionResetMode::Reconnect,
+        max_session_messages: 64,
+        collector: crate::collector_run::CollectorSpec::Off,
+        collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
+        extension: None,
     };
     let prepared = prepare(args)?;
     run_afl_plus_plus(prepared)
@@ -1354,7 +1566,7 @@ fn run_multicore_campaign(args: FuzzArgs) -> i32 {
                     return 1;
                 }
             }
-            0
+            merge_worker_findings(&config.work_dir, &summary)
         }
         Err(error) => {
             bhfeprintln!("{error}");
@@ -1364,6 +1576,52 @@ fn run_multicore_campaign(args: FuzzArgs) -> i32 {
                 | multicore_fuzz::MulticoreError::InvalidWorkerCount => 3,
                 _ => 1,
             }
+        }
+    }
+}
+
+/// Move the workers' findings into the campaign's own results/findings, so
+/// the results bracket around this command indexes them.
+fn merge_worker_findings(work_dir: &Path, summary: &multicore_fuzz::MulticoreSummary) -> i32 {
+    let workers: Vec<PathBuf> = summary
+        .per_worker
+        .iter()
+        .map(|worker| worker.work_dir.clone())
+        .collect();
+    match multicore_fuzz::merge_worker_findings(work_dir, &workers) {
+        Ok(merge) => {
+            if !merge.merged.is_empty() || merge.duplicates > 0 {
+                bhfeprintln!(
+                    "bhf fuzz: merged {} worker finding(s) into {} ({} duplicate(s) left in worker dirs)",
+                    merge.merged.len(),
+                    corpus::layout::findings_dir(work_dir).display(),
+                    merge.duplicates
+                );
+            }
+            if merge.unreadable > 0 {
+                bhfeprintln!(
+                    "warning: {} worker finding(s) without a readable finding.json were not merged",
+                    merge.unreadable
+                );
+            }
+            if merge.failed == 0 {
+                return 0;
+            }
+            bhfeprintln!(
+                "error: {} worker finding(s) could not be merged; they stay in their worker dirs and the next merge resumes them",
+                merge.failed
+            );
+            for error in &merge.errors {
+                bhfeprintln!("  {error}");
+            }
+            1
+        }
+        Err(error) => {
+            bhfeprintln!(
+                "error: worker findings not merged into {}: {error}",
+                work_dir.display()
+            );
+            1
         }
     }
 }
@@ -1554,6 +1812,23 @@ fn prepare(args: FuzzArgs) -> Result<PreparedFuzzRun, String> {
     let mut extra_env = args.extra_env;
     extra_env.extend(sanitizer_env.clone());
     apply_fuzz_child_env_overrides(&mut extra_env);
+    // #59: arm the runtime sink oracles on the manual path. `bhf auto` already
+    // threads LD_PRELOAD + BHF_RUNTRACE_LOG through `extra_env`, so this only
+    // fires for a direct `bhf fuzz` invocation (guarded: skip when already armed).
+    // The builtin loop already reads BHF_RUNTRACE_LOG, evaluates the oracle
+    // registry + cross-execution taint tracker, and emits oracle findings — we
+    // only supply the env that was missing on this path.
+    if !extra_env.iter().any(|(k, _)| k == "BHF_RUNTRACE_LOG") {
+        let mode_label = args.mode.to_string().to_ascii_lowercase();
+        if let Some(oracles) =
+            crate::runtime_oracles::RuntimeOracles::resolve(args.runtime_oracles, &mode_label)
+                .map_err(|e| e.to_string())?
+        {
+            let oracle_log = work_dir.join("runtrace.jsonl");
+            let _ = std::fs::write(&oracle_log, b"");
+            extra_env.extend(oracles.env_pairs(&oracle_log));
+        }
+    }
     // Only the standalone bhf-framed C/C++ driver carries the runtime that
     // writes these shared-memory channels; other engines/protocols ignore them.
     let builtin_framed = args.engine == FuzzEngine::Builtin
@@ -1636,6 +1911,7 @@ fn prepare(args: FuzzArgs) -> Result<PreparedFuzzRun, String> {
         deadline: args.deadline,
         print_final_stats: args.print_final_stats,
         rss_limit_mb: args.rss_limit_mb,
+        extension_manifest: args.extension,
     })
 }
 
@@ -2325,7 +2601,9 @@ fn run_builtin_with_progress(
         })
         .unwrap_or(false);
     let sandbox_metadata = prepared.runner.sandbox_metadata();
-    let emitter = FindingEmitter::with_metadata_and_sandbox(
+    let build_binary_identity = binary_analysis::build_identity(&prepared.harness_path)
+        .and_then(|identity| serde_json::to_value(identity).ok());
+    let mut emitter = FindingEmitter::with_metadata_and_sandbox(
         prepared.work_dir.clone(),
         prepared.harness_id.clone(),
         "unknown".to_owned(),
@@ -2335,6 +2613,9 @@ fn run_builtin_with_progress(
     )
     .with_mode(prepared.mode)
     .with_line_maps_dir(&prepared.work_dir.join("src_instrumented"));
+    if let Some(identity) = build_binary_identity {
+        emitter = emitter.with_build_binary(identity);
+    }
     let mut rng = MutationRng::new(prepared.rng_seed);
     // The mutation pool. Each entry carries its #382 entropic energy + selection
     // count (selection favors high-novelty, under-explored seeds) and its #400
@@ -2663,7 +2944,7 @@ fn run_builtin_with_progress(
         // Fold newly-mined value-profile operands into the dictionary every 2048
         // execs so the mutator can splice magic bytes it just observed (#398).
         if let Some(vp) = &vp_path {
-            if executions % 2048 == 0 {
+            if executions.is_multiple_of(2048) {
                 let mut added = false;
                 for token in read_vp_tokens(vp) {
                     if dictionary_token_set.insert(token.clone()) {
@@ -2886,7 +3167,11 @@ fn run_builtin_with_progress(
                     )
                 {
                     let id = emitter
-                        .emit_sanitizer_crash(&input, report)
+                        .emit_sanitizer_crash_with_log(
+                            &input,
+                            report,
+                            run.stderr.as_deref().map(str::as_bytes),
+                        )
                         .map_err(|error| format!("emit sanitizer finding: {error}"))?;
                     finding_ids.push(id.0);
                 } else {
@@ -3094,6 +3379,24 @@ fn run_builtin_with_progress(
         ));
     }
 
+    // ── #57: extension oracle.evaluate post-run pass (fenced) ───────────────
+    // When `--extension <manifest>` is set, drive the just-retained corpus
+    // through the explicitly-trusted extension's out-of-process
+    // `oracle.evaluate`. Runs AFTER the campaign (never in the hot mutation
+    // loop); an extension fault is bounded infrastructure that never aborts the
+    // run nor becomes a target finding. Reuses the run's finding emitter so an
+    // extension finding carries the harness identity.
+    let extension_block = prepared.extension_manifest.as_deref().map(|manifest| {
+        crate::extension::drive_fuzz_extension(
+            manifest,
+            &emitter,
+            &prepared.harness_id,
+            pool.iter()
+                .map(|entry| entry.bytes.as_slice())
+                .filter(|bytes| !crashing_inputs.contains(&crash_input_key(bytes))),
+        )
+    });
+
     let elapsed_secs = start.elapsed().as_secs_f64();
     let summary = FuzzRunSummary {
         schema_version: 1,
@@ -3116,6 +3419,7 @@ fn run_builtin_with_progress(
         elapsed_secs,
         executions_per_sec: executions_per_sec(executions, elapsed_secs),
         afl: None,
+        extension: extension_block,
     };
     if prepared.print_final_stats {
         bhfeprintln!(
@@ -3580,7 +3884,9 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
 
     let crashes_dir = out_dir.join("default").join("crashes");
     let sandbox_metadata = prepared.runner.sandbox_metadata();
-    let emitter = FindingEmitter::with_metadata_and_sandbox(
+    let build_binary_identity = binary_analysis::build_identity(&prepared.harness_path)
+        .and_then(|identity| serde_json::to_value(identity).ok());
+    let mut emitter = FindingEmitter::with_metadata_and_sandbox(
         prepared.work_dir.clone(),
         prepared.harness_id.clone(),
         "unknown".to_owned(),
@@ -3590,6 +3896,9 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
     )
     .with_mode(prepared.mode)
     .with_line_maps_dir(&prepared.work_dir.join("src_instrumented"));
+    if let Some(identity) = build_binary_identity {
+        emitter = emitter.with_build_binary(identity);
+    }
 
     let mut finding_ids = Vec::new();
     let mut seen_rule_sigs = HashSet::<String>::new();
@@ -3650,7 +3959,7 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
                 continue;
             }
             let id = emitter
-                .emit_sanitizer_crash(&input, &report)
+                .emit_sanitizer_crash_with_log(&input, &report, Some(stderr.as_bytes()))
                 .map_err(|error| format!("emit AFL finding: {error}"))?;
             finding_ids.push(id.0);
         }
@@ -3692,6 +4001,10 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
             afl_path: prepared.afl_path.clone(),
             inst_ranges: prepared.afl_inst_ranges.clone(),
         }),
+        // The extension `oracle.evaluate` pass is a builtin-engine feature
+        // (it iterates the builtin pool's retained corpus); AFL++ owns its own
+        // on-disk queue, so `--extension` is not driven here.
+        extension: None,
     };
     write_run_summary(&prepared.work_dir, &summary)?;
     Ok(summary)
@@ -3835,10 +4148,7 @@ fn read_bounded_head_tail(mut reader: impl Read, cap: usize) -> Vec<u8> {
     let mut tail: VecDeque<u8> = VecDeque::with_capacity(tail_cap);
     let mut truncated = false;
     let mut chunk = [0_u8; 64 * 1024];
-    loop {
-        let Ok(read) = reader.read(&mut chunk) else {
-            break;
-        };
+    while let Ok(read) = reader.read(&mut chunk) {
         if read == 0 {
             break;
         }
@@ -4075,6 +4385,7 @@ fn run_c_libfuzzer_single_input(
                         "harness exceeded the response deadline of {deadline:?} (took {elapsed:?})"
                     ),
                 }),
+                stderr: None,
                 rejected: false,
             });
         }
@@ -4085,6 +4396,7 @@ fn run_c_libfuzzer_single_input(
                 events: Vec::new(),
                 testcases: Vec::new(),
                 sanitizer: Some(report),
+                stderr: Some(stderr.to_string()),
                 rejected: false,
             });
         }
@@ -4108,6 +4420,7 @@ fn run_c_libfuzzer_single_input(
                     message: "harness exceeded the configured RSS limit (--rss-limit-mb)"
                         .to_owned(),
                 }),
+                stderr: None,
                 rejected: false,
             });
         }
@@ -4117,6 +4430,7 @@ fn run_c_libfuzzer_single_input(
                 events: Vec::new(),
                 testcases: Vec::new(),
                 sanitizer: None,
+                stderr: None,
                 rejected: false,
             });
         }
@@ -4130,6 +4444,7 @@ fn run_c_libfuzzer_single_input(
                 events: Vec::new(),
                 testcases: Vec::new(),
                 sanitizer: None,
+                stderr: None,
                 rejected: true,
             });
         }
@@ -4144,6 +4459,7 @@ fn run_c_libfuzzer_single_input(
             events: Vec::new(),
             testcases: Vec::new(),
             sanitizer: Some(fatal_signal_report(&output.status, &stderr)),
+            stderr: Some(stderr.to_string()),
             rejected: false,
         });
     }
@@ -4151,6 +4467,7 @@ fn run_c_libfuzzer_single_input(
         events: Vec::new(),
         testcases: Vec::new(),
         sanitizer: None,
+        stderr: None,
         rejected: false,
     })
 }
@@ -4930,7 +5247,7 @@ fn existing_crash_testcases(work_dir: &Path, harness_id: &str, max_len: usize) -
     let finding_record_limit = max_finding_record_bytes();
     let dedup_limit = max_finding_dedup_keys();
     let mut set = HashSet::new();
-    let Ok(entries) = fs::read_dir(work_dir.join("findings")) else {
+    let Ok(entries) = fs::read_dir(corpus::layout::findings_dir(work_dir)) else {
         return set;
     };
     for entry in entries.flatten() {
@@ -5002,7 +5319,7 @@ fn existing_finding_dedup_keys(work_dir: &Path, harness_id: &str) -> (Vec<String
     let dedup_limit = max_finding_dedup_keys();
     let mut clusters = Vec::new();
     let mut oracles = Vec::new();
-    let Ok(entries) = fs::read_dir(work_dir.join("findings")) else {
+    let Ok(entries) = fs::read_dir(corpus::layout::findings_dir(work_dir)) else {
         return (clusters, oracles);
     };
     for entry in entries.flatten() {
@@ -5022,29 +5339,13 @@ fn existing_finding_dedup_keys(work_dir: &Path, harness_id: &str) -> (Vec<String
         if record.get("harness_id").and_then(|value| value.as_str()) != Some(harness_id) {
             continue;
         }
-        let rule_id = record.get("rule_id").and_then(|v| v.as_str());
-        // Oracle-hit finding: key = rule_id|oracle_name|api (oracle_hit_dedupe_key).
-        if let (Some(rule_id), Some(oracle)) = (rule_id, record.get("oracle")) {
-            if let (Some(name), Some(api)) = (
-                oracle.get("name").and_then(|v| v.as_str()),
-                oracle.get("api").and_then(|v| v.as_str()),
-            ) {
-                oracles.push(format!("{rule_id}|{name}|{api}"));
-                continue;
-            }
-        }
-        // Sanitizer-crash finding: key = cluster_key_full, or rule:<id> on fallback
-        // (matches first_of_sanitizer_cluster).
-        let fallback = record
-            .get("cluster_fallback")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        if fallback {
-            if let Some(rule_id) = rule_id {
-                clusters.push(format!("rule:{rule_id}"));
-            }
-        } else if let Some(full) = record.get("cluster_key_full").and_then(|v| v.as_str()) {
-            clusters.push(full.to_owned());
+        // Oracle hits key on rule_id|oracle_name|api (oracle_hit_dedupe_key),
+        // sanitizer crashes on cluster_key_full or rule:<id> on fallback
+        // (first_of_sanitizer_cluster).
+        match corpus::finding::run_dedupe_key(&record) {
+            Some(corpus::finding::RunDedupeKey::Oracle(key)) => oracles.push(key),
+            Some(corpus::finding::RunDedupeKey::Cluster(key)) => clusters.push(key),
+            None => {}
         }
     }
     (clusters, oracles)
@@ -5203,6 +5504,7 @@ fn run_harness_with_protocol(
             events: Vec::new(),
             testcases: Vec::new(),
             sanitizer: None,
+            stderr: None,
             rejected: false,
         });
     };
@@ -5218,6 +5520,7 @@ fn run_harness_with_protocol(
                 events: Vec::new(),
                 testcases: Vec::new(),
                 sanitizer: Some(report),
+                stderr: Some(stderr.to_string()),
                 rejected: false,
             });
         }
@@ -5231,6 +5534,7 @@ fn run_harness_with_protocol(
                 events: Vec::new(),
                 testcases: Vec::new(),
                 sanitizer: None,
+                stderr: None,
                 rejected: true,
             });
         }
@@ -5242,6 +5546,7 @@ fn run_harness_with_protocol(
             events: Vec::new(),
             testcases: Vec::new(),
             sanitizer: Some(fatal_signal_report(&status, &stderr)),
+            stderr: Some(stderr.to_string()),
             rejected: false,
         });
     }
@@ -5266,6 +5571,7 @@ fn run_harness_with_protocol(
                 events: Vec::new(),
                 testcases: Vec::new(),
                 sanitizer: None,
+                stderr: None,
                 rejected: false,
             });
         }
@@ -5288,6 +5594,7 @@ fn run_harness_with_protocol(
         events,
         testcases,
         sanitizer: None,
+        stderr: None,
         rejected: false,
     })
 }
@@ -5602,6 +5909,7 @@ impl ForkServer {
                 events: Vec::new(),
                 testcases: Vec::new(),
                 sanitizer: None,
+                stderr: None,
                 rejected: false,
             });
         }
@@ -5630,6 +5938,7 @@ impl ForkServer {
             events,
             testcases,
             sanitizer: None,
+            stderr: None,
             rejected: false,
         })
     }
@@ -6078,7 +6387,7 @@ mod dedup_seed_tests {
         // #35: a later cascade pass must reconstruct the dedup keys of findings a
         // prior pass already wrote, so it does not re-emit byte-identical findings.
         let work = tempfile::tempdir().unwrap();
-        let findings = work.path().join("findings");
+        let findings = work.path().join("results").join("findings");
         // A sanitizer-crash finding (clustered).
         let c = findings.join("F-0001-aaaa");
         std::fs::create_dir_all(&c).unwrap();
@@ -7229,6 +7538,49 @@ mod auto_path_tests {
 
     #[test]
     #[cfg(unix)]
+    fn sanitizer_crash_writes_sanitizer_log_next_to_the_finding() {
+        // Task 25: the full captured stderr of a real sanitizer crash must land
+        // as `sanitizer.log` next to `finding.json`, not just the truncated
+        // excerpt that was already in the record.
+        let root = tmpdir();
+        let work_dir = root.join("bhf_work");
+        write_c_libfuzzer_harness(
+            &work_dir,
+            "H-SANLOG",
+            "#!/bin/sh\n>&2 echo 'ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1'\n\
+             >&2 echo '    #0 0x1 in real_parse /src/p.c:9'\nexit 1\n",
+        );
+        let summary = run_one_target_programmatic(
+            &work_dir,
+            "H-SANLOG",
+            vec![b"seed".to_vec()],
+            1,
+            None,
+            None,
+            0,
+            &[],
+            actionability::RunMode::Reporting,
+            None,
+            &[],
+            None,
+        )
+        .expect("a crash on every input is signal, not an all-reject failure");
+        assert_eq!(summary.findings.len(), 1);
+        let finding_dir = corpus::layout::finding_dir(&work_dir, &summary.findings[0]);
+        let log = fs::read_to_string(finding_dir.join("sanitizer.log"))
+            .expect("sanitizer.log must be written next to the finding");
+        assert!(
+            log.contains("AddressSanitizer: heap-buffer-overflow"),
+            "{log}"
+        );
+        assert!(log.contains("real_parse /src/p.c:9"), "{log}");
+        let finding: serde_json::Value =
+            serde_json::from_slice(&fs::read(finding_dir.join("finding.json")).unwrap()).unwrap();
+        assert_eq!(finding["paths"]["sanitizer_log"], "sanitizer.log");
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn harness_that_crashes_on_every_input_keeps_its_findings() {
         // #477: a target where EVERY input crashes (a callback struct cast from raw
         // bytes; a parser that aborts on malformed input) rejects all executions AND
@@ -7817,7 +8169,10 @@ mod auto_path_tests {
              starvation should not persist): {:?}",
             summary.findings
         );
-        let finding_dir = work_dir.join("findings").join(&summary.findings[0]);
+        let finding_dir = work_dir
+            .join("results")
+            .join("findings")
+            .join(&summary.findings[0]);
         let finding: serde_json::Value =
             serde_json::from_slice(&fs::read(finding_dir.join("finding.json")).unwrap()).unwrap();
         assert_eq!(finding["classification"], "oracle_hit");
@@ -8258,6 +8613,88 @@ mod auto_path_tests {
         assert!(load_grammar_for_run(Some(&path)).is_err());
     }
 
+    #[test]
+    fn collector_flag_parses_auto_none_path_and_window() {
+        use clap::Parser;
+        #[derive(clap::Parser)]
+        struct Wrap {
+            #[command(flatten)]
+            inner: FuzzArgs,
+        }
+        // Default: off, 250ms — a plain `bhf fuzz` stays unchanged.
+        let w = Wrap::try_parse_from(["fuzz", "wd", "--harness", "h"]).unwrap();
+        assert_eq!(w.inner.collector, crate::collector_run::CollectorSpec::Off);
+        assert_eq!(w.inner.collector_window_ms, 250);
+
+        let w =
+            Wrap::try_parse_from(["fuzz", "wd", "--harness", "h", "--collector", "auto"]).unwrap();
+        assert_eq!(w.inner.collector, crate::collector_run::CollectorSpec::Auto);
+
+        let w = Wrap::try_parse_from([
+            "fuzz",
+            "wd",
+            "--harness",
+            "h",
+            "--collector",
+            "/opt/probe",
+            "--collector-window-ms",
+            "750",
+        ])
+        .unwrap();
+        assert_eq!(
+            w.inner.collector,
+            crate::collector_run::CollectorSpec::Sidecar(std::path::PathBuf::from("/opt/probe"))
+        );
+        assert_eq!(w.inner.collector_window_ms, 750);
+    }
+
+    /// #60 AC6 regression: `bhf fuzz --collector auto` with the runtrace shim NOT
+    /// armed (no `runtrace.jsonl` — the default `--runtime-oracles off`) must never
+    /// report `clean_assurance=true` over an unobserved run. The Linux built-in
+    /// relies on the loop's shim log; absent it, the collector observed nothing and
+    /// must record a degraded, not-observed run.
+    #[cfg(unix)]
+    #[test]
+    fn collector_auto_without_shim_log_is_not_reported_clean() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let work = std::env::temp_dir().join(format!("bhf-fuzz-col-noobs-{nonce}"));
+        std::fs::create_dir_all(&work).unwrap();
+
+        // No runtrace.jsonl is written (the shim was never armed).
+        let prov = run_collector_for_fuzz(
+            &crate::collector_run::CollectorSpec::Auto,
+            crate::collector_run::DEFAULT_WINDOW_MS,
+            &work,
+            "harness",
+        )
+        .expect("collector provenance");
+
+        if prov.pointer("/active") == Some(&serde_json::json!(true)) {
+            // The runtrace built-in resolved (shim available) but observed nothing:
+            // it must be degraded, never a clean assurance over an empty stream.
+            assert_eq!(prov.pointer("/mode"), Some(&serde_json::json!("runtrace")));
+            assert_eq!(
+                prov.pointer("/observed"),
+                Some(&serde_json::json!(false)),
+                "a not-observed collector run must be marked observed:false: {prov}"
+            );
+            assert_ne!(
+                prov.pointer("/clean_assurance"),
+                Some(&serde_json::json!(true)),
+                "a collector that observed nothing must NOT report clean_assurance=true: {prov}"
+            );
+        } else {
+            // Shim unavailable on this host: the collector is inactive, so the
+            // false-clean claim cannot arise at all.
+            assert_eq!(prov.pointer("/active"), Some(&serde_json::json!(false)));
+        }
+
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
     fn fuzz_args_for_worker_passthrough(structured_inputs: StructuredInputMode) -> FuzzArgs {
         FuzzArgs {
             work_dir: tmpdir(),
@@ -8287,6 +8724,7 @@ mod auto_path_tests {
             sandbox_tool: None,
             sandbox_strict: false,
             extra_env: Vec::new(),
+            runtime_oracles: crate::runtime_oracles::RuntimeOracleMode::Off,
             cmplog_log: None,
             grammar_file: None,
             structured_inputs,
@@ -8294,6 +8732,13 @@ mod auto_path_tests {
             stop_after_findings: None,
             target_transport: None,
             transport_coverage_map: None,
+            protocol_profile: None,
+            session_transport: None,
+            session_reset: crate::session_fuzz::SessionResetMode::Reconnect,
+            max_session_messages: 64,
+            collector: crate::collector_run::CollectorSpec::Off,
+            collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
+            extension: None,
         }
     }
 }
@@ -8513,7 +8958,7 @@ mod sequence_layout_tests {
         for (step, expected) in harness_selected.iter().enumerate() {
             let span = &layout.steps[step].op_index_range;
             let selector = input[span.start];
-            let decoded = if selector % 4 == 0 {
+            let decoded = if selector.is_multiple_of(4) {
                 let raw: u32 = match selector % 6 {
                     0 => 0,
                     1 => 1,

@@ -86,7 +86,7 @@ mod tests {
         );
         assert_eq!(
             parse_header(&[b'N', b'O', b'P', b'E', 1, 2, 0, 0, 0, 0, 0, 0]).unwrap_err(),
-            GiopError::BadMagic([b'N', b'O', b'P', b'E'])
+            GiopError::BadMagic(*b"NOPE")
         );
     }
 

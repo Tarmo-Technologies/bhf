@@ -93,7 +93,7 @@ fn auto_grammar_drives_generation_and_rejects_bad_grammar() {
 
     // A finding whose reproducer starts with TOKEN proves the grammar drove it.
     let mut grammar_drove_a_crash = false;
-    if let Ok(entries) = std::fs::read_dir(work.join("findings")) {
+    if let Ok(entries) = std::fs::read_dir(work.join("results").join("findings")) {
         for entry in entries.flatten() {
             if let Ok(tc) = std::fs::read(entry.path().join("testcase.bin")) {
                 if tc.starts_with(TOKEN.as_bytes()) {

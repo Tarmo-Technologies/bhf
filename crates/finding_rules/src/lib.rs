@@ -802,6 +802,96 @@ pub const RULES: &[Rule] = &[
         iso_tr_24772_ada: &[],
     },
     Rule {
+        id: "BHF-308",
+        slug: "bhf.relational/unexpected-authorization",
+        name: "Unexpected authorization across relational profiles",
+        description: "A relational policy campaign observed a role/session profile allowed to perform an operation that policy required to be denied (for example while a higher-privileged profile was allowed), indicating a broken authorization relation between profiles.",
+        cwe: "CWE-863",
+        cwe_top_25: None,
+        default_severity: Severity::High,
+        default_confidence: Confidence::Medium,
+        security_severity: 7.5,
+        references: &["https://cwe.mitre.org/data/definitions/863.html"],
+        owasp_top_10: Some("A01:2021-Broken Access Control"),
+        cert_c: None,
+        cert_cpp: None,
+        misra_c: None,
+        misra_cpp: None,
+        iso_tr_24772_ada: &[],
+    },
+    Rule {
+        id: "BHF-309",
+        slug: "bhf.relational/allowlist-escape",
+        name: "Profile reached a target outside its declared allowlist",
+        description: "A relational policy campaign observed a profile launch or contact a process/target outside its declared allowlist — a missing-authorization escape that identical stdout and exit status did not mask.",
+        cwe: "CWE-862",
+        cwe_top_25: None,
+        default_severity: Severity::High,
+        default_confidence: Confidence::Medium,
+        security_severity: 7.5,
+        references: &["https://cwe.mitre.org/data/definitions/862.html"],
+        owasp_top_10: Some("A01:2021-Broken Access Control"),
+        cert_c: None,
+        cert_cpp: None,
+        misra_c: None,
+        misra_cpp: None,
+        iso_tr_24772_ada: &[],
+    },
+    Rule {
+        id: "BHF-310",
+        slug: "bhf.relational/unexpected-equivalence",
+        name: "Unexpected equivalence between relational profiles",
+        description: "A relational policy campaign observed two profiles that policy required to differ produce equivalent results, indicating an authorization or isolation boundary that failed to distinguish the profiles.",
+        cwe: "CWE-285",
+        cwe_top_25: None,
+        default_severity: Severity::Medium,
+        default_confidence: Confidence::Medium,
+        security_severity: 5.0,
+        references: &["https://cwe.mitre.org/data/definitions/285.html"],
+        owasp_top_10: Some("A01:2021-Broken Access Control"),
+        cert_c: None,
+        cert_cpp: None,
+        misra_c: None,
+        misra_cpp: None,
+        iso_tr_24772_ada: &[],
+    },
+    Rule {
+        id: "BHF-311",
+        slug: "bhf.relational/unexpected-divergence",
+        name: "Unexpected divergence between relational profiles",
+        description: "A relational policy campaign observed profiles that policy required to behave equivalently produce divergent results, indicating an unchecked condition that makes observable behavior depend on the profile.",
+        cwe: "CWE-754",
+        cwe_top_25: None,
+        default_severity: Severity::Medium,
+        default_confidence: Confidence::Medium,
+        security_severity: 5.0,
+        references: &["https://cwe.mitre.org/data/definitions/754.html"],
+        owasp_top_10: None,
+        cert_c: None,
+        cert_cpp: None,
+        misra_c: None,
+        misra_cpp: None,
+        iso_tr_24772_ada: &[],
+    },
+    Rule {
+        id: "BHF-312",
+        slug: "bhf.relational/external-comparator",
+        name: "External comparator reported a cross-profile policy violation",
+        description: "A trusted out-of-process comparator extension, handed the serialized cross-profile observation bundle for a relational campaign, reported a policy violation — a relation whose verdict is decided outside the built-in predicate set. The relational finding carries the comparator's own signature and classification plus the trusted-extension provenance.",
+        cwe: "CWE-285",
+        cwe_top_25: None,
+        default_severity: Severity::Medium,
+        default_confidence: Confidence::Medium,
+        security_severity: 5.0,
+        references: &["https://cwe.mitre.org/data/definitions/285.html"],
+        owasp_top_10: Some("A01:2021-Broken Access Control"),
+        cert_c: None,
+        cert_cpp: None,
+        misra_c: None,
+        misra_cpp: None,
+        iso_tr_24772_ada: &[],
+    },
+    Rule {
         id: "BHF-401",
         slug: "bhf.static/unsafe-string-copy",
         name: "Unsafe string copy call in source",
@@ -4374,6 +4464,33 @@ mod tests {
         assert!(rule.references.iter().any(|r| r.contains("833.html")));
         assert!(rule.references.iter().any(|r| r.contains("835.html")));
         assert_ne!(rule.cwe, by_id("BHF-209").unwrap().cwe);
+    }
+
+    #[test]
+    fn relational_rule_ids_are_registered() {
+        // The relational campaign (`bhf relational`) emits findings tagged
+        // BHF-308..312; each must resolve to a real catalog rule with the agreed
+        // CWE so SARIF / vulnerability-management importers can look them up. The
+        // ids here must stay in sync with `relational::rule_id_for_kind`.
+        for (id, cwe, slug) in [
+            (
+                "BHF-308",
+                "CWE-863",
+                "bhf.relational/unexpected-authorization",
+            ),
+            ("BHF-309", "CWE-862", "bhf.relational/allowlist-escape"),
+            (
+                "BHF-310",
+                "CWE-285",
+                "bhf.relational/unexpected-equivalence",
+            ),
+            ("BHF-311", "CWE-754", "bhf.relational/unexpected-divergence"),
+            ("BHF-312", "CWE-285", "bhf.relational/external-comparator"),
+        ] {
+            let rule = by_id(id).unwrap_or_else(|| panic!("{id} relational rule must exist"));
+            assert_eq!(rule.cwe, cwe, "{id} has unexpected cwe");
+            assert_eq!(rule.slug, slug, "{id} has unexpected slug");
+        }
     }
 
     #[test]

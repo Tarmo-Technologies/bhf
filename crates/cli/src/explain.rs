@@ -33,6 +33,10 @@ pub struct ExplainArgs {
 }
 
 pub fn run(args: ExplainArgs) -> i32 {
+    if let Err(error) = crate::workdir::prepare(&args.work_dir) {
+        bhfeprintln!("error: {error:#}");
+        return 1;
+    }
     let findings = match collect(&args.work_dir, args.finding_id.as_deref()) {
         Ok(f) => f,
         Err(e) => {
@@ -66,7 +70,7 @@ struct Finding {
 }
 
 fn collect(work_dir: &Path, only: Option<&str>) -> anyhow::Result<Vec<Finding>> {
-    let dir = work_dir.join("findings");
+    let dir = corpus::layout::findings_dir(work_dir);
     let entries = std::fs::read_dir(&dir)
         .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", dir.display()))?;
     let mut out = Vec::new();

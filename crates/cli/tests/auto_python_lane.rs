@@ -101,16 +101,30 @@ fn auto_builds_fuzzes_and_finds_recursion_cwe674() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let csv = std::fs::read_to_string(work.join("auto/findings.csv")).unwrap_or_default();
+    let doc = results_doc(&work);
     assert!(
-        // cwe column carries the bare number (`674`), no `CWE-` prefix.
-        csv.contains(",674;") || csv.contains(",674,"),
-        "expected a CWE-674 uncontrolled-recursion finding in findings.csv:\n{csv}"
+        has_cwe(&doc, 674),
+        "expected a CWE-674 uncontrolled-recursion finding in results/findings.json:\n{doc:#}"
     );
     assert!(
-        csv.contains("parse_record"),
-        "the finding should point at parse_record:\n{csv}"
+        doc.to_string().contains("parse_record"),
+        "the finding should point at parse_record:\n{doc:#}"
     );
     let _ = std::fs::remove_dir_all(&src);
     let _ = std::fs::remove_dir_all(&work);
+}
+
+fn results_doc(work: &std::path::Path) -> serde_json::Value {
+    let bytes = std::fs::read(work.join("results/findings.json")).unwrap_or_default();
+    serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+}
+
+fn has_cwe(doc: &serde_json::Value, cwe: u64) -> bool {
+    doc["findings"].as_array().into_iter().flatten().any(|f| {
+        f["cwe"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|c| c.as_u64() == Some(cwe))
+    })
 }

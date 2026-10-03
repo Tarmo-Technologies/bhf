@@ -631,7 +631,7 @@ pub enum Outcome {
         /// Count of static (report-only) findings emitted for this target.
         #[serde(default)]
         static_findings: usize,
-        /// Finding ids (under `<work>/findings/<id>/`) emitted by the report-only
+        /// Finding ids (under `<work>/results/findings/<id>/`) emitted by the report-only
         /// static scan, so the report aggregators (findings.csv, run.md) surface
         /// them with their CWE like any other finding.
         #[serde(default)]
@@ -3116,7 +3116,8 @@ fn run_attempt(
                         ipc_channel_observed,
                     );
                     for fid in &summary.findings {
-                        let finding_path = work_dir.join("findings").join(fid).join("finding.json");
+                        let finding_path =
+                            corpus::layout::finding_dir(work_dir, fid).join("finding.json");
                         if let Err(error) =
                             stamp_runtime_mode(&finding_path, *pass, &env_injected, reach_label)
                         {
@@ -3199,8 +3200,8 @@ fn run_attempt(
                                     ipc_channel_observed,
                                 );
                                 for fid in &summary.findings {
-                                    let finding_path =
-                                        work_dir.join("findings").join(fid).join("finding.json");
+                                    let finding_path = corpus::layout::finding_dir(work_dir, fid)
+                                        .join("finding.json");
                                     if let Err(error) = stamp_runtime_mode(
                                         &finding_path,
                                         crate::auto::pass::Pass::FuzzDriven,
@@ -8733,6 +8734,11 @@ fn stamp_runtime_mode(
         )
     })?;
     obj.insert("actionability".to_owned(), recomputed);
+    corpus::finding::append_history(
+        &mut value,
+        "auto",
+        &["runtime_mode", "input_reachability", "actionability"],
+    );
     let pretty = serde_json::to_vec_pretty(&value)?;
     std::fs::write(finding_path, pretty)
 }
@@ -9810,6 +9816,8 @@ mod stamp_tests {
             parsed["runtime_mode"]["env_injected"]["ACME_HOME"],
             "/tmp/bhf/fake_env/ACME_HOME"
         );
+        assert_eq!(parsed["history"][0]["command"], "auto");
+        assert_eq!(parsed["history"][0]["fields"][0], "runtime_mode");
         // Pre-existing fields untouched.
         assert_eq!(parsed["id"], "F-0001-abc");
         assert_eq!(parsed["exception"]["name"], "ASAN_HEAP_BUFFER_OVERFLOW");

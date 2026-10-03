@@ -19,11 +19,11 @@ Run it over a directory of inputs:
 ```sh
 # two compilers / two harness builds
 bhf differential --harness-a ./harness_a --harness-b ./harness_b \
-  --inputs ./corpus --out ./findings_differential
+  --inputs ./corpus --work-dir ./bhf_work
 
 # one harness, metamorphic transform
 bhf differential --harness ./harness --metamorphic-transform append-newline \
-  --inputs ./corpus --out ./findings_differential
+  --inputs ./corpus --work-dir ./bhf_work
 ```
 
 The CLI compares observable behaviour — stdout bytes and exit code/timeout —
@@ -34,8 +34,11 @@ and emits findings on divergence:
 - `BHF-307` (metamorphic relation violation) when one harness disagrees with
   itself across a metamorphic transform (currently `append-newline`).
 
-Each divergence is written under `--out` as a JSON finding with stdout/exit-code
-previews and oracle metadata (`--timeout-secs` bounds each side, default 5).
+Each divergence is written to `<work-dir>/results/findings/F-DIFF-NNNN/` as a
+JSON finding with stdout/exit-code previews and oracle metadata, and
+`results/` is rebuilt (`--timeout-secs` bounds each side, default 5). A rerun
+on the same work dir adds the next free `F-DIFF-` ids and never overwrites
+earlier findings. `--out DIR` is a deprecated spelling of `--work-dir DIR`.
 
 The internal `replay_min` library offers a narrower, signature-based path for
 control-flow diagnostics:

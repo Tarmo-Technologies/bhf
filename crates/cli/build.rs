@@ -93,6 +93,13 @@ fn main() {
     };
     println!("cargo:rustc-env=BHF_VERSION_FULL={version_full}");
 
+    // The target triple bhf itself was built for, so `bhf project` can record a
+    // best-effort toolchain in run/finding provenance (issue #56). Captured via
+    // `option_env!("BHF_TARGET")`; absent builds simply omit the field.
+    if let Ok(target) = env::var("TARGET") {
+        println!("cargo:rustc-env=BHF_TARGET={target}");
+    }
+
     if shim_src.is_file() {
         // Copy only if mtime changed.
         let needs_copy = match (shim_src.metadata(), shim_dst.metadata()) {

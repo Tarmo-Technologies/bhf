@@ -86,11 +86,11 @@ fn an_opaque_handle_defined_only_in_the_target_tu_is_drivable() {
         "the target must build and fuzz:\n{combined}"
     );
 
-    let csv = std::fs::read_to_string(work.join("auto/findings.csv")).unwrap_or_default();
+    let json = std::fs::read_to_string(work.join("results/findings.json")).unwrap_or_default();
     assert!(
-        csv.contains("pv_session_scan"),
+        json.contains("pv_session_scan"),
         "the planted out-of-bounds read is reached only through the stack-allocated \
-         handle, so finding it is the proof:\n{csv}\n{combined}"
+         handle, so finding it is the proof:\n{json}\n{combined}"
     );
 
     let _ = std::fs::remove_dir_all(&src);

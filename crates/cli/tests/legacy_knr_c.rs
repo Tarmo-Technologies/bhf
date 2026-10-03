@@ -71,7 +71,7 @@ fn knr_target_report_only_emits_cwe_finding() {
     assert!(count >= 1, "expected >=1 static finding on the K&R source");
 
     let mut saw_cwe = false;
-    for entry in fs::read_dir(work.join("findings")).unwrap() {
+    for entry in fs::read_dir(work.join("results").join("findings")).unwrap() {
         let fj = entry.unwrap().path().join("finding.json");
         if !fj.exists() {
             continue;

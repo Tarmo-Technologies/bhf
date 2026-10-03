@@ -558,14 +558,18 @@ mod tests {
             first_param_fuzz_affinity("PhpParser\\Node\\Expr"),
             OBJECT_INPUT_DEMOTION
         );
-        assert_eq!(first_param_fuzz_affinity("\\Closure"), OBJECT_INPUT_DEMOTION);
+        assert_eq!(
+            first_param_fuzz_affinity("\\Closure"),
+            OBJECT_INPUT_DEMOTION
+        );
         // Other scalars coerce cleanly: neutral.
         assert_eq!(first_param_fuzz_affinity("int"), 0);
         assert_eq!(first_param_fuzz_affinity("array"), 0);
         // The concrete php-parser regression: a string tokenizer must outrank the
         // Expr evaluator once the name score (equal at the `parse`/`evaluate` stem
         // bonus) is combined with the affinity.
-        assert!(DIRECT_INPUT_AFFINITY > OBJECT_INPUT_DEMOTION);
+        // Compile-time invariant: direct-input affinity must outrank object demotion.
+        const { assert!(DIRECT_INPUT_AFFINITY > OBJECT_INPUT_DEMOTION) };
     }
 
     #[test]

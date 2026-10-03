@@ -1,0 +1,33 @@
+{
+  "classification": "static_scan",
+  "confirmation": "static",
+  "created_at": "2026-10-01T11:10:00Z",
+  "exception": {
+    "message": "Unbounded string copy (strcpy/strcat/gets) with no length limit",
+    "source_file": "",
+    "source_line": ""
+  },
+  "finding_kind": "static",
+  "id": "F-RO-BHF-401-0000ABCD",
+  "oracle": {
+    "evidence": [
+      {
+        "key": "source",
+        "value": "/src/demo/lib/parse.c:6:copy_name"
+      }
+    ]
+  },
+  "report_only": true,
+  "rule_id": "BHF-401",
+  "schema_version": "bhf.finding.v1",
+  "severity": "high",
+  "target": {
+    "line": 6,
+    "location": {
+      "line": 6,
+      "path": "/src/demo/lib/parse.c"
+    },
+    "name": "parse.c",
+    "source_path": "/src/demo/lib/parse.c"
+  }
+}

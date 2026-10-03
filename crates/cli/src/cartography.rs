@@ -83,7 +83,7 @@ struct FindingRef {
 }
 
 fn collect(work_dir: &Path, only: Option<&str>) -> anyhow::Result<Vec<FindingRef>> {
-    let dir = work_dir.join("findings");
+    let dir = corpus::layout::findings_dir(work_dir);
     let entries = std::fs::read_dir(&dir)
         .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", dir.display()))?;
     let mut out = Vec::new();
@@ -551,6 +551,7 @@ fn write_card(f: &FindingRef, card: &Card) {
                     "controlling_bytes": card.primitive.controlling_bytes,
                 }),
             );
+            corpus::finding::append_history(&mut raw, "cartography", &["primitive"]);
             let _ = std::fs::write(
                 f.dir.join("finding.json"),
                 serde_json::to_vec_pretty(&raw).unwrap_or_default(),

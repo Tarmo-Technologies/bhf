@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Tarmo-Technologies/bhf/schemas/bhf.extension.v1.response.schema.json",
+  "title": "bhf.extension.v1 response",
+  "description": "A response envelope an out-of-process extension returns for one request. Transported as a length-framed message: {u32 little-endian length}{UTF-8 JSON payload}. The result class is deterministic: ok/reject/finding are target-truth outcomes; unsupported and infrastructure_error are bounded extension-side failures that must never be reported as a target vulnerability. An unknown top-level field is rejected (additionalProperties: false), so a forged or extended response is a bounded protocol error rather than being silently accepted.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol", "case", "result"],
+  "properties": {
+    "protocol": { "const": "bhf.extension.v1" },
+    "case": { "$ref": "#/$defs/case" },
+    "result": {
+      "enum": ["ok", "reject", "finding", "unsupported", "infrastructure_error"]
+    },
+    "finding": { "$ref": "#/$defs/finding" },
+    "value": {
+      "type": "object",
+      "description": "Capability-specific output for a non-oracle `ok` response (codec.*, mutator.mutate, scenario.*, lifecycle.*). Examples: {\"output_b64\": <base64>} for codec.encode/repair and mutator.mutate; {\"decoded\": <structured>} for codec.decode; {\"done\": true} or {\"message_b64\": <base64>, \"label\": <string>} for scenario.next. oracle.evaluate leaves it unset (its result travels in `finding`)."
+    },
+    "detail": {
+      "type": "string",
+      "description": "An optional human-readable reason for a reject/unsupported/infrastructure_error."
+    }
+  },
+  "$defs": {
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["campaign", "worker", "testcase"],
+      "properties": {
+        "campaign": { "type": "string" },
+        "worker": { "type": "string" },
+        "testcase": { "type": "string" }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rule", "classification", "signature_inputs", "evidence"],
+      "properties": {
+        "rule": { "type": "string" },
+        "classification": { "type": "string" },
+        "signature_inputs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Ordered inputs to the finding signature; the host hashes these in the order given so the signature reproduces byte-for-byte on replay/minimize."
+        },
+        "evidence": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/evidence" }
+        },
+        "min_predicate": {
+          "type": "string",
+          "description": "An optional minimization-predicate identifier the extension exposes."
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "value"],
+      "properties": {
+        "key": { "type": "string" },
+        "value": { "type": "string" }
+      }
+    }
+  }
+}

@@ -99,10 +99,10 @@ fn an_unconstructible_receiver_skips_with_its_reason_and_its_sibling_still_fuzze
         combined.contains("1 built+fuzzed") || combined.contains("built+fuzzed"),
         "the fuzzable sibling must still fuzz:\n{combined}"
     );
-    let csv = std::fs::read_to_string(work.join("auto/findings.csv")).unwrap_or_default();
+    let json = std::fs::read_to_string(work.join("results/findings.json")).unwrap_or_default();
     assert!(
-        csv.contains("parseThing"),
-        "the planted throw in the sibling must still be found:\n{csv}\n{combined}"
+        json.contains("parseThing"),
+        "the planted throw in the sibling must still be found:\n{json}\n{combined}"
     );
 
     let _ = std::fs::remove_dir_all(&src);
