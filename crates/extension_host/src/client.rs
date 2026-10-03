@@ -652,7 +652,22 @@ impl ExtensionClient {
         loop {
             if self.session.is_none() {
                 if self.restart.should_restart() {
-                    self.restart_child()?;
+                    if self.restart_child().is_err() {
+                        // A respawn / re-handshake failure during a permitted
+                        // restart exhausts the restart budget via a failed
+                        // re-handshake: it is a terminal, BOUNDED infrastructure
+                        // result (a crash the host could not recover), never a
+                        // target finding and never a hard error a caller would
+                        // misclassify as a usage/setup problem. Record the loss in
+                        // provenance and surface it as infrastructure, exactly like
+                        // the budget-exhaustion branch below.
+                        self.restart.record_loss();
+                        self.provenance.loss_count = self.restart.losses();
+                        return Ok(CallOutcome::Infrastructure(InfraFailure::Crashed {
+                            status: None,
+                            signal: None,
+                        }));
+                    }
                 } else {
                     // No live session and no restart budget: terminal.
                     return Ok(CallOutcome::Infrastructure(InfraFailure::Crashed {

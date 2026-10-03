@@ -81,6 +81,26 @@ pub fn append_history(record: &mut serde_json::Value, command: &str, fields: &[&
     }
 }
 
+/// The stable finding signature for an out-of-process extension oracle: the
+/// sha256 of the extension's ORDERED `signature_inputs`, each prefixed by a `0x1f`
+/// separator (a byte that cannot appear in the textual inputs, so distinct input
+/// lists never collide by concatenation) and `"extension"`-tagged.
+///
+/// Hashing in the order the extension gave makes the signature reproduce
+/// byte-for-byte on replay/minimize/re-evaluate regardless of host-side iteration
+/// order — the single source of truth shared by [`FindingEmitter::emit_extension_finding`]
+/// and `bhf extension minimize` so the two can never drift.
+pub fn extension_signature(signature_inputs: &[String]) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"extension");
+    for part in signature_inputs {
+        hasher.update(b"\x1f");
+        hasher.update(part.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 /// The key a fuzz run dedupes an emitted finding on, by the set it lives in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunDedupeKey {
@@ -464,16 +484,9 @@ impl FindingEmitter {
         finding: &ExtensionFinding,
     ) -> Result<FindingId, CorpusError> {
         use sha2::Digest;
-        // Signature: the extension's ORDERED signature inputs, separated by a
-        // byte that cannot appear in the (textual) inputs, so distinct input
-        // lists can never collide by concatenation.
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(b"extension");
-        for part in &finding.signature_inputs {
-            hasher.update(b"\x1f");
-            hasher.update(part.as_bytes());
-        }
-        let signature_hex = format!("{:x}", hasher.finalize());
+        // Signature: the extension's ORDERED signature inputs (see
+        // [`extension_signature`] — the shared source of truth with `minimize`).
+        let signature_hex = extension_signature(&finding.signature_inputs);
         // Cluster key: DEFECT-level (rule | classification), excluding per-input
         // evidence so one defect re-triggered on many inputs stays one cluster.
         let mut cluster_hasher = sha2::Sha256::new();

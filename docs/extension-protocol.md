@@ -128,7 +128,11 @@ The host hashes `signature_inputs` **in the order given** into the finding's
 stable `signature`, so the same violation reproduces the identical signature on
 replay/minimize/re-evaluate regardless of host-side iteration order. The
 `min_predicate`, when present, names a minimization predicate the extension
-exposes.
+exposes. `bhf extension minimize --manifest <m> --finding <dir>` delta-debugs an
+emitted finding's testcase by re-driving `oracle.evaluate`, accepting a candidate
+only when it reproduces the **same stable signature** — so a finding is emitted,
+replayed, and minimized with its signature unchanged, and the recorded `signature`
+is never rewritten.
 
 ## Trust, isolation, and provenance
 
@@ -139,7 +143,12 @@ exposes.
   environment (only the **names** of passed/dropped variables are ever recorded,
   never the values) and, on unix, `setrlimit(RLIMIT_AS/RLIMIT_CPU)` caps.
 - **Crash isolation + restart policy.** A crash or timeout triggers a bounded
-  restart policy; an exhausted restart budget is a terminal loss event.
+  restart policy; an exhausted restart budget — including one reached when a
+  restart-time **re-handshake itself fails** (the respawned child never completes
+  the handshake) — is a terminal loss event, not a hard error. Standalone
+  `bhf extension evaluate`/`session` classify it as infrastructure and still write
+  the run's `extension.json` provenance (exit code `4`, distinct from clean `0`,
+  finding `1`, and a usage/manifest error `2`).
 - **Provenance.** Findings and run metadata record the extension executable and
   config SHA-256, the negotiated protocol version and capabilities, the applied
   resource limits, and the restart/loss counts.

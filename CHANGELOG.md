@@ -94,7 +94,17 @@
   declares only a subset still works; CBOR wire encoding remains an optional,
   negotiated-but-unused format (the host speaks JSON only). The minimal reproduction (a
   toy `[u16 length][payload][u32 crc]` protocol with `OPEN`/`WRITE`) is implemented once
-  outside the tree in the Python reference extension (#57).
+  outside the tree in the Python reference extension, which is now also exercised by a
+  release-build integration test (not just the debug run). The reference extension's
+  `codec.decode`/`codec.repair` reject any input that is not a recognized toy frame, so an
+  unrecognized raw corpus entry is evaluated **verbatim** instead of being rebuilt — the
+  host stays codec-agnostic over arbitrary corpora. A crash/timeout whose restart-time
+  re-handshake fails (restart budget exhausted) is now classified as a bounded
+  infrastructure result — `EXIT_INFRA` (4) with run provenance (loss recorded) — rather
+  than a usage error with no provenance. New `bhf extension minimize` delta-debugs an
+  emitted extension-oracle finding by re-driving `oracle.evaluate`, accepting a candidate
+  only when it reproduces the **same stable signature**, so a finding is emitted, replayed,
+  and minimized with an unchanged signature (#57).
 - `bhf fuzz` / `bhf binary-fuzz` gain a platform-neutral **runtime-event collector**
   (`--collector <auto|none|PATH>`, `--collector-window-ms <MS>`) that observes the
   process, filesystem, and module-load effects a target performs even when it exits

@@ -17,8 +17,11 @@ and the full capability surface over it:
 
 * ``oracle.evaluate`` -- flag a clean-exiting target that "writes outside its
   sandbox root" (a path with a ``..`` component or an absolute path);
-* ``codec.decode`` / ``codec.encode`` -- structured view of a frame and back;
-* ``codec.repair`` -- recompute the length prefix and CRC after a mutation;
+* ``codec.decode`` / ``codec.encode`` -- structured view of a frame and back
+  (an input that is not a recognized toy frame is ``reject``ed, never decoded);
+* ``codec.repair`` -- recompute the length prefix and CRC after a mutation, but
+  only for a recognized toy frame -- an unrecognized raw input is ``reject``ed so
+  the host evaluates it verbatim and stays codec-agnostic over arbitrary corpora;
 * ``mutator.mutate`` -- a structure-aware mutation (grow the data region,
   leaving the computed fields stale for ``codec.repair`` to fix);
 * ``scenario.next`` / ``scenario.observe-response`` -- drive OPEN then WRITE,
@@ -87,6 +90,18 @@ def parse_frame(frame):
     payload = frame[2:-4]
     (crc,) = struct.unpack(">I", frame[-4:])
     return declared_len, payload, crc
+
+
+def is_known_op(payload):
+    """Whether a frame payload is one this toy protocol recognizes.
+
+    This is the codec-agnostic recognition guard: ``codec.decode`` / ``codec.repair``
+    MUST ``reject`` any input that is not a well-formed toy frame so the host
+    evaluates an UNRECOGNIZED raw corpus entry VERBATIM instead of silently
+    rebuilding arbitrary bytes into a toy frame (matching the in-repo mock's
+    ``is_known_op`` and the ``drive_fuzz_extension`` contract)."""
+    op = payload.split(b" ", 1)[0]
+    return op in (b"OPEN", b"WRITE", b"OPENOK", b"WRITEOK")
 
 
 # ---- envelope result helpers ---------------------------------------------
@@ -173,8 +188,10 @@ def encode_payload(decoded):
 
 def codec_decode(protocol, case, frame):
     parsed = parse_frame(frame)
-    if parsed is None:
-        return reject(protocol, case, "frame too short to decode")
+    if parsed is None or not is_known_op(parsed[1]):
+        # An input that is not a well-formed toy frame is rejected, never decoded,
+        # so the host stays codec-agnostic over arbitrary corpora.
+        return reject(protocol, case, "not a recognized frame")
     declared_len, payload, crc = parsed
     crc_valid = declared_len == len(payload) and crc == (zlib.crc32(payload) & 0xFFFFFFFF)
     return ok(protocol, case, {"decoded": decode_payload(payload, crc_valid)})
@@ -190,9 +207,13 @@ def codec_encode(protocol, case, request):
 
 
 def codec_repair(protocol, case, frame):
-    if len(frame) < 6:
-        return reject(protocol, case, "frame too short to repair")
-    payload = frame[2:-4]
+    parsed = parse_frame(frame)
+    if parsed is None or not is_known_op(parsed[1]):
+        # Only a frame recognized as this extension's format is rebuilt; an
+        # unrecognized raw corpus entry is rejected and left for the host to
+        # evaluate verbatim (never silently rebuilt into a toy frame).
+        return reject(protocol, case, "not a recognized frame to repair")
+    payload = parsed[1]
     repaired = build_frame(payload)
     return ok(protocol, case, {"output_b64": base64.b64encode(repaired).decode("ascii")})
 

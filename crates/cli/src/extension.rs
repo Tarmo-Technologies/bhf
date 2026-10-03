@@ -70,6 +70,8 @@ pub enum ExtensionCommand {
     Evaluate(EvaluateArgs),
     /// Drive a full multi-message session through a trusted extension: lifecycle.reset a fresh root, pull each scenario.next message, optionally extension-mutate and codec.repair it before it reaches the target, bind each response (scenario.observe-response) into a later message, then oracle.evaluate the clean-exit outcome. Every extension fault stays a bounded infrastructure result
     Session(SessionCmdArgs),
+    /// Minimize an emitted extension-oracle finding by delta-debugging its testcase through oracle.evaluate, accepting a candidate only when it reproduces the SAME stable signature (same rule + signature inputs). Writes min_testcase.bin and records the minimization without ever changing the finding's signature
+    Minimize(MinimizeCmdArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -129,12 +131,29 @@ pub struct SessionCmdArgs {
     json: bool,
 }
 
+#[derive(Debug, clap::Args)]
+pub struct MinimizeCmdArgs {
+    /// Path to the `bhf.extension-manifest.v1` manifest (TOML) whose oracle judged
+    /// the finding. Explicit load is the trust boundary; re-driving the oracle to
+    /// minimize is never implicit.
+    #[arg(long)]
+    manifest: PathBuf,
+    /// The extension-oracle finding directory to minimize (holds `finding.json` +
+    /// `testcase.bin`); `min_testcase.bin` is written alongside it.
+    #[arg(long)]
+    finding: PathBuf,
+    /// Emit a machine-readable JSON report instead of human-readable lines.
+    #[arg(long)]
+    json: bool,
+}
+
 /// Dispatch a `bhf extension` invocation, returning a process exit code.
 pub fn run(args: ExtensionArgs) -> i32 {
     match args.command {
         ExtensionCommand::Validate(a) => run_validate(&a),
         ExtensionCommand::Evaluate(a) => run_evaluate(&a),
         ExtensionCommand::Session(a) => run_session(&a),
+        ExtensionCommand::Minimize(a) => run_minimize(&a),
     }
 }
 
@@ -438,6 +457,217 @@ fn run_session(a: &SessionCmdArgs) -> i32 {
         println!("extension session: {result_label} (no finding)");
     }
     code
+}
+
+/// Re-drive `oracle.evaluate` over `bytes` and return the finding's stable
+/// signature, or `None` if the input is not (any longer) a finding. The signature
+/// is computed exactly as [`FindingEmitter::emit_extension_finding`] does (via the
+/// shared `corpus::finding::extension_signature`), so a match means byte-for-byte
+/// finding-identity equality.
+fn reevaluate_signature(
+    client: &mut ExtensionClient,
+    campaign: &str,
+    testcase_path: &Path,
+    bytes: &[u8],
+) -> Option<String> {
+    let case = CaseId::new(campaign, "min-0", testcase_id(testcase_path, bytes));
+    match client.evaluate(&case, bytes) {
+        Ok(EvaluateOutcome::Finding(finding)) => Some(corpus::finding::extension_signature(
+            &finding.signature_inputs,
+        )),
+        _ => None,
+    }
+}
+
+/// `bhf extension minimize`: delta-debug an emitted extension-oracle finding's
+/// testcase, accepting a candidate only when it re-drives the oracle to the SAME
+/// stable signature (so finding identity — rule + signature inputs — is preserved
+/// through minimization, satisfying issue #57's "emitted, replayed, AND minimized
+/// with the same stable signature"). The recorded `signature` is never rewritten.
+fn run_minimize(a: &MinimizeCmdArgs) -> i32 {
+    let finding_dir = a.finding.as_path();
+    let finding_json = finding_dir.join("finding.json");
+    let record: Value = match std::fs::read(&finding_json) {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(value) => value,
+            Err(error) => {
+                bhfeprintln!("error: could not parse {}: {error}", finding_json.display());
+                return EXIT_USAGE;
+            }
+        },
+        Err(error) => {
+            bhfeprintln!("error: could not read {}: {error}", finding_json.display());
+            return EXIT_USAGE;
+        }
+    };
+
+    // Only an extension-oracle finding can be re-driven through oracle.evaluate.
+    if record.get("confirmation").and_then(Value::as_str) != Some("extension") {
+        bhfeprintln!(
+            "error: {} is not an extension-oracle finding (confirmation != \"extension\")",
+            finding_json.display()
+        );
+        return EXIT_USAGE;
+    }
+    let Some(recorded_sig) = record
+        .get("signature")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        bhfeprintln!("error: finding has no `signature` to preserve across minimize");
+        return EXIT_USAGE;
+    };
+    let testcase_name = record
+        .get("paths")
+        .and_then(|p| p.get("testcase"))
+        .and_then(Value::as_str)
+        .unwrap_or("testcase.bin");
+    let testcase_path = finding_dir.join(testcase_name);
+    let original = match std::fs::read(&testcase_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            bhfeprintln!(
+                "error: could not read testcase '{}': {error}",
+                testcase_path.display()
+            );
+            return EXIT_USAGE;
+        }
+    };
+
+    let (_manifest, mut client) = match load_and_spawn(&a.manifest) {
+        Ok(pair) => pair,
+        Err(error) => {
+            bhfeprintln!("error: extension setup failed: {error}");
+            return EXIT_USAGE;
+        }
+    };
+
+    let campaign = campaign_id(finding_dir);
+
+    // Baseline: the recorded testcase must still reproduce the recorded signature,
+    // or there is nothing honest to minimize against.
+    match reevaluate_signature(&mut client, &campaign, &testcase_path, &original) {
+        Some(sig) if sig == recorded_sig => {}
+        _ => {
+            bhfeprintln!(
+                "error: finding {} no longer reproduces its recorded signature through the \
+                 extension oracle; refusing to minimize",
+                finding_dir.display()
+            );
+            return EXIT_INFRA;
+        }
+    }
+
+    let result = replay_min::ddmin_bytes(&original, |candidate: &[u8]| -> Result<bool, String> {
+        Ok(
+            reevaluate_signature(&mut client, &campaign, &testcase_path, candidate).as_deref()
+                == Some(recorded_sig.as_str()),
+        )
+    });
+    let minimized = match result {
+        Ok(result) => result.minimized,
+        Err(error) => {
+            bhfeprintln!("error: minimize failed: {error}");
+            return EXIT_INFRA;
+        }
+    };
+
+    // The 1-minimal candidate must still reproduce the signature (ddmin preserves
+    // the predicate, but re-confirm so a reported minimization is never a lie).
+    let final_sig = reevaluate_signature(&mut client, &campaign, &testcase_path, &minimized);
+    if final_sig.as_deref() != Some(recorded_sig.as_str()) {
+        bhfeprintln!("error: minimized input did not reproduce the recorded signature");
+        return EXIT_INFRA;
+    }
+
+    let removed = original.len().saturating_sub(minimized.len());
+    let reduced = removed > 0;
+    let min_path = finding_dir.join("min_testcase.bin");
+    if let Err(error) = std::fs::write(&min_path, &minimized) {
+        bhfeprintln!(
+            "error: could not write minimized testcase '{}': {error}",
+            min_path.display()
+        );
+        return EXIT_USAGE;
+    }
+    if let Err(error) = update_extension_minimized(
+        finding_dir,
+        original.len(),
+        minimized.len(),
+        removed,
+        reduced,
+    ) {
+        bhfeprintln!("warning: could not update finding record: {error}");
+    }
+
+    if a.json {
+        let report = json!({
+            "strategy": "bytes",
+            "predicate": "extension-oracle-signature",
+            "signature": recorded_sig,
+            "original_len": original.len(),
+            "minimized_len": minimized.len(),
+            "removed_bytes": removed,
+            "reduced": reduced,
+            "path": "min_testcase.bin",
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string())
+        );
+    } else {
+        println!(
+            "EXTENSION-MINIMIZED signature={recorded_sig} original_len={} minimized_len={} \
+             removed_bytes={removed} reduced={reduced} path=min_testcase.bin",
+            original.len(),
+            minimized.len()
+        );
+    }
+    EXIT_OK
+}
+
+/// Record the minimization on `finding.json` WITHOUT touching its `signature`
+/// (minimize preserves finding identity): point `paths.minimized` /
+/// `minimal_reproducer` at `min_testcase.bin` and stamp a `minimization` block.
+fn update_extension_minimized(
+    finding_dir: &Path,
+    original_len: usize,
+    minimized_len: usize,
+    removed: usize,
+    reduced: bool,
+) -> std::io::Result<()> {
+    let path = finding_dir.join("finding.json");
+    let bytes = std::fs::read(&path)?;
+    let mut value: Value = serde_json::from_slice(&bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    if let Some(obj) = value.as_object_mut() {
+        let paths = obj.entry("paths").or_insert_with(|| json!({}));
+        if let Some(paths) = paths.as_object_mut() {
+            paths.insert("minimized".to_string(), json!("min_testcase.bin"));
+        }
+        obj.insert("minimal_reproducer".to_string(), json!("min_testcase.bin"));
+        obj.insert(
+            "minimization".to_string(),
+            json!({
+                "strategy": "bytes",
+                "predicate": "extension-oracle-signature",
+                "original_len": original_len,
+                "minimized_len": minimized_len,
+                "removed_bytes": removed,
+                "reduced": reduced,
+            }),
+        );
+    }
+    corpus::finding::append_history(
+        &mut value,
+        "minimize",
+        &["paths.minimized", "minimal_reproducer", "minimization"],
+    );
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&value)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
+    )
 }
 
 /// The schema identifier of the run-level `extension.json` provenance record.

@@ -92,6 +92,46 @@ fn extension_findings(work: &Path) -> Vec<Value> {
         .collect()
 }
 
+/// The directory of every extension finding under `<work>/results/findings/`.
+fn extension_finding_dirs(work: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(entries) = fs::read_dir(work.join("results/findings")) {
+        for entry in entries.flatten() {
+            let finding = entry.path().join("finding.json");
+            if let Ok(bytes) = fs::read(&finding) {
+                if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+                    if value["confirmation"] == "extension" {
+                        out.push(entry.path());
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The out-of-tree, dependency-free Python reference extension fixture — the
+/// "implemented once outside the BHF tree" deliverable (it lives in the
+/// `extension_host` crate's fixtures and imports nothing from bhf).
+fn reference_extension_py() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../extension_host/tests/fixtures/reference_extension.py")
+}
+
+/// The absolute `python3` interpreter path, or `None` to skip a test that drives
+/// the Python reference (the manifest needs an absolute, resolvable executable).
+fn python3() -> Option<PathBuf> {
+    let out = Command::new("python3")
+        .args(["-c", "import sys; print(sys.executable)"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let path = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
 // ── validate ─────────────────────────────────────────────────────────────
 
 #[test]
@@ -259,6 +299,106 @@ fn extension_evaluate_reemits_same_stable_signature() {
     assert_eq!(s1.len(), 64);
 }
 
+/// Finding #3 (AC: a clean-exit violation is emitted, replayed, AND MINIMIZED with
+/// the same stable signature). `bhf extension minimize` delta-debugs the finding's
+/// testcase by re-driving `oracle.evaluate`, accepting a candidate only when it
+/// reproduces the SAME stable signature. The `defect-oracle` fires on the declared
+/// `path-contains-dotdot` predicate with a defect-level signature, so a padded input
+/// is reduced to the minimal `..` structure while the signature stays identical.
+#[test]
+fn extension_minimize_reduces_and_preserves_stable_signature() {
+    let dir = temp_dir("minimize-defect");
+    let manifest = write_manifest(&dir, "defect-oracle", &["oracle.evaluate"]);
+    let input = dir.join("input.bin");
+    fs::write(&input, b"junk../more/stuff").unwrap();
+    let work = dir.join("work");
+    let emit = run_extension(&[
+        "evaluate",
+        "--manifest",
+        manifest.to_str().unwrap(),
+        "--input",
+        input.to_str().unwrap(),
+        "--work",
+        work.to_str().unwrap(),
+    ]);
+    assert_eq!(emit.status.code(), Some(1), "a `..` input is a finding");
+
+    let dirs = extension_finding_dirs(&work);
+    assert_eq!(dirs.len(), 1, "exactly one extension finding");
+    let finding_dir = &dirs[0];
+    let before: Value =
+        serde_json::from_slice(&fs::read(finding_dir.join("finding.json")).unwrap()).unwrap();
+    let sig_before = before["signature"].as_str().unwrap().to_owned();
+    let original_len = fs::read(finding_dir.join("testcase.bin")).unwrap().len();
+
+    let min = run_extension(&[
+        "minimize",
+        "--manifest",
+        manifest.to_str().unwrap(),
+        "--finding",
+        finding_dir.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(
+        min.status.success(),
+        "minimize failed: {}",
+        String::from_utf8_lossy(&min.stderr)
+    );
+    let report: Value = serde_json::from_slice(&min.stdout).unwrap();
+    assert_eq!(
+        report["signature"], sig_before,
+        "minimize re-drives to the same stable signature: {report}"
+    );
+    assert_eq!(
+        report["reduced"], true,
+        "a padded input is genuinely reduced: {report}"
+    );
+    assert!(
+        (report["minimized_len"].as_u64().unwrap() as usize) < original_len,
+        "the minimized input is shorter than the original: {report}"
+    );
+
+    // The recorded signature on disk is unchanged (finding identity is preserved),
+    // and the minimized reproducer is recorded.
+    let after: Value =
+        serde_json::from_slice(&fs::read(finding_dir.join("finding.json")).unwrap()).unwrap();
+    assert_eq!(
+        after["signature"], sig_before,
+        "minimize must NEVER rewrite the finding signature"
+    );
+    assert_eq!(after["paths"]["minimized"], "min_testcase.bin");
+
+    // The minimized input preserves the required `..` structure and still triggers
+    // the oracle to the identical signature when re-driven end to end.
+    let minimized = fs::read(finding_dir.join("min_testcase.bin")).unwrap();
+    assert!(
+        minimized.windows(2).any(|w| w == b".."),
+        "the required `..` structure is preserved: {minimized:?}"
+    );
+    let reinput = dir.join("min_input.bin");
+    fs::write(&reinput, &minimized).unwrap();
+    let rework = dir.join("rework");
+    let reeval = run_extension(&[
+        "evaluate",
+        "--manifest",
+        manifest.to_str().unwrap(),
+        "--input",
+        reinput.to_str().unwrap(),
+        "--work",
+        rework.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        reeval.status.code(),
+        Some(1),
+        "the minimized input still triggers the oracle"
+    );
+    assert_eq!(
+        extension_findings(&rework)[0]["signature"],
+        sig_before,
+        "the minimized input reproduces the same stable signature"
+    );
+}
+
 #[test]
 fn extension_fault_is_not_a_target_finding() {
     // The extension crashes mid-evaluate: a bounded infrastructure result, NEVER a
@@ -283,6 +423,87 @@ fn extension_fault_is_not_a_target_finding() {
     );
     // A terminal crash with no restart budget is recorded as a loss event.
     assert!(run["provenance"]["loss_count"].as_u64().unwrap() >= 1);
+}
+
+/// Finding #2 (exit code + provenance on restart failure): a crash whose
+/// restart-time RE-HANDSHAKE fails exhausts the restart budget. The first child
+/// handshakes then crashes; the respawned child exits before emitting its hello, so
+/// `restart_child` fails. That must be classified as a bounded INFRASTRUCTURE
+/// result — `EXIT_INFRA` (4) with the run's `extension.json` provenance (loss
+/// recorded) — never `EXIT_USAGE` (2) with no provenance (the pre-fix behavior).
+#[test]
+fn extension_restart_rehandshake_failure_is_infra_with_provenance() {
+    let dir = temp_dir("evaluate-rehandshake-fail");
+    let state = dir.join("mock_state"); // absent initially → first child handshakes
+    let input = dir.join("input.bin");
+    fs::write(&input, b"../etc/passwd").unwrap();
+    let work = dir.join("work");
+    // Manifest: the first child crashes on its first request after marking `state`;
+    // the respawn sees the marker and fails its re-handshake. `max-restarts = 1`
+    // keeps it quick; a single failed re-handshake is terminal either way.
+    let manifest = dir.join("extension.toml");
+    fs::write(
+        &manifest,
+        format!(
+            "schema = \"bhf.extension-manifest.v1\"\n\
+             id = \"mock-extension\"\n\
+             executable = {exe:?}\n\
+             args = [\"--mode\", \"crash-then-unhandshake\"]\n\
+             required-capabilities = [\"oracle.evaluate\"]\n\
+             allow-external-paths = true\n\
+             \n\
+             [env]\n\
+             MOCK_STATE_FILE = {state:?}\n\
+             \n\
+             [limits]\n\
+             call-timeout-ms = 5000\n\
+             max-restarts = 1\n",
+            exe = mock_extension().to_str().unwrap(),
+            state = state.to_str().unwrap(),
+        ),
+    )
+    .unwrap();
+
+    let output = run_extension(&[
+        "evaluate",
+        "--manifest",
+        manifest.to_str().unwrap(),
+        "--input",
+        input.to_str().unwrap(),
+        "--work",
+        work.to_str().unwrap(),
+    ]);
+    let code = output.status.code().unwrap_or(-1);
+    assert_eq!(
+        code,
+        4,
+        "a restart-budget exhaustion via failed re-handshake is EXIT_INFRA (4), not usage (2): {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        extension_findings(&work).is_empty(),
+        "a restart failure never becomes a target finding"
+    );
+    // Run provenance was still written (the pre-fix bug returned before this).
+    let run: Value =
+        serde_json::from_slice(&fs::read(work.join("extension.json")).unwrap()).unwrap();
+    assert_eq!(run["findings"], 0);
+    assert!(
+        run["result"]
+            .as_str()
+            .unwrap()
+            .contains("infrastructure_error"),
+        "result records the bounded fault: {}",
+        run["result"]
+    );
+    assert!(
+        run["provenance"]["loss_count"].as_u64().unwrap() >= 1,
+        "the failed re-handshake is recorded as a terminal loss: {run}"
+    );
+    assert!(
+        run["provenance"]["restart_count"].as_u64().unwrap() >= 1,
+        "a restart was attempted: {run}"
+    );
 }
 
 #[test]
@@ -574,4 +795,88 @@ fn fuzz_extension_fault_never_aborts_campaign_nor_becomes_a_finding() {
         extension_findings(&work_dir).is_empty(),
         "an extension fault never becomes a target finding"
     );
+}
+
+/// Finding #1 (codec-agnostic contract): the out-of-tree Python reference
+/// extension must NOT rebuild an unrecognized raw corpus entry into a toy frame
+/// before `oracle.evaluate`. `bhf fuzz --extension` negotiates `codec.repair`, but
+/// a raw path like `../etc/passwd` is not a well-formed toy frame, so the
+/// reference's `codec.repair` must `reject` it and the host must evaluate it
+/// VERBATIM (`repaired == 0`). Before the guard was added the reference rebuilt any
+/// input of 6+ bytes into a fresh toy frame whose decoded bytes no longer contained
+/// the `..` segment, so the oracle saw a mangled input and emitted no finding; this
+/// test fails without the guard (repaired of 1+, findings of 0).
+#[test]
+fn extension_fuzz_python_reference_evaluates_unrecognized_entry_verbatim() {
+    let Some(python) = python3() else {
+        eprintln!("skipping: python3 not found");
+        return;
+    };
+    let script = reference_extension_py();
+    assert!(script.is_file(), "reference extension fixture missing");
+
+    let dir = temp_dir("fuzz-python-verbatim");
+    let work_dir = dir.join("bhf_work");
+    let harness_id = "H-TEST";
+    install_fake_harness(&work_dir, harness_id);
+
+    // A manifest launching `python3 reference_extension.py` (an external executable;
+    // PATH is forwarded so the interpreter runs). Requires only `oracle.evaluate`;
+    // the session caps (incl. codec.repair) are negotiated as optional by fuzz.
+    let manifest = dir.join("python-extension.toml");
+    fs::write(
+        &manifest,
+        format!(
+            "schema = \"bhf.extension-manifest.v1\"\n\
+             id = \"python-reference\"\n\
+             executable = {exe:?}\n\
+             args = [{script:?}]\n\
+             required-capabilities = [\"oracle.evaluate\"]\n\
+             allow-external-paths = true\n\
+             env-passthrough = [\"PATH\"]\n\
+             \n\
+             [limits]\n\
+             call-timeout-ms = 10000\n",
+            exe = python.to_str().unwrap(),
+            script = script.to_str().unwrap(),
+        ),
+    )
+    .unwrap();
+
+    let fuzz_exit = run_from(vec![
+        "bhf".to_string(),
+        "fuzz".to_string(),
+        work_dir.to_str().unwrap().to_string(),
+        "--harness".to_string(),
+        harness_id.to_string(),
+        "--iterations".to_string(),
+        "1".to_string(),
+        "--seed-input".to_string(),
+        "../etc/passwd".to_string(),
+        "--extension".to_string(),
+        manifest.to_str().unwrap().to_string(),
+    ]);
+    assert_eq!(fuzz_exit, 0, "an extension pass never aborts the campaign");
+
+    let summary: Value =
+        serde_json::from_slice(&fs::read(work_dir.join("fuzz_runs/H-TEST-latest.json")).unwrap())
+            .unwrap();
+    assert_eq!(summary["extension"]["active"], true, "{summary}");
+    assert_eq!(
+        summary["extension"]["codec_repair_available"], true,
+        "the reference negotiates codec.repair: {summary}"
+    );
+    // The crux: the unrecognized raw corpus entry was NOT rebuilt (guard rejected
+    // it), so it reached the oracle verbatim and the escape was flagged.
+    assert_eq!(
+        summary["extension"]["repaired"], 0,
+        "an unrecognized raw entry must be evaluated verbatim, never rebuilt: {summary}"
+    );
+    assert_eq!(
+        summary["extension"]["findings"], 1,
+        "the verbatim `../etc/passwd` is flagged by the oracle: {summary}"
+    );
+    let ext = extension_findings(&work_dir);
+    assert_eq!(ext.len(), 1);
+    assert_eq!(ext[0]["rule_id"], "oracle.path-escape");
 }

@@ -16,6 +16,7 @@
 //! unsupported capability, mismatched case identity).
 
 use std::env;
+use std::fs;
 use std::io::{self, ErrorKind, Read, Write};
 use std::process::exit;
 use std::time::Duration;
@@ -31,6 +32,18 @@ struct State {
 
 fn main() {
     let mode = parse_mode();
+
+    // `crash-then-unhandshake`: the FIRST child handshakes and then crashes on its
+    // first request (marking a cross-process state file); a RESPAWNED child sees the
+    // marker and exits BEFORE emitting its hello, so the host's restart-time
+    // re-handshake fails. This exercises the restart-budget-exhaustion-via-failed-
+    // re-handshake path (a bounded infrastructure result, EXIT_INFRA + provenance),
+    // distinct from a post-handshake crash that the host can re-handshake past.
+    if mode == "crash-then-unhandshake" && crashed_before() {
+        exit(7);
+    }
+
+    let defect_oracle = mode == "defect-oracle";
 
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
@@ -95,7 +108,14 @@ fn main() {
                 if let Some(obj) = tampered.as_object_mut() {
                     obj.insert("worker".to_string(), Value::String("EVIL".to_string()));
                 }
-                let response = handle(&protocol, &tampered, &capability, &request, &mut state);
+                let response = handle(
+                    &protocol,
+                    &tampered,
+                    &capability,
+                    &request,
+                    &mut state,
+                    defect_oracle,
+                );
                 write_frame(&mut stdout, &serde_json::to_vec(&response).unwrap()).unwrap();
             }
             "unsupported" => {
@@ -110,8 +130,21 @@ fn main() {
             "crash" => {
                 exit(101);
             }
+            "crash-then-unhandshake" => {
+                // Record that this (first) child reached a request, then crash. A
+                // respawn detects the marker and fails its re-handshake (above).
+                mark_crashed();
+                exit(101);
+            }
             _ => {
-                let response = handle(&protocol, &case, &capability, &request, &mut state);
+                let response = handle(
+                    &protocol,
+                    &case,
+                    &capability,
+                    &request,
+                    &mut state,
+                    defect_oracle,
+                );
                 write_frame(&mut stdout, &serde_json::to_vec(&response).unwrap()).unwrap();
             }
         }
@@ -128,9 +161,15 @@ fn handle(
     capability: &str,
     request: &Value,
     state: &mut State,
+    defect_oracle: bool,
 ) -> Value {
     match capability {
-        "oracle.evaluate" => oracle_evaluate(protocol, case, &decode_input(request, "input_b64")),
+        "oracle.evaluate" => oracle_evaluate(
+            protocol,
+            case,
+            &decode_input(request, "input_b64"),
+            defect_oracle,
+        ),
         "codec.decode" => codec_decode(protocol, case, &decode_input(request, "input_b64")),
         "codec.encode" => codec_encode(protocol, case, request),
         "codec.repair" => codec_repair(protocol, case, &decode_input(request, "input_b64")),
@@ -147,9 +186,25 @@ fn handle(
     }
 }
 
-fn oracle_evaluate(protocol: &str, case: &Value, input: &[u8]) -> Value {
+fn oracle_evaluate(protocol: &str, case: &Value, input: &[u8], defect_oracle: bool) -> Value {
     let path = String::from_utf8_lossy(input).to_string();
-    if escapes(&path) {
+    // `defect-oracle` fires precisely on the declared `path-contains-dotdot`
+    // predicate with a DEFECT-level signature (just the rule), independent of the
+    // surrounding input bytes: minimization can shrink the input down to the
+    // minimal `..` structure while reproducing the IDENTICAL stable signature. The
+    // default oracle flags any sandbox escape and keeps the full path in the
+    // signature (a per-input identity, which is not reducible without changing it).
+    let fires = if defect_oracle {
+        path.contains("..")
+    } else {
+        escapes(&path)
+    };
+    if fires {
+        let signature_inputs = if defect_oracle {
+            json!(["oracle.path-escape"])
+        } else {
+            json!(["oracle.path-escape", path])
+        };
         json!({
             "protocol": protocol,
             "case": case,
@@ -157,7 +212,7 @@ fn oracle_evaluate(protocol: &str, case: &Value, input: &[u8]) -> Value {
             "finding": {
                 "rule": "oracle.path-escape",
                 "classification": "extension_oracle",
-                "signature_inputs": ["oracle.path-escape", path],
+                "signature_inputs": signature_inputs,
                 "evidence": [
                     { "key": "path", "value": path },
                     { "key": "reason", "value": "escapes sandbox root" }
@@ -410,6 +465,27 @@ fn parse_mode() -> String {
         }
     }
     "well-behaved".to_string()
+}
+
+/// A cross-process marker path (set via the manifest `[env]`) so a respawned child
+/// can tell it is a restart of an earlier child.
+fn state_file() -> Option<String> {
+    env::var("MOCK_STATE_FILE").ok()
+}
+
+fn crashed_before() -> bool {
+    match state_file() {
+        Some(path) => fs::read_to_string(path)
+            .map(|s| s.trim() == "crashed")
+            .unwrap_or(false),
+        None => false,
+    }
+}
+
+fn mark_crashed() {
+    if let Some(path) = state_file() {
+        let _ = fs::write(path, "crashed");
+    }
 }
 
 fn decode_input(request: &Value, field: &str) -> Vec<u8> {
