@@ -1715,6 +1715,14 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/relational.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/src/relational/tests.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/replay.rs",
       "license": "Apache-2.0"
     },
@@ -2472,6 +2480,10 @@
     },
     {
       "path": "crates/cli/tests/redqueen_cmplog.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/relational_cli.rs",
       "license": "Apache-2.0"
     },
     {
@@ -3480,6 +3492,50 @@
     },
     {
       "path": "crates/python_parser/src/lib.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/relational/Cargo.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/relational/src/campaign.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/relational/src/coverage.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/relational/src/executor.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/relational/src/finding.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/relational/src/lib.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/relational/src/mutate.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/relational/src/observation.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/relational/src/predicate.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/relational/src/redact.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/relational/src/schema.rs",
       "license": "Apache-2.0"
     },
     {

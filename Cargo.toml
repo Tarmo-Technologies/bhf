@@ -50,6 +50,7 @@ members = [
     "crates/project_synth",
     "crates/protocol_session",
     "crates/python_parser",
+    "crates/relational",
     "crates/replay_min",
     "crates/report",
     "crates/results",

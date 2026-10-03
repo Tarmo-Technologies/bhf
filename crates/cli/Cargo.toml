@@ -75,6 +75,7 @@ project_synth = { path = "../project_synth" }
 protocol_session = { path = "../protocol_session" }
 python_parser = { path = "../python_parser" }
 regex.workspace = true
+relational = { path = "../relational" }
 replay_min = { path = "../replay_min" }
 bhf_report = { package = "report", path = "../report" }
 results = { path = "../results" }

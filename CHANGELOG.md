@@ -24,6 +24,30 @@
   `results/findings.json` (schema in `schemas/`, reference fixture in `tests/fixtures/golden_results/`).
 
 ### Added
+- **Coverage-guided relational policy fuzzing** (`bhf relational`): run one generated
+  testcase across several named launch/session **profiles** (differing in runner, args,
+  environment, declared target allowlist and secret references) and evaluate declarative
+  relational **predicates** (`status_relation`, `subset`/allowlist, `equal`, `differ`, and
+  an `external`-comparator seam) over each profile's observed behaviour, catching both
+  unexpected *divergence* and unexpected *equivalence* against an explicit policy — an
+  authorization bug class a crash-only or single-harness output-diff oracle cannot see,
+  because the offending runs can exit `0` with byte-identical stdout (#61). The campaign
+  retains inputs that reach new code in any profile, a new cross-profile outcome vector, or
+  a new effect-event shape, and emits a finding per violated relation: `BHF-308`
+  (unexpected authorization, CWE-863), `BHF-309` (allowlist escape, CWE-862), `BHF-310`
+  (unexpected equivalence, CWE-285) and `BHF-311` (unexpected divergence, CWE-754). Each
+  profile runs with a **distinct** coverage-shm file, runtime-trace log and scratch dir, so
+  one profile's coverage or effect events can never contaminate another's, and per-case
+  novelty is bucketed per profile. Effect events come from the runtime-trace collector,
+  with the platform-neutral `bhf.collector-event.v1` source feeding the same seam where it
+  is active. Secret references (`lab:` prefix) are resolved locally and in-process only and
+  redacted out of every finding and replay bundle — only the stable reference id survives.
+  New `bhf relational run` (campaign), `bhf relational replay` (re-run every required
+  profile and re-confirm the relation) and `bhf relational minimize` (shrink the testcase
+  and reduce the required profile set) subcommands; the policy is a TOML file
+  (`bhf.relational.v1`). Findings persist through the unified `results/` layout
+  (`results/findings/F-REL-*`) so importers / SARIF / vulnerability-management tools read
+  them with the same reader as every other finding kind.
 - Versioned **out-of-process extension protocol** (`bhf.extension.v1`): bhf can start an
   explicitly-trusted extension executable, negotiate a protocol version + capabilities
   before any work, and drive length-framed JSON request/response envelopes that each

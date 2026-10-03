@@ -73,6 +73,7 @@ mod policy;
 mod probe_backend;
 mod project;
 mod readiness;
+mod relational;
 mod replay;
 mod report;
 mod resource_limits;
@@ -112,7 +113,7 @@ Most users want `bhf auto <source-dir>`, which runs the whole pipeline.
 COMMANDS BY AREA (run `bhf <command> --help` for details):
   Pipeline      auto, scan, list, generate-harness, build, fuzz, report
   Build support stub, instrument, fake-corba
-  Crash triage  corpus, minimize, replay, differential, cmplog
+  Crash triage  corpus, minimize, replay, differential, relational, cmplog
   Binaries      binary (scan, adapter, fuzz — no source)
   Supply chain  sbom, license-audit, static-scan, extract-state-machines
   Reference     rules, list oracles
@@ -198,6 +199,8 @@ enum Command {
     EnvCapsule(env_capsule::EnvCapsuleArgs),
     /// Replay inputs through two harnesses or metamorphic variants and flag divergences (BHF-301 oracle)
     Differential(differential::DifferentialArgs),
+    /// Coverage-guided relational policy fuzzing: run one testcase under N role/session profiles and flag broken relational policies (BHF-308..311): run, replay, minimize
+    Relational(relational::RelationalArgs),
     /// Recover comparison operands (cmplog / RedQueen) from a runtrace log into a fuzzing dictionary
     Cmplog(cmplog_cli::CmplogArgs),
     /// Explain, offline and deterministically (no LLM), WHY a crash fired: input, gate constants, faked env, dataflow
@@ -392,6 +395,10 @@ where
         // (via `extension::run`), so it is NOT wrapped in the `with_results`
         // producer bracket (mirroring `bhf project`).
         Some(Command::Extension(extension_args)) => extension::run(extension_args),
+        // `bhf relational` manages its own work dir, findings, and producer
+        // bracket (via `relational::run`), so it is NOT wrapped in the
+        // `with_results` bracket here (mirroring `bhf project`/`bhf extension`).
+        Some(Command::Relational(relational_args)) => relational::run(relational_args),
         Some(Command::List(list)) => match list.command {
             ListCommand::Targets(args) => match list_targets::run(args) {
                 Ok(()) => 0,

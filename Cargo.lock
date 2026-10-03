@@ -212,6 +212,7 @@ dependencies = [
  "python_parser",
  "rayon",
  "regex",
+ "relational",
  "replay_min",
  "report",
  "results",
@@ -1835,6 +1836,17 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "relational"
+version = "0.2.34"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "toml",
+]
 
 [[package]]
 name = "replay_min"

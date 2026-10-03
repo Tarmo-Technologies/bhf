@@ -12,7 +12,7 @@ checks.
 |---|---|
 | Whole-tree and manual pipeline | `auto`, `snippet`, `scan`, `list`, `generate-harness`, `build`, `fuzz`, `report` |
 | Build and instrumentation support | `stub`, `instrument`, `fake-corba` |
-| Corpus and crash triage | `corpus`, `minimize`, `replay`, `capsule`, `verify-poc`, `env-capsule`, `differential`, `cmplog`, `explain`, `cartography` |
+| Corpus and crash triage | `corpus`, `minimize`, `replay`, `capsule`, `verify-poc`, `env-capsule`, `differential`, `relational`, `cmplog`, `explain`, `cartography` |
 | Source-unavailable binaries | `binary` (`scan`, `adapter`, `fuzz`) |
 | External project profiles | `project` (`validate`, `list`, `run`) |
 | Out-of-process extensions | `extension` (`validate`, `evaluate`), and `fuzz --extension` |
@@ -1010,6 +1010,104 @@ This slice ships the `oracle.evaluate` capability. The `codec.*`,
 `mutator.mutate`, `scenario.*`, and `lifecycle.*` capabilities, CBOR wire
 encoding, and a project-profile `[[extension]]` section (converging onto
 `bhf.project.v1`) are negotiated-but-deferred follow-ups.
+
+## Coverage-Guided Relational Policy Fuzzing
+
+`bhf relational` runs **one** generated testcase across several named
+launch/session **profiles** (differing in runner, args, environment, declared
+target allowlist and secret references) and evaluates declarative relational
+**predicates** over each profile's observed behaviour. It catches both unexpected
+*divergence* and unexpected *equivalence* against an explicit policy — a class of
+authorization bug a crash-only or single-harness output-diff oracle cannot see,
+because the offending runs can exit `0` with byte-identical stdout. The signal is
+the *effect* (what each profile launched, reached, or decided), not the output.
+
+```sh
+# Coverage-guided campaign: mutate a shared testcase, run it under every profile,
+# retain inputs that reach new code in any profile or a new cross-profile outcome,
+# and emit a finding when a policy relation breaks. Findings land under
+# <out>/results/findings/F-REL-*.
+bhf relational run --config policy.toml --seeds corpus/ --out findings_relational
+
+# Re-run every profile the finding requires and re-confirm the violated relation
+# (exit 0 when it still reproduces, non-zero when it no longer does). Resolved
+# secrets stay redacted; a replay.json bundle is written beside the finding.
+bhf relational replay --finding findings_relational/results/findings/F-REL-0000
+
+# Shrink the finding's testcase while the relation still holds and reduce the
+# required profile set to the minimum that still proves it.
+bhf relational minimize --finding findings_relational/results/findings/F-REL-0000
+```
+
+**Policy (`bhf.relational.v1`).** A TOML file declares the profiles and the
+relational predicates:
+
+```toml
+schema = "bhf.relational.v1"
+
+[status_map]                              # exit-code -> authorization status
+allowed = [0]
+denied = [77]
+auth_failure = [66]                       # a failed session/auth bootstrap
+
+[[profiles]]
+name = "administrator"
+runner = "/bin/sh"
+args = ["launcher.sh", "administrator"]
+allowlist = ["administrator-helper", "viewer-helper"]
+collector = "runtrace"                    # auto | runtrace | none
+[profiles.env]
+TOKEN = "lab:admin-token"                 # a secret reference, never a value
+
+[[profiles]]
+name = "viewer"
+runner = "/bin/sh"
+args = ["launcher.sh", "viewer"]
+allowlist = ["viewer-helper"]
+collector = "runtrace"
+
+# viewer must stay denied whenever administrator is allowed (BHF-308)
+[[predicates]]
+rule = "viewer must stay denied when administrator is allowed"
+require = { kind = "status_relation", profile = "viewer", status = "denied" }
+when = { kind = "status_is", profile = "administrator", status = "allowed" }
+
+# viewer may only launch targets in its declared allowlist (BHF-309)
+[[predicates]]
+rule = "viewer spawned targets must be a subset of its allowlist"
+require = { kind = "subset", set = "viewer.spawned", of = "viewer.allowlist" }
+```
+
+Predicate relations: `status_relation` (a profile's derived status must match),
+`subset` (an observed target set must be within a declared allowlist),
+`equal` / `differ` (selector values across profiles must be equal / must differ),
+and `external` (an out-of-process comparator seam — until one is wired it reports
+*inconclusive* rather than fabricating a verdict). Selectors read `profile.field`
+where field is one of `spawned`, `allowlist`, `status`, `response`, `edges`.
+
+**What a finding records.** Each violation becomes a finding
+(`BHF-308` unexpected authorization, `BHF-309` allowlist escape,
+`BHF-310` unexpected equivalence, `BHF-311` unexpected divergence) carrying the
+violated relation, the involved profiles, each profile's normalized observation,
+the testcase, the evidence event(s), and the policy + per-profile hashes. The
+persisted shape mirrors every other finding kind, so SARIF /
+vulnerability-management importers read relational findings with the same reader.
+
+**Per-profile isolation.** Every profile runs with a **distinct** coverage-shm
+file (`BHF_COV_SHM`), runtime-trace log (`BHF_RUNTRACE_LOG`) and scratch dir, so
+one profile's coverage or effect events can never contaminate another's. Per-case
+novelty is bucketed per profile, so an input that is novel in only one profile is
+still retained. Effect events come from the runtime-trace collector; the
+platform-neutral `bhf.collector-event.v1` source feeds the same seam where it is
+active. A target that emits its own trace stream (or must not be instrumented)
+sets `BHF_RUNTRACE_SHIM=off` to skip the LD_PRELOAD shim.
+
+**Secrets.** A profile env value with the `lab:` prefix is a *reference*; the
+driver resolves it locally from `BHF_SECRET_<NAME>` (name upper-cased,
+non-alphanumerics mapped to `_`) only in-process, and the resolved value is
+redacted out of every finding and replay bundle before anything is persisted —
+only the stable reference id survives (it lives in the policy, not in a resolved
+value).
 
 ## Release Commands
 
