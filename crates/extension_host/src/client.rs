@@ -289,12 +289,34 @@ impl AckOutcome {
     }
 }
 
+/// Upper bound on how long a dropped [`Session`] waits for its frame-reader
+/// thread to finish before detaching it.
+///
+/// In the normal case the reader hits EOF the instant the killed+reaped child's
+/// stdout pipe closes, so it finishes in microseconds and this bound is never
+/// reached. It only ever elapses in the pathological case where the extension
+/// double-forked a grandchild that inherited the child's stdout (fd 1) and keeps
+/// that pipe's write-end open after the direct child is reaped: the reader's
+/// blocking `read` then never sees EOF. Detaching the reader (rather than joining
+/// it) when the bound elapses keeps teardown bounded instead of hanging forever.
+/// The child itself is killed+reaped regardless, so no zombie results — only a
+/// detached reader thread that exits on its own once the grandchild releases the
+/// pipe.
+const READER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// A live child + its frame reader thread.
 struct Session {
     child: Child,
     stdin: ChildStdin,
     rx: Receiver<FrameEvent>,
     reader: Option<JoinHandle<()>>,
+    /// Disconnects the instant the reader thread's closure returns: its paired
+    /// `Sender` is moved into the reader thread and dropped when the thread ends.
+    /// A `recv_timeout` that observes `Disconnected` therefore proves the reader
+    /// has finished (so [`JoinHandle::join`] will not block); a `Timeout` means it
+    /// is still blocked in `read` and must be detached rather than joined. See
+    /// [`impl Drop for Session`](Session#impl-Drop-for-Session).
+    reader_done: Receiver<()>,
 }
 
 /// An event produced by the background frame reader.
@@ -334,11 +356,32 @@ impl Drop for Session {
     /// waits). Reaping an already-reaped child (the crash path already called
     /// `wait`) is harmless: `std` caches the exit status, so a second `wait` never
     /// reaps a reused PID, and `kill` of an exited child errors benignly.
+    ///
+    /// The reader-thread wait is **bounded**: the child is dead, but a grandchild
+    /// the extension may have double-forked can keep the child's stdout pipe open,
+    /// leaving the reader blocked in `read` with no EOF to unblock it. `reader_done`
+    /// disconnects the instant the reader returns (the normal EOF path), so a
+    /// successful bounded receive means `join` completes at once; if the bound
+    /// elapses the reader is still blocked on that grandchild-held pipe, so it is
+    /// DETACHED rather than joined — teardown must never hang. Either way the child
+    /// is already killed+reaped, so no zombie is leaked.
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
         if let Some(handle) = self.reader.take() {
-            let _ = handle.join();
+            match self.reader_done.recv_timeout(READER_JOIN_TIMEOUT) {
+                // Still blocked in `read` on a pipe a grandchild holds open:
+                // abandon the join. The detached thread owns only its own stdout
+                // handle and channel ends (never any `Session`/client state), so it
+                // exits cleanly on its own once that fd closes; nothing it touches
+                // is freed out from under it.
+                Err(RecvTimeoutError::Timeout) => {}
+                // Disconnected: the reader returned and dropped its sender, so this
+                // join is immediate. (`Ok` cannot occur — nothing is ever sent.)
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                    let _ = handle.join();
+                }
+            }
         }
     }
 }
@@ -1041,10 +1084,21 @@ fn spawn_session(spec: &SpawnSpec, redacted: &RedactedEnv) -> Result<Session> {
         .ok_or_else(|| ExtensionError::protocol("extension child stdout was not captured"))?;
 
     let (tx, rx) = mpsc::channel();
+    // A completion channel whose sender lives only for the reader thread's body:
+    // dropping it (when the closure returns) disconnects `reader_done`, which a
+    // dropped `Session` uses to tell "the reader finished" (join is safe) from
+    // "the reader is still blocked in `read`" (must be detached). See
+    // `impl Drop for Session`.
+    let (done_tx, reader_done) = mpsc::channel::<()>();
     let cap = spec.limits.max_frame_bytes;
     let reader = std::thread::Builder::new()
         .name("extension-reader".to_string())
-        .spawn(move || reader_loop(stdout, cap, tx))
+        .spawn(move || {
+            // Owned by the thread so it is dropped precisely when `reader_loop`
+            // returns, signalling completion via `reader_done`'s disconnect.
+            let _done_tx = done_tx;
+            reader_loop(stdout, cap, tx)
+        })
         .map_err(ExtensionError::Io)?;
 
     Ok(Session {
@@ -1052,6 +1106,7 @@ fn spawn_session(spec: &SpawnSpec, redacted: &RedactedEnv) -> Result<Session> {
         stdin,
         rx,
         reader: Some(reader),
+        reader_done,
     })
 }
 

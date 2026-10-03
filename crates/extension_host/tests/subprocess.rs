@@ -482,6 +482,119 @@ fn rehandshake_failure_is_terminal_and_reaps_every_child() {
     }
 }
 
+/// Best-effort SIGKILL the detached `grandchild-sleeper` whose pid the mock wrote
+/// to `path`, so a passing test does not leave it holding the (now-detached) pipe
+/// for its full self-terminate bound.
+fn reap_grandchild(path: &std::path::Path) {
+    if let Ok(contents) = std::fs::read_to_string(path) {
+        if let Ok(pid) = contents.trim().parse::<i32>() {
+            // SAFETY: `kill` is a plain libc syscall; `pid` is the one the
+            // grandchild recorded for itself. A stale/reused pid at worst signals
+            // nothing or an unrelated process we have no handle to — this is a
+            // best-effort test cleanup, not a correctness guarantee.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+/// Regression (#57 follow-up): a dropped `Session` whose extension double-forked a
+/// grandchild that inherited the child's stdout must NOT hang teardown.
+///
+/// The mock, in `grandchild-holds-stdout`, spawns a grandchild that inherits fd 1
+/// (the host's read-pipe write-end) and keeps it open, then the direct child
+/// handshakes and vanishes on the first request without responding. The host's
+/// frame-reader thread then blocks on `read` with no EOF (the grandchild still
+/// holds the pipe), so the `Session` drop's reader-join would block indefinitely.
+/// The fix bounds that join: teardown detaches the still-blocked reader after a
+/// short deadline instead of hanging.
+///
+/// `evaluate` runs on a worker thread under a wall-clock budget, so a regression
+/// (unbounded join) FAILS this test at the budget rather than hanging the whole
+/// suite. The budget (20s) sits well above the fix's ~2s bound and well below the
+/// grandchild's 120s pipe-hold, so pre-fix the join overruns the budget while
+/// post-fix it returns comfortably. The direct child must be reaped (no zombie)
+/// and the vanished extension must be a bounded infrastructure result, never a
+/// finding — even for a planted sandbox-escape input.
+#[test]
+fn grandchild_holding_stdout_does_not_hang_teardown() {
+    use std::sync::mpsc;
+
+    let pid_log = tempfile::NamedTempFile::new().expect("pid log");
+    let gc_pid = tempfile::NamedTempFile::new().expect("grandchild pid file");
+
+    let mut spec = mock_spec("grandchild-holds-stdout");
+    // A short per-call deadline: the host times the vanished extension out quickly,
+    // then tears the session down — which is where the bounded join matters.
+    spec.limits.call_timeout = Duration::from_millis(250);
+    spec.env = BTreeMap::from([
+        (
+            "MOCK_PID_LOG".to_string(),
+            pid_log.path().display().to_string(),
+        ),
+        (
+            "MOCK_GRANDCHILD_PID_FILE".to_string(),
+            gc_pid.path().display().to_string(),
+        ),
+    ]);
+
+    // Drive spawn + evaluate + explicit teardown on a worker thread so an unbounded
+    // join (the regression) trips the wall-clock budget below instead of hanging the
+    // whole test binary.
+    let (tx, rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let mut client = ExtensionClient::spawn(spec).expect("spawn");
+        let outcome = client
+            .evaluate(&case("worker-0", "tc-escape"), b"../etc/passwd")
+            .expect("evaluate");
+        // `shutdown` drops the (already torn-down) session again; still bounded.
+        client.shutdown();
+        let _ = tx.send(outcome);
+    });
+
+    let outcome = match rx.recv_timeout(Duration::from_secs(20)) {
+        Ok(outcome) => outcome,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            reap_grandchild(gc_pid.path());
+            panic!(
+                "teardown did not return within the budget: the Session reader-join is \
+                 unbounded and hung on a grandchild holding the stdout pipe open"
+            );
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            reap_grandchild(gc_pid.path());
+            panic!("worker thread panicked before sending an outcome");
+        }
+    };
+    worker.join().expect("worker thread");
+
+    // The vanished extension is a bounded infrastructure result, never a finding —
+    // even though the input is a planted sandbox escape.
+    assert!(
+        matches!(outcome, EvaluateOutcome::Infrastructure(_)),
+        "a vanished extension must be bounded infrastructure, never a finding; got {outcome:?}"
+    );
+
+    // Exactly one host-spawned extension child (restart = never; the grandchild
+    // returns before logging its pid), and it was reaped by the `Session` drop —
+    // not left a zombie, despite the grandchild still holding the stdout pipe.
+    let pids = read_pids(pid_log.path());
+    assert_eq!(
+        pids.len(),
+        1,
+        "expected exactly the one direct child; got {pids:?}"
+    );
+    assert!(
+        !is_zombie(pids[0]),
+        "the direct child {} was left unreaped (zombie) despite the grandchild holding the pipe",
+        pids[0]
+    );
+
+    // Clean up the detached grandchild so it does not linger for its full hold.
+    reap_grandchild(gc_pid.path());
+}
+
 #[test]
 fn from_manifest_spawns_handshakes_and_evaluates() {
     let dir = tempfile::tempdir().expect("tempdir");

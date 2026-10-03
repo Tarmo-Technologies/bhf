@@ -244,6 +244,15 @@
   extra child), and a `Session` reaps its child on drop on every path. The bounded outcome is
   unchanged: `EXIT_INFRA` (4) with `extension.json` provenance for `evaluate`/`session`, and the
   fuzz pass still ends cleanly without a target finding.
+- **Extension teardown cannot hang on a double-forked grandchild** (`bhf extension`/`bhf fuzz
+  --extension`, #57 follow-up): the `Session` drop that reaps the child now waits for its
+  stdout frame-reader thread only up to a short bound before detaching it. If the extension
+  double-forked a grandchild that inherited the child's stdout (fd 1), that grandchild keeps the
+  pipe's write-end open after the direct child is killed+reaped, so the reader's blocking `read`
+  never sees EOF; the previous unconditional `join()` on drop would then block teardown/restart
+  forever. The child is still killed+reaped (no zombie) and the normal path still joins the
+  reader cleanly at EOF — only a reader left blocked on a grandchild-held pipe is abandoned. The
+  bounded outcome (`EXIT_INFRA` (4) with `extension.json`) is unchanged.
 - **Relational executor robustness** (`bhf relational`, #61): the per-profile spawn now
   feeds stdin and drains stdout/stderr on dedicated threads concurrently with the wait
   loop, so a target that streams more than a pipe buffer of output — or never reads its

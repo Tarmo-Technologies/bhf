@@ -39,9 +39,34 @@ struct State {
 fn main() {
     let mode = parse_mode();
 
+    // `grandchild-sleeper`: a detached grandchild spawned by `grandchild-holds-stdout`.
+    // It inherited the direct child's stdout (fd 1) and keeps that pipe write-end
+    // open after the direct child exits, so the host's frame reader sees no EOF. It
+    // holds the pipe well past the host's bounded reader-join deadline, then
+    // self-terminates so a crashed/failing test cannot leak it forever. It records
+    // its own pid (so the test can reap it) and returns BEFORE `log_pid`, so it is
+    // never miscounted as a host-spawned extension child.
+    if mode == "grandchild-sleeper" {
+        if let Ok(path) = env::var("MOCK_GRANDCHILD_PID_FILE") {
+            let _ = fs::write(path, std::process::id().to_string());
+        }
+        std::thread::sleep(Duration::from_secs(120));
+        return;
+    }
+
     // Record this child's PID (every spawned child, including a respawn that fails
     // its re-handshake) so a test can assert no child is leaked/left unreaped.
     log_pid();
+
+    // `grandchild-holds-stdout`: before touching the wire, double-fork a grandchild
+    // that inherits this child's stdout (fd 1). After this direct child exits (on
+    // its first request, below), the grandchild keeps the stdout pipe open, so the
+    // host's frame-reader thread blocks on `read` with no EOF — the pathological
+    // case the host's bounded reader-join must survive without hanging teardown.
+    // The direct child must still be reaped.
+    if mode == "grandchild-holds-stdout" {
+        spawn_stdout_holding_grandchild();
+    }
 
     // `crash-then-unhandshake`: the FIRST child handshakes then crashes on its
     // first request (marking a cross-process marker); every RESPAWNED child sees
@@ -152,6 +177,14 @@ fn main() {
             }
             "crash" => {
                 exit(101);
+            }
+            "grandchild-holds-stdout" => {
+                // Vanish on the first request WITHOUT responding, after the
+                // handshake already succeeded. The grandchild spawned at startup
+                // keeps stdout open, so the host's reader never sees EOF; the host
+                // must bound its reader-join on teardown and still reap this direct
+                // child.
+                exit(0);
             }
             "crash-once" => {
                 if crashed_before() {
@@ -509,6 +542,32 @@ fn mark_crashed() {
     if let Some(path) = state_file() {
         let _ = fs::write(path, "crashed");
     }
+}
+
+/// Double-fork a detached grandchild (a re-exec of this mock in
+/// `grandchild-sleeper` mode) that inherits this process's stdout (fd 1) and so
+/// keeps the host's read-pipe write-end open after this process exits. The child
+/// handle is intentionally leaked (never waited on): the grandchild is not the
+/// host's child, and it self-terminates after a bound. `stdin`/`stderr` are not
+/// inherited so the grandchild holds ONLY the stdout pipe open.
+fn spawn_stdout_holding_grandchild() {
+    use std::process::{Command, Stdio};
+    let exe = env::current_exe().expect("current_exe");
+    // Intentionally detached: we must NOT wait on the grandchild — this process
+    // exits immediately after, and the grandchild outlives it (that is the whole
+    // point: it keeps the stdout pipe open). It is reparented to init and
+    // self-terminates after a bound, so it never becomes a zombie of this process.
+    #[allow(clippy::zombie_processes)]
+    let _child = Command::new(exe)
+        .arg("--mode")
+        .arg("grandchild-sleeper")
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit()) // the dup of fd 1 that keeps the pipe open
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn stdout-holding grandchild");
+    // `MOCK_GRANDCHILD_PID_FILE` is inherited from this process's environment, so
+    // the grandchild records its own pid there for the test to reap.
 }
 
 /// Append this process's PID to `MOCK_PID_LOG` (if set), one per line, so a test
