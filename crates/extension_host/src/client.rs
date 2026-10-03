@@ -12,15 +12,19 @@
 //! timeout triggers the [`RestartPolicy`]; once the restart budget is exhausted
 //! the loss is terminal and a loss event is recorded in provenance.
 
+use crate::codec::{self, DecodePayload, EncodePayload, RepairPayload};
 use crate::envelope::{CaseId, FindingResult, Request, Response, ResultClass};
 use crate::handshake::{negotiate, ExtHello, HostHello, Negotiated, WireLimits};
+use crate::lifecycle::LifecyclePayload;
 use crate::limits::{Limits, OutstandingGuard};
 use crate::manifest::ExtensionManifest;
+use crate::mutator::MutatePayload;
 use crate::oracle::EvaluatePayload;
 use crate::provenance::{
     hash_bytes, hash_file, redact_env, ExtensionProvenance, ProvLimits, RedactedEnv,
 };
 use crate::restart::{RestartPolicy, RestartState};
+use crate::scenario::{NextValue, ObserveResponsePayload, ScenarioNextPayload};
 use crate::wire::{read_frame, write_frame};
 use crate::{capability, ExtensionError, Result, PROTOCOL};
 use std::collections::BTreeMap;
@@ -163,6 +167,128 @@ impl EvaluateOutcome {
     }
 }
 
+/// The capability-generic outcome of a single request/response exchange. Every
+/// typed capability method ([`ExtensionClient::evaluate`], [`decode`](ExtensionClient::decode),
+/// [`mutate`](ExtensionClient::mutate), …) is a thin mapping over this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallOutcome {
+    /// The call succeeded; `value` is the capability-specific output payload
+    /// (`None` for capabilities that return no structured value, e.g. an oracle
+    /// `ok`).
+    Ok {
+        /// The response `value` payload, if any.
+        value: Option<serde_json::Value>,
+    },
+    /// The extension rejected the input for this capability (e.g. undecodable).
+    Reject {
+        /// The reason the extension gave, if any.
+        detail: Option<String>,
+    },
+    /// A semantic finding (only `oracle.evaluate` produces this).
+    Finding(Box<FindingResult>),
+    /// The capability is not supported for this input/mode (bounded).
+    Unsupported {
+        /// The detail the extension supplied, if any.
+        detail: Option<String>,
+    },
+    /// A bounded extension-side failure (never a target finding).
+    Infrastructure(InfraFailure),
+}
+
+/// The outcome of a `codec.decode` / `codec.encode` / `codec.repair` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodecOutcome {
+    /// `codec.decode` succeeded: the extension-defined structured value.
+    Decoded(serde_json::Value),
+    /// `codec.encode` / `codec.repair` succeeded: the raw output bytes.
+    Bytes(Vec<u8>),
+    /// The extension could not decode/repair this input; drop it.
+    Reject {
+        /// The reason, if any.
+        detail: Option<String>,
+    },
+    /// The capability is unsupported for this input (bounded).
+    Unsupported {
+        /// The detail, if any.
+        detail: Option<String>,
+    },
+    /// A bounded extension-side failure (never a target finding).
+    Infrastructure(InfraFailure),
+}
+
+/// The outcome of a `mutator.mutate` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MutateOutcome {
+    /// The extension produced a mutated input.
+    Mutated(Vec<u8>),
+    /// The extension declined to mutate this input; keep the original.
+    Reject {
+        /// The reason, if any.
+        detail: Option<String>,
+    },
+    /// Mutation is unsupported for this input (bounded).
+    Unsupported {
+        /// The detail, if any.
+        detail: Option<String>,
+    },
+    /// A bounded extension-side failure (never a target finding).
+    Infrastructure(InfraFailure),
+}
+
+/// One message yielded by `scenario.next`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScenarioMessage {
+    /// The raw bytes to send to the target.
+    pub bytes: Vec<u8>,
+    /// An optional diagnostic label (e.g. `OPEN`, `WRITE`).
+    pub label: Option<String>,
+}
+
+/// The outcome of a `scenario.next` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScenarioStep {
+    /// The next message to send.
+    Message(ScenarioMessage),
+    /// The session has no further messages.
+    Done,
+    /// The extension rejected this step (bounded).
+    Reject {
+        /// The reason, if any.
+        detail: Option<String>,
+    },
+    /// `scenario.next` is unsupported (bounded).
+    Unsupported {
+        /// The detail, if any.
+        detail: Option<String>,
+    },
+    /// A bounded extension-side failure (never a target finding).
+    Infrastructure(InfraFailure),
+}
+
+/// The outcome of a `scenario.observe-response` or `lifecycle.*` acknowledgement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AckOutcome {
+    /// The extension acknowledged the call.
+    Ok,
+    /// The call is unsupported (bounded).
+    Unsupported {
+        /// The detail, if any.
+        detail: Option<String>,
+    },
+    /// A bounded extension-side failure (never a target finding).
+    Infrastructure(InfraFailure),
+}
+
+impl AckOutcome {
+    /// Whether this is a bounded, non-success result.
+    pub fn is_infrastructure(&self) -> bool {
+        matches!(
+            self,
+            AckOutcome::Infrastructure(_) | AckOutcome::Unsupported { .. }
+        )
+    }
+}
+
 /// A live child + its frame reader thread.
 struct Session {
     child: Child,
@@ -264,6 +390,19 @@ impl ExtensionClient {
     /// Spawn and handshake from a loaded, validated trust manifest. The manifest
     /// path is hashed into provenance as the config hash.
     pub fn from_manifest(manifest: &ExtensionManifest, manifest_path: &Path) -> Result<Self> {
+        Self::from_manifest_with_optional(manifest, manifest_path, &[])
+    }
+
+    /// Like [`from_manifest`](Self::from_manifest), but additionally requests
+    /// `extra_optional` capabilities. The manifest's `required_capabilities`
+    /// remain the hard gate; these are merely offered so a capability the
+    /// extension provides is negotiated even if the manifest did not list it. A
+    /// session-driving caller passes the session capability set here.
+    pub fn from_manifest_with_optional(
+        manifest: &ExtensionManifest,
+        manifest_path: &Path,
+        extra_optional: &[&str],
+    ) -> Result<Self> {
         let manifest_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
         let program = manifest.resolve_executable(manifest_dir)?;
         let limits = Limits::from_wire(manifest.wire_limits(), manifest.max_outstanding());
@@ -271,13 +410,22 @@ impl ExtensionClient {
             address_space_bytes: manifest.limits.as_ref().and_then(|l| l.address_space_bytes),
             cpu_seconds: manifest.limits.as_ref().and_then(|l| l.cpu_seconds),
         };
+        let mut optional_capabilities = manifest.optional_capabilities.clone();
+        for cap in extra_optional {
+            let cap = cap.to_string();
+            if !manifest.required_capabilities.contains(&cap)
+                && !optional_capabilities.contains(&cap)
+            {
+                optional_capabilities.push(cap);
+            }
+        }
         let spec = SpawnSpec {
             program,
             args: manifest.args.clone(),
             env: manifest.env.clone(),
             env_passthrough: manifest.env_passthrough.clone(),
             required_capabilities: manifest.required_capabilities.clone(),
-            optional_capabilities: manifest.optional_capabilities.clone(),
+            optional_capabilities,
             limits,
             restart: manifest.restart_policy(),
             resource_limits,
@@ -303,14 +451,202 @@ impl ExtensionClient {
         self.last_digest.as_deref()
     }
 
+    /// Whether a capability was negotiated with the extension.
+    pub fn supports(&self, capability: &str) -> bool {
+        self.negotiated.caps.iter().any(|c| c == capability)
+    }
+
     /// Evaluate one test input against the extension oracle, restarting a
     /// crashed/timed-out child within the restart budget.
     pub fn evaluate(&mut self, case: &CaseId, input: &[u8]) -> Result<EvaluateOutcome> {
+        let payload = EvaluatePayload::from_input(input).to_value();
+        Ok(evaluate_outcome_from(self.call(
+            capability::ORACLE_EVALUATE,
+            case,
+            payload,
+        )?))
+    }
+
+    /// `codec.decode`: turn a raw frame into the extension's structured value.
+    pub fn decode(&mut self, case: &CaseId, raw: &[u8]) -> Result<CodecOutcome> {
+        let out = self.call(
+            capability::CODEC_DECODE,
+            case,
+            DecodePayload::from_input(raw).to_value(),
+        )?;
+        Ok(match out {
+            CallOutcome::Ok { value } => match require_value(value, "codec.decode")
+                .and_then(|v| crate::codec::DecodedValue::from_value(&v))
+            {
+                Ok(decoded) => CodecOutcome::Decoded(decoded.decoded),
+                Err(err) => CodecOutcome::Infrastructure(InfraFailure::Protocol {
+                    detail: err.to_string(),
+                }),
+            },
+            other => codec_fault(other, "codec.decode"),
+        })
+    }
+
+    /// `codec.encode`: turn a structured value back into raw bytes.
+    pub fn encode(&mut self, case: &CaseId, decoded: serde_json::Value) -> Result<CodecOutcome> {
+        let out = self.call(
+            capability::CODEC_ENCODE,
+            case,
+            EncodePayload::new(decoded).to_value(),
+        )?;
+        Ok(self.codec_bytes_outcome(out, "codec.encode"))
+    }
+
+    /// `codec.repair`: recompute a (mutated) frame's computed fields.
+    pub fn repair(&mut self, case: &CaseId, raw: &[u8]) -> Result<CodecOutcome> {
+        let out = self.call(
+            capability::CODEC_REPAIR,
+            case,
+            RepairPayload::from_input(raw).to_value(),
+        )?;
+        Ok(self.codec_bytes_outcome(out, "codec.repair"))
+    }
+
+    /// `mutator.mutate`: ask the extension for a structure-aware mutation.
+    pub fn mutate(&mut self, case: &CaseId, raw: &[u8], seed: u64) -> Result<MutateOutcome> {
+        let out = self.call(
+            capability::MUTATOR_MUTATE,
+            case,
+            MutatePayload::from_input(raw, seed).to_value(),
+        )?;
+        Ok(match out {
+            CallOutcome::Ok { value } => {
+                match require_value(value, "mutator.mutate")
+                    .and_then(|v| codec::output_bytes_from_value(&v))
+                {
+                    Ok(bytes) => MutateOutcome::Mutated(bytes),
+                    Err(err) => MutateOutcome::Infrastructure(InfraFailure::Protocol {
+                        detail: err.to_string(),
+                    }),
+                }
+            }
+            CallOutcome::Reject { detail } => MutateOutcome::Reject { detail },
+            CallOutcome::Unsupported { detail } => MutateOutcome::Unsupported { detail },
+            CallOutcome::Infrastructure(f) => MutateOutcome::Infrastructure(f),
+            CallOutcome::Finding(_) => MutateOutcome::Infrastructure(InfraFailure::Protocol {
+                detail: "mutator.mutate returned a finding".to_string(),
+            }),
+        })
+    }
+
+    /// `scenario.next`: get the next message in a multi-message session.
+    pub fn scenario_next(&mut self, case: &CaseId, step: u32) -> Result<ScenarioStep> {
+        self.scenario_next_payload(case, ScenarioNextPayload::new(step))
+    }
+
+    /// `scenario.next` carrying the session seed (first step), so the testcase
+    /// drives the session content.
+    pub fn scenario_next_seeded(
+        &mut self,
+        case: &CaseId,
+        step: u32,
+        seed: &[u8],
+    ) -> Result<ScenarioStep> {
+        self.scenario_next_payload(case, ScenarioNextPayload::with_seed(step, seed))
+    }
+
+    fn scenario_next_payload(
+        &mut self,
+        case: &CaseId,
+        payload: ScenarioNextPayload,
+    ) -> Result<ScenarioStep> {
+        let out = self.call(capability::SCENARIO_NEXT, case, payload.to_value())?;
+        Ok(match out {
+            CallOutcome::Ok { value } => {
+                match require_value(value, "scenario.next").and_then(|v| parse_next_value(&v)) {
+                    Ok(step) => step,
+                    Err(err) => ScenarioStep::Infrastructure(InfraFailure::Protocol {
+                        detail: err.to_string(),
+                    }),
+                }
+            }
+            CallOutcome::Reject { detail } => ScenarioStep::Reject { detail },
+            CallOutcome::Unsupported { detail } => ScenarioStep::Unsupported { detail },
+            CallOutcome::Infrastructure(f) => ScenarioStep::Infrastructure(f),
+            CallOutcome::Finding(_) => ScenarioStep::Infrastructure(InfraFailure::Protocol {
+                detail: "scenario.next returned a finding".to_string(),
+            }),
+        })
+    }
+
+    /// `scenario.observe-response`: feed the target's response bytes back so the
+    /// extension can bind a response-derived value into a later message.
+    pub fn scenario_observe_response(
+        &mut self,
+        case: &CaseId,
+        step: u32,
+        response: &[u8],
+    ) -> Result<AckOutcome> {
+        let out = self.call(
+            capability::SCENARIO_OBSERVE_RESPONSE,
+            case,
+            ObserveResponsePayload::new(step, response).to_value(),
+        )?;
+        Ok(ack_from(out, "scenario.observe-response"))
+    }
+
+    /// `lifecycle.setup`: set the session up before the first case.
+    pub fn lifecycle_setup(&mut self, case: &CaseId, root: Option<&Path>) -> Result<AckOutcome> {
+        let out = self.call(capability::LIFECYCLE_SETUP, case, lifecycle_payload(root))?;
+        Ok(ack_from(out, "lifecycle.setup"))
+    }
+
+    /// `lifecycle.reset`: reset state with a fresh root between cases.
+    pub fn lifecycle_reset(&mut self, case: &CaseId, root: &Path) -> Result<AckOutcome> {
+        let out = self.call(
+            capability::LIFECYCLE_RESET,
+            case,
+            LifecyclePayload::with_root(root).to_value(),
+        )?;
+        Ok(ack_from(out, "lifecycle.reset"))
+    }
+
+    /// `lifecycle.teardown`: tear the session down at the end.
+    pub fn lifecycle_teardown(&mut self, case: &CaseId) -> Result<AckOutcome> {
+        let out = self.call(
+            capability::LIFECYCLE_TEARDOWN,
+            case,
+            LifecyclePayload::empty().to_value(),
+        )?;
+        Ok(ack_from(out, "lifecycle.teardown"))
+    }
+
+    /// Map an `ok`/bytes-bearing codec response into a [`CodecOutcome::Bytes`].
+    fn codec_bytes_outcome(&self, out: CallOutcome, capability: &str) -> CodecOutcome {
+        match out {
+            CallOutcome::Ok { value } => {
+                match require_value(value, capability)
+                    .and_then(|v| codec::output_bytes_from_value(&v))
+                {
+                    Ok(bytes) => CodecOutcome::Bytes(bytes),
+                    Err(err) => CodecOutcome::Infrastructure(InfraFailure::Protocol {
+                        detail: err.to_string(),
+                    }),
+                }
+            }
+            other => codec_fault(other, capability),
+        }
+    }
+
+    /// Drive one capability request/response exchange, restarting a
+    /// crashed/timed-out child within the restart budget. The capability-generic
+    /// core shared by every typed method.
+    pub fn call(
+        &mut self,
+        capability: &str,
+        case: &CaseId,
+        payload: serde_json::Value,
+    ) -> Result<CallOutcome> {
         let request = Request {
             protocol: self.negotiated.protocol.clone(),
-            capability: capability::ORACLE_EVALUATE.to_string(),
+            capability: capability.to_string(),
             case: case.clone(),
-            payload: EvaluatePayload::from_input(input).to_value(),
+            payload,
         };
 
         loop {
@@ -319,16 +655,16 @@ impl ExtensionClient {
                     self.restart_child()?;
                 } else {
                     // No live session and no restart budget: terminal.
-                    return Ok(EvaluateOutcome::Infrastructure(InfraFailure::Crashed {
+                    return Ok(CallOutcome::Infrastructure(InfraFailure::Crashed {
                         status: None,
                         signal: None,
                     }));
                 }
             }
 
-            let outcome = self.try_evaluate_once(&request)?;
+            let outcome = self.try_call_once(&request)?;
             match &outcome {
-                EvaluateOutcome::Infrastructure(failure) if is_transport_fault(failure) => {
+                CallOutcome::Infrastructure(failure) if is_transport_fault(failure) => {
                     self.teardown_session();
                     if self.restart.should_restart() {
                         // Loop around; the top will record the restart + respawn
@@ -349,25 +685,25 @@ impl ExtensionClient {
         self.teardown_session();
     }
 
-    fn try_evaluate_once(&mut self, request: &Request) -> Result<EvaluateOutcome> {
+    fn try_call_once(&mut self, request: &Request) -> Result<CallOutcome> {
         self.outstanding.acquire()?;
-        let result = self.evaluate_inner(request);
+        let result = self.call_inner(request);
         self.outstanding.release();
         result
     }
 
-    fn evaluate_inner(&mut self, request: &Request) -> Result<EvaluateOutcome> {
+    fn call_inner(&mut self, request: &Request) -> Result<CallOutcome> {
         let timeout = self.limits.call_timeout;
         let session = self
             .session
             .as_mut()
-            .expect("evaluate_inner called without a live session");
+            .expect("call_inner called without a live session");
 
         let bytes = serde_json::to_vec(request)?;
         if write_frame(&mut session.stdin, &bytes).is_err() {
             // A broken pipe means the child died before/while reading.
             let infra = crash_from_child(&mut session.child);
-            return Ok(EvaluateOutcome::Infrastructure(infra));
+            return Ok(CallOutcome::Infrastructure(infra));
         }
 
         match session.recv(timeout) {
@@ -379,23 +715,24 @@ impl ExtensionClient {
             }
             Received::Closed => {
                 let infra = crash_from_child(&mut session.child);
-                Ok(EvaluateOutcome::Infrastructure(infra))
+                Ok(CallOutcome::Infrastructure(infra))
             }
             Received::Wire(ExtensionError::FrameTooLarge { declared, cap }) => {
                 let _ = session.child.kill();
-                Ok(EvaluateOutcome::Infrastructure(
-                    InfraFailure::FrameTooLarge { declared, cap },
-                ))
+                Ok(CallOutcome::Infrastructure(InfraFailure::FrameTooLarge {
+                    declared,
+                    cap,
+                }))
             }
             Received::Wire(err) => {
                 let _ = session.child.kill();
-                Ok(EvaluateOutcome::Infrastructure(InfraFailure::Protocol {
+                Ok(CallOutcome::Infrastructure(InfraFailure::Protocol {
                     detail: err.to_string(),
                 }))
             }
             Received::Timeout => {
                 let _ = session.child.kill();
-                Ok(EvaluateOutcome::Infrastructure(InfraFailure::Timeout {
+                Ok(CallOutcome::Infrastructure(InfraFailure::Timeout {
                     after: timeout,
                 }))
             }
@@ -466,12 +803,12 @@ fn classify_response(
     request: &Request,
     bytes: &[u8],
     negotiated: &Negotiated,
-) -> Result<(EvaluateOutcome, Option<String>)> {
+) -> Result<(CallOutcome, Option<String>)> {
     let response: Response = match serde_json::from_slice(bytes) {
         Ok(response) => response,
         Err(err) => {
             return Ok((
-                EvaluateOutcome::Infrastructure(InfraFailure::Protocol {
+                CallOutcome::Infrastructure(InfraFailure::Protocol {
                     detail: format!("response was not a valid envelope: {err}"),
                 }),
                 None,
@@ -481,7 +818,7 @@ fn classify_response(
 
     if response.protocol != negotiated.protocol {
         return Ok((
-            EvaluateOutcome::Infrastructure(InfraFailure::Protocol {
+            CallOutcome::Infrastructure(InfraFailure::Protocol {
                 detail: format!(
                     "response protocol {:?} does not match negotiated {:?}",
                     response.protocol, negotiated.protocol
@@ -493,7 +830,7 @@ fn classify_response(
 
     if response.case != request.case {
         return Ok((
-            EvaluateOutcome::Infrastructure(InfraFailure::CaseMismatch {
+            CallOutcome::Infrastructure(InfraFailure::CaseMismatch {
                 expected: Box::new(request.case.clone()),
                 got: Box::new(response.case.clone()),
             }),
@@ -503,21 +840,23 @@ fn classify_response(
 
     let digest = response_digest(&response);
     let outcome = match response.result {
-        ResultClass::Ok => EvaluateOutcome::Ok,
-        ResultClass::Reject => EvaluateOutcome::Reject {
+        ResultClass::Ok => CallOutcome::Ok {
+            value: response.value,
+        },
+        ResultClass::Reject => CallOutcome::Reject {
             detail: response.detail,
         },
-        ResultClass::Unsupported => EvaluateOutcome::Unsupported {
+        ResultClass::Unsupported => CallOutcome::Unsupported {
             detail: response.detail,
         },
         ResultClass::InfrastructureError => {
-            EvaluateOutcome::Infrastructure(InfraFailure::ExtensionReported {
+            CallOutcome::Infrastructure(InfraFailure::ExtensionReported {
                 detail: response.detail,
             })
         }
         ResultClass::Finding => match response.finding {
-            Some(finding) => EvaluateOutcome::Finding(Box::new(finding)),
-            None => EvaluateOutcome::Infrastructure(InfraFailure::Protocol {
+            Some(finding) => CallOutcome::Finding(Box::new(finding)),
+            None => CallOutcome::Infrastructure(InfraFailure::Protocol {
                 detail: "result was \"finding\" but no finding payload was attached".to_string(),
             }),
         },
@@ -525,15 +864,94 @@ fn classify_response(
     Ok((outcome, Some(digest)))
 }
 
-/// A stable digest of the response's *content* (result class, finding, detail),
-/// independent of the request-specific case identity.
+/// A stable digest of the response's *content* (result class, finding, value,
+/// detail), independent of the request-specific case identity.
 fn response_digest(response: &Response) -> String {
     let content = serde_json::json!({
         "result": response.result,
         "finding": response.finding,
+        "value": response.value,
         "detail": response.detail,
     });
     hash_bytes(&serde_json::to_vec(&content).unwrap_or_default())
+}
+
+/// Map the capability-generic [`CallOutcome`] onto the oracle-specific
+/// [`EvaluateOutcome`] (an oracle `ok` carries no `value`).
+fn evaluate_outcome_from(outcome: CallOutcome) -> EvaluateOutcome {
+    match outcome {
+        CallOutcome::Ok { .. } => EvaluateOutcome::Ok,
+        CallOutcome::Reject { detail } => EvaluateOutcome::Reject { detail },
+        CallOutcome::Finding(finding) => EvaluateOutcome::Finding(finding),
+        CallOutcome::Unsupported { detail } => EvaluateOutcome::Unsupported { detail },
+        CallOutcome::Infrastructure(failure) => EvaluateOutcome::Infrastructure(failure),
+    }
+}
+
+/// Require an `ok` response to carry a `value` payload, surfacing a bounded
+/// protocol error if it did not.
+fn require_value(value: Option<serde_json::Value>, capability: &str) -> Result<serde_json::Value> {
+    value.ok_or_else(|| {
+        ExtensionError::protocol(format!("{capability} ok response carried no value payload"))
+    })
+}
+
+/// Map a non-`ok` [`CallOutcome`] to a [`CodecOutcome`] fault.
+fn codec_fault(outcome: CallOutcome, capability: &str) -> CodecOutcome {
+    match outcome {
+        CallOutcome::Reject { detail } => CodecOutcome::Reject { detail },
+        CallOutcome::Unsupported { detail } => CodecOutcome::Unsupported { detail },
+        CallOutcome::Infrastructure(failure) => CodecOutcome::Infrastructure(failure),
+        CallOutcome::Finding(_) => CodecOutcome::Infrastructure(InfraFailure::Protocol {
+            detail: format!("{capability} returned a finding"),
+        }),
+        CallOutcome::Ok { .. } => CodecOutcome::Infrastructure(InfraFailure::Protocol {
+            detail: format!("{capability} ok handled elsewhere"),
+        }),
+    }
+}
+
+/// Map a [`CallOutcome`] to an [`AckOutcome`] (for observe-response / lifecycle).
+fn ack_from(outcome: CallOutcome, capability: &str) -> AckOutcome {
+    match outcome {
+        CallOutcome::Ok { .. } => AckOutcome::Ok,
+        CallOutcome::Reject { detail } => AckOutcome::Unsupported { detail },
+        CallOutcome::Unsupported { detail } => AckOutcome::Unsupported { detail },
+        CallOutcome::Infrastructure(failure) => AckOutcome::Infrastructure(failure),
+        CallOutcome::Finding(_) => AckOutcome::Infrastructure(InfraFailure::Protocol {
+            detail: format!("{capability} returned a finding"),
+        }),
+    }
+}
+
+/// Build a `lifecycle.setup` payload (optional root).
+fn lifecycle_payload(root: Option<&Path>) -> serde_json::Value {
+    match root {
+        Some(root) => LifecyclePayload::with_root(root).to_value(),
+        None => LifecyclePayload::empty().to_value(),
+    }
+}
+
+/// Parse a `scenario.next` response `value` into a [`ScenarioStep`].
+fn parse_next_value(value: &serde_json::Value) -> Result<ScenarioStep> {
+    let next: NextValue = serde_json::from_value(value.clone()).map_err(|e| {
+        ExtensionError::protocol(format!("scenario.next value was not a NextValue: {e}"))
+    })?;
+    if next.done {
+        return Ok(ScenarioStep::Done);
+    }
+    let encoded = next.message_b64.ok_or_else(|| {
+        ExtensionError::protocol("scenario.next was not done but carried no message_b64")
+    })?;
+    let bytes = crate::b64::decode(&encoded).map_err(|e| {
+        ExtensionError::protocol(format!(
+            "scenario.next message_b64 was not valid base64: {e}"
+        ))
+    })?;
+    Ok(ScenarioStep::Message(ScenarioMessage {
+        bytes,
+        label: next.label,
+    }))
 }
 
 fn spawn_session(spec: &SpawnSpec, redacted: &RedactedEnv) -> Result<Session> {

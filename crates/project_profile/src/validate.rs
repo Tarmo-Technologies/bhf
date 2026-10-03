@@ -34,6 +34,11 @@ pub fn validate(manifest: &Manifest, current_bhf: &str) -> Result<Vec<Warning>, 
         let (_launch, mut target_warnings) = lower::lower_target(target)?;
         warnings.append(&mut target_warnings);
     }
+    // Every declared `[[extension]]` is structurally checked (non-empty
+    // executable, supported wire format) without resolving or spawning it.
+    for extension in &manifest.extensions {
+        crate::validate_extension(extension)?;
+    }
     Ok(warnings)
 }
 

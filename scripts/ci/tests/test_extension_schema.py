@@ -27,6 +27,11 @@ REQUEST_FIXTURE = FIXTURES / "oracle_evaluate.request.json"
 OK_RESPONSE = FIXTURES / "oracle_ok.response.json"
 FINDING_RESPONSE = FIXTURES / "oracle_finding.response.json"
 MALFORMED_RESPONSE = FIXTURES / "malformed.response.json"
+# The codec/mutator/scenario/lifecycle capabilities carry their structured output
+# in a non-oracle `value` channel; these golden fixtures pin that wire shape too.
+CODEC_REPAIR_REQUEST = FIXTURES / "codec_repair.request.json"
+CODEC_REPAIR_RESPONSE = FIXTURES / "codec_repair.response.json"
+SCENARIO_NEXT_RESPONSE = FIXTURES / "scenario_next.response.json"
 
 
 def _validator(schema_file: Path):
@@ -54,17 +59,37 @@ class ExtensionSchemaTest(unittest.TestCase):
                             self.assertFalse(sub.get("additionalProperties", True))
                 _validator(schema_file)  # raises if the schema itself is invalid
 
-    def test_request_fixture_validates(self):
-        doc = json.loads(REQUEST_FIXTURE.read_text())
-        errors = list(_validator(REQUEST_SCHEMA).iter_errors(doc))
-        self.assertEqual([e.message for e in errors], [])
-
-    def test_ok_and_finding_responses_validate(self):
-        validator = _validator(RESPONSE_SCHEMA)
-        for fixture in (OK_RESPONSE, FINDING_RESPONSE):
+    def test_request_fixtures_validate(self):
+        validator = _validator(REQUEST_SCHEMA)
+        for fixture in (REQUEST_FIXTURE, CODEC_REPAIR_REQUEST):
             with self.subTest(fixture=fixture.name):
                 doc = json.loads(fixture.read_text())
                 self.assertEqual([e.message for e in validator.iter_errors(doc)], [])
+
+    def test_ok_and_finding_responses_validate(self):
+        validator = _validator(RESPONSE_SCHEMA)
+        for fixture in (
+            OK_RESPONSE,
+            FINDING_RESPONSE,
+            CODEC_REPAIR_RESPONSE,
+            SCENARIO_NEXT_RESPONSE,
+        ):
+            with self.subTest(fixture=fixture.name):
+                doc = json.loads(fixture.read_text())
+                self.assertEqual([e.message for e in validator.iter_errors(doc)], [])
+
+    def test_capability_value_channel_carries_structured_output(self):
+        # The non-oracle `value` channel is part of the published contract: a
+        # codec.repair ok carries repaired bytes; scenario.next carries the next
+        # message + label.
+        repair = json.loads(CODEC_REPAIR_RESPONSE.read_text())
+        self.assertIn("output_b64", repair["value"])
+        self.assertNotIn("finding", repair)
+        nxt = json.loads(SCENARIO_NEXT_RESPONSE.read_text())
+        self.assertEqual(nxt["value"]["label"], "OPEN")
+        self.assertIn("message_b64", nxt["value"])
+        # An oracle ok still carries no value channel.
+        self.assertNotIn("value", json.loads(OK_RESPONSE.read_text()))
 
     def test_finding_response_carries_rule_signature_and_evidence(self):
         doc = json.loads(FINDING_RESPONSE.read_text())

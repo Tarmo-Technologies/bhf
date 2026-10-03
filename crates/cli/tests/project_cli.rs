@@ -400,3 +400,117 @@ TOKEN = "${secret:API_TOKEN}"
     // The public literal passes through.
     assert!(stdout.contains("release"), "literal env missing: {stdout}");
 }
+
+// ── [[extension]] convergence (#57): bhf project run loads a trusted extension ──
+
+#[cfg(unix)]
+#[test]
+fn project_run_loads_declared_extension_and_emits_finding() {
+    let root = temp_dir("run-extension");
+    let project = root.join("project");
+    fs::create_dir_all(project.join("corpus/alpha")).unwrap();
+
+    // Harness (prebuilt) + the trusted extension executable, both staged into the
+    // project tree so they resolve manifest-relative (no --allow-external-paths).
+    let harness = PathBuf::from(env!("CARGO_BIN_EXE_cli_fake_harness"));
+    fs::create_dir_all(project.join("prebuilt")).unwrap();
+    fs::copy(&harness, project.join("prebuilt/harness")).unwrap();
+    make_executable(&project.join("prebuilt/harness"));
+
+    let ext = PathBuf::from(env!("CARGO_BIN_EXE_bhf_ext_mock"));
+    fs::create_dir_all(project.join("ext")).unwrap();
+    fs::copy(&ext, project.join("ext/mock")).unwrap();
+    make_executable(&project.join("ext/mock"));
+
+    // A clean-exit semantic violation the extension oracle flags (the fake harness
+    // does not crash on it).
+    fs::write(project.join("corpus/alpha/seed0"), b"../etc/passwd").unwrap();
+
+    let manifest = project.join("manifest.toml");
+    fs::write(
+        &manifest,
+        r#"
+schema = "bhf.project.v1"
+
+[project]
+id = "ext-demo"
+version = "1.0.0"
+
+[[target]]
+id = "alpha"
+engine = "builtin"
+binary = "prebuilt/harness"
+seeds = ["corpus/alpha"]
+time = "2s"
+
+[[extension]]
+id = "mock"
+executable = "ext/mock"
+args = ["--mode", "well-behaved"]
+required-capabilities = ["oracle.evaluate"]
+optional-capabilities = ["codec.repair"]
+"#,
+    )
+    .unwrap();
+
+    let work = root.join("work");
+    let out = bhf()
+        .args(["project", "run", "--target", "alpha", "--manifest"])
+        .arg(&manifest)
+        .arg("--work-dir")
+        .arg(&work)
+        .output()
+        .expect("run bhf project run with extension");
+    assert!(
+        out.status.success(),
+        "project run failed: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The project-level [[extension]] was materialized as a trusted
+    // bhf.extension-manifest.v1 in the work dir and loaded by the run.
+    let materialized = work.join("extension.toml");
+    assert!(
+        materialized.is_file(),
+        "extension manifest not materialized"
+    );
+    let mtext = fs::read_to_string(&materialized).unwrap();
+    assert!(mtext.contains("bhf.extension-manifest.v1"), "{mtext}");
+    assert!(mtext.contains("allow-external-paths = true"), "{mtext}");
+
+    // Provenance hashed the extension executable.
+    let prov: serde_json::Value =
+        serde_json::from_slice(&fs::read(work.join("results/project.json")).unwrap()).unwrap();
+    assert!(
+        prov["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["kind"] == "extension"),
+        "project.json records no extension asset: {prov}"
+    );
+
+    // The run summary carries the additive extension block (the extension was
+    // actually driven over the retained corpus).
+    let summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(work.join("fuzz_runs/alpha-latest.json")).unwrap())
+            .unwrap();
+    assert_eq!(summary["extension"]["active"], true, "{summary}");
+    assert_eq!(summary["extension"]["protocol_version"], "bhf.extension.v1");
+
+    // The loaded extension flagged the clean-exit escape as an extension finding.
+    let ext_finding = fs::read_dir(work.join("results/findings"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let f = e.path().join("finding.json");
+            f.is_file().then(|| {
+                serde_json::from_slice::<serde_json::Value>(&fs::read(f).unwrap()).unwrap()
+            })
+        })
+        .find(|f| f["confirmation"] == "extension");
+    let ext_finding = ext_finding.expect("an extension finding from the loaded extension");
+    assert_eq!(ext_finding["rule_id"], "oracle.path-escape");
+}

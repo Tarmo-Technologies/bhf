@@ -31,7 +31,7 @@ use project_profile::{
     check_bhf_version, load as load_text, lower_target, resolve, validate as validate_manifest,
     AflMode as PpAflMode, BinaryEngine as PpBinaryEngine, BinaryInput, BinaryLaunch, LoweredLaunch,
     Manifest, NativeEngine as PpNativeEngine, NativeLaunch, ProcessEnv, ResolveOptions, Resolved,
-    RunContext,
+    ResolvedExtension, RunContext,
 };
 
 use crate::binary_fuzz::{self, BinaryFuzzArgs, BinaryFuzzEngine, BinaryInputMode};
@@ -359,7 +359,7 @@ fn run_run(a: &RunArgs) -> Result<i32> {
         LoweredLaunch::Native(launch) => {
             materialize_native(launch, &target.id, &work_dir, &resolved)?;
             let seed_files = expand_seed_files(&resolved.resolved_seeds)?;
-            let fuzz_args = plan_to_fuzz_args(
+            let mut fuzz_args = plan_to_fuzz_args(
                 launch,
                 &target.id,
                 &work_dir,
@@ -367,9 +367,22 @@ fn run_run(a: &RunArgs) -> Result<i32> {
                 resolved.resolved_grammar.clone(),
                 resolved.resolved_env.clone(),
             )?;
+            // A project-level `[[extension]]` is materialized as a trusted
+            // `bhf.extension-manifest.v1` in the work dir and loaded by the run,
+            // converging the standalone manifest onto the project profile.
+            if let Some(extension) = &resolved.resolved_extension {
+                let manifest_path = materialize_extension_manifest(extension, &work_dir)?;
+                fuzz_args.extension = Some(manifest_path);
+            }
             fuzz::run(fuzz_args)
         }
         LoweredLaunch::Binary(launch) => {
+            if resolved.resolved_extension.is_some() {
+                bhfeprintln!(
+                    "warning: [[extension]] is loaded only on native-engine runs; \
+                     the binary lane ignores it"
+                );
+            }
             let seed_files = expand_seed_files(&resolved.resolved_seeds)?;
             let binary_args = plan_to_binary_fuzz_args(
                 launch,
@@ -387,6 +400,60 @@ fn run_run(a: &RunArgs) -> Result<i32> {
     stamp_provenance(&work_dir, &provenance_json, is_native)?;
 
     Ok(exit)
+}
+
+/// Materialize a resolved `[[extension]]` as a standalone
+/// `bhf.extension-manifest.v1` TOML in the work dir and return its path, so the
+/// run loads it through the same trusted-extension path as `bhf fuzz
+/// --extension`. The executable is written as its resolved absolute path with
+/// `allow-external-paths = true`, so load-time path resolution accepts it.
+fn materialize_extension_manifest(
+    extension: &ResolvedExtension,
+    work_dir: &Path,
+) -> Result<PathBuf> {
+    /// A serializable view matching the `bhf.extension-manifest.v1` schema.
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "kebab-case")]
+    struct Doc<'a> {
+        schema: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: &'a Option<String>,
+        executable: String,
+        allow_external_paths: bool,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        args: &'a Vec<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        required_capabilities: &'a Vec<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        optional_capabilities: &'a Vec<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        env_passthrough: &'a Vec<String>,
+        #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        env: &'a std::collections::BTreeMap<String, String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        format: &'a Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        limits: &'a Option<project_profile::ExtensionLimits>,
+    }
+
+    let doc = Doc {
+        schema: "bhf.extension-manifest.v1",
+        id: &extension.id,
+        executable: extension.resolved_executable.display().to_string(),
+        allow_external_paths: true,
+        args: &extension.args,
+        required_capabilities: &extension.required_capabilities,
+        optional_capabilities: &extension.optional_capabilities,
+        env_passthrough: &extension.env_passthrough,
+        env: &extension.env,
+        format: &extension.format,
+        limits: &extension.limits,
+    };
+    let text = toml::to_string(&doc).context("serialize materialized extension manifest")?;
+    let path = work_dir.join("extension.toml");
+    std::fs::write(&path, text)
+        .with_context(|| format!("write materialized extension manifest '{}'", path.display()))?;
+    Ok(path)
 }
 
 /// Run a target's trusted build command (argv form) with the manifest directory
@@ -574,9 +641,9 @@ fn plan_to_fuzz_args(
         max_session_messages: 64,
         collector: crate::collector_run::CollectorSpec::Off,
         collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
-        // A project profile cannot yet declare an extension; the `[[extension]]`
-        // convergence onto `bhf.project.v1` is a tracked follow-up (#57). Use
-        // `bhf fuzz --extension` / `bhf extension` for extension-backed oracles.
+        // A project-level `[[extension]]`, when declared, is materialized and
+        // wired in by `run_run` right after this plan is built (it is not part of
+        // the pure lowering). Default to none here.
         extension: None,
     })
 }

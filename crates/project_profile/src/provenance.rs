@@ -31,6 +31,8 @@ pub enum AssetKind {
     MergedDictionary,
     /// A structured-input grammar descriptor.
     Grammar,
+    /// An explicitly-trusted out-of-process extension executable.
+    Extension,
 }
 
 /// One asset's manifest-relative path and content hash.

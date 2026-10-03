@@ -954,16 +954,33 @@ bhf extension validate --manifest path/to/extension.toml
 # malformed/unsupported reply is a bounded infrastructure result, never a finding.
 bhf extension evaluate --manifest path/to/extension.toml --input case.bin --work bhf_work
 
+# Drive a full multi-message session: lifecycle.reset a fresh root, pull each
+# scenario.next message, optionally extension-mutate (--mutate SEED) and
+# codec.repair it before it reaches the target, bind each response into a later
+# message (scenario.observe-response), then oracle.evaluate the clean-exit outcome.
+bhf extension session --manifest path/to/extension.toml --input seed.bin --work bhf_work \
+  --mutate 42 --repair true
+
 # Drive the just-retained corpus of a fuzz campaign through the extension oracle
-# after the run (not in the hot mutation loop). An extension fault never aborts
-# the campaign nor becomes a target finding.
+# after the run (not in the hot mutation loop); when the extension provides
+# codec.repair, a recognized frame is repaired before the oracle sees it (a raw
+# corpus entry the extension rejects is evaluated verbatim). An extension fault
+# never aborts the campaign nor becomes a target finding.
 bhf fuzz bhf_work --harness H-0001 --extension path/to/extension.toml
 ```
 
-`bhf extension evaluate` exits `0` for a benign input, `1` when a semantic
-finding is emitted, `2` for a manifest/usage error, and `4` for a bounded
+`bhf extension evaluate` / `session` exit `0` for a benign input, `1` when a
+semantic finding is emitted, `2` for a manifest/usage error, and `4` for a bounded
 extension-side infrastructure failure (so a fault is never confused with a clean
 run or a finding). `--json` emits a machine-readable report.
+
+**Capabilities.** The host drives the full `bhf.extension.v1` surface —
+`oracle.evaluate`, `codec.decode`/`encode`/`repair`, `mutator.mutate`,
+`scenario.next`/`observe-response`, and `lifecycle.setup`/`reset`/`teardown`.
+Negotiation advertises them all as optional on top of the manifest's
+`required-capabilities`, so an extension that implements only a subset still
+works. See [`docs/extension-protocol.md`](../extension-protocol.md) for the wire
+shapes.
 
 **Trust boundary.** The manifest is only ever loaded through an explicit
 `--manifest` path — there is no auto-discovery, and naming the manifest is the
@@ -1006,10 +1023,29 @@ By default the `executable` may not be absolute or escape the manifest directory
 (`..`); set `allow-external-paths = true` to opt in. A `requires-bhf = ">=X.Y[.Z]"`
 bound fails closed on an older bhf.
 
-This slice ships the `oracle.evaluate` capability. The `codec.*`,
-`mutator.mutate`, `scenario.*`, and `lifecycle.*` capabilities, CBOR wire
-encoding, and a project-profile `[[extension]]` section (converging onto
-`bhf.project.v1`) are negotiated-but-deferred follow-ups.
+The full capability set is implemented: `oracle.evaluate`, `codec.decode` /
+`codec.encode` / `codec.repair`, `mutator.mutate`, `scenario.next` /
+`scenario.observe-response`, and `lifecycle.setup` / `lifecycle.reset` /
+`lifecycle.teardown`. A `bhf.project.v1` profile can declare the same extension
+inline via an `[[extension]]` section, which `bhf project run` materializes as a
+trusted `bhf.extension-manifest.v1` and loads for its native-engine campaigns.
+CBOR wire encoding remains an optional, negotiated-but-unused format (the host
+speaks JSON only).
+
+```toml
+# In a bhf.project.v1 manifest: declare a trusted extension the run loads.
+[[extension]]
+id = "path-oracle"
+executable = "./path-oracle"             # resolved relative to the manifest
+args = ["--serve"]
+required-capabilities = ["oracle.evaluate"]
+optional-capabilities = ["codec.repair", "scenario.next"]
+env-passthrough = ["ACME_MODE"]
+
+[extension.limits]
+call-timeout-ms = 5000
+max-restarts = 1
+```
 
 ## Coverage-Guided Relational Policy Fuzzing
 

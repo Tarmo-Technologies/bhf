@@ -14,13 +14,27 @@
 //! `package(extension_host)` tests.
 
 use extension_host::{
-    CaseId, EvaluateOutcome, ExtensionClient, ExtensionManifest, InfraFailure, Limits,
-    RestartPolicy, SpawnSpec,
+    CaseId, CodecOutcome, EvaluateOutcome, ExtensionClient, ExtensionManifest, InfraFailure,
+    Limits, MutateOutcome, RestartPolicy, SessionDriver, SessionOptions, SessionTarget, SpawnSpec,
 };
 use std::collections::BTreeMap;
 use std::time::Duration;
 
 const MOCK: &str = env!("CARGO_BIN_EXE_bhf_mock_extension");
+
+/// Every session capability, requested as optional so an extension that provides
+/// only a subset still negotiates cleanly.
+const SESSION_CAPS: &[&str] = &[
+    "codec.decode",
+    "codec.encode",
+    "codec.repair",
+    "mutator.mutate",
+    "scenario.next",
+    "scenario.observe-response",
+    "lifecycle.setup",
+    "lifecycle.reset",
+    "lifecycle.teardown",
+];
 
 fn case(worker: &str, testcase: &str) -> CaseId {
     CaseId::new("test-campaign", worker, testcase)
@@ -38,6 +52,99 @@ fn mock_spec(mode: &str) -> SpawnSpec {
     };
     spec.restart = RestartPolicy::never();
     spec
+}
+
+/// A spec that also requests the full session capability surface as optional.
+fn session_spec(mode: &str) -> SpawnSpec {
+    let mut spec = mock_spec(mode);
+    spec.optional_capabilities = SESSION_CAPS.iter().map(|c| c.to_string()).collect();
+    spec
+}
+
+// ---- The toy target: `[u16 BE len][payload][u32 BE CRC-32]`, OPEN/WRITE. ----
+
+fn toy_crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+fn toy_frame(payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(payload.len() + 6);
+    out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    out.extend_from_slice(payload);
+    out.extend_from_slice(&toy_crc32(payload).to_be_bytes());
+    out
+}
+
+/// Parse a frame into `(payload, crc_valid)`.
+fn toy_parse(frame: &[u8]) -> Option<(Vec<u8>, bool)> {
+    if frame.len() < 6 {
+        return None;
+    }
+    let declared = u16::from_be_bytes([frame[0], frame[1]]) as usize;
+    let payload = frame[2..frame.len() - 4].to_vec();
+    let crc = u32::from_be_bytes([
+        frame[frame.len() - 4],
+        frame[frame.len() - 3],
+        frame[frame.len() - 2],
+        frame[frame.len() - 1],
+    ]);
+    let valid = declared == payload.len() && crc == toy_crc32(&payload);
+    Some((payload, valid))
+}
+
+/// An in-process toy target: validates each frame's length+CRC, OPENs return a
+/// fixed handle, WRITEs are acked. It records every received frame so a test can
+/// assert what actually reached the target (binding, CRC validity after repair).
+#[derive(Default)]
+struct ToyTarget {
+    handle: &'static str,
+    received: Vec<ReceivedFrame>,
+}
+
+struct ReceivedFrame {
+    label: Option<String>,
+    crc_valid: bool,
+}
+
+impl ToyTarget {
+    fn new() -> Self {
+        Self {
+            handle: "7",
+            received: Vec::new(),
+        }
+    }
+}
+
+impl SessionTarget for ToyTarget {
+    fn exchange(
+        &mut self,
+        _step: u32,
+        label: Option<&str>,
+        message: &[u8],
+    ) -> std::io::Result<Vec<u8>> {
+        let (payload, crc_valid) = toy_parse(message).unwrap_or((Vec::new(), false));
+        self.received.push(ReceivedFrame {
+            label: label.map(str::to_string),
+            crc_valid,
+        });
+        if !crc_valid {
+            return Ok(toy_frame(b"ERR badframe"));
+        }
+        let text = String::from_utf8_lossy(&payload);
+        if text.starts_with("OPEN ") {
+            Ok(toy_frame(format!("OPENOK {}", self.handle).as_bytes()))
+        } else {
+            Ok(toy_frame(b"WRITEOK"))
+        }
+    }
 }
 
 #[test]
@@ -374,4 +481,233 @@ fn live_python_reference_extension_interops() {
         .provenance()
         .env_allowlist
         .contains(&"PATH".to_string()));
+}
+
+// ── codec / mutator / scenario / lifecycle capabilities ─────────────────────
+
+#[test]
+fn session_capabilities_are_negotiated_when_requested() {
+    // The host advertises the session caps as optional; the mock provides them,
+    // so negotiation picks them up (a subset-declaring extension would simply
+    // negotiate fewer — see `negotiation_rejects_missing_required_capability`).
+    let client = ExtensionClient::spawn(session_spec("well-behaved")).expect("spawn");
+    for cap in SESSION_CAPS {
+        assert!(client.supports(cap), "expected {cap} to be negotiated");
+    }
+    assert!(client.supports("oracle.evaluate"));
+}
+
+#[test]
+fn codec_decode_encode_and_repair_roundtrip() {
+    use serde_json::json;
+    let mut client = ExtensionClient::spawn(session_spec("well-behaved")).expect("spawn");
+    let c = case("worker-0", "tc-codec");
+
+    // decode a well-formed OPEN frame into its structured view.
+    let frame = toy_frame(b"OPEN logs/run.txt");
+    match client.decode(&c, &frame).expect("decode") {
+        CodecOutcome::Decoded(value) => {
+            assert_eq!(value["op"], "OPEN");
+            assert_eq!(value["path"], "logs/run.txt");
+            assert_eq!(value["crc_valid"], true);
+        }
+        other => panic!("expected Decoded, got {other:?}"),
+    }
+
+    // encode the structured value back to the identical frame bytes.
+    let decoded = json!({ "op": "OPEN", "path": "logs/run.txt" });
+    match client.encode(&c, decoded).expect("encode") {
+        CodecOutcome::Bytes(bytes) => assert_eq!(bytes, frame, "encode is the inverse of decode"),
+        other => panic!("expected Bytes, got {other:?}"),
+    }
+
+    // a frame with a clobbered CRC is repaired back to a valid frame.
+    let mut corrupt = frame.clone();
+    *corrupt.last_mut().unwrap() ^= 0xff;
+    assert!(!toy_parse(&corrupt).unwrap().1, "corrupt frame is invalid");
+    match client.repair(&c, &corrupt).expect("repair") {
+        CodecOutcome::Bytes(bytes) => {
+            assert!(toy_parse(&bytes).unwrap().1, "repaired frame is valid");
+            assert_eq!(bytes, frame, "repair restores the computed fields");
+        }
+        other => panic!("expected Bytes, got {other:?}"),
+    }
+}
+
+#[test]
+fn mutator_is_deterministic_and_needs_repair() {
+    let mut client = ExtensionClient::spawn(session_spec("well-behaved")).expect("spawn");
+    let c = case("worker-0", "tc-mut");
+    let frame = toy_frame(b"WRITE 7 data");
+
+    let first = match client.mutate(&c, &frame, 42).expect("mutate") {
+        MutateOutcome::Mutated(bytes) => bytes,
+        other => panic!("expected Mutated, got {other:?}"),
+    };
+    let second = match client.mutate(&c, &frame, 42).expect("mutate again") {
+        MutateOutcome::Mutated(bytes) => bytes,
+        other => panic!("expected Mutated, got {other:?}"),
+    };
+    assert_eq!(first, second, "same (input, seed) is reproducible");
+    assert_ne!(first, frame, "mutation changed the input");
+    // The structure-aware mutation leaves computed fields stale; repair fixes them.
+    assert!(!toy_parse(&first).unwrap().1, "mutated frame is malformed");
+    match client.repair(&c, &first).expect("repair") {
+        CodecOutcome::Bytes(bytes) => assert!(toy_parse(&bytes).unwrap().1),
+        other => panic!("expected Bytes, got {other:?}"),
+    }
+}
+
+#[test]
+fn session_binds_open_handle_into_write_and_oracle_flags_escape() {
+    let mut client = ExtensionClient::spawn(session_spec("well-behaved")).expect("spawn");
+    let mut target = ToyTarget::new();
+    let driver = SessionDriver::new(SessionOptions::default());
+    let root = tempfile::tempdir().expect("root");
+
+    let outcome = driver
+        .run(
+            &mut client,
+            &mut target,
+            &case("worker-0", "tc-escape"),
+            root.path(),
+            b"../etc/passwd",
+        )
+        .expect("session");
+
+    // The clean-exit semantic violation is a finding.
+    assert!(outcome.infrastructure.is_none(), "no fault: {outcome:?}");
+    let finding = outcome.finding.expect("escape is a finding");
+    assert_eq!(finding.rule, "oracle.path-escape");
+
+    // Two scenario steps (OPEN then WRITE), both reaching the target well-formed.
+    assert_eq!(outcome.steps.len(), 2);
+    assert_eq!(outcome.steps[0].label.as_deref(), Some("OPEN"));
+    let write = &outcome.steps[1];
+    assert_eq!(write.label.as_deref(), Some("WRITE"));
+    let (payload, valid) = toy_parse(&write.sent).expect("write parses");
+    assert!(valid, "WRITE frame is well-formed");
+    let text = String::from_utf8_lossy(&payload);
+    assert!(
+        text.starts_with("WRITE 7 "),
+        "WRITE binds the handle 7 from the OPEN response: {text:?}"
+    );
+    assert!(
+        target.received.iter().all(|r| r.crc_valid),
+        "every frame reached the target well-formed"
+    );
+    assert_eq!(target.received[0].label.as_deref(), Some("OPEN"));
+}
+
+#[test]
+fn session_repairs_mutated_frame_before_it_reaches_the_target() {
+    // Control: mutate WITHOUT repair — the target sees a malformed frame.
+    let mut client = ExtensionClient::spawn(session_spec("well-behaved")).expect("spawn");
+    let mut target = ToyTarget::new();
+    let driver = SessionDriver::new(SessionOptions {
+        mutate_seed: Some(0x99),
+        repair: false,
+        max_steps: 8,
+    });
+    let root = tempfile::tempdir().expect("root");
+    let outcome = driver
+        .run(
+            &mut client,
+            &mut target,
+            &case("worker-0", "tc-norepair"),
+            root.path(),
+            b"safe/path",
+        )
+        .expect("session");
+    assert!(outcome.any_mutated(), "the mutator ran");
+    assert!(!outcome.any_repaired(), "repair was disabled");
+    assert!(
+        target.received.iter().any(|r| !r.crc_valid),
+        "an unrepaired mutation corrupts the frame at the target"
+    );
+
+    // With repair, the mutated frame is repaired before it reaches the target.
+    let mut client2 = ExtensionClient::spawn(session_spec("well-behaved")).expect("spawn");
+    let mut target2 = ToyTarget::new();
+    let driver2 = SessionDriver::new(SessionOptions {
+        mutate_seed: Some(0x99),
+        repair: true,
+        max_steps: 8,
+    });
+    let root2 = tempfile::tempdir().expect("root");
+    let outcome2 = driver2
+        .run(
+            &mut client2,
+            &mut target2,
+            &case("worker-0", "tc-repair"),
+            root2.path(),
+            b"safe/path",
+        )
+        .expect("session");
+    assert!(outcome2.any_mutated() && outcome2.any_repaired());
+    assert!(
+        target2.received.iter().all(|r| r.crc_valid),
+        "repair makes the mutated frame well-formed at the target"
+    );
+    assert!(outcome2.finding.is_none(), "a safe path is not a finding");
+}
+
+#[test]
+fn live_python_reference_full_session() {
+    let python = match which::which("python3") {
+        Ok(path) => path,
+        Err(_) => {
+            eprintln!("skipping live_python_reference_full_session: python3 not found");
+            return;
+        }
+    };
+    let script = format!(
+        "{}/tests/fixtures/reference_extension.py",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let mut spec = SpawnSpec::new(python);
+    spec.args = vec![script];
+    spec.env_passthrough = vec!["PATH".to_string()];
+    spec.optional_capabilities = SESSION_CAPS.iter().map(|c| c.to_string()).collect();
+    spec.limits.call_timeout = Duration::from_secs(10);
+    spec.restart = RestartPolicy::never();
+
+    let mut client = ExtensionClient::spawn(spec).expect("spawn python reference");
+    assert!(client.supports("scenario.next"));
+    assert!(client.supports("codec.repair"));
+
+    let mut target = ToyTarget::new();
+    let driver = SessionDriver::new(SessionOptions {
+        mutate_seed: Some(7),
+        repair: true,
+        max_steps: 8,
+    });
+    let root = tempfile::tempdir().expect("root");
+    let outcome = driver
+        .run(
+            &mut client,
+            &mut target,
+            &case("worker-0", "tc-escape"),
+            root.path(),
+            b"../../etc/shadow",
+        )
+        .expect("python session");
+
+    // The out-of-tree Python extension drives the full session: a mutated frame
+    // is repaired before reaching the target, the OPEN handle is bound into the
+    // WRITE, and the clean-exit escape is a finding — all with no bhf internals.
+    let finding = outcome
+        .finding
+        .as_ref()
+        .expect("python oracle flags the escape");
+    assert_eq!(finding.rule, "oracle.path-escape");
+    assert!(outcome.any_mutated() && outcome.any_repaired());
+    assert!(target.received.iter().all(|r| r.crc_valid));
+    let write = outcome
+        .steps
+        .iter()
+        .find(|s| s.label.as_deref() == Some("WRITE"))
+        .expect("a WRITE step");
+    let (payload, _) = toy_parse(&write.sent).unwrap();
+    assert!(String::from_utf8_lossy(&payload).starts_with("WRITE 7 "));
 }

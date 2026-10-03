@@ -2759,6 +2759,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/extension_host/src/codec.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/extension_host/src/envelope.rs",
       "license": "Apache-2.0"
     },
@@ -2771,11 +2775,19 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/extension_host/src/lifecycle.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/extension_host/src/limits.rs",
       "license": "Apache-2.0"
     },
     {
       "path": "crates/extension_host/src/manifest.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/extension_host/src/mutator.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2788,6 +2800,14 @@
     },
     {
       "path": "crates/extension_host/src/restart.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/extension_host/src/scenario.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/extension_host/src/session.rs",
       "license": "Apache-2.0"
     },
     {

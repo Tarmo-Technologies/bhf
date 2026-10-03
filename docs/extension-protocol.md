@@ -146,12 +146,41 @@ exposes.
 
 ## Capability surface
 
-This slice ships the **`oracle.evaluate`** capability. The following are
-negotiated-but-deferred to named follow-ups:
+The host drives the full `bhf.extension.v1` capability set. Capability
+negotiation advertises every capability as optional on top of the manifest's
+`required-capabilities`, so an extension that implements only a subset still
+negotiates cleanly — the host drives exactly what both sides agreed on.
 
-- `codec.decode` / `codec.encode` / `codec.repair` and `mutator.mutate`
-  (structured-input decode/repair/mutation),
-- `scenario.next` / `scenario.observe-response` (response-derived session values),
-- `lifecycle.setup` / `lifecycle.reset` / `lifecycle.teardown` (case orchestration),
-- CBOR wire encoding (the handshake already negotiates `format`), and
-- a project-profile `[[extension]]` section converging onto `bhf.project.v1`.
+| Capability | Request payload | `ok` response `value` |
+|---|---|---|
+| `oracle.evaluate` | `{ "input_b64": … }` | *(none; result travels in `finding`)* |
+| `codec.decode` | `{ "input_b64": … }` | `{ "decoded": <structured> }` |
+| `codec.encode` | `{ "decoded": <structured> }` | `{ "output_b64": … }` |
+| `codec.repair` | `{ "input_b64": … }` | `{ "output_b64": … }` |
+| `mutator.mutate` | `{ "input_b64": …, "seed": <u64> }` | `{ "output_b64": … }` |
+| `scenario.next` | `{ "step": <u32>, "seed_b64"? : … }` | `{ "message_b64": …, "label"? : … }` or `{ "done": true }` |
+| `scenario.observe-response` | `{ "step": <u32>, "response_b64": … }` | *(ack)* |
+| `lifecycle.setup` / `lifecycle.reset` | `{ "root"? : "<path>" }` | *(ack)* |
+| `lifecycle.teardown` | `{}` | *(ack)* |
+
+- **`codec.*`** let a private codec decode a raw frame to a structured value,
+  encode it back, and **repair** computed fields (length prefixes, checksums)
+  after a mutation — so a mutation-corrupted frame reaches the target well-formed.
+  A frame the extension does not recognize is `reject`ed and left untouched, so
+  the host stays codec-agnostic over arbitrary corpora.
+- **`mutator.mutate`** supplies a structure-aware mutation of a decoded input; the
+  `seed` makes it reproducible for replay.
+- **`scenario.*`** drive a multi-message session: `scenario.next` yields the next
+  message, the target's response bytes are fed back via
+  `scenario.observe-response`, and the extension binds a response-derived value (a
+  handle, a nonce) into a later message. `bhf extension session` composes this
+  with `codec.repair`, `mutator.mutate`, and `oracle.evaluate` over a target seam;
+  the host owns the transport (the stateful-session TCP transport or an in-process
+  target), never the target's wire protocol.
+- **`lifecycle.*`** orchestrate per-case state: `setup` before the first case,
+  `reset` with a fresh temp root between cases, `teardown` at the end.
+
+CBOR wire encoding remains optional (the handshake already negotiates `format`);
+the host speaks JSON only. The same capabilities are also reachable from a
+`bhf.project.v1` profile's `[[extension]]` section, which `bhf project run`
+materializes as a trusted manifest and loads.

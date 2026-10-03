@@ -67,6 +67,13 @@ pub struct Response {
     /// The finding payload, present iff `result == finding`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finding: Option<FindingResult>,
+    /// The capability-specific output payload, present on an `ok` response from a
+    /// non-oracle capability (`codec.*`, `mutator.mutate`, `scenario.*`,
+    /// `lifecycle.*`). Opaque to the envelope layer — each capability module parses
+    /// its own shape. `oracle.evaluate` leaves it unset (its result travels in
+    /// `finding`), so existing oracle responses are byte-for-byte unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<serde_json::Value>,
     /// An optional human-readable detail (reason for a reject/unsupported/error).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
@@ -215,6 +222,34 @@ mod tests {
             finding.min_predicate.as_deref(),
             Some("path-contains-dotdot")
         );
+    }
+
+    #[test]
+    fn capability_value_channel_roundtrips_and_is_absent_on_oracle_responses() {
+        // A non-oracle capability carries its structured output in `value`.
+        let raw = json!({
+            "protocol": crate::PROTOCOL,
+            "case": { "campaign": "c", "worker": "w", "testcase": "t" },
+            "result": "ok",
+            "value": { "output_b64": "Zm9v", "label": "WRITE" }
+        });
+        let resp: Response = serde_json::from_value(raw.clone()).expect("parse value response");
+        assert_eq!(resp.result, ResultClass::Ok);
+        assert_eq!(resp.value.as_ref().unwrap()["output_b64"], json!("Zm9v"));
+        // Re-serializing yields the same JSON (the field round-trips).
+        assert_eq!(serde_json::to_value(&resp).unwrap(), raw);
+
+        // An oracle `ok` response has neither `finding` nor `value`, so its bytes
+        // are unchanged by the new field.
+        let oracle = json!({
+            "protocol": crate::PROTOCOL,
+            "case": { "campaign": "c", "worker": "w", "testcase": "t" },
+            "result": "ok"
+        });
+        let resp: Response = serde_json::from_value(oracle.clone()).expect("parse oracle ok");
+        assert!(resp.value.is_none());
+        assert!(resp.finding.is_none());
+        assert_eq!(serde_json::to_value(&resp).unwrap(), oracle);
     }
 
     #[test]

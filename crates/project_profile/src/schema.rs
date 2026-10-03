@@ -36,6 +36,72 @@ pub struct Manifest {
     /// The declared targets. TOML array-of-tables key is `target`.
     #[serde(default, rename = "target")]
     pub targets: Vec<Target>,
+    /// Explicitly-trusted out-of-process extensions (`bhf.extension.v1`). TOML
+    /// array-of-tables key is `extension`. A project-level `[[extension]]`
+    /// declares an extension `bhf project run` loads for its native-engine
+    /// campaigns — the convergence of the standalone `bhf.extension-manifest.v1`
+    /// onto the project profile.
+    #[serde(default, rename = "extension")]
+    pub extensions: Vec<Extension>,
+}
+
+/// A `[[extension]]` entry: an explicitly-trusted extension executable and the
+/// capabilities/limits it runs under. The field set mirrors the standalone
+/// `bhf.extension-manifest.v1` so the two trust surfaces converge.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Extension {
+    /// An optional operator-facing identifier.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// The extension executable, resolved relative to the manifest directory.
+    pub executable: PathBuf,
+    /// Fixed arguments passed to the executable.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Capabilities that MUST be negotiated or the campaign aborts.
+    #[serde(default)]
+    pub required_capabilities: Vec<String>,
+    /// Capabilities used opportunistically if provided.
+    #[serde(default)]
+    pub optional_capabilities: Vec<String>,
+    /// Explicit environment variables to set on the child.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Names of host environment variables to forward to the child.
+    #[serde(default)]
+    pub env_passthrough: Vec<String>,
+    /// The preferred wire format (only `json` is supported today).
+    #[serde(default)]
+    pub format: Option<String>,
+    /// Optional resource/limit overrides.
+    #[serde(default)]
+    pub limits: Option<ExtensionLimits>,
+}
+
+/// Optional `[extension.limits]` overrides, mirroring the standalone manifest's
+/// `[limits]`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct ExtensionLimits {
+    /// Maximum framed message size, in bytes.
+    #[serde(default)]
+    pub max_frame_bytes: Option<u64>,
+    /// Per-call deadline, in milliseconds.
+    #[serde(default)]
+    pub call_timeout_ms: Option<u64>,
+    /// Maximum concurrently outstanding requests.
+    #[serde(default)]
+    pub max_outstanding: Option<u64>,
+    /// Child `RLIMIT_AS`, in bytes (unix only).
+    #[serde(default)]
+    pub address_space_bytes: Option<u64>,
+    /// Child `RLIMIT_CPU`, in seconds (unix only).
+    #[serde(default)]
+    pub cpu_seconds: Option<u64>,
+    /// Maximum restarts before a fault is terminal.
+    #[serde(default)]
+    pub max_restarts: Option<u32>,
 }
 
 /// Project identity and bhf-version compatibility.

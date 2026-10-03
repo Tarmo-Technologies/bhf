@@ -50,7 +50,7 @@ pub use lower::{
 };
 pub use paths::{resolve_asset, ResolveOptions};
 pub use provenance::{AssetHash, AssetKind, Provenance};
-pub use schema::{Manifest, Project, Target, SCHEMA_V1};
+pub use schema::{Extension, ExtensionLimits, Manifest, Project, Target, SCHEMA_V1};
 pub use validate::{check_bhf_version, validate};
 pub use version_req::satisfied_by;
 pub use warning::{Warning, WarningKind};
@@ -95,8 +95,36 @@ pub struct Resolved {
     pub resolved_env: Vec<(String, String)>,
     /// The redacted provenance record.
     pub provenance: Provenance,
+    /// The project-level trusted extension to load for this run, if the manifest
+    /// declares one (`[[extension]]`). Native-engine runs load it via
+    /// `bhf.extension.v1`; the executable is resolved + hashed into provenance.
+    pub resolved_extension: Option<ResolvedExtension>,
     /// Fidelity / compatibility warnings collected during lowering + resolution.
     pub warnings: Vec<Warning>,
+}
+
+/// A resolved `[[extension]]`: the absolute executable path plus the fields the
+/// CLI needs to materialize a `bhf.extension-manifest.v1` and load it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedExtension {
+    /// An optional operator-facing identifier.
+    pub id: Option<String>,
+    /// The resolved, absolute extension executable path.
+    pub resolved_executable: PathBuf,
+    /// Fixed arguments passed to the executable.
+    pub args: Vec<String>,
+    /// Capabilities that MUST be negotiated.
+    pub required_capabilities: Vec<String>,
+    /// Capabilities used opportunistically.
+    pub optional_capabilities: Vec<String>,
+    /// Explicit environment to set on the child.
+    pub env: BTreeMap<String, String>,
+    /// Host environment variable names to forward.
+    pub env_passthrough: Vec<String>,
+    /// The preferred wire format, if declared.
+    pub format: Option<String>,
+    /// Resource/limit overrides, if declared.
+    pub limits: Option<ExtensionLimits>,
 }
 
 /// Inputs the caller injects into [`resolve`] that this crate must not fabricate
@@ -227,6 +255,10 @@ pub fn resolve(
         resolved_env.push((key.clone(), resolved.value));
     }
 
+    // Project-level trusted extension (`[[extension]]`): resolve + hash its
+    // executable so provenance records exactly which extension a run loads.
+    let resolved_extension = resolve_extension(manifest, manifest_dir, opts, &mut assets)?;
+
     let provenance = Provenance {
         schema: manifest.schema.clone(),
         project_id: manifest.project.id.clone(),
@@ -253,8 +285,61 @@ pub fn resolve(
         merged_dictionary,
         resolved_env,
         provenance,
+        resolved_extension,
         warnings,
     })
+}
+
+/// Validate and resolve the project-level `[[extension]]`, if any, hashing its
+/// executable into `assets`. Only the first entry is loaded today (a project
+/// declares a single trusted extension); additional entries are validated but a
+/// warning is not emitted here (the CLI loads the first).
+fn resolve_extension(
+    manifest: &Manifest,
+    manifest_dir: &Path,
+    opts: &ResolveOptions,
+    assets: &mut Vec<AssetHash>,
+) -> Result<Option<ResolvedExtension>, ProjectError> {
+    let Some(extension) = manifest.extensions.first() else {
+        return Ok(None);
+    };
+    validate_extension(extension)?;
+    let resolved_executable = resolve_asset(manifest_dir, &extension.executable, opts)?;
+    assets.push(AssetHash {
+        kind: AssetKind::Extension,
+        path: extension.executable.display().to_string(),
+        sha256: sha256_asset(&resolved_executable)?,
+    });
+    Ok(Some(ResolvedExtension {
+        id: extension.id.clone(),
+        resolved_executable,
+        args: extension.args.clone(),
+        required_capabilities: extension.required_capabilities.clone(),
+        optional_capabilities: extension.optional_capabilities.clone(),
+        env: extension.env.clone(),
+        env_passthrough: extension.env_passthrough.clone(),
+        format: extension.format.clone(),
+        limits: extension.limits.clone(),
+    }))
+}
+
+/// Structural checks for a `[[extension]]` entry (fail-closed, descriptive).
+pub fn validate_extension(extension: &Extension) -> Result<(), ProjectError> {
+    if extension.executable.as_os_str().is_empty() {
+        return Err(ProjectError::InvalidExtension {
+            id: extension.id.clone(),
+            detail: "`executable` must not be empty".to_owned(),
+        });
+    }
+    if let Some(format) = &extension.format {
+        if format != "json" {
+            return Err(ProjectError::InvalidExtension {
+                id: extension.id.clone(),
+                detail: format!("unsupported wire format {format:?} (only \"json\" is supported)"),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn ensure_unique_ids(manifest: &Manifest) -> Result<(), ProjectError> {

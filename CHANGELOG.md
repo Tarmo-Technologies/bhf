@@ -68,9 +68,23 @@
   auto-discovery. The wire contract is externally implementable (JSON Schemas in
   `schemas/`, operator docs in `docs/extension-protocol.md`, and a dependency-free Python
   reference extension), so an out-of-tree extension in any language interoperates with
-  the host. The `codec.*`, `mutator.mutate`, `scenario.*`, and `lifecycle.*`
-  capabilities, CBOR wire encoding, and a project-profile (`bhf.project.v1`)
-  `[[extension]]` section are negotiated-but-deferred follow-ups.
+  the host. The **full capability set** is now implemented: `codec.decode` /
+  `codec.encode` / `codec.repair` (decode a raw frame to a structured value, encode it
+  back, and repair computed fields like length/CRC after a mutation), `mutator.mutate`
+  (reproducible structure-aware mutation), `scenario.next` / `scenario.observe-response`
+  (drive a multi-message session, binding a response-derived handle/nonce into a later
+  message), and `lifecycle.setup` / `lifecycle.reset` / `lifecycle.teardown` (per-case
+  state with a fresh temp root between cases). A new `bhf extension session` composes
+  them end to end against a target (a mutated frame is codec-repaired before it reaches
+  the target; the OPEN handle is bound into the WRITE; a clean-exit escape is a finding),
+  and `bhf fuzz --extension` repairs a recognized retained frame before the oracle sees
+  it. A `bhf.project.v1` profile can declare the extension inline via an `[[extension]]`
+  section, which `bhf project run` materializes as a trusted `bhf.extension-manifest.v1`
+  and loads. Capability negotiation advertises the whole set, and an extension that
+  declares only a subset still works; CBOR wire encoding remains an optional,
+  negotiated-but-unused format (the host speaks JSON only). The minimal reproduction (a
+  toy `[u16 length][payload][u32 crc]` protocol with `OPEN`/`WRITE`) is implemented once
+  outside the tree in the Python reference extension (#57).
 - `bhf fuzz` / `bhf binary-fuzz` gain a platform-neutral **runtime-event collector**
   (`--collector <auto|none|PATH>`, `--collector-window-ms <MS>`) that observes the
   process, filesystem, and module-load effects a target performs even when it exits

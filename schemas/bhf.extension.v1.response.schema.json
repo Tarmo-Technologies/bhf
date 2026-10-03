@@ -13,6 +13,10 @@
       "enum": ["ok", "reject", "finding", "unsupported", "infrastructure_error"]
     },
     "finding": { "$ref": "#/$defs/finding" },
+    "value": {
+      "type": "object",
+      "description": "Capability-specific output for a non-oracle `ok` response (codec.*, mutator.mutate, scenario.*, lifecycle.*). Examples: {\"output_b64\": <base64>} for codec.encode/repair and mutator.mutate; {\"decoded\": <structured>} for codec.decode; {\"done\": true} or {\"message_b64\": <base64>, \"label\": <string>} for scenario.next. oracle.evaluate leaves it unset (its result travels in `finding`)."
+    },
     "detail": {
       "type": "string",
       "description": "An optional human-readable reason for a reject/unsupported/infrastructure_error."

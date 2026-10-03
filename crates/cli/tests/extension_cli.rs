@@ -315,6 +315,163 @@ fn release_profile_mock_oracle_end_to_end() {
     assert!(work.join("extension.json").is_file());
 }
 
+// ── session (codec / mutator / scenario / lifecycle) ────────────────────────
+
+/// Drive `bhf extension session` with the full capability surface, returning
+/// (exit code, work dir, the run's `extension.json`).
+fn run_session(name: &str, input_bytes: &[u8], extra: &[&str]) -> (i32, PathBuf, Value) {
+    let dir = temp_dir(name);
+    // The session caps are requested as optional by the command, so the manifest
+    // need only require `oracle.evaluate`.
+    let manifest = write_manifest(&dir, "well-behaved", &["oracle.evaluate"]);
+    let input = dir.join("input.bin");
+    fs::write(&input, input_bytes).unwrap();
+    let work = dir.join("work");
+    let mut args = vec![
+        "session",
+        "--manifest",
+        manifest.to_str().unwrap(),
+        "--input",
+        input.to_str().unwrap(),
+        "--work",
+        work.to_str().unwrap(),
+        "--json",
+    ];
+    args.extend_from_slice(extra);
+    let output = run_extension(&args);
+    let run: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+    (output.status.code().unwrap_or(-1), work, run)
+}
+
+#[test]
+fn extension_session_binds_open_handle_into_write_and_flags_escape() {
+    // The scenario drives OPEN(path) then WRITE(handle, data): the target returns
+    // a handle for OPEN, the extension binds it into WRITE, and the clean-exit
+    // escape is a finding.
+    let (code, work, run) = run_session("session-escape", b"../etc/passwd", &[]);
+    assert_eq!(code, 1, "a session escape is a finding: {run}");
+
+    let ext = extension_findings(&work);
+    assert_eq!(ext.len(), 1, "exactly one session finding");
+    assert_eq!(ext[0]["rule_id"], "oracle.path-escape");
+    assert_eq!(ext[0]["extension"]["protocol_version"], "bhf.extension.v1");
+
+    // The session record proves the OPEN handle reached the WRITE: the target
+    // resolved the WRITE's handle back to the OPEN path (so the write lands
+    // outside root). A failed binding would leave `wrote_outside_root` false.
+    let session = &run["session"];
+    assert_eq!(session["messages_sent"], 2, "OPEN then WRITE: {run}");
+    let target = &session["target"];
+    assert_eq!(target["all_frames_valid"], true, "{run}");
+    assert_eq!(target["writes"], 1);
+    assert_eq!(
+        target["wrote_outside_root"], true,
+        "the bound WRITE handle resolved to the escaping OPEN path: {run}"
+    );
+    // The WRITE step is labelled and used a real handle (not the unbound "0").
+    let write = session["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["label"] == "WRITE")
+        .expect("a WRITE step");
+    assert_eq!(write["step"], 1);
+    assert_ne!(
+        target["write_paths"][0]["handle"], "0",
+        "the handle was bound from the OPEN response: {run}"
+    );
+}
+
+#[test]
+fn extension_session_benign_path_is_clean_no_finding() {
+    let (code, work, run) = run_session("session-clean", b"logs/run-01.txt", &[]);
+    assert_eq!(code, 0, "a benign path exits clean: {run}");
+    assert!(extension_findings(&work).is_empty());
+    assert_eq!(run["session"]["target"]["wrote_outside_root"], false);
+}
+
+#[test]
+fn extension_session_repairs_mutated_frame_before_it_reaches_target() {
+    // With mutation but NO repair, the target sees malformed frames.
+    let (_c, _w, no_repair) = run_session(
+        "session-norepair",
+        b"logs/run.txt",
+        &["--mutate", "153", "--repair", "false"],
+    );
+    assert_eq!(no_repair["session"]["mutated"], true, "{no_repair}");
+    assert_eq!(no_repair["session"]["repaired"], false);
+    assert_eq!(
+        no_repair["session"]["target"]["all_frames_valid"], false,
+        "an unrepaired mutation corrupts the frame at the target: {no_repair}"
+    );
+
+    // With repair on, every mutated frame reaches the target well-formed.
+    let (_c2, _w2, repaired) = run_session(
+        "session-repair",
+        b"logs/run.txt",
+        &["--mutate", "153", "--repair", "true"],
+    );
+    assert_eq!(repaired["session"]["mutated"], true);
+    assert_eq!(repaired["session"]["repaired"], true, "{repaired}");
+    assert_eq!(
+        repaired["session"]["target"]["all_frames_valid"], true,
+        "repair makes the mutated frame well-formed at the target: {repaired}"
+    );
+}
+
+#[test]
+fn extension_session_reemits_same_stable_signature() {
+    // The session finding replays/minimizes to the same stable signature: the same
+    // violation evaluated again yields the identical signature (and it equals the
+    // standalone `evaluate` signature for the same path — the minimization
+    // predicate re-check).
+    let (_c1, w1, _r1) = run_session("session-sig-a", b"../etc/passwd", &[]);
+    let (_c2, w2, _r2) = run_session("session-sig-b", b"../etc/passwd", &[]);
+    let s1 = extension_findings(&w1)[0]["signature"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let s2 = extension_findings(&w2)[0]["signature"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(s1, s2, "session findings replay to the same signature");
+
+    let (_c3, w3) = run_evaluate("session-sig-eval", "well-behaved", b"../etc/passwd");
+    let s3 = extension_findings(&w3)[0]["signature"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        s1, s3,
+        "the session finding and the oracle predicate agree on the signature"
+    );
+}
+
+#[test]
+fn extension_session_crash_is_bounded_not_a_finding() {
+    let dir = temp_dir("session-crash");
+    let manifest = write_manifest(&dir, "crash", &["oracle.evaluate"]);
+    let input = dir.join("input.bin");
+    fs::write(&input, b"../etc/passwd").unwrap();
+    let work = dir.join("work");
+    let output = run_extension(&[
+        "session",
+        "--manifest",
+        manifest.to_str().unwrap(),
+        "--input",
+        input.to_str().unwrap(),
+        "--work",
+        work.to_str().unwrap(),
+    ]);
+    let code = output.status.code().unwrap_or(-1);
+    assert_ne!(code, 1, "a crash is not a finding");
+    assert!(
+        extension_findings(&work).is_empty(),
+        "an extension crash never becomes a target finding"
+    );
+}
+
 // ── bhf fuzz --extension ───────────────────────────────────────────────────
 
 fn install_fake_harness(work_dir: &Path, harness_id: &str) -> PathBuf {
@@ -377,6 +534,15 @@ fn fuzz_with_extension_drives_evaluate_on_retained_inputs() {
     assert_eq!(ext.len(), 1, "one extension finding");
     assert_eq!(ext[0]["rule_id"], "oracle.path-escape");
     assert_eq!(ext[0]["extension"]["protocol_version"], "bhf.extension.v1");
+
+    // The fuzz pass negotiated `codec.repair`; a raw (non-frame) corpus entry is
+    // `reject`ed by the extension and evaluated verbatim (0 repaired), so the host
+    // stays codec-agnostic over arbitrary corpora.
+    assert_eq!(
+        summary["extension"]["codec_repair_available"], true,
+        "{summary}"
+    );
+    assert_eq!(summary["extension"]["repaired"], 0, "{summary}");
 }
 
 #[test]

@@ -314,3 +314,147 @@ fn resolve_unknown_target_errors() {
     .unwrap_err();
     assert!(matches!(err, ProjectError::UnknownTarget(_)), "{err:?}");
 }
+
+// ── [[extension]] convergence (#57) ─────────────────────────────────────────
+
+const WITH_EXTENSION: &str = r#"
+schema = "bhf.project.v1"
+
+[project]
+id = "demo"
+version = "1.0.0"
+
+[[target]]
+id = "alpha"
+engine = "builtin"
+binary = "prebuilt/harness"
+seeds = ["corpus/alpha"]
+
+[[extension]]
+id = "path-oracle"
+executable = "ext/path-oracle"
+args = ["--serve"]
+required-capabilities = ["oracle.evaluate"]
+optional-capabilities = ["codec.repair", "scenario.next"]
+env-passthrough = ["ACME_MODE"]
+
+[extension.limits]
+call-timeout-ms = 5000
+max-frame-bytes = 1048576
+max-restarts = 1
+"#;
+
+fn stage_extension_fixture(root: &Path) {
+    write(root, "prebuilt/harness", b"#!/bin/sh\nexit 0\n");
+    write(root, "corpus/alpha/seed0", b"alpha-seed");
+    write(root, "ext/path-oracle", b"#!/bin/sh\nexit 0\n");
+}
+
+#[test]
+fn extension_section_parses_and_resolves_with_provenance() {
+    let dir = tempdir().unwrap();
+    stage_extension_fixture(dir.path());
+    let m = load(WITH_EXTENSION).unwrap();
+    assert_eq!(m.extensions.len(), 1);
+    assert_eq!(
+        m.extensions[0].executable.to_str().unwrap(),
+        "ext/path-oracle"
+    );
+
+    validate(&m, CURRENT_BHF).unwrap();
+
+    let ctx = RunContext {
+        bhf_version: CURRENT_BHF,
+        toolchain: None,
+    };
+    let resolved = resolve(
+        &m,
+        WITH_EXTENSION,
+        dir.path(),
+        "alpha",
+        &ResolveOptions::default(),
+        &ctx,
+        &env(&[]),
+    )
+    .unwrap();
+
+    // The resolved extension carries the fields the CLI needs to load it.
+    let ext = resolved.resolved_extension.expect("resolved extension");
+    assert_eq!(ext.id.as_deref(), Some("path-oracle"));
+    assert!(ext.resolved_executable.ends_with("ext/path-oracle"));
+    assert_eq!(ext.required_capabilities, vec!["oracle.evaluate"]);
+    assert_eq!(
+        ext.optional_capabilities,
+        vec!["codec.repair".to_string(), "scenario.next".to_string()]
+    );
+    assert_eq!(ext.env_passthrough, vec!["ACME_MODE"]);
+    assert_eq!(ext.limits.unwrap().call_timeout_ms, Some(5000));
+
+    // Provenance hashes the extension executable so a run records exactly which
+    // extension it loaded.
+    let hashed = resolved
+        .provenance
+        .assets
+        .iter()
+        .find(|a| matches!(a.kind, AssetKind::Extension))
+        .expect("extension asset hashed");
+    assert_eq!(hashed.path, "ext/path-oracle");
+    assert_eq!(hashed.sha256.len(), 64);
+}
+
+#[test]
+fn extension_missing_executable_asset_errors_on_resolve() {
+    let dir = tempdir().unwrap();
+    write(dir.path(), "prebuilt/harness", b"#!/bin/sh\nexit 0\n");
+    write(dir.path(), "corpus/alpha/seed0", b"seed");
+    // Note: ext/path-oracle is intentionally NOT staged.
+    let m = load(WITH_EXTENSION).unwrap();
+    let ctx = RunContext {
+        bhf_version: CURRENT_BHF,
+        toolchain: None,
+    };
+    let err = resolve(
+        &m,
+        WITH_EXTENSION,
+        dir.path(),
+        "alpha",
+        &ResolveOptions::default(),
+        &ctx,
+        &env(&[]),
+    )
+    .unwrap_err();
+    assert!(matches!(err, ProjectError::MissingAsset(_)), "{err:?}");
+}
+
+#[test]
+fn extension_unknown_key_is_rejected() {
+    let text = WITH_EXTENSION.replace("args = [\"--serve\"]", "surprise = true");
+    let err = load(&text).unwrap_err();
+    assert!(matches!(err, ProjectError::Parse(_)), "{err:?}");
+}
+
+#[test]
+fn extension_bad_wire_format_is_rejected_by_validate() {
+    let text = r#"
+schema = "bhf.project.v1"
+
+[project]
+id = "demo"
+version = "1.0.0"
+
+[[target]]
+id = "alpha"
+engine = "builtin"
+binary = "prebuilt/harness"
+
+[[extension]]
+executable = "ext/path-oracle"
+format = "cbor"
+"#;
+    let m = load(text).unwrap();
+    let err = validate(&m, CURRENT_BHF).unwrap_err();
+    assert!(
+        matches!(err, ProjectError::InvalidExtension { .. }),
+        "{err:?}"
+    );
+}

@@ -16,29 +16,53 @@
 //! on unix for child resource-limit hardening), and speaks a wire protocol that
 //! can be re-implemented in any language (see the reference extension fixture).
 //!
-//! The capability surface shipped here is [`capability::ORACLE_EVALUATE`]. The
-//! `codec.*`, `mutator.mutate`, `scenario.*`, and `lifecycle.*` capabilities are
-//! negotiated-but-deferred to follow-up work.
+//! The full `bhf.extension.v1` capability surface is implemented here:
+//! [`capability::ORACLE_EVALUATE`], the `codec.*` family
+//! ([`capability::CODEC_DECODE`]/[`CODEC_ENCODE`](capability::CODEC_ENCODE)/
+//! [`CODEC_REPAIR`](capability::CODEC_REPAIR)), [`capability::MUTATOR_MUTATE`],
+//! the `scenario.*` family
+//! ([`SCENARIO_NEXT`](capability::SCENARIO_NEXT)/[`SCENARIO_OBSERVE_RESPONSE`](capability::SCENARIO_OBSERVE_RESPONSE)),
+//! and the `lifecycle.*` family
+//! ([`LIFECYCLE_SETUP`](capability::LIFECYCLE_SETUP)/[`LIFECYCLE_RESET`](capability::LIFECYCLE_RESET)/[`LIFECYCLE_TEARDOWN`](capability::LIFECYCLE_TEARDOWN)).
+//! Capability negotiation advertises the full set; an extension that declares
+//! only a subset still works — the host drives exactly the capabilities both
+//! sides agreed on. CBOR remains an optional, negotiated-but-unused wire format;
+//! the host speaks JSON only.
 
 pub mod client;
+pub mod codec;
 pub mod envelope;
 pub mod handshake;
+pub mod lifecycle;
 pub mod limits;
 pub mod manifest;
+pub mod mutator;
 pub mod oracle;
 pub mod provenance;
 pub mod restart;
+pub mod scenario;
+pub mod session;
 pub mod wire;
 
 mod b64;
 
-pub use client::{EvaluateOutcome, ExtensionClient, InfraFailure, ResourceLimits, SpawnSpec};
+pub use client::{
+    AckOutcome, CallOutcome, CodecOutcome, EvaluateOutcome, ExtensionClient, InfraFailure,
+    MutateOutcome, ResourceLimits, ScenarioMessage, ScenarioStep, SpawnSpec,
+};
+pub use codec::{DecodePayload, DecodedValue, EncodePayload, RepairPayload};
 pub use envelope::{CaseId, Evidence, FindingResult, Request, Response, ResultClass};
 pub use handshake::{negotiate, ExtHello, Format, HostHello, Negotiated, WireLimits};
+pub use lifecycle::LifecyclePayload;
 pub use limits::{Limits, OutstandingGuard};
 pub use manifest::ExtensionManifest;
+pub use mutator::MutatePayload;
 pub use provenance::{hash_file, redact_env, ExtensionProvenance, RedactedEnv};
 pub use restart::{RestartPolicy, RestartState};
+pub use scenario::{ObserveResponsePayload, ScenarioNextPayload};
+pub use session::{
+    SessionDriver, SessionOptions, SessionOutcome, SessionStepRecord, SessionTarget,
+};
 
 /// The wire protocol identifier negotiated by this host.
 pub const PROTOCOL: &str = "bhf.extension.v1";
@@ -46,8 +70,42 @@ pub const PROTOCOL: &str = "bhf.extension.v1";
 /// Capability identifiers understood by this host.
 pub mod capability {
     /// Evaluate a (clean-exiting) test input against a private semantic oracle.
-    /// This is the only capability a host built from this crate drives today.
     pub const ORACLE_EVALUATE: &str = "oracle.evaluate";
+    /// Decode a raw frame into a structured value.
+    pub const CODEC_DECODE: &str = "codec.decode";
+    /// Encode a structured value back into a raw frame.
+    pub const CODEC_ENCODE: &str = "codec.encode";
+    /// Repair a (mutated) raw frame's computed fields (length, checksum).
+    pub const CODEC_REPAIR: &str = "codec.repair";
+    /// Produce a custom mutation of a decoded test input.
+    pub const MUTATOR_MUTATE: &str = "mutator.mutate";
+    /// Yield the next message in a multi-message session.
+    pub const SCENARIO_NEXT: &str = "scenario.next";
+    /// Feed a target's response bytes back so the extension can bind a
+    /// response-derived value into a later message.
+    pub const SCENARIO_OBSERVE_RESPONSE: &str = "scenario.observe-response";
+    /// Set a session up before the first case.
+    pub const LIFECYCLE_SETUP: &str = "lifecycle.setup";
+    /// Reset state (e.g. a fresh temp root) between cases.
+    pub const LIFECYCLE_RESET: &str = "lifecycle.reset";
+    /// Tear a session down at the end.
+    pub const LIFECYCLE_TEARDOWN: &str = "lifecycle.teardown";
+
+    /// Every capability this host can drive, in a stable order (used to build the
+    /// host hello's optional-capability set so a subset-declaring extension still
+    /// negotiates cleanly).
+    pub const ALL: &[&str] = &[
+        ORACLE_EVALUATE,
+        CODEC_DECODE,
+        CODEC_ENCODE,
+        CODEC_REPAIR,
+        MUTATOR_MUTATE,
+        SCENARIO_NEXT,
+        SCENARIO_OBSERVE_RESPONSE,
+        LIFECYCLE_SETUP,
+        LIFECYCLE_RESET,
+        LIFECYCLE_TEARDOWN,
+    ];
 }
 
 /// The crate's fallible result alias.

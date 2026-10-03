@@ -99,4 +99,9 @@ pub enum ProjectError {
         path: PathBuf,
         source: std::io::Error,
     },
+
+    /// A `[[extension]]` entry was malformed (empty executable, unsupported wire
+    /// format, …).
+    #[error("extension{}: {detail}", id.as_ref().map(|i| format!(" '{i}'")).unwrap_or_default())]
+    InvalidExtension { id: Option<String>, detail: String },
 }

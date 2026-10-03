@@ -38,12 +38,40 @@ where
 #[test]
 fn committed_request_fixture_roundtrips_through_envelope() {
     assert_roundtrips::<Request>("oracle_evaluate.request.json");
+    assert_roundtrips::<Request>("codec_repair.request.json");
 }
 
 #[test]
 fn committed_response_fixtures_roundtrip_through_envelope() {
     assert_roundtrips::<Response>("oracle_ok.response.json");
     assert_roundtrips::<Response>("oracle_finding.response.json");
+    assert_roundtrips::<Response>("codec_repair.response.json");
+    assert_roundtrips::<Response>("scenario_next.response.json");
+}
+
+#[test]
+fn capability_value_fixtures_expose_their_output_channel() {
+    // A codec.repair ok response carries its repaired bytes in `value.output_b64`.
+    let repair: Response =
+        serde_json::from_str(&fixture("codec_repair.response.json")).expect("parse repair");
+    let value = repair.value.expect("codec.repair ok carries a value");
+    assert!(value.get("output_b64").and_then(|v| v.as_str()).is_some());
+    assert!(
+        repair.finding.is_none(),
+        "a codec response is not a finding"
+    );
+
+    // A scenario.next ok response carries the next message + a label.
+    let next: Response =
+        serde_json::from_str(&fixture("scenario_next.response.json")).expect("parse next");
+    let value = next.value.expect("scenario.next ok carries a value");
+    assert_eq!(value["label"], serde_json::json!("OPEN"));
+    assert!(value.get("message_b64").and_then(|v| v.as_str()).is_some());
+
+    // An oracle ok response still carries no value channel at all.
+    let oracle: Response =
+        serde_json::from_str(&fixture("oracle_ok.response.json")).expect("parse oracle ok");
+    assert!(oracle.value.is_none());
 }
 
 #[test]
