@@ -214,6 +214,7 @@ dependencies = [
  "replay_min",
  "report",
  "results",
+ "runtime_collector",
  "runtrace_manifest",
  "rust_parser",
  "serde",
@@ -253,6 +254,15 @@ name = "bhf_cc_intercept"
 version = "0.2.34"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "bhf_collector_win"
+version = "0.2.34"
+dependencies = [
+ "runtime_collector",
+ "serde_json",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1867,6 +1877,15 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "runtime_collector"
+version = "0.2.34"
+dependencies = [
+ "finding_rules",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

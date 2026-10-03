@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Tarmo-Technologies/bhf/schemas/bhf.collector-event.v1.schema.json",
+  "title": "bhf.collector-event.v1",
+  "description": "One line of the platform-neutral runtime-event collector stream (JSONL). A collector observes the process, filesystem, and module-load effects a target performs while a testcase runs — including effects on a clean exit — so an out-of-repo provider (native Windows ETW, an external sidecar) can target this wire format and feed the bhf oracle layer. `phase` is a closed enum; `kind` is left open so a newer provider can emit a family an older host preserves as unknown rather than dropping.",
+  "type": "object",
+  "required": ["schema", "testcase", "worker", "seq", "phase", "kind"],
+  "properties": {
+    "schema": { "const": "bhf.collector-event.v1" },
+    "testcase": { "type": "string", "minLength": 1 },
+    "worker": { "type": "integer", "minimum": 0 },
+    "seq": { "type": "integer", "minimum": 0 },
+    "phase": {
+      "description": "Testcase lifecycle marker: `begin`/`end` bracket the testcase, `event` is everything observed in between.",
+      "enum": ["begin", "event", "end"]
+    },
+    "process": { "$ref": "#/$defs/process" },
+    "kind": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Normalized event family. Known values: process_create, shell_execute, file_create, file_open, file_write, file_rename, file_delete, module_load, network, registry. Other strings are preserved (forward compatibility), not rejected.",
+      "examples": [
+        "process_create",
+        "shell_execute",
+        "file_create",
+        "file_open",
+        "file_write",
+        "file_rename",
+        "file_delete",
+        "module_load",
+        "network",
+        "registry"
+      ]
+    },
+    "path": { "type": "string" },
+    "args": { "type": "array", "items": { "type": "string" } },
+    "verb": { "type": "string" },
+    "address": { "type": "string" },
+    "input_derived": { "type": "boolean" },
+    "taint_offset": { "type": "integer", "minimum": 0 },
+    "evidence_ref": { "type": "string" },
+    "ts": { "type": "number" },
+    "fidelity": { "$ref": "#/$defs/fidelity" }
+  },
+  "$defs": {
+    "process": {
+      "type": "object",
+      "description": "Identity of the acting process. `ancestor` is the testcase root pid attribution keys on; `parent` is the immediate parent; `user`/`token`/`session` capture the security principal.",
+      "required": ["pid"],
+      "properties": {
+        "pid": { "type": "integer", "minimum": 0 },
+        "image": { "type": "string" },
+        "parent": { "type": "integer", "minimum": 0 },
+        "ancestor": { "type": "integer", "minimum": 0 },
+        "user": { "type": "string" },
+        "token": { "type": "string" },
+        "session": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "fidelity": {
+      "type": "object",
+      "description": "Collection-fidelity metadata. Any of these signals must block a 'clean' assurance so a degraded observation never masquerades as 'the target did nothing dangerous'.",
+      "properties": {
+        "lost": { "type": "integer", "minimum": 0 },
+        "unsupported_fields": { "type": "array", "items": { "type": "string" } },
+        "permission_denied": { "type": "boolean" }
+      }
+    }
+  }
+}

@@ -58,6 +58,13 @@ pub fn run(args: ReplayArgs) -> i32 {
     if crate::session_fuzz::is_session_finding(&finding_dir) {
         return crate::session_fuzz::replay_session_finding(&finding_dir);
     }
+    // #60: a collector-sourced semantic finding reproduces deterministically from
+    // its stored CollectorSession evidence (re-evaluating the oracle registry and
+    // surfacing the attributing event + process tree), not from a harness re-run,
+    // so it dispatches before any harness resolution.
+    if crate::collector_run::is_collector_finding(&finding_dir) {
+        return crate::collector_run::replay_collector_finding(&finding_dir);
+    }
     // The finding already records where its harness was built; resolve it so the
     // user does not have to repeat `--harness`. An explicit `--harness` always wins.
     let harness = match resolve_harness(&finding_dir, args.harness) {

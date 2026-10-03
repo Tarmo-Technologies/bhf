@@ -43,6 +43,7 @@ mod cartography;
 pub mod ci;
 mod clean;
 mod cmplog_cli;
+mod collector_run;
 mod command_output;
 mod corpus;
 mod dashboard;

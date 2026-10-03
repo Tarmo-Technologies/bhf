@@ -461,6 +461,22 @@ pub struct FuzzArgs {
     /// would exceed it fails with a diagnostic rather than growing unbounded.
     #[arg(long = "max-session-messages", default_value_t = 64)]
     pub max_session_messages: usize,
+
+    /// Runtime-event collector that observes process, filesystem, and module-load
+    /// effects the harness performs even on a clean exit (#60). `auto` picks the
+    /// built-in provider for this platform (native Windows ETW; inactive on
+    /// Linux); a PATH runs an external sidecar that speaks the
+    /// bhf.collector-event.v1 JSONL protocol; `none` (default) disables it. A
+    /// collected semantic violation becomes a `binary_semantic` finding (no crash
+    /// needed), with the raw collector session stored for deterministic replay.
+    #[arg(long = "collector", value_parser = crate::collector_run::parse_collector_spec, default_value = "none")]
+    pub collector: crate::collector_run::CollectorSpec,
+
+    /// How long, in milliseconds, to keep observing descendant-process effects
+    /// after the testcase process exits — the bounded post-exit observation
+    /// window (#60).
+    #[arg(long = "collector-window-ms", default_value_t = crate::collector_run::DEFAULT_WINDOW_MS)]
+    pub collector_window_ms: u64,
 }
 
 impl FuzzArgs {
@@ -1118,6 +1134,13 @@ pub fn run(args: FuzzArgs) -> i32 {
         return run_multicore_campaign(args);
     }
 
+    // #60: capture the collector spec before `prepare` consumes `args`, so a
+    // collected clean-exit semantic violation can be emitted after the fuzz run.
+    let collector_spec = args.collector.clone();
+    let collector_window_ms = args.collector_window_ms;
+    let collector_work_dir = args.work_dir.clone();
+    let collector_harness = args.harness.clone();
+
     let prepared = match prepare(args) {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -1133,7 +1156,30 @@ pub fn run(args: FuzzArgs) -> i32 {
 
     match result {
         Ok(summary) => {
-            match serde_json::to_string_pretty(&summary) {
+            let mut value = match serde_json::to_value(&summary) {
+                Ok(value) => value,
+                Err(error) => {
+                    bhfeprintln!("failed to render fuzz summary: {error}");
+                    return 1;
+                }
+            };
+            // #60: run the platform-neutral collector (inactive by default, leaving
+            // behaviour unchanged) and attach its provenance + any findings.
+            match run_collector_for_fuzz(
+                &collector_spec,
+                collector_window_ms,
+                &collector_work_dir,
+                &collector_harness,
+            ) {
+                Ok(provenance) => {
+                    value["collector"] = provenance;
+                }
+                Err(error) => {
+                    bhfeprintln!("collector: {error:#}");
+                    return 1;
+                }
+            }
+            match serde_json::to_string_pretty(&value) {
                 Ok(json) => println!("{json}"),
                 Err(error) => {
                     bhfeprintln!("failed to render fuzz summary: {error}");
@@ -1147,6 +1193,47 @@ pub fn run(args: FuzzArgs) -> i32 {
             1
         }
     }
+}
+
+/// Run the platform-neutral runtime-event collector (#60) for a `bhf fuzz`
+/// invocation and return its run-manifest provenance (including the ids of any
+/// collector-sourced `binary_semantic` findings written to the results tree).
+/// Inactive (the default, or no built-in provider on this platform) is a no-op
+/// that returns inactive provenance, so the historical behaviour is unchanged.
+fn run_collector_for_fuzz(
+    spec: &crate::collector_run::CollectorSpec,
+    window_ms: u64,
+    work_dir: &Path,
+    harness_id: &str,
+) -> anyhow::Result<serde_json::Value> {
+    use anyhow::Context;
+    let Some(resolved) = crate::collector_run::resolve(spec, window_ms)? else {
+        return Ok(crate::collector_run::inactive_run_provenance(spec));
+    };
+    let findings_dir = corpus::layout::findings_dir(work_dir);
+    std::fs::create_dir_all(&findings_dir)
+        .with_context(|| format!("create {}", findings_dir.display()))?;
+    let params = crate::collector_run::CollectorRunParams {
+        testcase: "fuzz".to_owned(),
+        worker: 0,
+        root: work_dir.display().to_string(),
+        root_pid: 0,
+        root_image: harness_id.to_owned(),
+        input: &[],
+        tmp_dir: work_dir.join("collector_tmp"),
+    };
+    let outcome = resolved.run_once(&params)?;
+    let target = serde_json::json!({ "kind": "harness", "harness": harness_id });
+    let mut ids = Vec::new();
+    for finding in &outcome.findings {
+        let id = crate::collector_run::next_collector_finding_id(&findings_dir)?;
+        let dir = findings_dir.join(&id);
+        crate::collector_run::write_finding(&dir, &id, target.clone(), finding, &[])?;
+        ids.push(id);
+    }
+    let mut provenance = outcome.run_provenance;
+    provenance["findings"] = serde_json::json!(ids);
+    Ok(provenance)
 }
 
 /// Programmatic fuzz entry used by `bhf auto`. Builds a
@@ -1276,6 +1363,8 @@ pub(crate) fn run_one_target_programmatic_with_runner(
         session_transport: None,
         session_reset: crate::session_fuzz::SessionResetMode::Reconnect,
         max_session_messages: 64,
+        collector: crate::collector_run::CollectorSpec::Off,
+        collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
     };
     let mut prepared = prepare(args)?;
     // A caller-supplied cross runner overrides the direct/host runner `prepare`
@@ -1352,6 +1441,8 @@ pub(crate) fn run_afl_plus_plus_programmatic(
         session_transport: None,
         session_reset: crate::session_fuzz::SessionResetMode::Reconnect,
         max_session_messages: 64,
+        collector: crate::collector_run::CollectorSpec::Off,
+        collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
     };
     let prepared = prepare(args)?;
     run_afl_plus_plus(prepared)
@@ -8436,6 +8527,41 @@ mod auto_path_tests {
         assert!(load_grammar_for_run(Some(&path)).is_err());
     }
 
+    #[test]
+    fn collector_flag_parses_auto_none_path_and_window() {
+        use clap::Parser;
+        #[derive(clap::Parser)]
+        struct Wrap {
+            #[command(flatten)]
+            inner: FuzzArgs,
+        }
+        // Default: off, 250ms — a plain `bhf fuzz` stays unchanged.
+        let w = Wrap::try_parse_from(["fuzz", "wd", "--harness", "h"]).unwrap();
+        assert_eq!(w.inner.collector, crate::collector_run::CollectorSpec::Off);
+        assert_eq!(w.inner.collector_window_ms, 250);
+
+        let w =
+            Wrap::try_parse_from(["fuzz", "wd", "--harness", "h", "--collector", "auto"]).unwrap();
+        assert_eq!(w.inner.collector, crate::collector_run::CollectorSpec::Auto);
+
+        let w = Wrap::try_parse_from([
+            "fuzz",
+            "wd",
+            "--harness",
+            "h",
+            "--collector",
+            "/opt/probe",
+            "--collector-window-ms",
+            "750",
+        ])
+        .unwrap();
+        assert_eq!(
+            w.inner.collector,
+            crate::collector_run::CollectorSpec::Sidecar(std::path::PathBuf::from("/opt/probe"))
+        );
+        assert_eq!(w.inner.collector_window_ms, 750);
+    }
+
     fn fuzz_args_for_worker_passthrough(structured_inputs: StructuredInputMode) -> FuzzArgs {
         FuzzArgs {
             work_dir: tmpdir(),
@@ -8477,6 +8603,8 @@ mod auto_path_tests {
             session_transport: None,
             session_reset: crate::session_fuzz::SessionResetMode::Reconnect,
             max_session_messages: 64,
+            collector: crate::collector_run::CollectorSpec::Off,
+            collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
         }
     }
 }

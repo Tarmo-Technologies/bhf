@@ -24,6 +24,23 @@
   `results/findings.json` (schema in `schemas/`, reference fixture in `tests/fixtures/golden_results/`).
 
 ### Added
+- `bhf fuzz` / `bhf binary-fuzz` gain a platform-neutral **runtime-event collector**
+  (`--collector <auto|none|PATH>`, `--collector-window-ms <MS>`) that observes the
+  process, filesystem, and module-load effects a target performs even when it exits
+  cleanly (#60). Observed effects are attributed to the testcase's descendant process
+  tree within a bounded post-exit window and fed through the shared bug-oracle
+  registry, so a controlled process execution, a path escaping the allowed root, or a
+  controlled library load becomes a `binary_semantic` finding with no crash. The
+  contract is a versioned JSONL wire format (`bhf.collector-event.v1`, JSON Schema in
+  `schemas/`) that an out-of-repo provider can target: `auto` selects the native
+  Windows ETW provider (`bhf-collector-win`), a PATH runs an external sidecar, and
+  `none` (default) leaves behaviour unchanged. Findings store their raw collector
+  session as evidence so `bhf replay` reproduces the semantic finding deterministically
+  and a reviewer can audit the attribution; collection loss, unsupported APIs, or a
+  permission denial are recorded as fidelity limitations and refuse a false "clean"
+  assurance. Provenance records the backend name/version/hash, process-tree scope,
+  observation window, observed event classes, and fidelity, for importers /
+  SARIF / vulnerability-management tools. (#60)
 - `bhf fuzz --protocol-profile <PATH>` drives a response-dependent, multi-message
   **protocol session** (HDF-7): a versioned profile (`bhf.protocol.v1`, TOML)
   declares typed messages, computed length/CRC/offset/TLV fields, response

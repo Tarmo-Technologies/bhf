@@ -300,6 +300,20 @@ pub fn run(args: MinimizeArgs) -> i32 {
 
 fn run_inner(args: MinimizeArgs) -> anyhow::Result<MinimizeSummary> {
     let finding_dir = resolve_finding_arg(args.finding_dir, args.finding);
+    // #60: a collector-sourced finding is reproduced from provider-captured
+    // evidence that does not vary with the testcase bytes, so there is nothing to
+    // delta-debug under deterministic replay. Re-confirm it reproduces and report
+    // an honest no-op; this needs no harness, so it dispatches first.
+    if crate::collector_run::is_collector_finding(&finding_dir) {
+        let result = crate::collector_run::minimize_collector_finding(&finding_dir)?;
+        return Ok(MinimizeSummary {
+            strategy: args.strategy,
+            original_len: result.original_len,
+            minimized_len: result.original_len,
+            removed_bytes: 0,
+            reduced: result.reduced,
+        });
+    }
     let harness = args.harness.ok_or_else(|| {
         anyhow!("minimize requires --harness <path> for a crash/opaque-input finding")
     })?;

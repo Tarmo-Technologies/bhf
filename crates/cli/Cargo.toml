@@ -78,6 +78,7 @@ replay_min = { path = "../replay_min" }
 bhf_report = { package = "report", path = "../report" }
 results = { path = "../results" }
 runtrace_manifest = { path = "../runtrace_manifest" }
+runtime_collector = { path = "../runtime_collector" }
 rust_parser = { path = "../rust_parser" }
 serde.workspace = true
 serde_json.workspace = true
@@ -111,6 +112,14 @@ path = "src/main.rs"
 [[bin]]
 name = "cli_fake_harness"
 path = "tests/fixtures/fake_harness.rs"
+
+# Test-only mock runtime-event collector sidecar (#60). Speaks the
+# bhf.collector-event.v1 JSONL protocol via runtime_collector::mock::MockCollector
+# so the Linux CLI integration test can drive `--collector <PATH>` end-to-end
+# without a live OS tracer. A fixture binary (like cli_fake_harness), never shipped.
+[[bin]]
+name = "mock_collector"
+path = "tests/fixtures/mock_collector.rs"
 
 [dev-dependencies]
 serde.workspace = true

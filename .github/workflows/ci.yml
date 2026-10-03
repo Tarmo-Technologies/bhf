@@ -142,7 +142,7 @@ jobs:
       - name: Test workspace (nextest — fast tests + integration smoke)
         env:
           RAYON_NUM_THREADS: "1"
-        run: cargo nextest run --locked --workspace --no-fail-fast -E 'not (package(bhf) & kind(test)) | binary(=auto_c_common_cli) | binary(=auto_ada_access_lifecycle) | binary(=capability_cli) | (binary(=auto_cpp_amalgamation) & test(=cpp_amalgamation_detects_planted_bug_with_nonempty_testcase)) | (binary(=auto_go_force) & test(=forced_go_targets_build_fuzz_and_are_marked_forced)) | (binary(=auto_rust_discovery) & test(=rust_target_builds_and_fuzzes_natively_and_finds_planted_crash))'
+        run: cargo nextest run --locked --workspace --no-fail-fast -E 'not (package(bhf) & kind(test)) | binary(=auto_c_common_cli) | binary(=auto_ada_access_lifecycle) | binary(=capability_cli) | binary(=collector_mock) | (binary(=auto_cpp_amalgamation) & test(=cpp_amalgamation_detects_planted_bug_with_nonempty_testcase)) | (binary(=auto_go_force) & test(=forced_go_targets_build_fuzz_and_are_marked_forced)) | (binary(=auto_rust_discovery) & test(=rust_target_builds_and_fuzzes_natively_and_finds_planted_crash))'
 
       - name: Test doctests
         run: cargo test --locked --workspace --doc
@@ -370,8 +370,20 @@ jobs:
       - name: Test portable scheduler runtime reliability
         run: cargo test --locked -p continuous_daemon --lib health::tests
 
+      - name: Test native Windows runtime-event collector (#60)
+        shell: pwsh
+        env:
+          BHF_WIN_LIVE: "1"
+        run: |
+          # Pure core + ETW consumer compile and unit tests.
+          cargo test --locked -p bhf_collector_win --lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # Dependency-gated live ETW fixtures (ignored unless BHF_WIN_LIVE=1).
+          cargo test --locked -p bhf_collector_win --test live_windows -- --ignored
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Build Windows release artifacts
-        run: cargo build --locked --release -p bhf -p bhf-daemon -p bhf_runtrace_shim --target x86_64-pc-windows-msvc
+        run: cargo build --locked --release -p bhf -p bhf-daemon -p bhf_runtrace_shim -p bhf_collector_win --target x86_64-pc-windows-msvc
 
       - name: Exercise Windows release binaries
         shell: pwsh

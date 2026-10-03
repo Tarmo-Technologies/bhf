@@ -1,0 +1,25 @@
+{
+  "schema": "bhf.collector-event.v1",
+  "testcase": "tc-7",
+  "worker": 0,
+  "seq": 12,
+  "phase": "event",
+  "process": {
+    "pid": 1001,
+    "image": "C:\\Windows\\System32\\cmd.exe",
+    "parent": 1000,
+    "ancestor": 1000,
+    "user": "sandbox-user",
+    "token": "S-1-5-21",
+    "session": 1
+  },
+  "kind": "shell_execute",
+  "path": "C:\\Windows\\System32\\cmd.exe",
+  "verb": "runas",
+  "args": ["/c", "whoami"],
+  "input_derived": true,
+  "taint_offset": 12,
+  "evidence_ref": "etw:12345",
+  "ts": 1696200000.2,
+  "fidelity": { "lost": 0, "unsupported_fields": [], "permission_denied": false }
+}

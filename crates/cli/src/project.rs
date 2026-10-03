@@ -572,6 +572,8 @@ fn plan_to_fuzz_args(
         session_transport: None,
         session_reset: crate::session_fuzz::SessionResetMode::Reconnect,
         max_session_messages: 64,
+        collector: crate::collector_run::CollectorSpec::Off,
+        collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
     })
 }
 
@@ -613,6 +615,8 @@ fn plan_to_binary_fuzz_args(
         setup_command: None,
         oracle_command: None,
         reset_command: None,
+        collector: crate::collector_run::CollectorSpec::Off,
+        collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
     })
 }
 

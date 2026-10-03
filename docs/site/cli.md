@@ -289,6 +289,34 @@ re-confirming the oracle rather than a crash signature. (Interpreted-language
 runtime oracles and QEMU/Wine are out of scope for this flag — it is the native
 Linux layer `bhf auto` already uses.)
 
+`--collector <auto|none|PATH>` (on `bhf fuzz` and `bhf binary fuzz`) arms a
+**platform-neutral runtime-event collector**: a provider that observes the
+process, filesystem, and module-load effects a target performs — including effects
+on a **clean exit** — and emits the versioned `bhf.collector-event.v1` JSONL
+contract (JSON Schema in `schemas/`). The host attributes those events to the
+testcase's descendant process tree within a bounded post-exit window
+(`--collector-window-ms <MS>`, default `250`) and feeds them through the same
+bug-oracle registry as the runtime oracles, so a controlled process execution
+(BHF-431), a path escaping the allowed root (BHF-405), or a controlled library
+load (BHF-435) becomes a `kind: binary_semantic` finding **with no crash**. Unlike
+`--runtime-oracles` (the in-process Linux `LD_PRELOAD` layer), the collector is a
+decoupled provider addressed by the JSONL wire format, so an out-of-repo provider
+can implement it: `auto` selects the built-in provider for the platform (the native
+Windows ETW provider `bhf-collector-win`; inactive on Linux, where
+`--runtime-oracles` covers the native layer), a PATH runs an external sidecar that
+speaks the protocol, and `none` (default) disables it, leaving behaviour unchanged.
+A collector finding stores its raw `CollectorSession` evidence next to
+`finding.json` (`collector_session.jsonl`), so `bhf replay <id>` reproduces the
+semantic finding **deterministically from the stored evidence** — re-evaluating the
+oracle registry and surfacing the attributing event and descendant process tree,
+needing no `--harness`. Event loss, platform-unsupported APIs, or a permission
+denial are recorded as **fidelity limitations** that refuse a false "clean"
+assurance rather than silently dropping observations, and each run and finding
+records collector **provenance**: the backend name/version/hash, the process-tree
+scope, the observation window, the observed event classes, and the fidelity
+limitations. `bhf minimize` on a collector finding is a no-op (the provider-captured
+evidence does not vary with the testcase bytes) that re-confirms reproduction.
+
 `bhf binary fuzz` also accepts **user-defined postcondition oracles** with
 per-case fixture hooks: `--setup-command` runs before each testcase (prepare a
 fresh fixture), `--oracle-command` runs after it to check a security invariant,

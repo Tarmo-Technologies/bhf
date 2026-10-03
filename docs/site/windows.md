@@ -272,9 +272,22 @@ cmplog, and ASan all work natively on Windows.
   on Linux (shared-memory coverage via Win32 file mapping).
 - The LD_PRELOAD runtrace shim is Linux-only (an empty stub on Windows), so the
   behavioral and taint oracles (BHF-405 path control, BHF-304 command injection,
-  BHF-417 insecure temp, BHF-305 sensitive env) do not fire on native Windows.
-  Crash detection and coverage-guided fuzzing are unaffected; fuzz the target on
-  Linux to exercise those oracle classes.
+  BHF-417 insecure temp, BHF-305 sensitive env) do not fire on native Windows via
+  that path. Crash detection and coverage-guided fuzzing are unaffected.
+- The **runtime-event collector** (`--collector`, #60) is the native-Windows path
+  to clean-exit semantic findings. `--collector auto` selects the native ETW
+  provider (`bhf-collector-win`), which subscribes to the process / file / image-load
+  ETW providers and emits the platform-neutral `bhf.collector-event.v1` JSONL
+  contract. It observes `CreateProcess*`/`ShellExecute*` (target/verb/args + the
+  launched child), file create/open/write/rename/delete with resolved paths, and
+  `LoadLibrary*`/image-load, attributing each to the testcase's descendant process
+  tree — so a controlled process execution (BHF-431), a path escaping the allowed
+  root (BHF-405), or a controlled library load (BHF-435) becomes a `binary_semantic`
+  finding even on a clean exit, feeding the same oracle registry as the Linux shim.
+  Starting an ETW session needs session rights; when the provider lacks them it
+  records `fidelity.permission_denied` rather than reporting a silent clean run. The
+  provider's pure core is Linux-testable against synthetic ETW records; the live ETW
+  path is validated on the Windows CI runner under `BHF_WIN_LIVE=1`.
 - The native-Windows harness build uses GNU `make` + clang (same as Linux); the
   drive-letter colon + backslash quirks are handled by emitting forward-slash
   paths into the recipe.

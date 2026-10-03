@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::collector_run;
 use crate::minimize::MinimizeStrategy;
 use crate::runner::SandboxModeArg;
 use crate::runtime_oracles::RuntimeOracles;
@@ -122,6 +123,24 @@ pub struct BinaryFuzzArgs {
     /// Receives the same `BHF_TESTCASE`/`BHF_CASE_DIR` context.
     #[arg(long = "reset-command")]
     pub reset_command: Option<String>,
+
+    /// Runtime-event collector that observes process, filesystem, and module-load
+    /// effects the target performs even on a clean exit (#60). `auto` picks the
+    /// built-in provider for this platform (native Windows ETW; inactive on
+    /// Linux); a PATH runs an external sidecar that speaks the
+    /// bhf.collector-event.v1 JSONL protocol; `none` (default) disables it. A
+    /// collected semantic violation — a controlled process exec, a path escaping
+    /// the allowed root, or a controlled library load — becomes a
+    /// `binary_semantic` finding (no crash needed), with the raw collector session
+    /// stored for deterministic replay.
+    #[arg(long = "collector", value_parser = crate::collector_run::parse_collector_spec, default_value = "none")]
+    pub collector: crate::collector_run::CollectorSpec,
+
+    /// How long, in milliseconds, to keep observing descendant-process effects
+    /// after the testcase process exits — the bounded post-exit observation
+    /// window (#60).
+    #[arg(long = "collector-window-ms", default_value_t = crate::collector_run::DEFAULT_WINDOW_MS)]
+    pub collector_window_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -467,13 +486,70 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
         }
     }
 
+    // #60: run the platform-neutral runtime-event collector. A collected semantic
+    // violation (controlled process exec / path escape / controlled library load)
+    // becomes a `binary_semantic` finding through the SAME oracle registry, even
+    // when every execution exited cleanly. Inactive (default) leaves behaviour
+    // unchanged.
+    let collector_provenance =
+        match collector_run::resolve(&args.collector, args.collector_window_ms)? {
+            None => collector_run::inactive_run_provenance(&args.collector),
+            Some(resolved) => {
+                let representative = seeds.first().cloned().unwrap_or_default();
+                let params = collector_run::CollectorRunParams {
+                    testcase: "binary-fuzz".to_owned(),
+                    worker: 0,
+                    root: args.work_dir.display().to_string(),
+                    root_pid: 0,
+                    root_image: args.binary.display().to_string(),
+                    input: &representative,
+                    tmp_dir: tmp_dir.join("collector"),
+                };
+                let outcome = resolved.run_once(&params)?;
+                let target = collector_target(&args)?;
+                for finding in &outcome.findings {
+                    let id = collector_run::next_collector_finding_id(&findings_dir)?;
+                    let dir = findings_dir.join(&id);
+                    collector_run::write_finding(
+                        &dir,
+                        &id,
+                        target.clone(),
+                        finding,
+                        &representative,
+                    )?;
+                    finding_ids.push(id);
+                }
+                outcome.run_provenance
+            }
+        };
+
     Ok(json!({
         "schema_version": "bhf.binary_fuzz.run.v1",
         "binary": args.binary,
         "input_mode": args.input_mode.as_str(),
         "executions": executions,
         "runtime_oracles": runtime_oracle_provenance(args.runtime_oracles, oracles.as_ref()),
+        "collector": collector_provenance,
         "findings": finding_ids
+    }))
+}
+
+/// Lane-specific target descriptor spliced into a collector finding so a reviewer
+/// can see what ran.
+fn collector_target(args: &BinaryFuzzArgs) -> anyhow::Result<Value> {
+    Ok(json!({
+        "kind": "binary",
+        "binary": {
+            "path": args.binary,
+            "sha256": sha256_hex(&fs::read(&args.binary).with_context(|| format!("read {}", args.binary.display()))?),
+        },
+        "command": {
+            "argv": TargetInvocation::from_args(args).provenance_argv(args.input_mode),
+            "runner": args.runner,
+            "runner_args": args.runner_args,
+            "target_args": args.target_args,
+            "sandbox": format!("{:?}", args.sandbox).to_ascii_lowercase(),
+        }
     }))
 }
 
@@ -1833,6 +1909,42 @@ mod tests {
     }
 
     #[test]
+    fn collector_flag_parses_auto_none_path_and_window() {
+        use clap::Parser;
+        #[derive(clap::Parser)]
+        struct Wrap {
+            #[command(flatten)]
+            inner: BinaryFuzzArgs,
+        }
+        // Default: off, 250ms — a plain run must be byte-for-byte unchanged.
+        let w = Wrap::try_parse_from(["bf", "/bin/true"]).unwrap();
+        assert_eq!(
+            w.inner.collector,
+            crate::collector_run::CollectorSpec::Off,
+            "collector defaults to none"
+        );
+        assert_eq!(w.inner.collector_window_ms, 250, "window defaults to 250ms");
+
+        let w = Wrap::try_parse_from(["bf", "/bin/true", "--collector", "auto"]).unwrap();
+        assert_eq!(w.inner.collector, crate::collector_run::CollectorSpec::Auto);
+
+        let w = Wrap::try_parse_from([
+            "bf",
+            "/bin/true",
+            "--collector",
+            "/opt/probe",
+            "--collector-window-ms",
+            "500",
+        ])
+        .unwrap();
+        assert_eq!(
+            w.inner.collector,
+            crate::collector_run::CollectorSpec::Sidecar(PathBuf::from("/opt/probe"))
+        );
+        assert_eq!(w.inner.collector_window_ms, 500);
+    }
+
+    #[test]
     fn crash_signature_ignores_pids_and_addresses() {
         let first = "==12345==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x602000000010 at pc 0x55d4c3a1b2c3\n    #0 0x55d4c3a1b2c3 in parse /src/p.c:9\n==12345==ABORTING\n";
         let second = "==999==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x603000000a20 at pc 0x561234abcdef\n    #0 0x561234abcdef in parse /src/p.c:9\n==999==ABORTING\n";
@@ -2129,6 +2241,8 @@ mod tests {
             setup_command: None,
             oracle_command: None,
             reset_command: None,
+            collector: crate::collector_run::CollectorSpec::Off,
+            collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
         };
 
         // Without the triggering arg the target exits 0 — no finding.
@@ -2430,6 +2544,8 @@ mod afl_qemu_tests {
             setup_command: None,
             oracle_command: None,
             reset_command: None,
+            collector: crate::collector_run::CollectorSpec::Off,
+            collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
         };
         let summary = run_inner(args).expect("binary fuzz run");
         let ids = summary["findings"].as_array().expect("findings array");
@@ -2530,6 +2646,8 @@ mod afl_qemu_tests {
                     .to_owned(),
             ),
             reset_command: None,
+            collector: crate::collector_run::CollectorSpec::Off,
+            collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
         };
         let summary = run_inner(args).expect("binary fuzz run");
         let ids = summary["findings"].as_array().expect("findings array");

@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "bhf_collector_win"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+# Installed sidecar binary. Named with a hyphen per the CLI naming convention
+# while the crate/dir uses underscores (dir == package).
+[[bin]]
+name = "bhf-collector-win"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = { workspace = true }
+runtime_collector = { path = "../runtime_collector" }
+
+# Windows-only native ETW / Win32 bindings. Pure-Rust generated FFI (no C
+# toolchain), gated to `cfg(windows)` so it never enters a non-Windows build and
+# the crate compiles to its pure core on Linux CI. License: MIT OR Apache-2.0.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Diagnostics_Etw",
+    "Win32_System_Threading",
+] }

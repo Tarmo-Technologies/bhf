@@ -192,6 +192,30 @@ a `taint_path` evidence value describing the source→sink flow:
 for BHF-408. Static-scan findings carry no `confirmation` marker, so consumers
 use the field to separate runtime-confirmed hits from static candidates.
 
+### Platform-neutral collector (`--collector`)
+
+The `LD_PRELOAD` runtrace shim above is the in-process Linux provider. The
+`--collector` flag (`bhf fuzz` / `bhf binary fuzz`, #60) adds a **decoupled**
+provider addressed by a versioned JSONL wire contract
+(`bhf.collector-event.v1`, JSON Schema in `schemas/`) instead of linking into the
+target: it observes the same families of effects — process execution, filesystem
+operations with resolved paths, and module loads — but from a separate provider
+(the native Windows ETW provider `bhf-collector-win`, or any external sidecar that
+speaks the protocol). The host attributes the observed events to the testcase's
+descendant process tree within a bounded post-exit window and maps them through the
+**same executable-oracle registry**, so a controlled process execution, path escape,
+or controlled library load becomes a `binary_semantic` finding with no crash — the
+`CollectorEvent`'s `input_derived`/`taint_offset` carries byte-origin taint forward
+so a fixed program constant (not input-derived) is never taint-confirmed, exactly as
+the shim's cross-execution correlation does.
+
+Fidelity is first-class: dropped events, platform-unsupported APIs, and permission
+denials are recorded on the stream and refuse a false "clean" assurance rather than
+silently vanishing. Each run and finding records collector provenance (backend
+name/version/hash, process-tree scope, observation window, observed event classes,
+fidelity), and a collector finding stores its raw `CollectorSession` evidence so
+replay reproduces the finding deterministically and the attribution can be audited.
+
 ## Audit-Only Fallback
 
 If the shim cannot be loaded (host without `LD_PRELOAD` support, statically
