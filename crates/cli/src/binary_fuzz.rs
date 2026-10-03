@@ -586,10 +586,11 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
                 // >=4-byte subject appears in EVERY input that reaches the sink is
                 // fundamentally indistinguishable from a fuzz-controlled subject
                 // and may remain confirmed. This is acceptable — #60's threat model
-                // (printable path / command / module constants under mutation) is
-                // well served, because a real campaign eventually mutates the
-                // echoing bytes while still reaching the sink, producing the
-                // untainted observation that suppresses the constant.
+                // (printable path / command / module constants) is well served:
+                // across the campaign's distinct inputs (multiple operator-supplied
+                // seeds, or a mutating engine such as afl-qemu) the echoing bytes
+                // vary while the sink is still reached, producing the untainted
+                // observation that suppresses the constant.
                 let mut gate_tracker = if oracles.is_some() {
                     campaign_gate_tracker.clone()
                 } else {
