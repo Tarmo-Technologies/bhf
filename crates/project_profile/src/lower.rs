@@ -427,6 +427,10 @@ pub fn lower_target(target: &Target) -> Result<(LoweredLaunch, Vec<Warning>), Pr
 mod tests {
     use super::*;
 
+    // Wrong-variant arms name the variant statically and never Debug-format the
+    // launch body, which carries classified env/secret handles (CodeQL
+    // cleartext-logging). A real regression still panics with a useful message.
+
     fn base_target(id: &str, engine: &str) -> Target {
         Target {
             id: id.to_owned(),
@@ -470,7 +474,7 @@ mod tests {
                 assert_eq!(n.afl_mode, AflMode::Frida);
                 assert_eq!(n.afl_inst_ranges.as_deref(), Some("libfoo.so"));
             }
-            other => panic!("expected native launch, got {other:?}"),
+            LoweredLaunch::Binary(_) => panic!("expected native launch, got binary"),
         }
     }
 
@@ -492,7 +496,7 @@ mod tests {
                 assert_eq!(b.runtime_oracles, RuntimeOraclesMode::Off);
                 assert!(b.oracle_command.is_none());
             }
-            other => panic!("expected binary launch, got {other:?}"),
+            LoweredLaunch::Native(_) => panic!("expected binary launch, got native"),
         }
     }
 
@@ -566,7 +570,7 @@ mod tests {
                 // runner + postcondition are builtin-only → engine pinned.
                 assert_eq!(b.engine, BinaryEngine::Builtin);
             }
-            other => panic!("expected binary launch, got {other:?}"),
+            LoweredLaunch::Native(_) => panic!("expected binary launch, got native"),
         }
     }
 
@@ -577,7 +581,7 @@ mod tests {
         let (launch, _) = lower_target(&t).unwrap();
         match launch {
             LoweredLaunch::Binary(b) => assert_eq!(b.target_args, vec!["--flag".to_owned()]),
-            other => panic!("expected binary launch, got {other:?}"),
+            LoweredLaunch::Native(_) => panic!("expected binary launch, got native"),
         }
     }
 
@@ -653,7 +657,7 @@ mod tests {
         let (launch, _) = lower_target(&t).unwrap();
         match launch {
             LoweredLaunch::Native(n) => assert_eq!(n.runtime_oracles, RuntimeOraclesMode::On),
-            other => panic!("expected native launch, got {other:?}"),
+            LoweredLaunch::Binary(_) => panic!("expected native launch, got binary"),
         }
     }
 
@@ -680,7 +684,7 @@ mod tests {
         let (launch, _) = lower_target(&base_target("d", "builtin")).unwrap();
         match launch {
             LoweredLaunch::Native(n) => assert_eq!(n.runtime_oracles, RuntimeOraclesMode::Off),
-            other => panic!("expected native launch, got {other:?}"),
+            LoweredLaunch::Binary(_) => panic!("expected native launch, got binary"),
         }
     }
 
@@ -695,7 +699,7 @@ mod tests {
                 assert_eq!(b.engine, BinaryEngine::Auto);
                 assert_eq!(b.target_args, vec!["--flag".to_owned()]);
             }
-            other => panic!("expected binary launch, got {other:?}"),
+            LoweredLaunch::Native(_) => panic!("expected binary launch, got native"),
         }
     }
 

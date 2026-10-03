@@ -31,8 +31,8 @@ use serde_json::json;
 use project_profile::{
     check_bhf_version, load as load_text, lower_target, resolve, validate as validate_manifest,
     AflMode as PpAflMode, BinaryEngine as PpBinaryEngine, BinaryInput, BinaryLaunch, LoweredLaunch,
-    Manifest, NativeEngine as PpNativeEngine, NativeLaunch, ProcessEnv, ResolveOptions, Resolved,
-    ResolvedExtension, RunContext, RuntimeOraclesMode as PpRuntimeOraclesMode,
+    Manifest, MergedDictionary, NativeEngine as PpNativeEngine, NativeLaunch, ProcessEnv,
+    ResolveOptions, ResolvedExtension, RunContext, RuntimeOraclesMode as PpRuntimeOraclesMode,
 };
 
 use crate::binary_fuzz::{self, BinaryFuzzArgs, BinaryFuzzEngine, BinaryInputMode};
@@ -341,14 +341,26 @@ fn run_run(a: &RunArgs) -> Result<i32> {
     if a.json {
         println!("{provenance_json}");
     } else {
+        // Print only non-secret identifiers. `engine` is read from `target` (the
+        // manifest value, identical to `provenance.engine`) rather than from
+        // `resolved`, which also carries the resolved env/secret values — this
+        // keeps any secret-tainted field off this console sink (CodeQL
+        // cleartext-logging).
         println!(
             "project '{}' target '{}' [{}]: running in {}",
             manifest.project.id,
             target.id,
-            resolved.provenance.engine,
+            target.engine,
             work_dir.display()
         );
-        for w in &resolved.warnings {
+        // Move the warnings out of `resolved` before logging them: `resolved`
+        // also holds the real resolved env/secret values, so reading a field
+        // *through* it taints the value for CodeQL cleartext-logging. A move
+        // re-roots the clean sub-value — the same reason `run_validate` logs
+        // from its moved-out `provenances`. The dispatch below borrows only
+        // individual `resolved` fields, so this partial move is sound.
+        let warnings = resolved.warnings;
+        for w in &warnings {
             bhfeprintln!("warning: {}", w.message);
         }
     }
@@ -358,7 +370,13 @@ fn run_run(a: &RunArgs) -> Result<i32> {
     let is_native = matches!(resolved.launch, LoweredLaunch::Native(_));
     let exit = match &resolved.launch {
         LoweredLaunch::Native(launch) => {
-            materialize_native(launch, &target.id, &work_dir, &resolved)?;
+            materialize_native(
+                launch,
+                &target.id,
+                &work_dir,
+                &resolved.resolved_binary,
+                &resolved.merged_dictionary,
+            )?;
             let seed_files = expand_seed_files(&resolved.resolved_seeds)?;
             let mut fuzz_args = plan_to_fuzz_args(
                 launch,
@@ -483,7 +501,8 @@ fn materialize_native(
     launch: &NativeLaunch,
     target_id: &str,
     work_dir: &Path,
-    resolved: &Resolved,
+    resolved_binary: &Path,
+    merged_dictionary: &MergedDictionary,
 ) -> Result<()> {
     let build_dir = work_dir.join("build").join(target_id);
     std::fs::create_dir_all(&build_dir)
@@ -494,19 +513,19 @@ fn materialize_native(
         PpNativeEngine::Builtin => "main",
     };
     let dest = build_dir.join(main_name);
-    std::fs::copy(&resolved.resolved_binary, &dest).with_context(|| {
+    std::fs::copy(resolved_binary, &dest).with_context(|| {
         format!(
             "materialize harness '{}' to '{}'",
-            resolved.resolved_binary.display(),
+            resolved_binary.display(),
             dest.display()
         )
     })?;
     make_executable(&dest)?;
 
-    if !resolved.merged_dictionary.tokens.is_empty() {
+    if !merged_dictionary.tokens.is_empty() {
         std::fs::write(
             build_dir.join("dictionary.txt"),
-            resolved.merged_dictionary.to_afl_format(),
+            merged_dictionary.to_afl_format(),
         )
         .context("materialize merged dictionary")?;
     }

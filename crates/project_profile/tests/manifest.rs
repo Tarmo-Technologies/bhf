@@ -124,7 +124,7 @@ reset-command = "./reset-case"
             assert_eq!(b.oracle_command.as_deref(), Some("./check-postcondition"));
             assert_eq!(b.engine, project_profile::BinaryEngine::Builtin);
         }
-        other => panic!("expected binary launch, got {other:?}"),
+        LoweredLaunch::Native(_) => panic!("expected binary launch, got native"),
     }
 }
 
@@ -269,7 +269,12 @@ fn resolve_native_target_produces_full_provenance() {
     for a in &resolved.provenance.assets {
         if a.kind != AssetKind::MergedDictionary {
             // Declared (manifest-relative) path is recorded, not an abs path.
-            assert!(!a.path.starts_with('/'), "abs path leaked: {}", a.path);
+            // The message stays static: asset paths are manifest-derived and
+            // CodeQL conservatively taints them, so never format one into a sink.
+            assert!(
+                !a.path.starts_with('/'),
+                "a provenance asset path must be manifest-relative, not absolute"
+            );
         }
         assert_eq!(a.sha256.len(), 64);
     }
@@ -304,10 +309,11 @@ fn resolve_native_target_produces_full_provenance() {
         resolved.env_redaction.get("TOKEN").map(String::as_str),
         Some("${secret:API_TOKEN}")
     );
+    // Static message: the redaction map pairs env names with `${secret:...}` /
+    // `${env:...}` handles, which CodeQL taints — never format it into a sink.
     assert!(
         !resolved.env_redaction.contains_key("PROFILE"),
-        "a public literal must not be redacted: {:?}",
-        resolved.env_redaction
+        "a public literal must not appear in the redaction map"
     );
     assert!(resolved.env_redaction.values().all(|v| v != "s3cr3t-value"));
 }
@@ -363,7 +369,7 @@ fn resolve_binary_target_hashes_binary_and_seeds() {
         LoweredLaunch::Binary(b) => {
             assert_eq!(b.input_mode, project_profile::BinaryInput::File);
         }
-        other => panic!("expected binary launch, got {other:?}"),
+        LoweredLaunch::Native(_) => panic!("expected binary launch, got native"),
     }
     assert_eq!(resolved.provenance.engine, "binary");
     assert_eq!(resolved.provenance.input_mode, "file");
