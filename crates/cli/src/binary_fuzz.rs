@@ -344,6 +344,10 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
     let oracles = RuntimeOracles::resolve(args.runtime_oracles, "reporting")?;
     let oracle_log = tmp_dir.join("runtrace.jsonl");
     let mut tracker = crate::auto::runtrace::SinkTaintTracker::default();
+    // Snapshot of the campaign's cross-execution taint evidence, captured before
+    // `tracker.into_confirmed()` consumes it, so the #60 collector adapter's gate
+    // can reuse the SAME correlation #59 built (empty when runtime oracles are off).
+    let mut campaign_gate_tracker = crate::auto::runtrace::SinkTaintTracker::default();
     // (oracle hit, representative testcase) pairs; deduped at emission.
     let mut semantic_hits: Vec<(finding_rules::oracle_sdk::OracleHit, Vec<u8>)> = Vec::new();
 
@@ -462,6 +466,9 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
     // #59: emit semantic findings for every distinct oracle violation — these fire
     // even when the target exited zero on every input.
     if oracles.is_some() {
+        // Preserve the campaign's cross-execution evidence for the collector gate
+        // (below) before into_confirmed() moves the tracker's retained inputs out.
+        campaign_gate_tracker = tracker.clone();
         for confirmed in tracker.into_confirmed() {
             if let Some(hit) = crate::auto::runtrace::confirmed_sink_hit(&confirmed) {
                 semantic_hits.push((hit, confirmed.input.clone()));
@@ -523,6 +530,15 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
                         &tmp_dir,
                         Some((shim, col_log.as_path())),
                     )?;
+                    // #60: route sink confirmation through the SAME cross-execution
+                    // correlation #59 uses — never a single run's raw taint_offset.
+                    // Start from the campaign's accumulated evidence (so a sink the
+                    // campaign saw untainted elsewhere stays suppressed here) and fold
+                    // in this observation pass; with runtime oracles off the campaign
+                    // snapshot is empty, so the gate is this pass's own correlation.
+                    let mut gate_tracker = campaign_gate_tracker.clone();
+                    gate_tracker.observe(&run.oracle_events, &representative);
+                    let gate = gate_tracker.collector_gate();
                     let adapter_ctx = crate::auto::runtrace::CollectorAdapterCtx {
                         testcase: "binary-fuzz".to_owned(),
                         worker: 0,
@@ -532,6 +548,7 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
                         &run.oracle_events,
                         &adapter_ctx,
                         &args.binary.display().to_string(),
+                        &gate,
                     );
                     resolved.evaluate_jsonl(&jsonl, &args.work_dir.display().to_string())
                 } else {

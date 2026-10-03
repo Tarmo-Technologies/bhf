@@ -237,7 +237,14 @@ impl EtwDecoder {
                 let mut c = Cursor::new(ev.user_data, ev.pointer_size);
                 c.skip(ev.pointer_size.bytes())?; // IrpPtr
                 let file_object = c.ptr()?;
-                c.skip(4)?; // IssuingThreadId (v3+)
+                // `IssuingThreadId` is a v3+ addition to `FileIo_Create`; a v2
+                // payload has no such field. Skipping it unconditionally would
+                // mis-align every field after it (reading `FileAttributes` as
+                // `CreateOptions`, shifting the path) on a v2 event — so guard it
+                // by version, exactly like the sibling process/image decoders.
+                if ev.version >= 3 {
+                    c.skip(4)?; // IssuingThreadId (v3+)
+                }
                 let create_options = c.u32()?;
                 c.skip(4)?; // FileAttributes
                 c.skip(4)?; // ShareAccess
@@ -840,6 +847,125 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn fileio_create_v2_and_v3_decode_the_same_path_and_op() {
+        // The v3 `FileIo_Create` MOF has an `IssuingThreadId` DWORD that v2 lacks.
+        // Both versions must decode to the SAME create op + the EXACT SAME full path:
+        // v3 by skipping the field, v2 by NOT skipping it. The full-path equality is
+        // the discriminator — a mis-guarded skip shifts the v2 path read by 4 bytes
+        // (dropping its leading `\D`), which `ends_with` would miss but a full
+        // comparison catches.
+        let create_options = 2u32 << 24; // FILE_CREATE -> Create
+        let path = "\\Device\\HarddiskVolume2\\sandbox\\new.bin";
+
+        // v2: IrpPtr, FileObject, CreateOptions, FileAttributes, ShareAccess, Path.
+        let v2 = Buf::new(PointerSize::Eight)
+            .ptr(0xAAAA) // IrpPtr
+            .ptr(0xF00D) // FileObject
+            .u32(create_options)
+            .u32(0) // FileAttributes
+            .u32(0) // ShareAccess
+            .utf16z(path)
+            .done();
+        let mut d2 = EtwDecoder::new();
+        let rec2 = d2
+            .decode(&ev(
+                EtwProvider::FileIo,
+                OP_FILE_CREATE,
+                2,
+                PointerSize::Eight,
+                1000,
+                &v2,
+            ))
+            .expect("v2 fileio create decodes");
+
+        // v3: IrpPtr, FileObject, IssuingThreadId, CreateOptions, FileAttributes,
+        // ShareAccess, Path.
+        let v3 = Buf::new(PointerSize::Eight)
+            .ptr(0xAAAA) // IrpPtr
+            .ptr(0xF00D) // FileObject
+            .u32(99) // IssuingThreadId (v3+)
+            .u32(create_options)
+            .u32(0) // FileAttributes
+            .u32(0) // ShareAccess
+            .utf16z(path)
+            .done();
+        let mut d3 = EtwDecoder::new();
+        let rec3 = d3
+            .decode(&ev(
+                EtwProvider::FileIo,
+                OP_FILE_CREATE,
+                3,
+                PointerSize::Eight,
+                1000,
+                &v3,
+            ))
+            .expect("v3 fileio create decodes");
+
+        for (label, rec) in [("v2", rec2), ("v3", rec3)] {
+            match rec {
+                WinRawRecord::FileOp {
+                    pid,
+                    op,
+                    path: decoded,
+                    ..
+                } => {
+                    assert_eq!(pid, 1000, "{label} pid");
+                    assert_eq!(op, WinFileOp::Create, "{label} op");
+                    assert_eq!(decoded, path, "{label} path must decode EXACTLY, byte for byte");
+                }
+                other => panic!("{label}: expected FileOp, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn fileio_create_v2_version_guard_flips_op_and_path_if_removed() {
+        // A v2 payload has NO IssuingThreadId. This buffer is crafted so that if the
+        // decoder skipped the (non-existent) DWORD anyway — the pre-fix bug — it
+        // would read `FileAttributes` as the disposition and shift the path. Both the
+        // op AND the full path would change, so this test fails loudly if the version
+        // guard is ever removed (not a coincidence-pass).
+        //
+        // CreateOptions disposition = FILE_OPEN (1) -> correct result is Open.
+        // FileAttributes top byte = FILE_CREATE (2) -> the buggy skip would read it
+        // as the disposition and yield Create instead.
+        let path = "\\Device\\HarddiskVolume2\\sandbox\\v2only.bin";
+        let v2 = Buf::new(PointerSize::Eight)
+            .ptr(0xAAAA) // IrpPtr
+            .ptr(0xBEEF) // FileObject
+            .u32(1u32 << 24) // CreateOptions: FILE_OPEN  -> Open (correct)
+            .u32(2u32 << 24) // FileAttributes w/ FILE_CREATE top byte -> Create (buggy)
+            .u32(0) // ShareAccess
+            .utf16z(path)
+            .done();
+        let mut d = EtwDecoder::new();
+        let rec = d
+            .decode(&ev(
+                EtwProvider::FileIo,
+                OP_FILE_CREATE,
+                2,
+                PointerSize::Eight,
+                1000,
+                &v2,
+            ))
+            .expect("v2 fileio create decodes");
+        match rec {
+            WinRawRecord::FileOp { op, path: decoded, .. } => {
+                assert_eq!(
+                    op,
+                    WinFileOp::Open,
+                    "a v2 FILE_OPEN must classify as Open; Create means the guard was dropped"
+                );
+                assert_eq!(
+                    decoded, path,
+                    "a v2 path must decode EXACTLY; a shifted path means the guard was dropped"
+                );
+            }
+            other => panic!("expected FileOp, got {other:?}"),
+        }
     }
 
     #[test]

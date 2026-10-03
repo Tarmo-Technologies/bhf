@@ -1239,26 +1239,38 @@ fn run_collector_for_fuzz(
     let outcome = if resolved.runtrace_shim().is_some() {
         // Linux built-in provider: re-express the LD_PRELOAD shim events the builtin
         // fuzz loop already captured (`work_dir/runtrace.jsonl`) as collector events.
-        // The loop writes that log when the runtrace shim is armed (for example with
-        // `--runtime-oracles`), so `--collector auto` layers a collector-shaped view
-        // over the SAME shim events without changing the runtime-oracle behaviour or
-        // re-running the harness.
+        // The loop writes that log ONLY when the runtrace shim is armed (for example
+        // with `--runtime-oracles`), so `--collector auto` layers a collector-shaped
+        // view over the SAME shim events without changing the runtime-oracle
+        // behaviour or re-running the harness.
         let log = work_dir.join("runtrace.jsonl");
-        let events = if log.is_file() {
+        if !log.is_file() {
+            // #60 AC6: the shim was NOT armed (e.g. the default `--runtime-oracles
+            // off`), so the collector observed nothing this run. Record a degraded,
+            // not-observed run rather than evaluating an empty stream and claiming a
+            // clean collector assurance over coverage it never had.
+            resolved.not_observed("runtime_shim_not_armed")
+        } else {
             let mut events = crate::auto::runtrace::parse_log(&log).unwrap_or_default();
             crate::auto::runtrace::dedupe_in_place(&mut events);
-            events
-        } else {
-            Vec::new()
-        };
-        let adapter_ctx = crate::auto::runtrace::CollectorAdapterCtx {
-            testcase: "fuzz".to_owned(),
-            worker: 0,
-            root_pid: 1,
-        };
-        let jsonl =
-            crate::auto::runtrace::collector_jsonl_from_events(&events, &adapter_ctx, harness_id);
-        resolved.evaluate_jsonl(&jsonl, &work_dir.display().to_string())
+            // Route sink confirmation through the SAME cross-execution correlation
+            // #59 uses: the aggregated log spans every execution, so the gate's
+            // never-untainted / constant-suppression applies across the whole run
+            // and no sink is single-run taint-confirmed.
+            let gate = crate::auto::runtrace::CollectorTaintGate::from_events(&events);
+            let adapter_ctx = crate::auto::runtrace::CollectorAdapterCtx {
+                testcase: "fuzz".to_owned(),
+                worker: 0,
+                root_pid: 1,
+            };
+            let jsonl = crate::auto::runtrace::collector_jsonl_from_events(
+                &events,
+                &adapter_ctx,
+                harness_id,
+                &gate,
+            );
+            resolved.evaluate_jsonl(&jsonl, &work_dir.display().to_string())
+        }
     } else {
         let params = crate::collector_run::CollectorRunParams {
             testcase: "fuzz".to_owned(),
@@ -8634,6 +8646,53 @@ mod auto_path_tests {
             crate::collector_run::CollectorSpec::Sidecar(std::path::PathBuf::from("/opt/probe"))
         );
         assert_eq!(w.inner.collector_window_ms, 750);
+    }
+
+    /// #60 AC6 regression: `bhf fuzz --collector auto` with the runtrace shim NOT
+    /// armed (no `runtrace.jsonl` — the default `--runtime-oracles off`) must never
+    /// report `clean_assurance=true` over an unobserved run. The Linux built-in
+    /// relies on the loop's shim log; absent it, the collector observed nothing and
+    /// must record a degraded, not-observed run.
+    #[cfg(unix)]
+    #[test]
+    fn collector_auto_without_shim_log_is_not_reported_clean() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let work = std::env::temp_dir().join(format!("bhf-fuzz-col-noobs-{nonce}"));
+        std::fs::create_dir_all(&work).unwrap();
+
+        // No runtrace.jsonl is written (the shim was never armed).
+        let prov = run_collector_for_fuzz(
+            &crate::collector_run::CollectorSpec::Auto,
+            crate::collector_run::DEFAULT_WINDOW_MS,
+            &work,
+            "harness",
+        )
+        .expect("collector provenance");
+
+        if prov.pointer("/active") == Some(&serde_json::json!(true)) {
+            // The runtrace built-in resolved (shim available) but observed nothing:
+            // it must be degraded, never a clean assurance over an empty stream.
+            assert_eq!(prov.pointer("/mode"), Some(&serde_json::json!("runtrace")));
+            assert_eq!(
+                prov.pointer("/observed"),
+                Some(&serde_json::json!(false)),
+                "a not-observed collector run must be marked observed:false: {prov}"
+            );
+            assert_ne!(
+                prov.pointer("/clean_assurance"),
+                Some(&serde_json::json!(true)),
+                "a collector that observed nothing must NOT report clean_assurance=true: {prov}"
+            );
+        } else {
+            // Shim unavailable on this host: the collector is inactive, so the
+            // false-clean claim cannot arise at all.
+            assert_eq!(prov.pointer("/active"), Some(&serde_json::json!(false)));
+        }
+
+        let _ = std::fs::remove_dir_all(&work);
     }
 
     fn fuzz_args_for_worker_passthrough(structured_inputs: StructuredInputMode) -> FuzzArgs {

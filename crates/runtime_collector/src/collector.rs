@@ -24,6 +24,14 @@ pub struct BackendInfo {
     pub version: String,
     /// Content/build hash of the backend (empty when not applicable).
     pub hash: String,
+    /// The event classes this backend can observe *at all* — its declared
+    /// capability, independent of which classes happened to fire on any one run.
+    /// This feeds `CollectorProvenance.supported_event_classes` so a blind-spot
+    /// audit sees the backend's full coverage, never just the subset a given run
+    /// exercised (AC7). Empty means the backend did not declare its coverage (for
+    /// example an arbitrary out-of-tree `--collector <PATH>` sidecar whose
+    /// capabilities the host cannot know).
+    pub supported_event_classes: Vec<String>,
 }
 
 impl BackendInfo {
@@ -36,7 +44,19 @@ impl BackendInfo {
             name: name.into(),
             version: version.into(),
             hash: hash.into(),
+            supported_event_classes: Vec::new(),
         }
+    }
+
+    /// Declare the event classes this backend can observe (AC7). Chainable.
+    #[must_use]
+    pub fn with_supported_classes<I, S>(mut self, classes: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.supported_event_classes = classes.into_iter().map(Into::into).collect();
+        self
     }
 }
 

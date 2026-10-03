@@ -318,8 +318,9 @@ needing no `--harness`. Event loss, platform-unsupported APIs, or a permission
 denial are recorded as **fidelity limitations** that refuse a false "clean"
 assurance rather than silently dropping observations, and each run and finding
 records collector **provenance**: the backend name/version/hash, the process-tree
-scope, the observation window, the observed event classes, and the fidelity
-limitations. `bhf minimize` on a collector finding is a no-op (the provider-captured
+scope, the observation window, the backend's declared **supported event classes**
+(kept distinct from the classes actually **observed** firing this run), and the
+fidelity limitations. `bhf minimize` on a collector finding is a no-op (the provider-captured
 evidence does not vary with the testcase bytes) that re-confirms reproduction.
 
 `bhf binary fuzz` also accepts **user-defined postcondition oracles** with

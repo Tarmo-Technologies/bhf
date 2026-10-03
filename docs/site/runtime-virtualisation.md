@@ -58,15 +58,23 @@ re-expresses these effect events as the versioned `bhf.collector-event.v1`
 contract (`crate::auto::runtrace::to_collector_event` /
 `collector_jsonl_from_events`): `exec`/`system`/`popen` → `process_create`,
 `lib_load`/`dlopen` → `module_load`, `open`/`openat`/`fs_destroy` → the file
-families, `net_egress`/`connect` → `network`, carrying the byte-origin
-`taint_offset` through so a fuzz-controlled sink maps to the `Tainted*` oracle
-variant. On `bhf binary fuzz` the collector runs the target once under the shim
-as a **dedicated observation pass** (separate from the crash-detection loop, so
-`--runtime-oracles` behaviour is unchanged); on `bhf fuzz` it re-reads the loop's
-own `runtrace.jsonl`. The result feeds the same oracle registry and stored-
-evidence replay as the native Windows ETW provider — it is an additional view,
-not a second source. `--collector auto` stays inactive only when the runtrace
-shim is unavailable (never fabricating a clean run).
+families, `net_egress`/`connect` → `network`. A sink family is marked
+taint-confirmed in the collector stream **only** when a `CollectorTaintGate`
+confirms it through the SAME cross-execution correlation / constant-suppression
+the runtime oracles use — never from a single run's `taint_offset` — so a program
+constant echoed into one input is not presented as a taint-confirmed finding. On
+`bhf binary fuzz` the collector runs the target once under the shim as a
+**dedicated observation pass** (separate from the crash-detection loop, so
+`--runtime-oracles` behaviour is unchanged) and the gate reuses the campaign's
+accumulated taint evidence; on `bhf fuzz` it re-reads the loop's own
+`runtrace.jsonl` and correlates across every execution it contains. The result
+feeds the same oracle registry and stored-evidence replay as the native Windows
+ETW provider — it is an additional view, not a second source. `--collector auto`
+stays inactive when the runtrace shim is unavailable, and when the shim exists but
+was **not armed** (e.g. the default `--runtime-oracles off`, so the loop wrote no
+`runtrace.jsonl`) the run is recorded as a degraded, **not-observed** run —
+`observed: false`, never `clean_assurance: true` — rather than fabricating a clean
+observation over coverage it never had.
 
 ## Allocation Discipline
 
@@ -230,7 +238,8 @@ the shim's cross-execution correlation does.
 Fidelity is first-class: dropped events, platform-unsupported APIs, and permission
 denials are recorded on the stream and refuse a false "clean" assurance rather than
 silently vanishing. Each run and finding records collector provenance (backend
-name/version/hash, process-tree scope, observation window, observed event classes,
+name/version/hash, process-tree scope, observation window, the backend's declared
+supported event classes kept distinct from the classes observed firing this run,
 fidelity), and a collector finding stores its raw `CollectorSession` evidence so
 replay reproduces the finding deterministically and the attribution can be audited.
 

@@ -39,6 +39,35 @@ use std::process::Command;
 /// The default bounded post-exit observation window, in milliseconds.
 pub const DEFAULT_WINDOW_MS: u64 = 250;
 
+/// Event classes the Linux built-in (runtrace→collector) provider can observe at
+/// all — its *declared* coverage (AC7), independent of what fires on any one run.
+/// This is exactly the set [`crate::auto::runtrace::to_collector_event`] can
+/// produce from the LD_PRELOAD shim's event vocabulary. The shim cannot observe
+/// `shell_execute`/`registry`, nor the create/write/rename file sub-kinds, so
+/// declaring those would overstate coverage and mislead a blind-spot audit.
+pub const RUNTRACE_SUPPORTED_CLASSES: &[&str] = &[
+    "file_delete",
+    "file_open",
+    "module_load",
+    "network",
+    "process_create",
+];
+
+/// Event classes the native Windows ETW provider (`bhf-collector-win`) can
+/// observe — the process, file-I/O, and image-load kernel providers it
+/// subscribes to. It does not subscribe to a network or registry provider, so
+/// those are deliberately absent.
+pub const WINDOWS_SUPPORTED_CLASSES: &[&str] = &[
+    "file_create",
+    "file_delete",
+    "file_open",
+    "file_rename",
+    "file_write",
+    "module_load",
+    "process_create",
+    "shell_execute",
+];
+
 /// How `--collector` resolves a provider.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum CollectorSpec {
@@ -140,7 +169,16 @@ pub fn resolve(spec: &CollectorSpec, window_ms: u64) -> anyhow::Result<Option<Re
 fn resolve_auto(window_ms: u64) -> anyhow::Result<Option<ResolvedCollector>> {
     if cfg!(windows) {
         match locate_windows_sidecar() {
-            Some(path) => Ok(Some(resolved_for(path, window_ms)?)),
+            // The auto-resolved Windows sidecar is the known native ETW provider,
+            // so it declares the ETW-observable classes (AC7). An arbitrary
+            // `--collector <PATH>` sidecar cannot be assumed to, and declares none.
+            Some(path) => {
+                let mut resolved = resolved_for(path, window_ms)?;
+                resolved.backend = resolved
+                    .backend
+                    .with_supported_classes(WINDOWS_SUPPORTED_CLASSES.iter().copied());
+                Ok(Some(resolved))
+            }
             None => Err(anyhow!(
                 "--collector auto: the native Windows collector (bhf-collector-win) \
                  was not found next to bhf; build it (`cargo build -p bhf_collector_win`) \
@@ -186,7 +224,8 @@ fn resolved_runtrace(
         "runtrace",
         env!("CARGO_PKG_VERSION"),
         shim.shim_sha256().to_owned(),
-    );
+    )
+    .with_supported_classes(RUNTRACE_SUPPORTED_CLASSES.iter().copied());
     ResolvedCollector {
         source: CollectorSource::Runtrace(shim),
         window_ms,
@@ -318,6 +357,7 @@ impl ResolvedCollector {
         let mut seen: BTreeSet<String> = BTreeSet::new();
         let mut run_fidelity = runtime_collector::schema::Fidelity::default();
         let mut tree_scope: BTreeSet<u32> = BTreeSet::new();
+        let mut run_observed: BTreeSet<String> = BTreeSet::new();
 
         for session in &set.sessions {
             run_fidelity.merge(&session.fidelity);
@@ -326,12 +366,15 @@ impl ResolvedCollector {
             for pid in &attributed.tree_pids {
                 tree_scope.insert(*pid);
             }
-            let classes = observed_classes(session);
+            // The classes that actually FIRED this session (AC7: observed, kept
+            // distinct from the backend's declared coverage in provenance).
+            let observed = observed_classes(session);
+            run_observed.extend(observed.iter().cloned());
             let provenance = CollectorProvenance::from_attributed(
                 self.backend(),
                 &attributed,
                 self.window_ms,
-                classes,
+                observed,
                 session.fidelity.clone(),
             );
 
@@ -363,6 +406,10 @@ impl ResolvedCollector {
         let run_provenance = json!({
             "mode": self.source_label(),
             "active": true,
+            // The collector actually observed this run (events were collected and
+            // evaluated). Contrast `not_observed`, where a resolved collector could
+            // not observe at all and must never be read as a clean assurance (AC6).
+            "observed": true,
             "backend": {
                 "name": self.backend.name,
                 "version": self.backend.version,
@@ -370,6 +417,9 @@ impl ResolvedCollector {
             },
             "window_ms": self.window_ms,
             "process_tree_scope": tree_scope.into_iter().collect::<Vec<_>>(),
+            // AC7: declared backend coverage vs the subset that fired this run.
+            "supported_event_classes": self.backend.supported_event_classes.clone(),
+            "observed_event_classes": run_observed.into_iter().collect::<Vec<_>>(),
             "clean_assurance": set.clean_assurance_ok(),
             "fidelity": {
                 "lost": run_fidelity.lost,
@@ -380,6 +430,46 @@ impl ResolvedCollector {
 
         CollectorOutcome {
             findings,
+            run_provenance,
+        }
+    }
+
+    /// Provenance for a *resolved-but-not-observed* collector run: the provider
+    /// was active (successfully resolved) but could not actually observe this run,
+    /// so there is no event stream to evaluate. The Linux runtrace built-in hits
+    /// this when it relies on the fuzz loop's shim log and the loop did not arm the
+    /// shim (`--runtime-oracles off`): the shim never ran, so nothing was observed.
+    ///
+    /// Such a run is recorded DEGRADED — `observed: false`, `clean_assurance:
+    /// false`, with the reason captured as a fidelity limitation — and never
+    /// presents crash-only coverage as a clean collector assurance (#60 AC6). It
+    /// yields no findings (there was nothing to evaluate).
+    pub fn not_observed(&self, reason: impl Into<String>) -> CollectorOutcome {
+        let reason = reason.into();
+        let run_provenance = json!({
+            "mode": self.source_label(),
+            "active": true,
+            "observed": false,
+            "backend": {
+                "name": self.backend.name,
+                "version": self.backend.version,
+                "hash": self.backend.hash,
+            },
+            "window_ms": self.window_ms,
+            "process_tree_scope": Vec::<u32>::new(),
+            "supported_event_classes": self.backend.supported_event_classes.clone(),
+            "observed_event_classes": Vec::<String>::new(),
+            // Nothing was observed: a clean assurance is impossible, not merely
+            // absent. The reason is recorded as an unsupported-observation signal.
+            "clean_assurance": false,
+            "fidelity": {
+                "lost": 0,
+                "permission_denied": false,
+                "unsupported_fields": [reason],
+            },
+        });
+        CollectorOutcome {
+            findings: Vec::new(),
             run_provenance,
         }
     }
@@ -684,6 +774,17 @@ mod tests {
         }
     }
 
+    /// A runtrace-shaped resolved collector (sidecar source, but a backend that
+    /// declares the runtrace coverage) for exercising provenance class reporting.
+    fn declaring_resolved(window_ms: u64) -> ResolvedCollector {
+        ResolvedCollector {
+            source: CollectorSource::Sidecar(PathBuf::from("mock")),
+            window_ms,
+            backend: BackendInfo::new("mock", "test", "deadbeef")
+                .with_supported_classes(RUNTRACE_SUPPORTED_CLASSES.iter().copied()),
+        }
+    }
+
     fn sessions(mock: &MockCollector, testcase: &str, worker: u32) -> CollectorSessionSet {
         let ctx = CollectorContext::new(testcase, worker, "/srv/sandbox", 250);
         CollectorSessionSet::from_jsonl(&mock.observe(&ctx).unwrap())
@@ -761,6 +862,103 @@ mod tests {
             .findings
             .iter()
             .all(|f| !f.provenance.clean_assurance_ok()));
+    }
+
+    #[test]
+    fn not_observed_run_is_degraded_never_clean() {
+        // #60 AC6: a resolved collector that could not observe (shim not armed)
+        // must record a degraded, not-observed run — never a clean assurance over
+        // an unobserved stream — and emit no findings.
+        let collector = declaring_resolved(250);
+        let outcome = collector.not_observed("runtime_shim_not_armed");
+        assert!(outcome.findings.is_empty(), "no findings without observation");
+        assert_eq!(
+            outcome.run_provenance.pointer("/active"),
+            Some(&Value::Bool(true)),
+            "the collector was resolved/active"
+        );
+        assert_eq!(
+            outcome.run_provenance.pointer("/observed"),
+            Some(&Value::Bool(false)),
+            "but it observed nothing"
+        );
+        assert_eq!(
+            outcome.run_provenance.pointer("/clean_assurance"),
+            Some(&Value::Bool(false)),
+            "an unobserved run must never be reported clean"
+        );
+        let unsupported = outcome
+            .run_provenance
+            .pointer("/fidelity/unsupported_fields")
+            .and_then(Value::as_array)
+            .expect("unsupported_fields present");
+        assert!(
+            unsupported
+                .iter()
+                .any(|v| v.as_str() == Some("runtime_shim_not_armed")),
+            "the not-observed reason is recorded as a fidelity limitation"
+        );
+        // Declared backend coverage is still reported even with nothing observed.
+        assert_eq!(
+            outcome
+                .run_provenance
+                .pointer("/supported_event_classes")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(RUNTRACE_SUPPORTED_CLASSES.len())
+        );
+        assert_eq!(
+            outcome
+                .run_provenance
+                .pointer("/observed_event_classes")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn run_provenance_separates_declared_coverage_from_observed_classes() {
+        // #60 AC7: supported_event_classes is the backend's declared coverage;
+        // observed_event_classes is the subset that fired this run.
+        let collector = declaring_resolved(250);
+        let set = sessions(&MockCollector::process_exec(), "tc", 0);
+        let outcome = collector.evaluate(&set, "/srv/sandbox");
+
+        let supported: Vec<String> = outcome
+            .run_provenance
+            .pointer("/supported_event_classes")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect();
+        let observed: Vec<String> = outcome
+            .run_provenance
+            .pointer("/observed_event_classes")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect();
+
+        assert_eq!(
+            supported,
+            RUNTRACE_SUPPORTED_CLASSES
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+            "supported = backend-declared coverage, verbatim"
+        );
+        // observed = what the mock actually emitted this run (process_create
+        // boundaries + a shell_execute effect) — reported verbatim, NOT clamped to
+        // the declared set, and distinct from it.
+        assert!(observed.contains(&"shell_execute".to_owned()));
+        assert_ne!(observed, supported, "declared coverage != this run's hits");
+        // The per-finding provenance carries the same declared coverage.
+        for f in &outcome.findings {
+            assert_eq!(f.provenance.supported_event_classes, supported);
+        }
     }
 
     #[test]

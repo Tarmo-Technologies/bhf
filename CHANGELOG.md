@@ -109,15 +109,22 @@
   pointer-size- and version-aware MOF decode: `CreateProcess*`/descendants,
   file create/open/write/rename/delete with resolved paths, `LoadLibrary*`/image-load);
   on Linux the in-process `LD_PRELOAD` runtrace adapter, a collector-shaped view over
-  the same shim events that leaves `--runtime-oracles` unchanged. A PATH runs an
+  the same shim events that leaves `--runtime-oracles` unchanged. On Linux the adapter
+  reuses the fuzz loop's shim log, so `bhf fuzz --collector auto` with the shim not armed
+  (the default `--runtime-oracles off`) records a degraded, *not-observed* run rather
+  than claiming a clean assurance over coverage it never had, and the adapter confirms a
+  sink only through the SAME cross-execution correlation / constant-suppression the
+  runtime oracles use — never from a single run's taint. A PATH runs an
   external sidecar, and `none` (default) leaves behaviour unchanged. The Windows decode
-  logic is unit-tested on every platform against synthetic ETW-shaped records; the live
+  logic is unit-tested on every platform against synthetic ETW-shaped records (including
+  version-guarded v2/v3 `FileIo_Create` payloads); the live
   ETW run is validated on the Windows CI runner (`BHF_WIN_LIVE=1`). Findings store their raw collector
   session as evidence so `bhf replay` reproduces the semantic finding deterministically
   and a reviewer can audit the attribution; collection loss, unsupported APIs, or a
   permission denial are recorded as fidelity limitations and refuse a false "clean"
   assurance. Provenance records the backend name/version/hash, process-tree scope,
-  observation window, observed event classes, and fidelity, for importers /
+  observation window, the backend's *declared* supported event classes kept distinct
+  from the classes actually *observed* this run, and fidelity, for importers /
   SARIF / vulnerability-management tools. (#60)
 - `bhf fuzz --protocol-profile <PATH>` drives a response-dependent, multi-message
   **protocol session** (HDF-7): a versioned profile (`bhf.protocol.v1`, TOML)

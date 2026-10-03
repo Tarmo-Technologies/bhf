@@ -4,17 +4,25 @@
 //!
 //! Every collector-sourced finding has to be auditable: which backend produced
 //! it, at what version/hash, which process tree it watched, for how long after
-//! exit, which event classes that backend can observe at all, and what fidelity
-//! limitations applied. The seven fields below are serialized into the run
-//! manifest and each finding so a reviewer can tell a genuine clean run from one
-//! the collector simply could not see.
+//! exit, which event classes that backend can observe at all, which classes it
+//! actually saw fire on this run, and what fidelity limitations applied. The
+//! fields below are serialized into the run manifest and each finding so a
+//! reviewer can tell a genuine clean run from one the collector simply could not
+//! see.
+//!
+//! `supported_event_classes` and `observed_event_classes` are kept deliberately
+//! distinct (AC7): the former is the backend's *declared* coverage (what it can
+//! observe at all), the latter is the subset that actually fired this run.
+//! Conflating them — reporting only what fired as if it were the backend's
+//! coverage — would make a blind-spot audit under-report where the collector is
+//! blind, so they never share one field.
 
 use crate::attribute::AttributedSession;
 use crate::collector::BackendInfo;
 use crate::schema::Fidelity;
 use serde::{Deserialize, Serialize};
 
-/// The seven required provenance fields for a collector run / finding.
+/// The required provenance fields for a collector run / finding (AC7).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CollectorProvenance {
     /// 1. Backend name (for example `windows-etw`, `mock`).
@@ -27,19 +35,31 @@ pub struct CollectorProvenance {
     pub process_tree_scope: Vec<u32>,
     /// 5. The bounded post-exit observation window, in milliseconds.
     pub observation_window_ms: u64,
-    /// 6. The event classes this backend can observe.
+    /// 6. The event classes this backend can observe *at all* (its declared
+    ///    capability — not the subset that fired this run). Drives blind-spot
+    ///    audits: an empty or short list means the backend is blind to the
+    ///    classes it omits, regardless of what any single run happened to show.
     pub supported_event_classes: Vec<String>,
-    /// 7. Fidelity limitations that applied to this run.
+    /// 7. The event classes actually observed firing on *this* run (always a
+    ///    subset of `supported_event_classes` for a declaring backend). Recorded
+    ///    separately so "what the backend can see" is never confused with "what
+    ///    it saw this time".
+    pub observed_event_classes: Vec<String>,
+    /// 8. Fidelity limitations that applied to this run.
     pub fidelity: Fidelity,
 }
 
 impl CollectorProvenance {
     /// Build provenance from an attributed session plus the resolved backend.
+    ///
+    /// `supported_event_classes` is taken from the backend's *declared* coverage
+    /// ([`BackendInfo::supported_event_classes`]); `observed_event_classes` is
+    /// the set the caller observed firing on this run.
     pub fn from_attributed(
         backend: &BackendInfo,
         attributed: &AttributedSession<'_>,
         observation_window_ms: u64,
-        supported_event_classes: Vec<String>,
+        observed_event_classes: Vec<String>,
         fidelity: Fidelity,
     ) -> Self {
         CollectorProvenance {
@@ -48,7 +68,8 @@ impl CollectorProvenance {
             backend_hash: backend.hash.clone(),
             process_tree_scope: attributed.tree_pids.iter().copied().collect(),
             observation_window_ms,
-            supported_event_classes,
+            supported_event_classes: backend.supported_event_classes.clone(),
+            observed_event_classes,
             fidelity,
         }
     }
@@ -94,7 +115,16 @@ mod tests {
     fn collector_provenance_serializes_all_fields() {
         let session = sample_session(Fidelity::default());
         let attributed = attribute(&session, 250);
-        let backend = BackendInfo::new("windows-etw", "0.2.34", "deadbeef");
+        // A backend that can observe five classes...
+        let backend = BackendInfo::new("windows-etw", "0.2.34", "deadbeef")
+            .with_supported_classes([
+                "process_create",
+                "shell_execute",
+                "file_open",
+                "file_write",
+                "module_load",
+            ]);
+        // ...but only two fired on this run.
         let prov = CollectorProvenance::from_attributed(
             &backend,
             &attributed,
@@ -111,6 +141,7 @@ mod tests {
             "process_tree_scope",
             "observation_window_ms",
             "supported_event_classes",
+            "observed_event_classes",
             "fidelity",
         ] {
             assert!(
@@ -120,9 +151,52 @@ mod tests {
         }
         assert_eq!(prov.process_tree_scope, vec![1000, 1001]);
 
+        // AC7: supported = backend-declared coverage (five), observed = fired
+        // this run (two). The two must not be conflated.
+        assert_eq!(prov.supported_event_classes.len(), 5);
+        assert_eq!(
+            prov.observed_event_classes,
+            vec!["process_create".to_owned(), "module_load".to_owned()]
+        );
+        assert_ne!(prov.supported_event_classes, prov.observed_event_classes);
+        for observed in &prov.observed_event_classes {
+            assert!(
+                prov.supported_event_classes.contains(observed),
+                "an observed class must be within the backend's declared coverage"
+            );
+        }
+
         // And it round-trips.
         let back: CollectorProvenance = serde_json::from_value(json).unwrap();
         assert_eq!(prov, back);
+    }
+
+    #[test]
+    fn supported_classes_come_from_backend_not_from_what_fired() {
+        // Regression for AC7: even when NOTHING fired this run, the backend's
+        // declared coverage must still be reported — a blind-spot audit cannot
+        // conclude a backend is blind just because a single run was quiet.
+        let session = sample_session(Fidelity::default());
+        let attributed = attribute(&session, 250);
+        let backend = BackendInfo::new("windows-etw", "0.2.34", "deadbeef")
+            .with_supported_classes(["process_create", "file_open", "module_load"]);
+        let prov = CollectorProvenance::from_attributed(
+            &backend,
+            &attributed,
+            250,
+            Vec::new(), // nothing observed this run
+            Fidelity::default(),
+        );
+        assert_eq!(
+            prov.supported_event_classes,
+            vec![
+                "process_create".to_owned(),
+                "file_open".to_owned(),
+                "module_load".to_owned()
+            ],
+            "supported classes must reflect backend coverage, not this run's hits"
+        );
+        assert!(prov.observed_event_classes.is_empty());
     }
 
     #[test]
