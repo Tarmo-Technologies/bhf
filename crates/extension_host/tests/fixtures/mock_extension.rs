@@ -39,6 +39,20 @@ struct State {
 fn main() {
     let mode = parse_mode();
 
+    // Record this child's PID (every spawned child, including a respawn that fails
+    // its re-handshake) so a test can assert no child is leaked/left unreaped.
+    log_pid();
+
+    // `crash-then-unhandshake`: the FIRST child handshakes then crashes on its
+    // first request (marking a cross-process marker); every RESPAWNED child sees
+    // the marker and exits BEFORE emitting its hello, so the host's restart-time
+    // re-handshake fails persistently. This drives the terminal
+    // re-handshake-failure path (a bounded infrastructure result), distinct from
+    // `crash-once`, where the respawn recovers.
+    if mode == "crash-then-unhandshake" && crashed_before() {
+        exit(7);
+    }
+
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
 
@@ -148,6 +162,12 @@ fn main() {
                     exit(101);
                 }
                 continue;
+            }
+            "crash-then-unhandshake" => {
+                // The first child reaches a request, marks the marker, then crashes.
+                // Every respawn detects the marker and fails its re-handshake (above).
+                mark_crashed();
+                exit(101);
             }
             // "well-behaved" | "no-cap" fall through to the real handlers.
             _ => {
@@ -488,6 +508,16 @@ fn crashed_before() -> bool {
 fn mark_crashed() {
     if let Some(path) = state_file() {
         let _ = fs::write(path, "crashed");
+    }
+}
+
+/// Append this process's PID to `MOCK_PID_LOG` (if set), one per line, so a test
+/// can enumerate every child the host spawned and assert none was leaked.
+fn log_pid() {
+    if let Ok(path) = env::var("MOCK_PID_LOG") {
+        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(file, "{}", std::process::id());
+        }
     }
 }
 

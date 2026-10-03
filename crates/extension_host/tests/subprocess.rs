@@ -372,6 +372,116 @@ fn second_crash_is_terminal_with_loss() {
     assert_eq!(client.provenance().loss_count, 1);
 }
 
+/// Read the newline-separated PIDs the mock logged to `MOCK_PID_LOG`.
+fn read_pids(path: &std::path::Path) -> Vec<i32> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect()
+}
+
+/// Whether `pid` is a zombie (exited but not yet reaped by its parent, i.e. a
+/// leaked child). A reaped child has no `/proc/<pid>` entry; an unreaped one that
+/// has already exited is state `Z`. All mock children exit promptly, so a
+/// non-reaped child is necessarily a zombie here.
+fn is_zombie(pid: i32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // "pid (comm) state ..." — comm may contain spaces/parens, so split on the
+        // LAST ')' and read the state char that follows.
+        Ok(stat) => match stat.rsplit_once(')') {
+            Some((_, rest)) => rest.trim_start().starts_with('Z'),
+            None => false,
+        },
+        Err(_) => false, // no /proc entry -> reaped / gone
+    }
+}
+
+/// Regression (#57 follow-up): a persistently-failing re-handshake must be
+/// TERMINAL and must not leak a child per remaining restart slot.
+///
+/// The first child handshakes then crashes; every respawn exits before its hello,
+/// so `restart_child` fails on every attempt. With `max_restarts = 3` and the
+/// evaluate loop (as `drive_fuzz_extension` runs over a retained corpus) calling
+/// `evaluate` repeatedly, the pre-fix code both (a) re-attempted a respawn for
+/// every remaining restart slot — `max_restarts` spawn-and-fail cycles — and
+/// (b) dropped each failed-handshake `Session` via `?` without reaping its child
+/// (`Session` had no `Drop`, and `std::process::Child` neither kills nor waits on
+/// drop), leaking up to `max_restarts` zombies. The fix makes ONE failed
+/// re-handshake terminal (at most one respawn) and reaps any dropped `Session`'s
+/// child, so no spawned child survives.
+#[test]
+fn rehandshake_failure_is_terminal_and_reaps_every_child() {
+    let state = tempfile::NamedTempFile::new().expect("state file");
+    let pid_log = tempfile::NamedTempFile::new().expect("pid log");
+
+    let mut spec = mock_spec("crash-then-unhandshake");
+    spec.env = BTreeMap::from([
+        (
+            "MOCK_STATE_FILE".to_string(),
+            state.path().display().to_string(),
+        ),
+        (
+            "MOCK_PID_LOG".to_string(),
+            pid_log.path().display().to_string(),
+        ),
+    ]);
+    spec.restart = RestartPolicy {
+        max_restarts: 3,
+        base_backoff: Duration::from_millis(1),
+        max_backoff: Duration::from_millis(5),
+    };
+    let mut client = ExtensionClient::spawn(spec).expect("spawn");
+
+    // Drive the evaluate loop repeatedly: every call after the terminal failure
+    // must short-circuit to a bounded crash, never re-attempt a respawn.
+    for i in 0..5 {
+        let outcome = client
+            .evaluate(&case("worker-0", &format!("tc-{i}")), b"benign/path")
+            .expect("evaluate");
+        assert!(
+            matches!(
+                outcome,
+                EvaluateOutcome::Infrastructure(InfraFailure::Crashed { .. })
+            ),
+            "call {i} must be a bounded crash; got {outcome:?}"
+        );
+    }
+
+    // One failed re-handshake is terminal: exactly ONE restart was attempted (not
+    // `max_restarts`), and exactly ONE terminal loss was recorded (not one per
+    // call across the loop).
+    assert_eq!(
+        client.provenance().restart_count,
+        1,
+        "a terminal re-handshake failure must not keep respawning per restart slot"
+    );
+    assert_eq!(
+        client.provenance().loss_count,
+        1,
+        "the terminal loss is recorded once, not re-recorded on every subsequent call"
+    );
+
+    // The mock logged every child it spawned: the first child plus exactly ONE
+    // respawn (the single terminal failure) — two children total.
+    let pids = read_pids(pid_log.path());
+    assert_eq!(
+        pids.len(),
+        2,
+        "expected first child + exactly one respawn; got PIDs {pids:?}"
+    );
+
+    // No spawned child is leaked: every PID is reaped (gone), none a zombie. The
+    // client is still alive here, so a reaped respawn proves the reap happened at
+    // `Session` drop (via `?` in `restart_child`), not at `ExtensionClient` drop.
+    for pid in &pids {
+        assert!(
+            !is_zombie(*pid),
+            "child {pid} was left unreaped (zombie) — a leaked process"
+        );
+    }
+}
+
 #[test]
 fn from_manifest_spawns_handshakes_and_evaluates() {
     let dir = tempfile::tempdir().expect("tempdir");

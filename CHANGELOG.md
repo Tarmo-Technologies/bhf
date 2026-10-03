@@ -234,6 +234,16 @@
   than its codes imply no longer under-sizes and shifts the fields after it. A variant code that
   exceeds the resolved width now errors with `ValueTooWide` at encode time (mirroring the integer
   arm) instead of silently truncating.
+- **Extension re-handshake failure no longer leaks children** (`bhf extension`/`bhf fuzz
+  --extension`, #57): a supervised extension whose restart-time re-handshake fails persistently
+  now ends the pass after a single failed respawn instead of re-attempting one for every
+  remaining restart slot, and the host reaps every spawned child. Previously each failed
+  re-handshake dropped its freshly-spawned child's session via `?` without killing/reaping it
+  (`std::process::Child` neither kills nor waits on drop), leaking up to `max_restarts` zombie
+  processes across the evaluate loop. A failed respawn/re-handshake is now terminal (at most one
+  extra child), and a `Session` reaps its child on drop on every path. The bounded outcome is
+  unchanged: `EXIT_INFRA` (4) with `extension.json` provenance for `evaluate`/`session`, and the
+  fuzz pass still ends cleanly without a target finding.
 - **Relational executor robustness** (`bhf relational`, #61): the per-profile spawn now
   feeds stdin and drains stdout/stderr on dedicated threads concurrently with the wait
   loop, so a target that streams more than a pipe buffer of output — or never reads its

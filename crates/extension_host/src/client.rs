@@ -324,6 +324,25 @@ impl Session {
     }
 }
 
+impl Drop for Session {
+    /// Best-effort reap so a dropped `Session` can never leak its child. This is
+    /// the single kill+reap path — [`ExtensionClient::teardown_session`] drops the
+    /// session to invoke it, and it also fires on a `Session` dropped via `?`
+    /// (e.g. a failed re-handshake in [`ExtensionClient::restart_child`], or a
+    /// failed handshake in [`ExtensionClient::spawn`]), which `std::process::Child`
+    /// would otherwise leave running/unreaped (its own `Drop` neither kills nor
+    /// waits). Reaping an already-reaped child (the crash path already called
+    /// `wait`) is harmless: `std` caches the exit status, so a second `wait` never
+    /// reaps a reused PID, and `kill` of an exited child errors benignly.
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(handle) = self.reader.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// A supervised, out-of-process extension speaking `bhf.extension.v1`.
 pub struct ExtensionClient {
     spec: SpawnSpec,
@@ -335,6 +354,13 @@ pub struct ExtensionClient {
     redacted: RedactedEnv,
     session: Option<Session>,
     last_digest: Option<String>,
+    /// Set once the session is unrecoverably lost: a respawn/re-handshake failed,
+    /// or the restart budget was exhausted. The session can never be
+    /// re-established, so every subsequent call short-circuits to the terminal
+    /// bounded infrastructure result instead of spawning another child per
+    /// remaining restart slot (one failed re-handshake must not leak
+    /// `max_restarts` more children).
+    lost: bool,
 }
 
 impl ExtensionClient {
@@ -384,6 +410,7 @@ impl ExtensionClient {
             redacted,
             session: Some(session),
             last_digest: None,
+            lost: false,
         })
     }
 
@@ -650,30 +677,34 @@ impl ExtensionClient {
         };
 
         loop {
+            if self.lost {
+                // A prior fault was terminal (restart budget exhausted, or a
+                // respawn/re-handshake that could not recover). The session can
+                // never come back, so short-circuit without spawning yet another
+                // child: a persistently-failing re-handshake must leak at most one
+                // child total, not one per remaining restart slot across the whole
+                // evaluate loop.
+                return Ok(terminal_crash());
+            }
             if self.session.is_none() {
                 if self.restart.should_restart() {
                     if self.restart_child().is_err() {
                         // A respawn / re-handshake failure during a permitted
-                        // restart exhausts the restart budget via a failed
-                        // re-handshake: it is a terminal, BOUNDED infrastructure
+                        // restart is TERMINAL: it is a bounded infrastructure
                         // result (a crash the host could not recover), never a
                         // target finding and never a hard error a caller would
-                        // misclassify as a usage/setup problem. Record the loss in
-                        // provenance and surface it as infrastructure, exactly like
-                        // the budget-exhaustion branch below.
+                        // misclassify as a usage/setup problem. Record the loss,
+                        // mark the session lost so no further respawn is attempted,
+                        // and surface it as infrastructure.
+                        self.lost = true;
                         self.restart.record_loss();
                         self.provenance.loss_count = self.restart.losses();
-                        return Ok(CallOutcome::Infrastructure(InfraFailure::Crashed {
-                            status: None,
-                            signal: None,
-                        }));
+                        return Ok(terminal_crash());
                     }
                 } else {
                     // No live session and no restart budget: terminal.
-                    return Ok(CallOutcome::Infrastructure(InfraFailure::Crashed {
-                        status: None,
-                        signal: None,
-                    }));
+                    self.lost = true;
+                    return Ok(terminal_crash());
                 }
             }
 
@@ -686,6 +717,8 @@ impl ExtensionClient {
                         // and the same request is retried on the fresh child.
                         continue;
                     }
+                    // Budget exhausted: this transport fault is terminal.
+                    self.lost = true;
                     self.restart.record_loss();
                     self.provenance.loss_count = self.restart.losses();
                     return Ok(outcome);
@@ -770,14 +803,21 @@ impl ExtensionClient {
     }
 
     fn teardown_session(&mut self) {
-        if let Some(mut session) = self.session.take() {
-            let _ = session.child.kill();
-            let _ = session.child.wait();
-            if let Some(handle) = session.reader.take() {
-                let _ = handle.join();
-            }
-        }
+        // Dropping the `Session` kills + reaps the child and joins the reader; see
+        // `impl Drop for Session`. Keeping that logic in one place means a session
+        // dropped on any path (teardown here, or a `?` early-return) is reaped the
+        // same way.
+        self.session = None;
     }
+}
+
+/// The terminal, bounded infrastructure outcome for a session that cannot be
+/// recovered (no status/signal is available for a loss the host synthesizes).
+fn terminal_crash() -> CallOutcome {
+    CallOutcome::Infrastructure(InfraFailure::Crashed {
+        status: None,
+        signal: None,
+    })
 }
 
 impl Drop for ExtensionClient {
