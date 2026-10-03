@@ -607,3 +607,141 @@ reset-command = "true"
         "no provenance written"
     );
 }
+
+// ── Secret redaction (#56): a resolved `${secret:NAME}` value must NOT leak into
+//    a binary-lane finding; replay re-resolves it from the environment ──────────
+
+#[cfg(unix)]
+#[test]
+fn project_run_binary_redacts_secret_env_from_finding_and_replays_from_env() {
+    let root = temp_dir("run-secret-redact");
+    let project = root.join("project");
+    fs::create_dir_all(&project).unwrap();
+
+    // A target whose crash is GATED on the secret value actually reaching the
+    // child: it exits non-zero (a crash to the binary engine) only when
+    // `$TOKEN` equals the resolved secret. This makes the test prove two things
+    // at once — the secret reaches the spawned process, yet never lands in the
+    // finding (replay must recover it from the environment, not the record).
+    let target = project.join("target.sh");
+    fs::write(
+        &target,
+        "#!/bin/sh\nif [ \"$TOKEN\" = \"s3cr3t\" ]; then echo secret-gated-crash >&2; exit 139; fi\nexit 0\n",
+    )
+    .unwrap();
+    make_executable(&target);
+
+    let manifest = project.join("manifest.toml");
+    fs::write(
+        &manifest,
+        r#"schema = "bhf.project.v1"
+[project]
+id = "secret-redact"
+version = "1.0.0"
+[[target]]
+id = "sec"
+engine = "binary"
+binary = "target.sh"
+input-mode = "stdin"
+[target.env]
+PROFILE = "release"
+TOKEN = "${secret:API}"
+"#,
+    )
+    .unwrap();
+
+    let work = root.join("work");
+    let out = bhf()
+        .env("BHF_SECRET_API", "s3cr3t")
+        .args(["project", "run", "--target", "sec", "--manifest"])
+        .arg(&manifest)
+        .arg("--work-dir")
+        .arg(&work)
+        .output()
+        .expect("run bhf project run (secret-gated binary target)");
+    assert!(
+        out.status.success(),
+        "secret-gated project run failed: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Locate the binary_crash finding the secret-gated exit produced.
+    let findings_dir = work.join("results/findings");
+    let finding_dir = fs::read_dir(&findings_dir)
+        .expect("findings dir exists")
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            let f = p.join("finding.json");
+            f.is_file()
+                && serde_json::from_slice::<serde_json::Value>(&fs::read(&f).unwrap())
+                    .map(|v| v["kind"] == "binary_crash")
+                    .unwrap_or(false)
+        })
+        .expect("a binary_crash finding gated on the secret value");
+
+    // 1) The RAW finding bytes must not contain the secret value anywhere, and the
+    //    env must record the handle (never the value), with the key marked for
+    //    re-resolution. The public literal still passes through verbatim.
+    let finding_bytes = fs::read(finding_dir.join("finding.json")).unwrap();
+    assert!(
+        !String::from_utf8_lossy(&finding_bytes).contains("s3cr3t"),
+        "secret value leaked into finding.json: {}",
+        String::from_utf8_lossy(&finding_bytes)
+    );
+    let finding: serde_json::Value = serde_json::from_slice(&finding_bytes).unwrap();
+    assert_eq!(finding["env"]["TOKEN"], "${secret:API}", "{finding}");
+    assert_eq!(finding["env"]["PROFILE"], "release", "{finding}");
+    let redacted: Vec<&str> = finding["redacted_env_keys"]
+        .as_array()
+        .expect("redacted_env_keys array")
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(redacted, vec!["TOKEN"], "{finding}");
+
+    // 2) Replay re-resolves the secret from the environment and reproduces.
+    let replay_ok = bhf()
+        .env("BHF_SECRET_API", "s3cr3t")
+        .args(["replay"])
+        .arg(&finding_dir)
+        .arg("--harness")
+        .arg(&target)
+        .output()
+        .expect("run bhf replay with the secret present");
+    assert!(
+        replay_ok.status.success(),
+        "replay with the secret must reproduce: {}\n{}",
+        String::from_utf8_lossy(&replay_ok.stdout),
+        String::from_utf8_lossy(&replay_ok.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&replay_ok.stdout).contains("MATCH"),
+        "replay did not report MATCH: {}",
+        String::from_utf8_lossy(&replay_ok.stdout)
+    );
+
+    // 3) Without the secret in the environment, replay cannot recover it from the
+    //    stored finding — proving the value is not persisted. It must FAIL loudly,
+    //    not silently reproduce (which would mean the value had been stored).
+    let replay_missing = bhf()
+        .env_remove("BHF_SECRET_API")
+        .args(["replay"])
+        .arg(&finding_dir)
+        .arg("--harness")
+        .arg(&target)
+        .output()
+        .expect("run bhf replay without the secret");
+    assert!(
+        !replay_missing.status.success(),
+        "replay without the secret must fail, not silently reproduce: {}\n{}",
+        String::from_utf8_lossy(&replay_missing.stdout),
+        String::from_utf8_lossy(&replay_missing.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&replay_missing.stdout).contains("MATCH"),
+        "replay without the secret must not MATCH: {}",
+        String::from_utf8_lossy(&replay_missing.stdout)
+    );
+}

@@ -20,6 +20,7 @@
 //! `--skip-build` reuses a prebuilt binary. There is no auto-discovery path, so
 //! an untrusted manifest's code never runs.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -390,6 +391,7 @@ fn run_run(a: &RunArgs) -> Result<i32> {
                 &work_dir,
                 seed_files,
                 resolved.resolved_env.clone(),
+                resolved.env_redaction.clone(),
             )?;
             binary_fuzz::run(binary_args)
         }
@@ -649,12 +651,20 @@ fn plan_to_fuzz_args(
 }
 
 /// Lower a binary launch plan onto `BinaryFuzzArgs`. Pure over its inputs.
+///
+/// `env` carries the **real** resolved values (handed to the spawned target, so
+/// secrets reach the child). `env_redaction` maps the subset of keys backed by a
+/// `${secret:NAME}` / `${env:NAME}` handle to that handle, so the binary engine
+/// records the handle — never the value — into `finding.json` and re-resolves it
+/// from the environment on replay. For a standalone `bhf binary fuzz` invocation
+/// `env_redaction` is empty and every value is recorded verbatim.
 fn plan_to_binary_fuzz_args(
     launch: &BinaryLaunch,
     binary: &Path,
     work_dir: &Path,
     seed_files: Vec<PathBuf>,
     env: Vec<(String, String)>,
+    env_redaction: BTreeMap<String, String>,
 ) -> Result<BinaryFuzzArgs> {
     Ok(BinaryFuzzArgs {
         binary: binary.to_path_buf(),
@@ -672,6 +682,7 @@ fn plan_to_binary_fuzz_args(
             .map(|m| m.to_string())
             .unwrap_or_else(|| "none".to_owned()),
         env: env.into_iter().map(|(k, v)| format!("{k}={v}")).collect(),
+        env_redaction,
         runner: launch.runner.clone(),
         runner_args: launch.runner_args.clone(),
         target_args: launch.target_args.clone(),
@@ -852,6 +863,7 @@ mod tests {
             Path::new("/w"),
             vec![PathBuf::from("/seeds/s0")],
             vec![("K".to_owned(), "V".to_owned())],
+            BTreeMap::new(),
         )
         .unwrap();
 
@@ -894,6 +906,7 @@ mod tests {
             Path::new("/w"),
             vec![],
             vec![],
+            BTreeMap::new(),
         )
         .unwrap();
 
@@ -916,9 +929,15 @@ mod tests {
     #[test]
     fn binary_plan_defaults_mem_and_timeout() {
         let launch = binary_launch();
-        let args =
-            plan_to_binary_fuzz_args(&launch, Path::new("/t"), Path::new("/w"), vec![], vec![])
-                .unwrap();
+        let args = plan_to_binary_fuzz_args(
+            &launch,
+            Path::new("/t"),
+            Path::new("/w"),
+            vec![],
+            vec![],
+            BTreeMap::new(),
+        )
+        .unwrap();
         assert_eq!(args.timeout_ms, 10_000);
         assert_eq!(args.mem_mb, "none");
         assert!(matches!(args.input_mode, BinaryInputMode::Stdin));

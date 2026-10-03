@@ -93,6 +93,16 @@ pub struct Resolved {
     /// serialized into provenance; secrets live here but never in
     /// [`Provenance::redacted_env`].
     pub resolved_env: Vec<(String, String)>,
+    /// For each env key whose value came from a `${secret:NAME}` / `${env:NAME}`
+    /// handle, the handle form to RECORD in place of the resolved value (e.g.
+    /// `${secret:API}`). Keys backed by a public literal are absent (safe to
+    /// record verbatim). A consumer that persists env into a finding / replay
+    /// bundle (the binary lane) records these handles instead of the value from
+    /// [`resolved_env`], then re-resolves them from the environment on
+    /// replay/minimize via [`reresolve_env_handle`] — so a secret value never
+    /// reaches a stored finding. Native runs do not persist env, so they ignore
+    /// this.
+    pub env_redaction: BTreeMap<String, String>,
     /// The redacted provenance record.
     pub provenance: Provenance,
     /// The project-level trusted extension to load for this run, if the manifest
@@ -249,9 +259,15 @@ pub fn resolve(
     };
     let mut resolved_env = Vec::with_capacity(env_entries.len());
     let mut redacted_env = BTreeMap::new();
+    let mut env_redaction = BTreeMap::new();
     for (key, classified) in env_entries {
         let resolved = interpolate::resolve_classified(classified, env)?;
         redacted_env.insert(key.clone(), resolved.redacted_display());
+        // A handle-backed value (secret or env) must never be persisted into a
+        // finding verbatim; record the handle so the binary lane can redact it.
+        if !matches!(classified, InterpolatedValue::Literal(_)) {
+            env_redaction.insert(key.clone(), resolved.redacted_display());
+        }
         resolved_env.push((key.clone(), resolved.value));
     }
 
@@ -284,10 +300,25 @@ pub fn resolve(
         resolved_grammar,
         merged_dictionary,
         resolved_env,
+        env_redaction,
         provenance,
         resolved_extension,
         warnings,
     })
+}
+
+/// Re-resolve a redacted env handle recorded in a finding / replay bundle back
+/// to its concrete value: `${secret:NAME}` reads `BHF_SECRET_<NAME>` and
+/// `${env:NAME}` reads `NAME` — the SAME mechanism [`resolve`] uses at run time.
+///
+/// This is how `bhf replay`/`minimize` obtain a secret value for a project-lane
+/// finding WITHOUT it ever being stored in the finding: the record keeps only
+/// the handle (see [`Resolved::env_redaction`]), and the value is recovered from
+/// the environment here. A plain literal returns unchanged. Errors (descriptively)
+/// when the handle is malformed or the backing variable is unset.
+pub fn reresolve_env_handle(recorded: &str, env: &dyn EnvSource) -> Result<String, ProjectError> {
+    let classified = interpolate::classify(recorded)?;
+    Ok(interpolate::resolve_classified(&classified, env)?.value)
 }
 
 /// Validate and resolve the project-level `[[extension]]`, if any, hashing its

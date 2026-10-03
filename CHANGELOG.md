@@ -204,6 +204,14 @@
   removes `results/report/`.
 
 ### Fixed
+- **Secret redaction in binary-lane findings** (`bhf project run`, #56): a resolved
+  `${secret:NAME}` / `${env:NAME}` env value no longer leaks in plaintext into
+  `results/findings/<id>/finding.json` (nor anything `bhf replay`/`minimize` reads back).
+  The spawned target still receives the real resolved value, but the finding records only
+  the handle; `bhf replay`/`minimize` re-resolve it from the environment (the same
+  `BHF_SECRET_<NAME>` mechanism `project run` uses), erroring if it is unset rather than
+  reproducing with a missing secret. Standalone `bhf binary fuzz` env is unchanged
+  (recorded verbatim; it has no secret handles).
 - `F-TSAN`, `F-MEM`, `F-JSINK`, `F-EXT` and `F-DIFF` findings were missing from the auto index.
 - `bhf report` with default flags after `bhf auto` found nothing.
 - `replay.py` harness discovery looked in the pre-`harnesses/` location.

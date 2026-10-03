@@ -56,6 +56,16 @@ pub struct BinaryFuzzArgs {
     #[arg(long = "env")]
     pub env: Vec<String>,
 
+    /// Redaction map for secret/handle-backed env keys, set only by `bhf project
+    /// run`: maps an env key to the `${secret:NAME}` / `${env:NAME}` handle to
+    /// RECORD in its place. The real value in `--env` still reaches the spawned
+    /// target, but the handle — never the resolved value — is written into
+    /// `finding.json`, and `bhf replay`/`minimize` re-resolve it from the
+    /// environment. Empty for a standalone `bhf binary fuzz` invocation (every
+    /// `--env` value is recorded verbatim), so this is not a CLI flag.
+    #[arg(skip)]
+    pub env_redaction: BTreeMap<String, String>,
+
     /// Runner/emulator to launch the target under, e.g. `wine` or `qemu-x86_64`.
     /// The target binary and its `--target-arg`s follow. Builtin engine only
     /// (afl-qemu provides its own `-Q` runner).
@@ -963,7 +973,7 @@ pub(crate) fn minimize_binary_finding(
     }
     let finding = read_finding(finding_dir)?;
     let mode = finding_input_mode(&finding)?;
-    let env = finding_env(&finding);
+    let env = finding_env(&finding)?;
     let timeout = finding_timeout(&finding);
     let original = fs::read(finding_dir.join("testcase.bin"))
         .with_context(|| format!("read {}", finding_dir.join("testcase.bin").display()))?;
@@ -1072,7 +1082,7 @@ fn replay_binary_finding_inner(finding_dir: &Path, binary: &Path) -> anyhow::Res
     fs::create_dir_all(&tmp_dir).with_context(|| format!("create {}", tmp_dir.display()))?;
     let invocation = finding_invocation(&finding, binary);
     let mode = finding_input_mode(&finding)?;
-    let env = finding_env(&finding);
+    let env = finding_env(&finding)?;
     let timeout = finding_timeout(&finding);
 
     let matched = if finding.get("kind").and_then(Value::as_str) == Some("binary_semantic") {
@@ -1599,7 +1609,8 @@ fn render_finding(
             "bytes": input.len(),
             "testcase": "testcase.bin"
         },
-        "env": env,
+        "env": recorded_env(env, &args.env_redaction),
+        "redacted_env_keys": redacted_env_keys(env, &args.env_redaction),
         "crash": {
             "exit_code": run.exit_code,
             "timeout": run.timeout,
@@ -1660,7 +1671,8 @@ fn render_semantic_finding(
             "bytes": input.len(),
             "testcase": "testcase.bin"
         },
-        "env": env,
+        "env": recorded_env(env, &args.env_redaction),
+        "redacted_env_keys": redacted_env_keys(env, &args.env_redaction),
         "oracle": {
             "name": hit.oracle_name,
             "category": hit.category,
@@ -1725,7 +1737,8 @@ fn render_postcondition_finding(
             "bytes": input.len(),
             "testcase": "testcase.bin"
         },
-        "env": env,
+        "env": recorded_env(env, &args.env_redaction),
+        "redacted_env_keys": redacted_env_keys(env, &args.env_redaction),
         "target_status": {
             "exit_code": run.exit_code,
             "signal": run.signal,
@@ -1762,6 +1775,37 @@ fn parse_env(items: &[String]) -> anyhow::Result<BTreeMap<String, String>> {
     Ok(out)
 }
 
+/// The env to RECORD in a finding: every key's resolved value verbatim, EXCEPT
+/// keys whose value came from a `${secret:NAME}` / `${env:NAME}` handle (per
+/// `redaction`, populated only by `bhf project run`), which are recorded as the
+/// handle so a secret value never lands in `finding.json`. The real value still
+/// reaches the child during the run; replay re-resolves the handle from the
+/// environment (see [`finding_env`]).
+fn recorded_env(
+    env: &BTreeMap<String, String>,
+    redaction: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    env.iter()
+        .map(|(key, value)| {
+            let recorded = redaction.get(key).cloned().unwrap_or_else(|| value.clone());
+            (key.clone(), recorded)
+        })
+        .collect()
+}
+
+/// The (sorted) env keys whose recorded value is a redacted handle — the keys
+/// `bhf replay`/`minimize` must RE-RESOLVE from the environment instead of
+/// trusting the stored value. Empty for a standalone `bhf binary fuzz` finding.
+fn redacted_env_keys(
+    env: &BTreeMap<String, String>,
+    redaction: &BTreeMap<String, String>,
+) -> Vec<String> {
+    env.keys()
+        .filter(|key| redaction.contains_key(*key))
+        .cloned()
+        .collect()
+}
+
 fn read_finding(finding_dir: &Path) -> anyhow::Result<Value> {
     let path = finding_dir.join("finding.json");
     serde_json::from_slice(&fs::read(&path).with_context(|| format!("read {}", path.display()))?)
@@ -1777,18 +1821,45 @@ fn finding_input_mode(finding: &Value) -> anyhow::Result<BinaryInputMode> {
     }
 }
 
-fn finding_env(finding: &Value) -> BTreeMap<String, String> {
-    finding
-        .get("env")
-        .and_then(Value::as_object)
-        .map(|env| {
-            env.iter()
-                .filter_map(|(key, value)| {
-                    value.as_str().map(|value| (key.clone(), value.to_owned()))
-                })
+/// Rebuild the real env a finding ran under, for `bhf replay`/`minimize`.
+///
+/// A key listed in `redacted_env_keys` (a `bhf project run` secret/handle) is
+/// RE-RESOLVED from the live environment via the same `BHF_SECRET_<NAME>` /
+/// `${env:NAME}` mechanism `project run` used, so its value is NEVER read back
+/// from the stored finding (where only the handle is kept). Every other key is a
+/// recorded literal, used verbatim. Errors descriptively when a redacted handle
+/// cannot be resolved (e.g. `BHF_SECRET_<NAME>` is unset at replay time), so a
+/// reproduction never silently runs with a missing secret.
+fn finding_env(finding: &Value) -> anyhow::Result<BTreeMap<String, String>> {
+    let redacted: std::collections::BTreeSet<String> = finding
+        .get("redacted_env_keys")
+        .and_then(Value::as_array)
+        .map(|keys| {
+            keys.iter()
+                .filter_map(|k| k.as_str().map(str::to_owned))
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let Some(env) = finding.get("env").and_then(Value::as_object) else {
+        return Ok(BTreeMap::new());
+    };
+    let mut out = BTreeMap::new();
+    for (key, value) in env {
+        let Some(value) = value.as_str() else {
+            continue;
+        };
+        if redacted.contains(key) {
+            let resolved =
+                project_profile::reresolve_env_handle(value, &project_profile::ProcessEnv)
+                    .with_context(|| {
+                        format!("re-resolve redacted env key `{key}` (`{value}`) for replay")
+                    })?;
+            out.insert(key.clone(), resolved);
+        } else {
+            out.insert(key.clone(), value.to_owned());
+        }
+    }
+    Ok(out)
 }
 
 /// String array at a JSON pointer in a finding (e.g. recorded runner/target
@@ -2261,6 +2332,7 @@ mod tests {
             timeout_ms: 5000,
             mem_mb: "none".to_owned(),
             env: Vec::new(),
+            env_redaction: BTreeMap::new(),
             runner: Some("/bin/sh".to_owned()),
             runner_args: Vec::new(),
             target_args,
@@ -2564,6 +2636,7 @@ mod afl_qemu_tests {
             timeout_ms: 10_000,
             mem_mb: "none".to_owned(),
             env: Vec::new(),
+            env_redaction: BTreeMap::new(),
             runner: None,
             runner_args: Vec::new(),
             target_args: Vec::new(),
@@ -2657,6 +2730,7 @@ mod afl_qemu_tests {
                 timeout_ms: 10_000,
                 mem_mb: "none".to_owned(),
                 env: Vec::new(),
+                env_redaction: BTreeMap::new(),
                 runner: None,
                 runner_args: Vec::new(),
                 target_args: Vec::new(),
@@ -2833,6 +2907,7 @@ mod afl_qemu_tests {
             timeout_ms: 10_000,
             mem_mb: "none".to_owned(),
             env: Vec::new(),
+            env_redaction: BTreeMap::new(),
             runner: None,
             runner_args: Vec::new(),
             target_args: Vec::new(),

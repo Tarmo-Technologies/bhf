@@ -297,6 +297,47 @@ fn resolve_native_target_produces_full_provenance() {
     assert!(!json.contains("s3cr3t-value"));
     assert!(json.contains("${secret:API_TOKEN}"));
     assert_eq!(resolved.provenance.bhf_version, "0.2.34");
+
+    // The redaction map names ONLY the handle-backed key (so the binary lane
+    // records the handle, not the value), and never the public literal.
+    assert_eq!(
+        resolved.env_redaction.get("TOKEN").map(String::as_str),
+        Some("${secret:API_TOKEN}")
+    );
+    assert!(
+        !resolved.env_redaction.contains_key("PROFILE"),
+        "a public literal must not be redacted: {:?}",
+        resolved.env_redaction
+    );
+    assert!(resolved.env_redaction.values().all(|v| v != "s3cr3t-value"));
+}
+
+#[test]
+fn reresolve_env_handle_recovers_secret_without_storing_it() {
+    use project_profile::reresolve_env_handle;
+
+    // Replay recovers a secret value from the environment via the recorded handle
+    // — the same BHF_SECRET_<NAME> mechanism `resolve` uses — so a finding never
+    // needs to store it. A literal passes through unchanged.
+    let e = env(&[
+        ("BHF_SECRET_API_TOKEN", "s3cr3t-value"),
+        ("BUILD_PROFILE", "release"),
+    ]);
+    assert_eq!(
+        reresolve_env_handle("${secret:API_TOKEN}", &e).unwrap(),
+        "s3cr3t-value"
+    );
+    assert_eq!(
+        reresolve_env_handle("${env:BUILD_PROFILE}", &e).unwrap(),
+        "release"
+    );
+    assert_eq!(
+        reresolve_env_handle("plain-literal", &e).unwrap(),
+        "plain-literal"
+    );
+
+    // A missing secret is a hard error at replay, never a silent empty value.
+    assert!(reresolve_env_handle("${secret:MISSING}", &env(&[])).is_err());
 }
 
 #[test]
