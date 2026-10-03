@@ -514,3 +514,96 @@ optional-capabilities = ["codec.repair"]
     let ext_finding = ext_finding.expect("an extension finding from the loaded extension");
     assert_eq!(ext_finding["rule_id"], "oracle.path-escape");
 }
+
+// ── Composition (#47/#59/#55): `bhf project run` drives a runner + fixed argv +
+//    postcondition hooks + runtime oracles on the binary lane ──────────────────
+
+#[cfg(unix)]
+#[test]
+fn project_run_binary_wires_runner_target_args_and_postcondition() {
+    let root = temp_dir("run-composition");
+    let project = root.join("project");
+    fs::create_dir_all(project.join("corpus")).unwrap();
+
+    // A clean-exiting target: the user postcondition — not a crash — produces the
+    // finding, proving the oracle hooks ran.
+    let target = project.join("target.sh");
+    fs::write(&target, "#!/bin/sh\nexit 0\n").unwrap();
+    make_executable(&target);
+    fs::write(project.join("corpus/seed0"), b"seed").unwrap();
+
+    // A binary target composing #47 (runner via `env` + fixed `@@` argv), #59
+    // (runtime oracles), and #55 (setup/oracle/reset postcondition). The oracle
+    // always reports a violation so a binary_postcondition finding lands even on a
+    // clean target exit. The hooks are self-contained (they run in a per-case
+    // dir, not the project dir).
+    let manifest = project.join("manifest.toml");
+    fs::write(
+        &manifest,
+        r#"schema = "bhf.project.v1"
+[project]
+id = "composed"
+version = "1.0.0"
+[[target]]
+id = "acme"
+engine = "binary"
+binary = "target.sh"
+input-mode = "file"
+runner = "env"
+target-args = ["@@"]
+runtime-oracles = "auto"
+[target.postcondition]
+setup-command = "true"
+oracle-command = "echo policy-violation; exit 1"
+reset-command = "true"
+"#,
+    )
+    .unwrap();
+
+    let work = root.join("work");
+    let out = bhf()
+        .args(["project", "run", "--target", "acme", "--manifest"])
+        .arg(&manifest)
+        .arg("--work-dir")
+        .arg(&work)
+        .output()
+        .expect("run bhf project run (composed binary target)");
+    assert!(
+        out.status.success(),
+        "composed project run failed: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The user postcondition produced a BHF-502 finding on a clean target exit,
+    // and it records the runner + fixed argv (#47) and the hook commands (#55) —
+    // proving `bhf project run` wired every composition field end to end.
+    let finding = fs::read_dir(work.join("results/findings"))
+        .expect("findings dir")
+        .flatten()
+        .filter_map(|e| {
+            let f = e.path().join("finding.json");
+            f.is_file().then(|| {
+                serde_json::from_slice::<serde_json::Value>(&fs::read(f).unwrap()).unwrap()
+            })
+        })
+        .find(|f| f["kind"] == "binary_postcondition")
+        .expect("a binary_postcondition finding from the wired oracle");
+
+    assert_eq!(finding["rule_id"], "BHF-502");
+    assert_eq!(finding["command"]["runner"], "env");
+    assert_eq!(finding["command"]["target_args"][0], "@@");
+    assert_eq!(finding["postcondition"]["setup_command"], "true");
+    assert_eq!(
+        finding["postcondition"]["oracle_command"],
+        "echo policy-violation; exit 1"
+    );
+    assert_eq!(finding["postcondition"]["reset_command"], "true");
+    assert_eq!(finding["postcondition"]["signature"], "policy-violation");
+
+    // Provenance was written for the composed run.
+    assert!(
+        work.join("results/project.json").is_file(),
+        "no provenance written"
+    );
+}

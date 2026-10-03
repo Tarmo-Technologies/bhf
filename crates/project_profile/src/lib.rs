@@ -20,8 +20,8 @@
 //! ## Pipeline
 //!
 //! 1. [`load`] — parse TOML and gate the `schema` string.
-//! 2. [`validate`] — structural checks + `requires-bhf` gate + gated-field
-//!    rejection (the caller supplies the running bhf version).
+//! 2. [`validate`] — structural checks + `requires-bhf` gate + per-target
+//!    lowering/well-formedness (the caller supplies the running bhf version).
 //! 3. [`resolve`] — resolve+hash every asset, merge dictionaries, interpolate
 //!    env (secrets redacted), and assemble the [`Provenance`] for one target.
 
@@ -46,11 +46,11 @@ pub use hash::{sha256_asset, sha256_bytes, sha256_file, sha256_seed_dir};
 pub use interpolate::{EnvSource, InterpolatedValue, ProcessEnv, ResolvedValue};
 pub use lower::{
     lower_target, AflMode, BinaryEngine, BinaryInput, BinaryLaunch, LoweredLaunch, NativeEngine,
-    NativeLaunch,
+    NativeLaunch, RuntimeOraclesMode,
 };
 pub use paths::{resolve_asset, ResolveOptions};
 pub use provenance::{AssetHash, AssetKind, Provenance};
-pub use schema::{Extension, ExtensionLimits, Manifest, Project, Target, SCHEMA_V1};
+pub use schema::{Extension, ExtensionLimits, Manifest, Postcondition, Project, Target, SCHEMA_V1};
 pub use validate::{check_bhf_version, validate};
 pub use version_req::satisfied_by;
 pub use warning::{Warning, WarningKind};
@@ -58,8 +58,8 @@ pub use warning::{Warning, WarningKind};
 /// Parse a manifest from TOML text and gate the schema string.
 ///
 /// Rejects a genuine unknown-field typo (via `deny_unknown_fields`) and any
-/// `schema` other than [`SCHEMA_V1`]. Gated engine-feature fields still parse
-/// here; they are rejected later in [`validate`] / [`resolve`].
+/// `schema` other than [`SCHEMA_V1`]. Composition fields parse here; their
+/// well-formedness is checked later in [`validate`] / [`resolve`].
 pub fn load(text: &str) -> Result<Manifest, ProjectError> {
     let manifest: Manifest = toml::from_str(text)?;
     if manifest.schema != SCHEMA_V1 {

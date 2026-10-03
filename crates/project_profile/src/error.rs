@@ -75,15 +75,21 @@ pub enum ProjectError {
     #[error("secret '{name}' is not set (expected environment variable '{env_var}')")]
     UndefinedSecret { name: String, env_var: String },
 
-    /// A manifest field belongs to an engine feature not available in this bhf.
-    #[error(
-        "target '{target}': field '{field}' requires feature {issue} (not available in this bhf)"
-    )]
-    GatedFeature {
+    /// A composition field held a value outside its accepted set (e.g.
+    /// `runtime-oracles` must be `auto`/`on`/`off`).
+    #[error("target '{target}': field '{field}' has invalid value '{value}' ({detail})")]
+    InvalidFieldValue {
         target: String,
         field: &'static str,
-        issue: &'static str,
+        value: String,
+        detail: &'static str,
     },
+
+    /// A target's composed launch is not well-formed: two mutually-exclusive
+    /// fields are both set, a field requires another that is absent, or a
+    /// field is not valid for the selected engine.
+    #[error("target '{target}': {detail}")]
+    InvalidComposition { target: String, detail: String },
 
     /// The engine and `input-mode` are incompatible.
     #[error("target '{target}': {detail}")]

@@ -932,10 +932,43 @@ PROFILE = "release"
 TOKEN = "${secret:API_TOKEN}"            # resolved from BHF_SECRET_API_TOKEN, redacted
 ```
 
-Forward-looking fields that belong to engine features not yet available
-(`runner`, `runner-args`, `target-args`, `arguments`, `runtime-oracles`,
-`postcondition`) parse but are **rejected** with a "requires feature #NN"
-diagnostic (fail-closed), so a manifest stays stable as those features land.
+**Composition fields.** A target composes the engines' launch features:
+
+- `runner` / `runner-args` / `target-args` (#47) — launch the target under a
+  runner/emulator (e.g. `wine`, `qemu-x86_64`) with fixed argv. A literal `@@`
+  in `target-args` marks the input-file position (file mode). **Binary engine
+  only** (a native harness uses BHF's framed fork-server protocol, which has no
+  per-launch argv); declaring any of them on a native target is rejected.
+  `arguments` is an accepted alias for `target-args` (setting both is rejected),
+  and `runner-args` requires `runner`. A target that names a `runner` runs on the
+  binary **builtin** engine (afl-qemu provides its own `-Q` runner).
+- `runtime-oracles` (#59) — `"auto"`, `"on"`, or `"off"` (default). Loads the
+  runtrace sink oracles so a clean-exit semantic violation becomes a finding.
+  Applies to **both** lanes.
+- `[target.postcondition]` (#55) — `setup-command` / `oracle-command` /
+  `reset-command` user-defined postcondition hooks run around each testcase. The
+  `oracle-command` is **required** (a postcondition with no oracle asserts
+  nothing). **Binary engine only**, and pins the binary builtin engine.
+
+```toml
+[[target]]
+id = "channel-parser"
+engine = "binary"
+binary = "harnesses/parser"
+input-mode = "file"
+runner = "wine"                          # #47: launch under an emulator/loader
+runner-args = ["--mode", "fuzz"]
+target-args = ["@@"]                     # @@ = fuzz input-file position
+runtime-oracles = "auto"                 # #59: clean-exit sink oracles
+
+[target.postcondition]                   # #55: user security postcondition
+setup-command = "./prepare-case"
+oracle-command = "./check-postcondition" # required; exit 0=clean / 1=finding
+reset-command = "./reset-case"
+```
+
+Any unknown field (a typo) is still rejected at parse time by
+`deny-unknown-fields`, keeping the on-disk format strict.
 
 ## Out-of-Process Extensions
 

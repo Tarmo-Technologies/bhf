@@ -8,14 +8,13 @@
 //! settings — all kept outside the bhf source tree. The manifest is only ever
 //! loaded through an explicit path (the trust boundary), never auto-discovered.
 //!
-//! `#[serde(deny_unknown_fields)]` rejects genuine typos (e.g. `seedz`). Fields
-//! that belong to engine features not yet available in this bhf
-//! (`runner`, `runner-args`, `target-args`, `arguments`, `runtime-oracles`,
-//! `postcondition`) are declared here as `Option<_>` so the manifest still
-//! *parses* — they are then rejected during validation with a precise
-//! "requires feature #NN" diagnostic rather than a generic serde "unknown
-//! field" error. This keeps the on-disk format stable and fail-closed while the
-//! owning issues land.
+//! `#[serde(deny_unknown_fields)]` rejects genuine typos (e.g. `seedz`). The
+//! composition fields `runner`, `runner-args`, `target-args` / `arguments`
+//! (#47), `runtime-oracles` (#59), and `[target.postcondition]` (#55) are the
+//! launch knobs a profile sets to drive the engines' runner/semantic-oracle/
+//! runtime-oracle features; they are type-checked and lowered during validation
+//! (binary-lane launch wrappers require the binary engine; `runtime-oracles`
+//! applies to both lanes).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -190,23 +189,51 @@ pub struct Target {
     #[serde(default)]
     pub env: BTreeMap<String, String>,
 
-    // --- Gated fields: parse but are rejected in validation (fail-closed). ---
-    /// Binary runner / argv wrapper (e.g. a PE loader). Requires issue #47.
+    // --- Composition fields: launch knobs lowered per engine (#47/#59/#55). ---
+    /// Runner / argv wrapper the target is launched under (e.g. a PE loader like
+    /// `wine`, or `qemu-x86_64`). **Binary engine only** (the native fork-server
+    /// has no per-launch argv); forces the binary builtin engine. (#47)
     #[serde(default)]
     pub runner: Option<String>,
-    /// Runner arguments. Requires issue #47.
+    /// Arguments for the `runner` prefix, placed before the target binary.
+    /// Requires `runner`. Binary engine only. (#47)
     #[serde(default)]
     pub runner_args: Option<Vec<String>>,
-    /// Target argv. Requires issue #47.
+    /// Fixed argv passed to the target before the fuzz input. A literal `@@`
+    /// token marks where the input-file path goes (file mode); without one,
+    /// file-mode input is appended last. Binary engine only. (#47)
     #[serde(default)]
     pub target_args: Option<Vec<String>>,
-    /// Target argument template. Requires issue #47.
+    /// Accepted alias for `target-args`. Setting both at once is rejected. (#47)
     #[serde(default)]
     pub arguments: Option<Vec<String>>,
-    /// Runtime sink oracles. Requires issue #59.
+    /// Runtime sink-oracle mode: `auto`, `on`, or `off`. Loads the runtrace sink
+    /// oracles so a clean-exit semantic violation becomes a finding. Applies to
+    /// **both** lanes. (#59)
     #[serde(default)]
-    pub runtime_oracles: Option<Vec<String>>,
-    /// Postcondition / lifecycle hooks. Requires issue #55.
+    pub runtime_oracles: Option<String>,
+    /// User-defined postcondition / lifecycle hooks (`[target.postcondition]`).
+    /// **Binary engine only** (forces the binary builtin engine). (#55)
     #[serde(default)]
-    pub postcondition: Option<toml::Value>,
+    pub postcondition: Option<Postcondition>,
+}
+
+/// A `[target.postcondition]` sub-table (#55): per-testcase lifecycle + oracle
+/// hooks for the binary lane. `oracle-command` is required (a postcondition with
+/// no oracle asserts nothing); `setup-command` / `reset-command` are optional.
+/// Each value is a shell command the engine runs around every testcase.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Postcondition {
+    /// Shell command run BEFORE each testcase to prepare a fresh fixture.
+    #[serde(default)]
+    pub setup_command: Option<String>,
+    /// Shell command run AFTER each testcase to check a security invariant. Its
+    /// exit code is the contract (0 clean / 1 finding / other = infra error).
+    /// Required — enforced during lowering so the diagnostic is target-attributed.
+    #[serde(default)]
+    pub oracle_command: Option<String>,
+    /// Shell command run AFTER the oracle to reset state between testcases.
+    #[serde(default)]
+    pub reset_command: Option<String>,
 }

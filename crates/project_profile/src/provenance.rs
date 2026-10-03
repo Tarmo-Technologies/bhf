@@ -59,8 +59,9 @@ pub struct Provenance {
     pub engine: String,
     pub input_mode: String,
     pub assets: Vec<AssetHash>,
-    /// Resolved launch command. Per-input argv is gated (#47), so v1 records the
-    /// resolved harness/binary path only.
+    /// Resolved launch command: the resolved harness/binary path. The full
+    /// per-execution argv (runner prefix + fixed target args + the `@@` input
+    /// position, #47) is recorded by the binary engine in each finding.
     pub resolved_command: Vec<String>,
     /// Env in redacted form: literals verbatim, handles as `${env:NAME}` /
     /// `${secret:NAME}` with the value omitted.

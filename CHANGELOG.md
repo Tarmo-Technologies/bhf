@@ -176,9 +176,17 @@
   the `..`/absolute guard); `${env:NAME}`/`${secret:NAME}` env handles resolve at
   launch with only the handle recorded in provenance. Explicit `--manifest` is
   the trust boundary (no auto-discovery; `--skip-build` reuses a prebuilt
-  binary). Forward-looking fields (`runner`, `runner-args`, `target-args`,
-  `arguments`, `runtime-oracles`, `postcondition`) are parsed but rejected
-  fail-closed with a "requires feature #NN" diagnostic (#56).
+  binary). A target composes the engines' launch features: `runner` /
+  `runner-args` / `target-args` (with `arguments` as an alias) launch a binary
+  target under a runner/emulator with fixed `@@`-marked argv (#47, binary engine
+  only); `runtime-oracles` (`auto`/`on`/`off`) arms the clean-exit sink oracles
+  on both lanes (#59); and a `[target.postcondition]` with required
+  `oracle-command` plus optional `setup-command`/`reset-command` runs a
+  user-defined security postcondition around each testcase (#55, binary builtin
+  engine). Malformed compositions fail closed at `validate` (an unknown field, a
+  `runner-args` without `runner`, a `target-args`/`arguments` conflict, a
+  postcondition with no oracle, an invalid `runtime-oracles` mode, or a
+  binary-only wrapper on a native target) (#56).
 
 ### Changed
 - With no `--findings`/`--out`, `bhf report` rebuilds `bhf_work/results/`. `--junit`/

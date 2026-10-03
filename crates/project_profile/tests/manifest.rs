@@ -88,9 +88,10 @@ seedz = ["x"]
 }
 
 #[test]
-fn gated_field_parses_but_is_not_unknown() {
-    // `runner` is a declared (gated) field: it DESERIALIZES, so the error comes
-    // from validation ("requires #47"), not a serde unknown-field error.
+fn composition_fields_validate_and_lower() {
+    // runner (#47), target-args, runtime-oracles (#59), and a postcondition (#55)
+    // are the composition knobs a profile sets. They parse, validate, and lower
+    // into a usable binary launch (no longer rejected).
     let text = r#"
 schema = "bhf.project.v1"
 [project]
@@ -100,17 +101,88 @@ version = "1.0.0"
 id = "a"
 engine = "binary"
 binary = "h"
+input-mode = "file"
 runner = "wine"
+runner-args = ["--mode", "fuzz"]
+target-args = ["@@"]
+runtime-oracles = "auto"
+[target.postcondition]
+setup-command = "./prepare-case"
+oracle-command = "./check-postcondition"
+reset-command = "./reset-case"
 "#;
-    let m = load(text).expect("manifest with a gated field still parses");
-    let err = validate(&m, CURRENT_BHF).unwrap_err();
-    match err {
-        ProjectError::GatedFeature { field, issue, .. } => {
-            assert_eq!(field, "runner");
-            assert_eq!(issue, "#47");
+    let m = load(text).expect("manifest with composition fields parses");
+    validate(&m, CURRENT_BHF).expect("composition fields validate");
+
+    let (launch, _warnings) = project_profile::lower_target(&m.targets[0]).unwrap();
+    match launch {
+        LoweredLaunch::Binary(b) => {
+            assert_eq!(b.runner.as_deref(), Some("wine"));
+            assert_eq!(b.runner_args, vec!["--mode".to_owned(), "fuzz".to_owned()]);
+            assert_eq!(b.target_args, vec!["@@".to_owned()]);
+            assert_eq!(b.runtime_oracles, project_profile::RuntimeOraclesMode::Auto);
+            assert_eq!(b.oracle_command.as_deref(), Some("./check-postcondition"));
+            assert_eq!(b.engine, project_profile::BinaryEngine::Builtin);
         }
-        other => panic!("expected gated-feature error, got {other:?}"),
+        other => panic!("expected binary launch, got {other:?}"),
     }
+}
+
+#[test]
+fn postcondition_without_oracle_is_rejected_by_validate() {
+    // Well-formedness: a [target.postcondition] with no oracle-command asserts
+    // nothing and is rejected with a target-attributed diagnostic.
+    let text = r#"
+schema = "bhf.project.v1"
+[project]
+id = "demo"
+version = "1.0.0"
+[[target]]
+id = "a"
+engine = "binary"
+binary = "h"
+[target.postcondition]
+setup-command = "./prepare-case"
+"#;
+    let m = load(text).expect("parses");
+    let err = validate(&m, CURRENT_BHF).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ProjectError::MissingField {
+                field: "postcondition.oracle-command",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn invalid_runtime_oracles_mode_is_rejected_by_validate() {
+    let text = r#"
+schema = "bhf.project.v1"
+[project]
+id = "demo"
+version = "1.0.0"
+[[target]]
+id = "a"
+engine = "builtin"
+binary = "h"
+runtime-oracles = "asan"
+"#;
+    let m = load(text).expect("parses");
+    let err = validate(&m, CURRENT_BHF).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ProjectError::InvalidFieldValue {
+                field: "runtime-oracles",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
 }
 
 #[test]

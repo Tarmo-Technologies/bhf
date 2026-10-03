@@ -31,7 +31,7 @@ use project_profile::{
     check_bhf_version, load as load_text, lower_target, resolve, validate as validate_manifest,
     AflMode as PpAflMode, BinaryEngine as PpBinaryEngine, BinaryInput, BinaryLaunch, LoweredLaunch,
     Manifest, NativeEngine as PpNativeEngine, NativeLaunch, ProcessEnv, ResolveOptions, Resolved,
-    ResolvedExtension, RunContext,
+    ResolvedExtension, RunContext, RuntimeOraclesMode as PpRuntimeOraclesMode,
 };
 
 use crate::binary_fuzz::{self, BinaryFuzzArgs, BinaryFuzzEngine, BinaryInputMode};
@@ -627,7 +627,7 @@ fn plan_to_fuzz_args(
         sandbox_tool: None,
         sandbox_strict: false,
         extra_env,
-        runtime_oracles: RuntimeOracleMode::Off,
+        runtime_oracles: map_runtime_oracles(launch.runtime_oracles),
         cmplog_log: None,
         grammar_file,
         structured_inputs: StructuredInputMode::Auto,
@@ -672,9 +672,9 @@ fn plan_to_binary_fuzz_args(
             .map(|m| m.to_string())
             .unwrap_or_else(|| "none".to_owned()),
         env: env.into_iter().map(|(k, v)| format!("{k}={v}")).collect(),
-        runner: None,
-        runner_args: Vec::new(),
-        target_args: Vec::new(),
+        runner: launch.runner.clone(),
+        runner_args: launch.runner_args.clone(),
+        target_args: launch.target_args.clone(),
         sandbox: SandboxModeArg::Auto,
         engine: match launch.engine {
             PpBinaryEngine::Builtin => BinaryFuzzEngine::Builtin,
@@ -682,13 +682,23 @@ fn plan_to_binary_fuzz_args(
             PpBinaryEngine::Auto => BinaryFuzzEngine::Auto,
         },
         time: launch.time.clone(),
-        runtime_oracles: RuntimeOracleMode::Off,
-        setup_command: None,
-        oracle_command: None,
-        reset_command: None,
+        runtime_oracles: map_runtime_oracles(launch.runtime_oracles),
+        setup_command: launch.setup_command.clone(),
+        oracle_command: launch.oracle_command.clone(),
+        reset_command: launch.reset_command.clone(),
         collector: crate::collector_run::CollectorSpec::Off,
         collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
     })
+}
+
+/// Map the pure crate's engine-neutral runtime-oracle mode (#59) onto the CLI's
+/// own `RuntimeOracleMode`, shared by the native and binary lanes.
+fn map_runtime_oracles(mode: PpRuntimeOraclesMode) -> RuntimeOracleMode {
+    match mode {
+        PpRuntimeOraclesMode::Auto => RuntimeOracleMode::Auto,
+        PpRuntimeOraclesMode::On => RuntimeOracleMode::On,
+        PpRuntimeOraclesMode::Off => RuntimeOracleMode::Off,
+    }
 }
 
 /// Resolve an optional manifest duration string (e.g. `"60s"`, `"5m"`) with the
@@ -750,6 +760,28 @@ mod tests {
             max_len: Some("4096".to_owned()),
             rss_limit_mb: Some(512),
             sandbox: true,
+            runtime_oracles: PpRuntimeOraclesMode::Off,
+        }
+    }
+
+    /// A minimal binary launch with no composition wrappers, for per-field tests.
+    fn binary_launch() -> BinaryLaunch {
+        BinaryLaunch {
+            engine: PpBinaryEngine::Auto,
+            input_mode: BinaryInput::Stdin,
+            binary: PathBuf::from("prebuilt/target"),
+            seeds: vec![],
+            env: vec![],
+            timeout_ms: None,
+            mem_mb: None,
+            time: None,
+            runner: None,
+            runner_args: Vec::new(),
+            target_args: Vec::new(),
+            runtime_oracles: PpRuntimeOraclesMode::Off,
+            setup_command: None,
+            oracle_command: None,
+            reset_command: None,
         }
     }
 
@@ -786,6 +818,16 @@ mod tests {
         assert_eq!(args.rss_limit_mb, 512);
         // sandbox = true opts into the best available sandbox.
         assert!(matches!(args.sandbox, SandboxModeArg::Auto));
+        // No runtime oracles declared → off (crash-only), the native default.
+        assert!(matches!(args.runtime_oracles, RuntimeOracleMode::Off));
+    }
+
+    #[test]
+    fn native_plan_maps_runtime_oracles() {
+        let mut launch = native(PpNativeEngine::Builtin);
+        launch.runtime_oracles = PpRuntimeOraclesMode::On;
+        let args = plan_to_fuzz_args(&launch, "a", Path::new("/w"), vec![], None, vec![]).unwrap();
+        assert!(matches!(args.runtime_oracles, RuntimeOracleMode::On));
     }
 
     #[test]
@@ -799,16 +841,11 @@ mod tests {
 
     #[test]
     fn binary_plan_maps_to_binary_fuzz_args() {
-        let launch = BinaryLaunch {
-            engine: PpBinaryEngine::Auto,
-            input_mode: BinaryInput::File,
-            binary: PathBuf::from("prebuilt/target"),
-            seeds: vec![],
-            env: vec![],
-            timeout_ms: Some(5000),
-            mem_mb: Some(256),
-            time: Some("1m".to_owned()),
-        };
+        let mut launch = binary_launch();
+        launch.input_mode = BinaryInput::File;
+        launch.timeout_ms = Some(5000);
+        launch.mem_mb = Some(256);
+        launch.time = Some("1m".to_owned());
         let args = plan_to_binary_fuzz_args(
             &launch,
             Path::new("/abs/target"),
@@ -827,20 +864,58 @@ mod tests {
         assert_eq!(args.seed_files, vec![PathBuf::from("/seeds/s0")]);
         assert_eq!(args.env, vec!["K=V".to_owned()]);
         assert_eq!(args.time, Some("1m".to_owned()));
+        // No composition wrappers declared → defaults.
+        assert!(args.runner.is_none());
+        assert!(args.runner_args.is_empty());
+        assert!(args.target_args.is_empty());
+        assert!(matches!(args.runtime_oracles, RuntimeOracleMode::Off));
+        assert!(args.oracle_command.is_none());
+    }
+
+    #[test]
+    fn binary_plan_maps_runner_target_args_and_postcondition() {
+        // The composed binary launch (#47/#59/#55) maps every field onto the
+        // real `BinaryFuzzArgs`, so `bhf project run` drives a runner + fixed
+        // argv + semantic-oracle hooks + runtime oracles.
+        let mut launch = binary_launch();
+        launch.engine = PpBinaryEngine::Builtin;
+        launch.input_mode = BinaryInput::File;
+        launch.runner = Some("wine".to_owned());
+        launch.runner_args = vec!["--mode".to_owned(), "fuzz".to_owned()];
+        launch.target_args = vec!["@@".to_owned()];
+        launch.runtime_oracles = PpRuntimeOraclesMode::Auto;
+        launch.setup_command = Some("./prepare-case".to_owned());
+        launch.oracle_command = Some("./check-postcondition".to_owned());
+        launch.reset_command = Some("./reset-case".to_owned());
+
+        let args = plan_to_binary_fuzz_args(
+            &launch,
+            Path::new("/abs/target"),
+            Path::new("/w"),
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+        assert!(matches!(args.engine, BinaryFuzzEngine::Builtin));
+        assert_eq!(args.runner.as_deref(), Some("wine"));
+        assert_eq!(
+            args.runner_args,
+            vec!["--mode".to_owned(), "fuzz".to_owned()]
+        );
+        assert_eq!(args.target_args, vec!["@@".to_owned()]);
+        assert!(matches!(args.runtime_oracles, RuntimeOracleMode::Auto));
+        assert_eq!(args.setup_command.as_deref(), Some("./prepare-case"));
+        assert_eq!(
+            args.oracle_command.as_deref(),
+            Some("./check-postcondition")
+        );
+        assert_eq!(args.reset_command.as_deref(), Some("./reset-case"));
     }
 
     #[test]
     fn binary_plan_defaults_mem_and_timeout() {
-        let launch = BinaryLaunch {
-            engine: PpBinaryEngine::Builtin,
-            input_mode: BinaryInput::Stdin,
-            binary: PathBuf::from("t"),
-            seeds: vec![],
-            env: vec![],
-            timeout_ms: None,
-            mem_mb: None,
-            time: None,
-        };
+        let launch = binary_launch();
         let args =
             plan_to_binary_fuzz_args(&launch, Path::new("/t"), Path::new("/w"), vec![], vec![])
                 .unwrap();
