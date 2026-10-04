@@ -304,6 +304,16 @@ impl FindingEmitter {
             write_sanitizer_log(&finding_dir, log)?;
         }
 
+        // The exception name and the `sanitizer` provenance follow what actually
+        // occurred: with a sanitizer, `ASAN_HEAP_BUFFER_OVERFLOW` and a
+        // `sanitizer` tag; without one (a host fatal signal or an on-target
+        // transport fault), the kind alone (`TARGET_CPU_EXCEPTION`) and NO
+        // `sanitizer` key — never a synthesized `asan` value that did not occur.
+        let kind_token = report.kind.to_uppercase().replace('-', "_");
+        let exception_name = match report.sanitizer {
+            Some(sanitizer) => format!("{}_{}", sanitizer.as_str().to_uppercase(), kind_token),
+            None => kind_token,
+        };
         let mut record = json!({
             "id": id.0,
             "signature": signature_hex,
@@ -317,9 +327,8 @@ impl FindingEmitter {
             "dialect": self.metadata.dialect,
             "fixture_path": self.metadata.fixture_path,
             "exception": {
-                "name": format!("{}_{}", report.sanitizer.as_str().to_uppercase(), report.kind.to_uppercase().replace('-', "_")),
+                "name": exception_name,
                 "message": report.message,
-                "sanitizer": report.sanitizer.as_str(),
                 "stack": report.stack,
             },
             "paths": {
@@ -328,6 +337,15 @@ impl FindingEmitter {
                 "finding": "finding.json",
             },
         });
+        // Record the sanitizer provenance only when a sanitizer actually ran, so
+        // an unsanitized host signal / on-target fault carries no `sanitizer`
+        // field rather than a false `asan`. Older records that always wrote the
+        // tag still read back: the normalized model's `sanitizer` is optional, so
+        // a missing field and a present one both deserialize (a compatible,
+        // additive change — no schema-version bump).
+        if let Some(sanitizer) = report.sanitizer {
+            record["exception"]["sanitizer"] = json!(sanitizer.as_str());
+        }
         if log_written.is_some() {
             record["paths"]["sanitizer_log"] = json!("sanitizer.log");
         }
@@ -1193,7 +1211,7 @@ mod tests {
         let root = temp_dir("cluster-sanitizer");
         let emitter = super::FindingEmitter::new(root.clone());
         let report = SanitizerReport {
-            sanitizer: Sanitizer::AddressSanitizer,
+            sanitizer: Some(Sanitizer::AddressSanitizer),
             kind: "heap-buffer-overflow".to_owned(),
             rule_id: "BHF-201",
             stack: vec![
@@ -1230,6 +1248,42 @@ mod tests {
         assert_eq!(short.len(), 16);
         assert_eq!(v["cluster_fallback"], false);
         assert_eq!(v["cluster_key_full"].as_str().unwrap().len(), 64);
+        // A genuine sanitizer keeps its provenance and an ASAN_* exception name.
+        assert_eq!(v["exception"]["sanitizer"], "asan");
+        assert_eq!(v["exception"]["name"], "ASAN_HEAP_BUFFER_OVERFLOW");
+    }
+
+    #[test]
+    fn no_sanitizer_report_omits_the_sanitizer_field_and_names_by_kind() {
+        use crate::sanitizer::SanitizerReport;
+        // An on-target CPU fault ran no sanitizer: the finding must NOT claim one
+        // (#78) — no `sanitizer` key, and the exception name is built from the
+        // kind, not a synthesized `asan` tag.
+        let root = temp_dir("no-sanitizer");
+        let emitter = super::FindingEmitter::new(root.clone());
+        let report = SanitizerReport {
+            sanitizer: None,
+            kind: "target-cpu-exception".to_owned(),
+            rule_id: "BHF-210",
+            stack: Vec::new(),
+            message: "target transport reported a target CPU exception with no sanitizer report"
+                .to_owned(),
+        };
+        let id = emitter.emit_sanitizer_crash(b"in", &report).unwrap();
+        let v: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(
+                crate::layout::findings_dir(&root)
+                    .join(id.0)
+                    .join("finding.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            v["exception"].get("sanitizer").is_none(),
+            "a non-sanitizer fault must carry no sanitizer field: {v}"
+        );
+        assert_eq!(v["exception"]["name"], "TARGET_CPU_EXCEPTION");
     }
 
     #[test]
@@ -1238,7 +1292,7 @@ mod tests {
         let root = tmp.path().to_path_buf();
         let emitter = FindingEmitter::new(root.clone());
         let report = crate::sanitizer::SanitizerReport {
-            sanitizer: crate::sanitizer::Sanitizer::AddressSanitizer,
+            sanitizer: Some(crate::sanitizer::Sanitizer::AddressSanitizer),
             kind: "heap-buffer-overflow".to_owned(),
             rule_id: "BHF-201",
             stack: Vec::new(),
@@ -1264,7 +1318,7 @@ mod tests {
         let emitter =
             super::FindingEmitter::new(root.clone()).with_mode(actionability::RunMode::Attacking);
         let report = SanitizerReport {
-            sanitizer: Sanitizer::AddressSanitizer,
+            sanitizer: Some(Sanitizer::AddressSanitizer),
             kind: "heap-buffer-overflow".to_owned(),
             rule_id: "BHF-201",
             stack: vec![StackFrame {
@@ -1586,7 +1640,7 @@ mod tests {
         let root = temp_dir("cluster-fallback");
         let emitter = super::FindingEmitter::new(root.clone());
         let report = SanitizerReport {
-            sanitizer: Sanitizer::AddressSanitizer,
+            sanitizer: Some(Sanitizer::AddressSanitizer),
             kind: "heap-buffer-overflow".to_owned(),
             rule_id: "BHF-201",
             stack: vec![StackFrame {
@@ -1616,7 +1670,7 @@ mod tests {
         let root = temp_dir("v1-envelope");
         let emitter = FindingEmitter::new(root.clone());
         let report = crate::sanitizer::SanitizerReport {
-            sanitizer: crate::sanitizer::Sanitizer::AddressSanitizer,
+            sanitizer: Some(crate::sanitizer::Sanitizer::AddressSanitizer),
             kind: "heap-buffer-overflow".to_owned(),
             rule_id: "BHF-201",
             stack: Vec::new(),
@@ -1730,7 +1784,7 @@ mod tests {
         let root = tmp.path().to_path_buf();
         let emitter = FindingEmitter::new(root.clone());
         let report = crate::sanitizer::SanitizerReport {
-            sanitizer: crate::sanitizer::Sanitizer::AddressSanitizer,
+            sanitizer: Some(crate::sanitizer::Sanitizer::AddressSanitizer),
             kind: "heap-buffer-overflow".to_owned(),
             rule_id: "BHF-201",
             stack: Vec::new(),
@@ -1753,7 +1807,7 @@ mod tests {
         let emitter = FindingEmitter::new(root.clone())
             .with_build_binary(serde_json::json!({"sha256": "ab", "build_id": "cd"}));
         let report = crate::sanitizer::SanitizerReport {
-            sanitizer: crate::sanitizer::Sanitizer::AddressSanitizer,
+            sanitizer: Some(crate::sanitizer::Sanitizer::AddressSanitizer),
             kind: "heap-buffer-overflow".to_owned(),
             rule_id: "BHF-201",
             stack: Vec::new(),

@@ -26,9 +26,10 @@
 
 use crate::coverage::MemoryBufferReader;
 use crate::error::{Result, TransportError};
-use crate::outcome::{ExitKind, RunOutcome};
+use crate::outcome::{ExitKind, Fault, FaultKind, RunOutcome};
 use crate::transport::{TargetSession, TargetTransport};
 use std::io::{Read, Write};
+use std::time::{Duration, Instant};
 
 /// RSP escape byte (`}`); the following byte is the real byte XOR 0x20.
 const ESCAPE: u8 = 0x7d;
@@ -40,6 +41,12 @@ const MAX_PACKET_BYTES: usize = 2 * 1024 * 1024;
 const MAX_MEMORY_READ: usize = 1024 * 1024;
 /// Retransmit attempts on a `-` (NAK) before giving up.
 const MAX_RETRANSMITS: usize = 3;
+/// Max intermediate `O` console-output packets accepted between a `c` and the
+/// terminal stop reply before giving up, so a chatty or wedged target cannot
+/// stream forever (an absolute execution deadline is enforced by the campaign).
+const MAX_CONSOLE_PACKETS: usize = 100_000;
+/// Max total decoded console-output bytes retained while awaiting a stop reply.
+const MAX_CONSOLE_BYTES: usize = 1024 * 1024;
 
 /// The RSP checksum: the low byte of the sum of the packet data bytes.
 pub fn rsp_checksum(data: &[u8]) -> u8 {
@@ -174,6 +181,41 @@ pub enum StopReply {
     Terminated(u8),
 }
 
+/// GDB remote-protocol signal numbers.
+///
+/// RSP stop replies (`Sxx` / `Txx`) carry GDB's own `gdb_signal` enum values,
+/// **not** the host platform's POSIX signal numbers. The two namespaces
+/// diverge: notably GDB numbers `SIGBUS` as 10 and `SIGEMT` as 7, whereas Linux
+/// uses 7 for `SIGBUS`. Classifying an RSP reply with host constants therefore
+/// mislabels a bus error and never fires for a real `SIGBUS`. These are the
+/// protocol values from GDB's `include/gdb/signals.def`.
+pub mod gdb_signal {
+    /// Illegal instruction.
+    pub const ILL: u8 = 4;
+    /// Trace/breakpoint trap — benign (a planted breakpoint or single-step stop).
+    pub const TRAP: u8 = 5;
+    /// Abort / `abort()`.
+    pub const ABRT: u8 = 6;
+    /// Emulator trap.
+    pub const EMT: u8 = 7;
+    /// Floating-point / arithmetic exception.
+    pub const FPE: u8 = 8;
+    /// Bus error (GDB numbers this 10, not the Linux POSIX 7).
+    pub const BUS: u8 = 10;
+    /// Segmentation fault / invalid memory access.
+    pub const SEGV: u8 = 11;
+}
+
+/// True for a GDB-protocol signal that denotes a target fault (a crash), as
+/// opposed to a benign stop such as `SIGTRAP` (a breakpoint) or "no signal" (0).
+///
+/// Shared by [`StopReply::to_exit_kind`] and the full-system fault classifier so
+/// the coarse crash decision and the detailed fault taxonomy stay in agreement.
+pub fn is_fatal_signal(signal: u8) -> bool {
+    use gdb_signal::*;
+    matches!(signal, ILL | ABRT | EMT | FPE | BUS | SEGV)
+}
+
 impl StopReply {
     /// Parse a stop-reply packet body.
     pub fn parse(body: &[u8]) -> Result<Self> {
@@ -196,23 +238,47 @@ impl StopReply {
     }
 
     /// Coarse HDF-1 mapping to [`ExitKind`]. The full signal-to-fault taxonomy
-    /// is HDF-2; here only the classically fatal signals count as a crash so a
-    /// benign `SIGTRAP` breakpoint stop is not mislabeled.
+    /// is HDF-2; here only the fatal GDB-protocol signals count as a crash so a
+    /// benign `SIGTRAP` breakpoint stop is not mislabeled. Signal numbers are
+    /// GDB's, not the host's — see [`gdb_signal`] and [`is_fatal_signal`].
     pub fn to_exit_kind(&self) -> ExitKind {
         match self {
             Self::Exited(_) => ExitKind::Ok,
+            // `Xxx` always denotes termination by a signal: a crash.
             Self::Terminated(_) => ExitKind::Crash,
-            Self::Signal(0) => ExitKind::Ok,
-            Self::Signal(signal) => {
-                // SIGILL(4) SIGABRT(6) SIGBUS(7) SIGFPE(8) SIGSEGV(11).
-                if matches!(signal, 4 | 6 | 7 | 8 | 11) {
-                    ExitKind::Crash
-                } else {
-                    ExitKind::Ok
-                }
-            }
+            Self::Signal(signal) if is_fatal_signal(*signal) => ExitKind::Crash,
+            Self::Signal(_) => ExitKind::Ok,
         }
     }
+}
+
+/// The result of a bounded [`GdbClient::cont_until`]: the target reached a stop
+/// within its per-input execution deadline, or the deadline elapsed first.
+///
+/// `DeadlineExceeded` is a *target-execution* timeout (a hang) — distinct from a
+/// setup/control I/O failure, which the caller sees as an `Err` from the setup
+/// packets, and from a lost link. The session turns it into a first-class
+/// [`ExitKind::Timeout`] outcome rather than a propagated I/O error, so a hang is
+/// never misreported as a lost transport or a clean run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContStop {
+    /// The target stopped (a real stop reply) before the deadline.
+    Stopped(StopReply),
+    /// The absolute per-input execution deadline elapsed with no stop reply.
+    DeadlineExceeded,
+}
+
+/// True for an I/O error that is a read/write timeout (the per-input budget
+/// elapsed), as opposed to a framing or connection-drop failure.
+fn is_timeout_err(err: &TransportError) -> bool {
+    matches!(
+        err,
+        TransportError::Io(io)
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            )
+    )
 }
 
 /// Low-level framed RSP connection over any byte channel.
@@ -411,10 +477,75 @@ impl<C: Read + Write> GdbClient<C> {
         from_hex(&response)
     }
 
-    /// Continue execution via `c`, returning the stop reply.
-    pub fn cont(&mut self) -> Result<StopReply> {
-        let response = self.command(b"c")?;
-        StopReply::parse(&response)
+    /// Continue execution via `c`, draining any intermediate `O<hex>` console
+    /// -output packets (semihosting / serial writes the target emits while it
+    /// runs) until the terminal stop reply. Returns the stop together with the
+    /// decoded console output, which the session surfaces as
+    /// [`RunOutcome::stdout`].
+    ///
+    /// Per the RSP specification a debugger must keep reading after an `O`
+    /// packet and wait for the real stop or exit; parsing the first frame as
+    /// the stop reply (a single send/recv) aborts any run that prints. An
+    /// unsupported intermediate frame is surfaced as an explicit error rather
+    /// than interpreted as a completed clean execution, and the retained output
+    /// is bounded by byte and packet counts so a continuous stream cannot run
+    /// unbounded.
+    pub fn cont(&mut self) -> Result<(StopReply, Vec<u8>)> {
+        match self.cont_until(None)? {
+            (ContStop::Stopped(stop), output) => Ok((stop, output)),
+            // With no deadline supplied the loop never yields DeadlineExceeded;
+            // guard it explicitly rather than panic so the invariant is visible.
+            (ContStop::DeadlineExceeded, _) => Err(TransportError::gdb(
+                "cont() reported a deadline with no deadline configured",
+            )),
+        }
+    }
+
+    /// Like [`GdbClient::cont`] but bounded by an absolute per-input execution
+    /// `deadline` (#70). When the target reaches a stop first, returns
+    /// [`ContStop::Stopped`]; when the deadline elapses (or a read times out with
+    /// a deadline configured — the read timeout IS the per-input budget), returns
+    /// [`ContStop::DeadlineExceeded`] with whatever console output was drained so
+    /// far, so the session can record a target-execution timeout (a hang) instead
+    /// of blocking forever or misreading the hang as a lost link. `None` restores
+    /// the unbounded behavior (bounded only by the socket read timeout and the
+    /// packet/byte caps), for callers with no per-input deadline.
+    pub fn cont_until(&mut self, deadline: Option<Instant>) -> Result<(ContStop, Vec<u8>)> {
+        self.connection.send_packet(b"c")?;
+        let mut output = Vec::new();
+        for _ in 0..MAX_CONSOLE_PACKETS {
+            if let Some(deadline) = deadline {
+                if Instant::now() >= deadline {
+                    return Ok((ContStop::DeadlineExceeded, output));
+                }
+            }
+            let frame = match self.connection.recv_packet() {
+                Ok(frame) => frame,
+                // A read timeout while a per-input deadline is in force is the
+                // budget elapsing on a silent (hung) target during execution —
+                // a target timeout, not a lost link. With no deadline the timeout
+                // is a genuine I/O failure and propagates unchanged.
+                Err(err) if deadline.is_some() && is_timeout_err(&err) => {
+                    return Ok((ContStop::DeadlineExceeded, output));
+                }
+                Err(err) => return Err(err),
+            };
+            match frame.split_first() {
+                Some((&b'O', payload)) => {
+                    let decoded = from_hex(payload)?;
+                    if output.len() + decoded.len() > MAX_CONSOLE_BYTES {
+                        return Err(TransportError::gdb(format!(
+                            "console output exceeded {MAX_CONSOLE_BYTES} bytes before a stop reply"
+                        )));
+                    }
+                    output.extend_from_slice(&decoded);
+                }
+                _ => return Ok((ContStop::Stopped(StopReply::parse(&frame)?), output)),
+            }
+        }
+        Err(TransportError::gdb(format!(
+            "received more than {MAX_CONSOLE_PACKETS} console-output packets before a stop reply"
+        )))
     }
 
     /// Reset the target between iterations: enable extended mode, then issue
@@ -478,12 +609,27 @@ pub struct GdbMemoryMap {
 pub struct GdbRemoteTransport<F> {
     connect: F,
     map: GdbMemoryMap,
+    exec_deadline: Option<Duration>,
 }
 
 impl<F> GdbRemoteTransport<F> {
     /// Build a transport with the given connection factory and memory map.
     pub fn new(connect: F, map: GdbMemoryMap) -> Self {
-        Self { connect, map }
+        Self {
+            connect,
+            map,
+            exec_deadline: None,
+        }
+    }
+
+    /// Set the absolute per-input execution deadline (#70). A run whose `continue`
+    /// does not reach a stop within this wall-clock bound is a target-execution
+    /// timeout (a hang), surfaced as an [`ExitKind::Timeout`] outcome rather than
+    /// blocking on the socket read timeout alone. `None` (the default) relies on
+    /// the connection's read timeout and the packet/byte caps.
+    pub fn with_exec_deadline(mut self, deadline: Option<Duration>) -> Self {
+        self.exec_deadline = deadline;
+        self
     }
 }
 
@@ -498,6 +644,7 @@ where
         Ok(Box::new(GdbSession {
             client,
             map: self.map,
+            exec_deadline: self.exec_deadline,
         }))
     }
 }
@@ -530,20 +677,66 @@ pub fn read_coverage_ring<C: Read + Write>(
 pub struct GdbSession<C> {
     client: GdbClient<C>,
     map: GdbMemoryMap,
+    exec_deadline: Option<Duration>,
 }
 
 impl<C: Read + Write> TargetSession for GdbSession<C> {
     fn run_input(&mut self, input: &[u8]) -> Result<RunOutcome> {
+        // SETUP phase: reset + input injection. A failure here — including an I/O
+        // timeout — is a control/infrastructure error, NOT a target-execution
+        // hang, so it propagates (the caller halts without inventing a false
+        // target-timing finding) rather than being classed as a target timeout.
         self.client.reset()?;
         self.client.write_memory(self.map.input_address, input)?;
-        let stop = self.client.cont()?;
-        let coverage_edges = read_coverage_ring(&mut self.client, &self.map)?;
+
+        // EXECUTION phase: bounded by the absolute per-input deadline (#70). A
+        // target that never reaches its stop within the deadline is a first-class
+        // Timeout outcome (a hang) with a structured fault, distinct from a setup
+        // failure or a lost link. Coverage is not read from a hung target.
+        let deadline = self.exec_deadline.map(|budget| Instant::now() + budget);
+        let (stop, stdout) = match self.client.cont_until(deadline)? {
+            (ContStop::Stopped(stop), stdout) => (stop, stdout),
+            (ContStop::DeadlineExceeded, stdout) => {
+                let detail = match self.exec_deadline {
+                    Some(budget) => format!(
+                        "no stop within the per-input execution deadline {}ms",
+                        budget.as_millis()
+                    ),
+                    None => "no stop within the per-input execution deadline".to_owned(),
+                };
+                return Ok(RunOutcome {
+                    exit: ExitKind::Timeout,
+                    coverage_edges: Vec::new(),
+                    fault: Some(Fault {
+                        kind: FaultKind::Timeout,
+                        address: None,
+                        detail,
+                    }),
+                    stdout,
+                    coverage_incomplete: Some(
+                        "target hung: coverage ring not read after an execution timeout".to_owned(),
+                    ),
+                });
+            }
+        };
+
+        // COLLECTION phase: classify the stop reply FIRST, then collect coverage.
+        // A coverage-readback failure must not erase an already-known stop (#74):
+        // keep the exit classification and record the read failure as a diagnostic
+        // instead of propagating an error that loses the crash.
+        let exit = stop.to_exit_kind();
+        let (coverage_edges, coverage_incomplete) =
+            match read_coverage_ring(&mut self.client, &self.map) {
+                Ok(edges) => (edges, None),
+                Err(err) => (Vec::new(), Some(err.to_string())),
+            };
         Ok(RunOutcome {
-            exit: stop.to_exit_kind(),
+            exit,
             coverage_edges,
             // Fault classification over the debug-probe path is HDF-2.
             fault: None,
-            stdout: Vec::new(),
+            stdout,
+            coverage_incomplete,
         })
     }
 }
@@ -631,15 +824,114 @@ mod tests {
     }
 
     #[test]
-    fn stop_reply_parses_and_classifies() {
+    fn stop_reply_parses_signal_exit_and_terminate_tags() {
         assert_eq!(StopReply::parse(b"S05").unwrap(), StopReply::Signal(5));
+        assert_eq!(StopReply::parse(b"S0a").unwrap(), StopReply::Signal(10));
         assert_eq!(StopReply::parse(b"S0b").unwrap(), StopReply::Signal(11));
+        // A `T` reply carries the same signal in its first two hex digits, then
+        // register/thread fields the coarse decoder ignores.
+        assert_eq!(
+            StopReply::parse(b"T0b20:0000;thread:1;").unwrap(),
+            StopReply::Signal(11)
+        );
         assert_eq!(StopReply::parse(b"W00").unwrap(), StopReply::Exited(0));
         assert_eq!(StopReply::parse(b"X0b").unwrap(), StopReply::Terminated(11));
-        // SIGTRAP (breakpoint) is not a crash; SIGSEGV is.
-        assert_eq!(StopReply::Signal(5).to_exit_kind(), ExitKind::Ok);
-        assert_eq!(StopReply::Signal(11).to_exit_kind(), ExitKind::Crash);
-        assert_eq!(StopReply::Terminated(11).to_exit_kind(), ExitKind::Crash);
+    }
+
+    #[test]
+    fn to_exit_kind_uses_gdb_protocol_signal_numbers() {
+        use gdb_signal::*;
+        // Fatal GDB-protocol signals classify as a crash, via both `S` and `T`.
+        // SIGBUS is 10 here, not the host POSIX 7; a real `S0a` bus-error reply
+        // was previously misclassified as a clean `Ok`.
+        for sig in [ILL, ABRT, EMT, FPE, BUS, SEGV] {
+            assert_eq!(
+                StopReply::Signal(sig).to_exit_kind(),
+                ExitKind::Crash,
+                "GDB signal {sig} must classify as a crash"
+            );
+            assert_eq!(
+                StopReply::parse(format!("T{sig:02x}").as_bytes())
+                    .unwrap()
+                    .to_exit_kind(),
+                ExitKind::Crash,
+            );
+        }
+        // Benign stops: "no signal" (0) and the breakpoint / single-step trap.
+        assert_eq!(StopReply::Signal(0).to_exit_kind(), ExitKind::Ok);
+        assert_eq!(StopReply::Signal(TRAP).to_exit_kind(), ExitKind::Ok);
+        // A normal process exit is clean; an `X` termination is a crash.
+        assert_eq!(StopReply::Exited(0).to_exit_kind(), ExitKind::Ok);
+        assert_eq!(StopReply::Terminated(SEGV).to_exit_kind(), ExitKind::Crash);
+    }
+
+    #[test]
+    fn cont_drains_console_output_before_the_stop_reply() {
+        // The stub prints two console chunks via `O<hex>` packets, then stops
+        // cleanly. cont() must preserve the output and still reach the stop
+        // reply rather than aborting on the first `O` frame.
+        let (client_end, stub_end) = duplex();
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let stub = MockGdbStub::new(stub_end, log)
+            .with_stop_reply(b"W00".to_vec())
+            .with_console_output(vec![b"hello ".to_vec(), b"world".to_vec()]);
+        let handle = thread::spawn(move || stub.serve());
+
+        let mut client = GdbClient::new(client_end);
+        client.attach().unwrap();
+        let (stop, output) = client.cont().unwrap();
+        drop(client);
+        handle.join().unwrap().unwrap();
+
+        assert_eq!(stop, StopReply::Exited(0));
+        assert_eq!(output, b"hello world");
+    }
+
+    #[test]
+    fn cont_preserves_a_fatal_stop_after_console_output() {
+        // Console output followed by a SIGSEGV stop must retain both the fault
+        // signal and the printed output.
+        let (client_end, stub_end) = duplex();
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let stub = MockGdbStub::new(stub_end, log)
+            .with_stop_reply(b"S0b".to_vec())
+            .with_console_output(vec![b"panic: boom\n".to_vec()]);
+        let handle = thread::spawn(move || stub.serve());
+
+        let mut client = GdbClient::new(client_end);
+        client.attach().unwrap();
+        let (stop, output) = client.cont().unwrap();
+        drop(client);
+        handle.join().unwrap().unwrap();
+
+        assert_eq!(stop, StopReply::Signal(11));
+        assert_eq!(stop.to_exit_kind(), ExitKind::Crash);
+        assert_eq!(output, b"panic: boom\n");
+    }
+
+    #[test]
+    fn cont_bounds_oversized_console_output() {
+        // Two chunks whose decoded total exceeds MAX_CONSOLE_BYTES must be
+        // diagnosed before any stop reply, so an output stream cannot grow
+        // without bound (the absolute execution deadline is enforced by the
+        // campaign).
+        let chunk = vec![b'a'; MAX_CONSOLE_BYTES / 2 + 1];
+        let (client_end, stub_end) = duplex();
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let stub = MockGdbStub::new(stub_end, log)
+            .with_stop_reply(b"W00".to_vec())
+            .with_console_output(vec![chunk.clone(), chunk]);
+        thread::spawn(move || {
+            let _ = stub.serve();
+        });
+
+        let mut client = GdbClient::new(client_end);
+        client.attach().unwrap();
+        let error = client.cont().unwrap_err();
+        assert!(
+            error.to_string().contains("console output exceeded"),
+            "expected a bounded-output diagnostic, got: {error}"
+        );
     }
 
     #[test]
@@ -758,6 +1050,164 @@ mod tests {
         assert!(
             log.iter().any(|p| p.starts_with("M1000,")),
             "log missing input write: {log:?}"
+        );
+    }
+
+    #[test]
+    fn gdb_session_retains_crash_when_coverage_readback_fails() {
+        // A SIGSEGV stop followed by a too-short ring read must retain the crash
+        // (exit Crash) and record the readback failure, rather than propagating
+        // an error that erases the already-observed crash (#74).
+        let map = GdbMemoryMap {
+            input_address: 0x1000,
+            ring_address: 0x4000,
+            ring_write_address: 0x5000,
+            ring_wrapped_address: 0x5100,
+            ring_capacity: 32,
+        };
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (client_end, stub_end) = duplex();
+        let stub = MockGdbStub::new(stub_end, log)
+            .with_stop_reply(b"S0b".to_vec())
+            .with_region(map.input_address, vec![0_u8; 64])
+            .with_region(map.ring_address, vec![0_u8; 8]) // too short for cap=32
+            .with_region(map.ring_write_address, 4_u32.to_le_bytes().to_vec())
+            .with_region(map.ring_wrapped_address, vec![0_u8]);
+        thread::spawn(move || {
+            let _ = stub.serve();
+        });
+
+        let client_slot = Mutex::new(Some(client_end));
+        let transport = GdbRemoteTransport::new(
+            move || {
+                client_slot
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .ok_or_else(|| TransportError::gdb("connect invoked more than once"))
+            },
+            map,
+        );
+        let mut session = transport.arm().unwrap();
+        let outcome = session.run_input(b"boom").unwrap();
+
+        assert_eq!(outcome.exit, ExitKind::Crash);
+        assert!(
+            outcome.coverage_incomplete.is_some(),
+            "the readback failure must be recorded alongside the retained crash"
+        );
+    }
+
+    /// A channel that serves a fixed script of bytes to reads and, once the
+    /// script is exhausted, reports a read timeout — modelling a target that acks
+    /// the `continue` packet and then goes silent (hangs) for the deadline.
+    struct AckThenSilent {
+        to_read: std::collections::VecDeque<u8>,
+    }
+
+    impl Read for AckThenSilent {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.to_read.pop_front() {
+                Some(byte) => {
+                    buf[0] = byte;
+                    Ok(1)
+                }
+                None => Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+            }
+        }
+    }
+
+    impl Write for AckThenSilent {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn cont_until_times_out_on_a_silent_target_within_deadline() {
+        // The target acks the `c` packet (one `+`) then stays silent. With a
+        // per-input deadline in force, the read timeout is the budget elapsing on
+        // a hung target: cont_until reports DeadlineExceeded (a hang), NOT a
+        // propagated I/O error that the caller would misread as a lost link.
+        let channel = AckThenSilent {
+            to_read: std::collections::VecDeque::from(vec![b'+']),
+        };
+        let mut client = GdbClient::new(channel);
+        let deadline = Instant::now() + Duration::from_secs(3600);
+        let (stop, output) = client.cont_until(Some(deadline)).unwrap();
+        assert_eq!(stop, ContStop::DeadlineExceeded);
+        assert!(
+            output.is_empty(),
+            "no stop reply was read from the hung target"
+        );
+    }
+
+    #[test]
+    fn cont_until_without_a_deadline_propagates_a_read_timeout() {
+        // With NO deadline configured, a read timeout is a genuine I/O failure
+        // (setup/control, not a target-execution hang) and must propagate rather
+        // than be silently converted into a DeadlineExceeded result.
+        let channel = AckThenSilent {
+            to_read: std::collections::VecDeque::from(vec![b'+']),
+        };
+        let mut client = GdbClient::new(channel);
+        let err = client.cont_until(None).unwrap_err();
+        assert!(
+            is_timeout_err(&err),
+            "a bare read timeout must propagate: {err}"
+        );
+    }
+
+    #[test]
+    fn gdb_session_reports_timeout_when_execution_deadline_elapses() {
+        // A 1ns per-input deadline elapses before the stop reply can be read: the
+        // session reports a first-class Timeout outcome (a hang) with a Timeout
+        // fault — not a crash, not a propagated error — and does not read coverage
+        // from the hung target (#70).
+        let map = GdbMemoryMap {
+            input_address: 0x1000,
+            ring_address: 0x4000,
+            ring_write_address: 0x5000,
+            ring_wrapped_address: 0x5100,
+            ring_capacity: 32,
+        };
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (client_end, stub_end) = duplex();
+        let stub = MockGdbStub::new(stub_end, log)
+            .with_stop_reply(b"W00".to_vec())
+            .with_region(map.input_address, vec![0_u8; 64])
+            .with_region(map.ring_address, vec![0_u8; 32])
+            .with_region(map.ring_write_address, 0_u32.to_le_bytes().to_vec())
+            .with_region(map.ring_wrapped_address, vec![0_u8]);
+        thread::spawn(move || {
+            let _ = stub.serve();
+        });
+
+        let slot = Mutex::new(Some(client_end));
+        let transport = GdbRemoteTransport::new(
+            move || {
+                slot.lock()
+                    .unwrap()
+                    .take()
+                    .ok_or_else(|| TransportError::gdb("connect invoked more than once"))
+            },
+            map,
+        )
+        .with_exec_deadline(Some(Duration::from_nanos(1)));
+
+        let mut session = transport.arm().unwrap();
+        let outcome = session.run_input(b"x").unwrap();
+        assert_eq!(outcome.exit, ExitKind::Timeout);
+        assert_eq!(
+            outcome.fault.expect("a hang carries a Timeout fault").kind,
+            FaultKind::Timeout
+        );
+        assert!(
+            outcome.coverage_incomplete.is_some(),
+            "a hung target's coverage ring is not presented as complete"
         );
     }
 }

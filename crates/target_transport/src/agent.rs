@@ -182,6 +182,7 @@ pub fn read_response<R: Read>(reader: &mut R, limits: &AgentLimits) -> Result<Ru
         coverage_edges,
         fault,
         stdout: Vec::new(),
+        coverage_incomplete: None,
     })
 }
 
@@ -418,6 +419,7 @@ mod tests {
                 detail: "watchdog reset".to_string(),
             }),
             stdout: Vec::new(),
+            coverage_incomplete: None,
         };
         let encoded = encode_response(&outcome);
         let decoded = read_response(&mut encoded.as_slice(), &AgentLimits::default()).unwrap();

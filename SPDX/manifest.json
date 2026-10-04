@@ -1815,6 +1815,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/transport_replay.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/workdir.rs",
       "license": "Apache-2.0"
     },
@@ -2556,6 +2560,14 @@
     },
     {
       "path": "crates/cli/tests/toolchain_support.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/transport_fuzz_qemu_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/transport_fuzz_timeout_cli.rs",
       "license": "Apache-2.0"
     },
     {

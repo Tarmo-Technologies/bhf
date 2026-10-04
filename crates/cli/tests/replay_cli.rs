@@ -176,6 +176,146 @@ fn replay_subcommand_strict_missing_sandbox_returns_one() {
     );
 }
 
+// --- #81: the C/C++ replay paths must honor --qemu-user / sandbox too ---
+
+#[cfg(unix)]
+fn make_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = fs::metadata(path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).unwrap();
+}
+
+/// A minimal C/C++ finding (rule_id + testcase) the C replay paths expect.
+#[cfg(unix)]
+fn write_c_finding(root: &Path) -> PathBuf {
+    let finding = root.join("finding");
+    fs::create_dir_all(&finding).unwrap();
+    fs::write(finding.join("finding.json"), r#"{"rule_id":"BHF-210"}"#).unwrap();
+    fs::write(finding.join("testcase.bin"), b"input").unwrap();
+    finding
+}
+
+#[cfg(unix)]
+#[test]
+fn replay_c_afl_routes_through_qemu_user() {
+    // A CAfl harness (detected by the `main_afl` filename) reads stdin. Before
+    // the fix, replay_c_afl spawned a bare Command::new(harness) and ignored
+    // --qemu-user entirely; now it wraps through the runner (#81).
+    let root = temp_dir("c-afl-qemu");
+    let harness = root.join("main_afl");
+    fs::write(&harness, "#!/bin/sh\ncat >/dev/null\nexit 0\n").unwrap();
+    make_executable(&harness);
+    let qemu = root.join("fake-qemu");
+    write_fake_qemu_user(&qemu);
+    let finding_dir = write_c_finding(&root);
+
+    let exit = cli::run_from([
+        "bhf",
+        "replay",
+        finding_dir.to_str().unwrap(),
+        "--harness",
+        harness.to_str().unwrap(),
+        "--qemu-user",
+        qemu.to_str().unwrap(),
+        "--qemu-arg=-L",
+        "--qemu-arg=/opt/sysroot",
+    ]);
+
+    // A clean harness reproduces no crash -> MISMATCH (3); the point is that it
+    // ran THROUGH the qemu-user wrapper, which recorded the wrapped argv.
+    assert_eq!(
+        exit, 3,
+        "clean C-AFL harness -> MISMATCH, but via the wrapper"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("qemu-argv.txt")).unwrap(),
+        format!("-L\n/opt/sysroot\n{}\n", harness.display()),
+        "the C-AFL replay must wrap the harness under qemu-user"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn replay_c_libfuzzer_routes_through_sandbox_with_testcase_argv() {
+    // A CLibFuzzer harness (detected by a sibling main.c carrying BHF_FRAMED)
+    // takes the testcase as argv[1]. The fix routes it through the sandbox while
+    // preserving that argv protocol (#81).
+    let root = temp_dir("c-libfuzzer-sandbox");
+    fs::write(
+        root.join("main.c"),
+        "/* BHF_FRAMED driver */\nint main(){return 0;}\n",
+    )
+    .unwrap();
+    let harness = root.join("main");
+    fs::write(
+        &harness,
+        "#!/bin/sh\nprintf '%s' \"$1\" > \"$(dirname \"$0\")/harness-argv1.txt\"\nexit 0\n",
+    )
+    .unwrap();
+    make_executable(&harness);
+    let sandbox = root.join("fake-firejail");
+    write_fake_sandbox(&sandbox);
+    let finding_dir = write_c_finding(&root);
+
+    let exit = cli::run_from([
+        "bhf",
+        "replay",
+        finding_dir.to_str().unwrap(),
+        "--harness",
+        harness.to_str().unwrap(),
+        "--sandbox",
+        "firejail",
+        "--sandbox-tool",
+        sandbox.to_str().unwrap(),
+    ]);
+
+    assert_eq!(
+        exit, 3,
+        "clean C-libFuzzer harness -> MISMATCH, but via the sandbox"
+    );
+    let sandbox_argv = fs::read_to_string(root.join("sandbox-argv.txt")).unwrap();
+    assert!(
+        sandbox_argv.contains(&format!("{}\n", harness.display())),
+        "the C-libFuzzer replay must wrap the harness under the sandbox: {sandbox_argv}"
+    );
+    // The testcase was delivered as argv[1] (libFuzzer protocol), not stdin.
+    let argv1 = fs::read_to_string(root.join("harness-argv1.txt")).unwrap();
+    assert!(
+        argv1.ends_with("testcase.bin"),
+        "the libFuzzer testcase must be argv[1]: {argv1}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn replay_c_afl_strict_missing_sandbox_is_an_early_error() {
+    // A requested strict sandbox that is unavailable must fail the C replay, not
+    // be silently skipped (#81).
+    let root = temp_dir("c-afl-strict-sandbox");
+    let harness = root.join("main_afl");
+    fs::write(&harness, "#!/bin/sh\ncat >/dev/null\nexit 0\n").unwrap();
+    make_executable(&harness);
+    let finding_dir = write_c_finding(&root);
+
+    assert_eq!(
+        cli::run_from([
+            "bhf",
+            "replay",
+            finding_dir.to_str().unwrap(),
+            "--harness",
+            harness.to_str().unwrap(),
+            "--sandbox",
+            "firejail",
+            "--sandbox-tool",
+            root.join("missing-firejail").to_str().unwrap(),
+            "--sandbox-strict",
+        ]),
+        1,
+        "a strict missing sandbox must be an error on the C path, not a silent bypass"
+    );
+}
+
 #[test]
 fn replay_subcommand_mismatch_returns_three() {
     let finding_dir = write_finding("mismatch");

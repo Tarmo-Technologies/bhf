@@ -55,8 +55,8 @@ use fuzz_engine_builtin::{
 };
 use serde::Serialize;
 use target_transport::{
-    AgentTransport, ExitKind, FullSystemTransport, GdbMemoryMap, GdbRemoteTransport, RunOutcome,
-    TargetTransport, TransportError,
+    AgentTransport, ExitKind, FullSystemTransport, GdbMemoryMap, GdbRemoteTransport,
+    GuestFaultStatus, RunOutcome, TargetSession, TargetTransport, TransportError,
 };
 
 use crate::fuzz::FuzzArgs;
@@ -67,6 +67,47 @@ const DEFAULT_SEED: &[u8] = b"BHF-transport-seed";
 
 /// The default `qemu-system` baseline snapshot tag when the spec omits one.
 const DEFAULT_SNAPSHOT_TAG: &str = "bhf-baseline";
+
+/// Per-input I/O backstop when `--timeout` is not given, so a wedged peer that
+/// never greets / never answers / drips partial responses trips a bound instead
+/// of hanging a supposedly bounded campaign forever (#70). The documented
+/// cleanup allowance.
+const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Cap on the TCP connect phase — a connect should never consume the whole
+/// per-input I/O backstop.
+const CONNECT_TIMEOUT_CAP: Duration = Duration::from_secs(10);
+
+/// Dial a TCP endpoint with bounded connect / read / write lifetimes (#70).
+///
+/// A target that never greets, never answers `continue`, or delivers only
+/// partial responses trips the configured bound and surfaces a descriptive I/O
+/// error, rather than blocking a read forever — which the campaign's
+/// between-execution budget check cannot interrupt. `io_timeout` is the per
+/// read/write bound; `None` falls back to [`DEFAULT_IO_TIMEOUT`].
+fn connect_tcp_bounded(
+    host: &str,
+    port: u16,
+    io_timeout: Option<Duration>,
+) -> Result<std::net::TcpStream, TransportError> {
+    use std::net::ToSocketAddrs;
+    let io = io_timeout.unwrap_or(DEFAULT_IO_TIMEOUT);
+    let connect = io.min(CONNECT_TIMEOUT_CAP);
+    let addr = (host, port)
+        .to_socket_addrs()
+        .map_err(TransportError::from)?
+        .next()
+        .ok_or_else(|| TransportError::Protocol(format!("could not resolve {host}:{port}")))?;
+    let stream =
+        std::net::TcpStream::connect_timeout(&addr, connect).map_err(TransportError::from)?;
+    stream
+        .set_read_timeout(Some(io))
+        .map_err(TransportError::from)?;
+    stream
+        .set_write_timeout(Some(io))
+        .map_err(TransportError::from)?;
+    Ok(stream)
+}
 
 /// True when `bhf fuzz` should take the transport-driven path instead of the
 /// host libFuzzer/AFL path: exactly when `--target-transport` is set. When it is
@@ -105,6 +146,15 @@ pub(crate) enum TransportPlan {
         gdb_port: u16,
         map: GdbMemoryMap,
         snapshot_tag: String,
+        /// Completion breakpoint `(address, RSP kind)` planted at arm so a
+        /// self-HardFaulting Cortex-M target halts back to the debugger instead
+        /// of running `c` unbounded (#71). `None` for targets that trap on their
+        /// own; the bounded run control (#70) still backstops a missing one.
+        harness_done: Option<(u64, u32)>,
+        /// Firmware fault-status contract read after each run so a fault that
+        /// returns through the completion breakpoint is classified as a crash
+        /// rather than a silent clean pass (#72).
+        fault_status: Option<GuestFaultStatus>,
     },
 }
 
@@ -229,10 +279,18 @@ impl TransportPlan {
     /// Build the live [`TargetTransport`] this plan describes. Pure: the
     /// connect closures dial their resource only when [`TargetTransport::arm`]
     /// is called, so this never touches hardware/emulator/socket by itself.
-    pub(crate) fn into_transport(self) -> Result<Box<dyn TargetTransport>, TransportSpecError> {
+    ///
+    /// `io_timeout` bounds each TCP connect/read/write so a wedged peer cannot
+    /// hang the campaign (#70); a serial device uses the OS default (setting a
+    /// read timeout on a character device needs a termios adapter, a documented
+    /// follow-up).
+    pub(crate) fn into_transport(
+        self,
+        io_timeout: Option<Duration>,
+    ) -> Result<Box<dyn TargetTransport>, TransportSpecError> {
         match self {
             Self::AgentTcp { host, port } => Ok(Box::new(AgentTransport::new(move || {
-                std::net::TcpStream::connect((host.as_str(), port)).map_err(TransportError::from)
+                connect_tcp_bounded(&host, port, io_timeout)
             }))),
             Self::AgentSerial { path } => Ok(Box::new(AgentTransport::new(move || {
                 std::fs::OpenOptions::new()
@@ -241,13 +299,13 @@ impl TransportPlan {
                     .open(&path)
                     .map_err(TransportError::from)
             }))),
-            Self::Gdb { host, port, map } => Ok(Box::new(GdbRemoteTransport::new(
-                move || {
-                    std::net::TcpStream::connect((host.as_str(), port))
-                        .map_err(TransportError::from)
-                },
-                map,
-            ))),
+            Self::Gdb { host, port, map } => Ok(Box::new(
+                GdbRemoteTransport::new(move || connect_tcp_bounded(&host, port, io_timeout), map)
+                    // The I/O bound doubles as the absolute per-input execution
+                    // deadline so a hung target is a bounded Timeout outcome, not
+                    // an unbounded wait behind the per-read socket timeout (#70).
+                    .with_exec_deadline(io_timeout),
+            )),
             Self::QemuSystem {
                 qmp_host,
                 qmp_port,
@@ -255,19 +313,30 @@ impl TransportPlan {
                 gdb_port,
                 map,
                 snapshot_tag,
+                harness_done,
+                fault_status,
             } => {
-                let transport = FullSystemTransport::new(
-                    move || {
-                        std::net::TcpStream::connect((qmp_host.as_str(), qmp_port))
-                            .map_err(TransportError::from)
-                    },
-                    move || {
-                        std::net::TcpStream::connect((gdb_host.as_str(), gdb_port))
-                            .map_err(TransportError::from)
-                    },
+                let mut transport = FullSystemTransport::new(
+                    move || connect_tcp_bounded(&qmp_host, qmp_port, io_timeout),
+                    move || connect_tcp_bounded(&gdb_host, gdb_port, io_timeout),
                     map,
                     snapshot_tag,
                 )?;
+                // Wire the completion contract (#71) and the firmware
+                // fault-status channel (#72) the parser captured, so the guide's
+                // `bhf fuzz --target-transport qemu-system:...` command plants
+                // the harness-done breakpoint itself rather than relying on an
+                // out-of-band debugger.
+                if let Some((address, kind)) = harness_done {
+                    transport = transport.with_harness_breakpoint(address, kind);
+                }
+                if let Some(status) = fault_status {
+                    transport = transport.with_fault_status(status);
+                }
+                // The I/O bound doubles as the absolute per-input execution
+                // deadline (#70): a guest that never reaches the completion stop
+                // is a bounded Timeout outcome, not an unbounded run-control wait.
+                transport = transport.with_exec_deadline(io_timeout);
                 Ok(Box::new(transport))
             }
         }
@@ -315,6 +384,18 @@ fn parse_qemu_system(
     let mut qmp: Option<(String, u16)> = None;
     let mut gdb: Option<(String, u16)> = None;
     let mut snapshot_tag = DEFAULT_SNAPSHOT_TAG.to_owned();
+    // Completion contract (#71) and firmware fault-status (#72), all optional.
+    let mut done: Option<u64> = None;
+    let mut done_kind: u64 = 2; // ARM Thumb breakpoint kind (instruction size).
+    let mut fault: Option<u64> = None;
+    let mut fault_width: u64 = 4;
+    let mut fault_clear: u64 = 0;
+
+    let malformed = |reason: String| TransportSpecError::Malformed {
+        backend: "qemu-system",
+        spec: spec.to_owned(),
+        reason,
+    };
 
     for part in rest.split(',') {
         let part = part.trim();
@@ -323,35 +404,49 @@ fn parse_qemu_system(
         }
         let (key, value) = part
             .split_once('=')
-            .ok_or_else(|| TransportSpecError::Malformed {
-                backend: "qemu-system",
-                spec: spec.to_owned(),
-                reason: format!("expected key=value in {part:?}"),
-            })?;
+            .ok_or_else(|| malformed(format!("expected key=value in {part:?}")))?;
+        let value = value.trim();
         match key.trim() {
-            "qmp" => qmp = Some(parse_host_port("qemu-system", spec, value.trim())?),
-            "gdb" => gdb = Some(parse_host_port("qemu-system", spec, value.trim())?),
-            "snapshot" => snapshot_tag = value.trim().to_owned(),
+            "qmp" => qmp = Some(parse_host_port("qemu-system", spec, value)?),
+            "gdb" => gdb = Some(parse_host_port("qemu-system", spec, value)?),
+            "snapshot" => snapshot_tag = value.to_owned(),
+            "done" => done = Some(parse_int("done", value)?),
+            "done_kind" => done_kind = parse_int("done_kind", value)?,
+            "fault" => fault = Some(parse_int("fault", value)?),
+            "fault_width" => fault_width = parse_int("fault_width", value)?,
+            "fault_clear" => fault_clear = parse_int("fault_clear", value)?,
             other => {
-                return Err(TransportSpecError::Malformed {
-                    backend: "qemu-system",
-                    spec: spec.to_owned(),
-                    reason: format!("unknown key {other:?}; allowed: qmp, gdb, snapshot"),
-                })
+                return Err(malformed(format!(
+                    "unknown key {other:?}; allowed: qmp, gdb, snapshot, done, done_kind, \
+                     fault, fault_width, fault_clear"
+                )))
             }
         }
     }
 
-    let (qmp_host, qmp_port) = qmp.ok_or_else(|| TransportSpecError::Malformed {
-        backend: "qemu-system",
-        spec: spec.to_owned(),
-        reason: "missing required key qmp=HOST:PORT".to_owned(),
-    })?;
-    let (gdb_host, gdb_port) = gdb.ok_or_else(|| TransportSpecError::Malformed {
-        backend: "qemu-system",
-        spec: spec.to_owned(),
-        reason: "missing required key gdb=HOST:PORT".to_owned(),
-    })?;
+    let (qmp_host, qmp_port) =
+        qmp.ok_or_else(|| malformed("missing required key qmp=HOST:PORT".to_owned()))?;
+    let (gdb_host, gdb_port) =
+        gdb.ok_or_else(|| malformed("missing required key gdb=HOST:PORT".to_owned()))?;
+
+    let harness_done = match done {
+        Some(address) => {
+            let kind = u32::try_from(done_kind)
+                .map_err(|_| malformed(format!("done_kind {done_kind} is out of range")))?;
+            Some((address, kind))
+        }
+        None => None,
+    };
+    let fault_status = match fault {
+        Some(address) => {
+            let width = usize::try_from(fault_width)
+                .map_err(|_| malformed(format!("fault_width {fault_width} is out of range")))?;
+            // GuestFaultStatus::new validates the width (1..=8); its error maps
+            // through TransportSpecError::Transport.
+            Some(GuestFaultStatus::new(address, width, fault_clear)?)
+        }
+        None => None,
+    };
 
     Ok(TransportPlan::QemuSystem {
         qmp_host,
@@ -360,6 +455,8 @@ fn parse_qemu_system(
         gdb_port,
         map,
         snapshot_tag,
+        harness_done,
+        fault_status,
     })
 }
 
@@ -468,8 +565,22 @@ pub(crate) struct TransportFuzzConfig {
     pub seeds: Vec<Vec<u8>>,
     /// Total execution cap (bounded work — never unbounded).
     pub iterations: usize,
-    /// Optional wall-clock budget.
+    /// Optional whole-campaign wall-clock budget (`--time`).
     pub time_budget: Option<Duration>,
+    /// Optional absolute per-input execution deadline (`--timeout`). The transport
+    /// itself enforces it (a hang is an `ExitKind::Timeout` outcome); this copy is
+    /// persisted into each finding's replay profile so `bhf replay` rebuilds the
+    /// transport with the SAME per-input bound and can reproduce a timing finding.
+    pub per_input_timeout: Option<Duration>,
+    /// Optional response-time deadline (`--deadline`). A completed run whose
+    /// host-observed execution time exceeds it is recorded as a BHF-555 timing
+    /// finding rather than discarded as a slow unit (#70).
+    pub deadline: Option<Duration>,
+    /// The raw `--target-transport` spec, persisted with each finding so it can
+    /// be replayed against the same target/reset contract (#80).
+    pub spec: String,
+    /// The raw `--transport-coverage-map` spec, if any (persisted for replay).
+    pub coverage_map: Option<String>,
     /// Ceiling on a generated input's length.
     pub max_len: usize,
     /// Deterministic mutation RNG seed.
@@ -498,8 +609,18 @@ pub(crate) struct TransportFuzzSummary {
     pub coverage_blocks: usize,
     /// Total crash/timeout outcomes seen (before dedup).
     pub crashes: usize,
+    /// Executions whose coverage/evidence collection was incomplete (a post-stop
+    /// readback failure). Non-zero means some coverage is partial, not that the
+    /// run failed — surfaced so partial coverage is never read as complete (#74).
+    pub incomplete_observations: usize,
     /// Distinct finding ids written to `<work_dir>/findings/`.
     pub findings: Vec<String>,
+    /// Set when the campaign stopped early on a non-clean run-control condition
+    /// — a target-execution timeout (hang) or a lost transport (#70). `None` is
+    /// a clean, fully-bounded completion. Distinct from a crash finding, which
+    /// is a normal result recorded in `findings`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub halted: Option<String>,
     pub elapsed_secs: f64,
 }
 
@@ -591,11 +712,22 @@ pub(crate) fn run_transport_campaign(
     let mut executions = 0usize;
     let mut corpus_new = 0usize;
     let mut crashes = 0usize;
+    // Executions whose post-stop coverage/evidence collection was incomplete
+    // (#74): surfaced in the summary so partial coverage — on a clean run or a
+    // crash — is never silently presented as complete.
+    let mut incomplete_observations = 0usize;
     let mut finding_ids: Vec<String> = Vec::new();
     // Dedup findings on the same key the on-disk finding signature is built from
     // (rule_id | kind; the transport lane carries no stack frames), so one fault
     // class yields one finding regardless of how many inputs reach it.
     let mut seen_findings: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Distinct crash-candidate count per (target | rule | kind) class, bounding
+    // how many distinct fault sites one class may retain (#75).
+    let mut class_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    // Set when a run-control condition stops the campaign early (#70): a target
+    // hang or a lost transport — a distinct, non-clean outcome.
+    let mut halted: Option<String> = None;
 
     // --- seed phase: run every seed once; seeds are always corpus members. ---
     let seed_count = config.seeds.len();
@@ -610,39 +742,49 @@ pub(crate) fn run_transport_campaign(
         ) {
             break;
         }
-        let outcome = session.run_input(seed)?;
-        executions += 1;
-        let feedback = fold_coverage(&mut coverage, &outcome.coverage_edges);
-        scheduler.insert_with_feedback(seed.clone(), feedback.to_schedule_feedback());
-        handle_outcome(
-            &outcome,
-            seed,
-            &emitter,
-            &mut seen_findings,
-            &mut finding_ids,
-            &mut crashes,
-        )?;
+        match run_one_input(session.as_mut(), seed)? {
+            Step::Halt(reason) => {
+                halted = Some(reason);
+                break;
+            }
+            Step::Ran(outcome, elapsed) => {
+                executions += 1;
+                if outcome.coverage_incomplete.is_some() {
+                    incomplete_observations += 1;
+                }
+                let feedback = fold_coverage(&mut coverage, &outcome.coverage_edges);
+                scheduler.insert_with_feedback(seed.clone(), feedback.to_schedule_feedback());
+                handle_outcome(
+                    &outcome,
+                    seed,
+                    &config.transport_label,
+                    &emitter,
+                    &mut seen_findings,
+                    &mut class_counts,
+                    &mut finding_ids,
+                    &mut crashes,
+                )?;
+                // The deadline oracle is for a COMPLETED-but-slow run only: a
+                // crash or an execution timeout already yields its own finding
+                // via handle_outcome, so firing it here too would double-count.
+                if outcome.exit == ExitKind::Ok {
+                    maybe_emit_deadline(
+                        elapsed,
+                        config.deadline,
+                        seed,
+                        &emitter,
+                        &mut seen_findings,
+                        &mut finding_ids,
+                        &mut crashes,
+                    )?;
+                }
+            }
+        }
     }
 
     // --- mutation phase: scheduler-driven, coverage-guided. ---
-    'outer: loop {
-        if should_stop(
-            executions,
-            config.iterations,
-            start,
-            config.time_budget,
-            finding_ids.len(),
-            config.stop_after_findings,
-        ) {
-            break;
-        }
-        let Some(scheduled) = scheduler.select_next() else {
-            // No corpus (no seeds and none retained) — nothing to mutate.
-            break;
-        };
-        // The scheduler's power schedule sets how many children this seed earns.
-        let children = scheduled.energy.max(1);
-        for _ in 0..children {
+    if halted.is_none() {
+        'outer: loop {
             if should_stop(
                 executions,
                 config.iterations,
@@ -651,36 +793,86 @@ pub(crate) fn run_transport_campaign(
                 finding_ids.len(),
                 config.stop_after_findings,
             ) {
-                break 'outer;
+                break;
             }
-            let input = match mutator
-                .mutate(&MutationInput::new(&scheduled.bytes, &dictionary), &mut rng)
-            {
-                Some(result) => result.bytes,
-                None => scheduled.bytes.clone(),
+            let Some(scheduled) = scheduler.select_next() else {
+                // No corpus (no seeds and none retained) — nothing to mutate.
+                break;
             };
-            let outcome = session.run_input(&input)?;
-            executions += 1;
-            let feedback = fold_coverage(&mut coverage, &outcome.coverage_edges);
-            // Retain a clean input that reached new coverage as a new corpus
-            // seed, feeding its novelty back into the power schedule. A crashing
-            // input becomes a finding (below), not a corpus seed.
-            if outcome.exit == ExitKind::Ok
-                && (feedback.new_bitmap_bits() > 0 || feedback.new_exception_signatures > 0)
-            {
-                scheduler.insert_with_feedback(input.clone(), feedback.to_schedule_feedback());
-                corpus_new += 1;
+            // The scheduler's power schedule sets how many children this seed earns.
+            let children = scheduled.energy.max(1);
+            for _ in 0..children {
+                if should_stop(
+                    executions,
+                    config.iterations,
+                    start,
+                    config.time_budget,
+                    finding_ids.len(),
+                    config.stop_after_findings,
+                ) {
+                    break 'outer;
+                }
+                let input = match mutator
+                    .mutate(&MutationInput::new(&scheduled.bytes, &dictionary), &mut rng)
+                {
+                    Some(result) => result.bytes,
+                    None => scheduled.bytes.clone(),
+                };
+                match run_one_input(session.as_mut(), &input)? {
+                    Step::Halt(reason) => {
+                        halted = Some(reason);
+                        break 'outer;
+                    }
+                    Step::Ran(outcome, elapsed) => {
+                        executions += 1;
+                        if outcome.coverage_incomplete.is_some() {
+                            incomplete_observations += 1;
+                        }
+                        let feedback = fold_coverage(&mut coverage, &outcome.coverage_edges);
+                        // Retain a clean input that reached new coverage as a new
+                        // corpus seed, feeding its novelty back into the power
+                        // schedule. A crashing input becomes a finding, not a seed.
+                        if outcome.exit == ExitKind::Ok
+                            && (feedback.new_bitmap_bits() > 0
+                                || feedback.new_exception_signatures > 0)
+                        {
+                            scheduler.insert_with_feedback(
+                                input.clone(),
+                                feedback.to_schedule_feedback(),
+                            );
+                            corpus_new += 1;
+                        }
+                        handle_outcome(
+                            &outcome,
+                            &input,
+                            &config.transport_label,
+                            &emitter,
+                            &mut seen_findings,
+                            &mut class_counts,
+                            &mut finding_ids,
+                            &mut crashes,
+                        )?;
+                        // Deadline oracle: completed-but-slow runs only (a crash
+                        // or an execution timeout is already its own finding).
+                        if outcome.exit == ExitKind::Ok {
+                            maybe_emit_deadline(
+                                elapsed,
+                                config.deadline,
+                                &input,
+                                &emitter,
+                                &mut seen_findings,
+                                &mut finding_ids,
+                                &mut crashes,
+                            )?;
+                        }
+                    }
+                }
             }
-            handle_outcome(
-                &outcome,
-                &input,
-                &emitter,
-                &mut seen_findings,
-                &mut finding_ids,
-                &mut crashes,
-            )?;
         }
     }
+
+    // Persist a replayable target profile next to each finding (#80).
+    persist_transport_profiles(config, &finding_ids);
 
     let snapshot = coverage.snapshot();
     Ok(TransportFuzzSummary {
@@ -694,30 +886,260 @@ pub(crate) fn run_transport_campaign(
         coverage_edges: snapshot.edge_bits,
         coverage_blocks: snapshot.breadcrumb_bits,
         crashes,
+        incomplete_observations,
         findings: finding_ids,
+        halted,
         elapsed_secs: start.elapsed().as_secs_f64(),
     })
 }
 
-/// Turn one run outcome into a finding when it crashed/timed out, deduped by
-/// fault class, and count crash outcomes. A clean outcome is a no-op.
-fn handle_outcome(
-    outcome: &RunOutcome,
+/// Schema id and filename for the per-finding replay profile (#80).
+const TRANSPORT_PROFILE_SCHEMA: &str = "bhf.transport-profile.v1";
+pub(crate) const TRANSPORT_PROFILE_FILE: &str = "transport_profile.json";
+
+/// The backend and reset mechanism a spec implies, for the replay profile.
+fn backend_and_reset(spec: &str) -> (&'static str, &'static str) {
+    let spec = spec.trim();
+    if spec.starts_with("agent:tcp") || spec.starts_with("agent:serial") {
+        ("agent", "agent-protocol reset")
+    } else if spec.starts_with("gdb:") {
+        ("gdb-remote", "gdb R restart")
+    } else if spec.starts_with("qemu-system:") {
+        ("qemu-system", "qmp savevm/loadvm snapshot")
+    } else {
+        ("unknown", "unknown")
+    }
+}
+
+/// Persist a versioned, portable target profile next to each emitted finding so
+/// it can be replayed against the same target / reset contract (#80): the spec,
+/// coverage map, transport label, backend and reset mechanism, and the known
+/// fidelity limitations. Endpoints are recorded verbatim from the operator's
+/// spec; `bhf replay --transport-endpoint` relocates them, and a report that is
+/// published more widely should not embed sensitive endpoints indiscriminately.
+fn persist_transport_profiles(config: &TransportFuzzConfig, finding_ids: &[String]) {
+    if finding_ids.is_empty() {
+        return;
+    }
+    let (backend, reset) = backend_and_reset(&config.spec);
+    // Persist the timing contract so `bhf replay` can reproduce a timing finding:
+    // the per-input execution deadline (rebuild the transport with the SAME bound
+    // so an execution-timeout re-times-out) and the response-time deadline (so a
+    // "completed-but-slow" BHF-555 finding is re-evaluated against the same bound,
+    // not silently reported as "no fault reproduced"). `null` when unset (#70/#80).
+    let timing = serde_json::json!({
+        "per_input_timeout_ms": config.per_input_timeout.map(|d| d.as_millis()),
+        "deadline_ms": config.deadline.map(|d| d.as_millis()),
+    });
+    let profile = serde_json::json!({
+        "schema_version": TRANSPORT_PROFILE_SCHEMA,
+        "spec": config.spec,
+        "coverage_map": config.coverage_map,
+        "transport_label": config.transport_label,
+        "backend": backend,
+        "reset_mechanism": reset,
+        "timing": timing,
+        "firmware_identity": serde_json::Value::Null,
+        "limitations":
+            "host-observed timing; firmware/build identity not captured by this backend",
+    });
+    let Ok(body) = serde_json::to_vec_pretty(&profile) else {
+        return;
+    };
+    for id in finding_ids {
+        let dir = config.work_dir.join("results").join("findings").join(id);
+        let _ = std::fs::write(dir.join(TRANSPORT_PROFILE_FILE), &body);
+    }
+}
+
+/// How a single transport execution concluded (#70): it ran (carrying the
+/// outcome and the host-observed duration for the deadline oracle), or it hit a
+/// bounded, non-clean run-control halt (a target hang or a lost transport).
+enum Step {
+    Ran(RunOutcome, Duration),
+    Halt(String),
+}
+
+/// Classification of an I/O failure that ESCAPES a run (#70). A genuine
+/// target-execution timeout (a hang) is no longer classified here: the transport
+/// session now surfaces it as a first-class [`ExitKind::Timeout`] outcome, so an
+/// error reaching this point is necessarily a control/setup failure or a lost
+/// link — never a target overrunning its per-input execution deadline.
+enum RunFailure {
+    /// A read/write timeout on a CONTROL/setup exchange (reset, input injection,
+    /// handshake) or a run with no per-input deadline configured: the transport
+    /// stopped responding. This is NOT the target overrunning its execution
+    /// deadline (that is an `ExitKind::Timeout` outcome), so it halts WITHOUT
+    /// inventing a target-execution timing finding.
+    ControlTimeout,
+    /// The transport link dropped mid-exchange.
+    LostTransport,
+    /// Any other failure (setup / protocol) — propagated, not swallowed.
+    Other,
+}
+
+fn classify_run_failure(err: &TransportError) -> RunFailure {
+    match err {
+        TransportError::Io(io) => match io.kind() {
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+                RunFailure::ControlTimeout
+            }
+            std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::NotConnected => RunFailure::LostTransport,
+            _ => RunFailure::Other,
+        },
+        _ => RunFailure::Other,
+    }
+}
+
+/// Run one input, measuring its host-observed duration and classifying any I/O
+/// failure that escapes the session (#70). A target-execution timeout (a hang)
+/// is handled inside the session as an [`ExitKind::Timeout`] outcome and flows
+/// back through [`Step::Ran`] → [`handle_outcome`] as a BHF-555 finding; here a
+/// control/setup timeout and a lost transport halt the campaign WITHOUT inventing
+/// a finding, and any other error propagates.
+fn run_one_input(
+    session: &mut dyn TargetSession,
+    input: &[u8],
+) -> Result<Step, TransportFuzzError> {
+    let start = Instant::now();
+    match session.run_input(input) {
+        Ok(outcome) => Ok(Step::Ran(outcome, start.elapsed())),
+        Err(err) => match classify_run_failure(&err) {
+            RunFailure::ControlTimeout => {
+                Ok(Step::Halt(format!("transport control timeout: {err}")))
+            }
+            RunFailure::LostTransport => Ok(Step::Halt(format!("transport lost: {err}"))),
+            RunFailure::Other => Err(TransportFuzzError::Transport(err)),
+        },
+    }
+}
+
+/// Emit the BHF-555 deadline finding when a completed run's host-observed
+/// duration exceeded the configured `--deadline` (#70). A no-op when no
+/// deadline is set or the run was fast enough.
+#[allow(clippy::too_many_arguments)]
+fn maybe_emit_deadline(
+    elapsed: Duration,
+    deadline: Option<Duration>,
     input: &[u8],
     emitter: &FindingEmitter,
     seen: &mut std::collections::HashSet<String>,
     finding_ids: &mut Vec<String>,
     crashes: &mut usize,
 ) -> Result<(), CorpusError> {
-    let Some(report) = crate::transport_fault::outcome_finding(outcome) else {
+    if let Some(deadline) = deadline {
+        if elapsed > deadline {
+            let report = crate::transport_fault::deadline_report(elapsed, deadline);
+            emit_report(input, &report, emitter, seen, finding_ids, crashes)?;
+        }
+    }
+    Ok(())
+}
+
+/// Turn one run outcome into a finding when it crashed/timed out, deduped by
+/// fault class, and count crash outcomes. A clean outcome is a no-op.
+/// Upper bound on DISTINCT crash candidates retained per (target | rule | kind)
+/// class (#75). Distinct fault sites below this bound are each kept; beyond it
+/// further distinct sites dedup, so a varying backend-reported address cannot
+/// create unbounded findings.
+const MAX_CANDIDATES_PER_CLASS: usize = 16;
+
+#[allow(clippy::too_many_arguments)]
+fn handle_outcome(
+    outcome: &RunOutcome,
+    input: &[u8],
+    transport_label: &str,
+    emitter: &FindingEmitter,
+    seen: &mut std::collections::HashSet<String>,
+    class_counts: &mut std::collections::HashMap<String, usize>,
+    finding_ids: &mut Vec<String>,
+    crashes: &mut usize,
+) -> Result<(), CorpusError> {
+    let Some(mut report) = crate::transport_fault::outcome_finding(outcome) else {
         return Ok(());
     };
+    *crashes += 1;
+
+    // Structured fault-site identity (#75). A backend-attributed faulting address
+    // is a bounded SITE discriminator so two distinct sites of one fault class are
+    // retained as separate candidates, and the target label keeps faults from
+    // different targets from merging on identical relative values. The address is
+    // a backend-reported access/stop address, NOT a verified instruction site, and
+    // is never asserted as a confirmed root cause: candidates per class are capped.
+    //
+    // An UNLOCALIZED fault (no attributed address — e.g. a full-system signal or a
+    // guest fault-status fault) must NOT collapse every later testcase into one
+    // candidate (the #75 review): give each occurrence a distinct bounded slot
+    // (`unlocalized#N` up to the cap) so later distinct faults keep their testcase,
+    // and mark the grouping explicitly uncertain since they cannot be told apart.
+    let class_key = format!("{transport_label}|{}|{}", report.rule_id, report.kind);
+    let class_count = *class_counts.get(&class_key).unwrap_or(&0);
+    let (site, localized) = match outcome.fault.as_ref().and_then(|fault| fault.address) {
+        Some(address) => (format!("{address:#x}"), true),
+        None => (format!("unlocalized#{class_count}"), false),
+    };
+    let identity_key = format!("{class_key}|{site}");
+
+    // A localized site dedups on exact repeat; an unlocalized slot is distinct per
+    // occurrence, so later distinct faults of the same kind are not silently lost.
+    if seen.contains(&identity_key) {
+        return Ok(());
+    }
+    // Bounded candidate evidence: once the class is saturated, stop splitting.
+    let count = class_counts.entry(class_key).or_insert(0);
+    if *count >= MAX_CANDIDATES_PER_CLASS {
+        return Ok(());
+    }
+
+    if !localized {
+        report.message.push_str(
+            " [unlocalized fault site: no backend-attributed address — grouping uncertain]",
+        );
+    }
+    // Carry the collection diagnostic, when present, into the finding so an
+    // incomplete observation is not silently lost (#74 review).
+    if let Some(diag) = &outcome.coverage_incomplete {
+        report
+            .message
+            .push_str(&format!(" [coverage incomplete: {diag}]"));
+    }
+    // Fold the target + site into the persisted signature (via a synthetic frame)
+    // so the on-disk signature/cluster identity AGREES with this campaign-level
+    // dedup — removing the in-memory filter alone would not fix the empty-stack
+    // signature collapse the issue calls out.
+    report.stack.push(corpus::sanitizer::StackFrame {
+        function: format!("<on-target fault {transport_label} @ {site}>"),
+        file: None,
+        line: None,
+    });
+    let id = emitter.emit_sanitizer_crash(input, &report)?;
+    finding_ids.push(id.0);
+    seen.insert(identity_key);
+    *count += 1;
+    Ok(())
+}
+
+/// Persist one finding report for `input`, counting the non-clean outcome and
+/// deduping on the on-disk signature key (rule_id | kind). Shared by the
+/// crash/timeout path, the per-input timeout path, and the deadline oracle.
+fn emit_report(
+    input: &[u8],
+    report: &corpus::SanitizerReport,
+    emitter: &FindingEmitter,
+    seen: &mut std::collections::HashSet<String>,
+    finding_ids: &mut Vec<String>,
+    crashes: &mut usize,
+) -> Result<(), CorpusError> {
     *crashes += 1;
     let dedup_key = format!("{}|{}", report.rule_id, report.kind);
     if !seen.insert(dedup_key) {
         return Ok(());
     }
-    let id = emitter.emit_sanitizer_crash(input, &report)?;
+    let id = emitter.emit_sanitizer_crash(input, report)?;
     finding_ids.push(id.0);
     Ok(())
 }
@@ -730,16 +1152,22 @@ fn handle_outcome(
 /// transport, loads seeds, runs the campaign, and prints the JSON summary.
 pub(crate) fn run(args: FuzzArgs) -> i32 {
     match run_inner(args) {
-        Ok(summary) => match serde_json::to_string_pretty(&summary) {
-            Ok(json) => {
-                println!("{json}");
-                0
+        Ok(summary) => {
+            // A run-control halt (target hang / lost transport) is a non-clean
+            // outcome: print the summary (findings included) but exit non-zero so
+            // it is never reported as a clean run (#70).
+            let halted = summary.halted.is_some();
+            match serde_json::to_string_pretty(&summary) {
+                Ok(json) => {
+                    println!("{json}");
+                    i32::from(halted)
+                }
+                Err(error) => {
+                    crate::bhfeprintln!("failed to render transport-fuzz summary: {error}");
+                    1
+                }
             }
-            Err(error) => {
-                crate::bhfeprintln!("failed to render transport-fuzz summary: {error}");
-                1
-            }
-        },
+        }
         Err(code) => code,
     }
 }
@@ -756,7 +1184,7 @@ fn run_inner(args: FuzzArgs) -> Result<TransportFuzzSummary, i32> {
             2
         })?;
     let transport_label = plan.label();
-    let transport = plan.into_transport().map_err(|error| {
+    let transport = plan.into_transport(args.timeout).map_err(|error| {
         crate::bhfeprintln!("bhf fuzz --target-transport: {error}");
         2
     })?;
@@ -773,6 +1201,10 @@ fn run_inner(args: FuzzArgs) -> Result<TransportFuzzSummary, i32> {
         seeds,
         iterations: args.effective_iterations(),
         time_budget: args.time,
+        per_input_timeout: args.timeout,
+        deadline: args.deadline,
+        spec: spec.to_owned(),
+        coverage_map: args.transport_coverage_map.clone(),
         max_len: args.max_len,
         rng_seed: args.rng_seed,
         stop_after_findings: args.stop_after_findings,
@@ -919,6 +1351,8 @@ mod tests {
                 gdb_port,
                 map,
                 snapshot_tag,
+                harness_done,
+                fault_status,
             } => {
                 assert_eq!(qmp_host, "127.0.0.1");
                 assert_eq!(qmp_port, 4444);
@@ -927,6 +1361,9 @@ mod tests {
                 assert_eq!(map.input_address, 4096);
                 assert_eq!(map.ring_capacity, 32);
                 assert_eq!(snapshot_tag, DEFAULT_SNAPSHOT_TAG);
+                // No completion contract keys => both unset.
+                assert!(harness_done.is_none());
+                assert!(fault_status.is_none());
             }
             other => panic!("expected QemuSystem, got {other:?}"),
         }
@@ -942,6 +1379,81 @@ mod tests {
             }
             other => panic!("expected QemuSystem, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_qemu_system_completion_and_fault_status_contract() {
+        let map_spec = "input=4096,ring=16384,write=20480,wrapped=20736,cap=32";
+        // done= plants the completion breakpoint (default Thumb kind 2); fault=
+        // declares the firmware fault-status word (#71/#72).
+        let plan = TransportPlan::parse(
+            "qemu-system:qmp=h:1,gdb=h:2,done=0x1a8,fault=0x20000100",
+            Some(map_spec),
+        )
+        .unwrap();
+        match plan {
+            TransportPlan::QemuSystem {
+                harness_done,
+                fault_status,
+                ..
+            } => {
+                assert_eq!(harness_done, Some((0x1a8, 2)));
+                let status = fault_status.expect("fault status present");
+                assert_eq!(status.address, 0x2000_0100);
+                assert_eq!(status.width, 4);
+                assert_eq!(status.clear_value, 0);
+            }
+            other => panic!("expected QemuSystem, got {other:?}"),
+        }
+        // Explicit kind/width/clear are honored.
+        let plan = TransportPlan::parse(
+            "qemu-system:qmp=h:1,gdb=h:2,done=0x200,done_kind=4,fault=0x300,fault_width=2,fault_clear=0xff",
+            Some(map_spec),
+        )
+        .unwrap();
+        match plan {
+            TransportPlan::QemuSystem {
+                harness_done,
+                fault_status,
+                ..
+            } => {
+                assert_eq!(harness_done, Some((0x200, 4)));
+                let status = fault_status.unwrap();
+                assert_eq!(status.width, 2);
+                assert_eq!(status.clear_value, 0xff);
+            }
+            other => panic!("expected QemuSystem, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn qemu_system_rejects_invalid_fault_width() {
+        let map_spec = "input=4096,ring=16384,write=20480,wrapped=20736,cap=32";
+        let error = TransportPlan::parse(
+            "qemu-system:qmp=h:1,gdb=h:2,fault=0x300,fault_width=9",
+            Some(map_spec),
+        )
+        .unwrap_err();
+        // GuestFaultStatus::new rejects width 9 (>8); it surfaces as a Transport
+        // spec error rather than being silently accepted.
+        assert!(
+            matches!(error, TransportSpecError::Transport(_)),
+            "expected a transport validation error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn qemu_system_into_transport_wires_completion_contract() {
+        // The whole CLI parse -> build path accepts the completion contract and
+        // produces a transport (the breakpoint/fault-status behavior itself is
+        // proven end-to-end by the live RV-3 Cortex-M test).
+        let map_spec = "input=4096,ring=16384,write=20480,wrapped=20736,cap=32";
+        let plan = TransportPlan::parse(
+            "qemu-system:qmp=127.0.0.1:1,gdb=127.0.0.1:2,done=0x1a8,fault=0x20000100",
+            Some(map_spec),
+        )
+        .unwrap();
+        assert!(plan.into_transport(None).is_ok());
     }
 
     #[test]
@@ -1079,7 +1591,7 @@ mod tests {
         // Construction is pure — the socket is only dialed on arm(), which we
         // never call here, so this needs no listener.
         let plan = TransportPlan::parse("agent:tcp:127.0.0.1:1", None).unwrap();
-        assert!(plan.into_transport().is_ok());
+        assert!(plan.into_transport(None).is_ok());
     }
 
     #[test]
@@ -1092,7 +1604,7 @@ mod tests {
             Some(map_spec),
         )
         .unwrap();
-        let error = match plan.into_transport() {
+        let error = match plan.into_transport(None) {
             Ok(_) => panic!("an unsafe snapshot tag must be rejected"),
             Err(error) => error,
         };
@@ -1148,6 +1660,10 @@ mod tests {
             seeds,
             iterations,
             time_budget: None,
+            per_input_timeout: None,
+            deadline: None,
+            spec: "agent:tcp:127.0.0.1:65535".to_owned(),
+            coverage_map: None,
             max_len: 4096,
             rng_seed: 0x4756_4655_5a5a,
             stop_after_findings: None,
@@ -1248,6 +1764,72 @@ mod tests {
     }
 
     #[test]
+    fn classify_run_failure_distinguishes_timeout_lost_transport_and_other() {
+        use std::io::{Error, ErrorKind};
+        // A read timeout that ESCAPES the session is a control/setup timeout — a
+        // genuine target-execution hang is surfaced by the session as an
+        // ExitKind::Timeout outcome, never routed through here.
+        for kind in [ErrorKind::WouldBlock, ErrorKind::TimedOut] {
+            assert!(matches!(
+                classify_run_failure(&TransportError::Io(Error::from(kind))),
+                RunFailure::ControlTimeout
+            ));
+        }
+        // ...a dropped link is a LostTransport...
+        for kind in [
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::BrokenPipe,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::NotConnected,
+        ] {
+            assert!(matches!(
+                classify_run_failure(&TransportError::Io(Error::from(kind))),
+                RunFailure::LostTransport
+            ));
+        }
+        // ...and a protocol/setup error is neither (propagated, not swallowed).
+        assert!(matches!(
+            classify_run_failure(&TransportError::Protocol("bad frame".to_owned())),
+            RunFailure::Other
+        ));
+    }
+
+    #[test]
+    fn deadline_oracle_records_a_slow_completed_run_as_bhf555() {
+        // A zero deadline makes every completed run "too slow", so the clean seed
+        // run is recorded as a BHF-555 timing finding rather than discarded —
+        // the transport-lane deadline oracle (#70).
+        let (transport, _received) = mock_agent_transport(vec![ScriptedResponse::ok(vec![1, 2])]);
+        let work_dir = tmp_work_dir("deadline");
+        let mut config = config(work_dir.clone(), vec![b"seed".to_vec()], 1);
+        config.deadline = Some(Duration::from_secs(0));
+
+        let summary = run_transport_campaign(transport.as_ref(), &config).unwrap();
+
+        assert_eq!(summary.executions, 1);
+        assert!(
+            summary.halted.is_none(),
+            "a slow-but-complete run is not a halt"
+        );
+        assert_eq!(
+            summary.findings.len(),
+            1,
+            "the slow input is a finding: {summary:?}"
+        );
+        let finding_json = work_dir
+            .join("results")
+            .join("findings")
+            .join(&summary.findings[0])
+            .join("finding.json");
+        let record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&finding_json).unwrap()).unwrap();
+        assert_eq!(record["rule_id"], "BHF-555", "a timing finding: {record}");
+
+        std::fs::remove_dir_all(&work_dir).ok();
+    }
+
+    #[test]
     fn loop_stops_after_the_requested_distinct_finding_count() {
         // Two crashes of the SAME fault class dedup to one finding; the run keeps
         // going. Give distinct classes and cap at one distinct finding.
@@ -1271,8 +1853,9 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_fault_classes_collapse_to_one_finding() {
-        // Two crashes of the same class over two executions -> one finding.
+    fn duplicate_fault_classes_at_the_same_site_collapse_to_one_finding() {
+        // Two crashes of the same class AND same (unlocalized) site over two
+        // executions dedup to one finding — predictable same-site dedup (#75).
         let script = vec![
             ScriptedResponse::crash(vec![1], Fault::new(FaultKind::StackOverflow)),
             ScriptedResponse::crash(vec![2], Fault::new(FaultKind::StackOverflow)),
@@ -1288,7 +1871,214 @@ mod tests {
         assert_eq!(
             summary.findings.len(),
             1,
-            "same fault class -> one finding: {summary:?}"
+            "same fault class + site -> one finding: {summary:?}"
+        );
+
+        std::fs::remove_dir_all(&work_dir).ok();
+    }
+
+    #[test]
+    fn distinct_fault_sites_of_one_class_retain_separate_findings() {
+        // Two faults of the SAME class (memory-protection) but DISTINCT attributed
+        // sites must both be retained — not collapsed to one and the second
+        // testcase silently dropped (#75). Their persisted signatures must differ
+        // too, so campaign dedup and on-disk clustering agree.
+        let script = vec![
+            ScriptedResponse::crash(
+                vec![1],
+                Fault {
+                    kind: FaultKind::MemoryProtection,
+                    address: Some(0x2000_4000),
+                    detail: "site A".to_owned(),
+                },
+            ),
+            ScriptedResponse::crash(
+                vec![2],
+                Fault {
+                    kind: FaultKind::MemoryProtection,
+                    address: Some(0x2000_8000),
+                    detail: "site B".to_owned(),
+                },
+            ),
+        ];
+        let (transport, _received) = mock_agent_transport(script);
+        let work_dir = tmp_work_dir("distinct-sites");
+        let config = config(work_dir.clone(), vec![b"seed".to_vec()], 2);
+
+        let summary = run_transport_campaign(transport.as_ref(), &config).unwrap();
+
+        assert_eq!(summary.executions, 2);
+        assert_eq!(
+            summary.findings.len(),
+            2,
+            "two distinct sites of one class -> two findings: {summary:?}"
+        );
+        // The on-disk signatures differ (persisted identity agrees with dedup).
+        let sig = |id: &str| -> String {
+            let record: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(
+                    work_dir
+                        .join("results")
+                        .join("findings")
+                        .join(id)
+                        .join("finding.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            record["signature"].as_str().unwrap().to_owned()
+        };
+        assert_ne!(
+            sig(&summary.findings[0]),
+            sig(&summary.findings[1]),
+            "distinct sites must have distinct persisted signatures"
+        );
+
+        std::fs::remove_dir_all(&work_dir).ok();
+    }
+
+    #[test]
+    fn campaign_persists_a_replayable_transport_profile() {
+        // Each emitted transport finding gets a transport_profile.json recording
+        // the spec/backend/reset so `bhf replay` can re-drive it against the same
+        // target (#80).
+        let fault = Fault {
+            kind: FaultKind::MemoryProtection,
+            address: Some(0x2000_4000),
+            detail: String::new(),
+        };
+        let (transport, _received) =
+            mock_agent_transport(vec![ScriptedResponse::crash(vec![1], fault)]);
+        let work_dir = tmp_work_dir("profile");
+        let mut config = config(work_dir.clone(), vec![b"seed".to_vec()], 1);
+        config.spec = "agent:tcp:127.0.0.1:9000".to_owned();
+
+        let summary = run_transport_campaign(transport.as_ref(), &config).unwrap();
+        assert_eq!(summary.findings.len(), 1);
+
+        let profile_path = work_dir
+            .join("results")
+            .join("findings")
+            .join(&summary.findings[0])
+            .join("transport_profile.json");
+        let profile: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&profile_path).unwrap()).unwrap();
+        assert_eq!(profile["schema_version"], "bhf.transport-profile.v1");
+        assert_eq!(profile["spec"], "agent:tcp:127.0.0.1:9000");
+        assert_eq!(profile["backend"], "agent");
+
+        std::fs::remove_dir_all(&work_dir).ok();
+    }
+
+    #[test]
+    fn unbounded_distinct_sites_are_capped_per_class() {
+        // A fault class whose attributed address varies every execution must not
+        // create unbounded findings: distinct candidates are capped per class
+        // (#75), so a varying accessed address cannot explode the findings set.
+        let script: Vec<ScriptedResponse> = (0..(MAX_CANDIDATES_PER_CLASS + 8))
+            .map(|i| {
+                ScriptedResponse::crash(
+                    vec![1],
+                    Fault {
+                        kind: FaultKind::MemoryProtection,
+                        address: Some(0x1_0000 + (i as u64) * 0x100),
+                        detail: String::new(),
+                    },
+                )
+            })
+            .collect();
+        let n = script.len();
+        let (transport, _received) = mock_agent_transport(script);
+        let work_dir = tmp_work_dir("capped");
+        let config = config(work_dir.clone(), vec![b"seed".to_vec()], n);
+
+        let summary = run_transport_campaign(transport.as_ref(), &config).unwrap();
+
+        assert_eq!(summary.executions, n);
+        assert_eq!(
+            summary.findings.len(),
+            MAX_CANDIDATES_PER_CLASS,
+            "distinct candidates per class are bounded: {summary:?}"
+        );
+
+        std::fs::remove_dir_all(&work_dir).ok();
+    }
+
+    #[test]
+    fn unlocalized_faults_retain_bounded_distinct_candidates() {
+        // A fault with NO backend-attributed address (an unlocalized fault — e.g.
+        // a full-system stop or a bare crash) must NOT collapse every later
+        // testcase into one candidate (#75 review). Two such faults of one class
+        // are each retained as a distinct bounded candidate (the later testcase is
+        // not silently dropped), their persisted signatures differ, and each
+        // finding carries explicit grouping uncertainty. The agent wire always
+        // carries an address, so this exercises handle_outcome directly with the
+        // address-less outcome the gdb/full-system lanes actually produce.
+        use target_transport::RunOutcome;
+        let work_dir = tmp_work_dir("unlocalized");
+        let emitter = FindingEmitter::with_metadata(
+            work_dir.clone(),
+            "H-transport".to_owned(),
+            "transport".to_owned(),
+            "mock".to_owned(),
+        );
+        let mut seen = std::collections::HashSet::new();
+        let mut class_counts = std::collections::HashMap::new();
+        let mut finding_ids: Vec<String> = Vec::new();
+        let mut crashes = 0usize;
+        let bare_crash = || RunOutcome {
+            exit: ExitKind::Crash,
+            coverage_edges: Vec::new(),
+            fault: None,
+            stdout: Vec::new(),
+            coverage_incomplete: None,
+        };
+        for input in [b"a".as_slice(), b"b".as_slice()] {
+            handle_outcome(
+                &bare_crash(),
+                input,
+                "mock",
+                &emitter,
+                &mut seen,
+                &mut class_counts,
+                &mut finding_ids,
+                &mut crashes,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            finding_ids.len(),
+            2,
+            "two unlocalized faults of one class are retained, not collapsed"
+        );
+        assert_eq!(crashes, 2);
+
+        let record = |id: &str| -> serde_json::Value {
+            serde_json::from_slice(
+                &std::fs::read(
+                    work_dir
+                        .join("results")
+                        .join("findings")
+                        .join(id)
+                        .join("finding.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let first = record(&finding_ids[0]);
+        let second = record(&finding_ids[1]);
+        assert_ne!(
+            first["signature"].as_str().unwrap(),
+            second["signature"].as_str().unwrap(),
+            "distinct unlocalized candidates must have distinct persisted signatures"
+        );
+        assert!(
+            first["exception"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("grouping uncertain"),
+            "an unlocalized finding must carry explicit grouping uncertainty: {first}"
         );
 
         std::fs::remove_dir_all(&work_dir).ok();
