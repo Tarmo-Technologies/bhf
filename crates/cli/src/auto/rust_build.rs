@@ -4042,9 +4042,12 @@ fn write_resource_assumption(
         "{{\n  \"schema\": \"bhf.resource_recipe.v1\",\n  \
          \"target\": {:?},\n  \"path_param\": {:?},\n  \"param_index\": {},\n  \
          \"kind\": {:?},\n  \"assumption\": \"The fuzzed path points at a bhf-materialized, \
-         bounded temp resource under the harness binary's own directory (RAII-removed after \
-         each call). A finding assumes the target trusts a file beneath the passed path; the \
-         fuzz input reaches the target through that file, not through fabricated path bytes.\"\n}}\n",
+         bounded resource under the supervising runner's per-harness scratch directory \
+         (BHF_RES_SCRATCH_DIR), which the runner sweeps after both normal and abnormal child \
+         exits; the harness requires that directory and skips target entry if it is absent \
+         (no unmanaged temp resource). A finding assumes the target trusts a file beneath the \
+         passed path; the fuzz input reaches the target through that file, not through \
+         fabricated path bytes.\"\n}}\n",
         resolved.call_path.join("::"),
         param,
         recipe.param_index,

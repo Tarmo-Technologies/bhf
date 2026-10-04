@@ -221,6 +221,17 @@ fn private_path_opener_builds_fuzzes_and_finds_planted_crash_in_crate() {
         "in-crate Rust Cargo cache must be cleaned: {}",
         harness_root.display()
     );
+    // #83 re-review: the supervising runner OWNS and sweeps the per-harness resource
+    // scratch after the run, so no per-case `bhf_res_*` tree (orphaned by a harness
+    // abort/timeout that bypasses the harness's own Drop) is left behind.
+    let res_scratch = harness_root.join("res-scratch");
+    let leftover: Vec<_> = std::fs::read_dir(&res_scratch)
+        .map(|rd| rd.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    assert!(
+        leftover.is_empty(),
+        "runner-owned resource scratch must be swept after the run; leftover: {leftover:?}"
+    );
 
     // The user's source checkout is UNCHANGED (the copy is isolated under work-dir).
     let after = snapshot(&fixture_dir);

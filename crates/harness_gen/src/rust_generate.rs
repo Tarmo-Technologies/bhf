@@ -40,13 +40,17 @@ pub enum ReceiverUnwrap {
 }
 
 /// A bounded, path-backed resource the harness materializes at runtime to drive a
-/// path-opener target (zoxide's `Database::open_dir(dir: &Path)`): a temp tree is
-/// created under the harness binary's own directory, the fuzz input is written into
-/// a seed file, the path is passed to the target param, and a RAII guard removes the
-/// tree after the call. The fuzz bytes reach the target THROUGH the file the opener
-/// reads — no byte-driven `Path` decoder is used (fuzzing `Path` bytes would only
-/// fabricate paths, never a reachable resource). Resolved by the build lane and
-/// emitted in [`generate_rust_direct_harness`] next to the receiver setup (#83).
+/// path-opener target (zoxide's `Database::open_dir(dir: &Path)`): a per-case tree
+/// is created under the supervising runner's `BHF_RES_SCRATCH_DIR` (required — the
+/// harness skips target entry if it is absent, never using an unmanaged OS-temp
+/// dir), the fuzz input is written into a seed file, and the path is passed to the
+/// target param. A target-local RAII guard removes the tree on a clean return, but
+/// the RUNNER owns the lifetime and sweeps the whole scratch tree after the run so
+/// an abort / timeout-kill / sanitizer abort (which bypasses `Drop`) cannot leak.
+/// The fuzz bytes reach the target THROUGH the file the opener reads — no
+/// byte-driven `Path` decoder is used (fuzzing `Path` bytes would only fabricate
+/// paths, never a reachable resource). Resolved by the build lane and emitted in
+/// [`generate_rust_direct_harness`] next to the receiver setup (#83).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceRecipe {
     /// Index into the target's params (post-monomorphization) that receives the
@@ -71,30 +75,40 @@ fn resource_recipe_emission(recipe: &ResourceRecipe) -> (Vec<String>, String, Ar
     // Setup is emitted AFTER the ordinary method-arg decodes (see build_call_body),
     // so `rest_bytes()` here is the TAIL partition and cannot starve them.
     //
-    // #83 scratch lifetime: the base is a DECLARED writable location — the
-    // supervising runner's `BHF_RES_SCRATCH_DIR` when set (the runner owns that
-    // directory and sweeps it after BOTH normal and abnormal child exits, which a
-    // target-local `Drop` cannot cover after an abort / timeout-kill / sanitizer
-    // abort), else the OS temp dir. The exe's own parent directory is NOT used: it
-    // is not guaranteed writable on replay or under a restricted sandbox.
+    // #83 scratch lifetime: the per-case resource directory lives UNDER a scratch
+    // base the SUPERVISING RUNNER owns and sweeps after both normal and abnormal
+    // child exits (an abort / timeout-kill / sanitizer abort bypasses the
+    // target-local `Drop`, so the runner's sweep — not `Drop` — is the real
+    // cleanup). That base is passed in `BHF_RES_SCRATCH_DIR`. The path is REQUIRED,
+    // not best-effort: with no supervisor-owned base the harness must NOT invent an
+    // unmanaged OS-temp resource that would leak on an abnormal exit — it reports
+    // and returns 0 BEFORE `bhf_target_enter()`, so the path is simply unexercised
+    // (fail clearly when the lifecycle is absent) rather than silently leaking.
     //
-    // #83 setup honesty: a resource create/seed FAILURE is an INFRASTRUCTURE error,
-    // not target behavior — it is reported and the harness returns 0 BEFORE
-    // `bhf_target_enter()`, so a failed setup never runs the target's missing-file
-    // branch nor is counted as a target entry / defect.
+    // #83 setup honesty: a resource create/seed FAILURE is likewise an
+    // INFRASTRUCTURE error, not target behavior — reported, then return 0 before
+    // target entry, so a failed setup never runs the target's missing-file branch
+    // nor is counted as a target entry / defect.
     let mut lines = vec![
         "    // #83 resource recipe: materialize a bounded, path-backed resource seeded".to_owned(),
         "    // with the fuzz input so a path-opener reads attacker bytes from a real file."
             .to_owned(),
+        "    let Some(__bhf_res_base) = std::env::var_os(\"BHF_RES_SCRATCH_DIR\")".to_owned(),
+        "        .map(std::path::PathBuf::from)".to_owned(),
+        "        .filter(|p| !p.as_os_str().is_empty())".to_owned(),
+        "    else {".to_owned(),
+        "        eprintln!(\"bhf: in-crate resource recipe requires a supervisor-owned \
+         BHF_RES_SCRATCH_DIR; skipping target entry (no unmanaged temp resource)\");"
+            .to_owned(),
+        "        return 0;".to_owned(),
+        "    };".to_owned(),
         "    let __bhf_res_dir = {".to_owned(),
         "        static __BHF_RES_N: core::sync::atomic::AtomicU64 = \
          core::sync::atomic::AtomicU64::new(0);"
             .to_owned(),
         "        let __n = __BHF_RES_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);"
             .to_owned(),
-        "        let mut __base = std::env::var_os(\"BHF_RES_SCRATCH_DIR\")".to_owned(),
-        "            .map(std::path::PathBuf::from)".to_owned(),
-        "            .unwrap_or_else(std::env::temp_dir);".to_owned(),
+        "        let mut __base = __bhf_res_base;".to_owned(),
         "        __base.push(format!(\"bhf_res_{}_{}\", std::process::id(), __n));".to_owned(),
         "        __base".to_owned(),
         "    };".to_owned(),
@@ -1964,20 +1978,31 @@ mod tests {
     }
 
     #[test]
-    fn resource_recipe_uses_the_runner_owned_scratch_dir_when_provided() {
-        // #83 review item 5: the scratch base honors the supervising runner's
-        // BHF_RES_SCRATCH_DIR (so the runner can own the lifetime and sweep it after
-        // abnormal exits that a target-local Drop cannot cover), falling back to the
-        // OS temp dir — never the exe's own (possibly read-only) parent directory.
+    fn resource_recipe_requires_the_runner_owned_scratch_and_fails_clearly_when_absent() {
+        // #83 re-review item 5: the per-case resource dir lives under the
+        // supervisor-owned BHF_RES_SCRATCH_DIR, which the runner sweeps after both
+        // normal and abnormal child exits. The base is REQUIRED — there is NO
+        // OS-temp fallback that would leak on an abort — so with the env unset the
+        // harness returns BEFORE target entry (fail clearly), never the exe parent.
         let rs = resource_harness(&[("path", "&Path")], 0, ArgPass::Ref);
         assert!(
-            rs.contains("std::env::var_os(\"BHF_RES_SCRATCH_DIR\")")
-                && rs.contains("unwrap_or_else(std::env::temp_dir)"),
-            "scratch base must be the runner dir or temp, not the exe parent:\n{rs}"
+            rs.contains("std::env::var_os(\"BHF_RES_SCRATCH_DIR\")"),
+            "scratch base must come from the runner-owned BHF_RES_SCRATCH_DIR:\n{rs}"
         );
         assert!(
-            !rs.contains("current_exe()"),
-            "the exe parent dir must NOT be the scratch base:\n{rs}"
+            !rs.contains("std::env::temp_dir") && !rs.contains("current_exe()"),
+            "there must be NO OS-temp / exe-parent fallback that could leak:\n{rs}"
+        );
+        // The absent-env guard returns before target entry.
+        let guard_at = rs
+            .find("requires a supervisor-owned")
+            .expect("the absent-scratch diagnostic");
+        let enter = rs
+            .find("unsafe { bhf_target_enter(); }")
+            .expect("target-entry call site");
+        assert!(
+            guard_at < enter,
+            "the absent-scratch guard must precede target entry:\n{rs}"
         );
     }
 
