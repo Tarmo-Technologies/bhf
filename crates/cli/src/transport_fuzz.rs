@@ -569,6 +569,11 @@ pub(crate) struct TransportFuzzConfig {
     /// host-observed execution time exceeds it is recorded as a BHF-555 timing
     /// finding rather than discarded as a slow unit (#70).
     pub deadline: Option<Duration>,
+    /// The raw `--target-transport` spec, persisted with each finding so it can
+    /// be replayed against the same target/reset contract (#80).
+    pub spec: String,
+    /// The raw `--transport-coverage-map` spec, if any (persisted for replay).
+    pub coverage_map: Option<String>,
     /// Ceiling on a generated input's length.
     pub max_len: usize,
     /// Deterministic mutation RNG seed.
@@ -852,6 +857,9 @@ pub(crate) fn run_transport_campaign(
         }
     }
 
+    // Persist a replayable target profile next to each finding (#80).
+    persist_transport_profiles(config, &finding_ids);
+
     let snapshot = coverage.snapshot();
     Ok(TransportFuzzSummary {
         schema_version: 1,
@@ -868,6 +876,55 @@ pub(crate) fn run_transport_campaign(
         halted,
         elapsed_secs: start.elapsed().as_secs_f64(),
     })
+}
+
+/// Schema id and filename for the per-finding replay profile (#80).
+const TRANSPORT_PROFILE_SCHEMA: &str = "bhf.transport-profile.v1";
+pub(crate) const TRANSPORT_PROFILE_FILE: &str = "transport_profile.json";
+
+/// The backend and reset mechanism a spec implies, for the replay profile.
+fn backend_and_reset(spec: &str) -> (&'static str, &'static str) {
+    let spec = spec.trim();
+    if spec.starts_with("agent:tcp") || spec.starts_with("agent:serial") {
+        ("agent", "agent-protocol reset")
+    } else if spec.starts_with("gdb:") {
+        ("gdb-remote", "gdb R restart")
+    } else if spec.starts_with("qemu-system:") {
+        ("qemu-system", "qmp savevm/loadvm snapshot")
+    } else {
+        ("unknown", "unknown")
+    }
+}
+
+/// Persist a versioned, portable target profile next to each emitted finding so
+/// it can be replayed against the same target / reset contract (#80): the spec,
+/// coverage map, transport label, backend and reset mechanism, and the known
+/// fidelity limitations. Endpoints are recorded verbatim from the operator's
+/// spec; `bhf replay --transport-endpoint` relocates them, and a report that is
+/// published more widely should not embed sensitive endpoints indiscriminately.
+fn persist_transport_profiles(config: &TransportFuzzConfig, finding_ids: &[String]) {
+    if finding_ids.is_empty() {
+        return;
+    }
+    let (backend, reset) = backend_and_reset(&config.spec);
+    let profile = serde_json::json!({
+        "schema_version": TRANSPORT_PROFILE_SCHEMA,
+        "spec": config.spec,
+        "coverage_map": config.coverage_map,
+        "transport_label": config.transport_label,
+        "backend": backend,
+        "reset_mechanism": reset,
+        "firmware_identity": serde_json::Value::Null,
+        "limitations":
+            "host-observed timing; firmware/build identity not captured by this backend",
+    });
+    let Ok(body) = serde_json::to_vec_pretty(&profile) else {
+        return;
+    };
+    for id in finding_ids {
+        let dir = config.work_dir.join("results").join("findings").join(id);
+        let _ = std::fs::write(dir.join(TRANSPORT_PROFILE_FILE), &body);
+    }
 }
 
 /// How a single transport execution concluded (#70): it ran (carrying the
@@ -1105,6 +1162,8 @@ fn run_inner(args: FuzzArgs) -> Result<TransportFuzzSummary, i32> {
         time_budget: args.time,
         per_input_timeout: args.timeout,
         deadline: args.deadline,
+        spec: spec.to_owned(),
+        coverage_map: args.transport_coverage_map.clone(),
         max_len: args.max_len,
         rng_seed: args.rng_seed,
         stop_after_findings: args.stop_after_findings,
@@ -1562,6 +1621,8 @@ mod tests {
             time_budget: None,
             per_input_timeout: None,
             deadline: None,
+            spec: "agent:tcp:127.0.0.1:65535".to_owned(),
+            coverage_map: None,
             max_len: 4096,
             rng_seed: 0x4756_4655_5a5a,
             stop_after_findings: None,
@@ -1829,6 +1890,39 @@ mod tests {
             sig(&summary.findings[1]),
             "distinct sites must have distinct persisted signatures"
         );
+
+        std::fs::remove_dir_all(&work_dir).ok();
+    }
+
+    #[test]
+    fn campaign_persists_a_replayable_transport_profile() {
+        // Each emitted transport finding gets a transport_profile.json recording
+        // the spec/backend/reset so `bhf replay` can re-drive it against the same
+        // target (#80).
+        let fault = Fault {
+            kind: FaultKind::MemoryProtection,
+            address: Some(0x2000_4000),
+            detail: String::new(),
+        };
+        let (transport, _received) =
+            mock_agent_transport(vec![ScriptedResponse::crash(vec![1], fault)]);
+        let work_dir = tmp_work_dir("profile");
+        let mut config = config(work_dir.clone(), vec![b"seed".to_vec()], 1);
+        config.spec = "agent:tcp:127.0.0.1:9000".to_owned();
+
+        let summary = run_transport_campaign(transport.as_ref(), &config).unwrap();
+        assert_eq!(summary.findings.len(), 1);
+
+        let profile_path = work_dir
+            .join("results")
+            .join("findings")
+            .join(&summary.findings[0])
+            .join("transport_profile.json");
+        let profile: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&profile_path).unwrap()).unwrap();
+        assert_eq!(profile["schema_version"], "bhf.transport-profile.v1");
+        assert_eq!(profile["spec"], "agent:tcp:127.0.0.1:9000");
+        assert_eq!(profile["backend"], "agent");
 
         std::fs::remove_dir_all(&work_dir).ok();
     }

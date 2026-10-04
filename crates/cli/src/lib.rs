@@ -94,6 +94,7 @@ mod support_report;
 mod target_filter;
 pub mod transport_fault;
 mod transport_fuzz;
+mod transport_replay;
 pub mod workdir;
 
 #[derive(Debug, Parser)]

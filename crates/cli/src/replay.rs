@@ -65,6 +65,12 @@ pub struct ReplayArgs {
     /// Fail if the requested sandbox tool is unavailable.
     #[arg(long)]
     pub sandbox_strict: bool,
+
+    /// Relocate an on-target transport finding's endpoint to `HOST:PORT` for
+    /// replay (the recorded endpoint is often gone/unreachable). Applies to
+    /// agent:tcp / gdb transport findings; ignored for host harness findings.
+    #[arg(long = "transport-endpoint", value_name = "HOST:PORT")]
+    pub transport_endpoint: Option<String>,
 }
 
 pub fn run(args: ReplayArgs) -> i32 {
@@ -81,6 +87,16 @@ pub fn run(args: ReplayArgs) -> i32 {
     // so it dispatches before any harness resolution.
     if crate::collector_run::is_collector_finding(&finding_dir) {
         return crate::collector_run::replay_collector_finding(&finding_dir);
+    }
+    // #80: an on-target transport finding replays by re-driving its recorded
+    // input through the SAME transport (rebuilt from its persisted profile,
+    // endpoint relocatable), checking the fault identity — never by resolving a
+    // host harness, which would not be equivalent assurance.
+    if crate::transport_replay::is_transport_finding(&finding_dir) {
+        return crate::transport_replay::replay_transport_finding(
+            &finding_dir,
+            args.transport_endpoint.as_deref(),
+        );
     }
     // The finding already records where its harness was built; resolve it so the
     // user does not have to repeat `--harness`. An explicit `--harness` always wins.
