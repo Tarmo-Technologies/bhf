@@ -32,4 +32,7 @@ crates/*/bhf_work/
 /docker/corpus/
 /docker/results/
 /docker/sbom/
+/container-acceptance/
+/container-full-acceptance/
+/container-ada-acceptance/
 Authorization.md

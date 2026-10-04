@@ -14,9 +14,11 @@
 
 services:
   bhf:
+    platform: linux/amd64
     build:
       context: ..
       dockerfile: Dockerfile
+      target: core
     image: bhf:local
     shm_size: "2gb"
     cap_add:
@@ -35,8 +37,14 @@ services:
     #   docker compose ... run --rm bhf auto /src --work-dir /work/run --per-target-time 30
 
   sweep:
+    profiles: [validation]
     extends:
       service: bhf
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: runtime
+    image: bhf:full-local
     # Fetch the pinned corpus (needs network) then run the full 32-project sweep.
     command: ["bhf-sweep", "--fetch"]
 

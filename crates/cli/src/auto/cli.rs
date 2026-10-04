@@ -458,12 +458,14 @@ pub struct AutoArgs {
     pub install_deps: bool,
 
     /// Consent gate for running the project's own (untrusted) build/codegen to
-    /// materialize generated dependencies before harnessing — the umbrella for
+    /// materialize generated dependencies before harnessing, including Java
+    /// Maven/Gradle project builds — the umbrella for
     /// `--probe-build` (CMake/Make configure+codegen) plus an Ada build probe
     /// (`alr build` / `gprbuild`) that generates Alire config + codegen outputs.
-    /// Implies `--probe-build`. EXECUTES untrusted scripts; runs under bhf's
-    /// sandbox (bwrap/firejail) when one is available, degrading to a direct run
-    /// otherwise. Off by default — without it, bhf stubs generated deps and
+    /// Implies `--probe-build`. EXECUTES untrusted scripts; probe builds use
+    /// bhf's sandbox when available, while Java Maven/Gradle runs as the calling
+    /// user and should be contained by the deployment profile. Off by default
+    /// — without it, bhf stubs generated deps and
     /// records them in the manifest instead of running anything.
     #[arg(long = "run-untrusted")]
     pub run_untrusted: bool,
@@ -1610,6 +1612,7 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         total_time: args.total_time.map(std::time::Duration::from_secs),
         per_target_finding_count: args.per_target_finding_count,
         no_stubs: args.no_stubs,
+        run_untrusted: args.run_untrusted,
         passes,
         source_root: Some(path.clone()),
         project: args.project.clone(),

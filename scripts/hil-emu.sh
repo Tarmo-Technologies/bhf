@@ -36,12 +36,13 @@ declare -A tool_pkg=(
   [powerpc64-linux-gnu-gcc]="gcc-powerpc64-linux-gnu"
   [nm]="binutils"
   [cc]="build-essential"
+  [git]="git"
 )
 
 required_tools=(
   qemu-arm qemu-ppc64 qemu-system-arm qemu-img
   arm-none-eabi-gcc arm-linux-gnueabihf-gcc powerpc64-linux-gnu-gcc
-  nm cc
+  nm cc git
 )
 
 missing=()
@@ -78,7 +79,7 @@ echo
 echo "== RV-1: big_endian_input_reaches_a_native_endian_branch_only_on_the_target =="
 rv1_log="$(mktemp)"
 trap 'rm -f "$rv1_log"' EXIT
-cargo test -p bhf --lib \
+cargo test --locked -p bhf --lib \
   big_endian_input_reaches_a_native_endian_branch_only_on_the_target \
   -- --nocapture 2>&1 | tee "$rv1_log"
 if grep -q "skipping qemu-ppc64 run" "$rv1_log"; then
@@ -92,11 +93,24 @@ echo
 # tool into a hard failure, so these cannot self-skip in this lane.
 # ---------------------------------------------------------------------------
 echo "== RV-2: live_gdb (real qemu-arm gdbstub) =="
-BHF_HIL_REQUIRE=1 cargo test -p target_transport --test live_gdb -- --nocapture
+BHF_HIL_REQUIRE=1 cargo test --locked -p target_transport --test live_gdb -- --nocapture
 echo
 
 echo "== RV-3: live_fullsystem (qemu-system-arm mps2-an385 snapshot) =="
-BHF_HIL_REQUIRE=1 cargo test -p target_transport --test live_fullsystem -- --nocapture
+BHF_HIL_REQUIRE=1 cargo test --locked -p target_transport --test live_fullsystem -- --nocapture
 echo
 
-echo "== hil-emu: RV-1, RV-2, RV-3 all executed the REAL live path and passed =="
+echo "== RV-4: pinned FreeRTOS task/queue transport and CLI replay =="
+kernel_dir="$(mktemp -d)"
+trap 'rm -f "$rv1_log"; rm -rf "$kernel_dir"' EXIT
+git -C "$kernel_dir" init -q
+git -C "$kernel_dir" fetch -q --depth 1 https://github.com/FreeRTOS/FreeRTOS-Kernel \
+  8be86d4a24fd4091f8f4192018423ab590f408db
+git -C "$kernel_dir" checkout -q FETCH_HEAD
+BHF_RTOS_KERNEL="$kernel_dir" BHF_RTOS_LIVE=1 cargo test --locked \
+  -p target_transport --test live_rtos -- --nocapture
+BHF_RTOS_KERNEL="$kernel_dir" BHF_RTOS_CLI=1 cargo test --locked \
+  -p bhf --test transport_fuzz_qemu_cli cli_freertos_clean_fault_clean -- --nocapture
+echo
+
+echo "== hil-emu: RV-1 through RV-4 executed the REAL live paths and passed =="

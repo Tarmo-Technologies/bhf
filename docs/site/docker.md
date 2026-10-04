@@ -1,9 +1,10 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Running bhf in Docker
 
-The container carries the CLI, the daemon, both Linux shims, and every one of
-the sixteen language toolchains bhf can build, harness, and fuzz — plus AFL++
-and a Rust nightly for the Rust sanitizer lane. It runs as an unprivileged user
+The default `core` image carries the CLI, daemon, Linux shims, and C/C++ build
+and fuzz tools. The opt-in `runtime` image adds the full language toolchains,
+AFL++, and Rust nightly. Both build the production binaries without the optional
+`llm` Cargo feature. Each runs as an unprivileged user
 under `tini`, and grants fuzzing the two extra runtime privileges it needs and
 nothing more.
 
@@ -12,18 +13,37 @@ nothing more.
 ```sh
 # from the repo root
 docker build -t bhf:local -f Dockerfile .
-# or
+# full-language image (explicit):
+docker build --target runtime -t bhf:full-local -f Dockerfile .
+# selected Ada tooling on top of core:
+docker build --target ada -t bhf:ada-local -f Dockerfile .
+# or build the core image through Compose:
 docker compose -f docker/compose.yaml build
+# Explicit validation only:
+docker compose -f docker/compose.yaml --profile validation run --rm sweep
+# From a clean commit, stamp a local release candidate with version and source:
+scripts/build-container-release.sh bhf:release-candidate
 ```
 
-The build is multi-stage: a builder compiles the Rust workspace against Ubuntu
-24.04 glibc (so the preload shims match the runtime), and the runtime image
-installs the toolchains. The runtime carries all sixteen lanes + .NET 8 SDK +
-a headless JDK + Maven; scope it down further by deleting unused `apt` lanes from
-the `Dockerfile` if you only fuzz a few languages — an absent toolchain simply
-skips. The Java lane uses Maven + `javac`; **Gradle is intentionally omitted** to
-keep the image small (it pulls a large GUI-adjacent dependency tree). Add
-`gradle` back to the `Dockerfile` if you need Gradle-project build recovery.
+The image currently supports `linux/amd64` only, matching its checksum-pinned
+Go archive. The release script refuses dirty checkouts and supplies the same
+version and commit to the binary and image metadata. The build context comes
+from `git archive HEAD`, excluding untracked and ignored local files. An optional
+second argument selects `core`, `ada`, or `runtime`. Its `local_image_id` identifies
+the local image configuration, and is distinct from a registry manifest digest.
+
+The builder compiles only the release binaries and Linux shims against Ubuntu
+24.04 glibc. The default final stage inherits `core`, with C/C++ tools. The named
+`runtime` target carries all sixteen lanes + .NET 8 SDK + a headless JDK + Maven.
+Gradle is omitted from the full image; add it to that stage for Gradle-project
+build recovery. The full language validation sweep uses `runtime` explicitly.
+
+| Profile | Included build tools | Executed acceptance |
+|---|---|---|
+| `core` (default) | C/C++ with Clang/LLVM | Non-root, read-only, disconnected C fixture in the actual image |
+| `ada` (explicit) | Core plus GNAT/GPRbuild | Non-root, read-only, disconnected Ada compiler smoke; broader project acceptance remains project-specific |
+| `runtime` (explicit) | All sixteen language toolchains except Gradle project recovery | Bare Java and staged Maven fixture under a read-only, disconnected profile; other lanes need separate hardened-profile evidence |
+| FreeRTOS reference | Separate pinned kernel, ARM GCC, QEMU | Cooperative task/queue image, clean → fault → clean, retained finding and replay; no physical-board claim |
 
 ## Run
 
@@ -56,16 +76,57 @@ already exports `AFL_SKIP_CPUFREQ=1` and
 `AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1` so the AFL lane does not depend on the
 host's (non-namespaced) `kernel.core_pattern` or CPU governor.
 
-For a read-only root filesystem:
+In the full-language `runtime` image, the JVM coverage-agent JAR is prebuilt
+into an immutable image path. Java
+projects with Maven or Gradle build files still need a writable, disposable
+source staging copy because those tools write build outputs into their module.
+Mount that copy at `/src` for the Java project path. A bare `javac` project can
+use a read-only `/src` mount.
+
+For a read-only root filesystem and a bare source fixture:
 
 ```sh
-docker run --rm --read-only \
-  --tmpfs /tmp:exec --shm-size=2g --cap-add=SYS_PTRACE \
+docker run --rm --network none --read-only \
+  --tmpfs /tmp:rw,exec,nosuid,size=1g --shm-size=2g \
+  --memory=4g --pids-limit=512 --cap-drop=ALL --cap-add=SYS_PTRACE \
+  --security-opt no-new-privileges:true \
   -v bhf_work:/work -v "$PWD":/src:ro \
-  bhf:local auto /src --work-dir /work/run
+  bhf:local auto /src --work-dir /work/run --jobs 1
 ```
 
 `/tmp` needs `exec` because some lanes compile and run harnesses staged there.
+The 4 GB / 512-process envelope was exercised with the small C acceptance
+fixture; size these limits for the target project before using this profile.
+
+The equivalent supported Compose override is:
+
+```sh
+docker compose -f docker/compose.yaml -f docker/compose.hardened.yaml \
+  run --rm -v "$PWD":/src:ro bhf --help
+```
+
+It isolates networking, makes the root read-only, supplies `/tmp`, and routes
+language caches to `/work/cache`. Maven/Gradle source staging remains explicit:
+copy the project into disposable writable storage and mount that copy at `/src`.
+Populate its dependency cache during a separately authorized preparation step.
+`scripts/ci/java-offline-acceptance.sh` checks successful staged Maven compilation,
+unchanged original source, and a failing empty-cache build under network isolation.
+
+## Release inventory and build inputs
+
+The Ubuntu repositories use a dated snapshot. Builder Rust, runtime nightly,
+rustup, Go, esbuild, and selected Ruby gems have explicit versions; downloaded
+rustup and Go archives have checksum checks. Refresh pins through a reviewed
+build and scan. Package versions and ecosystem inventory are retained for each
+image, including dependencies supplied by package managers.
+
+`scripts/ci/inventory-image.sh IMAGE EVIDENCE_DIR` scans the immutable local image
+ID. It verifies the shipped binary hashes against the compiler receipt, then
+merges the filesystem inventory with the selected normal Cargo dependency graph.
+Build scripts and proc macros are recorded separately in `build-receipt.json`.
+The OS-only inventory remains labeled `os.cyclonedx.json`. Scanner versions and
+the vulnerability database identity accompany the scan; a successful inventory
+command alone is not a vulnerability disposition or publication approval.
 
 ## Resources
 
@@ -77,13 +138,14 @@ serial sweep (`--jobs 1`) and set `--rss-limit-mb` explicitly. See
 
 ## Air-gapped / offline use
 
-The image is built so that **bhf's own instrumentation dependencies are staged at
-build time** — no lane reaches the internet to fuzz on a disconnected host:
+The full-language image stages **bhf's own instrumentation dependencies at build time**.
+Target build tools can still try the network; use `--network none` with staged
+project dependencies to enforce disconnected execution:
 
-- **Java** — the JVM coverage agent shades ASM. `build-agent.sh` would otherwise
-  fetch `asm`/`asm-tree` from Maven Central; the image installs them
-  (`libasm-java` → `/usr/share/java`) and sets `ASM_JAR_DIR=/usr/share/java`, so
-  the agent builds offline.
+- **Java** — the JVM coverage agent is built into the image with the packaged
+  ASM jars. `BHF_JVM_AGENT_JAR` points at that immutable artifact, so first use
+  does not need a writable home cache. Target project dependencies still need
+  staging.
 - **C#** — the harness references `SharpFuzz`; the image primes the default NuGet
   cache with it at build time.
 
@@ -105,7 +167,7 @@ With those staged, run with `--network none` to prove the run is truly offline:
 ```sh
 docker run --rm --network none --shm-size=2g --cap-add=SYS_PTRACE \
   -v "$PWD":/src:ro -v "$HOME/.m2":/home/fuzzer/.m2 -v bhf_work:/work \
-  bhf:local auto /src --work-dir /work/run --build-command "mvn -o -B clean compile"
+  bhf:full-local auto /src --work-dir /work/run --run-untrusted
 ```
 
 ## Using a compile_commands.json
@@ -125,7 +187,7 @@ real translation-unit flags. bhf uses it automatically — you do **not** need
 
 ## The 32-project sweep
 
-The image bakes a reproducible validation sweep: two small, pinned, real
+The full-language image bakes a reproducible validation sweep: two small, pinned, real
 projects per language (32 total). A passing sweep demonstrates observed entry
 into at least one non-stub target in every selected project. It does not prove
 complete API coverage, useful coverage feedback in every lane, or competitive
@@ -134,7 +196,7 @@ fuzzing effectiveness.
 ```sh
 docker run --rm --shm-size=2g --cap-add=SYS_PTRACE \
   -v bhf_work:/work \
-  bhf:local bhf-sweep --fetch          # --fetch clones the pinned corpus first
+  bhf:full-local bhf-sweep --fetch          # --fetch clones the pinned corpus first
 ```
 
 Outputs land under `/work/results/`: `sweep-report.md`, `sweep-report.tsv`, and
@@ -196,8 +258,8 @@ See `docker/compliance/README.md`.
 
 **Deploying to accredited/classified environments?** See
 [ATO / RMF posture](./ato.md) — control crosswalk (800-53/800-190), the air-gap
-proof, the honest vulnerability posture (scan the OS layer + bhf, not the
-build-toolchain caches), and how to build a minimal least-functionality image.
+evidence limits and the control crosswalk. Inventory and scan the entire shipped
+image, including toolchain caches; authorization remains deployment-specific.
 
 ## Troubleshooting
 

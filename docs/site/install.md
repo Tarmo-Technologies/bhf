@@ -144,8 +144,10 @@ For Windows-native cross-fuzzing (mingw + wine) and foreign-arch fuzzing
 
 ### Optional LLM and agent integration
 
-No model, API key, or network connection is required for BHF. Optional
-assistance needs one of the following:
+No model, API key, or network connection is required for BHF. Default release
+binaries omit the LLM feature. Build with `--features bhf/llm,bhf-daemon/llm`
+for the optional assistance commands and MCP prompt/preflight tools. Optional
+assistance then needs one of the following:
 
 - the `bhf-daemon` release component plus an MCP-capable Codex or Claude
   host for the recommended current-session workflow;

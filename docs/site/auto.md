@@ -9,8 +9,8 @@ code with broken `#include` chains, undefined externs, missing types, missing
 `with` clauses, or no runtime environment — and produces a fuzz lab plus a
 findings report without manual harnessing.
 
-Optional LLM assistance is not part of this pipeline and `auto` never calls a
-model. Use the [LLM and MCP guide](../llm/) to plan a bounded run, diagnose an
+Optional LLM assistance is compiled only with `cargo build -p bhf --features llm`.
+It is not part of this pipeline and `auto` never calls a model. Use the [LLM and MCP guide](../llm/) to plan a bounded run, diagnose an
 artifact, or review findings after the deterministic command has produced
 evidence. Model output does not change target ranking, build status, coverage,
 finding verdicts, replay, or minimization.
@@ -102,7 +102,7 @@ their own interpreters with in-process edge coverage.
 | `--grammar <PATH>` | unset | JSON grammar describing the target's input format for structure-aware generation (a Nautilus-style grammar mutator), applied to every fuzzed target. Each rule maps a non-terminal to production strings where `{NAME}` references another rule; the start symbol is `START` or the first rule. Validated up front (a bad grammar fails the run fast) |
 | `--max-len <N \| auto>` | `auto` | Maximum fuzz input length. `auto` grows the effective length adaptively per target — free up to ~1 MiB, and beyond that only while longer inputs keep finding new coverage — so a large-object target (image, archive, firmware) is handled WITHOUT a seed corpus, and a small-format one is not grown pointlessly. A positive integer sets a fixed cap |
 | `--timeout <DUR>` | `10s` | Per-execution timeout (e.g. `10s`, `500ms`); an input exceeding it is a hang/timeout |
-| `--run-untrusted` | off | Consent umbrella for `--probe-build` plus an Ada (`alr build` / `gprbuild`) build probe that materializes Alire config + codegen — **required** for Ada pre-build context recovery; implies `--probe-build`. EXECUTES untrusted scripts |
+| `--run-untrusted` | off | Consent umbrella for `--probe-build`, Ada (`alr build` / `gprbuild`) build probes, and Java Maven/Gradle project builds. Java project builds use Maven offline mode or Gradle `--offline`; stage target dependencies first. Bare Java source can still use `javac` without this flag. Implies `--probe-build`. EXECUTES untrusted scripts |
 | `--unsafe-search-and-run-build-commands` | off | UNSAFE convenience: search the tree for its own build entry point and EXECUTE it to recover flags, instead of you passing `--build-command`. Finds a custom build (build.sh, autotools bootstrap/autogen/configure, SCons, Waf, Bazel) and runs it under the compiler-intercepting shim, and enables the `--probe-build` tiers (CMake/Meson/Make) + the Ada build probe. Runs sandboxed when available, but it executes UNTRUSTED code from the scanned tree — use only on sources you trust. An explicit `--build-command` overrides the search |
 | `--deps-only` | off | Build each target as far as possible, emit the missing-dependency manifest, and SKIP fuzzing — the fast "what does this tree need?" scan |
 | `--static` | off | Run the static analyzer over the WHOLE tree in addition to fuzzing — not only as a fallback when a target can't be built/fuzzed. Findings (classification `static_scan`, ids `F-STATIC-*`) merge into the unified report (findings.csv, run.json, SARIF) next to the fuzz findings, so a target that built+fuzzed still gets static coverage and files with no fuzzable subprogram are analyzed too. Same engine as the standalone `bhf static-scan`. BHF's own generated harnesses/stubs under the work-dir are excluded, and dependency/build/cache trees such as `node_modules`, virtualenvs, `dist`, vendored deps, and generated JS `compiled/` bundles are pruned before analysis — the scan reports the target tree, not scaffolding or dependency payloads |

@@ -23,15 +23,19 @@ x86_64-pc-windows-msvc = ["bhf-daemon"]
 [dependencies]
 ada_parser = { path = "../ada_parser" }
 c_parser = { path = "../c_parser" }
-cli = { package = "bhf", path = "../cli" }
+cli = { package = "bhf", path = "../cli", default-features = false }
 cpp_parser = { path = "../cpp_parser" }
 bhf_report = { package = "report", path = "../report" }
 instrumenter = { path = "../instrumenter" }
-llm_harness_gen = { path = "../llm_harness_gen" }
+llm_harness_gen = { path = "../llm_harness_gen", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 static_analysis = { path = "../static_analysis" }
 target_rank = { path = "../target_rank" }
+
+[features]
+default = []
+llm = ["dep:llm_harness_gen", "cli/llm"]
 
 [lib]
 name = "daemon"

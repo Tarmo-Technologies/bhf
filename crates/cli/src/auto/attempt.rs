@@ -133,6 +133,8 @@ pub struct AttemptOptions {
     /// When true, skip the repair planner entirely and mark any
     /// failed build as `FailedBuild` (diagnostics mode).
     pub no_stubs: bool,
+    /// Permit project-controlled Java Maven/Gradle build scripts.
+    pub run_untrusted: bool,
     /// Ordered list of fuzz passes to drive against the built
     /// harness. Each pass sets `BHF_RUNTRACE_MODE` so the shim's
     /// fakes activate in the corresponding mode. Default = all three
@@ -248,6 +250,7 @@ impl Default for AttemptOptions {
             total_time: None,
             per_target_finding_count: None,
             no_stubs: false,
+            run_untrusted: false,
             passes: crate::auto::pass::Pass::ALL.to_vec(),
             source_root: None,
             project: None,
@@ -1895,6 +1898,7 @@ fn run_attempt(
             work_dir,
             &candidate.harness_id,
             &source_root,
+            options.run_untrusted,
         ) {
             crate::auto::java_build::JavaBuildResult::Built => {
                 // harnesses/<id>/main now exists; the build pass-through finds it and

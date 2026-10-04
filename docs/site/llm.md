@@ -9,11 +9,17 @@ rank diagnostic hypotheses. It must not become the source of truth for whether
 a harness compiles, links, reaches its target, gains coverage, or reproduces a
 finding.
 
+The LLM surface is an opt-in build feature. Build `bhf` and `bhf-daemon` with
+`cargo build --locked -p bhf -p bhf-daemon --features bhf/llm,bhf-daemon/llm`
+to enable the assistance commands and MCP prompt/preflight tools. Default
+release binaries omit the LLM crate; their MCP mode exposes only deterministic
+scan, target-list, and finding-load tools.
+
 The LLM surface is optional and is not part of `bhf auto`. BHF does not
 silently call a model, apply a completion to the repository, execute a
 model-generated command, or promote model prose into a finding. `llm prompt`
 renders a prompt, `llm assist` makes one bounded provider request, and the MCP
-server exposes five read-only tools. The operator or host agent decides what to
+LLM-enabled MCP server exposes five read-only tools. The operator or host agent decides what to
 do next, under the same command-review and sandbox policy used for any other
 change.
 

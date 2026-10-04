@@ -4,6 +4,9 @@ use clap::{Parser, Subcommand};
 use config::Profile;
 use license_policy::enforce;
 
+/// Source identity supplied by the release builder (or local Git checkout).
+pub const BUILD_COMMIT: &str = env!("BHF_GIT_COMMIT");
+
 /// Terminal output, routed so it cannot be eaten by the live progress block.
 ///
 /// `auto` pins a status block to the bottom of the terminal and erases it by
@@ -65,6 +68,7 @@ mod license_audit;
 pub mod list_fakes;
 pub mod list_oracles;
 mod list_targets;
+#[cfg(feature = "llm")]
 mod llm;
 mod minimize;
 mod model;
@@ -100,6 +104,7 @@ pub mod workdir;
 #[derive(Debug, Parser)]
 #[command(name = "bhf")]
 #[command(version = env!("BHF_VERSION_FULL"))]
+#[command(long_version = concat!(env!("BHF_VERSION_FULL"), "\ncommit: ", env!("BHF_GIT_COMMIT")))]
 #[command(about = "Offline fuzz lab generator for sixteen-language software estates")]
 #[command(long_about = "\
 Offline fuzz lab generator for sixteen-language software estates.
@@ -119,7 +124,6 @@ COMMANDS BY AREA (run `bhf <command> --help` for details):
   Supply chain  sbom, license-audit, static-scan, extract-state-machines
   Reference     rules, list oracles
   Governance    policy, audit, pack, export
-  Assistance    llm (Codex, Claude, API, local, MCP workflows)
   Ops & CI      ci, runners, clean, introspect, bug-report
 
 `list` and `binary` group related subcommands (`bhf list targets`,
@@ -259,6 +263,7 @@ enum Command {
     /// Create a compact scrubbed support report from a running/completed auto work directory (no source or private names)
     BugReport(support_report::SupportReportArgs),
     /// Use Codex, Claude, API, or local LLMs for evidence-grounded planning, harness help, findings, and diagnostics
+    #[cfg(feature = "llm")]
     Llm(llm::LlmArgs),
 
     // ── Internal / metrics: hidden from the default menu, still runnable ─────
@@ -478,6 +483,7 @@ where
         Some(Command::LicenseAudit(license_audit_args)) => {
             license_audit::run(license_audit_args, profile)
         }
+        #[cfg(feature = "llm")]
         Some(Command::Llm(args)) => llm::run(args),
         Some(Command::ListOracles(args)) => list_oracles::run(args),
         Some(Command::ListTargets(list_args)) => match list_targets::run(list_args) {

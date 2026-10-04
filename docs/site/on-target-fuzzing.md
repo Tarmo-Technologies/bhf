@@ -54,7 +54,7 @@ binary release.
 | A cross toolchain + `qemu-user` | **qemu-user replay** (see Cross-Compilation) | Real ISA/endianness, no RTOS/peripherals | ✅ RV-1 (`qemu-ppc64`) |
 | A gdbstub (OpenOCD/J-Link/QEMU) | **Debug-probe / gdb-remote** | Real target memory + coverage ring | ✅ RV-2 (`qemu-arm`); real board gated |
 | A cross toolchain + `qemu-system` | **Full-system emulator (bare-metal)** | Real core, MMIO, interrupts, snapshot reset | ✅ RV-3 (`qemu-system-arm`, bare-metal Cortex-M — **not** an RTOS) |
-| An open RTOS (FreeRTOS) | **Actual RTOS execution** | Scheduler / tasks / queues | 🟡 FreeRTOS reference profile (`crates/target_transport/tests/freertos/`): image build + boot + `savevm` baseline validated under `qemu-system-arm`; the per-input fuzz-drive is gated while a harness-done-stop nuance is resolved. Kernel is bring-your-own (not vendored). |
+| An open RTOS (FreeRTOS) | **Actual RTOS execution** | Scheduler / tasks / queues | ✅ FreeRTOS reference profile (`crates/target_transport/tests/freertos/`): cooperative Cortex-M3 image build, boot, snapshot reset, task/queue input drive, HardFault classification, and clean → fault → clean CLI test under `qemu-system-arm`. Kernel is bring-your-own (not vendored); physical boards and other RTOSes are unvalidated. |
 | A proprietary RTOS image | **Actual RTOS execution** | VxWorks/INTEGRITY/QNX scheduler | ⛔ unproven (bring the image + toolchain) |
 | An on-device agent (TCP/serial) | **On-target agent** | Real device; coverage over the agent protocol | ⛔ unproven |
 | A physical board | **HIL** (hardware-in-the-loop) | Silicon | ⛔ unproven (`BHF_HIL_GDB`) |
@@ -309,7 +309,8 @@ bhf fuzz bhf_work --harness H-C0001 \
 `scripts/hil-emu.sh` runs the real (non-skippable) live-QEMU validations —
 big-endian PPC64 fidelity (RV-1), the gdb-remote client against a real
 `qemu-arm` stub (RV-2), and the full-system Cortex-M snapshot path with a
-planted HardFault (RV-3). It **hard-fails** if a required tool is missing so the
+planted HardFault (RV-3), and the pinned FreeRTOS task/queue profile with
+CLI finding and replay (RV-4). It **hard-fails** if a required tool is missing so the
 lane cannot silently skip:
 
 ```sh
@@ -318,8 +319,9 @@ BHF_HIL_REQUIRE=1 scripts/hil-emu.sh
 
 Prerequisites (Debian/Ubuntu): `qemu-system-arm qemu-user qemu-utils
 gcc-arm-none-eabi gcc-arm-linux-gnueabihf gcc-powerpc64-linux-gnu binutils`.
-These three paths are **validated end-to-end on QEMU** (see
-`docs/validation/2026-09-27-hil-emu-live-qemu.md`).
+RV-1 through RV-3 were validated on QEMU in September 2026 (see
+`docs/validation/2026-09-27-hil-emu-live-qemu.md`). RV-4 passed locally on
+October 4, 2026; hosted HIL-emu workflow evidence remains pending.
 
 ---
 

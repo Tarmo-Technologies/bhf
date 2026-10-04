@@ -117,6 +117,14 @@ jobs:
       - name: Build workspace
         run: cargo build --locked --workspace
 
+      - name: Require default production dependency graphs to exclude LLM
+        run: |
+          if cargo tree --locked -p bhf -p bhf-daemon --edges normal --prefix none \
+            | grep -q '^llm_harness_gen '; then
+            echo 'default CLI/daemon dependency graph contains llm_harness_gen' >&2
+            exit 1
+          fi
+
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets
 
@@ -176,6 +184,54 @@ jobs:
           cargo test --locked -p fuzz_engine_libafl_adapter --features libafl-engine
           cargo test --locked -p fuzz_engine_nyx_adapter --features nyx-engine
           cargo test --locked -p probe_gnat_actions --features enabled
+          cargo check --locked -p bhf -p bhf-daemon --features bhf/llm,bhf-daemon/llm
+          cargo test --locked -p bhf-daemon --features llm --lib
+
+  container-core:
+    name: Core container build and run
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build and exercise the shipping Dockerfile
+        run: bash scripts/ci/container-core-acceptance.sh
+      - name: Check the selected Ada toolchain flavor
+        run: bash scripts/ci/container-ada-acceptance.sh
+      - name: Retain container acceptance evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: container-core-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            container-acceptance/
+            container-ada-acceptance/
+          if-no-files-found: error
+
+  container-full:
+    name: Full-language container build and Java smoke
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build and exercise the full-language Docker target
+        run: bash scripts/ci/container-full-acceptance.sh
+      - name: Retain full-language container evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: container-full-${{ github.run_id }}-${{ github.run_attempt }}
+          path: container-full-acceptance/
+          if-no-files-found: error
 
   rhel7-build:
     name: RHEL 7 compatible build
@@ -454,6 +510,8 @@ jobs:
       - ci-policy
       - minimum-rust
       - build-test
+      - container-core
+      - container-full
       - rhel7-build
       - rhel-family-smoke
       - ubuntu-release-smoke

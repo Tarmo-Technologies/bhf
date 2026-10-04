@@ -314,3 +314,227 @@ fn cli_qemu_system_transport_persists_a_classified_fault_finding() {
 
     eprintln!("cli_qemu_system_transport: PASSED — CLI planted the breakpoint and persisted {id}");
 }
+
+/// Actual FreeRTOS CLI acceptance, separate from the bare-metal Cortex-M test.
+/// Opt in because it obtains a pinned upstream kernel unless BHF_RTOS_KERNEL is
+/// supplied. Each CLI invocation opens a fresh transport session on one guest.
+#[test]
+fn cli_freertos_clean_fault_clean() {
+    if std::env::var("BHF_RTOS_CLI").ok().as_deref() != Some("1") {
+        eprintln!("SKIP cli_freertos_clean_fault_clean: set BHF_RTOS_CLI=1");
+        return;
+    }
+    for tool in [CC, QEMU, QEMU_IMG, NM, "git"] {
+        assert!(tool_present(tool), "BHF_RTOS_CLI=1 requires {tool}");
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let kernel = if let Some(path) = std::env::var_os("BHF_RTOS_KERNEL") {
+        PathBuf::from(path)
+    } else {
+        let path = dir.join("kernel");
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&path)
+            .args([
+                "fetch",
+                "-q",
+                "--depth",
+                "1",
+                "https://github.com/FreeRTOS/FreeRTOS-Kernel",
+                "8be86d4a24fd4091f8f4192018423ab590f408db"
+            ])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&path)
+            .args(["checkout", "-q", "FETCH_HEAD"])
+            .status()
+            .unwrap()
+            .success());
+        path
+    };
+    let head = Command::new("git")
+        .arg("-C")
+        .arg(&kernel)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(head.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&head.stdout).trim(),
+        "8be86d4a24fd4091f8f4192018423ab590f408db",
+        "FreeRTOS CLI validation requires the pinned kernel"
+    );
+    let fx = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target_transport/tests/freertos");
+    let inc_port = kernel.join("portable/GCC/ARM_CM3");
+    let elf = dir.join("rtos.elf");
+    let built = Command::new(CC)
+        .args([
+            "-mcpu=cortex-m3",
+            "-mthumb",
+            "-nostdlib",
+            "-nostartfiles",
+            "-ffreestanding",
+            "-O1",
+            "-g",
+        ])
+        .arg("-I")
+        .arg(&fx)
+        .arg("-I")
+        .arg(kernel.join("include"))
+        .arg("-I")
+        .arg(&inc_port)
+        .arg("-T")
+        .arg(fx.join("link.ld"))
+        .arg("-o")
+        .arg(&elf)
+        .arg(fx.join("startup.c"))
+        .arg(fx.join("app.c"))
+        .arg(kernel.join("tasks.c"))
+        .arg(kernel.join("queue.c"))
+        .arg(kernel.join("list.c"))
+        .arg(inc_port.join("port.c"))
+        .arg(kernel.join("portable/MemMang/heap_4.c"))
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "FreeRTOS compile: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let symbol = |name, thumb| nm_symbol(&elf, name, thumb);
+    let spec_base = format!(
+        "done={:#x},done_kind=2,fault={:#x}",
+        symbol("harness_done", true),
+        symbol("bhf_fault_flag", false)
+    );
+    let map = format!(
+        "input={:#x},ring={:#x},write={:#x},wrapped={:#x},cap=512",
+        symbol("bhf_input", false),
+        symbol("adafuzz_probe_memory_buffer", false),
+        symbol("adafuzz_probe_memory_buffer_write", false),
+        symbol("adafuzz_probe_memory_buffer_wrapped", false)
+    );
+    for (i, byte, expect_crash) in [(0, 0x42_u8, false), (1, 0xF7, true), (2, 0x42, false)] {
+        let scratch = dir.join(format!("scratch-{i}.qcow2"));
+        assert!(Command::new(QEMU_IMG)
+            .args(["create", "-f", "qcow2"])
+            .arg(&scratch)
+            .arg("16M")
+            .output()
+            .unwrap()
+            .status
+            .success());
+        let qmp_port = free_port();
+        let gdb_port = free_port();
+        let child = Command::new(QEMU)
+            .args(["-M", "mps2-an385", "-nographic", "-S", "-kernel"])
+            .arg(&elf)
+            .arg("-gdb")
+            .arg(format!("tcp::{gdb_port}"))
+            .arg("-drive")
+            .arg(format!(
+                "if=none,file={},format=qcow2,id=sc0",
+                scratch.display()
+            ))
+            .arg("-qmp")
+            .arg(format!("tcp:127.0.0.1:{qmp_port},server,nowait"))
+            .spawn()
+            .unwrap();
+        let _guard = ChildGuard(child);
+        assert!(wait_port(qmp_port, Duration::from_secs(45)));
+        assert!(wait_port(gdb_port, Duration::from_secs(45)));
+        let spec =
+            format!("qemu-system:qmp=127.0.0.1:{qmp_port},gdb=127.0.0.1:{gdb_port},{spec_base}");
+        let seed = dir.join(format!("seed-{i}.bin"));
+        std::fs::write(&seed, [byte]).unwrap();
+        let work = dir.join(format!("work-{i}"));
+        let out = Command::new(bhf_bin())
+            .args([
+                "fuzz",
+                "--target-transport",
+                &spec,
+                "--transport-coverage-map",
+                &map,
+                "--harness",
+                "freertos-queue",
+                "--seed-file",
+            ])
+            .arg(&seed)
+            .args(["--iterations", "1", "--time", "30s", "--max-len", "64"])
+            .arg(&work)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "FreeRTOS CLI {i}: {}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let summary: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(
+            summary["crashes"].as_u64().unwrap_or(0) > 0,
+            expect_crash,
+            "FreeRTOS CLI {i}: {summary}"
+        );
+        if expect_crash {
+            let findings = summary["findings"].as_array().unwrap();
+            assert!(!findings.is_empty(), "FreeRTOS crash must retain a finding");
+            let finding_id = findings[0].as_str().unwrap();
+            let finding = work.join("results/findings").join(finding_id);
+            assert!(finding.join("transport_profile.json").is_file());
+
+            // Replay must start from reset, at the recorded QMP/GDB endpoints.
+            // A daemon parked at harness_done would snapshot a completed run.
+            drop(_guard);
+            let replay_scratch = dir.join("replay.qcow2");
+            assert!(Command::new(QEMU_IMG)
+                .args(["create", "-f", "qcow2"])
+                .arg(&replay_scratch)
+                .arg("16M")
+                .output()
+                .unwrap()
+                .status
+                .success());
+            let replay_guest = Command::new(QEMU)
+                .args(["-M", "mps2-an385", "-nographic", "-S", "-kernel"])
+                .arg(&elf)
+                .arg("-gdb")
+                .arg(format!("tcp::{gdb_port}"))
+                .arg("-drive")
+                .arg(format!(
+                    "if=none,file={},format=qcow2,id=sc0",
+                    replay_scratch.display()
+                ))
+                .arg("-qmp")
+                .arg(format!("tcp:127.0.0.1:{qmp_port},server,nowait"))
+                .spawn()
+                .unwrap();
+            let _replay_guard = ChildGuard(replay_guest);
+            assert!(wait_port(qmp_port, Duration::from_secs(45)));
+            assert!(wait_port(gdb_port, Duration::from_secs(45)));
+            let replay = Command::new(bhf_bin())
+                .arg("replay")
+                .arg(&finding)
+                .output()
+                .unwrap();
+            assert!(
+                replay.status.success(),
+                "FreeRTOS replay: {}\n{}",
+                String::from_utf8_lossy(&replay.stdout),
+                String::from_utf8_lossy(&replay.stderr)
+            );
+            assert!(String::from_utf8_lossy(&replay.stdout).contains("MATCH"));
+        }
+    }
+}
