@@ -68,11 +68,23 @@ pub struct ResourceRecipe {
 /// resource with `c.rest_bytes()` does not starve a ctor arg. Returns
 /// `(setup_lines, override_expr, arg_pass)`.
 fn resource_recipe_emission(recipe: &ResourceRecipe) -> (Vec<String>, String, ArgPass) {
+    // Setup is emitted AFTER the ordinary method-arg decodes (see build_call_body),
+    // so `rest_bytes()` here is the TAIL partition and cannot starve them.
+    //
+    // #83 scratch lifetime: the base is a DECLARED writable location — the
+    // supervising runner's `BHF_RES_SCRATCH_DIR` when set (the runner owns that
+    // directory and sweeps it after BOTH normal and abnormal child exits, which a
+    // target-local `Drop` cannot cover after an abort / timeout-kill / sanitizer
+    // abort), else the OS temp dir. The exe's own parent directory is NOT used: it
+    // is not guaranteed writable on replay or under a restricted sandbox.
+    //
+    // #83 setup honesty: a resource create/seed FAILURE is an INFRASTRUCTURE error,
+    // not target behavior — it is reported and the harness returns 0 BEFORE
+    // `bhf_target_enter()`, so a failed setup never runs the target's missing-file
+    // branch nor is counted as a target entry / defect.
     let mut lines = vec![
         "    // #83 resource recipe: materialize a bounded, path-backed resource seeded".to_owned(),
-        "    // with the fuzz input so a path-opener reads attacker bytes from a real file;"
-            .to_owned(),
-        "    // the temp tree lives under the harness binary's own dir and is RAII-removed."
+        "    // with the fuzz input so a path-opener reads attacker bytes from a real file."
             .to_owned(),
         "    let __bhf_res_dir = {".to_owned(),
         "        static __BHF_RES_N: core::sync::atomic::AtomicU64 = \
@@ -80,30 +92,51 @@ fn resource_recipe_emission(recipe: &ResourceRecipe) -> (Vec<String>, String, Ar
             .to_owned(),
         "        let __n = __BHF_RES_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);"
             .to_owned(),
-        "        let mut __base = std::env::current_exe().ok()".to_owned(),
-        "            .and_then(|p| p.parent().map(std::path::Path::to_path_buf))".to_owned(),
+        "        let mut __base = std::env::var_os(\"BHF_RES_SCRATCH_DIR\")".to_owned(),
+        "            .map(std::path::PathBuf::from)".to_owned(),
         "            .unwrap_or_else(std::env::temp_dir);".to_owned(),
         "        __base.push(format!(\"bhf_res_{}_{}\", std::process::id(), __n));".to_owned(),
-        "        let _ = std::fs::remove_dir_all(&__base);".to_owned(),
-        "        let _ = std::fs::create_dir_all(&__base);".to_owned(),
         "        __base".to_owned(),
         "    };".to_owned(),
+        "    let _ = std::fs::remove_dir_all(&__bhf_res_dir);".to_owned(),
         "    struct __BhfResGuard(std::path::PathBuf);".to_owned(),
         "    impl Drop for __BhfResGuard { fn drop(&mut self) { \
          let _ = std::fs::remove_dir_all(&self.0); } }"
             .to_owned(),
         "    let __bhf_res_guard = __BhfResGuard(__bhf_res_dir.clone());".to_owned(),
+        "    if std::fs::create_dir_all(&__bhf_res_dir).is_err() {".to_owned(),
+        "        eprintln!(\"bhf: harness resource setup failed (create_dir_all {:?}); \
+         skipping target entry\", __bhf_res_dir);"
+            .to_owned(),
+        "        return 0;".to_owned(),
+        "    }".to_owned(),
     ];
     match &recipe.seed_file {
         Some(name) => {
             lines.push(format!(
-                "    let _ = std::fs::write(__bhf_res_dir.join({name:?}), c.rest_bytes());"
+                "    if std::fs::write(__bhf_res_dir.join({name:?}), c.rest_bytes()).is_err() {{"
             ));
+            lines.push(
+                "        eprintln!(\"bhf: harness resource seed write failed; \
+                 skipping target entry\");"
+                    .to_owned(),
+            );
+            lines.push("        return 0;".to_owned());
+            lines.push("    }".to_owned());
             lines.push("    let __bhf_res_path = __bhf_res_dir.clone();".to_owned());
         }
         None => {
             lines.push("    let __bhf_res_path = __bhf_res_dir.join(\"resource\");".to_owned());
-            lines.push("    let _ = std::fs::write(&__bhf_res_path, c.rest_bytes());".to_owned());
+            lines.push(
+                "    if std::fs::write(&__bhf_res_path, c.rest_bytes()).is_err() {".to_owned(),
+            );
+            lines.push(
+                "        eprintln!(\"bhf: harness resource seed write failed; \
+                 skipping target entry\");"
+                    .to_owned(),
+            );
+            lines.push("        return 0;".to_owned());
+            lines.push("    }".to_owned());
         }
     }
     (lines, "__bhf_res_path.clone()".to_owned(), recipe.arg_pass)
@@ -242,6 +275,7 @@ fn build_call_body(
     method_trait_import: Option<&[String]>,
     is_unsafe: bool,
     resource_setup: &[String],
+    resource_param_index: Option<usize>,
 ) -> Result<String, RustGenerateError> {
     if call_path.is_empty() {
         return Err(RustGenerateError {
@@ -275,29 +309,44 @@ fn build_call_body(
     // other rest-eligible parameter falls back to its length-bounded form so they
     // don't all try to consume the whole input. Override slots are never the rest
     // channel.
-    let rest_idx = slots
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, s)| matches!(s, Slot::Decoded(e) if e.rest_eligible))
-        .map(|(i, _)| i);
+    //
+    // When a path-opener RESOURCE recipe is present it OWNS the rest channel — it
+    // is seeded from `c.rest_bytes()` as its payload view — so NO ordinary method
+    // arg may also claim the rest: every arg decodes in its bounded form from the
+    // front, giving each its own non-overlapping input partition, and the resource
+    // takes the tail (#83). Otherwise it would starve the later arg decoders (or
+    // vice versa) and fix those args at their empty/zero defaults.
+    let rest_idx = if resource_param_index.is_some() {
+        None
+    } else {
+        slots
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, s)| matches!(s, Slot::Decoded(e) if e.rest_eligible))
+            .map(|(i, _)| i)
+    };
 
-    let mut lines = Vec::new();
+    // Decode every NON-resource arg from the front first; defer the resource
+    // param's binding (it reads `__bhf_res_path`, which `resource_setup` defines
+    // only AFTER the front-partition decodes run).
+    let mut arg_lines = Vec::new();
+    let mut resource_arg_line: Option<String> = None;
     let mut call_args = Vec::new();
     for (i, s) in slots.iter().enumerate() {
         let bind = format!("a{i}");
         // `let mut` unconditionally: a `&mut T` parameter needs a mutable local
         // (RC3 — else E0596), and the harness `#![allow(unused_mut)]` makes the
         // mut harmless for by-value / shared-ref params.
-        match s {
-            Slot::Override(expr, by_ref) => {
-                lines.push(format!("    let mut {bind} = {expr};"));
-                call_args.push(match by_ref {
+        let (line, arg) = match s {
+            Slot::Override(expr, by_ref) => (
+                format!("    let mut {bind} = {expr};"),
+                match by_ref {
                     ArgPass::Move => bind.clone(),
                     ArgPass::Ref => format!("&{bind}"),
                     ArgPass::RefMut => format!("&mut {bind}"),
-                });
-            }
+                },
+            ),
             Slot::Decoded(e) => {
                 let expr = if Some(i) == rest_idx {
                     e.rest_expr
@@ -306,14 +355,21 @@ fn build_call_body(
                 } else {
                     e.bounded_expr.clone()
                 };
-                lines.push(format!("    let mut {bind} = {expr};"));
-                let arg = match e.by_ref {
-                    ArgPass::Move => bind.clone(),
-                    ArgPass::Ref => format!("&{bind}"),
-                    ArgPass::RefMut => format!("&mut {bind}"),
-                };
-                call_args.push(arg);
+                (
+                    format!("    let mut {bind} = {expr};"),
+                    match e.by_ref {
+                        ArgPass::Move => bind.clone(),
+                        ArgPass::Ref => format!("&{bind}"),
+                        ArgPass::RefMut => format!("&mut {bind}"),
+                    },
+                )
             }
+        };
+        call_args.push(arg);
+        if Some(i) == resource_param_index {
+            resource_arg_line = Some(line);
+        } else {
+            arg_lines.push(line);
         }
     }
 
@@ -436,14 +492,22 @@ fn build_call_body(
         body.push_str(line);
         body.push('\n');
     }
-    // A path-opener resource is materialized AFTER the receiver ctor decodes its
-    // args (so `rest_bytes` seeding does not starve them) and BEFORE the method-arg
-    // slots, whose path override references `__bhf_res_path` defined here (#83).
+    // Ordering that keeps every input channel non-overlapping (#83): the receiver
+    // ctor decodes its args, then the ordinary method args decode their bounded
+    // FRONT partitions, THEN the path-opener resource is materialized from the
+    // remaining bytes (`c.rest_bytes()`), and finally the resource param binding
+    // (which references `__bhf_res_path`) is emitted. Seeding the resource last
+    // means it cannot starve the scalar/bytes args that precede it, and they
+    // cannot starve it.
+    for line in &arg_lines {
+        body.push_str(line);
+        body.push('\n');
+    }
     for line in resource_setup {
         body.push_str(line);
         body.push('\n');
     }
-    for line in &lines {
+    if let Some(line) = &resource_arg_line {
         body.push_str(line);
         body.push('\n');
     }
@@ -550,7 +614,13 @@ fn substitute_type_param(ty: &str, name: &str, concrete: &str) -> String {
 /// (`data: T` -> `data: &[u8]`). Errors (a clean skip) if any type param has an
 /// unrecognized/absent bound, or is not used by an input param (return-only /
 /// uninferable, e.g. `from_slice<T: Deserialize>() -> Result<T>`).
-fn monomorphized_params(target: &RustFn) -> Result<Vec<RustParam>, RustGenerateError> {
+/// The concretized parameter list generation actually calls with: each generic
+/// type param bounded by a byte/str-slice conversion (`T: AsRef<[u8]>`) is
+/// substituted to its concrete form (`&[u8]`), and an uninferable generic is a
+/// hard error (a clean skip). Exposed so the resolver can classify the SAME
+/// representation the generator uses, rather than rejecting a raw `T` that the
+/// generator would have monomorphized (the #83 flag-off regression).
+pub fn monomorphized_params(target: &RustFn) -> Result<Vec<RustParam>, RustGenerateError> {
     if target.type_params.is_empty() {
         return Ok(target.params.clone());
     }
@@ -663,6 +733,7 @@ pub fn generate_rust_direct_harness(
         args.method_trait_import.as_deref(),
         args.target.is_unsafe,
         &resource_setup,
+        args.resource_recipe.as_ref().map(|r| r.param_index),
     )?;
     let harness_rs = render_harness_rs(&body);
     Ok(GeneratedRustHarness {
@@ -1772,6 +1843,141 @@ mod tests {
             h.harness_rs.contains("impl Drop for __BhfResGuard"),
             "the resource is RAII-cleaned:\n{}",
             h.harness_rs
+        );
+    }
+
+    /// Build a direct harness for a path-opener target whose path param is at
+    /// `path_index`, with the other params given, and return the generated source.
+    fn resource_harness(params: &[(&str, &str)], path_index: usize, arg_pass: ArgPass) -> String {
+        let target = rust_fn("load", params, true);
+        let args = GenerateRustDirectArgs {
+            call_path: vec!["k".to_owned(), "load".to_owned()],
+            target,
+            receiver: None,
+            receiver_ctor_params: Vec::new(),
+            receiver_unwrap: ReceiverUnwrap::Direct,
+            param_decoders: Vec::new(),
+            receiver_ctor_param_decoders: Vec::new(),
+            ufcs_trait: None,
+            method_trait_import: None,
+            resource_recipe: Some(ResourceRecipe {
+                param_index: path_index,
+                arg_pass,
+                seed_file: None,
+            }),
+        };
+        generate_rust_direct_harness(&args).unwrap().harness_rs
+    }
+
+    #[test]
+    fn resource_recipe_does_not_starve_a_trailing_scalar_arg() {
+        // #83 review item 1: `load(path: &Path, mode: u8)`. The scalar must decode
+        // its OWN front partition from the cursor BEFORE the resource is seeded from
+        // the tail, so `mode` varies under mutation instead of being pinned to 0.
+        let rs = resource_harness(&[("path", "&Path"), ("mode", "u8")], 0, ArgPass::Ref);
+        let mode = rs
+            .lines()
+            .find(|l| l.contains("let mut a1 ="))
+            .expect("the scalar (a1) binding");
+        assert!(
+            mode.contains("c.") && !mode.contains("__bhf_res_path"),
+            "the scalar must decode from the cursor, got: {mode}"
+        );
+        let decode_at = rs.find("let mut a1 =").unwrap();
+        let seed_at = rs.find("c.rest_bytes()").unwrap();
+        let path_at = rs.find("let mut a0 = __bhf_res_path.clone();").unwrap();
+        assert!(
+            decode_at < seed_at && seed_at < path_at,
+            "order must be scalar-decode < resource-seed < path-binding:\n{rs}"
+        );
+        assert!(rs.contains("k::load(&a0, a1)"), "{rs}");
+    }
+
+    #[test]
+    fn resource_recipe_does_not_starve_a_leading_scalar_arg() {
+        // Same, with the argument order reversed: `load(mode: u8, path: &Path)`.
+        let rs = resource_harness(&[("mode", "u8"), ("path", "&Path")], 1, ArgPass::Ref);
+        let decode_at = rs.find("let mut a0 =").unwrap();
+        let seed_at = rs.find("c.rest_bytes()").unwrap();
+        let path_at = rs.find("let mut a1 = __bhf_res_path.clone();").unwrap();
+        let mode = rs
+            .lines()
+            .find(|l| l.contains("let mut a0 ="))
+            .expect("the scalar (a0) binding");
+        assert!(
+            mode.contains("c.") && !mode.contains("__bhf_res_path"),
+            "the scalar must decode from the cursor, got: {mode}"
+        );
+        assert!(
+            decode_at < seed_at && seed_at < path_at,
+            "order must be scalar-decode < resource-seed < path-binding:\n{rs}"
+        );
+        assert!(rs.contains("k::load(a0, &a1)"), "{rs}");
+    }
+
+    #[test]
+    fn resource_recipe_does_not_starve_a_bytes_arg() {
+        // `load(path: &Path, extra: &[u8])`. With a resource present, the resource
+        // OWNS the rest channel, so `extra` must take a BOUNDED front partition
+        // (not `rest_bytes()`), leaving the tail for the seeded file — both vary.
+        let rs = resource_harness(&[("path", "&Path"), ("extra", "&[u8]")], 0, ArgPass::Ref);
+        let extra = rs
+            .lines()
+            .find(|l| l.contains("let mut a1 ="))
+            .expect("the bytes (a1) binding");
+        assert!(
+            extra.contains("c.") && !extra.contains("rest_bytes"),
+            "the bytes arg must take a bounded partition, not the rest channel: {extra}"
+        );
+        let decode_at = rs.find("let mut a1 =").unwrap();
+        let seed_at = rs.find("c.rest_bytes()").unwrap();
+        assert!(
+            decode_at < seed_at,
+            "the bytes arg must decode before the resource seed:\n{rs}"
+        );
+    }
+
+    #[test]
+    fn resource_recipe_bails_on_setup_failure_before_target_entry() {
+        // #83 review item 4: a resource create/seed FAILURE is infrastructure, not
+        // target behavior — the harness reports it and returns BEFORE
+        // `bhf_target_enter()`, so a failed setup never runs the target's
+        // missing-file branch nor is counted as a target entry.
+        let rs = resource_harness(&[("path", "&Path")], 0, ArgPass::Ref);
+        let create_bail = rs
+            .find("if std::fs::create_dir_all(&__bhf_res_dir).is_err() {")
+            .expect("create_dir_all is checked, not discarded");
+        let write_bail = rs
+            .find(".is_err() {")
+            .expect("the seed write is checked, not discarded");
+        let enter = rs
+            .find("unsafe { bhf_target_enter(); }")
+            .expect("target-entry call site");
+        assert!(
+            create_bail < enter && write_bail < enter,
+            "setup failure must be handled BEFORE target entry:\n{rs}"
+        );
+        assert!(
+            rs.contains("return 0;"),
+            "a failed setup returns cleanly (no target entry):\n{rs}"
+        );
+    }
+
+    #[test]
+    fn resource_recipe_uses_the_runner_owned_scratch_dir_when_provided() {
+        // #83 review item 5: the scratch base honors the supervising runner's
+        // BHF_RES_SCRATCH_DIR (so the runner can own the lifetime and sweep it after
+        // abnormal exits that a target-local Drop cannot cover), falling back to the
+        // OS temp dir — never the exe's own (possibly read-only) parent directory.
+        let rs = resource_harness(&[("path", "&Path")], 0, ArgPass::Ref);
+        assert!(
+            rs.contains("std::env::var_os(\"BHF_RES_SCRATCH_DIR\")")
+                && rs.contains("unwrap_or_else(std::env::temp_dir)"),
+            "scratch base must be the runner dir or temp, not the exe parent:\n{rs}"
+        );
+        assert!(
+            !rs.contains("current_exe()"),
+            "the exe parent dir must NOT be the scratch base:\n{rs}"
         );
     }
 

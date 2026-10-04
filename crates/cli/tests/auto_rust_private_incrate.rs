@@ -253,3 +253,51 @@ fn default_path_does_not_discover_the_non_pub_method() {
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[test]
+fn discovery_cache_tracks_the_incrate_private_flag_toggle() {
+    // #83 item 3: the discovery-cache identity includes the opt-in flag, so a warm
+    // cache on the SAME work directory does not leak the previous run's candidate
+    // set across a flag toggle. Discovery-only property (checks run.json attempts),
+    // so it runs without a toolchain — no `cargo +nightly` gate.
+    let bin = bhf_bin();
+    if !bin.exists() {
+        eprintln!("skip: bhf binary not built at {}", bin.display());
+        return;
+    }
+    let fx = fixture("rust_incrate_private");
+
+    // off -> on, ONE work directory: the stale flag-off cache must NOT suppress the
+    // private target once the flag is enabled.
+    let w1 = std::env::temp_dir().join(format!("bhf-incrate-cache-onoff-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&w1);
+    let (_c1, off) = run_auto(&fx, &w1, "2", "6", false);
+    assert!(
+        find_attempt(&off, "open_dir").is_none(),
+        "flag OFF must not discover open_dir:\n{off}"
+    );
+    let (_c2, on) = run_auto(&fx, &w1, "2", "6", true);
+    assert!(
+        find_attempt(&on, "open_dir").is_some(),
+        "flag ON on the SAME work dir must re-discover open_dir — the stale flag-off \
+         cache must not suppress it:\n{on}"
+    );
+    let _ = std::fs::remove_dir_all(&w1);
+
+    // on -> off, ONE work directory: a warm flag-on cache must NOT retain the
+    // private target once the flag is disabled.
+    let w2 = std::env::temp_dir().join(format!("bhf-incrate-cache-offon-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&w2);
+    let (_c3, on2) = run_auto(&fx, &w2, "2", "6", true);
+    assert!(
+        find_attempt(&on2, "open_dir").is_some(),
+        "flag ON must discover open_dir:\n{on2}"
+    );
+    let (_c4, off2) = run_auto(&fx, &w2, "2", "6", false);
+    assert!(
+        find_attempt(&off2, "open_dir").is_none(),
+        "flag OFF on the SAME work dir must drop open_dir — a warm flag-on cache must \
+         not retain it:\n{off2}"
+    );
+    let _ = std::fs::remove_dir_all(&w2);
+}

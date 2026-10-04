@@ -3013,8 +3013,24 @@ fn resolve_in_crate_target(
     // Any OTHER undecodable param means there is no resolvable setup for this
     // in-crate target -> a DISTINCT unsupported-setup skip (classified separately
     // from a generator/build failure).
+    //
+    // Classify the CONCRETIZED params the generator will actually call with — the
+    // SAME `monomorphized_params` representation — NOT the raw declared types. A
+    // raw generic `T: AsRef<[u8]>` is not a native decoder type, so classifying
+    // `p.ty` directly would reject a byte-generic in-crate target here before the
+    // generator substitutes `T -> &[u8]` (the flag-off coverage regression). An
+    // uninferable generic is still an honest unsupported skip (via the Err below).
+    let classify_params = match harness_gen::rust_generate::monomorphized_params(&target) {
+        Ok(params) => params,
+        Err(error) => {
+            return Err(format!(
+                "Rust target '{}' ({UNSUPPORTED_SETUP_TAG}): {}",
+                target.name, error.reason
+            ))
+        }
+    };
     let mut resource_recipe: Option<harness_gen::rust_generate::ResourceRecipe> = None;
-    for (i, p) in target.params.iter().enumerate() {
+    for (i, p) in classify_params.iter().enumerate() {
         if harness_gen::rust_decoders::select_rust_decoder(&p.ty).is_ok() {
             continue;
         }
@@ -6864,6 +6880,74 @@ mod tests {
         assert!(
             h.harness_rs.contains("recv.open_dir(&a0)"),
             "the materialized dir path is passed to the opener by reference:\n{}",
+            h.harness_rs
+        );
+    }
+
+    #[test]
+    fn in_crate_public_generic_byte_fn_resolves_without_the_flag_regressing() {
+        // #83 review item 2 (flag-OFF regression): a `pub fn parse<T: AsRef<[u8]>>`
+        // in a PRIVATE module reaches the in-crate resolver through the public-item/
+        // private-module fallback, INDEPENDENT of BHF_RUST_INCRATE_PRIVATE. The
+        // resolver must classify the MONOMORPHIZED param (`&[u8]`), not the raw `T`,
+        // so this target keeps resolving and generating a callable harness instead
+        // of being wrongly rejected as UnsupportedSetup (which would silently reduce
+        // existing Rust coverage with the flag unset).
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"k\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let lib = "mod inner { pub fn parse<T: AsRef<[u8]>>(data: T) -> u32 \
+                   { data.as_ref().len() as u32 } }\n";
+        std::fs::write(src.join("lib.rs"), lib).unwrap();
+        let fns = rust_parser::parse_rust_functions(lib).unwrap();
+        let target = fns.iter().find(|f| f.name == "parse").cloned().unwrap();
+        assert_eq!(target.visibility, rust_parser::RustVisibility::Pub);
+        assert!(
+            !target.type_params.is_empty(),
+            "parse must parse its generic T bound"
+        );
+
+        let manifest_dir = tmp.path();
+        let crate_root_src = read_crate_root_src(manifest_dir);
+        let resolved = resolve_in_crate_target(
+            lib,
+            &fns,
+            target,
+            manifest_dir,
+            "k",
+            &crate_root_src,
+            &["inner".to_owned()],
+            false,
+        )
+        .expect("a public generic byte-input fn in a private module must still resolve in-crate");
+        assert_eq!(resolved.build_mode, BuildMode::InCrate);
+        assert_eq!(resolved.call_path, vec!["crate", "inner", "parse"]);
+        assert!(
+            resolved.resource_recipe.is_none(),
+            "a byte-generic param is not a path resource"
+        );
+
+        let h = generate_rust_direct_harness(&GenerateRustDirectArgs {
+            call_path: resolved.call_path.clone(),
+            target: resolved.target.clone(),
+            receiver: resolved.receiver.clone(),
+            receiver_ctor_params: resolved.receiver_ctor_params.clone(),
+            receiver_unwrap: resolved.receiver_unwrap,
+            param_decoders: resolved.param_decoders.clone(),
+            receiver_ctor_param_decoders: resolved.receiver_ctor_param_decoders.clone(),
+            ufcs_trait: resolved.ufcs_trait.clone(),
+            method_trait_import: resolved.method_trait_import.clone(),
+            resource_recipe: resolved.resource_recipe.clone(),
+        })
+        .expect("harness generates for the monomorphized byte-input fn");
+        assert!(
+            h.harness_rs.contains("crate::inner::parse("),
+            "the private-module generic fn is called by its crate path:\n{}",
             h.harness_rs
         );
     }
