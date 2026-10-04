@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# §27.10 / #83 fixture: a crate-root PUBLIC type (`Database`) whose opener method
+# (`open_dir`) is NON-PUBLIC (`pub(crate)`) and takes a path-backed resource
+# (`dir: &Path`). An external dependent crate cannot call `open_dir` (E0603), and
+# the `&Path` param has no byte decoder — so the DEFAULT external lane can never
+# reach it. Only the opt-in IN-CRATE PRIVATE harness (`BHF_RUST_INCRATE_PRIVATE=1`),
+# injected as a module of a copy of this crate, reaches `crate::Database::open_dir`
+# AND materializes a bounded temp dir seeded with the fuzz input to pass to it. The
+# zoxide `Database::open_dir(dir: &Path)` shape. An empty `[workspace]` table
+# detaches it from the parent bhf workspace.
+
+[package]
+name = "rust_incrate_private_fixture"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "rust_incrate_private_fixture"
+path = "src/lib.rs"
+
+# Detach from any ancestor workspace.
+[workspace]

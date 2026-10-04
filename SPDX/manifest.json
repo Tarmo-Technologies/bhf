@@ -2223,6 +2223,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_rust_private_incrate.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_rust_reader_incrate.rs",
       "license": "Apache-2.0"
     },
@@ -5092,6 +5096,14 @@
     },
     {
       "path": "tests/fixtures/rust_incrate/src/lib.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/rust_incrate_private/Cargo.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/rust_incrate_private/src/lib.rs",
       "license": "Apache-2.0"
     },
     {
