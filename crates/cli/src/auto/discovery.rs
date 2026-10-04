@@ -2232,7 +2232,11 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
                     return record_discovery_drop(path, "rust", "parse", &format!("{error:?}"))
                 }
             };
-            for tgt in target_rank::rank_rust_targets(&fns) {
+            // #83: with the opt-in in-crate private lane enabled, ALSO rank
+            // `pub(crate)`/private items so the build lane can route them in-crate;
+            // off by default -> `rank_rust_targets` (pub-only), byte-identical.
+            let admit_non_pub = crate::auto::rust_build::incrate_private_enabled();
+            for tgt in target_rank::rank_rust_targets_with_opts(&fns, admit_non_pub) {
                 out.push(Candidate {
                     harness_id: stable_harness_id("H-R", path, tgt.line, &tgt.name),
                     lang: Lang::Rust,

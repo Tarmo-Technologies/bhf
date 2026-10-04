@@ -2375,6 +2375,16 @@ fn run_attempt(
                     harness_dir,
                 });
             }
+            // #83: the opt-in in-crate private lane admitted the target but had no
+            // resolvable resource recipe. A clean skip (like unsupported params),
+            // kept DISTINCT at the build layer so it never reads as a compile error.
+            crate::auto::rust_build::RustBuildResult::UnsupportedSetup { reason } => {
+                return Ok(AttemptResult {
+                    candidate: candidate.clone(),
+                    outcome: Outcome::UnsupportedParams { reason },
+                    harness_dir,
+                });
+            }
         }
     }
 

@@ -38,6 +38,43 @@ pub enum RustBuildResult {
     /// toolchain or an un-harnessable target (skip cleanly), false for a genuine
     /// build error worth surfacing.
     Failed { reason: String, skip: bool },
+    /// The opt-in in-crate private lane (#83) admitted the target but could not
+    /// resolve a bounded resource recipe to drive a non-byte-decodable param (a
+    /// path-backed resource it cannot materialize, or an unsupported in-crate
+    /// shape). Classified SEPARATELY from a generator/build failure: nothing was
+    /// built, no toolchain ran — the SETUP was unsupported. Treated as a clean skip
+    /// by the attempt loop, but kept distinct so reporting never conflates it with a
+    /// real compile error.
+    UnsupportedSetup { reason: String },
+}
+
+/// Reason-tag phrase marking a resolve failure as "unsupported in-crate setup"
+/// (#83) — no resolvable resource recipe for a non-byte-decodable param — rather
+/// than a generic un-harnessable skip or a build error. [`build_rust_harness`]
+/// maps a resolve `Err` carrying this phrase to [`RustBuildResult::UnsupportedSetup`].
+pub(crate) const UNSUPPORTED_SETUP_TAG: &str = "unsupported in-crate setup";
+
+/// True when a resolve failure reason is an [`UNSUPPORTED_SETUP_TAG`] setup failure
+/// (classified separately) rather than an ordinary skip / build failure.
+pub(crate) fn resolve_failure_is_unsupported_setup(reason: &str) -> bool {
+    reason.contains(UNSUPPORTED_SETUP_TAG)
+}
+
+/// Whether the opt-in in-crate PRIVATE harness lane (#83) is enabled. OFF by
+/// default (`BHF_RUST_INCRATE_PRIVATE` unset) so the Rust auto path is
+/// byte-identical; set to a truthy value (`1`/`true`/`yes`/`on`) to let the ranker
+/// admit `pub(crate)`/private methods and the build lane route them in-crate with a
+/// materialized path-backed resource. Follows the `BHF_*` env pattern
+/// ([`CargoTargetCleanup`]'s `BHF_KEEP_BUILD_ARTIFACTS`).
+pub(crate) fn incrate_private_enabled() -> bool {
+    std::env::var("BHF_RUST_INCRATE_PRIVATE")
+        .ok()
+        .is_some_and(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
 }
 
 /// The resolved nightly toolchain channel argument (`+nightly`, or a pinned
@@ -1602,6 +1639,10 @@ struct ResolvedTarget {
     /// path can't be resolved (the call stays bare — a prelude trait like Clone
     /// already works; anything else fails as before, no regression).
     method_trait_import: Option<Vec<String>>,
+    /// For an opt-in in-crate path-opener target (#83), the bounded resource recipe
+    /// that materializes a temp dir/file seeded with the fuzz input and binds its
+    /// path to a `&Path`/`PathBuf` param. `None` for every ordinary target.
+    resource_recipe: Option<harness_gen::rust_generate::ResourceRecipe>,
 }
 
 /// How an enum-typed param is wrapped: a bare `EnumName` (passed by value) or an
@@ -2497,6 +2538,29 @@ fn resolve_target(candidate: &Candidate) -> Result<ResolvedTarget, String> {
                     file_is_fuzz_target,
                 );
             }
+            // #83: the opt-in in-crate PRIVATE lane. A NON-`pub` (pub(crate)/private)
+            // method or free fn is unreachable from an external dependent crate
+            // (E0603) even when its enclosing type is reachable at the crate root, so
+            // route it to the in-crate build — a harness injected as a module of a
+            // copy of the crate reaches it by its `crate::...` path. Gated behind the
+            // env flag (off by default => the block never runs, default path
+            // byte-identical); a trait-impl method is left to the paths above (no
+            // in-crate trait synthesis yet).
+            if incrate_private_enabled()
+                && !matches!(target.visibility, rust_parser::RustVisibility::Pub)
+                && target.impl_trait.is_none()
+            {
+                return resolve_in_crate_target(
+                    &source,
+                    &fns,
+                    target,
+                    &manifest_dir,
+                    &crate_name,
+                    &crate_root_src,
+                    &module,
+                    file_is_fuzz_target,
+                );
+            }
             // Build the call path. Prefer the crate-root re-export façade over the
             // defining module path: crates routinely define a type/fn in a PRIVATE
             // `mod inner;` and surface it with `pub use inner::Thing;`, so
@@ -2733,6 +2797,7 @@ fn resolve_target(candidate: &Candidate) -> Result<ResolvedTarget, String> {
                 receiver_ctor_param_decoders,
                 ufcs_trait,
                 method_trait_import,
+                resource_recipe: None,
             })
         }
         None => Err(format!(
@@ -2839,6 +2904,7 @@ fn resolve_reader_trait_method(
         receiver_ctor_param_decoders,
         ufcs_trait: None,
         method_trait_import,
+        resource_recipe: None,
     })
 }
 
@@ -2940,6 +3006,44 @@ fn resolve_in_crate_target(
         crate_name,
         crate_root_src,
     );
+    // #83: classify the target's params. A byte-decodable param decodes natively. A
+    // `&Path`/`PathBuf` param is driven by a bounded, path-backed RESOURCE RECIPE (a
+    // temp dir/file seeded with the fuzz input) rather than by fuzzing path bytes —
+    // fuzzing `Path` bytes would only fabricate paths, never a reachable resource.
+    // Any OTHER undecodable param means there is no resolvable setup for this
+    // in-crate target -> a DISTINCT unsupported-setup skip (classified separately
+    // from a generator/build failure).
+    let mut resource_recipe: Option<harness_gen::rust_generate::ResourceRecipe> = None;
+    for (i, p) in target.params.iter().enumerate() {
+        if harness_gen::rust_decoders::select_rust_decoder(&p.ty).is_ok() {
+            continue;
+        }
+        match path_opener_recipe(&p.name, &p.ty) {
+            Some((arg_pass, seed_file)) => {
+                if resource_recipe.is_some() {
+                    return Err(format!(
+                        "Rust target '{}' ({UNSUPPORTED_SETUP_TAG}): needs more than one \
+                         path-backed resource, which the in-crate recipe does not support; \
+                         skipped",
+                        target.name
+                    ));
+                }
+                resource_recipe = Some(harness_gen::rust_generate::ResourceRecipe {
+                    param_index: i,
+                    arg_pass,
+                    seed_file,
+                });
+            }
+            None => {
+                return Err(format!(
+                    "Rust target '{}' ({UNSUPPORTED_SETUP_TAG}): parameter `{}: {}` is neither \
+                     byte-decodable nor a path-backed resource the recipe can materialize; \
+                     skipped",
+                    target.name, p.name, p.ty
+                ));
+            }
+        }
+    }
     Ok(ResolvedTarget {
         call_path,
         target,
@@ -2950,12 +3054,56 @@ fn resolve_in_crate_target(
         receiver,
         receiver_ctor_params,
         receiver_unwrap,
-        // In-crate mode uses only native decoders (no `crate`-rooted overrides).
+        // In-crate mode uses only native decoders + an optional path-resource recipe
+        // (no `crate`-rooted enum/const overrides).
         param_decoders: Vec::new(),
         receiver_ctor_param_decoders: Vec::new(),
         ufcs_trait: None,
         method_trait_import: None,
+        resource_recipe,
     })
+}
+
+/// If a parameter is a path-backed resource opener (`&Path`/`&PathBuf`/`PathBuf`),
+/// the [`ArgPass`](harness_gen::rust_decoders::ArgPass) it wants and the seed-file
+/// name to materialize. A DIRECTORY opener (param named like a dir) seeds `<dir>/db`
+/// and receives the DIRECTORY path; a FILE opener receives a seed FILE path written
+/// with the fuzz input directly. `None` for any non-path type (and for a bare owned
+/// `Path`, which is unsized and not constructible).
+fn path_opener_recipe(
+    param_name: &str,
+    ty: &str,
+) -> Option<(harness_gen::rust_decoders::ArgPass, Option<String>)> {
+    use harness_gen::rust_decoders::ArgPass;
+    // Erase a leading reference lifetime BEFORE collapsing whitespace, else the
+    // lifetime ident glues onto the type (`&'a Path` -> `&'aPath`, unrecoverable).
+    let trimmed = ty.trim();
+    let delifetimed = if let Some(rest) = trimmed.strip_prefix("&'") {
+        let cut = rest
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        format!("&{}", &rest[cut..]) // `&'a Path` -> `& Path`
+    } else {
+        trimmed.to_owned()
+    };
+    let compact: String = delifetimed.chars().filter(|c| !c.is_whitespace()).collect();
+    let (arg_pass, body) = match compact.strip_prefix('&') {
+        Some(inner) => (ArgPass::Ref, inner.to_owned()),
+        None => (ArgPass::Move, compact.clone()),
+    };
+    let leaf = body.rsplit("::").next().unwrap_or(&body);
+    if leaf != "Path" && leaf != "PathBuf" {
+        return None;
+    }
+    // A bare owned `Path` is unsized (not a constructible by-value arg) — only a
+    // reference (`&Path`) or an owned `PathBuf` is drivable.
+    if leaf == "Path" && arg_pass != ArgPass::Ref {
+        return None;
+    }
+    let name = param_name.to_ascii_lowercase();
+    let is_dir = name.contains("dir") || name == "root" || name == "base";
+    let seed_file = if is_dir { Some("db".to_owned()) } else { None };
+    Some((arg_pass, seed_file))
 }
 
 /// Locate the `c_runtime` directory (which holds `bhf_driver.c` +
@@ -3111,6 +3259,11 @@ pub fn build_rust_harness(
 
     let resolved = match resolve_target(candidate) {
         Ok(r) => r,
+        // #83: a no-resolvable-resource-recipe failure is an UNSUPPORTED SETUP,
+        // classified separately from a generic un-harnessable skip or a build error.
+        Err(reason) if resolve_failure_is_unsupported_setup(&reason) => {
+            return RustBuildResult::UnsupportedSetup { reason }
+        }
         Err(reason) => return RustBuildResult::Failed { reason, skip: true },
     };
 
@@ -3146,6 +3299,7 @@ pub fn build_rust_harness(
             receiver_ctor_param_decoders: resolved.receiver_ctor_param_decoders.clone(),
             ufcs_trait: resolved.ufcs_trait.clone(),
             method_trait_import: resolved.method_trait_import.clone(),
+            resource_recipe: resolved.resource_recipe.clone(),
         }) {
             Ok(h) => h,
             Err(e) => {
@@ -3483,6 +3637,14 @@ fn build_in_crate(
         };
     }
 
+    // #83: record the resource assumption as a RETAINED artifact beside the harness
+    // (persists; unlike `incrate/target`, which is RAII-cleaned). A path-opener
+    // finding assumes the target trusts a file under the passed, bhf-materialized
+    // path — the artifact makes that assumption auditable with the crash.
+    if let Some(recipe) = resolved.resource_recipe.as_ref() {
+        write_resource_assumption(&auto_dir, resolved, recipe);
+    }
+
     // Copy the target crate's source (excluding build/VCS dirs) into the work tree
     // so we never mutate the user's checkout.
     let _ = std::fs::remove_dir_all(&crate_copy);
@@ -3522,16 +3684,16 @@ fn build_in_crate(
     // via `#![cfg_attr(not(feature = "simd"), forbid(unsafe_code))]`) can't host the
     // in-crate harness — which needs `#[no_mangle]` (now an unsafe attribute) + an
     // `unsafe` FFI block — and `forbid` is NOT overridable by an inner `#[allow]`.
-    // Skip cleanly rather than inject a module that fails to compile with
-    // "declaration of a `no_mangle` function" / "usage of an `unsafe` block" (the
-    // external-API lane still applies).
+    // Classify as an UNSUPPORTED SETUP (not a build failure): nothing was built, the
+    // crate's own `forbid` makes the in-crate harness uninjectable (the external-API
+    // lane still applies). Kept distinct from a real compile error (#83 req 4).
     if forbids_unsafe_code(&lib_text) {
-        return RustBuildResult::Failed {
-            reason: "in-crate build: target crate forbids unsafe code \
-                     (`forbid(unsafe_code)`, possibly via `cfg_attr`); the injected harness \
-                     needs no_mangle + unsafe FFI which forbid disallows — skipped"
-                .to_owned(),
-            skip: true,
+        return RustBuildResult::UnsupportedSetup {
+            reason: format!(
+                "in-crate build ({UNSUPPORTED_SETUP_TAG}): target crate forbids unsafe code \
+                 (`forbid(unsafe_code)`, possibly via `cfg_attr`); the injected harness \
+                 needs no_mangle + unsafe FFI which forbid disallows — skipped"
+            ),
         };
     }
 
@@ -3840,6 +4002,39 @@ fn attr_forbids_unsafe_code(line: &str) -> bool {
 /// edition-2021 crate and is unaffected (it keeps using `harness_rs` verbatim).
 fn incrate_harness_with_unsafe_no_mangle(harness_rs: &str) -> String {
     harness_rs.replace("#[no_mangle]", "#[unsafe(no_mangle)]")
+}
+
+/// Write the #83 resource-assumption artifact (`resource_recipe.json`) beside the
+/// in-crate harness. Best effort: a write failure must never fail the build (the
+/// artifact is diagnostic, not load-bearing).
+fn write_resource_assumption(
+    auto_dir: &Path,
+    resolved: &ResolvedTarget,
+    recipe: &harness_gen::rust_generate::ResourceRecipe,
+) {
+    let param = resolved
+        .target
+        .params
+        .get(recipe.param_index)
+        .map(|p| format!("{}: {}", p.name, p.ty))
+        .unwrap_or_default();
+    let kind = match &recipe.seed_file {
+        Some(name) => format!("directory opener; a temp dir is seeded with `{name}` = fuzz input"),
+        None => "file opener; a temp file is written with the fuzz input".to_owned(),
+    };
+    let json = format!(
+        "{{\n  \"schema\": \"bhf.resource_recipe.v1\",\n  \
+         \"target\": {:?},\n  \"path_param\": {:?},\n  \"param_index\": {},\n  \
+         \"kind\": {:?},\n  \"assumption\": \"The fuzzed path points at a bhf-materialized, \
+         bounded temp resource under the harness binary's own directory (RAII-removed after \
+         each call). A finding assumes the target trusts a file beneath the passed path; the \
+         fuzz input reaches the target through that file, not through fabricated path bytes.\"\n}}\n",
+        resolved.call_path.join("::"),
+        param,
+        recipe.param_index,
+        kind,
+    );
+    let _ = std::fs::write(auto_dir.join("resource_recipe.json"), json);
 }
 
 /// The base field name of a workspace-INHERITED package-field line, if any: matches
@@ -6539,6 +6734,189 @@ mod tests {
     }
 
     #[test]
+    fn path_opener_recipe_classifies_path_types_and_dir_vs_file() {
+        use harness_gen::rust_decoders::ArgPass;
+        // A directory param (name contains "dir") -> seed `<dir>/db`, pass the dir by
+        // reference (`&Path` coerces from `&PathBuf`).
+        assert_eq!(
+            path_opener_recipe("dir", "&Path"),
+            Some((ArgPass::Ref, Some("db".to_owned())))
+        );
+        assert_eq!(
+            path_opener_recipe("data_dir", "&std::path::Path"),
+            Some((ArgPass::Ref, Some("db".to_owned())))
+        );
+        // A lifetime on the reference is erased.
+        assert_eq!(
+            path_opener_recipe("dir", "&'a Path"),
+            Some((ArgPass::Ref, Some("db".to_owned())))
+        );
+        // A FILE param (not a dir name) receives a seed file path directly.
+        assert_eq!(
+            path_opener_recipe("path", "&Path"),
+            Some((ArgPass::Ref, None))
+        );
+        // Owned `PathBuf` is moved; `&PathBuf` is borrowed.
+        assert_eq!(
+            path_opener_recipe("p", "PathBuf"),
+            Some((ArgPass::Move, None))
+        );
+        assert_eq!(
+            path_opener_recipe("p", "&PathBuf"),
+            Some((ArgPass::Ref, None))
+        );
+        // A bare owned `Path` is unsized / not constructible -> not a recipe.
+        assert_eq!(path_opener_recipe("p", "Path"), None);
+        // Non-path types are never a recipe.
+        assert_eq!(path_opener_recipe("d", "&[u8]"), None);
+        assert_eq!(path_opener_recipe("s", "&str"), None);
+        assert_eq!(path_opener_recipe("n", "u32"), None);
+    }
+
+    /// Write a crate-root fixture with a `pub` type and a NON-PUB method, returning
+    /// the tempdir, the parsed fns, and the lib source.
+    fn write_crate_root_fixture(
+        method: &str,
+    ) -> (tempfile::TempDir, String, Vec<rust_parser::RustFn>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"k\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let lib = format!(
+            "use std::path::Path;\n\
+             pub struct Database {{ n: usize }}\n\
+             impl Database {{\n\
+                 pub fn new() -> Self {{ Database {{ n: 0 }} }}\n\
+                 {method}\n\
+             }}\n"
+        );
+        std::fs::write(src.join("lib.rs"), &lib).unwrap();
+        let fns = rust_parser::parse_rust_functions(&lib).unwrap();
+        (tmp, lib, fns)
+    }
+
+    #[test]
+    fn in_crate_private_path_opener_builds_resource_recipe() {
+        // #83: a `pub(crate)` method on a crate-root type that opens a path-backed
+        // resource (`dir: &Path`) resolves IN-CRATE with a `crate::`-rooted path, a
+        // crate-rooted receiver ctor, and a DIRECTORY resource recipe on param 0.
+        let (tmp, source, fns) = write_crate_root_fixture(
+            "pub(crate) fn open_dir(&mut self, dir: &Path) -> u32 { let _ = dir; 0 }",
+        );
+        let manifest_dir = tmp.path();
+        let crate_root_src = read_crate_root_src(manifest_dir);
+        let module = module_path(manifest_dir, &manifest_dir.join("src/lib.rs"));
+        assert!(module.is_empty(), "lib.rs target has an empty module path");
+        let target = fns.iter().find(|f| f.name == "open_dir").cloned().unwrap();
+        assert_eq!(target.visibility, rust_parser::RustVisibility::PubCrate);
+
+        let resolved = resolve_in_crate_target(
+            &source,
+            &fns,
+            target,
+            manifest_dir,
+            "k",
+            &crate_root_src,
+            &module,
+            false,
+        )
+        .expect("private path-opener resolves in-crate");
+
+        assert_eq!(resolved.build_mode, BuildMode::InCrate);
+        assert_eq!(resolved.call_path, vec!["crate", "Database", "open_dir"]);
+        assert_eq!(
+            resolved.receiver.as_deref(),
+            Some(["crate", "Database", "new"].map(str::to_owned).as_slice())
+        );
+        let recipe = resolved
+            .resource_recipe
+            .as_ref()
+            .expect("a path opener must get a resource recipe");
+        assert_eq!(recipe.param_index, 0);
+        assert_eq!(recipe.arg_pass, harness_gen::rust_decoders::ArgPass::Ref);
+        assert_eq!(recipe.seed_file.as_deref(), Some("db"));
+
+        // The generated harness reaches the private path + materializes/seeds the
+        // resource, and never tries to byte-decode the `&Path`.
+        let h = generate_rust_direct_harness(&GenerateRustDirectArgs {
+            call_path: resolved.call_path.clone(),
+            target: resolved.target.clone(),
+            receiver: resolved.receiver.clone(),
+            receiver_ctor_params: resolved.receiver_ctor_params.clone(),
+            receiver_unwrap: resolved.receiver_unwrap,
+            param_decoders: resolved.param_decoders.clone(),
+            receiver_ctor_param_decoders: resolved.receiver_ctor_param_decoders.clone(),
+            ufcs_trait: resolved.ufcs_trait.clone(),
+            method_trait_import: resolved.method_trait_import.clone(),
+            resource_recipe: resolved.resource_recipe.clone(),
+        })
+        .expect("harness generates");
+        assert!(
+            h.harness_rs
+                .contains("std::fs::write(__bhf_res_dir.join(\"db\"), c.rest_bytes())"),
+            "harness seeds <dir>/db with the fuzz input:\n{}",
+            h.harness_rs
+        );
+        assert!(
+            h.harness_rs.contains("recv.open_dir(&a0)"),
+            "the materialized dir path is passed to the opener by reference:\n{}",
+            h.harness_rs
+        );
+    }
+
+    #[test]
+    fn in_crate_undecodable_param_is_unsupported_setup_not_a_build_failure() {
+        // #83 acceptance: an in-crate private target whose param is NEITHER
+        // byte-decodable NOR a path resource is classified as an UNSUPPORTED SETUP,
+        // kept DISTINCT from a generator/build failure. A path-opener sibling is NOT.
+        let (tmp, source, fns) = write_crate_root_fixture(
+            "pub(crate) fn ingest(&mut self, cfg: Config) -> u32 { let _ = cfg; 0 }",
+        );
+        let manifest_dir = tmp.path();
+        let crate_root_src = read_crate_root_src(manifest_dir);
+        let module = module_path(manifest_dir, &manifest_dir.join("src/lib.rs"));
+        let target = fns.iter().find(|f| f.name == "ingest").cloned().unwrap();
+        let err = resolve_in_crate_target(
+            &source,
+            &fns,
+            target,
+            manifest_dir,
+            "k",
+            &crate_root_src,
+            &module,
+            false,
+        )
+        .expect_err("an undecodable non-path param has no resolvable setup");
+        assert!(
+            resolve_failure_is_unsupported_setup(&err),
+            "must be tagged as unsupported setup: {err}"
+        );
+
+        // By contrast, an ordinary skip reason (not a setup failure) is NOT tagged —
+        // so the classifier keeps the two buckets distinct.
+        let generic = "Rust target 'x' is a &self method and no no-arg receiver \
+                       constructor was found; not auto-harnessable";
+        assert!(!resolve_failure_is_unsupported_setup(generic), "{generic}");
+    }
+
+    #[test]
+    fn incrate_private_flag_is_off_by_default() {
+        // The default path never enables the opt-in lane unless the env flag is a
+        // truthy value; a stray non-truthy value is also off.
+        std::env::remove_var("BHF_RUST_INCRATE_PRIVATE");
+        assert!(!incrate_private_enabled());
+        std::env::set_var("BHF_RUST_INCRATE_PRIVATE", "0");
+        assert!(!incrate_private_enabled());
+        std::env::set_var("BHF_RUST_INCRATE_PRIVATE", "1");
+        assert!(incrate_private_enabled());
+        std::env::remove_var("BHF_RUST_INCRATE_PRIVATE");
+    }
+
+    #[test]
     fn resolve_target_skips_unsafe_fn_primary_target() {
         // json-rust shape: `pub unsafe fn Short::from_slice(s: &str) -> Short` is
         // documented with a `s.len() <= 30` safety precondition. Feeding it the full
@@ -6681,6 +7059,7 @@ mod tests {
             receiver_ctor_param_decoders: resolved.receiver_ctor_param_decoders.clone(),
             ufcs_trait: resolved.ufcs_trait.clone(),
             method_trait_import: resolved.method_trait_import.clone(),
+            resource_recipe: resolved.resource_recipe.clone(),
         })
         .unwrap();
         apply_mined_rust_protocol(&mut harness, &candidate, &resolved).unwrap();

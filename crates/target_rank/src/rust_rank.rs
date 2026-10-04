@@ -37,6 +37,12 @@ pub struct RustTarget {
     pub is_static: bool,
     /// `#[cfg(...)]` guard carried through for the `Candidate`.
     pub foreign_guard: Option<String>,
+    /// The item's source visibility, carried through for honest reporting and so a
+    /// NON-`Pub` item admitted under the opt-in in-crate private lane (#83) can be
+    /// recognised downstream. `Pub` for every item in the default (flag-off) path.
+    /// Not serialized (`RustVisibility` is a plain parser enum without serde).
+    #[serde(skip)]
+    pub visibility: RustVisibility,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize)]
@@ -70,15 +76,29 @@ pub struct RustScoreBreakdown {
     pub total: i32,
 }
 
-/// Rank the `pub`/`pub(crate)` functions in `functions`, dropping private fns.
-/// Returns targets sorted by score descending, ties broken by name then line.
+/// Rank the externally-reachable `pub` functions in `functions`, dropping
+/// `pub(crate)`/private fns. Returns targets sorted by score descending, ties
+/// broken by name then line. This is the DEFAULT entry point — byte-identical to
+/// before; [`rank_rust_targets_with_opts`] with `admit_non_pub = false`.
 pub fn rank_rust_targets(functions: &[RustFn]) -> Vec<RustTarget> {
+    rank_rust_targets_with_opts(functions, false)
+}
+
+/// Rank Rust discovery targets. With `admit_non_pub = false` (the default) only
+/// externally-reachable `pub` items are kept — the separate-staticlib harness can
+/// call nothing else. With `admit_non_pub = true` (the opt-in in-crate private
+/// lane, #83) `pub(crate)`/private items are ALSO ranked, because an in-crate
+/// harness injected as a module of a copy of the crate reaches them by their
+/// `crate::...` path; the build lane then routes them in-crate (or skips cleanly).
+pub fn rank_rust_targets_with_opts(functions: &[RustFn], admit_non_pub: bool) -> Vec<RustTarget> {
     let mut targets: Vec<RustTarget> = functions
         .iter()
         .filter(|f| {
             // RC9: drop `#[cfg(test)]` fns — test helpers, not the public API, and
             // they don't exist in a normal build (they'd crowd out real targets).
-            is_rankable_visibility(f.visibility) && !f.doc_hidden && !is_cfg_test(&f.foreign_guard)
+            is_rankable_visibility(f.visibility, admit_non_pub)
+                && !f.doc_hidden
+                && !is_cfg_test(&f.foreign_guard)
         })
         .map(|f| {
             let (breakdown, input_reachability) = score_rust_function(f);
@@ -90,6 +110,7 @@ pub fn rank_rust_targets(functions: &[RustFn]) -> Vec<RustTarget> {
                 input_reachability,
                 is_static: f.is_static,
                 foreign_guard: f.foreign_guard.clone(),
+                visibility: f.visibility,
             }
         })
         .collect();
@@ -97,12 +118,16 @@ pub fn rank_rust_targets(functions: &[RustFn]) -> Vec<RustTarget> {
     targets
 }
 
-/// Only externally-reachable API is rankable. The generated harness is a SEPARATE
-/// crate that path-depends on the target, so it can call ONLY `pub` items —
-/// `pub(crate)` / `pub(super)` / `pub(in ...)` are crate-internal and would only
-/// yield a `failed_build` ("associated function is private" / "module is private").
-fn is_rankable_visibility(v: RustVisibility) -> bool {
-    matches!(v, RustVisibility::Pub)
+/// Whether an item of visibility `v` is rankable. By default only externally-
+/// reachable `pub` API is: the generated harness is a SEPARATE crate that
+/// path-depends on the target, so it can call ONLY `pub` items — `pub(crate)` /
+/// `pub(super)` / `pub(in ...)` / private are crate-internal and would only yield a
+/// `failed_build` ("associated function is private" / "module is private"). When
+/// `admit_non_pub` is set (the opt-in in-crate private lane, #83) the non-`pub`
+/// items become rankable too — the build lane reaches them via an injected in-crate
+/// `crate::...` harness.
+fn is_rankable_visibility(v: RustVisibility, admit_non_pub: bool) -> bool {
+    matches!(v, RustVisibility::Pub) || admit_non_pub
 }
 
 /// True when a `#[cfg(...)]` guard is TEST-EXCLUSIVE — the item exists ONLY under
@@ -516,6 +541,60 @@ mod tests {
         let ranked = rank_rust_targets(&[internal, public]);
         assert_eq!(ranked.len(), 1);
         assert_eq!(ranked[0].name, "parse_public");
+    }
+
+    #[test]
+    fn non_pub_admitted_and_visibility_carried_under_opt_in() {
+        // #83: with the in-crate private lane opted in, a `pub(crate)` and a private
+        // method are ranked (not dropped), and the ranked target carries the source
+        // visibility through so the build lane can route them in-crate.
+        let mut pc = rf("open_dir", &[("d", "&[u8]")]);
+        pc.is_static = false;
+        pc.visibility = RustVisibility::PubCrate;
+        let mut priv_m = rf("read_db", &[("d", "&[u8]")]);
+        priv_m.is_static = false;
+        priv_m.visibility = RustVisibility::Private;
+        let public = rf("parse_public", &[("d", "&[u8]")]);
+
+        // Default (flag off) drops both non-pub items — byte-identical to before.
+        let default = rank_rust_targets(&[pc.clone(), priv_m.clone(), public.clone()]);
+        assert_eq!(default.len(), 1);
+        assert_eq!(default[0].name, "parse_public");
+        assert_eq!(default[0].visibility, RustVisibility::Pub);
+
+        // Opt-in admits all three and carries each item's visibility.
+        let admitted = rank_rust_targets_with_opts(&[pc, priv_m, public], true);
+        assert_eq!(admitted.len(), 3);
+        assert_eq!(
+            by_name(&admitted, "open_dir").visibility,
+            RustVisibility::PubCrate
+        );
+        assert_eq!(
+            by_name(&admitted, "read_db").visibility,
+            RustVisibility::Private
+        );
+        assert_eq!(
+            by_name(&admitted, "parse_public").visibility,
+            RustVisibility::Pub
+        );
+    }
+
+    #[test]
+    fn opt_in_still_drops_cfg_test_and_doc_hidden() {
+        // The opt-in relaxes ONLY visibility: a `#[cfg(test)]` helper and a
+        // `#[doc(hidden)]` item are still dropped even when non-pub is admitted.
+        let mut test_only = rf("qc", &[("d", "&[u8]")]);
+        test_only.visibility = RustVisibility::PubCrate;
+        test_only.foreign_guard = Some("test".to_owned());
+        let mut hidden = rf("internal_unchecked", &[("d", "&[u8]")]);
+        hidden.visibility = RustVisibility::Private;
+        hidden.doc_hidden = true;
+        let ranked = rank_rust_targets_with_opts(&[test_only, hidden], true);
+        assert_eq!(
+            ranked.len(),
+            0,
+            "cfg(test)/doc(hidden) stay dropped: {ranked:?}"
+        );
     }
 
     #[test]
