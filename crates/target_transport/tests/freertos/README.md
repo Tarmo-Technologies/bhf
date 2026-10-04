@@ -23,11 +23,22 @@ live here.
   coverage (verified by a direct run under gdb: the `consumer` task executes,
   the `0x75C0` task marker + branch crumbs appear in the coverage ring).
 - **Gated / in progress** (`BHF_RTOS_FULL=1`): the full per-input fuzz drive
-  (run to the harness-done stop, classify, reset) is not yet green — the
-  transport's `continue` does not yet observe the harness-done stop for this
-  FreeRTOS image under `loadvm`, a backend nuance to resolve. This is the
-  remaining actual-RTOS validation step; it is gated rather than asserted
-  unvalidated, consistent with the roadmap's RTOS stance.
+  (run to the harness-done stop, classify, reset) is not yet green. Two concrete
+  follow-ups remain (isolated during bring-up):
+  1. **Harness-done stop not observed.** A gdb/Z0 breakpoint at `harness_done`
+     does not stop this FreeRTOS guest under `continue` (even without
+     `savevm`/`loadvm`), though a direct free-run reaches the consumer and emits
+     coverage. `harness_done` is now `noinline` (so it is a real call target),
+     but the stop still needs debugging (breakpoint vs. the Cortex-M3 boot /
+     scheduler-start path under QEMU TCG).
+  2. **Input survives reset.** Unlike the bare-metal fixture, this startup must
+     zero `.bss` and init `.data` (FreeRTOS requires it), which overwrites the
+     transport's post-`loadvm` write to `bhf_input`. Move `bhf_input` into a
+     `.noinit` section the startup does not clear so the delivered input
+     survives the boot.
+
+  Gated rather than asserted unvalidated, consistent with the roadmap's RTOS
+  stance; this is the remaining actual-RTOS validation step.
 
 ## What it demonstrates (target contract)
 

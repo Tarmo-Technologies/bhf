@@ -24,7 +24,10 @@ volatile uint8_t  bhf_input[64];
 volatile uint32_t bhf_fault_flag = 0;   /* #72 fault-status word */
 volatile uint32_t bhf_task_id    = 0;   /* #84 current-task identity observation */
 
-void harness_done(void){ for(;;){} }    /* host plants a gdb breakpoint here */
+/* The host plants a gdb breakpoint at this symbol, so it must NOT be inlined
+ * into its callers (otherwise the breakpoint address is never executed and the
+ * run-control `continue` never stops). */
+__attribute__((noinline, used)) void harness_done(void){ for(;;){} }
 
 void HardFault_Handler(void){
   emit_crumb(0xFA17);
