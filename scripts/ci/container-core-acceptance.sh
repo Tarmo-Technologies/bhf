@@ -74,4 +74,5 @@ grep -Fq "$commit" "$evidence/daemon-version.log"
 # Reconcile the filesystem and compiled Cargo inventory; retain the DB-bound scan.
 bash scripts/ci/container-runtime-acceptance.sh "$image_id" "$evidence"
 bash scripts/ci/inventory-image.sh "$image_id" "$evidence"
+python3 scripts/ci/review-image-scan.py "$evidence"
 python3 scripts/ci/container-evidence.py record "$evidence"

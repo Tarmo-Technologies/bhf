@@ -171,23 +171,29 @@ RUN curl --proto '=https' --tlsv1.2 -fsSLo /tmp/maven.tgz https://archive.apache
 COPY docker/python-build-tools.txt /usr/local/share/bhf/python-build-tools.txt
 RUN python3 -m pip install --break-system-packages --ignore-installed --no-cache-dir --no-deps --require-hashes \
       -r /usr/local/share/bhf/python-build-tools.txt \
-    && rm -rf /usr/lib/python3/dist-packages/setuptools* /usr/lib/python3/dist-packages/pkg_resources* \
+    && rm -rf /usr/lib/python3/dist-packages/pip* \
+              /usr/lib/python3/dist-packages/setuptools* /usr/lib/python3/dist-packages/pkg_resources* \
               /usr/lib/python3/dist-packages/wheel* /usr/lib/python3/dist-packages/packaging* \
+    && python3 -m pip --version \
     && python3 -c 'import setuptools, wheel, packaging; assert setuptools.__version__ == "84.0.0"; assert wheel.__version__ == "0.48.0"'
 
-# Ruby ships default gems that carry advisories (erb, net-imap, zlib). Update them
-# so the interpreter loads the patched versions, and for `erb` (self-contained,
-# pure-Ruby, the only High) remove the superseded bundled copy so nothing — runtime
-# or scanner — sees the old version. bhf's Ruby lane fuzzes target code and does not
-# invoke these gems, so any residual is not in its execution path (see ato.md).
-RUN set -eu; gem install --no-document erb:6.0.7 net-imap:0.6.7 zlib:3.2.3 rexml:3.4.4 webrick:1.9.2; \
+# Pin reviewed Ruby component versions and remove superseded installed copies,
+# including default-gem files and specifications. Keep the patched components
+# usable by the interpreter and retain their licenses and source in the image.
+RUN set -eu; gem install --no-document erb:6.0.7 net-imap:0.6.7 zlib:3.2.3 rexml:3.4.4 webrick:1.9.2 cgi:0.5.2 resolv:0.7.2; \
     gem uninstall --install-dir /usr/lib/ruby/gems/3.2.0 --ignore-dependencies --executables net-imap -v 0.3.4.1; \
     gem uninstall --install-dir /usr/lib/ruby/gems/3.2.0 --ignore-dependencies --executables rexml -v 3.2.5; \
     gem uninstall --install-dir /usr/share/rubygems-integration/all --ignore-dependencies --executables webrick -v 1.8.1; \
     rubylib="$(ruby -e 'puts RbConfig::CONFIG["rubylibdir"]')"; \
+    rubyarch="$(ruby -e 'puts RbConfig::CONFIG["archdir"]')"; \
     defdir="$(ruby -e 'require "rubygems"; puts Gem.default_specifications_dir')"; \
     rm -f "$rubylib/erb.rb" "$defdir"/erb-*.gemspec; rm -rf "$rubylib/erb" /root/.local/share/gem /root/.gem; \
+    rm -f "$rubylib/cgi.rb" "$rubylib/resolv.rb" "$rubyarch/zlib.so" \
+          "$defdir"/cgi-*.gemspec "$defdir"/resolv-*.gemspec "$defdir"/zlib-*.gemspec; \
+    rm -rf "$rubylib/cgi" "$rubyarch/cgi" /usr/lib/ruby/gems/3.2.0/gems/cgi-0.3.6 \
+           /usr/lib/ruby/gems/3.2.0/gems/resolv-0.2.2 /usr/lib/ruby/gems/3.2.0/gems/zlib-3.0.0; \
     ruby -e 'require "erb"; require "json"; require "net/imap"; require "zlib"; abort("erb not patched") unless Gem::Version.new(ERB.version) >= Gem::Version.new("6")' \
+    && ruby -e 'require "cgi"; require "resolv"; require "zlib"; {"cgi"=>"0.5.2", "resolv"=>"0.7.2", "zlib"=>"3.2.3"}.each { |n,v| abort("incorrect loaded gem: " + n) unless Gem.loaded_specs[n].version.to_s == v }' \
     && echo "erb runtime $(ruby -e 'require "erb"; puts ERB.version')"
 
 ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 \

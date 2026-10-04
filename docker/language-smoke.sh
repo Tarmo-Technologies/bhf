@@ -53,4 +53,4 @@ printf '%s\n' 'const result: string = "TypeScript ready"; console.log(result);' 
 esbuild smoke.ts --platform=node --outfile=smoke.js && node smoke.js
 lua5.4 -e 'print("Lua ready")'
 php -r 'echo "PHP ready\n";'
-ruby -e 'require "rexml/document"; require "net/imap"; require "webrick"; require "zlib"; puts "Ruby ready"'
+ruby -e 'require "rexml/document"; require "net/imap"; require "webrick"; require "zlib"; require "cgi"; require "resolv"; abort unless CGI.escape("<") == "%3C" && Resolv::IPv4.create("127.0.0.1").to_s == "127.0.0.1"; {"cgi"=>"0.5.2", "resolv"=>"0.7.2", "zlib"=>"3.2.3"}.each { |n,v| abort("incorrect loaded gem: " + n) unless Gem.loaded_specs[n].version.to_s == v }; puts "Ruby ready"'
