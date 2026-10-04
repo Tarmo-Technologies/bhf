@@ -162,6 +162,45 @@ pub fn fault_report(fault: &Fault) -> corpus::SanitizerReport {
     crash_report(class.rule_id, class.kind, message)
 }
 
+/// Build a BHF-555 timing finding for a completed-but-too-slow transport run
+/// (its host-observed execution time exceeded the configured `--deadline`).
+///
+/// This is the transport lane's deadline oracle (#70): the input ran to
+/// completion but took longer than `deadline`, which is a CWE-400 timing /
+/// availability finding rather than a memory crash. The message states the
+/// timing is host-observed round-trip, so the provenance is not overstated.
+pub fn deadline_report(
+    elapsed: std::time::Duration,
+    deadline: std::time::Duration,
+) -> corpus::SanitizerReport {
+    crash_report(
+        "BHF-555",
+        "transport-deadline-exceeded".to_owned(),
+        format!(
+            "target transport completed but its host-observed execution time {}ms exceeded \
+             the configured deadline {}ms — a timing/availability finding",
+            elapsed.as_millis(),
+            deadline.as_millis()
+        ),
+    )
+}
+
+/// Build a BHF-555 timing finding for an input that did not answer within the
+/// configured per-input bound — a target execution timeout (hang), recorded
+/// before the campaign stops so the triggering input is preserved (#70). This
+/// is a distinct, non-clean outcome from both a clean run and a lost transport.
+pub fn timeout_report(bound: std::time::Duration) -> corpus::SanitizerReport {
+    crash_report(
+        "BHF-555",
+        "transport-execution-timeout".to_owned(),
+        format!(
+            "target transport did not answer within the configured per-input bound {}ms — \
+             a target execution timeout (hang)",
+            bound.as_millis()
+        ),
+    )
+}
+
 /// Turn a transport [`RunOutcome`] into a replayable finding, or `None` for a
 /// clean run.
 ///
