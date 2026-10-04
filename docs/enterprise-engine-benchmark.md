@@ -1,6 +1,31 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Engine comparison: evidence and benchmark plan
 
+## Supported niche and the two separate experiments
+
+bhf's effectiveness evidence is split into two experiments that must not be
+merged into one headline (issue #85); both are documented, with their schemas,
+offline run instructions, and honest limitations, in
+`benchmarks/engine-comparison/METHODOLOGY.md`.
+
+- **Engine quality** (`benchmarks/engine-comparison/trade_study.py`): a
+  FuzzBench-style study holding the harness fixed across engines. The target set
+  is pluggable via a pinned real-code manifest; results are reported as
+  repeated-trial distributions (median + IQR + range) with a Wilson/bootstrap
+  confidence interval, per-target and pooled, and every failed/censored/
+  unsupported trial stays visible.
+- **Auto-harness productivity** (`benchmarks/harness-parity-20/`): an end-to-end
+  setup study from a raw checkout to a built, body-executing harness vs a
+  reviewed expert harness, with setup time separated from campaign time and
+  build failures counted, not dropped.
+
+**Measured niche, stated plainly:** on controlled gate-guarded micro-fixtures
+bhf's engine reaches planted bugs competitively, and on a pinned real-code set
+bhf auto-generates harnesses whose project-line coverage reaches expert parity.
+That is the claim the evidence supports. It is **not** a general
+industry-leading-effectiveness claim on arbitrary production targets, and **no
+licensed-tool (e.g. Mayhem) comparison** is made anywhere — none has been run.
+
 ## Current evidence boundary
 
 There is not yet evidence to claim that BHF matches AFL++ or Mayhem on production
@@ -182,3 +207,20 @@ cmplog/redqueen/value-profile), not whole-program throughput on production code.
 They complement — they do not replace — the real-code reach study in
 `benchmarks/harness-parity-20/` (bhf-generated vs expert harness). No Mayhem
 comparison is included (no licensed environment).
+
+### Pluggable real-code targets and distribution reporting (issue #85)
+
+The study's target set is no longer limited to the four toy gates. With a
+`--manifest` (schema and example in `benchmarks/engine-comparison/`;
+full field reference in `METHODOLOGY.md`) the identical harness/coverage/crash
+machinery runs pinned real-code targets. `aggregate()` now reports repeated-trial
+distributions — median, interquartile range, full range, and a Wilson (crash
+rate) or percentile-bootstrap (continuous) confidence interval — per-target AND
+pooled, plus the count of distinct confirmed defects. Every trial is classified
+and the per-engine outcome breakdown (confirmed / censored / build_failed /
+timeout / incomplete / unsupported) is reported, so a rate's effective sample
+size is never hidden; right-censored no-crash campaigns keep their censor time.
+Real-code targets that need a full project build are shown as visible
+`unsupported` rows with their upstream pin until a build recipe is wired, rather
+than silently omitted. The four-engine non-parity disclaimer above still holds:
+these remain micro-fixtures unless a real-code manifest is supplied.

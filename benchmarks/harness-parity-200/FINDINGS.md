@@ -1,6 +1,34 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # 200-project expert-parity findings
 
+> **Headline figure is a CROSS-RUN COMPOSITE, not a single run.** The 113/200
+> body-coverage number is the durable 200-project run (105/200) with two
+> like-for-like final-binary reruns substituted in (the Go lane 3→10 and one C++
+> lane). It is **not** a fresh monolithic 200-project execution on one binary.
+> Quote it only as a composite, or regenerate it on one identified binary via the
+> rerun path below. This audit measures a specific niche — endpoint entry and
+> project-body coverage vs reviewed expert harnesses on a pinned corpus — and
+> makes **no** licensed-tool (e.g. Mayhem) comparison and no general
+> production-effectiveness claim. Engine quality is a separate study; see
+> `../engine-comparison/METHODOLOGY.md`.
+
+## One-identified-binary rerun path
+
+To replace the composite with a single-binary number, re-run the whole matrix on
+one pinned binary and report that figure instead:
+
+```sh
+cargo build --release -p bhf
+bhf --version   # record this exact version + sha256 as the identified binary
+python3 benchmarks/harness-parity-200/run.py \
+  --seconds 15 --jobs <N> --output /path/to/audit-<date>
+# body-covered == rows whose oracle reports non-zero generated project lines;
+# read it from results.tsv / summary.md of THAT single run.
+```
+
+Until such a single-binary rerun is published, every use of 113/200 (and the
+112/200 Go-only intermediate) must stay labeled a composite, as it is below.
+
 ## What was measured
 
 The audit pins 200 real repositories across all 16 supported languages (12 or

@@ -56,3 +56,18 @@ bash benchmarks/run_ada.sh              # Ada   -> results/ada.tsv
 
 The planted-bug targets live under `targets/<lang>/` with a uniform entry point
 `target_one_input(bytes)`; the competitor harnesses are under `harnesses/`.
+
+## Effectiveness experiments (issue #85)
+
+Two separate, powered studies — do not merge their numbers:
+
+- **Experiment 1, engine quality:** `engine-comparison/` (FuzzBench-style; fixed
+  harness across engines; pluggable real-code manifest; repeated-trial
+  distributions with confidence intervals; visible failed/censored runs).
+- **Experiment 2, auto-harness productivity:** `harness-parity-20/` (raw checkout
+  → built, body-executing harness vs expert; setup time separated from campaign;
+  build failures counted).
+
+Both are run offline/scheduled, not in per-PR CI (the only CI-eligible piece is
+the deterministic smoke in `engine-comparison/test_runner.py`). Full methodology,
+manifest schema, and honest limitations: `engine-comparison/METHODOLOGY.md`.

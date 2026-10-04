@@ -1,10 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Render a trade-study JSON (from trade_study.py) into a Markdown report.
 
-Reads the raw rows + aggregated summary and emits per-target comparison tables,
-a cross-target rollup (which engine leads on crash speed, coverage, throughput),
+Reads the raw rows + aggregated summary and emits per-target comparison tables
+with repeated-trial distributions (median, IQR, range) and confidence intervals,
+a cross-target rollup, an all-targets-pooled per-engine aggregate, an explicit
+outcome-visibility table (how many trials failed/were censored/were unsupported),
 and the honest caveats. Pure rendering — no measurement — so it can be re-run on
 any completed or in-progress evidence file.
+
+Supports the v2 summary shape (``{per_target, aggregate_by_engine, ...}``) with
+distribution/CI fields; a v1 file predates this script's rewrite and should be
+re-rendered by re-running the study.
 """
 
 from __future__ import annotations
@@ -19,20 +25,72 @@ ENGINE_LABEL = {
     "libfuzzer": "libFuzzer",
     "honggfuzz": "honggfuzz",
 }
-CASE_DESC = {
-    "magic_byte": "2-byte sync + length gate → stack OOB (st24-style)",
-    "const_gate": "multi-byte constant gate → bug",
-    "len_field": "length-field record parse → bug",
-    "redqueen_int": "magic 32-bit integer comparison → bug (cmplog/redqueen probe)",
-}
 
 
-def fmt(v, suffix=""):
-    if v is None:
+def dist(d: dict | None, suffix: str = "") -> str:
+    """Render a Distribution dict as 'median [q1–q3] (CI lo–hi, n=N)'."""
+    if not d or d.get("n", 0) == 0 or d.get("median") is None:
         return "—"
-    if isinstance(v, float):
-        return f"{v:g}{suffix}"
-    return f"{v}{suffix}"
+    median = f"{d['median']:g}{suffix}"
+    iqr = f"[{d['q1']:g}–{d['q3']:g}]"
+    ci = ""
+    if d.get("ci_low") is not None and d.get("ci_method") != "degenerate":
+        ci = f" (CI {d['ci_low']:g}–{d['ci_high']:g})"
+    return f"{median} {iqr}{ci} n={d['n']}"
+
+
+def prop(d: dict | None) -> str:
+    """Render a Proportion dict as 'rate% (k/n, CI lo–hi%)'."""
+    if not d or d.get("trials", 0) == 0 or d.get("rate") is None:
+        return "— (0 valid)"
+    out = f"{d['rate']:.0%} ({d['successes']}/{d['trials']}"
+    if d.get("ci_low") is not None:
+        out += f", CI {d['ci_low']:.0%}–{d['ci_high']:.0%}"
+    return out + ")"
+
+
+def outcome_cell(outcomes: dict) -> str:
+    parts = [f"{k.replace('_', ' ')}: {v}" for k, v in outcomes.items() if v]
+    return ", ".join(parts) if parts else "—"
+
+
+def render_engine_rows(block: dict, engines: list[str]) -> list[str]:
+    out = [
+        "| Engine | In-budget crash-find (Wilson 95%) | Normalized diagnostic "
+        "variants (grouping aid, NOT a defect count) | Median in-budget TTFC (s) "
+        "| Common cov edges | Native exec/s (not comparable) |",
+        "|---|---|---|---|---|---|",
+    ]
+    for e in engines:
+        s = block.get(e)
+        if not s:
+            continue
+        out.append(
+            f"| {ENGINE_LABEL.get(e, e)} | {prop(s['crash_find'])} "
+            f"| {s['normalized_diagnostic_variants']} | {dist(s['ttfc_s'])} "
+            f"| {dist(s['common_cov_edges'])} "
+            f"| {dist(s['native_execs_per_s']['distribution'])} |"
+        )
+    return out
+
+
+def render_outcomes(block: dict, engines: list[str]) -> list[str]:
+    out = [
+        "",
+        "Outcome visibility (every trial accounted for):",
+        "",
+        "| Engine | Trials | Valid campaigns | Outcome breakdown |",
+        "|---|---|---|---|",
+    ]
+    for e in engines:
+        s = block.get(e)
+        if not s:
+            continue
+        out.append(
+            f"| {ENGINE_LABEL.get(e, e)} | {s['trials']} | {s['valid_campaigns']} "
+            f"| {outcome_cell(s['outcomes'])} |"
+        )
+    return out
 
 
 def main() -> int:
@@ -43,138 +101,81 @@ def main() -> int:
     d = json.loads(args.input.read_text())
     rows = d["rows"]
     summary = d["summary"]
+    if "per_target" not in summary:
+        raise SystemExit(
+            "input is a pre-v2 summary without distribution fields; re-run "
+            "trade_study.py to regenerate it"
+        )
     cfg = d["config"]
-    engines = cfg["engines"] if isinstance(cfg["engines"], list) else list(ENGINE_LABEL)
-    cases = list(summary)
-
-    out = []
-    out.append("<!-- SPDX-License-Identifier: Apache-2.0 -->")
-    out.append(
-        "# Multi-engine fuzzing trade study — BHF vs AFL++ vs libFuzzer vs honggfuzz\n"
+    engines = (
+        cfg["engines"] if isinstance(cfg.get("engines"), list) else list(ENGINE_LABEL)
     )
+    per_target = summary["per_target"]
+    cases = list(per_target)
+
+    out: list[str] = ["<!-- SPDX-License-Identifier: Apache-2.0 -->"]
+    out.append("# Engine-quality trade study (Experiment 1) — distribution report\n")
     out.append(
         f"Generated: {d.get('generated_utc', '?')} · elapsed {d.get('elapsed_s', '?')}s · "
-        f"{len(rows)} raw trial rows.\n"
+        f"{len(rows)} raw trial rows · commit `{(d.get('git_commit') or '?')[:12]}`.\n"
     )
     host = d.get("host", {})
     out.append(
-        f"**Host:** {host.get('cpu', '?')} ({host.get('nproc', '?')} cores; "
-        f"each campaign pinned to one core via taskset).\n"
+        f"**Host:** {host.get('cpu', '?')} ({host.get('nproc', '?')} cores; each "
+        f"campaign pinned to one core via taskset).\n"
     )
     out.append(
-        f"**Budget:** {cfg.get('budget')}s wall per trial · **trials:** {cfg.get('trials')} "
-        f"per (engine,target) · **max_len:** {cfg.get('max_len')} · "
-        f"identical zero-seed corpus for every engine.\n"
+        f"**Budget:** {cfg.get('budget')}s wall per trial (per-target overrides "
+        f"allowed) · **trials:** {cfg.get('trials')} per (engine,target) · "
+        f"**max_len:** {cfg.get('max_len')}.\n"
     )
+    manifest = d.get("manifest", {})
+    if manifest.get("path"):
+        out.append(
+            f"**Target manifest:** `{manifest['path']}` (sha256 `{(manifest.get('sha256') or '?')[:16]}`)\n"
+        )
+    else:
+        out.append(
+            "**Target set:** the four checked-in controlled fixtures (no manifest).\n"
+        )
 
-    tv = d.get("tool_versions", {})
-    out.append("## Tool versions\n")
-    out.append(f"- **BHF:** `{(tv.get('bhf') or '?').strip()}`")
+    out.append("## Methodology (unchanged from the reviewed machinery)\n")
     out.append(
-        f"- **AFL++:** pinned 5.03c build at `{tv.get('afl_fuzz_dir', '?')}` "
-        f"(compiler: `{(tv.get('afl_cc') or '?').splitlines()[0] if tv.get('afl_cc') else '?'}`)"
-    )
-    out.append(
-        f"- **libFuzzer / clang:** `{(tv.get('clang') or '?').splitlines()[0] if tv.get('clang') else '?'}`"
-    )
-    out.append(f"- **honggfuzz:** source build at `{tv.get('honggfuzz_dir', '?')}`\n")
-
-    out.append("## Methodology\n")
-    out.append(
-        "- **Targets:** controlled coverage-gated bug fixtures — a human-audited bug sits behind "
-        "a gate (a magic value / length field) so the metric is how well each engine's mutator "
-        "reaches deep, guarded code. Each fixture defines one `target_one_input(data,size)`; every "
-        "engine drives the SAME source.\n"
-        "- **Independent crash oracle:** each engine's saved crash artifact AND its final corpus are "
-        "replayed through one ASan+UBSan binary the engines never see; only oracle-confirmed crashes "
-        "count. This neutralizes each engine's own crash classifier (honggfuzz's persistent+ASan loop, "
-        "for instance, keeps the crasher in its corpus without flagging it).\n"
-        "- **Engine-neutral coverage:** every engine's final corpus is merged through ONE shared "
-        "libFuzzer-sancov binary (`-merge=1`), so `edges`/`features` use identical instrumentation and "
-        "are directly comparable — not each engine's own counter.\n"
-        "- **Time-to-first-crash (TTFC):** wall seconds from campaign start to the first "
-        "oracle-confirmed crash artifact, polled at 10 ms. Only engines that write a native crash "
-        "artifact get a TTFC (honggfuzz reports crash REACHABILITY via the corpus backstop, no TTFC).\n"
-        "- **Setup/build time is separated from campaign time.** Native exec/s is recorded but is "
-        "**not** cross-engine comparable (each engine defines an execution differently).\n"
+        "- One fixed harness per target drives EVERY engine; each engine's final "
+        "corpus is merged through ONE shared libFuzzer-sancov binary so coverage "
+        "edges are directly comparable, and each saved crash + final corpus is "
+        "replayed through ONE independent ASan/UBSan oracle.\n"
+        "- **Crash-find** is a Wilson 95% interval over VALID campaigns only; "
+        "build-failed/timeout/incomplete/unsupported trials are shown separately so "
+        "the effective sample size is never hidden.\n"
+        "- **Distributions**: median with interquartile range `[q1–q3]`, and a "
+        "percentile-bootstrap (or degenerate) CI. Native exec/s is per-engine only "
+        "and is NOT comparable across engines (counter semantics differ).\n"
     )
 
     for case in cases:
         out.append(f"## Target: `{case}`\n")
-        out.append(f"_{CASE_DESC.get(case, '')}_\n")
-        out.append(
-            "| Engine | Crash-find rate | Median TTFC (s) | Min TTFC (s) | "
-            "Median cov edges | Max cov edges | Median native exec/s | Median build (s) |"
-        )
-        out.append("|---|---|---|---|---|---|---|---|")
-        for e in engines:
-            s = summary[case].get(e)
-            if not s:
-                continue
-            out.append(
-                f"| {ENGINE_LABEL.get(e, e)} | {s['crash_find_rate']:.0%} "
-                f"({int(round(s['crash_find_rate'] * s['trials']))}/{s['trials']}) "
-                f"| {fmt(s['median_ttfc_s'])} | {fmt(s['min_ttfc_s'])} "
-                f"| {fmt(s['median_cov_edges'])} | {fmt(s['max_cov_edges'])} "
-                f"| {fmt(s['median_native_execs_per_s'])} | {fmt(s['median_build_s'])} |"
-            )
+        out.extend(render_engine_rows(per_target[case], engines))
+        out.extend(render_outcomes(per_target[case], engines))
         out.append("")
 
-    # Cross-target rollup.
-    out.append("## Cross-target rollup\n")
-    out.append("| Target | Fastest confirmed crash | Best common coverage |")
-    out.append("|---|---|---|")
-    for case in cases:
-        best_ttfc = None
-        best_ttfc_e = None
-        best_cov = None
-        best_cov_e = None
-        for e in engines:
-            s = summary[case].get(e)
-            if not s:
-                continue
-            if s["median_ttfc_s"] is not None and (
-                best_ttfc is None or s["median_ttfc_s"] < best_ttfc
-            ):
-                best_ttfc, best_ttfc_e = s["median_ttfc_s"], e
-            if s["median_cov_edges"] is not None and (
-                best_cov is None or s["median_cov_edges"] > best_cov
-            ):
-                best_cov, best_cov_e = s["median_cov_edges"], e
-        ttfc_s = (
-            f"{ENGINE_LABEL.get(best_ttfc_e, '—')} ({fmt(best_ttfc)}s)"
-            if best_ttfc_e
-            else "— (none solved)"
-        )
-        cov_s = (
-            f"{ENGINE_LABEL.get(best_cov_e, '—')} ({fmt(best_cov)} edges)"
-            if best_cov_e
-            else "—"
-        )
-        out.append(f"| `{case}` | {ttfc_s} | {cov_s} |")
-    out.append("")
-
-    # Aggregate crash-find across all targets.
-    out.append("### Overall crash-find reliability (all targets pooled)\n")
-    out.append("| Engine | Confirmed crashes / trials | Rate |")
-    out.append("|---|---|---|")
-    for e in engines:
-        sub = [r for r in rows if r["engine"] == e]
-        conf = sum(1 for r in sub if r["crash_confirmed"])
-        rate = conf / len(sub) if sub else 0
-        out.append(f"| {ENGINE_LABEL.get(e, e)} | {conf}/{len(sub)} | {rate:.0%} |")
+    out.append("## All targets pooled — per engine\n")
+    agg = summary.get("aggregate_by_engine", {})
+    out.extend(render_engine_rows(agg, engines))
+    out.extend(render_outcomes(agg, engines))
     out.append("")
 
     out.append("## Caveats\n")
     out.append(
-        "- These are **controlled micro-fixtures** with planted, gated bugs — they isolate mutator "
-        "reach and magic-value solving, not whole-program throughput on production code. They do not "
-        "establish enterprise superiority on real targets; pair with the real-code reach study in "
-        "`benchmarks/harness-parity-20/` (BHF-generated vs expert harness).\n"
-        "- Single-core, one host, bounded budget. `min_ttfc` and rate are the robust signals; a single "
-        "median can hide variance — the raw rows are in the evidence JSON.\n"
-        "- Native exec/s differs in definition per engine and is reported for context only.\n"
-        "- A licensed Mayhem comparison is out of scope (no license/environment).\n"
+        "- Crash-find CIs are only as meaningful as the trial count; a wide Wilson "
+        "interval (small n) is not evidence of parity.\n"
+        "- Controlled micro-fixtures isolate mutator reach/magic-value solving, not "
+        "whole-program throughput on production code. Real-code targets require a "
+        "pinned manifest; targets that need a full project build are shown as "
+        "`unsupported` rows until a build recipe is supplied.\n"
+        "- Native exec/s differs in definition per engine and is reported for "
+        "context only.\n"
+        "- No licensed-tool (e.g. Mayhem) comparison is included; none has been run.\n"
     )
     args.output.write_text("\n".join(out) + "\n")
     print(f"wrote {args.output} ({len(rows)} rows, {len(cases)} targets)")

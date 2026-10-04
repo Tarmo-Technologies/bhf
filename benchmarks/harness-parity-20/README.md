@@ -23,3 +23,12 @@ suite; `projects.tsv` and the checked 2026-08-14 results now contain 30 pinned
 projects. The ten-project expansion adds libxml2, PCRE2, libwebp, Snappy,
 msgpack-c, Lua, cmark, libucl, tomlc99, and libcsv. `ANALYSIS.md` records the
 methodology, conclusions, and next gaps.
+
+This suite is **Experiment 2 (auto-harness productivity)** of issue #85. Each run
+now records `setup_wall_s` (checkout) separately from `auto_wall_s` (the `bhf
+auto` campaign, incl. build recovery), emits a productivity funnel whose
+denominator is *every attempted project* (checkout/build failures stay visible,
+never dropped), and writes `run-metadata.json` pinning the binary sha256/version,
+git commit, host, and project commits. The companion engine-quality study
+(Experiment 1) and the shared methodology/limitations are in
+`../engine-comparison/METHODOLOGY.md`.
