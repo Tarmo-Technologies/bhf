@@ -59,7 +59,7 @@ selected compiled Cargo dependency graph and verifies the shipped binary hashes.
 Build-toolchain caches are included in the filesystem scan.
 
 The local October 4 observations are recorded in
-[the validation report](../validation/2026-10-04-rtos-container-local.md). Those
+[the validation report](https://github.com/Tarmo-Technologies/bhf/blob/04a54c4a2f922fb943e8a7f5ded9ef35e6fc38de/docs/validation/2026-10-04-rtos-container-local.md). Those
 working-tree scans are historical evidence and do not approve a later release.
 A match may need distro backport analysis; absence from a runtime path is not
 sufficient to dismiss an installed vulnerable component. Automatic matches stay

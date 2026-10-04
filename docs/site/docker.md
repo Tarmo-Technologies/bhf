@@ -283,7 +283,7 @@ candidate and residual findings. A detached signature authenticates the entire
 container archive using the existing BHF distribution signature scheme; the
 independent verifier checks it before the archive is extracted or loaded.
 Obtain the verifier and publisher public key through an independently trusted
-channel, as described in [verified distribution handoff](../verified-distribution-handoff.md).
+channel, as described in [verified distribution handoff](https://github.com/Tarmo-Technologies/bhf/blob/main/docs/verified-distribution-handoff.md).
 
 ```sh
 python3 scripts/verify-offline-dist.py \
