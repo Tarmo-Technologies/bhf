@@ -2558,6 +2558,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn spawn_replay_child_does_not_block_on_a_target_that_never_reads_stdin() {
         use std::os::unix::fs::PermissionsExt;
