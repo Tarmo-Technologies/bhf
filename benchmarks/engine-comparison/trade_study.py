@@ -57,20 +57,37 @@ ENGINES = ("bhf", "aflpp", "libfuzzer", "honggfuzz")
 # Per-trial outcome classes. Confirmed crashes count as solves; censored and
 # failed/incomplete trials are retained and reported so the denominator is never
 # silently shrunk to only the runs that worked.
-OUTCOME_CONFIRMED = "confirmed_crash"
-OUTCOME_CENSORED = "censored_no_crash"
+OUTCOME_CONFIRMED = (
+    "confirmed_crash"  # a crash confirmed WITHIN budget — an in-budget solve
+)
+OUTCOME_CONFIRMED_LATE = (
+    "confirmed_out_of_budget"  # confirmed, time known, AFTER budget
+)
+OUTCOME_REACHABLE = (
+    "reachable_time_unknown"  # confirmed via corpus backstop; time unknown
+)
+OUTCOME_CENSORED = "censored_no_crash"  # a VALID full-budget run that found no crash
 OUTCOME_BUILD_FAILED = "build_failed"
 OUTCOME_TIMEOUT = "supervisor_timeout"
-OUTCOME_INCOMPLETE = "incomplete"
+OUTCOME_INCOMPLETE = (
+    "incomplete"  # aborted short of budget / nonzero engine exit / no wall time
+)
 OUTCOME_UNSUPPORTED = "unsupported"
 OUTCOME_CLASSES = (
     OUTCOME_CONFIRMED,
+    OUTCOME_CONFIRMED_LATE,
+    OUTCOME_REACHABLE,
     OUTCOME_CENSORED,
     OUTCOME_BUILD_FAILED,
     OUTCOME_TIMEOUT,
     OUTCOME_INCOMPLETE,
     OUTCOME_UNSUPPORTED,
 )
+
+# A censored no-crash trial is only VALID evidence when the campaign actually ran
+# to (near) its budget: an engine that aborts early is an incomplete trial, not a
+# clean no-crash. Require at least this fraction of the requested budget.
+BUDGET_COMPLETION_FRACTION = 0.9
 
 
 def sha256(path: Path) -> str:
@@ -106,6 +123,39 @@ def materialize_target(spec: targets.TargetSpec, dest: Path) -> tuple[list[Path]
     return copied, derived
 
 
+def seed_file_args(seeds: list[Path]) -> list[str]:
+    """Repeated ``--seed-file`` arguments so bhf ingests the SAME full seed corpus
+    every other engine gets.
+
+    bhf's ``--seed-file`` is repeatable (`Vec<PathBuf>`); passing only the first
+    seed while libFuzzer/AFL++/honggfuzz consume the whole directory would confound
+    the engine-quality comparison. Seeds are sorted for a deterministic command.
+    """
+    args: list[str] = []
+    for seed in sorted(seeds):
+        args.extend(["--seed-file", str(seed)])
+    return args
+
+
+def verify_equal_seed_corpora(rows: list[dict]) -> None:
+    """Fail loudly if the engines in a trial did not start from the identical seed
+    byte set.
+
+    The engine-quality comparison is only honest when every lane fuzzes from the
+    same corpus. Unsupported rows (which run no campaign) are exempt.
+    """
+    seed_sets = {
+        r["engine"]: tuple(r.get("seed_sha256s") or [])
+        for r in rows
+        if r.get("outcome") != OUTCOME_UNSUPPORTED and r.get("seed_sha256s") is not None
+    }
+    if len(set(seed_sets.values())) > 1:
+        raise RuntimeError(
+            "engines in this trial received DIFFERENT seed corpora, which would "
+            f"confound the comparison: {seed_sets}"
+        )
+
+
 def source_build_args(
     target_sources: list[Path], spec: targets.TargetSpec
 ) -> list[str]:
@@ -129,6 +179,13 @@ def classify_trade_outcome(row: dict) -> str:
     Mirrors the fields ``run_engine`` records so the aggregate step and the
     renderer agree on what a trial was. Unsupported (not-yet-runnable) rows are
     labeled by ``run_engine``/the main loop and passed through here unchanged.
+
+    A confirmed crash is an in-budget solve ONLY when it was observed within the
+    budget; a confirmed-but-late artifact and a corpus-backstop reachability
+    (time unknown) are kept as distinct evidence rather than inflating the solve
+    rate. A no-crash trial is a valid censored campaign ONLY when it ran to (near)
+    its budget and the engine exited cleanly; otherwise it is an incomplete trial
+    that stays visible instead of being counted as a clean no-crash.
     """
     if row.get("outcome") == OUTCOME_UNSUPPORTED:
         return OUTCOME_UNSUPPORTED
@@ -137,11 +194,25 @@ def classify_trade_outcome(row: dict) -> str:
     if row.get("supervisor_timeout"):
         return OUTCOME_TIMEOUT
     if row.get("crash_confirmed"):
-        return OUTCOME_CONFIRMED
-    # A run that neither built-failed, timed out, nor crashed is censored only if
-    # the campaign actually ran to its budget; otherwise it is an incomplete run
-    # that must stay visible rather than be counted as a clean no-crash.
-    if row.get("campaign_wall_s") is None:
+        if row.get("crash_within_budget"):
+            return OUTCOME_CONFIRMED
+        # Confirmed but not within budget: a known-late native artifact keeps its
+        # (out-of-budget) time; a corpus-backstop confirmation has no known time.
+        if row.get("time_to_first_crash_s") is not None:
+            return OUTCOME_CONFIRMED_LATE
+        return OUTCOME_REACHABLE
+    # No crash. It is a valid censored campaign only if it actually ran to budget.
+    wall = row.get("campaign_wall_s")
+    if wall is None:
+        return OUTCOME_INCOMPLETE
+    rc = row.get("campaign_rc")
+    if rc is not None and rc != 0:
+        # A nonzero engine exit with no crash is a runner failure, not a clean
+        # no-crash campaign.
+        return OUTCOME_INCOMPLETE
+    budget = row.get("budget_s")
+    if budget is not None and wall < budget * BUDGET_COMPLETION_FRACTION:
+        # Engine aborted well short of the requested budget.
         return OUTCOME_INCOMPLETE
     return OUTCOME_CENSORED
 
@@ -167,6 +238,38 @@ def any_sanitizer_crash(stderr: str) -> tuple[bool, str | None]:
             )
             return True, sig
     return False, None
+
+
+# Volatile tokens that differ run-to-run for the SAME defect (so they must not
+# split one bug into several) — an ASan PID banner, hex addresses, thread ids,
+# and large decimals (addresses/sizes/pids rendered in decimal).
+_SIG_PID_RE = re.compile(r"==\d+==")
+_SIG_ADDR_RE = re.compile(r"0x[0-9a-fA-F]+")
+_SIG_THREAD_RE = re.compile(r"\bT\d+\b")
+_SIG_NUM_RE = re.compile(r"\b\d{3,}\b")
+
+
+def normalize_defect_signature(raw: str | None, target: str) -> str | None:
+    """Target-scoped, volatility-stripped defect identity for the distinct-defect
+    count.
+
+    The raw first-diagnostic line carries a PID, run addresses, and thread ids
+    that differ run-to-run for the SAME bug; strip them and namespace by target
+    so (a) the same defect with different addresses/PID counts once and (b)
+    identical generic diagnostics from UNRELATED targets do not merge. This is a
+    best-effort class-level identity, NOT a verified source/stack localization —
+    the resulting count is a lower-confidence "distinct defect variants" figure,
+    and uncertainty is retained wherever the diagnostic lacks localization.
+    """
+    if not raw:
+        return None
+    text = raw.strip()
+    text = _SIG_PID_RE.sub("==PID==", text)
+    text = _SIG_ADDR_RE.sub("0xADDR", text)
+    text = _SIG_THREAD_RE.sub("Tn", text)
+    text = _SIG_NUM_RE.sub("N", text)
+    text = re.sub(r"\s+", " ", text).strip().lower()
+    return f"{target}::{text}"
 
 
 def replay_oracle(binary: Path, input_path: Path) -> dict:
@@ -330,6 +433,9 @@ def run_engine(
                 shutil.copy(seed, corpus / seed.name)
     if not corpus.is_dir() or not any(corpus.iterdir()):
         run.make_corpus(corpus)
+    # Record the exact seed-byte set this engine is given, so the evidence shows
+    # (and one_trial can verify) every engine started from an identical corpus.
+    seed_sha256s = sorted(sha256(p) for p in corpus.iterdir() if p.is_file())
     row = {
         "engine": engine,
         "case": case,
@@ -339,6 +445,7 @@ def run_engine(
         "max_len": max_len,
         "sanitizer_policy": spec.sanitizer_policy,
         "bhf_harness_mode": spec.bhf_harness_mode,
+        "seed_sha256s": seed_sha256s,
     }
     src_suffix = source_build_args(target_sources, spec)
     build_s = 0.0
@@ -585,7 +692,7 @@ def run_engine(
             build_s += bs
             build_rc = brc
             binary = work / "build" / hid / "main"
-            seed_file = next(corpus.iterdir())
+            seeds = [p for p in corpus.iterdir() if p.is_file()]
             if build_rc == 0:
                 fcmd = [
                     str(args.bhf),
@@ -597,8 +704,9 @@ def run_engine(
                     "builtin",
                     "--time",
                     f"{budget}s",
-                    "--seed-file",
-                    str(seed_file),
+                    # The SAME full seed corpus the other engines consume (every
+                    # seed, not just the first), via repeated --seed-file.
+                    *seed_file_args(seeds),
                     "--rng-seed",
                     str(trial_seed),
                     "--max-len",
@@ -665,6 +773,10 @@ def run_engine(
             "build_s": round(build_s, 3),
             "build_rc": build_rc,
             "campaign_wall_s": round(measure["process_wall_s"], 3) if measure else None,
+            # The engine process exit status, so the classifier can tell an
+            # ordinary budget completion from a runner failure (a nonzero exit
+            # with no crash is an incomplete trial, not a clean no-crash).
+            "campaign_rc": measure.get("returncode") if measure else None,
             "supervisor_timeout": measure.get("timed_out") if measure else None,
             "crash_found": confirmed,
             "crash_confirmed": confirmed,
@@ -672,6 +784,9 @@ def run_engine(
             "time_to_first_crash_s": round(ttfc, 3) if ttfc is not None else None,
             "crash_within_budget": within_budget,
             "crash_signature": signature,
+            # Target-scoped, volatility-normalized identity for the distinct-defect
+            # count (the raw signature carries a PID/addresses that split one bug).
+            "defect_identity": normalize_defect_signature(signature, case),
             "common_cov_edges": cov.get("edges"),
             "common_cov_features": cov.get("features"),
             "final_corpus_size": cov.get("corpus_size"),
@@ -816,6 +931,9 @@ def one_trial(args, spec: targets.TargetSpec, trial_seed, trial_dir) -> list[dic
             f"ft={r.get('common_cov_features')} corpus={r.get('final_corpus_size')}",
             flush=True,
         )
+    # Honesty gate: every engine in this trial must have started from the same
+    # seed corpus, or the comparison is confounded.
+    verify_equal_seed_corpora(rows)
     return rows
 
 
@@ -862,7 +980,17 @@ def engine_summary(sub: list[dict]) -> dict:
     }
     confirmed = [r for r in sub if r.get("outcome") == OUTCOME_CONFIRMED]
     censored = [r for r in sub if r.get("outcome") == OUTCOME_CENSORED]
-    valid = outcomes[OUTCOME_CONFIRMED] + outcomes[OUTCOME_CENSORED]
+    # Valid campaigns are the ones that actually ran a full budget: an in-budget
+    # solve, a confirmed-but-late artifact, a corpus-backstop reachability, or a
+    # clean no-crash. Build-failed / supervisor-timeout / incomplete / unsupported
+    # trials are NOT in the denominator (they never produced comparable evidence).
+    valid = (
+        outcomes[OUTCOME_CONFIRMED]
+        + outcomes[OUTCOME_CONFIRMED_LATE]
+        + outcomes[OUTCOME_REACHABLE]
+        + outcomes[OUTCOME_CENSORED]
+    )
+    # In-budget time-to-first-crash only, from the in-budget solves.
     ttfcs = [
         r["time_to_first_crash_s"]
         for r in confirmed
@@ -880,17 +1008,29 @@ def engine_summary(sub: list[dict]) -> dict:
         r["native_execs_per_s"] for r in sub if r.get("native_execs_per_s") is not None
     ]
     builds = [r["build_s"] for r in sub if r.get("build_s") is not None]
-    signatures = {
-        r.get("crash_signature") for r in confirmed if r.get("crash_signature")
+    # Distinct-defect count over EVERY confirmed-reachability row (in-budget,
+    # late, or corpus-backstop), keyed by the target-scoped NORMALIZED identity so
+    # the same bug at different addresses/PID counts once and unrelated targets do
+    # not merge. It is a lower-confidence "variant" figure, not verified
+    # localization — see normalize_defect_signature.
+    crashing = [r for r in sub if r.get("crash_confirmed")]
+    defect_identities = {
+        r.get("defect_identity") for r in crashing if r.get("defect_identity")
     }
     return {
         "trials": len(sub),
         "valid_campaigns": valid,
         "outcomes": outcomes,
+        # In-budget solve rate: numerator is in-budget solves only; confirmed-late
+        # and corpus-reachable stay visible in `outcomes` as separate evidence.
         "crash_find": stats.wilson_interval(
             outcomes[OUTCOME_CONFIRMED], valid
         ).as_dict(),
-        "distinct_defect_signatures": len(signatures),
+        "distinct_defect_identities": len(defect_identities),
+        "distinct_defect_identities_note": (
+            "target-scoped, address/PID-normalized class-level variants; a "
+            "lower-confidence lower bound, not verified source/stack localization"
+        ),
         "ttfc_s": stats.summarize(ttfcs).as_dict(),
         "common_cov_edges": stats.summarize(edges, round_to=1).as_dict(),
         "common_cov_features": stats.summarize(fts, round_to=1).as_dict(),

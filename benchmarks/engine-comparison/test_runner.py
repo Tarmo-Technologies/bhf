@@ -263,15 +263,29 @@ class TradeOutcomeTests(unittest.TestCase):
             ),
             trade_study.OUTCOME_TIMEOUT,
         )
+        # An in-budget confirmed crash is a solve.
         self.assertEqual(
             trade_study.classify_trade_outcome(
-                {"build_rc": 0, "crash_confirmed": True, "campaign_wall_s": 5.0}
+                {
+                    "build_rc": 0,
+                    "crash_confirmed": True,
+                    "crash_within_budget": True,
+                    "time_to_first_crash_s": 5.0,
+                    "campaign_wall_s": 60.0,
+                }
             ),
             trade_study.OUTCOME_CONFIRMED,
         )
+        # A clean full-budget run that exited cleanly is a valid censored campaign.
         self.assertEqual(
             trade_study.classify_trade_outcome(
-                {"build_rc": 0, "crash_confirmed": False, "campaign_wall_s": 5.0}
+                {
+                    "build_rc": 0,
+                    "crash_confirmed": False,
+                    "campaign_wall_s": 60.0,
+                    "campaign_rc": 0,
+                    "budget_s": 60,
+                }
             ),
             trade_study.OUTCOME_CENSORED,
         )
@@ -282,12 +296,73 @@ class TradeOutcomeTests(unittest.TestCase):
             trade_study.OUTCOME_INCOMPLETE,
         )
 
+    def test_classify_rejects_out_of_budget_and_early_abort(self):
+        # Review case A: an engine that aborts in 0.1s of a 60s budget with no
+        # crash is NOT a valid censored no-crash — it is an incomplete trial.
+        self.assertEqual(
+            trade_study.classify_trade_outcome(
+                {
+                    "build_rc": 0,
+                    "supervisor_timeout": False,
+                    "crash_confirmed": False,
+                    "campaign_wall_s": 0.1,
+                    "campaign_rc": 0,
+                    "budget_s": 60,
+                }
+            ),
+            trade_study.OUTCOME_INCOMPLETE,
+        )
+        # A nonzero engine exit with no crash is a runner failure, not a clean run,
+        # even when the wall time reached the budget.
+        self.assertEqual(
+            trade_study.classify_trade_outcome(
+                {
+                    "build_rc": 0,
+                    "supervisor_timeout": False,
+                    "crash_confirmed": False,
+                    "campaign_wall_s": 60.0,
+                    "campaign_rc": 1,
+                    "budget_s": 60,
+                }
+            ),
+            trade_study.OUTCOME_INCOMPLETE,
+        )
+        # Review case B: a native crash first observed at 64s with a 60s budget is
+        # confirmed-but-late — kept as evidence, NOT an in-budget solve.
+        self.assertEqual(
+            trade_study.classify_trade_outcome(
+                {
+                    "build_rc": 0,
+                    "crash_confirmed": True,
+                    "crash_within_budget": False,
+                    "time_to_first_crash_s": 64.0,
+                    "budget_s": 60,
+                }
+            ),
+            trade_study.OUTCOME_CONFIRMED_LATE,
+        )
+        # A corpus-backstop confirmation has no known time: reachability, distinct
+        # from a known-late native artifact.
+        self.assertEqual(
+            trade_study.classify_trade_outcome(
+                {
+                    "build_rc": 0,
+                    "crash_confirmed": True,
+                    "crash_within_budget": False,
+                    "time_to_first_crash_s": None,
+                    "budget_s": 60,
+                }
+            ),
+            trade_study.OUTCOME_REACHABLE,
+        )
+
     def test_engine_summary_keeps_failures_visible_and_reports_ci(self):
         rows = [
             {
                 "outcome": "confirmed_crash",
                 "crash_confirmed": True,
                 "crash_signature": "ASan: oob",
+                "defect_identity": "tgt::asan: oob",
                 "time_to_first_crash_s": 1.0,
                 "common_cov_edges": 10,
                 "common_cov_features": 12,
@@ -299,6 +374,7 @@ class TradeOutcomeTests(unittest.TestCase):
                 "outcome": "confirmed_crash",
                 "crash_confirmed": True,
                 "crash_signature": "ASan: oob",
+                "defect_identity": "tgt::asan: oob",
                 "time_to_first_crash_s": 2.0,
                 "common_cov_edges": 11,
                 "common_cov_features": 13,
@@ -337,7 +413,7 @@ class TradeOutcomeTests(unittest.TestCase):
         self.assertEqual(
             summary["crash_find"]["trials"], 3
         )  # build_failed excluded from denom
-        self.assertEqual(summary["distinct_defect_signatures"], 1)  # deduped
+        self.assertEqual(summary["distinct_defect_identities"], 1)  # deduped
         self.assertEqual(summary["ttfc_s"]["n"], 2)
         self.assertEqual(summary["right_censored_s"], [30.0])
         self.assertFalse(summary["native_execs_per_s"]["comparable_across_engines"])
@@ -378,6 +454,109 @@ class TradeOutcomeTests(unittest.TestCase):
         self.assertEqual(
             summary["aggregate_by_engine"]["aflpp"]["outcomes"]["censored_no_crash"], 1
         )
+
+
+class SeedCorpusEqualityTests(unittest.TestCase):
+    def test_bhf_seed_args_pass_every_seed_sorted(self):
+        # Two distinct seeds must yield two --seed-file arguments (bhf's --seed-file
+        # is repeatable), so bhf fuzzes from the SAME corpus as the other engines
+        # instead of only the first seed. Order is deterministic (sorted).
+        seeds = [Path("/corpus/b-second"), Path("/corpus/a-first")]
+        args = trade_study.seed_file_args(seeds)
+        self.assertEqual(args.count("--seed-file"), 2)
+        self.assertEqual(
+            args,
+            [
+                "--seed-file",
+                "/corpus/a-first",
+                "--seed-file",
+                "/corpus/b-second",
+            ],
+        )
+
+    def test_verify_equal_seed_corpora_accepts_matching_sets(self):
+        rows = [
+            {
+                "engine": "bhf",
+                "outcome": "censored_no_crash",
+                "seed_sha256s": ["a", "b"],
+            },
+            {
+                "engine": "aflpp",
+                "outcome": "confirmed_crash",
+                "seed_sha256s": ["a", "b"],
+            },
+        ]
+        trade_study.verify_equal_seed_corpora(rows)  # must not raise
+
+    def test_verify_equal_seed_corpora_rejects_divergent_sets(self):
+        rows = [
+            {"engine": "bhf", "outcome": "censored_no_crash", "seed_sha256s": ["a"]},
+            {
+                "engine": "aflpp",
+                "outcome": "censored_no_crash",
+                "seed_sha256s": ["a", "b"],
+            },
+        ]
+        with self.assertRaises(RuntimeError):
+            trade_study.verify_equal_seed_corpora(rows)
+
+    def test_verify_equal_seed_corpora_exempts_unsupported_rows(self):
+        # An unsupported row runs no campaign, so its (absent) corpus is exempt.
+        rows = [
+            {"engine": "bhf", "outcome": "unsupported", "seed_sha256s": None},
+            {"engine": "aflpp", "outcome": "censored_no_crash", "seed_sha256s": ["a"]},
+        ]
+        trade_study.verify_equal_seed_corpora(rows)  # must not raise
+
+
+class DefectIdentityTests(unittest.TestCase):
+    def test_same_defect_different_pid_and_address_is_one_identity(self):
+        a = trade_study.normalize_defect_signature(
+            "==123==ERROR: AddressSanitizer: heap-buffer-overflow on address 0xdeadbeef",
+            "tgt",
+        )
+        b = trade_study.normalize_defect_signature(
+            "==9999==ERROR: AddressSanitizer: heap-buffer-overflow on address 0xcafef00d",
+            "tgt",
+        )
+        self.assertIsNotNone(a)
+        self.assertEqual(a, b)
+
+    def test_same_diagnostic_different_target_is_distinct(self):
+        line = "ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1"
+        self.assertNotEqual(
+            trade_study.normalize_defect_signature(line, "tgtA"),
+            trade_study.normalize_defect_signature(line, "tgtB"),
+        )
+
+    def test_missing_signature_is_none(self):
+        self.assertIsNone(trade_study.normalize_defect_signature(None, "tgt"))
+        self.assertIsNone(trade_study.normalize_defect_signature("", "tgt"))
+
+    def test_engine_summary_namespaces_defects_by_target(self):
+        # Identical generic diagnostics from UNRELATED targets must not merge into
+        # one defect; the normalized identity is target-scoped.
+        rows = [
+            {
+                "outcome": "confirmed_crash",
+                "crash_confirmed": True,
+                "defect_identity": trade_study.normalize_defect_signature(
+                    "ERROR: AddressSanitizer: SEGV on unknown address 0x0", "targetA"
+                ),
+                "time_to_first_crash_s": 1.0,
+            },
+            {
+                "outcome": "confirmed_crash",
+                "crash_confirmed": True,
+                "defect_identity": trade_study.normalize_defect_signature(
+                    "ERROR: AddressSanitizer: SEGV on unknown address 0x0", "targetB"
+                ),
+                "time_to_first_crash_s": 1.0,
+            },
+        ]
+        summary = trade_study.engine_summary(rows)
+        self.assertEqual(summary["distinct_defect_identities"], 2)
 
 
 if __name__ == "__main__":
