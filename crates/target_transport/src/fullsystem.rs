@@ -434,15 +434,23 @@ impl<CQ: Read + Write, CG: Read + Write> TargetSession for FullSystemSession<CQ,
         self.gdb.write_memory(self.map.input_address, input)?;
         let (stop, stdout) = self.gdb.cont()?;
 
-        // Harvest coverage from the in-guest ring.
-        let coverage_edges = read_coverage_ring(&mut self.gdb, &self.map)?;
-
+        // Classify the stop reply FIRST, then harvest coverage from the in-guest
+        // ring. A readback failure must not erase an already-observed crash
+        // (#74): the exit/fault classification stays authoritative and the ring
+        // read failure is recorded as a diagnostic.
         let exit = stop.to_exit_kind();
+        let fault = fault_from_stop(&stop);
+        let (coverage_edges, coverage_incomplete) =
+            match read_coverage_ring(&mut self.gdb, &self.map) {
+                Ok(edges) => (edges, None),
+                Err(err) => (Vec::new(), Some(err.to_string())),
+            };
         Ok(RunOutcome {
             exit,
             coverage_edges,
-            fault: fault_from_stop(&stop),
+            fault,
             stdout,
+            coverage_incomplete,
         })
     }
 }
@@ -665,10 +673,11 @@ mod tests {
         assert_eq!(fault.kind, FaultKind::MemoryProtection);
     }
 
-    #[test]
-    fn short_ring_memory_read_is_a_descriptive_error_not_a_panic() {
-        // The map claims a 64-byte ring but the stub only serves 16 bytes at the
-        // ring base, so the bounded gdb read cannot satisfy the request.
+    /// Build a full-system session whose ring region is shorter than the map's
+    /// declared capacity, so the post-stop coverage readback fails with a
+    /// bounded `memory read` error. `stop_reply` controls how the run itself
+    /// terminated.
+    fn short_ring_session(stop_reply: &[u8]) -> Box<dyn TargetSession> {
         let map = GdbMemoryMap {
             input_address: 0x1000,
             ring_address: 0x4000,
@@ -679,8 +688,9 @@ mod tests {
         let gdb_log = Arc::new(Mutex::new(Vec::<String>::new()));
         let (gdb_client_end, gdb_stub_end) = duplex();
         let stub = MockGdbStub::new(gdb_stub_end, gdb_log)
+            .with_stop_reply(stop_reply.to_vec())
             .with_region(map.input_address, vec![0_u8; 64])
-            .with_region(map.ring_address, vec![0_u8; 16]) // too short
+            .with_region(map.ring_address, vec![0_u8; 16]) // too short for cap=64
             .with_region(map.ring_write_address, 4_u32.to_le_bytes().to_vec())
             .with_region(map.ring_wrapped_address, vec![0_u8]);
         thread::spawn(move || {
@@ -715,12 +725,43 @@ mod tests {
             "bhf-baseline",
         )
         .unwrap();
+        transport.arm().unwrap()
+    }
 
-        let mut session = transport.arm().unwrap();
-        let error = session.run_input(b"x").unwrap_err();
+    #[test]
+    fn clean_stop_with_failed_readback_is_retained_as_coverage_incomplete() {
+        // A benign stop (S05) whose coverage read fails must NOT be presented as
+        // a fully observed clean run: the outcome stays Ok but is flagged
+        // incomplete with a descriptive diagnostic, so a coverage/infrastructure
+        // failure is distinguishable from complete clean coverage (#74).
+        let mut session = short_ring_session(b"S05");
+        let outcome = session.run_input(b"x").unwrap();
+        assert_eq!(outcome.exit, ExitKind::Ok);
+        assert!(outcome.coverage_edges.is_empty());
+        let diag = outcome
+            .coverage_incomplete
+            .expect("a failed readback must be recorded, not silently dropped");
         assert!(
-            matches!(error, TransportError::TargetError(ref m) if m.contains("memory read")),
-            "expected a descriptive memory-read error, got: {error}"
+            diag.contains("memory read"),
+            "expected a descriptive coverage diagnostic, got: {diag}"
+        );
+    }
+
+    #[test]
+    fn crash_stop_survives_a_failed_coverage_readback() {
+        // A SIGSEGV stop (S0b) followed by a coverage-ring read failure must
+        // retain the crash classification and fault rather than erroring out
+        // and losing the already-observed crash (#74).
+        let mut session = short_ring_session(b"S0b");
+        let outcome = session.run_input(b"boom").unwrap();
+        assert_eq!(outcome.exit, ExitKind::Crash);
+        assert_eq!(
+            outcome.fault.expect("the crash must be retained").kind,
+            FaultKind::MemoryProtection
+        );
+        assert!(
+            outcome.coverage_incomplete.is_some(),
+            "the readback failure must be recorded alongside the retained crash"
         );
     }
 

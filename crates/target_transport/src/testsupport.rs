@@ -195,6 +195,7 @@ impl ScriptedResponse {
             coverage_edges: self.edges.clone(),
             fault: self.fault.clone(),
             stdout: Vec::new(),
+            coverage_incomplete: None,
         }
     }
 }

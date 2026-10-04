@@ -124,6 +124,13 @@ pub struct RunOutcome {
     pub fault: Option<Fault>,
     /// Captured stdout, for backends that expose one.
     pub stdout: Vec<u8>,
+    /// `Some(reason)` when coverage/evidence collection failed or was partial
+    /// *after* the run completed (e.g. a post-stop coverage-ring readback
+    /// error). The [`exit`](Self::exit)/[`fault`](Self::fault) classification
+    /// is still authoritative — an unreadable target region must never erase an
+    /// already-observed crash, nor be silently presented as complete, clean
+    /// coverage. `None` means coverage was fully collected.
+    pub coverage_incomplete: Option<String>,
 }
 
 impl RunOutcome {
@@ -134,6 +141,7 @@ impl RunOutcome {
             coverage_edges,
             fault: None,
             stdout: Vec::new(),
+            coverage_incomplete: None,
         }
     }
 }

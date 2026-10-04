@@ -603,13 +603,23 @@ impl<C: Read + Write> TargetSession for GdbSession<C> {
         self.client.reset()?;
         self.client.write_memory(self.map.input_address, input)?;
         let (stop, stdout) = self.client.cont()?;
-        let coverage_edges = read_coverage_ring(&mut self.client, &self.map)?;
+        // Classify the target outcome from the stop reply FIRST, then collect
+        // coverage. A coverage-readback failure must not erase an already-known
+        // stop (#74): keep the exit classification and record the read failure
+        // as a diagnostic instead of propagating an error that loses the crash.
+        let exit = stop.to_exit_kind();
+        let (coverage_edges, coverage_incomplete) =
+            match read_coverage_ring(&mut self.client, &self.map) {
+                Ok(edges) => (edges, None),
+                Err(err) => (Vec::new(), Some(err.to_string())),
+            };
         Ok(RunOutcome {
-            exit: stop.to_exit_kind(),
+            exit,
             coverage_edges,
             // Fault classification over the debug-probe path is HDF-2.
             fault: None,
             stdout,
+            coverage_incomplete,
         })
     }
 }
@@ -923,6 +933,51 @@ mod tests {
         assert!(
             log.iter().any(|p| p.starts_with("M1000,")),
             "log missing input write: {log:?}"
+        );
+    }
+
+    #[test]
+    fn gdb_session_retains_crash_when_coverage_readback_fails() {
+        // A SIGSEGV stop followed by a too-short ring read must retain the crash
+        // (exit Crash) and record the readback failure, rather than propagating
+        // an error that erases the already-observed crash (#74).
+        let map = GdbMemoryMap {
+            input_address: 0x1000,
+            ring_address: 0x4000,
+            ring_write_address: 0x5000,
+            ring_wrapped_address: 0x5100,
+            ring_capacity: 32,
+        };
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (client_end, stub_end) = duplex();
+        let stub = MockGdbStub::new(stub_end, log)
+            .with_stop_reply(b"S0b".to_vec())
+            .with_region(map.input_address, vec![0_u8; 64])
+            .with_region(map.ring_address, vec![0_u8; 8]) // too short for cap=32
+            .with_region(map.ring_write_address, 4_u32.to_le_bytes().to_vec())
+            .with_region(map.ring_wrapped_address, vec![0_u8]);
+        thread::spawn(move || {
+            let _ = stub.serve();
+        });
+
+        let client_slot = Mutex::new(Some(client_end));
+        let transport = GdbRemoteTransport::new(
+            move || {
+                client_slot
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .ok_or_else(|| TransportError::gdb("connect invoked more than once"))
+            },
+            map,
+        );
+        let mut session = transport.arm().unwrap();
+        let outcome = session.run_input(b"boom").unwrap();
+
+        assert_eq!(outcome.exit, ExitKind::Crash);
+        assert!(
+            outcome.coverage_incomplete.is_some(),
+            "the readback failure must be recorded alongside the retained crash"
         );
     }
 }
