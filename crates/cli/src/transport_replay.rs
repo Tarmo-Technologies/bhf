@@ -27,6 +27,24 @@ const DEADLINE_EXCEPTION_NAME: &str = "TRANSPORT_DEADLINE_EXCEEDED";
 /// persisted `timing` block (older findings carry no recorded deadline).
 const REPLAY_DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Resolve the per-input execution deadline to rebuild the replay transport with.
+///
+/// Distinguishes an EXPLICITLY-UNSET deadline (the `timing` block present with a
+/// `null`/absent `per_input_timeout_ms` — the original campaign configured none)
+/// from an OLDER profile predating the timing block (no `timing` at all): the
+/// former replays with NO execution deadline, the latter falls back to a safe
+/// default so an old finding still replays bounded rather than silently gaining a
+/// deadline it never had (#70 re-review).
+fn parse_per_input_timeout(timing: Option<&serde_json::Value>) -> Option<Duration> {
+    match timing {
+        Some(block) => block
+            .get("per_input_timeout_ms")
+            .and_then(serde_json::Value::as_u64)
+            .map(Duration::from_millis), // number -> Some; null / absent -> None
+        None => Some(REPLAY_DEFAULT_TIMEOUT), // pre-timing-block profile: safe default
+    }
+}
+
 /// A transport finding is one that carries a `transport_profile.json`.
 pub(crate) fn is_transport_finding(finding_dir: &Path) -> bool {
     finding_dir.join(TRANSPORT_PROFILE_FILE).is_file()
@@ -67,12 +85,15 @@ pub(crate) fn replay_transport_finding(finding_dir: &Path, endpoint: Option<&str
     // execution deadline is reused to rebuild the transport so an execution
     // timeout re-times-out identically, and the response-time deadline is the
     // predicate a "completed-but-slow" BHF-555 finding is re-evaluated against.
+    //
+    // Distinguish an EXPLICITLY-UNSET per-input deadline (the `timing` block is
+    // present with a JSON `null`, i.e. the original campaign configured no
+    // execution deadline) from an OLDER profile that predates the timing block
+    // (the block is absent): the former replays with NO execution deadline, the
+    // latter falls back to a safe default so an old finding still replays bounded
+    // rather than silently gaining a 10s deadline it never had (#70 re-review).
     let timing = profile.get("timing");
-    let per_input_timeout = timing
-        .and_then(|t| t.get("per_input_timeout_ms"))
-        .and_then(serde_json::Value::as_u64)
-        .map(Duration::from_millis)
-        .unwrap_or(REPLAY_DEFAULT_TIMEOUT);
+    let per_input_timeout = parse_per_input_timeout(timing);
     let deadline = timing
         .and_then(|t| t.get("deadline_ms"))
         .and_then(serde_json::Value::as_u64)
@@ -113,7 +134,7 @@ pub(crate) fn replay_transport_finding(finding_dir: &Path, endpoint: Option<&str
             return 1;
         }
     };
-    let transport = match plan.into_transport(Some(per_input_timeout)) {
+    let transport = match plan.into_transport(per_input_timeout) {
         Ok(transport) => transport,
         Err(error) => {
             bhfeprintln!("rebuild transport from profile: {error}");
@@ -142,8 +163,12 @@ pub(crate) fn replay_transport_finding(finding_dir: &Path, endpoint: Option<&str
 
     // A "completed-but-slow" deadline finding (BHF-555, emitted by the deadline
     // oracle on an Ok run) reproduces no fault — so a fault-identity check would
-    // always report "no fault reproduced". Match it by the TIMING predicate it was
-    // found with instead: the replay must also exceed the recorded deadline.
+    // always report "no fault reproduced". Match it by the SAME predicate it was
+    // found with: the replay must reproduce the completed-but-slow OUTCOME — a
+    // clean completion (ExitKind::Ok) whose host-observed time exceeds the recorded
+    // deadline. Elapsed time alone is not enough: a later crash or execution
+    // timeout that happens to exceed that duration is a DIFFERENT outcome, not a
+    // reproduction of the slow-clean run (#70 re-review).
     if recorded_exception_name(finding_dir).as_deref() == Some(DEADLINE_EXCEPTION_NAME) {
         let Some(deadline) = deadline else {
             bhfeprintln!(
@@ -153,13 +178,22 @@ pub(crate) fn replay_transport_finding(finding_dir: &Path, endpoint: Option<&str
             );
             return 1;
         };
+        if outcome.exit != ExitKind::Ok {
+            bhfeprintln!(
+                "MISMATCH recorded=slow-clean(>{}ms) actual={:?} (a crash/timeout is a \
+                 different outcome, not a reproduction of the completed-but-slow run)",
+                deadline.as_millis(),
+                outcome.exit
+            );
+            return 3;
+        }
         if elapsed > deadline {
             let _ = corpus::finding::touch_last_seen(finding_dir, "replay (transport timing)");
             println!("MATCH");
             return 0;
         }
         bhfeprintln!(
-            "MISMATCH recorded=host-observed>{}ms actual={}ms (within the deadline)",
+            "MISMATCH recorded=slow-clean(>{}ms) actual=clean({}ms) (within the deadline)",
             deadline.as_millis(),
             elapsed.as_millis()
         );
@@ -519,6 +553,81 @@ mod tests {
     }
 
     #[test]
+    fn deadline_finding_with_a_crash_replay_is_a_mismatch() {
+        // #70 re-review: a completed-but-slow (Ok) deadline finding is NOT
+        // reproduced by a replay that CRASHES, even if that crash exceeds the
+        // recorded deadline — a crash is a different OUTCOME, not the slow-clean
+        // run. Match requires the same completed-Ok outcome, not elapsed alone.
+        let fault = Fault {
+            kind: FaultKind::MemoryProtection,
+            address: Some(0x2000_4000),
+            detail: String::new(),
+        };
+        let (port, _received, handle) =
+            spawn_scripted_agent(ScriptedResponse::crash(vec![1], fault));
+        let dir = temp_dir("deadline-crash");
+        write_timing_profile(
+            &dir,
+            &format!("agent:tcp:127.0.0.1:{port}"),
+            Some(1000),
+            Some(0),
+        );
+        write_deadline_finding(&dir);
+
+        let code = replay_transport_finding(&dir, None);
+        handle.join().unwrap();
+
+        assert_eq!(
+            code, 3,
+            "a crash replay is a MISMATCH for a slow-clean deadline finding, not a timing MATCH"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn deadline_finding_fast_clean_replay_is_a_mismatch() {
+        // A clean replay that completes WITHIN the recorded deadline does not
+        // reproduce a completed-but-slow finding either.
+        let (port, _received, handle) = spawn_scripted_agent(ScriptedResponse::ok(vec![1, 2]));
+        let dir = temp_dir("deadline-fast");
+        // A one-hour deadline is not exceeded by a sub-millisecond loopback run.
+        write_timing_profile(
+            &dir,
+            &format!("agent:tcp:127.0.0.1:{port}"),
+            Some(1000),
+            Some(3_600_000),
+        );
+        write_deadline_finding(&dir);
+
+        let code = replay_transport_finding(&dir, None);
+        handle.join().unwrap();
+
+        assert_eq!(code, 3, "a within-deadline clean replay is a MISMATCH");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_per_input_timeout_distinguishes_unset_number_and_missing_block() {
+        use serde_json::json;
+        // No timing block (an older profile) -> a safe default, so an old finding
+        // still replays bounded.
+        assert_eq!(parse_per_input_timeout(None), Some(REPLAY_DEFAULT_TIMEOUT));
+        // Block present with an explicit null -> NO deadline (the original had none).
+        let null_block = json!({"per_input_timeout_ms": null, "deadline_ms": 0});
+        assert_eq!(parse_per_input_timeout(Some(&null_block)), None);
+        // Block present with a number -> that exact bound.
+        let num_block = json!({"per_input_timeout_ms": 2500});
+        assert_eq!(
+            parse_per_input_timeout(Some(&num_block)),
+            Some(Duration::from_millis(2500))
+        );
+        // Block present but the key absent -> no deadline (distinct from an old
+        // profile, which gets the default).
+        let no_key = json!({"deadline_ms": 10});
+        assert_eq!(parse_per_input_timeout(Some(&no_key)), None);
+    }
+
+    #[test]
     fn deadline_finding_without_a_recorded_deadline_is_an_actionable_error() {
         // A deadline finding whose profile carries no deadline cannot have its
         // timing predicate evaluated: that is an actionable error (exit 1), never
@@ -560,6 +669,7 @@ mod tests {
             }),
             stdout: Vec::new(),
             coverage_incomplete: Some("hung".to_owned()),
+            inconclusive: None,
         };
         let id = replay_identity(&outcome).expect("a timeout reproduces a BHF-555 identity");
         assert_eq!(id.rule_id, "BHF-555");

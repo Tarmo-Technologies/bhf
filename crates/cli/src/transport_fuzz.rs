@@ -613,6 +613,12 @@ pub(crate) struct TransportFuzzSummary {
     /// readback failure). Non-zero means some coverage is partial, not that the
     /// run failed — surfaced so partial coverage is never read as complete (#74).
     pub incomplete_observations: usize,
+    /// Executions whose clean/crash classification is UNRELIABLE because a
+    /// configured fault-determining observation failed (e.g. a full-system
+    /// completion whose firmware fault-status word could not be read). These are
+    /// neither clean passes nor findings — surfaced so an inconclusive run is
+    /// never silently counted as a clean execution (#72).
+    pub inconclusive_observations: usize,
     /// Distinct finding ids written to `<work_dir>/findings/`.
     pub findings: Vec<String>,
     /// Set when the campaign stopped early on a non-clean run-control condition
@@ -716,6 +722,10 @@ pub(crate) fn run_transport_campaign(
     // (#74): surfaced in the summary so partial coverage — on a clean run or a
     // crash — is never silently presented as complete.
     let mut incomplete_observations = 0usize;
+    // Runs whose clean/crash classification is UNRELIABLE because a configured
+    // fault-determining observation failed (#72 re-review): recorded here, never
+    // counted as a clean pass and never turned into a fabricated finding.
+    let mut inconclusive_observations = 0usize;
     let mut finding_ids: Vec<String> = Vec::new();
     // Dedup findings on the same key the on-disk finding signature is built from
     // (rule_id | kind; the transport lane carries no stack frames), so one fault
@@ -752,6 +762,9 @@ pub(crate) fn run_transport_campaign(
                 if outcome.coverage_incomplete.is_some() {
                     incomplete_observations += 1;
                 }
+                if outcome.inconclusive.is_some() {
+                    inconclusive_observations += 1;
+                }
                 let feedback = fold_coverage(&mut coverage, &outcome.coverage_edges);
                 scheduler.insert_with_feedback(seed.clone(), feedback.to_schedule_feedback());
                 handle_outcome(
@@ -764,10 +777,11 @@ pub(crate) fn run_transport_campaign(
                     &mut finding_ids,
                     &mut crashes,
                 )?;
-                // The deadline oracle is for a COMPLETED-but-slow run only: a
-                // crash or an execution timeout already yields its own finding
-                // via handle_outcome, so firing it here too would double-count.
-                if outcome.exit == ExitKind::Ok {
+                // The deadline oracle is for a COMPLETED-but-slow run only: a crash
+                // or execution timeout already yields its own finding, and an
+                // INCONCLUSIVE run is not a proven clean completion — firing it for
+                // either would fabricate a timing finding.
+                if outcome.exit == ExitKind::Ok && outcome.inconclusive.is_none() {
                     maybe_emit_deadline(
                         elapsed,
                         config.deadline,
@@ -828,11 +842,17 @@ pub(crate) fn run_transport_campaign(
                         if outcome.coverage_incomplete.is_some() {
                             incomplete_observations += 1;
                         }
+                        if outcome.inconclusive.is_some() {
+                            inconclusive_observations += 1;
+                        }
                         let feedback = fold_coverage(&mut coverage, &outcome.coverage_edges);
                         // Retain a clean input that reached new coverage as a new
                         // corpus seed, feeding its novelty back into the power
-                        // schedule. A crashing input becomes a finding, not a seed.
+                        // schedule. A crashing input becomes a finding, not a seed;
+                        // an INCONCLUSIVE run is not a proven clean pass, so it is
+                        // not retained as a clean seed either (#72 re-review).
                         if outcome.exit == ExitKind::Ok
+                            && outcome.inconclusive.is_none()
                             && (feedback.new_bitmap_bits() > 0
                                 || feedback.new_exception_signatures > 0)
                         {
@@ -852,9 +872,10 @@ pub(crate) fn run_transport_campaign(
                             &mut finding_ids,
                             &mut crashes,
                         )?;
-                        // Deadline oracle: completed-but-slow runs only (a crash
-                        // or an execution timeout is already its own finding).
-                        if outcome.exit == ExitKind::Ok {
+                        // Deadline oracle: completed-but-slow runs only (a crash,
+                        // an execution timeout, or an inconclusive run is not a
+                        // proven clean completion).
+                        if outcome.exit == ExitKind::Ok && outcome.inconclusive.is_none() {
                             maybe_emit_deadline(
                                 elapsed,
                                 config.deadline,
@@ -887,6 +908,7 @@ pub(crate) fn run_transport_campaign(
         coverage_blocks: snapshot.breadcrumb_bits,
         crashes,
         incomplete_observations,
+        inconclusive_observations,
         findings: finding_ids,
         halted,
         elapsed_secs: start.elapsed().as_secs_f64(),
@@ -1078,15 +1100,28 @@ fn handle_outcome(
     // and mark the grouping explicitly uncertain since they cannot be told apart.
     let class_key = format!("{transport_label}|{}|{}", report.rule_id, report.kind);
     let class_count = *class_counts.get(&class_key).unwrap_or(&0);
-    let (site, localized) = match outcome.fault.as_ref().and_then(|fault| fault.address) {
-        Some(address) => (format!("{address:#x}"), true),
-        None => (format!("unlocalized#{class_count}"), false),
+    // `site` is the human / persisted-signature label; `dedup_key` is what the
+    // `seen` set keys on. A localized fault dedups on its exact address. An
+    // UNLOCALIZED fault dedups on the INPUT HASH, NOT on the occurrence counter:
+    // otherwise re-running the SAME testcase mints a fresh `unlocalized#N` identity
+    // every time and exhausts the bounded per-class allowance before a genuinely
+    // different testcase arrives (#75 re-review). The slot it is eventually given
+    // is still `unlocalized#N` (a bounded, grouping-uncertain candidate).
+    let (site, localized, dedup_key) = match outcome.fault.as_ref().and_then(|f| f.address) {
+        Some(address) => {
+            let site = format!("{address:#x}");
+            let dedup = format!("{class_key}|{site}");
+            (site, true, dedup)
+        }
+        None => (
+            format!("unlocalized#{class_count}"),
+            false,
+            format!("{class_key}|unlocalized:{}", short_input_hash(input)),
+        ),
     };
-    let identity_key = format!("{class_key}|{site}");
 
-    // A localized site dedups on exact repeat; an unlocalized slot is distinct per
-    // occurrence, so later distinct faults of the same kind are not silently lost.
-    if seen.contains(&identity_key) {
+    // Same fault (localized address, or unlocalized identical testcase) -> dedup.
+    if seen.contains(&dedup_key) {
         return Ok(());
     }
     // Bounded candidate evidence: once the class is saturated, stop splitting.
@@ -1118,9 +1153,22 @@ fn handle_outcome(
     });
     let id = emitter.emit_sanitizer_crash(input, &report)?;
     finding_ids.push(id.0);
-    seen.insert(identity_key);
+    seen.insert(dedup_key);
     *count += 1;
     Ok(())
+}
+
+/// A short, stable content hash of a testcase, used only to deduplicate repeated
+/// identical inputs within an unlocalized fault class (#75 re-review) — not a
+/// persisted identity. 64 bits of SHA-256 is ample to avoid in-run collisions.
+fn short_input_hash(input: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(input);
+    let mut out = String::with_capacity(16);
+    for byte in &digest[..8] {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 /// Persist one finding report for `input`, counting the non-clean outcome and
@@ -2032,6 +2080,7 @@ mod tests {
             fault: None,
             stdout: Vec::new(),
             coverage_incomplete: None,
+            inconclusive: None,
         };
         for input in [b"a".as_slice(), b"b".as_slice()] {
             handle_outcome(
@@ -2079,6 +2128,66 @@ mod tests {
                 .unwrap()
                 .contains("grouping uncertain"),
             "an unlocalized finding must carry explicit grouping uncertainty: {first}"
+        );
+
+        std::fs::remove_dir_all(&work_dir).ok();
+    }
+
+    #[test]
+    fn repeated_unlocalized_testcase_does_not_consume_the_candidate_cap() {
+        // #75 re-review: re-running the SAME unlocalized testcase must dedup on the
+        // input hash BEFORE a candidate slot is allocated, so it cannot exhaust the
+        // bounded per-class allowance ahead of a genuinely different testcase. Here
+        // input "a" repeated three times yields ONE candidate, and a different input
+        // "b" yields a second — two findings and two consumed slots, not four.
+        use target_transport::RunOutcome;
+        let work_dir = tmp_work_dir("unlocalized-dedup");
+        let emitter = FindingEmitter::with_metadata(
+            work_dir.clone(),
+            "H-transport".to_owned(),
+            "transport".to_owned(),
+            "mock".to_owned(),
+        );
+        let mut seen = std::collections::HashSet::new();
+        let mut class_counts = std::collections::HashMap::new();
+        let mut finding_ids: Vec<String> = Vec::new();
+        let mut crashes = 0usize;
+        let bare_crash = || RunOutcome {
+            exit: ExitKind::Crash,
+            coverage_edges: Vec::new(),
+            fault: None,
+            stdout: Vec::new(),
+            coverage_incomplete: None,
+            inconclusive: None,
+        };
+        for input in [
+            b"a".as_slice(),
+            b"a".as_slice(),
+            b"a".as_slice(),
+            b"b".as_slice(),
+        ] {
+            handle_outcome(
+                &bare_crash(),
+                input,
+                "mock",
+                &emitter,
+                &mut seen,
+                &mut class_counts,
+                &mut finding_ids,
+                &mut crashes,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            finding_ids.len(),
+            2,
+            "repeated identical unlocalized input dedups; only the distinct input adds a candidate"
+        );
+        // Exactly two bounded slots consumed for this one class (not four).
+        assert_eq!(
+            class_counts.values().copied().max().unwrap_or(0),
+            2,
+            "repeats must not consume the per-class candidate cap: {class_counts:?}"
         );
 
         std::fs::remove_dir_all(&work_dir).ok();

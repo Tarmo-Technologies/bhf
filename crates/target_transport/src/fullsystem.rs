@@ -460,7 +460,9 @@ where
     FQ: Fn() -> Result<CQ>,
     FG: Fn() -> Result<CG>,
     CQ: Read + Write + 'static,
-    CG: Read + Write + 'static,
+    // The gdb channel drives the bounded `continue`, so it must be able to set a
+    // read deadline (#70 re-review); the QMP channel does not.
+    CG: Read + Write + crate::gdb::ReadDeadline + 'static,
 {
     fn arm(&self) -> Result<Box<dyn TargetSession>> {
         let mut qmp = QmpClient::new((self.connect_qmp)()?);
@@ -503,7 +505,9 @@ pub struct FullSystemSession<CQ, CG> {
     exec_deadline: Option<Duration>,
 }
 
-impl<CQ: Read + Write, CG: Read + Write> TargetSession for FullSystemSession<CQ, CG> {
+impl<CQ: Read + Write, CG: Read + Write + crate::gdb::ReadDeadline> TargetSession
+    for FullSystemSession<CQ, CG>
+{
     fn run_input(&mut self, input: &[u8]) -> Result<RunOutcome> {
         // Reset to the baseline snapshot. loadvm needs paused vCPUs, so stop
         // first (idempotent). This is the per-iteration reset — it replaces the
@@ -541,6 +545,7 @@ impl<CQ: Read + Write, CG: Read + Write> TargetSession for FullSystemSession<CQ,
                     coverage_incomplete: Some(
                         "guest hung: coverage ring not read after an execution timeout".to_owned(),
                     ),
+                    inconclusive: None,
                 });
             }
         };
@@ -550,6 +555,7 @@ impl<CQ: Read + Write, CG: Read + Write> TargetSession for FullSystemSession<CQ,
         let mut exit = stop.to_exit_kind();
         let mut fault = fault_from_stop(&stop);
         let mut coverage_incomplete: Option<String> = None;
+        let mut inconclusive: Option<String> = None;
 
         // Explicit firmware fault-status channel (#72). A target whose fault
         // handler returns through the completion breakpoint reports a benign
@@ -569,8 +575,26 @@ impl<CQ: Read + Write, CG: Read + Write> TargetSession for FullSystemSession<CQ,
                     });
                 }
                 Ok(_) => {}
+                Err(err) if exit == ExitKind::Crash => {
+                    // The stop itself is already a crash; the fault-status word
+                    // would only add detail, so a failed read does not erase the
+                    // known crash — note it as incomplete evidence (#74) and keep
+                    // the authoritative Crash classification.
+                    coverage_incomplete = Some(format!(
+                        "fault-status read failed after a crash stop: {err}"
+                    ));
+                }
                 Err(err) => {
-                    coverage_incomplete = Some(format!("fault-status read failed: {err}"));
+                    // A benign completion stop whose fault-status word could NOT be
+                    // read is INCONCLUSIVE (#72 re-review): that word is the only
+                    // thing distinguishing a clean completion from a fault that
+                    // returned through the `done` breakpoint, so we must not count
+                    // this as a clean pass nor invent a crash — mark it inconclusive
+                    // and retain the reason.
+                    inconclusive = Some(format!(
+                        "firmware fault-status read failed on a benign completion stop: {err} \
+                         — cannot distinguish a clean completion from a returned-through-done fault"
+                    ));
                 }
             }
         }
@@ -590,6 +614,7 @@ impl<CQ: Read + Write, CG: Read + Write> TargetSession for FullSystemSession<CQ,
             fault,
             stdout,
             coverage_incomplete,
+            inconclusive,
         })
     }
 }
@@ -988,6 +1013,85 @@ mod tests {
         let outcome = session.run_input(b"ok").unwrap();
         assert_eq!(outcome.exit, ExitKind::Ok);
         assert!(outcome.fault.is_none());
+        assert!(
+            outcome.inconclusive.is_none(),
+            "a successful fault-status read is conclusive"
+        );
+    }
+
+    #[test]
+    fn benign_stop_with_unreadable_fault_status_is_inconclusive() {
+        // #72 re-review: a benign completion stop (S05) whose CONFIGURED firmware
+        // fault-status word cannot be read is INCONCLUSIVE — that word is the only
+        // thing distinguishing a clean completion from a fault that returned
+        // through the `done` breakpoint. The run must NOT be presented as a clean
+        // pass (nor a fabricated crash); the benign exit stays, with the reason
+        // retained in `inconclusive`.
+        const STATUS_ADDR: u64 = 0x6000;
+        let (image, write, wrapped) = scripted_ring(&[7], 64);
+        let map = GdbMemoryMap {
+            input_address: 0x1000,
+            ring_address: 0x4000,
+            ring_write_address: 0x5000,
+            ring_wrapped_address: 0x5100,
+            ring_capacity: 64,
+        };
+        let (gdb_client_end, gdb_stub_end) = duplex();
+        let stub = MockGdbStub::new(gdb_stub_end, Arc::new(Mutex::new(Vec::new())))
+            .with_stop_reply(b"S05".to_vec()) // benign completion trap
+            .with_region(map.input_address, vec![0_u8; 64])
+            .with_region(map.ring_address, image)
+            .with_region(map.ring_write_address, write.to_le_bytes().to_vec())
+            .with_region(map.ring_wrapped_address, vec![u8::from(wrapped)])
+            // The fault-status region is only 2 bytes, but the contract reads 4,
+            // so the read fails — the fault channel could not be observed.
+            .with_region(STATUS_ADDR, vec![0_u8; 2]);
+        thread::spawn(move || {
+            let _ = stub.serve();
+        });
+        let (qmp_client_end, qmp_server_end) = duplex();
+        let server = MockQmpServer::new(qmp_server_end, Arc::new(Mutex::new(Vec::new())));
+        thread::spawn(move || {
+            let _ = server.serve();
+        });
+        let gdb_slot = Mutex::new(Some(gdb_client_end));
+        let qmp_slot = Mutex::new(Some(qmp_client_end));
+        let transport = FullSystemTransport::new(
+            move || {
+                qmp_slot
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .ok_or_else(|| TransportError::protocol("q"))
+            },
+            move || {
+                gdb_slot
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .ok_or_else(|| TransportError::protocol("g"))
+            },
+            map,
+            "bhf-baseline",
+        )
+        .unwrap()
+        .with_fault_status(GuestFaultStatus::new(STATUS_ADDR, 4, 0).unwrap());
+        let mut session = transport.arm().unwrap();
+        let outcome = session.run_input(b"x").unwrap();
+
+        assert_eq!(
+            outcome.exit,
+            ExitKind::Ok,
+            "the benign stop classification is left intact, not upgraded to a crash"
+        );
+        assert!(outcome.fault.is_none(), "no crash is invented");
+        let reason = outcome
+            .inconclusive
+            .expect("a failed fault-status read on a benign stop is inconclusive, not clean");
+        assert!(
+            reason.contains("fault-status"),
+            "the inconclusive reason is retained: {reason}"
+        );
     }
 
     #[test]

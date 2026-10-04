@@ -131,6 +131,17 @@ pub struct RunOutcome {
     /// already-observed crash, nor be silently presented as complete, clean
     /// coverage. `None` means coverage was fully collected.
     pub coverage_incomplete: Option<String>,
+    /// `Some(reason)` when a *fault-determining* observation the backend was
+    /// configured to make could not be completed, so the clean/crash verdict in
+    /// [`exit`](Self::exit) is UNRELIABLE — the run is neither proven clean nor
+    /// proven crashed (e.g. a full-system completion stop whose firmware
+    /// fault-status word could not be read: that word is what distinguishes a
+    /// benign completion from a returned-through-`done` fault). Distinct from
+    /// [`coverage_incomplete`](Self::coverage_incomplete), which leaves the
+    /// classification authoritative. A consumer must NOT count an inconclusive
+    /// run as a clean pass or invent a crash; it records it as inconclusive and
+    /// retains the reason. `None` means the classification is trustworthy.
+    pub inconclusive: Option<String>,
 }
 
 impl RunOutcome {
@@ -142,6 +153,7 @@ impl RunOutcome {
             fault: None,
             stdout: Vec::new(),
             coverage_incomplete: None,
+            inconclusive: None,
         }
     }
 }

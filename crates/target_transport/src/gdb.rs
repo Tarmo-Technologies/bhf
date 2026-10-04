@@ -31,6 +31,27 @@ use crate::transport::{TargetSession, TargetTransport};
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
+/// A byte channel that can bound how long a single subsequent read may block.
+///
+/// [`GdbClient::cont_until`] uses this to re-arm each blocking read with the
+/// REMAINING absolute per-input budget, so neither the `continue` send/ack nor
+/// any one packet — even one dribbled a byte at a time — can push the total past
+/// the deadline. A channel that cannot enforce a read deadline returns `false`;
+/// such a channel is acceptable only when it cannot block indefinitely (the
+/// in-memory test pipe), and the GDB transport's live channel is always a
+/// `TcpStream`, which can.
+pub trait ReadDeadline {
+    /// Set the maximum time a single subsequent read may block (`None` clears the
+    /// bound). Returns `false` if the channel cannot enforce one.
+    fn set_read_deadline(&self, timeout: Option<Duration>) -> bool;
+}
+
+impl ReadDeadline for std::net::TcpStream {
+    fn set_read_deadline(&self, timeout: Option<Duration>) -> bool {
+        self.set_read_timeout(timeout).is_ok()
+    }
+}
+
 /// RSP escape byte (`}`); the following byte is the real byte XOR 0x20.
 const ESCAPE: u8 = 0x7d;
 /// RSP run-length-encoding marker (`*`).
@@ -384,6 +405,24 @@ impl<C: Read + Write> GdbConnection<C> {
     }
 }
 
+impl<C: Read + Write + ReadDeadline> GdbConnection<C> {
+    /// Bound the next blocking read(s) by the REMAINING time until `deadline`, so
+    /// the absolute per-input budget is enforced read-by-read (#70 re-review). A
+    /// `None` deadline leaves the channel's standing timeout unchanged. A minimum
+    /// of 1ms is armed even once the budget is spent, so the next read returns
+    /// promptly (rather than with a zero/forever timeout) and the caller observes
+    /// the deadline. Channels that cannot set a read deadline are a no-op here;
+    /// the GDB transport's live channel is a `TcpStream`, which can.
+    fn arm_read_budget(&mut self, deadline: Option<Instant>) {
+        if let Some(deadline) = deadline {
+            let remaining = deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(1));
+            let _ = self.channel.set_read_deadline(Some(remaining));
+        }
+    }
+}
+
 /// Higher-level RSP client: attach, memory access, continue, reset.
 pub struct GdbClient<C> {
     connection: GdbConnection<C>,
@@ -476,7 +515,12 @@ impl<C: Read + Write> GdbClient<C> {
         }
         from_hex(&response)
     }
+}
 
+/// The `continue`-family run-control, split out because it bounds each blocking
+/// read by the remaining absolute per-input budget (#70 re-review) and therefore
+/// needs a channel that can set a read deadline ([`ReadDeadline`]).
+impl<C: Read + Write + ReadDeadline> GdbClient<C> {
     /// Continue execution via `c`, draining any intermediate `O<hex>` console
     /// -output packets (semihosting / serial writes the target emits while it
     /// runs) until the terminal stop reply. Returns the stop together with the
@@ -511,14 +555,22 @@ impl<C: Read + Write> GdbClient<C> {
     /// the unbounded behavior (bounded only by the socket read timeout and the
     /// packet/byte caps), for callers with no per-input deadline.
     pub fn cont_until(&mut self, deadline: Option<Instant>) -> Result<(ContStop, Vec<u8>)> {
+        // Arm the `c` send + its ack read with the remaining budget, then send.
+        self.connection.arm_read_budget(deadline);
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Ok((ContStop::DeadlineExceeded, Vec::new()));
+        }
         self.connection.send_packet(b"c")?;
         let mut output = Vec::new();
         for _ in 0..MAX_CONSOLE_PACKETS {
-            if let Some(deadline) = deadline {
-                if Instant::now() >= deadline {
-                    return Ok((ContStop::DeadlineExceeded, output));
-                }
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                return Ok((ContStop::DeadlineExceeded, output));
             }
+            // Re-arm every read with the REMAINING absolute budget, so no single
+            // packet — even one dribbled a byte at a time — can push the total past
+            // the deadline (a fixed per-read socket timeout could be restarted
+            // indefinitely by partial progress).
+            self.connection.arm_read_budget(deadline);
             let frame = match self.connection.recv_packet() {
                 Ok(frame) => frame,
                 // A read timeout while a per-input deadline is in force is the
@@ -540,14 +592,23 @@ impl<C: Read + Write> GdbClient<C> {
                     }
                     output.extend_from_slice(&decoded);
                 }
-                _ => return Ok((ContStop::Stopped(StopReply::parse(&frame)?), output)),
+                // A terminal stop reply. Reject it as a hang if it only arrived
+                // AFTER the deadline — a late stop is not a normal in-budget stop.
+                _ => {
+                    if deadline.is_some_and(|d| Instant::now() >= d) {
+                        return Ok((ContStop::DeadlineExceeded, output));
+                    }
+                    return Ok((ContStop::Stopped(StopReply::parse(&frame)?), output));
+                }
             }
         }
         Err(TransportError::gdb(format!(
             "received more than {MAX_CONSOLE_PACKETS} console-output packets before a stop reply"
         )))
     }
+}
 
+impl<C: Read + Write> GdbClient<C> {
     /// Reset the target between iterations: enable extended mode, then issue
     /// the `R` restart packet (which, per RSP, has no reply).
     pub fn reset(&mut self) -> Result<()> {
@@ -636,7 +697,7 @@ impl<F> GdbRemoteTransport<F> {
 impl<F, C> TargetTransport for GdbRemoteTransport<F>
 where
     F: Fn() -> Result<C>,
-    C: Read + Write + 'static,
+    C: Read + Write + ReadDeadline + 'static,
 {
     fn arm(&self) -> Result<Box<dyn TargetSession>> {
         let mut client = GdbClient::new((self.connect)()?);
@@ -680,7 +741,7 @@ pub struct GdbSession<C> {
     exec_deadline: Option<Duration>,
 }
 
-impl<C: Read + Write> TargetSession for GdbSession<C> {
+impl<C: Read + Write + ReadDeadline> TargetSession for GdbSession<C> {
     fn run_input(&mut self, input: &[u8]) -> Result<RunOutcome> {
         // SETUP phase: reset + input injection. A failure here — including an I/O
         // timeout — is a control/infrastructure error, NOT a target-execution
@@ -716,6 +777,7 @@ impl<C: Read + Write> TargetSession for GdbSession<C> {
                     coverage_incomplete: Some(
                         "target hung: coverage ring not read after an execution timeout".to_owned(),
                     ),
+                    inconclusive: None,
                 });
             }
         };
@@ -737,6 +799,7 @@ impl<C: Read + Write> TargetSession for GdbSession<C> {
             fault: None,
             stdout,
             coverage_incomplete,
+            inconclusive: None,
         })
     }
 }
@@ -1126,6 +1189,12 @@ mod tests {
         }
     }
 
+    impl ReadDeadline for AckThenSilent {
+        fn set_read_deadline(&self, _timeout: Option<Duration>) -> bool {
+            false
+        }
+    }
+
     #[test]
     fn cont_until_times_out_on_a_silent_target_within_deadline() {
         // The target acks the `c` packet (one `+`) then stays silent. With a
@@ -1158,6 +1227,57 @@ mod tests {
         assert!(
             is_timeout_err(&err),
             "a bare read timeout must propagate: {err}"
+        );
+    }
+
+    #[test]
+    fn cont_until_partial_packet_then_stall_hits_the_deadline() {
+        // #70 re-review (partial-response boundary): the target acks `c` and
+        // begins a stop reply (`$T0`) but never terminates the packet before going
+        // silent. A partial/dribbled packet must NOT hang past the per-input
+        // deadline — the read budget expires and cont_until reports DeadlineExceeded
+        // rather than blocking inside one packet.
+        let channel = AckThenSilent {
+            to_read: std::collections::VecDeque::from(vec![b'+', b'$', b'T', b'0']),
+        };
+        let mut client = GdbClient::new(channel);
+        let deadline = Instant::now() + Duration::from_secs(3600);
+        let (stop, _out) = client.cont_until(Some(deadline)).unwrap();
+        assert_eq!(stop, ContStop::DeadlineExceeded);
+    }
+
+    #[test]
+    fn tcpstream_read_deadline_is_actually_enforced() {
+        // The ReadDeadline impl the bounded run-control relies on must really bound
+        // a blocking read on the live channel type. Connect a loopback pair, arm a
+        // short read deadline, and read with no data available: the OS returns a
+        // timeout promptly rather than blocking forever (#70 re-review).
+        use std::io::Read;
+        use std::net::{TcpListener, TcpStream};
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).expect("connect");
+        let _server = listener.accept().expect("accept").0; // keep the peer open (no data)
+
+        assert!(
+            ReadDeadline::set_read_deadline(&client, Some(Duration::from_millis(150))),
+            "a TcpStream must be able to set a read deadline"
+        );
+        let started = Instant::now();
+        let mut buf = [0_u8; 1];
+        let err = (&client)
+            .read(&mut buf)
+            .expect_err("read must time out, not block forever");
+        assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "a read past the deadline is a timeout, got: {err:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the read deadline must bound the blocking read"
         );
     }
 

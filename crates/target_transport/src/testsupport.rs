@@ -139,6 +139,15 @@ impl Write for DuplexStream {
     }
 }
 
+impl crate::gdb::ReadDeadline for DuplexStream {
+    /// An in-memory pipe cannot set a read deadline — but it also never blocks
+    /// indefinitely (a read returns promptly or observes EOF), so a per-input
+    /// execution deadline is still enforced by the caller's wall-clock checks.
+    fn set_read_deadline(&self, _timeout: Option<std::time::Duration>) -> bool {
+        false
+    }
+}
+
 /// Create a connected pair of [`DuplexStream`] ends.
 pub fn duplex() -> (DuplexStream, DuplexStream) {
     let (a_writer, a_reader) = new_pipe(); // direction: end1 -> end2
@@ -196,6 +205,7 @@ impl ScriptedResponse {
             fault: self.fault.clone(),
             stdout: Vec::new(),
             coverage_incomplete: None,
+            inconclusive: None,
         }
     }
 }

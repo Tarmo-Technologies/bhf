@@ -399,6 +399,7 @@ mod tests {
             fault: None,
             stdout: Vec::new(),
             coverage_incomplete: None,
+            inconclusive: None,
         };
         let report = outcome_finding(&bare_crash).expect("faultless crash is still a finding");
         assert_eq!(report.rule_id, "BHF-210");
@@ -409,6 +410,7 @@ mod tests {
             fault: None,
             stdout: Vec::new(),
             coverage_incomplete: None,
+            inconclusive: None,
         };
         let report = outcome_finding(&bare_timeout).expect("faultless timeout is still a finding");
         // A timeout is a timing/availability failure (CWE-400), not memory (#78).
