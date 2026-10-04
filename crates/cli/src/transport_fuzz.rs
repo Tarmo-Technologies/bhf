@@ -55,8 +55,8 @@ use fuzz_engine_builtin::{
 };
 use serde::Serialize;
 use target_transport::{
-    AgentTransport, ExitKind, FullSystemTransport, GdbMemoryMap, GdbRemoteTransport, RunOutcome,
-    TargetTransport, TransportError,
+    AgentTransport, ExitKind, FullSystemTransport, GdbMemoryMap, GdbRemoteTransport,
+    GuestFaultStatus, RunOutcome, TargetTransport, TransportError,
 };
 
 use crate::fuzz::FuzzArgs;
@@ -105,6 +105,15 @@ pub(crate) enum TransportPlan {
         gdb_port: u16,
         map: GdbMemoryMap,
         snapshot_tag: String,
+        /// Completion breakpoint `(address, RSP kind)` planted at arm so a
+        /// self-HardFaulting Cortex-M target halts back to the debugger instead
+        /// of running `c` unbounded (#71). `None` for targets that trap on their
+        /// own; the bounded run control (#70) still backstops a missing one.
+        harness_done: Option<(u64, u32)>,
+        /// Firmware fault-status contract read after each run so a fault that
+        /// returns through the completion breakpoint is classified as a crash
+        /// rather than a silent clean pass (#72).
+        fault_status: Option<GuestFaultStatus>,
     },
 }
 
@@ -255,8 +264,10 @@ impl TransportPlan {
                 gdb_port,
                 map,
                 snapshot_tag,
+                harness_done,
+                fault_status,
             } => {
-                let transport = FullSystemTransport::new(
+                let mut transport = FullSystemTransport::new(
                     move || {
                         std::net::TcpStream::connect((qmp_host.as_str(), qmp_port))
                             .map_err(TransportError::from)
@@ -268,6 +279,17 @@ impl TransportPlan {
                     map,
                     snapshot_tag,
                 )?;
+                // Wire the completion contract (#71) and the firmware
+                // fault-status channel (#72) the parser captured, so the guide's
+                // `bhf fuzz --target-transport qemu-system:...` command plants
+                // the harness-done breakpoint itself rather than relying on an
+                // out-of-band debugger.
+                if let Some((address, kind)) = harness_done {
+                    transport = transport.with_harness_breakpoint(address, kind);
+                }
+                if let Some(status) = fault_status {
+                    transport = transport.with_fault_status(status);
+                }
                 Ok(Box::new(transport))
             }
         }
@@ -315,6 +337,18 @@ fn parse_qemu_system(
     let mut qmp: Option<(String, u16)> = None;
     let mut gdb: Option<(String, u16)> = None;
     let mut snapshot_tag = DEFAULT_SNAPSHOT_TAG.to_owned();
+    // Completion contract (#71) and firmware fault-status (#72), all optional.
+    let mut done: Option<u64> = None;
+    let mut done_kind: u64 = 2; // ARM Thumb breakpoint kind (instruction size).
+    let mut fault: Option<u64> = None;
+    let mut fault_width: u64 = 4;
+    let mut fault_clear: u64 = 0;
+
+    let malformed = |reason: String| TransportSpecError::Malformed {
+        backend: "qemu-system",
+        spec: spec.to_owned(),
+        reason,
+    };
 
     for part in rest.split(',') {
         let part = part.trim();
@@ -323,35 +357,49 @@ fn parse_qemu_system(
         }
         let (key, value) = part
             .split_once('=')
-            .ok_or_else(|| TransportSpecError::Malformed {
-                backend: "qemu-system",
-                spec: spec.to_owned(),
-                reason: format!("expected key=value in {part:?}"),
-            })?;
+            .ok_or_else(|| malformed(format!("expected key=value in {part:?}")))?;
+        let value = value.trim();
         match key.trim() {
-            "qmp" => qmp = Some(parse_host_port("qemu-system", spec, value.trim())?),
-            "gdb" => gdb = Some(parse_host_port("qemu-system", spec, value.trim())?),
-            "snapshot" => snapshot_tag = value.trim().to_owned(),
+            "qmp" => qmp = Some(parse_host_port("qemu-system", spec, value)?),
+            "gdb" => gdb = Some(parse_host_port("qemu-system", spec, value)?),
+            "snapshot" => snapshot_tag = value.to_owned(),
+            "done" => done = Some(parse_int("done", value)?),
+            "done_kind" => done_kind = parse_int("done_kind", value)?,
+            "fault" => fault = Some(parse_int("fault", value)?),
+            "fault_width" => fault_width = parse_int("fault_width", value)?,
+            "fault_clear" => fault_clear = parse_int("fault_clear", value)?,
             other => {
-                return Err(TransportSpecError::Malformed {
-                    backend: "qemu-system",
-                    spec: spec.to_owned(),
-                    reason: format!("unknown key {other:?}; allowed: qmp, gdb, snapshot"),
-                })
+                return Err(malformed(format!(
+                    "unknown key {other:?}; allowed: qmp, gdb, snapshot, done, done_kind, \
+                     fault, fault_width, fault_clear"
+                )))
             }
         }
     }
 
-    let (qmp_host, qmp_port) = qmp.ok_or_else(|| TransportSpecError::Malformed {
-        backend: "qemu-system",
-        spec: spec.to_owned(),
-        reason: "missing required key qmp=HOST:PORT".to_owned(),
-    })?;
-    let (gdb_host, gdb_port) = gdb.ok_or_else(|| TransportSpecError::Malformed {
-        backend: "qemu-system",
-        spec: spec.to_owned(),
-        reason: "missing required key gdb=HOST:PORT".to_owned(),
-    })?;
+    let (qmp_host, qmp_port) =
+        qmp.ok_or_else(|| malformed("missing required key qmp=HOST:PORT".to_owned()))?;
+    let (gdb_host, gdb_port) =
+        gdb.ok_or_else(|| malformed("missing required key gdb=HOST:PORT".to_owned()))?;
+
+    let harness_done = match done {
+        Some(address) => {
+            let kind = u32::try_from(done_kind)
+                .map_err(|_| malformed(format!("done_kind {done_kind} is out of range")))?;
+            Some((address, kind))
+        }
+        None => None,
+    };
+    let fault_status = match fault {
+        Some(address) => {
+            let width = usize::try_from(fault_width)
+                .map_err(|_| malformed(format!("fault_width {fault_width} is out of range")))?;
+            // GuestFaultStatus::new validates the width (1..=8); its error maps
+            // through TransportSpecError::Transport.
+            Some(GuestFaultStatus::new(address, width, fault_clear)?)
+        }
+        None => None,
+    };
 
     Ok(TransportPlan::QemuSystem {
         qmp_host,
@@ -360,6 +408,8 @@ fn parse_qemu_system(
         gdb_port,
         map,
         snapshot_tag,
+        harness_done,
+        fault_status,
     })
 }
 
@@ -919,6 +969,8 @@ mod tests {
                 gdb_port,
                 map,
                 snapshot_tag,
+                harness_done,
+                fault_status,
             } => {
                 assert_eq!(qmp_host, "127.0.0.1");
                 assert_eq!(qmp_port, 4444);
@@ -927,6 +979,9 @@ mod tests {
                 assert_eq!(map.input_address, 4096);
                 assert_eq!(map.ring_capacity, 32);
                 assert_eq!(snapshot_tag, DEFAULT_SNAPSHOT_TAG);
+                // No completion contract keys => both unset.
+                assert!(harness_done.is_none());
+                assert!(fault_status.is_none());
             }
             other => panic!("expected QemuSystem, got {other:?}"),
         }
@@ -942,6 +997,81 @@ mod tests {
             }
             other => panic!("expected QemuSystem, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_qemu_system_completion_and_fault_status_contract() {
+        let map_spec = "input=4096,ring=16384,write=20480,wrapped=20736,cap=32";
+        // done= plants the completion breakpoint (default Thumb kind 2); fault=
+        // declares the firmware fault-status word (#71/#72).
+        let plan = TransportPlan::parse(
+            "qemu-system:qmp=h:1,gdb=h:2,done=0x1a8,fault=0x20000100",
+            Some(map_spec),
+        )
+        .unwrap();
+        match plan {
+            TransportPlan::QemuSystem {
+                harness_done,
+                fault_status,
+                ..
+            } => {
+                assert_eq!(harness_done, Some((0x1a8, 2)));
+                let status = fault_status.expect("fault status present");
+                assert_eq!(status.address, 0x2000_0100);
+                assert_eq!(status.width, 4);
+                assert_eq!(status.clear_value, 0);
+            }
+            other => panic!("expected QemuSystem, got {other:?}"),
+        }
+        // Explicit kind/width/clear are honored.
+        let plan = TransportPlan::parse(
+            "qemu-system:qmp=h:1,gdb=h:2,done=0x200,done_kind=4,fault=0x300,fault_width=2,fault_clear=0xff",
+            Some(map_spec),
+        )
+        .unwrap();
+        match plan {
+            TransportPlan::QemuSystem {
+                harness_done,
+                fault_status,
+                ..
+            } => {
+                assert_eq!(harness_done, Some((0x200, 4)));
+                let status = fault_status.unwrap();
+                assert_eq!(status.width, 2);
+                assert_eq!(status.clear_value, 0xff);
+            }
+            other => panic!("expected QemuSystem, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn qemu_system_rejects_invalid_fault_width() {
+        let map_spec = "input=4096,ring=16384,write=20480,wrapped=20736,cap=32";
+        let error = TransportPlan::parse(
+            "qemu-system:qmp=h:1,gdb=h:2,fault=0x300,fault_width=9",
+            Some(map_spec),
+        )
+        .unwrap_err();
+        // GuestFaultStatus::new rejects width 9 (>8); it surfaces as a Transport
+        // spec error rather than being silently accepted.
+        assert!(
+            matches!(error, TransportSpecError::Transport(_)),
+            "expected a transport validation error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn qemu_system_into_transport_wires_completion_contract() {
+        // The whole CLI parse -> build path accepts the completion contract and
+        // produces a transport (the breakpoint/fault-status behavior itself is
+        // proven end-to-end by the live RV-3 Cortex-M test).
+        let map_spec = "input=4096,ring=16384,write=20480,wrapped=20736,cap=32";
+        let plan = TransportPlan::parse(
+            "qemu-system:qmp=127.0.0.1:1,gdb=127.0.0.1:2,done=0x1a8,fault=0x20000100",
+            Some(map_spec),
+        )
+        .unwrap();
+        assert!(plan.into_transport().is_ok());
     }
 
     #[test]
