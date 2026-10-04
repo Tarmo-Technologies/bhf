@@ -321,6 +321,120 @@ impl WinCoreBuilder {
     }
 }
 
+// --- Native ETW session-lifecycle policy (pure, Linux-tested) ---------------
+//
+// The native consumer in `crate::etw` runs its OWN uniquely-named ETW
+// system-logger session and may stop ONLY a session it created. All of that
+// ownership logic lives here, OS-free, so it is unit-tested on Linux; the native
+// code maps `StartTraceW`/`ControlTraceW` status codes onto these types and acts
+// on the decision, holding no policy of its own (#77).
+
+/// Maximum number of distinct BHF-owned session names tried before degrading, so
+/// a name-collision storm can never spawn an unbounded number of sessions (one
+/// per testcase would leak resources and exhaust the 8 system-logger slots).
+pub const MAX_SESSION_NAME_ATTEMPTS: u32 = 4;
+
+/// The BHF-owned private ETW session name for this process and instance. Always a
+/// descriptive, BHF-scoped name — never `KERNEL_LOGGER_NAME` — so the collector
+/// can only ever control a session it started, never the global NT Kernel Logger
+/// or another application's session.
+pub fn owned_session_name(pid: u32, instance: u64) -> String {
+    format!("BHF-Collector-{pid}-{instance}")
+}
+
+/// Platform-neutral outcome of one `StartTraceW` attempt on a BHF-owned name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionStartStatus {
+    /// `ERROR_SUCCESS`: the session was created and is owned by this process.
+    Started,
+    /// `ERROR_ALREADY_EXISTS`: a session with this name already exists. BHF does
+    /// not own it, so it is never stopped — a fresh unique name is tried instead.
+    AlreadyExists,
+    /// `ERROR_ACCESS_DENIED`: the context lacks the rights to start a session.
+    AccessDenied,
+    /// Any other Win32 status code.
+    Other(u32),
+}
+
+/// Why the collector recorded a degraded (non-clean) observation because it could
+/// not acquire its own session. Each reason routes to a fidelity diagnostic —
+/// never an abort of the fuzz run and never a clean-assurance claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionDegradeReason {
+    /// Starting a session needs rights the current context did not have.
+    PermissionDenied,
+    /// Every attempted BHF-owned name was already taken.
+    NameCollisionExhausted,
+    /// Another Win32 failure (carries the status code for diagnostics).
+    Other(u32),
+}
+
+impl SessionDegradeReason {
+    /// The `fidelity.unsupported_fields` diagnostic string for this reason.
+    pub fn diagnostic(&self) -> String {
+        match self {
+            SessionDegradeReason::PermissionDenied => "etw.session_start_access_denied".to_owned(),
+            SessionDegradeReason::NameCollisionExhausted => {
+                "etw.session_name_collision_exhausted".to_owned()
+            }
+            SessionDegradeReason::Other(code) => format!("etw.session_start_status={code}"),
+        }
+    }
+}
+
+/// What the consumer should do after one `StartTraceW` attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionStartDecision {
+    /// The session started and is owned; consume it, then stop via its handle.
+    Proceed,
+    /// The name collided; retry under a fresh unique name (attempts remain).
+    RetryWithNewName,
+    /// Give up and record a degraded observation; stop nothing.
+    Degrade(SessionDegradeReason),
+}
+
+/// The whole session-acquisition policy. `attempt` is the zero-based retry index.
+///
+/// An `AlreadyExists` collision never authorizes a stop: while attempts remain it
+/// asks for a fresh unique name, and once they are exhausted it degrades — the
+/// colliding (unowned) session is left running in either case. Only `Proceed`
+/// yields an owned session, and only an owned session is ever stopped (see
+/// [`SessionStopTarget`]).
+pub fn decide_session_start(status: SessionStartStatus, attempt: u32) -> SessionStartDecision {
+    match status {
+        SessionStartStatus::Started => SessionStartDecision::Proceed,
+        SessionStartStatus::AccessDenied => {
+            SessionStartDecision::Degrade(SessionDegradeReason::PermissionDenied)
+        }
+        SessionStartStatus::Other(code) => {
+            SessionStartDecision::Degrade(SessionDegradeReason::Other(code))
+        }
+        SessionStartStatus::AlreadyExists => {
+            if attempt + 1 < MAX_SESSION_NAME_ATTEMPTS {
+                SessionStartDecision::RetryWithNewName
+            } else {
+                SessionStartDecision::Degrade(SessionDegradeReason::NameCollisionExhausted)
+            }
+        }
+    }
+}
+
+/// The only thing teardown may ever stop: a session this process started and
+/// still owns, identified by the control handle `StartTraceW` returned. There is
+/// deliberately no by-name variant — the collector cannot even express stopping a
+/// session it did not create, which is the #77 invariant enforced in the types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionStopTarget {
+    OwnedHandle(u64),
+}
+
+/// The stop plan for a session the collector owns (its `StartTraceW` control
+/// handle). Teardown issues `ControlTraceW(EVENT_TRACE_CONTROL_STOP)` against this
+/// handle — never a global or otherwise unowned session name.
+pub fn stop_plan_for_owned(control_handle: u64) -> SessionStopTarget {
+    SessionStopTarget::OwnedHandle(control_handle)
+}
+
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || needle.len() > haystack.len() {
         return None;
@@ -519,6 +633,103 @@ mod tests {
             "permission denial must block a clean assurance, not report nothing"
         );
         assert!(session.fidelity.permission_denied);
+    }
+
+    #[test]
+    fn owned_session_name_is_bhf_scoped_not_the_nt_kernel_logger() {
+        let name = owned_session_name(4242, 7);
+        assert!(name.starts_with("BHF-Collector-"), "name: {name}");
+        assert!(name.contains("4242"), "carries the pid: {name}");
+        assert_ne!(name, "NT Kernel Logger", "never the global kernel logger");
+        // Distinct instances yield distinct names so a retry (or a concurrent
+        // worker) never reuses a name that is already taken.
+        assert_ne!(owned_session_name(4242, 0), owned_session_name(4242, 1));
+        assert_ne!(owned_session_name(1, 0), owned_session_name(2, 0));
+    }
+
+    #[test]
+    fn start_success_is_the_only_outcome_that_yields_a_stoppable_session() {
+        assert_eq!(
+            decide_session_start(SessionStartStatus::Started, 0),
+            SessionStartDecision::Proceed
+        );
+        // Teardown stops strictly via the owned handle StartTraceW returned; the
+        // stop target has no by-name variant, so an unowned session is unstoppable.
+        assert_eq!(
+            stop_plan_for_owned(0xDEAD_BEEF),
+            SessionStopTarget::OwnedHandle(0xDEAD_BEEF)
+        );
+    }
+
+    #[test]
+    fn already_exists_collision_never_stops_the_unowned_session() {
+        // Collision on a BHF-owned name: BHF did not create the colliding session,
+        // so across every attempt the decision is retry-then-degrade — NEVER
+        // Proceed, the only outcome that would yield an owned handle (and thus any
+        // stop at all). This is the #77 "do not stop another app's session" proof.
+        for attempt in 0..MAX_SESSION_NAME_ATTEMPTS {
+            let decision = decide_session_start(SessionStartStatus::AlreadyExists, attempt);
+            assert_ne!(
+                decision,
+                SessionStartDecision::Proceed,
+                "a name collision must never be treated as an owned session (attempt {attempt})"
+            );
+            if attempt + 1 < MAX_SESSION_NAME_ATTEMPTS {
+                assert_eq!(decision, SessionStartDecision::RetryWithNewName);
+            } else {
+                assert_eq!(
+                    decision,
+                    SessionStartDecision::Degrade(SessionDegradeReason::NameCollisionExhausted)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn collision_retries_are_bounded() {
+        // The final attempt degrades rather than retrying, so the number of
+        // sessions BHF can create per observation is bounded — no unbounded churn
+        // of random sessions, one per testcase.
+        let last = decide_session_start(
+            SessionStartStatus::AlreadyExists,
+            MAX_SESSION_NAME_ATTEMPTS - 1,
+        );
+        assert_eq!(
+            last,
+            SessionStartDecision::Degrade(SessionDegradeReason::NameCollisionExhausted)
+        );
+        // Every earlier attempt retries, so acquisition tries at most
+        // MAX_SESSION_NAME_ATTEMPTS names before degrading — a bounded budget.
+        let retries = (0..MAX_SESSION_NAME_ATTEMPTS - 1)
+            .filter(|a| {
+                decide_session_start(SessionStartStatus::AlreadyExists, *a)
+                    == SessionStartDecision::RetryWithNewName
+            })
+            .count();
+        assert_eq!(retries as u32, MAX_SESSION_NAME_ATTEMPTS - 1);
+    }
+
+    #[test]
+    fn access_denied_degrades_to_permission_denied_not_abort() {
+        assert_eq!(
+            decide_session_start(SessionStartStatus::AccessDenied, 0),
+            SessionStartDecision::Degrade(SessionDegradeReason::PermissionDenied)
+        );
+        // The degrade reason carries an actionable diagnostic, never silence.
+        assert!(SessionDegradeReason::PermissionDenied
+            .diagnostic()
+            .contains("access_denied"));
+    }
+
+    #[test]
+    fn other_status_degrades_with_the_code_in_the_diagnostic() {
+        assert_eq!(
+            decide_session_start(SessionStartStatus::Other(1450), 0),
+            SessionStartDecision::Degrade(SessionDegradeReason::Other(1450))
+        );
+        assert!(SessionDegradeReason::Other(1450)
+            .diagnostic()
+            .contains("1450"));
     }
 
     #[test]

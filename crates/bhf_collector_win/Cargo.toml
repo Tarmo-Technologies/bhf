@@ -34,3 +34,12 @@ windows-sys = { version = "0.61", features = [
     # and are gated behind this feature in windows-sys 0.61.
     "Win32_System_Time",
 ] }
+
+# The gated (BHF_WIN_LIVE) live ownership test starts and queries an unrelated ETW
+# session directly to prove the collector never stops a session it did not create
+# (#77). Same crate/version/license as the runtime dependency above.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_Etw",
+] }
