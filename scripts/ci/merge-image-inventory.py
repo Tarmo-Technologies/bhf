@@ -70,7 +70,28 @@ def main():
         return json.loads((args.evidence / name).read_text())
     result = reconcile(read("filesystem.cyclonedx.json"), read("rust.cyclonedx.json"),
                        read("build-receipt.json"), read("image-inspect.json"), args.binaries)
+    tools = read("toolchains.json")
+    flavor = read("image-inspect.json")[0]["Config"]["Labels"]["io.tarmo.bhf.flavor"]
+    result = reconcile_tools(result, tools, flavor)
     (args.evidence / "image.cyclonedx.json").write_text(json.dumps(result, indent=2) + "\n")
+
+
+def reconcile_tools(sbom, tools, flavor):
+    expected = {"node", "esbuild", "go", "rustup", "rustc", "cargo", "rust-std", "llvm-tools-preview"} if flavor == "runtime" else set()
+    components = tools["components"]
+    if tools["flavor"] != flavor or {c["name"] for c in components} != expected:
+        raise ValueError("missing or mismatched standalone toolchain inventory")
+    refs = {c["bom-ref"] for c in sbom["components"]}
+    for c in components:
+        files = json.loads(next(p["value"] for p in c["properties"] if p["name"] == "bhf:installed-files-sha256"))
+        if not files or any(not re.fullmatch("[0-9a-f]{64}", sha) for sha in files.values()) or c["bom-ref"] in refs:
+            raise ValueError("invalid standalone toolchain file inventory")
+        refs.add(c["bom-ref"])
+    sbom["components"].extend(components)
+    root = sbom["metadata"]["component"]["bom-ref"]
+    dependency = next(d for d in sbom["dependencies"] if d["ref"] == root)
+    dependency["dependsOn"] = sorted(set(dependency["dependsOn"] + [c["bom-ref"] for c in components]))
+    return sbom
 
 
 if __name__ == "__main__":

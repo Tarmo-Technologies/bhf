@@ -55,6 +55,8 @@ jobs:
             qemu-system-arm \
             qemu-utils \
             gcc-arm-none-eabi \
+            libnewlib-dev \
+            libnewlib-arm-none-eabi \
             gcc-arm-linux-gnueabihf \
             gcc-powerpc64-linux-gnu \
             libc6-dev-armhf-cross \
@@ -71,7 +73,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
-          toolchain: stable
+          toolchain: 1.99.0
 
       - name: Run the emulator-in-the-loop validations
         run: scripts/hil-emu.sh

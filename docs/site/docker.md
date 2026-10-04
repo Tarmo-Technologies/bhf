@@ -122,6 +122,10 @@ unchanged original source, and a failing empty-cache build under network isolati
 
 ## Release inventory and build inputs
 
+Standalone Node, esbuild, Go, rustup, and each installed Rust component also
+have explicit version and file-hash inventories; filesystem discovery alone
+does not reliably identify these prebuilt tools.
+
 The Ubuntu repositories use a dated snapshot. Builder Rust, runtime nightly,
 rustup, Go, Node, Maven, esbuild, Python build tools, and selected Ruby gems have explicit versions; downloaded
 rustup and Go archives have checksum checks. Refresh pins through a reviewed

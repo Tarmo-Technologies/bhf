@@ -87,3 +87,11 @@ class InventoryTests(unittest.TestCase):
         self.rust["metadata"]["properties"][0]["value"] = "d" * 40
         with self.assertRaisesRegex(ValueError, "source identity"):
             self.merge()
+
+    def test_full_image_requires_identified_standalone_toolchains(self):
+        with self.assertRaisesRegex(ValueError, "toolchain inventory"):
+            MERGE.reconcile_tools(self.merge(), {"flavor": "runtime", "components": []}, "runtime")
+
+    def test_core_does_not_claim_extra_toolchains(self):
+        result = MERGE.reconcile_tools(self.merge(), {"flavor": "core", "components": []}, "core")
+        self.assertEqual(len(result["components"]), 4)

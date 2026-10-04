@@ -14,6 +14,12 @@ cleanup() {
 trap cleanup EXIT
 # Resolve once: every subsequent operation uses the immutable local image ID.
 image="$(docker image inspect --format '{{.Id}}' "$image")"
+flavor="$(docker image inspect --format '{{index .Config.Labels "io.tarmo.bhf.flavor"}}' "$image")"
+tool_script="$(realpath "$(dirname "$0")/toolchain-image-inventory.py")"
+docker run --rm --network none --read-only --memory 1g --pids-limit 128 \
+  --cap-drop ALL --security-opt no-new-privileges:true \
+  --volume "$tool_script:/toolchain-inventory.py:ro" "$image" \
+  /usr/bin/python3 /toolchain-inventory.py "$flavor" > "$evidence/toolchains.json"
 docker image inspect "$image" > "$evidence/image-inspect.json"
 container="$(docker create "$image")"
 docker cp "$container:/usr/share/bhf/sbom/rust.cyclonedx.json" "$evidence/rust.cyclonedx.json"
@@ -50,7 +56,7 @@ for component in sbom.get('components', []):
     components[purl.split(':', 1)[1].split('/', 1)[0] if ':' in purl else component['type']] += 1
 severities = collections.Counter(x['vulnerability']['severity'] for x in scan.get('matches', []))
 summary = {
-    'inventory_scope': 'filesystem catalog plus compiler-verified production Cargo runtime graph',
+    'inventory_scope': 'filesystem catalog, compiler-verified production Cargo runtime graph, and standalone toolchain versions/file hashes',
     'components': dict(components),
     'vulnerabilities_by_severity': dict(severities),
     'database': scan.get('descriptor', {}).get('db', {}).get('status', {}),

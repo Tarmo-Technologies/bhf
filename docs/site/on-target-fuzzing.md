@@ -318,7 +318,7 @@ BHF_HIL_REQUIRE=1 scripts/hil-emu.sh
 ```
 
 Prerequisites (Debian/Ubuntu): `qemu-system-arm qemu-user qemu-utils
-gcc-arm-none-eabi gcc-arm-linux-gnueabihf gcc-powerpc64-linux-gnu binutils`.
+gcc-arm-none-eabi libnewlib-dev libnewlib-arm-none-eabi gcc-arm-linux-gnueabihf gcc-powerpc64-linux-gnu binutils`.
 RV-1 through RV-3 were validated on QEMU in September 2026 (see
 `docs/validation/2026-09-27-hil-emu-live-qemu.md`). RV-4 passed locally on
 October 4, 2026; hosted HIL-emu workflow evidence remains pending.

@@ -65,6 +65,11 @@ if (( ${#missing[@]} > 0 )); then
   exit 1
 fi
 
+if ! printf '#include <stdlib.h>\n#include <string.h>\n' | arm-none-eabi-gcc -E -x c - >/dev/null 2>&1; then
+  echo 'ERROR: ARM bare-metal C headers missing; install libnewlib-dev and libnewlib-arm-none-eabi.' >&2
+  exit 1
+fi
+
 echo "== hil-emu: all required qemu + cross toolchains present =="
 for tool in "${required_tools[@]}"; do
   printf '  %-26s %s\n' "$tool" "$(command -v "$tool")"

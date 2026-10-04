@@ -7,7 +7,7 @@ import json
 import pathlib
 
 COMMON = {"build.log", "identity.txt", "image-inspect.json", "build-receipt.json",
-          "image.cyclonedx.json", "grype.json", "inventory-summary.json",
+          "image.cyclonedx.json", "grype.json", "inventory-summary.json", "toolchains.json",
           "os-package-count.txt", "no-llm-environment.log", "daemon-invalid.log", "termination.log"}
 FLAVOR_LOGS = {
     "core": {"auto.log", "nonroot.log", "result.log", "version.log", "daemon-help.log", "daemon-version.log"},
