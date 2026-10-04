@@ -27,22 +27,17 @@
 //! | [`FaultKind`]           | rule    | CWE (from catalog) | rationale |
 //! |-------------------------|---------|--------------------|-----------|
 //! | `CpuException`          | BHF-210 | CWE-119 | CPU exception vector, unlocalized reachable crash |
-//! | `MemoryProtection` @null| BHF-206 | CWE-476 | MMU/MPU trap at the null page — a NULL-pointer deref |
-//! | `MemoryProtection`      | BHF-210 | CWE-119 | MMU/MPU access violation — out-of-bounds memory access |
-//! | `Watchdog`              | BHF-210 | CWE-119 | watchdog / reset-controller trip — the target went down |
-//! | `AssertionPanic`        | BHF-210 | CWE-119 | reachable assertion / panic / abort (as the ruby/lua/php lanes map it) |
+//! | `MemoryProtection`      | BHF-210 | CWE-119 | MMU/MPU access violation (faulting address kept in the message; a NULL-deref is NOT inferred from a low address without a target memory map) |
+//! | `Watchdog`              | BHF-555 | CWE-400 | watchdog / reset-controller trip — an availability failure, not memory corruption |
+//! | `AssertionPanic`        | BHF-557 | CWE-617 | reachable assertion / panic / abort |
 //! | `StackOverflow`         | BHF-207 | CWE-674 | stack-overflow / guard-region violation — stack exhaustion |
-//! | `Timeout`               | BHF-210 | CWE-119 | exceeded a hard real-time / watchdog deadline — a hang |
+//! | `Timeout`               | BHF-555 | CWE-400 | exceeded a hard real-time / watchdog deadline — a timing/availability failure |
 //! | `Other(code)`           | BHF-210 | CWE-119 | an unrecognized backend fault code, preserved and surfaced |
+//!
+//! No fault claims a sanitizer: an on-target CPU fault is not produced by ASan,
+//! so the emitted report carries `sanitizer: None` (#78).
 
 use target_transport::{ExitKind, Fault, FaultKind, RunOutcome};
-
-/// A memory-protection trap whose faulting address is at or below this bound is a
-/// NULL / near-NULL pointer dereference — the CWE-476 case `BHF-206` already
-/// covers ("SEGV at low addresses ... via mmap of the null page"), not an
-/// arbitrary out-of-bounds access. One 4 KiB page, the conventional null guard
-/// region.
-const NULL_PAGE_LIMIT: u64 = 0x1000;
 
 /// A transport fault classified into the BHF finding taxonomy.
 ///
@@ -74,29 +69,28 @@ pub fn classify_fault(fault: &Fault) -> FaultClass {
             kind: "target-cpu-exception".to_owned(),
             name: "target CPU exception".to_owned(),
         },
-        // An MMU/MPU trap at (or just above) address zero is a NULL-pointer
-        // dereference; any other faulting address is an out-of-bounds access we
-        // cannot localize without a sanitizer, i.e. the generic memory-bounds
-        // crash the BHF-210 family covers.
-        FaultKind::MemoryProtection => match fault.address {
-            Some(address) if address < NULL_PAGE_LIMIT => FaultClass {
-                rule_id: "BHF-206",
-                kind: "target-null-pointer-dereference".to_owned(),
-                name: "target NULL-pointer dereference (MMU/MPU trap at the null page)".to_owned(),
-            },
-            _ => FaultClass {
-                rule_id: "BHF-210",
-                kind: "target-memory-protection".to_owned(),
-                name: "target memory-protection (MMU/MPU) trap".to_owned(),
-            },
-        },
-        FaultKind::Watchdog => FaultClass {
+        // An MMU/MPU access trap is a memory-protection violation (the BHF-210
+        // family). We do NOT infer a NULL-pointer dereference from a low faulting
+        // address: address 0 being the unmapped null guard is a target-specific
+        // memory-map assumption, not a universal embedded truth, and the
+        // transport carries no memory map here. The faulting address is preserved
+        // in the message for triage instead of forcing a CWE-476 label.
+        FaultKind::MemoryProtection => FaultClass {
             rule_id: "BHF-210",
+            kind: "target-memory-protection".to_owned(),
+            name: "target memory-protection (MMU/MPU) trap".to_owned(),
+        },
+        // A watchdog / reset-controller trip is an availability failure (the
+        // target went down), NOT a memory-bounds weakness — CWE-400, not CWE-119.
+        FaultKind::Watchdog => FaultClass {
+            rule_id: "BHF-555",
             kind: "target-watchdog-reset".to_owned(),
             name: "target watchdog / reset-controller trip".to_owned(),
         },
+        // A reachable assertion / panic / abort is CWE-617 (reachable assertion),
+        // not memory corruption.
         FaultKind::AssertionPanic => FaultClass {
-            rule_id: "BHF-210",
+            rule_id: "BHF-557",
             kind: "target-reachable-assertion".to_owned(),
             name: "target reachable assertion / panic / abort".to_owned(),
         },
@@ -105,8 +99,10 @@ pub fn classify_fault(fault: &Fault) -> FaultClass {
             kind: "target-stack-overflow".to_owned(),
             name: "target stack-overflow / guard-region violation".to_owned(),
         },
+        // A hard deadline / watchdog timeout is a timing/availability failure
+        // (CWE-400), not a memory error.
         FaultKind::Timeout => FaultClass {
-            rule_id: "BHF-210",
+            rule_id: "BHF-555",
             kind: "target-timeout".to_owned(),
             name: "target deadline / watchdog timeout".to_owned(),
         },
@@ -123,16 +119,18 @@ pub fn classify_fault(fault: &Fault) -> FaultClass {
 /// through, so every undiagnosed crash — POSIX signal or on-target fault —
 /// becomes one finding shape with a catalog `rule_id`.
 ///
-/// The sanitizer tag is `AddressSanitizer` to match the host lane's synthesized
-/// crash report (the reporter keys the CWE off `rule_id`, not this tag) and the
-/// stack is empty because an undiagnosed fault carries no sanitizer frames.
+/// `sanitizer` is `None`: neither a host fatal signal nor an on-target CPU fault
+/// is produced by a sanitizer, so the finding must not claim one — the CWE is
+/// keyed off `rule_id`, and the provenance states only what actually occurred
+/// (#78). The stack is empty because an undiagnosed fault carries no sanitizer
+/// frames; the transport lane attaches a structured fault-site frame separately.
 pub fn crash_report(
     rule_id: &'static str,
     kind: String,
     message: String,
 ) -> corpus::SanitizerReport {
     corpus::SanitizerReport {
-        sanitizer: corpus::Sanitizer::AddressSanitizer,
+        sanitizer: None,
         kind,
         rule_id,
         stack: Vec::new(),
@@ -149,7 +147,7 @@ pub fn crash_report(
 pub fn fault_report(fault: &Fault) -> corpus::SanitizerReport {
     let class = classify_fault(fault);
     let mut message = format!(
-        "target transport reported a {} with no sanitizer report — a reachable crash",
+        "target transport reported a {} with no sanitizer report",
         class.name
     );
     if let Some(address) = fault.address {
@@ -268,27 +266,31 @@ mod tests {
                 "CWE-119",
                 "memory-protection",
             ),
-            // MMU/MPU trap at the null page: a NULL-pointer dereference.
+            // MMU/MPU trap at a LOW address is NOT inferred as a null-pointer
+            // dereference without a target memory map (#78): it stays a generic
+            // memory-protection trap, with the address preserved in the message.
             (
                 Fault {
                     kind: FaultKind::MemoryProtection,
                     address: Some(0x8),
                     detail: String::new(),
                 },
-                "BHF-206",
-                "CWE-476",
-                "null-pointer",
+                "BHF-210",
+                "CWE-119",
+                "memory-protection",
             ),
+            // A watchdog trip is an availability failure, not memory corruption.
             (
                 Fault::new(FaultKind::Watchdog),
-                "BHF-210",
-                "CWE-119",
+                "BHF-555",
+                "CWE-400",
                 "watchdog",
             ),
+            // A reachable assertion is CWE-617, not memory corruption.
             (
                 Fault::new(FaultKind::AssertionPanic),
-                "BHF-210",
-                "CWE-119",
+                "BHF-557",
+                "CWE-617",
                 "assertion",
             ),
             (
@@ -297,10 +299,11 @@ mod tests {
                 "CWE-674",
                 "stack-overflow",
             ),
+            // A hard-deadline timeout is a timing/availability failure, not memory.
             (
                 Fault::new(FaultKind::Timeout),
-                "BHF-210",
-                "CWE-119",
+                "BHF-555",
+                "CWE-400",
                 "timeout",
             ),
             (
@@ -323,12 +326,16 @@ mod tests {
 
             let report = fault_report(&fault);
             // A replayable finding record: a real catalog rule, its correct CWE,
-            // no phantom sanitizer frames, and an informative message.
+            // no phantom sanitizer frames, and no false sanitizer provenance (#78).
             assert_eq!(report.rule_id, expected_rule, "report rule for {fault:?}");
             assert_eq!(cwe_of(&report), expected_cwe, "CWE for {fault:?}");
             assert!(report.stack.is_empty(), "undiagnosed fault has no frames");
             assert!(
-                report.message.contains("reachable crash"),
+                report.sanitizer.is_none(),
+                "an on-target fault must not claim a sanitizer: {fault:?}"
+            );
+            assert!(
+                report.message.contains("no sanitizer report"),
                 "message: {}",
                 report.message
             );
@@ -361,10 +368,10 @@ mod tests {
         let faults = [
             (FaultKind::CpuException, "BHF-210", "CWE-119"),
             (FaultKind::MemoryProtection, "BHF-210", "CWE-119"),
-            (FaultKind::Watchdog, "BHF-210", "CWE-119"),
-            (FaultKind::AssertionPanic, "BHF-210", "CWE-119"),
+            (FaultKind::Watchdog, "BHF-555", "CWE-400"),
+            (FaultKind::AssertionPanic, "BHF-557", "CWE-617"),
             (FaultKind::StackOverflow, "BHF-207", "CWE-674"),
-            (FaultKind::Timeout, "BHF-210", "CWE-119"),
+            (FaultKind::Timeout, "BHF-555", "CWE-400"),
             (FaultKind::Other(7), "BHF-210", "CWE-119"),
         ];
 
@@ -420,7 +427,9 @@ mod tests {
             coverage_incomplete: None,
         };
         let report = outcome_finding(&bare_timeout).expect("faultless timeout is still a finding");
-        assert_eq!(report.rule_id, "BHF-210");
-        assert_eq!(cwe_of(&report), "CWE-119");
+        // A timeout is a timing/availability failure (CWE-400), not memory (#78).
+        assert_eq!(report.rule_id, "BHF-555");
+        assert_eq!(cwe_of(&report), "CWE-400");
+        assert!(report.sanitizer.is_none(), "a timeout claims no sanitizer");
     }
 }

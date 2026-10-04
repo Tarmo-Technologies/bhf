@@ -4375,7 +4375,9 @@ fn run_c_libfuzzer_single_input(
                 sanitizer: Some(corpus::SanitizerReport {
                     // Synthesized like the RSS-limit OOM report: the rule_id is what
                     // classifies it, and there is no real sanitizer stack to attach.
-                    sanitizer: corpus::Sanitizer::AddressSanitizer,
+                    // No sanitizer ran, so the provenance is None — not a false
+                    // `asan` tag (#78).
+                    sanitizer: None,
                     kind: "response-deadline-exceeded".to_owned(),
                     // A real catalog rule (CWE-400 timing/availability) so it dedups,
                     // replays, and reports like any other finding.
@@ -4411,7 +4413,9 @@ fn run_c_libfuzzer_single_input(
                 events: Vec::new(),
                 testcases: Vec::new(),
                 sanitizer: Some(corpus::SanitizerReport {
-                    sanitizer: corpus::Sanitizer::AddressSanitizer,
+                    // A synthesized out-of-memory report: no sanitizer produced it,
+                    // so the provenance is None rather than a false `asan` (#78).
+                    sanitizer: None,
                     kind: "out-of-memory".to_owned(),
                     // A real catalog rule (CWE-789) so the OOM classifies as a
                     // finding like any sanitizer crash, not an unmapped "oom" tag.
@@ -7129,7 +7133,7 @@ mod auto_path_tests {
 
     fn sanitizer_report(rule_id: &'static str, frames: Vec<&str>) -> corpus::SanitizerReport {
         corpus::SanitizerReport {
-            sanitizer: corpus::Sanitizer::AddressSanitizer,
+            sanitizer: Some(corpus::Sanitizer::AddressSanitizer),
             kind: "heap-buffer-overflow".to_owned(),
             rule_id,
             stack: frames

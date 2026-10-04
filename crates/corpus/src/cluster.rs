@@ -245,7 +245,7 @@ fn is_rust_std_allocator_noise(lower_name: &str) -> bool {
 /// Conservative, like [`is_driver_glue_crash`]: requires a POSITIVE harness frame
 /// and bails the instant any real target/library frame resolves.
 pub fn is_harness_scaffolding_leak(report: &SanitizerReport) -> bool {
-    if report.sanitizer != Sanitizer::LeakSanitizer {
+    if report.sanitizer != Some(Sanitizer::LeakSanitizer) {
         return false;
     }
     let mut saw_harness = false;
@@ -779,7 +779,7 @@ mod tests {
 
     fn sample_leak_report(frames: Vec<&str>) -> SanitizerReport {
         SanitizerReport {
-            sanitizer: Sanitizer::LeakSanitizer,
+            sanitizer: Some(Sanitizer::LeakSanitizer),
             kind: "memory-leak".to_owned(),
             rule_id: "BHF-208",
             stack: frames
@@ -908,7 +908,7 @@ mod tests {
 
     fn sample_sanitizer_report(frames: Vec<&str>) -> SanitizerReport {
         SanitizerReport {
-            sanitizer: Sanitizer::AddressSanitizer,
+            sanitizer: Some(Sanitizer::AddressSanitizer),
             kind: "heap-buffer-overflow".to_owned(),
             rule_id: "BHF-201",
             stack: frames

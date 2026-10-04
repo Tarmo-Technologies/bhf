@@ -23,7 +23,7 @@ fn tempdir(prefix: &str) -> PathBuf {
 
 fn report_for(target_fn: &str) -> SanitizerReport {
     SanitizerReport {
-        sanitizer: Sanitizer::AddressSanitizer,
+        sanitizer: Some(Sanitizer::AddressSanitizer),
         kind: "heap-buffer-overflow".to_owned(),
         rule_id: "BHF-201",
         stack: vec![
