@@ -701,6 +701,10 @@ pub(crate) fn run_transport_campaign(
     // (rule_id | kind; the transport lane carries no stack frames), so one fault
     // class yields one finding regardless of how many inputs reach it.
     let mut seen_findings: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Distinct crash-candidate count per (target | rule | kind) class, bounding
+    // how many distinct fault sites one class may retain (#75).
+    let mut class_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     // Set when a run-control condition stops the campaign early (#70): a target
     // hang or a lost transport — a distinct, non-clean outcome.
     let mut halted: Option<String> = None;
@@ -738,8 +742,10 @@ pub(crate) fn run_transport_campaign(
                 handle_outcome(
                     &outcome,
                     seed,
+                    &config.transport_label,
                     &emitter,
                     &mut seen_findings,
+                    &mut class_counts,
                     &mut finding_ids,
                     &mut crashes,
                 )?;
@@ -824,8 +830,10 @@ pub(crate) fn run_transport_campaign(
                         handle_outcome(
                             &outcome,
                             &input,
+                            &config.transport_label,
                             &emitter,
                             &mut seen_findings,
+                            &mut class_counts,
                             &mut finding_ids,
                             &mut crashes,
                         )?;
@@ -953,18 +961,68 @@ fn maybe_emit_deadline(
 
 /// Turn one run outcome into a finding when it crashed/timed out, deduped by
 /// fault class, and count crash outcomes. A clean outcome is a no-op.
+/// Upper bound on DISTINCT crash candidates retained per (target | rule | kind)
+/// class (#75). Distinct fault sites below this bound are each kept; beyond it
+/// further distinct sites dedup, so a varying backend-reported address cannot
+/// create unbounded findings.
+const MAX_CANDIDATES_PER_CLASS: usize = 16;
+
+#[allow(clippy::too_many_arguments)]
 fn handle_outcome(
     outcome: &RunOutcome,
     input: &[u8],
+    transport_label: &str,
     emitter: &FindingEmitter,
     seen: &mut std::collections::HashSet<String>,
+    class_counts: &mut std::collections::HashMap<String, usize>,
     finding_ids: &mut Vec<String>,
     crashes: &mut usize,
 ) -> Result<(), CorpusError> {
-    let Some(report) = crate::transport_fault::outcome_finding(outcome) else {
+    let Some(mut report) = crate::transport_fault::outcome_finding(outcome) else {
         return Ok(());
     };
-    emit_report(input, &report, emitter, seen, finding_ids, crashes)
+    *crashes += 1;
+
+    // Structured fault-site identity (#75). A backend-attributed faulting address
+    // is a bounded SITE discriminator so two distinct sites of one fault class
+    // are retained as separate candidates, and the target label keeps faults
+    // from different targets from merging on identical relative values. The
+    // address is NOT asserted as a confirmed root cause: candidates per class are
+    // capped, so a varying accessed address cannot split into unbounded findings;
+    // a fault with no attributed site is explicitly "unlocalized".
+    let site = outcome
+        .fault
+        .as_ref()
+        .and_then(|fault| fault.address)
+        .map(|address| format!("{address:#x}"))
+        .unwrap_or_else(|| "unlocalized".to_owned());
+    let class_key = format!("{transport_label}|{}|{}", report.rule_id, report.kind);
+    let identity_key = format!("{class_key}|{site}");
+
+    // Same site -> predictable dedup (one candidate).
+    if seen.contains(&identity_key) {
+        return Ok(());
+    }
+    // Bounded candidate evidence: once the class is saturated, stop splitting.
+    let class_count = class_counts.entry(class_key).or_insert(0);
+    if *class_count >= MAX_CANDIDATES_PER_CLASS {
+        return Ok(());
+    }
+
+    // Fold the target + site into the persisted signature (via a synthetic frame)
+    // so the on-disk signature/cluster identity AGREES with this campaign-level
+    // dedup — removing the in-memory filter alone would not fix the empty-stack
+    // signature collapse the issue calls out.
+    report.stack.push(corpus::sanitizer::StackFrame {
+        function: format!("<on-target fault {transport_label} @ {site}>"),
+        file: None,
+        line: None,
+    });
+    let id = emitter.emit_sanitizer_crash(input, &report)?;
+    finding_ids.push(id.0);
+    seen.insert(identity_key);
+    *class_count += 1;
+    Ok(())
 }
 
 /// Persist one finding report for `input`, counting the non-clean outcome and
@@ -1691,8 +1749,9 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_fault_classes_collapse_to_one_finding() {
-        // Two crashes of the same class over two executions -> one finding.
+    fn duplicate_fault_classes_at_the_same_site_collapse_to_one_finding() {
+        // Two crashes of the same class AND same (unlocalized) site over two
+        // executions dedup to one finding — predictable same-site dedup (#75).
         let script = vec![
             ScriptedResponse::crash(vec![1], Fault::new(FaultKind::StackOverflow)),
             ScriptedResponse::crash(vec![2], Fault::new(FaultKind::StackOverflow)),
@@ -1708,7 +1767,101 @@ mod tests {
         assert_eq!(
             summary.findings.len(),
             1,
-            "same fault class -> one finding: {summary:?}"
+            "same fault class + site -> one finding: {summary:?}"
+        );
+
+        std::fs::remove_dir_all(&work_dir).ok();
+    }
+
+    #[test]
+    fn distinct_fault_sites_of_one_class_retain_separate_findings() {
+        // Two faults of the SAME class (memory-protection) but DISTINCT attributed
+        // sites must both be retained — not collapsed to one and the second
+        // testcase silently dropped (#75). Their persisted signatures must differ
+        // too, so campaign dedup and on-disk clustering agree.
+        let script = vec![
+            ScriptedResponse::crash(
+                vec![1],
+                Fault {
+                    kind: FaultKind::MemoryProtection,
+                    address: Some(0x2000_4000),
+                    detail: "site A".to_owned(),
+                },
+            ),
+            ScriptedResponse::crash(
+                vec![2],
+                Fault {
+                    kind: FaultKind::MemoryProtection,
+                    address: Some(0x2000_8000),
+                    detail: "site B".to_owned(),
+                },
+            ),
+        ];
+        let (transport, _received) = mock_agent_transport(script);
+        let work_dir = tmp_work_dir("distinct-sites");
+        let config = config(work_dir.clone(), vec![b"seed".to_vec()], 2);
+
+        let summary = run_transport_campaign(transport.as_ref(), &config).unwrap();
+
+        assert_eq!(summary.executions, 2);
+        assert_eq!(
+            summary.findings.len(),
+            2,
+            "two distinct sites of one class -> two findings: {summary:?}"
+        );
+        // The on-disk signatures differ (persisted identity agrees with dedup).
+        let sig = |id: &str| -> String {
+            let record: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(
+                    work_dir
+                        .join("results")
+                        .join("findings")
+                        .join(id)
+                        .join("finding.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            record["signature"].as_str().unwrap().to_owned()
+        };
+        assert_ne!(
+            sig(&summary.findings[0]),
+            sig(&summary.findings[1]),
+            "distinct sites must have distinct persisted signatures"
+        );
+
+        std::fs::remove_dir_all(&work_dir).ok();
+    }
+
+    #[test]
+    fn unbounded_distinct_sites_are_capped_per_class() {
+        // A fault class whose attributed address varies every execution must not
+        // create unbounded findings: distinct candidates are capped per class
+        // (#75), so a varying accessed address cannot explode the findings set.
+        let script: Vec<ScriptedResponse> = (0..(MAX_CANDIDATES_PER_CLASS + 8))
+            .map(|i| {
+                ScriptedResponse::crash(
+                    vec![1],
+                    Fault {
+                        kind: FaultKind::MemoryProtection,
+                        address: Some(0x1_0000 + (i as u64) * 0x100),
+                        detail: String::new(),
+                    },
+                )
+            })
+            .collect();
+        let n = script.len();
+        let (transport, _received) = mock_agent_transport(script);
+        let work_dir = tmp_work_dir("capped");
+        let config = config(work_dir.clone(), vec![b"seed".to_vec()], n);
+
+        let summary = run_transport_campaign(transport.as_ref(), &config).unwrap();
+
+        assert_eq!(summary.executions, n);
+        assert_eq!(
+            summary.findings.len(),
+            MAX_CANDIDATES_PER_CLASS,
+            "distinct candidates per class are bounded: {summary:?}"
         );
 
         std::fs::remove_dir_all(&work_dir).ok();
