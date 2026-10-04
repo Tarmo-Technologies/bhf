@@ -185,12 +185,12 @@ impl HarnessRunner {
     }
 
     /// Build a `Command` that launches the harness under the configured sandbox
-    /// + qemu-user prefix, with `io_file`'s directory bound into the sandbox so
+    /// and qemu-user prefix, with `io_file`'s directory bound into the sandbox so
     /// an input/events file there is reachable. It does NOT append `io_file` as
-    /// an argv — the caller supplies the input per the harness protocol (an Ada
+    /// an argv: the caller supplies the input per the harness protocol (an Ada
     /// events file via env, a libFuzzer testcase appended as argv, or AFL input
     /// piped to stdin). Resolving the sandbox here means a requested strict
-    /// sandbox that is unavailable is an early error, never a silent bypass — so
+    /// sandbox that is unavailable is an early error, never a silent bypass, so
     /// the C/C++ replay paths honor `--qemu-user`/sandbox exactly like the framed
     /// path instead of spawning a bare `Command::new(harness)` (#81).
     pub fn command_wrapped(&self, io_file: &Path) -> Result<Command, ReplayError> {
