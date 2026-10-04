@@ -297,8 +297,9 @@ class TradeOutcomeTests(unittest.TestCase):
         )
 
     def test_classify_rejects_out_of_budget_and_early_abort(self):
-        # Review case A: an engine that aborts in 0.1s of a 60s budget with no
-        # crash is NOT a valid censored no-crash — it is an incomplete trial.
+        # Review case A: an engine that aborts early (0.1s of a 60s budget) with a
+        # NONZERO exit and no crash is NOT a valid censored no-crash — it lacks
+        # completion evidence and is an incomplete trial.
         self.assertEqual(
             trade_study.classify_trade_outcome(
                 {
@@ -306,7 +307,7 @@ class TradeOutcomeTests(unittest.TestCase):
                     "supervisor_timeout": False,
                     "crash_confirmed": False,
                     "campaign_wall_s": 0.1,
-                    "campaign_rc": 0,
+                    "campaign_rc": 2,
                     "budget_s": 60,
                 }
             ),
@@ -326,6 +327,21 @@ class TradeOutcomeTests(unittest.TestCase):
                 }
             ),
             trade_study.OUTCOME_INCOMPLETE,
+        )
+        # Completion evidence is the engine's clean exit (rc 0), not a wall-clock
+        # fraction: a clean-exit no-crash run is a valid censored campaign.
+        self.assertEqual(
+            trade_study.classify_trade_outcome(
+                {
+                    "build_rc": 0,
+                    "supervisor_timeout": False,
+                    "crash_confirmed": False,
+                    "campaign_wall_s": 59.8,
+                    "campaign_rc": 0,
+                    "budget_s": 60,
+                }
+            ),
+            trade_study.OUTCOME_CENSORED,
         )
         # Review case B: a native crash first observed at 64s with a 60s budget is
         # confirmed-but-late — kept as evidence, NOT an in-budget solve.
@@ -355,6 +371,42 @@ class TradeOutcomeTests(unittest.TestCase):
             ),
             trade_study.OUTCOME_REACHABLE,
         )
+
+    def test_is_within_budget_uses_the_stated_budget_without_grace(self):
+        # #85 re-review: the 61s/60s boundary must NOT count as in-budget (the old
+        # `<= budget + 2` grace over-counted it); the stated budget is the line.
+        self.assertTrue(trade_study.is_within_budget(60.0, 60))
+        self.assertTrue(trade_study.is_within_budget(59.9, 60))
+        self.assertFalse(trade_study.is_within_budget(61.0, 60))
+        self.assertFalse(trade_study.is_within_budget(None, 60))
+
+    def test_corpus_reachability_from_an_aborted_run_is_not_a_valid_campaign(self):
+        # #85 re-review case A: a 0.1s, nonzero-exit campaign whose corpus happens
+        # to reach the bug is REACHABILITY evidence (kept visible) but is NOT valid
+        # budget exposure — it must not enter the rate denominator.
+        reachable_but_aborted = {
+            "outcome": "reachable_time_unknown",
+            "crash_confirmed": True,
+            "time_to_first_crash_s": None,  # corpus backstop; no native crash time
+            "campaign_wall_s": 0.1,
+            "campaign_rc": 2,  # aborted early, nonzero exit
+            "budget_s": 60,
+            "defect_identity": "t::x",
+        }
+        eligible_clean = {
+            "outcome": "censored_no_crash",
+            "crash_confirmed": False,
+            "time_to_first_crash_s": None,
+            "campaign_wall_s": 60.0,
+            "campaign_rc": 0,
+        }
+        self.assertFalse(trade_study.campaign_eligible(reachable_but_aborted))
+        self.assertTrue(trade_study.campaign_eligible(eligible_clean))
+        summary = trade_study.engine_summary([reachable_but_aborted, eligible_clean])
+        # Reachability stays VISIBLE in the outcome breakdown...
+        self.assertEqual(summary["outcomes"]["reachable_time_unknown"], 1)
+        # ...but only the eligible clean campaign is a valid-campaign datapoint.
+        self.assertEqual(summary["valid_campaigns"], 1)
 
     def test_engine_summary_keeps_failures_visible_and_reports_ci(self):
         rows = [
@@ -387,6 +439,9 @@ class TradeOutcomeTests(unittest.TestCase):
                 "crash_confirmed": False,
                 "crash_signature": None,
                 "time_to_first_crash_s": None,
+                # Clean completion evidence makes this an eligible campaign.
+                "campaign_rc": 0,
+                "campaign_wall_s": 60.0,
                 "common_cov_edges": 9,
                 "common_cov_features": 10,
                 "native_execs_per_s": 900.0,
@@ -395,6 +450,7 @@ class TradeOutcomeTests(unittest.TestCase):
             },
             {
                 "outcome": "build_failed",
+                "build_rc": 1,
                 "crash_confirmed": False,
                 "crash_signature": None,
                 "time_to_first_crash_s": None,
@@ -413,7 +469,7 @@ class TradeOutcomeTests(unittest.TestCase):
         self.assertEqual(
             summary["crash_find"]["trials"], 3
         )  # build_failed excluded from denom
-        self.assertEqual(summary["distinct_defect_identities"], 1)  # deduped
+        self.assertEqual(summary["normalized_diagnostic_variants"], 1)  # deduped
         self.assertEqual(summary["ttfc_s"]["n"], 2)
         self.assertEqual(summary["right_censored_s"], [30.0])
         self.assertFalse(summary["native_execs_per_s"]["comparable_across_engines"])
@@ -440,6 +496,8 @@ class TradeOutcomeTests(unittest.TestCase):
                 "crash_confirmed": False,
                 "crash_signature": None,
                 "time_to_first_crash_s": None,
+                "campaign_rc": 0,
+                "campaign_wall_s": 60.0,
                 "common_cov_edges": 4,
                 "common_cov_features": 5,
                 "native_execs_per_s": 20.0,
@@ -556,7 +614,7 @@ class DefectIdentityTests(unittest.TestCase):
             },
         ]
         summary = trade_study.engine_summary(rows)
-        self.assertEqual(summary["distinct_defect_identities"], 2)
+        self.assertEqual(summary["normalized_diagnostic_variants"], 2)
 
 
 if __name__ == "__main__":

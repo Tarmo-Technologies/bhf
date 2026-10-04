@@ -84,11 +84,6 @@ OUTCOME_CLASSES = (
     OUTCOME_UNSUPPORTED,
 )
 
-# A censored no-crash trial is only VALID evidence when the campaign actually ran
-# to (near) its budget: an engine that aborts early is an incomplete trial, not a
-# clean no-crash. Require at least this fraction of the requested budget.
-BUDGET_COMPLETION_FRACTION = 0.9
-
 
 def sha256(path: Path) -> str:
     return run.sha256(path)
@@ -201,20 +196,58 @@ def classify_trade_outcome(row: dict) -> str:
         if row.get("time_to_first_crash_s") is not None:
             return OUTCOME_CONFIRMED_LATE
         return OUTCOME_REACHABLE
-    # No crash. It is a valid censored campaign only if it actually ran to budget.
-    wall = row.get("campaign_wall_s")
-    if wall is None:
+    # No crash. A valid censored (full-budget) campaign needs COMPLETION EVIDENCE,
+    # not a wall-clock heuristic: the engine must have exited cleanly on its own
+    # (`campaign_rc == 0`) — every engine self-terminates at its budget
+    # (-max_total_time / -V / --run_time / --time) and exits 0. A missing wall, a
+    # nonzero/absent exit (an aborted or runner-failed run), or a supervisor kill
+    # is an incomplete trial that stays visible rather than counting as clean.
+    if row.get("campaign_wall_s") is None:
         return OUTCOME_INCOMPLETE
-    rc = row.get("campaign_rc")
-    if rc is not None and rc != 0:
-        # A nonzero engine exit with no crash is a runner failure, not a clean
-        # no-crash campaign.
-        return OUTCOME_INCOMPLETE
-    budget = row.get("budget_s")
-    if budget is not None and wall < budget * BUDGET_COMPLETION_FRACTION:
-        # Engine aborted well short of the requested budget.
-        return OUTCOME_INCOMPLETE
-    return OUTCOME_CENSORED
+    if row.get("campaign_rc") == 0:
+        return OUTCOME_CENSORED
+    return OUTCOME_INCOMPLETE
+
+
+def is_within_budget(ttfc: float | None, budget: float) -> bool:
+    """Whether a native time-to-first-crash counts as an IN-BUDGET solve.
+
+    Uses the STATED budget with no silent grace: a crash first observed at 61s for
+    a 60s request is confirmed-but-late, not an in-budget solve (#85 re-review).
+    `None` (no native crash time, e.g. a corpus-backstop confirmation) is never
+    in-budget.
+    """
+    return ttfc is not None and ttfc <= budget
+
+
+def campaign_eligible(row: dict) -> bool:
+    """Whether this trial ran a VALID full-budget campaign — comparable evidence
+    for the rate DENOMINATOR — kept SEPARATE from what it observed (#85 re-review).
+
+    Confirmation status (crash / reachable / clean) and campaign eligibility are
+    two different axes. A corpus-backstop reachability from a 0.1-second,
+    nonzero-exit run is still shown as reachability, but it is NOT valid budget
+    exposure and must not enter the denominator. Eligibility requires: the build
+    succeeded, the supervisor did not kill the run, a wall time was recorded, and
+    EITHER a native confirmed crash occurred (the engine legitimately exits nonzero
+    on a crash) OR the engine completed cleanly (`campaign_rc == 0`). An early /
+    aborted / runner-failed exit with no native crash is not eligible.
+    """
+    if row.get("build_rc"):
+        return False
+    if row.get("supervisor_timeout"):
+        return False
+    # A native confirmed crash (in- or out-of-budget, so a known ttfc) is a valid
+    # campaign — it ran and found the bug — regardless of the engine's crash-exit
+    # code (libFuzzer et al. exit nonzero on a crash).
+    if row.get("crash_confirmed") and row.get("time_to_first_crash_s") is not None:
+        return True
+    # Otherwise (a clean no-crash, or a corpus-only reachability with no native
+    # crash time) a valid full-budget campaign needs a recorded wall AND clean
+    # completion evidence (`campaign_rc == 0`).
+    if row.get("campaign_wall_s") is None:
+        return False
+    return row.get("campaign_rc") == 0
 
 
 def any_sanitizer_crash(stderr: str) -> tuple[bool, str | None]:
@@ -767,7 +800,7 @@ def run_engine(
         if (measure and native_confirmed)
         else None
     )
-    within_budget = ttfc is not None and ttfc <= budget + 2
+    within_budget = is_within_budget(ttfc, budget)
     row.update(
         {
             "build_s": round(build_s, 3),
@@ -980,16 +1013,12 @@ def engine_summary(sub: list[dict]) -> dict:
     }
     confirmed = [r for r in sub if r.get("outcome") == OUTCOME_CONFIRMED]
     censored = [r for r in sub if r.get("outcome") == OUTCOME_CENSORED]
-    # Valid campaigns are the ones that actually ran a full budget: an in-budget
-    # solve, a confirmed-but-late artifact, a corpus-backstop reachability, or a
-    # clean no-crash. Build-failed / supervisor-timeout / incomplete / unsupported
-    # trials are NOT in the denominator (they never produced comparable evidence).
-    valid = (
-        outcomes[OUTCOME_CONFIRMED]
-        + outcomes[OUTCOME_CONFIRMED_LATE]
-        + outcomes[OUTCOME_REACHABLE]
-        + outcomes[OUTCOME_CENSORED]
-    )
+    # Valid campaigns are decided by campaign ELIGIBILITY (did it run a valid full
+    # budget?), NOT by confirmation status — so a corpus-backstop reachability from
+    # an early-aborted / nonzero-exit run stays visible in `outcomes` but does not
+    # enter the rate denominator (#85 re-review). A build failure / supervisor
+    # timeout / incomplete / unsupported trial is likewise excluded.
+    valid = sum(1 for r in sub if campaign_eligible(r))
     # In-budget time-to-first-crash only, from the in-budget solves.
     ttfcs = [
         r["time_to_first_crash_s"]
@@ -1008,13 +1037,14 @@ def engine_summary(sub: list[dict]) -> dict:
         r["native_execs_per_s"] for r in sub if r.get("native_execs_per_s") is not None
     ]
     builds = [r["build_s"] for r in sub if r.get("build_s") is not None]
-    # Distinct-defect count over EVERY confirmed-reachability row (in-budget,
-    # late, or corpus-backstop), keyed by the target-scoped NORMALIZED identity so
-    # the same bug at different addresses/PID counts once and unrelated targets do
-    # not merge. It is a lower-confidence "variant" figure, not verified
-    # localization — see normalize_defect_signature.
+    # A count of DISTINCT NORMALIZED DIAGNOSTIC STRINGS over the confirmed-
+    # reachability rows (target-scoped; address/PID noise removed). This is NOT a
+    # distinct-defect count or a lower bound: it still varies with input-dependent
+    # operands in the message (e.g. "index 1" vs "index 2" at one source site), so
+    # it can over-count a single defect. It is reported only as a grouping aid
+    # (#85 re-review); a real defect count needs source/stack localization.
     crashing = [r for r in sub if r.get("crash_confirmed")]
-    defect_identities = {
+    diagnostic_variants = {
         r.get("defect_identity") for r in crashing if r.get("defect_identity")
     }
     return {
@@ -1026,10 +1056,12 @@ def engine_summary(sub: list[dict]) -> dict:
         "crash_find": stats.wilson_interval(
             outcomes[OUTCOME_CONFIRMED], valid
         ).as_dict(),
-        "distinct_defect_identities": len(defect_identities),
-        "distinct_defect_identities_note": (
-            "target-scoped, address/PID-normalized class-level variants; a "
-            "lower-confidence lower bound, not verified source/stack localization"
+        "normalized_diagnostic_variants": len(diagnostic_variants),
+        "normalized_diagnostic_variants_note": (
+            "distinct target-scoped diagnostic strings with address/PID noise "
+            "removed — a grouping aid, NOT a distinct-defect count or lower bound "
+            "(input-dependent operands can over-count one defect; a true count "
+            "needs source/stack localization)"
         ),
         "ttfc_s": stats.summarize(ttfcs).as_dict(),
         "common_cov_edges": stats.summarize(edges, round_to=1).as_dict(),

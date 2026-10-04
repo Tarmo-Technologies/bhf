@@ -56,9 +56,9 @@ def outcome_cell(outcomes: dict) -> str:
 
 def render_engine_rows(block: dict, engines: list[str]) -> list[str]:
     out = [
-        "| Engine | In-budget crash-find (Wilson 95%) | Distinct defect variants "
-        "(normalized, lower bound) | Median in-budget TTFC (s) | Common cov edges "
-        "| Native exec/s (not comparable) |",
+        "| Engine | In-budget crash-find (Wilson 95%) | Normalized diagnostic "
+        "variants (grouping aid, NOT a defect count) | Median in-budget TTFC (s) "
+        "| Common cov edges | Native exec/s (not comparable) |",
         "|---|---|---|---|---|---|",
     ]
     for e in engines:
@@ -67,7 +67,7 @@ def render_engine_rows(block: dict, engines: list[str]) -> list[str]:
             continue
         out.append(
             f"| {ENGINE_LABEL.get(e, e)} | {prop(s['crash_find'])} "
-            f"| {s['distinct_defect_identities']} | {dist(s['ttfc_s'])} "
+            f"| {s['normalized_diagnostic_variants']} | {dist(s['ttfc_s'])} "
             f"| {dist(s['common_cov_edges'])} "
             f"| {dist(s['native_execs_per_s']['distribution'])} |"
         )
