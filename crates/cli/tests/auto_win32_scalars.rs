@@ -30,6 +30,7 @@ fn options(src_root: &std::path::Path) -> AttemptOptions {
         project: None,
         decoder_limits: Default::default(),
         force: false,
+        run_untrusted: false,
         engines: vec![FuzzEngine::Builtin],
         ada_main_sources: Default::default(),
         dir_filter: Default::default(),

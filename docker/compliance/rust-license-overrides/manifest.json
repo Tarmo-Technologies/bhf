@@ -1,0 +1,42 @@
+[
+  {
+    "package": "tree-sitter-java",
+    "version": "0.23.5",
+    "vcs_commit": "94703d5a6bed02b98e438d7cad1136c01a60ba2c",
+    "source": "https://raw.githubusercontent.com/tree-sitter/tree-sitter-java/94703d5a6bed02b98e438d7cad1136c01a60ba2c/LICENSE",
+    "file": "tree-sitter-java-0.23.5/LICENSE",
+    "sha256": "52ed137b039cd9c46409bc22e89938af911c95b157feae2d040b51e6084369a7"
+  },
+  {
+    "package": "tree-sitter-cpp",
+    "version": "0.23.4",
+    "vcs_commit": "f41e1a044c8a84ea9fa8577fdd2eab92ec96de02",
+    "source": "https://raw.githubusercontent.com/tree-sitter/tree-sitter-cpp/f41e1a044c8a84ea9fa8577fdd2eab92ec96de02/LICENSE",
+    "file": "tree-sitter-cpp-0.23.4/LICENSE",
+    "sha256": "2e0110e07abef7c2548b26ec9d6969775617ca539a0dc8dbeeb14d6452c711d1"
+  },
+  {
+    "package": "tree-sitter-perl",
+    "version": "1.1.2",
+    "vcs_commit": "883ab51150f32583e4f6877a6bf16e9f83b8935f",
+    "source": "https://raw.githubusercontent.com/ganezdragon/tree-sitter-perl/883ab51150f32583e4f6877a6bf16e9f83b8935f/LICENSE",
+    "file": "tree-sitter-perl-1.1.2/LICENSE",
+    "sha256": "02c343f074753716e9c54fe12e6a27d03a041b54be545af8ecb280a7bb0ee703"
+  },
+  {
+    "package": "crc-catalog",
+    "version": "2.5.0",
+    "vcs_commit": "ed4ad631f22b05055c21a3a4127eb7cf6d75bb62",
+    "source": "https://raw.githubusercontent.com/akhilles/crc-catalog/ed4ad631f22b05055c21a3a4127eb7cf6d75bb62/LICENSES/Apache-2.0.txt",
+    "file": "crc-catalog-2.5.0/Apache-2.0.txt",
+    "sha256": "d3cdb764b98283ee7c3a3cea8d374e2a2957322374378d1f3263f4d512741fc3"
+  },
+  {
+    "package": "crc-catalog",
+    "version": "2.5.0",
+    "vcs_commit": "ed4ad631f22b05055c21a3a4127eb7cf6d75bb62",
+    "source": "https://raw.githubusercontent.com/akhilles/crc-catalog/ed4ad631f22b05055c21a3a4127eb7cf6d75bb62/LICENSES/MIT.txt",
+    "file": "crc-catalog-2.5.0/MIT.txt",
+    "sha256": "5ef8fcfb6cccec8fcae043c834099a60c8b7406408db576e026d2b7e67dc5cf5"
+  }
+]

@@ -11,7 +11,7 @@
 #
 # The packages are UNMODIFIED Ubuntu 24.04 packages, so their corresponding
 # source is the source Ubuntu/Canonical publishes for those exact versions.
-set -uo pipefail
+set -euo pipefail
 
 MANIFEST="${1:-/usr/share/bhf/licenses/COPYLEFT-SOURCES.txt}"
 DEST="${2:-$PWD/corresponding-source}"
@@ -33,24 +33,32 @@ Components: main universe multiverse restricted
 Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 EOF
 
-apt-get update
+apt-get update -o APT::Update::Error-Mode=any
 mkdir -p "$DEST"; cd "$DEST" || exit 1
+cp "$MANIFEST" REQUESTED-SOURCES.txt
 
 fail=0 n=0
 while IFS= read -r spec; do
     case "$spec" in ''|'#'*) continue;; esac
     n=$((n + 1))
     echo "== corresponding source: $spec =="
-    # Try the exact pinned version, then fall back to the package's current source
-    # (an older version may have been superseded out of the archive pockets).
+    # Only the installed package's exact source version is corresponding-source
+    # evidence. A newer version cannot silently satisfy this request.
     if ! apt-get source --download-only "$spec" 2>/dev/null; then
-        base="${spec%%=*}"
-        echo "   exact version unavailable; fetching current source for $base"
-        apt-get source --download-only "$base" || { echo "   WARN: no source for $base"; fail=$((fail + 1)); }
+        echo "   ERROR: exact source unavailable: $spec" >&2
+        fail=$((fail + 1))
     fi
 done < "$MANIFEST"
 
 echo
 echo "fetched corresponding source for $((n - fail))/$n package(s) into $DEST"
-[ "$fail" -gt 0 ] && echo "note: $fail package(s) need manual retrieval (e.g. launchpad.net) if aged out of the archive"
+if [ "$fail" -gt 0 ]; then
+    echo "incomplete source archive: $fail package(s) require exact-version retrieval" >&2
+    exit 1
+fi
+if [ "$n" -eq 0 ]; then
+    echo "empty source manifest" >&2
+    exit 1
+fi
+sha256sum -- ./*.dsc ./*.tar.* > SHA256SUMS
 exit 0

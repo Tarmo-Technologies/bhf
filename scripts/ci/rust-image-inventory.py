@@ -12,6 +12,7 @@ import hashlib
 import json
 import pathlib
 import re
+import shutil
 import subprocess
 import tomllib
 from urllib.parse import quote
@@ -135,6 +136,8 @@ def main():
         package = tomllib.loads(pathlib.Path(message["manifest_path"]).read_text())["package"]
         metadata["packages"].append({"id": package_id, "name": package["name"],
                                      "version": package["version"], "license": package.get("license"),
+                                     "manifest_path": message["manifest_path"],
+                                     "license_file": package.get("license-file"),
                                      "source": package_id.split("#", 1)[0]})
         known.add(package_id)
     sbom, receipt = generate(metadata, tree, messages, tomllib.loads(pathlib.Path("Cargo.lock").read_text()),
@@ -143,6 +146,43 @@ def main():
     out.mkdir(exist_ok=True)
     (out / "rust.cyclonedx.json").write_text(json.dumps(sbom, indent=2) + "\n")
     (out / "build-receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
+    selected, _ = parse_tree(tree, metadata["packages"])
+    notices = []
+    for p in metadata["packages"]:
+        if p["id"] not in selected:
+            continue
+        base = pathlib.Path(p["manifest_path"]).parent
+        files = [f for f in base.rglob("*") if f.is_file() and
+                 f.name.upper().startswith(("LICENSE", "LICENCE", "COPYING", "NOTICE", "COPYRIGHT"))]
+        if p.get("license_file"):
+            files.append(base / p["license_file"])
+        if not p["source"]:
+            files.append(pathlib.Path("LICENSE").resolve())
+        if not files:
+            overrides = pathlib.Path("docker/compliance/rust-license-overrides")
+            manifest = json.loads((overrides / "manifest.json").read_text())
+            for item in manifest:
+                if (item["package"], item["version"]) != (p["name"], p["version"]):
+                    continue
+                path = overrides / item["file"]
+                if hashlib.sha256(path.read_bytes()).hexdigest() != item["sha256"]:
+                    raise ValueError(f"license override checksum mismatch: {path}")
+                vcs = json.loads((base / ".cargo_vcs_info.json").read_text())["git"]["sha1"]
+                if vcs != item["vcs_commit"]:
+                    raise ValueError(f"license override revision mismatch: {p['name']}")
+                files.append(path)
+        destination = out / "rust-licenses" / (p["name"] + "-" + p["version"])
+        destination.mkdir(parents=True, exist_ok=True)
+        paths = []
+        for number, path in enumerate(sorted(set(files))):
+            dest = destination / (str(number) + "-" + path.name)
+            shutil.copyfile(path, dest)
+            paths.append(str(dest.relative_to(out)))
+        if not paths:
+            raise ValueError(f"no license/notice text found for compiled package {p['name']}")
+        notices.append({"name": p["name"], "version": p["version"],
+                        "license_expression": p.get("license"), "texts": paths})
+    (out / "rust-notices.json").write_text(json.dumps(notices, indent=2) + "\n")
 
 
 if __name__ == "__main__":

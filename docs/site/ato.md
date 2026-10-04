@@ -28,9 +28,9 @@ that a repository or container automatically satisfies the listed controls.
 |---|---|---|
 | Boundary / no exfil | SC-7, SC-7(4) | Enforce the network boundary with `--network none` (below); verify the selected workflows and mounts. Vendor telemetry disabled (`DOTNET_CLI_TELEMETRY_OPTOUT=1`, `DOTNET_NOLOGO`, `…SKIP_FIRST_TIME_EXPERIENCE`). |
 | Least privilege | AC-6, SC-2, SC-3 | Runs as non-root UID 10001 (`fuzzer`); `tini` PID 1; no listening services/daemons. |
-| Least functionality | CM-7 | One image per need: comment out unused language `apt` lanes for a minimal deployment (below). |
+| Least functionality | CM-7 | Named core, Ada, and full-language targets; select only the required tooling (below). |
 | Container hardening | 800-190 §4 | `--cap-drop=ALL` + only `--cap-add=SYS_PTRACE`; `--security-opt no-new-privileges`; read-only-rootfs compatible (`--read-only` + tmpfs); digest-pinned base. |
-| Supply chain / SBOM | SR-3, SR-4, SR-11, SA-15 | CycloneDX SBOM baked at `/usr/share/bhf/sbom/os.cyclonedx.json` (regenerable offline, `generate-sbom.sh`); `bhf sbom` emits SPDX-2.3/CycloneDX + CVE + OpenVEX for source trees; digest-pinned base + pinned toolchain/tool versions; OCI provenance labels (`revision`/`version`/`created`). |
+| Supply chain / SBOM | SR-3, SR-4, SR-11, SA-15 | OS inventory at `/usr/share/bhf/sbom/os.cyclonedx.json`; build-time Cargo inventory and binary receipt; reconciled final-image scan in acceptance evidence; `bhf sbom` emits SPDX-2.3/CycloneDX + CVE + OpenVEX for source trees; digest-pinned base + pinned toolchain/tool versions; OCI provenance labels (`revision`/`version`/`created`). |
 | Flaw remediation | RA-5, SI-2 | Re-scannable offline (grype offline DB, or `bhf sbom --emit vulnerabilities`). Baseline posture below. |
 | Integrity | SI-7 | Record source/base/dependency digests and verify artifact integrity. Version pins or OCI labels alone do not prove reproducible builds or authenticated provenance. |
 | Cryptography | SC-13 | BHF uses hashing and signature verification for integrity/update workflows. Identify the actual module, mode and authorization boundary; no FIPS validation or exemption is established here. |
@@ -52,57 +52,28 @@ own instrumentation deps are already baked in.
 
 ## Vulnerability posture (RA-5, SI-2)
 
-The figures below are a historical remediation record, not a current vulnerability
-assessment of an immutable image digest. Re-scan the exact deployment artifact
-and retain the database version before relying on them. The earlier "0 exploitable"
-claim is not established by component inventory or missing execution observations.
+Retain the whole-image inventory, scan database identity, raw matches, and a
+reviewed disposition for the exact shipped image. The baked OS inventory covers
+only dpkg packages. Container acceptance reconciles a filesystem scan with the
+selected compiled Cargo dependency graph and verifies the shipped binary hashes.
+Build-toolchain caches are included in the filesystem scan.
 
-Previously reported full-image `grype` totals:
-
-| | Total | Critical | High | Notes |
-|---|--:|--:|--:|---|
-| Before remediation | 2,247 | 44 | 516 | dominated by old Go toolchain (1,050) + npm |
-| Previously reported after remediation | ~870 | 0 | Exploitability not established | Historical counts; reassess the exact artifact |
-
-What was fixed, at the source (not suppressed):
-
-- **Go toolchain** — Ubuntu's `golang-go` (1.22.2) dragged ~1,050 CVE-flagged
-  stdlib/vendored modules. Replaced with **upstream Go (pinned + sha256-verified)**,
-  which ships the fixes → those ~1,050 (incl. 546 Critical/High) go to **0**.
-- **npm** — its Debian dependency tree (`node-handlebars`, `node-postcss`, …)
-  carried the npm-layer CVEs. npm is build-only (the lane needs `node` + `esbuild`
-  at runtime), so it is **purged after esbuild is installed**, removing ~357
-  packages and all npm CVEs.
-- **Base + apt packages** — `apt-get dist-upgrade` pulls the latest
-  `-security/-updates` patches over the pinned base.
-- **Ruby default gems** — `erb`/`net-imap` updated so the interpreter loads the
-  patched versions.
-
-The earlier explanation characterized remaining matches as a Medium/Low backlog
-and unused bundled gems. Those observations are not sufficient to establish
-non-impact or prescribe a `not_affected` VEX disposition. As corrected on
-2026-09-25, BHF leaves automatic matches `under_investigation` until
-vulnerability-specific evidence supports a reviewed decision. See
-[inventory assurance and review gates](./inventory-assurance.md). Historical
-scan counts do not establish current remediation or authorization status.
-
-Re-scan offline anytime:
-```sh
-grype "sbom:/usr/share/bhf/sbom/os.cyclonedx.json" --distro ubuntu:24.04   # OS layer
-bhf sbom <source-tree> --vuln-db <offline-db.json> --emit vulnerabilities,openvex,vex-review
-```
-
-Shrink the surface further by removing lanes you don't deploy (next section).
+The local October 4 observations are recorded in
+[the validation report](../validation/2026-10-04-rtos-container-local.md). Those
+working-tree scans are historical evidence and do not approve a later release.
+A match may need distro backport analysis; absence from a runtime path is not
+sufficient to dismiss an installed vulnerable component. Automatic matches stay
+under investigation until evidence supports a reviewed disposition. See
+[inventory assurance and review gates](./inventory-assurance.md).
 
 ## Minimal image for deployment (CM-7 least functionality)
 
-The default image carries all sixteen language lanes; a classified deployment
-usually needs only a few. Delete the unused `apt` lanes from the `Dockerfile`
-(e.g. keep `make clang llvm lld libclang-rt-18-dev` for C/C++, plus Rust) and
-drop the rest — this removes most packages, most of the CVE surface, and, if you
-drop Ada/COBOL/Fortran, the GPLv3/GPLv2 **compilers** (see
-[licensing](./docker.md#licensing--redistribution)). A C/C++-only image is a
-small fraction of the full one.
+Use the named `core` target for C/C++, `ada` for core plus GNAT/GPRbuild, and
+`runtime` for the explicit full-language toolchain image. The default Docker
+build inherits `core`. All three exclude optional LLM code. Use the documented
+hardened Compose override and stage project dependencies before disconnecting.
+Each supported deployment needs execution evidence for its selected language
+and source/cache mounts; a Java smoke does not validate every full-image lane.
 
 ## What remains with the accreditation team
 

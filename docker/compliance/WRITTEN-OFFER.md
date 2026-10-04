@@ -29,8 +29,9 @@ You become the distributor of its GPL/LGPL binaries and must make the
 
 The exact packages + versions are in `COPYLEFT-SOURCES.txt`; `fetch-sources.sh`
 downloads their source; full per-package license text is at
-`/usr/share/doc/<package>/copyright`; a whole-image inventory is in
-`THIRD_PARTY_NOTICES.md` and the SBOMs under `/usr/share/bhf/sbom/`.
+`/usr/share/doc/<package>/copyright`; OS-package notices are in
+`THIRD_PARTY_NOTICES.md`. The final-image inventory and scan accompany release
+evidence; the OS-only inventory by itself is incomplete.
 
 > Redistributor contact (fill in if you choose the "offer" path):
 > _______________________________________________

@@ -36,6 +36,22 @@ ARG UBUNTU_SNAPSHOT=20261004T000000Z
 RUN printf 'APT::Snapshot "%s";\nAPT::Update::Error-Mode "any";\n' "${UBUNTU_SNAPSHOT}" > /etc/apt/apt.conf.d/50snapshot
 LABEL io.tarmo.bhf.ubuntu-snapshot="${UBUNTU_SNAPSHOT}"
 
+# Prepare the supported JS/TS tools without shipping npm's dependency tree.
+FROM ubuntu-pinned AS javascript-tools
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl --proto '=https' --tlsv1.2 -fsSLo /tmp/node.tar.xz https://nodejs.org/dist/v24.21.0/node-v24.21.0-linux-x64.tar.xz \
+    && echo 'fd8e59d5a511510f6a298afb548f18c7d2b1be404d8b4a27d94fbe49f56cb2d6  /tmp/node.tar.xz' | sha256sum -c - \
+    && mkdir -p /opt/node /out/licenses \
+    && tar -xJf /tmp/node.tar.xz --strip-components=1 -C /opt/node
+ENV PATH=/opt/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+RUN npm install -g --prefix /opt/esbuild --no-fund --no-audit esbuild@0.28.2 \
+    && cp /opt/node/bin/node /out/node \
+    && cp /opt/esbuild/lib/node_modules/esbuild/bin/esbuild /out/esbuild \
+    && cp /opt/node/LICENSE /out/licenses/node-LICENSE \
+    && cp /opt/esbuild/lib/node_modules/esbuild/LICENSE.md /out/licenses/esbuild-LICENSE.md \
+    && /out/node --version && /out/esbuild --version
+
 ########################################  builder  ########################################
 FROM ubuntu-pinned AS builder
 ARG TARGETPLATFORM
@@ -107,7 +123,7 @@ RUN apt-get update && apt-get -y dist-upgrade && apt-get install -y --no-install
         gnat gprbuild \
         # Java  (headless JDK + Maven; libasm-java provides asm-9.7 + asm-tree-9.7
         # at /usr/share/java for the offline JVM coverage-agent build — see ASM_JAR_DIR)
-        default-jdk-headless maven libasm-java \
+        default-jdk-headless libasm-java \
         # Python  (3.12 -> sys.monitoring coverage)
         python3 python3-dev python3-venv python3-pip \
         # Perl
@@ -116,8 +132,6 @@ RUN apt-get update && apt-get -y dist-upgrade && apt-get install -y --no-install
         gfortran \
         # COBOL  (GnuCOBOL cobc)
         gnucobol \
-        # JavaScript / TypeScript  (node runtime; npm is build-only, purged below)
-        nodejs \
         # Ruby
         ruby ruby-dev \
         # Lua
@@ -141,23 +155,34 @@ RUN curl --proto '=https' --tlsv1.2 -fsSLo /tmp/go.tgz \
     && rm -f /tmp/go.tgz \
     && /usr/local/go/bin/go version
 
-# TypeScript bundler for the JS/TS lane (pinned). npm is BUILD-ONLY: install
-# esbuild into /usr/local (survives npm removal), then purge npm and its
-# now-orphaned node-* deps. The final-image scan determines remaining exposure.
-# bhf's JS/TS lane needs only `node` + `esbuild` at runtime.
-RUN apt-get update && apt-get install -y --no-install-recommends npm \
-    && npm install -g --prefix /usr/local --no-fund --no-audit esbuild@0.28.2 \
-    && npm cache clean --force \
-    && apt-get purge -y npm && apt-get autoremove -y --purge \
-    && rm -rf /var/lib/apt/lists/* /root/.npm \
-    && esbuild --version && node --version
+COPY --from=javascript-tools /out/node /usr/local/bin/node
+COPY --from=javascript-tools /out/esbuild /usr/local/bin/esbuild
+COPY --from=javascript-tools /out/licenses/ /usr/share/bhf/licenses/javascript/
+
+# Maven's upstream distribution retains its bundled licenses and has newer
+# dependencies than the archived Ubuntu Maven package.
+RUN curl --proto '=https' --tlsv1.2 -fsSLo /tmp/maven.tgz https://archive.apache.org/dist/maven/maven-3/3.10.0/binaries/apache-maven-3.10.0-bin.tar.gz \
+    && echo '908b1501bfb420bf7c8affb855534a9c407fd6099367bfb9f2f2dcb8e9799102bffb84518cde74c679bd76870247c6528683abdd620581bffa90f95d92d175aa  /tmp/maven.tgz' | sha512sum -c - \
+    && mkdir /opt/maven && tar -xzf /tmp/maven.tgz --strip-components=1 -C /opt/maven \
+    && ln -s /opt/maven/bin/mvn /usr/local/bin/mvn && rm /tmp/maven.tgz \
+    && mvn --version
+
+COPY docker/python-build-tools.txt /usr/local/share/bhf/python-build-tools.txt
+RUN python3 -m pip install --break-system-packages --no-cache-dir --no-deps --require-hashes \
+      -r /usr/local/share/bhf/python-build-tools.txt \
+    && rm -rf /usr/lib/python3/dist-packages/setuptools* /usr/lib/python3/dist-packages/pkg_resources* \
+              /usr/lib/python3/dist-packages/wheel* /usr/lib/python3/dist-packages/packaging* \
+    && python3 -c 'import setuptools, wheel, packaging; assert setuptools.__version__ == "84.0.0"; assert wheel.__version__ == "0.48.0"'
 
 # Ruby ships default gems that carry advisories (erb, net-imap, zlib). Update them
 # so the interpreter loads the patched versions, and for `erb` (self-contained,
 # pure-Ruby, the only High) remove the superseded bundled copy so nothing — runtime
 # or scanner — sees the old version. bhf's Ruby lane fuzzes target code and does not
 # invoke these gems, so any residual is not in its execution path (see ato.md).
-RUN set -eu; gem install --no-document erb:6.0.7 net-imap:0.6.7 zlib:3.2.3; \
+RUN set -eu; gem install --no-document erb:6.0.7 net-imap:0.6.7 zlib:3.2.3 rexml:3.4.4 webrick:1.9.2; \
+    gem uninstall --install-dir /usr/lib/ruby/gems/3.2.0 --ignore-dependencies --executables net-imap -v 0.3.4.1; \
+    gem uninstall --install-dir /usr/lib/ruby/gems/3.2.0 --ignore-dependencies --executables rexml -v 3.2.5; \
+    gem uninstall --install-dir /usr/share/rubygems-integration/all --ignore-dependencies --executables webrick -v 1.8.1; \
     rubylib="$(ruby -e 'puts RbConfig::CONFIG["rubylibdir"]')"; \
     defdir="$(ruby -e 'require "rubygems"; puts Gem.default_specifications_dir')"; \
     rm -f "$rubylib/erb.rb" "$defdir"/erb-*.gemspec; rm -rf "$rubylib/erb" /root/.local/share/gem /root/.gem; \

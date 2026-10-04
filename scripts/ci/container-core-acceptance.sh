@@ -68,4 +68,5 @@ grep -Fq "$commit" "$evidence/daemon-version.log"
 "${run[@]}" "$image_id" sh -c 'dpkg-query -W | wc -l' > "$evidence/os-package-count.txt" 2>&1
 
 # Reconcile the filesystem and compiled Cargo inventory; retain the DB-bound scan.
+bash scripts/ci/container-runtime-acceptance.sh "$image_id" "$evidence"
 bash scripts/ci/inventory-image.sh "$image_id" "$evidence"

@@ -63,4 +63,5 @@ grep -q "unrecognized subcommand 'llm'" "$evidence/no-llm.log"
 bash scripts/ci/java-offline-acceptance.sh "$image_id" "$evidence"
 
 # Reconcile the filesystem and compiled Cargo inventory; retain the DB-bound scan.
+bash scripts/ci/container-runtime-acceptance.sh "$image_id" "$evidence"
 bash scripts/ci/inventory-image.sh "$image_id" "$evidence"
