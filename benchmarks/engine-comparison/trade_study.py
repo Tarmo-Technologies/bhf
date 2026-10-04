@@ -18,22 +18,34 @@ hashes, the exact commands, and separates build/setup time from campaign time.
 Raw per-(engine,target,trial) rows and an aggregated summary are written to the
 output JSON. Native throughput counters are recorded but flagged not directly
 comparable across engines (different definitions of an "execution").
+
+The target set is PLUGGABLE (see ``targets.py`` and ``METHODOLOGY.md``). With no
+``--manifest`` it runs the four controlled toy gates exactly as before; with a
+manifest it runs pinned real-code targets through the identical harness/oracle/
+coverage/censoring machinery. The aggregate step reports repeated-trial
+DISTRIBUTIONS (median + IQR + range + a bootstrap/Wilson CI), per-target AND
+across targets, and keeps every failed/censored/incomplete/unsupported trial
+visible so the effective sample size is never hidden. This is Experiment 1
+(engine quality) of issue #85; Experiment 2 (auto-harness productivity) lives in
+``benchmarks/harness-parity-20/``.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import shutil
-import statistics
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 import run  # reviewed helpers: sha256, monitor, fixture_source, make_corpus, CASES, ...
+import stats  # deterministic distribution/CI summaries (unit-tested in CI)
+import targets  # pluggable real-code target set + manifest schema
 
 ROOT = run.ROOT
 HARNESS_ROOT = run.HARNESS_ROOT
@@ -42,9 +54,96 @@ SEED = run.SEED
 
 ENGINES = ("bhf", "aflpp", "libfuzzer", "honggfuzz")
 
+# Per-trial outcome classes. Confirmed crashes count as solves; censored and
+# failed/incomplete trials are retained and reported so the denominator is never
+# silently shrunk to only the runs that worked.
+OUTCOME_CONFIRMED = "confirmed_crash"
+OUTCOME_CENSORED = "censored_no_crash"
+OUTCOME_BUILD_FAILED = "build_failed"
+OUTCOME_TIMEOUT = "supervisor_timeout"
+OUTCOME_INCOMPLETE = "incomplete"
+OUTCOME_UNSUPPORTED = "unsupported"
+OUTCOME_CLASSES = (
+    OUTCOME_CONFIRMED,
+    OUTCOME_CENSORED,
+    OUTCOME_BUILD_FAILED,
+    OUTCOME_TIMEOUT,
+    OUTCOME_INCOMPLETE,
+    OUTCOME_UNSUPPORTED,
+)
+
 
 def sha256(path: Path) -> str:
     return run.sha256(path)
+
+
+# --- pluggable target materialization --------------------------------------
+
+
+def materialize_target(spec: targets.TargetSpec, dest: Path) -> tuple[list[Path], str]:
+    """Realize a target's compilable source(s) under ``dest``.
+
+    Returns ``(sources, derived_sha256)``. For a builtin fixture this writes the
+    wrapped fixture source (identical to the historical path). For a self-
+    contained real-code target it copies each pinned source in, preserving its
+    name, and the derived hash is computed over the sorted (name, content-hash)
+    pairs so the exact source set is pinned per trial.
+    """
+    dest.mkdir(parents=True, exist_ok=True)
+    if spec.kind == targets.KIND_BUILTIN:
+        assert spec.fixture_case is not None
+        run_source = dest / f"{spec.fixture_case}.c"
+        run_source.write_text(run.fixture_source(spec.fixture_case))
+        return [run_source], sha256(run_source)
+    copied: list[Path] = []
+    pairs: list[str] = []
+    for src in spec.sources:
+        target_path = dest / src.name
+        shutil.copy(src, target_path)
+        copied.append(target_path)
+        pairs.append(f"{src.name}:{sha256(target_path)}")
+    derived = hashlib.sha256("\n".join(sorted(pairs)).encode()).hexdigest()
+    return copied, derived
+
+
+def source_build_args(
+    target_sources: list[Path], spec: targets.TargetSpec
+) -> list[str]:
+    """clang/afl-cc/hfuzz-cc argument fragment for a target's sources + flags."""
+    args: list[str] = []
+    for inc in spec.include_dirs:
+        args.extend(["-I", str(inc)])
+    args.extend(spec.extra_cflags)
+    args.extend(str(s) for s in target_sources)
+    return args
+
+
+def sanitizer_flags(spec: targets.TargetSpec) -> str:
+    """Oracle/fuzz sanitizer selection from the target's pinned policy."""
+    return "address,undefined" if spec.sanitizer_policy == "asan_ubsan" else "address"
+
+
+def classify_trade_outcome(row: dict) -> str:
+    """Pure, deterministic per-row outcome class (safe to unit-test in CI).
+
+    Mirrors the fields ``run_engine`` records so the aggregate step and the
+    renderer agree on what a trial was. Unsupported (not-yet-runnable) rows are
+    labeled by ``run_engine``/the main loop and passed through here unchanged.
+    """
+    if row.get("outcome") == OUTCOME_UNSUPPORTED:
+        return OUTCOME_UNSUPPORTED
+    if row.get("build_rc"):
+        return OUTCOME_BUILD_FAILED
+    if row.get("supervisor_timeout"):
+        return OUTCOME_TIMEOUT
+    if row.get("crash_confirmed"):
+        return OUTCOME_CONFIRMED
+    # A run that neither built-failed, timed out, nor crashed is censored only if
+    # the campaign actually ran to its budget; otherwise it is an incomplete run
+    # that must stay visible rather than be counted as a clean no-crash.
+    if row.get("campaign_wall_s") is None:
+        return OUTCOME_INCOMPLETE
+    return OUTCOME_CENSORED
 
 
 def any_sanitizer_crash(stderr: str) -> tuple[bool, str | None]:
@@ -208,26 +307,79 @@ def parse_honggfuzz(log_path: Path) -> dict:
 
 
 def run_engine(
-    engine, args, case, trial_seed, run_source, trial_dir, oracle, cov_binary
+    engine,
+    args,
+    spec: targets.TargetSpec,
+    trial_seed,
+    target_sources,
+    primary_source,
+    trial_dir,
+    oracle,
+    cov_binary,
+    budget,
+    max_len,
 ):
+    case = spec.name
     engine_dir = trial_dir / engine
     engine_dir.mkdir()
     corpus = engine_dir / "seed-corpus"
-    run.make_corpus(corpus)
-    budget = args.budget
+    if spec.seed_dir and spec.seed_dir.is_dir():
+        corpus.mkdir(parents=True, exist_ok=True)
+        for seed in sorted(spec.seed_dir.iterdir()):
+            if seed.is_file():
+                shutil.copy(seed, corpus / seed.name)
+    if not corpus.is_dir() or not any(corpus.iterdir()):
+        run.make_corpus(corpus)
     row = {
         "engine": engine,
         "case": case,
+        "target": case,
         "trial_seed": trial_seed,
         "budget_s": budget,
-        "max_len": args.max_len,
+        "max_len": max_len,
+        "sanitizer_policy": spec.sanitizer_policy,
+        "bhf_harness_mode": spec.bhf_harness_mode,
     }
+    src_suffix = source_build_args(target_sources, spec)
     build_s = 0.0
     build_rc = 0
     measure = None
     native = {}
     final_corpus: list[Path] = []
     crash_artifact = None
+
+    # The engine-quality comparison is only honest when every engine drives the
+    # same fixed harness. bhf's "provided" mode (fuzz a supplied harness rather
+    # than generate one) is the correct real-code mode but its exact CLI is a
+    # documented maintainer step, so record a visible unsupported row instead of
+    # fabricating an invocation.
+    if engine == "bhf" and spec.bhf_harness_mode == targets.BHF_PROVIDED:
+        row.update(
+            {
+                "outcome": OUTCOME_UNSUPPORTED,
+                "build_rc": None,
+                "build_s": None,
+                "campaign_wall_s": None,
+                "supervisor_timeout": None,
+                "crash_found": False,
+                "crash_confirmed": False,
+                "crash_source": None,
+                "time_to_first_crash_s": None,
+                "crash_within_budget": None,
+                "crash_signature": None,
+                "common_cov_edges": None,
+                "common_cov_features": None,
+                "final_corpus_size": None,
+                "native_executions": None,
+                "native_execs_per_s": None,
+                "right_censor_s": None,
+                "unsupported_reason": (
+                    "bhf provided-harness mode is not wired to a CLI invocation; "
+                    "supply the exact `bhf fuzz` command for a pre-written harness"
+                ),
+            }
+        )
+        return row
 
     if engine == "libfuzzer":
         binary = engine_dir / "target"
@@ -238,10 +390,10 @@ def run_engine(
             "-O1",
             "-g",
             "-fno-omit-frame-pointer",
-            "-fsanitize=fuzzer,address,undefined",
+            f"-fsanitize=fuzzer,{sanitizer_flags(spec)}",
             *link,
             str(HARNESS_ROOT / "libfuzzer.c"),
-            str(run_source),
+            *src_suffix,
             "-o",
             str(binary),
         ]
@@ -250,13 +402,16 @@ def run_engine(
         artifacts.mkdir()
         libcorp = engine_dir / "corpus"
         libcorp.mkdir()
-        shutil.copy(next(corpus.iterdir()), libcorp / "seed")
+        for index, seed in enumerate(
+            sorted(p for p in corpus.iterdir() if p.is_file())
+        ):
+            shutil.copy(seed, libcorp / f"seed-{index:04d}")
         cmd_run = [
             str(binary),
             str(libcorp),
             f"-max_total_time={budget}",
             f"-timeout={max(1, (args.timeout_ms + 999) // 1000)}",
-            f"-max_len={args.max_len}",
+            f"-max_len={max_len}",
             f"-seed={trial_seed}",
             "-use_value_profile=1",
             "-print_final_stats=1",
@@ -286,9 +441,9 @@ def run_engine(
             afl_cc,
             "-O1",
             "-g",
-            "-fsanitize=address,undefined",
+            f"-fsanitize={sanitizer_flags(spec)}",
             str(HARNESS_ROOT / "afl_persistent.c"),
-            str(run_source),
+            *src_suffix,
             "-o",
         ]
         env = {**os.environ, "AFL_PATH": str(afl_path), "AFL_QUIET": "1"}
@@ -318,7 +473,7 @@ def run_engine(
             "-s",
             str(trial_seed),
             "-G",
-            str(args.max_len),
+            str(max_len),
             "-c",
             str(cmp_binary),
             "--",
@@ -354,9 +509,9 @@ def run_engine(
             hfcc,
             "-O1",
             "-g",
-            "-fsanitize=address,undefined",
+            f"-fsanitize={sanitizer_flags(spec)}",
             str(HARNESS_ROOT / "libfuzzer.c"),
-            str(run_source),
+            *src_suffix,
             "-o",
             str(binary),
         ]
@@ -376,7 +531,7 @@ def run_engine(
             "--crashdir",
             str(crashdir),
             "-F",
-            str(args.max_len),
+            str(max_len),
             "-n",
             "1",
             "-t",
@@ -414,7 +569,7 @@ def run_engine(
         gen = [
             str(args.bhf),
             "generate-harness",
-            str(run_source),
+            str(primary_source),
             "--target",
             "target_one_input",
             "--output",
@@ -447,7 +602,7 @@ def run_engine(
                     "--rng-seed",
                     str(trial_seed),
                     "--max-len",
-                    str(args.max_len),
+                    str(max_len),
                     "--len-control",
                     "0",
                     "--timeout",
@@ -529,15 +684,61 @@ def run_engine(
         )
     else:
         row["native_execs_per_s"] = None
+    # Native counters are retained but explicitly NOT a cross-engine unit.
+    row["native_executions_comparable_across_engines"] = False
+    row["outcome"] = classify_trade_outcome(row)
+    row["right_censor_s"] = (
+        row["campaign_wall_s"] if row["outcome"] == OUTCOME_CENSORED else None
+    )
     return row
 
 
-def one_trial(args, case, trial_seed, trial_dir) -> list[dict]:
+def unsupported_rows(spec: targets.TargetSpec, engines, trial_seed) -> list[dict]:
+    """Visible placeholder rows for a target the simple compile model can't run.
+
+    A ``requires_build_recipe``/``manual`` target still appears in the evidence —
+    with its upstream pin and the reason — so a maintainer sees exactly which
+    real-code targets remain to be wired, rather than the target vanishing.
+    """
+    reason = (
+        f"target status={spec.status!r}: the single-invocation compile model "
+        f"cannot build this target; supply a per-target build recipe"
+    )
+    rows = []
+    for engine in engines:
+        rows.append(
+            {
+                "engine": engine,
+                "case": spec.name,
+                "target": spec.name,
+                "trial_seed": trial_seed,
+                "outcome": OUTCOME_UNSUPPORTED,
+                "crash_found": False,
+                "crash_confirmed": False,
+                "time_to_first_crash_s": None,
+                "common_cov_edges": None,
+                "common_cov_features": None,
+                "final_corpus_size": None,
+                "native_executions": None,
+                "native_execs_per_s": None,
+                "native_executions_comparable_across_engines": False,
+                "build_rc": None,
+                "right_censor_s": None,
+                "crash_signature": None,
+                "unsupported_reason": reason,
+                "target_provenance": spec.provenance(),
+            }
+        )
+    return rows
+
+
+def one_trial(args, spec: targets.TargetSpec, trial_seed, trial_dir) -> list[dict]:
     src_dir = trial_dir / "source"
-    src_dir.mkdir(parents=True)
-    run_source = src_dir / f"{case}.c"
-    run_source.write_text(run.fixture_source(case))
-    derived_sha = sha256(run_source)
+    target_sources, derived_sha = materialize_target(spec, src_dir)
+    primary_source = target_sources[0]
+    budget = spec.budget_s if spec.budget_s is not None else args.budget
+    max_len = spec.max_len if spec.max_len is not None else args.max_len
+    src_suffix = source_build_args(target_sources, spec)
 
     oracle = trial_dir / "replay-oracle"
     ob, orc, _ = build(
@@ -546,9 +747,9 @@ def one_trial(args, case, trial_seed, trial_dir) -> list[dict]:
             "-O1",
             "-g",
             "-fno-omit-frame-pointer",
-            "-fsanitize=address,undefined",
+            f"-fsanitize={sanitizer_flags(spec)}",
             str(HARNESS_ROOT / "replay_stdin.c"),
-            str(run_source),
+            *src_suffix,
             "-o",
             str(oracle),
         ],
@@ -571,7 +772,7 @@ def one_trial(args, case, trial_seed, trial_dir) -> list[dict]:
             "-fsanitize=fuzzer,address",
             *link,
             str(HARNESS_ROOT / "libfuzzer.c"),
-            str(run_source),
+            *src_suffix,
             "-o",
             str(cov_binary),
         ],
@@ -586,21 +787,33 @@ def one_trial(args, case, trial_seed, trial_dir) -> list[dict]:
     rows = []
     for engine in args.engines:
         r = run_engine(
-            engine, args, case, trial_seed, run_source, trial_dir, oracle, cov_binary
+            engine,
+            args,
+            spec,
+            trial_seed,
+            target_sources,
+            primary_source,
+            trial_dir,
+            oracle,
+            cov_binary,
+            budget,
+            max_len,
         )
         r.update(
             {
                 "derived_source_sha256": derived_sha,
                 "oracle_sha256": sha256(oracle),
                 "coverage_binary_sha256": sha256(cov_binary),
+                "target_provenance": spec.provenance(),
             }
         )
         rows.append(r)
         print(
-            f"  [{case} t{trial_seed} {engine:9}] "
-            f"crash={r['crash_found']}({'ok' if r['crash_confirmed'] else '-'}) "
-            f"ttfc={r['time_to_first_crash_s']} cov_edges={r['common_cov_edges']} "
-            f"ft={r['common_cov_features']} corpus={r['final_corpus_size']}",
+            f"  [{spec.name} t{trial_seed} {engine:9}] "
+            f"outcome={r.get('outcome')} "
+            f"crash={r.get('crash_found')}({'ok' if r.get('crash_confirmed') else '-'}) "
+            f"ttfc={r.get('time_to_first_crash_s')} cov_edges={r.get('common_cov_edges')} "
+            f"ft={r.get('common_cov_features')} corpus={r.get('final_corpus_size')}",
             flush=True,
         )
     return rows
@@ -612,50 +825,189 @@ def aggregate(rows: list[dict], engines, cases) -> dict:
         summary[case] = {}
         for engine in engines:
             sub = [r for r in rows if r["case"] == case and r["engine"] == engine]
-            if not sub:
-                continue
-            confirmed = [r for r in sub if r["crash_confirmed"]]
-            ttfcs = [
-                r["time_to_first_crash_s"]
-                for r in confirmed
-                if r["time_to_first_crash_s"] is not None
-            ]
-            edges = [
-                r["common_cov_edges"] for r in sub if r["common_cov_edges"] is not None
-            ]
-            fts = [
-                r["common_cov_features"]
-                for r in sub
-                if r["common_cov_features"] is not None
-            ]
-            execs = [
-                r["native_execs_per_s"]
-                for r in sub
-                if r["native_execs_per_s"] is not None
-            ]
-            builds = [r["build_s"] for r in sub if r["build_s"] is not None]
-            summary[case][engine] = {
-                "trials": len(sub),
-                "crash_find_rate": round(len(confirmed) / len(sub), 3),
-                "median_ttfc_s": round(statistics.median(ttfcs), 3) if ttfcs else None,
-                "min_ttfc_s": round(min(ttfcs), 3) if ttfcs else None,
-                "median_cov_edges": statistics.median(edges) if edges else None,
-                "max_cov_edges": max(edges) if edges else None,
-                "median_cov_features": statistics.median(fts) if fts else None,
-                "median_native_execs_per_s": round(statistics.median(execs), 1)
-                if execs
-                else None,
-                "median_build_s": round(statistics.median(builds), 3)
-                if builds
-                else None,
-            }
-    return summary
+            if sub:
+                summary[case][engine] = engine_summary(sub)
+    aggregate_by_engine = {}
+    for engine in engines:
+        sub = [r for r in rows if r["engine"] == engine]
+        if sub:
+            aggregate_by_engine[engine] = engine_summary(sub)
+    return {
+        "schema": "bhf-trade-study-summary-v2",
+        "per_target": summary,
+        "aggregate_by_engine": aggregate_by_engine,
+        "metric_notes": {
+            "crash_find": (
+                "Wilson 95% CI over VALID campaigns only (confirmed + censored); "
+                "build_failed/timeout/incomplete/unsupported trials are reported "
+                "separately in 'outcomes' so the effective n stays visible."
+            ),
+            "ttfc_s": "distribution over oracle-confirmed trials with a native TTFC",
+            "common_cov_edges": "engine-neutral shared-sancov edges; median + IQR + range + bootstrap CI",
+            "native_execs_per_s": "per-engine only; NOT comparable across engines (counter semantics differ)",
+        },
+    }
+
+
+def engine_summary(sub: list[dict]) -> dict:
+    """Distribution-aware summary for one engine over a set of trial rows.
+
+    Keeps every outcome class visible, reports a binomial CI for the crash-find
+    rate over valid campaigns, distribution+CI for the continuous metrics, and
+    the distinct confirmed-defect signature count. Native throughput is reported
+    per-engine with an explicit non-comparability flag.
+    """
+    outcomes = {
+        cls: sum(1 for r in sub if r.get("outcome") == cls) for cls in OUTCOME_CLASSES
+    }
+    confirmed = [r for r in sub if r.get("outcome") == OUTCOME_CONFIRMED]
+    censored = [r for r in sub if r.get("outcome") == OUTCOME_CENSORED]
+    valid = outcomes[OUTCOME_CONFIRMED] + outcomes[OUTCOME_CENSORED]
+    ttfcs = [
+        r["time_to_first_crash_s"]
+        for r in confirmed
+        if r.get("time_to_first_crash_s") is not None
+    ]
+    edges = [
+        r["common_cov_edges"] for r in sub if r.get("common_cov_edges") is not None
+    ]
+    fts = [
+        r["common_cov_features"]
+        for r in sub
+        if r.get("common_cov_features") is not None
+    ]
+    execs = [
+        r["native_execs_per_s"] for r in sub if r.get("native_execs_per_s") is not None
+    ]
+    builds = [r["build_s"] for r in sub if r.get("build_s") is not None]
+    signatures = {
+        r.get("crash_signature") for r in confirmed if r.get("crash_signature")
+    }
+    return {
+        "trials": len(sub),
+        "valid_campaigns": valid,
+        "outcomes": outcomes,
+        "crash_find": stats.wilson_interval(
+            outcomes[OUTCOME_CONFIRMED], valid
+        ).as_dict(),
+        "distinct_defect_signatures": len(signatures),
+        "ttfc_s": stats.summarize(ttfcs).as_dict(),
+        "common_cov_edges": stats.summarize(edges, round_to=1).as_dict(),
+        "common_cov_features": stats.summarize(fts, round_to=1).as_dict(),
+        "build_s": stats.summarize(builds).as_dict(),
+        "native_execs_per_s": {
+            "comparable_across_engines": False,
+            "distribution": stats.summarize(execs, round_to=1).as_dict(),
+        },
+        "right_censored_s": sorted(
+            r["right_censor_s"] for r in censored if r.get("right_censor_s") is not None
+        ),
+    }
+
+
+def load_targets(args) -> list[targets.TargetSpec]:
+    """Resolve the pluggable target set: builtin fixtures or a manifest."""
+    if args.manifest:
+        specs = targets.load_manifest(args.manifest, resolve_sources=not args.dry_run)
+    else:
+        specs = targets.builtin_fixture_targets(run.CASES)
+    if args.cases:
+        wanted = set(args.cases)
+        specs = [s for s in specs if s.name in wanted]
+        missing = wanted - {s.name for s in specs}
+        if missing:
+            raise SystemExit(f"--cases named unknown targets: {sorted(missing)}")
+    if not specs:
+        raise SystemExit("no targets selected")
+    return specs
+
+
+def describe_plan(specs: list[targets.TargetSpec], args) -> None:
+    for spec in specs:
+        budget = spec.budget_s if spec.budget_s is not None else args.budget
+        max_len = spec.max_len if spec.max_len is not None else args.max_len
+        pin = f" @ {spec.upstream.commit[:12]}" if spec.upstream else ""
+        print(f"- {spec.name} [{spec.kind}/{spec.status}]{pin}")
+        print(
+            f"    budget={budget}s max_len={max_len} sanitizer={spec.sanitizer_policy} "
+            f"bhf_harness={spec.bhf_harness_mode}"
+        )
+        if spec.sources:
+            print(f"    sources: {', '.join(p.name for p in spec.sources)}")
+        if spec.source_sha256:
+            for name, digest in spec.source_sha256.items():
+                print(f"      {name}: {digest[:16]}")
+        if spec.notes:
+            print(f"    notes: {spec.notes}")
+
+
+def build_evidence(all_rows, specs, args, started) -> dict:
+    manifest_sha = (
+        sha256(args.manifest) if args.manifest and args.manifest.is_file() else None
+    )
+    return {
+        "schema": "bhf-trade-study-v2",
+        "experiment": "engine-quality",
+        "generated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "git_commit": run.command_output(["git", "rev-parse", "HEAD"]),
+        "host": {"cpu": run.cpu_model(), "nproc": os.cpu_count()},
+        "config": {
+            k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()
+        },
+        "manifest": {
+            "path": str(args.manifest) if args.manifest else None,
+            "sha256": manifest_sha,
+        },
+        "targets": [s.provenance() for s in specs],
+        "tool_versions": {
+            "bhf": run.command_output([str(args.bhf), "--version"]),
+            "afl_cc": run.command_output([str(args.afl_path / "afl-cc"), "--version"]),
+            "afl_fuzz_dir": str(args.afl_path),
+            "clang": run.command_output(["clang", "--version"]),
+            "honggfuzz_dir": str(args.honggfuzz_dir),
+        },
+        "rows": all_rows,
+        "summary": aggregate(all_rows, args.engines, [s.name for s in specs]),
+        "elapsed_s": round(time.time() - started, 1),
+    }
 
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--engines", nargs="+", choices=ENGINES, default=list(ENGINES))
-    p.add_argument("--cases", nargs="+", default=list(run.CASES))
+    p.add_argument(
+        "--cases",
+        nargs="+",
+        default=None,
+        help="restrict to these target names (default: all targets in the set)",
+    )
+    p.add_argument(
+        "--manifest",
+        type=Path,
+        default=None,
+        help="real-code target manifest (.json/.toml); default = the 4 builtin fixtures",
+    )
+    p.add_argument(
+        "--sources",
+        type=Path,
+        default=None,
+        help="checkout root for --fetch (default: <workdir>/sources)",
+    )
+    p.add_argument(
+        "--fetch",
+        action="store_true",
+        help="clone manifest upstreams at their pins, then exit",
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="validate + print the target plan without building",
+    )
+    p.add_argument(
+        "--list-targets",
+        action="store_true",
+        help="print the resolved target set and exit",
+    )
     p.add_argument("--trials", type=int, default=10)
     p.add_argument("--budget", type=int, default=60, help="fuzz wall seconds per trial")
     p.add_argument("--timeout-ms", type=int, default=1000)
@@ -665,50 +1017,66 @@ def main() -> int:
     p.add_argument("--afl-path", type=Path, default=Path("/tmp/bhf-afl503c.NoHEOu/src"))
     p.add_argument("--honggfuzz-dir", type=Path, default=Path("/tmp/honggfuzz"))
     p.add_argument("--workdir", type=Path, default=Path("/tmp/bhf-trade-study"))
-    p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--output", type=Path, default=None)
     args = p.parse_args()
     if args.cpu.lower() == "none":
         args.cpu = None
 
+    specs = load_targets(args)
+
+    if args.fetch:
+        sources_root = (args.sources or args.workdir / "sources").resolve()
+        log_dir = args.workdir / "fetch-logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        for spec in specs:
+            if spec.upstream is None:
+                print(f"- {spec.name}: no upstream pin, skipped")
+                continue
+            checkout = targets.fetch_sources(spec, sources_root, log_dir=log_dir)
+            print(
+                f"- {spec.name}: checked out {spec.upstream.commit[:12]} -> {checkout}"
+            )
+        print(
+            "Fetched. Point each target's 'sources'/'include_dirs' at these "
+            "checkouts, add a target_one_input adapter, and set status=runnable."
+        )
+        return 0
+
+    if args.list_targets or args.dry_run:
+        print(f"{len(specs)} target(s):")
+        describe_plan(specs, args)
+        runnable = sum(1 for s in specs if s.status == targets.RUNNABLE)
+        print(
+            f"\nrunnable: {runnable}/{len(specs)} (others emit visible unsupported rows)"
+        )
+        return 0
+
+    if args.output is None:
+        p.error("--output is required when running a study")
+
     args.workdir.mkdir(parents=True, exist_ok=True)
     all_rows: list[dict] = []
     started = time.time()
-    for case in args.cases:
+    for spec in specs:
+        if spec.status != targets.RUNNABLE:
+            all_rows.extend(unsupported_rows(spec, args.engines, None))
+            print(
+                f"[{spec.name}] status={spec.status} -> {len(args.engines)} unsupported rows"
+            )
+            args.output.write_text(
+                json.dumps(build_evidence(all_rows, specs, args, started), indent=2)
+            )
+            continue
         for t in range(args.trials):
             trial_seed = 1000 + t
-            trial_dir = args.workdir / case / f"trial-{t:03d}"
+            trial_dir = args.workdir / spec.name / f"trial-{t:03d}"
             if trial_dir.exists():
                 shutil.rmtree(trial_dir)
             trial_dir.mkdir(parents=True)
-            all_rows.extend(one_trial(args, case, trial_seed, trial_dir))
+            all_rows.extend(one_trial(args, spec, trial_seed, trial_dir))
             # Persist incrementally so a long run is never lost.
             args.output.write_text(
-                json.dumps(
-                    {
-                        "schema": "bhf-trade-study-v1",
-                        "generated_utc": time.strftime(
-                            "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
-                        ),
-                        "host": {"cpu": run.cpu_model(), "nproc": os.cpu_count()},
-                        "config": {
-                            k: (str(v) if isinstance(v, Path) else v)
-                            for k, v in vars(args).items()
-                        },
-                        "tool_versions": {
-                            "bhf": run.command_output([str(args.bhf), "--version"]),
-                            "afl_cc": run.command_output(
-                                [str(args.afl_path / "afl-cc"), "--version"]
-                            ),
-                            "afl_fuzz_dir": str(args.afl_path),
-                            "clang": run.command_output(["clang", "--version"]),
-                            "honggfuzz_dir": str(args.honggfuzz_dir),
-                        },
-                        "rows": all_rows,
-                        "summary": aggregate(all_rows, args.engines, args.cases),
-                        "elapsed_s": round(time.time() - started, 1),
-                    },
-                    indent=2,
-                )
+                json.dumps(build_evidence(all_rows, specs, args, started), indent=2)
             )
     print(
         f"\nDONE: {len(all_rows)} rows in {time.time() - started:.0f}s -> {args.output}"
