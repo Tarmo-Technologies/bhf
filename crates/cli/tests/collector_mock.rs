@@ -145,11 +145,19 @@ fn collector_three_positive_classes_emit_semantic_findings_without_a_crash() {
             assert!(prov.get(field).is_some(), "missing provenance {field}: {f}");
         }
         assert_eq!(prov["observation_window_ms"], 500);
-        // The attributing event + descendant tree are stored for audit.
+        // The attributing event + descendant tree are stored for audit. The tree is
+        // rooted at the REAL replayed target PID the host launched under the observer
+        // (#76), not a synthetic constant.
         assert!(f["collector"]["attributing_event"].is_object());
-        assert!(f["collector"]["process_tree"]
-            .as_array()
-            .is_some_and(|t| t.contains(&Value::from(1000u32))));
+        let replayed_pid = summary["collector"]["replayed_pid"]
+            .as_u64()
+            .expect("the replay records the launched target PID");
+        assert!(
+            f["collector"]["process_tree"]
+                .as_array()
+                .is_some_and(|t| t.contains(&Value::from(replayed_pid))),
+            "finding tree must contain the launched target PID {replayed_pid}: {f}"
+        );
     }
 }
 
