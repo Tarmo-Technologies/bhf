@@ -9,6 +9,8 @@ import re
 
 
 def reconcile(filesystem, rust, receipt, inspect, binaries):
+    if inspect[0].get("Architecture") != "amd64" or inspect[0].get("Os") != "linux":
+        raise ValueError("unsupported image platform")
     labels = inspect[0]["Config"]["Labels"]
     for key, label, pattern in (
         ("source_commit", "org.opencontainers.image.revision", r"[a-f0-9]{40}"),

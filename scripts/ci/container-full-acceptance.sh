@@ -61,6 +61,10 @@ grep -q "unrecognized subcommand 'llm'" "$evidence/no-llm.log"
 "${run[@]}" "$image_id" sh -c 'dpkg-query -W | wc -l' \
   > "$evidence/os-package-count.txt" 2>&1
 bash scripts/ci/java-offline-acceptance.sh "$image_id" "$evidence"
+docker run --rm --network none --read-only --tmpfs /tmp:rw,exec,nosuid,size=1g \
+  --memory 4g --pids-limit 512 --cap-drop ALL --security-opt no-new-privileges:true \
+  --volume "$PWD/docker/language-smoke.sh:/language-smoke.sh:ro" \
+  "$image_id" bash /language-smoke.sh > "$evidence/language-smoke.log" 2>&1
 
 # Reconcile the filesystem and compiled Cargo inventory; retain the DB-bound scan.
 bash scripts/ci/container-runtime-acceptance.sh "$image_id" "$evidence"

@@ -22,12 +22,25 @@ $expectedVersion = "bhf v$($workspaceVersion.Matches[0].Groups[1].Value)"
 Get-CimInstance Win32_OperatingSystem |
     Select-Object Caption, Version, BuildNumber |
     Format-List
-$actualVersion = (& $bhf --version).Trim()
+$versionLines = @(& $bhf --version)
+if ($LASTEXITCODE -ne 0) { throw "bhf --version failed" }
+$actualVersion = $versionLines[0].Trim()
 Write-Host $actualVersion
 if ($actualVersion -ne $expectedVersion) {
     throw "Expected '$expectedVersion', got '$actualVersion'"
 }
-& $daemon --help | Out-Null
+$expectedCommit = (& git -C $repoRoot rev-parse HEAD).Trim()
+if ($versionLines -notcontains "commit: $expectedCommit") {
+    throw "CLI does not report the exact tested source commit"
+}
+$daemonHelp = @(& $daemon --help)
+if ($LASTEXITCODE -ne 0 -or -not ($daemonHelp -match '^Usage: bhf-daemon')) {
+    throw "Daemon help did not report its actual command interface"
+}
+$daemonVersion = @(& $daemon --version)
+if ($LASTEXITCODE -ne 0 -or $daemonVersion -notcontains "commit: $expectedCommit") {
+    throw "Daemon source identity disagrees with the tested CLI"
+}
 & $bhf scan $fixture `
     --work-dir "$env:RUNNER_TEMP\bhf-windows-scan"
 & $bhf auto $fixture `

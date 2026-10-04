@@ -18,12 +18,14 @@ build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 image="${1:-bhf:${version}}"
 flavor="${2:-core}"
 case "$flavor" in core|runtime|ada) ;; *) echo "unsupported image flavor: $flavor" >&2; exit 2 ;; esac
+started=$SECONDS
 git archive --format=tar HEAD | docker build --platform linux/amd64 --target "$flavor" -f Dockerfile -t "$image" \
   --build-arg "BHF_VERSION=$version" \
   --build-arg "VCS_REF=$commit" \
   --build-arg "BUILD_DATE=$build_date" \
   --build-arg "BHF_SOURCE_SHA256=$source_sha" -
 image_id="$(docker image inspect --format '{{.Id}}' "$image")"
+elapsed=$((SECONDS - started))
 cat <<MANIFEST
 image=$image
 local_image_id=$image_id
@@ -34,4 +36,5 @@ platform=linux/amd64
 build_date=$build_date
 features=default-no-llm
 flavor=$flavor
+build_elapsed_seconds=$elapsed
 MANIFEST

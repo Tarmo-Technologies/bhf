@@ -42,7 +42,7 @@ class InventoryTests(unittest.TestCase):
         for name, path in RUST.ARTIFACTS.items():
             (self.binaries / name).write_bytes(name.encode())
             self.receipt["binaries"].append({"path": path, "sha256": hashlib.sha256(name.encode()).hexdigest()})
-        self.inspect = [{"Id": "sha256:" + "c" * 64, "Config": {"Labels": {
+        self.inspect = [{"Id": "sha256:" + "c" * 64, "Architecture": "amd64", "Os": "linux", "Config": {"Labels": {
             "org.opencontainers.image.version": "0.2.34", "org.opencontainers.image.revision": "a" * 40,
             "io.tarmo.bhf.source-archive-sha256": "b" * 64}}}]
         self.fs = {"metadata": {"component": {"bom-ref": "image"}}, "components": []}

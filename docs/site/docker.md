@@ -42,7 +42,7 @@ build recovery. The full language validation sweep uses `runtime` explicitly.
 |---|---|---|
 | `core` (default) | C/C++ with Clang/LLVM | Non-root, read-only, disconnected C fixture in the actual image |
 | `ada` (explicit) | Core plus GNAT/GPRbuild | Non-root, read-only, disconnected Ada compiler smoke; broader project acceptance remains project-specific |
-| `runtime` (explicit) | All sixteen language toolchains except Gradle project recovery | Bare Java and staged Maven fixture under a read-only, disconnected profile; other lanes need separate hardened-profile evidence |
+| `runtime` (explicit) | All sixteen language toolchains except Gradle project recovery | Bare Java, staged offline Maven, and benign compiler/runtime startup for all sixteen languages under isolation; project-specific dependencies still require staging |
 | FreeRTOS reference | Separate pinned kernel, ARM GCC, QEMU | Cooperative task/queue image, clean → fault → clean, retained finding and replay; no physical-board claim |
 
 ## Run
@@ -115,7 +115,7 @@ unchanged original source, and a failing empty-cache build under network isolati
 ## Release inventory and build inputs
 
 The Ubuntu repositories use a dated snapshot. Builder Rust, runtime nightly,
-rustup, Go, esbuild, and selected Ruby gems have explicit versions; downloaded
+rustup, Go, Node, Maven, esbuild, Python build tools, and selected Ruby gems have explicit versions; downloaded
 rustup and Go archives have checksum checks. Refresh pins through a reviewed
 build and scan. Package versions and ecosystem inventory are retained for each
 image, including dependencies supplied by package managers.
@@ -227,39 +227,54 @@ Apache-2.0 and runs the bundled toolchains as **subprocesses** — it does not l
 their GPL code, so aggregating them does not place bhf under the GPL (mere
 aggregation, GPLv2 §2 / GPLv3 §5). AFL++ is predominantly Apache-2.0.
 
-bhf is distributed as **source** and publishes **no prebuilt images**, so the
-project distributes no GPL/LGPL binaries and owes no corresponding-source offer —
-you build the image, and Ubuntu is the distributor of the packages it pulls.
-The duty only arises **if you choose to redistribute the built image** (push it
-to a registry, ship a `docker save` tarball): then you make the GPL/LGPL
-corresponding source available (the GNU compilers/tools, OpenJDK, glibc, AFL++'s
-gcc-pass file). The image is built to make that turnkey — under
-`/usr/share/bhf/licenses/` (and an SBOM under `/usr/share/bhf/sbom/`):
+Container candidates retain the installed OS package notices, selected Rust
+crate license texts, and upstream tool licenses. The candidate packager includes
+exact Ubuntu source archives from `COPYLEFT-SOURCES.txt`, their checksums, and the
+BHF source archive containing the build instructions. Source retrieval fails if
+any exact requested version is unavailable; it does not substitute a newer
+version. The generated OS notices and inventory do not cover every ecosystem by
+themselves.
 
-| File | Purpose |
-|---|---|
-| `THIRD_PARTY_NOTICES.md` | every package → version → source → declared license(s) |
-| `COPYLEFT-SOURCES.txt` | `source=version` for just the GPL/LGPL packages |
-| `WRITTEN-OFFER.md` | the written offer — **add your contact before distributing** |
-| `fetch-sources.sh` | downloads the matching Ubuntu source for those packages |
+`WRITTEN-OFFER.md` is informational material, not a completed publisher offer.
+Redistribution review must account for all bundled components and modifications.
+The signed candidate includes source material rather than relying on a blank
+contact field. [ATO / RMF posture](./ato.md) is supporting deployment evidence.
 
-Full per-package license text is retained at `/usr/share/doc/<pkg>/copyright`.
-To fulfil the offer:
+## Authenticated offline container handoff
+
+The `Container release candidate` workflow runs full CI at the exact source
+revision, builds and tests the chosen image, reconciles its inventory, and checks
+the scan. Critical/High findings, unknown severity, fixable Medium findings, and
+invalid/stale databases block packaging for signing. Other matches remain
+explicitly `under_investigation` in the review record; none are automatically
+marked unaffected.
+
+The unsigned archive includes `image.docker.tar`, `release-manifest.json`, source
+archives, binary hashes, SBOMs, scan/database details, and acceptance logs. It uses
+the tested local image configuration digest. A registry manifest digest is not
+claimed for this offline format.
+
+Publisher signing requires the matching version tag and approval in the existing
+`production-release` environment. The reviewer accepts or rejects the exact
+candidate and residual findings. A detached signature authenticates the entire
+container archive using the existing BHF distribution signature scheme; the
+independent verifier checks it before the archive is extracted or loaded.
+Obtain the verifier and publisher public key through an independently trusted
+channel, as described in [verified distribution handoff](../verified-distribution-handoff.md).
 
 ```sh
-docker run --rm --user 0 -v "$PWD/corresponding-source":/out bhf:local \
-  bash /usr/share/bhf/licenses/fetch-sources.sh \
-       /usr/share/bhf/licenses/COPYLEFT-SOURCES.txt /out
+python3 scripts/verify-offline-dist.py \
+  --archive bhf-container-VERSION-core-COMMIT.tar.gz \
+  --signature bhf-container-VERSION-core-COMMIT.tar.gz.sig \
+  --trusted-public-key /trusted/publisher.hex \
+  --max-archive-bytes 8589934592 \
+  --verified-copy /safe/verified-container.tar.gz
 ```
 
-To shed the GPLv3/GPLv2 **compilers**, drop the Ada, COBOL, and Fortran `apt`
-lanes from the `Dockerfile` (you keep clang for C/C++); `make`/`glibc` remain.
-See `docker/compliance/README.md`.
-
-**Deploying to accredited/classified environments?** See
-[ATO / RMF posture](./ato.md) — control crosswalk (800-53/800-190), the air-gap
-evidence limits and the control crosswalk. Inventory and scan the entire shipped
-image, including toolchain caches; authorization remains deployment-specific.
+After successful verification, extract the verified copy, load its
+`image.docker.tar` with `docker load`, and use the image ID recorded in
+`release-manifest.json`. These archives are separate from native binary bundles
+and receive their own signatures.
 
 ## Troubleshooting
 

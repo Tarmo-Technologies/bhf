@@ -58,6 +58,7 @@ ARG TARGETPLATFORM
 RUN test "${TARGETPLATFORM}" = linux/amd64
 
 ENV DEBIAN_FRONTEND=noninteractive \
+    RUSTUP_TOOLCHAIN=1.99.0 \
     RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -168,7 +169,7 @@ RUN curl --proto '=https' --tlsv1.2 -fsSLo /tmp/maven.tgz https://archive.apache
     && mvn --version
 
 COPY docker/python-build-tools.txt /usr/local/share/bhf/python-build-tools.txt
-RUN python3 -m pip install --break-system-packages --no-cache-dir --no-deps --require-hashes \
+RUN python3 -m pip install --break-system-packages --ignore-installed --no-cache-dir --no-deps --require-hashes \
       -r /usr/local/share/bhf/python-build-tools.txt \
     && rm -rf /usr/lib/python3/dist-packages/setuptools* /usr/lib/python3/dist-packages/pkg_resources* \
               /usr/lib/python3/dist-packages/wheel* /usr/lib/python3/dist-packages/packaging* \
@@ -292,7 +293,8 @@ RUN set -eux; d="$(mktemp -d)"; cd "$d"; \
     cd /; rm -rf "$d"
 
 WORKDIR /work
-ENV BHF_SWEEP_MANIFEST=/usr/local/share/bhf/sweep-manifest.tsv
+ENV BHF_SWEEP_MANIFEST=/usr/local/share/bhf/sweep-manifest.tsv \
+    NUGET_PACKAGES=/home/fuzzer/.nuget/packages
 
 # Build metadata (pass with --build-arg for reproducible provenance):
 #   docker build --build-arg VCS_REF=$(git rev-parse HEAD) \

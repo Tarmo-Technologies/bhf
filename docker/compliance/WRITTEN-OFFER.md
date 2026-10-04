@@ -1,37 +1,24 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
-# Redistribution & corresponding-source notice (GPL / LGPL)
+# Redistribution materials for container candidates
 
-**bhf is distributed as source** (Apache-2.0, this repository). The project does
-**not** publish prebuilt container images, so the project itself distributes no
-GPL/LGPL binaries and carries no corresponding-source offer. When you run
-`docker build`, the GPL/LGPL packages (gcc, glibc, make, gnat, gprbuild,
-gnucobol, openjdk, afl++'s gcc-pass file, …) are delivered to *you* by Ubuntu at
-build time — Ubuntu is their distributor, and its published source is their
-corresponding source.
+This file is informational material, not a completed publisher written offer.
+BHF's own code and the programs bundled into an image retain their respective
+license terms. Generated manifests do not constitute a legal compliance decision.
 
-This file, and the manifests beside it, exist so that **if you choose to
-redistribute the built image** (push it to a registry, ship a `docker save`
-tarball to another party), you can meet the obligation you take on as its
-distributor. Building the image for your own use, or on an air-gapped host you
-control, is not distribution and triggers nothing.
+The container candidate workflow retains:
 
-## If you redistribute the built image
+- OS package notices and license files under `/usr/share/bhf/licenses/` and
+  `/usr/share/doc/`;
+- the installed OS source package/version list in `COPYLEFT-SOURCES.txt`;
+- exact corresponding Ubuntu source downloads, with checksums, beside the image;
+- the BHF source archive and Dockerfile, including package modifications;
+- selected compiled Rust crate notices and license texts under
+  `/usr/share/bhf/sbom/rust-licenses/`;
+- upstream tool license material retained inside the image.
 
-You become the distributor of its GPL/LGPL binaries and must make the
-**corresponding source** available (GPLv2 §3, GPLv3 §6, LGPL). Easiest paths:
-
-1. **Accompany** the image with source (GPLv3 §6(a) / GPLv2 §3(a)): run
-   `fetch-sources.sh` once and ship its output next to the image. No ongoing
-   offer to maintain.
-2. **Offer** source (GPLv2 §3(b), 3 years / GPLv3 §6(c)): include a written offer
-   naming *your* contact, and archive the `fetch-sources.sh` output so you can
-   serve the exact versions later.
-
-The exact packages + versions are in `COPYLEFT-SOURCES.txt`; `fetch-sources.sh`
-downloads their source; full per-package license text is at
-`/usr/share/doc/<package>/copyright`; OS-package notices are in
-`THIRD_PARTY_NOTICES.md`. The final-image inventory and scan accompany release
-evidence; the OS-only inventory by itself is incomplete.
-
-> Redistributor contact (fill in if you choose the "offer" path):
-> _______________________________________________
+`fetch-sources.sh` fails if any requested source version cannot be retrieved. It
+never replaces a missing exact version with the current package source. The
+whole-image inventory and release review must account for separately installed
+components as well as OS packages. A distributor using an offer instead of the
+included source material needs its own completed, reviewed offer and retention
+process; this file supplies neither.
