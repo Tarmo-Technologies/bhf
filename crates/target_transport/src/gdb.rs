@@ -174,6 +174,41 @@ pub enum StopReply {
     Terminated(u8),
 }
 
+/// GDB remote-protocol signal numbers.
+///
+/// RSP stop replies (`Sxx` / `Txx`) carry GDB's own `gdb_signal` enum values,
+/// **not** the host platform's POSIX signal numbers. The two namespaces
+/// diverge: notably GDB numbers `SIGBUS` as 10 and `SIGEMT` as 7, whereas Linux
+/// uses 7 for `SIGBUS`. Classifying an RSP reply with host constants therefore
+/// mislabels a bus error and never fires for a real `SIGBUS`. These are the
+/// protocol values from GDB's `include/gdb/signals.def`.
+pub mod gdb_signal {
+    /// Illegal instruction.
+    pub const ILL: u8 = 4;
+    /// Trace/breakpoint trap — benign (a planted breakpoint or single-step stop).
+    pub const TRAP: u8 = 5;
+    /// Abort / `abort()`.
+    pub const ABRT: u8 = 6;
+    /// Emulator trap.
+    pub const EMT: u8 = 7;
+    /// Floating-point / arithmetic exception.
+    pub const FPE: u8 = 8;
+    /// Bus error (GDB numbers this 10, not the Linux POSIX 7).
+    pub const BUS: u8 = 10;
+    /// Segmentation fault / invalid memory access.
+    pub const SEGV: u8 = 11;
+}
+
+/// True for a GDB-protocol signal that denotes a target fault (a crash), as
+/// opposed to a benign stop such as `SIGTRAP` (a breakpoint) or "no signal" (0).
+///
+/// Shared by [`StopReply::to_exit_kind`] and the full-system fault classifier so
+/// the coarse crash decision and the detailed fault taxonomy stay in agreement.
+pub fn is_fatal_signal(signal: u8) -> bool {
+    use gdb_signal::*;
+    matches!(signal, ILL | ABRT | EMT | FPE | BUS | SEGV)
+}
+
 impl StopReply {
     /// Parse a stop-reply packet body.
     pub fn parse(body: &[u8]) -> Result<Self> {
@@ -196,21 +231,16 @@ impl StopReply {
     }
 
     /// Coarse HDF-1 mapping to [`ExitKind`]. The full signal-to-fault taxonomy
-    /// is HDF-2; here only the classically fatal signals count as a crash so a
-    /// benign `SIGTRAP` breakpoint stop is not mislabeled.
+    /// is HDF-2; here only the fatal GDB-protocol signals count as a crash so a
+    /// benign `SIGTRAP` breakpoint stop is not mislabeled. Signal numbers are
+    /// GDB's, not the host's — see [`gdb_signal`] and [`is_fatal_signal`].
     pub fn to_exit_kind(&self) -> ExitKind {
         match self {
             Self::Exited(_) => ExitKind::Ok,
+            // `Xxx` always denotes termination by a signal: a crash.
             Self::Terminated(_) => ExitKind::Crash,
-            Self::Signal(0) => ExitKind::Ok,
-            Self::Signal(signal) => {
-                // SIGILL(4) SIGABRT(6) SIGBUS(7) SIGFPE(8) SIGSEGV(11).
-                if matches!(signal, 4 | 6 | 7 | 8 | 11) {
-                    ExitKind::Crash
-                } else {
-                    ExitKind::Ok
-                }
-            }
+            Self::Signal(signal) if is_fatal_signal(*signal) => ExitKind::Crash,
+            Self::Signal(_) => ExitKind::Ok,
         }
     }
 }
@@ -631,15 +661,45 @@ mod tests {
     }
 
     #[test]
-    fn stop_reply_parses_and_classifies() {
+    fn stop_reply_parses_signal_exit_and_terminate_tags() {
         assert_eq!(StopReply::parse(b"S05").unwrap(), StopReply::Signal(5));
+        assert_eq!(StopReply::parse(b"S0a").unwrap(), StopReply::Signal(10));
         assert_eq!(StopReply::parse(b"S0b").unwrap(), StopReply::Signal(11));
+        // A `T` reply carries the same signal in its first two hex digits, then
+        // register/thread fields the coarse decoder ignores.
+        assert_eq!(
+            StopReply::parse(b"T0b20:0000;thread:1;").unwrap(),
+            StopReply::Signal(11)
+        );
         assert_eq!(StopReply::parse(b"W00").unwrap(), StopReply::Exited(0));
         assert_eq!(StopReply::parse(b"X0b").unwrap(), StopReply::Terminated(11));
-        // SIGTRAP (breakpoint) is not a crash; SIGSEGV is.
-        assert_eq!(StopReply::Signal(5).to_exit_kind(), ExitKind::Ok);
-        assert_eq!(StopReply::Signal(11).to_exit_kind(), ExitKind::Crash);
-        assert_eq!(StopReply::Terminated(11).to_exit_kind(), ExitKind::Crash);
+    }
+
+    #[test]
+    fn to_exit_kind_uses_gdb_protocol_signal_numbers() {
+        use gdb_signal::*;
+        // Fatal GDB-protocol signals classify as a crash, via both `S` and `T`.
+        // SIGBUS is 10 here, not the host POSIX 7; a real `S0a` bus-error reply
+        // was previously misclassified as a clean `Ok`.
+        for sig in [ILL, ABRT, EMT, FPE, BUS, SEGV] {
+            assert_eq!(
+                StopReply::Signal(sig).to_exit_kind(),
+                ExitKind::Crash,
+                "GDB signal {sig} must classify as a crash"
+            );
+            assert_eq!(
+                StopReply::parse(format!("T{sig:02x}").as_bytes())
+                    .unwrap()
+                    .to_exit_kind(),
+                ExitKind::Crash,
+            );
+        }
+        // Benign stops: "no signal" (0) and the breakpoint / single-step trap.
+        assert_eq!(StopReply::Signal(0).to_exit_kind(), ExitKind::Ok);
+        assert_eq!(StopReply::Signal(TRAP).to_exit_kind(), ExitKind::Ok);
+        // A normal process exit is clean; an `X` termination is a crash.
+        assert_eq!(StopReply::Exited(0).to_exit_kind(), ExitKind::Ok);
+        assert_eq!(StopReply::Terminated(SEGV).to_exit_kind(), ExitKind::Crash);
     }
 
     #[test]

@@ -454,27 +454,28 @@ impl<CQ: Read + Write, CG: Read + Write> TargetSession for FullSystemSession<CQ,
 /// best-effort [`FaultKind`] from its signal so the finding is not empty; a
 /// clean exit or a benign breakpoint stop carries no fault.
 fn fault_from_stop(stop: &crate::gdb::StopReply) -> Option<Fault> {
-    use crate::gdb::StopReply;
+    use crate::gdb::{gdb_signal, is_fatal_signal, StopReply};
+    // Produce a fault exactly when `to_exit_kind` classifies a crash, so the
+    // coarse exit and the detailed fault never disagree: a fatal `Sxx`/`Txx`
+    // signal, or any `Xxx` termination-by-signal. A benign `SIGTRAP`, "no
+    // signal", or a clean exit carries no fault.
     let signal = match stop {
-        StopReply::Signal(signal) => *signal,
+        StopReply::Signal(signal) if is_fatal_signal(*signal) => *signal,
         StopReply::Terminated(signal) => *signal,
-        StopReply::Exited(_) => return None,
+        StopReply::Signal(_) | StopReply::Exited(_) => return None,
     };
+    // GDB-protocol signal numbers (see `gdb::gdb_signal`), NOT host POSIX ones —
+    // in particular SIGBUS is 10 and SIGEMT is 7.
     let kind = match signal {
-        // SIGSEGV(11), SIGBUS(7): memory-protection faults.
-        11 | 7 => FaultKind::MemoryProtection,
-        // SIGILL(4), SIGFPE(8): CPU exceptions.
-        4 | 8 => FaultKind::CpuException,
-        // SIGABRT(6): assertion / abort.
-        6 => FaultKind::AssertionPanic,
-        // A non-fatal signal is not a crash (to_exit_kind agrees); no fault.
-        0 | 5 => return None,
-        other => FaultKind::Other(other as u32),
+        gdb_signal::SEGV | gdb_signal::BUS => FaultKind::MemoryProtection,
+        gdb_signal::ILL | gdb_signal::FPE | gdb_signal::EMT => FaultKind::CpuException,
+        gdb_signal::ABRT => FaultKind::AssertionPanic,
+        other => FaultKind::Other(u32::from(other)),
     };
     Some(Fault {
         kind,
         address: None,
-        detail: format!("qemu-system stop reply reported signal {signal}"),
+        detail: format!("qemu-system stop reply reported GDB signal {signal}"),
     })
 }
 
@@ -906,16 +907,57 @@ mod tests {
     }
 
     #[test]
-    fn fault_from_stop_maps_signals_and_ignores_clean_exit() {
+    fn fault_from_stop_uses_gdb_signal_numbers_and_ignores_clean_exit() {
+        use crate::gdb::gdb_signal;
         assert!(fault_from_stop(&StopReply::Exited(0)).is_none());
-        assert!(fault_from_stop(&StopReply::Signal(5)).is_none()); // benign trap
+        assert!(fault_from_stop(&StopReply::Signal(gdb_signal::TRAP)).is_none()); // benign trap
+        assert!(fault_from_stop(&StopReply::Signal(0)).is_none());
         assert_eq!(
-            fault_from_stop(&StopReply::Signal(11)).unwrap().kind,
+            fault_from_stop(&StopReply::Signal(gdb_signal::SEGV))
+                .unwrap()
+                .kind,
             FaultKind::MemoryProtection
         );
+        // SIGBUS is GDB signal 10 (not the host POSIX 7): a memory-protection
+        // fault that was previously misclassified as Other(10) and reported Ok.
         assert_eq!(
-            fault_from_stop(&StopReply::Terminated(6)).unwrap().kind,
+            fault_from_stop(&StopReply::Signal(gdb_signal::BUS))
+                .unwrap()
+                .kind,
+            FaultKind::MemoryProtection
+        );
+        // GDB signal 7 is SIGEMT (an emulator/CPU trap), not SIGBUS.
+        assert_eq!(
+            fault_from_stop(&StopReply::Signal(gdb_signal::EMT))
+                .unwrap()
+                .kind,
+            FaultKind::CpuException
+        );
+        assert_eq!(
+            fault_from_stop(&StopReply::Signal(gdb_signal::ILL))
+                .unwrap()
+                .kind,
+            FaultKind::CpuException
+        );
+        assert_eq!(
+            fault_from_stop(&StopReply::Terminated(gdb_signal::ABRT))
+                .unwrap()
+                .kind,
             FaultKind::AssertionPanic
+        );
+    }
+
+    #[test]
+    fn bus_error_stop_reply_is_a_crash_through_the_session() {
+        // GDB signal 10 (`S0a`) is a bus error. Routed through the session it
+        // must be a retained memory-protection crash, not a clean outcome.
+        let (transport, _qmp_log, _gdb_log) = wired_transport(&[9], b"S0a".to_vec(), 64);
+        let mut session = transport.arm().unwrap();
+        let outcome = session.run_input(b"bus").unwrap();
+        assert_eq!(outcome.exit, ExitKind::Crash);
+        assert_eq!(
+            outcome.fault.expect("a crash must carry a fault").kind,
+            FaultKind::MemoryProtection
         );
     }
 }
