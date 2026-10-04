@@ -2307,6 +2307,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/collector_replay.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/corpus_cli.rs",
       "license": "Apache-2.0"
     },

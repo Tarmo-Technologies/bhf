@@ -215,6 +215,50 @@ fn owned_collection_never_stops_an_unrelated_or_peer_session() {
     }
 }
 
+#[test]
+#[ignore = "requires BHF_WIN_LIVE=1 on a Windows runner"]
+fn replay_readiness_ack_and_clean_control_scaffold() {
+    // #76 native scaffold (gated BHF_WIN_LIVE). The FULL positive/clean control —
+    // the host spawning a retained testcase as a REAL child UNDER the live ETW
+    // session after the readiness ack, then handing off the child pid — is not yet
+    // wired (the native sidecar observes its own window; the host-driven replay
+    // spawn is the remaining piece). What IS native and asserted here: the #76
+    // readiness ack the host relies on to confirm the collector is watching, and
+    // the positive/clean invariant that a non-degraded live observation reports a
+    // clean assurance.
+    if !live_enabled() {
+        return;
+    }
+    let ready = std::env::temp_dir().join(format!("bhf-live-ready-{}", std::process::id()));
+    let _ = std::fs::remove_file(&ready);
+    // SAFETY: nextest runs each test in its own process, so this env mutation is
+    // process-local and not observed by other tests.
+    std::env::set_var("BHF_COLLECTOR_READY", &ready);
+    let jsonl = etw::collect(
+        &ctx(),
+        std::process::id(),
+        "C:\\sandbox\\target.exe",
+        Vec::new(),
+    );
+    std::env::remove_var("BHF_COLLECTOR_READY");
+
+    assert!(
+        ready.exists(),
+        "the collector must signal the #76 readiness ack to the host"
+    );
+    let _ = std::fs::remove_file(&ready);
+
+    let set = CollectorSessionSet::from_jsonl(&jsonl);
+    assert_eq!(set.malformed_lines, 0, "live stream must be valid schema");
+    let session = set.session("tc-live", 0).expect("session present");
+    if !session.fidelity.is_degraded() {
+        assert!(
+            session.clean_assurance_ok(),
+            "a non-degraded live observation is a clean assurance"
+        );
+    }
+}
+
 // The three positive fixtures (ShellExecuteExW on a fuzz-controlled target, a
 // fuzz-controlled `..\\escaped` path, and LoadLibraryW on a fuzz-controlled
 // non-system path) plus the fixed-constant negative controls require live

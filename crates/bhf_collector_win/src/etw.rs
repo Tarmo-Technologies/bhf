@@ -331,6 +331,12 @@ fn run_consumer(
         return;
     }
 
+    // #76 readiness ack: the session is live and the real-time consumer is open, so
+    // tell the host (which is waiting on `BHF_COLLECTOR_READY`) we are watching
+    // before it would run a replayed target. Best-effort; a missing marker only
+    // means the host bounds us by timeout and records a degraded, not-observed run.
+    signal_ready();
+
     // ProcessTrace blocks until the session stops; run it on a worker thread so
     // the controlling thread can bound the observation window.
     let handle_value = process_handle.Value;
@@ -359,6 +365,19 @@ fn run_consumer(
     }
     // keep `logger_name` alive until the consumer is fully torn down.
     drop(logger_name);
+}
+
+/// Signal the #76 readiness ack to the host: once the session is live and the
+/// real-time consumer is open, touch the `BHF_COLLECTOR_READY` path the host is
+/// waiting on so it can confirm the collector is watching before a replayed target
+/// runs. Best-effort — a missing/undeliverable marker never fails the run (the
+/// host bounds it by timeout and records a degraded, not-observed run instead).
+fn signal_ready() {
+    if let Some(path) = std::env::var_os("BHF_COLLECTOR_READY") {
+        if !path.is_empty() {
+            let _ = std::fs::write(&path, b"ready");
+        }
+    }
 }
 
 /// Real-time `EVENT_RECORD` callback. Routes the event through the pure decoder

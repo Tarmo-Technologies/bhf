@@ -35,9 +35,56 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 /// The default bounded post-exit observation window, in milliseconds.
 pub const DEFAULT_WINDOW_MS: u64 = 250;
+
+/// How long the host waits for a sidecar to signal it is live and watching (the
+/// readiness ack) before giving up and recording a degraded, not-observed run. A
+/// sidecar that never readies is bounded by this timeout rather than blocking the
+/// run or being mistaken for a clean observation.
+pub const READINESS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How the collector observed this run, recorded in provenance so a reviewer never
+/// reads a limited observation as whole-campaign coverage (#76).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservationMode {
+    /// A specific retained testcase replayed under the collector. Coverage is
+    /// limited to that one replayed execution — NOT the whole campaign.
+    Replay,
+    /// The Linux runtrace built-in re-expressing the campaign's aggregate shim log
+    /// as collector events. Coverage is campaign-level/aggregate, not a per-testcase
+    /// replay, so per-case identity is never fabricated for it.
+    Aggregate,
+}
+
+impl ObservationMode {
+    /// Short provenance label.
+    pub fn label(self) -> &'static str {
+        match self {
+            ObservationMode::Replay => "replay",
+            ObservationMode::Aggregate => "aggregate",
+        }
+    }
+
+    /// The coverage scope this observation honestly represents.
+    pub fn coverage(self) -> &'static str {
+        match self {
+            ObservationMode::Replay => "single-testcase-replay",
+            ObservationMode::Aggregate => "whole-campaign-aggregate",
+        }
+    }
+
+    /// Stamp `observation`/`coverage` onto a run-provenance JSON object, so the run
+    /// manifest states which (limited) scope was observed.
+    pub fn stamp(self, provenance: &mut Value) {
+        if let Some(obj) = provenance.as_object_mut() {
+            obj.insert("observation".to_owned(), json!(self.label()));
+            obj.insert("coverage".to_owned(), json!(self.coverage()));
+        }
+    }
+}
 
 /// Event classes the Linux built-in (runtrace→collector) provider can observe at
 /// all — its *declared* coverage (AC7), independent of what fires on any one run.
@@ -263,6 +310,88 @@ pub struct CollectorOutcome {
     pub run_provenance: Value,
 }
 
+/// The outcome of spawning the sidecar and waiting through the readiness handshake.
+enum ObserveOutcome {
+    /// The sidecar acked readiness, ran, and wrote a sink. Carries the raw JSONL.
+    Observed(String),
+    /// The sidecar could not observe this run (no readiness ack, it exited before
+    /// signaling, failed capture, or wrote no sink). Carries a degrade reason that
+    /// routes to [`ResolvedCollector::not_observed`] — never a clean assurance.
+    NotObserved(String),
+}
+
+/// A retained campaign testcase chosen to replay under the collector: real bytes,
+/// a real testcase id, and the worker that replays it — never a synthetic
+/// `testcase:"fuzz"` / empty input (#76).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayTestcase {
+    pub testcase: String,
+    pub worker: u32,
+    pub input: Vec<u8>,
+}
+
+/// Select a retained testcase to replay under the collector: a crash finding's
+/// stored `testcase.bin` first (the most interesting retained input), else a
+/// persisted coverage-corpus input. Returns `None` when the campaign retained
+/// nothing to replay — the caller then records a degraded, not-observed run rather
+/// than fabricating a synthetic observation. Deterministic (lowest id / name
+/// first) so a replayed finding is reproducible.
+///
+/// Collector findings (`COL-` ids) are skipped: they are what this pass writes,
+/// and are not themselves campaign testcases.
+pub fn select_replay_testcase(work_dir: &Path, harness_id: &str) -> Option<ReplayTestcase> {
+    // 1) Crash findings: results/findings/<id>/testcase.bin (crash lane ids).
+    let findings_dir = corpus::layout::findings_dir(work_dir);
+    if let Ok(entries) = std::fs::read_dir(&findings_dir) {
+        let mut crash_ids: Vec<(String, PathBuf)> = entries
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().to_str()?.to_owned();
+                if name.starts_with("COL-") {
+                    return None; // collector's own findings, not a campaign testcase
+                }
+                let tc = e.path().join("testcase.bin");
+                tc.is_file().then_some((name, tc))
+            })
+            .collect();
+        crash_ids.sort_by(|a, b| a.0.cmp(&b.0));
+        if let Some((id, tc)) = crash_ids.first() {
+            if let Ok(bytes) = std::fs::read(tc) {
+                return Some(ReplayTestcase {
+                    testcase: id.clone(),
+                    worker: 0,
+                    input: bytes,
+                });
+            }
+        }
+    }
+
+    // 2) Persisted coverage corpus: corpus/<harness_id>/queue/<sha>.bin.
+    let queue = work_dir.join("corpus").join(harness_id).join("queue");
+    if let Ok(entries) = std::fs::read_dir(&queue) {
+        let mut inputs: Vec<(String, PathBuf)> = entries
+            .flatten()
+            .filter_map(|e| {
+                let p = e.path();
+                let stem = p.file_stem()?.to_str()?.to_owned();
+                (p.extension().and_then(|x| x.to_str()) == Some("bin")).then_some((stem, p))
+            })
+            .collect();
+        inputs.sort_by(|a, b| a.0.cmp(&b.0));
+        if let Some((stem, path)) = inputs.first() {
+            if let Ok(bytes) = std::fs::read(path) {
+                return Some(ReplayTestcase {
+                    testcase: format!("corpus-{stem}"),
+                    worker: 0,
+                    input: bytes,
+                });
+            }
+        }
+    }
+
+    None
+}
+
 impl ResolvedCollector {
     fn backend(&self) -> &BackendInfo {
         &self.backend
@@ -295,8 +424,17 @@ impl ResolvedCollector {
         self.evaluate(&set, root)
     }
 
-    /// Run the sidecar for one testcase and return the raw JSONL sink it wrote.
-    fn observe(&self, params: &CollectorRunParams<'_>) -> anyhow::Result<String> {
+    /// Run the sidecar for one testcase with a readiness handshake and return the
+    /// raw JSONL sink it wrote, or a degrade reason when it could not observe.
+    ///
+    /// The host spawns the sidecar non-blocking and confirms it is live and
+    /// watching (the sidecar touches the `BHF_COLLECTOR_READY` path) BEFORE a
+    /// replayed target would run under it — so "the collector was not actually
+    /// watching the run" becomes a detectable, degraded outcome instead of a silent
+    /// clean claim (#76). A missing ack (timeout, or the sidecar exited first) and
+    /// a non-zero exit both route to [`ObserveOutcome::NotObserved`], never an
+    /// error that would abort the run.
+    fn observe(&self, params: &CollectorRunParams<'_>) -> anyhow::Result<ObserveOutcome> {
         let sidecar = match &self.source {
             CollectorSource::Sidecar(path) => path,
             CollectorSource::Runtrace(_) => {
@@ -310,13 +448,15 @@ impl ResolvedCollector {
             .with_context(|| format!("create {}", params.tmp_dir.display()))?;
         let sink = params.tmp_dir.join("collector.jsonl");
         let input_path = params.tmp_dir.join("collector_input.bin");
+        let ready_path = params.tmp_dir.join("collector.ready");
         std::fs::write(&input_path, params.input)
             .with_context(|| format!("write {}", input_path.display()))?;
-        // Truncate any prior sink so a failed provider is never mistaken for a
-        // prior clean run.
+        // Truncate any prior sink / readiness marker so a failed provider is never
+        // mistaken for a prior clean run, nor a stale ack taken for this run's ack.
         let _ = std::fs::remove_file(&sink);
+        let _ = std::fs::remove_file(&ready_path);
 
-        let status = Command::new(sidecar)
+        let mut child = Command::new(sidecar)
             .env("BHF_COLLECTOR_TESTCASE", &params.testcase)
             .env("BHF_COLLECTOR_WORKER", params.worker.to_string())
             .env("BHF_COLLECTOR_ROOT", &params.root)
@@ -325,29 +465,97 @@ impl ResolvedCollector {
             .env("BHF_COLLECTOR_WINDOW_MS", self.window_ms.to_string())
             .env("BHF_COLLECTOR_INPUT", &input_path)
             .env("BHF_COLLECTOR_LOG", &sink)
-            .status()
+            .env("BHF_COLLECTOR_READY", &ready_path)
+            .spawn()
             .with_context(|| format!("spawn collector sidecar {}", sidecar.display()))?;
+
+        // Wait for the readiness ack, the child exiting first, or the timeout.
+        let deadline = Instant::now() + READINESS_TIMEOUT;
+        let mut readied = false;
+        let mut exited_before_ready = false;
+        loop {
+            if ready_path.exists() {
+                readied = true;
+                break;
+            }
+            match child.try_wait() {
+                Ok(Some(_status)) => {
+                    // Exited before ever signaling readiness: it never established a
+                    // live observation of this run.
+                    exited_before_ready = true;
+                    break;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(anyhow!("collector sidecar {}: {error}", sidecar.display()));
+                }
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        if !readied {
+            if !exited_before_ready {
+                // Still running but silent past the deadline: bound it.
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+            let reason = if exited_before_ready {
+                "collector_exited_before_ready"
+            } else {
+                "collector_no_readiness_ack"
+            };
+            return Ok(ObserveOutcome::NotObserved(reason.to_owned()));
+        }
+
+        // The sidecar is live and watching. (A host-driven replay of the target
+        // would run here, under it; wiring that spawn to the native ETW provider is
+        // tracked as the live replay scaffold.) Wait for its observation window to
+        // finish and the sink to be written.
+        let status = child
+            .wait()
+            .with_context(|| format!("await collector sidecar {}", sidecar.display()))?;
         if !status.success() {
-            return Err(anyhow!(
-                "collector sidecar {} exited with {} (it could not observe; refusing to treat \
-                 this as a clean run)",
-                sidecar.display(),
+            return Ok(ObserveOutcome::NotObserved(format!(
+                "collector_capture_failed_exit_{}",
                 status
                     .code()
                     .map(|c| c.to_string())
                     .unwrap_or_else(|| "signal".to_owned())
-            ));
+            )));
         }
-        std::fs::read_to_string(&sink)
-            .with_context(|| format!("read collector sink {}", sink.display()))
+        match std::fs::read_to_string(&sink) {
+            Ok(jsonl) => Ok(ObserveOutcome::Observed(jsonl)),
+            Err(_) => Ok(ObserveOutcome::NotObserved(
+                "collector_sink_missing".to_owned(),
+            )),
+        }
     }
 
     /// Observe a testcase, attribute the events, and evaluate the oracle registry
     /// over them, returning deduplicated findings plus run provenance.
+    ///
+    /// A sidecar that could not observe (no readiness ack, failed capture, or a
+    /// sink with no session for the replayed testcase/worker) yields the degraded
+    /// [`Self::not_observed`] contract — never a clean assurance over a run the
+    /// collector was not actually watching (#76 / #60 AC6).
     pub fn run_once(&self, params: &CollectorRunParams<'_>) -> anyhow::Result<CollectorOutcome> {
-        let jsonl = self.observe(params)?;
-        let set = CollectorSessionSet::from_jsonl(&jsonl);
-        Ok(self.evaluate(&set, &params.root))
+        match self.observe(params)? {
+            ObserveOutcome::NotObserved(reason) => Ok(self.not_observed(reason)),
+            ObserveOutcome::Observed(jsonl) => {
+                let set = CollectorSessionSet::from_jsonl(&jsonl);
+                // The sidecar readied and ran but produced no session for the
+                // replayed testcase/worker: there is nothing honest to evaluate.
+                if set.session(&params.testcase, params.worker).is_none() {
+                    return Ok(self.not_observed("testcase_not_observed"));
+                }
+                Ok(self.evaluate(&set, &params.root))
+            }
+        }
     }
 
     /// Pure evaluation step (no I/O): attribute each session and run the oracle
@@ -509,8 +717,10 @@ fn observed_classes(session: &CollectorSession) -> Vec<String> {
     classes.into_iter().collect()
 }
 
-/// Build the `collector` provenance block embedded in a finding.
-fn collector_block(finding: &CollectorFinding) -> Value {
+/// Build the `collector` provenance block embedded in a finding. `observation`
+/// records the (limited) scope the collector actually watched, so a reviewer never
+/// reads a single-testcase replay as whole-campaign coverage (#76).
+fn collector_block(finding: &CollectorFinding, observation: ObservationMode) -> Value {
     json!({
         "provenance": finding.provenance,
         "root": finding.root,
@@ -518,6 +728,8 @@ fn collector_block(finding: &CollectorFinding) -> Value {
         "attributing_event": finding.attributing_event,
         "process_tree": finding.process_tree,
         "clean_assurance": finding.provenance.clean_assurance_ok(),
+        "observation": observation.label(),
+        "coverage": observation.coverage(),
     })
 }
 
@@ -559,6 +771,7 @@ pub fn write_finding(
     target: Value,
     finding: &CollectorFinding,
     input: &[u8],
+    observation: ObservationMode,
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     std::fs::write(dir.join("testcase.bin"), input)
@@ -595,7 +808,7 @@ pub fn write_finding(
             "evidence": evidence,
             "signature": finding.signature
         },
-        "collector": collector_block(finding),
+        "collector": collector_block(finding, observation),
         "paths": {
             "testcase": "testcase.bin",
             "collector_evidence": EVIDENCE_FILE
@@ -871,7 +1084,10 @@ mod tests {
         // an unobserved stream — and emit no findings.
         let collector = declaring_resolved(250);
         let outcome = collector.not_observed("runtime_shim_not_armed");
-        assert!(outcome.findings.is_empty(), "no findings without observation");
+        assert!(
+            outcome.findings.is_empty(),
+            "no findings without observation"
+        );
         assert_eq!(
             outcome.run_provenance.pointer("/active"),
             Some(&Value::Bool(true)),
@@ -975,7 +1191,15 @@ mod tests {
         let set = sessions(&MockCollector::path_control(), "tc", 0);
         let outcome = collector.evaluate(&set, "/srv/sandbox");
         let finding = &outcome.findings[0];
-        write_finding(&dir, "BF-0001", json!({"kind": "test"}), finding, b"seed").unwrap();
+        write_finding(
+            &dir,
+            "BF-0001",
+            json!({"kind": "test"}),
+            finding,
+            b"seed",
+            ObservationMode::Replay,
+        )
+        .unwrap();
 
         assert!(is_collector_finding(&dir));
         // Deterministic replay from stored evidence reproduces the signature.
@@ -989,5 +1213,53 @@ mod tests {
         assert_eq!(replay_collector_finding(&dir), 3);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn unique_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "bhf-select-replay-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn select_replay_prefers_crash_finding_then_corpus_then_none() {
+        let work = unique_dir("sel");
+        let hid = "harness-x";
+
+        // Nothing retained yet: the caller must degrade, not replay a synthetic id.
+        assert_eq!(select_replay_testcase(&work, hid), None);
+
+        // A persisted coverage-corpus input is a valid (fallback) replay source.
+        let queue = work.join("corpus").join(hid).join("queue");
+        std::fs::create_dir_all(&queue).unwrap();
+        std::fs::write(queue.join("aaaa.bin"), b"corpus-bytes").unwrap();
+        let picked = select_replay_testcase(&work, hid).expect("corpus input selected");
+        assert_eq!(picked.input, b"corpus-bytes");
+        assert_eq!(picked.testcase, "corpus-aaaa");
+        assert_eq!(picked.worker, 0);
+
+        // A crash finding's retained testcase outranks the corpus (most interesting).
+        let crash = corpus::layout::findings_dir(&work).join("BF-0001");
+        std::fs::create_dir_all(&crash).unwrap();
+        std::fs::write(crash.join("testcase.bin"), b"CRASH-INPUT").unwrap();
+        // A collector finding (COL-) is NOT a campaign testcase and is skipped.
+        let col = corpus::layout::findings_dir(&work).join("COL-0001");
+        std::fs::create_dir_all(&col).unwrap();
+        std::fs::write(col.join("testcase.bin"), b"not-a-source").unwrap();
+
+        let picked = select_replay_testcase(&work, hid).expect("crash testcase selected");
+        assert_eq!(
+            picked.input, b"CRASH-INPUT",
+            "crash testcase outranks corpus"
+        );
+        assert_eq!(picked.testcase, "BF-0001");
+
+        let _ = std::fs::remove_dir_all(&work);
     }
 }

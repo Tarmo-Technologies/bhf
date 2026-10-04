@@ -551,6 +551,13 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
         None => collector_run::inactive_run_provenance(&args.collector),
         Some(resolved) => {
             let representative = seeds.first().cloned().unwrap_or_default();
+            // #76: the collector observes a REPLAY of this specific retained input,
+            // not the whole campaign. Label the observation by the input's content
+            // hash so the finding ties to the exact replayed testcase rather than a
+            // fabricated per-case id, and record it as a limited replay observation.
+            let representative_hash = sha256_hex(&representative);
+            let replay_testcase = format!("replay-{}", &representative_hash[..16]);
+            let observation = collector_run::ObservationMode::Replay;
             let outcome = if let Some(shim) = resolved.runtrace_shim() {
                 // Linux built-in provider: a dedicated observation pass runs the
                 // target under the LD_PRELOAD runtrace shim and re-expresses its
@@ -598,9 +605,16 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
                 };
                 gate_tracker.observe(&run.oracle_events, &representative);
                 let gate = gate_tracker.collector_gate();
+                // The runtrace branch genuinely re-executes the representative input
+                // under the shim (`run_binary_once` above), so this IS a single-
+                // testcase replay with the run's real pids. Label it by the input's
+                // content hash rather than a fabricated per-case id.
                 let adapter_ctx = crate::auto::runtrace::CollectorAdapterCtx {
-                    testcase: "binary-fuzz".to_owned(),
+                    testcase: replay_testcase.clone(),
                     worker: 0,
+                    // Synthetic anchor for this single replayed execution's event
+                    // tree; the shim events carry the real child pids, which drive
+                    // attribution. Not a claim about a specific observed OS pid.
                     root_pid: 1,
                 };
                 let jsonl = crate::auto::runtrace::collector_jsonl_from_events(
@@ -612,9 +626,13 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
                 resolved.evaluate_jsonl(&jsonl, &args.work_dir.display().to_string())
             } else {
                 let params = collector_run::CollectorRunParams {
-                    testcase: "binary-fuzz".to_owned(),
+                    testcase: replay_testcase.clone(),
                     worker: 0,
                     root: args.work_dir.display().to_string(),
+                    // The host-spawned replay target's live pid is wired here only
+                    // on the native ETW provider (the live replay scaffold); for the
+                    // sidecar contract the provider reports the observed root in its
+                    // events, so attribution does not depend on this hint.
                     root_pid: 0,
                     root_image: args.binary.display().to_string(),
                     input: &representative,
@@ -626,10 +644,19 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
             for finding in &outcome.findings {
                 let id = collector_run::next_collector_finding_id(&findings_dir)?;
                 let dir = findings_dir.join(&id);
-                collector_run::write_finding(&dir, &id, target.clone(), finding, &representative)?;
+                collector_run::write_finding(
+                    &dir,
+                    &id,
+                    target.clone(),
+                    finding,
+                    &representative,
+                    observation,
+                )?;
                 finding_ids.push(id);
             }
-            outcome.run_provenance
+            let mut provenance = outcome.run_provenance;
+            observation.stamp(&mut provenance);
+            provenance
         }
     };
 

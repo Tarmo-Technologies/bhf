@@ -1236,20 +1236,32 @@ fn run_collector_for_fuzz(
     let findings_dir = corpus::layout::findings_dir(work_dir);
     std::fs::create_dir_all(&findings_dir)
         .with_context(|| format!("create {}", findings_dir.display()))?;
-    let outcome = if resolved.runtrace_shim().is_some() {
+    // #76: observation scope and (for a replay) the real triggering input the
+    // finding is reproducible from — never synthetic `testcase:"fuzz"`/empty input.
+    let (outcome, observation, finding_input): (
+        crate::collector_run::CollectorOutcome,
+        crate::collector_run::ObservationMode,
+        Vec<u8>,
+    ) = if resolved.runtrace_shim().is_some() {
         // Linux built-in provider: re-express the LD_PRELOAD shim events the builtin
         // fuzz loop already captured (`work_dir/runtrace.jsonl`) as collector events.
         // The loop writes that log ONLY when the runtrace shim is armed (for example
         // with `--runtime-oracles`), so `--collector auto` layers a collector-shaped
         // view over the SAME shim events without changing the runtime-oracle
-        // behaviour or re-running the harness.
+        // behaviour or re-running the harness. This log spans the WHOLE campaign, so
+        // the observation is labeled AGGREGATE (not a per-testcase replay) and never
+        // fabricates a per-case testcase/pid (#76).
         let log = work_dir.join("runtrace.jsonl");
         if !log.is_file() {
             // #60 AC6: the shim was NOT armed (e.g. the default `--runtime-oracles
             // off`), so the collector observed nothing this run. Record a degraded,
             // not-observed run rather than evaluating an empty stream and claiming a
             // clean collector assurance over coverage it never had.
-            resolved.not_observed("runtime_shim_not_armed")
+            (
+                resolved.not_observed("runtime_shim_not_armed"),
+                crate::collector_run::ObservationMode::Aggregate,
+                Vec::new(),
+            )
         } else {
             let mut events = crate::auto::runtrace::parse_log(&log).unwrap_or_default();
             crate::auto::runtrace::dedupe_in_place(&mut events);
@@ -1259,8 +1271,10 @@ fn run_collector_for_fuzz(
             // and no sink is single-run taint-confirmed.
             let gate = crate::auto::runtrace::CollectorTaintGate::from_events(&events);
             let adapter_ctx = crate::auto::runtrace::CollectorAdapterCtx {
-                testcase: "fuzz".to_owned(),
+                testcase: "campaign-aggregate".to_owned(),
                 worker: 0,
+                // Synthetic anchor for the aggregate event tree; the shim events
+                // carry the real pids. Not a per-case OS pid claim.
                 root_pid: 1,
             };
             let jsonl = crate::auto::runtrace::collector_jsonl_from_events(
@@ -1269,29 +1283,64 @@ fn run_collector_for_fuzz(
                 harness_id,
                 &gate,
             );
-            resolved.evaluate_jsonl(&jsonl, &work_dir.display().to_string())
+            (
+                resolved.evaluate_jsonl(&jsonl, &work_dir.display().to_string()),
+                crate::collector_run::ObservationMode::Aggregate,
+                // Aggregate: no single triggering input, so the finding is
+                // campaign-level (its `coverage` says so), not reproducible from one.
+                Vec::new(),
+            )
         }
     } else {
-        let params = crate::collector_run::CollectorRunParams {
-            testcase: "fuzz".to_owned(),
-            worker: 0,
-            root: work_dir.display().to_string(),
-            root_pid: 0,
-            root_image: harness_id.to_owned(),
-            input: &[],
-            tmp_dir: work_dir.join("collector_tmp"),
-        };
-        resolved.run_once(&params)?
+        // Sidecar provider: REPLAY an actual retained testcase under the collector
+        // with its real bytes/worker. With no retained testcase there is nothing
+        // honest to replay, so record a degraded, not-observed run instead of
+        // spawning the sidecar on a synthetic identity over an already-exited run.
+        match crate::collector_run::select_replay_testcase(work_dir, harness_id) {
+            None => (
+                resolved.not_observed("no_retained_testcase_to_replay"),
+                crate::collector_run::ObservationMode::Replay,
+                Vec::new(),
+            ),
+            Some(replay) => {
+                let finding_input = replay.input.clone();
+                let params = crate::collector_run::CollectorRunParams {
+                    testcase: replay.testcase,
+                    worker: replay.worker,
+                    root: work_dir.display().to_string(),
+                    // The host-spawned replay target's live pid is wired here only on
+                    // the native ETW provider (the live replay scaffold); the sidecar
+                    // reports the observed root in its events.
+                    root_pid: 0,
+                    root_image: harness_id.to_owned(),
+                    input: &replay.input,
+                    tmp_dir: work_dir.join("collector_tmp"),
+                };
+                (
+                    resolved.run_once(&params)?,
+                    crate::collector_run::ObservationMode::Replay,
+                    finding_input,
+                )
+            }
+        }
     };
     let target = serde_json::json!({ "kind": "harness", "harness": harness_id });
     let mut ids = Vec::new();
     for finding in &outcome.findings {
         let id = crate::collector_run::next_collector_finding_id(&findings_dir)?;
         let dir = findings_dir.join(&id);
-        crate::collector_run::write_finding(&dir, &id, target.clone(), finding, &[])?;
+        crate::collector_run::write_finding(
+            &dir,
+            &id,
+            target.clone(),
+            finding,
+            &finding_input,
+            observation,
+        )?;
         ids.push(id);
     }
     let mut provenance = outcome.run_provenance;
+    observation.stamp(&mut provenance);
     provenance["findings"] = serde_json::json!(ids);
     Ok(provenance)
 }
