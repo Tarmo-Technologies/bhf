@@ -4103,6 +4103,14 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/target_transport/tests/freertos/app.c",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/target_transport/tests/freertos/startup.c",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/target_transport/tests/hil_board.rs",
       "license": "Apache-2.0"
     },
@@ -4112,6 +4120,10 @@
     },
     {
       "path": "crates/target_transport/tests/live_gdb.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/target_transport/tests/live_rtos.rs",
       "license": "Apache-2.0"
     },
     {
