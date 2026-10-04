@@ -46,6 +46,16 @@ pub const DEFAULT_WINDOW_MS: u64 = 250;
 /// run or being mistaken for a clean observation.
 pub const READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Upper bound on how long the replayed target itself may run under the observer
+/// before it is killed (the replay is a single bounded execution, not a campaign).
+pub const REPLAY_TARGET_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Upper bound on how long the host waits for the observer to finish writing its
+/// sink after the replay completes. A provider that readies then wedges is killed
+/// at this bound and recorded not-observed, so it can never hang the fuzz command
+/// despite `--collector-window-ms` (#76 P2).
+pub const CAPTURE_DRAIN: Duration = Duration::from_secs(3);
+
 /// How the collector observed this run, recorded in provenance so a reviewer never
 /// reads a limited observation as whole-campaign coverage (#76).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,11 +295,23 @@ pub struct CollectorRunParams<'a> {
     pub testcase: String,
     pub worker: u32,
     pub root: String,
-    pub root_pid: u32,
     pub root_image: String,
     pub input: &'a [u8],
     pub tmp_dir: PathBuf,
+    /// Launches the retained target to replay, UNDER the already-ready observer,
+    /// and returns the spawned child. The host calls this only AFTER the sidecar
+    /// has acked readiness, so the observer is watching when the target runs, and
+    /// records the child's real PID. `None` means there is no target to launch on
+    /// this host (for example the sidecar path with no wired launch): the run is
+    /// then recorded `not_observed`, never claimed as a replay that did not run
+    /// (#76). The observer is still spawned and supervised so a readiness-but-hang
+    /// provider is bounded rather than hanging the command.
+    pub launch: Option<ReplayLauncher<'a>>,
 }
+
+/// Spawns the retained replay target and returns the running child (input already
+/// delivered). Called by the host after the readiness ack.
+pub type ReplayLauncher<'a> = Box<dyn Fn() -> anyhow::Result<std::process::Child> + 'a>;
 
 /// One collector-sourced semantic finding ready to be written.
 #[derive(Debug, Clone)]
@@ -310,63 +332,110 @@ pub struct CollectorOutcome {
     pub run_provenance: Value,
 }
 
-/// The outcome of spawning the sidecar and waiting through the readiness handshake.
+/// The outcome of spawning the sidecar, launching the target under it, and
+/// draining the capture — all bounded.
 enum ObserveOutcome {
-    /// The sidecar acked readiness, ran, and wrote a sink. Carries the raw JSONL.
-    Observed(String),
-    /// The sidecar could not observe this run (no readiness ack, it exited before
-    /// signaling, failed capture, or wrote no sink). Carries a degrade reason that
-    /// routes to [`ResolvedCollector::not_observed`] — never a clean assurance.
+    /// The observer acked readiness, the target was launched under it and ran, and
+    /// the observer wrote a sink. Carries the raw JSONL and the launched target's
+    /// real PID (so the caller can confirm the evidence is about THAT process).
+    Observed { jsonl: String, replayed_pid: u32 },
+    /// The run could not be observed as a replay (no readiness ack, no target to
+    /// launch, the capture timed out, a failed capture, or no sink). Carries a
+    /// degrade reason routed to [`ResolvedCollector::not_observed`] — never a clean
+    /// assurance, and never a false replay claim.
     NotObserved(String),
 }
 
 /// A retained campaign testcase chosen to replay under the collector: real bytes,
-/// a real testcase id, and the worker that replays it — never a synthetic
-/// `testcase:"fuzz"` / empty input (#76).
+/// a real testcase id, the worker that replays it, and the input's content hash —
+/// never a synthetic `testcase:"fuzz"` / empty input (#76).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplayTestcase {
     pub testcase: String,
     pub worker: u32,
     pub input: Vec<u8>,
+    /// SHA-256 of `input`, recorded in provenance so the replayed input is
+    /// identifiable and the selection is auditable.
+    pub input_sha256: String,
+}
+
+/// SHA-256 of `bytes` as lowercase hex.
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// Does this crash finding belong to `harness_id`'s campaign? A multi-target work
+/// dir shares one `results/findings/` tree, so a replay must only adopt THIS
+/// target's retained evidence — never another target's input/ID (#76 P2). The
+/// association is read from the finding's recorded target identity.
+fn finding_matches_harness(finding_dir: &Path, harness_id: &str) -> bool {
+    let Ok(bytes) = std::fs::read(finding_dir.join("finding.json")) else {
+        return false;
+    };
+    let Ok(doc) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    // The identity a lane records for its target: the binary path (binary-fuzz) or
+    // the harness id (harness lanes). Match any of the known locations exactly.
+    for ptr in [
+        "/target/binary/path",
+        "/target/harness",
+        "/harness_id",
+        "/harness",
+    ] {
+        if doc.pointer(ptr).and_then(Value::as_str) == Some(harness_id) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Select a retained testcase to replay under the collector: a crash finding's
-/// stored `testcase.bin` first (the most interesting retained input), else a
-/// persisted coverage-corpus input. Returns `None` when the campaign retained
-/// nothing to replay — the caller then records a degraded, not-observed run rather
-/// than fabricating a synthetic observation. Deterministic (lowest id / name
-/// first) so a replayed finding is reproducible.
+/// stored `testcase.bin` **from this harness's campaign** first (the most
+/// interesting retained input), else a persisted coverage-corpus input (already
+/// stored per-harness). Returns `None` when this campaign retained nothing to
+/// replay — the caller then records a degraded, not-observed run rather than
+/// fabricating a synthetic observation. Deterministic (lowest id / name first) so
+/// a replayed finding is reproducible, and the selected input's hash is recorded.
 ///
 /// Collector findings (`COL-` ids) are skipped: they are what this pass writes,
-/// and are not themselves campaign testcases.
+/// and are not themselves campaign testcases. Crash findings whose recorded target
+/// does not match `harness_id` are skipped so a sibling target's input is never
+/// adopted.
 pub fn select_replay_testcase(work_dir: &Path, harness_id: &str) -> Option<ReplayTestcase> {
-    // 1) Crash findings: results/findings/<id>/testcase.bin (crash lane ids).
+    // 1) This harness's crash findings: results/findings/<id>/testcase.bin.
     let findings_dir = corpus::layout::findings_dir(work_dir);
     if let Ok(entries) = std::fs::read_dir(&findings_dir) {
-        let mut crash_ids: Vec<(String, PathBuf)> = entries
+        let mut crash_ids: Vec<(String, PathBuf, PathBuf)> = entries
             .flatten()
             .filter_map(|e| {
                 let name = e.file_name().to_str()?.to_owned();
                 if name.starts_with("COL-") {
                     return None; // collector's own findings, not a campaign testcase
                 }
-                let tc = e.path().join("testcase.bin");
-                tc.is_file().then_some((name, tc))
+                let dir = e.path();
+                let tc = dir.join("testcase.bin");
+                // Only this harness's findings — never a sibling target's input.
+                (tc.is_file() && finding_matches_harness(&dir, harness_id))
+                    .then_some((name, dir, tc))
             })
             .collect();
         crash_ids.sort_by(|a, b| a.0.cmp(&b.0));
-        if let Some((id, tc)) = crash_ids.first() {
+        if let Some((id, _dir, tc)) = crash_ids.first() {
             if let Ok(bytes) = std::fs::read(tc) {
+                let input_sha256 = sha256_hex(&bytes);
                 return Some(ReplayTestcase {
                     testcase: id.clone(),
                     worker: 0,
                     input: bytes,
+                    input_sha256,
                 });
             }
         }
     }
 
-    // 2) Persisted coverage corpus: corpus/<harness_id>/queue/<sha>.bin.
+    // 2) Persisted coverage corpus: corpus/<harness_id>/queue/<sha>.bin. This path
+    //    is already scoped to the harness, so it cannot adopt a sibling's input.
     let queue = work_dir.join("corpus").join(harness_id).join("queue");
     if let Ok(entries) = std::fs::read_dir(&queue) {
         let mut inputs: Vec<(String, PathBuf)> = entries
@@ -380,16 +449,44 @@ pub fn select_replay_testcase(work_dir: &Path, harness_id: &str) -> Option<Repla
         inputs.sort_by(|a, b| a.0.cmp(&b.0));
         if let Some((stem, path)) = inputs.first() {
             if let Ok(bytes) = std::fs::read(path) {
+                let input_sha256 = sha256_hex(&bytes);
                 return Some(ReplayTestcase {
                     testcase: format!("corpus-{stem}"),
                     worker: 0,
                     input: bytes,
+                    input_sha256,
                 });
             }
         }
     }
 
     None
+}
+
+/// Wait for `child` to exit, but no later than `deadline`. Returns its exit
+/// status if it exited in time, or `None` after killing and reaping it on
+/// timeout. Guarantees a bounded wait (no unbounded `child.wait()`).
+fn wait_child_until(
+    child: &mut std::process::Child,
+    deadline: Instant,
+) -> Option<std::process::ExitStatus> {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => {}
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 impl ResolvedCollector {
@@ -424,16 +521,15 @@ impl ResolvedCollector {
         self.evaluate(&set, root)
     }
 
-    /// Run the sidecar for one testcase with a readiness handshake and return the
-    /// raw JSONL sink it wrote, or a degrade reason when it could not observe.
+    /// Spawn the sidecar, LAUNCH the retained target under it once it is ready,
+    /// observe through the target's exit plus the post-exit window, and return the
+    /// sink — all bounded. This is the honest replay: a real target process runs,
+    /// under the ready observer, with its real PID handed to the observer; the
+    /// result carries that PID so the caller can confirm the evidence is about it.
     ///
-    /// The host spawns the sidecar non-blocking and confirms it is live and
-    /// watching (the sidecar touches the `BHF_COLLECTOR_READY` path) BEFORE a
-    /// replayed target would run under it — so "the collector was not actually
-    /// watching the run" becomes a detectable, degraded outcome instead of a silent
-    /// clean claim (#76). A missing ack (timeout, or the sidecar exited first) and
-    /// a non-zero exit both route to [`ObserveOutcome::NotObserved`], never an
-    /// error that would abort the run.
+    /// Any failure to genuinely replay-and-observe — no readiness ack, no target to
+    /// launch, the capture timing out, a failed capture, or a sink with no session
+    /// — routes to [`ObserveOutcome::NotObserved`], never a false replay claim.
     fn observe(&self, params: &CollectorRunParams<'_>) -> anyhow::Result<ObserveOutcome> {
         let sidecar = match &self.source {
             CollectorSource::Sidecar(path) => path,
@@ -444,44 +540,54 @@ impl ResolvedCollector {
                 ));
             }
         };
+
+        // No retained target to launch under the observer on this host: do not
+        // spawn an observer that watches nothing, and never claim a replay that did
+        // not run. The caller records a degraded, not-observed run.
+        let Some(launch) = params.launch.as_ref() else {
+            return Ok(ObserveOutcome::NotObserved("no_replay_target".to_owned()));
+        };
+
         std::fs::create_dir_all(&params.tmp_dir)
             .with_context(|| format!("create {}", params.tmp_dir.display()))?;
         let sink = params.tmp_dir.join("collector.jsonl");
         let input_path = params.tmp_dir.join("collector_input.bin");
         let ready_path = params.tmp_dir.join("collector.ready");
+        let pid_path = params.tmp_dir.join("collector.target_pid");
+        let done_path = params.tmp_dir.join("collector.done");
         std::fs::write(&input_path, params.input)
             .with_context(|| format!("write {}", input_path.display()))?;
-        // Truncate any prior sink / readiness marker so a failed provider is never
-        // mistaken for a prior clean run, nor a stale ack taken for this run's ack.
-        let _ = std::fs::remove_file(&sink);
-        let _ = std::fs::remove_file(&ready_path);
+        // Clear prior sink / handshake markers so a stale one is never mistaken for
+        // this run's.
+        for stale in [&sink, &ready_path, &pid_path, &done_path] {
+            let _ = std::fs::remove_file(stale);
+        }
 
         let mut child = Command::new(sidecar)
             .env("BHF_COLLECTOR_TESTCASE", &params.testcase)
             .env("BHF_COLLECTOR_WORKER", params.worker.to_string())
             .env("BHF_COLLECTOR_ROOT", &params.root)
-            .env("BHF_COLLECTOR_ROOT_PID", params.root_pid.to_string())
             .env("BHF_COLLECTOR_ROOT_IMAGE", &params.root_image)
             .env("BHF_COLLECTOR_WINDOW_MS", self.window_ms.to_string())
             .env("BHF_COLLECTOR_INPUT", &input_path)
             .env("BHF_COLLECTOR_LOG", &sink)
             .env("BHF_COLLECTOR_READY", &ready_path)
+            .env("BHF_COLLECTOR_TARGET_PID", &pid_path)
+            .env("BHF_COLLECTOR_DONE", &done_path)
             .spawn()
             .with_context(|| format!("spawn collector sidecar {}", sidecar.display()))?;
 
-        // Wait for the readiness ack, the child exiting first, or the timeout.
-        let deadline = Instant::now() + READINESS_TIMEOUT;
+        // 1. Wait for the readiness ack, the child exiting first, or the timeout.
+        let ready_deadline = Instant::now() + READINESS_TIMEOUT;
         let mut readied = false;
         let mut exited_before_ready = false;
-        loop {
+        while Instant::now() < ready_deadline {
             if ready_path.exists() {
                 readied = true;
                 break;
             }
             match child.try_wait() {
                 Ok(Some(_status)) => {
-                    // Exited before ever signaling readiness: it never established a
-                    // live observation of this run.
                     exited_before_ready = true;
                     break;
                 }
@@ -492,15 +598,10 @@ impl ResolvedCollector {
                     return Err(anyhow!("collector sidecar {}: {error}", sidecar.display()));
                 }
             }
-            if Instant::now() >= deadline {
-                break;
-            }
             std::thread::sleep(Duration::from_millis(20));
         }
-
         if !readied {
             if !exited_before_ready {
-                // Still running but silent past the deadline: bound it.
                 let _ = child.kill();
             }
             let _ = child.wait();
@@ -512,13 +613,41 @@ impl ResolvedCollector {
             return Ok(ObserveOutcome::NotObserved(reason.to_owned()));
         }
 
-        // The sidecar is live and watching. (A host-driven replay of the target
-        // would run here, under it; wiring that spawn to the native ETW provider is
-        // tracked as the live replay scaffold.) Wait for its observation window to
-        // finish and the sink to be written.
-        let status = child
-            .wait()
-            .with_context(|| format!("await collector sidecar {}", sidecar.display()))?;
+        // 2. Launch the retained target UNDER the ready observer, record its PID.
+        let mut target = match (launch)() {
+            Ok(child) => child,
+            Err(error) => {
+                // Killing the sidecar PROCESS never stops an ETW session it owns
+                // (that is the sidecar's own teardown) — we only ever kill it, we
+                // never issue a control STOP on a session we do not own (#77).
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error.context("launch the replay target under the collector"));
+            }
+        };
+        let replayed_pid = target.id();
+
+        // 3. Hand the real PID to the observer so it attributes to our launched
+        //    process (a system-wide tracer may instead observe the PID directly).
+        let _ = std::fs::write(&pid_path, replayed_pid.to_string());
+
+        // 4. Bounded-wait the target to finish, then hold for the post-exit window.
+        let _ = wait_child_until(&mut target, Instant::now() + REPLAY_TARGET_TIMEOUT);
+        let window_end = Instant::now() + Duration::from_millis(self.window_ms);
+        while Instant::now() < window_end {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // 5. Tell the observer the replay completed so it can stop and emit.
+        let _ = std::fs::write(&done_path, b"done");
+
+        // 6. Bounded-wait the observer to finish writing its sink (#76 P2): a
+        //    provider that readies then wedges is killed here, never hangs the run.
+        let Some(status) = wait_child_until(&mut child, Instant::now() + CAPTURE_DRAIN) else {
+            return Ok(ObserveOutcome::NotObserved(
+                "collector_capture_timeout".to_owned(),
+            ));
+        };
         if !status.success() {
             return Ok(ObserveOutcome::NotObserved(format!(
                 "collector_capture_failed_exit_{}",
@@ -528,32 +657,53 @@ impl ResolvedCollector {
                     .unwrap_or_else(|| "signal".to_owned())
             )));
         }
+
+        // 7. Read the sink the observer wrote.
         match std::fs::read_to_string(&sink) {
-            Ok(jsonl) => Ok(ObserveOutcome::Observed(jsonl)),
+            Ok(jsonl) => Ok(ObserveOutcome::Observed {
+                jsonl,
+                replayed_pid,
+            }),
             Err(_) => Ok(ObserveOutcome::NotObserved(
                 "collector_sink_missing".to_owned(),
             )),
         }
     }
 
-    /// Observe a testcase, attribute the events, and evaluate the oracle registry
-    /// over them, returning deduplicated findings plus run provenance.
+    /// Replay a retained testcase under the collector, attribute the events, and
+    /// evaluate the oracle registry over them, returning deduplicated findings plus
+    /// run provenance.
     ///
-    /// A sidecar that could not observe (no readiness ack, failed capture, or a
-    /// sink with no session for the replayed testcase/worker) yields the degraded
-    /// [`Self::not_observed`] contract — never a clean assurance over a run the
-    /// collector was not actually watching (#76 / #60 AC6).
+    /// A run that was not genuinely replayed-and-observed (no readiness ack, no
+    /// target to launch, a timed-out/failed capture, a sink with no session for the
+    /// replayed testcase/worker, or evidence NOT rooted at the launched PID) yields
+    /// the degraded [`Self::not_observed`] contract — never a clean assurance, and
+    /// never a replay claim for a target that did not actually run (#76).
     pub fn run_once(&self, params: &CollectorRunParams<'_>) -> anyhow::Result<CollectorOutcome> {
         match self.observe(params)? {
             ObserveOutcome::NotObserved(reason) => Ok(self.not_observed(reason)),
-            ObserveOutcome::Observed(jsonl) => {
+            ObserveOutcome::Observed {
+                jsonl,
+                replayed_pid,
+            } => {
                 let set = CollectorSessionSet::from_jsonl(&jsonl);
-                // The sidecar readied and ran but produced no session for the
-                // replayed testcase/worker: there is nothing honest to evaluate.
-                if set.session(&params.testcase, params.worker).is_none() {
+                let Some(session) = set.session(&params.testcase, params.worker) else {
+                    // The observer produced no session for the replayed
+                    // testcase/worker: nothing honest to evaluate.
                     return Ok(self.not_observed("testcase_not_observed"));
+                };
+                // Honesty invariant: the evidence must be about the process we
+                // actually launched. If the observer's session is not rooted at the
+                // replayed PID, it did not observe our target — degrade rather than
+                // claim a replay of it.
+                if session.root_pid() != Some(replayed_pid) {
+                    return Ok(self.not_observed("replayed_process_not_observed"));
                 }
-                Ok(self.evaluate(&set, &params.root))
+                let mut outcome = self.evaluate(&set, &params.root);
+                if let Some(obj) = outcome.run_provenance.as_object_mut() {
+                    obj.insert("replayed_pid".to_owned(), json!(replayed_pid));
+                }
+                Ok(outcome)
             }
         }
     }
@@ -1227,6 +1377,19 @@ mod tests {
         dir
     }
 
+    /// Write a crash finding dir with a `testcase.bin` and a `finding.json` whose
+    /// recorded target binary path is `harness`, so selection can scope it.
+    fn write_crash_finding(work: &Path, id: &str, harness: &str, input: &[u8]) {
+        let dir = corpus::layout::findings_dir(work).join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("testcase.bin"), input).unwrap();
+        std::fs::write(
+            dir.join("finding.json"),
+            serde_json::to_vec(&json!({ "target": { "binary": { "path": harness } } })).unwrap(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn select_replay_prefers_crash_finding_then_corpus_then_none() {
         let work = unique_dir("sel");
@@ -1243,11 +1406,10 @@ mod tests {
         assert_eq!(picked.input, b"corpus-bytes");
         assert_eq!(picked.testcase, "corpus-aaaa");
         assert_eq!(picked.worker, 0);
+        assert_eq!(picked.input_sha256, sha256_hex(b"corpus-bytes"));
 
-        // A crash finding's retained testcase outranks the corpus (most interesting).
-        let crash = corpus::layout::findings_dir(&work).join("BF-0001");
-        std::fs::create_dir_all(&crash).unwrap();
-        std::fs::write(crash.join("testcase.bin"), b"CRASH-INPUT").unwrap();
+        // This harness's crash finding outranks the corpus (most interesting).
+        write_crash_finding(&work, "BF-0001", hid, b"CRASH-INPUT");
         // A collector finding (COL-) is NOT a campaign testcase and is skipped.
         let col = corpus::layout::findings_dir(&work).join("COL-0001");
         std::fs::create_dir_all(&col).unwrap();
@@ -1259,6 +1421,40 @@ mod tests {
             "crash testcase outranks corpus"
         );
         assert_eq!(picked.testcase, "BF-0001");
+        assert_eq!(picked.input_sha256, sha256_hex(b"CRASH-INPUT"));
+
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn select_replay_never_adopts_a_sibling_targets_input() {
+        // #76 P2: a multi-target work dir shares one findings tree. Each target must
+        // select ONLY its own retained evidence, never a sibling's input/ID.
+        let work = unique_dir("multi");
+        let harness_a = "/targets/alpha";
+        let harness_b = "/targets/bravo";
+
+        // Alpha crashes first (lexicographically-lowest id) with ITS input; bravo's
+        // crash is a different finding with a different input.
+        write_crash_finding(&work, "BF-0001", harness_a, b"ALPHA-INPUT");
+        write_crash_finding(&work, "BF-0002", harness_b, b"BRAVO-INPUT");
+
+        // Each harness selects only its own crash testcase, despite the shared tree
+        // and alpha's finding sorting first.
+        let a = select_replay_testcase(&work, harness_a).expect("alpha selects its own");
+        assert_eq!(a.testcase, "BF-0001");
+        assert_eq!(a.input, b"ALPHA-INPUT");
+
+        let b = select_replay_testcase(&work, harness_b).expect("bravo selects its own");
+        assert_eq!(
+            b.testcase, "BF-0002",
+            "bravo must not adopt alpha's lower-id finding"
+        );
+        assert_eq!(b.input, b"BRAVO-INPUT");
+
+        // A third harness with no retained evidence anywhere gets nothing (not a
+        // sibling's input).
+        assert_eq!(select_replay_testcase(&work, "/targets/charlie"), None);
 
         let _ = std::fs::remove_dir_all(&work);
     }

@@ -625,18 +625,31 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
                 );
                 resolved.evaluate_jsonl(&jsonl, &args.work_dir.display().to_string())
             } else {
+                // Sidecar provider: a genuine REPLAY. The host launches the target
+                // with the representative input UNDER the ready observer (recording
+                // its real PID), so the observation is of a process that actually
+                // ran — not a synthetic post-exit window. `run_once` bounds the whole
+                // capture and degrades to not_observed if it cannot genuinely
+                // replay-and-observe (#76).
+                let replay_input = representative.clone();
+                let replay_tmp = tmp_dir.clone();
+                let launch: collector_run::ReplayLauncher = Box::new(move || {
+                    spawn_replay_child(
+                        &invocation,
+                        args.input_mode,
+                        &replay_input,
+                        &env,
+                        &replay_tmp,
+                    )
+                });
                 let params = collector_run::CollectorRunParams {
                     testcase: replay_testcase.clone(),
                     worker: 0,
                     root: args.work_dir.display().to_string(),
-                    // The host-spawned replay target's live pid is wired here only
-                    // on the native ETW provider (the live replay scaffold); for the
-                    // sidecar contract the provider reports the observed root in its
-                    // events, so attribution does not depend on this hint.
-                    root_pid: 0,
                     root_image: args.binary.display().to_string(),
                     input: &representative,
                     tmp_dir: tmp_dir.join("collector"),
+                    launch: Some(launch),
                 };
                 resolved.run_once(&params)?
             };
@@ -656,6 +669,14 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
             }
             let mut provenance = outcome.run_provenance;
             observation.stamp(&mut provenance);
+            // Record the replayed input's content hash so the observation is
+            // auditable back to the exact retained input.
+            if let Some(obj) = provenance.as_object_mut() {
+                obj.insert(
+                    "replayed_input_sha256".to_owned(),
+                    json!(representative_hash),
+                );
+            }
             provenance
         }
     };
@@ -1459,6 +1480,53 @@ fn run_binary_once(
         signature,
         oracle_events,
     })
+}
+
+/// Spawn the retained target with `input` for the #76 collector REPLAY: a real
+/// target process the collector observes while it runs. Delivers the input the
+/// same way the campaign does (stdin or a file-mode argv path), inherits `env`,
+/// and returns the running child so the host can record its real PID and bound its
+/// execution. Unlike [`run_binary_once`], it does NOT arm the runtime-oracle shim
+/// (the external collector does the observing) and returns immediately after spawn.
+fn spawn_replay_child(
+    inv: &TargetInvocation,
+    mode: BinaryInputMode,
+    input: &[u8],
+    env: &BTreeMap<String, String>,
+    tmp_dir: &Path,
+) -> anyhow::Result<std::process::Child> {
+    let input_file = match mode {
+        BinaryInputMode::Stdin => None,
+        BinaryInputMode::File => {
+            let path = tmp_dir.join(format!("replay-input-{}.bin", nonce()));
+            fs::write(&path, input).with_context(|| format!("write {}", path.display()))?;
+            Some(path)
+        }
+    };
+    let (program, argv) = inv.command_for(input_file.as_deref());
+    let mut cmd = Command::new(&program);
+    cmd.args(&argv);
+    cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    match mode {
+        BinaryInputMode::Stdin => {
+            cmd.stdin(Stdio::piped());
+        }
+        BinaryInputMode::File => {
+            cmd.stdin(Stdio::null());
+        }
+    }
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("spawn replay target {}", program.display()))?;
+    if mode == BinaryInputMode::Stdin {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(input);
+        }
+    }
+    Ok(child)
 }
 
 /// `timeout`, `signal:<n>:<digest>` or `exit:<code>:<digest>`, where the

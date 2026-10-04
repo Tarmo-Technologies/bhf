@@ -1292,37 +1292,22 @@ fn run_collector_for_fuzz(
             )
         }
     } else {
-        // Sidecar provider: REPLAY an actual retained testcase under the collector
-        // with its real bytes/worker. With no retained testcase there is nothing
-        // honest to replay, so record a degraded, not-observed run instead of
-        // spawning the sidecar on a synthetic identity over an already-exited run.
-        match crate::collector_run::select_replay_testcase(work_dir, harness_id) {
-            None => (
-                resolved.not_observed("no_retained_testcase_to_replay"),
-                crate::collector_run::ObservationMode::Replay,
-                Vec::new(),
-            ),
-            Some(replay) => {
-                let finding_input = replay.input.clone();
-                let params = crate::collector_run::CollectorRunParams {
-                    testcase: replay.testcase,
-                    worker: replay.worker,
-                    root: work_dir.display().to_string(),
-                    // The host-spawned replay target's live pid is wired here only on
-                    // the native ETW provider (the live replay scaffold); the sidecar
-                    // reports the observed root in its events.
-                    root_pid: 0,
-                    root_image: harness_id.to_owned(),
-                    input: &replay.input,
-                    tmp_dir: work_dir.join("collector_tmp"),
-                };
-                (
-                    resolved.run_once(&params)?,
-                    crate::collector_run::ObservationMode::Replay,
-                    finding_input,
-                )
-            }
-        }
+        // Sidecar provider on the generic `fuzz` (harness) path: an honest replay
+        // requires LAUNCHING the retained testcase under the ready observer, but a
+        // language/driver harness cannot be re-launched standalone with an input
+        // here (that launch is wired only on the binary-fuzz lane and the native
+        // ETW provider). Rather than spawn an observer that watches nothing and
+        // call it a replay, record a degraded, not-observed run — distinguishing
+        // "nothing retained" from "retained but not replayable on this host" (#76).
+        let reason = match crate::collector_run::select_replay_testcase(work_dir, harness_id) {
+            Some(_) => "harness_sidecar_replay_unsupported",
+            None => "no_retained_testcase_to_replay",
+        };
+        (
+            resolved.not_observed(reason),
+            crate::collector_run::ObservationMode::Replay,
+            Vec::new(),
+        )
     };
     let target = serde_json::json!({ "kind": "harness", "harness": harness_id });
     let mut ids = Vec::new();
