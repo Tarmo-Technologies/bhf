@@ -20,8 +20,14 @@ static void emit_crumb(uint32_t id){
   ring_write_byte((uint8_t)(id & 0xff)); ring_write_byte((uint8_t)((id>>8)&0xff));
   ring_write_byte((uint8_t)((id>>16)&0xff)); ring_write_byte((uint8_t)((id>>24)&0xff));
 }
-volatile uint8_t  bhf_input[64];
-volatile uint32_t bhf_fault_flag = 0;   /* #72 fault-status word */
+/* The host writes the fuzz input here AFTER loadvm (restore to the pre-startup
+ * baseline) and BEFORE the continue runs Reset_Handler. A plain global would land
+ * in .bss and be zeroed by startup's .bss-clear loop, erasing the injected input
+ * before the producer reads it (#84). The .noinit section (see link.ld) is placed
+ * after .bss and is NOLOAD, so neither the .bss zero loop nor the .data copy
+ * touches it — the delivered input survives the reset-through-startup continue. */
+volatile uint8_t  bhf_input[64] __attribute__((section(".noinit")));
+volatile uint32_t bhf_fault_flag = 0;   /* #72 fault-status word (zero-init per run: no inherited fault) */
 volatile uint32_t bhf_task_id    = 0;   /* #84 current-task identity observation */
 
 /* The host plants a gdb breakpoint at this symbol, so it must NOT be inlined
