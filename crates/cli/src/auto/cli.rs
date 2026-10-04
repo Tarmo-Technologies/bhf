@@ -2880,6 +2880,20 @@ fn emit_campaign_sbom(root: &Path, work: &Path) {
 /// and the cache is rewritten so the NEXT `--reuse-discovery` run hits. The
 /// fingerprint guards correctness — a stale cache is never used silently — and
 /// which path was taken is always logged.
+/// The discovery-cache identity: a cached candidate list is reused only when the
+/// source-tree digest, the preprocess mode, AND the effective opt-in private
+/// in-crate flag all match. The flag is folded in because `discovery` changes the
+/// candidate set according to it (#83): a cache built with the flag OFF must not
+/// be reused once it is ON (it would suppress the new private targets), nor the
+/// reverse. The flag is read once per run and reflected here.
+fn discovery_cache_fingerprint(
+    tree_digest: &str,
+    preprocess: crate::auto::discovery::PreprocessMode,
+    incrate_private: bool,
+) -> String {
+    format!("{tree_digest}-pp:{preprocess}-icp:{incrate_private}")
+}
+
 fn discover_or_reuse(
     path: &Path,
     dir_filter: &DirFilter,
@@ -2913,7 +2927,14 @@ fn discover_or_reuse(
     let _tf = std::time::Instant::now();
     let (tree_digest, current_files) =
         crate::auto::discovery::source_fingerprint_with_files(path, dir_filter);
-    let fingerprint = format!("{tree_digest}-pp:{preprocess}");
+    // Fold the effective opt-in private in-crate flag into the identity too (#83):
+    // `discovery` changes the candidate set according to it, so a cache built with
+    // the flag OFF must not be reused once it is ON (it would suppress the new
+    // private targets), nor the reverse (it would retain candidates fresh flag-off
+    // discovery excludes). The flag is read once here and reflected in the cache
+    // key — a warm cache is only reused when the flag matches.
+    let incrate_private = crate::auto::rust_build::incrate_private_enabled();
+    let fingerprint = discovery_cache_fingerprint(&tree_digest, preprocess, incrate_private);
     crate::auto::discovery::bhfprof("auto:fingerprint", _tf);
     // Persist the source identity SEPARATELY from the ranked-list cache, and do it
     // before discovery runs.
@@ -6334,5 +6355,31 @@ mod tests {
             "{out}"
         );
         assert!(!out.contains("dropped by cap"), "{out}");
+    }
+
+    #[test]
+    fn discovery_cache_fingerprint_folds_the_incrate_private_flag() {
+        // #83: toggling the opt-in private in-crate flag must change the discovery
+        // cache identity, so a warm cache built with the flag OFF is not reused
+        // once it is ON (which would suppress the new private targets) and vice
+        // versa. Same inputs → stable key.
+        use crate::auto::discovery::PreprocessMode;
+        let off = discovery_cache_fingerprint("treedigest", PreprocessMode::Auto, false);
+        let on = discovery_cache_fingerprint("treedigest", PreprocessMode::Auto, true);
+        assert_ne!(off, on, "the flag must be part of the cache identity");
+        assert_eq!(
+            off,
+            discovery_cache_fingerprint("treedigest", PreprocessMode::Auto, false),
+            "the fingerprint is stable for identical inputs"
+        );
+        // The preprocess mode and tree digest still participate.
+        assert_ne!(
+            off,
+            discovery_cache_fingerprint("treedigest", PreprocessMode::Never, false)
+        );
+        assert_ne!(
+            off,
+            discovery_cache_fingerprint("other", PreprocessMode::Auto, false)
+        );
     }
 }

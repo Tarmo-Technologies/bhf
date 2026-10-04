@@ -2375,6 +2375,16 @@ fn run_attempt(
                     harness_dir,
                 });
             }
+            // #83: the opt-in in-crate private lane admitted the target but had no
+            // resolvable resource recipe. A clean skip (like unsupported params),
+            // kept DISTINCT at the build layer so it never reads as a compile error.
+            crate::auto::rust_build::RustBuildResult::UnsupportedSetup { reason } => {
+                return Ok(AttemptResult {
+                    candidate: candidate.clone(),
+                    outcome: Outcome::UnsupportedParams { reason },
+                    harness_dir,
+                });
+            }
         }
     }
 
@@ -4196,6 +4206,34 @@ fn run_fuzz_with_runtrace(
             harness_dir.join("vp.shm").display().to_string(),
         ),
     ];
+
+    // #83 runner-owned resource scratch: the opt-in in-crate path-opener harness
+    // materializes each case's seeded resource under a directory the SUPERVISOR
+    // owns and names (`BHF_RES_SCRATCH_DIR`), rather than an unmanaged OS-temp dir.
+    // The harness `Drop` cleans the common case, but an abort / timeout-kill /
+    // sanitizer abort bypasses it — so the supervisor sweeps the whole scratch tree
+    // here, after the run, including those orphans. The RAII guard runs on every
+    // exit path (normal, error, unwind); the start-of-pass remove handles a prior
+    // SIGKILLed run. Harnesses that need no resource simply leave the dir empty.
+    let res_scratch = harness_dir.join("res-scratch");
+    let _ = std::fs::remove_dir_all(&res_scratch);
+    if let Err(error) = std::fs::create_dir_all(&res_scratch) {
+        return Err(format!(
+            "create runner-owned resource scratch {}: {error}",
+            res_scratch.display()
+        ));
+    }
+    struct ResScratchSweep(std::path::PathBuf);
+    impl Drop for ResScratchSweep {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _res_scratch_guard = ResScratchSweep(res_scratch.clone());
+    child_env.push((
+        "BHF_RES_SCRATCH_DIR".to_owned(),
+        res_scratch.display().to_string(),
+    ));
     // RedQueen/cmplog per-base operand capture (#400): the passthrough/driver
     // harness writes comparison operand pairs to this MAP_SHARED region; the
     // engine arms it only for the corpus entry it is about to mutate, then

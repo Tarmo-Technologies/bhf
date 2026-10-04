@@ -25,7 +25,9 @@ pub use java_rank::{
 pub use perl_rank::{rank_perl_targets, PerlScoreBreakdown, PerlTarget};
 pub use python_rank::{rank_python_targets, PythonScoreBreakdown, PythonTarget};
 pub use rank::rank_targets;
-pub use rust_rank::{rank_rust_targets, RustScoreBreakdown, RustTarget};
+pub use rust_rank::{
+    rank_rust_targets, rank_rust_targets_with_opts, RustScoreBreakdown, RustTarget,
+};
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Target {
