@@ -551,6 +551,13 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
         None => collector_run::inactive_run_provenance(&args.collector),
         Some(resolved) => {
             let representative = seeds.first().cloned().unwrap_or_default();
+            // #76: the collector observes a REPLAY of this specific retained input,
+            // not the whole campaign. Label the observation by the input's content
+            // hash so the finding ties to the exact replayed testcase rather than a
+            // fabricated per-case id, and record it as a limited replay observation.
+            let representative_hash = sha256_hex(&representative);
+            let replay_testcase = format!("replay-{}", &representative_hash[..16]);
+            let observation = collector_run::ObservationMode::Replay;
             let outcome = if let Some(shim) = resolved.runtrace_shim() {
                 // Linux built-in provider: a dedicated observation pass runs the
                 // target under the LD_PRELOAD runtrace shim and re-expresses its
@@ -598,9 +605,16 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
                 };
                 gate_tracker.observe(&run.oracle_events, &representative);
                 let gate = gate_tracker.collector_gate();
+                // The runtrace branch genuinely re-executes the representative input
+                // under the shim (`run_binary_once` above), so this IS a single-
+                // testcase replay with the run's real pids. Label it by the input's
+                // content hash rather than a fabricated per-case id.
                 let adapter_ctx = crate::auto::runtrace::CollectorAdapterCtx {
-                    testcase: "binary-fuzz".to_owned(),
+                    testcase: replay_testcase.clone(),
                     worker: 0,
+                    // Synthetic anchor for this single replayed execution's event
+                    // tree; the shim events carry the real child pids, which drive
+                    // attribution. Not a claim about a specific observed OS pid.
                     root_pid: 1,
                 };
                 let jsonl = crate::auto::runtrace::collector_jsonl_from_events(
@@ -611,14 +625,31 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
                 );
                 resolved.evaluate_jsonl(&jsonl, &args.work_dir.display().to_string())
             } else {
+                // Sidecar provider: a genuine REPLAY. The host launches the target
+                // with the representative input UNDER the ready observer (recording
+                // its real PID), so the observation is of a process that actually
+                // ran — not a synthetic post-exit window. `run_once` bounds the whole
+                // capture and degrades to not_observed if it cannot genuinely
+                // replay-and-observe (#76).
+                let replay_input = representative.clone();
+                let replay_tmp = tmp_dir.clone();
+                let launch: collector_run::ReplayLauncher = Box::new(move || {
+                    spawn_replay_child(
+                        &invocation,
+                        args.input_mode,
+                        &replay_input,
+                        &env,
+                        &replay_tmp,
+                    )
+                });
                 let params = collector_run::CollectorRunParams {
-                    testcase: "binary-fuzz".to_owned(),
+                    testcase: replay_testcase.clone(),
                     worker: 0,
                     root: args.work_dir.display().to_string(),
-                    root_pid: 0,
                     root_image: args.binary.display().to_string(),
                     input: &representative,
                     tmp_dir: tmp_dir.join("collector"),
+                    launch: Some(launch),
                 };
                 resolved.run_once(&params)?
             };
@@ -626,10 +657,27 @@ fn run_inner(args: BinaryFuzzArgs) -> anyhow::Result<Value> {
             for finding in &outcome.findings {
                 let id = collector_run::next_collector_finding_id(&findings_dir)?;
                 let dir = findings_dir.join(&id);
-                collector_run::write_finding(&dir, &id, target.clone(), finding, &representative)?;
+                collector_run::write_finding(
+                    &dir,
+                    &id,
+                    target.clone(),
+                    finding,
+                    &representative,
+                    observation,
+                )?;
                 finding_ids.push(id);
             }
-            outcome.run_provenance
+            let mut provenance = outcome.run_provenance;
+            observation.stamp(&mut provenance);
+            // Record the replayed input's content hash so the observation is
+            // auditable back to the exact retained input.
+            if let Some(obj) = provenance.as_object_mut() {
+                obj.insert(
+                    "replayed_input_sha256".to_owned(),
+                    json!(representative_hash),
+                );
+            }
+            provenance
         }
     };
 
@@ -1432,6 +1480,64 @@ fn run_binary_once(
         signature,
         oracle_events,
     })
+}
+
+/// Spawn the retained target with `input` for the #76 collector REPLAY: a real
+/// target process the collector observes while it runs. Delivers the input the
+/// same way the campaign does (stdin or a file-mode argv path), inherits `env`,
+/// and returns the running child so the host can record its real PID and bound its
+/// execution. Unlike [`run_binary_once`], it does NOT arm the runtime-oracle shim
+/// (the external collector does the observing) and returns immediately after spawn.
+fn spawn_replay_child(
+    inv: &TargetInvocation,
+    mode: BinaryInputMode,
+    input: &[u8],
+    env: &BTreeMap<String, String>,
+    tmp_dir: &Path,
+) -> anyhow::Result<collector_run::LaunchedReplay> {
+    let input_file = match mode {
+        BinaryInputMode::Stdin => None,
+        BinaryInputMode::File => {
+            let path = tmp_dir.join(format!("replay-input-{}.bin", nonce()));
+            fs::write(&path, input).with_context(|| format!("write {}", path.display()))?;
+            Some(path)
+        }
+    };
+    let (program, argv) = inv.command_for(input_file.as_deref());
+    let mut cmd = Command::new(&program);
+    cmd.args(&argv);
+    cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    match mode {
+        BinaryInputMode::Stdin => {
+            cmd.stdin(Stdio::piped());
+        }
+        BinaryInputMode::File => {
+            cmd.stdin(Stdio::null());
+        }
+    }
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("spawn replay target {}", program.display()))?;
+    // Deliver stdin on a BACKGROUND thread so this returns immediately. A target
+    // that never drains stdin (with an input larger than the pipe buffer) would
+    // otherwise block `write_all` here forever, stalling the launch callback before
+    // the supervisor's bounded wait could start — bypassing the replay deadline
+    // (#76 re-review). The supervisor reaps this thread after the target exits or
+    // is killed (the closed pipe unblocks the write); its error is surfaced rather
+    // than discarded, though a BrokenPipe from a target that finished early is
+    // benign. `stdin` is moved into the thread and dropped there, closing the pipe.
+    let delivery = if mode == BinaryInputMode::Stdin {
+        child.stdin.take().map(|mut stdin| {
+            let input = input.to_vec();
+            std::thread::spawn(move || stdin.write_all(&input))
+        })
+    } else {
+        None
+    };
+    Ok(collector_run::LaunchedReplay { child, delivery })
 }
 
 /// `timeout`, `signal:<n>:<digest>` or `exit:<code>:<digest>`, where the
@@ -2450,6 +2556,49 @@ mod tests {
         assert_eq!(replay_binary_finding(&fdir, &script), 0);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_replay_child_does_not_block_on_a_target_that_never_reads_stdin() {
+        use std::os::unix::fs::PermissionsExt;
+        // #76 re-review: a target that keeps stdin open WITHOUT reading it, plus an
+        // input larger than the pipe buffer, must not block the launch. stdin is
+        // delivered on a background thread, so spawn_replay_child returns promptly
+        // and the supervisor's bounded wait runs. The old inline write_all would
+        // block here until the target exited, bypassing the replay deadline — so
+        // under the old code this call would hang for the target's full lifetime.
+        let dir = std::env::temp_dir().join(format!("bhf-replay-noread-{}", nonce()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("sleeper.sh");
+        std::fs::write(&target, "#!/bin/sh\nsleep 30\n").unwrap();
+        let mut perms = std::fs::metadata(&target).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&target, perms).unwrap();
+
+        let inv = TargetInvocation {
+            binary: target,
+            runner: None,
+            runner_args: Vec::new(),
+            target_args: Vec::new(),
+        };
+        let big = vec![0_u8; 256 * 1024]; // >> the ~64 KiB pipe buffer
+        let env = std::collections::BTreeMap::new();
+        let started = std::time::Instant::now();
+        let launched = spawn_replay_child(&inv, BinaryInputMode::Stdin, &big, &env, &dir).unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "launch must return without blocking on an undrained stdin write"
+        );
+        // Reap BOTH: killing the target closes the pipe, which unblocks and ends
+        // the background delivery thread.
+        let mut child = launched.child;
+        let _ = child.kill();
+        let _ = child.wait();
+        if let Some(handle) = launched.delivery {
+            let _ = handle.join();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

@@ -6,30 +6,43 @@
 //! on Linux CI. All `unsafe` FFI is confined here; [`crate::win_core`] and
 //! [`crate::win_etw_decode`] stay safe and pure.
 //!
-//! This consumer starts the NT Kernel Logger real-time session with the process,
-//! file-I/O and image-load flags, opens it with a real-time `EVENT_RECORD`
-//! callback, and runs `ProcessTrace` on a worker thread for the bounded
-//! observation window. Every delivered `EVENT_RECORD` is routed through the pure
+//! This consumer starts a **BHF-owned, uniquely-named system-logger** real-time
+//! session (NOT the single global NT Kernel Logger) with the process, file-I/O
+//! and image-load flags, opens it with a real-time `EVENT_RECORD` callback, and
+//! runs `ProcessTrace` on a worker thread for the bounded observation window.
+//! Every delivered `EVENT_RECORD` is routed through the pure
 //! [`crate::win_etw_decode::EtwDecoder`] — the complete, Linux-unit-tested decode
 //! of the process / file-I/O / image-load MOF payloads — and the decoded
 //! [`crate::win_core::WinRawRecord`] is fed into the attribution core.
 //!
-//! Starting a kernel ETW session requires rights the target context may not
-//! have; when `StartTraceW` returns `ERROR_ACCESS_DENIED` the provider records
-//! [`runtime_collector::schema::Fidelity::permission_denied`] rather than
-//! emitting a silent "clean" stream (AC #6). The end-to-end live run (that the
-//! three positive fixtures actually produce their findings) is validated on the
-//! Windows runner via the gated `live_windows` test; the decode logic itself is
-//! exercised on every platform by the `win_etw_decode` unit tests.
+//! Session ownership (#77): the collector runs its own private system-logger
+//! session so it can only ever stop a session it created. It never touches the
+//! global NT Kernel Logger and never issues a STOP against a session it did not
+//! start — a name collision is resolved by trying a fresh unique name (bounded),
+//! never by stopping the (possibly unrelated) session that holds the name. The
+//! whole ownership policy is the pure, Linux-tested [`crate::win_core`]
+//! `decide_session_start` / `stop_plan_for_owned`; this module only maps Win32
+//! status codes onto it and performs the resulting FFI calls.
+//!
+//! Starting a system-logger ETW session requires rights the target context may
+//! not have; when `StartTraceW` returns `ERROR_ACCESS_DENIED` the provider
+//! records [`runtime_collector::schema::Fidelity::permission_denied`] rather than
+//! emitting a silent "clean" stream (AC #6). A collision-exhausted or other
+//! acquisition failure is likewise recorded as a degraded observation, never a
+//! clean one and never an aborted run. The end-to-end live run (that the three
+//! positive fixtures actually produce their findings) is validated on the Windows
+//! runner via the gated `live_windows` test; the decode logic itself is exercised
+//! on every platform by the `win_etw_decode` unit tests.
 
 use runtime_collector::schema::CollectorEvent;
 use runtime_collector::CollectorContext;
 use std::ffi::c_void;
 use std::io::Write;
 use std::ptr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use crate::win_core::WinCoreBuilder;
+use crate::win_core::{self, SessionStartDecision, SessionStopTarget, WinCoreBuilder};
 use crate::win_etw_decode::{EtwDecoder, EtwGuid, EtwProvider, PointerSize, RawEtwEvent};
 
 use windows_sys::core::GUID;
@@ -39,10 +52,15 @@ use windows_sys::Win32::System::Diagnostics::Etw::{
     EVENT_HEADER_FLAG_32_BIT_HEADER, EVENT_RECORD, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_FLAG,
     EVENT_TRACE_FLAG_FILE_IO, EVENT_TRACE_FLAG_FILE_IO_INIT, EVENT_TRACE_FLAG_IMAGE_LOAD,
     EVENT_TRACE_FLAG_PROCESS, EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES,
-    EVENT_TRACE_REAL_TIME_MODE, KERNEL_LOGGER_NAMEW, PROCESSTRACE_HANDLE,
-    PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME, SystemTraceControlGuid,
-    WNODE_FLAG_TRACED_GUID,
+    EVENT_TRACE_REAL_TIME_MODE, EVENT_TRACE_SYSTEM_LOGGER_MODE, PROCESSTRACE_HANDLE,
+    PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME, WNODE_FLAG_TRACED_GUID,
 };
+
+/// Process-global base for BHF-owned session instance ids, so two observations in
+/// the same process (and each retry within one) always get a distinct session
+/// name and GUID. Bumped by [`MAX_SESSION_NAME_ATTEMPTS`](win_core::MAX_SESSION_NAME_ATTEMPTS)
+/// per acquisition to leave room for that acquisition's retries.
+static SESSION_INSTANCE: AtomicU64 = AtomicU64::new(0);
 
 /// Shared state the real-time callback mutates. Only the `ProcessTrace` worker
 /// thread touches it between session start and join; the controlling thread
@@ -100,72 +118,133 @@ fn fuzz_input_from_env() -> Vec<u8> {
     }
 }
 
-/// Outcome of trying to start the kernel session.
+/// Outcome of trying to acquire a BHF-owned ETW session.
 enum StartOutcome {
-    Started(CONTROLTRACE_HANDLE),
+    /// The session started and is owned by this process. `control` is the handle
+    /// `StartTraceW` returned (teardown's only stop target); `name` is the owned
+    /// session name, needed to open the real-time consumer.
+    Started {
+        control: CONTROLTRACE_HANDLE,
+        name: Vec<u16>,
+    },
+    /// Starting a session was denied — recorded as a permission-denied fidelity
+    /// limitation, never a clean run.
     PermissionDenied,
-    Other(u32),
+    /// A collision-exhausted or other acquisition failure — recorded as the given
+    /// `fidelity.unsupported_fields` diagnostic, never a clean run. Nothing is
+    /// stopped (BHF owns no session here).
+    Unsupported(String),
 }
 
-/// A zero-initialized `EVENT_TRACE_PROPERTIES` blob with room for the logger name
-/// appended after the header (the layout `StartTraceW`/`ControlTraceW` expect).
-fn properties_blob() -> Vec<u8> {
-    // The NT Kernel Logger name plus NUL, as UTF-16.
-    let name_units = kernel_logger_name().len();
+/// A zero-initialized `EVENT_TRACE_PROPERTIES` blob with room for `name_slots`
+/// trailing UTF-16 session names after the header. `StartTraceW` needs one slot
+/// for the session name it copies in; a `ControlTraceW` STOP that reads the
+/// session properties back needs room for both the logger name and the log-file
+/// name, hence two slots.
+fn properties_blob(name_units: usize, name_slots: usize) -> Vec<u8> {
     let props_size = std::mem::size_of::<EVENT_TRACE_PROPERTIES>();
-    let total = props_size + name_units * std::mem::size_of::<u16>();
+    let total = props_size + name_slots * name_units * std::mem::size_of::<u16>();
     vec![0u8; total]
 }
 
-/// `"NT Kernel Logger\0"` as UTF-16 code units.
-fn kernel_logger_name() -> Vec<u16> {
-    // KERNEL_LOGGER_NAMEW is a NUL-terminated wide literal; copy it out so we own
-    // a mutable buffer for OpenTraceW's LoggerName.
-    let mut out = Vec::new();
-    let mut p = KERNEL_LOGGER_NAMEW;
-    // SAFETY: KERNEL_LOGGER_NAMEW points at a static NUL-terminated wide string.
-    unsafe {
-        while *p != 0 {
-            out.push(*p);
-            p = p.add(1);
-        }
-    }
+/// A session name as an owned, NUL-terminated UTF-16 buffer for the ETW APIs.
+fn session_name_utf16(name: &str) -> Vec<u16> {
+    let mut out: Vec<u16> = name.encode_utf16().collect();
     out.push(0);
     out
 }
 
-/// Start the NT Kernel Logger real-time session with the collector's flags.
-/// Retries once after stopping a pre-existing instance.
-fn start_kernel_session() -> StartOutcome {
-    match try_start_kernel_session() {
-        Ok(handle) => StartOutcome::Started(handle),
-        Err(ERROR_ALREADY_EXISTS) => {
-            stop_kernel_session();
-            match try_start_kernel_session() {
-                Ok(handle) => StartOutcome::Started(handle),
-                Err(ERROR_ACCESS_DENIED) => StartOutcome::PermissionDenied,
-                Err(code) => StartOutcome::Other(code),
+/// A BHF-private session GUID derived from `(pid, instance)`, unique per live
+/// session so concurrent BHF workers never share one. It is deliberately NOT
+/// `SystemTraceControlGuid`: per Microsoft's "Configuring and Starting a
+/// SystemTraceProvider Session", a system logger other than the NT Kernel Logger
+/// must be given its own GUID and must not reuse `SystemTraceControlGuid`.
+/// https://learn.microsoft.com/en-us/windows/win32/etw/configuring-and-starting-a-systemtraceprovider-session
+fn private_session_guid(pid: u32, instance: u64) -> GUID {
+    // A fixed BHF namespace in the high 64 bits; the pid and instance in the low
+    // 64 bits make each live session's GUID distinct.
+    const BHF_NAMESPACE_HI: u64 = 0xB8F0_C011_7E70_0001;
+    let lo = ((pid as u64) << 32) | (instance & 0xFFFF_FFFF);
+    GUID::from_u128(((BHF_NAMESPACE_HI as u128) << 64) | lo as u128)
+}
+
+/// Acquire a BHF-owned real-time system-logger session with the collector's
+/// kernel flags. On a name collision this tries a fresh unique name (bounded by
+/// [`win_core::MAX_SESSION_NAME_ATTEMPTS`]) rather than stopping the colliding
+/// session, and degrades (never aborts, never claims clean) when it cannot
+/// acquire one. The retry/degrade policy is the pure [`win_core::decide_session_start`].
+fn start_owned_session() -> StartOutcome {
+    let pid = std::process::id();
+    // Reserve this acquisition's slice of the instance space up front so its
+    // retries — and any concurrent acquisition — never collide on a name/GUID.
+    let base = SESSION_INSTANCE.fetch_add(
+        win_core::MAX_SESSION_NAME_ATTEMPTS as u64,
+        Ordering::Relaxed,
+    );
+
+    for attempt in 0..win_core::MAX_SESSION_NAME_ATTEMPTS {
+        let instance = base + attempt as u64;
+        let name = session_name_utf16(&win_core::owned_session_name(pid, instance));
+        let guid = private_session_guid(pid, instance);
+        let result = try_start_owned_session(&name, guid);
+        let status = classify_start(&result);
+        match win_core::decide_session_start(status, attempt) {
+            SessionStartDecision::Proceed => {
+                let control = result.expect("Proceed is returned only for a started session");
+                return StartOutcome::Started { control, name };
             }
+            SessionStartDecision::RetryWithNewName => continue,
+            SessionStartDecision::Degrade(reason) => return degrade_outcome(&reason),
         }
-        Err(ERROR_ACCESS_DENIED) => StartOutcome::PermissionDenied,
-        Err(code) => StartOutcome::Other(code),
+    }
+
+    // All attempts collided (every decision was RetryWithNewName): degrade.
+    StartOutcome::Unsupported(win_core::SessionDegradeReason::NameCollisionExhausted.diagnostic())
+}
+
+/// Map a raw `StartTraceW` result to the platform-neutral status the pure policy
+/// consumes, without consuming `result` (the handle is needed on success).
+fn classify_start(result: &Result<CONTROLTRACE_HANDLE, u32>) -> win_core::SessionStartStatus {
+    match result {
+        Ok(_) => win_core::SessionStartStatus::Started,
+        Err(code) if *code == ERROR_ALREADY_EXISTS => win_core::SessionStartStatus::AlreadyExists,
+        Err(code) if *code == ERROR_ACCESS_DENIED => win_core::SessionStartStatus::AccessDenied,
+        Err(code) => win_core::SessionStartStatus::Other(*code),
     }
 }
 
-fn try_start_kernel_session() -> Result<CONTROLTRACE_HANDLE, u32> {
-    let mut blob = properties_blob();
+/// Turn a degrade reason into the corresponding [`StartOutcome`]; a failed start
+/// owns no session, so nothing is ever stopped here.
+fn degrade_outcome(reason: &win_core::SessionDegradeReason) -> StartOutcome {
+    match reason {
+        win_core::SessionDegradeReason::PermissionDenied => StartOutcome::PermissionDenied,
+        other => StartOutcome::Unsupported(other.diagnostic()),
+    }
+}
+
+/// Start one BHF-owned system-logger session named `name` with GUID `guid`.
+fn try_start_owned_session(name: &[u16], guid: GUID) -> Result<CONTROLTRACE_HANDLE, u32> {
+    let mut blob = properties_blob(name.len(), 1);
     let props_size = std::mem::size_of::<EVENT_TRACE_PROPERTIES>();
-    let name = kernel_logger_name();
 
     // SAFETY: `blob` is at least `size_of::<EVENT_TRACE_PROPERTIES>()` bytes and
-    // zero-initialized; every field write stays within the allocation.
+    // zero-initialized, with one trailing name slot `StartTraceW` copies the
+    // session name into; every field write stays within the allocation.
     let (status, handle) = unsafe {
         let props = blob.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
         (*props).Wnode.BufferSize = blob.len() as u32;
         (*props).Wnode.Flags = WNODE_FLAG_TRACED_GUID;
-        (*props).Wnode.Guid = SystemTraceControlGuid;
+        // A BHF-private session GUID — NOT SystemTraceControlGuid, which is
+        // reserved for the global NT Kernel Logger (see MS "Configuring and
+        // Starting a SystemTraceProvider Session").
+        (*props).Wnode.Guid = guid;
         (*props).Wnode.ClientContext = 1; // QPC clock
-        (*props).LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
+
+        // EVENT_TRACE_SYSTEM_LOGGER_MODE makes this a per-session system logger
+        // that honors the kernel EnableFlags below without touching the single
+        // global NT Kernel Logger; REAL_TIME_MODE delivers events live. Same MS
+        // doc: a system logger needs SYSTEM_LOGGER_MODE plus EnableFlags.
+        (*props).LogFileMode = EVENT_TRACE_REAL_TIME_MODE | EVENT_TRACE_SYSTEM_LOGGER_MODE;
         (*props).FlushTimer = 1;
         (*props).EnableFlags = kernel_enable_flags();
         (*props).LoggerNameOffset = props_size as u32;
@@ -181,20 +260,30 @@ fn try_start_kernel_session() -> Result<CONTROLTRACE_HANDLE, u32> {
     }
 }
 
-/// Stop the NT Kernel Logger session by name (best effort).
-fn stop_kernel_session() {
-    let mut blob = properties_blob();
+/// Stop a session this process OWNS, identified by the control handle
+/// `StartTraceW` returned. This is teardown's only stop path: the owned handle
+/// comes from a successful start, so BHF can never stop a session it did not
+/// create (#77). The authorized target is computed by the pure
+/// [`win_core::stop_plan_for_owned`], whose [`SessionStopTarget`] has no by-name
+/// variant — stopping an unowned session is unrepresentable.
+fn stop_owned_session(control: CONTROLTRACE_HANDLE, name_units: usize) {
+    let SessionStopTarget::OwnedHandle(handle_value) = win_core::stop_plan_for_owned(control.Value);
+    let mut blob = properties_blob(name_units.max(1), 2);
     let props_size = std::mem::size_of::<EVENT_TRACE_PROPERTIES>();
-    let name = kernel_logger_name();
-    // SAFETY: zero-initialized blob large enough for the header; a STOP by name
-    // needs only BufferSize + LoggerNameOffset set.
+    // SAFETY: zero-initialized blob large enough for the header plus two trailing
+    // name slots that ControlTraceW writes the session/log-file names back into.
     unsafe {
         let props = blob.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
         (*props).Wnode.BufferSize = blob.len() as u32;
-        (*props).Wnode.Guid = SystemTraceControlGuid;
         (*props).LoggerNameOffset = props_size as u32;
-        let handle = CONTROLTRACE_HANDLE::default();
-        let _ = ControlTraceW(handle, name.as_ptr(), props, EVENT_TRACE_CONTROL_STOP);
+        (*props).LogFileNameOffset =
+            (props_size + name_units.max(1) * std::mem::size_of::<u16>()) as u32;
+        let handle = CONTROLTRACE_HANDLE {
+            Value: handle_value,
+        };
+        // Stop BY HANDLE: the InstanceName is null so the session is identified
+        // solely by the owned handle, never by a (possibly unowned) name.
+        let _ = ControlTraceW(handle, ptr::null(), props, EVENT_TRACE_CONTROL_STOP);
     }
 }
 
@@ -203,17 +292,24 @@ fn is_invalid_trace_handle(handle: &PROCESSTRACE_HANDLE) -> bool {
     handle.Value == u64::MAX || handle.Value == 0x0000_0000_FFFF_FFFF
 }
 
-/// Open the real-time session and consume events into `state` for `window_ms`.
-/// `control` is the session handle used to stop it, which makes `ProcessTrace`
-/// return. On an open failure the loss is recorded in fidelity, never hidden.
-fn run_consumer(state_ptr: *mut ConsumerState, control: CONTROLTRACE_HANDLE, window_ms: u64) {
-    let mut name = kernel_logger_name();
+/// Open the BHF-owned real-time session `name` and consume events into `state`
+/// for `window_ms`. `control` is the owned session handle used to stop it, which
+/// makes `ProcessTrace` return. On an open failure the loss is recorded in
+/// fidelity, never hidden — and the owned session is still stopped by its handle.
+fn run_consumer(
+    state_ptr: *mut ConsumerState,
+    control: CONTROLTRACE_HANDLE,
+    name: &[u16],
+    window_ms: u64,
+) {
+    // OpenTraceW wants a writable LoggerName buffer; copy the owned session name.
+    let mut logger_name = name.to_vec();
 
     // SAFETY: a zeroed EVENT_TRACE_LOGFILEW is a valid "no file" real-time
     // consumer once LoggerName/mode/callback/context are set.
     let process_handle = unsafe {
         let mut logfile: EVENT_TRACE_LOGFILEW = std::mem::zeroed();
-        logfile.LoggerName = name.as_mut_ptr();
+        logfile.LoggerName = logger_name.as_mut_ptr();
         logfile.Anonymous1.ProcessTraceMode =
             PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
         logfile.Anonymous2.EventRecordCallback = Some(event_record_callback);
@@ -229,9 +325,17 @@ fn run_consumer(state_ptr: *mut ConsumerState, control: CONTROLTRACE_HANDLE, win
                 .builder
                 .mark_unsupported("etw.open_trace_failed");
         }
-        stop_kernel_session();
+        // We started (and therefore own) this session, so stop it by its handle
+        // even though the consumer could not open it — never by (unowned) name.
+        stop_owned_session(control, name.len());
         return;
     }
+
+    // #76 readiness ack: the session is live and the real-time consumer is open, so
+    // tell the host (which is waiting on `BHF_COLLECTOR_READY`) we are watching
+    // before it would run a replayed target. Best-effort; a missing marker only
+    // means the host bounds us by timeout and records a degraded, not-observed run.
+    signal_ready();
 
     // ProcessTrace blocks until the session stops; run it on a worker thread so
     // the controlling thread can bound the observation window.
@@ -249,9 +353,9 @@ fn run_consumer(state_ptr: *mut ConsumerState, control: CONTROLTRACE_HANDLE, win
 
     std::thread::sleep(Duration::from_millis(window_ms));
 
-    // Stopping the session unblocks ProcessTrace on the worker thread.
-    let _ = control;
-    stop_kernel_session();
+    // Stopping the OWNED session unblocks ProcessTrace on the worker thread. The
+    // stop is issued strictly via the handle StartTraceW returned, not the name.
+    stop_owned_session(control, name.len());
     let _ = worker.join();
 
     // SAFETY: the worker thread has joined, so the callback can no longer run and
@@ -259,8 +363,21 @@ fn run_consumer(state_ptr: *mut ConsumerState, control: CONTROLTRACE_HANDLE, win
     unsafe {
         CloseTrace(process_handle);
     }
-    // keep `name` alive until the consumer is fully torn down.
-    drop(name);
+    // keep `logger_name` alive until the consumer is fully torn down.
+    drop(logger_name);
+}
+
+/// Signal the #76 readiness ack to the host: once the session is live and the
+/// real-time consumer is open, touch the `BHF_COLLECTOR_READY` path the host is
+/// waiting on so it can confirm the collector is watching before a replayed target
+/// runs. Best-effort — a missing/undeliverable marker never fails the run (the
+/// host bounds it by timeout and records a degraded, not-observed run instead).
+fn signal_ready() {
+    if let Some(path) = std::env::var_os("BHF_COLLECTOR_READY") {
+        if !path.is_empty() {
+            let _ = std::fs::write(&path, b"ready");
+        }
+    }
 }
 
 /// Real-time `EVENT_RECORD` callback. Routes the event through the pure decoder
@@ -334,10 +451,12 @@ fn guid_to_etw(guid: &GUID) -> EtwGuid {
 
 /// Observe a testcase and return the `bhf.collector-event.v1` JSONL stream.
 ///
-/// Starts the kernel logger, consumes process / file-I/O / image-load events for
-/// the bounded window, decodes each `EVENT_RECORD` with the complete pure decoder
-/// and attributes it to the testcase's descendant tree. A missing-rights start
-/// records `fidelity.permission_denied` instead of fabricating a clean run.
+/// Starts a BHF-owned system-logger session, consumes process / file-I/O /
+/// image-load events for the bounded window, decodes each `EVENT_RECORD` with the
+/// complete pure decoder and attributes it to the testcase's descendant tree. A
+/// missing-rights or otherwise failed start records a degraded fidelity
+/// limitation (`permission_denied` / an unsupported-field diagnostic) instead of
+/// fabricating a clean run, and never stops a session BHF did not create.
 pub fn collect(
     ctx: &CollectorContext,
     root_pid: u32,
@@ -351,20 +470,18 @@ pub fn collect(
         max_ts: 0.0,
     });
 
-    match start_kernel_session() {
-        StartOutcome::Started(control) => {
+    match start_owned_session() {
+        StartOutcome::Started { control, name } => {
             let state_ptr: *mut ConsumerState = &mut *state;
-            run_consumer(state_ptr, control, ctx.window_ms);
+            run_consumer(state_ptr, control, &name, ctx.window_ms);
         }
         StartOutcome::PermissionDenied => {
             state
                 .builder
                 .mark_permission_denied("StartTraceW returned ERROR_ACCESS_DENIED");
         }
-        StartOutcome::Other(status) => {
-            state
-                .builder
-                .mark_unsupported(format!("etw.session_start_status={status}"));
+        StartOutcome::Unsupported(reason) => {
+            state.builder.mark_unsupported(reason);
         }
     }
 
