@@ -40,6 +40,12 @@ const MAX_PACKET_BYTES: usize = 2 * 1024 * 1024;
 const MAX_MEMORY_READ: usize = 1024 * 1024;
 /// Retransmit attempts on a `-` (NAK) before giving up.
 const MAX_RETRANSMITS: usize = 3;
+/// Max intermediate `O` console-output packets accepted between a `c` and the
+/// terminal stop reply before giving up, so a chatty or wedged target cannot
+/// stream forever (an absolute execution deadline is enforced by the campaign).
+const MAX_CONSOLE_PACKETS: usize = 100_000;
+/// Max total decoded console-output bytes retained while awaiting a stop reply.
+const MAX_CONSOLE_BYTES: usize = 1024 * 1024;
 
 /// The RSP checksum: the low byte of the sum of the packet data bytes.
 pub fn rsp_checksum(data: &[u8]) -> u8 {
@@ -441,10 +447,40 @@ impl<C: Read + Write> GdbClient<C> {
         from_hex(&response)
     }
 
-    /// Continue execution via `c`, returning the stop reply.
-    pub fn cont(&mut self) -> Result<StopReply> {
-        let response = self.command(b"c")?;
-        StopReply::parse(&response)
+    /// Continue execution via `c`, draining any intermediate `O<hex>` console
+    /// -output packets (semihosting / serial writes the target emits while it
+    /// runs) until the terminal stop reply. Returns the stop together with the
+    /// decoded console output, which the session surfaces as
+    /// [`RunOutcome::stdout`].
+    ///
+    /// Per the RSP specification a debugger must keep reading after an `O`
+    /// packet and wait for the real stop or exit; parsing the first frame as
+    /// the stop reply (a single send/recv) aborts any run that prints. An
+    /// unsupported intermediate frame is surfaced as an explicit error rather
+    /// than interpreted as a completed clean execution, and the retained output
+    /// is bounded by byte and packet counts so a continuous stream cannot run
+    /// unbounded.
+    pub fn cont(&mut self) -> Result<(StopReply, Vec<u8>)> {
+        self.connection.send_packet(b"c")?;
+        let mut output = Vec::new();
+        for _ in 0..MAX_CONSOLE_PACKETS {
+            let frame = self.connection.recv_packet()?;
+            match frame.split_first() {
+                Some((&b'O', payload)) => {
+                    let decoded = from_hex(payload)?;
+                    if output.len() + decoded.len() > MAX_CONSOLE_BYTES {
+                        return Err(TransportError::gdb(format!(
+                            "console output exceeded {MAX_CONSOLE_BYTES} bytes before a stop reply"
+                        )));
+                    }
+                    output.extend_from_slice(&decoded);
+                }
+                _ => return Ok((StopReply::parse(&frame)?, output)),
+            }
+        }
+        Err(TransportError::gdb(format!(
+            "received more than {MAX_CONSOLE_PACKETS} console-output packets before a stop reply"
+        )))
     }
 
     /// Reset the target between iterations: enable extended mode, then issue
@@ -566,14 +602,14 @@ impl<C: Read + Write> TargetSession for GdbSession<C> {
     fn run_input(&mut self, input: &[u8]) -> Result<RunOutcome> {
         self.client.reset()?;
         self.client.write_memory(self.map.input_address, input)?;
-        let stop = self.client.cont()?;
+        let (stop, stdout) = self.client.cont()?;
         let coverage_edges = read_coverage_ring(&mut self.client, &self.map)?;
         Ok(RunOutcome {
             exit: stop.to_exit_kind(),
             coverage_edges,
             // Fault classification over the debug-probe path is HDF-2.
             fault: None,
-            stdout: Vec::new(),
+            stdout,
         })
     }
 }
@@ -700,6 +736,75 @@ mod tests {
         // A normal process exit is clean; an `X` termination is a crash.
         assert_eq!(StopReply::Exited(0).to_exit_kind(), ExitKind::Ok);
         assert_eq!(StopReply::Terminated(SEGV).to_exit_kind(), ExitKind::Crash);
+    }
+
+    #[test]
+    fn cont_drains_console_output_before_the_stop_reply() {
+        // The stub prints two console chunks via `O<hex>` packets, then stops
+        // cleanly. cont() must preserve the output and still reach the stop
+        // reply rather than aborting on the first `O` frame.
+        let (client_end, stub_end) = duplex();
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let stub = MockGdbStub::new(stub_end, log)
+            .with_stop_reply(b"W00".to_vec())
+            .with_console_output(vec![b"hello ".to_vec(), b"world".to_vec()]);
+        let handle = thread::spawn(move || stub.serve());
+
+        let mut client = GdbClient::new(client_end);
+        client.attach().unwrap();
+        let (stop, output) = client.cont().unwrap();
+        drop(client);
+        handle.join().unwrap().unwrap();
+
+        assert_eq!(stop, StopReply::Exited(0));
+        assert_eq!(output, b"hello world");
+    }
+
+    #[test]
+    fn cont_preserves_a_fatal_stop_after_console_output() {
+        // Console output followed by a SIGSEGV stop must retain both the fault
+        // signal and the printed output.
+        let (client_end, stub_end) = duplex();
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let stub = MockGdbStub::new(stub_end, log)
+            .with_stop_reply(b"S0b".to_vec())
+            .with_console_output(vec![b"panic: boom\n".to_vec()]);
+        let handle = thread::spawn(move || stub.serve());
+
+        let mut client = GdbClient::new(client_end);
+        client.attach().unwrap();
+        let (stop, output) = client.cont().unwrap();
+        drop(client);
+        handle.join().unwrap().unwrap();
+
+        assert_eq!(stop, StopReply::Signal(11));
+        assert_eq!(stop.to_exit_kind(), ExitKind::Crash);
+        assert_eq!(output, b"panic: boom\n");
+    }
+
+    #[test]
+    fn cont_bounds_oversized_console_output() {
+        // Two chunks whose decoded total exceeds MAX_CONSOLE_BYTES must be
+        // diagnosed before any stop reply, so an output stream cannot grow
+        // without bound (the absolute execution deadline is enforced by the
+        // campaign).
+        let chunk = vec![b'a'; MAX_CONSOLE_BYTES / 2 + 1];
+        let (client_end, stub_end) = duplex();
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let stub = MockGdbStub::new(stub_end, log)
+            .with_stop_reply(b"W00".to_vec())
+            .with_console_output(vec![chunk.clone(), chunk]);
+        thread::spawn(move || {
+            let _ = stub.serve();
+        });
+
+        let mut client = GdbClient::new(client_end);
+        client.attach().unwrap();
+        let error = client.cont().unwrap_err();
+        assert!(
+            error.to_string().contains("console output exceeded"),
+            "expected a bounded-output diagnostic, got: {error}"
+        );
     }
 
     #[test]

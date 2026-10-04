@@ -432,7 +432,7 @@ impl<CQ: Read + Write, CG: Read + Write> TargetSession for FullSystemSession<CQ,
         // Deliver the input into the guest staging region, then run to the
         // harness end breakpoint and collect the stop reply.
         self.gdb.write_memory(self.map.input_address, input)?;
-        let stop = self.gdb.cont()?;
+        let (stop, stdout) = self.gdb.cont()?;
 
         // Harvest coverage from the in-guest ring.
         let coverage_edges = read_coverage_ring(&mut self.gdb, &self.map)?;
@@ -442,7 +442,7 @@ impl<CQ: Read + Write, CG: Read + Write> TargetSession for FullSystemSession<CQ,
             exit,
             coverage_edges,
             fault: fault_from_stop(&stop),
-            stdout: Vec::new(),
+            stdout,
         })
     }
 }
