@@ -203,7 +203,7 @@ RUN dotnet tool install --tool-path /usr/local/dotnet-tools --version 2.3.0 Shar
 # These generated notices cover OS packages. Per-package full license
 # text stays in /usr/share/doc/*/copyright. See docs/site/docker.md#licensing.
 COPY docker/compliance/ /usr/local/share/bhf/compliance/
-ARG BHF_VERSION=0.2.34
+ARG BHF_VERSION=0.0.0-local
 RUN bash /usr/local/share/bhf/compliance/generate-notices.sh /usr/share/bhf/licenses \
     && bash /usr/local/share/bhf/compliance/generate-sbom.sh /usr/share/bhf/sbom/os.cyclonedx.json \
     && install -m 0644 /usr/local/share/bhf/compliance/WRITTEN-OFFER.md /usr/share/bhf/licenses/ \
@@ -332,7 +332,7 @@ COPY --from=builder /out/libbhf_runtrace_shim.so /usr/local/lib/bhf/libbhf_runtr
 COPY --from=builder /out/libbhf_cc_intercept.so /usr/local/lib/bhf/libbhf_cc_intercept.so
 COPY --from=builder /out/inventory/ /usr/share/bhf/sbom/
 COPY docker/compliance/ /usr/local/share/bhf/compliance/
-ARG BHF_VERSION=0.2.34
+ARG BHF_VERSION=0.0.0-local
 RUN bash /usr/local/share/bhf/compliance/generate-notices.sh /usr/share/bhf/licenses \
     && bash /usr/local/share/bhf/compliance/generate-sbom.sh /usr/share/bhf/sbom/os.cyclonedx.json \
     && install -m 0644 /usr/local/share/bhf/compliance/WRITTEN-OFFER.md /usr/share/bhf/licenses/ \

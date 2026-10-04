@@ -1,6 +1,22 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# BHF v0.2.34 release notes
+# BHF v0.2.35 release candidate
+
+Unpublished. Exact-revision CI, image acceptance, scan review, and protected
+publisher signing determine release eligibility; this heading is not approval.
+
+- Default CLI/daemon exclude LLM connectivity, with explicit opt-in builds.
+- Supported container flavors are `core`, `ada`, and full-language `runtime`;
+  all default to no LLM integration. Validation sweeps require explicit startup.
+- Read-only, non-root, disconnected acceptance covers the selected profile.
+  Java's agent is prebuilt; project builds require consent and staged caches.
+- Binary/source/image identity, compiler-backed Cargo inventory, whole-image
+  scanning, corresponding sources, and an authenticated offline handoff now have
+  a common release path. Failed or stale acceptance evidence blocks packaging.
+- See [deployment support boundaries](docs/site/docker.md) for the exact limits
+  of Windows collectors, private Rust, RTOS emulation, and physical hardware.
+
+## Previous release: v0.2.34
 
 Released 2026-10-01.
 

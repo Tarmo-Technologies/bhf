@@ -90,7 +90,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
-          toolchain: stable
+          toolchain: 1.99.0
           components: clippy
 
       - name: Install Node
@@ -422,7 +422,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
-          toolchain: stable
+          toolchain: 1.99.0
 
       - name: Test Windows-specific logic and daemon
         shell: pwsh

@@ -16,7 +16,7 @@ arch="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
 . /etc/os-release 2>/dev/null || true
 distro="${ID:-ubuntu}"
 
-python3 - "$OUT" "$arch" "$distro" "${VERSION_ID:-24.04}" "${BHF_VERSION:-0.2.34}" <<'PY'
+python3 - "$OUT" "$arch" "$distro" "${VERSION_ID:-24.04}" "${BHF_VERSION:-0.0.0-local}" <<'PY'
 import json, subprocess, sys, datetime
 out, arch, distro, osver, bhf_version = sys.argv[1:6]
 

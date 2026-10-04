@@ -43,6 +43,7 @@ fn run_auto(fixture_dir: &Path, work: &Path) -> (String, serde_json::Value) {
     let output = Command::new(bhf_bin())
         .args([
             "auto",
+            "--run-untrusted",
             fixture_dir.to_str().unwrap(),
             "--per-target-time",
             "3",

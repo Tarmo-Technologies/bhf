@@ -133,7 +133,7 @@ pub struct AttemptOptions {
     /// When true, skip the repair planner entirely and mark any
     /// failed build as `FailedBuild` (diagnostics mode).
     pub no_stubs: bool,
-    /// Permit project-controlled Java Maven/Gradle build scripts.
+    /// Permit project-controlled Maven/Gradle, Cargo, and MSBuild scripts.
     pub run_untrusted: bool,
     /// Ordered list of fuzz passes to drive against the built
     /// harness. Each pass sets `BHF_RUNTRACE_MODE` so the shim's
@@ -1208,6 +1208,20 @@ pub fn attempt_with_progress(
     options: AttemptOptions,
     progress: &dyn crate::auto::progress::ProgressSink,
 ) -> Result<AttemptResult> {
+    if !options.run_untrusted
+        && matches!(
+            candidate.lang,
+            crate::auto::candidate::Lang::Rust | crate::auto::candidate::Lang::CSharp
+        )
+    {
+        return Ok(AttemptResult {
+            candidate: candidate.clone(),
+            outcome: Outcome::UnsupportedParams {
+                reason: "project build requires --run-untrusted: Cargo build scripts/proc macros and MSBuild targets execute project-controlled code; stage dependencies and use network isolation".into(),
+            },
+            harness_dir: crate::auto::layout::harness_dir(work_dir, &candidate.harness_id),
+        });
+    }
     // M22: a candidate whose detected dialect has no fuzzing lane yet (a legacy
     // dialect awaiting its phase) is not silently dropped — it is discovered +
     // statically analyzed (CWE-tagged findings) and reported as report-only,

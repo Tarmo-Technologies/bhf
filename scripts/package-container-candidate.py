@@ -28,6 +28,7 @@ def main():
     parser.add_argument("--sources", required=True, type=pathlib.Path)
     parser.add_argument("--out", required=True, type=pathlib.Path)
     args = parser.parse_args()
+    subprocess.run(["python3", "scripts/ci/container-evidence.py", "verify", str(args.evidence)], check=True)
     image = json.loads(subprocess.check_output(["docker", "image", "inspect", args.image], text=True))[0]
     evidence_image = json.loads((args.evidence / "image-inspect.json").read_text())[0]
     if image["Id"] != evidence_image["Id"]:

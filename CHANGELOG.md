@@ -5,6 +5,13 @@
 ## Unreleased
 
 ### Breaking
+- Default CLI and daemon artifacts omit LLM integrations; build with the explicit
+  `llm` feature to include them. The default container is the C/C++ `core` flavor;
+  select `ada` or `runtime` for additional toolchains. Validation sweep startup
+  requires the `validation` Compose profile.
+- Maven/Gradle, Cargo, and MSBuild project execution requires `--run-untrusted`;
+  dependency resolution uses staged caches. Disconnected deployment additionally
+  requires operating-system network isolation.
 - All findings, indexes and native reports live under `<work-dir>/results/`. `FINDINGS.md`,
   `findings.csv` and `auto/findings.csv` at the work-dir top, `auto/attestation.json`, and
   `reports/run-last.*` (written by `ci --sarif`) are gone. Use `results/INDEX.md`,

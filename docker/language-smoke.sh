@@ -35,9 +35,19 @@ cat > cs/smoke.csproj <<'XML'
 </Project>
 XML
 printf '%s\n' 'class Program { static void Main() { System.Console.WriteLine("CSharp ready"); } }' > cs/Program.cs
-dotnet restore cs/smoke.csproj --source "$stage/empty-feed" --ignore-failed-sources --nologo -v quiet
-dotnet build cs/smoke.csproj --no-restore --nologo -v quiet
+dotnet build cs/smoke.csproj "-p:RestoreSources=$stage/empty-feed" \
+  -p:RestoreAdditionalProjectSources= -p:NuGetAudit=false --nologo -v quiet
 dotnet cs/bin/Debug/net8.0/smoke.dll
+# A missing staged package must fail locally, without retrying public feeds.
+rm -rf cs/obj
+if NUGET_PACKAGES="$stage/empty-packages" dotnet build cs/smoke.csproj \
+  "-p:RestoreSources=$stage/empty-feed" -p:RestoreAdditionalProjectSources= \
+  -p:NuGetAudit=false --nologo -v quiet > missing-nuget.log 2>&1; then
+  echo 'empty NuGet cache unexpectedly succeeded' >&2
+  exit 1
+fi
+grep -q NU1101 missing-nuget.log
+echo 'CSharp empty cache denied'
 node -e 'console.log("JavaScript ready")'
 printf '%s\n' 'const result: string = "TypeScript ready"; console.log(result);' > smoke.ts
 esbuild smoke.ts --platform=node --outfile=smoke.js && node smoke.js

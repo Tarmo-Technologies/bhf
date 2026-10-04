@@ -150,6 +150,7 @@ fn rust_target_builds_and_fuzzes_natively_and_finds_planted_crash() {
     let output = Command::new(&bin)
         .args([
             "auto",
+            "--run-untrusted",
             rust_fuzz_fixture().to_str().unwrap(),
             // Enough wall to get past the `AB` magic + version gate via the
             // value-profile/cmplog mutator. The planted bug is hit in the first

@@ -8,6 +8,10 @@ if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
   echo 'full container acceptance requires a clean tracked source revision' >&2
   exit 2
 fi
+if [[ -d "$evidence" && -n "$(find "$evidence" -mindepth 1 -print -quit)" ]]; then
+  echo "evidence directory must be empty; preserve previous results and select a new path: $evidence" >&2
+  exit 2
+fi
 mkdir -p "$evidence"
 commit="$(git rev-parse --verify HEAD)"
 version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
@@ -69,3 +73,4 @@ docker run --rm --network none --read-only --tmpfs /tmp:rw,exec,nosuid,size=1g \
 # Reconcile the filesystem and compiled Cargo inventory; retain the DB-bound scan.
 bash scripts/ci/container-runtime-acceptance.sh "$image_id" "$evidence"
 bash scripts/ci/inventory-image.sh "$image_id" "$evidence"
+python3 scripts/ci/container-evidence.py record "$evidence"

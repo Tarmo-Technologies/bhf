@@ -459,14 +459,16 @@ pub struct AutoArgs {
 
     /// Consent gate for running the project's own (untrusted) build/codegen to
     /// materialize generated dependencies before harnessing, including Java
-    /// Maven/Gradle project builds — the umbrella for
+    /// Maven/Gradle, Rust Cargo, and C# MSBuild project builds. Also covers
     /// `--probe-build` (CMake/Make configure+codegen) plus an Ada build probe
     /// (`alr build` / `gprbuild`) that generates Alire config + codegen outputs.
     /// Implies `--probe-build`. EXECUTES untrusted scripts; probe builds use
-    /// bhf's sandbox when available, while Java Maven/Gradle runs as the calling
-    /// user and should be contained by the deployment profile. Off by default
-    /// — without it, bhf stubs generated deps and
-    /// records them in the manifest instead of running anything.
+    /// bhf's sandbox when available. Language project builds run as the calling
+    /// user and need deployment isolation. Maven/Gradle/Cargo/NuGet dependency
+    /// resolution uses staged local caches; script egress requires OS isolation.
+    /// Off by default. Denied project builds are reported as unsupported.
+    /// Direct compilers, interpreters, and the selected target still execute
+    /// during an auto run; this flag is not a general no-execution mode.
     #[arg(long = "run-untrusted")]
     pub run_untrusted: bool,
 

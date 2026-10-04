@@ -45,6 +45,14 @@ build recovery. The full language validation sweep uses `runtime` explicitly.
 | `runtime` (explicit) | All sixteen language toolchains except Gradle project recovery | Bare Java, staged offline Maven, and benign compiler/runtime startup for all sixteen languages under isolation; project-specific dependencies still require staging |
 | FreeRTOS reference | Separate pinned kernel, ARM GCC, QEMU | Cooperative task/queue image, clean → fault → clean, retained finding and replay; no physical-board claim |
 
+The release support boundary is host-native operation in the tested deployment
+profiles. Windows native artifact checks do not establish retained-target replay
+under a ready live ETW observer. Rust private/resource-backed placement remains
+experimental, and repeated-trial comparative effectiveness is not established.
+The FreeRTOS reference does not validate Samsung Android devices, arbitrary RTOS
+images, peripherals, or physical boards. Those need separate device-specific
+qualification; an attached Android phone is not evidence for this profile.
+
 ## Run
 
 ```sh
@@ -163,6 +171,17 @@ the gap, exactly as you already do to build the project by hand:
 | Node/TS | the target's `node_modules` |
 
 With those staged, run with `--network none` to prove the run is truly offline:
+
+Java Maven/Gradle, Rust Cargo, and C# MSBuild project builds require
+`--run-untrusted`. Cargo uses `--offline`; Maven/Gradle use their offline flags;
+NuGet resolves against the staged package cache and a local empty feed. Missing
+dependencies fail with build diagnostics. Denied project execution is reported
+as unsupported, never as successful assurance. These flags do not constrain
+network calls made by project scripts: use the isolated deployment profile.
+Direct compiler/interpreter invocation and target execution remain part of
+`auto` without this flag. C/C++ and Ada project probes also require this consent.
+Stage dependency-bearing sources in a disposable writable copy as described
+above, including projects whose MSBuild targets write next to their sources.
 
 ```sh
 docker run --rm --network none --shm-size=2g --cap-add=SYS_PTRACE \
