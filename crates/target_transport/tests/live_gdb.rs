@@ -137,7 +137,7 @@ fn live_gdb_remote_reads_known_memory_from_real_qemu() {
         checks += 1;
 
         // Continue to program exit; qemu-user reports a clean `W00`.
-        let exit = client.cont().expect("continue live guest to exit");
+        let (exit, _output) = client.cont().expect("continue live guest to exit");
         assert_eq!(
             exit,
             StopReply::Exited(0),

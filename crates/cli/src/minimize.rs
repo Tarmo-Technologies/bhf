@@ -314,6 +314,17 @@ fn run_inner(args: MinimizeArgs) -> anyhow::Result<MinimizeSummary> {
             reduced: result.reduced,
         });
     }
+    // #80: an on-target transport finding has no host harness; minimizing it
+    // must reuse the transport replay contract (re-drive through the recorded
+    // transport). Until on-target minimization lands, fail with an actionable
+    // message rather than silently resolving/executing a host harness.
+    if crate::transport_replay::is_transport_finding(&finding_dir) {
+        return Err(anyhow!(
+            "minimize does not yet support on-target transport findings; reproduce \
+             them with `bhf replay` (which re-drives the recorded input through the \
+             recorded transport). On-target minimization is a tracked follow-up."
+        ));
+    }
     let harness = args.harness.ok_or_else(|| {
         anyhow!("minimize requires --harness <path> for a crash/opaque-input finding")
     })?;

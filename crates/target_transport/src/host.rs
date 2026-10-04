@@ -135,6 +135,8 @@ impl TargetSession for HostChildSession {
                                 ),
                             }),
                             stdout: Vec::new(),
+                            coverage_incomplete: None,
+                            inconclusive: None,
                         });
                     }
                     std::thread::sleep(POLL_INTERVAL);
@@ -153,6 +155,8 @@ impl TargetSession for HostChildSession {
             coverage_edges: Vec::new(),
             fault,
             stdout,
+            coverage_incomplete: None,
+            inconclusive: None,
         })
     }
 }

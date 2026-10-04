@@ -10,7 +10,11 @@
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SanitizerReport {
-    pub sanitizer: Sanitizer,
+    /// The sanitizer that produced this report, or `None` when the crash was
+    /// observed WITHOUT a sanitizer (a host fatal signal, or an on-target /
+    /// transport CPU fault). An absent sanitizer is never serialized as a false
+    /// `asan` tag — the provenance states only what actually occurred.
+    pub sanitizer: Option<Sanitizer>,
     /// Short crash class string (e.g. `heap-buffer-overflow`,
     /// `signed-integer-overflow`).
     pub kind: String,
@@ -151,7 +155,7 @@ fn parse_js_finding(stderr: &str) -> Option<SanitizerReport> {
     stack.truncate(5);
 
     Some(SanitizerReport {
-        sanitizer: Sanitizer::AddressSanitizer,
+        sanitizer: Some(Sanitizer::AddressSanitizer),
         kind,
         rule_id,
         stack,
@@ -259,7 +263,7 @@ fn parse_csharp_finding(stderr: &str) -> Option<SanitizerReport> {
         format!("C# finding: {exc}: {msg}")
     };
     Some(SanitizerReport {
-        sanitizer: Sanitizer::AddressSanitizer,
+        sanitizer: Some(Sanitizer::AddressSanitizer),
         kind,
         rule_id,
         stack,
@@ -357,7 +361,7 @@ fn parse_go_panic(stderr: &str) -> Option<SanitizerReport> {
     let mut stack = parse_go_stack_frames(stderr);
     stack.truncate(5);
     Some(SanitizerReport {
-        sanitizer: Sanitizer::AddressSanitizer,
+        sanitizer: Some(Sanitizer::AddressSanitizer),
         kind,
         rule_id,
         stack,
@@ -461,7 +465,7 @@ fn parse_perl_finding(stderr: &str) -> Option<SanitizerReport> {
         _ => ("perl-uncaught-die".to_owned(), "BHF-210"),
     };
     Some(SanitizerReport {
-        sanitizer: Sanitizer::AddressSanitizer,
+        sanitizer: Some(Sanitizer::AddressSanitizer),
         kind,
         rule_id,
         stack: Vec::new(),
@@ -493,7 +497,7 @@ fn parse_ruby_finding(stderr: &str) -> Option<SanitizerReport> {
         _ => ("ruby-reachable-assertion".to_owned(), "BHF-210"),
     };
     Some(SanitizerReport {
-        sanitizer: Sanitizer::AddressSanitizer,
+        sanitizer: Some(Sanitizer::AddressSanitizer),
         kind,
         rule_id,
         stack: Vec::new(),
@@ -524,7 +528,7 @@ fn parse_lua_finding(stderr: &str) -> Option<SanitizerReport> {
         _ => ("lua-reachable-assertion".to_owned(), "BHF-210"),
     };
     Some(SanitizerReport {
-        sanitizer: Sanitizer::AddressSanitizer,
+        sanitizer: Some(Sanitizer::AddressSanitizer),
         kind,
         rule_id,
         stack: Vec::new(),
@@ -555,7 +559,7 @@ fn parse_php_finding(stderr: &str) -> Option<SanitizerReport> {
         _ => ("php-reachable-assertion".to_owned(), "BHF-210"),
     };
     Some(SanitizerReport {
-        sanitizer: Sanitizer::AddressSanitizer,
+        sanitizer: Some(Sanitizer::AddressSanitizer),
         kind,
         rule_id,
         stack: Vec::new(),
@@ -634,7 +638,7 @@ fn parse_jvm_finding(stderr: &str) -> Option<SanitizerReport> {
     Some(SanitizerReport {
         // The crash-channel tag; AddressSanitizer keeps a memory-safety exception
         // (OOB) in the right bucket. `kind`/`rule_id` carry the JVM classification.
-        sanitizer: Sanitizer::AddressSanitizer,
+        sanitizer: Some(Sanitizer::AddressSanitizer),
         kind,
         rule_id,
         stack,
@@ -679,7 +683,7 @@ fn parse_python_finding(stderr: &str) -> Option<SanitizerReport> {
         format!("Python finding: {exc}: {msg}")
     };
     Some(SanitizerReport {
-        sanitizer: Sanitizer::AddressSanitizer,
+        sanitizer: Some(Sanitizer::AddressSanitizer),
         kind,
         rule_id,
         stack,
@@ -835,7 +839,7 @@ fn parse_rust_panic(stderr: &str) -> Option<SanitizerReport> {
         // `Sanitizer` enum is the crash-channel tag; AddressSanitizer is the
         // closest existing variant and keeps the finding in the memory-safety
         // bucket. The `kind`/`rule_id` carry the real Rust classification.
-        sanitizer: Sanitizer::AddressSanitizer,
+        sanitizer: Some(Sanitizer::AddressSanitizer),
         kind,
         rule_id,
         stack,
@@ -916,7 +920,7 @@ fn parse_asan(stderr: &str) -> Option<SanitizerReport> {
         None => line.to_owned(),
     };
     Some(SanitizerReport {
-        sanitizer: Sanitizer::AddressSanitizer,
+        sanitizer: Some(Sanitizer::AddressSanitizer),
         kind,
         rule_id,
         stack: parse_stack_frames(rest),
@@ -1000,7 +1004,7 @@ fn parse_ubsan(stderr: &str) -> Option<SanitizerReport> {
     };
 
     Some(SanitizerReport {
-        sanitizer: Sanitizer::UndefinedBehaviorSanitizer,
+        sanitizer: Some(Sanitizer::UndefinedBehaviorSanitizer),
         kind,
         rule_id,
         stack: parse_stack_frames(stderr),
@@ -1014,7 +1018,7 @@ fn parse_lsan(stderr: &str) -> Option<SanitizerReport> {
             || line.contains("LeakSanitizer: detected memory leaks")
     })?;
     Some(SanitizerReport {
-        sanitizer: Sanitizer::LeakSanitizer,
+        sanitizer: Some(Sanitizer::LeakSanitizer),
         kind: "memory-leak".to_owned(),
         rule_id: "BHF-208",
         stack: parse_stack_frames(stderr),
@@ -1176,7 +1180,7 @@ mod tests {
         let r = parse_sanitizer_report(stderr).unwrap();
         assert_eq!(r.rule_id, "BHF-201");
         assert_eq!(r.kind, "heap-buffer-overflow");
-        assert_eq!(r.sanitizer, Sanitizer::AddressSanitizer);
+        assert_eq!(r.sanitizer, Some(Sanitizer::AddressSanitizer));
         assert_eq!(r.stack.len(), 2);
         assert_eq!(r.stack[0].function, "target_parse");
         assert_eq!(r.stack[0].file.as_deref(), Some("/src/parse.c"));
@@ -1569,7 +1573,7 @@ called `Option::unwrap()` on a `None` value
             let report = parse_sanitizer_report(stderr).expect("still a finding");
             assert_ne!(
                 report.sanitizer,
-                Sanitizer::UndefinedBehaviorSanitizer,
+                Some(Sanitizer::UndefinedBehaviorSanitizer),
                 "a Go panic must not be reported as C UBSan: {stderr}"
             );
         }
@@ -1725,7 +1729,7 @@ t.c:1:1: runtime error: signed integer overflow: 2 + 2147483647
             "=================================================================\n==1==ERROR: LeakSanitizer: detected memory leaks\n";
         let r = parse_sanitizer_report(stderr).unwrap();
         assert_eq!(r.rule_id, "BHF-208");
-        assert_eq!(r.sanitizer, Sanitizer::LeakSanitizer);
+        assert_eq!(r.sanitizer, Some(Sanitizer::LeakSanitizer));
     }
 
     #[test]

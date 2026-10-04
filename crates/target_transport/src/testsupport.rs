@@ -139,6 +139,15 @@ impl Write for DuplexStream {
     }
 }
 
+impl crate::gdb::ReadDeadline for DuplexStream {
+    /// An in-memory pipe cannot set a read deadline — but it also never blocks
+    /// indefinitely (a read returns promptly or observes EOF), so a per-input
+    /// execution deadline is still enforced by the caller's wall-clock checks.
+    fn set_read_deadline(&self, _timeout: Option<std::time::Duration>) -> bool {
+        false
+    }
+}
+
 /// Create a connected pair of [`DuplexStream`] ends.
 pub fn duplex() -> (DuplexStream, DuplexStream) {
     let (a_writer, a_reader) = new_pipe(); // direction: end1 -> end2
@@ -195,6 +204,8 @@ impl ScriptedResponse {
             coverage_edges: self.edges.clone(),
             fault: self.fault.clone(),
             stdout: Vec::new(),
+            coverage_incomplete: None,
+            inconclusive: None,
         }
     }
 }
@@ -278,6 +289,9 @@ pub struct MockGdbStub<C: Read + Write> {
     log: Arc<Mutex<Vec<String>>>,
     stop_reply: Vec<u8>,
     registers: Vec<u8>,
+    /// Raw payloads emitted as `O<hex>` console-output packets before the stop
+    /// reply on a `c`, modeling a target that prints while it runs.
+    console_output: Vec<Vec<u8>>,
 }
 
 impl<C: Read + Write> MockGdbStub<C> {
@@ -289,6 +303,7 @@ impl<C: Read + Write> MockGdbStub<C> {
             log,
             stop_reply: b"S05".to_vec(),
             registers: vec![0_u8; 4],
+            console_output: Vec::new(),
         }
     }
 
@@ -301,6 +316,14 @@ impl<C: Read + Write> MockGdbStub<C> {
     /// Override the stop-reply packet returned by `?` and `c`.
     pub fn with_stop_reply(mut self, reply: Vec<u8>) -> Self {
         self.stop_reply = reply;
+        self
+    }
+
+    /// Emit each payload as an `O<hex>` console-output packet before the stop
+    /// reply on a `c`, modeling a target that writes to the console/semihosting
+    /// while it runs.
+    pub fn with_console_output(mut self, chunks: Vec<Vec<u8>>) -> Self {
+        self.console_output = chunks;
         self
     }
 
@@ -354,7 +377,19 @@ impl<C: Read + Write> MockGdbStub<C> {
             };
             match command {
                 b'!' => self.connection.send_packet(b"OK")?,
-                b'?' | b'c' => {
+                b'?' => {
+                    let reply = self.stop_reply.clone();
+                    self.connection.send_packet(&reply)?;
+                }
+                b'c' => {
+                    // Emit any scripted console output as `O<hex>` packets first,
+                    // exactly as a real stub does while the target prints, then
+                    // the terminal stop reply.
+                    for chunk in &self.console_output {
+                        let mut packet = vec![b'O'];
+                        packet.extend_from_slice(hex(chunk).as_bytes());
+                        self.connection.send_packet(&packet)?;
+                    }
                     let reply = self.stop_reply.clone();
                     self.connection.send_packet(&reply)?;
                 }
