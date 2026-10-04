@@ -239,12 +239,14 @@ fn cli_qemu_system_transport_persists_a_classified_fault_finding() {
         .unwrap_or_else(|e| panic!("spawn {QEMU}: {e}"));
     let _guard = ChildGuard(child);
 
+    // Generous boot budgets: under a loaded CI/dev host (e.g. a concurrent
+    // workspace build) qemu can take tens of seconds to open its sockets.
     assert!(
-        wait_port(qmp_port, Duration::from_secs(15)),
+        wait_port(qmp_port, Duration::from_secs(45)),
         "qemu QMP port never came up"
     );
     assert!(
-        wait_port(gdb_port, Duration::from_secs(15)),
+        wait_port(gdb_port, Duration::from_secs(45)),
         "qemu gdbstub port never came up"
     );
 
