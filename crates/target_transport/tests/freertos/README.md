@@ -16,29 +16,36 @@ live here.
 
 ## Validation status
 
-- **Validated today** (gated test, `BHF_RTOS_LIVE=1`): the real FreeRTOS image
-  builds against the pinned kernel, boots on `mps2-an385`, the QMP + gdb attach
-  and the harness-done breakpoint plant succeed, and the deterministic `savevm`
-  baseline is captured. The app provably runs its tasks and emits task-aware
-  coverage (verified by a direct run under gdb: the `consumer` task executes,
-  the `0x75C0` task marker + branch crumbs appear in the coverage ring).
-- **Gated / in progress** (`BHF_RTOS_FULL=1`): the full per-input fuzz drive
-  (run to the harness-done stop, classify, reset) is not yet green. Two concrete
-  follow-ups remain (isolated during bring-up):
+- **Validated today** (gated smoke `live_rtos_freertos_build_boot_arm_snapshot_smoke`,
+  `BHF_RTOS_LIVE=1`): the real FreeRTOS image builds against the pinned kernel,
+  boots on `mps2-an385`, the QMP + gdb attach and the harness-done breakpoint
+  plant succeed, and the deterministic `savevm` baseline is captured. `arm()`
+  succeeding IS the assertion — this tier does **not** drive inputs. The app runs
+  its tasks and emits task-aware coverage under a direct gdb free-run (the
+  `consumer` task executes; the `0x75C0` task marker + branch crumbs appear in the
+  ring) — bring-up evidence, not an automated per-input assertion.
+- **Gated / in progress** (full drive `live_rtos_freertos_full_fuzz_drive`,
+  `BHF_RTOS_LIVE=1` **and** `BHF_RTOS_FULL=1`): the full per-input fuzz drive (run
+  to the harness-done stop, classify, reset) is **not yet green** and is excluded
+  from the ordinary gated run — it must not be read as passing. One concrete
+  follow-up remains:
   1. **Harness-done stop not observed.** A gdb/Z0 breakpoint at `harness_done`
      does not stop this FreeRTOS guest under `continue` (even without
      `savevm`/`loadvm`), though a direct free-run reaches the consumer and emits
-     coverage. `harness_done` is now `noinline` (so it is a real call target),
-     but the stop still needs debugging (breakpoint vs. the Cortex-M3 boot /
+     coverage. `harness_done` is `noinline` (so it is a real call target), but the
+     stop still needs debugging (breakpoint vs. the Cortex-M3 boot /
      scheduler-start path under QEMU TCG).
-  2. **Input survives reset.** Unlike the bare-metal fixture, this startup must
-     zero `.bss` and init `.data` (FreeRTOS requires it), which overwrites the
-     transport's post-`loadvm` write to `bhf_input`. Move `bhf_input` into a
-     `.noinit` section the startup does not clear so the delivered input
-     survives the boot.
+
+  Fixed during this review (no longer a blocker): **input now survives reset.**
+  `bhf_input` is declared in a `.noinit` section (see `link.ld`) placed after
+  `.bss` and marked `NOLOAD`, so neither startup's `.bss` zero loop nor the
+  `.data` copy clears the transport's post-`loadvm` write — the delivered input
+  reaches the producer. The ring/flags intentionally stay in `.bss`/`.data` so
+  they reset per run (fresh coverage, no inherited fault).
 
   Gated rather than asserted unvalidated, consistent with the roadmap's RTOS
-  stance; this is the remaining actual-RTOS validation step.
+  stance; the harness-done stop is the remaining actual-RTOS validation step, and
+  #84 stays open until the clean → fault → clean CLI path passes end to end.
 
 ## What it demonstrates (target contract)
 
@@ -78,14 +85,20 @@ live here.
 - Toolchain: `arm-none-eabi-gcc`; emulator: `qemu-system-arm -M mps2-an385`
   (validated with QEMU 8.2.2 — see `docs/validation/2026-09-27-hil-emu-live-qemu.md`).
 
-## Build & run (what the gated test automates)
+## Build & run (operator command path)
+
+This is the `bhf fuzz` command path. The gated **smoke** automates only the
+build/boot/arm/snapshot portion (it drives the transport library, not this CLI);
+the clean → fault → clean CLI run with a retained finding + replay is the #84
+acceptance that is **not yet passing** (blocked on the harness-done stop above).
 
 ```sh
-# 1. Fetch the pinned kernel next to this dir (NOT committed).
+# 1. Fetch the pinned kernel next to this dir (NOT committed) and point K at it.
 git clone https://github.com/FreeRTOS/FreeRTOS-Kernel kernel
 git -C kernel checkout 8be86d4a24fd4091f8f4192018423ab590f408db
+K="$(pwd)/kernel"
 
-# 2. Build the image (K = kernel dir).
+# 2. Build the image.
 arm-none-eabi-gcc -mcpu=cortex-m3 -mthumb -nostdlib -nostartfiles -ffreestanding -O1 -g \
   -I . -I "$K/include" -I "$K/portable/GCC/ARM_CM3" -T link.ld -o rtos.elf \
   startup.c app.c "$K/tasks.c" "$K/queue.c" "$K/list.c" \
@@ -94,19 +107,40 @@ arm-none-eabi-gcc -mcpu=cortex-m3 -mthumb -nostdlib -nostartfiles -ffreestanding
 # 3. Discover symbols (bhf_input, adafuzz_probe_memory_buffer{,_write,_wrapped},
 #    harness_done, bhf_fault_flag, bhf_task_id) with `nm rtos.elf`.
 
-# 4. Boot and drive through the shipped CLI (QMP + gdb over TCP).
+# 4. Create the scratch disk savevm/loadvm needs (any small qcow2).
+qemu-img create -f qcow2 scratch.qcow2 16M
+
+# 5. Boot and drive through the shipped CLI (QMP + gdb over TCP).
 qemu-system-arm -M mps2-an385 -nographic -S -kernel rtos.elf \
   -gdb tcp::3333 -qmp tcp:127.0.0.1:4444,server,nowait \
   -drive if=none,file=scratch.qcow2,format=qcow2,id=sc0 &
 bhf fuzz bhf_work --harness freertos-queue \
   --target-transport "qemu-system:qmp=127.0.0.1:4444,gdb=127.0.0.1:3333,snapshot=base,done=<harness_done>,fault=<bhf_fault_flag>" \
-  --transport-coverage-map "input=<bhf_input>,ring=<ring>,write=<write>,wrapped=<wrapped>,cap=512"
+  --transport-coverage-map "input=<bhf_input>,ring=<ring>,write=<write>,wrapped=<wrapped>,cap=512" \
+  --max-len 64
 ```
+
+`--max-len 64` bounds a generated input to the 64-byte `bhf_input` staging buffer.
+The transport has no staging-capacity field and the CLI's default maximum is
+larger, so without this cap a longer input would be written past `bhf_input[64]`
+into adjacent guest memory. Keep `--max-len` ≤ the staging buffer size.
 
 ## Gated test
 
-`crates/target_transport/tests/live_rtos.rs` automates the above and asserts the
-control outcomes (clean / default / planted-fault), task-aware coverage, and
-determinism. It self-skips unless `BHF_RTOS_LIVE=1` and the toolchain/emulator
-are present; set `BHF_RTOS_KERNEL=<path>` to point at an already-fetched kernel
-instead of cloning.
+`crates/target_transport/tests/live_rtos.rs` drives the transport **library**
+directly (not the `bhf fuzz` CLI above) in two self-skipping tiers; set
+`BHF_RTOS_KERNEL=<path>` to reuse an already-fetched kernel instead of cloning:
+
+- `live_rtos_freertos_build_boot_arm_snapshot_smoke` (`BHF_RTOS_LIVE=1`) — builds
+  the real pinned kernel, boots it, completes the QMP + gdb attach, plants the
+  harness breakpoint, and captures the `savevm` baseline. `arm()` succeeding is
+  the assertion; it does **not** drive inputs.
+- `live_rtos_freertos_full_fuzz_drive` (`BHF_RTOS_LIVE=1` **and**
+  `BHF_RTOS_FULL=1`) — the per-input clean / default / planted-fault assertions,
+  task-aware coverage, and determinism. **KNOWN-INCOMPLETE**: blocked on the
+  harness-done stop (follow-up #1 above), so it is excluded from the ordinary
+  gated run and must not be read as passing.
+
+Neither tier establishes the operator CLI path: obtaining a clean → fault → clean
+run through `bhf fuzz` with a retained finding and a successful `bhf replay` is
+the remaining #84 acceptance, which keeps the issue open.

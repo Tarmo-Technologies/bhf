@@ -1,21 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! #84: a REAL open-RTOS (FreeRTOS) reference profile driven through the shipped
-//! `FullSystemTransport`, not a host vendor-header stub.
+//! #84: a REAL open-RTOS (FreeRTOS) reference profile for the shipped
+//! `FullSystemTransport`, not a host vendor-header stub. This is BRING-UP, not a
+//! delivered RTOS-fuzzing claim (#84 stays open); the coverage is deliberately
+//! two-tiered so nothing asserts more than has actually been validated.
 //!
-//! A BHF-authored queue/message application runs on the FreeRTOS kernel under
-//! `qemu-system-arm -M mps2-an385` (Cortex-M3): a producer task forwards the
-//! fuzz input over a queue to a consumer task (the selected entry point), which
-//! records its task identity (a `0x75C0` task-marker coverage crumb), dispatches
-//! on the input, emits coverage, and — on the planted `0xF7` input — HardFaults
-//! through the `#72` fault-status channel. The snapshot `savevm`/`loadvm` reset
-//! makes each input deterministic (the app is cooperatively scheduled —
-//! `configUSE_PREEMPTION = 0` — a declared limitation; see `freertos/README.md`).
+//! A BHF-authored queue/message application targets the FreeRTOS kernel under
+//! `qemu-system-arm -M mps2-an385` (Cortex-M3): a producer task forwards the fuzz
+//! input over a queue to a consumer task (the selected entry point), which records
+//! its task identity (a `0x75C0` task-marker crumb), dispatches on the input,
+//! emits coverage, and — on the planted `0xF7` input — HardFaults through the
+//! `#72` fault-status channel. The snapshot `savevm`/`loadvm` reset makes each
+//! input deterministic (the app is cooperatively scheduled, `configUSE_PREEMPTION
+//! = 0` — a declared limitation; see `freertos/README.md`).
+//!
+//! Two gated tiers, both self-skipping unless the toolchain/emulator are present:
+//!
+//! * [`live_rtos_freertos_build_boot_arm_snapshot_smoke`] (`BHF_RTOS_LIVE=1`) —
+//!   the VALIDATED extent: build the real pinned kernel, boot it on the board,
+//!   complete the QMP + gdb attach, plant the harness breakpoint, and capture the
+//!   `savevm` baseline. It asserts `arm()` succeeds; it does NOT drive inputs.
+//! * [`live_rtos_freertos_full_fuzz_drive`] (`BHF_RTOS_LIVE=1` **and**
+//!   `BHF_RTOS_FULL=1`) — the per-input task/coverage/fault assertions. This is
+//!   KNOWN-INCOMPLETE: a FreeRTOS-specific harness-done breakpoint-stop issue
+//!   under `loadvm`+`continue` is unresolved for this image, so it is not part of
+//!   the ordinary run and must not be read as passing (#84).
 //!
 //! BHF ships no RTOS image: the kernel is fetched at a pinned commit (bring your
-//! own source), not vendored. The test self-skips unless `BHF_RTOS_LIVE=1` and
-//! the toolchain/emulator are present; `BHF_RTOS_KERNEL=<path>` reuses an
-//! already-fetched kernel instead of cloning.
+//! own source), not vendored. `BHF_RTOS_KERNEL=<path>` reuses an already-fetched
+//! kernel instead of cloning.
 
 mod common;
 
@@ -107,42 +120,44 @@ fn build_image(build_dir: &Path, kernel: &Path) -> PathBuf {
     elf
 }
 
-#[test]
-fn live_rtos_freertos_queue_app_runs_tasks_coverage_and_faults() {
+/// Gate both tiers: `BHF_RTOS_LIVE=1` plus the toolchain/emulator on PATH. Logs
+/// the reason and returns false (skip) when the environment is not present.
+fn rtos_live_gate() -> bool {
     if std::env::var("BHF_RTOS_LIVE").ok().as_deref() != Some("1") {
         eprintln!(
             "live_rtos: skipped (set BHF_RTOS_LIVE=1 with arm-none-eabi-gcc + qemu-system-arm \
              to run; fetches the pinned FreeRTOS kernel unless BHF_RTOS_KERNEL is set)"
         );
-        return;
+        return false;
     }
     for tool in [CC, QEMU, QEMU_IMG, NM, "git"] {
         if !common::tool_on_path(tool) {
             eprintln!("live_rtos: skipped ({tool} not on PATH)");
-            return;
+            return false;
         }
     }
+    true
+}
 
-    let dir = TempDir::new("bhf-live-rtos").expect("temp dir");
-    let Some(kernel) = obtain_kernel(dir.path()) else {
-        return;
-    };
+/// Build the real pinned kernel, boot it on `mps2-an385`, complete the QMP + gdb
+/// attach, plant the harness breakpoint, and capture the `savevm` baseline.
+/// Returns the armed session and the QEMU child guard — the caller keeps BOTH
+/// alive (the guard must outlive the session so QEMU stays up) — or `None` when
+/// the pinned kernel cannot be fetched (e.g. no network). This is the setup shared
+/// by the smoke and the full fuzz-drive so neither duplicates the bring-up.
+fn build_boot_arm(dir: &TempDir) -> Option<(Box<dyn target_transport::TargetSession>, ChildGuard)> {
+    let kernel = obtain_kernel(dir.path())?;
     let elf = build_image(dir.path(), &kernel);
 
-    let input_address = common::nm_symbol(NM, &elf, "bhf_input");
-    let ring_address = common::nm_symbol(NM, &elf, "adafuzz_probe_memory_buffer");
-    let ring_write_address = common::nm_symbol(NM, &elf, "adafuzz_probe_memory_buffer_write");
-    let ring_wrapped_address = common::nm_symbol(NM, &elf, "adafuzz_probe_memory_buffer_wrapped");
-    let harness_done = common::nm_symbol(NM, &elf, "harness_done") & !1;
-    let fault_flag = common::nm_symbol(NM, &elf, "bhf_fault_flag");
-
     let map = GdbMemoryMap {
-        input_address,
-        ring_address,
-        ring_write_address,
-        ring_wrapped_address,
+        input_address: common::nm_symbol(NM, &elf, "bhf_input"),
+        ring_address: common::nm_symbol(NM, &elf, "adafuzz_probe_memory_buffer"),
+        ring_write_address: common::nm_symbol(NM, &elf, "adafuzz_probe_memory_buffer_write"),
+        ring_wrapped_address: common::nm_symbol(NM, &elf, "adafuzz_probe_memory_buffer_wrapped"),
         ring_capacity: RING_CAP,
     };
+    let harness_done = common::nm_symbol(NM, &elf, "harness_done") & !1;
+    let fault_flag = common::nm_symbol(NM, &elf, "bhf_fault_flag");
 
     // Boot: TCP QMP + gdb (what the shipped CLI parses), scratch qcow2 for savevm.
     let scratch = dir.join("scratch.qcow2");
@@ -172,7 +187,7 @@ fn live_rtos_freertos_queue_app_runs_tasks_coverage_and_faults() {
         .arg(format!("tcp:127.0.0.1:{qmp_port},server,nowait"))
         .spawn()
         .unwrap_or_else(|e| panic!("spawn {QEMU}: {e}"));
-    let _guard = ChildGuard::new(child, format!("{QEMU} freertos gdb:{gdb_port}"));
+    let guard = ChildGuard::new(child, format!("{QEMU} freertos gdb:{gdb_port}"));
 
     let connect_qmp = move || -> Result<std::net::TcpStream, TransportError> {
         let s = common::connect_tcp_retry(qmp_port, Duration::from_secs(20))
@@ -194,28 +209,61 @@ fn live_rtos_freertos_queue_app_runs_tasks_coverage_and_faults() {
         .with_harness_breakpoint(harness_done, 2)
         .with_fault_status(GuestFaultStatus::new(fault_flag, 4, 0).expect("fault-status"));
 
-    // Build + boot + QMP handshake + gdb attach + harness breakpoint + the
-    // deterministic savevm baseline all succeed against the REAL FreeRTOS image
-    // — this is the validated-today extent of the actual-RTOS profile.
-    let mut session = transport.arm().expect("arm the live FreeRTOS target");
+    let session = transport.arm().expect("arm the live FreeRTOS target");
     eprintln!(
         "live_rtos: armed — real FreeRTOS image built (pinned kernel), booted on mps2-an385, \
          QMP+gdb attached, harness breakpoint planted, savevm baseline captured"
     );
+    Some((session, guard))
+}
 
-    // The full per-input fuzz drive (run to the harness-done stop, classify, reset
-    // deterministically) is behind a FURTHER opt-in while a FreeRTOS-specific
-    // breakpoint-stop issue under loadvm+cont is resolved: the app provably runs
-    // its tasks and emits task-aware coverage (see freertos/README.md), but the
-    // transport's `continue` does not yet observe the harness-done stop for this
-    // image. Keep it gated rather than asserting an unvalidated run.
+/// VALIDATED tier: build the real pinned kernel, boot it, attach QMP+gdb, plant
+/// the harness breakpoint, and capture the savevm baseline. `arm()` succeeding IS
+/// the assertion — this does not drive inputs. It is the honest, demonstrated
+/// extent of the actual-RTOS profile today; the per-input drive is a separate,
+/// known-incomplete test below (#84 stays open).
+#[test]
+fn live_rtos_freertos_build_boot_arm_snapshot_smoke() {
+    if !rtos_live_gate() {
+        return;
+    }
+    let dir = TempDir::new("bhf-live-rtos-smoke").expect("temp dir");
+    let Some((_session, _guard)) = build_boot_arm(&dir) else {
+        return;
+    };
+    eprintln!(
+        "live_rtos: SMOKE PASSED — build + boot + QMP/gdb attach + snapshot baseline \
+         (no input driven; see live_rtos_freertos_full_fuzz_drive for the gated per-input run)"
+    );
+}
+
+/// KNOWN-INCOMPLETE tier: the full per-input task/coverage/fault assertions.
+///
+/// Behind a FURTHER opt-in (`BHF_RTOS_FULL=1`) because a FreeRTOS-specific
+/// harness-done breakpoint-stop issue under `loadvm`+`continue` is unresolved for
+/// this image: the app provably runs its tasks and emits task-aware coverage (see
+/// `freertos/README.md`), but the transport's `continue` does not yet observe the
+/// harness-done stop here. This is bring-up evidence, NOT a passing capability —
+/// it is excluded from the ordinary gated run so nothing reports it as working
+/// (#84 stays open until it passes end to end through `bhf fuzz`).
+#[test]
+fn live_rtos_freertos_full_fuzz_drive() {
+    if !rtos_live_gate() {
+        return;
+    }
     if std::env::var("BHF_RTOS_FULL").ok().as_deref() != Some("1") {
         eprintln!(
-            "live_rtos: fuzz-drive gated (set BHF_RTOS_FULL=1 to run it; the harness-done-stop \
-             step is the remaining RTOS validation — see freertos/README.md)"
+            "live_rtos: full fuzz-drive gated (set BHF_RTOS_FULL=1 to run it). KNOWN-INCOMPLETE: \
+             the harness-done-stop under loadvm+cont is the remaining RTOS validation (#84) — \
+             see freertos/README.md"
         );
         return;
     }
+
+    let dir = TempDir::new("bhf-live-rtos-full").expect("temp dir");
+    let Some((mut session, _guard)) = build_boot_arm(&dir) else {
+        return;
+    };
 
     const TASK_MARKER: u32 = 0x75C0; // consumer task identity marker
     let run = |s: &mut Box<dyn target_transport::TargetSession>, byte: u8| {
