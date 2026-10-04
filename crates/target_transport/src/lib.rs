@@ -61,7 +61,9 @@ pub mod host;
 pub use agent::{AgentLimits, AgentSession, AgentTransport};
 pub use coverage::{edges_from_events, MemoryBufferReader, SemihostingReader};
 pub use error::{Result, TransportError};
-pub use fullsystem::{FullSystemSession, FullSystemTransport, QmpClient, QmpLimits};
+pub use fullsystem::{
+    FullSystemSession, FullSystemTransport, GuestFaultStatus, QmpClient, QmpLimits,
+};
 pub use gdb::{
     read_coverage_ring, GdbClient, GdbConnection, GdbMemoryMap, GdbRemoteTransport, GdbSession,
     StopReply,

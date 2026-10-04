@@ -75,7 +75,7 @@
 
 use crate::error::{Result, TransportError};
 use crate::gdb::{read_coverage_ring, GdbClient, GdbMemoryMap};
-use crate::outcome::{Fault, FaultKind, RunOutcome};
+use crate::outcome::{ExitKind, Fault, FaultKind, RunOutcome};
 use crate::transport::{TargetSession, TargetTransport};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
@@ -325,6 +325,57 @@ fn validate_snapshot_tag(tag: &str) -> Result<()> {
     Ok(())
 }
 
+/// An explicit firmware fault-status contract in guest memory.
+///
+/// A target whose fault handler routes back through the harness completion
+/// breakpoint — as a Cortex-M `HardFault_Handler` that calls the "done" symbol
+/// commonly does — reports a benign `SIGTRAP` at that breakpoint, so the fault
+/// is invisible in the GDB stop reply (#72). When the firmware also records the
+/// fault in a known memory word, this contract lets the session read that word
+/// as a separate evidence channel and classify the run as a crash independently
+/// of the completion trap. It is a deliberate, caller-declared location — never
+/// an inference from a particular coverage edge id.
+#[derive(Debug, Clone)]
+pub struct GuestFaultStatus {
+    /// Address of the little-endian fault-status word in guest memory.
+    pub address: u64,
+    /// Width of the status word in bytes (`1..=8`).
+    pub width: usize,
+    /// The value meaning "no fault" (typically `0`); any other value is a fault.
+    pub clear_value: u64,
+}
+
+impl GuestFaultStatus {
+    /// Build a contract, validating `width` is in `1..=8` bytes.
+    pub fn new(address: u64, width: usize, clear_value: u64) -> Result<Self> {
+        if !(1..=8).contains(&width) {
+            return Err(TransportError::protocol(format!(
+                "fault-status word width {width} must be 1..=8 bytes"
+            )));
+        }
+        Ok(Self {
+            address,
+            width,
+            clear_value,
+        })
+    }
+}
+
+/// Read the firmware fault-status word. Returns `Ok(Some(word))` when it differs
+/// from the contract's `clear_value` (a fault was recorded), `Ok(None)` when it
+/// is clear. The read is bounded by [`GdbClient::read_memory`].
+fn read_fault_status<C: Read + Write>(
+    gdb: &mut GdbClient<C>,
+    status: &GuestFaultStatus,
+) -> Result<Option<u64>> {
+    let bytes = gdb.read_memory(status.address, status.width)?;
+    let mut word = 0_u64;
+    for (i, byte) in bytes.iter().enumerate() {
+        word |= u64::from(*byte) << (8 * i);
+    }
+    Ok((word != status.clear_value).then_some(word))
+}
+
 /// A full-system transport over a `qemu-system-*` guest driven by QMP + GDB.
 ///
 /// `connect_qmp` dials a fresh QMP socket and `connect_gdb` a fresh gdbstub
@@ -337,6 +388,7 @@ pub struct FullSystemTransport<FQ, FG> {
     map: GdbMemoryMap,
     snapshot_tag: String,
     harness_breakpoint: Option<(u64, u32)>,
+    fault_status: Option<GuestFaultStatus>,
 }
 
 impl<FQ, FG> FullSystemTransport<FQ, FG> {
@@ -356,6 +408,7 @@ impl<FQ, FG> FullSystemTransport<FQ, FG> {
             map,
             snapshot_tag,
             harness_breakpoint: None,
+            fault_status: None,
         })
     }
 
@@ -373,6 +426,18 @@ impl<FQ, FG> FullSystemTransport<FQ, FG> {
     /// harness already traps back to the debugger.
     pub fn with_harness_breakpoint(mut self, address: u64, kind: u32) -> Self {
         self.harness_breakpoint = Some((address, kind));
+        self
+    }
+
+    /// Declare a firmware fault-status word ([`GuestFaultStatus`]) read after
+    /// each run. When the GDB stop reply is benign (e.g. a `SIGTRAP` at the
+    /// completion breakpoint) but the firmware recorded a fault — a Cortex-M
+    /// `HardFault_Handler` that returns through the "done" symbol — a set status
+    /// word upgrades the outcome to a crash with a structured fault, so the
+    /// crash is not reported as a silent clean pass (#72). Leave it unset (the
+    /// default) for targets that surface faults directly in the stop reply.
+    pub fn with_fault_status(mut self, status: GuestFaultStatus) -> Self {
+        self.fault_status = Some(status);
         self
     }
 }
@@ -408,6 +473,7 @@ where
             gdb,
             map: self.map,
             snapshot_tag: self.snapshot_tag.clone(),
+            fault_status: self.fault_status.clone(),
         }))
     }
 }
@@ -419,6 +485,7 @@ pub struct FullSystemSession<CQ, CG> {
     gdb: GdbClient<CG>,
     map: GdbMemoryMap,
     snapshot_tag: String,
+    fault_status: Option<GuestFaultStatus>,
 }
 
 impl<CQ: Read + Write, CG: Read + Write> TargetSession for FullSystemSession<CQ, CG> {
@@ -434,17 +501,45 @@ impl<CQ: Read + Write, CG: Read + Write> TargetSession for FullSystemSession<CQ,
         self.gdb.write_memory(self.map.input_address, input)?;
         let (stop, stdout) = self.gdb.cont()?;
 
-        // Classify the stop reply FIRST, then harvest coverage from the in-guest
-        // ring. A readback failure must not erase an already-observed crash
-        // (#74): the exit/fault classification stays authoritative and the ring
-        // read failure is recorded as a diagnostic.
-        let exit = stop.to_exit_kind();
-        let fault = fault_from_stop(&stop);
-        let (coverage_edges, coverage_incomplete) =
-            match read_coverage_ring(&mut self.gdb, &self.map) {
-                Ok(edges) => (edges, None),
-                Err(err) => (Vec::new(), Some(err.to_string())),
-            };
+        // Classify the stop reply FIRST (#74: a later readback failure must not
+        // erase an already-observed crash).
+        let mut exit = stop.to_exit_kind();
+        let mut fault = fault_from_stop(&stop);
+        let mut coverage_incomplete: Option<String> = None;
+
+        // Explicit firmware fault-status channel (#72). A target whose fault
+        // handler returns through the completion breakpoint reports a benign
+        // SIGTRAP, hiding the crash in the stop reply. Read the declared status
+        // word (before the next loadvm reset) and, when the stop itself was not
+        // already a crash, let a recorded fault upgrade the outcome. This is a
+        // separate evidence channel from coverage: a coverage edge id is never
+        // reinterpreted as a fault.
+        if let Some(status) = &self.fault_status {
+            match read_fault_status(&mut self.gdb, status) {
+                Ok(Some(word)) if exit != ExitKind::Crash => {
+                    exit = ExitKind::Crash;
+                    fault = Some(Fault {
+                        kind: FaultKind::CpuException,
+                        address: None,
+                        detail: format!("firmware fault-status {word:#x} at {:#x}", status.address),
+                    });
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    coverage_incomplete = Some(format!("fault-status read failed: {err}"));
+                }
+            }
+        }
+
+        // Harvest coverage from the in-guest ring, best-effort (#74).
+        let coverage_edges = match read_coverage_ring(&mut self.gdb, &self.map) {
+            Ok(edges) => edges,
+            Err(err) => {
+                coverage_incomplete.get_or_insert_with(|| err.to_string());
+                Vec::new()
+            }
+        };
+
         Ok(RunOutcome {
             exit,
             coverage_edges,
@@ -763,6 +858,99 @@ mod tests {
             outcome.coverage_incomplete.is_some(),
             "the readback failure must be recorded alongside the retained crash"
         );
+    }
+
+    /// Build a full-system session with a valid coverage ring, a benign stop
+    /// reply (`S05`, as a completion-breakpoint trap), and a fault-status word
+    /// region holding `status_word`, so the fault-status channel can be tested
+    /// in isolation from the stop reply.
+    fn fault_status_session(status_word: u32) -> Box<dyn TargetSession> {
+        const STATUS_ADDR: u64 = 0x6000;
+        let (image, write, wrapped) = scripted_ring(&[7], 64);
+        let map = GdbMemoryMap {
+            input_address: 0x1000,
+            ring_address: 0x4000,
+            ring_write_address: 0x5000,
+            ring_wrapped_address: 0x5100,
+            ring_capacity: 64,
+        };
+        let (gdb_client_end, gdb_stub_end) = duplex();
+        let stub = MockGdbStub::new(gdb_stub_end, Arc::new(Mutex::new(Vec::new())))
+            .with_stop_reply(b"S05".to_vec()) // benign completion trap
+            .with_region(map.input_address, vec![0_u8; 64])
+            .with_region(map.ring_address, image)
+            .with_region(map.ring_write_address, write.to_le_bytes().to_vec())
+            .with_region(map.ring_wrapped_address, vec![u8::from(wrapped)])
+            .with_region(STATUS_ADDR, status_word.to_le_bytes().to_vec());
+        thread::spawn(move || {
+            let _ = stub.serve();
+        });
+
+        let (qmp_client_end, qmp_server_end) = duplex();
+        let server = MockQmpServer::new(qmp_server_end, Arc::new(Mutex::new(Vec::new())));
+        thread::spawn(move || {
+            let _ = server.serve();
+        });
+
+        let gdb_slot = Mutex::new(Some(gdb_client_end));
+        let qmp_slot = Mutex::new(Some(qmp_client_end));
+        let transport = FullSystemTransport::new(
+            move || {
+                qmp_slot
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .ok_or_else(|| TransportError::protocol("q"))
+            },
+            move || {
+                gdb_slot
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .ok_or_else(|| TransportError::protocol("g"))
+            },
+            map,
+            "bhf-baseline",
+        )
+        .unwrap()
+        .with_fault_status(GuestFaultStatus::new(STATUS_ADDR, 4, 0).unwrap());
+        transport.arm().unwrap()
+    }
+
+    #[test]
+    fn benign_stop_with_set_fault_status_is_a_crash() {
+        // The run completes at the benign SIGTRAP completion breakpoint (S05)
+        // but the firmware recorded a fault word — the outcome must be a
+        // classified crash, not a silent clean pass (#72).
+        let mut session = fault_status_session(0xDEAD_FA11);
+        let outcome = session.run_input(b"fault").unwrap();
+        assert_eq!(outcome.exit, ExitKind::Crash);
+        let fault = outcome.fault.expect("a recorded fault must surface");
+        assert_eq!(fault.kind, FaultKind::CpuException);
+        assert!(
+            fault.detail.contains("deadfa11"),
+            "fault detail must carry the raw status word: {}",
+            fault.detail
+        );
+        // Coverage is a separate channel and is still harvested normally.
+        assert_eq!(outcome.coverage_edges, vec![7]);
+    }
+
+    #[test]
+    fn benign_stop_with_clear_fault_status_stays_clean() {
+        // A clean completion with a cleared fault word stays Ok with no fault:
+        // the fault-status channel must not fabricate a crash (#72).
+        let mut session = fault_status_session(0);
+        let outcome = session.run_input(b"ok").unwrap();
+        assert_eq!(outcome.exit, ExitKind::Ok);
+        assert!(outcome.fault.is_none());
+    }
+
+    #[test]
+    fn fault_status_width_is_validated() {
+        assert!(GuestFaultStatus::new(0x6000, 0, 0).is_err());
+        assert!(GuestFaultStatus::new(0x6000, 9, 0).is_err());
+        assert!(GuestFaultStatus::new(0x6000, 4, 0).is_ok());
     }
 
     // ------------------------------------------------------------------

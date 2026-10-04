@@ -43,7 +43,8 @@ use common::{connect_tcp_retry, connect_unix_retry, gate, ChildGuard, TempDir};
 use std::process::Command;
 use std::time::Duration;
 use target_transport::{
-    ExitKind, FullSystemTransport, GdbMemoryMap, TargetTransport, TransportError,
+    ExitKind, FaultKind, FullSystemTransport, GdbMemoryMap, GuestFaultStatus, TargetTransport,
+    TransportError,
 };
 
 const CC: &str = "arm-none-eabi-gcc";
@@ -236,10 +237,13 @@ fn live_fullsystem_snapshot_reads_coverage_and_detects_planted_fault() {
     let ring_wrapped_address = common::nm_symbol("nm", &elf, "adafuzz_probe_memory_buffer_wrapped");
     // `nm` sets the Thumb bit (bit 0) on function symbols; strip it for the bp.
     let harness_done = common::nm_symbol("nm", &elf, "harness_done") & !1;
+    // The firmware's HardFault_Handler records the fault in this data word before
+    // returning through harness_done; it is the explicit fault-status channel.
+    let fault_flag_address = common::nm_symbol("nm", &elf, "bhf_fault_flag");
     eprintln!(
         "live_fullsystem: map input={input_address:#x} ring={ring_address:#x} \
          write={ring_write_address:#x} wrapped={ring_wrapped_address:#x} \
-         harness_done={harness_done:#x}"
+         harness_done={harness_done:#x} fault_flag={fault_flag_address:#x}"
     );
 
     let map = GdbMemoryMap {
@@ -278,7 +282,12 @@ fn live_fullsystem_snapshot_reads_coverage_and_detects_planted_fault() {
     let transport = FullSystemTransport::new(connect_qmp, connect_gdb, map, "bhf_base")
         .expect("build FullSystemTransport")
         // Thumb software breakpoint (kind 2) at the harness done symbol.
-        .with_harness_breakpoint(harness_done, 2);
+        .with_harness_breakpoint(harness_done, 2)
+        // The HardFault handler returns through harness_done, so its SIGTRAP
+        // looks benign; the fault-status word makes the crash observable (#72).
+        .with_fault_status(
+            GuestFaultStatus::new(fault_flag_address, 4, 0).expect("fault-status contract"),
+        );
 
     // arm(): QMP handshake, gdb attach, plant the harness breakpoint, quiesce,
     // and savevm the clean baseline (this is the "savevm needs a block device"
@@ -347,9 +356,21 @@ fn live_fullsystem_snapshot_reads_coverage_and_detects_planted_fault() {
         !out_fault.coverage_edges.contains(&0x1FB),
         "the post-udf edge must be unreachable — proving the udf really faulted"
     );
+    // #72: the HardFault must surface as a classified crash through the fault
+    // channel, not a silent clean pass — coverage reachability is NOT the proof.
+    assert_eq!(
+        out_fault.exit,
+        ExitKind::Crash,
+        "the planted HardFault must classify as a crash, not a clean completion"
+    );
+    let fault = out_fault
+        .fault
+        .as_ref()
+        .expect("the HardFault must carry a structured fault record");
+    assert_eq!(fault.kind, FaultKind::CpuException);
     eprintln!(
-        "live_fullsystem: input=0xF7 edges={:x?} — REAL Cortex-M HardFault path taken",
-        out_fault.coverage_edges
+        "live_fullsystem: input=0xF7 edges={:x?} exit={:?} fault={:?} — REAL Cortex-M HardFault classified",
+        out_fault.coverage_edges, out_fault.exit, fault.kind
     );
 
     // ---- determinism: the snapshot reset makes the same input reproducible even
@@ -359,9 +380,20 @@ fn live_fullsystem_snapshot_reads_coverage_and_detects_planted_fault() {
         out_repeat.coverage_edges, out_normal.coverage_edges,
         "same input after loadvm reset must reproduce identical coverage"
     );
+    // #72: the loadvm reset must also clear the firmware fault flag the previous
+    // iteration set — a clean input after a fault must not inherit the crash.
+    assert_eq!(
+        out_repeat.exit,
+        ExitKind::Ok,
+        "a clean input after a fault must reset to Ok, not inherit the fault flag"
+    );
+    assert!(
+        out_repeat.fault.is_none(),
+        "the fault flag must not carry over across the snapshot reset"
+    );
     eprintln!(
-        "live_fullsystem: determinism — 0x42 again edges={:x?} (== first run)",
-        out_repeat.coverage_edges
+        "live_fullsystem: determinism — 0x42 again edges={:x?} exit={:?} (== first run, fault cleared)",
+        out_repeat.coverage_edges, out_repeat.exit
     );
 
     eprintln!(
