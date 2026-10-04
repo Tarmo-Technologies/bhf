@@ -299,10 +299,13 @@ impl TransportPlan {
                     .open(&path)
                     .map_err(TransportError::from)
             }))),
-            Self::Gdb { host, port, map } => Ok(Box::new(GdbRemoteTransport::new(
-                move || connect_tcp_bounded(&host, port, io_timeout),
-                map,
-            ))),
+            Self::Gdb { host, port, map } => Ok(Box::new(
+                GdbRemoteTransport::new(move || connect_tcp_bounded(&host, port, io_timeout), map)
+                    // The I/O bound doubles as the absolute per-input execution
+                    // deadline so a hung target is a bounded Timeout outcome, not
+                    // an unbounded wait behind the per-read socket timeout (#70).
+                    .with_exec_deadline(io_timeout),
+            )),
             Self::QemuSystem {
                 qmp_host,
                 qmp_port,
@@ -330,6 +333,10 @@ impl TransportPlan {
                 if let Some(status) = fault_status {
                     transport = transport.with_fault_status(status);
                 }
+                // The I/O bound doubles as the absolute per-input execution
+                // deadline (#70): a guest that never reaches the completion stop
+                // is a bounded Timeout outcome, not an unbounded run-control wait.
+                transport = transport.with_exec_deadline(io_timeout);
                 Ok(Box::new(transport))
             }
         }
@@ -560,10 +567,10 @@ pub(crate) struct TransportFuzzConfig {
     pub iterations: usize,
     /// Optional whole-campaign wall-clock budget (`--time`).
     pub time_budget: Option<Duration>,
-    /// Optional per-input I/O bound (`--timeout`). A target that does not answer
-    /// within it is a target-execution timeout (a hang), distinct from a clean
-    /// run and from a lost transport (#70). Also bounds the connect/read/write
-    /// lifetimes of the dialed transport.
+    /// Optional absolute per-input execution deadline (`--timeout`). The transport
+    /// itself enforces it (a hang is an `ExitKind::Timeout` outcome); this copy is
+    /// persisted into each finding's replay profile so `bhf replay` rebuilds the
+    /// transport with the SAME per-input bound and can reproduce a timing finding.
     pub per_input_timeout: Option<Duration>,
     /// Optional response-time deadline (`--deadline`). A completed run whose
     /// host-observed execution time exceeds it is recorded as a BHF-555 timing
@@ -602,6 +609,10 @@ pub(crate) struct TransportFuzzSummary {
     pub coverage_blocks: usize,
     /// Total crash/timeout outcomes seen (before dedup).
     pub crashes: usize,
+    /// Executions whose coverage/evidence collection was incomplete (a post-stop
+    /// readback failure). Non-zero means some coverage is partial, not that the
+    /// run failed — surfaced so partial coverage is never read as complete (#74).
+    pub incomplete_observations: usize,
     /// Distinct finding ids written to `<work_dir>/findings/`.
     pub findings: Vec<String>,
     /// Set when the campaign stopped early on a non-clean run-control condition
@@ -701,6 +712,10 @@ pub(crate) fn run_transport_campaign(
     let mut executions = 0usize;
     let mut corpus_new = 0usize;
     let mut crashes = 0usize;
+    // Executions whose post-stop coverage/evidence collection was incomplete
+    // (#74): surfaced in the summary so partial coverage — on a clean run or a
+    // crash — is never silently presented as complete.
+    let mut incomplete_observations = 0usize;
     let mut finding_ids: Vec<String> = Vec::new();
     // Dedup findings on the same key the on-disk finding signature is built from
     // (rule_id | kind; the transport lane carries no stack frames), so one fault
@@ -727,21 +742,16 @@ pub(crate) fn run_transport_campaign(
         ) {
             break;
         }
-        match run_one_input(
-            session.as_mut(),
-            seed,
-            config.per_input_timeout,
-            &emitter,
-            &mut seen_findings,
-            &mut finding_ids,
-            &mut crashes,
-        )? {
+        match run_one_input(session.as_mut(), seed)? {
             Step::Halt(reason) => {
                 halted = Some(reason);
                 break;
             }
             Step::Ran(outcome, elapsed) => {
                 executions += 1;
+                if outcome.coverage_incomplete.is_some() {
+                    incomplete_observations += 1;
+                }
                 let feedback = fold_coverage(&mut coverage, &outcome.coverage_edges);
                 scheduler.insert_with_feedback(seed.clone(), feedback.to_schedule_feedback());
                 handle_outcome(
@@ -754,15 +764,20 @@ pub(crate) fn run_transport_campaign(
                     &mut finding_ids,
                     &mut crashes,
                 )?;
-                maybe_emit_deadline(
-                    elapsed,
-                    config.deadline,
-                    seed,
-                    &emitter,
-                    &mut seen_findings,
-                    &mut finding_ids,
-                    &mut crashes,
-                )?;
+                // The deadline oracle is for a COMPLETED-but-slow run only: a
+                // crash or an execution timeout already yields its own finding
+                // via handle_outcome, so firing it here too would double-count.
+                if outcome.exit == ExitKind::Ok {
+                    maybe_emit_deadline(
+                        elapsed,
+                        config.deadline,
+                        seed,
+                        &emitter,
+                        &mut seen_findings,
+                        &mut finding_ids,
+                        &mut crashes,
+                    )?;
+                }
             }
         }
     }
@@ -803,21 +818,16 @@ pub(crate) fn run_transport_campaign(
                     Some(result) => result.bytes,
                     None => scheduled.bytes.clone(),
                 };
-                match run_one_input(
-                    session.as_mut(),
-                    &input,
-                    config.per_input_timeout,
-                    &emitter,
-                    &mut seen_findings,
-                    &mut finding_ids,
-                    &mut crashes,
-                )? {
+                match run_one_input(session.as_mut(), &input)? {
                     Step::Halt(reason) => {
                         halted = Some(reason);
                         break 'outer;
                     }
                     Step::Ran(outcome, elapsed) => {
                         executions += 1;
+                        if outcome.coverage_incomplete.is_some() {
+                            incomplete_observations += 1;
+                        }
                         let feedback = fold_coverage(&mut coverage, &outcome.coverage_edges);
                         // Retain a clean input that reached new coverage as a new
                         // corpus seed, feeding its novelty back into the power
@@ -842,15 +852,19 @@ pub(crate) fn run_transport_campaign(
                             &mut finding_ids,
                             &mut crashes,
                         )?;
-                        maybe_emit_deadline(
-                            elapsed,
-                            config.deadline,
-                            &input,
-                            &emitter,
-                            &mut seen_findings,
-                            &mut finding_ids,
-                            &mut crashes,
-                        )?;
+                        // Deadline oracle: completed-but-slow runs only (a crash
+                        // or an execution timeout is already its own finding).
+                        if outcome.exit == ExitKind::Ok {
+                            maybe_emit_deadline(
+                                elapsed,
+                                config.deadline,
+                                &input,
+                                &emitter,
+                                &mut seen_findings,
+                                &mut finding_ids,
+                                &mut crashes,
+                            )?;
+                        }
                     }
                 }
             }
@@ -872,6 +886,7 @@ pub(crate) fn run_transport_campaign(
         coverage_edges: snapshot.edge_bits,
         coverage_blocks: snapshot.breadcrumb_bits,
         crashes,
+        incomplete_observations,
         findings: finding_ids,
         halted,
         elapsed_secs: start.elapsed().as_secs_f64(),
@@ -907,6 +922,15 @@ fn persist_transport_profiles(config: &TransportFuzzConfig, finding_ids: &[Strin
         return;
     }
     let (backend, reset) = backend_and_reset(&config.spec);
+    // Persist the timing contract so `bhf replay` can reproduce a timing finding:
+    // the per-input execution deadline (rebuild the transport with the SAME bound
+    // so an execution-timeout re-times-out) and the response-time deadline (so a
+    // "completed-but-slow" BHF-555 finding is re-evaluated against the same bound,
+    // not silently reported as "no fault reproduced"). `null` when unset (#70/#80).
+    let timing = serde_json::json!({
+        "per_input_timeout_ms": config.per_input_timeout.map(|d| d.as_millis()),
+        "deadline_ms": config.deadline.map(|d| d.as_millis()),
+    });
     let profile = serde_json::json!({
         "schema_version": TRANSPORT_PROFILE_SCHEMA,
         "spec": config.spec,
@@ -914,6 +938,7 @@ fn persist_transport_profiles(config: &TransportFuzzConfig, finding_ids: &[Strin
         "transport_label": config.transport_label,
         "backend": backend,
         "reset_mechanism": reset,
+        "timing": timing,
         "firmware_identity": serde_json::Value::Null,
         "limitations":
             "host-observed timing; firmware/build identity not captured by this backend",
@@ -935,12 +960,18 @@ enum Step {
     Halt(String),
 }
 
-/// Classification of an I/O failure during a run, so a target hang, a lost
-/// transport, and a genuine setup/protocol error are distinct (#70) — none is
-/// ever reported as a clean execution.
+/// Classification of an I/O failure that ESCAPES a run (#70). A genuine
+/// target-execution timeout (a hang) is no longer classified here: the transport
+/// session now surfaces it as a first-class [`ExitKind::Timeout`] outcome, so an
+/// error reaching this point is necessarily a control/setup failure or a lost
+/// link — never a target overrunning its per-input execution deadline.
 enum RunFailure {
-    /// The target did not answer within the per-input bound (a hang).
-    TargetTimeout,
+    /// A read/write timeout on a CONTROL/setup exchange (reset, input injection,
+    /// handshake) or a run with no per-input deadline configured: the transport
+    /// stopped responding. This is NOT the target overrunning its execution
+    /// deadline (that is an `ExitKind::Timeout` outcome), so it halts WITHOUT
+    /// inventing a target-execution timing finding.
+    ControlTimeout,
     /// The transport link dropped mid-exchange.
     LostTransport,
     /// Any other failure (setup / protocol) — propagated, not swallowed.
@@ -951,7 +982,7 @@ fn classify_run_failure(err: &TransportError) -> RunFailure {
     match err {
         TransportError::Io(io) => match io.kind() {
             std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
-                RunFailure::TargetTimeout
+                RunFailure::ControlTimeout
             }
             std::io::ErrorKind::ConnectionReset
             | std::io::ErrorKind::ConnectionAborted
@@ -965,28 +996,21 @@ fn classify_run_failure(err: &TransportError) -> RunFailure {
 }
 
 /// Run one input, measuring its host-observed duration and classifying any I/O
-/// failure (#70). A target-execution timeout preserves the hanging input as a
-/// BHF-555 timing finding before signalling a halt; a lost transport halts
-/// without inventing a finding; any other error propagates.
-#[allow(clippy::too_many_arguments)]
+/// failure that escapes the session (#70). A target-execution timeout (a hang)
+/// is handled inside the session as an [`ExitKind::Timeout`] outcome and flows
+/// back through [`Step::Ran`] → [`handle_outcome`] as a BHF-555 finding; here a
+/// control/setup timeout and a lost transport halt the campaign WITHOUT inventing
+/// a finding, and any other error propagates.
 fn run_one_input(
     session: &mut dyn TargetSession,
     input: &[u8],
-    per_input_timeout: Option<Duration>,
-    emitter: &FindingEmitter,
-    seen: &mut std::collections::HashSet<String>,
-    finding_ids: &mut Vec<String>,
-    crashes: &mut usize,
 ) -> Result<Step, TransportFuzzError> {
     let start = Instant::now();
     match session.run_input(input) {
         Ok(outcome) => Ok(Step::Ran(outcome, start.elapsed())),
         Err(err) => match classify_run_failure(&err) {
-            RunFailure::TargetTimeout => {
-                let bound = per_input_timeout.unwrap_or(DEFAULT_IO_TIMEOUT);
-                let report = crate::transport_fault::timeout_report(bound);
-                emit_report(input, &report, emitter, seen, finding_ids, crashes)?;
-                Ok(Step::Halt(format!("target execution timeout: {err}")))
+            RunFailure::ControlTimeout => {
+                Ok(Step::Halt(format!("transport control timeout: {err}")))
             }
             RunFailure::LostTransport => Ok(Step::Halt(format!("transport lost: {err}"))),
             RunFailure::Other => Err(TransportFuzzError::Transport(err)),
@@ -1041,31 +1065,48 @@ fn handle_outcome(
     *crashes += 1;
 
     // Structured fault-site identity (#75). A backend-attributed faulting address
-    // is a bounded SITE discriminator so two distinct sites of one fault class
-    // are retained as separate candidates, and the target label keeps faults
-    // from different targets from merging on identical relative values. The
-    // address is NOT asserted as a confirmed root cause: candidates per class are
-    // capped, so a varying accessed address cannot split into unbounded findings;
-    // a fault with no attributed site is explicitly "unlocalized".
-    let site = outcome
-        .fault
-        .as_ref()
-        .and_then(|fault| fault.address)
-        .map(|address| format!("{address:#x}"))
-        .unwrap_or_else(|| "unlocalized".to_owned());
+    // is a bounded SITE discriminator so two distinct sites of one fault class are
+    // retained as separate candidates, and the target label keeps faults from
+    // different targets from merging on identical relative values. The address is
+    // a backend-reported access/stop address, NOT a verified instruction site, and
+    // is never asserted as a confirmed root cause: candidates per class are capped.
+    //
+    // An UNLOCALIZED fault (no attributed address — e.g. a full-system signal or a
+    // guest fault-status fault) must NOT collapse every later testcase into one
+    // candidate (the #75 review): give each occurrence a distinct bounded slot
+    // (`unlocalized#N` up to the cap) so later distinct faults keep their testcase,
+    // and mark the grouping explicitly uncertain since they cannot be told apart.
     let class_key = format!("{transport_label}|{}|{}", report.rule_id, report.kind);
+    let class_count = *class_counts.get(&class_key).unwrap_or(&0);
+    let (site, localized) = match outcome.fault.as_ref().and_then(|fault| fault.address) {
+        Some(address) => (format!("{address:#x}"), true),
+        None => (format!("unlocalized#{class_count}"), false),
+    };
     let identity_key = format!("{class_key}|{site}");
 
-    // Same site -> predictable dedup (one candidate).
+    // A localized site dedups on exact repeat; an unlocalized slot is distinct per
+    // occurrence, so later distinct faults of the same kind are not silently lost.
     if seen.contains(&identity_key) {
         return Ok(());
     }
     // Bounded candidate evidence: once the class is saturated, stop splitting.
-    let class_count = class_counts.entry(class_key).or_insert(0);
-    if *class_count >= MAX_CANDIDATES_PER_CLASS {
+    let count = class_counts.entry(class_key).or_insert(0);
+    if *count >= MAX_CANDIDATES_PER_CLASS {
         return Ok(());
     }
 
+    if !localized {
+        report.message.push_str(
+            " [unlocalized fault site: no backend-attributed address — grouping uncertain]",
+        );
+    }
+    // Carry the collection diagnostic, when present, into the finding so an
+    // incomplete observation is not silently lost (#74 review).
+    if let Some(diag) = &outcome.coverage_incomplete {
+        report
+            .message
+            .push_str(&format!(" [coverage incomplete: {diag}]"));
+    }
     // Fold the target + site into the persisted signature (via a synthetic frame)
     // so the on-disk signature/cluster identity AGREES with this campaign-level
     // dedup — removing the in-memory filter alone would not fix the empty-stack
@@ -1078,7 +1119,7 @@ fn handle_outcome(
     let id = emitter.emit_sanitizer_crash(input, &report)?;
     finding_ids.push(id.0);
     seen.insert(identity_key);
-    *class_count += 1;
+    *count += 1;
     Ok(())
 }
 
@@ -1725,11 +1766,13 @@ mod tests {
     #[test]
     fn classify_run_failure_distinguishes_timeout_lost_transport_and_other() {
         use std::io::{Error, ErrorKind};
-        // A target hang (read timeout) is a TargetTimeout...
+        // A read timeout that ESCAPES the session is a control/setup timeout — a
+        // genuine target-execution hang is surfaced by the session as an
+        // ExitKind::Timeout outcome, never routed through here.
         for kind in [ErrorKind::WouldBlock, ErrorKind::TimedOut] {
             assert!(matches!(
                 classify_run_failure(&TransportError::Io(Error::from(kind))),
-                RunFailure::TargetTimeout
+                RunFailure::ControlTimeout
             ));
         }
         // ...a dropped link is a LostTransport...
@@ -1956,6 +1999,86 @@ mod tests {
             summary.findings.len(),
             MAX_CANDIDATES_PER_CLASS,
             "distinct candidates per class are bounded: {summary:?}"
+        );
+
+        std::fs::remove_dir_all(&work_dir).ok();
+    }
+
+    #[test]
+    fn unlocalized_faults_retain_bounded_distinct_candidates() {
+        // A fault with NO backend-attributed address (an unlocalized fault — e.g.
+        // a full-system stop or a bare crash) must NOT collapse every later
+        // testcase into one candidate (#75 review). Two such faults of one class
+        // are each retained as a distinct bounded candidate (the later testcase is
+        // not silently dropped), their persisted signatures differ, and each
+        // finding carries explicit grouping uncertainty. The agent wire always
+        // carries an address, so this exercises handle_outcome directly with the
+        // address-less outcome the gdb/full-system lanes actually produce.
+        use target_transport::RunOutcome;
+        let work_dir = tmp_work_dir("unlocalized");
+        let emitter = FindingEmitter::with_metadata(
+            work_dir.clone(),
+            "H-transport".to_owned(),
+            "transport".to_owned(),
+            "mock".to_owned(),
+        );
+        let mut seen = std::collections::HashSet::new();
+        let mut class_counts = std::collections::HashMap::new();
+        let mut finding_ids: Vec<String> = Vec::new();
+        let mut crashes = 0usize;
+        let bare_crash = || RunOutcome {
+            exit: ExitKind::Crash,
+            coverage_edges: Vec::new(),
+            fault: None,
+            stdout: Vec::new(),
+            coverage_incomplete: None,
+        };
+        for input in [b"a".as_slice(), b"b".as_slice()] {
+            handle_outcome(
+                &bare_crash(),
+                input,
+                "mock",
+                &emitter,
+                &mut seen,
+                &mut class_counts,
+                &mut finding_ids,
+                &mut crashes,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            finding_ids.len(),
+            2,
+            "two unlocalized faults of one class are retained, not collapsed"
+        );
+        assert_eq!(crashes, 2);
+
+        let record = |id: &str| -> serde_json::Value {
+            serde_json::from_slice(
+                &std::fs::read(
+                    work_dir
+                        .join("results")
+                        .join("findings")
+                        .join(id)
+                        .join("finding.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let first = record(&finding_ids[0]);
+        let second = record(&finding_ids[1]);
+        assert_ne!(
+            first["signature"].as_str().unwrap(),
+            second["signature"].as_str().unwrap(),
+            "distinct unlocalized candidates must have distinct persisted signatures"
+        );
+        assert!(
+            first["exception"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("grouping uncertain"),
+            "an unlocalized finding must carry explicit grouping uncertainty: {first}"
         );
 
         std::fs::remove_dir_all(&work_dir).ok();

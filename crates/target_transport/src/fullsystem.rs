@@ -74,11 +74,12 @@
 //! are already in place, so the follow-up is additive.
 
 use crate::error::{Result, TransportError};
-use crate::gdb::{read_coverage_ring, GdbClient, GdbMemoryMap};
+use crate::gdb::{read_coverage_ring, ContStop, GdbClient, GdbMemoryMap};
 use crate::outcome::{ExitKind, Fault, FaultKind, RunOutcome};
 use crate::transport::{TargetSession, TargetTransport};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
+use std::time::{Duration, Instant};
 
 /// Bounds on inbound QMP reads, enforced before any large allocation or an
 /// unbounded wait.
@@ -389,6 +390,7 @@ pub struct FullSystemTransport<FQ, FG> {
     snapshot_tag: String,
     harness_breakpoint: Option<(u64, u32)>,
     fault_status: Option<GuestFaultStatus>,
+    exec_deadline: Option<Duration>,
 }
 
 impl<FQ, FG> FullSystemTransport<FQ, FG> {
@@ -409,7 +411,18 @@ impl<FQ, FG> FullSystemTransport<FQ, FG> {
             snapshot_tag,
             harness_breakpoint: None,
             fault_status: None,
+            exec_deadline: None,
         })
+    }
+
+    /// Set the absolute per-input execution deadline (#70). A run whose `continue`
+    /// does not reach the harness-completion stop within this wall-clock bound is
+    /// a target-execution timeout (a hang), surfaced as an [`ExitKind::Timeout`]
+    /// outcome rather than blocking on the gdbstub read timeout alone. `None` (the
+    /// default) relies on the connection read timeout and the packet/byte caps.
+    pub fn with_exec_deadline(mut self, deadline: Option<Duration>) -> Self {
+        self.exec_deadline = deadline;
+        self
     }
 
     /// Plant a gdbstub software breakpoint at `address` (RSP `kind`, e.g. `2` for
@@ -474,6 +487,7 @@ where
             map: self.map,
             snapshot_tag: self.snapshot_tag.clone(),
             fault_status: self.fault_status.clone(),
+            exec_deadline: self.exec_deadline,
         }))
     }
 }
@@ -486,6 +500,7 @@ pub struct FullSystemSession<CQ, CG> {
     map: GdbMemoryMap,
     snapshot_tag: String,
     fault_status: Option<GuestFaultStatus>,
+    exec_deadline: Option<Duration>,
 }
 
 impl<CQ: Read + Write, CG: Read + Write> TargetSession for FullSystemSession<CQ, CG> {
@@ -497,9 +512,38 @@ impl<CQ: Read + Write, CG: Read + Write> TargetSession for FullSystemSession<CQ,
         self.qmp.loadvm(&self.snapshot_tag)?;
 
         // Deliver the input into the guest staging region, then run to the
-        // harness end breakpoint and collect the stop reply.
+        // harness end breakpoint and collect the stop reply. The run control is
+        // bounded by the absolute per-input deadline (#70): a guest that never
+        // reaches the completion stop is a first-class Timeout outcome (a hang)
+        // with a structured fault, distinct from a lost link — not an unbounded
+        // wait and not a silent clean pass. Coverage is not read from a hung guest.
         self.gdb.write_memory(self.map.input_address, input)?;
-        let (stop, stdout) = self.gdb.cont()?;
+        let deadline = self.exec_deadline.map(|budget| Instant::now() + budget);
+        let (stop, stdout) = match self.gdb.cont_until(deadline)? {
+            (ContStop::Stopped(stop), stdout) => (stop, stdout),
+            (ContStop::DeadlineExceeded, stdout) => {
+                let detail = match self.exec_deadline {
+                    Some(budget) => format!(
+                        "no completion stop within the per-input execution deadline {}ms",
+                        budget.as_millis()
+                    ),
+                    None => "no completion stop within the per-input execution deadline".to_owned(),
+                };
+                return Ok(RunOutcome {
+                    exit: ExitKind::Timeout,
+                    coverage_edges: Vec::new(),
+                    fault: Some(Fault {
+                        kind: FaultKind::Timeout,
+                        address: None,
+                        detail,
+                    }),
+                    stdout,
+                    coverage_incomplete: Some(
+                        "guest hung: coverage ring not read after an execution timeout".to_owned(),
+                    ),
+                });
+            }
+        };
 
         // Classify the stop reply FIRST (#74: a later readback failure must not
         // erase an already-observed crash).
@@ -951,6 +995,27 @@ mod tests {
         assert!(GuestFaultStatus::new(0x6000, 0, 0).is_err());
         assert!(GuestFaultStatus::new(0x6000, 9, 0).is_err());
         assert!(GuestFaultStatus::new(0x6000, 4, 0).is_ok());
+    }
+
+    #[test]
+    fn run_input_reports_timeout_when_execution_deadline_elapses() {
+        // A 1ns per-input deadline elapses before the completion stop can be read:
+        // the session reports a first-class Timeout outcome (a hang) with a Timeout
+        // fault — not a crash, not a propagated error — and does not read coverage
+        // from the hung guest (#70).
+        let (transport, _qmp_log, _gdb_log) = wired_transport(&[7], b"W00".to_vec(), 64);
+        let transport = transport.with_exec_deadline(Some(Duration::from_nanos(1)));
+        let mut session = transport.arm().unwrap();
+        let outcome = session.run_input(b"hang").unwrap();
+        assert_eq!(outcome.exit, ExitKind::Timeout);
+        assert_eq!(
+            outcome.fault.expect("a hang carries a Timeout fault").kind,
+            FaultKind::Timeout
+        );
+        assert!(
+            outcome.coverage_incomplete.is_some(),
+            "a hung guest's coverage ring is not presented as complete"
+        );
     }
 
     // ------------------------------------------------------------------

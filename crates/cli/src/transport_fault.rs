@@ -183,22 +183,6 @@ pub fn deadline_report(
     )
 }
 
-/// Build a BHF-555 timing finding for an input that did not answer within the
-/// configured per-input bound — a target execution timeout (hang), recorded
-/// before the campaign stops so the triggering input is preserved (#70). This
-/// is a distinct, non-clean outcome from both a clean run and a lost transport.
-pub fn timeout_report(bound: std::time::Duration) -> corpus::SanitizerReport {
-    crash_report(
-        "BHF-555",
-        "transport-execution-timeout".to_owned(),
-        format!(
-            "target transport did not answer within the configured per-input bound {}ms — \
-             a target execution timeout (hang)",
-            bound.as_millis()
-        ),
-    )
-}
-
 /// Turn a transport [`RunOutcome`] into a replayable finding, or `None` for a
 /// clean run.
 ///

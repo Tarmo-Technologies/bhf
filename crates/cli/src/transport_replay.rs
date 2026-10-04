@@ -15,8 +15,17 @@
 
 use crate::transport_fuzz::{TransportPlan, TRANSPORT_PROFILE_FILE};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use target_transport::ExitKind;
+
+/// The `exception.name` a BHF-555 "completed-but-slow" deadline finding carries
+/// (the upper-snake form of the `transport-deadline-exceeded` crash class). Such
+/// a finding is matched by a TIMING predicate on replay, not a fault identity.
+const DEADLINE_EXCEPTION_NAME: &str = "TRANSPORT_DEADLINE_EXCEEDED";
+
+/// Default per-input bound used to rebuild a transport whose profile predates the
+/// persisted `timing` block (older findings carry no recorded deadline).
+const REPLAY_DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A transport finding is one that carries a `transport_profile.json`.
 pub(crate) fn is_transport_finding(finding_dir: &Path) -> bool {
@@ -54,6 +63,21 @@ pub(crate) fn replay_transport_finding(finding_dir: &Path, endpoint: Option<&str
         .and_then(|v| v.as_str())
         .map(ToOwned::to_owned);
 
+    // The timing contract recorded with the finding (#70/#80): the per-input
+    // execution deadline is reused to rebuild the transport so an execution
+    // timeout re-times-out identically, and the response-time deadline is the
+    // predicate a "completed-but-slow" BHF-555 finding is re-evaluated against.
+    let timing = profile.get("timing");
+    let per_input_timeout = timing
+        .and_then(|t| t.get("per_input_timeout_ms"))
+        .and_then(serde_json::Value::as_u64)
+        .map(Duration::from_millis)
+        .unwrap_or(REPLAY_DEFAULT_TIMEOUT);
+    let deadline = timing
+        .and_then(|t| t.get("deadline_ms"))
+        .and_then(serde_json::Value::as_u64)
+        .map(Duration::from_millis);
+
     // Relocate the endpoint if the operator supplied one (the recorded endpoint
     // is often gone or unreachable from the replay host).
     let spec = match relocate_endpoint(recorded_spec, endpoint) {
@@ -89,7 +113,7 @@ pub(crate) fn replay_transport_finding(finding_dir: &Path, endpoint: Option<&str
             return 1;
         }
     };
-    let transport = match plan.into_transport(Some(Duration::from_secs(10))) {
+    let transport = match plan.into_transport(Some(per_input_timeout)) {
         Ok(transport) => transport,
         Err(error) => {
             bhfeprintln!("rebuild transport from profile: {error}");
@@ -106,6 +130,7 @@ pub(crate) fn replay_transport_finding(finding_dir: &Path, endpoint: Option<&str
             return 1;
         }
     };
+    let started = Instant::now();
     let outcome = match session.run_input(&input) {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -113,6 +138,33 @@ pub(crate) fn replay_transport_finding(finding_dir: &Path, endpoint: Option<&str
             return 1;
         }
     };
+    let elapsed = started.elapsed();
+
+    // A "completed-but-slow" deadline finding (BHF-555, emitted by the deadline
+    // oracle on an Ok run) reproduces no fault — so a fault-identity check would
+    // always report "no fault reproduced". Match it by the TIMING predicate it was
+    // found with instead: the replay must also exceed the recorded deadline.
+    if recorded_exception_name(finding_dir).as_deref() == Some(DEADLINE_EXCEPTION_NAME) {
+        let Some(deadline) = deadline else {
+            bhfeprintln!(
+                "deadline finding {} carries no recorded deadline in its transport profile; \
+                 cannot evaluate the timing predicate",
+                finding_dir.display()
+            );
+            return 1;
+        };
+        if elapsed > deadline {
+            let _ = corpus::finding::touch_last_seen(finding_dir, "replay (transport timing)");
+            println!("MATCH");
+            return 0;
+        }
+        bhfeprintln!(
+            "MISMATCH recorded=host-observed>{}ms actual={}ms (within the deadline)",
+            deadline.as_millis(),
+            elapsed.as_millis()
+        );
+        return 3;
+    }
 
     let actual = replay_identity(&outcome);
     match actual {
@@ -166,8 +218,36 @@ fn recorded_identity(finding_dir: &Path) -> Result<FaultIdentity, String> {
                 .filter_map(|f| f.get("function").and_then(|v| v.as_str()))
                 .find_map(parse_site_frame)
         })
+        .map(|site| normalize_site(&site))
         .unwrap_or_else(|| "unlocalized".to_owned());
     Ok(FaultIdentity { rule_id, site })
+}
+
+/// Read the recorded finding's `exception.name` (the upper-snake crash class),
+/// used to recognize a timing finding that is matched by a predicate rather than
+/// a fault identity. `None` when the finding is unreadable or carries no name.
+fn recorded_exception_name(finding_dir: &Path) -> Option<String> {
+    let value: serde_json::Value = std::fs::read(finding_dir.join("finding.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())?;
+    value
+        .get("exception")
+        .and_then(|e| e.get("name"))
+        .and_then(|v| v.as_str())
+        .map(ToOwned::to_owned)
+}
+
+/// Collapse an unlocalized fault site to its bare form. The emitter indexes
+/// unlocalized sites (`unlocalized#N`) only to keep distinct same-class
+/// candidates apart WITHIN a campaign (#75); that index is not a reproducible
+/// property, so a replay's bare `unlocalized` must match a recorded
+/// `unlocalized#N` of the same rule. A real attributed address is left intact.
+fn normalize_site(site: &str) -> String {
+    if site.starts_with("unlocalized") {
+        "unlocalized".to_owned()
+    } else {
+        site.to_owned()
+    }
 }
 
 /// Extract `SITE` from a synthetic `<on-target fault <label> @ SITE>` frame.
@@ -193,7 +273,7 @@ fn replay_identity(outcome: &target_transport::RunOutcome) -> Option<FaultIdenti
         .unwrap_or_else(|| "unlocalized".to_owned());
     Some(FaultIdentity {
         rule_id: report.rule_id.to_owned(),
-        site,
+        site: normalize_site(&site),
     })
 }
 
@@ -245,6 +325,52 @@ mod tests {
         std::fs::write(dir.join("testcase.bin"), b"payload").unwrap();
     }
 
+    /// Write a profile carrying a `timing` block (per-input + response deadline),
+    /// in milliseconds (`None` -> JSON null, as an unset bound).
+    fn write_timing_profile(
+        dir: &Path,
+        spec: &str,
+        per_input_ms: Option<u64>,
+        deadline_ms: Option<u64>,
+    ) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join(TRANSPORT_PROFILE_FILE),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": "bhf.transport-profile.v1",
+                "spec": spec,
+                "coverage_map": serde_json::Value::Null,
+                "transport_label": spec,
+                "backend": "agent",
+                "reset_mechanism": "agent-protocol reset",
+                "timing": {
+                    "per_input_timeout_ms": per_input_ms,
+                    "deadline_ms": deadline_ms,
+                },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("testcase.bin"), b"payload").unwrap();
+    }
+
+    /// A completed-but-slow BHF-555 deadline finding (the deadline oracle's shape:
+    /// a timing class, no reproduced fault).
+    fn write_deadline_finding(dir: &Path) {
+        std::fs::write(
+            dir.join("finding.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "rule_id": "BHF-555",
+                "exception": {
+                    "name": DEADLINE_EXCEPTION_NAME,
+                    "stack": [],
+                },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
     /// A transport finding with a MemoryProtection fault at the given site.
     fn write_finding(dir: &Path, rule_id: &str, site: &str) {
         std::fs::write(
@@ -263,6 +389,7 @@ mod tests {
 
     /// Serve one scripted MockAgent connection on a fresh loopback port, logging
     /// the inputs it received. Returns (port, received-log, join-handle).
+    #[allow(clippy::type_complexity)]
     fn spawn_scripted_agent(
         response: ScriptedResponse,
     ) -> (u16, Arc<Mutex<Vec<Vec<u8>>>>, std::thread::JoinHandle<()>) {
@@ -357,6 +484,96 @@ mod tests {
             "an unreachable endpoint is an error, never a MATCH"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn deadline_finding_matches_when_replay_also_exceeds_the_deadline() {
+        // A completed-but-slow BHF-555 finding reproduces NO fault, so a
+        // fault-identity check would always report "no fault reproduced" — a false
+        // MISMATCH. It must instead be matched by the recorded timing predicate:
+        // host-observed elapsed > deadline. A 0ms recorded deadline is exceeded by
+        // any real agent round-trip, so the clean replay MATCHes (#70 replay).
+        let (port, received, handle) = spawn_scripted_agent(ScriptedResponse::ok(vec![1, 2]));
+        let dir = temp_dir("deadline-match");
+        write_timing_profile(
+            &dir,
+            &format!("agent:tcp:127.0.0.1:{port}"),
+            Some(1000),
+            Some(0),
+        );
+        write_deadline_finding(&dir);
+
+        let code = replay_transport_finding(&dir, None);
+        handle.join().unwrap();
+
+        assert_eq!(
+            code, 0,
+            "a replay that also exceeds the deadline is a MATCH"
+        );
+        assert_eq!(
+            received.lock().unwrap().len(),
+            1,
+            "the timing finding was re-driven THROUGH the agent, not host-executed"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn deadline_finding_without_a_recorded_deadline_is_an_actionable_error() {
+        // A deadline finding whose profile carries no deadline cannot have its
+        // timing predicate evaluated: that is an actionable error (exit 1), never
+        // a silent MATCH or a fault-identity MISMATCH.
+        let (port, _received, handle) = spawn_scripted_agent(ScriptedResponse::ok(vec![1]));
+        let dir = temp_dir("deadline-missing");
+        write_timing_profile(
+            &dir,
+            &format!("agent:tcp:127.0.0.1:{port}"),
+            Some(1000),
+            None,
+        );
+        write_deadline_finding(&dir);
+
+        let code = replay_transport_finding(&dir, None);
+        handle.join().unwrap();
+
+        assert_eq!(
+            code, 1,
+            "no recorded deadline -> cannot evaluate the predicate"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn replay_identity_of_a_timeout_is_bhf555_unlocalized() {
+        // An execution-timeout finding (rule BHF-555, unlocalized site) must
+        // reproduce as a BHF-555 unlocalized identity when the target hangs again,
+        // so it matches the recorded finding through the normal identity path once
+        // the transport is rebuilt with the recorded per-input deadline (#70).
+        use target_transport::{Fault, FaultKind, RunOutcome};
+        let outcome = RunOutcome {
+            exit: ExitKind::Timeout,
+            coverage_edges: Vec::new(),
+            fault: Some(Fault {
+                kind: FaultKind::Timeout,
+                address: None,
+                detail: "hang".to_owned(),
+            }),
+            stdout: Vec::new(),
+            coverage_incomplete: Some("hung".to_owned()),
+        };
+        let id = replay_identity(&outcome).expect("a timeout reproduces a BHF-555 identity");
+        assert_eq!(id.rule_id, "BHF-555");
+        assert_eq!(id.site, "unlocalized");
+    }
+
+    #[test]
+    fn normalize_site_collapses_unlocalized_index_but_keeps_addresses() {
+        // The `#N` on an unlocalized site is a within-campaign dedup index, not a
+        // reproducible property, so it must normalize away for replay matching; a
+        // real attributed address is preserved exactly.
+        assert_eq!(normalize_site("unlocalized#3"), "unlocalized");
+        assert_eq!(normalize_site("unlocalized"), "unlocalized");
+        assert_eq!(normalize_site("0x20004000"), "0x20004000");
     }
 
     #[test]
