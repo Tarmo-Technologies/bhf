@@ -181,6 +181,19 @@ impl HarnessRunner {
     }
 
     pub fn command_for_events(&self, events_path: &Path) -> Result<Command, ReplayError> {
+        self.command_wrapped(events_path)
+    }
+
+    /// Build a `Command` that launches the harness under the configured sandbox
+    /// + qemu-user prefix, with `io_file`'s directory bound into the sandbox so
+    /// an input/events file there is reachable. It does NOT append `io_file` as
+    /// an argv — the caller supplies the input per the harness protocol (an Ada
+    /// events file via env, a libFuzzer testcase appended as argv, or AFL input
+    /// piped to stdin). Resolving the sandbox here means a requested strict
+    /// sandbox that is unavailable is an early error, never a silent bypass — so
+    /// the C/C++ replay paths honor `--qemu-user`/sandbox exactly like the framed
+    /// path instead of spawning a bare `Command::new(harness)` (#81).
+    pub fn command_wrapped(&self, io_file: &Path) -> Result<Command, ReplayError> {
         let sandbox = self.sandbox.resolve()?;
         if let Some(qemu_user) = &self.qemu_user {
             Ok(wrap_command(
@@ -188,7 +201,7 @@ impl HarnessRunner {
                 &qemu_user.program,
                 qemu_user.args.iter().map(String::as_str),
                 self.harness_path.as_path(),
-                events_path,
+                io_file,
                 &self.extra_ro_binds,
                 &self.extra_rw_binds,
             ))
@@ -198,7 +211,7 @@ impl HarnessRunner {
                 &self.harness_path,
                 std::iter::empty::<&str>(),
                 self.harness_path.as_path(),
-                events_path,
+                io_file,
                 &self.extra_ro_binds,
                 &self.extra_rw_binds,
             ))

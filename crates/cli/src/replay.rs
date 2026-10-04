@@ -2,7 +2,24 @@
 
 use crate::finding_arg::resolve_finding_arg;
 use crate::runner::{detect_harness_engine, harness_runner, HarnessEngine, SandboxModeArg};
+use replay_min::HarnessRunner;
 use std::path::{Path, PathBuf};
+
+/// A short, truthful description of the backend a C/C++ replay actually used, so
+/// a reproduced finding records whether it ran under qemu-user and/or a sandbox
+/// rather than leaving that implicit (#81).
+fn replay_backend(runner: &HarnessRunner) -> String {
+    let mut parts = vec![if runner.qemu_prefix().is_some() {
+        "qemu-user".to_owned()
+    } else {
+        "native".to_owned()
+    }];
+    let sandbox = runner.sandbox_metadata();
+    if sandbox.mode != "none" {
+        parts.push(format!("sandbox={}", sandbox.mode));
+    }
+    format!("replay ({})", parts.join(", "))
+}
 
 #[derive(Debug, clap::Args)]
 pub struct ReplayArgs {
@@ -81,15 +98,11 @@ pub fn run(args: ReplayArgs) -> i32 {
     // that invokes the binary with the recorded testcase as argv[1]
     // and matches the resulting sanitizer rule_id against the
     // finding's recorded rule_id. AFL is still tracked by #291.
-    match detect_harness_engine(&harness) {
-        HarnessEngine::CAfl => {
-            return replay_c_afl(&finding_dir, &harness);
-        }
-        HarnessEngine::CLibFuzzer => {
-            return replay_c_libfuzzer(&finding_dir, &harness);
-        }
-        HarnessEngine::AdaStdin => {}
-    }
+    // Build the runner ONCE, before dispatching by engine, so every replay path
+    // — Ada framed, C libFuzzer, C AFL — honors --qemu-user / sandbox. The C
+    // paths used to `return` here with a bare Command::new(harness), silently
+    // bypassing the requested runner (#81).
+    let engine = detect_harness_engine(&harness);
     let runner = harness_runner(
         harness,
         args.qemu_user,
@@ -98,9 +111,14 @@ pub fn run(args: ReplayArgs) -> i32 {
         args.sandbox_tool,
         args.sandbox_strict,
     );
+    match engine {
+        HarnessEngine::CAfl => return replay_c_afl(&finding_dir, &runner),
+        HarnessEngine::CLibFuzzer => return replay_c_libfuzzer(&finding_dir, &runner),
+        HarnessEngine::AdaStdin => {}
+    }
     match replay_min::replay_with_runner(&finding_dir, &runner) {
         Ok(replay_min::ReplayResult::Match) => {
-            let _ = corpus::finding::touch_last_seen(&finding_dir, "replay");
+            let _ = corpus::finding::touch_last_seen(&finding_dir, &replay_backend(&runner));
             println!("MATCH");
             0
         }
@@ -216,12 +234,13 @@ fn harness_work_roots(finding_dir: &Path) -> Vec<PathBuf> {
 /// read from \`__AFL_FUZZ_TESTCASE_BUF\` which our template falls back
 /// to stdin via \`bhf_afl_read_stdin\`). Same MATCH/MISMATCH/error
 /// exit codes as the libFuzzer path.
-fn replay_c_afl(finding_dir: &Path, harness: &Path) -> i32 {
+fn replay_c_afl(finding_dir: &Path, runner: &HarnessRunner) -> i32 {
     use std::fs;
     use std::io::Write;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     use std::time::{Duration, Instant};
 
+    let harness = runner.harness_path();
     let testcase_path = finding_dir.join("testcase.bin");
     let finding_path = finding_dir.join("finding.json");
     let recorded_rule = match fs::read(&finding_path).and_then(|bytes| {
@@ -251,7 +270,15 @@ fn replay_c_afl(finding_dir: &Path, harness: &Path) -> i32 {
         }
     };
 
-    let mut stdin_replay = Command::new(harness);
+    // Route through the runner so --qemu-user / sandbox are applied (or a strict
+    // sandbox is rejected early), then keep AFL's stdin input protocol.
+    let mut stdin_replay = match runner.command_wrapped(&testcase_path) {
+        Ok(cmd) => cmd,
+        Err(error) => {
+            bhfeprintln!("replay runner: {error}");
+            return 1;
+        }
+    };
     stdin_replay
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -296,7 +323,7 @@ fn replay_c_afl(finding_dir: &Path, harness: &Path) -> i32 {
         .or_else(|| crate::fatal_signal::rule_id(&output.status, &stderr));
     match actual_rule {
         Some(rule) if rule == recorded_rule => {
-            let _ = corpus::finding::touch_last_seen(finding_dir, "replay");
+            let _ = corpus::finding::touch_last_seen(finding_dir, &replay_backend(runner));
             println!("MATCH");
             0
         }
@@ -315,11 +342,12 @@ fn replay_c_afl(finding_dir: &Path, harness: &Path) -> i32 {
 /// recorded testcase as argv[1]. Compare the resulting sanitizer
 /// rule_id against finding.json's `rule_id`. Exit codes mirror the
 /// Ada path: 0 = MATCH, 3 = MISMATCH, 1 = error.
-fn replay_c_libfuzzer(finding_dir: &Path, harness: &Path) -> i32 {
+fn replay_c_libfuzzer(finding_dir: &Path, runner: &HarnessRunner) -> i32 {
     use std::fs;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     use std::time::{Duration, Instant};
 
+    let harness = runner.harness_path();
     let testcase_path = finding_dir.join("testcase.bin");
     let finding_path = finding_dir.join("finding.json");
     let parsed = match fs::read(&finding_path).and_then(|bytes| {
@@ -362,20 +390,30 @@ fn replay_c_libfuzzer(finding_dir: &Path, harness: &Path) -> i32 {
         })
         .unwrap_or_default();
 
-    let mut cmd = Command::new(harness);
+    // Route through the runner so --qemu-user / sandbox are applied (or a strict
+    // sandbox is rejected early), then keep libFuzzer's argv testcase protocol.
+    let mut cmd = match runner.command_wrapped(&testcase_path) {
+        Ok(cmd) => cmd,
+        Err(error) => {
+            bhfeprintln!("replay runner: {error}");
+            return 1;
+        }
+    };
     cmd.arg(&testcase_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     // Recreate the runtime environment the auto loop used when this
-    // finding was first observed: LD_PRELOAD the runtrace shim,
-    // set the same BHF_RUNTRACE_MODE, and any env vars the
-    // pre-injection phase recorded. Use Command::env (not
-    // std::env::set_var) so we don't pollute the parent process
-    // env between replays in a single `cargo run` session.
-    let shim = crate::auto::shim_path::locate();
-    if let Some(s) = &shim {
-        cmd.env("LD_PRELOAD", crate::auto::shim_path::ld_preload_value(s));
+    // finding was first observed: the same BHF_RUNTRACE_MODE and any env vars
+    // the pre-injection phase recorded. Use Command::env (not
+    // std::env::set_var) so we don't pollute the parent process env between
+    // replays in a single `cargo run` session. The host LD_PRELOAD runtrace
+    // shim is a HOST .so, so it is injected only for a NATIVE replay — never
+    // forced into a foreign process running under qemu-user (#81).
+    if runner.qemu_prefix().is_none() {
+        if let Some(s) = crate::auto::shim_path::locate() {
+            cmd.env("LD_PRELOAD", crate::auto::shim_path::ld_preload_value(&s));
+        }
     }
     cmd.env("BHF_RUNTRACE_MODE", pass);
     for (k, v) in &env_injected {
@@ -419,7 +457,7 @@ fn replay_c_libfuzzer(finding_dir: &Path, harness: &Path) -> i32 {
         .or_else(|| crate::fatal_signal::rule_id(&output.status, &stderr));
     match actual_rule {
         Some(rule) if rule == recorded_rule => {
-            let _ = corpus::finding::touch_last_seen(finding_dir, "replay");
+            let _ = corpus::finding::touch_last_seen(finding_dir, &replay_backend(runner));
             println!("MATCH");
             0
         }
@@ -479,6 +517,7 @@ fn transient_spawn_failure(error: &std::io::Error) -> bool {
 #[cfg(all(test, unix))]
 mod silent_abort_tests {
     use super::replay_c_libfuzzer;
+    use replay_min::HarnessRunner;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
@@ -497,7 +536,10 @@ mod silent_abort_tests {
         permissions.set_mode(0o755);
         fs::set_permissions(&harness, permissions).expect("chmod");
 
-        assert_eq!(replay_c_libfuzzer(&finding, &harness), 0);
+        assert_eq!(
+            replay_c_libfuzzer(&finding, &HarnessRunner::direct(harness.clone())),
+            0
+        );
     }
 
     #[test]
@@ -518,7 +560,10 @@ mod silent_abort_tests {
         permissions.set_mode(0o755);
         fs::set_permissions(&harness, permissions).expect("chmod");
 
-        assert_eq!(replay_c_libfuzzer(&finding, &harness), 3);
+        assert_eq!(
+            replay_c_libfuzzer(&finding, &HarnessRunner::direct(harness.clone())),
+            3
+        );
     }
 }
 
