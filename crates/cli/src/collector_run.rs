@@ -309,9 +309,24 @@ pub struct CollectorRunParams<'a> {
     pub launch: Option<ReplayLauncher<'a>>,
 }
 
-/// Spawns the retained replay target and returns the running child (input already
-/// delivered). Called by the host after the readiness ack.
-pub type ReplayLauncher<'a> = Box<dyn Fn() -> anyhow::Result<std::process::Child> + 'a>;
+/// Spawns the retained replay target and returns it [`LaunchedReplay`]. Called by
+/// the host after the readiness ack. The launcher returns IMMEDIATELY: any stdin
+/// input is delivered on a background thread, so a target that does not drain
+/// stdin cannot block the supervising thread before its bounded wait begins (#76
+/// re-review).
+pub type ReplayLauncher<'a> = Box<dyn Fn() -> anyhow::Result<LaunchedReplay> + 'a>;
+
+/// A launched replay target plus its background stdin-delivery thread (if any).
+pub struct LaunchedReplay {
+    /// The running target. The supervisor bounded-waits and reaps it.
+    pub child: std::process::Child,
+    /// Joins the thread writing the retained input to the target's stdin, so the
+    /// supervisor can reap it after the target exits or is killed (the closed pipe
+    /// unblocks any pending write). `None` for non-stdin input modes. A benign
+    /// `BrokenPipe` here is expected when the target finishes (crashes/exits)
+    /// before draining all input — that is the target's behavior, not a failure.
+    pub delivery: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+}
 
 /// One collector-sourced semantic finding ready to be written.
 #[derive(Debug, Clone)]
@@ -614,8 +629,12 @@ impl ResolvedCollector {
         }
 
         // 2. Launch the retained target UNDER the ready observer, record its PID.
-        let mut target = match (launch)() {
-            Ok(child) => child,
+        //    The launcher returns IMMEDIATELY (stdin is delivered on a background
+        //    thread), so the whole launch/delivery/wait lifecycle below runs under
+        //    the bounded deadline rather than blocking on an unbounded stdin write
+        //    that a target which never drains stdin could stall forever (#76).
+        let launched = match (launch)() {
+            Ok(launched) => launched,
             Err(error) => {
                 // Killing the sidecar PROCESS never stops an ETW session it owns
                 // (that is the sidecar's own teardown) — we only ever kill it, we
@@ -625,14 +644,33 @@ impl ResolvedCollector {
                 return Err(error.context("launch the replay target under the collector"));
             }
         };
+        let mut target = launched.child;
+        let delivery = launched.delivery;
         let replayed_pid = target.id();
 
         // 3. Hand the real PID to the observer so it attributes to our launched
         //    process (a system-wide tracer may instead observe the PID directly).
         let _ = std::fs::write(&pid_path, replayed_pid.to_string());
 
-        // 4. Bounded-wait the target to finish, then hold for the post-exit window.
-        let _ = wait_child_until(&mut target, Instant::now() + REPLAY_TARGET_TIMEOUT);
+        // 4. Bounded-wait the target. A target that does NOT exit within the bound —
+        //    e.g. one that never drains the delivered input and hangs — is killed
+        //    and reaped here; the sidecar is reaped too, and the run degrades to
+        //    not-observed rather than being attributed an incompletely-delivered
+        //    replay. Then reap the stdin-delivery thread (the target's exit/kill
+        //    closed the pipe, so a pending write unblocks).
+        let target_status = wait_child_until(&mut target, Instant::now() + REPLAY_TARGET_TIMEOUT);
+        if let Some(handle) = delivery {
+            let _ = handle.join();
+        }
+        if target_status.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(ObserveOutcome::NotObserved(
+                "collector_replay_target_timeout".to_owned(),
+            ));
+        }
+
+        // Hold for the post-exit observation window.
         let window_end = Instant::now() + Duration::from_millis(self.window_ms);
         while Instant::now() < window_end {
             std::thread::sleep(Duration::from_millis(10));

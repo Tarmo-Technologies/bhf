@@ -1494,7 +1494,7 @@ fn spawn_replay_child(
     input: &[u8],
     env: &BTreeMap<String, String>,
     tmp_dir: &Path,
-) -> anyhow::Result<std::process::Child> {
+) -> anyhow::Result<collector_run::LaunchedReplay> {
     let input_file = match mode {
         BinaryInputMode::Stdin => None,
         BinaryInputMode::File => {
@@ -1521,12 +1521,23 @@ fn spawn_replay_child(
     let mut child = cmd
         .spawn()
         .with_context(|| format!("spawn replay target {}", program.display()))?;
-    if mode == BinaryInputMode::Stdin {
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(input);
-        }
-    }
-    Ok(child)
+    // Deliver stdin on a BACKGROUND thread so this returns immediately. A target
+    // that never drains stdin (with an input larger than the pipe buffer) would
+    // otherwise block `write_all` here forever, stalling the launch callback before
+    // the supervisor's bounded wait could start — bypassing the replay deadline
+    // (#76 re-review). The supervisor reaps this thread after the target exits or
+    // is killed (the closed pipe unblocks the write); its error is surfaced rather
+    // than discarded, though a BrokenPipe from a target that finished early is
+    // benign. `stdin` is moved into the thread and dropped there, closing the pipe.
+    let delivery = if mode == BinaryInputMode::Stdin {
+        child.stdin.take().map(|mut stdin| {
+            let input = input.to_vec();
+            std::thread::spawn(move || stdin.write_all(&input))
+        })
+    } else {
+        None
+    };
+    Ok(collector_run::LaunchedReplay { child, delivery })
 }
 
 /// `timeout`, `signal:<n>:<digest>` or `exit:<code>:<digest>`, where the
@@ -2545,6 +2556,48 @@ mod tests {
         assert_eq!(replay_binary_finding(&fdir, &script), 0);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spawn_replay_child_does_not_block_on_a_target_that_never_reads_stdin() {
+        use std::os::unix::fs::PermissionsExt;
+        // #76 re-review: a target that keeps stdin open WITHOUT reading it, plus an
+        // input larger than the pipe buffer, must not block the launch. stdin is
+        // delivered on a background thread, so spawn_replay_child returns promptly
+        // and the supervisor's bounded wait runs. The old inline write_all would
+        // block here until the target exited, bypassing the replay deadline — so
+        // under the old code this call would hang for the target's full lifetime.
+        let dir = std::env::temp_dir().join(format!("bhf-replay-noread-{}", nonce()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("sleeper.sh");
+        std::fs::write(&target, "#!/bin/sh\nsleep 30\n").unwrap();
+        let mut perms = std::fs::metadata(&target).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&target, perms).unwrap();
+
+        let inv = TargetInvocation {
+            binary: target,
+            runner: None,
+            runner_args: Vec::new(),
+            target_args: Vec::new(),
+        };
+        let big = vec![0_u8; 256 * 1024]; // >> the ~64 KiB pipe buffer
+        let env = std::collections::BTreeMap::new();
+        let started = std::time::Instant::now();
+        let launched = spawn_replay_child(&inv, BinaryInputMode::Stdin, &big, &env, &dir).unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "launch must return without blocking on an undrained stdin write"
+        );
+        // Reap BOTH: killing the target closes the pipe, which unblocks and ends
+        // the background delivery thread.
+        let mut child = launched.child;
+        let _ = child.kill();
+        let _ = child.wait();
+        if let Some(handle) = launched.delivery {
+            let _ = handle.join();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
