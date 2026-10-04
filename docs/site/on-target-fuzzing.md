@@ -54,7 +54,8 @@ binary release.
 | A cross toolchain + `qemu-user` | **qemu-user replay** (see Cross-Compilation) | Real ISA/endianness, no RTOS/peripherals | ✅ RV-1 (`qemu-ppc64`) |
 | A gdbstub (OpenOCD/J-Link/QEMU) | **Debug-probe / gdb-remote** | Real target memory + coverage ring | ✅ RV-2 (`qemu-arm`); real board gated |
 | A cross toolchain + `qemu-system` | **Full-system emulator (bare-metal)** | Real core, MMIO, interrupts, snapshot reset | ✅ RV-3 (`qemu-system-arm`, bare-metal Cortex-M — **not** an RTOS) |
-| A proprietary RTOS image | **Actual RTOS execution** | Scheduler / tasks / ISRs | ⛔ unproven (bring the image + toolchain) |
+| An open RTOS (FreeRTOS) | **Actual RTOS execution** | Scheduler / tasks / queues | 🟡 FreeRTOS reference profile (`crates/target_transport/tests/freertos/`): image build + boot + `savevm` baseline validated under `qemu-system-arm`; the per-input fuzz-drive is gated while a harness-done-stop nuance is resolved. Kernel is bring-your-own (not vendored). |
+| A proprietary RTOS image | **Actual RTOS execution** | VxWorks/INTEGRITY/QNX scheduler | ⛔ unproven (bring the image + toolchain) |
 | An on-device agent (TCP/serial) | **On-target agent** | Real device; coverage over the agent protocol | ⛔ unproven |
 | A physical board | **HIL** (hardware-in-the-loop) | Silicon | ⛔ unproven (`BHF_HIL_GDB`) |
 
