@@ -1,20 +1,20 @@
-# EXECUTIVE SUMMARY
+# Executive summary
 
 | Feature area | Verdict | Deciding number |
 |---|---|---|
-| **Multi-lang auto-fuzzing (zero-harness)** | **#1, uncontested** | 0 harnesses vs N for every competitor; 8 langs / 1 engine; fuzzes broken/non-building code (c_jansson recovered build, no `compile_commands.json`) |
-| **Fuzz-confirmation of static findings** | **#1, uncontested** | Only tool doing static→dynamic confirmation; 0 competitors have any equivalent |
-| **Static C/C++** | Competitive / #1 on precision, behind on volume + classes | cppcheck raw 465–1711 vs bhf 37–141, but ~90% of cppcheck is style/info; bhf is only tool with taint→sink + CWE. Loses on scanf/gets, printf-arg-type, dangling-lifetime, resource-leak classes |
-| **Static Go** | **#1** | Only tool producing signal on both repos: go_gin bhf 14 vs gosec **0** (build-gated fail) vs semgrep 20 (mostly CI-noise). go_cobra bhf 14 ≥ gosec 11 |
-| **Static Java** | **#1** | bhf 5 (3× deserialization) vs semgrep 2 (both CI-noise); only tool surfacing `ObjectInputStream` sinks |
-| **Static Rust** | #1 on security signal, behind on raw count | Only tool catching build.rs command-injection taint (1–0); semgrep 20 vs bhf 13 but all 20 semgrep = action-pin spam |
+| **Multi-lang auto-fuzzing (zero-harness)** | Unique in the measured set | 0 harnesses vs N for every competitor; 8 langs / 1 engine; fuzzes broken/non-building code (c_jansson recovered build, no `compile_commands.json`) |
+| **Fuzz-confirmation of static findings** | Unique in the measured set | Only measured tool doing static→dynamic confirmation |
+| **Static C/C++** | Higher precision, behind on volume and classes | cppcheck raw 465–1711 vs bhf 37–141, but ~90% of cppcheck is style/info; bhf is the only measured tool with taint→sink + CWE. Loses on scanf/gets, printf-arg-type, dangling-lifetime, resource-leak classes |
+| **Static Go** | Strongest measured signal | Only tool producing signal on both repos: go_gin bhf 14 vs gosec **0** (build-gated fail) vs semgrep 20 (mostly CI-noise). go_cobra bhf 14 ≥ gosec 11 |
+| **Static Java** | Strongest measured signal | bhf 5 (3× deserialization) vs semgrep 2 (both CI-noise); only measured tool surfacing `ObjectInputStream` sinks |
+| **Static Rust** | Strong security signal, behind on raw count | Only measured tool catching build.rs command-injection taint (1–0); semgrep 20 vs bhf 13 but all 20 semgrep = action-pin spam |
 | **Static Python** | **Mixed / behind** | py_requests bhf **wins** (14 HIGH taint vs bandit 0 substantive); py_click bhf **loses** (0 findings vs bandit 23 substantive, semgrep 3) |
-| **Static Perl** | Behind on count, best on severity quality | perlcritic 221 > semgrep 31 > bhf 18; bhf's 18 are highest-severity (eval/shell/weak-crypto), but misses insecure-websocket class |
-| **SBOM component discovery** | Co-#1; #1 on npm/cargo | Ties syft exactly on go (42/42, 7/7) + maven (21/21, 8/8); **beats** syft 45–0 (npm) and 6–0 (cargo); **loses** py_click 30 vs 81 (transitive) |
+| **Static Perl** | Behind on count, higher-severity findings | perlcritic 221 > semgrep 31 > bhf 18; bhf's 18 are eval/shell/weak-crypto findings, but it misses the insecure-websocket class |
+| **SBOM component discovery** | Mixed by ecosystem | Ties syft on go (42/42, 7/7) and maven (21/21, 8/8); exceeds syft 45–0 (npm) and 6–0 (cargo); trails on py_click, 30 vs 81 (transitive) |
 | **SBOM CVE correlation** | **Behind** | grype 11 (py_click) + 1 (java_gson) vs bhf **0 everywhere** — null versions from manifests can't match CVE ranges |
-| **Reporting richness** | **#1** | Only tool with codeFlows + fuzz-confirm provenance + reachability verdict + root-cause clustering + VEX combined |
+| **Reporting richness** | Broadest measured combination | Only measured tool with codeFlows + fuzz-confirm provenance + reachability verdict + root-cause clustering + VEX combined |
 | **Reporting breadth** | Competitive, 3 fixable gaps | No SPDX (syft wins), no per-finding CWE in primary JSON (bandit wins), no remediation text (semgrep/bandit win) |
-| **SLOC counting** | Behind on speed, tied-best on accuracy | tokei/scc ~0.1s vs bhf **16.5s (~150×)**; accuracy tied with cloc, beats scc/tokei on Perl (~2.5× overcount) + docstrings |
+| **SLOC counting** | Behind on speed, close to cloc | tokei/scc ~0.1s vs bhf **16.5s (~150×)**; counts align with cloc and avoid the measured Perl and docstring overcounts |
 
 ---
 
@@ -52,25 +52,29 @@
 
 9. **SLOC is ~150× slower than tokei (16.5s vs 0.09s).** Offer a standalone `bhf sloc <path>` / `--sloc-only` fast path that skips the SAST parse and supports whole-corpus multi-root in one invocation. Won't beat purpose-built counters on speed, but removes the "accurate-but-unusably-slow" penalty. Secondary: emit optional `c_header`/`cpp_header` split for apples-to-apples comparison.
 
-10. **Auto-harness coverage on hard signatures.** 3/5 C + 2/5 Go targets skipped as "could not auto-harness" (variadic `json_vpack_ex`/`json_vunpack_ex`, Go template-func/ActiveHelp closures). Every skip is a target a competitor's manual harness reaches. Closing these raises the built+fuzzed ratio — bhf's headline metric. Secondary: cache/persist the recovered-build archive so per-target re-linking (12 TUs) doesn't eat the fuzz budget (c_jansson stuck at 19 exec/s).
+10. **Auto-harness coverage on hard signatures.** 3/5 C + 2/5 Go targets skipped as "could not auto-harness" (variadic `json_vpack_ex`/`json_vunpack_ex`, Go template-func/ActiveHelp closures). Supporting these signatures would raise the measured built-and-fuzzed ratio. Secondary: cache the recovered-build archive so per-target re-linking of 12 translation units does not consume the fuzz budget (c_jansson measured 19 exec/s).
 
 11. **Rust code-rule breadth.** Outside the build.rs taint finding, bhf has near-zero Rust *code* rules and pads its Rust count with GH-Actions findings. Add unsafe-usage-context, panic-in-lib, etc.
 
 ---
 
-# HONEST FRAMING
+# Measurement scope
 
-**Where bhf genuinely wins — and the numbers back it:**
-- **Zero-harness multi-language fuzzing** is uncontested. 0 harnesses vs N-per-target for AFL++/libFuzzer/cargo-fuzz/Jazzer; 8 languages under one engine vs 1–2 each; and it fuzzes **broken/non-building code** (c_jansson: recovered a partial build, linked 12-source TU set, stubbed 3 deps, no `compile_commands.json`). No competitor offers any of this.
-- **Fuzz-confirmation of static findings** — static→dynamic confirmation exists nowhere else.
+**Where bhf led the selected tools in this measurement:**
+- **Zero-harness multi-language fuzzing.** 0 harnesses vs N-per-target for AFL++/libFuzzer/cargo-fuzz/Jazzer; 8 languages under one engine vs 1–2 each; and it fuzzed **broken/non-building code** (c_jansson: recovered a partial build, linked 12-source TU set, stubbed 3 deps, no `compile_commands.json`).
+- **Fuzz-confirmation of static findings.** None of the other measured tools performed static-to-dynamic confirmation.
 - **Integrated static + dynamic + SBOM + SLOC + reporting** in one offline/air-gapped tool. The build-independence is a *measured* advantage, not a marketing claim: gosec returned literally **0** on go_gin because it couldn't build under Go 1.22 while the repo demands 1.25; bhf's 14 taint findings didn't care.
-- **Reporting richness**: the only tool combining codeFlows dataflow, fuzz-confirm provenance, reachability verdicts, root-cause clustering, and VEX.
+- **Reporting richness**: the only measured tool combining codeFlows dataflow, fuzz-confirm provenance, reachability verdicts, root-cause clustering, and VEX.
 - **Correctness sub-wins**: cleaner SLOC than scc/tokei (Perl ~2.5× overcount, docstring miscounting); reads npm/cargo manifests syft needs a lockfile to see (45–0, 6–0).
 
-**Where dedicated single-purpose tools legitimately win — and we should say so plainly:**
+**Where dedicated single-purpose tools won in this measurement:**
 - **Raw SLOC speed**: tokei/scc are ~150× faster (0.09s vs 16.5s). They always will be — they're purpose-built line counters; bhf counts as a side-effect of a full tree-sitter SAST parse.
-- **Raw fuzz throughput on a mature single target**: AFL++/libFuzzer/cargo-fuzz/Jazzer win, backed by years of mutator engineering (redqueen/cmplog, LLVM integration). This was **not** quantified with an hours-long shootout — an honest unquantified concession, not a claimed win. Publishing that shootout (even losing it) would convert the caveat into a credible breadth-vs-depth trade-off story.
-- **CVE correlation today**: grype+syft win outright (11 + 1 vs 0) purely because they read pinned lockfiles — a gap that is *fixable*, not architectural (see P0 #1).
+- **Raw fuzz throughput on a mature single target**: this was **not** quantified with an hours-long, identical-harness comparison. The specialist tools have mature mutator engineering and integrations; the campaign does not rank their throughput against bhf.
+- **CVE correlation at measurement time**: grype+syft reported 11 + 1 CVEs versus 0 because they read pinned lockfiles (see P0 item 1).
 - **Python breadth on non-taint-reachable repos** (bandit), **Perl style/volume** (perlcritic), and **remediation text** (semgrep/bandit) are real, current deficits.
 
-**Net:** bhf is best-in-class on the axes it was designed for (zero-setup multi-lang fuzzing, fuzz-confirmation, integrated offline workflow, report richness) and honestly behind on the axes dedicated tools specialize in (raw counting/fuzzing speed, CVE correlation, and a handful of specific detection classes). The gap list above is dominated by *closable* gaps — lockfile ingestion (P0 #1) alone flips SBOM+CVE from behind to leading, and it plus the Python py_click rules (P0 #2) would leave raw fuzz throughput as the only axis where a specialist still legitimately wins.
+**Measured result:** bhf led the selected tools on zero-setup multi-language
+fuzzing, fuzz-confirmation, integrated offline workflow, and combined report
+content. Dedicated tools led on raw counting and fuzzing speed, CVE correlation,
+and several detection classes. The listed gaps were candidates for follow-up;
+this 14-repository campaign does not establish an overall product ranking.

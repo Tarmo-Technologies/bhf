@@ -43,7 +43,7 @@ reported separately because neither substitutes for the other.
 
 | Lever | Automatic behavior |
 |---|---|
-| Honest execution proof | Every lane checkpoints immediately before the selected call; decode/setup-only execution is demoted. |
+| Execution proof | Every lane checkpoints immediately before the selected call; decode/setup-only execution is demoted. |
 | Semantic selection | Identifier-token scoring prioritizes public parsers, decoders, whole-artifact entrypoints, and stateful surfaces while penalizing debug/report/inspection helpers. |
 | File-backed input | JavaScript, Ruby, and COBOL materialize fuzz bytes for path/file operands and clean them after the call. JavaScript awaits returned promises before cleanup. |
 | Stateful APIs | Go mines a bounded one-input feeder plus zero-argument terminal, including Cobra `SetArgs` → `Execute`. |

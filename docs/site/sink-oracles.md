@@ -83,7 +83,7 @@ Notes on individual classes:
 
 The sink oracle observes what a native program does through the C library and a
 handful of dominant client libraries. Some vulnerability classes are deliberately
-**not** confirmed here, and the honest reasons matter:
+**not** confirmed here for the following technical reasons:
 
 - **Deserialization (CWE-502)** has no common libc/library sink to interpose —
   every serializer (protobuf, msgpack, bespoke) exposes a different entrypoint.

@@ -28,7 +28,7 @@ corpus, matches each finding to the `EXPECT` labels, computes TP/FP/FN, writes
 silently stops firing). A rule change that introduces a false positive or drops a
 detection fails the test.
 
-## Scope & honesty
+## Scope and limitations
 
 The seed corpus is bhf-authored and license-clean. It is deliberately small
 and high-signal; expanding it with a permissive subset of NIST **Juliet** and

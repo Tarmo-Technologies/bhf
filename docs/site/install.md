@@ -215,7 +215,7 @@ What each optional component changes:
 - `source.tar.gz`, `dist-manifest.json`, and checksum files are not executable
   components. Do not install them into `PATH`.
 
-In short: the recommended full Linux delivery is the all-in-one bundle. Its
+The recommended full Linux delivery is the all-in-one bundle. Its
 manual equivalent is the CLI plus both shims, with the daemon added only when
 needed. The normal Windows set is the CLI alone, with the daemon added only for
 IDE/MCP use. Windows users should ignore the two Linux-only shim assets.

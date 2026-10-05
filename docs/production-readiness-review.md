@@ -68,7 +68,7 @@ the bounded fixes after recording their evidence and acceptance checks.
   generate and pass the builder's link validation.
 - PR-12 (medium, delegated to PR-02 owner): the full sweep exposed two stale
   release-test assertions: false signing language and Windows installation docs
-  pinned to `v0.2.19`. Tests now require honest integrity-only semantics and derive
+  pinned to `v0.2.19`. Tests now require integrity-only semantics and derive
   the expected example version from the workspace manifest, retaining OS matrix
   checks. The entire 11-test release target passes on rerun.
 

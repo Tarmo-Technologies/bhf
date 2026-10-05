@@ -305,8 +305,8 @@ Only no-arg-constructible receivers are supported.
 Checked, and it is not ours: the project's OWN module fails to import because it
 subscripts a class that is not generic on the installed library version
 (spec-kit's `Choice[...]`). Correctly reported as "not loadable (skipped
-cleanly)" with the interpreter's real message. I had this filed as a loader gap
-from inspection; reading an exemplar corrected it.
+cleanly)" with the interpreter's real message. Initial inspection classified it
+as a loader gap; reading an exemplar corrected the classification.
 
 ### Py-4. Python 2 — 20 — **BY DESIGN**
 

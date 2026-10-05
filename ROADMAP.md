@@ -2738,7 +2738,7 @@ modern compiler accepts cfront/ARM C++). Perl 4 is handled by the existing Perl 
 lane (Perl 5 is backward-compatible and runs most Perl 4), so it fuzzes there
 rather than degrading.
 
-### Deferred / honest limits
+### Deferred limits
 
 - Interpreter-level **Python 2** fuzzing needs a `python2` install (EOL); absent,
   report-only is the fallback. A py2-compatible runtime + lane is the increment.
@@ -2890,7 +2890,7 @@ mainstream.
   `docs/site/csharp.md`. **Remaining:** widen beyond a single input parameter
   (constructed options/context objects, generic methods), and a dictionary miner.
 
-### 30.4 Sequencing and honesty
+### 30.4 Sequencing and evidence
 
 - **Order:** (1) PR-native CI + Action, (2) differential fuzzing, (3) COBOL,
   Fortran, JavaScript, C# lanes.

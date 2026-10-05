@@ -56,7 +56,7 @@ follows it; neither is a production-readiness certification.
 
 | Workstream | Implemented or in progress | Evidence and limits |
 |---|---|---|
-| Initial review | Cleanup/capsule path checks, temporary-file handling, honest unsupported Nyx path, installer staging, version stamps, docs/MSRV/editor corrections | Broad initial suite: 5,541 passed, 2 failed, 4 ignored; the two stale release assertions were corrected and their entire 11-test target passed. The whole suite was not repeated afterward. |
+| Initial review | Cleanup/capsule path checks, temporary-file handling, explicitly unsupported Nyx path, installer staging, version stamps, docs/MSRV/editor corrections | Broad initial suite: 5,541 passed, 2 failed, 4 ignored; the two stale release assertions were corrected and their entire 11-test target passed. The whole suite was not repeated afterward. |
 | Authenticated distributions | Ring Ed25519 packs; key-ID-bound metadata; external trust policy; streamed hashing; detached tar signature; independent OpenSSL verifier; seed-member checks; protected signing workflow | Owner reported governance 68/68, distribution 26/26, pack CLI 1/1, enterprise CLI 11/11. Actual protected workflow/public release not run. Mutable-source and installation lifecycle gaps remain. |
 | Daemon/report/editor | Bounded serialization including large IDs; descriptor-based bounded finding reads; no auxiliary testcase reads; GNAT deadline; process-tree shutdown | Daemon 24/24, report 71/71, GNAT 18/18. Native Windows and stronger ancestor-race confinement remain unverified. |
 | Scheduler | Unique IDs, atomic persistence, Unix directory sync, corrupt/duplicate snapshot rejection, positive-budget rounding and scheduler deadline | Latest slice 22/22; strict scoped Clippy passed. Queue/history/startup memory and whole webhook/DNS shutdown remain unbounded. Zero budget still means unlimited. |
@@ -384,7 +384,7 @@ Full regression: `cargo test -p bhf --lib` → **1701 passed / 0 failed**; plus
 governance 72, bhf-daemon 24, continuous_daemon 28, target_rank 141, and the
 pack/offline/signed-release integration suites.
 
-**Genuinely blocked in this environment (cannot be passed here, only documented):**
+**Blocked in this environment (cannot be passed here, only documented):**
 licensed Mayhem comparison, native Windows/RHEL matrix, and a fresh libFuzzer
 benchmark arm (needs root to install `libstdc++-dev`). The large open studies
 (FuzzBench real-code comparison, sustained multiworker soak) are operational and

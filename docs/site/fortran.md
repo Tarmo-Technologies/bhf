@@ -47,7 +47,7 @@ or Fortran driver, compiles with `gfortran -fsanitize=address`, and points AFL a
 it — which bhf automates end to end (zero harness, auto-discovery, coverage +
 CmpLog + taint oracles). On the static side, gfortran's own `-Wall`/`-fcheck`
 warnings, and commercial linters (forcheck, fpt), flag candidate issues but don't
-confirm them with real input. bhf is the only tool that **fuzz-confirms**
+confirm them with real input. In the documented comparison, bhf **fuzz-confirms**
 Fortran memory-safety defects and applies behavioral taint oracles.
 
 ## Validation (campaign)
@@ -64,7 +64,7 @@ projects — LAPACK, CP2K, NWChem, FDS, neural-fortran, flibs, …):
   exact `.f90:line`; benign procedures run at **6,500+ executions/second** with **0
   false positives**.
 
-The campaign also surfaced the honest limits below: module-based library procedures
+The campaign also surfaced the limits below: module-based library procedures
 need their module context to compile standalone, and preprocessor include-fragment
 "template" files (invalid Fortran identifiers) are skipped rather than mis-compiled.
 
@@ -75,7 +75,7 @@ need their module context to compile standalone, and preprocessor include-fragme
   links into the *user's* harness like the C/GNAT runtime, never into bhf.
 - `clang` + `make` for the C driver build.
 
-## Limits (honest)
+## Limits
 
 - The fuzzable surface is a `character` dummy argument. Procedures that take only
   numeric (`real`/`integer`) arrays, or read input via Fortran I/O (`READ`), are

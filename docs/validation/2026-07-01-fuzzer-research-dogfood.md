@@ -50,7 +50,7 @@ Community and issue-tracker signals:
   https://github.com/CodeIntelligenceTesting/jazzer/discussions/881
 
 Community sources are anecdotal and should be treated as product-direction
-signals, not population-level evidence. I did not use X/Twitter claims because
+signals, not population-level evidence. X/Twitter claims were excluded because
 the available public results were not reliable enough to cite.
 
 ## Ecosystem Baseline

@@ -241,11 +241,11 @@ fn ci_enforces_the_current_supported_os_matrix() {
     let ci = read(root.join(".github/workflows/ci.yml"));
     let release = read(root.join(".github/workflows/release.yml"));
     let windows_smoke = read(root.join("scripts/ci/windows-release-smoke.ps1"));
-    let workspace: toml::Value =
-        toml::from_str(&read(root.join("Cargo.toml"))).expect("parse workspace manifest");
-    let version = workspace["workspace"]["package"]["version"]
-        .as_str()
-        .expect("workspace package version");
+    let release_notes = read(root.join("RELEASE_NOTES.md"));
+    let published_version = release_notes
+        .lines()
+        .find_map(|line| line.strip_prefix("## Previous release: v"))
+        .expect("latest published version in release notes");
     let readme = read(root.join("README.md"));
     let install = read(root.join("docs/site/install.md"));
     let windows = read(root.join("docs/site/windows.md"));
@@ -274,7 +274,9 @@ fn ci_enforces_the_current_supported_os_matrix() {
     assert!(windows_smoke.contains("GetEnvironmentVariable(\"Path\", \"User\")"));
     assert!(windows_smoke
         .contains("$expectedVersion = \"bhf v$($workspaceVersion.Matches[0].Groups[1].Value)\""));
-    assert!(windows_smoke.contains("$actualVersion = (& $bhf --version).Trim()"));
+    assert!(windows_smoke.contains("$versionLines = @(& $bhf --version)"));
+    assert!(windows_smoke.contains("$actualVersion = $versionLines[0].Trim()"));
+    assert!(windows_smoke.contains("$versionLines -notcontains \"commit: $expectedCommit\""));
     assert!(release.contains("RELEASE_TAG: ${{ needs.plan.outputs.tag }}"));
     assert!(release.contains("version=\"$RELEASE_TAG\""));
     assert!(release.contains("safe_version=\"$(printf '%s' \"$version\""));
@@ -292,7 +294,9 @@ fn ci_enforces_the_current_supported_os_matrix() {
             "support documentation omitted {required}"
         );
     }
-    assert!(windows.contains(&format!("$Version = \"{version}\"")));
+    assert!(readme.contains(&format!("VERSION={published_version}")));
+    assert!(install.contains(&format!("VERSION={published_version}")));
+    assert!(windows.contains(&format!("$Version = \"{published_version}\"")));
 }
 
 #[cfg(unix)]

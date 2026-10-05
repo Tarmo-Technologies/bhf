@@ -56,7 +56,7 @@ libFuzzer integration, no OSS-Fuzz COBOL targets. The state of practice is eithe
 - **Manual DIY**: hand-write a C driver, `cobc -C`, instrument, point AFL at it —
   what bhf automates end-to-end.
 
-bhf is the only tool that **fuzz-confirms** COBOL defects (a real input that
+In the documented comparison, bhf is the only tool that **fuzz-confirms** COBOL defects (a real input that
 trips a libcob/ASan check) and **dynamically confirms behavioral security issues**
 (input reaching a shell/SQL/file sink) that static COBOL analyzers can only flag.
 
@@ -84,7 +84,7 @@ GnuCOBOL Minecraft server — and several web/CLI COBOL projects):
   or GCC runtime), never into bhf — the strict-permissive core is unaffected.
 - `clang` + `make` for the C harness build.
 
-## Limits (honest)
+## Limits
 
 - The primary fuzz surface is the `LINKAGE` `PIC X` buffer. Programs that read
   input only via `ACCEPT`/file `READ`, or take no `USING` byte buffer, aren't

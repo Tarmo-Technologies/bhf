@@ -2,13 +2,13 @@
 # Static-scanner CWE coverage matrix
 
 What bhf's **static** analyzer (`bhf static-scan`, and `auto --static`)
-detects, per language and CWE. This is a deliberately honest map: a checkmark
+detects, per language and CWE. This is a bounded map: a checkmark
 means there is implemented core-scanner coverage for that language/CWE pair, not
 that the class is exhaustively covered. The curated precision benchmark remains
 the release gate for representative rule behavior; broader framework and
 configuration rules also ship with focused unit tests and real-project sweeps.
 
-The differentiator is the column that no pure SAST tool has: **fuzz-confirmation**.
+The additional column records **fuzz-confirmation**, which pure SAST tools do not provide.
 When `auto --static` runs, a static finding a fuzzer actually reaches at the same
 site is upgraded to `fuzz_confirmed`; one inside a function fuzzing proved is not
 attacker-reachable is downgraded to `lab_only`. A confirmed static finding is not
@@ -131,7 +131,7 @@ one-line **remediation** step. `--since <git-rev>` scans only files changed sinc
 revision — near-instant repeat-CI on a huge tree.
 
 **Static reachability tier.** Every finding carries a `reachability` tier — the
-honest, static analog of the "attacker-reachable" verdict the commercial tools
+static analog of the "attacker-reachable" verdict the commercial tools
 market. A taint flow is `source_reachable` by construction; a pattern finding is
 `source_reachable` when its enclosing function is reached (over the call graph) from
 an input source, `isolated` when the tree has input sources but none reach it, and

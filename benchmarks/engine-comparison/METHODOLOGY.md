@@ -130,7 +130,7 @@ python3 benchmarks/harness-parity-20/run.py --seconds 15 --jobs 2 \
 findings, not just coverage parity) is a dimension this coverage-parity suite
 does not yet capture; see limitations.
 
-## Honest limitations (what is NOT established)
+## Limitations (what is not established)
 
 - **Supported niche + measured advantage.** The controlled gates show bhf's
   engine reaches gate-guarded bugs competitively on micro-fixtures; the

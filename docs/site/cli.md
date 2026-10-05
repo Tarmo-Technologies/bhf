@@ -634,7 +634,7 @@ The run reports the two novelty channels **separately** — code-coverage novelt
 (`coverage_edges` / `coverage_blocks`) and protocol-state/transition novelty
 (`states_covered` / `transitions_covered`) are distinct fields, never merged. A
 plain request/response transport reports no code edges, so the code channel is
-honestly zero on such targets while the state channel carries the novelty;
+zero on such targets while the state channel carries the novelty;
 richer code coverage arrives when a backend supplies edges. The run and every
 finding record the profile SHA-256 and the effective transport/reset fidelity
 (e.g. `tcp;reset=reconnect`).

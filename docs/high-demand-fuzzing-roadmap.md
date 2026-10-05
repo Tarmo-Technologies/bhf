@@ -14,7 +14,7 @@ Status: **planning + phased implementation.** This roadmap was produced from a
 read-only capability audit of the tree (2026-09-25). Authorization for the work
 is recorded in [`Authorization.md`](../Authorization.md) (defensive tooling
 development on this repository). This document is the work list; each phase
-below carries its own acceptance criteria and an honest split between what is
+below carries its own acceptance criteria and an explicit split between what is
 implementable and testable in-tree versus what is gated on external resources
 (hardware, full-system emulators, proprietary vendor toolchains, or licensed
 RTOS images) that this repository cannot itself provide.
@@ -112,7 +112,7 @@ feature.
 | HDF-8 | `86aa8e6` | yes | `crates/cli/src/fuzz.rs` — `deadline_oracle_reports_a_slow_input_as_a_bhf555_finding_but_not_a_fast_one` (BHF-555); `crates/bhf_runtrace_shim/src/hooks/sched.rs` + `crates/bhf_runtrace_shim/tests/schedule_perturbation.rs` (cooperative perturbation + pinned replay) | exhaustive interleaving is intractable — claims bounded to "found within budget" (§5) |
 | CC-2 | this branch (uncommitted) | yes | Honesty audit: `crates/fork_server/src/lib.rs` documented as an unused reference impl (superseded by `AgentTransport` + the engine `BHF_FRAMED` loop); `crates/iiop/src/lib.rs` + `crates/ada_state_machine/src/lib.rs` crate docs state library-vs-CLI reachability honestly; `ada_runtime/adafuzz-probe-{semihosting,memory_buffer}.adb` documented as reader-consumed; `ROADMAP.md` IIOP note reconciled; this table | — (documentation reconciliation; no new capability) |
 
-**Honest carve-outs.**
+**Deferred surface.**
 
 - **HDF-7 is CLI-wired (#58).** The computed-field binary framing (`binframe`)
   and `ada_state_machine::ProtocolStateGraph` are now driven end-to-end by
@@ -148,7 +148,7 @@ feature.
    *what was and was not exercised* (arch, endianness, RTOS runtime, hardware,
    concurrency), so a clean host-stub run is never mistaken for target
    assurance. This is a safety requirement for DO-178/safety-critical users.
-4. **Honest gating.** Software is implemented and unit/integration-tested
+4. **Evidence gate.** Software is implemented and unit/integration-tested
    in-tree; validation that requires hardware, a full-system emulator image, or
    a proprietary vendor toolchain is written to self-skip when the resource is
    absent (repo convention), and its unproven status is recorded, never faked.
@@ -559,7 +559,7 @@ it does not have; each formerly-dead component is either wired (with a test
 proving reachability) or documented as scaffolding with the tracking track named.
 
 **Delivered (2026-09-25).** Each of the five is resolved by the honest,
-low-risk option — three are now genuinely wired (with a reachability test), two
+low-risk option — three are now wired with a reachability test, two
 are documented as scaffolding naming the completing track:
 
 - **`iiop`** — *wired (library); a candidate second session backend.* HDF-7 added
@@ -596,7 +596,7 @@ See §1a for the full per-track delivered-status table.
 
 ---
 
-## 5. Risks and honest limitations
+## 5. Risks and limitations
 
 - **Hardware/emulator/toolchain dependence.** HDF-1 (probe/agent), HDF-3
   (PPC/MIPS/SPARC toolchains + emulators), and HDF-4 (qemu-system/Renode/images)

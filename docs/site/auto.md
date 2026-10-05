@@ -274,9 +274,9 @@ Generated stubs, fake resources, missing-environment injections, and mocks force
 the verdict to `lab_only`; missing real resources without a substitution produce
 `blocked`.
 
-### Fuzz-confirmation (the differentiator)
+### Fuzz-confirmation
 
-bhf is the only tool that both statically scans **and** fuzzes the same tree,
+bhf both statically scans **and** fuzzes the same tree,
 so a fuzz run can *confirm* a static finding. After the sweep, bhf joins each
 static finding (`--static` / static-only, `F-STATIC-*` / `F-RO-*`) against the
 run's runtime findings (fuzz crashes + oracle hits) by source site (file:line):
@@ -497,7 +497,7 @@ The machine report. Each `built_and_fuzzed` target carries, under
 
 The top-level `summary` carries `fuzz_confirmed` — how many static findings a
 fuzz/oracle hit confirmed at the same source site (omitted when zero). See
-[Fuzz-confirmation](#fuzz-confirmation-the-differentiator).
+[Fuzz-confirmation](#fuzz-confirmation).
 
 ### `stub_execution` (false-clean guard)
 

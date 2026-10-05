@@ -1,4 +1,8 @@
-I have everything I need. Concrete gaps identified: bhf treats `scanf` as an unresolved-call analysis_gap rather than flagging it as a finding (semgrep + cppcheck both flag scanf/printf-format), and cppcheck's flow-sensitive engine finds classes bhf's heuristic lane doesn't (dangling-lifetime returns, printf arg-type mismatch, resource leaks). Final report below.
+The measurement identified concrete gaps. bhf treated `scanf` as an
+unresolved-call analysis gap rather than a finding, while semgrep and cppcheck
+flagged `scanf` and format-string cases. cppcheck also found dangling-lifetime
+returns, argument-type mismatches, and resource leaks that bhf's heuristic lane
+missed at the time.
 
 ---
 
@@ -22,16 +26,20 @@ Caveats on the raw counts (measured, not assumed):
 
 ## What each tool actually finds (classes)
 
-- **bhf**: security-typed findings with CWE + severity + confidence + remediation + dataflow. Clustered CWE distribution (issues view): CWE-120 unbounded-copy, CWE-22 path traversal (BHF-405 path-controlled-open, its taint differentiator, 39 in zlib), CWE-134 format-string, CWE-190 int-overflow, CWE-457 uninit-use, CWE-787 OOB-write, CWE-494 unpinned CI action, CWE-829/415/362. Every finding carries `analysis.path.predicates` (guard conditions), `evidence` snippet, `actionability.verdict`, and `analysis_gaps` records unresolved interprocedural calls honestly. This is the differentiator: **taint/behavioral findings (BHF-405 path-control, BHF-401 unsafe-copy) that are fuzz-confirmable and CWE-tagged** — cppcheck/flawfinder/semgrep have no taint-to-sink path story here.
+- **bhf**: security-typed findings with CWE + severity + confidence + remediation + dataflow. Clustered CWE distribution (issues view): CWE-120 unbounded-copy, CWE-22 path traversal (BHF-405 path-controlled-open, 39 in zlib), CWE-134 format-string, CWE-190 int-overflow, CWE-457 uninit-use, CWE-787 OOB-write, CWE-494 unpinned CI action, CWE-829/415/362. Every finding carries `analysis.path.predicates` (guard conditions), an `evidence` snippet, `actionability.verdict`, and `analysis_gaps` for unresolved interprocedural calls. Its measured taint and behavioral findings are fuzz-confirmable and CWE-tagged; the compared configurations did not provide an equivalent taint-to-sink path.
 - **cppcheck**: flow-sensitive C/C++ engine. Its real security value (err/warn) in zlib: `uninitvar`, `returnDanglingLifetime`, `returnTempReference`, `autoVariables` (return address of local), `resourceLeak`, `invalidPrintfArgType`, `nullPointer`, `ctuOneDefinitionRuleViolation`. Low count but **genuine memory-safety classes bhf's heuristic lane does not emit** (dangling-lifetime, printf arg-type mismatch, resource leak).
 - **flawfinder**: lexical only. High volume, zero flow, no confirmation. Not competitive on precision.
 - **semgrep `--config=auto`**: on C/C++ it is almost entirely **non-code YAML/CI noise** — `github-actions-mutable-action-tag` (26/7/2/0), `dependabot-missing-cooldown`. Its only real C-code rules that fired: `insecure-use-scanf-fn` (2, c_zlib) and misfired Python rules on cpp_json (`direct-use-of-jinja2`). semgrep's registry has essentially no C/C++ memory-safety depth; it is not a serious C/C++ static competitor out of the box.
 
 ## Verdict
 
-**Is bhf #1 on C/C++ static?** Not by raw count, and count is the wrong axis. By raw findings cppcheck "wins" (465–1711 vs bhf 37–141) and flawfinder is second — but those counts are dominated by style/informational/lexical noise (cppcheck: ~5–8% security; flawfinder: 100% unconfirmed). **On usable, CWE-tagged, taint-confirmable security findings bhf leads the field**: semgrep is effectively absent on C/C++ code (its top hits are CI-YAML), flawfinder has no flow, and cppcheck's security yield is a small, unranked slice with no CWE mapping or remediation. bhf is the only tool here that emits path-traversal/command-taint findings with dataflow predicates and fuzz-confirmability. **bhf is competitive and arguably #1 on precision/actionability; it is NOT #1 on raw volume (cppcheck wins volume ~3–45x, but ~90%+ of that volume is non-security).**
+cppcheck and flawfinder produced larger raw counts, but those counts were
+dominated by style, informational, or lexical results. In the measured
+configurations, bhf alone emitted path-traversal and command-taint findings with
+dataflow predicates, CWE mapping, remediation, and fuzz-confirmability.
+cppcheck also found real defect classes that bhf lacked, as listed below.
 
-## Concrete gaps bhf should fix to lead outright
+## Concrete gaps
 
 1. **`scanf`/`gets`-family unbounded-read is dropped to an analysis_gap, not a finding.** In c_zlib both semgrep (`insecure-use-scanf-fn`) and cppcheck flag `scanf("%1s",answer)` at `contrib/minizip/miniunz.c:392` and `minizip.c:343`; bhf records these two as `unresolved_project_local_call` gaps (`scanf` callee) and emits **0** scanf findings. Fix: add a lexical/AST rule (CWE-120/CWE-676) for unbounded `scanf`/`gets` reads so the gap becomes a finding — this is a class both competitors catch and bhf currently misses.
 2. **printf/format arg-type mismatch (`invalidPrintfArgType`, 8 in zlib) and dangling-lifetime returns (`returnDanglingLifetime`/`returnTempReference`/`autoVariables`) are cppcheck-only classes.** bhf has format-string (CWE-134) for *untrusted* format arg but no printf **argument-type** checker and no return-of-local/temp-reference (CWE-562) rule. Adding these would close cppcheck's real-bug lead in one shot.

@@ -143,7 +143,7 @@ CLI provider, inject provider keys through the CI secret store, and do not write
 key values into arguments, workflow YAML, caches, or uploaded prompts. See
 [LLM Assistance](./llm.md) for the exact provider and MCP boundaries.
 
-## Honesty
+## Scope of a passing check
 
 A diff-scoped run fuzzes only the changed files' targets under a bounded time
 budget. A green check means "no confirmed finding was introduced in the changed

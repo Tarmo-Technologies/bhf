@@ -36,7 +36,7 @@ live_fullsystem: input=0xF7 edges=[100, 101, 1fa, fa17] — REAL Cortex-M HardFa
 live_fullsystem: determinism — 0x42 again edges=[100, 101, 200, 201] (== first run)
 ```
 
-## Honest carve-outs (still gated)
+## Gated exclusions
 
 - **Emulator, not silicon.** This validates against QEMU, not a physical board.
   The real-hardware lane (`crates/target_transport/tests/hil_board.rs`, driven by

@@ -146,29 +146,24 @@ every raw number are in the [comparison](comparison.md); the headlines:
 
 ## Where it matters: legacy, defense, RTOS
 
-bhf was built for the codebases other fuzzers can't reach: government and
-defense legacy systems in Ada, C, and C++, frequently targeting RTOS platforms
-(VxWorks, Green Hills INTEGRITY, QNX) that a Linux lab box cannot run. For these,
-the setup tax isn't just expensive — it's the reason the code has never been
-fuzzed. bhf's build recovery, vendor-toolchain interception, and RTOS
-platform-stub isolation are what turn "we can't build this here" into "it's
-fuzzing." It operates fully offline, treats every scanned tree and child-process
-output as untrusted, and emits findings as JSON, SARIF, JUnit, Markdown, and CSV
-for the pipelines these programs already run.
+bhf targets legacy Ada, C, and C++ code, including projects built for RTOS
+platforms such as VxWorks, Green Hills INTEGRITY, and QNX that a Linux lab host
+cannot execute directly. Its build recovery, vendor-toolchain interception, and
+RTOS platform stubs reduce the manual work required to create a host-side fuzz
+target. It operates offline, treats scanned trees and child-process output as
+untrusted, and emits JSON, SARIF, JUnit, Markdown, and CSV reports.
 
 ---
 
-## Conclusion
+## Measured scope
 
-The fuzzing engines are a solved problem. The barrier to fuzzing real, legacy,
-multi-language, mission-critical software is the human plumbing around them —
-and for Ada, the total absence of a tool. bhf removes the plumbing: one tool
-with sixteen current language lanes that found the same planted bugs as AFL++,
-libFuzzer, cargo-fuzz, and Jazzer across the eight lanes measured here, with no
-harness, on code that does not even build — and the only fuzzer in this
-comparison that handles Ada.
+Across the eight lanes measured here, bhf found the same planted bugs as AFL++,
+libFuzzer, cargo-fuzz, and Jazzer without a handwritten harness. In this
+comparison, bhf was the only tool that exercised the Ada target. The result is
+a bounded comparison of the pinned fixtures and budgets listed below; it does
+not establish a general ranking across projects or fuzzing engines.
 
-One fuzzer for the whole codebase.
+One CLI coordinates the language lanes that this benchmark exercised.
 
 ---
 
