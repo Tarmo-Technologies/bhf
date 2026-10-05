@@ -1,9 +1,8 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# BHF v0.3.0 release candidate
+# BHF v0.3.0
 
-Unpublished. Exact-revision CI, image acceptance, scan review, and protected
-publisher signing determine release eligibility; this heading is not approval.
+Released 2026-10-05.
 
 - Default CLI/daemon exclude LLM connectivity, with explicit opt-in builds.
 - Native and container installers share language names, aliases, and dependency

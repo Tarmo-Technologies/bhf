@@ -2,7 +2,7 @@
 
 # Changelog
 
-## Unreleased
+## 0.3.0 - 2026-10-05
 
 ### Breaking
 - Default CLI and daemon artifacts omit LLM integrations; build with the explicit
