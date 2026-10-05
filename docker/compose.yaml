@@ -19,6 +19,9 @@ services:
       context: ..
       dockerfile: Dockerfile
       target: production
+      args:
+        BHF_LANGUAGES: ${BHF_LANGUAGES:-all}
+        BHF_ENGINES: ${BHF_ENGINES:-default}
     image: bhf:local
     shm_size: "2gb"
     cap_add:
@@ -43,7 +46,7 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
-      target: runtime
+      target: validation
     image: bhf:full-local
     # Fetch the pinned corpus (needs network) then run the full 32-project sweep.
     command: ["bhf-sweep", "--fetch"]

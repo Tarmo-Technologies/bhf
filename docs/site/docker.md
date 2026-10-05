@@ -39,7 +39,7 @@ The builder compiles only the release binaries and Linux shims against Ubuntu
 24.04 glibc. The default final stage inherits `runtime`, which carries all sixteen
 languages, including .NET 8 SDK, a headless JDK, and Maven.
 Gradle is omitted from the full image; add it to that stage for Gradle-project
-build recovery. The full language validation sweep uses `runtime` explicitly.
+build recovery. The validation helpers use the explicit `validation` target.
 
 | Profile | Included build tools | Executed acceptance |
 |---|---|---|
@@ -324,3 +324,61 @@ and receive their own signatures.
   raise the cap. bhf records an analysis gap when it hits the RSS ceiling.
 - **A language target is skipped** — that toolchain is not installed in your
   scoped image, or the project has no fuzzable entry point in that language.
+
+### Installation selection versus run selection
+
+The default image and native installer select all sixteen languages; the default
+CLI and daemon exclude LLM provider features. `bhf auto --languages` only filters
+a run. To omit toolchains and their caches from the image construction path:
+
+```sh
+scripts/build-container-release.sh bhf:all-local
+scripts/build-container-release.sh bhf:java-python --languages java,python
+scripts/build-container-release.sh bhf:embedded-host --languages c,cpp,ada
+scripts/build-container-release.sh bhf:rust-only --languages rust
+# Explicitly omit the optional AFL++ installation:
+scripts/build-container-release.sh bhf:java-python-builtin --languages java,python --engines builtin
+BHF_LANGUAGES=java,python BHF_ENGINES=builtin docker compose -f docker/compose.yaml build bhf
+```
+
+Builds require a clean checkout. Selections are nonempty, case insensitive,
+deduplicated, and order independent, using the same aliases as `auto`.
+`all` must appear alone; empty fields, `none`, unknown names, repeated selection
+options, and combining `--languages` with `--flavor` are errors. Legacy
+`--flavor core` and `--flavor ada` retain their previous component sets; use
+`--languages` for arbitrary subsets. `--engines` applies to the new selection
+path or `runtime`. Compiled parsers remain in the binary, and unfiltered discovery
+continues to consider every language. A toolchain selection is not proof that a
+language passed end-to-end qualification.
+
+Python remains a shared operational dependency. Rust, Go, Ada, COBOL and Fortran
+retain native linking/instrumentation tools. TypeScript includes Node and esbuild;
+JavaScript includes Node. AFL++ (the default optional engine) can pull native
+compiler dependencies even for a managed-language selection. System tools may
+transitively bring Perl or runtime libraries. These dependencies are intentional;
+this option does not promise the absence of every executable associated with an
+excluded language. No subset inherits and then strips an all-language image.
+The common Rust/C toolchains in the **BHF compiler builder stage** build BHF
+itself and are distinct from customer toolchains in the shipping image.
+
+The selected canonical list is stored in
+`/usr/local/share/bhf/selected-languages.txt`, with engines in
+`selected-engines.txt`. Missing project dependencies still require separately
+prepared caches; the image does not download project code at startup. Validation
+helpers now require the explicit `validation` Docker target/Compose profile.
+
+For an extracted native bundle, use its packaged installer:
+
+```sh
+./install.sh --non-interactive --no-content --languages java,python
+```
+
+Native selection controls new dependency installation, never removes existing
+host tools, and retains all compiled parsers. `--extras none --no-smoke` omits
+optional build-recovery packages and the installer's C smoke prerequisites.
+`--no-system-packages --no-rustup` uses operator-prepared toolchains. Native
+C#/TypeScript prerequisites remain explicit warnings when unavailable; a
+successful installation alone does not establish runtime availability.
+
+Executed evidence and outstanding qualification blockers are tracked in the
+[qualification checkpoint](https://github.com/Tarmo-Technologies/bhf/blob/hardening/language-subset-qualification/docs/validation/2026-10-05-qualification-checkpoint.md).

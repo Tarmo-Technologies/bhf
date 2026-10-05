@@ -595,3 +595,16 @@ public issue — see [SECURITY.md](SECURITY.md).
 Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE). The core links only Apache-2.0 / MIT /
 BSD dependencies; user-installed GPL tools (FSF GNAT, GPRbuild, AFL++) may be driven as optional
 subprocesses, never linked. See the [licensing matrix](ROADMAP.md#1-licensing-and-dependency-policy).
+
+### Selected language installations
+
+All sixteen languages remain the default; AI/LLM features remain opt-in at build
+and invocation time. Container `--languages` controls installed toolchains,
+while `bhf auto --languages` controls only the current run. For example:
+
+```sh
+scripts/build-container-release.sh bhf:java-python --languages java,python
+```
+
+For an extracted native bundle: `./install.sh --non-interactive --no-content --languages java,python` (one shell command). See [selection and dependency details](docs/site/docker.md#installation-selection-versus-run-selection) for aliases, conflicts,
+shared dependencies, engine opt-outs, and current executed evidence.

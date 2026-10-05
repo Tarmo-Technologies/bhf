@@ -38,19 +38,26 @@ LABEL io.tarmo.bhf.ubuntu-snapshot="${UBUNTU_SNAPSHOT}"
 
 # Prepare the supported JS/TS tools without shipping npm's dependency tree.
 FROM ubuntu-pinned AS javascript-tools
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl xz-utils \
-    && rm -rf /var/lib/apt/lists/*
-RUN curl --proto '=https' --tlsv1.2 -fsSLo /tmp/node.tar.xz https://nodejs.org/dist/v24.21.0/node-v24.21.0-linux-x64.tar.xz \
-    && echo 'fd8e59d5a511510f6a298afb548f18c7d2b1be404d8b4a27d94fbe49f56cb2d6  /tmp/node.tar.xz' | sha256sum -c - \
-    && mkdir -p /opt/node /out/licenses \
-    && tar -xJf /tmp/node.tar.xz --strip-components=1 -C /opt/node
-ENV PATH=/opt/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-RUN npm install -g --prefix /opt/esbuild --no-fund --no-audit esbuild@0.28.2 \
-    && cp /opt/node/bin/node /out/node \
-    && cp /opt/esbuild/lib/node_modules/esbuild/bin/esbuild /out/esbuild \
-    && cp /opt/node/LICENSE /out/licenses/node-LICENSE \
-    && cp /opt/esbuild/lib/node_modules/esbuild/LICENSE.md /out/licenses/esbuild-LICENSE.md \
-    && /out/node --version && /out/esbuild --version
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ARG BHF_LANGUAGES=all
+COPY scripts/language-selection.sh /selection.sh
+RUN source /selection.sh; languages="$(bhf_resolve_languages "$BHF_LANGUAGES")" || exit; \
+    mkdir -p /out/usr/local/bin /out/usr/share/bhf/licenses/javascript; \
+    if bhf_has_language "$languages" javascript || bhf_has_language "$languages" typescript; then \
+      apt-get update && apt-get install -y --no-install-recommends ca-certificates curl xz-utils \
+      && curl --proto '=https' --tlsv1.2 -fsSLo /tmp/node.tar.xz https://nodejs.org/dist/v24.21.0/node-v24.21.0-linux-x64.tar.xz \
+      && echo 'fd8e59d5a511510f6a298afb548f18c7d2b1be404d8b4a27d94fbe49f56cb2d6  /tmp/node.tar.xz' | sha256sum -c - \
+      && mkdir -p /opt/node && tar -xJf /tmp/node.tar.xz --strip-components=1 -C /opt/node \
+      && cp /opt/node/bin/node /out/usr/local/bin/node \
+      && cp /opt/node/LICENSE /out/usr/share/bhf/licenses/javascript/node-LICENSE \
+      && /out/usr/local/bin/node --version || exit; \
+      if bhf_has_language "$languages" typescript; then \
+        PATH=/opt/node/bin:$PATH npm install -g --prefix /opt/esbuild --no-fund --no-audit esbuild@0.28.2 \
+        && cp /opt/esbuild/lib/node_modules/esbuild/bin/esbuild /out/usr/local/bin/esbuild \
+        && cp /opt/esbuild/lib/node_modules/esbuild/LICENSE.md /out/usr/share/bhf/licenses/javascript/esbuild-LICENSE.md \
+        && /out/usr/local/bin/esbuild --version || exit; \
+      fi; \
+    fi
 
 ########################################  builder  ########################################
 FROM ubuntu-pinned AS builder
@@ -99,6 +106,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 
 ########################################  runtime  ########################################
 FROM ubuntu-pinned AS runtime
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ARG BHF_LANGUAGES=all
+ARG BHF_ENGINES=default
+COPY scripts/language-selection.sh /usr/local/share/bhf/language-selection.sh
 ARG TARGETPLATFORM
 RUN test "${TARGETPLATFORM}" = linux/amd64
 
@@ -106,81 +117,67 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8
 
-# --- Base utilities + the sixteen language toolchains -----------------------
-# C/C++ (clang/llvm/make) is mandatory; the rest install cleanly and a target
-# whose toolchain is absent simply skips, so this image covers every lane.
-# NB: the JDK is headless (no AWT/X11 -> no mesa/second-LLVM pull) and Gradle is
-# omitted (Maven + javac cover the Java lane; a Gradle project's build recovery
-# is the one lane feature traded for a much smaller image). See docs/site/docker.md.
-# `dist-upgrade` applies security/updates packages from the dated snapshot.
-# Refresh the snapshot in reviewed releases and retain the new scan disposition.
-# Go comes from the pinned upstream archive below.
-RUN apt-get update && apt-get -y dist-upgrade && apt-get install -y --no-install-recommends \
-        # base / runtime plumbing
-        ca-certificates curl xz-utils file git tini locales \
-        # C / C++  (required build+fuzz lane)
-        make clang llvm lld libclang-rt-18-dev \
-        # Ada
-        gnat gprbuild \
-        # Java  (headless JDK + Maven; libasm-java provides asm-9.7 + asm-tree-9.7
-        # at /usr/share/java for the offline JVM coverage-agent build — see ASM_JAR_DIR)
-        default-jdk-headless libasm-java \
-        # Python  (3.12 -> sys.monitoring coverage)
-        python3 python3-dev python3-venv python3-pip \
-        # Perl
-        perl \
-        # Fortran
-        gfortran \
-        # COBOL  (GnuCOBOL cobc)
-        gnucobol \
-        # Ruby
-        ruby ruby-dev \
-        # Lua
-        lua5.4 liblua5.4-dev \
-        # PHP
-        php-cli \
-        # C#  (.NET 8 SDK from the Ubuntu archive)
-        dotnet-sdk-8.0 \
-        # AFL++ engine (optional C/C++ adapter)
-        afl++ \
-    && rm -rf /var/lib/apt/lists/* \
-    && locale-gen C.UTF-8
+# Operational Python is shared by inventory and diagnostics. Native linking
+# tools are selected by the shared closure; no all-language parent is used.
+RUN source /usr/local/share/bhf/language-selection.sh; \
+    languages="$(bhf_resolve_languages "$BHF_LANGUAGES")" || exit; \
+    case "$BHF_ENGINES" in default|builtin) ;; *) echo 'invalid BHF_ENGINES' >&2; exit 2 ;; esac; \
+    mapfile -t packages < <(bhf_language_packages container "$languages"); \
+    if [[ "$BHF_ENGINES" == default ]]; then packages+=(afl++); fi; \
+    apt-get update && apt-get -y dist-upgrade && apt-get install -y --no-install-recommends \
+      ca-certificates curl xz-utils file git tini locales python3 "${packages[@]}" \
+    && rm -rf /var/lib/apt/lists/* && locale-gen C.UTF-8 \
+    && printf '%s\n' "$languages" > /usr/local/share/bhf/selected-languages.txt \
+    && printf '%s\n' "$BHF_ENGINES" > /usr/local/share/bhf/selected-engines.txt
 
 # Go from upstream (pinned + checksum-verified).
 ARG GO_VERSION=1.27.1
 ARG GO_SHA256=63d339f0da5ab53635a56f2490a7984dfe12dfcff22ad749f63edaf590168445
-RUN curl --proto '=https' --tlsv1.2 -fsSLo /tmp/go.tgz \
+RUN source /usr/local/share/bhf/language-selection.sh; \
+    languages="$(cat /usr/local/share/bhf/selected-languages.txt)"; \
+    if bhf_has_language "$languages" go; then \
+    curl --proto '=https' --tlsv1.2 -fsSLo /tmp/go.tgz \
         "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" \
     && echo "${GO_SHA256}  /tmp/go.tgz" | sha256sum -c - \
     && tar -C /usr/local -xzf /tmp/go.tgz \
     && rm -f /tmp/go.tgz \
-    && /usr/local/go/bin/go version
+    && /usr/local/go/bin/go version ; \
+    fi
 
-COPY --from=javascript-tools /out/node /usr/local/bin/node
-COPY --from=javascript-tools /out/esbuild /usr/local/bin/esbuild
-COPY --from=javascript-tools /out/licenses/ /usr/share/bhf/licenses/javascript/
+COPY --from=javascript-tools /out/ /
 
 # Maven's upstream distribution retains its bundled licenses and has newer
 # dependencies than the archived Ubuntu Maven package.
-RUN curl --proto '=https' --tlsv1.2 -fsSLo /tmp/maven.tgz https://archive.apache.org/dist/maven/maven-3/3.10.0/binaries/apache-maven-3.10.0-bin.tar.gz \
+RUN source /usr/local/share/bhf/language-selection.sh; \
+    languages="$(cat /usr/local/share/bhf/selected-languages.txt)"; \
+    if bhf_has_language "$languages" java; then \
+    curl --proto '=https' --tlsv1.2 -fsSLo /tmp/maven.tgz https://archive.apache.org/dist/maven/maven-3/3.10.0/binaries/apache-maven-3.10.0-bin.tar.gz \
     && echo '908b1501bfb420bf7c8affb855534a9c407fd6099367bfb9f2f2dcb8e9799102bffb84518cde74c679bd76870247c6528683abdd620581bffa90f95d92d175aa  /tmp/maven.tgz' | sha512sum -c - \
     && mkdir /opt/maven && tar -xzf /tmp/maven.tgz --strip-components=1 -C /opt/maven \
     && ln -s /opt/maven/bin/mvn /usr/local/bin/mvn && rm /tmp/maven.tgz \
-    && mvn --version
+    && mvn --version ; \
+    fi
 
 COPY docker/python-build-tools.txt /usr/local/share/bhf/python-build-tools.txt
-RUN python3 -m pip install --break-system-packages --ignore-installed --no-cache-dir --no-deps --require-hashes \
+RUN source /usr/local/share/bhf/language-selection.sh; \
+    languages="$(cat /usr/local/share/bhf/selected-languages.txt)"; \
+    if bhf_has_language "$languages" python; then \
+    python3 -m pip install --break-system-packages --ignore-installed --no-cache-dir --no-deps --require-hashes \
       -r /usr/local/share/bhf/python-build-tools.txt \
     && rm -rf /usr/lib/python3/dist-packages/pip* \
               /usr/lib/python3/dist-packages/setuptools* /usr/lib/python3/dist-packages/pkg_resources* \
               /usr/lib/python3/dist-packages/wheel* /usr/lib/python3/dist-packages/packaging* \
     && python3 -m pip --version \
-    && python3 -c 'import setuptools, wheel, packaging; assert setuptools.__version__ == "84.0.0"; assert wheel.__version__ == "0.48.0"'
+    && python3 -c 'import setuptools, wheel, packaging; assert setuptools.__version__ == "84.0.0"; assert wheel.__version__ == "0.48.0"' ; \
+    fi
 
 # Pin reviewed Ruby component versions and remove superseded installed copies,
 # including default-gem files and specifications. Keep the patched components
 # usable by the interpreter and retain their licenses and source in the image.
-RUN set -eu; gem install --no-document erb:6.0.7 net-imap:0.6.7 zlib:3.2.3 rexml:3.4.4 webrick:1.9.2 cgi:0.5.2 resolv:0.7.2; \
+RUN source /usr/local/share/bhf/language-selection.sh; \
+    languages="$(cat /usr/local/share/bhf/selected-languages.txt)"; \
+    if bhf_has_language "$languages" ruby; then \
+    set -eu; gem install --no-document erb:6.0.7 net-imap:0.6.7 zlib:3.2.3 rexml:3.4.4 webrick:1.9.2 cgi:0.5.2 resolv:0.7.2; \
     gem uninstall --install-dir /usr/lib/ruby/gems/3.2.0 --ignore-dependencies --executables net-imap -v 0.3.4.1; \
     gem uninstall --install-dir /usr/lib/ruby/gems/3.2.0 --ignore-dependencies --executables rexml -v 3.2.5; \
     gem uninstall --install-dir /usr/share/rubygems-integration/all --ignore-dependencies --executables webrick -v 1.8.1; \
@@ -194,15 +191,20 @@ RUN set -eu; gem install --no-document erb:6.0.7 net-imap:0.6.7 zlib:3.2.3 rexml
            /usr/lib/ruby/gems/3.2.0/gems/resolv-0.2.2 /usr/lib/ruby/gems/3.2.0/gems/zlib-3.0.0; \
     ruby -e 'require "erb"; require "json"; require "net/imap"; require "zlib"; abort("erb not patched") unless Gem::Version.new(ERB.version) >= Gem::Version.new("6")' \
     && ruby -e 'require "cgi"; require "resolv"; require "zlib"; {"cgi"=>"0.5.2", "resolv"=>"0.7.2", "zlib"=>"3.2.3"}.each { |n,v| abort("incorrect loaded gem: " + n) unless Gem.loaded_specs[n].version.to_s == v }' \
-    && echo "erb runtime $(ruby -e 'require "erb"; puts ERB.version')"
+    && echo "erb runtime $(ruby -e 'require "erb"; puts ERB.version')" ; \
+    fi
 
 ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 \
     DOTNET_NOLOGO=1 \
     DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1
 
 # --- C# instrumentation CLI (SharpFuzz) into a shared tools path ------------
-RUN dotnet tool install --tool-path /usr/local/dotnet-tools --version 2.3.0 SharpFuzz.CommandLine \
-    && chmod -R a+rX /usr/local/dotnet-tools
+RUN source /usr/local/share/bhf/language-selection.sh; \
+    languages="$(cat /usr/local/share/bhf/selected-languages.txt)"; \
+    if bhf_has_language "$languages" csharp; then \
+    dotnet tool install --tool-path /usr/local/dotnet-tools --version 2.3.0 SharpFuzz.CommandLine \
+    && chmod -R a+rX /usr/local/dotnet-tools ; \
+    fi
 
 # --- License compliance: third-party notices + GPL/LGPL corresponding-source offer ---
 # BHF's own license is Apache-2.0; bundled packages retain their own terms.
@@ -230,10 +232,14 @@ COPY --from=builder /out/inventory/ /usr/share/bhf/sbom/
 # so pointing bhf there makes the Java lane build its agent fully offline.
 ENV ASM_JAR_DIR=/usr/share/java
 COPY java_runtime/ /usr/local/share/bhf/java_runtime/
-RUN mkdir -p /usr/local/share/bhf/jvm /tmp/bhf-jvm-cache \
+RUN source /usr/local/share/bhf/language-selection.sh; \
+    languages="$(cat /usr/local/share/bhf/selected-languages.txt)"; \
+    if bhf_has_language "$languages" java; then \
+    mkdir -p /usr/local/share/bhf/jvm /tmp/bhf-jvm-cache \
     && BHF_JVM_CACHE=/tmp/bhf-jvm-cache \
        sh /usr/local/share/bhf/java_runtime/build-agent.sh /usr/local/share/bhf/jvm/bhf-jvm-agent.jar \
-    && rm -rf /tmp/bhf-jvm-cache
+    && rm -rf /tmp/bhf-jvm-cache ; \
+    fi
 ENV BHF_JVM_AGENT_JAR=/usr/local/share/bhf/jvm/bhf-jvm-agent.jar
 
 # Runtime env: shim paths, per-user Rust toolchain, C# tools + NuGet cache.
@@ -262,11 +268,7 @@ RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin fuzzer \
     && mkdir -p /work && chown fuzzer:fuzzer /work
 
 COPY --chown=root:root docker/entrypoint.sh /usr/local/bin/bhf-entrypoint
-COPY --chown=root:root docker/bhf-sweep.sh  /usr/local/bin/bhf-sweep
-COPY --chown=root:root docker/fetch-corpus.sh /usr/local/bin/bhf-fetch-corpus
-COPY --chown=root:root docker/sweep-manifest.tsv /usr/local/share/bhf/sweep-manifest.tsv
-COPY --chown=root:root docker/sweep_contract.py /usr/local/bin/sweep_contract.py
-RUN chmod 0755 /usr/local/bin/bhf-entrypoint /usr/local/bin/bhf-sweep /usr/local/bin/bhf-fetch-corpus
+RUN chmod 0755 /usr/local/bin/bhf-entrypoint
 
 # Everything below runs AS the unprivileged fuzzer so the Rust toolchain and the
 # NuGet cache land in $HOME already owned by fuzzer — no `chown -R` over a large
@@ -279,24 +281,32 @@ WORKDIR /home/fuzzer
 # rolling `cargo +nightly` (crates/cli/src/auto/rust_build.rs). rust-src is NOT
 # added: bhf instruments via SanitizerCoverage flags, not -Zbuild-std.
 ENV BHF_RUST_NIGHTLY=nightly-2026-06-10
-RUN curl --proto '=https' --tlsv1.2 -fsSLo /tmp/rustup-init https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init \
+RUN source /usr/local/share/bhf/language-selection.sh; \
+    languages="$(cat /usr/local/share/bhf/selected-languages.txt)"; \
+    if bhf_has_language "$languages" rust; then \
+    curl --proto '=https' --tlsv1.2 -fsSLo /tmp/rustup-init https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init \
     && echo '20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c  /tmp/rustup-init' | sha256sum -c - \
     && chmod +x /tmp/rustup-init \
     && /tmp/rustup-init -y --profile minimal --default-toolchain nightly-2026-06-10 \
     && rm /tmp/rustup-init \
     && rustup component add --toolchain nightly-2026-06-10 llvm-tools-preview \
-    && rustc +nightly-2026-06-10 --version
+    && rustc +nightly-2026-06-10 --version ; \
+    fi
 
 # C# air-gap: prime the fuzzer's default NuGet cache with SharpFuzz 2.3.0 (bhf's
 # own instrumentation dependency) plus the SDK build packages a net8.0 harness
 # restore pulls, so a self-contained C# target builds offline. A target with its
 # OWN NuGet PackageReferences still needs those staged into NUGET_PACKAGES by the
 # operator (see docs/site/docker.md), exactly like a Maven target's ~/.m2.
-RUN set -eux; d="$(mktemp -d)"; cd "$d"; \
+RUN source /usr/local/share/bhf/language-selection.sh; \
+    languages="$(cat /usr/local/share/bhf/selected-languages.txt)"; \
+    if bhf_has_language "$languages" csharp; then \
+    set -eux; d="$(mktemp -d)"; cd "$d"; \
     printf '%s' '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net8.0</TargetFramework><LangVersion>latest</LangVersion></PropertyGroup><ItemGroup><PackageReference Include="SharpFuzz" Version="2.3.0" /></ItemGroup></Project>' > warm.csproj; \
     echo 'class P{static void Main(){}}' > Program.cs; \
     dotnet build -c Release -v quiet; \
-    cd /; rm -rf "$d"
+    cd /; rm -rf "$d" ; \
+    fi
 
 WORKDIR /work
 ENV BHF_SWEEP_MANIFEST=/usr/local/share/bhf/sweep-manifest.tsv \
@@ -316,13 +326,14 @@ LABEL org.opencontainers.image.title="bhf" \
       org.opencontainers.image.version="${BHF_VERSION}" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.created="${BUILD_DATE}"
-LABEL io.tarmo.bhf.source-archive-sha256="${BHF_SOURCE_SHA256}" io.tarmo.bhf.flavor="runtime"
+LABEL io.tarmo.bhf.source-archive-sha256="${BHF_SOURCE_SHA256}" io.tarmo.bhf.flavor="runtime" \
+      io.tarmo.bhf.languages="${BHF_LANGUAGES}" io.tarmo.bhf.engines="${BHF_ENGINES}"
 
 ENTRYPOINT ["/usr/bin/tini","--","/usr/local/bin/bhf-entrypoint"]
 CMD ["--help"]
 
 ########################################  core  ########################################
-# Default distribution: C/C++ build-and-fuzz tools, deterministic CLI/daemon,
+# Legacy explicit profile: C/C++ tools, deterministic CLI/daemon,
 # and Linux shims. The full sixteen-language environment remains available as
 # `docker build --target runtime ...` (the validation Compose profile uses it).
 FROM ubuntu-pinned AS core
@@ -382,5 +393,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends gnat gprbuild \
 LABEL io.tarmo.bhf.flavor="ada"
 USER fuzzer
 
-# Include every supported language unless a smaller target is explicitly selected.
+# Validation helpers are an explicit component; never fetched/executed by default.
+FROM runtime AS validation
+USER root
+COPY docker/bhf-sweep.sh /usr/local/bin/bhf-sweep
+COPY docker/fetch-corpus.sh /usr/local/bin/bhf-fetch-corpus
+COPY docker/sweep-manifest.tsv /usr/local/share/bhf/sweep-manifest.tsv
+COPY docker/sweep_contract.py /usr/local/bin/sweep_contract.py
+RUN chmod 0755 /usr/local/bin/bhf-sweep /usr/local/bin/bhf-fetch-corpus
+USER fuzzer
+
+# Include every supported language unless a smaller selection is explicit.
 FROM runtime AS production

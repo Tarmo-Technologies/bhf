@@ -1546,7 +1546,7 @@ fn installer_command(bundle: &Path, prefix: &Path) -> Command {
         ])
         .args([
             "--languages",
-            "none",
+            "python",
             "--targets",
             "none",
             "--fuzzers",
@@ -1568,7 +1568,7 @@ fn installer_command_with_symlinks(bundle: &Path, prefix: &Path, bin_dir: &Path)
         .args(["--non-interactive", "--no-system-packages", "--no-rustup"])
         .args([
             "--languages",
-            "none",
+            "python",
             "--targets",
             "none",
             "--fuzzers",

@@ -95,3 +95,16 @@ class InventoryTests(unittest.TestCase):
     def test_core_does_not_claim_extra_toolchains(self):
         result = MERGE.reconcile_tools(self.merge(), {"flavor": "core", "components": []}, "core")
         self.assertEqual(len(result["components"]), 4)
+
+    def test_subset_requires_matching_image_selection(self):
+        tools = {"flavor": "runtime", "languages": ["java", "python"], "components": []}
+        result = MERGE.reconcile_tools(self.merge(), tools, "runtime", ["java", "python"])
+        self.assertEqual(len(result["components"]), 4)
+        with self.assertRaisesRegex(ValueError, "language inventory"):
+            MERGE.reconcile_tools(self.merge(), tools, "runtime", ["rust"])
+
+    def test_subset_cannot_omit_selected_standalone_tools(self):
+        for languages in [["rust"], ["go"], ["javascript"], ["typescript"]]:
+            tools = {"flavor": "runtime", "languages": languages, "components": []}
+            with self.assertRaisesRegex(ValueError, "toolchain inventory"):
+                MERGE.reconcile_tools(self.merge(), tools, "runtime", languages)

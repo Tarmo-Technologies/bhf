@@ -4,10 +4,16 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 usage() {
-  echo 'usage: build-container-release.sh [IMAGE] [--flavor runtime|core|ada]'
+  echo 'usage: build-container-release.sh [IMAGE] [--languages LIST | --flavor runtime|core|ada] [--engines default|builtin]'
   echo 'Default: all sixteen supported languages (runtime).'
 }
+source scripts/language-selection.sh
 image=''
+languages=all
+language_seen=0
+flavor_seen=0
+engines_seen=0
+engines=default
 flavor=runtime
 target=()
 while (($#)); do
@@ -15,19 +21,37 @@ while (($#)); do
     --help|-h) usage; exit 0 ;;
     --flavor)
       [[ $# -ge 2 ]] || { usage >&2; exit 2; }
-      flavor="$2"; target=(--target "$flavor"); shift 2 ;;
+      [[ "$flavor_seen" == 0 ]] || { echo 'duplicate --flavor' >&2; exit 2; }
+      flavor_seen=1; flavor="$2"; target=(--target "$flavor"); shift 2 ;;
+    --languages)
+      [[ $# -ge 2 && "$language_seen" == 0 ]] || { usage >&2; exit 2; }
+      language_seen=1; languages="$2"; shift 2 ;;
+    --engines)
+      [[ $# -ge 2 && "$engines_seen" == 0 ]] || { usage >&2; exit 2; }
+      engines_seen=1
+      engines="$2"; shift 2 ;;
     --*) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
     *)
       if [[ -z "$image" ]]; then image="$1"
       elif [[ ${#target[@]} -eq 0 ]]; then
         # Compatibility with the original IMAGE FLAVOR invocation.
-        flavor="$1"; target=(--target "$flavor")
+        flavor_seen=1; flavor="$1"; target=(--target "$flavor")
       else usage >&2; exit 2
       fi
       shift ;;
   esac
 done
 case "$flavor" in core|runtime|ada) ;; *) echo "unsupported image flavor: $flavor" >&2; exit 2 ;; esac
+[[ "$language_seen" == 0 || "$flavor_seen" == 0 ]] || { echo '--languages and --flavor are mutually exclusive' >&2; exit 2; }
+case "$engines" in default|builtin) ;; *) echo 'unsupported engines; use default or builtin' >&2; exit 2 ;; esac
+# Legacy Docker targets keep their historical component sets. Use --languages
+# for the unified arbitrary-subset path, including explicit engine selection.
+[[ "$flavor" == runtime || "$engines" == default ]] || { echo '--engines requires --languages or runtime flavor' >&2; exit 2; }
+case "$flavor" in
+  core) languages=c,cpp; engines=builtin ;;
+  ada) languages=c,cpp,ada; engines=builtin ;;
+esac
+languages="$(bhf_resolve_languages "$languages")"
 if [[ -n "$(git status --porcelain)" ]]; then
   echo 'release build requires a clean source checkout' >&2
   exit 2
@@ -43,6 +67,8 @@ build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 image="${image:-bhf:${version}}"
 started=$SECONDS
 git archive --format=tar HEAD | docker build --platform linux/amd64 "${target[@]}" -f Dockerfile -t "$image" \
+  --build-arg "BHF_LANGUAGES=$languages" \
+  --build-arg "BHF_ENGINES=$engines" \
   --build-arg "BHF_VERSION=$version" \
   --build-arg "VCS_REF=$commit" \
   --build-arg "BUILD_DATE=$build_date" \
@@ -59,5 +85,7 @@ platform=linux/amd64
 build_date=$build_date
 features=default-no-llm
 flavor=$flavor
+languages=$languages
+engines=$engines
 build_elapsed_seconds=$elapsed
 MANIFEST

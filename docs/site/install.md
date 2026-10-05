@@ -365,3 +365,16 @@ inspect the `stub_execution` block in `run.json` before trusting it.
 
 See [auto.md](./auto.md) for the full `bhf auto` reference, including scaling
 to large trees, force-fuzz mode, and static-analysis integration.
+
+### Selected language installations
+
+All sixteen languages remain the default; AI/LLM features remain opt-in at build
+and invocation time. Container `--languages` controls installed toolchains,
+while `bhf auto --languages` controls only the current run. For example:
+
+```sh
+scripts/build-container-release.sh bhf:java-python --languages java,python
+```
+
+For an extracted native bundle: `./install.sh --non-interactive --no-content --languages java,python` (one shell command). See [selection and dependency details](docker.md#installation-selection-versus-run-selection) for aliases, conflicts,
+shared dependencies, engine opt-outs, and current executed evidence.

@@ -39,16 +39,26 @@ def inventory(flavor):
     result = {"schema_version": 1, "flavor": flavor, "components": []}
     if flavor != "runtime":
         return result
-    for name, command, version in (
-        ("node", "node", output("node", "--version").removeprefix("v")),
-        ("esbuild", "esbuild", output("esbuild", "--version")),
-        ("go", "go", output("go", "version").split()[2].removeprefix("go")),
-        ("rustup", "rustup", output("rustup", "--version").split()[1]),
-    ):
+    selection_path = pathlib.Path("/usr/local/share/bhf/selected-languages.txt")
+    languages = selection_path.read_text().strip().split(",") if selection_path.exists() else None
+    if languages is not None:
+        result["languages"] = languages
+    commands = []
+    if languages is None or {"javascript", "typescript"} & set(languages):
+        commands.append(("node", "node", output("node", "--version").removeprefix("v")))
+    if languages is None or "typescript" in languages:
+        commands.append(("esbuild", "esbuild", output("esbuild", "--version")))
+    if languages is None or "go" in languages:
+        commands.append(("go", "go", output("go", "version").split()[2].removeprefix("go")))
+    if languages is None or "rust" in languages:
+        commands.append(("rustup", "rustup", output("rustup", "--version").split()[1]))
+    for name, command, version in commands:
         path = pathlib.Path(shutil.which(command)).resolve(strict=True)
         ecosystem = "npm" if name == "esbuild" else "generic"
         result["components"].append(component(name, version, f"pkg:{ecosystem}/{name}@{quote(version, safe='')}",
                                               {str(path): digest(path)}))
+    if languages is not None and "rust" not in languages:
+        return result
     rustc = pathlib.Path(output("rustup", "which", "rustc"))
     root = rustc.parent.parent.resolve()
     manifest_path = root / "lib/rustlib/multirust-channel-manifest.toml"

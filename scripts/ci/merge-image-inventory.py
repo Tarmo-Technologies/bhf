@@ -6,6 +6,7 @@ import hashlib
 import json
 import pathlib
 import re
+import subprocess
 
 
 def reconcile(filesystem, rust, receipt, inspect, binaries):
@@ -72,12 +73,26 @@ def main():
                        read("build-receipt.json"), read("image-inspect.json"), args.binaries)
     tools = read("toolchains.json")
     flavor = read("image-inspect.json")[0]["Config"]["Labels"]["io.tarmo.bhf.flavor"]
-    result = reconcile_tools(result, tools, flavor)
+    label = read("image-inspect.json")[0]["Config"]["Labels"].get("io.tarmo.bhf.languages")
+    languages = None
+    if label is not None:
+        resolver = pathlib.Path(__file__).resolve().parents[1] / "language-selection.sh"
+        languages = subprocess.check_output(["bash", "-c", 'source "$1"; bhf_resolve_languages "$2"',
+                                             "resolve", str(resolver), label], text=True).strip().split(",")
+    result = reconcile_tools(result, tools, flavor, languages)
     (args.evidence / "image.cyclonedx.json").write_text(json.dumps(result, indent=2) + "\n")
 
 
-def reconcile_tools(sbom, tools, flavor):
+def reconcile_tools(sbom, tools, flavor, languages=None):
     expected = {"node", "esbuild", "go", "rustup", "rustc", "cargo", "rust-std", "llvm-tools-preview"} if flavor == "runtime" else set()
+    if languages is not None:
+        if tools.get("languages") != languages or not languages:
+            raise ValueError("mismatched selected language inventory")
+        expected = set()
+        if {"javascript", "typescript"} & set(languages): expected.add("node")
+        if "typescript" in languages: expected.add("esbuild")
+        if "go" in languages: expected.add("go")
+        if "rust" in languages: expected.update({"rustup", "rustc", "cargo", "rust-std", "llvm-tools-preview"})
     components = tools["components"]
     if tools["flavor"] != flavor or {c["name"] for c in components} != expected:
         raise ValueError("missing or mismatched standalone toolchain inventory")
