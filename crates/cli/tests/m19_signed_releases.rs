@@ -241,11 +241,15 @@ fn ci_enforces_the_current_supported_os_matrix() {
     let ci = read(root.join(".github/workflows/ci.yml"));
     let release = read(root.join(".github/workflows/release.yml"));
     let windows_smoke = read(root.join("scripts/ci/windows-release-smoke.ps1"));
-    let release_notes = read(root.join("RELEASE_NOTES.md"));
-    let published_version = release_notes
+    let cargo = read(root.join("Cargo.toml"));
+    let release_version = cargo
+        .split("[workspace.package]")
+        .nth(1)
+        .expect("workspace package metadata")
         .lines()
-        .find_map(|line| line.strip_prefix("## Previous release: v"))
-        .expect("latest published version in release notes");
+        .find_map(|line| line.strip_prefix("version = \""))
+        .and_then(|line| line.strip_suffix('"'))
+        .expect("current release version in workspace metadata");
     let readme = read(root.join("README.md"));
     let install = read(root.join("docs/site/install.md"));
     let windows = read(root.join("docs/site/windows.md"));
@@ -294,9 +298,9 @@ fn ci_enforces_the_current_supported_os_matrix() {
             "support documentation omitted {required}"
         );
     }
-    assert!(readme.contains(&format!("VERSION={published_version}")));
-    assert!(install.contains(&format!("VERSION={published_version}")));
-    assert!(windows.contains(&format!("$Version = \"{published_version}\"")));
+    assert!(readme.contains(&format!("VERSION={release_version}")));
+    assert!(install.contains(&format!("VERSION={release_version}")));
+    assert!(windows.contains(&format!("$Version = \"{release_version}\"")));
 }
 
 #[cfg(unix)]

@@ -6,6 +6,21 @@ Unpublished. Exact-revision CI, image acceptance, scan review, and protected
 publisher signing determine release eligibility; this heading is not approval.
 
 - Default CLI/daemon exclude LLM connectivity, with explicit opt-in builds.
+- Native and container installers share language names, aliases, and dependency
+  selection. `all` selects sixteen languages; an empty language selection or
+  combining `all` with named languages is rejected before installation.
+- Windows C/C++ default runs locate Clang's ASan DLL automatically. The driver
+  reports unhandled exceptions while allowing exceptions handled by ASan or the
+  target to continue. Earlier sanitizer-disabled smoke checks missed this issue.
+- When every attempted fuzz pass fails, `auto` preserves the runtime error in
+  `auto/run.json`. A run with no successful target or finding exits nonzero.
+- README and CLI help show a one-target first run, compiler prerequisites, and
+  the findings and blocked-target reports. Offline installation verifies the
+  complete archive before extraction and requires an external operator policy.
+- Automatic runs retain a maximum 64 MiB corpus per target and stop starting
+  targets at the default 4 GiB work-directory ceiling. `bhf clean <work-dir> --compact`
+  preserves findings and replay evidence. `--resume` reuses completed targets
+  when source, build context, and harness options remain compatible.
 - The default container includes all sixteen supported languages without LLM
   integration. `--languages` explicitly narrows a run; `--flavor core` or
   `--flavor ada` selects a smaller image. Validation sweeps require explicit startup.

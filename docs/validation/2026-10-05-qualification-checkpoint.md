@@ -45,13 +45,13 @@ No external projects or credentials are mounted into these functional checks.
 | Area | Action and evidence status |
 |---|---|
 | Language selection | Shared resolver implemented. The exact `12d6066` default, sixteen singleton, and three mixed images passed construction, selection receipt, exclusion, and lifecycle checks. |
-| Native installation | Shared resolver, pre-side-effect rejection, dry-run dependency closure, and authenticated install/tamper/upgrade/rollback tests passed 30/30. Fresh bundles passed signed archive verification, installation, and a C target-entry smoke. Exact CI binaries passed authenticated installation on seven supported Linux releases. Actual generated CLI/daemon installers and native C execution also passed on the retained Server 2019 and Windows 11 guests. The new pre-tag installer CI gates exposed defects still being validated in the final fix pass. |
+| Native installation | Shared resolver, pre-side-effect rejection, dry-run dependency closure, and authenticated install/tamper/upgrade/rollback tests passed 30/30. Final CI and actual packaged customer-command checks passed after correcting the installer and Windows default-run defects. The final Linux bundle passed authenticated installation with its smoke enabled, default C execution, and resume. The final Windows component archives passed default sanitized C execution on all three retained guests and clean C++ execution on Server 2019. |
 | Default no AI | Selected CLI/daemon compiled graph excludes `llm_harness_gen`; all twenty images passed dummy-provider and command/MCP exposure controls. |
 | Functional controls | All sixteen BHF-owned clean controls entered non-stub targets through public `bhf auto`, executed inputs, produced measured feedback, and emitted valid JSON. Dependency-bearing Java controls also passed. |
 | Artifact sizes | Exact local configuration IDs and unpacked bytes recorded for twenty images. The exact-head default image's compressed Docker archive and complete review archive are also recorded. Compressed and largest-layer comparison remains incomplete across every subset. |
 | Inventory and signing | Independent verifier tests passed 8/8. Exact-head inventory, scan, acceptance record, BHF source, and all 108 requested Ubuntu source packages are in an unsigned review archive. The scan has zero policy blockers and 829 residual matches requiring review; no publisher key creation or release publication occurred. |
 | 100 upstream projects | No frozen verified 100-project manifest or scored trials produced. Unrun; no success rate claimed. |
-| Release support | Sixteen-language target-entry, supported-Linux authenticated installation, retained Windows component installation/native execution, and source-bound unsigned redistribution archives passed. Final installer CI, the 100-project qualification, redistribution review, and publisher-authenticated handoff remain incomplete. The user excluded protected human approval from this execution; no protected workflow setting or review decision was changed. |
+| Release support | Final installer CI, sixteen-language target-entry, default container execution, authenticated Linux customer installation/resume, retained Windows default component execution, and source-bound unsigned archive validation passed. The 100-project qualification, redistribution review, and publisher-authenticated handoff remain incomplete. The user excluded protected human approval from this execution; no protected workflow setting or review decision was changed. |
 | Optional limits | Physical boards, arbitrary RTOS fidelity, Windows ETW and broad private-resource Rust remain scoped capability limitations. |
 
 The 100-project qualification budget is up to 50 CPU-hours of requested target
@@ -295,3 +295,80 @@ workflow still needs execution against the rebuilt artifacts.
 The compact matrix identities, sizes, per-language owned-control measurements,
 and scan hashes are in the
 [language-selection results](2026-10-05-language-selection-results.md).
+
+## Final packaged customer-workflow validation
+
+Customer workflow decision: **PASS** for branch source
+`d3509e35766c56a377f6735bfd5a5b228492c5c4`. Hosted CI run
+`37321367468` passed every required check, including all supported Linux
+compatibility jobs and Windows Server 2022/2025. The native artifacts report
+CI merge source `d1bd11b74f690bbe70e8ccf61b0a223cbd65e63c`; its tracked tree
+is identical to the branch source. These source identities are preserved;
+subsequent documentation-only commits are not represented by these artifacts.
+
+The actual EL7 CI binaries were packaged with a disposable test key. The
+independent Python verifier authenticated a private copy before extraction.
+The extracted installer ran with its smoke enabled, an external test policy,
+a new prefix, and no package-manager, Rust, or symlink changes. The installed
+CLI then ran the README command with default sanitizers against a clean owned
+C fixture: one non-stub target, 103,814 executions, eight measured edges,
+zero findings, and both documented report paths. Repeating that command with
+`--resume` reloaded one completed target and reran zero targets. The private
+key was deleted. This proves the authentication workflow with a test identity;
+it does not authenticate a publisher.
+
+The 16,850,074-byte Linux bundle hashes to
+`7d6c731b7af92beb41e8d207376a558c0ea62776e025f8e5999fe6173efa4e25`.
+Its receipt hashes to
+`e78da0cbdc999da858d9e60b7b8bffedc2b8a15b4795bbbabc9655b639aa4d46`.
+Raw evidence is under
+`/tmp/bhf-qualification-20261005/customer-native-d3509e3`.
+
+The final default container is
+`sha256:ae789a83a8140534bfbeb65e540ca7f8e2fc21c3b1cbdd7e9ef78d3ab64199bb`.
+Its full acceptance record hashes to
+`b2bed9d2fdb60d81a91afc93e53757be9c681ee1949ff2e9eb132f20c2537d9e`.
+A disconnected, read-only, non-root run of the README default command completed
+97,688 executions and eight measured edges on a clean owned C target, with zero
+findings. All sixteen owned language controls also passed: each entered one
+non-stub target, executed 32 inputs, measured positive coverage, and produced
+zero findings. Those bounded controls used `--sanitizers none` and are separate
+from the default C check. Their combined JSON hashes to
+`9941f8b18d8f6079d22e26e7337851b0926f4db14bdbce3d0cd897186b6dec46`.
+
+The final unsigned container archive contains the tested image, exact BHF source,
+all 108 matching Ubuntu source-package requests, and sealed inventory/scan data.
+It is 2,263,886,372 bytes and hashes to
+`eb61458454348a1f64e7c31c0a2b696328bdff1d0230c348aa30daa37907cb1b`.
+An independent streaming read checked all 370 manifest files against their
+hashes and matched the source/image identity. The scan still has zero policy
+blockers and 829 residual matches under investigation. No risk acceptance or
+publisher signature is implied.
+
+Final retained Windows component/default C checks passed on Server 2019,
+Windows 11 25H2, and Windows 11 LTSC 2024, detecting the owned fixture's
+intentional ASan stack-buffer-overflow. A clean default C++ run on Server 2019
+completed 30,507 executions and 38 measured edges with zero findings. See
+[the Windows evidence record](2026-10-05-windows-installer-results.md).
+All three guests were shut down and their original boot orders restored.
+Horizon remained running.
+
+The final documentation review checked README/install steps against the actual
+installer, source, and packaged command output. All 41 public command-help
+interfaces returned valid help. The documentation site/link build, SPDX check,
+242 CI policy tests, real all-inputs-rejected regression, and 12 help-related
+ unit tests passed. A style-marker scan covered 183 tracked documentation files
+with no drafting or AI-phrase matches. The release checklist now assigns bundle
+creation/signing to the actual protected job and requires archive authentication
+before extraction. The unavailable dedicated documentation-review skill was
+replaced by direct source, command, and evidence review.
+
+The download examples now target the 0.2.35 candidate instead of the previous
+published release. The documentation contract checks those examples against
+the workspace release version. All 13 release-document/manifest contract tests
+pass. The candidate remains unpublished until the release process completes.
+
+The retained 100-project requirement remains unrun; customer functionality
+checks do not satisfy that scored qualification. Its status is kept separate
+from the passed functional checks. Protected human approval remains excluded
+from this execution, with no workflow setting or review decision changed.

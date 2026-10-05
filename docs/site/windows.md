@@ -100,7 +100,7 @@ installer:
   automation, or manual verification—not additional programs to install.
 
 ```powershell
-$Version = "0.2.34"
+$Version = "0.2.35"
 irm "https://github.com/Tarmo-Technologies/bhf/releases/download/$Version/bhf-installer.ps1" | iex
 bhf.exe --version
 ```

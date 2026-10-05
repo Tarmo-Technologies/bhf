@@ -226,10 +226,10 @@ Obtain the verifier, publisher public key, and operator policy through a trusted
 channel independent of the archive. Verification needs Python 3 and an
 Ed25519-capable OpenSSL; EL7 needs an approved newer OpenSSL or a separate
 verification host. Set `VERSION` to the release you received; the example uses
-the latest published version.
+0.2.35 release candidate.
 
 ```sh
-VERSION=0.2.34
+VERSION=0.2.35
 BASE="https://github.com/Tarmo-Technologies/bhf/releases/download/${VERSION}"
 ARCHIVE="bhf-dist-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 
@@ -316,7 +316,7 @@ Releases include `bhf-x86_64-pc-windows-msvc.zip`,
 PowerShell installers. For example:
 
 ```powershell
-$Version = "0.2.34"
+$Version = "0.2.35"
 irm "https://github.com/Tarmo-Technologies/bhf/releases/download/$Version/bhf-installer.ps1" | iex
 bhf.exe --version
 ```

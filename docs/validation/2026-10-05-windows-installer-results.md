@@ -37,9 +37,35 @@ LLVM/Visual Studio compilation, and public `bhf auto` execution of the owned
 | Windows 11 Enterprise 25H2 Evaluation | 115 | 26200 | CLI and daemon PASS | One non-stub target, 32 executions, nine measured edges, zero findings |
 | Windows 11 Enterprise LTSC 2024 Evaluation | 116 | 26100 | CLI and daemon PASS | One non-stub target, 32 executions, nine measured edges, zero findings |
 
-The clean fixture produced no findings as expected. These runs used
-`--sanitizers none`; sanitizer and concurrency fidelity remain unexercised by
-this smoke. Hosted CI separately exercises installers under PowerShell Core.
+The deliberately faulty fixture emitted no findings in these sanitizer-disabled
+runs. Those results did not validate default sanitizers or detection of its
+intended fault. Hosted CI separately exercises installers under PowerShell Core.
+
+## Default packaged customer command
+
+Final CI run `37321367468` passed every required job. Its Windows component
+artifact `11350274760` hashes to
+`6d62aa183b4a0f7536991b2b792935b345c2ded72bd9440e02d4a3bb33841d10`.
+The compiled source is `d1bd11b74f690bbe70e8ccf61b0a223cbd65e63c`, whose
+tracked tree equals branch commit `d3509e35766c56a377f6735bfd5a5b228492c5c4`.
+
+The actual generated installers were repeated on all three guests. The shared
+smoke now runs the README command with `--jobs 1 --max-targets 1
+--per-target-time 10`, keeping default sanitizers and the default pass cascade.
+It requires measured executions, coverage, and the documented reports.
+
+| Guest | Executions | Measured edges | Findings |
+|---|---|---|---|
+| Server 2019 | 242 | 11 | One intended ASan stack-buffer-overflow |
+| Windows 11 25H2 | 643 | 11 | One intended ASan stack-buffer-overflow |
+| Windows 11 LTSC 2024 | 655 | 11 | One intended ASan stack-buffer-overflow |
+
+A separate clean C++ default run on Server 2019 completed 30,507 executions,
+measured 38 edges, and produced zero findings. The combined C-run summary
+`windows-default-platform-summary-d1bd11b7.json` hashes to
+`5f69be96d35df6c94641219ae11f36aa43b34a6f4b28193ac942e8057536f147`.
+All guests were restored to their initial stopped states and original boot
+orders after evidence capture. Horizon remained running.
 
 ## Evidence and cleanup
 
