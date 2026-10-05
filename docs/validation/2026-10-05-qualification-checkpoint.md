@@ -28,10 +28,10 @@ No external projects or credentials are mounted into these functional checks.
 | Native installation | Shared resolver, pre-side-effect rejection, dry-run dependency closure, and authenticated install/tamper/upgrade/rollback tests passed 30/30. A fresh exact-head Linux bundle also passed signed archive verification, installation, and its C target-entry smoke. The disposable OS matrix remains a release gate. |
 | Default no AI | Selected CLI/daemon compiled graph excludes `llm_harness_gen`; all twenty images passed dummy-provider and command/MCP exposure controls. |
 | Functional controls | All sixteen BHF-owned clean controls entered non-stub targets through public `bhf auto`, executed inputs, produced measured feedback, and emitted valid JSON. Dependency-bearing Java controls also passed. |
-| Artifact sizes | Exact local configuration IDs and unpacked bytes recorded for twenty images. Compressed/archive and largest-layer comparison is still incomplete for every selection. |
-| Inventory and signing | Independent verifier tests passed 8/8. Exact-image inventory and scan completed with zero policy blockers and 829 residual matches requiring review; no publisher key creation or release publication occurred. |
+| Artifact sizes | Exact local configuration IDs and unpacked bytes recorded for twenty images. The exact-head default image's compressed Docker archive and complete review archive are also recorded. Compressed and largest-layer comparison remains incomplete across every subset. |
+| Inventory and signing | Independent verifier tests passed 8/8. Exact-head inventory, scan, acceptance record, BHF source, and all 108 requested Ubuntu source packages are in an unsigned review archive. The scan has zero policy blockers and 829 residual matches requiring review; no publisher key creation or release publication occurred. |
 | 100 upstream projects | No frozen verified 100-project manifest or scored trials produced. Unrun; no success rate claimed. |
-| Release support | Sixteen-language target-entry, exact-head CI, offline native/platform install matrix, license/source completeness and human risk review remain blockers until executed. |
+| Release support | Sixteen-language target-entry and an exact-head unsigned redistribution archive passed. The 100-project qualification, complete native/platform install matrix, redistribution review, protected human risk review, and publisher-authenticated handoff remain blockers. |
 | Optional limits | Physical boards, arbitrary RTOS fidelity, Windows ETW and broad private-resource Rust remain scoped capability limitations. |
 
 The 100-project qualification budget is up to 50 CPU-hours of requested target
@@ -139,11 +139,37 @@ Residual matches remain untriaged and require protected human review. Global
 Rust formatting also reports pre-existing differences outside the
 changed files; changed Rust files pass their scoped formatting check.
 
+The documentation head
+`27fa1bb85b9c0e4550c4617c340d01eaaf2ff5d6` was then built as a fresh
+all-language default image and passed the full container acceptance path. The
+image configuration digest is
+`sha256:0f87da0b4aad41751e22cb37d2491fecb2d7e0b0a501baca3d48cea84f364114`,
+with 3,647,380,699 unpacked bytes and a 1,392,718,906-byte gzip Docker archive.
+Its source archive hashes to
+`e3205d3c318ecc9949c0706a2d709abaa5bfe27f600d2cbf98b0caa5f9c0f226`.
+The sealed acceptance record is `PASS`; inventory reconciliation, isolated
+runtime controls, dependency-bearing Java, and all-language toolchain smoke
+completed. The current scan again records zero blockers and 829 residual
+matches. The scan JSON hashes to
+`bd74b591849f445ee7f3b36b2d132c3301b8fb4cc09c807cc0180d654c1f5549`.
+
+The matching unsigned redistribution candidate contains the saved tested
+image, exact BHF source archive, 108 requested Ubuntu source packages across
+335 corresponding-source files, license and Rust notice material, inventories,
+the complete scan, and sealed acceptance logs. All downloaded-source checksums
+and the candidate checksum passed. The archive has 374 members, with 370 files
+bound into its release manifest; it is 2,263,872,500 bytes and hashes to
+`b40b890b9ec208bff185aaa03d2b401b016682468f64629af3ea5e73c9e097f9`.
+Its manifest state is `requires_detached_signature`. These materials make the
+candidate reviewable; they do not complete license review, accept residual
+vulnerability risk, or authenticate a publisher.
+
 Raw execution evidence is retained locally under
 `/tmp/bhf-qualification-20261005`; this is a workspace location, not a contractor
 download link. The 100-project sweep, actual native package installation on every
-supported OS, complete redistribution materials, and publisher-authenticated
-handoff remain unrun or incomplete. Decision remains **NOT_READY**.
+supported OS, redistribution and residual-risk review, and
+publisher-authenticated handoff remain unrun or incomplete. Decision remains
+**NOT_READY**.
 
 The compact matrix identities, sizes, per-language owned-control measurements,
 and scan hashes are in the
