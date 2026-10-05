@@ -25,7 +25,7 @@ No external projects or credentials are mounted into these functional checks.
 | Area | Action and evidence status |
 |---|---|
 | Language selection | Shared resolver implemented. The exact `12d6066` default, sixteen singleton, and three mixed images passed construction, selection receipt, exclusion, and lifecycle checks. |
-| Native installation | Shared resolver, pre-side-effect rejection, dry-run dependency closure, authenticated install/tamper/upgrade/rollback tests passed 30/30. Actual disposable OS install matrix remains a release gate. |
+| Native installation | Shared resolver, pre-side-effect rejection, dry-run dependency closure, and authenticated install/tamper/upgrade/rollback tests passed 30/30. A fresh exact-head Linux bundle also passed signed archive verification, installation, and its C target-entry smoke. The disposable OS matrix remains a release gate. |
 | Default no AI | Selected CLI/daemon compiled graph excludes `llm_harness_gen`; all twenty images passed dummy-provider and command/MCP exposure controls. |
 | Functional controls | All sixteen BHF-owned clean controls entered non-stub targets through public `bhf auto`, executed inputs, produced measured feedback, and emitted valid JSON. Dependency-bearing Java controls also passed. |
 | Artifact sizes | Exact local configuration IDs and unpacked bytes recorded for twenty images. Compressed/archive and largest-layer comparison is still incomplete for every selection. |
@@ -104,6 +104,23 @@ Exact-head CI on PR #92 passed its acceptance gate at `12d6066`, including
 Rust 1.88, build/test, core and default container jobs, RHEL 7/8/9/10,
 Ubuntu 22.04/24.04/26.04, Windows build and Server 2025 compatibility,
 license audit, SBOM, docs, and the hermetic target-entry gate.
+
+At documentation head `b1b9bec379d430cb3f672401f2a234d11528fadf`, a clean
+locked release workspace build was packaged into a 17,109,697-byte offline
+Linux bundle with a disposable BHF-generated PKCS#8 v2 test key. The complete
+archive was independently verified into a private copy before extraction. The
+bundle installer then authenticated its content pack, installed the CLI,
+daemon, bug-report tool, and both Linux shims into a clean prefix, and passed
+its bundled C target-entry smoke: one target built and fuzzed, eight executions,
+six edges, and zero findings. The development binary reported
+`bhf 0.2.34-60-gb1b9bec` and commit `b1b9bec`; a version tag was not present.
+The archive SHA-256 is
+`d360dad713fd2c97b75cbda7bac6b8891395f3f3353c42b46b74f5b07c4d83e1`,
+and the 64-byte detached signature's SHA-256 is
+`62a0ddd35591c86ca6c1c7581670f447bd00544b06cc39990a34eb057f828936`.
+The disposable private key was deleted after the receipts were captured. This
+single-host test does not replace installation on every supported OS or
+publisher signing.
 
 Whole-image inventory of the older all-language image
 `sha256:6f7c175dff3751da9c7195219f5810481dfacd0fb13ca1c254ed47fa70cc78d4`
