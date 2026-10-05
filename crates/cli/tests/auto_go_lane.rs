@@ -111,10 +111,10 @@ fn go_coverage_instruments_the_target_module_not_just_the_harness() {
         eprintln!("skipping: no go toolchain on PATH (GNAT-less rule)");
         return;
     }
-    let src = std::env::temp_dir().join(format!("bhf_golane_cov_s_{}", std::process::id()));
+    let src = std::env::temp_dir().join(format!("bhf go lane cov source {}", std::process::id()));
     let _ = std::fs::remove_dir_all(&src);
     copy_dir(&fixture(), &src).expect("copy go fixture module");
-    let work = std::env::temp_dir().join(format!("bhf_golane_cov_w_{}", std::process::id()));
+    let work = std::env::temp_dir().join(format!("bhf go lane cov work {}", std::process::id()));
     let _ = std::fs::remove_dir_all(&work);
 
     let out = Command::new(bhf_bin())

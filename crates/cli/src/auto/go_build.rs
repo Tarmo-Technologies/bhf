@@ -142,7 +142,10 @@ pub fn build_go_harness(
         harness_module = harness_module_path(&module_path),
         module_path = module_path,
         version = placeholder_module_version(&module_path),
-        root = mod_root.display(),
+        // go.mod uses Go string-literal quoting, not shell quoting. A bare
+        // local replacement path breaks when the source directory has spaces.
+        root = serde_json::to_string(&mod_root.to_string_lossy())
+            .expect("serializing a path string cannot fail"),
     );
     if let Err(e) = std::fs::write(auto_dir.join("go.mod"), &go_mod) {
         return GoBuildResult::Failed {

@@ -13,7 +13,8 @@ FLAVOR_LOGS = {
     "core": {"auto.log", "nonroot.log", "result.log", "version.log", "daemon-help.log", "daemon-version.log"},
     "ada": {"compiler-smoke.log"},
     "runtime": {"java-auto.log", "nonroot-java-agent.log", "result.log", "version.log",
-                "java-dependency-staging.log", "java-offline-build.log", "java-missing-cache.log", "language-smoke.log"},
+                "java-dependency-staging.log", "java-offline-build.log", "java-missing-cache.log", "language-smoke.log",
+                "java-auto-no-consent.log", "java-auto-offline.log", "java-auto-missing-cache.log", "java-auto-results.json"},
 }
 
 

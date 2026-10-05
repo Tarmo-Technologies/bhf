@@ -59,6 +59,8 @@ class LanguageSelectionTests(unittest.TestCase):
             self.assertNotIn('clang', packages(language))
         self.assertEqual(packages('java,python'), packages('py,java,java'))
         self.assertEqual(packages('js,ts'), [])  # Node installed from pinned archive.
+        self.assertIn('php-pcov', packages('php'))
+        self.assertIn('zlib1g-dev', packages('ruby'))
 
     def test_contradictory_build_options_rejected_before_docker(self):
         for options in [['--languages', 'java', '--flavor', 'runtime'],

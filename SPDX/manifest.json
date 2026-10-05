@@ -4171,6 +4171,26 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "docker/fixtures/language-auto/ada/packet.adb",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docker/fixtures/language-auto/ada/packet.ads",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docker/fixtures/language-auto/c/packet.c",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docker/fixtures/language-auto/rust/Cargo.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docker/fixtures/language-auto/rust/src/lib.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "docs/ci-acceptance.md",
       "license": "Apache-2.0"
     },

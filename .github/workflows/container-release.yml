@@ -13,6 +13,10 @@ on:
         description: Request protected publisher signing (version tags only)
         type: boolean
         default: false
+      language_matrix:
+        description: Build all sixteen single-language images and mixed selections with owned bhf auto controls
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -27,8 +31,30 @@ jobs:
     with:
       force_full: true
 
-  candidate:
+  language-matrix:
     needs: validate-ci
+    if: ${{ inputs.language_matrix }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Build and exercise actual selected distributions
+        run: python3 scripts/ci/container-selection-matrix.py --evidence "$RUNNER_TEMP/selection-evidence" --auto
+      - name: Retain every selection disposition
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: language-selection-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/selection-evidence/
+          if-no-files-found: error
+          retention-days: 90
+
+  candidate:
+    needs: [validate-ci, language-matrix]
+    if: ${{ always() && needs.validate-ci.result == 'success' && (needs.language-matrix.result == 'success' || needs.language-matrix.result == 'skipped') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     outputs:

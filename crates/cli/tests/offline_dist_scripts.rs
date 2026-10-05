@@ -595,7 +595,7 @@ fn offline_dist_readme_documents_install_options_without_source_tree_note() {
         "--non-interactive",
         "--languages LIST",
         "c,cpp,rust,java,python,perl,go,ada,cobol,",
-        "fortran,csharp,javascript,typescript,ruby,lua,php,all,none",
+        "fortran,csharp,javascript,typescript,ruby,lua,php,all",
         "--targets LIST",
         "native,windows,aarch64,all,none",
         "--fuzzers LIST",
@@ -643,6 +643,8 @@ fn offline_dist_readme_documents_install_options_without_source_tree_note() {
     assert!(!lower.contains("build from source"));
     assert!(!lower.contains("git clone"));
     assert!(!lower.contains("cargo build"));
+    assert!(readme.contains("Language selections must be nonempty"));
+    assert!(readme.contains("`none` and mixing `all` with named languages are rejected"));
 }
 
 #[test]

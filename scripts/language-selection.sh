@@ -62,9 +62,10 @@ bhf_language_packages() {
       *:cobol) row=gnucobol ;;
       container:fortran|apt:fortran) row=gfortran ;; rpm:fortran) row=gcc-gfortran ;;
       apt:javascript|apt:typescript|rpm:javascript|rpm:typescript) row='nodejs npm' ;;
-      container:ruby) row='ruby ruby-dev make gcc' ;; apt:ruby|rpm:ruby) row=ruby ;;
+      container:ruby) row='ruby ruby-dev make gcc zlib1g-dev' ;; apt:ruby|rpm:ruby) row=ruby ;;
       container:lua) row='lua5.4 liblua5.4-dev' ;; apt:lua) row=lua5.4 ;; rpm:lua) row=lua ;;
-      *:php) row=php-cli ;;
+      container:php) row='php-cli php-pcov' ;;
+      apt:php|rpm:php) row=php-cli ;;
       container:csharp) row=dotnet-sdk-8.0 ;;
       *) row='' ;;
     esac

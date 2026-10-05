@@ -532,6 +532,7 @@ Full install example:
 
 `--languages all` means all sixteen supported languages and is the default.
 Use `--languages c,cpp` (or another explicit subset) to reduce installed tooling.
+Language selections must be nonempty; `none` and mixing `all` with named languages are rejected.
 The C# lane
 requires a separately staged .NET 8 SDK and `SharpFuzz.CommandLine`; TypeScript
 requires `esbuild` on `PATH` or already installed in the target project.

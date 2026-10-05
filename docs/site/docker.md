@@ -361,6 +361,10 @@ excluded language. No subset inherits and then strips an all-language image.
 The common Rust/C toolchains in the **BHF compiler builder stage** build BHF
 itself and are distinct from customer toolchains in the shipping image.
 
+Ruby includes the zlib development headers required to build its pinned native
+gem. PHP includes `pcov` for measured target coverage; a PHP interpreter without
+that extension can enter a target while reporting zero coverage feedback.
+
 The selected canonical list is stored in
 `/usr/local/share/bhf/selected-languages.txt`, with engines in
 `selected-engines.txt`. Missing project dependencies still require separately
@@ -382,3 +386,26 @@ successful installation alone does not establish runtime availability.
 
 Executed evidence and outstanding qualification blockers are tracked in the
 [qualification checkpoint](https://github.com/Tarmo-Technologies/bhf/blob/hardening/language-subset-qualification/docs/validation/2026-10-05-qualification-checkpoint.md).
+
+The explicitly dispatched **Container release candidate** workflow offers a
+`language_matrix` option. It constructs the default, every single-language
+selection, and three mixed selections, then exercises compiler startup, excluded
+ecosystems, daemon lifecycle, and clean BHF-owned target-entry/coverage controls
+through `bhf auto`. A requested matrix failure blocks candidate packaging.
+These short controls establish functionality, not upstream-project qualification.
+
+The same matrix can run locally from a clean checkout. Keep evidence outside the
+checkout; resume checks the exact commit, source-archive hash, selection order,
+control settings, and completed evidence hashes before starting the next row:
+
+```sh
+python3 scripts/ci/container-selection-matrix.py --evidence /tmp/bhf-selection --auto
+python3 scripts/ci/container-selection-matrix.py --evidence /tmp/bhf-selection --resume
+```
+
+Interrupted attempts retain their logs in separate directories. Failed rows stay
+failed in a resumed matrix; start a new evidence directory after a source fix.
+The owned controls use ordinary source paths by default. Their optional
+`--paths-with-spaces` mode records broader path compatibility separately:
+C/C++ Makefile generation currently rejects these paths. It must not be
+represented as validated support.

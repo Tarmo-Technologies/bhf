@@ -10,6 +10,43 @@ cd "$stage"
 source /usr/local/share/bhf/language-selection.sh
 selected="$(bhf_resolve_languages "${1:-all}")"
 has() { bhf_has_language "$selected" "$1"; }
+[[ "$(cat /usr/local/share/bhf/selected-languages.txt)" == "$selected" ]]
+# Check genuine ecosystem exclusion, allowing the documented operational
+# Python/Perl and native-linking dependencies shared by other lanes/AFL++.
+check_tools() {
+  local enabled="$1" tool
+  shift
+  for tool in "$@"; do
+    if command -v "$tool" >/dev/null 2>&1; then
+      [[ "$enabled" == yes ]] || { echo "unselected toolchain present: $tool" >&2; exit 1; }
+    else
+      [[ "$enabled" == no ]] || { echo "selected toolchain absent: $tool" >&2; exit 1; }
+    fi
+  done
+}
+for lane in rust go java ada cobol fortran csharp ruby lua php; do
+  enabled=no
+  if has "$lane"; then enabled=yes; fi
+  case "$lane" in
+    rust) check_tools "$enabled" rustup rustc cargo ;;
+    go) check_tools "$enabled" go ;;
+    java) check_tools "$enabled" java javac mvn ;;
+    ada) check_tools "$enabled" gnatmake gprbuild ;;
+    cobol) check_tools "$enabled" cobc ;;
+    fortran) check_tools "$enabled" gfortran ;;
+    csharp) check_tools "$enabled" dotnet ;;
+    ruby) check_tools "$enabled" ruby ;;
+    lua) check_tools "$enabled" lua5.4 ;;
+    php) check_tools "$enabled" php ;;
+  esac
+done
+enabled=no
+if has javascript || has typescript; then enabled=yes; fi
+check_tools "$enabled" node
+enabled=no
+if has typescript; then enabled=yes; fi
+check_tools "$enabled" esbuild
+echo "Selection receipt and toolchain exclusions verified: $selected"
 export XDG_CACHE_HOME="$stage/cache" GOCACHE="$stage/go-cache" GOMODCACHE="$stage/go-mod"
 export DOTNET_CLI_HOME="$stage/dotnet" GOENV=off GOPROXY=off GOSUMDB=off GOMAXPROCS=2
 if has c; then
@@ -98,7 +135,7 @@ lua5.4 -e 'print("Lua ready")'
 fi
 
 if has php; then
-php -r 'echo "PHP ready\n";'
+php -r 'if (!extension_loaded("pcov")) { fwrite(STDERR, "PHP pcov coverage extension absent\n"); exit(1); } echo "PHP ready\n";'
 fi
 
 if has ruby; then

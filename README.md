@@ -31,7 +31,7 @@ Build from source (Rust 1.88+, plus `make` + `clang` for the C/C++ lane):
 
 ```sh
 git clone https://github.com/Tarmo-Technologies/bhf.git && cd bhf
-cargo build --release --workspace
+cargo build --locked --release -p bhf -p bhf-daemon -p bhf_runtrace_shim -p bhf_cc_intercept
 ```
 
 Point `auto` at a source tree — including code that does not build:
