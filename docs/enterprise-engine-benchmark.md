@@ -5,7 +5,7 @@
 
 bhf's effectiveness evidence is split into two experiments that must not be
 merged into one headline (issue #85); both are documented, with their schemas,
-offline run instructions, and honest limitations, in
+offline run instructions, and explicit limitations, in
 `benchmarks/engine-comparison/METHODOLOGY.md`.
 
 - **Engine quality** (`benchmarks/engine-comparison/trade_study.py`): a

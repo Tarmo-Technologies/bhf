@@ -232,11 +232,18 @@ BHF_NOCOV static void *bhf_map_shared(const char *path, size_t size) {
 }
 
 #ifdef _WIN32
-/* No ASan on mingw: a vectored exception handler converts a fatal fault into an
- * immediate, distinctive exit so the engine detects a crash under wine instead
- * of the process hanging in wine's debugger dialog — bhf's ASan substitute. */
+/* Report only unhandled exceptions. First-chance exceptions can be handled by
+ * the target or by ASan (including its shadow-memory allocation), so treating
+ * them as crashes makes a valid sanitized harness reject every input. Chain
+ * the previous unhandled filter so ASan retains its diagnostics, then provide
+ * a distinctive exit instead of a debugger dialog for unsanitized builds. */
 #define BHF_WIN_CRASH_EXIT 0x39
-BHF_NOCOV static LONG CALLBACK bhf_win_veh(EXCEPTION_POINTERS *info) {
+static LPTOP_LEVEL_EXCEPTION_FILTER bhf_win_previous_filter;
+BHF_NOCOV static LONG WINAPI bhf_win_unhandled(EXCEPTION_POINTERS *info) {
+    if (bhf_win_previous_filter) {
+        LONG handled = bhf_win_previous_filter(info);
+        if (handled == EXCEPTION_CONTINUE_EXECUTION) return handled;
+    }
     DWORD code = info->ExceptionRecord->ExceptionCode;
     switch (code) {
     case EXCEPTION_ACCESS_VIOLATION:
@@ -248,13 +255,13 @@ BHF_NOCOV static LONG CALLBACK bhf_win_veh(EXCEPTION_POINTERS *info) {
         fprintf(stderr, "BHF_CRASH code=0x%lx\n", (unsigned long)code);
         fflush(stderr);
         TerminateProcess(GetCurrentProcess(), BHF_WIN_CRASH_EXIT);
-        return EXCEPTION_CONTINUE_SEARCH;
+        return EXCEPTION_CONTINUE_SEARCH; /* unreachable */
     default:
         return EXCEPTION_CONTINUE_SEARCH;
     }
 }
 BHF_NOCOV static void bhf_win_install_crash_handler(void) {
-    AddVectoredExceptionHandler(1, bhf_win_veh);
+    bhf_win_previous_filter = SetUnhandledExceptionFilter(bhf_win_unhandled);
 }
 #endif
 
@@ -869,11 +876,18 @@ BHF_NOCOV static void *bhf_map_shared(const char *path, size_t size) {
 }
 
 #ifdef _WIN32
-/* No ASan on mingw: a vectored exception handler converts a fatal fault into an
- * immediate, distinctive exit so the engine detects a crash under wine instead
- * of the process hanging in wine's debugger dialog — bhf's ASan substitute. */
+/* Report only unhandled exceptions. First-chance exceptions can be handled by
+ * the target or by ASan (including its shadow-memory allocation), so treating
+ * them as crashes makes a valid sanitized harness reject every input. Chain
+ * the previous unhandled filter so ASan retains its diagnostics, then provide
+ * a distinctive exit instead of a debugger dialog for unsanitized builds. */
 #define BHF_WIN_CRASH_EXIT 0x39
-BHF_NOCOV static LONG CALLBACK bhf_win_veh(EXCEPTION_POINTERS *info) {
+static LPTOP_LEVEL_EXCEPTION_FILTER bhf_win_previous_filter;
+BHF_NOCOV static LONG WINAPI bhf_win_unhandled(EXCEPTION_POINTERS *info) {
+    if (bhf_win_previous_filter) {
+        LONG handled = bhf_win_previous_filter(info);
+        if (handled == EXCEPTION_CONTINUE_EXECUTION) return handled;
+    }
     DWORD code = info->ExceptionRecord->ExceptionCode;
     switch (code) {
     case EXCEPTION_ACCESS_VIOLATION:
@@ -885,13 +899,13 @@ BHF_NOCOV static LONG CALLBACK bhf_win_veh(EXCEPTION_POINTERS *info) {
         fprintf(stderr, "BHF_CRASH code=0x%lx\n", (unsigned long)code);
         fflush(stderr);
         TerminateProcess(GetCurrentProcess(), BHF_WIN_CRASH_EXIT);
-        return EXCEPTION_CONTINUE_SEARCH;
+        return EXCEPTION_CONTINUE_SEARCH; /* unreachable */
     default:
         return EXCEPTION_CONTINUE_SEARCH;
     }
 }
 BHF_NOCOV static void bhf_win_install_crash_handler(void) {
-    AddVectoredExceptionHandler(1, bhf_win_veh);
+    bhf_win_previous_filter = SetUnhandledExceptionFilter(bhf_win_unhandled);
 }
 #endif
 

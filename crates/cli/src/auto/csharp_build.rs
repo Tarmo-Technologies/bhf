@@ -938,7 +938,13 @@ pub fn build_csharp_harness(
         }
     }
 
-    // Build. `--nologo`, restore from the local NuGet cache; keep the CLI quiet.
+    // Resolve packages only from the staged global cache and an empty local
+    // feed. Project MSBuild targets can still execute arbitrary code: callers
+    // must obtain build consent and use network isolation for disconnection.
+    let offline_feed = proj_dir.join("offline-feed");
+    if let Err(e) = std::fs::create_dir_all(&offline_feed) {
+        return CSharpBuildResult::Failed(format!("create offline NuGet feed: {e}"));
+    }
     // Under source-inclusion the first build often fails on project files that
     // are nothing to do with the target (view models needing a source
     // generator); those get ejected and the build retried until the compiling
@@ -959,6 +965,9 @@ pub fn build_csharp_harness(
                 .arg("-c")
                 .arg("Release")
                 .arg("--nologo")
+                .arg(format!("-p:RestoreSources={}", offline_feed.display()))
+                .arg("-p:RestoreAdditionalProjectSources=")
+                .arg("-p:NuGetAudit=false")
                 .arg("-v")
                 .arg("quiet")
                 .env("DOTNET_CLI_TELEMETRY_OPTOUT", "1")

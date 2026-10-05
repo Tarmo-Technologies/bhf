@@ -100,7 +100,7 @@ installer:
   automation, or manual verification—not additional programs to install.
 
 ```powershell
-$Version = "0.2.34"
+$Version = "0.3.0"
 irm "https://github.com/Tarmo-Technologies/bhf/releases/download/$Version/bhf-installer.ps1" | iex
 bhf.exe --version
 ```
@@ -128,37 +128,36 @@ cargo build --release --target x86_64-pc-windows-gnu -p bhf
 
 ## Running
 
-`bhf` works the same as on Linux. Use an x64 Developer PowerShell (or run
+Use an x64 Developer PowerShell (or run
 the initialization snippet above), make sure clang + make are on `PATH`, then
 point `auto` at a source tree:
 
 ```powershell
 $env:Path = "C:\Program Files\LLVM\bin;C:\w64devkit\bin;$env:Path"
-bhf.exe auto C:\path\to\source --per-target-time 30
+bhf.exe auto C:\path\to\source --work-dir C:\Temp\bhf-work `
+  --jobs 1 --max-targets 1 --per-target-time 10
 ```
 
 `auto` discovers fuzzable functions, generates typed harnesses, builds them with
 clang (edge coverage + cmplog + ASan), fuzzes with the built-in engine, and
 writes JSON/Markdown findings — the same core fuzzing pipeline as on Linux. A harness fault is
-detected as a crash via the driver's structured-exception handler (Windows has no
+detected through ASan or the driver's unhandled-exception filter (Windows has no
 POSIX signals).
 
 ### Verify the install
 
-Clone the repo and run `auto` against a bundled C library (needs only clang + make
-on `PATH`):
+Check the installed binary in the Developer PowerShell, then run the command
+above on your source tree:
 
 ```powershell
-git clone https://github.com/Tarmo-Technologies/bhf.git
-cd bhf
-$env:Path = "C:\Program Files\LLVM\bin;C:\w64devkit\bin;$env:Path"
-cargo build --release -p bhf
-.\target\release\bhf.exe auto tests\fixtures\build_recovery\fixtures\miniz `
-  --work-dir C:\Temp\bhf-miniz --per-target-time 10
+bhf.exe --version
+bhf.exe --help
+bhf.exe auto --help
 ```
 
-A summary line reporting discovered + built+fuzzed targets confirms the toolchain
-is wired up.
+The run should report at least one built+fuzzed target and a positive execution
+count. Read `C:\Temp\bhf-work\results\INDEX.md` for findings and
+`C:\Temp\bhf-work\auto\summary.txt` for skipped or blocked targets.
 
 ## Visual Studio solutions (.sln / .vcxproj)
 

@@ -1,4 +1,4 @@
-All numbers measured. Here are the findings.
+All numbers below were measured on the pinned repositories.
 
 ## Python SAST comparison: bhf vs bandit vs semgrep
 
@@ -21,24 +21,33 @@ Bandit's totals are dominated by test-file noise. After excluding test files and
 - **py_click**: 1290 of 1325 findings (97%) are in test files; 1292 are bare `assert`.
 - **py_requests**: 692 of 708 (98%) are in test files; **every non-test finding is an assert or timeout** — 0 substantive non-test findings after filtering.
 
-So bandit "wins by 700x" on raw count but that is almost entirely `assert` in tests plus `requests(...)` without a `timeout=` (a code-smell, not a vuln). Semgrep's auto ruleset is very quiet here (3/repo).
+Bandit's much larger raw count consists mostly of `assert` in tests plus
+`requests(...)` without a `timeout=`. Semgrep's auto ruleset reported three
+findings per repository.
 
-### bhf differentiators
+### bhf-specific results
 
 - **Taint-traced, HIGH-severity vuln classes** none of the others surfaced on py_requests: BHF-421 unsafe deserialization (pickle/marshal/yaml, CWE-502), BHF-426 TLS cert/hostname verification disabled (CWE-295), BHF-427 SSRF via tainted URL reaching an outbound HTTP request (CWE-918) — with a full `taint_trace` (assignment → project-local calls → sink), engine `bhf.static.taint.v1`. Bandit reports B301 (pickle *import/usage*, no dataflow) but never reaches SSRF or TLS-verify-disabled as taint findings. Semgrep's auto config missed all three classes on py_requests.
 - **Deduped, non-noisy output**: 14 findings all HIGH, no test-assert flood — vs bandit's 708/1325 that a human must triage down to ~0–23.
-- Emits SARIF/JSON/Markdown with baseline-diff (`new`/`unchanged`/`resolved`) and honest `analysis_gaps` (bhf *tells you* it couldn't resolve 24/36 project-local calls rather than silently dropping them).
+- Emits SARIF/JSON/Markdown with baseline-diff (`new`/`unchanged`/`resolved`) and records 24/36 unresolved project-local calls in `analysis_gaps`.
 
 ### Verdict
 
-**Mixed — bhf is NOT the raw-count leader, but it wins on substantive high-severity taint findings.**
+The result was mixed: bhf did not lead by raw count, but it produced the
+high-severity taint findings measured on py_requests.
 
-- **py_requests: bhf wins** — 14 real HIGH taint findings (SSRF/deser/TLS) vs bandit's **0 substantive non-test findings** and semgrep's 3 (sha1/import). On the vuln that matters, bhf leads clearly.
-- **py_click: bhf LOSES** — it reports **0** findings; semgrep gets 3, bandit gets 23 substantive (subprocess, try-except-pass, weak `random`). This is a real gap: bhf emitted 24 `unresolved_project_local_call` gaps and produced nothing. It has no rule for the `subprocess`/`try-except-pass`/`random.*`-for-security classes that bandit's B603/B110/B311 caught, so on a repo with no taint-reachable sink it goes silent.
+- **py_requests:** bhf reported 14 high-severity taint findings (SSRF,
+  deserialization, and TLS); bandit had no substantive non-test findings, and
+  semgrep reported three SHA-1/import findings.
+- **py_click:** bhf reported no findings; semgrep reported three, and bandit had
+  23 substantive findings covering subprocess use, swallowed exceptions, and
+  weak random-number generation. bhf also emitted 24
+  `unresolved_project_local_call` gaps.
 
-### Concrete gap bhf should fix to lead
+### Concrete gaps
 
 1. **py_click zero-finding miss** is the priority: add non-taint syntactic rules for the classes bandit caught and bhf has no equivalent for — `subprocess` without `shell=` review / partial-path exec (B603/B607, CWE-78/426), `try/except/pass` swallowing (B110, CWE-703), and non-crypto `random.*` used in a security context (B311, CWE-330). bhf already ships a weak-PRNG rule (BHF-428) per memory — verify why it didn't fire on py_click's 3 `random` sites (likely context-gate too strict, or Python lane not wired to BHF-428).
 2. **Resolve `unresolved_project_local_call` gaps** (24 in click, 36 in requests): bhf's taint engine is dropping intra-project call edges it can't resolve, which both suppresses findings and inflates the gap count. Improving the Python decl-index / call resolution would let the taint lane reach sinks it currently can't, directly converting gaps into findings.
 
-Net: keep the taint-finding lead (py_requests), but bhf cannot claim #1 on Python SAST until it stops returning 0 on a real 17k-SLOC repo where two competitors find issues.
+The py_requests result demonstrates bhf's taint analysis. The py_click result
+shows that the measured Python rule coverage was incomplete.

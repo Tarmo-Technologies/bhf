@@ -70,4 +70,4 @@ Two separate, powered studies — do not merge their numbers:
 
 Both are run offline/scheduled, not in per-PR CI (the only CI-eligible piece is
 the deterministic smoke in `engine-comparison/test_runner.py`). Full methodology,
-manifest schema, and honest limitations: `engine-comparison/METHODOLOGY.md`.
+manifest schema, and limitations: `engine-comparison/METHODOLOGY.md`.

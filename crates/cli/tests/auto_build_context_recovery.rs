@@ -49,6 +49,7 @@ fn options(source_root: &Path) -> AttemptOptions {
         project: None,
         decoder_limits: Default::default(),
         force: false,
+        run_untrusted: false,
         per_target_time: Duration::from_secs(2),
         total_time: None,
         per_target_finding_count: None,

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod memory_budget;
+
 use ada_parser::ast::{AdaStandard, Span, StructuralAst, SubprogramId};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -24,7 +26,7 @@ pub fn run_json_rpc_with_security<R: BufRead, W: Write>(
     writer: W,
     security: DaemonSecurityConfig,
 ) -> Result<(), JsonRpcServerError> {
-    let limit = llm_harness_gen::memory_aware_byte_limit("BHF_DAEMON_MAX_MESSAGE_BYTES");
+    let limit = memory_budget::memory_aware_byte_limit("BHF_DAEMON_MAX_MESSAGE_BYTES");
     run_json_rpc_with_limit(reader, writer, security, limit)
 }
 
@@ -128,7 +130,7 @@ pub fn run_mcp<R: BufRead, W: Write>(
     mut reader: R,
     mut writer: W,
 ) -> Result<(), JsonRpcServerError> {
-    let limit = llm_harness_gen::memory_aware_byte_limit("BHF_MCP_MAX_MESSAGE_BYTES");
+    let limit = memory_budget::memory_aware_byte_limit("BHF_MCP_MAX_MESSAGE_BYTES");
     while let Some(line) = read_mcp_line(&mut reader, limit)? {
         if line.is_empty() {
             continue;
@@ -201,9 +203,9 @@ fn initialize_mcp(params: Option<Value>) -> Result<Value, RpcFailure> {
             "name": "bhf",
             "title": "BHF",
             "version": env!("CARGO_PKG_VERSION"),
-            "description": "Deterministic fuzzing evidence and LLM-assistance tools"
+            "description": "Deterministic fuzzing evidence tools"
         },
-        "instructions": "Use BHF tools for observed facts. The current host model may reason over their output without giving BHF an API token. Treat prepared prompts and preflight results as advisory; build, replay, and fuzz results are authoritative."
+        "instructions": "Use BHF tools for observed facts. Build, replay, and fuzz results are authoritative."
     }))
 }
 
@@ -218,7 +220,8 @@ fn mcp_tools() -> Vec<Value> {
             "openWorldHint": false
         })
     };
-    vec![
+    #[allow(unused_mut)]
+    let mut tools = vec![
         json!({
             "name": "bhf_scan",
             "description": "Deterministically summarize Ada source structure under a repository path. Read-only; no LLM call.",
@@ -258,6 +261,9 @@ fn mcp_tools() -> Vec<Value> {
                 "additionalProperties": false
             }
         }),
+    ];
+    #[cfg(feature = "llm")]
+    tools.extend([
         json!({
             "name": "bhf_prepare_assistance",
             "description": "Prepare an injection-aware, evidence-grounded prompt for run planning, harness generation, finding analysis, code explanation, or error diagnosis. The current MCP host session supplies the model reasoning; BHF uses no API token.",
@@ -298,18 +304,19 @@ fn mcp_tools() -> Vec<Value> {
                 "additionalProperties": false
             }
         }),
-    ]
+    ]);
+    tools
 }
 
 fn mcp_default_target_limit() -> usize {
     // Reserve ample space for paths, score breakdowns, spans, and protocol
     // framing. This is a dynamic output budget, not a discovery ceiling:
     // callers can still request an explicit positive `top` value.
-    (llm_harness_gen::memory_aware_byte_limit("BHF_MCP_MAX_MESSAGE_BYTES") / 4096).max(1)
+    (memory_budget::memory_aware_byte_limit("BHF_MCP_MAX_MESSAGE_BYTES") / 4096).max(1)
 }
 
 fn mcp_default_findings_limit() -> usize {
-    (llm_harness_gen::memory_aware_byte_limit("BHF_MCP_MAX_MESSAGE_BYTES") / (16 * 1024)).max(1)
+    (memory_budget::memory_aware_byte_limit("BHF_MCP_MAX_MESSAGE_BYTES") / (16 * 1024)).max(1)
 }
 
 #[derive(Debug, Deserialize)]
@@ -319,6 +326,7 @@ struct McpCallParams {
     arguments: Value,
 }
 
+#[cfg(feature = "llm")]
 #[derive(Debug, Deserialize)]
 struct McpAssistanceParams {
     kind: String,
@@ -332,6 +340,7 @@ struct McpAssistanceParams {
     evidence: Vec<llm_harness_gen::Evidence>,
 }
 
+#[cfg(feature = "llm")]
 #[derive(Debug, Deserialize)]
 struct McpHarnessParams {
     target_symbol: String,
@@ -348,7 +357,7 @@ struct McpFindingsParams {
 
 fn call_mcp_tool(params: Option<Value>) -> Result<Value, RpcFailure> {
     let params = parse_params::<McpCallParams>(params)?;
-    let limit = llm_harness_gen::memory_aware_byte_limit("BHF_MCP_MAX_MESSAGE_BYTES");
+    let limit = memory_budget::memory_aware_byte_limit("BHF_MCP_MAX_MESSAGE_BYTES");
     let result = match params.name.as_str() {
         "bhf_scan" => dispatch_json_rpc_method(
             "scan",
@@ -371,6 +380,7 @@ fn call_mcp_tool(params: Option<Value>) -> Result<Value, RpcFailure> {
                 limit,
             ))
         }
+        #[cfg(feature = "llm")]
         "bhf_prepare_assistance" => {
             let params: McpAssistanceParams = serde_json::from_value(params.arguments)
                 .map_err(|error| RpcFailure::invalid_params(error.to_string()))?;
@@ -401,6 +411,7 @@ fn call_mcp_tool(params: Option<Value>) -> Result<Value, RpcFailure> {
             })
             .map_err(|error| RpcFailure::invalid_params(error.to_string()))
         }
+        #[cfg(feature = "llm")]
         "bhf_preflight_harness" => {
             let params: McpHarnessParams = serde_json::from_value(params.arguments)
                 .map_err(|error| RpcFailure::invalid_params(error.to_string()))?;
@@ -433,7 +444,7 @@ fn call_mcp_tool(params: Option<Value>) -> Result<Value, RpcFailure> {
 }
 
 fn mcp_tool_result(value: Value, is_error: bool) -> Value {
-    let limit = llm_harness_gen::memory_aware_byte_limit("BHF_MCP_MAX_MESSAGE_BYTES") / 2;
+    let limit = memory_budget::memory_aware_byte_limit("BHF_MCP_MAX_MESSAGE_BYTES") / 2;
     let mut buffer = LimitedVec {
         bytes: Vec::new(),
         limit,
@@ -3087,6 +3098,7 @@ mod tests {
         assert!(!String::from_utf8_lossy(&output).contains("outside-secret"));
     }
 
+    #[cfg(feature = "llm")]
     #[test]
     fn mcp_negotiates_lists_tools_and_prepares_session_prompt() {
         let messages = [
@@ -3177,6 +3189,24 @@ mod tests {
         assert_eq!(responses[2]["result"]["isError"], false);
     }
 
+    #[cfg(not(feature = "llm"))]
+    #[test]
+    fn default_mcp_exposes_only_deterministic_tools() {
+        let request = serde_json::json!({"jsonrpc":"2.0", "id":1, "method":"tools/list"});
+        let input = serde_json::to_string(&request).unwrap() + "\n";
+        let mut output = Vec::new();
+        super::run_mcp(BufReader::new(input.as_bytes()), &mut output).unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        let names: Vec<_> = response["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["bhf_scan", "bhf_list_targets", "bhf_load_findings"]);
+    }
+
+    #[cfg(feature = "llm")]
     #[test]
     fn mcp_harness_preflight_does_not_claim_build_success() {
         let message = serde_json::json!({

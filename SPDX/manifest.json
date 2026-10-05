@@ -27,6 +27,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": ".github/workflows/container-release.yml",
+      "license": "Apache-2.0"
+    },
+    {
       "path": ".github/workflows/docs-site.yml",
       "license": "Apache-2.0"
     },
@@ -2215,6 +2219,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_runtime_failure.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_runtrace.rs",
       "license": "Apache-2.0"
     },
@@ -2487,6 +2495,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/project_build_consent.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/project_cli.rs",
       "license": "Apache-2.0"
     },
@@ -2744,6 +2756,10 @@
     },
     {
       "path": "crates/daemon/src/main.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/daemon/src/memory_budget.rs",
       "license": "Apache-2.0"
     },
     {
@@ -4147,7 +4163,35 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "docker/compose.hardened.yaml",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "docker/compose.yaml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docker/fixtures/c-core/packet.c",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docker/fixtures/language-auto/ada/packet.adb",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docker/fixtures/language-auto/ada/packet.ads",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docker/fixtures/language-auto/c/packet.c",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docker/fixtures/language-auto/rust/Cargo.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docker/fixtures/language-auto/rust/src/lib.rs",
       "license": "Apache-2.0"
     },
     {
@@ -4560,6 +4604,22 @@
     },
     {
       "path": "docs/validation/2026-09-27-hil-emu-live-qemu.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/validation/2026-10-04-rtos-container-local.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/validation/2026-10-05-language-selection-results.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/validation/2026-10-05-qualification-checkpoint.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/validation/2026-10-05-windows-installer-results.md",
       "license": "Apache-2.0"
     },
     {

@@ -16,9 +16,9 @@ arch="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
 . /etc/os-release 2>/dev/null || true
 distro="${ID:-ubuntu}"
 
-python3 - "$OUT" "$arch" "$distro" "${VERSION_ID:-24.04}" <<'PY'
+python3 - "$OUT" "$arch" "$distro" "${VERSION_ID:-24.04}" "${BHF_VERSION:-0.0.0-local}" <<'PY'
 import json, subprocess, sys, datetime
-out, arch, distro, osver = sys.argv[1:5]
+out, arch, distro, osver, bhf_version = sys.argv[1:6]
 
 def license_of(pkg):
     try:
@@ -65,8 +65,8 @@ bom = {
     "version": 1,
     "metadata": {
         "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "component": {"type": "container", "name": "bhf", "version": "0.2.32",
-                      "description": f"OS package layer ({distro} {osver})"},
+        "component": {"type": "container", "name": "bhf-os-packages", "version": bhf_version,
+                      "description": f"OS package inventory only ({distro} {osver}); not a whole-image SBOM"},
         "tools": [{"vendor": "Tarmo Technologies", "name": "bhf-generate-sbom"}],
     },
     "components": components,

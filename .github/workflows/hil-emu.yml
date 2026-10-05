@@ -3,7 +3,8 @@
 # Emulator-in-the-loop (HIL-emu) validation lane.
 #
 # Runs the REAL (live-QEMU) transport validations — RV-1 (cross-endian fidelity),
-# RV-2 (live gdb-remote), RV-3 (live full-system snapshot on emulated Cortex-M) —
+# RV-2 (live gdb-remote), RV-3 (live full-system snapshot on emulated Cortex-M),
+# RV-4 (pinned FreeRTOS task/queue, CLI finding and replay) —
 # via scripts/hil-emu.sh. The script hard-fails if the qemu / cross toolchains are
 # missing and runs the gated tests with BHF_HIL_REQUIRE=1, so the emulator
 # validations CANNOT silently skip in CI. The physical-board lane
@@ -20,6 +21,9 @@ on:
       - "crates/target_transport/**"
       - "crates/event_log/**"
       - "crates/cli/src/auto/cross_target.rs"
+      - "crates/cli/src/transport_*.rs"
+      - "crates/cli/src/fuzz.rs"
+      - "crates/cli/tests/transport_fuzz_qemu_cli.rs"
       - "scripts/hil-emu.sh"
       - ".github/workflows/hil-emu.yml"
   schedule:
@@ -36,8 +40,9 @@ concurrency:
 
 jobs:
   hil-emu:
-    name: Live-QEMU transport validation (RV-1/RV-2/RV-3)
+    name: Live-QEMU transport validation (RV-1/RV-2/RV-3/RV-4)
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -50,22 +55,25 @@ jobs:
             qemu-system-arm \
             qemu-utils \
             gcc-arm-none-eabi \
+            libnewlib-dev \
+            libnewlib-arm-none-eabi \
             gcc-arm-linux-gnueabihf \
             gcc-powerpc64-linux-gnu \
             libc6-dev-armhf-cross \
             libc6-dev-ppc64-cross \
             binutils \
-            build-essential
+            build-essential \
+            git
           # Sanity: the exact binaries scripts/hil-emu.sh requires.
           for tool in qemu-arm qemu-ppc64 qemu-system-arm qemu-img \
-                      arm-none-eabi-gcc arm-linux-gnueabihf-gcc powerpc64-linux-gnu-gcc nm cc; do
+                      arm-none-eabi-gcc arm-linux-gnueabihf-gcc powerpc64-linux-gnu-gcc nm cc git; do
             command -v "$tool" >/dev/null || { echo "missing $tool after install" >&2; exit 1; }
           done
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
-          toolchain: stable
+          toolchain: 1.99.0
 
       - name: Run the emulator-in-the-loop validations
         run: scripts/hil-emu.sh

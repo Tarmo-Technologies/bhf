@@ -43,7 +43,7 @@ reported separately because neither substitutes for the other.
 
 | Lever | Automatic behavior |
 |---|---|
-| Honest execution proof | Every lane checkpoints immediately before the selected call; decode/setup-only execution is demoted. |
+| Execution proof | Every lane checkpoints immediately before the selected call; decode/setup-only execution is demoted. |
 | Semantic selection | Identifier-token scoring prioritizes public parsers, decoders, whole-artifact entrypoints, and stateful surfaces while penalizing debug/report/inspection helpers. |
 | File-backed input | JavaScript, Ruby, and COBOL materialize fuzz bytes for path/file operands and clean them after the call. JavaScript awaits returned promises before cleanup. |
 | Stateful APIs | Go mines a bounded one-input feeder plus zero-argument terminal, including Cobra `SetArgs` → `Execute`. |
@@ -64,7 +64,7 @@ reported separately because neither substitutes for the other.
    C++, C#, Fortran, Java, and Rust projects.
 3. **Framework bootstrapping.** Missing packages and browser, Neovim, Android, or
    Windows hosts remain distinct from generator defects. Local lockfile caches
-   and narrow, disclosed host stubs are the next leverage points.
+   and narrow, disclosed host stubs are the next proposed steps.
 4. **Structured scientific data.** Fortran scientific APIs need coherent bounded
    vectors/matrices plus coupled dimensions, leading dimensions, and alias/intent
    constraints rather than only character control inputs.

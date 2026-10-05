@@ -1,0 +1,175 @@
+# SPDX-License-Identifier: Apache-2.0
+name: Container release candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      flavor:
+        description: Container toolchain flavor
+        type: choice
+        options: [runtime, core, ada]
+        default: runtime
+      sign:
+        description: Request protected publisher signing (version tags only)
+        type: boolean
+        default: false
+      language_matrix:
+        description: Build all sixteen single-language images and mixed selections with owned bhf auto controls
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: container-release-${{ github.ref }}-${{ inputs.flavor }}
+  cancel-in-progress: false
+
+jobs:
+  validate-ci:
+    uses: ./.github/workflows/ci.yml
+    with:
+      force_full: true
+
+  language-matrix:
+    needs: validate-ci
+    if: ${{ inputs.language_matrix }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Build and exercise actual selected distributions
+        run: python3 scripts/ci/container-selection-matrix.py --evidence "$RUNNER_TEMP/selection-evidence" --auto
+      - name: Retain every selection disposition
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: language-selection-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/selection-evidence/
+          if-no-files-found: error
+          retention-days: 90
+
+  candidate:
+    needs: [validate-ci, language-matrix]
+    if: ${{ always() && needs.validate-ci.result == 'success' && (needs.language-matrix.result == 'success' || needs.language-matrix.result == 'skipped') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    outputs:
+      archive: ${{ steps.receipt.outputs.archive }}
+      sha256: ${{ steps.receipt.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify exact-revision full CI from this run and attempt
+        env:
+          OBSERVED: ${{ toJSON(needs.validate-ci) }}
+          SIGN_REQUEST: ${{ inputs.sign }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, tomllib
+          observed = json.loads(os.environ['OBSERVED'])
+          expected = {'decision':'PASS_FULL_CI', 'commit':os.environ['GITHUB_SHA'],
+                      'run_id':os.environ['GITHUB_RUN_ID'], 'run_attempt':os.environ['GITHUB_RUN_ATTEMPT']}
+          if observed.get('result') != 'success' or observed.get('outputs') != expected:
+              raise SystemExit('missing or mismatched complete CI acceptance')
+          if os.environ['SIGN_REQUEST'] == 'true':
+              version = tomllib.loads(pathlib.Path('Cargo.toml').read_text())['workspace']['package']['version']
+              if os.environ['GITHUB_REF_TYPE'] != 'tag' or os.environ['GITHUB_REF_NAME'] not in (version, 'v' + version):
+                  raise SystemExit('publisher signing requires the matching workspace version tag')
+          PY
+      - name: Build and test the actual image to be handed off
+        env:
+          FLAVOR: ${{ inputs.flavor }}
+        run: |
+          case "$FLAVOR" in
+            core) bash scripts/ci/container-core-acceptance.sh ;;
+            ada) bash scripts/ci/container-ada-acceptance.sh ;;
+            runtime) bash scripts/ci/container-full-acceptance.sh ;;
+            *) exit 2 ;;
+          esac
+      - name: Archive exact sources, inventory, scan, and image
+        env:
+          FLAVOR: ${{ inputs.flavor }}
+        run: bash scripts/ci/prepare-container-candidate.sh "$FLAVOR" > candidate-output.json
+      - name: Bind candidate outputs to this commit
+        id: receipt
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, re
+          receipt = json.loads(pathlib.Path('candidate-output.json').read_text().splitlines()[-1])
+          name = pathlib.Path(receipt['archive']).name
+          if receipt['source_commit'] != os.environ['GITHUB_SHA'] or not re.fullmatch(r'[A-Za-z0-9._-]+\.tar\.gz', name):
+              raise SystemExit('candidate source or filename mismatch')
+          if not re.fullmatch('[0-9a-f]{64}', receipt['sha256']):
+              raise SystemExit('invalid candidate digest')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('archive=' + name + '\nsha256=' + receipt['sha256'] + '\n')
+          PY
+      - name: Retain reviewable unsigned candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: container-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist/container/
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 90
+      - name: Retain acceptance and disposition even on failure
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: container-review-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            container-acceptance/
+            container-ada-acceptance/
+            container-full-acceptance/
+          if-no-files-found: error
+
+  sign:
+    needs: candidate
+    if: ${{ inputs.sign && github.ref_type == 'tag' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: production-release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: container-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: candidate
+      - name: Sign trusted candidate digest and independently verify
+        env:
+          ARCHIVE: ${{ needs.candidate.outputs.archive }}
+          EXPECTED_SHA: ${{ needs.candidate.outputs.sha256 }}
+          BHF_RELEASE_SIGNING_KEY_PKCS8_B64: ${{ secrets.BHF_RELEASE_SIGNING_KEY_PKCS8_B64 }}
+          BHF_RELEASE_PUBLIC_KEY_HEX: ${{ vars.BHF_RELEASE_PUBLIC_KEY_HEX }}
+        run: |
+          set -euo pipefail
+          [[ "$ARCHIVE" =~ ^[A-Za-z0-9._-]+\.tar\.gz$ ]]
+          [[ "$BHF_RELEASE_PUBLIC_KEY_HEX" =~ ^[0-9a-f]{64}$ ]]
+          signing_dir="$(mktemp -d "$RUNNER_TEMP/bhf-container-signing.XXXXXX")"
+          trap 'rm -rf "$signing_dir"' EXIT
+          umask 077
+          printf '%s' "$BHF_RELEASE_SIGNING_KEY_PKCS8_B64" | base64 --decode > "$signing_dir/private.der"
+          printf '%s\n' "$BHF_RELEASE_PUBLIC_KEY_HEX" > "$signing_dir/public.hex"
+          python3 scripts/sign-container-candidate.py --archive "candidate/$ARCHIVE" \
+            --expected-sha256 "$EXPECTED_SHA" --signing-key "$signing_dir/private.der" \
+            --trusted-public-key "$signing_dir/public.hex"
+          python3 scripts/verify-offline-dist.py --archive "candidate/$ARCHIVE" \
+            --signature "candidate/$ARCHIVE.sig" --trusted-public-key "$signing_dir/public.hex" \
+            --max-archive-bytes 8589934592 --json > candidate/signature-verification.json
+      - name: Retain authenticated offline container handoff
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: signed-container-${{ github.run_id }}-${{ github.run_attempt }}
+          path: candidate/
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 90

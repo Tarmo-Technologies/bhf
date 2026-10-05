@@ -184,7 +184,7 @@ ImageMagick). Do not restate this as a fuzz-count win.
 
 Note also that WindTerm's downstream `unknown type name 'bignum'` / `'MD5CTX'`
 errors are NOT consequences of the guard — they are `#ifdef
-HAVE_LIBGCRYPT`/`HAVE_LIBCRYPTO` blocks over genuinely absent libraries, which is
+HAVE_LIBGCRYPT`/`HAVE_LIBCRYPTO` blocks over absent libraries, which is
 a missing-dependency problem, not a config-guard one.
 
 ### What is left
@@ -223,7 +223,7 @@ BHF's own errors rather than project limitations:
 - **A CamelCase export macro leaking into the C harness** (`ModuleExport`), the C
   twin of the C++ decoration leak.
 
-What remains in `unknown type name` after those is dominated by genuinely absent
+What remains in `unknown type name` after those is dominated by absent
 SDKs — libevent, Qt, protobuf, JNI, Win32 — which is a manifest problem, not a
 repair one, and the manifest now reports them under `--force` too.
 

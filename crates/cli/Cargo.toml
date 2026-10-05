@@ -65,7 +65,7 @@ idl_parser = { path = "../idl_parser" }
 instrumenter = { path = "../instrumenter" }
 lang_profile = { path = "../lang_profile" }
 license_policy = { path = "../license_policy" }
-llm_harness_gen = { path = "../llm_harness_gen" }
+llm_harness_gen = { path = "../llm_harness_gen", optional = true }
 multicore_fuzz = { path = "../multicore_fuzz" }
 num_cpus = "1"
 go_parser = { path = "../go_parser" }
@@ -98,6 +98,10 @@ which.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[features]
+default = []
+llm = ["dep:llm_harness_gen"]
 
 [lib]
 name = "cli"

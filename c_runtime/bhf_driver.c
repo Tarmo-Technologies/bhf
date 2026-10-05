@@ -34,8 +34,8 @@
 #ifdef _WIN32
 /* Windows (mingw-w64) has no <unistd.h>/<sys/mman.h>. The shared coverage/cmplog
  * maps use Win32 file mapping; the framed-protocol pipe I/O uses the _-prefixed
- * CRT calls + _setmode for binary mode; windows.h supplies the vectored
- * exception handler that is bhf's crash detector here (no ASan on mingw). */
+ * CRT calls + _setmode for binary mode; windows.h supplies the unhandled
+ * exception filter used by unsanitized builds (no ASan on mingw). */
 #include <windows.h>
 #include <io.h>
 #include <fcntl.h>
@@ -128,13 +128,18 @@ BHF_NOCOV static void *bhf_map_shared(const char *path, size_t size) {
 }
 
 #ifdef _WIN32
-/* mingw has no ASan, so a memory-safety bug surfaces only as a hardware fault.
- * A vectored exception handler converts a fatal exception (access violation,
- * stack overflow, …) into an immediate, distinctive exit so the engine running
- * the harness under wine detects a crash — instead of wine popping a debugger
- * dialog that blocks the fuzz loop. This is bhf's ASan substitute here. */
+/* Report only unhandled exceptions. First-chance exceptions can be handled by
+ * the target or by ASan (including its shadow-memory allocation), so treating
+ * them as crashes makes a valid sanitized harness reject every input. Chain
+ * the previous unhandled filter so ASan retains its diagnostics, then provide
+ * a distinctive exit instead of a debugger dialog for unsanitized builds. */
 #define BHF_WIN_CRASH_EXIT 0x39
-BHF_NOCOV static LONG CALLBACK bhf_win_veh(EXCEPTION_POINTERS *info) {
+static LPTOP_LEVEL_EXCEPTION_FILTER bhf_win_previous_filter;
+BHF_NOCOV static LONG WINAPI bhf_win_unhandled(EXCEPTION_POINTERS *info) {
+    if (bhf_win_previous_filter) {
+        LONG handled = bhf_win_previous_filter(info);
+        if (handled == EXCEPTION_CONTINUE_EXECUTION) return handled;
+    }
     DWORD code = info->ExceptionRecord->ExceptionCode;
     switch (code) {
     case EXCEPTION_ACCESS_VIOLATION:
@@ -152,7 +157,7 @@ BHF_NOCOV static LONG CALLBACK bhf_win_veh(EXCEPTION_POINTERS *info) {
     }
 }
 BHF_NOCOV static void bhf_win_install_crash_handler(void) {
-    AddVectoredExceptionHandler(1, bhf_win_veh);
+    bhf_win_previous_filter = SetUnhandledExceptionFilter(bhf_win_unhandled);
 }
 #endif
 

@@ -101,7 +101,7 @@ carries taint-confirmed **command-injection** and **prototype-pollution** detect
 | Warm process reuse | per-runner | **framed fork-server (one warm V8)** |
 | Findings → CWE / SARIF / CSV | — | built-in |
 
-bhf is the only tool that fuzzes JavaScript from source with **zero harness**,
+In the documented comparison, bhf fuzzes JavaScript from source with **zero harness**,
 using the V8 engine's own coverage (no Babel/Istanbul source transform) folded into
 a shared edge map.
 
@@ -130,7 +130,7 @@ A 30-project campaign over the most-depended-on npm libraries — express, lodas
 axios, moment, validator.js, node-semver, marked, joi, qs, node-fetch, and more:
 
 - **2,018 JS files scanned, 531 fuzzable functions discovered, 0 bhf panics** —
-  discovery is robust across CommonJS and ESM, minified and hand-written code
+  the corpus included CommonJS and ESM, minified and hand-written code
   (validator.js alone → 111 targets, moment → 162). The first-argument name filter
   keeps internal array/options helpers (`multilineRegexp(parts)`) out of the fuzz
   set.
@@ -148,7 +148,7 @@ axios, moment, validator.js, node-semver, marked, joi, qs, node-fetch, and more:
 - The driver uses only Node built-ins (`inspector`, `fs`) — no third-party fuzzing
   dependency, nothing linked into bhf.
 
-## Limits (honest)
+## Limits
 
 - The fuzzable surface is the **first argument** (Buffer/string); a function whose
   behavior needs a second structured argument (an options object) is driven with

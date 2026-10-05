@@ -67,7 +67,7 @@ The campaign/coverage report remains in `auto/run.md`, `auto/run.json`, and
   in the repository) for the strongest known-build and unknown-build recipes and
   how the recovery flags combine.
 
-## Reading the result honestly
+## Interpreting the result
 
 `FINDINGS.md` is the primary handoff. `summary.txt` then separates coverage
 outcomes on purpose:

@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+# Combine with compose.yaml. Dependencies must already be staged before use.
+services:
+  bhf:
+    read_only: true
+    network_mode: none
+    pids_limit: 512
+    mem_limit: 4g
+    tmpfs:
+      - /tmp:rw,exec,nosuid,size=1g
+    environment:
+      XDG_CACHE_HOME: /work/cache
+      GOCACHE: /work/cache/go-build
+      GOMODCACHE: /work/cache/go-mod
+      PIP_CACHE_DIR: /work/cache/pip
+      GRADLE_USER_HOME: /work/cache/gradle
+      DOTNET_CLI_HOME: /work/cache/dotnet
+      MAVEN_OPTS: -Dmaven.repo.local=/work/cache/maven

@@ -32,3 +32,6 @@ ada_runtime/obj/
 # The docker artifacts themselves and local sweep corpora
 docker/corpus/
 docker/results/
+container-acceptance/
+container-full-acceptance/
+container-ada-acceptance/

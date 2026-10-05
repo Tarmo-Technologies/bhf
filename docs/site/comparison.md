@@ -10,7 +10,7 @@ Every number here is produced by the scripts under [`benchmarks/`](https://githu
 — nothing is hand-edited. See [Methodology](#methodology) for the rules and
 [Reproduce](#reproduce) to run it yourself.
 
-## Bottom line
+## Measured results
 
 | | **bhf** | libFuzzer | AFL++ | cargo-fuzz | Jazzer |
 |---|---|---|---|---|---|
@@ -23,12 +23,11 @@ Every number here is produced by the scripts under [`benchmarks/`](https://githu
 | Finds the planted bug | **yes (every language)** | yes | yes | yes | yes |
 | Drives this engine itself | — | deferred | **adapter** | — | no (own JVM agent) |
 
-bhf is **≥ every tool on every row**, and strictly better on harness effort,
-language breadth, Ada, targets-per-command, and build independence. It does not
-trade away bug-finding to get there: on each target, bhf finds the same
-planted bug the specialist tool finds.
+In this fixture set, bhf required less handwritten harness code and covered more
+languages and targets per command. It also exercised the Ada fixture and worked
+without an existing build. Each tool found the planted bug in the fixture it ran.
 
-## The thesis
+## How bhf reduces setup
 
 A modern fuzzer is two things: an **engine** (mutation + coverage feedback) and
 the **harness + build plumbing** a human writes to point that engine at code.
@@ -76,7 +75,7 @@ Three gate classes: a 32-bit magic, a length field, and an input-to-state
 \* end-to-end, including bhf's automatic build of the harness it generated.
 The competitors' times exclude both build and the human harness they require.
 
-**Read it honestly:** on raw fuzz-only wall-clock a bare in-process fuzzer with a
+**Scope:** on raw fuzz-only wall-clock a bare in-process fuzzer with a
 pre-built harness starts faster — that is what libFuzzer/AFL++ are for. bhf's
 built-in engine still solves **all three gate classes cold** (including the
 input-to-state gate that needs cmplog — on by default, no `-c` build, no flags),
@@ -182,12 +181,12 @@ scales with one command:
   generated; the competitors' is fuzz-only on a pre-built, human-written harness.
   This understates bhf's real-world advantage, which would also count the
   minutes a human spends writing the 5–13-line harness the competitor needs.
-- **Honesty.** bhf also ships the AFL++ engine adapter (libFuzzer is
+- **Engine selection.** bhf also ships the AFL++ engine adapter (libFuzzer is
   deferred; the optional LibAFL adapter crate is not exposed by the CLI); on
   these micro-targets the built-in engine was the more reliable zero-config
   default, so it is what the tables show. The competitors are not strawmen — they
-  all find their bug; bhf's win is the *workflow*, not a claim that the
-  engines are bad.
+  all find their bug. The comparison measures the workflow as well as the
+  engine result.
 
 ## Reproduce
 

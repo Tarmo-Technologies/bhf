@@ -595,7 +595,7 @@ fn offline_dist_readme_documents_install_options_without_source_tree_note() {
         "--non-interactive",
         "--languages LIST",
         "c,cpp,rust,java,python,perl,go,ada,cobol,",
-        "fortran,csharp,javascript,typescript,ruby,lua,php,all,none",
+        "fortran,csharp,javascript,typescript,ruby,lua,php,all",
         "--targets LIST",
         "native,windows,aarch64,all,none",
         "--fuzzers LIST",
@@ -643,6 +643,8 @@ fn offline_dist_readme_documents_install_options_without_source_tree_note() {
     assert!(!lower.contains("build from source"));
     assert!(!lower.contains("git clone"));
     assert!(!lower.contains("cargo build"));
+    assert!(readme.contains("Language selections must be nonempty"));
+    assert!(readme.contains("`none` and mixing `all` with named languages are rejected"));
 }
 
 #[test]
@@ -791,6 +793,75 @@ fn offline_dist_installer_supports_interactive_and_noninteractive_profiles() {
     assert!(stdout.contains("arrow-key checklist"));
     assert!(stdout.contains("Esc/Cancel"));
     assert!(!stdout.to_lowercase().contains("offline"));
+}
+
+#[test]
+fn offline_dist_installer_defaults_to_all_languages_and_honors_subset() {
+    let bundle = temp_dir("dist-installer-language-defaults");
+    create_minimal_bundle(&bundle);
+    for selection in [None, Some("java,python")] {
+        let mut command = Command::new("bash");
+        command
+            .arg(repo_root().join("scripts/install-dist.sh"))
+            .args([
+                "--non-interactive",
+                "--dry-run",
+                "--no-content",
+                "--no-smoke",
+                "--no-symlink",
+                "--package-manager",
+                "apt-get",
+                "--prefix",
+            ])
+            .arg(bundle.join("install"))
+            .current_dir(&bundle);
+        if let Some(languages) = selection {
+            command.args(["--languages", languages]);
+        }
+        let output = command
+            .output()
+            .expect("installer language selection dry-run");
+        assert_success(output.clone(), "installer language selection dry-run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let selected = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("  languages: "))
+            .expect("visible language selection");
+        if let Some(expected) = selection {
+            assert_eq!(selected, expected);
+            assert!(!stdout.contains("gnucobol"), "{stdout}");
+            assert!(!stdout.contains("gfortran"), "{stdout}");
+        } else {
+            let actual: std::collections::BTreeSet<_> = selected.split(',').collect();
+            let expected = [
+                "c",
+                "cpp",
+                "rust",
+                "java",
+                "python",
+                "perl",
+                "go",
+                "ada",
+                "cobol",
+                "fortran",
+                "csharp",
+                "javascript",
+                "typescript",
+                "ruby",
+                "lua",
+                "php",
+            ]
+            .into_iter()
+            .collect();
+            assert_eq!(actual, expected);
+            for package in [
+                "gnucobol", "gfortran", "nodejs", "ruby", "lua5.4", "php-cli",
+            ] {
+                assert!(stdout.contains(package), "missing {package}: {stdout}");
+            }
+        }
+    }
+    fs::remove_dir_all(bundle).unwrap();
 }
 
 #[test]
@@ -1477,7 +1548,7 @@ fn installer_command(bundle: &Path, prefix: &Path) -> Command {
         ])
         .args([
             "--languages",
-            "none",
+            "python",
             "--targets",
             "none",
             "--fuzzers",
@@ -1499,7 +1570,7 @@ fn installer_command_with_symlinks(bundle: &Path, prefix: &Path, bin_dir: &Path)
         .args(["--non-interactive", "--no-system-packages", "--no-rustup"])
         .args([
             "--languages",
-            "none",
+            "python",
             "--targets",
             "none",
             "--fuzzers",

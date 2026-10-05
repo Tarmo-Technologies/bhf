@@ -73,7 +73,7 @@ inherits = "release"
 lto = "thin"
 
 [workspace.package]
-version = "0.2.34"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -109,6 +109,11 @@ dist = false
 install-path = "CARGO_HOME"
 # Whether to install an updater program
 install-updater = false
+
+# Linux release binaries are built and ABI-checked on manylinux2014. Global
+# installer generation runs on a newer host and cannot infer that baseline.
+[workspace.metadata.dist.min-glibc-version]
+x86_64-unknown-linux-gnu = "2.17"
 
 [workspace.dependencies]
 anyhow = "1.0"

@@ -34,7 +34,7 @@ instead of being dropped. The attempt loop then picks a build+fuzz strategy:
   supports `-fsanitize-coverage=trace-pc,trace-cmp` (the driver implements the
   guard-less `__sanitizer_cov_trace_pc` hook), so the engine gets edge coverage +
   input-to-state feedback. There is no ASan runtime for mingw, so memory-safety
-  faults are detected by a vectored exception handler the driver installs: a
+  faults are detected by a unhandled-exception filter the driver installs: a
   hardware fault (access violation, stack overflow, …) becomes an immediate,
   distinctive process exit the engine classifies as a crash.
 - **Arch/SIMD (aarch64, armhf, neon) → cross toolchain + qemu-user.** A 64-bit
@@ -99,7 +99,7 @@ cargo build --release --target x86_64-pc-windows-gnu -p bhf
 
 `bhf.exe` runs the full CLI on Windows and fuzzes Windows harnesses. With no
 POSIX signals on Windows, a harness fault is classified as a crash via the
-driver's vectored-exception-handler exit sentinel (`0x39`). Validated under wine;
+driver's unhandled-exception exit sentinel (`0x39`). Validated under wine;
 on a real Windows host, use clang/mingw for the harness build step.
 
 Current native-Windows scope:

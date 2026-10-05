@@ -133,6 +133,8 @@ pub struct AttemptOptions {
     /// When true, skip the repair planner entirely and mark any
     /// failed build as `FailedBuild` (diagnostics mode).
     pub no_stubs: bool,
+    /// Permit project-controlled Maven/Gradle, Cargo, and MSBuild scripts.
+    pub run_untrusted: bool,
     /// Ordered list of fuzz passes to drive against the built
     /// harness. Each pass sets `BHF_RUNTRACE_MODE` so the shim's
     /// fakes activate in the corresponding mode. Default = all three
@@ -248,6 +250,7 @@ impl Default for AttemptOptions {
             total_time: None,
             per_target_finding_count: None,
             no_stubs: false,
+            run_untrusted: false,
             passes: crate::auto::pass::Pass::ALL.to_vec(),
             source_root: None,
             project: None,
@@ -1205,6 +1208,20 @@ pub fn attempt_with_progress(
     options: AttemptOptions,
     progress: &dyn crate::auto::progress::ProgressSink,
 ) -> Result<AttemptResult> {
+    if !options.run_untrusted
+        && matches!(
+            candidate.lang,
+            crate::auto::candidate::Lang::Rust | crate::auto::candidate::Lang::CSharp
+        )
+    {
+        return Ok(AttemptResult {
+            candidate: candidate.clone(),
+            outcome: Outcome::UnsupportedParams {
+                reason: "project build requires --run-untrusted: Cargo build scripts/proc macros and MSBuild targets execute project-controlled code; stage dependencies and use network isolation".into(),
+            },
+            harness_dir: crate::auto::layout::harness_dir(work_dir, &candidate.harness_id),
+        });
+    }
     // M22: a candidate whose detected dialect has no fuzzing lane yet (a legacy
     // dialect awaiting its phase) is not silently dropped — it is discovered +
     // statically analyzed (CWE-tagged findings) and reported as report-only,
@@ -1895,6 +1912,7 @@ fn run_attempt(
             work_dir,
             &candidate.harness_id,
             &source_root,
+            options.run_untrusted,
         ) {
             crate::auto::java_build::JavaBuildResult::Built => {
                 // harnesses/<id>/main now exists; the build pass-through finds it and
@@ -2922,6 +2940,7 @@ fn run_attempt(
                 let mut events: Vec<crate::auto::runtrace::RuntraceEvent> = Vec::new();
                 let mut env_injected: Vec<(String, String)> = Vec::new();
                 let mut consecutive_crashes = 0_usize;
+                let mut last_fuzz_error = None;
                 // `--per-target-finding-count`: distinct findings emitted across
                 // this target's passes so far. Each pass is told how many MORE it
                 // may emit before the target is done; once the running total
@@ -3056,6 +3075,7 @@ fn run_attempt(
                             p
                         }
                         Err(error) => {
+                            last_fuzz_error = Some(error.clone());
                             bhfeprintln!(
                                 "bhf auto: fuzz pass `{pass_label}` failed for {}: {error}",
                                 candidate.harness_id
@@ -3243,6 +3263,18 @@ fn run_attempt(
                 }
 
                 if pass_runs.is_empty() {
+                    if let Some(reason) = last_fuzz_error {
+                        return Ok(AttemptResult {
+                            candidate: candidate.clone(),
+                            outcome: Outcome::UnrecoverableRuntime {
+                                repairs: manifest.repairs.clone(),
+                                consecutive_crashes,
+                                reason,
+                                runtrace_events: events.clone(),
+                            },
+                            harness_dir,
+                        });
+                    }
                     // Cascade aborted before completing pass 1 — no
                     // fuzz signal at all. Downgrade to `Built` so the
                     // outer report still acknowledges the build.

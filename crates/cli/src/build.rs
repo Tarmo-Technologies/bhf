@@ -99,7 +99,45 @@ fn clang_supports_bhf_coverage(
         .unwrap_or(false)
 }
 
-#[cfg(unix)]
+/// LLVM's Windows ASan DLL lives under its resource directory, outside `bin`.
+/// Make it available to harnesses and replay children without changing the
+/// user's persistent PATH or copying a compiler runtime into the release.
+#[cfg(windows)]
+pub(crate) fn activate_windows_clang_runtime() {
+    for variable in ["CC", "CXX"] {
+        let compiler = std::env::var_os(variable).unwrap_or_else(|| "clang".into());
+        let Ok(output) = std::process::Command::new(compiler)
+            .arg("-print-resource-dir")
+            .output()
+        else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let resource = String::from_utf8_lossy(&output.stdout);
+        let resource = Path::new(resource.trim());
+        if !resource.is_absolute() {
+            continue;
+        }
+        let runtime = resource.join("lib/windows");
+        if !["x86_64", "i386", "aarch64"].iter().any(|arch| {
+            runtime
+                .join(format!("clang_rt.asan_dynamic-{arch}.dll"))
+                .is_file()
+        }) {
+            continue;
+        }
+        let already_present = std::env::var_os("PATH")
+            .map(|path| std::env::split_paths(&path).any(|entry| entry == runtime))
+            .unwrap_or(false);
+        if !already_present {
+            prepend_process_path("PATH", &[runtime]);
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
 fn prepend_process_path(key: &str, prefixes: &[PathBuf]) {
     let mut paths = prefixes.to_vec();
     if let Some(existing) = std::env::var_os(key) {

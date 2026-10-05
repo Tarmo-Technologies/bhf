@@ -27,6 +27,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", shim_src.display());
     println!("cargo:rerun-if-env-changed=PROFILE");
     println!("cargo:rerun-if-env-changed=BHF_RELEASE_VERSION");
+    println!("cargo:rerun-if-env-changed=BHF_VCS_REF");
     let _ = profile;
 
     // Stamp the short git commit so `bug_report` can identify exactly which
@@ -78,9 +79,12 @@ fn main() {
             watch_git_path(&path);
         }
     }
-    if let Some(commit) = git(&["rev-parse", "--short", "HEAD"]) {
-        println!("cargo:rustc-env=BHF_GIT_COMMIT={commit}");
-    }
+    let commit = env::var("BHF_VCS_REF")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| git(&["rev-parse", "--short", "HEAD"]))
+        .unwrap_or_else(|| "unknown".to_owned());
+    println!("cargo:rustc-env=BHF_GIT_COMMIT={commit}");
     // A human version for `bhf --version`: the git tag/describe (e.g.
     // `v0.2.3` on a tag, or `v0.2.2-3-gc307502` between tags), falling back to the
     // Cargo package version for an unpacked source tarball with no git. ALWAYS

@@ -19,7 +19,7 @@ fuzzer for that language.
 | `run_ada.sh` | bhf vs — | Ada: no other fuzzer exists |
 | `run_timing.sh` | first run (cold) vs second run (warm) | harness-build amortization + the behavioral-CWE clock win |
 
-## Fairness and honest notes
+## Fairness and limitations
 
 - Competitors run in their **best** config (AFL++ CMPLOG, libFuzzer
   value-profile) and are handed a harness for **each** vulnerable function in the

@@ -90,7 +90,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
-          toolchain: stable
+          toolchain: 1.99.0
           components: clippy
 
       - name: Install Node
@@ -117,6 +117,14 @@ jobs:
       - name: Build workspace
         run: cargo build --locked --workspace
 
+      - name: Require default production dependency graphs to exclude LLM
+        run: |
+          if cargo tree --locked -p bhf -p bhf-daemon --edges normal --prefix none \
+            | grep -q '^llm_harness_gen '; then
+            echo 'default CLI/daemon dependency graph contains llm_harness_gen' >&2
+            exit 1
+          fi
+
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets
 
@@ -142,7 +150,7 @@ jobs:
       - name: Test workspace (nextest — fast tests + integration smoke)
         env:
           RAYON_NUM_THREADS: "1"
-        run: cargo nextest run --locked --workspace --no-fail-fast -E 'not (package(bhf) & kind(test)) | binary(=auto_c_common_cli) | binary(=auto_ada_access_lifecycle) | binary(=capability_cli) | binary(=collector_mock) | binary(=extension_cli) | (binary(=auto_cpp_amalgamation) & test(=cpp_amalgamation_detects_planted_bug_with_nonempty_testcase)) | (binary(=auto_go_force) & test(=forced_go_targets_build_fuzz_and_are_marked_forced)) | (binary(=auto_rust_discovery) & test(=rust_target_builds_and_fuzzes_natively_and_finds_planted_crash))'
+        run: cargo nextest run --locked --workspace --no-fail-fast -E 'not (package(bhf) & kind(test)) | binary(=project_build_consent) | binary(=auto_c_common_cli) | binary(=auto_ada_access_lifecycle) | binary(=capability_cli) | binary(=collector_mock) | binary(=extension_cli) | (binary(=auto_cpp_amalgamation) & test(=cpp_amalgamation_detects_planted_bug_with_nonempty_testcase)) | (binary(=auto_go_force) & test(=forced_go_targets_build_fuzz_and_are_marked_forced)) | (binary(=auto_rust_discovery) & test(=rust_target_builds_and_fuzzes_natively_and_finds_planted_crash))'
 
       # #57 AC: the out-of-tree extension fixture must also be exercised by a
       # RELEASE-build integration test — the debug nextest above only covers it in
@@ -176,6 +184,54 @@ jobs:
           cargo test --locked -p fuzz_engine_libafl_adapter --features libafl-engine
           cargo test --locked -p fuzz_engine_nyx_adapter --features nyx-engine
           cargo test --locked -p probe_gnat_actions --features enabled
+          cargo check --locked -p bhf -p bhf-daemon --features bhf/llm,bhf-daemon/llm
+          cargo test --locked -p bhf-daemon --features llm --lib
+
+  container-core:
+    name: Core container build and run
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build and exercise the optional C/C++ Docker target
+        run: bash scripts/ci/container-core-acceptance.sh
+      - name: Check the selected Ada toolchain flavor
+        run: bash scripts/ci/container-ada-acceptance.sh
+      - name: Retain container acceptance evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: container-core-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            container-acceptance/
+            container-ada-acceptance/
+          if-no-files-found: error
+
+  container-full:
+    name: Default all-language container acceptance
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build and exercise the default all-language Dockerfile
+        run: bash scripts/ci/container-full-acceptance.sh
+      - name: Retain full-language container evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: container-full-${{ github.run_id }}-${{ github.run_attempt }}
+          path: container-full-acceptance/
+          if-no-files-found: error
 
   rhel7-build:
     name: RHEL 7 compatible build
@@ -202,6 +258,12 @@ jobs:
             "$RHEL7_BUILD_IMAGE" \
             bash -lc '
               set -euo pipefail
+              # The runner checkout is owned by the host user, while this
+              # disposable container runs as root. Trust this mount only.
+              git config --global --add safe.directory /io
+              export BHF_RELEASE_VERSION=1
+              BHF_VCS_REF="$(git rev-parse HEAD)"
+              export BHF_VCS_REF
               curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
               export PATH="$CARGO_HOME/bin:$PATH"
               test -x /opt/python/cp312-cp312/bin/python3
@@ -215,6 +277,14 @@ jobs:
               cargo test --locked -p bhf --test offline_dist_scripts -- --nocapture
               cargo build --locked --release --workspace
               scripts/check-linux-release-abi.sh "$CARGO_TARGET_DIR/release"
+              curl --proto "=https" --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh | sh
+              dist build --artifacts=local --target=x86_64-unknown-linux-gnu --output-format=json > /io/target/component-local-manifest.json
+              dist build --artifacts=global --output-format=json > /io/target/component-global-manifest.json
+              artifact_dir="$CARGO_TARGET_DIR/distrib"
+              python3 scripts/augment-release-installer.py "$artifact_dir/bhf-installer.sh"
+              python3 scripts/fix-dist-shell-installer.py "$artifact_dir/bhf-installer.sh" "$artifact_dir/bhf-daemon-installer.sh" "$artifact_dir/bhf_runtrace_shim-installer.sh" "$artifact_dir/bhf_cc_intercept-installer.sh"
+              python3 scripts/fix-dist-library-installer.py "$artifact_dir/bhf_runtrace_shim-installer.sh" "$artifact_dir/bhf_cc_intercept-installer.sh"
+              python3 scripts/ci/component-install-smoke.py --artifacts "$artifact_dir" --evidence /io/target/component-install-linux
               tar -C "$CARGO_TARGET_DIR/release" -czf /io/target/bhf-el7-release.tar.gz \
                 bhf \
                 bhf-daemon \
@@ -227,6 +297,14 @@ jobs:
         with:
           name: bhf-el7-release
           path: target/bhf-el7-release.tar.gz
+          if-no-files-found: error
+
+      - name: Retain Linux component installer evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: component-install-linux-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/component-install-linux/
           if-no-files-found: error
 
   rhel-family-smoke:
@@ -356,6 +434,7 @@ jobs:
     timeout-minutes: 60
     env:
       BHF_RELEASE_VERSION: "1"
+      BHF_VCS_REF: ${{ github.sha }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -365,7 +444,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
-          toolchain: stable
+          toolchain: 1.99.0
 
       - name: Test Windows-specific logic and daemon
         shell: pwsh
@@ -398,6 +477,31 @@ jobs:
       - name: Exercise Windows release binaries
         shell: pwsh
         run: scripts/ci/windows-release-smoke.ps1 -BinaryDir target/x86_64-pc-windows-msvc/release
+
+      - name: Build and install Windows component archives
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          irm https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.ps1 | iex
+          dist build --artifacts=local --target=x86_64-pc-windows-msvc --output-format=json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dist build --artifacts=global --output-format=json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/fix-dist-powershell-installer.py target/distrib/bhf-installer.ps1 target/distrib/bhf-daemon-installer.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/ci/component-install-smoke.py --artifacts target/distrib --evidence target/component-install-windows
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Retain Windows component archives and installer evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bhf-windows-components
+          path: |
+            target/distrib/bhf*x86_64-pc-windows-msvc.zip*
+            target/distrib/*installer.ps1
+            target/component-install-windows/
+          if-no-files-found: error
 
       - name: Stage Windows release binaries
         shell: pwsh
@@ -439,6 +543,24 @@ jobs:
         shell: pwsh
         run: scripts/ci/windows-release-smoke.ps1 -BinaryDir target/platform-release/bin
 
+      - name: Download generated Windows component archives and installers
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bhf-windows-components
+          path: target/component-release
+
+      - name: Install Windows components on Server 2025
+        shell: pwsh
+        run: python scripts/ci/component-install-smoke.py --artifacts target/component-release --evidence target/component-install-windows-2025
+
+      - name: Retain Windows Server 2025 component installer evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: component-install-windows-2025-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/component-install-windows-2025/
+          if-no-files-found: error
+
   ci-acceptance:
     # Make this the required check in branch protection. It is intentionally
     # not skipped when an upstream job fails or a documentation job is skipped.
@@ -454,6 +576,8 @@ jobs:
       - ci-policy
       - minimum-rust
       - build-test
+      - container-core
+      - container-full
       - rhel7-build
       - rhel-family-smoke
       - ubuntu-release-smoke

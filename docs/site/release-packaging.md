@@ -131,9 +131,9 @@ operation.
 The staged runtime trees cover C/C++, Ada, Rust, Java, Python, Perl, C#,
 JavaScript/TypeScript, Ruby, Lua, and PHP. COBOL, Fortran, and Go use their
 system toolchains plus the shared C runtime and do not have separate runtime
-trees. `--languages all` selects all sixteen installer dependency profiles;
-the interactive/default profile remains the original eight core lanes so new
-toolchains are opt-in.
+trees. All sixteen installer dependency profiles are selected by default in
+both interactive and non-interactive installation. Use `--languages c,cpp` or
+another explicit subset to select fewer languages.
 
 The bundled `install.sh` prompts with an arrow-key terminal checklist for
 languages, compile targets, fuzzers, and extras. Up/Down moves through options

@@ -46,6 +46,7 @@ fn run_auto(
     let output = Command::new(bhf_bin())
         .args([
             "auto",
+            "--run-untrusted",
             fixture_dir.to_str().unwrap(),
             "--per-target-time",
             per_target,

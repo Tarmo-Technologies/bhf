@@ -19,13 +19,13 @@ campaign README for why the two differ.
 
 Counts are targets, from the sweep's own residual-blocker histogram. They were
 produced by the binary **before** the 2026-07-27 fix wave, so a class fixed since
-is marked **[FIXED]** and its count is what it used to cost. Everything else is
-live.
+is marked **[FIXED]** and its count is what it used to cost. Other entries retain
+the unresolved classifications recorded by this snapshot.
 
 Each class carries a verdict:
 
 - **GAP** — BHF's own limitation. Fixable here. This is the work list.
-- **DEPENDENCY** — the code needed is genuinely not in the tree. The honest
+- **DEPENDENCY** — the code needed is not in the tree. The honest
   answer is the missing-dependency manifest, not a repair; installing the
   dependency fixes it.
 - **ENVIRONMENT** — a toolchain fact about this host. Not BHF's decision.
@@ -83,7 +83,7 @@ plumbed down to the decoder first. That is a real feature, not a small fix.
 ### C-2. `missing header` (26) / `missing type` (31) / `undeclared function` (20) — **mostly DEPENDENCY**
 
 After the repair loop exhausts itself. Spot-reading these in the previous
-campaign found them dominated by genuinely absent SDKs — libevent, Qt, protobuf,
+campaign found them dominated by absent SDKs — libevent, Qt, protobuf,
 JNI, Win32. The manifest reports them. A minority are BHF's own and worth
 re-reading the exemplars for; that method has produced a fix every time it was
 run.
@@ -305,8 +305,8 @@ Only no-arg-constructible receivers are supported.
 Checked, and it is not ours: the project's OWN module fails to import because it
 subscripts a class that is not generic on the installed library version
 (spec-kit's `Choice[...]`). Correctly reported as "not loadable (skipped
-cleanly)" with the interpreter's real message. I had this filed as a loader gap
-from inspection; reading an exemplar corrected it.
+cleanly)" with the interpreter's real message. Initial inspection classified it
+as a loader gap; reading an exemplar corrected the classification.
 
 ### Py-4. Python 2 — 20 — **BY DESIGN**
 

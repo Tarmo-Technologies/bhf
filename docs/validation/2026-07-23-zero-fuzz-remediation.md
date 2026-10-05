@@ -139,7 +139,7 @@ Status values:
 - Evidence: `COMPILE_DB_FLAGS` follows `CXXFLAGS`, so its `-std=` overrides
   `CXX_STD`. The generated harness unconditionally includes/uses post-C++03
   facilities while the ladder advertises `gnu++03` and `gnu++98`.
-- Impact: every retry may use the same project standard; genuinely old-only code
+- Impact: every retry may use the same project standard; old-only code
   cannot compile the generated driver.
 - Correction: normalize the recovered standard into the explicit
   `CXX_STD` decision instead of forwarding it twice; either provide a true

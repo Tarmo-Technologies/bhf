@@ -1,5 +1,5 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
-# bhf best-in-class comparison campaign (2026-07)
+# bhf comparison campaign (2026-07)
 
 Real measurements of bhf vs the leading tool(s) for each feature, across a
 14-repo multi-language corpus (C, C++, Rust, Go, Python, Java, Perl, JS). The

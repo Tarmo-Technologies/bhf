@@ -18,11 +18,13 @@ NO_SMOKE=0
 INSTALL_SEEDS=0
 SMOKE_WORK_DIR=""
 LANGUAGES=""
+LANGUAGES_SET=0
 TARGETS=""
 FUZZERS=""
 EXTRAS=""
 
-DEFAULT_LANGUAGES="c,cpp,rust,java,python,perl,go,ada"
+source "$(dirname "${BASH_SOURCE[0]}")/language-selection.sh"
+DEFAULT_LANGUAGES="$BHF_ALL_LANGUAGES"
 DEFAULT_TARGETS="native"
 DEFAULT_FUZZERS="builtin"
 DEFAULT_EXTRAS="build-recovery,archives"
@@ -45,7 +47,8 @@ Options:
   --bin-dir DIR           Directory for bhf symlinks (default: /usr/local/bin)
   --non-interactive       Do not prompt; use selected or default profiles
   --languages LIST        Comma list: c,cpp,rust,java,python,perl,go,ada,cobol,
-                          fortran,csharp,javascript,typescript,ruby,lua,php,all,none
+                          fortran,csharp,javascript,typescript,ruby,lua,php,all
+                          (default: all sixteen languages)
   --targets LIST          Comma list: native,windows,aarch64,all,none
   --fuzzers LIST          Comma list: builtin,afl,all,none
   --extras LIST           Comma list: build-recovery,sandbox,archives,all,none
@@ -530,7 +533,9 @@ while [[ $# -gt 0 ]]; do
       ;;
     --languages)
       [[ $# -ge 2 ]] || die "--languages requires a list"
-      LANGUAGES="$2"
+      [[ "$LANGUAGES_SET" == 0 ]] || die "duplicate --languages"
+      LANGUAGES="$(bhf_resolve_languages "$2")" || exit 2
+      LANGUAGES_SET=1
       shift 2
       ;;
     --targets)
@@ -681,14 +686,14 @@ if [[ "$NON_INTERACTIVE" -eq 0 ]]; then
     "perl|Perl harnesses and coverage driver|on" \
     "go|Go harnesses with atomic coverage|on" \
     "ada|Ada harnesses with GNAT/GPRbuild|on" \
-    "cobol|COBOL harnesses with GnuCOBOL|off" \
-    "fortran|Fortran harnesses with gfortran|off" \
-    "csharp|C# harnesses with .NET + SharpFuzz|off" \
-    "javascript|JavaScript harnesses with Node.js|off" \
-    "typescript|TypeScript with Node.js + esbuild|off" \
-    "ruby|Ruby harnesses and coverage driver|off" \
-    "lua|Lua harnesses and coverage driver|off" \
-    "php|PHP harnesses and coverage driver|off")"
+    "cobol|COBOL harnesses with GnuCOBOL|on" \
+    "fortran|Fortran harnesses with gfortran|on" \
+    "csharp|C# harnesses with .NET + SharpFuzz|on" \
+    "javascript|JavaScript harnesses with Node.js|on" \
+    "typescript|TypeScript with Node.js + esbuild|on" \
+    "ruby|Ruby harnesses and coverage driver|on" \
+    "lua|Lua harnesses and coverage driver|on" \
+    "php|PHP harnesses and coverage driver|on")"
   TARGETS="$(ask_checklist "Compile targets to support" "$TARGETS" \
     "native|Native Linux target|on" \
     "windows|Windows cross target and Wine smoke execution|off" \
@@ -707,7 +712,7 @@ else
   EXTRAS="${EXTRAS:-$DEFAULT_EXTRAS}"
 fi
 
-LANGUAGES="$(expand_selection "$LANGUAGES" c cpp rust java python perl go ada cobol fortran csharp javascript typescript ruby lua php)"
+LANGUAGES="$(bhf_resolve_languages "$LANGUAGES")"
 TARGETS="$(expand_selection "$TARGETS" native windows aarch64)"
 FUZZERS="$(expand_selection "$FUZZERS" builtin afl)"
 EXTRAS="$(expand_selection "$EXTRAS" build-recovery sandbox archives)"
@@ -776,65 +781,13 @@ if [[ "$NO_SMOKE" -eq 0 ]]; then
   add_unique APT_PACKAGES make clang llvm
   add_unique RPM_PACKAGES make clang llvm
 fi
+while IFS= read -r package; do [[ -z "$package" ]] || add_unique APT_PACKAGES "$package"; done < <(bhf_language_packages apt "$LANGUAGES")
+while IFS= read -r package; do [[ -z "$package" ]] || add_unique RPM_PACKAGES "$package"; done < <(bhf_language_packages rpm "$LANGUAGES")
 if contains_item "$LANGUAGES" c || contains_item "$LANGUAGES" cpp || contains_item "$LANGUAGES" rust; then
-  add_unique APT_PACKAGES make clang llvm lld
-  add_unique RPM_PACKAGES make clang llvm lld
-  # RHEL 7's base clang is 3.4 and predates SanitizerCoverage. When the
-  # supported RHSCL/SCLo repository is enabled, install LLVM Toolset 7 as the
-  # coverage-capable compiler; the bhf binary activates its nonstandard
-  # PATH/LD_LIBRARY_PATH automatically.
   RPM_PLATFORM_VERSION="$(awk -F= '$1 == "VERSION_ID" { gsub(/\"/, "", $2); print $2; exit }' /etc/os-release 2>/dev/null)"
   if [[ "$RPM_PLATFORM_VERSION" == 7 || "$RPM_PLATFORM_VERSION" == 7.* ]]; then
     add_unique RPM_PACKAGES llvm-toolset-7.0-clang llvm-toolset-7.0-compiler-rt
   fi
-fi
-if contains_item "$LANGUAGES" cpp; then
-  add_unique APT_PACKAGES g++
-  add_unique RPM_PACKAGES gcc-c++
-fi
-if contains_item "$LANGUAGES" ada; then
-  add_unique APT_PACKAGES gnat gprbuild
-  add_unique RPM_PACKAGES gcc-gnat gprbuild
-fi
-if contains_item "$LANGUAGES" java; then
-  add_unique APT_PACKAGES default-jdk maven gradle
-  add_unique RPM_PACKAGES java-17-openjdk-devel maven gradle
-fi
-if contains_item "$LANGUAGES" python; then
-  add_unique APT_PACKAGES python3
-  add_unique RPM_PACKAGES python3
-fi
-if contains_item "$LANGUAGES" perl; then
-  add_unique APT_PACKAGES perl
-  add_unique RPM_PACKAGES perl
-fi
-if contains_item "$LANGUAGES" go; then
-  add_unique APT_PACKAGES golang-go
-  add_unique RPM_PACKAGES golang
-fi
-if contains_item "$LANGUAGES" cobol; then
-  add_unique APT_PACKAGES gnucobol make clang llvm
-  add_unique RPM_PACKAGES gnucobol make clang llvm
-fi
-if contains_item "$LANGUAGES" fortran; then
-  add_unique APT_PACKAGES gfortran make clang llvm
-  add_unique RPM_PACKAGES gcc-gfortran make clang llvm
-fi
-if contains_item "$LANGUAGES" javascript || contains_item "$LANGUAGES" typescript; then
-  add_unique APT_PACKAGES nodejs npm
-  add_unique RPM_PACKAGES nodejs npm
-fi
-if contains_item "$LANGUAGES" ruby; then
-  add_unique APT_PACKAGES ruby
-  add_unique RPM_PACKAGES ruby
-fi
-if contains_item "$LANGUAGES" lua; then
-  add_unique APT_PACKAGES lua5.4
-  add_unique RPM_PACKAGES lua
-fi
-if contains_item "$LANGUAGES" php; then
-  add_unique APT_PACKAGES php-cli
-  add_unique RPM_PACKAGES php-cli
 fi
 if contains_item "$TARGETS" windows; then
   add_unique APT_PACKAGES gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 wine64

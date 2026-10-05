@@ -4,6 +4,9 @@ use clap::{Parser, Subcommand};
 use config::Profile;
 use license_policy::enforce;
 
+/// Source identity supplied by the release builder (or local Git checkout).
+pub const BUILD_COMMIT: &str = env!("BHF_GIT_COMMIT");
+
 /// Terminal output, routed so it cannot be eaten by the live progress block.
 ///
 /// `auto` pins a status block to the bottom of the terminal and erases it by
@@ -65,6 +68,7 @@ mod license_audit;
 pub mod list_fakes;
 pub mod list_oracles;
 mod list_targets;
+#[cfg(feature = "llm")]
 mod llm;
 mod minimize;
 mod model;
@@ -100,16 +104,24 @@ pub mod workdir;
 #[derive(Debug, Parser)]
 #[command(name = "bhf")]
 #[command(version = env!("BHF_VERSION_FULL"))]
-#[command(about = "Offline fuzz lab generator for sixteen-language software estates")]
+#[command(long_version = concat!(env!("BHF_VERSION_FULL"), "\ncommit: ", env!("BHF_GIT_COMMIT")))]
+#[command(about = "Discover targets, build harnesses, and fuzz your source tree offline")]
 #[command(long_about = "\
-Offline fuzz lab generator for sixteen-language software estates.
+Discover targets, build harnesses, and fuzz your source tree offline.
 
-Scan untrusted source (or binaries), rank fuzzable subprograms, generate typed
-harnesses + stubs, build with your installed toolchains, fuzz with a builtin
-engine or the AFL++ adapter, and emit
-JSON/Markdown/SARIF/JUnit/CSV findings — fully offline.
+START HERE:
+  bhf auto /path/to/source --work-dir /path/to/bhf_work \\
+    --jobs 1 --max-targets 1 --per-target-time 10
 
-Most users want `bhf auto <source-dir>`, which runs the whole pipeline.
+Keep the work directory outside the source tree. Install the compiler or
+interpreter for your selected languages. C/C++ needs clang and make; Windows
+also needs Visual Studio C++ Build Tools and the Windows SDK.
+No model or API key is required.
+
+Read /path/to/bhf_work/results/INDEX.md for findings and
+/path/to/bhf_work/auto/summary.txt for built, fuzzed, and skipped targets.
+Run `bhf auto --help` for language selection, budgets, and build options.
+If BHF itself errors, use `--debug` and `bhf bug-report <work-dir> --preview`.
 
 COMMANDS BY AREA (run `bhf <command> --help` for details):
   Pipeline      auto, scan, list, generate-harness, build, fuzz, report
@@ -119,7 +131,6 @@ COMMANDS BY AREA (run `bhf <command> --help` for details):
   Supply chain  sbom, license-audit, static-scan, extract-state-machines
   Reference     rules, list oracles
   Governance    policy, audit, pack, export
-  Assistance    llm (Codex, Claude, API, local, MCP workflows)
   Ops & CI      ci, runners, clean, introspect, bug-report
 
 `list` and `binary` group related subcommands (`bhf list targets`,
@@ -160,7 +171,8 @@ struct Args {
 #[derive(Debug, Subcommand)]
 enum Command {
     // ── Pipeline: the source -> findings flow ───────────────────────────────
-    /// End-to-end pipeline: discover targets, generate harnesses, auto-repair the build, fuzz, and report (flagship command)
+    /// Discover targets, generate harnesses, recover builds, fuzz, and write reports
+    #[command(long_about = auto::cli::FIRST_RUN_HELP)]
     Auto(auto::cli::AutoArgs),
     /// Fuzz ONE pasted function with no project/build/deps — detect language, synthesize a one-file project, run the auto pipeline
     Snippet(snippet::SnippetArgs),
@@ -259,6 +271,7 @@ enum Command {
     /// Create a compact scrubbed support report from a running/completed auto work directory (no source or private names)
     BugReport(support_report::SupportReportArgs),
     /// Use Codex, Claude, API, or local LLMs for evidence-grounded planning, harness help, findings, and diagnostics
+    #[cfg(feature = "llm")]
     Llm(llm::LlmArgs),
 
     // ── Internal / metrics: hidden from the default menu, still runnable ─────
@@ -357,6 +370,9 @@ where
         eprintln!("{error}");
         return 2;
     }
+
+    #[cfg(windows)]
+    build::activate_windows_clang_runtime();
 
     match args.command {
         Some(Command::Auto(auto_args)) => {
@@ -478,6 +494,7 @@ where
         Some(Command::LicenseAudit(license_audit_args)) => {
             license_audit::run(license_audit_args, profile)
         }
+        #[cfg(feature = "llm")]
         Some(Command::Llm(args)) => llm::run(args),
         Some(Command::ListOracles(args)) => list_oracles::run(args),
         Some(Command::ListTargets(list_args)) => match list_targets::run(list_args) {

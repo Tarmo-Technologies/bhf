@@ -56,7 +56,7 @@ pause ended with the 2026-09-24 resumption instruction.
 |---|---|---|
 | E1 | release_ci / GPT-6 Sol | Ed25519 offline pack creation/verification and trusted public-key policy; secure key handling; independent verification and tamper/rotation/revocation/downgrade tests; `enterprise-pack-authentication.md` |
 | E2 | daemon_editors / GPT-6 Sol | Bounded response production, GNAT request deadlines, scheduler process-tree shutdown/restart; adversarial regressions; `enterprise-daemon-reliability.md` |
-| E3 | feature_completeness / GPT-6 Luna | Run ignored cold-solve gates, implement controlled repeated engine comparison with raw results and honest limits; `enterprise-engine-benchmark.md` |
+| E3 | feature_completeness / GPT-6 Luna | Run ignored cold-solve gates, implement controlled repeated engine comparison with raw results and explicit limits; `enterprise-engine-benchmark.md` |
 | E4 | coordinating agent | Harden container build/sweep failure semantics, build a fresh source snapshot image and run its pinned language matrix; integrate/review agent changes and maintain evidence |
 
 Subsequent waves must cover the remaining matrix: real-code performance and

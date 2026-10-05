@@ -63,6 +63,7 @@ pub fn build_java_harness(
     work_dir: &Path,
     harness_id: &str,
     source_root: &Path,
+    run_untrusted: bool,
 ) -> JavaBuildResult {
     let Some(tc) = probe_toolchain() else {
         return JavaBuildResult::Failed {
@@ -150,6 +151,7 @@ pub fn build_java_harness(
         &candidate.source_path,
         work_dir,
         &target_classes,
+        run_untrusted,
     ) {
         Ok(resolved) => resolved,
         Err((reason, skip)) => return JavaBuildResult::Failed { reason, skip },
@@ -694,6 +696,7 @@ fn resolve_target_classpath(
     source_path: &Path,
     work_dir: &Path,
     fallback_classes: &Path,
+    run_untrusted: bool,
 ) -> Result<(String, bool), (String, bool)> {
     // Maven/gradle are ADDITIVE: try the build tool (it resolves dependencies for
     // dep-heavy projects), but on ANY failure fall back to a bare `javac` of the
@@ -703,7 +706,12 @@ fn resolve_target_classpath(
     let mut tool_error: Option<String> = None;
 
     if let Some(module) = find_build_file(source_path, source_root, &["pom.xml"]) {
-        if which::which("mvn").is_ok() {
+        if !run_untrusted {
+            tool_error = Some(
+                "Maven project build requires --run-untrusted (builds run offline)".to_owned(),
+            );
+        }
+        if run_untrusted && which::which("mvn").is_ok() {
             match maven_classpath(&module, work_dir) {
                 Ok(cp) => return Ok((cp, false)),
                 Err(e) => tool_error = Some(e),
@@ -716,7 +724,12 @@ fn resolve_target_classpath(
         &["build.gradle", "build.gradle.kts"],
     ) {
         let has_gradle = which::which("gradle").is_ok() || module.join("gradlew").is_file();
-        if has_gradle {
+        if !run_untrusted {
+            tool_error = Some(
+                "Gradle project build requires --run-untrusted (builds run offline)".to_owned(),
+            );
+        }
+        if run_untrusted && has_gradle {
             match gradle_classpath(&module) {
                 Ok(cp) => return Ok((cp, false)),
                 Err(e) => tool_error = tool_error.or(Some(e)),
@@ -735,13 +748,16 @@ fn resolve_target_classpath(
     match run_javac(&tc.javac, &[], fallback_classes, &sources, false) {
         Ok(preview) => Ok((fallback_classes.display().to_string(), preview)),
         Err(javac_err) => {
+            let consent_missing = tool_error
+                .as_ref()
+                .is_some_and(|e| e.contains("requires --run-untrusted"));
             // Both the build tool (if any) and javac failed — surface both so a
             // dep-heavy project's real blocker (the build tool) isn't hidden.
             let reason = match tool_error {
                 Some(t) => format!("build failed via maven/gradle ({t}) AND javac ({javac_err})"),
                 None => format!("javac (target) failed: {javac_err}"),
             };
-            Err((reason, false))
+            Err((reason, consent_missing))
         }
     }
 }
@@ -798,6 +814,7 @@ fn maven_classpath(module: &Path, work_dir: &Path) -> Result<String, String> {
             Command::new("mvn")
                 .arg("-q")
                 .arg("-B")
+                .arg("-o")
                 .arg("-Dmaven.test.skip=true")
                 .arg("-Denforcer.skip=true")
                 .arg("-Denforcer.fail=false")
@@ -865,6 +882,7 @@ fn gradle_classpath(module: &Path) -> Result<String, String> {
     let out = crate::command_output::output_with_timeout(
         Command::new(&gradle)
             .arg("-q")
+            .arg("--offline")
             .arg("compileJava")
             .current_dir(module),
         std::time::Duration::from_secs(30 * 60),
@@ -906,6 +924,7 @@ fn gradle_runtime_classpath(module: &Path, gradle: &Path) -> Option<String> {
     let out = crate::command_output::output_with_timeout(
         Command::new(gradle)
             .arg("-q")
+            .arg("--offline")
             .arg("-I")
             .arg(&init)
             .arg("bhfCp")
@@ -996,6 +1015,16 @@ fn collect_java_sources(root: &Path) -> Vec<PathBuf> {
 /// Ensure the bhf JVM agent jar exists AND is at least as new as its sources;
 /// build it via `build-agent.sh` otherwise. Returns the jar path.
 fn ensure_agent_jar() -> Result<PathBuf, String> {
+    if let Some(prebuilt) = std::env::var_os("BHF_JVM_AGENT_JAR") {
+        let path = PathBuf::from(prebuilt);
+        if path.is_file() {
+            return Ok(path);
+        }
+        return Err(format!(
+            "BHF_JVM_AGENT_JAR does not name a readable file: {}",
+            path.display()
+        ));
+    }
     let cache = agent_jar_cache_path();
     let script = locate_build_agent_script()
         .ok_or_else(|| "could not locate java_runtime/build-agent.sh".to_owned())?;
@@ -1119,6 +1148,28 @@ mod tests {
         assert_eq!(found, root);
         // No build file -> None.
         assert!(find_build_file(&src.join("A.java"), root, &["build.gradle"]).is_none());
+    }
+
+    #[test]
+    fn java_project_build_requires_consent_and_reports_incomplete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let source = root.join("A.java");
+        std::fs::write(&source, "class A {}").unwrap();
+        std::fs::write(root.join("pom.xml"), "<project/>").unwrap();
+        let tc = JavaToolchain {
+            javac: PathBuf::from("/definitely-not-a-javac"),
+            java: PathBuf::new(),
+        };
+        let result =
+            resolve_target_classpath(&tc, root, &source, root, &root.join("classes"), false);
+        let (reason, skip) = result.unwrap_err();
+        assert!(skip, "consent denial must be reported as incomplete");
+        assert!(reason.contains("requires --run-untrusted"), "{reason}");
+        assert!(
+            !root.join("target").exists(),
+            "Maven must not run by default"
+        );
     }
 
     #[test]

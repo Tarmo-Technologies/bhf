@@ -1,6 +1,14 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Run bhf on every pull request
 
+For BHF distribution validation, the explicitly dispatched **Container release
+candidate** workflow has a `language_matrix` option. It runs the all-language,
+sixteen single-language, and three mixed-image construction matrix with benign
+BHF-owned `bhf auto` controls. Requested matrix failures block candidate packaging;
+short functional controls do not establish upstream qualification. See the
+[Docker selection guide](docker.md#installation-selection-versus-run-selection)
+for local execution, evidence retention, and resumption.
+
 `bhf ci` fuzzes only the code a pull request changes and reports the results
 where reviewers already are: inline annotations on the changed lines and a single
 summary comment. The GitHub Action wraps it so the whole thing is one `uses:` line
@@ -135,7 +143,7 @@ CLI provider, inject provider keys through the CI secret store, and do not write
 key values into arguments, workflow YAML, caches, or uploaded prompts. See
 [LLM Assistance](./llm.md) for the exact provider and MCP boundaries.
 
-## Honesty
+## Scope of a passing check
 
 A diff-scoped run fuzzes only the changed files' targets under a bounded time
 budget. A green check means "no confirmed finding was introduced in the changed

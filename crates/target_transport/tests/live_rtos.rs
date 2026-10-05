@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! #84: a REAL open-RTOS (FreeRTOS) reference profile for the shipped
-//! `FullSystemTransport`, not a host vendor-header stub. This is BRING-UP, not a
-//! delivered RTOS-fuzzing claim (#84 stays open); the coverage is deliberately
-//! two-tiered so nothing asserts more than has actually been validated.
+//! `FullSystemTransport`, not a host vendor-header stub. The test exercises the
+//! reference profile under QEMU; physical boards and other RTOSes remain separate.
 //!
 //! A BHF-authored queue/message application targets the FreeRTOS kernel under
 //! `qemu-system-arm -M mps2-an385` (Cortex-M3): a producer task forwards the fuzz
@@ -20,11 +19,8 @@
 //!   the VALIDATED extent: build the real pinned kernel, boot it on the board,
 //!   complete the QMP + gdb attach, plant the harness breakpoint, and capture the
 //!   `savevm` baseline. It asserts `arm()` succeeds; it does NOT drive inputs.
-//! * [`live_rtos_freertos_full_fuzz_drive`] (`BHF_RTOS_LIVE=1` **and**
-//!   `BHF_RTOS_FULL=1`) — the per-input task/coverage/fault assertions. This is
-//!   KNOWN-INCOMPLETE: a FreeRTOS-specific harness-done breakpoint-stop issue
-//!   under `loadvm`+`continue` is unresolved for this image, so it is not part of
-//!   the ordinary run and must not be read as passing (#84).
+//! * [`live_rtos_freertos_full_fuzz_drive`] (`BHF_RTOS_LIVE=1`) — per-input
+//!   task/coverage/fault assertions through snapshot restore and continue.
 //!
 //! BHF ships no RTOS image: the kernel is fetched at a pinned commit (bring your
 //! own source), not vendored. `BHF_RTOS_KERNEL=<path>` reuses an already-fetched
@@ -58,29 +54,36 @@ fn fixture_dir() -> PathBuf {
 
 /// Obtain the pinned FreeRTOS kernel: an operator-provided path, or a shallow
 /// fetch of the exact pinned commit into `build_dir/kernel`.
-fn obtain_kernel(build_dir: &Path) -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("BHF_RTOS_KERNEL") {
-        return Some(PathBuf::from(path));
-    }
-    let kernel = build_dir.join("kernel");
-    std::fs::create_dir_all(&kernel).ok()?;
-    let git = |args: &[&str]| -> bool {
-        Command::new("git")
-            .current_dir(&kernel)
-            .args(args)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    };
-    if !git(&["init", "-q"])
-        || !git(&["remote", "add", "origin", KERNEL_URL])
-        || !git(&["fetch", "-q", "--depth", "1", "origin", KERNEL_PIN])
-        || !git(&["checkout", "-q", "FETCH_HEAD"])
-    {
-        eprintln!("live_rtos: could not fetch the pinned FreeRTOS kernel (no network?)");
-        return None;
-    }
-    Some(kernel)
+fn obtain_kernel(build_dir: &Path) -> PathBuf {
+    let kernel =
+        if let Ok(path) = std::env::var("BHF_RTOS_KERNEL") {
+            PathBuf::from(path)
+        } else {
+            let kernel = build_dir.join("kernel");
+            std::fs::create_dir_all(&kernel).expect("create FreeRTOS kernel directory");
+            let git =
+                |args: &[&str]| {
+                    assert!(Command::new("git").current_dir(&kernel).args(args)
+                .status().expect("run git for FreeRTOS kernel").success(),
+                "failed to obtain pinned FreeRTOS kernel; set BHF_RTOS_KERNEL for offline use");
+                };
+            git(&["init", "-q"]);
+            git(&["remote", "add", "origin", KERNEL_URL]);
+            git(&["fetch", "-q", "--depth", "1", "origin", KERNEL_PIN]);
+            git(&["checkout", "-q", "FETCH_HEAD"]);
+            kernel
+        };
+    let head = Command::new("git")
+        .arg("-C")
+        .arg(&kernel)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("inspect FreeRTOS kernel revision");
+    assert!(
+        head.status.success() && String::from_utf8_lossy(&head.stdout).trim() == KERNEL_PIN,
+        "BHF_RTOS_KERNEL must resolve to pinned commit {KERNEL_PIN}"
+    );
+    kernel
 }
 
 fn build_image(build_dir: &Path, kernel: &Path) -> PathBuf {
@@ -142,11 +145,12 @@ fn rtos_live_gate() -> bool {
 /// Build the real pinned kernel, boot it on `mps2-an385`, complete the QMP + gdb
 /// attach, plant the harness breakpoint, and capture the `savevm` baseline.
 /// Returns the armed session and the QEMU child guard — the caller keeps BOTH
-/// alive (the guard must outlive the session so QEMU stays up) — or `None` when
-/// the pinned kernel cannot be fetched (e.g. no network). This is the setup shared
+/// alive (the guard must outlive the session so QEMU stays up). When live
+/// validation was explicitly requested, a missing kernel is a failure. This is
+/// the setup shared
 /// by the smoke and the full fuzz-drive so neither duplicates the bring-up.
-fn build_boot_arm(dir: &TempDir) -> Option<(Box<dyn target_transport::TargetSession>, ChildGuard)> {
-    let kernel = obtain_kernel(dir.path())?;
+fn build_boot_arm(dir: &TempDir) -> (Box<dyn target_transport::TargetSession>, ChildGuard) {
+    let kernel = obtain_kernel(dir.path());
     let elf = build_image(dir.path(), &kernel);
 
     let map = GdbMemoryMap {
@@ -214,56 +218,36 @@ fn build_boot_arm(dir: &TempDir) -> Option<(Box<dyn target_transport::TargetSess
         "live_rtos: armed — real FreeRTOS image built (pinned kernel), booted on mps2-an385, \
          QMP+gdb attached, harness breakpoint planted, savevm baseline captured"
     );
-    Some((session, guard))
+    (session, guard)
 }
 
 /// VALIDATED tier: build the real pinned kernel, boot it, attach QMP+gdb, plant
 /// the harness breakpoint, and capture the savevm baseline. `arm()` succeeding IS
 /// the assertion — this does not drive inputs. It is the honest, demonstrated
 /// extent of the actual-RTOS profile today; the per-input drive is a separate,
-/// known-incomplete test below (#84 stays open).
+/// full-drive test below.
 #[test]
 fn live_rtos_freertos_build_boot_arm_snapshot_smoke() {
     if !rtos_live_gate() {
         return;
     }
     let dir = TempDir::new("bhf-live-rtos-smoke").expect("temp dir");
-    let Some((_session, _guard)) = build_boot_arm(&dir) else {
-        return;
-    };
+    let (_session, _guard) = build_boot_arm(&dir);
     eprintln!(
         "live_rtos: SMOKE PASSED — build + boot + QMP/gdb attach + snapshot baseline \
          (no input driven; see live_rtos_freertos_full_fuzz_drive for the gated per-input run)"
     );
 }
 
-/// KNOWN-INCOMPLETE tier: the full per-input task/coverage/fault assertions.
-///
-/// Behind a FURTHER opt-in (`BHF_RTOS_FULL=1`) because a FreeRTOS-specific
-/// harness-done breakpoint-stop issue under `loadvm`+`continue` is unresolved for
-/// this image: the app provably runs its tasks and emits task-aware coverage (see
-/// `freertos/README.md`), but the transport's `continue` does not yet observe the
-/// harness-done stop here. This is bring-up evidence, NOT a passing capability —
-/// it is excluded from the ordinary gated run so nothing reports it as working
-/// (#84 stays open until it passes end to end through `bhf fuzz`).
+/// Full per-input task/coverage/fault assertions against the actual kernel.
 #[test]
 fn live_rtos_freertos_full_fuzz_drive() {
     if !rtos_live_gate() {
         return;
     }
-    if std::env::var("BHF_RTOS_FULL").ok().as_deref() != Some("1") {
-        eprintln!(
-            "live_rtos: full fuzz-drive gated (set BHF_RTOS_FULL=1 to run it). KNOWN-INCOMPLETE: \
-             the harness-done-stop under loadvm+cont is the remaining RTOS validation (#84) — \
-             see freertos/README.md"
-        );
-        return;
-    }
 
     let dir = TempDir::new("bhf-live-rtos-full").expect("temp dir");
-    let Some((mut session, _guard)) = build_boot_arm(&dir) else {
-        return;
-    };
+    let (mut session, _guard) = build_boot_arm(&dir);
 
     const TASK_MARKER: u32 = 0x75C0; // consumer task identity marker
     let run = |s: &mut Box<dyn target_transport::TargetSession>, byte: u8| {

@@ -2,9 +2,17 @@
 
 # Changelog
 
-## Unreleased
+## 0.3.0 - 2026-10-05
 
 ### Breaking
+- Default CLI and daemon artifacts omit LLM integrations; build with the explicit
+  `llm` feature to include them. The default container includes all sixteen
+  supported languages; reduced `core` and `ada` images require explicit selection.
+  `--languages` limits a run only when supplied. Validation sweep startup
+  requires the `validation` Compose profile.
+- Maven/Gradle, Cargo, and MSBuild project execution requires `--run-untrusted`;
+  dependency resolution uses staged caches. Disconnected deployment additionally
+  requires operating-system network isolation.
 - All findings, indexes and native reports live under `<work-dir>/results/`. `FINDINGS.md`,
   `findings.csv` and `auto/findings.csv` at the work-dir top, `auto/attestation.json`, and
   `reports/run-last.*` (written by `ci --sarif`) are gone. Use `results/INDEX.md`,
@@ -222,6 +230,12 @@
   removes `results/report/`.
 
 ### Fixed
+- **Fuzz-pass deadlines now cover persistent execution and RedQueen setup**: a
+  persistent harness could continue fixed-length waits after its pass budget,
+  while descendants that inherited captured pipes could keep cleanup blocked
+  after the parent was killed. Persistent waits now inherit the effective pass
+  timeout, RedQueen setup stops at the pass deadline, and timeout/error cleanup
+  terminates the complete harness process group.
 - **Protocol-session replay/minimize honor the recorded oracle** (`bhf replay`/`bhf minimize`,
   #58): under a multi-oracle profile (`[[oracle]]` is a list) a session recorded for oracle
   `O1` could be "reproduced" — or minimized — via a *different* oracle `O2` firing, falsely
@@ -1190,7 +1204,7 @@ Reach release: the targets `--force` was supposed to rescue and did not.
   - `@response-file` compile-database arguments are expanded, preserving the
     `-I`/`-D` context they carried instead of dropping it.
 
-- **Honest fuzz outcomes.** An `--engine afl++` run that executed zero inputs is
+- **Fuzz outcomes.** An `--engine afl++` run that executed zero inputs is
   recorded as built, not fuzzed. A native target that was entered and executed
   but produced zero coverage edges is flagged as having fuzzed blind. A legacy
   C++ target whose older-dialect build ties the default's error count now adopts
@@ -1217,7 +1231,7 @@ Reach release: the targets `--force` was supposed to rescue and did not.
   with obsolete runtime imports are overlaid without inheriting those imports,
   and generic-local result types are qualified through the generated instance.
 
-- **Honest target execution and fallback evidence.** Successful campaigns now
+- **Target execution and fallback evidence.** Successful campaigns now
   prove entry into the selected project endpoint rather than counting driver
   execution alone. Generation fallback chains, repairs, terminal stages, cache
   provenance, and stable structured failure categories survive into per-target
@@ -1530,7 +1544,7 @@ Reach release: the targets `--force` was supposed to rescue and did not.
   cover DES/3DES/RC4/ECB/Blowfish/MD4 across C/Go/Rust/Python/Java (new Rust
   detector). All cross-checked against the competitor and verified 0 false
   positives on the 14-repo comparison corpus.
-- **Static C/C++ now best-in-class outright.** Added the two bug classes cppcheck
+- **Static C/C++ matched the measured defect-class set.** Added the two bug classes cppcheck
   caught and bhf missed, as precise per-function intraprocedural scanners:
   `BHF-549` dangling-lifetime return (returning the address/reference of a local;
   CWE-562) and `BHF-550` resource leak (an allocation/handle never freed, closed,
@@ -1538,7 +1552,7 @@ Reach release: the targets `--force` was supposed to rescue and did not.
   `returnDanglingLifetime`/`memleak` — bhf fires on the same real defects with
   0 false positives on the corpus.
 
-- **Best-in-class comparison + static/SBOM/SLOC improvements** (see
+- **Measured tool comparison + static/SBOM/SLOC improvements** (see
   `docs/site/comparison-2026-07.md`). New static rules: `BHF-546` Python
   `try/except/pass` swallowed exception (CWE-703), `BHF-547` unbounded
   `scanf`/`getwd` reads (CWE-120/676), `BHF-548` cleartext `ws://` transport
@@ -1548,8 +1562,8 @@ Reach release: the targets `--force` was supposed to rescue and did not.
   lockfiles) for pinned/transitive components so CVE correlation works; adds an
   SPDX-2.3 JSON emitter (`--format spdx-json`) alongside CycloneDX/VEX.
 - **`bhf sloc <PATH>...`** — a standalone, rayon-parallel SLOC counter (no SAST
-  scan) that counts one or more roots in a single invocation; best-in-class on both
-  accuracy and speed.
+  scan) that counts one or more roots in a single invocation; fastest and closest
+  to cloc on the pinned comparison repositories.
 - **`auto --force` (alias `--force-fuzz`)** — force-fuzz mode: attempt every
   discovered C/C++/Ada function even when a parameter can't be driven or a
   type/symbol is undefined. Bypasses the pre-build skip gates, synthesizes

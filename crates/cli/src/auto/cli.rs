@@ -37,7 +37,8 @@ RECOMMENDED SWEEP:
     --debug
 
   --work-dir   where everything lands; keep it OUTSIDE the scanned tree
-  --jobs       targets built+fuzzed at once; peak RAM is ~jobs x --rss-limit-mb
+  --jobs       targets built+fuzzed at once; child RAM is ~jobs x --rss-limit-mb
+               leave additional room for BHF, compiler processes, and the OS
   --per-target-time  fuzz seconds per target (libFuzzer -max_total_time parity)
   --campaign-time    hard cap for the whole sweep, in seconds
   --max-targets      stop once N targets actually FUZZED (failures don't count)
@@ -61,6 +62,20 @@ fn parse_positive_mib(value: &str) -> std::result::Result<usize, String> {
         .filter(|parsed| *parsed > 0)
         .ok_or_else(|| format!("expected a positive MiB value, got {value:?}"))
 }
+
+pub(crate) const FIRST_RUN_HELP: &str = "\
+Discover targets, generate harnesses, build, fuzz, and write reports.
+
+FIRST RUN:
+  bhf auto /path/to/source --work-dir /path/to/bhf_work \\
+    --jobs 1 --max-targets 1 --per-target-time 10
+
+Keep the work directory outside the source tree. Install the compiler or
+interpreter for the languages you select. For Windows C/C++, use an x64
+Developer PowerShell with LLVM, VS Build Tools/Windows SDK, and make installed.
+Read results/INDEX.md for findings
+and auto/summary.txt for targets that built, fuzzed, or were skipped.
+Add --resume to the same command to continue a stopped run.";
 
 #[derive(Debug, clap::Args)]
 #[command(after_help = RECOMMENDED_SWEEP, after_long_help = RECOMMENDED_SWEEP)]
@@ -101,7 +116,7 @@ pub struct AutoArgs {
     #[arg(long = "config", value_name = "PATH")]
     pub config: Option<PathBuf>,
 
-    /// #91: operator override for the governing Ada project (`.gpr`). By default
+    /// Override the governing Ada project (`.gpr`). By default
     /// `auto` selects the project that OWNS each target's source (the non-aggregate
     /// component whose active Source_Dirs contain it); pass this to force a specific
     /// project when a multi-project layout is ambiguous. The same project is used
@@ -187,7 +202,7 @@ pub struct AutoArgs {
     )]
     pub min_target_time: Option<u64>,
 
-    /// #94: cap on the number of targets that reach the FUZZ phase (successful
+    /// Cap on the number of targets that reach the FUZZ phase (successful
     /// builds), NOT on candidates inspected. The sweep attempts ranked candidates
     /// in order and stops once N of them fuzz; unsupported params and build
     /// failures never consume the cap, so lower-ranked viable endpoints are
@@ -197,7 +212,7 @@ pub struct AutoArgs {
     #[arg(long = "max-targets", value_name = "N")]
     pub max_targets: Option<usize>,
 
-    /// #94: hard ceiling on the number of ranked candidates INSPECTED (built/
+    /// Hard ceiling on the number of ranked candidates INSPECTED (built/
     /// attempted), independent of how many fuzz. Bounds a huge legacy tree where
     /// most candidates are nonviable so `--max-targets` backfill can't grind the
     /// whole tree. Unset (default) = inspect as many as needed to reach the
@@ -233,8 +248,8 @@ pub struct AutoArgs {
     /// host's parallelism (capped, minimum 1); pass `--jobs 1` for the historical
     /// serial sweep. Up to N targets' build+fuzz run in parallel via a bounded
     /// worker pool. MEMORY: each concurrent fuzz uses up to `--rss-limit-mb` of
-    /// RAM, so effective peak memory is roughly `jobs x rss-limit-mb` — size it to
-    /// the host (a too-high value OOM-kills, e.g. inside a cgroup MemoryMax slice),
+    /// RAM. Budget `jobs x rss-limit-mb` for children plus BHF, compiler, and OS
+    /// overhead (a too-high value OOM-kills, e.g. inside a cgroup MemoryMax slice),
     /// which is why the default is half the cores rather than all of them.
     /// Results are aggregated deterministically regardless of completion order.
     /// Ada targets build serially regardless: they share the staged source tree.
@@ -419,8 +434,9 @@ pub struct AutoArgs {
     /// before `--list-targets`, so the ranked list reflects the filter too.
     /// Common spellings are accepted (`c++`/`cxx`/`cc`→cpp, `rs`→rust,
     /// `py`→python, `pl`→perl, `golang`→go); matching is case-insensitive.
-    /// Unset (default) = fuzz every language bhf can build in the tree. The
-    /// SBOM/SCA pass is unaffected — it always scans the whole tree across all
+    /// Unset (default) = consider all sixteen supported languages. Unsupported
+    /// targets, missing dependencies, and denied project builds are reported as
+    /// incomplete work, not successful fuzzing. The SBOM/SCA pass is unaffected — it always scans the whole tree across all
     /// ecosystems regardless of this fuzzing-lane filter.
     #[arg(
         long = "languages",
@@ -458,13 +474,17 @@ pub struct AutoArgs {
     pub install_deps: bool,
 
     /// Consent gate for running the project's own (untrusted) build/codegen to
-    /// materialize generated dependencies before harnessing — the umbrella for
+    /// materialize generated dependencies before harnessing, including Java
+    /// Maven/Gradle, Rust Cargo, and C# MSBuild project builds. Also covers
     /// `--probe-build` (CMake/Make configure+codegen) plus an Ada build probe
     /// (`alr build` / `gprbuild`) that generates Alire config + codegen outputs.
-    /// Implies `--probe-build`. EXECUTES untrusted scripts; runs under bhf's
-    /// sandbox (bwrap/firejail) when one is available, degrading to a direct run
-    /// otherwise. Off by default — without it, bhf stubs generated deps and
-    /// records them in the manifest instead of running anything.
+    /// Implies `--probe-build`. EXECUTES untrusted scripts; probe builds use
+    /// bhf's sandbox when available. Language project builds run as the calling
+    /// user and need deployment isolation. Maven/Gradle/Cargo/NuGet dependency
+    /// resolution uses staged local caches; script egress requires OS isolation.
+    /// Off by default. Denied project builds are reported as unsupported.
+    /// Direct compilers, interpreters, and the selected target still execute
+    /// during an auto run; this flag is not a general no-execution mode.
     #[arg(long = "run-untrusted")]
     pub run_untrusted: bool,
 
@@ -1610,6 +1630,7 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         total_time: args.total_time.map(std::time::Duration::from_secs),
         per_target_finding_count: args.per_target_finding_count,
         no_stubs: args.no_stubs,
+        run_untrusted: args.run_untrusted,
         passes,
         source_root: Some(path.clone()),
         project: args.project.clone(),
@@ -3767,20 +3788,37 @@ impl AutoSummary {
         // count into the headline total shown on the CLI.
         findings += crate::auto::report::disk_only_finding_ids(work).len();
 
-        let per_language = [(Lang::Ada, "Ada"), (Lang::C, "C"), (Lang::Cpp, "C++")]
-            .into_iter()
-            .filter_map(|(lang, name)| {
-                let targets = results.iter().filter(|r| r.candidate.lang == lang).count();
-                if targets == 0 {
-                    return None;
-                }
-                let built = results
-                    .iter()
-                    .filter(|r| r.candidate.lang == lang && is_built(&r.outcome))
-                    .count();
-                Some((name, targets, built))
-            })
-            .collect();
+        let per_language = [
+            (Lang::Ada, "Ada"),
+            (Lang::C, "C"),
+            (Lang::Cpp, "C++"),
+            (Lang::Rust, "Rust"),
+            (Lang::Java, "Java"),
+            (Lang::Python, "Python"),
+            (Lang::Perl, "Perl"),
+            (Lang::Go, "Go"),
+            (Lang::Cobol, "COBOL"),
+            (Lang::Fortran, "Fortran"),
+            (Lang::CSharp, "C#"),
+            (Lang::Js, "JavaScript"),
+            (Lang::Ts, "TypeScript"),
+            (Lang::Ruby, "Ruby"),
+            (Lang::Lua, "Lua"),
+            (Lang::Php, "PHP"),
+        ]
+        .into_iter()
+        .filter_map(|(lang, name)| {
+            let targets = results.iter().filter(|r| r.candidate.lang == lang).count();
+            if targets == 0 {
+                return None;
+            }
+            let built = results
+                .iter()
+                .filter(|r| r.candidate.lang == lang && is_built(&r.outcome))
+                .count();
+            Some((name, targets, built))
+        })
+        .collect();
 
         Self {
             source: source.to_path_buf(),
@@ -6123,6 +6161,55 @@ mod tests {
         // #405: measured fuzz wall is summed across passes/targets (only the
         // one built+fuzzed target's single 0.5s pass here).
         assert_eq!(summary.total_elapsed_secs, 0.5);
+    }
+
+    #[test]
+    fn summary_includes_every_supported_language_when_builds_are_denied() {
+        use crate::auto::attempt::{AttemptResult, Outcome};
+        use crate::auto::candidate::{Candidate, LangSelector};
+        use clap::ValueEnum;
+
+        let results: Vec<_> = LangSelector::value_variants()
+            .iter()
+            .map(|selector| AttemptResult {
+                candidate: Candidate {
+                    harness_id: format!("H-{selector:?}"),
+                    lang: selector.to_lang(),
+                    source_path: PathBuf::from(format!("/s/{selector:?}")),
+                    line: 1,
+                    name: "fixture".to_owned(),
+                    score: 0,
+                    is_static: false,
+                    foreign_guard: None,
+                    input_reachability: None,
+                    dialect: None,
+                },
+                outcome: Outcome::UnsupportedParams {
+                    reason: "project build requires --run-untrusted".to_owned(),
+                },
+                harness_dir: PathBuf::from("/h"),
+            })
+            .collect();
+        let summary = AutoSummary::collect(
+            Path::new("/s"),
+            Path::new("/w"),
+            actionability::RunMode::Reporting,
+            std::time::Duration::from_secs(1),
+            &results,
+            0,
+            0,
+            false,
+        );
+        assert_eq!(
+            summary.per_language.len(),
+            LangSelector::value_variants().len()
+        );
+        assert_eq!(summary.skipped, results.len());
+        assert_eq!(summary.built_and_fuzzed, 0);
+        assert!(summary
+            .per_language
+            .iter()
+            .all(|(_, targets, built)| *targets == 1 && *built == 0));
     }
 
     #[test]

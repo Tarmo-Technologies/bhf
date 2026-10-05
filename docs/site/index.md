@@ -33,7 +33,7 @@ source-generated harnesses and a permissively licensed core.
   coverage vs the crash-only fuzzers: the behavioral bugs (path traversal,
   insecure temp, sensitive-env) they run right past, plus first/second-run timing.
 - [Static CWE Coverage Matrix](./static-cwe-coverage/) — what the static analyzer
-  detects per language and CWE, the fuzz-confirmation differentiator, and the
+  detects per language and CWE, its fuzz-confirmation evidence, and the
   web-only CWEs it deliberately declines (with rationale).
 - [SAST Comparison](./sast-comparison/) — bhf's static scanner measured on 50
   GitHub projects against the leading open-source SAST tool for each language
@@ -44,7 +44,7 @@ source-generated harnesses and a permissively licensed core.
 - [Taint-Confirmed Sink Oracles](./sink-oracles/) — how bhf confirms that a
   fuzz input *provably controls* a dangerous sink (command exec, path traversal,
   SSRF, library load, SQL, destructive fs) with byte-origin taint, the full sink
-  matrix with CWEs, and the honest boundary of what it deliberately declines.
+  matrix with CWEs, and the documented boundary of what it deliberately declines.
 - [Architecture](./architecture/) — pipeline overview and the crates that
   make it up.
 - [C and C++ Fuzzing](./c-cpp/) — C/C++ prerequisites, manual commands,

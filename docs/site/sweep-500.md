@@ -181,7 +181,7 @@ cannot be included outside their owning translation unit (53), and instance
 methods whose receiver cannot be constructed (31 in C#). Those are the levers
 worth building next, in that order.
 
-## Honest limits
+## Limits
 
 - A target whose parameters are types the project does not define — an external
   SDK's opaque handle — is skipped, not guessed at. bhf names the type; it
@@ -196,8 +196,8 @@ worth building next, in that order.
   sweep reached **13 fewer** targets than not passing it (214 → 201) for **one**
   extra fuzz finding, because a forced attempt costs ~36% more and the campaign
   budget ran out before the viable targets were reached. It is now a second pass
-  that runs after the normal one and only ever adds reach — but the honest
-  summary of the lever is that it converts unbuildable targets into static
+  that runs after the normal one and only ever adds reach. The measured
+  summary is that it converts unbuildable targets into static
   analysis, not into fuzzing.
 - Interpreted lanes execute the target's module to load it. That is the same
   exposure as fuzzing it, and it is bounded, but it is not free.

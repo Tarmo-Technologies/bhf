@@ -1,6 +1,42 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# BHF v0.2.34 release notes
+# BHF v0.3.0
+
+Released 2026-10-05.
+
+- Default CLI/daemon exclude LLM connectivity, with explicit opt-in builds.
+- Native and container installers share language names, aliases, and dependency
+  selection. `all` selects sixteen languages; an empty language selection or
+  combining `all` with named languages is rejected before installation.
+- Windows C/C++ default runs locate Clang's ASan DLL automatically. The driver
+  reports unhandled exceptions while allowing exceptions handled by ASan or the
+  target to continue. Earlier sanitizer-disabled smoke checks missed this issue.
+- When every attempted fuzz pass fails, `auto` preserves the runtime error in
+  `auto/run.json`. A run with no successful target or finding exits nonzero.
+- Persistent-harness waits and RedQueen setup now honor the fuzz-pass budget.
+  Timeout cleanup terminates the harness process group so a descendant cannot
+  retain an output pipe and stall the campaign after its deadline.
+- README and CLI help show a one-target first run, compiler prerequisites, and
+  the findings and blocked-target reports. Offline installation verifies the
+  complete archive before extraction and requires an external operator policy.
+- Automatic runs retain a maximum 64 MiB corpus per target and stop starting
+  targets at the default 4 GiB work-directory ceiling. `bhf clean <work-dir> --compact`
+  preserves findings and replay evidence. `--resume` reuses completed targets
+  when source, build context, and harness options remain compatible.
+- The default container includes all sixteen supported languages without LLM
+  integration. `--languages` explicitly narrows a run; `--flavor core` or
+  `--flavor ada` selects a smaller image. Validation sweeps require explicit startup.
+- Read-only, non-root, disconnected acceptance covers the selected profile.
+  Java's agent is prebuilt; project builds require consent and staged caches.
+- Binary/source/image identity, compiler-backed Cargo inventory, whole-image
+  scanning, corresponding sources, and an authenticated offline handoff now have
+  a common release path. Failed or stale acceptance evidence blocks packaging.
+- The 100-project release campaign measured all 100 projects after exact reruns
+  of the two timeout cases against the corrected candidate.
+- See [deployment support boundaries](docs/site/docker.md) for the exact limits
+  of Windows collectors, private Rust, RTOS emulation, and physical hardware.
+
+## Previous release: v0.2.34
 
 Released 2026-10-01.
 

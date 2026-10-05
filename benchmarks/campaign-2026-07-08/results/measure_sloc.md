@@ -1,10 +1,12 @@
-All measurements are real and complete. Here are my findings.
-
 ---
 
 ## SLOC Counting: bhf vs cloc / scc / tokei — Real Measured Results
 
-I ran all four tools over the 14-repo corpus. Numbers below are **primary-language code lines**. For the four C/C++ repos I summed `C + C++ + C/C++ Header` for cloc/scc/tokei (bhf folds headers into `c`/`cpp`, so I summed bhf `c+cpp` to compare fairly). `bhf Δ%` is bhf vs cloc (cloc is the accuracy anchor since it's the most conservative, comment-aware counter).
+All four tools ran over the 14-repository corpus. Numbers below are
+**primary-language code lines**. For the four C/C++ repositories, the comparison
+sums `C + C++ + C/C++ Header` for cloc, scc, and tokei. bhf folds headers into
+`c` or `cpp`, so its `c+cpp` values are summed on the same basis. `bhf Δ%` is
+relative to cloc, the conservative comment-aware reference used here.
 
 | repo | primary | cloc | scc | tokei | **bhf** | bhf Δ vs cloc |
 |---|---|---:|---:|---:|---:|---:|
@@ -23,7 +25,7 @@ I ran all four tools over the 14-repo corpus. Numbers below are **primary-langua
 | perl_mojo | Perl | 10608 | 25647* | 25665* | **10446** | −1.5% |
 | js_express | JavaScript | 15687 | 15878 | 15878 | **15756** | +0.4% |
 
-\* scc and tokei **misclassify** Mojolicious `.pod`/`.t`/embedded template files as "Raku," ballooning the Perl count to ~25.6k (plus a separate 31.9k "Raku" row in scc). cloc and bhf both report ~10.5k honest Perl. This is a real correctness win for bhf on Perl.
+\* scc and tokei **misclassify** Mojolicious `.pod`/`.t`/embedded template files as "Raku," increasing the Perl count to ~25.6k (plus a separate 31.9k "Raku" row in scc). cloc and bhf both report ~10.5k Perl.
 
 ### Speed (total wall over the whole corpus)
 
@@ -34,17 +36,23 @@ I ran all four tools over the 14-repo corpus. Numbers below are **primary-langua
 | cloc | 4.43 s | 118 MB | single whole-corpus run |
 | **bhf** | **16.5 s** | — | 14 separate `static-scan` invocations |
 
-Speed ranking: **tokei ≈ scc (both ~0.1 s) ≫ cloc (4.4 s) ≫ bhf (16.5 s)**. Caveat that keeps this honest: tokei/scc/cloc each ran once over the whole tree, while bhf ran 14 times (once per repo) because `--sloc` is a per-scan side output — and each bhf run is a full SAST parse+scan, not a dedicated line counter. Even normalized, bhf's per-repo counting is bundled inside heavier tree-sitter parsing, so it is **not** competitive on raw counting speed and never will be against purpose-built counters.
+Speed ranking: **tokei ≈ scc (both ~0.1 s) ≫ cloc (4.4 s) ≫ bhf (16.5 s)**. tokei, scc, and cloc each ran once over the whole tree, while bhf ran 14 times (once per repository) because `--sloc` is a per-scan side output. Each bhf run also performs a full SAST parse and scan. The measurements therefore compare the recorded invocation modes rather than isolated counting kernels.
 
 ### Accuracy verdict
 
-bhf is **highly accurate**: it agrees with cloc within ~5% on **all 14 repos** (worst case go_gin +5.5%, and there bhf sits *between* scc 18475 and tokei 17868 — cloc's 17317 is the low outlier, so bhf is arguably more correct than cloc there). On 8 of 14 repos bhf matches cloc within 0.0–0.5%. Where scc/tokei diverge upward (py_click +19%, py_requests +26%, ripgrep +7%), it's because they count Python docstrings and Rust `//!` doc comments as code; bhf's language-aware comment stripping tracks cloc's conservative counts. So on **fidelity to true code lines, bhf is essentially tied with cloc and cleaner than scc/tokei** (which over-count comments and misclassify Perl).
+bhf agrees with cloc within about 5% on all 14 repositories. On 8 of 14 it
+matches cloc within 0.0–0.5%. Where scc and tokei diverge upward (py_click +19%,
+py_requests +26%, ripgrep +7%), they count Python docstrings and Rust `//!` doc
+comments as code. bhf's language-aware comment stripping tracks cloc's
+conservative counts on these repositories.
 
-### Overall verdict: is bhf #1 on this feature?
+### Overall result
 
-**No — not on the headline "SLOC counter" metric.** For pure speed, **tokei and scc win decisively (~150× faster)**. bhf is #1 only on two narrow accuracy sub-points: (1) Perl classification correctness (scc/tokei are flat wrong, ~2.5× over-count), and (2) not counting docstrings/doc-comments as code (matches cloc, beats scc/tokei on Python/Rust fidelity).
+For the recorded invocation modes, tokei and scc were about 150 times faster.
+bhf aligned more closely with cloc on Perl classification and on excluding
+docstrings and documentation comments from code counts.
 
-bhf's **real differentiators** are contextual, not competitive-on-speed:
+The contextual differences were:
 - **Language-aware comment counting** matching cloc-grade accuracy across 8 languages.
 - **Dependency/build-tree pruning** — the same pruning as the security scan excludes `.venv`/`node_modules`/vendored code, which the others don't do by default.
 - **Integrated in the security tool** — you get the SLOC breakdown "for free" as a side-effect of the SAST scan you were already running (findings-per-KLOC density, etc.), no second tool.
@@ -54,6 +62,9 @@ bhf's **real differentiators** are contextual, not competitive-on-speed:
 1. **Speed / invocation model.** Offer a standalone `bhf sloc <path>` (or `--sloc-only`) that skips the SAST parse and does a fast line-count pass, and support multi-root/whole-corpus counting in one invocation. Today you pay full scan cost (16.5 s) for numbers tokei produces in 0.09 s. This is the single biggest gap.
 2. **Header attribution transparency.** bhf folds all `.h` into `c` even in a C++ repo (cpp_json shows `c: 44`, everything else `cpp`), which is defensible but makes apples-to-apples comparison require manual summing. Emitting an optional cloc-style `c_header`/`cpp_header` split (or documenting the fold) would remove the footgun.
 
-If bhf shipped a dedicated fast SLOC path, its accuracy (already cloc-grade, and *better* than scc/tokei on Perl and comment handling) would make it a legitimate best-in-class counter. Today it's accurate-but-slow, so **tokei wins the feature outright on speed by ~150×**, with bhf winning only the correctness sub-battle.
+A dedicated fast SLOC path would retain the measured accuracy while addressing
+the throughput gap. At the time of this measurement, tokei was about 150 times
+faster, while bhf handled Perl and comments more accurately on the pinned
+corpus.
 
 Relevant files: `/tmp/bhf/*_sloc.json` (bhf outputs), `/tmp/{cloc,scc,tokei}_time.txt` (timing captures).

@@ -92,7 +92,7 @@ bhf automates the entire SharpFuzz workflow end to end:
 
 It is the first tool to fuzz C# from source with **zero harness** and **zero AFL
 setup**, reusing SharpFuzz's proven IL instrumentation as the coverage source (the
-honest analog of how the Fortran lane reuses gfortran + ASan).
+analog of how the Fortran lane reuses gfortran + ASan).
 
 ## Validation (campaign)
 
@@ -101,8 +101,8 @@ roslyn, EF Core, Newtonsoft.Json, MessagePack-CSharp, YamlDotNet, ImageSharp,
 protobuf-net, SharpZipLib, ML.NET, and more:
 
 - **69,608 C# files scanned, 3,113 fuzzable methods discovered, 0 bhf panics** —
-  discovery is robust across enormous, idiomatic C# (roslyn alone: 17,094 files →
-  973 targets). 24 of 25 repos completed cleanly; only dotnet/runtime (32,403
+  roslyn alone contributed 17,094 files →
+  973 targets. 24 of 25 repos completed cleanly; only dotnet/runtime (32,403
   files, the single largest .NET repo) needs a longer discovery budget.
 - **End-to-end on YamlDotNet**: 14 of 21 methods were built, IL-instrumented, and
   fuzzed at **~15,000 executions/second** on one warm CLR with **2,304 edges** of
@@ -120,7 +120,7 @@ protobuf-net, SharpZipLib, ML.NET, and more:
   harness assembly, never into bhf. The .NET runtime is MIT. No GPL is
   involved; the lane keeps bhf's permissive-core policy intact.
 
-## Limits (honest)
+## Limits
 
 - The fuzzable surface is a single `byte[]`/`string`/`Stream` input parameter (plus
   an optional `int` length). Methods that need a constructed options/context object,

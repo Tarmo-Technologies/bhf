@@ -404,6 +404,7 @@ copy_tree "$REPO_ROOT/lua_runtime" "$TOOL_DIR/lua_runtime"
 copy_tree "$REPO_ROOT/php_runtime" "$TOOL_DIR/php_runtime"
 
 run cp "$SCRIPT_DIR/install-dist.sh" "$STAGE_ROOT/install.sh"
+run cp "$SCRIPT_DIR/language-selection.sh" "$STAGE_ROOT/language-selection.sh"
 run chmod +x "$STAGE_ROOT/install.sh"
 run cp "$REPO_ROOT/INSTALL.md" "$STAGE_ROOT/INSTALL.md"
 run cp "$REPO_ROOT/LICENSE" "$STAGE_ROOT/LICENSE"
@@ -487,7 +488,7 @@ Installer options:
 --bin-dir DIR           Directory for bhf symlinks (default: /usr/local/bin)
 --non-interactive       Do not prompt; use selected or default profiles
 --languages LIST        Comma list: c,cpp,rust,java,python,perl,go,ada,cobol,
-                        fortran,csharp,javascript,typescript,ruby,lua,php,all,none
+                        fortran,csharp,javascript,typescript,ruby,lua,php,all
 --targets LIST          Comma list: native,windows,aarch64,all,none
 --fuzzers LIST          Comma list: builtin,afl,all,none
 --extras LIST           Comma list: build-recovery,sandbox,archives,all,none
@@ -529,9 +530,10 @@ Full install example:
   --install-seeds
 ```
 
-`--languages all` means all sixteen fuzzing lanes. With no language option, the
-installer keeps the original eight core lanes selected and offers COBOL,
-Fortran, C#, JavaScript, TypeScript, Ruby, Lua, and PHP as opt-ins. The C# lane
+`--languages all` means all sixteen supported languages and is the default.
+Use `--languages c,cpp` (or another explicit subset) to reduce installed tooling.
+Language selections must be nonempty; `none` and mixing `all` with named languages are rejected.
+The C# lane
 requires a separately staged .NET 8 SDK and `SharpFuzz.CommandLine`; TypeScript
 requires `esbuild` on `PATH` or already installed in the target project.
 

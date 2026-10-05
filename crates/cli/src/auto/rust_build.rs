@@ -104,11 +104,34 @@ fn parse_host_triple(version_verbose: &str) -> Option<String> {
 /// (skip the lane) when cargo is absent or no nightly is installed.
 fn probe_toolchain() -> Option<RustToolchain> {
     let cargo = which::which("cargo").ok()?;
-    // Prefer the plain `+nightly` channel; rustup resolves it. Confirm a nightly
+    // A container can supply a dated, preinstalled channel to avoid resolving a
+    // rolling nightly while disconnected. Confirm a nightly
     // rustc actually exists by asking for its verbose version through cargo's
     // proxy — `-vV` also gives us the `host:` triple we need for `--target`.
+    let channel = std::env::var("BHF_RUST_NIGHTLY").unwrap_or_else(|_| "nightly".to_owned());
+    if !channel.starts_with("nightly")
+        || !channel
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return None;
+    }
+    // `cargo +channel` asks rustup to install a missing toolchain. Inspect the
+    // local registry first so probing never initiates a download.
+    let installed = Command::new("rustup")
+        .args(["toolchain", "list"])
+        .output()
+        .ok()?;
+    if !installed.status.success()
+        || !String::from_utf8_lossy(&installed.stdout)
+            .lines()
+            .any(|line| line.starts_with(&format!("{channel}-")) || line == channel)
+    {
+        return None;
+    }
+    let channel_arg = format!("+{channel}");
     let mut nightly_probe = Command::new(&cargo);
-    nightly_probe.arg("+nightly").arg("-vV");
+    nightly_probe.arg(&channel_arg).arg("-vV");
     // Bounded: rustup can go out to the network resolving a missing toolchain.
     let probe = crate::command_output::output_with_timeout(
         &mut nightly_probe,
@@ -120,7 +143,7 @@ fn probe_toolchain() -> Option<RustToolchain> {
         let host_triple = parse_host_triple(&stdout)?;
         return Some(RustToolchain {
             cargo,
-            channel_arg: "+nightly".to_owned(),
+            channel_arg,
             host_triple,
         });
     }
@@ -3393,6 +3416,7 @@ pub fn build_rust_harness(
         Command::new(&toolchain.cargo)
             .arg(&toolchain.channel_arg)
             .arg("build")
+            .arg("--offline")
             .arg("--manifest-path")
             .arg(crate_dir.join("Cargo.toml"))
             .arg("--target-dir")
@@ -3786,6 +3810,7 @@ fn build_in_crate(
         Command::new(&toolchain.cargo)
             .arg(&toolchain.channel_arg)
             .arg("build")
+            .arg("--offline")
             .arg("--manifest-path")
             .arg(&manifest_path)
             .arg("--target-dir")

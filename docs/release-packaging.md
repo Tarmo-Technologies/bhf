@@ -26,7 +26,7 @@ users should choose one delivery style rather than install every file:
 
 | Consumer scenario | Assets to use |
 |---|---|
-| Complete Linux install | `bhf-dist-<version>-x86_64-unknown-linux-gnu.tar.gz` and its checksum; extract and run `./install.sh` |
+| Complete Linux install | Full bundle, checksum, and detached signature; verify with an independently trusted verifier/key, then run `./install.sh --trust-policy /trusted/operator-policy.json` |
 | Windows CLI | `bhf-installer.ps1`, or the Windows CLI ZIP and its checksum—not both |
 | Basic Linux CLI | `bhf-installer.sh`, or the Linux CLI archive and its checksum—not both |
 | Full Linux `bhf auto` | The CLI, runtrace shim, and compiler-interception shim; choose the three installers or the three archives/checksums |
@@ -57,7 +57,8 @@ Linux-only. The generated workflow publishes the CLI and daemon for
 `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-msvc`, while publishing the
 two preload libraries only for Linux. The Linux target is built in a pinned
 manylinux2014 / CentOS 7 container and checked for a maximum glibc 2.17 ABI,
-covering Ubuntu 22.04/24.04/26.04 LTS and RHEL 7 through RHEL 10. The same gate
+covering Ubuntu 22.04/24.04/26.04 LTS and RHEL 7 through RHEL 10. Installer metadata
+explicitly uses that glibc 2.17 floor. The same gate
 verifies the runtrace shim's required interposition exports. For manual
 component installs, copy `libbhf_runtrace_shim.so` and
 `libbhf_cc_intercept.so` into the extracted `bhf-*` CLI directory, or
@@ -137,8 +138,8 @@ checklist or non-interactively:
 The runtime trees cover C/C++, Ada, Rust, Java, Python, Perl, C#,
 JavaScript/TypeScript, Ruby, Lua, and PHP. COBOL, Fortran, and Go use their
 system toolchains plus the shared C runtime. `--languages all` selects installer
-dependencies for all sixteen lanes; the default checklist keeps the original
-eight core lanes selected and offers the newer lanes as opt-ins.
+dependencies for all sixteen lanes and is the default for both interactive
+and non-interactive installation. Use an explicit subset to reduce tooling.
 
 ```sh
 ./install.sh --non-interactive --trust-policy /trusted/operator-policy.json \
