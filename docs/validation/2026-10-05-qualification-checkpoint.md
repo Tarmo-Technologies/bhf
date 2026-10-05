@@ -18,7 +18,8 @@ completed 64 executions with 11 coverage edges on Server 2019 and detected the
 owned fixture's intentional out-of-bounds write. This is a diagnostic build,
 not final packaged release acceptance. The shared Windows CI smoke now uses
 the README command with default sanitizers and requires executions, coverage,
-and the documented output files. Fresh packaged acceptance remains pending.
+and the documented output files. Fresh packaged acceptance subsequently passed
+on the retained Server 2019 and Windows 11 guests, as recorded below.
 The exception-filter fix also covers the embedded C/C++ driver templates.
 When every attempted fuzz pass fails, `auto` now records the last runtime
 error instead of a build-only success. A run with no other successful target
