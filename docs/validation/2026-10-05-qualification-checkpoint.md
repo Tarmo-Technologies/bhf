@@ -25,13 +25,13 @@ No external projects or credentials are mounted into these functional checks.
 | Area | Action and evidence status |
 |---|---|
 | Language selection | Shared resolver implemented. The exact `12d6066` default, sixteen singleton, and three mixed images passed construction, selection receipt, exclusion, and lifecycle checks. |
-| Native installation | Shared resolver, pre-side-effect rejection, dry-run dependency closure, and authenticated install/tamper/upgrade/rollback tests passed 30/30. A fresh exact-head Linux bundle also passed signed archive verification, installation, and its C target-entry smoke. The disposable OS matrix remains a release gate. |
+| Native installation | Shared resolver, pre-side-effect rejection, dry-run dependency closure, and authenticated install/tamper/upgrade/rollback tests passed 30/30. Fresh bundles passed signed archive verification, installation, and a C target-entry smoke. Exact CI binaries then passed authenticated installation on the seven supported Linux releases. Hosted Windows archive extraction and execution passed; tag-built component installers remain a release-workflow gate. |
 | Default no AI | Selected CLI/daemon compiled graph excludes `llm_harness_gen`; all twenty images passed dummy-provider and command/MCP exposure controls. |
 | Functional controls | All sixteen BHF-owned clean controls entered non-stub targets through public `bhf auto`, executed inputs, produced measured feedback, and emitted valid JSON. Dependency-bearing Java controls also passed. |
 | Artifact sizes | Exact local configuration IDs and unpacked bytes recorded for twenty images. The exact-head default image's compressed Docker archive and complete review archive are also recorded. Compressed and largest-layer comparison remains incomplete across every subset. |
 | Inventory and signing | Independent verifier tests passed 8/8. Exact-head inventory, scan, acceptance record, BHF source, and all 108 requested Ubuntu source packages are in an unsigned review archive. The scan has zero policy blockers and 829 residual matches requiring review; no publisher key creation or release publication occurred. |
 | 100 upstream projects | No frozen verified 100-project manifest or scored trials produced. Unrun; no success rate claimed. |
-| Release support | Sixteen-language target-entry and an exact-head unsigned redistribution archive passed. The 100-project qualification, complete native/platform install matrix, redistribution review, protected human risk review, and publisher-authenticated handoff remain blockers. |
+| Release support | Sixteen-language target-entry, supported-Linux authenticated installation, hosted Windows archive execution, and an exact-head unsigned redistribution archive passed. The 100-project qualification, tag-built installer artifacts, redistribution review, protected human risk review, and publisher-authenticated handoff remain blockers. |
 | Optional limits | Physical boards, arbitrary RTOS fidelity, Windows ETW and broad private-resource Rust remain scoped capability limitations. |
 
 The 100-project qualification budget is up to 50 CPU-hours of requested target
@@ -122,6 +122,23 @@ The disposable private key was deleted after the receipts were captured. This
 single-host test does not replace installation on every supported OS or
 publisher signing.
 
+The EL7-baseline binaries retained by exact implementation-head CI run
+`37254610365` were also packaged from the clean `12d6066` source with a new
+disposable BHF-generated key. The complete 16,856,154-byte archive was verified
+into a private copy before extraction. Its SHA-256 is
+`bb0fe1f0525ef8f99c7158c491f34433eebe43924b4e5165593466a3643f4750`,
+and its 64-byte detached signature hashes to
+`d7870cdd48515b73c8db1c807015f163e3e8faee2e2b183b004d9b5980f0f84f`.
+The real bundle installer authenticated and installed the Python selection on
+the pinned CentOS 7 ABI image, AlmaLinux 8.10, 9.8, and 10.2, and Ubuntu 22.04,
+24.04, and 26.04. Every row loaded the CLI, daemon, and two shims without a
+missing library and reported `bhf 0.2.35`. Network, system-package installation,
+rustup, symlink creation, and the bundled C smoke were disabled for this matrix;
+it establishes archive authentication, installation, and binary compatibility.
+Separate exact-head jobs and the all-language container matrix cover toolchains
+and target entry. Hosted CI also extracted and exercised the native Windows
+archive on Server 2022 and 2025. The disposable matrix key was deleted.
+
 Whole-image inventory of the older all-language image
 `sha256:6f7c175dff3751da9c7195219f5810481dfacd0fb13ca1c254ed47fa70cc78d4`
 used checksum-verified Syft 1.46.0 and Grype 0.115.0 with a valid database built
@@ -167,9 +184,9 @@ vulnerability risk, or authenticate a publisher.
 Raw execution evidence is retained locally under
 `/tmp/bhf-qualification-20261005`; this is a workspace location, not a contractor
 download link. The 100-project sweep, actual native package installation on every
-supported OS, redistribution and residual-risk review, and
-publisher-authenticated handoff remain unrun or incomplete. Decision remains
-**NOT_READY**.
+supported Windows client, tag-built component installers, redistribution and
+residual-risk review, and publisher-authenticated handoff remain unrun or
+incomplete. Decision remains **NOT_READY**.
 
 The compact matrix identities, sizes, per-language owned-control measurements,
 and scan hashes are in the
