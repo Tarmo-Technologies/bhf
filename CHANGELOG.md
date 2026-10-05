@@ -230,6 +230,12 @@
   removes `results/report/`.
 
 ### Fixed
+- **Fuzz-pass deadlines now cover persistent execution and RedQueen setup**: a
+  persistent harness could continue fixed-length waits after its pass budget,
+  while descendants that inherited captured pipes could keep cleanup blocked
+  after the parent was killed. Persistent waits now inherit the effective pass
+  timeout, RedQueen setup stops at the pass deadline, and timeout/error cleanup
+  terminates the complete harness process group.
 - **Protocol-session replay/minimize honor the recorded oracle** (`bhf replay`/`bhf minimize`,
   #58): under a multi-oracle profile (`[[oracle]]` is a list) a session recorded for oracle
   `O1` could be "reproduced" — or minimized — via a *different* oracle `O2` firing, falsely

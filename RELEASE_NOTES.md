@@ -14,6 +14,9 @@ publisher signing determine release eligibility; this heading is not approval.
   target to continue. Earlier sanitizer-disabled smoke checks missed this issue.
 - When every attempted fuzz pass fails, `auto` preserves the runtime error in
   `auto/run.json`. A run with no successful target or finding exits nonzero.
+- Persistent-harness waits and RedQueen setup now honor the fuzz-pass budget.
+  Timeout cleanup terminates the harness process group so a descendant cannot
+  retain an output pipe and stall the campaign after its deadline.
 - README and CLI help show a one-target first run, compiler prerequisites, and
   the findings and blocked-target reports. Offline installation verifies the
   complete archive before extraction and requires an external operator policy.
@@ -29,6 +32,8 @@ publisher signing determine release eligibility; this heading is not approval.
 - Binary/source/image identity, compiler-backed Cargo inventory, whole-image
   scanning, corresponding sources, and an authenticated offline handoff now have
   a common release path. Failed or stale acceptance evidence blocks packaging.
+- The 100-project release campaign measured all 100 projects after exact reruns
+  of the two timeout cases against the corrected candidate.
 - See [deployment support boundaries](docs/site/docker.md) for the exact limits
   of Windows collectors, private Rust, RTOS emulation, and physical hardware.
 

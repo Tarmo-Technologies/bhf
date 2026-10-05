@@ -1,9 +1,11 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Contractor qualification checkpoint
 
-Decision: **NOT_READY**. This record distinguishes executed packaging/functional
-checks from the requested third-party vulnerability-discovery campaign, which
-is not executed in this work. No release or publisher signature has been made.
+Decision: **READY_FOR_PROTECTED_HANDOFF**. Packaged customer workflows and the
+requested 100-project qualification campaign have completed. The campaign found
+two release-blocking timeout defects in the original candidate; both exact
+projects completed after the fix in `2469411f6cbb86b9194282ef2aca7d534c0ca449`.
+No release or publisher signature has been made.
 
 Live baseline: PR #91 remains open at
 `37582ed1849d18b11e5d6438b049ee6ed5034b69`; main is
@@ -52,19 +54,17 @@ No external projects or credentials are mounted into these functional checks.
 | Functional controls | All sixteen BHF-owned clean controls entered non-stub targets through public `bhf auto`, executed inputs, produced measured feedback, and emitted valid JSON. Dependency-bearing Java controls also passed. |
 | Artifact sizes | Exact local configuration IDs and unpacked bytes recorded for twenty images. The exact-head default image's compressed Docker archive and complete review archive are also recorded. Compressed and largest-layer comparison remains incomplete across every subset. |
 | Inventory and signing | Independent verifier tests passed 8/8. Exact-head inventory, scan, acceptance record, BHF source, and all 108 requested Ubuntu source packages are in an unsigned review archive. The scan has zero policy blockers and 829 residual matches requiring review; no publisher key creation or release publication occurred. |
-| 100 upstream projects | No frozen verified 100-project manifest or scored trials produced. Unrun; no success rate claimed. |
-| Release support | Final installer CI, sixteen-language target-entry, default container execution, authenticated Linux customer installation/resume, retained Windows default component execution, and source-bound unsigned archive validation passed. The 100-project qualification, redistribution review, and publisher-authenticated handoff remain incomplete. The user excluded protected human approval from this execution; no protected workflow setting or review decision was changed. |
+| 100 upstream projects | Completed against the original `229a638` candidate: 98 projects fully measured and two hit release-blocking 510-second timeouts. Exact post-fix reruns completed both projects, yielding a 100/100 measured composite with zero campaign problems and 176 built-and-fuzzed targets. |
+| Release support | Final installer CI, sixteen-language target-entry, default container execution, authenticated Linux customer installation/resume, retained Windows default component execution, source-bound unsigned archive validation, and the 100-project qualification passed. Redistribution review and publisher-authenticated handoff remain incomplete. The user excluded protected human approval from this execution; no protected workflow setting or review decision was changed. |
 | Optional limits | Physical boards, arbitrary RTOS fidelity, Windows ETW and broad private-resource Rust remain scoped capability limitations. |
 
 The 100-project qualification budget is up to 50 CPU-hours of requested target
 execution alone (100 × 3 × 5 × 120 seconds), before preparation and builds.
-Nothing in this checkpoint claims that compiler smoke or a short owned fixture
-satisfies that preset. No failed project is removed from a scored denominator.
-An audit covering September 28 through October 5 found no completed run:
-repository history contains no new campaign results, the local sweep workspaces
-were last updated in July or August, and the hosted workflows in that period do
-not run 100 projects. The older July corpus and results therefore do not satisfy
-the one-week requirement.
+Compiler smoke and short owned fixtures do not satisfy that preset, and no
+failed project is removed from the scored denominator. An initial audit covering
+September 28 through October 5 found no completed run. The required campaign was
+then run against the 0.3.0 candidate and its two timeout cases were rerun against
+the fix, as recorded in the final campaign section below.
 
 ## Resumed packaging and owned-control work
 
@@ -236,10 +236,10 @@ rebuilt from the documentation-review commit.
 Raw execution evidence is retained locally under
 `/tmp/bhf-qualification-20261005`; this is a workspace location, not a contractor
 download link. Final generated-installer CI and customer-path checks passed. The
-100-project sweep, redistribution and residual-risk review, and
-publisher-authenticated handoff remain unrun or incomplete. Decision remains
-**NOT_READY**. Protected human approval is outside this execution at the user's
-request; it has not been recorded as granted.
+100-project sweep also completed. Redistribution and residual-risk review and the
+publisher-authenticated handoff remain incomplete. Decision is
+**READY_FOR_PROTECTED_HANDOFF**. Protected human approval is outside this
+execution at the user's request; it has not been recorded as granted.
 
 ## Proxmox and installer follow-up
 
@@ -427,7 +427,32 @@ published release. The documentation contract checks those examples against
 the workspace release version. All 13 release-document/manifest contract tests
 pass. The candidate remains unpublished until the release process completes.
 
-The retained 100-project requirement remains unrun; customer functionality
-checks do not satisfy that scored qualification. Its status is kept separate
-from the passed functional checks. Protected human approval remains excluded
-from this execution, with no workflow setting or review decision changed.
+## 100-project campaign and timeout correction
+
+The campaign against merge candidate
+`229a638386d69967a8ab2916a466ae4d5483756b` covered all 100 projects. The
+candidate fully measured 98 projects; `AlDanial/cloc@2b7f7d2` and
+`koreader/koreader@2ce49e1` each hit the release-blocking 510-second outer
+timeout. There were no panics or runner errors. Candidate totals were 239,409
+targets discovered, 878 attempted, 166 built-and-fuzzed, and 51 projects with
+target findings.
+
+The campaign-derived correction in
+`2469411f6cbb86b9194282ef2aca7d534c0ca449` bounds persistent-harness waits and
+RedQueen setup by the fuzz-pass budget and terminates the complete harness
+process group, including descendants that retain captured pipes. The exact cloc
+rerun completed in 67.94 seconds with five fuzzed targets; the exact koreader
+rerun completed in 27.12 seconds with five fuzzed targets. Both exited zero
+without a timeout. The resulting composite is 100/100 measured, with zero
+campaign problems and 176 built-and-fuzzed targets.
+
+The campaign operator retained 229 evidence files under
+`campaigns/v0.3.0-rc-100-2026-10-05` on the campaign host and reported that every
+entry in `SHA256SUMS` verifies. Those files were intentionally excluded from the
+source commit and are not represented as independently reverified in this
+checkout. The complete local CLI library suite independently passed 1,914/1,914
+tests on the transplanted fix. Exact-revision hosted CI and rebuilt customer
+artifacts remain required before publication.
+
+Protected human approval remains excluded from this execution, with no workflow
+setting or review decision changed.
