@@ -6,8 +6,9 @@
 
 ### Breaking
 - Default CLI and daemon artifacts omit LLM integrations; build with the explicit
-  `llm` feature to include them. The default container is the C/C++ `core` flavor;
-  select `ada` or `runtime` for additional toolchains. Validation sweep startup
+  `llm` feature to include them. The default container includes all sixteen
+  supported languages; reduced `core` and `ada` images require explicit selection.
+  `--languages` limits a run only when supplied. Validation sweep startup
   requires the `validation` Compose profile.
 - Maven/Gradle, Cargo, and MSBuild project execution requires `--run-untrusted`;
   dependency resolution uses staged caches. Disconnected deployment additionally

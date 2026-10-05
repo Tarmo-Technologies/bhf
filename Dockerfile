@@ -1,19 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # syntax=docker/dockerfile:1.7
 #
-# BHF — Build Harness Fuzz — core default and full-language targets.
+# BHF — Build Harness Fuzz — all-language default and selected-language targets.
 #
 # Multi-stage:
 #   1. builder  : compiles the release binaries (CLI, daemon, both Linux shims)
 #                 against Ubuntu 24.04 glibc so the shims match the runtime.
-#   2. runtime  : explicit full-language target, Ubuntu 24.04 carrying every one of the sixteen language
+#   2. runtime  : default full-language target, Ubuntu 24.04 carrying every one of the sixteen language
 #                 toolchains bhf can build/harness/fuzz, plus AFL++ and a Rust
 #                 nightly for the Rust sanitizer lane. Runs as a non-root user
 #                 under tini. bhf's own instrumentation deps
 #                 (the JVM coverage agent's ASM jars, the C# SharpFuzz package)
 #                 are staged at build time; target-project dependencies are a
 #                 separate staging responsibility.
-#   3. core     : final/default C/C++ build-and-fuzz target without the other
+#   3. core     : explicit C/C++ build-and-fuzz target without the other
 #                 language toolchains or validation sweep helpers.
 #
 # Fuzzing needs a few runtime privileges the image cannot grant itself; grant
@@ -382,5 +382,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends gnat gprbuild \
 LABEL io.tarmo.bhf.flavor="ada"
 USER fuzzer
 
-# Keep the default build identical to core, despite optional stages above.
-FROM core AS production
+# Include every supported language unless a smaller target is explicitly selected.
+FROM runtime AS production

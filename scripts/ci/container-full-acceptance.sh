@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# Exercise the explicit full-language image, including Java on a read-only root.
+# Exercise the default full-language image, including Java on a read-only root.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 evidence="${BHF_FULL_CONTAINER_EVIDENCE:-container-full-acceptance}"
@@ -22,7 +22,7 @@ volume="bhf-ci-java-${commit:0:12}-$$"
 docker volume create "$volume" > /dev/null
 trap 'docker volume rm -f "$volume" >/dev/null 2>&1 || true' EXIT
 
-bash scripts/build-container-release.sh "$image" runtime > "$evidence/build.log" 2>&1 || { tail -100 "$evidence/build.log"; exit 1; }
+bash scripts/build-container-release.sh "$image" > "$evidence/build.log" 2>&1 || { tail -100 "$evidence/build.log"; exit 1; }
 
 docker image inspect "$image" > "$evidence/image-inspect.json"
 image_id="$(docker image inspect --format '{{.Id}}' "$image")"
@@ -57,7 +57,7 @@ if "${run[@]}" "$image_id" llm --help > "$evidence/no-llm.log" 2>&1; then
   exit 1
 fi
 grep -q "unrecognized subcommand 'llm'" "$evidence/no-llm.log"
-"${run[@]}" "$image_id" auto /src --work-dir /work/java-run --languages java \
+"${run[@]}" "$image_id" auto /src --work-dir /work/java-run \
   --max-targets 1 --per-target-time 10 --iterations 32 --jobs 1 \
   > "$evidence/java-auto.log" 2>&1
 "${run[@]}" "$image_id" /usr/bin/python3 -c 'import json; x=json.load(open("/work/java-run/auto/run.json")); assert not x["partial"] and x["summary"]["built_and_fuzzed"] == 1' \

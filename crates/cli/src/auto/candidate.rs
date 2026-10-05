@@ -104,7 +104,7 @@ pub enum Lang {
     Php,
 }
 
-/// CLI-facing selector for `--languages`: the eight fuzzable source languages,
+/// CLI-facing selector for `--languages`: the sixteen supported source languages,
 /// each accepting its canonical name plus the spellings operators reach for
 /// (`c++`/`cxx`/`cc` → C++, `rs` → Rust, `py` → Python, `pl` → Perl,
 /// `golang` → Go). Matching is case-insensitive. `to_lang` projects a selector

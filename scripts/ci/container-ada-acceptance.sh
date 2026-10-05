@@ -9,7 +9,7 @@ if [[ -d "$evidence" && -n "$(find "$evidence" -mindepth 1 -print -quit)" ]]; th
 fi
 mkdir -p "$evidence"
 image="bhf:ci-ada-$(git rev-parse --short=12 HEAD)"
-bash scripts/build-container-release.sh "$image" ada > "$evidence/build.log" 2>&1 || { tail -100 "$evidence/build.log"; exit 1; }
+bash scripts/build-container-release.sh "$image" --flavor ada > "$evidence/build.log" 2>&1 || { tail -100 "$evidence/build.log"; exit 1; }
 image="$(docker image inspect --format '{{.Id}}' "$image")"
 docker image inspect "$image" > "$evidence/image-inspect.json"
 image_size="$(docker image inspect --format '{{.Size}}' "$image")"

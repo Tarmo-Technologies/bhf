@@ -198,7 +198,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Build and exercise the shipping Dockerfile
+      - name: Build and exercise the optional C/C++ Docker target
         run: bash scripts/ci/container-core-acceptance.sh
       - name: Check the selected Ada toolchain flavor
         run: bash scripts/ci/container-ada-acceptance.sh
@@ -213,7 +213,7 @@ jobs:
           if-no-files-found: error
 
   container-full:
-    name: Full-language container build and Java smoke
+    name: Default all-language container acceptance
     needs: changes
     if: needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
@@ -223,7 +223,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Build and exercise the full-language Docker target
+      - name: Build and exercise the default all-language Dockerfile
         run: bash scripts/ci/container-full-acceptance.sh
       - name: Retain full-language container evidence
         if: ${{ always() }}

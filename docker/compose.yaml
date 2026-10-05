@@ -18,7 +18,7 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
-      target: core
+      target: production
     image: bhf:local
     shm_size: "2gb"
     cap_add:

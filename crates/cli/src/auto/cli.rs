@@ -419,8 +419,9 @@ pub struct AutoArgs {
     /// before `--list-targets`, so the ranked list reflects the filter too.
     /// Common spellings are accepted (`c++`/`cxx`/`cc`→cpp, `rs`→rust,
     /// `py`→python, `pl`→perl, `golang`→go); matching is case-insensitive.
-    /// Unset (default) = fuzz every language bhf can build in the tree. The
-    /// SBOM/SCA pass is unaffected — it always scans the whole tree across all
+    /// Unset (default) = consider all sixteen supported languages. Unsupported
+    /// targets, missing dependencies, and denied project builds are reported as
+    /// incomplete work, not successful fuzzing. The SBOM/SCA pass is unaffected — it always scans the whole tree across all
     /// ecosystems regardless of this fuzzing-lane filter.
     #[arg(
         long = "languages",
@@ -3772,20 +3773,37 @@ impl AutoSummary {
         // count into the headline total shown on the CLI.
         findings += crate::auto::report::disk_only_finding_ids(work).len();
 
-        let per_language = [(Lang::Ada, "Ada"), (Lang::C, "C"), (Lang::Cpp, "C++")]
-            .into_iter()
-            .filter_map(|(lang, name)| {
-                let targets = results.iter().filter(|r| r.candidate.lang == lang).count();
-                if targets == 0 {
-                    return None;
-                }
-                let built = results
-                    .iter()
-                    .filter(|r| r.candidate.lang == lang && is_built(&r.outcome))
-                    .count();
-                Some((name, targets, built))
-            })
-            .collect();
+        let per_language = [
+            (Lang::Ada, "Ada"),
+            (Lang::C, "C"),
+            (Lang::Cpp, "C++"),
+            (Lang::Rust, "Rust"),
+            (Lang::Java, "Java"),
+            (Lang::Python, "Python"),
+            (Lang::Perl, "Perl"),
+            (Lang::Go, "Go"),
+            (Lang::Cobol, "COBOL"),
+            (Lang::Fortran, "Fortran"),
+            (Lang::CSharp, "C#"),
+            (Lang::Js, "JavaScript"),
+            (Lang::Ts, "TypeScript"),
+            (Lang::Ruby, "Ruby"),
+            (Lang::Lua, "Lua"),
+            (Lang::Php, "PHP"),
+        ]
+        .into_iter()
+        .filter_map(|(lang, name)| {
+            let targets = results.iter().filter(|r| r.candidate.lang == lang).count();
+            if targets == 0 {
+                return None;
+            }
+            let built = results
+                .iter()
+                .filter(|r| r.candidate.lang == lang && is_built(&r.outcome))
+                .count();
+            Some((name, targets, built))
+        })
+        .collect();
 
         Self {
             source: source.to_path_buf(),
@@ -6128,6 +6146,55 @@ mod tests {
         // #405: measured fuzz wall is summed across passes/targets (only the
         // one built+fuzzed target's single 0.5s pass here).
         assert_eq!(summary.total_elapsed_secs, 0.5);
+    }
+
+    #[test]
+    fn summary_includes_every_supported_language_when_builds_are_denied() {
+        use crate::auto::attempt::{AttemptResult, Outcome};
+        use crate::auto::candidate::{Candidate, LangSelector};
+        use clap::ValueEnum;
+
+        let results: Vec<_> = LangSelector::value_variants()
+            .iter()
+            .map(|selector| AttemptResult {
+                candidate: Candidate {
+                    harness_id: format!("H-{selector:?}"),
+                    lang: selector.to_lang(),
+                    source_path: PathBuf::from(format!("/s/{selector:?}")),
+                    line: 1,
+                    name: "fixture".to_owned(),
+                    score: 0,
+                    is_static: false,
+                    foreign_guard: None,
+                    input_reachability: None,
+                    dialect: None,
+                },
+                outcome: Outcome::UnsupportedParams {
+                    reason: "project build requires --run-untrusted".to_owned(),
+                },
+                harness_dir: PathBuf::from("/h"),
+            })
+            .collect();
+        let summary = AutoSummary::collect(
+            Path::new("/s"),
+            Path::new("/w"),
+            actionability::RunMode::Reporting,
+            std::time::Duration::from_secs(1),
+            &results,
+            0,
+            0,
+            false,
+        );
+        assert_eq!(
+            summary.per_language.len(),
+            LangSelector::value_variants().len()
+        );
+        assert_eq!(summary.skipped, results.len());
+        assert_eq!(summary.built_and_fuzzed, 0);
+        assert!(summary
+            .per_language
+            .iter()
+            .all(|(_, targets, built)| *targets == 1 && *built == 0));
     }
 
     #[test]

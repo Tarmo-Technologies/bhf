@@ -529,9 +529,9 @@ Full install example:
   --install-seeds
 ```
 
-`--languages all` means all sixteen fuzzing lanes. With no language option, the
-installer keeps the original eight core lanes selected and offers COBOL,
-Fortran, C#, JavaScript, TypeScript, Ruby, Lua, and PHP as opt-ins. The C# lane
+`--languages all` means all sixteen supported languages and is the default.
+Use `--languages c,cpp` (or another explicit subset) to reduce installed tooling.
+The C# lane
 requires a separately staged .NET 8 SDK and `SharpFuzz.CommandLine`; TypeScript
 requires `esbuild` on `PATH` or already installed in the target project.
 

@@ -69,8 +69,9 @@ under investigation until evidence supports a reviewed disposition. See
 ## Minimal image for deployment (CM-7 least functionality)
 
 Use the named `core` target for C/C++, `ada` for core plus GNAT/GPRbuild, and
-`runtime` for the explicit full-language toolchain image. The default Docker
-build inherits `core`. All three exclude optional LLM code. Use the documented
+`runtime` for the full-language toolchain image. The default Docker
+build includes all sixteen supported languages through `runtime`; smaller images
+require explicit selection. All three exclude optional LLM code. Use the documented
 hardened Compose override and stage project dependencies before disconnecting.
 Each supported deployment needs execution evidence for its selected language
 and source/cache mounts; a Java smoke does not validate every full-image lane.

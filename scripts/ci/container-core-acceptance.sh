@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# Build and test the exact default Dockerfile stage, retaining the image identity.
+# Build and test the explicitly selected C/C++ Dockerfile stage, retaining the image identity.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 evidence="${BHF_CONTAINER_EVIDENCE:-container-acceptance}"
@@ -22,15 +22,14 @@ volume="bhf-ci-work-${commit:0:12}-$$"
 docker volume create "$volume" > /dev/null
 trap 'docker volume rm -f "$volume" >/dev/null 2>&1 || true' EXIT
 
-bash scripts/build-container-release.sh "$image" core > "$evidence/build.log" 2>&1 || { tail -100 "$evidence/build.log"; exit 1; }
+bash scripts/build-container-release.sh "$image" --flavor core > "$evidence/build.log" 2>&1 || { tail -100 "$evidence/build.log"; exit 1; }
 
 
 docker image inspect "$image" > "$evidence/image-inspect.json"
 image_id="$(docker image inspect --format '{{.Id}}' "$image")"
 image_size="$(docker image inspect --format '{{.Size}}' "$image")"
 # Observed local core build on 2026-10-04: 845,186,284 unpacked bytes.
-# Leave room for reviewed security-package updates while preventing a full
-# language layer from becoming the default image again.
+# Leave room for reviewed security-package updates within this reduced profile.
 (( image_size <= 1200000000 )) || { echo "core image exceeds 1.2 GB: $image_size" >&2; exit 1; }
 compressed_size="$(docker save "$image" | gzip -1 | wc -c | tr -d ' ')"
 label_version="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$image")"

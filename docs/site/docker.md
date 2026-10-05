@@ -1,9 +1,9 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Running bhf in Docker
 
-The default `core` image carries the CLI, daemon, Linux shims, and C/C++ build
-and fuzz tools. The opt-in `runtime` image adds the full language toolchains,
-AFL++, and Rust nightly. Both build the production binaries without the optional
+The default image includes all sixteen supported language toolchains, the CLI,
+daemon, Linux shims, AFL++, and Rust nightly. Smaller `core` and `ada` images
+require explicit selection. All build the production binaries without the optional
 `llm` Cargo feature. Each runs as an unprivileged user
 under `tini`, and grants fuzzing the two extra runtime privileges it needs and
 nothing more.
@@ -13,36 +13,39 @@ nothing more.
 ```sh
 # from the repo root
 docker build -t bhf:local -f Dockerfile .
-# full-language image (explicit):
-docker build --target runtime -t bhf:full-local -f Dockerfile .
+# smaller C/C++ image (explicit):
+docker build --target core -t bhf:core-local -f Dockerfile .
 # selected Ada tooling on top of core:
 docker build --target ada -t bhf:ada-local -f Dockerfile .
-# or build the core image through Compose:
+# or build the default all-language image through Compose:
 docker compose -f docker/compose.yaml build
 # Explicit validation only:
 docker compose -f docker/compose.yaml --profile validation run --rm sweep
 # From a clean commit, stamp a local release candidate with version and source:
 scripts/build-container-release.sh bhf:release-candidate
+# Smaller release candidate (explicit):
+scripts/build-container-release.sh bhf:core-candidate --flavor core
 ```
 
 The image currently supports `linux/amd64` only, matching its checksum-pinned
 Go archive. The release script refuses dirty checkouts and supplies the same
 version and commit to the binary and image metadata. The build context comes
-from `git archive HEAD`, excluding untracked and ignored local files. An optional
-second argument selects `core`, `ada`, or `runtime`. Its `local_image_id` identifies
+from `git archive HEAD`, excluding untracked and ignored local files. The optional
+`--flavor core|ada|runtime` flag selects a toolchain profile; the default is all
+languages (`runtime`). The legacy second positional flavor remains accepted. Its `local_image_id` identifies
 the local image configuration, and is distinct from a registry manifest digest.
 
 The builder compiles only the release binaries and Linux shims against Ubuntu
-24.04 glibc. The default final stage inherits `core`, with C/C++ tools. The named
-`runtime` target carries all sixteen lanes + .NET 8 SDK + a headless JDK + Maven.
+24.04 glibc. The default final stage inherits `runtime`, which carries all sixteen
+languages, including .NET 8 SDK, a headless JDK, and Maven.
 Gradle is omitted from the full image; add it to that stage for Gradle-project
 build recovery. The full language validation sweep uses `runtime` explicitly.
 
 | Profile | Included build tools | Executed acceptance |
 |---|---|---|
-| `core` (default) | C/C++ with Clang/LLVM | Non-root, read-only, disconnected C fixture in the actual image |
+| `core` (explicit) | C/C++ with Clang/LLVM | Non-root, read-only, disconnected C fixture in the actual image |
 | `ada` (explicit) | Core plus GNAT/GPRbuild | Non-root, read-only, disconnected Ada compiler smoke; broader project acceptance remains project-specific |
-| `runtime` (explicit) | All sixteen language toolchains except Gradle project recovery | Bare Java, staged offline Maven, and benign compiler/runtime startup for all sixteen languages under isolation; project-specific dependencies still require staging |
+| `runtime` / `production` (default) | All sixteen language toolchains except Gradle project recovery | Bare Java, staged offline Maven, and benign compiler/runtime startup for all sixteen languages under isolation; project-specific dependencies still require staging |
 | FreeRTOS reference | Separate pinned kernel, ARM GCC, QEMU | Cooperative task/queue image, clean → fault → clean, retained finding and replay; no physical-board claim |
 
 The release support boundary is host-native operation in the tested deployment
@@ -66,6 +69,19 @@ docker run --rm \
 
 Anything after the image name is passed to `bhf` (the entrypoint also accepts
 `bhf`, `bhf-daemon`, `bhf-sweep`, `bash`). Read `/work/run/FINDINGS.md` first.
+
+### Selecting languages
+
+With no `--languages` flag, discovery considers all sixteen supported languages:
+Ada, C, C++, Rust, Java, Python, Perl, Go, COBOL, Fortran, C#, JavaScript,
+TypeScript, Ruby, Lua, and PHP. To deliberately restrict a run, use, for example,
+`auto /src --languages java,python`. The CLI reports how many candidates that
+filter excludes. Selecting a smaller image does not silently change discovery.
+
+Toolchain availability is not proof that every target was fuzzed. Check the
+per-language counts, skipped targets, build failures, and target-entry results.
+Project build consent (`--run-untrusted`) and staged project dependencies still
+apply. Unsupported targets and denied builds are incomplete work.
 
 ## Why fuzzing needs those two flags
 

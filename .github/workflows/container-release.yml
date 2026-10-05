@@ -7,8 +7,8 @@ on:
       flavor:
         description: Container toolchain flavor
         type: choice
-        options: [core, ada, runtime]
-        default: core
+        options: [runtime, core, ada]
+        default: runtime
       sign:
         description: Request protected publisher signing (version tags only)
         type: boolean

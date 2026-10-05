@@ -22,7 +22,7 @@ TARGETS=""
 FUZZERS=""
 EXTRAS=""
 
-DEFAULT_LANGUAGES="c,cpp,rust,java,python,perl,go,ada"
+DEFAULT_LANGUAGES="c,cpp,rust,java,python,perl,go,ada,cobol,fortran,csharp,javascript,typescript,ruby,lua,php"
 DEFAULT_TARGETS="native"
 DEFAULT_FUZZERS="builtin"
 DEFAULT_EXTRAS="build-recovery,archives"
@@ -46,6 +46,7 @@ Options:
   --non-interactive       Do not prompt; use selected or default profiles
   --languages LIST        Comma list: c,cpp,rust,java,python,perl,go,ada,cobol,
                           fortran,csharp,javascript,typescript,ruby,lua,php,all,none
+                          (default: all sixteen languages)
   --targets LIST          Comma list: native,windows,aarch64,all,none
   --fuzzers LIST          Comma list: builtin,afl,all,none
   --extras LIST           Comma list: build-recovery,sandbox,archives,all,none
@@ -681,14 +682,14 @@ if [[ "$NON_INTERACTIVE" -eq 0 ]]; then
     "perl|Perl harnesses and coverage driver|on" \
     "go|Go harnesses with atomic coverage|on" \
     "ada|Ada harnesses with GNAT/GPRbuild|on" \
-    "cobol|COBOL harnesses with GnuCOBOL|off" \
-    "fortran|Fortran harnesses with gfortran|off" \
-    "csharp|C# harnesses with .NET + SharpFuzz|off" \
-    "javascript|JavaScript harnesses with Node.js|off" \
-    "typescript|TypeScript with Node.js + esbuild|off" \
-    "ruby|Ruby harnesses and coverage driver|off" \
-    "lua|Lua harnesses and coverage driver|off" \
-    "php|PHP harnesses and coverage driver|off")"
+    "cobol|COBOL harnesses with GnuCOBOL|on" \
+    "fortran|Fortran harnesses with gfortran|on" \
+    "csharp|C# harnesses with .NET + SharpFuzz|on" \
+    "javascript|JavaScript harnesses with Node.js|on" \
+    "typescript|TypeScript with Node.js + esbuild|on" \
+    "ruby|Ruby harnesses and coverage driver|on" \
+    "lua|Lua harnesses and coverage driver|on" \
+    "php|PHP harnesses and coverage driver|on")"
   TARGETS="$(ask_checklist "Compile targets to support" "$TARGETS" \
     "native|Native Linux target|on" \
     "windows|Windows cross target and Wine smoke execution|off" \

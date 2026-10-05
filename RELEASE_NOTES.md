@@ -6,8 +6,9 @@ Unpublished. Exact-revision CI, image acceptance, scan review, and protected
 publisher signing determine release eligibility; this heading is not approval.
 
 - Default CLI/daemon exclude LLM connectivity, with explicit opt-in builds.
-- Supported container flavors are `core`, `ada`, and full-language `runtime`;
-  all default to no LLM integration. Validation sweeps require explicit startup.
+- The default container includes all sixteen supported languages without LLM
+  integration. `--languages` explicitly narrows a run; `--flavor core` or
+  `--flavor ada` selects a smaller image. Validation sweeps require explicit startup.
 - Read-only, non-root, disconnected acceptance covers the selected profile.
   Java's agent is prebuilt; project builds require consent and staged caches.
 - Binary/source/image identity, compiler-backed Cargo inventory, whole-image
