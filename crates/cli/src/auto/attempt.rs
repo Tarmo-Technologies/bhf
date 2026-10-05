@@ -2940,6 +2940,7 @@ fn run_attempt(
                 let mut events: Vec<crate::auto::runtrace::RuntraceEvent> = Vec::new();
                 let mut env_injected: Vec<(String, String)> = Vec::new();
                 let mut consecutive_crashes = 0_usize;
+                let mut last_fuzz_error = None;
                 // `--per-target-finding-count`: distinct findings emitted across
                 // this target's passes so far. Each pass is told how many MORE it
                 // may emit before the target is done; once the running total
@@ -3074,6 +3075,7 @@ fn run_attempt(
                             p
                         }
                         Err(error) => {
+                            last_fuzz_error = Some(error.clone());
                             bhfeprintln!(
                                 "bhf auto: fuzz pass `{pass_label}` failed for {}: {error}",
                                 candidate.harness_id
@@ -3261,6 +3263,18 @@ fn run_attempt(
                 }
 
                 if pass_runs.is_empty() {
+                    if let Some(reason) = last_fuzz_error {
+                        return Ok(AttemptResult {
+                            candidate: candidate.clone(),
+                            outcome: Outcome::UnrecoverableRuntime {
+                                repairs: manifest.repairs.clone(),
+                                consecutive_crashes,
+                                reason,
+                                runtrace_events: events.clone(),
+                            },
+                            harness_dir,
+                        });
+                    }
                     // Cascade aborted before completing pass 1 — no
                     // fuzz signal at all. Downgrade to `Built` so the
                     // outer report still acknowledges the build.

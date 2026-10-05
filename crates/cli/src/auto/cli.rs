@@ -71,7 +71,9 @@ FIRST RUN:
     --jobs 1 --max-targets 1 --per-target-time 10
 
 Keep the work directory outside the source tree. Install the compiler or
-interpreter for the languages you select. Read results/INDEX.md for findings
+interpreter for the languages you select. For Windows C/C++, use an x64
+Developer PowerShell with LLVM, VS Build Tools/Windows SDK, and make installed.
+Read results/INDEX.md for findings
 and auto/summary.txt for targets that built, fuzzed, or were skipped.
 Add --resume to the same command to continue a stopped run.";
 

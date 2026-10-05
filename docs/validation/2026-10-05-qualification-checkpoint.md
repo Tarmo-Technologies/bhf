@@ -18,6 +18,10 @@ owned fixture's intentional out-of-bounds write. This is a diagnostic build,
 not final packaged release acceptance. The shared Windows CI smoke now uses
 the README command with default sanitizers and requires executions, coverage,
 and the documented output files. Fresh packaged acceptance remains pending.
+The exception-filter fix also covers the embedded C/C++ driver templates.
+When every attempted fuzz pass fails, `auto` now records the last runtime
+error instead of a build-only success. A run with no other successful target
+therefore exits nonzero and keeps the error in `auto/run.json`.
 
 The EL7 generated installer now installs successfully past its glibc check;
 the following archive identity check incorrectly counted a license directory
