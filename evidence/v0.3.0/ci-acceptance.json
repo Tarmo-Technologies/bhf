@@ -1,0 +1,24 @@
+{
+  "accepted": true,
+  "blockers": [],
+  "commit": "acc63b9951d23411300b188710ad0643dd1a6241",
+  "decision": "PASS_FULL_CI",
+  "enterprise_readiness": "not_assessed",
+  "event": "push",
+  "full_ci_passed": true,
+  "jobs": {
+    "build-test": "success",
+    "changes": "success",
+    "ci-policy": "success",
+    "container-core": "success",
+    "container-full": "success",
+    "minimum-rust": "success",
+    "rhel-family-smoke": "success",
+    "rhel7-build": "success",
+    "ubuntu-release-smoke": "success",
+    "windows-build": "success",
+    "windows-current-build": "success"
+  },
+  "schema_version": 1,
+  "scope": "full"
+}
