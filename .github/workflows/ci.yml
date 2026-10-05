@@ -258,6 +258,9 @@ jobs:
             "$RHEL7_BUILD_IMAGE" \
             bash -lc '
               set -euo pipefail
+              # The runner checkout is owned by the host user, while this
+              # disposable container runs as root. Trust this mount only.
+              git config --global --add safe.directory /io
               curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
               export PATH="$CARGO_HOME/bin:$PATH"
               test -x /opt/python/cp312-cp312/bin/python3

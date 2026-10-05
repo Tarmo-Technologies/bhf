@@ -72,7 +72,10 @@ def main():
             prefix = Path(temporary) / "installed binaries"
             env = os.environ.copy()
             for key in list(env):
-                if key.upper().endswith("_PROXY") or key.startswith("INSTALLER_") or (
+                # Python can inherit PowerShell 7 module paths and pass them to
+                # Windows PowerShell 5.1, whose modules cannot load that version.
+                if (windows and key.upper() in {"PSMODULEPATH", "WINPSMODULEPATH"}) or (
+                        key.upper().endswith("_PROXY")) or key.startswith("INSTALLER_") or (
                         key.startswith("BHF_") and any(x in key for x in (
                             "DOWNLOAD", "INSTALL", "NO_MODIFY", "GITHUB_TOKEN"))):
                     env.pop(key)

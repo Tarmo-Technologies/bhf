@@ -2,7 +2,8 @@
 
 param(
     [Parameter(Mandatory = $true)]
-    [string]$BinaryDir
+    [string]$BinaryDir,
+    [string]$ExpectedCommit
 )
 
 $ErrorActionPreference = "Stop"
@@ -29,7 +30,13 @@ Write-Host $actualVersion
 if ($actualVersion -ne $expectedVersion) {
     throw "Expected '$expectedVersion', got '$actualVersion'"
 }
-$expectedCommit = (& git -C $repoRoot rev-parse HEAD).Trim()
+if (-not $ExpectedCommit) {
+    $ExpectedCommit = (& git -C $repoRoot rev-parse HEAD).Trim()
+    if ($LASTEXITCODE -ne 0) { throw "Could not read the tested source commit" }
+}
+if ($ExpectedCommit -cnotmatch '^[0-9a-f]{40}$') {
+    throw "ExpectedCommit must be a full source commit SHA"
+}
 if ($versionLines -notcontains "commit: $expectedCommit") {
     throw "CLI does not report the exact tested source commit"
 }
