@@ -105,6 +105,18 @@ Rust 1.88, build/test, core and default container jobs, RHEL 7/8/9/10,
 Ubuntu 22.04/24.04/26.04, Windows build and Server 2025 compatibility,
 license audit, SBOM, docs, and the hermetic target-entry gate.
 
+The documentation and release-document contract review was pushed as
+`e95d2d08048e77db72dc95436853d251ffaae1de`. Repository-wide Markdown scans
+identified and removed first-person drafting residue and unsupported overall
+rankings; dated benchmark conclusions were scoped to their pinned corpora.
+Local site/link generation, SPDX validation, 239 CI policy tests, and 16
+documentation/release-contract tests passed. Hosted full CI run `37266433513`
+then passed for this commit, including the complete platform and container
+matrix. Separate docs, license, SBOM, dogfood, and hermetic target-entry jobs
+also passed. The public comparison's final accuracy pass additionally removed
+an unmeasured raw-throughput ranking and distinguished average SLOC deviation
+from per-repository deviation.
+
 At documentation head `b1b9bec379d430cb3f672401f2a234d11528fadf`, a clean
 locked release workspace build was packaged into a 17,109,697-byte offline
 Linux bundle with a disposable BHF-generated PKCS#8 v2 test key. The complete
@@ -180,6 +192,19 @@ bound into its release manifest; it is 2,263,872,500 bytes and hashes to
 Its manifest state is `requires_detached_signature`. These materials make the
 candidate reviewable; they do not complete license review, accept residual
 vulnerability risk, or authenticate a publisher.
+
+For the retained `27fa1bb` candidate, a local reviewer handoff under
+`/tmp/bhf-qualification-20261005/reviewer-handoff-27fa1bb` contains every one
+of the 829 residual matches in `residual-findings.csv`, plus
+`package-summary.csv` and `review-summary.json`. The matches span 115
+package/version pairs and 175 unique vulnerability IDs. All match decisions
+remain `under_investigation`; grouping does not remove rows or accept risk.
+The complete CSV hashes to
+`1f350bd4bda4fe9ba8d992ace126599195a964a82cf7333a6e58d7f7c468c528`,
+and the package summary hashes to
+`633e5049c968780437225494a3cd700189a593609e62d33976b7875066eab0a2`.
+These convenience files describe the earlier retained candidate, not a release
+rebuilt from the documentation-review commit.
 
 Raw execution evidence is retained locally under
 `/tmp/bhf-qualification-20261005`; this is a workspace location, not a contractor

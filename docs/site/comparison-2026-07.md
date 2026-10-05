@@ -16,8 +16,8 @@ shown per section.
 
 **Scope.** bhf is an integrated, offline fuzz-lab, static analyzer, and SBOM
 tool. This comparison focuses on breadth and *fuzz-confirmation of static
-findings*. It also reports cases where a specialist produced a better result on
-one measured axis, including raw single-target fuzz throughput.
+findings*. Raw single-target fuzz throughput was not measured on identical
+harnesses and is not ranked here.
 
 ---
 
@@ -47,7 +47,8 @@ Compared bhf to cloc, scc, tokei, using cloc as the accuracy reference.
 
 **Mean absolute deviation from cloc:** bhf **1.3 %**, scc 19.7 %, tokei 23.6 %.
 
-bhf matches cloc within ~1 % on all 14 repos. scc/tokei deviate ~20 % because
+bhf's mean absolute deviation from cloc is 1.3% across the 14 repos. scc/tokei
+deviate about 20% on average because
 they **over-count Perl POD and Python docstrings as code** (perl_mojo: scc/tokei
 ~25,600 vs bhf/cloc ~10,500; py_requests: ~9,300 vs ~7,600) and classify C/C++
 headers differently. bhf's language-aware comment stripping — the same engine
@@ -151,11 +152,10 @@ A real `auto` sweep on c_jansson recovered a partial build (linked a 12-source T
 set, stubbed 3 deps) with no `compile_commands.json`; none of the measured
 competitor configurations provided this workflow.
 
-**Throughput limit:** on *raw throughput against a single mature target*, AFL++/
-libFuzzer/cargo-fuzz/Jazzer win, backed by years of mutator engineering (RedQueen/
-CmpLog, LLVM integration). We did not run an hours-long shootout; this is an
-unquantified limitation, not a claimed result. bhf trades peak single-target speed
-for zero-setup breadth and confirmation when triaging an unknown tree.
+**Throughput scope:** this campaign did not run an hours-long comparison on
+identical harnesses. It therefore establishes no raw-throughput ranking between
+bhf, AFL++, libFuzzer, cargo-fuzz, and Jazzer. The workflow measurements above
+cover automatic setup, build recovery, and confirmation.
 
 ## 5. Reporting — measured format and evidence coverage
 
@@ -172,23 +172,16 @@ competitor beat it on were closed:
 Formats emitted: JSON, SARIF 2.1.0, JUnit, CSV, Markdown, CycloneDX, SPDX, OpenVEX —
 the broadest set in this comparison.
 
-## 6. Remaining measured limits
+## 6. Limits of the comparison
 
-After the fixes, essentially one axis remains where a specialist still legitimately
-leads:
-- **Raw single-target fuzz throughput** — dedicated fuzzers (AFL++/libFuzzer/
-  cargo-fuzz/Jazzer) with mature mutators (RedQueen/CmpLog, LLVM integration) win a
-  long shootout on one already-harnessed, already-building target. That is an
-  architectural trade-off, not a fixable gap: bhf spends its engineering on
-  *getting to a fuzzable state with zero setup across sixteen current lanes*
-  (eight represented in this campaign) and on
-  *confirming static findings* while triaging an unknown tree. It also drives a
-  coverage-guided engine with CmpLog/RedQueen and offers AFL++ as an optional
-  backend.
+The corpus contains fourteen repositories, with eight language lanes represented.
+SLOC speed was measured on three repositories. Raw single-target fuzz throughput
+was not measured on identical harnesses. Detection-class and reporting results
+apply to the pinned tool versions and configurations used here; they do not
+establish an overall ranking on other projects.
 
-Within this comparison, bhf matched or exceeded the selected tools on the other
-measured workflow axes. It also combined offline operation, static analysis,
-SBOM generation, and fuzz-confirmation in one tool.
+The measured bhf workflow combined offline operation, static analysis, SBOM
+generation, and fuzz-confirmation in one tool.
 
 ---
 
