@@ -1,6 +1,6 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# BHF v0.2.35 release candidate
+# BHF v0.3.0 release candidate
 
 Unpublished. Exact-revision CI, image acceptance, scan review, and protected
 publisher signing determine release eligibility; this heading is not approval.

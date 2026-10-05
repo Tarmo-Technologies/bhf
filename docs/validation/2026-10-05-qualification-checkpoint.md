@@ -7,7 +7,8 @@ is not executed in this work. No release or publisher signature has been made.
 
 Live baseline: PR #91 remains open at
 `37582ed1849d18b11e5d6438b049ee6ed5034b69`; main is
-`2e9ea97def2a71e66bf00b5d50d4c5f5a9112bd6`. Version remains 0.2.35.
+`2e9ea97def2a71e66bf00b5d50d4c5f5a9112bd6`. The release candidate is now
+version 0.3.0.
 Latest published release is 0.2.34; prior releases are preserved.
 The final customer-command check exposed a Windows default-run failure after
 the earlier sanitizer-disabled smoke passed. The first failure was the missing
@@ -58,6 +59,11 @@ The 100-project qualification budget is up to 50 CPU-hours of requested target
 execution alone (100 × 3 × 5 × 120 seconds), before preparation and builds.
 Nothing in this checkpoint claims that compiler smoke or a short owned fixture
 satisfies that preset. No failed project is removed from a scored denominator.
+An audit covering September 28 through October 5 found no completed run:
+repository history contains no new campaign results, the local sweep workspaces
+were last updated in July or August, and the hosted workflows in that period do
+not run 100 projects. The older July corpus and results therefore do not satisfy
+the one-week requirement.
 
 ## Resumed packaging and owned-control work
 
@@ -228,10 +234,11 @@ rebuilt from the documentation-review commit.
 
 Raw execution evidence is retained locally under
 `/tmp/bhf-qualification-20261005`; this is a workspace location, not a contractor
-download link. The 100-project sweep, final generated-installer CI, redistribution
-and residual-risk review, and publisher-authenticated handoff remain unrun or
-incomplete. Decision remains **NOT_READY**. Protected human approval is outside
-this execution at the user's request; it has not been recorded as granted.
+download link. Final generated-installer CI and customer-path checks passed. The
+100-project sweep, redistribution and residual-risk review, and
+publisher-authenticated handoff remain unrun or incomplete. Decision remains
+**NOT_READY**. Protected human approval is outside this execution at the user's
+request; it has not been recorded as granted.
 
 ## Proxmox and installer follow-up
 
@@ -345,6 +352,26 @@ hashes and matched the source/image identity. The scan still has zero policy
 blockers and 829 residual matches under investigation. No risk acceptance or
 publisher signature is implied.
 
+The documentation-complete `f46f885671b0e8f700cdb26671202c552905492d`
+revision was then rebuilt and rechecked. Hosted CI run `37326679648` passed all
+required jobs. The final EL7 artifact ZIP hashes to
+`093b2ff1b0b54916dc0287515b0089966b706caa7392c854dbe5081044de0dfa`;
+the binaries report CI merge source
+`647c82ab71896b0336e2f7b67b4984201cd9a299`. Its authenticated test bundle
+completed the installer smoke, README default run, and explicit resume path:
+105,105 executions, eight measured edges, zero findings, one completed target
+reloaded, and zero rerun. The disposable signing key was deleted.
+
+The corresponding final container image is
+`sha256:13f1c6667acdf12f7ac97903b652dcce9bba0566080406008c8bbac454bb7583`.
+Its unsigned 2,263,879,480-byte archive hashes to
+`e3683f8043cb3a4c772339d58e3169319cb284cf6bb68c291e5785042c434483`.
+An independent streaming read matched all 370 manifest files, the exact source
+commit, and the image digest. A fresh disconnected, read-only, non-root README
+run completed 94,424 executions with eight measured edges and zero findings.
+These retained artifacts are version 0.2.35. The requested 0.3.0 version-only
+candidate must pass its own exact-revision CI and artifact checks before release.
+
 Final retained Windows component/default C checks passed on Server 2019,
 Windows 11 25H2, and Windows 11 LTSC 2024, detecting the owned fixture's
 intentional ASan stack-buffer-overflow. A clean default C++ run on Server 2019
@@ -363,7 +390,7 @@ creation/signing to the actual protected job and requires archive authentication
 before extraction. The unavailable dedicated documentation-review skill was
 replaced by direct source, command, and evidence review.
 
-The download examples now target the 0.2.35 candidate instead of the previous
+The download examples now target the 0.3.0 candidate instead of the previous
 published release. The documentation contract checks those examples against
 the workspace release version. All 13 release-document/manifest contract tests
 pass. The candidate remains unpublished until the release process completes.
