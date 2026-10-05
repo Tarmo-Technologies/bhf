@@ -67,6 +67,31 @@ measured 38 edges, and produced zero findings. The combined C-run summary
 All guests were restored to their initial stopped states and original boot
 orders after evidence capture. Horizon remained running.
 
+## Version 0.3.0 candidate
+
+CI run `37335570954` rebuilt the component installers at version 0.3.0 and
+passed every required job. Artifact `11357402799` (`bhf-windows-components`)
+hashes to
+`0aa431492595c6309c0c8274196d1ff0cfdc5757cb9148d5373783b498e32ff0`.
+The binaries report CI merge source
+`06f750fa2aed2acc88bdd512e6ae9e885ec55ead`, whose tracked tree matches
+branch source `0eaca1ce4c916c76f10ff3404f06015e205dbc8b`. Hosted Server 2022
+installation passed under Windows PowerShell and PowerShell Core.
+
+The actual 0.3.0 installers and default sanitized command then passed again on
+the three retained guests:
+
+| Guest | Executions | Measured edges | Findings |
+|---|---:|---:|---|
+| Server 2019 | 201 | 11 | One intended ASan stack-buffer-overflow |
+| Windows 11 25H2 | 607 | 11 | One intended ASan stack-buffer-overflow |
+| Windows 11 LTSC 2024 | 684 | 11 | One intended ASan stack-buffer-overflow |
+
+The combined summary hashes to
+`b3cb09975a7ff4e16df778602e217ec3e6603af494fca028097b8e6e9456e34c`.
+Each guest was shut down before the next one started, and all original boot
+orders were restored. Horizon remained running.
+
 ## Evidence and cleanup
 
 Raw logs, component hashes, run JSON, and installer receipts are retained under

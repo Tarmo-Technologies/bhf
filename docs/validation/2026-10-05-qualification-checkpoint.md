@@ -370,22 +370,53 @@ An independent streaming read matched all 370 manifest files, the exact source
 commit, and the image digest. A fresh disconnected, read-only, non-root README
 run completed 94,424 executions with eight measured edges and zero findings.
 These retained artifacts are version 0.2.35. The requested 0.3.0 version-only
-candidate must pass its own exact-revision CI and artifact checks before release.
+candidate then passed its own exact-revision checks. Branch source
+`0eaca1ce4c916c76f10ff3404f06015e205dbc8b` and CI merge source
+`06f750fa2aed2acc88bdd512e6ae9e885ec55ead` have identical tracked trees.
+Hosted CI run `37335570954` passed build/test, Rust 1.88, core and full
+containers, EL7, AlmaLinux 8.10/9.8/10.2, Ubuntu 22.04/24.04/26.04, Windows,
+and final acceptance. The full image reported `bhf v0.3.0`, passed sealed
+acceptance, and retained zero scan blockers plus 829 residual findings for
+protected review.
 
-Final retained Windows component/default C checks passed on Server 2019,
+The 0.3.0 EL7 artifact ZIP hashes to
+`af9a5f147d0635dc177f0af6c807ce1902b3a467af5f5ef38036719fbe694a79`.
+Its actual binaries reported the exact CI merge source. A disposable-key bundle
+then passed independent verified-copy extraction, installer smoke, and the
+installed README default command: 99,511 executions, eight measured edges, and
+zero findings. Explicit `--resume` reloaded one target and reran none. The
+16,842,619-byte bundle hashes to
+`bed116dbeef494b63208716a989764b9262948ab98c6cb518f82bb1e6fd55f3a`;
+the disposable private key was deleted.
+
+The locally accepted 0.3.0 full image is
+`sha256:bcd1c93608ec94db89ad4cfda8f854a827781e1b42b6a9ee5d3f1dbce7e45955`.
+A fresh disconnected, read-only, non-root README run completed 90,595
+executions with eight measured edges and zero findings. The matching hosted
+image acceptance independently passed for merge source `06f750fa`.
+
+Final 0.3.0 Windows component/default C checks passed on Server 2019,
 Windows 11 25H2, and Windows 11 LTSC 2024, detecting the owned fixture's
-intentional ASan stack-buffer-overflow. A clean default C++ run on Server 2019
-completed 30,507 executions and 38 measured edges with zero findings. See
+intentional ASan stack-buffer-overflow. The generated component artifact hashes
+to `0aa431492595c6309c0c8274196d1ff0cfdc5757cb9148d5373783b498e32ff0`;
+its three-platform summary hashes to
+`b3cb09975a7ff4e16df778602e217ec3e6603af494fca028097b8e6e9456e34c`.
+A clean default C++ run on Server 2019 completed 30,507 executions and 38
+measured edges with zero findings on the code-identical 0.2.35 candidate. See
 [the Windows evidence record](2026-10-05-windows-installer-results.md).
 All three guests were shut down and their original boot orders restored.
 Horizon remained running.
 
 The final documentation review checked README/install steps against the actual
-installer, source, and packaged command output. All 41 public command-help
-interfaces returned valid help. The documentation site/link build, SPDX check,
-242 CI policy tests, real all-inputs-rejected regression, and 12 help-related
- unit tests passed. A style-marker scan covered 183 tracked documentation files
-with no drafting or AI-phrase matches. The release checklist now assigns bundle
+installer, source, and packaged command output. The root help and all 41 command
+interfaces returned valid help with a `Usage` section. The documentation site
+and link build, SPDX check, 242 CI policy tests, real all-inputs-rejected
+regression, and 12 help-related unit tests passed. A language scan covered all
+183 tracked documentation files and found no drafting residue or AI filler.
+Four flagged phrases describe
+statistical or fault-tolerance properties; placeholder matches are literal
+syntax or repair behavior, and the one credential-like phrase refers to
+sanitizer option names. The release checklist now assigns bundle
 creation/signing to the actual protected job and requires archive authentication
 before extraction. The unavailable dedicated documentation-review skill was
 replaced by direct source, command, and evidence review.
