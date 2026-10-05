@@ -9,9 +9,7 @@
 </div>
 
 <p align="center">
-<strong>BHF (Build Harness Fuzz)</strong> is an automated fuzzer and harness generator for Ada, C, C++, Rust, Java, Python, Perl, Go, COBOL, Fortran, C#, JavaScript, TypeScript, Ruby, Lua, and PHP —
-including the legacy language versions and hard-to-build codebases common in government and
-military systems. Point it at a source tree; it discovers candidate functions,
+<strong>BHF (Build Harness Fuzz)</strong> is an automated fuzzer and harness generator for Ada, C, C++, Rust, Java, Python, Perl, Go, COBOL, Fortran, C#, JavaScript, TypeScript, Ruby, Lua, and PHP. Point it at a source tree; it discovers candidate functions,
 generates harnesses, and attempts to build and fuzz them with your installed
 toolchains. Missing dependencies and unsupported targets are reported.
 </p>
