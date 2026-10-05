@@ -42,6 +42,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 fn apply_runaway_rlimits(cmd: &mut std::process::Command) {
     use std::os::unix::process::CommandExt;
+    // Give every harness its own process group. Targets routinely spawn shells
+    // and helpers; a timeout must reap those descendants too, especially when
+    // one inherited a captured stdout/stderr pipe that a drain thread joins.
+    cmd.process_group(0);
     unsafe {
         cmd.pre_exec(|| {
             #[cfg(target_os = "linux")]
@@ -2613,11 +2617,20 @@ fn run_builtin_with_progress(
     mut prepared: PreparedFuzzRun,
     progress: Option<FuzzProgressFn<'_>>,
 ) -> Result<FuzzRunSummary, String> {
+    // A single persistent-harness input must never outlive the entire fuzz pass.
+    // This matters most for interpreted lanes: a target such as cloc can block in
+    // one call, and the fork-server used to wait its fixed 30s repeatedly even
+    // when `--per-target-time` gave the pass only a few seconds.  The outer loop
+    // cannot observe its wall-clock budget while blocked in that protocol wait.
+    if let Some(pass_budget) = prepared.time {
+        prepared.per_input_timeout = prepared.per_input_timeout.min(pass_budget);
+    }
     reset_target_entry(&prepared.extra_env);
     bound_seed_corpus(&mut prepared.seeds, prepared.max_len);
     let corpus_limits = corpus_limits(prepared.max_len);
     let finding_dedup_limit = max_finding_dedup_keys();
     let start = Instant::now();
+    let pass_deadline = prepared.time.map(|budget| start + budget);
     let mut last_tick = Instant::now();
     let mut corpus = CorpusManager::new(prepared.work_dir.clone())
         .with_retention_limits(corpus_limits.entries, corpus_limits.bytes);
@@ -2796,6 +2809,7 @@ fn run_builtin_with_progress(
             &prepared.work_dir,
             &prepared.extra_env,
             prepared.rss_limit_mb,
+            prepared.per_input_timeout,
         )
         .ok()
     } else {
@@ -2856,10 +2870,14 @@ fn run_builtin_with_progress(
                 {
                     let base_bytes = pool[base_index].bytes.clone();
                     let colored = match cov_tracker.as_mut() {
-                        Some(cov) => colorize_base(cov, fork, &base_bytes, &mut rng),
+                        Some(cov) => colorize_base(cov, fork, &base_bytes, &mut rng, pass_deadline),
                         None => base_bytes,
                     };
-                    let log = capture_cmplog(reader, fork, &colored);
+                    let log = if pass_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                        cmplog::CmpLog::default()
+                    } else {
+                        capture_cmplog(reader, fork, &colored)
+                    };
                     if let Some(entry) = pool.get_mut(base_index) {
                         entry.cmplog = Some(log);
                         entry.colored = Some(colored);
@@ -2877,6 +2895,13 @@ fn run_builtin_with_progress(
                 &mut rng,
             )
         };
+        // RedQueen colorization can execute up to 65 probes before the main
+        // input. Slow interpreted targets used to multiply a one-second pass
+        // into more than a minute inside that setup work. Do not start another
+        // execution after setup has consumed the pass budget.
+        if pass_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            break;
+        }
         let portfolio_lane = sequence_geometry.and_then(|geometry| geometry.portfolio_lane(&input));
         // Empty inputs end the harness loop (an empty frame is the degenerate
         // "no input"), so they always go through the per-spawn path; everything
@@ -2929,6 +2954,7 @@ fn run_builtin_with_progress(
                         &prepared.work_dir,
                         &prepared.extra_env,
                         prepared.rss_limit_mb,
+                        prepared.per_input_timeout,
                     )
                     .ok();
                     forkserver_started |= fork_server.is_some();
@@ -4300,7 +4326,7 @@ fn run_with_timeout(
             Ok(Some(status)) => return Ok(collected_child_output(status, stderr_reader)),
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
+                    kill_process_group(&mut child);
                     let status = child.wait().map_err(|error| {
                         format!(
                             "failed to reap timed-out harness '{}': {error}",
@@ -4318,7 +4344,7 @@ fn run_with_timeout(
                 if rss_limit_mb > 0 {
                     if let Some(rss) = process_rss_mb(child.id()) {
                         if rss > rss_limit_mb {
-                            let _ = child.kill();
+                            kill_process_group(&mut child);
                             let status = child.wait().map_err(|error| {
                                 format!(
                                     "failed to reap OOM harness '{}': {error}",
@@ -4338,7 +4364,7 @@ fn run_with_timeout(
                 std::thread::sleep(Duration::from_millis(20));
             }
             Err(error) => {
-                let _ = child.kill();
+                kill_process_group(&mut child);
                 let _ = child.wait();
                 let _ = stderr_reader.and_then(|reader| reader.join().ok());
                 return Err(format!(
@@ -4794,6 +4820,7 @@ fn colorize_base(
     fork: &mut ForkServer,
     base: &[u8],
     rng: &mut MutationRng,
+    deadline: Option<Instant>,
 ) -> Vec<u8> {
     if base.len() < MIN_COLORIZE_LEN {
         return base.to_vec();
@@ -4808,6 +4835,9 @@ fn colorize_base(
     let mut colored = base.to_vec();
     let probes = base.len().min(MAX_COLORIZE_PROBES);
     for i in 0..probes {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            break;
+        }
         let original = colored[i];
         let candidate = rng.next_u8();
         if candidate == original {
@@ -5490,7 +5520,7 @@ fn run_harness_with_protocol(
         // on the first bytes). Swallow BrokenPipe; only a genuine I/O error aborts.
         if let Err(error) = stdin.write_all(input) {
             if error.kind() != std::io::ErrorKind::BrokenPipe {
-                let _ = child.kill();
+                kill_process_group(&mut child);
                 let _ = child.wait();
                 return Err(format!("write harness stdin: {error}"));
             }
@@ -5516,7 +5546,7 @@ fn run_harness_with_protocol(
             Ok(Some(status)) => break Some(status),
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
+                    kill_process_group(&mut child);
                     let _ = child.wait();
                     break None;
                 }
@@ -5753,6 +5783,10 @@ struct ForkServer {
     /// fork-server path (the common driver path since #399) silently ignored the
     /// limit — only the per-spawn fallback enforced it.
     rss_limit_mb: usize,
+    /// Per-input protocol wait, inherited from the run's effective timeout.
+    /// Keeping this on the server prevents its persistent fast path from using a
+    /// looser timeout than the per-spawn fallback or the enclosing pass budget.
+    run_timeout_ms: i32,
 }
 
 enum ForkOutcome {
@@ -5766,10 +5800,20 @@ enum ForkOutcome {
 /// (a C/libFuzzer harness, a stale build, a test mock) never does, so spawn bails
 /// to per-spawn after this.
 const FORK_HANDSHAKE_TIMEOUT_MS: i32 = 2000;
-/// Per-input sync timeout (ms): a backstop for a single input that hangs the
-/// persistent process (where the cumulative CPU rlimit would not catch it
-/// promptly). On timeout the input is isolated via the per-spawn path.
-const FORK_RUN_TIMEOUT_MS: i32 = 30_000;
+/// Convert a run timeout to the bounded millisecond value accepted by `poll(2)`.
+/// A zero/sub-millisecond budget still receives one millisecond so the protocol
+/// gets a chance to observe an already-readable sync byte.
+fn fork_run_timeout_ms(timeout: Duration) -> i32 {
+    timeout.as_millis().clamp(1, i32::MAX as u128) as i32
+}
+
+#[cfg(test)]
+#[test]
+fn fork_server_wait_inherits_short_pass_budget() {
+    assert_eq!(fork_run_timeout_ms(Duration::ZERO), 1);
+    assert_eq!(fork_run_timeout_ms(Duration::from_millis(750)), 750);
+    assert_eq!(fork_run_timeout_ms(Duration::from_secs(3)), 3_000);
+}
 
 /// Block until `fd` is readable or `timeout_ms` elapses. Returns true if
 /// readable, false on timeout/error (caller treats either as "no response").
@@ -5808,6 +5852,7 @@ impl ForkServer {
         work_dir: &Path,
         extra_env: &[(String, String)],
         rss_limit_mb: usize,
+        run_timeout: Duration,
     ) -> Result<Self, String> {
         let events_path = temp_event_path(work_dir)?;
         // Fresh, empty events file; we read deltas from it per input.
@@ -5855,10 +5900,9 @@ impl ForkServer {
         use std::io::Read;
         let fd = child_stdout_fd(&stdout);
         let mut ready = [0u8; 1];
-        if !fd_readable_within(fd, FORK_HANDSHAKE_TIMEOUT_MS)
-            || stdout.read_exact(&mut ready).is_err()
-        {
-            let _ = child.kill();
+        let handshake_timeout_ms = FORK_HANDSHAKE_TIMEOUT_MS.min(fork_run_timeout_ms(run_timeout));
+        if !fd_readable_within(fd, handshake_timeout_ms) || stdout.read_exact(&mut ready).is_err() {
+            kill_process_group(&mut child);
             let _ = child.wait();
             let _ = fs::remove_file(&events_path);
             return Err("fork-server: harness did not complete the protocol handshake".to_owned());
@@ -5870,6 +5914,7 @@ impl ForkServer {
             events_path,
             events_offset: 0,
             rss_limit_mb,
+            run_timeout_ms: fork_run_timeout_ms(run_timeout),
         })
     }
 
@@ -5897,7 +5942,7 @@ impl ForkServer {
             // Either the input hung the process or it blew past the RSS ceiling;
             // kill the child and isolate via the per-spawn path, which polls RSS
             // and synthesizes the BHF-209 out-of-memory finding.
-            let _ = self.child.kill();
+            kill_process_group(&mut self.child);
             return ForkOutcome::Died;
         }
         let mut sync = [0u8; 1];
@@ -5907,7 +5952,7 @@ impl ForkServer {
         // The input may have driven RSS over the ceiling and only then sent its
         // sync byte (the harness frees nothing mid-loop); catch that too.
         if self.rss_exceeded() {
-            let _ = self.child.kill();
+            kill_process_group(&mut self.child);
             return ForkOutcome::Died;
         }
         match self.read_event_delta() {
@@ -5923,10 +5968,10 @@ impl ForkServer {
     fn await_sync_within_rss_limit(&self) -> bool {
         let fd = child_stdout_fd(&self.stdout);
         if self.rss_limit_mb == 0 {
-            return fd_readable_within(fd, FORK_RUN_TIMEOUT_MS);
+            return fd_readable_within(fd, self.run_timeout_ms);
         }
         const RSS_POLL_INTERVAL_MS: i32 = 25;
-        let deadline = Instant::now() + Duration::from_millis(FORK_RUN_TIMEOUT_MS as u64);
+        let deadline = Instant::now() + Duration::from_millis(self.run_timeout_ms as u64);
         loop {
             if fd_readable_within(fd, RSS_POLL_INTERVAL_MS) {
                 return true;
@@ -5985,7 +6030,7 @@ impl ForkServer {
 impl Drop for ForkServer {
     fn drop(&mut self) {
         // Closing stdin is the EOF that ends the harness loop; then reap.
-        let _ = self.child.kill();
+        kill_process_group(&mut self.child);
         let _ = self.child.wait();
         let _ = fs::remove_file(&self.events_path);
     }
@@ -7719,14 +7764,13 @@ mod auto_path_tests {
     fn hanging_event_log_harness_is_reaped_at_per_input_timeout() {
         use std::os::unix::fs::PermissionsExt;
         // A non-C harness (no main.c/main.cpp in the dir, so it takes the
-        // event-log per-spawn lane) that hangs forever, ignoring stdin. Before
-        // the fix `run_harness` blocked in `wait_with_output` indefinitely —
-        // RLIMIT_CPU never fires for a 0%-CPU sleep — hanging the whole engine.
-        // Now `per_input_timeout` is a wall-clock bound. `exec` so the process
-        // we spawn (and kill) IS the sleep.
+        // event-log per-spawn lane) that hangs forever, ignoring stdin. Its
+        // descendant inherits stderr: killing only the shell leaves the pipe
+        // open and blocks the stderr drain thread forever. The timeout must kill
+        // the whole harness process group.
         let work = tmpdir();
         let hang = work.join("hang.sh");
-        fs::write(&hang, "#!/bin/sh\nexec sleep 3600\n").unwrap();
+        fs::write(&hang, "#!/bin/sh\nsleep 3600 &\nwait\n").unwrap();
         fs::set_permissions(&hang, fs::Permissions::from_mode(0o755)).unwrap();
         let runner = replay_min::HarnessRunner::direct(hang);
 
