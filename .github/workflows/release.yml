@@ -244,6 +244,7 @@ jobs:
     # name already includes the matrix combination.
     needs:
       - plan
+      - release-acceptance
     # MUST begin with always(). Any plain conditional `if` on this matrix job
     # suppresses matrix expansion on the tag/push path (the job skips WITHOUT
     # expanding), whereas `if: always()` expands it — proven by isolation probes
@@ -293,6 +294,24 @@ jobs:
       BHF_VCS_REF: ${{ github.sha }}
       RHEL7_BUILD_IMAGE: quay.io/pypa/manylinux2014_x86_64@sha256:0d25b049964b2549b83384036abdff06789a8c0b1e9ff003ec80f0d531f79e50
     steps:
+      # always() is needed for matrix expansion, so enforce the upstream gate
+      # again before checkout, tool installation, or artifact creation.
+      - name: Require accepted release plan before packaging
+        shell: bash
+        env:
+          RELEASE_ACCEPTANCE_RESULT: ${{ needs.release-acceptance.result }}
+          RELEASE_PLAN_RESULT: ${{ needs.plan.result }}
+          RELEASE_PUBLISHING: ${{ needs.plan.outputs.publishing }}
+        run: |
+          set -euo pipefail
+          if [[ "$RELEASE_ACCEPTANCE_RESULT" != success || "$RELEASE_PLAN_RESULT" != success || "$RELEASE_PUBLISHING" != true ]]; then
+            echo "Release packaging requires successful CI acceptance and a publishing plan" >&2
+            exit 1
+          fi
+          if [[ -z "$RELEASE_TAG" || "$RELEASE_TAG" != "$GITHUB_REF_NAME" ]]; then
+            echo "Release packaging requires a plan for the triggering tag" >&2
+            exit 1
+          fi
       - name: enable windows longpaths
         run: |
           git config --global core.longpaths true
@@ -344,9 +363,10 @@ jobs:
               curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
               export PATH="$CARGO_HOME/bin:$PATH"
               curl --proto "=https" --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh | sh
-              tag_args=()
-              [[ -z "$RELEASE_TAG" ]] || tag_args+=("--tag=$RELEASE_TAG")
-              dist build "${tag_args[@]}" --print=linkage --output-format=json $DIST_ARGS > dist-manifest.json
+              # Bash 4.2 treats empty arrays as unset under nounset. Publishing
+              # always requires a tag, validated before this job starts work.
+              : "${RELEASE_TAG:?release tag is required}"
+              dist build "--tag=$RELEASE_TAG" --print=linkage --output-format=json $DIST_ARGS > dist-manifest.json
               release_dir=target/x86_64-unknown-linux-gnu/dist
               [[ -d $release_dir ]] || release_dir=target/dist
               scripts/check-linux-release-abi.sh "$release_dir"
@@ -375,9 +395,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tag_args=()
-          [[ -z "$RELEASE_TAG" ]] || tag_args+=("--tag=$RELEASE_TAG")
-          dist build "${tag_args[@]}" --print=linkage --output-format=json $DIST_ARGS > dist-manifest.json
+          : "${RELEASE_TAG:?release tag is required}"
+          dist build "--tag=$RELEASE_TAG" --print=linkage --output-format=json $DIST_ARGS > dist-manifest.json
           echo "dist ran successfully"
       - name: Validate packaged harness runtimes (Linux)
         if: runner.os == 'Linux'
