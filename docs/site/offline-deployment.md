@@ -494,16 +494,23 @@ Re-running `install.sh` from a newer package **updates** an existing install; yo
 do not uninstall first. It is idempotent — safe to run repeatedly, and safe to
 re-run over the same version — and it never destroys your data.
 
-On the offline host, unpack the new package and run the installer exactly as for
-a first install:
+Verify the new package with the independently trusted verifier and publisher
+key before unpacking it, then reuse the operator policy from the first install.
+Set `ARCHIVE` to the new filename and preserve the existing install prefix:
 
 ```sh
-sha256sum -c bhf-dist-*.tar.gz.sha256
-tar xzf bhf-dist-*.tar.gz
-cd bhf-dist-*
-./install.sh                       # same prefix as before (default /opt/bhf)
+ARCHIVE='bhf-dist-<version>-x86_64-unknown-linux-gnu.tar.gz'
+sha256sum -c "$ARCHIVE.sha256"
+python3 /trusted/verify-offline-dist.py \
+  --archive "$ARCHIVE" --signature "$ARCHIVE.sig" \
+  --trusted-public-key /trusted/publisher.pub \
+  --verified-copy bhf-update-verified.tar.gz
+tar xzf bhf-update-verified.tar.gz
+cd "${ARCHIVE%.tar.gz}"
+./install.sh --trust-policy /trusted/operator-policy.json
 # or, non-interactive, reusing your prior selections:
-./install.sh --non-interactive --languages all --targets native --fuzzers builtin
+./install.sh --non-interactive --trust-policy /trusted/operator-policy.json \
+  --languages all --targets native --fuzzers builtin
 ```
 
 What the update does, atomically (stages `<prefix>.new.$$`, then swaps it in):

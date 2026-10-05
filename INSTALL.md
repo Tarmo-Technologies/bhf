@@ -18,15 +18,22 @@ Do not mix versions or target triples. The commands below use the published
 
 ## Choice 1: all-in-one `install.sh` bundle
 
-Download `bhf-dist-<version>-x86_64-unknown-linux-gnu.tar.gz` and its
-`.sha256` sidecar from the same release, then:
+Download `bhf-dist-<version>-x86_64-unknown-linux-gnu.tar.gz`, its `.sha256`
+sidecar, and its detached `.sig` from the same release. Obtain the verifier,
+publisher key, and operator policy through a separately trusted channel.
+Verification needs Python 3 and an Ed25519-capable OpenSSL; EL7 needs an
+approved newer OpenSSL or a separate verification host. Set `ARCHIVE` to the
+file you received (replace `<version>` below), then:
 
 ```sh
-sha256sum -c bhf-dist-*.tar.gz.sha256
-# Authenticate the whole archive with a separately trusted verifier and
-# publisher public key before extracting or executing bundle code.
-tar xzf bhf-dist-*.tar.gz
-cd bhf-dist-*-x86_64-unknown-linux-gnu
+ARCHIVE='bhf-dist-<version>-x86_64-unknown-linux-gnu.tar.gz'
+sha256sum -c "$ARCHIVE.sha256"
+python3 /trusted/verify-offline-dist.py \
+  --archive "$ARCHIVE" --signature "$ARCHIVE.sig" \
+  --trusted-public-key /trusted/publisher.pub \
+  --verified-copy bhf-verified.tar.gz
+tar xzf bhf-verified.tar.gz
+cd "${ARCHIVE%.tar.gz}"
 ./install.sh --trust-policy /trusted/operator-policy.json
 ```
 

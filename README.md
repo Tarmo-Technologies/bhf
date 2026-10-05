@@ -11,8 +11,9 @@
 <p align="center">
 <strong>BHF (Build Harness Fuzz)</strong> is an automated fuzzer and harness generator for Ada, C, C++, Rust, Java, Python, Perl, Go, COBOL, Fortran, C#, JavaScript, TypeScript, Ruby, Lua, and PHP —
 including the legacy language versions and hard-to-build codebases common in government and
-military systems. Point it at a source tree; it finds the fuzzable functions, writes the
-harnesses, recovers the build, and fuzzes — no test harness and no working build required.
+military systems. Point it at a source tree; it discovers candidate functions,
+generates harnesses, and attempts to build and fuzz them with your installed
+toolchains. Missing dependencies and unsupported targets are reported.
 </p>
 
 <p align="center">
@@ -27,7 +28,30 @@ harnesses, recovers the build, and fuzzes — no test harness and no working bui
 
 ## Quick Start
 
-Build from source (Rust 1.88+, plus `make` + `clang` for the C/C++ lane):
+For a prebuilt release, use the [complete Linux bundle](#complete-linux-install-with-installsh)
+or the [Windows installer](#windows-11--windows-server-quick-install).
+The Linux bundle includes the CLI, daemon, both shims, and harness runtimes.
+Install the compiler or interpreter for the languages you want to fuzz;
+C/C++ needs `clang` and `make` (plus Visual Studio Build Tools on Windows).
+No model or API key is required.
+
+After installing, start with one target:
+
+```sh
+bhf --version
+bhf --help
+bhf auto /path/to/source --work-dir /path/to/bhf_work \
+  --jobs 1 --max-targets 1 --per-target-time 10
+```
+
+Keep the work directory outside the source tree. Read
+`/path/to/bhf_work/results/INDEX.md` for findings and
+`/path/to/bhf_work/auto/summary.txt` for what built, ran, or was skipped.
+Use `bhf auto --help` for run limits, language selection, and build options.
+
+### Build from source
+
+You need Rust 1.88 or newer, plus the selected language's toolchain:
 
 ```sh
 git clone https://github.com/Tarmo-Technologies/bhf.git && cd bhf
@@ -85,9 +109,9 @@ bhf auto /path/to/source-tree \
   --debug
 ```
 
-| Flag | What it buys |
+| Flag | Purpose |
 |---|---|
-| `--jobs 4` | Targets built+fuzzed concurrently. Peak RAM ≈ `jobs × --rss-limit-mb`. |
+| `--jobs 4` | Targets built+fuzzed concurrently. Child RAM budget ≈ `jobs × --rss-limit-mb`, plus BHF/compiler/OS overhead. |
 | `--per-target-time 60` | Fuzz seconds per target (libFuzzer `-max_total_time` parity). |
 | `--campaign-time 3600` | Hard cap on the whole sweep; no new targets start after it. |
 | `--max-targets 40` | Stop once 40 targets actually **fuzzed** — failures don't consume the cap. |
@@ -283,6 +307,12 @@ manual co-location commands.
 
 #### Complete Linux install with `install.sh`
 
+Obtain `verify-offline-dist.py`, the publisher public key, and an operator trust
+policy through your trusted delivery channel. The paths below represent those
+files. Verification requires Python 3 and an Ed25519-capable OpenSSL; on EL7,
+use an approved verification host or an approved newer OpenSSL installation.
+Set `VERSION` to the release you received; 0.2.34 is the latest published version.
+
 ```sh
 VERSION=0.2.34
 BASE="https://github.com/Tarmo-Technologies/bhf/releases/download/${VERSION}"
@@ -290,15 +320,20 @@ ARCHIVE="bhf-dist-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 
 curl --proto '=https' --tlsv1.2 -fLO "$BASE/$ARCHIVE"
 curl --proto '=https' --tlsv1.2 -fLO "$BASE/$ARCHIVE.sha256"
+curl --proto '=https' --tlsv1.2 -fLO "$BASE/$ARCHIVE.sig"
 sha256sum -c "$ARCHIVE.sha256"
-tar xzf "$ARCHIVE"
+python3 /trusted/verify-offline-dist.py \
+  --archive "$ARCHIVE" --signature "$ARCHIVE.sig" \
+  --trusted-public-key /trusted/publisher.pub \
+  --verified-copy bhf-verified.tar.gz
+tar xzf bhf-verified.tar.gz
 cd "${ARCHIVE%.tar.gz}"
-./install.sh
+./install.sh --trust-policy /trusted/operator-policy.json
 ```
 
 The installer prompts for language toolchains, targets, fuzzers, and optional
-extras. Run `./install.sh --help` for non-interactive, custom-prefix, offline,
-and smoke-test controls.
+extras, then runs a bundled C smoke test. Run `./install.sh --help` for
+non-interactive, custom-prefix, offline, and smoke-test controls.
 
 #### Manual Linux component co-location
 
@@ -425,8 +460,8 @@ thresholds, not hardcoded analysis limits: without an explicit flag, the static
 ceiling is the smaller of 80% of host-available RAM and 70% of the cgroup limit;
 `auto` derives its per-harness RSS allowance from available memory as well.
 
-Retention and parsing budgets scale with available host/cgroup memory. The
-per-target mutation corpus defaults to 1/64 of available RAM (64 MiB..2 GiB),
+Standalone `bhf fuzz` retention budgets scale with available host/cgroup memory.
+Its per-target mutation corpus defaults to 1/64 of available RAM (64 MiB..2 GiB),
 and its entry allowance is derived from that byte budget and `--max-len`.
 Static-analysis source size defaults to 1/64 of its scan ceiling (16..256 MiB;
 standalone SLOC has a 64 MiB floor), while auto-discovery uses 1/32 of available

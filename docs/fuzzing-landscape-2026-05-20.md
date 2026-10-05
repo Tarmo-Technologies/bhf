@@ -330,7 +330,7 @@ The same problems show up across papers, project issues, and forum threads:
 ## Recommended Implementation Order
 
 1. Build `bhf introspect` v0.1.
-   It is the highest-leverage feature because it turns existing BHF runs
+   It would turn existing BHF runs
    into actionable "what is missing" guidance and gives Ada users something
    the mainstream stack does not provide.
 

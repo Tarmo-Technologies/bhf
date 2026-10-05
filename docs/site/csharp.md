@@ -101,8 +101,8 @@ roslyn, EF Core, Newtonsoft.Json, MessagePack-CSharp, YamlDotNet, ImageSharp,
 protobuf-net, SharpZipLib, ML.NET, and more:
 
 - **69,608 C# files scanned, 3,113 fuzzable methods discovered, 0 bhf panics** —
-  discovery is robust across enormous, idiomatic C# (roslyn alone: 17,094 files →
-  973 targets). 24 of 25 repos completed cleanly; only dotnet/runtime (32,403
+  roslyn alone contributed 17,094 files →
+  973 targets. 24 of 25 repos completed cleanly; only dotnet/runtime (32,403
   files, the single largest .NET repo) needs a longer discovery budget.
 - **End-to-end on YamlDotNet**: 14 of 21 methods were built, IL-instrumented, and
   fuzzed at **~15,000 executions/second** on one warm CLR with **2,304 edges** of

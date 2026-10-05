@@ -4615,6 +4615,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "docs/validation/2026-10-05-windows-installer-results.md",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "docs/verified-distribution-handoff.md",
       "license": "Apache-2.0"
     },

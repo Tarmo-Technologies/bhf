@@ -167,7 +167,7 @@ The competitor totals are dominated by low-signal rules:
 - **bandit:** 9882 of its 10822 Python findings (91%) are `B101 assert_used` —
   "don't use `assert` in production." Another large share is `B404`/`B603`
   ("you imported/called `subprocess`"). These are informational, not
-  vulnerabilities. bandit's genuinely security-relevant output is ~589 findings;
+  vulnerabilities. bandit's security-relevant output is ~589 findings;
   bhf's 155 are the higher-severity, taint-confirmed subset with less
   duplication.
 - **flawfinder:** flags every occurrence of a dangerous function name. On zlib

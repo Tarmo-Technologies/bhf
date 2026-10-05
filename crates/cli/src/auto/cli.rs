@@ -37,7 +37,8 @@ RECOMMENDED SWEEP:
     --debug
 
   --work-dir   where everything lands; keep it OUTSIDE the scanned tree
-  --jobs       targets built+fuzzed at once; peak RAM is ~jobs x --rss-limit-mb
+  --jobs       targets built+fuzzed at once; child RAM is ~jobs x --rss-limit-mb
+               leave additional room for BHF, compiler processes, and the OS
   --per-target-time  fuzz seconds per target (libFuzzer -max_total_time parity)
   --campaign-time    hard cap for the whole sweep, in seconds
   --max-targets      stop once N targets actually FUZZED (failures don't count)
@@ -61,6 +62,18 @@ fn parse_positive_mib(value: &str) -> std::result::Result<usize, String> {
         .filter(|parsed| *parsed > 0)
         .ok_or_else(|| format!("expected a positive MiB value, got {value:?}"))
 }
+
+pub(crate) const FIRST_RUN_HELP: &str = "\
+Discover targets, generate harnesses, build, fuzz, and write reports.
+
+FIRST RUN:
+  bhf auto /path/to/source --work-dir /path/to/bhf_work \\
+    --jobs 1 --max-targets 1 --per-target-time 10
+
+Keep the work directory outside the source tree. Install the compiler or
+interpreter for the languages you select. Read results/INDEX.md for findings
+and auto/summary.txt for targets that built, fuzzed, or were skipped.
+Add --resume to the same command to continue a stopped run.";
 
 #[derive(Debug, clap::Args)]
 #[command(after_help = RECOMMENDED_SWEEP, after_long_help = RECOMMENDED_SWEEP)]
@@ -101,7 +114,7 @@ pub struct AutoArgs {
     #[arg(long = "config", value_name = "PATH")]
     pub config: Option<PathBuf>,
 
-    /// #91: operator override for the governing Ada project (`.gpr`). By default
+    /// Override the governing Ada project (`.gpr`). By default
     /// `auto` selects the project that OWNS each target's source (the non-aggregate
     /// component whose active Source_Dirs contain it); pass this to force a specific
     /// project when a multi-project layout is ambiguous. The same project is used
@@ -187,7 +200,7 @@ pub struct AutoArgs {
     )]
     pub min_target_time: Option<u64>,
 
-    /// #94: cap on the number of targets that reach the FUZZ phase (successful
+    /// Cap on the number of targets that reach the FUZZ phase (successful
     /// builds), NOT on candidates inspected. The sweep attempts ranked candidates
     /// in order and stops once N of them fuzz; unsupported params and build
     /// failures never consume the cap, so lower-ranked viable endpoints are
@@ -197,7 +210,7 @@ pub struct AutoArgs {
     #[arg(long = "max-targets", value_name = "N")]
     pub max_targets: Option<usize>,
 
-    /// #94: hard ceiling on the number of ranked candidates INSPECTED (built/
+    /// Hard ceiling on the number of ranked candidates INSPECTED (built/
     /// attempted), independent of how many fuzz. Bounds a huge legacy tree where
     /// most candidates are nonviable so `--max-targets` backfill can't grind the
     /// whole tree. Unset (default) = inspect as many as needed to reach the
@@ -233,8 +246,8 @@ pub struct AutoArgs {
     /// host's parallelism (capped, minimum 1); pass `--jobs 1` for the historical
     /// serial sweep. Up to N targets' build+fuzz run in parallel via a bounded
     /// worker pool. MEMORY: each concurrent fuzz uses up to `--rss-limit-mb` of
-    /// RAM, so effective peak memory is roughly `jobs x rss-limit-mb` — size it to
-    /// the host (a too-high value OOM-kills, e.g. inside a cgroup MemoryMax slice),
+    /// RAM. Budget `jobs x rss-limit-mb` for children plus BHF, compiler, and OS
+    /// overhead (a too-high value OOM-kills, e.g. inside a cgroup MemoryMax slice),
     /// which is why the default is half the cores rather than all of them.
     /// Results are aggregated deterministically regardless of completion order.
     /// Ada targets build serially regardless: they share the staged source tree.

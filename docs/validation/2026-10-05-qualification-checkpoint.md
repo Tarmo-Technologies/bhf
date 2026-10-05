@@ -14,7 +14,8 @@ force pushes/deletions disabled. No required-review entry appeared in the
 protection response. The listed Copilot ruleset is disabled; no settings changed.
 PR #91 had no submitted reviews. Earlier-head CI is not acceptance of this work.
 
-Available local runner: 6 CPUs, 13 GiB RAM, 8 GiB swap, 179 GiB free disk;
+Local runner at the initial checkpoint: 6 CPUs, 13 GiB RAM, 8 GiB swap,
+179 GiB free disk;
 Docker 29.1.3, unprivileged workload support. No new paid resources authorized.
 Build concurrency: one image, two Cargo jobs. Functional containers: disconnected,
 read-only root, at most 4 GiB RAM, 512 PIDs, two CPUs, disposable work/tmp space.
@@ -25,13 +26,13 @@ No external projects or credentials are mounted into these functional checks.
 | Area | Action and evidence status |
 |---|---|
 | Language selection | Shared resolver implemented. The exact `12d6066` default, sixteen singleton, and three mixed images passed construction, selection receipt, exclusion, and lifecycle checks. |
-| Native installation | Shared resolver, pre-side-effect rejection, dry-run dependency closure, and authenticated install/tamper/upgrade/rollback tests passed 30/30. Fresh bundles passed signed archive verification, installation, and a C target-entry smoke. Exact CI binaries then passed authenticated installation on the seven supported Linux releases. Hosted Windows archive extraction and execution passed; tag-built component installers remain a release-workflow gate. |
+| Native installation | Shared resolver, pre-side-effect rejection, dry-run dependency closure, and authenticated install/tamper/upgrade/rollback tests passed 30/30. Fresh bundles passed signed archive verification, installation, and a C target-entry smoke. Exact CI binaries passed authenticated installation on seven supported Linux releases. Actual generated CLI/daemon installers and native C execution also passed on the retained Server 2019 and Windows 11 guests. The new pre-tag installer CI gates exposed defects still being validated in the final fix pass. |
 | Default no AI | Selected CLI/daemon compiled graph excludes `llm_harness_gen`; all twenty images passed dummy-provider and command/MCP exposure controls. |
 | Functional controls | All sixteen BHF-owned clean controls entered non-stub targets through public `bhf auto`, executed inputs, produced measured feedback, and emitted valid JSON. Dependency-bearing Java controls also passed. |
 | Artifact sizes | Exact local configuration IDs and unpacked bytes recorded for twenty images. The exact-head default image's compressed Docker archive and complete review archive are also recorded. Compressed and largest-layer comparison remains incomplete across every subset. |
 | Inventory and signing | Independent verifier tests passed 8/8. Exact-head inventory, scan, acceptance record, BHF source, and all 108 requested Ubuntu source packages are in an unsigned review archive. The scan has zero policy blockers and 829 residual matches requiring review; no publisher key creation or release publication occurred. |
 | 100 upstream projects | No frozen verified 100-project manifest or scored trials produced. Unrun; no success rate claimed. |
-| Release support | Sixteen-language target-entry, supported-Linux authenticated installation, hosted Windows archive execution, and an exact-head unsigned redistribution archive passed. The 100-project qualification, tag-built installer artifacts, redistribution review, protected human risk review, and publisher-authenticated handoff remain blockers. |
+| Release support | Sixteen-language target-entry, supported-Linux authenticated installation, retained Windows component installation/native execution, and source-bound unsigned redistribution archives passed. Final installer CI, the 100-project qualification, redistribution review, and publisher-authenticated handoff remain incomplete. The user excluded protected human approval from this execution; no protected workflow setting or review decision was changed. |
 | Optional limits | Physical boards, arbitrary RTOS fidelity, Windows ETW and broad private-resource Rust remain scoped capability limitations. |
 
 The 100-project qualification budget is up to 50 CPU-hours of requested target
@@ -208,10 +209,69 @@ rebuilt from the documentation-review commit.
 
 Raw execution evidence is retained locally under
 `/tmp/bhf-qualification-20261005`; this is a workspace location, not a contractor
-download link. The 100-project sweep, actual native package installation on every
-supported Windows client, tag-built component installers, redistribution and
-residual-risk review, and publisher-authenticated handoff remain unrun or
-incomplete. Decision remains **NOT_READY**.
+download link. The 100-project sweep, final generated-installer CI, redistribution
+and residual-risk review, and publisher-authenticated handoff remain unrun or
+incomplete. Decision remains **NOT_READY**. Protected human approval is outside
+this execution at the user's request; it has not been recorded as granted.
+
+## Proxmox and installer follow-up
+
+Proxmox SSH aliases now select the existing key for `proxmox`, `10.100.0.1`,
+`ms01`, and `192.168.48.22`. Each alias checks the existing trusted host record
+for `10.100.0.1`. Direct IP and hostname authentication passed. The retained
+Windows Server 2019, Windows 11 25H2, and Windows 11 LTSC 2024 guests then passed
+actual generated component installation and native C execution. Their source
+identity, artifact hashes, scoped results, and VM cleanup are recorded in the
+[Windows installer results](2026-10-05-windows-installer-results.md).
+
+The new CI installer checks exposed three issues: the host-owned checkout was
+not trusted inside the EL7 build container; Python inherited incompatible
+PowerShell 7 module paths when launching Windows PowerShell 5.1; and global
+cargo-dist installer generation incorrectly advertised glibc 2.31 instead of
+the ABI-checked 2.17 baseline. The fixes trust only the container checkout,
+clear inherited module paths in the child test environment, and explicitly
+declare the Linux target's validated glibc floor. Release builds also retain
+the exact source commit in their CLI and daemon version output.
+
+A fresh all-language image at
+`86bea93c73d513ec59d5021bb7f08670ed11c242` passed sealed container acceptance.
+Its configuration digest is
+`sha256:b9754f624ad042c76d8c46cc50d2aa1a4185038354e7602c17a4583121e532db`;
+its scan hashes to
+`2a9012e9deefda15416c0d6dbb036f10cc405cd7a6d1f29fe3b2ee6b41e0cf41`
+and again records zero policy blockers and 829 residual matches. The matching
+unsigned archive contains the tested image, exact BHF source, the same 108
+requested Ubuntu source packages, inventories, notices, and sealed evidence.
+The packager rechecked the downloaded-source checksums and exact installed
+source-version requests before reusing those files. The archive is
+2,263,880,329 bytes and hashes to
+`b5ba99e4baf0ec59c718220b1f63e637607142989320c61c53e8642770b9c83b`.
+It represents that source snapshot, before the final glibc metadata correction
+and documentation update; it remains unsigned.
+
+The retained `27fa1bb` redistribution review files now also include 64 packaged
+toolchain notice texts and their hashes. That JSON hashes to
+`972081931f44f337c02bbfbc14cc7cf3cb66ee7dcfb67557bfa9ba4ee1cc26f2`.
+Literal component-name references were found for 105 of the 1,549 records with
+missing scanner license metadata. These are unreviewed text pointers, not
+license assignments. The matching `dotnet8` corresponding-source request is
+present. This material does not complete redistribution review.
+
+PR #91's cancelled dogfood check was rerun and passed. Its other checks remain
+successful; the PR is still open. No merge, version tag, publisher signature,
+or new GitHub release has been made.
+
+The customer documentation pass corrected a failing full-bundle command:
+README and the site installation guide now pass the required external trust
+policy and verify the detached archive signature before extraction. The offline
+update example uses the same procedure. README and the two main help screens
+begin with a serial, one-target run and identify the results and skipped-target
+reports. Language defaults and the distinct `auto`/standalone `fuzz` corpus
+budgets were reconciled with the implementation. All 166 Markdown documents
+were rescanned for drafting residue and vague promotional language. Site/link
+generation, SPDX validation, 239 CI policy tests, existing help contracts, and
+13 release/document contract tests passed locally. The final packaged customer
+workflow still needs execution against the rebuilt artifacts.
 
 The compact matrix identities, sizes, per-language owned-control measurements,
 and scan hashes are in the

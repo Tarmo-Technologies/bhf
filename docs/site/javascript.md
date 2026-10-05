@@ -130,7 +130,7 @@ A 30-project campaign over the most-depended-on npm libraries — express, lodas
 axios, moment, validator.js, node-semver, marked, joi, qs, node-fetch, and more:
 
 - **2,018 JS files scanned, 531 fuzzable functions discovered, 0 bhf panics** —
-  discovery is robust across CommonJS and ESM, minified and hand-written code
+  the corpus included CommonJS and ESM, minified and hand-written code
   (validator.js alone → 111 targets, moment → 162). The first-argument name filter
   keeps internal array/options helpers (`multilineRegexp(parts)`) out of the fuzz
   set.

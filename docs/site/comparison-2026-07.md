@@ -111,7 +111,7 @@ everywhere.
   XML namespaces).
 
 Net: **no new noise in the measured corpus** — BHF-547/548 fire 0 times across the corpus's clean code and
-only on genuinely unsafe constructs; BHF-546 added 23 real findings across the two
+only on unsafe constructs; BHF-546 added 23 real findings across the two
 Python repos with zero false positives.
 
 ## 3. SBOM / SCA — component discovery and CVE correlation

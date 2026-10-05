@@ -23,7 +23,7 @@
 ### P0 — Structural gaps that flip a whole feature from "behind" to "leading"
 
 1. **SBOM CVE correlation: bhf finds 0 CVEs everywhere; grype finds 11 (py_click) + 1 (java_gson).**
-   Root cause is measured, not the DB: bhf parses `pyproject.toml`/`pom.xml` with `version: null`; a null version can't match a CVE range. **Fix: ingest lockfiles** — `uv.lock`, `poetry.lock`, pinned `requirements.txt`, `package-lock.json`/`pnpm-lock.yaml`, `Cargo.lock`, maven transitive resolution. This single fix closes **both** the CVE gap (pinned versions) **and** the Python transitive-depth gap (81 vs 30). Highest-leverage item in the whole campaign.
+   Root cause is measured, not the DB: bhf parses `pyproject.toml`/`pom.xml` with `version: null`; a null version can't match a CVE range. **Fix: ingest lockfiles** — `uv.lock`, `poetry.lock`, pinned `requirements.txt`, `package-lock.json`/`pnpm-lock.yaml`, `Cargo.lock`, maven transitive resolution. This single fix closes **both** the CVE gap (pinned versions) **and** the Python transitive-depth gap (81 vs 30). The campaign ranks this fix first.
 
 2. **Static Python py_click zero-finding miss: bhf 0 vs bandit 23 substantive vs semgrep 3.**
    On a 17.8k-SLOC repo with no taint-reachable sink, bhf goes silent (24 `unresolved_project_local_call` gaps, 0 findings). **Fix: add non-taint syntactic Python rules** for the classes bandit's B603/B607/B110/B311 catch — `subprocess` partial-path/`shell=` exec (CWE-78/426), `try/except/pass` swallowing (CWE-703), non-crypto `random.*` in security context (CWE-330). Also verify why the existing weak-PRNG rule (BHF-428) didn't fire on py_click's 3 `random` sites — likely context-gate too strict or Python lane not wired to BHF-428.

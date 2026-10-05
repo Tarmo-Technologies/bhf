@@ -261,6 +261,9 @@ jobs:
               # The runner checkout is owned by the host user, while this
               # disposable container runs as root. Trust this mount only.
               git config --global --add safe.directory /io
+              export BHF_RELEASE_VERSION=1
+              BHF_VCS_REF="$(git rev-parse HEAD)"
+              export BHF_VCS_REF
               curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
               export PATH="$CARGO_HOME/bin:$PATH"
               test -x /opt/python/cp312-cp312/bin/python3
@@ -274,8 +277,6 @@ jobs:
               cargo test --locked -p bhf --test offline_dist_scripts -- --nocapture
               cargo build --locked --release --workspace
               scripts/check-linux-release-abi.sh "$CARGO_TARGET_DIR/release"
-              export BHF_RELEASE_VERSION=1
-              export BHF_VCS_REF="$(git rev-parse HEAD)"
               curl --proto "=https" --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh | sh
               dist build --artifacts=local --target=x86_64-unknown-linux-gnu --output-format=json > /io/target/component-local-manifest.json
               dist build --artifacts=global --output-format=json > /io/target/component-global-manifest.json

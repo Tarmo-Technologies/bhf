@@ -55,8 +55,8 @@ Fortran memory-safety defects and applies behavioral taint oracles.
 A 20-project campaign over 40,367 real Fortran files (the most-starred Fortran
 projects — LAPACK, CP2K, NWChem, FDS, neural-fortran, flibs, …):
 
-- **0 bhf panics** across all 40,367 files — discovery is robust on massive,
-  varied scientific Fortran.
+- **0 bhf panics** while discovering targets in the campaign's 40,367
+  scientific Fortran files.
 - **13,406 fuzzable procedures discovered** (Fortran has a large character-argument
   surface — string handling, file paths, format processing).
 - **Standalone free-form subroutines fuzz and find real bugs**: a heap out-of-bounds

@@ -18,6 +18,10 @@ The checks use local artifact URLs, temporary install prefixes, archive and
 installed-binary hash comparisons, and exact source/version identity. They do
 not publish a release or authenticate a publisher.
 
+The `x86_64-unknown-linux-gnu` installer metadata requires glibc 2.17, matching
+the manylinux2014 build and ABI gate. This explicit cargo-dist setting prevents
+global installer generation on a newer host from raising the advertised floor.
+
 - [ ] The `build-local-artifacts` job builds the full distribution archive with
       `scripts/package-offline-dist.sh` and its `.sha256` sidecar.
 - [ ] The archive-content gate fails the release if any mandatory root file is

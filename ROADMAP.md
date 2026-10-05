@@ -2512,7 +2512,7 @@ temp-file/FS error rather than recording it as a missing dependency.
     "not reachable". The real value is an IN-CRATE build mode: build the harness as
     an integration test / example INSIDE the target crate so a private-module type
     (`crate::internal::Parser`) is reachable by its full path, instead of as an
-    external staticlib that genuinely can't see private items. Needs build-mode
+    external staticlib that can't see private items. Needs build-mode
     detection + emitting the full `crate::internal::...` path + the in-crate cargo
     wiring. Area: `auto/rust_build`. **SHIPPED 2026-06-28**: a private-module `pub`
     target (E0603 externally) is now detected in `resolve_target` (the two
@@ -2701,7 +2701,7 @@ with a `not fuzzed: <reason>` status, never silently dropped.
 
 ### Phase 1 — Tier-1 floor-lowering (no new parsers)
 
-- **1a (#471):** `c_runtime/bhf_decode.h` is genuinely C89-clean (the
+- **1a (#471):** `c_runtime/bhf_decode.h` is C89-clean (the
   runtime-value compound initializer became field assignment), verified under
   `-std=c89/c90/gnu89 -ansi -pedantic-errors`. Under the hybrid strategy the C
   harness builds with a modern `clang -std=c89` and C++11/14 targets build via
@@ -2745,7 +2745,7 @@ rather than degrading.
 - Compile-level **K&R** fuzzing (building the recovered prototype under `-std=c89`
   via an `AUTO_EXTRA_CFLAGS` injection) is the richer follow-up; the runtime is
   already C89-clean and the extractor recovers the signatures.
-- Genuinely **cfront** pre-C++98 code that the permissive tree-sitter-cpp grammar
+- **cfront** pre-C++98 code that the permissive tree-sitter-cpp grammar
   cannot parse at all yields no candidate (documented limitation); modern-C++-
   with-pre-standard-headers is the common, handled case.
 

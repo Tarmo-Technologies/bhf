@@ -105,16 +105,23 @@ pub mod workdir;
 #[command(name = "bhf")]
 #[command(version = env!("BHF_VERSION_FULL"))]
 #[command(long_version = concat!(env!("BHF_VERSION_FULL"), "\ncommit: ", env!("BHF_GIT_COMMIT")))]
-#[command(about = "Offline fuzz lab generator for sixteen-language software estates")]
+#[command(about = "Discover targets, build harnesses, and fuzz your source tree offline")]
 #[command(long_about = "\
-Offline fuzz lab generator for sixteen-language software estates.
+Discover targets, build harnesses, and fuzz your source tree offline.
 
-Scan untrusted source (or binaries), rank fuzzable subprograms, generate typed
-harnesses + stubs, build with your installed toolchains, fuzz with a builtin
-engine or the AFL++ adapter, and emit
-JSON/Markdown/SARIF/JUnit/CSV findings — fully offline.
+START HERE:
+  bhf auto /path/to/source --work-dir /path/to/bhf_work \\
+    --jobs 1 --max-targets 1 --per-target-time 10
 
-Most users want `bhf auto <source-dir>`, which runs the whole pipeline.
+Keep the work directory outside the source tree. Install the compiler or
+interpreter for your selected languages. C/C++ needs clang and make; Windows
+also needs Visual Studio C++ Build Tools and the Windows SDK.
+No model or API key is required.
+
+Read /path/to/bhf_work/results/INDEX.md for findings and
+/path/to/bhf_work/auto/summary.txt for built, fuzzed, and skipped targets.
+Run `bhf auto --help` for language selection, budgets, and build options.
+If BHF itself errors, use `--debug` and `bhf bug-report <work-dir> --preview`.
 
 COMMANDS BY AREA (run `bhf <command> --help` for details):
   Pipeline      auto, scan, list, generate-harness, build, fuzz, report
@@ -164,7 +171,8 @@ struct Args {
 #[derive(Debug, Subcommand)]
 enum Command {
     // ── Pipeline: the source -> findings flow ───────────────────────────────
-    /// End-to-end pipeline: discover targets, generate harnesses, auto-repair the build, fuzz, and report (flagship command)
+    /// Discover targets, generate harnesses, recover builds, fuzz, and write reports
+    #[command(long_about = auto::cli::FIRST_RUN_HELP)]
     Auto(auto::cli::AutoArgs),
     /// Fuzz ONE pasted function with no project/build/deps — detect language, synthesize a one-file project, run the auto pipeline
     Snippet(snippet::SnippetArgs),

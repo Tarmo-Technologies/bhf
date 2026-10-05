@@ -64,7 +64,7 @@ reported separately because neither substitutes for the other.
    C++, C#, Fortran, Java, and Rust projects.
 3. **Framework bootstrapping.** Missing packages and browser, Neovim, Android, or
    Windows hosts remain distinct from generator defects. Local lockfile caches
-   and narrow, disclosed host stubs are the next leverage points.
+   and narrow, disclosed host stubs are the next proposed steps.
 4. **Structured scientific data.** Fortran scientific APIs need coherent bounded
    vectors/matrices plus coupled dimensions, leading dimensions, and alias/intent
    constraints rather than only character control inputs.

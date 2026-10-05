@@ -289,6 +289,8 @@ jobs:
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
       DIST_ARGS: ${{ matrix.dist_args }}
       RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+      BHF_RELEASE_VERSION: "1"
+      BHF_VCS_REF: ${{ github.sha }}
       RHEL7_BUILD_IMAGE: quay.io/pypa/manylinux2014_x86_64@sha256:0d25b049964b2549b83384036abdff06789a8c0b1e9ff003ec80f0d531f79e50
     steps:
       - name: enable windows longpaths
@@ -330,11 +332,15 @@ jobs:
             --env GH_TOKEN \
             --env DIST_ARGS \
             --env RELEASE_TAG \
+            --env BHF_RELEASE_VERSION \
+            --env BHF_VCS_REF \
             --env CARGO_HOME=/tmp/cargo \
             --env RUSTUP_HOME=/tmp/rustup \
             "$RHEL7_BUILD_IMAGE" \
             bash -lc '
               set -euo pipefail
+              # Trust only the host-owned checkout mounted in this container.
+              git config --global --add safe.directory "$PWD"
               curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
               export PATH="$CARGO_HOME/bin:$PATH"
               curl --proto "=https" --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh | sh

@@ -6,7 +6,7 @@ virtualisation shim (`libbhf_runtrace_shim.so`) and the build-time compiler
 interception shim (`libbhf_cc_intercept.so`) next to the binaries, where
 `bhf auto` locates them automatically.
 
-## From source (recommended)
+## From source
 
 Prerequisites:
 
@@ -191,7 +191,7 @@ same individual component.
 
 | Task | Required assets | Optional additions |
 |---|---|---|
-| Complete Linux install with one installer | `bhf-dist-<version>-x86_64-unknown-linux-gnu.tar.gz` and its `.sha256` sidecar; extract it and run `./install.sh` | None; the CLI, daemon, both shims, runtimes, and checksum-verified content are included |
+| Complete Linux install with one installer | Full bundle, `.sha256`, and detached `.sig`; verify before extraction, then run `./install.sh --trust-policy /trusted/operator-policy.json` | Independently supplied verifier, publisher key, and trust policy; the CLI, daemon, both shims, runtimes, and signed content are included |
 | Windows CLI | `bhf-installer.ps1`, or `bhf-x86_64-pc-windows-msvc.zip` and its sidecar | `bhf-daemon-installer.ps1` or the daemon ZIP only for IDE/JSON-RPC/MCP use |
 | Basic Linux CLI, scan, build, and fuzz | `bhf-installer.sh`, or `bhf-x86_64-unknown-linux-gnu.tar.xz` and its sidecar | Add the two Linux shims below for full runtime behavior and complex C/C++ build recovery |
 | Full Linux `bhf auto` | The Linux CLI plus `bhf_runtrace_shim-installer.sh` (or its archive and sidecar) | Add `bhf_cc_intercept` when testing C/C++ projects with real build systems |
@@ -222,6 +222,12 @@ IDE/MCP use. Windows users should ignore the two Linux-only shim assets.
 
 ### Complete Linux installation with the bundled `install.sh`
 
+Obtain the verifier, publisher public key, and operator policy through a trusted
+channel independent of the archive. Verification needs Python 3 and an
+Ed25519-capable OpenSSL; EL7 needs an approved newer OpenSSL or a separate
+verification host. Set `VERSION` to the release you received; the example uses
+the latest published version.
+
 ```sh
 VERSION=0.2.34
 BASE="https://github.com/Tarmo-Technologies/bhf/releases/download/${VERSION}"
@@ -229,10 +235,15 @@ ARCHIVE="bhf-dist-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 
 curl --proto '=https' --tlsv1.2 -fLO "$BASE/$ARCHIVE"
 curl --proto '=https' --tlsv1.2 -fLO "$BASE/$ARCHIVE.sha256"
+curl --proto '=https' --tlsv1.2 -fLO "$BASE/$ARCHIVE.sig"
 sha256sum -c "$ARCHIVE.sha256"
-tar xzf "$ARCHIVE"
+python3 /trusted/verify-offline-dist.py \
+  --archive "$ARCHIVE" --signature "$ARCHIVE.sig" \
+  --trusted-public-key /trusted/publisher.pub \
+  --verified-copy bhf-verified.tar.gz
+tar xzf bhf-verified.tar.gz
 cd "${ARCHIVE%.tar.gz}"
-./install.sh
+./install.sh --trust-policy /trusted/operator-policy.json
 ```
 
 The interactive installer selects language toolchains, compile targets,
@@ -241,7 +252,7 @@ creates `bhf` and `bhf-daemon` symlinks in `/usr/local/bin`.
 For automation:
 
 ```sh
-./install.sh --non-interactive \
+./install.sh --non-interactive --trust-policy /trusted/operator-policy.json \
   --languages c,cpp,rust \
   --targets native \
   --fuzzers builtin \
