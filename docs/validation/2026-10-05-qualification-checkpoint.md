@@ -9,6 +9,21 @@ Live baseline: PR #91 remains open at
 `37582ed1849d18b11e5d6438b049ee6ed5034b69`; main is
 `2e9ea97def2a71e66bf00b5d50d4c5f5a9112bd6`. Version remains 0.2.35.
 Latest published release is 0.2.34; prior releases are preserved.
+The final customer-command check exposed a Windows default-run failure after
+the earlier sanitizer-disabled smoke passed. The first failure was the missing
+Clang ASan DLL search path. After resolving it, the driver's first-chance
+exception handler still terminated valid sanitized inputs. A corrected driver
+completed 64 executions with 11 coverage edges on Server 2019 and detected the
+owned fixture's intentional out-of-bounds write. This is a diagnostic build,
+not final packaged release acceptance. The shared Windows CI smoke now uses
+the README command with default sanitizers and requires executions, coverage,
+and the documented output files. Fresh packaged acceptance remains pending.
+
+The EL7 generated installer now installs successfully past its glibc check;
+the following archive identity check incorrectly counted a license directory
+named `bhf` as a second executable. That check now counts regular files only
+and still rejects missing or duplicate executables. Its three regression tests
+and the full 242-test CI policy suite pass locally.
 Read-only protection lookup: strict `CI acceptance`, admin enforcement enabled,
 force pushes/deletions disabled. No required-review entry appeared in the
 protection response. The listed Copilot ruleset is disabled; no settings changed.

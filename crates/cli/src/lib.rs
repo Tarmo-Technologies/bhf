@@ -371,6 +371,9 @@ where
         return 2;
     }
 
+    #[cfg(windows)]
+    build::activate_windows_clang_runtime();
+
     match args.command {
         Some(Command::Auto(auto_args)) => {
             build::activate_compatible_clang();

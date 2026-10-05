@@ -23,14 +23,16 @@ def digest(path):
 def archive_binary_digest(archive, binary):
     if archive.suffix == ".zip":
         with zipfile.ZipFile(archive) as bundle:
-            matches = [x for x in bundle.infolist() if Path(x.filename).name == binary]
-            if len(matches) != 1 or matches[0].is_dir():
+            matches = [x for x in bundle.infolist()
+                       if not x.is_dir() and Path(x.filename).name == binary]
+            if len(matches) != 1:
                 raise ValueError(f"expected exactly one {binary} in {archive.name}")
             with bundle.open(matches[0]) as stream:
                 return hashlib.file_digest(stream, "sha256").hexdigest()
     with tarfile.open(archive) as bundle:
-        matches = [x for x in bundle.getmembers() if Path(x.name).name == binary]
-        if len(matches) != 1 or not matches[0].isfile():
+        matches = [x for x in bundle.getmembers()
+                   if x.isfile() and Path(x.name).name == binary]
+        if len(matches) != 1:
             raise ValueError(f"expected exactly one {binary} in {archive.name}")
         with bundle.extractfile(matches[0]) as stream:
             return hashlib.file_digest(stream, "sha256").hexdigest()

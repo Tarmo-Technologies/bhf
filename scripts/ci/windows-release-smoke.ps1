@@ -85,16 +85,16 @@ Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation `
 Get-Command link.exe | Format-List Source
 
 $work = "$env:RUNNER_TEMP\bhf-windows-fuzz"
+# Exercise the README first run with the default ASan/UBSan build and pass
+# cascade. A sanitizer-disabled smoke cannot catch missing runtime DLLs or a
+# crash handler that intercepts ASan's handled exceptions.
 & $bhf auto $fixture `
     --work-dir $work `
-    --languages c `
-    --target parse_frame `
-    --iterations 32 `
-    --single-pass `
-    --sanitizers none `
-    --per-target-time 5 `
-    --no-discovery-cache `
+    --jobs 1 `
+    --max-targets 1 `
+    --per-target-time 10 `
     --verbose
+if ($LASTEXITCODE -ne 0) { throw "Default Windows first run failed" }
 $report = Get-Content "$work\auto\run.json" -Raw | ConvertFrom-Json
 if ($report.summary.built_and_fuzzed -ne 1) {
     Get-ChildItem $work -Recurse -File |
@@ -112,4 +112,13 @@ if ($report.summary.built_and_fuzzed -ne 1) {
             Get-Content $_.FullName
         }
     throw "Windows smoke did not build and fuzz parse_frame: $($report.summary | ConvertTo-Json -Compress)"
+}
+$passes = @($report.targets[0].outcome.passes)
+if (-not $passes -or ($passes | Measure-Object executions -Sum).Sum -le 0 -or
+    ($passes | Measure-Object coverage_edges -Maximum).Maximum -le 0) {
+    throw "Default Windows first run did not execute inputs with coverage"
+}
+if (-not (Test-Path "$work\results\INDEX.md") -or
+    -not (Test-Path "$work\auto\summary.txt")) {
+    throw "Default Windows first run did not produce the documented results"
 }
