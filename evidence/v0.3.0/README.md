@@ -1,7 +1,16 @@
 # BHF 0.3.0 release qualification evidence
 
-This branch retains evidence, not a published release. Publication still requires
-the protected CI and release workflow gates.
+This branch retains evidence separately from the published release. Version
+`0.3.0` was published on October 5, 2026 at 17:16:14 America/Chicago from
+`acc63b9951d23411300b188710ad0643dd1a6241`. All required release gates passed.
+The downloaded signed Linux bundle was independently authenticated before
+extraction, and its binary reported that exact version and full commit.
+
+`bhf-v0.3.0-release-qualification.json` binds the campaign to the final release.
+Final CI receipts, release logs, production approval, and independent published
+signature/version observations are retained alongside the campaign archive.
+The campaign archive contains the original RC binary for audit, not installation;
+use the release's signed `bhf-dist-0.3.0-x86_64-unknown-linux-gnu.tar.gz` to install.
 
 `bhf-v0.3.0-100-project-evidence.tar.gz` contains 229 checksum-bound evidence
 files and their `SHA256SUMS`. It includes the exact original candidate binary,

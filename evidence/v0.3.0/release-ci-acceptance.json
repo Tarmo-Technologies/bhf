@@ -1,0 +1,17 @@
+{
+  "accepted": true,
+  "artifact_authenticity": "not_assessed",
+  "blockers": [],
+  "commit": "acc63b9951d23411300b188710ad0643dd1a6241",
+  "decision": "PASS_RELEASE_CI",
+  "deployment_authorization": "not_assessed",
+  "enterprise_readiness": "not_assessed",
+  "evidence_source": "same_run_reusable_workflow_outputs",
+  "full_ci_passed": true,
+  "kind": "release_ci_acceptance",
+  "ref": "refs/tags/0.3.0",
+  "repository": "Tarmo-Technologies/bhf",
+  "run_attempt": "1",
+  "run_id": "37377365906",
+  "schema_version": 1
+}
