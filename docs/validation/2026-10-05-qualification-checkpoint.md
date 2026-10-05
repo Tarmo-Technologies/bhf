@@ -3,7 +3,7 @@
 
 Decision: **NOT_READY**. This record distinguishes executed packaging/functional
 checks from the requested third-party vulnerability-discovery campaign, which
-is not executed in this work. No release or publisher signature is authorized.
+is not executed in this work. No release or publisher signature has been made.
 
 Live baseline: PR #91 remains open at
 `37582ed1849d18b11e5d6438b049ee6ed5034b69`; main is
@@ -24,12 +24,12 @@ No external projects or credentials are mounted into these functional checks.
 
 | Area | Action and evidence status |
 |---|---|
-| Language selection | Implement shared canonical/alias/dependency resolver; build actual subset images; run selection properties and negative cases. Pending. |
-| Native installation | Reuse installer, package resolver with it, reject malformed selections before side effects; test disposable installs. Pending. |
-| Default no AI | Inspect selected compiled graph and run existing CLI/daemon dummy-provider controls. Pending. |
-| Functional controls | Prefer public `bhf auto` on BHF-owned benign fixtures; manual assistance must be labeled. Pending. |
-| Artifact sizes | Compare baseline image/config IDs, package counts, compressed exports and layers. Pending. |
-| Inventory and signing | Reuse existing inventory/scan gate and independent verifier tests; no publisher key creation or release publication. Pending. |
+| Language selection | Shared resolver implemented. The exact `12d6066` default, sixteen singleton, and three mixed images passed construction, selection receipt, exclusion, and lifecycle checks. |
+| Native installation | Shared resolver, pre-side-effect rejection, dry-run dependency closure, authenticated install/tamper/upgrade/rollback tests passed 30/30. Actual disposable OS install matrix remains a release gate. |
+| Default no AI | Selected CLI/daemon compiled graph excludes `llm_harness_gen`; all twenty images passed dummy-provider and command/MCP exposure controls. |
+| Functional controls | All sixteen BHF-owned clean controls entered non-stub targets through public `bhf auto`, executed inputs, produced measured feedback, and emitted valid JSON. Dependency-bearing Java controls also passed. |
+| Artifact sizes | Exact local configuration IDs and unpacked bytes recorded for twenty images. Compressed/archive and largest-layer comparison is still incomplete for every selection. |
+| Inventory and signing | Independent verifier tests passed 8/8. Exact-image inventory and scan completed with zero policy blockers and 829 residual matches requiring review; no publisher key creation or release publication occurred. |
 | 100 upstream projects | No frozen verified 100-project manifest or scored trials produced. Unrun; no success rate claimed. |
 | Release support | Sixteen-language target-entry, exact-head CI, offline native/platform install matrix, license/source completeness and human risk review remain blockers until executed. |
 | Optional limits | Physical boards, arbitrary RTOS fidelity, Windows ETW and broad private-resource Rust remain scoped capability limitations. |
@@ -69,17 +69,41 @@ Additional clean packet/checksum fixtures exercise all sixteen lanes through
 Go replacement-path quoting on spaced paths and missing PHP `pcov` feedback.
 The Go correction passed its 25 builder tests and all four integration tests,
 including real target coverage with spaced source/work directories. The Ruby
-dependency closure and PHP coverage extension are corrected for the next image
-snapshot. The first scalar-only Fortran fixture was ineligible by design; the
-character-input replacement entered successfully and the initial failure remains
-in local evidence. C/C++ spaced paths remain explicitly unsupported by strict
-Makefile input validation. Ordinary-path controls passed for those lanes.
+dependency closure and PHP coverage extension were corrected and passed in the
+final selected images. The first scalar-only Fortran fixture was ineligible by
+design. Its character-input replacement entered successfully, and the initial
+failure remains in local evidence. C/C++ spaced paths remain explicitly
+unsupported by strict Makefile input validation. Ordinary-path controls passed
+for those lanes.
 
 The matrix now supports source/hash-checked resumption, preserves interrupted
 attempt logs, checks ecosystem exclusions, and can require owned automatic
 controls. An explicitly requested workflow matrix gates candidate packaging.
-These changes and their final images still require their own executed matrix;
-the earlier twenty-image results do not certify the corrected implementation.
+The exact `12d6066662daa68cbe242919d311f663d90ea0bf` matrix then passed all
+twenty rows: the all-language default, each of sixteen singleton selections,
+and Java/Python, C/C++/Ada, and JavaScript/TypeScript mixes. Source archive
+SHA-256 was `2f6ff150ec95613cc31527dbbf3427c6d55f4e4fe8f969ce6fda37394479e2a0`.
+Every row passed build, non-root disconnected/read-only runtime, termination,
+malformed-option, dummy-provider/no-LLM, toolchain receipt/exclusion, and owned
+automatic controls. The matrix checkpoint hashes to
+`aa83811a4e6bb652b4a9b703aada7ede8ac3a96f98f3b0b74258efcc6d1e9711`.
+
+The final default image is
+`sha256:a3565b7e4c3c74754ab19068b565d254723e5da0f671bc06dfe6b73dd981f5f8`
+at 3,647,380,700 unpacked bytes. Singleton images range from 1,053,558,558
+bytes (Perl) to 2,096,099,063 bytes (Rust), showing real toolchain exclusion
+rather than inheritance from the full image. The all-language owned-control
+JSON hashes to `f916723ad99fe00c7e6c000197f29f29f1e49d0f9bd2db89d6c182b441f4256a`.
+Each language entered exactly one clean target for 32 executions. Measured edge
+counts were Ada 107, C 6, C++ 18, Rust 27, Java 17, Python 2, Perl 7, Go 14,
+COBOL 37, Fortran 151, C# 5, JavaScript 3, TypeScript 10, Ruby 1, Lua 4,
+and PHP 4. All produced zero findings, as expected for these clean controls.
+These are functionality checks, not the 100-project qualification sweep.
+
+Exact-head CI on PR #92 passed its acceptance gate at `12d6066`, including
+Rust 1.88, build/test, core and default container jobs, RHEL 7/8/9/10,
+Ubuntu 22.04/24.04/26.04, Windows build and Server 2025 compatibility,
+license audit, SBOM, docs, and the hermetic target-entry gate.
 
 Whole-image inventory of the older all-language image
 `sha256:6f7c175dff3751da9c7195219f5810481dfacd0fb13ca1c254ed47fa70cc78d4`
@@ -87,13 +111,23 @@ used checksum-verified Syft 1.46.0 and Grype 0.115.0 with a valid database built
 2026-10-04T08:11:47Z. Its policy result was
 `REQUIRES_PROTECTED_REVIEW: 0 blockers, 829 residual matches` (678 Medium,
 141 Low, 10 Negligible). Residual matches are untriaged; no risk was accepted.
-This inventory predates the new PHP extension and must be repeated on the final
-image. Global Rust formatting also reports pre-existing differences outside the
+The exact final image used the same checksum-verified Syft 1.46.0 and Grype
+0.115.0 database. It contained two additional Debian components from the PHP
+coverage correction and had the same 829 residual matches with zero policy
+blockers. Its CycloneDX inventory hashes to
+`1ed6d80f0ba2de4d9729bc9251f4025a8bce3473161b2e90e0afc60bcf665926`;
+the complete Grype JSON hashes to
+`e27bd156a317f7432fe4c623bb0b3b8d92377fc27247ce17b6ace15beb496794`.
+Residual matches remain untriaged and require protected human review. Global
+Rust formatting also reports pre-existing differences outside the
 changed files; changed Rust files pass their scoped formatting check.
 
 Raw execution evidence is retained locally under
 `/tmp/bhf-qualification-20261005`; this is a workspace location, not a contractor
-download link. Compact committed results and fresh-image dispositions will
-follow. The 100-project sweep, exact-final-source platform acceptance, complete
-redistribution materials, and publisher-authenticated handoff remain unrun or
-incomplete. Decision remains **NOT_READY**.
+download link. The 100-project sweep, actual native package installation on every
+supported OS, complete redistribution materials, and publisher-authenticated
+handoff remain unrun or incomplete. Decision remains **NOT_READY**.
+
+The compact matrix identities, sizes, per-language owned-control measurements,
+and scan hashes are in the
+[language-selection results](2026-10-05-language-selection-results.md).
