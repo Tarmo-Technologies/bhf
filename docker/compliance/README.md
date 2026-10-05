@@ -1,12 +1,16 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Compliance & supply-chain artifacts for the bhf image
 
-bhf is distributed as **source** (Apache-2.0). The project publishes **no
-prebuilt images**, so it distributes no GPL/LGPL binaries and carries no
-corresponding-source offer — you build the image yourself, and Ubuntu is the
-distributor of the toolchain packages it pulls. These files exist so the built
-image is **self-documenting** for supply-chain review / ATO, and so that anyone
-who chooses to *redistribute* the built image can meet the duty they take on.
+bhf source is Apache-2.0. Container images also include separately licensed
+toolchain and runtime packages. The container release path prepares an unsigned
+candidate containing the tested image, matching BHF source, exact requested
+Ubuntu source packages, inventories, notices, and validation evidence. Signing
+and publication require the release gates described in
+[`docs/release-packaging.md`](../../docs/release-packaging.md).
+
+These files provide materials for supply-chain and redistribution review.
+Generated inventories and source downloads do not constitute a completed
+license review or a publisher-authenticated release.
 
 ## Generated into the image at build
 
@@ -25,8 +29,8 @@ OpenVEX) comes from `bhf sbom <source-tree>` separately.
 
 ## Scripts (run outside the image build)
 
-- `fetch-sources.sh [manifest] [dest]` — fulfils the copyleft corresponding-
-  source duty (only relevant if you redistribute the built image). Run as root
+- `fetch-sources.sh [manifest] [dest]` — downloads the exact requested Ubuntu
+  source versions for redistribution review. Run as root
   on an Ubuntu 24.04 host with network.
 - `generate-sbom.sh [out.json]` / `generate-notices.sh [outdir]` — regenerate the
   SBOM / notices from any running image or host.

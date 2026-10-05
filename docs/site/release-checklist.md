@@ -10,6 +10,14 @@ runtimes. This checklist is mandatory for every version.
 
 ## Automated gates (enforced by `.github/workflows/release.yml`)
 
+The full CI called by the release workflow also builds real cargo-dist component
+archives and exercises their generated installers. Linux checks cover the CLI,
+daemon, and both shims on the EL7 ABI. Windows Server 2022 and 2025 each exercise
+the CLI and daemon installers under Windows PowerShell and PowerShell Core.
+The checks use local artifact URLs, temporary install prefixes, archive and
+installed-binary hash comparisons, and exact source/version identity. They do
+not publish a release or authenticate a publisher.
+
 - [ ] The `build-local-artifacts` job builds the full distribution archive with
       `scripts/package-offline-dist.sh` and its `.sha256` sidecar.
 - [ ] The archive-content gate fails the release if any mandatory root file is
