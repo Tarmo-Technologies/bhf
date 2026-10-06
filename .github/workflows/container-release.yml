@@ -34,7 +34,15 @@ jobs:
   language-matrix:
     needs: validate-ci
     if: ${{ inputs.language_matrix }}
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -47,7 +55,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: language-selection-${{ github.run_id }}-${{ github.run_attempt }}
+          name: language-selection-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/selection-evidence/
           if-no-files-found: error
           retention-days: 90
@@ -55,11 +63,16 @@ jobs:
   candidate:
     needs: [validate-ci, language-matrix]
     if: ${{ always() && needs.validate-ci.result == 'success' && (needs.language-matrix.result == 'success' || needs.language-matrix.result == 'skipped') }}
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
-    outputs:
-      archive: ${{ steps.receipt.outputs.archive }}
-      sha256: ${{ steps.receipt.outputs.sha256 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -95,25 +108,26 @@ jobs:
       - name: Archive exact sources, inventory, scan, and image
         env:
           FLAVOR: ${{ inputs.flavor }}
-        run: bash scripts/ci/prepare-container-candidate.sh "$FLAVOR" > candidate-output.json
-      - name: Bind candidate outputs to this commit
-        id: receipt
+        run: |
+          bash scripts/ci/prepare-container-candidate.sh "$FLAVOR" > candidate-output.json
+          cp candidate-output.json dist/container/candidate-output.json
+      - name: Verify candidate source and platform
         run: |
           python3 - <<'PY'
           import json, os, pathlib, re
           receipt = json.loads(pathlib.Path('candidate-output.json').read_text().splitlines()[-1])
           name = pathlib.Path(receipt['archive']).name
+          if receipt['platform'] != 'linux/${{ matrix.arch }}':
+              raise SystemExit('candidate platform mismatch')
           if receipt['source_commit'] != os.environ['GITHUB_SHA'] or not re.fullmatch(r'[A-Za-z0-9._-]+\.tar\.gz', name):
               raise SystemExit('candidate source or filename mismatch')
           if not re.fullmatch('[0-9a-f]{64}', receipt['sha256']):
               raise SystemExit('invalid candidate digest')
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              output.write('archive=' + name + '\nsha256=' + receipt['sha256'] + '\n')
           PY
       - name: Retain reviewable unsigned candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: container-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          name: container-candidate-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: dist/container/
           compression-level: 0
           if-no-files-found: error
@@ -122,7 +136,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: container-review-${{ github.run_id }}-${{ github.run_attempt }}
+          name: container-review-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             container-acceptance/
             container-ada-acceptance/
@@ -132,6 +146,10 @@ jobs:
   sign:
     needs: candidate
     if: ${{ inputs.sign && github.ref_type == 'tag' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     environment: production-release
@@ -142,16 +160,27 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          name: container-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          name: container-candidate-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: candidate
       - name: Sign trusted candidate digest and independently verify
         env:
-          ARCHIVE: ${{ needs.candidate.outputs.archive }}
-          EXPECTED_SHA: ${{ needs.candidate.outputs.sha256 }}
           BHF_RELEASE_SIGNING_KEY_PKCS8_B64: ${{ secrets.BHF_RELEASE_SIGNING_KEY_PKCS8_B64 }}
           BHF_RELEASE_PUBLIC_KEY_HEX: ${{ vars.BHF_RELEASE_PUBLIC_KEY_HEX }}
         run: |
           set -euo pipefail
+          python3 - <<'PYRECEIPT'
+          import json, os, pathlib, re
+          receipt = json.loads(pathlib.Path('candidate/candidate-output.json').read_text().splitlines()[-1])
+          name = pathlib.Path(receipt['archive']).name
+          if receipt['source_commit'] != os.environ['GITHUB_SHA'] or receipt['platform'] != 'linux/${{ matrix.arch }}':
+              raise SystemExit('candidate source or platform mismatch')
+          if not re.fullmatch(r'[A-Za-z0-9._-]+\.tar\.gz', name) or not re.fullmatch('[0-9a-f]{64}', receipt['sha256']):
+              raise SystemExit('invalid candidate filename or digest')
+          pathlib.Path('candidate/signing-input.txt').write_text(name + '\n' + receipt['sha256'] + '\n')
+          PYRECEIPT
+          mapfile -t signing_input < candidate/signing-input.txt
+          ARCHIVE="${signing_input[0]}"
+          EXPECTED_SHA="${signing_input[1]}"
           [[ "$ARCHIVE" =~ ^[A-Za-z0-9._-]+\.tar\.gz$ ]]
           [[ "$BHF_RELEASE_PUBLIC_KEY_HEX" =~ ^[0-9a-f]{64}$ ]]
           signing_dir="$(mktemp -d "$RUNNER_TEMP/bhf-container-signing.XXXXXX")"
@@ -168,7 +197,7 @@ jobs:
       - name: Retain authenticated offline container handoff
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: signed-container-${{ github.run_id }}-${{ github.run_attempt }}
+          name: signed-container-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: candidate/
           compression-level: 0
           if-no-files-found: error

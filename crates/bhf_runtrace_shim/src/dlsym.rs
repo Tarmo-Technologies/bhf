@@ -8,21 +8,11 @@
 //! `dlsym` name would bind back to our own hook and recurse. So we
 //! resolve in two steps:
 //!
-//! 1. `dlvsym(RTLD_NEXT, name, "GLIBC_2.2.5")` — the un-hooked
-//!    versioned lookup, which catches every symbol present in the
-//!    base glibc x86_64 version.
-//! 2. If that fails, the symbol is versioned later than the base
-//!    (e.g. `openat`/`faccessat`/`readlinkat` are `GLIBC_2.4`). Fall
-//!    back to an *unversioned* lookup through the real libc `dlsym`,
-//!    whose address we obtain once via `dlvsym` (so we still never
-//!    re-enter our own hook). `dlsym(RTLD_NEXT, name)` resolves a
-//!    symbol regardless of its version tag.
-//!
-//! The previous single hardcoded `GLIBC_2.2.5` lookup returned NULL
-//! for the `*at` family, and the hooks' null-fallback then called
-//! `libc::openat` — which, because this shim exports `openat`, bound
-//! straight back to the hook and span forever. Step 2 makes the
-//! happy path resolve, so that fallback is no longer reached.
+//! 1. Look up the symbol at the architecture's base glibc version
+//!    with `dlvsym`, which bypasses our hook.
+//! 2. For symbols introduced later, use the real libc `dlsym`,
+//!    resolved once at that base version. This avoids re-entering
+//!    the shim's own `dlsym` hook.
 //!
 //! We cache each resolution in a static AtomicPtr so subsequent
 //! calls are a single relaxed-atomic load.
@@ -30,6 +20,9 @@
 use std::ffi::CStr;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
+#[cfg(target_arch = "aarch64")]
+const GLIBC_BASE_VERSION: &[u8] = b"GLIBC_2.17\0";
+#[cfg(not(target_arch = "aarch64"))]
 const GLIBC_BASE_VERSION: &[u8] = b"GLIBC_2.2.5\0";
 
 /// The real libc `dlsym`, resolved once via the un-hooked `dlvsym`.
@@ -113,5 +106,21 @@ impl ResolvedFn {
         let p = unsafe { resolve(cstr) };
         self.cache.store(p, Ordering::Relaxed);
         p
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn libc_lookup_resolves_base_and_later_symbols() {
+        unsafe {
+            assert!(super::real_dlsym().is_some());
+            for symbol in [c"getpid", c"openat", c"secure_getenv"] {
+                assert!(
+                    !super::resolve(symbol).is_null(),
+                    "failed to resolve {symbol:?}"
+                );
+            }
+        }
     }
 }

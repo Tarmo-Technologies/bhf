@@ -27,11 +27,13 @@ def persist(report, evidence):
     temp.replace(evidence / 'matrix.json')
 
 
-def validate_resume(report, evidence, commit, source_sha, selections=None):
+def validate_resume(report, evidence, commit, source_sha, selections=None, platform=None):
     if report.get('schema_version') != 2:
         raise ValueError('checkpoint predates resumable matrices; retain it and start a new evidence directory')
     if report.get('source_commit') != commit or report.get('source_archive_sha256') != source_sha:
         raise ValueError('source identity differs from checkpoint')
+    if platform is not None and report.get('platform') != platform:
+        raise ValueError('container platform differs from checkpoint; start a new evidence directory')
     recorded = report['selections']
     if selections is not None and selections != recorded:
         raise ValueError('selection order differs from checkpoint')
@@ -67,10 +69,16 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--evidence', required=True, type=pathlib.Path)
     parser.add_argument('--selection', action='append', help='Override default full + 16 singles + 3 mixed matrix')
+    parser.add_argument('--platform', choices=('linux/amd64', 'linux/arm64'),
+                        help='Default: Docker daemon architecture')
     parser.add_argument('--resume', action='store_true', help='Continue the same source and selections, verifying retained evidence hashes')
     parser.add_argument('--auto', action='store_true', default=None,
                         help='Also exercise BHF-owned clean target-entry/coverage controls through bhf auto')
     args = parser.parse_args()
+    platform = args.platform or 'linux/' + subprocess.check_output(
+        ['docker', 'version', '--format', '{{.Server.Arch}}'], text=True).strip()
+    if platform not in ('linux/amd64', 'linux/arm64'):
+        parser.error('requires an x86-64 or ARM64 Docker platform')
     evidence = args.evidence.resolve()
     evidence.mkdir(parents=True, exist_ok=True)
     # The lock prevents two resumptions from assigning the same pending row.
@@ -88,7 +96,7 @@ def main():
     if args.resume:
         try:
             report = validate_resume(json.loads((evidence / 'matrix.json').read_text()),
-                                     evidence, commit, source_sha, args.selection)
+                                     evidence, commit, source_sha, args.selection, platform)
         except (ValueError, KeyError, OSError) as error:
             parser.error(str(error))
         selections = report['selections']
@@ -97,7 +105,7 @@ def main():
     else:
         selections = args.selection or ['all', *LANGUAGES, 'java,python', 'c,cpp,ada', 'javascript,typescript']
         report = {'schema_version': 2, 'kind': 'image-construction-and-benign-runtime-smoke',
-                  'source_commit': commit, 'source_archive_sha256': source_sha,
+                  'source_commit': commit, 'source_archive_sha256': source_sha, 'platform': platform,
                   'qualification_sweep': False, 'results': [], 'selections': selections,
                   'remaining': selections.copy(), 'auto_controls': bool(args.auto)}
     persist(report, evidence)
@@ -115,15 +123,17 @@ def main():
             stage = evidence / f'{index}-attempt-{attempt}'
         stage.mkdir()
         selection_id = hashlib.sha256(selection.encode()).hexdigest()[:10]
-        image = f'bhf:selection-{commit[:12]}-{selection_id}'
+        image = f'bhf:selection-{platform.split("/")[1]}-{commit[:12]}-{selection_id}'
         row = {'requested': selection, 'image': image}
         started = time.monotonic()
-        command = ['bash', 'scripts/build-container-release.sh', image, '--languages', selection]
+        command = ['bash', 'scripts/build-container-release.sh', image, '--languages', selection, '--platform', platform]
         row['build_command'] = command
         row['build_exit'] = run(command, stage / 'build.log')
         row['build_seconds'] = round(time.monotonic() - started, 3)
         if row['build_exit'] == 0:
             identity = json.loads(subprocess.check_output(['docker', 'image', 'inspect', image]))[0]
+            if f'{identity["Os"]}/{identity["Architecture"]}' != platform:
+                raise ValueError('built image platform differs from requested platform')
             row['local_image_id'] = identity['Id']
             row['unpacked_bytes'] = identity['Size']
             (stage / 'image-inspect.json').write_text(json.dumps([identity], indent=2) + '\n')

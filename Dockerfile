@@ -32,8 +32,16 @@ RUN dpkg-deb -x /tmp/ca.deb /tmp/ca \
 
 FROM ubuntu:24.04@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3 AS ubuntu-pinned
 COPY --from=certificates /certificates/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+ARG TARGETARCH
+COPY docker/toolchain-platform.sh /usr/local/share/bhf/toolchain-platform.sh
 ARG UBUNTU_SNAPSHOT=20261004T000000Z
 RUN printf 'APT::Snapshot "%s";\nAPT::Update::Error-Mode "any";\n' "${UBUNTU_SNAPSHOT}" > /etc/apt/apt.conf.d/50snapshot
+# Ubuntu ports sources do not opt into APT's snapshot selector. Use an
+# explicit snapshot URL on ARM64 and avoid filtering it a second time.
+RUN if [ "$TARGETARCH" = arm64 ]; then \
+      printf 'APT::Update::Error-Mode "any";\n' > /etc/apt/apt.conf.d/50snapshot; \
+      printf 'Types: deb\nURIs: https://snapshot.ubuntu.com/ubuntu/%s/\nSuites: noble noble-updates noble-backports noble-security\nComponents: main restricted universe multiverse\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n' "$UBUNTU_SNAPSHOT" > /etc/apt/sources.list.d/ubuntu.sources; \
+    fi
 LABEL io.tarmo.bhf.ubuntu-snapshot="${UBUNTU_SNAPSHOT}"
 
 # Prepare the supported JS/TS tools without shipping npm's dependency tree.
@@ -41,12 +49,13 @@ FROM ubuntu-pinned AS javascript-tools
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ARG BHF_LANGUAGES=all
 COPY scripts/language-selection.sh /selection.sh
-RUN source /selection.sh; languages="$(bhf_resolve_languages "$BHF_LANGUAGES")" || exit; \
+RUN source /usr/local/share/bhf/toolchain-platform.sh; bhf_toolchain_platform "$TARGETARCH"; \
+    source /selection.sh; languages="$(bhf_resolve_languages "$BHF_LANGUAGES")" || exit; \
     mkdir -p /out/usr/local/bin /out/usr/share/bhf/licenses/javascript; \
     if bhf_has_language "$languages" javascript || bhf_has_language "$languages" typescript; then \
       apt-get update && apt-get install -y --no-install-recommends ca-certificates curl xz-utils \
-      && curl --proto '=https' --tlsv1.2 -fsSLo /tmp/node.tar.xz https://nodejs.org/dist/v24.21.0/node-v24.21.0-linux-x64.tar.xz \
-      && echo 'fd8e59d5a511510f6a298afb548f18c7d2b1be404d8b4a27d94fbe49f56cb2d6  /tmp/node.tar.xz' | sha256sum -c - \
+      && curl --proto '=https' --tlsv1.2 -fsSLo /tmp/node.tar.xz "https://nodejs.org/dist/v24.21.0/node-v24.21.0-linux-${BHF_NODE_ARCH}.tar.xz" \
+      && echo "${BHF_NODE_SHA256}  /tmp/node.tar.xz" | sha256sum -c - \
       && mkdir -p /opt/node && tar -xJf /tmp/node.tar.xz --strip-components=1 -C /opt/node \
       && cp /opt/node/bin/node /out/usr/local/bin/node \
       && cp /opt/node/LICENSE /out/usr/share/bhf/licenses/javascript/node-LICENSE \
@@ -62,7 +71,7 @@ RUN source /selection.sh; languages="$(bhf_resolve_languages "$BHF_LANGUAGES")" 
 ########################################  builder  ########################################
 FROM ubuntu-pinned AS builder
 ARG TARGETPLATFORM
-RUN test "${TARGETPLATFORM}" = linux/amd64
+RUN case "${TARGETPLATFORM}" in linux/amd64|linux/arm64) ;; *) echo "unsupported platform: ${TARGETPLATFORM}" >&2; exit 2 ;; esac
 
 ENV DEBIAN_FRONTEND=noninteractive \
     RUSTUP_TOOLCHAIN=1.99.0 \
@@ -77,8 +86,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Pin the reviewed builder Rust version.
-RUN curl --proto '=https' --tlsv1.2 -fsSLo /tmp/rustup-init https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init \
-    && echo '20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c  /tmp/rustup-init' | sha256sum -c - \
+RUN . /usr/local/share/bhf/toolchain-platform.sh; bhf_toolchain_platform "$TARGETARCH"; \
+    curl --proto '=https' --tlsv1.2 -fsSLo /tmp/rustup-init "https://static.rust-lang.org/rustup/archive/1.28.2/${BHF_RUST_HOST}/rustup-init" \
+    && echo "${BHF_RUSTUP_SHA256}  /tmp/rustup-init" | sha256sum -c - \
     && chmod +x /tmp/rustup-init \
     && /tmp/rustup-init -y --profile minimal --default-toolchain 1.99.0 \
     && rm /tmp/rustup-init \
@@ -93,16 +103,18 @@ ARG BHF_SOURCE_SHA256=unknown
 # Build the release packages. Cache the registry and target dir across rebuilds,
 # then lift just the artifacts out of the cache mount into a real layer.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,target=/src/target,sharing=locked \
-    mkdir -p /out \
-    && BHF_RELEASE_VERSION=1 BHF_VCS_REF="${VCS_REF}" cargo build --locked --release -p bhf -p bhf-daemon -p bhf_runtrace_shim -p bhf_cc_intercept --jobs "${CARGO_BUILD_JOBS}" --message-format=json > /out/cargo-messages.jsonl \
+    --mount=type=cache,id=bhf-target-${TARGETARCH},target=/src/target,sharing=locked \
+    . /usr/local/share/bhf/toolchain-platform.sh \
+    && bhf_toolchain_platform "$TARGETARCH" \
+    && mkdir -p /out \
+    && BHF_RELEASE_VERSION=1 BHF_VCS_REF="${VCS_REF}" cargo build --locked --release -p bhf -p bhf-daemon -p bhf_runtrace_shim -p bhf_cc_intercept --jobs "${CARGO_BUILD_JOBS}" --message-format=json-render-diagnostics > /out/cargo-messages.jsonl \
     && cp target/release/bhf            /out/bhf \
     && cp target/release/bhf-daemon     /out/bhf-daemon \
     && cp target/release/libbhf_runtrace_shim.so /out/libbhf_runtrace_shim.so \
     && cp target/release/libbhf_cc_intercept.so  /out/libbhf_cc_intercept.so \
     && strip /out/bhf /out/bhf-daemon /out/*.so \
     && python3 scripts/ci/rust-image-inventory.py --artifacts /out --messages /out/cargo-messages.jsonl \
-         --commit "${VCS_REF}" --source-sha "${BHF_SOURCE_SHA256}"
+         --commit "${VCS_REF}" --source-sha "${BHF_SOURCE_SHA256}" --target "${BHF_RUST_HOST}"
 
 ########################################  runtime  ########################################
 FROM ubuntu-pinned AS runtime
@@ -111,7 +123,7 @@ ARG BHF_LANGUAGES=all
 ARG BHF_ENGINES=default
 COPY scripts/language-selection.sh /usr/local/share/bhf/language-selection.sh
 ARG TARGETPLATFORM
-RUN test "${TARGETPLATFORM}" = linux/amd64
+RUN case "${TARGETPLATFORM}" in linux/amd64|linux/arm64) ;; *) echo "unsupported platform: ${TARGETPLATFORM}" >&2; exit 2 ;; esac
 
 ENV DEBIAN_FRONTEND=noninteractive \
     LANG=C.UTF-8 \
@@ -132,13 +144,13 @@ RUN source /usr/local/share/bhf/language-selection.sh; \
 
 # Go from upstream (pinned + checksum-verified).
 ARG GO_VERSION=1.27.1
-ARG GO_SHA256=63d339f0da5ab53635a56f2490a7984dfe12dfcff22ad749f63edaf590168445
 RUN source /usr/local/share/bhf/language-selection.sh; \
     languages="$(cat /usr/local/share/bhf/selected-languages.txt)"; \
     if bhf_has_language "$languages" go; then \
+    source /usr/local/share/bhf/toolchain-platform.sh; bhf_toolchain_platform "$TARGETARCH"; \
     curl --proto '=https' --tlsv1.2 -fsSLo /tmp/go.tgz \
-        "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" \
-    && echo "${GO_SHA256}  /tmp/go.tgz" | sha256sum -c - \
+        "https://go.dev/dl/go${GO_VERSION}.linux-${BHF_GO_ARCH}.tar.gz" \
+    && echo "${BHF_GO_SHA256}  /tmp/go.tgz" | sha256sum -c - \
     && tar -C /usr/local -xzf /tmp/go.tgz \
     && rm -f /tmp/go.tgz \
     && /usr/local/go/bin/go version ; \
@@ -249,7 +261,7 @@ ENV BHF_RUNTRACE_SHIM=/usr/local/lib/bhf/libbhf_runtrace_shim.so \
     CARGO_HOME=/home/fuzzer/.cargo \
     PATH=/home/fuzzer/.cargo/bin:/usr/local/go/bin:/usr/local/dotnet-tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-# Sanitizer defaults tuned for containerised fuzzing. bhf sets the AFL/ASan
+# Sanitizer defaults tuned for containerized fuzzing. bhf sets the AFL/ASan
 # keys it strictly needs per-invocation; these are safe process-wide defaults.
 ENV ASAN_OPTIONS=abort_on_error=1:handle_abort=1:allocator_may_return_null=1 \
     UBSAN_OPTIONS=abort_on_error=1 \
@@ -284,8 +296,9 @@ ENV BHF_RUST_NIGHTLY=nightly-2026-06-10
 RUN source /usr/local/share/bhf/language-selection.sh; \
     languages="$(cat /usr/local/share/bhf/selected-languages.txt)"; \
     if bhf_has_language "$languages" rust; then \
-    curl --proto '=https' --tlsv1.2 -fsSLo /tmp/rustup-init https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init \
-    && echo '20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c  /tmp/rustup-init' | sha256sum -c - \
+    source /usr/local/share/bhf/toolchain-platform.sh; bhf_toolchain_platform "$TARGETARCH"; \
+    curl --proto '=https' --tlsv1.2 -fsSLo /tmp/rustup-init "https://static.rust-lang.org/rustup/archive/1.28.2/${BHF_RUST_HOST}/rustup-init" \
+    && echo "${BHF_RUSTUP_SHA256}  /tmp/rustup-init" | sha256sum -c - \
     && chmod +x /tmp/rustup-init \
     && /tmp/rustup-init -y --profile minimal --default-toolchain nightly-2026-06-10 \
     && rm /tmp/rustup-init \
@@ -338,7 +351,7 @@ CMD ["--help"]
 # `docker build --target runtime ...` (the validation Compose profile uses it).
 FROM ubuntu-pinned AS core
 ARG TARGETPLATFORM
-RUN test "${TARGETPLATFORM}" = linux/amd64
+RUN case "${TARGETPLATFORM}" in linux/amd64|linux/arm64) ;; *) echo "unsupported platform: ${TARGETPLATFORM}" >&2; exit 2 ;; esac
 ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 LC_ALL=C.UTF-8
 RUN apt-get update && apt-get -y dist-upgrade && apt-get install -y --no-install-recommends \
       ca-certificates clang llvm lld libclang-rt-18-dev make git file tini python3 \

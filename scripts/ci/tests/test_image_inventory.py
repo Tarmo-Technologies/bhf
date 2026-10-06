@@ -58,6 +58,16 @@ class InventoryTests(unittest.TestCase):
         result = self.merge()
         self.assertEqual(result["dependencies"][0]["dependsOn"], sorted(RUST.PACKAGES))
 
+    def test_arm64_inventory_requires_matching_compiler_target(self):
+        self.inspect[0]["Architecture"] = "arm64"
+        with self.assertRaisesRegex(ValueError, "features/platform"):
+            self.merge()
+        self.receipt["target"] = "aarch64-unknown-linux-gnu"
+        self.assertEqual(self.merge()["dependencies"][0]["dependsOn"], sorted(RUST.PACKAGES))
+        self.inspect[0]["Architecture"] = "amd64"
+        with self.assertRaisesRegex(ValueError, "features/platform"):
+            self.merge()
+
     def test_changed_binary_fails(self):
         (self.binaries / "bhf").write_bytes(b"different binary")
         with self.assertRaisesRegex(ValueError, "hash mismatch"):

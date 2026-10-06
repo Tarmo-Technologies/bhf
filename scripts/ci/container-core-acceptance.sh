@@ -27,6 +27,7 @@ bash scripts/build-container-release.sh "$image" --flavor core > "$evidence/buil
 
 docker image inspect "$image" > "$evidence/image-inspect.json"
 image_id="$(docker image inspect --format '{{.Id}}' "$image")"
+platform="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image")"
 image_size="$(docker image inspect --format '{{.Size}}' "$image")"
 # Observed local core build on 2026-10-04: 845,186,284 unpacked bytes.
 # Leave room for reviewed security-package updates within this reduced profile.
@@ -39,13 +40,13 @@ cat > "$evidence/identity.txt" <<IDENTITY
 source_commit=$commit
 source_archive_sha256=$source_sha
 version=$version
-platform=linux/amd64
+platform=$platform
 local_image_id=$image_id
 unpacked_size_bytes=$image_size
 gzip_docker_archive_bytes=$compressed_size
 IDENTITY
 
-run=(docker run --rm --platform linux/amd64 --network none --read-only
+run=(docker run --rm --platform "$platform" --network none --read-only
   --tmpfs /tmp:rw,exec,nosuid,size=1g --shm-size 2g --memory 4g --pids-limit 512
   --cap-drop ALL --cap-add SYS_PTRACE --security-opt no-new-privileges:true
   --volume "$volume:/work" --volume "$PWD/docker/fixtures/c-core:/src:ro")
@@ -71,6 +72,7 @@ grep -Fq "$commit" "$evidence/daemon-version.log"
 "${run[@]}" "$image_id" sh -c 'dpkg-query -W | wc -l' > "$evidence/os-package-count.txt" 2>&1
 
 # Reconcile the filesystem and compiled Cargo inventory; retain the DB-bound scan.
+bash scripts/ci/container-native-fuzz-acceptance.sh "$image_id" "$evidence"
 bash scripts/ci/container-runtime-acceptance.sh "$image_id" "$evidence"
 bash scripts/ci/inventory-image.sh "$image_id" "$evidence"
 python3 scripts/ci/review-image-scan.py "$evidence"

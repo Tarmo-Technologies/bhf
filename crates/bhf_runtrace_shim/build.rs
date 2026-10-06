@@ -4,6 +4,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/hooks/format_hooks.c");
     println!("cargo:rerun-if-changed=src/hooks/assertion.rs");
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_OS");
+    println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ARCH");
 
     // The runtrace shim is an LD_PRELOAD library and is only distributed on
     // Linux. cargo-dist can still compile every release package while it
@@ -11,6 +12,13 @@ fn main() {
     // cdylib free of GNU headers and linker arguments.
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
         return;
+    }
+
+    // Rust's AArch64 GNU target uses GNU ld by default. It rejects combining
+    // rustc's cdylib export map with the C-hook map below; LLVM lld supports
+    // both. The ARM64 Linux build therefore requires lld (included in Docker).
+    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64") {
+        println!("cargo:rustc-cdylib-link-arg=-fuse-ld=lld");
     }
 
     let out_dir = std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR set"));

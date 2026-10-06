@@ -9,6 +9,7 @@ compose file. Full usage guide: **[docs/site/docker.md](../docs/site/docker.md)*
 |---|---|
 | `../Dockerfile` | Multi-stage, hardened image: builds bhf, installs all 16 language toolchains + AFL++ + Rust nightly + SharpFuzz, runs as non-root `fuzzer` under `tini`. |
 | `../.dockerignore` | Keeps the build context to the Rust workspace + runtime source trees. |
+| `toolchain-platform.sh` | Verified Go, Node.js, and rustup archive pins for Linux x86-64 and ARM64. |
 | `entrypoint.sh` | Dispatches `docker run IMAGE …` to `bhf` / `bhf-daemon` / `bhf-sweep` / a shell. |
 | `sweep-manifest.tsv` | The 32-project validation corpus — 2 small, SHA-pinned, real projects per language. |
 | `fetch-corpus.sh` | Clones the manifest's projects at their pinned revisions (`bhf-fetch-corpus`). |

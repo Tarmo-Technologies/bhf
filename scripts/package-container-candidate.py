@@ -49,7 +49,10 @@ def main():
     if not list(args.sources.glob("*.dsc")):
         raise ValueError("missing corresponding source archives")
     subprocess.run(["python3", "scripts/ci/review-image-scan.py", str(args.evidence)], check=True)
-    name = f'bhf-container-{receipt["version"]}-{flavor}-{commit[:12]}'
+    platform = f'{image["Os"]}/{image["Architecture"]}'
+    if platform not in ("linux/amd64", "linux/arm64"):
+        raise ValueError("unsupported container platform")
+    name = f'bhf-container-{receipt["version"]}-{flavor}-{image["Architecture"]}-{commit[:12]}'
     args.out.mkdir(parents=True, exist_ok=True)
     archive = args.out / f"{name}.tar.gz"
     if archive.exists():
@@ -78,7 +81,7 @@ def main():
             subprocess.run(["docker", "save", image["Id"]], stdout=stream, check=True)
         manifest = {"schema_version": 1, "state": "requires_detached_signature",
                     "source_commit": commit, "source_archive_sha256": receipt["source_archive_sha256"],
-                    "version": receipt["version"], "flavor": flavor, "platform": "linux/amd64",
+                    "version": receipt["version"], "flavor": flavor, "platform": platform,
                     "image_config_digest": image["Id"], "registry_manifest_digest": None,
                     "features": "default-no-llm", "files": {}}
         for path in sorted(root.rglob("*")):
@@ -92,7 +95,7 @@ def main():
     digest = sha256(archive)
     (args.out / f"{name}.tar.gz.sha256").write_text(f"{digest}  {archive.name}\n")
     print(json.dumps({"archive": str(archive), "sha256": digest, "source_commit": commit,
-                      "archive_bytes": archive.stat().st_size,
+                      "archive_bytes": archive.stat().st_size, "platform": platform,
                       "image_config_digest": image["Id"], "state": "unsigned_candidate"}))
 
 

@@ -47,6 +47,14 @@ class ResumeTests(unittest.TestCase):
             with self.subTest(overrides=overrides), self.assertRaises(ValueError):
                 self.validate(**overrides)
 
+    def test_rejects_resume_on_another_architecture(self):
+        self.report['platform'] = 'linux/amd64'
+        MATRIX.validate_resume(self.report, self.root, 'c' * 40, 'a' * 64,
+                               platform='linux/amd64')
+        with self.assertRaisesRegex(ValueError, 'platform differs'):
+            MATRIX.validate_resume(self.report, self.root, 'c' * 40, 'a' * 64,
+                                   platform='linux/arm64')
+
     def test_rejects_modified_and_missing_evidence(self):
         log = self.root / '0/build.log'
         log.write_text('changed\n')

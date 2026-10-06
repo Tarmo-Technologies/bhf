@@ -33,6 +33,12 @@ def component(name, version, purl, files, **details):
                            *[{"name": "bhf:" + k, "value": str(v)} for k, v in details.items()]]}
 
 
+def rust_component_name(installed_name, rustc_details):
+    host = next(line.removeprefix("host: ") for line in rustc_details.splitlines()
+                if line.startswith("host: "))
+    return installed_name.removesuffix("-" + host)
+
+
 def inventory(flavor):
     if flavor not in ("core", "ada", "runtime"):
         raise ValueError("unknown flavor")
@@ -68,7 +74,7 @@ def inventory(flavor):
     result["observed_rustc"] = output(str(rustc), "-Vv")
     result["observed_cargo"] = output("cargo", "--version")
     for installed_name in installed:
-        name = installed_name.removesuffix("-x86_64-unknown-linux-gnu")
+        name = rust_component_name(installed_name, result["observed_rustc"])
         version_text = manifest["pkg"][name]["version"]
         version = version_text.split()[0]
         files = {}

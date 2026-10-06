@@ -18,6 +18,7 @@ image_size="$(docker image inspect --format '{{.Size}}' "$image")"
 compressed_size="$(docker save "$image" | gzip -1 | wc -c | tr -d ' ')"
 cat > "$evidence/identity.txt" <<IDENTITY
 source_commit=$(git rev-parse HEAD)
+platform=$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image")
 local_image_id=$image
 unpacked_size_bytes=$image_size
 gzip_docker_archive_bytes=$compressed_size
@@ -34,6 +35,7 @@ docker run --rm --network none --read-only --tmpfs /tmp:rw,exec,nosuid,size=256m
   ' > "$evidence/compiler-smoke.log" 2>&1
 grep -q 'Ada ready' "$evidence/compiler-smoke.log"
 docker run --rm --network none "$image" sh -c 'dpkg-query -W | wc -l' > "$evidence/os-package-count.txt"
+bash scripts/ci/container-native-fuzz-acceptance.sh "$image" "$evidence"
 bash scripts/ci/container-runtime-acceptance.sh "$image" "$evidence"
 bash scripts/ci/inventory-image.sh "$image" "$evidence"
 python3 scripts/ci/review-image-scan.py "$evidence"

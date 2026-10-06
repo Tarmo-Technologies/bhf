@@ -10,7 +10,9 @@ import subprocess
 
 
 def reconcile(filesystem, rust, receipt, inspect, binaries):
-    if inspect[0].get("Architecture") != "amd64" or inspect[0].get("Os") != "linux":
+    targets = {"amd64": "x86_64-unknown-linux-gnu", "arm64": "aarch64-unknown-linux-gnu"}
+    architecture = inspect[0].get("Architecture")
+    if architecture not in targets or inspect[0].get("Os") != "linux":
         raise ValueError("unsupported image platform")
     labels = inspect[0]["Config"]["Labels"]
     for key, label, pattern in (
@@ -21,7 +23,7 @@ def reconcile(filesystem, rust, receipt, inspect, binaries):
         value = receipt.get(key, "")
         if not re.fullmatch(pattern, value) or labels.get(label) != value:
             raise ValueError(f"invalid or inconsistent {key}")
-    if receipt.get("features") != "default-no-llm" or receipt.get("target") != "x86_64-unknown-linux-gnu":
+    if receipt.get("features") != "default-no-llm" or receipt.get("target") != targets[architecture]:
         raise ValueError("unexpected production features/platform")
     expected_paths = {"/usr/local/bin/bhf", "/usr/local/bin/bhf-daemon",
                       "/usr/local/lib/bhf/libbhf_runtrace_shim.so", "/usr/local/lib/bhf/libbhf_cc_intercept.so"}

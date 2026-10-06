@@ -1,12 +1,10 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Running bhf in Docker
 
-The default image includes all sixteen supported language toolchains, the CLI,
-daemon, Linux shims, AFL++, and Rust nightly. Smaller `core` and `ada` images
-require explicit selection. All build the production binaries without the optional
-`llm` Cargo feature. Each runs as an unprivileged user
-under `tini`, and grants fuzzing the two extra runtime privileges it needs and
-nothing more.
+The default image includes all sixteen language toolchains, the CLI, daemon,
+Linux shims, AFL++, and Rust nightly. Choose `core` or `ada` for a smaller image.
+Images run as an unprivileged user under `tini` and exclude the optional `llm`
+Cargo feature.
 
 ## Build
 
@@ -27,13 +25,31 @@ scripts/build-container-release.sh bhf:release-candidate
 scripts/build-container-release.sh bhf:core-candidate --flavor core
 ```
 
-The image currently supports `linux/amd64` only, matching its checksum-pinned
-Go archive. The release script refuses dirty checkouts and supplies the same
+The Dockerfile supports Linux x86-64 (`linux/amd64`) and ARM64 (`linux/arm64`)
+with architecture-specific, checksum-verified toolchains. Builds use the Docker
+daemon's architecture by default; Compose does the same.
+
+```sh
+# Build a specific architecture locally:
+scripts/build-container-release.sh bhf:arm64 --platform linux/arm64
+# Create an isolated Buildx builder, then export both variants locally:
+docker buildx create --name bhf-multiarch --driver docker-container
+BUILDX_BUILDER=bhf-multiarch scripts/build-container-release.sh bhf:multiarch \
+  --platform linux/amd64,linux/arm64 --output /tmp/bhf-multiarch.oci.tar
+```
+
+The multi-platform export uses a Buildx builder with native build nodes or
+emulation for both architectures. The release workflow requires native fuzzing
+validation on x86-64 and ARM64 runners and retains a tested candidate for each.
+Emulation is useful for build checks but can affect sanitizer behavior and
+fuzzing speed.
+
+The release script refuses dirty checkouts and supplies the same
 version and commit to the binary and image metadata. The build context comes
 from `git archive HEAD`, excluding untracked and ignored local files. The optional
 `--flavor core|ada|runtime` flag selects a toolchain profile; the default is all
-languages (`runtime`). The legacy second positional flavor remains accepted. Its `local_image_id` identifies
-the local image configuration, and is distinct from a registry manifest digest.
+languages (`runtime`). `local_image_id` identifies the local image configuration;
+it differs from a registry manifest digest.
 
 The builder compiles only the release binaries and Linux shims against Ubuntu
 24.04 glibc. The default final stage inherits `runtime`, which carries all sixteen
@@ -68,7 +84,19 @@ docker run --rm \
 ```
 
 Anything after the image name is passed to `bhf` (the entrypoint also accepts
-`bhf`, `bhf-daemon`, `bhf-sweep`, `bash`). Read `/work/run/FINDINGS.md` first.
+`bhf`, `bhf-daemon`, `bhf-sweep`, `bash`). Read `/work/run/results/INDEX.md` first.
+
+### Windows and macOS hosts
+
+Run these Linux images with Docker Desktop in Linux-container mode on Windows,
+or with Docker Desktop on macOS. x86-64 machines use `linux/amd64`; Apple Silicon
+uses `linux/arm64`. Bind-mount a source directory and keep results in a Docker
+volume as shown above. On Windows PowerShell, use `${PWD}` for the source path
+and put the command on one line instead of using shell `\` continuations.
+
+The container uses Linux toolchains and runtime behavior on every host.
+Windows-specific APIs and MSVC builds require the [native Windows release](windows.md).
+Cross-compilation and emulated targets need their own toolchains and runners.
 
 ### Selecting languages
 

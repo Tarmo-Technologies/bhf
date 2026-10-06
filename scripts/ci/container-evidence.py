@@ -8,7 +8,7 @@ import pathlib
 
 COMMON = {"build.log", "identity.txt", "image-inspect.json", "build-receipt.json",
           "image.cyclonedx.json", "grype.json", "inventory-summary.json", "toolchains.json",
-          "os-package-count.txt", "no-llm-environment.log", "daemon-invalid.log", "termination.log"}
+          "os-package-count.txt", "native-fuzz-replay.log", "no-llm-environment.log", "daemon-invalid.log", "termination.log"}
 FLAVOR_LOGS = {
     "core": {"auto.log", "nonroot.log", "result.log", "version.log", "daemon-help.log", "daemon-version.log"},
     "ada": {"compiler-smoke.log"},
@@ -25,6 +25,9 @@ def receipt(root):
     flavor = labels["io.tarmo.bhf.flavor"]
     if labels["org.opencontainers.image.revision"] != build["source_commit"]:
         raise ValueError("image and compiler source disagree")
+    platform = f'{image["Os"]}/{image["Architecture"]}'
+    if platform not in ("linux/amd64", "linux/arm64"):
+        raise ValueError("unsupported container platform")
     files = {}
     for name in sorted(COMMON | FLAVOR_LOGS[flavor]):
         path = root / name
@@ -32,7 +35,7 @@ def receipt(root):
             raise ValueError("acceptance evidence cannot be a symlink")
         files[name] = hashlib.sha256(path.read_bytes()).hexdigest()
     return {"schema_version": 1, "result": "PASS", "flavor": flavor,
-            "image_config_digest": image["Id"], "source_commit": build["source_commit"], "files": files}
+            "image_config_digest": image["Id"], "platform": platform, "source_commit": build["source_commit"], "files": files}
 
 
 def main():

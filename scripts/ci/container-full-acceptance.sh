@@ -26,6 +26,7 @@ bash scripts/build-container-release.sh "$image" > "$evidence/build.log" 2>&1 ||
 
 docker image inspect "$image" > "$evidence/image-inspect.json"
 image_id="$(docker image inspect --format '{{.Id}}' "$image")"
+platform="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image")"
 image_size="$(docker image inspect --format '{{.Size}}' "$image")"
 # Observed local full target on 2026-10-04: 3,558,046,779 bytes.
 (( image_size <= 4500000000 )) || { echo "full image exceeds 4.5 GB: $image_size" >&2; exit 1; }
@@ -37,13 +38,13 @@ cat > "$evidence/identity.txt" <<IDENTITY
 source_commit=$commit
 source_archive_sha256=$source_sha
 version=$version
-platform=linux/amd64
+platform=$platform
 local_image_id=$image_id
 unpacked_size_bytes=$image_size
 gzip_docker_archive_bytes=$compressed_size
 IDENTITY
 
-run=(docker run --rm --platform linux/amd64 --network none --read-only
+run=(docker run --rm --platform "$platform" --network none --read-only
   --tmpfs /tmp:rw,exec,nosuid,size=1g --shm-size 2g --memory 4g --pids-limit 512
   --cap-drop ALL --security-opt no-new-privileges:true --volume "$volume:/work"
   --volume "$PWD/docker/fixtures/java-bare:/src:ro")
@@ -71,6 +72,7 @@ docker run --rm --network none --read-only --tmpfs /tmp:rw,exec,nosuid,size=1g \
   "$image_id" bash /language-smoke.sh > "$evidence/language-smoke.log" 2>&1
 
 # Reconcile the filesystem and compiled Cargo inventory; retain the DB-bound scan.
+bash scripts/ci/container-native-fuzz-acceptance.sh "$image_id" "$evidence"
 bash scripts/ci/container-runtime-acceptance.sh "$image_id" "$evidence"
 bash scripts/ci/inventory-image.sh "$image_id" "$evidence"
 python3 scripts/ci/review-image-scan.py "$evidence"
