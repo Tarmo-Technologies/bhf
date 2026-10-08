@@ -11,7 +11,7 @@
 | **Static Python** | **Mixed / behind** | py_requests bhf **wins** (14 HIGH taint vs bandit 0 substantive); py_click bhf **loses** (0 findings vs bandit 23 substantive, semgrep 3) |
 | **Static Perl** | Behind on count, higher-severity findings | perlcritic 221 > semgrep 31 > bhf 18; bhf's 18 are eval/shell/weak-crypto findings, but it misses the insecure-websocket class |
 | **SBOM component discovery** | Mixed by ecosystem | Ties syft on go (42/42, 7/7) and maven (21/21, 8/8); exceeds syft 45–0 (npm) and 6–0 (cargo); trails on py_click, 30 vs 81 (transitive) |
-| **SBOM CVE correlation** | **Behind** | grype 11 (py_click) + 1 (java_gson) vs bhf **0 everywhere** — null versions from manifests can't match CVE ranges |
+| **SBOM CVE matching** | **Behind** | grype 11 (py_click) + 1 (java_gson) vs bhf **0 everywhere** — null versions from manifests can't match CVE ranges |
 | **Reporting richness** | Broadest measured combination | Only measured tool with codeFlows + fuzz-confirm provenance + reachability verdict + root-cause clustering + VEX combined |
 | **Reporting breadth** | Competitive, 3 fixable gaps | No SPDX (syft wins), no per-finding CWE in primary JSON (bandit wins), no remediation text (semgrep/bandit win) |
 | **SLOC counting** | Behind on speed, close to cloc | tokei/scc ~0.1s vs bhf **16.5s (~150×)**; counts align with cloc and avoid the measured Perl and docstring overcounts |
@@ -22,7 +22,7 @@
 
 ### P0 — Structural gaps that flip a whole feature from "behind" to "leading"
 
-1. **SBOM CVE correlation: bhf finds 0 CVEs everywhere; grype finds 11 (py_click) + 1 (java_gson).**
+1. **SBOM CVE matching: bhf finds 0 CVEs everywhere; grype finds 11 (py_click) + 1 (java_gson).**
    Root cause is measured, not the DB: bhf parses `pyproject.toml`/`pom.xml` with `version: null`; a null version can't match a CVE range. **Fix: ingest lockfiles** — `uv.lock`, `poetry.lock`, pinned `requirements.txt`, `package-lock.json`/`pnpm-lock.yaml`, `Cargo.lock`, maven transitive resolution. This single fix closes **both** the CVE gap (pinned versions) **and** the Python transitive-depth gap (81 vs 30). The campaign ranks this fix first.
 
 2. **Static Python py_click zero-finding miss: bhf 0 vs bandit 23 substantive vs semgrep 3.**
@@ -70,11 +70,11 @@
 **Where dedicated single-purpose tools won in this measurement:**
 - **Raw SLOC speed**: tokei/scc are ~150× faster (0.09s vs 16.5s). They always will be — they're purpose-built line counters; bhf counts as a side-effect of a full tree-sitter SAST parse.
 - **Raw fuzz throughput on a mature single target**: this was **not** quantified with an hours-long, identical-harness comparison. The specialist tools have mature mutator engineering and integrations; the campaign does not rank their throughput against bhf.
-- **CVE correlation at measurement time**: grype+syft reported 11 + 1 CVEs versus 0 because they read pinned lockfiles (see P0 item 1).
+- **CVE matching at measurement time**: grype+syft reported 11 + 1 CVEs versus 0 because they read pinned lockfiles (see P0 item 1).
 - **Python breadth on non-taint-reachable repos** (bandit), **Perl style/volume** (perlcritic), and **remediation text** (semgrep/bandit) are real, current deficits.
 
 **Measured result:** bhf led the selected tools on zero-setup multi-language
 fuzzing, fuzz-confirmation, integrated offline workflow, and combined report
-content. Dedicated tools led on raw counting and fuzzing speed, CVE correlation,
+content. Dedicated tools led on raw counting and fuzzing speed, CVE matching,
 and several detection classes. The listed gaps were candidates for follow-up;
 this 14-repository campaign does not establish an overall product ranking.

@@ -132,7 +132,7 @@
   reuses the fuzz loop's shim log, so `bhf fuzz --collector auto` with the shim not armed
   (the default `--runtime-oracles off`) records a degraded, *not-observed* run rather
   than claiming a clean assurance over coverage it never had, and the adapter confirms a
-  sink only through the SAME cross-execution correlation / constant-suppression the
+  sink only through the SAME cross-execution matching / constant-suppression the
   runtime oracles use — never from a single run's taint. A PATH runs an
   external sidecar, and `none` (default) leaves behaviour unchanged. The Windows decode
   logic is unit-tested on every platform against synthetic ETW-shaped records (including
@@ -1559,7 +1559,7 @@ Reach release: the targets `--force` was supposed to rescue and did not.
   (CWE-319). Every static finding now carries its CWE and a `remediation` line in
   the JSON, Markdown, and SARIF (`help`/`helpUri`) outputs.
 - **SBOM: lockfile ingestion + SPDX.** Reads `uv.lock` (and the existing
-  lockfiles) for pinned/transitive components so CVE correlation works; adds an
+  lockfiles) for pinned/transitive components so CVE matching works; adds an
   SPDX-2.3 JSON emitter (`--format spdx-json`) alongside CycloneDX/VEX.
 - **`bhf sloc <PATH>...`** — a standalone, rayon-parallel SLOC counter (no SAST
   scan) that counts one or more roots in a single invocation; fastest and closest

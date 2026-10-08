@@ -45,7 +45,7 @@ toolchains. Missing dependencies and unsupported targets are reported.
   JavaScript/TypeScript, QML, and config/IaC, with taint traces and SARIF codeFlows; fuzzing
   then confirms static findings. → [static CWE coverage](docs/site/static-cwe-coverage.md)
 - **SBOM / SCA** — multi-language SBOMs across 12 ecosystems (CycloneDX + OpenVEX) with
-  offline CVE/VEX correlation.
+  offline CVE/VEX matching.
 - **Binary triage** — `bhf binary scan` / `binary fuzz` over ELF, PE, Mach-O, and raw
   firmware blobs — recursing into `ar` / Debian `.deb` packages and their compressed
   (`gzip`/`xz`/`zstd`) tar members — with source-unavailable crash replay, including
@@ -523,7 +523,7 @@ annotations, posts a sticky summary comment, and fails only on a fuzz-confirmed 
 | `bhf auto <src> --differential clang:gcc` | Two-compiler differential (C/C++): flag inputs where the clang and gcc builds diverge (BHF-301) |
 | `bhf ci <src> --changed-since <ref>` | Fuzz changed files, emit SARIF, and fail on confirmed findings |
 | `bhf static-scan <src> --sarif` | Offline SAST only (JSON/Markdown/SARIF) |
-| `bhf sbom <src> --vuln-db <db>` | SBOM + offline CVE/VEX correlation |
+| `bhf sbom <src> --vuln-db <db>` | SBOM + offline CVE/VEX matching |
 | `bhf binary scan <bin>` | Inventory + hardening triage for ELF/PE/Mach-O/firmware; recurses into `ar`/`.deb` + tar archives |
 | `bhf binary fuzz <bin>` | Fuzz a source-unavailable executable (builtin, or AFL++ QEMU mode) |
 | `bhf sloc <src>` | Fast per-language SLOC count |

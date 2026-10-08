@@ -60,14 +60,14 @@ contract (`crate::auto::runtrace::to_collector_event` /
 `lib_load`/`dlopen` → `module_load`, `open`/`openat`/`fs_destroy` → the file
 families, `net_egress`/`connect` → `network`. A sink family is marked
 taint-confirmed in the collector stream **only** when a `CollectorTaintGate`
-confirms it through the SAME cross-execution correlation / constant-suppression
+confirms it through the SAME cross-execution matching / constant-suppression
 the runtime oracles use — never from a single run's `taint_offset` — so a program
 constant echoed into one input is not presented as a taint-confirmed finding. On
 `bhf binary fuzz` the collector runs the target once under the shim as a
 **dedicated observation pass** (separate from the crash-detection loop, so
 `--runtime-oracles` behaviour is unchanged) and the gate reuses the campaign's
 accumulated taint evidence; on `bhf fuzz` it re-reads the loop's own
-`runtrace.jsonl` and correlates across every execution it contains. The result
+`runtrace.jsonl` and matches across every execution it contains. The result
 feeds the same oracle registry and stored-evidence replay as the native Windows
 ETW provider — it is an additional view, not a second source. `--collector auto`
 stays inactive when the runtrace shim is unavailable, and when the shim exists but
@@ -194,7 +194,7 @@ race). `open`, `openat`, or `fopen` calls whose path argument carries byte-origi
 taint from the current fuzz input (the shim stamps the controlled flag and the
 originating input offset on the path event) become `path-controlled-open-runtime`
 BHF-405 oracle hits (CWE-22). Unlike the per-input oracles above, BHF-405 is
-confirmed by cross-execution correlation: a path is reported only if it was
+confirmed by cross-execution matching: a path is reported only if it was
 tainted on at least one execution and never opened untainted during the run,
 which suppresses program-constant paths the auto-dictionary (cmplog tokens
 harvested from the target's own string constants) echoes back into inputs.
@@ -233,7 +233,7 @@ descendant process tree within a bounded post-exit window and maps them through 
 or controlled library load becomes a `binary_semantic` finding with no crash — the
 `CollectorEvent`'s `input_derived`/`taint_offset` carries byte-origin taint forward
 so a fixed program constant (not input-derived) is never taint-confirmed, exactly as
-the shim's cross-execution correlation does.
+the shim's cross-execution matching does.
 
 Fidelity is first-class: dropped events, platform-unsupported APIs, and permission
 denials are recorded on the stream and refuse a false "clean" assurance rather than

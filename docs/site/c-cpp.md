@@ -123,7 +123,7 @@ two complementary interceptors that record every compile into one
   (a hard-coded vendor toolchain, a Bazel toolchain) or via `posix_spawn`
   (ninja/cmake drivers) is captured too.
 
-Records are deduplicated by translation unit, so the two interceptors never
+Records are processed for duplicates by translation unit, so the two interceptors never
 double-count. Both `--probe-build` and `--build-command` execute the project's
 untrusted build, so they run under bhf's sandbox (bwrap/firejail) when one is
 available.
@@ -291,7 +291,7 @@ BHF-415 findings with expression and source evidence. File-open calls
 `path-controlled-open-runtime` BHF-405 findings carrying a `taint_path`
 source→sink string (`fuzz_input[offset..] → open(path)`). The shim stamps
 byte-origin taint on each path event, and the CLI confirms the finding by
-cross-execution correlation: a path is reported only if it carried taint on at
+cross-execution matching: a path is reported only if it carried taint on at
 least one execution and was never opened untainted across the run, which
 suppresses program constants the auto-dictionary echoes back into inputs. Like
 the other runtime promotions, the resulting record is stamped

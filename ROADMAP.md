@@ -75,7 +75,7 @@ The user-facing current behavior is documented under `docs/site/`. In brief:
   ingestion, C++ lifecycle/sequence harnesses, and IDE/daemon parity.
 - The §25 top-of-class gap program (#341–#345) is **delivered** (2026-06-19):
   coverage-blocker introspection, structure-aware input + dictionary mining,
-  the executable oracle SDK, CycloneDX SBOM + offline CVE correlation, and
+  the executable oracle SDK, CycloneDX SBOM + offline CVE matching, and
   generalized C/C++ + Ada lifecycle/output harnessing all ship and are
   regression-tested. Post-1.0 continuous-improvement items are tracked in §24.
 
@@ -285,7 +285,7 @@ The native Rust lane (Phase 1) emits a `fuzz/` cargo-fuzz crate whose generated 
 | Compiler Adapter | `.gpr` | object files / diags | spawn gprbuild/gnatmake; capability probe | Apache-2.0 | parse `.../foo.ads:LINE:COL: <msg>`, `-gnatdJ` JSON | colorized variants | locale/version |
 | Fuzz Engine | harness | corpus + findings | shm/files + mutators | Apache-2.0 | built-in | AFL++/LibAFL adapters | feedback fidelity |
 | Probe Runtime (Ada 95) | harness | event stream | per-task ring buffer + binary log | Apache-2.0 | events for handlers/raises/breadcrumbs | resource counters | non-reentrancy |
-| Corpus Manager | inputs + sigs | dedup'd corpus | hashed + signature-tagged | Apache-2.0 | retain by exception signature | LRU + minimization | disk growth |
+| Corpus Manager | inputs + sigs | duplicate handling'd corpus | hashed + signature-tagged | Apache-2.0 | retain by exception signature | LRU + minimization | disk growth |
 | Replay/Minimize | finding | minimal repro | ddmin over byte input | Apache-2.0 | byte-level ddmin | typed-value minimize | local minima |
 | Report Generator | findings | JSON/MD/SARIF 2.1/JUnit | template engine | Apache-2.0 | JSON+MD | SARIF+JUnit+repro Ada | drift |
 | Daemon (M18) | JSON-RPC | findings/scan results | LSP-flavored JSON-RPC | Apache-2.0 | — | continuous fuzz, IDE plug-ins | sync with CLI |
@@ -1065,7 +1065,7 @@ Mining rules (from §6 answer):
 - **Length cap**: 4..256 bytes for strings; 1..32 for identifiers.
 - **Per-type buckets**: separate dictionaries for `String`, `Wide_String`, `Wide_Wide_String`, enumeration literal sets per enum type, exception-name set, IDL operation-name set, integer constants per scalar type. A target-`String` parameter never gets fed enum literals.
 - **Proximity weighting**: per-target dictionary scored by callgraph distance from target — full weight in/one-hop from target body, exponential decay further out, floor weight in leaf utilities.
-- **Dedup**: case-folded, whitespace-normalized; near-duplicates collapsed via 4-gram Jaccard ≥ 0.9.
+- **Duplicate handling**: case-folded, whitespace-normalized; near-duplicates collapsed via 4-gram Jaccard ≥ 0.9.
 - **Boilerplate filter**: drop SPDX/copyright/URL patterns; drop pure-punctuation or single-token English filler.
 - **Frequency cap**: top-K by occurrence per bucket per target (K=64; `--dict-top` configurable).
 - **Provenance**: each retained entry carries `(source_unit, span)` for replay traceability.
@@ -2006,7 +2006,7 @@ end Main;
      world-writable dir without `O_EXCL` (18 registered oracles now).
      **Advanced further.** The TOCTOU runtime oracle shipped (BHF-418
      `ToctouRuntime`, CWE-367): the runtrace shim logs the time-of-check path
-     probe and correlates it with a later tainted open (`log_path_check` in
+     probe and matches it with a later tainted open (`log_path_check` in
      `crates/bhf_runtrace_shim/src/hooks/fs.rs`). **Remaining:**
      weak-randomness (CWE-338) and integer-overflow-via-instrumentation oracle
      classes, deeper C/C++ recursive object graphs, and full C++ template/parity
@@ -2089,7 +2089,7 @@ program office adopts". Each is tracked as a GitHub issue:
    Python/Perl/Ruby/Lua/PHP interpreter processes; it is off for Java, C#,
    JavaScript/TypeScript, and cross/emulated targets. (#343)
 4. **CycloneDX SBOM (CISA 2025 minimum elements) + offline NVD/KEV CVE
-   correlation** — CycloneDX, KEV metadata, and first-pass reached-CVE
+   matching** — CycloneDX, KEV metadata, and first-pass reached-CVE
    ranking now land in offline reports; runtime `dlopen` evidence from
    fuzzed harnesses is folded into dynamic SBOM components, and the CycloneDX
    document identifies BHF itself as a supplier/purl-addressable tool

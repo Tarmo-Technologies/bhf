@@ -87,7 +87,7 @@ Status values:
   helpers. A few truncated module specs can produce hundreds of missing-symbol
   diagnostics.
 - Correction: parse all IDLs into one aggregate AST (with include
-  deduplication) or merge generated units semantically before one atomic write.
+  duplicate handling) or merge generated units semantically before one atomic write.
   Dictionary tokens must also be unioned rather than overwritten.
 - Proof requirement (met; see closure matrix): two and three-file reopened-module fixtures, cross-includes,
   repeated include guards, deterministic output, and a GNAT build of generated
@@ -274,7 +274,7 @@ Status values:
 ### ZF-22 — Ada missing-symbol classification inflates counts and repairs the unit, not the symbol
 
 - Status: `CLOSED`.
-- Correction/proof (met): deduplicate identical GNAT diagnostics per invocation; before
+- Correction/proof (met): handle duplicates identical GNAT diagnostics per invocation; before
   proposing `AddAdaSource`, verify that the selected spec declares the missing
   symbol, otherwise report wrong-version/incomplete-unit evidence or synthesize a
   safe declaration only where valid. Test repeated diagnostics and a wrong spec
@@ -618,7 +618,7 @@ nonzero fuzz-execution evidence rather than merely accepting a compiler exit.
 
 ## Diagnostic-count interpretation and intentional outcomes
 
-- Repeated GNAT diagnostics are deduplicated per invocation, and a symbol repair
+- Repeated GNAT diagnostics are processed for duplicates per invocation, and a symbol repair
   is proposed only when the selected unit actually declares that symbol. Counts
   now represent distinct structured diagnostics rather than raw repeated lines.
 - `blocked_by_concurrency` is intentional under ZF-30 and must not be repaired by

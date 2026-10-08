@@ -280,7 +280,7 @@ cmplog, and ASan all work natively on Windows.
   over it, emitting the platform-neutral `bhf.collector-event.v1` JSONL contract.
   Each live `EVENT_RECORD` is decoded by the pure `win_etw_decode` module — the
   **complete** MOF decode of the three kernel providers (pointer-size and event-
-  version aware, with `FileObject → path` correlation for read/write/rename/delete,
+  version aware, with `FileObject → path` matching for read/write/rename/delete,
   create-vs-open disposition classification, and `UserSID` rendering):
     - `CreateProcess*` process creation (`Process_TypeGroup1`) and the descendant
       tree — a `ShellExecuteEx` call surfaces at the kernel level as the resulting

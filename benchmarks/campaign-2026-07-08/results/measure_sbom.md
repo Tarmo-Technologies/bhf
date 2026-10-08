@@ -37,13 +37,13 @@ components.
   py_requests, bhf scanned multiple project and requirements files, including
   development and documentation extras that syft's default cataloger skipped.
 
-### CVE correlation
+### CVE matching
 
 grype found **11** vulns in py_click and **1** in java_gson; bhf matched **0** everywhere. Root cause is measured, not the offline DB: grype gets **pinned versions** from lockfiles (py_click `uv.lock` → starlette@1.0.0, urllib3@2.6.3, idna@3.11, uv@0.11.3, pytest@9.0.2; java_gson transitive jackson-databind@2.22.0). bhf parsed the same package names from `pyproject.toml`/`pom.xml` but with `version: null` — and a null version can't match a CVE range. bhf's version coverage confirms this: py_click 11/30, py_requests 2/21, rust_semver 2/6, js_express 9/45 components have versions; the rest are unpinned specifiers from manifests.
 
 ### Concrete gaps
 
-1. **Ingest lockfiles, not just manifests (highest impact).** bhf reads `pyproject.toml` but ignores `uv.lock` (confirmed: no uv.lock in any component's `evidence` field). Also add `package-lock.json`/`pnpm-lock.yaml`, `Cargo.lock`, and `poetry.lock`/`requirements.txt`-pinned parsing. Lockfiles give (a) the transitive closure syft counts (the 81-vs-30 Python gap) and (b) the pinned versions grype needs for CVE matching (the 11-vs-0 gap). This single fix closes both the Python component gap and the entire CVE-correlation deficit.
+1. **Ingest lockfiles, not just manifests (highest impact).** bhf reads `pyproject.toml` but ignores `uv.lock` (confirmed: no uv.lock in any component's `evidence` field). Also add `package-lock.json`/`pnpm-lock.yaml`, `Cargo.lock`, and `poetry.lock`/`requirements.txt`-pinned parsing. Lockfiles give (a) the transitive closure syft counts (the 81-vs-30 Python gap) and (b) the pinned versions grype needs for CVE matching (the 11-vs-0 gap). This single fix closes both the Python component gap and the entire CVE-matching deficit.
 2. **Fill in versions to enable its own CVE gate.** bhf's vuln matcher works but is starved — with null versions across most components it structurally can't match. Fixing lockfile ingestion feeds the matcher.
 
 ### Net
@@ -51,6 +51,6 @@ bhf found more declared components on the measured npm and cargo repositories,
 matched syft on Go and Maven, and found fewer transitive components on py_click.
 grype reported 11 and 1 CVEs on two repositories while bhf reported none.
 Lockfile ingestion addresses both the Python transitive-depth gap and the missing
-version data needed for CVE correlation.
+version data needed for CVE matching.
 
 Output files: bhf SBOMs at `/tmp/sb_<repo>/sbom.json`; syft at `/tmp/syft_<repo>.json`; grype at `/tmp/grype_<repo>.json`.

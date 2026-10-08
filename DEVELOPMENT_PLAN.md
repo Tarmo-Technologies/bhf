@@ -536,7 +536,7 @@ threat model, not merely additional configuration switches.
   delays. Crashes observed outside budget must not silently become in-budget
   successes. Preserve failed builds, tool errors and unconfirmed artifacts
   separately from valid right-censored no-result trials.
-- Confirm saved results through a common independent oracle, deduplicate bugs,
+- Confirm saved results through a common independent oracle, handle duplicates bugs,
   measure common coverage, and publish raw rows plus reproducible analysis and
   uncertainty. Pre-register targets/trials/budgets rather than hand-pick only
   favorable results. Use FuzzBench methodology for the real-code study.

@@ -371,7 +371,7 @@ paths that the runtrace shim observed carrying byte-origin taint from the fuzz
 input — and that were never opened untainted across the run — promote to BHF-405
 `path-controlled-open-runtime` findings carrying a `taint_path` source→sink
 string (`fuzz_input[offset..] → open(path)`). These are emitted once per run
-from cross-execution correlation, not per input, and capped per harness.
+from cross-execution matching, not per input, and capped per harness.
 
 These runtrace-derived findings — BHF-413, BHF-414, BHF-415, and BHF-405, together
 with the BHF-304 command-injection, BHF-417 insecure-temp, and BHF-305

@@ -33,7 +33,7 @@ harnesses and is not ranked here.
 | Static analysis — Python | **now competitive** (was behind) | py_click **0 → 14** after adding BHF-546 (`try/except/pass`, CWE-703); precision kept (0 FP) |
 | Static analysis — C/C++ | **matched the measured defect classes** | cppcheck's 465–1711 raw = ~90% style/info; only bhf has taint→sink + CWE. Closed the class gap: BHF-547 (`scanf`/`getwd`), BHF-549 (dangling-lifetime return, CWE-562), BHF-550 (resource leak, CWE-401) — bhf fires on the *same* real defects as cppcheck's `returnDanglingLifetime`/`memleak`, with **0 corpus false positives** |
 | SBOM component discovery | **strongest measured coverage** | py_click **30 → 94** components via `uv.lock`; matches syft's transitive depth; exceeds syft on npm/cargo in this corpus |
-| SBOM CVE correlation | **now enabled** (was 0) | versions now pinned from lockfiles, so an offline CVE DB matches (was null-version → 0 matches) |
+| SBOM CVE matching | **now enabled** (was 0) | versions now pinned from lockfiles, so an offline CVE DB matches (was null-version → 0 matches) |
 | Reporting richness | **broadest measured combination** | Only measured tool combining codeFlows + fuzz-confirm provenance + reachability + root-cause clustering + VEX |
 | Reporting breadth | **closed three measured gaps** | Added per-finding CWE (all formats), remediation + SARIF help/helpUri, SPDX-2.3 emitter |
 | SLOC — overall | **closest to cloc and fastest in the timed set** | **1.3 %** mean deviation from cloc vs scc/tokei at about 20%; release+parallel `bhf sloc` beat tokei and scc on all 3 timed repos (cpp_json 13 ms vs tokei 16 / scc 23; ~50× faster than cloc) |
@@ -114,7 +114,7 @@ Net: **no new noise in the measured corpus** — BHF-547/548 fire 0 times across
 only on unsafe constructs; BHF-546 added 23 real findings across the two
 Python repos with zero false positives.
 
-## 3. SBOM / SCA — component discovery and CVE correlation
+## 3. SBOM / SCA — component discovery and CVE matching
 
 Measured vs syft (components) and grype (CVEs).
 
@@ -126,7 +126,7 @@ parsing emitted `version: null` — a null version can't match a CVE range.
 **Gaps closed:**
 - **Lockfile ingestion** (`uv.lock` was the missing one py_click uses): py_click
   **30 → 94 components, 92 with pinned versions** (was 19 null) — matching syft's
-  transitive depth. With pinned versions, an offline CVE DB now correlates (the root
+  transitive depth. With pinned versions, an offline CVE DB now matches (the root
   cause the analysis identified; the box here ships no CVE DB, so matches show when a
   feed is supplied).
 - **SPDX-2.3 JSON emitter** (`--format spdx-json` → `sbom.spdx.json`): bhf emitted

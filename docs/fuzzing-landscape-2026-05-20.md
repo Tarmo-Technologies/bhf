@@ -124,7 +124,7 @@ Mature fuzzing stacks cluster around five capabilities:
 5. CI and triage.
    ClusterFuzzLite focuses on pull-request fuzzing, longer batch fuzzing,
    crash testcase download, and coverage reports. The developer pain is not
-   only finding a crash; it is reproducing, deduplicating, interpreting, and
+   only finding a crash; it is reproducing, handling duplicates, interpreting, and
    deciding whether it matters.
 
 ## Recurring Pain Points

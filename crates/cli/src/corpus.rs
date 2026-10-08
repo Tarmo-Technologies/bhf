@@ -203,7 +203,7 @@ fn run_minimize(args: MinimizeCorpusArgs) -> i32 {
         bhfeprintln!(
             "warning: harness produced no runtrace coverage for any input; \
              C/C++ libFuzzer harnesses are not supported for coverage-minimal \
-             merge — use `bhf corpus merge` for content deduplication"
+             merge — use `bhf corpus merge` to remove duplicate content"
         );
     }
 

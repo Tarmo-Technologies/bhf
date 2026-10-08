@@ -370,7 +370,7 @@ BHF_LANGUAGES=java,python BHF_ENGINES=builtin docker compose -f docker/compose.y
 ```
 
 Builds require a clean checkout. Selections are nonempty, case insensitive,
-deduplicated, and order independent, using the same aliases as `auto`.
+processed for duplicates, and order independent, using the same aliases as `auto`.
 `all` must appear alone; empty fields, `none`, unknown names, repeated selection
 options, and combining `--languages` with `--flavor` are errors. Legacy
 `--flavor core` and `--flavor ada` retain their previous component sets; use
