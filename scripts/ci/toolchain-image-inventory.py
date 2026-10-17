@@ -56,6 +56,9 @@ def inventory(flavor):
         commands.append(("esbuild", "esbuild", output("esbuild", "--version")))
     if languages is None or "go" in languages:
         commands.append(("go", "go", output("go", "version").split()[2].removeprefix("go")))
+    if languages is None or "csharp" in languages:
+        sdks = output("dotnet", "--list-sdks").split()
+        commands.append(("dotnet-sdk", "dotnet", sdks[0]))
     if languages is None or "rust" in languages:
         commands.append(("rustup", "rustup", output("rustup", "--version").split()[1]))
     for name, command, version in commands:

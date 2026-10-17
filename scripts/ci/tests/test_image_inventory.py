@@ -114,7 +114,7 @@ class InventoryTests(unittest.TestCase):
             MERGE.reconcile_tools(self.merge(), tools, "runtime", ["rust"])
 
     def test_subset_cannot_omit_selected_standalone_tools(self):
-        for languages in [["rust"], ["go"], ["javascript"], ["typescript"]]:
+        for languages in [["rust"], ["go"], ["csharp"], ["javascript"], ["typescript"]]:
             tools = {"flavor": "runtime", "languages": languages, "components": []}
             with self.assertRaisesRegex(ValueError, "toolchain inventory"):
                 MERGE.reconcile_tools(self.merge(), tools, "runtime", languages)
