@@ -24,17 +24,17 @@
 
 # Bootstrap HTTPS from an exact, checksum-verified Ubuntu CA package. This
 # avoids a mutable apt install before selecting the reviewed archive snapshot.
-FROM ubuntu:24.04@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3 AS certificates
+FROM ubuntu:24.04@sha256:ac3a3d13e90c660a1cb3e89ec695533399f7378dc1ae5fbdc28eb5781d561594 AS certificates
 ADD --checksum=sha256:6bac2a01979e210d9eac1d4d56747ec709ea60654744d66705dc3c36e7629e50 https://archive.ubuntu.com/ubuntu/pool/main/c/ca-certificates/ca-certificates_20260601~24.04.1_all.deb /tmp/ca.deb
 RUN dpkg-deb -x /tmp/ca.deb /tmp/ca \
     && mkdir /certificates \
     && cat /tmp/ca/usr/share/ca-certificates/mozilla/*.crt > /certificates/ca-certificates.crt
 
-FROM ubuntu:24.04@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3 AS ubuntu-pinned
+FROM ubuntu:24.04@sha256:ac3a3d13e90c660a1cb3e89ec695533399f7378dc1ae5fbdc28eb5781d561594 AS ubuntu-pinned
 COPY --from=certificates /certificates/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 ARG TARGETARCH
 COPY docker/toolchain-platform.sh /usr/local/share/bhf/toolchain-platform.sh
-ARG UBUNTU_SNAPSHOT=20261004T000000Z
+ARG UBUNTU_SNAPSHOT=20261016T000000Z
 RUN printf 'APT::Snapshot "%s";\nAPT::Update::Error-Mode "any";\n' "${UBUNTU_SNAPSHOT}" > /etc/apt/apt.conf.d/50snapshot
 # Ubuntu ports sources do not opt into APT's snapshot selector. Use an
 # explicit snapshot URL on ARM64 and avoid filtering it a second time.
@@ -143,7 +143,7 @@ RUN source /usr/local/share/bhf/language-selection.sh; \
     && printf '%s\n' "$BHF_ENGINES" > /usr/local/share/bhf/selected-engines.txt
 
 # Go from upstream (pinned + checksum-verified).
-ARG GO_VERSION=1.27.1
+ARG GO_VERSION=1.27.2
 RUN source /usr/local/share/bhf/language-selection.sh; \
     languages="$(cat /usr/local/share/bhf/selected-languages.txt)"; \
     if bhf_has_language "$languages" go; then \
@@ -154,6 +154,25 @@ RUN source /usr/local/share/bhf/language-selection.sh; \
     && tar -C /usr/local -xzf /tmp/go.tgz \
     && rm -f /tmp/go.tgz \
     && /usr/local/go/bin/go version ; \
+    fi
+
+# .NET SDK from Microsoft's release archive (pinned + checksum-verified).
+# Ubuntu noble still ships 8.0.131, which bundles NuGet assemblies with fixed
+# CVEs; 8.0.132 (runtime 8.0.32) carries the fixes.
+ARG DOTNET_SDK_VERSION=8.0.132
+RUN source /usr/local/share/bhf/language-selection.sh; \
+    languages="$(cat /usr/local/share/bhf/selected-languages.txt)"; \
+    if bhf_has_language "$languages" csharp; then \
+    source /usr/local/share/bhf/toolchain-platform.sh; bhf_toolchain_platform "$TARGETARCH"; \
+    curl --proto '=https' --tlsv1.2 -fsSLo /tmp/dotnet.tgz \
+        "https://builds.dotnet.microsoft.com/dotnet/Sdk/${DOTNET_SDK_VERSION}/dotnet-sdk-${DOTNET_SDK_VERSION}-linux-${BHF_DOTNET_ARCH}.tar.gz" \
+    && echo "${BHF_DOTNET_SHA512}  /tmp/dotnet.tgz" | sha512sum -c - \
+    && mkdir -p /usr/share/dotnet /usr/share/bhf/licenses/csharp && tar -C /usr/share/dotnet -xzf /tmp/dotnet.tgz \
+    && rm -f /tmp/dotnet.tgz \
+    && cp /usr/share/dotnet/LICENSE.txt /usr/share/bhf/licenses/csharp/dotnet-LICENSE.txt \
+    && cp /usr/share/dotnet/ThirdPartyNotices.txt /usr/share/bhf/licenses/csharp/dotnet-ThirdPartyNotices.txt \
+    && ln -s /usr/share/dotnet/dotnet /usr/local/bin/dotnet \
+    && DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 dotnet --list-sdks ; \
     fi
 
 COPY --from=javascript-tools /out/ /

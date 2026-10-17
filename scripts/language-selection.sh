@@ -66,7 +66,8 @@ bhf_language_packages() {
       container:lua) row='lua5.4 liblua5.4-dev' ;; apt:lua) row=lua5.4 ;; rpm:lua) row=lua ;;
       container:php) row='php-cli php-pcov' ;;
       apt:php|rpm:php) row=php-cli ;;
-      container:csharp) row=dotnet-sdk-8.0 ;;
+      # .NET SDK comes from Microsoft's pinned archive; these are its native deps.
+      container:csharp) row='libicu74 libssl3t64 zlib1g libstdc++6 libgcc-s1' ;;
       *) row='' ;;
     esac
     # Words here are static package names above, never caller input.
