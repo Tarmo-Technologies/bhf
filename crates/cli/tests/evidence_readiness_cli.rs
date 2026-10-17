@@ -102,7 +102,7 @@ fn seeded_benchmark_tracks_recall_precision_and_fails_on_missed_expected_finding
     .unwrap();
     fs::write(
         src.join("tasking.adb"),
-        "procedure Tasking is\n   task type Worker;\n   task body Worker is begin null; end Worker;\nbegin\n   null;\nend Tasking;\n",
+        "package body Tasking is\n   Count : Natural := 0;\n   task body Worker is\n   begin\n      Count := Count + 1;\n   end Worker;\n   function Current return Natural is (Count);\nend Tasking;\n",
     )
     .unwrap();
     let manifest = root.join("seeded-suite.json");

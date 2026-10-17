@@ -112,7 +112,7 @@ fn static_scan_reports_ada_c_and_cpp_findings_with_sarif() {
     .unwrap();
     fs::write(
         src.join("legacy.adb"),
-        "procedure Legacy is\nbegin\n   null;\nexception\n   when others => null;\nend Legacy;\n",
+        "procedure Legacy is\nbegin\n   Process;\nexception\n   when others => null;\nend Legacy;\n",
     )
     .unwrap();
 
@@ -817,11 +817,12 @@ fn static_scan_rule_pack_reports_seeded_findings_and_honors_policy() {
         "#include <cstdio>\n#include <cstdlib>\nvoid fmt_rule(char *input) { std::printf(input); }\n",
     )
     .unwrap();
-    // Seed the Ada hazard SITES (instantiations + a spawn), not the bare `with`
-    // context clauses — an import is not a hazard and is no longer flagged.
+    // Seed the Ada hazard SITES, not the bare `with` context clauses or the
+    // instantiations: a pointer-forging conversion, a double free through an
+    // alias, a task writing shared state, and a spawn of a non-constant program.
     fs::write(
         src.join("rules.adb"),
-        "with Ada.Command_Line;\nwith Ada.Unchecked_Conversion;\nwith Ada.Unchecked_Deallocation;\nwith GNAT.OS_Lib;\nprocedure Rules is\n   type Obj is null record;\n   type Obj_Access is access Obj;\n   function Conv is new Ada.Unchecked_Conversion (Integer, Float);\n   procedure Free is new Ada.Unchecked_Deallocation (Obj, Obj_Access);\n   task type Worker;\n   task body Worker is\n   begin\n      null;\n   end Worker;\nbegin\n   GNAT.OS_Lib.Spawn (Command);\nend Rules;\n",
+        "with Ada.Unchecked_Conversion;\nwith Ada.Unchecked_Deallocation;\nwith GNAT.OS_Lib;\npackage body Rules is\n   type Obj is null record;\n   type Obj_Access is access Obj;\n   function Conv is new Ada.Unchecked_Conversion (Integer, Obj_Access);\n   procedure Free is new Ada.Unchecked_Deallocation (Obj, Obj_Access);\n   Count : Natural := 0;\n   task body Worker is\n   begin\n      Count := Count + 1;\n   end Worker;\n   procedure Drop (P : in out Obj_Access) is\n      Q : Obj_Access := P;\n   begin\n      Free (P);\n      Free (Q);\n   end Drop;\n   procedure Run (Tool : Settings) is\n   begin\n      GNAT.OS_Lib.Spawn (Tool.Program.all, No_Args, Ok);\n      Put_Line (Natural'Image (Count));\n   end Run;\nend Rules;\n",
     )
     .unwrap();
     fs::write(
