@@ -30,7 +30,8 @@ COPYLEFT="$OUT/COPYLEFT-SOURCES.txt"
     echo
     echo "Non-dpkg components, all permissive: Rust toolchain (Apache-2.0 OR MIT),"
     echo "esbuild (MIT), SharpFuzz + dnlib (MIT), ASM/asm-tree (BSD-3-Clause),"
-    echo "bhf (Apache-2.0)."
+    echo ".NET SDK from Microsoft's release archive (MIT; LICENSE.txt and"
+    echo "ThirdPartyNotices.txt in /usr/share/bhf/licenses/csharp), bhf (Apache-2.0)."
     echo
     echo "| Package | Version | Source | Declared license(s) |"
     echo "|---|---|---|---|"

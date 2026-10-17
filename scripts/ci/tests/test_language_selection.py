@@ -61,6 +61,9 @@ class LanguageSelectionTests(unittest.TestCase):
         self.assertEqual(packages('js,ts'), [])  # Node installed from pinned archive.
         self.assertIn('php-pcov', packages('php'))
         self.assertIn('zlib1g-dev', packages('ruby'))
+        # .NET SDK installed from Microsoft's pinned archive; apt supplies its native deps.
+        self.assertNotIn('dotnet-sdk-8.0', packages('csharp'))
+        self.assertIn('libicu74', packages('csharp'))
 
     def test_contradictory_build_options_rejected_before_docker(self):
         for options in [['--languages', 'java', '--flavor', 'runtime'],

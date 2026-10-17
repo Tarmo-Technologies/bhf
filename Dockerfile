@@ -156,6 +156,25 @@ RUN source /usr/local/share/bhf/language-selection.sh; \
     && /usr/local/go/bin/go version ; \
     fi
 
+# .NET SDK from Microsoft's release archive (pinned + checksum-verified).
+# Ubuntu noble still ships 8.0.131, which bundles NuGet assemblies with fixed
+# CVEs; 8.0.132 (runtime 8.0.32) carries the fixes.
+ARG DOTNET_SDK_VERSION=8.0.132
+RUN source /usr/local/share/bhf/language-selection.sh; \
+    languages="$(cat /usr/local/share/bhf/selected-languages.txt)"; \
+    if bhf_has_language "$languages" csharp; then \
+    source /usr/local/share/bhf/toolchain-platform.sh; bhf_toolchain_platform "$TARGETARCH"; \
+    curl --proto '=https' --tlsv1.2 -fsSLo /tmp/dotnet.tgz \
+        "https://builds.dotnet.microsoft.com/dotnet/Sdk/${DOTNET_SDK_VERSION}/dotnet-sdk-${DOTNET_SDK_VERSION}-linux-${BHF_DOTNET_ARCH}.tar.gz" \
+    && echo "${BHF_DOTNET_SHA512}  /tmp/dotnet.tgz" | sha512sum -c - \
+    && mkdir -p /usr/share/dotnet /usr/share/bhf/licenses/csharp && tar -C /usr/share/dotnet -xzf /tmp/dotnet.tgz \
+    && rm -f /tmp/dotnet.tgz \
+    && cp /usr/share/dotnet/LICENSE.txt /usr/share/bhf/licenses/csharp/dotnet-LICENSE.txt \
+    && cp /usr/share/dotnet/ThirdPartyNotices.txt /usr/share/bhf/licenses/csharp/dotnet-ThirdPartyNotices.txt \
+    && ln -s /usr/share/dotnet/dotnet /usr/local/bin/dotnet \
+    && DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 dotnet --list-sdks ; \
+    fi
+
 COPY --from=javascript-tools /out/ /
 
 # Maven's upstream distribution retains its bundled licenses and has newer

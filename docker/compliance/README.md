@@ -22,6 +22,12 @@ license review or a publisher-authenticated release.
 | `/usr/share/bhf/licenses/fetch-sources.sh` | `fetch-sources.sh` | downloads matching Ubuntu source for the copyleft list |
 | `/usr/share/bhf/sbom/os.cyclonedx.json` | `generate-sbom.sh` | CycloneDX SBOM of the OS package layer (EO 14028) |
 | `/usr/share/doc/<pkg>/copyright` | apt | authoritative full per-package license text (retained) |
+| `/usr/share/bhf/licenses/csharp/` | .NET SDK archive | Microsoft's `LICENSE.txt` and `ThirdPartyNotices.txt` for the .NET SDK |
+
+The .NET SDK is installed from Microsoft's checksum-pinned release archive, not
+Ubuntu's `dotnet8` package: Ubuntu noble still ships 8.0.131, whose bundled
+NuGet assemblies have fixed CVEs that 8.0.132 resolves. It is therefore absent
+from the dpkg-generated notices and copyleft list.
 
 All generators are **offline / deterministic** (dpkg only) so they reproduce on
 an air-gapped host. bhf's own software composition (its Rust crates, with CVE +
