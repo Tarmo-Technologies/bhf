@@ -168,10 +168,17 @@ The static scanner now emits:
   resolution, overload arity filtering, string-literal-aware comment matching,
   and explicit unresolved-call gaps when source is missing.
 - CWE/CERT/MISRA-oriented seed rules for unsafe string copy, path-controlled
-  file opens, environment reads, unchecked integer conversion, nonliteral
-  format strings, Ada unchecked conversion, Ada unchecked deallocation, Ada
-  tasking constructs, Ada process/runtime dependencies, and broad Ada exception
-  suppression.
+  file opens, environment reads, unchecked integer conversion, and nonliteral
+  format strings.
+- Ada structural rules (statement and scope model, not line matching):
+  suppressed index/range/overflow checks, access values forged by
+  Unchecked_Conversion, address overlays, local `'Unchecked_Access` escapes,
+  double free and use after free through an alias, unprotected task writes,
+  non-constant spawns, SQL concatenation, unsafe C imports, leaked `New_String`,
+  secrets in logs, exceptions escaping C exports or `Finalize`, peer-sized
+  `String'Input`, predictable random values and MD5/SHA-1 password hashes, and
+  broad `when others => null` handlers. See
+  the Ada rule design (`docs/designs/2026-10-16-ada-static-rules.md`).
 - Framework and embedded-browser hardening checks for Django deployment
   settings (`SECURE_SSL_REDIRECT`, HSTS, proxy HTTPS state, nosniff, referrer
   policy, CSRF/session cookies), Flask host/CSRF controls, Electron renderer

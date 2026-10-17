@@ -311,6 +311,14 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "benchmarks/static/corpus/ada/safe.adb",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "benchmarks/static/corpus/ada/vuln.adb",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "benchmarks/static/corpus/c/alloc_size.c",
       "license": "Apache-2.0"
     },
@@ -3959,6 +3967,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/static_analysis/src/ada_rules.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/static_analysis/src/lib.rs",
       "license": "Apache-2.0"
     },
@@ -4228,6 +4240,10 @@
     },
     {
       "path": "docs/designs/2026-10-02-stateful-protocol-sessions.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/designs/2026-10-16-ada-static-rules.md",
       "license": "Apache-2.0"
     },
     {

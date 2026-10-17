@@ -14,6 +14,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
+mod ada_rules;
 mod taint_spec;
 
 pub const STATIC_SCHEMA_VERSION: &str = "bhf.static.v1";
@@ -567,6 +568,17 @@ pub fn remediation_for(rule_id: &str) -> &'static str {
         "BHF-417" => "Create temporary files atomically with a system API that uses an unpredictable name and exclusive creation; never reuse a caller-controlled temp path.",
         "BHF-418" => "Perform validation and use as one atomic operation on the same opened handle; avoid check-then-open path logic and use no-follow/exclusive flags where supported.",
         "BHF-304" | "BHF-404" | "BHF-412" => "Pass arguments as a list to a fixed program (execve-style), or validate against an allowlist — never build a shell string from input.",
+        "BHF-409" => "Keep raw addresses out of access types: use 'Access on aliased objects, or validate the address against a known object table before converting.",
+        "BHF-410" => "Give each allocation one owning access variable; after Free, null every alias or restructure so no copy survives the deallocation.",
+        "BHF-411" => "Move the shared state into a protected object, or mark it Atomic when single-word updates are enough.",
+        "BHF-564" => "Remove the Suppress pragma, or confine it to code whose absence of run-time errors is proved (for example with SPARK).",
+        "BHF-565" => "Remove the Suppress pragma; use a modular type where wrap-around is intended and range-check sizes and indexes.",
+        "BHF-566" => "Use 'Access so the accessibility check rejects the escape, or allocate the object with the lifetime the access value needs.",
+        "BHF-567" => "Decode the bytes explicitly, or use Unchecked_Conversion between same-sized types followed by a 'Valid check, instead of an address overlay.",
+        "BHF-568" => "Bind a bounded C function (strncpy/snprintf/fgets), spawn with an argument list instead of system/popen, or implement the operation in Ada.",
+        "BHF-569" => "Do not log the secret; log a redacted marker, its length or a non-reversible fingerprint.",
+        "BHF-570" => "Wrap the exported body in `exception when others =>` and return an error status to the foreign caller.",
+        "BHF-571" => "Handle every error inside Finalize and never let an exception propagate out of it.",
         "BHF-405" => "Canonicalize the path and confirm it stays within an allowed base directory (reject `..`); prefer an opaque id over a caller-supplied path.",
         "BHF-419" => "Use a parameterized/prepared query with bound arguments; never concatenate or format input into SQL.",
         "BHF-420" | "BHF-421" => "Do not eval/deserialize untrusted data; use a safe loader (JSON, `yaml.safe_load`, an allowlisted schema).",
@@ -23135,206 +23147,9 @@ fn java_jndi_injection_column(
 }
 
 fn scan_ada(root: &Path, path: &Path, source: &str, findings: &mut Vec<StaticFinding>) {
-    for (line_index, line) in source.lines().enumerate() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("--") {
-            continue;
-        }
-        let folded = trimmed.to_ascii_lowercase();
-        if !(folded.contains("when others") && folded.contains("=> null")) {
-            continue;
-        }
-        let column = line.find("when").unwrap_or(0) + 1;
-        findings.push(static_finding(
-            root,
-            path,
-            line_index,
-            column,
-            "BHF-402",
-            "ada",
-            "broad-exception-suppression",
-            "Broad Ada exception handler suppresses all failures",
-            StaticEvidence {
-                kind: "handler".to_owned(),
-                detail: "A when others handler immediately discards the exception.".to_owned(),
-                snippet: line.trim().to_owned(),
-            },
-        ));
-    }
-    for (line_index, line) in source.lines().enumerate() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("--") {
-            continue;
-        }
-        let folded = trimmed.to_ascii_lowercase();
-        // A `with`/`use` context clause is an IMPORT, not a hazard site — the
-        // instantiation or call it enables is what gets flagged. Skipping it
-        // removes the dominant Ada false positive (`with GNAT.OS_Lib;`,
-        // `with Ada.Unchecked_Deallocation;`).
-        let is_context_clause = folded.starts_with("with ")
-            || folded.starts_with("use ")
-            || folded.starts_with("limited with ")
-            || folded.starts_with("private with ");
-        // A subprogram DECLARATION or a block/subprogram terminator (`end Spawn;`)
-        // is not an operation site — skip both for the call/instantiation rules.
-        let is_subprogram_decl =
-            folded.starts_with("function ") || folded.starts_with("procedure ");
-        let is_terminator = folded.starts_with("end ");
-        if !is_context_clause && folded.contains("unchecked_conversion") {
-            findings.push(static_finding(
-                root,
-                path,
-                line_index,
-                line.to_ascii_lowercase()
-                    .find("unchecked_conversion")
-                    .unwrap_or(0)
-                    + 1,
-                "BHF-409",
-                "ada",
-                "ada-unchecked-conversion",
-                "Ada unchecked conversion dependency",
-                StaticEvidence {
-                    kind: "ada_dependency".to_owned(),
-                    detail: "Ada.Unchecked_Conversion bypasses normal type safety.".to_owned(),
-                    snippet: line.trim().to_owned(),
-                },
-            ));
-        }
-        if !is_context_clause && folded.contains("unchecked_deallocation") {
-            findings.push(static_finding(
-                root,
-                path,
-                line_index,
-                line.to_ascii_lowercase()
-                    .find("unchecked_deallocation")
-                    .unwrap_or(0)
-                    + 1,
-                "BHF-410",
-                "ada",
-                "ada-unchecked-deallocation",
-                "Ada unchecked deallocation dependency",
-                StaticEvidence {
-                    kind: "ada_dependency".to_owned(),
-                    detail: "Ada.Unchecked_Deallocation introduces manual lifetime risk."
-                        .to_owned(),
-                    snippet: line.trim().to_owned(),
-                },
-            ));
-        }
-        if contains_ada_tasking_construct(&folded) {
-            findings.push(static_finding(
-                root,
-                path,
-                line_index,
-                line.to_ascii_lowercase()
-                    .find("task")
-                    .or_else(|| line.to_ascii_lowercase().find("protected"))
-                    .or_else(|| line.to_ascii_lowercase().find("accept"))
-                    .unwrap_or(0)
-                    + 1,
-                "BHF-411",
-                "ada",
-                "ada-tasking-hazard",
-                "Ada tasking construct (concurrency surface)",
-                StaticEvidence {
-                    kind: "ada_tasking".to_owned(),
-                    detail: "Ada tasking/protected-object constructs need concurrency review."
-                        .to_owned(),
-                    snippet: line.trim().to_owned(),
-                },
-            ));
-        }
-        if !is_context_clause
-            && !is_subprogram_decl
-            && !is_terminator
-            && contains_ada_runtime_dependency(&strip_ada_string_literals(&folded))
-        {
-            findings.push(static_finding(
-                root,
-                path,
-                line_index,
-                line.to_ascii_lowercase()
-                    .find("spawn")
-                    .or_else(|| line.to_ascii_lowercase().find("ada.command_line"))
-                    .unwrap_or(0)
-                    + 1,
-                "BHF-412",
-                "ada",
-                "ada-process-runtime-dependency",
-                "Ada process/runtime dependency",
-                StaticEvidence {
-                    kind: "ada_runtime_dependency".to_owned(),
-                    detail: "Process, command-line, or OS integration needs explicit enclave policy modeling."
-                        .to_owned(),
-                    snippet: line.trim().to_owned(),
-                },
-            ));
-        }
-        // A subprogram DECLARATION (`function Open (Path : ...) return ...`) is not
-        // a call site; the parenthesised precedence also had to be corrected so a
-        // literal `Text_IO.Open` still requires the path-like guard.
-        let opens_file = folded.contains("text_io.open")
-            || (folded.contains("open (") && folded.contains("path"));
-        if opens_file && !is_subprogram_decl {
-            findings.push(static_finding(
-                root,
-                path,
-                line_index,
-                line.to_ascii_lowercase().find("open").unwrap_or(0) + 1,
-                "BHF-405",
-                "ada",
-                "path-controlled-file-open",
-                "Path-like value reaches an Ada file-open call",
-                StaticEvidence {
-                    kind: "file_open".to_owned(),
-                    detail: "A path-like argument is passed to a file-open API.".to_owned(),
-                    snippet: line.trim().to_owned(),
-                },
-            ));
-        }
-    }
-}
-
-fn contains_ada_tasking_construct(folded_line: &str) -> bool {
-    let trimmed = folded_line.trim_start();
-    trimmed.starts_with("task ")
-        || trimmed.starts_with("task type ")
-        || trimmed.starts_with("task body ")
-        || trimmed.starts_with("protected ")
-        || trimmed.starts_with("protected type ")
-        || trimmed.starts_with("accept ")
-        // Word boundary: bare `select` statement only — not `Selected`/`Selection`.
-        || trimmed == "select"
-        || trimmed.starts_with("select ")
-}
-
-/// BHF-412 (CWE-78) surface: actual process EXECUTION (`Spawn`/`Non_Blocking_Spawn`)
-/// or an attacker-facing command-line ARGUMENT read. A plain reference to a
-/// GNAT.OS_Lib operation that does not spawn (Close, Copy_File_Attributes, an
-/// `Argument_List` type declaration) or a socket import is not command execution
-/// and is excluded — that reference-anywhere match was the rule's noise floor.
-fn contains_ada_runtime_dependency(folded_line: &str) -> bool {
-    folded_line.contains("spawn") || folded_line.contains("ada.command_line.argument")
-}
-
-/// Blank out the contents of Ada `"..."` string literals so a keyword mentioned
-/// only inside a log message (`Trace.Detail ("Spawning: " & …)`) is not mistaken
-/// for a real call. Ada escapes a quote by doubling it, but blanking each span
-/// between quote characters is sufficient for a keyword-substring guard.
-fn strip_ada_string_literals(line: &str) -> String {
-    let mut out = String::with_capacity(line.len());
-    let mut in_string = false;
-    for ch in line.chars() {
-        if ch == '"' {
-            in_string = !in_string;
-            out.push('"');
-        } else if in_string {
-            out.push(' ');
-        } else {
-            out.push(ch);
-        }
-    }
-    out
+    // Ada path traversal (BHF-405) is reported by the taint engine's Ada file-open
+    // sinks; the former `open (` + "path" line heuristic was nearly all noise.
+    ada_rules::scan(root, path, source, findings);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39301,25 +39116,6 @@ mod tests {
         let g553: Vec<_> = findings.iter().filter(|f| f.rule_id == "BHF-553").collect();
         assert_eq!(g553.len(), 1, "exactly the library parse().unwrap() fires");
         assert_eq!(g553[0].location.line, 2);
-    }
-
-    /// BHF-411 tasking word boundary: `select` matches only the bare statement,
-    /// never `Selected`/`Selection`. BHF-412 runtime dependency is spawn/argv only,
-    /// after string literals are blanked.
-    #[test]
-    fn ada_tasking_and_runtime_word_boundaries() {
-        assert!(contains_ada_tasking_construct("select"));
-        assert!(contains_ada_tasking_construct("select "));
-        assert!(!contains_ada_tasking_construct("selected : integer := 0;"));
-        assert!(!contains_ada_tasking_construct(
-            "selection.targets (choice);"
-        ));
-        assert!(contains_ada_runtime_dependency("gnat.os_lib.spawn (cmd);"));
-        assert!(!contains_ada_runtime_dependency("gnat.os_lib.close (fd);"));
-        // A keyword only inside a string literal is not a real call.
-        assert!(!contains_ada_runtime_dependency(
-            &strip_ada_string_literals("trace.detail (\"spawning: \" & x);")
-        ));
     }
 
     /// BHF-405 fires only on a non-literal path CALL, never a literal path or a

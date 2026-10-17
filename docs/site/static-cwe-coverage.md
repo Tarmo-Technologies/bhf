@@ -20,7 +20,7 @@ a maybe.
 |---|---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
 | CWE-78 | OS command injection | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | |
 | CWE-79 | Cross-site scripting / raw HTML sink | | | | | | | | | ✅ | |
-| CWE-89 | SQL injection | | | ✅ | ✅ | | ✅ | ✅ | | ✅ | |
+| CWE-89 | SQL injection | ✅ | | ✅ | ✅ | | ✅ | ✅ | | ✅ | |
 | CWE-90 | LDAP injection | | | | | | ✅ | ✅ | | ✅ | |
 | CWE-94 | Code injection (eval/exec) | | | | | | | ✅ | ✅ | ✅ | |
 | CWE-117 | Log injection / log forging | | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | | | |
@@ -33,13 +33,13 @@ a maybe.
 | CWE-943 | NoSQL injection | | | | | | | | | ✅ | |
 | CWE-943 | GraphQL injection (dynamic `gql()` operation) | | | | | | | ✅ | | | |
 | CWE-470 | Unsafe reflection (tainted class/module name) | | | | | | ✅ | ✅ | | | |
-| CWE-789 | Uncontrolled allocation size (tainted alloc size) | | ✅ | ✅ | ✅ | ✅ | ✅ | | | | |
+| CWE-789 | Uncontrolled allocation size (tainted alloc size) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | | | | |
 | CWE-918 | SSRF (attacker-controlled URL) | | | | ✅ | ✅ | ✅ | ✅ | | ✅ | ✅⁵ |
 | CWE-295 | TLS verification disabled | | | | ✅ | ✅ | ✅ | ✅ | | ✅ | |
 | CWE-319 | Cleartext/downgrade transport controls | | | ✅³ | | | | ✅⁴ | | ✅⁶ | |
 | CWE-22 | Path traversal | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅¹ | ✅ | ✅⁷ | |
-| CWE-327 | Weak cryptography | | ✅ | ✅ | ✅ | | ✅ | ✅ | ✅ | ✅ | |
-| CWE-338 | Insecure randomness (security context) | | ✅ | ✅ | ✅ | | ✅ | ✅ | ✅ | ✅ | |
+| CWE-327 | Weak cryptography | ✅ | ✅ | ✅ | ✅ | | ✅ | ✅ | ✅ | ✅ | |
+| CWE-338 | Insecure randomness (security context) | ✅ | ✅ | ✅ | ✅ | | ✅ | ✅ | ✅ | ✅ | |
 | CWE-347 | Improper JWT signature verification | | | | | | ✅ | ✅ | | ✅ | |
 | CWE-352 | CSRF protection disabled | | | | | | ✅ | ✅ | | ✅ | |
 | CWE-693 | Protection mechanism disabled | | | ✅⁸ | | | | ✅ | | ✅⁸ | ✅⁸ |
@@ -52,14 +52,22 @@ a maybe.
 | CWE-190 | Unchecked integer conversion | | ✅ | ✅ | | | | | | | |
 | CWE-457 | Use of uninitialized variable | | ✅ | ✅ | | | | | | | |
 | CWE-197 | Numeric truncation | | ✅ | ✅ | | | | | | | |
-| CWE-416 | Use-after-free (static, intraprocedural) | | ✅ | ✅ | | | | | | | |
-| CWE-415 | Double free (static, intraprocedural) | | ✅ | ✅ | | | | | | | |
+| CWE-416 | Use-after-free (static, intraprocedural) | ✅ | ✅ | ✅ | | | | | | | |
+| CWE-415 | Double free (static, intraprocedural) | ✅ | ✅ | ✅ | | | | | | | |
 | CWE-15 | External control of setting (env) | | ✅ | ✅ | | | | | | | |
 | CWE-250/266/269/284/668 | Excess privilege / weak isolation | | | | | | | | | | ✅ |
 | CWE-494/829 | Mutable or unverified build inputs | | | | | | | | | | ✅ |
-| CWE-704 | Incorrect type conversion (Ada Unchecked_Conversion) | ✅ | | | | | | | | | |
-| CWE-362 | Race condition (Ada tasking) | ✅ | | | | | | | | | |
+| CWE-843 | Type confusion (Ada access forged by Unchecked_Conversion, address overlay) | ✅ | | | | | | | | | |
+| CWE-567 | Unsynchronized shared data (Ada task writes package state) | ✅ | | | | | | | | | |
 | CWE-755 | Improper exception handling (broad Ada handler) | ✅ | | | | | | | | | |
+| CWE-129 | Index/range checks suppressed (Ada `pragma Suppress`) | ✅ | | | | | | | | | |
+| CWE-190 | Overflow check suppressed (Ada `pragma Suppress`) | ✅ | | | | | | | | | |
+| CWE-562 | Local object access escapes its frame (Ada `'Unchecked_Access`) | ✅ | | | | | | | | | |
+| CWE-676 | Unsafe C function imported (Ada `pragma Import`) | ✅ | | | | | | | | | |
+| CWE-401 | C string never freed (Ada `New_String`) | ✅ | | | | | | | | | |
+| CWE-532 | Secret written to a log or console | ✅ | | | | | | | | | |
+| CWE-248 | Exception escapes a subprogram exported to C | ✅ | | | | | | | | | |
+| CWE-460 | Exception propagates out of `Finalize` | ✅ | | | | | | | | | |
 
 ¹ Python path traversal is covered by both the taint/oracle path (`open()` on a
 non-literal path) and `BHF-542`, which flags `tarfile.extract()`/`extractall()`
@@ -214,6 +222,13 @@ A blanket rule (bandit's `B311`, gosec's `G404`) flags *every* `random()`, most 
 which are benign jitter, sampling, or test-data uses; bhf reports the
 security-relevant subset and skips the crypto-secure sources (`secrets`,
 `crypto/rand`, `SecureRandom`, `getrandom`, `urandom`) outright.
+
+The Ada rows come from a statement and scope model of each unit
+(`ada_rules.rs`), not line patterns. The rule list, the false-positive patterns
+each rule excludes, and the precision measured on 18 public Ada projects are in
+the Ada rule design (`docs/designs/2026-10-16-ada-static-rules.md`). The Ada CWE-416/415 rows
+are use-after-free and double free through a local alias of a deallocated access
+value (`BHF-437`/`BHF-410`).
 
 The **CWE-457 / CWE-197** rows for C/C++ come from an intraprocedural def-use
 pass (uninitialized-variable read, narrowing numeric cast), not a line pattern —

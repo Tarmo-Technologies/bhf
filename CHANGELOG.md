@@ -2,6 +2,29 @@
 
 # Changelog
 
+## Unreleased
+
+### Changed
+- Ada static rules run on a statement and scope model instead of line
+  matching. BHF-409 now reports only Unchecked_Conversion to an access type
+  (and Address_To_Access_Conversions), BHF-410 a double free through an alias,
+  BHF-411 a task writing unprotected package state, and BHF-412 a spawn of a
+  non-constant program or shell command. Plain instantiations, tasking
+  constructs and constant spawns are no longer findings. BHF-402 ignores case
+  statements, `Finalize` handlers and cleanup-only guards. The Ada BHF-405 line
+  heuristic is removed (the taint engine still reports Ada file-open sinks).
+  Test trees, GNAT binder output and predefined-hierarchy runtime units are
+  not scanned. CWE mappings: BHF-409 CWE-704 -> CWE-843, BHF-411
+  CWE-362 -> CWE-567 (Base entries).
+
+### Added
+- Ada rules BHF-564 (index/range checks suppressed), BHF-565 (overflow check
+  suppressed), BHF-566 (local `'Unchecked_Access` escapes), BHF-567 (address
+  overlay), BHF-568 (unsafe C function imported), BHF-569 (secret logged),
+  BHF-570 (exception escapes a C export), BHF-571 (raise out of `Finalize`), and
+  Ada coverage for BHF-419, 422, 428, 436, 437 and 550. See
+  `docs/designs/2026-10-16-ada-static-rules.md`.
+
 ## 0.3.0 - 2026-10-05
 
 ### Breaking
