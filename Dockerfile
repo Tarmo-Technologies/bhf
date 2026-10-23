@@ -24,8 +24,10 @@
 
 # Bootstrap HTTPS from an exact, checksum-verified Ubuntu CA package. This
 # avoids a mutable apt install before selecting the reviewed archive snapshot.
+# The package comes from that snapshot (UBUNTU_SNAPSHOT below): the archive
+# pool drops a version once it is superseded, the snapshot keeps it.
 FROM ubuntu:24.04@sha256:ac3a3d13e90c660a1cb3e89ec695533399f7378dc1ae5fbdc28eb5781d561594 AS certificates
-ADD --checksum=sha256:6bac2a01979e210d9eac1d4d56747ec709ea60654744d66705dc3c36e7629e50 https://archive.ubuntu.com/ubuntu/pool/main/c/ca-certificates/ca-certificates_20260601~24.04.1_all.deb /tmp/ca.deb
+ADD --checksum=sha256:8a0a754aaafed72cc8efb8c1731808133284a84fbfc76a4fcc73fce9e01b4187 https://snapshot.ubuntu.com/ubuntu/20261023T000000Z/pool/main/c/ca-certificates/ca-certificates_20260816ubuntu0.24.04.1_all.deb /tmp/ca.deb
 RUN dpkg-deb -x /tmp/ca.deb /tmp/ca \
     && mkdir /certificates \
     && cat /tmp/ca/usr/share/ca-certificates/mozilla/*.crt > /certificates/ca-certificates.crt
@@ -34,7 +36,7 @@ FROM ubuntu:24.04@sha256:ac3a3d13e90c660a1cb3e89ec695533399f7378dc1ae5fbdc28eb57
 COPY --from=certificates /certificates/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 ARG TARGETARCH
 COPY docker/toolchain-platform.sh /usr/local/share/bhf/toolchain-platform.sh
-ARG UBUNTU_SNAPSHOT=20261016T000000Z
+ARG UBUNTU_SNAPSHOT=20261023T000000Z
 RUN printf 'APT::Snapshot "%s";\nAPT::Update::Error-Mode "any";\n' "${UBUNTU_SNAPSHOT}" > /etc/apt/apt.conf.d/50snapshot
 # Ubuntu ports sources do not opt into APT's snapshot selector. Use an
 # explicit snapshot URL on ARM64 and avoid filtering it a second time.
@@ -143,7 +145,7 @@ RUN source /usr/local/share/bhf/language-selection.sh; \
     && printf '%s\n' "$BHF_ENGINES" > /usr/local/share/bhf/selected-engines.txt
 
 # Go from upstream (pinned + checksum-verified).
-ARG GO_VERSION=1.27.2
+ARG GO_VERSION=1.27.3
 RUN source /usr/local/share/bhf/language-selection.sh; \
     languages="$(cat /usr/local/share/bhf/selected-languages.txt)"; \
     if bhf_has_language "$languages" go; then \

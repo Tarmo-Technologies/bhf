@@ -58,7 +58,7 @@ jobs:
           name: language-selection-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/selection-evidence/
           if-no-files-found: error
-          retention-days: 90
+          retention-days: 7
 
   candidate:
     needs: [validate-ci, language-matrix]
@@ -131,7 +131,7 @@ jobs:
           path: dist/container/
           compression-level: 0
           if-no-files-found: error
-          retention-days: 90
+          retention-days: 7
       - name: Retain acceptance and disposition even on failure
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -142,6 +142,7 @@ jobs:
             container-ada-acceptance/
             container-full-acceptance/
           if-no-files-found: error
+          retention-days: 7
 
   sign:
     needs: candidate
@@ -201,4 +202,4 @@ jobs:
           path: candidate/
           compression-level: 0
           if-no-files-found: error
-          retention-days: 90
+          retention-days: 7

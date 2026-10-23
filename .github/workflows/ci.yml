@@ -211,6 +211,7 @@ jobs:
             container-acceptance/
             container-ada-acceptance/
           if-no-files-found: error
+          retention-days: 7
 
   container-full:
     name: Default all-language container acceptance
@@ -232,6 +233,7 @@ jobs:
           name: container-full-${{ github.run_id }}-${{ github.run_attempt }}
           path: container-full-acceptance/
           if-no-files-found: error
+          retention-days: 7
 
   rhel7-build:
     name: RHEL 7 compatible build
@@ -298,6 +300,7 @@ jobs:
           name: bhf-el7-release
           path: target/bhf-el7-release.tar.gz
           if-no-files-found: error
+          retention-days: 7
 
       - name: Retain Linux component installer evidence
         if: ${{ always() }}
@@ -306,6 +309,7 @@ jobs:
           name: component-install-linux-${{ github.run_id }}-${{ github.run_attempt }}
           path: target/component-install-linux/
           if-no-files-found: error
+          retention-days: 7
 
   rhel-family-smoke:
     name: ${{ matrix.name }} release compatibility
@@ -502,6 +506,7 @@ jobs:
             target/distrib/*installer.ps1
             target/component-install-windows/
           if-no-files-found: error
+          retention-days: 7
 
       - name: Stage Windows release binaries
         shell: pwsh
@@ -517,6 +522,7 @@ jobs:
           name: bhf-windows-2022-release
           path: target/bhf-windows-release.zip
           if-no-files-found: error
+          retention-days: 7
 
   windows-current-build:
     name: Windows Server 2025 release compatibility
@@ -560,6 +566,7 @@ jobs:
           name: component-install-windows-2025-${{ github.run_id }}-${{ github.run_attempt }}
           path: target/component-install-windows-2025/
           if-no-files-found: error
+          retention-days: 7
 
   ci-acceptance:
     # Make this the required check in branch protection. It is intentionally
@@ -628,4 +635,4 @@ jobs:
           name: ci-acceptance-${{ github.run_id }}-${{ github.run_attempt }}
           path: ci-acceptance.json
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 7
