@@ -94,7 +94,7 @@ jobs:
           components: clippy
 
       - name: Install Node
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 20
           cache: npm
@@ -204,7 +204,7 @@ jobs:
         run: bash scripts/ci/container-ada-acceptance.sh
       - name: Retain container acceptance evidence
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: container-core-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -228,7 +228,7 @@ jobs:
         run: bash scripts/ci/container-full-acceptance.sh
       - name: Retain full-language container evidence
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: container-full-${{ github.run_id }}-${{ github.run_attempt }}
           path: container-full-acceptance/
@@ -295,7 +295,7 @@ jobs:
             '
 
       - name: Upload EL7-baseline release binaries
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: bhf-el7-release
           path: target/bhf-el7-release.tar.gz
@@ -304,7 +304,7 @@ jobs:
 
       - name: Retain Linux component installer evidence
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: component-install-linux-${{ github.run_id }}-${{ github.run_attempt }}
           path: target/component-install-linux/
@@ -333,7 +333,7 @@ jobs:
           persist-credentials: false
 
       - name: Download EL7-baseline release binaries
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: bhf-el7-release
           path: target/platform-release
@@ -397,7 +397,7 @@ jobs:
           persist-credentials: false
 
       - name: Download EL7-baseline release binaries
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: bhf-el7-release
           path: target/platform-release
@@ -498,7 +498,7 @@ jobs:
 
       - name: Retain Windows component archives and installer evidence
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: bhf-windows-components
           path: |
@@ -517,7 +517,7 @@ jobs:
             -DestinationPath target\bhf-windows-release.zip
 
       - name: Upload Windows Server 2022 release binaries
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: bhf-windows-2022-release
           path: target/bhf-windows-release.zip
@@ -536,7 +536,7 @@ jobs:
           persist-credentials: false
 
       - name: Download Windows Server 2022 release binaries
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: bhf-windows-2022-release
           path: target/platform-release
@@ -550,7 +550,7 @@ jobs:
         run: scripts/ci/windows-release-smoke.ps1 -BinaryDir target/platform-release/bin
 
       - name: Download generated Windows component archives and installers
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: bhf-windows-components
           path: target/component-release
@@ -561,7 +561,7 @@ jobs:
 
       - name: Retain Windows Server 2025 component installer evidence
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: component-install-windows-2025-${{ github.run_id }}-${{ github.run_attempt }}
           path: target/component-install-windows-2025/
@@ -630,7 +630,7 @@ jobs:
           PYTHON
       - name: Preserve acceptance or failure receipt
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ci-acceptance-${{ github.run_id }}-${{ github.run_attempt }}
           path: ci-acceptance.json
