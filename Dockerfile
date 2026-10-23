@@ -24,8 +24,10 @@
 
 # Bootstrap HTTPS from an exact, checksum-verified Ubuntu CA package. This
 # avoids a mutable apt install before selecting the reviewed archive snapshot.
+# The package comes from that snapshot (UBUNTU_SNAPSHOT below): the archive
+# pool drops a version once it is superseded, the snapshot keeps it.
 FROM ubuntu:24.04@sha256:ac3a3d13e90c660a1cb3e89ec695533399f7378dc1ae5fbdc28eb5781d561594 AS certificates
-ADD --checksum=sha256:6bac2a01979e210d9eac1d4d56747ec709ea60654744d66705dc3c36e7629e50 https://archive.ubuntu.com/ubuntu/pool/main/c/ca-certificates/ca-certificates_20260601~24.04.1_all.deb /tmp/ca.deb
+ADD --checksum=sha256:6bac2a01979e210d9eac1d4d56747ec709ea60654744d66705dc3c36e7629e50 https://snapshot.ubuntu.com/ubuntu/20261016T000000Z/pool/main/c/ca-certificates/ca-certificates_20260601~24.04.1_all.deb /tmp/ca.deb
 RUN dpkg-deb -x /tmp/ca.deb /tmp/ca \
     && mkdir /certificates \
     && cat /tmp/ca/usr/share/ca-certificates/mozilla/*.crt > /certificates/ca-certificates.crt
