@@ -64,7 +64,7 @@ jobs:
             ${{ runner.temp }}/dogfood.sarif
             ${{ runner.temp }}/dogfood_work/auto/
           if-no-files-found: ignore
-          retention-days: 14
+          retention-days: 7
 
       - name: Fail on a fuzz-confirmed finding
         run: |

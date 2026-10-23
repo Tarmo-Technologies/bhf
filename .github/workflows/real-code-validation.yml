@@ -129,3 +129,4 @@ jobs:
             ${{ runner.temp }}/real-code.json
             ${{ runner.temp }}/real-code.md
           if-no-files-found: ignore
+          retention-days: 7
