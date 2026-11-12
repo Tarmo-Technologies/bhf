@@ -98,7 +98,8 @@ pub struct ParamLayout {
     pub input: String,
     /// `scalar`, `bounded_int`, `enum_member`, `length_prefixed_string`,
     /// `capacity_string`, `rest_view`, `input_buffer`, `input_length`,
-    /// `input_stream`, `input_file`, `fixed` or `other`.
+    /// `input_end` (a pointer one past the bytes, a `[begin, end)` pair's
+    /// end), `input_stream`, `input_file`, `fixed` or `other`.
     pub decoder: String,
     /// The `bhf_decode.h` function that reads it, when one does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -531,6 +532,8 @@ fn decode_input(
             arg.decoded = true;
         }
         "input_buffer" | "input_stream" | "input_file" => fill_buffer(arg, bytes, param),
+        // One past the bytes: none of them.
+        "input_end" => fill_buffer(arg, &[], param),
         _ => {
             arg.reason = Some(
                 param
@@ -908,13 +911,23 @@ fn describe_cursor(param: &Described<'_>, layout: &mut ParamLayout) {
     });
 }
 
+/// Whether a whole-input decl points one past the input's bytes (`T end =
+/// (T)Data + Size`): the end of a `[begin, end)` pair, which points at none
+/// of them.
+pub(crate) fn points_past_input(decl: &str) -> bool {
+    let decl = decl.trim_end();
+    decl.ends_with(")Data + Size") || decl.ends_with("= Data + Size")
+}
+
 fn describe_input(param: &Described<'_>, layout: &mut ParamLayout) {
     let code = format!("{} {}", param.decl, param.arg);
     let pointer = param.ty.contains('*')
         || param.ty.contains('[')
         || matches!(param.shape, TypeShape::Pointer(_) | TypeShape::CString);
     let integer = matches!(param.shape, TypeShape::Scalar(kind) if !matches!(kind, ScalarKind::F32 | ScalarKind::F64));
-    if code.contains("fmemopen") {
+    if pointer && points_past_input(param.decl) {
+        layout.decoder = "input_end".to_owned();
+    } else if code.contains("fmemopen") {
         layout.decoder = "input_stream".to_owned();
     } else if code.contains("bhf_make_tempfile") {
         layout.decoder = "input_file".to_owned();
@@ -952,12 +965,20 @@ fn is_byte_container(ty: &str) -> bool {
 }
 
 /// Mark the `(buffer, length)` pairs among one call's whole-input
-/// parameters: a buffer and a length next to each other.
-pub(crate) fn pair_input_params(params: &mut [ParamLayout]) {
+/// parameters: a buffer and a length next to each other that take the same
+/// bytes (`groups` names the slice each takes, `None` for the bytes the
+/// cursor left), neither already paired.
+pub(crate) fn pair_input_params(params: &mut [ParamLayout], groups: &[Option<&str>]) {
     for at in 0..params.len().saturating_sub(1) {
+        if groups.get(at) != groups.get(at + 1) {
+            continue;
+        }
         let (left, right) = params.split_at_mut(at + 1);
         let (a, b) = (&mut left[at], &mut right[0]);
         if a.input != b.input || !matches!(a.input.as_str(), "remainder" | "whole_input") {
+            continue;
+        }
+        if a.paired_with.is_some() || b.paired_with.is_some() {
             continue;
         }
         let kinds = (a.decoder.as_str(), b.decoder.as_str());

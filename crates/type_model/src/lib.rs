@@ -19,6 +19,32 @@ pub fn crate_name() -> &'static str {
     "type_model"
 }
 
+/// The Win32 pointer typedefs of a byte, with whether the bytes they point
+/// at are `const`: `windows.h` defines `PBYTE`/`LPBYTE`/`PUCHAR` as
+/// `unsigned char *` and `PCBYTE`/`LPCBYTE`/`PCUCHAR` as
+/// `const unsigned char *`. Shared by the harness decoders and the target
+/// ranking, so both read these spellings as byte buffers. Each entry is
+/// (spelling, const).
+pub const WIN32_BYTE_POINTER_TYPEDEFS: &[(&str, bool)] = &[
+    ("PBYTE", false),
+    ("LPBYTE", false),
+    ("PUCHAR", false),
+    ("PCBYTE", true),
+    ("LPCBYTE", true),
+    ("PCUCHAR", true),
+];
+
+/// Whether `spelling` (surrounding whitespace ignored) is one of
+/// [`WIN32_BYTE_POINTER_TYPEDEFS`]: `Some(true)` for a pointer to `const`
+/// bytes, `Some(false)` for a writable one, `None` for any other spelling.
+pub fn win32_byte_pointer_typedef(spelling: &str) -> Option<bool> {
+    let spelling = spelling.trim();
+    WIN32_BYTE_POINTER_TYPEDEFS
+        .iter()
+        .find(|(name, _)| *name == spelling)
+        .map(|&(_, is_const)| is_const)
+}
+
 /// Canonical scalar spellings shared with `harness_gen`'s decoder
 /// table so the two never drift. Each entry is (spelling, kind).
 pub const SCALAR_SPELLINGS: &[(&str, ScalarKind)] = &[
@@ -975,6 +1001,19 @@ fn split_array(normalized: &str) -> Option<(&str, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn win32_byte_pointer_typedefs_carry_their_constness() {
+        for name in ["LPCBYTE", "PCBYTE", "PCUCHAR", " LPCBYTE "] {
+            assert_eq!(win32_byte_pointer_typedef(name), Some(true), "{name:?}");
+        }
+        for name in ["PBYTE", "LPBYTE", "PUCHAR"] {
+            assert_eq!(win32_byte_pointer_typedef(name), Some(false), "{name:?}");
+        }
+        for name in ["BYTE", "LPCSTR", "LPVOID", "lpcbyte"] {
+            assert_eq!(win32_byte_pointer_typedef(name), None, "{name:?}");
+        }
+    }
 
     #[test]
     fn cxx_character_types_resolve_to_integer_scalars() {

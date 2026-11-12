@@ -270,6 +270,14 @@ static inline size_t bhf_tr_readable(const void *p, size_t want, const uint8_t *
 #endif
 }
 
+/* Whether `p` is the end of the span [data, data + size): one past its last
+ * byte, as the `end` of a `[begin, end)` pair is. It points at none of the
+ * span's bytes, and past a buffer of exactly those bytes, so it is traced as
+ * empty without reading it. */
+static inline int bhf_tr_at_span_end(const void *p, const uint8_t *data, size_t size) {
+    return p && data && (size_t)p == (size_t)data + size;
+}
+
 static inline void bhf_tr_preview(const void *p, size_t n) {
     unsigned char tmp[BHF_TRACE_PREVIEW];
     if (n > BHF_TRACE_PREVIEW) n = BHF_TRACE_PREVIEW;
@@ -296,6 +304,11 @@ static inline void bhf_tr_ptr(const void *p, const uint8_t *data, size_t size,
     bhf_tl_str(",\"ptr\":\"");
     bhf_tl_hex_digits((uint64_t)(size_t)p);
     bhf_tl_raw("\"", 1);
+    if (bhf_tr_at_span_end(p, data, size)) {
+        bhf_tl_number("len", 0);
+        bhf_tr_preview(p, 0);
+        return;
+    }
     readable = bhf_tr_readable(p, BHF_TRACE_PREVIEW, data, size, &alloc, &alloc_known);
     if (alloc_known) {
         bhf_tl_number("alloc_size", (uint64_t)alloc);
@@ -324,6 +337,11 @@ static inline void bhf_tr_str(const char *s, const uint8_t *data, size_t size,
     bhf_tl_str(",\"ptr\":\"");
     bhf_tl_hex_digits((uint64_t)(size_t)s);
     bhf_tl_raw("\"", 1);
+    if (bhf_tr_at_span_end(s, data, size)) {
+        bhf_tl_number("len", 0);
+        bhf_tr_preview(s, 0);
+        return;
+    }
     readable = bhf_tr_readable(s, BHF_TRACE_STRING_MAX, data, size, &alloc, &alloc_known);
     if (alloc_known) {
         bhf_tl_number("alloc_size", (uint64_t)alloc);

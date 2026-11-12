@@ -563,8 +563,15 @@ fn build_cpp_param_decoders(
     let params = &params[..];
     let mut out = Vec::with_capacity(params.len());
     let mut i = 0;
-    let mut pair_consumed = false;
+    // The parameters each iteration decodes together, so every buffer of the
+    // call can be given its own bytes once the call is decoded.
+    let mut units: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut unit_start = 0;
     while i < params.len() {
+        if out.len() > unit_start {
+            units.push(unit_start..out.len());
+        }
+        unit_start = out.len();
         // User-defined-literal string operator: `operator"" _x(charT const *s,
         // size_t n)`. By [lex.ext] `n` is the literal's exact length, so it must
         // track the buffer — bind `s` via the standalone char decoder (a
@@ -628,8 +635,7 @@ fn build_cpp_param_decoders(
             i += 2;
             continue;
         }
-        if !pair_consumed
-            && i + 1 < params.len()
+        if i + 1 < params.len()
             // Both sides resolve through the type registry, as in the C lane: a
             // typedef'd byte pointer (`const u8_t *`, `const BYTE *`) or length
             // (`UINT`, `DWORD`) that failed to pair left the buffer a whole-input
@@ -638,7 +644,8 @@ fn build_cpp_param_decoders(
                 || crate::c_generate::registry_resolves_to_byte_pointer(
                     &params[i].cpp_type,
                     registry,
-                ))
+                )
+                || type_model::win32_byte_pointer_typedef(&params[i].cpp_type).is_some())
             && (is_length_cpp_param(&params[i + 1].cpp_type)
                 || crate::c_generate::registry_resolves_to_length(
                     &params[i + 1].cpp_type,
@@ -706,7 +713,6 @@ fn build_cpp_param_decoders(
                 free: None,
             });
             i += 2;
-            pair_consumed = true;
             continue;
         }
         let emission = match select_cpp_decoder_with_registry_limited(
@@ -753,6 +759,10 @@ fn build_cpp_param_decoders(
         out.push(emission);
         i += 1;
     }
+    if out.len() > unit_start {
+        units.push(unit_start..out.len());
+    }
+    crate::arg_trace::slice_input_units(&mut out, &units);
     Ok(out)
 }
 
@@ -1283,25 +1293,30 @@ fn build_cpp_context_common(
         && input.protocol_steps.is_empty()
         && is_cpp_byte_stream_decoder(&input.target.name, effective_params);
     let literal_operator = is_cpp_literal_operator(&input.target.name);
-    let mut params = if byte_stream {
-        build_cpp_param_decoders(
-            effective_params.get(1..).unwrap_or(&[]),
-            &registry,
-            input.handle_lifecycle,
-            &input.decoder_limits,
-            input.force,
-            literal_operator,
-        )?
+    // A parameter named like one of the harness's own locals (`Data`, `Size`,
+    // `Cur`) gets a local of its own; the trace keeps its declared name.
+    let local_params: Vec<CppParameter> = if byte_stream {
+        effective_params.get(1..).unwrap_or(&[])
     } else {
-        build_cpp_param_decoders(
-            effective_params,
-            &registry,
-            input.handle_lifecycle,
-            &input.decoder_limits,
-            input.force,
-            literal_operator,
-        )?
-    };
+        effective_params
+    }
+    .iter()
+    .enumerate()
+    .map(|(index, param)| CppParameter {
+        name: crate::arg_trace::harness_local_name(
+            &crate::c_decoders::sanitize_or_synthesize_param_name(&param.name, index),
+        ),
+        cpp_type: param.cpp_type.clone(),
+    })
+    .collect();
+    let mut params = build_cpp_param_decoders(
+        &local_params,
+        &registry,
+        input.handle_lifecycle,
+        &input.decoder_limits,
+        input.force,
+        literal_operator,
+    )?;
     apply_pugixml_buffer_cleanup(
         &input.target.qualifier_path,
         &input.target.name,
@@ -4624,6 +4639,57 @@ mod tests {
     }
 
     #[test]
+    fn cpp_run_together_and_win32_counts_bind_to_their_buffer() {
+        let registry = type_model::TypeRegistry::default();
+        for (buffer, length, buf_decl, len_decl) in [
+            (
+                ("buf", "const uint8_t *"),
+                ("nElem", "size_t"),
+                "const uint8_t * buf = (const uint8_t *)Data",
+                "size_t nElem = (size_t)Size",
+            ),
+            (
+                ("items", "const unsigned char *"),
+                ("number_of_bytes", "size_t"),
+                "const unsigned char * items = (const unsigned char *)Data",
+                "size_t number_of_bytes = (size_t)Size",
+            ),
+            (
+                ("pb", "const BYTE*"),
+                ("cb", "DWORD"),
+                "const BYTE * pb = (const BYTE *)Data",
+                "DWORD cb = (DWORD)Size",
+            ),
+        ] {
+            let decls = cpp_param_decls(&registry, &[buffer, length]);
+            assert_eq!(decls[0], buf_decl, "{buffer:?}/{length:?}: {decls:?}");
+            assert_eq!(decls[1], len_decl, "{buffer:?}/{length:?}: {decls:?}");
+        }
+        // A callback named `cb` is not a length: it is left to its own decoder,
+        // which the C++ lane does not have, rather than bound to the input size.
+        let params = [
+            CppParameter {
+                name: "p".to_owned(),
+                cpp_type: "const BYTE *".to_owned(),
+            },
+            CppParameter {
+                name: "cb".to_owned(),
+                cpp_type: "void (*)(int)".to_owned(),
+            },
+        ];
+        let error = build_cpp_param_decoders(
+            &params,
+            &registry,
+            &[],
+            &CppDecoderLimits::default(),
+            false,
+            false,
+        )
+        .expect_err("a callback has no C++ decoder");
+        assert!(error.to_string().contains("'cb'"), "{error}");
+    }
+
+    #[test]
     fn cpp_buffer_name_alone_does_not_bind_the_next_integer_to_the_input_length() {
         let registry = typedef_registry("typedef unsigned char u8_t;\n");
         let decls = cpp_param_decls(
@@ -4774,12 +4840,17 @@ mod tests {
              typedef const BYTE *LPCBYTE;\n\
              typedef BYTE *PBYTE;\n",
         );
-        for (buffer, length) in [
-            (("pbData", "LPCBYTE"), ("cbData", "DWORD")),
-            (("buf", "cu8_ptr"), ("len", "size_t")),
-            (("pbOut", "PBYTE"), ("cbOut", "ULONG")),
+        let default_registry = type_model::TypeRegistry::default();
+        for (buffer, length, registry) in [
+            (("pbData", "LPCBYTE"), ("cbData", "DWORD"), &registry),
+            (("buf", "cu8_ptr"), ("len", "size_t"), &registry),
+            (("pbOut", "PBYTE"), ("cbOut", "ULONG"), &registry),
+            (("pb", "LPCBYTE"), ("cb", "DWORD"), &registry),
+            // A Win32 spelling needs no typedef in the scanned tree.
+            (("pb", "LPCBYTE"), ("cb", "DWORD"), &default_registry),
+            (("pv", "PCUCHAR"), ("cch", "UINT"), &default_registry),
         ] {
-            let decls = cpp_param_decls(&registry, &[buffer, length]);
+            let decls = cpp_param_decls(registry, &[buffer, length]);
             let (buf_name, buf_type) = buffer;
             let (len_name, len_type) = length;
             assert!(
@@ -4795,6 +4866,28 @@ mod tests {
                     "{len_type} {len_name} = ({len_type})({buf_name} ? _bhf_cap_{buf_name} : 0)"
                 ),
                 "the length must track the copy: {decls:?}"
+            );
+        }
+    }
+
+    /// Alone, a pointer-typedef byte buffer is a heap copy of the input, not
+    /// one byte of storage.
+    #[test]
+    fn cpp_lone_pointer_typedef_byte_buffer_is_a_heap_copy_of_the_input() {
+        let registry = typedef_registry(
+            "typedef unsigned char BYTE;\n\
+             typedef const BYTE *cbytes_t;\n",
+        );
+        for (c_type, registry) in [
+            ("LPCBYTE", type_model::TypeRegistry::default()),
+            ("cbytes_t", registry),
+        ] {
+            let decls = cpp_param_decls(&registry, &[("p", c_type)]);
+            assert!(
+                !decls[0].contains("_bhf_out_p")
+                    && decls[0].contains("malloc(")
+                    && decls[0].contains("memcpy((void *)p, Data, Size)"),
+                "{c_type}: {decls:?}"
             );
         }
     }
@@ -6032,6 +6125,205 @@ mod tests {
             parameter_constructions: Vec::new(),
             receiver_class_override: None,
             factory_plan: None,
+        }
+    }
+
+    /// In the C++ lane too, every buffer of a call with several gets bytes
+    /// of its own: a sized slice for each but the last, whose length is its
+    /// buffer's size, and the bytes left for the last. The static layout
+    /// decodes the same values and spans as the trace.
+    #[test]
+    fn built_cpp_harness_gives_each_buffer_of_a_call_its_own_bytes() {
+        let out = temp_dir("cpp-merge-records");
+        let mut target = cpp_method("Widget", "feed");
+        target.api.is_method = true;
+        let args = cpp_args_for(
+            &out,
+            "H-CPP-MERGE",
+            target,
+            &[
+                ("a", "const uint8_t *"),
+                ("alen", "size_t"),
+                ("b", "const uint8_t *"),
+                ("blen", "size_t"),
+                ("x", "int"),
+            ],
+            &[("mode", "int")],
+            "#pragma once
+#include <cstddef>
+#include <cstdint>
+             class Widget {
+             public:
+                 explicit Widget(int mode) : mode_(mode) {}
+                 int feed(const uint8_t *a, std::size_t alen, const uint8_t *b,
+                          std::size_t blen, int x) {
+                     int s = mode_ + x;
+                     for (std::size_t i = 0; i < alen; i++) s += a[i];
+                     for (std::size_t i = 0; i < blen; i++) s += b[i];
+                     return s;
+                 }
+             private:
+                 int mode_;
+             };
+",
+        );
+        let Some(out) = build_cpp_harness(args) else {
+            return;
+        };
+        assert_cpp_compiles_warning_free(&out);
+        // The slice for `a` (4-byte length 2, then 2 bytes), `x`, the
+        // receiver's `mode`, then `b` takes what is left.
+        let input = [
+            2, 0, 0, 0, 0xa1, 0xa2, 5, 0, 0, 0, 9, 0, 0, 0, 0xb1, 0xb2, 0xb3,
+        ];
+        let args = cpp_traced_args(&out, &input);
+        let a = cpp_traced(&args, "a", None);
+        assert_eq!(a["span"], serde_json::json!([4, 6]), "{args:#?}");
+        assert_eq!(a["preview_hex"], "a1a2");
+        assert_eq!(cpp_traced(&args, "alen", None)["value"], "2");
+        assert_eq!(cpp_traced(&args, "x", None)["value"], "5");
+        assert_eq!(cpp_traced(&args, "mode", None)["value"], "9");
+        let b = cpp_traced(&args, "b", None);
+        assert_eq!(b["span"], serde_json::json!([14, 17]));
+        assert_eq!(b["preview_hex"], "b1b2b3");
+        assert_eq!(cpp_traced(&args, "blen", None)["value"], "3");
+        let layout = crate::arg_layout::ArgLayout::read(&out).unwrap().unwrap();
+        for input in [
+            &input[..],
+            &[32, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4],
+            b"",
+            &[0xff; 40],
+        ] {
+            let lines = cpp_traced_args(&out, input);
+            for stat in layout.decode(input) {
+                assert!(stat.decoded, "{stat:?}");
+                let trace = cpp_traced(&lines, &stat.name, None);
+                assert_eq!(
+                    serde_json::json!(stat.span),
+                    trace["span"],
+                    "{stat:?} vs {trace}"
+                );
+                if let Some(value) = &stat.value {
+                    assert_eq!(trace["value"], serde_json::json!(value), "{}", stat.name);
+                } else {
+                    assert_eq!(trace["len"], serde_json::json!(stat.len), "{}", stat.name);
+                }
+            }
+        }
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// C++ parameters named like the harness's own locals get locals of their
+    /// own, and keep their declared names in the trace and the layout.
+    #[test]
+    fn built_cpp_harness_renames_parameters_named_like_its_own_locals() {
+        let header = "#pragma once\n#include <cstddef>\n#include <cstdint>\n\
+             inline int last_of(const uint8_t *Data, std::size_t Size) {\n\
+             \x20   return Size ? Data[Size - 1] : 0;\n\
+             }\n\
+             inline int last_at(const uint8_t *Data, std::size_t Size, int level) {\n\
+             \x20   return Size ? Data[Size - 1] + level : level;\n\
+             }\n\
+             inline int walk(int Cur, int R, unsigned char _bhf_rest_p) {\n\
+             \x20   return Cur + R + _bhf_rest_p;\n\
+             }\n";
+        let cases: Vec<(&str, Vec<(&str, &str)>)> = vec![
+            (
+                "last_of",
+                vec![("Data", "const uint8_t *"), ("Size", "size_t")],
+            ),
+            (
+                "last_at",
+                vec![
+                    ("Data", "const uint8_t *"),
+                    ("Size", "size_t"),
+                    ("level", "int"),
+                ],
+            ),
+            (
+                "walk",
+                vec![
+                    ("Cur", "int"),
+                    ("R", "int"),
+                    ("_bhf_rest_p", "unsigned char"),
+                ],
+            ),
+        ];
+        for (name, params) in cases {
+            let out = temp_dir(&format!("cpp-reserved-{name}"));
+            let args = cpp_args_for(
+                &out,
+                "H-CPP-RESERVED",
+                cppfunction(name),
+                &params,
+                &[],
+                header,
+            );
+            let Some(out) = build_cpp_harness(args) else {
+                return;
+            };
+            let input = [7u8, 0, 0, 0, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+            let args = cpp_traced_args(&out, &input);
+            for (param, _) in &params {
+                cpp_traced(&args, param, None);
+            }
+            if let Some(size) = args.iter().find(|arg| arg["name"] == "Size") {
+                let level_bytes = if params.len() == 3 { 4 } else { 0 };
+                assert_eq!(
+                    size["value"],
+                    (input.len() - level_bytes).to_string(),
+                    "{name}: {args:#?}"
+                );
+            }
+            let layout = crate::arg_layout::ArgLayout::read(&out).unwrap().unwrap();
+            let names: Vec<&str> = layout.params().map(|p| p.name.as_str()).collect();
+            for (param, _) in &params {
+                assert!(names.contains(param), "{name}: {names:?}");
+            }
+            fs::remove_dir_all(&out).ok();
+        }
+    }
+
+    /// A correct function summing `count` bytes runs clean under its C++
+    /// harness when the count is named `nElem` or `cb`.
+    #[test]
+    fn built_cpp_harness_binds_run_together_and_win32_counts_to_their_buffer() {
+        let header = "#pragma once\n#include <cstddef>\n#include <cstdint>\n\
+             typedef unsigned char BYTE;\n\
+             typedef unsigned long DWORD;\n\
+             inline int sum_items(const uint8_t *buf, std::size_t nElem) {\n\
+             \x20   int s = 0;\n\
+             \x20   for (std::size_t i = 0; i < nElem; i++) s += buf[i];\n\
+             \x20   return s;\n\
+             }\n\
+             inline int sum_bytes(const BYTE *pb, DWORD cb) {\n\
+             \x20   int s = 0;\n\
+             \x20   for (DWORD i = 0; i < cb; i++) s += pb[i];\n\
+             \x20   return s;\n\
+             }\n";
+        for (name, params) in [
+            (
+                "sum_items",
+                [("buf", "const uint8_t *"), ("nElem", "size_t")],
+            ),
+            ("sum_bytes", [("pb", "const BYTE*"), ("cb", "DWORD")]),
+        ] {
+            let out = temp_dir(&format!("cpp-count-{name}"));
+            let mut args =
+                cpp_args_for(&out, "H-CPP-COUNT", cppfunction(name), &params, &[], header);
+            args.type_defs = vec![c_parser::parse_c_type_defs(header).unwrap()];
+            let Some(out) = build_cpp_harness(args) else {
+                return;
+            };
+            for input in [&b"A"[..], b"", &[0xff; 24]] {
+                let args = cpp_traced_args(&out, input);
+                assert_eq!(
+                    cpp_traced(&args, params[1].0, None)["value"],
+                    input.len().to_string(),
+                    "{name} on {input:02x?}: {args:#?}"
+                );
+            }
+            fs::remove_dir_all(&out).ok();
         }
     }
 

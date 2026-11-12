@@ -5,6 +5,36 @@
 ## Unreleased
 
 ### Fixed
+- C and C++ harnesses bind more lengths to their buffers, so correct code no
+  longer reports an overflow the harness made: counts spelled `n` or `num`
+  ahead of an element noun (`nElem`, `nMemb`, `nItem`, `nTok`, `numEntry`),
+  `number of` ahead of a plural (`numberOfElements`, `number_of_bytes`), and
+  the bare Win32 `cb`/`cch` (`const BYTE *pb, DWORD cb`) now pair. A callback
+  named `cb` still never pairs, and Hungarian integers (`nValue`, `nIndex`,
+  `nMode`) are still ordinary values.
+- The `end` of a `[begin, end)` pointer pair is traced and decoded as
+  pointing at no bytes: `BHF_TRACE_ARGS=1` gives it length 0 instead of
+  reading past the pair's buffer (which aborted a traced run once the pair
+  took a buffer of its own), and `arg-layout.json` describes it with the new
+  `input_end` decoder, so `bhf decode-args --static` agrees.
+- A byte buffer spelled through a pointer typedef (`LPCBYTE`, `PCBYTE`,
+  `PCUCHAR`, or a project's `typedef const BYTE *bytes_t`) with no length
+  partner is a heap copy of the input, as a spelled `const unsigned char *`
+  is, instead of one byte of storage the callee read past; with a count it
+  pairs in both lanes without a typedef in the scanned tree.
+- A target parameter named like one of the harness's own locals (`Data`,
+  `Size`, `Cur`, `R`, a `_bhf_` or `bhf_` name) gets a local of its own
+  (`bhf_arg_<name>`). Such a harness used to initialise the parameter from
+  itself (and crash on every input) or fail to build. The trace, the layout
+  and `decode-args` keep the declared name.
+- Every buffer of a call that takes several gets bytes of its own: each but
+  the last takes a sized slice of the input (a 4-byte length, then that many
+  bytes, in a heap copy of exactly that size), and the last the bytes the
+  cursor left. Only the first `(buffer, length)` pair of a call used to be
+  bound: a second pair's length was decoded on its own and could exceed its
+  buffer, and two buffers got the same bytes. `arg-layout.json` gives each
+  slice a sized `remainder` step, so `bhf decode-args --static` decodes these
+  calls exactly.
 - A C or C++ capsule's `build.sh` picks the sanitizer flags of the compiler that
   runs it (gcc has no `function` UBSan check and links its runtimes
   statically), as the harness Makefile does, and a capsule of a harness bhf
@@ -487,6 +517,13 @@
   this release's work dirs from earlier ones.
 
 ### Changed
+- The C/C++ harness input format is now version 4: a call with several
+  buffers, a count named as above, a pointer-typedef buffer or a parameter
+  named like a harness local decodes differently from format 3. Regenerate
+  such a harness and re-run its corpus. Findings, corpora and capsules
+  recorded against format 3 are flagged by `bhf replay`, `bhf minimize`,
+  `bhf decode-args` and `bhf capsule` as before; a harness whose calls have
+  none of these shapes decodes its inputs as format 3 did.
 - A target refused because a source path, include dir or compile flag holds a
   character no quoting makes safe in a build recipe now has its own outcome,
   `unsafe_build_path`, in `run.json` (and `summary.unsafe_build_path`, the

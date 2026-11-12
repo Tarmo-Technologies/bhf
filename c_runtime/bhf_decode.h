@@ -320,6 +320,26 @@ static inline const uint8_t *bhf_take_sized(bhf_cursor *c, size_t *size) {
     return at;
 }
 
+/* The bytes of one buffer of a call that takes several: as bhf_take_sized,
+ * a 32-bit little-endian length L, then the next min(L, remaining) bytes,
+ * which the cursor moves past, but returned as a heap copy of exactly those
+ * bytes (at least one byte, zero when there are none), so a read past them is
+ * a heap overflow the sanitizer reports instead of a read of the next
+ * buffer's bytes. Stores their count in *size and their offset in the input
+ * in *at. Caller frees the copy with free(). */
+static inline uint8_t *bhf_take_sized_copy(bhf_cursor *c, size_t *size, size_t *at) {
+    const uint8_t *from = bhf_take_sized(c, size);
+    uint8_t *copy = (uint8_t *)malloc(*size ? *size : 1);
+    *at = (size_t)(from - c->data);
+    if (!copy) {
+        *size = 0;
+        return NULL;
+    }
+    copy[0] = 0;
+    if (*size) memcpy(copy, from, *size);
+    return copy;
+}
+
 /* Lend the rest of the input as a (ptr, size) span. Lifetime matches the
  * cursor's backing buffer (the libFuzzer input). No allocation. */
 static inline void bhf_data_slice(bhf_cursor *c, const uint8_t **ptr, size_t *size) {

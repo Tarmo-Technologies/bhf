@@ -428,8 +428,12 @@ fn cpp_finding_capsule_round_trips_through_verify_poc_offline() {
 
     // The manifest records the harness's input format and the finding's, and
     // a finding recorded against another format is flagged.
-    assert_eq!(manifest["harness_format_version"], 3, "{manifest}");
-    assert_eq!(manifest["finding_harness_format_version"], 3, "{manifest}");
+    let current = harness_gen::HARNESS_FORMAT_VERSION;
+    assert_eq!(manifest["harness_format_version"], current, "{manifest}");
+    assert_eq!(
+        manifest["finding_harness_format_version"], current,
+        "{manifest}"
+    );
     assert!(manifest.get("harness_format_note").is_none(), "{manifest}");
     let record_path = finding_dir.join("finding.json");
     let mut record: serde_json::Value =
@@ -448,7 +452,7 @@ fn cpp_finding_capsule_round_trips_through_verify_poc_offline() {
     assert!(
         manifest["harness_format_note"]
             .as_str()
-            .is_some_and(|note| note.contains("decodes format 3")),
+            .is_some_and(|note| note.contains(&format!("decodes format {current}"))),
         "{manifest}"
     );
 }

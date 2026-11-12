@@ -305,9 +305,14 @@ arguments. A few rules decide what a parameter can receive:
   `bytes`, or a word ending in one (`srclen`, `bufsize`, `bufsz`, `bufsiz`,
   `nbytes`, `linecount`). So are `num` (`num_items`, `numBytes`), `n` and
   `nr` on their own or ahead of a plural (`nBytes`, `n_items`, `nr_pages`),
-  the run-together counts `nmemb`/`nitems`/`nelem`, OpenSSL's `inl`/`outl`,
-  `argc`, `avail`, `remaining`, and the Win32 `cb`/`cch` prefixes (`cbData`,
-  `pcbData`, `cchName`). A trailing digit is ignored (`len1`, `size_2`). A count marker
+  `n` or `num` ahead of an element noun (`nElem`, `nMemb`, `nItem`, `nTok`,
+  `nEntry`, `num_rec`, `nChar`, `nByte`), `number of` ahead of a plural
+  (`numberOfElements`, `number_of_bytes`), the run-together counts
+  `nmemb`/`nitems`/`nelem`, OpenSSL's `inl`/`outl`, `argc`, `avail`,
+  `remaining`, the Win32 `cb`/`cch` prefixes (`cbData`, `pcbData`,
+  `cchName`) and the bare `cb`, `cch`, `pcb` and `pcch`. A callback named `cb`
+  never pairs: its type is not a length type. A trailing digit is ignored
+  (`len1`, `size_2`). A count marker
   inside another word does not count (`account`, `caps`, `silent`, `enum`),
   and neither does a name whose last word is `id`, `flags`, `mode`, `type`,
   `kind`, `line`, `bit` or `status` (`account_id`, `count_mode`). Offset-,
@@ -320,9 +325,12 @@ arguments. A few rules decide what a parameter can receive:
 - **Typedefs.** In both C and C++, typedefs are resolved on both sides,
   typedef chains included (`const u8_t *` / `const BYTE *` buffers, `UINT` /
   `DWORD` / `u32_t` lengths). A buffer spelled through a pointer typedef
-  (`LPCBYTE`, `PBYTE`, `typedef const u8_t *cu8_ptr`) pairs too. The typedef
-  hides whether the bytes are const, so that buffer is always a heap copy of
-  the input, and its length is the copy's size.
+  (`LPCBYTE`, `PBYTE`, `typedef const u8_t *cu8_ptr`) pairs too, and the
+  Win32 ones (`PBYTE`, `LPBYTE`, `PUCHAR`, `PCBYTE`, `LPCBYTE`, `PCUCHAR`) do
+  without a typedef in the scanned tree. The typedef hides whether the bytes
+  are const, so that buffer is always a heap copy of the input, and its
+  length is the copy's size. Without a length partner it is decoded like a
+  read-only byte pointer (below): a NUL-terminated heap copy.
 - **Unsigned integers.** Unsigned parameters, struct fields and output-pointer
   values cover their full range, `size_t` included, so values with the top
   bit set (`0x80000000`..`0xffffffff`, wrap-around sizes, bit masks) are
@@ -397,8 +405,24 @@ with no cursor parameter, that is the whole testcase:
 So for `f(const uint8_t *data, uint32_t a, uint32_t b)`, `a` is bytes 0-3, `b`
 bytes 4-7 and `data` the bytes from 8 on, and for
 `g(const char *buf, size_t len, int flags)`, `flags` is bytes 0-3 and the pair
-the rest. No input byte feeds two parameters of one call. Several whole-input
-parameters of one call (two lone buffers) share the remaining input.
+the rest. No input byte feeds two parameters of one call.
+
+A call that takes several such buffers (two lone buffers, two pairs, a pair
+and a `FILE *`) gives each its own bytes. Every one but the last, in
+parameter order, is decoded with the cursor parameters, where it stands in
+the signature: 4 bytes of little-endian length L, then the next
+`min(L, bytes left)` bytes, in a heap copy of exactly that size (one byte when
+empty), freed after the call. A buffer paired with a length gets that size as
+its length. The last takes the remaining input as above. So for
+`h(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen, int x)`,
+bytes 0-3 are `alen`, the next `alen` bytes are `a`, the 4 after them `x`, and
+the rest `b`, with `blen` its size. A parameter that only takes the input's
+size (an output buffer's capacity) reads no bytes and follows the last buffer.
+
+A parameter named like one of the harness's own locals (`Data`, `Size`,
+`Cur`, `R`, or a name starting `_bhf_` or `bhf_`) is declared in `main.c` /
+`main.cpp` as `bhf_arg_<name>`; it is passed by position, and the trace, the
+layout and `bhf decode-args` show its declared name.
 
 The remaining input has no length of its own: a buffer without a length
 parameter is as long as the input lets it be. Set
@@ -488,8 +512,9 @@ them. Each parameter step gives its `call`, `index`, `name`, `type` and
 `order`, where its bytes come from (`input`: `cursor`, `remainder`,
 `whole_input` or `none`), the decoder kind (`decoder`: `scalar`,
 `bounded_int`, `enum_member`, `length_prefixed_string`, `capacity_string`,
-`rest_view`, `input_buffer`, `input_length`, `input_stream`, `input_file`,
-`fixed` or `other`), its `primitive` (`bhf_i32`, `bhf_c_string`, ...),
+`rest_view`, `input_buffer`, `input_length`, `input_end` (the `end` of a
+`[begin, end)` pair, one past the buffer's bytes), `input_stream`,
+`input_file`, `fixed` or `other`), its `primitive` (`bhf_i32`, `bhf_c_string`, ...),
 `width`, `endianness`, `value_kind`, bounds (`lo`, `hi`), enum `members`,
 `length_prefix_bytes` and `max_len`, whether a buffer is `copied`, whether
 the value is a C string read up to its first NUL (`nul_terminated`), the
@@ -498,7 +523,9 @@ other half of a pair (`paired_with`), and `static_decode` with a `note` when
 its value cannot be computed from the description. A `remainder` step marks
 where a call's whole-input parameters take the bytes the cursor left (`sized`
 with the explicit buffer-length dimension), and an `opaque` step a lifecycle
-loop, whose input use is known only at run time.
+loop, whose input use is known only at run time. In a call with several
+buffers, each buffer but the last follows a `sized` `remainder` step of its
+own, among the cursor steps: its 4-byte length, then its bytes.
 
 `bhf decode-args` maps a testcase to the value of each parameter:
 
@@ -566,7 +593,7 @@ gdb -q -batch -ex 'set debuginfod enabled off' -ex 'break <target>' -ex run -ex 
 Whenever a change makes the same input bytes decode to different argument
 values, the harness format version is bumped. Each harness records it as
 `harness_format_version` in `generation-metadata.json`. It also appears at the
-top of the generated `main.c` / `main.cpp` (`bhf harness format 3`). A harness
+top of the generated `main.c` / `main.cpp` (`bhf harness format 4`). A harness
 with no recorded version is format 1.
 
 Format 2 changed two things. An unsigned input with its top bit set, or a
@@ -587,6 +614,15 @@ only whole-input ones, decodes as before, except that a C++ receiver's
 constructor, factory and step arguments and a sequence harness's operations
 now take the bytes the cursor left instead of the whole input. Ada harnesses
 keep format 2: their decoding did not change.
+
+Format 4 gives every buffer of a call that takes several its own bytes (each
+but the last a sized slice, above) instead of the same remaining input, and
+binds every `(buffer, length)` pair of a call, not only the first. It also
+pairs the counts named `nElem`, `numberOfElements` or a bare `cb`, gives a
+lone pointer-typedef buffer (`LPCBYTE`) a heap copy of the input instead of
+one byte, and renames a parameter named like a harness local. A testcase of
+a call with any of these shapes decodes differently under format 3; any
+other harness decodes its inputs as format 3 did.
 
 A harness generated with `BHF_BUFFER_LEN_DIMENSION=1` decodes the same
 format differently again, so a finding also records `buffer_len_dimension`
@@ -609,8 +645,8 @@ they differ say so: replay as a `note` (also in `--json` `notes`), minimize
 on stderr, and capsule as a warning and as `harness_format_note` in the
 capsule's `manifest.json` (with `harness_format_version` and
 `finding_harness_format_version`). A finding that records no format came from
-a format 2 or earlier harness, so it is flagged against a format 3 harness.
-Such a finding replays as recorded against a harness of its own format; against
+a format 2 or earlier harness, so it is flagged against a format 3 or later
+harness. Such a finding replays as recorded against a harness of its own format; against
 a regenerated harness its testcase decodes into other arguments, so fuzz the
 regenerated harness again rather than comparing the two.
 

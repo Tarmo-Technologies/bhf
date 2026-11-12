@@ -953,13 +953,19 @@ fn build_param_decoders(
     let has_byte_buffer = params
         .iter()
         .any(|p| is_raw_buffer_param(&p.c_type, registry));
-    // Apply pair detection only once per harness: the libFuzzer Data span is
-    // consumed by the first matched pair, so a second `(const char *, int)`
-    // (e.g. xmlReadMemory's `encoding` + `options`) needs the standalone
-    // decoders. Without this, repeated pairs share Data and Size which
-    // produces obviously-wrong harnesses.
+    // Whether a `(buffer, length)` pair was bound to the input: optional
+    // metadata after it is passed as NULL (below). A later pair is bound too:
+    // `slice_input_units` gives it bytes of its own.
     let mut pair_consumed = false;
+    // The parameters each iteration decodes together, so every buffer of the
+    // call can be given its own bytes once the call is decoded.
+    let mut units: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut unit_start = 0;
     while i < params.len() {
+        if out.len() > unit_start {
+            units.push(unit_start..out.len());
+        }
+        unit_start = out.len();
         // libarchive documents this as an I/O buffer size, not semantic input.
         // Experts use a stable non-zero block (commonly 10 KiB); fuzzing zero or
         // tiny values makes valid file-backed seeds fail in setup and spends
@@ -1080,8 +1086,7 @@ fn build_param_decoders(
         // `Data` span — so a C-string parser (te_interp -> next_token) read past the
         // buffer end, a systematic heap-buffer-overflow FALSE POSITIVE. Without the
         // pair, the string falls through to the NUL-terminating `bhf_c_string` decoder.
-        if !pair_consumed
-            && i + 1 < params.len()
+        if i + 1 < params.len()
             && is_raw_buffer_param(&params[i].c_type, registry)
             && is_length_pointer_param(&params[i + 1].c_type)
             && looks_like_count_name(&params[i + 1].name)
@@ -1105,8 +1110,7 @@ fn build_param_decoders(
             i += 2;
             continue;
         }
-        if !pair_consumed
-            && i + 1 < params.len()
+        if i + 1 < params.len()
             && is_raw_buffer_param(&params[i].c_type, registry)
             && (is_length_param(&params[i + 1].c_type)
                 || (registry_resolves_to_length(&params[i + 1].c_type, registry)
@@ -1352,6 +1356,10 @@ fn build_param_decoders(
         out.push(emission);
         i += 1;
     }
+    if out.len() > unit_start {
+        units.push(unit_start..out.len());
+    }
+    crate::arg_trace::slice_input_units(&mut out, &units);
     Ok(out)
 }
 
@@ -1630,6 +1638,7 @@ fn is_raw_buffer_param(c_type: &str, registry: &TypeRegistry) -> bool {
     let without_const = strip_cv_tokens(&canonical);
     pointer_base(&without_const).is_some_and(is_byte_buffer_base)
         || registry_resolves_to_byte_pointer(c_type, registry)
+        || type_model::win32_byte_pointer_typedef(c_type).is_some()
 }
 
 /// Campaign #9: an integer in/out pointer that the callee uses as an index/cursor
@@ -1918,6 +1927,12 @@ pub(crate) fn looks_like_count_name(name: &str) -> bool {
     if looks_like_offset_name(name) {
         return false;
     }
+    // Win32's bare byte and character counts (`const BYTE *pb, DWORD cb`). A
+    // callback named `cb` never gets here: every pairing checks first that the
+    // parameter's type is a length type, which a function pointer is not.
+    if matches!(name, "cb" | "cch" | "pcb" | "pcch") {
+        return true;
+    }
     let words: Vec<String> = name_words(name)
         .into_iter()
         .map(|word| {
@@ -1942,7 +1957,30 @@ pub(crate) fn looks_like_count_name(name: &str) -> bool {
     if matches!(words[0].as_str(), "n" | "nr") && (words.len() == 1 || is_plural_word(last)) {
         return true;
     }
-    words.iter().any(|word| is_count_word(word))
+    // `n`/`num` ahead of a singular element noun is a count too (`nElem`,
+    // `nMemb`, `num_entry`), and so is `number of` ahead of a plural
+    // (`numberOfElements`, `number_of_bytes`).
+    if words.len() == 2 && matches!(words[0].as_str(), "n" | "num") && is_element_noun(last) {
+        return true;
+    }
+    if words.len() >= 3 && words[0] == "number" && words[1] == "of" && is_plural_word(last) {
+        return true;
+    }
+    if words.iter().any(|word| is_count_word(word)) {
+        return true;
+    }
+    // The words run together, as an unsplit name would be (`nElem` read as
+    // `nelem`, `nMatch` as `nmatch`).
+    words.len() > 1 && is_count_word(&words.concat())
+}
+
+/// A singular noun for one element of a buffer or array, which `n`/`num`
+/// ahead of it turns into an element count (`nElem`, `nTok`, `numEntry`).
+fn is_element_noun(word: &str) -> bool {
+    matches!(
+        word,
+        "elem" | "memb" | "item" | "tok" | "entry" | "rec" | "el" | "char" | "byte"
+    )
 }
 
 /// One lower-case name word that marks a length or element count: `len`,
@@ -1998,8 +2036,8 @@ fn is_plural_word(word: &str) -> bool {
 
 /// Win32 Hungarian byte and character counts (`cbData`, `cchName`) and their
 /// pointer forms (`pcbData`, `pcchName`, `lpcbData`). The prefix must be
-/// followed by an upper-case letter, so `cbor` and a bare `cb` (usually a
-/// callback) are not counts.
+/// followed by an upper-case letter, so `cbor` is not a count. (The bare
+/// `cb`/`cch` are matched on their own in [`looks_like_count_name`].)
 fn has_hungarian_count_prefix(name: &str) -> bool {
     ["cb", "cch", "pcb", "pcch", "lpcb", "lpcch"]
         .iter()
@@ -2284,17 +2322,25 @@ fn pair_buffer_length(
     }
 
     let cap_name = format!("_bhf_cap_{buf_name}");
+    // A pointer typedef (`LPCBYTE`, `typedef const BYTE *cbytes_t`) hides
+    // whether the bytes are const: write and free the copy through `(void *)`
+    // so a const pointee compiles too.
+    let buf_ref = if buf_type.contains('*') {
+        buf_name.to_owned()
+    } else {
+        format!("(void *){buf_name}")
+    };
     let buf_decl = format!(
         "size_t {cap_name} = Size <= (1024 * 1024) ? (size_t)Size : (1024 * 1024); \
          {buf_type} {buf_name} = ({buf_type})malloc({cap_name} ? {cap_name} : 1); \
-         if ({buf_name} && {cap_name}) memcpy({buf_name}, Data, {cap_name})"
+         if ({buf_name} && {cap_name}) memcpy({buf_ref}, Data, {cap_name})"
     );
     let buf_emission = CParamEmission {
         support: None,
         decl: buf_decl,
         arg: buf_name.to_owned(),
         c_type: buf_type,
-        free: Some(format!("free({buf_name})")),
+        free: Some(format!("free({buf_ref})")),
     };
     let len_emission = CParamEmission {
         support: None,
@@ -3085,8 +3131,17 @@ fn build_c_context(args: &GenerateCDirectArgs) -> Result<CTemplateContext, Harne
             .as_ref()
             .is_some_and(|env| env.fuzz_driven_callbacks),
     );
+    // A parameter named like one of the harness's own locals (`Data`, `Size`,
+    // `Cur`) gets a local of its own; the trace below keeps its declared name.
+    let local_params: Vec<CParameter> = normalized_c_params(decoder_params)
+        .into_iter()
+        .map(|param| CParameter {
+            name: crate::arg_trace::harness_local_name(&param.name),
+            c_type: param.c_type,
+        })
+        .collect();
     let mut params = build_param_decoders(
-        decoder_params,
+        &local_params,
         &registry,
         &args.lifecycle,
         Some(&header_complete),
@@ -3105,12 +3160,7 @@ fn build_c_context(args: &GenerateCDirectArgs) -> Result<CTemplateContext, Harne
     // geometry exactly as a maintained caller does. This is deliberately
     // signature- and symbol-gated; planar YUV needs a different multi-plane
     // allocation model and remains on the generic decoder.
-    bind_webp_interleaved_output_geometry(
-        &args.target.name,
-        decoder_params,
-        &registry,
-        &mut params,
-    );
+    bind_webp_interleaved_output_geometry(&args.target.name, &local_params, &registry, &mut params);
 
     // Strip storage/calling-convention/decoration noise off the return type so a
     // `<type> R = ...` result capture is valid (`__vectorcall`, `SIMDJSON_INLINE`).
@@ -5290,9 +5340,14 @@ mod tests {
         assert!(looks_like_count_name("cchName"));
         assert!(looks_like_count_name("srclen"));
         assert!(looks_like_count_name("size"));
-        // ...but only with the Hungarian capital: these are ordinary words.
+        // ...and so are the bare Win32 counts. A callback named `cb` never
+        // reaches this check: its pointer type is not a length type.
+        for name in ["cb", "cch", "pcb", "pcch"] {
+            assert!(looks_like_count_name(name), "{name:?} is a Win32 count");
+        }
+        // Otherwise the Hungarian prefix needs its capital: an ordinary word.
         assert!(!looks_like_count_name("cbor"));
-        assert!(!looks_like_count_name("cb"));
+        assert!(!looks_like_count_name("Cb"));
         // Offset-, index- and position-shaped names never bind to the input length,
         // even when another part of the name looks like a count.
         for name in [
@@ -5316,6 +5371,458 @@ mod tests {
                 "{name:?} must not pair as a buffer length"
             );
         }
+    }
+
+    #[test]
+    fn count_name_reads_run_together_and_spelled_out_counts() {
+        // `n`/`num` run together with an element noun, and `number of` a
+        // plural, name element counts.
+        for name in [
+            "nElem",
+            "nMemb",
+            "nItem",
+            "nTok",
+            "nEntry",
+            "nRec",
+            "nChar",
+            "nByte",
+            "nBytes",
+            "numElems",
+            "num_entry",
+            "numberOfElements",
+            "number_of_bytes",
+        ] {
+            assert!(looks_like_count_name(name), "{name:?} is a count");
+        }
+        // Hungarian integers, positions and plain values are not.
+        for name in [
+            "nValue",
+            "nFlag",
+            "nMode",
+            "nIndex",
+            "nOffset",
+            "numberValue",
+            "number",
+            "numberOfFlags_mode",
+        ] {
+            assert!(!looks_like_count_name(name), "{name:?} is not a count");
+        }
+    }
+
+    #[test]
+    fn run_together_and_win32_counts_bind_to_their_buffer() {
+        for (buffer, length) in [
+            (("buf", "const uint8_t *"), ("nElem", "size_t")),
+            (
+                ("items", "const unsigned char *"),
+                ("numberOfElements", "size_t"),
+            ),
+            (("pv", "const uint8_t *"), ("cb", "unsigned long")),
+        ] {
+            let decls = c_param_decls("sum_values", &[buffer, length]);
+            assert_eq!(
+                decls[1],
+                format!("{} {} = ({}){}", length.1, length.0, length.1, "Size"),
+                "{length:?} must be the length of {buffer:?}: {decls:?}"
+            );
+            assert!(
+                decls[0].contains(&format!("{} = ({})Data", buffer.0, buffer.1)),
+                "{buffer:?} must be the input: {decls:?}"
+            );
+        }
+        // Through the registry too: Win32 `BYTE`/`DWORD` spellings.
+        let registry = TypeRegistry::default();
+        let params = [
+            CParameter {
+                name: "pb".to_owned(),
+                c_type: "const BYTE *".to_owned(),
+            },
+            CParameter {
+                name: "cb".to_owned(),
+                c_type: "DWORD".to_owned(),
+            },
+        ];
+        let decls: Vec<String> = build_param_decoders(
+            &params,
+            &registry,
+            &[],
+            None,
+            false,
+            false,
+            DecoderLimits::default(),
+            "checksum",
+            false,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|emission| emission.decl)
+        .collect();
+        assert_eq!(decls[1], "DWORD cb = (DWORD)Size", "{decls:?}");
+    }
+
+    /// A byte buffer spelled through a pointer typedef, with no length
+    /// partner, is a heap copy of the input like any other lone byte buffer,
+    /// never a one-byte scalar the callee then reads past.
+    #[test]
+    fn lone_pointer_typedef_byte_buffer_is_a_heap_copy_of_the_input() {
+        let lone = |c_type: &str, registry: &TypeRegistry| -> String {
+            let params = [CParameter {
+                name: "p".to_owned(),
+                c_type: c_type.to_owned(),
+            }];
+            build_param_decoders(
+                &params,
+                registry,
+                &[],
+                None,
+                false,
+                false,
+                DecoderLimits::default(),
+                "checksum",
+                false,
+            )
+            .unwrap()
+            .remove(0)
+            .decl
+        };
+        let header = "typedef unsigned char BYTE;\n\
+             typedef const BYTE *cbytes_t;\n\
+             typedef BYTE *bytes_t;\n";
+        let defs = c_parser::parse_c_type_defs(header).unwrap();
+        let registry = TypeRegistry::from_defs(std::iter::once(&defs));
+        for (c_type, registry) in [
+            ("LPCBYTE", &TypeRegistry::default()),
+            ("PCBYTE", &TypeRegistry::default()),
+            ("PCUCHAR", &TypeRegistry::default()),
+            ("cbytes_t", &registry),
+            // The typedef hides the constness: the same copy suits both.
+            ("bytes_t", &registry),
+        ] {
+            let decl = lone(c_type, registry);
+            assert!(
+                !decl.contains("_bhf_out_p")
+                    && decl.contains("malloc(")
+                    && decl.contains("memcpy("),
+                "{c_type}: {decl}"
+            );
+            // Read-only bytes: the NUL-terminated copy, at least 8 bytes.
+            assert!(
+                decl.contains("< 8)") && decl.contains("'\\0'"),
+                "{c_type}: {decl}"
+            );
+        }
+        // A Win32 writable byte pointer is the spelled one it stands for: a
+        // writable copy with headroom.
+        let decl = lone("PBYTE", &TypeRegistry::default());
+        assert!(
+            decl.contains("+ 65536") && decl.contains("memcpy("),
+            "{decl}"
+        );
+
+        // With a count after it, a pointer typedef pairs, through the
+        // registry or as a Win32 spelling: a copy of the input, written
+        // through `(void *)` so a const pointee compiles, and its size.
+        for (c_type, registry) in [
+            ("LPCBYTE", &TypeRegistry::default()),
+            ("cbytes_t", &registry),
+        ] {
+            let params = [
+                CParameter {
+                    name: "pb".to_owned(),
+                    c_type: c_type.to_owned(),
+                },
+                CParameter {
+                    name: "cb".to_owned(),
+                    c_type: "DWORD".to_owned(),
+                },
+            ];
+            let decls: Vec<CParamEmission> = build_param_decoders(
+                &params,
+                registry,
+                &[],
+                None,
+                false,
+                false,
+                DecoderLimits::default(),
+                "checksum",
+                false,
+            )
+            .unwrap();
+            assert!(
+                decls[0]
+                    .decl
+                    .contains("memcpy((void *)pb, Data, _bhf_cap_pb)")
+                    && decls[0].free.as_deref() == Some("free((void *)pb)"),
+                "{c_type}: {decls:?}"
+            );
+            assert_eq!(
+                decls[1].decl, "DWORD cb = (DWORD)(pb ? _bhf_cap_pb : 0)",
+                "{c_type}: {decls:?}"
+            );
+        }
+    }
+
+    /// Assert that the static decode of `out`'s arg-layout.json gives the
+    /// values, lengths and spans its argument trace prints for `input`.
+    fn assert_layout_matches_trace(out: &Path, input: &[u8]) {
+        let layout = crate::arg_layout::ArgLayout::read(out).unwrap().unwrap();
+        let lines = traced_args(out, input, Some("1"));
+        for stat in layout.decode(input) {
+            assert!(stat.decoded, "{stat:?} on {input:02x?}");
+            let trace = traced(&lines, &stat.name, None);
+            assert_eq!(
+                serde_json::json!(stat.span),
+                trace["span"],
+                "{}: static {stat:?} vs traced {trace} on {input:02x?}",
+                stat.name
+            );
+            match &stat.value {
+                Some(value) => {
+                    assert_eq!(trace["value"], serde_json::json!(value), "{}", stat.name)
+                }
+                None => {
+                    assert_eq!(trace["len"], serde_json::json!(stat.len), "{}", stat.name);
+                    assert_eq!(
+                        trace["preview_hex"].as_str().unwrap_or_default(),
+                        stat.preview_hex.as_deref().unwrap_or_default(),
+                        "{}",
+                        stat.name
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every buffer of a call with several gets bytes of its own: each but
+    /// the last a sized slice of the input (a 4-byte length, then that many
+    /// bytes, in a heap copy of exactly that size), the last the bytes left.
+    /// Each paired length is its own buffer's size, so a correct function
+    /// summing both buffers runs clean whatever the input says, and two
+    /// buffers never get the same bytes.
+    #[test]
+    fn built_c_harness_gives_each_buffer_of_a_call_its_own_bytes() {
+        let Some(out) = build_c_harness(
+            "merge_records",
+            &[
+                ("a", "const uint8_t *"),
+                ("alen", "size_t"),
+                ("b", "const uint8_t *"),
+                ("blen", "size_t"),
+                ("x", "int"),
+            ],
+            "#include <stdint.h>\n#include <stddef.h>\n\
+             int merge_records(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen, int x) {\n\
+             \x20   int s = x;\n\
+             \x20   for (size_t i = 0; i < alen; i++) s += a[i];\n\
+             \x20   for (size_t i = 0; i < blen; i++) s += b[i];\n\
+             \x20   return s;\n\
+             }\n",
+        ) else {
+            return;
+        };
+        assert_compiles_warning_free(&out);
+        // Read the old way, the first 8 bytes made `blen` 32 against a
+        // 4-byte buffer.
+        let short_tail = [32, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4];
+        traced_args(&out, &short_tail, None);
+        let input = [2, 0, 0, 0, 0xa1, 0xa2, 5, 0, 0, 0, 0xb1, 0xb2, 0xb3];
+        let args = traced_args(&out, &input, Some("1"));
+        let a = traced(&args, "a", None);
+        assert_eq!(a["span"], serde_json::json!([4, 6]), "{args:#?}");
+        assert_eq!(a["preview_hex"], "a1a2");
+        assert_eq!(traced(&args, "alen", None)["value"], "2");
+        assert_eq!(traced(&args, "x", None)["value"], "5");
+        let b = traced(&args, "b", None);
+        assert_eq!(b["span"], serde_json::json!([10, 13]));
+        assert_eq!(b["preview_hex"], "b1b2b3");
+        assert_eq!(traced(&args, "blen", None)["value"], "3");
+        for input in [&short_tail[..], &input, b"", &[0xff; 40]] {
+            assert_layout_matches_trace(&out, input);
+        }
+        fs::remove_dir_all(&out).ok();
+
+        let Some(out) = build_c_harness(
+            "compare_heads",
+            &[("a", "const uint8_t *"), ("b", "const uint8_t *")],
+            "#include <stdint.h>\n\
+             int compare_heads(const uint8_t *a, const uint8_t *b) { return a[0] + b[0]; }\n",
+        ) else {
+            return;
+        };
+        let input = [1, 0, 0, 0, 0xa1, 0xb1, 0xb2];
+        let args = traced_args(&out, &input, Some("1"));
+        let a = traced(&args, "a", None);
+        let b = traced(&args, "b", None);
+        assert_eq!(a["span"], serde_json::json!([4, 5]), "{args:#?}");
+        assert_eq!(a["preview_hex"], "a1");
+        assert_eq!(b["span"], serde_json::json!([5, 7]));
+        assert_eq!(b["preview_hex"], "b1b2");
+        for input in [&input[..], b"", &[0x41; 9]] {
+            assert_layout_matches_trace(&out, input);
+        }
+        fs::remove_dir_all(&out).ok();
+
+        // A slice is a copy of exactly its bytes: reading one past it is a
+        // heap overflow, not a read of the next buffer's bytes.
+        let Some(out) = build_c_harness(
+            "peek_past",
+            &[
+                ("a", "const uint8_t *"),
+                ("alen", "size_t"),
+                ("b", "const uint8_t *"),
+                ("blen", "size_t"),
+            ],
+            "#include <stdint.h>
+#include <stddef.h>
+             int peek_past(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen) {
+                 return a[alen] + (blen ? b[0] : 0);
+             }
+",
+        ) else {
+            return;
+        };
+        let path = out.join("past.bin");
+        fs::write(&path, [2, 0, 0, 0, 0xa1, 0xa2, 0xb1, 0xb2]).unwrap();
+        let run = Command::new(out.join("main")).arg(&path).output().unwrap();
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            !run.status.success() && stderr.contains("heap-buffer-overflow"),
+            "{stderr}"
+        );
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// Parameters named like the harness's own locals (`Data`, `Size`, `Cur`,
+    /// `R`, `_bhf_*`) get locals of their own: the harness builds, each takes
+    /// its own bytes, and a correct function runs clean. The trace and the
+    /// layout still name them as declared.
+    #[test]
+    fn built_c_harness_renames_parameters_named_like_its_own_locals() {
+        type Case<'a> = (&'a str, Vec<(&'a str, &'a str)>, &'a str);
+        let cases: Vec<Case> = vec![
+            (
+                "last_of",
+                vec![("Data", "const uint8_t *"), ("Size", "size_t")],
+                "int last_of(const uint8_t *Data, size_t Size) {\n\
+                 \x20   return Size ? Data[Size - 1] : 0;\n\
+                 }\n",
+            ),
+            (
+                "last_at",
+                vec![
+                    ("Data", "const uint8_t *"),
+                    ("Size", "size_t"),
+                    ("level", "int"),
+                ],
+                "int last_at(const uint8_t *Data, size_t Size, int level) {\n\
+                 \x20   return Size ? Data[Size - 1] + level : level;\n\
+                 }\n",
+            ),
+            (
+                "first_of",
+                vec![("x", "int"), ("Data", "const uint8_t *")],
+                "int first_of(int x, const uint8_t *Data) { return x + Data[0]; }\n",
+            ),
+            (
+                "walk",
+                vec![
+                    ("Cur", "int"),
+                    ("R", "int"),
+                    ("_bhf_rest_p", "unsigned char"),
+                ],
+                "int walk(int Cur, int R, unsigned char _bhf_rest_p) {\n\
+                 \x20   return Cur + R + _bhf_rest_p;\n\
+                 }\n",
+            ),
+        ];
+        for (name, params, body) in cases {
+            let Some(out) = build_c_harness(
+                name,
+                &params,
+                &format!("#include <stdint.h>\n#include <stddef.h>\n{body}"),
+            ) else {
+                return;
+            };
+            let input = [7u8, 0, 0, 0, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+            let args = traced_args(&out, &input, Some("1"));
+            for (param, _) in &params {
+                traced(&args, param, None);
+            }
+            if let Some(size) = args.iter().find(|arg| arg["name"] == "Size") {
+                let level_bytes = if params.len() == 3 { 4 } else { 0 };
+                assert_eq!(
+                    size["value"],
+                    (input.len() - level_bytes).to_string(),
+                    "{name}: {args:#?}"
+                );
+            }
+            let layout = crate::arg_layout::ArgLayout::read(&out).unwrap().unwrap();
+            let names: Vec<&str> = layout.params().map(|p| p.name.as_str()).collect();
+            for (param, _) in &params {
+                assert!(names.contains(param), "{name}: {names:?}");
+            }
+            fs::remove_dir_all(&out).ok();
+        }
+    }
+
+    /// A correct function reading the bytes a pointer-typedef buffer holds
+    /// runs clean under its harness, alone or with its count.
+    #[test]
+    fn built_c_harness_gives_a_pointer_typedef_buffer_the_input() {
+        let header = "#include <stddef.h>\n\
+             typedef unsigned char BYTE;\n\
+             typedef unsigned long DWORD;\n\
+             typedef const BYTE *LPCBYTE;\n\
+             typedef const BYTE *cbytes_t;\n\
+             int lone_first(LPCBYTE p);\n\
+             int lone_typedef(cbytes_t p);\n\
+             int counted(LPCBYTE pb, DWORD cb);\n";
+        for (name, params, body) in [
+            (
+                "lone_first",
+                vec![("p", "LPCBYTE")],
+                "int lone_first(LPCBYTE p) { return p[1] + p[7]; }\n",
+            ),
+            (
+                "lone_typedef",
+                vec![("p", "cbytes_t")],
+                "int lone_typedef(cbytes_t p) { return p[1] + p[7]; }\n",
+            ),
+            (
+                "counted",
+                vec![("pb", "LPCBYTE"), ("cb", "DWORD")],
+                "int counted(LPCBYTE pb, DWORD cb) {\n\
+                 \x20   int s = 0;\n\
+                 \x20   for (DWORD i = 0; i < cb; i++) s += pb[i];\n\
+                 \x20   return s;\n\
+                 }\n",
+            ),
+        ] {
+            let Some(out) = build_c_harness_in(
+                name,
+                &params,
+                &format!("#include \"widget.h\"\n{body}"),
+                Some(header),
+            ) else {
+                return;
+            };
+            let args = traced_args(&out, b"ABCDEFGH", Some("1"));
+            let buffer = traced(&args, params[0].0, None);
+            assert_eq!(
+                buffer["preview_hex"], "4142434445464748",
+                "{name}: {args:#?}"
+            );
+            fs::remove_dir_all(&out).ok();
+        }
+    }
+
+    #[test]
+    fn a_callback_named_like_a_count_never_pairs_with_a_buffer() {
+        let decls = c_param_decls("visit", &[("p", "const BYTE *"), ("cb", "void (*)(int)")]);
+        assert!(
+            !decls[1].contains("Size") && !decls[0].contains(")Data"),
+            "a callback is not a length: {decls:?}"
+        );
     }
 
     fn c_param_decls(function_name: &str, params: &[(&str, &str)]) -> Vec<String> {
@@ -6565,6 +7072,57 @@ mod tests {
         assert_eq!(s["span"], serde_json::json!([8, 10]));
         assert_eq!(s["preview_hex"], "aabb");
         fs::remove_dir_all(&out).ok();
+    }
+
+    /// A correct function summing `count` bytes runs clean under its harness
+    /// when the count is named `nElem` or `cb`: the harness gives it the
+    /// buffer's own length, never an independent value that overruns it.
+    #[test]
+    fn built_c_harness_binds_run_together_and_win32_counts_to_their_buffer() {
+        let header = "#include <stdint.h>\n#include <stddef.h>\n\
+             typedef unsigned char BYTE;\n\
+             typedef unsigned long DWORD;\n\
+             int sum_items(const uint8_t *buf, size_t nElem);\n\
+             int sum_bytes(const BYTE *pb, DWORD cb);\n";
+        for (name, params, body) in [
+            (
+                "sum_items",
+                [("buf", "const uint8_t *"), ("nElem", "size_t")],
+                "int sum_items(const uint8_t *buf, size_t nElem) {\n\
+                 \x20   int s = 0;\n\
+                 \x20   for (size_t i = 0; i < nElem; i++) s += buf[i];\n\
+                 \x20   return s;\n\
+                 }\n",
+            ),
+            (
+                "sum_bytes",
+                [("pb", "const BYTE *"), ("cb", "DWORD")],
+                "int sum_bytes(const BYTE *pb, DWORD cb) {\n\
+                 \x20   int s = 0;\n\
+                 \x20   for (DWORD i = 0; i < cb; i++) s += pb[i];\n\
+                 \x20   return s;\n\
+                 }\n",
+            ),
+        ] {
+            let Some(out) = build_c_harness_in(
+                name,
+                &params,
+                &format!("#include \"widget.h\"\n{body}"),
+                Some(header),
+            ) else {
+                return;
+            };
+            for input in [&b"A"[..], b"", &[0xff; 24]] {
+                let args = traced_args(&out, input, Some("1"));
+                let length = traced(&args, params[1].0, None);
+                assert_eq!(
+                    length["value"],
+                    input.len().to_string(),
+                    "{name} on {input:02x?}: {args:#?}"
+                );
+            }
+            fs::remove_dir_all(&out).ok();
+        }
     }
 
     /// With BHF_TRACE_ARGS=1 a built sequence harness prints each operation's
@@ -8701,6 +9259,53 @@ mod tests {
             main.contains("key = bhf_c_string(&Cur"),
             "an unpaired string must keep its own decoder, got:\n{main}"
         );
+    }
+
+    /// A `[begin, end)` pair in a call with another buffer takes a slice of
+    /// its own, and `end` points one past the slice's copy: the argument
+    /// trace shows it as an empty span end instead of reading past the copy,
+    /// and the static decode gives what the trace prints.
+    #[test]
+    fn built_c_harness_traces_the_end_of_a_sliced_begin_end_pair() {
+        let Some(out) = build_c_harness(
+            "match_span",
+            &[
+                ("begin", "const char *"),
+                ("end", "const char *"),
+                ("key", "const uint8_t *"),
+                ("keylen", "size_t"),
+            ],
+            "#include <stdint.h>\n#include <stddef.h>\n\
+             int match_span(const char *begin, const char *end, const uint8_t *key, size_t keylen) {\n\
+             \x20   return begin != end && keylen ? begin[0] == (char)key[0] : 0;\n\
+             }\n",
+        ) else {
+            return;
+        };
+        let input = [3, 0, 0, 0, b'a', b'b', b'c', b'd', b'e', b'f', b'g', b'h'];
+        let args = traced_args(&out, &input, Some("1"));
+        let begin = traced(&args, "begin", None);
+        assert_eq!(begin["span"], serde_json::json!([4, 7]), "{args:#?}");
+        assert_eq!(begin["preview_hex"], "616263");
+        let end = traced(&args, "end", None);
+        assert_eq!(end["len"], 0, "{end}");
+        let key = traced(&args, "key", None);
+        assert_eq!(key["span"], serde_json::json!([7, 12]));
+        assert_eq!(key["preview_hex"], "6465666768");
+        assert_eq!(traced(&args, "keylen", None)["value"], "5");
+        let layout = crate::arg_layout::ArgLayout::read(&out).unwrap().unwrap();
+        let decoder = |name: &str| {
+            layout
+                .params()
+                .find(|param| param.name == name)
+                .map(|param| param.decoder.clone())
+        };
+        assert_eq!(decoder("end").as_deref(), Some("input_end"));
+        assert_eq!(decoder("begin").as_deref(), Some("input_buffer"));
+        for input in [&input[..], b"", &[0x41; 9], &[0, 0, 0, 0, b'k']] {
+            assert_layout_matches_trace(&out, input);
+        }
+        fs::remove_dir_all(&out).ok();
     }
 
     #[test]

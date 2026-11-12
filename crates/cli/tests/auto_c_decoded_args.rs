@@ -6,8 +6,8 @@
 // decoded.json and, summarised, in finding.json `decoded_args`; the heap access
 // names the parameter whose buffer it overflowed. `bhf replay --show-args`
 // prints the same values. The scalars take the leading bytes and the
-// length-less buffer the bytes after them (harness format 3), so no byte is
-// both.
+// length-less buffer the bytes after them (harness format 3 and later), so no
+// byte is both.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -118,15 +118,16 @@ fn a_c_finding_records_its_decoded_arguments() {
     assert_eq!(arg("data")["len"], rest.len());
     let hex: String = rest.iter().map(|byte| format!("{byte:02x}")).collect();
     assert_eq!(arg("data")["preview_hex"], hex);
-    assert_eq!(record["harness_format_version"], 3, "{record:#}");
-    assert_eq!(record["harness"]["format_version"], 3, "{record:#}");
+    let current = harness_gen::HARNESS_FORMAT_VERSION;
+    assert_eq!(record["harness_format_version"], current, "{record:#}");
+    assert_eq!(record["harness"]["format_version"], current, "{record:#}");
     // The harness's corpus records the same format.
     let harness_id = record["harness_id"].as_str().unwrap();
     let corpus_metadata: serde_json::Value = serde_json::from_slice(
         &std::fs::read(work.join("corpus").join(harness_id).join("metadata.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(corpus_metadata["harness"]["format_version"], 3);
+    assert_eq!(corpus_metadata["harness"]["format_version"], current);
     assert_eq!(
         record["exception"]["access"]["parameter"]["name"], "data",
         "{record:#}"

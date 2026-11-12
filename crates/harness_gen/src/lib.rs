@@ -27,10 +27,18 @@ pub use generate::{
 ///   `(buffer, length)` pairs, `FILE *`, temp-file paths) take the bytes the
 ///   cursor left, instead of the whole input again; a C++ method's
 ///   whole-input target parameters come after its receiver's arguments.
-pub const HARNESS_FORMAT_VERSION: u32 = 3;
+/// - 4: a call with several buffers gives each its own bytes: every one but
+///   the last takes a sized slice of the cursor (a 4-byte length, then that
+///   many bytes), and the last the bytes the cursor left, instead of all of
+///   them sharing those bytes (and a second `(buffer, length)` pair's length
+///   being decoded on its own). Counts named `nElem`, `numberOfItems` or a
+///   bare Win32 `cb`/`cch`, and buffers spelled through a pointer typedef
+///   (`LPCBYTE`), now pair, and a parameter named like a harness local
+///   (`Data`, `Size`, `Cur`) gets a local of its own.
+pub const HARNESS_FORMAT_VERSION: u32 = 4;
 
-/// The input format generated Ada harnesses decode. Format 3 changed only the
-/// C and C++ layout, so Ada harnesses stay at format 2.
+/// The input format generated Ada harnesses decode. Formats 3 and 4 changed
+/// only the C and C++ layout, so Ada harnesses stay at format 2.
 pub const ADA_HARNESS_FORMAT_VERSION: u32 = 2;
 
 /// The input format a harness generated for `language` (`"c"`, `"cpp"` or

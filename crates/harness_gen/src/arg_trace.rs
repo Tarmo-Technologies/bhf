@@ -14,11 +14,13 @@
 //!
 //! With tracing off the harness pays one cached branch per call.
 //!
-//! The plan also fixes the call's input layout (harness format 3): the
+//! The plan also fixes the call's input layout (harness format 3 and 4): the
 //! parameters decoded from the cursor take the leading bytes, in parameter
 //! order, and the parameters decoded from the whole input (`Data`/`Size`: a
 //! lone byte buffer, a `(buffer, length)` pair, a `FILE *`, ...) take the bytes
-//! the cursor left, so no input byte feeds two parameters.
+//! the cursor left, so no input byte feeds two parameters. When a call has
+//! several such buffers, every one but the last takes a sized slice of the
+//! cursor instead (see [`slice_input_units`]).
 
 use crate::c_decoders::CParamEmission;
 use serde::Serialize;
@@ -119,6 +121,188 @@ enum Source {
     Input,
     /// Takes no input bytes (a constant, a scratch object).
     None,
+    /// Takes the bytes of a sized slice of the cursor (see
+    /// [`slice_input_units`]).
+    Slice,
+}
+
+/// Prefixes of the locals holding the bytes of a call's sliced buffer (see
+/// [`slice_input_units`]): the heap copy, its length and its offset in the
+/// input. None is a prefix of another.
+const SLICE: &str = "_bhf_slice_";
+const SLICE_LEN: &str = "_bhf_slicelen_";
+const SLICE_AT: &str = "_bhf_sliceat_";
+
+/// The locals of the slice `id`: the copy, its length and its offset.
+fn slice_locals(id: &str) -> (String, String, String) {
+    (
+        format!("{SLICE}{id}"),
+        format!("{SLICE_LEN}{id}"),
+        format!("{SLICE_AT}{id}"),
+    )
+}
+
+/// The statements that take slice `id` from the cursor.
+fn slice_prefix(id: &str) -> String {
+    let (data, len, at) = slice_locals(id);
+    format!(
+        "size_t {len} = 0; size_t {at} = 0; \
+         uint8_t *{data} = bhf_take_sized_copy(&Cur, &{len}, &{at})"
+    )
+}
+
+/// The slice whose locals `code` names, if any.
+fn slice_named(code: &str) -> Option<String> {
+    identifiers(code).into_iter().find_map(|id| {
+        [SLICE_LEN, SLICE_AT, SLICE]
+            .iter()
+            .find_map(|prefix| id.strip_prefix(prefix))
+            .map(str::to_owned)
+    })
+}
+
+/// Give each buffer of one call its own bytes when the call takes several
+/// (format 4).
+///
+/// `units` partitions `emissions` into the parameters decoded together: a
+/// `(buffer, length)` pair, a lone buffer, a scalar. A unit that reads the
+/// input bytes (`Data`) without the cursor would otherwise share the bytes
+/// the cursor left with every other such unit of the call, so two buffers got
+/// the same bytes, and a second pair's length was decoded on its own and
+/// could exceed its buffer. Every such unit but the last now takes a sized
+/// slice of the cursor instead (`bhf_take_sized_copy`: a 4-byte length, then
+/// that many bytes, in a heap copy of exactly that size), its `Data`/`Size`
+/// become the slice and its length, and the copy is freed with the unit's
+/// first parameter. The last keeps the bytes the cursor leaves. A unit that
+/// only uses the input size (an output buffer's capacity) reads no bytes and
+/// is left alone.
+pub(crate) fn slice_input_units(
+    emissions: &mut [CParamEmission],
+    units: &[std::ops::Range<usize>],
+) {
+    let reads_input = |unit: &std::ops::Range<usize>| {
+        let unit = &emissions[unit.clone()];
+        unit.iter().any(|emission| {
+            identifiers(&format!("{} {}", emission.decl, emission.arg)).contains(&"Data")
+        }) && unit
+            .iter()
+            .all(|emission| source_of(&emission.decl) != Source::Cursor)
+    };
+    let input_units: Vec<std::ops::Range<usize>> = units
+        .iter()
+        .filter(|unit| reads_input(unit))
+        .cloned()
+        .collect();
+    let Some((_, sliced)) = input_units.split_last() else {
+        return;
+    };
+    let mut taken: Vec<String> = Vec::new();
+    for unit in sliced {
+        let first = &emissions[unit.start];
+        let base = first.arg.trim().trim_start_matches('&').trim();
+        let base = if is_identifier(base) {
+            base.to_owned()
+        } else {
+            declared_names(first)
+                .last()
+                .map(|name| (*name).to_owned())
+                .unwrap_or_else(|| format!("u{}", unit.start))
+        };
+        let mut id = base.clone();
+        let mut n = 1;
+        while taken.contains(&id) {
+            id = format!("{base}_{n}");
+            n += 1;
+        }
+        taken.push(id.clone());
+        let (data, len, _) = slice_locals(&id);
+        for emission in &mut emissions[unit.clone()] {
+            emission.decl = rewrite_input(&emission.decl, &data, &len);
+            emission.arg = rewrite_input(&emission.arg, &data, &len);
+            emission.free = emission
+                .free
+                .as_deref()
+                .map(|free| rewrite_input(free, &data, &len));
+        }
+        let first = &mut emissions[unit.start];
+        first.decl = if first.decl.trim().is_empty() {
+            slice_prefix(&id)
+        } else {
+            format!("{}; {}", slice_prefix(&id), first.decl)
+        };
+        let release = format!("free({data})");
+        first.free = Some(match first.free.take() {
+            Some(free) => format!("{free}; {release}"),
+            None => release,
+        });
+    }
+}
+
+/// A sliced emission as the decoder emitted it before
+/// [`slice_input_units`]: its decl and argument with the slice locals back to
+/// `Data`/`Size` and the slice statements removed, so it can be classified
+/// and traced like any whole-input parameter.
+fn unsliced(emission: &CParamEmission, id: &str) -> CParamEmission {
+    let (data, len, _) = slice_locals(id);
+    let back = |code: &str| {
+        let renamed: String = {
+            let mut out = String::with_capacity(code.len());
+            let mut last = 0;
+            for (at, word) in identifier_spans(code) {
+                let replacement = if word == data {
+                    Some("Data")
+                } else if word == len {
+                    Some("Size")
+                } else {
+                    None
+                };
+                if let Some(replacement) = replacement {
+                    out.push_str(&code[last..at]);
+                    out.push_str(replacement);
+                    last = at + word.len();
+                }
+            }
+            out.push_str(&code[last..]);
+            out
+        };
+        renamed
+    };
+    let prefix = format!("{}; ", slice_prefix(id));
+    let decl = emission
+        .decl
+        .strip_prefix(&prefix)
+        .or_else(|| (emission.decl == slice_prefix(id)).then_some(""))
+        .unwrap_or(&emission.decl);
+    CParamEmission {
+        support: emission.support.clone(),
+        decl: back(decl),
+        arg: back(&emission.arg),
+        c_type: emission.c_type.clone(),
+        free: emission.free.clone(),
+    }
+}
+
+/// Names a generated harness function declares or calls itself: the input
+/// (`Data`, `Size`), its cursor (`Cur`), the result (`R`), every helper local
+/// (`_bhf_*`), the runtime (`bhf_*`) and the C library functions the decoders
+/// call. A target parameter of one of these names would shadow or redefine
+/// it.
+const RESERVED_NAMES: &[&str] = &[
+    "Data", "Size", "Cur", "R", "malloc", "calloc", "realloc", "free", "memcpy", "memset",
+    "fmemopen", "fclose", "fwrite", "rewind", "tmpfile", "unlink", "strlen",
+];
+
+/// The local a generated harness declares for a target parameter named
+/// `name`: the name itself, or `bhf_arg_<name>` when the harness already
+/// uses that name ([`RESERVED_NAMES`], `_bhf_*`, `bhf_*`). Arguments are
+/// passed by position, so the call means the same; the trace and the layout
+/// keep the declared name.
+pub(crate) fn harness_local_name(name: &str) -> String {
+    if RESERVED_NAMES.contains(&name) || name.starts_with("_bhf_") || name.starts_with("bhf_") {
+        format!("bhf_arg_{name}")
+    } else {
+        name.to_owned()
+    }
 }
 
 /// Plan the decode and trace statements for one call's parameters.
@@ -134,9 +318,14 @@ pub(crate) fn plan(
     let rest = format!("_bhf_rest_{}", group.prefix);
     let rest_size = format!("_bhf_rest_size_{}", group.prefix);
     let rest_at = format!("_bhf_rest_at_{}", group.prefix);
+    let slices = slice_ids(emissions);
     let sources: Vec<Source> = emissions
         .iter()
-        .map(|emission| source_of(&format!("{} {}", emission.decl, emission.arg)))
+        .zip(&slices)
+        .map(|(emission, slice)| match slice {
+            Some(_) => Source::Slice,
+            None => source_of(&format!("{} {}", emission.decl, emission.arg)),
+        })
         .collect();
     let mut order = decode_order(emissions);
     let mut tail_start = order
@@ -153,7 +342,7 @@ pub(crate) fn plan(
     // parameter order.
     let head_reads_cursor = order[..tail_start]
         .iter()
-        .any(|&(index, _)| sources[index] == Source::Cursor);
+        .any(|&(index, _)| matches!(sources[index], Source::Cursor | Source::Slice));
     if !head_reads_cursor && group.fresh_cursor && !group.defer_input && !sized {
         order = (0..emissions.len()).map(|index| (index, false)).collect();
         tail_start = order.len();
@@ -210,6 +399,10 @@ pub(crate) fn plan(
         }
         spans[index] = match sources[index] {
             Source::Cursor => Some((at(position), at(position + 1))),
+            Source::Slice => {
+                let (_, len, at) = slice_locals(slices[index].as_deref().unwrap_or_default());
+                Some((at.clone(), format!("{at} + {len}")))
+            }
             Source::Input if deferred => {
                 Some((rest_at.clone(), format!("{rest_at} + {rest_size}")))
             }
@@ -227,6 +420,22 @@ pub(crate) fn plan(
     }
     for &(index, deferred) in &order {
         let declared = (declared.len() == emissions.len()).then(|| &declared[index]);
+        if let Some(id) = &slices[index] {
+            // Traced as the whole-input parameter it was, over its slice.
+            let (data, len, _) = slice_locals(id);
+            let traced = trace_param(
+                group,
+                index,
+                &unsliced(&emissions[index], id),
+                declared,
+                spans[index].clone(),
+            );
+            head.push(rewrite_input(&traced.before, &data, &len));
+            if let Some(after) = traced.after {
+                plan.after.push(rewrite_input(&after, &data, &len));
+            }
+            continue;
+        }
         let traced = trace_param(
             group,
             index,
@@ -254,7 +463,7 @@ pub(crate) fn plan(
         }
     }
     let (head_layout, tail_layout) = layout_steps(
-        group, emissions, declared, &order, &sources, tail_start, sized,
+        group, emissions, declared, &order, &sources, &slices, tail_start, sized,
     );
     plan.decode = head;
     plan.layout = head_layout;
@@ -270,13 +479,16 @@ pub(crate) fn plan(
 
 /// The layout steps of one call's parameters, in decode order, split where
 /// its whole-input parameters start (the head, then the tail that takes the
-/// bytes the cursor left).
+/// bytes the cursor left). A sliced buffer is described as the whole-input
+/// parameter it was, taking a sized remainder of its own.
+#[allow(clippy::too_many_arguments)]
 fn layout_steps(
     group: &Group<'_>,
     emissions: &[CParamEmission],
     declared: &[Declared],
     order: &[(usize, bool)],
     sources: &[Source],
+    slices: &[Option<String>],
     tail_start: usize,
     sized: bool,
 ) -> (
@@ -290,7 +502,10 @@ fn layout_steps(
     };
     let mut params = Vec::with_capacity(order.len());
     for (position, &(index, deferred)) in order.iter().enumerate() {
-        let emission = &emissions[index];
+        let unsliced_emission = slices[index]
+            .as_deref()
+            .map(|id| unsliced(&emissions[index], id));
+        let emission = unsliced_emission.as_ref().unwrap_or(&emissions[index]);
         let declared = (declared.len() == emissions.len()).then(|| &declared[index]);
         let name = declared
             .map(|d| d.name.clone())
@@ -306,11 +521,13 @@ fn layout_steps(
             .unwrap_or_else(|| spelled_shape(&emission.c_type));
         let source = match (sources[index], deferred) {
             (Source::Cursor, _) => InputSource::Cursor,
-            (Source::Input, true) | (Source::None, true) => InputSource::Remainder,
+            (Source::Input, true) | (Source::None, true) | (Source::Slice, _) => {
+                InputSource::Remainder
+            }
             (Source::Input, false) => InputSource::WholeInput,
             (Source::None, false) => InputSource::None,
         };
-        params.push(crate::arg_layout::describe(&crate::arg_layout::Described {
+        let mut param = crate::arg_layout::describe(&crate::arg_layout::Described {
             call: group.call,
             role,
             index: group.index_base + index,
@@ -321,24 +538,43 @@ fn layout_steps(
             arg: &emission.arg,
             source,
             shape: &shape,
-        }));
+        });
+        // A slice's bytes are a heap copy of their own.
+        if slices[index].is_some() && param.decoder == "input_buffer" {
+            param.copied = Some(true);
+        }
+        params.push(param);
     }
-    // Pairs are neighbours in parameter order.
+    // Pairs are neighbours in parameter order, taking the same bytes.
     let mut by_index: Vec<usize> = (0..params.len()).collect();
     by_index.sort_by_key(|&at| params[at].index);
     let mut sorted: Vec<_> = by_index.iter().map(|&at| params[at].clone()).collect();
-    crate::arg_layout::pair_input_params(&mut sorted);
+    let groups: Vec<Option<&str>> = by_index
+        .iter()
+        .map(|&at| slices[order[at].0].as_deref())
+        .collect();
+    crate::arg_layout::pair_input_params(&mut sorted, &groups);
     for (&at, param) in by_index.iter().zip(sorted) {
         params[at] = param;
     }
     let mut head = Vec::new();
     let mut tail = Vec::new();
-    for (position, (param, &(_, deferred))) in params.into_iter().zip(order).enumerate() {
+    let mut sliced: Vec<&str> = Vec::new();
+    for (position, (param, &(index, deferred))) in params.into_iter().zip(order).enumerate() {
         if deferred && position == tail_start {
             tail.push(LayoutStep::Remainder {
                 call: group.call.to_owned(),
                 sized,
             });
+        }
+        if let Some(id) = slices[index].as_deref() {
+            if !sliced.contains(&id) {
+                sliced.push(id);
+                head.push(LayoutStep::Remainder {
+                    call: group.call.to_owned(),
+                    sized: true,
+                });
+            }
         }
         if deferred {
             tail.push(LayoutStep::Param(param));
@@ -347,6 +583,43 @@ fn layout_steps(
         }
     }
     (head, tail)
+}
+
+/// The slice (see [`slice_input_units`]) each emission takes its bytes from:
+/// the one whose locals it names, or the one of a neighbour whose names it
+/// uses (a length decoded from its buffer's copy).
+fn slice_ids(emissions: &[CParamEmission]) -> Vec<Option<String>> {
+    let mut slices: Vec<Option<String>> = emissions
+        .iter()
+        .map(|emission| slice_named(&format!("{} {}", emission.decl, emission.arg)))
+        .collect();
+    if slices.iter().all(Option::is_none) {
+        return slices;
+    }
+    loop {
+        let mut changed = false;
+        for index in 0..emissions.len() {
+            if slices[index].is_some() {
+                continue;
+            }
+            let code = format!("{} {}", emissions[index].decl, emissions[index].arg);
+            let used = identifiers(&code);
+            let linked = (0..emissions.len()).find_map(|other| {
+                let slice = slices[other].as_ref()?;
+                declared_names(&emissions[other])
+                    .iter()
+                    .any(|name| used.contains(name))
+                    .then(|| slice.clone())
+            });
+            if linked.is_some() {
+                slices[index] = linked;
+                changed = true;
+            }
+        }
+        if !changed {
+            return slices;
+        }
+    }
 }
 
 /// Whether any of a call's decls reads the input cursor.
@@ -1032,6 +1305,10 @@ fn known_len(decl: &str, arg: &str) -> String {
         }
         return none;
     }
+    // The end of a `[begin, end)` pair points past the input's bytes.
+    if crate::arg_layout::points_past_input(decl) {
+        return "(size_t)(0)".to_owned();
+    }
     if decl.contains(")Data") || decl.contains("= Data") {
         return "(size_t)(Size)".to_owned();
     }
@@ -1259,6 +1536,98 @@ mod tests {
             fresh_cursor: true,
             sized_buffers: false,
         }
+    }
+
+    /// Of a call's buffers, every one but the last takes a sized slice of
+    /// the cursor, freed after the call, and the last the bytes left; a
+    /// length the input size gives only (an output capacity) is left alone.
+    #[test]
+    fn every_buffer_but_the_last_takes_a_slice_of_its_own() {
+        let mut emissions = vec![
+            emission("const uint8_t * a = (const uint8_t *)Data", "a", "const uint8_t *"),
+            emission("size_t alen = (size_t)Size", "alen", "size_t"),
+            emission(
+                "size_t _bhf_cap_out = Size + 65536; uint8_t * out = (uint8_t *)malloc(_bhf_cap_out)",
+                "out",
+                "uint8_t *",
+            ),
+            emission("size_t cap = (size_t)_bhf_cap_out", "cap", "size_t"),
+            emission("int x = bhf_i32(&Cur)", "x", "int"),
+            emission("const uint8_t * b = (const uint8_t *)Data", "b", "const uint8_t *"),
+            emission("size_t blen = (size_t)Size", "blen", "size_t"),
+        ];
+        slice_input_units(&mut emissions, &[0..2, 2..4, 4..5, 5..7]);
+        assert_eq!(
+            emissions[0].decl,
+            "size_t _bhf_slicelen_a = 0; size_t _bhf_sliceat_a = 0; \
+             uint8_t *_bhf_slice_a = bhf_take_sized_copy(&Cur, &_bhf_slicelen_a, &_bhf_sliceat_a); \
+             const uint8_t * a = (const uint8_t *)_bhf_slice_a"
+        );
+        assert_eq!(emissions[0].free.as_deref(), Some("free(_bhf_slice_a)"));
+        assert_eq!(emissions[1].decl, "size_t alen = (size_t)_bhf_slicelen_a");
+        assert!(
+            emissions[2].decl.contains("Size + 65536"),
+            "{:?}",
+            emissions[2]
+        );
+        assert_eq!(
+            emissions[5].decl,
+            "const uint8_t * b = (const uint8_t *)Data"
+        );
+
+        let registry = TypeRegistry::default();
+        let declared: Vec<Declared> = ["a", "alen", "out", "cap", "x", "b", "blen"]
+            .iter()
+            .zip(&emissions)
+            .map(|(name, emission)| Declared::new(*name, emission.c_type.clone()))
+            .collect();
+        let plan = plan(&c_group(&registry), &emissions, &declared);
+        let steps: Vec<String> = plan
+            .layout
+            .iter()
+            .map(|step| match step {
+                crate::arg_layout::LayoutStep::Param(p) => format!("{}:{}", p.name, p.input),
+                crate::arg_layout::LayoutStep::Remainder { sized, .. } => {
+                    format!("rest:{sized}")
+                }
+                crate::arg_layout::LayoutStep::Opaque { .. } => "opaque".to_owned(),
+            })
+            .collect();
+        assert_eq!(
+            steps,
+            [
+                "rest:true",
+                "a:remainder",
+                "alen:remainder",
+                "x:cursor",
+                "rest:false",
+                "out:remainder",
+                "cap:remainder",
+                "b:remainder",
+                "blen:remainder",
+            ]
+        );
+        let param = |name: &str| {
+            plan.layout
+                .iter()
+                .find_map(|step| match step {
+                    crate::arg_layout::LayoutStep::Param(p) if p.name == name => Some(p.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(param("a").paired_with.as_deref(), Some("alen"));
+        assert_eq!(param("a").copied, Some(true));
+        assert_eq!(param("b").paired_with.as_deref(), Some("blen"));
+        assert_eq!(param("alen").paired_with.as_deref(), Some("a"));
+        // The slice's span is its bytes after the 4-byte length.
+        assert!(
+            plan.decode.iter().any(|statement| statement.contains(
+                "bhf_tl_span((size_t)(_bhf_sliceat_a), (size_t)(_bhf_sliceat_a + _bhf_slicelen_a))"
+            )),
+            "{:#?}",
+            plan.decode
+        );
     }
 
     #[test]

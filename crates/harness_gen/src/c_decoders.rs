@@ -208,9 +208,14 @@ pub fn select_c_decoder(c_type: &str, name: &str) -> Option<CParamEmission> {
 /// `HANDLE`/`HWND`/`LPVOID` stay-opaque assertions in `type_model`). MFC *class*
 /// types like `CString` are also out of scope (constructing a class arg).
 fn normalize_win32_typedef(c_type: &str) -> Option<&'static str> {
+    // Byte-buffer pointers (`PBYTE`, `LPCBYTE`, ...) — driven from the fuzz
+    // input like the spelled byte pointers they stand for.
+    match type_model::win32_byte_pointer_typedef(c_type) {
+        Some(true) => return Some("const unsigned char *"),
+        Some(false) => return Some("unsigned char *"),
+        None => {}
+    }
     Some(match c_type.trim() {
-        // Byte-buffer pointers — driven from the fuzz `(Data, Size)` buffer.
-        "PUCHAR" | "PBYTE" | "LPBYTE" => "unsigned char *",
         // C-string pointers — driven from a NUL-terminated fuzz C string.
         "LPCSTR" | "LPCTSTR" | "PCSTR" => "const char *",
         "LPSTR" | "LPTSTR" | "PSTR" => "char *",
@@ -1276,6 +1281,16 @@ fn emit_top_level_pointer(
     lifecycle: &[CHandleLifecycle],
 ) -> Result<String, CDecoderError> {
     match inner {
+        TypeShape::Scalar(ScalarKind::U8 | ScalarKind::I8) if is_hidden_pointer(c_type) => {
+            // A byte pointer spelled through a typedef (`typedef const BYTE
+            // *cbytes_t`) is a buffer, like the spelled pointer it stands
+            // for, not a pointer to one byte of storage the callee reads
+            // past. The typedef hides whether the bytes are const, so it
+            // gets the read-only buffer's NUL-terminated copy, whose `(void
+            // *)` writes compile and whose size is the input's either way.
+            emit_nul_terminated_byte_copy(ctx, c_type, name);
+            Ok(name.to_owned())
+        }
         TypeShape::Scalar(kind) => {
             if is_const_byte_pointer(c_type, *kind) {
                 // A LONE const byte pointer (a `(buffer, length)` pair would have
@@ -1291,15 +1306,7 @@ fn emit_top_level_pointer(
                 // input. Zero the whole buffer first so the bytes past `Size` are
                 // defined (a fixed-width read sees zeros, not heap garbage), then copy
                 // the fuzz bytes and keep the C-string NUL terminator.
-                let cap = format!("_bhf_cap_{name}");
-                ctx.push(format!(
-                    "size_t {cap} = (size_t)Size + 1; if ({cap} < 8) {cap} = 8; \
-                     {c_type} {name} = ({c_type})malloc({cap}); \
-                     if ({name}) {{ memset((void *){name}, 0, {cap}); \
-                     if (Size) memcpy((void *){name}, Data, Size); \
-                     ((char *){name})[Size] = '\\0'; }}"
-                ));
-                ctx.cleanups.push(format!("free((void *){name})"));
+                emit_nul_terminated_byte_copy(ctx, c_type, name);
                 return Ok(name.to_owned());
             }
             let storage_type = output_pointer_storage_type(c_type, pointer_base_hint, name)?;
@@ -1559,6 +1566,27 @@ fn is_const_pointee(c_type: &str) -> bool {
             .any(|token| token == "const"),
         None => false,
     }
+}
+
+/// A NUL-terminated heap copy of the input for a lone read-only byte
+/// pointer `name` of type `c_type`, at least 8 bytes and zeroed past the
+/// input, freed after the call.
+fn emit_nul_terminated_byte_copy(ctx: &mut DecodeContext<'_>, c_type: &str, name: &str) {
+    let cap = format!("_bhf_cap_{name}");
+    ctx.push(format!(
+        "size_t {cap} = (size_t)Size + 1; if ({cap} < 8) {cap} = 8; \
+         {c_type} {name} = ({c_type})malloc({cap}); \
+         if ({name}) {{ memset((void *){name}, 0, {cap}); \
+         if (Size) memcpy((void *){name}, Data, Size); \
+         ((char *){name})[Size] = '\\0'; }}"
+    ));
+    ctx.cleanups.push(format!("free((void *){name})"));
+}
+
+/// A pointer type spelled without a declarator (a typedef name such as
+/// `LPCBYTE` or `cbytes_t`), so its spelling hides the pointee.
+fn is_hidden_pointer(c_type: &str) -> bool {
+    !c_type.contains('*') && !c_type.contains('[') && !c_type.contains('(')
 }
 
 fn is_const_byte_pointer(c_type: &str, kind: ScalarKind) -> bool {
