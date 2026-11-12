@@ -2937,9 +2937,11 @@ mod tests {
         let (_tmp, f) = normalize_dir(asan_record(), None, |dir| {
             std::fs::write(dir.join("replay.py"), b"print()").unwrap();
         });
+        // Windows' Python launcher is `python`.
+        let python = if cfg!(windows) { "python" } else { "python3" };
         assert_eq!(
             f.reproduce.as_ref().unwrap().command.as_deref(),
-            Some("python3 findings/F-0000-1a2b3c4d/replay.py")
+            Some(format!("{python} findings/F-0000-1a2b3c4d/replay.py").as_str())
         );
     }
 

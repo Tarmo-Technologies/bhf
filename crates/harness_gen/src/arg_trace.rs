@@ -184,9 +184,12 @@ fn is_lone_buffer(unit: &[CParamEmission]) -> bool {
 /// as large as the input unless the explicit buffer-length dimension is on.
 fn has_implicit_length(unit: &[CParamEmission]) -> bool {
     is_lone_buffer(unit)
-        && !identifiers(&unit[0].decl)
-            .iter()
-            .any(|name| matches!(*name, "fmemopen" | "tmpfile" | "bhf_make_tempfile"))
+        && !identifiers(&unit[0].decl).iter().any(|name| {
+            matches!(
+                *name,
+                "bhf_fmemopen" | "fmemopen" | "tmpfile" | "bhf_make_tempfile"
+            )
+        })
 }
 
 /// The slice whose locals `code` names, if any.
@@ -1268,6 +1271,7 @@ fn is_member_name(code: &str, at: usize) -> bool {
 fn decoder_label(decl: &str) -> String {
     let label = match first_runtime_call(decl) {
         Some((name, _)) if name == "bhf_make_tempfile" => "input file".to_owned(),
+        Some((name, _)) if name == "bhf_fmemopen" => "input stream".to_owned(),
         Some((name, args)) => {
             let args: Vec<&str> = args
                 .iter()
@@ -2017,6 +2021,22 @@ mod tests {
     }
 
     #[test]
+    fn stream_decoders_are_labelled_input_stream() {
+        // The FILE* decoders open the input as a stream through a runtime
+        // helper; the label names that use, not the helper call or its temporaries.
+        for c_type in ["FILE *", "MZ_FILE *"] {
+            let emission = crate::c_decoders::select_c_decoder(c_type, "stream")
+                .unwrap_or_else(|| panic!("{c_type} is supported"));
+            assert_eq!(
+                decoder_label(&emission.decl),
+                "input stream",
+                "{c_type}: {}",
+                emission.decl
+            );
+        }
+    }
+
+    #[test]
     fn positions_are_captured_only_where_a_span_uses_them() {
         let registry = TypeRegistry::default();
         let plan = plan(
@@ -2228,16 +2248,17 @@ mod tests {
         );
         assert!(plan(&group, &emissions, &[]).buffer_len_dimension);
 
-        // A stream gets exactly its bytes either way, and so does a pair.
+        // A stream gets exactly its bytes either way, and so does a pair. The
+        // stream is the decoder's own (`bhf_fmemopen`, which is a temporary
+        // file on Windows).
+        let stream = crate::c_decoders::select_c_decoder("FILE *", "f").expect("FILE * decodes");
         let mut emissions = vec![
+            stream,
             emission(
-                "unsigned char *_bhf_file_buf_f = (unsigned char *)calloc(Size ? Size : 1, 1); \
-                 if (_bhf_file_buf_f && Size) memcpy(_bhf_file_buf_f, Data, Size); \
-                 FILE * f = _bhf_file_buf_f ? (Size ? fmemopen(_bhf_file_buf_f, Size, \"r+\") : tmpfile()) : NULL",
-                "f",
-                "FILE *",
+                "const uint8_t * b = (const uint8_t *)Data",
+                "b",
+                "const uint8_t *",
             ),
-            emission("const uint8_t * b = (const uint8_t *)Data", "b", "const uint8_t *"),
             emission("size_t n = (size_t)Size", "n", "size_t"),
         ];
         slice_input_units(&mut emissions, &units, false);
@@ -2246,9 +2267,13 @@ mod tests {
             "{}",
             emissions[0].decl
         );
-        assert!(emissions[0]
-            .decl
-            .contains("fmemopen(_bhf_file_buf_f, _bhf_slicelen_f, "));
+        assert!(
+            emissions[0]
+                .decl
+                .contains("bhf_fmemopen(_bhf_file_buf_f, _bhf_slicelen_f)"),
+            "{}",
+            emissions[0].decl
+        );
         let mut emissions = call();
         emissions.swap(0, 2);
         emissions.swap(0, 1);

@@ -1062,7 +1062,7 @@ pub(crate) fn is_binary_finding(finding_dir: &Path) -> bool {
 }
 
 /// `bhf replay` of a binary finding with the default output.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn replay_binary_finding(finding_dir: &Path, binary: &Path) -> i32 {
     crate::replay::finish_lane(
         finding_dir,

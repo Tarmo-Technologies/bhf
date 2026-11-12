@@ -4027,13 +4027,20 @@ mod tests {
         #if defined(__QNX__)
         int qnx_only(int x) { return x; }
         #endif
+        #ifdef __linux__
+        int linux_only(int x) { return x; }
+        #endif
         int portable(int x) { return x; }
         "#,
         )
         .expect("C parses");
         let by_name = |n: &str| functions.iter().find(|f| f.name == n).unwrap();
-        assert!(by_name("win_only").foreign_guard.is_some());
-        assert!(by_name("msvc_only").foreign_guard.is_some());
+        // Which desktop platform is foreign depends on the host: Windows
+        // branches on a Unix host, Unix branches on a Windows host.
+        let windows_host = cfg!(windows);
+        assert_eq!(by_name("win_only").foreign_guard.is_some(), !windows_host);
+        assert_eq!(by_name("msvc_only").foreign_guard.is_some(), !windows_host);
+        assert_eq!(by_name("linux_only").foreign_guard.is_some(), windows_host);
         // RTOS-guarded branches are foreign on this host too (routed to a
         // stub-isolated build via foreign_platform_stub).
         assert_eq!(

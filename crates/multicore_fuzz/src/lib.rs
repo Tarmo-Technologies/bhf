@@ -1276,7 +1276,8 @@ mod tests {
             workers: WorkerCount::Fixed(0),
             per_worker_iterations: None,
             time_budget: Duration::from_secs(1),
-            bhf_bin: PathBuf::from("/bin/true"),
+            // Only has to exist; the worker count is what is refused.
+            bhf_bin: std::env::current_exe().unwrap(),
             per_worker_env: Vec::new(),
             extra_worker_args: Vec::new(),
             kill_grace: None,
@@ -1525,6 +1526,8 @@ mod tests {
         );
     }
 
+    // Runs `/bin/true` as each worker.
+    #[cfg(unix)]
     #[test]
     fn run_multicore_two_workers_with_bin_true_yields_two_started_workers() {
         // /bin/true exits 0 immediately; we just want to verify

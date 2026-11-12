@@ -3400,8 +3400,9 @@ fn read_json(path: &Path) -> Option<Value> {
 mod tests {
     use super::*;
 
+    /// A successful exit status (the default one), without running anything.
     fn ok_status() -> ExitStatus {
-        Command::new("true").status().unwrap()
+        ExitStatus::default()
     }
 
     #[test]
@@ -3655,6 +3656,8 @@ mod tests {
         assert_eq!(common_ancestor(std::iter::empty()), None);
     }
 
+    // Unix only: the fixture's paths are POSIX absolute paths.
+    #[cfg(unix)]
     #[test]
     fn per_translation_unit_rules_keep_their_own_flags() {
         let dir = tempfile::tempdir().unwrap();
@@ -4169,6 +4172,7 @@ mod tests {
         assert!(windows.script.contains("$Compiler = $env:CXX"));
     }
 
+    #[cfg(unix)]
     fn compile_line(script: &str) -> &str {
         script
             .lines()
@@ -4178,6 +4182,8 @@ mod tests {
 
     /// Headers keep their path relative to the include root, the include
     /// flags point at the copied roots, and spaced names stay one shell word.
+    // Unix only: the recorded recipe is read as POSIX shell words.
+    #[cfg(unix)]
     #[test]
     fn capsule_plan_keeps_include_subpaths_and_quotes_names() {
         let temp = tempfile::tempdir().unwrap();
@@ -4218,6 +4224,8 @@ mod tests {
     /// The recorded recipe's standard and extra sources reach build.sh; the C
     /// standard follows the recovered flags (the Makefile's `C_STD_FLAG`
     /// order), the C++ one leads them.
+    // Unix only: the recorded recipe is read as POSIX shell words.
+    #[cfg(unix)]
     #[test]
     fn capsule_plan_applies_the_recorded_recipe() {
         let temp = tempfile::tempdir().unwrap();
@@ -4295,6 +4303,7 @@ mod tests {
             .contains("no main.cpp"));
     }
 
+    #[cfg(unix)]
     fn executable(path: &Path, text: &str) {
         write(path, text);
         #[cfg(unix)]
@@ -4569,6 +4578,8 @@ mod tests {
 
     #[test]
     fn a_missing_compiler_is_named() {
+        // A program every host has on PATH stands in for an installed compiler.
+        let present = if cfg!(windows) { "cmd" } else { "sh" };
         let requirement = Requirement::new(
             "BHF_TEST_UNSET_COMPILER_VAR",
             "bhf-no-such-compiler",
@@ -4579,15 +4590,16 @@ mod tests {
         assert!(missing.contains("bhf-no-such-compiler"), "{missing}");
         assert!(missing.contains("BHF_TEST_UNSET_COMPILER_VAR"), "{missing}");
         assert!(missing.contains("compiles the harness"), "{missing}");
-        assert_eq!(missing_program("sh", "CC"), None);
+        assert_eq!(missing_program(present, "CC"), None);
         // A launcher in front of the compiler needs both programs, but a flag
         // after the compiler is not a program.
-        let launcher = missing_program("sh bhf-no-such-compiler-zz", "CXX").unwrap();
+        let launcher =
+            missing_program(&format!("{present} bhf-no-such-compiler-zz"), "CXX").unwrap();
         assert!(
             launcher.contains("bhf-no-such-compiler-zz is not found"),
             "{launcher}"
         );
-        assert_eq!(missing_program("sh -c", "CC"), None);
+        assert_eq!(missing_program(&format!("{present} -c"), "CC"), None);
     }
 
     /// A program the build script finds under any of several names (`lua`,

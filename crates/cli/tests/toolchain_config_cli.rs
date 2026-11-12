@@ -437,6 +437,7 @@ fn auto_forwards_the_ada_toolchain_to_the_generated_project() {
 
 /// A C file whose `parse_record` reads one byte past its input: only an
 /// AddressSanitizer build reports it.
+#[cfg(unix)]
 fn write_over_read(dir: &Path) {
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(
@@ -450,6 +451,7 @@ fn write_over_read(dir: &Path) {
 }
 
 /// An executable shell script at `path`.
+#[cfg(unix)]
 fn write_script(path: &Path, body: &str) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -460,6 +462,8 @@ fn write_script(path: &Path, body: &str) {
 /// A runner configured for a foreign Ada target only runs the Ada harnesses:
 /// the C/C++ candidates still build for the host, with sanitizers, and run
 /// natively. It used to turn the whole C/C++ sweep into an emulated one.
+// The fake compilers and runners are shell scripts.
+#[cfg(unix)]
 #[test]
 fn an_ada_only_runner_leaves_the_c_candidates_native() {
     if !have("clang") || !have("make") || std::env::consts::ARCH != "x86_64" {
@@ -511,6 +515,8 @@ fn an_ada_only_runner_leaves_the_c_candidates_native() {
 
 /// A runner with nothing foreign to run is refused rather than wrapped around
 /// host builds.
+// The fake compilers and runners are shell scripts.
+#[cfg(unix)]
 #[test]
 fn auto_refuses_a_runner_when_nothing_builds_for_another_target() {
     if !have("clang") {
@@ -539,6 +545,8 @@ fn auto_refuses_a_runner_when_nothing_builds_for_another_target() {
 /// A C/C++ compiler that builds for another target, with no runner, is
 /// refused up front, whether it comes from --cc or from CC. It used to build
 /// foreign binaries and run them natively, rejecting every input.
+// The fake compilers and runners are shell scripts.
+#[cfg(unix)]
 #[test]
 fn auto_refuses_a_foreign_compiler_without_a_runner() {
     let tmp = tempfile::tempdir().unwrap();
@@ -857,6 +865,8 @@ fn gcc_probe_builds_and_links_its_archive(src: &Path, work: &Path) {
 /// guard-driven aarch64 and armhf lanes: the candidates under `arm64/` and
 /// `arm/` build with the configured compiler and run under the configured
 /// runner, with coverage.
+// The fake compilers and runners are shell scripts.
+#[cfg(unix)]
 #[test]
 fn cross_tables_override_the_guard_lanes_compiler_and_runner() {
     let tools = [
@@ -1110,6 +1120,8 @@ fn auto_with_config(src: &Path, work: &Path, config: &Path) -> String {
 /// A `[cross.<lane>]` sysroot reaches every compile and link of the lane,
 /// bhf's own driver object included: an SDK compiler that refuses to compile
 /// or link a file without its sysroot still builds the guarded target.
+// The fake compilers and runners are shell scripts.
+#[cfg(unix)]
 #[test]
 fn a_cross_table_sysroot_reaches_every_compile_and_link() {
     let tools = ["aarch64-linux-gnu-gcc", "qemu-aarch64", "make"];

@@ -96,6 +96,11 @@ fn the_generated_makefile_checks_without_linking_prebuilt_objects() {
         eprintln!("skipping: clang+libfuzzer unavailable");
         return;
     }
+    // The check target is run with the `make` on PATH.
+    if which::which("make").is_err() {
+        eprintln!("skipping: make not on PATH");
+        return;
+    }
 
     let root = tmpdir("makefile");
     let src = root.join("src");

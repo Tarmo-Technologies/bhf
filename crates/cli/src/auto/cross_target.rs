@@ -940,6 +940,11 @@ pub(crate) fn is_win32_known_name(name: &str) -> bool {
 /// True when `exe` is resolvable as an executable: a path with a separator is
 /// checked as-is, a bare name is searched across `PATH` entries.
 pub fn executable_on_path(exe: &str) -> bool {
+    if cfg!(windows) {
+        // `which` also tries Windows' executable extensions, so `gcc` finds
+        // `gcc.exe` and `C:\tools\gcc` finds `C:\tools\gcc.exe`.
+        return which::which(exe).is_ok();
+    }
     let path = Path::new(exe);
     if path.components().count() > 1 {
         return path.is_file();
@@ -1249,6 +1254,10 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// A program every host has on PATH (`cmd.exe` is found without its
+    /// extension on Windows).
+    const PRESENT: &str = if cfg!(windows) { "cmd" } else { "sh" };
+
     #[test]
     fn win32_name_set_is_covered_by_the_stub() {
         // Whole-word match: `LONG` must not be satisfied by `ULONG`, nor `TCHAR`
@@ -1396,9 +1405,9 @@ mod tests {
             (
                 "aarch64",
                 config::CrossGuardConfig {
-                    cc: Some("sh".to_owned()),
+                    cc: Some(PRESENT.to_owned()),
                     cxx: Some("bhf-cross-no-such-cxx-zzz".to_owned()),
-                    runner: Some("sh".to_owned()),
+                    runner: Some(PRESENT.to_owned()),
                     ..Default::default()
                 },
             ),
@@ -1406,8 +1415,8 @@ mod tests {
                 "armhf",
                 config::CrossGuardConfig {
                     cc: Some("bhf-cross-no-such-cc-zzz".to_owned()),
-                    cxx: Some("sh".to_owned()),
-                    runner: Some("sh".to_owned()),
+                    cxx: Some(PRESENT.to_owned()),
+                    runner: Some(PRESENT.to_owned()),
                     ..Default::default()
                 },
             ),
@@ -1795,19 +1804,19 @@ int main(int argc, char **argv) {
 
     #[test]
     fn available_reflects_path_lookup() {
-        // `available()`/`missing_tools()` consult PATH. Use a shell that every
-        // POSIX host has on PATH as the "present" sentinel and a junk name as
-        // the "absent" one, so the test does not depend on a cross toolchain
+        // `available()`/`missing_tools()` consult PATH. Use a program every
+        // host has on PATH as the "present" sentinel and a junk name as the
+        // "absent" one, so the test does not depend on a cross toolchain
         // being installed.
-        assert!(executable_on_path("sh"));
+        assert!(executable_on_path(PRESENT));
         assert!(!executable_on_path("bhf-cross-no-such-tool-zzz"));
 
         let present = CrossTarget {
             triple: "t".to_owned(),
-            cc: "sh".to_owned(),
-            cxx: "sh".to_owned(),
+            cc: PRESENT.to_owned(),
+            cxx: PRESENT.to_owned(),
             runner: CrossRunner::QemuUser {
-                exe: "sh".to_owned(),
+                exe: PRESENT.to_owned(),
             },
             sysroot: None,
             guard_lane: true,
@@ -1937,6 +1946,9 @@ int main(int argc, char **argv) {
         );
     }
 
+    // The header maps the MSVC CRT names onto a POSIX C library for a
+    // non-Windows host; a Windows host has the real CRT.
+    #[cfg(not(windows))]
     #[test]
     fn crt_compat_header_compiles_and_resists_base_name_hijack() {
         // The header must (1) be valid C and (2) keep `_vsnprintf` bound to the real
@@ -2001,6 +2013,9 @@ int main(int argc, char **argv) {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // The header maps the MSVC CRT names onto a POSIX C library for a
+    // non-Windows host; a Windows host has the real CRT.
+    #[cfg(not(windows))]
     #[test]
     fn crt_compat_header_compiles_in_cpp_tu_with_cstddef() {
         // Regression: the faux `_MSC_VER 1900` (needed for version ladders) put

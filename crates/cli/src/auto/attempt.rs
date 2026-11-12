@@ -10854,8 +10854,12 @@ mod source_dictionary_tests {
         ));
         let harness_dir = root.join("H-PY");
         std::fs::create_dir_all(&harness_dir).unwrap();
+        // The sources exist, as a harness's target source always does: the
+        // label is relative to the resolved (canonical) directory.
+        std::fs::create_dir_all(root.join("src")).unwrap();
         let source_path = root.join("src").join("widget.py");
         let source = "def parse_record(s):\n    return s == \"WGT1\"\nTAG = \"WGT1\"\n";
+        std::fs::write(&source_path, source).unwrap();
         write_source_dictionary(&harness_dir, Some(source), &source_path, Lang::Python);
         let dictionary = std::fs::read_to_string(harness_dir.join("dictionary.txt")).unwrap();
         assert!(
@@ -10865,12 +10869,9 @@ mod source_dictionary_tests {
 
         let js_dir = root.join("H-JS");
         std::fs::create_dir_all(&js_dir).unwrap();
-        write_source_dictionary(
-            &js_dir,
-            Some("// widget\nfunction parseRecord(s) {\n  return s === 'WGT2';\n}\n"),
-            &root.join("widget.js"),
-            Lang::Js,
-        );
+        let js_source = "// widget\nfunction parseRecord(s) {\n  return s === 'WGT2';\n}\n";
+        std::fs::write(root.join("widget.js"), js_source).unwrap();
+        write_source_dictionary(&js_dir, Some(js_source), &root.join("widget.js"), Lang::Js);
         let dictionary = std::fs::read_to_string(js_dir.join("dictionary.txt")).unwrap();
         assert!(
             dictionary.contains("# from widget.js:3\n\"WGT2\"\n"),
@@ -12034,10 +12035,15 @@ mod stamp_tests {
             Some("widget")
         );
         assert_eq!(ada_unit_key_from_filename("shim.c"), None);
-        // A host platform variant maps to the base unit (unix is host on
-        // linux/macos CI); the suffix is stripped.
+        // A host platform variant maps to the base unit; the suffix is
+        // stripped.
+        let host_variant = if cfg!(windows) {
+            "gnatcoll-os-stat-fstat__windows.adb"
+        } else {
+            "gnatcoll-os-stat-fstat__unix.adb"
+        };
         assert_eq!(
-            ada_unit_key_from_filename("gnatcoll-os-stat-fstat__unix.adb").as_deref(),
+            ada_unit_key_from_filename(host_variant).as_deref(),
             Some("gnatcoll.os.stat.fstat")
         );
     }

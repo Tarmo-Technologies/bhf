@@ -12,18 +12,17 @@ pub fn crate_name() -> &'static str {
     "compiler_adapter"
 }
 
-#[cfg(test)]
+/// Probes, builds and canaries against fake `gprbuild`/`gnatmake` programs
+/// that are POSIX shell scripts, so these run only where a script is an
+/// executable.
+#[cfg(all(test, unix))]
 mod tests {
     use std::ffi::OsString;
-    use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
 
     use ada_parser::ast::AdaStandard;
 
-    use crate::capability::{parse_target_runtime, parse_version};
+    use crate::test_support::{PathEnvGuard, TestPathDir, PATH_LOCK};
     use crate::{BuildMode, CompilerAdapter, CompilerError, ToolchainConfig};
-
-    static PATH_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn compiler_adapter_discover_finds_gprbuild_when_present() {
@@ -49,17 +48,6 @@ mod tests {
 
         assert!(adapter.gprbuild_path().is_none());
         assert!(adapter.gnatmake_path().is_some());
-    }
-
-    #[test]
-    fn compiler_adapter_discover_returns_error_when_neither_present() {
-        let _lock = PATH_LOCK.lock().expect("path lock is acquired");
-        let dir = TestPathDir::new("discover_none");
-        let _path = PathEnvGuard::set(dir.path());
-
-        let error = CompilerAdapter::discover().expect_err("compiler is missing");
-
-        assert!(matches!(error, CompilerError::NoCompilerFound));
     }
 
     #[test]
@@ -243,61 +231,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_version_handles_fsf_gnat_13_format() {
-        let raw = "GNATMAKE 13.2.0 20240106 (experimental)\n";
-
-        let (compiler_id, version) = parse_version(raw).expect("version parses");
-
-        assert_eq!(compiler_id, "FSF GNAT 13.2.0");
-        assert_eq!(version, "13.2.0");
-    }
-
-    #[test]
-    fn parse_version_handles_adacore_gnat_pro_format() {
-        let raw = "GNAT Pro 24.0 (20240501)\n";
-
-        let (compiler_id, version) = parse_version(raw).expect("version parses");
-
-        assert_eq!(compiler_id, "AdaCore GNAT Pro 24.0");
-        assert_eq!(version, "24.0");
-    }
-
-    #[test]
-    fn parse_version_handles_gprbuild_pro_format() {
-        let raw = "GPRBUILD Pro 18.0w (19940713) (x86_64-linux-gnu)\n";
-
-        let (compiler_id, version) = parse_version(raw).expect("version parses");
-
-        assert_eq!(compiler_id, "AdaCore GPRbuild Pro 18.0w");
-        assert_eq!(version, "18.0w");
-    }
-
-    #[test]
-    fn parse_version_returns_error_on_empty_output() {
-        let error = parse_version("").expect_err("empty version output is invalid");
-
-        assert!(matches!(error, CompilerError::UnparseableVersion { .. }));
-    }
-
-    #[test]
-    fn parse_target_runtime_extracts_target_triple() {
-        let raw = "GNATMAKE 13.2.0\nTarget: x86_64-pc-linux-gnu\nRuntime: default\n";
-
-        let (target, runtime) = parse_target_runtime(raw);
-
-        assert_eq!(target, "x86_64-pc-linux-gnu");
-        assert_eq!(runtime, "default");
-    }
-
-    #[test]
-    fn parse_target_runtime_defaults_to_unknown_when_missing() {
-        let (target, runtime) = parse_target_runtime("GNATMAKE 13.2.0\n");
-
-        assert_eq!(target, "unknown");
-        assert_eq!(runtime, "unknown");
-    }
-
-    #[test]
     fn probe_compiler_returns_capabilities_when_compiler_present() {
         let _lock = PATH_LOCK.lock().expect("path lock is acquired");
         let dir = TestPathDir::new("probe_capabilities");
@@ -467,66 +400,6 @@ mod tests {
         assert_eq!(count.trim(), "4");
     }
 
-    struct TestPathDir {
-        path: PathBuf,
-    }
-
-    impl TestPathDir {
-        fn new(test_name: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "bhf-compiler-adapter-{test_name}-{}",
-                std::process::id()
-            ));
-            if path.exists() {
-                std::fs::remove_dir_all(&path).expect("old test directory is removed");
-            }
-            std::fs::create_dir_all(&path).expect("test directory is created");
-            Self { path }
-        }
-
-        fn path(&self) -> &Path {
-            &self.path
-        }
-
-        fn write_executable(&self, name: &str, contents: &str) {
-            let path = self.path.join(name);
-            std::fs::write(&path, contents).expect("fake compiler is written");
-            make_executable(&path);
-        }
-
-        fn file_path(&self, name: &str) -> PathBuf {
-            self.path.join(name)
-        }
-    }
-
-    impl Drop for TestPathDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
-
-    struct PathEnvGuard {
-        original: Option<OsString>,
-    }
-
-    impl PathEnvGuard {
-        fn set(path: &Path) -> Self {
-            let original = std::env::var_os("PATH");
-            std::env::set_var("PATH", path);
-            Self { original }
-        }
-    }
-
-    impl Drop for PathEnvGuard {
-        fn drop(&mut self) {
-            if let Some(original) = &self.original {
-                std::env::set_var("PATH", original);
-            } else {
-                std::env::remove_var("PATH");
-            }
-        }
-    }
-
     struct EnvVarGuard {
         key: &'static str,
         original: Option<OsString>,
@@ -667,6 +540,79 @@ printf '\n' >&2
 exit 1
 "#
     }
+}
+
+/// Test helpers for the tests that change `PATH`, shared by every test module
+/// so they take turns on the one process-wide variable.
+#[cfg(test)]
+mod test_support {
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    pub(crate) static PATH_LOCK: Mutex<()> = Mutex::new(());
+
+    pub(crate) struct TestPathDir {
+        path: PathBuf,
+    }
+
+    impl TestPathDir {
+        pub(crate) fn new(test_name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "bhf-compiler-adapter-{test_name}-{}",
+                std::process::id()
+            ));
+            if path.exists() {
+                std::fs::remove_dir_all(&path).expect("old test directory is removed");
+            }
+            std::fs::create_dir_all(&path).expect("test directory is created");
+            Self { path }
+        }
+
+        pub(crate) fn path(&self) -> &Path {
+            &self.path
+        }
+
+        #[cfg(unix)]
+        pub(crate) fn write_executable(&self, name: &str, contents: &str) {
+            let path = self.path.join(name);
+            std::fs::write(&path, contents).expect("fake compiler is written");
+            make_executable(&path);
+        }
+
+        #[cfg(unix)]
+        pub(crate) fn file_path(&self, name: &str) -> PathBuf {
+            self.path.join(name)
+        }
+    }
+
+    impl Drop for TestPathDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    pub(crate) struct PathEnvGuard {
+        original: Option<OsString>,
+    }
+
+    impl PathEnvGuard {
+        pub(crate) fn set(path: &Path) -> Self {
+            let original = std::env::var_os("PATH");
+            std::env::set_var("PATH", path);
+            Self { original }
+        }
+    }
+
+    impl Drop for PathEnvGuard {
+        fn drop(&mut self) {
+            if let Some(original) = &self.original {
+                std::env::set_var("PATH", original);
+            } else {
+                std::env::remove_var("PATH");
+            }
+        }
+    }
 
     #[cfg(unix)]
     fn make_executable(path: &Path) {
@@ -678,7 +624,83 @@ exit 1
         permissions.set_mode(0o755);
         std::fs::set_permissions(path, permissions).expect("fake compiler is executable");
     }
+}
 
-    #[cfg(not(unix))]
-    fn make_executable(_path: &Path) {}
+/// Discovery tests that need no fake compiler, so they run on every host.
+#[cfg(test)]
+mod discover_tests {
+    use crate::test_support::{PathEnvGuard, TestPathDir, PATH_LOCK};
+    use crate::{CompilerAdapter, CompilerError};
+
+    #[test]
+    fn compiler_adapter_discover_returns_error_when_neither_present() {
+        let _lock = PATH_LOCK.lock().expect("path lock is acquired");
+        let dir = TestPathDir::new("discover_none");
+        let _path = PathEnvGuard::set(dir.path());
+
+        let error = CompilerAdapter::discover().expect_err("compiler is missing");
+
+        assert!(matches!(error, CompilerError::NoCompilerFound));
+    }
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use crate::capability::{parse_target_runtime, parse_version};
+    use crate::CompilerError;
+
+    #[test]
+    fn parse_version_handles_fsf_gnat_13_format() {
+        let raw = "GNATMAKE 13.2.0 20240106 (experimental)\n";
+
+        let (compiler_id, version) = parse_version(raw).expect("version parses");
+
+        assert_eq!(compiler_id, "FSF GNAT 13.2.0");
+        assert_eq!(version, "13.2.0");
+    }
+
+    #[test]
+    fn parse_version_handles_adacore_gnat_pro_format() {
+        let raw = "GNAT Pro 24.0 (20240501)\n";
+
+        let (compiler_id, version) = parse_version(raw).expect("version parses");
+
+        assert_eq!(compiler_id, "AdaCore GNAT Pro 24.0");
+        assert_eq!(version, "24.0");
+    }
+
+    #[test]
+    fn parse_version_handles_gprbuild_pro_format() {
+        let raw = "GPRBUILD Pro 18.0w (19940713) (x86_64-linux-gnu)\n";
+
+        let (compiler_id, version) = parse_version(raw).expect("version parses");
+
+        assert_eq!(compiler_id, "AdaCore GPRbuild Pro 18.0w");
+        assert_eq!(version, "18.0w");
+    }
+
+    #[test]
+    fn parse_version_returns_error_on_empty_output() {
+        let error = parse_version("").expect_err("empty version output is invalid");
+
+        assert!(matches!(error, CompilerError::UnparseableVersion { .. }));
+    }
+
+    #[test]
+    fn parse_target_runtime_extracts_target_triple() {
+        let raw = "GNATMAKE 13.2.0\nTarget: x86_64-pc-linux-gnu\nRuntime: default\n";
+
+        let (target, runtime) = parse_target_runtime(raw);
+
+        assert_eq!(target, "x86_64-pc-linux-gnu");
+        assert_eq!(runtime, "default");
+    }
+
+    #[test]
+    fn parse_target_runtime_defaults_to_unknown_when_missing() {
+        let (target, runtime) = parse_target_runtime("GNATMAKE 13.2.0\n");
+
+        assert_eq!(target, "unknown");
+        assert_eq!(runtime, "unknown");
+    }
 }

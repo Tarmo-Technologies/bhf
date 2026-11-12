@@ -9850,8 +9850,12 @@ fn compile_command_arguments(entry: &CompileCommandEntry) -> Option<Vec<String>>
     if let Some(arguments) = &entry.arguments {
         return Some(arguments.clone());
     }
+    // A `command` string is split the way clang's compilation database splits
+    // it: with the Windows C runtime's rules on a Windows host, where a
+    // CMake-written `-c C:\src\x.c` keeps its backslashes, and for a cl-style
+    // command line anywhere.
     entry.command.as_deref().map(|command| {
-        if is_msvc_command_line(command) {
+        if cfg!(windows) || is_msvc_command_line(command) {
             split_windows_command_line(command)
         } else {
             split_compile_command(command)
@@ -10486,7 +10490,9 @@ fn preflight_header_includes(
     }
     for include_dir in include_dirs {
         flags.push("-I".to_owned());
-        flags.push(include_dir.to_string_lossy().to_string());
+        // Spelled as the harness Makefile spells it: on Windows without the
+        // `\\?\` prefix, which MinGW's compilers cannot open.
+        flags.push(harness_gen::build_safety::make_path(include_dir));
     }
     if cpp {
         // The real build repairs mixed Clang/GCC installations whose clang++
@@ -14024,12 +14030,10 @@ mod tests {
         );
         // (5) an out-of-tree toolchain the OPERATOR installed stays honored, which
         // is ordinary for the cross builds bhf exists to handle.
+        let toolchain_compiler = absolute("/opt/toolchain/bin/g++-12");
         assert_eq!(
-            super::compile_command_compiler(&[
-                "/opt/toolchain/bin/g++-12".to_owned(),
-                "-c".to_owned()
-            ]),
-            Some("/opt/toolchain/bin/g++-12".to_owned())
+            super::compile_command_compiler(&[toolchain_compiler.clone(), "-c".to_owned()]),
+            Some(toolchain_compiler)
         );
     }
 
@@ -14075,6 +14079,38 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// `path` as the inside of a JSON string: a Windows path's `\` escaped.
+    fn json_text(path: &Path) -> String {
+        let quoted = serde_json::to_string(&path.to_string_lossy()).unwrap();
+        quoted[1..quoted.len() - 1].to_owned()
+    }
+
+    /// Whether `compiler` links an AddressSanitizer + UBSan program, as the
+    /// Makefile's GCC lane asks it to. MinGW's GCC on Windows cannot.
+    fn gcc_links_sanitizers(compiler: &str) -> bool {
+        let dir = temp_dir(&format!("sanitizer-probe-{compiler}"));
+        let source = dir.join("probe.c");
+        fs::write(&source, "int main(void) { return 0; }\n").unwrap();
+        let linked = std::process::Command::new(compiler)
+            .args(["-x", "c", "-fsanitize=address,undefined"])
+            .arg(&source)
+            .arg("-o")
+            .arg(dir.join("probe"))
+            .output()
+            .is_ok_and(|output| output.status.success());
+        let _ = fs::remove_dir_all(&dir);
+        linked
+    }
+
+    /// An absolute path: `path` (spelled from `/`) carries a drive on Windows.
+    fn absolute(path: &str) -> String {
+        if cfg!(windows) {
+            format!("C:{path}")
+        } else {
+            path.to_owned()
+        }
+    }
 
     #[test]
     fn compile_database_candidates_includes_well_known_build_dirs() {
@@ -14614,14 +14650,14 @@ mod tests {
             file: PathBuf::from("../src/legacy.cpp"),
             arguments: Some(
                 [
-                    "/opt/toolchain/bin/g++-12",
+                    absolute("/opt/toolchain/bin/g++-12").as_str(),
                     "-fms-extensions",
                     "-fpermissive",
                     "-fpack-struct=1",
                     "-fshort-enums",
                     "-mms-bitfields",
                     "--sysroot",
-                    "/opt/sysroot",
+                    absolute("/opt/sysroot").as_str(),
                     "--target=x86_64-linux-gnu",
                     "-include",
                     "../include/config.h",
@@ -14640,15 +14676,20 @@ mod tests {
         };
         let flags = extract_compile_database_flags(&entry, &project.join("src/legacy.cpp"));
         let forced = harness_gen::build_safety::make_path(&project.join("include/config.h"));
+        let compiler_marker = format!(
+            "@bhf-build-context-compiler={}",
+            absolute("/opt/toolchain/bin/g++-12")
+        );
+        let sysroot = absolute("/opt/sysroot");
         for expected in [
-            "@bhf-build-context-compiler=/opt/toolchain/bin/g++-12",
+            compiler_marker.as_str(),
             "-fms-extensions",
             "-fpermissive",
             "-fpack-struct=1",
             "-fshort-enums",
             "-mms-bitfields",
             "--sysroot",
-            "/opt/sysroot",
+            sysroot.as_str(),
             "--target=x86_64-linux-gnu",
             "-include",
             forced.as_str(),
@@ -15201,7 +15242,7 @@ mod tests {
               {{"directory":"{root}","file":"src/emitter_test.cpp","arguments":["clang++","-c","src/emitter_test.cpp"]}},
               {{"directory":"{root}","file":"src/yaml_tool.cpp","arguments":["clang++","-c","src/yaml_tool.cpp"]}}
             ]"#,
-            root = root.display()
+            root = json_text(root)
         );
         std::fs::write(root.join("compile_commands.json"), db).unwrap();
         let from_db = recover_library_translation_units(&target, true);
@@ -15294,7 +15335,7 @@ mod tests {
               {{"directory":"{root}","file":"src/blocks.c","arguments":["clang","-c","src/blocks.c"]}},
               {{"directory":"{root}","file":"src/api_test/cplusplus.cpp","arguments":["clang++","-c","src/api_test/cplusplus.cpp"]}}
             ]"#,
-            root = root.display()
+            root = json_text(root)
         );
         std::fs::write(root.join("compile_commands.json"), db).unwrap();
 
@@ -15489,12 +15530,15 @@ ABSL_NAMESPACE_BEGIN
             None
         );
         assert!(!bare_library_resolves("nuttx_fs_no_such_lib_xyz"));
-        // A real system library is still forwarded.
-        assert!(bare_library_resolves("c"));
-        assert_eq!(
-            link_flag_from_build_token(base, "c"),
-            Some("-lc".to_owned())
-        );
+        // A real system library is still forwarded. The search covers the
+        // Unix library directories, which hold `libc`; Windows has neither.
+        if cfg!(unix) {
+            assert!(bare_library_resolves("c"));
+            assert_eq!(
+                link_flag_from_build_token(base, "c"),
+                Some("-lc".to_owned())
+            );
+        }
         // pthread keeps its canonical `-pthread` form regardless of resolution.
         assert_eq!(
             link_flag_from_build_token(base, "pthread"),
@@ -18426,7 +18470,9 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             .as_nanos();
         let dir = std::env::temp_dir().join(format!("bhf-cli-{name}-{nonce}"));
         fs::create_dir_all(&dir).unwrap();
-        dir
+        // Resolved, as generation resolves the paths it writes: Windows'
+        // temp dir is often spelled with an 8.3 short name (`RUNNER~1`).
+        crate::workdir::plain_canonical(&dir)
     }
 
     #[test]
@@ -18810,8 +18856,14 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             .expect("generated GPR is readable");
         let main = fs::read_to_string(temp.join("generated_harnesses/H-ROOTS/main.adb"))
             .expect("generated main is readable");
-        assert!(gpr.contains(&format!("\"{}\"", core.display())));
-        assert!(gpr.contains(&format!("\"{}\"", dates.display())));
+        assert!(gpr.contains(&format!(
+            "\"{}\"",
+            harness_gen::build_safety::make_path(&core)
+        )));
+        assert!(gpr.contains(&format!(
+            "\"{}\"",
+            harness_gen::build_safety::make_path(&dates)
+        )));
         assert!(main.contains("with Ada.Calendar;"));
     }
 
@@ -18878,8 +18930,14 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         let main = fs::read_to_string(temp.join("generated_harnesses/H-GPR/main.adb"))
             .expect("generated main is readable");
         assert!(gpr.contains("app.gpr"));
-        assert!(!gpr.contains(&format!("\"{}\"", app_src.display())));
-        assert!(!gpr.contains(&format!("\"{}\"", common_src.display())));
+        assert!(!gpr.contains(&format!(
+            "\"{}\"",
+            harness_gen::build_safety::make_path(&app_src)
+        )));
+        assert!(!gpr.contains(&format!(
+            "\"{}\"",
+            harness_gen::build_safety::make_path(&common_src)
+        )));
         assert!(main.contains("function Decode_Data return Common.Byte_Seq is"));
     }
 
@@ -18945,8 +19003,14 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             fs::read_to_string(temp.join("generated_harnesses/H-GPR-IMPORT/H_GPR_IMPORT.gpr"))
                 .expect("generated GPR is readable");
         assert!(gpr.contains("app.gpr"));
-        assert!(!gpr.contains(&format!("\"{}\"", app_src.display())));
-        assert!(!gpr.contains(&format!("\"{}\"", common_src.display())));
+        assert!(!gpr.contains(&format!(
+            "\"{}\"",
+            harness_gen::build_safety::make_path(&app_src)
+        )));
+        assert!(!gpr.contains(&format!(
+            "\"{}\"",
+            harness_gen::build_safety::make_path(&common_src)
+        )));
     }
 
     #[test]
@@ -19012,8 +19076,14 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         let main = fs::read_to_string(temp.join("generated_harnesses/H-GPR-NOEXT/main.adb"))
             .expect("generated main is readable");
         assert!(gpr.contains("app.gpr"));
-        assert!(!gpr.contains(&format!("\"{}\"", app_src.display())));
-        assert!(!gpr.contains(&format!("\"{}\"", common_src.display())));
+        assert!(!gpr.contains(&format!(
+            "\"{}\"",
+            harness_gen::build_safety::make_path(&app_src)
+        )));
+        assert!(!gpr.contains(&format!(
+            "\"{}\"",
+            harness_gen::build_safety::make_path(&common_src)
+        )));
         assert!(main.contains("function Decode_Data return Common.Byte_Seq is"));
     }
 
@@ -19081,8 +19151,14 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         let main = fs::read_to_string(temp.join("generated_harnesses/H-GPR-SEARCH/main.adb"))
             .expect("generated main is readable");
         assert!(gpr.contains("app.gpr"));
-        assert!(!gpr.contains(&format!("\"{}\"", app_src.display())));
-        assert!(!gpr.contains(&format!("\"{}\"", common_src.display())));
+        assert!(!gpr.contains(&format!(
+            "\"{}\"",
+            harness_gen::build_safety::make_path(&app_src)
+        )));
+        assert!(!gpr.contains(&format!(
+            "\"{}\"",
+            harness_gen::build_safety::make_path(&common_src)
+        )));
         assert!(main.contains("function Decode_Data return Common.Byte_Seq is"));
     }
 
@@ -19136,7 +19212,10 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             fs::read_to_string(temp.join("generated_harnesses/H-GPR-MISSING/H_GPR_MISSING.gpr"))
                 .expect("generated GPR is readable");
         assert!(gpr.contains("app.gpr"));
-        assert!(!gpr.contains(&format!("\"{}\"", app_src.display())));
+        assert!(!gpr.contains(&format!(
+            "\"{}\"",
+            harness_gen::build_safety::make_path(&app_src)
+        )));
     }
 
     #[test]
@@ -19190,9 +19269,18 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
 
         let gpr = fs::read_to_string(temp.join("generated_harnesses/H-TREE/H_TREE.gpr"))
             .expect("generated GPR is readable");
-        assert!(gpr.contains(&format!("\"{}\"", core.display())));
-        assert!(gpr.contains(&format!("\"{}\"", base.display())));
-        assert!(gpr.contains(&format!("\"{}\"", dates.display())));
+        assert!(gpr.contains(&format!(
+            "\"{}\"",
+            harness_gen::build_safety::make_path(&core)
+        )));
+        assert!(gpr.contains(&format!(
+            "\"{}\"",
+            harness_gen::build_safety::make_path(&base)
+        )));
+        assert!(gpr.contains(&format!(
+            "\"{}\"",
+            harness_gen::build_safety::make_path(&dates)
+        )));
     }
 
     #[test]
@@ -19708,9 +19796,9 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             root.join("compile_commands.json"),
             format!(
                 r#"[{{"directory":"{}","file":"{}","arguments":["gcc","-I","../include","-DLEGACY_MODE=1","-std=gnu11","-c","{}"]}}]"#,
-                src.display(),
-                source.display(),
-                source.display()
+                json_text(&src),
+                json_text(&source),
+                json_text(&source)
             ),
         )
         .unwrap();
@@ -19741,14 +19829,13 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         assert!(makefile.contains("CC = gcc"));
         assert!(makefile.contains("-fsanitize-coverage=trace-pc,trace-cmp"));
         assert!(makefile.contains("COMPILE_DB_FLAGS ="));
-        assert!(makefile.contains(&format!("-I {}", include.display())));
+        assert!(makefile.contains(&format!(
+            "-I {}",
+            harness_gen::build_safety::make_path(&include)
+        )));
         assert!(makefile.contains("-DLEGACY_MODE=1"));
         assert!(makefile.contains("-std=gnu11"));
-        if std::process::Command::new("gcc")
-            .arg("--version")
-            .output()
-            .is_ok_and(|output| output.status.success())
-        {
+        if gcc_links_sanitizers("gcc") && have_tool("make") {
             let status = std::process::Command::new("make")
                 .arg("-C")
                 .arg(root.join("out/H-CDB-C"))
@@ -19824,8 +19911,8 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
 
     #[test]
     fn generated_cpp_makefile_builds_with_an_ambient_gxx() {
-        if !have_tool("g++") || !have_tool("make") {
-            eprintln!("skip: g++/make unavailable");
+        if !gcc_links_sanitizers("g++") || !have_tool("make") {
+            eprintln!("skip: a sanitizing g++ or make unavailable");
             return;
         }
         let root = temp_dir("make-gxx-family");
@@ -20064,8 +20151,8 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
 
     #[test]
     fn switching_compilers_rebuilds_the_driver_object() {
-        if !have_tool("gcc") || !have_tool("clang") || !have_tool("make") {
-            eprintln!("skip: gcc/clang/make unavailable");
+        if !gcc_links_sanitizers("gcc") || !have_tool("clang") || !have_tool("make") {
+            eprintln!("skip: a sanitizing gcc, clang or make unavailable");
             return;
         }
         let root = temp_dir("make-compiler-switch");
@@ -20121,9 +20208,9 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             root.join("compile_commands.json"),
             format!(
                 r#"[{{"directory":"{}","file":"{}","arguments":["{cross}","-DFROM_DB=1","-c","{}"]}}]"#,
-                src.display(),
-                source.display(),
-                source.display()
+                json_text(&src),
+                json_text(&source),
+                json_text(&source)
             ),
         )
         .unwrap();
@@ -20166,9 +20253,9 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             root.join("compile_commands.json"),
             format!(
                 r#"[{{"directory":"{}","file":"{}","arguments":["cc","-I","../headers/public","-c","{}"]}}]"#,
-                src.display(),
-                source.display(),
-                source.display()
+                json_text(&src),
+                json_text(&source),
+                json_text(&source)
             ),
         )
         .unwrap();
@@ -20251,7 +20338,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
 
         let makefile = fs::read_to_string(root.join("out/H-C-STATIC-DIRECT/Makefile")).unwrap();
         assert!(
-            !makefile.contains(&source.display().to_string()),
+            !makefile.contains(&harness_gen::build_safety::make_path(&source)),
             "static target source should not be linked as a separate translation unit:\n{makefile}"
         );
     }
@@ -20386,7 +20473,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
 
         let makefile = fs::read_to_string(root.join("out/H-CSEQ/Makefile")).unwrap();
         assert!(
-            makefile.contains(&source.display().to_string()),
+            makefile.contains(&harness_gen::build_safety::make_path(&source)),
             "Makefile should link the project source: {makefile}"
         );
 
@@ -20690,7 +20777,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
 
         let makefile = fs::read_to_string(root.join("out/H-CSEQ-STATIC-LIFE/Makefile")).unwrap();
         assert!(
-            !makefile.contains(&source.display().to_string()),
+            !makefile.contains(&harness_gen::build_safety::make_path(&source)),
             "a whole-TU include must not also link the same definitions:\n{makefile}"
         );
     }
@@ -20712,9 +20799,9 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             root.join("compile_commands.json"),
             format!(
                 r#"[{{"directory":"{}","file":"{}","command":"clang++ --gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/13 -isystem ../third_party/include -DCPP_LEGACY=1 -std=gnu++20 -c {}" }}]"#,
-                src.display(),
-                source.display(),
-                source.display()
+                json_text(&src),
+                json_text(&source),
+                json_text(&source)
             ),
         )
         .unwrap();
@@ -20744,7 +20831,10 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         let makefile = fs::read_to_string(root.join("out/H-CDB-CPP/Makefile")).unwrap();
         assert!(makefile.contains("CXX = clang++"));
         assert!(makefile.contains("COMPILE_DB_FLAGS ="));
-        assert!(makefile.contains(&format!("-isystem {}", third_party.display())));
+        assert!(makefile.contains(&format!(
+            "-isystem {}",
+            harness_gen::build_safety::make_path(&third_party)
+        )));
         assert!(makefile.contains("-DCPP_LEGACY=1"));
         assert!(makefile.contains("CXX_STD ?= gnu++20"));
         let recovered_flags = makefile
@@ -20799,9 +20889,9 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             root.join("compile_commands.json"),
             format!(
                 r#"[{{"directory":"{}","file":"{}","arguments":["g++","-I","../include","-DOWNER_FEATURE=1","-include","../include/forced.hpp","-std=gnu++17","-c","{}"]}}]"#,
-                src.display(),
-                owner.display(),
-                owner.display()
+                json_text(&src),
+                json_text(&owner),
+                json_text(&owner)
             ),
         )
         .unwrap();
@@ -20831,16 +20921,18 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         let makefile = fs::read_to_string(root.join("out/H-X-HEADER-OWNER/Makefile")).unwrap();
         assert!(makefile.contains("CXX = g++"));
         assert!(makefile.contains("-fsanitize-coverage=trace-pc,trace-cmp"));
-        assert!(makefile.contains(&format!("-I {}", include.display())));
+        assert!(makefile.contains(&format!(
+            "-I {}",
+            harness_gen::build_safety::make_path(&include)
+        )));
         assert!(makefile.contains("-DOWNER_FEATURE=1"));
-        assert!(makefile.contains(&format!("-include {}", forced.display())));
+        assert!(makefile.contains(&format!(
+            "-include {}",
+            harness_gen::build_safety::make_path(&forced)
+        )));
         assert!(makefile.contains("CXX_STD ?= gnu++17"));
 
-        if std::process::Command::new("g++")
-            .arg("--version")
-            .output()
-            .is_ok_and(|output| output.status.success())
-        {
+        if gcc_links_sanitizers("g++") && have_tool("make") {
             let make_status = std::process::Command::new("make")
                 .arg("-C")
                 .arg(root.join("out/H-X-HEADER-OWNER"))
@@ -20873,12 +20965,8 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
 
     #[test]
     fn cpp_build_compiles_each_translation_unit_with_its_own_database_flags() {
-        if std::process::Command::new("g++")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            bhfeprintln!("skipping per-TU context test: g++ not on PATH");
+        if !gcc_links_sanitizers("g++") || !have_tool("make") {
+            bhfeprintln!("skipping per-TU context test: no sanitizing g++ or make on PATH");
             return;
         }
         let root = temp_dir("cpp-per-tu-build-context");
@@ -20914,12 +21002,12 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
 {{"directory":"{}","file":"{}","arguments":["g++","-I",".","-DMODE_PARSER=1","-std=c++14","-c","{}"]}},
 {{"directory":"{}","file":"{}","arguments":["g++","-I",".","-DMODE_SUPPORT=1","-std=c++17","-c","{}"]}}
 ]"#,
-                src.display(),
-                parser.display(),
-                parser.display(),
-                src.display(),
-                support.display(),
-                support.display()
+                json_text(&src),
+                json_text(&parser),
+                json_text(&parser),
+                json_text(&src),
+                json_text(&support),
+                json_text(&support)
             ),
         )
         .unwrap();
@@ -21211,12 +21299,22 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         let makefile = fs::read_to_string(root.join("out/H-CMAKE-CPP/Makefile")).unwrap();
         assert!(makefile.contains("BUILD_CONTEXT_PROVENANCE = cmake"));
         assert!(makefile.contains("BUILD_CONTEXT_CONFIDENCE = medium"));
-        assert!(makefile.contains(&format!("-I {}", include.display())));
+        assert!(makefile.contains(&format!(
+            "-I {}",
+            harness_gen::build_safety::make_path(&include)
+        )));
         assert!(makefile.contains("-DLEGACY_MODE=1"));
         assert!(makefile.contains("CXX_STD ?= c++20"));
         assert!(!makefile.contains("COMPILE_DB_FLAGS = -std="));
-        assert!(makefile.contains(support.to_str().unwrap()));
-        assert!(makefile.contains("BUILD_CONTEXT_LDFLAGS = -lz -pthread"));
+        assert!(makefile.contains(&harness_gen::build_safety::make_path(&support)));
+        // A bare library name is linked when it resolves in the Unix library
+        // directories (`libz`); Windows has none, so only `-pthread` stays.
+        let ldflags = if cfg!(unix) {
+            "BUILD_CONTEXT_LDFLAGS = -lz -pthread"
+        } else {
+            "BUILD_CONTEXT_LDFLAGS = -pthread"
+        };
+        assert!(makefile.contains(ldflags), "{makefile}");
     }
 
     #[test]
@@ -21755,11 +21853,14 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         let makefile = fs::read_to_string(root.join("out/H-MAKE-CPP/Makefile")).unwrap();
         assert!(makefile.contains("BUILD_CONTEXT_PROVENANCE = make"));
         assert!(makefile.contains("BUILD_CONTEXT_CONFIDENCE = low"));
-        assert!(makefile.contains(&format!("-I {}", include.display())));
+        assert!(makefile.contains(&format!(
+            "-I {}",
+            harness_gen::build_safety::make_path(&include)
+        )));
         assert!(makefile.contains("-DMAKE_MODE=1"));
         assert!(makefile.contains("CXX_STD ?= gnu++17"));
         assert!(!makefile.contains("COMPILE_DB_FLAGS = -std="));
-        assert!(makefile.contains(helper.to_str().unwrap()));
+        assert!(makefile.contains(&harness_gen::build_safety::make_path(&helper)));
         assert!(makefile.contains("BUILD_CONTEXT_LDFLAGS = -lm"));
     }
 
@@ -21904,7 +22005,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
 
         let main = fs::read_to_string(temp.join("out/H-CFILE/main.c")).unwrap();
         assert!(main.contains("unsigned char *_bhf_file_buf_stream"));
-        assert!(main.contains("fmemopen(_bhf_file_buf_stream, Size, \"r+\")"));
+        assert!(main.contains("bhf_fmemopen(_bhf_file_buf_stream, Size)"));
         assert!(main.contains("parse_stream(stream)"));
         assert!(main.contains("if (stream) fclose(stream);"));
         assert!(main.contains("free(_bhf_file_buf_stream);"));
@@ -22955,7 +23056,7 @@ class basic_json
         assert!(main.contains("parse_header(input, len)"));
         let makefile = fs::read_to_string(temp.join("out/H-C-HDR/Makefile")).unwrap();
         assert!(
-            !makefile.contains(source.to_str().unwrap()),
+            !makefile.contains(&harness_gen::build_safety::make_path(&source)),
             "header-only target must not be compiled as a source:\n{makefile}"
         );
     }
@@ -23052,7 +23153,7 @@ class basic_json
         assert!(main.contains("acme::parse_header_cpp(input)"));
         let makefile = fs::read_to_string(temp.join("out/H-X-HDR/Makefile")).unwrap();
         assert!(
-            !makefile.contains(source.to_str().unwrap()),
+            !makefile.contains(&harness_gen::build_safety::make_path(&source)),
             "header-only target must not be compiled as a source:\n{makefile}"
         );
     }
@@ -23105,7 +23206,7 @@ class basic_json
         );
         let makefile = fs::read_to_string(temp.join("out/H-X-STATIC-CPP/Makefile")).unwrap();
         assert!(
-            !makefile.contains(source.to_str().unwrap()),
+            !makefile.contains(&harness_gen::build_safety::make_path(&source)),
             "static C++ target source must not also be compiled separately:\n{makefile}"
         );
     }
@@ -23550,7 +23651,7 @@ class basic_json
         assert!(main.contains("catch (...)"));
         assert!(main.contains("RAII destructors run when _bhf_receiver leaves scope"));
         assert!(
-            !makefile.contains(source.to_str().unwrap()),
+            !makefile.contains(&harness_gen::build_safety::make_path(&source)),
             "source-local class declaration is included in main.cpp and must not be linked twice:\n{makefile}"
         );
     }
@@ -24132,15 +24233,12 @@ class basic_json
         assert!(!main.contains("Widget _bhf_owner"), "{main}");
         let build_context = fs::read_to_string(harness.join("build_context_objects.mk")).unwrap();
         assert!(
-            build_context.contains(factory.to_str().unwrap()),
+            build_context.contains(&harness_gen::build_safety::make_path(&factory)),
             "sibling factory definition must be linked: {build_context}"
         );
 
-        if std::process::Command::new("make")
-            .arg("--version")
-            .output()
-            .is_ok_and(|output| output.status.success())
-        {
+        // The compile database names g++, so the harness builds with it.
+        if have_tool("make") && gcc_links_sanitizers("g++") {
             let status = std::process::Command::new("make")
                 .arg("-C")
                 .arg(&harness)

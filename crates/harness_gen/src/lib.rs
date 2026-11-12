@@ -116,6 +116,44 @@ pub mod rust_generate;
 pub mod stream_init;
 pub mod templates;
 
+/// A command running a harness a test built with `make`. On Windows the
+/// harness needs clang's AddressSanitizer runtime DLL, which `bhf build`
+/// stages next to the binary, so its directory goes first on the child's
+/// PATH.
+#[cfg(test)]
+pub(crate) fn harness_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    #[allow(unused_mut)]
+    let mut command = std::process::Command::new(program);
+    #[cfg(windows)]
+    if let Some(runtime) = clang_sanitizer_runtime_dir() {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let dirs = std::iter::once(runtime.clone()).chain(std::env::split_paths(&path));
+        command.env(
+            "PATH",
+            std::env::join_paths(dirs).expect("PATH entries join"),
+        );
+    }
+    command
+}
+
+/// `<clang resource dir>/lib/windows`, where clang keeps its sanitizer DLLs.
+#[cfg(all(test, windows))]
+fn clang_sanitizer_runtime_dir() -> Option<&'static std::path::PathBuf> {
+    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let output = std::process::Command::new("clang")
+            .arg("-print-resource-dir")
+            .output()
+            .ok()?;
+        let resource = String::from_utf8_lossy(&output.stdout);
+        let dir = std::path::Path::new(resource.trim())
+            .join("lib")
+            .join("windows");
+        dir.is_dir().then_some(dir)
+    })
+    .as_ref()
+}
+
 #[cfg(test)]
 mod tests {
     use super::HarnessGenError;

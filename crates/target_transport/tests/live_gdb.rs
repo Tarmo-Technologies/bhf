@@ -13,6 +13,9 @@
 //! It self-skips (loudly) ONLY when `qemu-arm` or the ARM cross gcc is absent.
 //! Under `scripts/hil-emu.sh` (`BHF_HIL_REQUIRE=1`) a missing tool is a hard
 //! failure, so the live path cannot be silently skipped in CI.
+//!
+//! The shared emulator helpers use Unix sockets: Unix hosts only.
+#![cfg(unix)]
 
 mod common;
 

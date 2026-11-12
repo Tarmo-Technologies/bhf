@@ -805,10 +805,13 @@ mod tests {
         super::with_results_in(&work, "static-scan", Some(&dotted), false, complete, || 0);
         let manifest: serde_json::Value =
             serde_json::from_slice(&fs::read(work.join("results/manifest.json")).unwrap()).unwrap();
+        // Resolved, and without Windows' `\\?\` prefix.
+        let root = manifest["source"]["root"].as_str().unwrap();
         assert_eq!(
-            manifest["source"]["root"].as_str(),
-            Some(src.canonicalize().unwrap().to_str().unwrap())
+            Path::new(root),
+            super::workdir::plain_canonical(&src).as_path()
         );
+        assert!(!root.starts_with(r"\\?\"), "{root}");
     }
 
     #[test]
@@ -1213,6 +1216,8 @@ mod tests {
         assert!(work_dir.join("fake_corba/corba-any.adb").is_file());
     }
 
+    // The fake `gprbuild` is a POSIX shell script.
+    #[cfg(unix)]
     #[test]
     fn build_subcommand_discovers_compiler_and_invokes_build() {
         let _lock = PATH_LOCK.lock().expect("path lock is acquired");
@@ -1234,6 +1239,8 @@ mod tests {
         assert!(work_dir.join("build/H-TEST/bhf_build.gpr").is_file());
     }
 
+    // The fake `gprbuild` is a POSIX shell script.
+    #[cfg(unix)]
     #[test]
     fn build_subcommand_includes_fake_corba_source_root_when_present() {
         let _lock = PATH_LOCK.lock().expect("path lock is acquired");
@@ -1260,6 +1267,8 @@ mod tests {
         assert!(project.contains("fake_corba"));
     }
 
+    // The fake `gprbuild` is a POSIX shell script.
+    #[cfg(unix)]
     #[test]
     fn build_subcommand_writes_build_local_runtime_project() {
         let _lock = PATH_LOCK.lock().expect("path lock is acquired");
@@ -1291,6 +1300,8 @@ mod tests {
             .is_file());
     }
 
+    // The fake `gprbuild` is a POSIX shell script.
+    #[cfg(unix)]
     #[test]
     fn build_instruments_target_with_trace_pc_but_not_runtime() {
         // #412: a real `bhf build` must produce a self-consistent coverage
@@ -1352,6 +1363,8 @@ mod tests {
         );
     }
 
+    // The fake `gprbuild` is a POSIX shell script.
+    #[cfg(unix)]
     #[test]
     fn build_subcommand_writes_cross_attributes_and_uses_prefixed_probe() {
         let _lock = PATH_LOCK.lock().expect("path lock is acquired");
@@ -1402,6 +1415,8 @@ mod tests {
     /// `bhf build --config` reads the `[toolchain.ada]` table: an explicit
     /// gprbuild, the runtime, extra switches and the probe backend reach the
     /// generated project, and the prefix supplies its Target.
+    // The fake `gprbuild` is a POSIX shell script.
+    #[cfg(unix)]
     #[test]
     fn build_subcommand_reads_the_ada_toolchain_from_a_config_file() {
         let _lock = PATH_LOCK.lock().expect("path lock is acquired");
@@ -1455,6 +1470,8 @@ mod tests {
         assert!(probe_body.contains("adafuzz_probe_memory_buffer"));
     }
 
+    // The fake `gprbuild` is a POSIX shell script.
+    #[cfg(unix)]
     #[test]
     fn build_subcommand_writes_memory_buffer_probe_backend() {
         let _lock = PATH_LOCK.lock().expect("path lock is acquired");
@@ -1486,6 +1503,8 @@ mod tests {
         assert!(!probe_body.contains("Ada.Environment_Variables"));
     }
 
+    // The fake `gprbuild` is a POSIX shell script.
+    #[cfg(unix)]
     #[test]
     fn build_subcommand_writes_semihosting_probe_backend() {
         let _lock = PATH_LOCK.lock().expect("path lock is acquired");
@@ -1515,6 +1534,8 @@ mod tests {
         assert!(!probe_body.contains("Ada.Environment_Variables"));
     }
 
+    // The fake `gprbuild` is a POSIX shell script.
+    #[cfg(unix)]
     #[test]
     fn build_subcommand_writes_stub_probe_backend() {
         let _lock = PATH_LOCK.lock().expect("path lock is acquired");
@@ -1550,6 +1571,8 @@ mod tests {
     // `tests/cli_no_compiler.rs`: an empty PATH cannot be installed process-wide
     // without breaking tests running concurrently (see `PathEnvGuard::prepend`).
 
+    // The fake `gprbuild` is a POSIX shell script.
+    #[cfg(unix)]
     #[test]
     fn build_subcommand_returns_three_when_work_dir_missing() {
         let _lock = PATH_LOCK.lock().expect("path lock is acquired");
@@ -1568,6 +1591,8 @@ mod tests {
     // `stub_subcommand_returns_two_when_no_compiler` lives in
     // `tests/cli_no_compiler.rs`, for the same reason as the `build` case above.
 
+    // The fake `gprbuild` is a POSIX shell script.
+    #[cfg(unix)]
     #[test]
     fn stub_subcommand_returns_three_when_work_dir_missing() {
         let _lock = PATH_LOCK.lock().expect("path lock is acquired");
@@ -1583,6 +1608,8 @@ mod tests {
         assert_eq!(exit, 3);
     }
 
+    // The fake `gprbuild` is a POSIX shell script.
+    #[cfg(unix)]
     #[test]
     fn stub_subcommand_writes_manifest_on_success() {
         let _lock = PATH_LOCK.lock().expect("path lock is acquired");
@@ -1825,11 +1852,13 @@ mod tests {
         dir
     }
 
+    #[cfg(unix)]
     fn write_executable(path: &Path, contents: &str) {
         fs::write(path, contents).expect("fake compiler is written");
         make_executable(path);
     }
 
+    #[cfg(unix)]
     fn fake_build_compiler_script() -> &'static str {
         r#"#!/bin/sh
 if [ "$1" = "--version" ]; then
@@ -1849,6 +1878,7 @@ exit 0
 "#
     }
 
+    #[cfg(unix)]
     fn fake_raw_gnat_canary_script() -> &'static str {
         r#"#!/bin/sh
 if [ -n "$BHF_RAW_GNAT_LOG" ]; then
@@ -1870,10 +1900,12 @@ exit 1
 "#
     }
 
+    #[cfg(unix)]
     struct PathEnvGuard {
         original: Option<OsString>,
     }
 
+    #[cfg(unix)]
     impl PathEnvGuard {
         /// PREPEND `path` to the process `PATH` for the duration of a test, so a fake
         /// tool written there is found ahead of the real one.
@@ -1906,6 +1938,7 @@ exit 1
         }
     }
 
+    #[cfg(unix)]
     impl Drop for PathEnvGuard {
         fn drop(&mut self) {
             if let Some(original) = &self.original {
@@ -1916,11 +1949,13 @@ exit 1
         }
     }
 
+    #[cfg(unix)]
     struct EnvVarGuard {
         key: &'static str,
         original: Option<OsString>,
     }
 
+    #[cfg(unix)]
     impl EnvVarGuard {
         fn set<V>(key: &'static str, value: V) -> Self
         where
@@ -1932,6 +1967,7 @@ exit 1
         }
     }
 
+    #[cfg(unix)]
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             if let Some(original) = &self.original {
@@ -1952,7 +1988,4 @@ exit 1
         permissions.set_mode(0o755);
         fs::set_permissions(path, permissions).expect("fake compiler is executable");
     }
-
-    #[cfg(not(unix))]
-    fn make_executable(_path: &Path) {}
 }

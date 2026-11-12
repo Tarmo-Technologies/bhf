@@ -436,6 +436,8 @@ mod tests {
         ));
     }
 
+    /// The fake `gprbuild` is a POSIX shell script.
+    #[cfg(unix)]
     #[test]
     fn check_with_gprbuild_passes_dash_gnatc_via_dash_cargs() {
         let temp = tempfile::TempDir::new().expect("temp dir is created");
@@ -458,6 +460,7 @@ exit 1
         )
     }
 
+    #[cfg(unix)]
     fn write_strict_fake_gprbuild_check(dir: &Path) -> PathBuf {
         write_executable(
             dir,

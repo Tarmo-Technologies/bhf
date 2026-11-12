@@ -216,7 +216,8 @@ mod tests {
             reproducers: 9,
         };
         let lines = super::migration_lines(std::path::Path::new("/w"), &report);
-        let text = lines.join("\n");
+        // Paths are joined with the host separator; compare them with `/`.
+        let text = lines.join("\n").replace('\\', "/");
         for needle in [
             "migrated legacy work dir /w to the results layout",
             "moved /w/findings/ (9 findings) to /w/results/findings/",

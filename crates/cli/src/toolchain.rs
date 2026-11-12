@@ -1068,9 +1068,15 @@ mod tests {
             .collect();
         assert_eq!(values[ENV_CFLAGS], "-O2");
         assert_eq!(values[ENV_LDFLAGS], "-lm");
+        // A Windows recipe may run through `cmd`, which ignores single quotes.
+        let spaced_define = if cfg!(windows) {
+            "\"-DNAME=a b\""
+        } else {
+            "'-DNAME=a b'"
+        };
         assert_eq!(
             values[ENV_CPPFLAGS],
-            "-DBOARD=3 '-DNAME=a b' -I\"/opt/sdk dir/include\""
+            format!("-DBOARD=3 {spaced_define} -I\"/opt/sdk dir/include\"")
         );
         assert_eq!(
             values[ENV_TARGET_FLAGS],
@@ -1208,6 +1214,7 @@ mod tests {
     }
 
     /// The triple a foreign architecture would use on this host.
+    #[cfg(unix)]
     fn foreign_triple() -> &'static str {
         if std::env::consts::ARCH == "aarch64" {
             "x86_64-linux-gnu"

@@ -7161,6 +7161,60 @@ fn fork_run_timeout_ms(timeout: Duration) -> i32 {
     timeout.as_millis().clamp(1, i32::MAX as u128) as i32
 }
 
+/// A child's stdout is readable once it writes or exits, and not while it is
+/// alive and silent, so a harness that never answers the fork-server
+/// handshake (or hangs on an input) times out instead of blocking the run.
+#[cfg(all(test, any(unix, windows)))]
+#[test]
+fn fork_server_pipe_wait_times_out_on_a_silent_child() {
+    use std::process::{Command, Stdio};
+    let shell = |script_unix: &str, script_windows: &str| {
+        let mut command = if cfg!(windows) {
+            let mut command = Command::new("cmd");
+            command.args(["/c", script_windows]);
+            command
+        } else {
+            let mut command = Command::new("sh");
+            command.args(["-c", script_unix]);
+            command
+        };
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    };
+
+    let mut silent = shell("sleep 5", "ping -n 6 127.0.0.1 > nul");
+    let started = Instant::now();
+    assert!(!stdout_readable_within(
+        silent.stdout.as_ref().unwrap(),
+        200
+    ));
+    let waited = started.elapsed();
+    assert!(waited >= Duration::from_millis(150), "{waited:?}");
+    assert!(waited < Duration::from_secs(3), "{waited:?}");
+    let _ = silent.kill();
+    let _ = silent.wait();
+
+    let mut writer = shell("echo ready", "echo ready");
+    assert!(stdout_readable_within(
+        writer.stdout.as_ref().unwrap(),
+        3_000
+    ));
+    let _ = writer.wait();
+
+    // An exited child's pipe reads as end of file: readable, so the caller's
+    // read reports the death.
+    let mut exited = shell("exit 0", "exit 0");
+    let _ = exited.wait();
+    assert!(stdout_readable_within(
+        exited.stdout.as_ref().unwrap(),
+        3_000
+    ));
+}
+
 #[cfg(test)]
 #[test]
 fn fork_server_wait_inherits_short_pass_budget() {
@@ -7169,35 +7223,75 @@ fn fork_server_wait_inherits_short_pass_budget() {
     assert_eq!(fork_run_timeout_ms(Duration::from_secs(3)), 3_000);
 }
 
-/// Block until `fd` is readable or `timeout_ms` elapses. Returns true if
-/// readable, false on timeout/error (caller treats either as "no response").
+/// Block until the child's `stdout` is readable (it wrote, or it exited) or
+/// `timeout_ms` elapses. Returns true if readable, false on timeout/error
+/// (caller treats either as "no response").
 #[cfg(unix)]
-fn fd_readable_within(fd: std::os::unix::io::RawFd, timeout_ms: i32) -> bool {
+fn stdout_readable_within(stdout: &std::process::ChildStdout, timeout_ms: i32) -> bool {
+    use std::os::unix::io::AsRawFd;
     let mut pfd = libc::pollfd {
-        fd,
+        fd: stdout.as_raw_fd(),
         events: libc::POLLIN,
         revents: 0,
     };
     // SAFETY: `pfd` is a valid initialized pollfd for the duration of the call.
     unsafe { libc::poll(&mut pfd, 1, timeout_ms) > 0 }
 }
-#[cfg(not(unix))]
-fn fd_readable_within(_fd: i32, _timeout_ms: i32) -> bool {
-    true
+
+/// Windows has no `poll` for an anonymous pipe; `PeekNamedPipe` reports the
+/// bytes waiting in it, and fails once the writer has closed it. Polled: a
+/// short spin first, as a fork-server answer usually comes within
+/// microseconds, then millisecond sleeps.
+#[cfg(windows)]
+fn stdout_readable_within(stdout: &std::process::ChildStdout, timeout_ms: i32) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn PeekNamedPipe(
+            pipe: *mut std::ffi::c_void,
+            buffer: *mut std::ffi::c_void,
+            buffer_size: u32,
+            bytes_read: *mut u32,
+            bytes_available: *mut u32,
+            bytes_left_this_message: *mut u32,
+        ) -> i32;
+    }
+    let handle = stdout.as_raw_handle();
+    let started = Instant::now();
+    let timeout = Duration::from_millis(u64::try_from(timeout_ms).unwrap_or(0));
+    loop {
+        let mut available = 0u32;
+        // SAFETY: `handle` is the live read end of the child's stdout pipe,
+        // owned by `stdout` for the duration of the call; no buffer is passed.
+        let peeked = unsafe {
+            PeekNamedPipe(
+                handle,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            )
+        };
+        // A failed peek is a closed pipe: the read that follows reports it.
+        if peeked == 0 || available > 0 {
+            return true;
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= timeout {
+            return false;
+        }
+        if elapsed < Duration::from_millis(2) {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
 }
 
-/// The raw fd of a child's stdout for the readability poll on unix; a dummy on
-/// other platforms (where `fd_readable_within` ignores it and returns `true`, so
-/// the caller falls through to a blocking `read_exact`). Keeps the fork-server
-/// handshake/sync code platform-agnostic without sprinkling `os::unix` imports.
-#[cfg(unix)]
-fn child_stdout_fd(stdout: &std::process::ChildStdout) -> std::os::unix::io::RawFd {
-    use std::os::unix::io::AsRawFd;
-    stdout.as_raw_fd()
-}
-#[cfg(not(unix))]
-fn child_stdout_fd(_stdout: &std::process::ChildStdout) -> i32 {
-    0
+#[cfg(not(any(unix, windows)))]
+fn stdout_readable_within(_stdout: &std::process::ChildStdout, _timeout_ms: i32) -> bool {
+    true
 }
 
 impl ForkServer {
@@ -7252,10 +7346,11 @@ impl ForkServer {
         // protocol (a C/libFuzzer harness, a stale build, a test mock) -> bail so
         // the caller uses the per-spawn path.
         use std::io::Read;
-        let fd = child_stdout_fd(&stdout);
         let mut ready = [0u8; 1];
         let handshake_timeout_ms = FORK_HANDSHAKE_TIMEOUT_MS.min(fork_run_timeout_ms(run_timeout));
-        if !fd_readable_within(fd, handshake_timeout_ms) || stdout.read_exact(&mut ready).is_err() {
+        if !stdout_readable_within(&stdout, handshake_timeout_ms)
+            || stdout.read_exact(&mut ready).is_err()
+        {
             kill_process_group(&mut child);
             let _ = child.wait();
             let _ = fs::remove_file(&events_path);
@@ -7320,14 +7415,13 @@ impl ForkServer {
     /// polls in short slices, returning `false` if the child's RSS breaches the
     /// ceiling (or the whole-input timeout elapses) so the caller can isolate it.
     fn await_sync_within_rss_limit(&self) -> bool {
-        let fd = child_stdout_fd(&self.stdout);
         if self.rss_limit_mb == 0 {
-            return fd_readable_within(fd, self.run_timeout_ms);
+            return stdout_readable_within(&self.stdout, self.run_timeout_ms);
         }
         const RSS_POLL_INTERVAL_MS: i32 = 25;
         let deadline = Instant::now() + Duration::from_millis(self.run_timeout_ms as u64);
         loop {
-            if fd_readable_within(fd, RSS_POLL_INTERVAL_MS) {
+            if stdout_readable_within(&self.stdout, RSS_POLL_INTERVAL_MS) {
                 return true;
             }
             if self.rss_exceeded() || Instant::now() >= deadline {
@@ -9422,6 +9516,7 @@ mod auto_path_tests {
     /// The shell harness of the argument-trace tests: with BHF_TRACE_ARGS=1
     /// it prints a trace line first, and it always reports a heap overflow one
     /// byte past the traced buffer.
+    #[cfg(unix)]
     const TRACING_CRASH_SCRIPT: &str = "#!/bin/sh\n\
         if [ \"$BHF_TRACE_ARGS\" = 1 ]; then >&2 echo 'BHF_ARG {\"call\":\"target\",\"i\":0,\"role\":\"param\",\"name\":\"buffer\",\"type\":\"const char *\",\"span\":[0,2],\"ptr\":\"0x502000000030\",\"alloc_size\":1,\"len\":0,\"preview_hex\":\"\"}'; fi\n\
         >&2 echo '==1==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x502000000031 at pc 0x1 bp 0x2 sp 0x3'\n\
@@ -11103,7 +11198,8 @@ exit 0
 
     /// Write an `arg-layout.json` beside `harness` that decodes two 4-byte
     /// scalars before the buffer taking the bytes left: an 8-byte seed
-    /// prefix.
+    /// prefix. Its callers run shell-script harnesses, so Unix only.
+    #[cfg(unix)]
     fn write_scalars_first_layout(harness: &Path) {
         let scalar = |name: &str| {
             serde_json::json!({

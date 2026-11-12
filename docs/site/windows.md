@@ -461,3 +461,18 @@ cmplog, and ASan all work natively on Windows.
 - The native-Windows harness build uses GNU `make` + clang (same as Linux), or
   cl through `bhf-cl` with `--cc cl`; the drive-letter colon + backslash quirks
   are handled by emitting forward-slash paths into the recipe.
+- GNU make runs a harness recipe through `sh` when one is on `PATH`
+  (w64devkit, MSYS2) and through `cmd` otherwise, so a compile flag that needs
+  quoting there (a space, parenthesis, apostrophe or shell operator, as in
+  `-DBAR=(x)`) is double-quoted, which both honour. Such a flag that also holds
+  `%`, `"` or a backtick is refused, since one of the two shells acts on it
+  even inside double quotes.
+- A harness for a function that takes a `FILE *` gets its input through a
+  temporary file deleted on close, since the Windows C runtime has no
+  `fmemopen`.
+- `bhf corpus export --to afl` names entries `id_000000,sig_...`: Windows
+  allows no `:` in a file name. `bhf corpus import` and `merge` read both that
+  and AFL's usual `id:000000,...` spelling.
+- SARIF reports name Windows files as `file:///C:/...` URIs, and the Markdown
+  and CSV reports show paths under the scanned tree relative to it, whether
+  the build spelled them `C:\src\...` or `C:/src/...`.

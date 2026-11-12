@@ -404,7 +404,12 @@ mod tests {
         } else {
             eprintln!("skip: gcc unavailable");
         }
-        if have("clang") {
+        // The MSVC linker merges clang's `.SCOV$GM` guard section into
+        // another section, so a guard binary linked on Windows has no section
+        // that marks it.
+        if cfg!(windows) {
+            eprintln!("skip: an MSVC-linked guard binary has no guard section");
+        } else if have("clang") {
             let binary = build(
                 dir.path(),
                 "clang",
@@ -491,7 +496,10 @@ mod tests {
                     .status()
                     .unwrap();
                 assert!(status.success(), "{compiler}: the driver compiles");
-                let binary = dir.path().join(format!("{compiler}-{name}"));
+                // MinGW's gcc adds `.exe` to an output named without one.
+                let binary = dir
+                    .path()
+                    .join(format!("{compiler}-{name}{}", std::env::consts::EXE_SUFFIX));
                 let status = Command::new(compiler)
                     .args(["-O1", "-g"])
                     .args(coverage)

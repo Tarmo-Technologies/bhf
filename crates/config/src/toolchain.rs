@@ -590,9 +590,12 @@ probe-backend = "memory_buffer"
         );
         // A bare program name stays a PATH lookup; a relative path resolves.
         assert_eq!(config.cc.as_deref(), Some("aarch64-linux-gnu-gcc"));
+        // Compared as paths: the joined separator is the host's.
         assert_eq!(
-            config.cxx.as_deref(),
-            Some("/projects/widget/tools/bin/aarch64-linux-gnu-g++")
+            config.cxx.as_deref().map(Path::new),
+            Some(Path::new(
+                "/projects/widget/tools/bin/aarch64-linux-gnu-g++"
+            ))
         );
         assert_eq!(config.runner.as_deref(), Some("qemu-aarch64"));
         assert_eq!(
@@ -698,8 +701,8 @@ target = "arm-linux-gnueabihf"
         let aarch64 = cross.get_mut("aarch64").unwrap();
         aarch64.resolve_relative_to(Path::new("/projects/widget"));
         assert_eq!(
-            aarch64.cc.as_deref(),
-            Some("/projects/widget/tools/aarch64-linux-gnu-gcc")
+            aarch64.cc.as_deref().map(Path::new),
+            Some(Path::new("/projects/widget/tools/aarch64-linux-gnu-gcc"))
         );
         assert_eq!(
             aarch64.sysroot.as_deref(),

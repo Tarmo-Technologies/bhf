@@ -154,7 +154,13 @@ fn cartography_maps_the_bytes_that_set_a_cpp_segv_faulting_address() {
             .is_some_and(|h| h.starts_with("H-X")),
         "{finding}"
     );
-    assert_eq!(finding["exception"]["name"], "ASAN_SEGV", "{finding}");
+    // Windows' AddressSanitizer reports the fault as an access violation.
+    let fault = if cfg!(windows) {
+        "ASAN_ACCESS_VIOLATION"
+    } else {
+        "ASAN_SEGV"
+    };
+    assert_eq!(finding["exception"]["name"], fault, "{finding}");
 
     let carto = Command::new(env!("CARGO_BIN_EXE_bhf"))
         .arg("cartography")

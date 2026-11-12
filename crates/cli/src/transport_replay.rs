@@ -61,7 +61,7 @@ struct FaultIdentity {
 
 /// `bhf replay` of a transport finding with the default output. Returns 0
 /// (MATCH), 3 (MISMATCH), or 1 (error).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn replay_transport_finding(finding_dir: &Path, endpoint: Option<&str>) -> i32 {
     crate::replay::finish_lane(
         finding_dir,

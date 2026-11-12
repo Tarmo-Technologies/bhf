@@ -398,7 +398,8 @@ with no cursor parameter, that is the whole testcase:
   heap copy of the remaining input with 64 KiB of zeroed headroom;
 - C++ byte vectors and spans (`std::vector<uint8_t>`,
   `std::span<const uint8_t>`): a copy or view of the remaining input;
-- `FILE *`: `fmemopen` over a copy of the remaining input;
+- `FILE *`: `fmemopen` over a copy of the remaining input (on Windows, which
+  has no `fmemopen`, a temporary file holding it, deleted on close);
 - the path parameter of a file loader (`load_file(const char *path)`): the
   remaining input written to a temporary file;
 - a read-only pointer to a record bhf cannot construct: a view of the

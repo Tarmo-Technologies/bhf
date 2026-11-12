@@ -13,6 +13,7 @@ pub(crate) struct FatalSignal {
     pub(crate) name: String,
 }
 
+#[cfg(unix)]
 fn has_abort_rejection_diagnostic(stderr: &str) -> bool {
     let lower = stderr.to_ascii_lowercase();
     (lower.contains("assertion") && lower.contains("failed"))
@@ -59,7 +60,7 @@ pub(crate) fn classify(status: &std::process::ExitStatus, _stderr: &str) -> Opti
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn rule_id(status: &std::process::ExitStatus, stderr: &str) -> Option<&'static str> {
     classify(status, stderr).map(|_| RULE_ID)
 }

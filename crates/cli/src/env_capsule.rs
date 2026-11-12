@@ -557,6 +557,9 @@ fn set_executable(path: &Path) {
             let _ = std::fs::set_permissions(path, perms);
         }
     }
+    // Windows has no executable bit.
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 #[cfg(test)]

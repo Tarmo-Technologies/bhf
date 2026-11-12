@@ -651,10 +651,11 @@ fn write_finding_with_fixture(input: &str, fixture: &Path) -> PathBuf {
     fs::write(finding_dir.join("testcase.bin"), input.as_bytes()).unwrap();
     fs::write(
         finding_dir.join("finding.json"),
-        format!(
-            "{{\"signature\":\"{CANONICAL_SIGNATURE}\",\"fixture_path\":\"{}\"}}",
-            fixture.display()
-        ),
+        serde_json::json!({
+            "signature": CANONICAL_SIGNATURE,
+            "fixture_path": fixture,
+        })
+        .to_string(),
     )
     .unwrap();
     finding_dir

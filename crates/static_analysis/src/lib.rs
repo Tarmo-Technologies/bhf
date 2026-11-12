@@ -965,15 +965,29 @@ fn sarif_artifact_location(path: &str, root: Option<&Path>) -> Value {
     }
 }
 
-/// Render an absolute filesystem path as a `file://` URI. Anything already
-/// carrying a scheme (or not absolute) is returned unchanged.
+/// Render an absolute filesystem path as a `file://` URI (RFC 8089):
+/// `/abs` is `file:///abs`, a Windows drive path `C:\dir` is
+/// `file:///C:/dir` and a UNC path `\\server\share` is
+/// `file://server/share`, without the `\\?\` verbatim prefix. Paths that
+/// already carry a scheme, or are not absolute, are returned unchanged.
 fn file_uri(path: &str) -> String {
     if path.contains("://") {
-        path.to_owned()
-    } else if let Some(rest) = path.strip_prefix('/') {
-        format!("file:///{rest}")
-    } else {
-        path.to_owned()
+        return path.to_owned();
+    }
+    if let Some(rest) = path.strip_prefix('/') {
+        return format!("file:///{rest}");
+    }
+    let windows = match path.strip_prefix(r"\\?\UNC\") {
+        Some(share) => format!(r"\\{share}"),
+        None => path.strip_prefix(r"\\?\").unwrap_or(path).to_owned(),
+    }
+    .replace('\\', "/");
+    if let Some(share) = windows.strip_prefix("//") {
+        return format!("file://{share}");
+    }
+    match windows.as_bytes() {
+        [drive, b':', b'/', ..] if drive.is_ascii_alphabetic() => format!("file:///{windows}"),
+        _ => path.to_owned(),
     }
 }
 
@@ -1203,12 +1217,12 @@ fn spawn_memory_watchdog() -> MemoryWatchdog {
     MEMORY_PRESSURE.store(false, Ordering::Relaxed);
     MEMORY_SKIPPED_FILES.store(0, Ordering::Relaxed);
     let stop = Arc::new(AtomicBool::new(false));
-    let mut handle = None;
+    // Resident memory is read from /proc, so only Linux runs the watchdog.
     #[cfg(target_os = "linux")]
-    {
+    let handle = {
         let stop_thread = Arc::clone(&stop);
-        if let Some(ceiling) = memory_ceiling_kb() {
-            handle = Some(std::thread::spawn(move || {
+        memory_ceiling_kb().map(|ceiling| {
+            std::thread::spawn(move || {
                 while !stop_thread.load(Ordering::Relaxed) {
                     if let Some(rss) = proc_kb("/proc/self/status", "VmRSS:") {
                         if rss >= ceiling {
@@ -1217,9 +1231,11 @@ fn spawn_memory_watchdog() -> MemoryWatchdog {
                     }
                     std::thread::park_timeout(std::time::Duration::from_millis(500));
                 }
-            }));
-        }
-    }
+            })
+        })
+    };
+    #[cfg(not(target_os = "linux"))]
+    let handle = None;
     MemoryWatchdog { stop, handle }
 }
 
@@ -39175,18 +39191,55 @@ mod tests {
         let base = sarif["runs"][0]["originalUriBaseIds"]["SRCROOT"]["uri"]
             .as_str()
             .unwrap();
-        assert_eq!(base, format!("file://{}/", root.display()));
+        // A Windows drive path is `file:///C:/...`.
+        let shown = root.display().to_string();
+        let expected = if cfg!(windows) {
+            format!("file:///{}/", shown.replace('\\', "/"))
+        } else {
+            format!("file://{shown}/")
+        };
+        assert_eq!(base, expected);
         assert!(base.starts_with("file:///") && base.ends_with('/'));
+    }
+
+    /// `file://` URIs follow RFC 8089 for Windows paths too: a drive path
+    /// gains a third slash, `\` becomes `/`, a UNC path names its host, and
+    /// the `\\?\` verbatim prefix is dropped.
+    #[test]
+    fn file_uris_spell_windows_paths_with_forward_slashes() {
+        assert_eq!(file_uri("/abs/x.c"), "file:///abs/x.c");
+        assert_eq!(file_uri(r"C:\src\proj\x.c"), "file:///C:/src/proj/x.c");
+        assert_eq!(file_uri("C:/src/x.c"), "file:///C:/src/x.c");
+        assert_eq!(file_uri(r"\\?\C:\src\x.c"), "file:///C:/src/x.c");
+        assert_eq!(file_uri(r"\\server\share\x.c"), "file://server/share/x.c");
+        assert_eq!(
+            file_uri(r"\\?\UNC\server\share\x.c"),
+            "file://server/share/x.c"
+        );
+        // Relative and drive-relative paths are not URIs; they pass through.
+        assert_eq!(file_uri("src/x.c"), "src/x.c");
+        assert_eq!(file_uri("C:x.c"), "C:x.c");
+        assert_eq!(file_uri("file:///abs/x.c"), "file:///abs/x.c");
     }
 
     #[test]
     fn sarif_keeps_absolute_uri_for_path_outside_root() {
-        let outside =
-            sarif_artifact_location("/usr/include/stdio.h", Some(Path::new("/scan/root")));
-        assert_eq!(outside["uri"], "file:///usr/include/stdio.h");
+        // An absolute path carries a drive on Windows.
+        let drive = if cfg!(windows) { "C:" } else { "" };
+        let root = format!("{drive}/scan/root");
+        let outside = sarif_artifact_location(
+            &format!("{drive}/usr/include/stdio.h"),
+            Some(Path::new(&root)),
+        );
+        let expected = if cfg!(windows) {
+            "file:///C:/usr/include/stdio.h"
+        } else {
+            "file:///usr/include/stdio.h"
+        };
+        assert_eq!(outside["uri"], expected);
         assert!(outside.get("uriBaseId").is_none());
 
-        let under = sarif_artifact_location("/scan/root/src/p.c", Some(Path::new("/scan/root")));
+        let under = sarif_artifact_location(&format!("{root}/src/p.c"), Some(Path::new(&root)));
         assert_eq!(under["uri"], "src/p.c");
         assert_eq!(under["uriBaseId"], "SRCROOT");
     }

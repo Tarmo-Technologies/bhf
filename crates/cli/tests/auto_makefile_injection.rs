@@ -144,7 +144,8 @@ fn tree_config_cxx_std_cannot_inject_into_the_harness_makefile() {
     std::fs::write(
         s.root.join(".bhf.toml"),
         format!(
-            "cxx-std = \"c++17; touch {}; true\"\n",
+            // A literal string: a Windows path's `\` is no TOML escape there.
+            "cxx-std = 'c++17; touch {}; true'\n",
             s.marker.to_str().unwrap()
         ),
     )
@@ -225,7 +226,13 @@ fn compile_database_compiler_cannot_inject_into_the_harness_makefile() {
 fn well_formed_build_context_values_are_still_honored() {
     let s = Scenario::new("ok");
     std::fs::write(s.root.join(".bhf.toml"), "cxx-std = \"gnu++14\"\n").expect("write .bhf.toml");
-    s.write_compile_db("/usr/bin/clang++", "-DFOO=1");
+    // An absolute compiler path outside the tree (with a drive on Windows).
+    let compiler = if cfg!(windows) {
+        "C:/usr/bin/clang++"
+    } else {
+        "/usr/bin/clang++"
+    };
+    s.write_compile_db(compiler, "-DFOO=1");
 
     let out = s.run();
     assert!(
@@ -250,7 +257,7 @@ fn well_formed_build_context_values_are_still_honored() {
                 .join("\n")
         );
         assert!(
-            makefile.contains("CXX = /usr/bin/clang++"),
+            makefile.contains(&format!("CXX = {compiler}")),
             "the recovered compiler was dropped:\n{}",
             makefile
                 .lines()

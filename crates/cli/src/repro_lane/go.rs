@@ -382,6 +382,8 @@ mod tests {
         );
     }
 
+    // Unix only: the fixture's replace targets are POSIX absolute paths.
+    #[cfg(unix)]
     #[test]
     fn replaced_dirs_are_read_quoted_or_bare() {
         let go_mod = "module bhf.example/x/bhfharness\n\ngo 1.21\n\n\

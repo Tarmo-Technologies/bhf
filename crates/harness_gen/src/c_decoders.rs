@@ -2848,13 +2848,13 @@ fn file_pointer(c_type: &str, name: &str) -> CParamEmission {
         "unsigned char *{buffer} = (unsigned char *)calloc(Size ? Size : 1, 1); \
          if ({buffer} && Size) memcpy({buffer}, Data, Size)"
     );
+    // `bhf_fmemopen` (c_runtime/bhf_decode.h) is fmemopen, or a deleted-on-close
+    // temporary file where the C runtime has no fmemopen (Windows).
     let decl = if c_type == "FILE *" {
-        format!(
-            r#"{setup}; FILE * {name} = {buffer} ? (Size ? fmemopen({buffer}, Size, "r+") : tmpfile()) : NULL"#
-        )
+        format!("{setup}; FILE * {name} = {buffer} ? bhf_fmemopen({buffer}, Size) : NULL")
     } else {
         format!(
-            r#"{setup}; {c_type} {name} = ({c_type})({buffer} ? (Size ? fmemopen({buffer}, Size, "r+") : tmpfile()) : NULL)"#
+            "{setup}; {c_type} {name} = ({c_type})({buffer} ? bhf_fmemopen({buffer}, Size) : NULL)"
         )
     };
     CParamEmission {
@@ -4076,10 +4076,7 @@ mod tests {
         assert!(e.decl.contains("FILE * stream = _bhf_file_buf_stream ?"));
         assert!(e.decl.contains("memcpy(_bhf_file_buf_stream, Data, Size)"));
         assert!(e.decl.contains("Size"));
-        assert!(e
-            .decl
-            .contains("fmemopen(_bhf_file_buf_stream, Size, \"r+\")"));
-        assert!(e.decl.contains("tmpfile()"));
+        assert!(e.decl.contains("bhf_fmemopen(_bhf_file_buf_stream, Size)"));
         assert_eq!(e.arg, "stream");
         assert_eq!(e.c_type, "FILE *");
         assert_eq!(
@@ -4138,7 +4135,7 @@ mod tests {
 
         assert!(e
             .decl
-            .contains("MZ_FILE * stream = (MZ_FILE *)(_bhf_file_buf_stream ? (Size ? fmemopen"));
+            .contains("MZ_FILE * stream = (MZ_FILE *)(_bhf_file_buf_stream ? bhf_fmemopen("));
         assert!(e.decl.contains("memcpy(_bhf_file_buf_stream, Data, Size)"));
         assert!(e.decl.contains("Size"));
         assert_eq!(e.arg, "stream");

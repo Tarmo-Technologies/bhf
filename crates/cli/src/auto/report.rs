@@ -3822,14 +3822,16 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let link = dir.join("dangling.h");
+        // Creating a symlink on Windows needs a privilege a test cannot assume.
         #[cfg(unix)]
-        std::os::unix::fs::symlink(dir.join("nonexistent-target.h"), &link).unwrap();
-        #[cfg(unix)]
-        assert_eq!(
-            classify_missing_path(link.to_str().unwrap()),
-            DepKind::Symlink
-        );
+        {
+            let link = dir.join("dangling.h");
+            std::os::unix::fs::symlink(dir.join("nonexistent-target.h"), &link).unwrap();
+            assert_eq!(
+                classify_missing_path(link.to_str().unwrap()),
+                DepKind::Symlink
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

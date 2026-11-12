@@ -1566,7 +1566,9 @@ fn c_build_failure_hints(
             .map(recipe_words)
             .unwrap_or_default();
         linked.extend(inherited_sources.iter().map(PathBuf::from));
-        let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        // Resolved without Windows' `\\?\` prefix: the paths are shown in
+        // commands to run.
+        let canonical = crate::workdir::plain_canonical;
         let linked: Vec<PathBuf> = linked.iter().map(|path| canonical(path)).collect();
         let reference = target_sources.first().cloned();
         let Some(target_dir) = reference
@@ -1785,11 +1787,25 @@ pub(crate) fn try_run_c_make_build_with_target_and_ldflags(
         &mut cmd,
         std::time::Duration::from_secs(30 * 60),
     )
-    .expect("spawn make");
+    .unwrap_or_else(|error| make_spawn_failure(&error));
     if cfg!(windows) && output.status.success() {
         stage_sanitizer_runtime(&harness_dir, std::env::var_os("PATH").as_deref());
     }
     output
+}
+
+/// The result of a `make` that could not be started (not installed, or not
+/// on PATH): a failed build whose output says why, instead of a panic.
+fn make_spawn_failure(error: &std::io::Error) -> std::process::Output {
+    #[cfg(unix)]
+    let status = std::os::unix::process::ExitStatusExt::from_raw(127 << 8);
+    #[cfg(windows)]
+    let status = std::os::windows::process::ExitStatusExt::from_raw(1);
+    std::process::Output {
+        status,
+        stdout: Vec::new(),
+        stderr: format!("bhf: could not run make: {error}\n").into_bytes(),
+    }
 }
 
 /// Sidecar beside a harness binary naming the directories of the sanitizer
@@ -2777,13 +2793,21 @@ mod tests {
         // provides it).
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
+        // An absolute path carries a drive on Windows.
+        let absolute_import = if cfg!(windows) {
+            "C:/opt/x.gpr"
+        } else {
+            "/opt/x.gpr"
+        };
         fs::write(
             root.join("foo.gpr"),
-            "with \"../sub/dep.gpr\";\n\
-             with \"/opt/x.gpr\";\n\
-             with \"../../whatever/adafuzz.gpr\";\n\
-             project Foo is\n\
-             end Foo;\n",
+            format!(
+                "with \"../sub/dep.gpr\";\n\
+                 with \"{absolute_import}\";\n\
+                 with \"../../whatever/adafuzz.gpr\";\n\
+                 project Foo is\n\
+                 end Foo;\n"
+            ),
         )
         .unwrap();
 
@@ -2801,7 +2825,7 @@ mod tests {
             "fixture root must be absolute for this assertion"
         );
         // Absolute import preserved verbatim.
-        let expected_abs = PathBuf::from("/opt/x.gpr");
+        let expected_abs = PathBuf::from(absolute_import);
         assert_eq!(
             clauses,
             vec![expected_dep, expected_abs],
@@ -3173,7 +3197,11 @@ mod tests {
         let work = tmp.path().join("bhf_work");
         let src = work.join("src_instrumented");
         let harness = work.join("generated_harnesses/H-A0001");
-        let repair_stubs = work.join("harnesses/H-A0001/repairs/ada_stubs");
+        let repair_stubs = work
+            .join("harnesses")
+            .join("H-A0001")
+            .join("repairs")
+            .join("ada_stubs");
         fs::create_dir_all(&src).unwrap();
         fs::create_dir_all(&harness).unwrap();
         fs::create_dir_all(&repair_stubs).unwrap();
@@ -3649,6 +3677,32 @@ mod tests {
         );
     }
 
+    /// A `make` that cannot be started is a failed build that says why, not a
+    /// panic. The harness directory does not exist, so starting `make` in it
+    /// fails the way a `make` missing from PATH does, without changing PATH
+    /// under the tests running beside this one.
+    #[test]
+    fn a_make_that_cannot_start_is_a_failed_build_with_its_reason() {
+        let work = tempfile::tempdir().unwrap();
+        let output = try_run_c_make_build_with_target_and_ldflags(
+            work.path(),
+            "no-such-harness",
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.starts_with("bhf: could not run make: "), "{stderr}");
+        assert!(
+            stderr.trim_end().len() > "bhf: could not run make:".len(),
+            "the reason follows: {stderr}"
+        );
+    }
+
     #[test]
     fn failed_link_hint_names_the_in_tree_definer_and_the_exact_flags() {
         let temp = tempfile::tempdir().unwrap();
@@ -3677,7 +3731,7 @@ mod tests {
             harness.join("Makefile"),
             format!(
                 "main: main.cpp bhf_driver.o $(CONTEXT_MAIN_OBJECTS)\n\t$(CXX) $(CXXFLAGS) -DBHF_EXTERNAL_DRIVER -o $@ main.cpp {} $(CONTEXT_MAIN_OBJECTS) $(AUTO_EXTRA_SOURCES) bhf_driver.o\n",
-                src.join("codec.cpp").display()
+                harness_gen::build_safety::make_path(&src.join("codec.cpp"))
             ),
         )
         .unwrap();
@@ -3685,11 +3739,15 @@ mod tests {
                       codec.cpp:2: undefined reference to `vendor_checksum'\n";
         let none = RebuildEnv::default();
         let hints = c_build_failure_hints(&work, "H-ONE", &harness, output, &none).join("\n");
-        let table = src.join("table.cpp").display().to_string();
+        // The definer is named by its resolved path (Windows short names
+        // expanded, no `\\?\` prefix).
+        let table_path = crate::workdir::plain_canonical(&src.join("table.cpp"));
+        let table = table_path.display().to_string();
         assert!(
-            hints.contains(&format!("--extra-source {table}")),
+            hints.contains(&format!("--extra-source {}", shell_word(&table_path))),
             "{hints}"
         );
+        assert!(!hints.contains(r"\\?\"), "{hints}");
         assert!(
             hints.contains(&format!(
                 "AUTO_EXTRA_SOURCES={} bhf build",
@@ -3701,7 +3759,7 @@ mod tests {
         assert!(
             !hints.contains(&format!(
                 "--extra-source {}",
-                src.join("codec.cpp").display()
+                shell_word(&crate::workdir::plain_canonical(&src.join("codec.cpp")))
             )),
             "an already-linked source is never suggested: {hints}"
         );

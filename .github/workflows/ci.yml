@@ -435,7 +435,8 @@ jobs:
     needs: changes
     if: needs.changes.outputs.heavy == 'true'
     runs-on: windows-2022
-    timeout-minutes: 60
+    # The full unit-test suite and clippy run before the release build.
+    timeout-minutes: 90
     env:
       BHF_RELEASE_VERSION: "1"
       BHF_VCS_REF: ${{ github.sha }}
@@ -450,22 +451,18 @@ jobs:
         with:
           toolchain: 1.99.0
 
-      - name: Test Windows-specific logic and daemon
+      # Every crate's unit tests, the daemon's included: a test that only
+      # holds on Unix is cfg-gated in the source, so nothing is filtered here.
+      - name: Test the workspace libraries and the daemon
         shell: pwsh
         run: |
-          cargo test --locked -p bhf-daemon --lib
+          cargo test --locked --workspace --lib --no-fail-fast
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --locked -p bhf --lib windows
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --locked -p bhf --lib vcxproj
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --locked -p bhf --lib msbuild_import
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --locked -p bhf --lib msvc_cc
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --locked -p report --lib replay_script
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --locked -p build_classifier --lib msvc
+
+      - name: Clippy
+        shell: pwsh
+        run: |
+          cargo clippy --locked --workspace --all-targets -- -D warnings
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Test portable scheduler runtime reliability

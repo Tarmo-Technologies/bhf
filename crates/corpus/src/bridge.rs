@@ -8,6 +8,11 @@
 //! All four supported formats are flat directories of raw input
 //! bytes — only the file-naming convention differs. Sidecar metadata
 //! (AFL plot data, libFuzzer stats, etc.) is ignored.
+//!
+//! AFL names a queue entry `id:000000,orig:seed`. Windows does not allow
+//! `:` in a file name, so on Windows the export uses AFL's own
+//! Windows-safe spelling, `_` for `:` (`id_000000,sig_...`). Both
+//! spellings are read on every host.
 
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -89,7 +94,7 @@ pub fn detect_format(dir: &Path) -> Result<Format, BridgeError> {
         let Some(name) = name.to_str() else {
             continue;
         };
-        if name.starts_with("id:") {
+        if afl_id_rest(name).is_some() {
             afl += 1;
         } else if name.ends_with(".fuzz") {
             honggfuzz += 1;
@@ -116,6 +121,16 @@ pub fn detect_format(dir: &Path) -> Result<Format, BridgeError> {
     } else {
         Ok(Format::Unknown)
     }
+}
+
+/// The separator AFL queue names use after `id` and each field name:
+/// `:`, or `_` on Windows, where `:` cannot appear in a file name.
+const AFL_NAME_SEPARATOR: char = if cfg!(windows) { '_' } else { ':' };
+
+/// The text after an AFL queue name's `id:` or `id_` prefix.
+fn afl_id_rest(name: &str) -> Option<&str> {
+    name.strip_prefix("id:")
+        .or_else(|| name.strip_prefix("id_"))
 }
 
 fn is_sha1_hex(s: &str) -> bool {
@@ -249,7 +264,8 @@ fn output_name(format: Format, hash: &[u8; 32], next_afl_ord: &mut u32) -> Strin
         Format::Afl => {
             let n = *next_afl_ord;
             *next_afl_ord = n.saturating_add(1);
-            format!("id:{n:06},sig:{}", &hex[..16])
+            let sep = AFL_NAME_SEPARATOR;
+            format!("id{sep}{n:06},sig{sep}{}", &hex[..16])
         }
     }
 }
@@ -267,7 +283,7 @@ fn next_afl_ordinal(dst: &Path, target_format: Format) -> u32 {
         let Some(name) = name.to_str() else {
             continue;
         };
-        if let Some(rest) = name.strip_prefix("id:") {
+        if let Some(rest) = afl_id_rest(name) {
             let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
             if let Ok(n) = digits.parse::<i64>() {
                 if n > max {
@@ -308,12 +324,29 @@ mod tests {
         fs::write(dir.join(name), contents).unwrap();
     }
 
+    /// An AFL queue name spelled the way this host can store it.
+    fn afl(id: u32, orig: &str) -> String {
+        let sep = AFL_NAME_SEPARATOR;
+        format!("id{sep}{id:06},orig{sep}{orig}")
+    }
+
     #[test]
     fn detect_format_recognises_afl_queue() {
         let dir = temp_dir("detect-afl");
-        write_file(&dir, "id:000000,orig:seed1", b"input-a");
-        write_file(&dir, "id:000001,orig:seed2", b"input-b");
+        write_file(&dir, &afl(0, "seed1"), b"input-a");
+        write_file(&dir, &afl(1, "seed2"), b"input-b");
         assert_eq!(detect_format(&dir).unwrap(), Format::Afl);
+    }
+
+    /// AFL's Windows-safe spelling (`id_000000`, no `:`) is an AFL queue on
+    /// every host, and an export continues its numbering.
+    #[test]
+    fn windows_safe_afl_names_are_read_and_continued() {
+        let dir = temp_dir("detect-afl-simple");
+        write_file(&dir, "id_000000,orig_seed1", b"input-a");
+        write_file(&dir, "id_000001", b"input-b");
+        assert_eq!(detect_format(&dir).unwrap(), Format::Afl);
+        assert_eq!(next_afl_ordinal(&dir, Format::Afl), 2);
     }
 
     #[test]
@@ -344,9 +377,9 @@ mod tests {
     fn import_dir_copies_unique_files() {
         let src = temp_dir("import-unique-src");
         let dst = temp_dir("import-unique-dst");
-        write_file(&src, "id:000000,orig:a", b"aaa");
-        write_file(&src, "id:000001,orig:b", b"bbb");
-        write_file(&src, "id:000002,orig:c", b"ccc");
+        write_file(&src, &afl(0, "a"), b"aaa");
+        write_file(&src, &afl(1, "b"), b"bbb");
+        write_file(&src, &afl(2, "c"), b"ccc");
         let summary = import_dir(&src, &dst, Format::Afl).unwrap();
         assert_eq!(summary.unique, 3);
         assert_eq!(summary.duplicates, 0);
@@ -359,9 +392,9 @@ mod tests {
     fn import_dir_deduplicates_by_content_hash() {
         let src = temp_dir("import-dedup-src");
         let dst = temp_dir("import-dedup-dst");
-        write_file(&src, "id:000000,orig:a", b"aaa");
-        write_file(&src, "id:000001,orig:b", b"aaa"); // duplicate content
-        write_file(&src, "id:000002,orig:c", b"ccc");
+        write_file(&src, &afl(0, "a"), b"aaa");
+        write_file(&src, &afl(1, "b"), b"aaa"); // duplicate content
+        write_file(&src, &afl(2, "c"), b"ccc");
         let summary = import_dir(&src, &dst, Format::Afl).unwrap();
         assert_eq!(summary.unique, 2);
         assert_eq!(summary.duplicates, 1);
@@ -394,7 +427,10 @@ mod tests {
         let mut ordinals: Vec<u32> = Vec::new();
         for entry in fs::read_dir(&dst).unwrap() {
             let name = entry.unwrap().file_name().into_string().unwrap();
-            assert!(name.starts_with("id:"));
+            assert!(
+                name.starts_with(&format!("id{AFL_NAME_SEPARATOR}")),
+                "{name}"
+            );
             let digits: String = name[3..]
                 .chars()
                 .take_while(|c| c.is_ascii_digit())
@@ -424,7 +460,7 @@ mod tests {
         let src1 = temp_dir("merge-fmt-src1");
         let src2 = temp_dir("merge-fmt-src2");
         let dst = temp_dir("merge-fmt-dst");
-        write_file(&src1, "id:000000,orig:a", b"a");
+        write_file(&src1, &afl(0, "a"), b"a");
         write_file(&src2, "input1.bin", b"b");
         let summary = merge_dirs(&[src1, src2], &dst).unwrap();
         assert_eq!(summary.source_format, Format::Afl);

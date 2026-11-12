@@ -1387,10 +1387,11 @@ end_of_record\n";
         std::fs::write(&support, "// support\n").unwrap();
         std::fs::write(
             harness.path().join("Makefile"),
+            // Spelled as generated Makefiles spell paths (`/` on Windows).
             format!(
                 "main_cov:\n\t$(COV_CXX) -o $@ main.cpp {} {} $(AUTO_EXTRA_SOURCES)\n",
-                primary.display(),
-                support.display()
+                harness_gen::build_safety::make_path(&primary),
+                harness_gen::build_safety::make_path(&support)
             ),
         )
         .unwrap();

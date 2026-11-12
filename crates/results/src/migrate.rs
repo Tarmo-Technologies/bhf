@@ -4,6 +4,7 @@
 //! `results/` replaces (its index files and reproducer scripts) is kept under
 //! `results/legacy/`, with a `migration.json` record of what was moved.
 
+use crate::lock::ResultsLock;
 use crate::{io_err, layout, ResultsError};
 use std::path::{Path, PathBuf};
 
@@ -249,19 +250,37 @@ pub fn migrate_legacy(work_dir: &Path) -> Result<MigrationOutcome, ResultsError>
 /// migration was needed).
 pub fn migrate_legacy_report(work_dir: &Path) -> Result<Option<MigrationReport>, ResultsError> {
     let legacy = layout::legacy_findings_dir(work_dir);
-    match std::fs::symlink_metadata(&legacy) {
-        Ok(meta) if meta.is_dir() => {}
-        Ok(_) => return Ok(None),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => {
-            return Err(ResultsError::Io {
-                path: legacy,
-                source,
-            })
-        }
+    if !is_real_dir(&legacy)? {
+        return Ok(None);
+    }
+    // Migrations of one work dir run one at a time, under the results lock.
+    // A rename alone cannot tell racers apart on Windows: it moves the
+    // directory a handle was opened on, so a racer that opened `findings/`
+    // before a peer moved it then "moves" the peer's result onto itself and
+    // also reports a migration.
+    let results = layout::results_dir(work_dir);
+    std::fs::create_dir_all(&results).map_err(io_err(&results))?;
+    let _lock = ResultsLock::acquire(&results, MIGRATION_LOCK_TIMEOUT)?;
+    if !is_real_dir(&legacy)? {
+        return Ok(None);
     }
     let target = layout::findings_dir(work_dir);
     migrate_inner(&legacy, &target, work_dir)
+}
+
+/// How long a migration waits for a peer's migration or rebuild.
+const MIGRATION_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Whether `path` is a directory itself, not a symlink to one.
+fn is_real_dir(path: &Path) -> Result<bool, ResultsError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => Ok(meta.is_dir()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(ResultsError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 /// Inputs that look damaged by the seed encoding of earlier releases, which

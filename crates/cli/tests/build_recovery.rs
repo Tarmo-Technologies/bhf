@@ -594,6 +594,8 @@ fn name_matches_locator(name: &str, locator: &str) -> bool {
     name == locator || name.ends_with(&format!("{}{}", std::path::MAIN_SEPARATOR, locator))
 }
 
+// The fixture harness uses <dlfcn.h>, which is POSIX.
+#[cfg(unix)]
 #[test]
 fn smoke_extract_fixture_compiles() {
     if skip_if_no_toolchain() {

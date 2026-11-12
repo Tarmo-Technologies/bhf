@@ -7,12 +7,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// The Python interpreter: Windows' installer provides `python`, not `python3`.
+const PYTHON: &str = if cfg!(windows) { "python" } else { "python3" };
+
 #[test]
 fn real_code_matrix_reports_language_coverage_and_offline_subset_metadata() {
     let root = repo_root();
     let script = root.join("scripts/validation/real-code-matrix.py");
     let manifest = root.join("tests/fixtures/real_code_validation/manifest.toml");
-    let output = Command::new("python3")
+    let output = Command::new(PYTHON)
         .arg(&script)
         .arg("--manifest")
         .arg(&manifest)

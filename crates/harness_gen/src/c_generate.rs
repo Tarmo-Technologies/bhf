@@ -5704,7 +5704,10 @@ mod tests {
         };
         let path = out.join("past.bin");
         fs::write(&path, [2, 0, 0, 0, 0xa1, 0xa2, 0xb1, 0xb2]).unwrap();
-        let run = Command::new(out.join("main")).arg(&path).output().unwrap();
+        let run = crate::harness_command(out.join("main"))
+            .arg(&path)
+            .output()
+            .unwrap();
         let stderr = String::from_utf8_lossy(&run.stderr);
         assert!(
             !run.status.success() && stderr.contains("heap-buffer-overflow"),
@@ -6417,7 +6420,7 @@ mod tests {
         // A clean input runs the target once and exits 0.
         let ok = out.join("ok.bin");
         fs::write(&ok, b"hi").unwrap();
-        let r = std::process::Command::new(&bin).arg(&ok).output().unwrap();
+        let r = crate::harness_command(&bin).arg(&ok).output().unwrap();
         assert!(
             r.status.success(),
             "clean input must not crash: {}",
@@ -6427,10 +6430,7 @@ mod tests {
         // The magic input crashes under ASan — libFuzzer really drove bhf_run_one.
         let crash = out.join("crash.bin");
         fs::write(&crash, b"FUZZ....").unwrap();
-        let r = std::process::Command::new(&bin)
-            .arg(&crash)
-            .output()
-            .unwrap();
+        let r = crate::harness_command(&bin).arg(&crash).output().unwrap();
         let err = String::from_utf8_lossy(&r.stderr);
         assert!(
             !r.status.success(),
@@ -6509,10 +6509,7 @@ mod tests {
         let bin = out.join("main_libfuzzer");
         let crash = out.join("crash.bin");
         fs::write(&crash, b"FUZZ....").unwrap();
-        let r = std::process::Command::new(&bin)
-            .arg(&crash)
-            .output()
-            .unwrap();
+        let r = crate::harness_command(&bin).arg(&crash).output().unwrap();
         let err = String::from_utf8_lossy(&r.stderr);
         assert!(
             !r.status.success(),
@@ -6594,8 +6591,10 @@ mod tests {
 
         let makefile = fs::read_to_string(out.join("Makefile")).unwrap();
         assert!(
-            makefile.contains(&format!("-iquote \"{}\"", inc_dir.display()))
-                && makefile.contains(&format!(" \"{}\"", source.display())),
+            makefile.contains(&format!(
+                "-iquote \"{}\"",
+                crate::build_safety::make_path(&inc_dir)
+            )) && makefile.contains(&format!(" \"{}\"", crate::build_safety::make_path(&source))),
             "spaced paths must be double-quoted in the Makefile:\n{makefile}"
         );
         let build = Command::new("make")
@@ -6611,7 +6610,10 @@ mod tests {
         );
         let input = out.join("input.bin");
         fs::write(&input, b"record").unwrap();
-        let run = Command::new(out.join("main")).arg(&input).output().unwrap();
+        let run = crate::harness_command(out.join("main"))
+            .arg(&input)
+            .output()
+            .unwrap();
         assert!(
             run.status.success(),
             "{}",
@@ -6702,7 +6704,13 @@ mod tests {
     /// `-Werror` build would turn into a failure.
     fn assert_compiles_warning_free(out: &Path) {
         let runtime = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../c_runtime");
-        let check = Command::new("clang")
+        let mut check = Command::new("clang");
+        // The Microsoft C runtime deprecates standard functions (`getenv`)
+        // in favour of its own; that is no defect of the harness.
+        if cfg!(windows) {
+            check.arg("-D_CRT_SECURE_NO_WARNINGS");
+        }
+        let check = check
             .args(["-fsyntax-only", "-Wall", "-Wextra", "-Werror"])
             .arg("-I")
             .arg(&runtime)
@@ -6721,7 +6729,7 @@ mod tests {
     fn traced_args(out: &Path, input: &[u8], trace: Option<&str>) -> Vec<serde_json::Value> {
         let path = out.join("traced-input.bin");
         fs::write(&path, input).unwrap();
-        let mut command = Command::new(out.join("main"));
+        let mut command = crate::harness_command(out.join("main"));
         command.arg(&path).env_remove("BHF_TRACE_ARGS");
         if let Some(trace) = trace {
             command.env("BHF_TRACE_ARGS", trace);
@@ -7603,7 +7611,10 @@ mod tests {
         );
         let low = out.join("low.bin");
         fs::write(&low, [0x01, 0x00, 0x00, 0x00]).unwrap();
-        let run = Command::new(out.join("main")).arg(&low).output().unwrap();
+        let run = crate::harness_command(out.join("main"))
+            .arg(&low)
+            .output()
+            .unwrap();
         assert!(
             run.status.success(),
             "a small value must not reach the planted check: {}",
@@ -7611,7 +7622,10 @@ mod tests {
         );
         let high = out.join("high.bin");
         fs::write(&high, [0xff, 0xff, 0xff, 0xff]).unwrap();
-        let run = Command::new(out.join("main")).arg(&high).output().unwrap();
+        let run = crate::harness_command(out.join("main"))
+            .arg(&high)
+            .output()
+            .unwrap();
         assert!(
             !run.status.success(),
             "0xffffffff must be reachable from the input bytes: {}",
@@ -10832,7 +10846,7 @@ mod tests {
         let main = fs::read_to_string(&result.main_c).unwrap();
         assert!(main.contains("#define _GNU_SOURCE"));
         assert!(main.contains("#include <stdio.h>"));
-        assert!(main.contains("fmemopen(_bhf_file_buf_stream, Size, \"r+\")"));
+        assert!(main.contains("bhf_fmemopen(_bhf_file_buf_stream, Size)"));
         assert!(main.contains("if (stream) fclose(stream); free(_bhf_file_buf_stream);"));
         assert!(main.contains("int R = parse_stream(stream);"));
 
@@ -10860,6 +10874,59 @@ mod tests {
             String::from_utf8_lossy(&output.stderr),
             main
         );
+    }
+
+    /// The stream a FILE* parameter gets reads back exactly the input bytes,
+    /// and an empty input gives an empty stream, on every host (Windows has
+    /// no fmemopen).
+    #[test]
+    fn bhf_fmemopen_reads_back_the_input_bytes() {
+        if Command::new("clang").arg("--version").output().is_err() {
+            eprintln!("skipping stream round trip: clang not on PATH");
+            return;
+        }
+        let work = temp_dir("fmemopen-round-trip");
+        let source = work.join("stream.c");
+        fs::write(
+            &source,
+            r#"#define _GNU_SOURCE
+#include <stdio.h>
+#include "bhf_decode.h"
+int main(void) {
+    unsigned char input[4] = {'W', 'G', 'T', '1'};
+    unsigned char back[8] = {0};
+    FILE *stream = bhf_fmemopen(input, sizeof input);
+    if (!stream) return 2;
+    if (fread(back, 1, sizeof back, stream) != 4 || memcmp(back, input, 4) != 0) return 3;
+    fclose(stream);
+    stream = bhf_fmemopen(input, 0);
+    if (!stream || fgetc(stream) != EOF) return 4;
+    fclose(stream);
+    return 0;
+}
+"#,
+        )
+        .unwrap();
+        let program = work.join(if cfg!(windows) {
+            "stream.exe"
+        } else {
+            "stream"
+        });
+        let output = Command::new("clang")
+            .arg("-I")
+            .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../c_runtime"))
+            .arg(&source)
+            .arg("-o")
+            .arg(&program)
+            .output()
+            .expect("spawn clang");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let status = Command::new(&program).status().expect("run stream probe");
+        assert!(status.success(), "stream probe exited {status}");
     }
 
     #[test]
@@ -10907,7 +10974,7 @@ mod tests {
         assert!(main.contains("#include <stdio.h>"));
         assert!(main.contains("#include \"target.h\""));
         assert!(
-            main.contains("MZ_FILE * stream = (MZ_FILE *)(_bhf_file_buf_stream ? (Size ? fmemopen")
+            main.contains("MZ_FILE * stream = (MZ_FILE *)(_bhf_file_buf_stream ? bhf_fmemopen(")
         );
         assert!(main.contains("int R = parse_cfile(stream);"));
         assert!(main.contains("if (stream) fclose(stream); free(_bhf_file_buf_stream);"));

@@ -1947,30 +1947,39 @@ mod tests {
     /// dir holding the finding; the path as recorded is only a fallback.
     #[test]
     fn an_absolute_fixture_is_mapped_into_the_containing_work_dir() {
-        let finding = std::path::Path::new("/copy/results/findings/F-0001-aa");
+        // An absolute path carries a drive on Windows.
+        let abs = |path: &str| {
+            if cfg!(windows) {
+                format!("C:{path}")
+            } else {
+                path.to_owned()
+            }
+        };
+        let finding_dir = abs("/copy/results/findings/F-0001-aa");
+        let finding = std::path::Path::new(&finding_dir);
         assert_eq!(
-            super::fixture_path_candidates(finding, "/orig/work/harnesses/H-1/main"),
-            vec![PathBuf::from("/copy/harnesses/H-1/main")]
+            super::fixture_path_candidates(finding, &abs("/orig/work/harnesses/H-1/main")),
+            vec![PathBuf::from(abs("/copy/harnesses/H-1/main"))]
         );
         assert_eq!(
-            super::fixture_path_fallback(finding, "/orig/work/harnesses/H-1/main"),
-            Some(PathBuf::from("/orig/work/harnesses/H-1/main"))
+            super::fixture_path_fallback(finding, &abs("/orig/work/harnesses/H-1/main")),
+            Some(PathBuf::from(abs("/orig/work/harnesses/H-1/main")))
         );
         assert_eq!(
-            super::fixture_path_candidates(finding, "/copy/build/H-1/obj/main"),
-            vec![PathBuf::from("/copy/build/H-1/obj/main")]
+            super::fixture_path_candidates(finding, &abs("/copy/build/H-1/obj/main")),
+            vec![PathBuf::from(abs("/copy/build/H-1/obj/main"))]
         );
         assert_eq!(
-            super::fixture_path_fallback(finding, "/copy/build/H-1/obj/main"),
+            super::fixture_path_fallback(finding, &abs("/copy/build/H-1/obj/main")),
             None
         );
         // A path with no harness-root tail is used as given.
         assert_eq!(
-            super::fixture_path_candidates(finding, "/opt/prebuilt/main"),
-            vec![PathBuf::from("/opt/prebuilt/main")]
+            super::fixture_path_candidates(finding, &abs("/opt/prebuilt/main")),
+            vec![PathBuf::from(abs("/opt/prebuilt/main"))]
         );
         assert_eq!(
-            super::fixture_path_fallback(finding, "/opt/prebuilt/main"),
+            super::fixture_path_fallback(finding, &abs("/opt/prebuilt/main")),
             None
         );
         assert!(super::fixture_path_candidates(finding, "").is_empty());

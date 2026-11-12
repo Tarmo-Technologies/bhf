@@ -1087,6 +1087,8 @@ mod tests {
         ));
     }
 
+    // bubblewrap is Linux's: the sandbox probe runs the host's `true` inside.
+    #[cfg(unix)]
     #[test]
     fn bubblewrap_drops_unshare_net_when_netns_denied() {
         // Regression: when only the network namespace is denied (loopback

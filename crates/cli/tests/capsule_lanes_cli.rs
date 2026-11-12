@@ -393,6 +393,8 @@ fn php_finding_round_trips() {
     run.round_trip(&id, "php");
 }
 
+// Builds a PATH of symlinks into /usr/bin.
+#[cfg(unix)]
 #[test]
 fn lua_finding_round_trips() {
     let lua = ["lua", "lua5.4", "lua5.3"]

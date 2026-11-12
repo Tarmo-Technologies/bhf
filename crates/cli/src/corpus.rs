@@ -48,7 +48,9 @@ pub struct ImportArgs {
 
 #[derive(Debug, clap::Args)]
 pub struct ExportArgs {
-    /// Target format.
+    /// Target format. `afl` names entries `id:000000,sig:...`, or
+    /// `id_000000,sig_...` on Windows, which allows no `:` in a file name
+    /// (import reads both).
     #[arg(long, default_value = "libfuzzer")]
     pub to: String,
 

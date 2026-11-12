@@ -4,7 +4,9 @@ use serde_json::json;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -158,6 +160,7 @@ fn write_executable(path: &Path, source: &str) {
     fs::set_permissions(path, permissions).unwrap();
 }
 
+#[cfg(unix)]
 fn assert_success(output: std::process::Output) {
     assert!(
         output.status.success(),
@@ -168,6 +171,7 @@ fn assert_success(output: std::process::Output) {
     );
 }
 
+#[cfg(unix)]
 fn read_json(path: &Path) -> serde_json::Value {
     serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
 }

@@ -949,6 +949,10 @@ mod tests {
     /// own and marked as an environment problem rather than a missing type.
     #[test]
     fn an_unsafe_build_path_row_has_its_own_category() {
+        // `write` merges the recorded issues: a panic another test records
+        // meanwhile would be a second row.
+        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        reset_issues();
         init(false);
         let dir = std::env::temp_dir().join(format!("bhf-bugreport-path-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

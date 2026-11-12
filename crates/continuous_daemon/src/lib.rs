@@ -996,6 +996,12 @@ mod tests {
         dir
     }
 
+    /// A file that exists on every host, for a scheduler that refuses to
+    /// start before it would run a job.
+    fn existing_bin() -> PathBuf {
+        std::env::current_exe().unwrap()
+    }
+
     fn ok_config(dir: PathBuf, bin: PathBuf) -> DaemonConfig {
         DaemonConfig {
             data_dir: dir,
@@ -1054,6 +1060,8 @@ mod tests {
         ));
     }
 
+    // Runs `/bin/true`-style POSIX programs as the job binary.
+    #[cfg(unix)]
     #[test]
     fn submit_and_list_returns_queued_job() {
         let dir = tempdir("submit");
@@ -1067,6 +1075,8 @@ mod tests {
         assert!(jobs.iter().any(|j| j.job_id == id));
     }
 
+    // Runs `/bin/true`-style POSIX programs as the job binary.
+    #[cfg(unix)]
     #[test]
     fn worker_runs_submitted_job_to_completion_against_bin_true() {
         let dir = tempdir("run-complete");
@@ -1105,6 +1115,7 @@ mod tests {
         bin
     }
 
+    #[cfg(unix)]
     fn wait_for_state(scheduler: &Scheduler, id: &str, want: JobState) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -1121,6 +1132,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn producers(project: &Path) -> Vec<serde_json::Value> {
         std::fs::read(project.join("results/manifest.json"))
             .ok()
@@ -1209,6 +1221,8 @@ mod tests {
         );
     }
 
+    // Runs `/bin/true`-style POSIX programs as the job binary.
+    #[cfg(unix)]
     #[test]
     fn worker_marks_failure_when_bin_exits_nonzero() {
         let dir = tempdir("run-fail");
@@ -1328,6 +1342,11 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let sender = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
+            // Read the request first: closing a socket with unread input
+            // resets the connection, and Windows then discards the response
+            // bytes the client has not read yet.
+            let mut request = [0_u8; 1024];
+            let _ = std::io::Read::read(&mut stream, &mut request);
             let body = vec![b'x'; MAX_WEBHOOK_RESPONSE_BYTES + 1];
             let _ = stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n");
             let _ = stream.write_all(&body);
@@ -1365,6 +1384,8 @@ mod tests {
         sender.join().unwrap();
     }
 
+    // Runs `/bin/true`-style POSIX programs as the job binary.
+    #[cfg(unix)]
     #[test]
     fn restart_recovers_queued_jobs_from_disk() {
         let dir = tempdir("restart");
@@ -1387,6 +1408,8 @@ mod tests {
         assert!(!jobs.is_empty());
     }
 
+    // Runs `/bin/true`-style POSIX programs as the job binary.
+    #[cfg(unix)]
     #[test]
     fn restart_assigns_distinct_id_after_restored_job() {
         let dir = tempdir("restart-id");
@@ -1469,7 +1492,8 @@ mod tests {
             let dir = tempdir(name);
             let path = dir.join("jobs.jsonl");
             std::fs::write(&path, snapshot.as_bytes()).unwrap();
-            let error = match Scheduler::start(&ok_config(dir, PathBuf::from("/bin/true"))) {
+            // The binary only has to exist: startup refuses before running it.
+            let error = match Scheduler::start(&ok_config(dir, existing_bin())) {
                 Ok(_) => panic!("{name} snapshot unexpectedly accepted"),
                 Err(error) => error,
             };
@@ -1481,6 +1505,8 @@ mod tests {
         }
     }
 
+    // Runs `/bin/true`-style POSIX programs as the job binary.
+    #[cfg(unix)]
     #[test]
     fn startup_accepts_legacy_unpadded_numeric_id() {
         let dir = tempdir("legacy-id");
@@ -1506,6 +1532,8 @@ mod tests {
         );
     }
 
+    // Runs `/bin/true`-style POSIX programs as the job binary.
+    #[cfg(unix)]
     #[test]
     fn submit_does_not_acknowledge_job_if_persistence_fails() {
         let dir = tempdir("persist-error");
@@ -1520,6 +1548,8 @@ mod tests {
         assert!(scheduler.list_jobs().unwrap().is_empty());
     }
 
+    // Runs `/bin/true`-style POSIX programs as the job binary.
+    #[cfg(unix)]
     #[test]
     fn post_replace_sync_failure_preserves_id_and_stops_submissions() {
         let dir = tempdir("dir-sync-failure");
@@ -1559,6 +1589,8 @@ mod tests {
         );
     }
 
+    // Runs `/bin/true`-style POSIX programs as the job binary.
+    #[cfg(unix)]
     #[test]
     fn persistence_keeps_unrelated_temp_name_sentinel() {
         let dir = tempdir("persist-sentinel");
@@ -1724,6 +1756,8 @@ mod tests {
         assert_eq!(next, "J-000001");
     }
 
+    // Runs `/bin/true`-style POSIX programs as the job binary.
+    #[cfg(unix)]
     #[test]
     fn retained_capacity_rejects_without_changing_acknowledged_snapshot() {
         let dir = tempdir("capacity-retained");
@@ -1766,7 +1800,7 @@ mod tests {
     #[test]
     fn startup_enforces_byte_record_and_job_caps_without_rewriting_input() {
         let dir = tempdir("capacity-recovery");
-        let config = ok_config(dir.clone(), PathBuf::from("/bin/true"));
+        let config = ok_config(dir.clone(), existing_bin());
         let path = dir.join("jobs.jsonl");
         let job = FuzzJob {
             job_id: "J-000000".into(),

@@ -253,7 +253,8 @@ fn cache_guard() -> MutexGuard<'static, HashMap<CapabilityCacheKey, CompilerCapa
     }
 }
 
-#[cfg(test)]
+/// The canaries run fake compilers that are POSIX shell scripts.
+#[cfg(all(test, unix))]
 mod tests {
     use std::path::{Path, PathBuf};
 

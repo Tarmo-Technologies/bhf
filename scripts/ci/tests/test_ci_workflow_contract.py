@@ -79,15 +79,27 @@ class WorkflowContractTests(unittest.TestCase):
         for command in commands:
             self.assertIn("--locked", command)
 
+    def windows_step(self, name: str) -> str:
+        return self.jobs["windows-build"].split(f"      - name: {name}\n", 1)[1].split("      - name:", 1)[0]
+
     def test_windows_test_failures_are_checked_immediately(self):
-        block = self.source.split("      - name: Test Windows-specific logic and daemon\n", 1)[1].split("      - name:", 1)[0]
-        lines = block.splitlines()
-        commands = 0
-        for index, line in enumerate(lines):
-            if line.strip().startswith("cargo test "):
-                commands += 1
-                self.assertEqual(lines[index + 1].strip(), "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }")
-        self.assertEqual(commands, 7)
+        lines = self.windows_step("Test the workspace libraries and the daemon").splitlines()
+        commands = [index for index, line in enumerate(lines) if line.strip().startswith("cargo test ")]
+        self.assertEqual(len(commands), 1)
+        for index in commands:
+            self.assertEqual(lines[index + 1].strip(), "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }")
+
+    def test_windows_runs_every_library_test_unfiltered(self):
+        step = self.windows_step("Test the workspace libraries and the daemon")
+        self.assertIn("cargo test --locked --workspace --lib --no-fail-fast\n", step)
+        self.assertNotIn("--skip", step)
+        self.assertNotRegex(step, r"(?m)^\s*if:")
+
+    def test_windows_clippy_fails_on_warnings(self):
+        lines = self.windows_step("Clippy").splitlines()
+        index = next(i for i, line in enumerate(lines) if line.strip().startswith("cargo clippy "))
+        self.assertEqual(lines[index].strip(), "cargo clippy --locked --workspace --all-targets -- -D warnings")
+        self.assertEqual(lines[index + 1].strip(), "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }")
 
     def test_runner_jobs_are_bounded(self):
         for name, block in self.jobs.items():

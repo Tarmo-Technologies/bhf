@@ -1989,7 +1989,7 @@ fn debugger_breakpoint(source_dirs: &[PathBuf], raw: &Value) -> Option<(String, 
 }
 
 /// Reproduce a libFuzzer-protocol C/C++ finding with default output.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn replay_c_libfuzzer(finding_dir: &Path, runner: &HarnessRunner) -> i32 {
     let detection = Detection {
         protocol: HarnessProtocol::LibFuzzerSingleInput,
@@ -2333,7 +2333,7 @@ mod tests {
             error.contains("for main, main_afl, main.exe or main_afl.exe"),
             "{error}"
         );
-        let build = work.path().join("build/H-1").display().to_string();
+        let build = work.path().join("build").join("H-1").display().to_string();
         assert_eq!(error.matches(&build).count(), 1, "{error}");
         assert!(!error.contains("results/harnesses"), "{error}");
         assert!(!error.contains("findings/harnesses"), "{error}");
@@ -2502,7 +2502,16 @@ mod tests {
         let note = super::harness_format_note_for(&harness, &detection)
             .expect("the source dir's format 1 is reported");
         assert!(note.contains("input format 1"), "{note}");
-        assert!(note.contains("harnesses/H-X1"), "{note}");
+        // The harness dir is shown as a host path.
+        assert!(
+            note.contains(
+                &std::path::Path::new("harnesses")
+                    .join("H-X1")
+                    .display()
+                    .to_string()
+            ),
+            "{note}"
+        );
 
         // Metadata beside the binary wins over the source dir's.
         std::fs::write(

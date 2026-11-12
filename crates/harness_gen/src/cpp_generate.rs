@@ -2541,10 +2541,12 @@ mod tests {
     }
 
     fn runtime_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        let runtime = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../c_runtime")
             .canonicalize()
-            .unwrap()
+            .unwrap();
+        // Without Windows' `\\?\` prefix, which MinGW's g++ cannot open.
+        PathBuf::from(crate::build_safety::make_path(&runtime))
     }
 
     fn clangxx_compile_flags(prefix: &str) -> Option<Vec<String>> {
@@ -4235,9 +4237,7 @@ mod tests {
         let result = generate_cpp_direct_harness(args).unwrap();
         let main = fs::read_to_string(&result.main_cpp).unwrap();
         assert!(main.contains("#include <stdio.h>"));
-        assert!(main.contains("fmemopen(_bhf_file_buf_stream, Size, \"r+\")"));
-        assert!(main.contains("Size ? fmemopen"));
-        assert!(main.contains(": tmpfile()"));
+        assert!(main.contains("bhf_fmemopen(_bhf_file_buf_stream, Size)"));
         assert!(main.contains("int R = parse_stream(stream);"));
         assert!(main.contains("if (stream) fclose(stream); free(_bhf_file_buf_stream);"));
 
@@ -4300,7 +4300,7 @@ mod tests {
 
         let result = generate_cpp_direct_harness(args).unwrap();
         let main = fs::read_to_string(&result.main_cpp).unwrap();
-        assert!(main.contains("fmemopen(_bhf_file_buf_stream, Size, \"r+\")"));
+        assert!(main.contains("bhf_fmemopen(_bhf_file_buf_stream, Size)"));
         assert!(main.contains("parse_stream(stream);"));
         assert!(main.contains("if (stream) fclose(stream); free(_bhf_file_buf_stream);"));
     }
@@ -5811,6 +5811,14 @@ mod tests {
     /// `-fsanitize=fuzzer` C++ program. Gates the C++ libFuzzer e2e so a box
     /// without the fuzzer runtime (or needing gcc-install-dir flags) skips it.
     fn cpp_libfuzzer_toolchain_available() -> bool {
+        // The callers build through the generated Makefile.
+        if !Command::new("make")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            return false;
+        }
         if clangxx_compile_flags("libfuzzer-probe") != Some(Vec::new()) {
             return false;
         }
@@ -5869,7 +5877,13 @@ mod tests {
 
     /// The traced source must not add a warning a `-Werror` build fails on.
     fn assert_cpp_compiles_warning_free(out: &Path) {
-        let check = Command::new("clang++")
+        let mut check = Command::new("clang++");
+        // The Microsoft C runtime deprecates standard functions (`getenv`)
+        // in favour of its own; that is no defect of the harness.
+        if cfg!(windows) {
+            check.arg("-D_CRT_SECURE_NO_WARNINGS");
+        }
+        let check = check
             .args(["-std=c++17", "-fsyntax-only", "-Wall", "-Wextra", "-Werror"])
             .arg("-I")
             .arg(runtime_dir())
@@ -5890,7 +5904,7 @@ mod tests {
     fn cpp_traced_args(out: &Path, input: &[u8]) -> Vec<serde_json::Value> {
         let path = out.join("traced-input.bin");
         fs::write(&path, input).unwrap();
-        let run = Command::new(out.join("main"))
+        let run = crate::harness_command(out.join("main"))
             .arg(&path)
             .env("BHF_TRACE_ARGS", "1")
             .output()
@@ -6389,7 +6403,10 @@ mod tests {
         input.extend(std::iter::repeat_n(0x5a, 70_000));
         let path = out.join("wide.bin");
         fs::write(&path, &input).unwrap();
-        let run = Command::new(out.join("main")).arg(&path).output().unwrap();
+        let run = crate::harness_command(out.join("main"))
+            .arg(&path)
+            .output()
+            .unwrap();
         assert!(
             run.status.success(),
             "{}",
@@ -6734,6 +6751,13 @@ mod tests {
         let dir = temp_dir("cpp-trace-shapes");
         let source = dir.join("shapes.cpp");
         fs::write(&source, tu).unwrap();
+        // The oldest standard the host's C++ library accepts: Microsoft's
+        // standard library needs C++14.
+        let oldest = if cfg!(windows) {
+            "-std=c++14"
+        } else {
+            "-std=c++11"
+        };
         let mut compiled = 0;
         for compiler in ["clang++", "g++"] {
             if !Command::new(compiler)
@@ -6743,8 +6767,15 @@ mod tests {
             {
                 continue;
             }
-            for std in ["-std=c++11", "-std=c++17"] {
-                let out = Command::new(compiler)
+            for std in [oldest, "-std=c++17"] {
+                let mut command = Command::new(compiler);
+                // The Microsoft C runtime deprecates standard functions
+                // (`getenv`) in favour of its own; that is no defect of the
+                // trace.
+                if cfg!(windows) {
+                    command.arg("-D_CRT_SECURE_NO_WARNINGS");
+                }
+                let out = command
                     .args([std, "-fsyntax-only", "-Wall", "-Wextra", "-Werror"])
                     .arg("-I")
                     .arg(runtime_dir())
@@ -6766,7 +6797,7 @@ mod tests {
                 .is_ok_and(|o| o.status.success())
         {
             let expanded = Command::new("clang++")
-                .args(["-std=c++11", "-E", "-P", "-x", "c++"])
+                .args([oldest, "-E", "-P", "-x", "c++"])
                 .arg("-I")
                 .arg(runtime_dir())
                 .arg(runtime_dir().join("bhf_trace.h"))
@@ -6940,7 +6971,7 @@ mod tests {
         let ok = out.join("ok.bin");
         fs::write(&ok, b"hi").unwrap();
         assert!(
-            Command::new(&bin)
+            crate::harness_command(&bin)
                 .arg(&ok)
                 .output()
                 .unwrap()
@@ -6950,7 +6981,7 @@ mod tests {
         );
         let crash = out.join("crash.bin");
         fs::write(&crash, b"FUZZ....").unwrap();
-        let r = Command::new(&bin).arg(&crash).output().unwrap();
+        let r = crate::harness_command(&bin).arg(&crash).output().unwrap();
         let err = String::from_utf8_lossy(&r.stderr);
         assert!(
             !r.status.success(),
@@ -7044,7 +7075,7 @@ mod tests {
         let bin = out.join("main_libfuzzer");
         let ok = out.join("ok.bin");
         fs::write(&ok, b"hi").unwrap();
-        let clean = Command::new(&bin).arg(&ok).output().unwrap();
+        let clean = crate::harness_command(&bin).arg(&ok).output().unwrap();
         assert!(
             clean.status.success(),
             "clean input must run once and exit: {}",
@@ -7052,7 +7083,7 @@ mod tests {
         );
         let crash = out.join("crash.bin");
         fs::write(&crash, b"FUZZ....").unwrap();
-        let r = Command::new(&bin).arg(&crash).output().unwrap();
+        let r = crate::harness_command(&bin).arg(&crash).output().unwrap();
         let err = String::from_utf8_lossy(&r.stderr);
         assert!(
             !r.status.success(),
@@ -7142,8 +7173,10 @@ mod tests {
         generate_cpp_direct_harness(args).expect("spaced paths are accepted");
         let makefile = fs::read_to_string(out.join("Makefile")).unwrap();
         assert!(
-            makefile.contains(&format!("-iquote \"{}\"", inc_dir.display()))
-                && makefile.contains(&format!(" \"{}\"", source.display())),
+            makefile.contains(&format!(
+                "-iquote \"{}\"",
+                crate::build_safety::make_path(&inc_dir)
+            )) && makefile.contains(&format!(" \"{}\"", crate::build_safety::make_path(&source))),
             "spaced paths must be double-quoted in the Makefile:\n{makefile}"
         );
         let build = Command::new("make")
@@ -7159,7 +7192,10 @@ mod tests {
         );
         let input = out.join("input.bin");
         fs::write(&input, b"record").unwrap();
-        let run = Command::new(out.join("main")).arg(&input).output().unwrap();
+        let run = crate::harness_command(out.join("main"))
+            .arg(&input)
+            .output()
+            .unwrap();
         assert!(
             run.status.success(),
             "{}",
@@ -7252,7 +7288,10 @@ mod tests {
         // a 12-byte buffer if the length were decoded on its own.
         let input = out.join("input.bin");
         fs::write(&input, [0x00, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
-        let run = Command::new(out.join("main")).arg(&input).output().unwrap();
+        let run = crate::harness_command(out.join("main"))
+            .arg(&input)
+            .output()
+            .unwrap();
         assert!(
             run.status.success(),
             "a correct function must not crash under its harness:\n{}",
@@ -7348,7 +7387,10 @@ mod tests {
         // Decoded on its own, the length read from these bytes is about 1 MiB.
         let input = out.join("input.bin");
         fs::write(&input, [b'A', 0, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
-        let run = Command::new(out.join("main")).arg(&input).output().unwrap();
+        let run = crate::harness_command(out.join("main"))
+            .arg(&input)
+            .output()
+            .unwrap();
         assert!(
             run.status.success(),
             "a correct function must not crash under its harness:\n{}",

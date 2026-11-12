@@ -355,6 +355,7 @@ fn fuzz_multicore_merges_worker_findings_into_the_parent_index() {
 
 /// A harness laid out the way `bhf auto` builds it: `harnesses/<id>/main`, with
 /// no `build/<id>/` at all.
+#[cfg(unix)]
 fn install_auto_layout_harness(work_dir: &Path, harness_id: &str) -> PathBuf {
     let harness = PathBuf::from(env!("CARGO_BIN_EXE_cli_fake_harness"));
     let target = work_dir.join("harnesses").join(harness_id).join("main");
@@ -601,6 +602,7 @@ fn fuzz_workers_do_not_bring_back_a_removed_finding_of_an_old_harness() {
 
 /// A finding dir (`F-0000-aaaaaaaa`) a stand-in worker copies into its
 /// results, as a worker that found a crash would leave it.
+#[cfg(unix)]
 fn write_worker_finding_template(temp: &Path, harness_id: &str) -> PathBuf {
     let finding = temp.join("template/F-0000-aaaaaaaa");
     fs::create_dir_all(&finding).unwrap();

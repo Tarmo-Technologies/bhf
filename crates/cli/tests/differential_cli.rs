@@ -2,6 +2,9 @@
 
 //! End-to-end check that `bhf differential` finds output
 //! divergences between two harness binaries.
+//!
+//! The harnesses are shell scripts, so this runs on Unix only.
+#![cfg(unix)]
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;

@@ -328,6 +328,8 @@ fn walk_all(root: &Path) -> Vec<PathBuf> {
 mod tests {
     use super::*;
 
+    // Unix only: the fixture's path dependencies are POSIX absolute paths.
+    #[cfg(unix)]
     #[test]
     fn path_dependencies_are_read_from_the_manifest() {
         let manifest = "[dependencies]\n\

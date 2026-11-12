@@ -232,17 +232,18 @@ mod tests {
 
     #[test]
     fn missing_group_reports_first_alternative_when_none_present() {
-        // Resolves `sh` on PATH, and a sibling test rewrites PATH: env is
+        // Resolves a program on PATH, and a sibling test rewrites PATH: env is
         // process-global, so both must hold the same lock or they race.
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             missing_group(&["definitely-not-a-real-tool-xyz"]),
             Some("definitely-not-a-real-tool-xyz")
         );
-        // `sh` is on every unix host used here.
-        assert_eq!(missing_group(&["sh"]), None);
+        // A program every host has on PATH.
+        let present = if cfg!(windows) { "cmd" } else { "sh" };
+        assert_eq!(missing_group(&[present]), None);
         // Any alternative present satisfies the group.
-        assert_eq!(missing_group(&["nope-xyz", "sh"]), None);
+        assert_eq!(missing_group(&["nope-xyz", present]), None);
     }
 
     #[test]

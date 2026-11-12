@@ -126,7 +126,7 @@ pub(crate) struct Relocated {
     pub(crate) warnings: Vec<String>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl Relocated {
     /// Whether the capsule ships `to` (capsule-relative), copied or written.
     pub(crate) fn ships(&self, to: &str) -> bool {
@@ -619,6 +619,7 @@ pub(crate) fn is_harness_state(rel: &Path, is_dir: bool) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     fn relocator(work: &Path, tree: &Path) -> Relocator {
         Relocator {
             mounts: vec![
@@ -645,6 +646,8 @@ mod tests {
 
     /// A path is rewritten only as a whole name: `/t/src` does not touch
     /// `/t/src2`, and the deepest mount wins.
+    // Unix only: the fixture's paths are POSIX absolute paths.
+    #[cfg(unix)]
     #[test]
     fn paths_are_rewritten_as_whole_names_deepest_mount_first() {
         let r = relocator(Path::new("/t/src/bhf_work"), Path::new("/t/src"));
@@ -747,6 +750,8 @@ mod tests {
     /// A text file that ships as is but names the work dir or the scanned
     /// tree is reported, as a rebuild elsewhere cannot reach what it names; a
     /// binary file is not read for it.
+    // Unix only: the POSIX capsule names paths with `/`.
+    #[cfg(unix)]
     #[test]
     fn a_file_shipped_as_is_naming_the_work_dir_is_reported() {
         let temp = tempfile::tempdir().unwrap();

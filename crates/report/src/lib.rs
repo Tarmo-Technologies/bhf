@@ -291,6 +291,10 @@ fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<(), ReportE
 /// human-facing CSV/Markdown reports (SARIF has its own `SRCROOT` handling).
 /// String-replace of the canonical root prefix, so `/abs/root/src/x.c` ->
 /// `src/x.c`; paths outside the root, or when no root is known, are unchanged.
+///
+/// On Windows the root is matched without the `\\?\` prefix `canonicalize`
+/// adds, and in both separator spellings: a harness built from a generated
+/// Makefile names its sources `C:/src/x.c`, a native build `C:\src\x.c`.
 fn relativize_to_source_root(path: &str, source_root: Option<&str>) -> String {
     if path.is_empty() {
         return String::new();
@@ -299,14 +303,23 @@ fn relativize_to_source_root(path: &str, source_root: Option<&str>) -> String {
         return path.to_owned();
     };
     let root = std::fs::canonicalize(root).unwrap_or_else(|_| PathBuf::from(root));
-    let mut needle = root.to_string_lossy().into_owned();
+    let root = root.to_string_lossy();
+    let mut needle = match root.strip_prefix(r"\\?\") {
+        Some(disk) if disk.as_bytes().get(1) == Some(&b':') => disk.to_owned(),
+        _ => root.into_owned(),
+    };
     if needle.is_empty() {
         return path.to_owned();
     }
     if !needle.ends_with(std::path::MAIN_SEPARATOR) {
         needle.push(std::path::MAIN_SEPARATOR);
     }
-    path.replace(&needle, "")
+    let relative = path.replace(&needle, "");
+    if needle.contains('\\') {
+        relative.replace(&needle.replace('\\', "/"), "")
+    } else {
+        relative
+    }
 }
 
 pub fn render_csv_report(document: &ReportDocument) -> String {
@@ -1550,12 +1563,13 @@ pub fn render_sarif_report(document: &ReportDocument) -> Value {
             .collect();
     // Only enable the SRCROOT relativisation when we recovered an *absolute*
     // source root: a relative root cannot produce a valid `file://` base URI.
+    // Absolute as recorded, whichever host recorded it.
     let root: Option<PathBuf> = document
         .run
         .source_root
         .as_deref()
-        .map(PathBuf::from)
-        .filter(|root| root.is_absolute());
+        .filter(|root| is_recorded_absolute(root))
+        .map(PathBuf::from);
     let mut run = json!({
         "tool": {
             "driver": {
@@ -1607,35 +1621,72 @@ fn original_uri_base_ids(root: &Path) -> Value {
 /// already-relative paths are left as-is. Never panics on a non-relativisable
 /// path.
 fn sarif_artifact_location(path: &str, root: Option<&Path>) -> Value {
-    let candidate = Path::new(path);
     match root {
-        Some(root) if candidate.is_absolute() => {
-            if let Ok(relative) = candidate.strip_prefix(root) {
-                let relative = relative.to_string_lossy().replace('\\', "/");
-                let relative = relative.trim_start_matches('/');
-                let uri = if relative.is_empty() {
-                    ".".to_owned()
-                } else {
-                    relative.to_owned()
-                };
-                json!({ "uri": uri, "uriBaseId": "SRCROOT" })
-            } else {
-                json!({ "uri": file_uri(path) })
+        Some(root) if is_recorded_absolute(path) => {
+            match relative_to_recorded_root(path, &root.to_string_lossy()) {
+                Some(relative) => json!({ "uri": relative, "uriBaseId": "SRCROOT" }),
+                None => json!({ "uri": file_uri(path) }),
             }
         }
         _ => json!({ "uri": path }),
     }
 }
 
-/// Render an absolute filesystem path as a `file://` URI. Paths that already
-/// carry a scheme (or are not absolute) are returned unchanged.
+/// Whether `path` is absolute on the host that recorded it: a POSIX `/...`
+/// path, or a Windows drive (`C:\...`, `C:/...`) or UNC (`\\server\...`)
+/// path. Read as text, so a report renders the same on any host.
+fn is_recorded_absolute(path: &str) -> bool {
+    path.starts_with('/')
+        || path.starts_with("\\\\")
+        || matches!(path.as_bytes(), [drive, b':', b'/' | b'\\', ..] if drive.is_ascii_alphabetic())
+}
+
+/// `path` relative to `root`, both as recorded, with `/` separators (`.` for
+/// the root itself); `None` when `path` is not under `root`. Windows' `\\?\`
+/// prefix and either separator spelling are accepted.
+fn relative_to_recorded_root(path: &str, root: &str) -> Option<String> {
+    let recorded = |text: &str| {
+        let text = text.strip_prefix(r"\\?\").unwrap_or(text);
+        text.replace('\\', "/")
+    };
+    let path = recorded(path);
+    let root = recorded(root);
+    let root = root.trim_end_matches('/');
+    let rest = path.strip_prefix(root)?;
+    if rest.is_empty() {
+        return Some(".".to_owned());
+    }
+    let rest = rest.strip_prefix('/')?.trim_start_matches('/');
+    Some(if rest.is_empty() {
+        ".".to_owned()
+    } else {
+        rest.to_owned()
+    })
+}
+
+/// Render an absolute filesystem path as a `file://` URI (RFC 8089):
+/// `/abs` is `file:///abs`, a Windows drive path `C:\dir` is
+/// `file:///C:/dir` and a UNC path `\\server\share` is
+/// `file://server/share`, without the `\\?\` verbatim prefix. Paths that
+/// already carry a scheme, or are not absolute, are returned unchanged.
 fn file_uri(path: &str) -> String {
     if path.contains("://") {
-        path.to_owned()
-    } else if let Some(rest) = path.strip_prefix('/') {
-        format!("file:///{rest}")
-    } else {
-        path.to_owned()
+        return path.to_owned();
+    }
+    if let Some(rest) = path.strip_prefix('/') {
+        return format!("file:///{rest}");
+    }
+    let windows = match path.strip_prefix(r"\\?\UNC\") {
+        Some(share) => format!(r"\\{share}"),
+        None => path.strip_prefix(r"\\?\").unwrap_or(path).to_owned(),
+    }
+    .replace('\\', "/");
+    if let Some(share) = windows.strip_prefix("//") {
+        return format!("file://{share}");
+    }
+    match windows.as_bytes() {
+        [drive, b':', b'/', ..] if drive.is_ascii_alphabetic() => format!("file:///{windows}"),
+        _ => path.to_owned(),
     }
 }
 
@@ -5177,19 +5228,33 @@ mod tests {
     fn relativize_to_source_root_strips_prefix_everywhere() {
         let dir = std::env::temp_dir().join(format!("bhf-relr-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let root = std::fs::canonicalize(&dir).unwrap();
-        let rs = root.to_string_lossy().into_owned();
+        // The root as a run records it: resolved, without Windows' `\\?\`.
+        let canonical = std::fs::canonicalize(&dir).unwrap();
+        let canonical = canonical.to_string_lossy();
+        let rs = canonical
+            .strip_prefix(r"\\?\")
+            .unwrap_or(&canonical)
+            .to_owned();
+        let sep = std::path::MAIN_SEPARATOR;
         // a single absolute path -> tree-relative
         assert_eq!(
-            relativize_to_source_root(&format!("{rs}/src/x.c:5"), Some(&rs)),
-            "src/x.c:5"
+            relativize_to_source_root(&format!("{rs}{sep}src{sep}x.c:5"), Some(&rs)),
+            format!("src{sep}x.c:5")
         );
         // every occurrence in a whole rendered report is relativised
-        let text = format!("- Sink: `{rs}/a.c:1`\n- Inspect {rs}/b.c as the fix\n");
+        let text = format!("- Sink: `{rs}{sep}a.c:1`\n- Inspect {rs}{sep}b.c as the fix\n");
         assert_eq!(
             relativize_to_source_root(&text, Some(&rs)),
             "- Sink: `a.c:1`\n- Inspect b.c as the fix\n"
         );
+        if cfg!(windows) {
+            // A generated Makefile's build names sources with `/`.
+            let slashed = rs.replace('\\', "/");
+            assert_eq!(
+                relativize_to_source_root(&format!("{slashed}/src/x.c:5"), Some(&rs)),
+                "src/x.c:5"
+            );
+        }
         // no known root -> unchanged
         assert_eq!(
             relativize_to_source_root(&format!("{rs}/x.c"), None),
@@ -6809,7 +6874,16 @@ mod tests {
         let base = sarif["runs"][0]["originalUriBaseIds"]["SRCROOT"]["uri"]
             .as_str()
             .unwrap();
-        assert_eq!(base, format!("file://{}/", src_root.display()));
+        // A Windows drive path is `file:///C:/...`.
+        let file_uri_of = |path: &Path| {
+            let shown = path.display().to_string();
+            if cfg!(windows) {
+                format!("file:///{}", shown.replace('\\', "/"))
+            } else {
+                format!("file://{shown}")
+            }
+        };
+        assert_eq!(base, format!("{}/", file_uri_of(&src_root)));
         assert!(base.starts_with("file:///") && base.ends_with('/'));
 
         // Primary location (top non-runtime frame) under root → relative + SRCROOT.
@@ -6826,10 +6900,72 @@ mod tests {
         assert_eq!(under["uri"], "src/cbor/internal/loaders.c");
         assert_eq!(under["uriBaseId"], "SRCROOT");
         let outside = &frames[1]["location"]["physicalLocation"]["artifactLocation"];
-        assert_eq!(outside["uri"], format!("file://{}", outside_root.display()));
+        assert_eq!(outside["uri"], file_uri_of(&outside_root));
         assert!(outside.get("uriBaseId").is_none());
 
         validate_sarif_report(&sarif).unwrap();
+    }
+
+    /// A location is made root-relative from the recorded text, so a finding
+    /// from a Windows host and one from a Unix host render the same SARIF on
+    /// either host.
+    #[test]
+    fn sarif_locations_relativise_paths_recorded_on_either_host() {
+        let srcroot = |uri: &str| json!({ "uri": uri, "uriBaseId": "SRCROOT" });
+        let windows = Path::new(r"C:\src\demo");
+        assert_eq!(
+            super::sarif_artifact_location(r"C:\src\demo\src\parse.c", Some(windows)),
+            srcroot("src/parse.c")
+        );
+        assert_eq!(
+            super::sarif_artifact_location("C:/src/demo/src/parse.c", Some(windows)),
+            srcroot("src/parse.c")
+        );
+        assert_eq!(
+            super::sarif_artifact_location(r"C:\src\demo2\x.c", Some(windows)),
+            json!({ "uri": "file:///C:/src/demo2/x.c" })
+        );
+        let posix = Path::new("/src/demo");
+        assert_eq!(
+            super::sarif_artifact_location("/src/demo/lib/parse.c", Some(posix)),
+            srcroot("lib/parse.c")
+        );
+        assert_eq!(
+            super::sarif_artifact_location("/src/demo2/x.c", Some(posix)),
+            json!({ "uri": "file:///src/demo2/x.c" })
+        );
+        assert_eq!(
+            super::sarif_artifact_location("lib/parse.c", Some(posix)),
+            json!({ "uri": "lib/parse.c" })
+        );
+        assert!(super::is_recorded_absolute(r"C:\src") && super::is_recorded_absolute("/src"));
+        assert!(!super::is_recorded_absolute("src/x.c") && !super::is_recorded_absolute("C:x.c"));
+    }
+
+    /// `file://` URIs follow RFC 8089 for Windows paths too: a drive path
+    /// gains a third slash, `\` becomes `/`, a UNC path names its host, and
+    /// the `\\?\` verbatim prefix is dropped.
+    #[test]
+    fn file_uris_spell_windows_paths_with_forward_slashes() {
+        assert_eq!(super::file_uri("/abs/x.c"), "file:///abs/x.c");
+        assert_eq!(
+            super::file_uri(r"C:\src\proj\x.c"),
+            "file:///C:/src/proj/x.c"
+        );
+        assert_eq!(super::file_uri("C:/src/x.c"), "file:///C:/src/x.c");
+        assert_eq!(super::file_uri(r"\\?\C:\src\x.c"), "file:///C:/src/x.c");
+        assert_eq!(
+            super::file_uri(r"\\server\share\x.c"),
+            "file://server/share/x.c"
+        );
+        assert_eq!(
+            super::file_uri(r"\\?\UNC\server\share\x.c"),
+            "file://server/share/x.c"
+        );
+        // Relative and drive-relative paths are not URIs; they pass through.
+        assert_eq!(super::file_uri("src/x.c"), "src/x.c");
+        assert_eq!(super::file_uri("C:x.c"), "C:x.c");
+        assert_eq!(super::file_uri("file:///abs/x.c"), "file:///abs/x.c");
     }
 
     /// With no recoverable `auto/run.json`, the renderer degrades gracefully:

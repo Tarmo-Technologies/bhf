@@ -264,6 +264,48 @@
   claims a seed's `sha256` always names a corpus queue entry: a seed is kept
   in the queue under that name only when it adds coverage, and a crashing seed
   becomes a finding's testcase.
+- Windows reports: SARIF `file://` URIs for Windows paths follow RFC 8089
+  (`file:///C:/...`, UNC hosts, no `\\?\` prefix) in the fuzzing and
+  static-scan reports, and the Markdown and CSV reports make paths under the
+  recorded source root relative (the root is matched without `\\?\`, in
+  both separator spellings). SARIF locations are made root-relative from the
+  recorded paths as text, so a finding recorded on a Unix host and one
+  recorded on Windows render the same SARIF on either host.
+- Windows harness builds: a harness for a `FILE *` parameter builds without
+  `fmemopen`, which Windows lacks; its input goes to a temporary file deleted
+  on close (`bhf_fmemopen` in `c_runtime/bhf_decode.h`). A compile database
+  `command` string is split with the Windows command-line rules on a Windows
+  host, as clang splits it, so `-c C:\src\x.c` keeps its backslashes.
+  Repair `#include` lines, rewritten Cargo path dependencies, CMake link
+  metadata and link-failure hints spell Windows paths without `\\?\` (and
+  with `/` where a `\` would be an escape). Cross-lane compilers and runners
+  and the dependency installer's package managers are found as `name.exe`.
+- Windows fuzzing: the fork-server handshake and each persistent run wait
+  with a timeout on Windows too (`PeekNamedPipe`), so a harness that never
+  answers the handshake, or an input that hangs it, falls back to a fresh
+  process instead of stalling the campaign.
+- A C/C++ build whose `make` cannot be started is a failed build that says so
+  (`bhf: could not run make: ...`) instead of aborting bhf.
+- Windows harness Makefiles double-quote a compile flag that needs quoting,
+  which both `sh` (w64devkit, MSYS2) and `cmd` honour. A parenthesised define
+  such as `-DBAR=(x)`, or a flag with an apostrophe, was written bare and
+  failed the build under `sh`, and the single quotes put around a flag with a
+  shell operator (`-DFOO=a|b`) do not quote under `cmd`, which ran the
+  operator. On Windows such a flag that also holds `%`, `"` or a backtick is
+  now refused, since one of the two shells acts on it even inside double
+  quotes.
+- `bhf corpus export --to afl` writes `id_000000,sig_...` on Windows, where a
+  file name cannot hold `:`; import, merge and the export's numbering read
+  both spellings on every host.
+- An extension manifest's `executable` that is rooted (`\bin\x`) or
+  drive-relative (`C:x`) needs `allow-external-paths` on Windows, like an
+  absolute one.
+- Commands that migrate the same legacy work dir at once take turns under
+  `results/.lock`, so exactly one reports the migration. Windows renames a
+  directory by handle, so the rename alone did not settle the race there.
+- A Windows checkout gets LF line endings (`.gitattributes`), so a Windows
+  build embeds the same templates, runtime sources and scripts as a Linux
+  build.
 - A C or C++ capsule's `build.sh` picks the sanitizer flags of the compiler that
   runs it (gcc has no `function` UBSan check and links its runtimes
   statically), as the harness Makefile does, and a capsule of a harness bhf
@@ -763,6 +805,9 @@
   (the finding ID suffix) of a fatal signal the driver printed a pc for hashes
   that pc. A work dir from an earlier release may record such a crash once
   more; start from a fresh work dir to compare groups.
+- The Windows CI job runs every crate's unit tests, and clippy with warnings as
+  errors, instead of filtered subsets. Tests that only hold on Unix (POSIX
+  shell-script fakes, `/bin/true`, Unix sockets, bubblewrap) are cfg-gated.
 - A target refused because a source path, include dir or compile flag holds a
   character no quoting makes safe in a build recipe now has its own outcome,
   `unsafe_build_path`, in `run.json` (and `summary.unsafe_build_path`, the

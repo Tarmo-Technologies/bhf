@@ -625,10 +625,18 @@ mod tests {
     #[test]
     fn relative_paths_resolve_against_the_config_files_directory() {
         let tree = tempfile::tempdir().unwrap();
+        // An absolute path carries a drive on Windows.
+        let absolute = if cfg!(windows) {
+            r"C:\abs\inc"
+        } else {
+            "/abs/inc"
+        };
         std::fs::write(
             tree.path().join(CONFIG_FILE_NAME),
-            "extra-include = [\"include\", \"/abs/inc\"]\ngrammar = \"fmt.json\"\n\
-             seed-dir = [\"seeds\"]\nextra-source = [\"lib/aux.c\"]\n",
+            format!(
+                "extra-include = [\"include\", '{absolute}']\ngrammar = \"fmt.json\"\n\
+                 seed-dir = [\"seeds\"]\nextra-source = [\"lib/aux.c\"]\n"
+            ),
         )
         .unwrap();
         let elsewhere = tempfile::tempdir().unwrap();
@@ -638,7 +646,7 @@ mod tests {
         let base = crate::toolchain::config_base_dir(&tree.path().join(CONFIG_FILE_NAME));
         assert_eq!(
             args.extra_includes,
-            [base.join("include"), PathBuf::from("/abs/inc")]
+            [base.join("include"), PathBuf::from(absolute)]
         );
         assert_eq!(args.grammar_file, Some(base.join("fmt.json")));
         assert_eq!(args.seed_dirs, [base.join("seeds")]);

@@ -122,6 +122,12 @@ AFLPP_CXXFLAGS ?= -O1 -g -std=$(CXX_STD) -Wno-reserved-user-defined-literal -fsa
 # clang++ only — gcc has no libFuzzer. The shim is C, so it is compiled `-x c`.
 LIBFUZZER_CXX ?= clang++
 LIBFUZZER_CXXFLAGS ?= -O1 -g -std=$(CXX_STD) -Wno-reserved-user-defined-literal -fno-omit-frame-pointer -fsanitize=fuzzer,address,undefined -fno-sanitize=function,vptr,alignment
+# Microsoft's STL tags each object with its AddressSanitizer container
+# annotations (`/failifmismatch:annotate_string`), and clang's libFuzzer runtime
+# is built without them, so the libFuzzer build turns them off on Windows.
+ifeq ($(OS),Windows_NT)
+LIBFUZZER_CXXFLAGS += -D_DISABLE_STRING_ANNOTATION -D_DISABLE_VECTOR_ANNOTATION
+endif
 # Source-based coverage build used by auto's corpus replay and expert-harness
 # oracle. Keep sanitizers/edge callbacks out so llvm-cov measures one coherent
 # profile and the coverage binary links against ordinary project archives.

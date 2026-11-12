@@ -6,6 +6,9 @@
 #include <stddef.h>
 #include <string.h>
 #include <stdlib.h>
+#if defined(_WIN32)
+#include <stdio.h>
+#endif
 
 #if !defined(__cplusplus) && (!defined(__STDC_VERSION__) || __STDC_VERSION__ < 199901L)
 #ifndef inline
@@ -274,6 +277,30 @@ static inline wchar_t *bhf_wc_string(bhf_cursor *c, size_t max) {
     c->pos += nbytes;
     return out;
 }
+
+/* A readable FILE* over the `size` bytes at `buf` (a FILE* parameter's
+ * stream), or a fresh empty stream when `size` is 0; NULL on failure. POSIX
+ * has fmemopen. The Windows C runtime does not, so there the bytes go to a
+ * temporary file that is deleted when the stream is closed, rewound to its
+ * start. A macro, so a translation unit that never opens a stream does not
+ * need fmemopen declared (a -std=c89 build does not declare it). */
+#if defined(_WIN32)
+static inline FILE *bhf_win_fmemopen(const unsigned char *buf, size_t size) {
+    FILE *stream = NULL;
+    char *name = _tempnam(NULL, "bhf_in");
+    if (name && fopen_s(&stream, name, "w+bTD") != 0) stream = NULL;
+    free(name);
+    if (stream && size && fwrite(buf, 1, size, stream) != size) {
+        fclose(stream);
+        return NULL;
+    }
+    if (stream) rewind(stream);
+    return stream;
+}
+#define bhf_fmemopen(buf, size) bhf_win_fmemopen((buf), (size))
+#else
+#define bhf_fmemopen(buf, size) ((size) ? fmemopen((buf), (size), "r+") : tmpfile())
+#endif
 
 /* Write `size` bytes of `data` to a fresh temp file and return its path (stored
  * in caller-owned `path_buf`, which MUST be at least `bhf_tempfile_path_len`

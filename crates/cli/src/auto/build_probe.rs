@@ -2710,9 +2710,8 @@ fn is_library_file_token(token: &str) -> bool {
 }
 
 fn libraries_from_cmake_link_text(text: &str, cwd: &Path, archive: &Path) -> Vec<PathBuf> {
-    let archive = archive
-        .canonicalize()
-        .unwrap_or_else(|_| archive.to_path_buf());
+    // Resolved without Windows' `\\?\` prefix: these paths go on link lines.
+    let archive = crate::workdir::plain_canonical(archive);
     let resolve = |token: &str| {
         let token = token.trim_matches(['\'', '"']);
         let path = PathBuf::from(token);
@@ -2721,7 +2720,7 @@ fn libraries_from_cmake_link_text(text: &str, cwd: &Path, archive: &Path) -> Vec
         } else {
             cwd.join(path)
         };
-        path.canonicalize().unwrap_or(path)
+        crate::workdir::plain_canonical(&path)
     };
     let mut lines_with_archive = Vec::new();
     for line in text.lines() {
@@ -4068,12 +4067,11 @@ mod tests {
         let source = cmake_source_with_local_dependencies(&project, &probe);
         assert_ne!(source, project);
         let wrapper = fs::read_to_string(source.join("CMakeLists.txt")).unwrap();
+        // CMake reads `\` as an escape, so the wrapper spells paths with `/`.
+        let cmake_path = |path: &Path| path.display().to_string().replace('\\', "/");
         assert!(wrapper.contains("add_subdirectory"), "{wrapper}");
-        assert!(wrapper.contains(&abseil.display().to_string()), "{wrapper}");
-        assert!(
-            wrapper.contains(&project.display().to_string()),
-            "{wrapper}"
-        );
+        assert!(wrapper.contains(&cmake_path(&abseil)), "{wrapper}");
+        assert!(wrapper.contains(&cmake_path(&project)), "{wrapper}");
         assert!(wrapper.contains("re2::re2"), "{wrapper}");
         assert!(wrapper.contains("set(RE2_INSTALL OFF"), "{wrapper}");
         assert!(source.join("bhf-re2-link-probe.cc").is_file());
@@ -4146,8 +4144,14 @@ mod tests {
                 "{flag}"
             );
             let symbols = Command::new("nm").arg(object).output().unwrap();
+            // COFF spells a weak definition `.weak.<name>.`, ELF marks it `W`.
+            let weak_definition = if cfg!(windows) {
+                "T .weak.__sanitizer_cov_trace_pc."
+            } else {
+                "W __sanitizer_cov_trace_pc"
+            };
             assert!(
-                String::from_utf8_lossy(&symbols.stdout).contains("W __sanitizer_cov_trace_pc"),
+                String::from_utf8_lossy(&symbols.stdout).contains(weak_definition),
                 "{flag}"
             );
         }
@@ -4584,10 +4588,18 @@ mod tests {
             zlib.display(),
             crypto.display()
         );
+        // Resolved (symlinks and Windows short names expanded) and free of
+        // Windows' `\\?\` prefix, ready for a link line.
         assert_eq!(
             libraries_from_cmake_link_text(&link, &cwd, &archive),
-            vec![zlib, crypto]
+            vec![
+                crate::workdir::plain_canonical(&zlib),
+                crate::workdir::plain_canonical(&crypto)
+            ]
         );
+        assert!(!libraries_from_cmake_link_text(&link, &cwd, &archive)
+            .iter()
+            .any(|path| path.to_string_lossy().starts_with(r"\\?\")));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -4634,6 +4646,9 @@ mod tests {
         let _ = fs::remove_dir_all(wrapper);
     }
 
+    // The probe reuses `lib*.a` archives; an MSVC-ABI CMake build on Windows
+    // writes `.lib` files, which the probe does not reuse.
+    #[cfg(not(windows))]
     #[test]
     fn cmake_probe_builds_and_indexes_an_instrumented_static_library() {
         if !find_on_path("cmake") || !find_on_path("clang") || !find_on_path("clang++") {

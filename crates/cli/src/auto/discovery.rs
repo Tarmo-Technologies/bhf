@@ -5660,10 +5660,12 @@ mod tests {
         .unwrap();
         fs::write(
             root.join("compile_commands.json"),
-            format!(
-                r#"[{{"directory":"{}","file":"heavy.c","arguments":["clang","-DHAVE_AVX2=1","-DNDEBUG=1","-c","heavy.c"]}}]"#,
-                root.display()
-            ),
+            serde_json::json!([{
+                "directory": root,
+                "file": "heavy.c",
+                "arguments": ["clang", "-DHAVE_AVX2=1", "-DNDEBUG=1", "-c", "heavy.c"],
+            }])
+            .to_string(),
         )
         .unwrap();
         let cands = discover(&root).unwrap();

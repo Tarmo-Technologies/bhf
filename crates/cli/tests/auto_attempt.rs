@@ -2073,7 +2073,7 @@ fn attempt_builds_and_fuzzes_c_miniz_file_macro_pointer() {
     }
     let main = fs::read_to_string(result.harness_dir.join("main.c")).unwrap();
     assert!(main.contains("MZ_FILE * pFile = (MZ_FILE *)(_bhf_file_buf_pFile ?"));
-    assert!(main.contains("fmemopen(_bhf_file_buf_pFile, Size, \"r+\")"));
+    assert!(main.contains("bhf_fmemopen(_bhf_file_buf_pFile, Size)"));
     assert!(main.contains("parse_cfile(pFile)"));
     assert!(main.contains("if (pFile) fclose(pFile);"));
     assert!(main.contains("free(_bhf_file_buf_pFile);"));
@@ -2968,7 +2968,7 @@ fn attempt_builds_and_fuzzes_cpp_file_pointer_target() {
     let main = fs::read_to_string(result.harness_dir.join("main.cpp")).unwrap();
     assert!(main.contains("#include <stdio.h>"));
     assert!(main.contains("FILE * stream = _bhf_file_buf_stream ?"));
-    assert!(main.contains("fmemopen(_bhf_file_buf_stream, Size, \"r+\")"));
+    assert!(main.contains("bhf_fmemopen(_bhf_file_buf_stream, Size)"));
     assert!(main.contains("int R = parse_stream(stream);"));
     assert!(main.contains("if (stream) fclose(stream);"));
     assert!(main.contains("free(_bhf_file_buf_stream);"));
@@ -3481,6 +3481,8 @@ fn static_cpp_direct_targets_build_through_included_source() {
     );
 }
 
+// On a Windows host a `_WIN32` target is native, not foreign.
+#[cfg(not(windows))]
 #[test]
 fn foreign_platform_guarded_target_builds_via_cross_or_platform_stub() {
     // A Windows (`_WIN32`) OS-platform-guarded target is NO LONGER pre-skipped.
@@ -3894,6 +3896,10 @@ fn attempt_synthesises_corba_stub_for_missing_idl_header_but_empty_for_internal(
 #[test]
 fn attempt_skips_cpp_method_of_class_defined_only_in_translation_unit() {
     use cli::auto::{attempt::*, candidate::*, decl_index::DeclarationIndex};
+    if which::which("make").is_err() {
+        eprintln!("skipping: make not on PATH");
+        return;
+    }
 
     let root = tmpdir();
     fs::write(

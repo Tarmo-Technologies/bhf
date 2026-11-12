@@ -82,10 +82,13 @@ fn a_visual_studio_solution_is_imported_by_default() {
     let work = temp.path().join("work");
     let (output, run) = run_auto(&source, &work, &[]);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    // The solution is named with the host's separator (`vs\Widget.sln` on Windows).
+    let solution = Path::new("vs").join("Widget.sln");
     assert!(
-        stderr.contains(
-            "read 2 ClCompile entries from vs/Widget.sln (config Debug|x64, static evaluation)"
-        ),
+        stderr.contains(&format!(
+            "read 2 ClCompile entries from {} (config Debug|x64, static evaluation)",
+            solution.display()
+        )),
         "the import names the solution and configuration it read:\n{stderr}"
     );
     assert!(

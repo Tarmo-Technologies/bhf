@@ -7105,7 +7105,8 @@ mod tests {
             files_with_targets: 2,
             per_language: vec![("C", 191, 12)],
         };
-        let out = summary.render();
+        // Paths are joined with the host separator; compare them with `/`.
+        let out = summary.render().replace('\\', "/");
         assert!(out.contains("Duration:     2m 14s"), "{out}");
         // #405: campaign throughput = executions ÷ measured fuzz wall.
         assert!(out.contains("Throughput:   1000 exec/s"), "{out}");

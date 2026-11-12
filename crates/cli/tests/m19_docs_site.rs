@@ -4,6 +4,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// The Python interpreter: Windows' installer provides `python`, not `python3`.
+const PYTHON: &str = if cfg!(windows) { "python" } else { "python3" };
+
 #[test]
 fn docs_site_workflow_builds_and_deploys_github_pages() {
     let workflow = read(repo_root().join(".github/workflows/docs-site.yml"));
@@ -89,7 +92,7 @@ fn docs_site_generator_emits_html_pages_and_metadata() {
         });
     }
 
-    let status = Command::new("python3")
+    let status = Command::new(PYTHON)
         .arg("scripts/docs/build-site.py")
         .arg("--out")
         .arg(&output_dir)

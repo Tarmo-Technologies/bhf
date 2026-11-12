@@ -1397,10 +1397,7 @@ pub fn apply_repair_with_source(
                 std::fs::create_dir_all(parent)?;
             }
             let source_path = source_path.canonicalize()?;
-            let escaped = source_path
-                .to_string_lossy()
-                .replace('\\', "\\\\")
-                .replace('"', "\\\"");
+            let escaped = include_spelling(&source_path);
             std::fs::write(
                 &p,
                 format!(
@@ -1440,10 +1437,7 @@ pub fn apply_repair_with_source(
             })
         }
         Repair::IncludeTypeHeader { type_name, header } => {
-            let escaped = header
-                .to_string_lossy()
-                .replace('\\', "\\\\")
-                .replace('"', "\\\"");
+            let escaped = include_spelling(header);
             insert_type_header_before_consumer(
                 &cpp_includes_path,
                 &format!("#include \"{escaped}\"\n"),
@@ -1464,10 +1458,7 @@ pub fn apply_repair_with_source(
             if let Some(header) = target_source.and_then(|source| {
                 decl_index.lookup_c_type_definition_header_near_includes(type_name, source)
             }) {
-                let escaped = header
-                    .to_string_lossy()
-                    .replace('\\', "\\\\")
-                    .replace('"', "\\\"");
+                let escaped = include_spelling(&header);
                 prepend_or_create(&cpp_includes_path, &format!("#include \"{escaped}\"\n"))?;
                 return Ok(ApplyOutcome {
                     extra_sources: vec![],
@@ -1749,10 +1740,7 @@ pub fn apply_repair_with_source(
                 }
                 let mut body = String::new();
                 if let Some(header) = owning_header {
-                    let header = header
-                        .to_string_lossy()
-                        .replace('\\', "\\\\")
-                        .replace('"', "\\\"");
+                    let header = include_spelling(header);
                     body.push_str(&format!("#include \"{header}\"\n"));
                 }
                 body.push_str(&synthesized.ok_or_else(|| unsupported(symbol))?);
@@ -1775,10 +1763,7 @@ pub fn apply_repair_with_source(
                 // C++ definitions in auto_stubs.c (compiled as C) never compile.
                 let mut body = String::new();
                 if let Some(header) = decl_index.lookup_cpp_stub_header(symbol) {
-                    let header = header
-                        .to_string_lossy()
-                        .replace('\\', "\\\\")
-                        .replace('"', "\\\"");
+                    let header = include_spelling(header);
                     body.push_str(&format!("#include \"{header}\"\n"));
                 }
                 body.push_str(&c_stub_gen::synth_c_stub(&decl).ok_or_else(|| unsupported(symbol))?);
@@ -1797,10 +1782,7 @@ pub fn apply_repair_with_source(
                 // known and no in-tree definition exists.)
                 let mut body = String::new();
                 if let Some(header) = decl_index.lookup_cpp_stub_header(symbol) {
-                    let header = header
-                        .to_string_lossy()
-                        .replace('\\', "\\\\")
-                        .replace('"', "\\\"");
+                    let header = include_spelling(header);
                     body.push_str(&format!("#include \"{header}\"\n"));
                 }
                 body.push_str(&format!("{qualified_class}::~{simple_class}() {{}}\n"));
@@ -1864,10 +1846,7 @@ pub fn apply_repair_with_source(
                         })
                     });
                 if let Some((header, header_type)) = header_backed {
-                    let header = header
-                        .to_string_lossy()
-                        .replace('\\', "\\\\")
-                        .replace('"', "\\\"");
+                    let header = include_spelling(&header);
                     format!(
                         "#include \"{header}\"\n{}",
                         synth_header_backed_weak_c_data_stub(symbol, &header_type)
@@ -2245,7 +2224,7 @@ fn insert_type_header_before_consumer(
         .map(|header| target_source_include_prologue(target_source, header))
         .unwrap_or_default()
     {
-        let line = format!("#include \"{}\"\n", prerequisite.to_string_lossy());
+        let line = format!("#include \"{}\"\n", include_spelling(&prerequisite));
         if !lines.iter().any(|existing| existing.trim() == line.trim()) {
             lines.push(line);
         }
@@ -2379,6 +2358,20 @@ fn header_defined_macro_names(source: &str) -> Vec<String> {
         }
     }
     names
+}
+
+/// `path` spelled for a `#include "..."` line. On Windows it is spelled with
+/// `/` and without the `\\?\` prefix, which every Windows compiler accepts,
+/// so a header has one spelling however it was found and one include line can
+/// be matched against another. Elsewhere a `\` or `"` in the path is escaped.
+fn include_spelling(path: &Path) -> String {
+    if cfg!(windows) {
+        harness_gen::build_safety::make_path(path)
+    } else {
+        path.to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+    }
 }
 
 fn absolute_quoted_include_path(line: &str) -> Option<String> {
@@ -3679,6 +3672,16 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    /// How an include line names `path`: with `/` on Windows.
+    fn spelled(path: &Path) -> String {
+        let shown = path.display().to_string();
+        if cfg!(windows) {
+            shown.replace('\\', "/")
+        } else {
+            shown
+        }
+    }
+
     fn tmpdir() -> std::path::PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -4177,7 +4180,7 @@ mod tests {
         .unwrap();
 
         let stubs = fs::read_to_string(repairs.join(AUTO_STUBS_FILE)).unwrap();
-        assert!(stubs.contains(&format!("#include \"{}\"", header.display())));
+        assert!(stubs.contains(&format!("#include \"{}\"", spelled(&header))));
         assert!(stubs.contains("skill_t gameskill = {0};"), "got: {stubs}");
         assert!(!stubs.contains("enum skill_t"), "got: {stubs}");
     }
@@ -4247,7 +4250,7 @@ mod tests {
         .unwrap();
 
         let stubs = fs::read_to_string(repairs.join(AUTO_STUBS_FILE)).unwrap();
-        assert!(stubs.contains(&format!("#include \"{}\"", type_header.display())));
+        assert!(stubs.contains(&format!("#include \"{}\"", spelled(&type_header))));
         assert!(stubs.contains("skill_t gameskill = {0};"), "got: {stubs}");
     }
 
@@ -4291,7 +4294,7 @@ mod tests {
 
         let stubs = fs::read_to_string(repairs.join(AUTO_STUBS_FILE)).unwrap();
         assert!(
-            stubs.contains(&root.join("hexen/h2def.h").display().to_string()),
+            stubs.contains(&spelled(&root.join("hexen/h2def.h"))),
             "got: {stubs}"
         );
         assert!(
@@ -4334,7 +4337,7 @@ mod tests {
 
         let forced = fs::read_to_string(repairs.join(AUTO_CPP_INCLUDES_FILE)).unwrap();
         assert!(
-            forced.contains(&root.join("hexen/r_local.h").display().to_string()),
+            forced.contains(&spelled(&root.join("hexen/r_local.h"))),
             "got: {forced}"
         );
         let types = fs::read_to_string(repairs.join(AUTO_TYPES_FILE)).unwrap_or_default();
@@ -5438,7 +5441,7 @@ mod tests {
         apply_repair(&repair, &repairs, &idx).unwrap();
         let forwarded =
             fs::read_to_string(repairs.join(AUTO_INCLUDES_DIR).join("yajl/yajl_common.h")).unwrap();
-        assert!(forwarded.contains(&real.canonicalize().unwrap().display().to_string()));
+        assert!(forwarded.contains(&spelled(&crate::workdir::plain_canonical(&real))));
         assert!(!forwarded.contains("placeholder"), "got: {forwarded}");
     }
 
@@ -5713,9 +5716,9 @@ mod tests {
 
         let forced = fs::read_to_string(repairs.join(AUTO_CPP_INCLUDES_FILE)).unwrap();
         let internal_pos = forced
-            .find(internal.to_str().unwrap())
+            .find(&spelled(&internal))
             .unwrap_or_else(|| panic!("prerequisite header missing from:\n{forced}"));
-        let xmltok_pos = forced.find(xmltok.to_str().unwrap()).unwrap();
+        let xmltok_pos = forced.find(&spelled(&xmltok)).unwrap();
         assert!(
             internal_pos < xmltok_pos,
             "the macro prologue must precede its consumer:\n{forced}"
@@ -5765,9 +5768,9 @@ mod tests {
         }
 
         let forced = fs::read_to_string(repairs.join(AUTO_CPP_INCLUDES_FILE)).unwrap();
-        let public_pos = forced.find(public.to_str().unwrap()).unwrap();
-        let threads_pos = forced.find(threads.to_str().unwrap()).unwrap();
-        let private_pos = forced.find(private.to_str().unwrap()).unwrap();
+        let public_pos = forced.find(&spelled(&public)).unwrap();
+        let threads_pos = forced.find(&spelled(&threads)).unwrap();
+        let private_pos = forced.find(&spelled(&private)).unwrap();
         assert!(
             public_pos < threads_pos && threads_pos < private_pos,
             "{forced}"
@@ -5799,7 +5802,7 @@ mod tests {
         .unwrap();
 
         let forced = fs::read_to_string(repairs.join(AUTO_CPP_INCLUDES_FILE)).unwrap();
-        let type_pos = forced.find(types.to_str().unwrap()).unwrap();
+        let type_pos = forced.find(&spelled(&types)).unwrap();
         let declaration_pos = forced.find("extern boolean parse").unwrap();
         assert!(type_pos < declaration_pos, "{forced}");
     }
@@ -5839,8 +5842,8 @@ mod tests {
         }
 
         let forced = fs::read_to_string(repairs.join(AUTO_CPP_INCLUDES_FILE)).unwrap();
-        let public_pos = forced.find(public.to_str().unwrap()).unwrap();
-        let table_pos = forced.find(table.to_str().unwrap()).unwrap();
+        let public_pos = forced.find(&spelled(&public)).unwrap();
+        let table_pos = forced.find(&spelled(&table)).unwrap();
         assert!(public_pos < table_pos, "{forced}");
     }
 
@@ -6103,10 +6106,7 @@ mod tests {
 
         apply_repair(&repair, &repairs, &idx).unwrap();
         let stub = fs::read_to_string(repairs.join(AUTO_STUBS_CPP_FILE)).unwrap();
-        assert!(
-            stub.contains(&root.join("status.hh").display().to_string()),
-            "{stub}"
-        );
+        assert!(stub.contains(&spelled(&root.join("status.hh"))), "{stub}");
         assert!(stub.contains("leveldb::Status::Status("), "{stub}");
         assert!(!stub.contains("void leveldb::Status::Status"), "{stub}");
     }
@@ -6333,7 +6333,7 @@ mod tests {
 
         let stubs = fs::read_to_string(repairs.join(AUTO_STUBS_FILE)).unwrap();
         assert!(
-            stubs.contains(&format!("#include \"{}\"", header.display())),
+            stubs.contains(&format!("#include \"{}\"", spelled(&header))),
             "stub translation unit must use the declaration's real typedefs: {stubs}"
         );
         assert!(

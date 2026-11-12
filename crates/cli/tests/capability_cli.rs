@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
+// Linux only: the profile comes from the LD_PRELOAD runtrace shim.
+#![cfg(target_os = "linux")]
 //! End-to-end coverage for fuzz-driven capability profiling. A parser that execs a
 //! command and opens an input-derived path ONLY once the input carries a magic gate
 //! must, after fuzzing, produce a BHF-668 "input-triggered capability" finding for

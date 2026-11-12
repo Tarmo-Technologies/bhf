@@ -1493,7 +1493,7 @@ fn open_regular_nofollow(path: &Path) -> Result<fs::File, GovernanceError> {
     Ok(file)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn sha256_file_streamed(path: &Path) -> Result<String, GovernanceError> {
     let mut file = open_regular_nofollow(path)?;
     let mut hasher = Sha256::new();
