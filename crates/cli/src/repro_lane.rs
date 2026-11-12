@@ -631,17 +631,26 @@ pub(crate) fn alternative(
             sh_word(&binary.to_string_lossy())
         ));
     }
-    Some(direct_harness_command(&binary, &input))
+    Some(direct_harness_command(
+        &binary,
+        &input,
+        crate::replay::is_leak_finding(&finding.raw),
+    ))
 }
 
-/// The built harness run on one input with the sanitizer options a reader
-/// wants: UBSan stack traces, an abort on the first report.
-pub(crate) fn direct_harness_command(binary: &Path, input: &Path) -> String {
-    format!(
-        "ASAN_OPTIONS=abort_on_error=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 {} {}",
-        sh_word(&binary.to_string_lossy()),
-        sh_word(&input.to_string_lossy())
-    )
+/// The built harness run on one input with the sanitizer options `bhf replay`
+/// gives it ([`crate::fuzz::sanitizer_child_env`]): the first report halts the
+/// run, UBSan prints its stack and check name, and a leak finding (`leak`)
+/// keeps leak detection on. Your own `ASAN_OPTIONS`/`UBSAN_OPTIONS` are merged
+/// first, as replay merges them, so the command reproduces like a replay.
+pub(crate) fn direct_harness_command(binary: &Path, input: &Path, leak: bool) -> String {
+    let mut words: Vec<String> = crate::fuzz::sanitizer_child_env(leak)
+        .into_iter()
+        .map(|(key, value)| format!("{key}={}", sh_word(&value)))
+        .collect();
+    words.push(sh_word(&binary.to_string_lossy()));
+    words.push(sh_word(&input.to_string_lossy()));
+    words.join(" ")
 }
 
 // ── harness lookup and language ─────────────────────────────────────────────
@@ -3546,6 +3555,51 @@ mod tests {
             0
         );
         assert!(select(&empty.path().join("missing"), None, Tool::Capsule).is_err());
+    }
+
+    /// The direct harness run a refusal suggests uses the sanitizer options a
+    /// replay of the finding uses: the fuzz child's ASan and UBSan settings,
+    /// with leak detection for a leak finding.
+    #[test]
+    fn the_direct_harness_command_takes_the_replay_sanitizer_options() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path();
+        let binary = work.join("harnesses/H-X0001/main");
+        write(&binary, "\x7fELF");
+        let fdir = work.join("results/findings/F-1");
+        let input = fdir.join("testcase.bin");
+        write(&input, "x");
+        let refusal = Refusal::IncompleteHarness {
+            harness_id: "H-X0001".to_owned(),
+            language: "cpp".to_owned(),
+            harness_dir: work.join("harnesses/H-X0001"),
+            problem: "it has no main.cpp".to_owned(),
+        };
+        let crash = json!({"id": "F-1", "classification": "unhandled",
+                           "harness_id": "H-X0001", "rule_id": "BHF-201"});
+        let leak = json!({"id": "F-1", "classification": "unhandled",
+                          "harness_id": "H-X0001", "rule_id": "BHF-208",
+                          "exception": {"sanitizer": "lsan", "name": "memory_leak"}});
+        for (raw, leaks) in [(crash, false), (leak, true)] {
+            let command = alternative(work, &finding(&fdir, raw), &refusal)
+                .expect("a built harness has a direct command");
+            let options: Vec<String> = crate::fuzz::sanitizer_child_env(leaks)
+                .into_iter()
+                .map(|(key, value)| format!("{key}={}", sh_word(&value)))
+                .collect();
+            assert_eq!(
+                command,
+                format!(
+                    "{} {} {}",
+                    options.join(" "),
+                    sh_word(&binary.to_string_lossy()),
+                    sh_word(&input.to_string_lossy())
+                )
+            );
+            assert!(command.contains(":halt_on_error=1"), "{command}");
+            assert!(command.contains("report_error_type=1"), "{command}");
+            assert_eq!(command.contains("detect_leaks=1"), leaks, "{command}");
+        }
     }
 
     /// A harness Makefile in bhf's shape whose driver includes a header

@@ -5316,8 +5316,9 @@ fn apply_fuzz_child_env_overrides(extra_env: &mut Vec<(String, String)>) {
 
 /// The `ASAN_OPTIONS` and `UBSAN_OPTIONS` of a builtin fuzz child (see
 /// [`apply_fuzz_child_env_overrides`]), for every child that must reproduce a
-/// crash the way the fuzz loop saw it: `bhf replay`, minimization and
-/// `bhf report --backfill`. The operator's inherited values are merged first
+/// crash the way the fuzz loop saw it: `bhf replay`, minimization,
+/// `bhf report --backfill`, and the direct harness command `bhf explain` and
+/// the capsule refusals print. The operator's inherited values are merged first
 /// and bhf's keys win. `leak` adds `detect_leaks=1`, the key the
 /// `--sanitizers` lanes require, so a leak finding replays with leak detection
 /// on whatever the operator's `ASAN_OPTIONS` says; leak detection is never

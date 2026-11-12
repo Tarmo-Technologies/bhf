@@ -398,6 +398,13 @@
   only for findings capsule can package. For any other it says why and prints
   `python3 <finding>/replay.py` or the harness command; for an AddressSanitizer
   crash cartography can map it adds `bhf cartography`.
+- The harness command that `bhf explain` and the capsule refusals print runs
+  the built harness with the sanitizer options `bhf replay` uses, from the same
+  builder: `ASAN_OPTIONS` `abort_on_error=1:halt_on_error=1` (plus
+  `detect_leaks=1` for a leak finding) and `UBSAN_OPTIONS` also
+  `print_stacktrace=1:report_error_type=1`, merged after your own values. It
+  printed fixed options without `halt_on_error`, the UBSan check name or leak
+  detection, so it did not reproduce the way a replay does.
 - `bhf replay` reported `MATCH` whenever the rule matched, so a crash of the
   same class at another site, or in another harness, was confirmed and stamped
   into `finding.json` as a reproduction. A C/C++ replay now matches on rule,

@@ -1751,10 +1751,16 @@ mod tests {
         let out = explain_one(work.path(), &finding, &[], false);
         let reproduce = out.split("REPRODUCE OFFLINE").nth(1).unwrap();
         assert!(!reproduce.contains("bhf capsule --work-dir"), "{reproduce}");
+        // The direct run takes the sanitizer options a replay uses.
+        let direct = crate::repro_lane::direct_harness_command(
+            &harness.join("main"),
+            &finding_dir.join("testcase.bin"),
+            false,
+        );
+        assert!(reproduce.contains(&direct), "{reproduce}");
         assert!(
-            reproduce.contains("UBSAN_OPTIONS=print_stacktrace=1")
-                && reproduce.contains(&harness.join("main").display().to_string()),
-            "{reproduce}"
+            direct.contains(":halt_on_error=1") && direct.contains("report_error_type=1"),
+            "{direct}"
         );
 
         // A Windows build recorded where its sanitizer runtime lives: the

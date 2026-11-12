@@ -710,7 +710,9 @@ ones; `cartography` C and C++ (it maps AddressSanitizer reports). A finding a
 command does not take (an oracle hit, a missing harness or input, a harness its
 lane cannot rebuild offline) is refused with its own reason and, when there is
 one, a command that does reproduce it (`python3 <finding>/replay.py`, or the
-built harness run on the input). `bhf explain` applies the same first check:
+built harness run on the input with the sanitizer options `bhf replay` uses,
+leak detection included for a leak finding). `bhf explain` applies the same
+first check:
 it offers `bhf capsule`/`bhf verify-poc` only for findings whose lane and
 harness layout capsule takes, and `bhf cartography` for AddressSanitizer
 crashes it can map. What capsule checks while it packages (dependencies in the
