@@ -53,7 +53,9 @@ release (`fuzz.access`, `fuzz.access.parameter`, `fuzz.input_to_state`,
 `fuzz.input_to_state_input`, `fuzz.arguments`, the `runtrace` evidence role)
 are optional in the schema, so documents written
 before them still validate; bhf always writes them. A validator holding the
-older schema rejects them.
+older schema rejects them. `reproduce.build.fidelity` is optional the same
+way, but written only for a finding whose harness build used fabricated
+inputs (below).
 
 Document-level fields: `schema_version`, `generated_at`, `tool` (`{name,
 version, build}`), `source` (`{root, vcs}`), `producers[]` (the last 50
@@ -91,7 +93,8 @@ records that failed to load — a bad record never aborts the rebuild).
 | `fidelity` | `{stubs_used, forced, caveats[]}` | `forced` when the target ran forced-and-stub-heavy under `--force` |
 | `remediation` | string \| null | |
 | `patch_hints` | `[{title, guidance}]` | advisory, not a literal diff |
-| `reproduce` | `{harness_id, command, build}` \| null | `build`: `{sanitizers[], binary_sha256, build_id}`; `command` is relative to `results/` |
+| `reproduce` | `{harness_id, command, build}` \| null | `build`: `{sanitizers[], binary_sha256, build_id}`, plus `fidelity` when the harness compiled only after bhf supplied inputs the build context lacked; `command` is relative to `results/` |
+| `reproduce.build.fidelity` | `{level, context, fabricated[]}` (optional) | `level` is `reduced`; `context` is where the build context came from (`none`, `exact_tu_compile_database`, ...); each `fabricated` entry is `{kind, name, value}` with `kind` `macro`, `header` or `type`. Such a finding's `confidence.level` is `low` and `fidelity.caveats` names what was fabricated: code compiled against a placeholder macro value or header can take paths the real build never does, so the finding may be false or not reproduce against the real build |
 | `evidence` | `{dir, files[]}` \| null | each file: `{role, path, sha256, size}` — roles: `finding`, `testcase`, `testcase_minimized`, `sanitizer_log`, `decoded`, `replay_script`, `repro_ada`, `byte_control`, `runtrace` (the runtrace events of the replay that recorded the comparison evidence) |
 | `fuzz` | `{exception, classification, harness_id, dialect, oracle, access, input_to_state, arguments}` \| null | `exception`: `{name, message, sanitizer}`; see [Fuzz block](#fuzz-block) |
 | `static` | `{engine, precision, snippet, baseline_status, triage_state}` \| null | |
@@ -179,7 +182,7 @@ findings and owns the single record for the batch.
 One row per finding. Columns, from `CSV_HEADER`:
 
 ```
-id,kind,severity,confidence,confirmation,rule_id,cwe,title,file,line,function,group,occurrences,verdict,vuln_id,purl,first_seen,evidence_dir,access,access_size,region_size,region_offset,input_to_state,input_to_state_input,arguments,access_parameter
+id,kind,severity,confidence,confirmation,rule_id,cwe,title,file,line,function,group,occurrences,verdict,vuln_id,purl,first_seen,evidence_dir,access,access_size,region_size,region_offset,input_to_state,input_to_state_input,arguments,access_parameter,build_fidelity
 ```
 
 `cwe` is written `CWE-120`; multiple values are `;`-separated. The columns
@@ -188,8 +191,10 @@ columns by position keep working: `access` is the access direction,
 `access_size` its width, `region_size` and `region_offset` the object it hit,
 `input_to_state` lists the comparison evidence as
 `offset:len:cmp_kind:operand_hex`, `;`-separated, `input_to_state_input`
-names the file those offsets index, `arguments` summarises `fuzz.arguments`
-and `access_parameter` names `fuzz.access.parameter`. `arguments` is
+names the file those offsets index, `arguments` summarises `fuzz.arguments`,
+`access_parameter` names `fuzz.access.parameter`, and `build_fidelity` reads
+`reduced: macro NAME=VALUE, header NAME, ...` for a finding whose harness was
+built with fabricated inputs (empty otherwise). `arguments` is
 `name=value` per argument, `;`-separated: a buffer or string reads
 `len <N>`, followed by `hex <first 8 bytes>` when a preview was traced
 (`data=len 50718 hex 68baa77e0f010203...`), an output whose value changed

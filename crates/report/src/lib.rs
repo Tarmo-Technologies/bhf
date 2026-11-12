@@ -2573,6 +2573,52 @@ def candidate_harnesses(finding):
         yield from fixture_fallback(fixture, work)
 
 
+# Sidecar a Windows harness build writes beside the binary: the directories of
+# the sanitizer runtime DLLs it was linked against (clang_rt.asan_dynamic-*.dll),
+# one per line. A Windows loader finds a DLL only through PATH (or the binary's
+# own directory), so a sanitized harness started from a plain shell fails with
+# STATUS_DLL_NOT_FOUND unless they are put on PATH first.
+RUNTIME_PATH_FILE = "bhf-runtime-path.txt"
+
+
+def runtime_path_dirs(harness):
+    dirs = []
+    sidecar = Path(harness).parent / RUNTIME_PATH_FILE
+    try:
+        lines = sidecar.read_text().splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        line = line.strip()
+        if line and Path(line).is_dir() and line not in dirs:
+            dirs.append(line)
+    if not dirs:
+        # No sidecar (a harness built before it existed): ask clang where its
+        # runtime lives.
+        try:
+            resource = subprocess.run(
+                ["clang", "-print-resource-dir"], stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, timeout=60,
+            ).stdout.decode("utf-8", "replace").strip()
+        except (OSError, subprocess.SubprocessError):
+            resource = ""
+        candidate = Path(resource) / "lib" / "windows" if resource else None
+        if candidate is not None and candidate.is_dir():
+            dirs.append(str(candidate))
+    return dirs
+
+
+def with_runtime_path(env, harness, windows=None):
+    windows = (os.name == "nt") if windows is None else windows
+    if not windows:
+        return env
+    dirs = runtime_path_dirs(harness)
+    if dirs:
+        current = env.get("PATH", "")
+        env["PATH"] = os.pathsep.join(dirs + ([current] if current else []))
+    return env
+
+
 def resolve_harness(finding):
     tried = []
     for cand in candidate_harnesses(finding):
@@ -2595,6 +2641,7 @@ def main():
     env.setdefault("UBSAN_OPTIONS", UBSAN_OPTIONS_DEFAULT)
     for key, value in EXTRA_ENV.items():
         env.setdefault(key, value)
+    env = with_runtime_path(env, harness)
 
     # AFL persistent-mode harnesses read the testcase from stdin; libFuzzer /
     # bhf driver harnesses take it as argv[1]. Detect from the harness name,
@@ -4272,6 +4319,81 @@ mod tests {
             script.contains("UBSAN_OPTIONS_DEFAULT = \"print_stacktrace=1:report_error_type=1\""),
             "{script}"
         );
+    }
+
+    /// A Python 3 interpreter: `python3`, or `python` (its name on Windows,
+    /// where `python3` may be the Store's placeholder, which exits non-zero).
+    fn python3() -> Option<&'static str> {
+        ["python3", "python"].into_iter().find(|program| {
+            std::process::Command::new(program)
+                .args(["-c", "import sys; sys.exit(sys.version_info[0] != 3)"])
+                .output()
+                .is_ok_and(|output| output.status.success())
+        })
+    }
+
+    /// On Windows the reproducer puts the sanitizer runtime DLL directories a
+    /// harness was built against on PATH first, read from the sidecar the
+    /// build wrote beside the binary; elsewhere it leaves PATH alone.
+    #[test]
+    fn replay_script_puts_the_windows_sanitizer_runtime_on_path() {
+        let Some(python) = python3() else {
+            eprintln!("skipping: python3 unavailable");
+            return;
+        };
+        let script = super::render_repro_py(
+            "testcase.bin",
+            "",
+            "h1",
+            "detect_leaks=0",
+            "print_stacktrace=1",
+            &serde_json::Map::new(),
+            &[],
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = tmp.path().join("llvm runtime");
+        std::fs::create_dir_all(&runtime).unwrap();
+        let harness_dir = tmp.path().join("harnesses/h1");
+        std::fs::create_dir_all(&harness_dir).unwrap();
+        std::fs::write(
+            harness_dir.join("bhf-runtime-path.txt"),
+            format!(
+                "{}\n{}\n",
+                runtime.display(),
+                tmp.path().join("gone").display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("replay.py"), &script).unwrap();
+        let probe = format!(
+            "import importlib.util, json\n\
+             spec = importlib.util.spec_from_file_location('replay', {script:?})\n\
+             replay = importlib.util.module_from_spec(spec)\n\
+             spec.loader.exec_module(replay)\n\
+             harness = {harness:?}\n\
+             win = replay.with_runtime_path({{'PATH': 'C:/Windows'}}, harness, windows=True)\n\
+             posix = replay.with_runtime_path({{'PATH': '/usr/bin'}}, harness, windows=False)\n\
+             print(json.dumps([win['PATH'], posix['PATH']]))\n",
+            script = tmp.path().join("replay.py").display().to_string(),
+            harness = harness_dir.join("main.exe").display().to_string(),
+        );
+        let output = std::process::Command::new(python)
+            .args(["-c", &probe])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let paths: Vec<String> = serde_json::from_slice(&output.stdout).unwrap();
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        assert_eq!(
+            paths[0],
+            format!("{}{sep}C:/Windows", runtime.display()),
+            "the existing sidecar dir goes first; a missing one is skipped"
+        );
+        assert_eq!(paths[1], "/usr/bin", "PATH is untouched off Windows");
     }
 
     #[cfg(unix)]

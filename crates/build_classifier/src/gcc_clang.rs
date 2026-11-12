@@ -192,8 +192,13 @@ pub fn classify_into(stderr: &str, hits: &mut Vec<BuildErrorKind>) {
             }
             continue;
         }
-        if let Some(caps) = undefined_reference().captures(line) {
-            let symbol = &caps[1];
+        let msvc_symbol = msvc_unresolved_symbol(line);
+        if let Some(symbol) = msvc_symbol.as_deref().or_else(|| {
+            undefined_reference()
+                .captures(line)
+                .and_then(|caps| caps.get(1))
+                .map(|m| m.as_str())
+        }) {
             // System-library symbols (math, pthread, dl, rt) are
             // really "you forgot to link -l<lib>". Classifying these
             // as `UndefinedSymbol` would route them through the C
@@ -434,6 +439,65 @@ fn incomplete_type() -> &'static Regex {
 fn unknown_type() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| Regex::new(r#"error: unknown type name '(.+?)'"#).expect("regex"))
+}
+
+/// The symbol an MSVC-style linker reports unresolved: link.exe's
+/// `error LNK2019: unresolved external symbol NAME referenced in function F`
+/// (or `LNK2001`), and lld-link's `error: undefined symbol: NAME`. A C++
+/// symbol comes as `"int __cdecl ns::f(int)" (?f@ns@@YAHH@Z)` from link.exe
+/// and unquoted (`int __cdecl ns::f(int)`) from lld-link, which also prefixes
+/// an import with `__declspec(dllimport) `; it is named like GNU ld's
+/// demangled form, `ns::f(int)`, with `(void)` as `()`.
+pub fn msvc_unresolved_symbol(line: &str) -> Option<String> {
+    let line = line.trim_end_matches('\r');
+    let (rest, lld) = if let Some((_, rest)) = line.split_once("unresolved external symbol ") {
+        if !(line.contains("LNK2019") || line.contains("LNK2001")) {
+            return None;
+        }
+        (rest, false)
+    } else if let Some((head, rest)) = line.split_once("error: undefined symbol: ") {
+        if !head.contains("lld-link") {
+            return None;
+        }
+        (rest, true)
+    } else {
+        return None;
+    };
+    let rest = rest.trim();
+    let without_import = |text: &str| -> String {
+        text.trim()
+            .strip_prefix("__declspec(dllimport) ")
+            .unwrap_or(text.trim())
+            .to_owned()
+    };
+    if let Some(quoted) = rest.strip_prefix('"') {
+        let signature = quoted.split('"').next()?;
+        return Some(cpp_symbol_name(&without_import(signature)));
+    }
+    if lld {
+        // The rest of the line is the whole (demangled) symbol.
+        let symbol = without_import(rest);
+        return (!symbol.is_empty()).then(|| cpp_symbol_name(&symbol));
+    }
+    let symbol = rest.split_whitespace().next()?;
+    Some(symbol.to_owned())
+}
+
+/// `public: int __cdecl ns::Widget::size(void)const` -> `ns::Widget::size()`.
+fn cpp_symbol_name(signature: &str) -> String {
+    let Some(open) = signature.find('(') else {
+        return signature
+            .rsplit(char::is_whitespace)
+            .next()
+            .unwrap_or(signature)
+            .to_owned();
+    };
+    let close = signature.rfind(')').unwrap_or(signature.len() - 1);
+    let head = &signature[..open];
+    let name = head.rsplit(char::is_whitespace).next().unwrap_or(head);
+    let params = signature[open + 1..close].trim();
+    let params = if params == "void" { "" } else { params };
+    format!("{name}({params})")
 }
 
 fn undefined_reference() -> &'static Regex {

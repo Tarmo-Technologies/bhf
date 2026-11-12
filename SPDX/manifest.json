@@ -1295,6 +1295,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/auto/build_fidelity.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/auto/build_probe.rs",
       "license": "Apache-2.0"
     },
@@ -1448,6 +1452,10 @@
     },
     {
       "path": "crates/cli/src/auto/msan.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/src/auto/msbuild_import.rs",
       "license": "Apache-2.0"
     },
     {
@@ -1731,6 +1739,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/msvc_cc.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/pack.rs",
       "license": "Apache-2.0"
     },
@@ -1903,6 +1915,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/windows_env.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/workdir.rs",
       "license": "Apache-2.0"
     },
@@ -1988,6 +2004,10 @@
     },
     {
       "path": "crates/cli/tests/auto_build_context_recovery.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/auto_build_fidelity.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2271,6 +2291,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_msbuild_import.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_peripheral_sequence.rs",
       "license": "Apache-2.0"
     },
@@ -2440,6 +2464,10 @@
     },
     {
       "path": "crates/cli/tests/discovery_memory_ceiling.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/driver_inline_counters.rs",
       "license": "Apache-2.0"
     },
     {
@@ -5356,6 +5384,22 @@
     },
     {
       "path": "tests/fixtures/static_scan/weak.c",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/windows/handle_session/session.c",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/windows/vs_solution/src/core/legacy_unused.c",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/windows/vs_solution/src/core/mode.c",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "tests/fixtures/windows/vs_solution/src/core/widget.c",
       "license": "Apache-2.0"
     },
     {

@@ -17,8 +17,14 @@ endif
 # for its predefined macros. So CXX=g++, a cross-prefixed g++ or a vendor g++
 # gets GCC-spelled flags (`trace-pc`, no `function`/`vptr` UBSan checks), and
 # clang++ gets its own, whatever compiler the build context named.
+# `bhf-cl` is bhf's front end for MSVC `cl.exe` (see the msvc family below),
+# recognised by name.
 ifndef BHF_CXX_FAMILY
+ifneq ($(filter bhf-cl bhf-cl.exe,$(notdir $(subst ",,$(CXX)))),)
+BHF_CXX_FAMILY := msvc
+else
 BHF_CXX_FAMILY := $(shell bhf_macros=$$(echo | $(CXX) -dM -E -x c++ - 2>/dev/null); case "$$bhf_macros" in (*__clang__*) echo clang;; (*__GNUC__*) echo gcc;; (*) echo {{ cxx_compiler_family }};; esac)
+endif
 endif
 # Every bhf C++ direct harness ships its own `main` — the same persistent
 # framed fork-server driver the C path uses (#399/#398) — so we do NOT link
@@ -53,6 +59,10 @@ CXX_STD ?= {{ cxx_standard }}
 # reached. Link them statically, as clang does.
 ifeq ($(BHF_CXX_FAMILY),gcc)
 CXXFLAGS ?= -O1 -g -std=$(CXX_STD) -fsanitize=address,undefined -fno-sanitize=alignment -static-libasan -static-libubsan -fsanitize-coverage=trace-pc,trace-cmp
+else ifeq ($(BHF_CXX_FAMILY),msvc)
+# MSVC: AddressSanitizer plus cl's SanitizerCoverage subset (inline 8-bit edge
+# counters, comparison and division hooks); cl has no UBSan.
+CXXFLAGS ?= -O1 -g -std=$(CXX_STD) -fsanitize=address -fsanitize-coverage=inline-8bit-counters,edge,trace-cmp,trace-div
 else
 CXXFLAGS ?= -O1 -g -std=$(CXX_STD) -Wno-reserved-user-defined-literal -fsanitize=address,undefined -fno-sanitize=function,vptr,alignment -fsanitize-coverage=trace-pc-guard,trace-cmp
 endif
@@ -64,11 +74,16 @@ endif
 # `-std=`, which a C compile rejects. Otherwise it gets CFLAGS when given, else
 # the defaults spelled for $(CC).
 ifndef BHF_CC_FAMILY
+ifneq ($(filter bhf-cl bhf-cl.exe,$(notdir $(subst ",,$(CC)))),)
+BHF_CC_FAMILY := msvc
+else
 BHF_CC_FAMILY = $(eval BHF_CC_FAMILY := $(shell bhf_macros=$$(echo | $(CC) -dM -E -x c - 2>/dev/null); case "$$bhf_macros" in (*__clang__*) echo clang;; (*__GNUC__*) echo gcc;; (*) echo {{ cxx_compiler_family }};; esac))$(BHF_CC_FAMILY)
+endif
 endif
 BHF_CONTEXT_C_FLAGS_GCC = -O1 -g -fsanitize=address,undefined -fno-sanitize=alignment -static-libasan -static-libubsan -fsanitize-coverage=trace-pc,trace-cmp
 BHF_CONTEXT_C_FLAGS_CLANG = -O1 -g -fsanitize=address,undefined -fno-sanitize=function,vptr,alignment -fsanitize-coverage=trace-pc-guard,trace-cmp
-BHF_CONTEXT_C_FLAGS = $(if $(filter $(BHF_CXX_FAMILY),$(BHF_CC_FAMILY)),$(filter-out -std=%,$(CXXFLAGS)),$(if $(filter environment command,$(firstword $(origin CFLAGS))),$(CFLAGS),$(if $(filter gcc,$(BHF_CC_FAMILY)),$(BHF_CONTEXT_C_FLAGS_GCC),$(BHF_CONTEXT_C_FLAGS_CLANG))))
+BHF_CONTEXT_C_FLAGS_MSVC = -O1 -g -fsanitize=address -fsanitize-coverage=inline-8bit-counters,edge,trace-cmp,trace-div
+BHF_CONTEXT_C_FLAGS = $(if $(filter $(BHF_CXX_FAMILY),$(BHF_CC_FAMILY)),$(filter-out -std=%,$(CXXFLAGS)),$(if $(filter environment command,$(firstword $(origin CFLAGS))),$(CFLAGS),$(if $(filter gcc,$(BHF_CC_FAMILY)),$(BHF_CONTEXT_C_FLAGS_GCC),$(if $(filter msvc,$(BHF_CC_FAMILY)),$(BHF_CONTEXT_C_FLAGS_MSVC),$(BHF_CONTEXT_C_FLAGS_CLANG)))))
 # Toolchain additions from a `[toolchain]` config table or the --cxxflags /
 # --define / --sysroot ... flags. They are APPENDED, so they never drop bhf's
 # coverage or sanitizers. BHF_TOOLCHAIN_CPPFLAGS (defines, include dirs)

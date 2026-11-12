@@ -574,6 +574,55 @@ mod tests {
         );
     }
 
+    /// The MSVC linker (link.exe, used by clang and cl on Windows) and
+    /// lld-link name an unresolved symbol their own way; each is the same
+    /// undefined symbol the repair loop stubs. A C++ symbol is named by its
+    /// qualified function and parameter list.
+    #[test]
+    fn undefined_symbol_msvc_linker_forms() {
+        let stderr = "\
+main.obj : error LNK2019: unresolved external symbol widget_lookup referenced in function parse_record\r\n\
+widget.obj : error LNK2001: unresolved external symbol widget_table\r\n\
+main.obj : error LNK2019: unresolved external symbol \"public: int __cdecl ns::Widget::size(void)const \" (?size@Widget@ns@@QEBAHXZ) referenced in function main\r\n\
+main.obj : error LNK2019: unresolved external symbol \"int __cdecl widget_count(int,char const *)\" (?widget_count@@YAHHPEBD@Z) referenced in function main\r\n\
+lld-link: error: undefined symbol: widget_reset\n\
+>>> referenced by main.c:12\n\
+lld-link: error: undefined symbol: int __cdecl widget_total(int)\n\
+>>> referenced by main.cpp:7\n\
+lld-link: error: undefined symbol: public: void __cdecl ns::Widget::clear(void)\n\
+lld-link: error: undefined symbol: __declspec(dllimport) widget_open\n\
+main.exe : fatal error LNK1120: 4 unresolved externals\r\n";
+        let names: Vec<String> = classify(stderr)
+            .into_iter()
+            .filter_map(|kind| match kind {
+                BuildErrorKind::UndefinedSymbol { name } => Some(name),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "widget_lookup",
+                "widget_table",
+                "ns::Widget::size()",
+                "widget_count(int,char const *)",
+                "widget_reset",
+                "widget_total(int)",
+                "ns::Widget::clear()",
+                "widget_open",
+            ]
+        );
+        let kinds = classify(
+            "x.obj : error LNK2019: unresolved external symbol sqrt referenced in function f\n",
+        );
+        assert!(
+            kinds
+                .iter()
+                .any(|k| matches!(k, BuildErrorKind::MissingSharedLib { .. })),
+            "a math-library symbol is a missing library, not a stub: {kinds:?}"
+        );
+    }
+
     #[test]
     fn missing_macro_all_caps_undeclared_identifier() {
         let stderr = "api.c:11:12: error: use of undeclared identifier 'YAML_VERSION_STRING'\n";

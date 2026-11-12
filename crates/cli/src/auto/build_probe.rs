@@ -362,6 +362,80 @@ pub enum BuildSystem {
     None,
 }
 
+/// A Make build bhf can run: its Makefile, or a generated `configure`.
+const MAKE_MARKERS: &[&str] = &["Makefile", "makefile", "GNUmakefile", "configure"];
+
+/// A Bazel workspace root.
+const BAZEL_MARKERS: &[&str] = &[
+    "WORKSPACE",
+    "WORKSPACE.bazel",
+    "MODULE.bazel",
+    "BUILD.bazel",
+];
+
+/// Every file that says a directory has a build description of its own besides
+/// a Visual Studio solution: the markers [`detect_build_system`] follows, and
+/// the inputs portable builds generate theirs from (autotools before
+/// `autoreconf`, premake, xmake, waf, Boost.Build).
+const OTHER_BUILD_MARKERS: &[&[&str]] = &[
+    &["CMakeLists.txt", "meson.build"],
+    MAKE_MARKERS,
+    &["build.ninja", "SConstruct"],
+    BAZEL_MARKERS,
+    &[
+        "configure.ac",
+        "configure.in",
+        "Makefile.am",
+        "Makefile.in",
+        "autogen.sh",
+        "premake5.lua",
+        "premake4.lua",
+        "xmake.lua",
+        "wscript",
+        "Jamroot",
+    ],
+];
+
+/// The first build description in `tree` other than its Visual Studio files
+/// (`msbuild_files`, the solutions and projects found): a marker at the tree
+/// root, or in any directory between the root and one of those files (a
+/// wrapper directory holding `proj/configure.ac` and `proj/msvc/proj.sln`).
+/// Returned relative to `tree`.
+pub(crate) fn other_build_description(tree: &Path, msbuild_files: &[PathBuf]) -> Option<PathBuf> {
+    let mut dirs: Vec<PathBuf> = vec![tree.to_path_buf()];
+    for file in msbuild_files {
+        let mut cursor = file.parent();
+        while let Some(dir) = cursor {
+            if !dir.starts_with(tree) || dir == tree {
+                break;
+            }
+            if !dirs.iter().any(|known| known == dir) {
+                dirs.push(dir.to_path_buf());
+            }
+            cursor = dir.parent();
+        }
+    }
+    dirs.iter().find_map(|dir| {
+        OTHER_BUILD_MARKERS
+            .iter()
+            .flat_map(|group| group.iter())
+            .map(|marker| dir.join(marker))
+            .find(|path| path.is_file())
+            .map(|path| {
+                path.strip_prefix(tree)
+                    .map(Path::to_path_buf)
+                    .unwrap_or(path)
+            })
+    })
+}
+
+/// Every Visual Studio solution and project under `tree`.
+pub(crate) fn msbuild_files(tree: &Path) -> Vec<PathBuf> {
+    let mut files = crate::auto::msbuild_import::find_solutions(tree);
+    files.extend(crate::auto::msbuild_import::find_projects(tree));
+    files
+}
+
 /// Detect the project's build system from the marker files at the tree root.
 /// CMake takes precedence (it emits a DB natively and runs codegen at configure
 /// time); then a Visual Studio solution/project; then Make.
@@ -377,10 +451,7 @@ pub fn detect_build_system(tree: &Path) -> BuildSystem {
     if find_msbuild_project(tree).is_some() {
         return BuildSystem::MSBuild;
     }
-    if ["Makefile", "makefile", "GNUmakefile", "configure"]
-        .iter()
-        .any(|name| tree.join(name).is_file())
-    {
+    if MAKE_MARKERS.iter().any(|name| tree.join(name).is_file()) {
         return BuildSystem::Make;
     }
     // Standalone Ninja: a `build.ninja` at the tree root with no higher-level
@@ -389,15 +460,7 @@ pub fn detect_build_system(tree: &Path) -> BuildSystem {
         return BuildSystem::Ninja;
     }
     // Bazel / SCons have no native compile DB; we run them under interception.
-    if [
-        "WORKSPACE",
-        "WORKSPACE.bazel",
-        "MODULE.bazel",
-        "BUILD.bazel",
-    ]
-    .iter()
-    .any(|name| tree.join(name).is_file())
-    {
+    if BAZEL_MARKERS.iter().any(|name| tree.join(name).is_file()) {
         return BuildSystem::Bazel;
     }
     if tree.join("SConstruct").is_file() {
@@ -468,254 +531,352 @@ fn interception_build_command(bs: BuildSystem) -> Option<&'static str> {
 
 /// Find a Visual Studio solution (preferred) or project under `tree`, scanning a
 /// few directory levels (VS solutions commonly live in `projects/vstudio/`,
-/// `msvc/`, `build/`, etc.). Returns the `.sln` if any, else the first `.vcxproj`.
+/// `msvc/`, `build/`, etc.). Solutions are chosen shallowest first, then by
+/// path, so the pick among several is deterministic.
 fn find_msbuild_project(tree: &Path) -> Option<PathBuf> {
-    let mut vcxproj: Option<PathBuf> = None;
-    let mut stack = vec![(tree.to_path_buf(), 0u32)];
-    while let Some((dir, depth)) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
+    crate::auto::msbuild_import::find_solutions(tree)
+        .into_iter()
+        .next()
+        .or_else(|| {
+            crate::auto::msbuild_import::find_projects(tree)
+                .into_iter()
+                .next()
+        })
+}
+
+/// Whether `tree` holds a Visual Studio solution or project.
+pub(crate) fn has_msbuild_project(tree: &Path) -> bool {
+    find_msbuild_project(tree).is_some()
+}
+
+/// A compile database already present in `tree`: at its root, in a
+/// conventional build directory, or where `--probe-build` writes one.
+pub(crate) fn existing_compile_database(tree: &Path) -> Option<PathBuf> {
+    [
+        "",
+        "build",
+        "builddir",
+        "out",
+        "cmake-build-debug",
+        "cmake-build-release",
+        PROBE_DIR,
+    ]
+    .iter()
+    .map(|dir| tree.join(dir).join("compile_commands.json"))
+    .find(|path| path.is_file())
+}
+
+/// MSBuild tier of `--probe-build`: the project import, allowed to evaluate the
+/// projects with MSBuild itself when it is installed (the probe's consent covers
+/// MSBuild running the projects' property functions).
+fn probe_msbuild(tree: &Path, db: &Path) -> Option<PathBuf> {
+    let request = msbuild_import_request_from_env();
+    import_msbuild_projects(tree, db, &request, true).map(|(path, _)| path)
+}
+
+/// The solution and configuration chosen by `--msbuild-solution` /
+/// `--msbuild-config`, which `auto` publishes for the probe step.
+fn msbuild_import_request_from_env() -> crate::auto::msbuild_import::ImportRequest {
+    crate::auto::msbuild_import::ImportRequest {
+        solution: std::env::var_os("BHF_MSBUILD_SOLUTION").map(PathBuf::from),
+        configuration: std::env::var("BHF_MSBUILD_CONFIG").ok(),
+    }
+}
+
+/// Import the Visual Studio solution in `tree` into a compile database at `db`
+/// and report what was read. The static tier reads the project files and runs
+/// nothing; with `allow_msbuild_evaluation` and MSBuild on PATH, each project is
+/// evaluated by MSBuild instead (falling back to the static reading per
+/// project). On Windows each row also names the import libraries its project
+/// links (see [`harness_link_libraries`]). Returns the database path and the
+/// import, or `None` when there is nothing to import.
+pub(crate) fn import_msbuild_projects(
+    tree: &Path,
+    db: &Path,
+    request: &crate::auto::msbuild_import::ImportRequest,
+    allow_msbuild_evaluation: bool,
+) -> Option<(PathBuf, crate::auto::msbuild_import::SolutionImport)> {
+    let lib_dirs: Option<Vec<PathBuf>> = cfg!(windows).then(|| {
+        std::env::var_os("LIB")
+            .map(|value| std::env::split_paths(&value).collect())
+            .unwrap_or_default()
+    });
+    import_msbuild_projects_with(
+        tree,
+        db,
+        request,
+        allow_msbuild_evaluation,
+        lib_dirs.as_deref(),
+    )
+}
+
+/// C runtime and sanitizer runtime libraries. The harness build picks its own
+/// runtime (the sanitizers need the DLL CRT), so a project's choice is not
+/// linked.
+fn is_runtime_library(name: &str) -> bool {
+    let stem = name.to_ascii_lowercase();
+    let stem = stem.trim_end_matches(".lib");
+    stem.starts_with("clang_rt.")
+        || matches!(
+            stem,
+            "libcmt"
+                | "libcmtd"
+                | "msvcrt"
+                | "msvcrtd"
+                | "libucrt"
+                | "libucrtd"
+                | "ucrt"
+                | "ucrtd"
+                | "libvcruntime"
+                | "libvcruntimed"
+                | "vcruntime"
+                | "vcruntimed"
+                | "libcpmt"
+                | "libcpmtd"
+                | "libcpmt1"
+                | "libcpmtd1"
+                | "msvcprt"
+                | "msvcprtd"
+                | "libconcrt"
+                | "libconcrtd"
+                | "concrt"
+                | "concrtd"
+                | "msvcmrt"
+                | "msvcurt"
+                | "libsancov"
+        )
+}
+
+/// Whether `name` is a plain library file name (`ws2_32.lib`), safe to place
+/// on a recipe line.
+pub(crate) fn is_plain_library_name(name: &str) -> bool {
+    name.len() > 4
+        && name.to_ascii_lowercase().ends_with(".lib")
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+'))
+}
+
+/// The part of a project's `AdditionalDependencies` its own harnesses link:
+/// the Windows import libraries found in a `LIB` directory (`ws2_32.lib`).
+/// Everything else is returned with the reason it is left out: a library not
+/// in `LIB` (an output of the solution's own build, which may not exist yet and
+/// whose sources the harness compiles, or a third-party library), a resolved
+/// path, a C runtime library, or a name that is not a plain file name.
+pub(crate) fn harness_link_libraries(
+    inputs: &[String],
+    lib_dirs: &[PathBuf],
+) -> (Vec<String>, Vec<(String, &'static str)>) {
+    let mut kept = Vec::new();
+    let mut skipped = Vec::new();
+    for input in inputs {
+        let reason = if input.contains('/') || input.contains('\\') {
+            Some("a path: the solution's own output or a prebuilt library")
+        } else if !is_plain_library_name(input) {
+            Some("not a plain library name")
+        } else if is_runtime_library(input) {
+            Some("a C runtime library: the harness links its own")
+        } else if !lib_dirs.iter().any(|dir| dir.join(input).is_file()) {
+            Some("not in LIB: built by the solution, or not part of the toolset")
+        } else {
+            None
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                // Skip output/VCS dirs; bound the depth so a huge tree is cheap.
-                if depth < 4 && !name.starts_with('.') && name != "target" && name != "node_modules"
-                {
-                    stack.push((path, depth + 1));
+        match reason {
+            Some(reason) => skipped.push((input.clone(), reason)),
+            None => kept.push(input.clone()),
+        }
+    }
+    (kept, skipped)
+}
+
+/// A compile-database row of the Visual Studio import: the compile command, and
+/// the import libraries the row's project links (`bhf_link_libraries`, honoured
+/// only in this database).
+#[derive(Debug, Clone, Serialize)]
+struct ImportedEntry {
+    #[serde(flatten)]
+    entry: ProbeEntry,
+    #[serde(rename = "bhf_link_libraries", skip_serializing_if = "Vec::is_empty")]
+    link_libraries: Vec<String>,
+}
+
+/// [`import_msbuild_projects`] with the `LIB` directories to look for import
+/// libraries in; `None` links none (not a Windows link).
+pub(crate) fn import_msbuild_projects_with(
+    tree: &Path,
+    db: &Path,
+    request: &crate::auto::msbuild_import::ImportRequest,
+    allow_msbuild_evaluation: bool,
+    lib_dirs: Option<&[PathBuf]>,
+) -> Option<(PathBuf, crate::auto::msbuild_import::SolutionImport)> {
+    use crate::auto::msbuild_import as import;
+    let mut solution = import::import_tree(tree, request)?;
+    let display = |path: &Path| {
+        path.strip_prefix(tree)
+            .unwrap_or(path)
+            .display()
+            .to_string()
+    };
+    if solution.candidates.len() > 1 {
+        bhfeprintln!(
+            "bhf auto: {} Visual Studio solutions found; importing {} (choose another with \
+             --msbuild-solution)",
+            solution.candidates.len(),
+            solution
+                .solution
+                .as_deref()
+                .map(display)
+                .unwrap_or_default()
+        );
+    }
+    if allow_msbuild_evaluation {
+        if let Some(msbuild) = import::msbuild_program() {
+            let mut evaluated = 0;
+            for project in &mut solution.projects {
+                if let Some(sources) = import::evaluate_with_msbuild(
+                    &msbuild,
+                    &project.project,
+                    solution.solution.as_deref(),
+                    &project.configuration,
+                    &project.platform,
+                ) {
+                    project.sources = sources;
+                    evaluated += 1;
                 }
-            } else {
-                match path.extension().and_then(|e| e.to_str()) {
-                    Some("sln") => return Some(path),
-                    Some("vcxproj") if vcxproj.is_none() => vcxproj = Some(path),
-                    _ => {}
-                }
+            }
+            if evaluated > 0 {
+                solution.tier = "msbuild";
             }
         }
     }
-    vcxproj
-}
-
-/// MSBuild tier: recover a Visual Studio project's compile wiring by PARSING its
-/// `.vcxproj` files (include dirs, preprocessor defines, source files) into a
-/// `compile_commands.json`. Unlike the CMake/Make tiers this does NOT execute the
-/// build — it reads the project XML — so it needs no `msbuild` on PATH and runs
-/// the same on any host. bhf then builds each harness with the project's real
-/// `-I`/`-D` flags + clang coverage. (Headers produced by a custom build step are
-/// not materialized — a follow-up; most C/C++ projects declare their wiring.)
-fn probe_msbuild(tree: &Path, db: &Path) -> Option<PathBuf> {
-    let projects = msbuild_project_files(tree);
     let mut entries = Vec::new();
-    for proj in &projects {
-        entries.extend(vcxproj_entries(proj));
+    for project in &solution.projects {
+        const SHOWN_NOTES: usize = 3;
+        for note in project.notes.iter().take(SHOWN_NOTES) {
+            bhfeprintln!("bhf auto: {}: {note}", display(&project.project));
+        }
+        if project.notes.len() > SHOWN_NOTES {
+            bhfeprintln!(
+                "bhf auto: {}: {} more project-file note(s) like these",
+                display(&project.project),
+                project.notes.len() - SHOWN_NOTES
+            );
+        }
+        let link_libraries = match lib_dirs {
+            Some(lib_dirs) => {
+                let (kept, skipped) = harness_link_libraries(&project.link_inputs, lib_dirs);
+                if !kept.is_empty() {
+                    bhfeprintln!(
+                        "bhf auto: {}: its harnesses link {}",
+                        display(&project.project),
+                        kept.join(", ")
+                    );
+                }
+                let mut reasons: Vec<&str> = Vec::new();
+                for (_, reason) in &skipped {
+                    if !reasons.contains(reason) {
+                        reasons.push(reason);
+                    }
+                }
+                for reason in reasons {
+                    let names: Vec<&str> = skipped
+                        .iter()
+                        .filter(|(_, why)| *why == reason)
+                        .map(|(name, _)| name.as_str())
+                        .collect();
+                    bhfeprintln!(
+                        "bhf auto: {}: not linking {} ({reason}; AUTO_EXTRA_LDFLAGS adds a \
+                         library a harness needs)",
+                        display(&project.project),
+                        names.join(", ")
+                    );
+                }
+                kept
+            }
+            None => Vec::new(),
+        };
+        for source in &project.sources {
+            if !source.file.is_file() {
+                continue;
+            }
+            entries.push(ImportedEntry {
+                entry: probe_entry_for_imported_source(source),
+                link_libraries: link_libraries.clone(),
+            });
+        }
+        let unresolved: Vec<&str> = project
+            .unresolved
+            .iter()
+            .map(String::as_str)
+            .filter(|name| name.starts_with('$'))
+            .collect();
+        if !unresolved.is_empty() {
+            bhfeprintln!(
+                "bhf auto: {}: left out include dirs and defines built on MSBuild properties \
+                 with no value here: {} (MSBuild reads environment variables as properties; \
+                 set them, or add the paths with --extra-include)",
+                display(&project.project),
+                unresolved.join(", ")
+            );
+        }
     }
     if entries.is_empty() {
         bhfeprintln!(
-            "bhf auto: MSBuild probe found a VS solution/project under {} but no \
-             ClCompile sources to map",
+            "bhf auto: found a Visual Studio solution/project under {} but no ClCompile \
+             sources to map",
             tree.display()
         );
         return None;
     }
     let json = serde_json::to_vec_pretty(&entries).ok()?;
+    if let Some(parent) = db.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
     std::fs::write(db, json).ok()?;
-    Some(db.to_path_buf())
+    bhfeprintln!(
+        "bhf auto: read {} ClCompile entr{} from {} (config {}|{}, {} evaluation)",
+        entries.len(),
+        if entries.len() == 1 { "y" } else { "ies" },
+        solution
+            .solution
+            .as_deref()
+            .map(display)
+            .unwrap_or_else(|| format!("{} project file(s)", solution.projects.len())),
+        solution.configuration,
+        solution.platform,
+        solution.tier
+    );
+    Some((db.to_path_buf(), solution))
 }
 
-/// The `.vcxproj` files of the solution: parsed from a `.sln`'s `Project(...)`
-/// lines when a solution is present, else every `.vcxproj` found under the tree.
-fn msbuild_project_files(tree: &Path) -> Vec<PathBuf> {
-    match find_msbuild_project(tree) {
-        Some(p) if p.extension().and_then(|e| e.to_str()) == Some("sln") => {
-            let projects = parse_sln_projects(&p);
-            if projects.is_empty() {
-                collect_vcxproj(tree)
-            } else {
-                projects
-            }
-        }
-        _ => collect_vcxproj(tree),
+/// A compile-database row for one imported source, in the GCC spelling the
+/// compile-database reader and the generated Makefile use.
+fn probe_entry_for_imported_source(
+    source: &crate::auto::msbuild_import::ImportedSource,
+) -> ProbeEntry {
+    // The language comes from the file extension, as in the harness build; a
+    // `-x` here would also reach the link line's objects.
+    let mut arguments = vec!["clang".to_owned()];
+    for dir in &source.include_dirs {
+        arguments.push(format!("-I{}", harness_gen::build_safety::make_path(dir)));
     }
-}
-
-/// Resolve the `.vcxproj` paths referenced by a `.sln`. Solution lines read:
-/// `Project("{GUID}") = "Name", "rel\path\Name.vcxproj", "{GUID}"` — the path is
-/// the second quoted field, relative to the solution dir, with `\` separators.
-fn parse_sln_projects(sln: &Path) -> Vec<PathBuf> {
-    let Ok(text) = std::fs::read_to_string(sln) else {
-        return Vec::new();
-    };
-    let sln_dir = sln.parent().unwrap_or_else(|| Path::new("."));
-    let mut out = Vec::new();
-    for line in text.lines() {
-        if !line.trim_start().starts_with("Project(") {
-            continue;
-        }
-        let quoted: Vec<&str> = line.split('"').collect();
-        if let Some(rel) = quoted.get(3) {
-            if rel.to_ascii_lowercase().ends_with(".vcxproj") {
-                let rel_norm = rel.replace('\\', std::path::MAIN_SEPARATOR_STR);
-                let abs = resolve_against(sln_dir, &rel_norm);
-                if abs.is_file() {
-                    out.push(abs);
-                }
-            }
-        }
+    arguments.extend(source.defines.iter().map(|define| format!("-D{define}")));
+    arguments.extend(source.undefines.iter().map(|name| format!("-U{name}")));
+    for header in &source.forced_includes {
+        arguments.push("-include".to_owned());
+        arguments.push(harness_gen::build_safety::make_path(header));
     }
-    out
-}
-
-/// Every `.vcxproj` under `tree` (bounded scan), for when there is no `.sln` or
-/// it lists no resolvable projects.
-fn collect_vcxproj(tree: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut stack = vec![(tree.to_path_buf(), 0u32)];
-    while let Some((dir, depth)) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if depth < 4 {
-                    stack.push((path, depth + 1));
-                }
-            } else if path.extension().and_then(|e| e.to_str()) == Some("vcxproj") {
-                out.push(path);
-            }
-        }
+    if let Some(standard) = &source.standard {
+        arguments.push(format!("-std={standard}"));
     }
-    out
-}
-
-/// Parse one `.vcxproj` into compile entries — one per `ClCompile` source, each
-/// carrying the project's include dirs (`-I`) and preprocessor defines (`-D`).
-/// `$(ProjectDir)`/`$(SolutionDir)`/`$(MSBuildProjectDirectory)` resolve to the
-/// project directory; inherited `%(...)` placeholders and empty tokens are
-/// dropped; relative paths resolve against the project dir.
-fn vcxproj_entries(vcxproj: &Path) -> Vec<ProbeEntry> {
-    let Ok(text) = std::fs::read_to_string(vcxproj) else {
-        return Vec::new();
-    };
-    let proj_dir = vcxproj.parent().unwrap_or_else(|| Path::new("."));
-    let proj_dir_rendered = harness_gen::build_safety::make_path(proj_dir);
-    let proj_dir_slash = format!("{proj_dir_rendered}/");
-    let resolve_macros = |raw: &str| -> String {
-        raw.replace("$(ProjectDir)", &proj_dir_slash)
-            .replace("$(MSBuildProjectDirectory)", &proj_dir_rendered)
-            .replace("$(SolutionDir)", &proj_dir_slash)
-    };
-    // Union declared include dirs + defines across configurations because this
-    // static probe cannot evaluate arbitrary MSBuild `Condition=` expressions.
-    // Unknown property-dependent tokens are discarded below; ordinary conflicts
-    // remain visible to the normal compile/repair diagnostics.
-    let mut include_dirs: Vec<String> = Vec::new();
-    for raw in tag_values(&text, "AdditionalIncludeDirectories") {
-        for piece in raw.split(';') {
-            let piece = piece.trim();
-            if piece.is_empty() || piece.starts_with("%(") {
-                continue;
-            }
-            let piece = resolve_macros(piece);
-            // Configuration-dependent MSBuild properties such as `$(IntDir)`
-            // and `$(OutDir)` have no value in this static, cross-platform
-            // probe. Passing them through creates a bogus absolute path and,
-            // correctly, trips Makefile injection protection on `$`. Drop only
-            // the unresolved token; the project/source include roots remain.
-            if contains_unresolved_msbuild_placeholder(&piece) {
-                continue;
-            }
-            let abs = resolve_against(proj_dir, &piece);
-            let s = harness_gen::build_safety::make_path(&abs);
-            if !include_dirs.contains(&s) {
-                include_dirs.push(s);
-            }
-        }
+    arguments.extend(source.extra_flags.iter().cloned());
+    arguments.push("-c".to_owned());
+    arguments.push(source.file.display().to_string());
+    ProbeEntry {
+        directory: source.directory.clone(),
+        file: source.file.clone(),
+        arguments,
     }
-    // The project dir itself is always an include root (for `#include "sibling.h"`).
-    let proj_dir_s = proj_dir_rendered;
-    if !include_dirs.contains(&proj_dir_s) {
-        include_dirs.push(proj_dir_s);
-    }
-    let mut defines: Vec<String> = Vec::new();
-    for raw in tag_values(&text, "PreprocessorDefinitions") {
-        for piece in raw.split(';') {
-            let piece = piece.trim();
-            if piece.is_empty() || piece.starts_with("%(") {
-                continue;
-            }
-            if contains_unresolved_msbuild_placeholder(piece) {
-                continue;
-            }
-            if !defines.contains(&piece.to_owned()) {
-                defines.push(piece.to_owned());
-            }
-        }
-    }
-    let mut base_args = vec!["clang".to_owned()];
-    base_args.extend(include_dirs.iter().map(|d| format!("-I{d}")));
-    base_args.extend(defines.iter().map(|d| format!("-D{d}")));
-    let mut entries = Vec::new();
-    for src in clcompile_sources(&text) {
-        let rel = src.replace('\\', std::path::MAIN_SEPARATOR_STR);
-        let file = resolve_against(proj_dir, &rel);
-        if !file.is_file() {
-            continue;
-        }
-        let mut arguments = base_args.clone();
-        arguments.push("-c".to_owned());
-        arguments.push(file.display().to_string());
-        entries.push(ProbeEntry {
-            directory: proj_dir.to_path_buf(),
-            file,
-            arguments,
-        });
-    }
-    entries
-}
-
-fn contains_unresolved_msbuild_placeholder(value: &str) -> bool {
-    value.contains("$(") || value.contains("%(")
-}
-
-/// Inner texts of every `<TAG ...>...</TAG>` occurrence (tolerates attributes on
-/// the open tag, e.g. `<TAG Condition="...">`).
-fn tag_values(xml: &str, tag: &str) -> Vec<String> {
-    let open = format!("<{tag}");
-    let close = format!("</{tag}>");
-    let mut out = Vec::new();
-    let mut rest = xml;
-    while let Some(o) = rest.find(&open) {
-        let after_open = &rest[o + open.len()..];
-        let Some(gt) = after_open.find('>') else {
-            break;
-        };
-        let body = &after_open[gt + 1..];
-        let Some(c) = body.find(&close) else {
-            break;
-        };
-        out.push(body[..c].trim().to_owned());
-        rest = &body[c + close.len()..];
-    }
-    out
-}
-
-/// The `Include="..."` paths of every `<ClCompile Include="...">` element.
-fn clcompile_sources(xml: &str) -> Vec<String> {
-    let needle = "<ClCompile Include=\"";
-    let mut out = Vec::new();
-    let mut rest = xml;
-    while let Some(i) = rest.find(needle) {
-        let after = &rest[i + needle.len()..];
-        let Some(q) = after.find('"') else {
-            break;
-        };
-        out.push(after[..q].to_owned());
-        rest = &after[q + 1..];
-    }
-    out
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3049,6 +3210,12 @@ const INTERCEPT_COMPILER_NAMES: &[&str] = &[
     "cl2000",
     "cl6x",
     "cl430",
+    // MSVC and its clang-compatible driver. MSBuild starts cl from the
+    // toolset directory by absolute path, so a Visual Studio build is caught
+    // through the CL task's `CLToolPath`/`CLToolExe` (see
+    // `probe_build_command_windows`), not PATH.
+    "cl",
+    "clang-cl",
 ];
 
 fn intercept_compiler_names() -> &'static [&'static str] {
@@ -3106,20 +3273,26 @@ fn parse_intercept_log(log: &str) -> Vec<ProbeEntry> {
     let mut args: Vec<String> = Vec::new();
     for line in log.lines() {
         if line == "ENDREC" {
-            if let (Some(dir), Some(cc_path), Some(file)) = (
-                &directory,
-                &cc,
-                args.iter().find(|a| is_source_arg(a)).cloned(),
-            ) {
-                let mut arguments = Vec::with_capacity(args.len() + 1);
-                arguments.push(cc_path.clone());
-                arguments.extend(args.iter().cloned());
-                let file_path = resolve_against(Path::new(dir), &file);
-                entries.push(ProbeEntry {
-                    directory: PathBuf::from(dir),
-                    file: file_path,
-                    arguments,
-                });
+            // One compiler run can compile several translation units (cl
+            // compiles every ClCompile item of an MSBuild project in one
+            // call): one entry per source, each with the shared options.
+            if let (Some(dir), Some(cc_path)) = (&directory, &cc) {
+                let sources: Vec<&String> = args.iter().filter(|a| is_source_arg(a)).collect();
+                for file in &sources {
+                    let mut arguments = Vec::with_capacity(args.len() + 1);
+                    arguments.push(cc_path.clone());
+                    arguments.extend(
+                        args.iter()
+                            .filter(|a| !is_source_arg(a) || a == file)
+                            .cloned(),
+                    );
+                    let file_path = resolve_against(Path::new(dir), &file.replace('\\', "/"));
+                    entries.push(ProbeEntry {
+                        directory: PathBuf::from(dir),
+                        file: file_path,
+                        arguments,
+                    });
+                }
             }
             directory = None;
             cc = None;
@@ -3209,6 +3382,9 @@ pub fn probe_build_command(
     sandbox_program: Option<&Path>,
     sanitizers: &multicore_fuzz::SanitizerSelection,
 ) -> Option<PathBuf> {
+    if cfg!(windows) {
+        return probe_build_command_windows(tree, command);
+    }
     let probe_dir = tree.join(PROBE_DIR);
     let intercept_dir = probe_dir.join("intercept");
     if std::fs::create_dir_all(&intercept_dir).is_err() {
@@ -3355,6 +3531,243 @@ pub fn probe_build_command(
     let json = serde_json::to_vec_pretty(&entries).ok()?;
     std::fs::write(&db, json).ok()?;
     Some(db)
+}
+
+/// Names the Windows interception shims answer to (`cl.exe`, `clang.exe`, ...).
+pub(crate) const SHIM_MAP_ENV: &str = "BHF_CC_SHIM_MAP";
+/// Directory each Windows shim run writes its own record file into: parallel
+/// compiler runs never share a file, so no record can interleave with another.
+pub(crate) const SHIM_LOG_DIR_ENV: &str = "BHF_CC_LOG_DIR";
+const SHIM_MAP_FILE: &str = "bhf-shim-map.json";
+
+/// Whether `stem` names a compiler the interception shims stand in for.
+pub(crate) fn is_intercept_shim_name(stem: &str) -> bool {
+    intercept_compiler_names().contains(&stem) || is_cross_compiler_name(stem)
+}
+
+/// Read a compiler response file as text: MSBuild writes them UTF-16 with a
+/// byte-order mark; other tools write UTF-8.
+pub(crate) fn decode_response_file(bytes: &[u8]) -> String {
+    let utf16 = |bytes: &[u8], big: bool| -> String {
+        let units: Vec<u16> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&pair| {
+                if big {
+                    u16::from_be_bytes(pair)
+                } else {
+                    u16::from_le_bytes(pair)
+                }
+            })
+            .collect();
+        String::from_utf16_lossy(&units)
+    };
+    match bytes {
+        [0xFF, 0xFE, rest @ ..] => utf16(rest, false),
+        [0xFE, 0xFF, rest @ ..] => utf16(rest, true),
+        [0xEF, 0xBB, 0xBF, rest @ ..] => String::from_utf8_lossy(rest).into_owned(),
+        _ => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
+/// `args` with each `@file` replaced by the file's words (Windows quoting).
+fn expand_shim_response_files(args: &[String], cwd: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for arg in args {
+        match arg.strip_prefix('@') {
+            Some(file) => match std::fs::read(resolve_against(cwd, file)) {
+                Ok(bytes) => out.extend(crate::generate_harness::split_windows_command_line(
+                    &decode_response_file(&bytes),
+                )),
+                Err(_) => out.push(arg.clone()),
+            },
+            None => out.push(arg.clone()),
+        }
+    }
+    out
+}
+
+/// One interception record, in the format `parse_intercept_log` reads.
+fn shim_record(cwd: &Path, real: &Path, args: &[String]) -> String {
+    let mut record = format!("DIR {}\nCC {}\n", cwd.display(), real.display());
+    for arg in args {
+        record.push_str("ARG ");
+        record.push_str(&arg.replace(['\r', '\n'], " "));
+        record.push('\n');
+    }
+    record.push_str("ENDREC\n");
+    record
+}
+
+/// The Windows interception shim: `bhf.exe` started as `cl.exe` (or another
+/// compiler name) from the shim directory. It records the invocation — with
+/// response files expanded, since MSBuild deletes them after the run — and
+/// then runs the real compiler with the arguments unchanged.
+pub(crate) fn run_intercept_shim(stem: &str, args: &[std::ffi::OsString]) -> i32 {
+    let args: Vec<String> = args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let real = std::env::var_os(SHIM_MAP_ENV)
+        .and_then(|map| std::fs::read(map).ok())
+        .and_then(|bytes| serde_json::from_slice::<BTreeMap<String, PathBuf>>(&bytes).ok())
+        .and_then(|map| map.get(stem).cloned());
+    let Some(real) = real else {
+        eprintln!("bhf: no real compiler recorded for the {stem} shim");
+        return 127;
+    };
+    let cwd = std::env::current_dir().unwrap_or_default();
+    if let Some(dir) = std::env::var_os(SHIM_LOG_DIR_ENV) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let record = shim_record(&cwd, &real, &expand_shim_response_files(&args, &cwd));
+        let _ = std::fs::write(
+            PathBuf::from(dir).join(format!("rec-{}-{nanos}.log", std::process::id())),
+            record,
+        );
+    }
+    match Command::new(&real).args(&args).status() {
+        Ok(status) => status.code().unwrap_or(1),
+        Err(error) => {
+            eprintln!("bhf: could not run {}: {error}", real.display());
+            127
+        }
+    }
+}
+
+/// `--build-command` on Windows. Each compiler on PATH gets an `.exe` shim
+/// (this `bhf` executable under the compiler's name) at the front of PATH;
+/// MSBuild, which starts cl from the toolset directory by absolute path, is
+/// pointed at the `cl.exe` shim through the CL task's `CLToolPath`/`CLToolExe`
+/// (with file tracking and the multi-tool task off, both of which assume the
+/// real cl). The command runs through `cmd.exe`. The real build is not
+/// altered: the shims record and pass every argument through.
+fn probe_build_command_windows(tree: &Path, command: &str) -> Option<PathBuf> {
+    let probe_dir = tree.join(PROBE_DIR);
+    let intercept_dir = probe_dir.join("intercept");
+    let log_dir = intercept_dir.join("records");
+    let _ = std::fs::remove_dir_all(&log_dir);
+    if std::fs::create_dir_all(&log_dir).is_err() {
+        return None;
+    }
+    let mut map: BTreeMap<String, PathBuf> = BTreeMap::new();
+    for (name, real) in collect_intercept_targets() {
+        // A cross-prefixed name found on disk carries its own extension.
+        let stem = Path::new(&name)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or(&name)
+            .to_owned();
+        if map.contains_key(&stem) {
+            continue;
+        }
+        match crate::msvc_cc::install_multicall(&intercept_dir, &stem) {
+            Ok(_) => {
+                map.insert(stem, real);
+            }
+            Err(error) => {
+                bhfeprintln!(
+                    "bhf auto: --build-command: could not install the {stem} shim: {error}"
+                );
+            }
+        }
+    }
+    if map.is_empty() {
+        bhfeprintln!(
+            "bhf auto: --build-command: no C/C++ compiler found on PATH to intercept; skipping"
+        );
+        return None;
+    }
+    let map_file = intercept_dir.join(SHIM_MAP_FILE);
+    std::fs::write(&map_file, serde_json::to_vec_pretty(&map).ok()?).ok()?;
+    let mut env =
+        windows_intercept_env(&intercept_dir, &map_file, &log_dir, map.contains_key("cl"));
+    env.push(("MSBUILDDISABLENODEREUSE".to_owned(), "1".to_owned()));
+    let build_succeeded = run_windows_command(tree, command, &env);
+    if !build_succeeded {
+        bhfeprintln!("bhf auto: --build-command: `{command}` failed; using what it compiled");
+    }
+    let mut records: Vec<PathBuf> = std::fs::read_dir(&log_dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    records.sort();
+    let log_text: String = records
+        .iter()
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .collect();
+    let entries = dedup_intercept_entries(parse_intercept_log(&log_text));
+    if entries.is_empty() {
+        bhfeprintln!(
+            "bhf auto: --build-command: intercepted no compiler invocations \
+             (did `{command}` compile any C/C++?)"
+        );
+        return None;
+    }
+    bhfeprintln!(
+        "bhf auto: --build-command: recorded {} translation unit(s)",
+        entries.len()
+    );
+    let db = probe_dir.join("compile_commands.json");
+    let json = serde_json::to_vec_pretty(&entries).ok()?;
+    std::fs::write(&db, json).ok()?;
+    Some(db)
+}
+
+/// The environment of an intercepted Windows build: the shim directory first
+/// on PATH, the shim map and record directory, and — when cl is intercepted —
+/// MSBuild's CL task pointed at the `cl.exe` shim. MSBuild reads environment
+/// variables as properties, and the C++ targets only default `CLToolExe`/
+/// `CLToolPath` when they are empty.
+fn windows_intercept_env(
+    intercept_dir: &Path,
+    map_file: &Path,
+    log_dir: &Path,
+    intercept_cl: bool,
+) -> Vec<(String, String)> {
+    let mut path = vec![intercept_dir.to_path_buf()];
+    if let Some(existing) = std::env::var_os("PATH") {
+        path.extend(std::env::split_paths(&existing));
+    }
+    let path = std::env::join_paths(path)
+        .map(|joined| joined.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut env = vec![
+        ("PATH".to_owned(), path),
+        (SHIM_MAP_ENV.to_owned(), map_file.display().to_string()),
+        (SHIM_LOG_DIR_ENV.to_owned(), log_dir.display().to_string()),
+    ];
+    if intercept_cl {
+        env.push(("CLToolPath".to_owned(), intercept_dir.display().to_string()));
+        env.push(("CLToolExe".to_owned(), "cl.exe".to_owned()));
+        env.push(("TrackFileAccess".to_owned(), "false".to_owned()));
+        env.push(("UseMultiToolTask".to_owned(), "false".to_owned()));
+    }
+    env
+}
+
+/// Run `command` through `cmd.exe` in `dir`. `cmd /s /c "<command>"` keeps the
+/// command's own quoting intact.
+#[cfg(windows)]
+fn run_windows_command(dir: &Path, command: &str, env: &[(String, String)]) -> bool {
+    use std::os::windows::process::CommandExt;
+    let mut cmd = Command::new("cmd.exe");
+    cmd.raw_arg(format!("/d /s /c \"{command}\""))
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null());
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    cmd.status().map(|status| status.success()).unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+fn run_windows_command(_dir: &Path, _command: &str, _env: &[(String, String)]) -> bool {
+    false
 }
 
 /// Configure/Autotools builds often leave their archive beside `configure`
@@ -4591,6 +5004,10 @@ mod tests {
         );
     }
 
+    // The Windows capture's shims are the `bhf` executable itself under a
+    // compiler's name, which a unit-test binary is not; that path runs in the
+    // Windows release smoke (`scripts/ci/windows-release-smoke.ps1`).
+    #[cfg(unix)]
     #[test]
     fn intercepts_a_real_custom_build_into_a_compile_db() {
         // Needs a host C compiler; skip cleanly when absent (matches bhf's
@@ -4660,6 +5077,88 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// A Windows capture shim records cl's invocation with MSBuild's UTF-16
+    /// response file expanded (MSBuild deletes it after the run), and one cl
+    /// run that compiles several translation units becomes one database row
+    /// per source with the shared options.
+    #[test]
+    fn windows_shim_records_expand_response_files_and_split_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("src").join("core");
+        fs::create_dir_all(&cwd).unwrap();
+        let rsp = "/c /I\"C:\\My Projects\\inc\" /DWIDGET_MODE=1 /nologo widget.c table.c\r\n";
+        let mut utf16 = vec![0xFF, 0xFE];
+        for unit in rsp.encode_utf16() {
+            utf16.extend(unit.to_le_bytes());
+        }
+        fs::write(cwd.join("tmp1.rsp"), &utf16).unwrap();
+        assert_eq!(decode_response_file(&utf16), rsp);
+        assert_eq!(decode_response_file(b"\xEF\xBB\xBF/c a.c"), "/c a.c");
+
+        let args = expand_shim_response_files(&["@tmp1.rsp".to_owned()], &cwd);
+        assert_eq!(
+            args,
+            vec![
+                "/c",
+                "/IC:\\My Projects\\inc",
+                "/DWIDGET_MODE=1",
+                "/nologo",
+                "widget.c",
+                "table.c"
+            ]
+        );
+        let real = PathBuf::from("C:/VS/VC/Tools/MSVC/14.44/bin/HostX64/x64/cl.exe");
+        let entries = parse_intercept_log(&shim_record(&cwd, &real, &args));
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(entries[0].file, cwd.join("widget.c"));
+        assert_eq!(entries[1].file, cwd.join("table.c"));
+        for entry in &entries {
+            assert_eq!(entry.arguments[0], real.display().to_string());
+            assert!(entry.arguments.contains(&"/DWIDGET_MODE=1".to_owned()));
+            assert_eq!(
+                entry.arguments.iter().filter(|a| is_source_arg(a)).count(),
+                1,
+                "each row names only its own source: {:?}",
+                entry.arguments
+            );
+        }
+        assert!(is_intercept_shim_name("cl"));
+        assert!(is_intercept_shim_name("clang-cl"));
+        assert!(is_intercept_shim_name("x86_64-w64-mingw32-gcc"));
+        assert!(!is_intercept_shim_name("link"));
+    }
+
+    /// MSBuild starts cl by absolute path from the toolset directory, so the
+    /// Windows capture points the CL task at the shim through environment
+    /// properties, and turns off file tracking, which assumes the real cl.
+    #[test]
+    fn windows_capture_environment_redirects_the_cl_task() {
+        let temp = tempfile::tempdir().unwrap();
+        let shim = temp.path().join(".bhf-build").join("intercept");
+        let env: BTreeMap<String, String> = windows_intercept_env(
+            &shim,
+            &shim.join(SHIM_MAP_FILE),
+            &shim.join("records"),
+            true,
+        )
+        .into_iter()
+        .collect();
+        assert_eq!(env["CLToolPath"], shim.display().to_string());
+        assert_eq!(env["CLToolExe"], "cl.exe");
+        assert_eq!(env["TrackFileAccess"], "false");
+        assert_eq!(env["UseMultiToolTask"], "false");
+        assert!(env["PATH"].starts_with(&shim.display().to_string()));
+        assert_eq!(
+            env[SHIM_LOG_DIR_ENV],
+            shim.join("records").display().to_string()
+        );
+        let without_cl: BTreeMap<String, String> =
+            windows_intercept_env(&shim, &shim.join(SHIM_MAP_FILE), &shim, false)
+                .into_iter()
+                .collect();
+        assert!(!without_cl.contains_key("CLToolPath"));
+    }
+
     #[test]
     fn detects_msbuild_solution_then_cmake_wins() {
         let root = tmpdir();
@@ -4676,21 +5175,181 @@ mod tests {
         assert_eq!(detect_build_system(&root), BuildSystem::CMake);
     }
 
+    /// The project import writes one compile-database row per `ClCompile`
+    /// source with the project's include dirs and defines for ONE configuration:
+    /// a `Condition=` for another configuration is not applied, `\\` separators
+    /// are read as separators on every host (a backslash in a recipe path is
+    /// refused as an injection risk), and a token built on an MSBuild property
+    /// with no value is left out whole.
+    #[test]
+    fn a_visual_studio_solution_beside_another_build_description_is_found() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let touch = |rel: &str| {
+            let path = root.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, "").unwrap();
+        };
+        touch("win32/widget.vcxproj");
+        touch("src/widget.c");
+        assert_eq!(
+            other_build_description(root, &msbuild_files(root)),
+            None,
+            "a solution alone is the only build description"
+        );
+        touch("src/Makefile.am");
+        assert_eq!(
+            other_build_description(root, &msbuild_files(root)),
+            None,
+            "a build file beside the sources, not on the solution's path, is not a root"
+        );
+        for marker in [
+            "configure.ac",
+            "configure.in",
+            "Makefile.in",
+            "autogen.sh",
+            "WORKSPACE.bazel",
+            "BUILD.bazel",
+        ] {
+            touch(marker);
+            assert_eq!(
+                other_build_description(root, &msbuild_files(root)),
+                Some(PathBuf::from(marker))
+            );
+            fs::remove_file(root.join(marker)).unwrap();
+        }
+        // A wrapper directory around the project root.
+        let wrapped = tempfile::tempdir().unwrap();
+        let wrapped = wrapped.path();
+        fs::create_dir_all(wrapped.join("widget-1.0/msvc")).unwrap();
+        fs::write(wrapped.join("widget-1.0/configure.ac"), "").unwrap();
+        fs::write(wrapped.join("widget-1.0/msvc/widget.sln"), "").unwrap();
+        assert_eq!(
+            other_build_description(wrapped, &msbuild_files(wrapped)),
+            Some(PathBuf::from("widget-1.0/configure.ac"))
+        );
+    }
+
+    #[test]
+    fn only_import_libraries_found_in_lib_reach_the_harness_link() {
+        let lib = tmpdir();
+        fs::write(lib.join("ws2_32.lib"), "").unwrap();
+        fs::write(lib.join("libcmt.lib"), "").unwrap();
+        let inputs: Vec<String> = [
+            "ws2_32.lib",
+            "WidgetSupport.lib",
+            "zlib.lib",
+            "libcmt.lib",
+            "C:/proj/x64/Debug/core.lib",
+            "evil$(x).lib",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let (kept, skipped) = harness_link_libraries(&inputs, std::slice::from_ref(&lib));
+        assert_eq!(kept, vec!["ws2_32.lib"]);
+        let skipped: Vec<&str> = skipped.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            skipped,
+            vec![
+                "WidgetSupport.lib",
+                "zlib.lib",
+                "libcmt.lib",
+                "C:/proj/x64/Debug/core.lib",
+                "evil$(x).lib"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_projects_link_libraries_reach_only_its_own_rows() {
+        let root = tmpdir();
+        let lib = root.join("toolset-lib");
+        fs::create_dir_all(&lib).unwrap();
+        fs::write(lib.join("ws2_32.lib"), "").unwrap();
+        for dir in ["app", "support"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        fs::write(root.join("app/main.c"), "int app(void){return 0;}\n").unwrap();
+        fs::write(
+            root.join("support/support.c"),
+            "int support(void){return 0;}\n",
+        )
+        .unwrap();
+        // The app links the support project's output, which has not been
+        // built, and a system import library.
+        fs::write(
+            root.join("app/app.vcxproj"),
+            r#"<Project>
+  <ItemDefinitionGroup><Link><AdditionalDependencies>ws2_32.lib;WidgetSupport.lib;%(AdditionalDependencies)</AdditionalDependencies></Link></ItemDefinitionGroup>
+  <ItemGroup><ClCompile Include="main.c" /></ItemGroup>
+</Project>"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("support/support.vcxproj"),
+            r#"<Project><ItemGroup><ClCompile Include="support.c" /></ItemGroup></Project>"#,
+        )
+        .unwrap();
+        let db = root.join("out/compile_commands.json");
+        import_msbuild_projects_with(
+            &root,
+            &db,
+            &crate::auto::msbuild_import::ImportRequest::default(),
+            false,
+            Some(std::slice::from_ref(&lib)),
+        )
+        .expect("import");
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&fs::read(&db).unwrap()).expect("db");
+        let libraries = |source: &str| {
+            rows.iter()
+                .find(|row| row["file"].as_str().unwrap().ends_with(source))
+                .unwrap()
+                .get("bhf_link_libraries")
+                .cloned()
+        };
+        assert_eq!(libraries("main.c"), Some(serde_json::json!(["ws2_32.lib"])));
+        assert_eq!(
+            libraries("support.c"),
+            None,
+            "another project's libraries are not linked into its harnesses"
+        );
+
+        // Off Windows (no LIB to look in) nothing is linked.
+        import_msbuild_projects_with(
+            &root,
+            &db,
+            &crate::auto::msbuild_import::ImportRequest::default(),
+            false,
+            None,
+        )
+        .expect("import");
+        let text = fs::read_to_string(&db).unwrap();
+        assert!(!text.contains("bhf_link_libraries"), "{text}");
+    }
+
     #[test]
     fn vcxproj_entries_extract_includes_defines_and_sources() {
         let root = tmpdir();
-        fs::create_dir_all(root.join("src")).unwrap();
-        fs::create_dir_all(root.join("include")).unwrap();
-        fs::write(root.join("src/parser.c"), "int p(void){return 0;}\n").unwrap();
-        let vcxproj = root.join("lib.vcxproj");
+        fs::create_dir_all(root.join("lib/src")).unwrap();
+        fs::create_dir_all(root.join("lib/include")).unwrap();
+        fs::create_dir_all(root.join("shared/inc")).unwrap();
+        fs::write(root.join("lib/src/parser.c"), "int p(void){return 0;}\n").unwrap();
+        let vcxproj = root.join("lib/lib.vcxproj");
         fs::write(
             &vcxproj,
             r#"<?xml version="1.0"?>
 <Project>
   <ItemDefinitionGroup>
     <ClCompile>
-      <AdditionalIncludeDirectories>$(ProjectDir)include;$(IntDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions Condition="'$(Config)'=='Release'">PARSERLIB_BUILD;WIN32;CACHE_DIR=$(IntDir);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;..\shared\inc;$(IntDir)\gen\$(NoSuchMacro);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>PARSERLIB_BUILD;WIN32;CACHE_DIR=$(NoSuchMacro);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
+    <ClCompile>
+      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -4699,15 +5358,30 @@ mod tests {
 </Project>"#,
         )
         .unwrap();
-        let entries = vcxproj_entries(&vcxproj);
+        let db = root.join("out/compile_commands.json");
+        let (_, import) = import_msbuild_projects(
+            &root,
+            &db,
+            &crate::auto::msbuild_import::ImportRequest::default(),
+            false,
+        )
+        .expect("import");
+        assert_eq!(import.configuration, "Debug");
+        let entries: Vec<ProbeEntry> = serde_json::from_slice(&fs::read(&db).unwrap()).expect("db");
         assert_eq!(entries.len(), 1, "one ClCompile source -> one entry");
         let args = entries[0].arguments.join(" ");
+        let make = |path: &Path| harness_gen::build_safety::make_path(path);
         assert!(
-            args.contains(&format!(
-                "-I{}",
-                harness_gen::build_safety::make_path(&root.join("include"))
-            )),
+            args.contains(&format!("-I{}", make(&root.join("lib/include")))),
             "include dir resolved from $(ProjectDir): {args}"
+        );
+        assert!(
+            args.contains(&format!("-I{}", make(&root.join("shared/inc")))),
+            "a backslash-separated relative dir resolves on every host: {args}"
+        );
+        assert!(
+            !args.contains('\\'),
+            "no backslash reaches a recipe: {args}"
         );
         assert!(
             args.contains("-DPARSERLIB_BUILD"),
@@ -4715,18 +5389,25 @@ mod tests {
         );
         assert!(args.contains("-DWIN32"), "second define extracted: {args}");
         assert!(
+            !args.contains("NDEBUG"),
+            "another configuration's defines are not applied: {args}"
+        );
+        assert!(
             !args.contains("%("),
             "inherited %(...) placeholders dropped: {args}"
         );
         assert!(
-            !args.contains("$(IntDir)"),
-            "unresolved MSBuild properties are dropped, not emitted into make: {args}"
+            !args.contains("$("),
+            "unresolved properties never reach make: {args}"
         );
         assert!(
-            !args.contains("CACHE_DIR"),
-            "a define with an unresolved property is dropped as one token: {args}"
+            !args.contains("CACHE_DIR") && !args.contains("/gen"),
+            "a token with an unresolved property is dropped as one token: {args}"
         );
-        assert_eq!(entries[0].file, root.join("src").join("parser.c"));
+        assert_eq!(
+            entries[0].file,
+            crate::auto::msbuild_import::normalize_lexically(&root.join("lib/src/parser.c"))
+        );
     }
 
     #[test]

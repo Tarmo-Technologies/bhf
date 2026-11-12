@@ -81,6 +81,14 @@ pub fn damaged_inputs_line(damaged: &crate::migrate::DamagedInputs) -> String {
     )
 }
 
+/// On Windows a sanitized harness needs the sanitizer runtime DLL's directory
+/// on PATH; replay.py adds it (a direct `main.exe` run needs the same).
+const REPRODUCE_PLATFORM_NOTE: &str = if cfg!(windows) {
+    " (it puts the sanitizer runtime DLL directory on PATH; set the same PATH to run the harness directly)"
+} else {
+    ""
+};
+
 pub fn render_index(doc: &FindingsDocument, ctx: &IndexContext) -> String {
     let mut out = String::from("# BHF results\n\n");
     let source = match (&doc.source.root, &doc.source.vcs) {
@@ -368,7 +376,12 @@ pub fn render_index(doc: &FindingsDocument, ctx: &IndexContext) -> String {
             }
         }
         if let Some(command) = rep.reproduce.as_ref().and_then(|r| r.command.as_deref()) {
-            let _ = writeln!(out, "- Reproduce: `{}`", md_code(command));
+            let _ = writeln!(
+                out,
+                "- Reproduce: `{}`{}",
+                md_code(command),
+                REPRODUCE_PLATFORM_NOTE
+            );
         }
         out.push('\n');
     }

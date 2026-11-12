@@ -51,6 +51,47 @@
   spaces so a tree under a spaced path still configures), so they link into
   the GCC-built harnesses instead of clang-built AddressSanitizer archives. A
   toolchain that builds for another target leaves the host probe with clang.
+- The Visual Studio project import reads a solution the way MSBuild would for
+  one configuration: `$(SolutionDir)` is the solution's directory, local
+  `<Import>`s and property sheets are followed, `Condition=` is evaluated for
+  the chosen `Configuration|Platform` (the first listed for x64, or
+  `--msbuild-config`) instead of taking every configuration's defines at once,
+  `$(...)` resolves from the project files and the environment (a token left
+  without a value is named on the console), and each `ClCompile` item's forced
+  includes, undefines, language standard, `AdditionalOptions`, `CharacterSet`
+  and `ExcludedFromBuild` apply. `\` in project paths is read as a separator
+  on every host, so a solution analysed on Linux no longer yields include dirs
+  the recipe guard refuses. With several solutions the choice is
+  deterministic (shallowest, then by path) and printed; `.slnx` and
+  single-quoted `Include=` are read too.
+- A `compile_commands.json` written by an MSVC build (`cl.exe`, `clang-cl`)
+  contributes its include dirs, defines, forced includes and language
+  standard: cl options (`/I`, `/D`, `/U`, `/FI`, `/std:`, `/J`, `/Zp`,
+  `/external:I`) are translated, the rest is named in
+  `BUILD_CONTEXT_DROPPED`, and a `command` string is split by the Windows
+  rules. The harness is still built by bhf's compiler choice. A launcher name
+  (`ccache.exe`) is recognised with its `.exe` suffix and either separator.
+- The C sequence-harness template's Windows crash handler is the chained
+  unhandled-exception filter, as in the direct templates: a first-chance
+  vectored handler turned exceptions AddressSanitizer handles itself into
+  crashes.
+- Windows reproducers start from a plain shell: after a harness build the
+  sanitizer runtime DLL of the toolchain that built it is linked next to
+  `main.exe` and its directories are recorded in `bhf-runtime-path.txt`,
+  which `replay.py` puts on `PATH`. `results/INDEX.md` names `python` (not
+  `python3`) on Windows, and `bhf explain` prints the `PATH` line for a direct
+  run.
+- A harness refused because its build context supplied a path or flag no
+  recipe quoting can contain is reported as a failed build of the build
+  context, not as an unsupported parameter type.
+- A sanitizer stack frame whose source path contains spaces
+  (`C:\Users\...\My Projects\...`) keeps the path whole, so the frame's
+  function, `explain`'s sink and the call-frame chain no longer absorb part of
+  the path.
+- Unresolved symbols reported by the MSVC linkers (`LNK2019`/`LNK2001`,
+  `lld-link: undefined symbol`, including lld-link's unquoted C++ signatures
+  and `__declspec(dllimport)` names) are classified like GNU ld's, so the
+  repair loop stubs them on Windows.
 - `bhf explain` no longer presents dictionary substring matches as gates the
   engine solved. Its comparison evidence is recorded while the finding's own
   input runs: an input span counts only when a comparison operand equals its
@@ -454,6 +495,13 @@
   `passes[].coverage_instrumentation`, `finding.json`
   `build.binary.coverage_instrumentation` and `gate_capture.runner`, and a
   `bhf_runner.json` (`bhf.harness_runner.v1`) beside each cross-built harness.
+- `findings.json` gains an optional `reproduce.build.fidelity`, present only
+  for a finding built with fabricated inputs (both schemas describe it), and
+  `findings.csv` a trailing `build_fidelity` column; readers that address
+  columns by position keep working.
+- Visual Studio solutions, projects and property sheets are build-context
+  files: editing one makes `--resume` re-attempt the targets it affects (a
+  work dir from an earlier release re-attempts once).
 - A heap overflow of a buffer the generated harness sized itself, for a pointer
   parameter it passes without a length, is `lab_only` and reads as
   "precondition-dependent": whether a real caller can pass a buffer that short
@@ -692,6 +740,61 @@
   64 bytes, this run's first, then an earlier run's), under a header saying
   they were observed at runtime. `bhf fuzz` and later `bhf auto` runs load it
   after `dictionary.txt`, each token once, and AFL++ mode passes it with `-x`.
+- Windows: Visual Studio and Windows SDK discovery. Without `INCLUDE`/`LIB`
+  (no Developer shell), bhf finds the newest instance with the C++ toolset
+  through `vswhere`, applies the environment its `VsDevCmd.bat` sets, and
+  caches only what VsDevCmd changed (its variables and the `PATH` directories
+  it added, per instance, version and architecture under
+  `%LOCALAPPDATA%\bhf\vs-env`), which later runs apply onto their own
+  environment. It uses a clang on `PATH`, the standalone LLVM, or Visual Studio's bundled
+  clang, and GNU make from its usual install locations. Each command prints
+  what it used; `run.json` records it as `build_environment` and `--dry-run`
+  shows it. `--no-vs-env` (or `BHF_NO_VS_ENV=1`) and `--vs-arch` control it.
+- An MSVC `cl.exe` harness lane: `--cc cl` (or `clang-cl`, or
+  `[toolchain] cc = "cl"`) builds the C/C++ harnesses with Visual Studio's
+  compiler through `bhf-cl`, a front end that runs cl with the equivalent of
+  the generated Makefiles' command lines, `/fsanitize=address`, and MSVC's
+  SanitizerCoverage (`inline-8bit-counters`, `edge`, `trace-cmp`,
+  `trace-div`). The C driver folds inline 8-bit counters into its edge and
+  hit-count maps after each input and implements the division hooks. cl's
+  diagnostics gain their clang spelling for the repair loop, and weak repair
+  stubs become MSVC alternate names. The Makefiles recognise the `msvc`
+  family. The front end is installed in the user's own cache directory and an
+  existing one is reused only when its bytes are this `bhf`'s.
+- The Visual Studio project import runs by default when a tree has a
+  solution or project and no compile database or CMake/Meson build. Off
+  Windows it does so only when the solution is the tree's only build
+  description: a Makefile, autotools inputs (`configure.ac`, `Makefile.am`,
+  `autogen.sh`), Ninja, SCons or Bazel files at the root or on the way to the
+  solution mean that build is followed, unless `--msbuild-solution` names the
+  solution. It runs nothing and writes its database to `<work>/auto/msbuild/`.
+  On Windows each row carries the import libraries its own project links
+  (`bhf_link_libraries`): only libraries found in a `LIB` directory reach that
+  project's harnesses (`BUILD_CONTEXT_LDFLAGS`, now also in the C
+  Makefiles), and the rest (the solution's own outputs, third-party
+  libraries, paths, C runtime libraries) is named and left out. The project
+  reader is bounded (file size, nesting depth, expanded value length and a
+  per-project expansion budget), so a hostile project file cannot hang or
+  exhaust bhf. The default import is the static reading on every host:
+  MSBuild itself evaluates each project (`msbuild -getItem:ClCompile`) when it
+  is installed only with `--msbuild-evaluate` (config key `msbuild-evaluate`,
+  explicit `--config` only), `--probe-build` or `--run-untrusted`, because
+  evaluation runs the projects' property functions. New flags:
+  `--msbuild-solution` (relative to the scanned tree; a solution outside the
+  tree is imported, and a missing file is an error), `--msbuild-config`,
+  `--no-msbuild-import`, `--msbuild-evaluate`.
+- `--build-command` on Windows captures the cl invocations of an MSBuild
+  build: the command runs through `cmd.exe`, compilers on `PATH` get
+  executable shims, and MSBuild's CL task is pointed at the `cl.exe` shim
+  through `CLToolPath`/`CLToolExe`. Response files are expanded, and a cl run
+  that compiles several sources yields one database row per source.
+- Findings from a harness that compiled only with headers, macro values or
+  types bhf fabricated for missing build context are marked: `finding.json`
+  gets `build.fidelity` (`{level, context, fabricated: [{kind, name, value}]}`),
+  the normalized finding is low confidence with a caveat in INDEX.md and
+  `bhf explain`, and `run.json` lists the target's `build_fidelity` and counts
+  them in `summary.fabricated_build_context`; the console summary and `run.md`
+  list them too.
 - Comparison evidence per finding: `bhf auto` (after minimization) and
   `bhf report --backfill` replay each runtime finding's preferred input with
   the C/C++ driver's comparison capture (`BHF_CMP_EVIDENCE`) and store the

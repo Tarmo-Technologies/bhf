@@ -36,6 +36,10 @@ struct RunJson<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     seeds: Option<crate::auto::seed_manifest::SeedSummary>,
     needed_for_build: NeededForBuild,
+    /// Windows: the Visual Studio/SDK environment and tools the run used
+    /// (absent elsewhere).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    build_environment: Option<&'static crate::windows_env::BuildEnvironment>,
     targets: Vec<TargetEntry<'a>>,
 }
 
@@ -83,6 +87,12 @@ struct Summary {
     /// 0 (omitted) for a non-force run.
     #[serde(skip_serializing_if = "is_zero")]
     forced: usize,
+    /// Of the fuzzed targets, how many were built with headers, macro values
+    /// or types bhf fabricated for missing build context (see
+    /// `targets[].build_fidelity`). Their findings are low confidence. 0
+    /// (omitted) when every build used the real context.
+    #[serde(skip_serializing_if = "is_zero")]
+    fabricated_build_context: usize,
     /// #95: targets whose C/C++/Ada harness built and ran fuzz passes but never
     /// observed the target-entry checkpoint — the run exercised only decoding or
     /// blind stubs, so it is NOT a fuzz success (`built_and_fuzzed`). Surfaced
@@ -266,6 +276,11 @@ struct TargetEntry<'a> {
     /// target that never fuzzed (a failed build has nothing to characterize).
     #[serde(skip_serializing_if = "Option::is_none")]
     fidelity: Option<actionability::Fidelity>,
+    /// The inputs the harness build fabricated because the build context did
+    /// not supply them (placeholder headers, macro values, types). `None`
+    /// (omitted) for a build from the real context.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    build_fidelity: Option<results::model::BuildFidelity>,
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -419,6 +434,13 @@ fn annotate_findings_with_fidelity(
             }
         }
     }
+}
+
+/// Whether a harness-generation refusal came from the build-input safety check
+/// (see `harness_gen::build_safety`): an include dir, flag or path the
+/// project's build context supplied that no recipe quoting can contain.
+fn is_build_context_refusal(reason: &str) -> bool {
+    reason.contains("refusing to generate harness:")
 }
 
 /// force-fuzz Phase 2, persisted: findings from a forced-and-stub-heavy target
@@ -1196,10 +1218,31 @@ pub fn write_reports_with_output_limit(
     needed.missing_ada_units = drain_bag(bag_ada_units);
     needed.harness_codegen_errors = drain_bag(bag_codegen);
 
+    // Inputs each built harness had to fabricate (placeholder headers, macro
+    // values, types): its findings are low confidence and say so.
+    let build_fidelities: Vec<Option<results::model::BuildFidelity>> = results
+        .iter()
+        .map(|r| match &r.outcome {
+            Outcome::BuiltAndFuzzed { repairs, .. }
+            | Outcome::BuiltNotEntered { repairs, .. }
+            | Outcome::Built { repairs, .. } => {
+                crate::auto::build_fidelity::for_target(repairs, &r.harness_dir)
+            }
+            _ => None,
+        })
+        .collect();
+    summary.fabricated_build_context = results
+        .iter()
+        .zip(&build_fidelities)
+        .filter(|(r, fidelity)| {
+            fidelity.is_some() && matches!(r.outcome, Outcome::BuiltAndFuzzed { .. })
+        })
+        .count();
     let targets: Vec<TargetEntry> = results
         .iter()
         .zip(&target_fidelities)
-        .map(|(r, fidelity)| TargetEntry {
+        .zip(&build_fidelities)
+        .map(|((r, fidelity), build_fidelity)| TargetEntry {
             harness_id: &r.candidate.harness_id,
             source: &r.candidate.source_path,
             name: &r.candidate.name,
@@ -1211,6 +1254,7 @@ pub fn write_reports_with_output_limit(
             input_reachability: r.candidate.input_reachability,
             platform_stub: r.outcome.platform_stub(),
             fidelity: fidelity.clone(),
+            build_fidelity: build_fidelity.clone(),
         })
         .collect();
 
@@ -1220,6 +1264,18 @@ pub fn write_reports_with_output_limit(
     // findings so every renderer and importer floors them the same way the CSV
     // path does in memory.
     annotate_forced_findings(work_dir, &forced_harness_ids);
+    // Record the fabricated build inputs on each affected finding, so every
+    // renderer floors its confidence and names what was made up.
+    let fabricated_by_harness: BTreeMap<String, results::model::BuildFidelity> = results
+        .iter()
+        .zip(&build_fidelities)
+        .filter_map(|(r, fidelity)| {
+            fidelity
+                .clone()
+                .map(|fidelity| (r.candidate.harness_id.clone(), fidelity))
+        })
+        .collect();
+    crate::auto::build_fidelity::annotate_findings(work_dir, &fabricated_by_harness);
 
     let run_json = RunJson {
         schema_version: 1,
@@ -1231,6 +1287,7 @@ pub fn write_reports_with_output_limit(
         summary,
         seeds: crate::auto::seed_manifest::summary(work_dir),
         needed_for_build: needed,
+        build_environment: crate::windows_env::activated().filter(|e| e.source != "not_windows"),
         targets,
     };
     let json_path = auto_dir.join("run.json");
@@ -1306,6 +1363,18 @@ pub fn write_reports_with_output_limit(
             language: Some(format!("{:?}", r.candidate.lang)),
         };
         let entry = match &r.outcome {
+            // A path or flag from the project's build context that cannot be
+            // written into a recipe safely (a backslash or `$` left in an include
+            // dir) is a build-context problem, not a parameter type bhf lacks.
+            crate::auto::attempt::Outcome::UnsupportedParams { reason }
+                if is_build_context_refusal(reason) =>
+            {
+                Some((
+                    IssueCategory::FailedBuild,
+                    format!("build context: {}", strip_target_prefix(reason)),
+                    context("build-context"),
+                ))
+            }
             crate::auto::attempt::Outcome::UnsupportedParams { reason } => Some((
                 IssueCategory::UnsupportedType,
                 collapse_uninitializable_param_reason(&strip_target_prefix(reason)),
@@ -2889,6 +2958,32 @@ fn render_md(r: &RunJson<'_>) -> String {
             r.summary.forced, r.summary.built_and_fuzzed
         );
     }
+    if r.summary.fabricated_build_context > 0 {
+        let _ = writeln!(s);
+        let _ = writeln!(
+            s,
+            "## Fabricated build context — {} of {} fuzzed target(s)",
+            r.summary.fabricated_build_context, r.summary.built_and_fuzzed
+        );
+        let _ = writeln!(
+            s,
+            "These harnesses compiled only after bhf supplied headers, macro values or types \
+             the build context lacked. Their findings are low confidence: code built against \
+             a placeholder can take paths the real build never does. Supply the real build \
+             context (a compile database, the project's include dirs, `--define`) and re-run."
+        );
+        for t in &r.targets {
+            if let Some(fidelity) = &t.build_fidelity {
+                let _ = writeln!(
+                    s,
+                    "  - {} {} — {}",
+                    t.harness_id,
+                    t.name,
+                    fidelity.summary()
+                );
+            }
+        }
+    }
     // #417: never let a false clean hide. If any fuzzed target only exercised
     // blind stubs, lead with a loud, structured warning naming every such target
     // so a 0-finding run over millions of stub executions is not read as clean.
@@ -3683,6 +3778,276 @@ mod tests {
             input_reachability: None,
             dialect: None,
         }
+    }
+
+    /// A harness that compiled only after the repair loop fabricated a macro
+    /// value and a header: every report says so. `finding.json` records
+    /// `build.fidelity`, `run.json` names it per target and counts it, and the
+    /// normalized results floor the finding's confidence and carry the caveat
+    /// into INDEX.md and findings.csv. A target built from its real context
+    /// gets none of it.
+    #[test]
+    fn findings_from_a_fabricated_build_context_are_marked_everywhere() {
+        use crate::auto::attempt::{AttemptResult, Outcome, PassRun};
+        use crate::auto::pass::Pass;
+        use crate::auto::repair::Repair;
+
+        let work = tempfile::tempdir().unwrap();
+        let work = work.path();
+        for (id, harness) in [("F-0000-fab0cafe", "H-FAB"), ("F-0001-0e0ac70c", "H-EXACT")] {
+            let dir = work.join("results").join("findings").join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("finding.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "id": id,
+                    "harness_id": harness,
+                    "rule_id": "BHF-201",
+                    "classification": "unhandled",
+                    "build": {"binary": {"sha256": "ab".repeat(32)}},
+                    "exception": {"name": "ASAN_HEAP_BUFFER_OVERFLOW", "sanitizer": "asan",
+                                  "message": "heap-buffer-overflow WRITE of size 1"},
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        let fab_dir = work.join("harnesses").join("H-FAB");
+        std::fs::create_dir_all(fab_dir.join("repairs")).unwrap();
+        std::fs::write(
+            fab_dir.join("repairs/auto_defines.h"),
+            "#define WIDGET_SLOTS 0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            fab_dir.join("Makefile"),
+            "BUILD_CONTEXT_PROVENANCE = none\n",
+        )
+        .unwrap();
+        let built = |harness: &str, finding: &str, repairs: Vec<Repair>| {
+            let mut c = cand(harness);
+            c.name = "parse_record".to_owned();
+            AttemptResult {
+                candidate: c,
+                outcome: Outcome::BuiltAndFuzzed {
+                    repairs,
+                    retries: 0,
+                    per_pass_budget_secs: 60,
+                    total_wall_budget_secs: 60,
+                    executions_per_sec: 9.0,
+                    passes: vec![PassRun {
+                        pass: Pass::Empty,
+                        engine: "builtin".to_owned(),
+                        executions: 9,
+                        target_entry_observed: true,
+                        coverage_edges: 80,
+                        coverage_instrumentation: None,
+                        elapsed_secs: 1.0,
+                        executions_per_sec: 9.0,
+                        findings: vec![finding.to_owned()],
+                    }],
+                    runtrace_events: vec![],
+                },
+                harness_dir: work.join("harnesses").join(harness),
+            }
+        };
+        let results = vec![
+            built(
+                "H-FAB",
+                "F-0000-fab0cafe",
+                vec![
+                    Repair::MacroDefine {
+                        name: "WIDGET_SLOTS".to_owned(),
+                        as_value: true,
+                        function_like: false,
+                    },
+                    Repair::HeaderPlaceholder {
+                        virtual_path: "tables.h".to_owned(),
+                    },
+                ],
+            ),
+            built("H-EXACT", "F-0001-0e0ac70c", vec![]),
+        ];
+        write_reports(
+            std::path::Path::new("/tmp"),
+            &results,
+            work,
+            "T0",
+            "T1",
+            false,
+            actionability::RunMode::Reporting,
+            0,
+            0,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let read = |path: &str| -> serde_json::Value {
+            let bytes = std::fs::read(work.join(path)).unwrap_or_else(|error| {
+                let listing: Vec<_> = walkdir_list(work);
+                panic!("{path}: {error}; work dir holds {listing:#?}")
+            });
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        fn walkdir_list(dir: &std::path::Path) -> Vec<String> {
+            let mut out = Vec::new();
+            for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                out.push(entry.path().display().to_string());
+                if entry.path().is_dir() {
+                    out.extend(walkdir_list(&entry.path()));
+                }
+            }
+            out
+        }
+        let fabricated = read("results/findings/F-0000-fab0cafe/finding.json");
+        assert_eq!(
+            fabricated["build"]["fidelity"]["level"], "reduced",
+            "{fabricated}"
+        );
+        assert_eq!(
+            fabricated["build"]["fidelity"]["fabricated"][0],
+            serde_json::json!({"kind": "macro", "name": "WIDGET_SLOTS", "value": "0"})
+        );
+        assert_eq!(
+            fabricated["build"]["binary"]["sha256"],
+            "ab".repeat(32),
+            "kept"
+        );
+        let exact = read("results/findings/F-0001-0e0ac70c/finding.json");
+        assert!(exact["build"].get("fidelity").is_none(), "{exact}");
+
+        let run = read("auto/run.json");
+        assert_eq!(run["summary"]["fabricated_build_context"], 1, "{run}");
+        let target = |id: &str| {
+            run["targets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["harness_id"] == id)
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(
+            target("H-FAB")["build_fidelity"]["fabricated"][1]["name"],
+            "tables.h"
+        );
+        assert!(target("H-EXACT").get("build_fidelity").is_none());
+
+        results::rebuild(work, &results::RebuildOptions::default()).unwrap();
+        let findings = read("results/findings.json");
+        let normalized = |id: &str| {
+            findings["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|f| f["id"] == id)
+                .cloned()
+                .unwrap()
+        };
+        let fabricated = normalized("F-0000-fab0cafe");
+        assert_eq!(fabricated["confidence"]["level"], "low");
+        assert_eq!(
+            fabricated["reproduce"]["build"]["fidelity"]["level"],
+            "reduced"
+        );
+        let exact = normalized("F-0001-0e0ac70c");
+        assert!(
+            exact["reproduce"]["build"].get("fidelity").is_none(),
+            "{exact}"
+        );
+        assert!(
+            !exact["fidelity"]["caveats"]
+                .to_string()
+                .contains("build context"),
+            "{exact}"
+        );
+        let index = std::fs::read_to_string(work.join("results/INDEX.md")).unwrap();
+        assert!(
+            index.contains("macro WIDGET\\_SLOTS=0, header tables.h"),
+            "the caveat reaches INDEX.md:\n{index}"
+        );
+        let csv = std::fs::read_to_string(work.join("results/findings.csv")).unwrap();
+        let row = csv
+            .lines()
+            .find(|l| l.starts_with("F-0000-fab0cafe"))
+            .unwrap();
+        assert!(
+            row.ends_with("\"reduced: macro WIDGET_SLOTS=0, header tables.h\""),
+            "{row}"
+        );
+        let md = std::fs::read_to_string(work.join("auto/run.md")).unwrap();
+        assert!(md.contains("Fabricated build context — 1 of 2"), "{md}");
+    }
+
+    /// A harness refused because the build context handed it an include dir
+    /// that cannot be put in a recipe safely is reported as a failed build of
+    /// the build context, not as an unsupported parameter type.
+    #[test]
+    fn build_context_refusals_are_failed_builds_not_unsupported_types() {
+        use crate::auto::attempt::{AttemptResult, Outcome};
+        let work = tempfile::tempdir().unwrap();
+        let refused = AttemptResult {
+            candidate: cand("H-REFUSED"),
+            outcome: Outcome::UnsupportedParams {
+                reason: "C target 'f' refusing to generate harness: include dir \
+                         \"/p/src/..\\\\include\" contains a shell/make metacharacter and \
+                         could inject commands into the build recipe"
+                    .to_owned(),
+            },
+            harness_dir: work.path().join("harnesses/H-REFUSED"),
+        };
+        let unsupported = AttemptResult {
+            candidate: cand("H-TYPE"),
+            outcome: Outcome::UnsupportedParams {
+                reason: "C target 'f' has an unsupported parameter type 'va_list'".to_owned(),
+            },
+            harness_dir: work.path().join("harnesses/H-TYPE"),
+        };
+        write_reports(
+            std::path::Path::new("/tmp"),
+            &[refused, unsupported],
+            work.path(),
+            "T0",
+            "T1",
+            false,
+            actionability::RunMode::Reporting,
+            0,
+            0,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let report: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(work.path().join("auto/bug-report.json")).unwrap(),
+        )
+        .unwrap();
+        let issues = report["issues"].as_array().expect("issues");
+        let refused = issues
+            .iter()
+            .find(|issue| {
+                issue["summary"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("metacharacter")
+            })
+            .expect("refusal reported");
+        assert_eq!(refused["category"], "failed-build", "{refused}");
+        assert_eq!(refused["context"]["phase"], "build-context", "{refused}");
+        assert!(
+            refused["summary"]
+                .as_str()
+                .unwrap()
+                .starts_with("build context:"),
+            "{refused}"
+        );
+        let unsupported = issues
+            .iter()
+            .find(|issue| issue["summary"].as_str().unwrap_or("").contains("va_list"))
+            .expect("unsupported type reported");
+        assert_eq!(unsupported["category"], "unsupported-type", "{unsupported}");
     }
 
     /// CC-1: a fuzzed target's structured fidelity must land on both `run.json`
@@ -4582,6 +4947,7 @@ mod tests {
             summary: Summary::default(),
             seeds: None,
             needed_for_build: needed,
+            build_environment: None,
             targets: vec![],
         };
         let md = render_md(&r);
@@ -4609,6 +4975,7 @@ mod tests {
             summary: Summary::default(),
             seeds: None,
             needed_for_build: NeededForBuild::default(),
+            build_environment: None,
             targets: vec![],
         };
         let md = render_md(&r);

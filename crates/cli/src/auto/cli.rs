@@ -71,8 +71,10 @@ FIRST RUN:
     --jobs 1 --max-targets 1 --per-target-time 10
 
 Keep the work directory outside the source tree. Install the compiler or
-interpreter for the languages you select. For Windows C/C++, use an x64
-Developer PowerShell with LLVM, VS Build Tools/Windows SDK, and make installed.
+interpreter for the languages you select. For Windows C/C++, install VS Build
+Tools with the C++ workload (bhf finds it and its clang; no Developer shell
+needed) and GNU make; `--cc cl` builds the harnesses with cl.exe. A Visual
+Studio solution in the tree is imported for its include dirs and defines.
 Read results/INDEX.md for findings
 and auto/summary.txt for targets that built, fuzzed, or were skipped.
 Add --resume to the same command to continue a stopped run.";
@@ -441,6 +443,41 @@ pub struct AutoArgs {
     /// direct run otherwise. Off by default.
     #[arg(long = "probe-build")]
     pub probe_build: bool,
+
+    /// Visual Studio solution (`.sln`/`.slnx`) to import, when the tree has
+    /// several or it lies outside the scanned directory. A relative PATH is
+    /// resolved against the scanned tree; a missing file is an error. By
+    /// default bhf imports the shallowest one (ties broken by path) and names
+    /// it. The import reads the solution's `.vcxproj` files (and their property
+    /// sheets) for each `ClCompile` source's include dirs, defines, forced
+    /// includes and language standard; it runs nothing, so it is on by default
+    /// when the tree has no compile_commands.json and no CMake/Meson build (off
+    /// Windows, only when the solution is the tree's only build description:
+    /// no Makefile, autotools inputs, Ninja, SCons or Bazel build, unless this
+    /// flag names the solution). The default import reads the files
+    /// statically; MSBuild evaluates them with --msbuild-evaluate,
+    /// --probe-build or --run-untrusted.
+    #[arg(long = "msbuild-solution", value_name = "PATH")]
+    pub msbuild_solution: Option<PathBuf>,
+
+    /// Visual Studio configuration to import, as `Configuration|Platform`
+    /// (`Release|x64`). Default: the first one listed for x64, else the first
+    /// listed. Only that configuration's `Condition=` settings apply.
+    #[arg(long = "msbuild-config", value_name = "CONFIG|PLATFORM")]
+    pub msbuild_config: Option<String>,
+
+    /// Do not import a Visual Studio solution's compile settings by default.
+    #[arg(long = "no-msbuild-import")]
+    pub no_msbuild_import: bool,
+
+    /// Let MSBuild evaluate the Visual Studio projects in the default import,
+    /// when it is installed (Windows), with bhf's static reading as the
+    /// fallback for a project MSBuild cannot evaluate. Evaluation runs the
+    /// projects' property functions, so it is opt-in, like --probe-build
+    /// (which implies it). Config key `msbuild-evaluate`, honoured only from
+    /// an explicit --config.
+    #[arg(long = "msbuild-evaluate")]
+    pub msbuild_evaluate: bool,
 
     /// Dependency-scan mode: discover, build each target as far as possible
     /// (stubbing whatever is missing), and emit the missing-dependency manifest —
@@ -1297,6 +1334,39 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     );
     crate::auto::report::write_dependency_checkpoint(&path, &work, &early_dependency_seed, &[])?;
     let probe_requested = args.probe_build || args.run_untrusted || args.build_command.is_some();
+    // The Visual Studio solution/configuration to import, for both the default
+    // project import and the `--probe-build` MSBuild tier (which reads them
+    // from the environment).
+    // A relative `--msbuild-solution` names a file in the scanned tree.
+    let msbuild_solution = match &args.msbuild_solution {
+        Some(solution) => {
+            let resolved = if solution.is_absolute() {
+                solution.clone()
+            } else {
+                path.join(solution)
+            };
+            if !resolved.is_file() {
+                anyhow::bail!(
+                    "--msbuild-solution {}: no such file ({}; a relative path is resolved \
+                     against the scanned tree)",
+                    solution.display(),
+                    resolved.display()
+                );
+            }
+            Some(resolved)
+        }
+        None => None,
+    };
+    let msbuild_request = crate::auto::msbuild_import::ImportRequest {
+        solution: msbuild_solution.clone(),
+        configuration: args.msbuild_config.clone(),
+    };
+    if let Some(solution) = &msbuild_solution {
+        std::env::set_var("BHF_MSBUILD_SOLUTION", solution);
+    }
+    if let Some(config) = &args.msbuild_config {
+        std::env::set_var("BHF_MSBUILD_CONFIG", config);
+    }
     if probe_requested && cross_sweep.is_some() {
         bhfeprintln!(
             "bhf auto: note: the project's build runs for this host; its compile database and \
@@ -1371,6 +1441,20 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         (Some(target), true) => rebuild_probe_archives_for_sweep(&path, &work, target, &toolchain),
         _ => Vec::new(),
     };
+
+    // Visual Studio project import. It reads the solution and project files and
+    // runs nothing, so it is on by default for a tree whose only build
+    // description is a solution: no compile database (that one is
+    // authoritative) and no CMake/Meson build. The database lands in the work
+    // directory, never in the scanned tree, and harness generation reads it
+    // as the last compile-database candidate.
+    if !probe_requested && !args.no_msbuild_import {
+        if let Some(db) =
+            default_msbuild_import(&path, &work, &msbuild_request, args.msbuild_evaluate)
+        {
+            std::env::set_var(crate::generate_harness::PROJECT_COMPILE_DB_ENV, &db);
+        }
+    }
 
     // A build probe can produce exact missing-package/tool diagnostics and can
     // also satisfy generated-output declarations. Refresh and checkpoint both
@@ -1619,6 +1703,11 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
                 "  build recovery: this tree has its own build ({marker}); \
                  pass --build-command {cmd:?} (or --unsafe-search-and-run-build-commands) if targets fail to build"
             );
+        }
+        if let Some(environment) =
+            crate::windows_env::activated().filter(|e| e.source != "not_windows")
+        {
+            bhfeprintln!("  build environment: {}", environment.summary());
         }
         bhfeprintln!(
             "  would fuzz {} target(s){}",
@@ -2012,7 +2101,7 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     // per-target question that `resume_should_reattempt` answers with the
     // outcome and the prior run's force setting, which is strictly more
     // information than one global bit.
-    let build_knobs = format!(
+    let mut build_knobs = format!(
         "project={:?}|no_stubs={}|sanitizers={:?}|decoder_limits={:?}|passes={}|engines={:?}",
         options.project,
         options.no_stubs,
@@ -2021,6 +2110,18 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         options.passes.len(),
         options.engines,
     );
+    // The imported Visual Studio solution and configuration decide every
+    // imported target's defines; only a run that chose them carries the knob,
+    // so other work dirs keep their fingerprint.
+    if msbuild_request.solution.is_some() || msbuild_request.configuration.is_some() {
+        build_knobs.push_str(&format!(
+            "|msbuild={:?}/{:?}",
+            msbuild_request.solution, msbuild_request.configuration
+        ));
+    }
+    if args.msbuild_evaluate {
+        build_knobs.push_str("|msbuild_evaluate");
+    }
     let current_build_fp = crate::auto::discovery::build_context_fingerprint(&path, &build_knobs);
     let build_ctx_file = crate::auto::layout::reports_dir(&work).join("build-context.fingerprint");
     let prior_build_fp = std::fs::read_to_string(&build_ctx_file)
@@ -3943,6 +4044,10 @@ struct AutoSummary {
     /// only blind stubs and never the real library. Surfaced distinctly in the
     /// terminal summary so the run's headline count isn't misread.
     fuzzed_stub_only: usize,
+    /// One line per fuzzed target whose harness compiled only with inputs bhf
+    /// fabricated (placeholder headers, macro values, types): `<id> <name>:
+    /// <what>`. Its findings are low confidence.
+    fabricated_build_context: Vec<String>,
     built: usize,
     /// #95: targets that built and ran fuzz passes but whose entry-instrumented
     /// (C/C++/Ada) harness never observed the target-entry checkpoint — the run
@@ -4009,6 +4114,7 @@ impl AutoSummary {
         let mut built_not_entered = 0;
         let mut skipped = 0;
         let mut skipped_missing_package = 0;
+        let mut fabricated_build_context = Vec::new();
         let mut failed_build = 0;
         let mut link_errors = 0;
         let mut runtime_errors = 0;
@@ -4027,11 +4133,33 @@ impl AutoSummary {
         for r in results {
             files_with_targets.insert(r.candidate.source_path.as_path());
             match &r.outcome {
-                BuiltAndFuzzed { passes, .. } => {
+                BuiltAndFuzzed {
+                    passes, repairs, ..
+                } => {
                     built_and_fuzzed += 1;
                     // #417: track the false-clean subset for the summary line.
                     if r.outcome.stub_execution().is_some_and(|se| se.stub_only) {
                         fuzzed_stub_only += 1;
+                    }
+                    if let Some(fidelity) =
+                        crate::auto::build_fidelity::for_target(repairs, &r.harness_dir)
+                    {
+                        let missing =
+                            crate::auto::build_fidelity::incomplete_context_headers(&fidelity);
+                        let incomplete = if missing.is_empty() {
+                            String::new()
+                        } else {
+                            format!(
+                                " — build context incomplete: missing {}",
+                                missing.join(", ")
+                            )
+                        };
+                        fabricated_build_context.push(format!(
+                            "{} {}: {}{incomplete}",
+                            r.candidate.harness_id,
+                            r.candidate.name,
+                            fidelity.summary()
+                        ));
                     }
                     findings += passes.iter().map(|p| p.findings.len()).sum::<usize>();
                     executions += passes.iter().map(|p| p.executions).sum::<usize>();
@@ -4140,6 +4268,7 @@ impl AutoSummary {
             coverage_edges,
             built_and_fuzzed,
             fuzzed_stub_only,
+            fabricated_build_context,
             built,
             built_not_entered,
             skipped,
@@ -4287,6 +4416,27 @@ impl AutoSummary {
                  stub_execution",
                 self.fuzzed_stub_only
             );
+        }
+
+        if !self.fabricated_build_context.is_empty() {
+            const SHOWN: usize = 5;
+            let _ = writeln!(
+                s,
+                "  ⚠ Build context: {} target(s) compiled only with headers/macro values bhf \
+                 fabricated — their findings are low confidence (run.md, run.json \
+                 targets[].build_fidelity)",
+                self.fabricated_build_context.len()
+            );
+            for line in self.fabricated_build_context.iter().take(SHOWN) {
+                let _ = writeln!(s, "      {line}");
+            }
+            if self.fabricated_build_context.len() > SHOWN {
+                let _ = writeln!(
+                    s,
+                    "      … {} more",
+                    self.fabricated_build_context.len() - SHOWN
+                );
+            }
         }
 
         let _ = writeln!(s);
@@ -5246,6 +5396,60 @@ fn build_error_brief(err: &build_classifier::BuildErrorKind) -> String {
             pick.trim().to_owned()
         }
     }
+}
+
+/// The default Visual Studio project import for `auto`: when `tree` holds a
+/// solution or project, no compile database, and no CMake/Meson build, read
+/// its compile settings into `<work>/auto/msbuild/compile_commands.json`.
+/// The reading is static unless `msbuild_evaluate` (`--msbuild-evaluate`)
+/// lets an installed MSBuild evaluate the projects.
+fn default_msbuild_import(
+    tree: &Path,
+    work: &Path,
+    request: &crate::auto::msbuild_import::ImportRequest,
+    msbuild_evaluate: bool,
+) -> Option<PathBuf> {
+    use crate::auto::build_probe;
+    // A solution named with --msbuild-solution is imported wherever it is.
+    if request.solution.is_none()
+        && (!build_probe::has_msbuild_project(tree)
+            || tree.join("CMakeLists.txt").is_file()
+            || tree.join("meson.build").is_file())
+    {
+        return None;
+    }
+    // Many portable projects ship Visual Studio files next to their own
+    // build (a Makefile, autotools inputs, Bazel). Off Windows that build is
+    // the one the harness should follow, so the solution is imported by
+    // default only when it is the tree's only build description, unless it is
+    // named explicitly.
+    if !cfg!(windows) && request.solution.is_none() {
+        let files = build_probe::msbuild_files(tree);
+        if let Some(marker) = build_probe::other_build_description(tree, &files) {
+            bhfeprintln!(
+                "bhf auto: {} has its own build ({}); not importing its Visual Studio \
+                 solution on this host (--msbuild-solution imports it)",
+                tree.display(),
+                marker.display()
+            );
+            return None;
+        }
+    }
+    if let Some(existing) = build_probe::existing_compile_database(tree) {
+        bhfeprintln!(
+            "bhf auto: using {} rather than importing the Visual Studio solution",
+            existing.display()
+        );
+        return None;
+    }
+    let db = work
+        .join("auto")
+        .join("msbuild")
+        .join("compile_commands.json");
+    // Each row carries the Windows import libraries its own project links,
+    // so a harness links only its project's libraries.
+    let (db, _) = build_probe::import_msbuild_projects(tree, &db, request, msbuild_evaluate)?;
+    Some(db)
 }
 
 #[cfg(test)]
@@ -6873,6 +7077,7 @@ mod tests {
             resumed: 0,
             built_and_fuzzed: 12,
             fuzzed_stub_only: 0,
+            fabricated_build_context: Vec::new(),
             built: 0,
             built_not_entered: 0,
             skipped: 171,
@@ -6927,6 +7132,7 @@ mod tests {
             resumed: 0,
             built_and_fuzzed: 0,
             fuzzed_stub_only: 0,
+            fabricated_build_context: Vec::new(),
             built: 0,
             built_not_entered: 0,
             skipped: 5,
@@ -6965,6 +7171,7 @@ mod tests {
             resumed: 0,
             built_and_fuzzed: 20,
             fuzzed_stub_only: 0,
+            fabricated_build_context: Vec::new(),
             built: 0,
             built_not_entered: 0,
             skipped: 0,
@@ -7004,6 +7211,7 @@ mod tests {
             resumed: 0,
             built_and_fuzzed: 2,
             fuzzed_stub_only: 0,
+            fabricated_build_context: Vec::new(),
             built: 0,
             built_not_entered: 0,
             skipped: 0,

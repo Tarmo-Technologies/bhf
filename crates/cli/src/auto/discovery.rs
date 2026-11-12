@@ -1112,8 +1112,9 @@ pub fn build_context_fingerprint(root: &Path, knobs: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-/// Whether `path` is a build-context file: a compile database, GNAT project, or
-/// IDL — the inputs that change how bhf recovers a build.
+/// Whether `path` is a build-context file: a compile database, GNAT project,
+/// IDL, or Visual Studio solution/project/property sheet — the inputs that
+/// change how bhf recovers a build.
 fn is_build_context_file(path: &Path) -> bool {
     if path.file_name().and_then(|n| n.to_str()) == Some("compile_commands.json") {
         return true;
@@ -1123,7 +1124,7 @@ fn is_build_context_file(path: &Path) -> bool {
             .and_then(|e| e.to_str())
             .map(str::to_ascii_lowercase)
             .as_deref(),
-        Some("gpr") | Some("idl")
+        Some("gpr" | "idl" | "sln" | "slnx" | "vcxproj" | "props")
     )
 }
 
@@ -4217,6 +4218,23 @@ mod tests {
         fs::write(root.join("compile_commands.json"), "[]\n").unwrap();
         let fp2 = build_context_fingerprint(&root, "knobs-a");
         assert_ne!(fp1, fp2, "a new compile_commands.json must change it");
+
+        // The Visual Studio project import reads property sheets by default, so
+        // editing one changes how imported targets build.
+        fs::write(root.join("common.props"), "<Project/>\n").unwrap();
+        let with_sheet = build_context_fingerprint(&root, "knobs-a");
+        assert_ne!(fp2, with_sheet, "a property sheet is a build-context file");
+        fs::write(
+            root.join("common.props"),
+            "<Project><PropertyGroup/></Project>\n",
+        )
+        .unwrap();
+        assert_ne!(
+            with_sheet,
+            build_context_fingerprint(&root, "knobs-a"),
+            "editing a property sheet must change it"
+        );
+        fs::remove_file(root.join("common.props")).unwrap();
 
         // Changing a harness-affecting option (knobs) changes it with no file edit.
         assert_ne!(

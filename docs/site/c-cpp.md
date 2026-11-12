@@ -165,6 +165,58 @@ only when the file exists relative to the entry's `directory`; otherwise it is
 kept as written, so `-include iostream` still finds the system header through
 the include search path.
 
+A database written by an MSVC build (`cl.exe` or `clang-cl` rows, with `/I`,
+`/D`, `/U`, `/FI`, `/std:c11`, `/J`, `/Zp4`, `/Zc:wchar_t-`, `/external:I`)
+is read the same way: each option with build semantics becomes its clang
+spelling, backslash separators become `/`, and the rest (`/O2`, `/Zi`, `/MD`,
+`/EHsc`, `/W4`, `/Fo...`, precompiled-header switches) is left out and named
+in the Makefile's `BUILD_CONTEXT_DROPPED`. A `command` string is split by the
+Windows command-line rules. The harness is still built by bhf's compiler
+choice (clang, or cl with `--cc cl`), not by the row's `cl.exe`.
+
+**Visual Studio solutions.** A tree with a `.sln`, `.slnx` or `.vcxproj` and
+no compile database or CMake/Meson build is imported by default (off Windows,
+only when the solution is the tree's only build description: a tree that also
+has a Makefile, autotools inputs such as `configure.ac`/`Makefile.am`, Ninja,
+SCons or Bazel files, at its root or on the way to the solution, follows that
+build unless `--msbuild-solution` names the solution). The import
+reads the files and runs nothing: it takes the solution's directory as
+`$(SolutionDir)`, follows the project's local `<Import>`s and property sheets,
+evaluates `Condition=` for one configuration (the first listed for x64, or
+`--msbuild-config Release|x64`), resolves `$(...)` from the solution, the
+project files and the environment, and reads each `ClCompile` item's include
+dirs, defines, undefines, forced includes, `LanguageStandard`,
+`AdditionalOptions`, `CharacterSet` (`UNICODE`/`_UNICODE` or `_MBCS`) and
+`ExcludedFromBuild`. It prints the solution and configuration it read; with
+several solutions it takes the shallowest (then by path), and
+`--msbuild-solution` picks another (relative to the scanned tree; a solution
+outside it is imported too, and a missing file is an error). A `$(...)` with
+no value here leaves its
+include dir or define out, and the run names it (MSBuild reads environment
+variables as properties, so setting `MYSDK` supplies `$(MYSDK)`). The database
+is written to `<work>/auto/msbuild/compile_commands.json`, never into the
+tree. On Windows each row also carries the import libraries (`ws2_32.lib`,
+found in `LIB`) its own project links, which reach only that project's
+harnesses. `--no-msbuild-import` turns it off. The default import is this
+static reading; MSBuild itself evaluates each project
+(`msbuild -getItem:ClCompile`) when it is installed only with
+`--msbuild-evaluate`, `--probe-build` or `--run-untrusted`, since evaluation
+runs the project's property functions. See [windows.md](windows.md) for
+Windows specifics.
+
+**Fabricated build context.** When the build context still leaves a header,
+a macro value or a type undefined, the repair loop writes a placeholder
+(an empty header, `#define NAME 0`, `typedef void *T`) so the target
+compiles. Code compiled against a placeholder can take paths the real build
+never does, so such a finding may be false or need an input the real build
+rejects. Each one says so: its `finding.json` has `build.fidelity`
+(`{level: "reduced", context, fabricated: [{kind, name, value}]}`), its
+normalized record is low confidence with a caveat in INDEX.md, findings.csv's
+`build_fidelity` column and `bhf explain`, and `run.json` lists the target's
+`build_fidelity` and counts the targets in `summary.fabricated_build_context`.
+The console summary and `run.md` list them too. Supply the real context (a
+compile database, `--extra-include`, `--define`) and re-run.
+
 `bhf build` compiles exactly the sources the Makefile lists; it has no repair
 loop. When the link fails on symbols defined elsewhere in the tree, it prints
 the defining files with the `--extra-source` flags to regenerate with and an
@@ -185,7 +237,8 @@ this: they replace the sanitizer and coverage flags.
 To *recover* a database when none exists, `--probe-build` runs the project's own
 build offline and captures the real compile flags. It detects and drives CMake
 (`-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`), Meson (`meson setup`), MSBuild
-(Visual Studio `.vcxproj` parse), Make/autotools (a compiler-interposing `CC`/`CXX` wrapper),
+(the Visual Studio import above, evaluated by MSBuild when it is installed),
+Make/autotools (a compiler-interposing `CC`/`CXX` wrapper),
 standalone Ninja (`ninja -t compdb`), and — under compiler interception — Bazel
 (`bazel build //...`) and SCons (`scons`).
 
@@ -194,10 +247,12 @@ build named anything — `--build-command "<cmd>"` runs that exact command under
 two complementary interceptors that record every compile into one
 `compile_commands.json`:
 
-- a front-of-`PATH` compiler shim that catches `cc`/`gcc`/`clang` and the named
-  vendor compilers common in radar/RTOS work (Wind River Diab `dcc`/`dplus`,
-  Green Hills `ccarm`/`cxarm`, QNX `qcc`/`q++`, Keil/IAR, TI) plus cross-prefixed
-  GNU/LLVM toolchains invoked *by name*; and
+- a front-of-`PATH` compiler shim that catches `cc`/`gcc`/`clang`, MSVC's
+  `cl`/`clang-cl`, and the named vendor compilers common in radar/RTOS work
+  (Wind River Diab `dcc`/`dplus`, Green Hills `ccarm`/`cxarm`, QNX `qcc`/`q++`,
+  Keil/IAR, TI) plus cross-prefixed GNU/LLVM toolchains invoked *by name*
+  (on Windows the shims are executables, and an MSBuild build is captured
+  through its CL task, see [windows.md](windows.md)); and
 - an `LD_PRELOAD` exec-interposing shim (`libbhf_cc_intercept.so`) that hooks
   the `exec*`/`posix_spawn*` family, so a compiler invoked **by absolute path**
   (a hard-coded vendor toolchain, a Bazel toolchain) or via `posix_spawn`

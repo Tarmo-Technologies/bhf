@@ -10,9 +10,9 @@
 //! SECURITY: an AUTO-loaded `.bhf.toml` comes from the scanned, possibly-untrusted
 //! tree, so it honors ONLY safe knobs; the fields that make bhf EXECUTE something the
 //! file names (`build-command`, `unsafe-search-and-run…`, `run-untrusted`,
-//! `probe-build`, and the whole `[toolchain]` and `[cross.<guard>]` tables, whose
-//! compilers, flags and runners bhf would run) are ignored unless the config was passed
-//! EXPLICITLY with `--config`, so a hostile tree can't auto-run code.
+//! `probe-build`, `msbuild-evaluate`, and the whole `[toolchain]` and `[cross.<guard>]`
+//! tables, whose compilers, flags and runners bhf would run) are ignored unless the
+//! config was passed EXPLICITLY with `--config`, so a hostile tree can't auto-run code.
 
 use std::path::{Path, PathBuf};
 
@@ -65,6 +65,9 @@ pub struct AutoConfig {
     pub run_untrusted: Option<bool>,
     pub unsafe_search_and_run_build_commands: Option<bool>,
     pub probe_build: Option<bool>,
+    /// `--msbuild-evaluate`: MSBuild evaluates the imported Visual Studio
+    /// projects, running their property functions.
+    pub msbuild_evaluate: Option<bool>,
     /// The `[toolchain]` table shared with `bhf build --config`.
     pub toolchain: Option<config::ToolchainConfig>,
     /// `[cross.<guard>]` tables: the toolchain and emulator of each
@@ -108,6 +111,7 @@ pub(crate) const FLAG_CONFIG_KEYS: &[(&str, &str)] = &[
         "unsafe-search-and-run-build-commands",
     ),
     ("probe-build", "probe-build"),
+    ("msbuild-evaluate", "msbuild-evaluate"),
     ("cc", "toolchain.cc"),
     ("cxx", "toolchain.cxx"),
     ("cflags", "toolchain.cflags"),
@@ -172,6 +176,10 @@ pub(crate) const FLAGS_WITHOUT_CONFIG_KEYS: &[&str] = &[
     "sloc",
     "static-dynamic",
     "no-minimize",
+    // Visual Studio project import selection.
+    "msbuild-solution",
+    "msbuild-config",
+    "no-msbuild-import",
     // C/C++ decoder synthesis caps (shared with `bhf generate-harness`).
     "array-max-size",
     "bitset-max-size",
@@ -384,6 +392,7 @@ pub fn apply(args: &mut AutoArgs, tree_root: &Path) -> Result<Vec<String>, Strin
         || config.run_untrusted == Some(true)
         || config.unsafe_search_and_run_build_commands == Some(true)
         || config.probe_build == Some(true)
+        || config.msbuild_evaluate == Some(true)
         || config.toolchain.as_ref().is_some_and(|t| !t.is_empty())
         || config
             .cross
@@ -405,6 +414,9 @@ pub fn apply(args: &mut AutoArgs, tree_root: &Path) -> Result<Vec<String>, Strin
             if config.probe_build == Some(true) {
                 args.probe_build = true;
             }
+            if config.msbuild_evaluate == Some(true) {
+                args.msbuild_evaluate = true;
+            }
             if let Some(mut toolchain) = config.toolchain {
                 toolchain.resolve_relative_to(base);
                 args.config_toolchain = Some(toolchain);
@@ -420,9 +432,9 @@ pub fn apply(args: &mut AutoArgs, tree_root: &Path) -> Result<Vec<String>, Strin
             notes.push(format!(
                 "ignoring build-executing keys in the auto-loaded {CONFIG_FILE_NAME} \
                  (build-command / run-untrusted / unsafe-search-and-run-build-commands / \
-                 probe-build / [toolchain] / [cross.*]) — pass it explicitly with --config to \
-                 honor them, \
-                 since they run code or programs named by the scanned tree"
+                 probe-build / msbuild-evaluate / [toolchain] / [cross.*]) — pass it \
+                 explicitly with --config to honor them, since they run code or programs \
+                 named by the scanned tree"
             ));
         }
         Trust::TreeAutoloaded => {}
@@ -461,7 +473,8 @@ mod tests {
             | "seed-mining"
             | "run-untrusted"
             | "unsafe-search-and-run-build-commands"
-            | "probe-build" => "true",
+            | "probe-build"
+            | "msbuild-evaluate" => "true",
             "extra-include" | "extra-source" | "exclude-path" | "seed-file" | "seed-dir"
             | "sanitizers" | "languages" | "ada-deps" | "cflags" | "cxxflags" | "ldflags"
             | "defines" | "include-dirs" | "runner-args" | "switches" => "[\"c\"]",
@@ -515,9 +528,17 @@ mod tests {
                 top.push_str(&format!("{key} = {}\n", sample_value(key)));
             }
         }
-        let text = format!("{top}{toolchain}{ada}");
+        // The `[cross.<guard>]` tables have no flags; every key of one.
+        let cross = "[cross.aarch64]\ntarget = \"x\"\ncc = \"x\"\ncxx = \"x\"\n\
+                     sysroot = \"x\"\nrunner = \"x\"\nrunner-args = [\"c\"]\n";
+        let text = format!("{top}{toolchain}{ada}{cross}");
         let parsed: Result<AutoConfig, _> = toml::from_str(&text);
         assert!(parsed.is_ok(), "{:?}\n{text}", parsed.err());
+        let parsed = parsed.unwrap();
+        assert_eq!(parsed.msbuild_evaluate, Some(true));
+        let lane = &parsed.cross.expect("the cross table parses")["aarch64"];
+        assert_eq!(lane.runner_args, ["c"]);
+        assert!(lane.target.is_some() && lane.cxx.is_some() && lane.sysroot.is_some());
     }
 
     #[test]

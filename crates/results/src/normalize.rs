@@ -79,6 +79,10 @@ pub fn producer_for(kind: Kind, id: &str) -> &'static str {
     }
 }
 
+/// The interpreter a reproducer command names: Windows' Python installer
+/// provides `python` (and `py`), not `python3`.
+const REPLAY_PYTHON: &str = if cfg!(windows) { "python" } else { "python3" };
+
 /// One loaded `finding.json`. Errors (as a reason for the index's
 /// `errors[]`) when the record cannot be a finding directory: an invalid id,
 /// or an SCA kind, since SCA findings exist only as SBOM matches.
@@ -99,6 +103,12 @@ pub fn from_finding_report(
     }
     let a = &f.actionability;
     let forced = raw.get("forced").and_then(Value::as_bool).unwrap_or(false);
+    // A harness compiled with headers or macro values bhf made up: the finding
+    // keeps its severity, but its confidence is floored and it says why.
+    let build_fidelity = raw
+        .pointer("/build/fidelity")
+        .and_then(|value| serde_json::from_value::<crate::model::BuildFidelity>(value.clone()).ok())
+        .filter(|fidelity| !fidelity.fabricated.is_empty());
     let rule = rule_ref(f.rule_id.as_deref());
 
     let exception = ExceptionInfo {
@@ -146,6 +156,9 @@ pub fn from_finding_report(
     }
     if str_at(raw, &["minimization_skipped"]).as_deref() == Some("time_budget") {
         caveats.push(crate::UNMINIMIZED_CAVEAT.to_owned());
+    }
+    if let Some(fidelity) = &build_fidelity {
+        caveats.push(fidelity.caveat());
     }
 
     // A binary crash keeps its signature under `crash` (exit/signal + stderr
@@ -206,7 +219,7 @@ pub fn from_finding_report(
         explanation: a.explanation.clone(),
         impact: Some(a.impact.as_str().to_owned()),
         confidence: Confidence {
-            level: if forced {
+            level: if forced || build_fidelity.is_some() {
                 "low".to_owned()
             } else {
                 a.confidence.as_str().to_owned()
@@ -251,11 +264,12 @@ pub fn from_finding_report(
             harness_id: str_at(raw, &["harness_id"]),
             // Only commands bhf builds: record text (`triage.replay`) may come
             // from an imported directory.
-            command: has_replay.then(|| format!("python3 findings/{}/replay.py", f.id)),
+            command: has_replay.then(|| format!("{REPLAY_PYTHON} findings/{}/replay.py", f.id)),
             build: BuildInfo {
                 sanitizers: sanitizers(raw, exception.sanitizer.as_deref()),
                 binary_sha256: binary_sha256.clone(),
                 build_id: build_id.clone(),
+                fidelity: build_fidelity.clone(),
             },
         }),
         evidence,
@@ -2008,6 +2022,56 @@ mod tests {
         assert!(f.fidelity.forced);
         assert_eq!(f.confirmation.level, ConfirmationLevel::CrashLead);
         assert!(f.fidelity.caveats.iter().any(|c| c == "forced stub build"));
+    }
+
+    /// A harness that compiled only after bhf supplied headers or macro values
+    /// the build context lacked: its findings keep their severity but are
+    /// floored to low confidence, carry the caveat naming what was supplied,
+    /// and keep the record under `reproduce.build.fidelity`.
+    #[test]
+    fn findings_from_a_fabricated_build_context_are_floored_and_named() {
+        let mut raw = asan_record();
+        raw["build"] = json!({
+            "fidelity": {
+                "level": "reduced",
+                "context": "exact_tu_compile_database",
+                "fabricated": [
+                    {"kind": "macro", "name": "WIDGET_SLOTS", "value": "0"},
+                    {"kind": "header", "name": "tables.h"}
+                ]
+            }
+        });
+        let f = normalize(raw, None);
+        assert_eq!(f.confidence.level, "low");
+        assert!(
+            f.severity > Severity::Low,
+            "severity is not floored: {:?}",
+            f.severity
+        );
+        let caveat = f
+            .fidelity
+            .caveats
+            .iter()
+            .find(|c| c.contains("build context"))
+            .unwrap_or_else(|| panic!("no build-context caveat: {:?}", f.fidelity.caveats));
+        assert!(caveat.contains("macro WIDGET_SLOTS=0"), "{caveat}");
+        assert!(caveat.contains("header tables.h"), "{caveat}");
+        let fidelity = f
+            .reproduce
+            .as_ref()
+            .and_then(|r| r.build.fidelity.as_ref())
+            .expect("reproduce.build.fidelity");
+        assert_eq!(fidelity.level, "reduced");
+        assert_eq!(fidelity.fabricated.len(), 2);
+
+        let plain = normalize(asan_record(), None);
+        assert!(plain.reproduce.as_ref().unwrap().build.fidelity.is_none());
+        assert_ne!(plain.confidence.level, "low");
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(
+            json["reproduce"]["build"].get("fidelity").is_none(),
+            "an exact build adds nothing to its record: {json}"
+        );
     }
 
     #[test]

@@ -138,12 +138,13 @@ fn install_hint(lang: Lang, windows: bool) -> &'static str {
     if windows {
         return match lang {
             Lang::C | Lang::Cpp => {
-                "install LLVM, VS 2022 Build Tools/Windows SDK, and GNU make (winget/Chocolatey + w64devkit)"
+                "install VS 2022 Build Tools with the C++ workload (bhf finds it with vswhere; \
+                 its \"C++ Clang tools\" component or a standalone LLVM provides clang) and GNU \
+                 make (w64devkit in C:\\w64devkit, or Chocolatey); the `bhf: build environment` \
+                 line says what was found"
             }
             Lang::Ada => "install a Windows GNAT toolchain and GPRbuild",
-            Lang::Rust => {
-                "install rustup + a nightly toolchain (rustup toolchain install nightly)"
-            }
+            Lang::Rust => "install rustup + a nightly toolchain (rustup toolchain install nightly)",
             Lang::Java => "install a Windows JDK",
             Lang::Python => "install Python 3.12+ for sys.monitoring coverage",
             Lang::Perl => "install a Windows Perl distribution",

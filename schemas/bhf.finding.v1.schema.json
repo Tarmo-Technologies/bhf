@@ -13,6 +13,13 @@
     "last_seen": { "type": "string", "format": "date-time" },
     "forced": { "type": "boolean" },
     "forced_note": { "type": "string" },
+    "build": {
+      "description": "Build facts of the harness that produced the finding. `fidelity` is present when the harness compiled only after bhf supplied headers, macro values or types the build context lacked.",
+      "type": "object",
+      "properties": {
+        "fidelity": { "$ref": "bhf.findings.v1.schema.json#/$defs/build_fidelity" }
+      }
+    },
     "gates": {
       "description": "Comparison evidence recorded by replaying the finding's input (gate_capture.input): each input span whose bytes reached a comparison of the target.",
       "type": "array",

@@ -48,6 +48,30 @@
     }
   },
   "$defs": {
+    "build_fidelity": {
+      "description": "Inputs bhf fabricated so the harness compiled because the build context did not supply them (written only when there are any).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["level", "fabricated"],
+      "properties": {
+        "level": { "enum": ["reduced"] },
+        "context": { "$ref": "#/$defs/nullable_string" },
+        "fabricated": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "name"],
+            "properties": {
+              "kind": { "enum": ["macro", "header", "type"] },
+              "name": { "type": "string", "minLength": 1 },
+              "value": { "$ref": "#/$defs/nullable_string" }
+            }
+          }
+        }
+      }
+    },
     "count_map": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } },
     "nullable_string": { "type": ["string", "null"] },
     "tool": {
@@ -336,7 +360,8 @@
                   "properties": {
                     "sanitizers": { "type": "array", "items": { "type": "string" } },
                     "binary_sha256": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" },
-                    "build_id": { "type": ["string", "null"], "pattern": "^[0-9a-f]+$" }
+                    "build_id": { "type": ["string", "null"], "pattern": "^[0-9a-f]+$" },
+                    "fidelity": { "$ref": "#/$defs/build_fidelity" }
                   }
                 }
               }

@@ -87,7 +87,7 @@ class WorkflowContractTests(unittest.TestCase):
             if line.strip().startswith("cargo test "):
                 commands += 1
                 self.assertEqual(lines[index + 1].strip(), "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }")
-        self.assertEqual(commands, 3)
+        self.assertEqual(commands, 7)
 
     def test_runner_jobs_are_bounded(self):
         for name, block in self.jobs.items():

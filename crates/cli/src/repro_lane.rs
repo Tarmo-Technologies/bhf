@@ -1930,7 +1930,9 @@ impl CFamilyLane {
                 family: CompilerFamily::Clang,
                 source: "harness binary",
             },
-            None => CapsuleCompiler {
+            // The probe reads ELF notes only, so it never names cl; a harness
+            // it cannot attribute rebuilds with the lane's default.
+            Some(CompilerFamily::Msvc) | None => CapsuleCompiler {
                 command: toolchain.default.to_owned(),
                 family: CompilerFamily::Clang,
                 source: "default",

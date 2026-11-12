@@ -60,6 +60,32 @@ class SchemaFilesTest(unittest.TestCase):
         bad = {**doc, "finding_kind": "nope"}
         self.assertNotEqual(_errors(validator, bad), [])
 
+    def test_build_fidelity_validates_in_both_documents(self):
+        fidelity = {
+            "level": "reduced",
+            "context": "none",
+            "fabricated": [
+                {"kind": "macro", "name": "WIDGET_SLOTS", "value": "0"},
+                {"kind": "header", "name": "tables.h"},
+            ],
+        }
+        doc = json.loads((EXAMPLES / "findings.v1.example.json").read_text())
+        doc["findings"][0]["reproduce"]["build"]["fidelity"] = fidelity
+        findings = _validator("bhf.findings.v1.schema.json")
+        self.assertEqual(_errors(findings, doc), [])
+        bad = json.loads(json.dumps(doc))
+        bad["findings"][0]["reproduce"]["build"]["fidelity"]["fabricated"][0]["kind"] = "guess"
+        self.assertNotEqual(_errors(findings, bad), [])
+
+        envelope = {
+            "schema_version": "bhf.finding.v1",
+            "id": "F-0000-1a2b3c4d",
+            "finding_kind": "fuzz",
+            "created_at": "2026-10-01T11:20:00Z",
+            "build": {"binary": {"sha256": "0" * 64}, "fidelity": fidelity},
+        }
+        self.assertEqual(_errors(_validator("bhf.finding.v1.schema.json"), envelope), [])
+
     def test_manifest_validates(self):
         doc = {
             "schema_version": "bhf.results-manifest.v1",

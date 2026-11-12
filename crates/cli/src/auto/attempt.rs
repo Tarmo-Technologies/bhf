@@ -7397,7 +7397,7 @@ fn native_override_for(
             // harmless patterns; subtract them only when UBSan is in the set (the
             // subtraction must follow `-fsanitize=undefined`), mirroring the
             // Makefile default, in the spelling this family accepts.
-            if has_ubsan {
+            if has_ubsan && family.supports_ubsan() {
                 flags.push(family.ubsan_subtraction().to_owned());
             }
         }

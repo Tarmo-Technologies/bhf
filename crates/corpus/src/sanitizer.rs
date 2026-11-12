@@ -1698,6 +1698,16 @@ fn split_function_and_location(after: &str) -> (&str, Option<String>, Option<u32
     let mut cursor = after.trim();
     let mut file_opt: Option<String> = None;
     let mut line_opt: Option<u32> = None;
+    // A source path may itself hold spaces (`C:\Users\Some One\My
+    // Projects\x.c:25`, `/home/some one/x.c:3`), so the last token is not the
+    // whole location. Take the earliest absolute path start after a space
+    // whose remainder parses as `path:LINE[:COL]`.
+    if let Some(start) = spaced_location_start(cursor) {
+        let (file, line) = parse_file_line(cursor[start..].trim());
+        if file.is_some() {
+            return (cursor[..start].trim_end(), file, line);
+        }
+    }
     if let Some(last_ws) = cursor.rfind(char::is_whitespace) {
         let tail = cursor[last_ws..].trim_start();
         if !tail.starts_with('(') {
@@ -1749,6 +1759,27 @@ fn split_function_and_location(after: &str) -> (&str, Option<String>, Option<u32
         cursor = preceding.trim_end();
     }
     (cursor, file_opt, line_opt)
+}
+
+/// Where a location with spaces starts in the text after `" in "`: the
+/// earliest `X:\`, `X:/` or `/` that follows a space and leaves a symbol
+/// before it. `None` when the location has no space (the last-token rule
+/// handles it).
+fn spaced_location_start(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let last_space = text.rfind(char::is_whitespace)?;
+    (1..=last_space).find(|&i| {
+        if !bytes[i - 1].is_ascii_whitespace() || text[..i].trim().is_empty() {
+            return false;
+        }
+        let rest = &bytes[i..];
+        // The location must reach past the last space, or it has none.
+        let drive = rest.len() > 2
+            && rest[0].is_ascii_alphabetic()
+            && rest[1] == b':'
+            && (rest[2] == b'\\' || rest[2] == b'/');
+        (drive || rest.first() == Some(&b'/')) && i <= last_space
+    })
 }
 
 /// Parse the trailing `/path/file.c:42[:7]` token from a sanitizer frame.
@@ -2287,6 +2318,46 @@ t.c:1:1: runtime error: signed integer overflow: 2 + 2147483647
             "fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long)"
         );
         assert!(r.stack[0].file.is_none());
+    }
+
+    /// A source path with spaces (a Windows profile, `My Projects`) stays one
+    /// location: the frame's function is only the symbol before it.
+    #[test]
+    fn parse_stack_frame_keeps_a_spaced_windows_or_posix_path_whole() {
+        let stderr = "\
+==1==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x118c6c6a00b8
+    #0 0x7ff7c3a9540b in parse_record C:\\Users\\Some One\\My Projects\\widget\\src\\widget.c:25
+    #1 0x7ff7c3a93d7f in bhf_run_one C:/work dir/harnesses/H-1/main.c:83:7
+    #2 0x4ff in Widget::size(int) const /home/some one/src/widget.cpp:12
+    #3 0x4ff in main /src/plain.c:9
+";
+        let r = parse_sanitizer_report(stderr).unwrap();
+        let frames: Vec<(&str, Option<&str>, Option<u32>)> = r
+            .stack
+            .iter()
+            .map(|f| (f.function.as_str(), f.file.as_deref(), f.line))
+            .collect();
+        assert_eq!(
+            frames,
+            vec![
+                (
+                    "parse_record",
+                    Some("C:\\Users\\Some One\\My Projects\\widget\\src\\widget.c"),
+                    Some(25)
+                ),
+                (
+                    "bhf_run_one",
+                    Some("C:/work dir/harnesses/H-1/main.c"),
+                    Some(83)
+                ),
+                (
+                    "Widget::size(int) const",
+                    Some("/home/some one/src/widget.cpp"),
+                    Some(12)
+                ),
+                ("main", Some("/src/plain.c"), Some(9)),
+            ]
+        );
     }
 
     #[test]

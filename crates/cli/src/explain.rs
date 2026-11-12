@@ -203,6 +203,19 @@ fn explain_one(work_dir: &Path, f: &Finding, others: &[String], collapsed: bool)
             harness_label_paren(work_dir, &harness_id)
         );
     }
+    if let Some(fidelity) = f
+        .raw
+        .pointer("/build/fidelity")
+        .and_then(|value| {
+            serde_json::from_value::<results::model::BuildFidelity>(value.clone()).ok()
+        })
+        .filter(|fidelity| !fidelity.fabricated.is_empty())
+    {
+        let _ = writeln!(s, "  ⚠ BUILD FIDELITY (low confidence)");
+        for line in wrap(&fidelity.caveat(), 74) {
+            let _ = writeln!(s, "    {line}");
+        }
+    }
     if !others.is_empty() {
         let hint = if collapsed {
             " (pass --all-members to explain each)"
@@ -424,8 +437,10 @@ fn reproduce_lines(work_dir: &Path, f: &Finding) -> Vec<String> {
             );
             lines.push("  tree too large to ship, and says which)".to_owned());
             if replay.is_file() {
+                // Windows' Python installer provides `python`, not `python3`.
+                let python = if cfg!(windows) { "python" } else { "python3" };
                 lines.push(format!(
-                    "python3 {}",
+                    "{python} {}",
                     repro_lane::sh_word(&replay.to_string_lossy())
                 ));
             }
@@ -448,6 +463,27 @@ fn reproduce_lines(work_dir: &Path, f: &Finding) -> Vec<String> {
                     lines.push(format!("  {command}"));
                 }
                 None => lines.push("No offline reproducer is available.".to_owned()),
+            }
+        }
+    }
+    // A Windows harness needs its sanitizer runtime DLL directory on PATH;
+    // replay.py adds it, a direct run of the binary has to as well.
+    let harness_id = str_at(&f.raw, "/harness_id").unwrap_or_default();
+    if !harness_id.is_empty() {
+        let sidecar = crate::auto::layout::harness_dir(work_dir, harness_id)
+            .join(crate::build::RUNTIME_PATH_FILE);
+        if let Ok(text) = std::fs::read_to_string(&sidecar) {
+            let dirs: Vec<&str> = text
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .collect();
+            if !dirs.is_empty() {
+                lines.push(
+                    "To run the harness binary directly, first put its sanitizer runtime on PATH:"
+                        .to_owned(),
+                );
+                lines.push(format!("  $env:Path = \"{};$env:Path\"", dirs.join(";")));
             }
         }
     }
@@ -1721,6 +1757,23 @@ mod tests {
             "{reproduce}"
         );
 
+        // A Windows build recorded where its sanitizer runtime lives: the
+        // direct run is told to put it on PATH.
+        std::fs::write(
+            harness.join(crate::build::RUNTIME_PATH_FILE),
+            "C:/Program Files/LLVM/lib/clang/23/lib/windows\n",
+        )
+        .unwrap();
+        let out = explain_one(work.path(), &finding, &[], false);
+        let reproduce = out.split("REPRODUCE OFFLINE").nth(1).unwrap();
+        assert!(
+            reproduce.contains(
+                "$env:Path = \"C:/Program Files/LLVM/lib/clang/23/lib/windows;$env:Path\""
+            ),
+            "{reproduce}"
+        );
+        std::fs::remove_file(harness.join(crate::build::RUNTIME_PATH_FILE)).unwrap();
+
         // A packageable C harness: capsule and verify-poc.
         std::fs::write(harness.join("main.c"), b"int main(void) { return 0; }\n").unwrap();
         std::fs::write(
@@ -1898,6 +1951,43 @@ mod tests {
             "classification": "unhandled",
             "exception": {"name": "ASAN_HEAP_BUFFER_OVERFLOW", "sanitizer": "asan", "stack": []}
         })
+    }
+
+    /// A finding whose harness compiled only with fabricated headers or macro
+    /// values says so right under its title, naming what was fabricated.
+    #[test]
+    fn a_fabricated_build_context_is_called_out() {
+        let work = tempfile::tempdir().unwrap();
+        let mut raw = base_raw();
+        raw["build"] = serde_json::json!({"fidelity": {
+            "level": "reduced",
+            "context": "none",
+            "fabricated": [
+                {"kind": "macro", "name": "WIDGET_SLOTS", "value": "0"},
+                {"kind": "header", "name": "tables.h"}
+            ]
+        }});
+        let out = explain_one(work.path(), &finding_in(work.path(), raw), &[], false);
+        let caveat = out
+            .lines()
+            .position(|line| line.contains("BUILD FIDELITY"))
+            .unwrap_or_else(|| panic!("no build fidelity caveat:\n{out}"));
+        let text = out
+            .lines()
+            .skip(caveat)
+            .take(5)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(text.contains("macro WIDGET_SLOTS=0"), "{out}");
+        assert!(text.contains("header tables.h"), "{out}");
+        assert!(text.contains("low confidence"), "{out}");
+        let plain = explain_one(
+            work.path(),
+            &finding_in(work.path(), base_raw()),
+            &[],
+            false,
+        );
+        assert!(!plain.contains("BUILD FIDELITY"), "{plain}");
     }
 
     /// explain shows the minimized input when there is one, and says which

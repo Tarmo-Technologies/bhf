@@ -4,7 +4,8 @@
 //!
 //! A compile database, a captured build, or an operator setting names a
 //! compiler in many spellings: `gcc`, `g++-12`, `/usr/bin/aarch64-linux-gnu-gcc`,
-//! `x86_64-w64-mingw32-g++.exe`, `clang-18`, `C:/LLVM/bin/clang.exe`. Every
+//! `x86_64-w64-mingw32-g++.exe`, `clang-18`, `C:/LLVM/bin/clang.exe`,
+//! `cl.exe`, `clang-cl`. Every
 //! place that needs to know which driver it is uses this one normalisation —
 //! lowercase the file name, drop a `.exe` suffix, drop a trailing numeric
 //! version (`-12`, `-18.1`), then drop a target-triple prefix — so a check that
@@ -24,6 +25,12 @@ pub enum CompilerFamily {
     Clang,
     /// GCC (native or cross): `trace-pc` coverage and no `function` check.
     Gcc,
+    /// The MSVC command-line dialect: `cl.exe`, and `clang-cl` when it is the
+    /// harness compiler. Coverage is SanitizerCoverage's inline 8-bit counters
+    /// (the form MSVC implements), there is no UBSan, and the harness build goes
+    /// through bhf's `bhf-cl` front end, which spells the generated Makefile's
+    /// GCC-style command lines the way `cl` reads them.
+    Msvc,
 }
 
 impl CompilerFamily {
@@ -32,6 +39,7 @@ impl CompilerFamily {
         match self {
             Self::Clang => "clang",
             Self::Gcc => "gcc",
+            Self::Msvc => "msvc",
         }
     }
 
@@ -40,26 +48,36 @@ impl CompilerFamily {
         match value.trim() {
             "clang" => Some(Self::Clang),
             "gcc" => Some(Self::Gcc),
+            "msvc" => Some(Self::Msvc),
             _ => None,
         }
     }
 
     /// The SanitizerCoverage flag this family's compilers accept, with the
-    /// comparison hooks bhf's driver consumes. GCC has no `trace-pc-guard`.
+    /// comparison hooks bhf's driver consumes. GCC has no `trace-pc-guard`;
+    /// MSVC implements the inline 8-bit counters, which the driver folds into
+    /// the same edge map after every input.
     pub fn coverage_flag(self) -> &'static str {
         match self {
             Self::Clang => "-fsanitize-coverage=trace-pc-guard,trace-cmp",
             Self::Gcc => "-fsanitize-coverage=trace-pc,trace-cmp",
+            Self::Msvc => "-fsanitize-coverage=inline-8bit-counters,edge,trace-cmp,trace-div",
         }
     }
 
     /// The UBSan checks bhf subtracts from `-fsanitize=undefined`. GCC has no
-    /// `function` check and rejects its name.
+    /// `function` check and rejects its name; MSVC has no UBSan at all.
     pub fn ubsan_subtraction(self) -> &'static str {
         match self {
             Self::Clang => "-fno-sanitize=function,vptr,alignment",
             Self::Gcc => "-fno-sanitize=alignment",
+            Self::Msvc => "",
         }
+    }
+
+    /// Whether this family has UndefinedBehaviorSanitizer.
+    pub fn supports_ubsan(self) -> bool {
+        !matches!(self, Self::Msvc)
     }
 }
 
@@ -71,8 +89,8 @@ pub struct CompilerDriver {
 }
 
 /// The driver base name of `compiler` (a name or a path): `clang`, `clang++`,
-/// `gcc` or `g++` after the normalisation described in the module docs, or
-/// `None` when the name is none of them.
+/// `gcc`, `g++`, `cl` or `clang-cl` after the normalisation described in the
+/// module docs, or `None` when the name is none of them.
 pub fn driver_base_name(compiler: &str) -> Option<&'static str> {
     let trimmed = compiler.trim().trim_matches('"');
     let leaf = Path::new(trimmed)
@@ -93,6 +111,10 @@ pub fn driver_base_name(compiler: &str) -> Option<&'static str> {
         }
         _ => lower.as_str(),
     };
+    // `clang-cl` is one driver name, not a `clang` triple prefix on `cl`.
+    if stem == "clang-cl" || stem.ends_with("-clang-cl") {
+        return Some("clang-cl");
+    }
     // `aarch64-linux-gnu-gcc` -> the driver name is the last component.
     let base = stem.rsplit('-').next().unwrap_or(stem);
     match base {
@@ -100,6 +122,7 @@ pub fn driver_base_name(compiler: &str) -> Option<&'static str> {
         "clang++" => Some("clang++"),
         "gcc" => Some("gcc"),
         "g++" => Some("g++"),
+        "cl" => Some("cl"),
         _ => None,
     }
 }
@@ -117,6 +140,11 @@ pub fn driver_from_name(compiler: &str) -> Option<CompilerDriver> {
         },
         "gcc" => CompilerDriver {
             family: CompilerFamily::Gcc,
+            cxx: false,
+        },
+        // One driver for both languages; it picks C or C++ from the file name.
+        "cl" | "clang-cl" => CompilerDriver {
+            family: CompilerFamily::Msvc,
             cxx: false,
         },
         _ => CompilerDriver {
@@ -142,6 +170,7 @@ pub fn c_driver_for(cxx: &str) -> String {
             let (from, to) = match family {
                 CompilerFamily::Clang => ("clang++", "clang"),
                 CompilerFamily::Gcc => ("g++", "gcc"),
+                CompilerFamily::Msvc => return cxx.to_owned(),
             };
             // Replace the LAST occurrence: that is the driver component, after
             // any directory and triple prefix and before a version suffix.
@@ -164,6 +193,7 @@ pub fn cxx_driver_for(cc: &str) -> String {
             let (from, to) = match family {
                 CompilerFamily::Clang => ("clang", "clang++"),
                 CompilerFamily::Gcc => ("gcc", "g++"),
+                CompilerFamily::Msvc => return cc.to_owned(),
             };
             match cc.rfind(from) {
                 Some(at) => format!("{}{}{}", &cc[..at], to, &cc[at + from.len()..]),
@@ -176,8 +206,8 @@ pub fn cxx_driver_for(cc: &str) -> String {
 
 /// Parse the output of `<compiler> -dM -E -x c -` (the predefined macros) into
 /// a family: `__clang__` means Clang (which also defines `__GNUC__`), a bare
-/// `__GNUC__` means GCC. `None` for anything else, such as a compiler that
-/// could not run.
+/// `__GNUC__` means GCC, and a bare `_MSC_VER` means MSVC. `None` for anything
+/// else, such as a compiler that could not run.
 pub fn family_from_predefined_macros(macros: &str) -> Option<CompilerFamily> {
     let defines = |name: &str| {
         macros.lines().any(|line| {
@@ -189,6 +219,8 @@ pub fn family_from_predefined_macros(macros: &str) -> Option<CompilerFamily> {
         Some(CompilerFamily::Clang)
     } else if defines("__GNUC__") {
         Some(CompilerFamily::Gcc)
+    } else if defines("_MSC_VER") {
+        Some(CompilerFamily::Msvc)
     } else {
         None
     }
@@ -226,7 +258,7 @@ mod tests {
             "c++",
             "tcc",
             "icx",
-            "cl.exe",
+            "evilcl",
             "",
         ] {
             assert_eq!(driver_base_name(name), None, "{name}");
@@ -300,6 +332,63 @@ mod tests {
         assert_eq!(
             CompilerFamily::from_make_value(CompilerFamily::Gcc.make_value()),
             Some(CompilerFamily::Gcc)
+        );
+    }
+
+    #[test]
+    fn msvc_drivers_are_recognised_with_or_without_exe_and_path() {
+        for (name, base) in [
+            ("cl", "cl"),
+            ("cl.exe", "cl"),
+            ("CL.EXE", "cl"),
+            (
+                "C:\\Program Files\\VS\\VC\\Tools\\MSVC\\14.44\\bin\\HostX64\\x64\\cl.exe",
+                "cl",
+            ),
+            ("clang-cl", "clang-cl"),
+            ("clang-cl.exe", "clang-cl"),
+            ("C:/LLVM/bin/clang-cl.exe", "clang-cl"),
+            ("clang-cl-19", "clang-cl"),
+            ("bhf-cl.exe", "cl"),
+        ] {
+            assert_eq!(driver_base_name(name), Some(base), "{name}");
+            assert_eq!(family_from_name(name), Some(CompilerFamily::Msvc), "{name}");
+        }
+        // One cl-style driver compiles both languages, so its C and C++ pair is
+        // itself.
+        assert_eq!(c_driver_for("cl.exe"), "cl.exe");
+        assert_eq!(cxx_driver_for("cl"), "cl");
+        assert_eq!(cxx_driver_for("clang-cl.exe"), "clang-cl.exe");
+        assert_eq!(c_driver_for("clang-cl"), "clang-cl");
+    }
+
+    #[test]
+    fn msvc_flags_use_inline_counters_and_never_name_ubsan_checks() {
+        let coverage = CompilerFamily::Msvc.coverage_flag();
+        for kind in ["inline-8bit-counters", "edge", "trace-cmp", "trace-div"] {
+            assert!(coverage.contains(kind), "{coverage}");
+        }
+        assert!(!coverage.contains("trace-pc-guard"), "{coverage}");
+        assert_eq!(CompilerFamily::Msvc.ubsan_subtraction(), "");
+        assert!(!CompilerFamily::Msvc.supports_ubsan());
+        assert!(CompilerFamily::Clang.supports_ubsan());
+        assert_eq!(CompilerFamily::Msvc.make_value(), "msvc");
+        assert_eq!(
+            CompilerFamily::from_make_value("msvc"),
+            Some(CompilerFamily::Msvc)
+        );
+    }
+
+    #[test]
+    fn msvc_is_read_from_predefined_macros_without_clang_or_gcc() {
+        assert_eq!(
+            family_from_predefined_macros("#define _MSC_VER 1944\n#define _WIN64 1\n"),
+            Some(CompilerFamily::Msvc)
+        );
+        // clang-cl defines _MSC_VER too, and speaks the cl dialect.
+        assert_eq!(
+            family_from_predefined_macros("#define _MSC_VER 1944\n#define __clang__ 1\n"),
+            Some(CompilerFamily::Clang)
         );
     }
 }

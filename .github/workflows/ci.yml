@@ -459,6 +459,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked -p bhf --lib vcxproj
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p bhf --lib msbuild_import
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p bhf --lib msvc_cc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p report --lib replay_script
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p build_classifier --lib msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Test portable scheduler runtime reliability
         run: cargo test --locked -p continuous_daemon --lib health::tests

@@ -12,8 +12,15 @@ endif
 # its predefined macros. So CC=gcc, a cross-prefixed gcc or a vendor gcc gets
 # GCC-spelled flags (`trace-pc`, no `function` UBSan check), and clang gets its
 # own, whatever compiler the build context named.
+# `bhf-cl` is bhf's front end for MSVC `cl.exe`: it reads these GCC-style
+# command lines and runs cl with the equivalent options (see the msvc family
+# below), so it is recognised by name.
 ifndef BHF_CC_FAMILY
+ifneq ($(filter bhf-cl bhf-cl.exe,$(notdir $(subst ",,$(CC)))),)
+BHF_CC_FAMILY := msvc
+else
 BHF_CC_FAMILY := $(shell bhf_macros=$$(echo | $(CC) -dM -E -x c - 2>/dev/null); case "$$bhf_macros" in (*__clang__*) echo clang;; (*__GNUC__*) echo gcc;; (*) echo {{ c_compiler_family }};; esac)
+endif
 endif
 # Every bhf C direct harness (generated or passthrough) ships its own
 # lightweight `main` — a persistent framed fork-server driver (#399/#398) — so we
@@ -57,6 +64,11 @@ C_STD_FLAG := $(if $(C_STD),-std=$(C_STD),)
 # reached. Link them statically, as clang does.
 ifeq ($(BHF_CC_FAMILY),gcc)
 CFLAGS ?= -O1 -g -fsanitize=address,undefined -fno-sanitize=alignment -static-libasan -static-libubsan -fsanitize-coverage=trace-pc,trace-cmp
+else ifeq ($(BHF_CC_FAMILY),msvc)
+# MSVC: AddressSanitizer plus the SanitizerCoverage subset cl implements —
+# inline 8-bit edge counters, which bhf's driver folds into the edge map after
+# every input, and the comparison and division hooks. cl has no UBSan.
+CFLAGS ?= -O1 -g -fsanitize=address -fsanitize-coverage=inline-8bit-counters,edge,trace-cmp,trace-div
 else
 CFLAGS ?= -O1 -g -fsanitize=address,undefined -fno-sanitize=function,vptr,alignment -fsanitize-coverage=trace-pc-guard,trace-cmp
 endif
@@ -143,6 +155,7 @@ INCLUDES = -I . -I {{ c_runtime_include }}{% for inc in target_includes_dirs %} 
 BUILD_CONTEXT_PROVENANCE = {{ build_context_provenance }}
 BUILD_CONTEXT_DROPPED = {{ build_context_dropped }}
 COMPILE_DB_FLAGS = {% for flag in compile_flags %}{{ flag }}{% if not loop.last %} {% endif %}{% endfor %}
+BUILD_CONTEXT_LDFLAGS = {% for flag in link_flags %}{{ flag }}{% if not loop.last %} {% endif %}{% endfor %}
 # Toolchain stamp: every object and binary built with $(CC) depends on it, and
 # it is rewritten only when the compiler or its flags change. Switching
 # compilers in the same harness directory (bhf's gcc retry, a cross build, a
@@ -203,7 +216,7 @@ bhf_driver_diff.o:{% if bhf_driver_prereq %} $(BHF_DRIVER_SOURCE){% endif %} bhf
 	$(DIFF_CC) $(BHF_DRIVER_CFLAGS) $(FEATURE_TEST_FLAGS) -c -o $@ $(BHF_DRIVER_SOURCE)
 
 main: main.c bhf_driver.o bhf_toolchain.stamp $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS)
-	$(CC) $(CFLAGS) $(SECTION_FLAGS) $(C_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(BHF_TOOLCHAIN_TARGET_FLAGS) $(BHF_TOOLCHAIN_CFLAGS) $(C_STD_FLAG) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) -DBHF_EXTERNAL_DRIVER -o $@ main.c{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS) $(AUTO_EXTRA_SOURCES) bhf_driver.o $(SECTION_LDFLAGS) $(AUTO_EXTRA_LDFLAGS) $(BHF_TOOLCHAIN_LDFLAGS)
+	$(CC) $(CFLAGS) $(SECTION_FLAGS) $(C_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(BHF_TOOLCHAIN_TARGET_FLAGS) $(BHF_TOOLCHAIN_CFLAGS) $(C_STD_FLAG) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) -DBHF_EXTERNAL_DRIVER -o $@ main.c{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS) $(AUTO_EXTRA_SOURCES) bhf_driver.o $(BUILD_CONTEXT_LDFLAGS) $(SECTION_LDFLAGS) $(AUTO_EXTRA_LDFLAGS) $(BHF_TOOLCHAIN_LDFLAGS)
 
 # Semantic check only: the same translation units under the same flags as
 # `main`, minus code generation and the link. The repair loop reads compiler
@@ -219,7 +232,7 @@ syntaxcheck: main.c
 afl: main_afl
 
 main_afl: main.c $(CONTEXT_AFL_OBJECTS) $(REPAIR_CONTEXT_AFL_OBJECTS)
-	$(AFLPP_CC) $(AFLPP_CFLAGS) $(SECTION_FLAGS) $(C_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(C_STD_FLAG) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) -o $@ main.c{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_AFL_OBJECTS) $(REPAIR_CONTEXT_AFL_OBJECTS) $(AUTO_EXTRA_SOURCES) $(SECTION_LDFLAGS) $(AUTO_EXTRA_LDFLAGS)
+	$(AFLPP_CC) $(AFLPP_CFLAGS) $(SECTION_FLAGS) $(C_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(C_STD_FLAG) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) -o $@ main.c{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_AFL_OBJECTS) $(REPAIR_CONTEXT_AFL_OBJECTS) $(AUTO_EXTRA_SOURCES) $(BUILD_CONTEXT_LDFLAGS) $(SECTION_LDFLAGS) $(AUTO_EXTRA_LDFLAGS)
 
 # Portable libFuzzer binary (also drivable by Mayhem coverage-guided / honggfuzz).
 {%- if passthrough_libfuzzer_entrypoint is defined and passthrough_libfuzzer_entrypoint %}
@@ -230,7 +243,7 @@ main_afl: main.c $(CONTEXT_AFL_OBJECTS) $(REPAIR_CONTEXT_AFL_OBJECTS)
 libfuzzer: main_libfuzzer
 
 main_libfuzzer: $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS)
-	$(LIBFUZZER_CC) $(LIBFUZZER_CFLAGS) $(SECTION_FLAGS) $(C_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(C_STD_FLAG) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) -o $@{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS) $(AUTO_EXTRA_SOURCES) $(SECTION_LDFLAGS) $(AUTO_EXTRA_LDFLAGS)
+	$(LIBFUZZER_CC) $(LIBFUZZER_CFLAGS) $(SECTION_FLAGS) $(C_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(C_STD_FLAG) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) -o $@{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS) $(AUTO_EXTRA_SOURCES) $(BUILD_CONTEXT_LDFLAGS) $(SECTION_LDFLAGS) $(AUTO_EXTRA_LDFLAGS)
 {%- else %}
 # Compiled with -DBHF_EXTERNAL_DRIVER so main.c emits only `bhf_run_one` (no bhf
 # `main`, no bhf coverage runtime); bhf_libfuzzer.c adds `LLVMFuzzerTestOneInput`
@@ -239,28 +252,28 @@ main_libfuzzer: $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS)
 libfuzzer: main_libfuzzer
 
 main_libfuzzer: main.c bhf_libfuzzer.c $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS)
-	$(LIBFUZZER_CC) $(LIBFUZZER_CFLAGS) $(SECTION_FLAGS) $(C_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(C_STD_FLAG) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) -DBHF_EXTERNAL_DRIVER -o $@ main.c bhf_libfuzzer.c{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS) $(AUTO_EXTRA_SOURCES) $(SECTION_LDFLAGS) $(AUTO_EXTRA_LDFLAGS)
+	$(LIBFUZZER_CC) $(LIBFUZZER_CFLAGS) $(SECTION_FLAGS) $(C_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(C_STD_FLAG) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) -DBHF_EXTERNAL_DRIVER -o $@ main.c bhf_libfuzzer.c{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS) $(AUTO_EXTRA_SOURCES) $(BUILD_CONTEXT_LDFLAGS) $(SECTION_LDFLAGS) $(AUTO_EXTRA_LDFLAGS)
 {%- endif %}
 
 msan: main_msan
 
 main_msan: main.c bhf_driver_msan.o $(CONTEXT_MSAN_OBJECTS) $(REPAIR_CONTEXT_MSAN_OBJECTS)
-	$(MSAN_CC) $(MSAN_CFLAGS) $(SECTION_FLAGS) $(C_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(C_STD_FLAG) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) -DBHF_EXTERNAL_DRIVER -o $@ main.c{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_MSAN_OBJECTS) $(REPAIR_CONTEXT_MSAN_OBJECTS) $(AUTO_EXTRA_SOURCES) bhf_driver_msan.o $(SECTION_LDFLAGS) $(AUTO_EXTRA_LDFLAGS)
+	$(MSAN_CC) $(MSAN_CFLAGS) $(SECTION_FLAGS) $(C_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(C_STD_FLAG) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) -DBHF_EXTERNAL_DRIVER -o $@ main.c{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_MSAN_OBJECTS) $(REPAIR_CONTEXT_MSAN_OBJECTS) $(AUTO_EXTRA_SOURCES) bhf_driver_msan.o $(BUILD_CONTEXT_LDFLAGS) $(SECTION_LDFLAGS) $(AUTO_EXTRA_LDFLAGS)
 
 tsan: main_tsan
 
 main_tsan: main.c bhf_driver_tsan.o $(CONTEXT_TSAN_OBJECTS) $(REPAIR_CONTEXT_TSAN_OBJECTS)
-	$(TSAN_CC) $(TSAN_CFLAGS) $(SECTION_FLAGS) $(C_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(C_STD_FLAG) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) -DBHF_EXTERNAL_DRIVER -o $@ main.c{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_TSAN_OBJECTS) $(REPAIR_CONTEXT_TSAN_OBJECTS) $(AUTO_EXTRA_SOURCES) bhf_driver_tsan.o $(SECTION_LDFLAGS) $(AUTO_EXTRA_LDFLAGS)
+	$(TSAN_CC) $(TSAN_CFLAGS) $(SECTION_FLAGS) $(C_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(C_STD_FLAG) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) -DBHF_EXTERNAL_DRIVER -o $@ main.c{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_TSAN_OBJECTS) $(REPAIR_CONTEXT_TSAN_OBJECTS) $(AUTO_EXTRA_SOURCES) bhf_driver_tsan.o $(BUILD_CONTEXT_LDFLAGS) $(SECTION_LDFLAGS) $(AUTO_EXTRA_LDFLAGS)
 
 cov: main_cov
 
 main_cov: main.c bhf_driver_cov.o $(CONTEXT_COV_OBJECTS) $(REPAIR_CONTEXT_COV_OBJECTS)
-	$(COV_CC) $(COV_CFLAGS) $(SECTION_FLAGS) $(C_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(C_STD_FLAG) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) -DBHF_EXTERNAL_DRIVER -o $@ main.c{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_COV_OBJECTS) $(REPAIR_CONTEXT_COV_OBJECTS) $(AUTO_EXTRA_SOURCES) bhf_driver_cov.o $(SECTION_LDFLAGS) $(AUTO_EXTRA_LDFLAGS)
+	$(COV_CC) $(COV_CFLAGS) $(SECTION_FLAGS) $(C_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(C_STD_FLAG) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) -DBHF_EXTERNAL_DRIVER -o $@ main.c{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_COV_OBJECTS) $(REPAIR_CONTEXT_COV_OBJECTS) $(AUTO_EXTRA_SOURCES) bhf_driver_cov.o $(BUILD_CONTEXT_LDFLAGS) $(SECTION_LDFLAGS) $(AUTO_EXTRA_LDFLAGS)
 
 diff: main_diff
 
 main_diff: main.c bhf_driver_diff.o $(CONTEXT_DIFF_OBJECTS) $(REPAIR_CONTEXT_DIFF_OBJECTS)
-	$(DIFF_CC) $(DIFF_CFLAGS) $(SECTION_FLAGS) $(C_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) -DBHF_EXTERNAL_DRIVER -o $@ main.c{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_DIFF_OBJECTS) $(REPAIR_CONTEXT_DIFF_OBJECTS) $(AUTO_EXTRA_SOURCES) bhf_driver_diff.o $(SECTION_LDFLAGS) $(AUTO_EXTRA_LDFLAGS)
+	$(DIFF_CC) $(DIFF_CFLAGS) $(SECTION_FLAGS) $(C_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) -DBHF_EXTERNAL_DRIVER -o $@ main.c{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_DIFF_OBJECTS) $(REPAIR_CONTEXT_DIFF_OBJECTS) $(AUTO_EXTRA_SOURCES) bhf_driver_diff.o $(BUILD_CONTEXT_LDFLAGS) $(SECTION_LDFLAGS) $(AUTO_EXTRA_LDFLAGS)
 
 # Build-recovery provenance (stub-artifact vs real-defect): the SAME ASan build as
 # `main`, but the injected stubs come from $(AUTO_PROV_SOURCES) — a poisoned copy in
@@ -271,7 +284,7 @@ main_diff: main.c bhf_driver_diff.o $(CONTEXT_DIFF_OBJECTS) $(REPAIR_CONTEXT_DIF
 prov: main_prov
 
 main_prov: main.c bhf_driver.o bhf_toolchain.stamp $(CONTEXT_PROV_OBJECTS) $(REPAIR_CONTEXT_PROV_OBJECTS)
-	$(CC) $(CFLAGS) $(SECTION_FLAGS) $(C_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(BHF_TOOLCHAIN_TARGET_FLAGS) $(BHF_TOOLCHAIN_CFLAGS) $(C_STD_FLAG) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) -DBHF_EXTERNAL_DRIVER -o $@ main.c{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_PROV_OBJECTS) $(REPAIR_CONTEXT_PROV_OBJECTS) $(AUTO_PROV_SOURCES) bhf_driver.o $(SECTION_LDFLAGS) $(AUTO_EXTRA_LDFLAGS) $(BHF_TOOLCHAIN_LDFLAGS)
+	$(CC) $(CFLAGS) $(SECTION_FLAGS) $(C_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(BHF_TOOLCHAIN_TARGET_FLAGS) $(BHF_TOOLCHAIN_CFLAGS) $(C_STD_FLAG) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) -DBHF_EXTERNAL_DRIVER -o $@ main.c{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_PROV_OBJECTS) $(REPAIR_CONTEXT_PROV_OBJECTS) $(AUTO_PROV_SOURCES) bhf_driver.o $(BUILD_CONTEXT_LDFLAGS) $(SECTION_LDFLAGS) $(AUTO_EXTRA_LDFLAGS) $(BHF_TOOLCHAIN_LDFLAGS)
 
 clean:
 	rm -f main main_afl main_libfuzzer main_msan main_tsan main_cov main_prov main_diff bhf_driver.o bhf_driver_msan.o bhf_driver_tsan.o bhf_driver_cov.o bhf_driver_diff.o bhf_toolchain.stamp

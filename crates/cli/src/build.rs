@@ -1044,6 +1044,11 @@ fn try_run_c_make_build(args: &BuildArgs, toolchain: &config::ToolchainConfig) -
                     return Some(2);
                 }
                 bhfeprintln!("built harness binary -> {}", dest.display());
+                if cfg!(windows) {
+                    let path = std::env::var_os("PATH");
+                    stage_sanitizer_runtime(&harness_dir, path.as_deref());
+                    stage_sanitizer_runtime(&build_dir, path.as_deref());
+                }
             } else {
                 bhfeprintln!(
                     "make reported success but did not produce expected harness binary '{}'",
@@ -1178,10 +1183,16 @@ fn undefined_symbols_in(output: &str) -> Vec<String> {
     const MAX_SYMBOLS: usize = 64;
     let mut symbols: Vec<String> = Vec::new();
     for line in output.lines() {
-        let symbol = line
-            .split_once("undefined reference to `")
-            .and_then(|(_, rest)| rest.rsplit_once('\''))
-            .map(|(symbol, _)| symbol)
+        // link.exe / lld-link (`unresolved external symbol NAME`) first: the
+        // lld spelling below would otherwise keep the `>>>` decoration.
+        let msvc = build_classifier::gcc_clang::msvc_unresolved_symbol(line);
+        let symbol = msvc
+            .as_deref()
+            .or_else(|| {
+                line.split_once("undefined reference to `")
+                    .and_then(|(_, rest)| rest.rsplit_once('\''))
+                    .map(|(symbol, _)| symbol)
+            })
             .or_else(|| {
                 line.split_once("undefined symbol: ")
                     .map(|(_, rest)| rest.trim())
@@ -1770,8 +1781,90 @@ pub(crate) fn try_run_c_make_build_with_target_and_ldflags(
     if let Some(extra_ldflags) = extra_ldflags.filter(|value| !value.trim().is_empty()) {
         append_command_env_flags(&mut cmd, "AUTO_EXTRA_LDFLAGS", extra_ldflags);
     }
-    crate::command_output::output_with_timeout(&mut cmd, std::time::Duration::from_secs(30 * 60))
-        .expect("spawn make")
+    let output = crate::command_output::output_with_timeout(
+        &mut cmd,
+        std::time::Duration::from_secs(30 * 60),
+    )
+    .expect("spawn make");
+    if cfg!(windows) && output.status.success() {
+        stage_sanitizer_runtime(&harness_dir, std::env::var_os("PATH").as_deref());
+    }
+    output
+}
+
+/// Sidecar beside a harness binary naming the directories of the sanitizer
+/// runtime DLLs it needs, one per line. Windows finds a DLL only through PATH
+/// (or the binary's own directory): `bhf` puts them on its own PATH, and the
+/// finding's `replay.py` reads this file to do the same for a reproducer run
+/// from a plain shell.
+pub(crate) const RUNTIME_PATH_FILE: &str = "bhf-runtime-path.txt";
+
+/// The PATH entries holding a clang/MSVC AddressSanitizer runtime DLL
+/// (`clang_rt.asan_dynamic-x86_64.dll`, its debug variant), in PATH order.
+pub(crate) fn sanitizer_runtime_dirs(path: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
+    let Some(path) = path else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for dir in std::env::split_paths(path) {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        let holds_runtime = entries.flatten().any(|entry| {
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            name.starts_with("clang_rt.asan") && name.contains("dynamic") && name.ends_with(".dll")
+        });
+        if holds_runtime && !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
+}
+
+/// Give a Windows harness its sanitizer runtime: the DLLs of the first
+/// runtime directory on PATH (the one the build used: cl's own for the MSVC
+/// lane, clang's resource directory otherwise) are linked — or copied — next
+/// to the binary, where the loader looks before PATH, so the harness starts
+/// from any shell and never picks up another toolchain's same-named DLL. The
+/// directories are also recorded in [`RUNTIME_PATH_FILE`].
+fn stage_sanitizer_runtime(harness_dir: &Path, path: Option<&std::ffi::OsStr>) {
+    let dirs = sanitizer_runtime_dirs(path);
+    let sidecar = harness_dir.join(RUNTIME_PATH_FILE);
+    let Some(first) = dirs.first() else {
+        let _ = fs::remove_file(sidecar);
+        return;
+    };
+    let text = dirs
+        .iter()
+        .map(|dir| format!("{}\n", dir.display()))
+        .collect::<String>();
+    let _ = fs::write(sidecar, text);
+    let Ok(entries) = fs::read_dir(first) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let lower = name.to_string_lossy().to_ascii_lowercase();
+        if !(lower.starts_with("clang_rt.asan")
+            && lower.contains("dynamic")
+            && lower.ends_with(".dll"))
+        {
+            continue;
+        }
+        let source = entry.path();
+        let target = harness_dir.join(&name);
+        let same = fs::metadata(&target)
+            .ok()
+            .zip(fs::metadata(&source).ok())
+            .is_some_and(|(a, b)| a.len() == b.len());
+        if same {
+            continue;
+        }
+        let _ = fs::remove_file(&target);
+        if fs::hard_link(&source, &target).is_err() {
+            let _ = fs::copy(&source, &target);
+        }
+    }
 }
 
 /// Append flags to an environment value already staged on a command.
@@ -3540,14 +3633,19 @@ mod tests {
             ld.lld: error: undefined symbol: parse_record\n\
             >>> referenced by codec.c:4\n\
             codec.cpp:13: undefined reference to `widgets::Table::store(unsigned char const*, unsigned long)'\n\
-            /usr/bin/ld: undefined reference to `sqrt'\n";
+            /usr/bin/ld: undefined reference to `sqrt'\n\
+            main.obj : error LNK2019: unresolved external symbol widget_lookup referenced in function bhf_run_one\r\n\
+            lld-link: error: undefined symbol: widget_reset\n";
         assert_eq!(
             undefined_symbols_in(output),
             vec![
                 "widgets::Table::store(unsigned char const*, unsigned long)".to_owned(),
                 "parse_record".to_owned(),
                 "sqrt".to_owned(),
-            ]
+                "widget_lookup".to_owned(),
+                "widget_reset".to_owned(),
+            ],
+            "the MSVC linkers' spellings are read too"
         );
     }
 
@@ -3732,6 +3830,52 @@ mod tests {
         assert!(
             !collisions.iter().any(|f| f == "other.c"),
             "a C file with no Ada twin must not be excluded: {collisions:?}"
+        );
+    }
+
+    /// The sidecar a Windows harness build writes names exactly the PATH
+    /// directories that hold an AddressSanitizer runtime DLL, in PATH order,
+    /// and the first directory's DLL is staged beside the binary.
+    #[test]
+    fn sanitizer_runtime_dirs_are_the_path_entries_holding_the_dll() {
+        let temp = tempfile::tempdir().unwrap();
+        let llvm = temp.path().join("LLVM/lib/clang/23/lib/windows");
+        let msvc = temp.path().join("MSVC/bin/Hostx64/x64");
+        let other = temp.path().join("tools");
+        for dir in [&llvm, &msvc, &other] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(llvm.join("clang_rt.asan_dynamic-x86_64.dll"), b"").unwrap();
+        std::fs::write(msvc.join("clang_rt.asan_dbg_dynamic-x86_64.dll"), b"").unwrap();
+        std::fs::write(other.join("clang_rt.asan_static-x86_64.lib"), b"").unwrap();
+        let path =
+            std::env::join_paths([&other, &msvc, &llvm, &msvc, &temp.path().join("missing")])
+                .unwrap();
+        assert_eq!(
+            super::sanitizer_runtime_dirs(Some(&path)),
+            vec![msvc.clone(), llvm.clone()]
+        );
+        let harness = temp.path().join("harness");
+        std::fs::create_dir_all(&harness).unwrap();
+        super::stage_sanitizer_runtime(&harness, Some(&path));
+        assert_eq!(
+            std::fs::read_to_string(harness.join(super::RUNTIME_PATH_FILE)).unwrap(),
+            format!("{}\n{}\n", msvc.display(), llvm.display())
+        );
+        assert!(
+            harness
+                .join("clang_rt.asan_dbg_dynamic-x86_64.dll")
+                .is_file(),
+            "the first runtime directory's DLL sits beside the binary"
+        );
+        assert!(
+            !harness.join("clang_rt.asan_dynamic-x86_64.dll").exists(),
+            "another toolchain's runtime is not mixed in"
+        );
+        super::stage_sanitizer_runtime(&harness, Some(other.as_os_str()));
+        assert!(
+            !harness.join(super::RUNTIME_PATH_FILE).exists(),
+            "a stale sidecar is removed"
         );
     }
 }

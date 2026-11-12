@@ -17,6 +17,7 @@ use type_model::{ScalarKind, TypeRegistry, TypeShape};
 const BUILD_CONTEXT_COMPILER_PREFIX: &str = "@bhf-build-context-compiler=";
 const BUILD_CONTEXT_PROVENANCE_PREFIX: &str = "@bhf-build-context-provenance=";
 const BUILD_CONTEXT_DROPPED_PREFIX: &str = "@bhf-build-context-dropped=";
+const BUILD_CONTEXT_LDFLAG_PREFIX: &str = "@bhf-build-context-ldflag=";
 
 /// Parameter metadata captured from the C source for harness emission.
 #[derive(Debug, Clone)]
@@ -561,6 +562,9 @@ struct CTemplateContext {
     target_includes_dirs: Vec<String>,
     target_sources: Vec<String>,
     compile_flags: Vec<String>,
+    /// Link inputs the build context names for this target
+    /// (`BUILD_CONTEXT_LDFLAGS`, on every link line).
+    link_flags: Vec<String>,
     build_context_provenance: String,
     build_context_dropped: String,
     c_compiler: String,
@@ -631,6 +635,9 @@ struct CSequenceTemplateContext {
     target_includes_dirs: Vec<String>,
     target_sources: Vec<String>,
     compile_flags: Vec<String>,
+    /// Link inputs the build context names for this target
+    /// (`BUILD_CONTEXT_LDFLAGS`, on every link line).
+    link_flags: Vec<String>,
     build_context_provenance: String,
     build_context_dropped: String,
     c_compiler: String,
@@ -3046,13 +3053,14 @@ fn bind_webp_interleaved_output_geometry(
 
 fn build_c_context(args: &GenerateCDirectArgs) -> Result<CTemplateContext, HarnessGenError> {
     validate_c_build_inputs(args)?;
-    let (
+    let SplitCompileContext {
         compile_flags,
+        link_flags,
         c_compiler,
         c_compiler_family,
         build_context_provenance,
         build_context_dropped,
-    ) = split_c_compile_context(&args.compile_flags);
+    } = split_c_compile_context(&args.compile_flags);
     let registry = TypeRegistry::from_defs(args.type_defs.iter());
     // A byte-stream decoder is driven one byte at a time: the first parameter is
     // the untrusted byte (the loop variable), and only parameters 2..N are
@@ -3261,6 +3269,7 @@ fn build_c_context(args: &GenerateCDirectArgs) -> Result<CTemplateContext, Harne
         target_includes_dirs: recipe_paths(&args.target_includes_dirs),
         target_sources: recipe_paths(&args.target_sources),
         compile_flags,
+        link_flags,
         build_context_provenance,
         build_context_dropped,
         c_compiler,
@@ -3342,13 +3351,14 @@ fn build_c_sequence_context_untraced(
     args: &GenerateCSequenceArgs,
 ) -> Result<CSequenceTemplateContext, HarnessGenError> {
     validate_c_sequence_build_inputs(args)?;
-    let (
+    let SplitCompileContext {
         compile_flags,
+        link_flags,
         c_compiler,
         c_compiler_family,
         build_context_provenance,
         build_context_dropped,
-    ) = split_c_compile_context(&args.compile_flags);
+    } = split_c_compile_context(&args.compile_flags);
     let expert_jpeg_decompress = is_exact_libjpeg_header_reader(args);
     let expert_sqlite_prepare = is_exact_sqlite_prepare(args);
     if expert_jpeg_decompress || expert_sqlite_prepare {
@@ -3383,6 +3393,7 @@ fn build_c_sequence_context_untraced(
             target_includes_dirs: recipe_paths(&args.target_includes_dirs),
             target_sources: recipe_paths(&args.target_sources),
             compile_flags,
+            link_flags: link_flags.clone(),
             build_context_provenance,
             build_context_dropped,
             c_compiler,
@@ -3916,6 +3927,7 @@ fn build_c_sequence_context_untraced(
         target_includes_dirs: recipe_paths(&args.target_includes_dirs),
         target_sources: recipe_paths(&args.target_sources),
         compile_flags,
+        link_flags,
         build_context_provenance,
         build_context_dropped,
         c_compiler,
@@ -4214,10 +4226,21 @@ fn disable_sequence_callback_actions(step: &mut CSequenceStepEmission) {
     }
 }
 
-fn split_c_compile_context(flags: &[String]) -> (Vec<String>, String, String, String, String) {
+/// A C target's build-context flags, split into what the Makefile needs.
+struct SplitCompileContext {
+    compile_flags: Vec<String>,
+    link_flags: Vec<String>,
+    c_compiler: String,
+    c_compiler_family: String,
+    build_context_provenance: String,
+    build_context_dropped: String,
+}
+
+fn split_c_compile_context(flags: &[String]) -> SplitCompileContext {
     let mut compiler = None;
     let mut provenance = "none".to_owned();
     let mut dropped = "none".to_owned();
+    let mut link_flags = Vec::new();
     let compile_flags = flags
         .iter()
         .filter_map(|flag| {
@@ -4236,6 +4259,10 @@ fn split_c_compile_context(flags: &[String]) -> (Vec<String>, String, String, St
             } else if let Some(value) = flag.strip_prefix(BUILD_CONTEXT_DROPPED_PREFIX) {
                 dropped = value.to_owned();
                 None
+            } else if let Some(value) = flag.strip_prefix(BUILD_CONTEXT_LDFLAG_PREFIX) {
+                // A link input (an import library) for the link lines only.
+                link_flags.push(crate::build_safety::recipe_token(value));
+                None
             } else {
                 // Single-quote a flag that needs it. A CMake version-comparison
                 // define (`-DLLAMA_VERSIONS=>=3`) is legitimate but its `>` would
@@ -4253,17 +4280,20 @@ fn split_c_compile_context(flags: &[String]) -> (Vec<String>, String, String, St
         .unwrap_or(crate::compiler_family::CompilerFamily::Clang)
         .make_value()
         .to_owned();
-    (
+    SplitCompileContext {
         compile_flags,
+        link_flags,
         // `CC = <compiler>` heads every recipe; one under a spaced directory is
         // double-quoted so it stays a single word.
-        crate::build_safety::recipe_path(&crate::build_safety::make_path(Path::new(&compiler))),
+        c_compiler: crate::build_safety::recipe_path(&crate::build_safety::make_path(Path::new(
+            &compiler,
+        ))),
         c_compiler_family,
         // Metadata lands in `NAME = <value>` assignments; a newline would end the
         // assignment and let the remainder parse as Makefile source.
-        crate::build_safety::make_metadata_value(&provenance),
-        crate::build_safety::make_metadata_value(&dropped),
-    )
+        build_context_provenance: crate::build_safety::make_metadata_value(&provenance),
+        build_context_dropped: crate::build_safety::make_metadata_value(&dropped),
+    }
 }
 
 /// Mark ops that return a NEW handle derived from the live one, and give every
@@ -8307,6 +8337,61 @@ mod tests {
             main.contains("LLVMFuzzerTestOneInput"),
             "main.c should still emit the libFuzzer entrypoint as the default"
         );
+    }
+
+    #[test]
+    fn build_context_link_flags_reach_every_c_link_line_not_the_compile_flags() {
+        let out = temp_dir("ldflags");
+        let args = GenerateCDirectArgs {
+            environment: None,
+            decoder_limits: Default::default(),
+            force: false,
+            lifecycle: Vec::new(),
+            drive_plan: None,
+            harness_id: "H-C002".to_owned(),
+            output_dir: out.clone(),
+            source_path: PathBuf::from("/tmp/source.c"),
+            target: cfunction("parse"),
+            params: vec![CParameter {
+                name: "value".to_owned(),
+                c_type: "int".to_owned(),
+            }],
+            return_type: "int".to_owned(),
+            target_includes: vec!["target.h".to_owned()],
+            target_includes_dirs: vec![PathBuf::from("/tmp")],
+            target_sources: vec![PathBuf::from("/tmp/source.c")],
+            compile_flags: vec![
+                "-DWIDGET=1".to_owned(),
+                "@bhf-build-context-ldflag=-lws2_32".to_owned(),
+            ],
+            target_declared_in_header: false,
+            c_runtime_include: PathBuf::from("/tmp/c_runtime"),
+            type_defs: Vec::new(),
+            result_cleanup: None,
+        };
+        let result = generate_c_direct_harness(args).unwrap();
+        let mk = fs::read_to_string(&result.makefile).unwrap();
+        assert!(
+            mk.lines()
+                .any(|line| line.trim_end() == "BUILD_CONTEXT_LDFLAGS = -lws2_32"),
+            "{mk}"
+        );
+        let compile_db_flags = mk
+            .lines()
+            .find(|line| line.starts_with("COMPILE_DB_FLAGS ="))
+            .unwrap();
+        assert_eq!(compile_db_flags.trim_end(), "COMPILE_DB_FLAGS = -DWIDGET=1");
+        let links: Vec<&str> = mk
+            .lines()
+            .filter(|line| line.starts_with('\t') && line.contains("-o $@ main.c"))
+            .collect();
+        assert!(!links.is_empty(), "{mk}");
+        for line in links {
+            assert!(
+                line.contains("$(BUILD_CONTEXT_LDFLAGS) $(SECTION_LDFLAGS)"),
+                "{line}"
+            );
+        }
     }
 
     #[test]

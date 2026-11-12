@@ -5,7 +5,7 @@ use crate::model::FindingsDocument;
 
 /// Columns after `evidence_dir` were added later; they stay at the end so a
 /// reader that addresses columns by position keeps working.
-pub const CSV_HEADER: &str = "id,kind,severity,confidence,confirmation,rule_id,cwe,title,file,line,function,group,occurrences,verdict,vuln_id,purl,first_seen,evidence_dir,access,access_size,region_size,region_offset,input_to_state,input_to_state_input,arguments,access_parameter";
+pub const CSV_HEADER: &str = "id,kind,severity,confidence,confirmation,rule_id,cwe,title,file,line,function,group,occurrences,verdict,vuln_id,purl,first_seen,evidence_dir,access,access_size,region_size,region_offset,input_to_state,input_to_state_input,arguments,access_parameter,build_fidelity";
 
 /// Longest `arguments` cell, in characters.
 pub const ARGUMENTS_CELL_MAX: usize = 200;
@@ -70,11 +70,22 @@ pub fn render_csv(doc: &FindingsDocument) -> String {
                 .and_then(|a| a.parameter.as_ref())
                 .map(|p| p.name.clone())
                 .unwrap_or_default(),
+            build_fidelity_cell(f),
         ];
         out.push_str(&row.iter().map(|v| cell(v)).collect::<Vec<_>>().join(","));
         out.push('\n');
     }
     out
+}
+
+/// `reduced: macro NAME=VALUE, header NAME` for a finding whose harness was
+/// built with inputs bhf fabricated; empty otherwise.
+fn build_fidelity_cell(f: &crate::model::Finding) -> String {
+    f.reproduce
+        .as_ref()
+        .and_then(|reproduce| reproduce.build.fidelity.as_ref())
+        .map(|fidelity| format!("{}: {}", fidelity.level, fidelity.summary()))
+        .unwrap_or_default()
 }
 
 /// `offset:len:cmp_kind:operand_hex` per comparison-evidence entry,
@@ -174,7 +185,7 @@ mod tests {
         assert!(
             fuzz.ends_with(
                 ",findings/F-0000-1a2b3c4d,read,4,12,12,0:4:memcmp:48445231,min_testcase.bin,\
-                 data=len 12 hex 48445231;flags=7,data"
+                 data=len 12 hex 48445231;flags=7,data,"
             ),
             "{fuzz}"
         );
@@ -183,7 +194,7 @@ mod tests {
             sca.contains(",CVE-2026-0001,pkg:npm/example@2.4.2,"),
             "{sca}"
         );
-        assert!(sca.ends_with(",,,,,,,,"), "no fuzz columns for SCA: {sca}");
+        assert!(sca.ends_with(",,,,,,,,,"), "no fuzz columns for SCA: {sca}");
         assert_eq!(lines.next(), None);
     }
 
@@ -224,6 +235,41 @@ mod tests {
         let cell = arguments_cell(&many);
         assert!(cell.chars().count() <= ARGUMENTS_CELL_MAX, "{cell}");
         assert!(cell.ends_with("..."), "{cell}");
+    }
+
+    /// The last column names what bhf fabricated for the harness build, so a
+    /// spreadsheet sort by it separates findings from an exact build.
+    #[test]
+    fn a_fabricated_build_context_fills_the_build_fidelity_column() {
+        let mut doc = example();
+        doc.findings[0].reproduce.as_mut().unwrap().build.fidelity =
+            Some(crate::model::BuildFidelity {
+                level: "reduced".to_owned(),
+                context: Some("none".to_owned()),
+                fabricated: vec![
+                    crate::model::FabricatedInput {
+                        kind: "macro".to_owned(),
+                        name: "WIDGET_SLOTS".to_owned(),
+                        value: Some("0".to_owned()),
+                    },
+                    crate::model::FabricatedInput {
+                        kind: "header".to_owned(),
+                        name: "tables.h".to_owned(),
+                        value: None,
+                    },
+                ],
+            });
+        let out = render_csv(&doc);
+        let fuzz = out.lines().nth(1).unwrap();
+        assert!(
+            fuzz.ends_with(",\"reduced: macro WIDGET_SLOTS=0, header tables.h\""),
+            "{fuzz}"
+        );
+        assert_eq!(
+            CSV_HEADER.split(',').count(),
+            fuzz.matches(',').count(),
+            "one column per header field (the cell's own comma is quoted): {fuzz}"
+        );
     }
 
     #[test]

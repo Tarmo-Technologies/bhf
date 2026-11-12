@@ -318,6 +318,81 @@ pub struct BuildInfo {
     pub sanitizers: Vec<String>,
     pub binary_sha256: Option<String>,
     pub build_id: Option<String>,
+    /// Present only when the harness compiled with headers, macro values or
+    /// types bhf supplied because the project's build context did not (see
+    /// [`BuildFidelity`]). Absent for a build from the real context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fidelity: Option<BuildFidelity>,
+}
+
+/// What a finding's harness build had to supply itself: the build context
+/// (compile database, project import, or none) left a header, a macro value or
+/// a type undefined, and the repair loop wrote a placeholder so the target
+/// compiled. Code compiled against a placeholder value can take paths the
+/// project's real build never does, so the finding may be false or not
+/// reproduce against the real build.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuildFidelity {
+    /// `reduced`: at least one input was fabricated.
+    pub level: String,
+    /// Where the build context came from (the harness Makefile's
+    /// `BUILD_CONTEXT_PROVENANCE`: `none`, `exact_tu_compile_database`, ...).
+    #[serde(default)]
+    pub context: Option<String>,
+    pub fabricated: Vec<FabricatedInput>,
+}
+
+/// One input bhf fabricated for a harness build.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FabricatedInput {
+    /// `macro`, `header` or `type`.
+    pub kind: String,
+    pub name: String,
+    /// The value given to a macro (`0`, empty), or the type a placeholder
+    /// stands for.
+    #[serde(default)]
+    pub value: Option<String>,
+}
+
+impl BuildFidelity {
+    /// At most this many fabricated inputs are named in a caveat.
+    const NAMED: usize = 6;
+
+    /// The fabricated inputs as `macro NAME=VALUE`, `header NAME`, `type NAME`.
+    pub fn summary(&self) -> String {
+        let mut parts: Vec<String> = self
+            .fabricated
+            .iter()
+            .take(Self::NAMED)
+            .map(
+                |input| match (input.kind.as_str(), input.value.as_deref()) {
+                    ("macro", Some(value)) if !value.is_empty() => {
+                        format!("macro {}={value}", input.name)
+                    }
+                    (kind, _) => format!("{kind} {}", input.name),
+                },
+            )
+            .collect();
+        if self.fabricated.len() > Self::NAMED {
+            parts.push(format!("{} more", self.fabricated.len() - Self::NAMED));
+        }
+        parts.join(", ")
+    }
+
+    /// The one-line caveat every renderer shows for such a finding.
+    pub fn caveat(&self) -> String {
+        let source = match self.context.as_deref() {
+            Some("none") | None => "the build context".to_owned(),
+            Some(context) => format!("the build context ({context})"),
+        };
+        format!(
+            "built with inputs bhf supplied because {source} lacked them: {}; the finding \
+             may not reproduce against the project's real build",
+            self.summary()
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

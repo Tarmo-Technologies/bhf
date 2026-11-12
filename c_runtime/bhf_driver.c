@@ -59,9 +59,41 @@
 #define bhf_open open
 #endif
 
+/* MSVC (`cl.exe`, the MSVC harness lane): no GNU attributes or builtins.
+ * `_ReturnAddress` is the intrinsic for `__builtin_return_address(0)`, and a
+ * callback MSVC's `libsancov.lib` looks up at start-up must be exported from
+ * the executable for it to be found. */
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#pragma intrinsic(_ReturnAddress)
+#define BHF_MSVC 1
+#define BHF_RA _ReturnAddress()
+#define BHF_MEMCPY memcpy
+#define BHF_EXPORT __declspec(dllexport)
+#else
+#define BHF_RA __builtin_return_address(0)
+#define BHF_MEMCPY __builtin_memcpy
+#define BHF_EXPORT
+#endif
+
 /* The Rust staticlib defines this; the driver only calls it. */
 extern int bhf_run_one(const uint8_t *Data, size_t Size);
+#if defined(BHF_MSVC)
+/* MSVC has no weak symbols: an alternate name supplies the no-op default
+ * when the harness does not define LLVMFuzzerInitialize. */
+int bhf_no_fuzzer_initialize(int *argc, char ***argv) {
+    (void)argc;
+    (void)argv;
+    return 0;
+}
+#pragma comment(linker, "/alternatename:LLVMFuzzerInitialize=bhf_no_fuzzer_initialize")
+extern int LLVMFuzzerInitialize(int *argc, char ***argv);
+#define BHF_FUZZER_INITIALIZE(argc, argv) LLVMFuzzerInitialize((argc), (argv))
+#else
 extern int LLVMFuzzerInitialize(int *argc, char ***argv) __attribute__((weak));
+#define BHF_FUZZER_INITIALIZE(argc, argv) \
+    do { if (LLVMFuzzerInitialize) LLVMFuzzerInitialize((argc), (argv)); } while (0)
+#endif
 
 /* Republish the fuzz input to the runtrace shim so fuzz-driven mode can route
  * the current iteration's bytes into fake fds / sockets / dlopen stubs. The
@@ -580,6 +612,54 @@ BHF_NOCOV static void bhf_vp_add(const unsigned char *data, unsigned len) {
     *cursor = c + 1 + len;
 }
 
+/* Inline 8-bit counters (`-fsanitize-coverage=inline-8bit-counters`, the form
+ * MSVC implements): the instrumented code increments one byte per edge itself,
+ * and the counters are folded into the same edge and hit-count maps after each
+ * input, then cleared. Each instrumented module registers its counter array
+ * once, at start-up. */
+#define BHF_C8_MAX_MODULES 16
+static unsigned char *bhf_c8_start[BHF_C8_MAX_MODULES];
+static unsigned char *bhf_c8_stop[BHF_C8_MAX_MODULES];
+static uint32_t bhf_c8_base[BHF_C8_MAX_MODULES];
+static unsigned bhf_c8_modules = 0;
+BHF_NOCOV BHF_EXPORT void __sanitizer_cov_8bit_counters_init(unsigned char *start, unsigned char *stop) {
+    unsigned i;
+    if (start == stop) return;
+    for (i = 0; i < bhf_c8_modules; i++)
+        if (bhf_c8_start[i] == start) return;
+    if (bhf_c8_modules == BHF_C8_MAX_MODULES) return;
+    bhf_c8_start[bhf_c8_modules] = start;
+    bhf_c8_stop[bhf_c8_modules] = stop;
+    bhf_c8_base[bhf_c8_modules] = bhf_cov_next;
+    bhf_cov_next += (uint32_t)(stop - start);
+    bhf_c8_modules++;
+    bhf_cov_open();
+    bhf_cov_cnt_open();
+    bhf_cmp_open();
+    bhf_cmpp_open();
+    bhf_ev_open();
+}
+BHF_NOCOV static void bhf_c8_flush(void) {
+    unsigned module;
+    for (module = 0; module < bhf_c8_modules; module++) {
+        unsigned char *p = bhf_c8_start[module];
+        uint32_t edge = bhf_c8_base[module];
+        for (; p < bhf_c8_stop[module]; p++) {
+            unsigned char hits = *p;
+            uint32_t slot;
+            edge++;
+            if (!hits) continue;
+            *p = 0;
+            slot = edge & (BHF_COV_BITS - 1);
+            if (bhf_cov_map) bhf_cov_map[slot] = 1;
+            if (bhf_cov_cnt_map) {
+                unsigned total = (unsigned)bhf_cov_cnt_map[slot] + hits;
+                bhf_cov_cnt_map[slot] = (unsigned char)(total > 255 ? 255 : total);
+            }
+        }
+    }
+}
+
 BHF_NOCOV void __sanitizer_cov_trace_pc_guard_init(uint32_t *start, uint32_t *stop) {
     if (start == stop || *start) return;
     for (uint32_t *x = start; x < stop; x++) *x = ++bhf_cov_next;
@@ -601,13 +681,12 @@ BHF_NOCOV void __sanitizer_cov_trace_pc_guard(uint32_t *guard) {
  * engine's coverage reader stays platform-agnostic. */
 BHF_NOCOV void __sanitizer_cov_trace_pc(void) {
     if (!bhf_cov_map) return;
-    uintptr_t pc = (uintptr_t)__builtin_return_address(0);
+    uintptr_t pc = (uintptr_t)BHF_RA;
     uint32_t h = ((uint32_t)(pc * 2654435761u) >> 4) & (BHF_COV_BITS - 1);
     bhf_cov_map[h] = 1;
     if (bhf_cov_cnt_map && bhf_cov_cnt_map[h] != 255)
         bhf_cov_cnt_map[h]++;
 }
-#define BHF_RA __builtin_return_address(0)
 BHF_NOCOV void __sanitizer_cov_trace_cmp1(uint8_t a, uint8_t b) { bhf_ev_int(BHF_EV_INT, a, b, 1, 0, BHF_RA); bhf_cmp_int(a, b, 1); bhf_cmpp_int(a, b, 1, BHF_RA); }
 BHF_NOCOV void __sanitizer_cov_trace_cmp2(uint16_t a, uint16_t b) { bhf_ev_int(BHF_EV_INT, a, b, 2, 0, BHF_RA); bhf_cmp_int(a, b, 2); bhf_cmpp_int(a, b, 2, BHF_RA); }
 BHF_NOCOV void __sanitizer_cov_trace_cmp4(uint32_t a, uint32_t b) { bhf_ev_int(BHF_EV_INT, a, b, 4, 0, BHF_RA); bhf_cmp_int(a, b, 4); bhf_cmpp_int(a, b, 4, BHF_RA); }
@@ -615,8 +694,8 @@ BHF_NOCOV void __sanitizer_cov_trace_cmp8(uint64_t a, uint64_t b) { bhf_ev_int(B
 /* Float/double comparison hooks (Fortran numeric code + float-heavy C/C++ emit
  * these under trace-cmp; missing them fails the link). Feed the bit patterns to
  * the same cmplog so a magic float/double constant stays learnable. */
-BHF_NOCOV void __sanitizer_cov_trace_cmpf(float a, float b) { uint32_t ua, ub; __builtin_memcpy(&ua, &a, 4); __builtin_memcpy(&ub, &b, 4); bhf_ev_int(BHF_EV_FLOAT, ua, ub, 4, 0, BHF_RA); bhf_cmp_int(ua, ub, 4); bhf_cmpp_int(ua, ub, 4, BHF_RA); }
-BHF_NOCOV void __sanitizer_cov_trace_cmpd(double a, double b) { uint64_t ua, ub; __builtin_memcpy(&ua, &a, 8); __builtin_memcpy(&ub, &b, 8); bhf_ev_int(BHF_EV_DOUBLE, ua, ub, 8, 0, BHF_RA); bhf_cmp_int(ua, ub, 8); bhf_cmpp_int(ua, ub, 8, BHF_RA); }
+BHF_NOCOV void __sanitizer_cov_trace_cmpf(float a, float b) { uint32_t ua, ub; BHF_MEMCPY(&ua, &a, 4); BHF_MEMCPY(&ub, &b, 4); bhf_ev_int(BHF_EV_FLOAT, ua, ub, 4, 0, BHF_RA); bhf_cmp_int(ua, ub, 4); bhf_cmpp_int(ua, ub, 4, BHF_RA); }
+BHF_NOCOV void __sanitizer_cov_trace_cmpd(double a, double b) { uint64_t ua, ub; BHF_MEMCPY(&ua, &a, 8); BHF_MEMCPY(&ub, &b, 8); bhf_ev_int(BHF_EV_DOUBLE, ua, ub, 8, 0, BHF_RA); bhf_cmp_int(ua, ub, 8); bhf_cmpp_int(ua, ub, 8, BHF_RA); }
 /* In a const_cmp callback the FIRST argument is the compile-time constant. */
 BHF_NOCOV void __sanitizer_cov_trace_const_cmp1(uint8_t a, uint8_t b) { bhf_ev_int(BHF_EV_INT, a, b, 1, BHF_EV_CONST_A, BHF_RA); bhf_vp_add(&a, 1); bhf_vp_add(&b, 1); bhf_cmp_int(a, b, 1); bhf_cmpp_int(a, b, 1, BHF_RA); }
 BHF_NOCOV void __sanitizer_cov_trace_const_cmp2(uint16_t a, uint16_t b) { bhf_ev_int(BHF_EV_INT, a, b, 2, BHF_EV_CONST_A, BHF_RA); bhf_vp_add((unsigned char *)&a, 2); bhf_vp_add((unsigned char *)&b, 2); bhf_cmp_int(a, b, 2); bhf_cmpp_int(a, b, 2, BHF_RA); }
@@ -640,7 +719,10 @@ BHF_NOCOV void __sanitizer_cov_trace_switch(uint64_t val, uint64_t *cases) {
         for (i = 0; i < n && i < 64; i++) bhf_cmp_int(val, cases[2 + i], len);
     }
 }
-#undef BHF_RA
+/* Division hooks (`trace-div`): a divisor the input controls is compared with
+ * zero, which is what makes a division-by-zero reachable. */
+BHF_NOCOV void __sanitizer_cov_trace_div4(uint32_t val) { bhf_ev_int(BHF_EV_INT, val, 0, 4, BHF_EV_CONST_B, BHF_RA); bhf_cmpp_int(val, 0, 4, BHF_RA); }
+BHF_NOCOV void __sanitizer_cov_trace_div8(uint64_t val) { bhf_ev_int(BHF_EV_INT, val, 0, 8, BHF_EV_CONST_B, BHF_RA); bhf_cmpp_int(val, 0, 8, BHF_RA); }
 /* ASan's str/mem-cmp interceptors call these weak hooks (even without libFuzzer
  * linked), feeding multi-byte string/buffer gates into the RedQueen ring, the
  * runtime cmplog and comparison evidence. memcmp's hook also covers bcmp, which
@@ -725,6 +807,7 @@ BHF_NOCOV int __wrap_strncasecmp(const char *s1, const char *s2, size_t n) {
 BHF_NOCOV static void bhf_run_one_bytes(const uint8_t *data, size_t size) {
     BHF_PUBLISH_INPUT(data, size);
     bhf_run_one(data, size);
+    bhf_c8_flush();
 }
 static void bhf_run_file(const char *path) {
     FILE *f = fopen(path, "rb");
@@ -755,7 +838,7 @@ static int bhf_read_n(int fd, void *buf, size_t n) {
     return 1;
 }
 int main(int argc, char **argv) {
-    if (LLVMFuzzerInitialize) LLVMFuzzerInitialize(&argc, &argv);
+    BHF_FUZZER_INITIALIZE(&argc, &argv);
 #ifdef _WIN32
     /* Install the crash handler that makes a fault a detectable exit under wine. */
     bhf_win_install_crash_handler();

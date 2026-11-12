@@ -76,6 +76,7 @@ mod list_targets;
 mod llm;
 mod minimize;
 mod model;
+mod msvc_cc;
 mod pack;
 mod policy;
 mod probe_backend;
@@ -108,6 +109,7 @@ mod toolchain;
 pub mod transport_fault;
 mod transport_fuzz;
 mod transport_replay;
+mod windows_env;
 pub mod workdir;
 
 #[derive(Debug, Parser)]
@@ -162,6 +164,20 @@ struct Args {
     /// tree so the report has enough to fix the bug offline.
     #[arg(long, global = true)]
     debug: bool,
+
+    /// Windows: do not discover Visual Studio. By default, when `INCLUDE`/`LIB`
+    /// are not already set (no Developer shell), bhf finds the newest Visual
+    /// Studio or Build Tools instance with the C++ toolset (vswhere), applies
+    /// the environment its VsDevCmd sets (cached per instance), and uses the
+    /// standalone or Visual Studio-bundled clang when none is on PATH. Also
+    /// `BHF_NO_VS_ENV=1`.
+    #[arg(long = "no-vs-env", global = true, hide = !cfg!(windows))]
+    no_vs_env: bool,
+
+    /// Windows: target architecture of the discovered Visual Studio
+    /// environment (`x64`, `x86`, `arm64`). Default: this machine's.
+    #[arg(long = "vs-arch", global = true, value_name = "ARCH", hide = !cfg!(windows))]
+    vs_arch: Option<String>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -362,12 +378,35 @@ enum ListCommand {
     Oracles(list_oracles::ListOraclesArgs),
 }
 
+/// The `bhf` executable answers to other names: `bhf-cl` is the MSVC front
+/// end of the cl harness lane, and a compiler's name (`cl.exe`, `clang.exe`)
+/// inside a Windows build-capture shim directory is that capture shim.
+fn run_multicall(argv: &[std::ffi::OsString]) -> Option<i32> {
+    let stem = std::path::Path::new(argv.first()?)
+        .file_stem()?
+        .to_str()?
+        .to_ascii_lowercase();
+    if stem == msvc_cc::FRONT_END_STEM {
+        return Some(msvc_cc::run(&argv[1..]));
+    }
+    if std::env::var_os(auto::build_probe::SHIM_MAP_ENV).is_some()
+        && auto::build_probe::is_intercept_shim_name(&stem)
+    {
+        return Some(auto::build_probe::run_intercept_shim(&stem, &argv[1..]));
+    }
+    None
+}
+
 pub fn run_from<I, T>(args: I) -> i32
 where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
 {
-    let args = match Args::try_parse_from(args) {
+    let argv: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
+    if let Some(code) = run_multicall(&argv) {
+        return code;
+    }
+    let args = match Args::try_parse_from(argv) {
         Ok(args) => args,
         Err(error) => {
             let _ = error.print();
@@ -388,6 +427,16 @@ where
         return 2;
     }
 
+    #[cfg(windows)]
+    if args.command.is_some() {
+        let environment = windows_env::activate(&windows_env::ActivationOptions {
+            disabled: args.no_vs_env,
+            arch: args.vs_arch.clone(),
+        });
+        if environment.source != "developer_shell" {
+            eprintln!("bhf: build environment: {}", environment.summary());
+        }
+    }
     #[cfg(windows)]
     build::activate_windows_clang_runtime();
 

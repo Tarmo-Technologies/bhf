@@ -408,6 +408,9 @@ pub(crate) fn publish(config: &ToolchainConfig) -> Result<Published, String> {
             cxx.as_deref().unwrap_or("(environment)")
         ));
     }
+    if let Some(note) = route_msvc_through_front_end()? {
+        published.notes.push(note);
+    }
     let effective_cc = cc
         .clone()
         .or_else(|| std::env::var("CC").ok())
@@ -426,6 +429,71 @@ pub(crate) fn publish(config: &ToolchainConfig) -> Result<Published, String> {
         std::env::set_var(variable, value);
     }
     Ok(published)
+}
+
+/// MSVC lane: a `CC`/`CXX` naming `cl` or `clang-cl` (from the toolchain or
+/// the environment) is replaced by bhf's `bhf-cl` front end, which reads the
+/// generated Makefiles' GCC-style command lines and runs that compiler with
+/// cl's options. The compiler itself is published as `BHF_MSVC_CL`. Returns a
+/// note saying so, or `None` when no MSVC driver was named.
+pub(crate) fn route_msvc_through_front_end() -> Result<Option<String>, String> {
+    let mut real: Option<PathBuf> = None;
+    let mut routed = Vec::new();
+    for variable in ["CC", "CXX"] {
+        let Ok(value) = std::env::var(variable) else {
+            continue;
+        };
+        let unquoted = value.trim().trim_matches('"');
+        if compiler_family::family_from_name(unquoted) != Some(CompilerFamily::Msvc)
+            || Path::new(unquoted)
+                .file_stem()
+                .is_some_and(|stem| stem.eq_ignore_ascii_case(crate::msvc_cc::FRONT_END_STEM))
+        {
+            continue;
+        }
+        let resolved = if Path::new(unquoted).is_absolute() {
+            PathBuf::from(unquoted)
+        } else {
+            which::which(unquoted).map_err(|_| {
+                format!(
+                    "{variable}={unquoted} was not found on PATH (on Windows, bhf finds Visual \
+                     Studio's cl.exe itself unless --no-vs-env is given)"
+                )
+            })?
+        };
+        real.get_or_insert(resolved);
+        routed.push(variable);
+    }
+    let Some(real) = real else {
+        return Ok(None);
+    };
+    let front_end = crate::msvc_cc::front_end_path()?;
+    // `$(CC)` heads recipes that run through `sh`, which eats backslashes:
+    // the front end is named with forward slashes, which Windows also reads.
+    let front_end_word = harness_gen::build_safety::make_path(&front_end);
+    for variable in &routed {
+        std::env::set_var(variable, &front_end_word);
+    }
+    std::env::set_var(crate::msvc_cc::REAL_COMPILER_ENV, &real);
+    // MSVC ships its own AddressSanitizer runtime DLL beside cl.exe. A
+    // cl-built harness must load that one, not a clang release's same-named
+    // DLL that may come earlier on PATH (it fails to start with
+    // STATUS_ENTRYPOINT_NOT_FOUND), so cl's directory goes first.
+    if let Some(dir) = real.parent() {
+        let mut paths = vec![dir.to_path_buf()];
+        if let Some(existing) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&existing).filter(|entry| entry != dir));
+        }
+        if let Ok(joined) = std::env::join_paths(paths) {
+            std::env::set_var("PATH", joined);
+        }
+    }
+    TOOLCHAIN_CHOSE_COMPILERS.store(true, Ordering::Relaxed);
+    Ok(Some(format!(
+        "C/C++ harnesses build with {} (MSVC lane) through bhf's cl front end {}",
+        real.display(),
+        front_end.display()
+    )))
 }
 
 /// The `BHF_TOOLCHAIN_*` make values for `config`, rendered for a recipe.

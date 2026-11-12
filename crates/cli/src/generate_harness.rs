@@ -7940,27 +7940,79 @@ fn cmake_config_template_host_capability_flags(source_path: &Path) -> Vec<String
 }
 
 fn try_compile_database_flags_for_source(source_path: &Path) -> Result<Vec<String>> {
+    let import_db = std::env::var_os(PROJECT_COMPILE_DB_ENV).map(PathBuf::from);
     for db_path in compile_database_candidates(source_path) {
         if !db_path.is_file() {
             continue;
         }
-        let bytes = fs::read(&db_path)
-            .with_context(|| format!("read compile database {}", db_path.display()))?;
-        let entries: Vec<CompileCommandEntry> = serde_json::from_slice(&bytes)
-            .with_context(|| format!("parse compile database {}", db_path.display()))?;
-        for entry in &entries {
-            if compile_command_matches_source(entry, source_path) {
-                return Ok(extract_compile_database_flags(entry, source_path));
-            }
-        }
-        if is_c_family_header(source_path) {
-            if let Some(entry) = compile_database_entry_for_header(&entries, source_path) {
-                let owner = compile_command_source_path(entry);
-                return Ok(extract_compile_database_flags(entry, &owner));
-            }
+        let from_import = import_db.as_deref() == Some(db_path.as_path());
+        if let Some(flags) = compile_database_flags_in(&db_path, source_path, from_import)? {
+            return Ok(flags);
         }
     }
     Ok(Vec::new())
+}
+
+/// The `bhf_link_libraries` of a row in the database `bhf auto`'s Visual
+/// Studio import writes: the import libraries the row's project links.
+#[derive(Debug, Default, serde::Deserialize)]
+struct ImportLinkRow {
+    #[serde(default)]
+    bhf_link_libraries: Vec<String>,
+}
+
+/// The flags the database at `db_path` gives `source_path`, or `None` when it
+/// has no row for it. Only the project-import database (`from_import`) may add
+/// link inputs; a tree's own database cannot.
+fn compile_database_flags_in(
+    db_path: &Path,
+    source_path: &Path,
+    from_import: bool,
+) -> Result<Option<Vec<String>>> {
+    let bytes = fs::read(db_path)
+        .with_context(|| format!("read compile database {}", db_path.display()))?;
+    let entries: Vec<CompileCommandEntry> = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse compile database {}", db_path.display()))?;
+    let link_rows: Vec<ImportLinkRow> = if from_import {
+        serde_json::from_slice(&bytes).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let link_flags = |index: usize| -> Vec<String> {
+        link_rows
+            .get(index)
+            .map(|row| {
+                // `-lws2_32`: clang's MSVC driver and bhf-cl both pass it to
+                // the linker as `ws2_32.lib`, found through `LIB`; a bare
+                // `ws2_32.lib` would be read as a file in the harness dir.
+                row.bhf_link_libraries
+                    .iter()
+                    .filter(|name| crate::auto::build_probe::is_plain_library_name(name))
+                    .map(|name| {
+                        format!("{BUILD_CONTEXT_LDFLAG_PREFIX}-l{}", &name[..name.len() - 4])
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    for (index, entry) in entries.iter().enumerate() {
+        if compile_command_matches_source(entry, source_path) {
+            let mut flags = extract_compile_database_flags(entry, source_path);
+            flags.extend(link_flags(index));
+            return Ok(Some(flags));
+        }
+    }
+    if is_c_family_header(source_path) {
+        if let Some(entry) = compile_database_entry_for_header(&entries, source_path) {
+            let owner = compile_command_source_path(entry);
+            let mut flags = extract_compile_database_flags(entry, &owner);
+            if let Some(index) = entries.iter().position(|row| std::ptr::eq(row, entry)) {
+                flags.extend(link_flags(index));
+            }
+            return Ok(Some(flags));
+        }
+    }
+    Ok(None)
 }
 
 #[derive(Debug, Clone)]
@@ -8251,7 +8303,20 @@ const COMPILE_DB_BUILD_SUBDIRS: &[&str] = &[
     "out",                 // Generic out-of-source convention (e.g. GN, custom).
 ];
 
+/// Environment variable naming a compile database outside the scanned tree,
+/// consulted after every in-tree location. `bhf auto` sets it to the database
+/// its Visual Studio project import wrote into the work directory.
+pub(crate) const PROJECT_COMPILE_DB_ENV: &str = "BHF_PROJECT_COMPILE_DB";
+
 fn compile_database_candidates(source_path: &Path) -> Vec<PathBuf> {
+    let mut candidates = compile_database_candidates_in_tree(source_path);
+    if let Some(db) = std::env::var_os(PROJECT_COMPILE_DB_ENV) {
+        push_unique_path(&mut candidates, PathBuf::from(db));
+    }
+    candidates
+}
+
+fn compile_database_candidates_in_tree(source_path: &Path) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     let mut cursor = source_path.parent().map(Path::to_path_buf);
     while let Some(dir) = cursor {
@@ -9177,6 +9242,14 @@ fn extract_compile_database_flags(entry: &CompileCommandEntry, source_path: &Pat
         return Vec::new();
     };
     let args = expand_response_files(&raw_args, &entry.directory, 0);
+    // A row from an MSVC build speaks cl's dialect (`/I`, `/D`, `/FI`,
+    // `/std:c11`). Spell it the GCC way first, so the reader below — and every
+    // consumer of the flags it keeps — sees one dialect.
+    let (args, msvc_families) = if is_msvc_compile_row(&args) {
+        translate_msvc_compile_arguments(&args, &entry.directory)
+    } else {
+        (args, BTreeSet::new())
+    };
     let mut flags = Vec::new();
     if let Some(compiler) = compile_command_compiler(&args) {
         flags.push(format!("{BUILD_CONTEXT_COMPILER_PREFIX}{compiler}"));
@@ -9306,7 +9379,8 @@ fn extract_compile_database_flags(entry: &CompileCommandEntry, source_path: &Pat
     // (cached) and drop the ones it rejects, so a gcc-recovered build still
     // harnesses under clang instead of failing every target.
     flags.retain(|flag| !flag.starts_with("-m") || clang_accepts_flag(flag));
-    let dropped = dropped_compile_flag_families(&args);
+    let mut dropped = dropped_compile_flag_families(&args);
+    dropped.extend(msvc_families);
     if !dropped.is_empty() {
         flags.push(format!(
             "{BUILD_CONTEXT_DROPPED_PREFIX}{}",
@@ -9314,6 +9388,274 @@ fn extract_compile_database_flags(entry: &CompileCommandEntry, source_path: &Pat
         ));
     }
     flags
+}
+
+/// The leaf of a compiler or launcher argument, lowercased, with either path
+/// separator and a `.exe` suffix removed: `C:\tools\ccache.exe` -> `ccache`.
+fn compile_command_leaf(argument: &str) -> String {
+    let trimmed = argument.trim().trim_matches('"');
+    let leaf = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
+    let lower = leaf.to_ascii_lowercase();
+    lower
+        .strip_suffix(".exe")
+        .map(str::to_owned)
+        .unwrap_or(lower)
+}
+
+fn is_compiler_launcher_leaf(leaf: &str) -> bool {
+    matches!(
+        leaf,
+        "ccache" | "sccache" | "distcc" | "icecc" | "buildcache"
+    )
+}
+
+/// Whether a compile-database row's compiler (after any launcher) speaks the
+/// MSVC command-line dialect: `cl.exe` or `clang-cl`.
+fn is_msvc_compile_row(args: &[String]) -> bool {
+    args.iter()
+        .find(|argument| !is_compiler_launcher_leaf(&compile_command_leaf(argument)))
+        .and_then(|compiler| harness_gen::compiler_family::family_from_name(compiler))
+        == Some(harness_gen::compiler_family::CompilerFamily::Msvc)
+}
+
+/// A path written by an MSVC build: backslash separators become `/` (which
+/// Windows also accepts), so the row reads the same on every host and the
+/// harness recipe — run by `sh` — keeps its separators.
+fn msvc_path_operand(value: &str) -> String {
+    value.trim_matches('"').replace('\\', "/")
+}
+
+/// `cl` options that carry build semantics, spelled for clang, and the dropped
+/// families of the rest. The launcher and compiler words are kept as they are;
+/// options may use either `/` or `-`. A word that names an existing path (an
+/// absolute `/home/...` source on a POSIX host) is an operand, not an option.
+/// Everything after `/link` is for the linker and is dropped.
+pub(crate) fn translate_msvc_compile_arguments(
+    args: &[String],
+    directory: &Path,
+) -> (Vec<String>, BTreeSet<&'static str>) {
+    let mut families = BTreeSet::new();
+    families.insert("msvc_dialect_translated");
+    let compiler_index = args
+        .iter()
+        .position(|argument| !is_compiler_launcher_leaf(&compile_command_leaf(argument)))
+        .unwrap_or(0);
+    let mut out: Vec<String> = args[..=compiler_index.min(args.len().saturating_sub(1))].to_vec();
+    let mut index = compiler_index + 1;
+    // The value of an option that takes one, either attached (`/Idir`) or as
+    // the next word (`/I dir`).
+    let operand = |attached: &str, index: &mut usize| -> Option<String> {
+        if !attached.is_empty() {
+            return Some(attached.trim_start_matches(':').to_owned());
+        }
+        let next = args.get(*index + 1)?.clone();
+        *index += 1;
+        Some(next)
+    };
+    while index < args.len() {
+        let arg = &args[index];
+        let is_existing_path = (arg.starts_with('/') || arg.starts_with('-'))
+            && (Path::new(arg).exists() || directory.join(arg).exists());
+        let body = match arg.strip_prefix('/').or_else(|| arg.strip_prefix('-')) {
+            Some(body) if !is_existing_path && !body.is_empty() => body,
+            _ => {
+                // An operand (source file, object): keep it, separators normalised.
+                out.push(if arg.contains('\\') {
+                    msvc_path_operand(arg)
+                } else {
+                    arg.clone()
+                });
+                index += 1;
+                continue;
+            }
+        };
+        if body.eq_ignore_ascii_case("link") {
+            families.insert("linker_only");
+            break;
+        }
+        if let Some(rest) = body.strip_prefix("external:I") {
+            if let Some(dir) = operand(rest, &mut index) {
+                out.push("-isystem".to_owned());
+                out.push(msvc_path_operand(&dir));
+            }
+        } else if let Some(rest) = body.strip_prefix("external:") {
+            let _ = rest;
+            families.insert("warning_policy");
+        } else if let Some(rest) = body.strip_prefix("FI") {
+            if let Some(file) = operand(rest, &mut index) {
+                out.push("-include".to_owned());
+                out.push(msvc_path_operand(&file));
+            }
+        } else if let Some(rest) = body.strip_prefix('I') {
+            if let Some(dir) = operand(rest, &mut index) {
+                out.push("-I".to_owned());
+                out.push(msvc_path_operand(&dir));
+            }
+        } else if let Some(rest) = body.strip_prefix('D') {
+            if let Some(define) = operand(rest, &mut index) {
+                // cl also accepts `NAME#VALUE` for `NAME=VALUE`.
+                let define = match define.split_once('#') {
+                    Some((name, value)) if !name.contains('=') => format!("{name}={value}"),
+                    _ => define,
+                };
+                out.push(format!("-D{define}"));
+            }
+        } else if let Some(rest) = body.strip_prefix('U') {
+            if let Some(name) = operand(rest, &mut index) {
+                out.push(format!("-U{name}"));
+            }
+        } else if let Some(standard) = body.strip_prefix("std:") {
+            match msvc_language_standard(standard) {
+                Some(standard) => out.push(format!("-std={standard}")),
+                None => {
+                    families.insert("msvc_codegen");
+                }
+            }
+        } else if body == "J" {
+            out.push("-funsigned-char".to_owned());
+        } else if let Some(pack) = body.strip_prefix("Zp") {
+            out.push(if pack.is_empty() {
+                "-fpack-struct=1".to_owned()
+            } else {
+                format!("-fpack-struct={pack}")
+            });
+        } else if body == "Zc:wchar_t-" {
+            out.push("-fno-wchar".to_owned());
+        } else if body == "GR-" {
+            out.push("-fno-rtti".to_owned());
+        } else if body == "TC" || body == "TP" {
+            // `/TC`/`/TP` name the language of every input; MSBuild passes one
+            // for each source. The harness compile picks the language by file
+            // extension, and a `-x c` would also apply to the objects of its
+            // link line.
+            families.insert("msvc_codegen");
+        } else if let Some(file) = body.strip_prefix("Tc").or_else(|| body.strip_prefix("Tp")) {
+            if let Some(file) = operand(file, &mut index) {
+                out.push(msvc_path_operand(&file));
+            }
+        } else if let Some(arch) = body.strip_prefix("arch:") {
+            match arch {
+                "AVX" => out.push("-mavx".to_owned()),
+                "AVX2" => out.push("-mavx2".to_owned()),
+                "AVX512" => out.push("-mavx512f".to_owned()),
+                _ => {
+                    families.insert("msvc_codegen");
+                }
+            }
+        } else if body == "c" {
+            out.push("-c".to_owned());
+        } else if ["MD", "MDd", "MT", "MTd", "LD", "LDd"].contains(&body) {
+            families.insert("msvc_runtime_library");
+        } else if body.starts_with("Yc") || body.starts_with("Yu") || body.starts_with("Yl") {
+            families.insert("module_or_pch");
+        } else if body.starts_with("Fo")
+            || body.starts_with("Fd")
+            || body.starts_with("Fe")
+            || body.starts_with("Fa")
+            || body.starts_with("Fp")
+            || body.starts_with("FR")
+            || body.starts_with("Fr")
+            || body.starts_with("Fm")
+            || body == "nologo"
+            || body == "FC"
+            || body == "FS"
+            || body.starts_with("MP")
+            || body.starts_with("showIncludes")
+            || body.starts_with("errorReport")
+            || body.starts_with("diagnostics")
+        {
+            families.insert("output_control");
+        } else if body.starts_with('W') || body.starts_with('w') {
+            families.insert("warning_policy");
+        } else {
+            // Optimisation, debug-info, runtime-check, exception, conformance and
+            // charset options (`/O2`, `/Zi`, `/RTC1`, `/EHsc`, `/permissive-`,
+            // `/utf-8`, `/GS`, `/sdl`): the harness compile sets its own.
+            families.insert("msvc_codegen");
+        }
+        index += 1;
+    }
+    (out, families)
+}
+
+/// A cl `/std:` value as the `-std=` clang reads, or `None` when it has no
+/// clang spelling.
+fn msvc_language_standard(standard: &str) -> Option<&'static str> {
+    Some(match standard {
+        "c11" => "c11",
+        "c17" => "c17",
+        "clatest" => "c2x",
+        "c++14" => "c++14",
+        "c++17" => "c++17",
+        "c++20" => "c++20",
+        "c++23preview" | "c++latest" => "c++2b",
+        _ => return None,
+    })
+}
+
+/// Split a compile-database `command` the way the Windows C runtime splits a
+/// command line (`CommandLineToArgvW`): a backslash is literal unless it
+/// precedes a double quote, so `/IC:\proj\include` keeps its separators.
+pub(crate) fn split_windows_command_line(command: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_word = false;
+    let mut quoted = false;
+    let chars: Vec<char> = command.chars().collect();
+    let mut index = 0;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch == '\\' {
+            let start = index;
+            while index < chars.len() && chars[index] == '\\' {
+                index += 1;
+            }
+            let count = index - start;
+            in_word = true;
+            if index < chars.len() && chars[index] == '"' {
+                current.extend(std::iter::repeat_n('\\', count / 2));
+                if count % 2 == 1 {
+                    current.push('"');
+                    index += 1;
+                }
+            } else {
+                current.extend(std::iter::repeat_n('\\', count));
+            }
+            continue;
+        }
+        if ch == '"' {
+            in_word = true;
+            if quoted && chars.get(index + 1) == Some(&'"') {
+                current.push('"');
+                index += 2;
+                continue;
+            }
+            quoted = !quoted;
+        } else if ch.is_whitespace() && !quoted {
+            if in_word {
+                args.push(std::mem::take(&mut current));
+                in_word = false;
+            }
+        } else {
+            in_word = true;
+            current.push(ch);
+        }
+        index += 1;
+    }
+    if in_word {
+        args.push(current);
+    }
+    args
+}
+
+/// Whether a compile-database `command` string is a cl-style command line,
+/// judged by its first word.
+fn is_msvc_command_line(command: &str) -> bool {
+    split_windows_command_line(command)
+        .iter()
+        .find(|word| !is_compiler_launcher_leaf(&compile_command_leaf(word)))
+        .and_then(|compiler| harness_gen::compiler_family::family_from_name(compiler))
+        == Some(harness_gen::compiler_family::CompilerFamily::Msvc)
 }
 
 fn dropped_compile_flag_families(args: &[String]) -> BTreeSet<&'static str> {
@@ -9392,6 +9734,9 @@ fn is_inside_untrusted_tree(candidate: &Path) -> bool {
 /// 2. the path must not live inside the scanned tree (or the working directory).
 ///    A tree binary named exactly `clang` satisfies (1), so only this rejects it.
 ///
+/// A cl-style driver (`cl.exe`, `clang-cl`) is never adopted: the row's flags are
+/// translated to the GCC spelling instead (see `translate_msvc_compile_arguments`).
+///
 /// A bare name carries no directory, so it is left alone — make resolves it on the
 /// operator's PATH. An
 /// absolute path OUTSIDE the tree is honored as-is, which keeps a cross or custom
@@ -9400,16 +9745,20 @@ fn is_inside_untrusted_tree(candidate: &Path) -> bool {
 fn compile_command_compiler(args: &[String]) -> Option<String> {
     let mut index = 0;
     while let Some(argument) = args.get(index) {
-        let leaf = Path::new(argument)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(argument)
-            .to_ascii_lowercase();
-        if matches!(leaf.as_str(), "ccache" | "sccache" | "distcc" | "icecc") {
+        let leaf = compile_command_leaf(argument);
+        if is_compiler_launcher_leaf(&leaf) {
             index += 1;
             continue;
         }
         if !is_toolchain_leaf_name(&leaf) {
+            return None;
+        }
+        // A cl-style driver reads options the generated GCC-style Makefile
+        // does not write; its row's flags are translated instead, and the
+        // harness is built by bhf's own compiler choice.
+        if harness_gen::compiler_family::family_from_name(&leaf)
+            == Some(harness_gen::compiler_family::CompilerFamily::Msvc)
+        {
             return None;
         }
         let path = Path::new(argument);
@@ -9475,6 +9824,7 @@ fn compile_database_single_flag_is_safe(flag: &str) -> bool {
                 | "-fexceptions"
                 | "-fno-rtti"
                 | "-frtti"
+                | "-fno-wchar"
                 | "-fno-strict-aliasing"
                 | "-fstrict-aliasing"
                 | "-fwrapv"
@@ -9492,7 +9842,13 @@ fn compile_command_arguments(entry: &CompileCommandEntry) -> Option<Vec<String>>
     if let Some(arguments) = &entry.arguments {
         return Some(arguments.clone());
     }
-    entry.command.as_deref().map(split_compile_command)
+    entry.command.as_deref().map(|command| {
+        if is_msvc_command_line(command) {
+            split_windows_command_line(command)
+        } else {
+            split_compile_command(command)
+        }
+    })
 }
 
 /// The operand of `-include FILE` / `-imacros FILE` from a compile database.
@@ -13668,6 +14024,7 @@ mod tests {
         CppBuildContext, DecoderLimitArgs, GenerateHarnessArgs, HeaderPreflight,
         BLOCKED_BY_NON_SELF_CONTAINED_HEADER,
     };
+    use super::{compile_database_flags_in, BUILD_CONTEXT_LDFLAG_PREFIX};
     use super::{
         finding_format_note, recorded_harness_format_version, stale_harness_format_note,
         write_generation_metadata,
@@ -14273,6 +14630,238 @@ mod tests {
                 || flag == "-MJ"
                 || flag.ends_with("deps.json")
         }));
+    }
+
+    /// A database row written by an MSVC build (`cl.exe`, or `clang-cl`) uses
+    /// cl's option spellings. Each option that carries build semantics becomes
+    /// its clang equivalent; the rest are dropped and named in the dropped
+    /// families. The harness itself is still built by bhf's own compiler, so
+    /// the row's `cl.exe` is not adopted as the build-context compiler.
+    #[test]
+    fn only_the_project_import_database_adds_link_libraries() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("widget.c");
+        fs::write(&source, "int widget(void) { return 0; }\n").unwrap();
+        let db = temp.path().join("compile_commands.json");
+        fs::write(
+            &db,
+            serde_json::to_vec(&serde_json::json!([{
+                "directory": temp.path(),
+                "file": source,
+                "arguments": ["clang", "-DWIDGET=1", "-c", source],
+                "bhf_link_libraries": ["ws2_32.lib", "bad name.lib", "$(x).lib"]
+            }]))
+            .unwrap(),
+        )
+        .unwrap();
+        let from_import = compile_database_flags_in(&db, &source, true)
+            .unwrap()
+            .expect("row");
+        assert!(from_import.iter().any(|flag| flag == "-DWIDGET=1"));
+        let links: Vec<&String> = from_import
+            .iter()
+            .filter(|flag| flag.starts_with(BUILD_CONTEXT_LDFLAG_PREFIX))
+            .collect();
+        assert_eq!(
+            links,
+            vec![&format!("{BUILD_CONTEXT_LDFLAG_PREFIX}-lws2_32")],
+            "only plain library names are linked, by -l name"
+        );
+        let from_tree = compile_database_flags_in(&db, &source, false)
+            .unwrap()
+            .expect("row");
+        assert!(
+            !from_tree
+                .iter()
+                .any(|flag| flag.starts_with(BUILD_CONTEXT_LDFLAG_PREFIX)),
+            "a tree's own database cannot add link inputs: {from_tree:?}"
+        );
+    }
+
+    #[test]
+    fn cl_style_compile_database_rows_translate_to_clang_flags() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let core = project.join("src").join("core");
+        fs::create_dir_all(&core).unwrap();
+        fs::create_dir_all(project.join("include").join("gen")).unwrap();
+        fs::write(project.join("include").join("config.h"), "#pragma once\n").unwrap();
+        let include = harness_gen::build_safety::make_path(&project.join("include"));
+        let generated = harness_gen::build_safety::make_path(&project.join("include/gen"));
+        let forced = harness_gen::build_safety::make_path(&project.join("include/config.h"));
+        // Backslash separators on every host: the row was written on Windows.
+        let backslashed = |path: &str| path.replace('/', "\\");
+        for compiler in [
+            "cl.exe",
+            "C:\\Program Files\\VS\\VC\\Tools\\MSVC\\14.44\\bin\\HostX64\\x64\\CL.EXE",
+            "clang-cl.exe",
+        ] {
+            let arguments = [
+                compiler.to_owned(),
+                "/nologo".to_owned(),
+                "/I".to_owned(),
+                backslashed(&include),
+                format!("/I{}", backslashed(&generated)),
+                "/DWIDGET_MODE=1".to_owned(),
+                "/D".to_owned(),
+                "WIDGET_HAVE_TABLES=1".to_owned(),
+                "-DWIDGET_LEVEL#3".to_owned(),
+                "/UNDEBUG".to_owned(),
+                format!("/FI{}", backslashed(&forced)),
+                "/std:c11".to_owned(),
+                "/J".to_owned(),
+                "/Zp4".to_owned(),
+                "/Zc:wchar_t-".to_owned(),
+                "/utf-8".to_owned(),
+                "/permissive-".to_owned(),
+                "/EHsc".to_owned(),
+                "/MDd".to_owned(),
+                "/D_DEBUG".to_owned(),
+                "/W4".to_owned(),
+                "/WX".to_owned(),
+                "/Zi".to_owned(),
+                "/O2".to_owned(),
+                "/Fo\"x64\\Debug\\\\\"".to_owned(),
+                "/Fdx64\\Debug\\vc143.pdb".to_owned(),
+                "/Yupch.h".to_owned(),
+                "/TC".to_owned(),
+                "/c".to_owned(),
+                "widget.c".to_owned(),
+            ];
+            let entry = CompileCommandEntry {
+                directory: core.clone(),
+                file: PathBuf::from("widget.c"),
+                arguments: Some(arguments.to_vec()),
+                command: None,
+            };
+            let flags = extract_compile_database_flags(&entry, &core.join("widget.c"));
+            let pairs: Vec<(&str, &str)> = flags
+                .windows(2)
+                .map(|pair| (pair[0].as_str(), pair[1].as_str()))
+                .collect();
+            for (flag, value) in [
+                ("-I", include.as_str()),
+                ("-I", generated.as_str()),
+                ("-include", forced.as_str()),
+            ] {
+                assert!(
+                    pairs.contains(&(flag, value)),
+                    "{compiler}: missing {flag} {value}: {flags:?}"
+                );
+            }
+            for expected in [
+                "-DWIDGET_MODE=1",
+                "-DWIDGET_HAVE_TABLES=1",
+                "-DWIDGET_LEVEL=3",
+                "-UNDEBUG",
+                "-std=c11",
+                "-funsigned-char",
+                "-fpack-struct=4",
+                "-fno-wchar",
+            ] {
+                assert!(
+                    flags.iter().any(|flag| flag == expected),
+                    "{compiler}: missing {expected}: {flags:?}"
+                );
+            }
+            assert!(
+                !flags
+                    .iter()
+                    .any(|flag| flag.starts_with(super::BUILD_CONTEXT_COMPILER_PREFIX)),
+                "{compiler}: the harness is not built with the row's cl-style driver: {flags:?}"
+            );
+            for absent in ["_DEBUG", "pch.h", "vc143.pdb", "x64"] {
+                assert!(
+                    !flags.iter().any(|flag| flag.contains(absent)),
+                    "{compiler}: {absent} must not reach the harness: {flags:?}"
+                );
+            }
+            for absent in [
+                "/W4", "/WX", "/MDd", "/c", "-c", "/O2", "/EHsc", "/utf-8", "-x", "/TC",
+            ] {
+                assert!(
+                    !flags.iter().any(|flag| flag == absent),
+                    "{compiler}: {absent} must not reach the harness: {flags:?}"
+                );
+            }
+            let dropped = flags
+                .iter()
+                .find_map(|flag| flag.strip_prefix(super::BUILD_CONTEXT_DROPPED_PREFIX))
+                .unwrap_or_default();
+            for family in [
+                "msvc_dialect_translated",
+                "output_control",
+                "module_or_pch",
+                "msvc_runtime_library",
+                "msvc_codegen",
+                "warning_policy",
+            ] {
+                assert!(
+                    dropped.split(',').any(|item| item == family),
+                    "{compiler}: dropped families {dropped:?} lack {family}"
+                );
+            }
+        }
+    }
+
+    /// A cl-style `command` string is split by the Windows command-line rules,
+    /// where a backslash is a path separator, not an escape.
+    #[test]
+    fn cl_style_command_strings_keep_backslash_separators() {
+        assert_eq!(
+            super::split_windows_command_line(
+                r#""C:\VS\bin\cl.exe" /nologo /IC:\proj\include /D "LABEL=a b" /D Q=\"x\" "/FoC:\out dir\\" /c widget.c"#
+            ),
+            vec![
+                r"C:\VS\bin\cl.exe",
+                "/nologo",
+                r"/IC:\proj\include",
+                "/D",
+                "LABEL=a b",
+                "/D",
+                "Q=\"x\"",
+                r"/FoC:\out dir\",
+                "/c",
+                "widget.c",
+            ]
+        );
+        let entry = CompileCommandEntry {
+            directory: PathBuf::from("/proj/src"),
+            file: PathBuf::from("widget.c"),
+            arguments: None,
+            command: Some(
+                r#"cl.exe /nologo /IC:\proj\include /DWIDGET_MODE=2 /c widget.c"#.to_owned(),
+            ),
+        };
+        let flags = extract_compile_database_flags(&entry, Path::new("/proj/src/widget.c"));
+        assert!(
+            flags.iter().any(|flag| flag == "-DWIDGET_MODE=2"),
+            "{flags:?}"
+        );
+        assert!(
+            flags
+                .windows(2)
+                .any(|pair| pair[0] == "-I" && pair[1].ends_with("C:/proj/include")),
+            "{flags:?}"
+        );
+    }
+
+    /// The same normalisation names the compiler everywhere: a `.exe` suffix
+    /// and either path separator are not part of a launcher's name.
+    #[test]
+    fn compile_database_launcher_leaves_ignore_exe_and_separators() {
+        assert_eq!(
+            super::compile_command_compiler(&[
+                "C:\\tools\\ccache.exe".to_owned(),
+                "gcc".to_owned(),
+                "-c".to_owned()
+            ]),
+            Some("gcc".to_owned())
+        );
+        assert_eq!(
+            super::compile_command_compiler(&["sccache.EXE".to_owned(), "clang".to_owned()]),
+            Some("clang".to_owned())
+        );
     }
 
     #[test]
@@ -19248,6 +19837,57 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             .lines()
             .find(|line| line.contains(&format!("-o {object}")))
             .unwrap_or_else(|| panic!("no recipe for {object} in:\n{dry_run}"))
+    }
+
+    /// `bhf-cl` (bhf's front end for MSVC cl.exe) is recognised by name, so a
+    /// hand-run `make CC=.../bhf-cl.exe` gets cl's coverage form (inline 8-bit
+    /// counters) and AddressSanitizer without UBSan, which cl does not have —
+    /// in both the C and the C++ Makefile.
+    #[test]
+    fn generated_makefiles_pick_msvc_flags_for_the_cl_front_end() {
+        if !have_tool("make") {
+            eprintln!("skip: make unavailable");
+            return;
+        }
+        let root = temp_dir("make-msvc-family");
+        let c_source = root.join("widget.c");
+        fs::write(
+            &c_source,
+            "#include <stddef.h>\nint parse_record(const unsigned char *data, size_t size) \
+             { return size > 2 && data[0] == 'W' ? data[1] : 0; }\n",
+        )
+        .unwrap();
+        let front_end = "C:/Users/Some One/bhf/bhf-cl.exe";
+        let c_dir = generate_for_make_test(&c_source, "parse_record", "H-MSVC-C", &root);
+        let dry_run = make_dry_run(&c_dir, &[("CC", &format!("\"{front_end}\""))]);
+        let main = recipe_for(&dry_run, "main ");
+        assert!(
+            main.contains("-fsanitize-coverage=inline-8bit-counters,edge,trace-cmp,trace-div"),
+            "{main}"
+        );
+        assert!(main.contains("-fsanitize=address "), "{main}");
+        assert!(!main.contains("undefined"), "cl has no UBSan: {main}");
+        assert!(!main.contains("trace-pc-guard"), "{main}");
+
+        let cpp_root = root.join("cpp");
+        fs::create_dir_all(&cpp_root).unwrap();
+        let cpp_source = cpp_root.join("widget.cpp");
+        fs::write(
+            &cpp_source,
+            "#include <cstddef>\nint parse_record(const unsigned char *data, std::size_t size) \
+             { return size > 2 && data[0] == 'W' ? data[1] : 0; }\n",
+        )
+        .unwrap();
+        let cpp_dir = generate_for_make_test(&cpp_source, "parse_record", "H-MSVC-CPP", &cpp_root);
+        let quoted = format!("\"{front_end}\"");
+        let dry_run = make_dry_run(&cpp_dir, &[("CXX", &quoted), ("CC", &quoted)]);
+        let main = recipe_for(&dry_run, "main ");
+        assert!(
+            main.contains("-fsanitize-coverage=inline-8bit-counters,edge,trace-cmp,trace-div"),
+            "{main}"
+        );
+        assert!(!main.contains("undefined"), "cl has no UBSan: {main}");
+        fs::remove_dir_all(&root).ok();
     }
 
     /// A toolchain flag that selects the ABI must reach bhf's driver object as
