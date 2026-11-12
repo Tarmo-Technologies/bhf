@@ -355,6 +355,11 @@ and receive their own signatures.
   raise the cap. bhf records an analysis gap when it hits the RSS ceiling.
 - **A language target is skipped** — that toolchain is not installed in your
   scoped image, or the project has no fuzzable entry point in that language.
+- **`bhf cartography` warns that address-space randomization cannot be turned
+  off** — the default seccomp profile refuses `personality(2)`, so the bytes
+  that set a SEGV's faulting address show as `unknown`. Add
+  `--security-opt seccomp=unconfined` for the cartography run if you need them;
+  overflows mapped by their region-relative offset work either way.
 
 ### Installation selection versus run selection
 

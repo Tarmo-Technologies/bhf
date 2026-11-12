@@ -400,14 +400,35 @@ and explain it — all offline and deterministic (no LLM):
   the full `auto` pipeline against it. The fastest way to try bhf on a single
   routine.
 - `bhf capsule` — package a crash into a portable, self-verifying PoC capsule:
-  the minimized input, the generated harness, the recovered build context, and any
-  stubs, bundled so the crash can be reproduced elsewhere.
+  the generated harness, the target sources and the project headers they
+  include (in their original directory layout, so `#include "sub/x.h"` still
+  resolves), the stubs bhf synthesized, the build settings the harness was
+  actually built with (the Makefile plus the language standard and extra
+  sources/include dirs recorded in `harnesses/<id>/coverage-build-recipe.json`),
+  and the crash input. The input is the finding's `min_testcase.bin` when it
+  reproduces, else its `testcase.bin`; it ships as `input/testcase.bin`, and the
+  output and `manifest.json` (`input_source`) say which it is. The headers that
+  ship are the ones the compiler's `-M` lists for the build; when that fails,
+  every header under the include roots ships, plus the project headers the
+  sources' `#include` lines reach (also through `..`). For a C++ capsule whose
+  `clang++` cannot find the C++ standard library itself (it picked a GCC install
+  without libstdc++), the scan and `build.sh` fall back to the newest installed
+  libstdc++ headers and library, as bhf's own C++ builds do; `build.sh` probes
+  for them on the host that runs it. A rebuild that fails is reported by the
+  compiler's first `error:` line. The capsule is
+  built and replayed in a scratch dir, then moved into place, so a refused or
+  failed finding leaves nothing behind.
 - `bhf verify-poc <CAPSULE>` — rebuild a PoC capsule offline and assert the
-  crash reproduces. Only `clang` and a shell are needed, so a capsule verifies on a
-  clean machine without the full toolchain.
+  crash reproduces. Only the lane's compiler (`clang`, or `clang++` for a C++
+  capsule; `$CC`/`$CXX` override) and a shell are needed, so a capsule verifies
+  on a clean machine without the full toolchain. A path that does not exist is
+  reported as such, with the `bhf capsule` command that writes it.
 - `bhf env-capsule` — record and replay the shim-served faked environment so an
   environment-driven crash (missing files, unset env, unreachable sockets)
-  reproduces deterministically.
+  reproduces deterministically. The capsule ships the first input that crashes
+  under the recorded environment: `min_testcase.bin`, then `testcase.bin`, then
+  the corpus input that crashed while recording; `manifest.json`
+  (`input_source`) says which.
 - `bhf explain` — explain WHY a crash fired: the controlling input bytes, the
   gate constants it had to satisfy, the faked environment, and the dataflow to the
   sink, plus the recorded memory access (direction, width, the region hit and
@@ -417,6 +438,36 @@ and explain it — all offline and deterministic (no LLM):
   their harnesses; `--all-members` explains each one.
 - `bhf cartography` — map which input bytes control which sink operand
   (offset/size/index) by perturbation — the exploit-primitive view of a finding.
+  A SEGV on a wild pointer has no region-relative offset, so its bytes are mapped
+  by the faulting address instead: replays run with address-space randomization
+  off, and a byte that moves the address is `controls_address` (primitive
+  `controlled_address_read`/`_write`). When two identical replays fault on
+  different addresses, the bytes are `unknown` (primitive `unattributed_crash`)
+  rather than don't-care; a crash no byte gates is `uncontrolled_crash`, not
+  `gated_crash`. Turning randomization off needs the `personality(2)` system
+  call, which a container's default seccomp profile refuses (Docker's, even
+  with `--cap-add=SYS_PTRACE`). There, cartography prints a warning, and a
+  wild pointer's bytes show as `unknown`; run the container with
+  `--security-opt seccomp=unconfined` to map them. Heap, stack and global
+  overflows are mapped by their region-relative offset and are not affected.
+
+`capsule`, `verify-poc`, `cartography` and `env-capsule` work on runtime crash
+findings (`classification: unhandled`) of **C and C++ harnesses**. The language
+comes from `generation-metadata.json` in the harness dir (else the `H-C`/`H-X`
+id prefix), and the harness is looked up in `harnesses/`, `auto/`,
+`generated_harnesses/` and `build/`, so a harness made by hand with
+`generate-harness --id <name>`, `build` and `fuzz` works too. Any other finding
+(an Ada or other-language harness, an oracle hit, a missing harness or input)
+is refused with its own reason and, when the finding dir has one, a command
+that does reproduce it (`python3 <finding>/replay.py`, or the built harness run
+on the input with sanitizer options). `bhf explain` applies the same check: it
+offers `bhf capsule`/`bhf verify-poc` only for findings capsule can package,
+and `bhf cartography` for AddressSanitizer crashes it can map.
+
+Exit codes: each of the four exits non-zero when a requested `--finding-id` is
+refused (or cannot be packaged, mapped or captured, or its capsule did not
+reproduce), and when a run without `--finding-id` writes nothing although the
+work dir has runtime findings. A work dir with no runtime findings exits 0.
 
 ## Optional LLM and agent assistance
 

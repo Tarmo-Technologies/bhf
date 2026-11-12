@@ -80,6 +80,7 @@ mod readiness;
 mod relational;
 mod replay;
 mod report;
+mod repro_lane;
 mod resource_limits;
 mod rules;
 mod runner;
@@ -204,11 +205,11 @@ enum Command {
     Minimize(minimize::MinimizeArgs),
     /// Re-run a finding's crash input through a harness to reproduce it (sandbox / qemu-user)
     Replay(replay::ReplayArgs),
-    /// Package a crash into a portable, self-verifying PoC capsule (min input + harness + recovered build + stubs)
+    /// Package a C/C++ crash into a portable, self-verifying PoC capsule (input + harness + sources + recovered build + stubs); other findings are refused with the reason
     Capsule(capsule::CapsuleArgs),
-    /// Rebuild a PoC capsule offline and assert the crash reproduces (only clang + a shell needed)
+    /// Rebuild a PoC capsule offline and assert the crash reproduces (only clang or clang++ + a shell needed)
     VerifyPoc(capsule::VerifyPocArgs),
-    /// Record + replay the shim-served faked environment so an environment-driven crash reproduces deterministically
+    /// Record + replay the shim-served faked environment so an environment-driven C/C++ crash reproduces deterministically
     EnvCapsule(env_capsule::EnvCapsuleArgs),
     /// Replay inputs through two harnesses or metamorphic variants and flag divergences (BHF-301 oracle)
     Differential(differential::DifferentialArgs),
@@ -218,7 +219,7 @@ enum Command {
     Cmplog(cmplog_cli::CmplogArgs),
     /// Explain, offline and deterministically (no LLM), WHY a crash fired: input, gate constants, faked env, dataflow
     Explain(explain::ExplainArgs),
-    /// Map which input bytes control which sink operand (offset/size/index) via perturbation — the exploit primitive
+    /// Map which input bytes of a C/C++ crash control which sink operand (offset/size/index, or a SEGV's faulting address) via perturbation — the exploit primitive
     Cartography(cartography::CartographyArgs),
 
     // ── Binaries: no-source / firmware analysis ─────────────────────────────

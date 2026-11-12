@@ -397,6 +397,23 @@ when the relation is violated.
 Ada-only findings such as swallowed exception breadcrumbs, Ada handler paths,
 and generated `repro.adb` files do not apply to C/C++ targets.
 
+### Reproducing a finding offline
+
+Every C and C++ crash finding can be handed off without the work dir:
+
+```sh
+bhf capsule --work-dir bhf_work --finding-id <ID>     # package it
+bhf verify-poc bhf_work/capsules/capsule_<ID>          # rebuild + replay it anywhere
+bhf cartography --work-dir bhf_work --finding-id <ID>  # which input bytes steer it
+```
+
+A C capsule rebuilds with `clang` (or `$CC`), a C++ one with `clang++` (or
+`$CXX`), from the harness driver, the target sources and the headers they
+include in their original layout, the repair stubs, and the language standard
+and extra sources bhf recorded for the build. `python3
+bhf_work/results/findings/<ID>/replay.py` replays a finding against the work
+dir's own harness binary. See [CLI](cli.md) for the full behavior.
+
 ## Generated Dictionaries
 
 C and C++ harness generation writes `dictionary.txt` beside `main.c` or

@@ -1,28 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! `bhf cartography` — a byte-control card for a crash: which input bytes
-//! control which sink operand (offset / size / index), and what exploit primitive
-//! that implies.
+//! control which sink operand (offset / size / index, or the faulting address of
+//! a wild access), and what exploit primitive that implies.
 //!
 //! A crash tells you *where* memory safety broke; an exploit developer needs to
 //! know *what they control*. bhf answers this offline and deterministically by
-//! PERTURBATION: it replays the minimized crashing input with each byte flipped and
-//! reads how the sanitizer's report changes. The signal is ASLR-independent — not
-//! the absolute faulting address (which moves every run) but the RELATIVE operand
-//! the sanitizer names: the access size (`READ/WRITE of size N`) and the offset from
-//! the object (`located N bytes after a M-byte region`, `at offset N in frame`).
+//! PERTURBATION: it replays the crashing input (the minimized one when it
+//! reproduces) with each byte flipped and reads how the sanitizer's report
+//! changes. Where the report names a RELATIVE operand — the access size (`READ/WRITE
+//! of size N`) and the offset from the object (`located N bytes after a M-byte
+//! region`, `at offset N in frame`) — that is the signal, and it is
+//! ASLR-independent. A SEGV on a wild pointer names neither, only the faulting
+//! address; replays then run with address-space randomization off, and the address
+//! is compared only when two identical replays agree on it.
 //!
-//!   * flipping a byte removes the crash        ⇒ STRUCTURAL (a gate to reach the sink)
-//!   * flipping a byte moves the relative offset ⇒ controls the ACCESS OFFSET/INDEX
-//!   * flipping a byte changes the access size   ⇒ controls the ACCESS SIZE/LENGTH
-//!   * flipping a byte changes nothing           ⇒ don't-care (payload/filler)
+//!   * flipping a byte removes the crash          ⇒ STRUCTURAL (a gate to reach the sink)
+//!   * flipping a byte moves the relative offset  ⇒ controls the ACCESS OFFSET/INDEX
+//!   * flipping a byte moves the faulting address ⇒ controls the WILD ADDRESS (SEGV)
+//!   * flipping a byte changes the access size    ⇒ controls the ACCESS SIZE/LENGTH
+//!   * flipping a byte changes nothing            ⇒ don't-care (payload/filler)
 //!
 //! From the controlled operand + access direction it classifies the exploit
 //! primitive (a WRITE whose offset an attacker byte controls is a controlled
 //! relative write, CWE-787), writes a `<finding>/byte-control.json` card, and
-//! enriches the finding with a `primitive` object. C lane, best-effort: a min input
-//! that no longer reproduces, or a non-C finding, skips cleanly.
+//! enriches the finding with a `primitive` object. It replays the built harness of
+//! a C or C++ finding ([`crate::repro_lane`]); any other finding is refused with
+//! its reason.
 
+use crate::repro_lane::{self, Tool};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -37,88 +43,104 @@ pub struct CartographyArgs {
     #[arg(long = "work-dir", default_value = "bhf_work")]
     pub work_dir: PathBuf,
 
-    /// Map only this finding id (default: every reproducible C crash).
+    /// Map only this finding id (default: every runtime crash finding of a
+    /// built C or C++ harness). Exits non-zero, with the reason, when it
+    /// cannot be mapped.
     #[arg(long = "finding-id", value_name = "ID")]
     pub finding_id: Option<String>,
 }
 
 pub fn run(args: CartographyArgs) -> i32 {
-    let findings = match collect(&args.work_dir, args.finding_id.as_deref()) {
-        Ok(f) => f,
+    let requested = args.finding_id.is_some();
+    let selection = match repro_lane::select(
+        &args.work_dir,
+        args.finding_id.as_deref(),
+        Tool::Cartography,
+    ) {
+        Ok(selection) => selection,
         Err(e) => {
             bhfeprintln!("error: {e}");
             return 1;
         }
     };
-    if findings.is_empty() {
+    if selection.considered == 0 {
         bhfeprintln!(
-            "bhf cartography: no reproducible C crash findings in {}",
+            "bhf cartography: no runtime crash findings in {}",
             args.work_dir.display()
         );
         return 0;
     }
+    repro_lane::print_refusals(Tool::Cartography, &selection.refused, requested, 10);
+    if selection.eligible.is_empty() {
+        if !requested {
+            bhfeprintln!(
+                "bhf cartography: nothing mapped: none of the {} runtime finding(s) in {} can \
+                 be mapped",
+                selection.considered,
+                args.work_dir.display()
+            );
+        }
+        return 1;
+    }
     let mut mapped = 0usize;
+    let mut unmapped = 0usize;
     let mut first = true;
-    for f in &findings {
-        if let Some(card) = map_finding(&args.work_dir, f) {
-            if !first {
-                println!();
+    let randomization_off = address_randomization_can_be_disabled();
+    let mut warned = false;
+    for (record, eligible) in selection.eligible {
+        let Some(binary) = eligible.binary else {
+            continue;
+        };
+        let f = FindingRef {
+            id: record.id,
+            dir: record.dir,
+            binary,
+            inputs: eligible.inputs,
+        };
+        match map_finding(&f) {
+            Some(card) => {
+                if card.address_stable.is_some() && !randomization_off && !warned {
+                    warned = true;
+                    bhfeprintln!("{RANDOMIZATION_WARNING}");
+                }
+                if !first {
+                    println!();
+                }
+                first = false;
+                print!("{}", render_card(&f.id, &card));
+                write_card(&f, &card);
+                mapped += 1;
             }
-            first = false;
-            print!("{}", render_card(&f.id, &card));
-            write_card(f, &card);
-            mapped += 1;
+            None => {
+                unmapped += 1;
+                bhfeprintln!(
+                    "bhf cartography: {} skipped: replaying its crash input through {} \
+                     produced no AddressSanitizer report to map (cartography maps memory-access \
+                     crashes)",
+                    f.id,
+                    f.binary.display()
+                );
+            }
         }
     }
     if mapped == 0 {
         bhfeprintln!("bhf cartography: no finding reproduced under perturbation analysis");
+        return 1;
     }
-    0
+    if requested && unmapped > 0 {
+        1
+    } else {
+        0
+    }
 }
 
 struct FindingRef {
     id: String,
     dir: PathBuf,
-    harness_id: String,
-}
-
-fn collect(work_dir: &Path, only: Option<&str>) -> anyhow::Result<Vec<FindingRef>> {
-    let dir = corpus::layout::findings_dir(work_dir);
-    let entries = std::fs::read_dir(&dir)
-        .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", dir.display()))?;
-    let mut out = Vec::new();
-    for entry in entries.flatten() {
-        let fdir = entry.path();
-        let Some(raw) = read_json(&fdir.join("finding.json")) else {
-            continue;
-        };
-        if raw.get("classification").and_then(Value::as_str) != Some("unhandled") {
-            continue;
-        }
-        let harness_id = match raw.get("harness_id").and_then(Value::as_str) {
-            Some(h) if h.starts_with("H-C") => h.to_owned(),
-            _ => continue,
-        };
-        let id = raw
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        if let Some(want) = only {
-            if id != want {
-                continue;
-            }
-        }
-        if fdir.join("testcase.bin").is_file() {
-            out.push(FindingRef {
-                id,
-                dir: fdir,
-                harness_id,
-            });
-        }
-    }
-    out.sort_by(|a, b| a.id.cmp(&b.id));
-    Ok(out)
+    /// The built harness executable.
+    binary: PathBuf,
+    /// Crash inputs, minimized first.
+    inputs: Vec<PathBuf>,
 }
 
 /// The ASLR-independent facts of one crash, parsed from the sanitizer report.
@@ -130,6 +152,9 @@ struct CrashFacts {
     /// Signed offset of the faulting access from the object it overflowed (+ =
     /// after/right, - = before/left). ASLR-independent.
     rel_offset: Option<i64>,
+    /// The address a wild access faulted on (`SEGV on unknown address 0x...`).
+    /// Absolute, so only comparable between replays that agree on it.
+    fault_address: Option<u64>,
 }
 
 /// Per-byte control classification.
@@ -137,9 +162,13 @@ struct CrashFacts {
 enum ByteClass {
     Structural,
     ControlsOffset,
+    ControlsAddress,
     ControlsSize,
     ControlsClass,
     DontCare,
+    /// The crash survived but its faulting address is not stable between
+    /// identical replays, so whether this byte steers it cannot be measured.
+    Unknown,
 }
 
 impl ByteClass {
@@ -147,17 +176,24 @@ impl ByteClass {
         match self {
             ByteClass::Structural => "structural",
             ByteClass::ControlsOffset => "controls_offset",
+            ByteClass::ControlsAddress => "controls_address",
             ByteClass::ControlsSize => "controls_size",
             ByteClass::ControlsClass => "controls_class",
             ByteClass::DontCare => "dont_care",
+            ByteClass::Unknown => "unknown",
         }
     }
 }
 
 struct Card {
+    /// The input replayed (`min_testcase.bin` or `testcase.bin`).
+    input_name: String,
     input_len: usize,
     analyzed: usize,
     baseline: CrashFacts,
+    /// For a crash with a faulting address and no relative offset: whether
+    /// two identical replays faulted on the same address.
+    address_stable: Option<bool>,
     classes: Vec<ByteClass>,
     primitive: Primitive,
 }
@@ -170,24 +206,43 @@ struct Primitive {
     controlling_bytes: Vec<usize>,
 }
 
-fn map_finding(work_dir: &Path, f: &FindingRef) -> Option<Card> {
-    let bin = crate::auto::layout::harness_dir(work_dir, &f.harness_id).join("main");
-    if !bin.is_file() {
-        return None;
-    }
-    let input = std::fs::read(f.dir.join("testcase.bin")).ok()?;
-    let baseline = replay_facts(&bin, &input)?; // must reproduce a crash to map it.
+fn map_finding(f: &FindingRef) -> Option<Card> {
+    let bin = &f.binary;
+    // The first input that still crashes is the baseline (must reproduce to map it).
+    let (input_path, input, baseline) = f.inputs.iter().find_map(|path| {
+        let input = std::fs::read(path).ok()?;
+        let facts = replay_facts(bin, &input)?;
+        Some((path, input, facts))
+    })?;
+    // A wild access names no relative operand, only the address it faulted on.
+    // Compare addresses only when a second identical replay agrees on it.
+    let address_stable =
+        (baseline.rel_offset.is_none() && baseline.fault_address.is_some()).then(|| {
+            replay_facts(bin, &input)
+                .is_some_and(|again| again.fault_address == baseline.fault_address)
+        });
     let analyzed = input.len().min(MAX_BYTES);
 
     let mut classes = Vec::with_capacity(analyzed);
     for i in 0..analyzed {
-        classes.push(classify_byte(&bin, &input, i, &baseline));
+        classes.push(classify_byte(
+            bin,
+            &input,
+            i,
+            &baseline,
+            address_stable.unwrap_or(false),
+        ));
     }
     let primitive = classify_primitive(&baseline, &classes);
     Some(Card {
+        input_name: input_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default(),
         input_len: input.len(),
         analyzed,
         baseline,
+        address_stable,
         classes,
         primitive,
     })
@@ -195,7 +250,13 @@ fn map_finding(work_dir: &Path, f: &FindingRef) -> Option<Card> {
 
 /// Classify one byte by perturbing it (XOR 0xFF and XOR 0x01) and comparing the
 /// resulting crash facts to the baseline.
-fn classify_byte(bin: &Path, input: &[u8], i: usize, baseline: &CrashFacts) -> ByteClass {
+fn classify_byte(
+    bin: &Path,
+    input: &[u8],
+    i: usize,
+    baseline: &CrashFacts,
+    address_stable: bool,
+) -> ByteClass {
     let mut crashed_variants = Vec::new();
     for delta in [0xFFu8, 0x01u8] {
         let mut mutated = input.to_vec();
@@ -204,16 +265,30 @@ fn classify_byte(bin: &Path, input: &[u8], i: usize, baseline: &CrashFacts) -> B
             crashed_variants.push(facts);
         }
     }
+    classify_variants(baseline, &crashed_variants, address_stable)
+}
+
+/// The control a byte has, from the crashes its perturbations still produced.
+fn classify_variants(
+    baseline: &CrashFacts,
+    crashed_variants: &[CrashFacts],
+    address_stable: bool,
+) -> ByteClass {
     if crashed_variants.is_empty() {
         return ByteClass::Structural; // every perturbation removed the crash.
     }
     // Prefer the strongest operand-control signal observed across perturbations.
     let mut seen_offset = false;
+    let mut seen_address = false;
     let mut seen_size = false;
     let mut seen_class = false;
-    for v in &crashed_variants {
+    for v in crashed_variants {
         if v.rel_offset.is_some() && v.rel_offset != baseline.rel_offset {
             seen_offset = true;
+        }
+        if address_stable && v.fault_address.is_some() && v.fault_address != baseline.fault_address
+        {
+            seen_address = true;
         }
         if v.size.is_some() && v.size != baseline.size {
             seen_size = true;
@@ -224,10 +299,14 @@ fn classify_byte(bin: &Path, input: &[u8], i: usize, baseline: &CrashFacts) -> B
     }
     if seen_offset {
         ByteClass::ControlsOffset
+    } else if seen_address {
+        ByteClass::ControlsAddress
     } else if seen_size {
         ByteClass::ControlsSize
     } else if seen_class {
         ByteClass::ControlsClass
+    } else if baseline.rel_offset.is_none() && baseline.fault_address.is_some() && !address_stable {
+        ByteClass::Unknown
     } else {
         ByteClass::DontCare
     }
@@ -240,11 +319,16 @@ fn classify_byte(bin: &Path, input: &[u8], i: usize, baseline: &CrashFacts) -> B
 /// the memory-locator line we parse (`located N bytes after region`) is emitted by
 /// ASan's shadow analysis, NOT symbolization, so it survives. A `timeout` wrapper
 /// is a belt-and-suspenders guard against an input that genuinely loops.
+///
+/// The replay runs beside the binary, so the binary and the scratch input are
+/// made absolute first: a relative `--work-dir` would otherwise resolve against
+/// the binary's own dir.
 fn replay_facts(bin: &Path, input: &[u8]) -> Option<CrashFacts> {
+    let bin = std::path::absolute(bin).ok()?;
     let dir = bin.parent()?;
     let scratch = dir.join("cart_input.bin");
     std::fs::write(&scratch, input).ok()?;
-    let out = replay_command(bin)
+    let out = replay_command(&bin)
         .arg(&scratch)
         .env(
             "ASAN_OPTIONS",
@@ -260,17 +344,78 @@ fn replay_facts(bin: &Path, input: &[u8]) -> Option<CrashFacts> {
 /// Build the replay command, wrapping in `timeout` when it is available so a
 /// pathological input can never wedge the analysis.
 fn replay_command(bin: &Path) -> Command {
-    if which::which("timeout").is_ok() {
+    let mut cmd = if which::which("timeout").is_ok() {
         let mut cmd = Command::new("timeout");
         cmd.arg("-s").arg("KILL").arg("10").arg(bin);
-        crate::command_output::run_target_beside_binary(&mut cmd, bin);
         cmd
     } else {
-        let mut cmd = Command::new(bin);
-        crate::command_output::run_target_beside_binary(&mut cmd, bin);
-        cmd
+        Command::new(bin)
+    };
+    crate::command_output::run_target_beside_binary(&mut cmd, bin);
+    disable_address_randomization(&mut cmd);
+    cmd
+}
+
+/// Run the replay (and, through `timeout`, the harness it execs) with
+/// address-space randomization off, so a wild pointer's faulting address is the
+/// same on every identical replay and a perturbed byte that moves it shows.
+#[cfg(target_os = "linux")]
+fn disable_address_randomization(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: personality(2) is a plain syscall, safe between fork and exec; the
+    // closure allocates nothing. A refusal (seccomp) leaves randomization on,
+    // which the baseline stability check then detects.
+    unsafe {
+        command.pre_exec(|| {
+            let current = libc::personality(0xffff_ffff);
+            if current != -1 {
+                libc::personality((current | libc::ADDR_NO_RANDOMIZE) as libc::c_ulong);
+            }
+            Ok(())
+        });
     }
 }
+
+#[cfg(not(target_os = "linux"))]
+fn disable_address_randomization(_command: &mut Command) {}
+
+/// Whether the replays can run with address-space randomization off. A
+/// container's default seccomp profile (Docker's, even with
+/// `--cap-add=SYS_PTRACE`) refuses the personality(2) call that turns it off;
+/// the replays then fault on a different address every run.
+#[cfg(target_os = "linux")]
+fn address_randomization_can_be_disabled() -> bool {
+    // SAFETY: personality(2) changes only the calling thread's persona, which
+    // matters only at its next exec; it is restored before returning.
+    unsafe {
+        let current = libc::personality(0xffff_ffff);
+        if current == -1 {
+            return false;
+        }
+        if current & libc::ADDR_NO_RANDOMIZE != 0 {
+            return true;
+        }
+        if libc::personality((current | libc::ADDR_NO_RANDOMIZE) as libc::c_ulong) == -1 {
+            return false;
+        }
+        let set = libc::personality(0xffff_ffff);
+        libc::personality(current as libc::c_ulong);
+        set != -1 && set & libc::ADDR_NO_RANDOMIZE != 0
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn address_randomization_can_be_disabled() -> bool {
+    false
+}
+
+/// Printed once per run when a wild-pointer crash is mapped where
+/// randomization stays on.
+const RANDOMIZATION_WARNING: &str = "bhf cartography: warning: address-space randomization \
+    cannot be turned off here (personality(2) was refused, as a container's default seccomp \
+    profile does), so the input bytes that set a SEGV's faulting address cannot be \
+    attributed and show as `unknown`; in Docker, rerun with `--security-opt \
+    seccomp=unconfined`";
 
 /// Parse the ASLR-independent crash facts from a sanitizer report.
 fn parse_crash(stderr: &str) -> Option<CrashFacts> {
@@ -299,6 +444,23 @@ fn parse_crash(stderr: &str) -> Option<CrashFacts> {
         }
     }
     facts.rel_offset = parse_rel_offset(stderr);
+    // A wild access: "SEGV on unknown address 0x... (pc ...)" and "The signal is
+    // caused by a READ memory access."
+    if let Some(p) = stderr.find(" on unknown address 0x") {
+        let hex: String = stderr[p + " on unknown address 0x".len()..]
+            .chars()
+            .take_while(char::is_ascii_hexdigit)
+            .collect();
+        facts.fault_address = u64::from_str_radix(&hex, 16).ok();
+    }
+    if facts.access.is_none() {
+        for dir in ["READ", "WRITE"] {
+            if stderr.contains(&format!("caused by a {dir} memory access")) {
+                facts.access = Some(dir.to_owned());
+                break;
+            }
+        }
+    }
     Some(facts)
 }
 
@@ -320,12 +482,16 @@ fn classify_primitive(baseline: &CrashFacts, classes: &[ByteClass]) -> Primitive
         .filter(|(_, c)| {
             matches!(
                 c,
-                ByteClass::ControlsOffset | ByteClass::ControlsSize | ByteClass::ControlsClass
+                ByteClass::ControlsOffset
+                    | ByteClass::ControlsAddress
+                    | ByteClass::ControlsSize
+                    | ByteClass::ControlsClass
             )
         })
         .map(|(i, _)| i)
         .collect();
     let controls_offset = classes.contains(&ByteClass::ControlsOffset);
+    let controls_address = classes.contains(&ByteClass::ControlsAddress);
     let controls_size = classes.contains(&ByteClass::ControlsSize);
     let is_write = baseline.access.as_deref() == Some("WRITE");
     let operand = if controls_offset {
@@ -336,6 +502,25 @@ fn classify_primitive(baseline: &CrashFacts, classes: &[ByteClass]) -> Primitive
         ""
     };
 
+    if controls_address && !controls_offset {
+        // A wild pointer: the bytes set the address the access faults on.
+        let (kind, cwe, exploitability, what) = match baseline.access.as_deref() {
+            Some("WRITE") => ("controlled_address_write", "CWE-787", "high", "WRITE"),
+            Some("READ") => ("controlled_address_read", "CWE-125", "medium", "READ"),
+            _ => ("controlled_address_access", "CWE-119", "medium", "access"),
+        };
+        return Primitive {
+            kind,
+            cwe,
+            exploitability,
+            summary: format!(
+                "input byte(s) {} set the faulting address of a wild {what} — an \
+                 attacker-steered memory access",
+                span_list(&controlling)
+            ),
+            controlling_bytes: controlling,
+        };
+    }
     if !controlling.is_empty() && is_write {
         Primitive {
             kind: "controlled_relative_write",
@@ -358,6 +543,16 @@ fn classify_primitive(baseline: &CrashFacts, classes: &[ByteClass]) -> Primitive
             ),
             controlling_bytes: controlling,
         }
+    } else if classes.contains(&ByteClass::Unknown) {
+        Primitive {
+            kind: "unattributed_crash",
+            cwe: baseline_cwe(baseline),
+            exploitability: "unknown",
+            summary: "the faulting address moved between identical replays, so which input \
+                      bytes steer it could not be measured"
+                .to_owned(),
+            controlling_bytes: Vec::new(),
+        }
     } else if is_write {
         Primitive {
             kind: "fixed_write",
@@ -366,6 +561,20 @@ fn classify_primitive(baseline: &CrashFacts, classes: &[ByteClass]) -> Primitive
             summary:
                 "an out-of-bounds WRITE whose operand no single input byte controls (fixed offset)"
                     .to_owned(),
+            controlling_bytes: Vec::new(),
+        }
+    } else if !classes.contains(&ByteClass::Structural) {
+        Primitive {
+            kind: "uncontrolled_crash",
+            cwe: baseline_cwe(baseline),
+            exploitability: "low",
+            summary: if classes.is_empty() {
+                "the crash input is empty, so no input byte gates or steers the crash".to_owned()
+            } else {
+                "every perturbed input still crashed the same way: no input byte gates or \
+                 steers the crash"
+                    .to_owned()
+            },
             controlling_bytes: Vec::new(),
         }
     } else {
@@ -423,9 +632,16 @@ fn render_card(id: &str, card: &Card) -> String {
     let mut s = String::new();
     let b = &card.baseline;
     let _ = writeln!(s, "━━━ Byte-control card — {id} ━━━");
+    let address = match (b.fault_address, card.address_stable) {
+        (Some(address), Some(true)) => format!(", faulting address {address:#x}"),
+        (Some(address), _) => {
+            format!(", faulting address {address:#x}, not stable between replays")
+        }
+        (None, _) => String::new(),
+    };
     let _ = writeln!(
         s,
-        "  crash: {} ({} of size {}{})",
+        "  crash: {} ({} of size {}{}{address})",
         b.class,
         b.access.as_deref().unwrap_or("?"),
         b.size.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
@@ -435,8 +651,9 @@ fn render_card(id: &str, card: &Card) -> String {
     );
     let _ = writeln!(
         s,
-        "  input: {} byte(s){}",
+        "  input: {} byte(s), {}{}",
         card.input_len,
+        card.input_name,
         if card.analyzed < card.input_len {
             format!(" (first {} analyzed)", card.analyzed)
         } else {
@@ -453,8 +670,10 @@ fn render_card(id: &str, card: &Card) -> String {
     for (label, class) in [
         ("structural (gate)", ByteClass::Structural),
         ("controls offset/index", ByteClass::ControlsOffset),
+        ("controls faulting address", ByteClass::ControlsAddress),
         ("controls size/length", ByteClass::ControlsSize),
         ("controls crash kind", ByteClass::ControlsClass),
+        ("unknown (faulting address not stable)", ByteClass::Unknown),
     ] {
         let offs: Vec<usize> = card
             .classes
@@ -481,6 +700,7 @@ fn write_card(f: &FindingRef, card: &Card) {
     let card_json = json!({
         "schema": "bhf.byte-control/v1",
         "finding_id": f.id,
+        "input": card.input_name,
         "input_len": card.input_len,
         "analyzed_bytes": card.analyzed,
         "crash": {
@@ -488,6 +708,8 @@ fn write_card(f: &FindingRef, card: &Card) {
             "access": card.baseline.access,
             "size": card.baseline.size,
             "rel_offset": card.baseline.rel_offset,
+            "fault_address": card.baseline.fault_address.map(|a| format!("{a:#x}")),
+            "fault_address_stable": card.address_stable,
         },
         "primitive": {
             "kind": card.primitive.kind,
@@ -531,6 +753,30 @@ fn read_json(path: &Path) -> Option<Value> {
 mod tests {
     use super::*;
 
+    /// The probe answers what a replay really gets: a child started the way
+    /// replays are runs with randomization off exactly when the probe says it
+    /// can be turned off (a seccomp profile that refuses personality(2) makes
+    /// both false), and the probe leaves this thread's persona as it was.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_randomization_probe_matches_what_a_replay_gets() {
+        let persona = || std::fs::read_to_string("/proc/thread-self/personality").unwrap();
+        let before = persona();
+        let probe = address_randomization_can_be_disabled();
+        assert_eq!(persona(), before, "the probe must restore the persona");
+        let mut child = Command::new("cat");
+        child.arg("/proc/self/personality");
+        disable_address_randomization(&mut child);
+        let out = child.output().expect("run cat");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let flags = u64::from_str_radix(text.trim(), 16).expect("hex persona");
+        assert_eq!(
+            flags & libc::ADDR_NO_RANDOMIZE as u64 != 0,
+            probe,
+            "child persona {text:?}"
+        );
+    }
+
     #[test]
     fn parses_heap_read_facts_with_relative_offset() {
         let report = "\
@@ -568,6 +814,7 @@ READ of size 1 at 0x502000000035 thread T0\n\
             access: Some("READ".into()),
             size: Some(1),
             rel_offset: Some(21),
+            fault_address: None,
         };
         let classes = vec![
             ByteClass::Structural,
@@ -587,12 +834,100 @@ READ of size 1 at 0x502000000035 thread T0\n\
             access: Some("WRITE".into()),
             size: Some(4),
             rel_offset: Some(0),
+            fault_address: None,
         };
         let classes = vec![ByteClass::ControlsSize];
         let p = classify_primitive(&baseline, &classes);
         assert_eq!(p.kind, "controlled_relative_write");
         assert_eq!(p.cwe, "CWE-787");
         assert_eq!(p.exploitability, "high");
+    }
+
+    /// A SEGV on a wild pointer reports no region-relative offset: the
+    /// faulting address and the access direction are what is left.
+    #[test]
+    fn parses_segv_faulting_address_and_direction() {
+        let report = "\
+==7==ERROR: AddressSanitizer: SEGV on unknown address 0x555595558000 (pc 0x5555 bp 0x7fff sp 0x7fff T0)\n\
+==7==The signal is caused by a READ memory access.\n";
+        let f = parse_crash(report).unwrap();
+        assert_eq!(f.class, "SEGV");
+        assert_eq!(f.access.as_deref(), Some("READ"));
+        assert_eq!(f.fault_address, Some(0x5555_9555_8000));
+        assert_eq!(f.rel_offset, None);
+        assert_eq!(f.size, None);
+    }
+
+    fn segv(address: u64) -> CrashFacts {
+        CrashFacts {
+            class: "SEGV".into(),
+            access: Some("READ".into()),
+            size: None,
+            rel_offset: None,
+            fault_address: Some(address),
+        }
+    }
+
+    /// A byte that moves a stable faulting address controls it; when the
+    /// address is not stable between identical replays, that cannot be told
+    /// and the byte is not called don't-care.
+    #[test]
+    fn segv_bytes_are_classified_by_the_faulting_address() {
+        let baseline = segv(0x1000);
+        assert_eq!(
+            classify_variants(&baseline, &[segv(0x2000)], true),
+            ByteClass::ControlsAddress
+        );
+        assert_eq!(
+            classify_variants(&baseline, &[segv(0x1000), segv(0x1000)], true),
+            ByteClass::DontCare
+        );
+        assert_eq!(
+            classify_variants(&baseline, &[segv(0x2000)], false),
+            ByteClass::Unknown
+        );
+        assert_eq!(
+            classify_variants(&baseline, &[], true),
+            ByteClass::Structural
+        );
+    }
+
+    #[test]
+    fn primitives_for_wild_and_uncontrolled_crashes() {
+        let classes = vec![
+            ByteClass::ControlsAddress,
+            ByteClass::ControlsAddress,
+            ByteClass::DontCare,
+        ];
+        let p = classify_primitive(&segv(0x1000), &classes);
+        assert_eq!(p.kind, "controlled_address_read");
+        assert_eq!(p.cwe, "CWE-125");
+        assert_eq!(p.controlling_bytes, vec![0, 1]);
+        assert!(p.summary.contains("faulting address"), "{}", p.summary);
+
+        let mut write = segv(0x1000);
+        write.access = Some("WRITE".into());
+        assert_eq!(
+            classify_primitive(&write, &[ByteClass::ControlsAddress]).kind,
+            "controlled_address_write"
+        );
+        assert_eq!(
+            classify_primitive(&segv(0x1000), &[ByteClass::Unknown, ByteClass::Structural]).kind,
+            "unattributed_crash"
+        );
+        // Nothing gates the crash: it is not a "gated" crash.
+        assert_eq!(
+            classify_primitive(&segv(0x1000), &[ByteClass::DontCare, ByteClass::DontCare]).kind,
+            "uncontrolled_crash"
+        );
+        assert_eq!(
+            classify_primitive(&segv(0x1000), &[]).kind,
+            "uncontrolled_crash"
+        );
+        assert_eq!(
+            classify_primitive(&segv(0x1000), &[ByteClass::Structural, ByteClass::DontCare]).kind,
+            "gated_crash"
+        );
     }
 
     #[test]

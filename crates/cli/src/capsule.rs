@@ -7,20 +7,35 @@
 //! stitching one together. The flip side: the crash it finds lives inside a
 //! throwaway `bhf_work/` full of absolute paths and generated stubs. A capsule
 //! makes that crash *hand-offable*: it copies the minimal set that reproduces it —
-//! the harness driver, the target sources, the recovered stubs, the C runtime
-//! headers, and the minimized input — rewrites every path to be relative, and
-//! ships a `build.sh` plus a `manifest.json` recording the exact sanitizer
-//! signature to expect. `bhf verify-poc` rebuilds it offline (only `clang` + a
-//! shell needed — no bhf) and asserts the same crash reproduces.
+//! the harness driver, the target sources and the headers they include (in their
+//! original layout), the recovered stubs, the C runtime headers, and the crash
+//! input (the minimized one when it reproduces) — rewrites every path to be
+//! relative, and ships a `build.sh` plus a `manifest.json` recording the exact
+//! sanitizer signature to expect. `bhf verify-poc` rebuilds it offline (only the
+//! lane's compiler + a shell needed — no bhf) and asserts the same crash
+//! reproduces.
+//!
+//! What gets copied and how it rebuilds is the finding's lane
+//! ([`crate::repro_lane`]): C and C++ harnesses today. Any other finding is
+//! refused with a reason that names its harness and language.
 //!
 //! The capsule is self-verifying BY CONSTRUCTION: `capsule` builds and replays it in
-//! a scratch copy before finalizing, records the observed sanitizer signature, and
-//! marks `reproduced: false` (never silently) when the reconstruction doesn't fire —
-//! e.g. a multi-TU link this post-hoc packaging couldn't recover. C lane today.
+//! a scratch dir before moving it into place, records the observed sanitizer
+//! signature, and marks `reproduced: false` (never silently) when the
+//! reconstruction doesn't fire. A refused or failed finding leaves nothing behind.
 
+use crate::repro_lane::{self, Lane, PlanRequest, Tool};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
+
+/// Wall clock for rebuilding a capsule.
+const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// Wall clock for one replay of the rebuilt PoC.
+const REPLAY_TIMEOUT: Duration = Duration::from_secs(60);
+/// Where a capsule's crash input ships, whichever of the finding's inputs it is.
+const SHIPPED_INPUT: &str = "input/testcase.bin";
 
 // ── `bhf capsule` ───────────────────────────────────────────────────────
 
@@ -31,7 +46,9 @@ pub struct CapsuleArgs {
     #[arg(long = "work-dir", default_value = "bhf_work")]
     pub work_dir: PathBuf,
 
-    /// Package only this finding id (default: every reproducible C crash finding).
+    /// Package only this finding id (default: every runtime crash finding of a
+    /// C or C++ harness). Exits non-zero, with the reason, when it cannot be
+    /// packaged.
     #[arg(long = "finding-id", value_name = "ID")]
     pub finding_id: Option<String>,
 
@@ -60,42 +77,66 @@ pub fn run(args: CapsuleArgs) -> i32 {
         bhfeprintln!("error: {error:#}");
         return 1;
     }
+    let requested = args.finding_id.is_some();
+    let selection =
+        match repro_lane::select(&args.work_dir, args.finding_id.as_deref(), Tool::Capsule) {
+            Ok(selection) => selection,
+            Err(error) => {
+                bhfeprintln!("error: {error}");
+                return 1;
+            }
+        };
+    if selection.considered == 0 {
+        bhfeprintln!(
+            "bhf capsule: no runtime crash findings in {}",
+            args.work_dir.display()
+        );
+        return 0;
+    }
+    repro_lane::print_refusals(Tool::Capsule, &selection.refused, requested, 10);
+    let selection_refused = selection.refused.len();
+    if selection.eligible.is_empty() {
+        if !requested {
+            bhfeprintln!(
+                "bhf capsule: nothing packaged: none of the {} runtime finding(s) in {} can be \
+                 packaged",
+                selection.considered,
+                args.work_dir.display()
+            );
+        }
+        return 1;
+    }
     let out_root = args
         .out
         .clone()
         .unwrap_or_else(|| args.work_dir.join("capsules"));
-    if std::fs::create_dir_all(&out_root).is_err() {
-        bhfeprintln!("error: cannot create output dir {}", out_root.display());
-        return 1;
-    }
-    let findings = match collect_findings(&args.work_dir, args.finding_id.as_deref()) {
-        Ok(f) => f,
-        Err(e) => {
-            bhfeprintln!("error: {e}");
-            return 1;
-        }
-    };
-    if findings.is_empty() {
-        bhfeprintln!(
-            "bhf capsule: no reproducible C crash findings in {} (need a runtime finding with a testcase.bin)",
-            args.work_dir.display()
-        );
-        return if args.finding_id.is_some() { 1 } else { 0 };
-    }
+    let out_root_existed = out_root.exists();
     let mut made = 0usize;
     let mut reproduced = 0usize;
     let mut failed = 0usize;
-    for f in findings {
-        match build_capsule(&args.work_dir, &f, &out_root, args.tar) {
+    for (record, eligible) in selection.eligible {
+        let Some(harness_dir) = eligible.harness_dir else {
+            failed += 1;
+            continue;
+        };
+        let finding = FindingRef {
+            finding_id: record.id,
+            harness_id: eligible.harness_id,
+            harness_dir,
+            lane: eligible.lane,
+            inputs: eligible.inputs,
+            raw: record.raw,
+        };
+        match build_capsule(&finding, &out_root, args.tar) {
             Ok(report) => {
                 made += 1;
                 if report.reproduced {
                     reproduced += 1;
                 }
                 let mark = if report.reproduced {
-                    "✓"
+                    "✓".to_owned()
                 } else {
-                    "⚠ not reproduced"
+                    format!("⚠ not reproduced: {}", report.not_reproduced_reason)
                 };
                 println!(
                     "  {} {}  ({})",
@@ -103,21 +144,34 @@ pub fn run(args: CapsuleArgs) -> i32 {
                     report.capsule_path.display(),
                     mark
                 );
+                println!("      input: {}", report.input_note);
                 if args.verbose {
                     println!("      signature: {}", report.signature);
+                }
+                for warning in &report.warnings {
+                    bhfeprintln!("  {} warning: {warning}", report.finding_id);
                 }
             }
             Err(e) => {
                 failed += 1;
-                bhfeprintln!("  {} failed: {e}", f.finding_id);
+                bhfeprintln!("  {} failed: {e:#}", finding.finding_id);
             }
         }
     }
+    if !out_root_existed {
+        // Only removes an empty dir: nothing was packaged into it.
+        let _ = std::fs::remove_dir(&out_root);
+    }
+    let skipped = match selection_refused {
+        0 => String::new(),
+        n => format!("; {n} finding(s) skipped"),
+    };
     println!(
-        "bhf capsule: {made} capsule(s) written to {} ({reproduced} verified to reproduce)",
+        "bhf capsule: {made} capsule(s) written to {} ({reproduced} verified to reproduce{skipped})",
         out_root.display()
     );
-    if failed > 0 {
+    let requested_unverified = requested && reproduced < made;
+    if failed > 0 || made == 0 || requested_unverified {
         1
     } else {
         0
@@ -127,52 +181,12 @@ pub fn run(args: CapsuleArgs) -> i32 {
 /// A finding selected for packaging.
 struct FindingRef {
     finding_id: String,
-    finding_dir: PathBuf,
     harness_id: String,
+    harness_dir: PathBuf,
+    lane: &'static dyn Lane,
+    /// Crash inputs, minimized first.
+    inputs: Vec<PathBuf>,
     raw: Value,
-}
-
-/// Collect runtime C crash findings (with a min input) from the work dir.
-fn collect_findings(work_dir: &Path, only: Option<&str>) -> anyhow::Result<Vec<FindingRef>> {
-    let dir = corpus::layout::findings_dir(work_dir);
-    let entries = std::fs::read_dir(&dir)
-        .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", dir.display()))?;
-    let mut out = Vec::new();
-    for entry in entries.flatten() {
-        let fdir = entry.path();
-        let raw = match read_json(&fdir.join("finding.json")) {
-            Some(r) => r,
-            None => continue,
-        };
-        if raw.get("classification").and_then(Value::as_str) != Some("unhandled") {
-            continue;
-        }
-        let finding_id = raw
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        if let Some(want) = only {
-            if finding_id != want {
-                continue;
-            }
-        }
-        let harness_id = match raw.get("harness_id").and_then(Value::as_str) {
-            Some(h) if h.starts_with("H-C") => h.to_owned(), // C lane only, today.
-            _ => continue,
-        };
-        if !fdir.join("testcase.bin").is_file() {
-            continue;
-        }
-        out.push(FindingRef {
-            finding_id,
-            finding_dir: fdir,
-            harness_id,
-            raw,
-        });
-    }
-    out.sort_by(|a, b| a.finding_id.cmp(&b.finding_id));
-    Ok(out)
 }
 
 /// A written capsule's summary.
@@ -181,113 +195,128 @@ struct CapsuleReport {
     capsule_path: PathBuf,
     reproduced: bool,
     signature: String,
+    /// Which input shipped, e.g. `min_testcase.bin (minimized, 5 bytes)`.
+    input_note: String,
+    not_reproduced_reason: String,
+    warnings: Vec<String>,
 }
 
-/// The compile inputs recovered from a harness's Makefile.
-struct BuildRecipe {
-    /// Explicit target sources (absolute) listed in the `main:` recipe.
-    target_sources: Vec<PathBuf>,
-    /// `COMPILE_DB_FLAGS` (recovered `-std`/`-D` etc.), verbatim tokens.
-    compile_db_flags: Vec<String>,
-    /// Non-`.` `-I` include dirs from `INCLUDES` (the bhf C runtime + any
-    /// recovered dependency-header dir) — copied into the capsule's `runtime/`.
-    include_dirs: Vec<PathBuf>,
+/// What building and replaying a capsule showed.
+#[derive(Debug, Default)]
+struct Verification {
+    built: bool,
+    /// The last line the failed rebuild printed.
+    build_error: Option<String>,
+    /// The capsule-relative input that reproduced the crash.
+    reproduced_with: Option<String>,
+    signature: String,
 }
 
-fn build_capsule(
-    work_dir: &Path,
-    f: &FindingRef,
-    out_root: &Path,
-    tar: bool,
-) -> anyhow::Result<CapsuleReport> {
+fn build_capsule(f: &FindingRef, out_root: &Path, tar: bool) -> anyhow::Result<CapsuleReport> {
     validate_capsule_id(&f.finding_id, "finding")?;
     validate_capsule_id(&f.harness_id, "harness")?;
-    let hdir = crate::auto::layout::harness_dir(work_dir, &f.harness_id);
-    let makefile = hdir.join("Makefile");
-    let recipe = parse_makefile(&makefile)
-        .ok_or_else(|| anyhow::anyhow!("cannot parse harness Makefile {}", makefile.display()))?;
-
-    let cap = out_root.join(format!("capsule_{}", f.finding_id));
-    if cap.exists() {
-        std::fs::remove_dir_all(&cap)?;
+    let plan = f.lane.plan_capsule(&PlanRequest {
+        harness_dir: &f.harness_dir,
+    })?;
+    std::fs::create_dir_all(out_root).map_err(|error| {
+        anyhow::anyhow!("cannot create output dir {}: {error}", out_root.display())
+    })?;
+    // Build in a scratch dir beside the final one and move it into place only
+    // when complete: a failure removes the scratch dir, never leaving a
+    // half-written capsule for verify-poc to trip over.
+    let staging = tempfile::Builder::new()
+        .prefix(&format!(".capsule_{}.", f.finding_id))
+        .tempdir_in(out_root)?;
+    let cap = staging.path();
+    for file in &plan.files {
+        copy(&file.from, &cap.join(&file.to))?;
     }
-    for sub in ["harness", "sources", "stubs", "runtime", "input"] {
-        std::fs::create_dir_all(cap.join(sub))?;
+    let mut inputs = Vec::new();
+    for input in &f.inputs {
+        let name = basename(input);
+        copy(input, &cap.join("input").join(&name))?;
+        inputs.push(format!("input/{name}"));
     }
-
-    // 1. driver
-    copy(&hdir.join("main.c"), &cap.join("harness/main.c"))?;
-    // any harness-local headers main.c may include
-    copy_headers_in_dir(&hdir, &cap.join("harness"));
-
-    // 2. target sources (+ their sibling headers so quoted includes resolve)
-    for src in &recipe.target_sources {
-        let dest = cap.join("sources").join(basename(src));
-        copy(src, &dest)?;
-        if let Some(parent) = src.parent() {
-            copy_headers_in_dir(parent, &cap.join("sources"));
-        }
-    }
-
-    // 3. recovered stubs + placeholder types/defines
-    let repairs = hdir.join("repairs");
-    let mut stub_sources = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&repairs) {
-        for e in entries.flatten() {
-            let p = e.path();
-            let name = basename(&p);
-            // The provenance-poisoned copy is a bhf-internal artifact — never ship it.
-            if name == "auto_stubs_prov.c" {
-                continue;
-            }
-            match p.extension().and_then(|x| x.to_str()) {
-                Some("c") => {
-                    copy(&p, &cap.join("stubs").join(&name))?;
-                    stub_sources.push(format!("stubs/{name}"));
-                }
-                Some("h") => {
-                    copy(&p, &cap.join("stubs").join(&name))?;
-                }
-                _ => {}
-            }
-        }
-    }
-
-    // 4. C runtime + recovered dependency headers (bhf_decode.h + friends),
-    //    taken from the harness's own `-I` roots so the exact build headers ship.
-    for inc in &recipe.include_dirs {
-        copy_headers_in_dir(inc, &cap.join("runtime"));
-    }
-
-    // 5. minimized input
-    copy(
-        &f.finding_dir.join("testcase.bin"),
-        &cap.join("input/testcase.bin"),
-    )?;
-
-    // 6. build.sh + README
-    let force_include = cap.join("stubs/auto_defines.h").is_file();
-    let build_sh = render_build_sh(&recipe, &stub_sources, force_include, &cap);
     let build_path = cap.join("build.sh");
-    std::fs::write(&build_path, build_sh)?;
+    std::fs::write(&build_path, &plan.build_script)?;
     set_executable(&build_path);
 
-    // 7. verify by construction: build + replay in place, capture the signature.
-    let (reproduced, signature) = verify_capsule(&cap);
+    // Verify by construction: build + replay in place, capture the signature.
+    // The minimized input ships when it reproduces; otherwise the recorded one.
+    let verification = verify_capsule(cap, f.lane, &inputs);
     // Leave the capsule pristine (no compiled binary with a machine-specific path).
-    let _ = std::fs::remove_file(cap.join("poc"));
-
-    write_manifest(&cap, f, &recipe, reproduced, &signature)?;
-    std::fs::write(cap.join("README.md"), readme(&f.finding_id, &signature))?;
-
-    if tar {
-        make_tarball(out_root, &cap)?;
+    remove_build_outputs(cap, &plan.build_outputs);
+    let chosen = verification
+        .reproduced_with
+        .clone()
+        .or_else(|| {
+            inputs
+                .iter()
+                .find(|input| input.ends_with("/testcase.bin"))
+                .cloned()
+        })
+        .or_else(|| inputs.first().cloned());
+    // The chosen input always ships as `input/testcase.bin`, the path older
+    // capsules and scripts use; the manifest records which one it is.
+    let source = chosen
+        .as_deref()
+        .map(|input| basename(Path::new(input)))
+        .unwrap_or_else(|| "testcase.bin".to_owned());
+    for input in inputs
+        .iter()
+        .filter(|input| Some(*input) != chosen.as_ref())
+    {
+        let _ = std::fs::remove_file(cap.join(input));
     }
+    if let Some(chosen) = chosen.as_deref().filter(|input| *input != SHIPPED_INPUT) {
+        std::fs::rename(cap.join(chosen), cap.join(SHIPPED_INPUT))?;
+    }
+    let minimized = source == "min_testcase.bin";
+    let reproduced = verification.reproduced_with.is_some();
+    write_manifest(cap, f, &plan, &verification, &source)?;
+    std::fs::write(
+        cap.join("README.md"),
+        readme(f, &plan, &source, &verification.signature),
+    )?;
+
+    let final_dir = out_root.join(format!("capsule_{}", f.finding_id));
+    if final_dir.exists() {
+        std::fs::remove_dir_all(&final_dir)?;
+    }
+    let staged = staging.keep();
+    if let Err(error) = std::fs::rename(&staged, &final_dir) {
+        let _ = std::fs::remove_dir_all(&staged);
+        anyhow::bail!(
+            "cannot move the capsule into {}: {error}",
+            final_dir.display()
+        );
+    }
+    if tar {
+        make_tarball(out_root, &final_dir)?;
+    }
+    let size = std::fs::metadata(final_dir.join(SHIPPED_INPUT))
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    let not_reproduced_reason = match &verification.build_error {
+        Some(error) if !verification.built => format!("the rebuild failed: {error}"),
+        _ if !verification.built => "the rebuild failed".to_owned(),
+        _ => "the rebuilt PoC did not crash on the finding's input".to_owned(),
+    };
     Ok(CapsuleReport {
         finding_id: f.finding_id.clone(),
-        capsule_path: cap,
+        capsule_path: final_dir,
         reproduced,
-        signature,
+        signature: verification.signature,
+        input_note: format!(
+            "{source} ({}, {size} bytes) as {SHIPPED_INPUT}",
+            if minimized {
+                "minimized"
+            } else {
+                "as recorded"
+            }
+        ),
+        not_reproduced_reason,
+        warnings: plan.warnings,
     })
 }
 
@@ -300,185 +329,115 @@ fn validate_capsule_id(value: &str, label: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Parse a harness Makefile for the `main:` recipe's explicit target sources and the
-/// recovered `COMPILE_DB_FLAGS`.
-fn parse_makefile(path: &Path) -> Option<BuildRecipe> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let mut compile_db_flags = Vec::new();
-    let mut target_sources = Vec::new();
-    let mut include_dirs = Vec::new();
-    for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("COMPILE_DB_FLAGS =") {
-            compile_db_flags = rest.split_whitespace().map(ToOwned::to_owned).collect();
+/// Build the capsule in place, then replay each input in turn; the first that
+/// crashes is the one the capsule reproduces with.
+fn verify_capsule(cap: &Path, lane: &dyn Lane, inputs: &[String]) -> Verification {
+    let mut build = Command::new("sh");
+    build.arg("build.sh").current_dir(cap);
+    match crate::command_output::output_with_timeout(&mut build, BUILD_TIMEOUT) {
+        Ok(out) if out.status.success() && cap.join("poc").is_file() => {}
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Verification {
+                build_error: build_failure_line(&stderr),
+                ..Verification::default()
+            };
         }
-        if let Some(rest) = line.strip_prefix("INCLUDES =") {
-            // `-I <dir>` pairs; skip the `.` self-include (the harness dir, copied
-            // separately). `-iquote`/`-idirafter` source dirs come in via the
-            // target-source parents, so only collect real `-I` include roots.
-            // A dir with spaces is double-quoted; split the way the shell does.
-            let toks = crate::generate_harness::split_compile_command(rest);
-            let mut i = 0;
-            while i < toks.len() {
-                if toks[i] == "-I" && i + 1 < toks.len() && toks[i + 1] != "." {
-                    include_dirs.push(PathBuf::from(&toks[i + 1]));
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-        }
-        // The `main` recipe line: `$(CC) ... -o $@ main.c <sources> $(AUTO_EXTRA_SOURCES) ...`
-        let t = line.trim_start();
-        if t.starts_with("$(CC)") && t.contains("-o $@ main.c") {
-            // Tokens strictly between `main.c` and the first `$(...)` make var are the
-            // explicit target sources (absolute paths).
-            let after = t.split("-o $@ main.c").nth(1).unwrap_or("");
-            for tok in crate::generate_harness::split_compile_command(after) {
-                if tok.starts_with("$(") {
-                    break;
-                }
-                target_sources.push(PathBuf::from(tok));
-            }
+        Err(error) => {
+            return Verification {
+                build_error: Some(format!("cannot run build.sh: {error}")),
+                ..Verification::default()
+            };
         }
     }
-    Some(BuildRecipe {
-        target_sources,
-        compile_db_flags,
-        include_dirs,
-    })
-}
-
-/// Render a POSIX `build.sh` that compiles the capsule with relative paths.
-fn render_build_sh(
-    recipe: &BuildRecipe,
-    stub_sources: &[String],
-    force_include_defines: bool,
-    cap: &Path,
-) -> String {
-    let mut sources = vec!["harness/main.c".to_owned()];
-    if let Ok(entries) = std::fs::read_dir(cap.join("sources")) {
-        for e in entries.flatten() {
-            if e.path().extension().and_then(|x| x.to_str()) == Some("c") {
-                sources.push(sh_word(&format!("sources/{}", basename(&e.path()))));
-            }
+    for input in inputs {
+        let mut replay = lane.replay_command(cap, input);
+        let Ok(out) = crate::command_output::output_with_timeout(&mut replay, REPLAY_TIMEOUT)
+        else {
+            continue;
+        };
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if let Some(signature) = lane.crash_signature(&stderr, &out.status) {
+            return Verification {
+                built: true,
+                build_error: None,
+                reproduced_with: Some(input.clone()),
+                signature,
+            };
         }
     }
-    sources.extend(stub_sources.iter().map(|stub| sh_word(stub)));
-    let db_flags = recipe.compile_db_flags.join(" ");
-    let force = if force_include_defines {
-        " -include stubs/auto_defines.h"
-    } else {
-        ""
-    };
-    format!(
-        "#!/bin/sh\n\
-         # Rebuild this bhf PoC offline. Needs only clang (or set CC) + a shell.\n\
-         set -e\n\
-         cd \"$(dirname \"$0\")\"\n\
-         CC=\"${{CC:-clang}}\"\n\
-         \"$CC\" -O1 -g -fsanitize=address,undefined -fno-sanitize=function,vptr,alignment \\\n\
-         \x20 {db_flags} -I runtime -I stubs -I harness -iquote sources{force} \\\n\
-         \x20 -o poc {sources}\n",
-        db_flags = db_flags,
-        force = force,
-        sources = sources.join(" "),
-    )
-}
-
-/// One POSIX shell word for `value`: unchanged when every character is plain,
-/// otherwise single-quoted, with each `'` written as `'\''`. Source names come
-/// from the scanned tree and may carry spaces or apostrophes (`rec ord.c`).
-fn sh_word(value: &str) -> String {
-    let plain = !value.is_empty()
-        && value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+' | ','));
-    if plain {
-        value.to_owned()
-    } else {
-        format!("'{}'", value.replace('\'', "'\\''"))
+    Verification {
+        built: true,
+        ..Verification::default()
     }
 }
 
-/// Build + replay the capsule in place; return `(reproduced, signature)`.
-fn verify_capsule(cap: &Path) -> (bool, String) {
-    let build = Command::new("sh").arg("build.sh").current_dir(cap).output();
-    let built = build.map(|o| o.status.success()).unwrap_or(false);
-    if !built || !cap.join("poc").is_file() {
-        return (false, String::new());
+/// The line that says why a rebuild failed: the first compiler diagnostic
+/// (`error:`; for a failed link, the linker's own line before it), else the
+/// last line naming an error, else the last line.
+fn build_failure_line(stderr: &str) -> Option<String> {
+    let lines: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if let Some(at) = lines.iter().position(|line| line.contains("error:")) {
+        let line = match at.checked_sub(1) {
+            Some(before) if lines[at].contains("linker command failed") => lines[before],
+            _ => lines[at],
+        };
+        return Some(line.to_owned());
     }
-    let mut replay = Command::new("./poc");
-    configure_capsule_replay(&mut replay);
-    let Ok(out) = replay.arg("input/testcase.bin").current_dir(cap).output() else {
-        return (false, String::new());
-    };
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    match sanitizer_signature(&stderr, &out.status) {
-        Some(sig) => (true, sig),
-        None => (false, String::new()),
-    }
+    lines
+        .iter()
+        .rev()
+        .find(|line| line.contains("error"))
+        .or(lines.last())
+        .map(|line| (*line).to_owned())
 }
 
-/// Keep capsule verification local and deterministic. On Ubuntu,
-/// `DEBUGINFOD_URLS` is commonly set system-wide; a sanitizer crash can then
-/// make llvm-symbolizer wait on the network indefinitely. Capsules are promised
-/// to verify offline, so their replay must never inherit that remote lookup.
-fn configure_capsule_replay(command: &mut Command) {
-    command
-        .env("ASAN_OPTIONS", "abort_on_error=1:handle_abort=1")
-        .env("DEBUGINFOD_URLS", "");
-}
-
-/// Extract a stable sanitizer-crash signature from a replay's stderr — the ASan
-/// error class (`stack-buffer-overflow`, `heap-use-after-free`, `SEGV`, …) or a
-/// UBSan `runtime error`. `None` when the replay did not crash.
-pub fn sanitizer_signature(stderr: &str, status: &std::process::ExitStatus) -> Option<String> {
-    // ASan: `==NN==ERROR: AddressSanitizer: <class> on/at ...`
-    if let Some(pos) = stderr.find("AddressSanitizer: ") {
-        let rest = &stderr[pos + "AddressSanitizer: ".len()..];
-        let class: String = rest
-            .split(|c: char| c.is_whitespace())
-            .next()
-            .unwrap_or("")
-            .to_owned();
-        if !class.is_empty() {
-            return Some(format!("AddressSanitizer:{class}"));
+fn remove_build_outputs(cap: &Path, outputs: &[&str]) {
+    for output in outputs {
+        let path = cap.join(output);
+        if path.is_dir() {
+            let _ = std::fs::remove_dir_all(&path);
+        } else {
+            let _ = std::fs::remove_file(&path);
         }
     }
-    if stderr.contains("UndefinedBehaviorSanitizer") || stderr.contains("runtime error:") {
-        return Some("UndefinedBehaviorSanitizer:runtime-error".to_owned());
-    }
-    // Death by signal with no sanitizer text (rare — coverage-less repro of a raw SEGV).
-    if !status.success() && status.code().is_none() {
-        return Some("signal:crash".to_owned());
-    }
-    None
 }
 
 fn write_manifest(
     cap: &Path,
     f: &FindingRef,
-    _recipe: &BuildRecipe,
-    reproduced: bool,
-    signature: &str,
+    plan: &repro_lane::CapsulePlan,
+    verification: &Verification,
+    input_source: &str,
 ) -> anyhow::Result<()> {
     let sink = f.raw.pointer("/actionability/sink").cloned();
     let cwe = f.raw.pointer("/actionability/cwe").cloned();
+    let toolchain = f.lane.toolchain();
     let manifest = json!({
         "schema": "bhf.capsule/v1",
         "bhf_version": env!("BHF_VERSION_FULL"),
         "finding_id": f.finding_id,
         "harness_id": f.harness_id,
-        "lang": "c",
+        "lang": f.lane.tag(),
+        "language": f.lane.name(),
+        "toolchain": {"env": toolchain.env_var, "default": toolchain.default},
         "rule_id": f.raw.get("rule_id"),
         "cwe": cwe,
         "exception": f.raw.pointer("/exception/name"),
         "sink": sink,
-        "input": "input/testcase.bin",
+        "input": SHIPPED_INPUT,
+        "input_source": input_source,
+        "input_minimized": input_source == "min_testcase.bin",
         "build": "sh build.sh",
-        "run": "./poc input/testcase.bin",
-        "expected_signature": signature,
-        "reproduced": reproduced,
+        "build_recipe": plan.build_facts,
+        "run": format!("./poc {SHIPPED_INPUT}"),
+        "rebuilt": verification.built,
+        "expected_signature": verification.signature,
+        "reproduced": verification.reproduced_with.is_some(),
     });
     std::fs::write(
         cap.join("manifest.json"),
@@ -487,15 +446,40 @@ fn write_manifest(
     Ok(())
 }
 
-fn readme(finding_id: &str, signature: &str) -> String {
+fn readme(
+    f: &FindingRef,
+    plan: &repro_lane::CapsulePlan,
+    input_source: &str,
+    signature: &str,
+) -> String {
+    use std::fmt::Write as _;
+    let toolchain = f.lane.toolchain();
+    let which_input = if input_source == "min_testcase.bin" {
+        "the minimized crashing input"
+    } else {
+        "the crashing input"
+    };
+    let mut layout = String::new();
+    for (path, what) in &plan.layout {
+        let _ = writeln!(layout, "- `{path}` — {what}");
+    }
+    let _ = writeln!(
+        layout,
+        "- `{SHIPPED_INPUT}` — {which_input} (the finding's `{input_source}`)"
+    );
+    let _ = writeln!(
+        layout,
+        "- `manifest.json` — finding metadata + expected signature"
+    );
     format!(
-        "# BHF PoC capsule — {finding_id}\n\n\
-         Self-contained reproducer for a crash bhf found on a tree with no working\n\
-         build. Rebuilds offline with only `clang` (or `$CC`) and a shell.\n\n\
+        "# BHF PoC capsule — {id}\n\n\
+         Self-contained reproducer for a crash bhf found in a {language} target on a tree\n\
+         with no working build. Rebuilds offline with only `{compiler}` (or `${env}`) and a\n\
+         shell.\n\n\
          ## Reproduce\n\n\
          ```sh\n\
          sh build.sh                 # compile ./poc (ASan+UBSan)\n\
-         ./poc input/testcase.bin    # replay the minimized crash input\n\
+         ./poc {SHIPPED_INPUT}    # replay {which_input}\n\
          ```\n\n\
          Or verify with bhf:\n\n\
          ```sh\n\
@@ -503,12 +487,11 @@ fn readme(finding_id: &str, signature: &str) -> String {
          ```\n\n\
          Expected sanitizer signature: `{signature}`.\n\n\
          ## Layout\n\n\
-         - `harness/main.c` — the fuzz driver (decodes `testcase.bin`, calls the target)\n\
-         - `sources/` — the target source(s) under analysis\n\
-         - `stubs/` — the dependencies bhf stubbed to make the tree build\n\
-         - `runtime/` — bhf C decode-runtime headers\n\
-         - `input/testcase.bin` — the minimized crashing input\n\
-         - `manifest.json` — finding metadata + expected signature\n"
+         {layout}",
+        id = f.finding_id,
+        language = f.lane.name(),
+        compiler = toolchain.default,
+        env = toolchain.env_var,
     )
 }
 
@@ -527,7 +510,9 @@ pub fn run_verify(args: VerifyPocArgs) -> i32 {
         Some(m) => m,
         None => {
             bhfeprintln!(
-                "error: not a bhf capsule (missing manifest.json): {}",
+                "error: not a bhf capsule (missing manifest.json): {}. `bhf capsule` writes \
+                 the manifest last, so a dir without one was never finished; package the \
+                 finding again",
                 root.display()
             );
             return 1;
@@ -538,10 +523,31 @@ pub fn run_verify(args: VerifyPocArgs) -> i32 {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_owned();
+    // Capsules written before lanes existed are C capsules.
+    let tag = manifest.get("lang").and_then(Value::as_str).unwrap_or("c");
+    let Some(lane) = repro_lane::lane_for(tag) else {
+        bhfeprintln!(
+            "error: this capsule is for the `{tag}` lane, which this bhf cannot verify \
+             (it verifies {} capsules); rebuild it by hand with `sh build.sh`",
+            repro_lane::supported_language_names()
+        );
+        return 1;
+    };
+    if let Some(missing) = lane.toolchain().missing() {
+        println!("verify-poc: FAIL — cannot rebuild the capsule: {missing}");
+        return 1;
+    }
+    let input = manifest
+        .get("input")
+        .and_then(Value::as_str)
+        .unwrap_or("input/testcase.bin")
+        .to_owned();
 
     // Rebuild in place (or a temp copy — for a tar it's already scratch).
-    let (reproduced, observed) = verify_capsule(&root);
-    let _ = std::fs::remove_file(root.join("poc"));
+    let verification = verify_capsule(&root, lane, std::slice::from_ref(&input));
+    remove_build_outputs(&root, &["poc", "obj"]);
+    let reproduced = verification.reproduced_with.is_some();
+    let observed = verification.signature;
 
     if !reproduced {
         // A capsule records whether the crash fired when it was PACKAGED. If it
@@ -560,7 +566,12 @@ pub fn run_verify(args: VerifyPocArgs) -> i32 {
             println!("verify-poc: FAIL — the capsule did not rebuild+crash as expected");
             println!("  finding:  {finding}");
             println!("  expected: {expected}");
-            println!("  observed: <no crash>");
+            match &verification.build_error {
+                Some(error) if !verification.built => {
+                    println!("  observed: the rebuild failed: {error}");
+                }
+                _ => println!("  observed: <no crash>"),
+            }
         } else {
             println!(
                 "verify-poc: NOT REPRODUCIBLE — this capsule was recorded as \
@@ -612,6 +623,9 @@ fn resolve_capsule(arg: &Path) -> anyhow::Result<(PathBuf, Option<tempfile::Temp
     if arg.is_dir() {
         return Ok((arg.to_path_buf(), None));
     }
+    if !arg.exists() {
+        anyhow::bail!("{}", missing_capsule_message(arg));
+    }
     let name = arg.to_string_lossy();
     if !(name.ends_with(".tar.gz") || name.ends_with(".tgz") || name.ends_with(".tar")) {
         anyhow::bail!(
@@ -635,6 +649,39 @@ fn resolve_capsule(arg: &Path) -> anyhow::Result<(PathBuf, Option<tempfile::Temp
     // The tarball holds a single `capsule_*` dir; descend into it if present.
     let root = single_subdir(scratch.path()).unwrap_or_else(|| scratch.path().to_path_buf());
     Ok((root, Some(scratch)))
+}
+
+/// `no capsule at <path>`, and the `bhf capsule` command that writes one there
+/// when the path has the `<work>/capsules/capsule_<id>` shape.
+fn missing_capsule_message(arg: &Path) -> String {
+    let mut message = format!("no capsule at {}", arg.display());
+    let name = arg
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let id = name.strip_prefix("capsule_").map(|rest| {
+        [".tar.gz", ".tgz", ".tar"]
+            .iter()
+            .find_map(|ext| rest.strip_suffix(ext))
+            .unwrap_or(rest)
+            .to_owned()
+    });
+    match id.filter(|id| !id.is_empty()) {
+        Some(id) => {
+            let work_dir = arg
+                .parent()
+                .filter(|parent| parent.file_name().is_some_and(|n| n == "capsules"))
+                .and_then(Path::parent)
+                .map(|work| work.display().to_string())
+                .unwrap_or_else(|| "<work-dir>".to_owned());
+            message.push_str(&format!(
+                ": package it first with `bhf capsule --work-dir {work_dir} --finding-id {id}`, \
+                 which says why when it cannot package a finding"
+            ));
+        }
+        None => message.push_str(": pass a capsule dir or .tar.gz written by `bhf capsule`"),
+    }
+    message
 }
 
 /// If `dir` holds exactly one subdirectory (and nothing else of substance), return it.
@@ -679,25 +726,6 @@ fn copy(src: &Path, dest: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Copy every `*.h`/`*.hpp` in `from` (non-recursive) into `into`.
-fn copy_headers_in_dir(from: &Path, into: &Path) {
-    let Ok(entries) = std::fs::read_dir(from) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.is_file() {
-            let is_header = p
-                .extension()
-                .and_then(|x| x.to_str())
-                .is_some_and(|x| matches!(x, "h" | "hpp" | "hh" | "hxx"));
-            if is_header {
-                let _ = copy(&p, &into.join(basename(&p)));
-            }
-        }
-    }
-}
-
 fn basename(p: &Path) -> String {
     p.file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -724,154 +752,31 @@ fn read_json(path: &Path) -> Option<Value> {
 mod tests {
     use super::*;
 
+    /// A failed rebuild is reported by the compiler's diagnostic, not by its
+    /// closing `N error(s) generated.` tally.
     #[test]
-    fn capsule_replay_disables_remote_debuginfod() {
-        let mut command = Command::new("true");
-        configure_capsule_replay(&mut command);
-        let env: std::collections::HashMap<_, _> = command
-            .get_envs()
-            .filter_map(|(key, value)| value.map(|value| (key, value)))
-            .collect();
+    fn a_failed_rebuild_reports_the_diagnostic_line() {
+        let stderr = "\
+In file included from harness/main.cpp:15:
+sources/widget.h:2:10: fatal error: 'cstddef' file not found
+    2 | #include <cstddef>
+      |          ^~~~~~~~~
+1 error generated.
+";
         assert_eq!(
-            env.get(std::ffi::OsStr::new("DEBUGINFOD_URLS")),
-            Some(&std::ffi::OsStr::new(""))
+            build_failure_line(stderr).as_deref(),
+            Some("sources/widget.h:2:10: fatal error: 'cstddef' file not found")
         );
+        let link = "/usr/bin/ld: cannot find -lwidget\nclang: error: linker command failed with exit code 1 (use -v to see invocation)\n";
         assert_eq!(
-            env.get(std::ffi::OsStr::new("ASAN_OPTIONS")),
-            Some(&std::ffi::OsStr::new("abort_on_error=1:handle_abort=1"))
-        );
-    }
-
-    #[test]
-    fn signature_from_asan_stderr() {
-        let s = "==12==ERROR: AddressSanitizer: stack-buffer-overflow on address 0x...";
-        let ok = std::process::Command::new("true").status().unwrap();
-        assert_eq!(
-            sanitizer_signature(s, &ok),
-            Some("AddressSanitizer:stack-buffer-overflow".to_owned())
-        );
-    }
-
-    #[test]
-    fn signature_from_ubsan_stderr() {
-        let s = "x.c:5:9: runtime error: signed integer overflow";
-        let ok = std::process::Command::new("true").status().unwrap();
-        assert_eq!(
-            sanitizer_signature(s, &ok),
-            Some("UndefinedBehaviorSanitizer:runtime-error".to_owned())
-        );
-    }
-
-    #[test]
-    fn clean_run_has_no_signature() {
-        let ok = std::process::Command::new("true").status().unwrap();
-        assert_eq!(sanitizer_signature("all good\n", &ok), None);
-    }
-
-    #[test]
-    fn parse_makefile_extracts_sources_and_flags() {
-        let dir = std::env::temp_dir().join(format!("bhf-cap-mk-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let mk = dir.join("Makefile");
-        std::fs::write(
-            &mk,
-            "COMPILE_DB_FLAGS = -std=c11 -DFOO=1\n\
-             INCLUDES = -I . -I /bhf/c_runtime -iquote /proj -idirafter /proj\n\
-             main: main.c\n\
-             \t$(CC) $(CFLAGS) $(COMPILE_DB_FLAGS) $(INCLUDES) -o $@ main.c /proj/a.c /proj/b.c $(AUTO_EXTRA_SOURCES) $(AUTO_EXTRA_LDFLAGS)\n",
-        )
-        .unwrap();
-        let recipe = parse_makefile(&mk).unwrap();
-        assert_eq!(recipe.compile_db_flags, vec!["-std=c11", "-DFOO=1"]);
-        assert_eq!(
-            recipe.target_sources,
-            vec![PathBuf::from("/proj/a.c"), PathBuf::from("/proj/b.c")]
-        );
-        // `.` is skipped; the c_runtime `-I` root is captured.
-        assert_eq!(recipe.include_dirs, vec![PathBuf::from("/bhf/c_runtime")]);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Paths with spaces are double-quoted in the generated Makefile; reading
-    /// them back must yield the whole path, not its space-separated pieces.
-    #[test]
-    fn parse_makefile_reads_back_quoted_paths_with_spaces() {
-        let dir = tempfile::tempdir().unwrap();
-        let mk = dir.path().join("Makefile");
-        std::fs::write(
-            &mk,
-            "COMPILE_DB_FLAGS = -std=c11 '-I/proj dir/include'\n\
-             INCLUDES = -I . -I \"/opt/my tools/c_runtime\" -iquote \"/proj dir\"\n\
-             main: main.c\n\
-             \t$(CC) $(CFLAGS) $(COMPILE_DB_FLAGS) $(INCLUDES) -o $@ main.c \"/proj dir/a.c\" /proj/b.c $(AUTO_EXTRA_SOURCES)\n",
-        )
-        .unwrap();
-        let recipe = parse_makefile(&mk).unwrap();
-        // Flags are spliced back into build.sh verbatim, so their quoting survives.
-        assert_eq!(
-            recipe.compile_db_flags.join(" "),
-            "-std=c11 '-I/proj dir/include'"
+            build_failure_line(link).as_deref(),
+            Some("/usr/bin/ld: cannot find -lwidget")
         );
         assert_eq!(
-            recipe.target_sources,
-            vec![PathBuf::from("/proj dir/a.c"), PathBuf::from("/proj/b.c")]
+            build_failure_line("build.sh: 7: clang: not found\n").as_deref(),
+            Some("build.sh: 7: clang: not found")
         );
-        assert_eq!(
-            recipe.include_dirs,
-            vec![PathBuf::from("/opt/my tools/c_runtime")]
-        );
-    }
-
-    /// A copied source whose file name has a space or an apostrophe must reach
-    /// the compiler as one argument from `build.sh`.
-    #[test]
-    fn build_sh_quotes_source_names_for_the_shell() {
-        let cap = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(cap.path().join("sources")).unwrap();
-        for name in ["rec ord.c", "o'neil.c", "plain.c"] {
-            std::fs::write(cap.path().join("sources").join(name), "int x;\n").unwrap();
-        }
-        let recipe = BuildRecipe {
-            target_sources: Vec::new(),
-            compile_db_flags: vec!["-DMODE=1".to_owned()],
-            include_dirs: Vec::new(),
-        };
-        let script = render_build_sh(
-            &recipe,
-            &["stubs/auto_stubs.c".to_owned()],
-            false,
-            cap.path(),
-        );
-        let compile = script
-            .lines()
-            .find(|line| line.contains("-o poc"))
-            .unwrap_or_else(|| panic!("no compile line in:\n{script}"));
-        assert!(compile.contains("'sources/rec ord.c'"), "{compile}");
-        assert!(compile.contains("'sources/o'\\''neil.c'"), "{compile}");
-        assert!(compile.contains(" sources/plain.c"), "{compile}");
-        assert!(compile.contains(" stubs/auto_stubs.c"), "{compile}");
-        // The shell splits the line into exactly these words.
-        let words = Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "set -- {}; for w; do printf '%s\\n' \"$w\"; done",
-                compile.trim().trim_start_matches("-o poc ")
-            ))
-            .output()
-            .unwrap();
-        let words = String::from_utf8_lossy(&words.stdout);
-        for expected in [
-            "sources/rec ord.c",
-            "sources/o'neil.c",
-            "sources/plain.c",
-            "stubs/auto_stubs.c",
-        ] {
-            assert!(
-                words.lines().any(|word| word == expected),
-                "{expected:?} must be one shell word: {words}"
-            );
-        }
+        assert_eq!(build_failure_line("\n  \n"), None);
     }
 
     #[test]
@@ -903,11 +808,13 @@ mod tests {
         std::fs::write(sentinel.join("keep"), b"keep").unwrap();
         let finding = FindingRef {
             finding_id: "x/../../sentinel".to_owned(),
-            finding_dir: work.join("results/findings/x"),
             harness_id: "H-C-1".to_owned(),
+            harness_dir: harness,
+            lane: &repro_lane::C_LANE,
+            inputs: Vec::new(),
             raw: json!({}),
         };
-        assert!(build_capsule(&work, &finding, &out, false).is_err());
+        assert!(build_capsule(&finding, &out, false).is_err());
         assert_eq!(std::fs::read(sentinel.join("keep")).unwrap(), b"keep");
         assert!(validate_capsule_id("H-C\\..\\outside", "harness").is_err());
         assert!(validate_capsule_id("C:outside", "harness").is_err());
@@ -933,6 +840,90 @@ mod tests {
             verbose: false,
         });
         assert_eq!(code, 1, "missing harness Makefile must fail packaging");
+        assert!(
+            !temp.path().join("out").exists(),
+            "a refused finding leaves no output dir"
+        );
+    }
+
+    /// A packaging step that fails part-way leaves neither a skeleton capsule
+    /// nor scratch dirs behind.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_capsule_build_leaves_nothing_behind() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: root reads unreadable files");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("proj");
+        let harness = temp.path().join("work/harnesses/H-C0001-00000001");
+        std::fs::create_dir_all(&harness).unwrap();
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(harness.join("main.c"), "int main(void) { return 0; }\n").unwrap();
+        // The target source exists but cannot be read, so copying it fails
+        // after the scratch dir exists.
+        let target = src.join("locked.c");
+        std::fs::write(&target, "int locked;\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::write(
+            harness.join("Makefile"),
+            format!(
+                "main: main.c\n\t$(CC) $(CFLAGS) -o $@ main.c {} $(AUTO_EXTRA_SOURCES)\n",
+                target.display()
+            ),
+        )
+        .unwrap();
+        let out = temp.path().join("out");
+        let finding = FindingRef {
+            finding_id: "F-0001-00000001".to_owned(),
+            harness_id: "H-C0001-00000001".to_owned(),
+            harness_dir: harness,
+            lane: &repro_lane::C_LANE,
+            inputs: Vec::new(),
+            raw: json!({}),
+        };
+        let Err(error) = build_capsule(&finding, &out, false) else {
+            panic!("an unreadable target source must fail packaging");
+        };
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(format!("{error:#}").contains("locked.c"), "{error:#}");
+        let left: Vec<_> = std::fs::read_dir(&out)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            left.is_empty(),
+            "nothing may be left in {}: {left:?}",
+            out.display()
+        );
+    }
+
+    /// verify-poc on a path that does not exist reports that, with the
+    /// `bhf capsule` command that writes a capsule there.
+    #[test]
+    fn a_missing_capsule_path_names_the_command_that_makes_it() {
+        let message =
+            missing_capsule_message(Path::new("/w/bhf_work/capsules/capsule_F-0001-0000aaaa"));
+        assert!(
+            message.starts_with("no capsule at /w/bhf_work/capsules/capsule_F-0001-0000aaaa"),
+            "{message}"
+        );
+        assert!(
+            message.contains("bhf capsule --work-dir /w/bhf_work --finding-id F-0001-0000aaaa"),
+            "{message}"
+        );
+        let tarball = missing_capsule_message(Path::new("/x/capsule_F-2.tar.gz"));
+        assert!(
+            tarball.contains("--work-dir <work-dir> --finding-id F-2`"),
+            "{tarball}"
+        );
+        let other = missing_capsule_message(Path::new("/x/somewhere"));
+        assert!(other.contains("written by `bhf capsule`"), "{other}");
+        let error = resolve_capsule(Path::new("/nonexistent/capsule_F-3")).unwrap_err();
+        assert!(format!("{error}").starts_with("no capsule at"), "{error}");
     }
 
     #[test]

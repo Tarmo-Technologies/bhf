@@ -119,3 +119,53 @@ fn finding_dir_nonempty(work: &Path) -> bool {
         .map(|mut d| d.next().is_some())
         .unwrap_or(false)
 }
+
+/// explain offers `bhf capsule` / `bhf verify-poc` only for a finding capsule
+/// can package. For any other finding it names why and prints a command that
+/// does reproduce it.
+#[test]
+fn explain_suggests_only_reproduce_commands_that_apply() {
+    let root = tempfile::tempdir().unwrap();
+    let work = root.path().join("work");
+    let id = "F-0001-0000aaaa";
+    let harness_id = "H-A0003-0000ABCD";
+    let finding_dir = work.join("results/findings").join(id);
+    std::fs::create_dir_all(&finding_dir).unwrap();
+    std::fs::write(finding_dir.join("testcase.bin"), b"AAAA").unwrap();
+    std::fs::write(finding_dir.join("replay.py"), b"print('replay')\n").unwrap();
+    std::fs::write(
+        finding_dir.join("finding.json"),
+        serde_json::json!({"id": id, "classification": "unhandled", "harness_id": harness_id})
+            .to_string(),
+    )
+    .unwrap();
+    let harness = work.join("harnesses").join(harness_id);
+    std::fs::create_dir_all(&harness).unwrap();
+    std::fs::write(
+        harness.join("generation-metadata.json"),
+        br#"{"schema_version":1,"language":"ada"}"#,
+    )
+    .unwrap();
+
+    let explain = bhf()
+        .arg("explain")
+        .arg("--work-dir")
+        .arg(&work)
+        .output()
+        .expect("run bhf explain");
+    let text = String::from_utf8_lossy(&explain.stdout);
+    let reproduce = text
+        .split("REPRODUCE OFFLINE")
+        .nth(1)
+        .unwrap_or_else(|| panic!("missing REPRODUCE OFFLINE:\n{text}"));
+    assert!(!reproduce.contains("bhf capsule --work-dir"), "{reproduce}");
+    assert!(!reproduce.contains("bhf verify-poc"), "{reproduce}");
+    assert!(reproduce.contains("Ada"), "says why: {reproduce}");
+    assert!(
+        reproduce.contains(&format!(
+            "python3 {}",
+            finding_dir.join("replay.py").display()
+        )),
+        "a working alternative: {reproduce}"
+    );
+}

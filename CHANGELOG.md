@@ -115,6 +115,64 @@
   `--force` for them. `bug-report.md` tags them as a path problem rather than a
   missing type, although `run.json` still records them under the
   `unsupported_params` outcome.
+- `bhf capsule`, `bhf verify-poc`, `bhf cartography` and `bhf env-capsule`
+  work on C++ harnesses and on harnesses made with `generate-harness --id
+  <name>`. They kept only `H-C*` harness ids and dropped every other finding
+  under one message ("no reproducible C crash findings ... need a runtime
+  finding with a testcase.bin"). The harness's language now comes from its
+  `generation-metadata.json` (else the id prefix), and the harness is looked
+  up in `harnesses/`, `auto/`, `generated_harnesses/` and `build/`. Any other
+  finding is refused with its own reason (unknown id, not a runtime crash, no
+  harness, no input, unsupported language, harness not built) and, when there
+  is one, a command that reproduces it: `python3 <finding>/replay.py`, or the
+  built harness run on the input with sanitizer options.
+- The four commands exit non-zero when a requested `--finding-id` is refused,
+  fails, or (capsule, env-capsule) did not reproduce, and when a run without
+  `--finding-id` writes nothing although the work dir has runtime findings.
+  `capsule` exited 0 having packaged nothing, and `cartography` exited 0 on a
+  refused id. env-capsule reports refusals before it looks for the runtrace
+  shim, so its message no longer depends on how bhf was installed.
+- `bhf capsule` and `bhf env-capsule` build each capsule in a scratch dir and
+  move it into place when complete. A refused or failed run no longer leaves
+  an empty `capsules/` dir or a capsule skeleton without `manifest.json`.
+- A capsule rebuilds from what the harness was built with: the compiler's own
+  dependency list decides which headers ship, and they keep their path relative
+  to the project tree, so `#include "sub/x.h"` and `-iquote`/`-idirafter`/
+  `-include` roots resolve. Headers were flattened by basename, and only `-I`
+  roots were copied. The language standard and extra sources and include dirs
+  recorded in `harnesses/<id>/coverage-build-recipe.json`, per-translation-unit
+  compile-database objects, the force-included repair headers and the work
+  dir's `c_compat.mk` flags are applied; all were ignored.
+- `bhf capsule` ships the finding's `min_testcase.bin` when it reproduces (else
+  `testcase.bin`), still as `input/testcase.bin`, and prints and records which
+  one shipped. It always shipped `testcase.bin` while calling it minimized.
+- `bhf cartography` maps a SEGV by its faulting address. A wild-pointer report
+  has no region-relative offset, so every byte that kept the crash was
+  "don't care" and the crash was called `gated_crash`. Where address-space
+  randomization cannot be turned off (a container's default seccomp profile
+  refuses `personality(2)`), it prints a warning that those bytes cannot be
+  attributed and suggests `--security-opt seccomp=unconfined`.
+- `bhf cartography` and `bhf env-capsule` work with a relative `--work-dir`,
+  including the default `bhf_work`. The replays run in the harness's own dir,
+  where the relative binary and input paths did not resolve, so every finding
+  was reported as producing no AddressSanitizer report or as not crashing.
+- `bhf env-capsule` ships the first input that crashes under the recorded
+  environment (`min_testcase.bin`, then `testcase.bin`, then the input that
+  crashed while recording). It shipped `min_testcase.bin` without checking it,
+  so a capsule whose minimized input did not replay was marked not reproduced.
+- When the compiler cannot list a build's includes, a capsule also ships the
+  project headers the sources' `#include` lines reach, so a header outside the
+  include roots (`#include "../common/defs.h"`) is no longer left out. A C++
+  capsule recovers the installed libstdc++ headers and library when `clang++`
+  cannot find them itself, as bhf's own C++ builds do, both when it is packaged
+  and in its `build.sh`. A failed rebuild is reported by the compiler's first
+  `error:` line rather than its `N error(s) generated.` tally.
+- `bhf verify-poc` on a path that does not exist says so and names the
+  `bhf capsule` command that writes it, instead of a format error.
+- `bhf explain` prints `bhf capsule` / `bhf verify-poc` under REPRODUCE OFFLINE
+  only for findings capsule can package. For any other it says why and prints
+  `python3 <finding>/replay.py` or the harness command; for an AddressSanitizer
+  crash cartography can map it adds `bhf cartography`.
 
 ### Changed
 - `bhf auto --seed-dir` reads a directory's files in name order.
@@ -165,6 +223,22 @@
   Test trees, GNAT binder output and predefined-hierarchy runtime units are
   not scanned. CWE mappings: BHF-409 CWE-704 -> CWE-843, BHF-411
   CWE-362 -> CWE-567 (Base entries).
+- Capsule layout and `build.sh`: `sources/` keeps the project's directory
+  layout (it was flat), the driver is `harness/main.c` or `harness/main.cpp`,
+  and `build.sh` compiles like the harness Makefile's `main` rule (section
+  garbage collection, `-D_GNU_SOURCE -D_DEFAULT_SOURCE`, `CXX=${CXX:-clang++}`
+  for C++). `manifest.json` stays `bhf.capsule/v1`: `lang` is `c` or `cpp`, and
+  `language`, `toolchain`, `input_source`, `input_minimized`, `build_recipe`
+  and `rebuilt` are additive. A manifest without `lang` is read as C.
+- `byte-control.json` (`bhf.byte-control/v1`) gains additive fields `input`,
+  `crash.fault_address` and `crash.fault_address_stable`, the byte classes
+  `controls_address` and `unknown`, and the primitive kinds
+  `controlled_address_read`, `controlled_address_write`,
+  `controlled_address_access`, `unattributed_crash` and `uncontrolled_crash`
+  (a crash no input byte gates was `gated_crash`). Cartography perturbs the
+  minimized input when it reproduces, and replays with address-space
+  randomization off. The env-capsule manifest gains `lang` and `input_source`.
+  The capsule manifest's `build_recipe` gains `stdlib_include_fallback`.
 
 ### Added
 - `auto/seeds.json` lists every seed a `bhf auto` run used (path, source

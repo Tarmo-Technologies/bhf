@@ -339,19 +339,74 @@ fn explain_one(work_dir: &Path, f: &Finding, others: &[String], collapsed: bool)
 
     // REPRODUCE
     let _ = writeln!(s, "\nREPRODUCE OFFLINE");
-    let _ = writeln!(
-        s,
-        "  bhf capsule --work-dir {} --finding-id {}",
-        work_dir.display(),
-        f.id
-    );
-    let _ = writeln!(
-        s,
-        "  bhf verify-poc {}/capsules/capsule_{}",
-        work_dir.display(),
-        f.id
-    );
+    for line in reproduce_lines(work_dir, f) {
+        let _ = writeln!(s, "  {line}");
+    }
     s
+}
+
+/// The REPRODUCE OFFLINE commands that apply to `f`: `bhf capsule` and
+/// `bhf verify-poc` when capsule can package it (the same check capsule runs),
+/// otherwise why not and a command that does reproduce it; plus the finding's
+/// `replay.py` and, for an AddressSanitizer crash cartography can map,
+/// `bhf cartography`.
+fn reproduce_lines(work_dir: &Path, f: &Finding) -> Vec<String> {
+    use crate::repro_lane::{self, FindingRecord, Tool};
+    let record = FindingRecord {
+        id: f.id.clone(),
+        dir: f.dir.clone(),
+        raw: f.raw.clone(),
+    };
+    let work = work_dir.display();
+    let replay = f.dir.join("replay.py");
+    let mut lines = Vec::new();
+    match repro_lane::assess(work_dir, &record, Tool::Capsule) {
+        Ok(_) => {
+            lines.push(format!(
+                "bhf capsule --work-dir {work} --finding-id {}",
+                f.id
+            ));
+            lines.push(format!("bhf verify-poc {work}/capsules/capsule_{}", f.id));
+            lines.push(
+                "  (the capsule records whether its offline rebuild reproduced the crash)"
+                    .to_owned(),
+            );
+            if replay.is_file() {
+                lines.push(format!(
+                    "python3 {}",
+                    repro_lane::sh_word(&replay.to_string_lossy())
+                ));
+            }
+        }
+        Err(refusal) => {
+            let reason = format!(
+                "bhf capsule is not available for this finding: {}",
+                refusal.reason(Tool::Capsule)
+            );
+            for (index, line) in wrap(&reason, 74).into_iter().enumerate() {
+                lines.push(if index == 0 {
+                    line
+                } else {
+                    format!("  {line}")
+                });
+            }
+            match repro_lane::alternative(work_dir, &record, &refusal) {
+                Some(command) => {
+                    lines.push("Reproduce it with:".to_owned());
+                    lines.push(format!("  {command}"));
+                }
+                None => lines.push("No offline reproducer is available.".to_owned()),
+            }
+        }
+    }
+    let asan = str_at(&f.raw, "/exception/sanitizer") == Some("asan");
+    if asan && repro_lane::assess(work_dir, &record, Tool::Cartography).is_ok() {
+        lines.push(format!(
+            "bhf cartography --work-dir {work} --finding-id {}   # which input bytes steer the access",
+            f.id
+        ));
+    }
+    lines
 }
 
 /// The sanitizer's structured memory access (`exception.access`) as text: the
@@ -905,6 +960,86 @@ mod tests {
             ),
             "{out}"
         );
+    }
+
+    /// REPRODUCE OFFLINE offers capsule + verify-poc only for a finding capsule
+    /// takes; otherwise it says why and gives a command that works.
+    #[test]
+    fn reproduce_offline_suggests_only_commands_that_apply() {
+        let work = tempfile::tempdir().unwrap();
+        let finding_dir = work.path().join("results/findings/F-0001-0a0b0c0d");
+        std::fs::create_dir_all(&finding_dir).unwrap();
+        std::fs::write(finding_dir.join("testcase.bin"), b"AAAA").unwrap();
+        let finding = frameless_finding(&finding_dir);
+
+        // No harness dir: refused, and there is nothing to run instead yet.
+        let out = explain_one(work.path(), &finding, &[], false);
+        let reproduce = out.split("REPRODUCE OFFLINE").nth(1).unwrap();
+        let words = reproduce.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(!reproduce.contains("bhf verify-poc"), "{reproduce}");
+        assert!(
+            words.contains("harness H-C0001 was not found"),
+            "{reproduce}"
+        );
+
+        // A built harness with no capsule-able Makefile: the direct command.
+        let harness = crate::auto::layout::harness_dir(work.path(), "H-C0001");
+        std::fs::create_dir_all(&harness).unwrap();
+        std::fs::write(harness.join("main"), b"\x7fELF").unwrap();
+        let out = explain_one(work.path(), &finding, &[], false);
+        let reproduce = out.split("REPRODUCE OFFLINE").nth(1).unwrap();
+        assert!(!reproduce.contains("bhf capsule --work-dir"), "{reproduce}");
+        assert!(
+            reproduce.contains("UBSAN_OPTIONS=print_stacktrace=1")
+                && reproduce.contains(&harness.join("main").display().to_string()),
+            "{reproduce}"
+        );
+
+        // A packageable C harness: capsule and verify-poc.
+        std::fs::write(harness.join("main.c"), b"int main(void) { return 0; }\n").unwrap();
+        std::fs::write(
+            harness.join("Makefile"),
+            b"main: main.c\n\t$(CC) $(CFLAGS) -o $@ main.c $(AUTO_EXTRA_SOURCES)\n",
+        )
+        .unwrap();
+        let out = explain_one(work.path(), &finding, &[], false);
+        let reproduce = out.split("REPRODUCE OFFLINE").nth(1).unwrap();
+        assert!(
+            reproduce.contains(&format!(
+                "bhf capsule --work-dir {} --finding-id F-0001-0a0b0c0d",
+                work.path().display()
+            )),
+            "{reproduce}"
+        );
+        assert!(reproduce.contains("bhf verify-poc"), "{reproduce}");
+        // cartography maps AddressSanitizer reports only: not this UBSan one.
+        assert!(!reproduce.contains("bhf cartography"), "{reproduce}");
+
+        // The same built harness with an AddressSanitizer crash: cartography too.
+        let mut asan = frameless_finding(&finding_dir);
+        asan.raw["exception"] = serde_json::json!({
+            "name": "ASAN_HEAP_BUFFER_OVERFLOW",
+            "sanitizer": "asan",
+            "message": "AddressSanitizer: heap-buffer-overflow",
+            "stack": []
+        });
+        let out = explain_one(work.path(), &asan, &[], false);
+        let reproduce = out.split("REPRODUCE OFFLINE").nth(1).unwrap();
+        assert!(
+            reproduce.contains(&format!(
+                "bhf cartography --work-dir {} --finding-id F-0001-0a0b0c0d",
+                work.path().display()
+            )),
+            "{reproduce}"
+        );
+
+        // An oracle hit is not a sanitizer crash: no capsule.
+        let mut oracle = frameless_finding(&finding_dir);
+        oracle.raw["classification"] = serde_json::json!("oracle");
+        let out = explain_one(work.path(), &oracle, &[], false);
+        let reproduce = out.split("REPRODUCE OFFLINE").nth(1).unwrap();
+        assert!(!reproduce.contains("bhf verify-poc"), "{reproduce}");
+        assert!(reproduce.contains("oracle finding"), "{reproduce}");
     }
 
     #[test]
