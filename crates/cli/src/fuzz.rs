@@ -6744,6 +6744,23 @@ pub(crate) fn trace_arguments(
     qemu_prefix: Option<(&Path, &[String])>,
 ) -> corpus::decoded_args::TraceOutcome {
     use corpus::decoded_args::TraceOutcome;
+    // A harness that hands the input to the project's own
+    // `LLVMFuzzerTestOneInput` has no parameters to decode.
+    let mut source_dirs: Vec<PathBuf> = harness
+        .parent()
+        .map(Path::to_path_buf)
+        .into_iter()
+        .collect();
+    if let Some(id) = harness
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+    {
+        source_dirs.extend(crate::auto::layout::harness_dir_candidates(work_dir, id));
+    }
+    if crate::replay::is_passthrough_harness(&source_dirs) {
+        return TraceOutcome::Unavailable(crate::replay::PASSTHROUGH_NO_ARGUMENTS.to_owned());
+    }
     if !harness_has_arg_trace(harness) {
         return TraceOutcome::Unavailable(
             "the harness was built without the argument trace; regenerate it with this bhf \

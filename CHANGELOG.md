@@ -60,6 +60,17 @@
   and could exceed its buffer, and two buffers got the same bytes.
   `arg-layout.json` gives each slice a sized `remainder` step, so
   `bhf decode-args --static` decodes these calls exactly.
+- `bhf replay --show-args`, `bhf decode-args` and the argument trace a new
+  finding records say that a passthrough harness (one that hands the input
+  straight to the project's `LLVMFuzzerTestOneInput`) decodes no parameters,
+  instead of claiming it was built without the argument trace.
+- `bhf replay --debugger` on a harness whose generation metadata names no
+  target function breaks at the finding's recorded sink, with a note saying
+  so, instead of stopping only at the crash.
+- `bhf report --backfill` also records the decoded arguments
+  (`decoded.json` and `finding.json` `decoded_args`) of a finding without
+  `decoded.json` whose harness has the argument trace, and counts them in its
+  summary.
 - `bhf replay` no longer reports MATCH, stamps `last_seen` or records a
   reproduction in `results/` for a replay that could not compare where the
   crash happened. An unsymbolized report (frames that name only a module

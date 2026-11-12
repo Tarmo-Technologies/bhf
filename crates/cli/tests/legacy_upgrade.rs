@@ -260,6 +260,46 @@ fn report_backfill_replays_migrated_findings() {
     assert!(files.contains("sanitizer.log"), "{files}");
 }
 
+/// A migrated finding has no decoded.json; when its harness has the argument
+/// trace, `report --backfill` runs it once with the trace on and writes the
+/// decoded arguments, into decoded.json and finding.json.
+#[test]
+fn report_backfill_records_the_decoded_arguments_of_a_tracing_harness() {
+    let root = tempfile::tempdir().unwrap();
+    let work = legacy_work_dir(root.path());
+    let harness = work.join("harnesses/H-1/main");
+    fs::create_dir_all(harness.parent().unwrap()).unwrap();
+    fs::write(
+        &harness,
+        format!(
+            "#!/bin/sh\n# BHF_FRAMED test driver\n\
+             if [ \"$BHF_TRACE_ARGS\" = 1 ]; then\n\
+             >&2 echo 'BHF_ARG {{\"call\":\"target\",\"i\":0,\"role\":\"param\",\"name\":\"buffer\",\"type\":\"const char *\",\"decoder\":\"bhf_c_string(4096)\",\"span\":[0,2],\"ptr\":\"0x602000000030\",\"alloc_size\":1,\"len\":0,\"preview_hex\":\"\"}}'\n\
+             fi\n\
+             cat >&2 <<'REPORT'\n{ASAN_REPORT}REPORT\nkill -ABRT $$\n"
+        ),
+    )
+    .unwrap();
+    make_executable(&harness);
+
+    let out = bhf(&["report", "--backfill", "--work-dir", work.to_str().unwrap()]);
+    let stderr = text(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let done = work.join("results/findings/F-0001-aaaaaaaa");
+    let decoded: serde_json::Value =
+        serde_json::from_slice(&fs::read(done.join("decoded.json")).expect("decoded.json"))
+            .unwrap();
+    assert!(decoded.to_string().contains("buffer"), "{decoded}");
+    let record: serde_json::Value =
+        serde_json::from_slice(&fs::read(done.join("finding.json")).unwrap()).unwrap();
+    assert_eq!(record["decoded_args"][0]["name"], "buffer", "{record}");
+    assert!(stderr.contains("decoded argument"), "{stderr}");
+    assert!(
+        stderr.contains("1 with decoded arguments"),
+        "the summary counts it: {stderr}"
+    );
+}
+
 /// Inputs carrying runs of EF BF BD in a work dir from an earlier release are
 /// flagged in INDEX.md and by `bhf report` as likely damaged.
 #[test]

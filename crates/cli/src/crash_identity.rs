@@ -658,6 +658,13 @@ pub(crate) fn recorded_sink(raw: &Value) -> Option<String> {
     recorded_identity(raw).sink.map(|sink| sink.render())
 }
 
+/// The function of the finding's recorded sink, by its bare name (no
+/// parameter list): where a debugger session breaks when the harness names no
+/// target function.
+pub(crate) fn recorded_sink_function(raw: &Value) -> Option<String> {
+    recorded_identity(raw).sink.map(|sink| sink.function)
+}
+
 /// The replayed report's sink, rendered.
 pub(crate) fn replayed_sink(report: &SanitizerReport) -> Option<String> {
     replayed_identity(report).sink.map(|sink| sink.render())

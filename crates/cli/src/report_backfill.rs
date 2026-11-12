@@ -5,7 +5,9 @@
 //! before bhf kept the log) the evidence a current run records. Each one is
 //! replayed against its harness the way `bhf replay` replays it, and only when
 //! the replay is the recorded crash (same rule, kind and sink or reported
-//! site) are its `sanitizer.log`, crash frames and memory access written. The
+//! site) are its `sanitizer.log`, crash frames and memory access written. A
+//! finding without `decoded.json` whose harness has the argument trace gets
+//! its decoded arguments too, from one more run with the trace on. The
 //! finding's id and signature never change. The caller rebuilds `results/`
 //! afterwards.
 
@@ -21,6 +23,8 @@ const COMMAND: &str = "report --backfill";
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct BackfillSummary {
     pub(crate) updated: usize,
+    /// Of the updated findings, those that got their decoded arguments.
+    pub(crate) decoded: usize,
     pub(crate) skipped: usize,
     /// Findings that already had a log, or are not C/C++ sanitizer findings.
     pub(crate) not_needed: usize,
@@ -28,7 +32,13 @@ pub(crate) struct BackfillSummary {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Outcome {
-    Updated { frames: usize, harness: PathBuf },
+    Updated {
+        /// The crash frames written with `sanitizer.log`, when it was.
+        frames: Option<usize>,
+        /// The decoded arguments written, when they were.
+        arguments: Option<usize>,
+        harness: PathBuf,
+    },
     Skipped(String),
     NotNeeded,
 }
@@ -54,10 +64,23 @@ pub(crate) fn run(work_dir: &Path) -> BackfillSummary {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
         match backfill_finding(&dir) {
-            Outcome::Updated { frames, harness } => {
+            Outcome::Updated {
+                frames,
+                arguments,
+                harness,
+            } => {
                 summary.updated += 1;
+                let mut wrote = Vec::new();
+                if let Some(frames) = frames {
+                    wrote.push(format!("sanitizer.log and {frames} crash frames"));
+                }
+                if let Some(arguments) = arguments {
+                    summary.decoded += 1;
+                    wrote.push(format!("decoded.json ({arguments} decoded arguments)"));
+                }
                 bhfeprintln!(
-                    "bhf: backfill {id}: wrote sanitizer.log and {frames} crash frames from {}",
+                    "bhf: backfill {id}: wrote {} from {}",
+                    wrote.join(" and "),
                     harness.display()
                 );
             }
@@ -69,13 +92,23 @@ pub(crate) fn run(work_dir: &Path) -> BackfillSummary {
         }
     }
     bhfeprintln!(
-        "bhf: backfill: {} updated, {} skipped, {} not needed (already have a sanitizer.log, or \
-         are not C/C++ sanitizer findings)",
+        "bhf: backfill: {} updated ({} with decoded arguments), {} skipped, {} not needed \
+         (already have a sanitizer.log and decoded.json, or are not C/C++ sanitizer findings)",
         summary.updated,
+        summary.decoded,
         summary.skipped,
         summary.not_needed
     );
     summary
+}
+
+/// Whether `raw` is a finding of a fuzzed harness (not an oracle hit or a
+/// runtime finding), whose testcase a C/C++ harness decodes.
+fn is_fuzz_finding(raw: &Value) -> bool {
+    raw.get("finding_kind")
+        .and_then(Value::as_str)
+        .is_none_or(|kind| kind == corpus::finding::finding_kind::FUZZ)
+        && raw.get("oracle").is_none()
 }
 
 /// Whether `raw` is a crash a C/C++ sanitizer (or an undiagnosed fatal
@@ -100,7 +133,9 @@ fn is_sanitizer_crash(raw: &Value) -> bool {
 }
 
 fn backfill_finding(dir: &Path) -> Outcome {
-    if dir.join("sanitizer.log").exists() || !dir.join("testcase.bin").is_file() {
+    if !dir.join("testcase.bin").is_file()
+        || (dir.join("sanitizer.log").exists() && dir.join("decoded.json").exists())
+    {
         return Outcome::NotNeeded;
     }
     if crate::session_fuzz::is_session_finding(dir)
@@ -117,11 +152,14 @@ fn backfill_finding(dir: &Path) -> Outcome {
     else {
         return Outcome::Skipped(format!("cannot read {}", path.display()));
     };
-    if !is_sanitizer_crash(&raw) {
+    let needs_log = !dir.join("sanitizer.log").exists() && is_sanitizer_crash(&raw);
+    let needs_arguments = !dir.join("decoded.json").exists() && is_fuzz_finding(&raw);
+    if !needs_log && !needs_arguments {
         return Outcome::NotNeeded;
     }
     let harness = match crate::replay::recorded_harness(dir) {
         Ok(harness) => harness,
+        Err(_) if !needs_log => return Outcome::NotNeeded,
         Err(error) => return Outcome::Skipped(format!("no harness to replay against: {error}")),
     };
     let work = corpus::layout::work_dir_for_finding(dir);
@@ -135,6 +173,7 @@ fn backfill_finding(dir: &Path) -> Outcome {
     } else {
         match engine_for(detection.protocol) {
             HarnessEngine::CLibFuzzer | HarnessEngine::CAfl => CInput::ArgvFile,
+            HarnessEngine::AdaStdin if !needs_log => return Outcome::NotNeeded,
             HarnessEngine::AdaStdin => {
                 return Outcome::Skipped(format!(
                     "harness {} is not a C/C++ sanitizer harness ({})",
@@ -152,18 +191,96 @@ fn backfill_finding(dir: &Path) -> Outcome {
         None,
         false,
     );
+    let frames = if needs_log {
+        match backfill_log(dir, &mut raw, &runner, input, &harness) {
+            Ok(frames) => Some(frames),
+            Err(reason) => return Outcome::Skipped(reason),
+        }
+    } else {
+        None
+    };
+    let source_dirs =
+        crate::replay::harness_source_dirs(Some(dir), &raw, &harness, Some(&detection));
+    let arguments = (needs_arguments
+        && crate::fuzz::harness_has_arg_trace(&harness)
+        && !crate::replay::is_passthrough_harness(&source_dirs))
+    .then(|| backfill_arguments(dir, &raw, &runner, input))
+    .flatten();
+    if frames.is_none() && arguments.is_none() {
+        return Outcome::NotNeeded;
+    }
+    Outcome::Updated {
+        frames,
+        arguments,
+        harness,
+    }
+}
+
+/// Run the testcase once with the argument trace on and record the decoded
+/// arguments in `decoded.json` and `finding.json`, as the fuzz loop does for
+/// a new finding. The number of arguments recorded, or `None` when the run
+/// traced none.
+fn backfill_arguments(
+    dir: &Path,
+    raw: &Value,
+    runner: &replay_min::HarnessRunner,
+    input: CInput,
+) -> Option<usize> {
+    let testcase = dir.join("testcase.bin");
+    let run = crate::replay::run_c_testcase_with_env(
+        raw,
+        runner,
+        input,
+        &testcase,
+        REPLAY_TIMEOUT,
+        &[(
+            corpus::decoded_args::TRACE_ARGS_ENV.to_owned(),
+            "1".to_owned(),
+        )],
+    )
+    .ok()?;
+    let traced = corpus::decoded_args::parse_arg_trace(&String::from_utf8_lossy(&run.stderr));
+    if traced.is_empty() {
+        return None;
+    }
+    let count = traced.len();
+    let bytes = std::fs::read(&testcase).ok()?;
+    let outcome = corpus::decoded_args::TraceOutcome::Traced(traced);
+    corpus::decoded_args::record_trace(dir, &bytes, &outcome).ok()?;
+    // record_trace rewrote finding.json; note what it added.
+    let path = dir.join("finding.json");
+    let mut record: Value = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())?;
+    corpus::finding::append_history(&mut record, COMMAND, &["paths.decoded", "decoded_args"]);
+    record["paths"]["decoded"] = json!("decoded.json");
+    std::fs::write(&path, serde_json::to_vec_pretty(&record).ok()?).ok()?;
+    Some(count)
+}
+
+/// Replay the testcase and, when it is the recorded crash, write its
+/// `sanitizer.log`, frames and access into the finding. The frames written,
+/// or why nothing was.
+fn backfill_log(
+    dir: &Path,
+    raw: &mut Value,
+    runner: &replay_min::HarnessRunner,
+    input: CInput,
+    harness: &Path,
+) -> Result<usize, String> {
+    let path = dir.join("finding.json");
     let run = match run_c_testcase(
-        &raw,
-        &runner,
+        raw,
+        runner,
         input,
         &dir.join("testcase.bin"),
         REPLAY_TIMEOUT,
     ) {
         Ok(run) => run,
-        Err(error) => return Outcome::Skipped(format!("replay failed: {error}")),
+        Err(error) => return Err(format!("replay failed: {error}")),
     };
     let Some(report) = run.report() else {
-        return Outcome::Skipped(format!(
+        return Err(format!(
             "the testcase no longer crashes harness {} ({})",
             harness.display(),
             if run.timed_out {
@@ -173,9 +290,9 @@ fn backfill_finding(dir: &Path) -> Outcome {
             }
         ));
     };
-    let comparison = crash_identity::compare(&raw, &report);
+    let comparison = crash_identity::compare(raw, &report);
     if !comparison.matches() {
-        return Outcome::Skipped(format!(
+        return Err(format!(
             "harness {} now reports a different crash ({})",
             harness.display(),
             comparison.difference_lines().join("; ")
@@ -184,7 +301,7 @@ fn backfill_finding(dir: &Path) -> Outcome {
     // An unsymbolized report proves neither where the crash is nor gives the
     // frames the backfill is for.
     if comparison.location_not_compared() {
-        return Outcome::Skipped(format!(
+        return Err(format!(
             "the replay against harness {} is unsymbolized, so it gives no frames and its \
              location cannot be checked; put llvm-symbolizer on PATH or set ASAN_SYMBOLIZER_PATH \
              and run the backfill again",
@@ -192,21 +309,18 @@ fn backfill_finding(dir: &Path) -> Outcome {
         ));
     }
     if let Err(error) = corpus::finding::write_sanitizer_log(dir, &run.stderr) {
-        return Outcome::Skipped(format!("cannot write sanitizer.log: {error}"));
+        return Err(format!("cannot write sanitizer.log: {error}"));
     }
-    let fields = enrich(&mut raw, &report, &path);
-    corpus::finding::append_history(&mut raw, COMMAND, &fields);
-    let written = serde_json::to_vec_pretty(&raw)
+    let fields = enrich(raw, &report, &path);
+    corpus::finding::append_history(raw, COMMAND, &fields);
+    let written = serde_json::to_vec_pretty(&*raw)
         .map_err(std::io::Error::other)
         .and_then(|bytes| std::fs::write(&path, bytes));
     if let Err(error) = written {
         let _ = std::fs::remove_file(dir.join("sanitizer.log"));
-        return Outcome::Skipped(format!("cannot update {}: {error}", path.display()));
+        return Err(format!("cannot update {}: {error}", path.display()));
     }
-    Outcome::Updated {
-        frames: report.stack.len(),
-        harness,
-    }
+    Ok(report.stack.len())
 }
 
 fn exit_text(run: &crate::replay::CRun) -> String {

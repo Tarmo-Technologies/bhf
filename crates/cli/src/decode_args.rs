@@ -251,7 +251,16 @@ fn decode(args: &DecodeArgsArgs) -> Result<Report, String> {
         not_decoded: Vec::new(),
         notes,
     };
-    if !args.static_only {
+    // A passthrough harness decodes no parameters: there is nothing to trace,
+    // and its layout (if any) describes none.
+    if is_passthrough(&inputs) {
+        report
+            .notes
+            .push(crate::replay::PASSTHROUGH_NO_ARGUMENTS.to_owned());
+        if layout.is_none() {
+            return Err(crate::replay::PASSTHROUGH_NO_ARGUMENTS.to_owned());
+        }
+    } else if !args.static_only {
         match inputs.binary.as_deref() {
             Some(binary) => match trace(binary, &inputs, &bytes) {
                 Ok(traced) => {
@@ -330,6 +339,25 @@ fn dimension_text(on: bool) -> &'static str {
     } else {
         ""
     }
+}
+
+/// Whether the harness passes the input straight to the project's own
+/// `LLVMFuzzerTestOneInput` (see [`crate::replay::is_passthrough_harness`]).
+fn is_passthrough(inputs: &Inputs) -> bool {
+    let mut dirs = inputs
+        .binary
+        .as_deref()
+        .map(|binary| {
+            crate::replay::harness_source_dirs(
+                inputs.finding_dir.as_deref(),
+                &inputs.finding,
+                binary,
+                None,
+            )
+        })
+        .unwrap_or_default();
+    dirs.extend(inputs.layout_dir.clone());
+    crate::replay::is_passthrough_harness(&dirs)
 }
 
 /// Run the harness once on the testcase with its argument trace on.

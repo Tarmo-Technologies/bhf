@@ -509,7 +509,12 @@ with no region it names the nearest traced pointer below the faulting address
 and prints the arguments as a table. `bhf explain` shows the same table under
 HARNESS ARGUMENTS, and `bhf cartography` labels each byte with the parameter
 it was decoded into. Harnesses generated before the trace existed print
-nothing: regenerate them, or read the arguments under a debugger. In
+nothing: regenerate them, or read the arguments under a debugger. A
+passthrough harness, which hands the input straight to the project's own
+`LLVMFuzzerTestOneInput`, decodes no parameters, and `--show-args`,
+`decode-args` and `decoded.json` say so. `bhf report --backfill` records the
+decoded arguments of a finding that has no `decoded.json` (one migrated from
+an earlier release) when its harness has the trace. In
 `bhf explain`'s HARNESS ARGUMENTS table, an argument whose bytes a recorded
 comparison read is tagged `[compared at <file>:<line>]` (or the comparison's
 address when it could not be symbolized); evidence recorded on

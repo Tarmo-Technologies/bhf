@@ -1808,6 +1808,59 @@ fn replay_show_args_explains_a_harness_without_the_trace() {
     );
 }
 
+/// A harness that hands the input straight to the project's own
+/// `LLVMFuzzerTestOneInput` decodes no parameters: `--show-args` and
+/// `decode-args` say so, instead of blaming a missing argument trace.
+#[cfg(unix)]
+#[test]
+fn a_passthrough_harness_says_it_decodes_no_parameters() {
+    let root = temp_dir("show-args-passthrough");
+    let work = root.join("work");
+    let harness = work.join("harnesses/H-1/main");
+    let report = asan_report("Widget::copy_at", 12);
+    write_crashing_harness(&harness, &report);
+    let dir = harness.parent().unwrap();
+    fs::write(
+        dir.join("main.c"),
+        "/* BHF_FRAMED */\n/* bhf driver for a passthrough libFuzzer entrypoint. */\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("generation-metadata.json"),
+        r#"{"schema_version":1,"language":"c","target_function":"LLVMFuzzerTestOneInput"}"#,
+    )
+    .unwrap();
+    let finding = emit_finding(&work, &harness, &report);
+
+    let output = replay_output(&[finding.to_str().unwrap(), "--show-args"]);
+    let stdout = text(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert!(
+        stdout.contains(
+            "--- no decoded arguments: this harness passes the input straight to \
+             LLVMFuzzerTestOneInput; it decodes no parameters ---"
+        ),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("argument trace"), "{stdout}");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cli"))
+        .arg("decode-args")
+        .arg("--finding")
+        .arg(&finding)
+        .output()
+        .unwrap();
+    let all = format!("{}{}", text(&output.stdout), text(&output.stderr));
+    assert!(
+        all.contains(
+            "this harness passes the input straight to LLVMFuzzerTestOneInput; it decodes no \
+             parameters"
+        ),
+        "{all}"
+    );
+    assert!(!all.contains("built without the argument trace"), "{all}");
+}
+
 /// A finding recorded against an older harness input format than its
 /// harness now decodes is flagged by replay and minimize, which name both
 /// formats; one recorded against the same format is not.
@@ -1994,6 +2047,87 @@ fn replay_debugger_stops_at_the_target_and_at_the_crash() {
         assert!(stderr.contains("--debugger needs lldb on PATH"), "{stderr}");
         assert!(!stderr.contains("MATCH"), "{stderr}");
     }
+    fs::remove_dir_all(&work).ok();
+}
+
+/// A harness from an older bhf names no target function: the debugger
+/// session breaks at the finding's recorded sink instead, and says so.
+#[cfg(unix)]
+#[test]
+fn replay_debugger_breaks_at_the_recorded_sink_without_a_target_function() {
+    if !tool_runs("clang") || !tool_runs("gdb") {
+        eprintln!("skipping: clang or gdb unavailable");
+        return;
+    }
+    let work = temp_dir("debugger-sink");
+    let harness_dir = work.join("harnesses/H-DBG");
+    fs::create_dir_all(&harness_dir).unwrap();
+    fs::write(
+        harness_dir.join("main.c"),
+        "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\
+         __attribute__((noinline)) int widget_crash(int value, const char *label) {\n\
+         \x20   char *buf = malloc(4);\n\
+         \x20   memset(buf, 0, 4);\n\
+         \x20   int r = buf[value & 0xff];\n\
+         \x20   free(buf);\n\
+         \x20   return r + label[0];\n\
+         }\n\
+         int main(int argc, char **argv) {\n\
+         \x20   unsigned char b[4] = {0};\n\
+         \x20   FILE *f = argc > 1 ? fopen(argv[1], \"rb\") : NULL;\n\
+         \x20   if (!f) return 2;\n\
+         \x20   if (fread(b, 1, 4, f) != 4) return 2;\n\
+         \x20   fclose(f);\n\
+         \x20   return widget_crash(b[0] | b[1] << 8 | b[2] << 16 | b[3] << 24, \"AB\");\n\
+         }\n",
+    )
+    .unwrap();
+    let build = Command::new("clang")
+        .args(["-g", "-O0", "-fsanitize=address", "-o"])
+        .arg(harness_dir.join("main"))
+        .arg(harness_dir.join("main.c"))
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "{}", text(&build.stderr));
+    fs::write(
+        harness_dir.join("generation-metadata.json"),
+        r#"{"schema_version":1,"language":"c"}"#,
+    )
+    .unwrap();
+    let finding = corpus::layout::findings_dir(&work).join("F-0001-0dbg0dbg");
+    fs::create_dir_all(&finding).unwrap();
+    fs::write(finding.join("testcase.bin"), b"AAAA").unwrap();
+    fs::write(
+        finding.join("finding.json"),
+        r#"{"id":"F-0001-0dbg0dbg","rule_id":"BHF-201","harness_id":"H-DBG",
+            "fixture_path":"harnesses/H-DBG/main",
+            "exception":{"name":"ASAN_HEAP_BUFFER_OVERFLOW","sanitizer":"asan","stack":[
+              {"function":"widget_crash(int, char const*)","file":"/w/harnesses/H-DBG/main.c","line":7},
+              {"function":"main","file":"/w/harnesses/H-DBG/main.c","line":16}]}}"#,
+    )
+    .unwrap();
+
+    let out = replay_output(&[finding.to_str().unwrap(), "--debugger", "gdb"]);
+    let all = format!("{}{}", text(&out.stdout), text(&out.stderr));
+    assert!(
+        all.contains("--- debugger session (gdb, breaking at widget_crash) ---"),
+        "{all}"
+    );
+    assert!(
+        all.contains(
+            "breaking at the recorded sink widget_crash (the harness records no target function)"
+        ),
+        "{all}"
+    );
+    assert!(!all.contains("regenerate the harness"), "{all}");
+    let entry = all
+        .rfind("--- bhf: stopped (at the target entry")
+        .unwrap_or_else(|| panic!("{all}"));
+    let crash = all
+        .rfind("--- bhf: stopped at the crash ---")
+        .unwrap_or_else(|| panic!("{all}"));
+    assert!(entry < crash, "{all}");
+    assert!(all[entry..crash].contains("value = 1094795585"), "{all}");
     fs::remove_dir_all(&work).ok();
 }
 

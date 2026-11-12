@@ -102,8 +102,9 @@ pub struct ReplayArgs {
 
     /// Also re-run the testcase under a debugger in batch mode (gdb, lldb, or
     /// cdb on Windows; with no value, the first one found, cdb first on
-    /// Windows): break at the harness's target function, print its arguments
-    /// (`info args`) and full stack (`bt full`), then continue to the crash
+    /// Windows): break at the harness's target function (the finding's
+    /// recorded sink for a harness whose metadata names none), print its
+    /// arguments (`info args`) and full stack (`bt full`), then continue to the crash
     /// and print the full stack again. AddressSanitizer leaves the fault to
     /// the debugger (`handle_segv=0`) and aborts after a report; leak checks
     /// are off. The harness gets the replay's environment (runtime mode,
@@ -777,9 +778,11 @@ impl ArgumentsReport {
     }
 
     /// The arguments a replayed harness printed on `stderr`, and the parameter
-    /// whose buffer `report`'s memory access hit.
+    /// whose buffer `report`'s memory access hit. `passthrough` is a harness
+    /// that hands the input to the project's own `LLVMFuzzerTestOneInput`.
     fn from_run(
         harness: &Path,
+        passthrough: bool,
         stderr: &[u8],
         report: Option<&corpus::SanitizerReport>,
         input: Option<&[u8]>,
@@ -789,7 +792,9 @@ impl ArgumentsReport {
             corpus::decoded_args::annotate_length_prefixes(&mut traced, input);
         }
         if traced.is_empty() {
-            return Self::unavailable(if crate::fuzz::harness_has_arg_trace(harness) {
+            return Self::unavailable(if passthrough {
+                PASSTHROUGH_NO_ARGUMENTS
+            } else if crate::fuzz::harness_has_arg_trace(harness) {
                 "the harness printed no BHF_ARG lines: it decodes no arguments, or stopped before \
                  decoding them"
             } else {
@@ -823,6 +828,58 @@ impl ArgumentsReport {
         }
         lines
     }
+}
+
+/// Why a passthrough harness has no decoded arguments.
+pub(crate) const PASSTHROUGH_NO_ARGUMENTS: &str =
+    "this harness passes the input straight to LLVMFuzzerTestOneInput; it decodes no parameters";
+
+/// The marker bhf's driver for a passthrough libFuzzer entry point carries in
+/// its `main.c`/`main.cpp`.
+const PASSTHROUGH_MARKER: &str = "driver for a passthrough libFuzzer entrypoint";
+
+/// Whether the harness in one of `dirs` (its own dir, the driver source dir,
+/// the harness dirs of its work dir) passes the input straight to the
+/// project's `LLVMFuzzerTestOneInput`: its generation metadata names that as
+/// the target, or its driver source carries the passthrough marker.
+pub(crate) fn is_passthrough_harness(dirs: &[PathBuf]) -> bool {
+    dirs.iter().any(|dir| {
+        crate::generate_harness::recorded_target_function(dir).as_deref()
+            == Some("LLVMFuzzerTestOneInput")
+            || ["main.c", "main.cpp"].iter().any(|name| {
+                std::fs::read_to_string(dir.join(name))
+                    .is_ok_and(|source| source.contains(PASSTHROUGH_MARKER))
+            })
+    })
+}
+
+/// The dirs a harness's sources and metadata may be in: beside the binary,
+/// beside the driver source `detection` found, and the harness dirs of the
+/// finding's work dir.
+pub(crate) fn harness_source_dirs(
+    finding_dir: Option<&Path>,
+    raw: &Value,
+    harness: &Path,
+    detection: Option<&Detection>,
+) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = harness
+        .parent()
+        .map(Path::to_path_buf)
+        .into_iter()
+        .collect();
+    if let Some(ProtocolBasis::SourceMarker(source) | ProtocolBasis::PlainSource(source)) =
+        detection.map(|detection| &detection.basis)
+    {
+        dirs.extend(source.parent().map(Path::to_path_buf));
+    }
+    if let (Some(work), Some(id)) = (
+        finding_dir.and_then(corpus::layout::work_dir_for_finding),
+        raw.get("harness_id").and_then(Value::as_str),
+    ) {
+        dirs.extend(crate::auto::layout::harness_dir_candidates(&work, id));
+    }
+    dirs.dedup();
+    dirs
 }
 
 /// `the access hit parameter `buffer`'s buffer at offset 1`.
@@ -1716,10 +1773,17 @@ pub(crate) fn replay_c(
         Err(error) => return report_error(&output, finding_dir, &error),
     };
     let mut report = run.report();
+    let source_dirs = harness_source_dirs(
+        Some(finding_dir),
+        &raw,
+        runner.harness_path(),
+        Some(detection),
+    );
     let arguments = output.show_args.then(|| {
         let input = std::fs::read(&testcase_path).ok();
         ArgumentsReport::from_run(
             runner.harness_path(),
+            is_passthrough_harness(&source_dirs),
             &run.stderr,
             report.as_ref(),
             input.as_deref(),
@@ -1789,15 +1853,25 @@ pub(crate) fn replay_c(
         notes.push(note);
     }
     let debugger = debugger.map(|debugger| {
+        let breakpoint = debugger_breakpoint(&source_dirs, &raw);
         let mut session = crate::replay_debugger::run(
             debugger,
             runner.harness_path(),
             &testcase_path,
             input == CInput::Stdin,
-            harness_target_function(finding_dir, &raw, runner.harness_path(), detection).as_deref(),
+            breakpoint.as_ref().map(|(function, _)| function.as_str()),
             is_leak_finding(&raw),
             &replay_env(&raw, runner, input),
         );
+        if let Some((function, Breakpoint::RecordedSink)) = &breakpoint {
+            session.notes.insert(
+                0,
+                format!(
+                    "breaking at the recorded sink {function} (the harness records no target \
+                     function)"
+                ),
+            );
+        }
         let sandbox = runner.sandbox_metadata();
         if sandbox.mode != "none" {
             session.notes.push(format!(
@@ -1868,33 +1942,29 @@ fn symbolize_and_compare(
     (!comparison.location_not_compared()).then(|| (report, comparison, symbolizer.name()))
 }
 
-/// The function the harness calls, from its generation metadata: beside the
-/// binary, else beside the driver source `detection` found, else in the
-/// finding's harness dirs.
-fn harness_target_function(
-    finding_dir: &Path,
-    raw: &Value,
-    harness: &Path,
-    detection: &Detection,
-) -> Option<String> {
-    let mut dirs: Vec<PathBuf> = harness
-        .parent()
-        .map(Path::to_path_buf)
-        .into_iter()
-        .collect();
-    if let ProtocolBasis::SourceMarker(source) | ProtocolBasis::PlainSource(source) =
-        &detection.basis
-    {
-        dirs.extend(source.parent().map(Path::to_path_buf));
-    }
-    if let (Some(work), Some(id)) = (
-        corpus::layout::work_dir_for_finding(finding_dir),
-        raw.get("harness_id").and_then(Value::as_str),
-    ) {
-        dirs.extend(crate::auto::layout::harness_dir_candidates(&work, id));
-    }
-    dirs.iter()
+/// Where a debugger session's first breakpoint came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Breakpoint {
+    /// The function the harness calls, from its generation metadata.
+    TargetFunction,
+    /// The finding's recorded sink, for a harness whose metadata names no
+    /// target (one generated by an older bhf).
+    RecordedSink,
+}
+
+/// The function a debugger session breaks at first: the harness's target
+/// function from its generation metadata (beside the binary, beside the
+/// driver source, in the finding's harness dirs: `source_dirs`), else the
+/// function of the finding's recorded sink.
+fn debugger_breakpoint(source_dirs: &[PathBuf], raw: &Value) -> Option<(String, Breakpoint)> {
+    source_dirs
+        .iter()
         .find_map(|dir| crate::generate_harness::recorded_target_function(dir))
+        .map(|function| (function, Breakpoint::TargetFunction))
+        .or_else(|| {
+            crash_identity::recorded_sink_function(raw)
+                .map(|function| (function, Breakpoint::RecordedSink))
+        })
 }
 
 /// Reproduce a libFuzzer-protocol C/C++ finding with default output.
@@ -2207,6 +2277,77 @@ mod tests {
         assert!(!error.contains("results/harnesses"), "{error}");
         assert!(!error.contains("findings/harnesses"), "{error}");
         assert!(error.contains("--harness"), "{error}");
+    }
+
+    /// A harness whose metadata names no target function: the debugger
+    /// breaks at the finding's recorded sink, by its bare name.
+    #[test]
+    fn the_debugger_breaks_at_the_recorded_sink_without_a_target_function() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("generation-metadata.json"),
+            r#"{"schema_version":1,"language":"cpp"}"#,
+        )
+        .unwrap();
+        let raw = serde_json::json!({
+            "rule_id": "BHF-201",
+            "exception": {"name": "ASAN_HEAP_BUFFER_OVERFLOW", "stack": [
+                {"function": "Widget::copy_at(char const*, unsigned long)", "file": "/src/widget/widget.cc", "line": 12},
+                {"function": "parse_record(char const*)", "file": "/src/widget/parse.cc", "line": 40},
+            ]},
+        });
+        let dirs = vec![dir.path().to_path_buf()];
+        let (function, from) = super::debugger_breakpoint(&dirs, &raw).expect("a breakpoint");
+        assert_eq!(function, "Widget::copy_at");
+        assert_eq!(from, super::Breakpoint::RecordedSink);
+        let args = crate::replay_debugger::command_args(
+            crate::replay_debugger::DebuggerKind::Gdb,
+            std::path::Path::new("/w/main"),
+            std::path::Path::new("/w/testcase.bin"),
+            false,
+            Some(&function),
+            &[],
+        );
+        assert!(
+            args.iter().any(|arg| arg == "break Widget::copy_at"),
+            "{args:?}"
+        );
+        // The metadata's target function wins.
+        std::fs::write(
+            dir.path().join("generation-metadata.json"),
+            r#"{"schema_version":1,"language":"cpp","target_function":"parse_record"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            super::debugger_breakpoint(&dirs, &raw),
+            Some(("parse_record".to_owned(), super::Breakpoint::TargetFunction))
+        );
+        assert_eq!(
+            super::debugger_breakpoint(&[], &serde_json::json!({})),
+            None
+        );
+    }
+
+    /// A passthrough harness is recognised by its metadata or its driver
+    /// source.
+    #[test]
+    fn a_passthrough_harness_is_recognised() {
+        let dir = tempfile::tempdir().unwrap();
+        let dirs = vec![dir.path().to_path_buf()];
+        assert!(!super::is_passthrough_harness(&dirs));
+        std::fs::write(
+            dir.path().join("main.cpp"),
+            "/* bhf driver for a passthrough libFuzzer entrypoint. */\n",
+        )
+        .unwrap();
+        assert!(super::is_passthrough_harness(&dirs));
+        std::fs::remove_file(dir.path().join("main.cpp")).unwrap();
+        std::fs::write(
+            dir.path().join("generation-metadata.json"),
+            r#"{"target_function":"LLVMFuzzerTestOneInput"}"#,
+        )
+        .unwrap();
+        assert!(super::is_passthrough_harness(&dirs));
     }
 
     /// The note on an unverified location names its cause.
