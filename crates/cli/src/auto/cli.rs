@@ -366,6 +366,15 @@ pub struct AutoArgs {
     #[arg(long = "no-seed-mining")]
     pub no_seed_mining: bool,
 
+    /// In a work dir from an earlier bhf release (migrated from the 0.2.x
+    /// layout, or run by an earlier `bhf auto`), keep reseeding its old
+    /// corpus. By default the first run of this release there moves `corpus/`
+    /// to `corpus-legacy/` (kept, not reseeded), because entries written by
+    /// earlier releases can be seeds damaged by their seed encoding. The
+    /// decision is recorded in `auto/legacy-corpus.json`.
+    #[arg(long = "reuse-legacy-corpus")]
+    pub reuse_legacy_corpus: bool,
+
     /// Actionability profile to optimize for.
     #[arg(long, default_value_t = actionability::RunMode::Reporting)]
     pub mode: actionability::RunMode,
@@ -963,6 +972,9 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
             .unwrap_or(args.work_dir.clone()),
     );
     crate::workdir::prepare(&work)?;
+    // Judged before this run writes any auto state of its own: whether the
+    // work dir holds data (a corpus above all) from an earlier release.
+    let from_an_earlier_release = results::migrate::from_an_earlier_release(&work);
     // Register the report dir NOW so an uncaught panic anywhere below (discovery,
     // IDL/CORBA scaffolding, ranking, report) can still flush the bug report.
     crate::auto::bug_report::set_output_dir(work.join("auto"));
@@ -991,6 +1003,28 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     let work_state = crate::auto::work_state::prepare(&work, args.resume)
         .with_context(|| format!("prepare generated state under {}", work.display()))?;
     bhfeprintln!("bhf auto: work-directory state: {work_state}");
+    // A plan-only run (--dry-run / --list-targets) fuzzes nothing, so it
+    // leaves an earlier release's corpus to the first run that does.
+    let legacy_corpus = crate::auto::attempt::set_aside_legacy_corpus(
+        &work,
+        from_an_earlier_release,
+        args.reuse_legacy_corpus,
+        args.dry_run || args.list_targets,
+    )
+    .with_context(|| format!("set aside the legacy corpus under {}", work.display()))?;
+    match legacy_corpus {
+        crate::auto::attempt::LegacyCorpus::SetAside(dest) => bhfeprintln!(
+            "bhf auto: this work dir holds a corpus from an earlier bhf release; it is kept in {} \
+             and not reseeded (earlier releases could store damaged seeds). Pass \
+             --reuse-legacy-corpus to keep using it.",
+            dest.display()
+        ),
+        crate::auto::attempt::LegacyCorpus::Reused => bhfeprintln!(
+            "bhf auto: reusing the corpus an earlier bhf release left in this work dir \
+             (--reuse-legacy-corpus)"
+        ),
+        _ => {}
+    }
     // Repair work directories produced by older releases that retained one
     // private Cargo target tree per Rust harness. This preserves result.json,
     // generated source, findings, corpora, and the final replayable executable.

@@ -7,9 +7,9 @@
 //! sanitizer printed (`file:line:col: runtime error:`), the identity the
 //! finding signature uses for such reports.
 //!
-//! `bhf replay` and the fuzz loop's fresh-process confirmation both compare
-//! through [`compare`], so a crash of the same class at another site never
-//! counts as a reproduction.
+//! `bhf replay`, `bhf report --backfill` and the fuzz loop's fresh-process
+//! confirmation all compare through [`compare`], so a crash of the same class
+//! at another site never counts as a reproduction.
 
 use corpus::SanitizerReport;
 use serde::Serialize;

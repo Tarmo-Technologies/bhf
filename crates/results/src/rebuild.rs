@@ -51,6 +51,9 @@ pub struct RebuildSummary {
     pub findings: usize,
     pub errors: usize,
     pub index_path: PathBuf,
+    /// Inputs of a work dir from an earlier release that look damaged, as
+    /// INDEX.md warns about them.
+    pub damaged_inputs: Option<crate::migrate::DamagedInputs>,
 }
 
 /// Files under `results/` the attestation never treats as evidence.
@@ -283,6 +286,7 @@ fn rebuild_locked_with(
         has_static_dir: static_dir.is_dir(),
         has_sbom_dir: sbom_dir.is_dir(),
         unminimized_groups: unminimized_groups(&doc),
+        damaged_inputs: crate::migrate::damaged_inputs(work_dir),
     };
 
     write_atomic(&results.join("findings.csv"), render_csv(&doc).as_bytes())?;
@@ -306,6 +310,7 @@ fn rebuild_locked_with(
         findings: doc.findings.len(),
         errors: doc.errors.len(),
         index_path: results.join("INDEX.md"),
+        damaged_inputs: index_ctx.damaged_inputs.clone(),
     })
 }
 

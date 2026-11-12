@@ -1759,6 +1759,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/report_backfill.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/report_comparison.rs",
       "license": "Apache-2.0"
     },
@@ -2460,6 +2464,10 @@
     },
     {
       "path": "crates/cli/tests/legacy_python2.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/legacy_upgrade.rs",
       "license": "Apache-2.0"
     },
     {

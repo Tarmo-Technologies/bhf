@@ -68,6 +68,7 @@ their own interpreters with in-process edge coverage.
 | `--work-dir <DIR>` | `./bhf_work/` | Output root |
 | `--max-work-dir-mb <MiB>` | `4096` | Stop starting new targets once the allocated work-directory size reaches the ceiling. Completed and in-flight targets are preserved and reported, so parallel jobs can overshoot by their final artifacts. `0` disables the ceiling; findings are never deleted to meet it |
 | `--max-corpus-mb <MiB>` | `64` | Per-target retained coverage-corpus ceiling for both memory and `corpus/<harness-id>/queue/`. Finding testcases are separate and always preserved |
+| `--reuse-legacy-corpus` | off | In a work dir from an earlier release (migrated from the 0.2.x layout, or run by an earlier `bhf auto`), keep reseeding its old corpus instead of moving it to `corpus-legacy/` on the first run |
 | `--config <PATH>` | auto-load `.bhf.toml` | Load run options from a TOML file so a project's runs are reproducible; CLI flags always override it. Keys are the flag names in kebab-case (`per-target-time = 30`, `cxx-std = "gnu++14"`, `extra-include = ["deps/inc"]`); `seed-mining = false` turns tree seed mining off. Without this flag, a `.bhf.toml` in the scanned tree root is auto-loaded — but since that tree is untrusted, an auto-loaded config honors only SAFE knobs; the build-EXECUTING keys (`build-command`, `run-untrusted`, `unsafe-search-and-run-build-commands`) are ignored unless the config is passed explicitly with `--config` |
 | `--dry-run` | off | Plan only: discover + rank targets, run the toolchain preflight, report the build-recovery plan, then EXIT without building or fuzzing — validate scope, config, and toolchains before a long run |
 | `--per-target-time <SECS>` | `60` | **Total** per-target fuzz wall, split evenly across the passes under one shared deadline (so the per-target wall ≈ this, not × pass count). libFuzzer `-max_total_time` / AFL `-V` parity (#402) |
@@ -610,9 +611,19 @@ seeds (one that finds no fuzzable target, for example) removes a list an
 earlier run left in the work dir, and its `run.json` has no `seeds` block.
 
 A work directory written by an earlier release can hold corpus entries in
-which every byte that was not valid UTF-8 was replaced by `EF BF BD`. Those
-entries keep being reseeded; delete `<work>/corpus/` (or use a fresh work dir)
-to drop them.
+which every byte that was not valid UTF-8 was replaced by `EF BF BD`. In a work
+dir from an earlier release (one migrated from the 0.2.x layout, or one with
+state an earlier `bhf auto` left, `auto/run.json` or `auto/work-state.json`,
+and no `auto/legacy-corpus.json`), the first `bhf auto` run moves `corpus/` to
+`corpus-legacy/` (kept, not reseeded) and records that in
+`auto/legacy-corpus.json`; pass `--reuse-legacy-corpus` to keep reseeding it.
+Every run writes that record before anything else, so a new work dir is
+recorded as `fresh` and its corpus is never set aside. A plan-only run
+(`--dry-run`, `--list-targets`) leaves an earlier release's corpus to the
+first run that fuzzes. `results/INDEX.md`, `bhf report` and the end of each
+run warn when a work dir from an earlier release holds testcases or corpus
+entries with several `EF BF BD` sequences.
+See [Upgrading a 0.2.x work dir](https://github.com/Tarmo-Technologies/bhf/blob/main/docs/finding-report-fields.md#upgrading-a-02x-work-dir).
 
 ## Limitations
 

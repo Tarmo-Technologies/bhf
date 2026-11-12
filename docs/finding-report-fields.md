@@ -18,6 +18,7 @@ index when it finishes. This doc describes that layout, the `bhf.findings.v1` /
 | `results/manifest.json` | `bhf.results-manifest.v1`: tool, source, full producer history |
 | `results/attestation.json` | in-toto Statement v1 over every file under `results/` |
 | `results/findings/<ID>/` | Evidence for findings that have files: `finding.json`, `testcase.bin`, `min_testcase.bin` (when minimized), `sanitizer.log`, `decoded.json`, `replay.py` / `repro.adb` |
+| `results/legacy/` | Only in a work dir migrated from bhf ≤ 0.2.x: the old `FINDINGS.md`, `findings.csv`, `auto/findings.csv` and `findings/<ID>/replay.py`, and `migration.json` (what was moved, when) |
 | `results/static/` | Native `static-scan` output (`static-report.{json,md,sarif}`) |
 | `results/sbom/` | Native `sbom` output (`cyclonedx.json`, `sbom.spdx.json`, `openvex.json`, `vulnerabilities.json`, ...) |
 
@@ -183,12 +184,55 @@ reading the old layout directly:
 - `runtime_mode` is not written anywhere in the new contract.
 - An old-layout work dir (`<work>/findings/` at the top) is migrated
   automatically — `findings/` is renamed to `results/findings/`, the legacy
-  index files are deleted, and `results/` is rebuilt — the first time any
-  command opens it. `replay`, `minimize`, `capsule`, and `--resume` keep
-  working against a migrated work dir.
+  index files and reproducer scripts are kept under `results/legacy/`, and
+  `results/` is rebuilt — the first time any command opens it, including
+  commands that only read (`explain`, `report`). The command prints what it
+  moved and kept. `replay`, `minimize`, `capsule`, and `--resume` keep working
+  against a migrated work dir. See
+  [Upgrading a 0.2.x work dir](#upgrading-a-02x-work-dir).
 - Tools that read `bhf_work/findings.csv` or `bhf_work/findings/` directly
   must switch to `results/findings.json` (schema in `schemas/`, reference
   fixture in `tests/fixtures/golden_results/`).
+
+
+### Upgrading a 0.2.x work dir
+
+The migration is one-way: once a current bhf opens a 0.2.x work dir, bhf 0.2.x
+can no longer read it (`cannot read <wd>/findings`). Keep a copy first
+(`cp -a bhf_work bhf_work.0.2`). The copy replays its own harnesses: recorded
+harness paths are resolved in the work dir that holds the finding.
+
+What a migrated work dir has, and what it does not:
+
+- The findings keep their ids and the evidence 0.2.x recorded. They have no
+  `sanitizer.log`, crash frames for UBSan reports, or minimized inputs.
+  Re-running `bhf auto` over the source tree into the same work dir minimizes
+  the representative of each finding group that has no minimized input (within
+  its time budget; `bhf minimize <finding>` does the rest), but it adds no
+  `sanitizer.log` or frames: a crash that matches a migrated finding is a
+  duplicate. Run `bhf report --backfill --work-dir <wd>` to replay each one
+  against its harness and add `sanitizer.log`, frames and the memory access
+  where the harness still exists and still reports the same crash. A replay
+  that comes back unsymbolized is skipped; put `llvm-symbolizer` on `PATH` (or
+  set `ASAN_SYMBOLIZER_PATH`) and run it again.
+- `results/legacy/` keeps the old `FINDINGS.md`, `findings.csv`,
+  `auto/findings.csv` and `replay.py` scripts; `results/INDEX.md` and
+  `results/findings.{json,csv,sarif}` replace them, and each finding gets a
+  current `replay.py`.
+- The corpus may hold seeds damaged by the seed encoding of earlier releases
+  (every byte that was not valid UTF-8 became `EF BF BD`). The first `bhf auto`
+  run of this release sets `corpus/` aside as `corpus-legacy/` instead of
+  reseeding it, unless you pass `--reuse-legacy-corpus`. It does the same in a
+  0.2.x work dir an earlier release already migrated, and in any work dir an
+  earlier `bhf auto` wrote: it recognises them by their auto state
+  (`auto/run.json`, `auto/work-state.json`) without the
+  `auto/legacy-corpus.json` record every run of this release writes first.
+  `results/INDEX.md` and `bhf report` warn about testcases and corpus entries
+  that look damaged this way.
+
+For results comparable with a fresh install, run `bhf auto` into a new work
+dir. Read each finding's `sanitizer.log` where it has one, otherwise run its
+`replay.py` (or `bhf replay --finding <id>`), which prints the sanitizer report.
 
 ## Quick reading guide
 

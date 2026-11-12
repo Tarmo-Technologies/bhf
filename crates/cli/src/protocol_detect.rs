@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! How a harness binary consumes its input, decided in one place for `bhf fuzz`,
-//! `bhf replay` and `bhf minimize`.
+//! `bhf replay`, `bhf minimize` and `bhf report --backfill`.
 //!
 //! The evidence, strongest first:
 //!

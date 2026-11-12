@@ -9,8 +9,8 @@
   corpus entries reseeded into later passes or the AFL++ stage used to pass
   through a UTF-8 conversion that replaced every invalid byte with `EF BF BD`,
   so binary formats were fuzzed from mangled inputs. Corpora in work dirs from
-  earlier runs can still hold such entries and are reseeded; delete
-  `<work>/corpus/` or use a fresh work dir.
+  earlier releases can still hold such entries; the first `bhf auto` run of
+  this release in such a work dir sets its corpus aside (see below).
 - The `bhf auto` AFL++ stage cut every seed to 4096 bytes. It now uses the run's
   resolved `--max-len`; a fixed `--max-len` below AFL++'s 1 MiB default is also
   passed to afl-fuzz as `-G` when its `-h` lists that option (AFL++ 4.00c or
@@ -231,6 +231,21 @@
   and transport).
 - `bhf replay` panicked on a `build.binary.sha256` in `finding.json` that is
   not ASCII.
+- Migrating a bhf 0.2.x work dir deleted `FINDINGS.md`, `findings.csv`,
+  `auto/findings.csv` and each finding's `replay.py`, and said only that
+  `findings/` moved. They are now kept under `results/legacy/` with a
+  `migration.json` record, and the migration prints what it moved and kept,
+  that migrated findings lack `sanitizer.log` until backfilled, what happens to
+  the corpus, and that the migration is one-way.
+- `bhf auto` on a work dir from an earlier release kept reseeding its old
+  corpus queue, including seeds the old seed encoding damaged. On its first run
+  in a work dir migrated from 0.2.x, or one an earlier `bhf auto` wrote
+  (including a 0.2.x work dir an earlier release already migrated), it moves
+  `corpus/` to `corpus-legacy/` (kept, not reseeded) and records the decision
+  in `auto/legacy-corpus.json`; `--reuse-legacy-corpus` keeps reseeding it.
+  Every `bhf auto` run now writes that record before anything else (a new work
+  dir is recorded as `fresh`), which is how a later run or `bhf report` tells
+  this release's work dirs from earlier ones.
 
 ### Changed
 - `bhf auto --seed-dir` reads a directory's files in name order.
@@ -344,6 +359,23 @@
   every kind of finding (a non-harness finding's document carries `lane` and
   `details`, and `harness` only when a binary ran), and `--show-output` also
   prints the harness's raw output.
+- `bhf report --backfill` replays each C/C++ sanitizer finding without a
+  `sanitizer.log` (such as findings migrated from a 0.2.x work dir) against its
+  harness and, when the replay is the recorded crash, adds `sanitizer.log`, the
+  crash frames, the reported location, check and memory access, and a refreshed
+  sink and explanation to the finding (id and signature unchanged, a `history`
+  entry recorded). Findings whose harness is gone, that now crash elsewhere,
+  or whose replay is unsymbolized, are listed and left as they were. It runs
+  with the LLVM toolchain `bhf auto` uses on `PATH`.
+- `results/INDEX.md`, `bhf report` and the end of each producer run warn when a
+  work dir from an earlier release (migrated from 0.2.x, with a set-aside or
+  reused earlier corpus, or with `bhf auto` state and no
+  `auto/legacy-corpus.json`) holds testcases or corpus entries with several
+  `EF BF BD` sequences, which earlier seed encoding produced from binary seeds.
+  A work dir this release's `bhf auto` started is never flagged, even when the
+  run stopped before writing `auto/seeds.json`. `results::RebuildSummary`
+  gains a `damaged_inputs` field.
+- docs/finding-report-fields.md describes upgrading a 0.2.x work dir.
 
 ## 0.3.0 - 2026-10-05
 

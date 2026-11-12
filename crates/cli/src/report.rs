@@ -53,6 +53,16 @@ pub struct ReportArgs {
     /// Never suppresses findings or changes their security verdicts.
     #[arg(long, requires = "baseline")]
     pub triage: Option<PathBuf>,
+
+    /// Work-dir mode only: before rebuilding results/, replay each C/C++
+    /// sanitizer finding that has no sanitizer.log (such as findings migrated
+    /// from a bhf 0.2.x work dir) against its harness, and when the replay is
+    /// the recorded crash, write its sanitizer.log, crash frames and memory
+    /// access into the finding. Findings whose harness is gone, that now
+    /// crash elsewhere, or whose replay is unsymbolized, are listed and left
+    /// as they were.
+    #[arg(long, conflicts_with_all = ["findings", "out"])]
+    pub backfill: bool,
 }
 
 pub fn run(args: ReportArgs) -> i32 {

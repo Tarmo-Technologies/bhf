@@ -49,7 +49,14 @@ bhf clean bhf_work --build --corpus --reports
 `bhf report` has two modes. With no `--findings`/`--out`, it defaults to
 `--work-dir bhf_work` and rebuilds `<work-dir>/results/` in place (the same
 rebuild every other command triggers) — this is the normal post-hoc way to
-refresh the index. Pass `--findings <DIR>` and/or `--out <DIR>` for the
+refresh the index. `--backfill` first replays each C/C++ sanitizer finding that
+has no `sanitizer.log` (findings migrated from a 0.2.x work dir, for example)
+against its harness, as `bhf replay` does; when the replay is the recorded
+crash it writes `sanitizer.log`, the crash frames and the memory access into
+the finding (its id and signature do not change). A finding whose harness is
+gone, that now crashes elsewhere, or whose replay is unsymbolized (put
+`llvm-symbolizer` on `PATH` or set `ASAN_SYMBOLIZER_PATH`; the backfill puts
+the LLVM toolchain `bhf auto` uses on `PATH`) is listed and left as it was. Pass `--findings <DIR>` and/or `--out <DIR>` for the
 explicit mode shown above, which reports over an arbitrary findings directory
 and writes a standalone Markdown/JSON/SARIF/CSV report to `--out` instead of
 touching `results/`; `--sarif`/`--csv` are no-ops in work-dir mode (always

@@ -315,6 +315,100 @@ pub(crate) fn append_cmplog_records(runtrace_log: &std::path::Path, snapshot: &s
     }
 }
 
+/// Where `bhf auto` sets aside the corpus of a work dir from an earlier
+/// release: kept, but outside `corpus/`, which every pass reseeds from.
+pub(crate) const LEGACY_CORPUS_DIR: &str = results::migrate::LEGACY_CORPUS_DIR;
+/// The one-time record of what `bhf auto` found in a work dir.
+const LEGACY_CORPUS_DECISION: &str = results::migrate::CORPUS_DECISION_RECORD;
+
+/// What [`set_aside_legacy_corpus`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LegacyCorpus {
+    /// The work dir holds nothing from an earlier release; recorded as such.
+    Fresh,
+    /// An earlier run already decided (set aside, reused, none, or fresh).
+    Decided,
+    /// A plan-only run on a work dir from an earlier release: the decision is
+    /// left to the first run that fuzzes.
+    Pending,
+    /// The work dir from an earlier release had no corpus.
+    Absent,
+    /// The corpus was moved to this directory and is no longer reseeded.
+    SetAside(PathBuf),
+    /// The operator asked to keep reseeding it.
+    Reused,
+}
+
+/// A work dir from an earlier release (migrated from the 0.2.x layout, or run
+/// by an earlier `bhf auto`; see [`results::migrate::from_an_earlier_release`],
+/// which the caller evaluates before this run writes any auto state) keeps
+/// that release's corpus queue, whose entries can be seeds the earlier seed
+/// encoding damaged (every invalid UTF-8 byte replaced by `EF BF BD`). Every
+/// pass, the AFL++ stage and the replay passes read `corpus/<id>/queue/`, so
+/// on the first `bhf auto` run of this release the whole `corpus/` dir is
+/// moved to [`LEGACY_CORPUS_DIR`] (kept, not reseeded) unless `reuse` asks to
+/// keep it. The decision is recorded once; later runs leave the new corpus
+/// alone. A work dir with nothing from an earlier release is recorded as
+/// fresh, even by a `plan_only` run, so it is never mistaken for one later.
+pub(crate) fn set_aside_legacy_corpus(
+    work_dir: &Path,
+    from_an_earlier_release: bool,
+    reuse: bool,
+    plan_only: bool,
+) -> std::io::Result<LegacyCorpus> {
+    let decision_path = work_dir.join(LEGACY_CORPUS_DECISION);
+    if decision_path.exists() {
+        return Ok(LegacyCorpus::Decided);
+    }
+    let record = |decision: &str| -> std::io::Result<()> {
+        if let Some(parent) = decision_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let body = serde_json::json!({
+            "schema_version": 1,
+            "decision": decision,
+            "at": corpus::finding::now_rfc3339(),
+            "set_aside_to": (decision == "set_aside").then_some(LEGACY_CORPUS_DIR),
+        });
+        std::fs::write(
+            &decision_path,
+            serde_json::to_vec_pretty(&body).map_err(std::io::Error::other)?,
+        )
+    };
+    if !from_an_earlier_release {
+        record(results::migrate::CORPUS_FRESH)?;
+        return Ok(LegacyCorpus::Fresh);
+    }
+    if plan_only {
+        return Ok(LegacyCorpus::Pending);
+    }
+    let corpus = work_dir.join("corpus");
+    let is_dir = std::fs::symlink_metadata(&corpus).is_ok_and(|meta| meta.is_dir());
+    if !is_dir {
+        record("none")?;
+        return Ok(LegacyCorpus::Absent);
+    }
+    if reuse {
+        record("reused")?;
+        return Ok(LegacyCorpus::Reused);
+    }
+    let dest = work_dir.join(LEGACY_CORPUS_DIR);
+    if dest.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "cannot set the legacy corpus aside: {} already exists; move it away, or pass \
+                 --reuse-legacy-corpus to keep reseeding {}",
+                dest.display(),
+                corpus.display()
+            ),
+        ));
+    }
+    std::fs::rename(&corpus, &dest)?;
+    record("set_aside")?;
+    Ok(LegacyCorpus::SetAside(dest))
+}
+
 /// Cap on inputs reseeded from the persisted corpus into a later pass (#383),
 /// so a long-running target's queue can't blow the seed set up unboundedly.
 pub(crate) const CORPUS_RESEED_CAP: usize = 256;
@@ -9293,6 +9387,101 @@ mod sanitizer_override_tests {
 mod corpus_reseed_tests {
     use super::{reseed_from_corpus_queue, CORPUS_RESEED_CAP};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// A work dir from an earlier release keeps its corpus but does not
+    /// reseed it, once; a work dir with nothing from an earlier release is
+    /// recorded as fresh and its corpus left alone.
+    #[test]
+    fn an_earlier_release_corpus_is_set_aside_once() {
+        use super::{set_aside_legacy_corpus, LegacyCorpus};
+        let work = tempfile::tempdir().unwrap();
+        let w = work.path();
+        let queue = w.join("corpus/H-1/queue");
+        std::fs::create_dir_all(&queue).unwrap();
+        std::fs::write(queue.join("a.bin"), b"legacy-entry").unwrap();
+        // A plan-only run leaves an earlier release's corpus for later.
+        assert_eq!(
+            set_aside_legacy_corpus(w, true, false, true).unwrap(),
+            LegacyCorpus::Pending
+        );
+        assert!(queue.join("a.bin").is_file());
+        assert!(!w.join("auto/legacy-corpus.json").exists());
+        assert_eq!(
+            set_aside_legacy_corpus(w, true, false, false).unwrap(),
+            LegacyCorpus::SetAside(w.join("corpus-legacy"))
+        );
+        let mut seeds = Vec::new();
+        assert_eq!(
+            reseed_from_corpus_queue(w, "H-1", &mut seeds, CORPUS_RESEED_CAP),
+            0
+        );
+        assert_eq!(
+            std::fs::read(w.join("corpus-legacy/H-1/queue/a.bin")).unwrap(),
+            b"legacy-entry"
+        );
+        std::fs::create_dir_all(&queue).unwrap();
+        std::fs::write(queue.join("b.bin"), b"new-entry").unwrap();
+        assert_eq!(
+            set_aside_legacy_corpus(w, true, false, false).unwrap(),
+            LegacyCorpus::Decided
+        );
+        assert_eq!(
+            reseed_from_corpus_queue(w, "H-1", &mut seeds, CORPUS_RESEED_CAP),
+            1
+        );
+        assert_eq!(
+            results::migrate::corpus_decision(w).as_deref(),
+            Some("set_aside")
+        );
+    }
+
+    #[test]
+    fn a_fresh_work_dirs_corpus_is_kept_and_recorded_as_fresh() {
+        use super::{set_aside_legacy_corpus, LegacyCorpus};
+        let work = tempfile::tempdir().unwrap();
+        let w = work.path();
+        let queue = w.join("corpus/H-1/queue");
+        std::fs::create_dir_all(&queue).unwrap();
+        std::fs::write(queue.join("a.bin"), b"entry").unwrap();
+        // Even a plan-only run records it, so a later run is not mistaken
+        // for one on an earlier release's work dir.
+        assert_eq!(
+            set_aside_legacy_corpus(w, false, false, true).unwrap(),
+            LegacyCorpus::Fresh
+        );
+        assert!(queue.join("a.bin").is_file());
+        assert!(!results::migrate::from_an_earlier_release(w));
+        assert_eq!(
+            set_aside_legacy_corpus(w, true, false, false).unwrap(),
+            LegacyCorpus::Decided
+        );
+        assert!(queue.join("a.bin").is_file());
+    }
+
+    #[test]
+    fn an_earlier_release_corpus_is_reused_on_request() {
+        use super::{set_aside_legacy_corpus, LegacyCorpus};
+        let work = tempfile::tempdir().unwrap();
+        let w = work.path();
+        let queue = w.join("corpus/H-1/queue");
+        std::fs::create_dir_all(&queue).unwrap();
+        std::fs::write(queue.join("a.bin"), b"legacy-entry").unwrap();
+        assert_eq!(
+            set_aside_legacy_corpus(w, true, true, false).unwrap(),
+            LegacyCorpus::Reused
+        );
+        let mut seeds = Vec::new();
+        assert_eq!(
+            reseed_from_corpus_queue(w, "H-1", &mut seeds, CORPUS_RESEED_CAP),
+            1
+        );
+        assert_eq!(
+            set_aside_legacy_corpus(w, true, false, false).unwrap(),
+            LegacyCorpus::Decided
+        );
+        assert!(queue.join("a.bin").is_file());
+        assert!(results::migrate::from_an_earlier_release(w));
+    }
 
     #[test]
     fn reseed_from_corpus_queue_loads_deduped_capped_inputs() {

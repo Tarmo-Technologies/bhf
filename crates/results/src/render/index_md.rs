@@ -22,6 +22,63 @@ pub struct IndexContext {
     pub has_sbom_dir: bool,
     /// Root-cause groups whose representative was not minimized in budget.
     pub unminimized_groups: usize,
+    /// Inputs of a work dir from an earlier release that look damaged.
+    pub damaged_inputs: Option<crate::migrate::DamagedInputs>,
+}
+
+/// Most finding ids the damaged-input warning names.
+const MAX_DAMAGED_FINDINGS_SHOWN: usize = 20;
+
+/// The warning about inputs an earlier release's seed encoding damaged.
+pub fn damaged_inputs_line(damaged: &crate::migrate::DamagedInputs) -> String {
+    let mut parts = Vec::new();
+    if !damaged.findings.is_empty() {
+        let mut ids = damaged
+            .findings
+            .iter()
+            .take(MAX_DAMAGED_FINDINGS_SHOWN)
+            .map(|id| format!("`{}`", md_code(id)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if damaged.findings.len() > MAX_DAMAGED_FINDINGS_SHOWN {
+            let _ = write!(
+                ids,
+                " and {} more",
+                damaged.findings.len() - MAX_DAMAGED_FINDINGS_SHOWN
+            );
+        }
+        parts.push(format!("the testcases of {ids}"));
+    }
+    if damaged.corpus_entries > 0 {
+        parts.push(format!(
+            "{} corpus {} under the work dir's `corpus/`{}",
+            damaged.corpus_entries,
+            if damaged.corpus_entries == 1 {
+                "entry"
+            } else {
+                "entries"
+            },
+            if damaged.truncated {
+                " (the first entries scanned)"
+            } else {
+                ""
+            }
+        ));
+    }
+    let total = damaged.total();
+    format!(
+        "{total} {} runs of `EF BF BD` (U+FFFD, the UTF-8 replacement character): {}. \
+         This work dir holds data from an earlier bhf release, whose seed encoding replaced every \
+         invalid UTF-8 byte of a seed with it, so these are likely damaged copies of binary seeds \
+         rather than real inputs. Re-run `bhf auto` into a fresh work dir to fuzz from the \
+         original seeds.",
+        if total == 1 {
+            "input contains"
+        } else {
+            "inputs contain"
+        },
+        parts.join(" and ")
+    )
 }
 
 pub fn render_index(doc: &FindingsDocument, ctx: &IndexContext) -> String {
@@ -141,6 +198,9 @@ pub fn render_index(doc: &FindingsDocument, ctx: &IndexContext) -> String {
             "- ⚠ {} root-cause group(s) were not minimized within the time budget; run `bhf minimize` on them.",
             ctx.unminimized_groups
         );
+    }
+    if let Some(damaged) = &ctx.damaged_inputs {
+        let _ = writeln!(out, "- ⚠ {}", damaged_inputs_line(damaged));
     }
     out.push('\n');
 
@@ -333,6 +393,38 @@ mod tests {
             "../../../../schemas/examples/findings.v1.example.json"
         ))
         .unwrap()
+    }
+
+    /// The warning names the damaged testcases and counts corpus entries.
+    #[test]
+    fn index_warns_about_damaged_inputs() {
+        let ctx = IndexContext {
+            damaged_inputs: Some(crate::migrate::DamagedInputs {
+                findings: vec!["F-0001-aaaaaaaa".to_owned()],
+                corpus_entries: 3,
+                truncated: false,
+            }),
+            ..IndexContext::default()
+        };
+        let md = render_index(&example(), &ctx);
+        assert!(
+            md.contains("- ⚠ 4 inputs contain runs of `EF BF BD`"),
+            "{md}"
+        );
+        assert!(
+            md.contains("the testcases of `F-0001-aaaaaaaa` and 3 corpus entries"),
+            "{md}"
+        );
+        assert!(md.contains("likely damaged"), "{md}");
+        let single = damaged_inputs_line(&crate::migrate::DamagedInputs {
+            findings: Vec::new(),
+            corpus_entries: 1,
+            truncated: true,
+        });
+        assert!(single.starts_with("1 input contains"), "{single}");
+        assert!(single.contains("1 corpus entry"), "{single}");
+        assert!(single.contains("first entries scanned"), "{single}");
+        assert!(!render_index(&example(), &IndexContext::default()).contains("EF BF BD"));
     }
 
     #[test]

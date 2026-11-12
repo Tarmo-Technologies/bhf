@@ -312,6 +312,14 @@ fn resolve_harness(finding_dir: &Path, explicit: Option<PathBuf>) -> Result<Path
     ))
 }
 
+/// The harness a finding records ([`resolve_harness`] without an explicit
+/// path): its `fixture_path` resolved in the work dir holding the finding
+/// (see [`corpus::finding::fixture_path_candidates`]), then its `harness_id`
+/// under `harnesses/`, `auto/`, `generated_harnesses/` and `build/`.
+pub(crate) fn recorded_harness(finding_dir: &Path) -> Result<PathBuf, String> {
+    resolve_harness(finding_dir, None)
+}
+
 /// The input-format note for a generated harness binary (see
 /// [`crate::generate_harness::stale_harness_format_note`]), read from the
 /// metadata next to it.

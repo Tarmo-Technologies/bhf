@@ -82,6 +82,7 @@ mod readiness;
 mod relational;
 mod replay;
 mod report;
+mod report_backfill;
 mod repro_lane;
 mod resource_limits;
 mod rules;
@@ -553,12 +554,22 @@ where
                 bhfeprintln!("error: {error:#}");
                 return 1;
             }
+            // Replay findings that lack the evidence a current run records
+            // before the index is rebuilt from them, with the toolchain (and
+            // so the symbolizer) `bhf auto` gives its fuzz children.
+            if report_args.backfill {
+                build::activate_compatible_clang();
+                report_backfill::run(&work);
+            }
             match results::rebuild(&work, &results::RebuildOptions::default()) {
-                Ok(summary) => bhfeprintln!(
-                    "Results: {} ({} findings)",
-                    summary.index_path.display(),
-                    summary.findings
-                ),
+                Ok(summary) => {
+                    bhfeprintln!(
+                        "Results: {} ({} findings)",
+                        summary.index_path.display(),
+                        summary.findings
+                    );
+                    workdir::warn_about_damaged_inputs(&summary);
+                }
                 Err(error) => {
                     bhfeprintln!("error: results index not rebuilt: {error}");
                     return 1;
