@@ -31,8 +31,10 @@ const CACHE_VERSION: u32 = 3;
 
 /// Bump whenever discovery/ranking semantics change without an on-disk schema
 /// change. This deliberately invalidates an otherwise byte-identical source-tree
-/// cache produced by older target-selection logic.
-pub(crate) const DISCOVERY_SEMANTIC_VERSION: u32 = 1;
+/// cache produced by older target-selection logic. v2: the cached list keeps
+/// project fuzz drivers that library targets shadow, so an explicit selection
+/// can still pick one; `auto` drops the rest after its filters.
+pub(crate) const DISCOVERY_SEMANTIC_VERSION: u32 = 2;
 
 /// Filename written under the work dir.
 pub const CACHE_FILENAME: &str = "discovery-cache.json";

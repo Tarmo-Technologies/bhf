@@ -3631,6 +3631,7 @@ fn emit_rust_portability(
             libfuzzer_binary: Some("main_libfuzzer".to_owned()),
             afl_binary: None,
             crash_on_finding_env: false,
+            passthrough_entrypoint: false,
         },
     );
     if wrote.is_err() {

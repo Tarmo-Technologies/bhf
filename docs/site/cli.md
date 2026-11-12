@@ -46,6 +46,11 @@ bhf introspect path/to/src --work-dir bhf_work
 bhf clean bhf_work --build --corpus --reports
 ```
 
+The replay and minimize lines show the Ada layout. A C or C++ harness replays
+from the `build/<id>/main` that `bhf build` stages or from
+`bhf_work/harnesses/<id>/main`; without `--harness`, both commands resolve the
+finding's harness in its work dir.
+
 `bhf report` has two modes. With no `--findings`/`--out`, it defaults to
 `--work-dir bhf_work` and rebuilds `<work-dir>/results/` in place (the same
 rebuild every other command triggers) — this is the normal post-hoc way to
@@ -771,19 +776,19 @@ it exits `1`.
 
 `bhf fuzz --engine` accepts only `builtin` (the default) and `afl++`;
 `libfuzzer`, `libafl`, and `nyx` are **not** valid `--engine` values and clap
-rejects them. C/C++ generated harnesses do expose `LLVMFuzzerTestOneInput` and
-are built as libFuzzer-style sanitizer binaries, but BHF's built-in engine
-runs those binaries one input at a time so it can normalize sanitizer findings;
-there is no separate `libfuzzer` runtime path through this flag. A binary you
-compiled yourself with `-fsanitize=fuzzer` and placed at `build/<id>/main` is
-recognised by the libFuzzer runtime in it and run on one input file per
-process, so a crash it finds is recorded with the input that caused it. It gets
-no coverage guidance without bhf's runtime, and `bhf fuzz` says so: wrap the
-fuzz target with `bhf generate-harness <fuzz_target.cc> --target
-LLVMFuzzerTestOneInput`, build that harness and fuzz it instead. The standalone
-libFuzzer/LibAFL/Nyx adapters are not reachable through `bhf fuzz --engine`,
-and the Ada libFuzzer adapter remains deferred until users have a viable
-Ada/LLVM/libFuzzer toolchain.
+rejects them. C/C++ generated harnesses expose `LLVMFuzzerTestOneInput`, but
+their default `main` binary is bhf's own framed fork-server driver, not a
+libFuzzer binary, so BHF can normalize sanitizer findings; there is no separate
+`libfuzzer` runtime path through this flag (`make libfuzzer` builds a libFuzzer
+binary for other fuzzers). A binary you compiled yourself with
+`-fsanitize=fuzzer` and placed at `build/<id>/main` is recognised by the
+libFuzzer runtime in it and run on one input file per process, so a crash it
+finds is recorded with the input that caused it. It gets no coverage guidance
+without bhf's runtime, and `bhf fuzz` says so: wrap the fuzz target with
+`bhf generate-harness <fuzz_target.cc> --target LLVMFuzzerTestOneInput`, build
+that harness and fuzz it instead. The standalone libFuzzer/LibAFL/Nyx adapters
+are not reachable through `bhf fuzz --engine`, and the Ada libFuzzer adapter
+remains deferred until users have a viable Ada/LLVM/libFuzzer toolchain.
 
 Replay, minimize, and built-in fuzzing accept `--sandbox none|auto|firejail|bubblewrap`.
 Use `--sandbox-tool` to point at a specific wrapper and `--sandbox-strict` to
@@ -850,18 +855,29 @@ outside its directory, pass each additional source root to harness generation:
 bhf generate-harness src/base/dates/util-dates-iso8601.adb --target Value --source-root src/core --source-root src/base/dates
 ```
 
-For C and C++ manual runs, pass `--target` explicitly. The generated harness is
-Makefile-based, so `bhf build` runs `make` and stages `build/<harness-id>/main`.
+For C and C++ manual runs, `--target` is required. For C++ it accepts the bare
+name, a `::`-qualified suffix (`Parser::parse`), the fully qualified name as
+`bhf list targets` prints it, or any of those with a parameter list. An
+exact spelling wins over a suffix, a leading `::` names the global namespace
+only, and a miss lists the closest definitions. The generated harness is Makefile-based, so
+`bhf build` runs `make` and stages `build/<harness-id>/main`.
 
 ```sh
-bhf generate-harness src/parser.cpp --target parse --output bhf_work/generated_harnesses
+bhf generate-harness src/parser.cpp --target Parser::parse --output bhf_work/harnesses
 bhf build bhf_work --harness H-CPP000A
 bhf fuzz bhf_work --harness H-CPP000A --iterations 1000 --seed-input smoke
 ```
 
+`bhf build` takes the work directory (it also accepts a harness directory
+`bhf_work/harnesses/<id>` and says so). When the lookup fails it names the
+harness ids it found, and when the link fails it names the in-tree sources
+that define the missing symbols, with the `--extra-source` flags and an
+`AUTO_EXTRA_SOURCES` command to add them.
+
 Use `--extra-source`, `--extra-include`, and `--cleanup` when the target needs
 additional translation units, include directories, or return-value cleanup. See
-[C and C++ Fuzzing](../c-cpp/) for supported parameter shapes and limits.
+[C and C++ Fuzzing](../c-cpp/) for supported parameter shapes and limits, and
+[Custom C and C++ Harnesses](../custom-harness/) for writing your own harness.
 
 For AFL++ on a generated C/C++ harness:
 
@@ -934,7 +950,7 @@ Flags:
 - `--reuse-discovery` — deprecated no-op (caching is now the default); accepted for back-compat.
 - `--sanitizers <asan,ubsan,msan,tsan,lsan|none>` — arm the native C/C++ sanitizer matrix on the auto build; other lanes own their instrumentation.
 - `--languages <LIST>` (alias `--lang`) — restrict the sweep to a comma-separated subset of the sixteen fuzzable source languages (`ada`, `c`, `cpp`, `rust`, `java`, `python`, `perl`, `go`, `cobol`, `fortran`, `csharp`, `javascript`, `typescript`, `ruby`, `lua`, `php`). Candidates in other languages are dropped after discovery and before `--list-targets`/`--max-targets`, so the ranked list and the top-N reflect the filter. Common spellings accepted (`c++`/`cxx`/`cc`→cpp, `rs`→rust, `py`→python, `pl`→perl, `golang`→go); case-insensitive. Unset = fuzz every language found. The SBOM/SCA pass is unaffected.
-- `--target <NAME>` — exact target-name filter. Repeat to run a small named subset.
+- `--target <NAME>` — target-name filter: the full discovered name, the bare name, or a qualified suffix such as `Class::method`, optionally with the parameter list. An exact spelling wins: the suffix match applies only when no target has exactly that name. Repeat to run a small named subset. A name that selects nothing prints the closest discovered names. A project fuzz driver (`LLVMFuzzerTestOneInput`) is skipped when the tree has other targets unless `--target`, `--target-file`, or `--harness-id` selects it.
 - `--target-file <PATH>` — exact source-file filter. Accepts absolute paths or paths relative to the sweep root.
 - `--harness-id <ID>` — exact stable harness-id filter from a prior auto report.
 - `--exclude-path <TEXT>` — drop targets whose normalized relative source path contains `TEXT`. Repeatable.
@@ -1059,7 +1075,11 @@ manifest (`bhf.project.v1`, TOML) kept entirely **outside** the bhf source tree.
 One manifest composes a private harness (source or prebuilt binary) with its
 corpora, layered dictionaries, grammar, and launch settings under one or more
 stable target ids, so a private campaign is reproducible without vendoring it
-into bhf. `run` reuses the existing engines — `builtin`/`afl++` go through the
+into bhf. A `builtin` or `afl++` target's `binary` must be a bhf harness binary,
+built from a harness directory bhf generated (for C/C++, its `make main` or
+`make afl`), because `bhf fuzz` drives it through bhf's harness protocol and
+coverage map. Any other executable belongs on `engine = "binary"`. `run`
+reuses the existing engines — `builtin`/`afl++` go through the
 `bhf fuzz` lane, `binary` through the `bhf binary fuzz` lane — and adds no new
 execution path.
 

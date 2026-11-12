@@ -5,6 +5,62 @@
 ## Unreleased
 
 ### Fixed
+- C++ `--target` accepts a trailing qualified suffix, in `generate-harness`
+  and `bhf auto`: `Class::method` selects `ns::Class::method`, with or without
+  the parameter list. An exact spelling still wins: the suffix match applies
+  only when no target has exactly that name, so `Class::method` keeps naming a
+  global `Class` when a namespaced one also exists. A leading `::` names the
+  global namespace only. `bhf auto --target` used to match only the full
+  name, the name without its parameter list, or the bare name, so a value
+  that matched nothing before can now select targets. When a suffix matches
+  several functions, `generate-harness` lists every match and picks the first,
+  as for overloads (`--target-line` picks one); `bhf auto` keeps them all. A
+  target that matches nothing lists the closest definitions (and, in
+  `generate-harness`, the accepted spellings). `generate-harness --help` now
+  says `--target` is required for C and C++.
+- `bhf build` reports the C/C++ harness lookup error (an unknown `--harness`,
+  or several harnesses and no `--harness`, with the ids it found) instead of
+  falling through to the Ada layout check ("missing src_instrumented"). It
+  also accepts a harness directory or `<work>/harnesses` as its argument and
+  prints the equivalent `bhf build <work> --harness <id>` command.
+- A failed C/C++ `bhf build` explains itself: it names the in-tree sources
+  that define the undefined symbols, with the `--extra-source` flags and an
+  `AUTO_EXTRA_SOURCES=... bhf build ...` command that adds them, and suggests
+  `-include iostream` for standard streams used without their header, `-l`
+  flags for system libraries, and `-fms-extensions` (clang++) or
+  `-fpermissive` (g++) for a member declared with an extra class
+  qualification. Each suggested command keeps the `AUTO_EXTRA_SOURCES`,
+  `AUTO_EXTRA_INCLUDES`, `AUTO_EXTRA_LDFLAGS`, `CXX_STD` and `C_STD` values
+  the build ran with, and when several suggestions apply a last line combines
+  them into one command. The make output still streams while the build runs.
+- Standard stream names used without their header (`cerr`, `cout`, `cin`,
+  `clog`, `endl`, their `std::` forms, and `std::basic_istream<char>`-style
+  incomplete types) are classified as a missing standard type instead of an
+  unrecognised build error. `bhf auto` force-includes the header, and waits
+  for that repair before it drops a recovered source that fails this way. The
+  manipulators `ends`, `flush` and `ws` map to `<iostream>` only when written
+  `std::`-qualified, so a project type with one of those names still gets the
+  usual placeholder.
+- A member declared with an extra class qualification (`int Widget::name();`
+  inside class `Widget`) is classified as its own build error
+  (`extra_qualification` in `run.json`) instead of an unrecognised one. `bhf
+  auto` reports the declaration's location and the flag that relaxes the
+  check: `AUTO_EXTRA_INCLUDES=-fms-extensions` for clang++ or
+  `AUTO_EXTRA_INCLUDES=-fpermissive` for g++, set in the environment. It does
+  not add the flag itself.
+- A compile-database `-include`/`-imacros` operand is made absolute only when
+  the file exists relative to the entry's directory. `-include iostream` no
+  longer becomes a missing `<dir>/iostream`.
+- `bhf auto` keeps a project fuzz driver (`LLVMFuzzerTestOneInput`) that
+  `--target`, `--target-file` or `--harness-id` selects, even when the tree has
+  other targets, and otherwise prints a note naming the drivers it skipped.
+  The discovery cache's semantic version is bumped, so an existing cache is
+  recomputed once.
+- `make libfuzzer` works for a harness around the project's own
+  `LLVMFuzzerTestOneInput`: it links the project sources directly, and no
+  `bhf_libfuzzer.c` shim (a second `LLVMFuzzerTestOneInput`) is written. The
+  `PORTABILITY.md` honggfuzz recipe builds `main.cpp` with `hfuzz-clang++` for
+  C++ harnesses, and passes `-DBHF_EXTERNAL_DRIVER` for the shim builds.
 - `bhf auto` seeds are byte-exact. Mined seeds, `--seed-file`, `--seed-dir` and
   corpus entries reseeded into later passes or the AFL++ stage used to pass
   through a UTF-8 conversion that replaced every invalid byte with `EF BF BD`,
@@ -328,6 +384,12 @@
   both forms.
 
 ### Added
+- docs/site/custom-harness.md: writing an `LLVMFuzzerTestOneInput` entry
+  point and wrapping it with `generate-harness`, editing a generated
+  `bhf_run_one`, building with `AUTO_EXTRA_SOURCES`/`AUTO_EXTRA_INCLUDES`/
+  `CXX_STD`, fuzzing from byte-exact `--seed-file` seeds, triage, the
+  binary-only route, and what to avoid. The C/C++ and CLI pages now generate
+  manual harnesses into `<work>/harnesses/`.
 - `auto/seeds.json` lists every seed a `bhf auto` run used (path, source
   `user`/`mined`, size, bytes used, sha256), and `run.json` gains an additive
   `seeds` summary that points to it. `-v` prints the list. A run that stops

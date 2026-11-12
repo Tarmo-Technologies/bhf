@@ -2367,6 +2367,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/custom_harness_flow.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/differential_cli.rs",
       "license": "Apache-2.0"
     },
@@ -4440,6 +4444,10 @@
     },
     {
       "path": "docs/site/csharp.md",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "docs/site/custom-harness.md",
       "license": "Apache-2.0"
     },
     {

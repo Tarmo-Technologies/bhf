@@ -163,6 +163,7 @@ fn write_ada_portability_artifacts(
             libfuzzer_binary: None,
             afl_binary: None,
             crash_on_finding_env: true,
+            passthrough_entrypoint: false,
         },
     )?;
     Ok(())

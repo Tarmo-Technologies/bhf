@@ -314,9 +314,16 @@ pub struct AutoArgs {
     #[arg(long)]
     pub list_fakes: bool,
 
-    /// Attempt only targets whose discovered name exactly matches this value.
-    /// Repeatable. Useful when a source drop contains vendored support code
-    /// but the sweep should exercise a known wrapper target.
+    /// Attempt only targets this name selects: the full discovered name (as
+    /// --list-targets prints it), the bare function name, or a trailing
+    /// qualified suffix such as `Class::method`, each optionally with its
+    /// parameter list. An exact spelling wins: the suffix match applies only
+    /// when no target has exactly this name, and a leading `::` names the
+    /// global namespace only. Repeatable. Useful when a source drop contains
+    /// vendored support code but the sweep should exercise a known wrapper
+    /// target. A project fuzz driver (`LLVMFuzzerTestOneInput`) is skipped when
+    /// the tree has other targets, unless this option, --target-file, or
+    /// --harness-id selects it.
     #[arg(long = "target")]
     pub targets: Vec<String>,
 
@@ -1278,6 +1285,10 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     {
         bhfeprintln!("warning: could not checkpoint discovery-cache decision: {error}");
     }
+    // Discovery keeps project fuzz drivers (`LLVMFuzzerTestOneInput`) beside the
+    // library targets that shadow them; whether they stay is decided after the
+    // explicit selection filters below.
+    let library_targets_present = crate::auto::discovery::has_library_target(&candidates);
     if !args.exclude_paths.is_empty() || !args.exclude.is_empty() {
         candidates.retain(|candidate| {
             !path_matches_exclusion(
@@ -1289,13 +1300,13 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         });
     }
     if !args.targets.is_empty() {
-        candidates.retain(|candidate| {
-            let case_insensitive =
-                matches!(candidate.lang, Lang::Ada | Lang::Fortran | Lang::Cobol);
-            args.targets.iter().any(|selected| {
-                target_name_filter_matches(&candidate.name, selected, case_insensitive)
-            })
-        });
+        let unfiltered_names: Vec<String> = candidates.iter().map(|c| c.name.clone()).collect();
+        let selected_any = retain_selected_targets(&mut candidates, &args.targets);
+        for (selected, matched) in args.targets.iter().zip(&selected_any) {
+            if !matched {
+                bhfeprintln!("{}", unmatched_target_note(selected, &unfiltered_names));
+            }
+        }
     }
     if !args.harness_ids.is_empty() {
         let selected: std::collections::HashSet<&str> =
@@ -1315,6 +1326,18 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
                 .unwrap_or_else(|_| candidate.source_path.clone());
             selected.contains(&candidate_path)
         });
+    }
+    // A fuzz driver that survived an explicit --target/--harness-id/--target-file
+    // selection was asked for by name and is kept (it is harnessed as a
+    // passthrough). Without an explicit selection, library targets shadow the
+    // drivers: say what was left out and how to pick one.
+    let explicit_selection =
+        !args.targets.is_empty() || !args.harness_ids.is_empty() || !args.target_files.is_empty();
+    if library_targets_present && !explicit_selection {
+        let ignored = crate::auto::discovery::drop_shadowed_fuzz_drivers(&mut candidates);
+        if let Some(note) = ignored_fuzz_drivers_note(&ignored, &path) {
+            bhfeprintln!("{note}");
+        }
     }
     // Language filter (`--languages`): keep only the requested source-language
     // lanes. Applied AFTER discovery (which is language-agnostic, so one
@@ -3042,7 +3065,7 @@ fn discover_or_reuse(
     // the source tree is unchanged; `--resume` only skips completed targets then.)
     if !cache_enabled {
         return Ok((
-            crate::auto::discovery::discover_with_options(path, dir_filter, preprocess)?,
+            crate::auto::discovery::discover_with_fuzz_drivers(path, dir_filter, preprocess)?,
             false,
             // `--no-discovery-cache` keeps no source identity, so `--resume`
             // stays conservative and re-attempts, exactly as before.
@@ -3050,7 +3073,7 @@ fn discover_or_reuse(
         ));
     }
 
-    use crate::auto::discovery::discover_with_options;
+    use crate::auto::discovery::discover_with_fuzz_drivers;
     use crate::auto::discovery_cache::{self, DiscoveryCache};
 
     // `--discovery-cache <path>` overrides the default `<work>/discovery-cache.json`.
@@ -3121,7 +3144,7 @@ fn discover_or_reuse(
         );
     }
     let _td = std::time::Instant::now();
-    let candidates = discover_with_options(path, dir_filter, preprocess)?;
+    let candidates = discover_with_fuzz_drivers(path, dir_filter, preprocess)?;
     crate::auto::discovery::bhfprof("auto:discover", _td);
     let _tc = std::time::Instant::now();
     // Persist the freshly ranked list for a later --reuse-discovery run. The cache
@@ -4415,6 +4438,106 @@ fn render_selected_langs(selectors: &[crate::auto::candidate::LangSelector]) -> 
         .join(", ")
 }
 
+/// The console note for a `--target` that selected nothing: the closest
+/// discovered names, and the spellings `--target` accepts.
+fn unmatched_target_note(selected: &str, discovered: &[String]) -> String {
+    let closest = crate::target_filter::closest_matches(selected, discovered, |n| n, 5);
+    let mut note = format!("  --target '{selected}' matched no discovered target");
+    if !closest.is_empty() {
+        let listed: Vec<&str> = closest.iter().map(|name| name.as_str()).collect();
+        note.push_str(&format!("; closest: {}", listed.join(", ")));
+    }
+    note.push_str(
+        " (accepted: the bare name, a qualified suffix such as `Class::method`, or the full \
+         name from --list-targets, optionally with its parameter list)",
+    );
+    note
+}
+
+/// The console note for project fuzz drivers that library targets shadowed.
+fn ignored_fuzz_drivers_note(
+    ignored: &[crate::auto::candidate::Candidate],
+    root: &Path,
+) -> Option<String> {
+    if ignored.is_empty() {
+        return None;
+    }
+    let mut files: Vec<String> = ignored
+        .iter()
+        .map(|c| {
+            c.source_path
+                .strip_prefix(root)
+                .unwrap_or(&c.source_path)
+                .display()
+                .to_string()
+        })
+        .collect();
+    files.sort();
+    files.dedup();
+    let shown = files.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+    let more = if files.len() > 3 {
+        format!(" and {} more", files.len() - 3)
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "  note: ignored {} project fuzz driver(s) (LLVMFuzzerTestOneInput in {shown}{more}); \
+         select one with --target LLVMFuzzerTestOneInput or --target-file <file>, or run auto \
+         on the driver's directory",
+        ignored.len()
+    ))
+}
+
+/// Keep the candidates that a `--target` value selects; returns, per value,
+/// whether it selected anything.
+///
+/// Each value is matched exactly first (the full name, the name without its
+/// parameter list, or the bare name). Only a value that matches no candidate
+/// exactly falls back to a trailing qualified suffix, the same precedence as
+/// `generate-harness --target`: `Codec::decode` keeps a global
+/// `Codec::decode` alone even when `widgets::Codec::decode` also exists.
+fn retain_selected_targets(
+    candidates: &mut Vec<crate::auto::candidate::Candidate>,
+    targets: &[String],
+) -> Vec<bool> {
+    let case_insensitive = |candidate: &crate::auto::candidate::Candidate| {
+        matches!(candidate.lang, Lang::Ada | Lang::Fortran | Lang::Cobol)
+    };
+    let exact_hit: Vec<bool> = targets
+        .iter()
+        .map(|selected| {
+            candidates.iter().any(|candidate| {
+                target_name_filter_matches(&candidate.name, selected, case_insensitive(candidate))
+            })
+        })
+        .collect();
+    let mut selected_any = vec![false; targets.len()];
+    candidates.retain(|candidate| {
+        let case_insensitive = case_insensitive(candidate);
+        let mut keep = false;
+        for (index, selected) in targets.iter().enumerate() {
+            let hit = if exact_hit[index] {
+                target_name_filter_matches(&candidate.name, selected, case_insensitive)
+            } else {
+                crate::target_filter::qualified_suffix_matches(
+                    &candidate.name,
+                    selected,
+                    case_insensitive,
+                )
+            };
+            if hit {
+                selected_any[index] = true;
+                keep = true;
+            }
+        }
+        keep
+    });
+    selected_any
+}
+
+/// Whether `selected` spells `candidate_name` exactly: the full discovered name,
+/// the name without its parameter list, the bare (unqualified) name, or the full
+/// name with a whitespace-insensitive parameter list or a leading global `::`.
 fn target_name_filter_matches(
     candidate_name: &str,
     selected: &str,
@@ -4445,7 +4568,10 @@ fn target_name_filter_matches(
     let colon_leaf = base.rfind("::").map(|index| index + 2);
     let dot_leaf = base.rfind('.').map(|index| index + 1);
     let leaf_start = colon_leaf.into_iter().chain(dot_leaf).max().unwrap_or(0);
-    equal(&base[leaf_start..], selected)
+    if equal(&base[leaf_start..], selected) {
+        return true;
+    }
+    crate::target_filter::qualified_exact_matches(candidate_name, selected, case_insensitive)
 }
 
 fn sort_attacking_candidates(
@@ -4929,6 +5055,9 @@ fn build_error_brief(err: &build_classifier::BuildErrorKind) -> String {
             line,
             message,
         } => format!("build-config #error at {file}:{line}: {message}"),
+        ExtraQualification { file, line, member } => {
+            format!("extra class qualification on member '{member}' at {file}:{line}")
+        }
         Other { tail } => {
             // The tail is the last few lines of build output. GNAT prints
             // warnings before the fatal error, so the first tail line is often
@@ -6053,6 +6182,82 @@ mod tests {
             "Reset",
             false,
         ));
+    }
+
+    #[test]
+    fn target_name_filter_accepts_qualified_suffixes() {
+        let name = "widgets::Codec::decode(const unsigned char *, size_t)";
+        let mut candidates = vec![candidate("/p/src/b.cpp", 3, "H-X0002")];
+        candidates[0].lang = Lang::Cpp;
+        candidates[0].name = name.to_owned();
+        let mut ada = candidate("/p/src/pkg.adb", 9, "H-A0001");
+        ada.lang = Lang::Ada;
+        ada.name = "Root.Pkg.Op".to_owned();
+        candidates.push(ada);
+        let selects = |selected: &str| {
+            let mut kept = candidates.clone();
+            retain_selected_targets(&mut kept, &[selected.to_owned()]);
+            kept.into_iter().map(|c| c.harness_id).collect::<Vec<_>>()
+        };
+        assert_eq!(selects("Codec::decode"), ["H-X0002"]);
+        assert_eq!(
+            selects("Codec::decode(const unsigned char *, size_t)"),
+            ["H-X0002"]
+        );
+        assert!(selects("odec::decode").is_empty());
+        assert!(selects("Codec::decode(int)").is_empty());
+        assert_eq!(selects("pkg.op"), ["H-A0001"]);
+    }
+
+    #[test]
+    fn target_filter_prefers_an_exact_spelling_over_a_suffix() {
+        let tree = || {
+            let mut global = candidate("/p/src/a.cpp", 3, "H-X0001");
+            global.lang = Lang::Cpp;
+            global.name = "Codec::decode(const unsigned char *, size_t)".to_owned();
+            let mut namespaced = candidate("/p/src/b.cpp", 3, "H-X0002");
+            namespaced.lang = Lang::Cpp;
+            namespaced.name = "widgets::Codec::decode(const unsigned char *, size_t)".to_owned();
+            let mut other = candidate("/p/src/c.cpp", 7, "H-X0003");
+            other.lang = Lang::Cpp;
+            other.name = "gadgets::Table::store(int)".to_owned();
+            vec![global, namespaced, other]
+        };
+        let kept = |selectors: &[&str]| {
+            let mut candidates = tree();
+            let selectors: Vec<String> = selectors.iter().map(|s| (*s).to_owned()).collect();
+            let matched = retain_selected_targets(&mut candidates, &selectors);
+            let ids: Vec<String> = candidates.into_iter().map(|c| c.harness_id).collect();
+            (ids, matched)
+        };
+        // The global class's spelling selects only it, not every `*::Codec::decode`.
+        assert_eq!(
+            kept(&["Codec::decode"]),
+            (vec!["H-X0001".to_owned()], vec![true])
+        );
+        assert_eq!(
+            kept(&["Codec::decode(const unsigned char*, size_t)"]).0,
+            vec!["H-X0001".to_owned()]
+        );
+        // A leading `::` names the global namespace only.
+        assert_eq!(kept(&["::Codec::decode"]).0, vec!["H-X0001".to_owned()]);
+        // The fully qualified spelling selects only the namespaced class.
+        assert_eq!(
+            kept(&["widgets::Codec::decode"]).0,
+            vec!["H-X0002".to_owned()]
+        );
+        // A selector with no exact match still selects by suffix.
+        assert_eq!(kept(&["Table::store"]).0, vec!["H-X0003".to_owned()]);
+        // Each selector gets its own precedence; a miss is reported per selector.
+        assert_eq!(
+            kept(&["Codec::decode", "Table::store", "Codec::encode"]),
+            (
+                vec!["H-X0001".to_owned(), "H-X0003".to_owned()],
+                vec![true, true, false]
+            )
+        );
+        // The bare name still keeps every definition with that leaf.
+        assert_eq!(kept(&["decode"]).0.len(), 2);
     }
 
     #[test]

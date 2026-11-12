@@ -41,6 +41,7 @@ fn docs_site_sources_cover_m19_topics() {
         ("c-cpp", "C and C++ Fuzzing"),
         ("cross-compilation", "cross-compilation"),
         ("daemon", "JSON-RPC daemon"),
+        ("custom-harness", "Custom C and C++ Harnesses"),
     ];
 
     for (slug, required_text) in required_pages {
@@ -106,6 +107,7 @@ fn docs_site_generator_emits_html_pages_and_metadata() {
     assert!(index.contains("href=\"licensing/\""));
     assert!(index.contains("href=\"cli/\""));
     assert!(index.contains("href=\"c-cpp/\""));
+    assert!(index.contains("href=\"custom-harness/\""));
     assert!(index.contains("href=\"cross-compilation/\""));
     assert!(index.contains("href=\"daemon/\""));
 
@@ -114,6 +116,24 @@ fn docs_site_generator_emits_html_pages_and_metadata() {
 
     let c_cpp = read(output_dir.join("c-cpp/index.html"));
     assert!(c_cpp.contains("Supported C++ Parameter Shapes"));
+    assert!(c_cpp.contains("href=\"../custom-harness/\""));
+
+    let custom = read(output_dir.join("custom-harness/index.html"));
+    for expected in [
+        "LLVMFuzzerTestOneInput",
+        "--output bhf_work/harnesses",
+        "AUTO_EXTRA_SOURCES",
+        "AUTO_EXTRA_INCLUDES",
+        "CXX_STD",
+        "--seed-file",
+        "bhf_run_one",
+        "bhf binary fuzz",
+    ] {
+        assert!(
+            custom.contains(expected),
+            "custom-harness page should cover {expected:?}"
+        );
+    }
 
     assert!(output_dir.join("CNAME").is_file());
     assert_eq!(

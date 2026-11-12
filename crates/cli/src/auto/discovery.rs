@@ -727,6 +727,50 @@ pub fn discover_with_options(
     filter: &DirFilter,
     preprocess: PreprocessMode,
 ) -> Result<Vec<Candidate>> {
+    let mut candidates = discover_with_fuzz_drivers(root, filter, preprocess)?;
+    drop_shadowed_fuzz_drivers(&mut candidates);
+    Ok(candidates)
+}
+
+/// Whether discovery found anything other than a project fuzz driver
+/// (`LLVMFuzzerTestOneInput`). When it did, the drivers are shadowed: they are
+/// harness glue, not library targets, and are dropped unless an explicit
+/// selection names them.
+pub fn has_library_target(candidates: &[Candidate]) -> bool {
+    candidates
+        .iter()
+        .any(|c| !is_libfuzzer_test_one_input(&c.name))
+}
+
+/// Whether `candidate` is a project fuzz driver (`LLVMFuzzerTestOneInput`).
+pub fn is_fuzz_driver(candidate: &Candidate) -> bool {
+    is_libfuzzer_test_one_input(&candidate.name)
+}
+
+/// Remove project fuzz drivers when the tree also has library targets and
+/// return them. A tree whose only candidate is a driver keeps it as the
+/// passthrough target.
+pub fn drop_shadowed_fuzz_drivers(candidates: &mut Vec<Candidate>) -> Vec<Candidate> {
+    if !has_library_target(candidates) {
+        return Vec::new();
+    }
+    let (drivers, rest) = std::mem::take(candidates)
+        .into_iter()
+        .partition(is_fuzz_driver);
+    *candidates = rest;
+    drivers
+}
+
+/// As [`discover_with_options`], but project fuzz drivers stay in the result
+/// even when library targets exist, so `auto` can keep one an explicit
+/// `--target`/`--target-file`/`--harness-id` names and report the rest. The
+/// drivers never take part in the call-graph rerank; they are ranked among the
+/// other candidates by their own score.
+pub fn discover_with_fuzz_drivers(
+    root: &Path,
+    filter: &DirFilter,
+    preprocess: PreprocessMode,
+) -> Result<Vec<Candidate>> {
     // Parsing is recursive over the syntax tree, and real source contains
     // expressions deep enough to exhaust the 8 MiB a main thread gets: vllm's
     // `csrc/cpu/cpu_types_arm.hpp` aborted the whole run with "fatal runtime
@@ -893,19 +937,27 @@ fn discover_on_this_stack(
             || (matches!(c.lang, Lang::C | Lang::Cpp) && bare_name(&c.name) == "main");
         !drop_always
     });
-    // `LLVMFuzzerTestOneInput` is a fuzz DRIVER, not a library target. Drop it when
-    // the tree ALSO has a real target — so a project's own harness can't out-rank its
-    // parser (libconfig's `fuzz/` harness was ranked #1 over `__config_read`), and a
-    // re-run over a directory of prior bhf output never targets itself. But when
-    // it is the SOLE fuzzable candidate, the tree IS a project-supplied single-file
-    // libFuzzer target: keep it as the PASSTHROUGH target (#408/#410) rather than
+    // `LLVMFuzzerTestOneInput` is a fuzz DRIVER, not a library target. Set it aside
+    // when the tree ALSO has a real target — so a project's own harness can't
+    // out-rank its parser (libconfig's `fuzz/` harness was ranked #1 over
+    // `__config_read`), and a re-run over a directory of prior bhf output never
+    // targets itself. The caller drops the set-aside drivers unless an explicit
+    // selection names one ([`drop_shadowed_fuzz_drivers`]). When a driver is the
+    // SOLE fuzzable candidate, the tree IS a project-supplied single-file libFuzzer
+    // target: keep it as the PASSTHROUGH target (#408/#410) rather than
     // discovering nothing.
-    if out.iter().any(|c| !is_libfuzzer_test_one_input(&c.name)) {
-        out.retain(|c| !is_libfuzzer_test_one_input(&c.name));
-    }
+    let shadowed_drivers = if has_library_target(&out) {
+        let (drivers, rest): (Vec<Candidate>, Vec<Candidate>) =
+            out.into_iter().partition(is_fuzz_driver);
+        out = rest;
+        drivers
+    } else {
+        Vec::new()
+    };
     dedup_amalgamated_single_header(&mut out);
     dedup_ada_spec_body_candidates(&mut out);
     apply_entrypoint_callgraph(&mut out);
+    out.extend(shadowed_drivers);
     out.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.name.cmp(&b.name)));
     Ok(out)
 }
@@ -4468,6 +4520,50 @@ mod tests {
         assert_eq!(
             cands[0].name, "cfg_parse",
             "real library parser ranks #1 once the harness is dropped: {cands:?}"
+        );
+    }
+
+    #[test]
+    fn shadowed_fuzz_drivers_are_kept_aside_for_explicit_selection() {
+        // A library plus the project's own driver in a non-`fuzz/` directory:
+        // the plain discovery API still drops the driver, while the driver-keeping
+        // API returns it so an explicit `auto --target` can select it.
+        let root = tmpdir();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("harness")).unwrap();
+        fs::write(
+            root.join("src/codec.c"),
+            "int parse_record(const unsigned char *data, unsigned long size) {\n\
+             \x20  return size ? data[0] : 0;\n\
+             }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("harness/drive.c"),
+            "int parse_record(const unsigned char *data, unsigned long size);\n\
+             int LLVMFuzzerTestOneInput(const unsigned char *data, unsigned long size) {\n\
+             \x20  return parse_record(data, size);\n\
+             }\n",
+        )
+        .unwrap();
+        let has = |cs: &[Candidate], n: &str| cs.iter().any(|c| c.name == n);
+        let plain = discover(&root).unwrap();
+        assert!(has(&plain, "parse_record"), "{plain:?}");
+        assert!(!has(&plain, "LLVMFuzzerTestOneInput"), "{plain:?}");
+
+        let mut kept =
+            discover_with_fuzz_drivers(&root, &DirFilter::default(), PreprocessMode::Auto).unwrap();
+        assert!(has(&kept, "parse_record"), "{kept:?}");
+        assert!(has(&kept, "LLVMFuzzerTestOneInput"), "{kept:?}");
+        assert!(has_library_target(&kept));
+        let dropped = drop_shadowed_fuzz_drivers(&mut kept);
+        assert_eq!(dropped.len(), 1, "{dropped:?}");
+        assert!(dropped[0].source_path.ends_with("harness/drive.c"));
+        assert!(!has(&kept, "LLVMFuzzerTestOneInput"));
+        // The library ranking is unaffected by the set-aside driver.
+        assert_eq!(
+            kept.iter().map(|c| (&c.name, c.score)).collect::<Vec<_>>(),
+            plain.iter().map(|c| (&c.name, c.score)).collect::<Vec<_>>()
         );
     }
 

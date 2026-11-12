@@ -816,6 +816,7 @@ fn build_error_shape(error: &Value) -> String {
         "uncompilable_ada_body" => "source=<FILE>".to_owned(),
         "missing_gpr_import" => "project=<GPR_FILE>".to_owned(),
         "malformed_function_decl" => "declarator at <FILE>:<LINE>".to_owned(),
+        "extra_qualification" => "member=<MEMBER> at <FILE>:<LINE>".to_owned(),
         "other" => error
             .get("tail")
             .and_then(Value::as_str)
@@ -1747,6 +1748,20 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn extra_qualification_errors_have_a_path_free_shape() {
+        let error = serde_json::to_value(build_classifier::BuildErrorKind::ExtraQualification {
+            file: "/home/someone/src/widget.h".to_owned(),
+            line: 136,
+            member: "name".to_owned(),
+        })
+        .unwrap();
+        assert_eq!(
+            build_error_shape(&error),
+            "member=<MEMBER> at <FILE>:<LINE>"
+        );
+    }
 
     fn temp_dir(label: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(

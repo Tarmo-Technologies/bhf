@@ -150,7 +150,10 @@ fn prepend_process_path(key: &str, prefixes: &[PathBuf]) {
 
 #[derive(Debug, Clone, clap::Args, PartialEq)]
 pub struct BuildArgs {
-    /// Path to bhf_work directory containing src_instrumented and harnesses/generated_harnesses.
+    /// Path to the bhf_work directory: the parent of `harnesses/` or
+    /// `generated_harnesses/` (and of `src_instrumented/` for Ada). A C/C++
+    /// harness directory (`<work>/harnesses/<id>`) or `<work>/harnesses` itself
+    /// is also accepted and mapped onto its work directory.
     pub work_dir: PathBuf,
 
     /// Governing Ada project whose evaluated build semantics the generated
@@ -158,7 +161,8 @@ pub struct BuildArgs {
     #[arg(long)]
     pub source_project: Option<PathBuf>,
 
-    /// Harness id to build. Defaults to the only harness present (errors if multiple).
+    /// Harness id to build. Defaults to the only harness present; with several,
+    /// the error lists their ids.
     #[arg(long)]
     pub harness: Option<String>,
 
@@ -697,15 +701,33 @@ fn normalize_path_lexical(path: &Path) -> PathBuf {
 /// the harness's Makefile directly. Returns `Some(exit_code)` when the
 /// build was dispatched; `None` to fall through to the Ada path.
 fn try_run_c_make_build(args: &BuildArgs) -> Option<i32> {
-    let work_dir = absolutize(&args.work_dir).ok()?;
-    let (harness_id, harness_dir) = select_harness(&work_dir, args.harness.as_deref()).ok()?;
-    let makefile = harness_dir.join("Makefile");
-    if !makefile.is_file() {
+    let requested_dir = absolutize(&args.work_dir).ok()?;
+    let (work_dir, requested_harness) =
+        match resolve_c_family_work_dir(&requested_dir, args.harness.as_deref()) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                bhfeprintln!("{error}");
+                return Some(3);
+            }
+        };
+    if !work_dir.is_dir() {
         return None;
     }
-    let main_c = harness_dir.join("main.c");
-    let main_cpp = harness_dir.join("main.cpp");
-    if !main_c.is_file() && !main_cpp.is_file() {
+    let (harness_id, harness_dir) = match select_harness(&work_dir, requested_harness.as_deref()) {
+        Ok(selected) => selected,
+        Err(error) => {
+            // An Ada work dir reports through `prepare_layout`. Anything else —
+            // a C/C++ harness root, or no `src_instrumented` at all — gets the
+            // lookup error itself rather than a misleading Ada layout complaint.
+            if work_dir.join("src_instrumented").is_dir() && !has_c_family_harness(&work_dir) {
+                return None;
+            }
+            bhfeprintln!("{error}");
+            bhfeprintln!("{C_FAMILY_BUILD_LAYOUT_HINT}");
+            return Some(3);
+        }
+    };
+    if !is_c_family_harness_dir(&harness_dir) {
         return None;
     }
 
@@ -734,13 +756,18 @@ fn try_run_c_make_build(args: &BuildArgs) -> Option<i32> {
     let force_includes = repair_force_includes(&harness_dir);
     apply_c_family_make_env(&mut cmd, &[], &[], &force_includes, None);
     // Bounded and process-grouped: an unbounded `status()` here let one spinning
-    // compile consume a whole campaign and outlive bhf entirely.
-    let status = crate::command_output::status_with_timeout(
+    // compile consume a whole campaign and outlive bhf entirely. The output is
+    // shown as it arrives and also kept, so a failed build can be explained.
+    let output = crate::command_output::output_with_timeout_teed(
         &mut cmd,
         std::time::Duration::from_secs(30 * 60),
     );
-    match status {
-        Ok(s) if s.success() => {
+    match output {
+        Ok((_, true)) => {
+            bhfeprintln!("invoke make: timed out");
+            Some(2)
+        }
+        Ok((out, false)) if out.status.success() => {
             let built = harness_dir.join(built_name);
             if built.is_file() {
                 let dest = build_dir.join(staged_name);
@@ -762,8 +789,19 @@ fn try_run_c_make_build(args: &BuildArgs) -> Option<i32> {
             }
             Some(0)
         }
-        Ok(s) => {
-            bhfeprintln!("make exited with status {:?}", s.code());
+        Ok((out, false)) => {
+            bhfeprintln!("make exited with status {:?}", out.status.code());
+            let text = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let inherited = RebuildEnv::inherited();
+            for line in
+                c_build_failure_hints(&work_dir, &harness_id, &harness_dir, &text, &inherited)
+            {
+                bhfeprintln!("{line}");
+            }
             Some(1)
         }
         Err(error) => {
@@ -771,6 +809,615 @@ fn try_run_c_make_build(args: &BuildArgs) -> Option<i32> {
             Some(2)
         }
     }
+}
+
+const C_FAMILY_BUILD_LAYOUT_HINT: &str = "hint: bhf build takes the work directory that holds \
+     the harness as harnesses/<id>/ or generated_harnesses/<id>/ (generate it with \
+     `bhf generate-harness <source> --target <name> --output <work>/harnesses`), then run \
+     `bhf build <work> --harness <id>`";
+
+/// Whether `dir` is a generated C/C++ harness directory (a Makefile beside
+/// `main.c` or `main.cpp`).
+fn is_c_family_harness_dir(dir: &Path) -> bool {
+    dir.join("Makefile").is_file()
+        && (dir.join("main.c").is_file() || dir.join("main.cpp").is_file())
+}
+
+/// Whether `root` directly holds at least one C/C++ harness directory.
+fn root_holds_c_family_harness(root: &Path) -> bool {
+    fs::read_dir(root).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|entry| entry.path().is_dir() && is_c_family_harness_dir(&entry.path()))
+    })
+}
+
+/// Whether either harness root of `work_dir` holds a C/C++ harness.
+fn has_c_family_harness(work_dir: &Path) -> bool {
+    harness_roots(work_dir)
+        .iter()
+        .any(|root| root_holds_c_family_harness(root))
+}
+
+fn is_harness_root_name(dir: &Path) -> bool {
+    dir.file_name().is_some_and(|name| {
+        name == crate::auto::layout::HARNESSES_DIR
+            || name == crate::auto::layout::GENERATED_HARNESSES_DIR
+    })
+}
+
+/// Map the directory given to `bhf build` onto the work directory and harness
+/// id. Besides a work directory, it accepts a C/C++ harness directory itself
+/// (`<work>/harnesses/<id>`) and a harness root (`<work>/harnesses`, which is
+/// what `generate-harness --output` names), printing the equivalent canonical
+/// invocation. A harness directory that is not inside a work layout is an
+/// error naming the layout `bhf build` expects.
+fn resolve_c_family_work_dir(
+    dir: &Path,
+    harness: Option<&str>,
+) -> Result<(PathBuf, Option<String>), String> {
+    let unchanged = || Ok((dir.to_path_buf(), harness.map(str::to_owned)));
+    if !dir.is_dir() || dir.join("src_instrumented").is_dir() {
+        return unchanged();
+    }
+    if is_c_family_harness_dir(dir) {
+        let id = dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if let Some(requested) = harness.filter(|requested| *requested != id) {
+            return Err(format!(
+                "{} is the harness directory of '{id}', but --harness asks for '{requested}'; \
+                 pass the work directory instead",
+                dir.display()
+            ));
+        }
+        let work = dir
+            .parent()
+            .filter(|root| is_harness_root_name(root))
+            .and_then(Path::parent);
+        let Some(work) = work else {
+            return Err(format!(
+                "{} is a harness directory, but bhf build expects the work directory that \
+                 holds it as harnesses/<id>/ (or generated_harnesses/<id>/); generate it there \
+                 with `bhf generate-harness ... --output <work>/harnesses`, then run \
+                 `bhf build <work> --harness {id}`",
+                dir.display()
+            ));
+        };
+        bhfeprintln!(
+            "note: {} is a harness directory; building it as `bhf build {} --harness {id}`",
+            dir.display(),
+            work.display()
+        );
+        return Ok((work.to_path_buf(), Some(id)));
+    }
+    if is_harness_root_name(dir)
+        && root_holds_c_family_harness(dir)
+        && !harness_roots(dir).iter().any(|root| root.is_dir())
+    {
+        if let Some(work) = dir.parent() {
+            bhfeprintln!(
+                "note: {} holds harness directories; using its parent {} as the work directory",
+                dir.display(),
+                work.display()
+            );
+            return Ok((work.to_path_buf(), harness.map(str::to_owned)));
+        }
+    }
+    unchanged()
+}
+
+/// The symbols a failed link reported as undefined, in first-seen order:
+/// GNU ld (`undefined reference to `sym'`) and lld (`undefined symbol: sym`).
+fn undefined_symbols_in(output: &str) -> Vec<String> {
+    const MAX_SYMBOLS: usize = 64;
+    let mut symbols: Vec<String> = Vec::new();
+    for line in output.lines() {
+        let symbol = line
+            .split_once("undefined reference to `")
+            .and_then(|(_, rest)| rest.rsplit_once('\''))
+            .map(|(symbol, _)| symbol)
+            .or_else(|| {
+                line.split_once("undefined symbol: ")
+                    .map(|(_, rest)| rest.trim())
+            });
+        let Some(symbol) = symbol.map(str::trim).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        if !symbols.iter().any(|known| known == symbol) {
+            symbols.push(symbol.to_owned());
+            if symbols.len() == MAX_SYMBOLS {
+                break;
+            }
+        }
+    }
+    symbols
+}
+
+/// Split a Makefile recipe or an `AUTO_EXTRA_SOURCES` value into words,
+/// honouring the double/single quotes generated recipes put around paths with
+/// spaces.
+fn recipe_words(text: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    for ch in text.chars() {
+        match (quote, ch) {
+            (Some(open), c) if c == open => quote = None,
+            (Some(_), c) => current.push(c),
+            (None, '"' | '\'') => quote = Some(ch),
+            (None, c) if c.is_whitespace() => {
+                if !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                }
+            }
+            (None, c) => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
+/// The target sources the harness Makefile compiles into `main` (the operands
+/// after `main.c`/`main.cpp` on the `main:` recipe), and the first `-iquote`
+/// include directory, which is the target's own directory.
+fn makefile_target_context(harness_dir: &Path) -> (Vec<PathBuf>, Option<PathBuf>) {
+    let Ok(text) = fs::read_to_string(harness_dir.join("Makefile")) else {
+        return (Vec::new(), None);
+    };
+    let mut sources = Vec::new();
+    let mut target_dir = None;
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        if let Some(includes) = line.strip_prefix("INCLUDES = ") {
+            let words = recipe_words(includes);
+            target_dir = words
+                .iter()
+                .position(|word| word == "-iquote")
+                .and_then(|index| words.get(index + 1))
+                .map(PathBuf::from);
+        } else if line.starts_with("main:") {
+            let Some(recipe) = lines.next() else {
+                break;
+            };
+            let words = recipe_words(recipe);
+            if let Some(start) = words
+                .iter()
+                .position(|word| word == "main.c" || word == "main.cpp")
+            {
+                sources = words[start + 1..]
+                    .iter()
+                    .take_while(|word| !word.starts_with("$("))
+                    .map(PathBuf::from)
+                    .collect();
+            }
+        }
+    }
+    (sources, target_dir)
+}
+
+/// Where to look for the in-tree definitions of undefined symbols: the
+/// enclosing checkout when it is close by, the project directory around a
+/// conventional `src/`/`lib/` directory, or the target's own directory. A tree
+/// with too many sources to index quickly falls back to the target directory.
+fn definition_search_root(target_dir: &Path) -> PathBuf {
+    const MAX_ASCENT: usize = 3;
+    const MAX_INDEXED_SOURCES: usize = 5_000;
+    let mut candidate = None;
+    let mut current = Some(target_dir);
+    for _ in 0..=MAX_ASCENT {
+        let Some(dir) = current else {
+            break;
+        };
+        if dir.join(".git").exists() {
+            candidate = Some(dir.to_path_buf());
+            break;
+        }
+        current = dir.parent();
+    }
+    let candidate = candidate.unwrap_or_else(|| {
+        let conventional = target_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                matches!(
+                    name.to_ascii_lowercase().as_str(),
+                    "src" | "source" | "sources" | "lib" | "libs"
+                )
+            });
+        match target_dir.parent() {
+            Some(parent) if conventional => parent.to_path_buf(),
+            _ => target_dir.to_path_buf(),
+        }
+    });
+    if candidate != target_dir
+        && c_family_source_count(&candidate, MAX_INDEXED_SOURCES + 1) > MAX_INDEXED_SOURCES
+    {
+        return target_dir.to_path_buf();
+    }
+    candidate
+}
+
+/// The number of C/C++ sources under `root`, counting at most `cap`. Symbolic
+/// links are not followed, so a link cycle cannot keep the walk going.
+fn c_family_source_count(root: &Path, cap: usize) -> usize {
+    const MAX_DIRS: usize = 50_000;
+    let mut count = 0;
+    let mut visited_dirs = 0;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        visited_dirs += 1;
+        if visited_dirs > MAX_DIRS {
+            return cap;
+        }
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if file_type.is_dir() {
+                if !entry.file_name().to_string_lossy().starts_with('.') {
+                    stack.push(path);
+                }
+            } else if file_type.is_file()
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| {
+                        matches!(
+                            ext,
+                            "c" | "cc" | "cpp" | "cxx" | "C" | "h" | "hh" | "hpp" | "hxx"
+                        )
+                    })
+            {
+                count += 1;
+                if count >= cap {
+                    return count;
+                }
+            }
+        }
+    }
+    count
+}
+
+/// A path for a shell command line: single-quoted when it needs quoting.
+fn shell_word(path: &Path) -> String {
+    let text = path.display().to_string();
+    if text
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "/._-+:@%,=".contains(c))
+    {
+        text
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
+}
+
+/// The make variables an operator sets on `bhf build` to extend a harness
+/// build, in the order a suggested command spells them.
+const REBUILD_ENV_VARS: [&str; 5] = [
+    "AUTO_EXTRA_SOURCES",
+    "AUTO_EXTRA_INCLUDES",
+    "AUTO_EXTRA_LDFLAGS",
+    "CXX_STD",
+    "C_STD",
+];
+
+/// The build variables a suggested `bhf build` command sets. It starts from
+/// the operator's own values, so following one hint never drops another fix.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RebuildEnv {
+    vars: Vec<(&'static str, String)>,
+}
+
+impl RebuildEnv {
+    /// The values this `bhf build` was run with.
+    fn inherited() -> Self {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
+        let vars = REBUILD_ENV_VARS
+            .iter()
+            .filter_map(|name| {
+                let value = lookup(name)?;
+                let value = value.trim();
+                (!value.is_empty()).then(|| (*name, value.to_owned()))
+            })
+            .collect();
+        Self { vars }
+    }
+
+    fn get(&self, name: &str) -> Option<&str> {
+        self.vars
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// A copy with each of `phrases` (a flag with its operand, or a path)
+    /// appended to `name`, unless the value already holds it.
+    fn with(&self, name: &'static str, phrases: &[String]) -> Self {
+        let mut value = self.get(name).unwrap_or_default().to_owned();
+        for phrase in phrases {
+            let held: Vec<String> = recipe_words(&value);
+            let wanted: Vec<String> = recipe_words(phrase);
+            if wanted.is_empty() || held.windows(wanted.len()).any(|window| window == wanted) {
+                continue;
+            }
+            if !value.is_empty() {
+                value.push(' ');
+            }
+            value.push_str(phrase);
+        }
+        let mut next = self.clone();
+        next.vars.retain(|(key, _)| *key != name);
+        if !value.is_empty() {
+            next.vars.push((name, value));
+        }
+        next
+    }
+
+    /// `VAR=value ... <rebuild>`, with the variables in [`REBUILD_ENV_VARS`] order.
+    fn command(&self, rebuild: &str) -> String {
+        let mut parts: Vec<String> = REBUILD_ENV_VARS
+            .iter()
+            .filter_map(|name| {
+                self.get(name)
+                    .map(|value| format!("{name}={}", shell_text(value)))
+            })
+            .collect();
+        parts.push(rebuild.to_owned());
+        parts.join(" ")
+    }
+}
+
+/// `text` as one shell word: bare when it has no special characters, else
+/// single-quoted.
+fn shell_text(text: &str) -> String {
+    if !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-+:@%,=".contains(c))
+    {
+        text.to_owned()
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
+}
+
+/// What a failed C/C++ harness build was missing, with the exact command that
+/// adds it: in-tree sources that define the symbols the link could not
+/// resolve (`AUTO_EXTRA_SOURCES` or `--extra-source`), standard stream headers
+/// an old source never included (`AUTO_EXTRA_INCLUDES='-include iostream'`),
+/// system libraries (`AUTO_EXTRA_LDFLAGS`), and the MSVC-only extra member
+/// qualification. Every suggested command keeps the operator's own build
+/// variables (`inherited`); when several hints apply, a last line combines them.
+fn c_build_failure_hints(
+    work_dir: &Path,
+    harness_id: &str,
+    harness_dir: &Path,
+    output: &str,
+    inherited: &RebuildEnv,
+) -> Vec<String> {
+    let mut hints = Vec::new();
+    let rebuild = format!("bhf build {} --harness {harness_id}", shell_word(work_dir));
+    let classified = build_classifier::classify(output);
+    // Every suggestion, applied together.
+    let mut combined = inherited.clone();
+    let mut suggestions = 0usize;
+
+    // Standard stream headers a pre-standard source relied on getting
+    // transitively.
+    let mut stream_names: Vec<&str> = Vec::new();
+    let mut stream_headers: Vec<&str> = Vec::new();
+    for kind in &classified {
+        if let build_classifier::BuildErrorKind::MissingType { name } = kind {
+            if let Some(header) = build_classifier::std_stream_header(name) {
+                if !stream_names.contains(&name.as_str()) {
+                    stream_names.push(name);
+                }
+                if !stream_headers.contains(&header) {
+                    stream_headers.push(header);
+                }
+            }
+        }
+    }
+    if !stream_headers.is_empty() {
+        let includes: Vec<String> = stream_headers
+            .iter()
+            .map(|header| format!("-include {header}"))
+            .collect();
+        hints.push(format!(
+            "hint: the sources use {} without including <{}>; force-include it into every \
+             translation unit: {}",
+            stream_names.join(", "),
+            stream_headers.join(">, <"),
+            inherited
+                .with("AUTO_EXTRA_INCLUDES", &includes)
+                .command(&rebuild)
+        ));
+        combined = combined.with("AUTO_EXTRA_INCLUDES", &includes);
+        suggestions += 1;
+    }
+    let qualified: Vec<(&str, u32, &str)> = classified
+        .iter()
+        .filter_map(|kind| match kind {
+            build_classifier::BuildErrorKind::ExtraQualification { file, line, member } => {
+                Some((file.as_str(), *line, member.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    if let Some((file, line, member)) = qualified.first() {
+        // g++ tags the error with the flag that relaxes it; clang does not.
+        let (flag, other) = if output.contains("[-fpermissive]") {
+            ("-fpermissive", "with clang++, -fms-extensions")
+        } else {
+            ("-fms-extensions", "with g++, -fpermissive")
+        };
+        let more = match qualified.len() {
+            1 => String::new(),
+            n => format!(" (and {} more)", n - 1),
+        };
+        let flags = [flag.to_owned()];
+        hints.push(format!(
+            "hint: {file}:{line} declares member '{member}' with an extra class qualification{more} \
+             (`int Widget::{member}();` inside class Widget), which only MSVC accepts; remove the \
+             qualification, or relax the check: {} ({other})",
+            inherited
+                .with("AUTO_EXTRA_INCLUDES", &flags)
+                .command(&rebuild)
+        ));
+        combined = combined.with("AUTO_EXTRA_INCLUDES", &flags);
+        suggestions += 1;
+    }
+
+    'link: {
+        let undefined = undefined_symbols_in(output);
+        if undefined.is_empty() {
+            break 'link;
+        }
+        let (target_sources, include_dir) = makefile_target_context(harness_dir);
+        let mut linked: Vec<PathBuf> = target_sources.clone();
+        let inherited_sources: Vec<String> = inherited
+            .get("AUTO_EXTRA_SOURCES")
+            .map(recipe_words)
+            .unwrap_or_default();
+        linked.extend(inherited_sources.iter().map(PathBuf::from));
+        let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let linked: Vec<PathBuf> = linked.iter().map(|path| canonical(path)).collect();
+        let reference = target_sources.first().cloned();
+        let Some(target_dir) = reference
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .or(include_dir)
+        else {
+            break 'link;
+        };
+        let reference = reference.unwrap_or_else(|| target_dir.join("main.cpp"));
+        let root = definition_search_root(&target_dir);
+        let index = match crate::auto::decl_index::DeclarationIndex::build(&root) {
+            Ok(index) => index,
+            Err(_) => break 'link,
+        };
+        let work_canonical = canonical(work_dir);
+        let mut definers: Vec<(String, PathBuf)> = Vec::new();
+        let mut unresolved: Vec<String> = Vec::new();
+        let mut libraries: Vec<String> = Vec::new();
+        for symbol in &undefined {
+            let as_link_error = format!("undefined reference to `{symbol}'");
+            if let Some(build_classifier::BuildErrorKind::MissingSharedLib { name }) =
+                build_classifier::classify(&as_link_error)
+                    .into_iter()
+                    .next()
+            {
+                if !libraries.contains(&name) {
+                    libraries.push(name);
+                }
+                continue;
+            }
+            let definer = index
+                .lookup_definition_source_near(symbol, &reference)
+                .map(canonical)
+                .filter(|path| {
+                    !linked.contains(path)
+                        && !path.starts_with(&work_canonical)
+                        && !crate::generate_harness::source_defines_main(path)
+                });
+            match definer {
+                Some(path) => definers.push((symbol.clone(), path)),
+                None => unresolved.push(symbol.clone()),
+            }
+        }
+        if !definers.is_empty() {
+            let mut files: Vec<PathBuf> = Vec::new();
+            for (_, path) in &definers {
+                if !files.contains(path) {
+                    files.push(path.clone());
+                }
+            }
+            hints.push(format!(
+                "hint: the link failed on {} symbol(s) defined in source files this harness does \
+                 not compile:",
+                definers.len()
+            ));
+            for (symbol, path) in definers.iter().take(10) {
+                hints.push(format!("  {symbol}  (defined in {})", path.display()));
+            }
+            if definers.len() > 10 {
+                hints.push(format!("  ... and {} more", definers.len() - 10));
+            }
+            let needs_quoting = |text: &str| {
+                text.chars()
+                    .any(|c| c.is_whitespace() || c == '"' || c == '\'')
+            };
+            // make splits AUTO_EXTRA_SOURCES on whitespace, so a path that needs
+            // quoting cannot travel through it.
+            let env_safe = !files
+                .iter()
+                .any(|path| needs_quoting(&path.display().to_string()))
+                && !inherited_sources.iter().any(|word| needs_quoting(word));
+            if env_safe {
+                let added: Vec<String> = files
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect();
+                hints.push(format!(
+                    "  link them without regenerating: {}",
+                    inherited
+                        .with("AUTO_EXTRA_SOURCES", &added)
+                        .command(&rebuild)
+                ));
+                combined = combined.with("AUTO_EXTRA_SOURCES", &added);
+                suggestions += 1;
+            }
+            let flags: Vec<String> = files
+                .iter()
+                .map(|path| format!("--extra-source {}", shell_word(path)))
+                .collect();
+            hints.push(format!(
+                "  or regenerate the harness with them: add {} to the bhf generate-harness command",
+                flags.join(" ")
+            ));
+        }
+        if !libraries.is_empty() {
+            let flags: Vec<String> = libraries.iter().map(|lib| format!("-l{lib}")).collect();
+            hints.push(format!(
+                "hint: link the system libraries: {}",
+                inherited
+                    .with("AUTO_EXTRA_LDFLAGS", &flags)
+                    .command(&rebuild)
+            ));
+            combined = combined.with("AUTO_EXTRA_LDFLAGS", &flags);
+            suggestions += 1;
+        }
+        if !unresolved.is_empty() {
+            let shown: Vec<&str> = unresolved.iter().take(10).map(String::as_str).collect();
+            hints.push(format!(
+                "hint: no in-tree definition found under {} for: {}{}; link the library that \
+                 provides them (AUTO_EXTRA_LDFLAGS='-L<dir> -l<name>') or add the source with \
+                 --extra-source",
+                root.display(),
+                shown.join(", "),
+                if unresolved.len() > 10 { ", ..." } else { "" }
+            ));
+        }
+    }
+    if suggestions > 1 {
+        hints.push(format!(
+            "hint: every suggestion above at once: {}",
+            combined.command(&rebuild)
+        ));
+    }
+    hints
 }
 
 /// Core of the auto C/C++ make build, parameterized on the make target. With
@@ -1438,13 +2085,19 @@ fn select_harness(work_dir: &Path, requested: Option<&str>) -> Result<(String, P
                 return Ok((harness_id.to_owned(), harness_dir));
             }
         }
+        let available = harness_ids_under(work_dir);
         return Err(format!(
-            "work dir malformed: harness '{}' not found under {} or {}",
+            "work dir malformed: harness '{}' not found under {} or {}{}",
             harness_id,
             work_dir
                 .join(crate::auto::layout::GENERATED_HARNESSES_DIR)
                 .display(),
-            crate::auto::layout::harness_root(work_dir).display()
+            crate::auto::layout::harness_root(work_dir).display(),
+            if available.is_empty() {
+                String::new()
+            } else {
+                format!(" (available: {})", available.join(", "))
+            }
         ));
     }
 
@@ -1491,10 +2144,28 @@ fn select_harness(work_dir: &Path, requested: Option<&str>) -> Result<(String, P
             let (id, dir) = harnesses.into_iter().next().expect("one harness");
             Ok((id, dir))
         }
-        count => Err(format!(
-            "work dir malformed: {count} harnesses found; pass --harness"
-        )),
+        count => {
+            let ids: Vec<String> = harnesses.into_keys().collect();
+            Err(format!(
+                "work dir malformed: {count} harnesses found ({}); pass --harness <id>",
+                ids.join(", ")
+            ))
+        }
     }
+}
+
+/// The harness ids under either harness root of `work_dir`, sorted.
+fn harness_ids_under(work_dir: &Path) -> Vec<String> {
+    let mut ids: Vec<String> = harness_roots(work_dir)
+        .iter()
+        .filter_map(|root| fs::read_dir(root).ok())
+        .flat_map(|entries| entries.flatten())
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
 }
 
 fn harness_roots(work_dir: &Path) -> [PathBuf; 2] {
@@ -2294,6 +2965,254 @@ mod tests {
         assert!(
             !without.contains("-fsanitize-coverage"),
             "default Bhf_Build must carry no coverage flag:\n{without}"
+        );
+    }
+
+    fn c_build_args(work_dir: &Path, harness: Option<&str>) -> BuildArgs {
+        BuildArgs {
+            work_dir: work_dir.to_path_buf(),
+            source_project: None,
+            harness: harness.map(str::to_owned),
+            target: None,
+            runtime: None,
+            toolchain: None,
+            probe_backend: ProbeBackend::HostFile,
+            c_engine: CEngine::Libfuzzer,
+        }
+    }
+
+    /// A C++ harness directory whose Makefile `main` goal just writes a file, so
+    /// the layout handling can be exercised without a compiler.
+    fn write_trivial_cpp_harness(dir: &Path) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("main.cpp"), "int main() { return 0; }\n").unwrap();
+        fs::write(dir.join("Makefile"), "main:\n\tprintf built > main\n").unwrap();
+    }
+
+    #[test]
+    fn c_build_reports_the_harness_lookup_error_instead_of_the_ada_layout() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        write_trivial_cpp_harness(&work.join("harnesses").join("H-ONE"));
+        write_trivial_cpp_harness(&work.join("harnesses").join("H-TWO"));
+        // Two harnesses and no --harness, or an unknown id: the C/C++ lookup error
+        // is the answer (exit 3), not a fall-through to the Ada src_instrumented check.
+        assert_eq!(try_run_c_make_build(&c_build_args(&work, None)), Some(3));
+        assert_eq!(
+            try_run_c_make_build(&c_build_args(&work, Some("H-MISSING"))),
+            Some(3)
+        );
+        assert!(!work.join("build").exists(), "nothing may be built");
+    }
+
+    #[test]
+    fn c_build_accepts_a_harness_directory_or_harness_root_as_work_dir() {
+        if std::process::Command::new("make")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            bhfeprintln!("skipping harness-dir layout test: make not on PATH");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        let harness = work.join("harnesses").join("H-ONE");
+        write_trivial_cpp_harness(&harness);
+        assert_eq!(try_run_c_make_build(&c_build_args(&harness, None)), Some(0));
+        let staged = work.join("build").join("H-ONE").join("main");
+        assert_eq!(fs::read_to_string(&staged).unwrap(), "built");
+        fs::remove_file(&staged).unwrap();
+        assert_eq!(
+            try_run_c_make_build(&c_build_args(&work.join("harnesses"), Some("H-ONE"))),
+            Some(0)
+        );
+        assert!(staged.is_file());
+    }
+
+    #[test]
+    fn c_build_layout_rejects_a_conflicting_harness_id_for_a_harness_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let harness = temp.path().join("work").join("harnesses").join("H-ONE");
+        write_trivial_cpp_harness(&harness);
+        let error = resolve_c_family_work_dir(&harness, Some("H-TWO")).unwrap_err();
+        assert!(
+            error.contains("H-ONE") && error.contains("H-TWO"),
+            "{error}"
+        );
+        // A harness directory outside a work layout gets the expected layout.
+        let loose = temp.path().join("loose");
+        write_trivial_cpp_harness(&loose);
+        let error = resolve_c_family_work_dir(&loose, None).unwrap_err();
+        assert!(error.contains("harnesses/<id>/"), "{error}");
+    }
+
+    #[test]
+    fn undefined_symbols_are_read_from_gnu_ld_and_lld_output() {
+        let output = "/usr/bin/ld: /tmp/codec.o: in function `widgets::Codec::decode(unsigned char const*, unsigned long)':\n\
+            codec.cpp:12: undefined reference to `widgets::Table::store(unsigned char const*, unsigned long)'\n\
+            ld.lld: error: undefined symbol: parse_record\n\
+            >>> referenced by codec.c:4\n\
+            codec.cpp:13: undefined reference to `widgets::Table::store(unsigned char const*, unsigned long)'\n\
+            /usr/bin/ld: undefined reference to `sqrt'\n";
+        assert_eq!(
+            undefined_symbols_in(output),
+            vec![
+                "widgets::Table::store(unsigned char const*, unsigned long)".to_owned(),
+                "parse_record".to_owned(),
+                "sqrt".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_link_hint_names_the_in_tree_definer_and_the_exact_flags() {
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("lib").join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(
+            src.join("table.h"),
+            "#pragma once\n#include <cstddef>\nnamespace widgets { struct Table { static int store(const unsigned char *d, size_t n); }; }\n",
+        )
+        .unwrap();
+        fs::write(
+            src.join("table.cpp"),
+            "#include \"table.h\"\nnamespace widgets {\nint Table::store(const unsigned char *d, size_t n) { return n ? d[0] : 0; }\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            src.join("codec.cpp"),
+            "#include \"table.h\"\nint decode(const unsigned char *d, size_t n) { return widgets::Table::store(d, n); }\n",
+        )
+        .unwrap();
+        let work = temp.path().join("work");
+        let harness = work.join("harnesses").join("H-ONE");
+        fs::create_dir_all(&harness).unwrap();
+        fs::write(harness.join("main.cpp"), "").unwrap();
+        fs::write(
+            harness.join("Makefile"),
+            format!(
+                "main: main.cpp bhf_driver.o $(CONTEXT_MAIN_OBJECTS)\n\t$(CXX) $(CXXFLAGS) -DBHF_EXTERNAL_DRIVER -o $@ main.cpp {} $(CONTEXT_MAIN_OBJECTS) $(AUTO_EXTRA_SOURCES) bhf_driver.o\n",
+                src.join("codec.cpp").display()
+            ),
+        )
+        .unwrap();
+        let output = "codec.cpp:2: undefined reference to `widgets::Table::store(unsigned char const*, unsigned long)'\n\
+                      codec.cpp:2: undefined reference to `vendor_checksum'\n";
+        let none = RebuildEnv::default();
+        let hints = c_build_failure_hints(&work, "H-ONE", &harness, output, &none).join("\n");
+        let table = src.join("table.cpp").display().to_string();
+        assert!(
+            hints.contains(&format!("--extra-source {table}")),
+            "{hints}"
+        );
+        assert!(
+            hints.contains(&format!(
+                "AUTO_EXTRA_SOURCES={} bhf build",
+                shell_text(&table)
+            )),
+            "{hints}"
+        );
+        assert!(hints.contains("vendor_checksum"), "{hints}");
+        assert!(
+            !hints.contains(&format!(
+                "--extra-source {}",
+                src.join("codec.cpp").display()
+            )),
+            "an already-linked source is never suggested: {hints}"
+        );
+        // The operator's own build variables are kept in the suggested command.
+        let inherited = RebuildEnv::from_lookup(|name| match name {
+            "AUTO_EXTRA_SOURCES" => Some("/opt/extra.cpp".to_owned()),
+            "AUTO_EXTRA_INCLUDES" => Some("-fms-extensions".to_owned()),
+            "CXX_STD" => Some("gnu++14".to_owned()),
+            _ => None,
+        });
+        let hints = c_build_failure_hints(&work, "H-ONE", &harness, output, &inherited).join("\n");
+        assert!(
+            hints.contains(&format!(
+                "AUTO_EXTRA_SOURCES='/opt/extra.cpp {table}' AUTO_EXTRA_INCLUDES=-fms-extensions \
+                 CXX_STD=gnu++14 bhf build"
+            )),
+            "{hints}"
+        );
+    }
+
+    #[test]
+    fn failed_compile_hints_cover_std_streams_and_extra_qualification() {
+        let temp = tempfile::tempdir().unwrap();
+        let harness = temp.path().join("harnesses").join("H-ONE");
+        fs::create_dir_all(&harness).unwrap();
+        let output = "src/parser.cpp:331:2: error: use of undeclared identifier 'cerr'\n\
+                      src/lexer.cpp:52:19: error: implicit instantiation of undefined template 'std::basic_istream<char>'\n\
+                      src/widget.h:136:18: error: extra qualification on member 'name'\n";
+        let none = RebuildEnv::default();
+        let hints = c_build_failure_hints(temp.path(), "H-ONE", &harness, output, &none);
+        let text = hints.join("\n");
+        let line_with = |needle: &str| {
+            hints
+                .iter()
+                .find(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("no hint with {needle}: {text}"))
+                .clone()
+        };
+        assert!(
+            line_with("without including")
+                .contains("AUTO_EXTRA_INCLUDES='-include iostream' bhf build"),
+            "{text}"
+        );
+        let qualification = line_with("extra class qualification");
+        assert!(qualification.contains("src/widget.h:136"), "{text}");
+        assert!(
+            qualification.contains("AUTO_EXTRA_INCLUDES=-fms-extensions bhf build"),
+            "{text}"
+        );
+        assert!(qualification.contains("-fpermissive"), "{text}");
+        // One command applies both fixes.
+        assert!(
+            line_with("at once")
+                .contains("AUTO_EXTRA_INCLUDES='-include iostream -fms-extensions' bhf build"),
+            "{text}"
+        );
+
+        // The operator's own variables travel into every suggested command, and a
+        // flag already set is not repeated.
+        let inherited = RebuildEnv::from_lookup(|name| match name {
+            "AUTO_EXTRA_SOURCES" => Some("/src/table.cpp".to_owned()),
+            "AUTO_EXTRA_INCLUDES" => Some("-fms-extensions".to_owned()),
+            "C_STD" => Some("gnu89".to_owned()),
+            _ => None,
+        });
+        let hints = c_build_failure_hints(temp.path(), "H-ONE", &harness, output, &inherited);
+        let text = hints.join("\n");
+        let commands: Vec<&String> = hints
+            .iter()
+            .filter(|line| line.contains("bhf build"))
+            .collect();
+        assert!(!commands.is_empty(), "{text}");
+        for command in &commands {
+            assert!(
+                command.contains("AUTO_EXTRA_SOURCES=/src/table.cpp ")
+                    && command.contains(" C_STD=gnu89 bhf build"),
+                "{text}"
+            );
+            assert_eq!(command.matches("-fms-extensions").count(), 1, "{text}");
+        }
+        assert!(
+            text.contains("AUTO_EXTRA_INCLUDES='-fms-extensions -include iostream' C_STD=gnu89"),
+            "{text}"
+        );
+
+        // g++ names -fpermissive itself; that is the flag to suggest.
+        let gcc = "src/widget.h:136:12: error: extra qualification 'Widget::' on member 'name' [-fpermissive]\n";
+        let hints = c_build_failure_hints(temp.path(), "H-ONE", &harness, gcc, &none).join("\n");
+        assert!(
+            hints.contains("AUTO_EXTRA_INCLUDES=-fpermissive bhf build"),
+            "{hints}"
+        );
+        assert!(
+            !hints.contains("at once"),
+            "a single fix needs no combined line: {hints}"
         );
     }
 

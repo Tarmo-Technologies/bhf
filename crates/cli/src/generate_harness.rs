@@ -25,7 +25,15 @@ pub struct GenerateHarnessArgs {
     /// Path to the Ada, C, or C++ source file containing the target subprogram.
     pub source: PathBuf,
 
-    /// Subprogram name to harness. If omitted, harness the highest-ranked target.
+    /// Function or subprogram to harness. Required for C and C++ sources. For
+    /// C++, any of these spellings selects a definition: the bare name
+    /// (`decode`), a `::`-qualified suffix (`Codec::decode`), the fully
+    /// qualified name exactly as `bhf list targets` prints it
+    /// (`widgets::Codec::decode`), or any of those with a parameter list
+    /// (`Codec::decode(const unsigned char *, size_t)`). An exact spelling
+    /// wins over a suffix, and a leading `::` names the global namespace only.
+    /// Pair it with --target-line to pick one of several matching definitions.
+    /// For Ada, if omitted, harness the highest-ranked target.
     #[arg(long)]
     pub target: Option<String>,
 
@@ -6285,13 +6293,21 @@ fn pick_c_target(
     target_name: &str,
     target_line: Option<u32>,
 ) -> Result<(c_parser::CFunction, Option<String>)> {
-    let mut matches: Vec<c_parser::CFunction> = functions
-        .into_iter()
-        .filter(|f| f.name == target_name)
-        .collect();
+    let (mut matches, others): (Vec<c_parser::CFunction>, Vec<c_parser::CFunction>) =
+        functions.into_iter().partition(|f| f.name == target_name);
     if matches.is_empty() {
+        let closest: Vec<String> =
+            crate::target_filter::closest_matches(target_name, &others, |f| f.name.as_str(), 5)
+                .into_iter()
+                .map(|f| format!("{} (line {})", f.name, f.line))
+                .collect();
+        let hint = if closest.is_empty() {
+            String::new()
+        } else {
+            format!("; closest definitions: {}", closest.join(", "))
+        };
         return Err(anyhow::anyhow!(
-            "function '{target_name}' not found in {}",
+            "function '{target_name}' not found in {}{hint}",
             source_path.display()
         ));
     }
@@ -6330,15 +6346,22 @@ fn pick_cpp_target(
     target_name: &str,
     target_line: Option<u32>,
 ) -> Result<(cpp_parser::CppFunction, Option<String>)> {
+    // An exact spelling wins. Only when nothing matches exactly does a trailing
+    // qualified suffix (`Codec::decode` for `widgets::Codec::decode`) select.
     let mut matches: Vec<cpp_parser::CppFunction> = functions
-        .into_iter()
+        .iter()
         .filter(|f| cpp_target_matches(f, target_name))
+        .cloned()
         .collect();
     if matches.is_empty() {
-        return Err(anyhow::anyhow!(
-            "function '{target_name}' not found in {}",
-            source_path.display()
-        ));
+        matches = functions
+            .iter()
+            .filter(|f| cpp_target_suffix_matches(f, target_name))
+            .cloned()
+            .collect();
+    }
+    if matches.is_empty() {
+        return Err(cpp_target_not_found(source_path, &functions, target_name));
     }
     matches.sort_by_key(|f| f.line);
     if let Some(line) = target_line {
@@ -6364,9 +6387,19 @@ fn pick_cpp_target(
                 )
             })
             .collect();
+        let distinct_names = matches
+            .iter()
+            .map(cpp_qualified_target_name)
+            .collect::<BTreeSet<_>>()
+            .len();
+        let shape = if distinct_names > 1 {
+            "matches several functions"
+        } else {
+            "is overloaded"
+        };
         format!(
-            "warning: target '{target_name}' is overloaded in {} ({} candidates: {}); \
-             picking the first. Pass --target-line or --id to disambiguate.",
+            "warning: target '{target_name}' {shape} in {} ({} candidates: {}); \
+             picking the first. Pass --target-line or the fully qualified name to disambiguate.",
             source_path.display(),
             matches.len(),
             summaries.join("; ")
@@ -6374,6 +6407,71 @@ fn pick_cpp_target(
     });
     let picked = matches.into_iter().next().expect("at least one match");
     Ok((picked, warning))
+}
+
+/// Whether `target_name` selects `function` as a trailing `::`-qualified suffix
+/// of its fully qualified name or signature (`Codec::decode` selects
+/// `widgets::Codec::decode`; `Codec::decode(int)` selects only that overload).
+fn cpp_target_suffix_matches(function: &cpp_parser::CppFunction, target_name: &str) -> bool {
+    let qualified = cpp_qualified_target_name(function);
+    crate::target_filter::qualified_suffix_matches(
+        &cpp_signature_target_name(function, &qualified),
+        target_name,
+        false,
+    )
+}
+
+/// The "not found" error for a C++ `--target`: the closest definitions in the
+/// file and the spellings `--target` accepts, illustrated with the best match.
+fn cpp_target_not_found(
+    source_path: &Path,
+    functions: &[cpp_parser::CppFunction],
+    target_name: &str,
+) -> anyhow::Error {
+    let candidates: Vec<(String, &cpp_parser::CppFunction)> = functions
+        .iter()
+        .map(|f| (cpp_qualified_target_name(f), f))
+        .collect();
+    let closest = crate::target_filter::closest_matches(
+        target_name,
+        &candidates,
+        |(qualified, _)| qualified.as_str(),
+        5,
+    );
+    let mut message = format!(
+        "function '{target_name}' not found in {}",
+        source_path.display()
+    );
+    if functions.is_empty() {
+        message.push_str(" (no function definitions were parsed from it)");
+        return anyhow::anyhow!(message);
+    }
+    if !closest.is_empty() {
+        let listed: Vec<String> = closest
+            .iter()
+            .map(|(qualified, f)| format!("{qualified} (line {})", f.line))
+            .collect();
+        message.push_str(&format!("\n  closest definitions: {}", listed.join(", ")));
+    }
+    let (qualified, example) = closest
+        .first()
+        .map(|(qualified, f)| (qualified.clone(), *f))
+        .unwrap_or_else(|| (candidates[0].0.clone(), candidates[0].1));
+    let segments: Vec<&str> = qualified.split("::").collect();
+    let suffix = if segments.len() > 2 {
+        segments[segments.len() - 2..].join("::")
+    } else {
+        qualified.clone()
+    };
+    message.push_str(&format!(
+        "\n  --target accepts the bare name (`{bare}`), a `::`-qualified suffix (`{suffix}`), \
+         the fully qualified name as `bhf list targets` prints it (`{qualified}`), or any of \
+         those with a parameter list (`{signature}`); add --target-line N to pick one of \
+         several matching definitions",
+        bare = example.name,
+        signature = cpp_signature_target_name(example, &suffix),
+    ));
+    anyhow::anyhow!(message)
 }
 
 fn cpp_target_matches(function: &cpp_parser::CppFunction, target_name: &str) -> bool {
@@ -6384,9 +6482,13 @@ fn cpp_target_matches(function: &cpp_parser::CppFunction, target_name: &str) -> 
     if qualified == target_name {
         return true;
     }
+    let signature = cpp_signature_target_name(function, &qualified);
     cpp_signature_target_name(function, &function.name) == target_name
-        || cpp_signature_target_name(function, &qualified) == target_name
+        || signature == target_name
         || (!function.api.overload_key.is_empty() && function.api.overload_key == target_name)
+        // The full name with a leading global `::` or differently spaced
+        // parameters (`Codec::decode(const char*)`).
+        || crate::target_filter::qualified_exact_matches(&signature, target_name, false)
 }
 
 fn cpp_qualified_target_name(function: &cpp_parser::CppFunction) -> String {
@@ -7887,7 +7989,7 @@ fn is_c_or_cpp_translation_unit(path: &Path) -> bool {
 /// drops the TU, so a false positive only loses one sibling source (still
 /// recoverable by the per-symbol `AddSource` cascade) rather than mis-link a
 /// second `main`.
-fn source_defines_main(path: &Path) -> bool {
+pub(crate) fn source_defines_main(path: &Path) -> bool {
     crate::source_text::read_source_text(path)
         .map(|text| text_declares_function(&text, "main"))
         .unwrap_or(false)
@@ -8773,7 +8875,7 @@ fn extract_compile_database_flags(entry: &CompileCommandEntry, source_path: &Pat
                     continue;
                 }
             }
-            "-isystem" | "-iquote" | "-idirafter" | "-isysroot" | "--sysroot" | "-imacros" => {
+            "-isystem" | "-iquote" | "-idirafter" | "-isysroot" | "--sysroot" => {
                 if let Some(value) = args.get(i + 1) {
                     flags.push(arg.clone());
                     flags.push(resolve_compile_database_path(&entry.directory, value));
@@ -8796,10 +8898,13 @@ fn extract_compile_database_flags(entry: &CompileCommandEntry, source_path: &Pat
                     continue;
                 }
             }
-            "-include" => {
+            "-include" | "-imacros" => {
                 if let Some(value) = args.get(i + 1) {
                     flags.push(arg.clone());
-                    flags.push(resolve_compile_database_path(&entry.directory, value));
+                    flags.push(resolve_compile_database_forced_include(
+                        &entry.directory,
+                        value,
+                    ));
                     i += 2;
                     continue;
                 }
@@ -9078,6 +9183,23 @@ fn compile_command_arguments(entry: &CompileCommandEntry) -> Option<Vec<String>>
         return Some(arguments.clone());
     }
     entry.command.as_deref().map(split_compile_command)
+}
+
+/// The operand of `-include FILE` / `-imacros FILE` from a compile database.
+///
+/// The compiler looks for a relative FILE in its working directory first and
+/// then along the `#include "..."` search chain, so `-include iostream` names a
+/// system header. Rewriting it against the entry's directory would turn that
+/// into a file that does not exist. Only absolutize when the entry directory
+/// really holds the file; otherwise keep the operand verbatim so the search
+/// path still applies from the harness directory.
+fn resolve_compile_database_forced_include(directory: &Path, value: &str) -> String {
+    let path = Path::new(value);
+    if path.is_absolute() || directory.join(path).is_file() {
+        resolve_compile_database_path(directory, value)
+    } else {
+        value.to_owned()
+    }
 }
 
 fn resolve_compile_database_path(directory: &Path, value: &str) -> String {
@@ -13510,8 +13632,15 @@ mod tests {
 
     #[test]
     fn compile_database_preserves_compiler_abi_and_extension_context() {
+        // The forced include must exist for its relative operand to be
+        // absolutized against the entry directory.
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir_all(project.join("build")).unwrap();
+        fs::create_dir_all(project.join("include")).unwrap();
+        fs::write(project.join("include").join("config.h"), "#pragma once\n").unwrap();
         let entry = CompileCommandEntry {
-            directory: PathBuf::from("/project/build"),
+            directory: project.join("build"),
             file: PathBuf::from("../src/legacy.cpp"),
             arguments: Some(
                 [
@@ -13539,7 +13668,8 @@ mod tests {
             ),
             command: None,
         };
-        let flags = extract_compile_database_flags(&entry, Path::new("/project/src/legacy.cpp"));
+        let flags = extract_compile_database_flags(&entry, &project.join("src/legacy.cpp"));
+        let forced = harness_gen::build_safety::make_path(&project.join("include/config.h"));
         for expected in [
             "@bhf-build-context-compiler=/opt/toolchain/bin/g++-12",
             "-fms-extensions",
@@ -13551,7 +13681,7 @@ mod tests {
             "/opt/sysroot",
             "--target=x86_64-linux-gnu",
             "-include",
-            "/project/include/config.h",
+            forced.as_str(),
         ] {
             assert!(
                 flags.iter().any(|flag| flag == expected),
@@ -13564,6 +13694,64 @@ mod tests {
                 || flag == "-MJ"
                 || flag.ends_with("deps.json")
         }));
+    }
+
+    #[test]
+    fn compile_database_force_include_is_absolutized_only_when_the_file_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let build = temp.path().join("project").join("build");
+        let include = temp.path().join("project").join("include");
+        fs::create_dir_all(&build).unwrap();
+        fs::create_dir_all(&include).unwrap();
+        fs::write(include.join("prelude.h"), "#pragma once\n").unwrap();
+        let entry = CompileCommandEntry {
+            directory: build.clone(),
+            file: PathBuf::from("../src/widget.cpp"),
+            arguments: Some(
+                [
+                    "clang++",
+                    "-include",
+                    "iostream",
+                    "-include",
+                    "../include/prelude.h",
+                    "-include",
+                    "sub/config.h",
+                    "-imacros",
+                    "settings.h",
+                    "-c",
+                    "../src/widget.cpp",
+                ]
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
+            ),
+            command: None,
+        };
+        let flags = extract_compile_database_flags(
+            &entry,
+            &temp.path().join("project").join("src").join("widget.cpp"),
+        );
+        let operand = |flag: &str, nth: usize| -> String {
+            flags
+                .iter()
+                .enumerate()
+                .filter(|(_, value)| value.as_str() == flag)
+                .nth(nth)
+                .and_then(|(index, _)| flags.get(index + 1))
+                .cloned()
+                .unwrap_or_else(|| panic!("missing {flag} #{nth}: {flags:?}"))
+        };
+        // A system header name stays bare so the compiler's search path finds it.
+        assert_eq!(operand("-include", 0), "iostream");
+        // A header that exists relative to the entry directory becomes absolute.
+        assert_eq!(
+            operand("-include", 1),
+            harness_gen::build_safety::make_path(&include.join("prelude.h"))
+        );
+        // A relative name that is not under the entry directory also falls back
+        // to the include search path rather than a guessed absolute path.
+        assert_eq!(operand("-include", 2), "sub/config.h");
+        assert_eq!(operand("-imacros", 0), "settings.h");
     }
 
     #[test]
@@ -20914,6 +21102,156 @@ class basic_json
             warning.is_none(),
             "signature-qualified target name is unambiguous"
         );
+    }
+
+    fn suffix_target_fixture() -> Vec<cpp_parser::CppFunction> {
+        cpp_parser::parse_cpp_functions(
+            r#"
+            #include <cstddef>
+            namespace widgets {
+            class Codec {
+            public:
+                int decode(const unsigned char *data, size_t size);
+                int encode(const unsigned char *data, size_t size);
+            };
+            int Codec::decode(const unsigned char *data, size_t size) { return data && size ? data[0] : 0; }
+            int Codec::encode(const unsigned char *data, size_t size) { return data ? (int)size : 0; }
+            }
+            namespace gadgets {
+            class Codec {
+            public:
+                int decode(const unsigned char *data, size_t size) { return data ? (int)size : 1; }
+            };
+            }
+            "#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn pick_cpp_target_accepts_class_qualified_suffix_without_namespace() {
+        let functions: Vec<_> = suffix_target_fixture()
+            .into_iter()
+            .filter(|f| f.qualifier_path.first().map(String::as_str) != Some("gadgets"))
+            .collect();
+        let (selected, warning) =
+            pick_cpp_target(Path::new("codec.cpp"), functions, "Codec::decode", None).unwrap();
+        assert_eq!(selected.name, "decode");
+        assert_eq!(selected.qualifier_path, vec!["widgets", "Codec"]);
+        assert!(warning.is_none(), "a unique suffix needs no warning");
+    }
+
+    #[test]
+    fn pick_cpp_target_suffix_with_signature_selects_that_overload() {
+        let functions: Vec<_> = suffix_target_fixture()
+            .into_iter()
+            .filter(|f| f.qualifier_path.first().map(String::as_str) != Some("gadgets"))
+            .collect();
+        let (selected, _) = pick_cpp_target(
+            Path::new("codec.cpp"),
+            functions,
+            "Codec::encode(const unsigned char *, size_t)",
+            None,
+        )
+        .unwrap();
+        assert_eq!(selected.name, "encode");
+    }
+
+    #[test]
+    fn pick_cpp_target_ambiguous_suffix_lists_every_match() {
+        let (selected, warning) = pick_cpp_target(
+            Path::new("codec.cpp"),
+            suffix_target_fixture(),
+            "Codec::decode",
+            None,
+        )
+        .unwrap();
+        let warning = warning.expect("two classes named Codec must be reported");
+        assert!(
+            warning.contains("widgets::Codec::decode")
+                && warning.contains("gadgets::Codec::decode"),
+            "{warning}"
+        );
+        assert!(warning.contains("--target-line"), "{warning}");
+        // The first definition by line is picked, as for any ambiguous name.
+        assert_eq!(selected.qualifier_path[0], "widgets");
+    }
+
+    #[test]
+    fn pick_cpp_target_exact_qualified_name_beats_a_longer_suffix_match() {
+        let functions = cpp_parser::parse_cpp_functions(
+            r#"
+            class Codec { public: int decode(int v) { return v; } };
+            namespace widgets {
+            class Codec { public: int decode(int v) { return v + 1; } };
+            }
+            "#,
+        )
+        .unwrap();
+        for spelling in [
+            "Codec::decode",
+            "::Codec::decode",
+            "Codec::decode(int)",
+            "Codec::decode( int )",
+        ] {
+            let (selected, warning) =
+                pick_cpp_target(Path::new("codec.cpp"), functions.clone(), spelling, None).unwrap();
+            assert!(
+                selected.qualifier_path == vec!["Codec"],
+                "{spelling}: {selected:?}"
+            );
+            assert!(warning.is_none(), "{spelling}: {warning:?}");
+        }
+        let (selected, warning) = pick_cpp_target(
+            Path::new("codec.cpp"),
+            functions,
+            "widgets::Codec::decode",
+            None,
+        )
+        .unwrap();
+        assert_eq!(selected.qualifier_path, vec!["widgets", "Codec"]);
+        assert!(warning.is_none(), "{warning:?}");
+    }
+
+    #[test]
+    fn pick_cpp_target_not_found_lists_closest_candidates_and_spellings() {
+        let error = pick_cpp_target(
+            Path::new("codec.cpp"),
+            suffix_target_fixture(),
+            "Codec::decod",
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("'Codec::decod' not found"), "{error}");
+        assert!(error.contains("widgets::Codec::decode"), "{error}");
+        assert!(error.contains("gadgets::Codec::decode"), "{error}");
+        assert!(
+            error.contains("bhf list targets") && error.contains("--target-line"),
+            "the accepted spellings must be named: {error}"
+        );
+        assert!(!error.contains("Codec::encode (line"), "{error}");
+    }
+
+    #[test]
+    fn pick_c_target_not_found_lists_closest_candidates() {
+        let f = |name: &str, line| c_parser::CFunction {
+            name: name.into(),
+            line,
+            return_type: "int".into(),
+            params: vec![],
+            ..Default::default()
+        };
+        let error = pick_c_target(
+            Path::new("x.c"),
+            vec![f("parse_record", 10), f("free_record", 20)],
+            "parse_recrod",
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("parse_record (line 10)"), "{error}");
+        assert!(!error.contains("free_record"), "{error}");
     }
 
     #[test]

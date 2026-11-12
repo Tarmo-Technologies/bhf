@@ -339,6 +339,7 @@ fn render_cpp_harness(
             libfuzzer_binary: Some("main_libfuzzer".to_owned()),
             afl_binary: Some("main_afl".to_owned()),
             crash_on_finding_env: false,
+            passthrough_entrypoint: context.passthrough_libfuzzer_entrypoint,
         },
     )?;
 
@@ -5571,6 +5572,105 @@ mod tests {
             err.contains("AddressSanitizer") || err.contains("ERROR") || err.contains("SUMMARY"),
             "expected an ASan/libFuzzer crash report, got:\n{err}"
         );
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// A harness around the project's own `LLVMFuzzerTestOneInput` builds its
+    /// portable libFuzzer binary from the project sources alone: no shim (which
+    /// would define the entry point a second time) and no `main.cpp` (whose
+    /// `bhf_run_one` forwards into that same entry point).
+    #[test]
+    fn make_libfuzzer_links_a_passthrough_entrypoint_directly() {
+        if !cpp_libfuzzer_toolchain_available() {
+            eprintln!("skipping C++ passthrough make_libfuzzer e2e: clang++/libFuzzer unavailable");
+            return;
+        }
+        let out = temp_dir("cpp-passthrough-libfuzzer");
+        let driver = out.join("drive_codec.cpp");
+        fs::write(
+            &driver,
+            "#include <cstddef>\n#include <cstdint>\n\
+             static int decode_record(const uint8_t *data, size_t size) {\n\
+             \x20   if (size >= 4 && data[0]=='F' && data[1]=='U' && data[2]=='Z' && data[3]=='Z') {\n\
+             \x20       volatile int *p = nullptr; *p = 1;\n\
+             \x20   }\n\
+             \x20   return 0;\n\
+             }\n\
+             extern \"C\" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {\n\
+             \x20   return decode_record(data, size);\n\
+             }\n",
+        )
+        .unwrap();
+        let args = GenerateCppDirectArgs {
+            decoder_limits: Default::default(),
+            force: false,
+            harness_id: "H-CPP-PASSTHROUGH-LF".to_owned(),
+            output_dir: out.clone(),
+            source_path: driver.clone(),
+            target: cppfunction("LLVMFuzzerTestOneInput"),
+            params: vec![
+                CppParameter {
+                    name: "data".to_owned(),
+                    cpp_type: "const uint8_t *".to_owned(),
+                },
+                CppParameter {
+                    name: "size".to_owned(),
+                    cpp_type: "size_t".to_owned(),
+                },
+            ],
+            return_type: "int".to_owned(),
+            target_includes: Vec::new(),
+            target_includes_dirs: vec![out.clone()],
+            target_sources: vec![driver.clone()],
+            compile_flags: Vec::new(),
+            c_runtime_include: runtime_dir(),
+            using_namespaces: Vec::new(),
+            result_cleanup: None,
+            constructor_params: Vec::new(),
+            type_defs: Vec::new(),
+            default_constructible_classes: Vec::new(),
+            parameter_constructions: Vec::new(),
+            receiver_class_override: None,
+            factory_plan: None,
+        };
+        generate_cpp_direct_harness(args).unwrap();
+        assert!(
+            !out.join("bhf_libfuzzer.c").exists(),
+            "no shim for a passthrough"
+        );
+        let doc = fs::read_to_string(out.join("PORTABILITY.md")).unwrap();
+        assert!(doc.contains("hfuzz-clang++"), "{doc}");
+        assert!(!doc.contains(" main.c "), "{doc}");
+
+        let build = Command::new("make")
+            .arg("libfuzzer")
+            .current_dir(&out)
+            .output()
+            .expect("run make");
+        assert!(
+            build.status.success(),
+            "make libfuzzer failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr)
+        );
+        let bin = out.join("main_libfuzzer");
+        let ok = out.join("ok.bin");
+        fs::write(&ok, b"hi").unwrap();
+        let clean = Command::new(&bin).arg(&ok).output().unwrap();
+        assert!(
+            clean.status.success(),
+            "clean input must run once and exit: {}",
+            String::from_utf8_lossy(&clean.stderr)
+        );
+        let crash = out.join("crash.bin");
+        fs::write(&crash, b"FUZZ....").unwrap();
+        let r = Command::new(&bin).arg(&crash).output().unwrap();
+        let err = String::from_utf8_lossy(&r.stderr);
+        assert!(
+            !r.status.success(),
+            "magic input must crash, stderr:\n{err}"
+        );
+        assert!(err.contains("AddressSanitizer"), "{err}");
         fs::remove_dir_all(&out).ok();
     }
 

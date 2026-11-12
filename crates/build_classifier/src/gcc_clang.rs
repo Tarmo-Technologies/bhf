@@ -31,6 +31,26 @@ pub fn classify_into(stderr: &str, hits: &mut Vec<BuildErrorKind>) {
             });
             continue;
         }
+        // A C++ source that uses the standard streams (`cerr << ...`,
+        // `std::istream &`) without including their header, which older standard
+        // libraries pulled in transitively. Reported as the missing standard name so
+        // repair force-includes the real header (`<iostream>`, `<fstream>`, ...).
+        // Ahead of the incomplete-type pattern, which `std::basic_istream<char>`
+        // would otherwise match.
+        if let Some(name) = missing_std_stream_name(line) {
+            hits.push(BuildErrorKind::MissingType { name });
+            continue;
+        }
+        // A member declared with its own class's qualification inside the class
+        // (`int Widget::name();`), which only MSVC accepts by default.
+        if let Some((file, error_line, member)) = extra_member_qualification(line) {
+            hits.push(BuildErrorKind::ExtraQualification {
+                file,
+                line: error_line,
+                member,
+            });
+            continue;
+        }
         if let Some(caps) = missing_header().captures(line) {
             hits.push(BuildErrorKind::MissingHeader {
                 path: caps
@@ -238,6 +258,107 @@ pub fn classify_into(stderr: &str, hits: &mut Vec<BuildErrorKind>) {
             }
         }
     }
+}
+
+/// The stream objects a pre-standard source names WITHOUT `std::` (it relies on
+/// `using namespace std;`). Deliberately narrower than
+/// [`crate::std_stream_header`]: an unqualified `flush` or `ws` is as likely to
+/// be a project function as a manipulator.
+fn is_unqualified_std_stream_object(name: &str) -> bool {
+    matches!(
+        name,
+        "cin" | "cout" | "cerr" | "clog" | "wcin" | "wcout" | "wcerr" | "wclog" | "endl"
+    )
+}
+
+/// `std::basic_istream<char>` -> `std::istream`, `std::basic_ofstream<wchar_t>`
+/// -> `std::wofstream`; any other spelling is returned without its template
+/// arguments. Implementation namespaces (`std::__1::`, `std::__cxx11::`) are
+/// dropped.
+fn normalize_std_template_name(spelling: &str) -> String {
+    let spelling = spelling.trim();
+    let (head, args) = match spelling.split_once('<') {
+        Some((head, args)) => (head.trim(), args),
+        None => (spelling, ""),
+    };
+    let bare = head.strip_prefix("std::").unwrap_or(head);
+    let bare = bare
+        .strip_prefix("__1::")
+        .or_else(|| bare.strip_prefix("__cxx11::"))
+        .unwrap_or(bare);
+    let Some(stream) = bare.strip_prefix("basic_") else {
+        return format!("std::{bare}");
+    };
+    let wide = args.trim_start().starts_with("wchar_t");
+    format!("std::{}{stream}", if wide { "w" } else { "" })
+}
+
+fn missing_std_stream_name(line: &str) -> Option<String> {
+    static UNQUALIFIED: OnceLock<Regex> = OnceLock::new();
+    static QUALIFIED: OnceLock<Regex> = OnceLock::new();
+    static TEMPLATE: OnceLock<Regex> = OnceLock::new();
+    if !line.contains("error") {
+        return None;
+    }
+    // clang: use of undeclared identifier 'cerr'; gcc: 'cerr' was not declared
+    // in this scope (gcc quotes with U+2018/U+2019 in a UTF-8 locale).
+    let unqualified = UNQUALIFIED.get_or_init(|| {
+        Regex::new(
+            "error: (?:use of undeclared identifier ['\u{2018}]([A-Za-z_][A-Za-z0-9_]*)['\u{2019}]\
+             |['\u{2018}]([A-Za-z_][A-Za-z0-9_]*)['\u{2019}] was not declared in this scope)",
+        )
+        .expect("regex")
+    });
+    if let Some(caps) = unqualified.captures(line) {
+        let name = caps.get(1).or_else(|| caps.get(2))?.as_str();
+        return is_unqualified_std_stream_object(name).then(|| name.to_owned());
+    }
+    // clang: no member named 'cout' in namespace 'std'; gcc: 'cout' is not a
+    // member of 'std'.
+    let qualified = QUALIFIED.get_or_init(|| {
+        Regex::new(
+            "error: (?:no member named ['\u{2018}]([A-Za-z_][A-Za-z0-9_]*)['\u{2019}] in namespace ['\u{2018}]std['\u{2019}]\
+             |['\u{2018}](?:std::)?([A-Za-z_][A-Za-z0-9_]*)['\u{2019}] is not a member of ['\u{2018}]std['\u{2019}])",
+        )
+        .expect("regex")
+    });
+    if let Some(caps) = qualified.captures(line) {
+        let name = format!("std::{}", caps.get(1).or_else(|| caps.get(2))?.as_str());
+        return crate::std_stream_header(&name).map(|_| name);
+    }
+    // clang: implicit instantiation of undefined template 'std::basic_istream<char>',
+    // or a stream type used by value while only <iosfwd> declared it.
+    let template = TEMPLATE.get_or_init(|| {
+        Regex::new(
+            "error: (?:implicit instantiation of undefined template|.*incomplete (?:return )?type) \
+             ['\u{2018}](?:class )?(std::[^'\u{2019}]+)['\u{2019}]",
+        )
+        .expect("regex")
+    });
+    let caps = template.captures(line)?;
+    let name = normalize_std_template_name(&caps[1]);
+    crate::std_stream_header(&name).map(|_| name)
+}
+
+/// clang: `f.h:136:18: error: extra qualification on member 'name'`; gcc:
+/// `f.h:136:12: error: extra qualification 'Widget::' on member 'name'
+/// [-fpermissive]` (with U+2018/U+2019 quotes in a UTF-8 locale).
+fn extra_member_qualification(line: &str) -> Option<(String, u32, String)> {
+    static R: OnceLock<Regex> = OnceLock::new();
+    if !line.contains("extra qualification") {
+        return None;
+    }
+    let caps = R
+        .get_or_init(|| {
+            Regex::new(
+                "error: extra qualification (?:['\u{2018}][^'\u{2019}]*['\u{2019}] )?on member \
+                 ['\u{2018}]([^'\u{2019}]+)['\u{2019}]",
+            )
+            .expect("regex")
+        })
+        .captures(line)?;
+    let (file, error_line) = diagnostic_location(line)?;
+    Some((file, error_line, caps[1].to_owned()))
 }
 
 fn identifier_at_column(line: &str, one_based_column: usize) -> Option<&str> {

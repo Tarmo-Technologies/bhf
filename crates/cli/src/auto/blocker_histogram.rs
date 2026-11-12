@@ -324,6 +324,7 @@ fn build_error_detail(error: &build_classifier::BuildErrorKind) -> String {
         E::MissingGprImport { .. } => "missing GPR import".to_owned(),
         E::MalformedFunctionDecl { .. } => "malformed function declaration".to_owned(),
         E::ConfigGuardError { .. } => "build-config #error guard".to_owned(),
+        E::ExtraQualification { .. } => "extra member qualification".to_owned(),
         E::Other { tail } => normalize_detail(tail),
     }
 }

@@ -700,6 +700,148 @@ fn attempt_adds_project_source_for_missing_cpp_symbol() {
     }
 }
 
+/// A recovered sibling source that writes to `cerr` under `using namespace std;`
+/// without including `<iostream>` (an old transitive-include assumption) must get
+/// the header force-included and stay linked, not be dropped and stubbed.
+#[test]
+fn attempt_force_includes_stream_header_for_recovered_cpp_source() {
+    use cli::auto::{attempt::*, candidate::*, decl_index::DeclarationIndex, pass::Pass};
+
+    if which::which("clang++").is_err() {
+        eprintln!("skipping: clang++ not on PATH");
+        return;
+    }
+    if which::which("make").is_err() {
+        eprintln!("skipping: make not on PATH");
+        return;
+    }
+    let Some(cxx_flags) = clangxx_libfuzzer_flags("attempt-cpp-stream") else {
+        eprintln!("skipping: clang++ -fsanitize=fuzzer toolchain incomplete");
+        return;
+    };
+
+    let root = tmpdir();
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(
+        src.join("api.cpp"),
+        "#include <string>\n\
+         namespace widgets {\n\
+         int check_record(const std::string &record);\n\
+         int parse_record(const char *data, unsigned long size) {\n\
+             return check_record(std::string(data, size));\n\
+         }\n\
+         }\n",
+    )
+    .unwrap();
+    let helper = src.join("checker.cpp");
+    fs::write(
+        &helper,
+        "#include <string>\n\
+         using namespace std;\n\
+         namespace widgets {\n\
+         int check_record(const string &record) {\n\
+             if (record.empty()) cerr << \"empty record\" << endl;\n\
+             return (int)record.size();\n\
+         }\n\
+         }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("compile_commands.json"),
+        format!(
+            r#"[{{"directory":"{}","file":"{}","command":"clang++ {} -std=c++17 -c {}" }}]"#,
+            src.display(),
+            src.join("api.cpp").display(),
+            cxx_flags.join(" "),
+            src.join("api.cpp").display()
+        ),
+    )
+    .unwrap();
+    let work = root.join("work");
+    fs::create_dir_all(&work).unwrap();
+    let work = fs::canonicalize(&work).unwrap();
+    let candidate = Candidate {
+        harness_id: "H-X0016".to_owned(),
+        lang: Lang::Cpp,
+        source_path: src.join("api.cpp"),
+        line: 4,
+        name: "widgets::parse_record".to_owned(),
+        score: 60,
+        is_static: false,
+        foreign_guard: None,
+        input_reachability: None,
+        dialect: None,
+    };
+    let idx = DeclarationIndex::build(&root).unwrap();
+    let options = AttemptOptions {
+        decoder_limits: Default::default(),
+        force: false,
+        run_untrusted: false,
+        engines: vec![cli::auto::attempt::FuzzEngine::Builtin],
+        ada_main_sources: Default::default(),
+        dir_filter: Default::default(),
+        comparison_progress: false,
+        max_repair_rounds: 48,
+        sanitizers: Default::default(),
+        per_target_time: std::time::Duration::from_secs(5),
+        total_time: None,
+        per_target_finding_count: None,
+        no_stubs: false,
+        passes: vec![Pass::Empty],
+        source_root: Some(src.clone()),
+        project: None,
+        ada_dep_dirs: Vec::new(),
+        mode: actionability::RunMode::Reporting,
+        user_seeds: Vec::new(),
+        extra_include_dirs: Vec::new(),
+        extra_sources: Vec::new(),
+        iterations: None,
+        rss_limit_mb: 2048,
+    };
+
+    let result = attempt(&candidate, &work, &idx, options).unwrap();
+
+    match &result.outcome {
+        Outcome::Built { repairs, .. } | Outcome::BuiltAndFuzzed { repairs, .. } => {
+            assert!(
+                repairs.iter().any(|repair| matches!(
+                    repair,
+                    cli::auto::repair::Repair::AddSource { source_path, .. }
+                        if source_path == &helper
+                )),
+                "expected the checker source to be linked, got {repairs:?}"
+            );
+            assert!(
+                repairs.iter().any(|repair| matches!(
+                    repair,
+                    cli::auto::repair::Repair::TypePlaceholder { type_name }
+                        if type_name == "cerr"
+                )),
+                "expected the stream header repair for cerr, got {repairs:?}"
+            );
+            assert!(
+                !repairs.iter().any(|repair| matches!(
+                    repair,
+                    cli::auto::repair::Repair::StubBlind { symbol }
+                    | cli::auto::repair::Repair::StubDeclared { symbol, .. }
+                        if symbol.contains("check_record")
+                )),
+                "the real source must not be dropped and stubbed: {repairs:?}"
+            );
+            let includes = fs::read_to_string(
+                result
+                    .harness_dir
+                    .join("repairs")
+                    .join(cli::auto::repair::AUTO_CPP_INCLUDES_FILE),
+            )
+            .unwrap();
+            assert!(includes.contains("#include <iostream>"), "{includes}");
+        }
+        other => panic!("expected a build with the checker source, got {other:?}"),
+    }
+}
+
 #[test]
 fn attempt_prefers_sequence_for_cpp_class_method_with_lifecycle_steps() {
     use cli::auto::{attempt::*, candidate::*, decl_index::DeclarationIndex, pass::Pass};

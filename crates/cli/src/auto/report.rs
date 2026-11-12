@@ -1693,6 +1693,13 @@ fn record_failed_build_blockers(
                             .to_owned(),
                     ),
                 ),
+                E::ExtraQualification { file, line, member } => manifest.push_merge_with_hint(
+                    DepKind::Other,
+                    format!("{file}:{line} (member '{member}' declared with an extra class qualification)"),
+                    vec![id.clone()],
+                    false,
+                    Some(EXTRA_QUALIFICATION_HINT.to_owned()),
+                ),
                 E::Other { tail } => manifest.push_merge_with_hint(
                     DepKind::Other,
                     first_error_line(tail),
@@ -1753,6 +1760,13 @@ fn record_failed_build_blockers(
         }
     }
 }
+
+/// Remedy for a member declared inside its class with the class name repeated
+/// (`int Widget::name();`). bhf does not add compiler-family flags on its own.
+const EXTRA_QUALIFICATION_HINT: &str = "only MSVC accepts a member declared with its own \
+     class qualification (`int Widget::name();` inside class Widget); remove the extra \
+     `Widget::`, or rerun with AUTO_EXTRA_INCLUDES=-fms-extensions (clang++) or \
+     AUTO_EXTRA_INCLUDES=-fpermissive (g++) in the environment";
 
 /// Number of manifest entries that list `id` among their referencing targets.
 /// Used to detect whether a failed target contributed any actionable entry.
@@ -3408,6 +3422,31 @@ mod tests {
                 .any(|e| e.name == "build failed for target H-LIB"),
             "no redundant safety-net entry for a lib-only failure"
         );
+    }
+
+    #[test]
+    fn extra_member_qualification_names_the_declaration_and_the_flags() {
+        use build_classifier::BuildErrorKind;
+        let needed = NeededForBuild::default();
+        let mut m = build_dependency_manifest(&needed, &PathBuf::from("/tmp"), "");
+        let failed = vec![(
+            "H-WIDGET".to_owned(),
+            vec![BuildErrorKind::ExtraQualification {
+                file: "src/widget.h".to_owned(),
+                line: 136,
+                member: "name".to_owned(),
+            }],
+        )];
+        record_failed_build_blockers(&mut m, &failed, &PathBuf::from("/tmp"));
+        let text = m.render_text();
+        assert!(text.contains("src/widget.h:136"), "{text}");
+        assert!(text.contains("member 'name'"), "{text}");
+        assert!(
+            text.contains("AUTO_EXTRA_INCLUDES=-fms-extensions"),
+            "{text}"
+        );
+        assert!(text.contains("-fpermissive"), "{text}");
+        assert!(!text.contains("unrecognised build error"), "{text}");
     }
 
     #[test]

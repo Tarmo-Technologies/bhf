@@ -386,7 +386,11 @@ pub fn generate_c_direct_harness(
     let makefile_path = args.output_dir.join("Makefile");
     fs::write(&main_path, main_c)?;
     fs::write(&makefile_path, makefile)?;
-    write_c_portability_artifacts(&args.output_dir, &args.harness_id)?;
+    write_c_portability_artifacts(
+        &args.output_dir,
+        &args.harness_id,
+        context.passthrough_libfuzzer_entrypoint,
+    )?;
 
     Ok(GeneratedCFiles {
         main_c: main_path,
@@ -438,10 +442,12 @@ pub(crate) fn recipe_paths(paths: &[PathBuf]) -> Vec<String> {
 /// Emit the Mayhemfile, PORTABILITY.md, and libFuzzer shim beside a generated C
 /// harness so it can be driven by Mayhem, libFuzzer, AFL++, or honggfuzz. The C
 /// default binary (`main`) reads `argv[1]` as a file (ASan-instrumented), and the
-/// Makefile offers `make libfuzzer`/`make afl`.
+/// Makefile offers `make libfuzzer`/`make afl`. `passthrough` marks a harness
+/// around the project's own `LLVMFuzzerTestOneInput`, which needs no shim.
 fn write_c_portability_artifacts(
     output_dir: &std::path::Path,
     harness_id: &str,
+    passthrough: bool,
 ) -> Result<(), HarnessGenError> {
     crate::portability::write_artifacts(
         output_dir,
@@ -454,6 +460,7 @@ fn write_c_portability_artifacts(
             libfuzzer_binary: Some("main_libfuzzer".to_owned()),
             afl_binary: Some("main_afl".to_owned()),
             crash_on_finding_env: false,
+            passthrough_entrypoint: passthrough,
         },
     )?;
     Ok(())
@@ -481,7 +488,7 @@ pub fn generate_c_sequence_harness(
     let makefile_path = args.output_dir.join("Makefile");
     fs::write(&main_path, main_c)?;
     fs::write(&makefile_path, makefile)?;
-    write_c_portability_artifacts(&args.output_dir, &args.harness_id)?;
+    write_c_portability_artifacts(&args.output_dir, &args.harness_id, false)?;
     // Describe the op program's geometry so the engine can build a
     // structure-aware mutation layout for an input of any length. Without it
     // the sequence mutator has nothing to describe, and every op program is
@@ -5549,6 +5556,84 @@ mod tests {
             "expected an ASan/libFuzzer crash report, got:\n{err}"
         );
 
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// The C counterpart of the passthrough libFuzzer build: the project's
+    /// `LLVMFuzzerTestOneInput` is linked directly, with no shim beside it.
+    #[test]
+    fn make_libfuzzer_links_a_passthrough_entrypoint_directly() {
+        if !libfuzzer_toolchain_available() {
+            eprintln!(
+                "skipping C passthrough make_libfuzzer e2e: clang+libFuzzer+make unavailable"
+            );
+            return;
+        }
+        let out = temp_dir("c_passthrough_libfuzzer");
+        let c_runtime = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../c_runtime")
+            .canonicalize()
+            .expect("c_runtime dir");
+        let driver = out.join("drive_record.c");
+        fs::write(
+            &driver,
+            "#include <stddef.h>\n#include <stdint.h>\n\
+             static int parse_record(const uint8_t *data, size_t size) {\n\
+             \x20   if (size >= 4 && data[0]=='F' && data[1]=='U' && data[2]=='Z' && data[3]=='Z') {\n\
+             \x20       volatile int *p = 0; *p = 1;\n\
+             \x20   }\n\
+             \x20   return 0;\n\
+             }\n\
+             int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {\n\
+             \x20   return parse_record(data, size);\n\
+             }\n",
+        )
+        .unwrap();
+        let mut args = direct_args("c_passthrough_libfuzzer", out.clone());
+        args.target = cfunction("LLVMFuzzerTestOneInput");
+        args.params = vec![
+            CParameter {
+                name: "data".to_owned(),
+                c_type: "const uint8_t *".to_owned(),
+            },
+            CParameter {
+                name: "size".to_owned(),
+                c_type: "size_t".to_owned(),
+            },
+        ];
+        args.target_includes_dirs = vec![out.clone()];
+        args.target_sources = vec![driver.clone()];
+        args.c_runtime_include = c_runtime;
+        generate_c_direct_harness(args).unwrap();
+        assert!(
+            !out.join("bhf_libfuzzer.c").exists(),
+            "no shim for a passthrough"
+        );
+
+        let build = std::process::Command::new("make")
+            .arg("libfuzzer")
+            .current_dir(&out)
+            .output()
+            .expect("run make");
+        assert!(
+            build.status.success(),
+            "make libfuzzer failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr)
+        );
+        let bin = out.join("main_libfuzzer");
+        let crash = out.join("crash.bin");
+        fs::write(&crash, b"FUZZ....").unwrap();
+        let r = std::process::Command::new(&bin)
+            .arg(&crash)
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&r.stderr);
+        assert!(
+            !r.status.success(),
+            "magic input must crash, stderr:\n{err}"
+        );
+        assert!(err.contains("AddressSanitizer"), "{err}");
         fs::remove_dir_all(&out).ok();
     }
 

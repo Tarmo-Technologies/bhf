@@ -114,7 +114,7 @@ their own interpreters with in-process edge coverage.
 | `--install-deps` | off | After the sweep, fetch still-blocking deps from the manifest (apt-get / `alr get`). Opt-in and the only ONLINE part of `auto`; nothing is fatal |
 | `--list-fakes` | — | Print the fake-resource plugin inventory and exit |
 | `--languages <LIST>` (alias `--lang`) | all languages found | Restrict the sweep to a comma-separated subset of source languages. Accepts any of the sixteen fuzzable languages: `ada`, `c`, `cpp`, `rust`, `java`, `python`, `perl`, `go`, `cobol`, `fortran`, `csharp`, `javascript`, `typescript`, `ruby`, `lua`, `php`. Candidates in any other language are dropped **after** discovery (so one discovery cache serves every language subset) and **before** `--list-targets` and `--max-targets`, so the ranked list and the top-N both reflect the filter. Common spellings are accepted (`c++`/`cxx`/`cc`→cpp, `rs`→rust, `py`→python, `pl`→perl, `golang`→go); matching is case-insensitive. The SBOM/SCA pass is unaffected — it always scans the whole tree across all ecosystems regardless of this fuzzing-lane filter |
-| `--target <NAME>` | all discovered targets | Exact target-name filter; repeat to run a small named subset |
+| `--target <NAME>` | all discovered targets | Target-name filter: the full discovered name, the bare name, or a qualified suffix (`Class::method`), optionally with the parameter list. An exact spelling wins; the suffix match applies only when no target has exactly that name. Repeat to run a small named subset. A miss prints the closest names. Selects a project fuzz driver (`LLVMFuzzerTestOneInput`) that other targets would otherwise shadow |
 | `--target-file <PATH>` | all discovered source files | Exact source-file filter; accepts absolute paths or paths relative to the sweep root |
 | `--harness-id <ID>` | all discovered harness ids | Exact stable harness-id filter from a prior auto report |
 | `--exclude-path <TEXT>` | none | Drop targets whose normalized relative source path contains `TEXT`; repeatable |
@@ -320,7 +320,9 @@ discoverable and drivable, each C/C++/Rust/Ada harness dir
 | Ada | `./main < input` (stdin) | — | — |
 
 The libFuzzer binaries use a generated `bhf_libfuzzer.c` shim that forwards
-libFuzzer's `LLVMFuzzerTestOneInput` to bhf's `bhf_run_one`. For Rust it is a
+libFuzzer's `LLVMFuzzerTestOneInput` to bhf's `bhf_run_one`. A harness that
+wraps the project's own `LLVMFuzzerTestOneInput` has no shim: `make libfuzzer`
+links the project's sources directly. For Rust it is a
 separate instrumented build (`build-libfuzzer.sh`), because modern libFuzzer
 cannot consume bhf's default `trace-pc-guard` staticlib.
 

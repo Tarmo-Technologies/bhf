@@ -5,7 +5,7 @@
 //! `Command::output` is not safe at this trust boundary.
 
 use std::collections::VecDeque;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -56,7 +56,13 @@ fn kill_child_tree(child: &mut std::process::Child) {
     let _ = child.kill();
 }
 
-fn read_head_tail(mut reader: impl Read, cap: usize) -> (Vec<u8>, bool) {
+/// Read `reader` to the end, keeping at most `cap` bytes (its head and tail),
+/// and copy every chunk to `forward` as it arrives when one is given.
+fn read_head_tail_forwarding(
+    mut reader: impl Read,
+    cap: usize,
+    mut forward: Option<impl Write>,
+) -> (Vec<u8>, bool) {
     let head_cap = cap / 2;
     let tail_cap = cap.saturating_sub(head_cap);
     let mut head = Vec::with_capacity(head_cap);
@@ -66,6 +72,12 @@ fn read_head_tail(mut reader: impl Read, cap: usize) -> (Vec<u8>, bool) {
     while let Ok(read) = reader.read(&mut chunk) {
         if read == 0 {
             break;
+        }
+        if let Some(sink) = forward.as_mut() {
+            // Forwarding is best effort: a closed terminal must not stop the
+            // capture the caller still needs.
+            let _ = sink.write_all(&chunk[..read]);
+            let _ = sink.flush();
         }
         let mut bytes = &chunk[..read];
         if head.len() < head_cap {
@@ -253,36 +265,6 @@ fn spawn_riding_out_transients(command: &mut Command) -> io::Result<std::process
     command.spawn()
 }
 
-pub(crate) fn status_with_timeout(
-    command: &mut Command,
-    timeout: Duration,
-) -> io::Result<std::process::ExitStatus> {
-    prepare_child(command);
-    let mut child = spawn_riding_out_transients(command)?;
-    let deadline = Instant::now() + clamp_to_campaign(timeout);
-    loop {
-        match child.try_wait() {
-            Err(error) => {
-                kill_child_tree(&mut child);
-                let _ = child.wait();
-                return Err(error);
-            }
-            Ok(Some(status)) => return Ok(status),
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    kill_child_tree(&mut child);
-                    let _ = child.wait();
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "timed out (campaign budget)",
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-        }
-    }
-}
-
 /// Run a command with bounded stdout/stderr and a wall-clock timeout. Both pipes
 /// are drained concurrently so a noisy child cannot deadlock on a full pipe.
 pub(crate) fn output_with_timeout(command: &mut Command, timeout: Duration) -> io::Result<Output> {
@@ -306,6 +288,24 @@ pub(crate) fn output_with_timeout_flagged(
         .map(|captured| (captured.output, captured.timed_out))
 }
 
+/// As [`output_with_timeout`], but the child's stdout and stderr are also
+/// copied to this process's stdout and stderr as they arrive. A long build
+/// stays visible to the operator while its bounded output is kept for
+/// diagnosis afterwards. The flag is true when the child was killed for
+/// exceeding `timeout`.
+pub(crate) fn output_with_timeout_teed(
+    command: &mut Command,
+    timeout: Duration,
+) -> io::Result<(Output, bool)> {
+    capture_impl(
+        command,
+        clamp_to_campaign(timeout),
+        max_stream_bytes(),
+        true,
+    )
+    .map(|captured| (captured.output, captured.timed_out))
+}
+
 /// Variant for consumers (notably external analyzer JSON) that need to reject a
 /// truncated stream rather than treating the bounded head/tail as complete data.
 pub(crate) fn capture_with_timeout(
@@ -313,17 +313,28 @@ pub(crate) fn capture_with_timeout(
     timeout: Duration,
     max_stream_bytes: usize,
 ) -> io::Result<BoundedOutput> {
+    capture_impl(command, timeout, max_stream_bytes, false)
+}
+
+fn capture_impl(
+    command: &mut Command,
+    timeout: Duration,
+    max_stream_bytes: usize,
+    tee: bool,
+) -> io::Result<BoundedOutput> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     prepare_child(command);
     let mut child = spawn_riding_out_transients(command)?;
-    let stdout = child
-        .stdout
-        .take()
-        .map(|pipe| std::thread::spawn(move || read_head_tail(pipe, max_stream_bytes)));
-    let stderr = child
-        .stderr
-        .take()
-        .map(|pipe| std::thread::spawn(move || read_head_tail(pipe, max_stream_bytes)));
+    let stdout = child.stdout.take().map(|pipe| {
+        std::thread::spawn(move || {
+            read_head_tail_forwarding(pipe, max_stream_bytes, tee.then(io::stdout))
+        })
+    });
+    let stderr = child.stderr.take().map(|pipe| {
+        std::thread::spawn(move || {
+            read_head_tail_forwarding(pipe, max_stream_bytes, tee.then(io::stderr))
+        })
+    });
     let deadline = Instant::now() + timeout;
     let (status, timed_out) = loop {
         match child.try_wait() {
@@ -367,6 +378,28 @@ pub(crate) fn capture_with_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn teed_capture_keeps_both_streams_and_reports_a_timeout() {
+        let (output, timed_out) = output_with_timeout_teed(
+            Command::new("sh").args(["-c", "echo built; echo 'undefined reference' >&2; exit 2"]),
+            Duration::from_secs(20),
+        )
+        .unwrap();
+        assert!(!timed_out);
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "built\n");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("undefined reference"));
+
+        let (output, timed_out) = output_with_timeout_teed(
+            Command::new("sh").args(["-c", "sleep 30"]),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        assert!(timed_out);
+        assert!(!output.status.success());
+    }
 
     #[test]
     #[cfg(unix)]
@@ -448,10 +481,17 @@ mod tests {
 
     #[test]
     fn bounded_capture_reports_truncation() {
-        let (bytes, truncated) = read_head_tail(&b"0123456789abcdef"[..], 8);
+        let (bytes, truncated) =
+            read_head_tail_forwarding(&b"0123456789abcdef"[..], 8, None::<io::Sink>);
         assert!(truncated);
         assert!(bytes.starts_with(b"0123"));
         assert!(bytes.ends_with(b"cdef"));
+        // A forwarding sink sees every byte, not just the kept head and tail.
+        let mut forwarded = Vec::new();
+        let (kept, _) =
+            read_head_tail_forwarding(&b"0123456789abcdef"[..], 8, Some(&mut forwarded));
+        assert_eq!(kept, bytes);
+        assert_eq!(forwarded, b"0123456789abcdef");
     }
 
     #[test]

@@ -21,8 +21,8 @@ For manual control against one C++ function:
 ```sh
 bhf list targets path/to/src --top 20
 bhf generate-harness path/to/src/parser.cpp \
-  --target parse \
-  --output bhf_work/generated_harnesses
+  --target Parser::parse \
+  --output bhf_work/harnesses
 bhf build bhf_work --harness H-CPP000A
 bhf fuzz bhf_work --harness H-CPP000A --iterations 1000 --seed-input smoke
 ```
@@ -30,26 +30,37 @@ bhf fuzz bhf_work --harness H-CPP000A --iterations 1000 --seed-input smoke
 Use the actual harness id printed by `generate-harness` or by
 `list-targets`. Stable ids from `list-targets` and `auto` use `H-C...` for C
 and `H-X...` for C++; standalone manual generation defaults to `H-C<line>` or
-`H-CPP<line>` unless `--id` is supplied.
+`H-CPP<line>` unless `--id` is supplied. Generate into `<work>/harnesses/`,
+where `bhf auto` puts its harnesses; `bhf explain` and `bhf capsule` read
+harnesses from there.
+
+To write the harness yourself, wrap an existing `LLVMFuzzerTestOneInput`, or
+edit a generated one, see [Custom C and C++ Harnesses](../custom-harness/).
 
 ## Prerequisites
 
 - `make`
 - `clang` for C harnesses and `clang++` for C++ harnesses
 - a working C++ standard library for C++ harnesses
-- sanitizer support for `-fsanitize=fuzzer,address,undefined`
+- sanitizer support for `-fsanitize=address,undefined` and
+  `-fsanitize-coverage=trace-pc-guard,trace-cmp`; the libFuzzer runtime
+  (`-fsanitize=fuzzer`) only for the optional `make libfuzzer` export
 - `afl-fuzz` plus `afl-clang-fast` / `afl-clang-fast++` only when using AFL++
 - `libbhf_runtrace_shim.so` on Linux when runtime virtualisation is desired
   (the build also stages a `libbhf_runtrace.so` copy beside the `bhf`
   binary, which the auto loop prefers)
 
 Generated C/C++ harnesses are Makefile-based. The default build target creates
-`main`, a libFuzzer-style sanitizer binary. `bhf build --c-engine afl++`
-runs `make afl` and stages `main_afl` for `bhf fuzz --engine afl++`.
+`main`: bhf's own driver (a framed fork server plus a SanitizerCoverage
+runtime), built with ASan and UBSan. It is not a libFuzzer binary;
+`make libfuzzer` builds one for other fuzzers (see the harness's
+`PORTABILITY.md`). `bhf build --c-engine afl++` runs `make afl` and stages
+`main_afl` for `bhf fuzz --engine afl++`.
 When make's built-in compiler defaults are still `cc` / `g++`, the generated
-Makefile and `bhf build` prefer `clang` / `clang++` because
-`-fsanitize=fuzzer` is a clang feature. Pass `CC=...` or `CXX=...` explicitly
-to override that choice.
+Makefile and `bhf build` prefer `clang` / `clang++`. The generated sanitizer
+and coverage flags are clang's unless the harness was generated from a gcc
+compile database, so leave `CC`/`CXX` unset or point them at clang; a
+`CXX=g++` build of a clang Makefile fails on unrecognized options.
 
 ## Discovery
 
@@ -78,7 +89,23 @@ keeps reported locations pointing at the original source.
 ## Harness Generation
 
 C and C++ manual harness generation requires `--target`; there is no implicit
-"best target" selection for these languages.
+"best target" selection for these languages. For C++, these spellings select
+`widgets::Codec::decode`:
+
+| Spelling | Example |
+|---|---|
+| Bare name | `decode` |
+| Qualified suffix | `Codec::decode` |
+| Fully qualified, as `bhf list targets` prints it | `widgets::Codec::decode` |
+| Any of those with a parameter list | `Codec::decode(const unsigned char *, size_t)` |
+
+An exact spelling wins over a suffix: a suffix is tried only when no
+definition has exactly that name, so `Codec::decode` names a global `Codec`
+even when `widgets::Codec` also exists. A leading `::` (`::Codec::decode`)
+names the global namespace only. When a spelling matches several
+definitions, bhf picks the first, prints all of them, and `--target-line N`
+selects one. A spelling that matches nothing fails with the closest
+definitions in the file. `bhf auto --target` accepts the same spellings.
 
 Useful flags:
 
@@ -113,7 +140,27 @@ conventional out-of-source build directories (`build/`, `builddir/`,
 source, so a database an integrator hands over is consumed with **no build
 execution**. Compile database entries contribute include paths, forced include
 files, defines/undefines, `-std=...`, and `-pthread` flags to the generated
-Makefile.
+Makefile. A forced include (`-include FILE`, `-imacros FILE`) is made absolute
+only when the file exists relative to the entry's `directory`; otherwise it is
+kept as written, so `-include iostream` still finds the system header through
+the include search path.
+
+`bhf build` compiles exactly the sources the Makefile lists; it has no repair
+loop. When the link fails on symbols defined elsewhere in the tree, it prints
+the defining files with the `--extra-source` flags to regenerate with and an
+`AUTO_EXTRA_SOURCES=... bhf build ...` command that needs no regeneration. It
+also suggests `AUTO_EXTRA_INCLUDES='-include iostream'` for standard streams
+used without their header, and `-fms-extensions` (clang++) or `-fpermissive`
+(g++) for a member declared with an extra class qualification
+(`int Widget::name();` inside class `Widget`), which only MSVC accepts. Each
+suggested command keeps the build variables you already set, and when several
+apply a last line combines them. `bhf auto` reports the same extra
+qualification with the flag to set but does not add it itself. Extra build
+input comes from the environment:
+`AUTO_EXTRA_SOURCES` (sources), `AUTO_EXTRA_INCLUDES` (any compile flags:
+`-I`, `-D`, `-include`, `-fms-extensions`), `AUTO_EXTRA_LDFLAGS` (link flags)
+and `CXX_STD`/`C_STD` (language standard). Do not use `CXXFLAGS`/`CFLAGS` for
+this: they replace the sanitizer and coverage flags.
 
 To *recover* a database when none exists, `--probe-build` runs the project's own
 build offline and captures the real compile flags. It detects and drives CMake
@@ -456,7 +503,9 @@ runs even without one.
 - Complex object graphs, custom allocators, ownership-bearing pointer-to-pointer
   APIs beyond nullable `void **` output slots, callbacks that require semantic
   side effects, unsupported constructors, non-aggregate C++ class inputs, and
-  virtual dispatch usually need a hand-written wrapper.
+  virtual dispatch usually need a hand-written wrapper. See
+  [Custom C and C++ Harnesses](../custom-harness/) for writing one and
+  running it through `bhf build`, `bhf fuzz` and the triage commands.
 - Build-system ingestion consumes a pre-existing `compile_commands.json`;
   `--probe-build` recovers one from CMake, Meson, MSBuild, Make/autotools,
   Ninja, Bazel, and SCons; and `--build-command` recovers one from any other

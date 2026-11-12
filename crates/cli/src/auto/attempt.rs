@@ -3607,11 +3607,19 @@ fn run_attempt(
                 let c_build_output =
                     std::fs::read_to_string(harness_dir.join("repairs").join(C_BUILD_OUTPUT_LOG))
                         .unwrap_or_default();
-                if let Some(ejected) = eject_unbuildable_added_source(
-                    &c_build_output,
-                    &mut extra_sources,
-                    &options.extra_sources,
-                ) {
+                // A recovered unit that only lacks a standard stream header (`cerr`
+                // used without `<iostream>`) is repairable: force-include the header
+                // this round, and eject the unit only if it still fails afterwards.
+                let ejected = if std_stream_include_pending(&errors, &manifest) {
+                    None
+                } else {
+                    eject_unbuildable_added_source(
+                        &c_build_output,
+                        &mut extra_sources,
+                        &options.extra_sources,
+                    )
+                };
+                if let Some(ejected) = ejected {
                     bhfeprintln!(
                         "bhf auto: {}: recovered source {} does not compile in \
                          isolation; dropping it and stubbing the symbols it \
@@ -6795,6 +6803,20 @@ fn persist_c_build_output(work_dir: &Path, harness_id: &str, raw: &str) {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::write(log, raw);
+}
+
+/// Whether `errors` name a standard stream object or class (`cerr`,
+/// `std::istream`) whose header has not been force-included yet. Such a build
+/// failure is one repair away from compiling, so no source is ejected for it.
+fn std_stream_include_pending(
+    errors: &[BuildErrorKind],
+    manifest: &crate::auto::repair::RepairManifest,
+) -> bool {
+    errors.iter().any(|error| {
+        matches!(error, BuildErrorKind::MissingType { name }
+            if build_classifier::std_stream_header(name).is_some()
+                && !manifest.already_attempted(name))
+    })
 }
 
 /// Drop one auto-added translation unit that the compiler is complaining ABOUT,
@@ -11946,6 +11968,29 @@ mod eject_unbuildable_added_source_tests {
     //! error kinds carry a name and no location (`IncompleteType` is just a type
     //! name), so the classified list cannot say which file failed.
     use super::*;
+
+    #[test]
+    fn a_pending_std_stream_include_defers_ejection_once() {
+        use crate::auto::repair::{Repair, RepairManifest};
+        let cerr = vec![BuildErrorKind::MissingType {
+            name: "cerr".to_owned(),
+        }];
+        let mut manifest = RepairManifest::default();
+        assert!(std_stream_include_pending(&cerr, &manifest));
+        // Once the header was force-included, a source that still fails can go.
+        manifest.repairs.push(Repair::TypePlaceholder {
+            type_name: "cerr".to_owned(),
+        });
+        assert!(!std_stream_include_pending(&cerr, &manifest));
+        // Any other missing name is not a pending stream include.
+        let other = vec![BuildErrorKind::MissingType {
+            name: "widget_t".to_owned(),
+        }];
+        assert!(!std_stream_include_pending(
+            &other,
+            &RepairManifest::default()
+        ));
+    }
 
     #[test]
     fn the_blamed_source_is_the_one_dropped() {

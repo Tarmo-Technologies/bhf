@@ -98,9 +98,46 @@ pub enum BuildErrorKind {
         line: u32,
         message: String,
     },
+    /// A member declared inside its class with the class name repeated
+    /// (`int Widget::name();` within `class Widget`), which only MSVC accepts.
+    /// clang accepts it under `-fms-extensions` and g++ under `-fpermissive`; no
+    /// `-std=` accepts it, so the dialect ladder cannot help. `file:line` is the
+    /// declaration, `member` the member's name.
+    ExtraQualification {
+        file: String,
+        line: u32,
+        member: String,
+    },
     Other {
         tail: String,
     },
+}
+
+/// The C++ standard header that declares a stream object, manipulator or stream
+/// class: `cerr`/`std::cerr`/`endl`/`std::istream` -> `iostream`, `ifstream` ->
+/// `fstream`, `stringstream` -> `sstream`. The manipulators `ends`, `flush` and
+/// `ws` count only when written `std::`-qualified, since the bare names are
+/// common project identifiers.
+///
+/// Pre-standard C++ often reached these through a transitive include that a
+/// modern standard library no longer provides, so a missing `#include
+/// <iostream>` surfaces as "undeclared identifier 'cerr'" or an implicit
+/// instantiation of `std::basic_istream<char>`. `None` for any other name.
+pub fn std_stream_header(name: &str) -> Option<&'static str> {
+    let name = name.trim();
+    let qualified = name.starts_with("std::");
+    let bare = name.strip_prefix("std::").unwrap_or(name);
+    Some(match bare {
+        "cin" | "cout" | "cerr" | "clog" | "wcin" | "wcout" | "wcerr" | "wclog" | "endl"
+        | "istream" | "ostream" | "iostream" | "wistream" | "wostream" | "wiostream"
+        | "streambuf" | "wstreambuf" => "iostream",
+        "ends" | "flush" | "ws" if qualified => "iostream",
+        "ifstream" | "ofstream" | "fstream" | "wifstream" | "wofstream" | "wfstream"
+        | "filebuf" | "wfilebuf" => "fstream",
+        "istringstream" | "ostringstream" | "stringstream" | "wistringstream"
+        | "wostringstream" | "wstringstream" | "stringbuf" | "wstringbuf" => "sstream",
+        _ => return None,
+    })
 }
 
 /// Classify a captured stderr against both toolchain regex packs.
@@ -1081,6 +1118,121 @@ mod tests {
             )),
             "got {kinds:?}"
         );
+    }
+
+    #[test]
+    fn std_stream_identifiers_classify_as_missing_iostream_names() {
+        // clang and gcc spellings (ASCII and UTF-8 quotes) of a source that uses
+        // the standard streams without including <iostream>.
+        let cases = [
+            ("parser.cpp:331:2: error: use of undeclared identifier 'cerr'", "cerr"),
+            (
+                "parser.cpp:3:27: error: use of undeclared identifier 'endl'; did you mean 'end'?",
+                "endl",
+            ),
+            ("parser.cpp:9:3: error: \u{2018}cout\u{2019} was not declared in this scope", "cout"),
+            ("parser.cpp:9:3: error: 'clog' was not declared in this scope", "clog"),
+            ("parser.cpp:9:3: error: use of undeclared identifier 'cin'", "cin"),
+            (
+                "parser.cpp:4:17: error: no member named 'cout' in namespace 'std'",
+                "std::cout",
+            ),
+            (
+                "parser.cpp:4:17: error: \u{2018}cerr\u{2019} is not a member of \u{2018}std\u{2019}",
+                "std::cerr",
+            ),
+            (
+                "lexer.cpp:52:19: error: implicit instantiation of undefined template 'std::basic_istream<char>'",
+                "std::istream",
+            ),
+            (
+                "lexer.cpp:52:19: error: implicit instantiation of undefined template 'std::basic_ifstream<wchar_t>'",
+                "std::wifstream",
+            ),
+        ];
+        for (line, expected) in cases {
+            let kinds = classify(line);
+            assert_eq!(
+                kinds,
+                vec![BuildErrorKind::MissingType {
+                    name: expected.to_owned()
+                }],
+                "{line}"
+            );
+        }
+        // Other undeclared lowercase identifiers keep their old classification.
+        assert!(matches!(
+            classify("x.cpp:4:5: error: 'state' was not declared in this scope").as_slice(),
+            [BuildErrorKind::Other { .. }]
+        ));
+        assert!(matches!(
+            classify("x.cpp:4:5: error: no member named 'widget' in namespace 'std'").as_slice(),
+            [BuildErrorKind::Other { .. }]
+        ));
+    }
+
+    #[test]
+    fn extra_member_qualification_is_classified_with_its_location() {
+        let expected = |file: &str, member: &str| BuildErrorKind::ExtraQualification {
+            file: file.to_owned(),
+            line: 136,
+            member: member.to_owned(),
+        };
+        for (line, file, member) in [
+            (
+                "src/widget.h:136:18: error: extra qualification on member 'name'",
+                "src/widget.h",
+                "name",
+            ),
+            (
+                "src/widget.h:136:12: error: extra qualification 'Widget::' on member 'name' [-fpermissive]",
+                "src/widget.h",
+                "name",
+            ),
+            (
+                "inc/w.h:136:12: error: extra qualification \u{2018}ns::Widget::\u{2019} on member \u{2018}set\u{2019} [-fpermissive]",
+                "inc/w.h",
+                "set",
+            ),
+        ] {
+            assert_eq!(classify(line), vec![expected(file, member)], "{line}");
+        }
+        // The same header included by two translation units is one cause.
+        let twice = "src/widget.h:136:18: error: extra qualification on member 'name'\n\
+                     src/widget.h:136:18: error: extra qualification on member 'name'\n";
+        assert_eq!(classify(twice).len(), 1);
+        // Accepted under -fpermissive it is only a warning, not a build error.
+        assert!(matches!(
+            classify("src/widget.h:136:12: warning: extra qualification 'Widget::' on member 'name' [-fpermissive]")
+                .as_slice(),
+            [BuildErrorKind::Other { .. }]
+        ));
+    }
+
+    #[test]
+    fn std_stream_header_names_the_declaring_header() {
+        for (name, header) in [
+            ("cerr", "iostream"),
+            ("std::cout", "iostream"),
+            ("wclog", "iostream"),
+            ("endl", "iostream"),
+            ("std::istream", "iostream"),
+            ("ofstream", "fstream"),
+            ("std::stringstream", "sstream"),
+        ] {
+            assert_eq!(std_stream_header(name), Some(header), "{name}");
+        }
+        assert_eq!(std_stream_header("state"), None);
+        assert_eq!(std_stream_header("std::vector"), None);
+        // Bare manipulator names are common project identifiers.
+        for bare in ["ws", "flush", "ends"] {
+            assert_eq!(std_stream_header(bare), None, "{bare}");
+            assert_eq!(
+                std_stream_header(&format!("std::{bare}")),
+                Some("iostream"),
+                "{bare}"
+            );
+        }
     }
 
     #[test]

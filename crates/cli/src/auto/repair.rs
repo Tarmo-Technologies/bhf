@@ -3576,6 +3576,12 @@ pub(crate) fn plan_repair_forced_with_source_policy(
                 macro_required_integer_value(&source, &name).unwrap_or_else(|| "1".to_owned());
             Some(Repair::ConfigGuardDefine { name, value })
         }
+        // `int Widget::name();` inside class Widget. No `-std=` accepts it; only
+        // a compiler-family flag does (`-fms-extensions` for clang,
+        // `-fpermissive` for g++), and repairs here add sources, headers and
+        // definitions, not compile flags. The report names the flag, which the
+        // operator passes through AUTO_EXTRA_INCLUDES.
+        BuildErrorKind::ExtraQualification { .. } => None,
     }
 }
 

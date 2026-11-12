@@ -129,15 +129,25 @@ main_afl: main.cpp $(CONTEXT_AFL_OBJECTS) $(REPAIR_CONTEXT_AFL_OBJECTS)
 	$(AFLPP_CXX) $(AFLPP_CXXFLAGS) $(SECTION_FLAGS) $(COMPILE_DB_FLAGS) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) -o $@ main.cpp{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_AFL_OBJECTS) $(REPAIR_CONTEXT_AFL_OBJECTS) $(AUTO_EXTRA_SOURCES) $(BUILD_CONTEXT_LDFLAGS) $(SECTION_LDFLAGS) $(AUTO_EXTRA_LDFLAGS)
 
 # Portable libFuzzer binary (also drivable by Mayhem coverage-guided / honggfuzz).
+libfuzzer: main_libfuzzer
+{%- if passthrough_libfuzzer_entrypoint is defined and passthrough_libfuzzer_entrypoint %}
+
+# The project's own source defines `LLVMFuzzerTestOneInput`, so libFuzzer drives
+# it directly: the project sources are linked with `-fsanitize=fuzzer` and neither
+# main.cpp (bhf's driver around the same entry point) nor a shim is compiled.
+# See PORTABILITY.md.
+main_libfuzzer: $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS)
+	$(LIBFUZZER_CXX) $(LIBFUZZER_CXXFLAGS) $(SECTION_FLAGS) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) -o $@{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS) $(AUTO_EXTRA_SOURCES) $(BUILD_CONTEXT_LDFLAGS) $(SECTION_LDFLAGS) $(AUTO_EXTRA_LDFLAGS)
+{%- else %}
+
 # The shim is C; compile it `-x c` into its own object (the C++ `main.cpp` declares
 # `bhf_run_one` extern "C", so the C-linkage symbol matches). See PORTABILITY.md.
-libfuzzer: main_libfuzzer
-
 bhf_libfuzzer.o: bhf_libfuzzer.c
 	$(LIBFUZZER_CXX) -x c -O1 -g -fno-omit-frame-pointer -fsanitize=fuzzer,address,undefined -c -o $@ bhf_libfuzzer.c
 
 main_libfuzzer: main.cpp bhf_libfuzzer.o $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS)
 	$(LIBFUZZER_CXX) $(LIBFUZZER_CXXFLAGS) $(SECTION_FLAGS) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) -DBHF_EXTERNAL_DRIVER -o $@ main.cpp bhf_libfuzzer.o{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS) $(AUTO_EXTRA_SOURCES) $(BUILD_CONTEXT_LDFLAGS) $(SECTION_LDFLAGS) $(AUTO_EXTRA_LDFLAGS)
+{%- endif %}
 
 cov: main_cov
 
