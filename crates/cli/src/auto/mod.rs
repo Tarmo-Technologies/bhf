@@ -69,6 +69,7 @@ pub mod run_status;
 pub mod runtrace;
 pub mod rust_build;
 pub mod script_load_roots;
+pub(crate) mod seed_manifest;
 pub mod shim_path;
 pub mod sink_oracle;
 pub mod storage;

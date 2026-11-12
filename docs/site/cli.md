@@ -560,8 +560,9 @@ JSON output. Use that id with `bhf auto --harness-id <ID>` to rerun one
 specific target when names collide across files.
 
 `bhf fuzz` runs the built-in engine against a built harness under
-`bhf_work/build/<harness-id>/`. It accepts literal `--seed-input` values,
-`--seed-file` bytes, or prototype `--symbolic-seed-source` Ada files whose
+`bhf_work/build/<harness-id>/`. It accepts literal `--seed-input` values
+(their UTF-8 bytes), `--seed-file` bytes (used byte for byte, so binary seeds
+belong there), or prototype `--symbolic-seed-source` Ada files whose
 guarded string literals are mined into seed bytes. It writes corpus entries under
 `bhf_work/corpus/`, emits findings under `bhf_work/findings/`, and stores
 the latest run metadata in `bhf_work/fuzz_runs/<harness-id>-latest.json`.
@@ -760,7 +761,8 @@ Flags:
 - `--exclude <tests,tools,examples>` — drop common project areas before attempts run.
 - `--no-stubs` — skip the build-time repair planner (diagnostics mode).
 - `--mode reporting|attacking` — actionability profile and, in attacking mode, target scheduling.
-- `--seed-file <PATH>` / `--seed-dir <DIR>` — seed bytes bootstrapped into every target's corpus (a real `.zip`, `.bz2`, sample document) so parsers reach deep code. Repeatable.
+- `--seed-file <PATH>` / `--seed-dir <DIR>` — seed bytes bootstrapped into every target's corpus (a real `.zip`, `.bz2`, sample document) so parsers reach deep code. Used byte for byte. Repeatable. Without them, auto mines seeds from the tree's own test data.
+- `--no-seed-mining` — do not mine seeds from the tree's test data (config key `seed-mining = false`). Every run lists the seeds it used in `auto/seeds.json`; `-v` prints them.
 - `--extra-include <DIR>` — extra C/C++ include dirs for dependency headers outside the swept tree (cFE OSAL/PSP, a vendored SDK's `include/`). Read from local disk only. Repeatable.
 - `--max-decode-depth <N>` — C decoder synthesis: max recursion depth for nested struct/union/array decoders; past it a field is left zeroed. Default `4`.
 - `--max-array-elems <N>` — C decoder synthesis: max elements decoded per fixed array (a larger array fuzzes its fill count `0..cap` instead of every slot). Default `64`.

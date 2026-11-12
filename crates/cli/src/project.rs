@@ -633,6 +633,7 @@ fn plan_to_fuzz_args(
         no_fork_server: false,
         seed_inputs: Vec::new(),
         seed_files,
+        seed_bytes: Vec::new(),
         sanitizers: Vec::new(),
         symbolic_seed_sources: Vec::new(),
         rng_seed: 0x4756_4655_5a5a,

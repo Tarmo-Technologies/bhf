@@ -9329,6 +9329,78 @@ mod corpus_reseed_tests {
         let mut capped = Vec::new();
         assert_eq!(reseed_from_corpus_queue(&work, "H-RS", &mut capped, 1), 1);
     }
+
+    #[test]
+    #[cfg(unix)]
+    fn reseeded_queue_entry_reaches_the_engine_unchanged() {
+        // A later cascade pass (and the AFL++ stage) reseeds from the queue the
+        // earlier passes persisted. A queue entry that is not valid UTF-8 must be
+        // run exactly as stored, not rewritten on its way back into the engine.
+        use std::os::unix::fs::PermissionsExt;
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("bhf-reseed-bytes-{nonce}"));
+        let work = root.join("bhf_work");
+        let mut entry: Vec<u8> = vec![0xab, 0xcd, 0xef, 0x99, 0x00, 0x80, 0xff];
+        entry.extend((0x80..=0xffu8).rev());
+        let queue = work.join("corpus").join("H-RQ").join("queue");
+        std::fs::create_dir_all(&queue).unwrap();
+        std::fs::write(queue.join("entry.bin"), &entry).unwrap();
+        let expected = root.join("expected.bin");
+        std::fs::write(&expected, &entry).unwrap();
+        // Crashes only on the byte-exact queue entry.
+        let build = work.join("build").join("H-RQ");
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::write(build.join("main.c"), "// marker for libFuzzer detection\n").unwrap();
+        let harness = build.join("main");
+        std::fs::write(
+            &harness,
+            format!(
+                "#!/bin/sh\n\
+                 if cmp -s \"$1\" '{}'; then\n\
+                   >&2 echo 'ERROR: AddressSanitizer: heap-buffer-overflow on address 0x701 at pc 0x444'\n\
+                   >&2 echo '    #0 0x444 in parse_record /src/record.c:21'\n\
+                   >&2 echo '    #1 0x445 in LLVMFuzzerTestOneInput /src/h.c:20'\n\
+                   exit 1\n\
+                 fi\n\
+                 exit 0\n",
+                expected.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&harness, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut seeds = vec![b"".to_vec(), b"A".to_vec()];
+        assert_eq!(
+            reseed_from_corpus_queue(&work, "H-RQ", &mut seeds, CORPUS_RESEED_CAP),
+            1
+        );
+        let summary = crate::fuzz::run_one_target_programmatic(
+            &work,
+            "H-RQ",
+            seeds,
+            4,
+            None,
+            None,
+            0,
+            &[],
+            actionability::RunMode::Reporting,
+            None,
+            &[],
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(summary.findings.len(), 1, "{:?}", summary.findings);
+        let testcase = std::fs::read(
+            corpus::layout::finding_dir(&work, &summary.findings[0]).join("testcase.bin"),
+        )
+        .unwrap();
+        assert_eq!(testcase, entry, "the reseeded entry must run byte for byte");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 #[cfg(test)]

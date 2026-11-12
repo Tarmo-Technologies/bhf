@@ -4,7 +4,24 @@
 
 ## Unreleased
 
+### Fixed
+- `bhf auto` seeds are byte-exact. Mined seeds, `--seed-file`, `--seed-dir` and
+  corpus entries reseeded into later passes or the AFL++ stage used to pass
+  through a UTF-8 conversion that replaced every invalid byte with `EF BF BD`,
+  so binary formats were fuzzed from mangled inputs. Corpora in work dirs from
+  earlier runs can still hold such entries and are reseeded; delete
+  `<work>/corpus/` or use a fresh work dir.
+- The `bhf auto` AFL++ stage cut every seed to 4096 bytes. It now uses the run's
+  resolved `--max-len`; a fixed `--max-len` below AFL++'s 1 MiB default is also
+  passed to afl-fuzz as `-G` when its `-h` lists that option (AFL++ 4.00c or
+  newer). An older afl-fuzz gets only the capped seeds, and stderr says so.
+- Seed mining no longer takes build and IDE artifacts (`.vcxproj`, `.sln`,
+  `.filters`, `.user`, `.suo`, `.props`, `.pdb`, `.dll`, `.lib`, `.obj`, `.ilk`,
+  `.exp`, ...) from test-data directories. Pass such files with `--seed-dir`
+  when the target parses them.
+
 ### Changed
+- `bhf auto --seed-dir` reads a directory's files in name order.
 - Ada static rules run on a statement and scope model instead of line
   matching. BHF-409 now reports only Unchecked_Conversion to an access type
   (and Address_To_Access_Conversions), BHF-410 a double free through an alias,
@@ -18,6 +35,12 @@
   CWE-362 -> CWE-567 (Base entries).
 
 ### Added
+- `auto/seeds.json` lists every seed a `bhf auto` run used (path, source
+  `user`/`mined`, size, bytes used, sha256), and `run.json` gains an additive
+  `seeds` summary that points to it. `-v` prints the list. A run that stops
+  before resolving seeds removes a list left by an earlier run in the work dir.
+- `bhf auto --no-seed-mining` and the config key `seed-mining = false` turn off
+  seeding from the tree's own test data.
 - Ada rules BHF-564 (index/range checks suppressed), BHF-565 (overflow check
   suppressed), BHF-566 (local `'Unchecked_Access` escapes), BHF-567 (address
   overlay), BHF-568 (unsafe C function imported), BHF-569 (secret logged),

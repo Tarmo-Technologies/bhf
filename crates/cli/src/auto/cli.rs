@@ -358,6 +358,14 @@ pub struct AutoArgs {
     #[arg(long = "seed-dir", value_name = "DIR")]
     pub seed_dirs: Vec<PathBuf>,
 
+    /// Do not harvest seeds from the tree's own test-data directories. Without
+    /// `--seed-file`/`--seed-dir`, auto otherwise seeds every target from the
+    /// data files it finds there (source, build and IDE files excluded). The
+    /// seeds a run used are listed in `auto/seeds.json` (and with `-v`). Also
+    /// settable as `seed-mining = false` in the project config.
+    #[arg(long = "no-seed-mining")]
+    pub no_seed_mining: bool,
+
     /// Actionability profile to optimize for.
     #[arg(long, default_value_t = actionability::RunMode::Reporting)]
     pub mode: actionability::RunMode,
@@ -655,7 +663,11 @@ pub struct AutoArgs {
 /// engine presents only its current adaptive-length prefix to the mutator, so
 /// preserving a larger initial sample does not clone multi-megabyte inputs on
 /// every mutation. The cap still prevents one huge sample from collapsing a run.
-fn load_seed_inputs(seed_files: &[PathBuf], seed_dirs: &[PathBuf], cap: usize) -> Vec<Vec<u8>> {
+fn load_seed_inputs(
+    seed_files: &[PathBuf],
+    seed_dirs: &[PathBuf],
+    cap: usize,
+) -> Vec<crate::auto::seed_manifest::LoadedSeed> {
     let cap = cap.max(1);
     let corpus_entry_limit = crate::fuzz::corpus_limits(cap).entries;
     let mut seeds = Vec::new();
@@ -674,7 +686,11 @@ fn load_seed_inputs(seed_files: &[PathBuf], seed_dirs: &[PathBuf], cap: usize) -
                         path.display()
                     );
                 }
-                seeds.push(bytes);
+                seeds.push(crate::auto::seed_manifest::LoadedSeed {
+                    path: path.to_path_buf(),
+                    bytes,
+                    file_size: original_len,
+                });
             }
             Err(error) => {
                 bhfeprintln!("bhf auto: skipping seed file '{}': {error}", path.display())
@@ -687,11 +703,15 @@ fn load_seed_inputs(seed_files: &[PathBuf], seed_dirs: &[PathBuf], cap: usize) -
     for dir in seed_dirs {
         match std::fs::read_dir(dir) {
             Ok(entries) => {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_file() {
-                        push_path(&path);
-                    }
+                // Sorted, so the manifest and the seed order are reproducible.
+                let mut paths: Vec<PathBuf> = entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| path.is_file())
+                    .collect();
+                paths.sort();
+                for path in paths {
+                    push_path(&path);
                 }
             }
             Err(error) => bhfeprintln!("bhf auto: skipping seed dir '{}': {error}", dir.display()),
@@ -704,6 +724,70 @@ fn load_seed_inputs(seed_files: &[PathBuf], seed_dirs: &[PathBuf], cap: usize) -
         );
     }
     seeds
+}
+
+/// Load the run's seeds: explicit `--seed-file`/`--seed-dir` inputs, or (when
+/// none were given and mining is on) the tree's own test-data files. Every seed
+/// is recorded in `auto/seeds.json` and, under `-v`, listed on stderr. The
+/// bytes are returned exactly as read.
+fn resolve_auto_seeds(
+    args: &AutoArgs,
+    tree_root: &std::path::Path,
+    work: &std::path::Path,
+    seed_cap: usize,
+) -> Vec<Vec<u8>> {
+    use crate::auto::seed_manifest::{SeedManifest, SeedMining, SeedSource};
+    let user_seeds = load_seed_inputs(&args.seed_files, &args.seed_dirs, seed_cap);
+    let (mining, source, seeds) = if !user_seeds.is_empty() {
+        bhfeprintln!(
+            "bhf auto: {} user seed input(s) added to each target's corpus",
+            user_seeds.len()
+        );
+        (SeedMining::SkippedUserSeeds, SeedSource::User, user_seeds)
+    } else if args.no_seed_mining {
+        (SeedMining::Disabled, SeedSource::Mined, Vec::new())
+    } else {
+        // No seeds given: harvest the project's own test-data files. A parser
+        // reached through random bytes spends its budget bouncing off the header
+        // check, while the same harness given one real archive or document starts
+        // INSIDE the format. Projects already ship those files next to their
+        // tests; bhf used to walk straight past them. Explicit `--seed-*` wins,
+        // so this can never override what an operator asked for.
+        let mined = crate::auto::recipe_mining::mine_seed_corpus(tree_root);
+        let mined_seeds = if mined.is_empty() {
+            Vec::new()
+        } else {
+            load_seed_inputs(&mined, &[], seed_cap)
+        };
+        if !mined_seeds.is_empty() {
+            bhfeprintln!(
+                "bhf auto: {} seed input(s) mined from the tree's own test data \
+                 (pass --seed-dir to override, --no-seed-mining to disable)",
+                mined_seeds.len()
+            );
+        }
+        (SeedMining::Ran, SeedSource::Mined, mined_seeds)
+    };
+    let manifest = SeedManifest::new(mining, &seeds, source);
+    match crate::auto::seed_manifest::write(work, &manifest) {
+        Ok(manifest_path) => {
+            if !seeds.is_empty() {
+                bhfeprintln!("bhf auto: seed list: {}", manifest_path.display());
+            }
+        }
+        Err(error) => bhfeprintln!("bhf auto: warning: could not write the seed list: {error}"),
+    }
+    if args.verbose {
+        for entry in &manifest.seeds {
+            bhfeprintln!(
+                "bhf auto:   seed {} ({} bytes, sha256 {})",
+                entry.path,
+                entry.bytes_used,
+                &entry.sha256[..16]
+            );
+        }
+    }
+    seeds.into_iter().map(|seed| seed.bytes).collect()
 }
 
 fn sanitizer_replay_enabled(
@@ -1349,6 +1433,15 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         finish_dependency_pointer(&work, &mut dependency_pointer_guard);
         return Ok(0);
     }
+    // Every path from here writes this run's run.json. The seed list is written
+    // only once seeds are resolved, so drop one an earlier run left behind, or a
+    // run that stops first would report the earlier run's seeds as its own.
+    crate::auto::seed_manifest::remove_stale(&work).with_context(|| {
+        format!(
+            "remove the seed list an earlier run left at {}",
+            crate::auto::seed_manifest::manifest_path(&work).display()
+        )
+    })?;
     if candidates.is_empty() {
         // --static is a whole-tree scan independent of fuzzable targets, so it
         // must run even when discovery finds nothing to fuzz (config files,
@@ -1495,33 +1588,7 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
             .parse::<usize>()
             .unwrap_or(crate::fuzz::DEFAULT_MAX_LEN)
     };
-    let mut user_seeds = load_seed_inputs(&args.seed_files, &args.seed_dirs, seed_cap);
-    if !user_seeds.is_empty() {
-        bhfeprintln!(
-            "bhf auto: {} user seed input(s) added to each target's corpus",
-            user_seeds.len()
-        );
-    }
-    // No seeds given: harvest the project's own test-data files. A parser
-    // reached through random bytes spends its budget bouncing off the header
-    // check, while the same harness given one real archive or document starts
-    // INSIDE the format. Projects already ship those files next to their tests;
-    // bhf used to walk straight past them. Explicit `--seed-*` wins, so this
-    // can never override what an operator asked for.
-    if user_seeds.is_empty() {
-        let mined = crate::auto::recipe_mining::mine_seed_corpus(&path);
-        if !mined.is_empty() {
-            let mined_seeds = load_seed_inputs(&mined, &[], seed_cap);
-            if !mined_seeds.is_empty() {
-                bhfeprintln!(
-                    "bhf auto: {} seed input(s) mined from the tree's own test data \
-                     (pass --seed-dir to override)",
-                    mined_seeds.len()
-                );
-                user_seeds = mined_seeds;
-            }
-        }
-    }
+    let user_seeds = resolve_auto_seeds(&args, &path, &work, seed_cap);
     // Dependency-scan mode builds each target (stubbing as it goes) but runs no
     // fuzz passes — an empty pass list makes `attempt` return `Built`, and the
     // manifest is emitted as usual.
@@ -5580,11 +5647,11 @@ mod tests {
         std::fs::write(dir.join("a.bin"), b"BB").unwrap();
         std::fs::write(dir.join("b.bin"), b"C").unwrap();
 
-        let seeds = load_seed_inputs(
+        let seeds = seed_bytes(load_seed_inputs(
             &[file, base.join("missing.bin")],
             std::slice::from_ref(&dir),
             crate::fuzz::DEFAULT_MAX_LEN,
-        );
+        ));
 
         // 1 readable file (missing one skipped) + 2 dir entries.
         assert_eq!(seeds.len(), 3);
@@ -5607,7 +5674,11 @@ mod tests {
         let small = base.join("small.bin");
         std::fs::write(&small, b"hello").unwrap();
 
-        let seeds = load_seed_inputs(&[big, small], &[], crate::fuzz::DEFAULT_MAX_LEN);
+        let seeds = seed_bytes(load_seed_inputs(
+            &[big, small],
+            &[],
+            crate::fuzz::DEFAULT_MAX_LEN,
+        ));
 
         assert_eq!(seeds.len(), 2);
         // The oversized seed is capped, not dropped, and its prefix is preserved.
@@ -5634,7 +5705,11 @@ mod tests {
         bytes.extend_from_slice(b"PK\x05\x06"); // ZIP directory trailer at EOF.
         std::fs::write(&archive, &bytes).unwrap();
 
-        let seeds = load_seed_inputs(&[archive], &[], crate::fuzz::AUTO_SOFT_CEILING);
+        let seeds = seed_bytes(load_seed_inputs(
+            &[archive],
+            &[],
+            crate::fuzz::AUTO_SOFT_CEILING,
+        ));
 
         assert_eq!(
             seeds,
@@ -5642,6 +5717,41 @@ mod tests {
             "auto mode must not discard an EOF index"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn seed_bytes(seeds: Vec<crate::auto::seed_manifest::LoadedSeed>) -> Vec<Vec<u8>> {
+        seeds.into_iter().map(|seed| seed.bytes).collect()
+    }
+
+    #[test]
+    fn load_seed_inputs_keeps_binary_bytes_and_records_where_each_came_from() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("seeds");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut image: Vec<u8> = vec![0x4d, 0x5a, 0x90, 0x00, 0x03];
+        image.extend((0x80..=0xffu8).chain(0x00..0x80u8));
+        let file = base.path().join("image.bin");
+        std::fs::write(&file, &image).unwrap();
+        // A lone continuation byte and bytes that never occur in UTF-8.
+        let odd = vec![0x80, 0xfe, 0xff, 0x00, 0xc0];
+        std::fs::write(dir.join("b.bin"), &odd).unwrap();
+        std::fs::write(dir.join("a.bin"), [0xefu8, 0xbb]).unwrap();
+
+        let seeds = load_seed_inputs(std::slice::from_ref(&file), std::slice::from_ref(&dir), 8);
+
+        assert_eq!(seeds.len(), 3);
+        assert_eq!(seeds[0].path, file);
+        assert_eq!(
+            seeds[0].bytes,
+            image[..8].to_vec(),
+            "capped prefix, unchanged"
+        );
+        assert_eq!(seeds[0].file_size, image.len() as u64);
+        // Directory entries come back in name order.
+        assert_eq!(seeds[1].path, dir.join("a.bin"));
+        assert_eq!(seeds[1].bytes, vec![0xef, 0xbb]);
+        assert_eq!(seeds[2].bytes, odd);
+        assert_eq!(seeds[2].file_size, odd.len() as u64);
     }
 
     fn alire_tmp(name: &str) -> PathBuf {

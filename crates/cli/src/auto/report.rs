@@ -30,6 +30,11 @@ struct RunJson<'a> {
     mode: actionability::RunMode,
     source_root: &'a Path,
     summary: Summary,
+    /// Where this run's seeds came from (`user`, `mined` or `none`), whether
+    /// tree seed mining ran, and the path of the full per-seed list
+    /// (`auto/seeds.json`). Absent for a work dir written before the list existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seeds: Option<crate::auto::seed_manifest::SeedSummary>,
     needed_for_build: NeededForBuild,
     targets: Vec<TargetEntry<'a>>,
 }
@@ -1215,6 +1220,7 @@ pub fn write_reports_with_output_limit(
         mode,
         source_root,
         summary,
+        seeds: crate::auto::seed_manifest::summary(work_dir),
         needed_for_build: needed,
         targets,
     };
@@ -2723,6 +2729,15 @@ fn render_md(r: &RunJson<'_>) -> String {
     let _ = writeln!(s, "# BHF auto run — {}", r.finished_at);
     let _ = writeln!(s, "Source: {}", r.source_root.display());
     let _ = writeln!(s, "Mode: {}", r.mode.as_str());
+    if let Some(seeds) = &r.seeds {
+        let _ = writeln!(
+            s,
+            "Seeds: {} ({}; tree seed mining: {}), listed in [`seeds.json`](seeds.json)",
+            seeds.count,
+            seeds.source,
+            seeds.mining.as_str()
+        );
+    }
     let _ = writeln!(s);
     let _ = writeln!(s, "## Findings");
     if r.summary.findings > 0 {
@@ -4489,6 +4504,7 @@ mod tests {
             mode: actionability::RunMode::Reporting,
             source_root: std::path::Path::new("/x"),
             summary: Summary::default(),
+            seeds: None,
             needed_for_build: needed,
             targets: vec![],
         };
@@ -4515,6 +4531,7 @@ mod tests {
             mode: actionability::RunMode::Reporting,
             source_root: std::path::Path::new("/x"),
             summary: Summary::default(),
+            seeds: None,
             needed_for_build: NeededForBuild::default(),
             targets: vec![],
         };

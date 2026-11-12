@@ -68,7 +68,7 @@ their own interpreters with in-process edge coverage.
 | `--work-dir <DIR>` | `./bhf_work/` | Output root |
 | `--max-work-dir-mb <MiB>` | `4096` | Stop starting new targets once the allocated work-directory size reaches the ceiling. Completed and in-flight targets are preserved and reported, so parallel jobs can overshoot by their final artifacts. `0` disables the ceiling; findings are never deleted to meet it |
 | `--max-corpus-mb <MiB>` | `64` | Per-target retained coverage-corpus ceiling for both memory and `corpus/<harness-id>/queue/`. Finding testcases are separate and always preserved |
-| `--config <PATH>` | auto-load `.bhf.toml` | Load run options from a TOML file so a project's runs are reproducible; CLI flags always override it. Keys are the flag names in kebab-case (`per-target-time = 30`, `cxx-std = "gnu++14"`, `extra-include = ["deps/inc"]`). Without this flag, a `.bhf.toml` in the scanned tree root is auto-loaded — but since that tree is untrusted, an auto-loaded config honors only SAFE knobs; the build-EXECUTING keys (`build-command`, `run-untrusted`, `unsafe-search-and-run-build-commands`) are ignored unless the config is passed explicitly with `--config` |
+| `--config <PATH>` | auto-load `.bhf.toml` | Load run options from a TOML file so a project's runs are reproducible; CLI flags always override it. Keys are the flag names in kebab-case (`per-target-time = 30`, `cxx-std = "gnu++14"`, `extra-include = ["deps/inc"]`); `seed-mining = false` turns tree seed mining off. Without this flag, a `.bhf.toml` in the scanned tree root is auto-loaded — but since that tree is untrusted, an auto-loaded config honors only SAFE knobs; the build-EXECUTING keys (`build-command`, `run-untrusted`, `unsafe-search-and-run-build-commands`) are ignored unless the config is passed explicitly with `--config` |
 | `--dry-run` | off | Plan only: discover + rank targets, run the toolchain preflight, report the build-recovery plan, then EXIT without building or fuzzing — validate scope, config, and toolchains before a long run |
 | `--per-target-time <SECS>` | `60` | **Total** per-target fuzz wall, split evenly across the passes under one shared deadline (so the per-target wall ≈ this, not × pass count). libFuzzer `-max_total_time` / AFL `-V` parity (#402) |
 | `--per-target-finding-count <N>` | unset (collect all) | Stop a target as soon as it has produced N **distinct** findings (crash signatures), or when its `--per-target-time` is spent — whichever first. Checked mid-pass (stops the instant the Nth lands; remaining passes skipped). `1` ≈ libFuzzer stop-on-first-crash |
@@ -92,15 +92,16 @@ their own interpreters with in-process edge coverage.
 | `--comparison-progress` | off | Enable laf-intel comparison-progress coverage (#421); rewards an input that matches more leading bytes of a multi-byte magic/format gate. Alias `--cmp-progress` |
 | `--engine <LIST>` | `builtin` | Fuzz engine(s) for the per-target fuzz phase, comma-separated. `builtin` is the in-process coverage-guided engine; `afl++` drives AFL++ on the auto-recovered build (C/C++ only; needs `afl-fuzz` + `afl-clang-fast`, else falls back to builtin with a warning). `--engine builtin,afl++` runs both per target, splitting `--per-target-time` between them |
 | `--differential <A:B>` | unset | Two-compiler differential fuzzing (C/C++), e.g. `clang:gcc`: after the normal run, rebuild each C/C++ harness under both compilers and replay the corpus through both, flagging any input whose exit/crash behavior diverges (a codegen- or UB-dependent bug) as a BHF-301 finding |
-| `--seed-file <PATH>` | none | Seed-input file whose bytes bootstrap every target's corpus; repeatable |
-| `--seed-dir <DIR>` | none | Directory of seed inputs (one per regular file); repeatable |
+| `--seed-file <PATH>` | none | Seed-input file whose bytes bootstrap every target's corpus, used byte for byte (binary formats included); repeatable. Any explicit seed turns tree seed mining off |
+| `--seed-dir <DIR>` | none | Directory of seed inputs (one per regular file, in name order); repeatable |
+| `--no-seed-mining` | off | Do not seed targets from the tree's own test-data files (see [Seeds](#seeds)). Config key: `seed-mining = false` |
 | `--extra-include <DIR>` | none | Extra C/C++ include dirs for dependency headers outside the swept tree; seeded onto every harness `-I` ahead of synthesized placeholders. Read from local disk only; repeatable |
 | `--ada-deps <DIR>` | none | Local Ada dependency-source dirs put on the build path (offline: never fetched); repeatable. Locally-cached Alire deps are picked up automatically |
 | `--probe-build` | off | Run the project's own build offline to recover real compile flags and generated headers. Detects + drives CMake, Meson, Visual Studio, Make/autotools (compiler-interposing wrapper), Ninja, and — under interception — Bazel/SCons. EXECUTES untrusted build scripts (sandboxed when bwrap/firejail is present) |
 | `--build-command <CMD>` | unset | Recover flags from any CUSTOM build (a `build.sh`, Waf, a vendor RTOS build) by running `<CMD>` under (1) a front-of-`PATH` compiler shim for `cc`/`gcc`/`clang` + named vendor compilers (Diab, Green Hills, QNX, Keil/IAR, TI) + cross-prefixed toolchains invoked by name, and (2) an `LD_PRELOAD` exec-interposer for compilers invoked by absolute path or `posix_spawn`. The universal escape hatch; takes precedence over the auto-detected tier. Accepts either a script (`--build-command ./build.sh`) or a full command (`--build-command "make -C src lib"`), run via `sh -c`. EXECUTES the command (sandboxed when available). When builds fail and a custom build script is present, `auto` prints a ready-to-run hint with this flag |
 | `--cxx-std <STD>` | auto | Pin the C++ standard for every harness build (`gnu++14`, `c++03`, …) for legacy C++. By default `auto` builds C++ at the modern standard and, on a dialect failure, automatically retries successively older standards (`gnu++17`→`gnu++14`→…→`gnu++98`) until one builds — the chosen standard is cached per project, so no flag is needed for old code unless you want to override the search |
 | `--grammar <PATH>` | unset | JSON grammar describing the target's input format for structure-aware generation (a Nautilus-style grammar mutator), applied to every fuzzed target. Each rule maps a non-terminal to production strings where `{NAME}` references another rule; the start symbol is `START` or the first rule. Validated up front (a bad grammar fails the run fast) |
-| `--max-len <N \| auto>` | `auto` | Maximum fuzz input length. `auto` grows the effective length adaptively per target — free up to ~1 MiB, and beyond that only while longer inputs keep finding new coverage — so a large-object target (image, archive, firmware) is handled WITHOUT a seed corpus, and a small-format one is not grown pointlessly. A positive integer sets a fixed cap |
+| `--max-len <N \| auto>` | `auto` | Maximum fuzz input length. `auto` grows the effective length adaptively per target — free up to ~1 MiB, and beyond that only while longer inputs keep finding new coverage — so a large-object target (image, archive, firmware) is handled WITHOUT a seed corpus, and a small-format one is not grown pointlessly. A positive integer sets a fixed cap. Seeds are kept whole up to this cap for both engines; with `--engine afl++` a fixed cap below AFL++'s 1 MiB default is also passed to afl-fuzz as `-G` when it has that option (AFL++ 4.00c or newer; an older afl-fuzz gets only the capped seeds, and a note on stderr) |
 | `--timeout <DUR>` | `10s` | Per-execution timeout (e.g. `10s`, `500ms`); an input exceeding it is a hang/timeout |
 | `--run-untrusted` | off | Consent umbrella for `--probe-build`, Ada (`alr build` / `gprbuild`) build probes, and Java Maven/Gradle project builds. Java project builds use Maven offline mode or Gradle `--offline`; stage target dependencies first. Bare Java source can still use `javac` without this flag. Implies `--probe-build`. EXECUTES untrusted scripts |
 | `--unsafe-search-and-run-build-commands` | off | UNSAFE convenience: search the tree for its own build entry point and EXECUTE it to recover flags, instead of you passing `--build-command`. Finds a custom build (build.sh, autotools bootstrap/autogen/configure, SCons, Waf, Bazel) and runs it under the compiler-intercepting shim, and enables the `--probe-build` tiers (CMake/Meson/Make) + the Ada build probe. Runs sandboxed when available, but it executes UNTRUSTED code from the scanned tree — use only on sources you trust. An explicit `--build-command` overrides the search |
@@ -451,6 +452,7 @@ configurations do not receive the BHF-405/BHF-304/BHF-417/BHF-305 runtrace oracl
 ├── auto/
 │   ├── run.md                                  # human report
 │   ├── run.json                                # machine report
+│   ├── seeds.json                              # every seed the run used, with provenance
 │   ├── missing-deps.json                       # missing-dependency manifest (#418)
 │   └── missing-deps.txt                        # same, human-readable
 ├── harnesses/<harness-id>/
@@ -498,6 +500,11 @@ The machine report. Each `built_and_fuzzed` target carries, under
 The top-level `summary` carries `fuzz_confirmed` — how many static findings a
 fuzz/oracle hit confirmed at the same source site (omitted when zero). See
 [Fuzz-confirmation](#fuzz-confirmation).
+
+The top-level `seeds` block records where the run's seeds came from:
+`source` (`user`, `mined` or `none`), `count`, `mining` (`ran`,
+`skipped_user_seeds` or `disabled`) and `manifest`, the path of the per-seed
+list (`auto/seeds.json`, see [Seeds](#seeds)).
 
 ### `stub_execution` (false-clean guard)
 
@@ -580,6 +587,32 @@ and `corpus minimize`. The queue and the active mutation pool share the
 are never evicted by it. Every pass after the first reseeds from a bounded subset
 of this queue, so deep code reached once stays reachable instead of each pass
 restarting from the tiny built-in seeds.
+
+### Seeds
+
+Each target's corpus starts from a few built-in inputs plus the run's seeds:
+the `--seed-file`/`--seed-dir` files when any are given, otherwise files mined
+from the tree's own test data (regular files directly inside `test/`, `tests/`,
+`examples/`, `samples/`, … and inside `data/`, `testdata/`, `fixtures/`,
+`corpus/`, … directories below them). Mining skips source and prose files and
+build/IDE artifacts (`.vcxproj`, `.sln`, `.filters`, `.user`, `.suo`, `.props`,
+`.pdb`, `.dll`, `.lib`, `.obj`, `.ilk`, `.exp`, …), files over 256 KiB, and
+stops at 64 files. Turn it off with `--no-seed-mining` or `seed-mining = false`.
+
+Seeds reach the engine byte for byte, as do the corpus entries a later pass or
+the AFL++ stage reseeds from `corpus/<harness-id>/queue/`. `auto/seeds.json`
+lists every seed the run used: its `path`, `source` (`user` or `mined`), file
+`size`, `bytes_used`, and the `sha256` of those bytes (the name of its
+`corpus/<harness-id>/queue/<sha256>.bin` entry), plus whether mining `ran`, was
+`skipped_user_seeds`, or was `disabled`. `run.json` carries the same summary
+under `seeds`, and `-v` prints the list. A run that stops before it resolves
+seeds (one that finds no fuzzable target, for example) removes a list an
+earlier run left in the work dir, and its `run.json` has no `seeds` block.
+
+A work directory written by an earlier release can hold corpus entries in
+which every byte that was not valid UTF-8 was replaced by `EF BF BD`. Those
+entries keep being reseeded; delete `<work>/corpus/` (or use a fresh work dir)
+to drop them.
 
 ## Limitations
 

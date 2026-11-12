@@ -243,6 +243,7 @@ fn auto_args_from_ci(args: &CiArgs, scoped_files: &[PathBuf]) -> AutoArgs {
         ada_deps: Vec::new(),
         seed_files: Vec::new(),
         seed_dirs: Vec::new(),
+        no_seed_mining: false,
         mode: args.mode,
         engine: "builtin".to_owned(),
         verbose: false,

@@ -43,6 +43,8 @@ pub struct AutoConfig {
     pub extra_include: Option<Vec<PathBuf>>,
     pub exclude_path: Option<Vec<String>>,
     pub force: Option<bool>,
+    /// `false` turns off seeding from the tree's own test data (`--no-seed-mining`).
+    pub seed_mining: Option<bool>,
 
     // Execute-y knobs: honored ONLY from an explicit --config (they run the tree's build).
     pub build_command: Option<String>,
@@ -160,6 +162,11 @@ pub fn apply(args: &mut AutoArgs, tree_root: &Path) -> Result<Vec<String>, Strin
     if let Some(true) = config.force {
         args.force = true; // union: config or CLI enables it
     }
+    if let Some(false) = config.seed_mining {
+        // Union with `--no-seed-mining`: either one turns mining off. Turning it
+        // off only narrows what the run reads, so the tree's own config may too.
+        args.no_seed_mining = true;
+    }
 
     // --- Execute-y knobs: only from an EXPLICIT --config. ---
     let execute_y_requested = config.build_command.is_some()
@@ -218,5 +225,37 @@ mod tests {
             vec![PathBuf::from("deps/include")]
         );
         assert!(toml::from_str::<AutoConfig>("bogus-key = 1\n").is_err());
+    }
+
+    fn parse_auto_args(argv: &[&str]) -> AutoArgs {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            auto: AutoArgs,
+        }
+        TestCli::try_parse_from(argv).unwrap().auto
+    }
+
+    #[test]
+    fn seed_mining_false_turns_tree_seed_mining_off() {
+        let tree = tempfile::tempdir().unwrap();
+        std::fs::write(tree.path().join(CONFIG_FILE_NAME), "seed-mining = false\n").unwrap();
+        let mut args = parse_auto_args(&["bhf", "tree"]);
+        assert!(!args.no_seed_mining);
+        apply(&mut args, tree.path()).unwrap();
+        assert!(
+            args.no_seed_mining,
+            "an auto-loaded config may disable mining"
+        );
+
+        // `seed-mining = true` never re-enables what the CLI turned off.
+        std::fs::write(tree.path().join(CONFIG_FILE_NAME), "seed-mining = true\n").unwrap();
+        let mut args = parse_auto_args(&["bhf", "tree", "--no-seed-mining"]);
+        apply(&mut args, tree.path()).unwrap();
+        assert!(args.no_seed_mining);
+        let mut args = parse_auto_args(&["bhf", "tree"]);
+        apply(&mut args, tree.path()).unwrap();
+        assert!(!args.no_seed_mining);
     }
 }

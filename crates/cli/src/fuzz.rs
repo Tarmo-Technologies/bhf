@@ -329,13 +329,20 @@ pub struct FuzzArgs {
     #[arg(long)]
     pub no_fork_server: bool,
 
-    /// Literal seed input bytes, interpreted as UTF-8 bytes.
+    /// Literal seed input; its UTF-8 bytes become a seed. Use `--seed-file` for
+    /// a binary seed (any byte value, including NUL).
     #[arg(long = "seed-input")]
     pub seed_inputs: Vec<String>,
 
-    /// File containing seed input bytes.
+    /// File containing seed input bytes, used byte for byte.
     #[arg(long = "seed-file")]
     pub seed_files: Vec<PathBuf>,
+
+    /// Raw seed bytes supplied programmatically (`bhf auto`: mined, user and
+    /// reseeded corpus inputs). Kept as bytes end to end, so a seed that is not
+    /// valid UTF-8 reaches the engine unchanged. Not a CLI flag.
+    #[arg(skip)]
+    pub seed_bytes: Vec<Vec<u8>>,
 
     /// Path to an explicitly-trusted extension manifest (`bhf.extension-manifest.v1`,
     /// TOML). When set, after the campaign the retained corpus is driven through
@@ -1067,6 +1074,9 @@ struct PreparedFuzzRun {
     deadline: Option<Duration>,
     print_final_stats: bool,
     rss_limit_mb: usize,
+    /// `-G` (maximum generated input length) for afl-fuzz. Set only by the
+    /// `bhf auto` AFL++ stage, from the run's resolved `--max-len`.
+    afl_max_len: Option<usize>,
     /// Explicitly-trusted extension manifest (`--extension`). When set, the
     /// builtin engine drives `oracle.evaluate` over the retained corpus after the
     /// run. `None` leaves fuzzing byte-for-byte unchanged.
@@ -1433,11 +1443,9 @@ pub(crate) fn run_one_target_programmatic_with_runner(
         rss_limit_mb,
         fork_server: false,
         no_fork_server: false,
-        seed_inputs: seeds
-            .into_iter()
-            .map(|b| String::from_utf8_lossy(&b).into_owned())
-            .collect(),
+        seed_inputs: Vec::new(),
         seed_files: Vec::new(),
+        seed_bytes: seeds,
         sanitizers: sanitizers
             .iter()
             .map(|s| sanitizer_name(*s).to_owned())
@@ -1494,7 +1502,113 @@ pub(crate) fn run_afl_plus_plus_programmatic(
     rss_limit_mb: usize,
     sanitizers: &[multicore_fuzz::Sanitizer],
 ) -> Result<FuzzRunSummary, String> {
-    let args = FuzzArgs {
+    let prepared = prepare_afl_programmatic(
+        work_dir,
+        harness_id,
+        seeds,
+        time_budget,
+        extra_env,
+        mode,
+        rss_limit_mb,
+        sanitizers,
+        std::env::var("BHF_MAX_LEN").ok().as_deref(),
+    )?;
+    run_afl_plus_plus(prepared)
+}
+
+/// The prepared AFL++ run behind [`run_afl_plus_plus_programmatic`], for the
+/// run's `--max-len` spec (`BHF_MAX_LEN`: a number, `auto`, or unset).
+#[allow(clippy::too_many_arguments)]
+fn prepare_afl_programmatic(
+    work_dir: &Path,
+    harness_id: &str,
+    seeds: Vec<Vec<u8>>,
+    time_budget: Option<Duration>,
+    extra_env: &[(String, String)],
+    mode: actionability::RunMode,
+    rss_limit_mb: usize,
+    sanitizers: &[multicore_fuzz::Sanitizer],
+    max_len_spec: Option<&str>,
+) -> Result<PreparedFuzzRun, String> {
+    // Resolve the length cap exactly as the builtin programmatic runner does, so
+    // `auto --max-len` governs AFL++ seeds too instead of a fixed 4096 bytes.
+    let largest_seed = seeds.iter().map(Vec::len).max().unwrap_or(0);
+    let max_len = resolve_max_len_spec(max_len_spec, largest_seed);
+    let args = afl_programmatic_args(
+        work_dir,
+        harness_id,
+        seeds,
+        time_budget,
+        extra_env,
+        mode,
+        rss_limit_mb,
+        sanitizers,
+        max_len,
+    );
+    let mut prepared = prepare(args)?;
+    prepared.afl_max_len = afl_generated_max_len(max_len);
+    Ok(prepared)
+}
+
+/// AFL++'s own default (and compiled maximum) generated-input length.
+const AFL_DEFAULT_MAX_LEN: usize = 1024 * 1024;
+
+/// The `-G` value to hand afl-fuzz for a resolved `max_len`: only a cap tighter
+/// than AFL++'s own default is passed, since afl-fuzz cannot generate past its
+/// compiled maximum anyway (and older afl-fuzz builds lack `-G`).
+fn afl_generated_max_len(max_len: usize) -> Option<usize> {
+    (max_len < AFL_DEFAULT_MAX_LEN).then_some(max_len.max(1))
+}
+
+/// Whether this afl-fuzz takes `-G` (maximum generated input length, added in
+/// AFL++ 4.00c). Probed from `afl-fuzz -h` once per afl-fuzz path.
+fn afl_fuzz_supports_max_len(afl_fuzz: &Path) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static PROBED: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
+    let probed = PROBED.get_or_init(Default::default);
+    if let Some(&known) = probed
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(afl_fuzz)
+    {
+        return known;
+    }
+    let mut probe = std::process::Command::new(afl_fuzz);
+    probe.arg("-h").stdin(Stdio::null());
+    let supported = crate::command_output::output_with_timeout(&mut probe, Duration::from_secs(10))
+        .is_ok_and(|out| {
+            afl_help_lists_max_len(&out.stdout) || afl_help_lists_max_len(&out.stderr)
+        });
+    probed
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(afl_fuzz.to_path_buf(), supported);
+    supported
+}
+
+/// `afl-fuzz -h` usage lists `-G maxlength` among its mutator settings.
+fn afl_help_lists_max_len(help: &[u8]) -> bool {
+    String::from_utf8_lossy(help)
+        .lines()
+        .any(|line| line.trim_start().starts_with("-G "))
+}
+
+/// The [`FuzzArgs`] behind [`run_afl_plus_plus_programmatic`], with the length
+/// cap already resolved.
+#[allow(clippy::too_many_arguments)]
+fn afl_programmatic_args(
+    work_dir: &Path,
+    harness_id: &str,
+    seeds: Vec<Vec<u8>>,
+    time_budget: Option<Duration>,
+    extra_env: &[(String, String)],
+    mode: actionability::RunMode,
+    rss_limit_mb: usize,
+    sanitizers: &[multicore_fuzz::Sanitizer],
+    max_len: usize,
+) -> FuzzArgs {
+    FuzzArgs {
         work_dir: work_dir.to_path_buf(),
         harness: harness_id.to_owned(),
         engine: FuzzEngine::AflPlusPlus,
@@ -1506,17 +1620,15 @@ pub(crate) fn run_afl_plus_plus_programmatic(
         time: time_budget,
         timeout: None,
         deadline: None,
-        max_len: DEFAULT_MAX_LEN,
+        max_len,
         len_control: DEFAULT_LEN_CONTROL,
         print_final_stats: false,
         rss_limit_mb,
         fork_server: false,
         no_fork_server: false,
-        seed_inputs: seeds
-            .into_iter()
-            .map(|b| String::from_utf8_lossy(&b).into_owned())
-            .collect(),
+        seed_inputs: Vec::new(),
         seed_files: Vec::new(),
+        seed_bytes: seeds,
         sanitizers: sanitizers
             .iter()
             .map(|s| sanitizer_name(*s).to_owned())
@@ -1543,9 +1655,7 @@ pub(crate) fn run_afl_plus_plus_programmatic(
         collector: crate::collector_run::CollectorSpec::Off,
         collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
         extension: None,
-    };
-    let prepared = prepare(args)?;
-    run_afl_plus_plus(prepared)
+    }
 }
 
 fn multicore_requested(args: &FuzzArgs) -> bool {
@@ -1556,7 +1666,11 @@ fn multicore_requested(args: &FuzzArgs) -> bool {
         || matches!(args.workers, Some(FuzzWorkerCount::Fixed(n)) if n > 1)
 }
 
-fn run_multicore_campaign(args: FuzzArgs) -> i32 {
+fn run_multicore_campaign(mut args: FuzzArgs) -> i32 {
+    if let Err(error) = materialize_seed_bytes(&mut args) {
+        bhfeprintln!("{error}");
+        return 1;
+    }
     let sanitizers = match parse_sanitizer_args(&args.sanitizers) {
         Ok(sanitizers) => sanitizers,
         Err(error) => {
@@ -1662,6 +1776,31 @@ fn merge_worker_findings(work_dir: &Path, summary: &multicore_fuzz::MulticoreSum
             1
         }
     }
+}
+
+/// Workers receive their seeds through argv, which cannot carry arbitrary bytes
+/// (a NUL ends an argument; a non-UTF-8 `--seed-input` is rejected). Write the
+/// programmatic seed bytes to content-named files under the campaign dir and
+/// hand them over as `--seed-file`, which every worker reads byte for byte.
+fn materialize_seed_bytes(args: &mut FuzzArgs) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    if args.seed_bytes.is_empty() {
+        return Ok(());
+    }
+    let dir = args
+        .work_dir
+        .join("fuzz_campaigns")
+        .join(&args.harness)
+        .join("seed_bytes");
+    fs::create_dir_all(&dir)
+        .map_err(|error| format!("create seed dir '{}': {error}", dir.display()))?;
+    for bytes in std::mem::take(&mut args.seed_bytes) {
+        let path = dir.join(format!("{:x}.bin", Sha256::digest(&bytes)));
+        fs::write(&path, &bytes)
+            .map_err(|error| format!("write seed '{}': {error}", path.display()))?;
+        args.seed_files.push(path);
+    }
+    Ok(())
 }
 
 fn worker_passthrough_args(args: &FuzzArgs) -> Vec<String> {
@@ -1792,6 +1931,7 @@ fn prepare(args: FuzzArgs) -> Result<PreparedFuzzRun, String> {
         .into_iter()
         .map(String::into_bytes)
         .collect::<Vec<_>>();
+    seeds.extend(args.seed_bytes);
     for seed_file in args.seed_files {
         let (bytes, original_len) = read_seed_file_prefix(&seed_file, args.max_len.max(1))
             .map_err(|error| format!("read seed file '{}': {error}", seed_file.display()))?;
@@ -1949,6 +2089,7 @@ fn prepare(args: FuzzArgs) -> Result<PreparedFuzzRun, String> {
         deadline: args.deadline,
         print_final_stats: args.print_final_stats,
         rss_limit_mb: args.rss_limit_mb,
+        afl_max_len: None,
         extension_manifest: args.extension,
     })
 }
@@ -3739,6 +3880,17 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
     }
     if let Some(dictionary) = &generated_dictionary {
         afl_cmd.arg("-x").arg(dictionary);
+    }
+    if let Some(max_len) = prepared.afl_max_len {
+        if afl_fuzz_supports_max_len(&afl_fuzz) {
+            afl_cmd.arg("-G").arg(max_len.to_string());
+        } else {
+            bhfeprintln!(
+                "bhf: {} has no -G option (AFL++ 4.00c or newer), so its generated inputs \
+                 are not held to --max-len {max_len}; the seeds are still cut to {max_len} bytes",
+                afl_fuzz.display()
+            );
+        }
     }
     afl_cmd
         .arg("--")
@@ -7980,6 +8132,28 @@ mod auto_path_tests {
     }
 
     #[test]
+    fn multicore_workers_receive_seed_bytes_as_byte_exact_seed_files() {
+        let mut args = fuzz_args_for_worker_passthrough(StructuredInputMode::Auto);
+        let seed = non_utf8_seed();
+        args.seed_bytes = vec![seed.clone()];
+        materialize_seed_bytes(&mut args).unwrap();
+        assert!(args.seed_bytes.is_empty());
+
+        let passthrough = worker_passthrough_args(&args);
+        let files: Vec<&String> = passthrough
+            .windows(2)
+            .filter(|pair| pair[0] == "--seed-file")
+            .map(|pair| &pair[1])
+            .collect();
+        assert_eq!(files.len(), 1, "{passthrough:?}");
+        assert_eq!(fs::read(files[0]).unwrap(), seed);
+        assert!(
+            !passthrough.iter().any(|a| a == "--seed-input"),
+            "raw bytes never travel as a UTF-8 --seed-input: {passthrough:?}"
+        );
+    }
+
+    #[test]
     fn worker_passthrough_includes_len_control() {
         let mut args = fuzz_args_for_worker_passthrough(StructuredInputMode::Auto);
         args.len_control = 7;
@@ -8589,6 +8763,240 @@ mod auto_path_tests {
         );
     }
 
+    /// A seed that is not valid UTF-8: every byte value, a lone continuation
+    /// byte, two bytes that never appear in UTF-8, an embedded NUL and a
+    /// truncated multi-byte lead at the very end.
+    fn non_utf8_seed() -> Vec<u8> {
+        let mut seed: Vec<u8> = (0..=255u8).collect();
+        seed.extend_from_slice(&[0x80, 0xff, 0xfe, 0x00, 0x4d, 0x5a, 0x90, 0xc3]);
+        seed
+    }
+
+    /// A libFuzzer-style harness that reports a sanitizer crash only when its
+    /// input is byte-identical to `expected`, so a finding proves the engine ran
+    /// that exact input.
+    fn write_exact_match_harness(work_dir: &Path, id: &str, expected: &Path) {
+        let script = format!(
+            "#!/bin/sh\n\
+             if cmp -s \"$1\" '{}'; then\n\
+               >&2 echo 'ERROR: AddressSanitizer: heap-buffer-overflow on address 0x601 at pc 0x333'\n\
+               >&2 echo '    #0 0x333 in copy_at /src/record.c:15'\n\
+               >&2 echo '    #1 0x334 in LLVMFuzzerTestOneInput /src/h.c:20'\n\
+               exit 1\n\
+             fi\n\
+             exit 0\n",
+            expected.display()
+        );
+        write_c_libfuzzer_harness(work_dir, id, &script);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn programmatic_run_feeds_non_utf8_seed_bytes_unchanged() {
+        // `bhf auto` hands every seed (mined, --seed-file, --seed-dir, reseeded
+        // queue entries) to this runner. The harness crashes only on the exact
+        // seed bytes, so a finding whose testcase equals the seed proves no byte
+        // was rewritten on the way to the engine.
+        let root = tmpdir();
+        let work_dir = root.join("bhf_work");
+        let seed = non_utf8_seed();
+        let expected = root.join("expected.bin");
+        fs::write(&expected, &seed).unwrap();
+        write_exact_match_harness(&work_dir, "H-BYTES", &expected);
+
+        let summary = run_one_target_programmatic(
+            &work_dir,
+            "H-BYTES",
+            vec![seed.clone()],
+            4,
+            None,
+            None,
+            0,
+            &[],
+            actionability::RunMode::Reporting,
+            None,
+            &[],
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            summary.findings.len(),
+            1,
+            "the exact seed must reach the harness: {:?}",
+            summary.findings
+        );
+        let testcase = fs::read(
+            corpus::layout::finding_dir(&work_dir, &summary.findings[0]).join("testcase.bin"),
+        )
+        .unwrap();
+        assert_eq!(
+            testcase, seed,
+            "testcase.bin must be the seed, byte for byte"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn afl_programmatic_seeds_keep_their_bytes_and_honor_the_resolved_max_len() {
+        // The AFL++ stage of `bhf auto` used a fixed 4096-byte cap, so every
+        // seed handed to afl-fuzz was cut short whatever `--max-len` said.
+        let root = tmpdir();
+        let work_dir = root.join("bhf_work");
+        write_c_libfuzzer_harness(&work_dir, "H-AFLSEED", "#!/bin/sh\nexit 0\n");
+        let mut big = Vec::new();
+        while big.len() < 10 * 1024 {
+            big.extend_from_slice(&non_utf8_seed());
+        }
+        let max_len = resolve_max_len_spec(Some("auto"), big.len());
+        let args = afl_programmatic_args(
+            &work_dir,
+            "H-AFLSEED",
+            vec![big.clone(), non_utf8_seed()],
+            Some(Duration::from_secs(1)),
+            &[],
+            actionability::RunMode::Reporting,
+            0,
+            &[],
+            max_len,
+        );
+        let prepared = prepare(args).unwrap();
+        assert!(prepared.seeds.contains(&big), "10 KiB seed kept whole");
+        assert!(prepared.seeds.contains(&non_utf8_seed()));
+
+        // A numeric cap still bounds the seeds, and is what afl-fuzz gets as -G.
+        let capped = afl_programmatic_args(
+            &work_dir,
+            "H-AFLSEED",
+            vec![big.clone()],
+            Some(Duration::from_secs(1)),
+            &[],
+            actionability::RunMode::Reporting,
+            0,
+            &[],
+            resolve_max_len_spec(Some("8192"), big.len()),
+        );
+        let prepared = prepare(capped).unwrap();
+        assert_eq!(prepared.seeds, vec![big[..8192].to_vec()]);
+        assert_eq!(afl_generated_max_len(8192), Some(8192));
+        assert_eq!(
+            afl_generated_max_len(max_len),
+            None,
+            "the adaptive ceiling leaves afl-fuzz at its own default"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn afl_programmatic_prepare_keeps_a_numeric_max_len_for_afl_fuzz() {
+        let root = tmpdir();
+        let work_dir = root.join("bhf_work");
+        write_c_libfuzzer_harness(&work_dir, "H-AFLCAP", "#!/bin/sh\nexit 0\n");
+        let prepare_with = |spec: &str| {
+            prepare_afl_programmatic(
+                &work_dir,
+                "H-AFLCAP",
+                vec![non_utf8_seed()],
+                Some(Duration::from_secs(1)),
+                &[],
+                actionability::RunMode::Reporting,
+                0,
+                &[],
+                Some(spec),
+            )
+            .unwrap()
+        };
+        assert_eq!(prepare_with("8192").afl_max_len, Some(8192));
+        assert_eq!(
+            prepare_with("auto").afl_max_len,
+            None,
+            "the adaptive ceiling leaves afl-fuzz at its own default"
+        );
+    }
+
+    /// An `afl-fuzz` stand-in: `-h` prints a usage text (with or without the
+    /// `-G` line), anything else records its argv to `argv.txt` beside it.
+    #[cfg(unix)]
+    fn fake_afl_fuzz(dir: &Path, lists_max_len: bool) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        fs::create_dir_all(dir).unwrap();
+        let usage = if lists_max_len {
+            "  -g minlength  - set min length of generated fuzz input (default: 1)\n  \
+             -G maxlength  - set max length of generated fuzz input (default: 1048576)\n"
+        } else {
+            "  -x dict_file  - fuzzer dictionary\n"
+        };
+        let argv = dir.join("argv.txt");
+        let script = dir.join("afl-fuzz");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = -h ]; then\n  printf '\\033[0;36mafl-fuzz\\033[0m usage\\n{}'\n  exit 1\nfi\n\
+                 printf '%s\\n' \"$@\" > '{}'\nexit 0\n",
+                usage.replace('\n', "\\n"),
+                argv.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        argv
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn afl_fuzz_gets_the_max_len_as_g_only_when_it_has_the_option() {
+        let root = tmpdir();
+        let work_dir = root.join("bhf_work");
+        let dir = work_dir.join("build").join("H-AFLG");
+        write_c_libfuzzer_harness(&work_dir, "H-AFLG", "#!/bin/sh\nexit 0\n");
+        fs::copy(dir.join("main"), dir.join("main_afl")).unwrap();
+        for lists_max_len in [true, false] {
+            let afl_dir = root.join(format!("afl-{lists_max_len}"));
+            let argv = fake_afl_fuzz(&afl_dir, lists_max_len);
+            let mut prepared = prepare_afl_programmatic(
+                &work_dir,
+                "H-AFLG",
+                vec![non_utf8_seed()],
+                Some(Duration::from_secs(1)),
+                &[],
+                actionability::RunMode::Reporting,
+                0,
+                &[],
+                Some("8192"),
+            )
+            .unwrap();
+            prepared.afl_path = Some(afl_dir.clone());
+            run_afl_plus_plus(prepared).unwrap();
+            let args: Vec<String> = fs::read_to_string(&argv)
+                .unwrap()
+                .lines()
+                .map(str::to_owned)
+                .collect();
+            let g = args.iter().position(|arg| arg == "-G");
+            if lists_max_len {
+                let g = g.unwrap_or_else(|| panic!("-G passed: {args:?}"));
+                assert_eq!(args[g + 1], "8192");
+                assert!(g < args.iter().position(|arg| arg == "--").unwrap());
+            } else {
+                assert_eq!(g, None, "an afl-fuzz without -G must not get it: {args:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn afl_help_parsing_finds_the_g_option_line_only() {
+        let current = b"\x1b[0;36mafl-fuzz++4.09c\x1b[0m based on afl\n\nMutator settings:\n  \
+            -a            - target input format\n  \
+            -g minlength  - set min length of generated fuzz input (default: 1)\n  \
+            -G maxlength  - set max length of generated fuzz input (default: 1048576)\n";
+        assert!(afl_help_lists_max_len(current));
+        let older = b"afl-fuzz++3.14c\n  -x dict_file  - fuzzer dictionary\n  \
+            -s seed       - use a fixed seed for the RNG\n  \
+            Note: -G is not an option here\n";
+        assert!(!afl_help_lists_max_len(older));
+        assert!(!afl_help_lists_max_len(b""));
+    }
+
     #[test]
     #[cfg(unix)]
     fn non_driver_zero_coverage_run_persists_bounded_corpus() {
@@ -8798,6 +9206,7 @@ mod auto_path_tests {
             no_fork_server: false,
             seed_inputs: Vec::new(),
             seed_files: Vec::new(),
+            seed_bytes: Vec::new(),
             sanitizers: Vec::new(),
             symbolic_seed_sources: Vec::new(),
             rng_seed: 1,
