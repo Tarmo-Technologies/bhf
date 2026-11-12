@@ -293,3 +293,73 @@ fn auto_uses_compile_database_flags_under_an_apostrophe_directory() {
         "parse_rec must build with its compile-database flags; got {outcomes:?}\n{log}"
     );
 }
+
+/// A tree under a path no quoting makes safe in a build recipe (here a `$`,
+/// which make expands) is refused with its own outcome, `unsafe_build_path`,
+/// counted on its own in run.json and filed in the bug report as a path to
+/// rename, not as an unsupported type.
+#[test]
+fn an_unquotable_tree_path_is_its_own_outcome() {
+    let bin = bhf_bin();
+    if !bin.is_file() {
+        eprintln!("skip: bhf binary not built");
+        return;
+    }
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let tree = tmp.path().join("build$tree");
+    let src = tree.join("src");
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("record.h"),
+        "#include <stddef.h>\nint parse_record(const unsigned char *data, size_t len);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("record.c"),
+        "#include \"record.h\"\n\
+         int parse_record(const unsigned char *data, size_t len) { return len ? data[0] : 0; }\n",
+    )
+    .unwrap();
+    let output = Command::new(&bin)
+        .arg("auto")
+        .arg(&tree)
+        .arg("--work-dir")
+        .arg(&work)
+        .args([
+            "--languages",
+            "c",
+            "--max-targets",
+            "1",
+            "--jobs",
+            "1",
+            "--per-target-time",
+            "2",
+            "--no-discovery-cache",
+        ])
+        .output()
+        .expect("run bhf auto");
+    let log = format!(
+        "stderr:\n{}\nstdout:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let outcomes = outcomes(&work);
+    assert!(
+        outcomes
+            .iter()
+            .any(|(name, outcome, _)| name == "parse_record" && outcome == "unsafe_build_path"),
+        "{outcomes:?}\n{log}"
+    );
+    let run: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(work.join("auto/run.json")).unwrap()).unwrap();
+    assert_eq!(
+        run["summary"]["unsafe_build_path"], 1,
+        "{:#}",
+        run["summary"]
+    );
+    let report = std::fs::read_to_string(work.join("auto/bug-report.md")).unwrap_or_default();
+    assert!(report.contains("[unsafe-build-path]"), "{report}\n{log}");
+    assert!(!report.contains("[unsupported-type"), "{report}");
+    assert!(log.contains("Rename or move that path"), "{log}");
+}

@@ -721,6 +721,15 @@ pub enum Outcome {
     UnsupportedParams {
         reason: String,
     },
+    /// The target was refused before generation because a source path,
+    /// include dir or compile flag holds a character no quoting makes safe in
+    /// a build recipe (`$`, `#`, a backtick, a shell operator, a control
+    /// character). An environment problem with one remedy, renaming or moving
+    /// the path; `--force` cannot help. Before it had its own outcome such a
+    /// refusal was recorded as `unsupported_params`.
+    UnsafeBuildPath {
+        reason: String,
+    },
     UnrecoverableLink {
         repairs: Vec<Repair>,
         missing: Vec<String>,
@@ -890,6 +899,16 @@ impl Outcome {
                 build_error_count: 0,
                 build_error_categories: Vec::new(),
             },
+            Outcome::UnsafeBuildPath { reason } => AttemptTrace {
+                terminal_stage: "generation".to_owned(),
+                fallback_chain: vec!["unsafe_build_path".to_owned()],
+                reason_category: Some("unsafe_build_path".to_owned()),
+                terminal_reason: Some(reason.clone()),
+                repairs_attempted: false,
+                repair_count: 0,
+                build_error_count: 0,
+                build_error_categories: Vec::new(),
+            },
             Outcome::UnrecoverableLink { repairs, missing } => AttemptTrace {
                 terminal_stage: "link".to_owned(),
                 fallback_chain: vec!["build_repair".to_owned(), "link_unrecoverable".to_owned()],
@@ -928,6 +947,20 @@ impl Outcome {
         }
     }
 
+    /// An `unsupported_params` skip whose reason is a build-safety refusal (a
+    /// path or flag no quoting makes safe) as its own `unsafe_build_path`
+    /// outcome; every other outcome as it is.
+    pub(crate) fn with_path_refusal_classified(self) -> Self {
+        match self {
+            Outcome::UnsupportedParams { reason }
+                if harness_gen::build_safety::is_unsafe_build_input_reason(&reason) =>
+            {
+                Outcome::UnsafeBuildPath { reason }
+            }
+            other => other,
+        }
+    }
+
     /// #417: per-target stub-vs-real execution summary derived from the repair
     /// ledger, or `None` for outcomes that never fuzzed (only `BuiltAndFuzzed`
     /// carries a fuzz result). Recomputed from `repairs` on demand — see
@@ -956,7 +989,9 @@ impl Outcome {
             | Outcome::FailedBuild { repairs, .. }
             | Outcome::UnrecoverableLink { repairs, .. }
             | Outcome::UnrecoverableRuntime { repairs, .. } => repairs.as_slice(),
-            Outcome::UnsupportedParams { .. } | Outcome::ReportOnly { .. } => return None,
+            Outcome::UnsupportedParams { .. }
+            | Outcome::UnsafeBuildPath { .. }
+            | Outcome::ReportOnly { .. } => return None,
         };
         repairs.iter().find_map(|r| match r {
             Repair::PlatformStub { platform } => Some(platform.clone()),
@@ -1345,6 +1380,18 @@ pub fn attempt_with_progress(
     options: AttemptOptions,
     progress: &dyn crate::auto::progress::ProgressSink,
 ) -> Result<AttemptResult> {
+    let mut result = attempt_unclassified(candidate, work_dir, decl_index, options, progress)?;
+    result.outcome = result.outcome.with_path_refusal_classified();
+    Ok(result)
+}
+
+fn attempt_unclassified(
+    candidate: &Candidate,
+    work_dir: &Path,
+    decl_index: &DeclarationIndex,
+    options: AttemptOptions,
+    progress: &dyn crate::auto::progress::ProgressSink,
+) -> Result<AttemptResult> {
     if !options.run_untrusted
         && matches!(
             candidate.lang,
@@ -1689,6 +1736,40 @@ mod sequence_fallback_tests {
             BuildErrorKind::Other { tail }
                 if tail.contains("sequence harness failed") && tail.contains("SequenceOnlyType")
         ));
+    }
+
+    /// A refusal because a path or flag cannot be quoted safely is its own
+    /// outcome, with its own trace category; a parameter refusal is not.
+    #[test]
+    fn an_unquotable_build_path_refusal_has_its_own_outcome() {
+        let reason = harness_gen::build_safety::ensure_build_path_safe(
+            "include dir",
+            "/srv/build$tmp/include",
+        )
+        .unwrap_err()
+        .to_string();
+        let outcome = Outcome::UnsupportedParams {
+            reason: reason.clone(),
+        }
+        .with_path_refusal_classified();
+        assert!(
+            matches!(&outcome, Outcome::UnsafeBuildPath { reason: kept } if *kept == reason),
+            "{outcome:?}"
+        );
+        let json = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(json["outcome"], "unsafe_build_path");
+        assert_eq!(json["reason"], reason.as_str());
+        let back: Outcome = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, Outcome::UnsafeBuildPath { .. }));
+        let trace = outcome.attempt_trace();
+        assert_eq!(trace.terminal_stage, "generation");
+        assert_eq!(trace.reason_category.as_deref(), Some("unsafe_build_path"));
+        assert_eq!(trace.fallback_chain, ["unsafe_build_path"]);
+        let other = Outcome::UnsupportedParams {
+            reason: "opaque type 'widget_t' for parameter 'w' needs lifecycle support".to_owned(),
+        }
+        .with_path_refusal_classified();
+        assert!(matches!(other, Outcome::UnsupportedParams { .. }));
     }
 
     #[test]

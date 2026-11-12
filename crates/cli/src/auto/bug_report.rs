@@ -361,6 +361,11 @@ pub enum IssueCategory {
     /// bhf could not build a harness for a target — an unsupported parameter
     /// or return type (a feature gap: a type spelling the decoder can't handle).
     UnsupportedType,
+    /// A target was refused because a source path, include dir or compile
+    /// flag holds a character no quoting makes safe in a build recipe (the
+    /// `unsafe_build_path` outcome): an environment problem, fixed by renaming
+    /// or moving the path, not a bhf gap.
+    UnsafeBuildPath,
     /// A generated harness would not COMPILE (undefined-in-tree types, link
     /// errors). May be a bhf gap or a missing dependency (see missing-deps.txt).
     FailedBuild,
@@ -468,6 +473,7 @@ fn issue_rank(issue: &InternalIssue) -> u8 {
         IssueCategory::TargetNotReached => 4,
         IssueCategory::DiscoveryDiagnostic => 5,
         IssueCategory::ReportOnly => 6,
+        IssueCategory::UnsafeBuildPath => 7,
     }
 }
 
@@ -481,8 +487,15 @@ fn category_label(category: IssueCategory) -> &'static str {
         IssueCategory::TargetNotReached => "target-not-reached",
         IssueCategory::DiscoveryDiagnostic => "discovery-drop",
         IssueCategory::ReportOnly => "static-only",
+        IssueCategory::UnsafeBuildPath => "unsafe-build-path",
     }
 }
+
+/// What an `unsafe-build-path` row asks of the reader.
+const UNSAFE_BUILD_PATH_NOTE: &str =
+    "an environment/path problem, not a bhf bug: a source path, include dir or compile flag \
+     holds a character that cannot be quoted safely in a build recipe (the reason names it); \
+     rename or move that path";
 
 /// Whether an `unsupported-type` row is a KNOWN, working-as-intended boundary
 /// rather than something to report — and, if so, the short parenthetical that
@@ -498,11 +511,7 @@ fn category_label(category: IssueCategory) -> &'static str {
 /// renaming or moving the path is the fix.
 fn unsupported_type_boundary_note(summary: &str) -> Option<&'static str> {
     if harness_gen::build_safety::is_unsafe_build_input_reason(summary) {
-        return Some(
-            "an environment/path problem, not a bhf bug: a source path, include dir or \
-             compile flag holds a character that cannot be quoted safely in a build recipe \
-             (the reason names it); rename or move that path",
-        );
+        return Some(UNSAFE_BUILD_PATH_NOTE);
     }
     let s = summary.to_ascii_lowercase();
     if s.contains("phase c") || s.contains("needs lifecycle support") {
@@ -552,7 +561,8 @@ fn render_md(report: &BugReport) -> String {
     out.push_str(
         "What bhf could NOT fully handle on your tree — its own bugs (`PANIC`, \
          `codegen-bug`) plus targets it couldn't fuzz (`unsupported-type`, `failed-build`, \
-         `static-only`). Deduplicated BY TYPE (one row per unique type/reason, not per \
+         `static-only`, and `unsafe-build-path`: a path to rename, not a bhf bug). \
+         Deduplicated BY TYPE (one row per unique type/reason, not per \
          file) so it's short enough to re-type. NOT findings in your target, and NOT missing \
          dependencies (see `missing-deps.txt`). Send a row to the maintainer.\n\n",
     );
@@ -573,13 +583,14 @@ fn render_md(report: &BugReport) -> String {
     let count_of = |c: IssueCategory| report.issues.iter().filter(|i| i.category == c).count();
     out.push_str(&format!(
         "**{} issue(s): {} panic(s), {} codegen-bug(s), {} unsupported-type(s), {} \
-         failed-build(s), {} static-only.**\n\n",
+         failed-build(s), {} static-only, {} unsafe-build-path.**\n\n",
         report.issue_count,
         count_of(IssueCategory::InternalPanic),
         count_of(IssueCategory::CodegenDefect),
         count_of(IssueCategory::UnsupportedType),
         count_of(IssueCategory::FailedBuild),
         count_of(IssueCategory::ReportOnly),
+        count_of(IssueCategory::UnsafeBuildPath),
     ));
     out.push_str("`xN` = number of targets/files that hit the same type/reason.\n\n");
     // If any row is a recognized working-as-intended boundary, explain the marker
@@ -607,7 +618,12 @@ fn render_md(report: &BugReport) -> String {
         out.push_str(&format!("{}. [{kind}{occ}] {}\n", n + 1, issue.summary));
         // Tag a recognized working-as-intended boundary so it isn't mistaken for a
         // bug worth reporting (only `unsupported-type` rows carry these reasons).
-        if let Some(note) = unsupported_type_boundary_note(&issue.summary) {
+        if issue.category == IssueCategory::UnsafeBuildPath {
+            out.push_str(&format!(
+                "   ↳ **(environment problem)** {}\n",
+                UNSAFE_BUILD_PATH_NOTE
+            ));
+        } else if let Some(note) = unsupported_type_boundary_note(&issue.summary) {
             out.push_str(&format!("   ↳ **(working as intended)** {note}\n"));
         }
         // A panic also carries WHERE in bhf it fired (the pin) plus the full
@@ -927,6 +943,47 @@ mod tests {
         assert!(unsupported_type_boundary_note("no factory method or free function").is_some());
         // Not a recognized boundary — should stay reportable.
         assert!(unsupported_type_boundary_note("unsupported parameter type 'WCHAR'").is_none());
+    }
+
+    /// An `unsafe_build_path` outcome is its own row category, counted on its
+    /// own and marked as an environment problem rather than a missing type.
+    #[test]
+    fn an_unsafe_build_path_row_has_its_own_category() {
+        init(false);
+        let dir = std::env::temp_dir().join(format!("bhf-bugreport-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let reason = harness_gen::build_safety::ensure_build_path_safe(
+            "include dir",
+            "/srv/build$tmp/include",
+        )
+        .unwrap_err()
+        .to_string();
+        let issue = InternalIssue {
+            category: IssueCategory::UnsafeBuildPath,
+            summary: reason,
+            context: IssueContext {
+                phase: "harness-gen".to_owned(),
+                ..Default::default()
+            },
+            detail: None,
+            backtrace: None,
+            occurrences: 2,
+        };
+        write(&dir, "2026-07-07T00:00:00Z", &[issue], false);
+        let md = std::fs::read_to_string(dir.join("bug-report.md")).unwrap();
+        assert!(
+            md.contains("1. [unsafe-build-path x2] refusing to generate harness"),
+            "{md}"
+        );
+        assert!(md.contains("↳ **(environment problem)**"), "{md}");
+        assert!(md.contains("rename or move that path"), "{md}");
+        assert!(md.contains("0 unsupported-type(s)"), "{md}");
+        assert!(md.contains("1 unsafe-build-path"), "{md}");
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("bug-report.json")).unwrap()).unwrap();
+        assert_eq!(json["issues"][0]["category"], "unsafe-build-path");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A target refused because its path or a compile flag holds a character no

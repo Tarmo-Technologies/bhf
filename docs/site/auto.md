@@ -715,7 +715,12 @@ See [Upgrading a 0.2.x work dir](https://github.com/Tarmo-Technologies/bhf/blob/
   generated harness does not compile, or whose own build fails is logged and
   skipped while the sweep continues. Run with `--debug` to capture these in
   `<work>/auto/bug-report.json` — `issue_count` plus a per-issue `category`
-  (`unsupported-type`, `codegen-defect`, `failed-build`, `target-not-reached`, …).
+  (`unsupported-type`, `codegen-defect`, `failed-build`, `target-not-reached`,
+  `unsafe-build-path`, …). An `unsafe-build-path` row (outcome
+  `unsafe_build_path` in `run.json`) is a target refused because a source path,
+  include dir or compile flag holds a character no quoting makes safe in a
+  build recipe (`$`, `#`, a backtick, a shell operator): an environment problem,
+  fixed by renaming or moving the path, not a bhf gap.
   A non-zero `issue_count` is **informational**: it counts candidates bhf could
   not fully drive, not a run failure. `--debug` also sets `RUST_BACKTRACE` and
   keeps going past a file that would otherwise crash bhf itself, enriching the

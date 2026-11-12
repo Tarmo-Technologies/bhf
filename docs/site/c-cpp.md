@@ -147,7 +147,10 @@ compiler given as a path with spaces is quoted the same way. A path or flag
 with a character no quoting can make safe is refused before generation, and
 the message names the character: `$`, `#`, a backtick, a double quote, a
 backslash, `;`, `|`, `&`, `<` or `>`. On Windows, where `\` separates path
-components, `%` and `^` are refused instead of the backslash.
+components, `%` and `^` are refused instead of the backslash. In `bhf auto`
+such a target's outcome is `unsafe_build_path` (counted as
+`summary.unsafe_build_path` in `run.json`, and filed as an `unsafe-build-path`
+row in `bug-report.md`): rename or move the path; `--force` cannot help.
 
 BHF auto-detects sibling headers such as `parser.hpp`, local quoted
 includes, nearby `include/` or `inc/` directories, and a pre-existing

@@ -3146,6 +3146,7 @@ fn attempt_dispatches_ada_candidate_to_gprbuild() {
         | Outcome::FailedBuild { .. }
         | Outcome::UnrecoverableLink { .. }
         | Outcome::UnrecoverableRuntime { .. }
+        | Outcome::UnsafeBuildPath { .. }
         | Outcome::ReportOnly { .. } => {
             // Any of these is fine - the dispatch reached the Ada path.
         }

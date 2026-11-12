@@ -411,6 +411,13 @@
   this release's work dirs from earlier ones.
 
 ### Changed
+- A target refused because a source path, include dir or compile flag holds a
+  character no quoting makes safe in a build recipe now has its own outcome,
+  `unsafe_build_path`, in `run.json` (and `summary.unsafe_build_path`, the
+  terminal label and the blocker histogram), and its own `unsafe-build-path`
+  category in `bug-report.json`/`bug-report.md`, instead of
+  `unsupported_params` / `unsupported-type`. Tooling that grouped these refusals
+  under `unsupported_params` should also read the new outcome.
 - Target ranking (`bhf auto` discovery and `bhf list targets`) reads C and C++
   parameter types through the file's typedefs and those of the project headers
   it includes, and through the built-in Windows and stdint spellings. A byte

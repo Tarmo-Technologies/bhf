@@ -269,6 +269,7 @@ pub(crate) fn blocker_for(result: &AttemptResult) -> Option<BlockerKey> {
     let (category, detail) = match &result.outcome {
         Outcome::BuiltAndFuzzed { .. } => return None,
         Outcome::UnsupportedParams { reason } => ("unsupported_params", normalize_detail(reason)),
+        Outcome::UnsafeBuildPath { reason } => ("unsafe_build_path", normalize_detail(reason)),
         Outcome::ReportOnly {
             reason, dialect, ..
         } => {

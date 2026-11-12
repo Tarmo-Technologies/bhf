@@ -335,6 +335,7 @@ fn blocker_kind(outcome: &str) -> &'static str {
         "built" => "built_not_fuzzed",
         "failed_build" => "build_blocked",
         "unsupported_params" => "unsupported_params",
+        "unsafe_build_path" => "unsafe_build_path",
         "unrecoverable_link" => "link_blocked",
         "unrecoverable_runtime" => "runtime_blocked",
         "not_seen_in_prior_run" => "not_run",
@@ -356,6 +357,11 @@ fn recommendation_for(blocker_kind: &str, candidate: &Candidate) -> String {
         }
         "unsupported_params" => {
             "Harness generation skipped unsupported parameters; add a wrapper or type decoder."
+                .to_owned()
+        }
+        "unsafe_build_path" => {
+            "Refused because a source path, include dir or compile flag holds a character that \
+             cannot be quoted safely in a build recipe; rename or move that path."
                 .to_owned()
         }
         "link_blocked" => {

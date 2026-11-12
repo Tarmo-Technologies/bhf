@@ -92,6 +92,12 @@ struct Summary {
     built_not_entered: usize,
     failed_build: usize,
     unsupported_params: usize,
+    /// Targets refused because a source path, include dir or compile flag
+    /// holds a character no quoting makes safe in a build recipe (outcome
+    /// `unsafe_build_path`; counted in `unsupported_params` before it had its
+    /// own outcome). 0 (omitted) when none was.
+    #[serde(skip_serializing_if = "is_zero")]
+    unsafe_build_path: usize,
     unrecoverable_link: usize,
     unrecoverable_runtime: usize,
     /// M22: targets discovered + statically analyzed but not fuzzed (legacy
@@ -1073,6 +1079,9 @@ pub fn write_reports_with_output_limit(
             Outcome::UnsupportedParams { .. } => {
                 summary.unsupported_params += 1;
             }
+            Outcome::UnsafeBuildPath { .. } => {
+                summary.unsafe_build_path += 1;
+            }
             Outcome::UnrecoverableLink { missing, .. } => {
                 summary.unrecoverable_link += 1;
                 for m in missing {
@@ -1300,6 +1309,11 @@ pub fn write_reports_with_output_limit(
             crate::auto::attempt::Outcome::UnsupportedParams { reason } => Some((
                 IssueCategory::UnsupportedType,
                 collapse_uninitializable_param_reason(&strip_target_prefix(reason)),
+                context("harness-gen"),
+            )),
+            crate::auto::attempt::Outcome::UnsafeBuildPath { reason } => Some((
+                IssueCategory::UnsafeBuildPath,
+                strip_target_prefix(reason),
                 context("harness-gen"),
             )),
             crate::auto::attempt::Outcome::FailedBuild { last_errors, .. } => Some((
@@ -2015,7 +2029,8 @@ pub fn dependency_manifest_pointer(work_dir: &Path) -> String {
 fn missing_language_package(outcome: &Outcome) -> Option<String> {
     let reason = match outcome {
         Outcome::UnsupportedParams { reason } => reason.as_str(),
-        Outcome::FailedBuild { .. }
+        Outcome::UnsafeBuildPath { .. }
+        | Outcome::FailedBuild { .. }
         | Outcome::BuiltAndFuzzed { .. }
         | Outcome::BuiltNotEntered { .. }
         | Outcome::Built { .. }
@@ -2044,7 +2059,9 @@ fn add_checkpoint_result(
         | Outcome::FailedBuild { repairs, .. }
         | Outcome::UnrecoverableLink { repairs, .. }
         | Outcome::UnrecoverableRuntime { repairs, .. } => repairs,
-        Outcome::UnsupportedParams { .. } | Outcome::ReportOnly { .. } => &[],
+        Outcome::UnsupportedParams { .. }
+        | Outcome::UnsafeBuildPath { .. }
+        | Outcome::ReportOnly { .. } => &[],
     };
     // An interpreted target that could not load because a package is not
     // installed is a missing DEPENDENCY, not an unsupported signature. Without
@@ -2293,7 +2310,9 @@ fn add_checkpoint_result(
                 );
             }
         }
-        Outcome::Built { .. } | Outcome::UnsupportedParams { .. } => {}
+        Outcome::Built { .. }
+        | Outcome::UnsupportedParams { .. }
+        | Outcome::UnsafeBuildPath { .. } => {}
     }
 }
 
@@ -2816,6 +2835,13 @@ fn render_md(r: &RunJson<'_>) -> String {
         "Skipped (could not auto-harness): {}",
         r.summary.unsupported_params
     );
+    if r.summary.unsafe_build_path > 0 {
+        let _ = writeln!(
+            s,
+            "Refused (a path or flag cannot be quoted safely): {}",
+            r.summary.unsafe_build_path
+        );
+    }
     let _ = writeln!(s, "Unrecoverable link: {}", r.summary.unrecoverable_link);
     let _ = writeln!(
         s,

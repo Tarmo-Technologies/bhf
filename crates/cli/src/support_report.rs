@@ -732,7 +732,11 @@ fn ingest_outcome(evidence: &mut Evidence, lang: &str, outcome: &Value) {
         }
     } else if matches!(
         tag,
-        "unsupported_params" | "report_only" | "unrecoverable_link" | "unrecoverable_runtime"
+        "unsupported_params"
+            | "unsafe_build_path"
+            | "report_only"
+            | "unrecoverable_link"
+            | "unrecoverable_runtime"
     ) {
         let raw = outcome
             .get("reason")

@@ -2971,8 +2971,7 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
                 .filter(|result| {
                     matches!(
                         &result.outcome,
-                        crate::auto::attempt::Outcome::UnsupportedParams { reason }
-                            if harness_gen::build_safety::is_unsafe_build_input_reason(reason)
+                        crate::auto::attempt::Outcome::UnsafeBuildPath { .. }
                     )
                 })
                 .count(),
@@ -3978,6 +3977,7 @@ impl AutoSummary {
                     coverage_edges = coverage_edges
                         .max(passes.iter().map(|p| p.coverage_edges).max().unwrap_or(0));
                 }
+                UnsafeBuildPath { .. } => skipped += 1,
                 UnsupportedParams { reason } => {
                     skipped += 1;
                     // An interpreted target that could not LOAD because a package
@@ -4733,6 +4733,8 @@ pub(crate) fn outcome_label(o: &crate::auto::attempt::Outcome) -> &'static str {
         // signature (e.g. a function-pointer or opaque-userdata param it
         // can't drive from a byte buffer).
         UnsupportedParams { .. } => "skipped: could not auto-harness",
+        // Not a missing feature: a path or flag no quoting makes safe.
+        UnsafeBuildPath { .. } => "refused: a path or flag cannot be quoted safely",
         UnrecoverableLink { .. } => "unrecoverable_link",
         UnrecoverableRuntime { .. } => "unrecoverable_runtime",
         // M22: discovered + statically analyzed, not fuzzed.
@@ -4785,7 +4787,7 @@ fn verbose_detail(outcome: &crate::auto::attempt::Outcome) -> Vec<String> {
                 lines.push(format!("last error: {}", build_error_brief(err)));
             }
         }
-        UnsupportedParams { reason } => lines.push(reason.clone()),
+        UnsupportedParams { reason } | UnsafeBuildPath { reason } => lines.push(reason.clone()),
         UnrecoverableLink { missing, .. } => {
             if !missing.is_empty() {
                 lines.push(format!("missing libraries: {}", missing.join(", ")));
