@@ -280,12 +280,20 @@ MSBuild itself evaluates each project when it is installed
 (`msbuild <proj> -getItem:ClCompile`, MSBuild 17.8+) with `--msbuild-evaluate`
 (config key `msbuild-evaluate`, honoured only from an explicit `--config`),
 `--probe-build` or `--run-untrusted`. Evaluation also covers whatever the
-static reading cannot (property functions, NuGet-imported targets), but it
-runs the projects' property functions, so it needs one of those opt-ins; a
+static reading cannot (property functions, NuGet-imported targets); a
 project MSBuild cannot evaluate falls back to the static reading. The import
 then prints `msbuild evaluation` instead of `static evaluation`; under
 `--probe-build` it writes `<tree>\.bhf-build\compile_commands.json` like the
 other probe tiers.
+
+Why evaluation is opt-in: evaluating a project runs code the scanned tree
+chooses. MSBuild calls the property functions the project files contain
+(`$([System.IO.File]::ReadAllText(...))`, `$([MSBuild]::...)`, and more),
+reads and evaluates every file they import (a `Directory.Build.props` or
+`.targets` anywhere above the project, NuGet package targets), and can
+resolve and load SDKs. A tree under analysis is untrusted, so bhf runs none
+of that unless you ask it to with one of the flags above. The static reading
+only parses the files, with the bounds described above.
 
 A harness whose build still needed a placeholder header or a made-up macro
 value is reported as such: its findings are low confidence and carry a

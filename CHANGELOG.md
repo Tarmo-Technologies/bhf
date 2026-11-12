@@ -1151,8 +1151,10 @@
   exhaust bhf. The default import is the static reading on every host:
   MSBuild itself evaluates each project (`msbuild -getItem:ClCompile`) when it
   is installed only with `--msbuild-evaluate` (config key `msbuild-evaluate`,
-  explicit `--config` only), `--probe-build` or `--run-untrusted`, because
-  evaluation runs the projects' property functions. New flags:
+  explicit `--config` only), `--probe-build` or `--run-untrusted`. This is a
+  security boundary: evaluation runs the projects' property functions and the
+  `.props`/`.targets` files they import, which is code from the scanned tree,
+  while the static reading only parses the files. New flags:
   `--msbuild-solution` (relative to the scanned tree; a solution outside the
   tree is imported, and a missing file is an error), `--msbuild-config`,
   `--no-msbuild-import`, `--msbuild-evaluate`.

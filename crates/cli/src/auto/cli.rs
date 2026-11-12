@@ -473,8 +473,9 @@ pub struct AutoArgs {
     /// Let MSBuild evaluate the Visual Studio projects in the default import,
     /// when it is installed (Windows), with bhf's static reading as the
     /// fallback for a project MSBuild cannot evaluate. Evaluation runs the
-    /// projects' property functions, so it is opt-in, like --probe-build
-    /// (which implies it). Config key `msbuild-evaluate`, honoured only from
+    /// projects' property functions and imported .props/.targets files, code
+    /// from the scanned tree, so it is opt-in, like --probe-build (which
+    /// implies it). Config key `msbuild-evaluate`, honoured only from
     /// an explicit --config.
     #[arg(long = "msbuild-evaluate")]
     pub msbuild_evaluate: bool,
