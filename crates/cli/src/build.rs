@@ -945,8 +945,10 @@ fn apply_c_family_make_env(
         // Foreign-target cross build: force the cross CC/CXX (and replacement
         // flags) unconditionally, overriding both the Makefile defaults and any
         // ambient CC/CXX so the candidate compiles for its real platform/arch.
-        cmd.env("CC", &compiler.cc);
-        cmd.env("CXX", &compiler.cxx);
+        // `$(CC)`/`$(CXX)` head each recipe line, so a toolchain installed under
+        // a spaced directory is double-quoted to stay one word.
+        cmd.env("CC", compiler_recipe_word(&compiler.cc));
+        cmd.env("CXX", compiler_recipe_word(&compiler.cxx));
         if !compiler.cflags.is_empty() {
             cmd.env("CFLAGS", compiler.cflags.join(" "));
         }
@@ -989,16 +991,15 @@ fn c_family_make_env(
 ) -> Vec<(String, String)> {
     let mut env = Vec::new();
 
+    // Every path below reaches a recipe through a make variable, so it is
+    // double-quoted when it carries a space (or parenthesis/apostrophe), and
+    // dropped with a warning when no quoting could make it safe.
+    let extra_sources = recipe_paths_or_warn("extra source", extra_sources);
     if !extra_sources.is_empty() {
-        env.push((
-            "AUTO_EXTRA_SOURCES".to_owned(),
-            extra_sources
-                .iter()
-                .map(|p| harness_gen::build_safety::make_path(p))
-                .collect::<Vec<_>>()
-                .join(" "),
-        ));
+        env.push(("AUTO_EXTRA_SOURCES".to_owned(), extra_sources.join(" ")));
     }
+    let extra_includes = recipe_paths_or_warn("extra include dir", extra_includes);
+    let force_includes = recipe_paths_or_warn("force-include header", force_includes);
 
     let mut include_flags = inherited_extra_includes
         .filter(|value| !value.trim().is_empty())
@@ -1011,22 +1012,14 @@ fn c_family_make_env(
     // help — those dirs still precede the built-in system dirs. Detected
     // project `-I` flags below are left as-is so project-internal angle
     // includes still resolve.
-    include_flags.extend(
-        extra_includes
-            .iter()
-            .map(|p| format!("-iquote {}", harness_gen::build_safety::make_path(p))),
-    );
+    include_flags.extend(extra_includes.iter().map(|p| format!("-iquote {p}")));
     // Also search the same dirs AFTER the system dirs (`-idirafter`) so a
     // synthesized placeholder for a genuinely-missing ANGLED system header (a
     // stubbed `<vxWorks.h>`/`<sys/neutrino.h>` for RTOS code, or any `<...>`
     // header the host lacks) resolves. `-idirafter` is searched last, so a real
     // same-named system header still wins — #366's no-shadow guarantee holds; this
     // only adds a fallback for headers the host genuinely does not provide.
-    include_flags.extend(
-        extra_includes
-            .iter()
-            .map(|p| format!("-idirafter {}", harness_gen::build_safety::make_path(p))),
-    );
+    include_flags.extend(extra_includes.iter().map(|p| format!("-idirafter {p}")));
     include_flags.extend(detected_include_flags.iter().cloned());
     // Force-include synthesised repair headers (C++-stdlib includes, build-config
     // defines) into every TU so their content is seen by the harness `main` and
@@ -1037,10 +1030,7 @@ fn c_family_make_env(
     // eats Windows backslashes — `-include C:\...\auto_defines.h` would arrive as
     // `C:...auto_defines.h` and the repair header would never be found.
     for force in force_includes.iter().rev() {
-        include_flags.insert(
-            0,
-            format!("-include {}", harness_gen::build_safety::make_path(force)),
-        );
+        include_flags.insert(0, format!("-include {force}"));
     }
     if !include_flags.is_empty() {
         env.push(("AUTO_EXTRA_INCLUDES".to_owned(), include_flags.join(" ")));
@@ -1052,13 +1042,44 @@ fn c_family_make_env(
         .into_iter()
         .collect::<Vec<_>>();
     if let Some(extra) = detected_ld_search_path {
-        ldflags.push(format!("-L{extra}"));
+        if let Some(dir) = recipe_paths_or_warn("library search dir", &[PathBuf::from(extra)]).pop()
+        {
+            ldflags.push(format!("-L{dir}"));
+        }
     }
     if !ldflags.is_empty() {
         env.push(("AUTO_EXTRA_LDFLAGS".to_owned(), ldflags.join(" ")));
     }
 
     env
+}
+
+/// A compiler for `CC`/`CXX`: double-quoted when its path has a space. Any
+/// other value passes through unchanged, as before; overrides come from bhf's
+/// own toolchain selection, not from the scanned tree.
+fn compiler_recipe_word(compiler: &str) -> String {
+    if harness_gen::build_safety::is_compiler_token(compiler) {
+        harness_gen::build_safety::recipe_path(compiler)
+    } else {
+        compiler.to_owned()
+    }
+}
+
+/// Render paths for a recipe (see [`harness_gen::build_safety::recipe_path`]),
+/// leaving out, with a warning, any path that quoting cannot make safe.
+fn recipe_paths_or_warn(kind: &str, paths: &[PathBuf]) -> Vec<String> {
+    paths
+        .iter()
+        .filter_map(
+            |path| match harness_gen::build_safety::checked_recipe_path(kind, path) {
+                Ok(rendered) => Some(rendered),
+                Err(error) => {
+                    bhfeprintln!("warning: {error}; leaving it out of the harness build");
+                    None
+                }
+            },
+        )
+        .collect()
 }
 
 fn detect_libstdcxx_include_flags() -> Vec<String> {
@@ -1795,6 +1816,150 @@ mod tests {
         assert!(
             includes.contains("-I/proj/build"),
             "detected project -I flags must pass through untouched: {includes}"
+        );
+    }
+
+    /// `--extra-include`/`--extra-source` dirs and the work dir's own repair
+    /// headers can live under a path with spaces (`SDK 10/Include`, a user
+    /// profile). They reach the recipe through make variables, so each one must
+    /// arrive double-quoted or the shell splits it into two arguments.
+    #[test]
+    fn extra_paths_with_spaces_are_quoted_for_the_recipe() {
+        let env = c_family_make_env(
+            &[PathBuf::from("/work dir/repairs/auto_stubs.c")],
+            &[PathBuf::from("/opt/SDK 10/Include")],
+            None,
+            &[],
+            None,
+            Some("/opt/tool chain/lib".to_owned()),
+            &[PathBuf::from("/work dir/repairs/auto_defines.h")],
+        );
+        let value = |key: &str| {
+            env.iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("{key} is set: {env:?}"))
+        };
+        assert_eq!(
+            crate::generate_harness::split_compile_command(&value("AUTO_EXTRA_INCLUDES")),
+            vec![
+                "-include",
+                "/work dir/repairs/auto_defines.h",
+                "-iquote",
+                "/opt/SDK 10/Include",
+                "-idirafter",
+                "/opt/SDK 10/Include",
+            ]
+        );
+        assert_eq!(
+            value("AUTO_EXTRA_SOURCES"),
+            "\"/work dir/repairs/auto_stubs.c\""
+        );
+        assert_eq!(value("AUTO_EXTRA_LDFLAGS"), "-L\"/opt/tool chain/lib\"");
+    }
+
+    /// Windows SDK, Visual Studio and user-profile dirs live under paths such as
+    /// `C:/Program Files (x86)/...` and `C:/Users/<First Last>/OneDrive - Org`.
+    /// Rendered with forward slashes, they are quoted like any spaced path. This
+    /// runs on every platform; the Windows CI job selects it by name.
+    #[test]
+    fn windows_style_extra_paths_with_spaces_are_quoted_for_the_recipe() {
+        let sdk = "C:/Program Files (x86)/Windows Kits/10/Include/10.0.22621.0/ucrt";
+        let helper = "C:/Users/Dana Smith/OneDrive - Org/proj/helpers.c";
+        let env = c_family_make_env(
+            &[PathBuf::from(helper)],
+            &[PathBuf::from(sdk)],
+            None,
+            &[],
+            None,
+            None,
+            &[],
+        );
+        let value = |key: &str| {
+            env.iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("{key} is set: {env:?}"))
+        };
+        assert_eq!(
+            crate::generate_harness::split_compile_command(&value("AUTO_EXTRA_INCLUDES")),
+            vec!["-iquote", sdk, "-idirafter", sdk]
+        );
+        assert_eq!(value("AUTO_EXTRA_SOURCES"), format!("\"{helper}\""));
+    }
+
+    /// On Windows a native path is first rendered with forward slashes and
+    /// without the `\\?\` verbatim prefix, then quoted like any other; a
+    /// command-interpreter metacharacter (`%`) stays refused.
+    #[cfg(windows)]
+    #[test]
+    fn windows_native_paths_with_spaces_are_rendered_and_quoted() {
+        let env = c_family_make_env(
+            &[PathBuf::from(r"C:\Users\Dana Smith\proj\helpers.c")],
+            &[PathBuf::from(
+                r"\\?\C:\Program Files (x86)\Windows Kits\10\Include",
+            )],
+            None,
+            &[],
+            None,
+            None,
+            &[],
+        );
+        let value = |key: &str| {
+            env.iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("{key} is set: {env:?}"))
+        };
+        let sdk = "C:/Program Files (x86)/Windows Kits/10/Include";
+        assert_eq!(
+            crate::generate_harness::split_compile_command(&value("AUTO_EXTRA_INCLUDES")),
+            vec!["-iquote", sdk, "-idirafter", sdk]
+        );
+        assert_eq!(
+            value("AUTO_EXTRA_SOURCES"),
+            "\"C:/Users/Dana Smith/proj/helpers.c\""
+        );
+        assert_eq!(
+            harness_gen::build_safety::checked_recipe_path(
+                "source path",
+                std::path::Path::new(r"C:\src\a.c")
+            )
+            .unwrap(),
+            "C:/src/a.c"
+        );
+        assert!(harness_gen::build_safety::checked_recipe_path(
+            "source path",
+            std::path::Path::new(r"C:\a%PATH%\b.c")
+        )
+        .is_err());
+    }
+
+    /// A path no quoting can make safe (`make` expands `$` before the shell runs)
+    /// never reaches the recipe.
+    #[test]
+    fn extra_paths_with_unquotable_characters_are_dropped() {
+        let env = c_family_make_env(
+            &[PathBuf::from("/tmp/$(id)/stub.c")],
+            &[
+                PathBuf::from("/tmp/a`id`/include"),
+                PathBuf::from("/usr/include/x"),
+            ],
+            None,
+            &[],
+            None,
+            None,
+            &[],
+        );
+        assert!(
+            env.iter()
+                .all(|(_, v)| !v.contains("$(id)") && !v.contains('`')),
+            "{env:?}"
+        );
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "AUTO_EXTRA_INCLUDES" && v.contains("-iquote /usr/include/x")),
+            "a safe dir beside a refused one is still passed: {env:?}"
         );
     }
 

@@ -16,6 +16,10 @@ pub struct TriageInputs<'a> {
     /// is not installed. `--force` cannot install a package, so these get the
     /// install action instead of the force one.
     pub skipped_missing_package: usize,
+    /// Of `skipped`, those refused because a path or compile flag carries a
+    /// character no quoting can make safe in a build recipe. The remedy is to
+    /// move or rename the path, not `--force`.
+    pub skipped_unsafe_path: usize,
     pub report_only: usize,
     pub findings: usize,
     pub preflight: &'a PreflightReport,
@@ -86,10 +90,24 @@ pub fn render_triage(inputs: &TriageInputs) -> String {
         ));
     }
 
-    // 3b. Skipped (a parameter couldn't be driven) — what --force is actually for.
+    // 3b. Refused before generation because a path or flag cannot be quoted
+    // safely in a recipe. Spaces are fine; what is left is rare, and --force
+    // cannot help with it.
+    if inputs.skipped_unsafe_path > 0 {
+        actions.push(format!(
+            "{} target(s) were refused because a source path, include dir or compile flag \
+             contains a character that cannot be quoted safely in a build recipe (each reason \
+             names it). Rename or move that path; spaces, parentheses and apostrophes are \
+             supported. --force cannot help.",
+            inputs.skipped_unsafe_path
+        ));
+    }
+
+    // 3c. Skipped (a parameter couldn't be driven) — what --force is actually for.
     let undrivable = inputs
         .skipped
-        .saturating_sub(inputs.skipped_missing_package);
+        .saturating_sub(inputs.skipped_missing_package)
+        .saturating_sub(inputs.skipped_unsafe_path);
     if undrivable > 0 {
         actions.push(format!(
             "{undrivable} target(s) were skipped (a parameter couldn't be driven — opaque handle, callback, unknown type). Attempt them anyway with --force.",
@@ -223,6 +241,7 @@ mod tests {
             failed_build: 0,
             skipped: 0,
             skipped_missing_package: 0,
+            skipped_unsafe_path: 0,
             report_only: 0,
             findings: 2,
             preflight: &healthy(),
@@ -238,6 +257,7 @@ mod tests {
             failed_build: 3,
             skipped: 2,
             skipped_missing_package: 0,
+            skipped_unsafe_path: 0,
             report_only: 0,
             findings: 0,
             preflight: &healthy(),
@@ -262,6 +282,7 @@ mod tests {
             failed_build: 0,
             skipped: 4,
             skipped_missing_package: 4,
+            skipped_unsafe_path: 0,
             report_only: 0,
             findings: 0,
             preflight: &healthy(),
@@ -291,6 +312,7 @@ mod tests {
             failed_build: 0,
             skipped: 7,
             skipped_missing_package: 5,
+            skipped_unsafe_path: 0,
             report_only: 0,
             findings: 0,
             preflight: &healthy(),
@@ -301,6 +323,36 @@ mod tests {
         assert!(
             text.contains("2 target(s) were skipped (a parameter couldn't be driven"),
             "the force action must count only the undrivable ones:\n{text}"
+        );
+    }
+
+    /// A target refused because a path or flag carries a character no quoting
+    /// can contain is an environment problem with one remedy: move or rename
+    /// the path. `--force` drives parameters and cannot help.
+    #[test]
+    fn a_refused_build_path_asks_for_a_rename_not_force() {
+        let inputs = TriageInputs {
+            built_and_fuzzed: 0,
+            failed_build: 0,
+            skipped: 3,
+            skipped_missing_package: 0,
+            skipped_unsafe_path: 2,
+            report_only: 0,
+            findings: 0,
+            preflight: &healthy(),
+            custom_build: None,
+        };
+        let text = render_triage(&inputs);
+        assert!(
+            text.contains(
+                "2 target(s) were refused because a source path, include dir or compile flag"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("Rename or move that path"), "{text}");
+        assert!(
+            text.contains("1 target(s) were skipped (a parameter couldn't be driven"),
+            "the force action counts only the undrivable skip:\n{text}"
         );
     }
 

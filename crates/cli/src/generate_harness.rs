@@ -62,12 +62,12 @@ pub struct GenerateHarnessArgs {
 
     /// Additional C/C++ source files to link into the generated harness
     /// (resolves multi-file libraries like bzip2 / libxml2 / mbedtls).
-    /// Repeatable.
+    /// Paths with spaces are quoted in the generated Makefile. Repeatable.
     #[arg(long = "extra-source")]
     pub extra_sources: Vec<PathBuf>,
 
     /// Additional include directory for the generated C/C++ harness.
-    /// Repeatable.
+    /// Paths with spaces are quoted in the generated Makefile. Repeatable.
     #[arg(long = "extra-include")]
     pub extra_includes: Vec<PathBuf>,
 
@@ -7685,18 +7685,24 @@ fn write_per_tu_context(
     variants: &[(&str, &str, &str, bool)],
     cpp: bool,
 ) -> Result<()> {
+    use harness_gen::build_safety::{
+        checked_recipe_path, ensure_all_compile_flags_safe, ensure_build_path_safe,
+        quoted_build_input, recipe_path,
+    };
+    // Paths may carry spaces (double-quoted below) and flags may need quoting
+    // (`-I/proj dir/include`); anything quoting cannot contain is refused.
+    let mut sources = Vec::with_capacity(contexts.len());
+    let mut compilers = Vec::with_capacity(contexts.len());
     for context in contexts {
-        harness_gen::build_safety::ensure_build_input_safe(
-            "per-TU source path",
-            &context.source.to_string_lossy(),
-        )?;
-        if let Some(compiler) = &context.compiler {
-            harness_gen::build_safety::ensure_build_input_safe("per-TU compiler", compiler)?;
-        }
-        harness_gen::build_safety::ensure_all_build_inputs_safe(
-            "per-TU compile flag",
-            context.flags.iter().map(String::as_str),
-        )?;
+        sources.push(checked_recipe_path("per-TU source path", &context.source)?);
+        compilers.push(match &context.compiler {
+            Some(compiler) => {
+                ensure_build_path_safe("per-TU compiler", compiler)?;
+                Some(recipe_path(compiler))
+            }
+            None => None,
+        });
+        ensure_all_compile_flags_safe(context.flags.iter().map(String::as_str))?;
     }
 
     let mut fragment = String::from(
@@ -7720,14 +7726,16 @@ fn write_per_tu_context(
         for (index, context) in contexts.iter().enumerate() {
             let object = format!("{object_dir}/{}_{}.o", variant.to_ascii_lowercase(), index);
             let compiler = if *variant == "MAIN" || *variant == "PROV" {
-                context.compiler.as_deref().unwrap_or(default_compiler)
+                compilers[index].as_deref().unwrap_or(default_compiler)
             } else {
                 default_compiler
             };
+            // A flag that is safe bare keeps its quoted-define escaping; one that
+            // needs quoting (a spaced include dir) is single-quoted whole.
             let flags = context
                 .flags
                 .iter()
-                .map(|flag| flag.replace('"', "\\\""))
+                .map(|flag| quoted_build_input(flag).unwrap_or_else(|| flag.replace('"', "\\\"")))
                 .collect::<Vec<_>>()
                 .join(" ");
             let compat = if cpp { "" } else { " $(C_COMPAT_FLAGS)" };
@@ -7738,7 +7746,7 @@ fn write_per_tu_context(
             };
             fragment.push_str(&format!(
                 "{object}: FORCE_CONTEXT_OBJECTS\n\t@mkdir -p {object_dir}\n\t{compiler} {variant_flags} $(SECTION_FLAGS){compat} {flags} $(INCLUDES) $(AUTO_EXTRA_INCLUDES){driver_define} -c {} -o {object}\n\n",
-                harness_gen::build_safety::make_path(&context.source)
+                sources[index]
             ));
         }
     }
@@ -12966,6 +12974,7 @@ mod tests {
     use super::{
         recorded_harness_format_version, stale_harness_format_note, write_generation_metadata,
     };
+    use super::{split_compile_command, write_c_per_tu_context, PerTuCompileContext};
     use ada_parser::ast::{Package, PackageId, StructuralAst as StructuralAstForMerge};
     use ada_parser::ast::{
         Span, Subprogram, SubprogramId, SubprogramKind, SubprogramOwner, Visibility,
@@ -17937,6 +17946,47 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         let main = fs::read_to_string(temp.join("generated_harnesses/H-CHILD-PARENT/main.adb"))
             .expect("generated main is readable");
         assert!(main.contains("Bhf_Result : constant Parent.Thing := Parent.Child.Get;"));
+    }
+
+    /// A compile-database row for a source under a spaced directory compiles it
+    /// with its own flags; every path in the generated object rule must reach
+    /// the compiler as one argument.
+    #[test]
+    fn per_tu_context_quotes_paths_with_spaces() {
+        let dir = temp_dir("per-tu-spaces");
+        let contexts = vec![PerTuCompileContext {
+            source: PathBuf::from("/proj dir/src lib/a.c"),
+            compiler: Some("/opt/my tools/bin/clang".to_owned()),
+            flags: vec![
+                "-I/proj dir/include".to_owned(),
+                "-DMODE=1".to_owned(),
+                "-DNAME=\"widget\"".to_owned(),
+            ],
+        }];
+        write_c_per_tu_context(&dir, &contexts).expect("spaced paths are accepted");
+        let fragment = fs::read_to_string(dir.join("build_context_objects.mk")).unwrap();
+        let recipe = fragment
+            .lines()
+            .find(|line| line.starts_with('\t') && line.contains("-c ") && line.contains("main_0"))
+            .unwrap_or_else(|| panic!("MAIN object rule in:\n{fragment}"));
+        let words = split_compile_command(recipe.trim());
+        assert_eq!(words[0], "/opt/my tools/bin/clang", "{recipe}");
+        assert!(
+            words.contains(&"-I/proj dir/include".to_owned()),
+            "{recipe}"
+        );
+        assert!(words.contains(&"-DNAME=\"widget\"".to_owned()), "{recipe}");
+        let c = words.iter().position(|w| w == "-c").unwrap();
+        assert_eq!(words[c + 1], "/proj dir/src lib/a.c", "{recipe}");
+
+        // A path no quoting can make safe is still refused.
+        let hostile = vec![PerTuCompileContext {
+            source: PathBuf::from("/proj/$(id)/a.c"),
+            compiler: None,
+            flags: Vec::new(),
+        }];
+        assert!(write_c_per_tu_context(&dir, &hostile).is_err());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// The decode of fuzz input into arguments is versioned, so a corpus or a

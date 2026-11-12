@@ -2263,6 +2263,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_spaced_paths.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_static_scan.rs",
       "license": "Apache-2.0"
     },

@@ -378,7 +378,7 @@ pub fn generate_c_direct_harness(
     let main_c = tera.render("direct_harness_c", &harness_source_context(&context)?)?;
     let makefile = tera.render(
         "harness_makefile",
-        &tera::Context::from_serialize(&context)?,
+        &harness_makefile_context(&context, &args.c_runtime_include)?,
     )?;
 
     fs::create_dir_all(&args.output_dir)?;
@@ -403,6 +403,36 @@ pub(crate) fn harness_source_context(
     let mut context = tera::Context::from_serialize(context)?;
     context.insert("harness_format_version", &crate::HARNESS_FORMAT_VERSION);
     Ok(context)
+}
+
+/// Template context for a generated harness MAKEFILE: the emitter's own context
+/// plus the runtime driver source, quoted for recipes. The driver source is a
+/// prerequisite of `bhf_driver.o` only when its path needs no quoting: `make`
+/// splits prerequisites on spaces whatever the quotes, while a recipe hands the
+/// quoted path to the shell intact. The harness dir is regenerated per attempt,
+/// so the object is still always built.
+pub(crate) fn harness_makefile_context(
+    context: &impl Serialize,
+    c_runtime_include: &Path,
+) -> Result<tera::Context, HarnessGenError> {
+    let mut context = tera::Context::from_serialize(context)?;
+    let driver = crate::build_safety::checked_recipe_path(
+        "runtime include",
+        &c_runtime_include.join("bhf_driver.c"),
+    )?;
+    context.insert("bhf_driver_prereq", &!driver.starts_with('"'));
+    context.insert("bhf_driver_source", &driver);
+    Ok(context)
+}
+
+/// Render filesystem paths for a generated Makefile: `make_path` form, double-
+/// quoted when they contain a space, parenthesis or apostrophe. Callers have
+/// validated them with [`crate::build_safety::ensure_build_path_safe`].
+pub(crate) fn recipe_paths(paths: &[PathBuf]) -> Vec<String> {
+    paths
+        .iter()
+        .map(|p| crate::build_safety::recipe_path(&crate::build_safety::make_path(p)))
+        .collect()
 }
 
 /// Emit the Mayhemfile, PORTABILITY.md, and libFuzzer shim beside a generated C
@@ -443,7 +473,7 @@ pub fn generate_c_sequence_harness(
     let main_c = tera.render("sequence_harness_c", &harness_source_context(&context)?)?;
     let makefile = tera.render(
         "harness_makefile",
-        &tera::Context::from_serialize(&context)?,
+        &harness_makefile_context(&context, &args.c_runtime_include)?,
     )?;
 
     fs::create_dir_all(&args.output_dir)?;
@@ -2822,49 +2852,49 @@ fn pair_output_buffer_length(
 /// line in the generated harness source.
 fn validate_c_build_inputs(args: &GenerateCDirectArgs) -> Result<(), HarnessGenError> {
     use crate::build_safety::{
-        ensure_all_build_inputs_safe, ensure_all_compile_flags_safe, ensure_build_input_safe,
+        ensure_all_build_paths_safe, ensure_all_compile_flags_safe, ensure_build_path_safe,
+        make_path,
     };
-    // Flags are recipe-only, so one that is safe once single-quoted is allowed;
-    // paths and include names below stay strict (a path is also a make target).
+    // Flags are recipe-only, so one that is safe once single-quoted is allowed.
+    // Paths and include names may carry spaces, parentheses and apostrophes —
+    // the Makefile double-quotes them, and a C string literal holds them — but
+    // no character that quoting cannot contain.
     ensure_all_compile_flags_safe(args.compile_flags.iter().map(String::as_str))?;
-    ensure_all_build_inputs_safe(
+    ensure_all_build_paths_safe(
         "include name",
         args.target_includes.iter().map(String::as_str),
     )?;
     for dir in &args.target_includes_dirs {
-        ensure_build_input_safe("include dir", &dir.display().to_string())?;
+        ensure_build_path_safe("include dir", &make_path(dir))?;
     }
     for src in &args.target_sources {
-        ensure_build_input_safe("source path", &src.display().to_string())?;
+        ensure_build_path_safe("source path", &make_path(src))?;
     }
-    ensure_build_input_safe(
-        "runtime include",
-        &args.c_runtime_include.display().to_string(),
-    )?;
+    ensure_build_path_safe("runtime include", &make_path(&args.c_runtime_include))?;
     Ok(())
 }
 
 fn validate_c_sequence_build_inputs(args: &GenerateCSequenceArgs) -> Result<(), HarnessGenError> {
     use crate::build_safety::{
-        ensure_all_build_inputs_safe, ensure_all_compile_flags_safe, ensure_build_input_safe,
+        ensure_all_build_paths_safe, ensure_all_compile_flags_safe, ensure_build_path_safe,
+        make_path,
     };
-    // Flags are recipe-only, so one that is safe once single-quoted is allowed;
-    // paths and include names below stay strict (a path is also a make target).
+    // Flags are recipe-only, so one that is safe once single-quoted is allowed.
+    // Paths and include names may carry spaces, parentheses and apostrophes —
+    // the Makefile double-quotes them, and a C string literal holds them — but
+    // no character that quoting cannot contain.
     ensure_all_compile_flags_safe(args.compile_flags.iter().map(String::as_str))?;
-    ensure_all_build_inputs_safe(
+    ensure_all_build_paths_safe(
         "include name",
         args.target_includes.iter().map(String::as_str),
     )?;
     for dir in &args.target_includes_dirs {
-        ensure_build_input_safe("include dir", &dir.display().to_string())?;
+        ensure_build_path_safe("include dir", &make_path(dir))?;
     }
     for src in &args.target_sources {
-        ensure_build_input_safe("source path", &src.display().to_string())?;
+        ensure_build_path_safe("source path", &make_path(src))?;
     }
-    ensure_build_input_safe(
-        "runtime include",
-        &args.c_runtime_include.display().to_string(),
-    )?;
+    ensure_build_path_safe("runtime include", &make_path(&args.c_runtime_include))?;
     Ok(())
 }
 
@@ -3128,22 +3158,16 @@ fn build_c_context(args: &GenerateCDirectArgs) -> Result<CTemplateContext, Harne
         harness_id: args.harness_id.clone(),
         qualified_target_name: args.target.name.clone(),
         target_includes: args.target_includes.clone(),
-        target_includes_dirs: args
-            .target_includes_dirs
-            .iter()
-            .map(|p| crate::build_safety::make_path(p))
-            .collect(),
-        target_sources: args
-            .target_sources
-            .iter()
-            .map(|p| crate::build_safety::make_path(p))
-            .collect(),
+        target_includes_dirs: recipe_paths(&args.target_includes_dirs),
+        target_sources: recipe_paths(&args.target_sources),
         compile_flags,
         build_context_provenance,
         build_context_dropped,
         c_compiler,
         compiler_is_gcc,
-        c_runtime_include: crate::build_safety::make_path(&args.c_runtime_include),
+        c_runtime_include: crate::build_safety::recipe_path(&crate::build_safety::make_path(
+            &args.c_runtime_include,
+        )),
         emit_forward_declaration: !args.target_declared_in_header,
         // When the target's header is INCLUDED (not forward-declared), a callback
         // param's support re-`typedef`s the callback type the header already
@@ -3254,22 +3278,16 @@ fn build_c_sequence_context(
         return Ok(CSequenceTemplateContext {
             harness_id: args.harness_id.clone(),
             target_includes,
-            target_includes_dirs: args
-                .target_includes_dirs
-                .iter()
-                .map(|p| crate::build_safety::make_path(p))
-                .collect(),
-            target_sources: args
-                .target_sources
-                .iter()
-                .map(|p| crate::build_safety::make_path(p))
-                .collect(),
+            target_includes_dirs: recipe_paths(&args.target_includes_dirs),
+            target_sources: recipe_paths(&args.target_sources),
             compile_flags,
             build_context_provenance,
             build_context_dropped,
             c_compiler,
             compiler_is_gcc,
-            c_runtime_include: crate::build_safety::make_path(&args.c_runtime_include),
+            c_runtime_include: crate::build_safety::recipe_path(&crate::build_safety::make_path(
+                &args.c_runtime_include,
+            )),
             emit_forward_declaration: false,
             expert_jpeg_decompress,
             expert_sqlite_prepare,
@@ -3792,22 +3810,16 @@ fn build_c_sequence_context(
     Ok(CSequenceTemplateContext {
         harness_id: args.harness_id.clone(),
         target_includes: args.target_includes.clone(),
-        target_includes_dirs: args
-            .target_includes_dirs
-            .iter()
-            .map(|p| crate::build_safety::make_path(p))
-            .collect(),
-        target_sources: args
-            .target_sources
-            .iter()
-            .map(|p| crate::build_safety::make_path(p))
-            .collect(),
+        target_includes_dirs: recipe_paths(&args.target_includes_dirs),
+        target_sources: recipe_paths(&args.target_sources),
         compile_flags,
         build_context_provenance,
         build_context_dropped,
         c_compiler,
         compiler_is_gcc,
-        c_runtime_include: crate::build_safety::make_path(&args.c_runtime_include),
+        c_runtime_include: crate::build_safety::recipe_path(&crate::build_safety::make_path(
+            &args.c_runtime_include,
+        )),
         emit_forward_declaration: !args.target_declared_in_header,
         expert_jpeg_decompress: false,
         expert_sqlite_prepare: false,
@@ -4140,7 +4152,9 @@ fn split_c_compile_context(flags: &[String]) -> (Vec<String>, String, bool, Stri
         leaf == "gcc" || leaf.starts_with("gcc-") || leaf == "g++" || leaf.starts_with("g++-");
     (
         compile_flags,
-        compiler,
+        // `CC = <compiler>` heads every recipe; one under a spaced directory is
+        // double-quoted so it stays a single word.
+        crate::build_safety::recipe_path(&crate::build_safety::make_path(Path::new(&compiler))),
         compiler_is_gcc,
         // Metadata lands in `NAME = <value>` assignments; a newline would end the
         // assignment and let the remainder parse as Makefile source.
@@ -5536,6 +5550,104 @@ mod tests {
         );
 
         fs::remove_dir_all(&out).ok();
+    }
+
+    fn copy_c_runtime_to(dir: &Path) {
+        let runtime = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../c_runtime")
+            .canonicalize()
+            .expect("c_runtime dir");
+        fs::create_dir_all(dir).unwrap();
+        for entry in fs::read_dir(&runtime).unwrap().flatten() {
+            if entry.path().is_file() {
+                fs::copy(entry.path(), dir.join(entry.file_name())).unwrap();
+            }
+        }
+    }
+
+    /// A source tree, include dir and runtime dir whose paths contain spaces and
+    /// parentheses must generate, build and run, not be refused or word-split.
+    #[test]
+    fn harness_builds_from_paths_with_spaces() {
+        let make_ok = Command::new("make")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        let clang_ok = Command::new("clang")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !make_ok || !clang_ok {
+            eprintln!("skipping spaced-path e2e: clang/make unavailable");
+            return;
+        }
+        let root = temp_dir("spaced paths");
+        let src_dir = root.join("My Proj (copy)/src lib");
+        let inc_dir = root.join("My Proj (copy)/include dir");
+        let runtime = root.join("tool's runtime/c_runtime");
+        let out = root.join("work dir/harnesses/H-SPACED");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::create_dir_all(&inc_dir).unwrap();
+        copy_c_runtime_to(&runtime);
+        fs::write(
+            inc_dir.join("record.h"),
+            "#include <stddef.h>\nint parse_record(const unsigned char *data, size_t len);\n",
+        )
+        .unwrap();
+        let source = src_dir.join("record.c");
+        fs::write(
+            &source,
+            "#include \"record.h\"\n\
+             int parse_record(const unsigned char *data, size_t len) {\n\
+             \x20   return len ? data[len - 1] : 0;\n\
+             }\n",
+        )
+        .unwrap();
+        let mut args = direct_args("parse_record", out.clone());
+        args.source_path = source.clone();
+        args.params = vec![
+            CParameter {
+                name: "data".to_owned(),
+                c_type: "const unsigned char *".to_owned(),
+            },
+            CParameter {
+                name: "len".to_owned(),
+                c_type: "size_t".to_owned(),
+            },
+        ];
+        args.target_includes = vec!["record.h".to_owned()];
+        args.target_includes_dirs = vec![inc_dir.clone()];
+        args.target_sources = vec![source.clone()];
+        args.target_declared_in_header = true;
+        args.c_runtime_include = runtime.clone();
+        generate_c_direct_harness(args).expect("spaced paths are accepted");
+
+        let makefile = fs::read_to_string(out.join("Makefile")).unwrap();
+        assert!(
+            makefile.contains(&format!("-iquote \"{}\"", inc_dir.display()))
+                && makefile.contains(&format!(" \"{}\"", source.display())),
+            "spaced paths must be double-quoted in the Makefile:\n{makefile}"
+        );
+        let build = Command::new("make")
+            .arg("main")
+            .current_dir(&out)
+            .output()
+            .expect("run make");
+        assert!(
+            build.status.success(),
+            "make main failed:\n{}\n{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr)
+        );
+        let input = out.join("input.bin");
+        fs::write(&input, b"record").unwrap();
+        let run = Command::new(out.join("main")).arg(&input).output().unwrap();
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]

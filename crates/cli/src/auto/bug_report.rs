@@ -493,7 +493,17 @@ fn category_label(category: IssueCategory) -> &'static str {
 /// expected gaps the user can't file as bhf bugs; the second is fixable in
 /// the user's own tree (the message says how). Returns `None` for an unsupported
 /// type that is NOT a recognized boundary — genuinely worth a report.
+///
+/// A build path or compile flag that no quoting can make safe is tagged too:
+/// renaming or moving the path is the fix.
 fn unsupported_type_boundary_note(summary: &str) -> Option<&'static str> {
+    if harness_gen::build_safety::is_unsafe_build_input_reason(summary) {
+        return Some(
+            "an environment/path problem, not a bhf bug: a source path, include dir or \
+             compile flag holds a character that cannot be quoted safely in a build recipe \
+             (the reason names it); rename or move that path",
+        );
+    }
     let s = summary.to_ascii_lowercase();
     if s.contains("phase c") || s.contains("needs lifecycle support") {
         return Some(
@@ -917,5 +927,20 @@ mod tests {
         assert!(unsupported_type_boundary_note("no factory method or free function").is_some());
         // Not a recognized boundary — should stay reportable.
         assert!(unsupported_type_boundary_note("unsupported parameter type 'WCHAR'").is_none());
+    }
+
+    /// A target refused because its path or a compile flag holds a character no
+    /// quoting can make safe is an environment problem, not a type bhf lacks.
+    #[test]
+    fn an_unquotable_build_path_is_tagged_as_a_path_problem() {
+        let reason = harness_gen::build_safety::ensure_build_path_safe(
+            "include dir",
+            "/srv/build$tmp/include",
+        )
+        .unwrap_err()
+        .to_string();
+        let note = unsupported_type_boundary_note(&reason).expect("a path refusal is tagged");
+        assert!(note.contains("path problem"), "{note}");
+        assert!(note.contains("rename or move"), "{note}");
     }
 }

@@ -315,11 +315,12 @@ fn parse_makefile(path: &Path) -> Option<BuildRecipe> {
             // `-I <dir>` pairs; skip the `.` self-include (the harness dir, copied
             // separately). `-iquote`/`-idirafter` source dirs come in via the
             // target-source parents, so only collect real `-I` include roots.
-            let toks: Vec<&str> = rest.split_whitespace().collect();
+            // A dir with spaces is double-quoted; split the way the shell does.
+            let toks = crate::generate_harness::split_compile_command(rest);
             let mut i = 0;
             while i < toks.len() {
                 if toks[i] == "-I" && i + 1 < toks.len() && toks[i + 1] != "." {
-                    include_dirs.push(PathBuf::from(toks[i + 1]));
+                    include_dirs.push(PathBuf::from(&toks[i + 1]));
                     i += 2;
                 } else {
                     i += 1;
@@ -332,7 +333,7 @@ fn parse_makefile(path: &Path) -> Option<BuildRecipe> {
             // Tokens strictly between `main.c` and the first `$(...)` make var are the
             // explicit target sources (absolute paths).
             let after = t.split("-o $@ main.c").nth(1).unwrap_or("");
-            for tok in after.split_whitespace() {
+            for tok in crate::generate_harness::split_compile_command(after) {
                 if tok.starts_with("$(") {
                     break;
                 }
@@ -358,11 +359,11 @@ fn render_build_sh(
     if let Ok(entries) = std::fs::read_dir(cap.join("sources")) {
         for e in entries.flatten() {
             if e.path().extension().and_then(|x| x.to_str()) == Some("c") {
-                sources.push(format!("sources/{}", basename(&e.path())));
+                sources.push(sh_word(&format!("sources/{}", basename(&e.path()))));
             }
         }
     }
-    sources.extend(stub_sources.iter().cloned());
+    sources.extend(stub_sources.iter().map(|stub| sh_word(stub)));
     let db_flags = recipe.compile_db_flags.join(" ");
     let force = if force_include_defines {
         " -include stubs/auto_defines.h"
@@ -382,6 +383,21 @@ fn render_build_sh(
         force = force,
         sources = sources.join(" "),
     )
+}
+
+/// One POSIX shell word for `value`: unchanged when every character is plain,
+/// otherwise single-quoted, with each `'` written as `'\''`. Source names come
+/// from the scanned tree and may carry spaces or apostrophes (`rec ord.c`).
+fn sh_word(value: &str) -> String {
+    let plain = !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+' | ','));
+    if plain {
+        value.to_owned()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
 }
 
 /// Build + replay the capsule in place; return `(reproduced, signature)`.
@@ -775,6 +791,87 @@ mod tests {
         // `.` is skipped; the c_runtime `-I` root is captured.
         assert_eq!(recipe.include_dirs, vec![PathBuf::from("/bhf/c_runtime")]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Paths with spaces are double-quoted in the generated Makefile; reading
+    /// them back must yield the whole path, not its space-separated pieces.
+    #[test]
+    fn parse_makefile_reads_back_quoted_paths_with_spaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let mk = dir.path().join("Makefile");
+        std::fs::write(
+            &mk,
+            "COMPILE_DB_FLAGS = -std=c11 '-I/proj dir/include'\n\
+             INCLUDES = -I . -I \"/opt/my tools/c_runtime\" -iquote \"/proj dir\"\n\
+             main: main.c\n\
+             \t$(CC) $(CFLAGS) $(COMPILE_DB_FLAGS) $(INCLUDES) -o $@ main.c \"/proj dir/a.c\" /proj/b.c $(AUTO_EXTRA_SOURCES)\n",
+        )
+        .unwrap();
+        let recipe = parse_makefile(&mk).unwrap();
+        // Flags are spliced back into build.sh verbatim, so their quoting survives.
+        assert_eq!(
+            recipe.compile_db_flags.join(" "),
+            "-std=c11 '-I/proj dir/include'"
+        );
+        assert_eq!(
+            recipe.target_sources,
+            vec![PathBuf::from("/proj dir/a.c"), PathBuf::from("/proj/b.c")]
+        );
+        assert_eq!(
+            recipe.include_dirs,
+            vec![PathBuf::from("/opt/my tools/c_runtime")]
+        );
+    }
+
+    /// A copied source whose file name has a space or an apostrophe must reach
+    /// the compiler as one argument from `build.sh`.
+    #[test]
+    fn build_sh_quotes_source_names_for_the_shell() {
+        let cap = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cap.path().join("sources")).unwrap();
+        for name in ["rec ord.c", "o'neil.c", "plain.c"] {
+            std::fs::write(cap.path().join("sources").join(name), "int x;\n").unwrap();
+        }
+        let recipe = BuildRecipe {
+            target_sources: Vec::new(),
+            compile_db_flags: vec!["-DMODE=1".to_owned()],
+            include_dirs: Vec::new(),
+        };
+        let script = render_build_sh(
+            &recipe,
+            &["stubs/auto_stubs.c".to_owned()],
+            false,
+            cap.path(),
+        );
+        let compile = script
+            .lines()
+            .find(|line| line.contains("-o poc"))
+            .unwrap_or_else(|| panic!("no compile line in:\n{script}"));
+        assert!(compile.contains("'sources/rec ord.c'"), "{compile}");
+        assert!(compile.contains("'sources/o'\\''neil.c'"), "{compile}");
+        assert!(compile.contains(" sources/plain.c"), "{compile}");
+        assert!(compile.contains(" stubs/auto_stubs.c"), "{compile}");
+        // The shell splits the line into exactly these words.
+        let words = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "set -- {}; for w; do printf '%s\\n' \"$w\"; done",
+                compile.trim().trim_start_matches("-o poc ")
+            ))
+            .output()
+            .unwrap();
+        let words = String::from_utf8_lossy(&words.stdout);
+        for expected in [
+            "sources/rec ord.c",
+            "sources/o'neil.c",
+            "sources/plain.c",
+            "stubs/auto_stubs.c",
+        ] {
+            assert!(
+                words.lines().any(|word| word == expected),
+                "{expected:?} must be one shell word: {words}"
+            );
+        }
     }
 
     #[test]

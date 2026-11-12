@@ -92,6 +92,19 @@ Useful flags:
 | `--max-array-elems <N>` | Cap synthesized fixed-array elements (default 64); larger arrays fuzz a `0..cap` fill count |
 | `--max-decl-bytes <BYTES>` | Cap aggregate size for inline struct/union synthesis (default 64 KiB); larger types are rejected |
 
+Source, include, extra-source, runtime and compiler paths may contain spaces,
+parentheses, apostrophes and the characters `* ? [ ] { } ~ !`. The generated
+Makefile double-quotes such paths in recipes and never uses them as make
+prerequisites, so a tree under `/home/Dana Smith/...` or
+`C:/Program Files (x86)/...` builds like any other. Compile-database flags
+that name such paths are quoted too: single-quoted, or double-quoted when they
+contain an apostrophe (`-I/home/Dana's tree/include`). A `--differential`
+compiler given as a path with spaces is quoted the same way. A path or flag
+with a character no quoting can make safe is refused before generation, and
+the message names the character: `$`, `#`, a backtick, a double quote, a
+backslash, `;`, `|`, `&`, `<` or `>`. On Windows, where `\` separates path
+components, `%` and `^` are refused instead of the backslash.
+
 BHF auto-detects sibling headers such as `parser.hpp`, local quoted
 includes, nearby `include/` or `inc/` directories, and a pre-existing
 `compile_commands.json`. The database is searched in place and in the

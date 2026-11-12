@@ -196,9 +196,9 @@ fn build_side(hdir: &Path, is_cpp: bool, cc: &str, cxx: &str, tag: &str) -> Opti
     let mut cmd = Command::new("make");
     cmd.arg("-B").arg("diff").current_dir(hdir);
     if is_cpp {
-        cmd.arg(format!("DIFF_CXX={cxx}"));
+        cmd.arg(format!("DIFF_CXX={}", diff_compiler_word(cxx)));
     } else {
-        cmd.arg(format!("DIFF_CC={cc}"));
+        cmd.arg(format!("DIFF_CC={}", diff_compiler_word(cc)));
     }
     let ok = crate::command_output::output_with_timeout(
         &mut cmd,
@@ -215,6 +215,19 @@ fn build_side(hdir: &Path, is_cpp: bool, cc: &str, cxx: &str, tag: &str) -> Opti
         return None;
     }
     Some(tagged)
+}
+
+/// A `--differential` compiler for the `DIFF_CC=`/`DIFF_CXX=` make argument,
+/// which heads the diff recipe as `$(DIFF_CC)`. A path to an installed compiler
+/// under a directory with spaces is double-quoted so the recipe shell keeps it
+/// one word. Anything else (a bare name, a multi-word command such as
+/// `ccache clang`) passes through as given.
+fn diff_compiler_word(compiler: &str) -> String {
+    if Path::new(compiler).is_file() && harness_gen::build_safety::is_compiler_token(compiler) {
+        harness_gen::build_safety::recipe_path(compiler)
+    } else {
+        compiler.to_owned()
+    }
 }
 
 struct Run {
@@ -378,6 +391,19 @@ mod tests {
         assert_eq!(s.cxx_a, "clang++");
         assert_eq!(s.cc_b, "gcc");
         assert_eq!(s.cxx_b, "g++");
+    }
+
+    #[test]
+    fn a_spaced_compiler_path_stays_one_recipe_word() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = dir.path().join("my tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        let compiler = tools.join("gcc");
+        std::fs::write(&compiler, b"").unwrap();
+        let compiler = compiler.display().to_string();
+        assert_eq!(diff_compiler_word(&compiler), format!("\"{compiler}\""));
+        assert_eq!(diff_compiler_word("clang"), "clang");
+        assert_eq!(diff_compiler_word("ccache clang"), "ccache clang");
     }
 
     #[test]

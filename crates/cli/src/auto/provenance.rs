@@ -270,6 +270,13 @@ fn build_prov(hdir: &Path, prov_src: &Path) -> bool {
     // Match the auto build's default C/C++ compiler when the caller's env doesn't
     // already pin one (the generated Makefile's CC default is plain `clang`, which
     // is correct here — the ASan flags are baked into CFLAGS).
+    // The recipe expands `$(AUTO_PROV_SOURCES)` through the shell, so a work
+    // dir with spaces must arrive quoted.
+    let Ok(prov_src) =
+        harness_gen::build_safety::checked_recipe_path("provenance stub source", prov_src)
+    else {
+        return false;
+    };
     let mut cmd = Command::new("make");
     cmd.arg("prov").current_dir(hdir);
     cmd.env("AUTO_PROV_SOURCES", prov_src);

@@ -98,6 +98,23 @@
   `size_t` included, decode across their full range. Before, values of 2^31
   and above (65537 and above for `size_t`) were unreachable. Length-, size-
   and count-named values stay bounded.
+- C/C++ harnesses build from paths that contain spaces, parentheses,
+  apostrophes or `* ? [ ] { } ~ !`. This covers the source tree, include dirs,
+  the work dir, the runtime dir, the compiler, `--extra-include`/`--extra-source`
+  and `--differential` compiler paths. Such paths are double-quoted in
+  generated Makefiles, per-translation-unit object rules and the
+  `AUTO_EXTRA_INCLUDES`/`AUTO_EXTRA_SOURCES` variables, and they never become
+  make prerequisites. Compile-database flags naming them are quoted too
+  (double-quoted when they contain an apostrophe), and `bhf capsule` quotes
+  copied source names in `build.sh`. Before, every target under such a path
+  was refused, a spaced `--extra-include` was split into two arguments, and a
+  capsule of a source file named with a space did not rebuild. Characters no
+  quoting can make safe (`$`, `#`, backtick, `"`, `\`, `;`, `|`, `&`, `<`,
+  `>`) are still refused. The message now names the character, and the
+  next-steps advice lists these refusals separately and no longer suggests
+  `--force` for them. `bug-report.md` tags them as a path problem rather than a
+  missing type, although `run.json` still records them under the
+  `unsupported_params` outcome.
 
 ### Changed
 - `bhf auto --seed-dir` reads a directory's files in name order.

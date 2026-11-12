@@ -79,14 +79,17 @@ fn is_quoted_define_safe(value: &str) -> bool {
         .any(|c| c.is_control() || DANGEROUS_IN_QUOTES.contains(&c))
 }
 
-/// A token that is not safe BARE but is safe once wrapped in single quotes,
-/// rendered with those quotes. `None` when it is unsafe either way, or when it
-/// needs no quoting at all (the caller then emits it unchanged).
+/// A token that is not safe BARE but is safe once quoted, rendered with those
+/// quotes. `None` when it is unsafe either way, or when it needs no quoting at
+/// all (the caller then emits it unchanged).
 ///
 /// `sh` treats every character inside single quotes literally, so the only shell
 /// hazard is a single quote itself. `make` expands `$` BEFORE the shell ever sees
 /// the line, so that stays forbidden, as do newlines and control characters,
-/// which no quoting can contain.
+/// which no quoting can contain. A flag with an apostrophe in it (an include dir
+/// under `/home/Dana's tree/`) is double-quoted instead, when every character
+/// that needs quoting is one a path may carry ([`QUOTABLE_IN_PATH`]); see
+/// [`first_unquotable_flag_char`].
 ///
 /// This is what lets a legitimate CMake define through. `-DLLAMA_VERSIONS=>=3`
 /// (gpt4all) and `-D_LIBCPP_HARDENING_MODE=..._DEBUG>` (btop) are ordinary
@@ -94,30 +97,50 @@ fn is_quoted_define_safe(value: &str) -> bool {
 /// them cost every target in those projects, and quoting them is both correct and
 /// safe.
 pub fn quoted_build_input(value: &str) -> Option<String> {
-    if is_build_input_safe(value) {
-        return None;
-    }
-    const UNQUOTABLE: &[char] = &['\'', '$', '\n', '\r'];
-    if value.is_empty()
-        || value
-            .chars()
-            .any(|c| c.is_control() || UNQUOTABLE.contains(&c))
+    if value.is_empty() || is_build_input_safe(value) || first_unquotable_flag_char(value).is_some()
     {
         return None;
     }
-    Some(format!("'{value}'"))
+    if value.contains('\'') {
+        Some(format!("\"{value}\""))
+    } else {
+        Some(format!("'{value}'"))
+    }
+}
+
+/// The first character of a compile flag that no quoting can make safe, or
+/// `None` when the flag can be emitted bare or quoted by
+/// [`quoted_build_input`].
+///
+/// A control character or `$` is never safe. Single quotes contain anything
+/// else except a single quote. A flag with an apostrophe is double-quoted, and
+/// inside double quotes `sh` still acts on `$`, a backtick, a backslash and a
+/// double quote, so such a flag may only carry the characters a path may
+/// ([`QUOTABLE_IN_PATH`]) beyond those safe bare.
+fn first_unquotable_flag_char(value: &str) -> Option<char> {
+    if is_build_input_safe(value) {
+        return None;
+    }
+    if let Some(c) = value.chars().find(|c| c.is_control() || *c == '$') {
+        return Some(c);
+    }
+    if !value.contains('\'') {
+        return None;
+    }
+    value
+        .chars()
+        .find(|c| *c == '\\' || (FORBIDDEN.contains(c) && !QUOTABLE_IN_PATH.contains(c)))
 }
 
 /// Whether a COMPILE FLAG may be interpolated into a recipe — bare or quoted.
 ///
 /// Deliberately narrower than it looks: this relaxation is for flags ONLY. A
 /// compile flag appears only inside a recipe command line, where single quotes
-/// contain it completely. A source path or include dir also appears as a make
-/// TARGET or prerequisite, where quoting does not help and a `;` or `|` breaks
-/// rule parsing outright, and an include NAME is interpolated into an
-/// `#include "..."` line in generated C. Those stay strict.
+/// contain it completely. Filesystem paths get their own, narrower relaxation
+/// ([`is_build_path_usable`]): they also land in `#include "..."` lines and in
+/// make variable assignments, so a `;` or `|` in one stays refused.
 pub fn is_compile_flag_usable(value: &str) -> bool {
-    is_build_input_safe(value) || quoted_build_input(value).is_some()
+    first_unquotable_flag_char(value).is_none()
 }
 
 /// Render a compile flag for a recipe: unchanged when it is safe bare,
@@ -126,21 +149,114 @@ pub fn recipe_token(value: &str) -> String {
     quoted_build_input(value).unwrap_or_else(|| value.to_owned())
 }
 
+/// Characters a filesystem path may contain once it is double-quoted, beyond
+/// those already safe bare: a space, the parentheses and apostrophe found in
+/// `C:/Program Files (x86)/...` and personal directory names, and the glob,
+/// brace, tilde and history characters (`* ? [ ] { } ~ !`). Inside double
+/// quotes `sh` treats each of them literally, and `make` only acts on them in
+/// rule targets and prerequisites, where a quoted path never appears. Even if a
+/// path were ever emitted unquoted they could only split, expand or break the
+/// command line, never start another command, which is why shell control
+/// operators (`;`, `|`, `&`, `<`, `>`) are not on this list although quoting
+/// would contain them too.
+const QUOTABLE_IN_PATH: &[char] = &[' ', '(', ')', '\'', '*', '?', '[', ']', '{', '}', '~', '!'];
+
+/// The first character of `value` that no quoting makes safe in a recipe path:
+/// a control character, or a metacharacter outside [`QUOTABLE_IN_PATH`]. That
+/// covers `$` (expanded by `make`), `#` (a `make` comment), a backtick or a
+/// double quote (which would break out of the quotes), and the shell operators.
+fn first_unquotable_path_char(value: &str) -> Option<char> {
+    value
+        .chars()
+        .find(|c| c.is_control() || (FORBIDDEN.contains(c) && !QUOTABLE_IN_PATH.contains(c)))
+}
+
+/// Whether a filesystem PATH (source file, include dir, extra source, runtime
+/// dir, compiler) can be emitted into a generated Makefile: bare when it is
+/// plain, double-quoted by [`recipe_path`] when it carries a space, parenthesis
+/// or apostrophe. Paths reach recipes and make variables only, never a make
+/// target or prerequisite while they need quoting.
+pub fn is_build_path_usable(value: &str) -> bool {
+    first_unquotable_path_char(value).is_none()
+}
+
+/// Validate one filesystem path for a generated Makefile, naming the offending
+/// character and the remedy when it cannot be quoted safely.
+pub fn ensure_build_path_safe(kind: &str, value: &str) -> Result<(), HarnessGenError> {
+    match first_unquotable_path_char(value) {
+        None => Ok(()),
+        Some(c) => Err(HarnessGenError::UnsafeBuildInput(format!(
+            "refusing to generate harness: {kind} {value:?} contains {c:?}, which cannot be \
+             quoted safely in a build recipe (a shell/make metacharacter that could inject \
+             commands); rename or move it to a path without that character (spaces, \
+             parentheses and apostrophes are supported)"
+        ))),
+    }
+}
+
+/// Validate every path in an iterator, naming the offending one.
+pub fn ensure_all_build_paths_safe<'a, I>(kind: &str, values: I) -> Result<(), HarnessGenError>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    for value in values {
+        ensure_build_path_safe(kind, value)?;
+    }
+    Ok(())
+}
+
+/// A character that needs no quoting in a recipe word.
+fn is_plain_path_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+' | ',' | '=' | ':' | '@' | '%')
+}
+
+/// Render a validated path for a recipe or a make variable that a recipe
+/// expands: unchanged when every character is plain, otherwise wrapped in
+/// double quotes, which `sh` and the Windows argument parser both honour.
+/// Callers validate with [`ensure_build_path_safe`] first; `$`, `#`, a backtick
+/// and a double quote can never appear here.
+pub fn recipe_path(value: &str) -> String {
+    debug_assert!(
+        is_build_path_usable(value),
+        "unvalidated recipe path {value:?}"
+    );
+    if value.chars().all(is_plain_path_char) {
+        value.to_owned()
+    } else {
+        format!("\"{value}\"")
+    }
+}
+
+/// [`make_path`], validated and quoted for a recipe in one step.
+pub fn checked_recipe_path(kind: &str, path: &std::path::Path) -> Result<String, HarnessGenError> {
+    let rendered = make_path(path);
+    ensure_build_path_safe(kind, &rendered)?;
+    Ok(recipe_path(&rendered))
+}
+
 /// Validate every compile flag, permitting one that is safe once quoted.
 pub fn ensure_all_compile_flags_safe<'a, I>(values: I) -> Result<(), HarnessGenError>
 where
     I: IntoIterator<Item = &'a str>,
 {
     for value in values {
-        if !is_compile_flag_usable(value) {
+        if let Some(c) = first_unquotable_flag_char(value) {
             return Err(HarnessGenError::UnsafeBuildInput(format!(
-                "refusing to generate harness: compile flag {value:?} contains a shell/make \
-                 metacharacter that quoting cannot contain and could inject commands into \
-                 the build recipe"
+                "refusing to generate harness: compile flag {value:?} contains {c:?}, a \
+                 shell/make metacharacter that quoting cannot contain and could inject \
+                 commands into the build recipe; rename or move the path it names to one \
+                 without that character"
             )));
         }
     }
     Ok(())
+}
+
+/// Whether a failure reason is a build-input refusal from this module (an
+/// unsafe path, include name or compile flag), as opposed to a parameter the
+/// decoders could not drive. Every refusal message starts this way.
+pub fn is_unsafe_build_input_reason(reason: &str) -> bool {
+    reason.contains("refusing to generate harness: ")
 }
 
 /// Validate one untrusted build-input token, returning a descriptive
@@ -198,12 +314,14 @@ pub fn is_cxx_standard_token(value: &str) -> bool {
 /// it is the single most powerful injection point in the Makefile. It comes from the
 /// scanned tree's `compile_commands.json`, where a "compiler" of
 /// `clang++; id > /tmp/x; true` is recognised by a leaf-name check but executes as
-/// three shell commands. Hold it to the strict bare-token rule — a compiler path
-/// never legitimately needs a metacharacter, and the quoting relaxation that exists
-/// for compile FLAGS must not apply here, because `CC`/`CXX` are also expanded in
-/// contexts where surrounding quotes would break the command.
+/// three shell commands. Hold it to the path rule — a compiler path never
+/// legitimately needs a shell operator. The single-quote relaxation for compile
+/// FLAGS does not apply. A compiler under a directory with spaces
+/// (`C:/Program Files/LLVM/bin/clang.exe`) is accepted, and the Makefile names
+/// it through [`recipe_path`], double-quoted, so it stays one word at the head of
+/// each recipe line.
 pub fn is_compiler_token(value: &str) -> bool {
-    !value.trim().is_empty() && is_build_input_safe(value) && !value.starts_with('-')
+    !value.trim().is_empty() && is_build_path_usable(value) && !value.starts_with('-')
 }
 
 /// Characters allowed in a build-context METADATA value (`BUILD_CONTEXT_PROVENANCE`
@@ -256,7 +374,8 @@ where
     for value in values {
         if !is_gpr_string_safe(value) {
             return Err(HarnessGenError::UnsafeBuildInput(format!(
-                "refusing to generate harness: {kind} {value:?} contains a quote or newline                  that would terminate its GPR string literal and inject project syntax"
+                "refusing to generate harness: {kind} {value:?} contains a quote or newline \
+                 that would terminate its GPR string literal and inject project syntax"
             )));
         }
     }
@@ -440,12 +559,194 @@ mod tests {
         assert_eq!(recipe_token("-DNDEBUG"), "-DNDEBUG");
         assert_eq!(recipe_token("-I/usr/include"), "-I/usr/include");
 
-        // The relaxation is for FLAGS only. A source path is also a make target
-        // and an include name lands inside `#include "..."`, so both stay strict
-        // even though single-quoting would satisfy the shell.
-        for hostile in ["src/a;curl evil|sh.c", "/path/with a space.c"] {
-            assert!(ensure_build_input_safe("source path", hostile).is_err());
+        // A shell control operator in a source path stays refused even though
+        // quoting would contain it (paths have their own, narrower relaxation).
+        assert!(ensure_build_input_safe("source path", "src/a;curl evil|sh.c").is_err());
+        assert!(ensure_build_path_safe("source path", "src/a;curl evil|sh.c").is_err());
+    }
+
+    /// Source trees, work directories and SDK include dirs routinely contain
+    /// spaces (`/home/Dana Smith/...`, `C:/Program Files (x86)/Windows Kits/...`).
+    /// They are accepted and double-quoted wherever they reach a recipe.
+    #[test]
+    fn paths_with_spaces_are_accepted_and_quoted_for_recipes() {
+        for (path, rendered) in [
+            (
+                "/home/Dana Smith/My Proj/src/a.c",
+                "\"/home/Dana Smith/My Proj/src/a.c\"",
+            ),
+            (
+                "C:/Program Files (x86)/Windows Kits/10/Include",
+                "\"C:/Program Files (x86)/Windows Kits/10/Include\"",
+            ),
+            ("/srv/o'neil/include", "\"/srv/o'neil/include\""),
+            ("/home/Dana Smith/work dir", "\"/home/Dana Smith/work dir\""),
+        ] {
+            assert!(is_build_path_usable(path), "{path:?} must be usable");
+            assert!(
+                ensure_build_path_safe("source path", path).is_ok(),
+                "{path:?}"
+            );
+            assert_eq!(recipe_path(path), rendered);
         }
+        // An ordinary path is emitted exactly as before.
+        for plain in [
+            "/usr/include",
+            "src/miniz.c",
+            "C:/tools/llvm/bin/clang.exe",
+            "-",
+        ] {
+            assert_eq!(recipe_path(plain), plain);
+        }
+    }
+
+    /// What quoting cannot make safe is still refused: `make` expands `$` and
+    /// starts a comment at `#` before the shell sees the line, a backtick or an
+    /// inner double quote breaks out of the quotes, a newline ends the recipe
+    /// line, and shell control operators are refused even though quoting would
+    /// contain them, so a path never carries an operator into a recipe.
+    #[test]
+    fn paths_with_unquotable_metacharacters_stay_refused() {
+        for hostile in [
+            "/tmp/$(id)/a.c",
+            "/tmp/${HOME}/a.c",
+            "/tmp/`id`/a.c",
+            "/tmp/a\"b/a.c",
+            "/tmp/a#b/a.c",
+            "/tmp/a\nrun: ; id/a.c",
+            "/tmp/a\tb/a.c",
+            "src/a;curl evil|sh.c",
+            "/tmp/a&b/a.c",
+            "/tmp/a>b/a.c",
+        ] {
+            assert!(
+                !is_build_path_usable(hostile),
+                "{hostile:?} must be refused"
+            );
+            let error = ensure_build_path_safe("source path", hostile).unwrap_err();
+            assert!(
+                error.to_string().contains("source path"),
+                "the refusal names what was refused: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_path_names_the_character_and_the_remedy() {
+        let error = ensure_build_path_safe("include dir", "/srv/build$tmp/include")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("'$'"), "{error}");
+        assert!(error.contains("rename or move"), "{error}");
+        assert!(error.contains("spaces"), "{error}");
+    }
+
+    #[test]
+    fn every_refusal_is_recognised_as_a_build_input_refusal() {
+        let refusals = [
+            ensure_build_path_safe("include dir", "/a$b").unwrap_err(),
+            ensure_build_input_safe("include name", "a;b.h").unwrap_err(),
+            ensure_all_compile_flags_safe(["-DX=$(id)"]).unwrap_err(),
+            ensure_all_gpr_strings_safe("source dir", ["a\"b"]).unwrap_err(),
+        ];
+        for refusal in refusals {
+            assert!(
+                is_unsafe_build_input_reason(&refusal.to_string()),
+                "{refusal}"
+            );
+        }
+        assert!(!is_unsafe_build_input_reason(
+            "C++ parameter 'cb' of type 'callback_t' has no byte-buffer decoder"
+        ));
+    }
+
+    /// On Windows the native path is first rendered with forward slashes (and
+    /// without the `\\?\` verbatim prefix), then quoted like any other.
+    #[cfg(windows)]
+    #[test]
+    fn windows_paths_with_spaces_are_rendered_and_quoted() {
+        let rendered = checked_recipe_path(
+            "include dir",
+            std::path::Path::new(r"\\?\C:\Program Files (x86)\Windows Kits\10\Include"),
+        )
+        .unwrap();
+        assert_eq!(
+            rendered,
+            "\"C:/Program Files (x86)/Windows Kits/10/Include\""
+        );
+        assert_eq!(
+            checked_recipe_path("source path", std::path::Path::new(r"C:\src\a.c")).unwrap(),
+            "C:/src/a.c"
+        );
+        assert!(
+            checked_recipe_path("source path", std::path::Path::new(r"C:\a%PATH%\b.c")).is_err()
+        );
+    }
+
+    /// A compile-database flag under a directory with an apostrophe
+    /// (`-I/home/Dana's tree/include`) cannot be single-quoted, so it is
+    /// double-quoted, which holds a space, parenthesis or apostrophe literally.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_flag_with_an_apostrophe_is_double_quoted() {
+        for flag in [
+            "-I/home/Dana's tree/proj/include",
+            "-I/srv/o'neil/include",
+            "-DOWNER=o'neil",
+            "-iquote/opt/Kit's (x86)/inc",
+            "-I/data/proj [old]/inc's",
+        ] {
+            assert!(is_compile_flag_usable(flag), "{flag:?} must be usable");
+            assert_eq!(recipe_token(flag), format!("\"{flag}\""), "{flag:?}");
+            assert!(ensure_all_compile_flags_safe([flag]).is_ok(), "{flag:?}");
+        }
+        // With an apostrophe, anything double quotes do not hold literally stays
+        // refused: an operator, an expansion, a backtick, a quote or a backslash.
+        for flag in [
+            "-DX='; id; '",
+            "-I/a'b/$(id)",
+            "-I/a'b/`id`",
+            "-DX='a\"b'",
+            "-I/a'b\\c",
+            "-DX='a|b'",
+        ] {
+            assert!(!is_compile_flag_usable(flag), "{flag:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn a_refused_compile_flag_names_the_character() {
+        let error = ensure_all_compile_flags_safe(["-DX=$(id)"])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("'$'"), "{error}");
+        let error = ensure_all_compile_flags_safe(["-DX=a\nb"])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("'\\n'"), "{error}");
+    }
+
+    /// Glob, brace, tilde and history characters are inert inside the double
+    /// quotes a path gets in a recipe, so a path may carry them.
+    #[cfg(not(windows))]
+    #[test]
+    fn paths_with_glob_and_brace_characters_are_quoted_not_refused() {
+        for path in [
+            "/data/proj [old]/src/a.c",
+            "/data/proj~backup/include",
+            "/data/wow!/src",
+            "/data/{tmp}/a*b?.c",
+        ] {
+            assert!(is_build_path_usable(path), "{path:?} must be usable");
+            assert_eq!(recipe_path(path), format!("\"{path}\""));
+        }
+    }
+
+    #[test]
+    fn a_compiler_path_with_spaces_is_accepted_and_quoted() {
+        let clang = "C:/Program Files/LLVM/bin/clang.exe";
+        assert!(is_compiler_token(clang));
+        assert_eq!(recipe_path(clang), format!("\"{clang}\""));
     }
 
     #[test]

@@ -250,6 +250,16 @@ not execute msbuild. `--build-command` runs the real build and so materializes t
 C:\src\proj\helpers.c` compiles+links a sibling translation unit whose symbols the
 target needs (instead of blind-stubbing them). Both are repeatable.
 
+**Paths with spaces.** The source tree, the work directory, the compiler and
+`--extra-include`/`--extra-source` paths may contain spaces, parentheses and
+apostrophes (`C:\Program Files (x86)\...`, a user profile, a OneDrive folder).
+bhf double-quotes them in the generated Makefile and keeps them out of make
+prerequisites. A path containing `$`, `#`, `%`, `^`, a backtick, a double quote
+or a shell operator (`;`, `|`, `&`, `<`, `>`) is still refused, and the message
+names the character. The Developer PowerShell sets `INCLUDE` and `LIB`, which clang
+reads for the MSVC target, so the Visual Studio and Windows SDK system include
+dirs do not need `--extra-include`.
+
 **What you give up vs. Linux.** Only the LD_PRELOAD behavioral/taint oracles (see
 the limitations below) — they are Linux-only. Crash detection (a fault becomes a
 distinctive exit via the driver's structured-exception handler), edge coverage,

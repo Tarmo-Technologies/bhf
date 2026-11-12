@@ -185,7 +185,12 @@ pub fn generate_cpp_direct_harness(
     args: GenerateCppDirectArgs,
 ) -> Result<GeneratedCppFiles, HarnessGenError> {
     let context = build_cpp_context(&args, &[])?;
-    render_cpp_harness(&args.output_dir, &args.harness_id, &context)
+    render_cpp_harness(
+        &args.output_dir,
+        &args.harness_id,
+        &context,
+        &args.c_runtime_include,
+    )
 }
 
 /// Like [`generate_cpp_direct_harness`] but constructs opaque-handle parameters
@@ -199,14 +204,24 @@ pub fn generate_cpp_direct_harness_with_lifecycle(
     handle_lifecycle: &[crate::c_decoders::CHandleLifecycle],
 ) -> Result<GeneratedCppFiles, HarnessGenError> {
     let context = build_cpp_context(&args, handle_lifecycle)?;
-    render_cpp_harness(&args.output_dir, &args.harness_id, &context)
+    render_cpp_harness(
+        &args.output_dir,
+        &args.harness_id,
+        &context,
+        &args.c_runtime_include,
+    )
 }
 
 pub fn generate_cpp_sequence_harness(
     args: GenerateCppSequenceArgs,
 ) -> Result<GeneratedCppFiles, HarnessGenError> {
     let context = build_cpp_sequence_context(&args)?;
-    render_cpp_harness(&args.output_dir, &args.harness_id, &context)
+    render_cpp_harness(
+        &args.output_dir,
+        &args.harness_id,
+        &context,
+        &args.c_runtime_include,
+    )
 }
 
 pub fn cpp_parameter_type_supported(cpp_type: &str) -> bool {
@@ -293,6 +308,7 @@ fn render_cpp_harness(
     output_dir: &PathBuf,
     harness_id: &str,
     context: &CppTemplateContext,
+    c_runtime_include: &Path,
 ) -> Result<GeneratedCppFiles, HarnessGenError> {
     let tera = templates::build_tera()?;
     let main_cpp = tera.render(
@@ -301,7 +317,7 @@ fn render_cpp_harness(
     )?;
     let makefile = tera.render(
         "harness_makefile_cpp",
-        &tera::Context::from_serialize(context)?,
+        &crate::c_generate::harness_makefile_context(context, c_runtime_include)?,
     )?;
 
     fs::create_dir_all(output_dir)?;
@@ -1059,26 +1075,25 @@ struct CppContextInput<'a> {
 /// generated Makefile recipe.
 fn validate_cpp_build_inputs(input: &CppContextInput<'_>) -> Result<(), HarnessGenError> {
     use crate::build_safety::{
-        ensure_all_build_inputs_safe, ensure_all_compile_flags_safe, ensure_build_input_safe,
+        ensure_all_build_paths_safe, ensure_all_compile_flags_safe, ensure_build_path_safe,
+        make_path,
     };
-    // Flags are recipe-only, so one that is safe once single-quoted is allowed;
-    // paths and include names below stay strict (a path is also a make target,
-    // and an include name is interpolated into an `#include "..."` line).
+    // Flags are recipe-only, so one that is safe once single-quoted is allowed.
+    // Paths and include names may carry spaces, parentheses and apostrophes —
+    // the Makefile double-quotes them, and an `#include "..."` literal holds
+    // them — but no character that quoting cannot contain.
     ensure_all_compile_flags_safe(input.compile_flags.iter().map(String::as_str))?;
-    ensure_all_build_inputs_safe(
+    ensure_all_build_paths_safe(
         "include name",
         input.target_includes.iter().map(String::as_str),
     )?;
     for dir in input.target_includes_dirs {
-        ensure_build_input_safe("include dir", &dir.display().to_string())?;
+        ensure_build_path_safe("include dir", &make_path(dir))?;
     }
     for src in input.target_sources {
-        ensure_build_input_safe("source path", &src.display().to_string())?;
+        ensure_build_path_safe("source path", &make_path(src))?;
     }
-    ensure_build_input_safe(
-        "runtime include",
-        &input.c_runtime_include.display().to_string(),
-    )?;
+    ensure_build_path_safe("runtime include", &make_path(input.c_runtime_include))?;
     // Robustness gate (campaign: tinyobjloader): refuse to emit a harness whose
     // TARGET call would not compile because the parser handed us a non-identifier
     // leaf name or a parse-artifact return type (a mis-recovered `namespace X {`
@@ -1505,10 +1520,11 @@ fn build_cpp_context_common(
     let lifecycle_step_count = lifecycle_steps.len();
 
     let compiler_is_gcc = build_context.compiler_is_gcc();
-    let cxx_compiler = build_context
-        .compiler
-        .clone()
-        .unwrap_or_else(|| "clang++".to_owned());
+    // `CXX = <compiler>` heads every recipe; one under a spaced directory is
+    // double-quoted so it stays a single word.
+    let cxx_compiler = crate::build_safety::recipe_path(&crate::build_safety::make_path(
+        Path::new(build_context.compiler.as_deref().unwrap_or("clang++")),
+    ));
     Ok(CppTemplateContext {
         harness_id: input.harness_id.to_owned(),
         qualified_target_name,
@@ -1529,15 +1545,8 @@ fn build_cpp_context_common(
             .map(|parameter| parameter.cpp_type.clone())
             .collect(),
         target_includes,
-        target_includes_dirs: input
-            .target_includes_dirs
-            .iter()
-            .map(|p| crate::build_safety::make_path(p))
-            .collect(),
-        target_sources: target_sources
-            .iter()
-            .map(|p| crate::build_safety::make_path(p))
-            .collect(),
+        target_includes_dirs: crate::c_generate::recipe_paths(input.target_includes_dirs),
+        target_sources: crate::c_generate::recipe_paths(&target_sources),
         compile_flags: cpp_compile_flags_with_stl_compat(
             build_context.compile_flags,
             cfg!(windows),
@@ -1549,7 +1558,9 @@ fn build_cpp_context_common(
         build_context_dropped: build_context.dropped,
         cxx_compiler,
         compiler_is_gcc,
-        c_runtime_include: crate::build_safety::make_path(input.c_runtime_include),
+        c_runtime_include: crate::build_safety::recipe_path(&crate::build_safety::make_path(
+            input.c_runtime_include,
+        )),
         params,
         pugi_retained_buffers,
         return_type: if return_type_present {
@@ -5561,6 +5572,112 @@ mod tests {
             "expected an ASan/libFuzzer crash report, got:\n{err}"
         );
         fs::remove_dir_all(&out).ok();
+    }
+
+    /// A C++ source tree, include dir and runtime dir whose paths contain spaces,
+    /// parentheses and an apostrophe must generate, build and run.
+    #[test]
+    fn cpp_harness_builds_from_paths_with_spaces() {
+        let Some(cxx_flags) = clangxx_compile_flags("cpp-spaced-paths") else {
+            eprintln!("skipping spaced-path e2e: clang++ C++ headers unavailable");
+            return;
+        };
+        if !Command::new("make")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            eprintln!("skipping spaced-path e2e: make unavailable");
+            return;
+        }
+        let root = temp_dir("cpp spaced paths");
+        let src_dir = root.join("My Proj (copy)/src lib");
+        let inc_dir = root.join("My Proj (copy)/include dir");
+        let runtime = root.join("tool's runtime/c_runtime");
+        let out = root.join("work dir/harnesses/H-CPP-SPACED");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::create_dir_all(&inc_dir).unwrap();
+        fs::create_dir_all(&runtime).unwrap();
+        for entry in fs::read_dir(runtime_dir()).unwrap().flatten() {
+            if entry.path().is_file() {
+                fs::copy(entry.path(), runtime.join(entry.file_name())).unwrap();
+            }
+        }
+        fs::write(
+            inc_dir.join("record.hpp"),
+            "#include <stddef.h>\nnamespace demo {\nint last_byte(const unsigned char *data, size_t len);\n}\n",
+        )
+        .unwrap();
+        let source = src_dir.join("record.cpp");
+        fs::write(
+            &source,
+            "#include \"record.hpp\"\n\
+             namespace demo {\n\
+             int last_byte(const unsigned char *data, size_t len) { return len ? data[len - 1] : 0; }\n\
+             }\n",
+        )
+        .unwrap();
+        let mut target = cppfunction("last_byte");
+        target.qualifier_path = vec!["demo".to_owned()];
+        let args = GenerateCppDirectArgs {
+            decoder_limits: Default::default(),
+            force: false,
+            harness_id: "H-CPP-SPACED".to_owned(),
+            output_dir: out.clone(),
+            source_path: inc_dir.join("record.hpp"),
+            target,
+            params: vec![
+                CppParameter {
+                    name: "data".to_owned(),
+                    cpp_type: "const unsigned char *".to_owned(),
+                },
+                CppParameter {
+                    name: "len".to_owned(),
+                    cpp_type: "size_t".to_owned(),
+                },
+            ],
+            return_type: "int".to_owned(),
+            target_includes: vec!["record.hpp".to_owned()],
+            target_includes_dirs: vec![inc_dir.clone()],
+            target_sources: vec![source.clone()],
+            compile_flags: cxx_flags,
+            c_runtime_include: runtime,
+            using_namespaces: Vec::new(),
+            result_cleanup: None,
+            constructor_params: Vec::new(),
+            type_defs: Vec::new(),
+            default_constructible_classes: Vec::new(),
+            parameter_constructions: Vec::new(),
+            receiver_class_override: None,
+            factory_plan: None,
+        };
+        generate_cpp_direct_harness(args).expect("spaced paths are accepted");
+        let makefile = fs::read_to_string(out.join("Makefile")).unwrap();
+        assert!(
+            makefile.contains(&format!("-iquote \"{}\"", inc_dir.display()))
+                && makefile.contains(&format!(" \"{}\"", source.display())),
+            "spaced paths must be double-quoted in the Makefile:\n{makefile}"
+        );
+        let build = Command::new("make")
+            .arg("main")
+            .current_dir(&out)
+            .output()
+            .expect("run make");
+        assert!(
+            build.status.success(),
+            "make main failed:\n{}\n{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr)
+        );
+        let input = out.join("input.bin");
+        fs::write(&input, b"record").unwrap();
+        let run = Command::new(out.join("main")).arg(&input).output().unwrap();
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        fs::remove_dir_all(&root).ok();
     }
 
     /// A correct function over a typedef'd `(buffer, length)` pair must not crash

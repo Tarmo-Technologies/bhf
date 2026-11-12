@@ -67,7 +67,7 @@ COV_CXXFLAGS ?= -O0 -g -std=$(CXX_STD) -Wno-reserved-user-defined-literal -fprof
 # the recovered C++ dialect carries over; ASan stays on (identical across compilers).
 DIFF_CXX ?= clang++
 DIFF_CXXFLAGS ?= -O2 -g -std=$(CXX_STD) -Wno-reserved-user-defined-literal -fsanitize=address
-BHF_DRIVER_SOURCE ?= {{ c_runtime_include }}/bhf_driver.c
+BHF_DRIVER_SOURCE ?= {{ bhf_driver_source }}
 BHF_DRIVER_CFLAGS ?= -O1 -g
 # POSIX feature-test macros as command-line -D: a force-included project
 # header can lock glibc's feature-test macros in before the harness source's
@@ -103,8 +103,10 @@ all: main
 # Target sources stay OUT of the prerequisites and live only in the recipe: an
 # absolute Windows source path carries a drive-letter colon (`C:\...`) that GNU
 # make parses as a target:prereq separator. In the recipe it is just a compiler
-# argument, so the colon is harmless. (The harness dir is regenerated per attempt.)
-bhf_driver.o: $(BHF_DRIVER_SOURCE)
+# argument, so the colon is harmless. A path with spaces is double-quoted in the
+# recipe and kept out of prerequisites for the same reason. (The harness dir is
+# regenerated per attempt.)
+bhf_driver.o:{% if bhf_driver_prereq %} $(BHF_DRIVER_SOURCE){% endif %}
 	$(CXX) -x c $(BHF_DRIVER_CFLAGS) $(FEATURE_TEST_FLAGS) -c -o $@ $(BHF_DRIVER_SOURCE)
 
 main: main.cpp bhf_driver.o $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS)

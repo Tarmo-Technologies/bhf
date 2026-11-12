@@ -176,3 +176,56 @@ fn stub_dependent_crash_capsule_ships_stubs_and_reproduces() {
     );
     let _ = std::fs::remove_dir_all(&work);
 }
+
+/// A target source whose FILE name has a space (`rec ord.c`) is copied into the
+/// capsule under that name; `build.sh` must hand it to the compiler as one
+/// argument, or the capsule cannot rebuild and is reported as not reproducing.
+#[test]
+fn capsule_of_a_source_file_named_with_a_space_reproduces_offline() {
+    if !clang_available() {
+        eprintln!("skipping: clang not installed");
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("bhf-cap-spaced-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let tree = root.join("proj");
+    let work = root.join("work");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("rec ord.c"), OVERFLOW_C).unwrap();
+    let out = bhf()
+        .arg("auto")
+        .arg(&tree)
+        .arg("--work-dir")
+        .arg(&work)
+        .args([
+            "--languages",
+            "c",
+            "--max-targets",
+            "1",
+            "--jobs",
+            "1",
+            "--per-target-time",
+            "6",
+            "--no-discovery-cache",
+        ])
+        .output()
+        .expect("run bhf auto");
+    assert!(
+        work.join("results").join("findings").is_dir(),
+        "auto produced no findings: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = build_capsule(&work, false);
+    assert!(
+        stdout.contains("verified to reproduce"),
+        "capsule stdout:\n{stdout}"
+    );
+    let cap = only_capsule(&work);
+    assert!(
+        cap.join("sources").join("rec ord.c").is_file(),
+        "the spaced source must ship under its own name"
+    );
+    let (pass, verify) = verify_from_scratch(&cap, "spaced");
+    assert!(pass, "verify-poc should PASS offline; got:\n{verify}");
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -527,7 +527,8 @@ pub struct AutoArgs {
     /// in. Seeded onto every harness `-I` path before the repair loop (so real
     /// headers win over synthesized placeholders) and folded into cross-dir
     /// header resolution. Read from local disk only; nothing is fetched.
-    /// Repeatable.
+    /// Paths with spaces, parentheses or apostrophes (`C:/Program Files
+    /// (x86)/...`) are quoted in the build. Repeatable.
     #[arg(long = "extra-include", value_name = "DIR")]
     pub extra_includes: Vec<PathBuf>,
 
@@ -537,7 +538,7 @@ pub struct AutoArgs {
     /// otherwise blind-stub (e.g. libACPI's `AMLParserProcessBuffer` calling
     /// across `AMLRouter.c`/`AMLName.c`/…): pass the real sources so the symbols
     /// resolve and nothing is stubbed. Read from local disk only; nothing is
-    /// fetched. Repeatable.
+    /// fetched. Paths with spaces are quoted in the build. Repeatable.
     #[arg(long = "extra-source", value_name = "FILE")]
     pub extra_sources: Vec<PathBuf>,
 
@@ -623,7 +624,8 @@ pub struct AutoArgs {
     /// after the normal run, rebuild each C/C++ harness under both compilers via a
     /// portable build and replay the fuzz corpus through both, flagging any input
     /// on which their exit/crash behavior diverges (a codegen- or UB-dependent bug
-    /// one compiler exposes and the other hides) as a BHF-301 finding.
+    /// one compiler exposes and the other hides) as a BHF-301 finding. Either side
+    /// may be a path to a compiler; one with spaces is quoted in the build recipe.
     #[arg(long, value_name = "A:B")]
     pub differential: Option<String>,
 
@@ -2819,6 +2821,16 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
             failed_build: summary.failed_build,
             skipped: summary.skipped,
             skipped_missing_package: summary.skipped_missing_package,
+            skipped_unsafe_path: results
+                .iter()
+                .filter(|result| {
+                    matches!(
+                        &result.outcome,
+                        crate::auto::attempt::Outcome::UnsupportedParams { reason }
+                            if harness_gen::build_safety::is_unsafe_build_input_reason(reason)
+                    )
+                })
+                .count(),
             report_only: summary.report_only,
             findings: summary.findings,
             preflight: &preflight,

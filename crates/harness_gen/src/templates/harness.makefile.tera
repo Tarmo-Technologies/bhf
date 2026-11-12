@@ -110,7 +110,7 @@ COV_CFLAGS ?= -O0 -g -fprofile-instr-generate -fcoverage-mapping
 # that only one compiler's output triggers still surfaces as an exit divergence.
 DIFF_CC ?= clang
 DIFF_CFLAGS ?= -O2 -g -fsanitize=address
-BHF_DRIVER_SOURCE ?= {{ c_runtime_include }}/bhf_driver.c
+BHF_DRIVER_SOURCE ?= {{ bhf_driver_source }}
 BHF_DRIVER_CFLAGS ?= -O1 -g
 INCLUDES = -I . -I {{ c_runtime_include }}{% for inc in target_includes_dirs %} -iquote {{ inc }} -idirafter {{ inc }}{% endfor %}
 BUILD_CONTEXT_PROVENANCE = {{ build_context_provenance }}
@@ -144,8 +144,11 @@ all: main
 # absolute Windows source path carries a drive-letter colon (`C:\...`) which GNU
 # make parses as a target:prereq separator ("multiple target patterns"). In the
 # recipe the path is just an argument to the compiler, so the colon is harmless.
-# (bhf regenerates the harness dir per attempt, so `main` is always built.)
-bhf_driver.o: $(BHF_DRIVER_SOURCE)
+# The same holds for a path with spaces: make splits a prerequisite on them
+# whatever the quoting, while the recipe hands the double-quoted path to the
+# shell as one word. (bhf regenerates the harness dir per attempt, so `main` is
+# always built.)
+bhf_driver.o:{% if bhf_driver_prereq %} $(BHF_DRIVER_SOURCE){% endif %}
 	$(CC) $(BHF_DRIVER_CFLAGS) $(FEATURE_TEST_FLAGS) -c -o $@ $(BHF_DRIVER_SOURCE)
 
 main: main.c bhf_driver.o $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS)
