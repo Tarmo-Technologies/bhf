@@ -226,9 +226,11 @@ used without their header, and `-fms-extensions` (clang++) or `-fpermissive`
 (g++) for a member declared with an extra class qualification
 (`int Widget::name();` inside class `Widget`), which only MSVC accepts. Each
 suggested command keeps the build variables you already set, and when several
-apply a last line combines them. `bhf auto` reports the same extra
-qualification with the flag to set but does not add it itself. Extra build
-input comes from the environment:
+apply a last line combines them. `bhf auto` adds that flag itself when a
+target needs it (`-fms-extensions` for clang++, `-fpermissive` for g++,
+through the work dir's `cxx_compat.mk`, which every harness Makefile includes,
+kept only when the retry removes the error). Extra build input comes from the
+environment:
 `AUTO_EXTRA_SOURCES` (sources), `AUTO_EXTRA_INCLUDES` (any compile flags:
 `-I`, `-D`, `-include`, `-fms-extensions`), `AUTO_EXTRA_LDFLAGS` (link flags)
 and `CXX_STD`/`C_STD` (language standard). Do not use `CXXFLAGS`/`CFLAGS` for

@@ -153,6 +153,13 @@
   no longer turns a UBSan finding into a frameless report and `exit status: 0`.
   The script exits with the harness's status, 128 plus the signal for a
   harness killed by one.
+- The custom-harness guide no longer says only clang works: `CC`/`CXX` may
+  name gcc or a cross gcc, as the C/C++ compiler contract describes, with a
+  note on distribution gcc's default `_FORTIFY_SOURCE`. It now says
+  `bhf minimize` needs `--harness`, and that a capsule of a harness built by
+  `bhf build` with `AUTO_EXTRA_*` or `CXX_STD`/`C_STD` set can fail to
+  rebuild. The C/C++ page says `bhf auto` adds the C++ compatibility flag for
+  extra class qualification itself (`cxx_compat.mk`).
 - Comparison evidence searches inputs longer than 32 bytes for operands
   computed from input bytes (folded range checks such as `width - 1 > 31`):
   first the bytes the harness decodes its scalar parameters from

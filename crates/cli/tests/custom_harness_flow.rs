@@ -371,6 +371,92 @@ mod linux {
         );
     }
 
+    /// The same flow with `CXX=g++`: the Makefile takes gcc's flags, and the
+    /// gcc-built harness fuzzes to the same AddressSanitizer finding.
+    #[test]
+    fn documented_flow_builds_and_fuzzes_with_gcc() {
+        let gxx = Command::new("g++")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !gxx || !cpp_toolchain() {
+            eprintln!("skipping gcc custom-harness flow: g++, clang++ or make unavailable");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let lib = write_library(root.path());
+        let work = root.path().join("bhf_work");
+        let harnesses = work.join("harnesses");
+        let id = "H-WIDGET-GCC";
+        let generate = bhf(
+            &args(&[
+                &"generate-harness",
+                &lib.join("src/codec.cpp"),
+                &"--target",
+                &"Codec::decode",
+                &"--id",
+                &id,
+                &"--output",
+                &harnesses,
+                &"--extra-include",
+                &lib.join("include"),
+                &"--extra-source",
+                &lib.join("src/table.cpp"),
+            ]),
+            &[],
+            Duration::from_secs(60),
+        );
+        assert!(generate.status.success(), "{}", text(&generate));
+        let built = bhf(
+            &args(&[&"build", &work, &"--harness", &id]),
+            &[("CXX", "g++".into())],
+            Duration::from_secs(300),
+        );
+        assert!(built.status.success(), "gcc build failed: {}", text(&built));
+        let seed = root.path().join("crash.bin");
+        fs::write(&seed, CRASHING_SEED).unwrap();
+        let finding_dir = fuzz_to_finding(&work, id, &seed);
+        replay_matches(&finding_dir, &harnesses.join(id).join("main"));
+    }
+
+    /// The guide no longer says gcc does not work, and the C/C++ page no
+    /// longer says `bhf auto` leaves the C++ compatibility flag to be set by hand.
+    #[test]
+    fn the_guides_do_not_repeat_retired_claims() {
+        let docs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/site");
+        let flat = |name: &str| {
+            fs::read_to_string(docs.join(name))
+                .unwrap()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let guide = flat("custom-harness.md");
+        assert!(
+            !guide.contains("Leave `CC`/`CXX` unset, or set them to `clang`/`clang++`"),
+            "custom-harness.md still says only clang works"
+        );
+        assert!(
+            guide.contains("c-cpp.md"),
+            "the pitfall points at the compiler contract"
+        );
+        assert!(
+            !guide.contains("`bhf minimize` from the finding"),
+            "custom-harness.md still says bhf minimize finds the harness from the finding"
+        );
+        assert!(
+            guide.contains("`bhf minimize` takes it as `--harness`"),
+            "custom-harness.md says bhf minimize takes the harness as --harness"
+        );
+        let c_cpp = flat("c-cpp.md");
+        assert!(
+            !c_cpp.contains("but does not add it itself"),
+            "c-cpp.md still says auto does not add the compatibility flag"
+        );
+    }
+
     #[test]
     fn documented_passthrough_driver_flow_builds_fuzzes_and_replays() {
         if !cpp_toolchain() {
