@@ -17,6 +17,8 @@ use crate::fakes::mode::current;
 use crate::jsonl::Builder;
 use crate::reentrancy::HookGuard;
 use std::ffi::CStr;
+use std::mem::MaybeUninit;
+use std::ptr::NonNull;
 
 static REAL_DLSYM: ResolvedFn = ResolvedFn::new(b"dlsym\0");
 
@@ -102,7 +104,7 @@ const RTLD_DL_LINKMAP: libc::c_int = 2;
 static REAL_DLADDR1: ResolvedFn = ResolvedFn::new(b"dladdr1\0");
 
 /// The loaded object that contains `addr`.
-unsafe fn link_map_of(addr: *const libc::c_void) -> Option<*mut LinkMap> {
+unsafe fn link_map_of(addr: *const libc::c_void) -> Option<NonNull<LinkMap>> {
     let real = REAL_DLADDR1.ptr();
     if real.is_null() {
         return None;
@@ -114,9 +116,12 @@ unsafe fn link_map_of(addr: *const libc::c_void) -> Option<*mut LinkMap> {
         libc::c_int,
     ) -> libc::c_int = std::mem::transmute(real);
     let mut info: libc::Dl_info = std::mem::zeroed();
-    let mut map: *mut libc::c_void = std::ptr::null_mut();
-    (real(addr, &mut info, &mut map, RTLD_DL_LINKMAP) != 0 && !map.is_null())
-        .then_some(map as *mut LinkMap)
+    // dladdr1 writes the link map only when it succeeds, so it is read only then.
+    let mut map = MaybeUninit::<*mut libc::c_void>::uninit();
+    if real(addr, &mut info, map.as_mut_ptr(), RTLD_DL_LINKMAP) == 0 {
+        return None;
+    }
+    NonNull::new(map.assume_init().cast::<LinkMap>())
 }
 
 /// Whether the object containing `caller` comes before this library in load
@@ -131,15 +136,15 @@ unsafe fn loaded_before_this_library(caller: *const libc::c_void) -> bool {
     if caller == own {
         return false;
     }
-    let mut next = (*caller).l_next;
+    let mut next = NonNull::new(caller.as_ref().l_next);
     for _ in 0..4096 {
-        if next.is_null() {
+        let Some(entry) = next else {
             return false;
-        }
-        if next == own {
+        };
+        if entry == own {
             return true;
         }
-        next = (*next).l_next;
+        next = NonNull::new(entry.as_ref().l_next);
     }
     false
 }
