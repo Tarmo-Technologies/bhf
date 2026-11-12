@@ -1835,6 +1835,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/repro_lane/windows.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/resource_limits.rs",
       "license": "Apache-2.0"
     },

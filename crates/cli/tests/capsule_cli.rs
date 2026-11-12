@@ -399,6 +399,30 @@ fn cpp_finding_capsule_round_trips_through_verify_poc_offline() {
     } else {
         assert_eq!(manifest["input_source"], "testcase.bin", "{manifest}");
     }
+    // The Windows build ships too: bhf's driver, which it links, and
+    // build.ps1 in the family the harness was built with.
+    for shipped in ["build.ps1", "runtime/bhf_driver.c"] {
+        assert!(
+            files.iter().any(|f| f == shipped),
+            "the Windows build must ship {shipped}: {files:?}"
+        );
+    }
+    assert_eq!(
+        manifest["build_windows"], "powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1",
+        "{manifest}"
+    );
+    assert_eq!(
+        manifest["run_windows"], ".\\poc.exe input/testcase.bin",
+        "{manifest}"
+    );
+    assert_eq!(manifest["requires_windows"][0]["env"], "CXX", "{manifest}");
+    assert_eq!(
+        manifest["build_recipe"]["windows_compiler_dialect"], "clang",
+        "a clang-built harness rebuilds with clang on Windows: {manifest}"
+    );
+    let script = std::fs::read_to_string(cap.join("build.ps1")).unwrap();
+    assert!(script.contains("$Recorded = 'clang'"), "{script}");
+    assert!(script.contains("'/fsanitize=address'"), "{script}");
     let (pass, verify) = verify_from_scratch(&cap, "cpp");
     assert!(pass, "verify-poc should PASS offline; got:\n{verify}");
 

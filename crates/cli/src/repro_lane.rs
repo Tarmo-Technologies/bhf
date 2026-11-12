@@ -34,6 +34,7 @@ mod jvm;
 pub(crate) mod relocate;
 mod rust;
 mod script;
+pub(crate) mod windows;
 
 use harness_gen::compiler_family::CompilerFamily;
 use serde_json::{json, Value};
@@ -611,7 +612,9 @@ pub(crate) fn alternative(
     }
     let replay = finding.dir.join("replay.py");
     if replay.is_file() {
-        return Some(format!("python3 {}", sh_word(&replay.to_string_lossy())));
+        // Windows' Python installer provides `python`, not `python3`.
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        return Some(format!("{python} {}", sh_word(&replay.to_string_lossy())));
     }
     let harness_id = finding.raw.get("harness_id").and_then(Value::as_str)?;
     if !corpus::layout::is_valid_finding_id(harness_id) {
@@ -1090,6 +1093,31 @@ pub(crate) struct CapsulePlan {
     pub(crate) build_outputs: Vec<&'static str>,
     /// Problems worth telling the operator about (non-fatal).
     pub(crate) warnings: Vec<String>,
+    /// The Windows build a C or C++ capsule also ships (`build.ps1`).
+    pub(crate) windows: Option<WindowsBuild>,
+}
+
+/// A capsule's Windows build: `build.ps1`, which needs no POSIX shell, and the
+/// programs it needs (manifest `requires_windows`).
+pub(crate) struct WindowsBuild {
+    pub(crate) script: String,
+    pub(crate) requires: Vec<Requirement>,
+}
+
+/// Where a Windows build of a capsule writes its outputs besides `obj/`: the
+/// PoC, its debug info and the import library of the symbols it exports.
+pub(crate) const WINDOWS_BUILD_OUTPUTS: &[&str] =
+    &["poc.exe", "poc.pdb", "poc.ilk", "poc.lib", "poc.exp"];
+
+/// The rebuilt PoC in a capsule: `poc.exe` when a Windows build wrote one,
+/// else `poc`.
+pub(crate) fn poc_path(capsule: &Path) -> PathBuf {
+    let exe = capsule.join("poc.exe");
+    if cfg!(windows) && exe.is_file() {
+        exe
+    } else {
+        capsule.join("poc")
+    }
 }
 
 /// A lane's reason not to package a harness, decided while planning (a
@@ -1305,7 +1333,7 @@ pub(crate) fn replay_poc(
 ) -> std::io::Result<ReplayOutput> {
     use crate::protocol_detect::HarnessProtocol;
     let capsule = &std::path::absolute(capsule)?;
-    let mut command = Command::new(capsule.join("poc"));
+    let mut command = Command::new(poc_path(capsule));
     configure_offline_replay(&mut command);
     command.current_dir(capsule);
     match protocol {
@@ -1576,6 +1604,9 @@ pub(crate) struct MakefileFacts {
     pub(crate) link_flags: Vec<String>,
     /// Whether a `main` rule compiling the lane's driver was found.
     pub(crate) has_main_rule: bool,
+    /// `BHF_DRIVER_SOURCE`: bhf's driver, which the Makefile links beside the
+    /// harness (`-DBHF_EXTERNAL_DRIVER`).
+    pub(crate) driver_source: Option<String>,
 }
 
 /// The build `bhf auto` recorded for a harness (`coverage-build-recipe.json`):
@@ -1592,10 +1623,23 @@ struct RecordedRecipe {
     extra_includes: Vec<PathBuf>,
     #[serde(default)]
     standard: Option<String>,
+    /// The compiler bhf's cl front end ran (`cl`, `clang-cl`), for a harness
+    /// built through it.
+    #[serde(default)]
+    msvc_compiler: Option<String>,
 }
 
 fn default_true() -> bool {
     true
+}
+
+/// The compiler family the harness Makefile last built with, as its toolchain
+/// stamp records it (`bhf_toolchain.stamp`: the compiler, then its family).
+fn recorded_compiler_family(harness_dir: &Path) -> Option<CompilerFamily> {
+    let stamp = std::fs::read_to_string(harness_dir.join("bhf_toolchain.stamp")).ok()?;
+    let compilers = stamp.lines().next()?.split(" | ").next()?;
+    let words = crate::generate_harness::split_compile_command(compilers);
+    CompilerFamily::from_make_value(words.get(1)?)
 }
 
 fn read_recorded_recipe(harness_dir: &Path) -> Option<RecordedRecipe> {
@@ -1722,6 +1766,10 @@ pub(crate) struct BuildModel {
     link_flags: Vec<Arg>,
     recorded_recipe: bool,
     pub(crate) compiler: CapsuleCompiler,
+    /// The compiler build.ps1 rebuilds with by default.
+    pub(crate) windows_compiler: windows::WindowsCompiler,
+    /// bhf's driver source the Makefile links (`BHF_DRIVER_SOURCE`).
+    driver_source: Option<PathBuf>,
     /// Objects the link names that build.sh compiles from shipped sources
     /// first (a Fortran target), instead of shipping the prebuilt object.
     pub(crate) rebuilt_objects: Vec<RebuiltObject>,
@@ -1766,6 +1814,10 @@ impl CFamilyLane {
                 facts.link_flags = crate::generate_harness::split_compile_command(rest);
             } else if let Some(rest) = line.strip_prefix(&standard_default) {
                 facts.default_standard = Some(rest.trim().to_owned()).filter(|s| !s.is_empty());
+            } else if let Some(rest) = line.strip_prefix("BHF_DRIVER_SOURCE ?=") {
+                facts.driver_source = crate::generate_harness::split_compile_command(rest)
+                    .into_iter()
+                    .next();
             }
             if line.starts_with("main:") {
                 in_main = true;
@@ -1887,6 +1939,11 @@ impl CFamilyLane {
                 .or(facts.default_standard),
             recorded_recipe: recipe.is_some(),
             compiler: self.capsule_compiler(&harness_dir),
+            windows_compiler: self.windows_compiler(&harness_dir, recipe.as_ref()),
+            driver_source: facts
+                .driver_source
+                .as_deref()
+                .map(|source| absolute(source, &harness_dir)),
             harness_dir,
             target_sources,
             extra_sources,
@@ -1946,6 +2003,53 @@ impl CFamilyLane {
                 family: CompilerFamily::Clang,
                 source: "default",
             },
+        }
+    }
+
+    /// The compiler build.ps1 rebuilds with by default: `$CC`/`$CXX` when it
+    /// names a Windows compiler (bhf's cl front end: the compiler it runs),
+    /// else the family recorded for the harness (its `bhf_toolchain.stamp`;
+    /// for the MSVC lane, the compiler the front end ran, from the build
+    /// recipe), else clang. gcc has no Windows AddressSanitizer, so a
+    /// gcc-built harness rebuilds with clang there.
+    fn windows_compiler(
+        &self,
+        harness_dir: &Path,
+        recipe: Option<&RecordedRecipe>,
+    ) -> windows::WindowsCompiler {
+        use windows::{Dialect, WindowsCompiler};
+        let cxx = self.probe_language == "c++";
+        let named = |dialect: Dialect, source| WindowsCompiler {
+            dialect,
+            program: dialect.program(cxx).to_owned(),
+            source,
+        };
+        if let Some(command) = env_value(self.tools[0].env_var) {
+            if let Some(real) = crate::msvc_cc::front_end_compiler(&command) {
+                let dialect = Dialect::of_compiler(&real)
+                    .filter(|dialect| *dialect != Dialect::Clang)
+                    .unwrap_or(Dialect::Cl);
+                return named(dialect, "environment");
+            }
+            if let Some(dialect) = Dialect::of_compiler(&command) {
+                return WindowsCompiler {
+                    dialect,
+                    program: command,
+                    source: "environment",
+                };
+            }
+        }
+        match recorded_compiler_family(harness_dir) {
+            Some(CompilerFamily::Msvc) => {
+                let dialect = recipe
+                    .and_then(|recipe| recipe.msvc_compiler.as_deref())
+                    .and_then(Dialect::of_compiler)
+                    .filter(|dialect| *dialect != Dialect::Clang)
+                    .unwrap_or(Dialect::Cl);
+                named(dialect, "recorded build")
+            }
+            Some(CompilerFamily::Clang) => named(Dialect::Clang, "recorded build"),
+            Some(CompilerFamily::Gcc) | None => named(Dialect::Clang, "default"),
         }
     }
 
@@ -2250,6 +2354,20 @@ impl CFamilyLane {
                 None => warnings.push(format!("{} has no place in the capsule", path.display())),
             }
         }
+        // bhf's driver ships with the runtime headers: build.ps1 links it
+        // beside the harness, as the Makefile does.
+        let driver_place = match (&model.driver_source, self.glue) {
+            (Some(source), None) if source.is_file() => place(source),
+            _ => None,
+        };
+        if let (Some(source), Some(to)) = (&model.driver_source, &driver_place) {
+            if !copies.iter().any(|copy| copy.to == *to) {
+                copies.push(CapsuleFile {
+                    from: source.clone(),
+                    to: to.clone(),
+                });
+            }
+        }
 
         // 3. build.sh: per-TU objects first, then the `main` link, all relative.
         let compiler_var = self.tools[0].env_var;
@@ -2341,6 +2459,39 @@ impl CFamilyLane {
             },
         ));
 
+        // 4. build.ps1: the same build for Windows, without a POSIX shell.
+        let mut generated: Vec<GeneratedFile> = model
+            .generated_sources
+            .iter()
+            .map(|(to, text)| GeneratedFile {
+                to: to.clone(),
+                bytes: text.clone().into_bytes(),
+                executable: false,
+            })
+            .collect();
+        let windows = match &driver_place {
+            Some(driver) => match self.windows_build(model, &capsule_path, &copies, driver) {
+                Ok((build, stubs)) => {
+                    generated.extend(stubs);
+                    Some(build)
+                }
+                Err(error) => {
+                    warnings.push(format!("no build.ps1 (Windows rebuild): {error}"));
+                    None
+                }
+            },
+            None => {
+                if cfg!(windows) && self.glue.is_none() {
+                    warnings.push(
+                        "no build.ps1 (Windows rebuild): the harness Makefile names no bhf \
+                         driver source (BHF_DRIVER_SOURCE) for it to link"
+                            .to_owned(),
+                    );
+                }
+                None
+            }
+        };
+
         let mut layout = vec![(
             format!("harness/{}", self.driver),
             "the fuzz driver (decodes the input, calls the target)".to_owned(),
@@ -2364,7 +2515,21 @@ impl CFamilyLane {
         if has("runtime") {
             layout.push((
                 "runtime/".to_owned(),
-                "the bhf decode-runtime headers".to_owned(),
+                if windows.is_some() {
+                    "the bhf decode-runtime headers and bhf's driver (`bhf_driver.c`, which \
+                     build.ps1 links)"
+                } else {
+                    "the bhf decode-runtime headers"
+                }
+                .to_owned(),
+            ));
+        }
+        if windows.is_some() {
+            layout.push((
+                "build.ps1".to_owned(),
+                "the Windows build: compiles .\\poc.exe with cl, clang-cl or clang, no POSIX \
+                 shell needed"
+                    .to_owned(),
             ));
         }
         let mut facts = serde_json::Map::new();
@@ -2382,26 +2547,166 @@ impl CFamilyLane {
             "stdlib_include_fallback".to_owned(),
             json!(!stdlib_flags.is_empty()),
         );
+        if windows.is_some() {
+            let recorded = &model.windows_compiler;
+            facts.insert("windows_compiler".to_owned(), json!(recorded.program));
+            facts.insert(
+                "windows_compiler_dialect".to_owned(),
+                json!(recorded.dialect.label()),
+            );
+            facts.insert("windows_compiler_source".to_owned(), json!(recorded.source));
+        }
         facts.extend(model.facts.clone());
         Ok(CapsulePlan {
             build_facts: Value::Object(facts),
             files: copies,
-            generated: model
-                .generated_sources
-                .iter()
-                .map(|(to, text)| GeneratedFile {
-                    to: to.clone(),
-                    bytes: text.clone().into_bytes(),
-                    executable: false,
-                })
-                .collect(),
+            generated,
             build_script: script,
             build_summary: "compile ./poc (ASan+UBSan)".to_owned(),
             requires: self.requirements(model),
             layout,
-            build_outputs: vec!["poc", "obj"],
+            build_outputs: [&["poc", "obj"][..], WINDOWS_BUILD_OUTPUTS].concat(),
             warnings,
+            windows,
         })
+    }
+
+    /// build.ps1 for this harness: the Makefile's build (bhf's driver linked
+    /// beside the harness, its sanitizer and coverage flags) in each Windows
+    /// dialect, the recorded one the default, plus the MSVC copies of weak
+    /// repair stubs cl needs. `driver` is the capsule path of bhf's driver.
+    fn windows_build(
+        &self,
+        model: &BuildModel,
+        capsule_path: &dyn Fn(&Path) -> String,
+        copies: &[CapsuleFile],
+        driver: &str,
+    ) -> Result<(WindowsBuild, Vec<GeneratedFile>), String> {
+        use windows::{Dialect, DialectBuild, Step};
+        let cxx = self.probe_language == "c++";
+        let arch = env_value("VSCMD_ARG_TGT_ARCH")
+            .map(|arch| arch.to_ascii_lowercase())
+            .unwrap_or_else(|| "x64".to_owned());
+        // The GCC-style command lines: bhf's driver, each per-TU object, then
+        // the harness compiled and linked with them (the Makefile's `main`).
+        let commands = |sanitize: &[String], ext: &str| -> Vec<(String, Vec<String>)> {
+            let words = |words: &[&str]| words.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+            let driver_object = format!("obj/bhf_driver.{ext}");
+            let mut driver_args = if cxx { words(&["-x", "c"]) } else { Vec::new() };
+            driver_args.extend(words(OPT_FLAGS));
+            driver_args.extend(words(FEATURE_TEST_FLAGS));
+            driver_args.extend(words(&["-c", driver, "-o", &driver_object]));
+            let mut commands = vec![("bhf_driver".to_owned(), driver_args)];
+            let mut objects = Vec::new();
+            for (index, unit) in model.units.iter().enumerate() {
+                let object = format!("obj/unit_{index}.{ext}");
+                let mut args = self.unit_args(model, unit, sanitize, capsule_path);
+                args.extend([
+                    "-c".to_owned(),
+                    capsule_path(&unit.source),
+                    "-o".to_owned(),
+                    object.clone(),
+                ]);
+                commands.push((format!("unit_{index}"), args));
+                objects.push(object);
+            }
+            let mut args = self.main_args(model, sanitize, capsule_path);
+            args.extend(words(&["-DBHF_EXTERNAL_DRIVER", "-o", "poc.exe"]));
+            args.push(capsule_path(&model.driver));
+            args.extend(model.target_sources.iter().map(|p| capsule_path(p)));
+            args.extend(objects);
+            args.extend(model.extra_sources.iter().map(|p| capsule_path(p)));
+            args.push(driver_object);
+            args.extend(model.link_flags.iter().flat_map(|a| a.render(capsule_path)));
+            // The linker's own spelling of `--gc-sections`, which link.exe and
+            // lld-link take from clang and from cl alike.
+            args.push("-Wl,/OPT:REF".to_owned());
+            commands.push(("link".to_owned(), args));
+            commands
+        };
+        let mut clang_sanitize = self.sanitize_flags(CompilerFamily::Clang);
+        clang_sanitize.push(CompilerFamily::Clang.coverage_flag().to_owned());
+        let msvc_sanitize = vec![
+            "-fsanitize=address".to_owned(),
+            CompilerFamily::Msvc.coverage_flag().to_owned(),
+        ];
+        // cl has no weak symbols: bhf's weak repair stubs compile from MSVC
+        // copies, as the bhf-cl front end compiles them.
+        let msvc_commands = commands(&msvc_sanitize, "obj");
+        let mut weak = std::collections::BTreeMap::new();
+        let mut stubs = Vec::new();
+        for (_, args) in &msvc_commands {
+            for arg in args {
+                let Some(rest) = arg.strip_prefix("stubs/") else {
+                    continue;
+                };
+                if weak.contains_key(arg) || !has_extension(Path::new(arg), SOURCE_EXTENSIONS) {
+                    continue;
+                }
+                let Some(copy) = copies.iter().find(|copy| copy.to == *arg) else {
+                    continue;
+                };
+                let Ok(text) = std::fs::read_to_string(&copy.from) else {
+                    continue;
+                };
+                if !text.contains("__attribute__((weak))") {
+                    continue;
+                }
+                let cpp = !has_extension(Path::new(arg), &["c"]);
+                let to = format!("stubs_msvc/{rest}");
+                stubs.push(GeneratedFile {
+                    to: to.clone(),
+                    bytes: crate::msvc_cc::msvc_weak_symbols(&text, cpp, arch == "x86")
+                        .into_bytes(),
+                    executable: false,
+                });
+                let dir = Path::new(arg)
+                    .parent()
+                    .map(|dir| dir.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "stubs".to_owned());
+                weak.insert(arg.clone(), (to, dir));
+            }
+        }
+        let mut builds = Vec::new();
+        for dialect in Dialect::ALL {
+            let build = match dialect.backend() {
+                Some(backend) => windows::cl_build(&msvc_commands, backend, &weak)?,
+                None => DialectBuild {
+                    steps: commands(&clang_sanitize, "o")
+                        .into_iter()
+                        .map(|(name, args)| Step { name, args })
+                        .collect(),
+                    include_after: Vec::new(),
+                },
+            };
+            builds.push((dialect, build));
+        }
+        let toolchain = self.tools[0];
+        let recorded = &model.windows_compiler;
+        let script = windows::render(&windows::ScriptInputs {
+            compiler_var: toolchain.env_var,
+            cxx,
+            recorded,
+            arch: &arch,
+            builds: &builds,
+        });
+        let mut requirement = Requirement::new(
+            toolchain.env_var,
+            &recorded.program,
+            toolchain.purpose,
+            toolchain.version_args,
+        );
+        requirement.alternatives = windows::candidates(recorded, cxx)
+            .into_iter()
+            .skip(1)
+            .collect();
+        Ok((
+            WindowsBuild {
+                script,
+                requires: vec![requirement],
+            },
+            stubs,
+        ))
     }
 
     /// The programs the rebuild needs: the recorded compiler, then the lane's
@@ -3564,7 +3869,7 @@ mod tests {
     fn the_direct_harness_command_takes_the_replay_sanitizer_options() {
         let temp = tempfile::tempdir().unwrap();
         let work = temp.path();
-        let binary = work.join("harnesses/H-X0001/main");
+        let binary = work.join("harnesses").join("H-X0001").join("main");
         write(&binary, "\x7fELF");
         let fdir = work.join("results/findings/F-1");
         let input = fdir.join("testcase.bin");
@@ -3627,13 +3932,241 @@ mod tests {
                  COMPILE_DB_FLAGS = -DMODE=1\n\
                  main: main.c\n\
                  \t$(CC) $(CFLAGS) $(COMPILE_DB_FLAGS) $(C_STD_FLAG) $(INCLUDES) -DBHF_EXTERNAL_DRIVER -o $@ main.c \"{src}/rec ord.c\" $(AUTO_EXTRA_SOURCES)\n",
-                src = src.display()
+                // bhf's Makefiles name paths with forward slashes on every host.
+                src = harness_gen::build_safety::make_path(&src)
             ),
         );
         if let Some(recipe) = recipe {
             write(&harness.join(BUILD_RECIPE_FILE), &recipe.to_string());
         }
         harness
+    }
+
+    /// [`sample_harness`] with bhf's runtime (its headers and its driver
+    /// source, which the Makefile links), a weak repair stub the recorded
+    /// recipe links, and the toolchain stamp of the build.
+    fn runtime_harness(root: &Path, stamp: Option<&str>, msvc_compiler: Option<&str>) -> PathBuf {
+        let harness = root.join("work/harnesses/H-C0001-00000001");
+        let stub = harness.join("repairs/stub.c");
+        let harness = sample_harness(
+            root,
+            Some(json!({
+                "schema_version": 1,
+                "native": true,
+                "extra_sources": [stub],
+                "extra_includes": [],
+                "standard": null,
+                "msvc_compiler": msvc_compiler,
+            })),
+        );
+        write(
+            &stub,
+            "__attribute__((weak)) int lookup(int key) { return key; }\n",
+        );
+        let runtime = root.join("c_runtime");
+        write(&runtime.join("bhf_decode.h"), "/* decode */\n");
+        write(&runtime.join("bhf_driver.c"), "int bhf_driver_marker;\n");
+        let makefile = std::fs::read_to_string(harness.join("Makefile")).unwrap();
+        write(
+            &harness.join("Makefile"),
+            &makefile.replacen(
+                "INCLUDES = -I .",
+                &format!(
+                    "BHF_DRIVER_SOURCE ?= {runtime}/bhf_driver.c\nINCLUDES = -I . -I {runtime}",
+                    runtime = harness_gen::build_safety::make_path(&runtime)
+                ),
+                1,
+            ),
+        );
+        if let Some(stamp) = stamp {
+            write(&harness.join("bhf_toolchain.stamp"), stamp);
+        }
+        harness
+    }
+
+    /// The `switch` branch of build.ps1 for one dialect.
+    fn ps1_branch<'a>(script: &'a str, dialect: &str) -> &'a str {
+        let start = script
+            .find(&format!("\r\n  '{dialect}' {{\r\n"))
+            .unwrap_or_else(|| panic!("no {dialect} branch in:\n{script}"));
+        let rest = &script[start + 2..];
+        &rest[..rest.find("\r\n  }\r\n").unwrap()]
+    }
+
+    /// A C capsule also ships build.ps1, which rebuilds poc.exe on Windows in
+    /// the family the harness was built with: cl with /fsanitize=address and
+    /// cl's coverage flags, clang-cl, or clang, each linking bhf's driver as
+    /// the Makefile does.
+    #[test]
+    fn a_capsule_ships_a_windows_build_in_the_recorded_family() {
+        let temp = tempfile::tempdir().unwrap();
+        let front_end = "C:/Users/a b/AppData/Local/bhf/multicall/x/bhf-cl.exe";
+        let harness = runtime_harness(
+            temp.path(),
+            Some(&format!(
+                "\"{front_end}\" msvc clang clang clang | -O1 -g -fsanitize=address | |\n"
+            )),
+            Some("cl"),
+        );
+        let plan = C_LANE.plan_capsule(&context(&harness)).unwrap();
+        assert!(
+            plan.files
+                .iter()
+                .any(|file| file.to == "runtime/bhf_driver.c"),
+            "bhf's driver ships: {:?}",
+            plan.files
+        );
+        let windows = plan.windows.as_ref().expect("a Windows build");
+        let script = &windows.script;
+        assert!(script.contains("$Recorded = 'cl'"), "{script}");
+        assert_eq!(windows.requires[0].env_var, "CC");
+        assert_eq!(windows.requires[0].program, "cl");
+        assert_eq!(windows.requires[0].alternatives, ["clang-cl", "clang"]);
+        assert_eq!(plan.build_facts["windows_compiler_dialect"], "cl");
+        assert_eq!(
+            plan.build_facts["windows_compiler_source"],
+            "recorded build"
+        );
+
+        let cl = ps1_branch(script, "cl");
+        for expected in [
+            "'/fsanitize=address'",
+            "'/fsanitize-coverage=inline-8bit-counters'",
+            "'/fsanitize-coverage=edge'",
+            "'/fsanitize-coverage=trace-cmp'",
+            "'/fsanitize-coverage=trace-div'",
+            "'libsancov.lib'",
+            "'/DBHF_EXTERNAL_DRIVER'",
+            "'/DMODE=1'",
+            "'/Fe:poc.exe'",
+            "'/OPT:REF'",
+            "'runtime/bhf_driver.c'",
+            "'/Fo:obj/bhf_driver.obj'",
+            "'obj/bhf_driver.obj'",
+            "'\"sources/rec ord.c\"'",
+            "'stubs_msvc/stub.c'",
+        ] {
+            assert!(
+                cl.contains(expected),
+                "{expected} not in the cl build:\n{cl}"
+            );
+        }
+        assert!(!cl.contains("-fsanitize"), "no clang flags for cl:\n{cl}");
+        assert!(
+            cl.contains("$env:INCLUDE = (@($env:INCLUDE, (Join-Path $PSScriptRoot 'sources'))"),
+            "-idirafter dirs are searched after the system headers:\n{cl}"
+        );
+        let clang_cl = ps1_branch(script, "clang-cl");
+        assert!(clang_cl.contains("'/fsanitize=address'"), "{clang_cl}");
+        assert!(!clang_cl.contains("libsancov.lib"), "{clang_cl}");
+        let clang = ps1_branch(script, "clang");
+        for expected in [
+            "'-fsanitize=address,undefined'",
+            "'-fno-sanitize=function,vptr,alignment'",
+            "'-fsanitize-coverage=trace-pc-guard,trace-cmp'",
+            "'-DBHF_EXTERNAL_DRIVER'",
+            "'-o', 'poc.exe'",
+            "'stubs/stub.c'",
+            "'obj/bhf_driver.o'",
+            "'-Wl,/OPT:REF'",
+        ] {
+            assert!(
+                clang.contains(expected),
+                "{expected} not in the clang build:\n{clang}"
+            );
+        }
+        let stub = plan
+            .generated
+            .iter()
+            .find(|file| file.to == "stubs_msvc/stub.c")
+            .expect("the MSVC spelling of the weak stub");
+        let stub = String::from_utf8_lossy(&stub.bytes);
+        assert!(stub.contains("/alternatename:lookup="), "{stub}");
+        assert!(plan.layout.iter().any(|(path, _)| path == "build.ps1"));
+        assert!(plan.build_outputs.contains(&"poc.exe"));
+
+        // The front end ran clang-cl: that is the default.
+        let other = tempfile::tempdir().unwrap();
+        let harness = runtime_harness(
+            other.path(),
+            Some("bhf-cl.exe msvc clang clang clang | |\n"),
+            Some("clang-cl"),
+        );
+        let windows = C_LANE
+            .plan_capsule(&context(&harness))
+            .unwrap()
+            .windows
+            .unwrap();
+        assert!(
+            windows.script.contains("$Recorded = 'clang-cl'"),
+            "{}",
+            windows.script
+        );
+        assert_eq!(windows.requires[0].program, "clang-cl");
+
+        // A clang build, its compiler named by a quoted path with spaces.
+        let other = tempfile::tempdir().unwrap();
+        let harness = runtime_harness(
+            other.path(),
+            Some("\"C:/Program Files/LLVM/bin/clang.exe\" clang clang clang clang | |\n"),
+            None,
+        );
+        let plan = C_LANE.plan_capsule(&context(&harness)).unwrap();
+        let windows = plan.windows.unwrap();
+        assert!(
+            windows.script.contains("$Recorded = 'clang'"),
+            "{}",
+            windows.script
+        );
+        assert_eq!(windows.requires[0].program, "clang");
+        assert_eq!(windows.requires[0].alternatives, ["cl", "clang-cl"]);
+        assert_eq!(
+            plan.build_facts["windows_compiler_source"],
+            "recorded build"
+        );
+
+        // No stamp: clang, the default.
+        let other = tempfile::tempdir().unwrap();
+        let harness = runtime_harness(other.path(), None, None);
+        let plan = C_LANE.plan_capsule(&context(&harness)).unwrap();
+        assert_eq!(plan.build_facts["windows_compiler_source"], "default");
+        assert_eq!(plan.build_facts["windows_compiler_dialect"], "clang");
+    }
+
+    /// A C++ capsule's build.ps1 compiles bhf's C driver as C, and its clang
+    /// is clang++.
+    #[test]
+    fn a_cpp_capsule_compiles_bhfs_driver_as_c_on_windows() {
+        let temp = tempfile::tempdir().unwrap();
+        let harness = runtime_harness(
+            temp.path(),
+            Some("bhf-cl.exe msvc clang clang++ clang++ | |\n"),
+            Some("cl"),
+        );
+        std::fs::rename(harness.join("main.c"), harness.join("main.cpp")).unwrap();
+        let makefile = std::fs::read_to_string(harness.join("Makefile")).unwrap();
+        write(
+            &harness.join("Makefile"),
+            &makefile.replace("main.c", "main.cpp"),
+        );
+        let plan = CPP_LANE.plan_capsule(&context(&harness)).unwrap();
+        let windows = plan.windows.unwrap();
+        assert_eq!(windows.requires[0].env_var, "CXX");
+        assert_eq!(windows.requires[0].alternatives, ["clang-cl", "clang++"]);
+        let cl = ps1_branch(&windows.script, "cl");
+        let driver = cl
+            .lines()
+            .find(|line| line.contains("Invoke-Step 'bhf_driver'"))
+            .unwrap();
+        assert!(driver.contains("'/TC'"), "{driver}");
+        assert!(cl.contains("'/EHsc'"), "{cl}");
+        let clang = ps1_branch(&windows.script, "clang");
+        let driver = clang
+            .lines()
+            .find(|line| line.contains("Invoke-Step 'bhf_driver'"))
+            .unwrap();
+        assert!(driver.contains("'-x', 'c'"), "{driver}");
+        assert!(windows.script.contains("$Compiler = $env:CXX"));
     }
 
     fn compile_line(script: &str) -> &str {

@@ -209,6 +209,7 @@ impl Lane for GoLane {
             layout,
             build_outputs: vec!["poc", "build"],
             warnings: relocated.warnings,
+            windows: None,
         })
     }
 

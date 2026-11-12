@@ -227,6 +227,7 @@ impl Lane for ScriptLane {
             layout,
             build_outputs: vec!["poc", "build"],
             warnings: relocated.warnings,
+            windows: None,
         })
     }
 

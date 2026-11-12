@@ -266,14 +266,13 @@ pub(crate) fn translate(gnu: &[String], backend: Backend) -> Result<ClCommand, S
                         | "trace-cmp"
                         | "trace-div" => {
                             coverage = true;
-                            compile_args.push(format!("/fsanitize-coverage={kind}"));
+                            compile_args.push(coverage_option(backend, kind));
                         }
                         // GCC's `trace-pc` has no cl spelling; the counters
                         // give the same edge map.
                         "trace-pc" => {
                             coverage = true;
-                            compile_args
-                                .push("/fsanitize-coverage=inline-8bit-counters".to_owned());
+                            compile_args.push(coverage_option(backend, "inline-8bit-counters"));
                         }
                         _ => {}
                     }
@@ -386,6 +385,16 @@ pub(crate) fn translate(gnu: &[String], backend: Backend) -> Result<ClCommand, S
         });
     }
     Ok(out)
+}
+
+/// One SanitizerCoverage kind as `backend` takes it: cl's `/fsanitize-coverage=`,
+/// or clang's own `-fsanitize-coverage=` for clang-cl, which has no slash
+/// spelling of it (it reads one as a file name).
+fn coverage_option(backend: Backend, kind: &str) -> String {
+    match backend {
+        Backend::Cl => format!("/fsanitize-coverage={kind}"),
+        Backend::ClangCl => format!("-fsanitize-coverage={kind}"),
+    }
 }
 
 /// The cl runs for a compile-and-link line whose sources would overwrite each
@@ -617,7 +626,36 @@ pub(crate) fn msvc_weak_symbols(source: &str, cpp: bool, underscore: bool) -> St
     out
 }
 
-/// The `#define`s a `-dM -E` probe gets: enough for bhf's family detection/// The `#define`s a `-dM -E` probe gets: enough for bhf's family detection
+/// The compiler the front end runs for `compiler` (a `CC`/`CXX` value) when it
+/// names the front end: `BHF_MSVC_CL`, else `cl.exe`. `None` for any other
+/// compiler.
+pub(crate) fn front_end_compiler(compiler: &str) -> Option<String> {
+    let stem = Path::new(compiler.trim().trim_matches('"'))
+        .file_stem()?
+        .to_string_lossy()
+        .into_owned();
+    stem.eq_ignore_ascii_case(FRONT_END_STEM).then(|| {
+        std::env::var(REAL_COMPILER_ENV)
+            .ok()
+            .filter(|real| !real.trim().is_empty())
+            .unwrap_or_else(|| "cl.exe".to_owned())
+    })
+}
+
+/// The compiler C/C++ harness builds run through the front end, by driver
+/// name (`cl`, `clang-cl`), when `CC` or `CXX` names the front end (the MSVC
+/// lane); `None` otherwise.
+pub(crate) fn routed_compiler() -> Option<String> {
+    let compilers = crate::toolchain::effective_compilers();
+    let real = front_end_compiler(&compilers.cxx).or_else(|| front_end_compiler(&compilers.cc))?;
+    Some(
+        harness_gen::compiler_family::driver_base_name(&real)
+            .map(str::to_owned)
+            .unwrap_or(real),
+    )
+}
+
+/// The `#define`s a `-dM -E` probe gets: enough for bhf's family detection
 /// to read the MSVC dialect.
 pub(crate) fn predefined_macros() -> &'static str {
     "#define _MSC_VER 1900\n#define _WIN32 1\n"
@@ -1071,6 +1109,19 @@ mod tests {
         assert!(
             !clang_cl.args.contains(&"libsancov.lib".to_owned()),
             "clang-cl calls the counters callback itself"
+        );
+        // clang-cl takes the coverage kinds only in clang's own spelling: it
+        // reads `/fsanitize-coverage=...` as a file name.
+        assert!(
+            clang_cl
+                .args
+                .contains(&"-fsanitize-coverage=inline-8bit-counters".to_owned())
+                && !clang_cl
+                    .args
+                    .iter()
+                    .any(|arg| arg.starts_with("/fsanitize-coverage")),
+            "{:?}",
+            clang_cl.args
         );
     }
 

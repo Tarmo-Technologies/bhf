@@ -39,6 +39,10 @@ struct CoverageBuildRecipe {
     extra_sources: Vec<PathBuf>,
     extra_includes: Vec<PathBuf>,
     standard: Option<String>,
+    /// The compiler bhf's cl front end ran (`cl`, `clang-cl`), for a harness
+    /// built through it (the MSVC lane). `bhf capsule` rebuilds with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    msvc_compiler: Option<String>,
 }
 
 /// Checkpoint the successful build closure while the repair loop still owns it.
@@ -57,6 +61,7 @@ pub(crate) fn persist_build_recipe(
         extra_sources: extra_sources.to_vec(),
         extra_includes: extra_includes.to_vec(),
         standard,
+        msvc_compiler: crate::msvc_cc::routed_compiler(),
     };
     if let Ok(bytes) = serde_json::to_vec_pretty(&recipe) {
         let _ = crate::auto::report::atomic_write(&harness_dir.join(BUILD_RECIPE_FILE), &bytes);

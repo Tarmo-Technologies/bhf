@@ -183,6 +183,30 @@ python C:\Temp\bhf-work\results\findings\<id>\replay.py
 `python3` on Windows, and `bhf explain` prints the `$env:Path` line for a direct
 run.
 
+A C or C++ finding packages into a capsule that rebuilds natively, with no
+POSIX shell: `bhf capsule` writes `build.ps1` beside `build.sh`, and on
+Windows both `bhf capsule` and `bhf verify-poc` rebuild with it. It compiles
+with the compiler family the harness was built with (cl for `--cc cl`,
+clang-cl for `--cc clang-cl`, clang otherwise); cl gets `/fsanitize=address`
+and the same SanitizerCoverage flags as the cl lane, spelled by the bhf-cl
+front end's translation, and bhf's weak repair stubs compile from MSVC copies.
+`$env:CC`/`$env:CXX` names another compiler. Outside a Developer shell the
+script takes the environment cl and clang-cl read from Visual Studio itself,
+and it copies the
+sanitizer runtime DLL next to `poc.exe`, so a capsule rebuilds and replays
+from a plain PowerShell on a machine without bhf:
+
+```powershell
+bhf.exe capsule --work-dir C:\Temp\bhf-work --finding-id <id>
+bhf.exe verify-poc C:\Temp\bhf-work\capsules\capsule_<id>
+# or by hand, in a copy of the capsule:
+powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
+.\poc.exe input/testcase.bin
+```
+
+`bhf explain` quotes the work dir and capsule paths it prints, so a path
+with spaces (`C:\Users\a b\work`) pastes as one argument.
+
 ## Visual Studio solutions (.sln / .vcxproj)
 
 `bhf auto` imports a Visual Studio solution by default — no flag — when the

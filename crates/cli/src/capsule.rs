@@ -42,6 +42,10 @@ const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const REPLAY_TIMEOUT: Duration = Duration::from_secs(60);
 /// Where a capsule's crash input ships, whichever of the finding's inputs it is.
 const SHIPPED_INPUT: &str = "input/testcase.bin";
+/// The Windows build script a C or C++ capsule ships beside `build.sh`.
+const WINDOWS_BUILD_SCRIPT: &str = "build.ps1";
+/// How the manifest and the README say to run it.
+const WINDOWS_BUILD_COMMAND: &str = "powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1";
 
 // ── `bhf capsule` ───────────────────────────────────────────────────────
 
@@ -75,7 +79,11 @@ pub struct CapsuleArgs {
 ///
 /// It needs the programs the capsule's manifest lists under `requires` (the
 /// lane's compiler or interpreter, each overridable by its variable, such as
-/// `CC`, `GPRBUILD`, `PYTHON` or `DOTNET`) and says which are missing.
+/// `CC`, `GPRBUILD`, `PYTHON` or `DOTNET`) and says which are missing. On
+/// Windows a C or C++ capsule rebuilds with its `build.ps1` instead of
+/// `build.sh`, which needs no POSIX shell, with the compiler the harness was
+/// built with (cl, clang-cl or clang; `CC`/`CXX` names another), as
+/// `requires_windows` lists it.
 #[derive(Debug, clap::Args)]
 pub struct VerifyPocArgs {
     /// Capsule directory or `.tar.gz` produced by `bhf capsule` (absolute, or
@@ -308,6 +316,9 @@ fn build_capsule(f: &FindingRef, out_root: &Path, tar: bool) -> anyhow::Result<C
     let build_path = cap.join("build.sh");
     std::fs::write(&build_path, &plan.build_script)?;
     set_executable(&build_path);
+    if let Some(windows) = &plan.windows {
+        std::fs::write(cap.join(WINDOWS_BUILD_SCRIPT), &windows.script)?;
+    }
 
     // Verify by construction: build + replay in place, capture the signature.
     // The minimized input ships when it reproduces; otherwise the recorded one.
@@ -435,10 +446,10 @@ fn validate_capsule_id(value: &str, label: &str) -> anyhow::Result<()> {
 /// with the protocol the shared detector reads off it (the lane's own when the
 /// detector finds nothing that says).
 fn verify_capsule(cap: &Path, lane: &dyn Lane, inputs: &[String]) -> Verification {
-    let mut build = Command::new("sh");
-    build.arg("build.sh").current_dir(cap);
+    let (mut build, script, poc) = build_command(cap);
+    let built = |cap: &Path| cap.join(poc).is_file();
     match crate::command_output::output_with_timeout(&mut build, BUILD_TIMEOUT) {
-        Ok(out) if out.status.success() && cap.join("poc").is_file() => {}
+        Ok(out) if out.status.success() && built(cap) => {}
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
             let stdout = String::from_utf8_lossy(&out.stdout);
@@ -446,15 +457,15 @@ fn verify_capsule(cap: &Path, lane: &dyn Lane, inputs: &[String]) -> Verificatio
                 build_error: build_failure_line(&stderr)
                     .or_else(|| build_failure_line(&stdout))
                     .or_else(|| {
-                        (!out.status.success() || !cap.join("poc").is_file())
-                            .then(|| "build.sh produced no ./poc".to_owned())
+                        (!out.status.success() || !built(cap))
+                            .then(|| format!("{script} produced no {poc}"))
                     }),
                 ..Verification::default()
             };
         }
         Err(error) => {
             return Verification {
-                build_error: Some(format!("cannot run build.sh: {error}")),
+                build_error: Some(format!("cannot run {script}: {error}")),
                 ..Verification::default()
             };
         }
@@ -491,10 +502,38 @@ fn verify_capsule(cap: &Path, lane: &dyn Lane, inputs: &[String]) -> Verificatio
     }
 }
 
+/// Whether the capsule rebuilds here with its Windows build: on Windows, when
+/// it ships one.
+fn uses_windows_build(cap: &Path) -> bool {
+    cfg!(windows) && cap.join(WINDOWS_BUILD_SCRIPT).is_file()
+}
+
+/// How a capsule rebuilds here: `build.ps1` through Windows PowerShell on
+/// Windows when the capsule ships one (it needs no POSIX shell), else
+/// `build.sh` through `sh`; with the script's name and the PoC it writes.
+fn build_command(cap: &Path) -> (Command, &'static str, &'static str) {
+    if uses_windows_build(cap) {
+        let mut command = Command::new("powershell.exe");
+        command.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            WINDOWS_BUILD_SCRIPT,
+        ]);
+        command.current_dir(cap);
+        return (command, WINDOWS_BUILD_SCRIPT, "poc.exe");
+    }
+    let mut command = Command::new("sh");
+    command.arg("build.sh").current_dir(cap);
+    (command, "build.sh", "poc")
+}
+
 /// How the rebuilt `<cap>/poc` takes its input: what the shared protocol
 /// detector reads off it, else the lane's own protocol.
 fn replay_protocol(cap: &Path, lane: &dyn Lane) -> (HarnessProtocol, String) {
-    let detection = protocol_detect::detect(&cap.join("poc"), &[]);
+    let detection = protocol_detect::detect(&repro_lane::poc_path(cap), &[]);
     if detection.basis == protocol_detect::ProtocolBasis::Default {
         let protocol = lane.protocol();
         return (
@@ -520,16 +559,37 @@ fn run_line(protocol: HarnessProtocol, input: &str) -> String {
     }
 }
 
+/// The Windows command line that replays `input` on the PoC build.ps1 wrote.
+fn run_line_windows(protocol: HarnessProtocol, input: &str) -> String {
+    match protocol {
+        // Piped, not redirected: the Ada runtime re-reads its stdin.
+        HarnessProtocol::StdinEventLog => format!(
+            "cmd /c \"set BHF_EVENTS_PATH=events.bin&& type {} | .\\poc.exe\"",
+            input.replace('/', "\\")
+        ),
+        HarnessProtocol::BhfFramed | HarnessProtocol::LibFuzzerSingleInput => {
+            format!(".\\poc.exe {input}")
+        }
+    }
+}
+
 /// The line that says why a rebuild failed: the first compiler diagnostic
-/// (`error:`; for a failed link, the linker's own line before it), else the
-/// last line naming an error, else the last line.
+/// (`error:`, or MSVC's `error C2065:` and `error LNK2019:`; for a failed
+/// link, the linker's own line before clang's summary), else the last line
+/// naming an error, else the last line.
 fn build_failure_line(stderr: &str) -> Option<String> {
     let lines: Vec<&str> = stderr
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .collect();
-    if let Some(at) = lines.iter().position(|line| line.contains("error:")) {
+    let diagnostic = |line: &str| {
+        line.contains("error:")
+            || [" error C", " error LNK", "fatal error C", "fatal error LNK"]
+                .iter()
+                .any(|marker| line.contains(marker))
+    };
+    if let Some(at) = lines.iter().position(|line| diagnostic(line)) {
         let line = match at.checked_sub(1) {
             Some(before) if lines[at].contains("linker command failed") => lines[before],
             _ => lines[at],
@@ -551,6 +611,13 @@ fn remove_build_outputs(cap: &Path, outputs: &[&str]) {
             let _ = std::fs::remove_dir_all(&path);
         } else {
             let _ = std::fs::remove_file(&path);
+        }
+    }
+    // The sanitizer runtime DLLs build.ps1 copies next to poc.exe.
+    for entry in std::fs::read_dir(cap).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        if name.starts_with("clang_rt.") && name.ends_with(".dll") && entry.path().is_file() {
+            let _ = std::fs::remove_file(entry.path());
         }
     }
 }
@@ -602,6 +669,16 @@ fn write_manifest(
         "reproduced": verification.reproduced_with.is_some(),
     });
     let mut manifest = manifest;
+    // The Windows build: no POSIX shell, its own compilers.
+    if let Some(windows) = &plan.windows {
+        manifest["build_windows"] = json!(WINDOWS_BUILD_COMMAND);
+        manifest["run_windows"] = json!(run_line_windows(protocol, SHIPPED_INPUT));
+        manifest["requires_windows"] = json!(windows
+            .requires
+            .iter()
+            .map(Requirement::to_json)
+            .collect::<Vec<_>>());
+    }
     // The input formats of the harness packaged and of the finding's testcase,
     // when they are recorded, and the note when they differ.
     if let Some(version) = crate::generate_harness::recorded_harness_format_version(&f.harness_dir)
@@ -666,25 +743,64 @@ fn readme(
         layout,
         "- `manifest.json` — finding metadata, the toolchain it needs + expected signature"
     );
-    let mut requires = String::new();
-    for requirement in &plan.requires {
-        let _ = writeln!(
-            requires,
-            "- `{}` (or `${}`){}{}",
-            requirement.program,
-            requirement.env_var,
-            if requirement.purpose.is_empty() {
-                String::new()
-            } else {
-                format!(": {}", requirement.purpose)
-            },
-            requirement
-                .version
-                .as_deref()
-                .map(|version| format!(" — packaged with `{version}`"))
-                .unwrap_or_default(),
-        );
-    }
+    let list = |requirements: &[Requirement]| {
+        let mut out = String::new();
+        for requirement in requirements {
+            let _ = writeln!(
+                out,
+                "- `{}` (or `${}`){}{}{}",
+                requirement.program,
+                requirement.env_var,
+                if requirement.purpose.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", requirement.purpose)
+                },
+                if requirement.alternatives.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "; else {}",
+                        requirement
+                            .alternatives
+                            .iter()
+                            .map(|name| format!("`{name}`"))
+                            .collect::<Vec<_>>()
+                            .join(" or ")
+                    )
+                },
+                requirement
+                    .version
+                    .as_deref()
+                    .map(|version| format!(" — packaged with `{version}`"))
+                    .unwrap_or_default(),
+            );
+        }
+        out
+    };
+    let requires = list(&plan.requires);
+    let windows = match &plan.windows {
+        Some(windows) => format!(
+            "\nOn Windows, `build.ps1` rebuilds it with no POSIX shell. It needs:\n\n\
+             {}\n\
+             ```powershell\n\
+             {WINDOWS_BUILD_COMMAND}   # compile .\\poc.exe\n\
+             {}    # replay {which_input}\n\
+             ```\n\n\
+             It compiles with the compiler the harness was built with (cl gets\n\
+             `/fsanitize=address` and cl's coverage flags; clang and clang-cl their own),\n\
+             or with the one `$env:{}` names. Outside a Developer shell it takes the\n\
+             environment cl and clang-cl read from the newest Visual Studio install.\n",
+            list(&windows.requires),
+            run_line_windows(protocol, SHIPPED_INPUT),
+            windows
+                .requires
+                .first()
+                .map(|requirement| requirement.env_var.as_str())
+                .unwrap_or("CC"),
+        ),
+        None => String::new(),
+    };
     let run = run_line(protocol, SHIPPED_INPUT);
     let stdin_note = if protocol == HarnessProtocol::StdinEventLog {
         "\nThe harness reads its input from stdin and records what it raised in the\n\
@@ -703,7 +819,7 @@ fn readme(
          sh build.sh                 # {summary}\n\
          {run}    # replay {which_input}\n\
          ```\n\
-         {stdin_note}\n\
+         {stdin_note}{windows}\n\
          Or verify with bhf:\n\n\
          ```sh\n\
          bhf verify-poc .\n\
@@ -777,8 +893,14 @@ pub fn run_verify(args: VerifyPocArgs) -> i32 {
         );
         return 1;
     };
-    // The programs the capsule recorded it needs (older capsules: the lane's).
-    let requires: Vec<Requirement> = match manifest.get("requires").and_then(Value::as_array) {
+    // The programs the capsule recorded it needs (older capsules: the lane's);
+    // on Windows, those of the Windows build when the capsule ships one.
+    let requires_key = if uses_windows_build(&root) {
+        "requires_windows"
+    } else {
+        "requires"
+    };
+    let requires: Vec<Requirement> = match manifest.get(requires_key).and_then(Value::as_array) {
         Some(recorded) => recorded.iter().filter_map(Requirement::from_json).collect(),
         None => lane.tools().iter().map(|tool| tool.requirement()).collect(),
     };
@@ -802,7 +924,14 @@ pub fn run_verify(args: VerifyPocArgs) -> i32 {
 
     // Rebuild in place (or a temp copy — for a tar it's already scratch).
     let verification = verify_capsule(&root, lane, std::slice::from_ref(&input));
-    remove_build_outputs(&root, &["poc", "obj", "build"]);
+    remove_build_outputs(
+        &root,
+        &[
+            &["poc", "obj", "build"][..],
+            repro_lane::WINDOWS_BUILD_OUTPUTS,
+        ]
+        .concat(),
+    );
     let reproduced = verification.reproduced_with.is_some();
     let observed = verification.signature;
 
@@ -1046,6 +1175,72 @@ sources/widget.h:2:10: fatal error: 'cstddef' file not found
             Some("build.sh: 7: clang: not found")
         );
         assert_eq!(build_failure_line("\n  \n"), None);
+        // cl's and link.exe's diagnostics, which build.ps1 passes to stderr.
+        let cl = "\
+main.c
+sources/rec ord.c(3): error C2065: 'CAP': undeclared identifier
+build.ps1: C:\\VS\\cl.exe exited with 2 at step link_1
+";
+        assert_eq!(
+            build_failure_line(cl).as_deref(),
+            Some("sources/rec ord.c(3): error C2065: 'CAP': undeclared identifier")
+        );
+        let link = "rec ord.obj : error LNK2019: unresolved external symbol lookup referenced in function record\n\
+                    poc.exe : fatal error LNK1120: 1 unresolved externals\n";
+        assert_eq!(
+            build_failure_line(link).as_deref(),
+            Some("rec ord.obj : error LNK2019: unresolved external symbol lookup referenced in function record")
+        );
+    }
+
+    /// What a Windows build leaves beside the shipped files is removed: the
+    /// PoC, its debug info, export library and the sanitizer runtime DLLs.
+    #[test]
+    fn the_outputs_of_a_windows_build_are_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let cap = temp.path();
+        for file in [
+            "poc.exe",
+            "poc.pdb",
+            "poc.lib",
+            "poc.exp",
+            "clang_rt.asan_dynamic-x86_64.dll",
+            "clang_rt.asan_dbg_dynamic-x86_64.dll",
+            "build.ps1",
+            "manifest.json",
+        ] {
+            std::fs::write(cap.join(file), b"x").unwrap();
+        }
+        std::fs::create_dir_all(cap.join("obj")).unwrap();
+        std::fs::write(cap.join("obj/link.rsp"), b"x").unwrap();
+        remove_build_outputs(
+            cap,
+            &[
+                &["poc", "obj", "build"][..],
+                repro_lane::WINDOWS_BUILD_OUTPUTS,
+            ]
+            .concat(),
+        );
+        let mut left: Vec<String> = std::fs::read_dir(cap)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["build.ps1", "manifest.json"]);
+    }
+
+    /// The Windows replay line runs poc.exe from PowerShell or cmd.
+    #[test]
+    fn the_windows_replay_line_names_poc_exe() {
+        assert_eq!(
+            run_line_windows(HarnessProtocol::BhfFramed, SHIPPED_INPUT),
+            ".\\poc.exe input/testcase.bin"
+        );
+        assert_eq!(
+            run_line_windows(HarnessProtocol::StdinEventLog, SHIPPED_INPUT),
+            "cmd /c \"set BHF_EVENTS_PATH=events.bin&& type input\\testcase.bin | .\\poc.exe\""
+        );
     }
 
     /// A replay that crashes with another crash than the one the finding

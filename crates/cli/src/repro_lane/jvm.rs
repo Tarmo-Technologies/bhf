@@ -294,6 +294,7 @@ impl Lane for JavaLane {
             layout,
             build_outputs: vec!["poc", "build"],
             warnings: relocated.warnings,
+            windows: None,
         })
     }
 

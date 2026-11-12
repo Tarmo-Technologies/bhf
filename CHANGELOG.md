@@ -405,6 +405,13 @@
   `print_stacktrace=1:report_error_type=1`, merged after your own values. It
   printed fixed options without `halt_on_error`, the UBSan check name or leak
   detection, so it did not reproduce the way a replay does.
+- `bhf explain` quotes the work dir and capsule path in its `bhf capsule` and
+  `bhf verify-poc` lines, so a path with spaces pastes as one argument, and on
+  Windows the capsule refusals name `python` for a finding's `replay.py`.
+- The clang-cl harness lane (`--cc clang-cl`) builds again: bhf's cl front
+  end handed clang-cl the coverage flags in cl's `/fsanitize-coverage=`
+  spelling, which clang-cl reads as file names, so every harness build failed.
+  It now passes clang's own `-fsanitize-coverage=` to clang-cl.
 - `bhf replay` reported `MATCH` whenever the rule matched, so a crash of the
   same class at another site, or in another harness, was confirmed and stamped
   into `finding.json` as a reproduction. A C/C++ replay now matches on rule,
@@ -951,6 +958,26 @@
   run stopped before writing `auto/seeds.json`. `results::RebuildSummary`
   gains a `damaged_inputs` field.
 - docs/finding-report-fields.md describes upgrading a 0.2.x work dir.
+- A C or C++ capsule ships `build.ps1`, a Windows build that needs no POSIX
+  shell, and on Windows `bhf capsule` and `bhf verify-poc` rebuild with it.
+  It builds the way the harness Makefile builds there, linking bhf's driver
+  (the capsule now also ships `runtime/bhf_driver.c`), with the compiler
+  family recorded for the harness (`bhf_toolchain.stamp`; for the MSVC lane,
+  the compiler bhf's cl front end ran, now recorded in
+  `coverage-build-recipe.json` as `msvc_compiler`): cl with
+  `/fsanitize=address` and cl's SanitizerCoverage flags (linking
+  `libsancov.lib`) as the bhf-cl front end spells them, with bhf's weak repair
+  stubs compiled from MSVC copies; clang-cl; or clang targeting MSVC.
+  `$CC`/`$CXX` names another compiler. Outside a Developer shell the script
+  takes the environment cl and clang-cl read from Visual Studio, and it
+  copies the sanitizer
+  runtime DLL next to `poc.exe`. The manifest gains `build_windows`,
+  `run_windows`, `requires_windows` and `build_recipe` `windows_compiler`,
+  `windows_compiler_dialect` and `windows_compiler_source` (all additive).
+  Before, a capsule rebuilt only through `sh build.sh`, with clang-style
+  `-fsanitize` flags even for a cl-built harness, and its `./poc` did not run
+  on Windows. A rebuild that fails is reported by MSVC's `error C2065:` /
+  `error LNK2019:` line as well as by an `error:` line.
 
 ## 0.3.0 - 2026-10-05
 

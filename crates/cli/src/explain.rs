@@ -417,7 +417,9 @@ fn reproduce_lines(work_dir: &Path, f: &Finding) -> Vec<String> {
         dir: f.dir.clone(),
         raw: f.raw.clone(),
     };
-    let work = work_dir.display();
+    // One shell word each: a work dir may have spaces (`C:\Users\a b\work`).
+    let work = repro_lane::sh_word(&work_dir.to_string_lossy());
+    let capsule = work_dir.join("capsules").join(format!("capsule_{}", f.id));
     let replay = f.dir.join("replay.py");
     let mut lines = Vec::new();
     match repro_lane::assess(work_dir, &record, Tool::Capsule) {
@@ -426,7 +428,10 @@ fn reproduce_lines(work_dir: &Path, f: &Finding) -> Vec<String> {
                 "bhf capsule --work-dir {work} --finding-id {}",
                 f.id
             ));
-            lines.push(format!("bhf verify-poc {work}/capsules/capsule_{}", f.id));
+            lines.push(format!(
+                "bhf verify-poc {}",
+                repro_lane::sh_word(&capsule.to_string_lossy())
+            ));
             lines.push(
                 "  (the capsule records whether its offline rebuild reproduced the crash;"
                     .to_owned(),
@@ -1724,6 +1729,43 @@ mod tests {
         );
     }
 
+    /// The capsule and verify-poc commands keep a work dir with spaces one
+    /// shell word.
+    #[test]
+    fn reproduce_offline_quotes_a_work_dir_with_spaces() {
+        let root = tempfile::tempdir().unwrap();
+        let work = root.path().join("work dir");
+        let finding_dir = work.join("results/findings/F-0001-0a0b0c0d");
+        std::fs::create_dir_all(&finding_dir).unwrap();
+        std::fs::write(finding_dir.join("testcase.bin"), b"AAAA").unwrap();
+        let harness = crate::auto::layout::harness_dir(&work, "H-C0001");
+        std::fs::create_dir_all(&harness).unwrap();
+        std::fs::write(harness.join("main.c"), b"int main(void) { return 0; }\n").unwrap();
+        std::fs::write(
+            harness.join("Makefile"),
+            b"main: main.c\n\t$(CC) $(CFLAGS) -o $@ main.c $(AUTO_EXTRA_SOURCES)\n",
+        )
+        .unwrap();
+        let out = explain_one(&work, &frameless_finding(&finding_dir), &[], false);
+        let reproduce = out.split("REPRODUCE OFFLINE").nth(1).unwrap();
+        assert!(
+            reproduce.contains(&format!(
+                "bhf capsule --work-dir '{}' --finding-id F-0001-0a0b0c0d",
+                work.display()
+            )),
+            "{reproduce}"
+        );
+        assert!(
+            reproduce.contains(&format!(
+                "bhf verify-poc '{}'",
+                work.join("capsules")
+                    .join("capsule_F-0001-0a0b0c0d")
+                    .display()
+            )),
+            "{reproduce}"
+        );
+    }
+
     /// REPRODUCE OFFLINE offers capsule + verify-poc only for a finding capsule
     /// takes; otherwise it says why and gives a command that works.
     #[test]
@@ -1792,7 +1834,7 @@ mod tests {
         assert!(
             reproduce.contains(&format!(
                 "bhf capsule --work-dir {} --finding-id F-0001-0a0b0c0d",
-                work.path().display()
+                crate::repro_lane::sh_word(&work.path().to_string_lossy())
             )),
             "{reproduce}"
         );
@@ -1813,7 +1855,7 @@ mod tests {
         assert!(
             reproduce.contains(&format!(
                 "bhf cartography --work-dir {} --finding-id F-0001-0a0b0c0d",
-                work.path().display()
+                crate::repro_lane::sh_word(&work.path().to_string_lossy())
             )),
             "{reproduce}"
         );
@@ -1869,7 +1911,7 @@ mod tests {
         assert!(
             reproduce.contains(&format!(
                 "bhf capsule --work-dir {} --finding-id F-0001-0a0b0c0d",
-                work.path().display()
+                crate::repro_lane::sh_word(&work.path().to_string_lossy())
             )) && reproduce.contains("bhf verify-poc"),
             "{reproduce}"
         );

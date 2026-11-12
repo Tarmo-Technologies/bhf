@@ -27,9 +27,14 @@ fn runs(program: &str, args: &[&str]) -> bool {
 
 /// A scratch root holding `src/` (the scanned tree) and `work/`.
 struct Run {
-    _root: tempfile::TempDir,
+    scratch: tempfile::TempDir,
     src: PathBuf,
     work: PathBuf,
+    /// Variables every bhf command of the run gets (a local package source).
+    env: Vec<(String, std::ffi::OsString)>,
+    /// Dirs besides the tree and the work dir that the clean rebuild must not
+    /// reach (a local package source or cache).
+    hidden: Vec<PathBuf>,
 }
 
 impl Run {
@@ -46,16 +51,36 @@ impl Run {
         }
         let work = root.path().join("work");
         Run {
-            _root: root,
+            scratch: root,
             src,
             work,
+            env: Vec::new(),
+            hidden: Vec::new(),
         }
+    }
+
+    /// The scratch root the tree and the work dir are in.
+    fn root(&self) -> &Path {
+        self.scratch.path()
+    }
+
+    /// `program` with the run's environment.
+    fn command(&self, program: &str) -> Command {
+        let mut command = Command::new(program);
+        command.envs(self.env.iter().map(|(key, value)| (key, value)));
+        command
+    }
+
+    /// `bhf` with the run's environment.
+    fn bhf(&self) -> Command {
+        self.command(env!("CARGO_BIN_EXE_bhf"))
     }
 
     /// `bhf auto` on the tree for `language`, then the first runtime crash
     /// finding it recorded.
     fn auto(&self, language: &str, seconds: u32, extra: &[&str]) -> Option<String> {
-        let out = bhf()
+        let out = self
+            .bhf()
             .arg("auto")
             .arg(&self.src)
             .arg("--work-dir")
@@ -83,7 +108,14 @@ impl Run {
     /// Package `id`, verify the capsule from a clean copy with the tree and
     /// the work dir gone, and return the capsule's manifest.
     fn round_trip(&self, id: &str, lang: &str) -> serde_json::Value {
-        let packaged = bhf()
+        self.package(id, lang);
+        self.verify_packaged(id, lang)
+    }
+
+    /// Package `id` and assert the capsule reproduced when it was packaged.
+    fn package(&self, id: &str, lang: &str) {
+        let packaged = self
+            .bhf()
             .arg("capsule")
             .arg("--work-dir")
             .arg(&self.work)
@@ -96,6 +128,11 @@ impl Run {
             packaged.status.success() && stdout.contains("1 verified to reproduce"),
             "the {lang} capsule must reproduce when packaged; stdout:\n{stdout}\nstderr:\n{stderr}"
         );
+    }
+
+    /// Verify the packaged capsule of `id` from a clean copy, with the tree,
+    /// the work dir and the run's hidden dirs gone, and return its manifest.
+    fn verify_packaged(&self, id: &str, lang: &str) -> serde_json::Value {
         let capsule = self.work.join("capsules").join(format!("capsule_{id}"));
         let manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(capsule.join("manifest.json")).unwrap()).unwrap();
@@ -131,19 +168,25 @@ impl Run {
             .unwrap()
             .success());
         // Nothing the capsule did not ship may be reachable from the rebuild.
-        let hidden_src = self.src.with_extension("moved");
-        let hidden_work = self.work.with_extension("moved");
-        std::fs::rename(&self.src, &hidden_src).unwrap();
-        std::fs::rename(&self.work, &hidden_work).unwrap();
+        let hidden: Vec<(PathBuf, PathBuf)> = [&self.src, &self.work]
+            .into_iter()
+            .chain(&self.hidden)
+            .map(|dir| (dir.clone(), dir.with_extension("moved")))
+            .collect();
+        for (dir, moved) in &hidden {
+            std::fs::rename(dir, moved).unwrap();
+        }
         // The capsule path is relative to the current dir, as `bhf explain`
         // prints it.
-        let verified = bhf()
+        let verified = self
+            .bhf()
             .arg("verify-poc")
             .arg(&relative)
             .current_dir(clean.path())
             .output();
-        std::fs::rename(&hidden_src, &self.src).unwrap();
-        std::fs::rename(&hidden_work, &self.work).unwrap();
+        for (dir, moved) in &hidden {
+            std::fs::rename(moved, dir).unwrap();
+        }
         let verified = verified.expect("run bhf verify-poc");
         let verify_out = String::from_utf8_lossy(&verified.stdout);
         assert!(
@@ -428,6 +471,185 @@ fn go_finding_round_trips() {
         .expect("bhf auto must find the crash");
     let manifest = run.round_trip(&id, "go");
     assert_eq!(manifest["build_recipe"]["vendored"], false, "{manifest}");
+}
+
+/// A Go target whose module requires a module from outside the scanned tree:
+/// the capsule vendors it from the local module cache (`go mod vendor`) and
+/// rebuilds with `-mod=vendor`, with no module cache or proxy reachable. The
+/// module comes from a `file://` module proxy of the test's own, so the cache
+/// fills without the network.
+#[test]
+fn go_finding_with_a_cached_module_dependency_round_trips_vendored() {
+    skip_unless!(runs("go", &["version"]), "go not installed");
+    let mut run = Run::new(&[
+        (
+            "go.mod",
+            "module example.com/widget\n\ngo 1.21\n\nrequire example.com/slots v1.0.0\n",
+        ),
+        (
+            "recordparser/parser.go",
+            "package recordparser\n\nimport \"example.com/slots\"\n\n\
+             func ParseRecord(data []byte) int {\n\tif len(data) > 0 && data[0] == 'A' {\n\t\t\
+             return slots.Pick(data)\n\t}\n\treturn len(data)\n}\n",
+        ),
+    ]);
+    let proxy = run.root().join("proxy");
+    write_module_proxy(
+        &proxy,
+        "example.com/slots",
+        "v1.0.0",
+        &[
+            ("go.mod", "module example.com/slots\n\ngo 1.21\n"),
+            (
+                "slots.go",
+                "package slots\n\n// Pick reads past the end of a two-slot table.\n\
+                 func Pick(data []byte) int {\n\ttable := []int{1, 2}\n\t\
+                 return table[len(data)+2]\n}\n",
+            ),
+        ],
+    );
+    let cache = run.root().join("modcache");
+    let empty_cache = run.root().join("empty-modcache");
+    std::fs::create_dir_all(&empty_cache).unwrap();
+    run.env = vec![
+        (
+            "GOPROXY".into(),
+            format!("file://{}", proxy.display()).into(),
+        ),
+        ("GOMODCACHE".into(), cache.clone().into()),
+        ("GOSUMDB".into(), "off".into()),
+        ("GOTOOLCHAIN".into(), "local".into()),
+    ];
+    let id = run.auto("go", 10, &[]);
+    // The module cache is read-only, as Go leaves it: make it removable.
+    let _cleanup = WritableOnDrop(cache.clone());
+    let id = id.expect("bhf auto must find the crash");
+    let capsule = run.work.join("capsules").join(format!("capsule_{id}"));
+    // Packaging vendors from the cache that holds the module (with the
+    // proxy switched off); the rebuild gets an empty cache and can reach
+    // neither the proxy nor the cache that filled it.
+    run.env[0].1 = "off".into();
+    run.package(&id, "go");
+    run.env[1].1 = empty_cache.clone().into();
+    run.hidden = vec![proxy.clone(), cache.clone()];
+    let manifest = run.verify_packaged(&id, "go");
+    assert_eq!(manifest["build_recipe"]["vendored"], true, "{manifest}");
+    assert_eq!(
+        manifest["build_recipe"]["module_mode"], "vendor",
+        "{manifest}"
+    );
+    assert!(
+        capsule
+            .join("harness/vendor/example.com/slots/slots.go")
+            .is_file(),
+        "the dependency ships in harness/vendor/"
+    );
+    assert!(capsule.join("harness/vendor/modules.txt").is_file());
+}
+
+/// Makes a dir tree writable again when dropped, so a read-only Go module
+/// cache inside a scratch dir can be removed.
+struct WritableOnDrop(PathBuf);
+
+impl Drop for WritableOnDrop {
+    fn drop(&mut self) {
+        let _ = Command::new("chmod")
+            .arg("-R")
+            .arg("u+w")
+            .arg(&self.0)
+            .status();
+    }
+}
+
+/// A `file://` Go module proxy (`go help goproxy`) serving one version of
+/// `module`: its `@v/list`, `.info`, `.mod` and module zip.
+fn write_module_proxy(proxy: &Path, module: &str, version: &str, files: &[(&str, &str)]) {
+    let dir = proxy.join(module).join("@v");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("list"), format!("{version}\n")).unwrap();
+    std::fs::write(
+        dir.join(format!("{version}.info")),
+        format!("{{\"Version\":\"{version}\",\"Time\":\"2024-01-01T00:00:00Z\"}}"),
+    )
+    .unwrap();
+    let go_mod = files
+        .iter()
+        .find(|(name, _)| *name == "go.mod")
+        .map(|(_, text)| *text)
+        .expect("a module zip holds its go.mod");
+    std::fs::write(dir.join(format!("{version}.mod")), go_mod).unwrap();
+    let entries: Vec<(String, &[u8])> = files
+        .iter()
+        .map(|(name, text)| (format!("{module}@{version}/{name}"), text.as_bytes()))
+        .collect();
+    std::fs::write(dir.join(format!("{version}.zip")), stored_zip(&entries)).unwrap();
+}
+
+/// A zip archive holding `entries` uncompressed (method 0, "stored").
+fn stored_zip(entries: &[(String, &[u8])]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut central = Vec::new();
+    // 1980-01-01, the earliest date a zip entry can carry.
+    let (time, date) = (0u16, 0x21u16);
+    for (name, data) in entries {
+        let offset = out.len() as u32;
+        let crc = crc32(data);
+        let size = data.len() as u32;
+        let name_len = name.len() as u16;
+        out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+        for field in [20u16, 0, 0, time, date] {
+            out.extend_from_slice(&field.to_le_bytes());
+        }
+        for field in [crc, size, size] {
+            out.extend_from_slice(&field.to_le_bytes());
+        }
+        out.extend_from_slice(&name_len.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(data);
+
+        central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+        for field in [20u16, 20, 0, 0, time, date] {
+            central.extend_from_slice(&field.to_le_bytes());
+        }
+        for field in [crc, size, size] {
+            central.extend_from_slice(&field.to_le_bytes());
+        }
+        for field in [name_len, 0, 0, 0, 0] {
+            central.extend_from_slice(&field.to_le_bytes());
+        }
+        central.extend_from_slice(&0u32.to_le_bytes());
+        central.extend_from_slice(&offset.to_le_bytes());
+        central.extend_from_slice(name.as_bytes());
+    }
+    let central_offset = out.len() as u32;
+    let central_size = central.len() as u32;
+    out.extend_from_slice(&central);
+    out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+    let count = entries.len() as u16;
+    for field in [0u16, 0, count, count] {
+        out.extend_from_slice(&field.to_le_bytes());
+    }
+    out.extend_from_slice(&central_size.to_le_bytes());
+    out.extend_from_slice(&central_offset.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out
+}
+
+/// CRC-32 (IEEE 802.3), as a zip entry records it.
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
 }
 
 #[test]
@@ -785,6 +1007,102 @@ fn csharp_harness_round_trips() {
         ("Widget.csproj", WIDGET_CSPROJ),
         ("Parser.cs", WIDGET_PARSER_CS),
     ]);
+    let id = lay_out_csharp_harness(&run, &sharpfuzz_common, None);
+    let manifest = run.round_trip(&id, "csharp");
+    assert_eq!(
+        manifest["expected_signature"], "BHF-201:csharp-index-out-of-bounds",
+        "{manifest}"
+    );
+}
+
+/// A C# target that references a NuGet package: the capsule vendors the
+/// package from the local NuGet package cache into `vendor/nuget` and restores
+/// from that feed alone, with no other feed or cache reachable. The package is
+/// packed by the test into a local feed dir, which fills a package cache of
+/// the test's own without the network.
+#[test]
+fn csharp_finding_with_a_cached_package_round_trips_vendored() {
+    skip_unless!(
+        runs("dotnet", &["--version"]),
+        "the .NET SDK is not installed"
+    );
+    let Some(sharpfuzz_common) = sharpfuzz_common_dll() else {
+        eprintln!(
+            "skipping: no SharpFuzz.Common.dll (install the sharpfuzz tool: dotnet tool install \
+             --global SharpFuzz.CommandLine)"
+        );
+        return;
+    };
+    let mut run = Run::new(&[
+        ("Widget.csproj", WIDGET_CODEC_CSPROJ),
+        ("Parser.cs", WIDGET_CODEC_PARSER_CS),
+    ]);
+    let codec = run.root().join("codec");
+    let feed = run.root().join("feed");
+    let cache = run.root().join("nuget-cache");
+    let empty_cache = run.root().join("empty-nuget-cache");
+    std::fs::create_dir_all(&codec).unwrap();
+    std::fs::create_dir_all(&feed).unwrap();
+    std::fs::create_dir_all(&empty_cache).unwrap();
+    std::fs::write(codec.join("Widget.Codec.csproj"), CODEC_CSPROJ).unwrap();
+    std::fs::write(codec.join("Slots.cs"), CODEC_SLOTS_CS).unwrap();
+    run.env = vec![
+        ("NUGET_PACKAGES".into(), cache.clone().into()),
+        ("DOTNET_CLI_TELEMETRY_OPTOUT".into(), "1".into()),
+        ("DOTNET_NOLOGO".into(), "1".into()),
+    ];
+    let packed = run
+        .command("dotnet")
+        .arg("pack")
+        .arg(codec.join("Widget.Codec.csproj"))
+        .args(["-c", "Release", "--nologo", "-o"])
+        .arg(&feed)
+        .arg(format!("-p:RestoreSources={}", feed.display()))
+        .output()
+        .expect("run dotnet pack");
+    assert!(
+        packed.status.success() && feed.join("Widget.Codec.1.0.0.nupkg").is_file(),
+        "dotnet pack must write the package into the local feed:\n{}\n{}",
+        String::from_utf8_lossy(&packed.stdout),
+        String::from_utf8_lossy(&packed.stderr)
+    );
+    let id = lay_out_csharp_harness(&run, &sharpfuzz_common, Some(&feed));
+    assert!(
+        cache
+            .join("widget.codec/1.0.0/widget.codec.1.0.0.nupkg")
+            .is_file(),
+        "the harness restore put the package in the cache"
+    );
+    run.package(&id, "csharp");
+    // The rebuild gets an empty package cache and reaches neither the feed,
+    // the cache that holds the package, nor the package's project.
+    run.env[0].1 = empty_cache.clone().into();
+    run.hidden = vec![codec, feed, cache];
+    let manifest = run.verify_packaged(&id, "csharp");
+    assert_eq!(
+        manifest["build_recipe"]["vendored_packages"],
+        serde_json::json!(["Widget.Codec 1.0.0"]),
+        "{manifest}"
+    );
+    assert_eq!(
+        manifest["expected_signature"], "BHF-201:csharp-index-out-of-bounds",
+        "{manifest}"
+    );
+    let capsule = run.work.join("capsules").join(format!("capsule_{id}"));
+    assert!(capsule
+        .join("vendor/nuget/widget.codec.1.0.0.nupkg")
+        .is_file());
+}
+
+/// Lay out a C# harness for `Widget.Parser.ParseRecord` exactly as the C# lane
+/// writes it (the harness project, bhf's .NET driver, the entry, the build
+/// output's SharpFuzz.Common.dll and the launcher), plus a recorded finding,
+/// and return the finding id. With `feed`, the harness project's packages are
+/// restored from that local feed, as the lane's own build restores them: the
+/// restore resolves them into the run's package cache and records them in
+/// `proj/obj/project.assets.json` (SharpFuzz, which no local feed holds, is
+/// left out of that restore).
+fn lay_out_csharp_harness(run: &Run, sharpfuzz_common: &Path, feed: Option<&Path>) -> String {
     let harness_id = "H-S0001-0000C0DE";
     let id = "F-0000-0000c0de";
     let harness = run.work.join("harnesses").join(harness_id);
@@ -792,15 +1110,14 @@ fn csharp_harness_round_trips() {
     std::fs::create_dir_all(harness.join("out")).unwrap();
     let runtime = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../csharp_runtime/Driver.cs");
     std::fs::copy(runtime, harness.join("proj/Driver.cs")).unwrap();
-    std::fs::copy(&sharpfuzz_common, harness.join("out/SharpFuzz.Common.dll")).unwrap();
+    std::fs::copy(sharpfuzz_common, harness.join("out/SharpFuzz.Common.dll")).unwrap();
     std::fs::write(
         harness.join("proj/BhfEntry.cs"),
         "namespace Bhfgen {\n  public static class BhfEntry {\n    public static void Run(byte[] data) {\n      \
          var bhfArg0 = data;\n      global::Widget.Parser.ParseRecord(bhfArg0);\n    }\n  }\n}\n",
     )
     .unwrap();
-    std::fs::write(
-        harness.join("proj/bhf_harness.csproj"),
+    let csproj = |sharpfuzz: &str| {
         format!(
             "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    <OutputType>Exe</OutputType>\n    \
              <TargetFramework>net8.0</TargetFramework>\n    <LangVersion>latest</LangVersion>\n    \
@@ -808,12 +1125,40 @@ fn csharp_harness_round_trips() {
              <AllowUnsafeBlocks>true</AllowUnsafeBlocks>\n    <Nullable>disable</Nullable>\n    \
              <AssemblyName>bhf_harness</AssemblyName>\n    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>\n    \
              <ImplicitUsings>disable</ImplicitUsings>\n  </PropertyGroup>\n  <ItemGroup>\n    \
-             <Compile Include=\"Driver.cs;BhfEntry.cs\" />\n    \
-             <PackageReference Include=\"SharpFuzz\" Version=\"2.3.0\" />\n    \
+             <Compile Include=\"Driver.cs;BhfEntry.cs\" />\n    {sharpfuzz}\n    \
              <ProjectReference Include=\"{}\" SetTargetFramework=\"TargetFramework=net8.0\" />\n  \
              </ItemGroup>\n</Project>\n",
             run.src.join("Widget.csproj").display()
-        ),
+        )
+    };
+    let project = harness.join("proj/bhf_harness.csproj");
+    if let Some(feed) = feed {
+        std::fs::write(
+            &project,
+            csproj(&format!(
+                "<Reference Include=\"SharpFuzz.Common\"><HintPath>{}</HintPath></Reference>",
+                harness.join("out/SharpFuzz.Common.dll").display()
+            )),
+        )
+        .unwrap();
+        let restored = run
+            .command("dotnet")
+            .arg("restore")
+            .arg(&project)
+            .arg("--nologo")
+            .arg(format!("-p:RestoreSources={}", feed.display()))
+            .output()
+            .expect("run dotnet restore");
+        assert!(
+            restored.status.success() && harness.join("proj/obj/project.assets.json").is_file(),
+            "the harness project must restore from the local feed:\n{}\n{}",
+            String::from_utf8_lossy(&restored.stdout),
+            String::from_utf8_lossy(&restored.stderr)
+        );
+    }
+    std::fs::write(
+        &project,
+        csproj("<PackageReference Include=\"SharpFuzz\" Version=\"2.3.0\" />"),
     )
     .unwrap();
     let launcher = harness.join("main");
@@ -851,11 +1196,7 @@ fn csharp_harness_round_trips() {
         .to_string(),
     )
     .unwrap();
-    let manifest = run.round_trip(id, "csharp");
-    assert_eq!(
-        manifest["expected_signature"], "BHF-201:csharp-index-out-of-bounds",
-        "{manifest}"
-    );
+    id.to_owned()
 }
 
 const WIDGET_CSPROJ: &str = "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    \
@@ -866,6 +1207,26 @@ const WIDGET_PARSER_CS: &str = "namespace Widget\n{\n    public static class Par
      if (data.Length > 0 && data[0] == 0x41)\n            {\n                \
      int[] slots = new int[2];\n                return slots[data.Length + 4];\n            }\n            \
      return data.Length;\n        }\n    }\n}\n";
+
+/// The target project of the vendored-package test: it references the
+/// `Widget.Codec` package, whose index runs past the two slots.
+const WIDGET_CODEC_CSPROJ: &str = "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    \
+     <TargetFramework>net8.0</TargetFramework>\n  </PropertyGroup>\n  <ItemGroup>\n    \
+     <PackageReference Include=\"Widget.Codec\" Version=\"1.0.0\" />\n  </ItemGroup>\n</Project>\n";
+
+const WIDGET_CODEC_PARSER_CS: &str = "namespace Widget\n{\n    public static class Parser\n    {\n        \
+     public static int ParseRecord(byte[] data)\n        {\n            \
+     if (data.Length > 0 && data[0] == 0x41)\n            {\n                \
+     int[] slots = new int[2];\n                return slots[Widget.Codec.Slots.Index(data)];\n            }\n            \
+     return data.Length;\n        }\n    }\n}\n";
+
+const CODEC_CSPROJ: &str = "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    \
+     <TargetFramework>net8.0</TargetFramework>\n    <PackageId>Widget.Codec</PackageId>\n    \
+     <Version>1.0.0</Version>\n  </PropertyGroup>\n</Project>\n";
+
+const CODEC_SLOTS_CS: &str =
+    "namespace Widget.Codec\n{\n    public static class Slots\n    {\n        \
+     public static int Index(byte[] data) => data.Length + 4;\n    }\n}\n";
 
 /// Whether the local NuGet package cache holds the SharpFuzz package the C#
 /// lane's fuzz build references.

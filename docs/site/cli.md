@@ -596,15 +596,42 @@ and explain it — all offline and deterministic (no LLM):
   libstdc++ headers and library, else (a libc++ host) to `-stdlib=libc++` or
   an installed libc++ header dir; `build.sh` probes for them on the host that
   runs it. A rebuild that fails is reported by the compiler's first `error:`
-  line. The capsule is built and replayed in a scratch dir, then moved into
-  place, so a refused or failed finding leaves nothing behind.
+  line (or MSVC's `error C2065:` / `error LNK2019:`). The capsule is built and
+  replayed in a scratch dir, then moved into place, so a refused or failed
+  finding leaves nothing behind.
+
+  A C or C++ capsule also ships `build.ps1`, its Windows build, which needs no
+  POSIX shell (`powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1`,
+  then `.\poc.exe input/testcase.bin`; manifest `build_windows`, `run_windows`
+  and `requires_windows`). It builds the way the harness Makefile builds on
+  Windows, linking bhf's driver (`runtime/bhf_driver.c`), with the compiler
+  family recorded for the harness (its `bhf_toolchain.stamp`; for the MSVC
+  lane, the compiler bhf's cl front end ran, recorded in
+  `coverage-build-recipe.json` `msvc_compiler`): cl gets `/fsanitize=address`
+  and cl's SanitizerCoverage flags (`inline-8bit-counters`, `edge`,
+  `trace-cmp`, `trace-div`, linking `libsancov.lib`), spelled by the bhf-cl
+  front end's translation, and bhf's weak repair stubs compile from MSVC
+  copies (`stubs_msvc/`); clang-cl gets the same without `libsancov.lib`;
+  clang (targeting MSVC) gets the Makefile's ASan, UBSan and coverage flags.
+  `$CC`/`$CXX` names another compiler, and when it is unset and the recorded
+  one is not installed, the script takes the first of cl, clang-cl and clang
+  that is (manifest `build_recipe` `windows_compiler`,
+  `windows_compiler_dialect`, `windows_compiler_source`). Each compile runs
+  from a response file, so arguments with spaces and quotes stay whole;
+  outside a Developer shell the script takes the environment cl and clang-cl
+  read (`INCLUDE`, `LIB`, `PATH`) from the newest Visual Studio instance with
+  the C++ toolset; and it copies the sanitizer
+  runtime DLL of the compiler that ran next to `poc.exe`. On Windows, `bhf
+  capsule` and `bhf verify-poc` rebuild with `build.ps1`.
 - `bhf verify-poc <CAPSULE>` — rebuild a PoC capsule offline in place (or in a
   scratch copy of a `.tar.gz`) and assert the recorded crash reproduces. The
   path may be absolute or relative to the current dir. It
   needs only the programs the manifest lists under `requires` and a shell, so
   a capsule verifies on a clean machine without bhf's work dir or the scanned
   tree; it checks them first and names each missing one and the variable that
-  overrides it. A path that does not exist is reported as such, with the
+  overrides it. On Windows it rebuilds a C or C++ capsule with `build.ps1`
+  and checks the programs `requires_windows` lists, so no POSIX shell is
+  needed. A path that does not exist is reported as such, with the
   `bhf capsule` command that writes it.
 - `bhf env-capsule` — record and replay the shim-served faked environment so an
   environment-driven crash (missing files, unset env, unreachable sockets)
@@ -725,8 +752,8 @@ Per-lane requirements (a capsule records what it needs in `manifest.json`
 
 | Lane (id prefix) | The capsule ships | Rebuild and replay need | Crash oracle | Refused when |
 |---|---|---|---|---|
-| C (`H-C`) | driver, target sources and their headers, stubs, C runtime headers | `clang` or the compiler that built the harness (`CC`) | ASan / UBSan report | built with a cross compiler; no `main` rule in the Makefile |
-| C++ (`H-X`) | as C | `clang++` or the compiler that built the harness (`CXX`) | ASan / UBSan report | as C |
+| C (`H-C`) | driver, target sources and their headers, stubs, C runtime headers and bhf's driver source, `build.sh` and `build.ps1` | `clang` or the compiler that built the harness (`CC`); on Windows (`build.ps1`) the recorded cl, clang-cl or clang | ASan / UBSan report | built with a cross compiler; no `main` rule in the Makefile |
+| C++ (`H-X`) | as C | `clang++` or the compiler that built the harness (`CXX`); on Windows (`build.ps1`) the recorded cl, clang-cl or clang++ | ASan / UBSan report | as C |
 | Ada (`H-A`) | `bhf_build.gpr`, `adafuzz_runtime.gpr` and the runtime sources, `src_instrumented/`, the generated harness, the stub packages, the operator projects it extends or `with`s (with the scanned tree) | `gprbuild` (`GPRBUILD`) and GNAT (`GNAT`) | unhandled exception in the event log, or a sanitizer report | never built (no `build/<id>/bhf_build.gpr`); built for another target; a project file it names lies outside the scanned tree |
 | Rust (`H-R`) | harness crate, bhf's driver, the `rust_runtime` crate, the scanned tree, `vendor/` (`cargo vendor --offline`) when the lock file names crates.io or git packages | `cargo +nightly` through rustup (`BHF_CARGO`; `BHF_RUST_NIGHTLY` names the nightly) and `clang` (`CC`) | the panic, or an ASan report | a package not in the local cargo cache |
 | Go (`H-G`) | harness module, the scanned tree, `vendor/` when the module needs modules from outside it | `go` (`GO`) | the recovered panic (`== bhf go finding:`) | a module not in the local module cache |
