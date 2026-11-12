@@ -446,14 +446,12 @@ pub(crate) fn finding_format_note(
     harness_dir: &Path,
 ) -> Option<String> {
     let harness = recorded_harness_format(harness_dir)?;
-    let recorded = finding
-        .get("harness_format_version")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|version| u32::try_from(version).ok());
-    let recorded_dimension = finding
-        .get("buffer_len_dimension")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+    // The finding's own record first (`harness.format_version`, else the
+    // top-level key of findings written before it); with neither, the harness
+    // dir's format decides below.
+    let recorded_format = corpus::finding::finding_harness_format(finding);
+    let recorded = recorded_format.map(|format| format.version);
+    let recorded_dimension = recorded_format.is_some_and(|format| format.buffer_len_dimension);
     let with = |on: bool| if on { "with" } else { "without" };
     let (recorded_text, harness_text) = match recorded {
         Some(recorded) if recorded == harness.version => {
@@ -18961,6 +18959,19 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             unversioned.contains("input format 2 or earlier"),
             "{unversioned}"
         );
+        // `harness.format_version` is read first; the top-level key only when
+        // the finding has no `harness` record.
+        let nested = serde_json::json!({
+            "harness": {"format_version": current, "buffer_len_dimension": false},
+            "harness_format_version": current - 1,
+        });
+        assert_eq!(finding_format_note(&nested, &dir), None);
+        let nested_older = serde_json::json!({
+            "harness": {"format_version": current - 1, "buffer_len_dimension": false},
+        });
+        assert!(finding_format_note(&nested_older, &dir)
+            .expect("a nested older format is flagged")
+            .contains(&format!("input format {}", current - 1)));
         fs::remove_dir_all(&dir).ok();
     }
 

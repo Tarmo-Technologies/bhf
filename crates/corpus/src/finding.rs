@@ -7,7 +7,7 @@ use crate::{
 use event_log::{HandlerEvent, Testcase};
 use serde_json::json;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub struct FindingEmitter {
     root: PathBuf,
@@ -754,8 +754,97 @@ impl FindingEmitter {
         let short: String = signature_hex.chars().take(8).collect();
         let mut allocator = crate::layout::FamilyAllocator::new(&findings_root, "F-")?;
         let (id, dir) = allocator.create_with_suffix(&short)?;
+        self.record_corpus_format();
         Ok((FindingId(id), dir))
     }
+
+    /// Record the harness's input format in its corpus's metadata
+    /// (`corpus/<harness_id>/metadata.json`), so inputs kept from a harness
+    /// of another format are recognised. Best-effort: a corpus dir that cannot
+    /// be written never fails the finding.
+    fn record_corpus_format(&self) {
+        let Some(version) = self.metadata.harness_format_version else {
+            return;
+        };
+        let harness_id = self.metadata.harness_id.as_str();
+        if harness_id.is_empty()
+            || harness_id.contains(['/', '\\'])
+            || harness_id == "."
+            || harness_id == ".."
+        {
+            return;
+        }
+        let dir = self.root.join("corpus").join(harness_id);
+        let metadata = json!({
+            "schema_version": CORPUS_METADATA_SCHEMA,
+            "harness_id": harness_id,
+            "harness": {
+                "format_version": version,
+                "buffer_len_dimension": self.metadata.buffer_len_dimension,
+            },
+            "updated_at": now_rfc3339(),
+        });
+        if fs::create_dir_all(&dir).is_ok() {
+            if let Ok(bytes) = serde_json::to_vec_pretty(&metadata) {
+                let _ = fs::write(dir.join(CORPUS_METADATA_FILE), bytes);
+            }
+        }
+    }
+}
+
+/// The metadata file of a harness's corpus, `corpus/<harness_id>/metadata.json`.
+pub const CORPUS_METADATA_FILE: &str = "metadata.json";
+/// `schema_version` of the corpus metadata.
+pub const CORPUS_METADATA_SCHEMA: &str = "bhf.corpus-metadata.v1";
+
+/// A generated harness's input format: its version, and whether the explicit
+/// buffer-length dimension was on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HarnessFormat {
+    pub version: u32,
+    pub buffer_len_dimension: bool,
+}
+
+/// The input format a finding records: `harness.format_version` (and
+/// `harness.buffer_len_dimension`) first, else the top-level
+/// `harness_format_version` / `buffer_len_dimension` findings written before
+/// `harness` existed carry. `None` when the finding records none.
+pub fn finding_harness_format(record: &serde_json::Value) -> Option<HarnessFormat> {
+    let version = |value: Option<&serde_json::Value>| {
+        value
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|version| u32::try_from(version).ok())
+    };
+    if let Some(version) = version(record.pointer("/harness/format_version")) {
+        return Some(HarnessFormat {
+            version,
+            buffer_len_dimension: record
+                .pointer("/harness/buffer_len_dimension")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        });
+    }
+    Some(HarnessFormat {
+        version: version(record.get("harness_format_version"))?,
+        buffer_len_dimension: record
+            .get("buffer_len_dimension")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+/// The input format recorded for the corpus of `harness_id` under
+/// `work_dir` (`corpus/<harness_id>/metadata.json`), when one is.
+pub fn recorded_corpus_format(work_dir: &Path, harness_id: &str) -> Option<HarnessFormat> {
+    let bytes = fs::read(
+        work_dir
+            .join("corpus")
+            .join(harness_id)
+            .join(CORPUS_METADATA_FILE),
+    )
+    .ok()?;
+    let metadata: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    finding_harness_format(&metadata)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -947,6 +1036,12 @@ pub fn touch_last_seen(finding_dir: &std::path::Path, command: &str) -> std::io:
 /// there. No-op when `metadata` carries no build identity.
 fn merge_build_binary(record: &mut serde_json::Value, metadata: &FindingMetadata) {
     if let Some(version) = metadata.harness_format_version {
+        // `harness` is where readers look first; the top-level keys stay for
+        // readers that predate it.
+        record["harness"] = json!({
+            "format_version": version,
+            "buffer_len_dimension": metadata.buffer_len_dimension,
+        });
         record["harness_format_version"] = json!(version);
     }
     if metadata.buffer_len_dimension {
@@ -1057,6 +1152,10 @@ fn oracle_exception_name(name: &str) -> String {
 mod tests {
     use super::FindingEmitter;
     use super::{append_history, finding_kind, stamp_v1};
+    use super::{
+        finding_harness_format, recorded_corpus_format, HarnessFormat, CORPUS_METADATA_FILE,
+        CORPUS_METADATA_SCHEMA,
+    };
     use crate::compute_signature;
     use event_log::{HandlerEvent, Testcase};
     use std::fs;
@@ -1107,6 +1206,11 @@ mod tests {
         .unwrap();
         assert_eq!(record["harness_format_version"], 3);
         assert!(record.get("buffer_len_dimension").is_none());
+        assert_eq!(
+            record["harness"],
+            serde_json::json!({"format_version": 3, "buffer_len_dimension": false}),
+            "the format is also recorded under `harness`"
+        );
 
         let sized = FindingEmitter::new(root.clone())
             .with_harness_format_version(Some(3))
@@ -1122,6 +1226,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(record["buffer_len_dimension"], true);
+        assert_eq!(record["harness"]["buffer_len_dimension"], true);
 
         let unversioned = FindingEmitter::new(root.clone());
         let id = unversioned.emit(b"abd", &testcase(), 0).unwrap();
@@ -1135,6 +1240,73 @@ mod tests {
         )
         .unwrap();
         assert!(record.get("harness_format_version").is_none());
+        assert!(record.get("harness").is_none());
+    }
+
+    /// The corpus of the harness that found something records the harness's
+    /// input format, so inputs kept from another format are recognised.
+    #[test]
+    fn a_finding_records_the_harness_format_in_the_corpus_metadata() {
+        let root = temp_dir("corpus-format");
+        let emitter = FindingEmitter::with_metadata(
+            root.clone(),
+            "H-C0001".to_owned(),
+            "c".to_owned(),
+            "harnesses/H-C0001/main".to_owned(),
+        )
+        .with_harness_format_version(Some(3));
+        emitter.emit(b"abc", &testcase(), 0).unwrap();
+        let metadata: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.join("corpus/H-C0001").join(CORPUS_METADATA_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata["schema_version"], CORPUS_METADATA_SCHEMA);
+        assert_eq!(metadata["harness_id"], "H-C0001");
+        assert_eq!(metadata["harness"]["format_version"], 3);
+        assert_eq!(
+            recorded_corpus_format(&root, "H-C0001"),
+            Some(HarnessFormat {
+                version: 3,
+                buffer_len_dimension: false
+            })
+        );
+        // An emitter that knows no format leaves the corpus metadata alone.
+        let unknown = FindingEmitter::with_metadata(
+            root.clone(),
+            "H-C0002".to_owned(),
+            "c".to_owned(),
+            String::new(),
+        );
+        unknown.emit(b"abd", &testcase(), 0).unwrap();
+        assert!(!root
+            .join("corpus/H-C0002")
+            .join(CORPUS_METADATA_FILE)
+            .exists());
+        assert_eq!(recorded_corpus_format(&root, "H-C0002"), None);
+    }
+
+    #[test]
+    fn the_recorded_format_is_read_from_harness_first_then_the_legacy_key() {
+        let both = serde_json::json!({
+            "harness": {"format_version": 3, "buffer_len_dimension": true},
+            "harness_format_version": 2
+        });
+        assert_eq!(
+            finding_harness_format(&both),
+            Some(HarnessFormat {
+                version: 3,
+                buffer_len_dimension: true
+            })
+        );
+        let legacy = serde_json::json!({"harness_format_version": 2, "buffer_len_dimension": true});
+        assert_eq!(
+            finding_harness_format(&legacy),
+            Some(HarnessFormat {
+                version: 2,
+                buffer_len_dimension: true
+            })
+        );
+        assert_eq!(finding_harness_format(&serde_json::json!({})), None);
     }
 
     #[test]

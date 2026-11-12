@@ -8955,6 +8955,8 @@ mod auto_path_tests {
         // The harness's input format, its buffer-length dimension included.
         assert_eq!(finding["harness_format_version"], 3);
         assert_eq!(finding["buffer_len_dimension"], true);
+        assert_eq!(finding["harness"]["format_version"], 3);
+        assert_eq!(finding["harness"]["buffer_len_dimension"], true);
         // The sanitizer log is the crashing run's, not the trace run's.
         let log = fs::read_to_string(finding_dir.join("sanitizer.log")).unwrap();
         assert!(!log.contains("BHF_ARG"), "{log}");

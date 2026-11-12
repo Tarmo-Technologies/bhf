@@ -542,8 +542,14 @@ finding replayed against a harness generated with the other setting.
 a harness directory whose recorded format differs from the one it writes.
 `bhf replay` prints a note when the harness it replays against was generated
 with another format. Each new finding records the format of the harness that
-found it (`harness_format_version` in `finding.json`). `bhf replay`, `bhf
-minimize` and `bhf capsule` compare it with the harness they run, and when
+found it, as `harness.format_version` (and `harness.buffer_len_dimension`) in
+`finding.json`, with the older top-level `harness_format_version` kept for
+earlier readers, and writes the same to the harness's corpus metadata
+(`corpus/<id>/metadata.json`, `bhf.corpus-metadata.v1`); `bhf auto` notes when
+a corpus was recorded against another format than the harness it fuzzes.
+`bhf replay`, `bhf minimize`, `bhf decode-args` and `bhf capsule` read the
+finding's format from `harness` first, then the top-level key, then the
+harness dir's metadata. They compare it with the harness they run, and when
 they differ say so: replay as a `note` (also in `--json` `notes`), minimize
 on stderr, and capsule as a warning and as `harness_format_note` in the
 capsule's `manifest.json` (with `harness_format_version` and

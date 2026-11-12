@@ -410,7 +410,8 @@ fn cpp_finding_capsule_round_trips_through_verify_poc_offline() {
     let record_path = finding_dir.join("finding.json");
     let mut record: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
-    record["harness_format_version"] = serde_json::json!(2);
+    // Readers take the format from `harness` first.
+    record["harness"]["format_version"] = serde_json::json!(2);
     std::fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
     let packaged = capsule_for(&work, &id);
     let stderr = String::from_utf8_lossy(&packaged.stderr);

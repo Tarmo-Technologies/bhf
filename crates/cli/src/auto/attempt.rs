@@ -437,6 +437,41 @@ pub(crate) fn set_aside_legacy_corpus(
     Ok(LegacyCorpus::SetAside(dest))
 }
 
+/// A warning when the persisted corpus of `harness_id` was recorded against
+/// another harness input format than the harness in `harness_dir` decodes
+/// (`corpus/<id>/metadata.json`, written when that harness found something):
+/// its inputs decode into other argument values here. `None` when they
+/// agree or either is unrecorded.
+pub(crate) fn corpus_format_note(
+    work_dir: &std::path::Path,
+    harness_id: &str,
+    harness_dir: &std::path::Path,
+) -> Option<String> {
+    let corpus = corpus::finding::recorded_corpus_format(work_dir, harness_id)?;
+    let harness = crate::generate_harness::recorded_harness_format(harness_dir)?;
+    if corpus.version == harness.version
+        && corpus.buffer_len_dimension == harness.buffer_len_dimension
+    {
+        return None;
+    }
+    let with = |on: bool| {
+        if on {
+            " with the explicit buffer-length dimension"
+        } else {
+            ""
+        }
+    };
+    Some(format!(
+        "the corpus of {harness_id} was recorded against harness input format {}{}, and this \
+         harness decodes format {}{}: its inputs decode into other argument values here. They \
+         are still used as seeds; findings re-found now record the new format",
+        corpus.version,
+        with(corpus.buffer_len_dimension),
+        harness.version,
+        with(harness.buffer_len_dimension),
+    ))
+}
+
 /// Cap on inputs reseeded from the persisted corpus into a later pass (#383),
 /// so a long-running target's queue can't blow the seed set up unboundedly.
 pub(crate) const CORPUS_RESEED_CAP: usize = 256;
@@ -3206,6 +3241,11 @@ fn run_attempt(
                 // pass 1 is spliced in pass 2). Start fresh per target.
                 let cmplog_snapshot = harness_dir.join("cmplog.jsonl");
                 let _ = std::fs::remove_file(&cmplog_snapshot);
+                if let Some(note) =
+                    corpus_format_note(work_dir, &candidate.harness_id, &harness_dir)
+                {
+                    bhfeprintln!("bhf auto: note: {note}");
+                }
                 let mut pass_runs: Vec<PassRun> = Vec::new();
                 let mut events: Vec<crate::auto::runtrace::RuntraceEvent> = Vec::new();
                 let mut env_injected: Vec<(String, String)> = Vec::new();
@@ -10487,6 +10527,38 @@ mod throughput_tests {
         // No measurable wall must yield 0.0, never NaN/inf from a 0 divide.
         assert_eq!(aggregate_executions_per_sec(&[pass(0, 0.0)]), 0.0);
         assert_eq!(aggregate_executions_per_sec(&[]), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod corpus_format_tests {
+    use super::corpus_format_note;
+
+    #[test]
+    fn a_corpus_of_another_harness_format_is_noted() {
+        let work = tempfile::tempdir().unwrap();
+        let harness = work.path().join("harnesses/H-C0001");
+        std::fs::create_dir_all(&harness).unwrap();
+        std::fs::write(
+            harness.join("generation-metadata.json"),
+            r#"{"schema_version":1,"harness_format_version":3,"language":"c"}"#,
+        )
+        .unwrap();
+        assert_eq!(corpus_format_note(work.path(), "H-C0001", &harness), None);
+        let corpus = work.path().join("corpus/H-C0001");
+        std::fs::create_dir_all(&corpus).unwrap();
+        let metadata = |version: u32| {
+            format!(
+                r#"{{"schema_version":"bhf.corpus-metadata.v1","harness_id":"H-C0001",
+                    "harness":{{"format_version":{version},"buffer_len_dimension":false}}}}"#
+            )
+        };
+        std::fs::write(corpus.join("metadata.json"), metadata(3)).unwrap();
+        assert_eq!(corpus_format_note(work.path(), "H-C0001", &harness), None);
+        std::fs::write(corpus.join("metadata.json"), metadata(2)).unwrap();
+        let note = corpus_format_note(work.path(), "H-C0001", &harness).expect("noted");
+        assert!(note.contains("input format 2"), "{note}");
+        assert!(note.contains("decodes format 3"), "{note}");
     }
 }
 

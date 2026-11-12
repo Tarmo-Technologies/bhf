@@ -608,8 +608,8 @@ fn write_manifest(
     {
         manifest["harness_format_version"] = json!(version);
     }
-    if let Some(version) = f.raw.get("harness_format_version") {
-        manifest["finding_harness_format_version"] = version.clone();
+    if let Some(format) = corpus::finding::finding_harness_format(&f.raw) {
+        manifest["finding_harness_format_version"] = json!(format.version);
     }
     if let Some(note) = format_note {
         manifest["harness_format_note"] = json!(note);

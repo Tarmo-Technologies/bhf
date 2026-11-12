@@ -212,12 +212,18 @@ fn decode(args: &DecodeArgsArgs) -> Result<Report, String> {
         }
         None => None,
     };
-    if let (Some(layout), Some(recorded)) = (&layout, recorded_format(&inputs.finding)) {
-        if layout.harness_format_version != recorded {
+    // The finding's recorded format first, else the harness dir's.
+    if let (Some(layout), Some(recorded)) = (&layout, recorded_format(&inputs)) {
+        if layout.harness_format_version != recorded.version
+            || layout.buffer_len_dimension != recorded.buffer_len_dimension
+        {
             notes.push(format!(
-                "the finding was recorded with harness input format {recorded} and the layout \
-                 describes format {}: the same bytes decode to other values there",
-                layout.harness_format_version
+                "the finding was recorded with harness input format {}{} and the layout \
+                 describes format {}{}: the same bytes decode to other values there",
+                recorded.version,
+                dimension_text(recorded.buffer_len_dimension),
+                layout.harness_format_version,
+                dimension_text(layout.buffer_len_dimension),
             ));
         }
     }
@@ -301,12 +307,29 @@ fn decode(args: &DecodeArgsArgs) -> Result<Report, String> {
     Ok(report)
 }
 
-/// The harness input format the finding was recorded with.
-fn recorded_format(finding: &Value) -> Option<u32> {
-    finding
-        .get("harness_format_version")
-        .and_then(Value::as_u64)
-        .and_then(|version| u32::try_from(version).ok())
+/// The harness input format the testcase was recorded with: the finding's
+/// own record (`harness.format_version`, else its top-level key), else the
+/// format the harness dir's generation metadata records. A finding from a
+/// bhf that recorded no format at all predates format 3 when its C/C++
+/// harness is format 3 or later.
+fn recorded_format(inputs: &Inputs) -> Option<corpus::finding::HarnessFormat> {
+    if let Some(format) = corpus::finding::finding_harness_format(&inputs.finding) {
+        return Some(format);
+    }
+    let harness = crate::generate_harness::recorded_harness_format(inputs.layout_dir.as_deref()?)?;
+    let predates = inputs.finding_dir.is_some() && harness.version >= 3;
+    Some(corpus::finding::HarnessFormat {
+        version: if predates { 2 } else { harness.version },
+        buffer_len_dimension: !predates && harness.buffer_len_dimension,
+    })
+}
+
+fn dimension_text(on: bool) -> &'static str {
+    if on {
+        " with the explicit buffer-length dimension"
+    } else {
+        ""
+    }
 }
 
 /// Run the harness once on the testcase with its argument trace on.
@@ -544,7 +567,8 @@ mod tests {
         std::fs::write(finding.join("testcase.bin"), b"\x01\x00\x00\x00").unwrap();
         std::fs::write(
             finding.join("finding.json"),
-            r#"{"id":"F-0001-aa","harness_id":"H-1","harness_format_version":2}"#,
+            r#"{"id":"F-0001-aa","harness_id":"H-1","harness":{"format_version":2},
+                "harness_format_version":3}"#,
         )
         .unwrap();
         let harness = work.path().join("harnesses/H-1");

@@ -119,6 +119,14 @@ fn a_c_finding_records_its_decoded_arguments() {
     let hex: String = rest.iter().map(|byte| format!("{byte:02x}")).collect();
     assert_eq!(arg("data")["preview_hex"], hex);
     assert_eq!(record["harness_format_version"], 3, "{record:#}");
+    assert_eq!(record["harness"]["format_version"], 3, "{record:#}");
+    // The harness's corpus records the same format.
+    let harness_id = record["harness_id"].as_str().unwrap();
+    let corpus_metadata: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(work.join("corpus").join(harness_id).join("metadata.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(corpus_metadata["harness"]["format_version"], 3);
     assert_eq!(
         record["exception"]["access"]["parameter"]["name"], "data",
         "{record:#}"

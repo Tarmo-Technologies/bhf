@@ -55,6 +55,15 @@
         "shim_armed": { "type": "boolean" }
       }
     },
+    "harness": {
+      "description": "The input format of the generated harness that found it. Readers prefer it to the older top-level harness_format_version and buffer_len_dimension, which are still written.",
+      "type": "object",
+      "required": ["format_version"],
+      "properties": {
+        "format_version": { "type": "integer", "minimum": 1 },
+        "buffer_len_dimension": { "type": "boolean" }
+      }
+    },
     "history": {
       "type": "array",
       "items": {
