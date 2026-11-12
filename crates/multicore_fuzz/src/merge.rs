@@ -4,9 +4,15 @@
 //! parent `bhf fuzz` indexes what its workers found. A worker finding moves to
 //! a fresh parent id unless a finding of the same harness already there, or
 //! one met earlier in the merge, shares any of its
-//! [`corpus::finding::dedupe_keys`]; duplicates stay in the worker dir. A
-//! record with no key always moves. Symlinks under a worker dir are never
-//! followed or moved.
+//! [`corpus::finding::dedupe_keys`]; duplicates stay in the worker dir, marked
+//! with [`DUPLICATE_MARKER`]. A record with no key always moves. Symlinks under
+//! a worker dir are never followed or moved.
+//!
+//! A marked duplicate stays only while the parent holds a finding it
+//! duplicates. Once that finding is removed (triaged away, or `results/`
+//! wiped), the duplicate is dropped, by [`drop_orphaned_duplicates`] before
+//! the next campaign or by the next merge, rather than merged back: it came
+//! from an earlier campaign, possibly of a harness build that no longer exists.
 //!
 //! `finding.json` is the commit point, so neither a crash nor an I/O error
 //! leaves a half-moved finding the results loader would index:
@@ -42,6 +48,9 @@ const RECORD_TMP: &str = "finding.json.tmp";
 /// The history entry that marks a worker record's `id` as its parent id.
 const INTENT_COMMAND: &str = "fuzz";
 const INTENT_FIELDS: [&str; 1] = ["id"];
+/// File a merge leaves in a worker finding dir it found to duplicate a parent
+/// finding.
+pub const DUPLICATE_MARKER: &str = "merged-duplicate";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergeReport {
@@ -49,6 +58,10 @@ pub struct MergeReport {
     pub merged: Vec<String>,
     /// Worker findings the parent already held under another id.
     pub duplicates: usize,
+    /// Duplicates an earlier merge left in a worker dir whose parent finding
+    /// has since been removed; dropped, not merged back.
+    #[serde(default)]
+    pub dropped: usize,
     /// Worker finding dirs whose `finding.json` is not a readable record (bad
     /// JSON, too large, a symlink), left in place.
     pub unreadable: usize,
@@ -111,12 +124,7 @@ fn merge_with(
 ) -> Result<MergeReport, MulticoreError> {
     refuse_unsafe_parent(work_dir)?;
     let parent = corpus::layout::findings_dir(work_dir);
-    let mut seen = Seen::default();
-    for dir in real_subdirs(&parent, limits.entries)?.dirs {
-        if let Ok(Some(record)) = read_record(&dir, limits.record_bytes) {
-            seen.insert(Seen::keys(&record));
-        }
-    }
+    let mut seen = parent_keys(&parent, limits)?;
     let mut ids = FamilyAllocator::new(&parent, "F-")?;
     let mut report = MergeReport::default();
     for worker in worker_dirs {
@@ -150,6 +158,14 @@ fn merge_with(
             if resume.is_none() && seen.holds(&keys) {
                 seen.insert(keys);
                 report.duplicates += 1;
+                mark_duplicate(&source);
+                continue;
+            }
+            if resume.is_none() && is_marked_duplicate(&source) {
+                match std::fs::remove_dir_all(&source) {
+                    Ok(()) => report.dropped += 1,
+                    Err(error) => report.fail(format!("{}: {error}", source.display())),
+                }
                 continue;
             }
             match merge_one(&source, record, resume, &mut ids, &parent, fault) {
@@ -162,6 +178,61 @@ fn merge_with(
         }
     }
     Ok(report)
+}
+
+/// Remove from `worker_dirs` every marked duplicate whose parent finding is
+/// gone, before their workers start: a worker skips a crash its own results
+/// already hold, so a kept copy would also hide that crash from this campaign.
+/// Returns how many were removed. An unmarked finding (one whose merge failed)
+/// is never removed.
+pub(crate) fn drop_orphaned_duplicates(
+    work_dir: &Path,
+    worker_dirs: &[PathBuf],
+) -> Result<usize, MulticoreError> {
+    refuse_unsafe_parent(work_dir)?;
+    let seen = parent_keys(&corpus::layout::findings_dir(work_dir), LIMITS)?;
+    let mut dropped = 0;
+    for worker in worker_dirs {
+        for dir in worker_finding_dirs(worker, LIMITS.entries)?.dirs {
+            if !is_marked_duplicate(&dir) {
+                continue;
+            }
+            let Ok(Some(record)) = read_record(&dir, LIMITS.record_bytes) else {
+                continue;
+            };
+            if !seen.holds(&Seen::keys(&record)) {
+                std::fs::remove_dir_all(&dir)?;
+                dropped += 1;
+            }
+        }
+    }
+    Ok(dropped)
+}
+
+/// The dedupe keys of every finding already in the parent's findings dir.
+fn parent_keys(parent: &Path, limits: Limits) -> io::Result<Seen> {
+    let mut seen = Seen::default();
+    for dir in real_subdirs(parent, limits.entries)?.dirs {
+        if let Ok(Some(record)) = read_record(&dir, limits.record_bytes) {
+            seen.insert(Seen::keys(&record));
+        }
+    }
+    Ok(seen)
+}
+
+/// Mark a worker finding dir as a duplicate. Best effort, and never through an
+/// existing entry: `create_new` refuses a planted symlink instead of following it.
+fn mark_duplicate(dir: &Path) {
+    let _ = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dir.join(DUPLICATE_MARKER));
+}
+
+/// Whether an earlier merge marked `dir` as a duplicate (a regular file, not a
+/// symlink, named [`DUPLICATE_MARKER`]).
+fn is_marked_duplicate(dir: &Path) -> bool {
+    std::fs::symlink_metadata(dir.join(DUPLICATE_MARKER)).is_ok_and(|meta| meta.is_file())
 }
 
 /// Distinct crashes across `worker_dirs`, by the merge's rule: a finding
@@ -1230,5 +1301,105 @@ mod tests {
             "{:?}",
             report.errors
         );
+    }
+
+    /// Two workers that found the same crash: after one merge, the parent
+    /// holds worker 0's copy and worker 1's copy is a marked duplicate.
+    fn merged_pair(work: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let w0 = work.join("worker-H-0");
+        let w1 = work.join("worker-H-1");
+        put(
+            &corpus::layout::findings_dir(&w0),
+            "F-0000-aaaaaaaa",
+            &record("F-0000-aaaaaaaa", SIG_X, Some("X")),
+        );
+        let leftover = put(
+            &corpus::layout::findings_dir(&w1),
+            "F-0000-bbbbbbbb",
+            &record("F-0000-bbbbbbbb", SIG_X2, Some("X")),
+        );
+        let report = merge_worker_findings(work, &[w0.clone(), w1.clone()]).unwrap();
+        assert_eq!(report.merged, ["F-0000-aaaaaaaa"]);
+        assert_eq!(report.duplicates, 1);
+        assert!(leftover.join(DUPLICATE_MARKER).is_file(), "marked");
+        (w0, w1, leftover)
+    }
+
+    #[test]
+    fn a_duplicate_stays_while_the_parent_finding_it_duplicates_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path();
+        let (w0, w1, leftover) = merged_pair(work);
+        assert_eq!(
+            drop_orphaned_duplicates(work, &[w0.clone(), w1.clone()]).unwrap(),
+            0
+        );
+        let again = merge_worker_findings(work, &[w0, w1]).unwrap();
+        assert!(again.merged.is_empty());
+        assert_eq!((again.duplicates, again.dropped), (1, 0));
+        assert!(leftover.join("finding.json").is_file());
+    }
+
+    #[test]
+    fn a_duplicate_of_a_removed_parent_finding_is_dropped_not_merged_back() {
+        // The parent finding was removed (triaged away, or results/ wiped):
+        // the worker's duplicate of it must not bring it back.
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path();
+        let (w0, w1, leftover) = merged_pair(work);
+        std::fs::remove_dir_all(corpus::layout::results_dir(work)).unwrap();
+
+        let again = merge_worker_findings(work, &[w0, w1]).unwrap();
+        assert!(again.merged.is_empty(), "{again:?}");
+        assert_eq!(again.dropped, 1);
+        assert!(!leftover.exists());
+        assert!(
+            !corpus::layout::findings_dir(work).exists()
+                || names(&corpus::layout::findings_dir(work)).is_empty()
+        );
+    }
+
+    #[test]
+    fn orphaned_duplicates_are_dropped_before_a_campaign_and_others_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path();
+        let (w0, w1, leftover) = merged_pair(work);
+        // Not marked: a finding whose merge failed before it was reserved. The
+        // next merge must still pick it up.
+        let unmerged = put(
+            &corpus::layout::findings_dir(&w1),
+            "F-0001-cccccccc",
+            &record("F-0001-cccccccc", SIG_Y, Some("Y")),
+        );
+        std::fs::remove_dir_all(corpus::layout::finding_dir(work, "F-0000-aaaaaaaa")).unwrap();
+
+        assert_eq!(drop_orphaned_duplicates(work, &[w0, w1]).unwrap(), 1);
+        assert!(!leftover.exists());
+        assert!(unmerged.join("finding.json").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn marking_a_duplicate_never_writes_through_a_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path();
+        let w0 = work.join("worker-H-0");
+        let w1 = work.join("worker-H-1");
+        put(
+            &corpus::layout::findings_dir(&w0),
+            "F-0000-aaaaaaaa",
+            &record("F-0000-aaaaaaaa", SIG_X, Some("X")),
+        );
+        let planted = put(
+            &corpus::layout::findings_dir(&w1),
+            "F-0000-bbbbbbbb",
+            &record("F-0000-bbbbbbbb", SIG_X2, Some("X")),
+        );
+        let outside = work.join("outside");
+        std::os::unix::fs::symlink(&outside, planted.join(DUPLICATE_MARKER)).unwrap();
+        let report = merge_worker_findings(work, &[w0, w1]).unwrap();
+        assert_eq!(report.duplicates, 1);
+        assert!(!outside.exists(), "the link target is never created");
+        assert!(!is_marked_duplicate(&planted));
     }
 }

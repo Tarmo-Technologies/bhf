@@ -569,6 +569,12 @@ the latest run metadata in `bhf_work/fuzz_runs/<harness-id>-latest.json`.
 Fuzz run summaries and finding records include `sandbox` metadata so reports
 distinguish sandboxed and unsandboxed executions.
 
+A crash whose root cause is already recorded for the harness (a finding under
+`results/findings/` from an earlier run) is not recorded again. The summary
+lists those findings under `duplicates_of_existing`, counts the matching
+executions in `duplicate_crashes_of_existing`, and stderr gets a one-line note,
+so a run whose crashes were all known does not read as clean.
+
 `bhf fuzz` flags (libFuzzer-parity knobs and engine controls):
 
 - `--engine <builtin|afl++>` — engine to run. Default `builtin`.
@@ -583,7 +589,7 @@ distinguish sandboxed and unsandboxed executions.
 - `--deadline <DURATION>` — real-time response deadline, the **timing oracle** (off by default). Unlike `--timeout` (which discards a slow unit), any input whose wall-clock execution exceeds the deadline is recorded as a *finding* (BHF-555, a CWE-400 timing/availability failure). For watchdog / RTOS / radar targets where overrunning a budget is a fault, not just a hang. Whole-second spec (e.g. `1s`); use `BHF_DEADLINE_MS` for sub-second budgets. See [On-Target & Embedded](./on-target-fuzzing.md).
 - `--rss-limit-mb <MB>` — per-execution resident-memory ceiling for a C/C++ harness (libFuzzer `-rss_limit_mb`); an execution over budget is killed and reported as an OOM finding. `0` (default) disables it.
 - `--print-final-stats` — print a final-stats line (libFuzzer `-print_final_stats`): executions, exec/s, new vs duplicate corpus signatures, findings, elapsed time.
-- `--workers <N|auto>` — run multiple fuzz workers. When the campaign ends, their findings move into `<work-dir>/results/findings` under fresh ids, one per crash cluster; duplicates stay in the worker dirs.
+- `--workers <N|auto>` — run multiple fuzz workers. When the campaign ends, their findings move into `<work-dir>/results/findings` under fresh ids, one per crash cluster; duplicates stay in the worker dirs while the finding they duplicate is in `results/findings`. Once that finding is removed (or `results/` is wiped), the next campaign drops them instead of merging them back.
 - `--fork-server` / `--no-fork-server` — persistent framed execution is the default for the builtin engine. Native drivers and the Java, Python, Perl, Go, C#, JavaScript/TypeScript, Ruby, Lua, and PHP launchers each keep one target runtime alive and feed it inputs over the same protocol. Every finding is replay-validated in a fresh process so a global-state artifact never escapes (#416). `--no-fork-server` runs a fresh process per input — use it for a target that intentionally carries fuzz-relevant global state across calls.
 - `--cmplog-log <PATH>` — replay a runtrace audit log captured with `BHF_CMPLOG=1`; recovered cmplog operands seed both the mutator dictionary and an offset-aware RedQueen-style splice that replaces `operand_a` with `operand_b` at the offset it appears in the current input (#400).
 - `--sanitizers <asan,msan,ubsan,tsan,lsan|none>` — native C/C++ sanitizer campaign matrix; other lanes own their instrumentation.
@@ -594,6 +600,25 @@ distinguish sandboxed and unsandboxed executions.
 - `--session-reset <reconnect|none>` — how a session is reset between testcases: `reconnect` (default; a fresh connection gives fresh per-session target state, so a new handle/id/nonce is captured each run) or `none` (keep one connection). Recorded as the run's reset fidelity.
 - `--max-session-messages <N>` — bounded cap on messages per session (default `64`); a sequence mutation that would exceed it fails with a diagnostic rather than growing unbounded.
 - `--rng-seed <N>` — deterministic RNG seed for built-in mutation.
+
+Multi-worker campaigns (`--workers N` with N > 1, or `--sanitizers` with more
+than one sanitizer, one worker per sanitizer) resolve the harness executable in
+the parent, as a single run does. Each harness dir the lookup reads
+(`build/<id>/` and the `bhf auto` layouts `harnesses/<id>/`, `auto/<id>/`,
+`generated_harnesses/<id>/`) in each `worker-<id>-N/` dir is made an exact copy
+of the parent's: the worker's copy of a dir the parent does not have is removed,
+and a copy that differs from the parent's (a file added, missing, resized or
+rewritten) is copied again. A worker therefore runs the executable the parent
+resolved, never one left by an earlier campaign. Without a built harness the
+campaign exits `3` before starting any worker. Each worker's stderr goes to
+`worker-<id>-N/worker-stderr.log`; for a worker that did not complete, the
+summary's `per_worker[].stderr_tail` and stderr show its last lines, and
+`per_worker[].stopped_at_deadline` marks a worker stopped at the time limit.
+When every worker exits non-zero (or is killed by a signal), `bhf fuzz` exits
+non-zero (the workers' shared exit code, else `1`). Workers stopped at the time
+limit fuzzed until then: when they recorded findings, the campaign keeps its
+usual exit code and stderr says they were stopped; when none recorded anything,
+it exits `1`.
 
 `bhf fuzz --engine` accepts only `builtin` (the default) and `afl++`;
 `libfuzzer`, `libafl`, and `nyx` are **not** valid `--engine` values and clap

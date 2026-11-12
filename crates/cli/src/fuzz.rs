@@ -250,7 +250,10 @@ pub struct FuzzArgs {
     #[arg(long = "afl-inst-range", value_name = "RANGE")]
     pub afl_inst_ranges: Vec<String>,
 
-    /// Run multiple fuzz workers. Use a number or `auto`.
+    /// Run multiple fuzz workers. Use a number or `auto`. Each worker fuzzes an
+    /// exact copy of the harness dirs in `<work>/worker-<id>-N/` and logs its
+    /// stderr there; when every worker fails, the command exits non-zero and
+    /// prints each worker's stderr tail.
     #[arg(long, value_parser = parse_worker_count)]
     pub workers: Option<FuzzWorkerCount>,
 
@@ -876,6 +879,13 @@ pub(crate) struct FuzzRunSummary {
     pub(crate) sanitizers: SanitizerRunSummary,
     pub(crate) coverage: CoverageRunSummary,
     pub(crate) findings: Vec<String>,
+    /// Findings recorded for this harness before the run (sorted ids) that a
+    /// crash in this run matched, so the crash was not recorded again.
+    #[serde(default)]
+    pub(crate) duplicates_of_existing: Vec<String>,
+    /// How many crashing executions matched one of `duplicates_of_existing`.
+    #[serde(default)]
+    pub(crate) duplicate_crashes_of_existing: usize,
     /// #405: actual wall-clock seconds this run spent fuzzing — the engine's
     /// measured run time, NOT the requested budget (a run can finish early or
     /// lose time to setup). 0.0 only when no measurable time elapsed.
@@ -1223,6 +1233,9 @@ pub fn run(args: FuzzArgs) -> i32 {
                     return 1;
                 }
             }
+            if let Some(note) = duplicates_of_existing_note(&summary) {
+                bhfeprintln!("{note}");
+            }
             0
         }
         Err(error) => {
@@ -1230,6 +1243,25 @@ pub fn run(args: FuzzArgs) -> i32 {
             1
         }
     }
+}
+
+/// The stderr note for crashes that matched findings recorded before the run:
+/// they are left out of `findings`, and without a note the run reads as clean.
+fn duplicates_of_existing_note(summary: &FuzzRunSummary) -> Option<String> {
+    const SHOWN: usize = 10;
+    let ids = &summary.duplicates_of_existing;
+    if ids.is_empty() {
+        return None;
+    }
+    let mut listed = ids[..ids.len().min(SHOWN)].join(", ");
+    if ids.len() > SHOWN {
+        listed.push_str(&format!(" and {} more", ids.len() - SHOWN));
+    }
+    Some(format!(
+        "bhf fuzz: {} crashing input(s) matched finding(s) already recorded for {} ({listed}); \
+         they were not recorded again (see \"duplicates_of_existing\")",
+        summary.duplicate_crashes_of_existing, summary.harness_id
+    ))
 }
 
 /// Run the platform-neutral runtime-event collector (#60) for a `bhf fuzz`
@@ -1667,6 +1699,18 @@ fn multicore_requested(args: &FuzzArgs) -> bool {
 }
 
 fn run_multicore_campaign(mut args: FuzzArgs) -> i32 {
+    // Resolve the harness once, through the same layout lookup a single-worker
+    // run uses, and give every worker that layout. Without a harness there is
+    // nothing for the workers to run, so fail as the single-worker path does.
+    let harness_path = match find_harness_executable(&args.work_dir, &args.harness, args.engine) {
+        Ok(path) => path,
+        Err(error) => {
+            bhfeprintln!("{error}");
+            return 3;
+        }
+    };
+    let (harness_dirs, harness_executable) =
+        worker_harness_layout(&args.work_dir, &args.harness, &harness_path);
     if let Err(error) = materialize_seed_bytes(&mut args) {
         bhfeprintln!("{error}");
         return 1;
@@ -1707,6 +1751,8 @@ fn run_multicore_campaign(mut args: FuzzArgs) -> i32 {
         per_worker_env: multicore_fuzz::sanitizer_envs(sanitizers.runtime_set()),
         extra_worker_args: worker_passthrough_args(&args),
         kill_grace: None,
+        harness_dirs,
+        harness_executable,
     };
 
     match multicore_fuzz::run_multicore(&config) {
@@ -1718,7 +1764,51 @@ fn run_multicore_campaign(mut args: FuzzArgs) -> i32 {
                     return 1;
                 }
             }
-            merge_worker_findings(&config.work_dir, &summary)
+            report_failed_workers(&summary);
+            let merged = merge_worker_findings(&config.work_dir, &summary);
+            if summary.dropped_duplicates > 0 {
+                bhfeprintln!(
+                    "bhf fuzz: dropped {} duplicate(s) earlier campaigns left in worker dirs; \
+                     the findings they duplicated are no longer in {}",
+                    summary.dropped_duplicates,
+                    corpus::layout::findings_dir(&config.work_dir).display()
+                );
+            }
+            let Some(outcome) = no_worker_completed(&summary) else {
+                return merged;
+            };
+            let started = summary.workers_started;
+            let log = multicore_fuzz::WORKER_STDERR_LOG;
+            match outcome {
+                NoWorkerCompleted::Stopped { stopped, recorded } if recorded > 0 => {
+                    bhfeprintln!(
+                        "warning: no worker finished on its own; {stopped} of {started} were \
+                         stopped at the time limit, and the {recorded} finding(s) recorded until \
+                         then were merged"
+                    );
+                }
+                NoWorkerCompleted::Stopped { stopped, .. } => {
+                    bhfeprintln!(
+                        "error: no worker finished: {stopped} of {started} were stopped at the \
+                         time limit and none recorded a finding; each worker's full stderr is \
+                         in its {log}"
+                    );
+                }
+                NoWorkerCompleted::Failed { recorded: 0, .. } => {
+                    bhfeprintln!(
+                        "error: none of the {started} worker(s) completed, so this campaign \
+                         fuzzed nothing; each worker's full stderr is in its {log}"
+                    );
+                }
+                NoWorkerCompleted::Failed { recorded, .. } => {
+                    bhfeprintln!(
+                        "error: none of the {started} worker(s) completed; the {recorded} \
+                         finding(s) they recorded before failing were merged; each worker's \
+                         full stderr is in its {log}"
+                    );
+                }
+            }
+            incomplete_campaign_exit(outcome, merged)
         }
         Err(error) => {
             bhfeprintln!("{error}");
@@ -1729,6 +1819,124 @@ fn run_multicore_campaign(mut args: FuzzArgs) -> i32 {
                 _ => 1,
             }
         }
+    }
+}
+
+/// The harness layout to mirror into each worker tree: every work-dir-relative
+/// harness dir a worker's lookup reads (`build/<id>` and the `bhf auto` layouts
+/// under `harnesses/`, `auto/` and `generated_harnesses/`), whether or not the
+/// parent has it, so a worker's copy of one the parent lacks is removed; plus
+/// the executable the parent resolved, relative to the work dir.
+fn worker_harness_layout(
+    work_dir: &Path,
+    harness_id: &str,
+    executable: &Path,
+) -> (Vec<PathBuf>, Option<PathBuf>) {
+    let mut candidates = vec![work_dir.join("build").join(harness_id)];
+    candidates.extend(crate::auto::layout::harness_dir_candidates(
+        work_dir, harness_id,
+    ));
+    let dirs = candidates
+        .iter()
+        .filter_map(|dir| dir.strip_prefix(work_dir).ok().map(Path::to_path_buf))
+        .collect();
+    let executable = executable
+        .strip_prefix(work_dir)
+        .ok()
+        .map(Path::to_path_buf);
+    (dirs, executable)
+}
+
+/// Name each worker that did not complete, with the tail of its stderr: the
+/// summary alone only shows an exit code.
+fn report_failed_workers(summary: &multicore_fuzz::MulticoreSummary) {
+    for worker in summary
+        .per_worker
+        .iter()
+        .filter(|worker| !worker.completed())
+    {
+        let how = match worker.exit_code {
+            Some(code) => format!("exited {code}"),
+            None if worker.stopped_at_deadline => "was stopped at the time limit".to_owned(),
+            None => "was killed by a signal".to_owned(),
+        };
+        match &worker.stderr_tail {
+            Some(tail) => {
+                bhfeprintln!(
+                    "bhf fuzz: worker {} {how} ({}); last stderr lines:",
+                    worker.worker_id,
+                    worker.work_dir.display()
+                );
+                for line in tail.lines() {
+                    bhfeprintln!("  | {line}");
+                }
+            }
+            None => bhfeprintln!(
+                "bhf fuzz: worker {} {how} ({}) with no stderr output",
+                worker.worker_id,
+                worker.work_dir.display()
+            ),
+        }
+    }
+}
+
+/// How a campaign in which no worker completed ended. `recorded` counts the
+/// findings the workers recorded during this campaign.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoWorkerCompleted {
+    /// Every worker exited non-zero or was killed by a signal. `exit_code` is
+    /// the workers' shared exit code when they agree (3, for instance, when none
+    /// found its harness), else 1.
+    Failed { exit_code: i32, recorded: usize },
+    /// `stopped` workers were still running at the time limit and were stopped;
+    /// they fuzzed until then.
+    Stopped { stopped: usize, recorded: usize },
+}
+
+/// `None` when at least one worker completed (or none started).
+fn no_worker_completed(summary: &multicore_fuzz::MulticoreSummary) -> Option<NoWorkerCompleted> {
+    if summary.workers_started == 0 || summary.workers_completed > 0 {
+        return None;
+    }
+    let recorded = summary
+        .per_worker
+        .iter()
+        .map(|worker| worker.new_findings)
+        .sum();
+    let stopped = summary
+        .per_worker
+        .iter()
+        .filter(|worker| worker.stopped_at_deadline)
+        .count();
+    if stopped > 0 {
+        return Some(NoWorkerCompleted::Stopped { stopped, recorded });
+    }
+    let first = summary
+        .per_worker
+        .first()
+        .and_then(|worker| worker.exit_code);
+    let shared = first.filter(|&code| {
+        code != 0
+            && summary
+                .per_worker
+                .iter()
+                .all(|worker| worker.exit_code == Some(code))
+    });
+    Some(NoWorkerCompleted::Failed {
+        exit_code: shared.unwrap_or(1),
+        recorded,
+    })
+}
+
+/// The exit code of a campaign in which no worker completed. Workers stopped
+/// at the time limit after recording findings fuzzed: that campaign keeps the
+/// merge's exit code. Stopped workers that recorded nothing exit 1, and failed
+/// workers exit with their shared code.
+fn incomplete_campaign_exit(outcome: NoWorkerCompleted, merged: i32) -> i32 {
+    match outcome {
+        NoWorkerCompleted::Stopped { recorded, .. } if recorded > 0 => merged,
+        NoWorkerCompleted::Stopped { .. } => 1,
+        NoWorkerCompleted::Failed { exit_code, .. } => exit_code,
     }
 }
 
@@ -1748,6 +1956,13 @@ fn merge_worker_findings(work_dir: &Path, summary: &multicore_fuzz::MulticoreSum
                     merge.merged.len(),
                     corpus::layout::findings_dir(work_dir).display(),
                     merge.duplicates
+                );
+            }
+            if merge.dropped > 0 {
+                bhfeprintln!(
+                    "bhf fuzz: dropped {} worker duplicate(s) of findings no longer in {}",
+                    merge.dropped,
+                    corpus::layout::findings_dir(work_dir).display()
                 );
             }
             if merge.unreadable > 0 {
@@ -2875,15 +3090,18 @@ fn run_builtin_with_progress(
     // #35: pre-seed the within-pass dedup sets from findings already on disk so the
     // NEXT cascade pass (Empty/Rng/FuzzDriven) over the SAME harness does not
     // re-emit a byte-identical finding it already wrote (~2-3x inflation otherwise).
-    let (seed_clusters, seed_oracles) =
-        existing_finding_dedup_keys(&prepared.work_dir, &prepared.harness_id);
-    let mut seen_oracle_hits = HashSet::<String>::from_iter(seed_oracles);
+    let existing_findings = ExistingFindings::load(&prepared.work_dir, &prepared.harness_id);
+    let mut seen_oracle_hits =
+        HashSet::<String>::from_iter(existing_findings.oracles.keys().cloned());
     // Sanitizer-crash cluster key -> hit count, for dedup (#389): one finding
     // per root cause, not one per crashing input.
     let mut seen_sanitizer_clusters = HashMap::<String, usize>::new();
-    for key in seed_clusters {
-        seen_sanitizer_clusters.insert(key, 1);
+    for key in existing_findings.clusters.keys() {
+        seen_sanitizer_clusters.insert(key.clone(), 1);
     }
+    // A crash dropped because it matches one of those findings is counted
+    // here (finding id -> crashing executions) and reported, never silent.
+    let mut duplicates_of_existing = std::collections::BTreeMap::<String, usize>::new();
     // Replay-verify + driver-glue filtering only apply to passthrough C/C++
     // libFuzzer harnesses (the class that crashes in driver glue); the Ada
     // event-log lane validates findings separately via per-spawn replay.
@@ -3333,6 +3551,11 @@ fn run_builtin_with_progress(
                         .emit(&input, testcase, handler_index)
                         .map_err(|error| format!("emit finding: {error}"))?;
                     finding_ids.push(id.0);
+                } else {
+                    note_duplicate_of_existing(
+                        &mut duplicates_of_existing,
+                        existing_findings.signatures.get(&signature.hex()),
+                    );
                 }
             }
         }
@@ -3378,6 +3601,13 @@ fn run_builtin_with_progress(
                 } else {
                     non_reproducible += 1;
                 }
+            } else {
+                note_duplicate_of_existing(
+                    &mut duplicates_of_existing,
+                    existing_findings
+                        .clusters
+                        .get(&sanitizer_cluster_dedupe_key(report)),
+                );
             }
         }
 
@@ -3386,7 +3616,11 @@ fn run_builtin_with_progress(
             interpreted_lane,
         ) {
             let key = oracle_hit_dedupe_key(&hit);
-            if !seen_oracle_hits.insert(key) {
+            if !seen_oracle_hits.insert(key.clone()) {
+                note_duplicate_of_existing(
+                    &mut duplicates_of_existing,
+                    existing_findings.oracles.get(&key),
+                );
                 continue;
             }
             let id = emitter
@@ -3482,7 +3716,12 @@ fn run_builtin_with_progress(
         let Some(hit) = crate::auto::runtrace::confirmed_sink_hit(&confirmed) else {
             continue;
         };
-        if !seen_oracle_hits.insert(oracle_hit_dedupe_key(&hit)) {
+        let key = oracle_hit_dedupe_key(&hit);
+        if !seen_oracle_hits.insert(key.clone()) {
+            note_duplicate_of_existing(
+                &mut duplicates_of_existing,
+                existing_findings.oracles.get(&key),
+            );
             continue;
         }
         let id = emitter
@@ -3617,6 +3856,8 @@ fn run_builtin_with_progress(
         sanitizers: sanitizer_summary(&prepared.sanitizers, &prepared.sanitizer_env, false),
         coverage: coverage_from_env(&prepared.extra_env),
         findings: finding_ids,
+        duplicate_crashes_of_existing: duplicates_of_existing.values().sum(),
+        duplicates_of_existing: duplicates_of_existing.into_keys().collect(),
         elapsed_secs,
         executions_per_sec: executions_per_sec(executions, elapsed_secs),
         afl: None,
@@ -3701,12 +3942,7 @@ fn first_of_sanitizer_cluster(
     report: &corpus::SanitizerReport,
 ) -> bool {
     let limit = max_finding_dedup_keys();
-    let cluster = corpus::cluster::cluster_for_sanitizer(report);
-    let key = if cluster.fallback {
-        format!("rule:{}", report.rule_id)
-    } else {
-        cluster.full
-    };
+    let key = sanitizer_cluster_dedupe_key(report);
     if let Some(count) = seen.get_mut(&key) {
         *count = count.saturating_add(1);
         return false;
@@ -3724,6 +3960,28 @@ fn first_of_sanitizer_cluster(
     }
     seen.insert(key, 1);
     true
+}
+
+/// The key a sanitizer crash dedupes on: its full cluster key, or `rule:<id>`
+/// when clustering fell back.
+fn sanitizer_cluster_dedupe_key(report: &corpus::SanitizerReport) -> String {
+    let cluster = corpus::cluster::cluster_for_sanitizer(report);
+    if cluster.fallback {
+        format!("rule:{}", report.rule_id)
+    } else {
+        cluster.full
+    }
+}
+
+/// Count one crash that matched an existing finding (`None`: the match was a
+/// finding emitted earlier in this same run, which is not reported).
+fn note_duplicate_of_existing(
+    duplicates: &mut std::collections::BTreeMap<String, usize>,
+    existing_id: Option<&String>,
+) {
+    if let Some(id) = existing_id {
+        *duplicates.entry(id.clone()).or_default() += 1;
+    }
 }
 
 fn oracle_hit_dedupe_key(hit: &finding_rules::oracle_sdk::OracleHit) -> String {
@@ -4203,6 +4461,8 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
         sanitizers: sanitizer_summary(&prepared.sanitizers, &prepared.sanitizer_env, false),
         coverage: coverage_from_env(&prepared.extra_env),
         findings: finding_ids,
+        duplicates_of_existing: Vec::new(),
+        duplicate_crashes_of_existing: 0,
         elapsed_secs,
         // AFL++ owns its own loop; its real per-second throughput comes from
         // `out/default/fuzzer_stats` (`execs_per_sec`). 0.0 only when afl-fuzz
@@ -5531,44 +5791,89 @@ fn crash_testcase_key(path: &Path, max_len: usize) -> Option<u64> {
 /// later cascade pass (Empty/Rng/FuzzDriven) over the SAME harness does not
 /// re-emit a finding it already produced (#35: the cascade otherwise wrote the
 /// same root cause once per pass, inflating findings.csv / the findings dir /
-/// summary counts ~2-3x). Returns `(sanitizer-cluster keys, oracle-hit keys)`
+/// summary counts ~2-3x). Holds the sanitizer-cluster and oracle-hit keys,
 /// reconstructed to match the runtime keys `first_of_sanitizer_cluster` /
-/// `oracle_hit_dedupe_key` compute. Mirrors `existing_crash_testcases`.
-fn existing_finding_dedup_keys(work_dir: &Path, harness_id: &str) -> (Vec<String>, Vec<String>) {
-    let finding_record_limit = max_finding_record_bytes();
-    let dedup_limit = max_finding_dedup_keys();
-    let mut clusters = Vec::new();
-    let mut oracles = Vec::new();
-    let Ok(entries) = fs::read_dir(corpus::layout::findings_dir(work_dir)) else {
-        return (clusters, oracles);
-    };
-    for entry in entries.flatten() {
-        if clusters.len().saturating_add(oracles.len()) >= dedup_limit {
-            break;
-        }
-        let finding_path = entry.path().join("finding.json");
-        if fs::metadata(&finding_path).is_ok_and(|metadata| metadata.len() > finding_record_limit) {
-            continue;
-        }
-        let Ok(bytes) = fs::read(finding_path) else {
-            continue;
+/// `oracle_hit_dedupe_key` compute, and each finding's event signature, all
+/// mapped to the finding id, so a crash dropped as one of them is reported as a
+/// duplicate of that finding. Mirrors `existing_crash_testcases`.
+#[derive(Debug, Default)]
+struct ExistingFindings {
+    /// Sanitizer-crash dedupe key -> finding id.
+    clusters: HashMap<String, String>,
+    /// Oracle-hit dedupe key -> finding id.
+    oracles: HashMap<String, String>,
+    /// Event signature (hex) -> finding id, for the event-log lane.
+    signatures: HashMap<String, String>,
+}
+
+impl ExistingFindings {
+    fn load(work_dir: &Path, harness_id: &str) -> Self {
+        let finding_record_limit = max_finding_record_bytes();
+        let dedup_limit = max_finding_dedup_keys();
+        let mut existing = Self::default();
+        let Ok(entries) = fs::read_dir(corpus::layout::findings_dir(work_dir)) else {
+            return existing;
         };
-        let Ok(record) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-            continue;
-        };
-        if record.get("harness_id").and_then(|value| value.as_str()) != Some(harness_id) {
-            continue;
+        for entry in entries.flatten() {
+            if existing
+                .clusters
+                .len()
+                .saturating_add(existing.oracles.len())
+                >= dedup_limit
+                || existing.signatures.len() >= dedup_limit
+            {
+                break;
+            }
+            let finding_path = entry.path().join("finding.json");
+            if fs::metadata(&finding_path)
+                .is_ok_and(|metadata| metadata.len() > finding_record_limit)
+            {
+                continue;
+            }
+            let Ok(bytes) = fs::read(finding_path) else {
+                continue;
+            };
+            let Ok(record) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                continue;
+            };
+            if record.get("harness_id").and_then(|value| value.as_str()) != Some(harness_id) {
+                continue;
+            }
+            let id = record
+                .get("id")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+                .unwrap_or_else(|| entry.file_name().to_string_lossy().into_owned());
+            if let Some(signature) = record.get("signature").and_then(|value| value.as_str()) {
+                keep_lowest_id(&mut existing.signatures, signature.to_owned(), &id);
+            }
+            // Oracle hits key on rule_id|oracle_name|api (oracle_hit_dedupe_key),
+            // sanitizer crashes on cluster_key_full or rule:<id> on fallback
+            // (first_of_sanitizer_cluster).
+            match corpus::finding::run_dedupe_key(&record) {
+                Some(corpus::finding::RunDedupeKey::Oracle(key)) => {
+                    keep_lowest_id(&mut existing.oracles, key, &id);
+                }
+                Some(corpus::finding::RunDedupeKey::Cluster(key)) => {
+                    keep_lowest_id(&mut existing.clusters, key, &id);
+                }
+                None => {}
+            }
         }
-        // Oracle hits key on rule_id|oracle_name|api (oracle_hit_dedupe_key),
-        // sanitizer crashes on cluster_key_full or rule:<id> on fallback
-        // (first_of_sanitizer_cluster).
-        match corpus::finding::run_dedupe_key(&record) {
-            Some(corpus::finding::RunDedupeKey::Oracle(key)) => oracles.push(key),
-            Some(corpus::finding::RunDedupeKey::Cluster(key)) => clusters.push(key),
-            None => {}
-        }
+        existing
     }
-    (clusters, oracles)
+}
+
+/// Map `key` to the lowest finding id that carries it, so the reported
+/// duplicate does not depend on directory order.
+fn keep_lowest_id(map: &mut HashMap<String, String>, key: String, id: &str) {
+    map.entry(key)
+        .and_modify(|current| {
+            if id < current.as_str() {
+                id.clone_into(current);
+            }
+        })
+        .or_insert_with(|| id.to_owned());
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6615,7 +6920,7 @@ mod engine_list_tests {
 
 #[cfg(test)]
 mod dedup_seed_tests {
-    use super::existing_finding_dedup_keys;
+    use super::ExistingFindings;
 
     #[test]
     fn seeds_sanitizer_cluster_and_oracle_keys_from_findings_dir() {
@@ -6667,17 +6972,61 @@ mod dedup_seed_tests {
         )
         .unwrap();
 
-        let (clusters, oracles) = existing_finding_dedup_keys(work.path(), "H-TEST");
-        assert!(clusters.contains(&"deadbeef".to_owned()));
-        assert!(clusters.contains(&"rule:BHF-210".to_owned()));
-        assert!(oracles.contains(&"BHF-405|path-traversal|open".to_owned()));
+        let existing = ExistingFindings::load(work.path(), "H-TEST");
+        assert_eq!(
+            existing.clusters.get("deadbeef").map(String::as_str),
+            Some("F-0001-aaaa")
+        );
+        assert_eq!(
+            existing.clusters.get("rule:BHF-210").map(String::as_str),
+            Some("F-0002-bbbb")
+        );
+        assert_eq!(
+            existing
+                .oracles
+                .get("BHF-405|path-traversal|open")
+                .map(String::as_str),
+            Some("F-0003-cccc")
+        );
+    }
+
+    #[test]
+    fn a_key_shared_by_several_findings_maps_to_the_lowest_id() {
+        let work = tempfile::tempdir().unwrap();
+        let findings = work.path().join("results").join("findings");
+        for id in ["F-0007-ffff", "F-0002-eeee", "F-0009-dddd"] {
+            let dir = findings.join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("finding.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "id": id,
+                    "harness_id": "H-TEST",
+                    "rule_id": "BHF-201",
+                    "cluster_key_full": "c0ffee",
+                    "signature": "5151",
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        let existing = ExistingFindings::load(work.path(), "H-TEST");
+        assert_eq!(
+            existing.clusters.get("c0ffee").map(String::as_str),
+            Some("F-0002-eeee")
+        );
+        assert_eq!(
+            existing.signatures.get("5151").map(String::as_str),
+            Some("F-0002-eeee")
+        );
     }
 
     #[test]
     fn missing_findings_dir_yields_empty_seeds() {
         let work = tempfile::tempdir().unwrap();
-        let (clusters, oracles) = existing_finding_dedup_keys(work.path(), "H-TEST");
-        assert!(clusters.is_empty() && oracles.is_empty());
+        let existing = ExistingFindings::load(work.path(), "H-TEST");
+        assert!(existing.clusters.is_empty() && existing.oracles.is_empty());
+        assert!(existing.signatures.is_empty());
     }
 }
 
@@ -8154,6 +8503,113 @@ mod auto_path_tests {
     }
 
     #[test]
+    fn workers_mirror_every_harness_layout_dir_the_lookup_reads() {
+        // Dirs the parent lacks are listed too: the mirror removes a worker's
+        // copy of them, so it cannot outrank the harness the parent resolved.
+        let work = tmpdir();
+        fs::create_dir_all(work.join("harnesses/H-L")).unwrap();
+        let (dirs, executable) =
+            worker_harness_layout(&work, "H-L", &work.join("harnesses/H-L/main"));
+        assert_eq!(
+            dirs,
+            vec![
+                PathBuf::from("build/H-L"),
+                PathBuf::from("harnesses/H-L"),
+                PathBuf::from("auto/H-L"),
+                PathBuf::from("generated_harnesses/H-L")
+            ]
+        );
+        assert_eq!(executable, Some(PathBuf::from("harnesses/H-L/main")));
+    }
+
+    #[test]
+    fn a_campaign_fails_only_when_its_workers_failed_or_brought_nothing_back() {
+        let worker = |worker_id: u32, exit_code: Option<i32>| multicore_fuzz::WorkerReport {
+            worker_id,
+            exit_code,
+            ..multicore_fuzz::WorkerReport::default()
+        };
+        let stopped = |worker_id: u32, new_findings: usize| multicore_fuzz::WorkerReport {
+            stopped_at_deadline: true,
+            new_findings,
+            ..worker(worker_id, None)
+        };
+        let summary =
+            |per_worker: Vec<multicore_fuzz::WorkerReport>| multicore_fuzz::MulticoreSummary {
+                harness_id: "H".to_owned(),
+                workers_started: per_worker.len() as u32,
+                workers_completed: per_worker.iter().filter(|w| w.completed()).count() as u32,
+                total_findings: 0,
+                unique_findings: 0,
+                campaign_dir: PathBuf::new(),
+                sync_manifest_path: PathBuf::new(),
+                sync: multicore_fuzz::CorpusSyncReport {
+                    shared_queue: PathBuf::new(),
+                    seed_inputs_loaded: 0,
+                    imported_inputs: 0,
+                    duplicate_inputs: 0,
+                },
+                per_worker,
+                dropped_duplicates: 0,
+            };
+        let exit = |per_worker| no_worker_completed(&summary(per_worker));
+        // Every worker failed the same way: keep its exit code.
+        let failed = exit(vec![worker(0, Some(3)), worker(1, Some(3))]).unwrap();
+        assert_eq!(
+            failed,
+            NoWorkerCompleted::Failed {
+                exit_code: 3,
+                recorded: 0
+            }
+        );
+        assert_eq!(incomplete_campaign_exit(failed, 0), 3);
+        // Mixed failures, or a worker killed by a signal: 1.
+        for per_worker in [
+            vec![worker(0, Some(3)), worker(1, Some(2))],
+            vec![worker(0, Some(3)), worker(1, None)],
+        ] {
+            let outcome = exit(per_worker).unwrap();
+            assert_eq!(incomplete_campaign_exit(outcome, 0), 1, "{outcome:?}");
+        }
+        // Workers failing after they recorded something still fail.
+        let late = multicore_fuzz::WorkerReport {
+            new_findings: 1,
+            ..worker(1, Some(4))
+        };
+        let outcome = exit(vec![worker(0, Some(4)), late]).unwrap();
+        assert_eq!(
+            outcome,
+            NoWorkerCompleted::Failed {
+                exit_code: 4,
+                recorded: 1
+            }
+        );
+        // Stopped at the time limit after recording findings: the campaign
+        // fuzzed and keeps the merge's code.
+        let outcome = exit(vec![stopped(0, 1), stopped(1, 0)]).unwrap();
+        assert_eq!(
+            outcome,
+            NoWorkerCompleted::Stopped {
+                stopped: 2,
+                recorded: 1
+            }
+        );
+        assert_eq!(incomplete_campaign_exit(outcome, 0), 0);
+        // Stopped, and nothing came back.
+        let outcome = exit(vec![worker(0, Some(3)), stopped(1, 0)]).unwrap();
+        assert_eq!(
+            outcome,
+            NoWorkerCompleted::Stopped {
+                stopped: 1,
+                recorded: 0
+            }
+        );
+        assert_eq!(incomplete_campaign_exit(outcome, 0), 1);
+        // One completed worker is a campaign that ran.
+        assert_eq!(exit(vec![worker(0, Some(3)), worker(1, Some(0))]), None);
+    }
+
+    #[test]
     fn worker_passthrough_includes_len_control() {
         let mut args = fuzz_args_for_worker_passthrough(StructuredInputMode::Auto);
         args.len_control = 7;
@@ -8440,6 +8896,117 @@ mod auto_path_tests {
             fs::read(finding_dir.join("testcase.bin")).unwrap(),
             b"../secret"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_crash_matching_a_recorded_sanitizer_finding_is_reported_not_dropped() {
+        let root = tmpdir();
+        let work_dir = root.join("bhf_work");
+        write_c_libfuzzer_harness(
+            &work_dir,
+            "H-DUP",
+            "#!/bin/sh\n\
+             if [ \"$(head -c1 \"$1\")\" = A ]; then\n\
+               >&2 echo 'ERROR: AddressSanitizer: heap-buffer-overflow on address 0x501 at pc 0x111'\n\
+               >&2 echo '    #0 0x111 in parse_record /src/record.c:10'\n\
+               >&2 echo '    #1 0x112 in LLVMFuzzerTestOneInput /src/h.c:20'\n\
+               exit 1\n\
+             fi\n\
+             exit 0\n",
+        );
+        let run = || {
+            run_one_target_programmatic(
+                &work_dir,
+                "H-DUP",
+                vec![b"A".to_vec(), b"AB".to_vec()],
+                2,
+                None,
+                None,
+                0,
+                &[],
+                actionability::RunMode::Reporting,
+                None,
+                &[],
+                None,
+            )
+            .unwrap()
+        };
+        let first = run();
+        assert_eq!(first.findings.len(), 1, "{:?}", first.findings);
+        assert!(first.duplicates_of_existing.is_empty());
+
+        let second = run();
+        assert!(second.findings.is_empty(), "{:?}", second.findings);
+        assert_eq!(second.duplicates_of_existing, first.findings);
+        assert!(second.duplicate_crashes_of_existing >= 2);
+        let note = duplicates_of_existing_note(&second).expect("a note");
+        assert!(note.contains(&first.findings[0]), "{note}");
+        assert!(note.contains("H-DUP"), "{note}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_oracle_hit_matching_a_recorded_finding_is_reported_not_dropped() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tmpdir();
+        let work_dir = root.join("bhf_work");
+        let harness_dir = work_dir.join("build").join("H-ODUP");
+        fs::create_dir_all(&harness_dir).unwrap();
+        let harness = harness_dir.join("main");
+        fs::write(
+            &harness,
+            "#!/bin/sh\n\
+             input=$(cat)\n\
+             if [ -n \"$BHF_RUNTRACE_LOG\" ]; then\n\
+               printf '{\"e\":\"open\",\"p\":\"%s\",\"r\":-1,\"n\":2}\\n' \"$input\" >> \"$BHF_RUNTRACE_LOG\"\n\
+             fi\n\
+             exit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&harness, fs::Permissions::from_mode(0o755)).unwrap();
+        let runtrace_log = root.join("runtrace.jsonl");
+        let run = || {
+            fs::write(&runtrace_log, "").unwrap();
+            run_one_target_programmatic(
+                &work_dir,
+                "H-ODUP",
+                vec![b"../secret".to_vec()],
+                1,
+                None,
+                None,
+                0,
+                &[(
+                    "BHF_RUNTRACE_LOG".to_owned(),
+                    runtrace_log.display().to_string(),
+                )],
+                actionability::RunMode::Reporting,
+                None,
+                &[],
+                None,
+            )
+            .unwrap()
+        };
+        // A starved shell subprocess can miss its event (see
+        // builtin_fuzz_emits_oracle_finding_from_runtrace_event); retry that case.
+        let mut first = run();
+        for _ in 0..15 {
+            if !first.findings.is_empty() {
+                break;
+            }
+            first = run();
+        }
+        assert_eq!(first.findings.len(), 1, "{:?}", first.findings);
+        let mut second = run();
+        for _ in 0..15 {
+            if !second.duplicates_of_existing.is_empty() {
+                break;
+            }
+            second = run();
+        }
+        assert!(second.findings.is_empty(), "{:?}", second.findings);
+        assert_eq!(second.duplicates_of_existing, first.findings);
     }
 
     #[cfg(unix)]

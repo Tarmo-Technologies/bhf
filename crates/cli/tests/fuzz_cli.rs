@@ -186,7 +186,8 @@ fn fuzz_multicore_cli_writes_campaign_summary() {
 
     let temp = temp_dir("multicore-cli");
     let work_dir = temp.join("bhf_work");
-    fs::create_dir_all(work_dir.join("build/H-MULTI")).expect("build directory is created");
+    // The parent resolves the harness before it starts any worker.
+    install_fake_harness(&work_dir, "H-MULTI");
     fs::create_dir_all(work_dir.join("corpus/H-MULTI/queue")).expect("queue is created");
     fs::write(work_dir.join("corpus/H-MULTI/queue/base.bin"), b"base").unwrap();
     let script = temp.join("fake-bhf.sh");
@@ -246,7 +247,7 @@ fn fuzz_multicore_merges_worker_findings_into_the_parent_index() {
 
     let temp = temp_dir("multicore-merge");
     let work_dir = temp.join("bhf_work");
-    fs::create_dir_all(work_dir.join("build/H-MULTI")).unwrap();
+    install_fake_harness(&work_dir, "H-MULTI");
     fs::create_dir_all(work_dir.join("corpus/H-MULTI/queue")).unwrap();
 
     // What each worker "finds": worker 0 crash X; worker 1 crash X again
@@ -350,6 +351,406 @@ fn fuzz_multicore_merges_worker_findings_into_the_parent_index() {
         "{index}"
     );
     assert!(stderr.contains("(2 findings"), "{stderr}");
+}
+
+/// A harness laid out the way `bhf auto` builds it: `harnesses/<id>/main`, with
+/// no `build/<id>/` at all.
+fn install_auto_layout_harness(work_dir: &Path, harness_id: &str) -> PathBuf {
+    let harness = PathBuf::from(env!("CARGO_BIN_EXE_cli_fake_harness"));
+    let target = work_dir.join("harnesses").join(harness_id).join("main");
+    fs::create_dir_all(target.parent().expect("target has parent"))
+        .expect("harness directory is created");
+    fs::copy(&harness, &target).expect("fake harness is copied");
+    make_executable(&target);
+    target
+}
+
+fn finding_ids(work_dir: &Path) -> Vec<String> {
+    let mut ids: Vec<String> = fs::read_dir(work_dir.join("results/findings"))
+        .map(|entries| {
+            entries
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect()
+        })
+        .unwrap_or_default();
+    ids.sort();
+    ids
+}
+
+/// `bhf fuzz` run as its own process (so multicore workers re-exec the real
+/// binary), returning `(exit code, stdout JSON, stderr)`.
+fn fuzz_process(work_dir: &Path, args: &[&str]) -> (Option<i32>, serde_json::Value, String) {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bhf"))
+        .arg("fuzz")
+        .arg(work_dir)
+        .args(args)
+        .output()
+        .expect("bhf fuzz runs");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json = serde_json::from_str(stdout.trim()).unwrap_or(serde_json::Value::Null);
+    (output.status.code(), json, stderr)
+}
+
+#[cfg(unix)]
+#[test]
+fn fuzz_workers_find_an_auto_layout_harness() {
+    let temp = temp_dir("multicore-auto-layout");
+    let work_dir = temp.join("bhf_work");
+    install_auto_layout_harness(&work_dir, "H-AUTO");
+
+    let (code, summary, stderr) = fuzz_process(
+        &work_dir,
+        &[
+            "--harness",
+            "H-AUTO",
+            "--iterations",
+            "1",
+            "--seed-input",
+            "crash",
+            "--workers",
+            "2",
+        ],
+    );
+
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(summary["workers_started"], 2, "{summary}");
+    assert_eq!(summary["workers_completed"], 2, "{summary}\n{stderr}");
+    assert_eq!(finding_ids(&work_dir).len(), 1, "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn fuzz_sanitizer_matrix_finds_an_auto_layout_harness() {
+    let temp = temp_dir("matrix-auto-layout");
+    let work_dir = temp.join("bhf_work");
+    install_auto_layout_harness(&work_dir, "H-AUTO");
+
+    let (code, summary, stderr) = fuzz_process(
+        &work_dir,
+        &[
+            "--harness",
+            "H-AUTO",
+            "--iterations",
+            "1",
+            "--seed-input",
+            "crash",
+            "--sanitizers",
+            "asan,ubsan",
+        ],
+    );
+
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(summary["workers_completed"], 2, "{summary}\n{stderr}");
+    assert_eq!(summary["per_worker"][0]["env_keys"][0], "ASAN_OPTIONS");
+    assert_eq!(summary["per_worker"][1]["env_keys"][0], "UBSAN_OPTIONS");
+    assert_eq!(finding_ids(&work_dir).len(), 1, "{stderr}");
+}
+
+/// A libFuzzer-style shell harness in `dir` that reports an ASan crash in
+/// `function` on every input.
+#[cfg(unix)]
+fn install_crashing_script_harness(dir: &Path, function: &str) {
+    fs::create_dir_all(dir).unwrap();
+    fs::write(dir.join("main.c"), "// marker for libFuzzer detection\n").unwrap();
+    let main = dir.join("main");
+    fs::write(
+        &main,
+        format!(
+            "#!/bin/sh\n\
+             >&2 echo 'ERROR: AddressSanitizer: heap-buffer-overflow on address 0x601 at pc 0x333'\n\
+             >&2 echo '    #0 0x333 in {function} /src/record.c:15'\n\
+             >&2 echo '    #1 0x334 in LLVMFuzzerTestOneInput /src/h.c:20'\n\
+             exit 1\n"
+        ),
+    )
+    .unwrap();
+    make_executable(&main);
+}
+
+#[cfg(unix)]
+#[test]
+fn fuzz_workers_run_the_harness_the_parent_resolves_after_it_moves() {
+    // Campaign 1 fuzzes `build/<id>/main`. The build dir is then removed and the
+    // harness rebuilt under `harnesses/<id>/`: campaign 2's workers must run the
+    // new binary, not the copy of the old build dir left in their trees.
+    let temp = temp_dir("multicore-moved-harness");
+    let work_dir = temp.join("bhf_work");
+    install_crashing_script_harness(&work_dir.join("build/H-MOVED"), "old_copy_at");
+    let args = [
+        "--harness",
+        "H-MOVED",
+        "--iterations",
+        "2",
+        "--seed-input",
+        "x",
+        "--workers",
+        "2",
+    ];
+    let (code, _, stderr) = fuzz_process(&work_dir, &args);
+    assert_eq!(code, Some(0), "{stderr}");
+    let before = finding_ids(&work_dir);
+    assert_eq!(before.len(), 1, "{stderr}");
+
+    fs::remove_dir_all(work_dir.join("build/H-MOVED")).unwrap();
+    install_crashing_script_harness(&work_dir.join("harnesses/H-MOVED"), "current_copy_at");
+    let (code, _, stderr) = fuzz_process(&work_dir, &args);
+    assert_eq!(code, Some(0), "{stderr}");
+    let new: Vec<String> = finding_ids(&work_dir)
+        .into_iter()
+        .filter(|id| !before.contains(id))
+        .collect();
+    assert_eq!(
+        new.len(),
+        1,
+        "the current harness's crash is recorded: {stderr}"
+    );
+    let record = fs::read_to_string(
+        work_dir
+            .join("results/findings")
+            .join(&new[0])
+            .join("finding.json"),
+    )
+    .unwrap();
+    assert!(record.contains("current_copy_at"), "{record}");
+    assert!(!record.contains("old_copy_at"), "{record}");
+    for worker in 0..2 {
+        let tree = work_dir.join(format!("worker-H-MOVED-{worker}"));
+        assert!(!tree.join("build/H-MOVED").exists(), "{}", tree.display());
+        assert!(tree.join("harnesses/H-MOVED/main").is_file());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn fuzz_multicore_fails_and_shows_worker_stderr_when_no_worker_completes() {
+    let temp = temp_dir("multicore-no-worker");
+    let work_dir = temp.join("bhf_work");
+    install_auto_layout_harness(&work_dir, "H-AUTO");
+    let script = temp.join("broken-bhf.sh");
+    fs::write(
+        &script,
+        "#!/bin/sh\necho 'starting worker' >&2\n\
+         echo 'error while loading shared libraries: libwidget.so' >&2\nexit 3\n",
+    )
+    .unwrap();
+    make_executable(&script);
+
+    let (code, summary, stderr) = fuzz_process(
+        &work_dir,
+        &[
+            "--harness",
+            "H-AUTO",
+            "--iterations",
+            "1",
+            "--workers",
+            "2",
+            "--bhf-bin",
+            script.to_str().unwrap(),
+        ],
+    );
+
+    assert_ne!(code, Some(0), "no worker completed: {stderr}");
+    assert_eq!(summary["workers_completed"], 0, "{summary}");
+    assert!(
+        stderr.contains("error while loading shared libraries: libwidget.so"),
+        "each failing worker's stderr tail is printed: {stderr}"
+    );
+    assert!(stderr.contains("worker 1"), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn fuzz_workers_do_not_bring_back_a_removed_finding_of_an_old_harness() {
+    // Campaign 1's two workers both find the old harness's crash: one copy is
+    // merged, the other stays in its worker dir as a duplicate. results/ is then
+    // wiped and the harness replaced by one that never crashes. Campaign 2 must
+    // neither run the old binary nor merge the old duplicate back.
+    let temp = temp_dir("multicore-wiped-results");
+    let work_dir = temp.join("bhf_work");
+    install_crashing_script_harness(&work_dir.join("build/H-WIPE"), "old_copy_at");
+    let args = [
+        "--harness",
+        "H-WIPE",
+        "--iterations",
+        "2",
+        "--seed-input",
+        "x",
+        "--workers",
+        "2",
+    ];
+    let (code, _, stderr) = fuzz_process(&work_dir, &args);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(finding_ids(&work_dir).len(), 1, "{stderr}");
+
+    fs::remove_dir_all(work_dir.join("build/H-WIPE")).unwrap();
+    fs::remove_dir_all(work_dir.join("results")).unwrap();
+    let harness = work_dir.join("harnesses/H-WIPE");
+    fs::create_dir_all(&harness).unwrap();
+    fs::write(
+        harness.join("main.c"),
+        "// marker for libFuzzer detection\n",
+    )
+    .unwrap();
+    fs::write(harness.join("main"), "#!/bin/sh\nexit 0\n").unwrap();
+    make_executable(&harness.join("main"));
+    let (code, _, stderr) = fuzz_process(&work_dir, &args);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(finding_ids(&work_dir), Vec::<String>::new(), "{stderr}");
+}
+
+/// A finding dir (`F-0000-aaaaaaaa`) a stand-in worker copies into its
+/// results, as a worker that found a crash would leave it.
+fn write_worker_finding_template(temp: &Path, harness_id: &str) -> PathBuf {
+    let finding = temp.join("template/F-0000-aaaaaaaa");
+    fs::create_dir_all(&finding).unwrap();
+    let record = serde_json::json!({
+        "id": "F-0000-aaaaaaaa",
+        "signature": "aaaaaaaa11",
+        "cluster_key": "c1c1c1c1",
+        "cluster_key_full": "c1c1c1c1c1c1c1c1",
+        "rule_id": "BHF-201",
+        "classification": "unhandled",
+        "harness_id": harness_id,
+        "exception": {
+            "name": "ASAN_HEAP_BUFFER_OVERFLOW",
+            "message": "heap-buffer-overflow READ of size 4",
+            "sanitizer": "asan",
+            "stack": [{"function": "copy_at", "file": "/src/record.c", "line": 15}]
+        },
+        "paths": {"testcase": "testcase.bin", "finding": "finding.json"}
+    });
+    fs::write(
+        finding.join("finding.json"),
+        serde_json::to_vec_pretty(&record).unwrap(),
+    )
+    .unwrap();
+    fs::write(finding.join("testcase.bin"), b"x").unwrap();
+    finding
+}
+
+#[cfg(unix)]
+#[test]
+fn fuzz_multicore_workers_that_all_fail_after_finding_something_are_not_called_idle() {
+    let temp = temp_dir("multicore-failed-with-findings");
+    let work_dir = temp.join("bhf_work");
+    install_auto_layout_harness(&work_dir, "H-LATE");
+    let finding = write_worker_finding_template(&temp, "H-LATE");
+    let script = temp.join("late-failure.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nmkdir -p \"$2/results/findings\"\n\
+             cp -R '{}' \"$2/results/findings/\"\necho 'write failed' >&2\nexit 4\n",
+            finding.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&script);
+
+    let (code, _, stderr) = fuzz_process(
+        &work_dir,
+        &[
+            "--harness",
+            "H-LATE",
+            "--iterations",
+            "1",
+            "--workers",
+            "2",
+            "--bhf-bin",
+            script.to_str().unwrap(),
+        ],
+    );
+
+    assert_eq!(code, Some(4), "every worker failed with 4: {stderr}");
+    assert!(
+        stderr.contains("recorded before failing were merged"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("fuzzed nothing"), "{stderr}");
+    assert_eq!(finding_ids(&work_dir).len(), 1, "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn fuzz_multicore_workers_stopped_at_the_time_limit_keep_what_they_found() {
+    // Each worker records a finding, then outlives the time limit and is
+    // stopped. That campaign fuzzed: it must not fail as one that ran nothing.
+    let temp = temp_dir("multicore-stopped");
+    let work_dir = temp.join("bhf_work");
+    install_auto_layout_harness(&work_dir, "H-SLOW");
+    let finding = write_worker_finding_template(&temp, "H-SLOW");
+    let script = temp.join("slow-worker.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nmkdir -p \"$2/results/findings\"\n\
+             cp -R '{}' \"$2/results/findings/\"\necho 'fuzzing' >&2\nexec sleep 30\n",
+            finding.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&script);
+
+    let (code, summary, stderr) = fuzz_process(
+        &work_dir,
+        &[
+            "--harness",
+            "H-SLOW",
+            "--time",
+            "1s",
+            "--workers",
+            "2",
+            "--bhf-bin",
+            script.to_str().unwrap(),
+        ],
+    );
+
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(summary["workers_completed"], 0, "{summary}");
+    assert_eq!(
+        summary["per_worker"][0]["stopped_at_deadline"], true,
+        "{summary}"
+    );
+    assert!(stderr.contains("stopped at the time limit"), "{stderr}");
+    assert!(!stderr.contains("fuzzed nothing"), "{stderr}");
+    assert_eq!(finding_ids(&work_dir).len(), 1, "{stderr}");
+}
+
+#[test]
+fn fuzz_reports_crashes_that_match_findings_already_recorded() {
+    let temp = temp_dir("duplicate-of-existing");
+    let work_dir = temp.join("bhf_work");
+    install_fake_harness(&work_dir, "H-TEST");
+    let args = [
+        "--harness",
+        "H-TEST",
+        "--iterations",
+        "1",
+        "--seed-input",
+        "crash",
+    ];
+
+    let (code, first, stderr) = fuzz_process(&work_dir, &args);
+    assert_eq!(code, Some(0), "{stderr}");
+    let recorded = first["findings"][0]
+        .as_str()
+        .expect("first run records it")
+        .to_owned();
+
+    let (code, second, stderr) = fuzz_process(&work_dir, &args);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(second["findings"], serde_json::json!([]), "{second}");
+    assert_eq!(
+        second["duplicates_of_existing"],
+        serde_json::json!([recorded]),
+        "{second}"
+    );
+    assert!(
+        stderr.contains(&recorded) && stderr.contains("already recorded"),
+        "a stderr note names the existing finding: {stderr}"
+    );
+    assert_eq!(finding_ids(&work_dir), [recorded]);
 }
 
 fn install_fake_harness(work_dir: &Path, harness_id: &str) -> PathBuf {

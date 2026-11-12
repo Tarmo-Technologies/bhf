@@ -19,6 +19,33 @@
   `.filters`, `.user`, `.suo`, `.props`, `.pdb`, `.dll`, `.lib`, `.obj`, `.ilk`,
   `.exp`, ...) from test-data directories. Pass such files with `--seed-dir`
   when the target parses them.
+- `bhf fuzz --workers N` and `--sanitizers a,b` on a `bhf auto` work dir found no
+  harness: workers got only `build/<id>/`, while auto keeps the binary in
+  `harnesses/<id>/`. The parent now resolves the harness as a single run does
+  and makes each worker's harness dirs (`build/`, `harnesses/`, `auto/`,
+  `generated_harnesses/`) exact copies of its own. A worker copy of a dir the
+  parent no longer has is removed and one that differs is copied again, so a
+  worker never runs a harness left by an earlier campaign; symlinked files are
+  copied as files. A campaign without a built harness fails up front with exit 3.
+- A multi-worker campaign in which every worker failed exited 0 with 0 findings.
+  It now exits non-zero (the workers' shared exit code, else 1) and prints each
+  failing worker's stderr tail. Workers stopped at the time limit after
+  recording findings are not failures: that campaign keeps its exit code and
+  stderr says they were stopped (stopped workers that recorded nothing exit 1).
+  Worker stderr goes to `worker-<id>-N/worker-stderr.log` instead of an
+  undrained pipe (a chatty worker no longer blocks), and the campaign summary
+  gains additive `per_worker[].stderr_log`, `stderr_tail`,
+  `stopped_at_deadline` and `new_findings` fields.
+- A duplicate a multi-worker campaign left in a worker dir was merged back into
+  `results/findings` by a later campaign once the finding it duplicated had
+  been removed, so a finding triaged away (or one from a harness build that no
+  longer exists) came back. The merge now marks duplicates
+  (`merged-duplicate`), and a marked duplicate whose finding is gone is dropped
+  before the next campaign starts. The campaign summary gains an additive
+  `dropped_duplicates` count and the merge report a `dropped` count.
+- `bhf fuzz` dropped a crash matching a finding already recorded for the harness
+  without a trace. The run JSON gains additive `duplicates_of_existing` (finding
+  ids) and `duplicate_crashes_of_existing` fields, and stderr gets a note.
 
 ### Changed
 - `bhf auto --seed-dir` reads a directory's files in name order.
