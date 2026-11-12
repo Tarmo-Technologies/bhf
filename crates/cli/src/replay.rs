@@ -994,6 +994,10 @@ struct ReplaySummary {
     /// `--debugger`: the batch debugger session.
     #[serde(skip_serializing_if = "Option::is_none")]
     debugger: Option<crate::replay_debugger::DebuggerSession>,
+    /// `<finding>/replay.log`, the raw output of this replay, when it could
+    /// be written.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    replay_log: Option<String>,
     /// `bhf replay` printed the status line first; kept for the text view.
     #[serde(skip)]
     status_line: String,
@@ -1230,7 +1234,102 @@ fn render_text(summary: &ReplaySummary) -> Vec<String> {
             testcase.sha256.as_deref().map_or("?", short_hash)
         ),
     );
+    if let Some(log) = &summary.replay_log {
+        push("log", log.clone());
+    }
     lines
+}
+
+/// The file every replay writes in the finding dir: what ran and its raw
+/// output. It is not an evidence file of the finding (results/ does not hash
+/// it as one); results/ is rebuilt after it is written so the attestation
+/// covers it.
+pub(crate) const REPLAY_LOG: &str = "replay.log";
+/// Bytes of one output stream a replay log keeps from its start, and from
+/// its end (where a sanitizer report is).
+const REPLAY_LOG_HEAD: usize = 256 * 1024;
+const REPLAY_LOG_TAIL: usize = 768 * 1024;
+
+/// Write `<finding>/replay.log` for `summary`: the verdict and what ran, then
+/// the harness's stderr and stdout (`streams`, each bounded to its first and
+/// last bytes), then a debugger session's transcript. `None` when there was
+/// nothing to write it to (a read-only finding dir).
+fn write_replay_log(
+    finding_dir: &Path,
+    summary: &ReplaySummary,
+    streams: Option<(&[u8], &[u8])>,
+    no_output: &str,
+) -> Option<PathBuf> {
+    let mut log = String::new();
+    log.push_str(&format!(
+        "bhf replay at {}\n",
+        corpus::finding::now_rfc3339()
+    ));
+    log.push_str(&format!("finding: {}\n", summary.finding.id));
+    log.push_str(&format!("verdict: {}\n", summary.verdict));
+    log.push_str(&format!("status: {}\n", summary.status_line));
+    if let Some(lane) = summary.lane {
+        log.push_str(&format!("lane: {lane}\n"));
+    }
+    if let Some(harness) = &summary.harness {
+        log.push_str(&format!(
+            "harness: {} ({})\n",
+            harness.path, harness.protocol
+        ));
+    }
+    log.push_str(&format!("testcase: {}\n", summary.testcase.path));
+    if let Some(exit) = &summary.exit {
+        log.push_str(&format!("exit: {}\n", exit.text));
+    }
+    match streams {
+        Some((stdout, stderr)) => {
+            for (name, bytes) in [("stderr", stderr), ("stdout", stdout)] {
+                log.push_str(&format!("--- harness {name} ({} bytes) ---\n", bytes.len()));
+                log.push_str(&bounded_stream(bytes));
+                if !log.ends_with('\n') {
+                    log.push('\n');
+                }
+            }
+        }
+        None => log.push_str(&format!("--- no harness output: {no_output} ---\n")),
+    }
+    if let Some(session) = &summary.debugger {
+        log.push_str("--- debugger session ---\n");
+        for line in session.lines() {
+            log.push_str(&line);
+            log.push('\n');
+        }
+    }
+    let path = finding_dir.join(REPLAY_LOG);
+    std::fs::write(&path, log).ok()?;
+    Some(path)
+}
+
+/// `bytes` as text, keeping its first [`REPLAY_LOG_HEAD`] and last
+/// [`REPLAY_LOG_TAIL`] bytes and marking what was cut between them.
+fn bounded_stream(bytes: &[u8]) -> String {
+    if bytes.len() <= REPLAY_LOG_HEAD + REPLAY_LOG_TAIL {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    let cut = bytes.len() - REPLAY_LOG_HEAD - REPLAY_LOG_TAIL;
+    format!(
+        "{}\n[... {cut} bytes not kept ...]\n{}",
+        String::from_utf8_lossy(&bytes[..REPLAY_LOG_HEAD]),
+        String::from_utf8_lossy(&bytes[bytes.len() - REPLAY_LOG_TAIL..])
+    )
+}
+
+/// After a replay: stamp `last_seen` when it reproduced (`history` is the
+/// command recorded with it), and rebuild results/ when that or a written
+/// replay log changed the finding dir, so the index and attestation describe
+/// the files on disk.
+fn settle_finding(finding_dir: &Path, history: Option<&str>, log_written: bool) {
+    // A read-only evidence tree must not fail the replay.
+    let touched = history
+        .is_some_and(|history| corpus::finding::touch_last_seen(finding_dir, history).is_ok());
+    if touched || log_written {
+        refresh_results(finding_dir);
+    }
 }
 
 fn signature_text(signature: &Value) -> String {
@@ -1337,14 +1436,6 @@ fn refresh_results(finding_dir: &Path) {
     }
 }
 
-/// Record a full reproduction: stamp `last_seen` and keep results/ current.
-fn record_reproduction(finding_dir: &Path, runner: &HarnessRunner) {
-    // A read-only evidence tree must not fail the replay.
-    if corpus::finding::touch_last_seen(finding_dir, &replay_backend(runner)).is_ok() {
-        refresh_results(finding_dir);
-    }
-}
-
 /// Printed when a replayed report has no frame naming a function and no
 /// source position: the crash class still matched, but not where it happened.
 pub(crate) const UNSYMBOLIZED_NOTE: &str =
@@ -1390,9 +1481,6 @@ pub(crate) fn finish_lane(
         Ok(lane) => lane,
         Err(error) => return report_error(&output, finding_dir, &error),
     };
-    if lane.matched && corpus::finding::touch_last_seen(finding_dir, lane.history).is_ok() {
-        refresh_results(finding_dir);
-    }
     let raw = read_finding(finding_dir).unwrap_or(Value::Null);
     // A sanitized binary target prints a sanitizer report.
     let report = lane
@@ -1441,6 +1529,7 @@ pub(crate) fn finish_lane(
             ))
         }),
         debugger: None,
+        replay_log: None,
         status_line: lane.status_line,
     };
     let captured = match &lane.output {
@@ -1448,6 +1537,19 @@ pub(crate) fn finish_lane(
         None if lane.binary.is_some() => Err("the target's output was not kept"),
         None => Err("this replay runs no local harness"),
     };
+    let mut summary = summary;
+    let log = write_replay_log(
+        finding_dir,
+        &summary,
+        captured.ok(),
+        captured.err().unwrap_or_default(),
+    );
+    settle_finding(
+        finding_dir,
+        lane.matched.then_some(lane.history),
+        log.is_some(),
+    );
+    summary.replay_log = log.map(|path| path.display().to_string());
     emit(&summary, output, captured);
     if lane.matched {
         0
@@ -1551,9 +1653,6 @@ pub(crate) fn replay_c(
     if let Some(note) = finding_format_note_for(&raw, runner.harness_path(), detection) {
         notes.push(note);
     }
-    if reproduced {
-        record_reproduction(finding_dir, runner);
-    }
     let debugger = debugger.map(|debugger| {
         let mut session = crate::replay_debugger::run(
             debugger,
@@ -1597,8 +1696,18 @@ pub(crate) fn replay_c(
         }),
         arguments,
         debugger,
+        replay_log: None,
         status_line,
     };
+    let mut summary = summary;
+    let log = write_replay_log(finding_dir, &summary, Some((&run.stdout, &run.stderr)), "");
+    let history = replay_backend(runner);
+    settle_finding(
+        finding_dir,
+        reproduced.then_some(history.as_str()),
+        log.is_some(),
+    );
+    summary.replay_log = log.map(|path| path.display().to_string());
     emit(&summary, output, Ok((&run.stdout, &run.stderr)));
     if reproduced {
         0
@@ -1673,7 +1782,6 @@ fn replay_ada(
                 .get("signature")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            record_reproduction(finding_dir, runner);
             (
                 "match",
                 "MATCH".to_owned(),
@@ -1734,8 +1842,23 @@ fn replay_ada(
             .show_args
             .then(|| ArgumentsReport::unavailable("an Ada harness has no argument trace")),
         debugger: None,
+        replay_log: None,
         status_line,
     };
+    let mut summary = summary;
+    let log = write_replay_log(
+        finding_dir,
+        &summary,
+        None,
+        "an Ada harness reports through its event log, whose signature the verdict compares",
+    );
+    let history = replay_backend(runner);
+    settle_finding(
+        finding_dir,
+        (verdict == "match").then_some(history.as_str()),
+        log.is_some(),
+    );
+    summary.replay_log = log.map(|path| path.display().to_string());
     emit(
         &summary,
         output,

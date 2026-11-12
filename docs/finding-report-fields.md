@@ -17,7 +17,7 @@ index when it finishes. This doc describes that layout, the `bhf.findings.v1` /
 | `results/findings.sarif` | SARIF 2.1.0, one run, every finding kind except `sca` |
 | `results/manifest.json` | `bhf.results-manifest.v1`: tool, source, full producer history |
 | `results/attestation.json` | in-toto Statement v1 over every file under `results/` |
-| `results/findings/<ID>/` | Evidence for findings that have files: `finding.json`, `testcase.bin`, `min_testcase.bin` (when minimized), `sanitizer.log`, `decoded.json`, `replay.py` / `repro.adb` |
+| `results/findings/<ID>/` | Evidence for findings that have files: `finding.json`, `testcase.bin`, `min_testcase.bin` (when minimized), `sanitizer.log`, `decoded.json`, `replay.py` / `repro.adb`; plus `replay.log`, the raw output of the last `bhf replay` (covered by `attestation.json`, not an evidence role) |
 | `results/legacy/` | Only in a work dir migrated from bhf ≤ 0.2.x: the old `FINDINGS.md`, `findings.csv`, `auto/findings.csv` and `findings/<ID>/replay.py`, and `migration.json` (what was moved, when) |
 | `results/static/` | Native `static-scan` output (`static-report.{json,md,sarif}`) |
 | `results/sbom/` | Native `sbom` output (`cyclonedx.json`, `sbom.spdx.json`, `openvex.json`, `vulnerabilities.json`, ...) |

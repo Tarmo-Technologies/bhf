@@ -606,6 +606,12 @@
 - The Fortran lane records how each Fortran object of a harness link was
   compiled (`harnesses/<id>/fortran-build.json`), which a capsule uses to
   rebuild them from source.
+- `bhf replay` writes `<finding>/replay.log` on every run, match or not: the
+  verdict, what ran, the exit status, the harness's raw stderr and stdout
+  (each bounded to its first 256 KiB and last 768 KiB, the cut marked) and any
+  debugger transcript. The summary names it (`log`; `replay_log` in `--json`).
+  It is not an evidence file, and results/ is now rebuilt after a mismatch too,
+  so the attestation covers it.
 - New findings record the generated harness's input format as
   `harness.format_version` (and `harness.buffer_len_dimension`) in
   `finding.json`, next to the top-level `harness_format_version` kept for

@@ -465,6 +465,16 @@ MATCH
   protocol and why, sha256) and `testcase`. Exit codes are unchanged.
 - **`--show-output`** also prints the harness's raw stderr and stdout (the full
   sanitizer report).
+- **`replay.log`.** Every replay, `MATCH` or `MISMATCH`, writes
+  `<finding>/replay.log`: the verdict, what ran, the exit status, the
+  harness's raw stderr and stdout (each kept to its first 256 KiB and last
+  768 KiB, with the cut marked, so a sanitizer report at the end survives)
+  and any `--debugger` transcript. The summary names it (`log`, and
+  `replay_log` in `--json`). It is overwritten by the next replay, is not one
+  of the finding's evidence files, and results/ is rebuilt after it is
+  written so `attestation.json` stays current. A lane with no local harness
+  (session, collector, transport, Ada event log) writes the verdict and why
+  there is no output.
 - **`--show-args`** runs a generated C/C++ harness with `BHF_TRACE_ARGS=1` and
   prints the value it decoded for each parameter under the summary: name,
   type, the testcase bytes it came from, its value (or a buffer's length and

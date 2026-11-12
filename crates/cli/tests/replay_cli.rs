@@ -1873,3 +1873,81 @@ fn replay_debugger_under_lldb_prints_the_crash_stack() {
     assert_preloaded_into_the_harness_only(&work, &log);
     fs::remove_dir_all(&work).ok();
 }
+
+/// Every replay writes the harness's raw output, bounded, to
+/// `<finding>/replay.log` and names it in the summary and `--json`; the
+/// results index is rebuilt after a mismatch too, so the attestation covers
+/// the log.
+#[cfg(unix)]
+#[test]
+fn replay_writes_a_bounded_replay_log_and_keeps_the_attestation_current() {
+    let root = temp_dir("replay-log");
+    let work = root.join("work");
+    let harness = work.join("harnesses/H-1/main");
+    let report = asan_report("Widget::copy_at", 12);
+    write_crashing_harness(&harness, &report);
+    let finding = emit_finding(&work, &harness, &report);
+    assert_eq!(
+        cli::run_from(["bhf", "report", "--work-dir", work.to_str().unwrap()]),
+        0
+    );
+
+    let output = replay_output(&[finding.to_str().unwrap()]);
+    let stdout = text(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    let log_path = finding.join("replay.log");
+    assert!(
+        stdout.contains(&format!("  log        {}", log_path.display())),
+        "{stdout}"
+    );
+    let log = fs::read_to_string(&log_path).unwrap();
+    assert!(log.contains("verdict: match"), "{log}");
+    assert!(log.contains("--- harness stderr"), "{log}");
+    assert!(
+        log.contains("ERROR: AddressSanitizer: heap-buffer-overflow"),
+        "{log}"
+    );
+    assert_attestation_current(&work);
+
+    // A mismatch writes it too, and results/ is rebuilt for it.
+    let other = root.join("other/main");
+    let noisy = format!(
+        "{}{}",
+        "x".repeat(3 * 1024 * 1024),
+        asan_report("Widget::other", 8)
+    );
+    write_crashing_harness(&other, &noisy);
+    let output = replay_output(&[
+        finding.to_str().unwrap(),
+        "--harness",
+        other.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_eq!(output.status.code(), Some(3));
+    let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        doc["replay_log"],
+        serde_json::json!(log_path.display().to_string())
+    );
+    let log = fs::read_to_string(&log_path).unwrap();
+    assert!(
+        log.contains("verdict: mismatch"),
+        "{}",
+        &log[..log.len().min(400)]
+    );
+    assert!(
+        log.len() < 2 * 1024 * 1024,
+        "the log is bounded: {} bytes",
+        log.len()
+    );
+    assert!(log.contains("bytes not kept"), "the cut is marked");
+    assert_attestation_current(&work);
+    // The log is not hashed as finding evidence.
+    let findings: serde_json::Value =
+        serde_json::from_slice(&fs::read(work.join("results/findings.json")).unwrap()).unwrap();
+    assert!(
+        !findings.to_string().contains("replay.log"),
+        "replay.log is not an evidence file"
+    );
+    fs::remove_dir_all(&root).ok();
+}
