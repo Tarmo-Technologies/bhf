@@ -108,13 +108,32 @@ pub struct AutoArgs {
     pub discovery_cache: Option<PathBuf>,
 
     /// Load run options from a TOML config file. Persists common flags so a project's
-    /// runs are reproducible; CLI flags always override it. Without this, a
-    /// `.bhf.toml` in the scanned tree root is auto-loaded — but an auto-loaded
-    /// config honors only SAFE knobs (fields that EXECUTE the tree's own build, like
-    /// `build-command`, require this explicit flag). Keys are the flag names in
-    /// kebab-case (e.g. `per-target-time = 30`, `cxx-std = "gnu++14"`).
+    /// runs are reproducible; CLI flags always override it, and relative paths in it
+    /// resolve against the file's directory. Without this, a `.bhf.toml` in the
+    /// scanned tree root is auto-loaded — but an auto-loaded config honors only SAFE
+    /// knobs (keys that EXECUTE something, `build-command`, `run-untrusted`,
+    /// `unsafe-search-and-run-build-commands`, `probe-build` and the `[toolchain]`
+    /// table, require this explicit flag). Only these flags have a key, spelled as
+    /// the flag: per-target-time, max-targets, jobs, rss-limit-mb, max-work-dir-mb,
+    /// max-corpus-mb, cxx-std, max-len, timeout, grammar, extra-include,
+    /// extra-source, exclude-path, seed-file, seed-dir, sanitizers, engine,
+    /// languages, project, ada-deps, passes, force, build-command, run-untrusted,
+    /// unsafe-search-and-run-build-commands, probe-build (`seed-mining = false` is
+    /// --no-seed-mining). The toolchain flags (--cc, --cxx, --cflags, --cxxflags,
+    /// --ldflags, --define, --toolchain-include, --sysroot, --target-triple,
+    /// --runner, --runner-arg, --ada-*, --probe-backend) are keys of a
+    /// `[toolchain]` / `[toolchain.ada]` table, the same table `bhf build --config`
+    /// reads. Any other key is an error.
     #[arg(long = "config", value_name = "PATH")]
     pub config: Option<PathBuf>,
+
+    /// The `[toolchain]` table of an explicit `--config`, merged with the
+    /// toolchain flags before the sweep starts.
+    #[arg(skip)]
+    pub(crate) config_toolchain: Option<config::ToolchainConfig>,
+
+    #[command(flatten)]
+    pub(crate) toolchain: crate::toolchain::AutoToolchainArgs,
 
     /// Override the governing Ada project (`.gpr`). By default
     /// `auto` selects the project that OWNS each target's source (the non-aggregate
@@ -1100,6 +1119,57 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         std::env::set_var("BHF_CXX_STD", s);
     }
 
+    // The toolchain: an explicit --config's [toolchain] table with the toolchain
+    // flags laid over it. Validated before anything builds, and published to
+    // this process's environment (CC/CXX + the BHF_TOOLCHAIN_* make variables)
+    // before any worker starts, so every build and retry of the run uses it.
+    let toolchain =
+        crate::toolchain::resolve(args.config_toolchain.take(), args.toolchain.to_config())
+            .and_then(|toolchain| {
+                crate::toolchain::check_runnable(&toolchain)?;
+                Ok(toolchain)
+            })
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let published =
+        crate::toolchain::publish(&toolchain).map_err(|error| anyhow::anyhow!("{error}"))?;
+    for note in &published.notes {
+        bhfeprintln!("bhf auto: {note}");
+    }
+    let cross_sweep = crate::toolchain::cross_sweep_target(&toolchain)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    if let Some(target) = &cross_sweep {
+        bhfeprintln!(
+            "bhf auto: cross sweep: building every C/C++ candidate for {} with {} / {} and \
+             running it under {}",
+            target.triple,
+            target.cc,
+            target.cxx,
+            target.runner.exe()
+        );
+    }
+    let mut ada_toolchain = crate::toolchain::AdaBuildSettings::from_config(&toolchain);
+    ada_toolchain.runner = crate::toolchain::ada_runner(&toolchain, cross_sweep.as_ref());
+    if let (Some(runner), Some(target)) = (&ada_toolchain.runner, ada_toolchain.effective_target())
+    {
+        bhfeprintln!(
+            "bhf auto: Ada harnesses built for {target} run under {}{}",
+            runner.exe(),
+            if cross_sweep.is_some() {
+                ""
+            } else {
+                "; the C/C++ candidates build and run on this host (set toolchain.target \
+                 to cross-build them too)"
+            }
+        );
+    }
+    if cross_sweep.is_some() && !args.sanitizers.is_empty() {
+        bhfeprintln!(
+            "bhf auto: note: --sanitizers does not apply to the cross sweep's emulated \
+             C/C++ builds (sanitizer runtimes do not survive the emulator); add sanitizer \
+             flags through toolchain.cflags if the runner supports them"
+        );
+    }
+
     // Parse once before the optional project build. Probe-built archives must
     // carry the exact same sanitizer/coverage contract as the harnesses that
     // will link them; parsing this only after the probe produced stale/default
@@ -1155,6 +1225,13 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     );
     crate::auto::report::write_dependency_checkpoint(&path, &work, &early_dependency_seed, &[])?;
     let probe_requested = args.probe_build || args.run_untrusted || args.build_command.is_some();
+    if probe_requested && cross_sweep.is_some() {
+        bhfeprintln!(
+            "bhf auto: note: the project's build runs for this host; its compile database and \
+             generated headers apply to the cross sweep, but the archives it builds are not \
+             linked into the cross-built harnesses (each target is built from its sources)"
+        );
+    }
 
     // --sloc: write a per-language SLOC breakdown of the source tree up front,
     // independent of build/fuzz outcomes. A failure here shouldn't abort the run.
@@ -1779,6 +1856,8 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         // §27.11: CLI-configured C/C++ decoder caps, threaded to harness gen.
         decoder_limits: args.decoder_limits.clone(),
         force: args.force,
+        cross_sweep,
+        ada_toolchain,
     };
     // #6: the fully-ranked candidate count BEFORE any --max-targets / campaign
     // split cap, so the report can surface how many targets the cap dropped from

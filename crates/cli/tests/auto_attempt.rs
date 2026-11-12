@@ -112,6 +112,8 @@ fn attempt_repairs_missing_header_for_simple_c_target() {
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = cli::auto::attempt::AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -215,6 +217,8 @@ fn attempt_skips_target_whose_definition_is_conditionally_compiled_out() {
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -348,6 +352,8 @@ fn attempt_pairs_tree_wide_c_lifecycle_from_unincluded_header() {
         idx.c_tree_lifecycle
     );
     let options = cli::auto::attempt::AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -428,6 +434,8 @@ fn attempt_adds_project_source_for_missing_c_symbol() {
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -535,6 +543,8 @@ fn attempt_builds_harness_for_unnamed_param_callback_typedef() {
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -643,6 +653,8 @@ fn attempt_adds_project_source_for_missing_cpp_symbol() {
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -775,6 +787,8 @@ fn attempt_force_includes_stream_header_for_recovered_cpp_source() {
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -905,6 +919,8 @@ fn attempt_prefers_sequence_for_cpp_class_method_with_lifecycle_steps() {
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -1015,6 +1031,8 @@ fn attempt_uses_direct_cpp_harness_when_lifecycle_helpers_are_private() {
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -1106,6 +1124,8 @@ fn attempt_runtime_cap_excludes_build_time() {
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -1192,6 +1212,8 @@ fn attempt_total_time_apportions_across_passes() {
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -1294,6 +1316,8 @@ fn attempt_builds_and_fuzzes_struct_by_value_c_target() {
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -1391,6 +1415,8 @@ fn attempt_rss_limit_classifies_oom_as_bhf209() {
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -1499,6 +1525,8 @@ fn attempt_prefers_sequence_for_first_param_handle_c_target() {
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -1599,6 +1627,8 @@ fn attempt_prefers_sequence_for_c_target_with_static_lifecycle_helpers() {
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -1689,6 +1719,8 @@ fn attempt_uses_direct_harness_for_generic_void_pointer_c_target() {
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -1787,6 +1819,8 @@ fn attempt_builds_and_fuzzes_c_scalar_and_enum_output_pointers() {
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -1880,6 +1914,8 @@ fn attempt_builds_and_fuzzes_c_const_byte_typedef_pair() {
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -1977,6 +2013,8 @@ fn attempt_builds_and_fuzzes_c_miniz_file_macro_pointer() {
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -2072,6 +2110,8 @@ fn attempt_builds_and_fuzzes_c_miniz_time_pointer_alias() {
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -2164,6 +2204,8 @@ fn attempt_builds_and_fuzzes_c_void_pointer_output_slot() {
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -2264,6 +2306,8 @@ fn attempt_builds_and_fuzzes_c_void_output_capacity_and_input_pair() {
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -2380,6 +2424,8 @@ fn attempt_builds_and_fuzzes_cpp_void_output_capacity_and_input_pair() {
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -2500,6 +2546,8 @@ fn attempt_builds_and_fuzzes_cpp_void_output_length_pointer_and_input_pair() {
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -2615,6 +2663,8 @@ fn attempt_builds_and_fuzzes_cpp_standard_scalar_aliases() {
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -2741,6 +2791,8 @@ fn attempt_builds_and_fuzzes_cpp_struct_by_value_target() {
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -2847,6 +2899,8 @@ fn attempt_builds_and_fuzzes_cpp_file_pointer_target() {
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -2956,6 +3010,8 @@ fn attempt_builds_and_fuzzes_cpp_callback_typedef_target() {
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -3044,6 +3100,8 @@ fn attempt_dispatches_ada_candidate_to_gprbuild() {
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -3152,6 +3210,8 @@ fn attempt_recovers_cross_dir_ada_unit_source() {
     // project root (where `core/` lives) — the cross-tree lever.
     let idx = DeclarationIndex::build_indexed(&types, &root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -3254,6 +3314,8 @@ fn static_c_direct_targets_build_through_included_source() {
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = cli::auto::attempt::AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -3346,6 +3408,8 @@ fn static_cpp_direct_targets_build_through_included_source() {
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = cli::auto::attempt::AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -3419,6 +3483,8 @@ fn foreign_platform_guarded_target_builds_via_cross_or_platform_stub() {
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = cli::auto::attempt::AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -3518,6 +3584,8 @@ fn attempt_reports_phase_progression_through_progress_sink() {
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = cli::auto::attempt::AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -3636,6 +3704,8 @@ fn attempt_constructs_typedef_hidden_opaque_handle_via_returning_ctor() {
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -3730,6 +3800,8 @@ fn attempt_synthesises_corba_stub_for_missing_idl_header_but_empty_for_internal(
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -3819,6 +3891,8 @@ fn attempt_skips_cpp_method_of_class_defined_only_in_translation_unit() {
     let work = fs::canonicalize(&work).unwrap();
     let idx = DeclarationIndex::build(&root).unwrap();
     let make_options = || AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,

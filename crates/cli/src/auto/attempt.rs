@@ -241,6 +241,14 @@ pub struct AttemptOptions {
     /// that would normally be pre-skipped instead falls through to the build+repair
     /// path. Default `false` leaves every non-force path byte-for-byte unchanged.
     pub force: bool,
+    /// Whole-sweep cross target (`[toolchain] runner`, `--runner`): every C/C++
+    /// candidate is built for it with coverage and fuzzed under its runner,
+    /// whatever its `foreign_guard`. `None` keeps the host build and the
+    /// guard-driven foreign lane.
+    pub cross_sweep: Option<CrossTarget>,
+    /// The Ada toolchain (`[toolchain.ada]`, `--ada-*`, `--probe-backend`)
+    /// every Ada harness build uses.
+    pub ada_toolchain: crate::toolchain::AdaBuildSettings,
 }
 
 impl Default for AttemptOptions {
@@ -269,6 +277,8 @@ impl Default for AttemptOptions {
             ada_main_sources: HashMap::new(),
             decoder_limits: crate::generate_harness::DecoderLimitArgs::default(),
             force: false,
+            cross_sweep: None,
+            ada_toolchain: crate::toolchain::AdaBuildSettings::default(),
         }
     }
 }
@@ -2668,10 +2678,25 @@ fn run_attempt(
     //     real host ASan/coverage; findings are reduced-fidelity (#c).
     //   - else → skip with an actionable reason naming what's missing.
     // `Native` (no foreign_guard) is byte-identical to before.
+    let candidate_is_c_family = matches!(
+        candidate.lang,
+        crate::auto::candidate::Lang::C | crate::auto::candidate::Lang::Cpp
+    );
+    let candidate_is_ada = matches!(candidate.lang, crate::auto::candidate::Lang::Ada);
     let strategy: ForeignStrategy = match &candidate.foreign_guard {
         // A prebuilt (Rust/Java) harness is always the Native path — cargo
         // resolves `#[cfg]` and the JVM is host-native, so no cross/stub applies.
         _ if is_prebuilt => ForeignStrategy::Native,
+        // A whole-sweep cross target: the operator chose the platform, so every
+        // C/C++ candidate is built for it, guarded or not.
+        _ if candidate_is_c_family && options.cross_sweep.is_some() => {
+            ForeignStrategy::Cross(options.cross_sweep.clone().expect("checked above"))
+        }
+        // An Ada toolchain the operator configured for a target decides the
+        // platform for Ada candidates too; the guard no longer skips them.
+        Some(_) if candidate_is_ada && options.ada_toolchain.effective_target().is_some() => {
+            ForeignStrategy::Native
+        }
         Some(guard) => match resolve_foreign_strategy(candidate, guard) {
             Ok(strategy) => strategy,
             Err(reason) => {
@@ -2685,11 +2710,28 @@ fn run_attempt(
         None => ForeignStrategy::Native,
     };
     let cross_compiler = match &strategy {
-        ForeignStrategy::Cross(target) => Some(cross_compiler_override(target)),
+        ForeignStrategy::Cross(target) => {
+            // A guard-driven cross build replaces the operator's own compilers
+            // for this target; say so rather than silently.
+            let effective = crate::toolchain::effective_compilers();
+            if options.cross_sweep.is_none() && effective.explicit && effective.cc != target.cc {
+                announce_once(&format!(
+                    "{}: built with the {} cross toolchain ({}) for its platform guard \
+                     instead of CC={}",
+                    candidate.harness_id, target.triple, target.cc, effective.cc
+                ));
+            }
+            Some(cross_compiler_override(target))
+        }
         ForeignStrategy::Native | ForeignStrategy::StubIsolated(_) => None,
     };
     let cross_runner = match &strategy {
         ForeignStrategy::Cross(target) => Some(cross_harness_wrapper(target)),
+        // An Ada harness built for a target this host cannot run goes through
+        // the toolchain's runner (validated up front: such a target has one).
+        ForeignStrategy::Native if candidate_is_ada => {
+            options.ada_toolchain.runner.as_ref().map(runner_wrapper)
+        }
         ForeignStrategy::Native | ForeignStrategy::StubIsolated(_) => None,
     };
 
@@ -2715,14 +2757,28 @@ fn run_attempt(
         candidate.lang,
         crate::auto::candidate::Lang::C | crate::auto::candidate::Lang::Cpp
     );
+    // A cross build links only archives built for its own target. A build
+    // probe's archives are always built for this host, and a project's own
+    // archives are kept only when their objects are for the target's
+    // architecture, so neither fails the link "in wrong format".
+    let cross_triple = match &strategy {
+        ForeignStrategy::Cross(target) => Some(target.triple.as_str()),
+        ForeignStrategy::Native | ForeignStrategy::StubIsolated(_) => None,
+    };
     let library_archives: Vec<PathBuf> = if is_c_family {
-        crate::auto::build_probe::discover_static_libraries(&tree_root)
+        let mut archives = crate::auto::build_probe::discover_static_libraries(&tree_root);
+        if let Some(triple) = cross_triple {
+            archives.retain(|archive| {
+                crate::auto::cross_target::archive_matches_target(archive, triple) != Some(false)
+            });
+        }
+        archives
     } else {
         Vec::new()
     };
     let library_archive_symbols =
         crate::auto::build_probe::index_static_library_symbols(&library_archives);
-    let compatible_probe_archives = if is_c_family {
+    let compatible_probe_archives = if is_c_family && cross_triple.is_none() {
         crate::auto::build_probe::compatible_probe_static_libraries(&tree_root, &options.sanitizers)
     } else {
         Vec::new()
@@ -2967,6 +3023,7 @@ fn run_attempt(
             &options.sanitizers,
             &options.dir_filter,
             options.project.as_deref(),
+            &options.ada_toolchain,
             round,
         ) {
             BuildOutcome::Success => {
@@ -5716,6 +5773,7 @@ fn try_build(
     sanitizers: &multicore_fuzz::SanitizerSelection,
     dir_filter: &crate::auto::discovery::DirFilter,
     project_override: Option<&Path>,
+    ada_toolchain: &crate::toolchain::AdaBuildSettings,
     round: usize,
 ) -> BuildOutcome {
     use crate::auto::candidate::Lang;
@@ -5746,6 +5804,7 @@ fn try_build(
             ada_dep_dirs,
             dir_filter,
             project_override,
+            ada_toolchain,
             round,
         ),
         // The Rust lane builds its harness in `run_attempt` Step 0a (the
@@ -5945,9 +6004,12 @@ fn try_build_c(
     let fallback_override;
     // A previous target already proved this project needs the other compiler.
     // Honour that before anything else so one probe serves the whole run — but
-    // never over an explicit cross build or an operator's `--sanitizers`, both of
-    // which carry their own compiler and flags on purpose.
+    // never over an explicit cross build, an operator's `--sanitizers`, or the
+    // operator's own CC/CXX (`[toolchain]`), all of which choose the compiler on
+    // purpose.
+    let operator_compilers = crate::toolchain::effective_compilers().explicit;
     let cached_alternate = cross_compiler.is_none()
+        && !operator_compilers
         && matches!(sanitizers, SanitizerSelection::Default)
         && std::fs::read_to_string(c_compiler_cache_path(work_dir))
             .is_ok_and(|cached| cached.trim() == "gcc");
@@ -6042,6 +6104,43 @@ fn try_build_c(
     // the retry removes that class of error. Every C Makefile lane includes the
     // same fragment, so AFL/MSan/TSan/coverage/differential replay stay aligned.
     let c_compat_path = work_dir.join("c_compat.mk");
+    // The C++ counterpart: a member declared with its own class's
+    // qualification (`int Widget::size();` inside `class Widget`), which only
+    // MSVC accepts by default. clang accepts it under `-fms-extensions`, gcc
+    // under `-fpermissive`; the fragment carries both, and each Makefile lane
+    // takes the one for its compiler. Kept only when the retry removes that
+    // error class, like `-fcommon` below.
+    let cxx_compat_path = work_dir.join(CXX_COMPAT_FILE);
+    if is_cpp
+        && !cxx_compat_path.is_file()
+        && output_has_extra_qualification(&errors)
+        && std::fs::write(&cxx_compat_path, CXX_COMPAT_EXTRA_QUALIFICATION).is_ok()
+    {
+        let compat_output = crate::build::try_run_c_make_build_with_target(
+            work_dir,
+            harness_id,
+            extra_sources,
+            extra_includes,
+            compiler,
+            None,
+            chosen_std.as_deref(),
+        );
+        if build_succeeded(&compat_output) {
+            return BuildOutcome::Success;
+        }
+        let compat_raw = combined_build_output(&compat_output);
+        let compat_errors = build_classifier::classify(&compat_raw);
+        if !output_has_extra_qualification(&compat_errors) {
+            // The class is gone; whatever remains is the next thing to repair.
+            raw_output = compat_raw;
+            persist_c_build_output(work_dir, harness_id, &raw_output);
+            errors = compat_errors;
+        } else {
+            // The flag did not remove the error class (a compiler that accepts
+            // neither spelling); do not weaken later targets for nothing.
+            let _ = std::fs::remove_file(&cxx_compat_path);
+        }
+    }
     if !is_cpp
         && !c_compat_path.is_file()
         && output_may_require_fcommon(&raw_output)
@@ -6184,6 +6283,7 @@ fn try_build_c(
     // cannot conjure a symbol that is genuinely undefined.
     if !is_pure_link_failure
         && !cached_alternate
+        && !operator_compilers
         && cross_compiler.is_none()
         && matches!(sanitizers, SanitizerSelection::Default)
         && !c_compiler_cache_path(work_dir).exists()
@@ -6225,6 +6325,24 @@ fn try_build_c(
         }
     }
     BuildOutcome::Failed { errors }
+}
+
+/// The work-dir C++ compatibility fragment every C++ harness Makefile
+/// includes as `../../cxx_compat.mk`.
+pub(crate) const CXX_COMPAT_FILE: &str = "cxx_compat.mk";
+
+/// [`CXX_COMPAT_FILE`] for a member declared with its own class's
+/// qualification: clang's spelling and gcc's, chosen per lane by the Makefile.
+const CXX_COMPAT_EXTRA_QUALIFICATION: &str =
+    "# Written by bhf auto: members declared with their own class's qualification.\n\
+CXX_COMPAT_FLAGS_CLANG := -fms-extensions\n\
+CXX_COMPAT_FLAGS_GCC := -fpermissive\n";
+
+/// Whether a classified build failure includes an extra member qualification.
+fn output_has_extra_qualification(errors: &[BuildErrorKind]) -> bool {
+    errors
+        .iter()
+        .any(|error| matches!(error, BuildErrorKind::ExtraQualification { .. }))
 }
 
 /// Whether the C-family build produced the harness executable that the fuzz
@@ -6543,7 +6661,8 @@ fn resolve_foreign_candidate_target(
     if matches!(candidate.lang, crate::auto::candidate::Lang::Ada) {
         return Err(format!(
             "foreign-platform Ada target (guard `{guard}`) needs a matching GNAT cross \
-             toolchain; bhf auto currently cross-compiles only C/C++ (would target {})",
+             toolchain (would target {}); configure it with [toolchain.ada] prefix/target \
+             and a [toolchain] runner (--ada-prefix/--ada-target, --runner)",
             target.toolchain_hint()
         ));
     }
@@ -6626,8 +6745,32 @@ fn apply_platform_stub(
 /// driver's vectored exception handler (a fault → distinctive crash exit) rather
 /// than ASan shadow checks.
 fn cross_compiler_override(target: &CrossTarget) -> crate::build::CFamilyCompilerOverride {
+    cross_compiler_override_with(target, cached_compiler_accepts_flag)
+}
+
+/// [`cross_compiler_override`] with the flag probe injected.
+///
+/// An emulated Linux build (qemu-user, or an operator's runner) arms coverage
+/// too when the cross compiler accepts it: GCC's `trace-pc` + `trace-cmp`
+/// (clang's `trace-pc-guard` for a clang cross build), whose callbacks the
+/// driver implements, so the emulated harness is fuzzed coverage-guided with
+/// input-to-state comparison hooks instead of blind. ASan stays off: its shadow memory
+/// does not survive qemu-user.
+fn cross_compiler_override_with(
+    target: &CrossTarget,
+    accepts: impl Fn(&str, &str) -> bool,
+) -> crate::build::CFamilyCompilerOverride {
     let mut cflags = vec!["-O1".to_owned(), "-g".to_owned()];
     let mut cxxflags = vec!["-O1".to_owned(), "-g".to_owned(), "-std=gnu++17".to_owned()];
+    if !matches!(target.runner, CrossRunner::Wine { .. }) {
+        let family = crate::toolchain::compiler_family(&target.cc, false)
+            .unwrap_or(harness_gen::compiler_family::CompilerFamily::Gcc);
+        let coverage = family.coverage_flag();
+        if accepts(&target.cc, coverage) {
+            cflags.push(coverage.to_owned());
+            cxxflags.push(coverage.to_owned());
+        }
+    }
     if matches!(target.runner, CrossRunner::Wine { .. }) {
         let coverage = "-fsanitize-coverage=trace-pc,trace-cmp".to_owned();
         cflags.push(coverage.clone());
@@ -6648,7 +6791,7 @@ fn cross_compiler_override(target: &CrossTarget) -> crate::build::CFamilyCompile
     // toolchain still builds.
     if cross_guards_opt_in() {
         let cc = target.cc.clone();
-        let guards = cross_guard_flags(&target.triple, |flag| compiler_accepts_flag(&cc, flag));
+        let guards = cross_guard_flags(&target.triple, |flag| accepts(&cc, flag));
         cflags.extend(guards.iter().cloned());
         cxxflags.extend(guards);
     }
@@ -6724,6 +6867,24 @@ pub(crate) fn cross_guard_flags(triple: &str, supports: impl Fn(&str) -> bool) -
     flags
 }
 
+/// [`compiler_accepts_flag`], remembered per compiler and flag for the run: a
+/// sweep asks the same question of the same cross compiler for every target.
+fn cached_compiler_accepts_flag(cc: &str, flag: &str) -> bool {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<(String, String), bool>>> = OnceLock::new();
+    let key = (cc.to_owned(), flag.to_owned());
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(&known) = cache.lock().expect("flag probe cache").get(&key) {
+        return known;
+    }
+    let accepted = compiler_accepts_flag(cc, flag);
+    cache
+        .lock()
+        .expect("flag probe cache")
+        .insert(key, accepted);
+    accepted
+}
+
 /// Whether `cc` accepts `flag`: compile a trivial translation unit from stdin
 /// with the flag and no output; success means the flag is understood. Any spawn
 /// failure (compiler absent) degrades to "unsupported" rather than an error, so a
@@ -6760,21 +6921,27 @@ fn sanitizer_fsanitize_name(s: multicore_fuzz::Sanitizer) -> &'static str {
     }
 }
 
-/// Native clang compile flags for `auto --sanitizers`. Replicates the harness
+/// Native compile flags for `auto --sanitizers`. Replicates the harness
 /// Makefile's default CFLAGS/CXXFLAGS structure — `-O1 -g`, the engine's
-/// `-fsanitize-coverage=trace-pc-guard,trace-cmp` (edge coverage #385 + cmplog
-/// #398/#400), and the UBSan check subtractions OSS-Fuzz also drops — but swaps the
-/// baked-in `-fsanitize=address,undefined` for EXACTLY the requested set, so a user
-/// can build an MSan/TSan harness (or pin ASan-only) instead of the default. Only the
+/// SanitizerCoverage (edge coverage #385 + cmplog #398/#400), and the UBSan check
+/// subtractions OSS-Fuzz also drops — but swaps the baked-in
+/// `-fsanitize=address,undefined` for EXACTLY the requested set, so a user can
+/// build an MSan/TSan harness (or pin ASan-only) instead of the default. Only the
 /// `-fsanitize=` group is replaced; COMPILE_DB_FLAGS / INCLUDES / AUTO_EXTRA_* are
 /// separate make variables and stay intact. C++ uses `gnu++17` (matching the cross
 /// override) since overriding CXXFLAGS drops the template's detected standard.
 ///
+/// The compilers are the ones the build would use anyway — the operator's
+/// CC/CXX or `[toolchain]` compilers, else clang — with flags spelled for their
+/// family. Only when the operator's compiler cannot build the requested
+/// sanitizers (gcc has no MemorySanitizer) does it switch to clang, and it says
+/// so once.
+///
 /// Sanitizers that conflict (e.g. `asan` + `msan`, or `msan` + `tsan`) will fail to
-/// compile — clang rejects the combination — which surfaces as a normal build error;
-/// `address,undefined,leak` are the compatible set. MSan/TSan are best-effort: without
-/// a fully-instrumented libc they can report false positives, but the harness still
-/// builds and runs.
+/// compile — the compiler rejects the combination — which surfaces as a normal
+/// build error; `address,undefined,leak` are the compatible set. MSan/TSan are
+/// best-effort: without a fully-instrumented libc they can report false
+/// positives, but the harness still builds and runs.
 fn sanitizer_compiler_override(
     sanitizers: &[multicore_fuzz::Sanitizer],
 ) -> crate::build::CFamilyCompilerOverride {
@@ -6787,31 +6954,171 @@ fn sanitizer_compiler_override(
             .join(",")
     );
     let has_ubsan = sanitizers.contains(&multicore_fuzz::Sanitizer::Ubsan);
-    native_coverage_override(Some(fsanitize), has_ubsan)
+    let (selected, note) = native_override_for(
+        &crate::toolchain::effective_compilers(),
+        Some(fsanitize),
+        has_ubsan,
+        crate::toolchain::compiler_family,
+        compiler_links_with_flag,
+    );
+    if let Some(note) = note {
+        announce_once(&note);
+    }
+    selected
 }
 
-/// Native clang compile flags for `auto --sanitizers none` (#434): the same
-/// `-O1 -g` + engine coverage (`-fsanitize-coverage=trace-pc-guard,trace-cmp`)
-/// structure as [`sanitizer_compiler_override`], but with NO `-fsanitize=` group.
-/// The harness gets coverage-guided, crash-only fuzzing (SIGSEGV/SIGABRT still
-/// caught) with zero ASan/UBSan false positives — the escape hatch for code that
-/// FP-storms under ASan (shared memory, custom allocators, RTOS). Replaces the
-/// Makefile's baked-in `-fsanitize=address,undefined`.
+/// Native compile flags for `auto --sanitizers none` (#434): the same
+/// `-O1 -g` + engine coverage structure as [`sanitizer_compiler_override`], but
+/// with NO `-fsanitize=` group. The harness gets coverage-guided, crash-only
+/// fuzzing (SIGSEGV/SIGABRT still caught) with zero ASan/UBSan false positives —
+/// the escape hatch for code that FP-storms under ASan (shared memory, custom
+/// allocators, RTOS). Replaces the Makefile's baked-in
+/// `-fsanitize=address,undefined`, and keeps the operator's compilers.
 fn coverage_only_compiler_override() -> crate::build::CFamilyCompilerOverride {
-    native_coverage_override(None, false)
+    native_override_for(
+        &crate::toolchain::effective_compilers(),
+        None,
+        false,
+        crate::toolchain::compiler_family,
+        compiler_links_with_flag,
+    )
+    .0
 }
 
-/// Shared builder for the native override: `-O1 -g`, an optional `-fsanitize=`
-/// group, the UBSan check subtractions (only when UBSan is present and a
-/// `-fsanitize=` group is set), then the engine's coverage flags last. Only the
-/// `-fsanitize=` group differs across callers; COMPILE_DB_FLAGS / INCLUDES /
-/// AUTO_EXTRA_* are separate make variables and stay intact. C++ uses `gnu++17`
-/// (matching the cross override) since overriding CXXFLAGS drops the template's
-/// detected standard.
-///
-/// Conflicting sanitizers (e.g. `asan`+`msan`) make clang reject the build — a
-/// normal build error; `address,undefined,leak` are the compatible set. MSan/TSan
-/// are best-effort without an instrumented libc but still build and run.
+/// Print `note` once per run, however many targets reach the same decision.
+fn announce_once(note: &str) {
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(BTreeSet::new()));
+    if seen
+        .lock()
+        .expect("announcement set")
+        .insert(note.to_owned())
+    {
+        bhfeprintln!("bhf auto: {note}");
+    }
+}
+
+/// Whether `compiler` compiles AND links a trivial program with `flag` (a
+/// sanitizer needs its runtime library, which only the link proves).
+/// Remembered per compiler and flag for the run.
+fn compiler_links_with_flag(compiler: &str, flag: &str) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<(String, String), bool>>> = OnceLock::new();
+    let key = (compiler.to_owned(), flag.to_owned());
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(&known) = cache.lock().expect("link probe cache").get(&key) {
+        return known;
+    }
+    let Ok(dir) = tempfile::tempdir() else {
+        return false;
+    };
+    let output = dir.path().join("probe");
+    let linked = Command::new(compiler)
+        .arg(flag)
+        .args(["-x", "c", "-", "-o"])
+        .arg(&output)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()
+        .and_then(|mut child| {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(b"int main(void) { return 0; }\n");
+            }
+            child.wait().ok()
+        })
+        .is_some_and(|status| status.success());
+    cache.lock().expect("link probe cache").insert(key, linked);
+    linked
+}
+
+/// GCC's sanitizer runtimes are shared libraries by default, and a shared
+/// libasan aborts at startup unless it comes first in the library list, which
+/// the runtrace `LD_PRELOAD` shim prevents. Link each requested runtime
+/// statically, as clang does.
+fn gcc_static_sanitizer_runtimes(fsanitize: &str) -> Vec<String> {
+    let set = fsanitize.strip_prefix("-fsanitize=").unwrap_or(fsanitize);
+    set.split(',')
+        .filter_map(|name| match name {
+            "address" => Some("-static-libasan"),
+            "undefined" => Some("-static-libubsan"),
+            "thread" => Some("-static-libtsan"),
+            "leak" => Some("-static-liblsan"),
+            _ => None,
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The native override for an explicit sanitizer selection (or none, for
+/// coverage only), built on `effective` — the compilers the build would use
+/// without an override. Returns the override and, when it had to leave the
+/// operator's compilers, a note saying which it used and why.
+fn native_override_for(
+    effective: &crate::toolchain::EffectiveCompilers,
+    fsanitize: Option<String>,
+    has_ubsan: bool,
+    family_of: impl Fn(&str, bool) -> Option<harness_gen::compiler_family::CompilerFamily>,
+    links_with: impl Fn(&str, &str) -> bool,
+) -> (crate::build::CFamilyCompilerOverride, Option<String>) {
+    use harness_gen::compiler_family::CompilerFamily;
+    let mut cc = effective.cc.clone();
+    let mut cxx = effective.cxx.clone();
+    let mut note = None;
+    if let (Some(fsanitize), true) = (&fsanitize, effective.explicit) {
+        if !links_with(&cc, fsanitize) {
+            note = Some(format!(
+                "--sanitizers: CC={cc} cannot build with {fsanitize}; building the C/C++ \
+                 harnesses with clang/clang++ instead"
+            ));
+            cc = "clang".to_owned();
+            cxx = "clang++".to_owned();
+        }
+    }
+    let c_family = family_of(&cc, false).unwrap_or(CompilerFamily::Clang);
+    let cxx_family = family_of(&cxx, true).unwrap_or(c_family);
+    let flags_for = |family: CompilerFamily, cpp: bool| {
+        let mut flags = vec!["-O1".to_owned(), "-g".to_owned()];
+        if cpp {
+            flags.push("-std=gnu++17".to_owned());
+            if family == CompilerFamily::Clang {
+                // Keep the generated C++ Makefile's compatibility suppression
+                // when --sanitizers replaces CXXFLAGS. Clang 18 otherwise rejects
+                // the pre-C++11 `"%" PRId64`/`"text"MACRO` idiom as a hard error.
+                flags.push("-Wno-reserved-user-defined-literal".to_owned());
+            }
+        }
+        if let Some(fsanitize) = &fsanitize {
+            flags.push(fsanitize.clone());
+            if family == CompilerFamily::Gcc {
+                flags.extend(gcc_static_sanitizer_runtimes(fsanitize));
+            }
+            // The `function`/`vptr`/`alignment` checks fire on pervasive
+            // harmless patterns; subtract them only when UBSan is in the set (the
+            // subtraction must follow `-fsanitize=undefined`), mirroring the
+            // Makefile default, in the spelling this family accepts.
+            if has_ubsan {
+                flags.push(family.ubsan_subtraction().to_owned());
+            }
+        }
+        flags.push(family.coverage_flag().to_owned());
+        flags
+    };
+    (
+        crate::build::CFamilyCompilerOverride {
+            cflags: flags_for(c_family, false),
+            cxxflags: flags_for(cxx_family, true),
+            cc,
+            cxx,
+        },
+        note,
+    )
+}
+
 /// File under a target's `repairs/` holding the last C/C++ build's raw combined
 /// output, mirroring the Ada lane's log. The classified errors are not enough on
 /// their own: most kinds carry a name and no location (`IncompleteType` is just a
@@ -6926,29 +7233,17 @@ fn eject_unbuildable_added_source(
 /// different built-in expectations. A target that only one of them can compile
 /// was simply lost, because bhf always used the same one.
 ///
-/// The coverage flag differs between them and is not interchangeable: GCC has no
-/// `trace-pc-guard`, and asking for it fails the build outright, so the fallback
-/// carries GCC's `trace-pc` — the same flag the generated Makefile emits when it
-/// detects a GCC toolchain.
+/// Only the compilers change: the generated Makefile chooses its flags from the
+/// compiler that runs, so gcc gets GCC's `trace-pc` coverage and sanitizer
+/// spelling without bhf replacing CFLAGS/CXXFLAGS (and the C++ dialect ladder's
+/// `CXX_STD` keeps applying). The toolchain stamp rebuilds every object the
+/// previous compiler left behind.
 fn gcc_fallback_override() -> crate::build::CFamilyCompilerOverride {
-    let coverage = "-fsanitize-coverage=trace-pc".to_owned();
-    let sanitizers = "-fsanitize=address,undefined".to_owned();
-    let no_sanitize = "-fno-sanitize=alignment".to_owned();
-    let base = |extra: &str| {
-        let mut flags = vec!["-O1".to_owned(), "-g".to_owned()];
-        if !extra.is_empty() {
-            flags.push(extra.to_owned());
-        }
-        flags.push(sanitizers.clone());
-        flags.push(no_sanitize.clone());
-        flags.push(coverage.clone());
-        flags
-    };
     crate::build::CFamilyCompilerOverride {
         cc: "gcc".to_owned(),
         cxx: "g++".to_owned(),
-        cflags: base(""),
-        cxxflags: base("-std=gnu++17"),
+        cflags: Vec::new(),
+        cxxflags: Vec::new(),
     }
 }
 
@@ -6956,43 +7251,6 @@ fn gcc_fallback_override() -> crate::build::CFamilyCompilerOverride {
 /// whole run instead of every target rediscovering it.
 fn c_compiler_cache_path(work_dir: &Path) -> PathBuf {
     work_dir.join("c_compiler.txt")
-}
-
-fn native_coverage_override(
-    fsanitize: Option<String>,
-    has_ubsan: bool,
-) -> crate::build::CFamilyCompilerOverride {
-    let coverage = "-fsanitize-coverage=trace-pc-guard,trace-cmp".to_owned();
-    let mut cflags = vec!["-O1".to_owned(), "-g".to_owned()];
-    let mut cxxflags = vec![
-        "-O1".to_owned(),
-        "-g".to_owned(),
-        "-std=gnu++17".to_owned(),
-        // Keep the generated C++ Makefile's compatibility suppression when
-        // --sanitizers replaces CXXFLAGS. Clang 18 otherwise rejects the
-        // pre-C++11 `"%" PRId64`/`"text"MACRO` idiom as a hard error.
-        "-Wno-reserved-user-defined-literal".to_owned(),
-    ];
-    if let Some(fsanitize) = fsanitize {
-        cflags.push(fsanitize.clone());
-        cxxflags.push(fsanitize);
-        // The `function`/`vptr`/`alignment` checks fire on pervasive harmless
-        // patterns; subtract them only when UBSan is in the set (the subtraction
-        // must follow `-fsanitize=undefined`), mirroring the Makefile default.
-        if has_ubsan {
-            let no_sanitize = "-fno-sanitize=function,vptr,alignment".to_owned();
-            cflags.push(no_sanitize.clone());
-            cxxflags.push(no_sanitize);
-        }
-    }
-    cflags.push(coverage.clone());
-    cxxflags.push(coverage);
-    crate::build::CFamilyCompilerOverride {
-        cc: "clang".to_owned(),
-        cxx: "clang++".to_owned(),
-        cflags,
-        cxxflags,
-    }
 }
 
 /// Build the emulation wrapper that launches a cross-built harness: qemu-user
@@ -7006,6 +7264,29 @@ fn cross_harness_wrapper(target: &CrossTarget) -> crate::runner::HarnessWrapper 
         },
         CrossRunner::Wine { exe } => crate::runner::HarnessWrapper::Wine {
             exe: PathBuf::from(exe),
+        },
+        // An operator runner prefixes the harness exactly like qemu-user does.
+        CrossRunner::Configured { exe, args } => crate::runner::HarnessWrapper::QemuUser {
+            exe: PathBuf::from(exe),
+            args: args.clone(),
+        },
+    }
+}
+
+/// The wrapper for a runner on its own (an Ada harness's): qemu-user and an
+/// operator runner prefix the harness with their arguments, wine with none.
+fn runner_wrapper(runner: &CrossRunner) -> crate::runner::HarnessWrapper {
+    match runner {
+        CrossRunner::QemuUser { exe } => crate::runner::HarnessWrapper::QemuUser {
+            exe: PathBuf::from(exe),
+            args: Vec::new(),
+        },
+        CrossRunner::Wine { exe } => crate::runner::HarnessWrapper::Wine {
+            exe: PathBuf::from(exe),
+        },
+        CrossRunner::Configured { exe, args } => crate::runner::HarnessWrapper::QemuUser {
+            exe: PathBuf::from(exe),
+            args: args.clone(),
         },
     }
 }
@@ -7067,6 +7348,7 @@ fn try_build_ada(
     ada_dep_dirs: &[PathBuf],
     dir_filter: &crate::auto::discovery::DirFilter,
     project_override: Option<&Path>,
+    ada_toolchain: &crate::toolchain::AdaBuildSettings,
     round: usize,
 ) -> BuildOutcome {
     // The Ada build pipeline (prepare_layout in crate::build) requires
@@ -7122,7 +7404,13 @@ fn try_build_ada(
     }
 
     // #91: build against the SAME governing project used for staging/exclusions.
-    run_ada_build_once(work_dir, harness_id, governing_gpr.as_deref(), round)
+    run_ada_build_once(
+        work_dir,
+        harness_id,
+        governing_gpr.as_deref(),
+        ada_toolchain,
+        round,
+    )
 }
 
 /// The generic repair loop records selected real C definitions and generated C
@@ -7179,16 +7467,16 @@ fn stage_ada_c_repair_sources(
     Ok(())
 }
 
-/// Run the Ada build pipeline once for `harness_id` and classify the result.
-/// `BuildArgs` defaults mirror clap's value-enum defaults for the build
-/// subcommand (host_file probe, libfuzzer engine — the latter irrelevant here).
-fn run_ada_build_once(
+/// The `bhf build` arguments of an auto Ada harness build: the sweep's Ada
+/// toolchain (target, runtime, prefix or explicit tools, switches, probe
+/// backend), and clap's defaults for the rest.
+fn ada_build_args(
     work_dir: &Path,
     harness_id: &str,
     source_project: Option<&Path>,
-    round: usize,
-) -> BuildOutcome {
-    let build_args = crate::build::BuildArgs {
+    ada_toolchain: &crate::toolchain::AdaBuildSettings,
+) -> crate::build::BuildArgs {
+    let mut args = crate::build::BuildArgs {
         work_dir: work_dir.to_path_buf(),
         source_project: source_project.map(Path::to_path_buf),
         harness: Some(harness_id.to_owned()),
@@ -7196,8 +7484,24 @@ fn run_ada_build_once(
         runtime: None,
         toolchain: None,
         probe_backend: crate::probe_backend::ProbeBackend::HostFile,
+        toolchain_args: crate::build::BuildToolchainArgs::default(),
         c_engine: crate::build::CEngine::Libfuzzer,
     };
+    ada_toolchain.apply_to(&mut args);
+    args
+}
+
+/// Run the Ada build pipeline once for `harness_id` and classify the result.
+/// `BuildArgs` defaults mirror clap's value-enum defaults for the build
+/// subcommand (host_file probe, libfuzzer engine — the latter irrelevant here).
+fn run_ada_build_once(
+    work_dir: &Path,
+    harness_id: &str,
+    source_project: Option<&Path>,
+    ada_toolchain: &crate::toolchain::AdaBuildSettings,
+    round: usize,
+) -> BuildOutcome {
+    let build_args = ada_build_args(work_dir, harness_id, source_project, ada_toolchain);
     // Persist the raw combined output so the force-fuzz external-stub refiner
     // (which needs GNAT's `expected/found` type pairs, not just the classified
     // errors) can read it in the repair loop.
@@ -9366,11 +9670,28 @@ mod ipc_reachability_tests {
 
 #[cfg(test)]
 mod sanitizer_override_tests {
-    use super::{coverage_only_compiler_override, sanitizer_compiler_override};
-    use multicore_fuzz::Sanitizer;
+    use super::native_override_for;
+    use crate::toolchain::EffectiveCompilers;
+    use harness_gen::compiler_family::{family_from_name, CompilerFamily};
 
     fn has_flag(flags: &[String], needle: &str) -> bool {
         flags.iter().any(|f| f.contains(needle))
+    }
+
+    fn by_name(compiler: &str, _cxx: bool) -> Option<CompilerFamily> {
+        family_from_name(compiler)
+    }
+
+    fn compilers(cc: &str, cxx: &str, explicit: bool) -> EffectiveCompilers {
+        EffectiveCompilers {
+            cc: cc.to_owned(),
+            cxx: cxx.to_owned(),
+            explicit,
+        }
+    }
+
+    fn clang_default() -> EffectiveCompilers {
+        compilers("clang", "clang++", false)
     }
 
     #[test]
@@ -9378,7 +9699,8 @@ mod sanitizer_override_tests {
         // `--sanitizers none` (#434): native crash-only + coverage. The build must
         // carry the engine's coverage instrumentation but NO `-fsanitize=` group,
         // so ASan/UBSan never run and cannot false-positive.
-        let ov = coverage_only_compiler_override();
+        let (ov, note) = native_override_for(&clang_default(), None, false, by_name, |_, _| true);
+        assert_eq!(note, None);
         for flags in [&ov.cflags, &ov.cxxflags] {
             assert!(
                 has_flag(flags, "-fsanitize-coverage=trace-pc-guard,trace-cmp"),
@@ -9404,7 +9726,13 @@ mod sanitizer_override_tests {
     fn set_override_keeps_fsanitize_and_coverage() {
         // `--sanitizers asan,ubsan` still bakes the exact -fsanitize= set plus
         // coverage, and subtracts the noisy UBSan checks.
-        let ov = sanitizer_compiler_override(&[Sanitizer::Asan, Sanitizer::Ubsan]);
+        let (ov, _) = native_override_for(
+            &clang_default(),
+            Some("-fsanitize=address,undefined".to_owned()),
+            true,
+            by_name,
+            |_, _| true,
+        );
         assert!(
             ov.cxxflags
                 .iter()
@@ -9427,8 +9755,124 @@ mod sanitizer_override_tests {
 
     #[test]
     fn set_override_without_ubsan_does_not_subtract_checks() {
-        let ov = sanitizer_compiler_override(&[Sanitizer::Asan]);
+        let (ov, _) = native_override_for(
+            &clang_default(),
+            Some("-fsanitize=address".to_owned()),
+            false,
+            by_name,
+            |_, _| true,
+        );
         assert!(!has_flag(&ov.cflags, "-fno-sanitize="), "{:?}", ov.cflags);
+    }
+
+    /// `--sanitizers` used to replace an operator's CC/CXX with clang without
+    /// a word. It keeps them when they can build the sanitizers, in their own
+    /// flag spelling.
+    #[test]
+    fn an_operator_gcc_is_kept_with_gcc_spelled_flags() {
+        let (ov, note) = native_override_for(
+            &compilers("gcc", "g++", true),
+            Some("-fsanitize=address,undefined".to_owned()),
+            true,
+            by_name,
+            |_, _| true,
+        );
+        assert_eq!(note, None);
+        assert_eq!((ov.cc.as_str(), ov.cxx.as_str()), ("gcc", "g++"));
+        for flags in [&ov.cflags, &ov.cxxflags] {
+            assert!(has_flag(flags, "-fsanitize=address,undefined"), "{flags:?}");
+            assert!(
+                has_flag(flags, "-fsanitize-coverage=trace-pc,trace-cmp"),
+                "{flags:?}"
+            );
+            assert!(!has_flag(flags, "trace-pc-guard"), "{flags:?}");
+            assert!(has_flag(flags, "-fno-sanitize=alignment"), "{flags:?}");
+            assert!(!has_flag(flags, "function"), "{flags:?}");
+            // A shared libasan aborts under the runtrace LD_PRELOAD shim.
+            assert!(
+                has_flag(flags, "-static-libasan") && has_flag(flags, "-static-libubsan"),
+                "{flags:?}"
+            );
+            assert!(!has_flag(flags, "-Wno-reserved-user-defined-literal"));
+        }
+        // Coverage only keeps the operator's compiler too.
+        let (ov, _) = native_override_for(
+            &compilers("gcc", "g++", true),
+            None,
+            false,
+            by_name,
+            |_, _| unreachable!("nothing to probe without a sanitizer"),
+        );
+        assert_eq!(ov.cc, "gcc");
+        assert!(has_flag(&ov.cflags, "trace-pc,trace-cmp"));
+    }
+
+    /// The gcc retry swaps only the compilers: the Makefile picks GCC's flags
+    /// itself, so the retry keeps `trace-cmp` and the dialect ladder's standard.
+    #[test]
+    fn the_gcc_retry_changes_only_the_compilers() {
+        let ov = super::gcc_fallback_override();
+        assert_eq!((ov.cc.as_str(), ov.cxx.as_str()), ("gcc", "g++"));
+        assert!(ov.cflags.is_empty() && ov.cxxflags.is_empty(), "{ov:?}");
+    }
+
+    /// An auto Ada build carries the sweep's Ada toolchain into `bhf build`.
+    #[test]
+    fn ada_builds_carry_the_configured_toolchain() {
+        let settings = crate::toolchain::AdaBuildSettings {
+            target: Some("aarch64-linux-gnu".to_owned()),
+            runtime: Some("light".to_owned()),
+            prefix: Some("aarch64-linux-gnu".to_owned()),
+            gprbuild: None,
+            gnat: Some("/opt/gnat/bin/aarch64-linux-gnu-gnat".to_owned()),
+            switches: vec!["-O1".to_owned()],
+            probe_backend: crate::probe_backend::ProbeBackend::MemoryBuffer,
+            runner: None,
+        };
+        let args = super::ada_build_args(std::path::Path::new("/w"), "H-A0001", None, &settings);
+        assert_eq!(args.target.as_deref(), Some("aarch64-linux-gnu"));
+        assert_eq!(args.runtime.as_deref(), Some("light"));
+        assert_eq!(args.toolchain.as_deref(), Some("aarch64-linux-gnu"));
+        assert_eq!(
+            args.toolchain_args.ada_gnat.as_deref(),
+            Some("/opt/gnat/bin/aarch64-linux-gnu-gnat")
+        );
+        assert_eq!(args.toolchain_args.ada_switches, ["-O1"]);
+        assert_eq!(
+            args.probe_backend,
+            crate::probe_backend::ProbeBackend::MemoryBuffer
+        );
+        let default = super::ada_build_args(
+            std::path::Path::new("/w"),
+            "H-A0001",
+            None,
+            &crate::toolchain::AdaBuildSettings::default(),
+        );
+        assert_eq!(default.target, None);
+        assert_eq!(
+            default.probe_backend,
+            crate::probe_backend::ProbeBackend::HostFile
+        );
+    }
+
+    /// A sanitizer the operator's compiler cannot build (gcc has no
+    /// MemorySanitizer) switches to clang, and says so.
+    #[test]
+    fn an_unsupported_sanitizer_switches_to_clang_with_a_note() {
+        let (ov, note) = native_override_for(
+            &compilers("gcc", "g++", true),
+            Some("-fsanitize=memory".to_owned()),
+            false,
+            by_name,
+            |compiler, flag| compiler != "gcc" || flag != "-fsanitize=memory",
+        );
+        assert_eq!((ov.cc.as_str(), ov.cxx.as_str()), ("clang", "clang++"));
+        let note = note.expect("the switch is announced");
+        assert!(
+            note.contains("CC=gcc") && note.contains("-fsanitize=memory") && note.contains("clang"),
+            "{note}"
+        );
+        assert!(has_flag(&ov.cflags, "trace-pc-guard"), "{:?}", ov.cflags);
     }
 }
 
@@ -11466,17 +11910,39 @@ mod platform_stub_tests {
     }
 
     #[test]
-    fn aarch64_cross_override_stays_coverage_blind() {
-        // The qemu-user arch path is unchanged: plain `-O1 -g` (ASan/coverage do
-        // not survive qemu-user today). Guards against accidentally arming it.
+    fn an_emulated_cross_build_arms_coverage_when_the_compiler_accepts_it() {
+        // The qemu-user arch path used to build plain `-O1 -g`, fuzzing blind,
+        // although the cross GCCs accept `trace-pc` + `trace-cmp` and the driver
+        // implements both callbacks. ASan stays off: it does not survive qemu-user.
         let target = crate::auto::cross_target::resolve_cross_target("aarch64").unwrap();
-        let ov = cross_compiler_override(&target);
-        let cflags = ov.cflags.join(" ");
-        assert!(
-            !cflags.contains("fsanitize-coverage"),
-            "aarch64 cross stays coverage-blind, got: {cflags}"
-        );
-        assert!(!cflags.contains("-fsanitize=address"));
+        let ov = super::cross_compiler_override_with(&target, |_, _| true);
+        for flags in [&ov.cflags, &ov.cxxflags] {
+            let joined = flags.join(" ");
+            assert!(
+                joined.contains("-fsanitize-coverage=trace-pc,trace-cmp"),
+                "aarch64 cross build must be coverage-guided, got: {joined}"
+            );
+            assert!(!joined.contains("trace-pc-guard"), "{joined}");
+            assert!(!joined.contains("-fsanitize=address"), "{joined}");
+        }
+        // A toolchain that rejects the flag degrades to the plain build.
+        let ov = super::cross_compiler_override_with(&target, |_, _| false);
+        assert!(!ov.cflags.join(" ").contains("fsanitize-coverage"));
+
+        // An operator's runner is an emulated build too.
+        let configured = CrossTarget {
+            runner: CrossRunner::Configured {
+                exe: "qemu-aarch64".to_owned(),
+                args: vec!["-L".to_owned(), "/usr/aarch64-linux-gnu".to_owned()],
+            },
+            ..target
+        };
+        let ov = super::cross_compiler_override_with(&configured, |_, _| true);
+        assert!(ov.cflags.join(" ").contains("trace-pc,trace-cmp"));
+        assert!(matches!(
+            super::cross_harness_wrapper(&configured),
+            crate::runner::HarnessWrapper::QemuUser { ref args, .. } if args.len() == 2
+        ));
     }
 
     #[test]

@@ -69,7 +69,7 @@ their own interpreters with in-process edge coverage.
 | `--max-work-dir-mb <MiB>` | `4096` | Stop starting new targets once the allocated work-directory size reaches the ceiling. Completed and in-flight targets are preserved and reported, so parallel jobs can overshoot by their final artifacts. `0` disables the ceiling; findings are never deleted to meet it |
 | `--max-corpus-mb <MiB>` | `64` | Per-target retained coverage-corpus ceiling for both memory and `corpus/<harness-id>/queue/`. Finding testcases are separate and always preserved |
 | `--reuse-legacy-corpus` | off | In a work dir from an earlier release (migrated from the 0.2.x layout, or run by an earlier `bhf auto`), keep reseeding its old corpus instead of moving it to `corpus-legacy/` on the first run |
-| `--config <PATH>` | auto-load `.bhf.toml` | Load run options from a TOML file so a project's runs are reproducible; CLI flags always override it. Keys are the flag names in kebab-case (`per-target-time = 30`, `cxx-std = "gnu++14"`, `extra-include = ["deps/inc"]`); `seed-mining = false` turns tree seed mining off. Without this flag, a `.bhf.toml` in the scanned tree root is auto-loaded — but since that tree is untrusted, an auto-loaded config honors only SAFE knobs; the build-EXECUTING keys (`build-command`, `run-untrusted`, `unsafe-search-and-run-build-commands`) are ignored unless the config is passed explicitly with `--config` |
+| `--config <PATH>` | auto-load `.bhf.toml` | Load run options from a TOML file so a project's runs are reproducible; CLI flags always override it, and relative paths in it resolve against the file's own directory. Only the keys listed under [Config file](#config-file) are accepted, any other key is an error. Without this flag, a `.bhf.toml` in the scanned tree root is auto-loaded — but since that tree is untrusted, an auto-loaded config honors only SAFE knobs; the keys that EXECUTE something (`build-command`, `run-untrusted`, `unsafe-search-and-run-build-commands`, `probe-build`, and the whole `[toolchain]` table) are ignored, with a note, unless the config is passed explicitly with `--config` |
 | `--dry-run` | off | Plan only: discover + rank targets, run the toolchain preflight, report the build-recovery plan, then EXIT without building or fuzzing — validate scope, config, and toolchains before a long run |
 | `--per-target-time <SECS>` | `60` | **Total** per-target fuzz wall, split evenly across the passes under one shared deadline (so the per-target wall ≈ this, not × pass count). libFuzzer `-max_total_time` / AFL `-V` parity (#402) |
 | `--per-target-finding-count <N>` | unset (collect all) | Stop a target as soon as it has produced N **distinct** findings (crash signatures), or when its `--per-target-time` is spent — whichever first. Checked mid-pass (stops the instant the Nth lands; remaining passes skipped). `1` ≈ libFuzzer stop-on-first-crash |
@@ -97,6 +97,13 @@ their own interpreters with in-process edge coverage.
 | `--seed-dir <DIR>` | none | Directory of seed inputs (one per regular file, in name order); repeatable |
 | `--no-seed-mining` | off | Do not seed targets from the tree's own test-data files (see [Seeds](#seeds)). Config key: `seed-mining = false` |
 | `--extra-include <DIR>` | none | Extra C/C++ include dirs for dependency headers outside the swept tree; seeded onto every harness `-I` ahead of synthesized placeholders. Read from local disk only; paths with spaces are quoted; repeatable |
+| `--cc <PROGRAM>` / `--cxx <PROGRAM>` | `clang` / `clang++` | C/C++ compiler for every harness build (a name on `PATH` or a path), replacing `CC`/`CXX`. The Makefile picks matching instrumentation (gcc, a cross-prefixed gcc, or clang), so no flag spelling has to be adapted. The choice is announced; config keys `toolchain.cc` / `toolchain.cxx` |
+| `--cflags <FLAGS>` / `--cxxflags <FLAGS>` / `--ldflags <FLAGS>` | none | Extra compile / link flags, APPENDED to bhf's coverage and sanitizer flags (whitespace-separated; repeatable). They apply to the lanes built with `$(CC)`/`$(CXX)`; config keys `toolchain.cflags` / `toolchain.cxxflags` / `toolchain.ldflags` |
+| `--define <NAME[=VALUE]>` / `--toolchain-include <DIR>` | none | Preprocessor definitions and `-I` directories for every harness compile and every lane (repeatable); config keys `toolchain.defines` / `toolchain.include-dirs` |
+| `--sysroot <DIR>` | unset | Handed to the compiler as `--sysroot=`, and to a qemu-user runner as `-L <DIR>` when `--runner-arg` is not given; config key `toolchain.sysroot` |
+| `--target-triple <TRIPLE>` | host | Build every C/C++ candidate for this triple, with `<triple>-gcc`/`<triple>-g++` unless `--cc`/`--cxx` name the compilers (a clang gets `--target=`). A triple the host cannot run needs `--runner`; config key `toolchain.target` |
+| `--runner <PROGRAM>` / `--runner-arg <ARG>` | unset | Whole-sweep cross mode: every C/C++ candidate is built for the target WITH coverage and fuzzed under this emulator (`qemu-aarch64`). Arguments go between the runner and the harness; see [Cross-Compilation](../cross-compilation/#whole-sweep-cross-targets). Config keys `toolchain.runner` / `toolchain.runner-args` |
+| `--ada-prefix`, `--ada-target`, `--ada-runtime`, `--ada-gprbuild`, `--ada-gnat`, `--ada-switch`, `--probe-backend` | host GNAT, `host_file` | The Ada toolchain of every Ada harness build: tool prefix (`<prefix>-gnat`), `for Target use`, `for Runtime ("Ada") use`, explicit `gprbuild`/`gnat` programs, extra compiler switches appended to bhf's, and the AdaFuzz probe backend. `--ada-target` defaults to `--target-triple`. Config keys `toolchain.ada.prefix`, `toolchain.ada.target`, `toolchain.ada.runtime`, `toolchain.ada.gprbuild`, `toolchain.ada.gnat`, `toolchain.ada.switches`, `toolchain.ada.probe-backend` |
 | `--ada-deps <DIR>` | none | Local Ada dependency-source dirs put on the build path (offline: never fetched); repeatable. Locally-cached Alire deps are picked up automatically |
 | `--probe-build` | off | Run the project's own build offline to recover real compile flags and generated headers. Detects + drives CMake, Meson, Visual Studio, Make/autotools (compiler-interposing wrapper), Ninja, and — under interception — Bazel/SCons. EXECUTES untrusted build scripts (sandboxed when bwrap/firejail is present) |
 | `--build-command <CMD>` | unset | Recover flags from any CUSTOM build (a `build.sh`, Waf, a vendor RTOS build) by running `<CMD>` under (1) a front-of-`PATH` compiler shim for `cc`/`gcc`/`clang` + named vendor compilers (Diab, Green Hills, QNX, Keil/IAR, TI) + cross-prefixed toolchains invoked by name, and (2) an `LD_PRELOAD` exec-interposer for compilers invoked by absolute path or `posix_spawn`. The universal escape hatch; takes precedence over the auto-detected tier. Accepts either a script (`--build-command ./build.sh`) or a full command (`--build-command "make -C src lib"`), run via `sh -c`. EXECUTES the command (sandboxed when available). When builds fail and a custom build script is present, `auto` prints a ready-to-run hint with this flag |
@@ -122,6 +129,79 @@ their own interpreters with in-process edge coverage.
 | `--no-stubs` | off | Skip build-time auto-stubbing (diagnostics only) |
 | `--mode reporting\|attacking` | `reporting` | Actionability profile and, in attacking mode, target scheduling |
 | `--verbose` / `-v` | off | Per-target outcome detail: skip/fail reason, repairs applied, per-pass exec/finding counts |
+
+## Config file
+
+`--config <PATH>` (or a `.bhf.toml` auto-loaded from the scanned tree root)
+holds run options as TOML. A key fills a flag the command line left at its
+default; relative paths resolve against the config file's directory, so the
+file means the same thing from any working directory. Only these keys exist,
+each spelled like its flag:
+
+- Run budget and limits: `per-target-time`, `max-targets`, `jobs`,
+  `rss-limit-mb`, `max-work-dir-mb`, `max-corpus-mb`, `max-len`, `timeout`.
+- Build inputs: `cxx-std`, `grammar`, `extra-include`, `extra-source`,
+  `exclude-path`, `project`, `ada-deps`.
+- Seeds and selection: `seed-file`, `seed-dir`, `seed-mining = false` (the
+  `--no-seed-mining` flag), `sanitizers`, `engine`, `languages`, `passes`,
+  `force`.
+- Explicit `--config` only, because they execute something: `build-command`,
+  `run-untrusted`, `unsafe-search-and-run-build-commands`, `probe-build`, and
+  the `[toolchain]` table.
+
+The other flags (target selection, `--resume`, `--dry-run`, output and
+diagnostic switches) have no key; a unit test keeps this list and the flag set
+in step.
+
+The `[toolchain]` table is shared with `bhf build --config`:
+
+```toml
+[toolchain]
+cc = "aarch64-linux-gnu-gcc"     # program on PATH, or a path
+cxx = "aarch64-linux-gnu-g++"
+cflags = ["-O1"]                 # appended to bhf's instrumentation
+cxxflags = []
+ldflags = []
+defines = ["BOARD=3"]            # NAME or NAME=VALUE
+include-dirs = ["vendor/include"]
+target = "aarch64-linux-gnu"     # without cc/cxx: <target>-gcc / <target>-g++
+sysroot = "/opt/sdk/sysroot"
+runner = "qemu-aarch64"          # runs whatever is built for another target
+runner-args = ["-L", "/usr/aarch64-linux-gnu"]
+
+[toolchain.ada]
+prefix = "aarch64-linux-gnu"     # <prefix>-gnat; also the Target by default (Ada only)
+gprbuild = "/opt/gnat/bin/gprbuild"
+gnat = "/opt/gnat/bin/aarch64-linux-gnu-gnat"
+target = "aarch64-linux-gnu"     # defaults to [toolchain] target
+runtime = "light"
+switches = ["-O1"]
+probe-backend = "memory_buffer"
+```
+
+Every value is validated before the sweep starts: an unknown key, a define
+that is not `NAME[=VALUE]`, a target that is not a triple, `runner-args`
+without a `runner`, a compiler or runner that is not installed, a target (C/C++
+or Ada) or a C/C++ compiler (including `CC`/`CXX` from the environment) that
+builds for a platform the host cannot run without a runner, and a runner with
+nothing foreign to run are all errors naming the key.
+
+The C/C++ candidates become a cross sweep only when the C/C++ side builds for
+another target (`target`, or a cross `cc`); a runner set for a foreign
+`[toolchain.ada] target` alone runs just the Ada harnesses, and the C/C++
+candidates keep their native sanitizer builds. In a cross sweep, the archives
+`probe-build`/`build-command`/`run-untrusted` build for this host are not
+linked into the harnesses (their compile database still applies). See
+[Cross-Compilation](../cross-compilation/#whole-sweep-cross-targets).
+
+An Ada harness's project extends the governing project but replaces its
+`package Compiler` switches with bhf's own; add the switches the harness needs
+(such as `-O1`) with `switches`.
+
+`toolchain.cflags` reach bhf's driver object as well as the target's
+translation units (without `-std=` and `-Werror`), so an ABI-selecting flag
+(`-m32`, `-mabi=...`) applies to the whole link; in a C++ harness the driver
+takes `cxxflags` too.
 
 ## Outputs and disk cleanup
 

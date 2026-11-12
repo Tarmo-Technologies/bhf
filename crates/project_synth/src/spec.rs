@@ -28,6 +28,9 @@ pub struct ProjectSpec {
     pub ada_standard: AdaStandard,
     pub target: Option<String>,
     pub runtime: Option<String>,
+    /// A gprconfig compiler name (`GNAT`), written as `Toolchain_Name`, or a
+    /// tool prefix (`aarch64-linux-gnu`), which supplies `Target` when
+    /// `target` is unset (see [`crate::gpr_toolchain_name`]).
     pub toolchain: Option<String>,
     pub switches: Switches,
     pub with_clauses: Vec<PathBuf>,

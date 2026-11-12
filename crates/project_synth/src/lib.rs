@@ -12,6 +12,16 @@ pub fn crate_name() -> &'static str {
     "project_synth"
 }
 
+/// `toolchain` when it is a gprconfig compiler NAME (`GNAT`, `GNAT_LLVM`): an
+/// identifier, which is what `for Toolchain_Name (...) use` must hold. A tool
+/// prefix or target triple (`aarch64-linux-gnu`) contains a `-` and is not one.
+pub fn gpr_toolchain_name(toolchain: &str) -> Option<&str> {
+    let mut chars = toolchain.chars();
+    let identifier = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    identifier.then_some(toolchain)
+}
+
 #[cfg(test)]
 mod tests {
     use ada_parser::ast::AdaStandard;
@@ -206,7 +216,54 @@ mod tests {
 
         assert!(rendered.contains("for Target use \"aarch64-linux-gnu\";"));
         assert!(rendered.contains("for Runtime (\"Ada\") use \"ravenscar-full\";"));
-        assert!(rendered.contains("for Toolchain_Name (\"Ada\") use \"aarch64-linux-gnu\";"));
+        // A tool prefix is not a gprconfig compiler name: written as
+        // Toolchain_Name, gprconfig finds no Ada compiler at all.
+        assert!(!rendered.contains("Toolchain_Name"), "{rendered}");
+    }
+
+    #[test]
+    fn a_toolchain_prefix_supplies_the_target_when_none_is_given() {
+        let mut spec = spec_named("Bhf_Build");
+        spec.toolchain = Some("aarch64-linux-gnu".to_owned());
+        let rendered = render_project(&spec).expect("project renders");
+        assert!(
+            rendered.contains("for Target use \"aarch64-linux-gnu\";"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Toolchain_Name"), "{rendered}");
+
+        // A trailing dash on the prefix is not part of the triple.
+        spec.toolchain = Some("arm-eabi-".to_owned());
+        let rendered = render_project(&spec).expect("project renders");
+        assert!(
+            rendered.contains("for Target use \"arm-eabi\";"),
+            "{rendered}"
+        );
+
+        // An explicit target wins over the prefix.
+        spec.toolchain = Some("aarch64-linux-gnu".to_owned());
+        spec.target = Some("aarch64-elf".to_owned());
+        let rendered = render_project(&spec).expect("project renders");
+        assert!(
+            rendered.contains("for Target use \"aarch64-elf\";"),
+            "{rendered}"
+        );
+        assert_eq!(rendered.matches("for Target use").count(), 1, "{rendered}");
+    }
+
+    #[test]
+    fn a_gprconfig_compiler_name_is_written_as_the_toolchain_name() {
+        let mut spec = spec_named("Bhf_Build");
+        spec.toolchain = Some("GNAT_LLVM".to_owned());
+        let rendered = render_project(&spec).expect("project renders");
+        assert!(
+            rendered.contains("for Toolchain_Name (\"Ada\") use \"GNAT_LLVM\";"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("for Target use"), "{rendered}");
+        assert_eq!(crate::gpr_toolchain_name("GNAT"), Some("GNAT"));
+        assert_eq!(crate::gpr_toolchain_name("aarch64-linux-gnu"), None);
+        assert_eq!(crate::gpr_toolchain_name(""), None);
     }
 
     #[test]

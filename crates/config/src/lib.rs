@@ -2,6 +2,10 @@
 
 use std::str::FromStr;
 
+pub mod toolchain;
+
+pub use toolchain::{AdaToolchainConfig, ToolchainConfig, ToolchainConfigError};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Profile {
     StrictPermissive,

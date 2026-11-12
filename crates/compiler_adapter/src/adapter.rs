@@ -171,6 +171,12 @@ impl CompilerAdapter {
 
     pub(crate) fn canary_compiler(&self) -> Result<(CanaryCompilerKind, &Path), CompilerError> {
         if self.toolchain.compiler_prefix().is_some() {
+            // `<prefix>-gnatmake` takes the canary's compile switches as given;
+            // the `<prefix>-gnat` driver wants a subcommand first, so it is the
+            // fallback when no prefixed gnatmake is installed.
+            if let Some(gnatmake) = self.gnatmake.as_deref() {
+                return Ok((CanaryCompilerKind::Gnatmake, gnatmake));
+            }
             let gnat = self.gnat.as_deref().ok_or_else(|| {
                 self.toolchain
                     .missing_tool_error(self.toolchain.prefixed_tool_name("gnat"))

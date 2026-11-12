@@ -67,13 +67,30 @@ pub fn render_project(spec: &ProjectSpec) -> Result<String, ProjectSynthError> {
     if let Some(main_adb) = &spec.main_adb {
         out.push_str(&format!("   for Main use (\"{main_adb}\");\n"));
     }
-    if let Some(target) = &spec.target {
+    // `toolchain` is either a gprconfig compiler name (`GNAT`, `GNAT_LLVM`),
+    // written as Toolchain_Name, or a tool prefix (`aarch64-linux-gnu`). A
+    // prefix only locates `<prefix>-gprbuild`/`<prefix>-gnat`; as a
+    // Toolchain_Name it matches no compiler in gprconfig's knowledge base and
+    // the project has no Ada compiler at all. A prefix is the target triple, so
+    // it becomes `for Target use` when no target was given.
+    let toolchain_name = spec
+        .toolchain
+        .as_deref()
+        .and_then(crate::gpr_toolchain_name);
+    let target = spec.target.clone().or_else(|| {
+        spec.toolchain
+            .as_deref()
+            .filter(|toolchain| crate::gpr_toolchain_name(toolchain).is_none())
+            .map(|prefix| prefix.trim_end_matches('-').to_owned())
+            .filter(|prefix| !prefix.is_empty())
+    });
+    if let Some(target) = &target {
         out.push_str(&format!("   for Target use \"{target}\";\n"));
     }
     if let Some(runtime) = &spec.runtime {
         out.push_str(&format!("   for Runtime (\"Ada\") use \"{runtime}\";\n"));
     }
-    if let Some(toolchain) = &spec.toolchain {
+    if let Some(toolchain) = toolchain_name {
         out.push_str(&format!(
             "   for Toolchain_Name (\"Ada\") use \"{toolchain}\";\n"
         ));

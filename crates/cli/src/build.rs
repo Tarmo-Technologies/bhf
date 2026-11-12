@@ -166,21 +166,35 @@ pub struct BuildArgs {
     #[arg(long)]
     pub harness: Option<String>,
 
-    /// Target triple for cross-compilation project synthesis and default tool prefix.
-    #[arg(long)]
+    /// Target triple to build for. C/C++ harness: selects `<triple>-gcc` /
+    /// `<triple>-g++` unless --cc/--cxx name the compilers (a clang compiler
+    /// gets `--target=<triple>`). Ada harness: written as `for Target use`, and
+    /// the default tool prefix. Config key: `toolchain.target`.
+    #[arg(long, visible_alias = "target-triple")]
     pub target: Option<String>,
 
-    /// Ada runtime name to pass through the generated GPR project.
-    #[arg(long)]
+    /// Ada runtime name to pass through the generated GPR project. Ada
+    /// harnesses only; rejected for a C/C++ harness. Config key:
+    /// `toolchain.ada.runtime`.
+    #[arg(long, visible_alias = "ada-runtime")]
     pub runtime: Option<String>,
 
-    /// Toolchain executable prefix, e.g. aarch64-linux-gnu for aarch64-linux-gnu-gprbuild.
-    #[arg(long)]
+    /// Toolchain executable prefix. Ada harness: `<prefix>-gprbuild` /
+    /// `<prefix>-gnat`, and the Target when --target is not given (config key:
+    /// `toolchain.ada.prefix`). C/C++ harness: `<prefix>-gcc`/`<prefix>-g++`
+    /// unless --cc/--cxx are given; in a config file that choice is
+    /// `toolchain.target` or `toolchain.cc`/`toolchain.cxx`, because
+    /// `toolchain.ada.prefix` applies to Ada harnesses only.
+    #[arg(long, visible_alias = "ada-prefix")]
     pub toolchain: Option<String>,
 
-    /// AdaFuzz.Probe runtime backend to compile into the harness runtime.
+    /// AdaFuzz.Probe runtime backend to compile into the harness runtime. Ada
+    /// harnesses only. Config key: `toolchain.ada.probe-backend`.
     #[arg(long, value_enum, default_value = "host_file")]
     pub(crate) probe_backend: ProbeBackend,
+
+    #[command(flatten)]
+    pub(crate) toolchain_args: BuildToolchainArgs,
 
     /// For C/C++ harnesses: which Makefile target to build.
     /// `libfuzzer` (default) runs `make` which produces a libFuzzer binary
@@ -188,6 +202,35 @@ pub struct BuildArgs {
     /// persistent-mode AFL++ binary suitable for `bhf fuzz --engine afl++`.
     #[arg(long, value_enum, default_value = "libfuzzer")]
     pub c_engine: CEngine,
+}
+
+/// The toolchain options of `bhf build` beyond the historical Ada flags.
+#[derive(Debug, Clone, Default, PartialEq, Eq, clap::Args)]
+pub(crate) struct BuildToolchainArgs {
+    /// TOML file whose `[toolchain]` table sets the compiler, flags, target,
+    /// sysroot and Ada toolchain (the same table `bhf auto --config` reads).
+    /// Command-line flags override it key by key; relative paths in it
+    /// resolve against the file's directory.
+    #[arg(long = "config", value_name = "PATH")]
+    pub(crate) config: Option<PathBuf>,
+
+    #[command(flatten)]
+    pub(crate) c: crate::toolchain::CToolchainArgs,
+
+    /// `gprbuild` to run for an Ada harness (name or path). Config key:
+    /// `toolchain.ada.gprbuild`.
+    #[arg(long = "ada-gprbuild", value_name = "PROGRAM")]
+    pub(crate) ada_gprbuild: Option<String>,
+
+    /// `gnat` driver for an Ada harness (name or path). Config key:
+    /// `toolchain.ada.gnat`.
+    #[arg(long = "ada-gnat", value_name = "PROGRAM")]
+    pub(crate) ada_gnat: Option<String>,
+
+    /// Extra Ada compiler switch, appended to bhf's own (repeatable). Config
+    /// key: `toolchain.ada.switches`.
+    #[arg(long = "ada-switch", value_name = "SWITCH", allow_hyphen_values = true)]
+    pub(crate) ada_switches: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -200,13 +243,29 @@ pub enum CEngine {
 }
 
 pub fn run(args: BuildArgs) -> i32 {
+    let toolchain = match resolve_build_toolchain(&args) {
+        Ok(toolchain) => toolchain,
+        Err(error) => {
+            bhfeprintln!("bhf build: {error}");
+            return 2;
+        }
+    };
     // Try the C / C++ make-based build path first. The generated harness
     // ships its own Makefile (Slice A / B of #286); if it's present, the
     // Ada-specific prepare_layout below would fail on the missing
     // src_instrumented dir anyway.
-    if let Some(exit) = try_run_c_make_build(&args) {
+    if let Some(exit) = try_run_c_make_build(&args, &toolchain) {
         return exit;
     }
+
+    let given = args.toolchain_args.c.given_flag_names();
+    if !given.is_empty() {
+        bhfeprintln!(
+            "bhf build: note: {} set the C/C++ toolchain and do not apply to an Ada harness",
+            given.join(", ")
+        );
+    }
+    let args = with_ada_toolchain(args, &toolchain);
 
     let layout = match prepare_layout(&args) {
         Ok(layout) => layout,
@@ -216,7 +275,7 @@ pub fn run(args: BuildArgs) -> i32 {
         }
     };
 
-    let adapter = match CompilerAdapter::discover_for(toolchain_config(&args)) {
+    let adapter = match ada_compiler_adapter(&args) {
         Ok(adapter) => adapter,
         Err(error) => {
             bhfeprintln!("{error}");
@@ -249,6 +308,165 @@ pub fn run(args: BuildArgs) -> i32 {
 
 pub(crate) struct BuildLayout {
     pub(crate) project_path: PathBuf,
+}
+
+/// The toolchain of this `bhf build`: the `--config` file's `[toolchain]`
+/// table with the command-line flags laid over it, validated.
+fn resolve_build_toolchain(args: &BuildArgs) -> Result<config::ToolchainConfig, String> {
+    let file = match &args.toolchain_args.config {
+        Some(path) => crate::toolchain::load_config_file(path)?,
+        None => None,
+    };
+    let mut cli = args.toolchain_args.c.to_config();
+    cli.target = args.target.clone();
+    // `--toolchain <prefix>` names the C/C++ compilers too, unless --cc/--cxx do
+    // (a gprconfig compiler name such as `GNAT` is Ada-only).
+    if let Some(prefix) = args
+        .toolchain
+        .as_deref()
+        .filter(|toolchain| project_synth::gpr_toolchain_name(toolchain).is_none())
+    {
+        if cli.cc.is_none() && cli.cxx.is_none() {
+            let prefix = prefix.trim_end_matches('-');
+            cli.cc = Some(format!("{prefix}-gcc"));
+            cli.cxx = Some(format!("{prefix}-g++"));
+        }
+    }
+    cli.ada.prefix = args.toolchain.clone();
+    cli.ada.runtime = args.runtime.clone();
+    cli.ada.gprbuild = args.toolchain_args.ada_gprbuild.clone();
+    cli.ada.gnat = args.toolchain_args.ada_gnat.clone();
+    cli.ada.switches = args.toolchain_args.ada_switches.clone();
+    if args.probe_backend != ProbeBackend::HostFile {
+        cli.ada.probe_backend = Some(
+            clap::ValueEnum::to_possible_value(&args.probe_backend).map_or_else(
+                || "host_file".to_owned(),
+                |value| value.get_name().to_owned(),
+            ),
+        );
+    }
+    crate::toolchain::resolve(file, cli)
+}
+
+/// `args` with the Ada toolchain fields set from the resolved `[toolchain]`
+/// (command-line values already won in [`resolve_build_toolchain`]).
+fn with_ada_toolchain(mut args: BuildArgs, toolchain: &config::ToolchainConfig) -> BuildArgs {
+    args.target = toolchain.ada_target().map(str::to_owned);
+    args.runtime = toolchain.ada.runtime.clone();
+    args.toolchain = toolchain.ada.prefix.clone();
+    args.probe_backend = crate::toolchain::probe_backend(toolchain);
+    args.toolchain_args.ada_gprbuild = toolchain.ada.gprbuild.clone();
+    args.toolchain_args.ada_gnat = toolchain.ada.gnat.clone();
+    args.toolchain_args.ada_switches = toolchain.ada.switches.clone();
+    args
+}
+
+/// A config file's `toolchain.ada.prefix` does not choose a C/C++ harness's
+/// compilers (the `--toolchain` flag does). The note saying so, when nothing
+/// else chose them.
+fn ada_prefix_note(
+    toolchain: &config::ToolchainConfig,
+    toolchain_flag: Option<&str>,
+    harness_id: &str,
+) -> Option<String> {
+    let prefix = toolchain.ada.prefix.as_deref()?;
+    if toolchain_flag.is_some() || crate::toolchain::selected_compilers(toolchain) != (None, None) {
+        return None;
+    }
+    Some(format!(
+        "toolchain.ada.prefix `{prefix}` applies to Ada harnesses only; set toolchain.target \
+         or toolchain.cc/cxx (or pass --toolchain) to choose the compilers of the C/C++ \
+         harness '{harness_id}'"
+    ))
+}
+
+/// The Ada flags given to a C/C++ harness build, which cannot apply to it.
+fn ada_only_flags_given(args: &BuildArgs) -> Vec<&'static str> {
+    let mut given = Vec::new();
+    if args.runtime.is_some() {
+        given.push("--runtime");
+    }
+    if args.probe_backend != ProbeBackend::HostFile {
+        given.push("--probe-backend");
+    }
+    if args.toolchain_args.ada_gprbuild.is_some() {
+        given.push("--ada-gprbuild");
+    }
+    if args.toolchain_args.ada_gnat.is_some() {
+        given.push("--ada-gnat");
+    }
+    if !args.toolchain_args.ada_switches.is_empty() {
+        given.push("--ada-switch");
+    }
+    given
+}
+
+/// The compiler adapter for an Ada build: explicit `gprbuild`/`gnat` programs
+/// when the toolchain names them, else the (prefixed) tools on `PATH`.
+fn ada_compiler_adapter(args: &BuildArgs) -> Result<CompilerAdapter, String> {
+    let toolchain = toolchain_config(args);
+    let explicit_gprbuild = args.toolchain_args.ada_gprbuild.as_deref();
+    let explicit_gnat = args.toolchain_args.ada_gnat.as_deref();
+    let prefixed = |tool: &str| match toolchain.compiler_prefix() {
+        Some(prefix) => format!("{}-{tool}", prefix.trim_end_matches('-')),
+        None => tool.to_owned(),
+    };
+    if explicit_gprbuild.is_none() && explicit_gnat.is_none() {
+        return match CompilerAdapter::discover_for(toolchain.clone()) {
+            Ok(adapter) => Ok(adapter),
+            // A GNAT cross toolchain ships prefixed compiler drivers
+            // (`<prefix>-gnat`, `<prefix>-gcc`), while gprbuild is usually one
+            // multi-target program that takes the target from the project's
+            // `for Target use`. Use it when there is no prefixed gprbuild.
+            Err(error) => match (
+                toolchain.compiler_prefix(),
+                which::which("gprbuild"),
+                which::which(prefixed("gnat")),
+            ) {
+                (Some(_), Ok(gprbuild), Ok(gnat)) => Ok(CompilerAdapter::with_binaries(
+                    Some(gprbuild),
+                    which::which(prefixed("gnatmake")).ok(),
+                    Some(gnat),
+                    toolchain,
+                )),
+                _ => Err(error.to_string()),
+            },
+        };
+    }
+    let locate = |explicit: Option<&str>, tool: &str| -> Result<Option<PathBuf>, String> {
+        match explicit {
+            Some(program) => {
+                let found = if crate::toolchain::program_exists(program) {
+                    which::which(program)
+                        .ok()
+                        .or_else(|| Some(PathBuf::from(program)))
+                } else {
+                    None
+                };
+                found
+                    .map(Some)
+                    .ok_or_else(|| format!("the toolchain's {tool} `{program}` was not found"))
+            }
+            None => Ok(which::which(prefixed(tool)).ok()),
+        }
+    };
+    let gprbuild = locate(explicit_gprbuild, "gprbuild")?;
+    let gnat = locate(explicit_gnat, "gnat")?;
+    if gprbuild.is_none() {
+        return Err(format!(
+            "no `{}` found for the Ada build; set toolchain.ada.gprbuild (--ada-gprbuild)",
+            prefixed("gprbuild")
+        ));
+    }
+    // An explicitly named gnat is the compiler the operator wants probed; only
+    // without one does a prefixed gnatmake stand in for the canary.
+    let gnatmake = explicit_gnat
+        .is_none()
+        .then(|| which::which(prefixed("gnatmake")).ok())
+        .flatten();
+    Ok(CompilerAdapter::with_binaries(
+        gprbuild, gnatmake, gnat, toolchain,
+    ))
 }
 
 /// Whether `dir` directly contains at least one C source file (`.c`). Used to
@@ -496,6 +714,11 @@ pub(crate) fn prepare_layout(args: &BuildArgs) -> Result<BuildLayout, String> {
     // specification into a fuzzing oracle — code that ships with assertions disabled
     // still gets them exercised under the fuzzer, at no cost to production behavior.
     switches.default.push("-gnata".to_owned());
+    // Operator switches (`toolchain.ada.switches`, --ada-switch) come after
+    // bhf's own, so an operator setting wins where the two disagree.
+    switches
+        .default
+        .extend(args.toolchain_args.ada_switches.iter().cloned());
     if source_roots
         .iter()
         .any(|root| dir_contains_in_tree_ada_runtime_unit(&root.path))
@@ -700,7 +923,7 @@ fn normalize_path_lexical(path: &Path) -> PathBuf {
 /// Detect a C/C++ harness layout (generated by Slice A/B of #286) and run
 /// the harness's Makefile directly. Returns `Some(exit_code)` when the
 /// build was dispatched; `None` to fall through to the Ada path.
-fn try_run_c_make_build(args: &BuildArgs) -> Option<i32> {
+fn try_run_c_make_build(args: &BuildArgs, toolchain: &config::ToolchainConfig) -> Option<i32> {
     let requested_dir = absolutize(&args.work_dir).ok()?;
     let (work_dir, requested_harness) =
         match resolve_c_family_work_dir(&requested_dir, args.harness.as_deref()) {
@@ -729,6 +952,42 @@ fn try_run_c_make_build(args: &BuildArgs) -> Option<i32> {
     };
     if !is_c_family_harness_dir(&harness_dir) {
         return None;
+    }
+
+    // Ada flags given for a C/C++ harness would be silently meaningless; say so
+    // and point at the flags that do apply.
+    let ada_only = ada_only_flags_given(args);
+    if !ada_only.is_empty() {
+        bhfeprintln!(
+            "bhf build: {} appl{} only to Ada harnesses; '{harness_id}' is a C/C++ harness. \
+             Choose its toolchain with --cc/--cxx, --target, --toolchain <prefix>, --cflags, \
+             --sysroot, or a [toolchain] table in --config.",
+            ada_only.join(", "),
+            if ada_only.len() == 1 { "ies" } else { "y" }
+        );
+        return Some(2);
+    }
+    if let Some(note) = ada_prefix_note(toolchain, args.toolchain.as_deref(), &harness_id) {
+        bhfeprintln!("bhf build: note: {note}");
+    }
+    match crate::toolchain::publish(toolchain) {
+        Ok(published) => {
+            for note in published.notes {
+                bhfeprintln!("bhf build: {note}");
+            }
+        }
+        Err(error) => {
+            bhfeprintln!("bhf build: {error}");
+            return Some(2);
+        }
+    }
+    if let Some(target) = toolchain.target.as_deref() {
+        if !crate::toolchain::triple_runs_natively(target) {
+            bhfeprintln!(
+                "bhf build: building '{harness_id}' for {target}; run it under an emulator \
+                 (for example `bhf replay --qemu-user <qemu> --qemu-arg=-L --qemu-arg=<sysroot>`)"
+            );
+        }
     }
 
     // Mirror the Ada path's `build/<harness-id>/main` layout so `bhf fuzz`
@@ -1588,12 +1847,12 @@ fn apply_c_family_make_env(
     // built-in CC/CXX defaults are usually cc/g++, which do not support
     // -fsanitize=fuzzer on common Linux hosts. Respect explicit caller
     // choices, but provide clang defaults when no compiler was selected.
-    if let Some(compiler) = compiler {
-        // Foreign-target cross build: force the cross CC/CXX (and replacement
-        // flags) unconditionally, overriding both the Makefile defaults and any
-        // ambient CC/CXX so the candidate compiles for its real platform/arch.
-        // `$(CC)`/`$(CXX)` head each recipe line, so a toolchain installed under
-        // a spaced directory is double-quoted to stay one word.
+    let (cc, cxx) = if let Some(compiler) = compiler {
+        // An explicit override (a cross build, the gcc retry, a sanitizer
+        // matrix): force its CC/CXX (and replacement flags), overriding both the
+        // Makefile defaults and the ambient CC/CXX. `$(CC)`/`$(CXX)` head each
+        // recipe line, so a toolchain installed under a spaced directory is
+        // double-quoted to stay one word.
         cmd.env("CC", compiler_recipe_word(&compiler.cc));
         cmd.env("CXX", compiler_recipe_word(&compiler.cxx));
         if !compiler.cflags.is_empty() {
@@ -1602,12 +1861,39 @@ fn apply_c_family_make_env(
         if !compiler.cxxflags.is_empty() {
             cmd.env("CXXFLAGS", compiler.cxxflags.join(" "));
         }
+        (compiler.cc.clone(), compiler.cxx.clone())
     } else {
-        if std::env::var_os("CC").is_none() {
-            cmd.env("CC", "clang");
+        let effective = crate::toolchain::effective_compilers();
+        // `$(CC)`/`$(CXX)` head each recipe line, so a compiler from the
+        // environment (or a `[toolchain]`) installed under a spaced directory
+        // is double-quoted to stay one word.
+        for (variable, default) in [("CC", "clang"), ("CXX", "clang++")] {
+            match std::env::var(variable) {
+                Err(_) => {
+                    cmd.env(variable, default);
+                }
+                Ok(value)
+                    if value.contains(' ')
+                        && !value.starts_with('"')
+                        && crate::toolchain::program_exists(&value) =>
+                {
+                    cmd.env(variable, compiler_recipe_word(&value));
+                }
+                Ok(_) => {}
+            }
         }
-        if std::env::var_os("CXX").is_none() {
-            cmd.env("CXX", "clang++");
+        (effective.cc, effective.cxx)
+    };
+    // The Makefile picks its instrumentation flags from the compiler that
+    // runs. Probe each compiler once per process and hand make the answer, so
+    // the Makefile need not ask again; an unknown compiler leaves the
+    // Makefile's own probe in charge.
+    for (variable, compiler, cxx) in [
+        ("BHF_CC_FAMILY", &cc, false),
+        ("BHF_CXX_FAMILY", &cxx, true),
+    ] {
+        if let Some(family) = crate::toolchain::compiler_family(compiler, cxx) {
+            cmd.env(variable, family.make_value());
         }
     }
 
@@ -1925,8 +2211,7 @@ pub(crate) fn try_run_ada_check_capturing(args: &BuildArgs) -> Result<CapturedBu
 
 fn run_ada_project(args: &BuildArgs, mode: BuildMode) -> Result<CapturedBuild, String> {
     let layout = prepare_layout(args)?;
-    let adapter = CompilerAdapter::discover_for(toolchain_config(args))
-        .map_err(|error| format!("{error}"))?;
+    let adapter = ada_compiler_adapter(args)?;
     probe_compiler(&adapter).map_err(|error| format!("{error}"))?;
     let result = match mode {
         BuildMode::Full => adapter.build(&layout.project_path),
@@ -1944,7 +2229,12 @@ pub(crate) fn toolchain_config(args: &BuildArgs) -> ToolchainConfig {
     ToolchainConfig {
         target: args.target.clone(),
         runtime: args.runtime.clone(),
-        toolchain: args.toolchain.clone(),
+        // A gprconfig compiler name (`--toolchain GNAT`) names the project's
+        // Toolchain_Name, not a prefix of the tools to run.
+        toolchain: args
+            .toolchain
+            .clone()
+            .filter(|toolchain| project_synth::gpr_toolchain_name(toolchain).is_none()),
     }
 }
 
@@ -2774,6 +3064,7 @@ mod tests {
             runtime: None,
             toolchain: None,
             probe_backend: ProbeBackend::HostFile,
+            toolchain_args: BuildToolchainArgs::default(),
             c_engine: CEngine::Libfuzzer,
         };
 
@@ -2888,6 +3179,7 @@ mod tests {
             runtime: None,
             toolchain: None,
             probe_backend: ProbeBackend::HostFile,
+            toolchain_args: BuildToolchainArgs::default(),
             c_engine: CEngine::Libfuzzer,
         };
 
@@ -2977,6 +3269,7 @@ mod tests {
             runtime: None,
             toolchain: None,
             probe_backend: ProbeBackend::HostFile,
+            toolchain_args: BuildToolchainArgs::default(),
             c_engine: CEngine::Libfuzzer,
         }
     }
@@ -2989,6 +3282,155 @@ mod tests {
         fs::write(dir.join("Makefile"), "main:\n\tprintf built > main\n").unwrap();
     }
 
+    /// The C/C++ make path with no toolchain configured.
+    fn c_make_build(args: &BuildArgs) -> Option<i32> {
+        try_run_c_make_build(args, &config::ToolchainConfig::default())
+    }
+
+    /// `--toolchain GNAT` names the project's Toolchain_Name; only a prefix
+    /// (a triple) selects prefixed tools.
+    #[test]
+    fn a_gprconfig_compiler_name_is_not_a_tool_prefix() {
+        let mut args = c_build_args(Path::new("/w"), None);
+        args.toolchain = Some("GNAT".to_owned());
+        assert_eq!(toolchain_config(&args).toolchain, None);
+        args.toolchain = Some("aarch64-linux-gnu".to_owned());
+        assert_eq!(
+            toolchain_config(&args).toolchain.as_deref(),
+            Some("aarch64-linux-gnu")
+        );
+    }
+
+    /// A config file's Ada prefix chooses no C/C++ compilers, and a C/C++
+    /// harness build says so instead of quietly using the host compilers.
+    #[test]
+    fn a_config_ada_prefix_on_a_c_family_harness_gets_a_note() {
+        let mut toolchain = config::ToolchainConfig::default();
+        assert_eq!(ada_prefix_note(&toolchain, None, "H-ONE"), None);
+        toolchain.ada.prefix = Some("aarch64-linux-gnu".to_owned());
+        let note = ada_prefix_note(&toolchain, None, "H-ONE").expect("a note");
+        assert!(
+            note.contains("toolchain.ada.prefix") && note.contains("toolchain.target"),
+            "{note}"
+        );
+        // The --toolchain flag, a target or a compiler do choose them.
+        assert_eq!(
+            ada_prefix_note(&toolchain, Some("aarch64-linux-gnu"), "H-ONE"),
+            None
+        );
+        toolchain.target = Some("aarch64-linux-gnu".to_owned());
+        assert_eq!(ada_prefix_note(&toolchain, None, "H-ONE"), None);
+        toolchain.target = None;
+        toolchain.cc = Some("gcc".to_owned());
+        assert_eq!(ada_prefix_note(&toolchain, None, "H-ONE"), None);
+    }
+
+    /// Ada-only flags on a C/C++ harness used to be accepted and ignored (exit
+    /// 0, a host binary). They are refused, naming the flags that do apply.
+    #[test]
+    fn ada_only_flags_are_refused_for_a_c_family_harness() {
+        if std::process::Command::new("make")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            bhfeprintln!("skipping: make not on PATH");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        write_trivial_cpp_harness(&work.join("harnesses").join("H-ONE"));
+        let mut args = c_build_args(&work, Some("H-ONE"));
+        args.runtime = Some("light".to_owned());
+        assert_eq!(run(args), 2);
+        assert!(
+            !work.join("harnesses/H-ONE/main").exists(),
+            "a refused build must not run make"
+        );
+        let mut args = c_build_args(&work, Some("H-ONE"));
+        args.probe_backend = ProbeBackend::MemoryBuffer;
+        assert_eq!(run(args), 2);
+        let mut args = c_build_args(&work, Some("H-ONE"));
+        args.toolchain_args.ada_switches = vec!["-O2".to_owned()];
+        assert_eq!(run(args), 2);
+        // The cross options that do apply still build.
+        assert_eq!(run(c_build_args(&work, Some("H-ONE"))), 0);
+    }
+
+    /// `--target` / `--toolchain` select the C/C++ compilers for a C/C++
+    /// harness (they used to reach only the Ada adapter), and `--config`'s
+    /// `[toolchain]` table does the same with paths relative to the file.
+    #[test]
+    fn target_and_toolchain_select_the_c_family_compilers() {
+        if std::process::Command::new("make")
+            .arg("--version")
+            .output()
+            .is_err()
+            || which::which("aarch64-linux-gnu-gcc").is_err()
+            || which::which("aarch64-linux-gnu-g++").is_err()
+        {
+            bhfeprintln!("skipping: make or the aarch64 cross gcc not on PATH");
+            return;
+        }
+        let saved: Vec<_> = ["CC", "CXX", crate::toolchain::ENV_CPPFLAGS]
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect();
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        let harness = work.join("harnesses").join("H-ONE");
+        fs::create_dir_all(&harness).unwrap();
+        fs::write(harness.join("main.cpp"), "int main() { return 0; }\n").unwrap();
+        fs::write(
+            harness.join("Makefile"),
+            "main:\n\tprintf '%s|%s|%s' \"$(CXX)\" \"$(CC)\" \"$(BHF_TOOLCHAIN_CPPFLAGS)\" > main\n",
+        )
+        .unwrap();
+        let built = || fs::read_to_string(harness.join("main")).unwrap();
+
+        let mut args = c_build_args(&work, Some("H-ONE"));
+        args.target = Some("aarch64-linux-gnu".to_owned());
+        assert_eq!(run(args), 0);
+        assert_eq!(built(), "aarch64-linux-gnu-g++|aarch64-linux-gnu-gcc|");
+
+        fs::remove_file(harness.join("main")).unwrap();
+        let mut args = c_build_args(&work, Some("H-ONE"));
+        args.toolchain = Some("aarch64-linux-gnu".to_owned());
+        assert_eq!(run(args), 0);
+        assert!(built().starts_with("aarch64-linux-gnu-g++|"), "{}", built());
+
+        fs::remove_file(harness.join("main")).unwrap();
+        let config_dir = temp.path().join("cfg");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("bhf.toml"),
+            "[toolchain]\ncxx = \"aarch64-linux-gnu-g++\"\ndefines = [\"BOARD=2\"]\n\
+             include-dirs = [\"vendor\"]\n",
+        )
+        .unwrap();
+        let mut args = c_build_args(&work, Some("H-ONE"));
+        args.toolchain_args.config = Some(config_dir.join("bhf.toml"));
+        assert_eq!(run(args), 0);
+        assert_eq!(
+            built(),
+            format!(
+                "aarch64-linux-gnu-g++|aarch64-linux-gnu-gcc|-DBOARD=2 -I{}",
+                config_dir.join("vendor").display()
+            )
+        );
+
+        // A compiler that is not installed is reported, not silently replaced.
+        let mut args = c_build_args(&work, Some("H-ONE"));
+        args.toolchain_args.c.cc = Some("/nonexistent/bin/gcc".to_owned());
+        assert_eq!(run(args), 2);
+        for (key, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
     #[test]
     fn c_build_reports_the_harness_lookup_error_instead_of_the_ada_layout() {
         let temp = tempfile::tempdir().unwrap();
@@ -2997,9 +3439,9 @@ mod tests {
         write_trivial_cpp_harness(&work.join("harnesses").join("H-TWO"));
         // Two harnesses and no --harness, or an unknown id: the C/C++ lookup error
         // is the answer (exit 3), not a fall-through to the Ada src_instrumented check.
-        assert_eq!(try_run_c_make_build(&c_build_args(&work, None)), Some(3));
+        assert_eq!(c_make_build(&c_build_args(&work, None)), Some(3));
         assert_eq!(
-            try_run_c_make_build(&c_build_args(&work, Some("H-MISSING"))),
+            c_make_build(&c_build_args(&work, Some("H-MISSING"))),
             Some(3)
         );
         assert!(!work.join("build").exists(), "nothing may be built");
@@ -3019,12 +3461,12 @@ mod tests {
         let work = temp.path().join("work");
         let harness = work.join("harnesses").join("H-ONE");
         write_trivial_cpp_harness(&harness);
-        assert_eq!(try_run_c_make_build(&c_build_args(&harness, None)), Some(0));
+        assert_eq!(c_make_build(&c_build_args(&harness, None)), Some(0));
         let staged = work.join("build").join("H-ONE").join("main");
         assert_eq!(fs::read_to_string(&staged).unwrap(), "built");
         fs::remove_file(&staged).unwrap();
         assert_eq!(
-            try_run_c_make_build(&c_build_args(&work.join("harnesses"), Some("H-ONE"))),
+            c_make_build(&c_build_args(&work.join("harnesses"), Some("H-ONE"))),
             Some(0)
         );
         assert!(staged.is_file());

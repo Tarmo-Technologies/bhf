@@ -2,22 +2,112 @@
 
 # Cross-Compilation
 
-BHF supports cross-compilation through explicit target, runtime, toolchain,
-probe-backend, and qemu-user runner flags.
+BHF cross-compiles C, C++ and Ada harnesses. `bhf build` and `bhf auto` share
+one toolchain description: command-line flags, or a `[toolchain]` table in a
+`--config` file (the table is documented under
+[`bhf auto` → Config file](../auto/#config-file)). Command-line flags override
+the file key by key, and relative paths in the file resolve against its
+directory.
 
 ## Build Flags
+
+A C or C++ harness:
+
+```sh
+bhf build bhf_work --harness H-C0001 --target aarch64-linux-gnu
+```
+
+`--target` selects `aarch64-linux-gnu-gcc` / `aarch64-linux-gnu-g++`
+(`--toolchain <prefix>` does the same for a prefix), unless `--cc`/`--cxx` name
+the compilers; a clang compiler gets `--target=<triple>` instead. `--sysroot`,
+`--cflags`, `--cxxflags`, `--ldflags`, `--define` and `--toolchain-include`
+complete the toolchain. bhf announces the compilers it uses, and the generated
+Makefile picks GCC- or clang-spelled coverage and sanitizer flags from the
+compiler that actually runs. The binary is foreign, so run it under an emulator:
+`bhf replay --qemu-user qemu-aarch64 --qemu-arg=-L --qemu-arg=/usr/aarch64-linux-gnu`.
+`--runtime`, `--probe-backend` and the `--ada-*` flags apply to Ada harnesses
+only; on a C/C++ harness they are an error rather than silently ignored.
+
+An Ada harness:
 
 ```sh
 bhf build bhf_work \
   --harness H-TEST \
   --target aarch64-linux-gnu \
-  --runtime ravenscar-full \
+  --runtime light \
   --toolchain aarch64-linux-gnu
 ```
 
-When `--toolchain` is present, BHF looks for prefixed tools such as
-`<prefix>-gprbuild` and `<prefix>-gnat`. If `--toolchain` is omitted but
-`--target` is provided, the target triple is used as the prefix.
+`--target` and `--runtime` are written into the generated `bhf_build.gpr` as
+`for Target use` and `for Runtime ("Ada") use`. `--toolchain` is the tool
+prefix: bhf runs `<prefix>-gprbuild` when it exists and the multi-target
+`gprbuild` otherwise, and probes the compiler with `<prefix>-gnatmake` (or
+`<prefix>-gnat`). When `--target` is omitted the prefix is the target. The
+prefix is never written as `Toolchain_Name`: that attribute takes a gprconfig
+compiler name, and a value such as `GNAT` or `GNAT_LLVM` given to `--toolchain`
+is written as `for Toolchain_Name ("Ada") use` instead. `--ada-gprbuild` /
+`--ada-gnat` name the programs explicitly, and `--ada-switch` appends compiler
+switches to bhf's own.
+
+The generated project `extends` the governing project, so its `Target`,
+`Runtime` and source settings are inherited, but its `package Compiler` is
+not: bhf writes its own `Default_Switches` (`-g`, assertions, coverage), which
+replace the parent project's. Switches such as `-O1` from the parent project
+are therefore not used; add the ones the harness needs with `--ada-switch` or
+`toolchain.ada.switches`.
+
+In a config file, `toolchain.ada.prefix` applies to Ada harnesses only. To
+choose the compilers of a C/C++ harness there, set `toolchain.target` or
+`toolchain.cc`/`toolchain.cxx`; `bhf build` notes a prefix that chose nothing.
+
+## Whole-Sweep Cross Targets
+
+`bhf auto` builds every C/C++ candidate for one target when the toolchain names
+a runner:
+
+```sh
+bhf auto src --work-dir bhf_work \
+  --target-triple aarch64-linux-gnu --runner qemu-aarch64
+```
+
+or, in a config file passed with `--config`:
+
+```toml
+[toolchain]
+target = "aarch64-linux-gnu"
+runner = "qemu-aarch64"
+runner-args = ["-L", "/usr/aarch64-linux-gnu"]
+```
+
+Each harness is built with the cross compiler and SanitizerCoverage
+(`trace-pc,trace-cmp` for GCC, `trace-pc-guard,trace-cmp` for clang, when the
+compiler accepts it) and run as `<runner> <runner-args> <harness>`, so the sweep
+is coverage-guided with input-to-state comparison hooks. ASan is not armed, because its
+shadow memory does not survive qemu-user; hard faults are reported as crashes,
+and `cflags` can add trap-mode checks (`BHF_CROSS_GUARDS=1` arms the probed
+guard set). Without `runner-args`, a qemu-user runner gets `-L <sysroot>`, or
+`-L /usr/<triple>` when that directory exists. The triple comes from
+`--target-triple`, or from `<cc> -dumpmachine` when only `--cc` (or `CC`) names
+a cross compiler.
+
+A runner turns the C/C++ sweep into a cross sweep only when the C/C++ toolchain
+builds for another target: a `target`, or a compiler whose `-dumpmachine` names
+a triple this host cannot run. A runner given only for a foreign Ada target
+(`[toolchain.ada] target`) runs the Ada harnesses, with `-L /usr/<ada triple>`
+for a qemu-user runner (the C/C++ `sysroot` only when the C/C++ sweep builds for
+the same triple); the C/C++ candidates keep their native, sanitizer-instrumented
+builds. A runner with nothing foreign to run is an error.
+
+The reverse is refused too: a target, an Ada target, or a C/C++ compiler (from
+`--cc`/`--cxx`, the config file or `CC`/`CXX`) that builds for a platform the
+host cannot run, with no runner, is an error before anything builds.
+
+`--probe-build`, `--build-command` and `--run-untrusted` still run the
+project's build for this host. Its compile database and generated headers apply
+to the cross sweep, but the static archives it builds are host objects, so they
+are not linked into the cross-built harnesses (bhf says so); each target is
+built from its sources. A project archive found in the tree is linked into a
+cross build only when its objects are for the target's architecture.
 
 ## Foreign-Platform Targets in `bhf auto`
 
@@ -40,9 +130,10 @@ instead of being dropped. The attempt loop then picks a build+fuzz strategy:
 - **Arch/SIMD (aarch64, armhf, neon) → cross toolchain + qemu-user.** A 64-bit
   ARM / NEON guard builds with `aarch64-linux-gnu-gcc` under `qemu-aarch64`; a
   32-bit ARM (armv7/armhf) guard builds with `arm-linux-gnueabihf-gcc` under
-  `qemu-arm`. This
-  path is coverage-blind today (the cross GCCs reject `trace-pc-guard` and ASan
-  does not survive qemu-user); hard crashes still surface via SIGSEGV/SIGABRT.
+  `qemu-arm`. The build arms GCC's `trace-pc,trace-cmp` coverage when the cross
+  compiler accepts it, so the emulated harness is fuzzed coverage-guided. ASan
+  does not survive qemu-user and stays off; hard crashes surface via
+  SIGSEGV/SIGABRT.
 - **Windows fallback → native stub-isolated build.** When mingw/wine is absent,
   a `_WIN32` C/C++ target (not Ada or Rust) is built NATIVELY with `_WIN32` defined and a synthesized
   fake `<windows.h>` so its portable logic type-checks and fuzzes with real host
@@ -53,10 +144,11 @@ instead of being dropped. The attempt loop then picks a build+fuzz strategy:
 
 ### Cross-compilation scope and oracle limitations
 
-These `auto` build+fuzz strategies cover C and C++ targets; foreign-platform Ada
-targets are skipped with an actionable reason (`auto` cross-compiles only C/C++ —
-Ada cross-compilation is available via the explicit `bhf build
---target/--toolchain` path with a matching GNAT cross toolchain). Rust
+These guard-driven strategies cover C and C++ targets. A foreign-platform Ada
+target is skipped with an actionable reason unless the sweep has an Ada
+toolchain for a target (`[toolchain.ada]`, `--ada-prefix`/`--ada-target`), in
+which case every Ada candidate is built for that target and, when the host
+cannot run it, fuzzed under the `[toolchain] runner`. Rust
 cross-compilation is partial (it shares the qemu-user path), and Java targets
 cannot be cross-compiled — they run only on the host JVM.
 

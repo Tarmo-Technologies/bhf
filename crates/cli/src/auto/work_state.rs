@@ -42,6 +42,7 @@ const REGENERABLE_DIRECTORIES: &[&str] = &[
 
 const REGENERABLE_FILES: &[&str] = &[
     "c_compat.mk",
+    crate::auto::attempt::CXX_COMPAT_FILE,
     "cxx_dialect.txt",
     crate::auto::attempt::ADA_EXTERNAL_MODEL,
     // Cached "this closure cannot be built" verdicts. Regenerable by definition,

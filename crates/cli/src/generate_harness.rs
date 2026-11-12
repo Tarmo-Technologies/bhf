@@ -7856,12 +7856,7 @@ fn write_cpp_per_tu_context(output_dir: &Path, contexts: &[PerTuCompileContext])
         "CONTEXT",
         "context_objs",
         contexts,
-        &[
-            ("MAIN", "$(CXX)", "$(CXXFLAGS)", true),
-            ("AFL", "$(AFLPP_CXX)", "$(AFLPP_CXXFLAGS)", false),
-            ("COV", "$(COV_CXX)", "$(COV_CXXFLAGS)", true),
-            ("DIFF", "$(DIFF_CXX)", "$(DIFF_CXXFLAGS)", true),
-        ],
+        CPP_CONTEXT_VARIANTS,
         true,
     )
 }
@@ -7877,18 +7872,33 @@ fn write_c_per_tu_context(output_dir: &Path, contexts: &[PerTuCompileContext]) -
         "CONTEXT",
         "context_objs",
         contexts,
-        &[
-            ("MAIN", "$(CC)", "$(CFLAGS)", true),
-            ("AFL", "$(AFLPP_CC)", "$(AFLPP_CFLAGS)", false),
-            ("MSAN", "$(MSAN_CC)", "$(MSAN_CFLAGS)", true),
-            ("TSAN", "$(TSAN_CC)", "$(TSAN_CFLAGS)", true),
-            ("COV", "$(COV_CC)", "$(COV_CFLAGS)", true),
-            ("DIFF", "$(DIFF_CC)", "$(DIFF_CFLAGS)", true),
-            ("PROV", "$(CC)", "$(CFLAGS)", true),
-        ],
+        C_CONTEXT_VARIANTS,
         false,
     )
 }
+
+/// One object graph of a per-translation-unit fragment: the make-variable
+/// suffix, the lane's compiler and flags, whether the TU is compiled for bhf's
+/// external driver, and whether this is the lane built with the operator's
+/// `$(CC)`/`$(CXX)` (which also takes the toolchain flags).
+type ContextVariant = (&'static str, &'static str, &'static str, bool, bool);
+
+const C_CONTEXT_VARIANTS: &[ContextVariant] = &[
+    ("MAIN", "$(CC)", "$(CFLAGS)", true, true),
+    ("AFL", "$(AFLPP_CC)", "$(AFLPP_CFLAGS)", false, false),
+    ("MSAN", "$(MSAN_CC)", "$(MSAN_CFLAGS)", true, false),
+    ("TSAN", "$(TSAN_CC)", "$(TSAN_CFLAGS)", true, false),
+    ("COV", "$(COV_CC)", "$(COV_CFLAGS)", true, false),
+    ("DIFF", "$(DIFF_CC)", "$(DIFF_CFLAGS)", true, false),
+    ("PROV", "$(CC)", "$(CFLAGS)", true, true),
+];
+
+const CPP_CONTEXT_VARIANTS: &[ContextVariant] = &[
+    ("MAIN", "$(CXX)", "$(CXXFLAGS)", true, true),
+    ("AFL", "$(AFLPP_CXX)", "$(AFLPP_CXXFLAGS)", false, false),
+    ("COV", "$(COV_CXX)", "$(COV_CXXFLAGS)", true, false),
+    ("DIFF", "$(DIFF_CXX)", "$(DIFF_CXXFLAGS)", true, false),
+];
 
 fn remove_stale_per_tu_context(output_dir: &Path, fragment_name: &str) -> Result<()> {
     let fragment = output_dir.join(fragment_name);
@@ -7906,26 +7916,24 @@ fn write_per_tu_context(
     variable_prefix: &str,
     object_dir: &str,
     contexts: &[PerTuCompileContext],
-    variants: &[(&str, &str, &str, bool)],
+    variants: &[ContextVariant],
     cpp: bool,
 ) -> Result<()> {
     use harness_gen::build_safety::{
         checked_recipe_path, ensure_all_compile_flags_safe, ensure_build_path_safe,
-        quoted_build_input, recipe_path,
+        quoted_build_input,
     };
     // Paths may carry spaces (double-quoted below) and flags may need quoting
     // (`-I/proj dir/include`); anything quoting cannot contain is refused.
     let mut sources = Vec::with_capacity(contexts.len());
-    let mut compilers = Vec::with_capacity(contexts.len());
     for context in contexts {
         sources.push(checked_recipe_path("per-TU source path", &context.source)?);
-        compilers.push(match &context.compiler {
-            Some(compiler) => {
-                ensure_build_path_safe("per-TU compiler", compiler)?;
-                Some(recipe_path(compiler))
-            }
-            None => None,
-        });
+        // The database compiler is not written into the rule (it uses
+        // `$(CC)`/`$(CXX)`, whose Makefile default is the database compiler),
+        // but a hostile one is still refused rather than silently dropped.
+        if let Some(compiler) = &context.compiler {
+            ensure_build_path_safe("per-TU compiler", compiler)?;
+        }
         ensure_all_compile_flags_safe(context.flags.iter().map(String::as_str))?;
     }
 
@@ -7935,7 +7943,7 @@ fn write_per_tu_context(
          .PHONY: FORCE_CONTEXT_OBJECTS\n\
          FORCE_CONTEXT_OBJECTS:\n",
     );
-    for (variant, _, _, _) in variants {
+    for (variant, _, _, _, _) in variants {
         let objects = (0..contexts.len())
             .map(|index| format!("{object_dir}/{}_{}.o", variant.to_ascii_lowercase(), index))
             .collect::<Vec<_>>()
@@ -7946,13 +7954,19 @@ fn write_per_tu_context(
     }
     fragment.push('\n');
 
-    for (variant, default_compiler, variant_flags, external_driver) in variants {
+    for (variant, lane_compiler, lane_flags, external_driver, operator_lane) in variants {
         for (index, context) in contexts.iter().enumerate() {
             let object = format!("{object_dir}/{}_{}.o", variant.to_ascii_lowercase(), index);
-            let compiler = if *variant == "MAIN" || *variant == "PROV" {
-                compilers[index].as_deref().unwrap_or(default_compiler)
+            // A C row of a C++ harness keeps C semantics on the operator lane:
+            // the paired C driver, with the C++ `-std=` filtered out of the
+            // lane flags.
+            let c_row_of_cpp = cpp
+                && *operator_lane
+                && context.source.extension().and_then(|ext| ext.to_str()) == Some("c");
+            let (compiler, variant_flags) = if c_row_of_cpp {
+                ("$(CC)", "$(BHF_CONTEXT_C_FLAGS)")
             } else {
-                default_compiler
+                (*lane_compiler, *lane_flags)
             };
             // A flag that is safe bare keeps its quoted-define escaping; one that
             // needs quoting (a spaced include dir) is single-quoted whole.
@@ -7962,14 +7976,32 @@ fn write_per_tu_context(
                 .map(|flag| quoted_build_input(flag).unwrap_or_else(|| flag.replace('"', "\\\"")))
                 .collect::<Vec<_>>()
                 .join(" ");
+            // C keeps its compat flags right after the section flags. The C++
+            // ones and the toolchain additions follow the include flags, so the
+            // tokens between `$(SECTION_FLAGS)` and `$(INCLUDES)` stay exactly
+            // the database row's own flags.
             let compat = if cpp { "" } else { " $(C_COMPAT_FLAGS)" };
+            let cxx_compat = match (cpp, *operator_lane, c_row_of_cpp) {
+                (true, true, false) => " $(CXX_COMPAT_FLAGS)",
+                (true, false, _) => " $(CXX_COMPAT_FLAGS_CLANG)",
+                _ => "",
+            };
+            let toolchain = match (*operator_lane, cpp && !c_row_of_cpp) {
+                (true, true) => {
+                    " $(BHF_TOOLCHAIN_TARGET_FLAGS) $(BHF_TOOLCHAIN_CXXFLAGS) $(BHF_TOOLCHAIN_CPPFLAGS)"
+                }
+                (true, false) => {
+                    " $(BHF_TOOLCHAIN_TARGET_FLAGS) $(BHF_TOOLCHAIN_CFLAGS) $(BHF_TOOLCHAIN_CPPFLAGS)"
+                }
+                (false, _) => " $(BHF_TOOLCHAIN_CPPFLAGS)",
+            };
             let driver_define = if *external_driver {
                 " -DBHF_EXTERNAL_DRIVER"
             } else {
                 ""
             };
             fragment.push_str(&format!(
-                "{object}: FORCE_CONTEXT_OBJECTS\n\t@mkdir -p {object_dir}\n\t{compiler} {variant_flags} $(SECTION_FLAGS){compat} {flags} $(INCLUDES) $(AUTO_EXTRA_INCLUDES){driver_define} -c {} -o {object}\n\n",
+                "{object}: FORCE_CONTEXT_OBJECTS\n\t@mkdir -p {object_dir}\n\t{compiler} {variant_flags} $(SECTION_FLAGS){compat} {flags} $(INCLUDES) $(AUTO_EXTRA_INCLUDES){cxx_compat}{toolchain}{driver_define} -c {} -o {object}\n\n",
                 sources[index]
             ));
         }
@@ -8012,23 +8044,10 @@ pub(crate) fn prepare_repair_per_tu_context(
         return Ok(fallback_sources);
     }
 
-    let variants: &[(&str, &str, &str, bool)] = if cpp {
-        &[
-            ("MAIN", "$(CXX)", "$(CXXFLAGS)", true),
-            ("AFL", "$(AFLPP_CXX)", "$(AFLPP_CXXFLAGS)", false),
-            ("COV", "$(COV_CXX)", "$(COV_CXXFLAGS)", true),
-            ("DIFF", "$(DIFF_CXX)", "$(DIFF_CXXFLAGS)", true),
-        ]
+    let variants = if cpp {
+        CPP_CONTEXT_VARIANTS
     } else {
-        &[
-            ("MAIN", "$(CC)", "$(CFLAGS)", true),
-            ("AFL", "$(AFLPP_CC)", "$(AFLPP_CFLAGS)", false),
-            ("MSAN", "$(MSAN_CC)", "$(MSAN_CFLAGS)", true),
-            ("TSAN", "$(TSAN_CC)", "$(TSAN_CFLAGS)", true),
-            ("COV", "$(COV_CC)", "$(COV_CFLAGS)", true),
-            ("DIFF", "$(DIFF_CC)", "$(DIFF_CFLAGS)", true),
-            ("PROV", "$(CC)", "$(CFLAGS)", true),
-        ]
+        C_CONTEXT_VARIANTS
     };
     write_per_tu_context(
         output_dir,
@@ -9146,23 +9165,15 @@ fn dropped_compile_flag_families(args: &[String]) -> BTreeSet<&'static str> {
 
 /// Whether a compile-database compiler's LEAF NAME is a real toolchain name.
 ///
-/// Deliberately an exact match against the known driver names, after stripping a
-/// version suffix (`gcc-12`) and a target-triple prefix (`aarch64-linux-gnu-gcc`).
-/// The previous test was `leaf.contains("clang")`, which accepts `evilclang` — any
-/// executable at all, as long as its name embeds the substring.
+/// Deliberately an exact match against the known driver names, after the shared
+/// normalisation in [`harness_gen::compiler_family`] (a `.exe` suffix, a version
+/// suffix `gcc-12`, a target-triple prefix `aarch64-linux-gnu-gcc`). The same
+/// normalisation picks the Makefile's fallback flag family, so a name accepted
+/// here is never paired with the other family's flags. The previous test was
+/// `leaf.contains("clang")`, which accepts `evilclang` — any executable at all,
+/// as long as its name embeds the substring.
 fn is_toolchain_leaf_name(leaf: &str) -> bool {
-    // `gcc-12`, `clang-18.1` -> drop a trailing all-numeric version component.
-    let stem = match leaf.rsplit_once('-') {
-        Some((base, suffix))
-            if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit() || c == '.') =>
-        {
-            base
-        }
-        _ => leaf,
-    };
-    // `aarch64-linux-gnu-gcc` -> the driver name is the last component.
-    let base = stem.rsplit('-').next().unwrap_or(stem);
-    matches!(base, "clang" | "clang++" | "gcc" | "g++")
+    harness_gen::compiler_family::driver_base_name(leaf).is_some()
 }
 
 /// Whether `candidate` lives inside the scanned (untrusted) tree.
@@ -13117,6 +13128,10 @@ mod tests {
             "aarch64-linux-gnu-gcc",
             "x86_64-linux-gnu-gcc-12",
             "arm-none-eabi-g++",
+            // Windows drivers carry `.exe`; the same normalisation picks the
+            // Makefile's flag family, so the two checks cannot disagree.
+            "clang.exe",
+            "x86_64-w64-mingw32-g++.exe",
         ] {
             assert!(
                 super::is_toolchain_leaf_name(ok),
@@ -13219,7 +13234,10 @@ mod tests {
         finding_format_note, recorded_harness_format_version, stale_harness_format_note,
         write_generation_metadata,
     };
-    use super::{split_compile_command, write_c_per_tu_context, PerTuCompileContext};
+    use super::{
+        split_compile_command, write_c_per_tu_context, write_cpp_per_tu_context,
+        PerTuCompileContext,
+    };
     use ada_parser::ast::{Package, PackageId, StructuralAst as StructuralAstForMerge};
     use ada_parser::ast::{
         Span, Subprogram, SubprogramId, SubprogramKind, SubprogramOwner, Visibility,
@@ -18281,7 +18299,9 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             .find(|line| line.starts_with('\t') && line.contains("-c ") && line.contains("main_0"))
             .unwrap_or_else(|| panic!("MAIN object rule in:\n{fragment}"));
         let words = split_compile_command(recipe.trim());
-        assert_eq!(words[0], "/opt/my tools/bin/clang", "{recipe}");
+        // The database compiler is only the Makefile's default `CC`; the rule
+        // itself names `$(CC)` so a toolchain override reaches this TU too.
+        assert_eq!(words[0], "$(CC)", "{recipe}");
         assert!(
             words.contains(&"-I/proj dir/include".to_owned()),
             "{recipe}"
@@ -18297,6 +18317,88 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             flags: Vec::new(),
         }];
         assert!(write_c_per_tu_context(&dir, &hostile).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The compiler a compile-database row names is never written into its
+    /// object rule: the rule uses `$(CC)`/`$(CXX)`, so an operator toolchain, a
+    /// gcc retry or a cross build compiles every translation unit with the same
+    /// compiler as `main` instead of mixing in the database's (a cross gcc's
+    /// objects then fail the link "in wrong format").
+    #[test]
+    fn per_tu_context_rules_use_the_make_compiler_not_the_database_compiler() {
+        let dir = temp_dir("per-tu-make-compiler");
+        let cross = vec![PerTuCompileContext {
+            source: PathBuf::from("/proj/lib/parse.c"),
+            compiler: Some("/usr/bin/aarch64-linux-gnu-gcc".to_owned()),
+            flags: vec!["-DFROM_DB=1".to_owned()],
+        }];
+        write_c_per_tu_context(&dir, &cross).unwrap();
+        let fragment = fs::read_to_string(dir.join("build_context_objects.mk")).unwrap();
+        assert!(!fragment.contains("aarch64-linux-gnu-gcc"), "{fragment}");
+        let rule = |variant: &str, fragment: &str| -> Vec<String> {
+            let line = fragment
+                .lines()
+                .find(|line| line.starts_with('\t') && line.contains(&format!("/{variant}_0.o")))
+                .unwrap_or_else(|| panic!("{variant} rule in:\n{fragment}"))
+                .to_owned();
+            split_compile_command(line.trim())
+        };
+        let main = rule("main", &fragment);
+        assert_eq!(main[0], "$(CC)");
+        assert!(main.contains(&"$(C_COMPAT_FLAGS)".to_owned()), "{main:?}");
+        assert!(
+            main.contains(&"$(BHF_TOOLCHAIN_CFLAGS)".to_owned())
+                && main.contains(&"$(BHF_TOOLCHAIN_TARGET_FLAGS)".to_owned())
+                && main.contains(&"$(BHF_TOOLCHAIN_CPPFLAGS)".to_owned()),
+            "{main:?}"
+        );
+        assert_eq!(rule("prov", &fragment)[0], "$(CC)");
+        let cov = rule("cov", &fragment);
+        assert_eq!(cov[0], "$(COV_CC)");
+        assert!(cov.contains(&"$(BHF_TOOLCHAIN_CPPFLAGS)".to_owned()));
+        assert!(!cov.contains(&"$(BHF_TOOLCHAIN_TARGET_FLAGS)".to_owned()));
+
+        // A C++ harness compiles a C row with the paired C driver (C semantics,
+        // the C++ `-std=` filtered out) and a C++ row with $(CXX); each takes the
+        // C++ compatibility flags of its lane.
+        let mixed = vec![
+            PerTuCompileContext {
+                source: PathBuf::from("/proj/lib/legacy.c"),
+                compiler: Some("/usr/bin/gcc".to_owned()),
+                flags: vec!["-std=c99".to_owned()],
+            },
+            PerTuCompileContext {
+                source: PathBuf::from("/proj/lib/widget.cpp"),
+                compiler: Some("/usr/bin/g++".to_owned()),
+                flags: Vec::new(),
+            },
+        ];
+        write_cpp_per_tu_context(&dir, &mixed).unwrap();
+        let fragment = fs::read_to_string(dir.join("build_context_objects.mk")).unwrap();
+        let line = |object: &str| -> Vec<String> {
+            let line = fragment
+                .lines()
+                .find(|line| line.starts_with('\t') && line.contains(object))
+                .unwrap_or_else(|| panic!("{object} rule in:\n{fragment}"))
+                .to_owned();
+            split_compile_command(line.trim())
+        };
+        let c_unit = line("context_objs/main_0.o");
+        assert_eq!(c_unit[0], "$(CC)", "{c_unit:?}");
+        assert!(
+            c_unit.contains(&"$(BHF_CONTEXT_C_FLAGS)".to_owned()),
+            "{c_unit:?}"
+        );
+        assert!(c_unit.contains(&"$(BHF_TOOLCHAIN_CFLAGS)".to_owned()));
+        let cpp_unit = line("context_objs/main_1.o");
+        assert_eq!(cpp_unit[0], "$(CXX)", "{cpp_unit:?}");
+        assert!(cpp_unit.contains(&"$(CXXFLAGS)".to_owned()));
+        assert!(cpp_unit.contains(&"$(CXX_COMPAT_FLAGS)".to_owned()));
+        assert!(cpp_unit.contains(&"$(BHF_TOOLCHAIN_CXXFLAGS)".to_owned()));
+        let cov_unit = line("context_objs/cov_1.o");
+        assert_eq!(cov_unit[0], "$(COV_CXX)");
+        assert!(cov_unit.contains(&"$(CXX_COMPAT_FLAGS_CLANG)".to_owned()));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -18559,6 +18661,338 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
                 .unwrap();
             assert!(status.success(), "native GCC C harness must link");
         }
+    }
+
+    /// Whether `program` runs (`--version`) on this host.
+    fn have_tool(program: &str) -> bool {
+        std::process::Command::new(program)
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
+    /// Generate a direct harness for `target` in `source` under `root/out`.
+    fn generate_for_make_test(source: &Path, target: &str, id: &str, root: &Path) -> PathBuf {
+        run(GenerateHarnessArgs {
+            source: source.to_path_buf(),
+            target: Some(target.to_owned()),
+            target_line: None,
+            output: root.join("out"),
+            id: Some(id.to_owned()),
+            kind: "direct".to_owned(),
+            source_roots: Vec::new(),
+            project: None,
+            source_trees: Vec::new(),
+            extra_sources: Vec::new(),
+            extra_includes: Vec::new(),
+            cleanup: None,
+            template_instantiate: Vec::new(),
+            tree_type_defs: None,
+            decoder_limits: Default::default(),
+            force: false,
+            archive_backed: false,
+            environment: None,
+        })
+        .unwrap();
+        root.join("out").join(id)
+    }
+
+    /// Run `make main` in `dir` with exactly `vars` as compiler settings (the
+    /// ambient CC/CXX/CFLAGS/CXXFLAGS and bhf's family hints are cleared).
+    fn make_main(dir: &Path, vars: &[(&str, &str)]) -> std::process::Output {
+        let mut command = std::process::Command::new("make");
+        command.arg("-C").arg(dir).arg("main");
+        for key in [
+            "CC",
+            "CXX",
+            "CFLAGS",
+            "CXXFLAGS",
+            "BHF_CC_FAMILY",
+            "BHF_CXX_FAMILY",
+        ] {
+            command.env_remove(key);
+        }
+        for (key, value) in vars {
+            command.env(key, value);
+        }
+        command.output().unwrap()
+    }
+
+    fn output_text(output: &std::process::Output) -> String {
+        format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    }
+
+    #[test]
+    fn generated_cpp_makefile_builds_with_an_ambient_gxx() {
+        if !have_tool("g++") || !have_tool("make") {
+            eprintln!("skip: g++/make unavailable");
+            return;
+        }
+        let root = temp_dir("make-gxx-family");
+        let source = root.join("widget.cpp");
+        fs::write(
+            &source,
+            "#include <cstddef>\nint parse_record(const unsigned char *data, std::size_t size) \
+             { return size > 2 && data[0] == 'W' ? data[1] : 0; }\n",
+        )
+        .unwrap();
+        let dir = generate_for_make_test(&source, "parse_record", "H-GXX", &root);
+        // The generated Makefile names clang++; an operator's CXX=g++ must still
+        // get flags g++ accepts, chosen from the compiler that actually runs.
+        let output = make_main(&dir, &[("CXX", "g++"), ("CC", "gcc")]);
+        assert!(
+            output.status.success(),
+            "g++ must build the harness:\n{}",
+            output_text(&output)
+        );
+        let text = output_text(&output);
+        assert!(
+            text.contains("trace-pc,trace-cmp") && !text.contains("trace-pc-guard"),
+            "g++ gets GCC-spelled coverage:\n{text}"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// `make -n main` in `dir` with exactly `vars` as compiler settings: the
+    /// recipes make would run, one per line.
+    fn make_dry_run(dir: &Path, vars: &[(&str, &str)]) -> String {
+        let mut command = std::process::Command::new("make");
+        command.arg("-C").arg(dir).args(["-n", "main"]);
+        for key in [
+            "CC",
+            "CXX",
+            "CFLAGS",
+            "CXXFLAGS",
+            "BHF_CC_FAMILY",
+            "BHF_CXX_FAMILY",
+            "BHF_TOOLCHAIN_CFLAGS",
+            "BHF_TOOLCHAIN_CXXFLAGS",
+        ] {
+            command.env_remove(key);
+        }
+        for (key, value) in vars {
+            command.env(key, value);
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{}", output_text(&output));
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// The recipe line of `dry_run` that writes `object`.
+    fn recipe_for<'a>(dry_run: &'a str, object: &str) -> &'a str {
+        dry_run
+            .lines()
+            .find(|line| line.contains(&format!("-o {object}")))
+            .unwrap_or_else(|| panic!("no recipe for {object} in:\n{dry_run}"))
+    }
+
+    /// A toolchain flag that selects the ABI must reach bhf's driver object as
+    /// well as `main`, or the two objects are built for different ABIs and the
+    /// link fails. The driver keeps its own dialect and warning policy.
+    #[test]
+    fn toolchain_flags_reach_the_driver_object() {
+        if !have_tool("make") || !have_tool("clang") {
+            eprintln!("skip: make/clang unavailable");
+            return;
+        }
+        let root = temp_dir("make-driver-toolchain-flags");
+        let source = root.join("parse.c");
+        fs::write(
+            &source,
+            "int parse_record(const unsigned char *data, unsigned long size) \
+             { return size > 1 && data[0] == 'D' ? data[1] : 0; }\n",
+        )
+        .unwrap();
+        let dir = generate_for_make_test(&source, "parse_record", "H-DRVFLAGS", &root);
+        let dry_run = make_dry_run(
+            &dir,
+            &[
+                ("CC", "clang"),
+                (
+                    "BHF_TOOLCHAIN_CFLAGS",
+                    "-DWIDGET_ABI_MARK=1 -std=gnu89 -Werror",
+                ),
+            ],
+        );
+        let driver = recipe_for(&dry_run, "bhf_driver.o");
+        assert!(driver.contains("-DWIDGET_ABI_MARK=1"), "{driver}");
+        assert!(
+            !driver.contains("-std=gnu89") && !driver.contains("-Werror"),
+            "{driver}"
+        );
+        let main = recipe_for(&dry_run, "main ");
+        assert!(
+            main.contains("-DWIDGET_ABI_MARK=1") && main.contains("-std=gnu89"),
+            "{main}"
+        );
+
+        // A C++ harness compiles the C driver with $(CXX): it takes the C and the
+        // C++ toolchain flags, without the C++ `-std=`.
+        let source = root.join("widget.cpp");
+        fs::write(
+            &source,
+            "#include <cstddef>\nint parse_record(const unsigned char *data, std::size_t size) \
+             { return size > 2 && data[0] == 'W' ? data[1] : 0; }\n",
+        )
+        .unwrap();
+        let dir = generate_for_make_test(&source, "parse_record", "H-DRVFLAGS-CPP", &root);
+        let dry_run = make_dry_run(
+            &dir,
+            &[
+                ("CXX", "clang++"),
+                ("CC", "clang"),
+                ("BHF_TOOLCHAIN_CFLAGS", "-DWIDGET_C_MARK=1"),
+                ("BHF_TOOLCHAIN_CXXFLAGS", "-DWIDGET_CXX_MARK=1 -std=c++17"),
+            ],
+        );
+        let driver = recipe_for(&dry_run, "bhf_driver.o");
+        assert!(
+            driver.contains("-DWIDGET_C_MARK=1") && driver.contains("-DWIDGET_CXX_MARK=1"),
+            "{driver}"
+        );
+        assert!(!driver.contains("-std=c++17"), "{driver}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A C unit of a C++ harness is compiled with $(CC), so it takes flags for
+    /// $(CC)'s family even when $(CXX) is another family (CC=gcc beside
+    /// clang++ used to get clang's `-fno-sanitize=function` and
+    /// `trace-pc-guard`, which gcc rejects).
+    #[test]
+    fn a_c_unit_of_a_cpp_harness_gets_the_flags_of_its_own_compiler() {
+        if !have_tool("make") || !have_tool("gcc") || !have_tool("clang++") {
+            eprintln!("skip: make/gcc/clang++ unavailable");
+            return;
+        }
+        let root = temp_dir("make-cpp-c-unit-family");
+        let source = root.join("widget.cpp");
+        fs::write(
+            &source,
+            "#include <cstddef>\nint parse_record(const unsigned char *data, std::size_t size) \
+             { return size > 2 && data[0] == 'W' ? data[1] : 0; }\n",
+        )
+        .unwrap();
+        let dir = generate_for_make_test(&source, "parse_record", "H-CUNIT", &root);
+        write_cpp_per_tu_context(
+            &dir,
+            &[PerTuCompileContext {
+                source: PathBuf::from("/proj/lib/legacy.c"),
+                compiler: Some("/usr/bin/gcc".to_owned()),
+                flags: vec!["-DLEGACY=1".to_owned()],
+            }],
+        )
+        .unwrap();
+        let dry_run = make_dry_run(&dir, &[("CC", "gcc"), ("CXX", "clang++")]);
+        let c_unit = recipe_for(&dry_run, "context_objs/main_0.o");
+        assert!(c_unit.starts_with("gcc "), "{c_unit}");
+        assert!(c_unit.contains("trace-pc,trace-cmp"), "{c_unit}");
+        assert!(
+            !c_unit.contains("trace-pc-guard") && !c_unit.contains("function,vptr"),
+            "{c_unit}"
+        );
+        // An explicit CFLAGS is what a C unit of another family gets.
+        let dry_run = make_dry_run(
+            &dir,
+            &[
+                ("CC", "gcc"),
+                ("CXX", "clang++"),
+                ("CFLAGS", "-O0 -DWIDGET_OWN=1"),
+            ],
+        );
+        assert!(
+            recipe_for(&dry_run, "context_objs/main_0.o").contains("-DWIDGET_OWN=1"),
+            "{dry_run}"
+        );
+        // The same family keeps the C++ instrumentation (minus its -std=).
+        let dry_run = make_dry_run(&dir, &[("CC", "clang"), ("CXX", "clang++")]);
+        let c_unit = recipe_for(&dry_run, "context_objs/main_0.o");
+        assert!(c_unit.contains("trace-pc-guard,trace-cmp"), "{c_unit}");
+        assert!(!c_unit.contains("-std=gnu++"), "{c_unit}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn switching_compilers_rebuilds_the_driver_object() {
+        if !have_tool("gcc") || !have_tool("clang") || !have_tool("make") {
+            eprintln!("skip: gcc/clang/make unavailable");
+            return;
+        }
+        let root = temp_dir("make-compiler-switch");
+        let source = root.join("parse.c");
+        fs::write(
+            &source,
+            "int parse_record(const unsigned char *data, unsigned long size) \
+             { return size > 1 && data[0] == 'R' ? data[1] : 0; }\n",
+        )
+        .unwrap();
+        let dir = generate_for_make_test(&source, "parse_record", "H-SWITCH", &root);
+        let first = make_main(&dir, &[("CC", "clang")]);
+        assert!(first.status.success(), "{}", output_text(&first));
+        // The same make again is a no-op: the stamp only changes with the toolchain.
+        let again = make_main(&dir, &[("CC", "clang")]);
+        assert!(
+            !output_text(&again).contains("-o bhf_driver.o"),
+            "an unchanged toolchain must not rebuild:\n{}",
+            output_text(&again)
+        );
+        let switched = make_main(&dir, &[("CC", "gcc")]);
+        let text = output_text(&switched);
+        assert!(switched.status.success(), "{text}");
+        assert!(
+            text.contains("gcc") && text.contains("-o bhf_driver.o"),
+            "a compiler change must rebuild bhf_driver.o, not link clang's:\n{text}"
+        );
+        assert!(
+            text.contains("-o main "),
+            "a compiler change must relink main:\n{text}"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_cross_prefixed_gcc_from_the_compile_database_gets_gcc_flags() {
+        let cross = "/usr/bin/aarch64-linux-gnu-gcc";
+        if !Path::new(cross).is_file() || !have_tool("make") {
+            eprintln!("skip: {cross}/make unavailable");
+            return;
+        }
+        let root = temp_dir("make-cross-db");
+        let src = root.join("src");
+        fs::create_dir_all(&src).unwrap();
+        let source = src.join("parse.c");
+        fs::write(
+            &source,
+            "int parse_record(const unsigned char *data, unsigned long size) \
+             { return size > 1 && data[0] == 'X' ? data[1] : 0; }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("compile_commands.json"),
+            format!(
+                r#"[{{"directory":"{}","file":"{}","arguments":["{cross}","-DFROM_DB=1","-c","{}"]}}]"#,
+                src.display(),
+                source.display(),
+                source.display()
+            ),
+        )
+        .unwrap();
+        let dir = generate_for_make_test(&source, "parse_record", "H-XDB", &root);
+        let makefile = fs::read_to_string(dir.join("Makefile")).unwrap();
+        assert!(makefile.contains(&format!("CC = {cross}")), "{makefile}");
+        // A hand-run make uses the database's cross gcc and must pair it with
+        // GCC flags, not clang's `-fno-sanitize=function` / `trace-pc-guard`.
+        let output = make_main(&dir, &[]);
+        let text = output_text(&output);
+        assert!(output.status.success(), "{text}");
+        assert!(!text.contains("trace-pc-guard"), "{text}");
+        let elf = fs::read(dir.join("main")).unwrap();
+        // e_machine 183 (0xB7) = AArch64.
+        assert_eq!(&elf[18..20], &[0xB7, 0x00], "main must be an AArch64 ELF");
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]

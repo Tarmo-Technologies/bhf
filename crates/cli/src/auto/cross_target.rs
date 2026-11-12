@@ -37,13 +37,18 @@ pub enum CrossRunner {
     QemuUser { exe: String },
     /// Wine for a Windows (mingw) PE target. `wine` just prefixes argv.
     Wine { exe: String },
+    /// The operator's own runner (`[toolchain] runner` + `runner-args`), used
+    /// for a whole-sweep cross target: `<exe> <args...> <harness>`.
+    Configured { exe: String, args: Vec<String> },
 }
 
 impl CrossRunner {
     /// The emulator executable that prefixes the harness argv.
     pub fn exe(&self) -> &str {
         match self {
-            CrossRunner::QemuUser { exe } | CrossRunner::Wine { exe } => exe,
+            CrossRunner::QemuUser { exe }
+            | CrossRunner::Wine { exe }
+            | CrossRunner::Configured { exe, .. } => exe,
         }
     }
 }
@@ -913,6 +918,105 @@ int  MsgReply(int rcvid, long status, const void *msg, size_t bytes);
 #endif /* BHF_FAKE_NEUTRINO_H */
 "#;
 
+/// Whether the static archive at `path` holds objects for `triple`'s
+/// architecture, judged from its first ELF or COFF member. `None` when that
+/// cannot be told: not a regular `ar` archive, a member format this does not
+/// read (LLVM bitcode), or an architecture it does not know.
+pub fn archive_matches_target(path: &Path, triple: &str) -> Option<bool> {
+    let member = first_archive_member_header(path)?;
+    let windows = {
+        let lower = triple.to_ascii_lowercase();
+        lower.contains("mingw") || lower.contains("windows") || lower.contains("cygwin")
+    };
+    if member.starts_with(b"\x7fELF") {
+        if windows {
+            return Some(false);
+        }
+        let expected = elf_machine_for(triple)?;
+        let machine = match member.get(5)? {
+            1 => u16::from_le_bytes([*member.get(18)?, *member.get(19)?]),
+            2 => u16::from_be_bytes([*member.get(18)?, *member.get(19)?]),
+            _ => return None,
+        };
+        return Some(machine == expected);
+    }
+    // A COFF object starts with its machine field.
+    let coff_machine = u16::from_le_bytes([*member.first()?, *member.get(1)?]);
+    let coff_expected = coff_machine_for(triple)?;
+    if windows {
+        return Some(coff_machine == coff_expected);
+    }
+    None
+}
+
+/// The first bytes of the first object member of the `ar` archive at `path`,
+/// skipping the symbol and long-name tables.
+fn first_archive_member_header(path: &Path) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut magic = [0u8; 8];
+    file.read_exact(&mut magic).ok()?;
+    if &magic != b"!<arch>\n" {
+        return None;
+    }
+    // A long symbol table can push the first object far in; a bounded walk
+    // keeps a pathological archive cheap.
+    for _ in 0..8 {
+        let mut header = [0u8; 60];
+        file.read_exact(&mut header).ok()?;
+        let name = std::str::from_utf8(&header[..16]).ok()?.trim_end();
+        let size: u64 = std::str::from_utf8(&header[48..58])
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        let table = matches!(
+            name,
+            "/" | "//" | "/SYM64/" | "__.SYMDEF" | "__.SYMDEF SORTED"
+        ) || name.starts_with("__.SYMDEF");
+        if !table {
+            let mut start = vec![0u8; size.min(64) as usize];
+            file.read_exact(&mut start).ok()?;
+            return Some(start);
+        }
+        // Members are two-byte aligned.
+        file.seek(SeekFrom::Current((size + size % 2) as i64))
+            .ok()?;
+    }
+    None
+}
+
+/// The ELF `e_machine` for `triple`'s architecture, when known.
+fn elf_machine_for(triple: &str) -> Option<u16> {
+    let arch = triple.split('-').next()?.to_ascii_lowercase();
+    Some(match arch.as_str() {
+        "x86_64" | "amd64" => 62,
+        "i386" | "i486" | "i586" | "i686" | "x86" => 3,
+        "aarch64" | "aarch64_be" | "arm64" => 183,
+        a if a.starts_with("arm") || a.starts_with("thumb") => 40,
+        "riscv32" | "riscv64" => 243,
+        a if a.starts_with("mips") => 8,
+        "powerpc" | "ppc" | "powerpcle" | "ppcle" => 20,
+        a if a.starts_with("powerpc64") || a.starts_with("ppc64") => 21,
+        "sparc" => 2,
+        "sparc64" | "sparcv9" => 43,
+        "s390x" => 22,
+        "loongarch64" => 258,
+        _ => return None,
+    })
+}
+
+/// The COFF machine field for a Windows `triple`'s architecture, when known.
+fn coff_machine_for(triple: &str) -> Option<u16> {
+    let arch = triple.split('-').next()?.to_ascii_lowercase();
+    Some(match arch.as_str() {
+        "x86_64" | "amd64" => 0x8664,
+        "i386" | "i486" | "i586" | "i686" | "x86" => 0x014c,
+        "aarch64" | "arm64" => 0xaa64,
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1524,5 +1628,86 @@ int main(int argc, char **argv) {
                 "{guard} must not platform-stub"
             );
         }
+    }
+
+    /// An `ar` archive at `path` holding one member that starts with `object`,
+    /// behind a GNU symbol table.
+    fn write_archive(path: &Path, object: &[u8]) {
+        let mut bytes = b"!<arch>\n".to_vec();
+        let mut member = |name: &str, data: &[u8]| {
+            bytes.extend(
+                format!(
+                    "{name:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+                    0,
+                    0,
+                    0,
+                    644,
+                    data.len()
+                )
+                .as_bytes(),
+            );
+            bytes.extend_from_slice(data);
+            if data.len() % 2 == 1 {
+                bytes.push(b'\n');
+            }
+        };
+        member("/", &[0, 0, 0, 0, 7]);
+        member("parse.o/", object);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// The first 20 bytes of a little-endian ELF object for `machine`.
+    fn elf_object(machine: u16) -> Vec<u8> {
+        let mut object = vec![0u8; 20];
+        object[..4].copy_from_slice(b"\x7fELF");
+        object[4] = 2;
+        object[5] = 1;
+        object[18..20].copy_from_slice(&machine.to_le_bytes());
+        object
+    }
+
+    #[test]
+    fn an_archive_is_matched_to_the_target_by_its_object_machine() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = dir.path().join("libwidget_x86.a");
+        write_archive(&host, &elf_object(62));
+        let arm = dir.path().join("libwidget_arm.a");
+        write_archive(&arm, &elf_object(183));
+        assert_eq!(
+            archive_matches_target(&host, "aarch64-linux-gnu"),
+            Some(false)
+        );
+        assert_eq!(
+            archive_matches_target(&arm, "aarch64-linux-gnu"),
+            Some(true)
+        );
+        assert_eq!(
+            archive_matches_target(&host, "x86_64-pc-linux-gnu"),
+            Some(true)
+        );
+        // An ELF object never links into a Windows target; a COFF one is
+        // judged by its machine field.
+        assert_eq!(
+            archive_matches_target(&host, "x86_64-w64-mingw32"),
+            Some(false)
+        );
+        let coff = dir.path().join("libwidget_win.a");
+        write_archive(&coff, &[0x64, 0x86, 0, 0]);
+        assert_eq!(
+            archive_matches_target(&coff, "x86_64-w64-mingw32"),
+            Some(true)
+        );
+        assert_eq!(
+            archive_matches_target(&coff, "i686-w64-mingw32"),
+            Some(false)
+        );
+        // What cannot be told is left to the link.
+        assert_eq!(archive_matches_target(&host, "xtensa-esp32-elf"), None);
+        let bitcode = dir.path().join("libwidget_lto.a");
+        write_archive(&bitcode, b"BC\xc0\xde");
+        assert_eq!(archive_matches_target(&bitcode, "aarch64-linux-gnu"), None);
+        let text = dir.path().join("libwidget.txt");
+        std::fs::write(&text, "not an archive").unwrap();
+        assert_eq!(archive_matches_target(&text, "aarch64-linux-gnu"), None);
     }
 }

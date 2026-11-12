@@ -57,10 +57,27 @@ runtime), built with ASan and UBSan. It is not a libFuzzer binary;
 `PORTABILITY.md`). `bhf build --c-engine afl++` runs `make afl` and stages
 `main_afl` for `bhf fuzz --engine afl++`.
 When make's built-in compiler defaults are still `cc` / `g++`, the generated
-Makefile and `bhf build` prefer `clang` / `clang++`. The generated sanitizer
-and coverage flags are clang's unless the harness was generated from a gcc
-compile database, so leave `CC`/`CXX` unset or point them at clang; a
-`CXX=g++` build of a clang Makefile fails on unrecognized options.
+Makefile and `bhf build` prefer `clang` / `clang++`. `CC`/`CXX` (or `--cc`/`--cxx`,
+or `[toolchain] cc`/`cxx` in a config file) choose another compiler, and the
+Makefile picks its instrumentation from the compiler that actually runs: clang
+gets `trace-pc-guard,trace-cmp` coverage and the `function`/`vptr` UBSan
+subtractions, gcc (native or cross-prefixed, `.exe` included) gets
+`trace-pc,trace-cmp` and statically linked sanitizer runtimes. Setting
+`CFLAGS`/`CXXFLAGS` still replaces bhf's flags entirely; use `--cflags` /
+`--cxxflags` (`toolchain.cflags`) to APPEND flags and keep coverage and ASan.
+Every object depends on a toolchain stamp, so changing the compiler or its flags
+in the same harness directory rebuilds instead of linking stale objects. A
+compile database's compiler is only the Makefile's default `CC`/`CXX`; it never
+overrides the compiler bhf or the operator selects. `--sanitizers` keeps the
+selected compiler when it can build the requested sanitizers and otherwise
+says which compiler it uses instead. A C translation unit of a C++ harness is
+compiled with `CC` and takes flags spelled for `CC`'s family (with `CFLAGS`
+when the two compilers are of different families and `CFLAGS` is set).
+`--cflags` also reach bhf's driver object (without `-std=` and `-Werror`; a
+C++ harness's driver takes `--cxxflags` too), so an ABI-selecting flag such as
+`-m32` applies to the whole link. `CC=clang` in the environment is bhf's own
+default: `bhf auto` still retries a target clang rejects with gcc, which it
+does not do for a compiler the operator chose.
 
 ## Discovery
 

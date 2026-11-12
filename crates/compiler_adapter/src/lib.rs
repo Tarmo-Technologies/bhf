@@ -343,6 +343,35 @@ mod tests {
         assert!(log.contains("-gnat2022"));
     }
 
+    /// The `<prefix>-gnat` driver wants a subcommand before compile switches;
+    /// a prefixed gnatmake takes them directly and runs the canary instead.
+    #[test]
+    fn probe_compiler_for_target_prefers_a_prefixed_gnatmake_canary() {
+        let _lock = PATH_LOCK.lock().expect("path lock is acquired");
+        let dir = TestPathDir::new("probe_target_gnatmake");
+        dir.write_executable("aarch64-linux-gnu-gprbuild", fake_version_compiler_script());
+        dir.write_executable("aarch64-linux-gnu-gnatmake", fake_raw_gnat_canary_script());
+        dir.write_executable("aarch64-linux-gnu-gnat", "#!/bin/sh\nexit 4\n");
+        let log_path = dir.file_path("raw-gnat.log");
+        let _path = PathEnvGuard::set(dir.path());
+        let _log = EnvVarGuard::set("BHF_RAW_GNAT_LOG", log_path.as_os_str());
+
+        let adapter = CompilerAdapter::discover_for(ToolchainConfig {
+            target: None,
+            runtime: None,
+            toolchain: Some("aarch64-linux-gnu".to_owned()),
+        })
+        .expect("prefixed adapter is discovered");
+        let cwd = std::env::current_dir().expect("cwd");
+        crate::probe_compiler(&adapter).expect("the gnatmake canary passes");
+        let log = std::fs::read_to_string(log_path).expect("canary log is readable");
+        assert!(log.contains("aarch64-linux-gnu-gnatmake"), "{log}");
+        assert!(
+            !cwd.join("canary.ali").exists(),
+            "the canary must not write into the working directory"
+        );
+    }
+
     #[test]
     fn canary_probes_ada2022_when_supported() {
         let _lock = PATH_LOCK.lock().expect("path lock is acquired");

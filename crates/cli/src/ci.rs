@@ -206,6 +206,8 @@ fn auto_args_from_ci(args: &CiArgs, scoped_files: &[PathBuf]) -> AutoArgs {
         max_corpus_mb: 64,
         discovery_cache: None,
         config: None,
+        config_toolchain: None,
+        toolchain: Default::default(),
         project: None,
         grammar_file: None,
         max_len: "auto".to_owned(),

@@ -48,6 +48,45 @@
 - docs/site/c-cpp.md described a lone read-only byte pointer as a borrowed
   view of the fuzz input. The harness passes a NUL-terminated heap copy of the
   input, `max(Size + 1, 8)` bytes.
+- Generated C/C++ Makefiles choose their coverage and sanitizer flags from the
+  compiler that actually runs, at build time: `CC=gcc`/`CXX=g++`, a
+  cross-prefixed gcc (from `CC`, a compile database or a build capture) and
+  `.exe` driver names get GCC-spelled flags (`trace-pc,trace-cmp`, no
+  `function`/`vptr` UBSan checks, statically linked sanitizer runtimes so the
+  runtrace shim does not abort them) instead of failing on clang-only
+  options. A compile database's compiler is only the Makefile default: the
+  per-translation-unit object rules use `$(CC)`/`$(CXX)`, so an override or a
+  retry reaches every unit.
+- Objects are rebuilt when the compiler or its flags change in the same harness
+  directory: every object and binary depends on a toolchain stamp (compiler,
+  family and flags). A gcc retry, a cross build or a new `CC` between runs no
+  longer links objects from the previous compiler ("file in wrong format").
+  The MemorySanitizer, ThreadSanitizer, coverage and differential lanes link a
+  driver object from their own compiler.
+- `bhf build --target`/`--toolchain` apply to C/C++ harnesses (they select
+  `<prefix>-gcc`/`<prefix>-g++`, or `--target=` for clang) instead of being
+  ignored, and `--runtime`, `--probe-backend` and the `--ada-*` flags are
+  refused for a C/C++ harness with the flags that do apply.
+- The generated Ada project no longer writes a tool prefix as
+  `Toolchain_Name`, which gprconfig cannot match; the prefix becomes the
+  `Target` when none is given, and a gprconfig compiler name (`GNAT`) is still
+  written as `Toolchain_Name`. A prefixed toolchain without a prefixed gprbuild
+  uses the multi-target `gprbuild`, and the compiler canary prefers
+  `<prefix>-gnatmake`, which takes compile switches directly.
+- `bhf auto --sanitizers` keeps an operator's `CC`/`CXX` when they can build
+  the requested sanitizers, with flags in their spelling; otherwise it says it
+  uses clang and why. The gcc retry no longer replaces an operator's compiler
+  and only swaps the compilers, keeping `trace-cmp` and the dialect ladder;
+  `CC=clang` in the environment is bhf's own default and keeps the retry.
+- A C translation unit of a C++ harness takes flags for its own compiler's
+  family, so `CC=gcc` beside `clang++` no longer gets clang-only options, and
+  toolchain C/C++ flags reach bhf's driver object (without `-std=`/`-Werror`),
+  so an ABI-selecting flag such as `-m32` applies to the whole link.
+- Relative paths in a `bhf auto` config file (`--config` or an auto-loaded
+  `.bhf.toml`) resolve against the file's directory, not the working
+  directory.
+- `bhf auto --help` and the docs no longer claim every flag is a config key;
+  they list the accepted keys, and a test keeps the list in step with the flags.
 - C++ `--target` accepts a trailing qualified suffix, in `generate-harness`
   and `bhf auto`: `Class::method` selects `ns::Class::method`, with or without
   the parameter list. An exact spelling still wins: the suffix match applies
@@ -396,6 +435,16 @@
   additive `buffer_len_dimension: true`, and a finding replayed, minimized or
   packaged against a harness generated with the other setting is flagged the
   same way.
+- The foreign-guard qemu-user lane of `bhf auto` builds with GCC's
+  `trace-pc,trace-cmp` coverage when the cross compiler accepts it, so emulated
+  arch targets are fuzzed coverage-guided instead of blind.
+- A failed C++ build caused by a member declared with its own class's
+  qualification is retried with `-fms-extensions` (clang) or `-fpermissive`
+  (gcc) from a new work-dir `cxx_compat.mk`, spliced into every C++ Makefile
+  lane and object rule; the fragment is kept only when that error disappears.
+- Toolchain changes are announced: the compilers a `[toolchain]` or `--cc`
+  selects, the environment values they replace, and the compiler a
+  `--sanitizers` build falls back to.
 - `bhf auto --seed-dir` reads a directory's files in name order.
 - Sanitizer finding signatures, IDs and root-cause keys changed. UBSan runs
   with `print_stacktrace=1` and `report_error_type=1` during fuzzing,
@@ -532,6 +581,31 @@
   endianness, bounds, length prefixes, which parameters use the whole input,
   receivers, constructors and lifecycle loops, the argument trace, and a gdb
   recipe for reading arguments from harnesses built before it.
+- A `[toolchain]` table, shared by `bhf auto --config` and the new
+  `bhf build --config`, with matching flags: `cc`, `cxx`, `cflags`, `cxxflags`,
+  `ldflags` (appended to bhf's instrumentation), `defines`, `include-dirs`,
+  `target`, `sysroot`, `runner`, `runner-args`, and `[toolchain.ada]` `prefix`,
+  `gprbuild`, `gnat`, `target`, `runtime`, `switches`, `probe-backend`. It is
+  validated before anything builds and, from an auto-loaded `.bhf.toml`, ignored
+  with a note. `bhf auto` gains `--cc`, `--cxx`, `--cflags`, `--cxxflags`,
+  `--ldflags`, `--define`, `--toolchain-include`, `--sysroot`,
+  `--target-triple`, `--runner`, `--runner-arg`, `--ada-prefix`,
+  `--ada-target`, `--ada-runtime`, `--ada-gprbuild`, `--ada-gnat`,
+  `--ada-switch` and `--probe-backend`; `bhf build` gains the C/C++ ones plus
+  `--ada-gprbuild`, `--ada-gnat` and `--ada-switch`.
+- Whole-sweep cross mode: with a `[toolchain] runner` (`--runner`) and a
+  C/C++ toolchain that builds for another target (`target`, or a cross `cc`),
+  every C/C++ candidate is built for the target with coverage and fuzzed under
+  the runner. A runner for a foreign `[toolchain.ada] target` alone runs only
+  the Ada harnesses (with that target's qemu-user `-L` directory) and leaves the
+  C/C++ candidates native. A foreign target or C/C++ compiler (also from
+  `CC`/`CXX`) without a runner, and a runner with nothing foreign to run, are
+  refused before anything builds. Archives a build probe builds for the host are
+  not linked into cross-built harnesses, and a project archive is linked into a
+  cross build only when its objects are for the target's architecture.
+- More `bhf auto` config keys: `extra-source`, `seed-file`, `seed-dir`,
+  `sanitizers`, `engine`, `languages`, `project`, `ada-deps`, `passes`, and
+  `probe-build` (explicit `--config` only).
 - docs/site/custom-harness.md: writing an `LLVMFuzzerTestOneInput` entry
   point and wrapping it with `generate-harness`, editing a generated
   `bhf_run_one`, building with `AUTO_EXTRA_SOURCES`/`AUTO_EXTRA_INCLUDES`/

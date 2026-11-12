@@ -5,10 +5,13 @@
 //! are reproducible without re-typing them.
 //!
 //! Merge rule: the CLI always overrides the config — the config only fills a field left
-//! at its default/unset value. SECURITY: an AUTO-loaded `.bhf.toml` comes from the
-//! scanned, possibly-untrusted tree, so it honors ONLY safe knobs; the fields that make
-//! bhf EXECUTE the tree's own build (`build-command`, `unsafe-search-and-run…`,
-//! `run-untrusted`) are ignored unless the config was passed EXPLICITLY with `--config`,
+//! at its default/unset value. Relative paths in the file resolve against the file's
+//! own directory, so a config means the same thing whatever directory bhf runs from.
+//! SECURITY: an AUTO-loaded `.bhf.toml` comes from the scanned, possibly-untrusted
+//! tree, so it honors ONLY safe knobs; the fields that make bhf EXECUTE something the
+//! file names (`build-command`, `unsafe-search-and-run…`, `run-untrusted`,
+//! `probe-build`, and the whole `[toolchain]` table, whose compilers, flags and runner
+//! bhf would run) are ignored unless the config was passed EXPLICITLY with `--config`,
 //! so a hostile tree can't auto-run code.
 
 use std::path::{Path, PathBuf};
@@ -25,6 +28,7 @@ const DEFAULT_PER_TARGET_TIME: u64 = 60;
 const DEFAULT_JOBS: usize = 1;
 const DEFAULT_MAX_LEN: &str = "auto";
 const DEFAULT_MAX_CORPUS_MIB: usize = 64;
+const DEFAULT_ENGINE: &str = "builtin";
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
@@ -41,16 +45,138 @@ pub struct AutoConfig {
     pub timeout: Option<String>,
     pub grammar: Option<PathBuf>,
     pub extra_include: Option<Vec<PathBuf>>,
+    pub extra_source: Option<Vec<PathBuf>>,
     pub exclude_path: Option<Vec<String>>,
+    pub seed_file: Option<Vec<PathBuf>>,
+    pub seed_dir: Option<Vec<PathBuf>>,
+    pub sanitizers: Option<Vec<String>>,
+    pub engine: Option<String>,
+    pub languages: Option<Vec<String>>,
+    pub project: Option<PathBuf>,
+    pub ada_deps: Option<Vec<PathBuf>>,
+    pub passes: Option<String>,
     pub force: Option<bool>,
     /// `false` turns off seeding from the tree's own test data (`--no-seed-mining`).
     pub seed_mining: Option<bool>,
 
-    // Execute-y knobs: honored ONLY from an explicit --config (they run the tree's build).
+    // Execute-y knobs: honored ONLY from an explicit --config (they run the tree's build
+    // or a program the file names).
     pub build_command: Option<String>,
     pub run_untrusted: Option<bool>,
     pub unsafe_search_and_run_build_commands: Option<bool>,
+    pub probe_build: Option<bool>,
+    /// The `[toolchain]` table shared with `bhf build --config`.
+    pub toolchain: Option<config::ToolchainConfig>,
 }
+
+/// Every `bhf auto` flag that has a config key, as `(flag, key)`. A flag that
+/// is not listed here is in [`FLAGS_WITHOUT_CONFIG_KEYS`]; a unit test holds the
+/// two lists to the real flag set, so a new flag cannot silently go missing
+/// from both. The `--help` text and `docs/site/auto.md` list these keys.
+#[cfg(test)]
+pub(crate) const FLAG_CONFIG_KEYS: &[(&str, &str)] = &[
+    ("per-target-time", "per-target-time"),
+    ("max-targets", "max-targets"),
+    ("jobs", "jobs"),
+    ("rss-limit-mb", "rss-limit-mb"),
+    ("max-work-dir-mb", "max-work-dir-mb"),
+    ("max-corpus-mb", "max-corpus-mb"),
+    ("cxx-std", "cxx-std"),
+    ("max-len", "max-len"),
+    ("timeout", "timeout"),
+    ("grammar", "grammar"),
+    ("extra-include", "extra-include"),
+    ("extra-source", "extra-source"),
+    ("exclude-path", "exclude-path"),
+    ("seed-file", "seed-file"),
+    ("seed-dir", "seed-dir"),
+    ("sanitizers", "sanitizers"),
+    ("engine", "engine"),
+    ("languages", "languages"),
+    ("project", "project"),
+    ("ada-deps", "ada-deps"),
+    ("passes", "passes"),
+    ("force", "force"),
+    ("no-seed-mining", "seed-mining"),
+    ("build-command", "build-command"),
+    ("run-untrusted", "run-untrusted"),
+    (
+        "unsafe-search-and-run-build-commands",
+        "unsafe-search-and-run-build-commands",
+    ),
+    ("probe-build", "probe-build"),
+    ("cc", "toolchain.cc"),
+    ("cxx", "toolchain.cxx"),
+    ("cflags", "toolchain.cflags"),
+    ("cxxflags", "toolchain.cxxflags"),
+    ("ldflags", "toolchain.ldflags"),
+    ("define", "toolchain.defines"),
+    ("toolchain-include", "toolchain.include-dirs"),
+    ("sysroot", "toolchain.sysroot"),
+    ("target-triple", "toolchain.target"),
+    ("runner", "toolchain.runner"),
+    ("runner-arg", "toolchain.runner-args"),
+    ("ada-prefix", "toolchain.ada.prefix"),
+    ("ada-target", "toolchain.ada.target"),
+    ("ada-runtime", "toolchain.ada.runtime"),
+    ("ada-gprbuild", "toolchain.ada.gprbuild"),
+    ("ada-gnat", "toolchain.ada.gnat"),
+    ("ada-switch", "toolchain.ada.switches"),
+    ("probe-backend", "toolchain.ada.probe-backend"),
+];
+
+/// The `bhf auto` flags that deliberately have no config key: per-run actions
+/// and selections (`--target`, `--resume`, `--dry-run`, ...), output and
+/// diagnostics switches, and the config file itself.
+#[cfg(test)]
+pub(crate) const FLAGS_WITHOUT_CONFIG_KEYS: &[&str] = &[
+    "work-dir",
+    "discovery-cache",
+    "config",
+    "total-time",
+    "per-target-finding-count",
+    "campaign-time",
+    "min-target-time",
+    "max-attempts",
+    "max-repair-rounds",
+    "single-pass",
+    "reuse-discovery",
+    "no-discovery-cache",
+    "fresh-discovery",
+    "resume",
+    "iterations",
+    "no-stubs",
+    "list-fakes",
+    "target",
+    "harness-id",
+    "target-file",
+    "exclude",
+    "reuse-legacy-corpus",
+    "mode",
+    "verbose",
+    "deps-only",
+    "list-targets",
+    "dry-run",
+    "exclude-dir",
+    "include-dir",
+    "preprocess",
+    "install-deps",
+    "comparison-progress",
+    "sbom",
+    "static",
+    "external-tools",
+    "differential",
+    "sloc",
+    "static-dynamic",
+    "no-minimize",
+    // C/C++ decoder synthesis caps (shared with `bhf generate-harness`).
+    "array-max-size",
+    "bitset-max-size",
+    "container-size-max",
+    "max-array-elems",
+    "max-decl-bytes",
+    "max-decode-depth",
+];
 
 /// Where the effective config came from, which gates the execute-y knobs.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -61,14 +187,19 @@ enum Trust {
     TreeAutoloaded,
 }
 
+/// A parsed config, where it came from, and the directory its relative paths
+/// resolve against.
+struct LoadedConfig {
+    config: AutoConfig,
+    trust: Trust,
+    path: PathBuf,
+    base_dir: PathBuf,
+}
+
 /// Load the config for a run: `--config <PATH>` if given (explicit trust), else an
-/// auto-loaded `.bhf.toml` from the tree root (safe knobs only). Returns the parsed
-/// config + its trust level, or `Ok(None)` when there is no config. A malformed config
-/// is a hard error.
-fn load(
-    config_flag: Option<&Path>,
-    tree_root: &Path,
-) -> Result<Option<(AutoConfig, Trust)>, String> {
+/// auto-loaded `.bhf.toml` from the tree root (safe knobs only). Returns `Ok(None)`
+/// when there is no config. A malformed config is a hard error.
+fn load(config_flag: Option<&Path>, tree_root: &Path) -> Result<Option<LoadedConfig>, String> {
     let (path, trust) = match config_flag {
         Some(p) => (p.to_path_buf(), Trust::Explicit),
         None => {
@@ -83,16 +214,42 @@ fn load(
         .map_err(|e| format!("read config {}: {e}", path.display()))?;
     let config: AutoConfig =
         toml::from_str(&text).map_err(|e| format!("parse config {}: {e}", path.display()))?;
-    Ok(Some((config, trust)))
+    let base_dir = crate::toolchain::config_base_dir(&path);
+    Ok(Some(LoadedConfig {
+        config,
+        trust,
+        path,
+        base_dir,
+    }))
+}
+
+fn resolved(base: &Path, path: PathBuf) -> PathBuf {
+    if path.is_relative() {
+        base.join(path)
+    } else {
+        path
+    }
+}
+
+fn resolved_all(base: &Path, paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    paths.into_iter().map(|path| resolved(base, path)).collect()
 }
 
 /// Load + apply the project config to `args` in place (CLI values already parsed win).
 /// Returns human-readable notes to print (what was applied / ignored), or an error for
-/// a malformed config / bad value.
+/// a malformed config / bad value. A `[toolchain]` table is stored in
+/// `args.config_toolchain` for the caller to merge with the toolchain flags.
 pub fn apply(args: &mut AutoArgs, tree_root: &Path) -> Result<Vec<String>, String> {
-    let Some((config, trust)) = load(args.config.as_deref(), tree_root)? else {
+    let Some(LoadedConfig {
+        config,
+        trust,
+        path,
+        base_dir,
+    }) = load(args.config.as_deref(), tree_root)?
+    else {
         return Ok(Vec::new());
     };
+    let base = base_dir.as_path();
     let mut notes = Vec::new();
 
     // --- Safe knobs: apply only where the arg is still at its default/unset. ---
@@ -146,17 +303,68 @@ pub fn apply(args: &mut AutoArgs, tree_root: &Path) -> Result<Vec<String>, Strin
     }
     if let Some(v) = config.grammar {
         if args.grammar_file.is_none() {
-            args.grammar_file = Some(v);
+            args.grammar_file = Some(resolved(base, v));
         }
     }
     if let Some(v) = config.extra_include {
         if args.extra_includes.is_empty() {
-            args.extra_includes = v;
+            args.extra_includes = resolved_all(base, v);
+        }
+    }
+    if let Some(v) = config.extra_source {
+        if args.extra_sources.is_empty() {
+            args.extra_sources = resolved_all(base, v);
         }
     }
     if let Some(v) = config.exclude_path {
         if args.exclude_paths.is_empty() {
             args.exclude_paths = v;
+        }
+    }
+    if let Some(v) = config.seed_file {
+        if args.seed_files.is_empty() {
+            args.seed_files = resolved_all(base, v);
+        }
+    }
+    if let Some(v) = config.seed_dir {
+        if args.seed_dirs.is_empty() {
+            args.seed_dirs = resolved_all(base, v);
+        }
+    }
+    if let Some(v) = config.sanitizers {
+        if args.sanitizers.is_empty() {
+            args.sanitizers = v;
+        }
+    }
+    if let Some(v) = config.engine {
+        if args.engine == DEFAULT_ENGINE {
+            args.engine = v;
+        }
+    }
+    if let Some(v) = config.languages {
+        if args.languages.is_empty() {
+            args.languages = v
+                .iter()
+                .map(|name| {
+                    <crate::auto::candidate::LangSelector as clap::ValueEnum>::from_str(name, true)
+                        .map_err(|_| format!("languages: unknown language {name:?}"))
+                })
+                .collect::<Result<_, _>>()?;
+        }
+    }
+    if let Some(v) = config.project {
+        if args.project.is_none() {
+            args.project = Some(resolved(base, v));
+        }
+    }
+    if let Some(v) = config.ada_deps {
+        if args.ada_deps.is_empty() {
+            args.ada_deps = resolved_all(base, v);
+        }
+    }
+    if let Some(v) = config.passes {
+        if args.passes.is_none() && !args.single_pass {
+            args.passes = Some(v);
         }
     }
     if let Some(true) = config.force {
@@ -171,7 +379,9 @@ pub fn apply(args: &mut AutoArgs, tree_root: &Path) -> Result<Vec<String>, Strin
     // --- Execute-y knobs: only from an EXPLICIT --config. ---
     let execute_y_requested = config.build_command.is_some()
         || config.run_untrusted == Some(true)
-        || config.unsafe_search_and_run_build_commands == Some(true);
+        || config.unsafe_search_and_run_build_commands == Some(true)
+        || config.probe_build == Some(true)
+        || config.toolchain.as_ref().is_some_and(|t| !t.is_empty());
     match trust {
         Trust::Explicit => {
             if let Some(v) = config.build_command {
@@ -185,26 +395,26 @@ pub fn apply(args: &mut AutoArgs, tree_root: &Path) -> Result<Vec<String>, Strin
             if config.unsafe_search_and_run_build_commands == Some(true) {
                 args.unsafe_search_and_run_build_commands = true;
             }
+            if config.probe_build == Some(true) {
+                args.probe_build = true;
+            }
+            if let Some(mut toolchain) = config.toolchain {
+                toolchain.resolve_relative_to(base);
+                args.config_toolchain = Some(toolchain);
+            }
         }
         Trust::TreeAutoloaded if execute_y_requested => {
             notes.push(format!(
                 "ignoring build-executing keys in the auto-loaded {CONFIG_FILE_NAME} \
-                 (build-command / run-untrusted / unsafe-search-and-run-build-commands) — \
-                 pass it explicitly with --config to honor them, since it runs code from the scanned tree"
+                 (build-command / run-untrusted / unsafe-search-and-run-build-commands / \
+                 probe-build / [toolchain]) — pass it explicitly with --config to honor them, \
+                 since they run code or programs named by the scanned tree"
             ));
         }
         Trust::TreeAutoloaded => {}
     }
 
-    let source = match trust {
-        Trust::Explicit => args
-            .config
-            .as_deref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default(),
-        Trust::TreeAutoloaded => tree_root.join(CONFIG_FILE_NAME).display().to_string(),
-    };
-    notes.insert(0, format!("loaded config from {source}"));
+    notes.insert(0, format!("loaded config from {}", path.display()));
     Ok(notes)
 }
 
@@ -225,6 +435,204 @@ mod tests {
             vec![PathBuf::from("deps/include")]
         );
         assert!(toml::from_str::<AutoConfig>("bogus-key = 1\n").is_err());
+    }
+
+    /// A sample TOML value for each config key, so every listed key is proved
+    /// to deserialize.
+    fn sample_value(key: &str) -> &'static str {
+        match key {
+            "per-target-time" | "max-targets" | "jobs" | "rss-limit-mb" | "max-work-dir-mb"
+            | "max-corpus-mb" => "2",
+            "force"
+            | "seed-mining"
+            | "run-untrusted"
+            | "unsafe-search-and-run-build-commands"
+            | "probe-build" => "true",
+            "extra-include" | "extra-source" | "exclude-path" | "seed-file" | "seed-dir"
+            | "sanitizers" | "languages" | "ada-deps" | "cflags" | "cxxflags" | "ldflags"
+            | "defines" | "include-dirs" | "runner-args" | "switches" => "[\"c\"]",
+            _ => "\"x\"",
+        }
+    }
+
+    #[test]
+    fn every_auto_flag_is_either_a_config_key_or_listed_as_flag_only() {
+        use clap::Args;
+        let command = AutoArgs::augment_args(clap::Command::new("auto"));
+        let mut flags: Vec<String> = command
+            .get_arguments()
+            .filter_map(|arg| arg.get_long().map(str::to_owned))
+            .filter(|long| long != "help")
+            .collect();
+        flags.sort();
+        let mut listed: Vec<String> = FLAG_CONFIG_KEYS
+            .iter()
+            .map(|(flag, _)| (*flag).to_owned())
+            .chain(
+                FLAGS_WITHOUT_CONFIG_KEYS
+                    .iter()
+                    .map(|flag| (*flag).to_owned()),
+            )
+            .collect();
+        listed.sort();
+        let missing: Vec<_> = flags.iter().filter(|f| !listed.contains(f)).collect();
+        let stale: Vec<_> = listed.iter().filter(|f| !flags.contains(f)).collect();
+        assert!(
+            missing.is_empty() && stale.is_empty(),
+            "auto flags not classified as config key or flag-only: {missing:?}; \
+             listed but no such flag: {stale:?}"
+        );
+        let mut deduped = listed.clone();
+        deduped.dedup();
+        assert_eq!(deduped, listed, "a flag is listed twice");
+    }
+
+    #[test]
+    fn every_listed_config_key_is_accepted() {
+        let mut top = String::new();
+        let mut toolchain = String::from("[toolchain]\n");
+        let mut ada = String::from("[toolchain.ada]\n");
+        for (_, key) in FLAG_CONFIG_KEYS {
+            if let Some(rest) = key.strip_prefix("toolchain.ada.") {
+                ada.push_str(&format!("{rest} = {}\n", sample_value(rest)));
+            } else if let Some(rest) = key.strip_prefix("toolchain.") {
+                toolchain.push_str(&format!("{rest} = {}\n", sample_value(rest)));
+            } else {
+                top.push_str(&format!("{key} = {}\n", sample_value(key)));
+            }
+        }
+        let text = format!("{top}{toolchain}{ada}");
+        let parsed: Result<AutoConfig, _> = toml::from_str(&text);
+        assert!(parsed.is_ok(), "{:?}\n{text}", parsed.err());
+    }
+
+    #[test]
+    fn the_docs_list_every_config_key() {
+        let docs = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/site/auto.md"),
+        )
+        .unwrap();
+        for (_, key) in FLAG_CONFIG_KEYS {
+            let leaf = key.rsplit('.').next().unwrap();
+            // `key`, or `key = value`.
+            let documented = |name: &str| {
+                docs.contains(&format!("`{name}`")) || docs.contains(&format!("`{name} ="))
+            };
+            assert!(
+                documented(key) || documented(leaf),
+                "docs/site/auto.md does not document config key {key}"
+            );
+        }
+        assert!(
+            !docs.contains("Keys are the flag names in kebab-case"),
+            "the docs must not claim every flag is a config key"
+        );
+    }
+
+    #[test]
+    fn relative_paths_resolve_against_the_config_files_directory() {
+        let tree = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tree.path().join(CONFIG_FILE_NAME),
+            "extra-include = [\"include\", \"/abs/inc\"]\ngrammar = \"fmt.json\"\n\
+             seed-dir = [\"seeds\"]\nextra-source = [\"lib/aux.c\"]\n",
+        )
+        .unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let mut args = parse_auto_args(&["bhf", "tree"]);
+        // An auto-loaded config: relative to the tree root it sits in.
+        apply(&mut args, tree.path()).unwrap();
+        let base = crate::toolchain::config_base_dir(&tree.path().join(CONFIG_FILE_NAME));
+        assert_eq!(
+            args.extra_includes,
+            [base.join("include"), PathBuf::from("/abs/inc")]
+        );
+        assert_eq!(args.grammar_file, Some(base.join("fmt.json")));
+        assert_eq!(args.seed_dirs, [base.join("seeds")]);
+        assert_eq!(args.extra_sources, [base.join("lib/aux.c")]);
+
+        // An explicit --config elsewhere: relative to that file, not the CWD.
+        let config = elsewhere.path().join("ci.toml");
+        std::fs::write(
+            &config,
+            "extra-include = [\"deps/inc\"]\nproject = \"p.gpr\"\n",
+        )
+        .unwrap();
+        let mut args = parse_auto_args(&["bhf", "tree", "--config", config.to_str().unwrap()]);
+        apply(&mut args, tree.path()).unwrap();
+        let base = crate::toolchain::config_base_dir(&config);
+        assert_eq!(args.extra_includes, [base.join("deps/inc")]);
+        assert_eq!(args.project, Some(base.join("p.gpr")));
+    }
+
+    #[test]
+    fn the_toolchain_table_is_honored_only_from_an_explicit_config() {
+        let tree = tempfile::tempdir().unwrap();
+        let text =
+            "[toolchain]\ncc = \"tools/gcc\"\ninclude-dirs = [\"inc\"]\nprobe-build = true\n";
+        // `probe-build` inside [toolchain] is not a toolchain key.
+        std::fs::write(tree.path().join(CONFIG_FILE_NAME), text).unwrap();
+        let mut args = parse_auto_args(&["bhf", "tree"]);
+        let error = apply(&mut args, tree.path()).unwrap_err();
+        assert!(error.contains("probe-build"), "{error}");
+
+        let text =
+            "probe-build = true\n[toolchain]\ncc = \"tools/gcc\"\ninclude-dirs = [\"inc\"]\n";
+        std::fs::write(tree.path().join(CONFIG_FILE_NAME), text).unwrap();
+        let mut args = parse_auto_args(&["bhf", "tree"]);
+        let notes = apply(&mut args, tree.path()).unwrap();
+        assert!(args.config_toolchain.is_none());
+        assert!(!args.probe_build);
+        assert!(
+            notes.iter().any(|note| note.contains("[toolchain]")),
+            "{notes:?}"
+        );
+
+        let explicit = tree.path().join(CONFIG_FILE_NAME);
+        let mut args = parse_auto_args(&["bhf", "tree", "--config", explicit.to_str().unwrap()]);
+        apply(&mut args, tree.path()).unwrap();
+        assert!(args.probe_build);
+        let toolchain = args
+            .config_toolchain
+            .expect("explicit config keeps the table");
+        let base = crate::toolchain::config_base_dir(&explicit);
+        assert_eq!(
+            toolchain.cc.as_deref(),
+            Some(base.join("tools/gcc").to_str().unwrap())
+        );
+        assert_eq!(toolchain.include_dirs, [base.join("inc")]);
+    }
+
+    #[test]
+    fn list_and_selection_keys_fill_only_unset_flags() {
+        let tree = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tree.path().join(CONFIG_FILE_NAME),
+            "sanitizers = [\"asan\"]\nengine = \"builtin,afl++\"\nlanguages = [\"c\", \"cpp\"]\n\
+             passes = \"fuzz_driven\"\n",
+        )
+        .unwrap();
+        let mut args = parse_auto_args(&["bhf", "tree"]);
+        apply(&mut args, tree.path()).unwrap();
+        assert_eq!(args.sanitizers, ["asan"]);
+        assert_eq!(args.engine, "builtin,afl++");
+        assert_eq!(args.languages.len(), 2);
+        assert_eq!(args.passes.as_deref(), Some("fuzz_driven"));
+
+        let mut args = parse_auto_args(&["bhf", "tree", "--languages", "ada", "--single-pass"]);
+        apply(&mut args, tree.path()).unwrap();
+        assert_eq!(args.languages.len(), 1, "the CLI wins");
+        assert_eq!(args.passes, None, "--single-pass is not overridden");
+
+        std::fs::write(
+            tree.path().join(CONFIG_FILE_NAME),
+            "languages = [\"cobolx\"]\n",
+        )
+        .unwrap();
+        let mut args = parse_auto_args(&["bhf", "tree"]);
+        assert!(apply(&mut args, tree.path())
+            .unwrap_err()
+            .contains("cobolx"));
     }
 
     fn parse_auto_args(argv: &[&str]) -> AutoArgs {

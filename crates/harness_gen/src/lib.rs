@@ -92,6 +92,7 @@ pub(crate) mod arg_trace;
 pub mod build_safety;
 pub mod c_decoders;
 pub mod c_generate;
+pub mod compiler_family;
 pub mod cpp_decoders;
 pub mod cpp_generate;
 pub mod decoders;

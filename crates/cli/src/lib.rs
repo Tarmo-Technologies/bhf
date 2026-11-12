@@ -101,6 +101,7 @@ mod static_scan;
 mod stub;
 mod support_report;
 mod target_filter;
+mod toolchain;
 pub mod transport_fault;
 mod transport_fuzz;
 mod transport_replay;
@@ -1334,10 +1335,67 @@ mod tests {
         assert_eq!(exit, 0);
         assert!(project.contains("for Target use \"aarch64-linux-gnu\";"));
         assert!(project.contains("for Runtime (\"Ada\") use \"ravenscar-full\";"));
-        assert!(project.contains("for Toolchain_Name (\"Ada\") use \"aarch64-linux-gnu\";"));
+        // The prefix locates the tools; it is not a gprconfig compiler name.
+        assert!(!project.contains("Toolchain_Name"), "{project}");
         assert!(build_argv.contains("bhf_build.gpr"));
         assert!(gnat_argv.contains("aarch64-linux-gnu-gnat"));
         assert!(gnat_argv.contains("-gnatc"));
+    }
+
+    /// `bhf build --config` reads the `[toolchain.ada]` table: an explicit
+    /// gprbuild, the runtime, extra switches and the probe backend reach the
+    /// generated project, and the prefix supplies its Target.
+    #[test]
+    fn build_subcommand_reads_the_ada_toolchain_from_a_config_file() {
+        let _lock = PATH_LOCK.lock().expect("path lock is acquired");
+        let temp = temp_dir("build-ada-toolchain-config");
+        let work_dir = create_minimal_work_dir(&temp);
+        let tools = temp.join("tools");
+        fs::create_dir_all(&tools).expect("tool directory is created");
+        write_executable(&tools.join("my-gprbuild"), fake_build_compiler_script());
+        write_executable(&tools.join("my-gnat"), fake_raw_gnat_canary_script());
+        let build_log_path = temp.join("build-args.log");
+        let _build_log = EnvVarGuard::set("BHF_BUILD_LOG", build_log_path.as_os_str());
+        let config = temp.join("bhf.toml");
+        fs::write(
+            &config,
+            "[toolchain.ada]\n\
+             gprbuild = \"tools/my-gprbuild\"\n\
+             gnat = \"tools/my-gnat\"\n\
+             prefix = \"x86_64-linux-gnu\"\n\
+             runtime = \"light\"\n\
+             switches = [\"-O1\", \"-gnatVa\"]\n\
+             probe-backend = \"memory_buffer\"\n",
+        )
+        .expect("config is written");
+
+        let exit = run_from([
+            "bhf",
+            "build",
+            work_dir.to_str().expect("work dir path is utf-8"),
+            "--config",
+            config.to_str().expect("config path is utf-8"),
+        ]);
+
+        let project = fs::read_to_string(work_dir.join("build/H-TEST/bhf_build.gpr"))
+            .expect("project file is readable");
+        assert_eq!(exit, 0, "{project}");
+        assert!(
+            project.contains("for Target use \"x86_64-linux-gnu\";"),
+            "{project}"
+        );
+        assert!(
+            project.contains("for Runtime (\"Ada\") use \"light\";"),
+            "{project}"
+        );
+        assert!(!project.contains("Toolchain_Name"), "{project}");
+        assert!(project.contains("\"-O1\", \"-gnatVa\""), "{project}");
+        let build_argv = fs::read_to_string(build_log_path).expect("build argv log is readable");
+        assert!(build_argv.contains("bhf_build.gpr"), "{build_argv}");
+        let probe_body =
+            fs::read_to_string(work_dir.join("build/H-TEST/adafuzz_runtime_src/adafuzz-probe.adb"))
+                .expect("selected probe body is readable");
+        assert!(probe_body.contains("adafuzz_probe_memory_buffer"));
     }
 
     #[test]

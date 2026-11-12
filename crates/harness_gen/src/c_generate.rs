@@ -559,7 +559,9 @@ struct CTemplateContext {
     build_context_provenance: String,
     build_context_dropped: String,
     c_compiler: String,
-    compiler_is_gcc: bool,
+    /// Flag family the Makefile falls back to when it cannot ask `$(CC)`:
+    /// `gcc` for a GCC-named compiler (cross prefixes included), else `clang`.
+    c_compiler_family: String,
     c_runtime_include: String,
     emit_forward_declaration: bool,
     params: Vec<CParamEmission>,
@@ -624,7 +626,9 @@ struct CSequenceTemplateContext {
     build_context_provenance: String,
     build_context_dropped: String,
     c_compiler: String,
-    compiler_is_gcc: bool,
+    /// Flag family the Makefile falls back to when it cannot ask `$(CC)`:
+    /// `gcc` for a GCC-named compiler (cross prefixes included), else `clang`.
+    c_compiler_family: String,
     c_runtime_include: String,
     emit_forward_declaration: bool,
     /// Exact public libjpeg decompressor lifecycle. `jpeg_read_header` cannot
@@ -3037,7 +3041,7 @@ fn build_c_context(args: &GenerateCDirectArgs) -> Result<CTemplateContext, Harne
     let (
         compile_flags,
         c_compiler,
-        compiler_is_gcc,
+        c_compiler_family,
         build_context_provenance,
         build_context_dropped,
     ) = split_c_compile_context(&args.compile_flags);
@@ -3246,7 +3250,7 @@ fn build_c_context(args: &GenerateCDirectArgs) -> Result<CTemplateContext, Harne
         build_context_provenance,
         build_context_dropped,
         c_compiler,
-        compiler_is_gcc,
+        c_compiler_family,
         c_runtime_include: crate::build_safety::recipe_path(&crate::build_safety::make_path(
             &args.c_runtime_include,
         )),
@@ -3327,7 +3331,7 @@ fn build_c_sequence_context_untraced(
     let (
         compile_flags,
         c_compiler,
-        compiler_is_gcc,
+        c_compiler_family,
         build_context_provenance,
         build_context_dropped,
     ) = split_c_compile_context(&args.compile_flags);
@@ -3367,7 +3371,7 @@ fn build_c_sequence_context_untraced(
             build_context_provenance,
             build_context_dropped,
             c_compiler,
-            compiler_is_gcc,
+            c_compiler_family,
             c_runtime_include: crate::build_safety::recipe_path(&crate::build_safety::make_path(
                 &args.c_runtime_include,
             )),
@@ -3899,7 +3903,7 @@ fn build_c_sequence_context_untraced(
         build_context_provenance,
         build_context_dropped,
         c_compiler,
-        compiler_is_gcc,
+        c_compiler_family,
         c_runtime_include: crate::build_safety::recipe_path(&crate::build_safety::make_path(
             &args.c_runtime_include,
         )),
@@ -4194,7 +4198,7 @@ fn disable_sequence_callback_actions(step: &mut CSequenceStepEmission) {
     }
 }
 
-fn split_c_compile_context(flags: &[String]) -> (Vec<String>, String, bool, String, String) {
+fn split_c_compile_context(flags: &[String]) -> (Vec<String>, String, String, String, String) {
     let mut compiler = None;
     let mut provenance = "none".to_owned();
     let mut dropped = "none".to_owned();
@@ -4226,19 +4230,19 @@ fn split_c_compile_context(flags: &[String]) -> (Vec<String>, String, bool, Stri
         })
         .collect();
     let compiler = compiler.unwrap_or_else(|| "clang".to_owned());
-    let leaf = Path::new(&compiler)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(&compiler)
-        .to_ascii_lowercase();
-    let compiler_is_gcc =
-        leaf == "gcc" || leaf.starts_with("gcc-") || leaf == "g++" || leaf.starts_with("g++-");
+    // Only the fallback for a Makefile that cannot ask the compiler itself; the
+    // shared name normalisation keeps a cross-prefixed `aarch64-linux-gnu-gcc`
+    // in the GCC family, as the compile-database reader already accepts it.
+    let c_compiler_family = crate::compiler_family::family_from_name(&compiler)
+        .unwrap_or(crate::compiler_family::CompilerFamily::Clang)
+        .make_value()
+        .to_owned();
     (
         compile_flags,
         // `CC = <compiler>` heads every recipe; one under a spaced directory is
         // double-quoted so it stays a single word.
         crate::build_safety::recipe_path(&crate::build_safety::make_path(Path::new(&compiler))),
-        compiler_is_gcc,
+        c_compiler_family,
         // Metadata lands in `NAME = <value>` assignments; a newline would end the
         // assignment and let the remainder parse as Makefile source.
         crate::build_safety::make_metadata_value(&provenance),

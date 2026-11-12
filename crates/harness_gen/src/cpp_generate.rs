@@ -385,7 +385,11 @@ struct CppTemplateContext {
     build_context_recovery: String,
     build_context_dropped: String,
     cxx_compiler: String,
-    compiler_is_gcc: bool,
+    /// The C driver paired with `cxx_compiler`, the Makefile's default `CC`
+    /// for C translation units of the compile database.
+    c_compiler: String,
+    /// Flag family the Makefile falls back to when it cannot ask `$(CXX)`.
+    cxx_compiler_family: String,
     c_runtime_include: String,
     params: Vec<CParamEmission>,
     /// The target parameters' decode statements, in decode order, with the
@@ -1614,12 +1618,15 @@ fn build_cpp_context_common(
             })
     };
 
-    let compiler_is_gcc = build_context.compiler_is_gcc();
+    let cxx_compiler_family = build_context.compiler_family().make_value().to_owned();
     // `CXX = <compiler>` heads every recipe; one under a spaced directory is
     // double-quoted so it stays a single word.
-    let cxx_compiler = crate::build_safety::recipe_path(&crate::build_safety::make_path(
-        Path::new(build_context.compiler.as_deref().unwrap_or("clang++")),
-    ));
+    let context_cxx = build_context.compiler.as_deref().unwrap_or("clang++");
+    let cxx_compiler =
+        crate::build_safety::recipe_path(&crate::build_safety::make_path(Path::new(context_cxx)));
+    let c_compiler = crate::build_safety::recipe_path(&crate::build_safety::make_path(Path::new(
+        &crate::compiler_family::c_driver_for(context_cxx),
+    )));
     Ok(CppTemplateContext {
         harness_id: input.harness_id.to_owned(),
         qualified_target_name,
@@ -1652,7 +1659,8 @@ fn build_cpp_context_common(
         build_context_recovery: build_context.recovery,
         build_context_dropped: build_context.dropped,
         cxx_compiler,
-        compiler_is_gcc,
+        c_compiler,
+        cxx_compiler_family,
         c_runtime_include: crate::build_safety::recipe_path(&crate::build_safety::make_path(
             input.c_runtime_include,
         )),
@@ -1860,16 +1868,14 @@ struct CppBuildContextRender {
 }
 
 impl CppBuildContextRender {
-    fn compiler_is_gcc(&self) -> bool {
-        let Some(compiler) = &self.compiler else {
-            return false;
-        };
-        let leaf = Path::new(compiler)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(compiler)
-            .to_ascii_lowercase();
-        leaf == "gcc" || leaf.starts_with("gcc-") || leaf == "g++" || leaf.starts_with("g++-")
+    /// The family the Makefile falls back to when it cannot ask `$(CXX)`:
+    /// GCC for a GCC-named build-context compiler (cross prefixes included),
+    /// Clang otherwise.
+    fn compiler_family(&self) -> crate::compiler_family::CompilerFamily {
+        self.compiler
+            .as_deref()
+            .and_then(crate::compiler_family::family_from_name)
+            .unwrap_or(crate::compiler_family::CompilerFamily::Clang)
     }
 }
 

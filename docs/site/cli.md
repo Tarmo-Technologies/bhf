@@ -930,6 +930,22 @@ harness ids it found, and when the link fails it names the in-tree sources
 that define the missing symbols, with the `--extra-source` flags and an
 `AUTO_EXTRA_SOURCES` command to add them.
 
+`bhf build` takes the toolchain from `--cc`/`--cxx`, `--target <triple>` (or
+`--toolchain <prefix>`: `<prefix>-gcc`/`<prefix>-g++`), `--sysroot`, `--cflags`,
+`--cxxflags`, `--ldflags`, `--define` and `--toolchain-include`, or from the
+`[toolchain]` table of `--config <file>` (the same table `bhf auto --config`
+reads; there the compilers come from `target` or `cc`/`cxx`, since
+`toolchain.ada.prefix` applies to Ada harnesses only). Flags are appended to
+bhf's coverage and sanitizer flags, and the compilers in use are announced.
+`--runtime`, `--probe-backend` and the `--ada-*` flags are Ada-only and refused
+for a C/C++ harness. See
+[Cross-Compilation](../cross-compilation/).
+
+```sh
+bhf build bhf_work --harness H-CPP000A --target aarch64-linux-gnu
+bhf build bhf_work --harness H-CPP000A --cxx g++ --define BOARD=3
+```
+
 Use `--extra-source`, `--extra-include`, and `--cleanup` when the target needs
 additional translation units, include directories, or return-value cleanup. See
 [C and C++ Fuzzing](../c-cpp/) for supported parameter shapes and limits, and

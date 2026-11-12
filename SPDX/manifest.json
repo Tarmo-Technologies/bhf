@@ -1843,6 +1843,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/toolchain.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/transport_fault.rs",
       "license": "Apache-2.0"
     },
@@ -2631,6 +2635,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/toolchain_config_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/toolchain_support.rs",
       "license": "Apache-2.0"
     },
@@ -2704,6 +2712,10 @@
     },
     {
       "path": "crates/config/src/main.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/config/src/toolchain.rs",
       "license": "Apache-2.0"
     },
     {
@@ -3120,6 +3132,10 @@
     },
     {
       "path": "crates/harness_gen/src/c_generate.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/harness_gen/src/compiler_family.rs",
       "license": "Apache-2.0"
     },
     {
@@ -3564,6 +3580,10 @@
     },
     {
       "path": "crates/project_synth/src/writer.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/project_synth/tests/gprconfig_native.rs",
       "license": "Apache-2.0"
     },
     {
