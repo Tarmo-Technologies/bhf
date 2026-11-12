@@ -153,6 +153,11 @@
   no longer turns a UBSan finding into a frameless report and `exit status: 0`.
   The script exits with the harness's status, 128 plus the signal for a
   harness killed by one.
+- Classification reads a GNAT-style message (`parser.adb:17 range check
+  failed`, `unit.adb:42:7 index check failed`) after its source location, as
+  it already did for `file:line:` prefixes, so a unit named `timeout_ctl` or
+  `oom_check` no longer turns a `CONSTRAINT_ERROR` into a timeout or
+  out-of-memory finding.
 - Stack frames whose relative source path starts with a directory named like a
   glibc component that projects also use (`io/`, `misc/`, `posix/`, `elf/`,
   `signal/`, `csu/`, `nptl/`, `assert/`, `dlfcn/`), such as `./io/scaled_reader.cpp`

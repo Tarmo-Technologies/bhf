@@ -2551,12 +2551,16 @@ fn segv_sub_page_fault(hay: &str) -> bool {
 
 /// The part of a report message classification may read: the text after a
 /// UBSan `runtime error:` marker, else after a leading `<file>:<line>[:<col>]:`
-/// source prefix, else the whole message. The source path is never part of it,
-/// so a directory named `zoom`, `timeout` or `division_by_zero` cannot change
-/// the bug class.
+/// source prefix or GNAT's `<file>:<line>[:<col>] ` one (`parser.adb:17 range
+/// check failed`), else the whole message. The source path is never part of
+/// it, so a directory or unit named `zoom`, `timeout`, `oom_check` or
+/// `division_by_zero` cannot change the bug class.
 fn classification_text(message: &str) -> &str {
     if let Some((_, after)) = message.split_once("runtime error:") {
         return after.trim();
+    }
+    if let Some(rest) = gnat_location_rest(message) {
+        return rest;
     }
     let mut fields = message.splitn(4, ':');
     let file = fields.next().unwrap_or("");
@@ -2571,6 +2575,38 @@ fn classification_text(message: &str) -> &str {
         }
         _ => message,
     }
+}
+
+/// The message after a GNAT-style location, `<file>:<line> ` or
+/// `<file>:<line>:<col> ` (digits then a space, no colon), when `<file>` has no
+/// whitespace and names a source file by its extension.
+fn gnat_location_rest(message: &str) -> Option<&str> {
+    const SOURCE_EXTENSIONS: &[&str] = &[
+        "adb", "ads", "ada", "c", "h", "cc", "cpp", "cxx", "c++", "hh", "hpp", "hxx", "inl", "m",
+        "mm", "rs", "go", "f", "f77", "f90", "f95", "f03", "f08", "for", "cob", "cbl",
+    ];
+    let (file, rest) = message.split_once(':')?;
+    let (_, extension) = file.rsplit_once('.')?;
+    if file.is_empty()
+        || file.contains(char::is_whitespace)
+        || !SOURCE_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+    {
+        return None;
+    }
+    let digits = |text: &str| text.bytes().take_while(u8::is_ascii_digit).count();
+    let line = digits(rest);
+    if line == 0 {
+        return None;
+    }
+    let mut tail = &rest[line..];
+    if let Some(after) = tail.strip_prefix(':') {
+        let column = digits(after);
+        if column == 0 {
+            return None;
+        }
+        tail = &after[column..];
+    }
+    tail.starts_with(' ').then(|| tail.trim())
 }
 
 /// Whether `word` occurs in `hay` as a whole word (bounded by non-alphanumeric

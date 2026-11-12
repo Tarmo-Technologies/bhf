@@ -508,6 +508,26 @@ fn source_path_substrings_never_reclassify_a_finding() {
             "{path}"
         );
     }
+    // GNAT's `file.adb:NN message` form (a line number followed by a space,
+    // not a colon): the unit's file name decides nothing either, so a unit
+    // named `timeout_ctl` or `oom_check` classifies like any other.
+    let gnat = |message: &str| {
+        let raw = json!({
+            "rule_id": "BHF-101",
+            "exception": {"name": "CONSTRAINT_ERROR", "message": message}
+        });
+        let rec = backfill_actionability(RunMode::Reporting, &raw, None);
+        (rec.cwe, rec.cwe_name)
+    };
+    let control = gnat("parser.adb:17 range check failed");
+    for message in [
+        "timeout_ctl.adb:42 index check failed",
+        "oom_check.adb:17 range check failed",
+        "timeout_ctl.adb:42:7 index check failed",
+        "zoom_out_of_memory.ads:9 range check failed",
+    ] {
+        assert_eq!(gnat(message), control, "{message}");
+    }
     // A real out-of-memory and a real timeout are still recognised.
     let oom = json!({"rule_id": "BHF-209", "exception": {"name": "OUT_OF_MEMORY", "message": "harness exceeded the configured RSS limit (--rss-limit-mb)"}});
     assert_eq!(
