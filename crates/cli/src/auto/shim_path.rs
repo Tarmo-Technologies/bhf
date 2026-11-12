@@ -10,22 +10,18 @@
 //!   4. A sibling `bhf_runtrace_shim-*` dist archive directory.
 //!   5. None — the shim isn't on disk; caller falls back to
 //!      audit-disabled mode with a one-line warning.
-//!
-//! ld.so splits `LD_PRELOAD` on spaces and colons, so a shim installed under
-//! such a path (`/opt/Program Files (x86)/bhf/bin`) would never load. The
-//! located shim is then staged at a path ld.so reads whole
-//! ([`stage_for_preload`]), and that copy is what [`locate`] returns.
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
-
-/// The file name a staged copy of the shim gets.
-const STAGED_NAME: &str = "libbhf_runtrace_shim.so";
 
 /// The preloadable runtrace shim: the shim found on disk, or the copy of it
 /// staged at a path `LD_PRELOAD` can carry. `None` when no shim is installed,
 /// or when it sits under a path with spaces or colons and no copy could be
-/// staged (warned once).
+/// staged (warned once; see [`unavailable_reason`]).
+///
+/// ld.so splits `LD_PRELOAD` on spaces and colons, so a shim installed under
+/// such a path (`/opt/Program Files (x86)/bhf/bin`) would never load: it is
+/// staged at a path ld.so reads whole (`stage_for_preload`), and that copy
+/// is what this returns.
 pub fn locate() -> Option<PathBuf> {
     let shim = locate_on_disk()?;
     if is_preload_safe(&shim) {
@@ -48,6 +44,46 @@ pub fn locate() -> Option<PathBuf> {
     staged
 }
 
+/// Why [`locate`] found no shim, as one sentence for a warning or an error:
+/// it is not installed where bhf looks, or it is installed under a path that
+/// `LD_PRELOAD` cannot carry and no copy could be staged.
+pub fn unavailable_reason() -> String {
+    if let Some(shim) = UNPRELOADABLE.get() {
+        return format!(
+            "the runtrace shim {} is under a path with a space or colon, which LD_PRELOAD \
+             cannot carry, and no copy of it could be staged at a path without them",
+            shim.display()
+        );
+    }
+    let exe = std::env::current_exe().ok();
+    missing_message(
+        exe.as_deref(),
+        std::env::var_os("BHF_RUNTRACE_SHIM").as_deref(),
+    )
+}
+
+/// [`unavailable_reason`] for a shim that is not installed, naming every
+/// place [`locate`] looked: beside `exe`, a sibling dist directory, and
+/// `$BHF_RUNTRACE_SHIM` (`env`) when it was set.
+fn missing_message(exe: Option<&Path>, env: Option<&std::ffi::OsStr>) -> String {
+    let beside = exe
+        .and_then(Path::parent)
+        .map(|dir| dir.display().to_string())
+        .unwrap_or_else(|| "the bhf executable".to_owned());
+    let env = match env {
+        Some(value) if !value.is_empty() => format!(
+            "BHF_RUNTRACE_SHIM={} is not a file; ",
+            Path::new(value).display()
+        ),
+        _ => String::new(),
+    };
+    format!(
+        "{env}the runtrace shim (libbhf_runtrace.so or libbhf_runtrace_shim.so) was not found \
+         beside {beside} or in a sibling bhf_runtrace_shim directory; set \
+         BHF_RUNTRACE_SHIM=<path> to use one"
+    )
+}
+
 /// The shim on disk, wherever it was installed.
 fn locate_on_disk() -> Option<PathBuf> {
     if let Some(env_path) = std::env::var_os("BHF_RUNTRACE_SHIM") {
@@ -62,17 +98,20 @@ fn locate_on_disk() -> Option<PathBuf> {
 
 /// The shim that was found but could not be preloaded, once [`locate`] has
 /// given up on it.
-static UNPRELOADABLE: OnceLock<PathBuf> = OnceLock::new();
+static UNPRELOADABLE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// The work directory of this run, whose `.bhf-runtime/` is the first place a
 /// shim that needs staging is copied to.
-static STAGING_WORK_DIR: OnceLock<PathBuf> = OnceLock::new();
+static STAGING_WORK_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// Stage a shim that needs it under `<work_dir>/.bhf-runtime/` for the rest of
 /// this process (the first call wins).
 pub fn set_staging_work_dir(work_dir: &Path) {
     let _ = STAGING_WORK_DIR.set(std::path::absolute(work_dir).unwrap_or_else(|_| work_dir.into()));
 }
+
+/// The file name a staged copy of the shim gets.
+const STAGED_NAME: &str = "libbhf_runtrace_shim.so";
 
 /// Whether ld.so takes `path` whole from `LD_PRELOAD`, which it splits on
 /// whitespace and colons.
@@ -478,6 +517,25 @@ mod tests {
         let plain = dir.path().join("libbhf_runtrace.so");
         std::fs::write(&plain, b"x").unwrap();
         assert_eq!(stage_for_preload(&plain, &unsafe_dirs), Some(plain));
+    }
+
+    #[test]
+    fn the_missing_shim_message_names_both_files_where_it_looked_and_the_override() {
+        let message = missing_message(Some(Path::new("/opt/bhf/bin/bhf")), None);
+        assert_eq!(
+            message,
+            "the runtrace shim (libbhf_runtrace.so or libbhf_runtrace_shim.so) was not found \
+             beside /opt/bhf/bin or in a sibling bhf_runtrace_shim directory; set \
+             BHF_RUNTRACE_SHIM=<path> to use one"
+        );
+        let stale = missing_message(
+            Some(Path::new("/opt/bhf/bin/bhf")),
+            Some(std::ffi::OsStr::new("/old/libbhf_runtrace.so")),
+        );
+        assert!(
+            stale.starts_with("BHF_RUNTRACE_SHIM=/old/libbhf_runtrace.so is not a file; "),
+            "{stale}"
+        );
     }
 
     #[test]

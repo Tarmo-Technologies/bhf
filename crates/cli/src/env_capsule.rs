@@ -93,8 +93,8 @@ pub fn run(args: EnvCapsuleArgs) -> i32 {
     }
     let Some(shim) = crate::auto::shim_path::locate() else {
         bhfeprintln!(
-            "bhf env-capsule: the runtrace shim (libbhf_runtrace.so) was not found; \
-             it is required to record/replay the faked environment"
+            "bhf env-capsule: {}; it is required to record/replay the faked environment",
+            crate::auto::shim_path::unavailable_reason()
         );
         return 1;
     };

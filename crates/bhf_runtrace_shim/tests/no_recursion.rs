@@ -44,6 +44,8 @@ fn fresh_shim(profile: &str) -> Option<PathBuf> {
                 "src/hooks/proc.rs",
                 "src/hooks/format.rs",
                 "src/hooks/format_hooks.c",
+                "src/hooks/dlsym.rs",
+                "src/dlsym.rs",
                 "src/jsonl.rs",
             ]
             .iter()
@@ -971,6 +973,302 @@ fn dl_hooks_log_failed_dlopen_under_a_sanitizer() {
                 "{label}: failed dlopen missing from the runtrace log of {}:\n{text}",
                 shim.display()
             );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The `"d"` field of a runtrace line.
+fn event_fd(line: &str) -> Option<i64> {
+    let start = line.find("\"d\":")? + 4;
+    let digits: String = line[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '-')
+        .collect();
+    digits.parse().ok()
+}
+
+/// glibc's `fclose` closes the stream's descriptor internally, never through
+/// the `close` hook, so a file opened with `fopen` (or wrapped with `fdopen`)
+/// and closed with `fclose` must log its close itself, or every such file
+/// reads as leaked. Checked in a plain program and under each sanitizer
+/// runtime the host can build, whose `fclose` interceptor forwards to the next
+/// definition.
+#[test]
+fn fclose_logs_the_close_of_a_fopened_or_fdopened_stream() {
+    let shims: Vec<PathBuf> = ["debug", "release"]
+        .into_iter()
+        .filter_map(fresh_shim)
+        .collect();
+    if shims.is_empty() {
+        eprintln!("skipping: shim cdylib not built yet");
+        return;
+    }
+    let Some(cc) = cc() else {
+        eprintln!("skipping: no C compiler");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("bhf-shim-fclose-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // Outside the runtrace-log dir: the shim records nothing inside it.
+    let present =
+        std::env::temp_dir().join(format!("bhf-shim-fclose-widget-{}.cfg", std::process::id()));
+    std::fs::write(&present, "widget=1\n").unwrap();
+    let src = dir.join("probe.c");
+    std::fs::write(
+        &src,
+        r#"
+        #include <fcntl.h>
+        #include <stdio.h>
+        int main(int argc, char **argv) {
+            if (argc < 2) return 1;
+            FILE *f = fopen(argv[1], "r");
+            if (!f) return 2;
+            if (fclose(f) != 0) return 3;
+            int fd = open(argv[1], O_RDONLY);
+            if (fd < 0) return 4;
+            FILE *g = fdopen(fd, "r");
+            if (!g) return 5;
+            if (fclose(g) != 0) return 6;
+            return 0;
+        }
+    "#,
+    )
+    .unwrap();
+    let mut builds = vec![("plain", cc, Vec::<&str>::new())];
+    for (label, compiler, flags) in [
+        ("clang-asan", "clang", vec!["-fsanitize=address"]),
+        (
+            "gcc-asan-static",
+            "gcc",
+            vec!["-fsanitize=address", "-static-libasan"],
+        ),
+    ] {
+        let built = Command::new(compiler)
+            .args(&flags)
+            .arg(&src)
+            .arg("-o")
+            .arg(dir.join(format!("probe-{label}")))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if built {
+            builds.push((label, compiler, flags));
+        }
+    }
+    for (label, compiler, flags) in &builds {
+        let bin = dir.join(format!("probe-{label}"));
+        let built = Command::new(compiler)
+            .args(flags)
+            .arg(&src)
+            .arg("-o")
+            .arg(&bin)
+            .status()
+            .unwrap();
+        assert!(built.success(), "{label} probe failed to compile");
+        for shim in &shims {
+            let log = dir.join(format!("rt-{label}.jsonl"));
+            let _ = std::fs::remove_file(&log);
+            let status = Command::new(&bin)
+                .arg(&present)
+                .env("LD_PRELOAD", shim)
+                .env("BHF_RUNTRACE_LOG", &log)
+                .env("ASAN_OPTIONS", "verify_asan_link_order=0:detect_leaks=0")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("spawn probe");
+            assert!(
+                status.success(),
+                "{label} probe under {} exited abnormally: {status:?}",
+                shim.display()
+            );
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            let opened = format!("\"p\":\"{}\"", present.display());
+            let fopen_fd = text
+                .lines()
+                .find(|line| line.contains("\"e\":\"fopen\"") && line.contains(&opened))
+                .and_then(event_fd)
+                .unwrap_or_else(|| panic!("{label}: no fopen event:\n{text}"));
+            let closes: Vec<i64> = text
+                .lines()
+                .filter(|line| line.contains("\"e\":\"close\"") && line.contains("\"r\":0"))
+                .filter_map(event_fd)
+                .collect();
+            assert!(
+                closes.contains(&fopen_fd),
+                "{label} under {}: fclose of fd {fopen_fd} logged no close:\n{text}",
+                shim.display()
+            );
+            let open_fd = text
+                .lines()
+                .filter(|line| line.contains("\"e\":\"open\"") && line.contains(&opened))
+                .filter_map(event_fd)
+                .next_back()
+                .unwrap_or_else(|| panic!("{label}: no open event:\n{text}"));
+            assert!(
+                text.lines().any(
+                    |line| line.contains("\"e\":\"fdopen\"") && event_fd(line) == Some(open_fd)
+                ),
+                "{label}: fdopen of fd {open_fd} not logged:\n{text}"
+            );
+            assert!(
+                closes.iter().filter(|fd| **fd == open_fd).count() >= 1,
+                "{label}: fclose of the fdopened fd {open_fd} logged no close:\n{text}"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&present);
+}
+
+/// A sanitizer runtime defines the printf family in the executable and
+/// forwards each call to the `va_list` variant it finds next (`printf` to
+/// `vprintf`, `snprintf` to `vsnprintf`), and a fortified build calls
+/// `__printf_chk` and friends: the format strings must be logged on every
+/// one of those lanes, under the variadic API the program called.
+#[test]
+fn format_hooks_log_printf_formats_under_sanitizers_and_fortify() {
+    let shims: Vec<PathBuf> = ["debug", "release"]
+        .into_iter()
+        .filter_map(fresh_shim)
+        .collect();
+    if shims.is_empty() {
+        eprintln!("skipping: shim cdylib not built yet");
+        return;
+    }
+    let Some(cc) = cc() else {
+        eprintln!("skipping: no C compiler");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("bhf-shim-vformat-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("probe.c");
+    std::fs::write(
+        &src,
+        r#"
+        #include <stdarg.h>
+        #include <stdio.h>
+        #include <stdlib.h>
+        static int log_line(const char *fmt, ...) {
+            va_list ap;
+            va_start(ap, fmt);
+            int n = vfprintf(stdout, fmt, ap);
+            va_end(ap);
+            return n;
+        }
+        int main(int argc, char **argv) {
+            char buf[64];
+            char *heap = NULL;
+            const char *fmt = argc > 99 ? argv[1] : "widget %d\n";
+            if (printf(fmt, 1) < 0) return 1;
+            if (snprintf(buf, sizeof buf, "copy_at %u", 2u) < 0) return 2;
+            if (fprintf(stdout, "bit_index %d\n", 3) < 0) return 3;
+            if (log_line("record %s\n", "x") < 0) return 4;
+            if (asprintf(&heap, "heap %ld", 5L) < 0) return 5;
+            free(heap);
+            return 0;
+        }
+    "#,
+    )
+    .unwrap();
+    let mut builds = vec![("plain", cc, Vec::<&str>::new())];
+    for (label, compiler, flags) in [
+        ("clang-asan", "clang", vec!["-fsanitize=address"]),
+        (
+            "clang-asan-ubsan",
+            "clang",
+            vec!["-fsanitize=address,undefined"],
+        ),
+        (
+            "clang-asan-shared",
+            "clang",
+            vec!["-fsanitize=address", "-shared-libasan"],
+        ),
+        ("gcc-asan-shared", "gcc", vec!["-fsanitize=address"]),
+        (
+            "gcc-asan-static",
+            "gcc",
+            vec!["-fsanitize=address", "-static-libasan"],
+        ),
+        (
+            "gcc-fortify",
+            "gcc",
+            vec!["-O2", "-U_FORTIFY_SOURCE", "-D_FORTIFY_SOURCE=2"],
+        ),
+    ] {
+        let bin = dir.join(format!("probe-{label}"));
+        let built = Command::new(compiler)
+            .args(&flags)
+            .arg(&src)
+            .arg("-o")
+            .arg(&bin)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        // A lane whose runtime library the loader cannot find (a shared
+        // sanitizer runtime outside the library path) is skipped.
+        let runs = built
+            && Command::new(&bin)
+                .env("ASAN_OPTIONS", "detect_leaks=0")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+        if runs {
+            builds.push((label, compiler, flags));
+        }
+    }
+    for (label, compiler, flags) in &builds {
+        let bin = dir.join(format!("probe-{label}"));
+        let built = Command::new(compiler)
+            .args(flags)
+            .arg(&src)
+            .arg("-o")
+            .arg(&bin)
+            .status()
+            .unwrap();
+        assert!(built.success(), "{label} probe failed to compile");
+        for shim in &shims {
+            let log = dir.join(format!("rt-{label}.jsonl"));
+            let _ = std::fs::remove_file(&log);
+            let output = Command::new(&bin)
+                .env("LD_PRELOAD", shim)
+                .env("BHF_RUNTRACE_LOG", &log)
+                .env("ASAN_OPTIONS", "verify_asan_link_order=0:detect_leaks=0")
+                .output()
+                .expect("spawn probe");
+            assert!(
+                output.status.success(),
+                "{label} probe under {} exited abnormally: {:?}\n{}",
+                shim.display(),
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            // The calls themselves still produce their output.
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains("widget 1") && stdout.contains("record x"),
+                "{label}: {stdout}"
+            );
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            for (api, format) in [
+                ("printf", "widget %d\\n"),
+                ("snprintf", "copy_at %u"),
+                ("fprintf", "bit_index %d\\n"),
+                ("fprintf", "record %s\\n"),
+                ("asprintf", "heap %ld"),
+            ] {
+                assert!(
+                    text.lines().any(|line| line.contains("\"e\":\"format\"")
+                        && line.contains(&format!("\"a\":\"{api}\""))
+                        && line.contains(&format!("\"f\":\"{format}\""))),
+                    "{label} under {}: no {api} format event for {format:?}:\n{text}",
+                    shim.display()
+                );
+            }
         }
     }
     let _ = std::fs::remove_dir_all(&dir);

@@ -82,7 +82,9 @@ fn next_hook(name: &[u8]) -> Option<*mut libc::c_void> {
     Some(match name {
         b"fopen" => crate::hooks::fs::fopen_hook as *mut libc::c_void,
         b"fopen64" => crate::hooks::fs::fopen64_hook as *mut libc::c_void,
-        _ => return None,
+        b"fdopen" => crate::hooks::fs::fdopen_hook as *mut libc::c_void,
+        b"fclose" => crate::hooks::fs::fclose_hook as *mut libc::c_void,
+        _ => return crate::hooks::format::next_hook(name),
     })
 }
 

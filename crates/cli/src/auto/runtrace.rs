@@ -856,12 +856,15 @@ struct OpenResource {
 pub fn is_bhf_owned_resource(path: &str) -> bool {
     // Distinctive work-dir subdirectory components: the per-iteration input
     // files (`fuzz_inputs/input-<pid>-<nonce>.bin`), the harness scratch cwd
-    // (`fuzz_scratch/`), the runtrace event logs (`fuzz_runs/`), and the
-    // injected fake-env tree used for missing env-derived paths.
+    // (`fuzz_scratch/`), the runtrace event logs (`fuzz_runs/`), the event log
+    // an Ada harness writes (`events/fuzz-events-<pid>-<nonce>.bin`, opened by
+    // its runtime and closed only by the process exit), and the injected
+    // fake-env tree used for missing env-derived paths.
     const OWNED_SUBSTRINGS: &[&str] = &[
         "/fuzz_inputs/",
         "/fuzz_scratch/",
         "/fuzz_runs/",
+        "/events/fuzz-events-",
         "/bhf/fake_env/",
     ];
     // `bhf_make_tempfile()` materializes fuzz bytes at `/tmp/bhf_inXXXXXX`;
@@ -2581,6 +2584,9 @@ mod tests {
             "/home/u/work/build/H-1/vp.shm",
             "/home/u/work/fuzz_scratch/cwd",
             "/home/u/work/fuzz_runs/fuzz-events-1-2.bin",
+            // The event log bhf hands an Ada harness (`<work>/events/`), which
+            // the harness's runtime opens and the process exit closes.
+            "/home/u/work/events/fuzz-events-4242-1700000000123456789.bin",
             "/dev/null",
         ] {
             assert!(
@@ -2591,6 +2597,7 @@ mod tests {
         // Genuine target / user paths — must remain leak-eligible.
         for target in [
             "/etc/hostname",
+            "/home/u/proj/events/calendar.bin",
             "/home/u/dogfood-scratch/mpack/state.db",
             "/var/lib/app/session.sock",
             "/tmp/acme.conf",

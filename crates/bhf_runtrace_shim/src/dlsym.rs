@@ -75,6 +75,21 @@ unsafe fn resolve(symbol: &CStr) -> *mut libc::c_void {
     }
 }
 
+/// The resolution [`ResolvedFn`] uses, for the shim's C hooks
+/// (`format_hooks.c`): the next definition of `symbol` after this library,
+/// or null.
+///
+/// # Safety
+///
+/// `symbol` must be null or point to a NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn bhf_shim_resolve_next(symbol: *const libc::c_char) -> *mut libc::c_void {
+    if symbol.is_null() {
+        return std::ptr::null_mut();
+    }
+    resolve(CStr::from_ptr(symbol))
+}
+
 /// Cache the resolution of a single named symbol. Use one
 /// `ResolvedFn` per intercepted function:
 ///

@@ -4767,9 +4767,8 @@ fn run_fuzz_with_runtrace(
         child_env.push(("LD_PRELOAD".to_owned(), ld_preload));
     } else if SHIM_MISSING_WARNED.set(()).is_ok() {
         bhfeprintln!(
-            "bhf auto: libbhf_runtrace.so not found beside bhf or in a \
-             sibling bhf_runtrace_shim archive directory; \
-             running fuzz without runtime audit"
+            "bhf auto: {}; running fuzz without the runtrace shim",
+            crate::auto::shim_path::unavailable_reason()
         );
     }
     for (k, v) in extra_env {

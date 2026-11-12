@@ -2343,6 +2343,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_runtrace_streams.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_rust_discovery.rs",
       "license": "Apache-2.0"
     },

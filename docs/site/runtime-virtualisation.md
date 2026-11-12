@@ -53,7 +53,20 @@ executable oracles against only the events appended by the current input.
 `fopen` and `fopen64` are hooked too: glibc's `fopen` opens the file
 through an internal call that the `open` hook never sees. They log the same
 open and missing-file events as `open`, under their own event names (`fopen`,
-`fopen64`); a missing file is reported, not replaced by a fake one. In an
+`fopen64`); a missing file is reported, not replaced by a fake one. `fdopen`
+logs an `fdopen` event naming the descriptor it wraps, and `fclose` logs the
+`close` of the stream's descriptor, which glibc closes internally (nothing
+for an invalid stream, `EBADF`), so a file opened and closed through stdio is
+not reported as leaked.
+
+Besides `printf`, `fprintf`, `dprintf`, `sprintf` and `snprintf`, the format
+hooks cover `asprintf`, the `va_list` forms (`vprintf`, `vfprintf`,
+`vsprintf`, `vsnprintf`, `vdprintf`, `vasprintf`) and the fortified
+`__*printf_chk` entry points. Each event names the variadic API
+(`vfprintf` and `__fprintf_chk` log as `fprintf`), so a format is named the
+same in a plain, a fortified and a sanitized build: a sanitizer's `printf`
+interceptor forwards to the `vprintf` it resolves with `dlsym(RTLD_NEXT)`,
+which is the shim's. In an
 AddressSanitizer harness the sanitizer runtime defines `fopen` in the
 executable and resolves the real one with `dlsym(RTLD_NEXT, "fopen")`; the
 shim's `dlsym` hook answers that call, from an object loaded before the shim,

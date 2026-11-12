@@ -323,6 +323,23 @@
   path needs quoting for another reason than a space is quoted too, and
   `bhf explain` quotes the work dir in the `bhf capsule`, `bhf verify-poc`
   and `bhf cartography` commands it suggests.
+- A file opened with `fopen`/`fopen64` (or wrapped with `fdopen`) and closed
+  with `fclose` is no longer reported as an unreleased resource (BHF-306):
+  the runtrace shim hooks `fclose`, which closes the descriptor inside glibc,
+  and logs the close (also under a sanitizer, whose `fclose` interceptor
+  reaches the shim through `dlsym(RTLD_NEXT)`). The event log bhf hands an
+  Ada harness (`<work>/events/fuzz-events-*`) counts as bhf's own file.
+- printf-family format strings are observed in sanitized and fortified
+  builds: the shim hooks the `va_list` forms (`vprintf`, `vfprintf`,
+  `vsprintf`, `vsnprintf`, `vdprintf`, `vasprintf`), `asprintf` and the
+  `__*printf_chk` entry points, which a sanitizer's interceptors and
+  `_FORTIFY_SOURCE` route calls through. Each format event names the
+  variadic API the program called (`vfprintf` logs as `fprintf`), so a format
+  bug is named the same on every lane.
+- The message for a missing runtrace shim names both file names bhf looks
+  for (`libbhf_runtrace.so`, `libbhf_runtrace_shim.so`), where it looked,
+  and `BHF_RUNTRACE_SHIM=<path>`, in `bhf auto`, `--runtime-oracles on` and
+  `bhf env-capsule` alike.
 - A C or C++ capsule's `build.sh` picks the sanitizer flags of the compiler that
   runs it (gcc has no `function` UBSan check and links its runtimes
   statically), as the harness Makefile does, and a capsule of a harness bhf
