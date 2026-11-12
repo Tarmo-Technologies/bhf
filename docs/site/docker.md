@@ -301,8 +301,9 @@ BHF source archive containing the build instructions. Source retrieval fails if
 any exact requested version is unavailable; it does not substitute a newer
 version. The generated OS notices and inventory do not cover every ecosystem by
 themselves. The .NET SDK comes from Microsoft's checksum-pinned release
-archive because Ubuntu noble does not yet ship 8.0.132; its license and
-third-party notices are in `/usr/share/bhf/licenses/csharp/`.
+archive (8.0.134) because Ubuntu noble's package has lagged its security
+releases; its license and third-party notices are in
+`/usr/share/bhf/licenses/csharp/`.
 
 `WRITTEN-OFFER.md` is informational material, not a completed publisher offer.
 Redistribution review must account for all bundled components and modifications.

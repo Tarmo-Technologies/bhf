@@ -25,8 +25,8 @@ license review or a publisher-authenticated release.
 | `/usr/share/bhf/licenses/csharp/` | .NET SDK archive | Microsoft's `LICENSE.txt` and `ThirdPartyNotices.txt` for the .NET SDK |
 
 The .NET SDK is installed from Microsoft's checksum-pinned release archive, not
-Ubuntu's `dotnet8` package: Ubuntu noble still ships 8.0.131, whose bundled
-NuGet assemblies have fixed CVEs that 8.0.132 resolves. It is therefore absent
+Ubuntu's `dotnet8` package, which has lagged Microsoft's security releases
+(the pinned 8.0.134 carries runtime 8.0.34's fixes). It is therefore absent
 from the dpkg-generated notices and copyleft list.
 
 All generators are **offline / deterministic** (dpkg only) so they reproduce on
