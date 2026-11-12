@@ -61,6 +61,7 @@ mod fake_corba;
 mod fatal_signal;
 mod finding_arg;
 mod fuzz;
+mod gate_evidence;
 mod generate_harness;
 mod git_diff;
 mod instrument;
@@ -220,7 +221,7 @@ enum Command {
     Relational(relational::RelationalArgs),
     /// Recover comparison operands (cmplog / RedQueen) from a runtrace log into a fuzzing dictionary
     Cmplog(cmplog_cli::CmplogArgs),
-    /// Explain, offline and deterministically (no LLM), WHY a crash fired: input, gate constants, faked env, dataflow
+    /// Explain, offline (no LLM), WHY a crash fired: the minimized input, the comparisons it reached, the environment it touched, reachability, each with its evidence
     Explain(explain::ExplainArgs),
     /// Map which input bytes of a C/C++ crash control which sink operand (offset/size/index, or a SEGV's faulting address) via perturbation — the exploit primitive
     Cartography(cartography::CartographyArgs),
@@ -560,6 +561,11 @@ where
             if report_args.backfill {
                 build::activate_compatible_clang();
                 report_backfill::run(&work);
+                let (captured, uncaptured) = gate_evidence::run_pass(&work);
+                bhfeprintln!(
+                    "bhf: backfill: comparison evidence recorded for {captured} finding(s); \
+                     {uncaptured} left for `bhf explain` (time budget)"
+                );
             }
             match results::rebuild(&work, &results::RebuildOptions::default()) {
                 Ok(summary) => {

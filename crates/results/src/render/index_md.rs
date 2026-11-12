@@ -288,6 +288,49 @@ pub fn render_index(doc: &FindingsDocument, ctx: &IndexContext) -> String {
             };
             let _ = writeln!(out, "- Component: `{}`{fixed}", md_code(&package));
         }
+        if let Some(access) = rep.fuzz.as_ref().and_then(|fuzz| fuzz.access.as_ref()) {
+            let _ = writeln!(out, "- Memory access: {}", md_text(&access_text(access)));
+        }
+        if let Some(gates) = rep
+            .fuzz
+            .as_ref()
+            .and_then(|fuzz| fuzz.input_to_state.as_deref())
+            .filter(|gates| !gates.is_empty())
+        {
+            let shown = gates
+                .iter()
+                .take(MAX_GATES_SHOWN)
+                .map(|g| {
+                    let site = g
+                        .site_location
+                        .as_ref()
+                        .map(|l| match l.line {
+                            Some(line) => format!(" at `{}:{line}`", md_code(&l.file)),
+                            None => format!(" at `{}`", md_code(&l.file)),
+                        })
+                        .unwrap_or_default();
+                    format!(
+                        "bytes {}..{} → {}{site}",
+                        g.offset,
+                        g.offset + g.len,
+                        md_text(&g.cmp_kind)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" · ");
+            let more = if gates.len() > MAX_GATES_SHOWN {
+                format!(" · … {} more", gates.len() - MAX_GATES_SHOWN)
+            } else {
+                String::new()
+            };
+            let input = rep
+                .fuzz
+                .as_ref()
+                .and_then(|fuzz| fuzz.input_to_state_input.as_deref())
+                .map(|name| format!(" (offsets in `{}`)", md_code(name)))
+                .unwrap_or_default();
+            let _ = writeln!(out, "- Input bytes compared{input}: {shown}{more}");
+        }
         if group.members.len() > 1 {
             let _ = writeln!(out, "- Collapsed observations: {}", group.members.len());
         }
@@ -325,6 +368,35 @@ pub fn render_index(doc: &FindingsDocument, ctx: &IndexContext) -> String {
         out.push('\n');
     }
     out
+}
+
+/// Comparison-evidence entries listed per group before `… N more`.
+const MAX_GATES_SHOWN: usize = 4;
+
+/// `read of 4 byte(s), 0 byte(s) after a 12-byte heap region`.
+fn access_text(access: &crate::model::MemoryAccess) -> String {
+    let mut text = match access.direction.as_str() {
+        "read" | "write" => access.direction.clone(),
+        _ => "unknown-direction access".to_owned(),
+    };
+    if let Some(size) = access.size {
+        let _ = write!(text, " of {size} byte(s)");
+    }
+    if let Some(region) = &access.region {
+        let object = match region.size {
+            Some(size) => format!("{size}-byte {} object", region.kind),
+            None => format!("{} object", region.kind),
+        };
+        match (region.distance, region.relation.as_deref()) {
+            (Some(distance), Some(relation)) => {
+                let _ = write!(text, ", {distance} byte(s) {relation} a {object}");
+            }
+            _ => {
+                let _ = write!(text, ", in a {object}");
+            }
+        }
+    }
+    text
 }
 
 fn status_word(status: crate::model::ProducerStatus) -> &'static str {
@@ -441,6 +513,19 @@ mod tests {
         ));
         assert!(md.contains("- Reproduce: `python3 findings/F-0000-1a2b3c4d/replay.py`"));
         assert!(md.contains("- Component: `pkg:npm/example@2.4.2` · fixed in 2.4.3"));
+        assert!(
+            md.contains(
+                "- Memory access: read of 4 byte(s), 0 byte(s) after a 12-byte heap object\n"
+            ),
+            "{md}"
+        );
+        assert!(
+            md.contains(
+                "- Input bytes compared (offsets in `min_testcase.bin`): bytes 0..4 → memcmp at \
+                 `src/parse.c:31`\n"
+            ),
+            "{md}"
+        );
     }
 
     #[test]

@@ -5800,7 +5800,7 @@ fn load_afl_dictionary_tokens(path: &Path) -> Result<Vec<Vec<u8>>, String> {
     Ok(tokens)
 }
 
-fn parse_afl_dictionary_line(line: &str) -> Result<Option<Vec<u8>>, String> {
+pub(crate) fn parse_afl_dictionary_line(line: &str) -> Result<Option<Vec<u8>>, String> {
     let trimmed = line.trim();
     if trimmed.is_empty() || trimmed.starts_with('#') {
         return Ok(None);

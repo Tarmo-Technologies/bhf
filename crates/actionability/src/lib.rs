@@ -329,6 +329,7 @@ pub fn classify_verdict(
         || is_harness_cleanup_artifact(raw)
         || is_go_must_panic(raw)
         || is_native_assertion_enum_domain_precondition(raw)
+        || is_harness_sized_buffer_overflow(raw)
     {
         return Verdict::LabOnly;
     }
@@ -1676,6 +1677,264 @@ fn is_fixed_width_slice_read_panic(raw: &Value) -> bool {
         return false;
     };
     matches!(n, 1 | 2 | 4 | 8 | 16) && m < n
+}
+
+/// A heap buffer bhf's generated harness allocated for a pointer parameter it
+/// passes without a length, as [`harness_sized_buffer`] finds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarnessSizedBuffer {
+    /// The harness variable holding the buffer, when its allocation statement
+    /// names one.
+    pub variable: Option<String>,
+    /// Where the harness allocated it, `main.c:76`.
+    pub site: Option<String>,
+}
+
+/// The decode helpers of `bhf_decode.h` that allocate a NUL-terminated string
+/// for a parameter that takes no length.
+const LENGTHLESS_STRING_DECODERS: &[&str] = &[
+    "bhf_c_string",
+    "bhf_c_string_out",
+    "bhf_c_format_string",
+    "bhf_wc_string",
+];
+
+/// Whether [`harness_sized_buffer`] finds one.
+pub fn is_harness_sized_buffer_overflow(raw: &Value) -> bool {
+    harness_sized_buffer(raw).is_some()
+}
+
+/// A heap overflow of a buffer the generated harness allocated and sized
+/// itself for a pointer parameter that takes no length: a decoded C string
+/// (`bhf_c_string` and its relatives), or a copy of the input whose allocating
+/// statement in the generated `bhf_run_one` passes no length companion with
+/// it. Whether a real caller can pass a buffer that short is the entry's
+/// contract, which bhf cannot see, so the crash is precondition-dependent and
+/// not read as reachable from input.
+///
+/// The generated `bhf_run_one` also allocates buffers that it passes WITH a
+/// length: the buffer of a `(buf, len)` pair, an output buffer with its
+/// capacity, a NUL-terminated copy passed with a length. Every such companion
+/// is declared from the buffer as `(buf ? cap : 0)`, so the allocating
+/// statement is read from the harness source (the allocation frame's file and
+/// line) and a buffer with a companion does not count. Nor does a buffer the
+/// project allocated, the driver's input buffer, or an allocation whose source
+/// is not a bhf-generated harness or cannot be read.
+pub fn harness_sized_buffer(raw: &Value) -> Option<HarnessSizedBuffer> {
+    let access = raw.pointer("/exception/access")?;
+    if access.pointer("/region/kind").and_then(Value::as_str) != Some("heap")
+        || !matches!(
+            access.pointer("/region/relation").and_then(Value::as_str),
+            Some("after" | "before")
+        )
+    {
+        return None;
+    }
+    let mut frames = access
+        .get("alloc_stack")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|frame| {
+            let function = string_at(frame, &["function"]).unwrap_or_default();
+            let file = string_at(frame, &["file"]);
+            !function.is_empty()
+                && !is_runtime_noise_frame(&function, file.as_deref())
+                && !is_allocator_frame(&function)
+        });
+    let frame = frames.next()?;
+    let function = function_head(&string_at(frame, &["function"]).unwrap_or_default());
+    let file = string_at(frame, &["file"]).unwrap_or_default();
+    if file.replace('\\', "/").ends_with("bhf_driver.c") {
+        return None;
+    }
+    let line = frame.get("line").and_then(Value::as_u64);
+    if LENGTHLESS_STRING_DECODERS.contains(&function.as_str()) {
+        // The statement that called the decoder names the variable.
+        let caller = frames.next();
+        let statement = caller.and_then(|caller| {
+            let file = string_at(caller, &["file"])?;
+            generated_harness_line(&file, caller.get("line").and_then(Value::as_u64)?)
+        });
+        let variable = statement.as_deref().and_then(|statement| {
+            assigned_variable(statement, |part| part.contains(&format!("{function}(")))
+        });
+        let site = caller.and_then(frame_site);
+        return Some(HarnessSizedBuffer { variable, site });
+    }
+    if function != "bhf_run_one" {
+        return None;
+    }
+    let source = generated_harness_source(&file)?;
+    let statement = source
+        .lines()
+        .nth(usize::try_from(line?).ok()?.checked_sub(1)?)?;
+    let variable = assigned_variable(statement, is_allocation)?;
+    if passes_length_with(&source, &variable) {
+        return None;
+    }
+    Some(HarnessSizedBuffer {
+        variable: Some(variable),
+        site: frame_site(frame),
+    })
+}
+
+/// `main.c:76` for a frame with a file and line.
+fn frame_site(frame: &Value) -> Option<String> {
+    let file = string_at(frame, &["file"])?;
+    let line = frame.get("line").and_then(Value::as_u64)?;
+    let base = file.rsplit(['/', '\\']).next().unwrap_or(&file).to_owned();
+    Some(format!("{base}:{line}"))
+}
+
+/// The text of a source file bhf generated as a harness: it carries the
+/// `bhf harness format` stamp in its first lines. `None` for any other file,
+/// a missing one, or one too large to be a harness.
+fn generated_harness_source(file: &str) -> Option<String> {
+    const MAX_HARNESS_SOURCE: u64 = 16 * 1024 * 1024;
+    let path = Path::new(file);
+    if !path.is_absolute() || std::fs::metadata(path).ok()?.len() > MAX_HARNESS_SOURCE {
+        return None;
+    }
+    let text = std::fs::read_to_string(path).ok()?;
+    text.lines()
+        .take(8)
+        .any(|line| line.contains("bhf harness format"))
+        .then_some(text)
+}
+
+fn generated_harness_line(file: &str, line: u64) -> Option<String> {
+    let source = generated_harness_source(file)?;
+    let index = usize::try_from(line).ok()?.checked_sub(1)?;
+    source.lines().nth(index).map(str::to_owned)
+}
+
+fn is_allocation(statement: &str) -> bool {
+    ["malloc(", "calloc(", "realloc("]
+        .iter()
+        .any(|call| statement.contains(call))
+}
+
+/// The variable a statement of `line` assigns, for the one statement that
+/// `matches`: `buf` in `uint8_t * buf = (uint8_t *)malloc(n)`. `None` when no
+/// statement or more than one matches, or the assigned name is not a plain
+/// identifier (`items[i] = ...`).
+fn assigned_variable(line: &str, matches: impl Fn(&str) -> bool) -> Option<String> {
+    let mut found = line.split(';').filter(|part| matches(part));
+    let statement = found.next()?;
+    if found.next().is_some() {
+        return None;
+    }
+    let (target, _) = statement.split_once('=')?;
+    let target = target.trim_end();
+    let name: String = target
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let starts_well = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+    (starts_well && name.len() < target.len()).then_some(name)
+}
+
+/// Whether the harness passes a length with `variable`: the generated
+/// companion of a buffer is declared as `(variable ? capacity : 0)`.
+fn passes_length_with(source: &str, variable: &str) -> bool {
+    source.contains(&format!("({variable} ? "))
+}
+
+/// What a finding's reachability verdict (`actionability.verdict`) rests on,
+/// in words: the evidence behind it or the lack of it. A verdict inferred from
+/// the entry's signature says so; an entry nothing was recorded for reads as
+/// not assessed. `entry` names the fuzzed function when the caller knows it
+/// (the record itself often names only the harness).
+pub fn reachability_statement(raw: &Value, entry: Option<&str>) -> String {
+    let verdict = string_at(raw, &["actionability", "verdict"]).unwrap_or_default();
+    let reachability = string_at(raw, &["input_reachability"])
+        .or_else(|| string_at(raw, &["target", "input_reachability"]));
+    let entry = match entry.map(str::trim).filter(|name| !name.is_empty()) {
+        Some(name) => format!("the entry `{name}`"),
+        None => match string_at(raw, &["target", "subprogram"]) {
+            Some(name) => format!("the entry `{name}`"),
+            None => "the fuzzed entry".to_owned(),
+        },
+    };
+    match verdict.as_str() {
+        "real_reachable" => "reachable: a replay reproduced the crash and the fix location is in \
+                             the project's source"
+            .to_owned(),
+        "likely_reachable" => match reachability.as_deref() {
+            Some("attacker_reachable") => format!(
+                "the signature of {entry} matches an input-taking shape, so likely reachable \
+                 from input; not proven (inferred from its signature; bhf's harness calls it \
+                 directly)"
+            ),
+            Some("ipc_channel_reachable") => format!(
+                "input reached {entry} through a virtualized IPC channel, so likely reachable \
+                 from input; not proven (attacker control depends on who can write to that channel)"
+            ),
+            Some("registered_entry_point" | "channel_consumer") => format!(
+                "{entry} is registered as a task, interrupt or message handler, so likely \
+                 reachable from input; not proven (attacker control depends on that channel)"
+            ),
+            _ => format!(
+                "reachability not assessed: nothing records how input reaches {entry}; the \
+                 crash reproduces through bhf's harness, which calls it directly"
+            ),
+        },
+        "lab_only" => {
+            if let Some(buffer) = harness_sized_buffer(raw) {
+                let what = match &buffer.variable {
+                    Some(variable) => format!("the overflowed buffer `{variable}`"),
+                    None => "the overflowed buffer".to_owned(),
+                };
+                let at = buffer
+                    .site
+                    .map(|site| format!(" (allocated at {site})"))
+                    .unwrap_or_default();
+                format!(
+                    "precondition-dependent: {what} was sized by bhf's harness{at} for a \
+                     pointer parameter passed without a length; whether a real caller can pass \
+                     a buffer this short depends on the entry's contract, which bhf cannot see"
+                )
+            } else if raw
+                .pointer("/actionability/prosthetics/used")
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                "reproducible in the lab only: the crash needed a value a build-recovery stub \
+                 or fake supplied"
+                    .to_owned()
+            } else {
+                match reachability.as_deref() {
+                    // The classifier reads type spellings: a typedef'd byte
+                    // buffer (`frame_buf_t`) does not show as one.
+                    Some("reachability_unproven") => format!(
+                        "reproducible in the lab; the signature of {entry}, as spelled, does \
+                         not match an input-taking shape (a read-only byte buffer, or a \
+                         parser-named entry with a length), so reachability from input is \
+                         unproven"
+                    ),
+                    Some("output_serializer") => format!(
+                        "reproducible in the lab; {entry} looks like an output serializer, so \
+                         reachability from input is unproven"
+                    ),
+                    _ => "reproducible in the lab; reachability from input is unproven".to_owned(),
+                }
+            }
+        }
+        "blocked" => {
+            "blocked: the path needed a resource the run did not have, so reachability was not \
+             tested"
+                .to_owned()
+        }
+        _ => "not assessed".to_owned(),
+    }
 }
 
 /// The bhf harness scaffolding (entry shims + the generated `main`), which

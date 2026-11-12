@@ -48,7 +48,11 @@ the first time any command opens it; see [Migration from 0.2.x](#migration-from-
 field summary. `findings.json` always starts with `schema_version`, then
 `generated_at`, `tool`, so an importer can detect the format from the first
 few bytes. Every key is present (`null` where a value does not apply — never
-omitted), and unknown keys are rejected.
+omitted), and unknown keys are rejected. Keys added to v1 after its first
+release (`fuzz.access`, `fuzz.input_to_state`, `fuzz.input_to_state_input`,
+`fuzz.arguments`, the `runtrace` evidence role) are optional in the schema, so documents written
+before them still validate; bhf always writes them. A validator holding the
+older schema rejects them.
 
 Document-level fields: `schema_version`, `generated_at`, `tool` (`{name,
 version, build}`), `source` (`{root, vcs}`), `producers[]` (the last 50
@@ -87,12 +91,21 @@ records that failed to load — a bad record never aborts the rebuild).
 | `remediation` | string \| null | |
 | `patch_hints` | `[{title, guidance}]` | advisory, not a literal diff |
 | `reproduce` | `{harness_id, command, build}` \| null | `build`: `{sanitizers[], binary_sha256, build_id}`; `command` is relative to `results/` |
-| `evidence` | `{dir, files[]}` \| null | each file: `{role, path, sha256, size}` — roles: `finding`, `testcase`, `testcase_minimized`, `sanitizer_log`, `decoded`, `replay_script`, `repro_ada`, `byte_control` |
-| `fuzz` | `{exception, classification, harness_id, dialect, oracle}` \| null | `exception`: `{name, message, sanitizer}` |
+| `evidence` | `{dir, files[]}` \| null | each file: `{role, path, sha256, size}` — roles: `finding`, `testcase`, `testcase_minimized`, `sanitizer_log`, `decoded`, `replay_script`, `repro_ada`, `byte_control`, `runtrace` (the runtrace events of the replay that recorded the comparison evidence) |
+| `fuzz` | `{exception, classification, harness_id, dialect, oracle, access, input_to_state, arguments}` \| null | `exception`: `{name, message, sanitizer}`; see [Fuzz block](#fuzz-block) |
 | `static` | `{engine, precision, snippet, baseline_status, triage_state}` \| null | |
 | `sca` | object \| null | `{vuln_id, aliases[], component, fixed_versions[], cvss, kev, references[], match_confidence, matching_method, vex}` |
 | `binary` | `{sha256, build_id, arch, crash}` \| null | |
 | `raw_ref` | string \| null | path of the source record, relative to `results/` |
+
+### Fuzz block
+
+| Field | Type | Notes |
+|---|---|---|
+| `access` | object \| null | the memory access the sanitizer reported: `{direction, size, address_hint, region, alloc_stack[], free_stack[]}`. `direction` is `read`, `write` or `unknown`; `region` is `{kind, size, offset, relation, distance, variable, frame_offset}` (`kind` `heap`, `stack` or `global`; `offset` negative before the object, `>= size` past it). The raw address is left out (it differs run to run); the stacks keep project and harness frames only, at most 8 |
+| `input_to_state` | array \| null | comparison evidence recorded while this finding's input ran (from `finding.json` `gates`); `null` when no capture ran or it could not run (`gate_capture.status` `unavailable`), `[]` when one ran and no input bytes fed a comparison. Each entry: `{offset, len, operand_hex, compared_with_hex, cmp_kind, site, site_location, relation, operands_equal}`. `relation` is `equal` (the operand bytes are the input bytes), `byte_swapped` (the same, read big-endian) or `derived` (the operand is computed from those bytes and changed when they did); `site` is the comparison's offset in the harness executable, `site_location` its source position when it could be symbolized (never for `memcmp`/`bcmp` under AddressSanitizer, whose interceptor reports itself as the site) |
+| `input_to_state_input` | string \| null | the finding file whose bytes the `input_to_state` offsets index: `min_testcase.bin` or `testcase.bin` (`finding.json` `gate_capture.input`); `null` when no capture named it |
+| `arguments` | array \| null | the values the harness decoded from the input and passed to the target (`finding.json` `decoded_args`), when traced: `{name, type, value, len, span, preview_hex, role, after_call_value}`; `span` is `[start, end)` in the testcase, `role` `param`, `receiver` or `out` |
 
 ### Severity
 
@@ -141,6 +154,9 @@ carries the envelope below, in addition to its producer-specific fields
 | `forced` | `true` when the finding came from a forced/stub-heavy build under `--force` |
 | `history[]` | `{at, command, fields[]}` — one entry per enrichment pass (`minimize`, `cartography`, `confirm`, fidelity) that edited this record in place |
 | `minimization_skipped` | `true` when `auto`'s minimization pass ran out of budget before reaching this finding's group |
+| `gates` | comparison evidence for the input named in `gate_capture.input`: each input span (`offset`, `len`) whose bytes reached a comparison, with `operand_hex`, `compared_with_hex`, `cmp_kind`, `site`, `location` (`{file, line, function}` or `null`), `relation` and `operands_equal`. Written by `bhf auto` after minimization and by `bhf report --backfill`. An operand counts only when its bytes occur in the input and a replay with those bytes changed shows it change with them (`derived`: flipping a byte changed it, and two replays of the unchanged input agreed on it, so a process id or clock reading does not count). Comparisons the harness makes before entering the target are left out, and so are later ones whose site symbolizes to harness code (this needs `llvm-symbolizer`) |
+| `gate_capture` | how `gates` was recorded: `{input, input_len, status, reason, comparisons, truncated, unconfirmed, runs, shim_armed}`. `status` is `recorded`, `no_input_comparisons`, `no_comparisons` (no instrumented comparison was recorded in the target; uninstrumented code such as a prebuilt library is not observed) or `unavailable` (the capture could not run; with `reason`); `unconfirmed` counts operands whose bytes occur in the input but that did not follow a change of them; `shim_armed` says the replay ran with the runtrace shim, whose events for this one input are in the finding's `runtrace.jsonl` |
+| `runtime_mode` | `{pass, env_injected, shim_armed}` stamped by `auto` on each finding: the fuzz pass, the environment it injected, and whether the runtrace shim was loaded for it |
 
 ## Producer history
 
@@ -161,10 +177,21 @@ findings and owns the single record for the batch.
 One row per finding. Columns, from `CSV_HEADER`:
 
 ```
-id,kind,severity,confidence,confirmation,rule_id,cwe,title,file,line,function,group,occurrences,verdict,vuln_id,purl,first_seen,evidence_dir
+id,kind,severity,confidence,confirmation,rule_id,cwe,title,file,line,function,group,occurrences,verdict,vuln_id,purl,first_seen,evidence_dir,access,access_size,region_size,region_offset,input_to_state,input_to_state_input
 ```
 
-`cwe` is written `CWE-120`; multiple values are `;`-separated.
+`cwe` is written `CWE-120`; multiple values are `;`-separated. The columns
+after `evidence_dir` were added later, at the end, so readers that address
+columns by position keep working: `access` is the access direction,
+`access_size` its width, `region_size` and `region_offset` the object it hit,
+`input_to_state` lists the comparison evidence as
+`offset:len:cmp_kind:operand_hex`, `;`-separated, and `input_to_state_input`
+names the file those offsets index.
+
+SARIF results carry the comparison evidence as the `bhfInputToState` property
+(the `finding.json` `gates` entries), the file its offsets index as
+`bhfInputToStateInput`, and each comparison site with a source position as a
+related location. A capture that could not run adds neither property.
 
 ## Migration from 0.2.x
 
@@ -245,3 +272,14 @@ dir. Read each finding's `sanitizer.log` where it has one, otherwise run its
   start) — read `explanation` + `patch_hints` first.
 - **Reproduce?** `evidence.files[role=replay_script]`, or
   `bhf replay --finding <id>`.
+- **Which input bytes matter?** `fuzz.input_to_state`: the spans that reached a
+  comparison while the finding's input ran. `dictionary.txt` in the harness dir
+  is mined from source when the harness is generated; a token of it that occurs
+  in an input is not evidence that any comparison read it.
+- **How sure is `likely_reachable`?** For C/C++ it is usually inferred from the
+  entry's signature (an input-taking shape, such as a byte-buffer parameter or
+  a parser taking a byte); `bhf explain` says what
+  each verdict rests on. A heap overflow of a buffer the generated harness sized
+  for a pointer parameter it passes without a length is `lab_only`
+  (precondition-dependent); one passed with its length, such as the buffer of a
+  `(buf, len)` pair, keeps the entry's verdict.

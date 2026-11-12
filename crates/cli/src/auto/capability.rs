@@ -228,12 +228,31 @@ fn replay_into(
     let mut events = runtrace::parse_log(&log).unwrap_or_default();
     runtrace::dedupe_in_place(&mut events);
     let _ = std::fs::remove_file(&log);
-    for ev in &events {
+    fold_capabilities(&events, input, caps);
+    completed
+}
+
+/// Add the capabilities `events` show for a replay of `input` to `caps`. The
+/// driver opening `input` itself (its `fopen`, which the shim records) is
+/// bhf's own file access, not the target's: a corpus file's path differs for
+/// every input, so it would read as an input-triggered path.
+fn fold_capabilities(events: &[RuntraceEvent], input: &Path, caps: &mut BTreeSet<Capability>) {
+    let input = input.to_string_lossy();
+    for ev in events {
+        let is_input = matches!(
+            ev,
+            RuntraceEvent::FileOpened { path, .. }
+                | RuntraceEvent::FileMissing { path, .. }
+                | RuntraceEvent::PathChecked { path, .. }
+                if *path == *input
+        );
+        if is_input {
+            continue;
+        }
         if let Some(cap) = classify(ev) {
             caps.insert(cap);
         }
     }
-    completed
 }
 
 /// Build the replay command, wrapping in `timeout` when available so a
@@ -723,6 +742,31 @@ mod tests {
         };
         assert_eq!(classify(&opened), None);
         assert_eq!(classify(&deleted), None);
+    }
+
+    /// The driver's own read of the replayed input is not a capability; a
+    /// path the target opens in the same replay still is.
+    #[test]
+    fn the_replayed_input_file_is_not_an_opened_path() {
+        let input = Path::new("/work/corpus/H-C0001/queue/3f2a.bin");
+        let events = [
+            RuntraceEvent::FileOpened {
+                syscall: "fopen".into(),
+                fd: 5,
+                path: input.to_string_lossy().into_owned(),
+                taint_offset: None,
+            },
+            RuntraceEvent::FileOpened {
+                syscall: "fopen".into(),
+                fd: 6,
+                path: "/etc/widget.cfg".into(),
+                taint_offset: None,
+            },
+        ];
+        let mut caps = BTreeSet::new();
+        fold_capabilities(&events, input, &mut caps);
+        let operands: Vec<&str> = caps.iter().map(|c| c.operand.as_str()).collect();
+        assert_eq!(operands, ["/etc/widget.cfg"], "{caps:?}");
     }
 
     #[test]

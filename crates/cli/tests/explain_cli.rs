@@ -2,8 +2,9 @@
 //! End-to-end coverage for `bhf explain`: after fuzzing a crash that is gated
 //! behind a magic value AND reads an env var (faked by the shim), the offline,
 //! deterministic explanation must join every evidence source — the sink + CWE, the
-//! minimized input, the recovered gate constants the engine solved (input-to-state),
-//! the virtualized environment, and the reproduce commands — with no LLM.
+//! minimized input, the comparisons that input reached (recorded by the harness's
+//! driver while it ran), the environment the runtrace shim observed for that
+//! input, and the reproduce commands — with no LLM.
 
 use std::path::Path;
 use std::process::Command;
@@ -79,18 +80,42 @@ fn explain_joins_input_gates_faked_env_and_dataflow() {
         "missing CWE/class:\n{text}"
     );
     assert!(
-        text.contains("THE INPUT THAT TRIGGERS IT"),
-        "missing input section:\n{text}"
+        text.contains("THE INPUT THAT TRIGGERS IT  (min_testcase.bin,"),
+        "the minimized input is shown and named:\n{text}"
     );
-    // Input-to-state: the engine solved the "BOOM" gate — at least one gate byte
-    // must be surfaced from the recovered dictionary.
+    // The "BOOM" gate: the comparisons that read the input's magic bytes were
+    // recorded while this input ran, with their offsets — not a dictionary
+    // substring match.
+    let words = text.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        text.contains("Input-to-state") && text.contains("matched recovered constant"),
-        "missing gate-constant reasoning:\n{text}"
+        words.contains("Comparison evidence for this input (min_testcase.bin, recorded when the finding was saved):")
+            && (words.contains("reaches cmp") || words.contains("reach cmp")),
+        "missing recorded comparison evidence:\n{text}"
     );
-    // The faked environment: the shim served getenv APP_MODE.
     assert!(
-        text.contains("FAKED ENVIRONMENT") && text.contains("APP_MODE"),
+        !text.contains("matched recovered constant") && !text.contains("solved"),
+        "no heuristic presented as solved gates:\n{text}"
+    );
+    let finding = std::fs::read_dir(work.join("results/findings"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.join("min_testcase.bin").is_file())
+        .expect("a minimized finding");
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(finding.join("finding.json")).unwrap()).unwrap();
+    let gates = record["gates"].as_array().expect("finding.json gates");
+    assert!(
+        gates.iter().any(|g| g["operand_hex"]
+            .as_str()
+            .is_some_and(|h| h.starts_with("42"))),
+        "the 'B' of BOOM reached a comparison: {gates:?}"
+    );
+    // The environment: the shim served getenv APP_MODE to this input's own replay.
+    assert!(
+        text.contains(
+            "FAKED ENVIRONMENT  (observed while replaying min_testcase.bin with the runtrace shim)"
+        ) && text.contains("APP_MODE"),
         "missing faked-env timeline:\n{text}"
     );
     // Reproduce hooks wire into the capsule feature.

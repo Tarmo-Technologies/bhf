@@ -74,6 +74,24 @@
             "bhf.rule_slug": "bhf.c/heap-buffer-overflow",
             "bhfExceptionSignature": "aa11bb22",
             "bhfFindingId": "F-0000-1a2b3c4d",
+            "bhfInputToState": [
+              {
+                "cmp_kind": "cmp",
+                "compared_with_hex": "41",
+                "len": 1,
+                "location": {
+                  "file": "src/parse.c",
+                  "function": "parse_header",
+                  "line": 40
+                },
+                "offset": 0,
+                "operand_hex": "41",
+                "operands_equal": true,
+                "relation": "equal",
+                "site": "0x1a2b"
+              }
+            ],
+            "bhfInputToStateInput": "min_testcase.bin",
             "classification": "unhandled",
             "clusterFallback": false,
             "clusterKey": "c0ffee00",
@@ -88,7 +106,8 @@
             "cwe": "CWE-122",
             "cwe_top_25": null,
             "cwes": [
-              "CWE-122"
+              "CWE-122",
+              "CWE-125"
             ],
             "generatedReproAda": null,
             "generatedReproPy": null,
@@ -106,7 +125,23 @@
               "bhf.slug:bhf.c/heap-buffer-overflow"
             ]
           },
-          "relatedLocations": [],
+          "relatedLocations": [
+            {
+              "id": 1,
+              "message": {
+                "text": "Input bytes 0..1 of min_testcase.bin reach this cmp"
+              },
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/parse.c",
+                  "uriBaseId": "SRCROOT"
+                },
+                "region": {
+                  "startLine": 40
+                }
+              }
+            }
+          ],
           "ruleId": "BHF-201",
           "stacks": [
             {

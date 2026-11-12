@@ -20,10 +20,25 @@ use std::ffi::CStr;
 
 static REAL_DLSYM: ResolvedFn = ResolvedFn::new(b"dlsym\0");
 
+/// The `dlsym` hook, entered from the C trampoline in `format_hooks.c` with
+/// the address it was called from.
+///
+/// `dlsym(RTLD_NEXT, name)` means "the next definition after the calling
+/// object", and glibc reads the caller from `dlsym`'s return address. A
+/// sanitizer runtime resolves the real `fopen`, `dlopen`, `memcmp`, ...
+/// behind its interceptors this way; were the lookup forwarded from here, it
+/// would search the objects after this library and skip its hooks (or, for a
+/// runtime loaded after it, find the interceptor itself). So this only
+/// answers what is the shim's to answer: a synthetic handle's stub, and for
+/// the symbols in [`next_hook`], when the caller was loaded before this
+/// library, this library's hook. Anything else returns [`FORWARD`], and the C
+/// trampoline in `format_hooks.c` tail-calls the real `dlsym`, which then
+/// sees the original caller.
 #[no_mangle]
-pub unsafe extern "C" fn dlsym(
+pub unsafe extern "C" fn bhf_shim_dlsym(
     handle: *mut libc::c_void,
     symbol: *const libc::c_char,
+    caller: *const libc::c_void,
 ) -> *mut libc::c_void {
     if is_synthetic(handle) {
         if !symbol.is_null() {
@@ -38,16 +53,95 @@ pub unsafe extern "C" fn dlsym(
         }
         return bhf_fake_dlsym_stub as *mut libc::c_void;
     }
-    let real = REAL_DLSYM.ptr() as *const ();
-    if real.is_null() {
-        // Can't call libc::dlsym here — that would re-dispatch
-        // back into this hook and recurse. Return null and let
-        // the caller treat the symbol as unresolved.
-        return std::ptr::null_mut();
+    if handle == libc::RTLD_NEXT && !symbol.is_null() {
+        if let Some(hook) = next_hook(CStr::from_ptr(symbol).to_bytes()) {
+            if loaded_before_this_library(caller) {
+                return hook;
+            }
+        }
     }
-    let real: unsafe extern "C" fn(*mut libc::c_void, *const libc::c_char) -> *mut libc::c_void =
-        std::mem::transmute(real);
-    real(handle, symbol)
+    FORWARD as *mut libc::c_void
+}
+
+/// What [`bhf_shim_dlsym`] returns for a lookup the real `dlsym` answers. No
+/// symbol resolves to the last address.
+pub const FORWARD: usize = usize::MAX;
+
+/// The real `dlsym` the trampoline forwards to, or null when it cannot be
+/// resolved (calling `libc::dlsym` from here would re-enter the hook).
+#[no_mangle]
+pub extern "C" fn bhf_shim_real_dlsym() -> *mut libc::c_void {
+    REAL_DLSYM.ptr()
+}
+
+/// This library's hook that `dlsym(RTLD_NEXT, name)` from an earlier object
+/// should find.
+fn next_hook(name: &[u8]) -> Option<*mut libc::c_void> {
+    Some(match name {
+        b"fopen" => crate::hooks::fs::fopen_hook as *mut libc::c_void,
+        b"fopen64" => crate::hooks::fs::fopen64_hook as *mut libc::c_void,
+        _ => return None,
+    })
+}
+
+/// glibc's `struct link_map` prefix (`<link.h>`).
+#[repr(C)]
+struct LinkMap {
+    l_addr: usize,
+    l_name: *const libc::c_char,
+    l_ld: *mut libc::c_void,
+    l_next: *mut LinkMap,
+    l_prev: *mut LinkMap,
+}
+
+const RTLD_DL_LINKMAP: libc::c_int = 2;
+
+/// libc's `dladdr1`, not the one the PLT binds: a sanitizer defines `dladdr1`
+/// in the executable, and its interceptor has nothing to call while the
+/// sanitizer is still resolving its interceptors through this hook.
+static REAL_DLADDR1: ResolvedFn = ResolvedFn::new(b"dladdr1\0");
+
+/// The loaded object that contains `addr`.
+unsafe fn link_map_of(addr: *const libc::c_void) -> Option<*mut LinkMap> {
+    let real = REAL_DLADDR1.ptr();
+    if real.is_null() {
+        return None;
+    }
+    let real: unsafe extern "C" fn(
+        *const libc::c_void,
+        *mut libc::Dl_info,
+        *mut *mut libc::c_void,
+        libc::c_int,
+    ) -> libc::c_int = std::mem::transmute(real);
+    let mut info: libc::Dl_info = std::mem::zeroed();
+    let mut map: *mut libc::c_void = std::ptr::null_mut();
+    (real(addr, &mut info, &mut map, RTLD_DL_LINKMAP) != 0 && !map.is_null())
+        .then_some(map as *mut LinkMap)
+}
+
+/// Whether the object containing `caller` comes before this library in load
+/// order (the program itself always does).
+unsafe fn loaded_before_this_library(caller: *const libc::c_void) -> bool {
+    let (Some(caller), Some(own)) = (
+        link_map_of(caller),
+        link_map_of(next_hook as *const libc::c_void),
+    ) else {
+        return false;
+    };
+    if caller == own {
+        return false;
+    }
+    let mut next = (*caller).l_next;
+    for _ in 0..4096 {
+        if next.is_null() {
+            return false;
+        }
+        if next == own {
+            return true;
+        }
+        next = (*next).l_next;
+    }
+    false
 }
 
 pub struct Dlsym;

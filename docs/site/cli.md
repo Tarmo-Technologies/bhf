@@ -109,8 +109,12 @@ byte/dictionary mutation without structured synthesis.
 Generated Ada harnesses write `dictionary.txt` from enum literals and string
 literals; generated C/C++ harnesses write the same artifact from source and
 header constants, including C++ namespaced `enum class` members and switch case
-labels. The fuzz command loads a harness-specific dictionary automatically when
-present.
+labels (but not `#include` paths). Each integer literal is also written as its
+raw little- and big-endian bytes, under a `# raw bytes of the literal above`
+comment. The file is mined from source when the harness is generated and is not
+runtime evidence; comparison operands observed while fuzzing accumulate in
+`cmplog.jsonl` beside it. The fuzz command loads a harness-specific dictionary
+automatically when present.
 
 `bhf scan` accepts an Ada, C, or C++ source file or directory tree. It
 writes `bhf_work/scan_index.json`, prints the same JSON summary to stdout,
@@ -528,10 +532,53 @@ and explain it — all offline and deterministic (no LLM):
   under the recorded environment: `min_testcase.bin`, then `testcase.bin`, then
   the corpus input that crashed while recording; `manifest.json`
   (`input_source`) says which.
-- `bhf explain` — explain WHY a crash fired: the controlling input bytes, the
-  gate constants it had to satisfy, the faked environment, and the dataflow to the
-  sink, plus the recorded memory access (direction, width, the region hit and
-  its allocation site). Each block names its harness. Findings of one root
+- `bhf explain` — explain WHY a crash fired, each claim with its evidence or
+  a line saying there is none:
+  - the input: `min_testcase.bin` when the finding was minimized, else
+    `testcase.bin`, named with its size, and whether it is one of bhf's
+    built-in starting inputs (empty, `A`, `AAAAAAAA`) or a byte-identical
+    copy of a seed listed in `auto/seeds.json`;
+  - comparison evidence for that input: each input span that reached a
+    comparison of the target, with its offset, the operand, what it was
+    compared with, whether they were equal, the comparison (`cmp`, `switch`,
+    `memcmp`, `strcmp`, ...) and its source position. It is recorded by
+    replaying the input with the driver's comparison capture
+    (`BHF_CMP_EVIDENCE`): an operand counts only when its bytes occur in the
+    input and a replay with those bytes changed shows the operand change with
+    them. For inputs of up to 32 bytes, flipping each byte also finds operands
+    computed from input bytes, such as a folded `x == 0 || x > 32` range
+    check; two replays of the unchanged input bracket the flips, and an
+    operand that differs between them (a process id, a clock reading) is not
+    evidence. Comparisons the harness makes before entering the target are
+    discarded, and later ones in harness code are left out when
+    `llvm-symbolizer` can locate them. Under AddressSanitizer a `memcmp` or
+    `bcmp` gate has no source position: the interceptor reports itself as the
+    call site. `bhf auto` records it after minimization (`finding.json`
+    `gates`); for a finding without it, explain replays the input once (nothing
+    is written). Otherwise it prints `No comparison evidence recorded:` and the
+    reason, which says what was not searched (computed operands of an input
+    over 32 bytes, comparisons past the driver's 8192-record limit) and that
+    only instrumented code is observed. Dictionary tokens found in the input are listed only as labelled
+    substring matches (at least 3 bytes, at most 3 occurrences);
+  - the environment: the runtrace events of that input's own replay when the
+    runtrace shim was loaded for it, else the harness's last fuzz pass (all of
+    its inputs, labelled so), and `environment not observed (runtrace shim not
+    loaded)` when the shim was not loaded (`finding.json`
+    `runtime_mode.shim_armed`). An installed bhf without the shim beside it
+    can be pointed at one with `BHF_RUNTRACE_SHIM=/path/libbhf_runtrace_shim.so`;
+  - reachability: the verdict and what it rests on. A verdict inferred from the
+    entry's signature says it "matches an input-taking shape, so likely
+    reachable from input; not proven"; an entry with no recorded reachability
+    reads "not assessed"; and an overflow of a buffer the generated harness
+    sized itself for a pointer parameter it passes without a length (a decoded
+    C string, or a copy of the input with no length companion in the harness
+    source) reads "precondition-dependent" (verdict `lab_only`). A harness
+    buffer passed together with its length, such as the buffer of a
+    `(buf, len)` pair, keeps the entry's verdict;
+  - the recorded memory access (direction, width, the region hit and its
+    allocation site), the sink and frames, and how to fix and reproduce it.
+
+  Each block names its harness. Findings of one root
   cause (the same `cluster_key_full`, such as one site reached through several
   harnesses) are explained once, by the first, which lists the others and
   their harnesses; `--all-members` explains each one.

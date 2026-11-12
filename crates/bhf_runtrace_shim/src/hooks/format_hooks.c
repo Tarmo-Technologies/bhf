@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #define _GNU_SOURCE
+#include <dlfcn.h>
 #include <errno.h>
 #include <stdarg.h>
 #include <stddef.h>
@@ -64,10 +65,43 @@ BHF_HOOK int snprintf(char *str, size_t size, const char *format, ...) {
     return result;
 }
 
+/* dlsym(RTLD_NEXT, ...) searches the objects loaded after its CALLER, and
+ * glibc's dlsym reads the caller from its return address. A sanitizer runtime
+ * resolves the real functions behind its interceptors this way. The hook
+ * needs the caller's address, which only C can read portably, and a lookup it
+ * does not answer itself goes to the real dlsym as a tail call, so the real
+ * one sees the original caller: forwarded with an ordinary call, the lookup
+ * would start after this library and skip its hooks (fopen, dlopen, memcmp,
+ * ...), or find a later-loaded sanitizer runtime's own interceptor. build.rs
+ * compiles this file optimized for compilers without musttail. */
+extern void *bhf_shim_dlsym(void *handle, const char *symbol, const void *caller);
+extern void *bhf_shim_real_dlsym(void);
+
+#if defined(__has_attribute)
+#if __has_attribute(musttail)
+#define BHF_MUSTTAIL __attribute__((musttail))
+#endif
+#endif
+#ifndef BHF_MUSTTAIL
+#define BHF_MUSTTAIL
+#endif
+
+typedef void *(*bhf_dlsym_fn)(void *, const char *);
+
+BHF_HOOK void *dlsym(void *handle, const char *symbol) {
+    void *answer = bhf_shim_dlsym(handle, symbol, __builtin_return_address(0));
+    bhf_dlsym_fn real;
+    if (answer != (void *)~(size_t)0) return answer;
+    real = (bhf_dlsym_fn)bhf_shim_real_dlsym();
+    if (!real) return NULL;
+    BHF_MUSTTAIL return real(handle, symbol);
+}
+
 BHF_HOOK void *bhf_format_hook_symbols[] = {
     (void *)&printf,
     (void *)&fprintf,
     (void *)&dprintf,
     (void *)&sprintf,
     (void *)&snprintf,
+    (void *)&dlsym,
 };

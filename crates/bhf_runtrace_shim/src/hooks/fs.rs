@@ -42,6 +42,8 @@ static REAL_SYMLINKAT: ResolvedFn = ResolvedFn::new(b"symlinkat\0");
 static REAL_LINK: ResolvedFn = ResolvedFn::new(b"link\0");
 static REAL_LINKAT: ResolvedFn = ResolvedFn::new(b"linkat\0");
 static REAL_TRUNCATE: ResolvedFn = ResolvedFn::new(b"truncate\0");
+static REAL_FOPEN: ResolvedFn = ResolvedFn::new(b"fopen\0");
+static REAL_FOPEN64: ResolvedFn = ResolvedFn::new(b"fopen64\0");
 
 /// Permission bits that make a `chmod` dangerous: setuid, setgid, or
 /// world-writable. Assigning any of these from data derived from untrusted
@@ -319,6 +321,80 @@ pub unsafe extern "C" fn open(
     }
     restore_errno(saved_errno);
     result
+}
+
+type FopenFn = unsafe extern "C" fn(*const libc::c_char, *const libc::c_char) -> *mut libc::FILE;
+
+/// `fopen` / `fopen64`: glibc opens the file through an internal call that
+/// never reaches the `open` hook, so these are hooked themselves and log the
+/// same open / missing-file events under their own names. A sanitizer runtime
+/// that defines `fopen` in the executable forwards to the next definition,
+/// which is this one. A missing file is reported, not faked.
+unsafe fn fopen_hooked(
+    real: &ResolvedFn,
+    api: &'static [u8],
+    path: *const libc::c_char,
+    mode: *const libc::c_char,
+) -> *mut libc::FILE {
+    let real = real.ptr() as *const ();
+    if real.is_null() {
+        // Calling libc's `fopen` here would bind back to this hook.
+        *libc::__errno_location() = libc::ENOSYS;
+        return std::ptr::null_mut();
+    }
+    let real: FopenFn = std::mem::transmute(real);
+    let file = real(path, mode);
+    let saved_errno = save_errno();
+    let path_bytes = path_bytes_from_ptr(path);
+    if let Some(_g) = HookGuard::acquire() {
+        if !file.is_null() {
+            log_path_open(api, path_bytes, libc::fileno(file));
+        } else if saved_errno == libc::ENOENT {
+            log_path_miss(api, path_bytes, -1, saved_errno);
+        }
+    }
+    restore_errno(saved_errno);
+    file
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn fopen(
+    path: *const libc::c_char,
+    mode: *const libc::c_char,
+) -> *mut libc::FILE {
+    fopen_hook(path, mode)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn fopen64(
+    path: *const libc::c_char,
+    mode: *const libc::c_char,
+) -> *mut libc::FILE {
+    fopen64_hook(path, mode)
+}
+
+/// The `fopen` hook under a name nothing else defines. The address of the
+/// exported `fopen` is preemptible: taken here it resolves to the first
+/// `fopen` in the process, which in a sanitized program is the sanitizer's
+/// own interceptor. `dlsym(RTLD_NEXT, "fopen")` hands out this one. Never
+/// inlined into the exported `fopen`: two identical bodies would be merged
+/// into one symbol in an optimized build, and this address would become the
+/// preemptible one again.
+#[inline(never)]
+pub(crate) unsafe extern "C" fn fopen_hook(
+    path: *const libc::c_char,
+    mode: *const libc::c_char,
+) -> *mut libc::FILE {
+    fopen_hooked(&REAL_FOPEN, b"fopen", path, mode)
+}
+
+/// [`fopen_hook`] for `fopen64`.
+#[inline(never)]
+pub(crate) unsafe extern "C" fn fopen64_hook(
+    path: *const libc::c_char,
+    mode: *const libc::c_char,
+) -> *mut libc::FILE {
+    fopen_hooked(&REAL_FOPEN64, b"fopen64", path, mode)
 }
 
 #[no_mangle]
@@ -829,9 +905,11 @@ impl crate::sdk::FakeResource for Fs {
             // `__xstat` is the only stat-family symbol this module defines, and
             // it is legacy: glibc 2.33+ compiles stat()/lstat() to direct
             // fstatat syscalls that bypass it (see the note above the hook).
-            // There is no `fopen` interposer at all. Both were advertised by
-            // `--list-fakes`, overstating what the shim actually sees.
+            // A bare `stat` was once advertised by `--list-fakes`, overstating
+            // what the shim actually sees.
             b"__xstat\0",
+            b"fopen\0",
+            b"fopen64\0",
             b"unlink\0",
             b"unlinkat\0",
             b"remove\0",

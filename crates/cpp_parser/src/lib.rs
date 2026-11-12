@@ -1956,7 +1956,12 @@ fn collect_cpp_string_dictionary_tokens(
     let Some(_depth_guard) = AstDepthGuard::enter() else {
         return;
     };
-    if node.kind() == "string_literal" {
+    // The path of `#include "x.h"` parses as a string literal too, but it
+    // names a file; the target never compares its input against it.
+    let include_path = node
+        .parent()
+        .is_some_and(|parent| parent.kind() == "preproc_include");
+    if node.kind() == "string_literal" && !include_path {
         if let Ok(raw) = node.utf8_text(source) {
             if let Some(value) = cpp_string_literal_value(raw) {
                 push_dictionary_token(tokens, value);
@@ -5208,6 +5213,26 @@ struct MappedFile {
                 "missing {expected} from {tokens:?}"
             );
         }
+    }
+
+    /// An `#include "..."` path is a file name, not a value the target compares
+    /// its input against; mining it made header names look like magic values.
+    #[test]
+    fn cpp_dictionary_skips_include_paths() {
+        let tokens = extract_cpp_dictionary_tokens(
+            r#"
+            #include "widget.h"
+            #include "include/widget_io.h"
+            #include <string>
+            int parse_record(const std::string &s) { return s == "WIDGET" ? 1 : 0; }
+            "#,
+        )
+        .expect("C++ dictionary tokens parse");
+        assert!(tokens.contains(&"WIDGET".to_owned()), "{tokens:?}");
+        assert!(
+            !tokens.iter().any(|token| token.ends_with(".h")),
+            "include paths are not tokens: {tokens:?}"
+        );
     }
 
     #[test]

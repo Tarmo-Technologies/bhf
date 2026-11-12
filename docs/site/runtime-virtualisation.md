@@ -50,6 +50,26 @@ Each event is appended as one JSONL line to the path in
 `needed_for_build` Layer C and, during built-in fuzzing, to evaluate
 executable oracles against only the events appended by the current input.
 
+`fopen` and `fopen64` are hooked too: glibc's `fopen` opens the file
+through an internal call that the `open` hook never sees. They log the same
+open and missing-file events as `open`, under their own event names (`fopen`,
+`fopen64`); a missing file is reported, not replaced by a fake one. In an
+AddressSanitizer harness the sanitizer runtime defines `fopen` in the
+executable and resolves the real one with `dlsym(RTLD_NEXT, "fopen")`; the
+shim's `dlsym` hook answers that call, from an object loaded before the shim,
+with the shim's own `fopen` hook, as `RTLD_NEXT` means, so the hook runs there
+as well.
+
+The sanitizer runtime also defines `strcmp`, `strncmp`, `memcmp` and `bcmp`
+in a sanitized executable, so the shim's comparison hooks do not run there.
+bhf's C/C++ driver writes the same `cmplog` records from the sanitizer's
+comparison hooks instead (they also cover `bcmp` and the `strcasecmp` family),
+once per distinct operand pair per process, leaving out comparisons the shim
+makes inside its own hooks. `strcmp`-family calls made by libc or a preloaded
+library are left out as well; `memcmp` and `bcmp` calls are not, because the
+sanitizer's interceptor reports a position inside itself rather than its
+caller's.
+
 ### Collector-shaped view (`--collector auto` on Linux, #60)
 
 The same shim events also back the platform-neutral runtime-event collector on
@@ -110,7 +130,8 @@ in the parent shell.
 | `BHF_FUZZ_INPUT_LEN` | harness | shim | Length of the fuzz input in the shared memfd |
 | `BHF_DISABLE_DLOPEN_FAKE` | user | shim | Opt out of synthetic `dlopen` / `dlsym` handles when a target uses struct-return-by-value through `dlsym` |
 | `BHF_FAKE_IDENTITY` | auto (replay) | shim | Enable deterministic `getpid`/`getuid`/`getgid`/`getppid` constants |
-| `BHF_CMPLOG` | auto | shim | Enable `strcmp`/`strncmp`/`memcmp` comparison-operand recording (cmplog / RedQueen) |
+| `BHF_CMPLOG` | auto | shim, C/C++ driver | Enable `strcmp`/`strncmp`/`memcmp` comparison-operand recording (cmplog / RedQueen) into `BHF_RUNTRACE_LOG` |
+| `BHF_CMP_EVIDENCE` | bhf (capture replays) | C/C++ driver | File the driver records every comparison of one run into, for the comparison evidence of a finding's input; unset during fuzzing |
 | `LD_PRELOAD` | auto | dynamic linker | Always includes the absolute path to `libbhf_runtrace.so`. Pre-existing values are preserved. |
 
 `bhf auto` locates the shim by searching alongside the `bhf` binary.

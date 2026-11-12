@@ -12,8 +12,10 @@
 - Finding: `F-0000-1a2b3c4d` (fuzz)
 - Rule: `BHF-201`
 - Evidence: sanitizer_crash · confidence medium · verdict likely\_reachable
-- CWE: CWE-122
+- CWE: CWE-122, CWE-125
 - Location: `src/parse.c`:42 in `parse_header`
+- Memory access: read of 4 byte(s), 0 byte(s) after a 4-byte heap object
+- Input bytes compared (offsets in `min_testcase.bin`): bytes 0..1 → cmp at `src/parse.c:40`
 - Suggested fix: Bounds-check the index/length before the access at \`src/parse.c:42\` (\`parse\_header\`): validate it against the buffer size before reading or writing.
 - Evidence bundle: [`findings/F-0000-1a2b3c4d/`](findings/F-0000-1a2b3c4d/)
 

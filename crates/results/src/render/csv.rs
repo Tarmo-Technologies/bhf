@@ -3,7 +3,9 @@
 
 use crate::model::FindingsDocument;
 
-pub const CSV_HEADER: &str = "id,kind,severity,confidence,confirmation,rule_id,cwe,title,file,line,function,group,occurrences,verdict,vuln_id,purl,first_seen,evidence_dir";
+/// Columns after `evidence_dir` were added later; they stay at the end so a
+/// reader that addresses columns by position keeps working.
+pub const CSV_HEADER: &str = "id,kind,severity,confidence,confirmation,rule_id,cwe,title,file,line,function,group,occurrences,verdict,vuln_id,purl,first_seen,evidence_dir,access,access_size,region_size,region_offset,input_to_state,input_to_state_input";
 
 pub fn render_csv(doc: &FindingsDocument) -> String {
     let mut out = String::from(CSV_HEADER);
@@ -17,6 +19,9 @@ pub fn render_csv(doc: &FindingsDocument) -> String {
             .collect::<Vec<_>>()
             .join(";");
         let sca = f.sca.as_ref();
+        let access = f.fuzz.as_ref().and_then(|fuzz| fuzz.access.as_ref());
+        let region = access.and_then(|a| a.region.as_ref());
+        let number = |n: Option<String>| n.unwrap_or_default();
         let row = [
             f.id.clone(),
             f.kind.as_str().to_owned(),
@@ -42,11 +47,36 @@ pub fn render_csv(doc: &FindingsDocument) -> String {
                 .as_ref()
                 .map(|e| e.dir.clone())
                 .unwrap_or_default(),
+            access.map(|a| a.direction.clone()).unwrap_or_default(),
+            number(access.and_then(|a| a.size).map(|n| n.to_string())),
+            number(region.and_then(|r| r.size).map(|n| n.to_string())),
+            number(region.and_then(|r| r.offset).map(|n| n.to_string())),
+            input_to_state_cell(f),
+            f.fuzz
+                .as_ref()
+                .and_then(|fuzz| fuzz.input_to_state_input.clone())
+                .unwrap_or_default(),
         ];
         out.push_str(&row.iter().map(|v| cell(v)).collect::<Vec<_>>().join(","));
         out.push('\n');
     }
     out
+}
+
+/// `offset:len:cmp_kind:operand_hex` per comparison-evidence entry,
+/// `;`-separated.
+fn input_to_state_cell(f: &crate::model::Finding) -> String {
+    f.fuzz
+        .as_ref()
+        .and_then(|fuzz| fuzz.input_to_state.as_ref())
+        .map(|gates| {
+            gates
+                .iter()
+                .map(|g| format!("{}:{}:{}:{}", g.offset, g.len, g.cmp_kind, g.operand_hex))
+                .collect::<Vec<_>>()
+                .join(";")
+        })
+        .unwrap_or_default()
 }
 
 /// RFC 4180 escaping plus spreadsheet formula neutralization (OWASP CSV
@@ -88,12 +118,18 @@ mod tests {
             "{fuzz}"
         );
         assert!(fuzz.contains(",src/parse.c,42,parse_header,"));
-        assert!(fuzz.ends_with(",findings/F-0000-1a2b3c4d"));
+        assert!(
+            fuzz.ends_with(
+                ",findings/F-0000-1a2b3c4d,read,4,12,12,0:4:memcmp:48445231,min_testcase.bin"
+            ),
+            "{fuzz}"
+        );
         let sca = lines.next().unwrap();
         assert!(
             sca.contains(",CVE-2026-0001,pkg:npm/example@2.4.2,"),
             "{sca}"
         );
+        assert!(sca.ends_with(",,,,,,"), "no fuzz columns for SCA: {sca}");
         assert_eq!(lines.next(), None);
     }
 

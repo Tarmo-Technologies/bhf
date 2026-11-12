@@ -70,12 +70,13 @@ pub const MANIFEST: &[ManifestEntry] = &[
             b"close\0",
             // `__xstat` only — glibc <2.33 routed stat()/lstat() through it,
             // while 2.33+ compiles them to direct fstatat syscalls that bypass
-            // the hook (hooks/fs.rs:498). Advertising a bare `stat` claimed an
-            // interposition that does not fire on a modern host. There is no
-            // `fopen` interposer at all, so it is not listed either: a
-            // capability report that overstates coverage is worse than a short
-            // one, because an operator plans around it.
+            // the hook (hooks/fs.rs). Advertising a bare `stat` claimed an
+            // interposition that does not fire on a modern host: a capability
+            // report that overstates coverage is worse than a short one,
+            // because an operator plans around it.
             b"__xstat\0",
+            b"fopen\0",
+            b"fopen64\0",
             b"unlink\0",
             b"unlinkat\0",
             b"remove\0",

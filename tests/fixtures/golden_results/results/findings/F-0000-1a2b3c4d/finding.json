@@ -15,6 +15,30 @@
   "created_at": "2026-10-01T11:20:00Z",
   "dialect": "c11",
   "exception": {
+    "access": {
+      "address": "0x602000000010",
+      "alloc_stack": [
+        {
+          "file": "/llvm/compiler-rt/lib/asan/asan_malloc_linux.cpp",
+          "function": "malloc",
+          "line": 68
+        },
+        {
+          "file": "/src/demo/src/parse.c",
+          "function": "parse_header",
+          "line": 38
+        }
+      ],
+      "direction": "read",
+      "region": {
+        "distance": 0,
+        "kind": "heap",
+        "offset": 4,
+        "relation": "after",
+        "size": 4
+      },
+      "size": 4
+    },
     "message": "heap-buffer-overflow on address 0x602000000010",
     "name": "ASAN_HEAP_BUFFER_OVERFLOW",
     "sanitizer": "asan",
@@ -27,6 +51,34 @@
     ]
   },
   "finding_kind": "fuzz",
+  "gate_capture": {
+    "comparisons": 2,
+    "input": "min_testcase.bin",
+    "input_len": 1,
+    "reason": null,
+    "runs": 6,
+    "shim_armed": false,
+    "status": "recorded",
+    "truncated": false,
+    "unconfirmed": 0
+  },
+  "gates": [
+    {
+      "cmp_kind": "cmp",
+      "compared_with_hex": "41",
+      "len": 1,
+      "location": {
+        "file": "/src/demo/src/parse.c",
+        "function": "parse_header",
+        "line": 40
+      },
+      "offset": 0,
+      "operand_hex": "41",
+      "operands_equal": true,
+      "relation": "equal",
+      "site": "0x1a2b"
+    }
+  ],
   "harness_id": "H-C-parse",
   "id": "F-0000-1a2b3c4d",
   "rule_id": "BHF-201",

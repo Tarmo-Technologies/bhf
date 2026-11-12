@@ -1,0 +1,2212 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! Comparison evidence for one finding's input: which input bytes reach which
+//! comparison of the target.
+//!
+//! bhf's C/C++ driver (`c_runtime/bhf_driver.c`) records every comparison the
+//! instrumented code makes while `BHF_CMP_EVIDENCE` names a file: integer
+//! compares and switches from `-fsanitize-coverage=trace-cmp`, and
+//! `memcmp`/`bcmp`/`str*cmp` from the sanitizer's interceptor hooks. Replaying
+//! the finding's input once with it set lists the comparisons that input
+//! reached.
+//!
+//! A comparison counts as evidence for input bytes only when, as in
+//! RedQueen's input-to-state correspondence, one operand's bytes occur in the
+//! input AND a replay with those input bytes changed shows that operand
+//! changed the same way. A byte sequence that merely occurs in the input is
+//! never reported. For a short input every byte is also flipped once, which
+//! finds comparisons whose operand is computed from input bytes rather than
+//! copied from them (a folded range check such as `width - 1 > 31`); two
+//! replays of the unchanged input bracket the flips, and an operand that
+//! differs between identical runs (a process id, a clock) is left out.
+//!
+//! The harness's own comparisons are left out: those it makes before it
+//! enters the target (`bhf_target_enter`), which the driver discards at
+//! entry, and those whose site symbolizes to harness code.
+//!
+//! The replays are bounded: one baseline run, at most [`MAX_VERIFY_RUNS`]
+//! verification runs, [`MAX_DERIVED_INPUT`] byte flips and their two
+//! controls, each under [`RUN_TIMEOUT`], and nothing after the caller's
+//! deadline.
+
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+/// The driver variable naming the evidence file.
+pub(crate) const EVIDENCE_ENV: &str = "BHF_CMP_EVIDENCE";
+/// The driver records nothing without this string in its binary: a harness
+/// built by an older bhf ignores the variable.
+const DRIVER_MARKER: &[u8] = b"BHF_CMP_EVIDENCE";
+
+const MAGIC: u32 = 0x4546_4842;
+const VERSION: u32 = 1;
+const HEADER: usize = 16;
+const OPMAX: usize = 32;
+const RECORD: usize = 12 + 2 * OPMAX;
+
+const FLAG_IN_TARGET: u8 = 1;
+const FLAG_CONST_A: u8 = 2;
+const FLAG_CONST_B: u8 = 4;
+const FLAG_EQUAL: u8 = 8;
+
+/// One harness run's time limit.
+pub(crate) const RUN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Most verification replays per capture.
+pub(crate) const MAX_VERIFY_RUNS: usize = 48;
+/// Inputs up to this many bytes also get one replay per flipped byte.
+pub(crate) const MAX_DERIVED_INPUT: usize = 32;
+/// Occurrences of one operand in the input tried in one verification replay.
+const MAX_OCCURRENCES: usize = 64;
+/// Evidence entries kept per finding.
+pub(crate) const MAX_GATES: usize = 64;
+/// Candidate operands checked per comparison site (per site and compared
+/// value for a buffer or string comparison).
+const MAX_CANDIDATES_PER_SITE: usize = 4;
+/// Comparisons the driver keeps per run (`BHF_EV_CAP` in `bhf_driver.c`).
+const DRIVER_CAPACITY: usize = 8192;
+
+/// The comparison a record came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum CmpKind {
+    Int,
+    Switch,
+    Float,
+    Double,
+    Memcmp,
+    Strncmp,
+    Strcmp,
+    Strncasecmp,
+    Strcasecmp,
+}
+
+impl CmpKind {
+    fn from_code(code: u8) -> Option<Self> {
+        Some(match code {
+            1 => Self::Int,
+            2 => Self::Switch,
+            3 => Self::Float,
+            4 => Self::Double,
+            5 => Self::Memcmp,
+            6 => Self::Strncmp,
+            7 => Self::Strcmp,
+            8 => Self::Strncasecmp,
+            9 => Self::Strcasecmp,
+            _ => return None,
+        })
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Int => "cmp",
+            Self::Switch => "switch",
+            Self::Float => "float_cmp",
+            Self::Double => "double_cmp",
+            Self::Memcmp => "memcmp",
+            Self::Strncmp => "strncmp",
+            Self::Strcmp => "strcmp",
+            Self::Strncasecmp => "strncasecmp",
+            Self::Strcasecmp => "strcasecmp",
+        }
+    }
+
+    /// A byte-buffer or string comparison (operands in memory order), as
+    /// opposed to an integer one (operands little-endian).
+    fn is_buffer(self) -> bool {
+        matches!(
+            self,
+            Self::Memcmp | Self::Strncmp | Self::Strcmp | Self::Strncasecmp | Self::Strcasecmp
+        )
+    }
+
+    fn is_string(self) -> bool {
+        matches!(
+            self,
+            Self::Strncmp | Self::Strcmp | Self::Strncasecmp | Self::Strcasecmp
+        )
+    }
+}
+
+/// One recorded comparison.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CmpRecord {
+    pub(crate) kind: CmpKind,
+    pub(crate) a: Vec<u8>,
+    pub(crate) b: Vec<u8>,
+    pub(crate) a_const: bool,
+    pub(crate) b_const: bool,
+    pub(crate) equal: bool,
+    pub(crate) in_target: bool,
+    pub(crate) site: u32,
+}
+
+impl CmpRecord {
+    fn operand(&self, side: Side) -> &[u8] {
+        match side {
+            Side::A => &self.a,
+            Side::B => &self.b,
+        }
+    }
+
+    fn other(&self, side: Side) -> &[u8] {
+        match side {
+            Side::A => &self.b,
+            Side::B => &self.a,
+        }
+    }
+
+    fn is_const(&self, side: Side) -> bool {
+        match side {
+            Side::A => self.a_const,
+            Side::B => self.b_const,
+        }
+    }
+
+    /// A 64-bit operand that looks like a user-space pointer: a heap or stack
+    /// address moves whenever an allocation does, so it is never input state.
+    /// That includes the switches the sanitizers' own pointer checks compile
+    /// to.
+    fn is_pointer_like(&self) -> bool {
+        let pointer = |bytes: &[u8]| {
+            bytes.len() == 8 && {
+                let value = u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]));
+                (1u64 << 40..1u64 << 47).contains(&value)
+            }
+        };
+        matches!(self.kind, CmpKind::Int | CmpKind::Switch)
+            && (pointer(&self.a) || pointer(&self.b))
+    }
+}
+
+/// Which operand of a comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum Side {
+    A,
+    B,
+}
+
+/// A parsed evidence file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct EvidenceLog {
+    pub(crate) target_entered: bool,
+    pub(crate) truncated: bool,
+    pub(crate) records: Vec<CmpRecord>,
+}
+
+impl EvidenceLog {
+    /// The target's own comparisons. When the harness marked where the target
+    /// starts (the header's entry flag), only those made after it: what came
+    /// before is the harness decoding the input. A harness that never marks
+    /// entry leaves no way to tell, so all of its records count.
+    pub(crate) fn target_records(&self) -> Vec<&CmpRecord> {
+        self.records
+            .iter()
+            .filter(|r| !self.target_entered || r.in_target)
+            .filter(|r| !r.is_pointer_like())
+            .collect()
+    }
+}
+
+fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
+}
+
+/// Parse an evidence file the driver wrote.
+pub(crate) fn parse_log(bytes: &[u8]) -> Result<EvidenceLog, String> {
+    if u32_at(bytes, 0) != Some(MAGIC) {
+        return Err("the evidence file has no driver header".to_owned());
+    }
+    let version = u32_at(bytes, 4).unwrap_or(0);
+    if version != VERSION {
+        return Err(format!(
+            "the evidence file is version {version}, not {VERSION}"
+        ));
+    }
+    let count = u32_at(bytes, 8).unwrap_or(0) as usize;
+    let flags = bytes.get(12).copied().unwrap_or(0);
+    let mut records = Vec::new();
+    for index in 0..count {
+        let at = HEADER + index * RECORD;
+        let Some(record) = bytes.get(at..at + RECORD) else {
+            break;
+        };
+        let Some(kind) = CmpKind::from_code(record[0]) else {
+            continue;
+        };
+        let la = usize::from(record[1]).min(OPMAX);
+        let lb = usize::from(record[2]).min(OPMAX);
+        let rflags = record[3];
+        records.push(CmpRecord {
+            kind,
+            a: record[12..12 + la].to_vec(),
+            b: record[12 + OPMAX..12 + OPMAX + lb].to_vec(),
+            a_const: rflags & FLAG_CONST_A != 0,
+            b_const: rflags & FLAG_CONST_B != 0,
+            equal: rflags & FLAG_EQUAL != 0,
+            in_target: rflags & FLAG_IN_TARGET != 0,
+            site: u32_at(record, 4).unwrap_or(0),
+        });
+    }
+    Ok(EvidenceLog {
+        target_entered: flags & 1 != 0,
+        truncated: flags & 2 != 0,
+        records,
+    })
+}
+
+/// Where a comparison is in the source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SiteLocation {
+    pub(crate) file: String,
+    pub(crate) line: Option<u64>,
+    pub(crate) function: Option<String>,
+}
+
+/// One input span that reached a comparison (`finding.json` `gates[]`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Gate {
+    pub(crate) offset: usize,
+    pub(crate) len: usize,
+    /// The operand as the comparison saw it.
+    pub(crate) operand_hex: String,
+    /// The other operand.
+    pub(crate) compared_with_hex: String,
+    pub(crate) cmp_kind: String,
+    /// The comparison's offset in the harness executable.
+    pub(crate) site: String,
+    pub(crate) location: Option<SiteLocation>,
+    /// `equal`, `byte_swapped` or `derived`.
+    pub(crate) relation: String,
+    pub(crate) operands_equal: bool,
+}
+
+/// What a capture did (`finding.json` `gate_capture`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CaptureSummary {
+    /// The file replayed, e.g. `min_testcase.bin`.
+    pub(crate) input: String,
+    pub(crate) input_len: usize,
+    /// `recorded`, `no_input_comparisons`, `no_comparisons` or
+    /// `unavailable`.
+    pub(crate) status: String,
+    /// Why there is no evidence, when there is none.
+    pub(crate) reason: Option<String>,
+    /// Comparisons the target made on this input.
+    pub(crate) comparisons: usize,
+    /// More comparisons happened than the driver keeps.
+    pub(crate) truncated: bool,
+    /// Candidate operands whose bytes occur in the input but that were not
+    /// checked (replay budget spent) or did not follow a change of them.
+    pub(crate) unconfirmed: usize,
+    /// Harness runs this capture made.
+    pub(crate) runs: usize,
+    /// The baseline replay ran with the runtrace shim, so `runtrace.jsonl` in
+    /// the finding dir lists this input's own environment use.
+    pub(crate) shim_armed: bool,
+}
+
+/// A finished capture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Capture {
+    pub(crate) gates: Vec<Gate>,
+    pub(crate) summary: CaptureSummary,
+}
+
+impl Capture {
+    fn unavailable(input: &str, input_len: usize, reason: String) -> Self {
+        Self {
+            gates: Vec::new(),
+            summary: CaptureSummary {
+                input: input.to_owned(),
+                input_len,
+                status: "unavailable".to_owned(),
+                reason: Some(reason),
+                comparisons: 0,
+                truncated: false,
+                unconfirmed: 0,
+                runs: 0,
+                shim_armed: false,
+            },
+        }
+    }
+}
+
+/// How to replay the harness.
+pub(crate) struct Replay<'a> {
+    pub(crate) harness: &'a Path,
+    /// The finding's record: its leak rule, recorded runtime mode and
+    /// injected environment shape the replay as `bhf replay` does.
+    pub(crate) raw: &'a Value,
+    /// Scratch directory for inputs and evidence files; created and removed.
+    pub(crate) scratch: PathBuf,
+    /// Where the baseline run's runtrace events go (the shim is preloaded for
+    /// it only when this is set and the shim is found).
+    pub(crate) runtrace_log: Option<PathBuf>,
+    pub(crate) deadline: Instant,
+}
+
+/// Whether `harness` carries a driver that records comparison evidence: its
+/// binary names the variable the driver reads.
+pub(crate) fn harness_records_evidence(harness: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(harness) else {
+        return false;
+    };
+    let keep = DRIVER_MARKER.len() - 1;
+    let mut window = Vec::with_capacity(64 * 1024 + keep);
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        let read = match file.read(&mut chunk) {
+            Ok(0) | Err(_) => return false,
+            Ok(read) => read,
+        };
+        window.extend_from_slice(&chunk[..read]);
+        if window
+            .windows(DRIVER_MARKER.len())
+            .any(|candidate| candidate == DRIVER_MARKER)
+        {
+            return true;
+        }
+        let tail = window.len().saturating_sub(keep);
+        window.drain(..tail);
+    }
+}
+
+/// Replay `input` (named `input_name`) and return the comparison evidence.
+pub(crate) fn capture(replay: &Replay<'_>, input: &[u8], input_name: &str) -> Capture {
+    capture_with(replay, input, input_name, find_symbolizer())
+}
+
+/// [`capture`] with `symbolizer` (`llvm-symbolizer`) giving the comparison
+/// sites their source positions, when there is one.
+fn capture_with(
+    replay: &Replay<'_>,
+    input: &[u8],
+    input_name: &str,
+    symbolizer: Option<PathBuf>,
+) -> Capture {
+    if !replay.harness.is_file() {
+        return Capture::unavailable(
+            input_name,
+            input.len(),
+            format!(
+                "the harness binary {} was not found",
+                replay.harness.display()
+            ),
+        );
+    }
+    if !harness_records_evidence(replay.harness) {
+        return Capture::unavailable(
+            input_name,
+            input.len(),
+            "the harness was built without a driver that records comparisons \
+             (built by an earlier bhf, or not by bhf); rebuild it to record them"
+                .to_owned(),
+        );
+    }
+    if let Err(error) = std::fs::create_dir_all(&replay.scratch) {
+        return Capture::unavailable(
+            input_name,
+            input.len(),
+            format!("cannot create {}: {error}", replay.scratch.display()),
+        );
+    }
+    let capture = capture_in(replay, input, input_name, symbolizer.as_deref());
+    let _ = std::fs::remove_dir_all(&replay.scratch);
+    capture
+}
+
+fn capture_in(
+    replay: &Replay<'_>,
+    input: &[u8],
+    input_name: &str,
+    symbolizer: Option<&Path>,
+) -> Capture {
+    let mut runner = Runner::new(replay);
+    let baseline = match runner.run(input, true) {
+        Ok(log) => log,
+        Err(reason) => return Capture::unavailable(input_name, input.len(), reason),
+    };
+    // Every site the baseline reached, symbolized once: a comparison in bhf's
+    // harness code (decoding it does after entering the target, or checks of
+    // the target's result) is left out of this run and every later one.
+    let mut locations: BTreeMap<u32, SiteLocation> = BTreeMap::new();
+    let mut all_located = false;
+    if let Some(symbolizer) = symbolizer {
+        let sites: BTreeSet<u32> = baseline.target_records().iter().map(|r| r.site).collect();
+        if sites.len() <= MAX_SYMBOLIZED_SITES {
+            locations = site_locations(replay.harness, symbolizer, &sites);
+            all_located = true;
+            runner.excluded = locations
+                .iter()
+                .filter(|(_, location)| is_harness_location(location))
+                .map(|(site, _)| *site)
+                .collect();
+        }
+    }
+    let records: Vec<CmpRecord> = baseline
+        .target_records()
+        .into_iter()
+        .filter(|r| !runner.excluded.contains(&r.site))
+        .cloned()
+        .collect();
+    let mut summary = CaptureSummary {
+        input: input_name.to_owned(),
+        input_len: input.len(),
+        status: String::new(),
+        reason: None,
+        comparisons: records.len(),
+        truncated: baseline.truncated,
+        unconfirmed: 0,
+        runs: 0,
+        shim_armed: runner.shim_armed,
+    };
+    let mut gates = Vec::new();
+    if input.is_empty() {
+        summary.status = if records.is_empty() {
+            "no_comparisons"
+        } else {
+            "no_input_comparisons"
+        }
+        .to_owned();
+        summary.reason = Some(
+            "the input is empty, so no comparison operand can come from it: every scalar \
+             parameter decodes to 0 and every buffer is empty"
+                .to_owned(),
+        );
+    } else if records.is_empty() {
+        summary.status = "no_comparisons".to_owned();
+        summary.reason = Some(if baseline.target_entered {
+            "no instrumented comparison was recorded in the target on this input (code built \
+             without bhf's comparison instrumentation, such as a prebuilt library, is not \
+             observed)"
+                .to_owned()
+        } else {
+            "no instrumented comparison was recorded on this input".to_owned()
+        });
+    } else {
+        let (equal, unconfirmed) = equal_gates(&mut runner, input, &records);
+        summary.unconfirmed = unconfirmed;
+        gates.extend(equal);
+        let search = if input.len() <= MAX_DERIVED_INPUT {
+            let (derived, search) = derived_gates(&mut runner, input, &records, &gates);
+            gates.extend(derived);
+            search
+        } else {
+            DerivedSearch::TooLong
+        };
+        if gates.is_empty() {
+            summary.status = "no_input_comparisons".to_owned();
+            summary.reason = Some(no_gate_reason(
+                records.len(),
+                input.len(),
+                baseline.truncated,
+                search,
+            ));
+        } else {
+            summary.status = "recorded".to_owned();
+        }
+    }
+    summary.runs = runner.runs;
+    gates.sort_by(|a, b| {
+        (a.offset, a.len, &a.site, &a.cmp_kind).cmp(&(b.offset, b.len, &b.site, &b.cmp_kind))
+    });
+    gates.dedup_by(|a, b| {
+        a.offset == b.offset && a.len == b.len && a.site == b.site && a.cmp_kind == b.cmp_kind
+    });
+    let gate_site = |gate: &Gate| u32::from_str_radix(gate.site.trim_start_matches("0x"), 16).ok();
+    if let (Some(symbolizer), false) = (symbolizer, all_located) {
+        let sites: BTreeSet<u32> = gates.iter().filter_map(gate_site).collect();
+        if !sites.is_empty() {
+            locations = site_locations(replay.harness, symbolizer, &sites);
+        }
+    }
+    for gate in &mut gates {
+        gate.location = gate_site(gate).and_then(|site| locations.get(&site).cloned());
+    }
+    gates.retain(|gate| !gate.location.as_ref().is_some_and(is_harness_location));
+    gates.truncate(MAX_GATES);
+    if gates.is_empty() && summary.status == "recorded" {
+        summary.status = "no_input_comparisons".to_owned();
+        summary.reason = Some(
+            "the only comparisons of input bytes were in bhf's harness code, which decodes \
+             the input"
+                .to_owned(),
+        );
+    }
+    Capture { gates, summary }
+}
+
+/// How far the search for operands computed from input bytes got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DerivedSearch {
+    /// Every byte was flipped and the controls agreed.
+    Done,
+    /// The replay budget ran out first.
+    Partial,
+    /// The input is longer than [`MAX_DERIVED_INPUT`], so it was not tried.
+    TooLong,
+}
+
+/// Why comparisons were recorded but none is evidence, with what the search
+/// left out.
+fn no_gate_reason(
+    comparisons: usize,
+    input_len: usize,
+    truncated: bool,
+    search: DerivedSearch,
+) -> String {
+    let mut reason = format!(
+        "{comparisons} comparison(s) recorded; no operand followed a change of the input bytes"
+    );
+    match search {
+        DerivedSearch::Done => {}
+        DerivedSearch::Partial => reason.push_str(
+            "; the replay budget ran out before every byte was tried for operands computed \
+             from it (such as range checks)",
+        ),
+        DerivedSearch::TooLong => reason.push_str(&format!(
+            "; operands computed from input bytes (such as range checks) are searched only in \
+             inputs of up to {MAX_DERIVED_INPUT} bytes, and this one has {input_len}"
+        )),
+    }
+    if truncated {
+        reason.push_str(&format!(
+            "; the driver keeps the first {DRIVER_CAPACITY} comparisons of a run and this one \
+             made more, so later ones were not seen"
+        ));
+    }
+    reason
+}
+
+/// How an operand's bytes are laid out in the input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum Order {
+    /// The operand bytes occur in the input as they are.
+    Same,
+    /// They occur reversed: an integer read big-endian.
+    Reversed,
+}
+
+/// Operand bytes that occur in the input, at the occurrences found.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct Candidate {
+    site: u32,
+    kind: CmpKind,
+    side: Side,
+    order: Order,
+    /// The bytes to find in the input, in input order.
+    pattern: Vec<u8>,
+    compared_with: Vec<u8>,
+    equal: bool,
+}
+
+/// The input-side byte sequences of `record` worth looking for: the whole
+/// operand of a buffer or string comparison (up to the shorter string), and
+/// for an integer the full width in either byte order, else its low bytes (a
+/// narrower value the compiler widened).
+fn patterns(record: &CmpRecord, side: Side) -> Vec<(Order, Vec<u8>)> {
+    let operand = record.operand(side);
+    if operand.is_empty() {
+        return Vec::new();
+    }
+    if record.kind.is_buffer() {
+        let len = if record.kind.is_string() {
+            operand.len().min(record.other(side).len().max(1))
+        } else {
+            operand.len()
+        };
+        return vec![(Order::Same, operand[..len].to_vec())];
+    }
+    let mut out = vec![(Order::Same, operand.to_vec())];
+    if operand.len() > 1 {
+        out.push((Order::Reversed, operand.iter().rev().copied().collect()));
+    }
+    // A zero- or sign-extended narrower value: its significant low bytes.
+    let fill = if operand.last().is_some_and(|b| b & 0x80 != 0) {
+        0xff
+    } else {
+        0x00
+    };
+    let significant = operand
+        .iter()
+        .rposition(|b| *b != fill)
+        .map(|i| i + 1)
+        .unwrap_or(1);
+    if significant < operand.len() {
+        out.push((Order::Same, operand[..significant].to_vec()));
+        if significant > 1 {
+            out.push((
+                Order::Reversed,
+                operand[..significant].iter().rev().copied().collect(),
+            ));
+        }
+    }
+    out
+}
+
+/// Offsets at which `needle` occurs in `haystack`, at most `cap` of them, and
+/// how many there are in all.
+fn occurrences(haystack: &[u8], needle: &[u8], cap: usize) -> (Vec<usize>, usize) {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return (Vec::new(), 0);
+    }
+    let mut found = Vec::new();
+    let mut total = 0;
+    for (offset, window) in haystack.windows(needle.len()).enumerate() {
+        if window == needle {
+            total += 1;
+            if found.len() < cap {
+                found.push(offset);
+            }
+        }
+    }
+    (found, total)
+}
+
+/// The input byte a verification replay changes for an occurrence: the
+/// operand's first byte (lowest for an integer).
+fn changed_byte(order: Order, len: usize) -> usize {
+    match order {
+        Order::Same => 0,
+        Order::Reversed => len - 1,
+    }
+}
+
+/// Comparisons whose operand is a copy of input bytes, each confirmed by a
+/// replay in which those bytes changed and the operand changed with them.
+/// Returns the gates and the number of candidates left unconfirmed.
+fn equal_gates(runner: &mut Runner<'_>, input: &[u8], records: &[CmpRecord]) -> (Vec<Gate>, usize) {
+    // Candidate operands, with the occurrences of their bytes in the input.
+    let mut candidates: BTreeMap<Candidate, Vec<usize>> = BTreeMap::new();
+    for record in records {
+        for side in [Side::A, Side::B] {
+            if record.is_const(side) {
+                continue;
+            }
+            // The first byte order and width whose bytes occur in the input.
+            for (order, pattern) in patterns(record, side) {
+                let (found, _) = occurrences(input, &pattern, MAX_OCCURRENCES);
+                if found.is_empty() {
+                    continue;
+                }
+                let key = Candidate {
+                    site: record.site,
+                    kind: record.kind,
+                    side,
+                    order,
+                    pattern,
+                    compared_with: record.other(side).to_vec(),
+                    equal: record.equal,
+                };
+                candidates.entry(key).or_insert(found);
+                break;
+            }
+        }
+    }
+    // Strings and buffers first, then operands found in few places, then
+    // wider integers before single bytes: an operand that occurs all over a
+    // large input is the least likely to be one, so it does not spend the
+    // replay budget first.
+    let mut ordered: Vec<(Candidate, Vec<usize>)> = candidates.into_iter().collect();
+    ordered.sort_by_key(|(c, found)| {
+        (
+            !c.kind.is_buffer(),
+            found.len() > MAX_TRIED_ALONE,
+            std::cmp::Reverse(c.pattern.len()),
+            found.first().copied(),
+        )
+    });
+    let mut gates = Vec::new();
+    let mut unconfirmed = 0;
+    let mut confirmed_spans: BTreeSet<(u32, usize, usize)> = BTreeSet::new();
+    // Under AddressSanitizer every memcmp and bcmp reports the interceptor as
+    // its site, so a buffer comparison's budget is per compared value too.
+    let mut tried_at_site: BTreeMap<(u32, Option<Vec<u8>>), usize> = BTreeMap::new();
+    for (candidate, found) in ordered {
+        if found
+            .iter()
+            .all(|o| confirmed_spans.contains(&(candidate.site, *o, candidate.pattern.len())))
+        {
+            continue;
+        }
+        // A loop that compares every byte it scans gives one site many
+        // operand values; a few of them say what it does.
+        let site_key = (
+            candidate.site,
+            candidate
+                .kind
+                .is_buffer()
+                .then(|| candidate.compared_with.clone()),
+        );
+        let tried = tried_at_site.entry(site_key).or_default();
+        if *tried >= MAX_CANDIDATES_PER_SITE || !runner.budget_left(1 + MAX_VERIFY_RUNS) {
+            unconfirmed += 1;
+            continue;
+        }
+        *tried += 1;
+        let confirmed = confirm_candidate(runner, input, records, &candidate, &found);
+        if confirmed.is_empty() {
+            unconfirmed += 1;
+            continue;
+        }
+        for offset in confirmed {
+            confirmed_spans.insert((candidate.site, offset, candidate.pattern.len()));
+            gates.push(Gate {
+                offset,
+                len: candidate.pattern.len(),
+                operand_hex: hex(&input_operand(&candidate, input, offset)),
+                compared_with_hex: hex(&candidate.compared_with),
+                cmp_kind: candidate.kind.as_str().to_owned(),
+                site: format!("{:#x}", candidate.site),
+                location: None,
+                relation: match candidate.order {
+                    Order::Same => "equal",
+                    Order::Reversed => "byte_swapped",
+                }
+                .to_owned(),
+                operands_equal: candidate.equal,
+            });
+        }
+    }
+    (gates, unconfirmed)
+}
+
+/// The operand bytes as the comparison saw them, read back from the input.
+fn input_operand(candidate: &Candidate, input: &[u8], offset: usize) -> Vec<u8> {
+    let span = &input[offset..offset + candidate.pattern.len()];
+    match candidate.order {
+        Order::Same => span.to_vec(),
+        Order::Reversed => span.iter().rev().copied().collect(),
+    }
+}
+
+/// Occurrences of an operand tried one replay each when a replay changing all
+/// of them at once confirmed none.
+const MAX_TRIED_ALONE: usize = 3;
+
+/// The occurrences of `candidate` that a replay confirms: one replay changes
+/// every non-overlapping occurrence at once, each to a different value, and
+/// an occurrence is confirmed when the comparison at the same site then saw
+/// exactly its changed bytes. When that replay confirms nothing (the changes
+/// moved the path), the first few occurrences are tried alone.
+fn confirm_candidate(
+    runner: &mut Runner<'_>,
+    input: &[u8],
+    records: &[CmpRecord],
+    candidate: &Candidate,
+    found: &[usize],
+) -> Vec<usize> {
+    let len = candidate.pattern.len();
+    let mut batch = Vec::new();
+    let mut end = 0;
+    for &offset in found {
+        if offset >= end || batch.is_empty() {
+            batch.push(offset);
+            end = offset + len;
+        }
+    }
+    // The values this site's operand took on the unchanged input: a changed
+    // value it already took proves nothing.
+    let before: BTreeSet<Vec<u8>> = records
+        .iter()
+        .filter(|r| r.site == candidate.site && r.kind == candidate.kind)
+        .map(|r| r.operand(candidate.side))
+        .filter(|operand| operand.len() >= len)
+        .map(|operand| operand[..len].to_vec())
+        .collect();
+    let confirmed = confirm_occurrences(runner, input, candidate, &batch, &before);
+    if !confirmed.is_empty() || batch.len() == 1 || batch.len() > MAX_TRIED_ALONE * 3 {
+        return confirmed;
+    }
+    let mut alone = Vec::new();
+    for &offset in batch.iter().take(MAX_TRIED_ALONE) {
+        if !runner.budget_left(1 + MAX_VERIFY_RUNS) {
+            break;
+        }
+        alone.extend(confirm_occurrences(
+            runner,
+            input,
+            candidate,
+            &[offset],
+            &before,
+        ));
+    }
+    alone
+}
+
+fn confirm_occurrences(
+    runner: &mut Runner<'_>,
+    input: &[u8],
+    candidate: &Candidate,
+    offsets: &[usize],
+    before: &BTreeSet<Vec<u8>>,
+) -> Vec<usize> {
+    let len = candidate.pattern.len();
+    let at = changed_byte(candidate.order, len);
+    let original = candidate.pattern[at];
+    // Each occurrence gets its own change: bit 7 kept (a sign-extended
+    // operand keeps its high bytes), never a NUL that would end a string
+    // operand early, and never a value the operand already took.
+    let mut masks = (1u8..0x80).filter(|mask| original ^ mask != 0);
+    let mut mutated = input.to_vec();
+    let mut expected: Vec<(usize, Vec<u8>)> = Vec::new();
+    for &offset in offsets {
+        // The changed input byte is the operand's first byte in either order.
+        let next = masks.by_ref().find_map(|mask| {
+            let mut operand = operand_bytes(candidate);
+            operand[0] ^= mask;
+            (!before.contains(&operand)).then_some((mask, operand))
+        });
+        let Some((mask, operand)) = next else {
+            break;
+        };
+        mutated[offset + at] ^= mask;
+        expected.push((offset, operand));
+    }
+    let Ok(log) = runner.run(&mutated, false) else {
+        return Vec::new();
+    };
+    let seen: Vec<&[u8]> = log
+        .target_records()
+        .into_iter()
+        .filter(|r| r.site == candidate.site && r.kind == candidate.kind)
+        .map(|r| r.operand(candidate.side))
+        .collect();
+    expected
+        .into_iter()
+        .filter(|(_, operand)| {
+            seen.iter()
+                .any(|got| got.len() >= operand.len() && got[..operand.len()] == operand[..])
+        })
+        .map(|(offset, _)| offset)
+        .collect()
+}
+
+/// The candidate's bytes in operand order (lowest byte first for an integer).
+fn operand_bytes(candidate: &Candidate) -> Vec<u8> {
+    match candidate.order {
+        Order::Same => candidate.pattern.clone(),
+        Order::Reversed => candidate.pattern.iter().rev().copied().collect(),
+    }
+}
+
+/// Each comparison site's operand pairs, in execution order.
+type OperandsBySite = BTreeMap<(u32, CmpKind), Vec<(Vec<u8>, Vec<u8>)>>;
+
+/// Comparisons whose operand is computed from input bytes: each input byte
+/// is flipped once, and a byte feeds a comparison when the operand on its
+/// non-constant side changed while the comparison ran as often as before.
+/// Comparisons the copied-bytes pass already explained are skipped.
+///
+/// Two control replays of the unchanged input, one before the flips and one
+/// after them, are the reference: an operand that differs between them, or
+/// from the baseline, depends on something besides the input (a process id,
+/// a clock, an address), so its change after a flip says nothing about the
+/// flipped byte and it is left out. Without the closing control no gate is
+/// reported.
+fn derived_gates(
+    runner: &mut Runner<'_>,
+    input: &[u8],
+    records: &[CmpRecord],
+    known: &[Gate],
+) -> (Vec<Gate>, DerivedSearch) {
+    let explained: BTreeSet<String> = known.iter().map(|g| g.site.clone()).collect();
+    let base_refs: Vec<&CmpRecord> = records.iter().collect();
+    let base = operands_by_site(&base_refs);
+    let consts: BTreeMap<(u32, CmpKind), (bool, bool)> = records
+        .iter()
+        .map(|r| ((r.site, r.kind), (r.a_const, r.b_const)))
+        .collect();
+    // The flips plus the two controls.
+    let limit = runner.runs + input.len().min(MAX_DERIVED_INPUT) + 2;
+    if !runner.budget_left(limit) {
+        return (Vec::new(), DerivedSearch::Partial);
+    }
+    let Ok(control) = runner.run(input, false) else {
+        return (Vec::new(), DerivedSearch::Partial);
+    };
+    let reference = operands_by_site(&control.target_records());
+    let mut unstable = unstable_operands(&base, &reference);
+    // (site, kind, side) -> input offsets that fed it.
+    let mut fed: BTreeMap<(u32, CmpKind, Side), BTreeSet<usize>> = BTreeMap::new();
+    let mut flipped = 0;
+    for offset in 0..input.len() {
+        // One run stays for the closing control.
+        if !runner.budget_left(limit - 1) {
+            break;
+        }
+        let mut mutated = input.to_vec();
+        mutated[offset] ^= 0x5a;
+        let Ok(log) = runner.run(&mutated, false) else {
+            continue;
+        };
+        flipped += 1;
+        let after = operands_by_site(&log.target_records());
+        for (key, before) in &reference {
+            if explained.contains(&format!("{:#x}", key.0)) {
+                continue;
+            }
+            let Some(now) = after.get(key) else {
+                continue;
+            };
+            if now.len() != before.len() {
+                continue;
+            }
+            let (a_const, b_const) = consts.get(key).copied().unwrap_or((false, false));
+            for side in [Side::A, Side::B] {
+                let constant = match side {
+                    Side::A => a_const,
+                    Side::B => b_const,
+                };
+                if constant {
+                    continue;
+                }
+                if side_differs(before, now, side) {
+                    fed.entry((key.0, key.1, side)).or_default().insert(offset);
+                }
+            }
+        }
+    }
+    let closing = if runner.budget_left(limit) {
+        runner.run(input, false).ok()
+    } else {
+        None
+    };
+    let Some(closing) = closing else {
+        return (Vec::new(), DerivedSearch::Partial);
+    };
+    unstable.extend(unstable_operands(
+        &reference,
+        &operands_by_site(&closing.target_records()),
+    ));
+    fed.retain(|key, _| !unstable.contains(key));
+    let search = if flipped == input.len() {
+        DerivedSearch::Done
+    } else {
+        DerivedSearch::Partial
+    };
+    let mut gates = Vec::new();
+    for ((site, kind, side), offsets) in fed {
+        let Some((a, b)) = base.get(&(site, kind)).and_then(|v| v.first()) else {
+            continue;
+        };
+        let (operand, other) = match side {
+            Side::A => (a, b),
+            Side::B => (b, a),
+        };
+        let equal = records
+            .iter()
+            .find(|r| r.site == site && r.kind == kind)
+            .is_some_and(|r| r.equal);
+        for (start, len) in runs(&offsets) {
+            // Bytes a copied operand already explains: this comparison is a
+            // consequence of that one (the `== 0` test of a strcmp result).
+            if (start..start + len).all(|offset| {
+                known
+                    .iter()
+                    .any(|g| g.offset <= offset && offset < g.offset + g.len)
+            }) {
+                continue;
+            }
+            gates.push(Gate {
+                offset: start,
+                len,
+                operand_hex: hex(operand),
+                compared_with_hex: hex(other),
+                cmp_kind: kind.as_str().to_owned(),
+                site: format!("{site:#x}"),
+                location: None,
+                relation: "derived".to_owned(),
+                operands_equal: equal,
+            });
+        }
+    }
+    (gates, search)
+}
+
+/// Each comparison site's operand pairs, in execution order.
+fn operands_by_site(records: &[&CmpRecord]) -> OperandsBySite {
+    let mut map = OperandsBySite::new();
+    for r in records {
+        map.entry((r.site, r.kind))
+            .or_default()
+            .push((r.a.clone(), r.b.clone()));
+    }
+    map
+}
+
+/// Whether the `side` operands of two runs of one site differ.
+fn side_differs(before: &[(Vec<u8>, Vec<u8>)], now: &[(Vec<u8>, Vec<u8>)], side: Side) -> bool {
+    before.len() != now.len()
+        || before
+            .iter()
+            .zip(now)
+            .any(|((a0, b0), (a1, b1))| match side {
+                Side::A => a0 != a1,
+                Side::B => b0 != b1,
+            })
+}
+
+/// The operands that differ between two runs of the same input: a site that
+/// ran a different number of times, or whose operand on a side took
+/// different values.
+fn unstable_operands(
+    first: &OperandsBySite,
+    second: &OperandsBySite,
+) -> BTreeSet<(u32, CmpKind, Side)> {
+    let empty = Vec::new();
+    let mut unstable = BTreeSet::new();
+    for key in first.keys().chain(second.keys()) {
+        let one = first.get(key).unwrap_or(&empty);
+        let two = second.get(key).unwrap_or(&empty);
+        for side in [Side::A, Side::B] {
+            if side_differs(one, two, side) {
+                unstable.insert((key.0, key.1, side));
+            }
+        }
+    }
+    unstable
+}
+
+/// Contiguous runs of `offsets` as `(start, len)`.
+fn runs(offsets: &BTreeSet<usize>) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    for &offset in offsets {
+        match out.last_mut() {
+            Some((start, len)) if *start + *len == offset => *len += 1,
+            _ => out.push((offset, 1)),
+        }
+    }
+    out
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Runs the harness on inputs with evidence capture armed.
+struct Runner<'a> {
+    replay: &'a Replay<'a>,
+    runs: usize,
+    shim_armed: bool,
+    /// Sites in the harness's own code, dropped from every run's records.
+    excluded: BTreeSet<u32>,
+}
+
+impl<'a> Runner<'a> {
+    fn new(replay: &'a Replay<'a>) -> Self {
+        Self {
+            replay,
+            runs: 0,
+            shim_armed: false,
+            excluded: BTreeSet::new(),
+        }
+    }
+
+    /// Whether another replay fits under `limit` runs in all and the deadline.
+    fn budget_left(&self, limit: usize) -> bool {
+        self.runs < limit && Instant::now() < self.replay.deadline
+    }
+
+    /// Run `input`; `baseline` arms the runtrace shim when a log is wanted.
+    fn run(&mut self, input: &[u8], baseline: bool) -> Result<EvidenceLog, String> {
+        let index = self.runs;
+        self.runs += 1;
+        let scratch = &self.replay.scratch;
+        let input_path = scratch.join(format!("input-{index}.bin"));
+        let evidence = scratch.join(format!("evidence-{index}.bin"));
+        std::fs::write(&input_path, input)
+            .map_err(|error| format!("write {}: {error}", input_path.display()))?;
+        let _ = std::fs::remove_file(&evidence);
+        let mut command = std::process::Command::new(self.replay.harness);
+        command
+            .arg(&input_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .env(EVIDENCE_ENV, &evidence)
+            // The driver's other channels belong to a fuzz campaign.
+            .env_remove("BHF_CMP_SHM")
+            .env_remove("BHF_COV_SHM")
+            .env_remove("BHF_VP_SHM")
+            .env_remove("BHF_CMPLOG")
+            .env_remove("BHF_FRAMED");
+        for (key, value) in replay_env(self.replay.raw) {
+            command.env(key, value);
+        }
+        command.env_remove("LD_PRELOAD");
+        command.env_remove("BHF_RUNTRACE_LOG");
+        if baseline {
+            if let Some(log) = &self.replay.runtrace_log {
+                // A log from an earlier capture would not describe this run.
+                let _ = std::fs::remove_file(log);
+                if let Some(shim) = crate::auto::shim_path::locate() {
+                    command
+                        .env(
+                            "LD_PRELOAD",
+                            crate::auto::shim_path::ld_preload_value(&shim),
+                        )
+                        .env("BHF_RUNTRACE_LOG", log);
+                    self.shim_armed = true;
+                }
+            }
+        }
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("cannot run {}: {error}", self.replay.harness.display()))?;
+        let started = Instant::now();
+        let limit = RUN_TIMEOUT.min(
+            self.replay
+                .deadline
+                .saturating_duration_since(started)
+                .max(Duration::from_secs(1)),
+        );
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if started.elapsed() >= limit => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+                Err(error) => return Err(format!("wait for the harness: {error}")),
+            }
+        }
+        let _ = std::fs::remove_file(&input_path);
+        let bytes = std::fs::read(&evidence).map_err(|_| {
+            "the harness wrote no comparison evidence (its driver does not record \
+             comparisons, or it exited before its driver started)"
+                .to_owned()
+        })?;
+        let _ = std::fs::remove_file(&evidence);
+        let mut log = parse_log(&bytes)?;
+        log.records.retain(|r| !self.excluded.contains(&r.site));
+        Ok(log)
+    }
+}
+
+/// The environment of a capture replay: the fuzz child's sanitizer options
+/// without symbolization or leak checks (no report is read), and the runtime
+/// mode and injected environment the finding recorded.
+fn replay_env(raw: &Value) -> Vec<(String, String)> {
+    let mut env = Vec::new();
+    for (key, value) in crate::fuzz::sanitizer_child_env(false) {
+        let value =
+            multicore_fuzz::merge_sanitizer_options(Some(&value), "symbolize=0:detect_leaks=0");
+        env.push((key, value));
+    }
+    let runtime_mode = raw.get("runtime_mode");
+    // Without a recorded pass the shim runs in its default, observe-only mode.
+    if let Some(pass) = runtime_mode
+        .and_then(|m| m.get("pass"))
+        .and_then(Value::as_str)
+    {
+        env.push(("BHF_RUNTRACE_MODE".to_owned(), pass.to_owned()));
+    }
+    if let Some(injected) = runtime_mode
+        .and_then(|m| m.get("env_injected"))
+        .and_then(Value::as_object)
+    {
+        for (key, value) in injected {
+            if let Some(value) = value.as_str() {
+                env.push((key.clone(), value.to_owned()));
+            }
+        }
+    }
+    env
+}
+
+/// Most distinct comparison sites symbolized up front; a run reaching more
+/// has only its evidence sites symbolized, after the search.
+const MAX_SYMBOLIZED_SITES: usize = 4096;
+
+/// Source positions of comparison sites from the harness's debug info, by
+/// `llvm-symbolizer`: the innermost function at each site, so target code
+/// inlined into the harness keeps its own position. A site without debug
+/// info, or inside the sanitizer runtime (under AddressSanitizer every
+/// `memcmp` and `bcmp` reports its interceptor as the site), is absent.
+fn site_locations(
+    harness: &Path,
+    symbolizer: &Path,
+    sites: &BTreeSet<u32>,
+) -> BTreeMap<u32, SiteLocation> {
+    let mut located = BTreeMap::new();
+    let Some(base) = elf_link_base(harness) else {
+        return located;
+    };
+    // A return address: the comparison is the instruction before it.
+    let addresses: Vec<(u32, u64)> = sites
+        .iter()
+        .map(|site| (*site, (base + u64::from(*site)).saturating_sub(1)))
+        .collect();
+    let mut command = std::process::Command::new(symbolizer);
+    command
+        .arg(format!("--obj={}", harness.display()))
+        .arg("--functions=linkage")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        // A debuginfod lookup could wait on the network.
+        .env("DEBUGINFOD_URLS", "");
+    for (_, address) in &addresses {
+        command.arg(format!("{address:#x}"));
+    }
+    let Ok(output) =
+        crate::command_output::output_with_timeout(&mut command, Duration::from_secs(10))
+    else {
+        return located;
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let blocks: Vec<&str> = text.split("\n\n").collect();
+    for ((site, _), block) in addresses.iter().zip(blocks) {
+        let mut lines = block.lines().filter(|l| !l.trim().is_empty());
+        let function = lines.next().map(str::trim).unwrap_or("??");
+        let position = lines.next().map(str::trim).unwrap_or("??");
+        if function == "??" || actionability::is_runtime_noise_frame(function, None) {
+            continue;
+        }
+        let mut parts = position.rsplitn(3, ':');
+        let _column = parts.next();
+        let line = parts.next().and_then(|l| l.parse::<u64>().ok());
+        let Some(file) = parts.next().filter(|f| !f.is_empty() && *f != "??") else {
+            continue;
+        };
+        if actionability::is_runtime_noise_frame(function, Some(file)) {
+            continue;
+        }
+        located.insert(
+            *site,
+            SiteLocation {
+                file: file.to_owned(),
+                line: line.filter(|l| *l > 0),
+                function: Some(function.to_owned()),
+            },
+        );
+    }
+    located
+}
+
+/// Whether a comparison site is in bhf's harness or runtime code rather than
+/// the target's: the harness compares input bytes while decoding them, which
+/// says nothing about the target.
+fn is_harness_location(location: &SiteLocation) -> bool {
+    actionability::is_harness_frame(
+        location.function.as_deref().unwrap_or_default(),
+        Some(&location.file),
+    )
+}
+
+fn find_symbolizer() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("ASAN_SYMBOLIZER_PATH").map(PathBuf::from) {
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    which::which("llvm-symbolizer").ok().or_else(|| {
+        (14..=24)
+            .rev()
+            .find_map(|version| which::which(format!("llvm-symbolizer-{version}")).ok())
+    })
+}
+
+/// The link-time address the driver's `__executable_start` corresponds to:
+/// 0 for a position-independent executable, the first loadable segment's
+/// address otherwise. ELF64 little-endian only.
+fn elf_link_base(path: &Path) -> Option<u64> {
+    use std::io::Read;
+    let mut header = vec![0u8; 4096];
+    let mut file = std::fs::File::open(path).ok()?;
+    let read = file.read(&mut header).ok()?;
+    header.truncate(read);
+    if header.get(..4)? != b"\x7fELF" || header.get(4)? != &2 || header.get(5)? != &1 {
+        return None;
+    }
+    let u16_at = |at: usize| -> Option<u16> {
+        Some(u16::from_le_bytes(header.get(at..at + 2)?.try_into().ok()?))
+    };
+    let u64_at = |at: usize| -> Option<u64> {
+        Some(u64::from_le_bytes(header.get(at..at + 8)?.try_into().ok()?))
+    };
+    match u16_at(16)? {
+        3 => return Some(0),
+        2 => {}
+        _ => return None,
+    }
+    let phoff = usize::try_from(u64_at(32)?).ok()?;
+    let phentsize = usize::from(u16_at(54)?);
+    let phnum = usize::from(u16_at(56)?);
+    (0..phnum)
+        .filter_map(|index| {
+            let at = phoff + index * phentsize;
+            let kind = u32::from_le_bytes(header.get(at..at + 4)?.try_into().ok()?);
+            (kind == 1).then(|| u64_at(at + 16)).flatten()
+        })
+        .min()
+}
+
+/// Total time `bhf auto` spends recording comparison evidence after fuzzing.
+pub(crate) const PASS_BUDGET: Duration = Duration::from_secs(120);
+/// Time for one finding's capture.
+pub(crate) const PER_FINDING: Duration = Duration::from_secs(20);
+
+/// The input explain and the capture use: `min_testcase.bin` when the
+/// finding has one, else `testcase.bin`, as `(file name, bytes)`.
+pub(crate) fn preferred_input(finding_dir: &Path) -> Option<(&'static str, Vec<u8>)> {
+    ["min_testcase.bin", "testcase.bin"]
+        .into_iter()
+        .find_map(|name| Some((name, std::fs::read(finding_dir.join(name)).ok()?)))
+}
+
+/// The harness binary a finding replays against, as minimization finds it.
+pub(crate) fn harness_for_finding(
+    work_dir: &Path,
+    finding_dir: &Path,
+    raw: &Value,
+) -> Option<PathBuf> {
+    let text = |key: &str| raw.get(key).and_then(Value::as_str).map(str::to_owned);
+    let pick = crate::auto::minimize_pass::Pick {
+        id: text("id").unwrap_or_default(),
+        dir: finding_dir.to_path_buf(),
+        harness_id: text("harness_id"),
+        fixture_path: text("fixture_path"),
+    };
+    crate::auto::minimize_pass::harness_for(work_dir, &pick)
+}
+
+/// After fuzzing and minimization, `bhf auto` records the comparison evidence
+/// of every runtime finding whose harness can record it, replaying its
+/// preferred input, and the environment that replay touched. A finding whose
+/// recorded capture already covers that input is left alone. Bounded by
+/// [`PASS_BUDGET`]; returns how many findings were recorded and how many were
+/// left for lack of time.
+pub(crate) fn run_pass(work_dir: &Path) -> (usize, usize) {
+    let findings_dir = corpus::layout::findings_dir(work_dir);
+    let Ok(entries) = std::fs::read_dir(&findings_dir) else {
+        return (0, 0);
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    dirs.sort();
+    let started = Instant::now();
+    let (mut recorded_count, mut skipped) = (0, 0);
+    for dir in dirs {
+        let path = dir.join("finding.json");
+        let Some(raw) = std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        else {
+            continue;
+        };
+        if !matches!(
+            raw.get("classification").and_then(Value::as_str),
+            Some("unhandled" | "oracle")
+        ) {
+            continue;
+        }
+        let Some((name, bytes)) = preferred_input(&dir) else {
+            continue;
+        };
+        if recorded(&raw)
+            .is_some_and(|c| c.summary.input == name && c.summary.input_len == bytes.len())
+        {
+            continue;
+        }
+        let Some(harness) = harness_for_finding(work_dir, &dir, &raw) else {
+            continue;
+        };
+        if !harness_records_evidence(&harness) {
+            continue;
+        }
+        let remaining = PASS_BUDGET.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            skipped += 1;
+            continue;
+        }
+        let replay = Replay {
+            harness: &harness,
+            raw: &raw,
+            scratch: dir.join(".gate-capture"),
+            runtrace_log: Some(dir.join(FINDING_RUNTRACE)),
+            deadline: Instant::now() + PER_FINDING.min(remaining),
+        };
+        let capture = capture(&replay, &bytes, name);
+        match write_capture(&path, &capture) {
+            Ok(()) => recorded_count += 1,
+            Err(error) => bhfeprintln!(
+                "bhf: comparison evidence for {} not written: {error}",
+                dir.display()
+            ),
+        }
+    }
+    (recorded_count, skipped)
+}
+
+/// The runtrace log of a finding's own capture replay, in its finding dir.
+pub(crate) const FINDING_RUNTRACE: &str = "runtrace.jsonl";
+
+/// Store `capture` in the `finding.json` at `path`.
+pub(crate) fn write_capture(path: &Path, capture: &Capture) -> std::io::Result<()> {
+    let bytes = std::fs::read(path)?;
+    let mut value: Value = serde_json::from_slice(&bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let (gates, summary) = record_fields(capture);
+    let Some(object) = value.as_object_mut() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "finding.json is not a JSON object",
+        ));
+    };
+    object.insert("gates".to_owned(), gates);
+    object.insert("gate_capture".to_owned(), summary);
+    corpus::finding::append_history(&mut value, "auto", &["gates", "gate_capture"]);
+    std::fs::write(path, serde_json::to_vec_pretty(&value)?)
+}
+
+/// The capture as `finding.json` stores it: `gates` and `gate_capture`.
+pub(crate) fn record_fields(capture: &Capture) -> (Value, Value) {
+    (
+        serde_json::to_value(&capture.gates).unwrap_or_else(|_| json!([])),
+        serde_json::to_value(&capture.summary).unwrap_or_else(|_| json!({})),
+    )
+}
+
+/// The capture a finding records, if any.
+pub(crate) fn recorded(raw: &Value) -> Option<Capture> {
+    let summary: CaptureSummary = serde_json::from_value(raw.get("gate_capture")?.clone()).ok()?;
+    let gates = raw
+        .get("gates")
+        .and_then(Value::as_array)
+        .map(|gates| {
+            gates
+                .iter()
+                .filter_map(|gate| serde_json::from_value::<Gate>(gate.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(Capture { gates, summary })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(kind: u8, flags: u8, site: u32, a: &[u8], b: &[u8]) -> Vec<u8> {
+        let mut out = vec![0u8; RECORD];
+        out[0] = kind;
+        out[1] = a.len() as u8;
+        out[2] = b.len() as u8;
+        out[3] = flags;
+        out[4..8].copy_from_slice(&site.to_le_bytes());
+        out[12..12 + a.len()].copy_from_slice(a);
+        out[12 + OPMAX..12 + OPMAX + b.len()].copy_from_slice(b);
+        out
+    }
+
+    fn log_bytes(flags: u8, records: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&MAGIC.to_le_bytes());
+        out.extend_from_slice(&VERSION.to_le_bytes());
+        out.extend_from_slice(&(records.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[flags, 0, 0, 0]);
+        for r in records {
+            out.extend_from_slice(r);
+        }
+        out
+    }
+
+    #[test]
+    fn parses_driver_records_and_keeps_only_the_targets_own() {
+        let bytes = log_bytes(
+            1,
+            &[
+                // The harness's decoding, before it entered the target.
+                record(1, 0, 0x10, &[4, 0, 0, 0], &[8, 0, 0, 0]),
+                record(7, 1 | 8, 0x20, b"WIDGET", b"WIDGET"),
+                record(1, 1 | 2, 0x30, &[0x42], &[0x41]),
+                // A heap pointer compare.
+                record(
+                    1,
+                    1,
+                    0x40,
+                    &0x5020_0000_0010u64.to_le_bytes(),
+                    &0u64.to_le_bytes(),
+                ),
+            ],
+        );
+        let log = parse_log(&bytes).unwrap();
+        assert!(log.target_entered && !log.truncated);
+        assert_eq!(log.records.len(), 4);
+        let own = log.target_records();
+        assert_eq!(own.len(), 2, "{own:?}");
+        assert_eq!(own[0].kind, CmpKind::Strcmp);
+        assert!(own[0].equal && !own[0].a_const);
+        assert!(own[1].a_const);
+        assert_eq!(
+            parse_log(b"nope").unwrap_err(),
+            "the evidence file has no driver header"
+        );
+        // The target was entered but compared nothing: the harness's records
+        // are not the target's.
+        let decoding_only = log_bytes(
+            1,
+            &[
+                record(1, 0, 0x10, &[4, 0, 0, 0], &[8, 0, 0, 0]),
+                record(1, 2, 0x30, &[0x25], &[0x41]),
+            ],
+        );
+        assert!(parse_log(&decoding_only)
+            .unwrap()
+            .target_records()
+            .is_empty());
+        // A harness that never marks entry: every record counts.
+        let unmarked = log_bytes(0, &[record(1, 0, 0x10, &[4, 0, 0, 0], &[8, 0, 0, 0])]);
+        assert_eq!(parse_log(&unmarked).unwrap().target_records().len(), 1);
+    }
+
+    #[test]
+    fn a_reason_without_evidence_says_what_was_not_searched() {
+        let done = no_gate_reason(4, 8, false, DerivedSearch::Done);
+        assert_eq!(
+            done,
+            "4 comparison(s) recorded; no operand followed a change of the input bytes"
+        );
+        let long = no_gate_reason(4, 40, false, DerivedSearch::TooLong);
+        assert!(
+            long.contains("searched only in inputs of up to 32 bytes, and this one has 40"),
+            "{long}"
+        );
+        let partial = no_gate_reason(4, 8, true, DerivedSearch::Partial);
+        assert!(partial.contains("replay budget ran out"), "{partial}");
+        assert!(
+            partial.contains("keeps the first 8192 comparisons"),
+            "{partial}"
+        );
+    }
+
+    #[test]
+    fn operands_that_differ_between_identical_runs_are_unstable() {
+        let a = |value: u8| (vec![value, 0, 0, 0], vec![1, 0, 0, 0]);
+        let mut first = OperandsBySite::new();
+        first.insert((0x10, CmpKind::Int), vec![a(7)]);
+        first.insert((0x20, CmpKind::Int), vec![a(9)]);
+        first.insert((0x30, CmpKind::Int), vec![a(3)]);
+        let mut second = first.clone();
+        second.insert((0x10, CmpKind::Int), vec![a(8)]);
+        second.insert((0x30, CmpKind::Int), vec![a(3), a(3)]);
+        let unstable = unstable_operands(&first, &second);
+        assert!(unstable.contains(&(0x10, CmpKind::Int, Side::A)));
+        assert!(!unstable.contains(&(0x10, CmpKind::Int, Side::B)));
+        assert!(!unstable.contains(&(0x20, CmpKind::Int, Side::A)));
+        // A site that ran a different number of times is unstable on both sides.
+        assert!(unstable.contains(&(0x30, CmpKind::Int, Side::A)));
+        assert!(unstable.contains(&(0x30, CmpKind::Int, Side::B)));
+    }
+
+    #[test]
+    fn integer_operands_are_looked_up_in_both_byte_orders_and_narrowed() {
+        let r = CmpRecord {
+            kind: CmpKind::Int,
+            a: vec![0x5a, 0x4d, 0, 0],
+            b: vec![0x4d, 0x5a, 0, 0],
+            a_const: false,
+            b_const: true,
+            equal: false,
+            in_target: true,
+            site: 1,
+        };
+        let found = patterns(&r, Side::A);
+        assert!(found.contains(&(Order::Same, vec![0x5a, 0x4d, 0, 0])));
+        assert!(found.contains(&(Order::Reversed, vec![0, 0, 0x4d, 0x5a])));
+        assert!(found.contains(&(Order::Same, vec![0x5a, 0x4d])));
+        assert!(found.contains(&(Order::Reversed, vec![0x4d, 0x5a])));
+        // A sign-extended byte narrows to that byte.
+        let negative = CmpRecord {
+            a: vec![0xfb, 0xff, 0xff, 0xff],
+            ..r.clone()
+        };
+        assert!(patterns(&negative, Side::A).contains(&(Order::Same, vec![0xfb])));
+        // A string operand is cut to the shorter string.
+        let string = CmpRecord {
+            kind: CmpKind::Strcmp,
+            a: b"WIDGETS-AND-MORE".to_vec(),
+            b: b"WIDGET".to_vec(),
+            ..r
+        };
+        assert_eq!(
+            patterns(&string, Side::A),
+            vec![(Order::Same, b"WIDGET".to_vec())]
+        );
+    }
+
+    #[test]
+    fn occurrences_are_capped_but_counted() {
+        let (found, total) = occurrences(b"abab_ab", b"ab", 2);
+        assert_eq!(found, vec![0, 2]);
+        assert_eq!(total, 3);
+        assert_eq!(occurrences(b"", b"a", 4), (Vec::new(), 0));
+    }
+
+    #[test]
+    fn runs_merge_contiguous_offsets() {
+        let offsets: BTreeSet<usize> = [4, 5, 6, 7, 9].into_iter().collect();
+        assert_eq!(runs(&offsets), vec![(4, 4), (9, 1)]);
+    }
+
+    #[test]
+    fn a_recorded_capture_round_trips_through_finding_json() {
+        let capture = Capture {
+            gates: vec![Gate {
+                offset: 0,
+                len: 6,
+                operand_hex: hex(b"WIDGET"),
+                compared_with_hex: hex(b"WIDGET"),
+                cmp_kind: "strcmp".to_owned(),
+                site: "0x20".to_owned(),
+                location: None,
+                relation: "equal".to_owned(),
+                operands_equal: true,
+            }],
+            summary: CaptureSummary {
+                input: "min_testcase.bin".to_owned(),
+                input_len: 6,
+                status: "recorded".to_owned(),
+                reason: None,
+                comparisons: 3,
+                truncated: false,
+                unconfirmed: 0,
+                runs: 2,
+                shim_armed: false,
+            },
+        };
+        let (gates, summary) = record_fields(&capture);
+        let raw = json!({"gates": gates, "gate_capture": summary});
+        assert_eq!(recorded(&raw), Some(capture));
+        assert!(recorded(&json!({})).is_none());
+    }
+}
+
+/// End to end through bhf's real driver: AddressSanitizer harnesses built
+/// the way bhf builds them (trace-cmp coverage, the driver uninstrumented).
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod harness_tests {
+    use super::*;
+    use std::process::Command;
+
+    const TARGET: &str = r#"
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+#include <stdlib.h>
+#include <time.h>
+#include <unistd.h>
+extern void bhf_target_enter(void);
+/* Not constants, so the compiler keeps the library calls. */
+volatile size_t tag_len = 5;
+volatile size_t field_len = 4;
+volatile size_t name_len = 6;
+__attribute__((noinline)) int parse_record(const char *s, const uint8_t *raw, size_t n) {
+    if (getenv("WIDGET_MODE")) return 0;
+    if (strcmp(s, "WIDGET") == 0) {
+        volatile char *p = malloc(2);
+        p[3] = 1;
+        free((void *)p);
+        return 1;
+    }
+    if (n >= 13 && memcmp(raw + 8, "WXYZQ", tag_len) == 0) {
+        volatile char *p = malloc(2);
+        p[4] = 1;
+        free((void *)p);
+        return 2;
+    }
+    return 0;
+}
+__attribute__((noinline)) int copy_at(uint32_t width) {
+    if (width == 0 || width > 32) return 0;
+    volatile char *p = malloc(4);
+    p[width] = 1;
+    free((void *)p);
+    return 1;
+}
+/* Compares only values the input does not decide: the process id and a
+ * clock reading, which differ from run to run. */
+__attribute__((noinline)) int check_host(void) {
+    volatile int pid = getpid();
+    if (pid == 1) return 0;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    volatile long nanos = ts.tv_nsec;
+    if ((nanos & 0xffff) == 0x1234) return 0;
+    return 1;
+}
+/* Reads input bytes but compares nothing. */
+__attribute__((noinline)) int mix(const uint8_t *raw, const char *s) {
+    (void)s;
+    return raw[1] * 3 + raw[2];
+}
+__attribute__((noinline)) int check_name(const uint8_t *raw, const char *s) {
+    (void)raw;
+    return strncmp(s + 1, "WIDGET", name_len) == 0;
+}
+/* Six fields, each checked by its own memcmp. */
+__attribute__((noinline)) int parse_header(const uint8_t *p) {
+    if (memcmp(p, "HDR1", field_len)) return 0;
+    if (memcmp(p + 4, "VER2", field_len)) return 1;
+    if (memcmp(p + 8, "TYP3", field_len)) return 2;
+    if (memcmp(p + 12, "LEN4", field_len)) return 3;
+    if (memcmp(p + 16, "CRC5", field_len)) return 4;
+    if (memcmp(p + 20, "END6", field_len)) return 5;
+    return 6;
+}
+int bhf_run_one(const uint8_t *data, size_t size) {
+    /* The harness's own decoding: a NUL-terminated copy of the input and a
+     * 4-byte field. Its comparisons are not the target's. */
+    char *s = malloc(size + 1);
+    memcpy(s, data, size);
+    s[size] = 0;
+    int r;
+    if (size >= 3 && (data[0] == '!' || data[0] == '%')) {
+        /* More decoding: neutralise every '%' after the first byte. The
+         * target is chosen before entry, so the harness compares nothing
+         * after it. */
+        int (*target)(const uint8_t *, const char *) = data[0] == '!' ? mix : check_name;
+        for (size_t i = 1; i < size; i++)
+            if (s[i] == '%') s[i] = ' ';
+        bhf_target_enter();
+        r = target(data, s);
+    } else if (size >= 3 && data[0] == '?') {
+        bhf_target_enter();
+        r = mix(data, s);
+        /* The harness checks an input byte after the call: its own
+         * comparison, not the target's. */
+        if (data[1] == 'Q') r = 0;
+    } else if (size >= 1 && data[0] == '$') {
+        bhf_target_enter();
+        r = check_host();
+    } else if (size >= 25 && data[0] == '&') {
+        bhf_target_enter();
+        r = parse_header(data + 1);
+    } else {
+        uint32_t width = 0;
+        int ranged = size >= 8 && data[0] == '#';
+        if (ranged) memcpy(&width, data + 4, 4);
+        bhf_target_enter();
+        r = ranged ? copy_at(width) : parse_record(s + 2, data, size);
+    }
+    free(s);
+    return r;
+}
+"#;
+
+    fn clang() -> bool {
+        Command::new("clang")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    /// Build the target and bhf's driver into an ASan harness in `dir`.
+    fn build(dir: &Path) -> Option<PathBuf> {
+        let driver = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../c_runtime/bhf_driver.c");
+        std::fs::write(dir.join("target.c"), TARGET).unwrap();
+        let run = |args: &[&str]| {
+            Command::new("clang")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        // The generated Makefile's sanitizer set.
+        let ok = run(&[
+            "-O1",
+            "-g",
+            "-fsanitize=address,undefined",
+            "-fno-sanitize=function,vptr,alignment",
+            "-fsanitize-coverage=trace-pc-guard,trace-cmp",
+            "-c",
+            "target.c",
+            "-o",
+            "target.o",
+        ]) && run(&[
+            "-O1",
+            "-g",
+            "-c",
+            driver.to_str().unwrap(),
+            "-o",
+            "driver.o",
+        ]) && run(&[
+            "-fsanitize=address,undefined",
+            "target.o",
+            "driver.o",
+            "-o",
+            "main",
+        ]);
+        ok.then(|| dir.join("main"))
+    }
+
+    /// The runtrace shim this checkout built, if it was built.
+    fn built_shim() -> Option<PathBuf> {
+        let target = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target"));
+        ["debug", "release"]
+            .into_iter()
+            .map(|profile| target.join(profile).join("libbhf_runtrace_shim.so"))
+            .find(|path| path.is_file())
+    }
+
+    fn capture_for(harness: &Path, scratch: &Path, input: &[u8]) -> Capture {
+        let raw = json!({});
+        let replay = Replay {
+            harness,
+            raw: &raw,
+            scratch: scratch.join("capture"),
+            runtrace_log: None,
+            deadline: Instant::now() + Duration::from_secs(60),
+        };
+        capture(&replay, input, "testcase.bin")
+    }
+
+    /// As [`capture_for`], with no symbolizer: nothing can tell harness code
+    /// from target code by its source position.
+    fn capture_unsymbolized(harness: &Path, scratch: &Path, input: &[u8]) -> Capture {
+        let raw = json!({});
+        let replay = Replay {
+            harness,
+            raw: &raw,
+            scratch: scratch.join("capture-unsymbolized"),
+            runtrace_log: None,
+            deadline: Instant::now() + Duration::from_secs(60),
+        };
+        capture_with(&replay, input, "testcase.bin", None)
+    }
+
+    /// An AddressSanitizer harness with bhf's driver whose target compares
+    /// input bytes 2.. with `strcmp(s, "WIDGET")`, or `None` without clang.
+    pub(crate) fn harness() -> Option<(tempfile::TempDir, PathBuf)> {
+        if !clang() {
+            eprintln!("skipping: clang not installed");
+            return None;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let Some(main) = build(dir.path()) else {
+            eprintln!("skipping: clang cannot build an AddressSanitizer harness here");
+            return None;
+        };
+        Some((dir, main))
+    }
+
+    #[test]
+    fn a_strcmp_gate_is_recorded_at_its_input_offset() {
+        let Some((dir, main)) = harness() else {
+            return;
+        };
+        assert!(harness_records_evidence(&main));
+        let capture = capture_for(&main, dir.path(), b"\x05\x00WIDGET");
+        assert_eq!(capture.summary.status, "recorded", "{capture:?}");
+        let gate = capture
+            .gates
+            .iter()
+            .find(|g| g.cmp_kind == "strcmp")
+            .unwrap_or_else(|| panic!("no strcmp evidence: {capture:?}"));
+        assert_eq!((gate.offset, gate.len), (2, 6), "{gate:?}");
+        assert_eq!(gate.operand_hex, hex(b"WIDGET"));
+        assert_eq!(gate.compared_with_hex, hex(b"WIDGET"));
+        assert!(gate.operands_equal);
+        assert_eq!(gate.relation, "equal");
+        if find_symbolizer().is_some() {
+            let location = gate.location.as_ref().expect("symbolized site");
+            assert_eq!(
+                location.function.as_deref(),
+                Some("parse_record"),
+                "{location:?}"
+            );
+            assert!(location.file.ends_with("target.c"), "{location:?}");
+        }
+        // The harness's own decoding compared input bytes too ('#' at byte
+        // 0); it ran before the target and is not evidence.
+        assert!(
+            capture.gates.iter().all(|g| g.offset >= 2),
+            "{:?}",
+            capture.gates
+        );
+    }
+
+    #[test]
+    fn a_memcmp_gate_compiled_to_bcmp_is_recorded_at_its_input_offset() {
+        let Some((dir, main)) = harness() else {
+            return;
+        };
+        let capture = capture_for(&main, dir.path(), b"\x05\x00nopeABWXYZQ");
+        let gate = capture
+            .gates
+            .iter()
+            .find(|g| g.cmp_kind == "memcmp")
+            .unwrap_or_else(|| panic!("no memcmp evidence: {capture:?}"));
+        assert_eq!((gate.offset, gate.len), (8, 5), "{gate:?}");
+        assert_eq!(gate.operand_hex, hex(b"WXYZQ"));
+        assert!(gate.operands_equal);
+    }
+
+    /// A large seed-like input holds every single-byte value many times over;
+    /// none of that is evidence. Only the comparison that read input bytes
+    /// is reported.
+    #[test]
+    fn coincidental_bytes_of_a_large_input_are_not_reported() {
+        let Some((dir, main)) = harness() else {
+            return;
+        };
+        let mut input = b"\x05\x00WIDGET\x00".to_vec();
+        let mut state = 0x2545_f491_u32;
+        for _ in 0..40_000 {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            input.push(match (state >> 16) % 5 {
+                0 => 0,
+                1 => b'0',
+                2 => b'1',
+                3 => 1,
+                _ => (state >> 24) as u8,
+            });
+        }
+        let capture = capture_for(&main, dir.path(), &input);
+        assert!(!capture.gates.is_empty(), "{capture:?}");
+        for gate in &capture.gates {
+            assert!(
+                gate.offset >= 2 && gate.offset + gate.len <= 8,
+                "only the strcmp operand at bytes 2..8 is evidence: {gate:?}"
+            );
+        }
+    }
+
+    /// A folded range check (`width == 0 || width > 32` compiles to one
+    /// compare of `width - 1`) has no operand equal to input bytes; flipping
+    /// each byte of a short input finds the bytes that feed it.
+    #[test]
+    fn a_range_check_operand_is_traced_to_the_bytes_it_is_computed_from() {
+        let Some((dir, main)) = harness() else {
+            return;
+        };
+        let capture = capture_for(&main, dir.path(), b"#...\x0f\x00\x00\x00");
+        let derived: Vec<&Gate> = capture
+            .gates
+            .iter()
+            .filter(|g| g.relation == "derived" || g.relation == "equal")
+            .filter(|g| g.offset >= 4)
+            .collect();
+        assert!(
+            derived.iter().any(|g| g.offset == 4),
+            "byte 4 (the low byte of width) feeds the range check: {capture:?}"
+        );
+        assert!(capture.summary.runs > 1, "{capture:?}");
+    }
+
+    /// Without `BHF_CMP_EVIDENCE` the driver records nothing, so a fuzz
+    /// campaign pays nothing for it; and an empty input says why it has none.
+    #[test]
+    fn evidence_is_recorded_only_on_request_and_an_empty_input_says_so() {
+        let Some((dir, main)) = harness() else {
+            return;
+        };
+        let input = dir.path().join("in.bin");
+        std::fs::write(&input, b"\x05\x00WIDGEX").unwrap();
+        let evidence = dir.path().join("evidence.bin");
+        let status = Command::new(&main).arg(&input).status().unwrap();
+        assert!(status.success());
+        assert!(!evidence.exists());
+        let capture = capture_for(&main, dir.path(), b"");
+        assert!(capture.gates.is_empty());
+        assert!(
+            capture
+                .summary
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("empty")),
+            "{capture:?}"
+        );
+    }
+
+    /// A comparison of values that differ between identical runs (a process
+    /// id, a clock reading) changes on every replay whatever byte changed;
+    /// it is not computed from the input and is not evidence.
+    #[test]
+    fn a_comparison_that_varies_between_identical_runs_is_not_evidence() {
+        let Some((dir, main)) = harness() else {
+            return;
+        };
+        let capture = capture_for(&main, dir.path(), b"$abcdefg");
+        assert!(capture.summary.comparisons > 0, "{capture:?}");
+        assert!(capture.gates.is_empty(), "{:?}", capture.gates);
+        assert_eq!(
+            capture.summary.status, "no_input_comparisons",
+            "{capture:?}"
+        );
+    }
+
+    /// A target that compares nothing: the harness's own decoding compared
+    /// every input byte before entering it, and none of that is the
+    /// target's, with or without a symbolizer to name the harness code.
+    #[test]
+    fn a_target_without_comparisons_has_none_whatever_the_harness_compared() {
+        let Some((dir, main)) = harness() else {
+            return;
+        };
+        for capture in [
+            capture_for(&main, dir.path(), b"!abc%efg"),
+            capture_unsymbolized(&main, dir.path(), b"!abc%efg"),
+        ] {
+            assert!(capture.gates.is_empty(), "{:?}", capture.gates);
+            assert_eq!(capture.summary.status, "no_comparisons", "{capture:?}");
+            assert_eq!(capture.summary.comparisons, 0, "{capture:?}");
+            let reason = capture.summary.reason.as_deref().unwrap_or_default();
+            assert!(
+                reason.contains("no instrumented comparison was recorded in the target"),
+                "{reason}"
+            );
+        }
+    }
+
+    /// A comparison the harness makes after entering the target (checking
+    /// an input byte after the call) is harness code, located as such, and
+    /// neither evidence nor counted as the target's.
+    #[test]
+    fn a_harness_comparison_after_target_entry_is_not_the_targets() {
+        let Some((dir, main)) = harness() else {
+            return;
+        };
+        if find_symbolizer().is_none() {
+            eprintln!("skipping: no llvm-symbolizer to locate harness code");
+            return;
+        }
+        let capture = capture_for(&main, dir.path(), b"?Qcdefgh");
+        assert!(capture.gates.is_empty(), "{:?}", capture.gates);
+        assert_eq!(capture.summary.status, "no_comparisons", "{capture:?}");
+        assert_eq!(capture.summary.comparisons, 0, "{capture:?}");
+    }
+
+    /// The harness decodes a large input with a comparison per byte before
+    /// it enters the target; those records must not use up the driver's
+    /// capacity before the target's own comparison is recorded.
+    #[test]
+    fn harness_decoding_before_the_target_does_not_crowd_out_its_comparisons() {
+        let Some((dir, main)) = harness() else {
+            return;
+        };
+        let mut input = b"%WIDGET".to_vec();
+        input.extend(std::iter::repeat_n(b'x', 9000));
+        for capture in [
+            capture_for(&main, dir.path(), &input),
+            capture_unsymbolized(&main, dir.path(), &input),
+        ] {
+            assert!(!capture.summary.truncated, "{capture:?}");
+            let gate = capture
+                .gates
+                .iter()
+                .find(|g| g.cmp_kind == "strncmp")
+                .unwrap_or_else(|| panic!("no strncmp evidence: {capture:?}"));
+            assert_eq!((gate.offset, gate.len), (1, 6), "{gate:?}");
+            assert!(gate.operands_equal, "{gate:?}");
+            assert!(
+                capture
+                    .gates
+                    .iter()
+                    .all(|g| g.cmp_kind == "strncmp" || g.offset >= 1),
+                "{:?}",
+                capture.gates
+            );
+        }
+    }
+
+    /// Under AddressSanitizer every memcmp reports the interceptor as its
+    /// call site, so six field checks share one site; each field is still
+    /// confirmed on its own.
+    #[test]
+    fn every_field_checked_by_memcmp_is_confirmed() {
+        let Some((dir, main)) = harness() else {
+            return;
+        };
+        let mut input = b"&HDR1VER2TYP3LEN4CRC5END6".to_vec();
+        input.extend_from_slice(b"................");
+        let capture = capture_for(&main, dir.path(), &input);
+        let mut offsets: Vec<usize> = capture
+            .gates
+            .iter()
+            .filter(|g| g.cmp_kind == "memcmp" && g.relation == "equal")
+            .map(|g| g.offset)
+            .collect();
+        offsets.sort_unstable();
+        offsets.dedup();
+        assert_eq!(offsets, vec![1, 5, 9, 13, 17, 21], "{capture:?}");
+    }
+
+    /// Runtime cmplog (`BHF_CMPLOG=1`) for a sanitized harness: the sanitizer
+    /// defines strcmp/bcmp in the executable, so the operands come from the
+    /// driver's hooks, in the shim's record format the engine ingests.
+    #[test]
+    fn runtime_cmplog_records_sanitized_string_and_buffer_compares() {
+        let Some((dir, main)) = harness() else {
+            return;
+        };
+        let log = dir.path().join("runtrace.jsonl");
+        for input in [&b"\x05\x00WIDGEX"[..], &b"\x05\x00nopeABWXYZR"[..]] {
+            let path = dir.path().join("in.bin");
+            std::fs::write(&path, input).unwrap();
+            let status = Command::new(&main)
+                .arg(&path)
+                .env("BHF_CMPLOG", "1")
+                .env("BHF_RUNTRACE_LOG", &log)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            text.contains(&format!(
+                "{{\"e\":\"cmplog\",\"k\":\"strcmp\",\"a\":\"{}\",\"b\":\"{}\"}}",
+                hex(b"WIDGEX"),
+                hex(b"WIDGET")
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "{{\"e\":\"cmplog\",\"k\":\"memcmp\",\"a\":\"{}\",\"b\":\"{}\"}}",
+                hex(b"WXYZR"),
+                hex(b"WXYZQ")
+            )),
+            "{text}"
+        );
+        // The runtrace shim's own name checks inside its getenv hook reach
+        // the sanitizer's comparison hooks too; they are not recorded.
+        if let Some(shim) = built_shim() {
+            let shim_log = dir.path().join("shim-runtrace.jsonl");
+            let path = dir.path().join("in.bin");
+            std::fs::write(&path, b"\x05\x00WIDGEX").unwrap();
+            let status = Command::new(&main)
+                .arg(&path)
+                .env("LD_PRELOAD", &shim)
+                .env("ASAN_OPTIONS", "verify_asan_link_order=0:detect_leaks=0")
+                .env("BHF_CMPLOG", "1")
+                .env("BHF_RUNTRACE_LOG", &shim_log)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let text = std::fs::read_to_string(&shim_log).unwrap();
+            assert!(text.contains("\"e\":\"getenv\""), "the shim ran: {text}");
+            assert!(text.contains(&hex(b"WIDGEX")), "{text}");
+            assert!(
+                !text.contains(&format!("\"{}", hex(b"BHF_"))),
+                "the shim's own compares are not the target's: {text}"
+            );
+        }
+        let ingested = cmplog::ingest_from_jsonl_log(&log).expect("the engine reads it");
+        let tokens = ingested.dictionary_tokens();
+        assert!(tokens.contains(&b"WIDGET".to_vec()), "{tokens:?}");
+        assert!(tokens.contains(&b"WXYZQ".to_vec()), "{tokens:?}");
+    }
+}

@@ -5,6 +5,46 @@
 ## Unreleased
 
 ### Fixed
+- `bhf explain` no longer presents dictionary substring matches as gates the
+  engine solved. Its comparison evidence is recorded while the finding's own
+  input runs: an input span counts only when a comparison operand equals its
+  bytes and a replay with those bytes changed shows the operand change with
+  them (for inputs of up to 32 bytes, flipping each byte also finds operands
+  computed from them, such as a folded range check, and an operand that
+  differs between two replays of the unchanged input, such as a process id or
+  a clock reading, is not counted). Comparisons the harness makes while
+  decoding the input are not the target's: the driver discards those made
+  before the target is entered, and later ones in harness code are dropped
+  when `llvm-symbolizer` locates them. Without evidence it says so and why
+  (empty input, no instrumented comparison in the target, harness without a
+  recording driver, computed operands not searched in an input over 32 bytes,
+  ...) instead of "not gated". Dictionary tokens found in the input are
+  listed only as labelled substring matches (3 bytes or more, at most 3
+  occurrences). explain shows `min_testcase.bin` when there is one and names
+  the file it shows, and notes when the input is a built-in starting input or
+  a byte-identical copy of a listed seed.
+- explain reads `dictionary.txt` with the engine's AFL parser: tokens
+  containing `=` are no longer dropped, and `\r` is a carriage return.
+- C/C++ dictionary mining skips `#include "..."` paths.
+- `FAKED ENVIRONMENT` in explain says where its events come from: the replay of
+  the finding's own input when the runtrace shim was loaded for it, else the
+  harness's last fuzz pass (labelled as covering all of its inputs), and
+  "environment not observed (runtrace shim not loaded)" when the shim was not
+  loaded, instead of claiming no resources were touched.
+- explain's reachability line says what the verdict rests on. A verdict
+  inferred from the entry's signature reads "the signature of the entry ...
+  matches an input-taking shape, so likely reachable from input; not proven",
+  and an entry with no recorded
+  reachability reads "not assessed" rather than attacker-reachable.
+- Runtime cmplog (`BHF_CMPLOG`) produces records for sanitized C/C++ harnesses.
+  The sanitizer defines `strcmp`, `memcmp` and `bcmp` in the executable, so the
+  runtrace shim's hooks never ran; bhf's driver now writes the same records
+  from the sanitizer's comparison hooks, which also cover `bcmp` and the
+  `strcasecmp` family.
+- The runtrace shim records `fopen` and `fopen64`, also in AddressSanitizer
+  harnesses: its `dlsym` hook answers `dlsym(RTLD_NEXT, "fopen")` from an
+  earlier object with the shim's hook, as `RTLD_NEXT` means, instead of
+  resolving from the shim itself and skipping it.
 - C++ `--target` accepts a trailing qualified suffix, in `generate-harness`
   and `bhf auto`: `Class::method` selects `ns::Class::method`, with or without
   the parameter list. An exact spelling still wins: the suffix match applies
@@ -304,6 +344,26 @@
   this release's work dirs from earlier ones.
 
 ### Changed
+- A heap overflow of a buffer the generated harness sized itself, for a pointer
+  parameter it passes without a length, is `lab_only` and reads as
+  "precondition-dependent": whether a real caller can pass a buffer that short
+  is the entry's contract, which bhf cannot see. This covers decoded C strings
+  and input copies whose allocating statement in the harness source has no
+  length companion; a buffer passed with its length (a `(buf, len)` pair, an
+  output buffer with its capacity) keeps the entry's verdict.
+- `bhf.findings.v1` gains four optional `fuzz` keys, written for every fuzz
+  finding: `access` (the sanitizer-reported memory access, without its raw
+  address), `input_to_state` (the comparison evidence; `null` when no capture
+  ran or it could not run), `input_to_state_input` (the file its offsets
+  index, `min_testcase.bin` or `testcase.bin`) and `arguments` (the harness's
+  decoded arguments, when traced), plus the `runtrace` evidence role.
+  Documents written before them still validate against the new schema; a
+  strict validator holding the previous schema rejects the new keys.
+  `findings.csv` appends the columns `access`, `access_size`, `region_size`,
+  `region_offset`, `input_to_state` and `input_to_state_input` after
+  `evidence_dir`.
+- Harness `dictionary.txt` files start with a comment saying their tokens are
+  mined from source, and mark the raw-byte encodings of each integer literal.
 - `bhf auto --seed-dir` reads a directory's files in name order.
 - Sanitizer finding signatures, IDs and root-cause keys changed. UBSan runs
   with `print_stacktrace=1` and `report_error_type=1` during fuzzing,
@@ -384,6 +444,20 @@
   both forms.
 
 ### Added
+- Comparison evidence per finding: `bhf auto` (after minimization) and
+  `bhf report --backfill` replay each runtime finding's preferred input with
+  the C/C++ driver's comparison capture (`BHF_CMP_EVIDENCE`) and store the
+  result in `finding.json` as `gates` and `gate_capture`, with the runtrace
+  events of that replay in the finding's `runtrace.jsonl`. It reaches
+  `findings.json` (`fuzz.input_to_state`, with the file its offsets index in
+  `fuzz.input_to_state_input`), `findings.csv`, `INDEX.md` and SARIF (the
+  `bhfInputToState` and `bhfInputToStateInput` properties and a related
+  location per comparison site). Under AddressSanitizer `memcmp`/`bcmp`
+  evidence carries no source position, as the interceptor reports itself as
+  the call site. `finding.json` `runtime_mode.shim_armed` records whether the runtrace
+  shim was loaded for the fuzz pass.
+- `bhf.findings.v1` `fuzz.access` and the CSV access columns carry the memory
+  access the sanitizer reported.
 - docs/site/custom-harness.md: writing an `LLVMFuzzerTestOneInput` entry
   point and wrapping it with `generate-harness`, editing a generated
   `bhf_run_one`, building with `AUTO_EXTRA_SOURCES`/`AUTO_EXTRA_INCLUDES`/

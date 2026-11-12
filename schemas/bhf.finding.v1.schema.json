@@ -13,6 +13,48 @@
     "last_seen": { "type": "string", "format": "date-time" },
     "forced": { "type": "boolean" },
     "forced_note": { "type": "string" },
+    "gates": {
+      "description": "Comparison evidence recorded by replaying the finding's input (gate_capture.input): each input span whose bytes reached a comparison of the target.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["offset", "len", "operand_hex", "compared_with_hex", "cmp_kind", "site", "relation", "operands_equal"],
+        "properties": {
+          "offset": { "type": "integer", "minimum": 0 },
+          "len": { "type": "integer", "minimum": 1 },
+          "operand_hex": { "type": "string", "pattern": "^([0-9a-f]{2})*$" },
+          "compared_with_hex": { "type": "string", "pattern": "^([0-9a-f]{2})*$" },
+          "cmp_kind": { "type": "string" },
+          "site": { "type": "string", "pattern": "^0x[0-9a-f]+$" },
+          "location": {
+            "type": ["object", "null"],
+            "properties": {
+              "file": { "type": "string" },
+              "line": { "type": ["integer", "null"] },
+              "function": { "type": ["string", "null"] }
+            }
+          },
+          "relation": { "enum": ["equal", "byte_swapped", "derived"] },
+          "operands_equal": { "type": "boolean" }
+        }
+      }
+    },
+    "gate_capture": {
+      "description": "How the comparison evidence in gates was recorded, or why there is none.",
+      "type": "object",
+      "required": ["input", "input_len", "status"],
+      "properties": {
+        "input": { "type": "string" },
+        "input_len": { "type": "integer", "minimum": 0 },
+        "status": { "enum": ["recorded", "no_input_comparisons", "no_comparisons", "unavailable"] },
+        "reason": { "type": ["string", "null"] },
+        "comparisons": { "type": "integer", "minimum": 0 },
+        "truncated": { "type": "boolean" },
+        "unconfirmed": { "type": "integer", "minimum": 0 },
+        "runs": { "type": "integer", "minimum": 0 },
+        "shim_armed": { "type": "boolean" }
+      }
+    },
     "history": {
       "type": "array",
       "items": {

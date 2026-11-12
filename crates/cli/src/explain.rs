@@ -4,23 +4,40 @@
 //!
 //! Every other tool's answer to "explain this crash" is either a raw sanitizer
 //! dump or an LLM round-trip. bhf already holds every fact needed to answer it
-//! precisely and reproducibly, with NO model: the minimized input, the comparison
-//! constants the engine mined to get past the target's gates (cmplog / value
-//! profile → `dictionary.txt`), the byte-origin taint the shim recorded at each
-//! resource call (#422), the virtualized environment the sandbox served, the sink
-//! site + call frames, and the build-recovery provenance verdict. This joins them
-//! through a FIXED narrative grammar into a triage-ready explanation.
+//! precisely and reproducibly, with NO model: the minimized input
+//! (`min_testcase.bin`, else `testcase.bin`, named in the output), the
+//! comparisons that input reached, recorded by the harness's driver while it
+//! ran and confirmed byte by byte ([`crate::gate_evidence`]), the byte-origin
+//! taint the shim recorded at each resource call (#422), the environment the
+//! runtrace shim observed, the sink site + call frames, and the
+//! build-recovery provenance verdict. This joins them through a FIXED
+//! narrative grammar into a triage-ready explanation. Each claim names its
+//! evidence, or says it has none.
 //!
-//! Deterministic by construction: the same finding always yields the same text.
-//! Best-effort per section — a missing artifact drops that section, never the
-//! whole explanation.
+//! `dictionary.txt` is mined from the target's source when the harness is
+//! generated; it is not runtime evidence. A dictionary token found in the
+//! input is listed only as a labelled substring match.
+//!
+//! Deterministic for a recorded finding: the same finding always yields the
+//! same text. A finding with no recorded comparison evidence is replayed once
+//! to record it (nothing is written back). Best-effort per section — a
+//! missing artifact drops that section, never the whole explanation.
 
 use crate::auto::runtrace::{self, RuntraceEvent};
+use crate::gate_evidence::{self, Capture, Gate};
 use serde_json::Value;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-/// `bhf explain` — explain, offline and deterministically, why a crash fired.
+/// `bhf explain` — explain, offline, why a crash fired.
+///
+/// The input shown is the finding's `min_testcase.bin`, else its
+/// `testcase.bin`, named in the output. Comparison evidence is what the
+/// harness recorded while that input ran; a finding without it is replayed
+/// once against its harness to record it (nothing is written). The
+/// environment comes from that replay when the runtrace shim was loaded, else
+/// from the harness's last fuzz pass, and says so; without the shim it reads
+/// "not observed".
 #[derive(Debug, clap::Args)]
 pub struct ExplainArgs {
     /// Work directory of a prior `auto` run.
@@ -262,55 +279,78 @@ fn explain_one(work_dir: &Path, f: &Finding, others: &[String], collapsed: bool)
         }
     }
 
-    // THE INPUT THAT TRIGGERS IT
-    let input = f.dir.join("testcase.bin");
-    if let Ok(bytes) = std::fs::read(&input) {
-        let _ = writeln!(s, "\nTHE INPUT THAT TRIGGERS IT  ({} byte(s))", bytes.len());
-        for line in hexdump(&bytes, 6) {
+    // THE INPUT THAT TRIGGERS IT: the minimized input when there is one.
+    let input = gate_evidence::preferred_input(&f.dir);
+    if let Some((name, bytes)) = &input {
+        let _ = writeln!(
+            s,
+            "\nTHE INPUT THAT TRIGGERS IT  ({})",
+            input_label(&f.dir, name, bytes.len())
+        );
+        for line in hexdump(bytes, 6) {
             let _ = writeln!(s, "  {line}");
         }
-        // Input-to-state: which recovered comparison constants the input satisfies.
-        let dict = load_dictionary(work_dir, &harness_id);
-        let gates = matched_gates(&bytes, &dict);
-        if gates.is_empty() {
-            let _ = writeln!(
-                s,
-                "  (no recovered gate constants matched — the crash is not gated \
-                 behind a magic value)"
-            );
-        } else {
-            let _ = writeln!(
-                s,
-                "  Input-to-state — the engine solved these gates to reach the sink:"
-            );
-            for (off, tok) in gates {
-                let _ = writeln!(s, "    byte {off}: matched recovered constant {tok}");
+        for note in input_origin(work_dir, bytes) {
+            for (index, line) in wrap(&note, 74).into_iter().enumerate() {
+                let indent = if index == 0 { "  " } else { "    " };
+                let _ = writeln!(s, "{indent}{line}");
             }
         }
     }
 
-    // FAKED ENVIRONMENT + byte-origin taint
-    let events = harness_id
-        .is_empty()
-        .then(Vec::new)
-        .unwrap_or_else(|| load_events(work_dir, &harness_id));
-    let env = summarize_env(&events);
-    let _ = writeln!(s, "\nFAKED ENVIRONMENT  (served by the bhf sandbox)");
-    if env.is_empty() {
-        let _ = writeln!(
-            s,
-            "  the target touched no external resources before the crash"
-        );
-    } else {
-        for line in env {
-            let _ = writeln!(s, "  {line}");
+    // Comparison evidence: operands recorded while this input ran.
+    let evidence = comparison_evidence(work_dir, f, input.as_ref());
+    if let Some((name, bytes)) = &input {
+        for line in evidence_lines(&evidence, name) {
+            let _ = writeln!(s, "{line}");
         }
+        let dict = load_dictionary(work_dir, &harness_id);
+        let present = dictionary_tokens_present(bytes, &dict);
+        if !present.is_empty() {
+            let _ = writeln!(
+                s,
+                "  Dictionary tokens present in the input (substring matches, not evidence \
+                 that a comparison used them):"
+            );
+            for (token, first, count) in present {
+                let more = if count > 1 {
+                    format!(" (and {} more)", count - 1)
+                } else {
+                    String::new()
+                };
+                let _ = writeln!(s, "    {token} at byte {first}{more}");
+            }
+        }
+    }
+
+    // FAKED ENVIRONMENT + byte-origin taint: this input's own replay when it
+    // was recorded, else the harness's last fuzz pass, else not observed.
+    let (env_source, env) = environment(work_dir, f, &harness_id, &evidence);
+    match env_source {
+        Some(source) => {
+            let _ = writeln!(s, "\nFAKED ENVIRONMENT  ({source})");
+        }
+        None => {
+            let _ = writeln!(s, "\nFAKED ENVIRONMENT");
+        }
+    }
+    for line in env {
+        let _ = writeln!(s, "  {line}");
     }
 
     // REACHABILITY & PROVENANCE
     let _ = writeln!(s, "\nREACHABILITY & PROVENANCE");
-    let verdict = str_at(&f.raw, "/actionability/verdict").unwrap_or("");
-    let _ = writeln!(s, "  Verdict: {}", humanize_verdict(verdict));
+    let statement = actionability::reachability_statement(
+        &f.raw,
+        harness_target_name(work_dir, &harness_id).as_deref(),
+    );
+    for (index, line) in wrap(&format!("Verdict: {statement}"), 76)
+        .into_iter()
+        .enumerate()
+    {
+        let indent = if index == 0 { "  " } else { "    " };
+        let _ = writeln!(s, "{indent}{line}");
+    }
     if let Some(prov) = str_at(&f.raw, "/provenance") {
         let note = str_at(&f.raw, "/stub_provenance/note").unwrap_or("");
         let _ = writeln!(s, "  Build-recovery provenance: {}", humanize_prov(prov));
@@ -574,8 +614,8 @@ fn taint_note(verb: &str, path: &str, taint: Option<u32>) -> String {
     }
 }
 
-/// Parse the fuzz dictionary (`dictionary.txt`, one `"..."`-quoted token per line)
-/// into raw byte tokens.
+/// The harness's fuzz dictionary (`dictionary.txt`), parsed by the engine's
+/// own AFL dictionary parser. Empty when the harness has none.
 fn load_dictionary(work_dir: &Path, harness_id: &str) -> Vec<Vec<u8>> {
     if harness_id.is_empty() {
         return Vec::new();
@@ -584,79 +624,402 @@ fn load_dictionary(work_dir: &Path, harness_id: &str) -> Vec<Vec<u8>> {
     let Ok(text) = std::fs::read_to_string(&path) else {
         return Vec::new();
     };
+    text.lines()
+        .filter_map(|line| crate::fuzz::parse_afl_dictionary_line(line).ok().flatten())
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+/// Dictionary tokens shorter than this match almost any input by chance.
+const MIN_TOKEN_LEN: usize = 3;
+/// A token found more often than this is too common to say anything.
+const MAX_TOKEN_HITS: usize = 3;
+/// Dictionary tokens listed at most.
+const MAX_TOKENS_SHOWN: usize = 8;
+
+/// Dictionary tokens that occur in the input, as `(printable token, first
+/// offset, occurrences)`, in input order. A plain substring search, so it is
+/// labelled as such: short tokens and tokens found more than
+/// [`MAX_TOKEN_HITS`] times are left out.
+fn dictionary_tokens_present(input: &[u8], dict: &[Vec<u8>]) -> Vec<(String, usize, usize)> {
+    let mut seen = std::collections::BTreeSet::new();
     let mut out = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        // Drop an optional `name=` prefix, then the surrounding quotes.
-        let quoted = line.split_once('=').map(|(_, v)| v).unwrap_or(line).trim();
-        if let Some(tok) = unquote_dict_token(quoted) {
-            if !tok.is_empty() {
-                out.push(tok);
+    for token in dict {
+        if token.len() < MIN_TOKEN_LEN || token.len() > input.len() || !seen.insert(token) {
+            continue;
+        }
+        let hits: Vec<usize> = input
+            .windows(token.len())
+            .enumerate()
+            .filter(|(_, window)| window == token)
+            .map(|(offset, _)| offset)
+            .collect();
+        if let Some(&first) = hits.first() {
+            if hits.len() <= MAX_TOKEN_HITS {
+                out.push((render_token(token), first, hits.len()));
             }
         }
     }
+    out.sort_by_key(|(_, first, _)| *first);
+    out.truncate(MAX_TOKENS_SHOWN);
     out
 }
 
-/// Unescape an AFL/libFuzzer dictionary token `"...\xNN..."` into raw bytes.
-fn unquote_dict_token(quoted: &str) -> Option<Vec<u8>> {
-    let inner = quoted.strip_prefix('"')?.strip_suffix('"')?;
-    let mut out = Vec::new();
-    let mut chars = inner.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.next() {
-                Some('x') => {
-                    let h: String = (0..2).filter_map(|_| chars.next()).collect();
-                    if let Ok(b) = u8::from_str_radix(&h, 16) {
-                        out.push(b);
-                    }
-                }
-                Some('\\') => out.push(b'\\'),
-                Some('"') => out.push(b'"'),
-                Some('n') => out.push(b'\n'),
-                Some('t') => out.push(b'\t'),
-                Some(other) => out.push(other as u8),
-                None => {}
-            }
+/// `min_testcase.bin, 5 byte(s), minimized from 4194` or `testcase.bin, 12
+/// byte(s), not minimized`.
+fn input_label(finding_dir: &Path, name: &str, len: usize) -> String {
+    if name == "min_testcase.bin" {
+        match std::fs::metadata(finding_dir.join("testcase.bin")) {
+            Ok(original) => format!(
+                "{name}, {len} byte(s), minimized from {} byte(s)",
+                original.len()
+            ),
+            Err(_) => format!("{name}, {len} byte(s), minimized"),
+        }
+    } else {
+        format!("{name}, {len} byte(s), not minimized")
+    }
+}
+
+/// What is known about where the input came from: one of bhf's built-in
+/// starting inputs, or a byte-identical copy of a seed the run listed in
+/// `auto/seeds.json`.
+fn input_origin(work_dir: &Path, bytes: &[u8]) -> Vec<String> {
+    let mut notes = Vec::new();
+    if matches!(bytes, b"" | b"A" | b"AAAAAAAA") {
+        notes.push(
+            "This is one of bhf's built-in starting inputs (empty, \"A\" or \"AAAAAAAA\"): \
+             the crash needed no mutation."
+                .to_owned(),
+        );
+    }
+    if bytes.is_empty() {
+        notes.push(
+            "The input is empty: every scalar parameter decodes to 0 and every buffer is empty."
+                .to_owned(),
+        );
+        return notes;
+    }
+    let digest = {
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(bytes);
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+    let manifest = crate::auto::seed_manifest::manifest_path(work_dir);
+    if let Some(seed) = read_json(&manifest)
+        .as_ref()
+        .and_then(|m| m.get("seeds"))
+        .and_then(Value::as_array)
+        .and_then(|seeds| {
+            seeds
+                .iter()
+                .find(|seed| seed.get("sha256").and_then(Value::as_str) == Some(digest.as_str()))
+                .cloned()
+        })
+    {
+        let source = match seed.get("source").and_then(Value::as_str) {
+            Some("user") => "your seed",
+            _ => "the seed mined from",
+        };
+        let path = seed.get("path").and_then(Value::as_str).unwrap_or("?");
+        notes.push(format!(
+            "This input is byte-identical to {source} {path}: the crash needed no mutation of it."
+        ));
+    }
+    notes
+}
+
+/// Comparison evidence for a finding's input, and the environment the
+/// replay that recorded it touched.
+struct Evidence {
+    capture: Option<Capture>,
+    /// The capture was recorded just now, by explain, rather than stored.
+    recorded_now: bool,
+    /// Why there is no capture.
+    missing: Option<String>,
+    /// The runtrace events of the capture's own replay, when the shim ran.
+    own_events: Option<Vec<RuntraceEvent>>,
+}
+
+/// Time one explain run spends replaying findings that have no recorded
+/// comparison evidence.
+const LAZY_CAPTURE_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The finding's stored capture when it covers the input shown, else one
+/// recorded now by replaying that input against its harness.
+fn comparison_evidence(work_dir: &Path, f: &Finding, input: Option<&(&str, Vec<u8>)>) -> Evidence {
+    let Some((name, bytes)) = input else {
+        return Evidence {
+            capture: None,
+            recorded_now: false,
+            missing: Some("the finding has no input file".to_owned()),
+            own_events: None,
+        };
+    };
+    if let Some(capture) = gate_evidence::recorded(&f.raw)
+        .filter(|c| c.summary.input == *name && c.summary.input_len == bytes.len())
+    {
+        let log = f.dir.join(gate_evidence::FINDING_RUNTRACE);
+        let own_events = (capture.summary.shim_armed && log.is_file()).then(|| parsed_events(&log));
+        return Evidence {
+            capture: Some(capture),
+            recorded_now: false,
+            missing: None,
+            own_events,
+        };
+    }
+    let Some(harness) = gate_evidence::harness_for_finding(work_dir, &f.dir, &f.raw) else {
+        return Evidence {
+            capture: None,
+            recorded_now: false,
+            missing: Some(
+                "none was recorded for this finding, and its harness binary was not found to \
+                 record it now"
+                    .to_owned(),
+            ),
+            own_events: None,
+        };
+    };
+    // One explain run replays for at most LAZY_CAPTURE_BUDGET in all.
+    static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let started = *STARTED.get_or_init(std::time::Instant::now);
+    let budget_end = started + LAZY_CAPTURE_BUDGET;
+    if std::time::Instant::now() >= budget_end {
+        return Evidence {
+            capture: None,
+            recorded_now: false,
+            missing: Some(
+                "none was recorded for this finding, and this explain run spent its replay \
+                 budget on earlier findings; `bhf report --backfill` records it"
+                    .to_owned(),
+            ),
+            own_events: None,
+        };
+    }
+    let Ok(scratch) = tempfile::tempdir() else {
+        return Evidence {
+            capture: None,
+            recorded_now: false,
+            missing: Some("no scratch directory to replay the input in".to_owned()),
+            own_events: None,
+        };
+    };
+    let log = scratch.path().join("runtrace.jsonl");
+    let replay = gate_evidence::Replay {
+        harness: &harness,
+        raw: &f.raw,
+        scratch: scratch.path().join("replay"),
+        runtrace_log: Some(log.clone()),
+        deadline: (std::time::Instant::now() + gate_evidence::PER_FINDING).min(budget_end),
+    };
+    let capture = gate_evidence::capture(&replay, bytes, name);
+    let own_events = (capture.summary.shim_armed && log.is_file()).then(|| parsed_events(&log));
+    Evidence {
+        capture: Some(capture),
+        recorded_now: true,
+        missing: None,
+        own_events,
+    }
+}
+
+/// The comparison-evidence lines under THE INPUT THAT TRIGGERS IT.
+fn evidence_lines(evidence: &Evidence, input_name: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let push_wrapped = |lines: &mut Vec<String>, text: &str, first: &str, rest: &str| {
+        for (index, line) in wrap(text, 74).into_iter().enumerate() {
+            lines.push(format!("{}{line}", if index == 0 { first } else { rest }));
+        }
+    };
+    let Some(capture) = &evidence.capture else {
+        let reason = evidence.missing.as_deref().unwrap_or("none was recorded");
+        push_wrapped(
+            &mut lines,
+            &format!("No comparison evidence recorded: {reason}."),
+            "  ",
+            "    ",
+        );
+        return lines;
+    };
+    if capture.gates.is_empty() {
+        let reason = capture
+            .summary
+            .reason
+            .as_deref()
+            .unwrap_or("no comparison operand came from the input");
+        push_wrapped(
+            &mut lines,
+            &format!("No comparison evidence recorded for {input_name}: {reason}."),
+            "  ",
+            "    ",
+        );
+    } else {
+        let how = if evidence.recorded_now {
+            "recorded now by replaying it"
         } else {
-            let mut buf = [0u8; 4];
-            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            "recorded when the finding was saved"
+        };
+        lines.push(format!(
+            "  Comparison evidence for this input ({input_name}, {how}):"
+        ));
+        for gate in &capture.gates {
+            push_wrapped(&mut lines, &gate_line(gate), "    ", "      ");
         }
     }
-    Some(out)
+    if capture.summary.unconfirmed > 0 {
+        push_wrapped(
+            &mut lines,
+            &format!(
+                "({} more operand(s) occur in the input but did not change when those input \
+                 bytes did, or were not checked within the replay budget; they are not \
+                 evidence.)",
+                capture.summary.unconfirmed
+            ),
+            "  ",
+            "   ",
+        );
+    }
+    if capture.summary.truncated {
+        lines.push(
+            "  (More comparisons were made than the driver keeps (8192); later ones are missing.)"
+                .to_owned(),
+        );
+    }
+    lines
 }
 
-/// Find dictionary tokens present in the input, returning `(offset, printable
-/// token)` for the notable matches (longest first, deduped by token). A token that
-/// appears in the input is a comparison constant the engine had to place there.
-fn matched_gates(input: &[u8], dict: &[Vec<u8>]) -> Vec<(usize, String)> {
-    let mut tokens: Vec<&Vec<u8>> = dict.iter().filter(|t| !t.is_empty()).collect();
-    // Longest tokens are the most informative gates; report those first.
-    tokens.sort_by_key(|t| std::cmp::Reverse(t.len()));
-    let mut out = Vec::new();
-    let mut used = std::collections::BTreeSet::new();
-    for tok in tokens {
-        if let Some(off) = find_sub(input, tok) {
-            let rendered = render_token(tok);
-            if used.insert(rendered.clone()) {
-                out.push((off, rendered));
+/// `bytes 0..5 "WIDGET" reach strcmp at parse.c:12 in parse_record, compared
+/// with "WIDGET" (equal)`.
+fn gate_line(gate: &Gate) -> String {
+    let (span, reach, feed) = if gate.len == 1 {
+        (format!("byte {}", gate.offset), "reaches", "feeds")
+    } else {
+        (
+            format!("bytes {}..{}", gate.offset, gate.offset + gate.len),
+            "reach",
+            "feed",
+        )
+    };
+    let site = match &gate.location {
+        Some(location) => {
+            let at = match location.line {
+                Some(line) => format!("{}:{line}", basename(&location.file)),
+                None => basename(&location.file).to_owned(),
+            };
+            match location.function.as_deref() {
+                Some(function) => format!(" at {at} in {function}"),
+                None => format!(" at {at}"),
             }
         }
-        if out.len() >= 8 {
-            break;
-        }
+        None => format!(" at {}", gate.site),
+    };
+    let token = |hex: &str| render_token(&decode_hex(hex));
+    let outcome = if gate.operands_equal {
+        "equal"
+    } else {
+        "not equal"
+    };
+    match gate.relation.as_str() {
+        "derived" => format!(
+            "{span} {feed} {}{site}: operand {} compared with {} ({outcome}; the operand is \
+             computed from these bytes and changed when they did)",
+            gate.cmp_kind,
+            token(&gate.operand_hex),
+            token(&gate.compared_with_hex)
+        ),
+        relation => format!(
+            "{span} {} {reach} {}{site}, compared with {} ({outcome}{})",
+            token(&gate.operand_hex),
+            gate.cmp_kind,
+            token(&gate.compared_with_hex),
+            if relation == "byte_swapped" {
+                "; read big-endian"
+            } else {
+                ""
+            }
+        ),
     }
-    out.sort_by_key(|(off, _)| *off);
-    out
 }
 
-/// First offset of `needle` in `haystack`.
-fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return None;
+fn decode_hex(hex: &str) -> Vec<u8> {
+    (0..hex.len() / 2)
+        .filter_map(|i| u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok())
+        .collect()
+}
+
+/// The FAKED ENVIRONMENT section: where its events come from (`None` when
+/// none were observed) and its lines.
+fn environment(
+    work_dir: &Path,
+    f: &Finding,
+    harness_id: &str,
+    evidence: &Evidence,
+) -> (Option<String>, Vec<String>) {
+    if let (Some(events), Some(capture)) = (&evidence.own_events, &evidence.capture) {
+        let lines = summarize_env(events);
+        let source = format!(
+            "observed while replaying {} with the runtrace shim",
+            capture.summary.input
+        );
+        if lines.is_empty() {
+            return (
+                Some(source),
+                vec![
+                    "the replay touched no external resource the runtrace shim watches".to_owned(),
+                ],
+            );
+        }
+        return (Some(source), lines);
     }
-    haystack.windows(needle.len()).position(|w| w == needle)
+    let shim_armed = f
+        .raw
+        .pointer("/runtime_mode/shim_armed")
+        .and_then(Value::as_bool);
+    if shim_armed == Some(false) {
+        return (
+            None,
+            vec!["environment not observed (runtrace shim not loaded)".to_owned()],
+        );
+    }
+    let events = if harness_id.is_empty() {
+        Vec::new()
+    } else {
+        load_events(work_dir, harness_id)
+    };
+    let lines = summarize_env(&events);
+    let campaign = "runtrace events of the harness's last fuzz pass, across all of its inputs, \
+                    not only this one"
+        .to_owned();
+    if !lines.is_empty() {
+        return (Some(campaign), lines);
+    }
+    match shim_armed {
+        Some(true) => (
+            Some(campaign),
+            vec![
+                "the last fuzz pass touched no external resource the runtrace shim watches"
+                    .to_owned(),
+            ],
+        ),
+        _ => (
+            None,
+            vec![
+                "environment not observed (no runtrace events were recorded; the runtrace shim \
+                 may not have been loaded)"
+                    .to_owned(),
+            ],
+        ),
+    }
+}
+
+fn parsed_events(log: &Path) -> Vec<RuntraceEvent> {
+    let mut events = runtrace::parse_log(log).unwrap_or_default();
+    runtrace::dedupe_in_place(&mut events);
+    events
 }
 
 /// Render a token as `"printable"` or `\xNN` bytes.
@@ -670,10 +1033,7 @@ fn render_token(tok: &[u8]) -> String {
 }
 
 fn load_events(work_dir: &Path, harness_id: &str) -> Vec<RuntraceEvent> {
-    let log = crate::auto::layout::harness_dir(work_dir, harness_id).join("runtrace.jsonl");
-    let mut events = runtrace::parse_log(&log).unwrap_or_default();
-    runtrace::dedupe_in_place(&mut events);
-    events
+    parsed_events(&crate::auto::layout::harness_dir(work_dir, harness_id).join("runtrace.jsonl"))
 }
 
 /// Collapse consecutive duplicate frames (`handle → handle` → `handle`).
@@ -685,16 +1045,6 @@ fn dedup_chain<'a>(frames: &[&'a str]) -> Vec<&'a str> {
         }
     }
     out
-}
-
-fn humanize_verdict(v: &str) -> &str {
-    match v {
-        "likely_reachable" => "attacker-reachable via the fuzzed input channel",
-        "lab_only" => "reproducible in the lab; attacker-reachability unproven",
-        "reachability_unproven" => "reachability from attacker input unproven",
-        _ if v.is_empty() => "unassessed",
-        other => other,
-    }
 }
 
 fn humanize_prov(p: &str) -> &str {
@@ -1042,23 +1392,352 @@ mod tests {
         assert!(reproduce.contains("oracle finding"), "{reproduce}");
     }
 
+    /// The dictionary is read with the engine's own AFL parser: a token may
+    /// contain `=`, `\r` is a carriage return, and a `name=` prefix and
+    /// comments are skipped.
     #[test]
-    fn unquotes_dictionary_tokens() {
-        assert_eq!(unquote_dict_token("\"BOOM\""), Some(b"BOOM".to_vec()));
-        assert_eq!(unquote_dict_token("\"\\x04\""), Some(vec![0x04]));
-        assert_eq!(unquote_dict_token("\"A\\x00B\""), Some(vec![b'A', 0, b'B']));
-        assert_eq!(unquote_dict_token("notquoted"), None);
+    fn dictionary_loader_shares_the_engine_parser() {
+        let work = tempfile::tempdir().unwrap();
+        let harness = crate::auto::layout::harness_dir(work.path(), "H-C0001");
+        std::fs::create_dir_all(&harness).unwrap();
+        std::fs::write(
+            harness.join("dictionary.txt"),
+            "# mined from widget.c\n\"encoding=utf8\"\n\"\\r\\nBODY\"\nhdr=\"HDR\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            load_dictionary(work.path(), "H-C0001"),
+            vec![
+                b"encoding=utf8".to_vec(),
+                b"\r\nBODY".to_vec(),
+                b"HDR".to_vec()
+            ]
+        );
+        assert!(load_dictionary(work.path(), "H-C0002").is_empty());
     }
 
+    /// Dictionary tokens are a labelled substring match: short tokens and
+    /// tokens found too often are dropped, so a large input's coincidental
+    /// single bytes never show up.
     #[test]
-    fn matches_gate_constants_in_input() {
-        let input = b"BOOM\xfe\x4d";
-        let dict = vec![b"BOOM".to_vec(), b"XY".to_vec(), b"B".to_vec()];
-        let gates = matched_gates(input, &dict);
-        // "BOOM" (longest) matches at 0; "XY" is absent. "B" is deduped-in by offset
-        // order but distinct token, so it also appears — both at offset 0.
-        assert!(gates.iter().any(|(o, t)| *o == 0 && t == "\"BOOM\""));
-        assert!(!gates.iter().any(|(_, t)| t == "\"XY\""));
+    fn dictionary_tokens_present_drop_short_and_common_tokens() {
+        let mut input = b"WIDGET".to_vec();
+        for i in 0..40_000u32 {
+            input.push(match i % 7 {
+                0 => 0,
+                1 => b'0',
+                2 => b'1',
+                3 => b'z',
+                _ => (i % 251) as u8,
+            });
+        }
+        input.extend_from_slice(b"zzzzzz");
+        let dict = vec![
+            b"WIDGET".to_vec(),
+            vec![0],
+            b"0".to_vec(),
+            b"01".to_vec(),
+            b"zzz".to_vec(),
+        ];
+        assert_eq!(
+            dictionary_tokens_present(&input, &dict),
+            vec![("\"WIDGET\"".to_owned(), 0, 1)]
+        );
+    }
+
+    fn finding_in(work: &Path, raw: serde_json::Value) -> Finding {
+        let dir = corpus::layout::findings_dir(work).join("F-0001-0a0b0c0d");
+        std::fs::create_dir_all(&dir).unwrap();
+        Finding {
+            id: "F-0001-0a0b0c0d".to_owned(),
+            dir,
+            raw,
+        }
+    }
+
+    fn base_raw() -> serde_json::Value {
+        serde_json::json!({
+            "id": "F-0001-0a0b0c0d", "rule_id": "BHF-201", "harness_id": "H-C0001",
+            "classification": "unhandled",
+            "exception": {"name": "ASAN_HEAP_BUFFER_OVERFLOW", "sanitizer": "asan", "stack": []}
+        })
+    }
+
+    /// explain shows the minimized input when there is one, and says which
+    /// file it shows.
+    #[test]
+    fn the_minimized_input_is_preferred_and_named() {
+        let work = tempfile::tempdir().unwrap();
+        let finding = finding_in(work.path(), base_raw());
+        std::fs::write(finding.dir.join("testcase.bin"), vec![b'Q'; 4096]).unwrap();
+        let out = explain_one(work.path(), &finding, &[], false);
+        assert!(
+            out.contains("THE INPUT THAT TRIGGERS IT  (testcase.bin, 4096 byte(s), not minimized)"),
+            "{out}"
+        );
+        std::fs::write(finding.dir.join("min_testcase.bin"), b"WIDGE").unwrap();
+        let out = explain_one(work.path(), &finding, &[], false);
+        assert!(
+            out.contains(
+                "THE INPUT THAT TRIGGERS IT  (min_testcase.bin, 5 byte(s), minimized from 4096 byte(s))"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("57 49 44 47 45"),
+            "the minimized bytes are dumped: {out}"
+        );
+        assert!(!out.contains("51 51 51"), "{out}");
+    }
+
+    fn recorded_capture(gates: serde_json::Value, reason: Option<&str>) -> serde_json::Value {
+        let mut raw = base_raw();
+        raw["gates"] = gates;
+        raw["gate_capture"] = serde_json::json!({
+            "input": "testcase.bin", "input_len": 8,
+            "status": if reason.is_some() { "no_input_comparisons" } else { "recorded" },
+            "reason": reason, "comparisons": 4, "truncated": false, "unconfirmed": 2,
+            "runs": 3, "shim_armed": false
+        });
+        raw
+    }
+
+    /// Recorded comparison evidence is shown with its offsets, operands and
+    /// site, titled as evidence for this input; nothing is ever presented as
+    /// solved gates without it.
+    #[test]
+    fn recorded_comparison_evidence_is_shown_and_its_absence_is_explained() {
+        let work = tempfile::tempdir().unwrap();
+        let raw = recorded_capture(
+            serde_json::json!([{
+                "offset": 2, "len": 6, "operand_hex": "574944474554", "compared_with_hex": "574944474554",
+                "cmp_kind": "strcmp", "site": "0x1a2b", "relation": "equal", "operands_equal": true,
+                "location": {"file": "/src/widget/parse.c", "line": 12, "function": "parse_record"}
+            }, {
+                "offset": 0, "len": 2, "operand_hex": "e0ffffff", "compared_with_hex": "1f000000",
+                "cmp_kind": "cmp", "site": "0x1a40", "relation": "derived", "operands_equal": false,
+                "location": null
+            }]),
+            None,
+        );
+        let finding = finding_in(work.path(), raw);
+        std::fs::write(finding.dir.join("testcase.bin"), b"\x21\x00WIDGET").unwrap();
+        let out = explain_one(work.path(), &finding, &[], false);
+        let words = out.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            words.contains(
+                "Comparison evidence for this input (testcase.bin, recorded when the finding was saved):"
+            ),
+            "{out}"
+        );
+        assert!(
+            words.contains(
+                "bytes 2..8 \"WIDGET\" reach strcmp at parse.c:12 in parse_record, compared with \"WIDGET\" (equal)"
+            ),
+            "{out}"
+        );
+        assert!(words.contains("bytes 0..2 feed cmp at 0x1a40"), "{out}");
+        assert!(
+            words.contains("2 more operand(s) occur in the input"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("solved") && !out.contains("not gated"),
+            "{out}"
+        );
+
+        let none = finding_in(
+            work.path(),
+            recorded_capture(
+                serde_json::json!([]),
+                Some("4 comparison(s) recorded; no operand followed a change of the input bytes"),
+            ),
+        );
+        let out = explain_one(work.path(), &none, &[], false);
+        let words = out.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            words.contains("No comparison evidence recorded for testcase.bin: 4 comparison(s) recorded; no operand followed a change of the input bytes."),
+            "{out}"
+        );
+
+        let unrecorded = finding_in(work.path(), base_raw());
+        let out = explain_one(work.path(), &unrecorded, &[], false);
+        let words = out.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            words.contains("No comparison evidence recorded: none was recorded for this finding, and its harness binary was not found to record it now."),
+            "{out}"
+        );
+        assert!(
+            !out.contains("Input-to-state") && !out.contains("recovered constant"),
+            "{out}"
+        );
+    }
+
+    /// An empty input, one of the built-in starting inputs, or a copy of a
+    /// listed seed says so.
+    #[test]
+    fn the_input_says_where_it_came_from() {
+        let work = tempfile::tempdir().unwrap();
+        let finding = finding_in(work.path(), base_raw());
+        std::fs::write(finding.dir.join("testcase.bin"), b"").unwrap();
+        let out = explain_one(work.path(), &finding, &[], false);
+        let words = out.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            words.contains("one of bhf's built-in starting inputs"),
+            "{out}"
+        );
+        assert!(
+            words.contains("The input is empty: every scalar parameter decodes to 0 and every buffer is empty."),
+            "{out}"
+        );
+
+        let seed = b"<Project><ClInclude Include=\"widget.h\"/></Project>";
+        std::fs::write(finding.dir.join("testcase.bin"), seed).unwrap();
+        let digest = {
+            use sha2::Digest;
+            sha2::Sha256::digest(seed)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        let manifest = crate::auto::seed_manifest::manifest_path(work.path());
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::fs::write(
+            &manifest,
+            serde_json::json!({"schema_version": 1, "mining": "ran", "seeds": [{
+                "path": "tests/widget.vcxproj", "source": "mined", "sha256": digest,
+                "size": seed.len(), "bytes_used": seed.len()
+            }]})
+            .to_string(),
+        )
+        .unwrap();
+        let out = explain_one(work.path(), &finding, &[], false);
+        let words = out.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            words.contains("byte-identical to the seed mined from tests/widget.vcxproj"),
+            "{out}"
+        );
+        assert!(!words.contains("built-in starting inputs"), "{out}");
+    }
+
+    /// The environment section names where its events come from, and says
+    /// when nothing was observed instead of claiming no resources were used.
+    #[test]
+    fn the_environment_section_states_its_evidence() {
+        let work = tempfile::tempdir().unwrap();
+        let mut raw = base_raw();
+        raw["runtime_mode"] =
+            serde_json::json!({"pass": "empty", "env_injected": {}, "shim_armed": false});
+        let finding = finding_in(work.path(), raw);
+        std::fs::write(finding.dir.join("testcase.bin"), b"AB").unwrap();
+        let out = explain_one(work.path(), &finding, &[], false);
+        assert!(
+            out.contains(
+                "FAKED ENVIRONMENT\n  environment not observed (runtrace shim not loaded)\n"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("touched no external resources"), "{out}");
+
+        let unknown = finding_in(work.path(), base_raw());
+        let out = explain_one(work.path(), &unknown, &[], false);
+        assert!(
+            out.contains("environment not observed (no runtrace events"),
+            "{out}"
+        );
+
+        let harness = crate::auto::layout::harness_dir(work.path(), "H-C0001");
+        std::fs::create_dir_all(&harness).unwrap();
+        std::fs::write(
+            harness.join("runtrace.jsonl"),
+            "{\"e\":\"getenv\",\"n\":\"WIDGET_MODE\",\"r\":1}\n",
+        )
+        .unwrap();
+        let mut raw = base_raw();
+        raw["runtime_mode"] =
+            serde_json::json!({"pass": "empty", "env_injected": {}, "shim_armed": true});
+        let campaign = finding_in(work.path(), raw);
+        let out = explain_one(work.path(), &campaign, &[], false);
+        assert!(
+            out.contains("FAKED ENVIRONMENT  (runtrace events of the harness's last fuzz pass, across all of its inputs, not only this one)\n  getenv WIDGET_MODE"),
+            "{out}"
+        );
+
+        let mut raw = recorded_capture(serde_json::json!([]), Some("no comparisons"));
+        raw["gate_capture"]["shim_armed"] = serde_json::json!(true);
+        let own = finding_in(work.path(), raw);
+        std::fs::write(own.dir.join("testcase.bin"), b"ABCDEFGH").unwrap();
+        std::fs::write(
+            own.dir.join("runtrace.jsonl"),
+            "{\"e\":\"getenv\",\"n\":\"WIDGET_HOME\",\"r\":1}\n",
+        )
+        .unwrap();
+        let out = explain_one(work.path(), &own, &[], false);
+        assert!(
+            out.contains("FAKED ENVIRONMENT  (observed while replaying testcase.bin with the runtrace shim)\n  getenv WIDGET_HOME"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("WIDGET_MODE"),
+            "the finding's own replay wins: {out}"
+        );
+    }
+
+    /// A finding with no recorded comparison evidence is replayed once to
+    /// record it, and nothing is written back.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn missing_comparison_evidence_is_recorded_by_replaying_the_input() {
+        let Some((_build, main)) = crate::gate_evidence::harness_tests::harness() else {
+            return;
+        };
+        let work = tempfile::tempdir().unwrap();
+        let harness = crate::auto::layout::harness_dir(work.path(), "H-C0001");
+        std::fs::create_dir_all(&harness).unwrap();
+        std::fs::copy(&main, harness.join("main")).unwrap();
+        let finding = finding_in(work.path(), base_raw());
+        std::fs::write(finding.dir.join("testcase.bin"), b"\x05\x00WIDGET").unwrap();
+        let record = finding.dir.join("finding.json");
+        std::fs::write(&record, finding.raw.to_string()).unwrap();
+        let out = explain_one(work.path(), &finding, &[], false);
+        let words = out.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            words.contains(
+                "Comparison evidence for this input (testcase.bin, recorded now by replaying it):"
+            ),
+            "{out}"
+        );
+        assert!(
+            words.contains("bytes 2..8 \"WIDGET\" reach strcmp"),
+            "{out}"
+        );
+        let after: Value = serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+        assert!(after.get("gates").is_none(), "explain writes nothing back");
+    }
+
+    /// The reachability line names its basis: a signature inference says so,
+    /// and an unassessed entry is not called reachable.
+    #[test]
+    fn the_reachability_line_names_its_basis() {
+        let work = tempfile::tempdir().unwrap();
+        let mut raw = base_raw();
+        raw["actionability"] = serde_json::json!({"verdict": "likely_reachable"});
+        raw["input_reachability"] = serde_json::json!("attacker_reachable");
+        let finding = finding_in(work.path(), raw);
+        let out = explain_one(work.path(), &finding, &[], false);
+        let words = out.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            words.contains(
+                "matches an input-taking shape, so likely reachable from input; not proven"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("attacker-reachable"), "{out}");
+        let mut raw = base_raw();
+        raw["actionability"] = serde_json::json!({"verdict": "likely_reachable"});
+        let unassessed = finding_in(work.path(), raw);
+        let out = explain_one(work.path(), &unassessed, &[], false);
+        assert!(out.contains("Verdict: reachability not assessed"), "{out}");
     }
 
     #[test]

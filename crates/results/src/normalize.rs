@@ -4,9 +4,10 @@
 
 use crate::confirmation::{self, ConfirmationInput};
 use crate::model::{
-    BinaryBlock, BuildInfo, Component, Confidence, Confirmation, ConfirmationLevel, Evidence,
-    EvidenceFile, ExceptionInfo, Fidelity, Finding, Fingerprint, Frame, FuzzBlock, Kind, Location,
-    PatchHint, Reproduce, RuleRef, ScaBlock, StaticBlock, TraceStep,
+    AccessRegion, Argument, BinaryBlock, BuildInfo, Component, Confidence, Confirmation,
+    ConfirmationLevel, Evidence, EvidenceFile, ExceptionInfo, Fidelity, Finding, Fingerprint,
+    Frame, FuzzBlock, InputToState, Kind, Location, MemoryAccess, PatchHint, Reproduce, RuleRef,
+    ScaBlock, StaticBlock, TraceStep,
 };
 use crate::severity;
 use serde_json::Value;
@@ -27,7 +28,7 @@ const MAX_HASH_BYTES: u64 = 64 * 1024 * 1024;
 const TITLE_MAX: usize = 160;
 
 /// Evidence files we surface, in display order: (role, file name).
-const EVIDENCE_FILES: [(&str, &str); 8] = [
+const EVIDENCE_FILES: [(&str, &str); 9] = [
     ("finding", "finding.json"),
     ("testcase", "testcase.bin"),
     ("testcase_minimized", "min_testcase.bin"),
@@ -36,6 +37,9 @@ const EVIDENCE_FILES: [(&str, &str); 8] = [
     ("replay_script", "replay.py"),
     ("repro_ada", "repro.adb"),
     ("byte_control", "byte-control.json"),
+    // The runtrace events of the replay that recorded the finding's
+    // comparison evidence: this one input's environment use.
+    ("runtrace", "runtrace.jsonl"),
 ];
 
 pub fn kind_for(id: &str, raw: &Value) -> Kind {
@@ -261,6 +265,15 @@ pub fn from_finding_report(
             harness_id: str_at(raw, &["harness_id"]),
             dialect: str_at(raw, &["dialect"]),
             oracle: raw.get("oracle").filter(|v| v.is_object()).cloned(),
+            access: f
+                .exception
+                .get("access")
+                .and_then(|access| memory_access(access, ctx.source_root)),
+            input_to_state: comparison_evidence(raw)
+                .and_then(|gates| input_to_state(gates, ctx.source_root)),
+            input_to_state_input: comparison_evidence(raw)
+                .and(str_at(raw, &["gate_capture", "input"])),
+            arguments: raw.get("decoded_args").and_then(arguments),
         }),
         static_: (kind == Kind::Static).then(|| StaticBlock {
             engine: str_at(raw, &["analysis", "engine"]).or_else(|| Some("bhf-static".to_owned())),
@@ -281,6 +294,166 @@ pub fn from_finding_report(
     strip_root_in_text(&mut finding, ctx.source_root);
     debug_assert_kind_block(&finding);
     Ok(finding)
+}
+
+/// Frames of an allocation or free stack kept in `fuzz.access`.
+const MAX_ACCESS_FRAMES: usize = 8;
+
+/// `exception.access` as the results model carries it: no raw address (it
+/// differs run to run), and only the allocation and free frames that are not
+/// sanitizer, allocator or libc runtime.
+fn memory_access(access: &Value, root: Option<&Path>) -> Option<MemoryAccess> {
+    let direction = match access.get("direction").and_then(Value::as_str) {
+        Some(direction @ ("read" | "write")) => direction.to_owned(),
+        Some(_) | None if access.is_object() => "unknown".to_owned(),
+        _ => return None,
+    };
+    let region = access
+        .get("region")
+        .filter(|r| r.is_object())
+        .and_then(|r| {
+            Some(AccessRegion {
+                kind: str_at(r, &["kind"])?,
+                size: r.get("size").and_then(Value::as_u64),
+                offset: r.get("offset").and_then(Value::as_i64),
+                relation: str_at(r, &["relation"]),
+                distance: r.get("distance").and_then(Value::as_u64),
+                variable: str_at(r, &["variable"]),
+                frame_offset: r.get("frame_offset").and_then(Value::as_u64),
+            })
+        });
+    let frames = |key: &str| -> Vec<Frame> {
+        access
+            .get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|frame| {
+                let function = str_at(frame, &["function"])?;
+                let file = str_at(frame, &["file"]);
+                if actionability::is_runtime_noise_frame(&function, file.as_deref()) {
+                    return None;
+                }
+                Some(Frame {
+                    function: Some(function),
+                    file: file.map(|file| relativize(&file, root)),
+                    line: frame.get("line").and_then(Value::as_u64).filter(|l| *l > 0),
+                })
+            })
+            .take(MAX_ACCESS_FRAMES)
+            .collect()
+    };
+    Some(MemoryAccess {
+        direction,
+        size: access.get("size").and_then(Value::as_u64),
+        address_hint: str_at(access, &["address_hint"]),
+        region,
+        alloc_stack: frames("alloc_stack"),
+        free_stack: frames("free_stack"),
+    })
+}
+
+/// `finding.json` `gates`, unless its `gate_capture` says the capture could
+/// not run (then nothing was recorded, which is not "no input bytes fed a
+/// comparison").
+fn comparison_evidence(raw: &Value) -> Option<&Value> {
+    let unavailable =
+        raw.pointer("/gate_capture/status").and_then(Value::as_str) == Some("unavailable");
+    raw.get("gates").filter(|_| !unavailable)
+}
+
+/// The comparison-evidence entries of `finding.json` `gates`. An entry
+/// missing a required field, or with operands that are not lowercase hex, is
+/// dropped rather than failing the finding.
+fn input_to_state(gates: &Value, root: Option<&Path>) -> Option<Vec<InputToState>> {
+    let gates = gates.as_array()?;
+    let hex = |value: &Value, key: &str| -> Option<String> {
+        let text = value.get(key)?.as_str()?;
+        (text.len() % 2 == 0 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+            .then(|| text.to_owned())
+    };
+    Some(
+        gates
+            .iter()
+            .filter_map(|gate| {
+                let site = str_at(gate, &["site"])?;
+                if !site.starts_with("0x") {
+                    return None;
+                }
+                let relation = str_at(gate, &["relation"])?;
+                if !matches!(relation.as_str(), "equal" | "byte_swapped" | "derived") {
+                    return None;
+                }
+                let location = gate.get("location").filter(|l| l.is_object());
+                Some(InputToState {
+                    offset: gate.get("offset")?.as_u64()?,
+                    len: gate.get("len")?.as_u64().filter(|len| *len > 0)?,
+                    operand_hex: hex(gate, "operand_hex")?,
+                    compared_with_hex: hex(gate, "compared_with_hex").unwrap_or_default(),
+                    cmp_kind: str_at(gate, &["cmp_kind"])?,
+                    site,
+                    site_location: location.and_then(|l| {
+                        Some(Location {
+                            file: relativize(&str_at(l, &["file"])?, root),
+                            line: l.get("line").and_then(Value::as_u64).filter(|n| *n > 0),
+                            column: None,
+                            function: str_at(l, &["function"]),
+                        })
+                    }),
+                    relation,
+                    operands_equal: gate
+                        .get("operands_equal")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                })
+            })
+            .collect(),
+    )
+}
+
+/// The harness's decoded arguments (`finding.json` `decoded_args`). A scalar
+/// `value` or `after_call_value` that is not a string is kept as its JSON
+/// text; an entry without a name is dropped.
+fn arguments(decoded: &Value) -> Option<Vec<Argument>> {
+    let text = |value: Option<&Value>| -> Option<String> {
+        match value? {
+            Value::String(text) => Some(text.clone()),
+            Value::Number(number) => Some(number.to_string()),
+            Value::Bool(flag) => Some(flag.to_string()),
+            _ => None,
+        }
+    };
+    Some(
+        decoded
+            .as_array()?
+            .iter()
+            .filter_map(|arg| {
+                let span = arg.get("span").and_then(Value::as_array).and_then(|span| {
+                    match span.as_slice() {
+                        [start, end] => Some([start.as_u64()?, end.as_u64()?]),
+                        _ => None,
+                    }
+                });
+                Some(Argument {
+                    name: arg.get("name")?.as_str()?.to_owned(),
+                    type_: arg
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    value: text(arg.get("value")),
+                    len: arg.get("len").and_then(Value::as_u64),
+                    span,
+                    preview_hex: str_at(arg, &["preview_hex"]),
+                    role: match arg.get("role").and_then(Value::as_str) {
+                        Some(role @ ("param" | "receiver" | "out")) => role.to_owned(),
+                        _ => "param".to_owned(),
+                    },
+                    after_call_value: text(arg.get("after_call_value")),
+                })
+            })
+            .collect(),
+    )
 }
 
 fn sink_location(a: &actionability::ActionabilityRecord, root: Option<&Path>) -> Option<Location> {
@@ -1411,6 +1584,95 @@ mod tests {
             f.title
         );
         assert!(f.static_.is_none() && f.sca.is_none() && f.binary.is_none());
+    }
+
+    /// The memory access, the comparison evidence and the decoded arguments a
+    /// finding records reach its fuzz block; raw addresses and runtime frames
+    /// do not, and a malformed evidence entry is dropped, not fatal.
+    #[test]
+    fn fuzz_block_carries_access_comparison_evidence_and_arguments() {
+        let mut raw = asan_record();
+        raw["exception"]["access"] = json!({
+            "direction": "read", "size": 4, "address": "0x602000000010",
+            "region": {"kind": "heap", "size": 5, "offset": 5, "relation": "after", "distance": 0},
+            "alloc_stack": [
+                {"function": "malloc", "file": "/llvm/compiler-rt/lib/asan/asan_malloc_linux.cpp", "line": 68},
+                {"function": "copy_at", "file": "/src/demo/src/copy.c", "line": 7}
+            ]
+        });
+        raw["gates"] = json!([
+            {"offset": 0, "len": 4, "operand_hex": "57494447", "compared_with_hex": "57494447",
+             "cmp_kind": "memcmp", "site": "0x1a2b", "relation": "equal", "operands_equal": true,
+             "location": {"file": "/src/demo/src/parse.c", "line": 31, "function": "parse_header"}},
+            {"offset": 9, "len": 1, "operand_hex": "not hex", "cmp_kind": "cmp", "site": "0x10",
+             "relation": "equal"}
+        ]);
+        raw["decoded_args"] = json!([
+            {"name": "bit_index", "type": "uint32_t", "value": 7, "span": [0, 4], "role": "param"},
+            {"name": "data", "type": "const uint8_t *", "len": 12, "preview_hex": "57494447"}
+        ]);
+        let f = normalize(raw, Some("/src/demo"));
+        let fuzz = f.fuzz.unwrap();
+
+        let access = fuzz.access.expect("access");
+        assert_eq!((access.direction.as_str(), access.size), ("read", Some(4)));
+        let region = access.region.as_ref().expect("region");
+        assert_eq!(
+            (region.kind.as_str(), region.size, region.offset),
+            ("heap", Some(5), Some(5))
+        );
+        assert_eq!(access.alloc_stack.len(), 1, "{:?}", access.alloc_stack);
+        assert_eq!(access.alloc_stack[0].file.as_deref(), Some("src/copy.c"));
+        let serialized = serde_json::to_string(&access).unwrap();
+        assert!(!serialized.contains("0x602000000010"), "{serialized}");
+
+        let gates = fuzz.input_to_state.expect("evidence");
+        assert_eq!(gates.len(), 1, "{gates:?}");
+        assert!(
+            fuzz.input_to_state_input.is_none(),
+            "no gate_capture, so no input named"
+        );
+        assert_eq!((gates[0].offset, gates[0].len), (0, 4));
+        assert_eq!(gates[0].cmp_kind, "memcmp");
+        let site = gates[0].site_location.as_ref().expect("site location");
+        assert_eq!((site.file.as_str(), site.line), ("src/parse.c", Some(31)));
+
+        let arguments = fuzz.arguments.expect("arguments");
+        assert_eq!(arguments.len(), 2);
+        assert_eq!(arguments[0].value.as_deref(), Some("7"));
+        assert_eq!(arguments[0].span, Some([0, 4]));
+        assert_eq!(arguments[1].role, "param");
+        assert_eq!(arguments[1].len, Some(12));
+    }
+
+    /// `null` means no capture ran; `[]` means one ran and found nothing.
+    #[test]
+    fn missing_and_empty_comparison_evidence_stay_distinct() {
+        let f = normalize(asan_record(), None);
+        let fuzz = f.fuzz.unwrap();
+        assert!(fuzz.input_to_state.is_none());
+        assert!(fuzz.access.is_none());
+        assert!(fuzz.arguments.is_none());
+        let mut raw = asan_record();
+        raw["gates"] = json!([]);
+        raw["gate_capture"] = json!({"input": "min_testcase.bin", "input_len": 6,
+            "status": "no_input_comparisons", "reason": "4 comparison(s) recorded"});
+        let fuzz = normalize(raw, None).fuzz.unwrap();
+        assert_eq!(fuzz.input_to_state, Some(Vec::new()));
+        assert_eq!(
+            fuzz.input_to_state_input.as_deref(),
+            Some("min_testcase.bin"),
+            "the offsets index the replayed file"
+        );
+        // A capture that could not run recorded nothing: not "ran and found
+        // no input bytes".
+        let mut raw = asan_record();
+        raw["gates"] = json!([]);
+        raw["gate_capture"] = json!({"input": "testcase.bin", "input_len": 6,
+            "status": "unavailable", "reason": "the harness binary was not found"});
+        let fuzz = normalize(raw, None).fuzz.unwrap();
+        assert!(fuzz.input_to_state.is_none(), "{:?}", fuzz.input_to_state);
+        assert!(fuzz.input_to_state_input.is_none());
     }
 
     #[test]

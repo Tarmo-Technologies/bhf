@@ -344,6 +344,103 @@ pub struct FuzzBlock {
     pub harness_id: Option<String>,
     pub dialect: Option<String>,
     pub oracle: Option<Value>,
+    /// The memory access the sanitizer reported (`exception.access` in
+    /// `finding.json`), without the raw address. `null` when the report named
+    /// none. Added after the first v1 release: `#[serde(default)]` keeps
+    /// documents written before it readable.
+    #[serde(default)]
+    pub access: Option<MemoryAccess>,
+    /// Comparison evidence recorded while this finding's input ran: which
+    /// input bytes reached which comparison. `null` when no capture ran or it
+    /// could not run, `[]` when one ran and found no input bytes feeding a
+    /// comparison.
+    #[serde(default)]
+    pub input_to_state: Option<Vec<InputToState>>,
+    /// The finding file the `input_to_state` offsets index
+    /// (`min_testcase.bin` or `testcase.bin`), when the capture named it.
+    /// Added after the first v1 release, like `input_to_state`.
+    #[serde(default)]
+    pub input_to_state_input: Option<String>,
+    /// The values the harness decoded from the input and passed to the target
+    /// (`decoded_args` in `finding.json`). `null` when they were not traced.
+    #[serde(default)]
+    pub arguments: Option<Vec<Argument>>,
+}
+
+/// A sanitizer-reported memory access.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryAccess {
+    /// `read`, `write` or `unknown`.
+    pub direction: String,
+    pub size: Option<u64>,
+    /// `zero-page` or `high-value-address`, from the report's `Hint:`.
+    pub address_hint: Option<String>,
+    pub region: Option<AccessRegion>,
+    /// Where the region was allocated (or, for a stack object, its frame),
+    /// runtime and allocator frames dropped.
+    pub alloc_stack: Vec<Frame>,
+    pub free_stack: Vec<Frame>,
+}
+
+/// The object a memory access hit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccessRegion {
+    /// `heap`, `stack` or `global`.
+    pub kind: String,
+    pub size: Option<u64>,
+    /// Access offset from the start of the object: negative before it,
+    /// `>= size` past its end.
+    pub offset: Option<i64>,
+    /// `after`, `before` or `inside`.
+    pub relation: Option<String>,
+    pub distance: Option<u64>,
+    pub variable: Option<String>,
+    pub frame_offset: Option<u64>,
+}
+
+/// One comparison operand that came from the input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InputToState {
+    /// First input byte offset of the span.
+    pub offset: u64,
+    pub len: u64,
+    /// The operand as the comparison saw it.
+    pub operand_hex: String,
+    /// The other operand.
+    pub compared_with_hex: String,
+    /// `cmp` (integer), `switch`, `float_cmp`, `double_cmp`, `memcmp`,
+    /// `strcmp`, `strncmp`, `strcasecmp` or `strncasecmp`.
+    pub cmp_kind: String,
+    /// The comparison's offset in the harness executable (`0x...`).
+    pub site: String,
+    /// The comparison's source position, when it could be symbolized.
+    pub site_location: Option<Location>,
+    /// `equal`: the operand bytes are the input bytes; `byte_swapped`: the
+    /// same in reverse order (a big-endian read); `derived`: the operand is
+    /// computed from these bytes and changed when they did.
+    pub relation: String,
+    /// Whether the two operands were equal when compared.
+    pub operands_equal: bool,
+}
+
+/// A decoded harness argument.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Argument {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub value: Option<String>,
+    pub len: Option<u64>,
+    /// `[start, end)` byte offsets of the testcase the argument came from.
+    pub span: Option<[u64; 2]>,
+    pub preview_hex: Option<String>,
+    /// `param`, `receiver` or `out`.
+    pub role: String,
+    pub after_call_value: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

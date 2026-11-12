@@ -1667,6 +1667,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/gate_evidence.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/generate_harness.rs",
       "license": "Apache-2.0"
     },

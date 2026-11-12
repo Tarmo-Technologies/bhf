@@ -988,7 +988,7 @@ fn parse_line(line: &str) -> Option<RuntraceEvent> {
                 Some(RuntraceEvent::EnvVarAccess { api, name })
             }
         }
-        "open" | "openat" => {
+        "open" | "openat" | "fopen" | "fopen64" => {
             let path = obj.get("p").and_then(Value::as_str)?.to_owned();
             let result = obj.get("r").and_then(Value::as_i64).unwrap_or(-1);
             let taint_offset = parse_taint_offset(obj);
@@ -1606,6 +1606,28 @@ mod tests {
             &evs[0],
             RuntraceEvent::FileMissing { syscall, path, .. }
                 if syscall == "open" && path == "/etc/missing.conf"
+        ));
+    }
+
+    /// The shim's `fopen` / `fopen64` hooks log open and missing-file events
+    /// under their own names; they are file events like `open`'s.
+    #[test]
+    fn parses_fopen_events_as_file_events() {
+        let log = concat!(
+            "{\"e\":\"fopen\",\"p\":\"/etc/widget.cfg\",\"r\":-1,\"n\":2}\n",
+            "{\"e\":\"fopen64\",\"p\":\"/var/widget/state\",\"d\":5,\"r\":5}\n",
+        );
+        let evs = parse_str(log);
+        assert_eq!(evs.len(), 2, "{evs:?}");
+        assert!(matches!(
+            &evs[0],
+            RuntraceEvent::FileMissing { syscall, path, .. }
+                if syscall == "fopen" && path == "/etc/widget.cfg"
+        ));
+        assert!(matches!(
+            &evs[1],
+            RuntraceEvent::FileOpened { syscall, path, fd: 5, .. }
+                if syscall == "fopen64" && path == "/var/widget/state"
         ));
     }
 

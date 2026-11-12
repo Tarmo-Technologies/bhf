@@ -3239,12 +3239,17 @@ fn run_attempt(
                         candidate.input_reachability,
                         ipc_channel_observed,
                     );
+                    let shim_armed = fuzz_pass_shim_armed(&harness_dir, cross_runner.is_some());
                     for fid in &summary.findings {
                         let finding_path =
                             corpus::layout::finding_dir(work_dir, fid).join("finding.json");
-                        if let Err(error) =
-                            stamp_runtime_mode(&finding_path, *pass, &env_injected, reach_label)
-                        {
+                        if let Err(error) = stamp_runtime_mode(
+                            &finding_path,
+                            *pass,
+                            &env_injected,
+                            reach_label,
+                            shim_armed,
+                        ) {
                             bhfeprintln!("bhf auto: warning: stamp {fid} runtime_mode: {error}");
                         }
                     }
@@ -3326,11 +3331,13 @@ fn run_attempt(
                                 for fid in &summary.findings {
                                     let finding_path = corpus::layout::finding_dir(work_dir, fid)
                                         .join("finding.json");
+                                    // The AFL++ child runs without the runtrace shim.
                                     if let Err(error) = stamp_runtime_mode(
                                         &finding_path,
                                         crate::auto::pass::Pass::FuzzDriven,
                                         &env_injected,
                                         reach_label,
+                                        false,
                                     ) {
                                         bhfeprintln!(
                                             "bhf auto: warning: stamp {fid} runtime_mode: {error}"
@@ -4252,6 +4259,34 @@ fn dependency_fallback_after_refused_source(
     (!repair_replaces_candidate_target(&fallback, candidate)).then_some(fallback)
 }
 
+/// An interpreter/VM launcher harness (`main` is a launcher script), whose
+/// language-aware driver owns coverage and finding classification, so the
+/// native runtrace shim is not preloaded into it.
+fn harness_owns_runtime_instrumentation(harness_dir: &std::path::Path) -> bool {
+    std::fs::read_to_string(harness_dir.join("main"))
+        .map(|s| {
+            s.contains("BHF_JVM_LAUNCHER")
+                || s.contains("BHF_CS_LAUNCHER")
+                || s.contains("BHF_JS_LAUNCHER")
+                || s.contains("BHF_PY_LAUNCHER")
+                || s.contains("BHF_PL_LAUNCHER")
+                || s.contains("BHF_RB_LAUNCHER")
+                || s.contains("BHF_LUA_LAUNCHER")
+                || s.contains("BHF_PHP_LAUNCHER")
+        })
+        .unwrap_or(false)
+}
+
+/// Whether a builtin fuzz pass of this harness runs with the runtrace shim
+/// preloaded: a native (not emulated) harness without its own launcher, and
+/// the shim found. Recorded in each finding's `runtime_mode.shim_armed`, so a
+/// report can tell "no environment use observed" from "not observed".
+fn fuzz_pass_shim_armed(harness_dir: &std::path::Path, cross: bool) -> bool {
+    !cross
+        && !harness_owns_runtime_instrumentation(harness_dir)
+        && crate::auto::shim_path::locate().is_some()
+}
+
 /// One-shot warning latch so we don't print "shim not found" once
 /// per candidate during a large sweep. First-failed-lookup prints
 /// a single stderr line; every subsequent call is silent.
@@ -4401,18 +4436,7 @@ fn run_fuzz_with_runtrace(
     // comparisons). Besides false behavioral events, CPython can emit megabytes of
     // startup cmplog and miss a short campaign's handshake entirely. Native lanes
     // retain the shim; managed/scripting lanes use their language-aware drivers.
-    let owns_runtime_instrumentation = std::fs::read_to_string(harness_dir.join("main"))
-        .map(|s| {
-            s.contains("BHF_JVM_LAUNCHER")
-                || s.contains("BHF_CS_LAUNCHER")
-                || s.contains("BHF_JS_LAUNCHER")
-                || s.contains("BHF_PY_LAUNCHER")
-                || s.contains("BHF_PL_LAUNCHER")
-                || s.contains("BHF_RB_LAUNCHER")
-                || s.contains("BHF_LUA_LAUNCHER")
-                || s.contains("BHF_PHP_LAUNCHER")
-        })
-        .unwrap_or(false);
+    let owns_runtime_instrumentation = harness_owns_runtime_instrumentation(harness_dir);
     if cross_wrapper.is_some() || owns_runtime_instrumentation {
         // no shim for emulated targets or interpreter/VM lanes
     } else if let Some(shim) = crate::auto::shim_path::locate() {
@@ -8873,6 +8897,7 @@ fn stamp_runtime_mode(
     pass: crate::auto::pass::Pass,
     env_injected: &[(String, String)],
     input_reachability: Option<&str>,
+    shim_armed: bool,
 ) -> std::io::Result<()> {
     let bytes = std::fs::read(finding_path)?;
     let mut value: serde_json::Value = serde_json::from_slice(&bytes)
@@ -8899,6 +8924,8 @@ fn stamp_runtime_mode(
             serde_json::json!({
                 "pass": pass.as_str(),
                 "env_injected": env_map,
+                // Whether the runtrace shim watched this run's environment use.
+                "shim_armed": shim_armed,
             }),
         );
         // Persist the fuzzed entry's attacker-reachability so the recomputed
@@ -10161,10 +10188,12 @@ mod stamp_tests {
                 "/tmp/bhf/fake_env/ACME_HOME".to_owned(),
             )],
             None,
+            true,
         )
         .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(parsed["runtime_mode"]["pass"], "rng");
+        assert_eq!(parsed["runtime_mode"]["shim_armed"], true);
         assert_eq!(
             parsed["runtime_mode"]["env_injected"]["ACME_HOME"],
             "/tmp/bhf/fake_env/ACME_HOME"
@@ -10180,9 +10209,13 @@ mod stamp_tests {
     #[test]
     fn empty_env_injected_stamps_empty_object() {
         let path = tmp_finding();
-        stamp_runtime_mode(&path, Pass::Empty, &[], None).unwrap();
+        stamp_runtime_mode(&path, Pass::Empty, &[], None, false).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(parsed["runtime_mode"]["pass"], "empty");
+        assert_eq!(
+            parsed["runtime_mode"]["shim_armed"], false,
+            "a run without the shim says so"
+        );
         assert!(parsed["runtime_mode"]["env_injected"]
             .as_object()
             .unwrap()
@@ -10224,6 +10257,7 @@ mod stamp_tests {
                 "/tmp/bhf/fake_env/ACME_HOME".to_owned(),
             )],
             None,
+            true,
         )
         .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();

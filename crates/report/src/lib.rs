@@ -2865,6 +2865,19 @@ fn sarif_result(
             .expect("properties is an object")
             .insert("cwe".to_owned(), json!(cwe));
     }
+    // Comparison evidence recorded for this input (`finding.json` `gates`):
+    // which input bytes reached which comparison of the target, and the file
+    // whose bytes the offsets index.
+    if let Some(gates) = recorded_gates(&finding.raw) {
+        let bag = properties.as_object_mut().expect("properties is an object");
+        bag.insert(
+            "bhfInputToState".to_owned(),
+            sarif_input_to_state(gates, root),
+        );
+        if let Some(input) = string_at(&finding.raw, &["gate_capture", "input"]) {
+            bag.insert("bhfInputToStateInput".to_owned(), json!(input));
+        }
+    }
     if let Some(rule) = rule {
         let cwe = finding_cwe.unwrap_or(rule.cwe);
         let mut tags = vec![cwe.to_owned()];
@@ -3340,7 +3353,64 @@ fn sarif_related_locations(finding: &FindingReport, root: Option<&Path>) -> Vec<
         }));
         next_id = next_id.saturating_add(1);
     }
+    // The source position of each comparison an input byte reached.
+    let input = string_at(&finding.raw, &["gate_capture", "input"])
+        .map(|name| format!(" of {name}"))
+        .unwrap_or_default();
+    for gate in recorded_gates(&finding.raw).into_iter().flatten() {
+        let Some(file) = string_at(gate, &["location", "file"]) else {
+            continue;
+        };
+        let mut physical = json!({ "artifactLocation": sarif_artifact_location(&file, root) });
+        if let Some(line) = gate.pointer("/location/line").and_then(Value::as_u64) {
+            physical["region"] = json!({ "startLine": line.max(1) });
+        }
+        let offset = gate.get("offset").and_then(Value::as_u64).unwrap_or(0);
+        let len = gate.get("len").and_then(Value::as_u64).unwrap_or(0);
+        let kind = string_at(gate, &["cmp_kind"]).unwrap_or_else(|| "comparison".to_owned());
+        locations.push(json!({
+            "id": next_id,
+            "physicalLocation": physical,
+            "message": {
+                "text": format!("Input bytes {offset}..{}{input} reach this {kind}", offset + len),
+            }
+        }));
+        next_id = next_id.saturating_add(1);
+    }
     locations
+}
+
+/// `finding.json` `gates`, unless its `gate_capture` says the capture could
+/// not run: then nothing was recorded, which is not an empty result.
+fn recorded_gates(raw: &Value) -> Option<&Vec<Value>> {
+    let unavailable =
+        raw.pointer("/gate_capture/status").and_then(Value::as_str) == Some("unavailable");
+    raw.get("gates")
+        .and_then(Value::as_array)
+        .filter(|_| !unavailable)
+}
+
+/// `finding.json` `gates` for the SARIF property bag, with each comparison
+/// site's file made relative to the source root where it lies under it.
+fn sarif_input_to_state(gates: &[Value], root: Option<&Path>) -> Value {
+    Value::Array(
+        gates
+            .iter()
+            .filter(|gate| gate.is_object())
+            .map(|gate| {
+                let mut gate = gate.clone();
+                if let Some(file) = string_at(&gate, &["location", "file"]) {
+                    if let Some(uri) = sarif_artifact_location(&file, root)
+                        .get("uri")
+                        .and_then(Value::as_str)
+                    {
+                        gate["location"]["file"] = json!(uri);
+                    }
+                }
+                gate
+            })
+            .collect(),
+    )
 }
 
 fn build_dependency_paths(build: &Value) -> Vec<(String, &'static str)> {
@@ -4853,6 +4923,74 @@ mod tests {
     /// #484: SARIF results carry a `confirmation` property. A `fuzz_confirmed`
     /// static finding (join-upgraded) surfaces that provenance; a static-scan
     /// finding with no marker defaults to `static`.
+    /// Comparison evidence a finding records reaches SARIF as the
+    /// `bhfInputToState` property and as related locations at each compare
+    /// site; a finding without it carries neither.
+    #[test]
+    fn sarif_result_carries_input_to_state_evidence() {
+        let mut gated =
+            finding_report_with_actionability("F-gated", actionability::Verdict::LikelyReachable);
+        gated.raw = json!({
+            "gates": [{
+                "offset": 0, "len": 5, "operand_hex": "5749444745", "compared_with_hex": "5749444745",
+                "cmp_kind": "strcmp", "site": "0x1a2b", "relation": "equal", "operands_equal": true,
+                "location": {"file": "/src/widget/parse.c", "line": 12, "function": "parse_record"}
+            }],
+            "gate_capture": {"input": "min_testcase.bin", "input_len": 5, "status": "recorded"}
+        });
+        let plain =
+            finding_report_with_actionability("F-plain", actionability::Verdict::LikelyReachable);
+        // A capture that could not run recorded nothing.
+        let mut unavailable =
+            finding_report_with_actionability("F-unrun", actionability::Verdict::LikelyReachable);
+        unavailable.raw = json!({
+            "gates": [],
+            "gate_capture": {"input": "testcase.bin", "input_len": 5, "status": "unavailable",
+                             "reason": "the harness binary was not found"}
+        });
+        let mut document = report_document_with_single_actionability_finding();
+        document.findings = vec![gated, plain, unavailable];
+
+        let sarif = render_sarif_report(&document);
+        let results = sarif["runs"][0]["results"].as_array().unwrap();
+        let result = |id: &str| {
+            results
+                .iter()
+                .find(|r| r["properties"]["bhfFindingId"] == id)
+                .unwrap()
+        };
+        let gates = result("F-gated")["properties"]["bhfInputToState"]
+            .as_array()
+            .expect("bhfInputToState");
+        assert_eq!(gates.len(), 1);
+        assert_eq!(gates[0]["offset"], 0);
+        assert_eq!(gates[0]["cmp_kind"], "strcmp");
+        assert_eq!(
+            result("F-gated")["properties"]["bhfInputToStateInput"],
+            "min_testcase.bin"
+        );
+        let related = result("F-gated")["relatedLocations"].as_array().unwrap();
+        assert!(
+            related.iter().any(|loc| {
+                loc["message"]["text"] == "Input bytes 0..5 of min_testcase.bin reach this strcmp"
+                    && loc["physicalLocation"]["region"]["startLine"] == 12
+            }),
+            "{related:?}"
+        );
+        for id in ["F-plain", "F-unrun"] {
+            assert!(
+                result(id)["properties"].get("bhfInputToState").is_none(),
+                "{id}"
+            );
+            assert!(
+                result(id)["properties"]
+                    .get("bhfInputToStateInput")
+                    .is_none(),
+                "{id}"
+            );
+        }
+    }
+
     #[test]
     fn sarif_result_carries_confirmation_property() {
         let mut confirmed = finding_report_with_actionability(

@@ -16,25 +16,25 @@
   "subject": [
     {
       "digest": {
-        "sha256": "66cb138c12cd1b6e4dc0921daf555777eb2829dba0c0654ed8d08f3a6b980c32"
+        "sha256": "58f81cddd43d70ffcac1077b9b6a432c888134bbdc45c6d8303fcc56d21e72b4"
       },
       "name": "INDEX.md"
     },
     {
       "digest": {
-        "sha256": "11ca28e1381f67f72e4cba23a5c41eafff1f09f0a96840e4dbcb9ce2172059c3"
+        "sha256": "ddf2cafea6341793486531c02bc626b96f6c9ab59888e88f9601b1bee827eb28"
       },
       "name": "findings.csv"
     },
     {
       "digest": {
-        "sha256": "c39723f23cd2e111dcab914f9270ee7d10d13c6bc5899b8006588c9d43ee53f8"
+        "sha256": "9da570cddeda4528ce205248e944bbf48e3c37128e5d92703c8a0b3dbd09fb64"
       },
       "name": "findings.json"
     },
     {
       "digest": {
-        "sha256": "2ead982fa22f3fc61f55071e47ef9bf46074fb6bac5cfea00c603186010ba1e4"
+        "sha256": "9bb2da5d3cc3cf6973be316c79be215fc591b30b8dc88057422b8cf6bca5f8de"
       },
       "name": "findings.sarif"
     },
@@ -52,7 +52,7 @@
     },
     {
       "digest": {
-        "sha256": "a36cb214534ea62f8ca91f0b0b08a02be791e6af8584e1b1e67a154e044a0b3c"
+        "sha256": "efcf514c32a147639df1f331ed9fb19640bc9533bcbc3f58b45e0ae9c56531ef"
       },
       "name": "findings/F-0000-1a2b3c4d/finding.json"
     },

@@ -60,7 +60,8 @@ pub struct ReportArgs {
     /// the recorded crash, write its sanitizer.log, crash frames and memory
     /// access into the finding. Findings whose harness is gone, that now
     /// crash elsewhere, or whose replay is unsymbolized, are listed and left
-    /// as they were.
+    /// as they were. Runtime findings whose harness records comparisons also
+    /// get the comparison evidence of their input (`gates` in finding.json).
     #[arg(long, conflicts_with_all = ["findings", "out"])]
     pub backfill: bool,
 }

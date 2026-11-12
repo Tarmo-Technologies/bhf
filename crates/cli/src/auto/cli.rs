@@ -2794,6 +2794,15 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
             );
         }
     }
+    // After minimization, so a minimized input is the one replayed: which input
+    // bytes reach which comparison, and the environment that one input touched.
+    let (captured, uncaptured) = crate::gate_evidence::run_pass(&work);
+    if captured + uncaptured > 0 {
+        bhfeprintln!(
+            "bhf: recorded comparison evidence for {captured} finding(s); {uncaptured} left for \
+             `bhf explain` to record (time budget)"
+        );
+    }
 
     // --install-deps: read the just-written manifest and fetch what we can
     // (online, opt-in). Re-run afterward to build against the real deps.

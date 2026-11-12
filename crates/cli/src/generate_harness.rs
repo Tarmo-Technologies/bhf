@@ -3127,11 +3127,21 @@ fn push_unique_dictionary_tokens(tokens: &mut Vec<String>, incoming: Vec<String>
     }
 }
 
+/// The first lines of a harness's `dictionary.txt`: where its tokens come
+/// from, so nobody reads them as values the engine observed.
+pub(crate) const DICTIONARY_HEADER: &str = "\
+# Tokens mined from the target's source when this harness was generated:
+# string literals (not #include paths), case labels, comparison literals,
+# #define values and enum members. Not runtime evidence: comparison operands
+# observed while fuzzing are in cmplog.jsonl beside this file.
+";
+
 pub(crate) fn write_harness_dictionary(output_dir: &Path, tokens: &[String]) -> Result<()> {
     if tokens.is_empty() {
         return Ok(());
     }
-    let mut out = String::new();
+    // AFL, libFuzzer and bhf's own dictionary parser skip `#` lines.
+    let mut out = String::from(DICTIONARY_HEADER);
     for token in tokens {
         out.push('"');
         out.push_str(&escape_afl_dictionary_token(token.as_bytes()));
@@ -3139,7 +3149,11 @@ pub(crate) fn write_harness_dictionary(output_dir: &Path, tokens: &[String]) -> 
         // #379: also emit the raw little- and big-endian bytes of a numeric
         // magic constant so the dictionary matches the bytes the target
         // compares, not the ASCII spelling of the literal.
-        for raw in numeric_token_byte_encodings(token) {
+        let encodings = numeric_token_byte_encodings(token);
+        if !encodings.is_empty() {
+            out.push_str("# raw bytes of the literal above\n");
+        }
+        for raw in encodings {
             out.push('"');
             out.push_str(&escape_afl_dictionary_token(&raw));
             out.push_str("\"\n");
@@ -20719,6 +20733,11 @@ class basic_json
         .unwrap();
 
         let dictionary = fs::read_to_string(temp.join("out/H-CDICT/dictionary.txt")).unwrap();
+        assert!(
+            dictionary.starts_with(crate::generate_harness::DICTIONARY_HEADER),
+            "the dictionary says where its tokens come from:\n{dictionary}"
+        );
+        assert!(dictionary.contains("# raw bytes of the literal above\n\"\\x04\\x03KP\""));
         assert!(dictionary.contains("\"GIF89a\""));
         assert!(dictionary.contains("\"0x504b0304\""));
         // #379: the numeric magic 0x504b0304 must also appear as raw bytes so it

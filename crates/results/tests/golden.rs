@@ -43,7 +43,16 @@ fn build(work: &Path) {
             "cluster_normalized_frames": ["parse_header"], "cluster_fallback": false,
             "rule_id": "BHF-201", "classification": "unhandled", "harness_id": "H-C-parse", "dialect": "c11",
             "exception": {"name": "ASAN_HEAP_BUFFER_OVERFLOW", "message": "heap-buffer-overflow on address 0x602000000010",
-                          "sanitizer": "asan", "stack": [{"function": "parse_header", "file": "/src/demo/src/parse.c", "line": 42}]},
+                          "sanitizer": "asan", "stack": [{"function": "parse_header", "file": "/src/demo/src/parse.c", "line": 42}],
+                          "access": {"direction": "read", "size": 4, "address": "0x602000000010",
+                                     "region": {"kind": "heap", "size": 4, "offset": 4, "relation": "after", "distance": 0},
+                                     "alloc_stack": [{"function": "malloc", "file": "/llvm/compiler-rt/lib/asan/asan_malloc_linux.cpp", "line": 68},
+                                                     {"function": "parse_header", "file": "/src/demo/src/parse.c", "line": 38}]}},
+            "gates": [{"offset": 0, "len": 1, "operand_hex": "41", "compared_with_hex": "41", "cmp_kind": "cmp",
+                       "site": "0x1a2b", "location": {"file": "/src/demo/src/parse.c", "line": 40, "function": "parse_header"},
+                       "relation": "equal", "operands_equal": true}],
+            "gate_capture": {"input": "min_testcase.bin", "input_len": 1, "status": "recorded", "reason": null,
+                             "comparisons": 2, "truncated": false, "unconfirmed": 0, "runs": 6, "shim_armed": false},
             "build": {"binary": {"sha256": "2222222222222222222222222222222222222222222222222222222222222222", "build_id": "abcdef01"}}
         }),
     );

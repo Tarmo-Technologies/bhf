@@ -103,6 +103,83 @@
     "confirmation_level": {
       "enum": ["sanitizer_crash", "runtime_oracle", "capability", "crash_lead", "intended_rejection", "static_confirmed", "static", "advisory"]
     },
+    "memory_access": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["direction", "size", "address_hint", "region", "alloc_stack", "free_stack"],
+      "properties": {
+        "direction": { "enum": ["read", "write", "unknown"] },
+        "size": { "type": ["integer", "null"], "minimum": 0 },
+        "address_hint": { "$ref": "#/$defs/nullable_string" },
+        "region": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind", "size", "offset", "relation", "distance", "variable", "frame_offset"],
+              "properties": {
+                "kind": { "type": "string", "minLength": 1 },
+                "size": { "type": ["integer", "null"], "minimum": 0 },
+                "offset": { "type": ["integer", "null"] },
+                "relation": { "$ref": "#/$defs/nullable_string" },
+                "distance": { "type": ["integer", "null"], "minimum": 0 },
+                "variable": { "$ref": "#/$defs/nullable_string" },
+                "frame_offset": { "type": ["integer", "null"], "minimum": 0 }
+              }
+            }
+          ]
+        },
+        "alloc_stack": { "type": "array", "maxItems": 8, "items": { "$ref": "#/$defs/frame" } },
+        "free_stack": { "type": "array", "maxItems": 8, "items": { "$ref": "#/$defs/frame" } }
+      }
+    },
+    "frame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["function", "file", "line"],
+      "properties": {
+        "function": { "$ref": "#/$defs/nullable_string" },
+        "file": { "$ref": "#/$defs/nullable_string" },
+        "line": { "type": ["integer", "null"], "minimum": 1 }
+      }
+    },
+    "input_to_state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["offset", "len", "operand_hex", "compared_with_hex", "cmp_kind", "site", "site_location", "relation", "operands_equal"],
+      "properties": {
+        "offset": { "type": "integer", "minimum": 0 },
+        "len": { "type": "integer", "minimum": 1 },
+        "operand_hex": { "type": "string", "pattern": "^([0-9a-f]{2})*$" },
+        "compared_with_hex": { "type": "string", "pattern": "^([0-9a-f]{2})*$" },
+        "cmp_kind": { "enum": ["cmp", "switch", "float_cmp", "double_cmp", "memcmp", "strcmp", "strncmp", "strcasecmp", "strncasecmp"] },
+        "site": { "type": "string", "pattern": "^0x[0-9a-f]+$" },
+        "site_location": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/location" }] },
+        "relation": { "enum": ["equal", "byte_swapped", "derived"] },
+        "operands_equal": { "type": "boolean" }
+      }
+    },
+    "argument": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "type", "value", "len", "span", "preview_hex", "role", "after_call_value"],
+      "properties": {
+        "name": { "type": "string" },
+        "type": { "type": "string" },
+        "value": { "$ref": "#/$defs/nullable_string" },
+        "len": { "type": ["integer", "null"], "minimum": 0 },
+        "span": {
+          "oneOf": [
+            { "type": "null" },
+            { "type": "array", "items": { "type": "integer", "minimum": 0 }, "minItems": 2, "maxItems": 2 }
+          ]
+        },
+        "preview_hex": { "$ref": "#/$defs/nullable_string" },
+        "role": { "enum": ["param", "receiver", "out"] },
+        "after_call_value": { "$ref": "#/$defs/nullable_string" }
+      }
+    },
     "location": {
       "type": "object",
       "additionalProperties": false,
@@ -266,7 +343,7 @@
                     "additionalProperties": false,
                     "required": ["role", "path", "sha256", "size"],
                     "properties": {
-                      "role": { "enum": ["finding", "testcase", "testcase_minimized", "sanitizer_log", "decoded", "replay_script", "repro_ada", "byte_control"] },
+                      "role": { "enum": ["finding", "testcase", "testcase_minimized", "sanitizer_log", "decoded", "replay_script", "repro_ada", "byte_control", "runtrace"] },
                       "path": { "type": "string", "pattern": "^findings/" },
                       "sha256": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" },
                       "size": { "type": "integer", "minimum": 0 }
@@ -298,7 +375,23 @@
                 "classification": { "$ref": "#/$defs/nullable_string" },
                 "harness_id": { "$ref": "#/$defs/nullable_string" },
                 "dialect": { "$ref": "#/$defs/nullable_string" },
-                "oracle": { "type": ["object", "null"] }
+                "oracle": { "type": ["object", "null"] },
+                "access": {
+                  "description": "The memory access the sanitizer reported, without its raw address. Added after the first v1 release, so documents written before it omit the key.",
+                  "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/memory_access" }]
+                },
+                "input_to_state": {
+                  "description": "Comparison evidence recorded while the finding's input ran: null when no capture ran or it could not run, [] when one ran and no input bytes fed a comparison. Added after the first v1 release.",
+                  "oneOf": [{ "type": "null" }, { "type": "array", "items": { "$ref": "#/$defs/input_to_state" } }]
+                },
+                "input_to_state_input": {
+                  "description": "The finding file whose bytes the input_to_state offsets index (min_testcase.bin or testcase.bin), or null when the capture did not name it. Added after the first v1 release.",
+                  "type": ["string", "null"]
+                },
+                "arguments": {
+                  "description": "The values the harness decoded from the input and passed to the target, when traced. Added after the first v1 release.",
+                  "oneOf": [{ "type": "null" }, { "type": "array", "items": { "$ref": "#/$defs/argument" } }]
+                }
               }
             }
           ]

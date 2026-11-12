@@ -25,7 +25,7 @@ fn main() {
     let exports = out_dir.join("format_hook_exports.map");
     std::fs::write(
         &exports,
-        "{ global: printf; fprintf; dprintf; sprintf; snprintf; __assert_fail; __assert_perror_fail; };",
+        "{ global: printf; fprintf; dprintf; sprintf; snprintf; dlsym; __assert_fail; __assert_perror_fail; };",
     )
     .expect("write format hook export map");
     println!(
@@ -34,6 +34,10 @@ fn main() {
     );
     cc::Build::new()
         .file("src/hooks/format_hooks.c")
+        // The dlsym trampoline's forward must compile to a tail call (see
+        // format_hooks.c); optimized in every profile, so it does.
+        .opt_level(2)
+        .flag_if_supported("-foptimize-sibling-calls")
         .warnings(false)
         .compile("bhf_format_hooks");
 }

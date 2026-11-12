@@ -65,7 +65,7 @@ pub(crate) fn representatives(work_dir: &Path) -> Vec<Pick> {
 /// in the work dir holding the finding first (so a copied work dir uses its
 /// own harness), else the standard harness dirs for its `harness_id`, else a
 /// `fixture_path` that points into another work dir.
-fn harness_for(work_dir: &Path, pick: &Pick) -> Option<PathBuf> {
+pub(crate) fn harness_for(work_dir: &Path, pick: &Pick) -> Option<PathBuf> {
     let fixture = pick.fixture_path.as_deref();
     if let Some(path) = fixture.and_then(|fixture| {
         corpus::finding::fixture_path_candidates(&pick.dir, fixture)
