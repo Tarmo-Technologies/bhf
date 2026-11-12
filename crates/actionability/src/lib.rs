@@ -520,12 +520,7 @@ fn sanitizer_patch_hint(raw: &Value) -> Option<PatchHint> {
                 "Validate the pointer and any offset/length before the access at {at}; reject inputs that drive it out of range."
             ),
         ),
-        BugClass::UndefinedBehavior => (
-            "Check before the arithmetic / shift",
-            format!(
-                "Check for overflow before the arithmetic at {at} (or use a wider / unsigned type), and validate shift amounts and conversions against their type's range."
-            ),
-        ),
+        BugClass::UndefinedBehavior(check) => ub_patch_hint(check, &at),
         BugClass::Timeout => (
             "Bound the work per input",
             format!(
@@ -1459,7 +1454,7 @@ fn is_harness_cleanup_artifact(raw: &Value) -> bool {
         | BugClass::GlobalBufferOverflow
         | BugClass::NullDeref
         | BugClass::WildSegv
-        | BugClass::UndefinedBehavior => {}
+        | BugClass::UndefinedBehavior(_) => {}
         _ => return false,
     }
     let Some(frames) = raw.pointer("/exception/stack").and_then(Value::as_array) else {
@@ -1898,7 +1893,9 @@ enum BugClass {
     MemoryLeak,
     NullDeref,
     WildSegv,
-    UndefinedBehavior,
+    /// An UndefinedBehaviorSanitizer check (or the generic undefined-behavior
+    /// class), by check family.
+    UndefinedBehavior(UbCheck),
     Timeout,
     OutOfMemory,
     /// Reachable assertion / `abort()` / `SIGABRT` with no memory-safety class.
@@ -1926,6 +1923,50 @@ enum BugClass {
     Unknown,
 }
 
+/// The UndefinedBehaviorSanitizer check families bhf explains and advises on
+/// separately. UBSan's NULL and division-by-zero checks map to
+/// [`BugClass::NullDeref`] and [`BugClass::DivideByZero`] instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UbCheck {
+    IntegerOverflow,
+    IndexOutOfBounds,
+    VlaBound,
+    InvalidShift,
+    MissingReturn,
+    Unreachable,
+    InvalidValueLoad,
+    FloatCastOverflow,
+    ImplicitConversion,
+    PointerOverflow,
+    Misaligned,
+    ObjectSize,
+    TypeMismatch,
+    InvalidBuiltin,
+    Generic,
+}
+
+impl UbCheck {
+    fn slug(self) -> &'static str {
+        match self {
+            Self::IntegerOverflow => "integer-overflow",
+            Self::IndexOutOfBounds => "array-index-out-of-bounds",
+            Self::VlaBound => "invalid-vla-bound",
+            Self::InvalidShift => "invalid-shift",
+            Self::MissingReturn => "missing-return",
+            Self::Unreachable => "unreachable",
+            Self::InvalidValueLoad => "invalid-value-load",
+            Self::FloatCastOverflow => "float-cast-overflow",
+            Self::ImplicitConversion => "implicit-conversion",
+            Self::PointerOverflow => "pointer-overflow",
+            Self::Misaligned => "misaligned-access",
+            Self::ObjectSize => "insufficient-object-size",
+            Self::TypeMismatch => "type-mismatch",
+            Self::InvalidBuiltin => "invalid-builtin-use",
+            Self::Generic => "undefined-behavior",
+        }
+    }
+}
+
 impl BugClass {
     fn slug(self) -> &'static str {
         match self {
@@ -1938,7 +1979,7 @@ impl BugClass {
             Self::MemoryLeak => "memory-leak",
             Self::NullDeref => "null-deref",
             Self::WildSegv => "segv",
-            Self::UndefinedBehavior => "undefined-behavior",
+            Self::UndefinedBehavior(check) => check.slug(),
             Self::Timeout => "timeout",
             Self::OutOfMemory => "out-of-memory",
             Self::ReachableAssertion => "reachable-assertion",
@@ -1970,15 +2011,168 @@ fn segv_sub_page_fault(hay: &str) -> bool {
     u64::from_str_radix(&hex, 16).is_ok_and(|addr| addr < 0x1000)
 }
 
+/// The part of a report message classification may read: the text after a
+/// UBSan `runtime error:` marker, else after a leading `<file>:<line>[:<col>]:`
+/// source prefix, else the whole message. The source path is never part of it,
+/// so a directory named `zoom`, `timeout` or `division_by_zero` cannot change
+/// the bug class.
+fn classification_text(message: &str) -> &str {
+    if let Some((_, after)) = message.split_once("runtime error:") {
+        return after.trim();
+    }
+    let mut fields = message.splitn(4, ':');
+    let file = fields.next().unwrap_or("");
+    let numeric = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let rest: Vec<&str> = fields.collect();
+    let prefixed = !file.trim().is_empty() && !file.contains(char::is_whitespace);
+    match rest.as_slice() {
+        [line, col, tail] if prefixed && numeric(line) && numeric(col) => tail.trim(),
+        [line, tail @ ..] if prefixed && numeric(line) && !tail.is_empty() => {
+            let skip = file.len() + 1 + line.len() + 1;
+            message.get(skip..).unwrap_or(message).trim()
+        }
+        _ => message,
+    }
+}
+
+/// Whether `word` occurs in `hay` as a whole word (bounded by non-alphanumeric
+/// characters), so `oom` matches `ASAN_OOM` but not `zoom` or `room`.
+fn has_word(hay: &str, word: &str) -> bool {
+    hay.match_indices(word).any(|(start, _)| {
+        let before = hay[..start].chars().next_back();
+        let after = hay[start + word.len()..].chars().next();
+        !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+    })
+}
+
+/// The UBSan check kind of a UBSan finding, from structured fields first: the
+/// kind in `exception.name` (`UBSAN_MISSING_RETURN`), then UBSan's check name
+/// (`exception.check`), and only then the report text after `runtime error:`.
+/// `None` for a finding that is not UBSan's.
+fn ubsan_kind(raw: &Value, name: &str, sanitizer: &str, message: &str) -> Option<&'static str> {
+    let upper = name.to_ascii_uppercase();
+    let prefixed = upper.strip_prefix("UBSAN_");
+    if sanitizer != "ubsan" && prefixed.is_none() {
+        return None;
+    }
+    // `UBSAN_MISSING_RETURN`, or a bare `missing-return` on a UBSan record.
+    let named = prefixed
+        .unwrap_or(&upper)
+        .to_ascii_lowercase()
+        .replace('_', "-");
+    let structured = Some(named.as_str())
+        .and_then(|kind| {
+            finding_rules::ubsan::KINDS
+                .iter()
+                .copied()
+                .find(|known| *known == kind)
+        })
+        .filter(|kind| *kind != "undefined-behavior");
+    if structured.is_some() {
+        return structured;
+    }
+    if let Some(kind) = string_at(raw, &["exception", "check"])
+        .and_then(|check| finding_rules::ubsan::kind_for_check_name(&check))
+    {
+        return Some(kind);
+    }
+    Some(finding_rules::ubsan::kind_for_message(classification_text(
+        message,
+    )))
+}
+
+/// The bug class of a UBSan kind.
+fn class_for_ubsan_kind(kind: &str) -> BugClass {
+    let check = match kind {
+        "null-pointer-dereference" => return BugClass::NullDeref,
+        "division-by-zero" => return BugClass::DivideByZero,
+        "signed-integer-overflow" | "unsigned-integer-overflow" => UbCheck::IntegerOverflow,
+        "out-of-bounds-access" => UbCheck::IndexOutOfBounds,
+        "invalid-vla-bound" => UbCheck::VlaBound,
+        "invalid-shift" => UbCheck::InvalidShift,
+        "missing-return" => UbCheck::MissingReturn,
+        "unreachable" => UbCheck::Unreachable,
+        "invalid-value-load" => UbCheck::InvalidValueLoad,
+        "float-cast-overflow" => UbCheck::FloatCastOverflow,
+        "implicit-conversion" => UbCheck::ImplicitConversion,
+        "pointer-overflow" => UbCheck::PointerOverflow,
+        "misaligned-access" => UbCheck::Misaligned,
+        "insufficient-object-size" => UbCheck::ObjectSize,
+        "type-mismatch" => UbCheck::TypeMismatch,
+        "invalid-builtin-use" => UbCheck::InvalidBuiltin,
+        _ => UbCheck::Generic,
+    };
+    BugClass::UndefinedBehavior(check)
+}
+
+/// The direction of a faulting access: `exception.access.direction` when the
+/// finding records it, else ASan's `READ`/`WRITE` token as folded into the
+/// message (`(READ of size 4)`, `(WRITE memory access)`), never a substring
+/// (`thread` is not a read). A non-canonical ("high value") address faults
+/// before any direction is known, whatever ASan printed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Read,
+    Write,
+    Unknown,
+}
+
+fn access_direction(raw: &Value) -> Direction {
+    let message = string_at(raw, &["exception", "message"]).unwrap_or_default();
+    if let Some(access) = raw.pointer("/exception/access") {
+        if string_at(access, &["address_hint"]).as_deref() == Some("high-value-address") {
+            return Direction::Unknown;
+        }
+        return match string_at(access, &["direction"]).as_deref() {
+            Some("read") => Direction::Read,
+            Some("write") => Direction::Write,
+            _ => Direction::Unknown,
+        };
+    }
+    if message.contains("high value address") {
+        return Direction::Unknown;
+    }
+    let tokens: Vec<&str> = message
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    for pair in tokens.windows(2) {
+        if matches!(pair[1], "of" | "memory") {
+            match pair[0] {
+                "READ" => return Direction::Read,
+                "WRITE" => return Direction::Write,
+                _ => {}
+            }
+        }
+    }
+    // UBSan's object-size check names the operation: `load of address` /
+    // `store to address ... with insufficient space`.
+    let text = classification_text(&message);
+    if text.starts_with("load of") {
+        return Direction::Read;
+    }
+    if text.starts_with("store to") {
+        return Direction::Write;
+    }
+    Direction::Unknown
+}
+
 fn classify_bug(raw: &Value) -> BugClass {
     let name = string_at(raw, &["exception", "name"]).unwrap_or_default();
     let sanitizer = string_at(raw, &["exception", "sanitizer"])
         .unwrap_or_default()
         .to_ascii_lowercase();
     let message = string_at(raw, &["exception", "message"]).unwrap_or_default();
+    // A UBSan finding is classified by its check, before any message needle:
+    // its message starts with the source path, which is not evidence.
+    if let Some(kind) = ubsan_kind(raw, &name, &sanitizer, &message) {
+        return class_for_ubsan_kind(kind);
+    }
+    let rule_id = string_at(raw, &["rule_id"]).unwrap_or_default();
     // Normalize `_`/`-` so `HEAP_BUFFER_OVERFLOW` and `heap-buffer-overflow`
-    // both match the same needles.
-    let hay = format!("{name} {message}")
+    // both match the same needles. Only the message text after any source
+    // location prefix is read.
+    let hay = format!("{name} {}", classification_text(&message))
         .to_ascii_lowercase()
         .replace('_', "-");
     let has = |needle: &str| hay.contains(needle);
@@ -2036,11 +2230,11 @@ fn classify_bug(raw: &Value) -> BugClass {
         || has("requested allocation size")
         || has("rss-limit")
         || has("rss limit")
-        || has("oom")
+        || has_word(&hay, "oom")
     {
         return BugClass::OutOfMemory;
     }
-    if has("timeout") || has("timed out") {
+    if has_word(&hay, "timeout") || has("timed out") {
         return BugClass::Timeout;
     }
     // Divide-by-zero is its own weakness (CWE-369), not generic UB. Catch it
@@ -2060,16 +2254,21 @@ fn classify_bug(raw: &Value) -> BugClass {
     {
         return BugClass::DivideByZero;
     }
-    if sanitizer == "ubsan"
-        || has("undefined-behavior")
-        || has("signed-integer-overflow")
-        || has("integer-overflow")
-        || has("shift-exponent")
-        || has("invalid-shift")
-        || has("float-cast-overflow")
-        || has("misaligned-address")
-    {
-        return BugClass::UndefinedBehavior;
+    // UB named by a non-UBSan lane (UBSan findings returned above).
+    if has("signed-integer-overflow") || has("integer-overflow") {
+        return BugClass::UndefinedBehavior(UbCheck::IntegerOverflow);
+    }
+    if has("shift-exponent") || has("invalid-shift") {
+        return BugClass::UndefinedBehavior(UbCheck::InvalidShift);
+    }
+    if has("float-cast-overflow") {
+        return BugClass::UndefinedBehavior(UbCheck::FloatCastOverflow);
+    }
+    if has("misaligned-address") {
+        return BugClass::UndefinedBehavior(UbCheck::Misaligned);
+    }
+    if has("undefined-behavior") {
+        return BugClass::UndefinedBehavior(UbCheck::Generic);
     }
     // An uncaught/unhandled exception escaping a managed runtime (Jazzer-style
     // JVM throwable, etc.) terminates the process — CWE-248.
@@ -2084,11 +2283,20 @@ fn classify_bug(raw: &Value) -> BugClass {
         return BugClass::UncaughtException;
     }
     if has("segv") || has("sigsegv") || has("segmentation") || has("access-violation") {
+        // The parser already split SEGVs into NULL (BHF-206) and wild-address
+        // (BHF-223) rules; a wild-address rule is never a NULL dereference.
+        if rule_id == "BHF-223" {
+            return BugClass::WildSegv;
+        }
         // A near-null fault — a null base pointer plus a small struct-field /
         // array-element offset — lands at a SUB-PAGE address, not exactly zero. The
         // old `0x000000000000` (12-zero) needle missed those; treat any sub-page
         // fault address as a NULL deref (CWE-476) rather than a wild SEGV (#30).
-        if has("0x000000000000") || has("null") || segv_sub_page_fault(&hay) {
+        let zero_page = raw
+            .pointer("/exception/access/address_hint")
+            .and_then(Value::as_str)
+            == Some("zero-page");
+        if zero_page || has("0x000000000000") || has("null") || segv_sub_page_fault(&hay) {
             return BugClass::NullDeref;
         }
         return BugClass::WildSegv;
@@ -2129,27 +2337,32 @@ fn classify_bug(raw: &Value) -> BugClass {
 /// human-readable name. Returns `(vec![], None)` for an unknown bug class.
 fn cwe_for_finding(raw: &Value) -> (Vec<String>, Option<String>) {
     let class = classify_bug(raw);
-    // Read vs write disambiguates the overflow CWEs; the UB subtype distinguishes
-    // signed-overflow (CWE-190) from other undefined behavior (CWE-682).
+    // Read vs write disambiguates the out-of-bounds CWEs; an unknown direction
+    // is the general CWE-119, never a guessed write.
+    let direction = access_direction(raw);
+    let read_write_or_119 = || match direction {
+        Direction::Read => ("CWE-125", None),
+        Direction::Write => ("CWE-787", None),
+        Direction::Unknown => ("CWE-119", None),
+    };
+    // The bounds-checked-panic class still names a write in its prose
+    // (`copy_from_slice`, an explicit "write").
     let hay = format!(
         "{} {}",
         string_at(raw, &["exception", "name"]).unwrap_or_default(),
-        string_at(raw, &["exception", "message"]).unwrap_or_default()
+        classification_text(&string_at(raw, &["exception", "message"]).unwrap_or_default())
     )
     .to_ascii_lowercase()
     .replace('_', "-");
-    let is_read = hay.contains("read");
-    let is_write = hay.contains("write");
+    let is_write = direction == Direction::Write || has_word(&hay, "write");
 
     let (primary, secondary): (&str, Option<&str>) = match class {
         BugClass::HeapBufferOverflow => (
             "CWE-122",
-            if is_write {
-                Some("CWE-787")
-            } else if is_read {
-                Some("CWE-125")
-            } else {
-                None
+            match direction {
+                Direction::Write => Some("CWE-787"),
+                Direction::Read => Some("CWE-125"),
+                Direction::Unknown => None,
             },
         ),
         BugClass::StackBufferOverflow => ("CWE-121", None),
@@ -2165,34 +2378,43 @@ fn cwe_for_finding(raw: &Value) -> (Vec<String>, Option<String>) {
             }
         }
         // A global-buffer-overflow is an out-of-bounds access; pick the
-        // read/write CWE that matches the sanitizer report (write by default).
-        BugClass::GlobalBufferOverflow => {
-            if is_read {
-                ("CWE-125", None)
-            } else {
-                ("CWE-787", None)
-            }
-        }
+        // read/write CWE that matches the sanitizer report.
+        BugClass::GlobalBufferOverflow => read_write_or_119(),
         BugClass::UseAfterFree => ("CWE-416", None),
         BugClass::DoubleFree => ("CWE-415", None),
         BugClass::MemoryLeak => ("CWE-401", None),
         BugClass::NullDeref => ("CWE-476", None),
         // A wild (non-null) bad access — model as an out-of-bounds access,
         // matching the read/write direction when the report records one.
-        BugClass::WildSegv => {
-            if is_read {
-                ("CWE-125", None)
-            } else {
-                ("CWE-787", None)
+        BugClass::WildSegv => read_write_or_119(),
+        BugClass::UndefinedBehavior(check) => match check {
+            UbCheck::IntegerOverflow => ("CWE-190", None),
+            UbCheck::InvalidShift => ("CWE-1335", None),
+            UbCheck::FloatCastOverflow => ("CWE-681", None),
+            UbCheck::ImplicitConversion => ("CWE-681", Some("CWE-197")),
+            UbCheck::PointerOverflow => ("CWE-823", Some("CWE-119")),
+            UbCheck::VlaBound => ("CWE-129", None),
+            // An unchecked array index, read or write unknown: the index
+            // validation weakness plus both out-of-bounds outcomes.
+            UbCheck::IndexOutOfBounds => {
+                return (
+                    vec![
+                        "CWE-129".to_owned(),
+                        "CWE-125".to_owned(),
+                        "CWE-787".to_owned(),
+                    ],
+                    Some(cwe_name("CWE-129").to_owned()),
+                );
             }
-        }
-        BugClass::UndefinedBehavior => {
-            if hay.contains("signed-integer-overflow") || hay.contains("integer-overflow") {
-                ("CWE-190", None)
-            } else {
-                ("CWE-682", None)
-            }
-        }
+            UbCheck::ObjectSize => read_write_or_119(),
+            UbCheck::TypeMismatch => ("CWE-843", None),
+            UbCheck::MissingReturn
+            | UbCheck::Unreachable
+            | UbCheck::InvalidValueLoad
+            | UbCheck::Misaligned
+            | UbCheck::InvalidBuiltin
+            | UbCheck::Generic => ("CWE-758", None),
+        },
         BugClass::Timeout => ("CWE-834", Some("CWE-400")),
         BugClass::OutOfMemory => ("CWE-789", Some("CWE-400")),
         BugClass::ReachableAssertion => ("CWE-617", None),
@@ -2258,6 +2480,14 @@ fn cwe_name(id: &str) -> &'static str {
         "CWE-674" => "Uncontrolled Recursion",
         "CWE-562" => "Return of Stack Variable Address",
         "CWE-825" => "Expired Pointer Dereference",
+        "CWE-119" => "Improper Restriction of Operations within the Bounds of a Memory Buffer",
+        "CWE-129" => "Improper Validation of Array Index",
+        "CWE-197" => "Numeric Truncation Error",
+        "CWE-681" => "Incorrect Conversion between Numeric Types",
+        "CWE-758" => "Reliance on Undefined, Unspecified, or Implementation-Defined Behavior",
+        "CWE-823" => "Use of Out-of-range Pointer Offset",
+        "CWE-843" => "Access of Resource Using Incompatible Type ('Type Confusion')",
+        "CWE-1335" => "Incorrect Bitwise Shift of Integer",
         _ => "Uncategorized Weakness",
     }
 }
@@ -2301,9 +2531,7 @@ fn explanation_for(raw: &Value, sink: Option<&Sink>, source: &Option<Source>) ->
         BugClass::WildSegv => format!(
             "This is an invalid-memory access (segmentation fault): while processing a crafted input, {fn_ref} touched a memory address it should not have, and the program crashed. An attacker who can supply this input can crash the program, and such faults sometimes lead to worse."
         ),
-        BugClass::UndefinedBehavior => format!(
-            "This is undefined behavior: while processing a crafted input, {fn_ref} performed an operation the language leaves undefined (for example arithmetic that overflows or an out-of-range shift). The result is unpredictable and can produce wrong answers or crashes."
-        ),
+        BugClass::UndefinedBehavior(check) => ub_explanation(check, &fn_ref),
         BugClass::Timeout => format!(
             "This input makes the code run far too long: while processing a crafted input, {fn_ref} got stuck doing excessive work (a hang or near-endless loop). An attacker who can supply this input can make the program unresponsive (denial of service)."
         ),
@@ -2330,6 +2558,153 @@ fn explanation_for(raw: &Value, sink: Option<&Sink>, source: &Option<Source>) ->
         ),
     };
     Some(format!("{body} {trigger}"))
+}
+
+/// The plain-English description of one UBSan check family.
+fn ub_explanation(check: UbCheck, fn_ref: &str) -> String {
+    match check {
+        UbCheck::IntegerOverflow => format!(
+            "This is an integer overflow: while processing a crafted input, {fn_ref} computed a value too large or too small for its integer type, which C and C++ leave undefined for signed types. The wrapped value can produce wrong sizes, lengths or indexes that lead to memory corruption, or simply wrong answers."
+        ),
+        UbCheck::InvalidShift => format!(
+            "This is an invalid bit shift: while processing a crafted input, {fn_ref} shifted by a negative amount or by at least the width of the type, or shifted a negative value left. The language leaves the result undefined, and common hardware silently masks the shift count, so the code computes a wrong value."
+        ),
+        UbCheck::MissingReturn => format!(
+            "This is a missing return value: while processing a crafted input, execution reached the end of {fn_ref}, a function declared to return a value, without a return statement. The caller then uses an undefined value, and an optimizing compiler may assume the path is impossible and generate arbitrary code for it."
+        ),
+        UbCheck::Unreachable => format!(
+            "This is unreachable code being reached: while processing a crafted input, {fn_ref} reached a point the code marks as impossible (`__builtin_unreachable()` or `std::unreachable()`). The compiler optimizes on that promise, so what happens next is arbitrary; an input case the code assumed could not happen is reachable."
+        ),
+        UbCheck::InvalidValueLoad => format!(
+            "This is an invalid value load: while processing a crafted input, {fn_ref} read a bool or enum whose stored bits are not a valid value of its type, usually memory filled from raw input bytes or never initialized. Code generated for the type can then take impossible branches or index a table out of range."
+        ),
+        UbCheck::FloatCastOverflow => format!(
+            "This is an out-of-range conversion: while processing a crafted input, {fn_ref} converted a floating-point value to an integer type that cannot represent it (too large, too small, infinite or NaN). The language leaves the result undefined, so the converted value is garbage."
+        ),
+        UbCheck::ImplicitConversion => format!(
+            "This is a value-changing conversion: while processing a crafted input, {fn_ref} converted an integer to a narrower or differently signed type and the value changed (truncation or sign change). The changed value can corrupt sizes, lengths or indexes computed from it."
+        ),
+        UbCheck::PointerOverflow => format!(
+            "This is pointer arithmetic overflow: while processing a crafted input, {fn_ref} added an offset to a pointer that wrapped around the address space or turned a valid pointer into null. The resulting pointer is invalid for any object, so using it reads or writes the wrong memory."
+        ),
+        UbCheck::IndexOutOfBounds => format!(
+            "This is an out-of-bounds array index: while processing a crafted input, {fn_ref} used an index outside the declared bounds of a fixed-size array. The access reads or writes the memory next to the array, which can leak data, corrupt state or crash the program."
+        ),
+        UbCheck::VlaBound => format!(
+            "This is an invalid variable-length array size: while processing a crafted input, {fn_ref} declared a variable-length array whose size came out zero or negative. The stack allocation is then meaningless, and later accesses to the array hit memory it does not own."
+        ),
+        UbCheck::Misaligned => format!(
+            "This is a misaligned memory access: while processing a crafted input, {fn_ref} read or wrote through a pointer that is not aligned for its type (typically a byte buffer cast to a wider type). The language leaves this undefined; some processors fault on it and compilers may assume it cannot happen."
+        ),
+        UbCheck::ObjectSize => format!(
+            "This is an access through a pointer to too small an object: while processing a crafted input, {fn_ref} read or wrote an object of a type larger than the memory the pointer refers to. The access runs past the end of the real object, an out-of-bounds read or write."
+        ),
+        UbCheck::TypeMismatch => format!(
+            "This is type confusion: while processing a crafted input, {fn_ref} called a function through a pointer of the wrong type, or used an object as a class it is not. The code then reads, writes or calls memory with the wrong layout, a common path to code execution."
+        ),
+        UbCheck::InvalidBuiltin => format!(
+            "This is an invalid builtin argument: while processing a crafted input, {fn_ref} passed a value a compiler builtin does not accept (for example zero to a count-leading-zeros builtin), so the result is undefined."
+        ),
+        UbCheck::Generic => format!(
+            "This is undefined behavior: while processing a crafted input, {fn_ref} performed an operation the C or C++ language leaves undefined; the sanitizer report names the exact check. The result is unpredictable and can change with the compiler or optimization level."
+        ),
+    }
+}
+
+/// The fix guidance for one UBSan check family, at `at`.
+fn ub_patch_hint(check: UbCheck, at: &str) -> (&'static str, String) {
+    match check {
+        UbCheck::IntegerOverflow => (
+            "Check for overflow before the arithmetic",
+            format!(
+                "Check for overflow before the arithmetic at {at} (or use a wider or unsigned type), and reject inputs that drive the operands out of range."
+            ),
+        ),
+        UbCheck::InvalidShift => (
+            "Validate the shift amount",
+            format!(
+                "Check that the shift amount at {at} is at least 0 and less than the operand's bit width before shifting, and shift an unsigned value instead of a negative signed one."
+            ),
+        ),
+        UbCheck::MissingReturn => (
+            "Return a value on every path",
+            format!(
+                "Return a value on every path out of the function at {at}: add the missing `return` (or handle the unmatched case explicitly) so no input reaches the end of the function without one. The reported line is the function, not the path that falls off its end; find the branch this input takes that has no return."
+            ),
+        ),
+        UbCheck::Unreachable => (
+            "Handle the case marked unreachable",
+            format!(
+                "Handle the input case that reaches the unreachable marker at {at} explicitly, for example by returning an error, instead of promising the compiler it cannot happen."
+            ),
+        ),
+        UbCheck::InvalidValueLoad => (
+            "Validate the value before storing it as bool or enum",
+            format!(
+                "Validate the raw value against the type's valid range before storing it into the bool or enum read at {at}; convert input bytes with an explicit range check rather than memcpy or a cast, and initialize the object before use."
+            ),
+        ),
+        UbCheck::FloatCastOverflow => (
+            "Range-check before converting",
+            format!(
+                "Check that the floating-point value at {at} is finite and within the destination integer type's range before converting it."
+            ),
+        ),
+        UbCheck::ImplicitConversion => (
+            "Make the narrowing explicit and checked",
+            format!(
+                "Make the conversion at {at} explicit and range-checked: verify the value fits the destination type, or use a destination wide and signed enough to hold it."
+            ),
+        ),
+        UbCheck::PointerOverflow => (
+            "Bound the offset before the pointer arithmetic",
+            format!(
+                "Validate the offset against the size of the object before adding it to the pointer at {at}; compute with indexes into the object and bounds-check them rather than forming an out-of-range pointer."
+            ),
+        ),
+        UbCheck::IndexOutOfBounds => (
+            "Bounds-check the array index",
+            format!(
+                "Validate the index against the array's length before the access at {at}, and reject inputs that drive it out of range."
+            ),
+        ),
+        UbCheck::VlaBound => (
+            "Validate the array size",
+            format!(
+                "Check that the input-derived length is positive and below a fixed limit before declaring the variable-length array at {at}, or allocate it on the heap with a checked size."
+            ),
+        ),
+        UbCheck::Misaligned => (
+            "Copy unaligned data before reading it",
+            format!(
+                "Copy unaligned input bytes into a properly typed local with memcpy before reading them at {at}, instead of casting a byte pointer to a wider type."
+            ),
+        ),
+        UbCheck::ObjectSize => (
+            "Check the object size before the access",
+            format!(
+                "Make sure the memory at {at} is at least as large as the type it is accessed as: bounds-check the length first and do not cast a short buffer to a larger structure."
+            ),
+        ),
+        UbCheck::TypeMismatch => (
+            "Use the object as its real type",
+            format!(
+                "Call the function at {at} only through a pointer of its exact type, and check an object's dynamic type (or use a checked cast) before using it as a derived class."
+            ),
+        ),
+        UbCheck::InvalidBuiltin => (
+            "Guard the builtin's argument",
+            format!(
+                "Check the argument before the builtin at {at}, for example that it is non-zero for a count-leading- or trailing-zeros builtin."
+            ),
+        ),
+        UbCheck::Generic => (
+            "Make the operation well defined",
+            format!(
+                "Read the sanitizer report for the exact check at {at} and validate the operands before the operation so it is well defined for every input."
+            ),
+        ),
+    }
 }
 
 fn verdict_rank(verdict: Verdict) -> u8 {

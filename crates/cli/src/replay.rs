@@ -335,11 +335,18 @@ fn replay_c_afl(finding_dir: &Path, runner: &HarnessRunner) -> i32 {
         }
     };
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let actual_rule = corpus::parse_sanitizer_report(&stderr)
+    let report = corpus::parse_sanitizer_report(&stderr);
+    let actual_rule = report
+        .as_ref()
         .map(|r| r.rule_id)
         .or_else(|| crate::fatal_signal::rule_id(&output.status, &stderr));
+    // A finding recorded under the rule an earlier release gave this report
+    // (before UBSan checks and wild SEGVs had their own rules) still matches.
+    let legacy_match = report
+        .as_ref()
+        .is_some_and(|r| corpus::sanitizer::rule_matches(&recorded_rule, r));
     match actual_rule {
-        Some(rule) if rule == recorded_rule => {
+        Some(rule) if rule == recorded_rule || legacy_match => {
             let _ = corpus::finding::touch_last_seen(finding_dir, &replay_backend(runner));
             println!("MATCH");
             0
@@ -470,11 +477,18 @@ fn replay_c_libfuzzer(finding_dir: &Path, runner: &HarnessRunner) -> i32 {
         }
     };
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let actual_rule = corpus::parse_sanitizer_report(&stderr)
+    let report = corpus::parse_sanitizer_report(&stderr);
+    let actual_rule = report
+        .as_ref()
         .map(|r| r.rule_id)
         .or_else(|| crate::fatal_signal::rule_id(&output.status, &stderr));
+    // A finding recorded under the rule an earlier release gave this report
+    // (before UBSan checks and wild SEGVs had their own rules) still matches.
+    let legacy_match = report
+        .as_ref()
+        .is_some_and(|r| corpus::sanitizer::rule_matches(&recorded_rule, r));
     match actual_rule {
-        Some(rule) if rule == recorded_rule => {
+        Some(rule) if rule == recorded_rule || legacy_match => {
             let _ = corpus::finding::touch_last_seen(finding_dir, &replay_backend(runner));
             println!("MATCH");
             0

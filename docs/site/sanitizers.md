@@ -74,6 +74,53 @@ Common RTOS / partial-build false-positive killers:
   ASan's fake stack.
 - `suppressions=<file>` — silence a specific known-benign report.
 
+## How a sanitizer report is classified
+
+Each UBSan check kind has its own rule, CWE, explanation and fix hint; only
+signed and unsigned integer overflow share one rule, BHF-205. The
+kind comes from UBSan's check name on its `SUMMARY:` line when it printed one,
+else from the report text after `runtime error:`. Classification reads these
+structured fields and the text after the source location only, so a path such
+as `src/zoom/` or `src/timeout/` never changes it.
+
+| UBSan check | Kind | Rule | CWE |
+|---|---|---|---|
+| `signed-integer-overflow`, `unsigned-integer-overflow` | `signed-integer-overflow`, `unsigned-integer-overflow` | BHF-205 | CWE-190 |
+| `null-pointer-use`, `invalid-null-argument`, `invalid-null-return`, `nullptr-with-offset` | `null-pointer-dereference` | BHF-206 | CWE-476 |
+| `out-of-bounds-index` | `out-of-bounds-access` | BHF-220 | CWE-129 (+ CWE-125, CWE-787) |
+| `non-positive-vla-index` | `invalid-vla-bound` | BHF-224 | CWE-129 |
+| `integer-divide-by-zero`, `float-divide-by-zero` | `division-by-zero` | BHF-222 | CWE-369 |
+| `invalid-shift-exponent`, `invalid-shift-base` | `invalid-shift` | BHF-215 | CWE-1335 |
+| `missing-return` | `missing-return` | BHF-214 | CWE-758 |
+| `unreachable-call` | `unreachable` | BHF-216 | CWE-758 |
+| `invalid-bool-load`, `invalid-enum-load` | `invalid-value-load` | BHF-217 | CWE-758 |
+| `float-cast-overflow` | `float-cast-overflow` | BHF-218 | CWE-681 |
+| `implicit-*-truncation`, `implicit-integer-sign-change` | `implicit-conversion` | BHF-225 | CWE-681 (+ CWE-197) |
+| `pointer-overflow`, `nullptr-after-nonzero-offset` | `pointer-overflow` | BHF-219 | CWE-823 (+ CWE-119) |
+| `function-type-mismatch`, `dynamic-type-mismatch`, `cfi-bad-type` | `type-mismatch` | BHF-221 | CWE-843 |
+| `insufficient-object-size` | `insufficient-object-size` | BHF-227 | CWE-125 / CWE-787 / CWE-119 |
+| `misaligned-pointer-use`, `alignment-assumption` | `misaligned-access` | BHF-226 | CWE-758 |
+| `invalid-builtin-use` | `invalid-builtin-use` | BHF-228 | CWE-758 |
+| any other | `undefined-behavior` | BHF-213 | CWE-758 |
+
+An ASan SEGV in the first memory page (ASan's "zero page" hint, or an address
+below `0x1000`) is a NULL dereference, BHF-206 / CWE-476. Any other SEGV is a
+wild or corrupted pointer, BHF-223: CWE-125 for a READ, CWE-787 for a WRITE,
+and CWE-119 when ASan reports no direction or the address is a non-canonical
+"high value address", for which ASan prints READ whatever the access was. The
+direction is ASan's `READ`/`WRITE` token, recorded as
+`exception.access.direction`.
+
+The SARIF result's `properties.cwe` is the finding's CWE (the first of
+`properties.cwes`); the rule entry keeps its catalog CWE. `bhf replay` still
+matches findings recorded under the rules earlier releases used for these
+reports. Those releases classified a UBSan report by its text alone: integer
+overflow, division by zero and any "cannot be represented in type" report
+(a left shift included) were BHF-205, the load, store, member-access,
+reference-binding and NULL-argument or NULL-return reports BHF-206, an array
+index BHF-201, and every other check (a member call on NULL included)
+BHF-210. Every ASan SEGV was BHF-206.
+
 ## How a sanitizer finding is identified
 
 Each sanitizer crash becomes one finding per root cause per harness, not one

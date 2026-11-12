@@ -287,6 +287,48 @@ fn replay_c_libfuzzer_routes_through_sandbox_with_testcase_argv() {
     );
 }
 
+/// A finding written before UBSan checks had their own rules was recorded under
+/// the generic rule; replaying it must still MATCH the same report, and the
+/// replay runs with the fuzz child's UBSan options.
+#[cfg(unix)]
+#[test]
+fn replay_c_libfuzzer_matches_a_finding_recorded_under_an_earlier_rule() {
+    let root = temp_dir("c-libfuzzer-legacy-rule");
+    fs::write(
+        root.join("main.c"),
+        "/* BHF_FRAMED driver */\nint main(){return 0;}\n",
+    )
+    .unwrap();
+    let harness = root.join("main");
+    fs::write(
+        &harness,
+        "#!/bin/sh\nprintf '%s' \"$UBSAN_OPTIONS\" > \"$(dirname \"$0\")/ubsan-options.txt\"\n\
+         echo '/src/widget/classify.cc:3:5: runtime error: execution reached the end of a value-returning function without returning a value' >&2\n\
+         echo 'SUMMARY: UndefinedBehaviorSanitizer: missing-return /src/widget/classify.cc:3:5 ' >&2\n\
+         exit 1\n",
+    )
+    .unwrap();
+    make_executable(&harness);
+    let finding_dir = write_c_finding(&root);
+    let replay = || {
+        cli::run_from([
+            "bhf",
+            "replay",
+            finding_dir.to_str().unwrap(),
+            "--harness",
+            harness.to_str().unwrap(),
+        ])
+    };
+    assert_eq!(replay(), 0, "an older BHF-210 record still matches");
+    let options = fs::read_to_string(root.join("ubsan-options.txt")).unwrap();
+    assert!(options.contains("print_stacktrace=1"), "{options}");
+    assert!(options.contains("report_error_type=1"), "{options}");
+    fs::write(finding_dir.join("finding.json"), r#"{"rule_id":"BHF-214"}"#).unwrap();
+    assert_eq!(replay(), 0, "today's rule matches");
+    fs::write(finding_dir.join("finding.json"), r#"{"rule_id":"BHF-202"}"#).unwrap();
+    assert_eq!(replay(), 3, "an unrelated rule does not");
+}
+
 #[cfg(unix)]
 #[test]
 fn replay_c_afl_strict_missing_sandbox_is_an_early_error() {

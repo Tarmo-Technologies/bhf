@@ -1044,10 +1044,10 @@ fn parse_asan(stderr: &str) -> Option<SanitizerReport> {
         // was not malloc()-ed" (kind token "free") are both the free-of-invalid-
         // pointer class — CWE-415 (#37).
         "double-free" | "free" => "BHF-204",
-        // ASan reports null deref as "SEGV on unknown address". Match the
-        // common variant explicitly so we don't lose the signal.
-        "SEGV" if line.contains("0x000000000000") => "BHF-206",
-        "SEGV" => "BHF-206",
+        // A SEGV is a NULL dereference (BHF-206) only when it faults in the
+        // first page; anything else is a wild pointer (BHF-223). Decided below,
+        // once the address and ASan's hint about it are parsed.
+        "SEGV" => "BHF-223",
         // Global / static buffers and intra-object are all "OOB writes/reads"
         // at the rule-catalog level - one heuristic, same CWE-787.
         "global-buffer-overflow"
@@ -1082,12 +1082,24 @@ fn parse_asan(stderr: &str) -> Option<SanitizerReport> {
         }
         None
     });
+    // For a non-canonical address ASan's direction is not one (see
+    // `memory_access`); say so next to it.
+    let high_value = rest
+        .lines()
+        .take(12)
+        .any(|l| l.contains("Hint:") && l.contains("high value address"));
     let message = match access {
+        Some(a) if high_value => format!("{line} ({a}; high value address)"),
         Some(a) => format!("{line} ({a})"),
         None => line.to_owned(),
     };
     let stacks = split_asan_stacks(rest);
     let access = memory_access(rest, line, stacks.alloc, stacks.free);
+    let rule_id = if kind == "SEGV" && access.as_deref().is_some_and(faults_in_null_page) {
+        "BHF-206"
+    } else {
+        rule_id
+    };
     Some(SanitizerReport {
         sanitizer: Some(Sanitizer::AddressSanitizer),
         kind,
@@ -1132,49 +1144,6 @@ fn parse_ubsan(stderr: &str) -> Option<SanitizerReport> {
         .find(|line| line.contains("runtime error:"))?;
     let after = line.split("runtime error:").nth(1)?.trim();
 
-    let (kind, rule_id) = if after.starts_with("signed integer overflow")
-        || after.starts_with("unsigned integer overflow")
-        || after.contains("cannot be represented in type")
-    {
-        ("signed-integer-overflow".to_owned(), "BHF-205")
-    } else if after.starts_with("load of null pointer")
-        || after.starts_with("store to null pointer")
-        || after.starts_with("member access within null pointer")
-        || after.starts_with("reference binding to null pointer")
-        // UBSan's `nonnull`/`nullability-arg` checks. `memcpy`, `strcpy`, `memset`
-        // and most of libc are declared `__attribute__((nonnull))`, so passing NULL
-        // to one is reported this way rather than as a load/store — and it is one of
-        // the most common real null-deref shapes there is. Unmatched, the report
-        // fell through to `None` below, the SIGABRT read as an assert-style input
-        // rejection, and the crash was DISCARDED: a NULL returned by a stubbed
-        // external and handed to memcpy produced no finding at all.
-        || after.starts_with("null pointer passed as argument")
-        || after.starts_with("null pointer returned from function")
-        // The `pointer-overflow` check on a null base. The offset is interpolated
-        // ("applying non-zero offset 8 to null pointer"), so match the ends.
-        || (after.starts_with("applying") && after.contains("to null pointer"))
-    {
-        ("null-pointer-dereference".to_owned(), "BHF-206")
-    } else if after.starts_with("index ") && after.contains("out of bounds") {
-        ("out-of-bounds-access".to_owned(), "BHF-201")
-    } else if after.starts_with("division by zero") {
-        ("division-by-zero".to_owned(), "BHF-205")
-    } else if is_ubsan_output(line, stderr) {
-        // An unrecognised check is still UNDEFINED BEHAVIOUR that UBSan localized
-        // to a file and line. Returning None for it failed CLOSED: the caller reads
-        // no report, the abort looks like the target rejecting the input, and a real
-        // fault is dropped. UBSan has ~20 checks and the list above covers four, so
-        // failing closed silently discarded most of them. Report it generically
-        // instead; the message carries the exact check.
-        ("undefined-behavior".to_owned(), "BHF-210")
-    } else {
-        // `runtime error:` is not UBSan's alone — a Go panic reads `panic: runtime
-        // error: index out of range [5] with length 1`, and this parser runs BEFORE
-        // the Go one. Without this guard the generic arm above would hijack every
-        // Go panic and report it as C undefined behaviour.
-        return None;
-    };
-
     // The report's own stack is the frames printed after its `runtime error:`
     // line (`print_stacktrace=1`), up to the blank line or `SUMMARY:` that ends
     // it — not every `#N` line anywhere in the log.
@@ -1182,6 +1151,26 @@ fn parse_ubsan(stderr: &str) -> Option<SanitizerReport> {
         .find(line)
         .map(|pos| &stderr[pos + line.len()..])
         .unwrap_or("");
+    let check = ubsan_check_name(after_line);
+    // Each UBSan check is its own kind and rule. UBSan's own check name
+    // (`report_error_type=1`) decides when it is present; otherwise the report
+    // text after `runtime error:` does — never the source path before it.
+    let kind = check
+        .as_deref()
+        .and_then(finding_rules::ubsan::kind_for_check_name)
+        .unwrap_or_else(|| finding_rules::ubsan::kind_for_message(after));
+    if kind == "undefined-behavior" && !is_ubsan_output(line, stderr) {
+        // `runtime error:` is not UBSan's alone — a Go panic reads `panic: runtime
+        // error: index out of range [5] with length 1`, and this parser runs BEFORE
+        // the Go one. Without this guard the generic arm would hijack every Go
+        // panic and report it as C undefined behaviour.
+        return None;
+    }
+    // An unrecognised check is still UNDEFINED BEHAVIOUR that UBSan localized to
+    // a file and line: it is reported generically (the message carries the exact
+    // check), never dropped as an input rejection.
+    let rule_id = finding_rules::ubsan::rule_for_kind(kind);
+    let kind = kind.to_owned();
     Some(SanitizerReport {
         sanitizer: Some(Sanitizer::UndefinedBehaviorSanitizer),
         kind,
@@ -1189,7 +1178,7 @@ fn parse_ubsan(stderr: &str) -> Option<SanitizerReport> {
         stack: report_stack(after_line),
         message: line.to_owned(),
         location: ubsan_location(line),
-        check: ubsan_check_name(after_line),
+        check,
         access: None,
     })
 }
@@ -1452,6 +1441,11 @@ fn memory_access(
             address_hint = Some("high-value-address".to_owned());
         }
     }
+    // A non-canonical ("high value") address faults before the CPU reports a
+    // direction, and ASan then prints READ whatever the instruction did.
+    if address_hint.as_deref() == Some("high-value-address") {
+        direction = AccessDirection::Unknown;
+    }
     let access = MemoryAccess {
         direction,
         size,
@@ -1462,6 +1456,78 @@ fn memory_access(
         free_stack,
     };
     (access != MemoryAccess::default()).then(|| Box::new(access))
+}
+
+/// Addresses below this are in the first memory page: a NULL base plus a small
+/// field or element offset.
+const NULL_PAGE_LIMIT: u64 = 0x1000;
+
+/// Whether a SEGV faulted in the first memory page (a NULL dereference), by
+/// ASan's `zero page` hint or by the faulting address itself.
+fn faults_in_null_page(access: &MemoryAccess) -> bool {
+    access.address_hint.as_deref() == Some("zero-page")
+        || access
+            .address
+            .as_deref()
+            .and_then(|a| u64::from_str_radix(a.trim_start_matches("0x"), 16).ok())
+            .is_some_and(|address| address < NULL_PAGE_LIMIT)
+}
+
+/// The rule an earlier bhf release recorded for this report, where it differs
+/// from today's. Earlier releases classified a UBSan report by five shapes of
+/// the text after `runtime error:` ([`earlier_ubsan_rule`]) and gave every
+/// ASan SEGV BHF-206. `None` when the rule did not change.
+pub fn legacy_rule_id(report: &SanitizerReport) -> Option<&'static str> {
+    let legacy = match report.sanitizer {
+        Some(Sanitizer::UndefinedBehaviorSanitizer) => {
+            let after = report
+                .message
+                .split_once("runtime error:")
+                .map_or("", |(_, text)| text.trim());
+            earlier_ubsan_rule(after)
+        }
+        Some(Sanitizer::AddressSanitizer) if report.kind == "SEGV" => "BHF-206",
+        _ => return None,
+    };
+    (legacy != report.rule_id).then_some(legacy)
+}
+
+/// The rule earlier releases gave a UBSan report, from the text after
+/// `runtime error:`: integer overflow, any "cannot be represented in type"
+/// text and division by zero were BHF-205, the NULL shapes below BHF-206, an
+/// array index BHF-201, and every other check BHF-210.
+fn earlier_ubsan_rule(after: &str) -> &'static str {
+    const NULL_PREFIXES: &[&str] = &[
+        "load of null pointer",
+        "store to null pointer",
+        "member access within null pointer",
+        "reference binding to null pointer",
+        "null pointer passed as argument",
+        "null pointer returned from function",
+    ];
+    if after.starts_with("signed integer overflow")
+        || after.starts_with("unsigned integer overflow")
+        || after.contains("cannot be represented in type")
+    {
+        "BHF-205"
+    } else if NULL_PREFIXES.iter().any(|prefix| after.starts_with(prefix))
+        || (after.starts_with("applying") && after.contains("to null pointer"))
+    {
+        "BHF-206"
+    } else if after.starts_with("index ") && after.contains("out of bounds") {
+        "BHF-201"
+    } else if after.starts_with("division by zero") {
+        "BHF-205"
+    } else {
+        "BHF-210"
+    }
+}
+
+/// Whether `report` is the crash a finding recorded with `recorded_rule`: the
+/// same rule, or the rule an earlier release gave the same report
+/// ([`legacy_rule_id`]), so replaying an older finding still matches.
+pub fn rule_matches(recorded_rule: &str, report: &SanitizerReport) -> bool {
+    report.rule_id == recorded_rule || legacy_rule_id(report) == Some(recorded_rule)
 }
 
 /// The address on the `ERROR:` line: `on address 0x...`, `on unknown address
@@ -2102,13 +2168,15 @@ called `Option::unwrap()` on a `None` value
     #[test]
     fn an_unrecognised_ubsan_check_is_reported_generically_not_dropped() {
         let stderr = "/src/t.c:9:3: runtime error: \
-                      execution reached an unreachable program point\n\
+                      a check this parser has never seen\n\
                       SUMMARY: UndefinedBehaviorSanitizer: undefined-behavior /src/t.c:9:3\n";
         let report = parse_sanitizer_report(stderr).expect("must not be dropped");
-        assert_eq!(report.rule_id, "BHF-210");
+        assert_eq!(report.rule_id, "BHF-213");
         assert_eq!(report.kind, "undefined-behavior");
         assert!(
-            report.message.contains("unreachable program point"),
+            report
+                .message
+                .contains("a check this parser has never seen"),
             "the exact check must survive in the message: {}",
             report.message
         );
@@ -2264,10 +2332,10 @@ t.c:1:1: runtime error: signed integer overflow: 2 + 2147483647
     }
 
     #[test]
-    fn parse_ubsan_oob_index_maps_to_bhf201() {
+    fn parse_ubsan_oob_index_maps_to_the_array_index_rule() {
         let stderr = "t.c:7:9: runtime error: index 88 out of bounds for type 'char[4]'";
         let r = parse_sanitizer_report(stderr).unwrap();
-        assert_eq!(r.rule_id, "BHF-201");
+        assert_eq!(r.rule_id, "BHF-220");
         assert_eq!(r.kind, "out-of-bounds-access");
     }
 
@@ -2762,5 +2830,167 @@ SUMMARY: UndefinedBehaviorSanitizer: invalid-shift-exponent src/widget/bits.c:5:
             "{:?}",
             r.stack
         );
+    }
+
+    fn ubsan_report(message: &str, check: Option<&str>) -> String {
+        let summary = check.unwrap_or("undefined-behavior");
+        format!(
+            "/src/widget/w.cc:7:9: runtime error: {message}\n    \
+             #0 0x1 in parse_record /src/widget/w.cc:7:9\n\n\
+             SUMMARY: UndefinedBehaviorSanitizer: {summary} /src/widget/w.cc:7:9 \n"
+        )
+    }
+
+    /// Each UBSan check is its own kind and rule, whether the kind comes from
+    /// UBSan's check name (report_error_type=1) or from the report text.
+    #[test]
+    fn every_ubsan_check_parses_to_its_own_kind_and_rule() {
+        for (message, check, kind, rule) in [
+            ("shift exponent 40 is too large for 32-bit type 'int'", "invalid-shift-exponent", "invalid-shift", "BHF-215"),
+            ("left shift of negative value -5", "invalid-shift-base", "invalid-shift", "BHF-215"),
+            ("execution reached the end of a value-returning function without returning a value", "missing-return", "missing-return", "BHF-214"),
+            ("load of null pointer of type 'int'", "null-pointer-use", "null-pointer-dereference", "BHF-206"),
+            ("index 10 out of bounds for type 'int[4]'", "out-of-bounds-index", "out-of-bounds-access", "BHF-220"),
+            ("signed integer overflow: 2147483647 + 5 cannot be represented in type 'int'", "signed-integer-overflow", "signed-integer-overflow", "BHF-205"),
+            ("division by zero", "integer-divide-by-zero", "division-by-zero", "BHF-222"),
+            ("1e+20 is outside the range of representable values of type 'int'", "float-cast-overflow", "float-cast-overflow", "BHF-218"),
+            ("load of value 7, which is not a valid value for type 'bool'", "invalid-bool-load", "invalid-value-load", "BHF-217"),
+            ("load of value 9, which is not a valid value for type 'Color'", "invalid-enum-load", "invalid-value-load", "BHF-217"),
+            ("execution reached an unreachable program point", "unreachable-call", "unreachable", "BHF-216"),
+            ("variable length array bound evaluates to non-positive value -1", "non-positive-vla-index", "invalid-vla-bound", "BHF-224"),
+            ("implicit conversion from type 'long long' of value 1099511627776 (64-bit, signed) to type 'int' changed the value to 0 (32-bit, signed)", "implicit-signed-integer-truncation", "implicit-conversion", "BHF-225"),
+            ("load of misaligned address 0x7c3938b00021 for type 'int', which requires 4 byte alignment", "misaligned-pointer-use", "misaligned-access", "BHF-226"),
+            ("load of address 0x7ffc8f3e2c10 with insufficient space for an object of type 'int'", "insufficient-object-size", "insufficient-object-size", "BHF-227"),
+            ("passing zero to __builtin_clz(), which is not a valid argument", "invalid-builtin-use", "invalid-builtin-use", "BHF-228"),
+            ("null pointer passed as argument 1, which is declared to never be null", "invalid-null-argument", "null-pointer-dereference", "BHF-206"),
+            ("pointer index expression with base 0x7fffffffffff overflowed to 0x80000000fffe", "pointer-overflow", "pointer-overflow", "BHF-219"),
+            ("call to function parse_record through pointer to incorrect function type 'int (*)(void)'", "function-type-mismatch", "type-mismatch", "BHF-221"),
+        ] {
+            for summary in [Some(check), None] {
+                let r = parse_sanitizer_report(&ubsan_report(message, summary)).unwrap();
+                assert_eq!(r.kind, kind, "{message} ({summary:?})");
+                assert_eq!(r.rule_id, rule, "{message} ({summary:?})");
+                assert_ne!(r.rule_id, "BHF-210");
+            }
+        }
+    }
+
+    #[test]
+    fn the_ubsan_check_name_wins_over_unfamiliar_report_text() {
+        let r = parse_sanitizer_report(&ubsan_report(
+            "a phrasing a future runtime might print",
+            Some("missing-return"),
+        ))
+        .unwrap();
+        assert_eq!((r.kind.as_str(), r.rule_id), ("missing-return", "BHF-214"));
+    }
+
+    /// Classification reads the text after `runtime error:`, never the source
+    /// path before it.
+    #[test]
+    fn a_source_path_never_classifies_a_ubsan_report() {
+        let stderr = "/src/division_by_zero/index_out_of_bounds/zoom_timeout.c:3:5: runtime error: \
+                      execution reached the end of a value-returning function without returning a value\n";
+        let r = parse_sanitizer_report(stderr).unwrap();
+        assert_eq!(r.kind, "missing-return");
+    }
+
+    fn segv(address: &str, direction: &str, hint: &str) -> SanitizerReport {
+        parse_sanitizer_report(&format!(
+            "==1==ERROR: AddressSanitizer: SEGV on unknown address {address}(pc 0x55 bp 0x1 sp 0x2 T0)\n\
+             ==1==The signal is caused by a {direction} memory access.\n{hint}    \
+             #0 0x55 in store_word /src/widget/obj.c:18:73\n"
+        ))
+        .unwrap()
+    }
+
+    /// A NULL dereference faults in the first page; every other SEGV is a wild
+    /// or corrupted pointer, a different defect with its own rule.
+    #[test]
+    fn segv_null_page_and_wild_address_have_different_rules() {
+        let zero_page = "==1==Hint: address points to the zero page.\n";
+        assert_eq!(
+            segv("0x000000000000 ", "READ", zero_page).rule_id,
+            "BHF-206"
+        );
+        assert_eq!(
+            segv("0x000000000010 ", "WRITE", zero_page).rule_id,
+            "BHF-206"
+        );
+        assert_eq!(segv("0x000000000ff8 ", "READ", "").rule_id, "BHF-206");
+        let wild = segv("0x7f0000001000 ", "WRITE", "");
+        assert_eq!(wild.rule_id, "BHF-223");
+        assert_eq!(wild.access.unwrap().direction, AccessDirection::Write);
+        // A non-canonical address faults before the access direction is
+        // known; ASan's READ is then not a direction.
+        let high = segv(
+            "",
+            "READ",
+            "==1==Hint: this fault was caused by a dereference of a high value address (see register values below).\n",
+        );
+        assert_eq!(high.rule_id, "BHF-223");
+        assert!(
+            high.message
+                .ends_with("(READ memory access; high value address)"),
+            "{}",
+            high.message
+        );
+        let access = high.access.unwrap();
+        assert_eq!(access.direction, AccessDirection::Unknown);
+        assert_eq!(access.address_hint.as_deref(), Some("high-value-address"));
+    }
+
+    /// The rule an earlier release recorded for the same report, so a replay
+    /// of an older finding still matches.
+    #[test]
+    fn legacy_rule_ids_cover_reports_whose_rule_changed() {
+        let ub = |message: &str| parse_sanitizer_report(&ubsan_report(message, None)).unwrap();
+        for (report, legacy) in [
+            (ub("execution reached the end of a value-returning function without returning a value"), Some("BHF-210")),
+            (ub("shift exponent 40 is too large for 32-bit type 'int'"), Some("BHF-210")),
+            (ub("index 10 out of bounds for type 'int[4]'"), Some("BHF-201")),
+            (ub("division by zero"), Some("BHF-205")),
+            (ub("load of null pointer of type 'int'"), None),
+            // Earlier releases sent any "cannot be represented in type" text to
+            // the overflow rule, a shift report included.
+            (
+                ub("left shift of 1 by 31 places cannot be represented in type 'int'"),
+                Some("BHF-205"),
+            ),
+            (
+                ub("left shift of negative value -5"),
+                Some("BHF-210"),
+            ),
+            // ...and had no NULL arm for a member call.
+            (
+                ub("member call on null pointer of type 'Widget'"),
+                Some("BHF-210"),
+            ),
+            (ub("applying non-zero offset 8 to null pointer"), None),
+            (segv("0x7f0000001000 ", "WRITE", ""), Some("BHF-206")),
+        ] {
+            assert_eq!(legacy_rule_id(&report), legacy, "{}", report.message);
+        }
+        let heap = parse_sanitizer_report(
+            "==1==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1\n",
+        )
+        .unwrap();
+        assert_eq!(
+            legacy_rule_id(&heap),
+            None,
+            "unchanged rules have no legacy id"
+        );
+        assert!(rule_matches(
+            "BHF-210",
+            &ub("execution reached an unreachable program point")
+        ));
+        assert!(rule_matches(
+            "BHF-216",
+            &ub("execution reached an unreachable program point")
+        ));
+        assert!(!rule_matches(
+            "BHF-202",
+            &ub("execution reached an unreachable program point")
+        ));
     }
 }

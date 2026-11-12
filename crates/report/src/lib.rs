@@ -2771,8 +2771,8 @@ fn sarif_result(
         "confirmation": confirmation,
         "severity": finding.severity,
         // Always carry the finding's CWE(s) so every SARIF result is mapped to a
-        // weakness even when no catalog rule matched (the scalar `cwe` below is
-        // set only for rule-matched findings).
+        // weakness even when no catalog rule matched; the scalar `cwe` below is
+        // the first of them.
         "cwes": &finding.actionability.cwe,
         "replayCommand": string_at(&finding.replay, &["command"]),
         "sandbox": finding.sandbox,
@@ -2789,8 +2789,27 @@ fn sarif_result(
         "actionabilityPatchHints": &finding.actionability.patch_hints,
         "actionabilityNextSteps": &finding.actionability.next_steps,
     });
+    // The finding's own computed CWE (an out-of-bounds READ under a rule whose
+    // catalog CWE is the write CWE, a wild SEGV under its own rule, ...), else
+    // the rule's.
+    let finding_cwe = finding
+        .actionability
+        .cwe
+        .first()
+        .map(String::as_str)
+        .filter(|cwe| !cwe.trim().is_empty());
+    if let Some(cwe) = finding_cwe {
+        properties
+            .as_object_mut()
+            .expect("properties is an object")
+            .insert("cwe".to_owned(), json!(cwe));
+    }
     if let Some(rule) = rule {
-        let mut tags = vec![rule.cwe.to_owned()];
+        let cwe = finding_cwe.unwrap_or(rule.cwe);
+        let mut tags = vec![cwe.to_owned()];
+        if cwe != rule.cwe {
+            tags.push(rule.cwe.to_owned());
+        }
         if let Some(place) = rule.cwe_top_25 {
             tags.push(format!("cwe-top-25-{place}"));
             tags.push("cwe-top-25".to_owned());
@@ -2805,8 +2824,13 @@ fn sarif_result(
             "security-severity".to_owned(),
             json!(format!("{:.1}", rule.security_severity)),
         );
-        obj.insert("cwe".to_owned(), json!(rule.cwe));
-        obj.insert("cwe_top_25".to_owned(), json!(rule.cwe_top_25));
+        obj.insert("cwe".to_owned(), json!(cwe));
+        // The rank belongs to the rule's catalog CWE: only report it when the
+        // result's CWE is that one.
+        obj.insert(
+            "cwe_top_25".to_owned(),
+            json!(rule.cwe_top_25.filter(|_| cwe == rule.cwe)),
+        );
         obj.insert("bhf.rule_slug".to_owned(), json!(rule.slug));
         obj.insert(
             "precision".to_owned(),
@@ -4916,6 +4940,83 @@ mod tests {
                 .unwrap()
                 .len(),
             2
+        );
+    }
+
+    /// A result's `properties.cwe` is the finding's own computed CWE (an
+    /// out-of-bounds READ is not the rule's write CWE); the rule entry keeps
+    /// the catalog CWE.
+    #[test]
+    fn sarif_result_cwe_is_the_findings_cwe_not_the_rules() {
+        let root = temp_dir("sarif-finding-cwe");
+        let findings = root.join("findings");
+        let out = root.join("reports");
+        write_finding(
+            &findings.join("F-0001-heapread"),
+            json!({
+                "id": "F-0001-heapread",
+                "rule_id": "BHF-201",
+                "classification": "unhandled",
+                "exception": {
+                    "name": "ASAN_HEAP_BUFFER_OVERFLOW",
+                    "sanitizer": "asan",
+                    "message": "ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1 at pc 0x2 bp 0x3 sp 0x4 (READ of size 4)",
+                    "access": { "direction": "read", "size": 4 },
+                    "stack": [{ "function": "copy_at", "file": "/src/widget/copy.c", "line": 9 }]
+                }
+            }),
+        );
+        write_finding(
+            &findings.join("F-0002-wildread"),
+            json!({
+                "id": "F-0002-wildread",
+                "rule_id": "BHF-223",
+                "classification": "unhandled",
+                "exception": {
+                    "name": "ASAN_SEGV",
+                    "sanitizer": "asan",
+                    "message": "ERROR: AddressSanitizer: SEGV on unknown address 0x7f0000001000 (pc 0x1 bp 0x2 sp 0x3 T0) (READ memory access)",
+                    "access": { "direction": "read", "address": "0x7f0000001000" },
+                    "stack": [{ "function": "parse_header", "file": "/src/widget/hdr.c", "line": 4 }]
+                }
+            }),
+        );
+        let summary = write_reports(
+            ReportOptions::new(&findings, &out)
+                .with_run_id("finding-cwe")
+                .with_sarif(true),
+        )
+        .unwrap();
+        let sarif: serde_json::Value = serde_json::from_slice(
+            &fs::read(summary.sarif_path.expect("SARIF path is recorded")).unwrap(),
+        )
+        .unwrap();
+        validate_sarif_report(&sarif).unwrap();
+        let result = |id: &str| {
+            sarif["runs"][0]["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["properties"]["bhfFindingId"] == id)
+                .unwrap()
+                .clone()
+        };
+        let heap = result("F-0001-heapread");
+        assert_eq!(heap["properties"]["cwe"], "CWE-122");
+        assert_eq!(heap["properties"]["cwes"], json!(["CWE-122", "CWE-125"]));
+        let wild = result("F-0002-wildread");
+        assert_eq!(wild["ruleId"], "BHF-223");
+        assert_eq!(wild["properties"]["cwe"], "CWE-125");
+        let rule = sarif["runs"][0]["tool"]["driver"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == "BHF-201")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            rule["properties"]["cwe"], "CWE-787",
+            "the rule keeps its catalog CWE"
         );
     }
 

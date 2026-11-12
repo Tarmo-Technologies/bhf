@@ -72,6 +72,14 @@
 - An ASan address description with a distance, size or offset too large for
   a signed offset leaves `exception.access.region.offset` unset instead of
   overflowing.
+- UBSan NULL and index reports no longer read "Incorrect Calculation": a
+  UBSan finding is classified by its check before any message needle.
+- Classification ignores the source path in a report: a directory named
+  `zoom`, `timeout` or `division_by_zero` no longer turns a finding into an
+  out-of-memory, hang or divide-by-zero finding.
+- A SEGV's direction is ASan's READ/WRITE token. An unknown direction, or a
+  non-canonical high address, is CWE-119 instead of an assumed write
+  (CWE-787).
 
 ### Changed
 - `bhf auto --seed-dir` reads a directory's files in name order.
@@ -92,6 +100,17 @@
   one, the memory access: direction, width, the region it hit and where that
   region was allocated or freed. `--all-members` explains every finding as
   before.
+- UBSan findings report under a rule, CWE, explanation and fix hint per
+  check instead of BHF-210 / "Incorrect Calculation (CWE-682)": for example
+  missing return is BHF-214 / CWE-758 and an invalid shift BHF-215 /
+  CWE-1335. Only signed and unsigned integer overflow share a rule
+  (BHF-205). UBSan index reports move from BHF-201 to BHF-220, division by
+  zero from BHF-205 to BHF-222, and insufficient object size from BHF-201 to
+  BHF-227. An ASan SEGV outside the first memory page reports under BHF-223
+  instead of the NULL-dereference rule BHF-206. `bhf replay` still matches
+  findings recorded under the earlier rules.
+- SARIF result `properties.cwe` is the finding's computed CWE rather than the
+  rule's catalog CWE; `properties.cwe_top_25` is set only when the two agree.
 - Ada static rules run on a statement and scope model instead of line
   matching. BHF-409 now reports only Unchecked_Conversion to an access type
   (and Address_To_Access_Conversions), BHF-410 a double free through an alias,
@@ -118,6 +137,14 @@
   counts later crashes folded into an already-reported root cause, and
   `unreproduced_sanitizer_hits` the crashes of a root cause that never
   reproduced in a fresh process. All are additive.
+- Rules BHF-213 (undefined behavior), BHF-214 (missing return), BHF-215
+  (invalid shift), BHF-216 (unreachable reached), BHF-217 (invalid bool/enum
+  load), BHF-218 (out-of-range floating-point conversion), BHF-219 (pointer
+  overflow), BHF-220 (array index out of bounds), BHF-221 (type mismatch),
+  BHF-222 (division by zero), BHF-223 (SEGV on a non-null address), BHF-224
+  (invalid variable-length array size), BHF-225 (value-changing implicit
+  integer conversion), BHF-226 (misaligned access), BHF-227 (access to an
+  undersized object) and BHF-228 (invalid builtin argument).
 - Ada rules BHF-564 (index/range checks suppressed), BHF-565 (overflow check
   suppressed), BHF-566 (local `'Unchecked_Access` escapes), BHF-567 (address
   overlay), BHF-568 (unsafe C function imported), BHF-569 (secret logged),

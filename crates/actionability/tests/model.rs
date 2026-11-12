@@ -220,9 +220,10 @@ fn cwe_mapping_covers_core_bug_classes() {
         case("signed-integer-overflow", "", "ubsan"),
         vec!["CWE-190".to_owned()]
     );
+    // A shift is its own weakness (CWE-1335), not "Incorrect Calculation".
     assert_eq!(
         case("shift-exponent", "shift exponent too large", "ubsan"),
-        vec!["CWE-682".to_owned()]
+        vec!["CWE-1335".to_owned()]
     );
     assert_eq!(
         case("timeout", "timeout after 60s", ""),
@@ -325,4 +326,294 @@ fn rust_index_out_of_bounds_panic_maps_to_oob_cwe() {
     );
     assert_eq!(write.cwe[0], "CWE-787");
     assert_eq!(write.cwe_name.as_deref(), Some("Out-of-bounds Write"));
+}
+
+/// A UBSan finding as the emitter writes it: the per-check exception name, the
+/// UBSan report line (location prefix included) and the check name.
+fn ubsan_finding(kind: &str, rule: &str, message: &str) -> serde_json::Value {
+    json!({
+        "rule_id": rule,
+        "harness_id": "H-C0001",
+        "paths": { "testcase": "testcase.bin" },
+        "exception": {
+            "name": format!("UBSAN_{}", kind.to_ascii_uppercase().replace('-', "_")),
+            "sanitizer": "ubsan",
+            "message": format!("/src/widget/w.cc:7:9: runtime error: {message}"),
+            "stack": [{ "function": "parse_record(unsigned char const*)", "file": "/src/widget/w.cc", "line": 7 }]
+        }
+    })
+}
+
+const UBSAN_KINDS: &[(&str, &str, &str, &[&str])] = &[
+    ("signed-integer-overflow", "BHF-205", "signed integer overflow: 2147483647 + 5 cannot be represented in type 'int'", &["CWE-190"]),
+    ("null-pointer-dereference", "BHF-206", "load of null pointer of type 'int'", &["CWE-476"]),
+    ("out-of-bounds-access", "BHF-220", "index 10 out of bounds for type 'int[4]'", &["CWE-129", "CWE-125", "CWE-787"]),
+    ("invalid-vla-bound", "BHF-220", "variable length array bound evaluates to non-positive value -1", &["CWE-129"]),
+    ("division-by-zero", "BHF-222", "division by zero", &["CWE-369"]),
+    ("invalid-shift", "BHF-215", "shift exponent 40 is too large for 32-bit type 'int'", &["CWE-1335"]),
+    ("missing-return", "BHF-214", "execution reached the end of a value-returning function without returning a value", &["CWE-758"]),
+    ("unreachable", "BHF-216", "execution reached an unreachable program point", &["CWE-758"]),
+    ("invalid-value-load", "BHF-217", "load of value 7, which is not a valid value for type 'bool'", &["CWE-758"]),
+    ("float-cast-overflow", "BHF-218", "1e+20 is outside the range of representable values of type 'int'", &["CWE-681"]),
+    ("implicit-conversion", "BHF-218", "implicit conversion from type 'long long' of value 1099511627776 (64-bit, signed) to type 'int' changed the value to 0 (32-bit, signed)", &["CWE-681", "CWE-197"]),
+    ("pointer-overflow", "BHF-219", "pointer index expression with base 0x7fffffffffff overflowed to 0x80000000fffe", &["CWE-823", "CWE-119"]),
+    ("misaligned-access", "BHF-213", "load of misaligned address 0x7c3938b00021 for type 'int', which requires 4 byte alignment", &["CWE-758"]),
+    ("insufficient-object-size", "BHF-201", "store to address 0x7ffc with insufficient space for an object of type 'int'", &["CWE-787"]),
+    ("type-mismatch", "BHF-221", "call to function parse_record through pointer to incorrect function type 'int (*)(void)'", &["CWE-843"]),
+    ("invalid-builtin-use", "BHF-213", "passing zero to __builtin_ctz(), which is not a valid argument", &["CWE-758"]),
+    ("undefined-behavior", "BHF-213", "a check this release does not name", &["CWE-758"]),
+];
+
+/// Each UBSan check kind gets its own CWE, explanation and fix hint; none of
+/// them is the arithmetic-overflow narrative except the overflow itself.
+#[test]
+fn every_ubsan_kind_gets_its_own_cwe_explanation_and_fix_hint() {
+    let mut explanations = std::collections::BTreeSet::new();
+    let mut hints = std::collections::BTreeSet::new();
+    for (kind, rule, message, cwes) in UBSAN_KINDS {
+        let raw = ubsan_finding(kind, rule, message);
+        let rec = backfill_actionability(RunMode::Reporting, &raw, None);
+        let want: Vec<String> = cwes.iter().map(|c| (*c).to_owned()).collect();
+        assert_eq!(rec.cwe, want, "{kind}");
+        let name = rec.cwe_name.clone().unwrap_or_default();
+        assert!(
+            !name.is_empty() && name != "Uncategorized Weakness",
+            "{kind}: {name}"
+        );
+        assert_ne!(name, "Incorrect Calculation", "{kind}");
+        let explanation = rec.explanation.clone().unwrap();
+        if *kind != "signed-integer-overflow" {
+            assert!(!explanation.contains("overflows"), "{kind}: {explanation}");
+        }
+        let hint = rec
+            .patch_hints
+            .first()
+            .map(|h| h.guidance.clone())
+            .unwrap_or_default();
+        if ![
+            "signed-integer-overflow",
+            "null-pointer-dereference",
+            "division-by-zero",
+        ]
+        .contains(kind)
+        {
+            assert!(
+                !hint.contains("overflow before the arithmetic"),
+                "{kind}: {hint}"
+            );
+        }
+        explanations.insert(explanation.split(':').next().unwrap().to_owned());
+        hints.insert(hint);
+    }
+    assert_eq!(explanations.len(), UBSAN_KINDS.len(), "{explanations:#?}");
+    assert_eq!(hints.len(), UBSAN_KINDS.len(), "{hints:#?}");
+
+    let missing_return = backfill_actionability(
+        RunMode::Reporting,
+        &ubsan_finding("missing-return", "BHF-214", UBSAN_KINDS[6].2),
+        None,
+    );
+    assert_eq!(
+        missing_return.cwe_name.as_deref(),
+        Some("Reliance on Undefined, Unspecified, or Implementation-Defined Behavior")
+    );
+    assert!(missing_return.patch_hints[0].guidance.contains("return"));
+    let shift = backfill_actionability(
+        RunMode::Reporting,
+        &ubsan_finding("invalid-shift", "BHF-215", UBSAN_KINDS[5].2),
+        None,
+    );
+    assert_eq!(
+        shift.cwe_name.as_deref(),
+        Some("Incorrect Bitwise Shift of Integer")
+    );
+}
+
+/// Records written before the per-check kinds carry the generic
+/// `UBSAN_UNDEFINED_BEHAVIOR` name, or a NULL/index kind whose UBSan origin
+/// used to short-circuit to "Incorrect Calculation"; the report text after the
+/// location still names the check.
+#[test]
+fn older_ubsan_records_are_classified_from_their_report_text() {
+    let generic = json!({
+        "rule_id": "BHF-210",
+        "exception": {
+            "name": "UBSAN_UNDEFINED_BEHAVIOR",
+            "sanitizer": "ubsan",
+            "message": "/src/widget/classify.cc:3:5: runtime error: execution reached the end of a value-returning function without returning a value",
+            "stack": []
+        }
+    });
+    let rec = backfill_actionability(RunMode::Reporting, &generic, None);
+    assert_eq!(rec.cwe, vec!["CWE-758".to_owned()]);
+    assert!(rec.patch_hints[0].guidance.contains("return"));
+    for (name, rule, message, cwe) in [
+        (
+            "UBSAN_NULL_POINTER_DEREFERENCE",
+            "BHF-206",
+            "load of null pointer of type 'int'",
+            "CWE-476",
+        ),
+        (
+            "UBSAN_OUT_OF_BOUNDS_ACCESS",
+            "BHF-201",
+            "index 65 out of bounds for type 'int[4]'",
+            "CWE-129",
+        ),
+    ] {
+        let raw = json!({
+            "rule_id": rule,
+            "exception": {
+                "name": name,
+                "sanitizer": "ubsan",
+                "message": format!("/src/widget/two.cc:9:3: runtime error: {message}"),
+                "stack": [{ "function": "index_arr", "file": "/src/widget/two.cc", "line": 9 }]
+            }
+        });
+        let rec = backfill_actionability(RunMode::Reporting, &raw, None);
+        assert_eq!(rec.cwe[0], cwe, "{name}");
+        assert_ne!(
+            rec.cwe_name.as_deref(),
+            Some("Incorrect Calculation"),
+            "{name}"
+        );
+    }
+}
+
+/// The source path a report starts with never decides the bug class: a path
+/// segment containing `oom`, `timeout` or `division_by_zero` is not an
+/// out-of-memory, hang or divide-by-zero finding.
+#[test]
+fn source_path_substrings_never_reclassify_a_finding() {
+    for path in [
+        "/src/zoomlib/Scale.cpp",
+        "/src/bloom/room.cc",
+        "/src/timeout/retry.c",
+        "/src/division_by_zero/math.c",
+        "/src/out_of_memory/alloc.c",
+    ] {
+        let raw = json!({
+            "rule_id": "BHF-205",
+            "exception": {
+                "name": "UBSAN_SIGNED_INTEGER_OVERFLOW",
+                "sanitizer": "ubsan",
+                "message": format!("{path}:5:24: runtime error: signed integer overflow: 1094795585 * 1094795585 cannot be represented in type 'int'"),
+                "stack": [{ "function": "zoom_scale", "file": path, "line": 5 }]
+            }
+        });
+        let rec = backfill_actionability(RunMode::Reporting, &raw, None);
+        assert_eq!(rec.cwe, vec!["CWE-190".to_owned()], "{path}");
+        assert!(
+            rec.explanation.unwrap().contains("integer overflow"),
+            "{path}"
+        );
+    }
+    // A real out-of-memory and a real timeout are still recognised.
+    let oom = json!({"rule_id": "BHF-209", "exception": {"name": "OUT_OF_MEMORY", "message": "harness exceeded the configured RSS limit (--rss-limit-mb)"}});
+    assert_eq!(
+        backfill_actionability(RunMode::Reporting, &oom, None).cwe[0],
+        "CWE-789"
+    );
+    let leak_named_oom = json!({"exception": {"name": "LIBFUZZER_OOM", "message": "out-of-memory (malloc(2147483648))"}});
+    assert_eq!(
+        backfill_actionability(RunMode::Reporting, &leak_named_oom, None).cwe[0],
+        "CWE-789"
+    );
+}
+
+fn segv_record(rule: &str, message: &str, access: Option<serde_json::Value>) -> serde_json::Value {
+    let mut raw = json!({
+        "rule_id": rule,
+        "exception": { "name": "ASAN_SEGV", "sanitizer": "asan", "message": message }
+    });
+    if let Some(access) = access {
+        raw["exception"]["access"] = access;
+    }
+    raw
+}
+
+/// SEGV direction is ASan's READ/WRITE token, not a substring of the message;
+/// no direction, or a non-canonical address whose READ is not a direction,
+/// maps to CWE-119 instead of defaulting to an out-of-bounds write.
+#[test]
+fn segv_direction_is_a_token_and_unknown_maps_to_cwe_119() {
+    let wild =
+        "ERROR: AddressSanitizer: SEGV on unknown address 0x7f0000001000 (pc 0x1 bp 0x2 sp 0x3 T0)";
+    let cwe = |raw: &serde_json::Value| backfill_actionability(RunMode::Reporting, raw, None).cwe;
+    assert_eq!(
+        cwe(&segv_record(
+            "BHF-223",
+            wild,
+            Some(json!({"direction": "read"}))
+        )),
+        ["CWE-125"]
+    );
+    assert_eq!(
+        cwe(&segv_record(
+            "BHF-223",
+            wild,
+            Some(json!({"direction": "write"}))
+        )),
+        ["CWE-787"]
+    );
+    assert_eq!(
+        cwe(&segv_record(
+            "BHF-223",
+            wild,
+            Some(json!({"direction": "unknown"}))
+        )),
+        ["CWE-119"]
+    );
+    assert_eq!(
+        cwe(&segv_record(
+            "BHF-223",
+            "ERROR: AddressSanitizer: SEGV on unknown address (pc 0x1 bp 0x2 sp 0x3 T0) (READ memory access)",
+            Some(json!({"direction": "read", "address_hint": "high-value-address"}))
+        )),
+        ["CWE-119"]
+    );
+    // Older records: the direction folded into the message, or none at all.
+    assert_eq!(
+        cwe(&segv_record(
+            "BHF-206",
+            &format!("{wild} (READ memory access)"),
+            None
+        )),
+        ["CWE-125"]
+    );
+    assert_eq!(cwe(&segv_record("BHF-206", wild, None)), ["CWE-119"]);
+    // "thread" is not a READ.
+    let global = json!({
+        "rule_id": "BHF-201",
+        "exception": {
+            "name": "ASAN_GLOBAL_BUFFER_OVERFLOW",
+            "sanitizer": "asan",
+            "message": "ERROR: AddressSanitizer: global-buffer-overflow on address 0x1 at pc 0x2 bp 0x3 sp 0x4 (WRITE of size 4 at 0x1 thread T0)"
+        }
+    });
+    assert_eq!(cwe(&global), ["CWE-787"]);
+}
+
+/// A wild-address SEGV is its own rule and class, never a NULL dereference.
+#[test]
+fn wild_address_segv_is_not_a_null_dereference() {
+    let wild = segv_record(
+        "BHF-223",
+        "ERROR: AddressSanitizer: SEGV on unknown address 0x4141414141414141 (pc 0x1 bp 0x2 sp 0x3 T0)",
+        Some(json!({"direction": "write", "address": "0x4141414141414141"})),
+    );
+    let rec = backfill_actionability(RunMode::Reporting, &wild, None);
+    assert_ne!(rec.cwe[0], "CWE-476");
+    assert!(rec.explanation.unwrap().contains("invalid-memory access"));
+    let null = segv_record(
+        "BHF-206",
+        "ERROR: AddressSanitizer: SEGV on unknown address 0x000000000010 (pc 0x1 bp 0x2 sp 0x3 T0)",
+        Some(
+            json!({"direction": "write", "address": "0x000000000010", "address_hint": "zero-page"}),
+        ),
+    );
+    assert_eq!(
+        backfill_actionability(RunMode::Reporting, &null, None).cwe,
+        ["CWE-476"]
+    );
 }

@@ -85,8 +85,8 @@
             "clusterRepresentative": "F-0000-1a2b3c4d",
             "clusterSize": 1,
             "confirmation": "fuzz",
-            "cwe": "CWE-787",
-            "cwe_top_25": 2,
+            "cwe": "CWE-122",
+            "cwe_top_25": null,
             "cwes": [
               "CWE-122"
             ],
@@ -99,6 +99,7 @@
             "security-severity": "9.5",
             "severity": "critical",
             "tags": [
+              "CWE-122",
               "CWE-787",
               "cwe-top-25-2",
               "cwe-top-25",

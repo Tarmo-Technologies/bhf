@@ -34,7 +34,7 @@
     },
     {
       "digest": {
-        "sha256": "3477afec50cad0b0bc897636f2c1ca6f32cd9f5e0ef5c6685d9fc771da935be6"
+        "sha256": "2ead982fa22f3fc61f55071e47ef9bf46074fb6bac5cfea00c603186010ba1e4"
       },
       "name": "findings.sarif"
     },
