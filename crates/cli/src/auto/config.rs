@@ -132,6 +132,18 @@ pub(crate) const FLAG_CONFIG_KEYS: &[(&str, &str)] = &[
     ("probe-backend", "toolchain.ada.probe-backend"),
 ];
 
+/// The config keys honored only from an explicit `--config`: they make bhf
+/// execute the scanned tree's code or a program the file names.
+#[cfg(test)]
+pub(crate) const EXPLICIT_CONFIG_KEYS: &[&str] = &[
+    "build-command",
+    "run-untrusted",
+    "unsafe-search-and-run-build-commands",
+    "probe-build",
+    "msbuild-evaluate",
+    "[toolchain]",
+];
+
 /// The `bhf auto` flags that deliberately have no config key: per-run actions
 /// and selections (`--target`, `--resume`, `--dry-run`, ...), output and
 /// diagnostics switches, and the config file itself.
@@ -562,6 +574,52 @@ mod tests {
             !docs.contains("Keys are the flag names in kebab-case"),
             "the docs must not claim every flag is a config key"
         );
+    }
+
+    /// The `--config` help names every config key, and lists every key that
+    /// is honored only from an explicit `--config` among those.
+    #[test]
+    fn the_config_help_lists_every_config_key() {
+        use clap::Args;
+        let command = AutoArgs::augment_args(clap::Command::new("auto"));
+        let help = command
+            .get_arguments()
+            .find(|arg| arg.get_long() == Some("config"))
+            .and_then(|arg| arg.get_long_help().or(arg.get_help()))
+            .map(|help| help.to_string())
+            .unwrap_or_default();
+        let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        let section = |from: &str, to: &str| -> String {
+            let start = help
+                .find(from)
+                .unwrap_or_else(|| panic!("--config help has no {from:?}: {help}"));
+            let rest = &help[start..];
+            rest[..rest.find(to).unwrap_or(rest.len())].to_owned()
+        };
+        let explicit = section("keys that EXECUTE something", "require this explicit flag");
+        for key in EXPLICIT_CONFIG_KEYS {
+            assert!(
+                explicit.contains(key),
+                "--config help does not list {key} as needing --config: {explicit}"
+            );
+        }
+        let keyed = section("Only these flags have a key", "The toolchain flags");
+        for (flag, key) in FLAG_CONFIG_KEYS {
+            if key.starts_with("toolchain.") {
+                // The Ada flags are listed together, as `--ada-*`.
+                let listed = help.contains(&format!("--{flag}"))
+                    || (flag.starts_with("ada-") && help.contains("--ada-*"));
+                assert!(
+                    listed,
+                    "--config help does not list toolchain flag --{flag}: {help}"
+                );
+            } else {
+                assert!(
+                    keyed.contains(key),
+                    "--config help does not list config key {key}: {keyed}"
+                );
+            }
+        }
     }
 
     #[test]

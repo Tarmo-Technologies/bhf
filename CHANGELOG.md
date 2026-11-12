@@ -153,6 +153,9 @@
   no longer turns a UBSan finding into a frameless report and `exit status: 0`.
   The script exits with the harness's status, 128 plus the signal for a
   harness killed by one.
+- `bhf auto --help` for `--config` lists `msbuild-evaluate` both among the keys
+  honored only from an explicit `--config` and among the keys the file
+  accepts; a unit test now checks the help text against the config key lists.
 - The custom-harness guide no longer says only clang works: `CC`/`CXX` may
   name gcc or a cross gcc, as the C/C++ compiler contract describes, with a
   note on distribution gcc's default `_FORTIFY_SOURCE`. It now says

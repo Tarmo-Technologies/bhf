@@ -114,14 +114,14 @@ pub struct AutoArgs {
     /// resolve against the file's directory. Without this, a `.bhf.toml` in the
     /// scanned tree root is auto-loaded — but an auto-loaded config honors only SAFE
     /// knobs (keys that EXECUTE something, `build-command`, `run-untrusted`,
-    /// `unsafe-search-and-run-build-commands`, `probe-build` and the `[toolchain]`
-    /// table, require this explicit flag). Only these flags have a key, spelled as
-    /// the flag: per-target-time, max-targets, jobs, rss-limit-mb, max-work-dir-mb,
-    /// max-corpus-mb, cxx-std, max-len, timeout, grammar, extra-include,
-    /// extra-source, exclude-path, seed-file, seed-dir, sanitizers, engine,
-    /// languages, project, ada-deps, passes, force, build-command, run-untrusted,
-    /// unsafe-search-and-run-build-commands, probe-build (`seed-mining = false` is
-    /// --no-seed-mining). The toolchain flags (--cc, --cxx, --cflags, --cxxflags,
+    /// `unsafe-search-and-run-build-commands`, `probe-build`, `msbuild-evaluate` and
+    /// the `[toolchain]` table, require this explicit flag). Only these flags have a
+    /// key, spelled as the flag: per-target-time, max-targets, jobs, rss-limit-mb,
+    /// max-work-dir-mb, max-corpus-mb, cxx-std, max-len, timeout, grammar,
+    /// extra-include, extra-source, exclude-path, seed-file, seed-dir, sanitizers,
+    /// engine, languages, project, ada-deps, passes, force, build-command,
+    /// run-untrusted, unsafe-search-and-run-build-commands, probe-build,
+    /// msbuild-evaluate (`seed-mining = false` is --no-seed-mining). The toolchain flags (--cc, --cxx, --cflags, --cxxflags,
     /// --ldflags, --define, --toolchain-include, --sysroot, --target-triple,
     /// --runner, --runner-arg, --ada-*, --probe-backend) are keys of a
     /// `[toolchain]` / `[toolchain.ada]` table, the same table `bhf build --config`
