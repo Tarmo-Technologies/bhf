@@ -60,6 +60,38 @@
   and could exceed its buffer, and two buffers got the same bytes.
   `arg-layout.json` gives each slice a sized `remainder` step, so
   `bhf decode-args --static` decodes these calls exactly.
+- `bhf replay` no longer reports MATCH, stamps `last_seen` or records a
+  reproduction in `results/` for a replay that could not compare where the
+  crash happened. An unsymbolized report (frames that name only a module
+  offset) is `UNVERIFIED recorded=<rule> actual=<rule> not_compared=sink`
+  with exit code 4 (`"verdict": "unverified"` in `--json`). When the harness
+  is the recorded build (its sha256 is `build.binary.sha256`), replay
+  symbolizes such a report itself with `llvm-symbolizer` or `addr2line` and
+  compares again. A finding that records no crash location (no frames, sink,
+  site or pc) matches only the recorded build. Fuzz, replay and minimization
+  children put `symbolize=1` after an inherited `ASAN_OPTIONS`/`UBSAN_OPTIONS`.
+- A fatal signal without a sanitizer report records its signal
+  (`exception.signal`, and as `exception.check`), and replay compares it: an
+  abort finding replayed against a harness that dies of an illegal
+  instruction is `MISMATCH ... differs=signal`. The recorded faulting pc
+  offset is compared against the recorded build. Minimization of a C/C++
+  finding keeps a reduction only when it is the recorded crash (same rule,
+  kind, signal, and sink, site or pc), so an abort is no longer minimized into
+  an input that crashes with another signal somewhere else.
+- The unsymbolized-replay note names its cause: a fatal signal that printed no
+  sanitizer report, a stripped harness binary, or an inherited `symbolize=0`,
+  before the symbolizer advice.
+- A replay or minimization timeout kills the harness's whole process group,
+  so a launcher whose child keeps running no longer hangs `bhf replay`, and
+  output a leftover process holds is waited for at most 2 s. The event-log
+  (Ada) replay and minimization now time out after 10 s too.
+- The "could not auto-resolve the harness" error names each directory it
+  searched once (`looked in <dirs> for main, main_afl, main.exe or
+  main_afl.exe`) and no longer searches `results/` or `results/findings/` as
+  work dirs.
+- An I/O or JSON error in the event-log replay names the file (finding.json,
+  testcase.bin, the event log, decoded.json or the harness) instead of
+  `I/O error during replay`.
 - Crashes with no frames and no source position, such as the raw SIGSEGVs of
   a cross sweep's harnesses, are no longer one root-cause group for the whole
   work dir. Their key hashes the rule, kind, check name and the harness that
@@ -566,6 +598,11 @@
   recorded against format 3 are flagged by `bhf replay`, `bhf minimize`,
   `bhf decode-args` and `bhf capsule` as before; a harness whose calls have
   none of these shapes decodes its inputs as format 3 did.
+- `bhf replay` has a new exit code, 4, for an `UNVERIFIED` replay; scripts
+  that treated every non-zero, non-3 code as an error should treat 4 as "not
+  reproduced".
+- The signature and root-cause key of a fatal signal without a sanitizer
+  report hash the signal, so BHF-210 finding IDs change.
 - The root-cause key (`cluster_key_full`) of a crash without frames or a
   source position now hashes the harness that found it, and the signature
   (the finding ID suffix) of a fatal signal the driver printed a pc for hashes

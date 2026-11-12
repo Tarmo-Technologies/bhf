@@ -56,6 +56,7 @@ pub(crate) fn classify(status: &std::process::ExitStatus, _stderr: &str) -> Opti
     })
 }
 
+#[cfg(test)]
 pub(crate) fn rule_id(status: &std::process::ExitStatus, stderr: &str) -> Option<&'static str> {
     classify(status, stderr).map(|_| RULE_ID)
 }

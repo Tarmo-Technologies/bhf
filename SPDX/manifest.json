@@ -1743,6 +1743,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/offline_symbolize.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/pack.rs",
       "license": "Apache-2.0"
     },
@@ -3792,6 +3796,10 @@
     },
     {
       "path": "crates/replay_min/src/minimize.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/replay_min/src/process.rs",
       "license": "Apache-2.0"
     },
     {

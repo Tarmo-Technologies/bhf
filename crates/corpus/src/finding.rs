@@ -437,6 +437,13 @@ impl FindingEmitter {
         if let Some(access) = &report.access {
             record["exception"]["access"] = json!(access);
         }
+        // A fatal signal with no sanitizer report names its signal as its
+        // check; it is recorded as such too.
+        if report.sanitizer.is_none() && report.kind == "fatal-signal" {
+            if let Some(signal) = report.check.as_deref().filter(|c| c.starts_with("SIG")) {
+                record["exception"]["signal"] = json!(signal);
+            }
+        }
         // A crash with no sanitizer report: where the driver saw it fault.
         if let Some(offset) = report.pc_offset {
             record["exception"]["pc_offset"] = json!(format!("{offset:#x}"));
@@ -2673,6 +2680,10 @@ mod tests {
                 super::sanitizer_dedupe_key_scoped(&signal(None), "H-PARSE")
             ))
         );
+        let mut abort = signal(None);
+        abort.check = Some("SIGABRT".to_owned());
+        assert_eq!(emit("H-PARSE", &abort)["exception"]["signal"], "SIGABRT");
+        assert!(parse["exception"].get("signal").is_none());
         let at = |pc| emit("H-PARSE", &signal(Some(pc)));
         let (a, b) = (at(0x1b3c), at(0x2a10));
         assert_eq!(a["exception"]["pc_offset"], "0x1b3c");

@@ -1859,6 +1859,7 @@ dependencies = [
  "corpus",
  "event_log",
  "fuzz_engine_builtin",
+ "libc",
  "serde",
  "serde_json",
  "thiserror",

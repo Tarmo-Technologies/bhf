@@ -68,20 +68,8 @@ fn apply_runaway_rlimits(_cmd: &mut std::process::Command) {}
 /// kill. The child must have been spawned with `process_group(0)` so its PID is
 /// the group id; `kill(-pid, ...)` then reaps the forked grandchildren (e.g. the
 /// persistent harness afl-fuzz forks) that a plain `child.kill()` would orphan.
-#[cfg(unix)]
-fn kill_process_group(child: &mut std::process::Child) {
-    let pid = child.id() as i32;
-    // Negative pid => the process group led by `pid`.
-    unsafe {
-        libc::kill(-pid, libc::SIGKILL);
-    }
-    let _ = child.kill();
-}
-
-#[cfg(not(unix))]
-fn kill_process_group(child: &mut std::process::Child) {
-    let _ = child.kill();
-}
+/// Shared with replay and minimization.
+use replay_min::process::kill_process_group;
 
 /// SIGKILL any process still executing `exe`. AFL++'s persistent forkserver
 /// `setsid()`s its worker into a fresh session, so a group kill of afl-fuzz can
@@ -1223,6 +1211,12 @@ pub(crate) fn fatal_signal_report(
         ),
     );
     report.pc_offset = fatal_signal_pc_offset(stderr, &crash.name);
+    // The signal is the check that failed: it is part of the signature and of
+    // the root-cause key, so an abort and an illegal instruction with no frames
+    // are two findings, and replay compares it.
+    if crash.name.starts_with("SIG") {
+        report.check = Some(crash.name.clone());
+    }
     report
 }
 
@@ -5473,10 +5467,12 @@ fn apply_fuzz_child_env_overrides(extra_env: &mut Vec<(String, String)>) {
 /// on whatever the operator's `ASAN_OPTIONS` says; leak detection is never
 /// turned off.
 pub(crate) fn sanitizer_child_env(leak: bool) -> Vec<(String, String)> {
+    // `symbolize=1`: the location a replay compares must not be erased by an
+    // inherited `symbolize=0`.
     let asan_required = if leak {
-        "abort_on_error=1:halt_on_error=1:detect_leaks=1"
+        "abort_on_error=1:halt_on_error=1:symbolize=1:detect_leaks=1"
     } else {
-        "abort_on_error=1:halt_on_error=1"
+        "abort_on_error=1:halt_on_error=1:symbolize=1"
     };
     vec![
         (
@@ -5500,7 +5496,7 @@ pub(crate) fn ubsan_child_options() -> String {
     multicore_fuzz::merge_sanitizer_options(
         std::env::var("UBSAN_OPTIONS").ok().as_deref(),
         &format!(
-            "abort_on_error=1:halt_on_error=1:{}",
+            "abort_on_error=1:halt_on_error=1:symbolize=1:{}",
             multicore_fuzz::UBSAN_REPORT_OPTIONS
         ),
     )
@@ -7462,6 +7458,25 @@ mod signal_classification_tests {
         );
     }
 
+    /// A fatal signal names its signal as the report's check, so an abort and
+    /// an illegal instruction with no frames are two signatures, two
+    /// root-cause keys and two findings.
+    #[test]
+    fn fatal_signal_reports_of_different_signals_have_different_identities() {
+        let abort = super::fatal_signal_report(&ExitStatus::from_raw(6), "");
+        let illegal = super::fatal_signal_report(&ExitStatus::from_raw(4), "");
+        assert_eq!(abort.check.as_deref(), Some("SIGABRT"));
+        assert_eq!(illegal.check.as_deref(), Some("SIGILL"));
+        assert_ne!(
+            corpus::finding::sanitizer_signature(&abort),
+            corpus::finding::sanitizer_signature(&illegal)
+        );
+        assert_ne!(
+            corpus::finding::sanitizer_dedupe_key_scoped(&abort, "H-1"),
+            corpus::finding::sanitizer_dedupe_key_scoped(&illegal, "H-1")
+        );
+    }
+
     #[test]
     fn windows_crash_sentinel_exit_is_a_crash_not_a_rejection() {
         // Under wine a guest fault carries NO POSIX signal; the driver's vectored
@@ -8477,9 +8492,10 @@ mod fuzz_child_env_tests {
             // ...but NOT symbolize=0. AFL++ needs that on its own child; setting
             // it here stripped file:line from every builtin child's report, and
             // file:line is what joins a crash to the static finding at the same
-            // line, so fuzz_confirmed silently became fuzz_exercised.
+            // line, so fuzz_confirmed silently became fuzz_exercised. The
+            // child turns it on explicitly instead.
             assert!(
-                !value.1.contains("symbolize"),
+                !value.1.contains("symbolize=0") && value.1.contains("symbolize=1"),
                 "{key} must leave symbolization on for the fuzz-confirmation join: {}",
                 value.1
             );

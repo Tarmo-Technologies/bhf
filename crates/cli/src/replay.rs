@@ -79,8 +79,9 @@ pub struct ReplayArgs {
     pub transport_endpoint: Option<String>,
 
     /// Print the result as one `bhf.replay.v1` JSON document on stdout instead
-    /// of the MATCH/MISMATCH line and summary, for every kind of finding.
-    /// Exit codes are unchanged.
+    /// of the MATCH/MISMATCH/UNVERIFIED line and summary, for every kind of
+    /// finding. Exit codes are unchanged (0 MATCH, 3 MISMATCH, 4 UNVERIFIED,
+    /// 1 error).
     #[arg(long)]
     pub json: bool,
 
@@ -361,6 +362,8 @@ fn resolve_harness(finding_dir: &Path, explicit: Option<PathBuf>) -> Result<Path
         })?;
 
     let mut tried: Vec<PathBuf> = Vec::new();
+    // The harness dirs searched for one of HARNESS_LEAVES, each listed once.
+    let mut searched: Vec<PathBuf> = Vec::new();
 
     // 1) `fixture_path` records the harness binary that ran when the finding
     // was observed — the most direct resolution.
@@ -384,14 +387,14 @@ fn resolve_harness(finding_dir: &Path, explicit: Option<PathBuf>) -> Result<Path
             let mut dirs = crate::auto::layout::harness_dir_candidates(&work, harness_id);
             dirs.push(work.join("build").join(harness_id));
             for harness_dir in dirs {
-                for leaf in ["main", "main_afl", "main.exe", "main_afl.exe"] {
+                for leaf in HARNESS_LEAVES {
                     let candidate = harness_dir.join(leaf);
                     if candidate.is_file() {
                         return Ok(candidate);
                     }
-                    if !tried.contains(&candidate) {
-                        tried.push(candidate);
-                    }
+                }
+                if !searched.contains(&harness_dir) {
+                    searched.push(harness_dir);
                 }
             }
         }
@@ -408,21 +411,37 @@ fn resolve_harness(finding_dir: &Path, explicit: Option<PathBuf>) -> Result<Path
         tried.push(candidate);
     }
 
-    let looked = if tried.is_empty() {
-        "no fixture_path or harness_id recorded in the finding".to_owned()
-    } else {
-        tried
+    let list = |paths: &[PathBuf]| {
+        paths
             .iter()
             .map(|path| path.display().to_string())
             .collect::<Vec<_>>()
             .join(", ")
     };
+    let mut looked = Vec::new();
+    if !tried.is_empty() {
+        looked.push(format!("looked at {}", list(&tried)));
+    }
+    if !searched.is_empty() {
+        looked.push(format!(
+            "looked in {} for main, main_afl, main.exe or main_afl.exe",
+            list(&searched)
+        ));
+    }
+    let looked = if looked.is_empty() {
+        "no fixture_path or harness_id recorded in the finding".to_owned()
+    } else {
+        looked.join("; ")
+    };
     Err(format!(
-        "could not auto-resolve the harness binary for finding {}; looked at: {looked}. \
+        "could not auto-resolve the harness binary for finding {}; {looked}. \
          Pass --harness <path>.",
         finding_dir.display()
     ))
 }
+
+/// The binary names a harness dir is searched for.
+const HARNESS_LEAVES: [&str; 4] = ["main", "main_afl", "main.exe", "main_afl.exe"];
 
 /// The harness a finding records ([`resolve_harness`] without an explicit
 /// path): its `fixture_path` resolved in the work dir holding the finding
@@ -473,10 +492,10 @@ fn finding_format_note_for(raw: &Value, harness: &Path, detection: &Detection) -
 }
 
 /// Candidate fuzz-work roots for a finding directory, most-likely first. The
-/// results layout nests findings as `<work>/results/findings/<F-...>/`, so the
-/// work root comes from [`corpus::layout::work_dir_for_finding`]; the finding
-/// dir's grandparent and parent are offered as fallbacks for the legacy and
-/// flatter layouts.
+/// results layout nests findings as `<work>/results/findings/<F-...>/` (and
+/// the legacy one `<work>/findings/<F-...>/`), so the work root comes from
+/// [`corpus::layout::work_dir_for_finding`]; only a finding outside such a
+/// layout falls back to its grandparent and parent.
 fn harness_work_roots(finding_dir: &Path) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     let mut push = |p: PathBuf| {
@@ -485,7 +504,9 @@ fn harness_work_roots(finding_dir: &Path) -> Vec<PathBuf> {
         }
     };
     if let Some(work) = corpus::layout::work_dir_for_finding(finding_dir) {
+        // `results/` and `results/findings/` are not work dirs.
         push(work);
+        return roots;
     }
     if let Some(grandparent) = finding_dir.parent().and_then(Path::parent) {
         push(grandparent.to_path_buf());
@@ -644,6 +665,26 @@ pub(crate) fn run_c_testcase_with_env(
     timeout: Duration,
     extra_env: &[(String, String)],
 ) -> Result<CRun, String> {
+    let env: Vec<(String, String)> = replay_env(raw, runner, input)
+        .into_iter()
+        .chain(extra_env.iter().cloned())
+        .collect();
+    run_c_harness(runner, input, testcase_path, timeout, &env)
+}
+
+/// Run `testcase_path` through a C/C++ harness via `runner` with exactly the
+/// variables `env` sets on top of the inherited environment. The harness runs
+/// in its own process group: a timeout kills it and everything it started
+/// (a launcher's children too), and its output pipes are drained for a
+/// bounded time after it ends, so a descendant that keeps a pipe open cannot
+/// hang the replay.
+pub(crate) fn run_c_harness(
+    runner: &HarnessRunner,
+    input: CInput,
+    testcase_path: &Path,
+    timeout: Duration,
+    env: &[(String, String)],
+) -> Result<CRun, String> {
     use std::io::Write;
     use std::process::Stdio;
 
@@ -670,42 +711,36 @@ pub(crate) fn run_c_testcase_with_env(
     .stderr(Stdio::piped());
     // Command::env (not std::env::set_var) so the parent env is untouched
     // between replays in one process.
-    for (key, value) in replay_env(raw, runner, input)
-        .into_iter()
-        .chain(extra_env.iter().cloned())
-    {
+    for (key, value) in env {
         cmd.env(key, value);
     }
+    replay_min::process::isolate_process_group(&mut cmd);
     let started = Instant::now();
     let mut child =
         spawn_harness(&mut cmd).map_err(|error| format!("spawn {}: {error}", harness.display()))?;
-    let stdout = child.stdout.take().map(drain);
-    let stderr = child.stderr.take().map(drain);
+    let stdout = child
+        .stdout
+        .take()
+        .map(|pipe| replay_min::process::drain(pipe, MAX_CAPTURED_OUTPUT));
+    let stderr = child
+        .stderr
+        .take()
+        .map(|pipe| replay_min::process::drain(pipe, MAX_CAPTURED_OUTPUT));
     if let (Some(bytes), Some(mut stdin)) = (bytes, child.stdin.take()) {
         // A harness that exits before reading all of its input closes the pipe;
         // its exit status, not the write, is the result.
         let _ = stdin.write_all(&bytes);
     }
-    let deadline = started + timeout;
-    let mut timed_out = false;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    timed_out = true;
-                    break child.wait().ok();
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => return Err(format!("poll {}: {error}", harness.display())),
-        }
-    };
+    let (status, timed_out) = replay_min::process::wait_with_timeout(&mut child, timeout)
+        .map_err(|error| format!("poll {}: {error}", harness.display()))?;
     let duration = started.elapsed();
+    // Whatever the harness left running would keep the pipes open.
+    replay_min::process::kill_process_group(&mut child);
     let join = |handle: Option<std::thread::JoinHandle<Vec<u8>>>| {
         handle
-            .and_then(|handle| handle.join().ok())
+            .and_then(|handle| {
+                replay_min::process::join_bounded(handle, replay_min::process::DRAIN_GRACE)
+            })
             .unwrap_or_default()
     };
     Ok(CRun {
@@ -714,23 +749,6 @@ pub(crate) fn run_c_testcase_with_env(
         duration,
         stdout: join(stdout),
         stderr: join(stderr),
-    })
-}
-
-/// Read a child pipe to its end on a thread, keeping at most
-/// [`MAX_CAPTURED_OUTPUT`] bytes.
-fn drain(mut pipe: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
-    std::thread::spawn(move || {
-        let mut kept = Vec::new();
-        let mut chunk = [0u8; 64 * 1024];
-        while let Ok(read) = pipe.read(&mut chunk) {
-            if read == 0 {
-                break;
-            }
-            let room = MAX_CAPTURED_OUTPUT.saturating_sub(kept.len());
-            kept.extend_from_slice(&chunk[..read.min(room)]);
-        }
-        kept
     })
 }
 
@@ -1358,8 +1376,8 @@ fn short_hash(hash: &str) -> &str {
 }
 
 /// Print a summary: JSON on stdout, or the status line and summary (stdout for
-/// a MATCH, stderr for a MISMATCH, as the status line always was), then the
-/// harness output when asked for.
+/// a MATCH, stderr for a MISMATCH or an UNVERIFIED replay, as the status line
+/// always was), then the harness output when asked for.
 /// `captured` is the harness's (stdout, stderr), or why there is none.
 fn emit(summary: &ReplaySummary, output: OutputMode, captured: Result<(&[u8], &[u8]), &str>) {
     if output.json {
@@ -1442,6 +1460,96 @@ pub(crate) const UNSYMBOLIZED_NOTE: &str =
     "the replayed report names no function or source position, so where it crashed was not \
      compared; the replay looks unsymbolized: put llvm-symbolizer on PATH or set \
      ASAN_SYMBOLIZER_PATH";
+
+/// Why a replayed `report` names no crash location, for the note under an
+/// UNVERIFIED verdict: a fatal signal printed no sanitizer report, the
+/// harness binary is `stripped`, an `inherited` `<SAN>_OPTIONS` value turned
+/// symbolization off, or else (most often) no symbolizer was found.
+pub(crate) fn unlocated_report_note(
+    report: &corpus::SanitizerReport,
+    stripped: bool,
+    inherited: &[(&str, Option<String>)],
+) -> String {
+    if report.sanitizer.is_none() {
+        let signal = report
+            .check
+            .clone()
+            .unwrap_or_else(|| "a fatal signal".to_owned());
+        return format!(
+            "the replay crashed with {signal} and printed no sanitizer report, so where it \
+             crashed was not compared"
+        );
+    }
+    if stripped {
+        return "the harness binary is stripped; replay a build with symbols".to_owned();
+    }
+    let symbolize_off = |options: &str| {
+        options
+            .split(':')
+            .rev()
+            .find_map(|item| item.trim().strip_prefix("symbolize="))
+            .is_some_and(|value| matches!(value.trim(), "0" | "false"))
+    };
+    if let Some((variable, _)) = inherited
+        .iter()
+        .find(|(_, value)| value.as_deref().is_some_and(symbolize_off))
+    {
+        return format!(
+            "{variable} sets symbolize=0, so the report names no function or source position; \
+             remove it from {variable} and replay again"
+        );
+    }
+    UNSYMBOLIZED_NOTE.to_owned()
+}
+
+/// The notes under an UNVERIFIED verdict: why each location field could not
+/// be compared.
+fn unverified_notes(
+    comparison: &crash_identity::Comparison,
+    report: &corpus::SanitizerReport,
+    harness: &Path,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    let build = match comparison.same_binary {
+        Some(true) => "",
+        Some(false) => " and this harness's sha256 differs from the recorded build",
+        None => " and no build sha256 to check this harness against",
+    };
+    for field in comparison.not_compared_fields().split(',') {
+        match field {
+            "location" => notes.push(format!(
+                "the finding records no crash location (no frames, sink, site or pc){build}, \
+                 so this run cannot show it is the recorded crash; replay the recorded build"
+            )),
+            "pc" if report.pc_offset.is_none() => notes.push(
+                "the finding records where it faulted as a pc offset, and the replay printed \
+                 none (bhf's driver prints one for a fatal signal in a build without a \
+                 sanitizer runtime)"
+                    .to_owned(),
+            ),
+            "pc" => notes.push(format!(
+                "the finding records where it faulted as a pc offset in the recorded build{build}, \
+                 so the offsets were not compared"
+            )),
+            "sink" | "site" => {
+                let stripped = crate::runner::elf_has_symbols(harness) == Some(false);
+                let inherited: Vec<(&str, Option<String>)> = ["ASAN_OPTIONS", "UBSAN_OPTIONS"]
+                    .into_iter()
+                    .map(|key| (key, std::env::var(key).ok()))
+                    .collect();
+                let note = unlocated_report_note(report, stripped, &inherited);
+                if !notes.contains(&note) {
+                    notes.push(note);
+                }
+            }
+            _ => {}
+        }
+    }
+    notes
+}
+
+/// Exit code of a replay that is not a reproduction although nothing differs.
+pub(crate) const EXIT_UNVERIFIED: i32 = 4;
 
 /// What a replay lane that does not run a C/C++ or Ada harness found: session,
 /// collector, transport and binary findings. [`finish_lane`] prints it the way
@@ -1560,8 +1668,10 @@ pub(crate) fn finish_lane(
 
 /// Reproduce a C/C++ finding: run the recorded testcase (argv[1] for
 /// libFuzzer and bhf driver harnesses, stdin for AFL) and compare the crash it
-/// reports with the finding's rule, kind and sink (or reported site). Exit
-/// codes: 0 = MATCH, 3 = MISMATCH, 1 = error.
+/// reports with the finding's rule, kind, signal and sink (or reported site,
+/// or faulting pc). Exit codes: 0 = MATCH, 3 = MISMATCH, 4 = UNVERIFIED
+/// (nothing differs, but where it crashed was not compared, so nothing is
+/// recorded), 1 = error.
 pub(crate) fn replay_c(
     finding_dir: &Path,
     runner: &HarnessRunner,
@@ -1605,7 +1715,7 @@ pub(crate) fn replay_c(
         Ok(run) => run,
         Err(error) => return report_error(&output, finding_dir, &error),
     };
-    let report = run.report();
+    let mut report = run.report();
     let arguments = output.show_args.then(|| {
         let input = std::fs::read(&testcase_path).ok();
         ArgumentsReport::from_run(
@@ -1615,25 +1725,51 @@ pub(crate) fn replay_c(
             input.as_deref(),
         )
     });
-    let comparison = report
+    let harness_info = harness_summary(&raw, runner.harness_path(), detection);
+    let same_binary = harness_info.sha256_matches;
+    let mut comparison = report
         .as_ref()
-        .map(|report| crash_identity::compare(&raw, report))
+        .map(|report| crash_identity::compare_with(&raw, report, same_binary))
         .unwrap_or_default();
-    let reproduced = report.is_some() && comparison.matches();
+    let mut notes = Vec::new();
+    // The recorded build's report printed without a symbolizer: resolve its
+    // module offsets here and compare again.
+    if same_binary == Some(true) && comparison.location_not_compared() {
+        if let Some((symbolized, comparison_again, tool)) =
+            symbolize_and_compare(&raw, &run.stderr, same_binary)
+        {
+            notes.push(format!(
+                "the replayed report was unsymbolized; replay symbolized it with {tool} against \
+                 the recorded build"
+            ));
+            report = Some(symbolized);
+            comparison = comparison_again;
+        }
+    }
+    let verdict = if report.is_some() {
+        comparison.verdict()
+    } else {
+        crash_identity::Verdict::Mismatch
+    };
+    let reproduced = verdict == crash_identity::Verdict::Match;
     let actual = match (&report, run.timed_out) {
         (Some(report), _) => report.rule_id.to_owned(),
         (None, true) => "<timeout>".to_owned(),
         (None, false) => "<none>".to_owned(),
     };
-    let status_line = if reproduced {
-        "MATCH".to_owned()
-    } else if report.is_some() {
-        format!(
+    let status_line = match verdict {
+        crash_identity::Verdict::Match => "MATCH".to_owned(),
+        crash_identity::Verdict::Unverified => format!(
+            "UNVERIFIED recorded={recorded_rule} actual={actual} not_compared={}",
+            comparison.not_compared_fields()
+        ),
+        crash_identity::Verdict::Mismatch if report.is_some() => format!(
             "MISMATCH recorded={recorded_rule} actual={actual} differs={}",
             comparison.differing_fields()
-        )
-    } else {
-        format!("MISMATCH recorded={recorded_rule} actual={actual}")
+        ),
+        crash_identity::Verdict::Mismatch => {
+            format!("MISMATCH recorded={recorded_rule} actual={actual}")
+        }
     };
     let mut differences = comparison.difference_lines();
     if report.is_none() {
@@ -1646,9 +1782,8 @@ pub(crate) fn replay_c(
             format!("no crash: {}", run.exit().text)
         });
     }
-    let mut notes = Vec::new();
-    if report.is_some() && comparison.location_not_compared() {
-        notes.push(UNSYMBOLIZED_NOTE.to_owned());
+    if let (crash_identity::Verdict::Unverified, Some(report)) = (verdict, &report) {
+        notes.extend(unverified_notes(&comparison, report, runner.harness_path()));
     }
     if let Some(note) = finding_format_note_for(&raw, runner.harness_path(), detection) {
         notes.push(note);
@@ -1675,7 +1810,7 @@ pub(crate) fn replay_c(
     });
     let summary = ReplaySummary {
         schema_version: REPLAY_SCHEMA,
-        verdict: if reproduced { "match" } else { "mismatch" },
+        verdict: verdict.as_str(),
         finding: finding_ref(finding_dir),
         lane: None,
         recorded_rule: Some(recorded_rule),
@@ -1688,7 +1823,7 @@ pub(crate) fn replay_c(
         signature: None,
         details: Vec::new(),
         exit: Some(run.exit()),
-        harness: Some(harness_summary(&raw, runner.harness_path(), detection)),
+        harness: Some(harness_info),
         testcase: testcase_summary(&testcase_path),
         output: output.show_output.then(|| OutputCapture {
             stdout: String::from_utf8_lossy(&run.stdout).into_owned(),
@@ -1709,11 +1844,28 @@ pub(crate) fn replay_c(
     );
     summary.replay_log = log.map(|path| path.display().to_string());
     emit(&summary, output, Ok((&run.stdout, &run.stderr)));
-    if reproduced {
-        0
-    } else {
-        3
+    match verdict {
+        crash_identity::Verdict::Match => 0,
+        crash_identity::Verdict::Mismatch => 3,
+        crash_identity::Verdict::Unverified => EXIT_UNVERIFIED,
     }
+}
+
+/// Symbolize an unsymbolized report of the recorded build (see
+/// [`crate::offline_symbolize`]) and compare it again: the symbolized report,
+/// its comparison and the symbolizer's name, when the location could now be
+/// compared.
+fn symbolize_and_compare(
+    raw: &Value,
+    stderr: &[u8],
+    same_binary: Option<bool>,
+) -> Option<(corpus::SanitizerReport, crash_identity::Comparison, String)> {
+    let symbolizer = crate::offline_symbolize::find()?;
+    let text =
+        crate::offline_symbolize::symbolize_report(&String::from_utf8_lossy(stderr), &symbolizer)?;
+    let report = corpus::parse_sanitizer_report(&text)?;
+    let comparison = crash_identity::compare_with(raw, &report, same_binary);
+    (!comparison.location_not_compared()).then(|| (report, comparison, symbolizer.name()))
 }
 
 /// The function the harness calls, from its generation metadata: beside the
@@ -1921,12 +2073,13 @@ mod silent_abort_tests {
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 
+    /// A silent abort recorded with no crash location is reproduced by a run
+    /// of the recorded build; without a recorded build it is unverified.
     #[test]
     fn libfuzzer_replay_matches_silent_abort_finding() {
         let root = tempdir().expect("tempdir");
         let finding = root.path().join("finding");
         fs::create_dir(&finding).expect("finding dir");
-        fs::write(finding.join("finding.json"), r#"{"rule_id":"BHF-210"}"#).expect("finding");
         fs::write(finding.join("testcase.bin"), b"crash").expect("testcase");
 
         let harness = root.path().join("abort.sh");
@@ -1935,6 +2088,16 @@ mod silent_abort_tests {
         permissions.set_mode(0o755);
         fs::set_permissions(&harness, permissions).expect("chmod");
 
+        fs::write(finding.join("finding.json"), r#"{"rule_id":"BHF-210"}"#).expect("finding");
+        assert_eq!(
+            replay_c_libfuzzer(&finding, &HarnessRunner::direct(harness.clone())),
+            super::EXIT_UNVERIFIED
+        );
+        let recorded = serde_json::json!({
+            "rule_id": "BHF-210",
+            "build": {"binary": {"sha256": super::sha256_file(&harness).unwrap()}},
+        });
+        fs::write(finding.join("finding.json"), recorded.to_string()).expect("finding");
         assert_eq!(
             replay_c_libfuzzer(&finding, &HarnessRunner::direct(harness.clone())),
             0
@@ -2006,17 +2169,86 @@ mod tests {
         assert_eq!(roots[0], std::path::PathBuf::from("/w"));
     }
 
+    /// A finding in a work dir is looked up in that work dir only, never in
+    /// `results/` or `results/findings/` as if they were work dirs; a finding
+    /// outside one falls back to its grandparent and parent.
     #[test]
-    fn harness_roots_dedupe_overlapping_candidates() {
-        // For the legacy depth, work_dir_for_finding and the grandparent both
-        // yield /w; it must appear once, followed by the finding's parent.
-        let roots = super::harness_work_roots(std::path::Path::new("/w/findings/F-1"));
+    fn harness_roots_are_the_work_dir_when_there_is_one() {
+        use std::path::{Path, PathBuf};
+        for finding in ["/w/findings/F-1", "/w/results/findings/F-1"] {
+            assert_eq!(
+                super::harness_work_roots(Path::new(finding)),
+                vec![PathBuf::from("/w")],
+                "{finding}"
+            );
+        }
         assert_eq!(
-            roots,
-            vec![
-                std::path::PathBuf::from("/w"),
-                std::path::PathBuf::from("/w/findings"),
-            ]
+            super::harness_work_roots(Path::new("/x/flat/F-1")),
+            vec![PathBuf::from("/x"), PathBuf::from("/x/flat")]
+        );
+    }
+
+    /// The "no harness" error names each directory it searched once, with
+    /// the binary names it looked for, and stays short.
+    #[test]
+    fn the_no_harness_error_lists_each_searched_dir_once() {
+        let work = tempfile::tempdir().unwrap();
+        let finding = work.path().join("results/findings/F-0001-aaaaaaaa");
+        std::fs::create_dir_all(&finding).unwrap();
+        std::fs::write(finding.join("finding.json"), r#"{"harness_id":"H-1"}"#).unwrap();
+        let error = super::recorded_harness(&finding).unwrap_err();
+        assert!(error.len() < 600, "{} chars: {error}", error.len());
+        assert!(
+            error.contains("for main, main_afl, main.exe or main_afl.exe"),
+            "{error}"
+        );
+        let build = work.path().join("build/H-1").display().to_string();
+        assert_eq!(error.matches(&build).count(), 1, "{error}");
+        assert!(!error.contains("results/harnesses"), "{error}");
+        assert!(!error.contains("findings/harnesses"), "{error}");
+        assert!(error.contains("--harness"), "{error}");
+    }
+
+    /// The note on an unverified location names its cause.
+    #[test]
+    fn the_unverified_location_note_names_its_cause() {
+        let asan = corpus::parse_sanitizer_report(
+            "==1==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1 at pc 0x1 bp 0x2 sp 0x3\n\
+             WRITE of size 1 at 0x1 thread T0\n\
+             \x20   #0 0x4f5a2b  (/w/harnesses/H-1/main+0x4f5a2b)\n",
+        )
+        .unwrap();
+        let fatal = corpus::SanitizerReport {
+            kind: "fatal-signal".to_owned(),
+            rule_id: "BHF-210",
+            message: "harness crashed with SIGSEGV and no sanitizer report".to_owned(),
+            check: Some("SIGSEGV".to_owned()),
+            ..Default::default()
+        };
+        let none: [(&str, Option<String>); 0] = [];
+        assert_eq!(
+            super::unlocated_report_note(&fatal, false, &none),
+            "the replay crashed with SIGSEGV and printed no sanitizer report, so where it \
+             crashed was not compared"
+        );
+        assert_eq!(
+            super::unlocated_report_note(&asan, true, &none),
+            "the harness binary is stripped; replay a build with symbols"
+        );
+        let inherited = [
+            ("ASAN_OPTIONS", Some("verbosity=0:symbolize=0".to_owned())),
+            ("UBSAN_OPTIONS", None),
+        ];
+        let note = super::unlocated_report_note(&asan, false, &inherited);
+        assert!(note.contains("ASAN_OPTIONS sets symbolize=0"), "{note}");
+        let turned_back_on = [("ASAN_OPTIONS", Some("symbolize=0:symbolize=1".to_owned()))];
+        assert_eq!(
+            super::unlocated_report_note(&asan, false, &turned_back_on),
+            super::UNSYMBOLIZED_NOTE
+        );
+        assert_eq!(
+            super::unlocated_report_note(&asan, false, &none),
+            super::UNSYMBOLIZED_NOTE
         );
     }
 

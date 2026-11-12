@@ -310,6 +310,15 @@ fn replay_c_libfuzzer_matches_a_finding_recorded_under_an_earlier_rule() {
     .unwrap();
     make_executable(&harness);
     let finding_dir = write_c_finding(&root);
+    // The records name no crash location, so they are checked against the
+    // build they were recorded with.
+    let record = |rule: &str| {
+        let value = serde_json::json!({
+            "rule_id": rule,
+            "build": {"binary": {"sha256": sha256_hex(&harness)}},
+        });
+        fs::write(finding_dir.join("finding.json"), value.to_string()).unwrap();
+    };
     let replay = || {
         cli::run_from([
             "bhf",
@@ -319,14 +328,22 @@ fn replay_c_libfuzzer_matches_a_finding_recorded_under_an_earlier_rule() {
             harness.to_str().unwrap(),
         ])
     };
+    record("BHF-210");
     assert_eq!(replay(), 0, "an older BHF-210 record still matches");
     let options = fs::read_to_string(root.join("ubsan-options.txt")).unwrap();
     assert!(options.contains("print_stacktrace=1"), "{options}");
     assert!(options.contains("report_error_type=1"), "{options}");
-    fs::write(finding_dir.join("finding.json"), r#"{"rule_id":"BHF-214"}"#).unwrap();
+    record("BHF-214");
     assert_eq!(replay(), 0, "today's rule matches");
-    fs::write(finding_dir.join("finding.json"), r#"{"rule_id":"BHF-202"}"#).unwrap();
+    record("BHF-202");
     assert_eq!(replay(), 3, "an unrelated rule does not");
+}
+
+/// The sha256 of `path`, as `build.binary.sha256` records it.
+#[cfg(unix)]
+fn sha256_hex(path: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(fs::read(path).unwrap()))
 }
 
 #[cfg(unix)]
@@ -929,6 +946,36 @@ fn replay_reports_a_hang_as_a_timeout() {
     assert!(stderr.contains("timed out after 10s"), "{stderr}");
 }
 
+/// A launcher harness whose own child never finishes: the replay timeout
+/// kills both, so replay returns soon after the timeout instead of hanging
+/// on the pipe the grandchild holds.
+#[cfg(unix)]
+#[test]
+fn a_replay_timeout_kills_what_the_harness_started() {
+    for (name, launched, limit) in [
+        ("busy", "sh -c 'while :; do :; done'", 13),
+        ("sleep", "sleep 30", 15),
+    ] {
+        let root = temp_dir(&format!("timeout-group-{name}"));
+        let work = root.join("work");
+        let harness = work.join("harnesses/H-1/main");
+        let report = asan_report("Widget::copy_at", 12);
+        write_crashing_harness(&harness, &report);
+        let finding = emit_finding(&work, &harness, &report);
+        fs::write(&harness, format!("#!/bin/sh\n# BHF_FRAMED\n{launched}\n")).unwrap();
+        let started = std::time::Instant::now();
+        let output = replay_output(&[finding.to_str().unwrap()]);
+        let elapsed = started.elapsed();
+        let stderr = text(&output.stderr);
+        assert_eq!(output.status.code(), Some(3), "{name}: {stderr}");
+        assert!(stderr.contains("timed out after 10s"), "{name}: {stderr}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(limit),
+            "{name}: replay took {elapsed:?}"
+        );
+    }
+}
+
 /// Replay runs with the fuzz child's sanitizer options; a leak finding keeps
 /// leak detection on, and nothing turns it off.
 #[cfg(unix)]
@@ -964,6 +1011,33 @@ fn replay_uses_the_fuzz_child_sanitizer_options() {
     let options =
         fs::read_to_string(leak_harness.parent().unwrap().join("asan-options.txt")).unwrap();
     assert!(options.contains("detect_leaks=1"), "{options}");
+}
+
+/// An inherited `symbolize=0` cannot strip the location a replay compares:
+/// replay puts `symbolize=1` after it.
+#[cfg(unix)]
+#[test]
+fn replay_symbolizes_whatever_the_inherited_options_say() {
+    let root = temp_dir("symbolize");
+    let work = root.join("work");
+    let harness = work.join("harnesses/H-1/main");
+    let report = asan_report("Widget::copy_at", 12);
+    write_crashing_harness(&harness, &report);
+    let finding = emit_finding(&work, &harness, &report);
+    let output = Command::new(env!("CARGO_BIN_EXE_cli"))
+        .arg("replay")
+        .arg(&finding)
+        .env("ASAN_OPTIONS", "symbolize=0")
+        .env("UBSAN_OPTIONS", "symbolize=0")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    let options = fs::read_to_string(harness.parent().unwrap().join("asan-options.txt")).unwrap();
+    let last = options
+        .split(':')
+        .rev()
+        .find(|item| item.starts_with("symbolize="));
+    assert_eq!(last, Some("symbolize=1"), "{options}");
 }
 
 /// A copied work dir replays against its own harness, not the original's.
@@ -1176,37 +1250,317 @@ fn a_binary_finding_replay_has_a_summary_json_and_a_current_attestation() {
     );
 }
 
-/// The same crash replayed without a symbolizer names no function and no
-/// position: that is not another crash site. Replay says the location was not
-/// compared instead of reporting a sink difference.
+/// The recorded crash replayed without a symbolizer names no function or
+/// position: that is not another crash site, but it is not a reproduction
+/// either. Replay says UNVERIFIED (exit 4), names what it could not compare,
+/// and records nothing: no `last_seen`, no history entry.
 #[cfg(unix)]
 #[test]
-fn an_unsymbolized_replay_of_the_recorded_crash_is_not_a_sink_difference() {
+fn an_unsymbolized_replay_of_the_recorded_crash_is_unverified() {
     let root = temp_dir("unsymbolized");
     let work = root.join("work");
     let harness = work.join("harnesses/H-1/main");
     let report = asan_report("Widget::copy_at", 12);
     write_crashing_harness(&harness, &report);
     let finding = emit_finding(&work, &harness, &report);
-    write_crashing_harness(
-        &harness,
-        "==1==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x602000000031 at pc 0x1 bp 0x2 sp 0x3\n\
-         WRITE of size 1 at 0x602000000031 thread T0\n\
-         \x20   #0 0x4f5a2b  (/w/harnesses/H-1/main+0x4f5a2b)\n\
-         \x20   #1 0x4f5c10  (/w/harnesses/H-1/main+0x4f5c10)\n\
-         \n\
-         SUMMARY: AddressSanitizer: heap-buffer-overflow (/w/harnesses/H-1/main+0x4f5a2b)\n",
-    );
+    write_crashing_harness(&harness, UNSYMBOLIZED_REPORT);
 
     let output = replay_output(&[finding.to_str().unwrap()]);
     let stdout = text(&output.stdout);
     let stderr = text(&output.stderr);
-    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
-    assert_eq!(stdout.lines().next(), Some("MATCH"), "{stdout}");
-    assert!(!stdout.contains("differs"), "{stdout}");
-    assert!(stdout.contains("sink not compared"), "{stdout}");
-    assert!(stdout.contains("unsymbolized"), "{stdout}");
-    assert!(stdout.contains("ASAN_SYMBOLIZER_PATH"), "{stdout}");
+    assert_eq!(output.status.code(), Some(4), "{stdout}{stderr}");
+    assert_eq!(
+        stderr.lines().next(),
+        Some("UNVERIFIED recorded=BHF-201 actual=BHF-201 not_compared=sink"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("differs"), "{stderr}");
+    assert!(stderr.contains("sink not compared"), "{stderr}");
+    assert!(stderr.contains("unsymbolized"), "{stderr}");
+    assert!(stderr.contains("ASAN_SYMBOLIZER_PATH"), "{stderr}");
+    let record = read_finding_json(&finding);
+    assert!(record.get("last_seen").is_none(), "{record}");
+    assert!(
+        !record["history"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|entry| entry["command"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("replay")),
+        "{record}"
+    );
+    let output = replay_output(&[finding.to_str().unwrap(), "--json"]);
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["verdict"], "unverified");
+    assert_eq!(output.status.code(), Some(4));
+}
+
+/// An ASan heap-buffer-overflow report printed without a symbolizer: frames
+/// that name only a module offset, and a summary without a position.
+#[cfg(unix)]
+const UNSYMBOLIZED_REPORT: &str =
+    "==1==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x602000000031 at pc 0x1 bp 0x2 sp 0x3\n\
+     WRITE of size 1 at 0x602000000031 thread T0\n\
+     \x20   #0 0x4f5a2b  (/w/harnesses/H-1/main+0x4f5a2b)\n\
+     \x20   #1 0x4f5c10  (/w/harnesses/H-1/main+0x4f5c10)\n\
+     \n\
+     SUMMARY: AddressSanitizer: heap-buffer-overflow (/w/harnesses/H-1/main+0x4f5a2b)\n";
+
+/// `--harness` naming another binary whose report is unsymbolized: the
+/// replay cannot say it is the recorded crash, so it is no MATCH and the
+/// results index is left as it was.
+#[cfg(unix)]
+#[test]
+fn an_unsymbolized_report_of_another_binary_is_not_a_match() {
+    let root = temp_dir("unsymbolized-other");
+    let work = root.join("work");
+    let harness = work.join("harnesses/H-1/main");
+    let report = asan_report("Widget::copy_at", 12);
+    write_crashing_harness(&harness, &report);
+    let finding = emit_finding(&work, &harness, &report);
+    let mut record = read_finding_json(&finding);
+    record["build"] = serde_json::json!({"binary": {"sha256": sha256_hex(&harness)}});
+    fs::write(
+        finding.join("finding.json"),
+        serde_json::to_vec_pretty(&record).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        cli::run_from(["bhf", "report", "--work-dir", work.to_str().unwrap()]),
+        0
+    );
+    // The index, less the time it was written.
+    let index = || {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(work.join("results/findings.json")).unwrap()).unwrap();
+        value.as_object_mut().unwrap().remove("generated_at");
+        value
+    };
+    let index_before = index();
+    let other = root.join("other/main");
+    write_crashing_harness(&other, UNSYMBOLIZED_REPORT);
+
+    let output = replay_output(&[
+        finding.to_str().unwrap(),
+        "--harness",
+        other.to_str().unwrap(),
+    ]);
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(4), "{stderr}");
+    assert!(stderr.starts_with("UNVERIFIED "), "{stderr}");
+    assert!(
+        stderr.contains("sha256 differs from the recorded build"),
+        "{stderr}"
+    );
+    assert!(read_finding_json(&finding).get("last_seen").is_none());
+    assert_eq!(index(), index_before, "results/findings.json changed");
+}
+
+/// A clang AddressSanitizer harness built with bhf's driver from a target
+/// that writes one byte past a heap buffer, or `None` without clang.
+#[cfg(unix)]
+fn build_overflowing_harness(dir: &Path) -> Option<PathBuf> {
+    fs::create_dir_all(dir).unwrap();
+    fs::write(
+        dir.join("target.c"),
+        "#include <stdint.h>\n#include <stddef.h>\n#include <stdlib.h>\n\
+         __attribute__((noinline)) void copy_at(char *out, size_t n) { out[n] = 1; }\n\
+         int bhf_run_one(const uint8_t *data, size_t size) {\n\
+             char *out = malloc(4);\n\
+             if (size > 0 && data[0] == 'W') copy_at(out, 4);\n\
+             free(out);\n\
+             return 0;\n\
+         }\n",
+    )
+    .unwrap();
+    let driver = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../c_runtime/bhf_driver.c");
+    let built = Command::new("clang")
+        .current_dir(dir)
+        .args(["-O0", "-g", "-fsanitize=address", "-o", "main", "target.c"])
+        .arg(&driver)
+        .output()
+        .ok()?;
+    built.status.success().then(|| dir.join("main"))
+}
+
+/// A finding recorded from a real run of `harness` on `input`, with the
+/// harness build's sha256.
+#[cfg(unix)]
+fn record_real_finding(work: &Path, harness: &Path, input: &[u8]) -> PathBuf {
+    let testcase = work.join("input.bin");
+    fs::write(&testcase, input).unwrap();
+    let output = Command::new(harness).arg(&testcase).output().unwrap();
+    let stderr = text(&output.stderr);
+    let parsed = corpus::parse_sanitizer_report(&stderr).expect("the harness reports");
+    let id = corpus::FindingEmitter::with_metadata(
+        work.to_path_buf(),
+        "H-1".to_owned(),
+        "c".to_owned(),
+        harness.display().to_string(),
+    )
+    .with_build_binary(serde_json::json!({"sha256": sha256_hex(harness)}))
+    .emit_sanitizer_crash_with_log(input, &parsed, Some(stderr.as_bytes()))
+    .expect("finding emitted");
+    corpus::layout::findings_dir(work).join(id.0)
+}
+
+/// A stripped copy of the harness reports the crash with module offsets only:
+/// UNVERIFIED, with a note that says the binary is stripped. The recorded
+/// build replayed where only `addr2line` can symbolize it is symbolized by
+/// replay itself and MATCHes; with no symbolizer at all it is UNVERIFIED.
+#[cfg(unix)]
+#[test]
+fn an_unsymbolized_replay_is_symbolized_for_the_recorded_build_only() {
+    let root = temp_dir("stripped");
+    let work = root.join("work");
+    let Some(harness) = build_overflowing_harness(&work.join("harnesses/H-1")) else {
+        eprintln!("skipping: clang unavailable");
+        return;
+    };
+    let finding = record_real_finding(&work, &harness, b"W");
+    let stripped = root.join("stripped/main");
+    fs::create_dir_all(stripped.parent().unwrap()).unwrap();
+    copy_executable(&harness, &stripped);
+    if !Command::new("strip")
+        .arg(&stripped)
+        .status()
+        .is_ok_and(|status| status.success())
+    {
+        eprintln!("skipping: strip unavailable");
+        return;
+    }
+    let output = replay_output(&[
+        finding.to_str().unwrap(),
+        "--harness",
+        stripped.to_str().unwrap(),
+    ]);
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(4), "{stderr}");
+    assert!(stderr.starts_with("UNVERIFIED "), "{stderr}");
+    assert!(
+        stderr.contains("the harness binary is stripped"),
+        "{stderr}"
+    );
+
+    // The recorded build, whose in-process symbolizer resolves nothing (a
+    // symbolizer that answers `??`), under a PATH where only addr2line can
+    // symbolize it.
+    let Ok(addr2line) = which::which("addr2line") else {
+        eprintln!("skipping the offline symbolization: addr2line unavailable");
+        return;
+    };
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    std::os::unix::fs::symlink(&addr2line, bin.join("addr2line")).unwrap();
+    let blind = root.join("blind/llvm-symbolizer");
+    fs::create_dir_all(blind.parent().unwrap()).unwrap();
+    fs::write(
+        &blind,
+        "#!/bin/sh\nwhile read -r line; do printf '??\\n??:0:0\\n\\n'; done\n",
+    )
+    .unwrap();
+    make_executable(&blind);
+    let replay_with_path = |path: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_cli"))
+            .arg("replay")
+            .arg(&finding)
+            .env("PATH", path)
+            .env(
+                "ASAN_OPTIONS",
+                format!("external_symbolizer_path={}", blind.display()),
+            )
+            .env_remove("ASAN_SYMBOLIZER_PATH")
+            .output()
+            .unwrap()
+    };
+    let output = replay_with_path(&bin);
+    let stdout = text(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{stdout}{}",
+        text(&output.stderr)
+    );
+    assert!(stdout.contains("sink copy_at"), "{stdout}");
+    assert!(stdout.contains("symbolized"), "{stdout}");
+    let empty = root.join("empty");
+    fs::create_dir_all(&empty).unwrap();
+    let output = replay_with_path(&empty);
+    assert_eq!(output.status.code(), Some(4), "{}", text(&output.stderr));
+}
+
+/// A fatal-signal finding replays only as the same signal: an abort finding
+/// replayed against a harness that dies of an illegal instruction is a
+/// MISMATCH naming the signal, and nothing is recorded.
+#[cfg(unix)]
+#[test]
+fn a_fatal_signal_replayed_as_another_signal_is_a_mismatch() {
+    let root = temp_dir("signal");
+    let work = root.join("work");
+    let harness = work.join("harnesses/H-1/main");
+    fs::create_dir_all(harness.parent().unwrap()).unwrap();
+    fs::write(
+        &harness,
+        "#!/bin/sh
+# BHF_FRAMED test driver
+kill -ABRT $$
+",
+    )
+    .unwrap();
+    make_executable(&harness);
+    let abort = corpus::SanitizerReport {
+        kind: "fatal-signal".to_owned(),
+        rule_id: "BHF-210",
+        message: "harness crashed with SIGABRT and no sanitizer report — a reachable crash"
+            .to_owned(),
+        check: Some("SIGABRT".to_owned()),
+        ..Default::default()
+    };
+    let id = corpus::FindingEmitter::with_metadata(
+        work.clone(),
+        "H-1".to_owned(),
+        "c".to_owned(),
+        harness.display().to_string(),
+    )
+    .with_build_binary(serde_json::json!({"sha256": sha256_hex(&harness)}))
+    .emit_sanitizer_crash(b"x", &abort)
+    .unwrap();
+    let finding = corpus::layout::findings_dir(&work).join(id.0);
+    assert_eq!(
+        read_finding_json(&finding)["exception"]["signal"],
+        "SIGABRT"
+    );
+    let output = replay_output(&[finding.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+
+    let illegal = root.join("illegal/main");
+    fs::create_dir_all(illegal.parent().unwrap()).unwrap();
+    fs::write(
+        &illegal,
+        "#!/bin/sh
+# BHF_FRAMED test driver
+kill -ILL $$
+",
+    )
+    .unwrap();
+    make_executable(&illegal);
+    let mut record = read_finding_json(&finding);
+    record.as_object_mut().unwrap().remove("last_seen");
+    fs::write(finding.join("finding.json"), record.to_string()).unwrap();
+    let output = replay_output(&[
+        finding.to_str().unwrap(),
+        "--harness",
+        illegal.to_str().unwrap(),
+    ]);
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(3), "{stderr}");
+    assert!(
+        stderr.starts_with("MISMATCH recorded=BHF-210 actual=BHF-210 differs=signal"),
+        "{stderr}"
+    );
+    assert!(read_finding_json(&finding).get("last_seen").is_none());
 }
 
 /// A relative `fixture_path` resolves in the work dir holding the finding. When
@@ -1721,12 +2075,15 @@ fn env_dependent_finding(name: &str) -> Option<(PathBuf, PathBuf, PathBuf)> {
     let finding = corpus::layout::findings_dir(&work).join("F-0001-0e0e0e0e");
     fs::create_dir_all(&finding).unwrap();
     fs::write(finding.join("testcase.bin"), b"AAAA").unwrap();
+    // Recorded without frames, so the replay is checked against the build.
     fs::write(
         finding.join("finding.json"),
         r#"{"id":"F-0001-0e0e0e0e","rule_id":"BHF-201","harness_id":"H-ENV","harness_format_version":3,
             "fixture_path":"harnesses/H-ENV/main",
             "runtime_mode":{"pass":"rng","env_injected":{"WIDGET_MODE":"x"}},
-            "exception":{"name":"ASAN_HEAP_BUFFER_OVERFLOW","sanitizer":"asan","stack":[]}}"#,
+            "build":{"binary":{"sha256":"SHA256"}},
+            "exception":{"name":"ASAN_HEAP_BUFFER_OVERFLOW","sanitizer":"asan","stack":[]}}"#
+            .replace("SHA256", &sha256_hex(&harness_dir.join("main"))),
     )
     .unwrap();
     Some((work, finding, library))

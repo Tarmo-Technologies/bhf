@@ -421,9 +421,17 @@ LD_PRELOAD behavioral and taint findings are the unavailable layer.
 ## Replaying a Finding
 
 `bhf replay --finding <id-or-dir>` re-runs a finding's testcase against its
-harness and says whether the recorded crash reproduced. The first line is still
-`MATCH` (stdout, exit `0`) or `MISMATCH recorded=<rule> actual=<rule>` (stderr,
-exit `3`); errors exit `1`. Under it comes a summary of what ran:
+harness and says whether the recorded crash reproduced. The first line is the
+verdict:
+
+| Verdict | Stream | Exit | Meaning |
+|---|---|---|---|
+| `MATCH` | stdout | `0` | the recorded crash at the recorded place; `last_seen` and a `replay` history entry are recorded |
+| `MISMATCH recorded=<rule> actual=<rule> differs=<fields>` | stderr | `3` | a compared field differs, or no crash (`actual=<none>`, `actual=<timeout>`) |
+| `UNVERIFIED recorded=<rule> actual=<rule> not_compared=<fields>` | stderr | `4` | nothing differs, but where it crashed could not be compared; nothing is recorded |
+| error | stderr | `1` | the replay could not run |
+
+Under it comes a summary of what ran:
 
 ```text
 MATCH
@@ -445,19 +453,38 @@ MATCH
   the place match: the sink (the top project frame, chosen as for
   `actionability.sink`, compared by function and `file:line`) or, for a finding
   recorded without frames (a UBSan report from an earlier release), the site
-  the sanitizer printed. A crash of the same rule elsewhere is a `MISMATCH`
+  the sanitizer printed. A fatal signal without a sanitizer report also
+  compares its signal (`exception.signal`, or the signal an older record's
+  message names): an abort is not reproduced by an illegal instruction
+  (`differs=signal`). A crash of the same rule elsewhere is a `MISMATCH`
   whose `differs=` field and `differs` line name what differed. Rules and
   kinds earlier releases gave the same report still match. A hang is reported
   as `actual=<timeout>` after 10 s, a clean exit as `actual=<none>` with its
-  exit status. A replayed report that names no function and no source position
-  (an unsymbolized one) is not another site: the location shows as "not
-  compared" and a `note` line says the replay looks unsymbolized. Replay puts
-  the LLVM toolchain `bhf auto` uses on `PATH` (the RHEL 7 LLVM Toolset when
-  the base `clang` lacks SanitizerCoverage); elsewhere put `llvm-symbolizer` on
-  `PATH` or set `ASAN_SYMBOLIZER_PATH`.
+  exit status.
+- **Unverified.** A replayed report that names no function and no source
+  position (an unsymbolized one) is not another site, but it is not a
+  reproduction either: the verdict is `UNVERIFIED ... not_compared=sink`
+  (exit `4`), and `last_seen`, the history and `results/` are left as they
+  were. When the harness is the recorded build (its sha256 is
+  `build.binary.sha256`), replay first symbolizes the report itself with
+  `llvm-symbolizer` (or `addr2line`) from `PATH` and compares again. A finding
+  that records no crash location at all (no frames, sink, site or pc, such as
+  a rule-only record from an earlier release) is a `MATCH` only against the
+  recorded build, and so is the faulting pc offset a fatal signal records
+  (`not_compared=location`, `not_compared=pc` otherwise). A `note` line names
+  the cause: a fatal signal that printed no sanitizer report, a stripped
+  harness binary, a `symbolize=0` in an inherited `ASAN_OPTIONS` or
+  `UBSAN_OPTIONS`, or no symbolizer. Replay puts the LLVM toolchain `bhf auto`
+  uses on `PATH` (the RHEL 7 LLVM Toolset when the base `clang` lacks
+  SanitizerCoverage); elsewhere put `llvm-symbolizer` on `PATH` or set
+  `ASAN_SYMBOLIZER_PATH`.
+- **Timeout.** The harness runs in its own process group: after 10 s it is
+  killed with every process it started (a launcher script's children too),
+  and replay does not wait more than 2 s for output a leftover process holds.
 - **Build identity.** When the harness's sha256 differs from the finding's
   `build.binary.sha256`, the harness line says so.
-- **`--json`** prints one `bhf.replay.v1` document on stdout instead: `verdict`,
+- **`--json`** prints one `bhf.replay.v1` document on stdout instead: `verdict`
+  (`match`, `mismatch` or `unverified`),
   every compared field (`compared[]` with `outcome`: `equal`, `legacy`,
   `differs`, `not_recorded` or `not_comparable`), `differences`, `notes`, the
   replayed `crash` (rule, kind, sink, frames, `access` region, allocation
@@ -524,10 +551,11 @@ MATCH
   lanes run no local harness. An Ada (event-log) replay shows the harness exit
   status and duration, and compares event-log signatures.
 - **Sanitizer options.** C/C++ replays use the fuzz child's options:
-  `ASAN_OPTIONS` gets `abort_on_error=1:halt_on_error=1` (plus `detect_leaks=1`
-  for a leak finding) and `UBSAN_OPTIONS` also `print_stacktrace=1` and
-  `report_error_type=1`, merged after your own values. Leak detection is never
-  turned off.
+  `ASAN_OPTIONS` gets `abort_on_error=1:halt_on_error=1:symbolize=1` (plus
+  `detect_leaks=1` for a leak finding) and `UBSAN_OPTIONS` also
+  `symbolize=1`, `print_stacktrace=1` and `report_error_type=1`, merged after
+  your own values, so an inherited `symbolize=0` cannot erase the location.
+  Leak detection is never turned off.
 - **Harness resolution.** Without `--harness`, the finding's `fixture_path` is
   used. bhf records it relative to the work dir and resolves it there, never
   relative to the current directory; an absolute path from an earlier release
@@ -549,7 +577,8 @@ MATCH
 - **Results stay current.** A `MATCH` stamps `last_seen` in `finding.json`; when
   the work dir has a results index, replay rebuilds it so
   `results/findings.json` and `results/attestation.json` match the files on
-  disk. This holds for every kind of finding. A `MISMATCH` changes nothing.
+  disk. This holds for every kind of finding. A `MISMATCH` or an `UNVERIFIED`
+  replay records nothing in the finding (only `replay.log`).
 
 ## Crash → PoC, Explanation, and One-Shot Fuzzing
 

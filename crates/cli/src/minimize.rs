@@ -94,8 +94,10 @@ enum CEngineIo {
 /// Minimize a C/C++ harness crash by delta-debugging the recorded
 /// testcase. The predicate runs the harness via the engine-specific
 /// I/O contract (argv file for libFuzzer, stdin for AFL), parses
-/// stderr for a sanitizer report, and accepts the candidate only
-/// when it reproduces the same sanitizer rule_id as the original.
+/// stderr for a sanitizer report (or classifies an undiagnosed fatal
+/// signal), and accepts the candidate only when it is the original's crash
+/// ([`crate::crash_identity::same_crash`]: same rule, kind, signal, and
+/// sink, site or pc).
 fn minimize_c_engine(
     finding_dir: &Path,
     harness: &Path,
@@ -116,8 +118,6 @@ fn minimize_c_engine_until(
     io: CEngineIo,
     deadline: Option<std::time::Instant>,
 ) -> anyhow::Result<MinimizeSummary> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     if strategy != MinimizeStrategy::Bytes {
@@ -137,63 +137,35 @@ fn minimize_c_engine_until(
         .ok()
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
         .is_some_and(|raw| crate::replay::is_leak_finding(&raw));
+    // The fuzz child's sanitizer options (UBSan prints and continues by
+    // default), so a finding reproduces as the crash it was recorded as.
     let sanitizer_env = crate::fuzz::sanitizer_child_env(leak);
-    let run_once = |bytes: &[u8]| -> anyhow::Result<Option<&'static str>> {
-        let mut cmd = Command::new(harness);
-        cmd.stdout(Stdio::null()).stderr(Stdio::piped());
-        // The fuzz child's sanitizer options (UBSan prints and continues by
-        // default), so a finding reproduces as the crash it was recorded as.
-        for (key, value) in &sanitizer_env {
-            cmd.env(key, value);
-        }
-        let input_path = match io {
-            CEngineIo::ArgvFile => {
-                let nonce = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0);
-                let p = tmp_dir.join(format!("input-{}-{}.bin", std::process::id(), nonce));
-                fs::write(&p, bytes).with_context(|| format!("write {}", p.display()))?;
-                cmd.arg(&p).stdin(Stdio::null());
-                Some(p)
-            }
-            CEngineIo::Stdin => {
-                cmd.stdin(Stdio::piped());
-                None
-            }
-        };
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("spawn {}", harness.display()))?;
-        if let CEngineIo::Stdin = io {
-            if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(bytes);
-            }
-        }
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            match child.try_wait()? {
-                Some(_) => break,
-                None => {
-                    if Instant::now() >= deadline {
-                        let _ = child.kill();
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-            }
-        }
-        let output = child.wait_with_output()?;
-        if let Some(p) = input_path {
-            let _ = fs::remove_file(&p);
-        }
-        if output.status.success() {
+    let runner = replay_min::HarnessRunner::direct(harness);
+    let input = match io {
+        CEngineIo::ArgvFile => crate::replay::CInput::ArgvFile,
+        CEngineIo::Stdin => crate::replay::CInput::Stdin,
+    };
+    let run_once = |bytes: &[u8]| -> anyhow::Result<Option<corpus::SanitizerReport>> {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = tmp_dir.join(format!("input-{}-{}.bin", std::process::id(), nonce));
+        fs::write(&path, bytes).with_context(|| format!("write {}", path.display()))?;
+        // Its own process group: a timeout kills whatever the harness started.
+        let run = crate::replay::run_c_harness(
+            &runner,
+            input,
+            &path,
+            Duration::from_secs(10),
+            &sanitizer_env,
+        );
+        let _ = fs::remove_file(&path);
+        let run = run.map_err(|error| anyhow!(error))?;
+        if run.timed_out || run.status.is_some_and(|status| status.success()) {
             return Ok(None);
         }
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Ok(corpus::parse_sanitizer_report(&stderr)
-            .map(|r| r.rule_id)
-            .or_else(|| crate::fatal_signal::rule_id(&output.status, &stderr)))
+        Ok(run.report())
     };
 
     let baseline = run_once(&original_input)?.ok_or_else(|| {
@@ -208,7 +180,8 @@ fn minimize_c_engine_until(
         if deadline.is_some_and(|d| Instant::now() >= d) {
             return Ok(false); // budget spent: reject further reductions, keep best-so-far
         }
-        Ok(run_once(candidate)?.map(|r| r == baseline).unwrap_or(false))
+        Ok(run_once(candidate)?
+            .is_some_and(|report| crate::crash_identity::same_crash(&baseline, &report)))
     })?;
 
     let _ = fs::remove_dir_all(&tmp_dir);
@@ -616,5 +589,41 @@ mod silent_abort_tests {
             "an already-expired deadline must not reduce"
         );
         assert!(finding.join("min_testcase.bin").is_file());
+    }
+
+    /// A reduction must be the recorded crash, not merely a crash of the same
+    /// rule: an abort is not minimized into an input that dies of SIGSEGV.
+    #[test]
+    fn a_reduction_that_crashes_with_another_signal_is_rejected() {
+        let root = tempdir().expect("tempdir");
+        let finding = root.path().join("finding");
+        fs::create_dir(&finding).expect("finding dir");
+        fs::write(
+            finding.join("finding.json"),
+            r#"{"rule_id":"BHF-210","paths":{}}"#,
+        )
+        .expect("finding");
+        fs::write(finding.join("testcase.bin"), b"AB").expect("testcase");
+        // "AB..." aborts; anything else ending in B dies of SIGSEGV.
+        let harness = root.path().join("two-signals.sh");
+        fs::write(
+            &harness,
+            "#!/bin/sh\ncase \"$(cat \"$1\")\" in\n  AB*) kill -ABRT $$;;\n  *B) kill -SEGV $$;;\nesac\nexit 0\n",
+        )
+        .expect("harness");
+        let mut permissions = fs::metadata(&harness).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&harness, permissions).expect("chmod");
+
+        let summary = minimize_c_engine(
+            &finding,
+            &harness,
+            MinimizeStrategy::Bytes,
+            CEngineIo::ArgvFile,
+        )
+        .expect("minimize");
+
+        assert!(!summary.reduced, "{summary:?}");
+        assert_eq!(fs::read(finding.join("min_testcase.bin")).unwrap(), b"AB");
     }
 }

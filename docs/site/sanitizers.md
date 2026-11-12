@@ -60,7 +60,10 @@ report into a clean exit) and exits with the harness's status, 128 plus the
 signal for a harness killed by one. Minimization, `bhf replay` and
 `bhf report --backfill` run C/C++ harnesses with the same `ASAN_OPTIONS` and
 `UBSAN_OPTIONS` as a fuzz child (a leak finding also gets `detect_leaks=1`;
-leak detection is never turned off). UBSan then prints the stack of
+leak detection is never turned off). Fuzz children, minimization, `bhf replay`
+and `bhf report --backfill` also get `symbolize=1` after an inherited value,
+so an inherited `symbolize=0` cannot erase the frames a replay compares.
+UBSan then prints the stack of
 each report and names the failed check (`missing-return`,
 `invalid-shift-exponent`, ...) on its `SUMMARY:` line. Each sanitizer is merged independently, so
 per-sanitizer suppressions land in the right variable:

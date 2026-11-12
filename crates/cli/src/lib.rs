@@ -77,6 +77,7 @@ mod llm;
 mod minimize;
 mod model;
 mod msvc_cc;
+mod offline_symbolize;
 mod pack;
 mod policy;
 mod probe_backend;
@@ -234,7 +235,7 @@ enum Command {
     Corpus(corpus::CorpusArgs),
     /// Shrink a crashing input by binary search while preserving the crash (testcase reduction)
     Minimize(minimize::MinimizeArgs),
-    /// Re-run a finding's crash input through a harness to reproduce it: MATCH only on the same rule, kind and sink (or reported site), with a crash summary, --json and --show-output (sandbox / qemu-user)
+    /// Re-run a finding's crash input through a harness to reproduce it: MATCH (exit 0) only on the same rule, kind, signal and sink (or reported site), MISMATCH (exit 3), or UNVERIFIED (exit 4) when where it crashed could not be compared; with a crash summary, --json and --show-output (sandbox / qemu-user)
     Replay(replay::ReplayArgs),
     /// Package a crash from a harness in any language bhf generates into a portable, self-verifying PoC capsule (input + harness + sources + recorded build + stubs + vendored dependencies); a harness that cannot rebuild offline is refused with the reason
     Capsule(capsule::CapsuleArgs),

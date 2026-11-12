@@ -108,6 +108,134 @@ pub(crate) fn engine_for(protocol: HarnessProtocol) -> HarnessEngine {
     }
 }
 
+/// What bhf reads from an ELF file's header: the machine it is built for and
+/// its byte order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ElfInfo {
+    /// `e_machine` (`EM_X86_64` 62, `EM_AARCH64` 183, ...).
+    pub(crate) machine: u16,
+    pub(crate) class64: bool,
+    pub(crate) big_endian: bool,
+}
+
+/// The ELF header of `path`, or `None` for anything that is not an ELF file
+/// (a script, a PE binary, an unreadable path).
+pub(crate) fn elf_info(path: &Path) -> Option<ElfInfo> {
+    use std::io::Read;
+    let mut header = [0u8; 20];
+    std::fs::File::open(path)
+        .ok()?
+        .read_exact(&mut header)
+        .ok()?;
+    if &header[..4] != b"\x7fELF" {
+        return None;
+    }
+    let big_endian = match header[5] {
+        1 => false,
+        2 => true,
+        _ => return None,
+    };
+    let class64 = match header[4] {
+        1 => false,
+        2 => true,
+        _ => return None,
+    };
+    let bytes = [header[18], header[19]];
+    let machine = if big_endian {
+        u16::from_be_bytes(bytes)
+    } else {
+        u16::from_le_bytes(bytes)
+    };
+    Some(ElfInfo {
+        machine,
+        class64,
+        big_endian,
+    })
+}
+
+/// Whether the ELF file at `path` carries a symbol table or debug
+/// information (`.symtab`, `.debug_info`). `Some(false)` is a stripped
+/// binary; `None` is not an ELF file or one whose section headers cannot be
+/// read.
+pub(crate) fn elf_has_symbols(path: &Path) -> Option<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+    let info = elf_info(path)?;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut header = vec![0u8; if info.class64 { 64 } else { 52 }];
+    file.read_exact(&mut header).ok()?;
+    let read = |bytes: &[u8], at: usize, len: usize| -> Option<u64> {
+        let field = bytes.get(at..at + len)?;
+        let mut value = 0u64;
+        for index in 0..len {
+            let byte = if info.big_endian {
+                field[index]
+            } else {
+                field[len - 1 - index]
+            };
+            value = (value << 8) | u64::from(byte);
+        }
+        Some(value)
+    };
+    let (shoff, shentsize, shnum, shstrndx) = if info.class64 {
+        (
+            read(&header, 0x28, 8)?,
+            read(&header, 0x3a, 2)?,
+            read(&header, 0x3c, 2)?,
+            read(&header, 0x3e, 2)?,
+        )
+    } else {
+        (
+            read(&header, 0x20, 4)?,
+            read(&header, 0x2e, 2)?,
+            read(&header, 0x30, 2)?,
+            read(&header, 0x32, 2)?,
+        )
+    };
+    if shoff == 0 || shnum == 0 || shnum > 4096 || shentsize < 40 || shstrndx >= shnum {
+        return None;
+    }
+    let mut table = vec![0u8; usize::try_from(shentsize * shnum).ok()?];
+    file.seek(SeekFrom::Start(shoff)).ok()?;
+    file.read_exact(&mut table).ok()?;
+    let section = |index: u64| -> Option<(u64, u64, u64)> {
+        let base = usize::try_from(index * shentsize).ok()?;
+        let entry = table.get(base..base + usize::try_from(shentsize).ok()?)?;
+        Some(if info.class64 {
+            (
+                read(entry, 0, 4)?,
+                read(entry, 0x18, 8)?,
+                read(entry, 0x20, 8)?,
+            )
+        } else {
+            (
+                read(entry, 0, 4)?,
+                read(entry, 0x10, 4)?,
+                read(entry, 0x14, 4)?,
+            )
+        })
+    };
+    let (_, names_offset, names_size) = section(shstrndx)?;
+    if names_size > 1 << 20 {
+        return None;
+    }
+    let mut names = vec![0u8; usize::try_from(names_size).ok()?];
+    file.seek(SeekFrom::Start(names_offset)).ok()?;
+    file.read_exact(&mut names).ok()?;
+    let name_at = |offset: u64| -> &[u8] {
+        let start = usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(names.len());
+        let rest = &names[start..];
+        &rest[..rest.iter().position(|b| *b == 0).unwrap_or(rest.len())]
+    };
+    Some((0..shnum).filter_map(section).any(|(name, _, _)| {
+        matches!(
+            name_at(name),
+            b".symtab" | b".debug_info" | b".zdebug_info" | b".gnu_debuglink"
+        )
+    }))
+}
+
 fn sandbox_config(
     sandbox: SandboxModeArg,
     sandbox_tool: Option<PathBuf>,
@@ -179,6 +307,39 @@ mod tests {
             detect_harness_engine(&build.join("main")),
             HarnessEngine::CLibFuzzer
         );
+    }
+
+    /// A built binary has symbols, a stripped copy has none, and a script is
+    /// not an ELF file.
+    #[cfg(unix)]
+    #[test]
+    fn a_stripped_binary_is_told_from_one_with_symbols() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("w.c"), "int main(void) { return 0; }\n").unwrap();
+        let built = std::process::Command::new("cc")
+            .current_dir(dir.path())
+            .args(["-g", "-o", "w", "w.c"])
+            .status();
+        if !built.is_ok_and(|status| status.success()) {
+            eprintln!("skipping: no C compiler");
+            return;
+        }
+        let binary = dir.path().join("w");
+        let info = super::elf_info(&binary).expect("an ELF file");
+        assert!(info.class64 == cfg!(target_pointer_width = "64"));
+        assert_eq!(super::elf_has_symbols(&binary), Some(true));
+        let stripped = dir.path().join("w.stripped");
+        let ok = std::process::Command::new("strip")
+            .arg("-o")
+            .arg(&stripped)
+            .arg(&binary)
+            .status();
+        if ok.is_ok_and(|status| status.success()) {
+            assert_eq!(super::elf_has_symbols(&stripped), Some(false));
+        }
+        fs::write(dir.path().join("s"), "#!/bin/sh\n").unwrap();
+        assert_eq!(super::elf_info(&dir.path().join("s")), None);
+        assert_eq!(super::elf_has_symbols(&dir.path().join("s")), None);
     }
 
     #[test]

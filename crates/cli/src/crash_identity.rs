@@ -7,9 +7,15 @@
 //! sanitizer printed (`file:line:col: runtime error:`), the identity the
 //! finding signature uses for such reports.
 //!
+//! A fatal signal without a sanitizer report is also identified by its signal
+//! and, when bhf's driver printed one, the faulting pc offset in the
+//! executable, which only the recorded build can reproduce.
+//!
 //! `bhf replay`, `bhf report --backfill` and the fuzz loop's fresh-process
-//! confirmation all compare through [`compare`], so a crash of the same class
-//! at another site never counts as a reproduction.
+//! confirmation all compare through [`compare_with`], so a crash of the same
+//! class at another site never counts as a reproduction. The [`Verdict`] also
+//! says when nothing differed but where the crash happened could not be
+//! checked: such a replay is not a reproduction either.
 
 use corpus::SanitizerReport;
 use serde::Serialize;
@@ -56,13 +62,84 @@ impl Check {
     }
 }
 
+/// What a comparison concludes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Verdict {
+    /// The recorded crash, at the recorded place.
+    Match,
+    /// A compared field differs.
+    Mismatch,
+    /// Nothing differs, but where the crash happened was not compared: the
+    /// replay names no location, or the finding records none (or only a pc
+    /// offset) and the harness is not the recorded build.
+    Unverified,
+}
+
+impl Verdict {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Match => "match",
+            Self::Mismatch => "mismatch",
+            Self::Unverified => "unverified",
+        }
+    }
+}
+
+/// The fields that say where a crash happened.
+const LOCATION_FIELDS: [&str; 3] = ["sink", "site", "pc"];
+
 /// The field-by-field comparison of a replayed report with a recorded finding.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct Comparison {
     pub(crate) checks: Vec<Check>,
+    /// Whether the binary that ran is the one the finding was recorded with
+    /// (its sha256 is `build.binary.sha256`); `None` when that is unknown.
+    #[serde(skip)]
+    pub(crate) same_binary: Option<bool>,
 }
 
 impl Comparison {
+    /// What the comparison concludes: a [`Verdict::Mismatch`] when a field
+    /// differs; [`Verdict::Unverified`] when nothing differs but a location
+    /// field was not comparable, or when the finding records no location and
+    /// the harness is not shown to be the recorded build; else a match.
+    pub(crate) fn verdict(&self) -> Verdict {
+        if self.differences().next().is_some() {
+            Verdict::Mismatch
+        } else if self.location_not_compared() || self.location_unverified() {
+            Verdict::Unverified
+        } else {
+            Verdict::Match
+        }
+    }
+
+    /// The finding records no crash location to compare, and the harness is
+    /// not known to be the binary it was recorded with.
+    fn location_unverified(&self) -> bool {
+        self.same_binary != Some(true)
+            && !self.checks.iter().any(|check| {
+                LOCATION_FIELDS.contains(&check.field)
+                    && matches!(check.outcome, Outcome::Equal | Outcome::Legacy)
+            })
+    }
+
+    /// The fields an [`Verdict::Unverified`] verdict could not compare,
+    /// comma-separated (`sink`, `pc`, or `location` for a finding that
+    /// records none).
+    pub(crate) fn not_compared_fields(&self) -> String {
+        let fields: Vec<&str> = self
+            .checks
+            .iter()
+            .filter(|check| check.outcome == Outcome::NotComparable)
+            .map(|check| check.field)
+            .collect();
+        if fields.is_empty() && self.location_unverified() {
+            return "location".to_owned();
+        }
+        fields.join(",")
+    }
+
     /// Every compared field is equal (or an earlier name for the same thing);
     /// a field the finding does not record cannot fail the match.
     pub(crate) fn matches(&self) -> bool {
@@ -205,6 +282,29 @@ struct Identity {
     sink: Option<SinkSite>,
     site: Option<Position>,
     ubsan: bool,
+    /// The fatal signal of a crash with no sanitizer report (`SIGSEGV`).
+    signal: Option<String>,
+    /// Where such a crash faulted: the pc offset in the executable.
+    pc_offset: Option<u64>,
+}
+
+/// The signal a fatal-signal message names: `harness crashed with SIGABRT ...`.
+fn message_signal(message: &str) -> Option<String> {
+    let rest = message.split("crashed with ").nth(1)?;
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        .collect();
+    (name.len() > 3 && name.starts_with("SIG")).then_some(name)
+}
+
+/// `0x1b3c` (or a bare hex or decimal number) as an offset.
+fn parse_offset(text: &str) -> Option<u64> {
+    let text = text.trim();
+    match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        Some(hex) => u64::from_str_radix(hex, 16).ok(),
+        None => text.parse().ok(),
+    }
 }
 
 fn normalize_kind(kind: &str) -> String {
@@ -264,13 +364,31 @@ fn recorded_identity(raw: &Value) -> Identity {
         });
     let name = text(exception.and_then(|e| e.get("name")));
     let sanitizer = text(exception.and_then(|e| e.get("sanitizer")));
+    let kind = name.as_deref().and_then(kind_from_exception_name);
+    // The signal: recorded since this release, else the check name a fatal
+    // signal carries, else the message an older release wrote.
+    let signal = text(exception.and_then(|e| e.get("signal")))
+        .or_else(|| {
+            text(exception.and_then(|e| e.get("check")))
+                .filter(|check| kind.as_deref() == Some("fatal-signal") && check.starts_with("SIG"))
+        })
+        .or_else(|| {
+            text(exception.and_then(|e| e.get("message")))
+                .filter(|_| kind.as_deref() == Some("fatal-signal"))
+                .as_deref()
+                .and_then(message_signal)
+        });
     Identity {
         rule: text(raw.get("rule_id")),
-        kind: name.as_deref().and_then(kind_from_exception_name),
+        kind,
         sink: actionability::sink_for_finding(raw).and_then(SinkSite::from_sink),
         site,
         ubsan: sanitizer.as_deref() == Some("ubsan")
             || name.as_deref().is_some_and(|n| n.starts_with("UBSAN_")),
+        signal,
+        pc_offset: text(exception.and_then(|e| e.get("pc_offset")))
+            .as_deref()
+            .and_then(parse_offset),
     }
 }
 
@@ -293,12 +411,23 @@ fn replayed_identity(report: &SanitizerReport) -> Identity {
             location.column.map(u64::from),
         )
     });
+    let fatal = report.sanitizer.is_none() && normalize_kind(&report.kind) == "fatal-signal";
     Identity {
         rule: Some(report.rule_id.to_owned()),
         kind: Some(normalize_kind(&report.kind)),
         sink: actionability::sink_for_finding(&report_record(report)).and_then(SinkSite::from_sink),
         site,
         ubsan: report.sanitizer == Some(corpus::sanitizer::Sanitizer::UndefinedBehaviorSanitizer),
+        signal: fatal
+            .then(|| {
+                report
+                    .check
+                    .clone()
+                    .filter(|check| check.starts_with("SIG"))
+                    .or_else(|| message_signal(&report.message))
+            })
+            .flatten(),
+        pc_offset: report.pc_offset,
     }
 }
 
@@ -372,13 +501,59 @@ fn check_kind(recorded: &Identity, replayed: &Identity, report: &SanitizerReport
     }
 }
 
+/// The signal of a recorded fatal signal against the replay's.
+fn check_signal(recorded: &Identity, replayed: &Identity) -> Option<Check> {
+    let signal = recorded.signal.as_ref()?;
+    Some(Check {
+        field: "signal",
+        recorded: Some(signal.clone()),
+        replayed: replayed.signal.clone(),
+        outcome: if replayed.signal.as_ref() == Some(signal) {
+            Outcome::Equal
+        } else {
+            Outcome::Differs
+        },
+    })
+}
+
+/// A recorded pc offset, for a finding with no sink or site: a crash site of
+/// the recorded build, so it is compared only when `same_binary`.
+fn check_pc(recorded: &Identity, replayed: &Identity, same_binary: Option<bool>) -> Check {
+    let render = |offset: u64| format!("exe+{offset:#x}");
+    let outcome = match replayed.pc_offset {
+        Some(pc) if same_binary == Some(true) => {
+            if Some(pc) == recorded.pc_offset {
+                Outcome::Equal
+            } else {
+                Outcome::Differs
+            }
+        }
+        _ => Outcome::NotComparable,
+    };
+    Check {
+        field: "pc",
+        recorded: recorded.pc_offset.map(render),
+        replayed: replayed.pc_offset.map(render),
+        outcome,
+    }
+}
+
 /// The sink when the finding names a function; the reported site when it
 /// records none (a UBSan report recorded without frames), or for UBSan, whose
-/// signature keys on the site. A replay that names neither a function nor a
+/// signature keys on the site; the faulting pc offset for a fatal signal
+/// recorded with neither. A replay that names neither a function nor a
 /// position (an unsymbolized report) is not comparable, which is not a
 /// difference: missing information is not another crash site.
-fn check_location(recorded: &Identity, replayed: &Identity) -> Vec<Check> {
+fn check_location(
+    recorded: &Identity,
+    replayed: &Identity,
+    same_binary: Option<bool>,
+) -> Vec<Check> {
     let mut checks = Vec::new();
+    if recorded.sink.is_none() && recorded.site.is_none() && recorded.pc_offset.is_some() {
+        checks.push(check_pc(recorded, replayed, same_binary));
+        return checks;
+    }
     let replay_has_nothing = replayed.sink.is_none() && replayed.site.is_none();
     if let Some(sink) = &recorded.sink {
         let outcome = match &replayed.sink {
@@ -420,16 +595,32 @@ fn check_location(recorded: &Identity, replayed: &Identity) -> Vec<Check> {
     checks
 }
 
-/// Compare a replayed report with the finding record `raw`.
+/// Compare a replayed report with the finding record `raw`, not knowing
+/// whether the binary that ran is the recorded build.
 pub(crate) fn compare(raw: &Value, report: &SanitizerReport) -> Comparison {
+    compare_with(raw, report, None)
+}
+
+/// Compare a replayed report with the finding record `raw`. `same_binary`
+/// says whether the harness that ran is the build the finding was recorded
+/// with (its sha256 is the recorded `build.binary.sha256`).
+pub(crate) fn compare_with(
+    raw: &Value,
+    report: &SanitizerReport,
+    same_binary: Option<bool>,
+) -> Comparison {
     let recorded = recorded_identity(raw);
     let replayed = replayed_identity(report);
     let mut checks = vec![
         check_rule(&recorded, report),
         check_kind(&recorded, &replayed, report),
     ];
-    checks.extend(check_location(&recorded, &replayed));
-    Comparison { checks }
+    checks.extend(check_signal(&recorded, &replayed));
+    checks.extend(check_location(&recorded, &replayed, same_binary));
+    Comparison {
+        checks,
+        same_binary,
+    }
 }
 
 /// Whether a fresh re-run's report is the same crash as `original`: same rule,
@@ -447,7 +638,14 @@ pub(crate) fn same_crash(original: &SanitizerReport, fresh: &SanitizerReport) ->
     if let Some(sanitizer) = original.sanitizer {
         record["exception"]["sanitizer"] = json!(sanitizer.as_str());
     }
-    let comparison = compare(&record, fresh);
+    if let Some(check) = &original.check {
+        record["exception"]["check"] = json!(check);
+    }
+    if let Some(offset) = original.pc_offset {
+        record["exception"]["pc_offset"] = json!(format!("{offset:#x}"));
+    }
+    // The fresh re-run runs the same binary.
+    let comparison = compare_with(&record, fresh, Some(true));
     comparison.matches()
         && comparison
             .checks
@@ -620,6 +818,14 @@ mod tests {
         let comparison = compare(&recorded, &unsymbolized);
         assert!(comparison.matches(), "{comparison:?}");
         assert!(comparison.location_not_compared());
+        // Nothing differs, but where it crashed was not compared: that is
+        // not a reproduction, whatever binary ran.
+        assert_eq!(comparison.verdict(), Verdict::Unverified);
+        assert_eq!(comparison.not_compared_fields(), "sink");
+        assert_eq!(
+            compare_with(&recorded, &unsymbolized, Some(true)).verdict(),
+            Verdict::Unverified
+        );
         let sink = comparison
             .checks
             .iter()
@@ -631,6 +837,102 @@ mod tests {
         let comparison = compare(&recorded, &asan(OTHER));
         assert!(!comparison.location_not_compared());
         assert_eq!(comparison.differing_fields(), "sink");
+    }
+
+    fn fatal(signal: &str, pc_offset: Option<u64>) -> SanitizerReport {
+        SanitizerReport {
+            sanitizer: None,
+            kind: "fatal-signal".to_owned(),
+            rule_id: "BHF-210",
+            message: format!("harness crashed with {signal} and no sanitizer report"),
+            check: Some(signal.to_owned()),
+            pc_offset,
+            ..Default::default()
+        }
+    }
+
+    /// A record that names no crash location (no stack, sink, site or pc)
+    /// is reproduced only by a run of the binary it was recorded with.
+    #[test]
+    fn a_location_less_record_is_verified_only_against_the_recorded_build() {
+        let recorded = json!({
+            "rule_id": "BHF-210",
+            "exception": {"name": "FATAL_SIGNAL", "signal": "SIGABRT", "stack": []},
+        });
+        let replay = fatal("SIGABRT", None);
+        assert_eq!(
+            compare_with(&recorded, &replay, Some(true)).verdict(),
+            Verdict::Match
+        );
+        for other in [Some(false), None] {
+            let comparison = compare_with(&recorded, &replay, other);
+            assert_eq!(comparison.verdict(), Verdict::Unverified, "{other:?}");
+            assert_eq!(comparison.not_compared_fields(), "location");
+        }
+        // A rule-only record from an earlier release likewise.
+        let comparison = compare(&json!({"rule_id": "BHF-201"}), &asan(COPY_AT));
+        assert!(comparison.matches());
+        assert_eq!(comparison.verdict(), Verdict::Unverified);
+    }
+
+    /// A fatal-signal finding is reproduced only by the same signal: an abort
+    /// is not reproduced by an illegal instruction. The signal is read from
+    /// `exception.signal`, or from the message of an older record.
+    #[test]
+    fn a_fatal_signal_of_another_signal_differs_on_the_signal() {
+        let recorded = json!({
+            "rule_id": "BHF-210",
+            "exception": {"name": "FATAL_SIGNAL", "signal": "SIGABRT", "stack": []},
+        });
+        let comparison = compare_with(&recorded, &fatal("SIGILL", None), Some(true));
+        assert_eq!(comparison.differing_fields(), "signal");
+        assert_eq!(comparison.verdict(), Verdict::Mismatch);
+        assert_eq!(
+            comparison.difference_lines(),
+            ["signal: recorded SIGABRT, replayed SIGILL"]
+        );
+        let older = json!({
+            "rule_id": "BHF-210",
+            "exception": {
+                "name": "FATAL_SIGNAL",
+                "message": "harness crashed with SIGABRT and no sanitizer report — a reachable crash",
+            },
+        });
+        assert_eq!(
+            compare_with(&older, &fatal("SIGILL", None), Some(true)).differing_fields(),
+            "signal"
+        );
+        assert_eq!(
+            compare_with(&older, &fatal("SIGABRT", None), Some(true)).verdict(),
+            Verdict::Match
+        );
+    }
+
+    /// The faulting pc offset the driver printed is a crash site of one
+    /// build: compared against that build only.
+    #[test]
+    fn a_recorded_pc_offset_is_compared_in_the_recorded_build_only() {
+        let recorded = json!({
+            "rule_id": "BHF-210",
+            "exception": {"name": "FATAL_SIGNAL", "signal": "SIGSEGV", "pc_offset": "0x1b3c"},
+        });
+        let same = compare_with(&recorded, &fatal("SIGSEGV", Some(0x1b3c)), Some(true));
+        assert_eq!(same.verdict(), Verdict::Match, "{same:?}");
+        let elsewhere = compare_with(&recorded, &fatal("SIGSEGV", Some(0x2a10)), Some(true));
+        assert_eq!(elsewhere.differing_fields(), "pc");
+        let rebuilt = compare_with(&recorded, &fatal("SIGSEGV", Some(0x2a10)), Some(false));
+        assert_eq!(rebuilt.verdict(), Verdict::Unverified);
+        assert_eq!(rebuilt.not_compared_fields(), "pc");
+        // A fresh re-run (the same binary) at another pc is another crash.
+        assert!(same_crash(
+            &fatal("SIGSEGV", Some(0x1b3c)),
+            &fatal("SIGSEGV", Some(0x1b3c))
+        ));
+        assert!(!same_crash(
+            &fatal("SIGSEGV", Some(0x1b3c)),
+            &fatal("SIGSEGV", Some(0x2a10))
+        ));
+        assert!(!same_crash(&fatal("SIGSEGV", None), &fatal("SIGILL", None)));
     }
 
     #[test]
