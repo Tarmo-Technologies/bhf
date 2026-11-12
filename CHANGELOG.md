@@ -5,6 +5,12 @@
 ## Unreleased
 
 ### Fixed
+- `bhf decode-args --static` decodes a C++ reference to a scalar
+  (`unsigned short &offset`, `const unsigned int &mask`) as the scalar it
+  refers to, as the harness does, instead of listing it under "not decoded
+  statically". `arg-layout.json` describes it like the plain scalar
+  (`value_kind`, `static_decode`), so explain's argument evidence covers it
+  too.
 - C and C++ harnesses bind more lengths to their buffers, so correct code no
   longer reports an overflow the harness made: counts spelled `n` or `num`
   ahead of an element noun (`nElem`, `nMemb`, `nItem`, `nTok`, `numEntry`),

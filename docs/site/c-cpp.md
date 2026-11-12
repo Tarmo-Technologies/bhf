@@ -538,7 +538,8 @@ bhf decode-args --finding F-0003-9c1d22e0 --static --json
 With a built harness that has the argument trace it runs it once with
 `BHF_TRACE_ARGS=1` and shows its `BHF_ARG` values. Without one (a work dir
 copied without binaries, a cross-compiled harness) or with `--static`, it
-replays `arg-layout.json` over the testcase: scalars, bounded integers,
+replays `arg-layout.json` over the testcase: scalars (and C++ references to
+them, which the harness decodes as their referent), bounded integers,
 enums, length-prefixed and capacity strings, and remainder, whole-input and
 paired buffers are decoded as `bhf_decode.h` decodes them (a C string's
 length and preview stop at its first NUL byte, as the target reads it and

@@ -515,10 +515,13 @@ fn layout_steps(
             .map(|d| d.ty.trim().to_owned())
             .filter(|ty| !ty.is_empty())
             .unwrap_or_else(|| emission.c_type.trim().to_owned());
+        // A C++ reference is decoded as a local of its referent: describe it
+        // as that type (`unsigned short &` as `unsigned short`).
+        let referent = crate::arg_layout::referent_type(&emission.c_type);
         let shape = group
             .registry
-            .map(|registry| registry.resolve(&emission.c_type))
-            .unwrap_or_else(|| spelled_shape(&emission.c_type));
+            .map(|registry| registry.resolve(referent))
+            .unwrap_or_else(|| spelled_shape(referent));
         let source = match (sources[index], deferred) {
             (Source::Cursor, _) => InputSource::Cursor,
             (Source::Input, true) | (Source::None, true) | (Source::Slice, _) => {

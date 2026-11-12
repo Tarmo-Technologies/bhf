@@ -789,6 +789,25 @@ fn scalar_kind_label(shape: &TypeShape) -> Option<&'static str> {
     }
 }
 
+/// The type a C++ reference parameter refers to, without the reference and
+/// its `const` (`const unsigned int &` is `unsigned int`); any other type as
+/// it is. The harness decodes a reference into a local of that type.
+pub(crate) fn referent_type(ty: &str) -> &str {
+    let ty = ty.trim();
+    let Some(base) = ty
+        .strip_suffix("&&")
+        .or_else(|| ty.strip_suffix('&'))
+        .map(str::trim_end)
+    else {
+        return ty;
+    };
+    let base = match base.strip_suffix("const") {
+        Some(rest) if rest.ends_with(|c: char| c.is_whitespace() || c == '*') => rest.trim_end(),
+        _ => base,
+    };
+    base.strip_prefix("const ").map_or(base, str::trim_start)
+}
+
 /// Bytes a fixed-width cursor primitive reads.
 fn primitive_width(name: &str) -> Option<u32> {
     match name {
@@ -1198,6 +1217,22 @@ fn parse_c_integer(text: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_reference_is_described_as_its_referent() {
+        for (ty, referent) in [
+            ("unsigned short &", "unsigned short"),
+            ("const unsigned int &", "unsigned int"),
+            ("unsigned int const&", "unsigned int"),
+            ("std::uint32_t &&", "std::uint32_t"),
+            ("char *const &", "char *"),
+            ("myconst &", "myconst"),
+            ("const char *", "const char *"),
+            ("int", "int"),
+        ] {
+            assert_eq!(super::referent_type(ty), referent, "{ty:?}");
+        }
+    }
+
     use super::*;
 
     fn param(input: &str, decoder: &str) -> ParamLayout {

@@ -210,3 +210,69 @@ fn a_c_finding_records_its_decoded_arguments() {
     let _ = std::fs::remove_dir_all(&work);
     let _ = std::fs::remove_dir_all(&seeds);
 }
+
+/// `bhf decode-args --static` decodes a C++ reference to a scalar as its
+/// referent, as the harness does, instead of listing it as not decodable.
+#[test]
+fn decode_args_statically_decodes_a_cpp_reference_scalar() {
+    let bin = bhf_bin();
+    if !bin.exists() {
+        eprintln!("skip: bhf binary not built at {}", bin.display());
+        return;
+    }
+    let src = scratch("cpp_ref");
+    std::fs::write(
+        src.join("widget.cpp"),
+        "namespace demo {\n\
+         int adjust(unsigned short &offset, int level) { return offset + level; }\n\
+         }\n",
+    )
+    .unwrap();
+    let out = src.join("out");
+    let generated = Command::new(&bin)
+        .args([
+            "generate-harness",
+            "--target",
+            "demo::adjust",
+            "--id",
+            "H-REF",
+        ])
+        .arg("--output")
+        .arg(&out)
+        .arg(src.join("widget.cpp"))
+        .output()
+        .expect("run bhf generate-harness");
+    assert!(
+        generated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let testcase = src.join("t.bin");
+    // offset: 65541 modulo 65536; level: 7.
+    std::fs::write(&testcase, [0x05, 0x00, 0x01, 0x00, 0x07, 0, 0, 0]).unwrap();
+    let decoded = Command::new(&bin)
+        .arg("decode-args")
+        .arg(&testcase)
+        .arg("--harness")
+        .arg(out.join("H-REF"))
+        .args(["--static", "--json"])
+        .output()
+        .expect("run bhf decode-args");
+    assert!(
+        decoded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&decoded.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&decoded.stdout).unwrap();
+    assert_eq!(doc["not_decoded"], serde_json::json!([]), "{doc:#}");
+    let offset = doc["arguments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|arg| arg["name"] == "offset")
+        .unwrap_or_else(|| panic!("no offset in {doc:#}"));
+    assert_eq!(offset["type"], "unsigned short &", "{doc:#}");
+    assert_eq!(offset["value"], "5", "{doc:#}");
+    assert_eq!(offset["span"], serde_json::json!([0, 4]), "{doc:#}");
+    let _ = std::fs::remove_dir_all(&src);
+}

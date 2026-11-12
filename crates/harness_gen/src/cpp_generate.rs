@@ -5960,6 +5960,16 @@ mod tests {
         assert_eq!(offset["value"], "5");
         assert_eq!(offset["span"], serde_json::json!([5, 9]));
         assert_eq!(cpp_traced(&args, "offset", Some("after"))["value"], "6");
+        // The reference decodes statically to the value the trace prints.
+        let layout = crate::arg_layout::ArgLayout::read(&out).unwrap().unwrap();
+        let stat = layout
+            .decode(&input)
+            .into_iter()
+            .find(|stat| stat.name == "offset")
+            .unwrap();
+        assert!(stat.decoded, "{stat:?}");
+        assert_eq!(serde_json::json!(stat.value), offset["value"]);
+        assert_eq!(serde_json::json!(stat.span), offset["span"]);
 
         let mode = cpp_traced(&args, "mode", None);
         assert_eq!(mode["call"], "receiver");
@@ -5970,6 +5980,64 @@ mod tests {
         assert_eq!(receiver["role"], "receiver");
         assert_eq!(receiver["type"], "Widget");
         assert_eq!(receiver["decoder"], "constructor(1 decoded argument(s))");
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// A C++ reference to a scalar is decoded as its referent: the layout
+    /// describes it like the plain scalar, so it decodes statically.
+    #[test]
+    fn cpp_reference_scalars_decode_statically_like_their_referent() {
+        let out = temp_dir("cpp-layout-references");
+        let args = cpp_args_for(
+            &out,
+            "H-CPP-REFS",
+            cppfunction("adjust"),
+            &[
+                ("offset", "unsigned short &"),
+                ("level", "int &"),
+                ("mask", "const unsigned int &"),
+                ("strict", "bool&"),
+                ("scale", "const double &"),
+            ],
+            &[],
+            "#pragma once
+             inline int adjust(unsigned short &offset, int &level, const unsigned int &mask,
+                               bool &strict, const double &scale) {
+                 return offset + level + (int)mask + strict + (int)scale;
+             }
+",
+        );
+        generate_cpp_direct_harness(args).unwrap();
+        let layout = crate::arg_layout::ArgLayout::read(&out).unwrap().unwrap();
+        for param in layout.params() {
+            assert!(param.static_decode, "{param:?}");
+        }
+        let offset = layout.params().find(|p| p.name == "offset").unwrap();
+        assert_eq!(offset.value_kind.as_deref(), Some("u16"), "{offset:?}");
+        assert_eq!(offset.ty, "unsigned short &");
+        let input = [
+            0x05, 0x00, 0x01, 0x00, // offset: 65541 mod 65536
+            0xfe, 0xff, 0xff, 0xff, // level
+            0xff, 0xff, 0xff, 0xff, // mask
+            0x03, // strict: the low bit
+            0x02, 0, 0, 0, 0, 0, 0, 0, // scale
+        ];
+        let values: Vec<(String, Option<String>)> = layout
+            .decode(&input)
+            .into_iter()
+            .map(|stat| (stat.name, stat.value))
+            .collect();
+        let expect = |name: &str, value: &str| (name.to_owned(), Some(value.to_owned()));
+        assert_eq!(
+            values,
+            [
+                expect("offset", "5"),
+                expect("level", "-2"),
+                expect("mask", "4294967295"),
+                expect("strict", "true"),
+                expect("scale", "2"),
+            ]
+        );
         fs::remove_dir_all(&out).ok();
     }
 
