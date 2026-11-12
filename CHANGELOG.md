@@ -153,6 +153,10 @@
   no longer turns a UBSan finding into a frameless report and `exit status: 0`.
   The script exits with the harness's status, 128 plus the signal for a
   harness killed by one.
+- `bhf auto`'s "top findings" summary shows each finding's real severity, the
+  one the reports give it (its actionability impact, else its recorded
+  severity, else its rule's default), instead of `[UNKNOWN]` for every
+  finding, and ranks them by it.
 - `bhf auto --help` for `--config` lists `msbuild-evaluate` both among the keys
   honored only from an explicit `--config` and among the keys the file
   accepts; a unit test now checks the help text against the config key lists.

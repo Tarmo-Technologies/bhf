@@ -165,10 +165,10 @@ pub fn render_top_findings(work_dir: &Path, max: usize) -> String {
         let Ok(json): Result<serde_json::Value, _> = serde_json::from_str(&raw) else {
             continue;
         };
-        let severity = json
-            .get("severity")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
+        // The severity the reports give it: the actionability impact, else
+        // the record's own severity, else its rule's default.
+        let severity = results::severity::resolve_raw(&json, Some(&dir.join("finding.json")))
+            .as_str()
             .to_owned();
         let rule_id = json
             .get("rule_id")
@@ -380,6 +380,40 @@ mod tests {
         assert!(hi < lo, "high severity should rank first:\n{text}");
         assert!(text.contains("bhf replay --finding"));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The summary shows the severity the reports give a finding: its
+    /// actionability impact, which finding.json carries instead of a
+    /// top-level `severity`.
+    #[test]
+    fn top_findings_show_the_severity_the_reports_use() {
+        let tmp = tempfile::tempdir().unwrap();
+        let findings = corpus::layout::findings_dir(tmp.path());
+        for (id, impact) in [("F-0001-0a0b0c0d", "high"), ("F-0002-0a0b0c0d", "critical")] {
+            let dir = findings.join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("finding.json"),
+                serde_json::json!({
+                    "id": id, "rule_id": "BHF-201", "harness_id": "H-C0001",
+                    "classification": "unhandled",
+                    "exception": {"name": "ASAN_HEAP_BUFFER_OVERFLOW", "message": "boom"},
+                    "actionability": {"mode": "reporting", "verdict": "likely_reachable",
+                        "impact": impact, "confidence": "medium",
+                        "prosthetics": {"used": false}}
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+        let text = render_top_findings(tmp.path(), 8);
+        assert!(text.contains("[HIGH] BHF-201"), "{text}");
+        assert!(text.contains("[CRITICAL] BHF-201"), "{text}");
+        assert!(!text.contains("[UNKNOWN]"), "{text}");
+        assert!(
+            text.find("[CRITICAL]") < text.find("[HIGH]"),
+            "most severe first: {text}"
+        );
     }
 
     /// A work dir whose path has a space still gives a reproduce command that
