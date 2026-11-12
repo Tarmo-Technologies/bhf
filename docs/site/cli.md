@@ -453,6 +453,15 @@ MATCH
   protocol and why, sha256) and `testcase`. Exit codes are unchanged.
 - **`--show-output`** also prints the harness's raw stderr and stdout (the full
   sanitizer report).
+- **`--show-args`** runs a generated C/C++ harness with `BHF_TRACE_ARGS=1` and
+  prints the value it decoded for each parameter under the summary: name,
+  type, the testcase bytes it came from, its value (or a buffer's length and
+  allocation size, and an output's value after the call) and a hex preview.
+  When the access starts in a traced buffer, a last line names that parameter.
+  With `--json` they are `arguments.traced` (with `arguments.accessed_parameter`).
+  A harness generated without the trace, and the other lanes, say why there
+  are no arguments. See the
+  [C/C++ guide](c-cpp.md#seeing-the-decoded-arguments).
 - **Other finding kinds.** Binary, session, collector and transport findings
   print the same kind of summary under their `MATCH`/`MISMATCH` line, for what
   their replay compares: a binary target's crash, oracle or postcondition

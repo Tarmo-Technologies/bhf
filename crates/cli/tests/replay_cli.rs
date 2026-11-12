@@ -1362,3 +1362,94 @@ fn replay_keeps_the_results_attestation_current() {
         );
     }
 }
+
+/// A bhf-driver-protocol script harness that, with BHF_TRACE_ARGS=1, prints
+/// the argument trace a generated harness prints, then crashes with `report`.
+#[cfg(unix)]
+fn write_tracing_crashing_harness(path: &Path, report: &str) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        path,
+        format!(
+            "#!/bin/sh\n# BHF_FRAMED test driver\n\
+             if [ \"$BHF_TRACE_ARGS\" = 1 ]; then\n\
+             >&2 echo 'BHF_ARG {{\"call\":\"target\",\"i\":0,\"role\":\"param\",\"name\":\"buffer\",\"type\":\"const char *\",\"decoder\":\"bhf_c_string(4096)\",\"span\":[0,2],\"ptr\":\"0x602000000030\",\"alloc_size\":1,\"len\":0,\"preview_hex\":\"\"}}'\n\
+             >&2 echo 'BHF_ARG {{\"call\":\"target\",\"i\":1,\"role\":\"out\",\"name\":\"offset\",\"type\":\"unsigned short &\",\"span\":[2,6],\"value\":\"5\"}}'\n\
+             fi\n\
+             cat >&2 <<'REPORT'\n{report}REPORT\nkill -ABRT $$\n"
+        ),
+    )
+    .unwrap();
+    make_executable(path);
+}
+
+/// `--show-args` runs the harness with its argument trace on and prints each
+/// decoded argument and the parameter whose buffer the access hit; `--json`
+/// carries them as `arguments`. Without the flag the trace stays off.
+#[cfg(unix)]
+#[test]
+fn replay_show_args_prints_the_decoded_arguments() {
+    let root = temp_dir("show-args");
+    let work = root.join("work");
+    let harness = work.join("harnesses/H-1/main");
+    let report = asan_report("Widget::copy_at", 12);
+    write_tracing_crashing_harness(&harness, &report);
+    let finding = emit_finding(&work, &harness, &report);
+
+    let output = replay_output(&[finding.to_str().unwrap(), "--show-args"]);
+    let stdout = text(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{stdout}\n{}",
+        text(&output.stderr)
+    );
+    assert!(
+        stdout.contains("--- decoded arguments (BHF_TRACE_ARGS=1) ---"),
+        "{stdout}"
+    );
+    let buffer = stdout
+        .lines()
+        .find(|line| line.trim_start().starts_with("buffer"))
+        .unwrap_or_else(|| panic!("no buffer row in:\n{stdout}"));
+    assert!(buffer.contains("const char *"), "{buffer}");
+    assert!(buffer.contains("0..2"), "{buffer}");
+    // The prefix is read from the testcase ("wi"), the length is the harness's.
+    assert!(buffer.contains("len 0 (prefix 26999), alloc 1"), "{buffer}");
+    assert!(stdout.contains("unsigned short &"), "{stdout}");
+    assert!(
+        stdout.contains("the access hit parameter `buffer`'s buffer, at offset 1"),
+        "{stdout}"
+    );
+
+    let output = replay_output(&[finding.to_str().unwrap(), "--json", "--show-args"]);
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert_eq!(value["arguments"]["traced"][0]["name"], "buffer");
+    assert_eq!(value["arguments"]["traced"][1]["value"], "5");
+    assert_eq!(value["arguments"]["accessed_parameter"]["name"], "buffer");
+
+    let output = replay_output(&[finding.to_str().unwrap()]);
+    let stdout = text(&output.stdout);
+    assert!(!stdout.contains("decoded arguments"), "{stdout}");
+}
+
+/// A harness built without the argument trace says so under `--show-args`.
+#[cfg(unix)]
+#[test]
+fn replay_show_args_explains_a_harness_without_the_trace() {
+    let root = temp_dir("show-args-none");
+    let work = root.join("work");
+    let harness = work.join("harnesses/H-1/main");
+    let report = asan_report("Widget::copy_at", 12);
+    write_crashing_harness(&harness, &report);
+    let finding = emit_finding(&work, &harness, &report);
+
+    let output = replay_output(&[finding.to_str().unwrap(), "--show-args"]);
+    let stdout = text(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert!(
+        stdout
+            .contains("--- no decoded arguments: the harness was built without the argument trace"),
+        "{stdout}"
+    );
+}

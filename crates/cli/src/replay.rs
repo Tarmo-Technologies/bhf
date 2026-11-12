@@ -90,6 +90,14 @@ pub struct ReplayArgs {
     /// through its event log, so they have none to print.
     #[arg(long = "show-output")]
     pub show_output: bool,
+
+    /// Also print the value each harness parameter was decoded to: run a
+    /// generated C/C++ harness with BHF_TRACE_ARGS=1 and show its BHF_ARG lines
+    /// as a table (name, type, the testcase bytes it came from, value or buffer
+    /// length, allocation size and a hex preview, and an output's value after
+    /// the call). With --json they are the `arguments` array.
+    #[arg(long = "show-args")]
+    pub show_args: bool,
 }
 
 /// How the replay result is printed.
@@ -97,6 +105,7 @@ pub struct ReplayArgs {
 pub(crate) struct OutputMode {
     pub(crate) json: bool,
     pub(crate) show_output: bool,
+    pub(crate) show_args: bool,
 }
 
 /// How long one replayed execution may run before it is killed.
@@ -111,6 +120,7 @@ pub fn run(args: ReplayArgs) -> i32 {
     let output = OutputMode {
         json: args.json,
         show_output: args.show_output,
+        show_args: args.show_args,
     };
     // HDF-7: a finding carrying a session artifact replays by re-driving the
     // recorded multi-message session against a freshly reset transport (which
@@ -503,6 +513,18 @@ pub(crate) fn run_c_testcase(
     testcase_path: &Path,
     timeout: Duration,
 ) -> Result<CRun, String> {
+    run_c_testcase_with_env(raw, runner, input, testcase_path, timeout, &[])
+}
+
+/// [`run_c_testcase`] with `extra_env` set on top of the replay environment.
+pub(crate) fn run_c_testcase_with_env(
+    raw: &Value,
+    runner: &HarnessRunner,
+    input: CInput,
+    testcase_path: &Path,
+    timeout: Duration,
+    extra_env: &[(String, String)],
+) -> Result<CRun, String> {
     use std::io::Write;
     use std::process::Stdio;
 
@@ -529,7 +551,10 @@ pub(crate) fn run_c_testcase(
     .stderr(Stdio::piped());
     // Command::env (not std::env::set_var) so the parent env is untouched
     // between replays in one process.
-    for (key, value) in replay_env(raw, runner, input) {
+    for (key, value) in replay_env(raw, runner, input)
+        .into_iter()
+        .chain(extra_env.iter().cloned())
+    {
         cmd.env(key, value);
     }
     let started = Instant::now();
@@ -591,6 +616,99 @@ fn drain(mut pipe: impl std::io::Read + Send + 'static) -> std::thread::JoinHand
 }
 
 pub(crate) const REPLAY_SCHEMA: &str = "bhf.replay.v1";
+
+/// The decoded harness arguments `--show-args` reports.
+#[derive(Debug, Serialize)]
+struct ArgumentsReport {
+    /// The traced values, in the order the harness printed them.
+    traced: Vec<corpus::decoded_args::TracedArg>,
+    /// The parameter whose buffer the replayed memory access hit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    accessed_parameter: Option<Value>,
+    /// Why nothing was traced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unavailable: Option<String>,
+}
+
+impl ArgumentsReport {
+    fn unavailable(reason: impl Into<String>) -> Self {
+        ArgumentsReport {
+            traced: Vec::new(),
+            accessed_parameter: None,
+            unavailable: Some(reason.into()),
+        }
+    }
+
+    /// The arguments a replayed harness printed on `stderr`, and the parameter
+    /// whose buffer `report`'s memory access hit.
+    fn from_run(
+        harness: &Path,
+        stderr: &[u8],
+        report: Option<&corpus::SanitizerReport>,
+        input: Option<&[u8]>,
+    ) -> Self {
+        let mut traced = corpus::decoded_args::parse_arg_trace(&String::from_utf8_lossy(stderr));
+        if let Some(input) = input {
+            corpus::decoded_args::annotate_length_prefixes(&mut traced, input);
+        }
+        if traced.is_empty() {
+            return Self::unavailable(if crate::fuzz::harness_has_arg_trace(harness) {
+                "the harness printed no BHF_ARG lines: it decodes no arguments, or stopped before \
+                 decoding them"
+            } else {
+                "the harness was built without the argument trace; regenerate it with this bhf, \
+                 or read the arguments under a debugger (see the C/C++ guide)"
+            });
+        }
+        let accessed_parameter = report
+            .and_then(|report| report.access.as_ref())
+            .and_then(|access| serde_json::to_value(access).ok())
+            .and_then(|access| corpus::decoded_args::accessed_parameter(&access, &traced));
+        ArgumentsReport {
+            traced,
+            accessed_parameter,
+            unavailable: None,
+        }
+    }
+
+    fn lines(&self) -> Vec<String> {
+        if let Some(reason) = &self.unavailable {
+            return vec![format!("--- no decoded arguments: {reason} ---")];
+        }
+        let mut lines = vec!["--- decoded arguments (BHF_TRACE_ARGS=1) ---".to_owned()];
+        lines.extend(
+            corpus::decoded_args::render_table(&self.traced)
+                .into_iter()
+                .map(|line| format!("  {line}")),
+        );
+        if let Some(parameter) = &self.accessed_parameter {
+            lines.push(accessed_parameter_line(parameter));
+        }
+        lines
+    }
+}
+
+/// `the access hit parameter `buffer`'s buffer at offset 1`.
+pub(crate) fn accessed_parameter_line(parameter: &Value) -> String {
+    let name = parameter.get("name").and_then(Value::as_str).unwrap_or("?");
+    let offset = parameter
+        .get("offset")
+        .map(Value::to_string)
+        .unwrap_or_default();
+    match parameter.get("basis").and_then(Value::as_str) {
+        Some("region_start") => {
+            format!("  the access hit parameter `{name}`'s buffer, at offset {offset}")
+        }
+        Some("region_interior") => format!(
+            "  the access hit parameter `{name}`'s buffer, which starts inside the region, at \
+             offset {offset}"
+        ),
+        _ => format!(
+            "  the faulting address is {offset} byte(s) past parameter `{name}` (the nearest \
+             traced pointer below it)"
+        ),
+    }
+}
 
 #[derive(Debug, Serialize)]
 struct FindingRef {
@@ -751,6 +869,9 @@ struct ReplaySummary {
     testcase: TestcaseSummary,
     #[serde(skip_serializing_if = "Option::is_none")]
     output: Option<OutputCapture>,
+    /// `--show-args`: the decoded harness arguments, or why there are none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    arguments: Option<ArgumentsReport>,
     /// `bhf replay` printed the status line first; kept for the text view.
     #[serde(skip)]
     status_line: String,
@@ -1027,7 +1148,10 @@ fn emit(summary: &ReplaySummary, output: OutputMode, captured: Result<(&[u8], &[
         }
         return;
     }
-    let lines = render_text(summary);
+    let mut lines = render_text(summary);
+    if let Some(arguments) = &summary.arguments {
+        lines.extend(arguments.lines());
+    }
     for line in &lines {
         if summary.verdict == "match" {
             println!("{line}");
@@ -1185,6 +1309,12 @@ pub(crate) fn finish_lane(
                 stdout: String::from_utf8_lossy(stdout).into_owned(),
                 stderr: String::from_utf8_lossy(stderr).into_owned(),
             }),
+        arguments: output.show_args.then(|| {
+            ArgumentsReport::unavailable(format!(
+                "a {} replay runs no generated C/C++ harness",
+                lane.lane
+            ))
+        }),
         status_line: lane.status_line,
     };
     let captured = match &lane.output {
@@ -1227,11 +1357,35 @@ pub(crate) fn replay_c(
         return report_error(&output, finding_dir, &error);
     };
     let testcase_path = finding_dir.join("testcase.bin");
-    let run = match run_c_testcase(&raw, runner, input, &testcase_path, REPLAY_TIMEOUT) {
+    let trace_env: Vec<(String, String)> = if output.show_args {
+        vec![(
+            corpus::decoded_args::TRACE_ARGS_ENV.to_owned(),
+            "1".to_owned(),
+        )]
+    } else {
+        Vec::new()
+    };
+    let run = match run_c_testcase_with_env(
+        &raw,
+        runner,
+        input,
+        &testcase_path,
+        REPLAY_TIMEOUT,
+        &trace_env,
+    ) {
         Ok(run) => run,
         Err(error) => return report_error(&output, finding_dir, &error),
     };
     let report = run.report();
+    let arguments = output.show_args.then(|| {
+        let input = std::fs::read(&testcase_path).ok();
+        ArgumentsReport::from_run(
+            runner.harness_path(),
+            &run.stderr,
+            report.as_ref(),
+            input.as_deref(),
+        )
+    });
     let comparison = report
         .as_ref()
         .map(|report| crash_identity::compare(&raw, report))
@@ -1291,6 +1445,7 @@ pub(crate) fn replay_c(
             stdout: String::from_utf8_lossy(&run.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&run.stderr).into_owned(),
         }),
+        arguments,
         status_line,
     };
     emit(&summary, output, Ok((&run.stdout, &run.stderr)));
@@ -1394,6 +1549,9 @@ fn replay_ada(
         harness: Some(harness_summary(&raw, runner.harness_path(), detection)),
         testcase: testcase_summary(&testcase_path),
         output: None,
+        arguments: output
+            .show_args
+            .then(|| ArgumentsReport::unavailable("an Ada harness has no argument trace")),
         status_line,
     };
     emit(
@@ -1505,6 +1663,24 @@ mod silent_abort_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_accessed_parameter_line_says_how_the_buffer_was_matched() {
+        let line = |basis: &str| {
+            super::accessed_parameter_line(
+                &serde_json::json!({"name": "buf", "offset": 5, "basis": basis}),
+            )
+        };
+        assert_eq!(
+            line("region_start"),
+            "  the access hit parameter `buf`'s buffer, at offset 5"
+        );
+        assert_eq!(
+            line("region_interior"),
+            "  the access hit parameter `buf`'s buffer, which starts inside the region, at offset 5"
+        );
+        assert!(line("nearest_pointer").contains("5 byte(s) past parameter `buf`"));
+    }
+
     #[test]
     fn harness_roots_start_at_the_work_dir_for_results_layout() {
         let roots = super::harness_work_roots(std::path::Path::new("/w/results/findings/F-1"));

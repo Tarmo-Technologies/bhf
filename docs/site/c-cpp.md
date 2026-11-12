@@ -256,6 +256,145 @@ arguments. A few rules decide what a parameter can receive:
   length stays in `0..=0x7fffffff`. A huge length only produces allocation
   failures. Each value consumes the same number of input bytes either way.
 
+### Decoding layout
+
+A generated harness reads the testcase through one cursor, starting at byte 0,
+and decodes the parameters in declaration order. Every multi-byte value is
+little-endian. A read past the end of the input yields zero bytes, so a short
+input still calls the target, with zeros and empty strings in the parameters
+it did not reach. The per-type rules are:
+
+| Parameter | Input bytes | Value |
+|---|---|---|
+| `bool`, `_Bool` | 1 | the low bit of the byte |
+| `char`, `signed char`, `int8_t`, `unsigned char`, `uint8_t` | 1 | the byte |
+| `short`, `int16_t` | 4 | a 32-bit read, truncated to 16 bits |
+| `unsigned short`, `uint16_t` | 4 | a 32-bit read modulo 65536 |
+| `int`, `int32_t` | 4 | a 32-bit read |
+| `unsigned`, `uint32_t` | 4 | a 32-bit read; named like a length: modulo 2^31 |
+| `long`, `long long`, `int64_t` | 8 | a 64-bit read |
+| `unsigned long`, `uint64_t` | 8 | a 64-bit read; named like a length: modulo 2^31 |
+| `size_t`, `z_size_t` | 8 | a 64-bit read; named like a length: modulo 65537 |
+| `float`, `double` | 4, 8 | the integer read, converted to the floating type |
+| enum with N named members | 4 | a 32-bit read modulo N picks the member, in declaration order |
+| enum with no named members | 4 | a 32-bit read modulo 256 |
+| `channels`, `req_comps` and other channel counts | 4 | a 32-bit read modulo 9 |
+| `const char *` | 2 + L | a 16-bit length prefix, then L bytes (at most 4096 and at most what is left) in a heap copy of L + 1 bytes ending in NUL |
+| `char *` (writable) | up to 4096 | a fixed 4097-byte heap buffer holding the next 4096 bytes (or what is left), no prefix |
+| `fmt`, `format` and the last `char *` of a variadic function | 2 + L | as `const char *`, with every `%` replaced by a space |
+| `const wchar_t *` | 2 + L wide characters | a 16-bit prefix counting wide characters (4 bytes each on Linux), at most 2048 |
+| `const char **` with a count | 8, then strings | a count modulo 17, then that many length-prefixed strings of at most 256 bytes |
+| `T *items` with a count | 8 | a count modulo 65 sizes a zeroed array of that many elements |
+| struct or union | its fields' bytes | each field by its own rule, in declaration order, nested up to 4 deep; arrays fill at most 64 elements |
+| pointer to a scalar or enum | the scalar's bytes | the address of a local holding the decoded value |
+| C++ `T &` | `T`'s bytes | a local decoded as `T`, passed by reference |
+| C++ `std::string`, `std::string_view` | 2 + L | as `const char *` |
+| C++ `std::vector<T>` and other sequences | 8, then elements | a count modulo 17, then each element (a byte vector or span is the whole input, below) |
+
+The length-named, offset-named and channel-count names are the ones listed
+above. Some parameters read no cursor bytes at all and are fed from the whole
+testcase instead:
+
+- a byte buffer paired with a length-named integer: a read-only buffer is the
+  testcase itself (`(Data, Size)`) and its length is the input size; a
+  writable one is a heap copy of the input (at most 1 MiB) and its length is
+  the copy's size;
+- a read-only byte pointer with no length partner (`const uint8_t *`,
+  `const unsigned char *` or a typedef of one): a NUL-terminated heap copy of the
+  whole input, `max(Size + 1, 8)` bytes, zero-filled past the input. It is a
+  copy, not a view of the fuzz input, so ASan reports overflows against that
+  allocation;
+- `const void *` with no partner: the testcase itself; `void *`: a heap copy;
+- a writable byte pointer with no partner (`unsigned char *`, `uint8_t *`): a
+  heap copy of the input with 64 KiB of zeroed headroom;
+- C++ byte vectors and spans (`std::vector<uint8_t>`,
+  `std::span<const uint8_t>`): a copy or view of the input;
+- `FILE *`: `fmemopen` over a copy of the input;
+- the path parameter of a file loader (`load_file(const char *path)`): the
+  input written to a temporary file;
+- a read-only pointer to a record bhf cannot construct: the testcase itself.
+
+In harness formats 1 and 2 these whole-input parameters do not move the
+cursor, so the parameters decoded after them read the same leading bytes:
+for `f(const uint8_t *data, uint32_t a, uint32_t b)`, `a` is bytes 0-3 and `b`
+bytes 4-7, which are also the first bytes of `data`.
+
+A C++ method's receiver is decoded after the target's own parameters. A
+default-constructible class takes no input bytes; otherwise its constructor or
+factory arguments are decoded next, by the same rules. A mined protocol then
+decodes each step's arguments before that step's call. A lifecycle loop reads
+one byte for the number of steps (modulo the step count plus one), then for
+each step one selector byte (modulo the step count) and that step's
+arguments, and the target is called after the loop. A C sequence harness keeps
+its operation program in a control block at the end of the input
+(`sequence-layout.json` gives its length) and decodes the operations'
+arguments from the front.
+
+### Seeing the decoded arguments
+
+A generated harness prints the value of every parameter it decoded when
+`BHF_TRACE_ARGS=1` is set, one `BHF_ARG` line per parameter on stderr after
+decoding and before the call:
+
+```sh
+BHF_TRACE_ARGS=1 bhf_work/harnesses/<id>/main bhf_work/results/findings/<ID>/testcase.bin
+BHF_ARG {"call":"target","i":1,"role":"param","name":"width","type":"unsigned int","decoder":"bhf_i32()","span":[0,4],"value":"640"}
+```
+
+Each line carries the call (`target`, `receiver` for a C++ receiver's
+constructor arguments and the receiver object, or the name of another function
+the harness calls), the parameter index, name and type, how it was decoded,
+`span` (the `[start, end)` bytes of the testcase it came from), and its value.
+A pointer carries `ptr` (its address), `alloc_size` (the heap allocation, from
+AddressSanitizer), `len` (the content length) and `preview_hex` (at most 32
+leading bytes, never raw text). An output or in-out parameter (a non-const
+reference, a pointer to scalar storage, a writable string) has `"role":"out"`
+and a second line with `"phase":"after"` and its value after the call. Without
+the variable a harness prints nothing.
+
+When the fuzz loop records a new C/C++ crash (builtin engine, fork-server or
+AFL++), it re-runs the testcase once with the trace on. `decoded.json`
+(`schema_version` `bhf.decoded.v1`) then holds every traced value in
+`arguments` (a length-prefixed string also gets `length_prefix`, the 16-bit
+prefix its bytes ask for, next to the `len` the harness took) and their byte
+ranges in `provenance`, or `arguments_unavailable` with the reason. `finding.json` gains `decoded_args`, the target call's
+arguments with `name`, `type`, `role`, `value` or `len`, `span`, `preview_hex`
+and `after_call_value`. When a heap access hits a region a traced buffer
+starts (`basis` `region_start`) or points into (`region_interior`, for a view
+that starts after the bytes other parameters took), `exception.access.parameter`
+names that parameter and the access offset from its pointer. For a wild access
+with no region it names the nearest traced pointer below the faulting address
+(`nearest_pointer`). `bhf replay --show-args` re-runs the harness with the trace
+and prints the arguments as a table. `bhf explain` shows the same table under
+HARNESS ARGUMENTS, and `bhf cartography` labels each byte with the parameter
+it was decoded into. Harnesses generated before the trace existed print
+nothing: regenerate them, or read the arguments under a debugger.
+
+### Reading arguments in a debugger
+
+Harnesses are built with `-O1 -g`, so gdb can show the target's arguments:
+
+```sh
+gdb -q -batch -ex 'set debuginfod enabled off' -ex 'break <target>' -ex run -ex 'info args' \
+    --args bhf_work/harnesses/<id>/main bhf_work/results/findings/<ID>/testcase.bin
+```
+
+- A reference parameter prints with `p offset`, not `p *offset`.
+- A buffer's allocation size is
+  `call (unsigned long)__sanitizer_get_allocated_size(buffer)`.
+- For a SEGV, run with `ASAN_OPTIONS=handle_segv=0` and `-ex run -ex 'bt 4'`:
+  gdb stops on the signal with the arguments in the backtrace.
+- For another ASan report, `-ex 'break __asan::ReportGenericError' -ex run
+  -ex 'frame 2' -ex 'info args'` (frame 1 is `__asan_report_load*`).
+- For UBSan, run with
+  `UBSAN_OPTIONS=halt_on_error=1:abort_on_error=1:print_stacktrace=1` and
+  `-ex run -ex bt`, or break on the check's handler
+  (`__ubsan_handle_mul_overflow`) and use `frame 1`.
+- At `-O1` a local can print `<optimized out>`: break at the target's entry,
+  where the arguments are live, or rebuild a copy of the harness with
+  `make -B main CFLAGS='-O0 -g -fsanitize=address,undefined'`
+  (`CXXFLAGS='-O0 -g -std=$(CXX_STD) -fsanitize=address,undefined'` for C++).
+
 ### Harness format version
 
 Whenever a change makes the same input bytes decode to different argument
@@ -283,9 +422,10 @@ but a regenerated harness decodes its testcase differently.
 The C emitter supports:
 
 - scalar integer and length-like types, including common zlib/miniz aliases;
-- `const char *`, `char *`, standalone immutable byte pointers as borrowed
-  fuzz-input views, and byte pointer plus adjacent length pairs, including
-  typedef aliases such as `const mz_uint8 *`;
+- `const char *`, `char *`, standalone immutable byte pointers as a
+  NUL-terminated heap copy of the fuzz input (see the decoding layout above),
+  and byte pointer plus adjacent length pairs, including typedef aliases such
+  as `const mz_uint8 *`;
 - standalone `const void *` as a borrowed fuzz-input view and standalone
   `void *` as a heap-owned mutable copy of the current fuzz input;
 - output byte buffer plus adjacent output-length pointer or scalar-capacity

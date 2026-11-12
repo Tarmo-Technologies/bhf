@@ -3,6 +3,7 @@
 pub mod bridge;
 pub mod classify;
 pub mod cluster;
+pub mod decoded_args;
 pub mod finding;
 pub mod layout;
 pub mod line_remap;

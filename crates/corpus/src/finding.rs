@@ -929,16 +929,16 @@ fn merge_build_binary(record: &mut serde_json::Value, metadata: &FindingMetadata
     }
 }
 
+/// `decoded.json` before any argument trace: the input's size, preview and raw
+/// byte provenance. A C/C++ finding's trace rewrites it (see
+/// [`crate::decoded_args::record_trace`]).
 fn decoded_placeholder(input: &[u8]) -> serde_json::Value {
-    json!({
-        "input_size": input.len(),
-        "preview_hex": preview_hex(input),
-        "provenance": [{
-            "kind": "raw_bytes",
-            "source": "testcase.bin",
-            "byte_range": { "start": 0, "end": input.len() }
-        }]
-    })
+    crate::decoded_args::decoded_document(
+        input,
+        &crate::decoded_args::TraceOutcome::Unavailable(
+            "no argument trace was recorded for this finding".to_owned(),
+        ),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1004,16 +1004,6 @@ fn classification_label(classification: Classification) -> &'static str {
         Classification::SwallowedUser => "swallowed_user",
         Classification::ExplicitRaise => "explicit_raise",
     }
-}
-
-fn preview_hex(input: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(input.len().min(32) * 2);
-    for byte in input.iter().take(32) {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0F) as usize] as char);
-    }
-    out
 }
 
 fn oracle_exception_name(name: &str) -> String {

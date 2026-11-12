@@ -1955,6 +1955,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/auto_c_decoded_args.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/auto_c_dialect_ladder.rs",
       "license": "Apache-2.0"
     },
@@ -2743,6 +2747,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/corpus/src/decoded_args.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/corpus/src/finding.rs",
       "license": "Apache-2.0"
     },
@@ -3096,6 +3104,10 @@
     },
     {
       "path": "crates/harness_gen/Cargo.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/harness_gen/src/arg_trace.rs",
       "license": "Apache-2.0"
     },
     {

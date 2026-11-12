@@ -40,6 +40,8 @@
 #ifdef getenv
 #undef getenv
 #endif
+/* BHF_TRACE_ARGS=1 prints each decoded argument to stderr (bhf_trace.h). */
+#include "bhf_trace.h"
 
 /* Sanitizer-runtime callbacks (edge coverage + cmplog operand capture, #400)
  * must never be instrumented themselves: with `-fsanitize-coverage=trace-cmp`
@@ -701,8 +703,8 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
     _bhf_env_size = Size;
     _bhf_env_index = 0;
 {%- endif %}
-{%- for p in params %}
-    {{ p.decl }};
+{%- for d in params_decode %}
+    {{ d }};
 {%- endfor %}
 {%- if byte_stream %}
     /* Byte-stream decoder: replay the whole fuzz input through the target one
@@ -742,6 +744,9 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
 {%- endif %}
 {%- endif %}
 {%- endif %}
+{%- for d in params_after %}
+    {{ d }};
+{%- endfor %}
     (void)Cur;
 {%- if result_cleanup and not byte_stream %}
     {{ result_cleanup }};

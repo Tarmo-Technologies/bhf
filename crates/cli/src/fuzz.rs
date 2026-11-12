@@ -3620,6 +3620,16 @@ fn run_builtin_with_progress(
                         )
                         .map_err(|error| format!("emit sanitizer finding: {error}"))?;
                     sanitizer_dedup.consumed(key);
+                    record_finding_arguments(
+                        &prepared.work_dir,
+                        &id.0,
+                        prepared.runner.harness_path(),
+                        &input,
+                        TraceInput::ArgvFile,
+                        &prepared.extra_env,
+                        prepared.per_input_timeout,
+                        prepared.runner.qemu_prefix(),
+                    );
                     finding_ids.push(id.0);
                 } else {
                     sanitizer_dedup.unconfirmed(key);
@@ -4576,6 +4586,16 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
             let id = emitter
                 .emit_sanitizer_crash_with_log(&input, &report, Some(stderr.as_bytes()))
                 .map_err(|error| format!("emit AFL finding: {error}"))?;
+            record_finding_arguments(
+                &prepared.work_dir,
+                &id.0,
+                &prepared.harness_path,
+                &input,
+                TraceInput::Stdin,
+                &prepared.extra_env,
+                AFL_REPLAY_TRACE_TIMEOUT,
+                None,
+            );
             finding_ids.push(id.0);
         }
     }
@@ -6347,6 +6367,190 @@ fn sanitizer_crash_reproduces(
             .as_ref()
             .is_some_and(|fresh| crate::crash_identity::same_crash(report, fresh)),
         Err(_) => false,
+    }
+}
+
+/// Bounds on the argument-trace re-run of a new finding: the run's per-input
+/// timeout, but never less than a sanitized harness needs to start and never
+/// more than a single replay is allowed.
+const ARG_TRACE_TIMEOUT_MIN: Duration = Duration::from_secs(5);
+const ARG_TRACE_TIMEOUT_MAX: Duration = Duration::from_secs(30);
+/// The AFL++ lane has no per-input timeout of its own here.
+const AFL_REPLAY_TRACE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How a C/C++ harness takes the testcase for an argument-trace run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TraceInput {
+    /// `./harness <file>`: generated harnesses, the bhf driver, libFuzzer.
+    ArgvFile,
+    /// The bytes on stdin: AFL++ persistent-mode harnesses.
+    Stdin,
+}
+
+/// Whether a harness binary was generated with the argument trace: the name of
+/// the `BHF_TRACE_ARGS` switch is compiled into every harness that has one.
+pub(crate) fn harness_has_arg_trace(harness: &Path) -> bool {
+    let Ok(bytes) = fs::read(harness) else {
+        return false;
+    };
+    let needle = corpus::decoded_args::TRACE_ARGS_ENV.as_bytes();
+    bytes.windows(needle.len()).any(|window| window == needle)
+}
+
+/// Run `harness` once on `input` with its argument trace on and parse the
+/// `BHF_ARG` lines it prints. A harness without the trace, a failed run or a
+/// run that prints no trace lines is `Unavailable`, saying why.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn trace_arguments(
+    harness: &Path,
+    work_dir: &Path,
+    input: &[u8],
+    mode: TraceInput,
+    extra_env: &[(String, String)],
+    timeout: Duration,
+    qemu_prefix: Option<(&Path, &[String])>,
+) -> corpus::decoded_args::TraceOutcome {
+    use corpus::decoded_args::TraceOutcome;
+    if !harness_has_arg_trace(harness) {
+        return TraceOutcome::Unavailable(
+            "the harness was built without the argument trace; regenerate it with this bhf \
+             (or read the arguments under a debugger, see the C/C++ guide)"
+                .to_owned(),
+        );
+    }
+    let mut env = extra_env.to_vec();
+    env.retain(|(key, _)| key != corpus::decoded_args::TRACE_ARGS_ENV);
+    env.push((
+        corpus::decoded_args::TRACE_ARGS_ENV.to_owned(),
+        "1".to_owned(),
+    ));
+    let stderr = match mode {
+        TraceInput::ArgvFile => {
+            run_traced_argv(harness, work_dir, input, &env, timeout, qemu_prefix)
+        }
+        TraceInput::Stdin => run_traced_stdin(harness, work_dir, input, &env, timeout),
+    };
+    match stderr {
+        Ok(stderr) => {
+            let args = corpus::decoded_args::parse_arg_trace(&String::from_utf8_lossy(&stderr));
+            if args.is_empty() {
+                TraceOutcome::Unavailable(
+                    "the argument-trace run printed no BHF_ARG lines (the harness takes no \
+                     decoded arguments, or failed before decoding them)"
+                        .to_owned(),
+                )
+            } else {
+                TraceOutcome::Traced(args)
+            }
+        }
+        Err(error) => TraceOutcome::Unavailable(format!("the argument-trace run failed: {error}")),
+    }
+}
+
+fn run_traced_argv(
+    harness: &Path,
+    work_dir: &Path,
+    input: &[u8],
+    env: &[(String, String)],
+    timeout: Duration,
+    qemu_prefix: Option<(&Path, &[String])>,
+) -> Result<Vec<u8>, String> {
+    let dir = work_dir.join("fuzz_inputs");
+    fs::create_dir_all(&dir)
+        .map_err(|error| format!("create fuzz inputs dir '{}': {error}", dir.display()))?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = dir.join(format!("trace-{}-{nonce}.bin", std::process::id()));
+    fs::write(&path, input)
+        .map_err(|error| format!("write trace input '{}': {error}", path.display()))?;
+    let output = run_with_timeout(
+        harness,
+        &path,
+        timeout,
+        env,
+        &ensure_harness_scratch(work_dir)?,
+        0,
+        qemu_prefix,
+    );
+    let _ = fs::remove_file(&path);
+    Ok(output?.stderr)
+}
+
+fn run_traced_stdin(
+    harness: &Path,
+    work_dir: &Path,
+    input: &[u8],
+    env: &[(String, String)],
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
+    let mut command = std::process::Command::new(harness);
+    command
+        .current_dir(ensure_harness_scratch(work_dir)?)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    apply_runaway_rlimits(&mut command);
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("spawn '{}': {error}", harness.display()))?;
+    let stderr_reader = drain_child_stderr(child.stderr.take());
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(input);
+    }
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(collected_child_output(status, stderr_reader).stderr),
+            Ok(None) if Instant::now() >= deadline => {
+                kill_process_group(&mut child);
+                let status = child
+                    .wait()
+                    .map_err(|error| format!("reap '{}': {error}", harness.display()))?;
+                return Ok(collected_child_output(status, stderr_reader).stderr);
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(error) => {
+                kill_process_group(&mut child);
+                let _ = child.wait();
+                return Err(format!("poll '{}': {error}", harness.display()));
+            }
+        }
+    }
+}
+
+/// Record the decoded arguments of a new C/C++ finding: re-run its testcase
+/// once with the argument trace on and write them to its `decoded.json` and
+/// `finding.json` (see [`corpus::decoded_args::record_trace`]). Called once per
+/// emitted finding, which is once per new crash cluster.
+#[allow(clippy::too_many_arguments)]
+fn record_finding_arguments(
+    work_dir: &Path,
+    finding_id: &str,
+    harness: &Path,
+    input: &[u8],
+    mode: TraceInput,
+    extra_env: &[(String, String)],
+    per_input_timeout: Duration,
+    qemu_prefix: Option<(&Path, &[String])>,
+) {
+    let timeout = per_input_timeout.clamp(ARG_TRACE_TIMEOUT_MIN, ARG_TRACE_TIMEOUT_MAX);
+    let outcome = trace_arguments(
+        harness,
+        work_dir,
+        input,
+        mode,
+        extra_env,
+        timeout,
+        qemu_prefix,
+    );
+    let finding_dir = corpus::layout::finding_dir(work_dir, finding_id);
+    if let Err(error) = corpus::decoded_args::record_trace(&finding_dir, input, &outcome) {
+        bhfeprintln!("warning: could not record the decoded arguments of {finding_id}: {error}");
     }
 }
 
@@ -8554,6 +8758,143 @@ mod auto_path_tests {
         let finding: serde_json::Value =
             serde_json::from_slice(&fs::read(finding_dir.join("finding.json")).unwrap()).unwrap();
         assert_eq!(finding["paths"]["sanitizer_log"], "sanitizer.log");
+    }
+
+    /// The shell harness of the argument-trace tests: with BHF_TRACE_ARGS=1
+    /// it prints a trace line first, and it always reports a heap overflow one
+    /// byte past the traced buffer.
+    const TRACING_CRASH_SCRIPT: &str = "#!/bin/sh\n\
+        if [ \"$BHF_TRACE_ARGS\" = 1 ]; then >&2 echo 'BHF_ARG {\"call\":\"target\",\"i\":0,\"role\":\"param\",\"name\":\"buffer\",\"type\":\"const char *\",\"span\":[0,2],\"ptr\":\"0x502000000030\",\"alloc_size\":1,\"len\":0,\"preview_hex\":\"\"}'; fi\n\
+        >&2 echo '==1==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x502000000031 at pc 0x1 bp 0x2 sp 0x3'\n\
+        >&2 echo 'READ of size 4 at 0x502000000031 thread T0'\n\
+        >&2 echo '    #0 0x1 in real_parse /src/p.c:9'\n\
+        >&2 echo '0x502000000031 is located 0 bytes after 1-byte region [0x502000000030,0x502000000031)'\n\
+        exit 1\n";
+
+    /// A new finding is re-run once with the argument trace on, and its
+    /// decoded arguments land in decoded.json and finding.json, with the
+    /// overflowed parameter named on the access.
+    #[test]
+    #[cfg(unix)]
+    fn a_new_finding_records_its_traced_arguments() {
+        let root = tmpdir();
+        let work_dir = root.join("bhf_work");
+        write_c_libfuzzer_harness(&work_dir, "H-ARGTRACE", TRACING_CRASH_SCRIPT);
+        let summary = run_one_target_programmatic(
+            &work_dir,
+            "H-ARGTRACE",
+            vec![b"seed".to_vec()],
+            1,
+            None,
+            None,
+            0,
+            &[],
+            actionability::RunMode::Reporting,
+            None,
+            &[],
+            None,
+        )
+        .expect("the crash is a finding");
+        assert_eq!(summary.findings.len(), 1);
+        let finding_dir = corpus::layout::finding_dir(&work_dir, &summary.findings[0]);
+        let decoded: serde_json::Value =
+            serde_json::from_slice(&fs::read(finding_dir.join("decoded.json")).unwrap()).unwrap();
+        assert_eq!(decoded["schema_version"], "bhf.decoded.v1");
+        assert_eq!(decoded["arguments_source"], "harness_trace");
+        assert_eq!(decoded["arguments"][0]["ptr"], "0x502000000030");
+        assert_eq!(decoded["arguments"][0]["alloc_size"], 1);
+        let finding: serde_json::Value =
+            serde_json::from_slice(&fs::read(finding_dir.join("finding.json")).unwrap()).unwrap();
+        assert_eq!(
+            finding["decoded_args"],
+            serde_json::json!([{"name": "buffer", "type": "const char *", "role": "param",
+                                "len": 0, "span": [0, 2], "preview_hex": ""}])
+        );
+        assert_eq!(
+            finding["exception"]["access"]["parameter"]["name"],
+            "buffer"
+        );
+        assert_eq!(finding["exception"]["access"]["parameter"]["offset"], 1);
+        // The sanitizer log is the crashing run's, not the trace run's.
+        let log = fs::read_to_string(finding_dir.join("sanitizer.log")).unwrap();
+        assert!(!log.contains("BHF_ARG"), "{log}");
+    }
+
+    /// A harness built without the argument trace is never re-run for it, and
+    /// decoded.json says why it has no arguments.
+    #[test]
+    #[cfg(unix)]
+    fn a_harness_without_the_trace_records_why_it_has_no_arguments() {
+        let root = tmpdir();
+        let work_dir = root.join("bhf_work");
+        let counter = root.join("runs");
+        write_c_libfuzzer_harness(
+            &work_dir,
+            "H-NOTRACE",
+            &format!(
+                "#!/bin/sh\necho run >> '{}'\n\
+                 >&2 echo 'ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1'\n\
+                 >&2 echo '    #0 0x1 in real_parse /src/p.c:9'\nexit 1\n",
+                counter.display()
+            ),
+        );
+        let summary = run_one_target_programmatic(
+            &work_dir,
+            "H-NOTRACE",
+            vec![b"seed".to_vec()],
+            1,
+            None,
+            None,
+            0,
+            &[],
+            actionability::RunMode::Reporting,
+            None,
+            &[],
+            None,
+        )
+        .expect("the crash is a finding");
+        let finding_dir = corpus::layout::finding_dir(&work_dir, &summary.findings[0]);
+        let decoded: serde_json::Value =
+            serde_json::from_slice(&fs::read(finding_dir.join("decoded.json")).unwrap()).unwrap();
+        assert_eq!(decoded["arguments_source"], "none");
+        assert!(decoded["arguments_unavailable"]
+            .as_str()
+            .unwrap()
+            .contains("without the argument trace"));
+        let finding: serde_json::Value =
+            serde_json::from_slice(&fs::read(finding_dir.join("finding.json")).unwrap()).unwrap();
+        assert!(finding.get("decoded_args").is_none());
+        let runs_before = fs::read_to_string(&counter).unwrap().lines().count();
+        assert!(runs_before >= 1);
+    }
+
+    /// The AFL++ lane's harness reads the testcase from stdin; its trace run
+    /// feeds it the same way.
+    #[test]
+    #[cfg(unix)]
+    fn the_argument_trace_feeds_stdin_harnesses_their_input() {
+        let root = tmpdir();
+        let work_dir = root.join("bhf_work");
+        let harness = write_c_libfuzzer_harness(
+            &work_dir,
+            "H-AFLTRACE",
+            "#!/bin/sh\n# BHF_TRACE_ARGS\nbytes=$(od -An -tu1 | tr -s ' ' | sed 's/^ //;s/ $//')\n\
+             [ \"$BHF_TRACE_ARGS\" = 1 ] && >&2 echo \"BHF_ARG {\\\"call\\\":\\\"target\\\",\\\"i\\\":0,\\\"role\\\":\\\"param\\\",\\\"name\\\":\\\"first\\\",\\\"type\\\":\\\"int\\\",\\\"value\\\":\\\"$bytes\\\"}\"\n\
+             exit 0\n",
+        );
+        let outcome = trace_arguments(
+            &harness,
+            &work_dir,
+            &[42],
+            TraceInput::Stdin,
+            &[],
+            Duration::from_secs(10),
+            None,
+        );
+        let corpus::decoded_args::TraceOutcome::Traced(args) = outcome else {
+            panic!("no trace: {outcome:?}");
+        };
+        assert_eq!(args[0].value.as_deref(), Some("42"));
     }
 
     #[test]

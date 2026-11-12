@@ -388,11 +388,21 @@ struct CppTemplateContext {
     compiler_is_gcc: bool,
     c_runtime_include: String,
     params: Vec<CParamEmission>,
+    /// The target parameters' decode statements, in decode order, with the
+    /// position captures and argument-trace statements (see
+    /// [`crate::arg_trace`]); and the after-call trace statements.
+    params_decode: Vec<String>,
+    params_after: Vec<String>,
     /// A borrowed Pugixml in-place buffer must outlive the document's parse tree.
     pugi_retained_buffers: bool,
     return_type: String,
     return_type_present: bool,
     constructor_params: Vec<CParamEmission>,
+    /// [`Self::params_decode`] for the receiver's constructor arguments.
+    constructor_decode: Vec<String>,
+    /// The trace statement describing the constructed receiver object.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receiver_trace: Option<String>,
     /// Class name (heuristically detected) when the target is a member
     /// function and we should emit a stack instance + method call instead
     /// of a free-function forward decl.
@@ -459,6 +469,9 @@ struct CppTemplateContext {
 struct CppLifecycleStepEmission {
     name: String,
     params: Vec<CParamEmission>,
+    /// Decode and argument-trace statements (see [`crate::arg_trace`]).
+    decode: Vec<String>,
+    after: Vec<String>,
     return_type: String,
     return_type_present: bool,
     result_name: String,
@@ -468,6 +481,9 @@ struct CppLifecycleStepEmission {
 struct CppProtocolStepEmission {
     name: String,
     params: Vec<CParamEmission>,
+    /// Decode and argument-trace statements (see [`crate::arg_trace`]).
+    decode: Vec<String>,
+    after: Vec<String>,
     return_type: String,
     return_type_present: bool,
     result_name: String,
@@ -484,6 +500,8 @@ struct CppTemplateFactoryContext {
     owner_method_is_static: bool,
     method: String,
     params: Vec<CParamEmission>,
+    /// Decode and argument-trace statements (see [`crate::arg_trace`]).
+    decode: Vec<String>,
     receiver_is_pointer: bool,
 }
 
@@ -1283,11 +1301,20 @@ fn build_cpp_context_common(
             &registry,
             &input.decoder_limits,
         )?;
+        let trace = cpp_trace_plan(
+            "f",
+            "receiver",
+            crate::arg_trace::Role::Receiver,
+            0,
+            &plan.factory_params,
+            &factory_params,
+        );
         Some(CppTemplateFactoryContext {
             owner_type: plan.owner_type.clone().unwrap_or_default(),
             owner_method_is_static: plan.owner_method_is_static,
             method: plan.factory_method.clone(),
             params: factory_params,
+            decode: trace.decode,
             receiver_is_pointer: plan.receiver_is_pointer,
         })
     } else {
@@ -1519,6 +1546,57 @@ fn build_cpp_context_common(
     }
     let passthrough_libfuzzer_entrypoint = input.target.name == "LLVMFuzzerTestOneInput";
     let lifecycle_step_count = lifecycle_steps.len();
+    // A byte-stream target's first parameter is each input byte in turn; the
+    // decoded parameters start at index 1.
+    let params_trace = cpp_trace_plan(
+        "p",
+        "target",
+        crate::arg_trace::Role::Param,
+        usize::from(byte_stream),
+        if byte_stream {
+            effective_params.get(1..).unwrap_or(&[])
+        } else {
+            effective_params
+        },
+        &params,
+    );
+    let constructor_trace = cpp_trace_plan(
+        "c",
+        "receiver",
+        crate::arg_trace::Role::Receiver,
+        0,
+        input.constructor_params,
+        &constructor_params,
+    );
+    // The receiver object, as the template builds it: from a factory when one
+    // is planned, else by its constructor (unless the target IS the constructor,
+    // whose arguments are the target's own).
+    let receiver_trace = if let Some(factory) = &factory {
+        let how = if factory.owner_type.is_empty() {
+            format!("factory {}()", factory.method)
+        } else {
+            format!("factory {}::{}()", factory.owner_type, factory.method)
+        };
+        Some(crate::arg_trace::receiver_statement(
+            &input.target.qualifier_path.join("::"),
+            &how,
+        ))
+    } else {
+        receiver_class
+            .as_deref()
+            .filter(|_| !target_is_constructor)
+            .map(|class| {
+                let how = if constructor_params.is_empty() {
+                    "default constructor".to_owned()
+                } else {
+                    format!(
+                        "constructor({} decoded argument(s))",
+                        constructor_params.len()
+                    )
+                };
+                crate::arg_trace::receiver_statement(class, &how)
+            })
+    };
 
     let compiler_is_gcc = build_context.compiler_is_gcc();
     // `CXX = <compiler>` heads every recipe; one under a spaced directory is
@@ -1563,6 +1641,8 @@ fn build_cpp_context_common(
             input.c_runtime_include,
         )),
         params,
+        params_decode: params_trace.decode,
+        params_after: params_trace.after,
         pugi_retained_buffers,
         return_type: if return_type_present {
             return_type
@@ -1571,6 +1651,8 @@ fn build_cpp_context_common(
         },
         return_type_present,
         constructor_params,
+        constructor_decode: constructor_trace.decode,
+        receiver_trace,
         receiver_class,
         target_is_constructor,
         target_is_method: input.target.api.is_method,
@@ -1676,6 +1758,42 @@ fn push_cpp_target_namespace(
     if !namespace.is_empty() && !using_namespaces.iter().any(|ns| ns == &namespace) {
         using_namespaces.push(namespace);
     }
+}
+
+/// The argument-trace plan for a C++ call's parameter emissions (see
+/// [`crate::arg_trace`]). `params` are the parameters as declared, so a trace
+/// line names a parameter by its declared name even where the harness renamed
+/// its local.
+fn cpp_trace_plan(
+    prefix: &str,
+    call: &str,
+    role: crate::arg_trace::Role,
+    index_base: usize,
+    params: &[CppParameter],
+    emissions: &[CParamEmission],
+) -> crate::arg_trace::DecodePlan {
+    let declared: Vec<crate::arg_trace::Declared> = params
+        .iter()
+        .enumerate()
+        .map(|(index, param)| {
+            crate::arg_trace::Declared::new(
+                crate::c_decoders::sanitize_or_synthesize_param_name(&param.name, index),
+                crate::c_decoders::strip_type_decoration(&param.cpp_type),
+            )
+        })
+        .collect();
+    crate::arg_trace::plan(
+        &crate::arg_trace::Group {
+            lang: crate::arg_trace::Lang::Cpp,
+            prefix,
+            call,
+            role,
+            index_base,
+            registry: None,
+        },
+        emissions,
+        &declared,
+    )
 }
 
 fn build_constructor_param_emissions(
@@ -1827,9 +1945,19 @@ fn build_lifecycle_step_emissions(
             apply_pugixml_buffer_cleanup(owner, &step.name, &step.params, &mut params);
             let return_type = step.return_type.trim().to_owned();
             let return_type_present = !return_type.is_empty() && return_type != "void";
+            let trace = cpp_trace_plan(
+                &format!("l{step_index}_"),
+                &step.name,
+                crate::arg_trace::Role::Param,
+                0,
+                &step.params,
+                &params,
+            );
             Ok(CppLifecycleStepEmission {
                 name: step.name.clone(),
                 params,
+                decode: trace.decode,
+                after: trace.after,
                 return_type: if return_type_present {
                     return_type
                 } else {
@@ -1930,9 +2058,19 @@ fn build_cpp_protocol_emissions(
             );
             let return_type = observed.step.return_type.trim().to_owned();
             let return_type_present = !return_type.is_empty() && return_type != "void";
+            let trace = cpp_trace_plan(
+                &format!("s{step_index}_"),
+                &observed.step.name,
+                crate::arg_trace::Role::Param,
+                0,
+                &observed.step.params,
+                &params,
+            );
             Ok(CppProtocolStepEmission {
                 name: observed.step.name.clone(),
                 params,
+                decode: trace.decode,
+                after: trace.after,
                 return_type: if return_type_present {
                     return_type
                 } else {
@@ -5467,6 +5605,430 @@ mod tests {
                 .unwrap_or(false);
         fs::remove_dir_all(&smoke).ok();
         ok
+    }
+
+    /// Generate and `make main` a C++ harness for `args`, or `None` (skipping)
+    /// when clang++, its C++ headers or make are missing.
+    fn build_cpp_harness(args: GenerateCppDirectArgs) -> Option<PathBuf> {
+        let make_ok = Command::new("make")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !make_ok || clangxx_compile_flags("cpp-trace").is_none_or(|flags| !flags.is_empty()) {
+            eprintln!(
+                "skipping {} build: clang++/make unavailable",
+                args.harness_id
+            );
+            return None;
+        }
+        let out = args.output_dir.clone();
+        generate_cpp_direct_harness(args).unwrap();
+        let build = Command::new("make")
+            .arg("main")
+            .current_dir(&out)
+            .output()
+            .expect("run make");
+        assert!(
+            build.status.success(),
+            "make main failed:\n{}\n{}\n{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr),
+            fs::read_to_string(out.join("main.cpp")).unwrap_or_default()
+        );
+        Some(out)
+    }
+
+    /// The traced source must not add a warning a `-Werror` build fails on.
+    fn assert_cpp_compiles_warning_free(out: &Path) {
+        let check = Command::new("clang++")
+            .args(["-std=c++17", "-fsyntax-only", "-Wall", "-Wextra", "-Werror"])
+            .arg("-I")
+            .arg(runtime_dir())
+            .arg("-I")
+            .arg(out)
+            .arg(out.join("main.cpp"))
+            .output()
+            .expect("run clang++");
+        assert!(
+            check.status.success(),
+            "warnings in the generated harness:\n{}",
+            String::from_utf8_lossy(&check.stderr)
+        );
+    }
+
+    /// Run a built harness on `input` with BHF_TRACE_ARGS=1 and return its
+    /// `BHF_ARG` lines as JSON.
+    fn cpp_traced_args(out: &Path, input: &[u8]) -> Vec<serde_json::Value> {
+        let path = out.join("traced-input.bin");
+        fs::write(&path, input).unwrap();
+        let run = Command::new(out.join("main"))
+            .arg(&path)
+            .env("BHF_TRACE_ARGS", "1")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(run.status.success(), "harness failed:\n{stderr}");
+        stderr
+            .lines()
+            .filter_map(|line| line.strip_prefix("BHF_ARG "))
+            .map(|json| serde_json::from_str(json).unwrap_or_else(|e| panic!("{e}: {json}")))
+            .collect()
+    }
+
+    fn cpp_traced<'a>(
+        args: &'a [serde_json::Value],
+        name: &str,
+        phase: Option<&str>,
+    ) -> &'a serde_json::Value {
+        args.iter()
+            .find(|arg| arg["name"] == name && arg.get("phase").and_then(|p| p.as_str()) == phase)
+            .unwrap_or_else(|| panic!("no {name} ({phase:?}) line in {args:#?}"))
+    }
+
+    /// With BHF_TRACE_ARGS=1 a built C++ method harness prints the receiver's
+    /// constructor argument and the constructed receiver, a length-prefixed
+    /// string, and an in-out reference before and after the call.
+    #[test]
+    fn built_cpp_harness_traces_receiver_and_reference_arguments() {
+        let out = temp_dir("cpp-trace-receiver");
+        fs::write(
+            out.join("widget.hpp"),
+            "#pragma once\n\
+             class Widget {\n\
+             public:\n\
+             \x20   explicit Widget(int mode) : mode_(mode) {}\n\
+             \x20   unsigned int read(const char *buffer, unsigned short &offset) {\n\
+             \x20       offset = (unsigned short)(offset + 1);\n\
+             \x20       return (unsigned int)(buffer[0] + mode_);\n\
+             \x20   }\n\
+             private:\n\
+             \x20   int mode_;\n\
+             };\n",
+        )
+        .unwrap();
+        let mut target = cppfunction("read");
+        target.qualifier_path = vec!["Widget".to_owned()];
+        target.api.is_method = true;
+        target.api.class_name = Some("Widget".to_owned());
+        let args = GenerateCppDirectArgs {
+            decoder_limits: Default::default(),
+            force: false,
+            harness_id: "H-CPP-TRACE".to_owned(),
+            output_dir: out.clone(),
+            source_path: out.join("widget.hpp"),
+            target,
+            params: vec![
+                CppParameter {
+                    name: "buffer".to_owned(),
+                    cpp_type: "const char *".to_owned(),
+                },
+                CppParameter {
+                    name: "offset".to_owned(),
+                    cpp_type: "unsigned short &".to_owned(),
+                },
+            ],
+            return_type: "unsigned int".to_owned(),
+            target_includes: vec!["widget.hpp".to_owned()],
+            target_includes_dirs: vec![out.clone()],
+            target_sources: Vec::new(),
+            compile_flags: Vec::new(),
+            c_runtime_include: runtime_dir(),
+            using_namespaces: Vec::new(),
+            result_cleanup: None,
+            constructor_params: vec![CppParameter {
+                name: "mode".to_owned(),
+                cpp_type: "int".to_owned(),
+            }],
+            type_defs: Vec::new(),
+            default_constructible_classes: Vec::new(),
+            parameter_constructions: Vec::new(),
+            receiver_class_override: None,
+            factory_plan: None,
+        };
+        let Some(out) = build_cpp_harness(args) else {
+            return;
+        };
+        // The traced source must not add a warning a `-Werror` build fails on.
+        let check = Command::new("clang++")
+            .args(["-std=c++17", "-fsyntax-only", "-Wall", "-Wextra", "-Werror"])
+            .arg("-I")
+            .arg(runtime_dir())
+            .arg("-I")
+            .arg(&out)
+            .arg(out.join("main.cpp"))
+            .output()
+            .expect("run clang++");
+        assert!(
+            check.status.success(),
+            "warnings in the generated harness:\n{}",
+            String::from_utf8_lossy(&check.stderr)
+        );
+        let input = [3, 0, b'A', b'B', b'C', 5, 0, 0, 0, 2, 0, 0, 0];
+        let args = cpp_traced_args(&out, &input);
+
+        let buffer = cpp_traced(&args, "buffer", None);
+        assert_eq!(buffer["call"], "target");
+        assert_eq!(buffer["span"], serde_json::json!([0, 5]));
+        assert_eq!(buffer["len"], 3);
+        assert_eq!(buffer["alloc_size"], 4);
+        assert_eq!(buffer["preview_hex"], "414243");
+        let offset = cpp_traced(&args, "offset", None);
+        assert_eq!(offset["role"], "out");
+        assert_eq!(offset["value"], "5");
+        assert_eq!(offset["span"], serde_json::json!([5, 9]));
+        assert_eq!(cpp_traced(&args, "offset", Some("after"))["value"], "6");
+
+        let mode = cpp_traced(&args, "mode", None);
+        assert_eq!(mode["call"], "receiver");
+        assert_eq!(mode["role"], "receiver");
+        assert_eq!(mode["value"], "2");
+        assert_eq!(mode["span"], serde_json::json!([9, 13]));
+        let receiver = cpp_traced(&args, "this", None);
+        assert_eq!(receiver["role"], "receiver");
+        assert_eq!(receiver["type"], "Widget");
+        assert_eq!(receiver["decoder"], "constructor(1 decoded argument(s))");
+        fs::remove_dir_all(&out).ok();
+    }
+
+    fn cpp_args_for(
+        out: &Path,
+        harness_id: &str,
+        target: CppFunction,
+        params: &[(&str, &str)],
+        constructor_params: &[(&str, &str)],
+        header: &str,
+    ) -> GenerateCppDirectArgs {
+        fs::write(out.join("widget.hpp"), header).unwrap();
+        let to_params = |params: &[(&str, &str)]| {
+            params
+                .iter()
+                .map(|(name, ty)| CppParameter {
+                    name: (*name).to_owned(),
+                    cpp_type: (*ty).to_owned(),
+                })
+                .collect::<Vec<_>>()
+        };
+        GenerateCppDirectArgs {
+            decoder_limits: Default::default(),
+            force: false,
+            harness_id: harness_id.to_owned(),
+            output_dir: out.to_path_buf(),
+            source_path: out.join("widget.hpp"),
+            target,
+            params: to_params(params),
+            return_type: "int".to_owned(),
+            target_includes: vec!["widget.hpp".to_owned()],
+            target_includes_dirs: vec![out.to_path_buf()],
+            target_sources: Vec::new(),
+            compile_flags: Vec::new(),
+            c_runtime_include: runtime_dir(),
+            using_namespaces: Vec::new(),
+            result_cleanup: None,
+            constructor_params: to_params(constructor_params),
+            type_defs: Vec::new(),
+            default_constructible_classes: Vec::new(),
+            parameter_constructions: Vec::new(),
+            receiver_class_override: None,
+            factory_plan: None,
+        }
+    }
+
+    fn cpp_method(class: &str, method: &str) -> CppFunction {
+        let mut target = cppfunction(method);
+        target.qualifier_path = vec![class.to_owned()];
+        target.api.is_method = true;
+        target.api.class_name = Some(class.to_owned());
+        target
+    }
+
+    /// The trace builds for any receiver and argument type: a receiver whose
+    /// `get()` returns a value rather than a pointer, one whose `data()`
+    /// returns `const void *`, and a pointer to `volatile` storage. Such a
+    /// receiver is shown as its object bytes.
+    #[test]
+    fn built_cpp_harness_traces_receivers_and_pointers_of_any_shape() {
+        let out = temp_dir("cpp-trace-get");
+        let args = cpp_args_for(
+            &out,
+            "H-CPP-TRACE-GET",
+            cpp_method("Counter", "bump"),
+            &[("by", "int")],
+            &[],
+            "#pragma once\n\
+             class Counter {\n\
+             public:\n\
+             \x20   Counter() : n_(0) {}\n\
+             \x20   int get() const { return n_; }\n\
+             \x20   int bump(int by) { n_ += by; return n_; }\n\
+             private:\n\
+             \x20   int n_;\n\
+             };\n",
+        );
+        let Some(out) = build_cpp_harness(args) else {
+            return;
+        };
+        assert_cpp_compiles_warning_free(&out);
+        let args = cpp_traced_args(&out, &[2, 0, 0, 0]);
+        assert_eq!(cpp_traced(&args, "by", None)["value"], "2");
+        let receiver = cpp_traced(&args, "this", None);
+        assert_eq!(receiver["len"], 4);
+        assert_eq!(receiver["preview_hex"], "00000000");
+        fs::remove_dir_all(&out).ok();
+
+        let out = temp_dir("cpp-trace-void-data");
+        let args = cpp_args_for(
+            &out,
+            "H-CPP-TRACE-VOID-DATA",
+            cpp_method("Blob", "poke"),
+            &[("by", "int")],
+            &[],
+            "#pragma once\n#include <cstddef>\n\
+             class Blob {\n\
+             public:\n\
+             \x20   Blob() : n_(0) {}\n\
+             \x20   const void *data() const { return &n_; }\n\
+             \x20   std::size_t size() const { return sizeof n_; }\n\
+             \x20   int poke(int by) { n_ += by; return n_; }\n\
+             private:\n\
+             \x20   int n_;\n\
+             };\n",
+        );
+        let Some(out) = build_cpp_harness(args) else {
+            return;
+        };
+        assert_cpp_compiles_warning_free(&out);
+        let args = cpp_traced_args(&out, &[3, 0, 0, 0]);
+        assert_eq!(cpp_traced(&args, "by", None)["value"], "3");
+        assert_eq!(cpp_traced(&args, "this", None)["len"], 4);
+        fs::remove_dir_all(&out).ok();
+
+        let out = temp_dir("cpp-trace-volatile");
+        let args = cpp_args_for(
+            &out,
+            "H-CPP-TRACE-VOLATILE",
+            cppfunction("widget_poke"),
+            &[("reg", "volatile unsigned int *"), ("value", "int")],
+            &[],
+            "#pragma once\n\
+             inline int widget_poke(volatile unsigned int *reg, int value) {\n\
+             \x20   *reg = (unsigned int)value;\n\
+             \x20   return value;\n\
+             }\n",
+        );
+        let Some(out) = build_cpp_harness(args) else {
+            return;
+        };
+        assert_cpp_compiles_warning_free(&out);
+        let args = cpp_traced_args(&out, &[9, 0, 0, 0, 4, 0, 0, 0]);
+        assert!(cpp_traced(&args, "reg", None)["ptr"]
+            .as_str()
+            .unwrap()
+            .starts_with("0x"));
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// `bhf_trace_value` compiles warning-free for every argument shape a
+    /// harness can pass (accessors that only look like a container or a smart
+    /// pointer, cv-qualified pointers, incomplete pointees, overloaded `&`),
+    /// with clang++ and g++, and under clang it needs no library trait that
+    /// an older libstdc++ lacks.
+    #[test]
+    fn the_cpp_trace_dispatch_compiles_for_any_argument_shape() {
+        let tu = "#include <cstddef>\n#include <cstdint>\n#include <memory>\n#include <string>\n\
+                  #include <vector>\n#include \"bhf_trace.h\"\n\
+                  struct Counter { int n; int get() const { return n; } };\n\
+                  struct Ref { int n; int &get() { return n; } const int &get() const { return n; } };\n\
+                  struct Blob { int n; const void *data() const { return &n; } std::size_t size() const { return 4; } };\n\
+                  struct Impl;\n\
+                  struct Handle { Impl *p; Impl *data() const { return p; } int size() const { return 0; } Impl *get() const { return p; } };\n\
+                  struct Odd { int n; void size() const {} const int *data() const { return &n; } };\n\
+                  struct Amp { int n; Amp *operator&() { return 0; } const Amp *operator&() const { return 0; } };\n\
+                  struct Owned { std::string s; };\n\
+                  enum Mode { MODE_A = 1 };\n\
+                  enum class Wide : unsigned short { X = 2 };\n\
+                  typedef int (*Fn)(int);\n\
+                  int main() {\n\
+                  \x20   const uint8_t d[4] = {1, 2, 3, 4};\n\
+                  \x20   volatile unsigned int reg = 5; volatile unsigned int *preg = &reg;\n\
+                  \x20   const volatile Mode vm = MODE_A; const volatile Mode *pvm = &vm;\n\
+                  \x20   volatile char vc[2] = {'a', 0}; volatile char *pvc = vc;\n\
+                  \x20   volatile void *vv = preg; Fn fn = 0; int arr[3] = {1, 2, 3};\n\
+                  \x20   Counter c = {1}; Ref r = {2}; Blob b = {3}; Handle h = {0}; Odd o = {4}; Amp a = {5};\n\
+                  \x20   Owned w; std::vector<int> v(2, 7); std::unique_ptr<int> u(new int(9));\n\
+                  \x20   std::shared_ptr<Impl> si; Wide wide = Wide::X; volatile int vi = 6;\n\
+                  \x20   bhf_tl_begin(\"{\");\n\
+                  \x20   bhf_trace_value(preg, d, 4, BHF_TRACE_NO_LEN, BHF_TRACE_DEREF);\n\
+                  \x20   bhf_trace_value(pvm, d, 4, BHF_TRACE_NO_LEN, BHF_TRACE_DEREF);\n\
+                  \x20   bhf_trace_value(pvc, d, 4, BHF_TRACE_NO_LEN, BHF_TRACE_NUL);\n\
+                  \x20   bhf_trace_value(vv, d, 4, BHF_TRACE_NO_LEN, 0);\n\
+                  \x20   bhf_trace_value(fn, d, 4, BHF_TRACE_NO_LEN, 0);\n\
+                  \x20   bhf_trace_value(arr, d, 4, BHF_TRACE_NO_LEN, 0);\n\
+                  \x20   bhf_trace_value(c, d, 4, BHF_TRACE_NO_LEN, 0);\n\
+                  \x20   bhf_trace_value(r, d, 4, BHF_TRACE_NO_LEN, 0);\n\
+                  \x20   bhf_trace_value(b, d, 4, BHF_TRACE_NO_LEN, 0);\n\
+                  \x20   bhf_trace_value(h, d, 4, BHF_TRACE_NO_LEN, 0);\n\
+                  \x20   bhf_trace_value(o, d, 4, BHF_TRACE_NO_LEN, 0);\n\
+                  \x20   bhf_trace_value(a, d, 4, BHF_TRACE_NO_LEN, 0);\n\
+                  \x20   bhf_trace_value(w, d, 4, BHF_TRACE_NO_LEN, 0);\n\
+                  \x20   bhf_trace_value(v, d, 4, BHF_TRACE_NO_LEN, 0);\n\
+                  \x20   bhf_trace_value(u, d, 4, BHF_TRACE_NO_LEN, 0);\n\
+                  \x20   bhf_trace_value(si, d, 4, BHF_TRACE_NO_LEN, 0);\n\
+                  \x20   bhf_trace_value(wide, d, 4, BHF_TRACE_NO_LEN, 0);\n\
+                  \x20   bhf_trace_value(vi, d, 4, BHF_TRACE_NO_LEN, 0);\n\
+                  \x20   bhf_trace_value(nullptr, d, 4, BHF_TRACE_NO_LEN, 0);\n\
+                  \x20   bhf_tl_end();\n\
+                  \x20   return 0;\n\
+                  }\n";
+        let dir = temp_dir("cpp-trace-shapes");
+        let source = dir.join("shapes.cpp");
+        fs::write(&source, tu).unwrap();
+        let mut compiled = 0;
+        for compiler in ["clang++", "g++"] {
+            if !Command::new(compiler)
+                .arg("--version")
+                .output()
+                .is_ok_and(|o| o.status.success())
+            {
+                continue;
+            }
+            for std in ["-std=c++11", "-std=c++17"] {
+                let out = Command::new(compiler)
+                    .args([std, "-fsyntax-only", "-Wall", "-Wextra", "-Werror"])
+                    .arg("-I")
+                    .arg(runtime_dir())
+                    .arg(&source)
+                    .output()
+                    .expect("run the C++ compiler");
+                assert!(
+                    out.status.success(),
+                    "{compiler} {std}:\n{}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                compiled += 1;
+            }
+        }
+        if compiled > 0
+            && Command::new("clang++")
+                .arg("--version")
+                .output()
+                .is_ok_and(|o| o.status.success())
+        {
+            let expanded = Command::new("clang++")
+                .args(["-std=c++11", "-E", "-P", "-x", "c++"])
+                .arg("-I")
+                .arg(runtime_dir())
+                .arg(runtime_dir().join("bhf_trace.h"))
+                .output()
+                .expect("run clang++ -E");
+            let expanded = String::from_utf8_lossy(&expanded.stdout);
+            let trace_part = &expanded[expanded.find("namespace bhf_trace_detail").unwrap()..];
+            assert!(
+                !trace_part.contains("is_trivially_copyable<"),
+                "the trace uses the library trait under clang"
+            );
+            assert!(trace_part.contains("__is_trivially_copyable("));
+        }
+        fs::remove_dir_all(&dir).ok();
     }
 
     /// End-to-end proof of the portable C++ libFuzzer target (#62): the C++

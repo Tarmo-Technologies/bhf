@@ -23,6 +23,7 @@ pub use generate::{
 ///   buffer and its capacity, only when that integer is named like a length.
 pub const HARNESS_FORMAT_VERSION: u32 = 2;
 
+pub(crate) mod arg_trace;
 pub mod build_safety;
 pub mod c_decoders;
 pub mod c_generate;

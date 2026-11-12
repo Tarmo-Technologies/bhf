@@ -564,6 +564,11 @@ struct CTemplateContext {
     #[serde(skip_serializing_if = "Option::is_none")]
     result_cleanup: Option<String>,
     passthrough_libfuzzer_entrypoint: bool,
+    /// The target parameters' decode statements, in decode order, with the
+    /// position captures and argument-trace statements (see
+    /// [`crate::arg_trace`]); and the after-call trace statements.
+    params_decode: Vec<String>,
+    params_after: Vec<String>,
     /// True for a byte-stream decoder: a `parse`/`decode` function whose first
     /// parameter is a single untrusted byte the driver feeds one at a time
     /// (PX4 st24_decode/sumd_decode). The harness feeds the whole fuzz input
@@ -718,6 +723,13 @@ struct CSequenceStepEmission {
     /// Safe comparison against a previously declared protocol result.
     #[serde(skip_serializing_if = "Option::is_none")]
     condition: Option<String>,
+    /// The parameters as declared, naming the argument-trace lines.
+    #[serde(skip)]
+    declared: Vec<crate::arg_trace::Declared>,
+    /// Decode and argument-trace statements (see [`crate::arg_trace`]), set
+    /// once the whole sequence context is built.
+    decode: Vec<String>,
+    after: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -896,28 +908,7 @@ fn build_param_decoders(
     // would emit an illegal `func(const name)`), and strip parameter-attribute
     // decoration macros from the type (`XXH_NOESCAPE XXH3_state_t *`) so they do
     // not pollute type resolution and turn a real type into an opaque skip.
-    let params: Vec<CParameter> = params
-        .iter()
-        .enumerate()
-        .map(|(i, p)| {
-            // Defensive: a function-pointer param whose declarator leaked into the
-            // name (`(*cb)(args)` with c_type collapsed to the bare return type)
-            // is rebuilt into the canonical funcptr model so it routes through the
-            // trampoline decoder rather than the broken buffer-init splice.
-            if let Some((fname, ftype)) =
-                crate::c_decoders::recover_leaked_funcptr_param(&p.name, &p.c_type)
-            {
-                return CParameter {
-                    name: fname,
-                    c_type: ftype,
-                };
-            }
-            CParameter {
-                name: crate::c_decoders::sanitize_or_synthesize_param_name(&p.name, i),
-                c_type: crate::c_decoders::strip_type_decoration(&p.c_type),
-            }
-        })
-        .collect();
+    let params = normalized_c_params(params);
     let params = &params[..];
     let mut out = Vec::with_capacity(params.len());
     let mut i = 0;
@@ -1339,6 +1330,61 @@ fn build_param_decoders(
         i += 1;
     }
     Ok(out)
+}
+
+/// The parameters as the decoders see them: bare identifier names and types
+/// without decoration macros.
+fn normalized_c_params(params: &[CParameter]) -> Vec<CParameter> {
+    params
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            // Defensive: a function-pointer param whose declarator leaked into the
+            // name (`(*cb)(args)` with c_type collapsed to the bare return type)
+            // is rebuilt into the canonical funcptr model so it routes through the
+            // trampoline decoder rather than the broken buffer-init splice.
+            if let Some((fname, ftype)) =
+                crate::c_decoders::recover_leaked_funcptr_param(&p.name, &p.c_type)
+            {
+                return CParameter {
+                    name: fname,
+                    c_type: ftype,
+                };
+            }
+            CParameter {
+                name: crate::c_decoders::sanitize_or_synthesize_param_name(&p.name, i),
+                c_type: crate::c_decoders::strip_type_decoration(&p.c_type),
+            }
+        })
+        .collect()
+}
+
+/// The argument-trace plan for a C call's parameter emissions (see
+/// [`crate::arg_trace`]).
+pub(crate) fn c_trace_plan(
+    prefix: &str,
+    call: &str,
+    index_base: usize,
+    params: &[CParameter],
+    emissions: &[CParamEmission],
+    registry: &TypeRegistry,
+) -> crate::arg_trace::DecodePlan {
+    let declared: Vec<crate::arg_trace::Declared> = normalized_c_params(params)
+        .into_iter()
+        .map(|p| crate::arg_trace::Declared::new(p.name, p.c_type))
+        .collect();
+    crate::arg_trace::plan(
+        &crate::arg_trace::Group {
+            lang: crate::arg_trace::Lang::C,
+            prefix,
+            call,
+            role: crate::arg_trace::Role::Param,
+            index_base,
+            registry: Some(registry),
+        },
+        emissions,
+        &declared,
+    )
 }
 
 /// A non-const pointer to a concrete (declarable) struct/union, in a function
@@ -3161,6 +3207,28 @@ fn build_c_context(args: &GenerateCDirectArgs) -> Result<CTemplateContext, Harne
         args.result_cleanup.clone()
     };
 
+    // When the target's header is INCLUDED (not forward-declared), a callback
+    // param's support re-`typedef`s the callback type the header already
+    // declares — a redefinition conflict if the signatures differ. Drop our
+    // typedef and use the header's (the trampoline assignment is cast, so a
+    // signature mismatch still compiles).
+    let params: Vec<CParamEmission> = if args.target_declared_in_header {
+        params
+            .into_iter()
+            .map(strip_redundant_callback_typedef)
+            .collect()
+    } else {
+        params
+    };
+    let trace = c_trace_plan(
+        "p",
+        "target",
+        usize::from(byte_stream),
+        decoder_params,
+        &params,
+        &registry,
+    );
+
     Ok(CTemplateContext {
         harness_id: args.harness_id.clone(),
         qualified_target_name: args.target.name.clone(),
@@ -3176,19 +3244,9 @@ fn build_c_context(args: &GenerateCDirectArgs) -> Result<CTemplateContext, Harne
             &args.c_runtime_include,
         )),
         emit_forward_declaration: !args.target_declared_in_header,
-        // When the target's header is INCLUDED (not forward-declared), a callback
-        // param's support re-`typedef`s the callback type the header already
-        // declares — a redefinition conflict if the signatures differ. Drop our
-        // typedef and use the header's (the trampoline assignment is cast, so a
-        // signature mismatch still compiles).
-        params: if args.target_declared_in_header {
-            params
-                .into_iter()
-                .map(strip_redundant_callback_typedef)
-                .collect()
-        } else {
-            params
-        },
+        params_decode: trace.decode,
+        params_after: trace.after,
+        params,
         return_type: if return_type_present {
             return_type
         } else {
@@ -3245,6 +3303,17 @@ fn is_c_byte_stream_decoder(name: &str, params: &[CParameter]) -> bool {
 }
 
 fn build_c_sequence_context(
+    args: &GenerateCSequenceArgs,
+) -> Result<CSequenceTemplateContext, HarnessGenError> {
+    let mut context = build_c_sequence_context_untraced(args)?;
+    apply_sequence_traces(
+        &mut context,
+        &TypeRegistry::from_defs(args.type_defs.iter()),
+    );
+    Ok(context)
+}
+
+fn build_c_sequence_context_untraced(
     args: &GenerateCSequenceArgs,
 ) -> Result<CSequenceTemplateContext, HarnessGenError> {
     validate_c_sequence_build_inputs(args)?;
@@ -4432,6 +4501,9 @@ fn build_c_sequence_step_emission(
         marks_target: false,
         callback_context_arg: None,
         condition: None,
+        declared: declared_lifecycle_params(step),
+        decode: Vec::new(),
+        after: Vec::new(),
     })
 }
 
@@ -4905,6 +4977,9 @@ fn build_c_returning_init_emission(
         marks_target: false,
         callback_context_arg: None,
         condition: None,
+        declared: declared_lifecycle_params(step),
+        decode: Vec::new(),
+        after: Vec::new(),
     })
 }
 
@@ -4983,7 +5058,78 @@ fn build_c_out_handle_init_emission(
         marks_target: false,
         callback_context_arg: None,
         condition: None,
+        declared: declared_lifecycle_params(step),
+        decode: Vec::new(),
+        after: Vec::new(),
     })
+}
+
+/// A lifecycle step's parameters as declared, for its argument-trace lines.
+fn declared_lifecycle_params(step: &CLifecycleStep) -> Vec<crate::arg_trace::Declared> {
+    normalized_c_params(&step.params)
+        .into_iter()
+        .map(|p| crate::arg_trace::Declared::new(p.name, p.c_type))
+        .collect()
+}
+
+/// Give every call of a sequence harness its decode and argument-trace
+/// statements (see [`crate::arg_trace`]). Runs once the context is complete,
+/// after every rewrite of the steps' decls and arguments.
+fn apply_sequence_traces(context: &mut CSequenceTemplateContext, registry: &TypeRegistry) {
+    let mut counter = 0usize;
+    let mut visit = |step: &mut CSequenceStepEmission| {
+        let prefix = format!("q{counter}_");
+        counter += 1;
+        let plan = crate::arg_trace::plan(
+            &crate::arg_trace::Group {
+                lang: crate::arg_trace::Lang::C,
+                prefix: &prefix,
+                call: &step.name,
+                role: crate::arg_trace::Role::Param,
+                // The live handle is the call's first argument.
+                index_base: usize::from(!step.receiver.is_empty()),
+                registry: Some(registry),
+            },
+            &step.params,
+            &step.declared,
+        );
+        step.decode = plan.decode;
+        step.after = plan.after;
+    };
+    if let Some(step) = context.init_step.as_mut() {
+        visit(step);
+    }
+    for step in context
+        .op_steps
+        .iter_mut()
+        .chain(context.configure_steps.iter_mut())
+        .chain(context.mined_protocol_steps.iter_mut())
+    {
+        visit(step);
+    }
+    for object in &mut context.mined_protocol_objects {
+        visit(&mut object.constructor);
+        for step in &mut object.protocol_steps {
+            visit(step);
+        }
+        if let Some(step) = object.end_step.as_mut() {
+            visit(step);
+        }
+    }
+    if let Some(pump) = context.expert_stream_pump.as_mut() {
+        visit(&mut pump.open_step);
+        visit(&mut pump.header_step);
+        visit(&mut pump.data_step);
+        if let Some(step) = pump.skip_step.as_mut() {
+            visit(step);
+        }
+    }
+    if let Some(drain) = context.expert_output_drain.as_mut() {
+        visit(&mut drain.target_step);
+    }
+    if let Some(step) = context.end_step.as_mut() {
+        visit(step);
+    }
 }
 
 fn scoped_c_param_name(prefix: &str, index: usize, raw: &str) -> String {
@@ -5747,6 +5893,319 @@ mod tests {
         let main = fs::read_to_string(&result.main_c).unwrap();
         let stamp = format!("/* bhf harness format {} */", crate::HARNESS_FORMAT_VERSION);
         assert!(main.contains(&stamp), "missing {stamp:?} in:\n{main}");
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// Build a direct C harness for `name(params)` defined in `source`, or
+    /// `None` (skipping) when clang or make is missing.
+    fn build_c_harness(name: &str, params: &[(&str, &str)], source: &str) -> Option<PathBuf> {
+        let tools = ["make", "clang"].iter().all(|tool| {
+            Command::new(tool)
+                .arg("--version")
+                .output()
+                .is_ok_and(|o| o.status.success())
+        });
+        if !tools {
+            eprintln!("skipping {name} build: clang/make unavailable");
+            return None;
+        }
+        let out = temp_dir(name);
+        let target_c = out.join("target.c");
+        fs::write(&target_c, source).unwrap();
+        let mut args = direct_args(name, out.clone());
+        args.params = params
+            .iter()
+            .map(|(name, c_type)| CParameter {
+                name: (*name).to_owned(),
+                c_type: (*c_type).to_owned(),
+            })
+            .collect();
+        args.target_sources = vec![target_c];
+        args.c_runtime_include = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../c_runtime")
+            .canonicalize()
+            .expect("c_runtime dir");
+        generate_c_direct_harness(args).unwrap();
+        let build = Command::new("make")
+            .arg("main")
+            .current_dir(&out)
+            .output()
+            .expect("run make");
+        assert!(
+            build.status.success(),
+            "make main failed:\n{}\n{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr)
+        );
+        Some(out)
+    }
+
+    /// The traced harness source must not add a warning a project's
+    /// `-Werror` build would turn into a failure.
+    fn assert_compiles_warning_free(out: &Path) {
+        let runtime = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../c_runtime");
+        let check = Command::new("clang")
+            .args(["-fsyntax-only", "-Wall", "-Wextra", "-Werror"])
+            .arg("-I")
+            .arg(&runtime)
+            .arg(out.join("main.c"))
+            .output()
+            .expect("run clang");
+        assert!(
+            check.status.success(),
+            "warnings in the generated harness:\n{}",
+            String::from_utf8_lossy(&check.stderr)
+        );
+    }
+
+    /// Run a built harness on `input` with `BHF_TRACE_ARGS` set to `trace` and
+    /// return its `BHF_ARG` lines as JSON.
+    fn traced_args(out: &Path, input: &[u8], trace: Option<&str>) -> Vec<serde_json::Value> {
+        let path = out.join("traced-input.bin");
+        fs::write(&path, input).unwrap();
+        let mut command = Command::new(out.join("main"));
+        command.arg(&path).env_remove("BHF_TRACE_ARGS");
+        if let Some(trace) = trace {
+            command.env("BHF_TRACE_ARGS", trace);
+        }
+        let run = command.output().unwrap();
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(run.status.success(), "harness failed:\n{stderr}");
+        stderr
+            .lines()
+            .filter_map(|line| line.strip_prefix("BHF_ARG "))
+            .map(|json| serde_json::from_str(json).unwrap_or_else(|e| panic!("{e}: {json}")))
+            .collect()
+    }
+
+    fn traced<'a>(
+        args: &'a [serde_json::Value],
+        name: &str,
+        phase: Option<&str>,
+    ) -> &'a serde_json::Value {
+        args.iter()
+            .find(|arg| arg["name"] == name && arg.get("phase").and_then(|p| p.as_str()) == phase)
+            .unwrap_or_else(|| panic!("no {name} ({phase:?}) line in {args:#?}"))
+    }
+
+    /// With BHF_TRACE_ARGS=1 a built C harness prints each decoded parameter:
+    /// scalars with their value and the bytes they came from, a length-prefixed
+    /// string with its length and bytes, a whole-input buffer with its address,
+    /// allocation and preview, and an out-pointer before and after the call.
+    /// Without the variable it prints nothing.
+    #[test]
+    fn built_c_harness_traces_each_decoded_argument() {
+        let Some(out) = build_c_harness(
+            "widget_scan",
+            &[
+                ("data", "const unsigned char *"),
+                ("bit_index", "unsigned int"),
+                ("width", "unsigned short"),
+                ("label", "const char *"),
+                ("score", "int *"),
+            ],
+            "int widget_scan(const unsigned char *data, unsigned int bit_index,\n\
+             \x20                unsigned short width, const char *label, int *score) {\n\
+             \x20   *score = (int)width + (label[0] == 'A');\n\
+             \x20   return data[0] + (int)(bit_index & 1u);\n\
+             }\n",
+        ) else {
+            return;
+        };
+        assert_compiles_warning_free(&out);
+        let input = [
+            0x40, 0xe2, 0x01, 0x00, 0x2a, 0x00, 0x00, 0x00, 0x03, 0x00, b'A', b'B', b'C',
+        ];
+        assert!(traced_args(&out, &input, None).is_empty());
+        assert!(traced_args(&out, &input, Some("0")).is_empty());
+        let args = traced_args(&out, &input, Some("1"));
+
+        let data = traced(&args, "data", None);
+        assert_eq!(data["call"], "target");
+        assert_eq!(data["i"], 0);
+        assert_eq!(data["role"], "param");
+        assert_eq!(data["type"], "const unsigned char *");
+        assert_eq!(data["span"], serde_json::json!([0, 13]));
+        assert_eq!(data["len"], 13);
+        assert_eq!(data["alloc_size"], 14);
+        assert_eq!(data["preview_hex"], "40e201002a0000000300414243");
+        assert!(data["ptr"].as_str().unwrap().starts_with("0x"));
+
+        let bit_index = traced(&args, "bit_index", None);
+        assert_eq!(bit_index["value"], "123456");
+        assert_eq!(bit_index["span"], serde_json::json!([0, 4]));
+        let width = traced(&args, "width", None);
+        assert_eq!(width["value"], "42");
+        assert_eq!(width["span"], serde_json::json!([4, 8]));
+
+        let label = traced(&args, "label", None);
+        assert_eq!(label["span"], serde_json::json!([8, 13]));
+        assert_eq!(label["len"], 3);
+        assert_eq!(label["alloc_size"], 4);
+        assert_eq!(label["preview_hex"], "414243");
+        assert_eq!(label["decoder"], "bhf_c_string(4096)");
+
+        let score = traced(&args, "score", None);
+        assert_eq!(score["role"], "out");
+        assert_eq!(score["value"], "0");
+        assert_eq!(traced(&args, "score", Some("after"))["value"], "43");
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// A `(buffer, length)` pair traces the buffer as a view of the input and
+    /// the length as the input size; a scalar after it reads the cursor.
+    #[test]
+    fn built_c_harness_traces_a_paired_buffer() {
+        let Some(out) = build_c_harness(
+            "widget_parse",
+            &[
+                ("buf", "const unsigned char *"),
+                ("len", "size_t"),
+                ("bias", "int"),
+            ],
+            "#include <stddef.h>\n\
+             int widget_parse(const unsigned char *buf, size_t len, int bias) {\n\
+             \x20   return len ? buf[0] + bias : bias;\n\
+             }\n",
+        ) else {
+            return;
+        };
+        assert_compiles_warning_free(&out);
+        let args = traced_args(&out, &[7, 0, 0, 0, 9], Some("1"));
+        let buf = traced(&args, "buf", None);
+        assert_eq!(buf["len"], 5);
+        assert_eq!(buf["preview_hex"], "0700000009");
+        assert_eq!(traced(&args, "len", None)["value"], "5");
+        let bias = traced(&args, "bias", None);
+        assert_eq!(bias["value"], "7");
+        assert_eq!(bias["span"], serde_json::json!([0, 4]));
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// A call whose parameters all use the whole input captures no cursor
+    /// positions, so a `-Wall -Werror` build stays clean.
+    #[test]
+    fn built_c_harness_without_cursor_parameters_traces_cleanly() {
+        let Some(out) = build_c_harness(
+            "widget_feed",
+            &[("buf", "const unsigned char *"), ("len", "size_t")],
+            "#include <stddef.h>\n\
+             int widget_feed(const unsigned char *buf, size_t len) {\n\
+             \x20   return len ? buf[0] : 0;\n\
+             }\n",
+        ) else {
+            return;
+        };
+        assert_compiles_warning_free(&out);
+        let args = traced_args(&out, b"abc", Some("1"));
+        assert_eq!(
+            traced(&args, "buf", None)["span"],
+            serde_json::json!([0, 3])
+        );
+        assert_eq!(traced(&args, "len", None)["value"], "3");
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// With BHF_TRACE_ARGS=1 a built sequence harness prints each operation's
+    /// decoded arguments, with spans in the argument region at the front of
+    /// the input.
+    #[test]
+    fn built_sequence_harness_traces_operation_arguments() {
+        let tools = ["make", "clang"].iter().all(|tool| {
+            Command::new(tool)
+                .arg("--version")
+                .output()
+                .is_ok_and(|o| o.status.success())
+        });
+        if !tools {
+            eprintln!("skipping sequence trace e2e: clang/make unavailable");
+            return;
+        }
+        let out = temp_dir("seq-trace");
+        let header = "typedef struct widget_t { int total; } widget_t;\n\
+                      int widget_open(widget_t *w);\n\
+                      int widget_push(widget_t *w, int value);\n\
+                      int widget_close(widget_t *w);\n";
+        fs::write(out.join("widget.h"), header).unwrap();
+        fs::write(
+            out.join("widget.c"),
+            "#include \"widget.h\"\n\
+             int widget_open(widget_t *w) { w->total = 0; return 0; }\n\
+             int widget_push(widget_t *w, int value) { w->total += value; return 0; }\n\
+             int widget_close(widget_t *w) { w->total = 0; return 0; }\n",
+        )
+        .unwrap();
+        let step = |name: &str, params: Vec<CParameter>| CLifecycleStep {
+            name: name.to_owned(),
+            params,
+            return_type: "int".to_owned(),
+            role: CStepRole::Operation,
+        };
+        let args = GenerateCSequenceArgs {
+            decoder_limits: Default::default(),
+            harness_id: "H-SEQTRACE".to_owned(),
+            output_dir: out.clone(),
+            source_path: out.join("widget.c"),
+            target: cfunction("widget_push"),
+            handle_type: "widget_t".to_owned(),
+            handle_param_type: "widget_t *".to_owned(),
+            init_returns_handle: false,
+            init_out_handle_argument: None,
+            init_success_nonzero: false,
+            handle_field_initializers: Vec::new(),
+            output_drain_protocol: None,
+            init_step: Some(step("widget_open", Vec::new())),
+            op_steps: vec![step(
+                "widget_push",
+                vec![CParameter {
+                    name: "value".to_owned(),
+                    c_type: "int".to_owned(),
+                }],
+            )],
+            protocol_steps: Vec::new(),
+            protocol_objects: Vec::new(),
+            receiver_configuration_names: Vec::new(),
+            callback_action: None,
+            end_step: Some(step("widget_close", Vec::new())),
+            target_includes: vec!["widget.h".to_owned()],
+            target_includes_dirs: vec![out.clone()],
+            target_sources: vec![out.join("widget.c")],
+            compile_flags: Vec::new(),
+            target_declared_in_header: true,
+            c_runtime_include: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../c_runtime")
+                .canonicalize()
+                .expect("c_runtime dir"),
+            type_defs: vec![c_parser::parse_c_type_defs(header).unwrap()],
+        };
+        generate_c_sequence_harness(args).unwrap();
+        let build = Command::new("make")
+            .arg("main")
+            .current_dir(&out)
+            .output()
+            .expect("run make");
+        assert!(
+            build.status.success(),
+            "make main failed:\n{}\n{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr)
+        );
+        let layout: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(out.join(SEQUENCE_LAYOUT_FILE)).unwrap())
+                .unwrap();
+        let control_len = layout["control_len"].as_u64().unwrap() as usize;
+        // Argument bytes, then the program: one step, slot 0 selecting op 0.
+        let mut input = vec![7, 0, 0, 0];
+        let mut control = vec![0u8; control_len];
+        control[0] = 1;
+        control[1] = 1;
+        input.extend_from_slice(&control);
+        let args = traced_args(&out, &input, Some("1"));
+        let value = traced(&args, "value", None);
+        assert_eq!(value["call"], "widget_push");
+        assert_eq!(value["i"], 1);
+        assert_eq!(value["value"], "7");
+        assert_eq!(value["span"], serde_json::json!([0, 4]));
         fs::remove_dir_all(&out).ok();
     }
 

@@ -323,6 +323,11 @@ fn explain_one(work_dir: &Path, f: &Finding, others: &[String], collapsed: bool)
         }
     }
 
+    // HARNESS ARGUMENTS: what each parameter was decoded to
+    for line in argument_lines(f) {
+        let _ = writeln!(s, "{line}");
+    }
+
     // FAKED ENVIRONMENT + byte-origin taint: this input's own replay when it
     // was recorded, else the harness's last fuzz pass, else not observed.
     let (env_source, env) = environment(work_dir, f, &harness_id, &evidence);
@@ -449,6 +454,52 @@ fn reproduce_lines(work_dir: &Path, f: &Finding) -> Vec<String> {
     lines
 }
 
+/// The HARNESS ARGUMENTS section: the value the harness decoded for each
+/// parameter, from the argument trace recorded in `decoded.json`, or why there
+/// is none and how to get it.
+fn argument_lines(f: &Finding) -> Vec<String> {
+    let Some(decoded) = read_json(&f.dir.join("decoded.json")) else {
+        return Vec::new();
+    };
+    let args: Vec<corpus::decoded_args::TracedArg> = decoded
+        .get("arguments")
+        .cloned()
+        .and_then(|args| serde_json::from_value(args).ok())
+        .unwrap_or_default();
+    let mut lines = vec!["\nHARNESS ARGUMENTS  (what each parameter was decoded to)".to_owned()];
+    if args.is_empty() {
+        let reason = decoded
+            .get("arguments_unavailable")
+            .and_then(Value::as_str)
+            .unwrap_or("no argument trace was recorded for this finding");
+        for line in wrap(&format!("not recorded: {reason}."), 76) {
+            lines.push(format!("  {line}"));
+        }
+        if f.raw
+            .get("exception")
+            .and_then(|e| e.get("sanitizer"))
+            .is_some()
+        {
+            lines.push(format!(
+                "  bhf replay --show-args {}   # re-run the harness with the trace",
+                crate::repro_lane::sh_word(&f.dir.to_string_lossy())
+            ));
+        }
+        return lines;
+    }
+    lines.extend(
+        corpus::decoded_args::render_table(&args)
+            .into_iter()
+            .map(|line| format!("  {line}")),
+    );
+    lines.push(
+        "  (bytes are [start..end) offsets in testcase.bin; a buffer spanning the whole input \
+         shares its bytes with the parameters decoded from the front of it)"
+            .to_owned(),
+    );
+    lines
+}
+
 /// The sanitizer's structured memory access (`exception.access`) as text: the
 /// direction and width, the region it hit, and where that region was
 /// allocated and freed (runtime and allocator frames skipped).
@@ -473,6 +524,27 @@ fn access_lines(access: &Value) -> Vec<String> {
         }
     }
     let mut lines = vec![format!("  Access: {head}")];
+    // The traced parameter whose buffer the access hit (see `decoded_args`).
+    if let Some(parameter) = access.get("parameter") {
+        let name = parameter.get("name").and_then(Value::as_str).unwrap_or("?");
+        let offset = parameter
+            .get("offset")
+            .map(Value::to_string)
+            .unwrap_or_default();
+        lines.push(match parameter.get("basis").and_then(Value::as_str) {
+            Some("region_start") => {
+                format!("    the region is parameter `{name}`'s buffer (access at offset {offset})")
+            }
+            Some("region_interior") => format!(
+                "    parameter `{name}`'s buffer starts inside the region (access at offset \
+                 {offset} from it)"
+            ),
+            _ => format!(
+                "    {offset} byte(s) past parameter `{name}` (the nearest traced pointer below \
+                 the faulting address)"
+            ),
+        });
+    }
     let stack_object = access.pointer("/region/kind").and_then(Value::as_str) == Some("stack");
     let alloc_verb = if stack_object {
         "in the frame of"
@@ -1248,6 +1320,76 @@ mod tests {
         assert_eq!(one.len(), 1);
         assert!(one[0].starts_with("━━━ F-0002-bbbbbbbb"), "{}", one[0]);
         assert!(one[0].contains("F-0001-aaaaaaaa (H-C0001)"), "{}", one[0]);
+    }
+
+    /// The decoded arguments recorded in decoded.json are tabulated, and the
+    /// access names the parameter whose buffer it hit.
+    #[test]
+    fn the_harness_arguments_are_tabulated_and_the_accessed_parameter_named() {
+        let work = tempfile::tempdir().unwrap();
+        let mut finding = frameless_finding(work.path());
+        let args = corpus::decoded_args::parse_arg_trace(
+            "BHF_ARG {\"call\":\"target\",\"i\":0,\"role\":\"param\",\"name\":\"data\",\"type\":\"const unsigned char *\",\"span\":[4,9],\"ptr\":\"0x502000000030\",\"alloc_size\":8,\"len\":5,\"preview_hex\":\"5a3c99012e\"}\n\
+             BHF_ARG {\"call\":\"target\",\"i\":1,\"role\":\"param\",\"name\":\"bit_index\",\"type\":\"unsigned int\",\"span\":[0,4],\"value\":\"305419896\"}\n",
+        );
+        corpus::decoded_args::record_trace(
+            work.path(),
+            &[0x78, 0x56, 0x34, 0x12, 0x5a, 0x3c, 0x99, 0x01, 0x2e],
+            &corpus::decoded_args::TraceOutcome::Traced(args),
+        )
+        .expect_err("no finding.json yet: decoded.json is still written");
+        finding.raw["exception"]["access"] = serde_json::json!({
+            "direction": "read",
+            "size": 1,
+            "address": "0x502000000038",
+            "region": {"kind": "heap", "size": 8, "offset": 8, "relation": "after", "distance": 0},
+            "parameter": {"name": "data", "offset": 8, "basis": "region_start"}
+        });
+        let out = explain_one(work.path(), &finding, &[], false);
+        assert!(out.contains("\nHARNESS ARGUMENTS"), "{out}");
+        let data = out
+            .lines()
+            .find(|line| line.trim_start().starts_with("data "))
+            .unwrap_or_else(|| panic!("no data row in:\n{out}"));
+        assert!(data.contains("const unsigned char *"), "{data}");
+        assert!(data.contains("4..9"), "{data}");
+        assert!(data.contains("len 5, alloc 8"), "{data}");
+        assert!(data.contains("5a3c99012e"), "{data}");
+        assert!(out.contains("305419896"), "{out}");
+        assert!(
+            out.contains("    the region is parameter `data`'s buffer (access at offset 8)\n"),
+            "{out}"
+        );
+        finding.raw["exception"]["access"]["parameter"] =
+            serde_json::json!({"name": "data", "offset": 5, "basis": "region_interior"});
+        let out = explain_one(work.path(), &finding, &[], false);
+        assert!(
+            out.contains(
+                "    parameter `data`'s buffer starts inside the region (access at offset 5 from it)\n"
+            ),
+            "{out}"
+        );
+    }
+
+    /// Without a recorded trace the section says why and how to get one.
+    #[test]
+    fn missing_harness_arguments_say_how_to_trace_them() {
+        let work = tempfile::tempdir().unwrap();
+        let finding = frameless_finding(work.path());
+        corpus::decoded_args::record_trace(
+            work.path(),
+            b"x",
+            &corpus::decoded_args::TraceOutcome::Unavailable(
+                "the harness was built without the argument trace".to_owned(),
+            ),
+        )
+        .unwrap();
+        let out = explain_one(work.path(), &finding, &[], false);
+        assert!(
+            out.contains("  not recorded: the harness was built without the argument trace."),
+            "{out}"
+        );
+        assert!(out.contains("bhf replay --show-args"), "{out}");
     }
 
     /// The structured access a sanitizer recorded (direction, size, the region

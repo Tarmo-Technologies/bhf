@@ -26,7 +26,9 @@
 //! relative write, CWE-787), writes a `<finding>/byte-control.json` card, and
 //! enriches the finding with a `primitive` object. It replays the built harness of
 //! a C or C++ finding ([`crate::repro_lane`]); any other finding is refused with
-//! its reason.
+//! its reason. When the harness carries the argument trace (`BHF_TRACE_ARGS`),
+//! one more replay names the harness parameter each byte was decoded into, so a
+//! byte that steers the access is reported as part of a named parameter.
 
 use crate::repro_lane::{self, Tool};
 use serde_json::{json, Value};
@@ -196,6 +198,9 @@ struct Card {
     address_stable: Option<bool>,
     classes: Vec<ByteClass>,
     primitive: Primitive,
+    /// The harness's decoded arguments for the replayed input, from its
+    /// argument trace (empty without one).
+    args: Vec<corpus::decoded_args::TracedArg>,
 }
 
 struct Primitive {
@@ -234,6 +239,7 @@ fn map_finding(f: &FindingRef) -> Option<Card> {
         ));
     }
     let primitive = classify_primitive(&baseline, &classes);
+    let args = traced_args(bin, &input);
     Some(Card {
         input_name: input_path
             .file_name()
@@ -245,7 +251,78 @@ fn map_finding(f: &FindingRef) -> Option<Card> {
         address_stable,
         classes,
         primitive,
+        args,
     })
+}
+
+/// The target call's decoded arguments for `input`, from one replay with the
+/// harness's argument trace on; empty when the harness has none.
+fn traced_args(bin: &Path, input: &[u8]) -> Vec<corpus::decoded_args::TracedArg> {
+    if !crate::fuzz::harness_has_arg_trace(bin) {
+        return Vec::new();
+    }
+    let Some(bin) = std::path::absolute(bin).ok() else {
+        return Vec::new();
+    };
+    let Some(dir) = bin.parent() else {
+        return Vec::new();
+    };
+    let scratch = dir.join("cart_trace_input.bin");
+    if std::fs::write(&scratch, input).is_err() {
+        return Vec::new();
+    }
+    let out = replay_command(&bin)
+        .arg(&scratch)
+        .env(
+            "ASAN_OPTIONS",
+            "abort_on_error=1:symbolize=0:detect_leaks=0",
+        )
+        .env(corpus::decoded_args::TRACE_ARGS_ENV, "1")
+        .output();
+    let _ = std::fs::remove_file(&scratch);
+    let Ok(out) = out else {
+        return Vec::new();
+    };
+    let args = corpus::decoded_args::parse_arg_trace(&String::from_utf8_lossy(&out.stderr));
+    corpus::decoded_args::summary_args(&args)
+        .into_iter()
+        .cloned()
+        .collect()
+}
+
+/// The parameters whose decoded bytes include `offset`.
+fn params_at(args: &[corpus::decoded_args::TracedArg], offset: usize) -> Vec<String> {
+    let offset = offset as u64;
+    let mut names: Vec<String> = Vec::new();
+    for arg in args {
+        if arg
+            .byte_range()
+            .is_some_and(|range| range.contains(&offset))
+        {
+            let name = arg.display_name();
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    names
+}
+
+/// ` (in bit_index, data)`: the parameters any of `offs` was decoded into.
+fn params_label(args: &[corpus::decoded_args::TracedArg], offs: &[usize]) -> String {
+    let mut names: Vec<String> = Vec::new();
+    for &offset in offs {
+        for name in params_at(args, offset) {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    if names.is_empty() {
+        String::new()
+    } else {
+        format!(" (in {})", names.join(", "))
+    }
 }
 
 /// Classify one byte by perturbing it (XOR 0xFF and XOR 0x01) and comparing the
@@ -683,7 +760,25 @@ fn render_card(id: &str, card: &Card) -> String {
             .map(|(i, _)| i)
             .collect();
         if !offs.is_empty() {
-            let _ = writeln!(s, "    {label}: bytes {}", span_list(&offs));
+            let _ = writeln!(
+                s,
+                "    {label}: bytes {}{}",
+                span_list(&offs),
+                params_label(&card.args, &offs)
+            );
+        }
+    }
+    if !card.args.is_empty() {
+        let _ = writeln!(s, "  parameter bytes:");
+        for arg in &card.args {
+            if let Some(range) = arg.byte_range().filter(|range| !range.is_empty()) {
+                let _ = writeln!(
+                    s,
+                    "    {}: bytes {}",
+                    arg.display_name(),
+                    fmt_span(range.start as usize, range.end as usize - 1)
+                );
+            }
         }
     }
     s
@@ -695,7 +790,14 @@ fn write_card(f: &FindingRef, card: &Card) {
         .classes
         .iter()
         .enumerate()
-        .map(|(i, c)| json!({ "offset": i, "class": c.tag() }))
+        .map(|(i, c)| {
+            let params = params_at(&card.args, i);
+            if params.is_empty() {
+                json!({ "offset": i, "class": c.tag() })
+            } else {
+                json!({ "offset": i, "class": c.tag(), "params": params })
+            }
+        })
         .collect();
     let card_json = json!({
         "schema": "bhf.byte-control/v1",
@@ -719,6 +821,10 @@ fn write_card(f: &FindingRef, card: &Card) {
             "controlling_bytes": card.primitive.controlling_bytes,
         },
         "bytes": bytes,
+        "parameters": card.args.iter().filter_map(|arg| {
+            let [start, end] = arg.span?;
+            Some(json!({ "name": arg.display_name(), "type": arg.ty, "span": [start, end] }))
+        }).collect::<Vec<_>>(),
     });
     let _ = std::fs::write(
         f.dir.join("byte-control.json"),
@@ -866,6 +972,42 @@ READ of size 1 at 0x502000000035 thread T0\n\
             rel_offset: None,
             fault_address: Some(address),
         }
+    }
+
+    /// With the harness's argument trace, the card names the parameter each
+    /// classified byte was decoded into.
+    #[test]
+    fn the_card_names_the_parameters_bytes_were_decoded_into() {
+        let args = corpus::decoded_args::parse_arg_trace(
+            "BHF_ARG {\"call\":\"target\",\"i\":0,\"role\":\"param\",\"name\":\"bit_index\",\"type\":\"unsigned int\",\"span\":[0,4],\"value\":\"9\"}\n\
+             BHF_ARG {\"call\":\"target\",\"i\":1,\"role\":\"param\",\"name\":\"width\",\"type\":\"unsigned int\",\"span\":[4,5],\"value\":\"1\"}\n",
+        );
+        let baseline = segv(0x6030_0a1b_2c40);
+        let classes = vec![
+            ByteClass::ControlsAddress,
+            ByteClass::ControlsAddress,
+            ByteClass::ControlsAddress,
+            ByteClass::ControlsAddress,
+            ByteClass::DontCare,
+        ];
+        let card = Card {
+            input_name: "testcase.bin".into(),
+            input_len: 5,
+            analyzed: 5,
+            primitive: classify_primitive(&baseline, &classes),
+            baseline,
+            address_stable: Some(true),
+            classes,
+            args,
+        };
+        let text = render_card("F-0001-0a0b0c0d", &card);
+        assert!(
+            text.contains("controls faulting address: bytes 0-3 (in bit_index)"),
+            "{text}"
+        );
+        assert!(text.contains("    width: bytes 4\n"), "{text}");
+        assert_eq!(params_at(&card.args, 4), vec!["width".to_owned()]);
+        assert!(params_at(&card.args, 5).is_empty());
     }
 
     /// A byte that moves a stable faulting address controls it; when the
