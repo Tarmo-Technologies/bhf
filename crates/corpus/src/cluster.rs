@@ -1330,6 +1330,27 @@ mod tests {
         );
     }
 
+    /// A project whose relative source paths start with a directory named like
+    /// a glibc component (`./io/scaled_reader.cpp`) keeps those frames in its key;
+    /// glibc's own frames under such dirs are still noise.
+    #[test]
+    fn project_frames_in_dirs_named_like_glibc_components_are_kept() {
+        let frames = vec![
+            located("read_scaled(int)", "./io/scaled_reader.cpp", 4),
+            located("Widget::load()", "./misc/widget.cpp", 9),
+            located(
+                "__libc_start_call_main",
+                "../sysdeps/nptl/libc_start_call_main.h",
+                58,
+            ),
+            located("__libc_start_main", "csu/../csu/libc-start.c", 360),
+        ];
+        assert_eq!(
+            normalize_frames(&frames),
+            vec!["read_scaled".to_owned(), "Widget::load".to_owned()]
+        );
+    }
+
     #[test]
     fn interceptor_crashes_from_different_callers_do_not_share_a_cluster() {
         let report = |caller: &str| {

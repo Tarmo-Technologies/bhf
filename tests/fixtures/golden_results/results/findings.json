@@ -124,8 +124,8 @@
           {
             "role": "finding",
             "path": "findings/F-0000-1a2b3c4d/finding.json",
-            "sha256": "67fe15a2f0c46643d95e018a562469dad4bed0c2fd4633a7360fbdaed454486b",
-            "size": 2422
+            "sha256": "41e80218ac3cd6760aaed32beba24f66f1e28bee6cc34c36d30d026f35692e00",
+            "size": 2739
           },
           {
             "role": "testcase",

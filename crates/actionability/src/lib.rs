@@ -470,8 +470,10 @@ fn sanitizer_patch_hint(raw: &Value) -> Option<PatchHint> {
     if matches!(class, BugClass::Unknown) {
         return None;
     }
-    let at = sink_from(raw)
-        .map(|sink| sink_location_phrase(&sink))
+    let sink = sink_from(raw);
+    let at = sink
+        .as_ref()
+        .map(sink_location_phrase)
         .unwrap_or_else(|| "the faulting location".to_owned());
     // Keep the hint tied to the finding's rule when it has one, else label it by
     // bug class so consumers still get a stable, meaningful id.
@@ -521,6 +523,9 @@ fn sanitizer_patch_hint(raw: &Value) -> Option<PatchHint> {
                 "Validate the pointer and any offset/length before the access at {at}; reject inputs that drive it out of range."
             ),
         ),
+        BugClass::UndefinedBehavior(UbCheck::MissingReturn) => {
+            missing_return_patch_hint(raw, sink.as_ref())
+        }
         BugClass::UndefinedBehavior(check) => ub_patch_hint(check, &at),
         BugClass::Timeout => (
             "Bound the work per input",
@@ -572,6 +577,40 @@ fn sanitizer_patch_hint(raw: &Value) -> Option<PatchHint> {
         guidance,
         diff: None,
     })
+}
+
+/// The fix hint for a missing return. UBSan reports the function's own line
+/// (`util.cpp:2:5`), while frame #0 is the line in its body where the input
+/// fell off the end (`util.cpp:4`): the hint names the function, cites the
+/// reported line as where it is declared, and frame #0's line only as where the
+/// input reached the end of it.
+fn missing_return_patch_hint(raw: &Value, sink: Option<&Sink>) -> (&'static str, String) {
+    let reported = message_source_location(raw);
+    let subject = match sink.map(|sink| sink.function.trim()) {
+        Some(function) if !function.is_empty() => format!("`{function}`"),
+        _ => "the function".to_owned(),
+    };
+    let declared = reported
+        .as_ref()
+        .map(|location| format!(" (declared at `{}:{}`)", location.file, location.line))
+        .unwrap_or_default();
+    let reached = sink
+        .and_then(|sink| Some((sink.file.as_deref()?, sink.line?)))
+        .filter(|(file, line)| {
+            !reported
+                .as_ref()
+                .is_some_and(|location| location.file == *file && location.line == *line)
+        })
+        .map(|(file, line)| {
+            format!("; the input reached the end of the function from `{file}:{line}`")
+        })
+        .unwrap_or_default();
+    (
+        "Return a value on every path",
+        format!(
+            "Return a value on every path out of {subject}{declared}: add the missing `return` (or handle the unmatched case explicitly) so no input reaches the end of the function without one{reached}. Find the branch this input takes that has no return."
+        ),
+    )
 }
 
 /// A compact, human-readable reference to the sink location for hint / next-step
@@ -961,7 +1000,7 @@ fn sanitizer_stack_location(raw: &Value) -> Option<FixLocation> {
         }
         // A glibc-internal source file (libio/iofread.c, sysdeps/.../memmove.S)
         // is never the developer's fix site — the project caller above it is.
-        if is_libc_source_file(Some(&file)) {
+        if is_libc_frame(&function, Some(&file)) {
             continue;
         }
         // A Rust toolchain stdlib frame (core::ptr::copy_nonoverlapping at
@@ -1248,49 +1287,281 @@ pub fn is_runtime_noise_frame(function: &str, file: Option<&str>) -> bool {
     let head = function_head(function);
     is_libc_runtime_function(&head)
         || is_sanitizer_interceptor(&head)
-        || is_libc_source_file(file)
+        || is_libc_frame(function, file)
         || is_sanitizer_runtime_file(file)
+}
+
+/// glibc component dirs no project names its own source dirs after, so a
+/// frame path starting with one is libc whatever its function.
+const LIBC_COMPONENT_DIRS: &[&str] = &[
+    "libio/",
+    "sysdeps/",
+    "string/",
+    "malloc/",
+    "stdio-common/",
+    "stdlib/",
+    "wcsmbs/",
+    "time/",
+];
+
+/// glibc component dirs whose names projects use for their own sources too
+/// (`./io/scaled_reader.cpp` in a build made with `-ffile-prefix-map=<src>=.`), each
+/// with the basenames of glibc's own sources there (an entry ending in `*` is
+/// a prefix). A frame path under one of these dirs is libc when its file is
+/// one of glibc's, whose static helpers (`parse_expression` in
+/// `posix/regcomp.c`, `call_init` in `elf/dl-init.c`) carry no reserved
+/// prefix, or when its function is libc's own ([`is_libc_internal_function`]).
+const SHARED_LIBC_COMPONENT_DIRS: &[(&str, &[&str])] = &[
+    // Process start-up: `csu/libc-start.c`, `nptl/libc_start_call_main.h`.
+    (
+        "csu/",
+        &[
+            "libc-*",
+            "init-first.c",
+            "check_fds.c",
+            "static-reloc.c",
+            "errno.c",
+            "errno-loc.c",
+            "dso_handle.c",
+            "version.c",
+        ],
+    ),
+    (
+        "nptl/",
+        &[
+            "pthread_*",
+            "libc_*",
+            "libc-*",
+            "nptl*",
+            "sem_*",
+            "thrd_*",
+            "mtx_*",
+            "cnd_*",
+            "tss_*",
+            "lowlevellock*",
+            "futex-internal.c",
+            "elision-*",
+            "allocatestack.c",
+            "cancellation.c",
+            "cleanup*",
+            "descr.h",
+            "unwind.c",
+            "tpp.c",
+            "events.c",
+            "register-atfork.c",
+            "call_once.c",
+        ],
+    ),
+    // `assert()` failures, signal delivery and the dynamic loader.
+    ("assert/", &["assert.c", "assert-perr.c", "__assert.c"]),
+    (
+        "signal/",
+        &[
+            "sigaction.c",
+            "raise.c",
+            "sigsetops.c",
+            "sigprocmask.c",
+            "sigreturn.c",
+            "sigsuspend.c",
+            "sigwait.c",
+            "sigtimedwait.c",
+            "sigqueue.c",
+            "sigaltstack.c",
+            "killpg.c",
+            "allocrtsig.c",
+        ],
+    ),
+    (
+        "posix/",
+        &[
+            "regcomp.c",
+            "regexec.c",
+            "regex.c",
+            "regex_internal.*",
+            "glob.c",
+            "glob64.c",
+            "globfree.c",
+            "globfree64.c",
+            "glob_pattern_p.c",
+            "glob-lstat-compat.c",
+            "fnmatch.c",
+            "fnmatch_loop.c",
+            "wordexp.c",
+            "getopt.c",
+            "getopt1.c",
+            "execvp.c",
+            "execvpe.c",
+            "execl.c",
+            "execle.c",
+            "execlp.c",
+            "spawn.c",
+            "spawnp.c",
+            "spawni.c",
+            "spawn_faction_*",
+            "sysconf.c",
+            "confstr.c",
+        ],
+    ),
+    ("elf/", &["dl-*", "rtld*", "ldconfig.c"]),
+    (
+        "misc/",
+        &[
+            "syslog.c",
+            "tsearch.c",
+            "hsearch.c",
+            "hsearch_r.c",
+            "lsearch.c",
+            "insremque.c",
+            "getpass.c",
+            "getusershell.c",
+            "mntent.c",
+            "mntent_r.c",
+            "getttyent.c",
+            "init-misc.c",
+            "getauxval.c",
+            "efgcvt*",
+            "qefgcvt*",
+        ],
+    ),
+    (
+        "io/",
+        &[
+            "fts.c",
+            "fts64*",
+            "ftw.c",
+            "ftw64*",
+            "lockf.c",
+            "lockf64.c",
+            "getdirname.c",
+        ],
+    ),
+    ("dlfcn/", &["dl*", "sdl*", "libc_dl*"]),
+];
+
+/// For a component-relative path under one of [`SHARED_LIBC_COMPONENT_DIRS`],
+/// whether it names one of glibc's own sources there; `None` elsewhere.
+fn shared_libc_component(rest: &str) -> Option<bool> {
+    SHARED_LIBC_COMPONENT_DIRS
+        .iter()
+        .find_map(|(dir, sources)| {
+            let file = rest.strip_prefix(dir)?;
+            Some(
+                !file.contains('/')
+                    && sources.iter().any(|source| match source.strip_suffix('*') {
+                        Some(prefix) => file.starts_with(prefix),
+                        None => file == *source,
+                    }),
+            )
+        })
+}
+
+/// `file` as glibc's component-relative form: leading `../` and `./` dropped
+/// and each `dir/..` pair collapsed (`signal/../sysdeps/posix/raise.c` is
+/// `sysdeps/posix/raise.c`).
+fn libc_component_path(file: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in file.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if parts.pop().is_none() {
+                    continue;
+                }
+            }
+            other => parts.push(other),
+        }
+    }
+    parts.join("/")
 }
 
 /// A glibc-internal *source file* (not a target source). glibc builds with
 /// component-relative paths (`libio/iofread.c`, `../sysdeps/.../memmove.S`), so
-/// a frame whose file begins with one of those component dirs (after stripping
-/// leading `../`/`./`) is libc, never the project sink. Anchored at the path
-/// start so a real target path like `/home/u/proj/string/parse.c` does NOT
-/// match.
+/// a frame whose file begins with one of the component dirs no project shares
+/// ([`LIBC_COMPONENT_DIRS`], after stripping leading `../`/`./` and collapsing
+/// `dir/..`) is libc, never the project sink. Anchored at the path start so a
+/// real target path like `/home/u/proj/string/parse.c` does NOT match. Paths
+/// under the component dirs projects share (`io/`, `misc/`, `posix/`, ...) need
+/// the file's name or the frame's function to decide: see [`is_libc_frame`].
 pub fn is_libc_source_file(file: Option<&str>) -> bool {
     let Some(file) = file else {
         return false;
     };
-    let mut rest = file;
-    loop {
-        rest = match rest.strip_prefix("../").or_else(|| rest.strip_prefix("./")) {
-            Some(stripped) => stripped,
-            None => break,
-        };
+    if file.starts_with('/') {
+        return false;
     }
-    const DIRS: &[&str] = &[
-        "libio/",
-        "sysdeps/",
-        "string/",
-        "malloc/",
-        "stdio-common/",
-        "stdlib/",
-        "wcsmbs/",
-        "time/",
-        // Process start-up: `csu/libc-start.c`, `nptl/libc_start_call_main.h`.
-        "csu/",
-        "nptl/",
-        // `assert()` failures, signal delivery and the dynamic loader.
-        "assert/",
-        "signal/",
-        "posix/",
-        "elf/",
-        "misc/",
-        "io/",
-        "dlfcn/",
-    ];
-    DIRS.iter().any(|dir| rest.starts_with(dir))
+    let rest = libc_component_path(file);
+    LIBC_COMPONENT_DIRS.iter().any(|dir| rest.starts_with(dir))
+}
+
+/// A glibc frame by its source path, function and module: a path under a
+/// component dir no project shares ([`is_libc_source_file`]); a path under one
+/// projects share too (`io/`, `misc/`, `posix/`, `elf/`, `signal/`, ...) that
+/// names one of glibc's own sources there (`posix/regcomp.c`,
+/// `elf/dl-init.c`) or whose function is libc-internal (`__libc_*`, `__GI_*`,
+/// `_IO_*`, `_dl_*`, `__*`, `abort`, `raise`, `_start`, ...); or an
+/// unsymbolized frame in libc or the dynamic loader
+/// (`(/lib/x86_64-linux-gnu/libc.so.6+0x29d90)`).
+pub fn is_libc_frame(function: &str, file: Option<&str>) -> bool {
+    let Some(file) = file else {
+        return false;
+    };
+    if is_libc_source_file(Some(file)) || is_libc_module(file) {
+        return true;
+    }
+    if file.starts_with('/') {
+        return false;
+    }
+    shared_libc_component(&libc_component_path(file))
+        .is_some_and(|glibc_source| glibc_source || is_libc_internal_function(function))
+}
+
+/// A glibc or dynamic-loader function: the reserved `__`/`_IO_`/`_dl_`
+/// prefixes and the few public entry points that show on crash stacks.
+fn is_libc_internal_function(function: &str) -> bool {
+    let head = function_head(function);
+    // `pthread_cond_wait@@GLIBC_2.3.2`
+    let name = head.split('@').next().unwrap_or_default().trim();
+    if ["__libc_", "__GI_", "_IO_", "_dl_", "__", "pthread_"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+    {
+        return true;
+    }
+    matches!(
+        name,
+        "abort"
+            | "raise"
+            | "_start"
+            | "__restore_rt"
+            | "start_thread"
+            | "clone"
+            | "clone3"
+            | "dl_main"
+            | "dl_iterate_phdr"
+            | "dlopen"
+            | "dlmopen"
+            | "dlsym"
+            | "dlvsym"
+            | "dlclose"
+            | "dlerror"
+    )
+}
+
+/// An unsymbolized frame's module, as the sanitizer prints it in place of a
+/// source position (`(/lib/x86_64-linux-gnu/libc.so.6+0x29d90)`), naming libc
+/// or the dynamic loader.
+fn is_libc_module(file: &str) -> bool {
+    let Some(module) = file.strip_prefix('(') else {
+        return false;
+    };
+    let path = module.split('+').next().unwrap_or_default();
+    let name = path.rsplit('/').next().unwrap_or_default();
+    name.starts_with("libc.so")
+        || name.starts_with("libc-2.")
+        || name.starts_with("ld-linux")
+        || name.starts_with("ld.so")
+        || name.starts_with("ld-musl")
+        || name.starts_with("libc.musl")
 }
 
 /// The bare callable name with any argument list / trailing `()` stripped, so
@@ -1425,7 +1696,7 @@ fn is_rust_alloc_only_leak(raw: &Value) -> bool {
                 || is_allocator_frame(&func)
                 || is_rust_std_alloc_frame(&func)
                 || is_harness_frame(&func, file.as_deref())
-                || is_libc_source_file(file.as_deref())
+                || is_libc_frame(&func, file.as_deref())
         }),
     }
 }
@@ -2893,10 +3164,11 @@ fn ub_patch_hint(check: UbCheck, at: &str) -> (&'static str, String) {
                 "Check that the shift amount at {at} is at least 0 and less than the operand's bit width before shifting, and shift an unsigned value instead of a negative signed one."
             ),
         ),
+        // Rendered from the report and the stack by `missing_return_patch_hint`.
         UbCheck::MissingReturn => (
             "Return a value on every path",
             format!(
-                "Return a value on every path out of the function at {at}: add the missing `return` (or handle the unmatched case explicitly) so no input reaches the end of the function without one. The reported line is the function, not the path that falls off its end; find the branch this input takes that has no return."
+                "Return a value on every path out of the function at {at}: add the missing `return` (or handle the unmatched case explicitly) so no input reaches the end of the function without one. Find the branch this input takes that has no return."
             ),
         ),
         UbCheck::Unreachable => (

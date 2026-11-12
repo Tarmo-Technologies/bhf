@@ -153,6 +153,29 @@
   no longer turns a UBSan finding into a frameless report and `exit status: 0`.
   The script exits with the harness's status, 128 plus the signal for a
   harness killed by one.
+- Stack frames whose relative source path starts with a directory named like a
+  glibc component that projects also use (`io/`, `misc/`, `posix/`, `elf/`,
+  `signal/`, `csu/`, `nptl/`, `assert/`, `dlfcn/`), such as `./io/scaled_reader.cpp`
+  in a build made with `-ffile-prefix-map=<src>=.`, are project frames again:
+  they count as libc only when their file is one of glibc's own sources in
+  that directory (`posix/regcomp.c`, `elf/dl-init.c`, `io/fts.c`, ...), their
+  function is libc's own (`__libc_*`, `__GI_*`, `_IO_*`, `_dl_*`, `__*`,
+  `abort`, `raise`, `_start`, ...) or the frame is in libc's or the dynamic
+  loader's module. Such a finding gets its sink, call frames and cluster
+  frames back. `libio/`, `sysdeps/`, `string/`, `malloc/`, `stdio-common/`,
+  `stdlib/`, `wcsmbs/` and `time/` stay libc.
+- The fix hint of a missing-return UBSan finding names the function and cites
+  the line UBSan reports (where the function is declared), and mentions frame
+  #0's line only as where the input reached the end of the function, instead
+  of calling frame #0's line in the body "the function".
+- `results/findings.json` `fuzz.access.alloc_stack` and `free_stack` keep only
+  the project's frames, filtered as the crash stack is: allocator and libc
+  frames, the generated harness and any path outside the source root are left
+  out. Both, and the crash `stack`, also leave out bhf's own runtime wherever
+  it is installed: the driver (`bhf_driver.c`, its `bhf_run_*` functions),
+  the helpers it copies into a harness (`bhf_decode.h`, `bhf_cov*`,
+  `bhf_trace.h`, `bhf_asan*.h`) and `_start`. A project's own `*_runtime/` or
+  `auto/` sources and an in-tree fuzz entry point stay.
 - A multi-worker `bhf fuzz` (`--workers N`, or `--sanitizers` with several
   sanitizers) merges the workers' findings before it prints its summary, and
   the summary gains `merged_findings` (the parent ids), `duplicates_of_existing`

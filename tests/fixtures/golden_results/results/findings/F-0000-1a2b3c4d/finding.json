@@ -49,6 +49,19 @@
           "file": "/src/demo/src/parse.c",
           "function": "parse_header",
           "line": 38
+        },
+        {
+          "file": "/opt/bhf/c_runtime/bhf_driver.c",
+          "function": "bhf_run_one_bytes",
+          "line": 761
+        },
+        {
+          "file": "/opt/bhf/c_runtime/bhf_driver.c",
+          "function": "main",
+          "line": 840
+        },
+        {
+          "function": "_start"
         }
       ],
       "direction": "read",

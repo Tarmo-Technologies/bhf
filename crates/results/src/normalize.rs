@@ -336,24 +336,20 @@ fn memory_access(access: &Value, root: Option<&Path>) -> Option<MemoryAccess> {
                 frame_offset: r.get("frame_offset").and_then(Value::as_u64),
             })
         });
+    // The crash stack's project filter, plus the allocator and libc frames
+    // (`malloc`, `free`) the allocation and free stacks start with.
     let frames = |key: &str| -> Vec<Frame> {
         access
             .get(key)
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
-            .filter_map(|frame| {
-                let function = str_at(frame, &["function"])?;
-                let file = str_at(frame, &["file"]);
-                if actionability::is_runtime_noise_frame(&function, file.as_deref()) {
-                    return None;
-                }
-                Some(Frame {
-                    function: Some(function),
-                    file: file.map(|file| relativize(&file, root)),
-                    line: frame.get("line").and_then(Value::as_u64).filter(|l| *l > 0),
-                })
+            .filter(|frame| {
+                let function = frame.get("function").and_then(Value::as_str);
+                let file = frame.get("file").and_then(Value::as_str);
+                function.is_some_and(|f| !actionability::is_runtime_noise_frame(f, file))
             })
+            .filter_map(|frame| project_frame(frame, root))
             .take(MAX_ACCESS_FRAMES)
             .collect()
     };
@@ -813,6 +809,39 @@ fn is_drive_path(path: &str) -> bool {
 /// the root, when the root is on disk; glibc's component paths
 /// (`assert/assert.c`) never do.
 fn project_frames(exception: &Value, root: Option<&Path>) -> Vec<Frame> {
+    exception
+        .get("stack")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|frame| project_frame(frame, root))
+        .take(MAX_STACK)
+        .collect()
+}
+
+/// bhf's own runtime on a stack: the driver (`c_runtime/bhf_driver.c`, its
+/// `bhf_run_*` entry functions), the decode, coverage and trace helpers it
+/// copies into a harness (`bhf_decode.h`, `bhf_cov*`, `bhf_trace.h`,
+/// `bhf_asan*.h`) and the program's `_start`. Named precisely, so a project's
+/// own `js_runtime/` or `auto/main.c`, or a fuzz entry point in its tree,
+/// is not mistaken for it.
+fn is_bhf_runtime_frame(function: Option<&str>, file: &str) -> bool {
+    let name = function.map(str::trim).unwrap_or_default();
+    let base = file.rsplit(['/', '\\']).next().unwrap_or_default();
+    name == "_start"
+        || name.starts_with("bhf_run_")
+        || base == "bhf_driver.c"
+        || ["bhf_decode", "bhf_cov", "bhf_trace", "bhf_asan"]
+            .iter()
+            .any(|prefix| base.starts_with(prefix))
+}
+
+/// One stack frame as the results model keeps it, when it is the project's
+/// code (see [`project_frames`]): a frame with a source file that is not
+/// toolchain, sanitizer, libc, the generated harness or bhf's runtime
+/// ([`is_bhf_runtime_frame`]), with its path made relative to the root and,
+/// under a root, inside it.
+fn project_frame(frame: &Value, root: Option<&Path>) -> Option<Frame> {
     const NOISE: [&str; 6] = [
         "compiler-rt",
         "sanitizer_common",
@@ -821,53 +850,44 @@ fn project_frames(exception: &Value, root: Option<&Path>) -> Vec<Frame> {
         "generated_harnesses/",
         "/usr/",
     ];
-    exception
-        .get("stack")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|frame| {
-            let file = frame.get("file").and_then(Value::as_str)?;
-            let rel = relativize(file, root);
-            let lower = rel.to_ascii_lowercase();
-            if NOISE.iter().any(|n| lower.contains(n)) {
-                return None;
+    let file = frame.get("file").and_then(Value::as_str)?;
+    let function = frame.get("function").and_then(Value::as_str);
+    if is_bhf_runtime_frame(function, file) {
+        return None;
+    }
+    let rel = relativize(file, root);
+    let lower = rel.to_ascii_lowercase();
+    if NOISE.iter().any(|n| lower.contains(n)) {
+        return None;
+    }
+    // glibc frames carry component-relative paths such as
+    // `csu/../csu/libc-start.c` or `assert/assert.c`. They are judged by the
+    // path as the symbolizer printed it (a project's `/src/malloc/x.c` made
+    // root-relative is not libc), with the `..` resolved first.
+    let original = lexically_normalized(&file.replace('\\', "/"));
+    if !original.starts_with('/') && !is_drive_path(&original) {
+        match root.filter(|root| root.is_dir()) {
+            // A relative path names project code only if it resolves under
+            // the source root.
+            Some(root) if !root.join(&original).is_file() => return None,
+            Some(_) => {}
+            None if actionability::is_libc_frame(function.unwrap_or_default(), Some(&original)) => {
+                return None
             }
-            // glibc frames carry component-relative paths such as
-            // `csu/../csu/libc-start.c` or `assert/assert.c`. They are judged
-            // by the path as the symbolizer printed it (a project's
-            // `/src/malloc/x.c` made root-relative is not libc), with the `..`
-            // resolved first.
-            let original = lexically_normalized(&file.replace('\\', "/"));
-            if !original.starts_with('/') && !is_drive_path(&original) {
-                match root.filter(|root| root.is_dir()) {
-                    // A relative path names project code only if it resolves
-                    // under the source root.
-                    Some(root) if !root.join(&original).is_file() => return None,
-                    Some(_) => {}
-                    None if actionability::is_libc_source_file(Some(&original)) => return None,
-                    None => {}
-                }
-            }
-            let lexical = lexically_normalized(&rel);
-            if root.is_some()
-                && (lexical.starts_with('/')
-                    || lexical.starts_with("..")
-                    || is_drive_path(&lexical))
-            {
-                return None;
-            }
-            Some(Frame {
-                function: frame
-                    .get("function")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                file: Some(rel),
-                line: frame.get("line").and_then(Value::as_u64).filter(|l| *l > 0),
-            })
-        })
-        .take(MAX_STACK)
-        .collect()
+            None => {}
+        }
+    }
+    let lexical = lexically_normalized(&rel);
+    if root.is_some()
+        && (lexical.starts_with('/') || lexical.starts_with("..") || is_drive_path(&lexical))
+    {
+        return None;
+    }
+    Some(Frame {
+        function: function.map(str::to_owned),
+        file: Some(rel),
+        line: frame.get("line").and_then(Value::as_u64).filter(|l| *l > 0),
+    })
 }
 
 /// `path` with `.` components dropped and each `dir/..` pair collapsed,
@@ -1686,6 +1706,86 @@ mod tests {
         assert_eq!(arguments[0].span, Some([0, 4]));
         assert_eq!(arguments[1].role, "param");
         assert_eq!(arguments[1].len, Some(12));
+    }
+
+    /// An allocation or free stack is cut to the project's own frames, as the
+    /// crash stack is: bhf's driver frames (at the install path of
+    /// `c_runtime/bhf_driver.c`), the generated harness, the C runtime's
+    /// `_start` and frames outside the source root are not project code.
+    #[test]
+    fn access_stacks_keep_only_project_frames() {
+        let mut raw = asan_record();
+        let driver = "/opt/bhf/share/c_runtime/bhf_driver.c";
+        raw["exception"]["access"] = json!({
+            "direction": "read", "size": 1,
+            "alloc_stack": [
+                {"function": "malloc", "file": "/llvm/compiler-rt/lib/asan/asan_malloc_linux.cpp", "line": 68},
+                {"function": "copy_at", "file": "/src/demo/src/copy.c", "line": 7},
+                {"function": "bhf_run_one", "file": "/w/harnesses/H-C0001/main.c", "line": 30},
+                {"function": "bhf_run_one_bytes", "file": driver, "line": 761},
+                {"function": "bhf_run_file", "file": driver, "line": 778},
+                {"function": "main", "file": driver, "line": 840},
+                {"function": "__libc_start_call_main", "file": "csu/../sysdeps/nptl/libc_start_call_main.h", "line": 58},
+                {"function": "_start", "file": "/build/glibc/csu/../sysdeps/x86_64/start.S", "line": 115}
+            ],
+            "free_stack": [
+                {"function": "free", "file": "/llvm/compiler-rt/lib/asan/asan_malloc_linux.cpp", "line": 52},
+                {"function": "release_record", "file": "/src/demo/src/copy.c", "line": 12},
+                {"function": "main", "file": driver, "line": 840},
+                {"function": "_start"}
+            ]
+        });
+        for root in [Some("/src/demo"), None] {
+            let access = normalize(raw.clone(), root).fuzz.unwrap().access.unwrap();
+            let names = |frames: &[Frame]| -> Vec<String> {
+                frames.iter().filter_map(|f| f.function.clone()).collect()
+            };
+            assert_eq!(names(&access.alloc_stack), ["copy_at"], "root {root:?}");
+            assert_eq!(
+                names(&access.free_stack),
+                ["release_record"],
+                "root {root:?}"
+            );
+            let text = serde_json::to_string(&access).unwrap();
+            assert!(!text.contains("bhf_driver.c"), "{text}");
+            if root.is_some() {
+                assert_eq!(access.alloc_stack[0].file.as_deref(), Some("src/copy.c"));
+            }
+        }
+    }
+
+    /// Only bhf's own runtime is dropped from the results stacks: project code
+    /// in a `*_runtime/` or `auto/` dir, and a fuzz entry point in the
+    /// project's tree, stay frames of the crash, allocation and free stacks.
+    #[test]
+    fn project_frames_in_dirs_named_like_bhf_runtime_dirs_are_kept() {
+        let mut raw = asan_record();
+        let project = json!([
+            {"function": "eval_expr", "file": "/src/demo/js_runtime/eval.c", "line": 14},
+            {"function": "parse_cfg", "file": "/src/demo/auto/main.c", "line": 22},
+            {"function": "LLVMFuzzerTestOneInput", "file": "/src/demo/fuzz/fuzz_parser.c", "line": 5},
+            {"function": "bhf_run_one_bytes", "file": "/opt/bhf/share/c_runtime/bhf_driver.c", "line": 761},
+            {"function": "bhf_c_string", "file": "/w/H-1/bhf_decode.h", "line": 195},
+            {"function": "_start"}
+        ]);
+        raw["exception"]["stack"] = project.clone();
+        raw["exception"]["access"] = json!({
+            "direction": "read", "size": 1,
+            "alloc_stack": project.clone(),
+            "free_stack": project,
+        });
+        for root in [Some("/src/demo"), None] {
+            let normalized = normalize(raw.clone(), root);
+            let fuzz = normalized.fuzz.as_ref().unwrap();
+            let access = fuzz.access.as_ref().unwrap();
+            let names = |frames: &[Frame]| -> Vec<String> {
+                frames.iter().filter_map(|f| f.function.clone()).collect()
+            };
+            let kept = ["eval_expr", "parse_cfg", "LLVMFuzzerTestOneInput"];
+            assert_eq!(names(&normalized.stack), kept, "root {root:?}");
+            assert_eq!(names(&access.alloc_stack), kept, "root {root:?}");
+            assert_eq!(names(&access.free_stack), kept, "root {root:?}");
+        }
     }
 
     /// An accessed parameter with an unknown basis or no name is dropped, an
@@ -2745,6 +2845,23 @@ mod tests {
         assert_eq!(names(Some(root)), ["check_record", "copy_at", "main"]);
         // No root to resolve against: the glibc component list decides.
         assert_eq!(names(None), ["check_record", "copy_at", "unmapped", "main"]);
+    }
+
+    /// Without a source root, a relative frame under a directory named like a
+    /// glibc component (`./io/scaled_reader.cpp`) is project code unless its function
+    /// is libc's own.
+    #[test]
+    fn relative_project_frames_in_glibc_named_dirs_stay_project_frames() {
+        let exception = json!({"stack": [
+            {"function": "read_scaled(int)", "file": "./io/scaled_reader.cpp", "line": 4},
+            {"function": "__GI___libc_read", "file": "io/read.c", "line": 26},
+            {"function": "__libc_start_call_main", "file": "../sysdeps/nptl/libc_start_call_main.h", "line": 58}
+        ]});
+        let names: Vec<String> = project_frames(&exception, None)
+            .into_iter()
+            .filter_map(|f| f.function)
+            .collect();
+        assert_eq!(names, ["read_scaled(int)"]);
     }
 
     /// A project directory that shares a name with a glibc component
