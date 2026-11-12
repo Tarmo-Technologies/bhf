@@ -714,8 +714,9 @@ stops at 64 files. Turn it off with `--no-seed-mining` or `seed-mining = false`.
 Seeds reach the engine byte for byte, as do the corpus entries a later pass or
 the AFL++ stage reseeds from `corpus/<harness-id>/queue/`. `auto/seeds.json`
 lists every seed the run used: its `path`, `source` (`user` or `mined`), file
-`size`, `bytes_used`, and the `sha256` of those bytes (the name of its
-`corpus/<harness-id>/queue/<sha256>.bin` entry), plus whether mining `ran`, was
+`size`, `bytes_used`, and the `sha256` of the bytes used (when the seed adds
+coverage it is kept as `corpus/<harness-id>/queue/<sha256>.bin`, and a crashing
+seed becomes a finding's testcase), plus whether mining `ran`, was
 `skipped_user_seeds`, or was `disabled`. `run.json` carries the same summary
 under `seeds`, and `-v` prints the list. A run that stops before it resolves
 seeds (one that finds no fuzzable target, for example) removes a list an

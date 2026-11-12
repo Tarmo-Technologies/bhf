@@ -827,6 +827,9 @@ fn resolve_auto_seeds(
         );
         (SeedMining::SkippedUserSeeds, SeedSource::User, user_seeds)
     } else if args.no_seed_mining {
+        bhfeprintln!(
+            "bhf auto: tree seed mining disabled (--no-seed-mining or seed-mining = false)"
+        );
         (SeedMining::Disabled, SeedSource::Mined, Vec::new())
     } else {
         // No seeds given: harvest the project's own test-data files. A parser

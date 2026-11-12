@@ -153,6 +153,12 @@
   no longer turns a UBSan finding into a frameless report and `exit status: 0`.
   The script exits with the harness's status, 128 plus the signal for a
   harness killed by one.
+- `bhf auto --no-seed-mining` (or `seed-mining = false`) says on the console
+  that tree seed mining is disabled, as the mined and explicit-seed cases
+  already said what seeded the run. The seed list's documentation no longer
+  claims a seed's `sha256` always names a corpus queue entry: a seed is kept
+  in the queue under that name only when it adds coverage, and a crashing seed
+  becomes a finding's testcase.
 - A C or C++ capsule's `build.sh` picks the sanitizer flags of the compiler that
   runs it (gcc has no `function` UBSan check and links its runtimes
   statically), as the harness Makefile does, and a capsule of a harness bhf

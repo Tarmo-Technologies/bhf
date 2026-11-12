@@ -6,8 +6,10 @@
 //! Corpus queue entries are named by content hash only, so without this record
 //! nobody can tell that a queue entry (or a finding's ancestry) started as a
 //! file mined out of the tree's own test data. Each entry carries the file's
-//! path, its size on disk, and the sha256 of the bytes the engine received,
-//! which is also the name of that seed's `corpus/<harness-id>/queue/<sha256>.bin`.
+//! path, its size on disk, and the sha256 of the bytes the engine received.
+//! When the seed adds coverage it is kept as
+//! `corpus/<harness-id>/queue/<sha256>.bin`; a seed that adds none is not kept,
+//! and a crashing seed becomes a finding's testcase instead.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -233,7 +235,8 @@ mod tests {
         assert_eq!(
             entry["sha256"],
             format!("{:x}", Sha256::digest(&bytes)),
-            "the hash names the seed's corpus queue entry"
+            "the sha256 of the bytes used: the queue name when the seed adds coverage, \
+             and the testcase hash when it crashes"
         );
 
         let summary = summary(work.path()).unwrap();

@@ -286,7 +286,10 @@ fn no_seed_mining_keeps_tree_data_out_of_the_corpus() {
     write_tree(&src);
     let work = tmp.join("work");
 
-    run_auto(&src, &work, "2", &["--no-seed-mining"]);
+    let disabled = "bhf auto: tree seed mining disabled (--no-seed-mining or seed-mining = false)";
+    let out = run_auto(&src, &work, "2", &["--no-seed-mining"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(disabled), "the run says so:\n{stderr}");
 
     assert!(!queue_entries(&work).contains(&binary_seed(1)));
     let manifest = seed_manifest(&work);
@@ -296,7 +299,9 @@ fn no_seed_mining_keeps_tree_data_out_of_the_corpus() {
     // The same through the tree's own config file.
     std::fs::write(src.join(".bhf.toml"), "seed-mining = false\n").unwrap();
     let work_cfg = tmp.join("work_cfg");
-    run_auto(&src, &work_cfg, "2", &[]);
+    let out = run_auto(&src, &work_cfg, "2", &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(disabled), "the run says so:\n{stderr}");
     assert!(!queue_entries(&work_cfg).contains(&binary_seed(1)));
     assert_eq!(seed_manifest(&work_cfg)["mining"], "disabled");
 
