@@ -836,7 +836,7 @@ fn attempt_force_includes_stream_header_for_recovered_cpp_source() {
             assert!(
                 repairs.iter().any(|repair| matches!(
                     repair,
-                    cli::auto::repair::Repair::TypePlaceholder { type_name }
+                    cli::auto::repair::Repair::TypePlaceholder { type_name, .. }
                         if type_name == "cerr"
                 )),
                 "expected the stream header repair for cerr, got {repairs:?}"

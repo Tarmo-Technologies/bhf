@@ -1631,7 +1631,7 @@ fn attempt_unclassified(
             let synthesized: BTreeSet<String> = repairs
                 .iter()
                 .filter_map(|r| match r {
-                    Repair::TypePlaceholder { type_name } => Some(type_name.clone()),
+                    Repair::TypePlaceholder { type_name, .. } => Some(type_name.clone()),
                     _ => None,
                 })
                 .collect();
@@ -1686,7 +1686,7 @@ fn attempt_unclassified(
             let synthesized: BTreeSet<String> = repairs
                 .iter()
                 .filter_map(|r| match r {
-                    Repair::TypePlaceholder { type_name } => Some(type_name.clone()),
+                    Repair::TypePlaceholder { type_name, .. } => Some(type_name.clone()),
                     _ => None,
                 })
                 .collect();
@@ -4224,6 +4224,14 @@ fn run_attempt(
                                         extra_includes.push(i);
                                     }
                                 }
+                                // Which form a type repair took: the real
+                                // header it included, or a fabricated stand-in.
+                                if let Repair::TypePlaceholder {
+                                    resolved_header, ..
+                                } = &mut repair
+                                {
+                                    *resolved_header = outcome.resolved_header;
+                                }
                                 manifest.repairs.push(repair);
                                 applied_any = true;
                             }
@@ -4400,7 +4408,7 @@ fn repair_key(repair: &Repair) -> String {
         Repair::ConfigHeaderSynth { virtual_path } => format!("config-h:{virtual_path}"),
         Repair::AddIncludeDir { dir } => dir.display().to_string(),
         Repair::IncludeTypeHeader { type_name, .. } => format!("type-header:{type_name}"),
-        Repair::TypePlaceholder { type_name } => type_name.clone(),
+        Repair::TypePlaceholder { type_name, .. } => type_name.clone(),
         Repair::TypeAlias { type_name, .. } => type_name.clone(),
         Repair::ConfigTypeAlias { type_name, .. } => format!("config-alias:{type_name}"),
         Repair::MacroDefine { name, .. } | Repair::ConfigGuardDefine { name, .. } => {
@@ -13205,6 +13213,7 @@ mod eject_unbuildable_added_source_tests {
         // Once the header was force-included, a source that still fails can go.
         manifest.repairs.push(Repair::TypePlaceholder {
             type_name: "cerr".to_owned(),
+            resolved_header: None,
         });
         assert!(!std_stream_include_pending(&cerr, &manifest));
         // Any other missing name is not a pending stream include.

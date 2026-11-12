@@ -94,10 +94,96 @@ fn findings_from_fabricated_macro_values_are_marked() {
             && index.contains("FRAME\\_SLOTS=0"),
         "{index}"
     );
+    // The `build_fidelity` column, wherever later columns put it.
     let csv = std::fs::read_to_string(work.join("results/findings.csv")).unwrap();
     assert!(
-        csv.lines()
-            .any(|row| row.starts_with(id) && row.ends_with("reduced: macro FRAME_SLOTS=0")),
+        csv.lines().any(|row| row.starts_with(id)
+            && (row.ends_with(",reduced: macro FRAME_SLOTS=0")
+                || row.contains(",reduced: macro FRAME_SLOTS=0,"))),
         "{csv}"
+    );
+}
+
+/// A C++ target whose only gap is a header it never included (`cerr` without
+/// `<iostream>`) is repaired by including that real header, not by a
+/// fabricated `void *` type: the build keeps full fidelity, and run.json and
+/// run.md list the header bhf included.
+#[test]
+fn a_cpp_target_missing_only_a_standard_header_keeps_full_fidelity() {
+    if which::which("clang++").is_err() || which::which("make").is_err() {
+        eprintln!("skipping: clang++/make not on PATH");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("tree");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(
+        source.join("widget.cpp"),
+        "#include <cstddef>\n#include <string>\n\
+         using namespace std;\n\
+         namespace demo {\n\
+         int parse_widget(const unsigned char *data, size_t len) {\n\
+         \x20   if (len > 2 && data[0] == 'W') cerr << \"widget \" << data[1] << \"\\n\";\n\
+         \x20   return len ? data[0] : 0;\n\
+         }\n\
+         }\n",
+    )
+    .unwrap();
+    let work = temp.path().join("work");
+    let output = Command::new(env!("CARGO_BIN_EXE_bhf"))
+        .arg("auto")
+        .arg(&source)
+        .arg("--work-dir")
+        .arg(&work)
+        .args([
+            "--jobs",
+            "1",
+            "--max-targets",
+            "1",
+            "--per-target-time",
+            "3",
+        ])
+        .args(["--languages", "cpp", "--no-discovery-cache"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let run: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(work.join("auto/run.json"))
+            .unwrap_or_else(|error| panic!("run.json: {error}\n{stderr}")),
+    )
+    .unwrap();
+    assert_eq!(run["summary"]["built_and_fuzzed"], 1, "{stderr}");
+    let target = &run["targets"][0];
+    assert!(
+        target["outcome"]["repairs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|repair| repair["kind"] == "type_placeholder"
+                && repair["type_name"] == "cerr"
+                && repair["resolved_header"] == "<iostream>"),
+        "the cerr repair records the header it included: {target}"
+    );
+    assert!(
+        target.get("build_fidelity").is_none(),
+        "a real header is no fabricated input: {target}"
+    );
+    assert_eq!(
+        run["summary"]["fabricated_build_context"]
+            .as_u64()
+            .unwrap_or(0),
+        0,
+        "{stderr}"
+    );
+    assert_eq!(
+        target["real_headers_included"][0], "type cerr: real header included (<iostream>)",
+        "{target}"
+    );
+    assert!(!stderr.contains("⚠ Build context"), "{stderr}");
+    let run_md = std::fs::read_to_string(work.join("auto/run.md")).unwrap();
+    assert!(
+        run_md.contains("type cerr: real header included (<iostream>)")
+            && !run_md.contains("## Fabricated build context"),
+        "{run_md}"
     );
 }

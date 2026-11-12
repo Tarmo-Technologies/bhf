@@ -64,8 +64,18 @@ pub enum Repair {
         type_name: String,
         header: PathBuf,
     },
+    /// A type the build left undefined. Applying it either includes the real
+    /// header that defines it (a C or C++ standard type, `cerr` from
+    /// `<iostream>`, or the one project header the target's includes lead
+    /// to), recorded as `resolved_header`, or fabricates a stand-in for it
+    /// (a `void *` alias, a struct inferred from its uses).
     TypePlaceholder {
         type_name: String,
+        /// The real header the repair included for the type (`<iostream>`, a
+        /// project header path); `None` when the type was fabricated. Absent
+        /// from repair records written before it existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resolved_header: Option<String>,
     },
     /// Real typedef chain synthesised from the tree-wide type index for a type
     /// the target's include closure left undefined — e.g. an arch/config-gated
@@ -242,7 +252,7 @@ impl RepairManifest {
             Repair::IncludeTypeHeader { type_name, .. } => {
                 key == format!("type-header:{type_name}")
             }
-            Repair::TypePlaceholder { type_name } => type_name == key,
+            Repair::TypePlaceholder { type_name, .. } => type_name == key,
             Repair::TypeAlias { type_name, .. } => type_name == key,
             Repair::ConfigTypeAlias { type_name, .. } => key == format!("config-alias:{type_name}"),
             Repair::MacroDefine { name, .. }
@@ -273,6 +283,10 @@ impl RepairManifest {
 pub struct ApplyOutcome {
     pub extra_sources: Vec<PathBuf>,
     pub extra_includes: Vec<PathBuf>,
+    /// For a `TypePlaceholder`: the real header it included for the type,
+    /// which the caller records on the repair (`resolved_header`). `None`
+    /// when the type was fabricated, and for every other repair.
+    pub resolved_header: Option<String>,
 }
 
 /// The real in-tree source files (`.ads` + `.adb`) for an Ada unit, but only
@@ -1386,6 +1400,7 @@ pub fn apply_repair_with_source(
             Ok(ApplyOutcome {
                 extra_sources: vec![],
                 extra_includes,
+                resolved_header: None,
             })
         }
         Repair::HeaderForward {
@@ -1407,6 +1422,7 @@ pub fn apply_repair_with_source(
             Ok(ApplyOutcome {
                 extra_sources: vec![],
                 extra_includes: vec![includes_dir],
+                resolved_header: None,
             })
         }
         Repair::ConfigHeaderSynth { virtual_path } => {
@@ -1421,6 +1437,7 @@ pub fn apply_repair_with_source(
             Ok(ApplyOutcome {
                 extra_sources: vec![],
                 extra_includes: vec![includes_dir],
+                resolved_header: None,
             })
         }
         Repair::AddIncludeDir { dir } => {
@@ -1434,6 +1451,7 @@ pub fn apply_repair_with_source(
             Ok(ApplyOutcome {
                 extra_sources: vec![],
                 extra_includes: vec![dir.clone()],
+                resolved_header: None,
             })
         }
         Repair::IncludeTypeHeader { type_name, header } => {
@@ -1447,9 +1465,10 @@ pub fn apply_repair_with_source(
             Ok(ApplyOutcome {
                 extra_sources: vec![],
                 extra_includes: vec![],
+                resolved_header: None,
             })
         }
-        Repair::TypePlaceholder { type_name } => {
+        Repair::TypePlaceholder { type_name, .. } => {
             // A tree-wide type leaf can be ambiguous while the target's own
             // include graph identifies one exact module definition. Include that
             // real umbrella and avoid a stale `void *` alias in auto_types.h: a
@@ -1463,6 +1482,7 @@ pub fn apply_repair_with_source(
                 return Ok(ApplyOutcome {
                     extra_sources: vec![],
                     extra_includes: vec![],
+                    resolved_header: Some(header.display().to_string()),
                 });
             }
             // A recognised C standard type (uint32_t, size_t, ...) or C++ stdlib
@@ -1471,8 +1491,10 @@ pub fn apply_repair_with_source(
             // `void *` placeholder in auto_types.h, pulled in only via
             // auto_stubs.c — never force-included — so it cannot clash with a
             // real definition in a target source.
+            let mut resolved_header = None;
             if let Some(body) = c_stub_gen::synth_c_std_include(type_name) {
                 append_or_create(&cpp_includes_path, &body)?;
+                resolved_header = c_stub_gen::c_std_header(type_name).map(|h| format!("<{h}>"));
             } else if let Some(body) = c_stub_gen::synth_c_integer_alias_typedef(type_name) {
                 // OSAL / cFE / classic-flight-software integer aliases
                 // (`int32`, `uint16`, ...). A sound `typedef int32_t int32;`
@@ -1485,6 +1507,8 @@ pub fn apply_repair_with_source(
                 append_or_create(&cpp_includes_path, &body)?;
             } else if let Some(body) = c_stub_gen::synth_cpp_stdlib_include(type_name) {
                 append_or_create(&cpp_includes_path, &body)?;
+                resolved_header =
+                    c_stub_gen::cpp_stdlib_header(type_name).map(|h| format!("<{h}>"));
             } else if let Some(record) =
                 target_source.and_then(|source| source_defines_named_record_tag(source, type_name))
             {
@@ -1550,6 +1574,7 @@ pub fn apply_repair_with_source(
             Ok(ApplyOutcome {
                 extra_sources: vec![],
                 extra_includes: vec![],
+                resolved_header,
             })
         }
         Repair::TypeAlias { decls, .. } => {
@@ -1565,6 +1590,7 @@ pub fn apply_repair_with_source(
             Ok(ApplyOutcome {
                 extra_sources: vec![],
                 extra_includes: vec![],
+                resolved_header: None,
             })
         }
         Repair::ConfigTypeAlias {
@@ -1589,6 +1615,7 @@ pub fn apply_repair_with_source(
                 Ok(ApplyOutcome {
                     extra_sources: vec![],
                     extra_includes: vec![includes_dir],
+                    resolved_header: None,
                 })
             } else {
                 // Bare MissingType: route exactly like the `void *` placeholder
@@ -1607,6 +1634,7 @@ pub fn apply_repair_with_source(
                 Ok(ApplyOutcome {
                     extra_sources: vec![],
                     extra_includes: vec![],
+                    resolved_header: None,
                 })
             }
         }
@@ -1664,6 +1692,7 @@ pub fn apply_repair_with_source(
             Ok(ApplyOutcome {
                 extra_sources: vec![],
                 extra_includes: vec![],
+                resolved_header: None,
             })
         }
         Repair::ConfigGuardDefine { name, value } => {
@@ -1673,6 +1702,7 @@ pub fn apply_repair_with_source(
             Ok(ApplyOutcome {
                 extra_sources: vec![],
                 extra_includes: vec![],
+                resolved_header: None,
             })
         }
         Repair::IncludeStdHeader { symbol, header } => {
@@ -1687,6 +1717,7 @@ pub fn apply_repair_with_source(
             Ok(ApplyOutcome {
                 extra_sources: vec![],
                 extra_includes: vec![],
+                resolved_header: None,
             })
         }
         Repair::DeclareFunction { symbol, .. } => {
@@ -1707,6 +1738,7 @@ pub fn apply_repair_with_source(
             Ok(ApplyOutcome {
                 extra_sources: vec![],
                 extra_includes: vec![],
+                resolved_header: None,
             })
         }
         Repair::StubDeclared { symbol, .. } => {
@@ -1757,6 +1789,7 @@ pub fn apply_repair_with_source(
                 Ok(ApplyOutcome {
                     extra_sources: vec![stubs_path],
                     extra_includes: vec![],
+                    resolved_header: None,
                 })
             } else if let Some(decl) = decl_index.lookup_cpp_stub_declaration(symbol) {
                 // A C++ declaration: emit its stub into a .cpp compiled as C++ —
@@ -1772,6 +1805,7 @@ pub fn apply_repair_with_source(
                 Ok(ApplyOutcome {
                     extra_sources: vec![cpp_stubs_path],
                     extra_includes: vec![],
+                    resolved_header: None,
                 })
             } else if let Some((qualified_class, simple_class)) = cpp_destructor_class(symbol) {
                 // #97: a declared-but-undefined C++ destructor — emit ONE source-level
@@ -1791,6 +1825,7 @@ pub fn apply_repair_with_source(
                 Ok(ApplyOutcome {
                     extra_sources: vec![cpp_stubs_path],
                     extra_includes: vec![],
+                    resolved_header: None,
                 })
             } else {
                 Err(std::io::Error::new(
@@ -1819,6 +1854,7 @@ pub fn apply_repair_with_source(
                 .map(Path::to_path_buf)
                 .into_iter()
                 .collect(),
+            resolved_header: None,
         }),
         Repair::StubBlind { symbol } => {
             let inferred_return =
@@ -1883,6 +1919,7 @@ pub fn apply_repair_with_source(
             Ok(ApplyOutcome {
                 extra_sources: vec![stubs_path],
                 extra_includes: vec![],
+                resolved_header: None,
             })
         }
         Repair::EnvVarInjection { .. } => {
@@ -1893,6 +1930,7 @@ pub fn apply_repair_with_source(
             Ok(ApplyOutcome {
                 extra_sources: vec![],
                 extra_includes: vec![],
+                resolved_header: None,
             })
         }
         Repair::AdaPackageStub {
@@ -1907,6 +1945,7 @@ pub fn apply_repair_with_source(
             Ok(ApplyOutcome {
                 extra_sources: files.into_iter().map(|file| file.path).collect(),
                 extra_includes: vec![],
+                resolved_header: None,
             })
         }
         Repair::AddAdaSource { sources, .. } => {
@@ -1947,6 +1986,7 @@ pub fn apply_repair_with_source(
             Ok(ApplyOutcome {
                 extra_sources: copied,
                 extra_includes: vec![],
+                resolved_header: None,
             })
         }
         Repair::StubGprImport { project } => {
@@ -1970,6 +2010,7 @@ pub fn apply_repair_with_source(
             Ok(ApplyOutcome {
                 extra_sources: vec![],
                 extra_includes: vec![],
+                resolved_header: None,
             })
         }
         Repair::AdaPackageBodyStub { unit, ops, .. } => {
@@ -1982,6 +2023,7 @@ pub fn apply_repair_with_source(
             Ok(ApplyOutcome {
                 extra_sources: files.into_iter().map(|file| file.path).collect(),
                 extra_includes: vec![],
+                resolved_header: None,
             })
         }
         Repair::OverrideAdaBodyStub { source, unit, ops } => {
@@ -2007,6 +2049,7 @@ pub fn apply_repair_with_source(
             Ok(ApplyOutcome {
                 extra_sources: vec![],
                 extra_includes: vec![],
+                resolved_header: None,
             })
         }
         Repair::PlatformStub { .. } => {
@@ -2016,6 +2059,7 @@ pub fn apply_repair_with_source(
             Ok(ApplyOutcome {
                 extra_sources: vec![],
                 extra_includes: vec![],
+                resolved_header: None,
             })
         }
         Repair::ForcedSyntheticParams { .. } => {
@@ -2024,6 +2068,7 @@ pub fn apply_repair_with_source(
             Ok(ApplyOutcome {
                 extra_sources: vec![],
                 extra_includes: vec![],
+                resolved_header: None,
             })
         }
         Repair::Win32Pack => {
@@ -2048,6 +2093,7 @@ pub fn apply_repair_with_source(
             Ok(ApplyOutcome {
                 extra_sources: vec![],
                 extra_includes: vec![repairs_dir.to_path_buf()],
+                resolved_header: None,
             })
         }
     }
@@ -3064,6 +3110,7 @@ pub(crate) fn plan_repair_forced_with_source_policy(
             } else {
                 Some(Repair::TypePlaceholder {
                     type_name: name.clone(),
+                    resolved_header: None,
                 })
             }
         }
@@ -3096,6 +3143,7 @@ pub(crate) fn plan_repair_forced_with_source_policy(
             if c_stub_gen::synth_c_integer_alias_typedef(name).is_some() {
                 return Some(Repair::TypePlaceholder {
                     type_name: name.clone(),
+                    resolved_header: None,
                 });
             }
             let tree = [
@@ -3123,6 +3171,7 @@ pub(crate) fn plan_repair_forced_with_source_policy(
                 }
                 return Some(Repair::TypePlaceholder {
                     type_name: name.clone(),
+                    resolved_header: None,
                 });
             }
             // Don't `#define` a project namespace/class/type that the all-caps
@@ -3161,6 +3210,7 @@ pub(crate) fn plan_repair_forced_with_source_policy(
                 // parses instead.
                 Some(Repair::TypePlaceholder {
                     type_name: name.clone(),
+                    resolved_header: None,
                 })
             } else {
                 Some(Repair::MacroDefine {
@@ -3440,6 +3490,7 @@ pub(crate) fn plan_repair_forced_with_source_policy(
             {
                 Some(Repair::TypePlaceholder {
                     type_name: name.clone(),
+                    resolved_header: None,
                 })
             } else {
                 None
@@ -4327,6 +4378,7 @@ mod tests {
         apply_repair_with_source(
             &Repair::TypePlaceholder {
                 type_name: "sector_t".to_owned(),
+                resolved_header: None,
             },
             &repairs,
             &idx,
@@ -4483,7 +4535,7 @@ mod tests {
         .expect("pollfd should be repaired from the host SDK");
         assert!(matches!(
             &repair,
-            Repair::TypePlaceholder { type_name } if type_name == "pollfd"
+            Repair::TypePlaceholder { type_name, .. } if type_name == "pollfd"
         ));
 
         let repairs = root.join("repairs");
@@ -4564,7 +4616,7 @@ mod tests {
         assert!(
             matches!(
                 plan_repair_forced(&incomplete, &idx, &no_attempts, true),
-                Some(Repair::TypePlaceholder { ref type_name }) if type_name == "Foo"
+                Some(Repair::TypePlaceholder { ref type_name, .. }) if type_name == "Foo"
             ),
             "force: an incomplete type must become an opaque TypePlaceholder"
         );
@@ -4578,7 +4630,7 @@ mod tests {
             assert!(
                 matches!(
                     plan_repair_forced(&missing, &idx, &no_attempts, force),
-                    Some(Repair::TypePlaceholder { ref type_name }) if type_name == "widget_t"
+                    Some(Repair::TypePlaceholder { ref type_name, .. }) if type_name == "widget_t"
                 ),
                 "a tree-unresolvable missing type must yield a TypePlaceholder (force={force})"
             );
@@ -5576,7 +5628,7 @@ mod tests {
                 },
                 &idx,
             ),
-            Some(Repair::TypePlaceholder { ref type_name }) if type_name == "cJSON_bool"
+            Some(Repair::TypePlaceholder { ref type_name, .. }) if type_name == "cJSON_bool"
         ));
     }
 
@@ -6132,6 +6184,7 @@ mod tests {
         apply_repair(
             &Repair::TypePlaceholder {
                 type_name: "widget_t".to_owned(),
+                resolved_header: None,
             },
             &repairs,
             &idx,
@@ -6174,6 +6227,32 @@ mod tests {
         assert!(forced.contains("extern int rand_s(unsigned int * _bhf_p0);"));
     }
 
+    /// The applied form of a type repair is reported back, so the ledger can
+    /// tell a real header from a fabricated stand-in: `cerr` gets `<iostream>`
+    /// and `uint32_t` `<stdint.h>`, an unknown project type nothing.
+    #[test]
+    fn type_placeholder_reports_the_real_header_it_included() {
+        let root = tmpdir();
+        let idx = crate::auto::decl_index::DeclarationIndex::build(&root).unwrap();
+        let repairs = root.join("repairs");
+        fs::create_dir_all(&repairs).unwrap();
+        let apply = |name: &str| {
+            apply_repair(
+                &Repair::TypePlaceholder {
+                    type_name: name.to_owned(),
+                    resolved_header: None,
+                },
+                &repairs,
+                &idx,
+            )
+            .unwrap()
+            .resolved_header
+        };
+        assert_eq!(apply("cerr").as_deref(), Some("<iostream>"));
+        assert_eq!(apply("uint32_t").as_deref(), Some("<stdint.h>"));
+        assert_eq!(apply("widget_handle_t"), None);
+    }
+
     #[test]
     fn type_placeholder_routes_by_collision_safety() {
         // A non-stdlib unknown type → void* in auto_types.h (reached only via
@@ -6189,6 +6268,7 @@ mod tests {
         apply_repair(
             &Repair::TypePlaceholder {
                 type_name: "RealT".to_owned(),
+                resolved_header: None,
             },
             &repairs,
             &idx,
@@ -6197,6 +6277,7 @@ mod tests {
         apply_repair(
             &Repair::TypePlaceholder {
                 type_name: "ostrstream".to_owned(),
+                resolved_header: None,
             },
             &repairs,
             &idx,
@@ -6228,6 +6309,7 @@ mod tests {
         apply_repair_with_source(
             &Repair::TypePlaceholder {
                 type_name: "CodecState".to_owned(),
+                resolved_header: None,
             },
             &repairs,
             &idx,
@@ -6263,6 +6345,7 @@ mod tests {
         apply_repair_with_source(
             &Repair::TypePlaceholder {
                 type_name: "cJSON".to_owned(),
+                resolved_header: None,
             },
             &repairs,
             &idx,
@@ -6292,6 +6375,7 @@ mod tests {
         apply_repair_with_source(
             &Repair::TypePlaceholder {
                 type_name: "Status".to_owned(),
+                resolved_header: None,
             },
             &repairs,
             &idx,
@@ -6663,7 +6747,7 @@ mod tests {
             },
             &idx,
         ) {
-            Some(Repair::TypePlaceholder { type_name }) => assert_eq!(type_name, "HMODULE"),
+            Some(Repair::TypePlaceholder { type_name, .. }) => assert_eq!(type_name, "HMODULE"),
             other => panic!("expected TypePlaceholder for HMODULE, got {other:?}"),
         }
         for ty in ["HWND", "LPVOID"] {

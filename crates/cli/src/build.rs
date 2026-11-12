@@ -1274,13 +1274,106 @@ fn makefile_target_context(harness_dir: &Path) -> (Vec<PathBuf>, Option<PathBuf>
     (sources, target_dir)
 }
 
+/// The include directories a harness Makefile searches for the target
+/// (`-iquote <dir>` in its `INCLUDES`), in order.
+fn makefile_include_dirs(harness_dir: &Path) -> Vec<PathBuf> {
+    let Ok(text) = fs::read_to_string(harness_dir.join("Makefile")) else {
+        return Vec::new();
+    };
+    let Some(includes) = text
+        .lines()
+        .find_map(|line| line.strip_prefix("INCLUDES = "))
+    else {
+        return Vec::new();
+    };
+    let words = recipe_words(includes);
+    words
+        .windows(2)
+        .filter(|pair| pair[0] == "-iquote")
+        .map(|pair| PathBuf::from(&pair[1]))
+        .collect()
+}
+
+/// The `--extra-source` files, `--extra-include` dirs and `--source-root`s
+/// generation recorded in the harness's `generation-metadata.json`.
+fn recorded_build_inputs(harness_dir: &Path) -> Vec<PathBuf> {
+    let Ok(bytes) = fs::read(harness_dir.join("generation-metadata.json")) else {
+        return Vec::new();
+    };
+    let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Vec::new();
+    };
+    ["extra_sources", "extra_includes", "source_roots"]
+        .iter()
+        .filter_map(|key| metadata.get(*key).and_then(serde_json::Value::as_array))
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// Every directory to look in for the definitions of a failed link's
+/// undefined symbols: [`definition_search_root`] around the target first,
+/// then the directories of the harness's other inputs — each source its
+/// Makefile compiles, each include dir it searches, and the extra sources,
+/// extra include dirs and source roots generation recorded — so a library
+/// kept beside the harness outside any checkout (`harness/` + `lib/`) is
+/// searched too. A directory inside one already listed, or inside the work
+/// dir, is left out, and so is one that would take the sources indexed in
+/// all past [`MAX_INDEXED_SOURCES`].
+fn definition_search_roots(target_dir: &Path, harness_dir: &Path, work_dir: &Path) -> Vec<PathBuf> {
+    // Resolved as the caller resolves the work dir and the linked sources,
+    // without Windows' `\\?\` prefix: the roots are shown in a hint.
+    let canonical = crate::workdir::plain_canonical;
+    let primary = canonical(&definition_search_root(target_dir));
+    let mut budget =
+        MAX_INDEXED_SOURCES.saturating_sub(c_family_source_count(&primary, MAX_INDEXED_SOURCES));
+    let (sources, _) = makefile_target_context(harness_dir);
+    let mut candidates: Vec<PathBuf> = sources
+        .iter()
+        .filter_map(|source| source.parent().map(Path::to_path_buf))
+        .collect();
+    candidates.extend(makefile_include_dirs(harness_dir));
+    for input in recorded_build_inputs(harness_dir) {
+        if input.is_file() {
+            candidates.extend(input.parent().map(Path::to_path_buf));
+        } else {
+            candidates.push(input);
+        }
+    }
+    // Shallowest first, so a directory is skipped when one containing it
+    // is already searched.
+    let mut candidates: Vec<PathBuf> = candidates.iter().map(|dir| canonical(dir)).collect();
+    candidates.sort_by_key(|dir| dir.components().count());
+    candidates.dedup();
+    let mut roots = vec![primary];
+    for dir in candidates {
+        if !dir.is_dir()
+            || dir.starts_with(work_dir)
+            || roots.iter().any(|root| dir.starts_with(root))
+        {
+            continue;
+        }
+        let count = c_family_source_count(&dir, budget + 1);
+        if count == 0 || count > budget {
+            continue;
+        }
+        budget -= count;
+        roots.push(dir);
+    }
+    roots
+}
+
 /// Where to look for the in-tree definitions of undefined symbols: the
 /// enclosing checkout when it is close by, the project directory around a
 /// conventional `src/`/`lib/` directory, or the target's own directory. A tree
 /// with too many sources to index quickly falls back to the target directory.
+/// The most C/C++ sources the undefined-symbol hint indexes, over every
+/// directory it searches.
+const MAX_INDEXED_SOURCES: usize = 5_000;
+
 fn definition_search_root(target_dir: &Path) -> PathBuf {
     const MAX_ASCENT: usize = 3;
-    const MAX_INDEXED_SOURCES: usize = 5_000;
     let mut candidate = None;
     let mut current = Some(target_dir);
     for _ in 0..=MAX_ASCENT {
@@ -1580,12 +1673,23 @@ fn c_build_failure_hints(
             break 'link;
         };
         let reference = reference.unwrap_or_else(|| target_dir.join("main.cpp"));
-        let root = definition_search_root(&target_dir);
-        let index = match crate::auto::decl_index::DeclarationIndex::build(&root) {
+        let work_canonical = canonical(work_dir);
+        let roots = definition_search_roots(&target_dir, harness_dir, &work_canonical);
+        let Some((primary, extra)) = roots.split_first() else {
+            break 'link;
+        };
+        let mut index = match crate::auto::decl_index::DeclarationIndex::build(primary) {
             Ok(index) => index,
             Err(_) => break 'link,
         };
-        let work_canonical = canonical(work_dir);
+        // The other inputs' directories add their headers (so a definer that
+        // includes `widgets/table.h` from a sibling include dir still counts)
+        // and their definitions.
+        if index.add_header_search_roots(extra).is_err()
+            || index.add_definition_search_roots(extra).is_err()
+        {
+            break 'link;
+        }
         let mut definers: Vec<(String, PathBuf)> = Vec::new();
         let mut unresolved: Vec<String> = Vec::new();
         let mut libraries: Vec<String> = Vec::new();
@@ -1682,7 +1786,11 @@ fn c_build_failure_hints(
                 "hint: no in-tree definition found under {} for: {}{}; link the library that \
                  provides them (AUTO_EXTRA_LDFLAGS='-L<dir> -l<name>') or add the source with \
                  --extra-source",
-                root.display(),
+                roots
+                    .iter()
+                    .map(|root| root.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 shown.join(", "),
                 if unresolved.len() > 10 { ", ..." } else { "" }
             ));
@@ -3776,6 +3884,106 @@ mod tests {
                 "AUTO_EXTRA_SOURCES='/opt/extra.cpp {table}' AUTO_EXTRA_INCLUDES=-fms-extensions \
                  CXX_STD=gnu++14 bhf build"
             )),
+            "{hints}"
+        );
+    }
+
+    /// A custom harness kept beside its library outside any checkout
+    /// (`harness/` + `lib/`): the target's own directory holds no definer, so
+    /// the hint searches the directories of the harness's other inputs too —
+    /// the extra sources the Makefile compiles, its include dirs, and the
+    /// paths generation recorded — and names the file that defines the symbol.
+    #[test]
+    fn failed_link_hint_finds_the_definer_beside_the_harness_outside_a_checkout() {
+        let temp = tempfile::tempdir().unwrap();
+        let proj = temp.path().join("proj");
+        let harness_src = proj.join("harness");
+        let lib_src = proj.join("lib").join("src");
+        let lib_inc = proj.join("lib").join("include").join("widgets");
+        for dir in [&harness_src, &lib_src, &lib_inc] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::write(
+            lib_inc.join("table.h"),
+            "#pragma once\n#include <cstddef>\nnamespace widgets { struct Table { static int store(const unsigned char *d, std::size_t n); }; }\n",
+        )
+        .unwrap();
+        fs::write(
+            lib_src.join("table.cpp"),
+            "#include \"widgets/table.h\"\nnamespace widgets {\nint Table::store(const unsigned char *d, std::size_t n) { return n ? d[0] : 0; }\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            lib_src.join("codec.cpp"),
+            "#include \"widgets/table.h\"\nint decode(const unsigned char *d, std::size_t n) { return widgets::Table::store(d, n); }\n",
+        )
+        .unwrap();
+        fs::write(
+            harness_src.join("drive_codec.cpp"),
+            "#include <cstddef>\n#include <cstdint>\nint decode(const unsigned char *d, std::size_t n);\n\
+             extern \"C\" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) { return decode(data, size); }\n",
+        )
+        .unwrap();
+        let output = "codec.cpp:2: undefined reference to `widgets::Table::store(unsigned char const*, unsigned long)'\n";
+        // Named by its resolved path (Windows short names expanded, no
+        // `\\?\` prefix), one shell word.
+        let table = shell_word(&crate::workdir::plain_canonical(&lib_src.join("table.cpp")));
+        let none = RebuildEnv::default();
+
+        // The library's source dir is known from the extra source the
+        // Makefile compiles.
+        let work = temp.path().join("work");
+        let harness = work.join("harnesses").join("H-XCODEC");
+        fs::create_dir_all(&harness).unwrap();
+        fs::write(harness.join("main.cpp"), "").unwrap();
+        fs::write(
+            harness.join("Makefile"),
+            format!(
+                "INCLUDES = -I . -I /opt/bhf/c_runtime -iquote {h} -idirafter {h} -iquote {i} -idirafter {i}\n\
+                 main: main.cpp bhf_driver.o $(CONTEXT_MAIN_OBJECTS)\n\t$(CXX) $(CXXFLAGS) -DBHF_EXTERNAL_DRIVER -o $@ main.cpp {t} {c} $(CONTEXT_MAIN_OBJECTS) $(AUTO_EXTRA_SOURCES) bhf_driver.o\n",
+                h = harness_gen::build_safety::make_path(&harness_src),
+                i = harness_gen::build_safety::make_path(&proj.join("lib").join("include")),
+                t = harness_gen::build_safety::make_path(&harness_src.join("drive_codec.cpp")),
+                c = harness_gen::build_safety::make_path(&lib_src.join("codec.cpp")),
+            ),
+        )
+        .unwrap();
+        let hints = c_build_failure_hints(&work, "H-XCODEC", &harness, output, &none).join("\n");
+        assert!(
+            hints.contains(&format!("--extra-source {table}")),
+            "{hints}"
+        );
+        assert!(!hints.contains("no in-tree definition found"), "{hints}");
+
+        // Known only from the --extra-include dirs generation recorded.
+        let work = temp.path().join("work2");
+        let harness = work.join("harnesses").join("H-XCODEC");
+        fs::create_dir_all(&harness).unwrap();
+        fs::write(harness.join("main.cpp"), "").unwrap();
+        fs::write(
+            harness.join("Makefile"),
+            format!(
+                "main: main.cpp bhf_driver.o\n\t$(CXX) $(CXXFLAGS) -o $@ main.cpp {t} bhf_driver.o\n",
+                t = harness_gen::build_safety::make_path(&harness_src.join("drive_codec.cpp")),
+            ),
+        )
+        .unwrap();
+        fs::write(
+            harness.join("generation-metadata.json"),
+            serde_json::json!({
+                "schema_version": 1,
+                "language": "cpp",
+                "extra_includes": [
+                    proj.join("lib").join("include").display().to_string(),
+                    lib_src.display().to_string(),
+                ],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let hints = c_build_failure_hints(&work, "H-XCODEC", &harness, output, &none).join("\n");
+        assert!(
+            hints.contains(&format!("--extra-source {table}")),
             "{hints}"
         );
     }

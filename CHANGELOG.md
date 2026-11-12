@@ -340,6 +340,20 @@
   for (`libbhf_runtrace.so`, `libbhf_runtrace_shim.so`), where it looked,
   and `BHF_RUNTRACE_SHIM=<path>`, in `bhf auto`, `--runtime-oracles on` and
   `bhf env-capsule` alike.
+- A type a C/C++ source uses without including its header (`cerr` without
+  `<iostream>`) that the repair loop resolves by including the real header no
+  longer counts as fabricated build context: the target keeps full fidelity
+  and its findings keep their confidence. The repair record carries the
+  header (`resolved_header`, additive), and `run.json`
+  `targets[].real_headers_included` (additive) and `run.md` list it as
+  `type cerr: real header included (<iostream>)`; it is no longer listed as a
+  missing type either. Only a `void *` or other stand-in reduces fidelity.
+- `bhf build`'s undefined-symbol hint also searches the directories of the
+  harness's other sources and include dirs and the `--extra-source`,
+  `--extra-include` and `--source-root` paths generation recorded (new
+  optional `generation-metadata.json` fields `extra_sources`,
+  `extra_includes`, `source_roots`), so a harness kept beside its library
+  outside a git checkout or a `src/`/`lib/` directory names the defining file.
 - A C or C++ capsule's `build.sh` picks the sanitizer flags of the compiler that
   runs it (gcc has no `function` UBSan check and links its runtimes
   statically), as the harness Makefile does, and a capsule of a harness bhf

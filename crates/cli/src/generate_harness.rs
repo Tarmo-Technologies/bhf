@@ -285,6 +285,51 @@ struct GenerationMetadata<'a> {
     /// harness's arguments ([`harness_gen::arg_layout`]). C and C++ only.
     #[serde(skip_serializing_if = "Option::is_none")]
     arg_layout: Option<&'static str>,
+    /// The `--extra-source` files the harness was generated with (absolute).
+    /// `bhf build` looks in their directories, and in the ones below, for
+    /// the definitions of a failed link's undefined symbols. Absent when none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    extra_sources: Vec<String>,
+    /// The `--extra-include` directories (absolute). Absent when none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    extra_includes: Vec<String>,
+    /// The `--source-root` directories (absolute). Absent when none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    source_roots: Vec<String>,
+}
+
+/// The build inputs given to `generate-harness` beyond the target source,
+/// recorded in `generation-metadata.json`.
+#[derive(Default, Clone, Copy)]
+struct RecordedBuildInputs<'a> {
+    extra_sources: &'a [PathBuf],
+    extra_includes: &'a [PathBuf],
+    source_roots: &'a [PathBuf],
+}
+
+impl<'a> RecordedBuildInputs<'a> {
+    fn of(args: &'a GenerateHarnessArgs) -> Self {
+        Self {
+            extra_sources: &args.extra_sources,
+            extra_includes: &args.extra_includes,
+            source_roots: &args.source_roots,
+        }
+    }
+}
+
+/// `paths` made absolute, for the generation metadata: resolved, without
+/// Windows' `\\?\` prefix, so they read like the paths `bhf build` matches
+/// them against.
+fn absolute_path_strings(paths: &[PathBuf]) -> Vec<String> {
+    paths
+        .iter()
+        .map(|path| {
+            let absolute = absolutize(path).unwrap_or_else(|_| path.clone());
+            crate::workdir::plain_canonical(&absolute)
+                .display()
+                .to_string()
+        })
+        .collect()
 }
 
 fn write_generation_metadata(
@@ -303,12 +348,14 @@ fn write_generation_metadata(
         requested_kind,
         emitted_path,
         None,
+        RecordedBuildInputs::default(),
     )
 }
 
 /// [`write_generation_metadata`] for a C or C++ harness calling
 /// `target_function`; records the harness's `arg-layout.json` when the
-/// generator wrote one.
+/// generator wrote one, and the extra build inputs it was generated with.
+#[allow(clippy::too_many_arguments)]
 fn write_target_generation_metadata(
     output_dir: &Path,
     language: &str,
@@ -317,6 +364,7 @@ fn write_target_generation_metadata(
     requested_kind: &str,
     emitted_path: &str,
     target_function: Option<&str>,
+    inputs: RecordedBuildInputs<'_>,
 ) -> Result<()> {
     let arg_layout = (language != "ada"
         && output_dir
@@ -333,6 +381,9 @@ fn write_target_generation_metadata(
     let metadata = GenerationMetadata {
         target_function,
         arg_layout,
+        extra_sources: absolute_path_strings(inputs.extra_sources),
+        extra_includes: absolute_path_strings(inputs.extra_includes),
+        source_roots: absolute_path_strings(inputs.source_roots),
         schema_version: 1,
         harness_format_version: harness_gen::harness_format_version_for(language),
         buffer_len_dimension,
@@ -3309,6 +3360,7 @@ fn run_c_direct(args: &GenerateHarnessArgs) -> Result<()> {
             "direct"
         },
         Some(&invocation_function.name),
+        RecordedBuildInputs::of(args),
     )?;
     if generation_banner_enabled() {
         println!(
@@ -11245,6 +11297,7 @@ fn run_cpp_direct(args: &GenerateHarnessArgs) -> Result<()> {
         &args.kind,
         emitted_path,
         Some(&target_function),
+        RecordedBuildInputs::of(args),
     )?;
     if generation_banner_enabled() {
         println!(
@@ -19558,6 +19611,69 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         assert_eq!(cov_unit[0], "$(COV_CXX)");
         assert!(cov_unit.contains(&"$(CXX_COMPAT_FLAGS_CLANG)".to_owned()));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The extra sources and include dirs a C or C++ harness was generated
+    /// with are recorded (absolute), so `bhf build` can look in them for the
+    /// definitions of a failed link's undefined symbols.
+    #[test]
+    fn generation_metadata_records_the_extra_build_inputs() {
+        let root = temp_dir("build-inputs");
+        let lib = root.join("lib");
+        fs::create_dir_all(lib.join("include")).unwrap();
+        fs::write(
+            lib.join("table.c"),
+            "int table_store(int v) { return v; }\n",
+        )
+        .unwrap();
+        for (file, id) in [("record.c", "H-INPUTS-C"), ("record.cpp", "H-INPUTS-CPP")] {
+            let source = root.join(file);
+            fs::write(
+                &source,
+                "int table_store(int v);\nint parse_record(unsigned int flags) { return table_store((int)flags); }\n",
+            )
+            .unwrap();
+            run(GenerateHarnessArgs {
+                source: source.clone(),
+                target: Some("parse_record".to_owned()),
+                target_line: None,
+                output: root.join("out"),
+                id: Some(id.to_owned()),
+                kind: "direct".to_owned(),
+                source_roots: Vec::new(),
+                project: None,
+                source_trees: Vec::new(),
+                extra_sources: vec![lib.join("table.c")],
+                extra_includes: vec![lib.join("include")],
+                cleanup: None,
+                template_instantiate: Vec::new(),
+                tree_type_defs: None,
+                decoder_limits: Default::default(),
+                force: false,
+                archive_backed: false,
+                environment: None,
+            })
+            .unwrap();
+            let metadata: serde_json::Value = serde_json::from_str(
+                &fs::read_to_string(root.join("out").join(id).join("generation-metadata.json"))
+                    .unwrap(),
+            )
+            .unwrap();
+            // Resolved, without Windows' `\\?\` prefix.
+            let resolved =
+                |path: &Path| crate::workdir::plain_canonical(path).display().to_string();
+            assert_eq!(
+                metadata["extra_sources"],
+                serde_json::json!([resolved(&lib.join("table.c"))]),
+                "{id}: {metadata}"
+            );
+            assert_eq!(
+                metadata["extra_includes"],
+                serde_json::json!([resolved(&lib.join("include"))]),
+                "{id}: {metadata}"
+            );
+            assert!(metadata.get("source_roots").is_none(), "{id}: {metadata}");
+        }
     }
 
     /// The decode of fuzz input into arguments is versioned, so a corpus or a

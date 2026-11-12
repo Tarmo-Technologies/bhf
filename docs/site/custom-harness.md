@@ -140,7 +140,10 @@ prints what was missing and the exact fix:
 
 - Undefined symbols: the in-tree source files that define them, with the
   `--extra-source` flags to add when regenerating and an `AUTO_EXTRA_SOURCES`
-  command that builds without regenerating.
+  command that builds without regenerating. They are looked for around the
+  target and in the directories of the harness's other sources and include
+  dirs (the `--extra-source`/`--extra-include` paths it was generated with),
+  so the `harness/` + `lib/` layout above works outside a git checkout too.
 - Standard streams used without their header (`cerr`, `cout`, `endl`,
   `std::istream`): an `AUTO_EXTRA_INCLUDES='-include iostream'` command.
 - A member declared with an extra class qualification, which only MSVC

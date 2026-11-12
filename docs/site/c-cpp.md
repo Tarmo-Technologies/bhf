@@ -216,12 +216,25 @@ normalized record is low confidence with a caveat in INDEX.md, findings.csv's
 `build_fidelity` column and `bhf explain`, and `run.json` lists the target's
 `build_fidelity` and counts the targets in `summary.fabricated_build_context`.
 The console summary and `run.md` list them too. Supply the real context (a
-compile database, `--extra-include`, `--define`) and re-run.
+compile database, `--extra-include`, `--define`) and re-run. A type the
+sources use without including its header (`cerr` without `<iostream>`, a
+`uint32_t` without `<stdint.h>`, or a project type the target's includes
+lead to one header for) is resolved by including that real header, which is
+no fabrication: the build keeps full fidelity, the repair record in
+`run.json` carries `resolved_header`, and `run.json`
+`targets[].real_headers_included` and `run.md` list it as
+`type cerr: real header included (<iostream>)`.
 
 `bhf build` compiles exactly the sources the Makefile lists; it has no repair
 loop. When the link fails on symbols defined elsewhere in the tree, it prints
 the defining files with the `--extra-source` flags to regenerate with and an
-`AUTO_EXTRA_SOURCES=... bhf build ...` command that needs no regeneration. It
+`AUTO_EXTRA_SOURCES=... bhf build ...` command that needs no regeneration.
+It looks for them around the target (the enclosing checkout, or the project
+around a `src/`/`lib/` directory) and in the directories of the harness's
+other inputs: every source its Makefile compiles, every include dir it
+searches, and the `--extra-source`/`--extra-include`/`--source-root` paths
+`generation-metadata.json` records, so a harness kept beside its library
+outside a checkout (`harness/` + `lib/`) finds the definer too. It
 also suggests `AUTO_EXTRA_INCLUDES='-include iostream'` for standard streams
 used without their header, and `-fms-extensions` (clang++) or `-fpermissive`
 (g++) for a member declared with an extra class qualification

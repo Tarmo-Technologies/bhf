@@ -281,6 +281,12 @@ struct TargetEntry<'a> {
     /// (omitted) for a build from the real context.
     #[serde(skip_serializing_if = "Option::is_none")]
     build_fidelity: Option<results::model::BuildFidelity>,
+    /// Types the build left undefined that the repairs resolved by including
+    /// their real header (`type cerr: real header included (<iostream>)`).
+    /// Not fabricated, so they do not reduce `build_fidelity`; omitted when
+    /// there are none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    real_headers_included: Vec<String>,
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -1319,6 +1325,14 @@ pub fn write_reports_with_output_limit(
             platform_stub: r.outcome.platform_stub(),
             fidelity: fidelity.clone(),
             build_fidelity: build_fidelity.clone(),
+            real_headers_included: match &r.outcome {
+                Outcome::BuiltAndFuzzed { repairs, .. }
+                | Outcome::BuiltNotEntered { repairs, .. }
+                | Outcome::Built { repairs, .. } => {
+                    crate::auto::build_fidelity::real_headers_included(repairs)
+                }
+                _ => Vec::new(),
+            },
         })
         .collect();
 
@@ -2228,8 +2242,13 @@ fn add_checkpoint_result(
                 RequirementBasis::Observed,
                 Some("BHF synthesized a minimal configuration header".to_owned()),
             ),
-            Repair::TypePlaceholder { type_name } => {
-                if !build_classifier::is_recovery_artifact(type_name)
+            Repair::TypePlaceholder {
+                type_name,
+                resolved_header,
+            } => {
+                // A type resolved to its real header is not a missing dependency.
+                if resolved_header.is_none()
+                    && !build_classifier::is_recovery_artifact(type_name)
                     && !crate::auto::repair::is_synthesized_type_report_noise(type_name)
                 {
                     manifest.push_merge(
@@ -2733,7 +2752,16 @@ fn aggregate_repairs(
             // still linked and executed, so this is not a synthesized dependency
             // or a stub inventory entry.
             Repair::DeclareFunction { .. } => {}
-            Repair::TypePlaceholder { type_name } => {
+            // A real header included for the type is a build adjustment, like a
+            // force-included standard header for a standard symbol.
+            Repair::TypePlaceholder {
+                type_name,
+                resolved_header: Some(header),
+            } => macros
+                .entry(format!("{type_name} -> {header} (real header included)"))
+                .or_default()
+                .push(id.to_owned()),
+            Repair::TypePlaceholder { type_name, .. } => {
                 // A clang recovery-artifact placeholder (`type`/`expression`) is not
                 // a real missing type the maintainer must ship — never report it as a
                 // synthesized_type dependency (#48). Defense in depth: the planner
@@ -3044,6 +3072,32 @@ fn render_md(r: &RunJson<'_>) -> String {
                     t.harness_id,
                     t.name,
                     fidelity.summary()
+                );
+            }
+        }
+    }
+    // Types resolved to their real header were not fabricated; say which, so
+    // a reader sees what bhf added without reading it as a fidelity loss.
+    if r.targets
+        .iter()
+        .any(|t| !t.real_headers_included.is_empty())
+    {
+        let _ = writeln!(s);
+        let _ = writeln!(s, "## Real headers included for undefined types");
+        let _ = writeln!(
+            s,
+            "The sources used these types without including the header that defines \
+             them; bhf included that real header (not a placeholder), so the build \
+             keeps full fidelity."
+        );
+        for t in &r.targets {
+            if !t.real_headers_included.is_empty() {
+                let _ = writeln!(
+                    s,
+                    "  - {} {} — {}",
+                    t.harness_id,
+                    t.name,
+                    t.real_headers_included.join("; ")
                 );
             }
         }
@@ -4865,9 +4919,11 @@ mod tests {
                 repairs: vec![
                     Repair::TypePlaceholder {
                         type_name: "WCHAR".into(),
+                        resolved_header: None,
                     },
                     Repair::TypePlaceholder {
                         type_name: "my_widget_t".into(),
+                        resolved_header: None,
                     },
                 ],
                 retries: 1,

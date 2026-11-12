@@ -46,7 +46,12 @@ pub(crate) fn for_target(repairs: &[Repair], harness_dir: &Path) -> Option<Build
             | Repair::ConfigHeaderSynth { virtual_path } => {
                 push("header", virtual_path, None);
             }
-            Repair::TypePlaceholder { type_name } => {
+            // A real header included for the type is no fabrication.
+            Repair::TypePlaceholder {
+                resolved_header: Some(_),
+                ..
+            } => {}
+            Repair::TypePlaceholder { type_name, .. } => {
                 push("type", type_name, Some("void *".to_owned()));
             }
             Repair::ConfigTypeAlias {
@@ -67,6 +72,27 @@ pub(crate) fn for_target(repairs: &[Repair], harness_dir: &Path) -> Option<Build
         context: build_context_provenance(&harness_dir.join("Makefile")),
         fabricated,
     })
+}
+
+/// The types a build's repairs resolved by including their real header
+/// instead of fabricating them, as `type NAME: real header included
+/// (<header>)` lines: listed beside the build's fidelity, never counted
+/// against it.
+pub(crate) fn real_headers_included(repairs: &[Repair]) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for repair in repairs {
+        if let Repair::TypePlaceholder {
+            type_name,
+            resolved_header: Some(header),
+        } = repair
+        {
+            let line = format!("type {type_name}: real header included ({header})");
+            if !lines.contains(&line) {
+                lines.push(line);
+            }
+        }
+    }
+    lines
 }
 
 /// `NAME -> replacement` for each `#define` in a repair defines file. A
@@ -219,6 +245,7 @@ mod tests {
             },
             Repair::TypePlaceholder {
                 type_name: "widget_ctx".to_owned(),
+                resolved_header: None,
             },
             Repair::StubBlind {
                 symbol: "widget_log".to_owned(),
@@ -253,5 +280,45 @@ mod tests {
         );
         assert_eq!(incomplete_context_headers(&fidelity), vec!["tables.h"]);
         assert!(for_target(&[Repair::StubBlind { symbol: "x".into() }], temp.path()).is_none());
+    }
+
+    /// A type the repair resolved by including its real header (`cerr` from
+    /// `<iostream>`) was not fabricated: it leaves the build at full fidelity
+    /// and is listed as a real header, while a `void *` stand-in still
+    /// reduces it.
+    #[test]
+    fn a_type_resolved_to_its_real_header_is_not_fabricated() {
+        let temp = tempfile::tempdir().unwrap();
+        let resolved = |name: &str, header: &str| Repair::TypePlaceholder {
+            type_name: name.to_owned(),
+            resolved_header: Some(header.to_owned()),
+        };
+        let only_real = [
+            resolved("cerr", "<iostream>"),
+            resolved("istream", "<istream>"),
+        ];
+        assert!(
+            for_target(&only_real, temp.path()).is_none(),
+            "real headers alone keep the build at full fidelity"
+        );
+        assert_eq!(
+            real_headers_included(&only_real),
+            vec![
+                "type cerr: real header included (<iostream>)".to_owned(),
+                "type istream: real header included (<istream>)".to_owned(),
+            ]
+        );
+        let mixed = [
+            resolved("cerr", "<iostream>"),
+            Repair::TypePlaceholder {
+                type_name: "widget_ctx".to_owned(),
+                resolved_header: None,
+            },
+        ];
+        let fidelity = for_target(&mixed, temp.path()).expect("one type was fabricated");
+        assert_eq!(fidelity.level, "reduced");
+        assert_eq!(fidelity.fabricated.len(), 1);
+        assert_eq!(fidelity.fabricated[0].name, "widget_ctx");
+        assert_eq!(fidelity.fabricated[0].value.as_deref(), Some("void *"));
     }
 }
