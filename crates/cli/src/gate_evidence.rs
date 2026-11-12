@@ -24,6 +24,13 @@
 //! enters the target (`bhf_target_enter`), which the driver discards at
 //! entry, and those whose site symbolizes to harness code.
 //!
+//! A harness built for another platform is replayed the way it was fuzzed:
+//! under the emulator `bhf auto` recorded beside it ([`RUNNER_FILE`]), such as
+//! `qemu-aarch64 -L /usr/aarch64-linux-gnu`, which passes the evidence
+//! variable through to the harness. Such a build has no sanitizer runtime to
+//! report its string and buffer comparisons, so bhf links it with
+//! [`COMPARISON_WRAP_LDFLAGS`] and the driver's wrappers report them instead.
+//!
 //! The replays are bounded: one baseline run, at most [`MAX_VERIFY_RUNS`]
 //! verification runs, [`MAX_DERIVED_INPUT`] byte flips and their two
 //! controls, each under [`RUN_TIMEOUT`], and nothing after the caller's
@@ -40,6 +47,62 @@ pub(crate) const EVIDENCE_ENV: &str = "BHF_CMP_EVIDENCE";
 /// The driver records nothing without this string in its binary: a harness
 /// built by an older bhf ignores the variable.
 const DRIVER_MARKER: &[u8] = b"BHF_CMP_EVIDENCE";
+
+/// Link flags that route a harness's own `memcmp`/`bcmp`/`str*cmp` calls
+/// through the driver's wrappers (`__wrap_strcmp`, ...), which report them to
+/// the same hooks a sanitizer's interceptors call. For builds without a
+/// sanitizer runtime, such as a cross build run under an emulator.
+pub(crate) const COMPARISON_WRAP_LDFLAGS: &str = "-Wl,--wrap=memcmp,--wrap=bcmp,--wrap=strcmp,\
+--wrap=strncmp,--wrap=strcasecmp,--wrap=strncasecmp";
+
+/// The file beside a harness binary naming the emulator it runs under, when
+/// `bhf auto` built it for a platform this host cannot run directly.
+pub(crate) const RUNNER_FILE: &str = "bhf_runner.json";
+const RUNNER_SCHEMA: &str = "bhf.harness_runner.v1";
+
+/// The emulator a harness runs under: `<program> <args...> <harness>`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct HarnessRunner {
+    pub(crate) program: PathBuf,
+    #[serde(default)]
+    pub(crate) args: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RunnerRecord {
+    schema: String,
+    #[serde(flatten)]
+    runner: HarnessRunner,
+}
+
+/// Record (or, with `None`, forget) the emulator the harness built in
+/// `harness_dir` runs under, so a later replay of its findings uses it too.
+pub(crate) fn record_runner(
+    harness_dir: &Path,
+    runner: Option<&HarnessRunner>,
+) -> std::io::Result<()> {
+    let path = harness_dir.join(RUNNER_FILE);
+    match runner {
+        Some(runner) => {
+            let record = RunnerRecord {
+                schema: RUNNER_SCHEMA.to_owned(),
+                runner: runner.clone(),
+            };
+            std::fs::write(path, serde_json::to_vec_pretty(&record)?)
+        }
+        None => match std::fs::remove_file(path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        },
+    }
+}
+
+/// The emulator recorded beside `harness`, if any.
+pub(crate) fn recorded_runner(harness: &Path) -> Option<HarnessRunner> {
+    let bytes = std::fs::read(harness.parent()?.join(RUNNER_FILE)).ok()?;
+    let record: RunnerRecord = serde_json::from_slice(&bytes).ok()?;
+    (record.schema == RUNNER_SCHEMA).then_some(record.runner)
+}
 
 const MAGIC: u32 = 0x4546_4842;
 const VERSION: u32 = 1;
@@ -305,6 +368,10 @@ pub(crate) struct CaptureSummary {
     /// The baseline replay ran with the runtrace shim, so `runtrace.jsonl` in
     /// the finding dir lists this input's own environment use.
     pub(crate) shim_armed: bool,
+    /// The emulator the replays ran under (`qemu-aarch64`), for a harness
+    /// built for another platform.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) runner: Option<String>,
 }
 
 /// A finished capture.
@@ -328,6 +395,7 @@ impl Capture {
                 unconfirmed: 0,
                 runs: 0,
                 shim_armed: false,
+                runner: None,
             },
         }
     }
@@ -462,6 +530,7 @@ fn capture_in(
         unconfirmed: 0,
         runs: 0,
         shim_armed: runner.shim_armed,
+        runner: runner.emulator_label(),
     };
     let mut gates = Vec::new();
     if input.is_empty() {
@@ -1094,6 +1163,8 @@ struct Runner<'a> {
     shim_armed: bool,
     /// Sites in the harness's own code, dropped from every run's records.
     excluded: BTreeSet<u32>,
+    /// The emulator the harness runs under, recorded beside it.
+    emulator: Option<HarnessRunner>,
 }
 
 impl<'a> Runner<'a> {
@@ -1103,7 +1174,15 @@ impl<'a> Runner<'a> {
             runs: 0,
             shim_armed: false,
             excluded: BTreeSet::new(),
+            emulator: recorded_runner(replay.harness),
         }
+    }
+
+    /// The emulator's program name, for the capture summary.
+    fn emulator_label(&self) -> Option<String> {
+        self.emulator
+            .as_ref()
+            .map(|runner| runner.program.display().to_string())
     }
 
     /// Whether another replay fits under `limit` runs in all and the deadline.
@@ -1121,7 +1200,16 @@ impl<'a> Runner<'a> {
         std::fs::write(&input_path, input)
             .map_err(|error| format!("write {}: {error}", input_path.display()))?;
         let _ = std::fs::remove_file(&evidence);
-        let mut command = std::process::Command::new(self.replay.harness);
+        // A foreign harness runs under its emulator, which hands the guest
+        // the environment set here (the evidence file among it).
+        let mut command = match &self.emulator {
+            Some(runner) => {
+                let mut command = std::process::Command::new(&runner.program);
+                command.args(&runner.args).arg(self.replay.harness);
+                command
+            }
+            None => std::process::Command::new(self.replay.harness),
+        };
         command
             .arg(&input_path)
             .stdin(std::process::Stdio::null())
@@ -1139,7 +1227,9 @@ impl<'a> Runner<'a> {
         }
         command.env_remove("LD_PRELOAD");
         command.env_remove("BHF_RUNTRACE_LOG");
-        if baseline {
+        // The runtrace shim is a host library: it cannot load into a
+        // harness that runs under an emulator.
+        if baseline && self.emulator.is_none() {
             if let Some(log) = &self.replay.runtrace_log {
                 // A log from an earlier capture would not describe this run.
                 let _ = std::fs::remove_file(log);
@@ -1154,9 +1244,14 @@ impl<'a> Runner<'a> {
                 }
             }
         }
-        let mut child = command
-            .spawn()
-            .map_err(|error| format!("cannot run {}: {error}", self.replay.harness.display()))?;
+        let mut child = command.spawn().map_err(|error| match &self.emulator {
+            Some(runner) => format!(
+                "cannot run {} under {}: {error}",
+                self.replay.harness.display(),
+                runner.program.display()
+            ),
+            None => format!("cannot run {}: {error}", self.replay.harness.display()),
+        })?;
         let started = Instant::now();
         let limit = RUN_TIMEOUT.min(
             self.replay
@@ -1315,35 +1410,83 @@ fn find_symbolizer() -> Option<PathBuf> {
 
 /// The link-time address the driver's `__executable_start` corresponds to:
 /// 0 for a position-independent executable, the first loadable segment's
-/// address otherwise. ELF64 little-endian only.
+/// address otherwise. ELF32 and ELF64, either byte order, so a harness built
+/// for another architecture is symbolized too.
 fn elf_link_base(path: &Path) -> Option<u64> {
     use std::io::Read;
     let mut header = vec![0u8; 4096];
     let mut file = std::fs::File::open(path).ok()?;
     let read = file.read(&mut header).ok()?;
     header.truncate(read);
-    if header.get(..4)? != b"\x7fELF" || header.get(4)? != &2 || header.get(5)? != &1 {
+    if header.get(..4)? != b"\x7fELF" {
         return None;
     }
+    let wide = match header.get(4)? {
+        1 => false,
+        2 => true,
+        _ => return None,
+    };
+    let big = match header.get(5)? {
+        1 => false,
+        2 => true,
+        _ => return None,
+    };
+    let bytes_at = |at: usize, len: usize| header.get(at..at + len);
     let u16_at = |at: usize| -> Option<u16> {
-        Some(u16::from_le_bytes(header.get(at..at + 2)?.try_into().ok()?))
+        let raw: [u8; 2] = bytes_at(at, 2)?.try_into().ok()?;
+        Some(if big {
+            u16::from_be_bytes(raw)
+        } else {
+            u16::from_le_bytes(raw)
+        })
+    };
+    let u32_at = |at: usize| -> Option<u32> {
+        let raw: [u8; 4] = bytes_at(at, 4)?.try_into().ok()?;
+        Some(if big {
+            u32::from_be_bytes(raw)
+        } else {
+            u32::from_le_bytes(raw)
+        })
     };
     let u64_at = |at: usize| -> Option<u64> {
-        Some(u64::from_le_bytes(header.get(at..at + 8)?.try_into().ok()?))
+        let raw: [u8; 8] = bytes_at(at, 8)?.try_into().ok()?;
+        Some(if big {
+            u64::from_be_bytes(raw)
+        } else {
+            u64::from_le_bytes(raw)
+        })
     };
     match u16_at(16)? {
         3 => return Some(0),
         2 => {}
         _ => return None,
     }
-    let phoff = usize::try_from(u64_at(32)?).ok()?;
-    let phentsize = usize::from(u16_at(54)?);
-    let phnum = usize::from(u16_at(56)?);
-    (0..phnum)
+    // (e_phoff, e_phentsize, e_phnum) and each entry's p_vaddr.
+    let (phoff, phentsize, phnum, vaddr_at) = if wide {
+        (
+            usize::try_from(u64_at(32)?).ok()?,
+            u16_at(54)?,
+            u16_at(56)?,
+            16,
+        )
+    } else {
+        (
+            usize::try_from(u32_at(28)?).ok()?,
+            u16_at(42)?,
+            u16_at(44)?,
+            8,
+        )
+    };
+    (0..usize::from(phnum))
         .filter_map(|index| {
-            let at = phoff + index * phentsize;
-            let kind = u32::from_le_bytes(header.get(at..at + 4)?.try_into().ok()?);
-            (kind == 1).then(|| u64_at(at + 16)).flatten()
+            let at = phoff + index * usize::from(phentsize);
+            let loadable = u32_at(at)? == 1;
+            let vaddr = if wide {
+                u64_at(at + vaddr_at)?
+            } else {
+                u64::from(u32_at(at + vaddr_at)?)
+            };
+            loadable.then_some(vaddr)
         })
         .min()
 }
@@ -1683,6 +1826,7 @@ mod tests {
                 unconfirmed: 0,
                 runs: 2,
                 shim_armed: false,
+                runner: Some("qemu-aarch64".to_owned()),
             },
         };
         let (gates, summary) = record_fields(&capture);
@@ -1936,6 +2080,103 @@ int bhf_run_one(const uint8_t *data, size_t size) {
             "{:?}",
             capture.gates
         );
+    }
+
+    /// A harness cross-built for another architecture, the way a cross sweep
+    /// builds it (GCC `trace-pc,trace-cmp`, no sanitizer runtime, the
+    /// comparison wrappers linked in), is replayed under the emulator recorded
+    /// beside it, and its `strcmp` gate is recorded and symbolized.
+    #[test]
+    fn a_cross_built_harness_records_its_strcmp_gate_under_its_emulator() {
+        let driver = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../c_runtime/bhf_driver.c");
+        let lanes = [
+            (
+                "aarch64-linux-gnu-gcc",
+                "qemu-aarch64",
+                "/usr/aarch64-linux-gnu",
+            ),
+            (
+                "arm-linux-gnueabihf-gcc",
+                "qemu-arm",
+                "/usr/arm-linux-gnueabihf",
+            ),
+        ];
+        for (cc, emulator, sysroot) in lanes {
+            if which::which(cc).is_err()
+                || which::which(emulator).is_err()
+                || !Path::new(sysroot).is_dir()
+            {
+                eprintln!("skipping: {cc}/{emulator}/{sysroot} not installed");
+                continue;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("target.c"), TARGET).unwrap();
+            let run = |args: &[&str]| {
+                let output = Command::new(cc)
+                    .current_dir(dir.path())
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{cc} {args:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            };
+            run(&[
+                "-O1",
+                "-g",
+                "-fsanitize-coverage=trace-pc,trace-cmp",
+                "-c",
+                "target.c",
+                "-o",
+                "target.o",
+            ]);
+            run(&[
+                "-O1",
+                "-g",
+                "-c",
+                driver.to_str().unwrap(),
+                "-o",
+                "driver.o",
+            ]);
+            run(&[
+                COMPARISON_WRAP_LDFLAGS,
+                "target.o",
+                "driver.o",
+                "-o",
+                "main",
+            ]);
+            let main = dir.path().join("main");
+            let runner = HarnessRunner {
+                program: PathBuf::from(emulator),
+                args: vec!["-L".to_owned(), sysroot.to_owned()],
+            };
+            record_runner(dir.path(), Some(&runner)).unwrap();
+            assert_eq!(recorded_runner(&main), Some(runner));
+
+            let capture = capture_for(&main, dir.path(), b"\x05\x00WIDGET");
+            assert_eq!(capture.summary.status, "recorded", "{cc}: {capture:?}");
+            assert_eq!(capture.summary.runner.as_deref(), Some(emulator));
+            assert!(!capture.summary.shim_armed, "no host shim in a guest");
+            let gate = capture
+                .gates
+                .iter()
+                .find(|g| g.cmp_kind == "strcmp")
+                .unwrap_or_else(|| panic!("{cc}: no strcmp evidence: {capture:?}"));
+            assert_eq!((gate.offset, gate.len), (2, 6), "{cc}: {gate:?}");
+            assert_eq!(gate.operand_hex, hex(b"WIDGET"));
+            assert!(gate.operands_equal);
+            if find_symbolizer().is_some() {
+                let location = gate.location.as_ref().expect("symbolized site");
+                assert_eq!(location.function.as_deref(), Some("parse_record"), "{cc}");
+            }
+
+            // Forgetting the runner leaves a native harness alone.
+            record_runner(dir.path(), None).unwrap();
+            assert_eq!(recorded_runner(&main), None);
+            record_runner(dir.path(), None).unwrap();
+        }
     }
 
     #[test]

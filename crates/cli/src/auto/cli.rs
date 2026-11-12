@@ -123,7 +123,11 @@ pub struct AutoArgs {
     /// --ldflags, --define, --toolchain-include, --sysroot, --target-triple,
     /// --runner, --runner-arg, --ada-*, --probe-backend) are keys of a
     /// `[toolchain]` / `[toolchain.ada]` table, the same table `bhf build --config`
-    /// reads. Any other key is an error.
+    /// reads. `[cross.<lane>]` tables (lanes mingw, aarch64, armhf, ppc64le, ppc64,
+    /// ppc, mipsel, mips, sparc64; keys cc, cxx, target, sysroot, runner,
+    /// runner-args) override the toolchain and emulator of a guard-driven cross
+    /// lane; like `[toolchain]`, they need this explicit flag. Any other key is an
+    /// error.
     #[arg(long = "config", value_name = "PATH")]
     pub config: Option<PathBuf>,
 
@@ -131,6 +135,10 @@ pub struct AutoArgs {
     /// toolchain flags before the sweep starts.
     #[arg(skip)]
     pub(crate) config_toolchain: Option<config::ToolchainConfig>,
+
+    /// The `[cross.<guard>]` tables of an explicit `--config`.
+    #[arg(skip)]
+    pub(crate) config_cross: Option<config::CrossConfig>,
 
     #[command(flatten)]
     pub(crate) toolchain: crate::toolchain::AutoToolchainArgs,
@@ -953,6 +961,51 @@ fn resolve_license_profile() -> config::Profile {
         .unwrap_or(config::Profile::ExternalTools)
 }
 
+/// Rebuild the build probe's archives for the cross sweep's `target` (see
+/// [`crate::auto::build_probe::rebuild_probe_archives`]), saying which were
+/// rebuilt and exactly why any could not be, and return the ones the sweep's
+/// harnesses link: the rebuilt ones and those already built for the target.
+fn rebuild_probe_archives_for_sweep(
+    tree: &Path,
+    work: &Path,
+    target: &crate::auto::cross_target::CrossTarget,
+    toolchain: &config::ToolchainConfig,
+) -> Vec<PathBuf> {
+    let archive_toolchain = crate::auto::attempt::cross_archive_toolchain(target, toolchain);
+    let report = crate::auto::build_probe::rebuild_probe_archives(
+        tree,
+        &archive_toolchain,
+        &work.join("auto").join("probe-archives"),
+    );
+    for archive in &report.rebuilt {
+        bhfeprintln!(
+            "bhf auto: rebuilt probe archive {} for {} with {}",
+            archive.display(),
+            target.triple,
+            target.cc
+        );
+    }
+    for archive in &report.already_for_target {
+        bhfeprintln!(
+            "bhf auto: probe archive {} is already built for {}; linked as it is",
+            archive.display(),
+            target.triple
+        );
+    }
+    for (archive, reason) in &report.failed {
+        bhfeprintln!(
+            "bhf auto: note: probe archive {} is not linked into the {} harnesses: it could \
+             not be rebuilt for the target because {reason}; their targets are built from \
+             their sources",
+            archive.display(),
+            target.triple
+        );
+    }
+    let mut linked = report.rebuilt;
+    linked.extend(report.already_for_target);
+    linked
+}
+
 /// Detect a CUSTOM build entry point in the tree root that bhf does NOT auto-probe
 /// (a bare build.sh, autotools, SCons, Waf, Bazel), returning `(marker, suggested
 /// --build-command value)`. CMake/Make/Meson are intentionally excluded — those are
@@ -1137,6 +1190,25 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     }
     let cross_sweep = crate::toolchain::cross_sweep_target(&toolchain)
         .map_err(|error| anyhow::anyhow!("{error}"))?;
+    // The guard-driven cross lanes: an explicit --config's [cross.<guard>]
+    // tables replace bhf's built-in compilers, sysroot and emulator for the
+    // lanes they name. Installed before anything resolves a guard (the
+    // dependency scan, every attempt), and replaced on every run.
+    let cross_overrides = crate::auto::cross_target::CrossOverrides::from_config(
+        args.config_cross.take().unwrap_or_default(),
+    )
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
+    for line in cross_overrides.describe() {
+        bhfeprintln!("bhf auto: {line}");
+    }
+    if let (Some(target), false) = (&cross_sweep, cross_overrides.is_empty()) {
+        bhfeprintln!(
+            "bhf auto: note: the cross sweep builds every C/C++ candidate for {}, so the \
+             [cross.*] tables, which apply to guarded candidates, are not used",
+            target.triple
+        );
+    }
+    crate::auto::cross_target::install_overrides(cross_overrides);
     if let Some(target) = &cross_sweep {
         bhfeprintln!(
             "bhf auto: cross sweep: building every C/C++ candidate for {} with {} / {} and \
@@ -1228,8 +1300,8 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     if probe_requested && cross_sweep.is_some() {
         bhfeprintln!(
             "bhf auto: note: the project's build runs for this host; its compile database and \
-             generated headers apply to the cross sweep, but the archives it builds are not \
-             linked into the cross-built harnesses (each target is built from its sources)"
+             generated headers apply to the cross sweep, and the archives it builds are \
+             rebuilt for the target before they are linked"
         );
     }
 
@@ -1292,6 +1364,13 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
             crate::auto::build_probe::probe_ada_build(&path, sandbox.as_deref());
         }
     }
+    // The probe built its archives for this host. A cross sweep rebuilds each
+    // one for its target from the captured compile commands, so the
+    // cross-built harnesses link the project's library code too.
+    let cross_probe_archives = match (&cross_sweep, probe_requested) {
+        (Some(target), true) => rebuild_probe_archives_for_sweep(&path, &work, target, &toolchain),
+        _ => Vec::new(),
+    };
 
     // A build probe can produce exact missing-package/tool diagnostics and can
     // also satisfy generated-output declarations. Refresh and checkpoint both
@@ -1856,7 +1935,10 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         // §27.11: CLI-configured C/C++ decoder caps, threaded to harness gen.
         decoder_limits: args.decoder_limits.clone(),
         force: args.force,
-        cross_sweep,
+        cross_sweep: cross_sweep.map(|target| crate::auto::attempt::CrossSweep {
+            target,
+            probe_archives: cross_probe_archives,
+        }),
         ada_toolchain,
     };
     // #6: the fully-ranked candidate count BEFORE any --max-targets / campaign
@@ -5170,6 +5252,53 @@ fn build_error_brief(err: &build_classifier::BuildErrorKind) -> String {
 mod tests {
     use super::*;
 
+    /// A probe archive that is already built for the sweep's target is linked
+    /// as it is: it is handed to the sweep's harnesses with the rebuilt ones,
+    /// not left to the undefined-symbol fallback.
+    #[test]
+    fn a_probe_archive_already_for_the_target_reaches_the_sweep() {
+        let cross = "aarch64-linux-gnu-gcc";
+        if which::which(cross).is_err() || which::which("ar").is_err() {
+            eprintln!("skip: {cross}/ar unavailable");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let tree = tmp.path().join("src");
+        let probe = tree.join(crate::auto::build_probe::PROBE_DIR);
+        std::fs::create_dir_all(&probe).unwrap();
+        std::fs::write(
+            tree.join("util.c"),
+            "int widget_scale(int v) { return v * 3; }\n",
+        )
+        .unwrap();
+        let object = probe.join("util.o");
+        assert!(std::process::Command::new(cross)
+            .arg("-c")
+            .arg(tree.join("util.c"))
+            .arg("-o")
+            .arg(&object)
+            .status()
+            .unwrap()
+            .success());
+        let archive = probe.join("libwidget.a");
+        assert!(std::process::Command::new("ar")
+            .arg("rcs")
+            .arg(&archive)
+            .arg(&object)
+            .status()
+            .unwrap()
+            .success());
+        let target = crate::auto::cross_target::resolve_cross_target("aarch64").unwrap();
+        let work = tmp.path().join("work");
+        let linked = rebuild_probe_archives_for_sweep(
+            &tree,
+            &work,
+            &target,
+            &config::ToolchainConfig::default(),
+        );
+        assert_eq!(linked, vec![archive]);
+    }
+
     #[test]
     fn explicit_sanitizer_policy_controls_post_campaign_replays() {
         use multicore_fuzz::{Sanitizer, SanitizerSelection};
@@ -6466,6 +6595,7 @@ mod tests {
                     executions: 127,
                     target_entry_observed: false,
                     coverage_edges: 0,
+                    coverage_instrumentation: None,
                     elapsed_secs: 1.0,
                     executions_per_sec: 127.0,
                     findings: vec![],
@@ -6476,6 +6606,7 @@ mod tests {
                     executions: 112,
                     target_entry_observed: false,
                     coverage_edges: 0,
+                    coverage_instrumentation: None,
                     elapsed_secs: 1.0,
                     executions_per_sec: 112.0,
                     findings: vec!["F-0001".to_owned()],
@@ -6564,6 +6695,7 @@ mod tests {
                         executions: 1,
                         target_entry_observed: false,
                         coverage_edges: 0,
+                        coverage_instrumentation: None,
                         elapsed_secs: 0.5,
                         executions_per_sec: 2.0,
                         findings: vec!["F-0001".to_owned(), "F-0002".to_owned()],
@@ -6690,6 +6822,7 @@ mod tests {
                     executions: 100,
                     target_entry_observed: false,
                     coverage_edges: 3,
+                    coverage_instrumentation: None,
                     elapsed_secs: 0.5,
                     executions_per_sec: 200.0,
                     // A crash produced WITHOUT target entry — a decode/stub

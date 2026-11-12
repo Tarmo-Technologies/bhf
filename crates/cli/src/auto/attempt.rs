@@ -245,10 +245,21 @@ pub struct AttemptOptions {
     /// candidate is built for it with coverage and fuzzed under its runner,
     /// whatever its `foreign_guard`. `None` keeps the host build and the
     /// guard-driven foreign lane.
-    pub cross_sweep: Option<CrossTarget>,
+    pub cross_sweep: Option<CrossSweep>,
     /// The Ada toolchain (`[toolchain.ada]`, `--ada-*`, `--probe-backend`)
     /// every Ada harness build uses.
     pub ada_toolchain: crate::toolchain::AdaBuildSettings,
+}
+
+/// A whole-sweep cross target and what the run prepared for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrossSweep {
+    pub target: CrossTarget,
+    /// The build probe's archives rebuilt for `target`
+    /// ([`crate::auto::build_probe::rebuild_probe_archives`]), and those it
+    /// built for `target` already, which its harnesses link in place of the
+    /// probe's host archives.
+    pub probe_archives: Vec<PathBuf>,
 }
 
 impl Default for AttemptOptions {
@@ -535,6 +546,11 @@ pub struct PassRun {
     /// driver harnesses carry one today).
     #[serde(default)]
     pub coverage_edges: usize,
+    /// The instrumentation that fed the edge map, from the harness binary
+    /// (`sancov-trace-pc-guard` for clang, `sancov-trace-pc` for GCC, ...).
+    /// Absent when the pass ran without an edge map.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage_instrumentation: Option<String>,
     /// #405: actual wall-clock seconds the engine spent fuzzing this pass — the
     /// measured run time, NOT the budget (`per_pass_budget_secs`); a pass can
     /// finish early or lose time to setup. 0.0 only when no time was measured.
@@ -2843,9 +2859,13 @@ fn run_attempt(
         _ if is_prebuilt => ForeignStrategy::Native,
         // A whole-sweep cross target: the operator chose the platform, so every
         // C/C++ candidate is built for it, guarded or not.
-        _ if candidate_is_c_family && options.cross_sweep.is_some() => {
-            ForeignStrategy::Cross(options.cross_sweep.clone().expect("checked above"))
-        }
+        _ if candidate_is_c_family && options.cross_sweep.is_some() => ForeignStrategy::Cross(
+            options
+                .cross_sweep
+                .as_ref()
+                .map(|sweep| sweep.target.clone())
+                .expect("checked above"),
+        ),
         // An Ada toolchain the operator configured for a target decides the
         // platform for Ada candidates too; the guard no longer skips them.
         Some(_) if candidate_is_ada && options.ada_toolchain.effective_target().is_some() => {
@@ -2912,9 +2932,10 @@ fn run_attempt(
         crate::auto::candidate::Lang::C | crate::auto::candidate::Lang::Cpp
     );
     // A cross build links only archives built for its own target. A build
-    // probe's archives are always built for this host, and a project's own
-    // archives are kept only when their objects are for the target's
-    // architecture, so neither fails the link "in wrong format".
+    // probe's archives are built for this host; a cross sweep links the ones
+    // rebuilt for its target instead, and a project's own archives are kept
+    // only when their objects are for the target's architecture, so none fails
+    // the link "in wrong format".
     let cross_triple = match &strategy {
         ForeignStrategy::Cross(target) => Some(target.triple.as_str()),
         ForeignStrategy::Native | ForeignStrategy::StubIsolated(_) => None,
@@ -2932,10 +2953,27 @@ fn run_attempt(
     };
     let library_archive_symbols =
         crate::auto::build_probe::index_static_library_symbols(&library_archives);
-    let compatible_probe_archives = if is_c_family && cross_triple.is_none() {
-        crate::auto::build_probe::compatible_probe_static_libraries(&tree_root, &options.sanitizers)
-    } else {
-        Vec::new()
+    let compatible_probe_archives = match &strategy {
+        _ if !is_c_family => Vec::new(),
+        ForeignStrategy::Cross(target)
+            if options
+                .cross_sweep
+                .as_ref()
+                .is_some_and(|sweep| sweep.target == *target) =>
+        {
+            options
+                .cross_sweep
+                .as_ref()
+                .map(|sweep| sweep.probe_archives.clone())
+                .unwrap_or_default()
+        }
+        ForeignStrategy::Cross(_) => Vec::new(),
+        ForeignStrategy::Native | ForeignStrategy::StubIsolated(_) => {
+            crate::auto::build_probe::compatible_probe_static_libraries(
+                &tree_root,
+                &options.sanitizers,
+            )
+        }
     };
     let compatible_probe_index =
         crate::auto::build_probe::index_static_library_symbols(&compatible_probe_archives);
@@ -3181,6 +3219,18 @@ fn run_attempt(
             round,
         ) {
             BuildOutcome::Success => {
+                // Record the emulator this harness runs under beside it (or
+                // forget a stale one), so the replays after fuzzing, such as the
+                // comparison-evidence capture, run it the way the fuzzer did.
+                if let Err(error) = crate::gate_evidence::record_runner(
+                    &harness_dir,
+                    cross_runner.as_ref().map(harness_runner_record).as_ref(),
+                ) {
+                    bhfeprintln!(
+                        "bhf auto: warning: {}: could not record its emulator: {error}",
+                        candidate.harness_id
+                    );
+                }
                 if matches!(
                     candidate.lang,
                     crate::auto::candidate::Lang::C | crate::auto::candidate::Lang::Cpp
@@ -3437,6 +3487,7 @@ fn run_attempt(
                         executions: summary.executions,
                         target_entry_observed: summary.target_entry_observed,
                         coverage_edges: summary.coverage.edges,
+                        coverage_instrumentation: summary.coverage.instrumentation(),
                         // #405: the engine's own measured fuzz wall (excludes
                         // build/repair/reseed), carried up so run.json and
                         // fuzz_runs/<hid>-*.json report the same throughput.
@@ -3567,6 +3618,7 @@ fn run_attempt(
                                     executions: summary.executions,
                                     target_entry_observed: summary.target_entry_observed,
                                     coverage_edges: summary.coverage.edges,
+                                    coverage_instrumentation: summary.coverage.instrumentation(),
                                     elapsed_secs: summary.elapsed_secs,
                                     executions_per_sec: summary.executions_per_sec,
                                     findings: summary.findings.clone(),
@@ -6892,46 +6944,59 @@ fn apply_platform_stub(
 
 /// Cross compiler + replacement flags for a foreign build. The native harness
 /// Makefile bakes clang's `-fsanitize-coverage=trace-pc-guard,trace-cmp` and
-/// `-fsanitize=address,undefined` into `CFLAGS`/`CXXFLAGS`. The cross GCCs reject
-/// `trace-pc-guard` outright, so an arch (qemu-user) build drops coverage + ASan
-/// entirely and compiles plain `-O1 -g` — the harness still runs and hard crashes
-/// (SIGSEGV / SIGABRT) are still caught, just without coverage or ASan.
+/// `-fsanitize=address,undefined` into `CFLAGS`/`CXXFLAGS`, which a cross build
+/// replaces: ASan does not survive qemu-user and mingw has no runtime for it,
+/// so the build is `-O1 -g` plus the coverage the cross compiler accepts. The
+/// harness still runs and hard crashes (SIGSEGV / SIGABRT) are still caught.
 ///
-/// A Windows (mingw + wine) build does better: mingw-w64 gcc DOES accept
-/// `trace-pc` + `trace-cmp` (just not the guard variant), so we arm them — the
-/// Windows driver implements the guard-less `__sanitizer_cov_trace_pc` hook and
-/// the cmplog operand hooks, giving real coverage-guided, input-to-state fuzzing
-/// under wine. ASan still has no mingw runtime, so memory bugs surface via the
-/// driver's vectored exception handler (a fault → distinctive crash exit) rather
-/// than ASan shadow checks.
+/// A Windows (mingw + wine) build arms `trace-pc` + `trace-cmp` (mingw-w64 gcc
+/// has no guard variant): the Windows driver implements the guard-less
+/// `__sanitizer_cov_trace_pc` hook and the cmplog operand hooks, giving real
+/// coverage-guided, input-to-state fuzzing under wine. Memory bugs surface via
+/// the driver's vectored exception handler (a fault -> distinctive crash exit)
+/// rather than ASan shadow checks.
 fn cross_compiler_override(target: &CrossTarget) -> crate::build::CFamilyCompilerOverride {
-    cross_compiler_override_with(target, cached_compiler_accepts_flag)
+    cross_compiler_override_with(
+        target,
+        cached_compiler_accepts_flag,
+        compiler_links_with_flags,
+    )
 }
 
-/// [`cross_compiler_override`] with the flag probe injected.
+/// [`cross_compiler_override`] with the flag probes injected: `accepts`
+/// compiles with a flag, `links` links a program with a set of flags.
 ///
 /// An emulated Linux build (qemu-user, or an operator's runner) arms coverage
 /// too when the cross compiler accepts it: GCC's `trace-pc` + `trace-cmp`
 /// (clang's `trace-pc-guard` for a clang cross build), whose callbacks the
 /// driver implements, so the emulated harness is fuzzed coverage-guided with
-/// input-to-state comparison hooks instead of blind. ASan stays off: its shadow memory
-/// does not survive qemu-user.
+/// input-to-state comparison hooks instead of blind. With no sanitizer runtime
+/// to intercept `strcmp`/`memcmp`, the harness is also linked with the driver's
+/// comparison wrappers ([`crate::gate_evidence::COMPARISON_WRAP_LDFLAGS`]), so
+/// string and buffer gates reach the same hooks: the fuzzer's comparison log
+/// and a finding's comparison evidence.
+///
+/// A guard-driven lane selects its target in every compile and link, bhf's
+/// driver object included, through the override's target flags: its
+/// `[cross.<guard>]` sysroot, and `--target=<triple>` for a clang compiler.
 fn cross_compiler_override_with(
     target: &CrossTarget,
     accepts: impl Fn(&str, &str) -> bool,
+    links: impl Fn(&str, &[String]) -> bool,
 ) -> crate::build::CFamilyCompilerOverride {
+    use harness_gen::compiler_family::CompilerFamily;
     let mut cflags = vec!["-O1".to_owned(), "-g".to_owned()];
     let mut cxxflags = vec!["-O1".to_owned(), "-g".to_owned(), "-std=gnu++17".to_owned()];
-    if !matches!(target.runner, CrossRunner::Wine { .. }) {
-        let family = crate::toolchain::compiler_family(&target.cc, false)
-            .unwrap_or(harness_gen::compiler_family::CompilerFamily::Gcc);
-        let coverage = family.coverage_flag();
-        if accepts(&target.cc, coverage) {
-            cflags.push(coverage.to_owned());
-            cxxflags.push(coverage.to_owned());
-        }
-    }
-    if matches!(target.runner, CrossRunner::Wine { .. }) {
+    let family = crate::toolchain::compiler_family(&target.cc, false);
+    let clang = family == Some(CompilerFamily::Clang);
+    // Rendered for the Makefile recipe the flags land in; the probes below
+    // run the compiler directly and take the path as it is.
+    let target_flags = target.guard_lane.then(|| {
+        use harness_gen::build_safety::{make_path, recipe_path};
+        target.target_args(clang, |path| recipe_path(&make_path(path)))
+    });
+    let target_args = target.target_args(clang, |path| path.display().to_string());
+    if target.is_windows() {
         let coverage = "-fsanitize-coverage=trace-pc,trace-cmp".to_owned();
         cflags.push(coverage.clone());
         cxxflags.push(coverage);
@@ -6941,6 +7006,26 @@ fn cross_compiler_override_with(
         // start under wine with STATUS_DLL_NOT_FOUND and never fuzzes.
         cflags.push("-static".to_owned());
         cxxflags.push("-static".to_owned());
+    } else {
+        let coverage = family.unwrap_or(CompilerFamily::Gcc).coverage_flag();
+        if accepts(&target.cc, coverage) {
+            cflags.push(coverage.to_owned());
+            cxxflags.push(coverage.to_owned());
+            // clang links its sanitizer runtime for coverage alone, and none
+            // is installed for a foreign target; the driver defines the hooks.
+            let no_runtime = "-fno-sanitize-link-runtime";
+            if clang && accepts(&target.cc, no_runtime) {
+                cflags.push(no_runtime.to_owned());
+                cxxflags.push(no_runtime.to_owned());
+            }
+        }
+        let wrap = crate::gate_evidence::COMPARISON_WRAP_LDFLAGS.to_owned();
+        let mut probe = target_args.clone();
+        probe.push(wrap.clone());
+        if links(&target.cc, &probe) {
+            cflags.push(wrap.clone());
+            cxxflags.push(wrap);
+        }
     }
     // HDF-2: opt-in compiler-assisted guards for a cross/embedded build where the
     // full ASan runtime cannot cross-compile/link. Each guard is trap-based, so a
@@ -6961,6 +7046,51 @@ fn cross_compiler_override_with(
         cxx: target.cxx.clone(),
         cflags,
         cxxflags,
+        target_flags,
+    }
+}
+
+/// The toolchain a cross sweep rebuilds the build probe's archives with: the
+/// target's compilers, the code-generation flags of its harness builds
+/// (coverage, opt-in guards, sysroot), the toolchain's own compile flags, and
+/// none of the link-only ones.
+pub(crate) fn cross_archive_toolchain(
+    target: &CrossTarget,
+    toolchain: &config::ToolchainConfig,
+) -> crate::auto::build_probe::ArchiveToolchain {
+    let harness = cross_compiler_override(target);
+    let codegen = |flags: &[String]| -> Vec<String> {
+        flags
+            .iter()
+            .filter(|flag| {
+                !matches!(
+                    flag.as_str(),
+                    "-O1" | "-g" | "-static" | "-fno-sanitize-link-runtime"
+                ) && !flag.starts_with("-std=")
+                    && !flag.starts_with("-Wl,")
+            })
+            .cloned()
+            .collect()
+    };
+    let family = crate::toolchain::compiler_family(&target.cc, false);
+    let clang = family == Some(harness_gen::compiler_family::CompilerFamily::Clang);
+    let flags_for = |cpp: bool, harness_flags: &[String]| {
+        let mut flags: Vec<String> = ["-O1", "-g", "-ffunction-sections", "-fdata-sections"]
+            .map(str::to_owned)
+            .to_vec();
+        flags.extend(target.target_args(clang, |path| path.display().to_string()));
+        flags.extend(codegen(harness_flags));
+        flags.extend(crate::toolchain::compile_args(toolchain, family, cpp));
+        // The project's own -Werror must not fail bhf's rebuild.
+        flags.push("-Wno-error".to_owned());
+        flags
+    };
+    crate::auto::build_probe::ArchiveToolchain {
+        triple: target.triple.clone(),
+        cc: target.cc.clone(),
+        cxx: target.cxx.clone(),
+        c_flags: flags_for(false, &harness.cflags),
+        cxx_flags: flags_for(true, &harness.cxxflags),
     }
 }
 
@@ -7163,11 +7293,17 @@ fn announce_once(note: &str) {
 /// sanitizer needs its runtime library, which only the link proves).
 /// Remembered per compiler and flag for the run.
 fn compiler_links_with_flag(compiler: &str, flag: &str) -> bool {
+    compiler_links_with_flags(compiler, &[flag.to_owned()])
+}
+
+/// [`compiler_links_with_flag`] for a set of flags given together.
+pub(crate) fn compiler_links_with_flags(compiler: &str, flags: &[String]) -> bool {
     use std::io::Write;
     use std::process::{Command, Stdio};
     use std::sync::{Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<HashMap<(String, String), bool>>> = OnceLock::new();
-    let key = (compiler.to_owned(), flag.to_owned());
+    type LinkCache = Mutex<HashMap<(String, Vec<String>), bool>>;
+    static CACHE: OnceLock<LinkCache> = OnceLock::new();
+    let key = (compiler.to_owned(), flags.to_vec());
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(&known) = cache.lock().expect("link probe cache").get(&key) {
         return known;
@@ -7177,7 +7313,7 @@ fn compiler_links_with_flag(compiler: &str, flag: &str) -> bool {
     };
     let output = dir.path().join("probe");
     let linked = Command::new(compiler)
-        .arg(flag)
+        .args(flags)
         .args(["-x", "c", "-", "-o"])
         .arg(&output)
         .stdin(Stdio::piped())
@@ -7274,6 +7410,7 @@ fn native_override_for(
             cxxflags: flags_for(cxx_family, true),
             cc,
             cxx,
+            target_flags: None,
         },
         note,
     )
@@ -7404,6 +7541,7 @@ fn gcc_fallback_override() -> crate::build::CFamilyCompilerOverride {
         cxx: "g++".to_owned(),
         cflags: Vec::new(),
         cxxflags: Vec::new(),
+        target_flags: None,
     }
 }
 
@@ -7429,6 +7567,24 @@ fn cross_harness_wrapper(target: &CrossTarget) -> crate::runner::HarnessWrapper 
         CrossRunner::Configured { exe, args } => crate::runner::HarnessWrapper::QemuUser {
             exe: PathBuf::from(exe),
             args: args.clone(),
+        },
+    }
+}
+
+/// The emulator a wrapper launches a harness under, as recorded beside it.
+fn harness_runner_record(
+    wrapper: &crate::runner::HarnessWrapper,
+) -> crate::gate_evidence::HarnessRunner {
+    match wrapper {
+        crate::runner::HarnessWrapper::QemuUser { exe, args } => {
+            crate::gate_evidence::HarnessRunner {
+                program: exe.clone(),
+                args: args.clone(),
+            }
+        }
+        crate::runner::HarnessWrapper::Wine { exe } => crate::gate_evidence::HarnessRunner {
+            program: exe.clone(),
+            args: Vec::new(),
         },
     }
 }
@@ -10357,6 +10513,7 @@ mod throughput_tests {
             executions: 10,
             target_entry_observed: false,
             coverage_edges: 0,
+            coverage_instrumentation: None,
             elapsed_secs: 1.0,
             executions_per_sec: 10.0,
             findings: vec![],
@@ -10372,6 +10529,7 @@ mod throughput_tests {
             executions,
             target_entry_observed: false,
             coverage_edges: 0,
+            coverage_instrumentation: None,
             elapsed_secs,
             executions_per_sec: if elapsed_secs > 0.0 {
                 executions as f64 / elapsed_secs
@@ -12182,7 +12340,7 @@ mod platform_stub_tests {
         // although the cross GCCs accept `trace-pc` + `trace-cmp` and the driver
         // implements both callbacks. ASan stays off: it does not survive qemu-user.
         let target = crate::auto::cross_target::resolve_cross_target("aarch64").unwrap();
-        let ov = super::cross_compiler_override_with(&target, |_, _| true);
+        let ov = super::cross_compiler_override_with(&target, |_, _| true, |_, _| true);
         for flags in [&ov.cflags, &ov.cxxflags] {
             let joined = flags.join(" ");
             assert!(
@@ -12193,7 +12351,7 @@ mod platform_stub_tests {
             assert!(!joined.contains("-fsanitize=address"), "{joined}");
         }
         // A toolchain that rejects the flag degrades to the plain build.
-        let ov = super::cross_compiler_override_with(&target, |_, _| false);
+        let ov = super::cross_compiler_override_with(&target, |_, _| false, |_, _| true);
         assert!(!ov.cflags.join(" ").contains("fsanitize-coverage"));
 
         // An operator's runner is an emulated build too.
@@ -12204,12 +12362,114 @@ mod platform_stub_tests {
             },
             ..target
         };
-        let ov = super::cross_compiler_override_with(&configured, |_, _| true);
+        let ov = super::cross_compiler_override_with(&configured, |_, _| true, |_, _| true);
         assert!(ov.cflags.join(" ").contains("trace-pc,trace-cmp"));
         assert!(matches!(
             super::cross_harness_wrapper(&configured),
             crate::runner::HarnessWrapper::QemuUser { ref args, .. } if args.len() == 2
         ));
+    }
+
+    /// With no sanitizer runtime to intercept them, an emulated build routes
+    /// the program's `strcmp`/`memcmp` calls through the driver's wrappers, so
+    /// string gates feed the comparison log and a finding's evidence; a
+    /// `[cross.<guard>]` sysroot reaches the link probe and, as a target flag,
+    /// every object of the build (the driver's included).
+    #[test]
+    fn an_emulated_cross_build_links_the_comparison_wrappers_and_its_sysroot() {
+        let wrap = crate::gate_evidence::COMPARISON_WRAP_LDFLAGS;
+        let mut target = crate::auto::cross_target::resolve_cross_target("aarch64").unwrap();
+        target.sysroot = Some(PathBuf::from("/opt/arm sdk/sysroot"));
+        let probed = std::cell::RefCell::new(Vec::new());
+        let ov = super::cross_compiler_override_with(
+            &target,
+            |_, _| true,
+            |cc, flags| {
+                probed.borrow_mut().push((cc.to_owned(), flags.to_vec()));
+                true
+            },
+        );
+        for flags in [&ov.cflags, &ov.cxxflags] {
+            assert!(flags.iter().any(|flag| flag == wrap), "{flags:?}");
+        }
+        assert_eq!(
+            ov.target_flags,
+            Some(vec!["--sysroot=\"/opt/arm sdk/sysroot\"".to_owned()])
+        );
+        let probed = probed.into_inner();
+        assert_eq!(probed.len(), 1);
+        assert_eq!(probed[0].0, "aarch64-linux-gnu-gcc");
+        assert!(
+            probed[0]
+                .1
+                .iter()
+                .any(|flag| flag == "--sysroot=/opt/arm sdk/sysroot"),
+            "{probed:?}"
+        );
+
+        // A linker that cannot wrap leaves the flags out.
+        let ov = super::cross_compiler_override_with(&target, |_, _| true, |_, _| false);
+        assert!(!ov.cflags.iter().any(|flag| flag == wrap));
+
+        // A Windows PE never gets them: the wrappers are ELF-only.
+        let windows = crate::auto::cross_target::resolve_cross_target("_WIN32").unwrap();
+        let ov = super::cross_compiler_override_with(&windows, |_, _| true, |_, _| true);
+        assert!(!ov.cflags.iter().any(|flag| flag == wrap));
+        assert!(ov.cflags.iter().any(|flag| flag == "-static"));
+    }
+
+    /// A clang lane compiler gets `--target=<triple>` in every compile, link
+    /// and probe, or it would build for this host. A whole-sweep target keeps
+    /// the `[toolchain]`'s published target flags instead of replacing them.
+    #[test]
+    fn a_clang_lane_builds_for_its_target_and_a_sweep_keeps_the_toolchain_flags() {
+        if which::which("clang").is_err() {
+            eprintln!("skip: clang unavailable");
+            return;
+        }
+        let mut target = crate::auto::cross_target::resolve_cross_target("aarch64").unwrap();
+        target.cc = "clang".to_owned();
+        target.cxx = "clang++".to_owned();
+        let probed = std::cell::RefCell::new(Vec::new());
+        let ov = super::cross_compiler_override_with(
+            &target,
+            |_, _| true,
+            |_, flags| {
+                probed.borrow_mut().push(flags.to_vec());
+                true
+            },
+        );
+        assert_eq!(
+            ov.target_flags,
+            Some(vec!["--target=aarch64-linux-gnu".to_owned()])
+        );
+        for flag in [
+            "-fsanitize-coverage=trace-pc-guard,trace-cmp",
+            "-fno-sanitize-link-runtime",
+        ] {
+            assert!(
+                ov.cflags.iter().any(|f| f == flag),
+                "{flag}: {:?}",
+                ov.cflags
+            );
+        }
+        assert!(
+            probed.borrow().iter().all(|flags| flags
+                .iter()
+                .any(|flag| flag == "--target=aarch64-linux-gnu")),
+            "{probed:?}"
+        );
+        // A gcc lane without a sysroot still replaces a host sysroot.
+        let gcc = crate::auto::cross_target::resolve_cross_target("aarch64").unwrap();
+        let ov = super::cross_compiler_override_with(&gcc, |_, _| true, |_, _| true);
+        assert_eq!(ov.target_flags, Some(Vec::new()));
+        // A whole-sweep target is the toolchain's own.
+        let sweep = CrossTarget {
+            guard_lane: false,
+            ..target
+        };
+        let ov = super::cross_compiler_override_with(&sweep, |_, _| true, |_, _| true);
+        assert_eq!(ov.target_flags, None);
     }
 
     #[test]

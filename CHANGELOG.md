@@ -30,6 +30,27 @@
   as `\xNN` in `dictionary.txt`, `learned_dictionary.txt` and the IDL and Go
   lanes' dictionaries. AFL++ dropped a `\r`/`\n`/`\t` line with "Invalid
   escaping" and libFuzzer rejected the whole file.
+- The coverage label of a fuzz run (`run.json` `coverage.source`) names the
+  instrumentation the harness binary carries: `sancov-trace-pc` when GCC's
+  debug information records code compiled with `trace-pc`,
+  `sancov-trace-pc-guard` for clang's guards, `go-cover` for the Go lane, and
+  `edge-bitmap` when the binary shows none (a build made without coverage
+  included; the driver's coverage hook alone does not count), instead of
+  `sancov-trace-pc-guard` for every edge map. The same label is in `run.json`
+  `targets[].outcome.passes[].coverage_instrumentation`, in `finding.json`
+  `build.binary.coverage_instrumentation` and in the report's coverage figure.
+- Comparison evidence for a finding of a cross-built harness is recorded under
+  the emulator the harness was fuzzed with (recorded beside it), instead of a
+  native replay that could not run it. Cross builds without a sanitizer runtime
+  link the driver's `memcmp`/`bcmp`/`str*cmp` wrappers (`-Wl,--wrap=`), so
+  string and buffer gates reach the comparison log and the evidence there too,
+  and comparison sites of 32-bit and big-endian ELF harnesses are symbolized.
+- With a GCC toolchain, a build probe builds the project's archives with that
+  GCC and GCC-spelled sanitizer and coverage flags (and no-op coverage hooks
+  for the programs the probe build links of its own, kept at a path without
+  spaces so a tree under a spaced path still configures), so they link into
+  the GCC-built harnesses instead of clang-built AddressSanitizer archives. A
+  toolchain that builds for another target leaves the host probe with clang.
 - `bhf explain` no longer presents dictionary substring matches as gates the
   engine solved. Its comparison evidence is recorded while the finding's own
   input runs: an input span counts only when a comparison operand equals its
@@ -427,6 +448,12 @@
   byte. Targets taking such parameters now rank as input-taking functions and
   record `input_reachability: attacker_reachable` where they were
   `reachability_unproven`, so their rank and reported reachability change.
+- `run.json` `coverage.source` values changed meaning (see Fixed): consumers
+  that matched `sancov-trace-pc-guard` for every edge map should accept
+  `sancov-trace-pc`, `go-cover` and `edge-bitmap`. Additive fields:
+  `passes[].coverage_instrumentation`, `finding.json`
+  `build.binary.coverage_instrumentation` and `gate_capture.runner`, and a
+  `bhf_runner.json` (`bhf.harness_runner.v1`) beside each cross-built harness.
 - A heap overflow of a buffer the generated harness sized itself, for a pointer
   parameter it passes without a length, is `lab_only` and reads as
   "precondition-dependent": whether a real caller can pass a buffer that short
@@ -740,9 +767,23 @@
   the Ada harnesses (with that target's qemu-user `-L` directory) and leaves the
   C/C++ candidates native. A foreign target or C/C++ compiler (also from
   `CC`/`CXX`) without a runner, and a runner with nothing foreign to run, are
-  refused before anything builds. Archives a build probe builds for the host are
-  not linked into cross-built harnesses, and a project archive is linked into a
-  cross build only when its objects are for the target's architecture.
+  refused before anything builds. The archives a build probe (`--probe-build`,
+  `--build-command`, `--run-untrusted`) builds for the host, in its probe
+  directory or (a plain Makefile) in the tree, are rebuilt for the target
+  member by member from the captured compile commands and linked into the
+  cross-built harnesses; members of the same name from different translation
+  units are told apart by the objects the build left, and an archive that
+  cannot be rebuilt is named with the reason. An archive already built for the
+  target is linked as it is, and a project archive is linked into a cross build
+  only when its objects are for the target's architecture.
+- `[cross.<guard>]` config tables (explicit `--config` only) override the
+  compiler (`cc`, `cxx`), `target`, `sysroot`, `runner` and `runner-args` of a
+  guard-driven cross lane (`mingw`, `aarch64`, `armhf`, `ppc64le`, `ppc64`,
+  `ppc`, `mipsel`, `mips`, `sparc64`) instead of the built-in table. They are
+  validated before anything builds, and bhf prints what each selects. A lane's
+  sysroot reaches every compile and link, bhf's driver object included, and a
+  clang `cc` gets `--target=<triple>`; they replace a `[toolchain]` sysroot or
+  target for the lane's candidates.
 - More `bhf auto` config keys: `extra-source`, `seed-file`, `seed-dir`,
   `sanitizers`, `engine`, `languages`, `project`, `ada-deps`, `passes`, and
   `probe-build` (explicit `--config` only).

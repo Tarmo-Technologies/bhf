@@ -82,13 +82,26 @@ runner-args = ["-L", "/usr/aarch64-linux-gnu"]
 Each harness is built with the cross compiler and SanitizerCoverage
 (`trace-pc,trace-cmp` for GCC, `trace-pc-guard,trace-cmp` for clang, when the
 compiler accepts it) and run as `<runner> <runner-args> <harness>`, so the sweep
-is coverage-guided with input-to-state comparison hooks. ASan is not armed, because its
-shadow memory does not survive qemu-user; hard faults are reported as crashes,
-and `cflags` can add trap-mode checks (`BHF_CROSS_GUARDS=1` arms the probed
-guard set). Without `runner-args`, a qemu-user runner gets `-L <sysroot>`, or
-`-L /usr/<triple>` when that directory exists. The triple comes from
-`--target-triple`, or from `<cc> -dumpmachine` when only `--cc` (or `CC`) names
-a cross compiler.
+is coverage-guided with input-to-state comparison hooks. `run.json`,
+`finding.json` (`build.binary.coverage_instrumentation`) and the reports name
+the instrumentation the harness binary carries: `sancov-trace-pc` when GCC's
+debug information records code compiled with `trace-pc`, and `edge-bitmap`
+for a build the compiler had to make without coverage. ASan is not armed, because its shadow memory does not survive
+qemu-user; hard faults are reported as crashes, and `cflags` can add trap-mode
+checks (`BHF_CROSS_GUARDS=1` arms the probed guard set). With no sanitizer
+runtime to intercept `memcmp`, `bcmp` and the `str*cmp` family, the harness is
+linked with `-Wl,--wrap=` for each of them, and bhf's driver reports those
+comparisons itself, so string and buffer gates still feed the fuzzer's
+comparison log. Without `runner-args`, a qemu-user runner gets
+`-L <sysroot>`, or `-L /usr/<triple>` when that directory exists. The triple
+comes from `--target-triple`, or from `<cc> -dumpmachine` when only `--cc` (or
+`CC`) names a cross compiler.
+
+bhf records the runner beside each cross-built harness (`bhf_runner.json`), so
+the comparison evidence a finding records after fuzzing (and the one
+`bhf explain` records for a finding that has none) replays the harness under
+the same emulator, which passes the evidence variable through to it. The
+capture's `gate_capture.runner` names the emulator.
 
 A runner turns the C/C++ sweep into a cross sweep only when the C/C++ toolchain
 builds for another target: a `target`, or a compiler whose `-dumpmachine` names
@@ -104,10 +117,33 @@ host cannot run, with no runner, is an error before anything builds.
 
 `--probe-build`, `--build-command` and `--run-untrusted` still run the
 project's build for this host. Its compile database and generated headers apply
-to the cross sweep, but the static archives it builds are host objects, so they
-are not linked into the cross-built harnesses (bhf says so); each target is
-built from its sources. A project archive found in the tree is linked into a
-cross build only when its objects are for the target's architecture.
+to the cross sweep. The static archives it builds hold host objects, so bhf
+rebuilds each one for the target before the sweep: the archives in the probe
+directory, and the ones the build leaves in the tree (a plain Makefile builds
+beside its sources) or in its `build/`-style directories. Every member is
+compiled again from its compile-database entry with the cross compiler and the
+sweep's code-generation flags (the project's defines, include paths and
+language flags kept; bhf's host instrumentation, `-march=`/`-mcpu=` and the
+like dropped), and the result, under `<work-dir>/auto/probe-archives/<triple>/`,
+is linked into the cross-built harnesses. A member is found by its object's
+name; when several translation units write an object of that name (two
+libraries that each compile a `util.c`), it is the one whose object file the
+build left holds the member's bytes. An archive that cannot be rebuilt (a
+member with no compile command or no way to tell its translation unit, a
+member that does not compile for the target) is named with the reason, and its
+targets are built from their sources. An archive already built for the target
+is linked as it is. The configuration the
+host build generated (a `config.h`) describes the host, which matters for a
+target with a different data model. A project archive found in the tree is
+linked into a cross build only when its objects are for the target's
+architecture. The guard-driven lanes below build their targets from source.
+
+In a native sweep whose toolchain is GCC, the build probe builds the project
+with that GCC and GCC-spelled sanitizer and `trace-pc` coverage flags, so the
+archives it leaves link into the GCC-built harnesses; the programs the probe
+build links of its own (CMake's compiler checks) get no-op coverage hooks, an
+object kept in the probe directory, or under the system temporary directory
+when the tree's path has a space or comma.
 
 ## Foreign-Platform Targets in `bhf auto`
 
@@ -142,6 +178,49 @@ instead of being dropped. The attempt loop then picks a build+fuzz strategy:
 - **No strategy → actionable skip.** A guard with neither a platform stub nor an
   installed cross toolchain is skipped with a reason naming exactly what to install.
 
+### Overriding a Lane's Toolchain
+
+Each guard-driven lane has a built-in toolchain and emulator: `mingw`
+(`x86_64-w64-mingw32-gcc`, `wine`), `aarch64` (`aarch64-linux-gnu-gcc`,
+`qemu-aarch64`), `armhf` (`arm-linux-gnueabihf-gcc`, `qemu-arm`), `ppc64le`,
+`ppc64`, `ppc`, `mipsel`, `mips` and `sparc64` (`<triple>-gcc`, `qemu-<arch>`).
+A `[cross.<lane>]` table in an explicit `--config` replaces any of them for
+the candidates that lane takes:
+
+```toml
+[cross.aarch64]
+cc = "/opt/arm/bin/aarch64-none-linux-gnu-gcc"   # cxx follows: ...-g++
+sysroot = "/opt/arm/aarch64-none-linux-gnu/libc"
+runner = "qemu-aarch64"
+runner-args = ["-L", "/opt/arm/aarch64-none-linux-gnu/libc"]
+
+[cross.armhf]
+runner = "tools/run-armhf"       # relative paths resolve against the config file
+
+[cross.mingw]
+runner = "wine64"
+```
+
+`target` sets the triple (and, without `cc`/`cxx`, `<target>-gcc` /
+`<target>-g++`); `cc`/`cxx` name the compilers (one given alone selects its
+pair); `sysroot` is passed to every compile and link as `--sysroot=`, bhf's
+driver object included, and to a qemu-user runner without `runner-args` as
+`-L`; `runner` and `runner-args` replace the emulator. A clang `cc` builds for
+the lane's triple: bhf adds `--target=<triple>` to every compile and link (and
+links no clang sanitizer runtime, which a foreign target does not have). The
+lane's `--sysroot=`/`--target=` replace a `[toolchain]` sysroot or target for
+its candidates. A distribution's multiarch directory (`/usr/aarch64-linux-gnu`)
+is not a sysroot: its `libc.so` names absolute paths that a `--sysroot=` link
+cannot find, so leave `sysroot` out for the distribution's own cross compilers
+(and for clang, which finds their libraries itself). A key left out keeps the built-in value. An unknown lane or
+key, a target that is not a triple, or a program or path a generated Makefile
+cannot carry is an error before anything builds; bhf prints what each table
+selects and names any of its programs that is not installed (the lane's
+candidates are then skipped with that reason; only its C++ candidates when
+just the C++ compiler is missing). The tables do not apply to a
+whole-sweep cross target, which builds every C/C++ candidate itself, and an
+auto-loaded `.bhf.toml` ignores them, as it does `[toolchain]`.
+
 ### Cross-compilation scope and oracle limitations
 
 These guard-driven strategies cover C and C++ targets. A foreign-platform Ada
@@ -156,8 +235,9 @@ Emulated targets (qemu-user / wine) run WITHOUT the LD_PRELOAD runtrace shim, so
 the behavioral and taint-tracking oracles (BHF-405 path-controlled file access,
 BHF-304 command injection, BHF-417 insecure temp files, BHF-305 sensitive-environment
 exposure) are unavailable — only crashes and, where the toolchain supports it,
-edge coverage surface. To catch those vulnerability classes, fuzz the target
-natively.
+edge coverage and the comparison log (with comparison evidence for each
+finding on qemu-user targets) surface. To catch those vulnerability classes,
+fuzz the target natively.
 
 The AFL++ secondary engine is native C/C++ only, so cross-compiled or emulated
 C/C++ targets — along with all Ada, Rust, and Java targets — fall back to the

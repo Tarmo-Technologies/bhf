@@ -10,9 +10,9 @@
 //! SECURITY: an AUTO-loaded `.bhf.toml` comes from the scanned, possibly-untrusted
 //! tree, so it honors ONLY safe knobs; the fields that make bhf EXECUTE something the
 //! file names (`build-command`, `unsafe-search-and-run…`, `run-untrusted`,
-//! `probe-build`, and the whole `[toolchain]` table, whose compilers, flags and runner
-//! bhf would run) are ignored unless the config was passed EXPLICITLY with `--config`,
-//! so a hostile tree can't auto-run code.
+//! `probe-build`, and the whole `[toolchain]` and `[cross.<guard>]` tables, whose
+//! compilers, flags and runners bhf would run) are ignored unless the config was passed
+//! EXPLICITLY with `--config`, so a hostile tree can't auto-run code.
 
 use std::path::{Path, PathBuf};
 
@@ -67,6 +67,9 @@ pub struct AutoConfig {
     pub probe_build: Option<bool>,
     /// The `[toolchain]` table shared with `bhf build --config`.
     pub toolchain: Option<config::ToolchainConfig>,
+    /// `[cross.<guard>]` tables: the toolchain and emulator of each
+    /// guard-driven cross lane (`aarch64`, `armhf`, `mingw`, `ppc`, ...).
+    pub cross: Option<config::CrossConfig>,
 }
 
 /// Every `bhf auto` flag that has a config key, as `(flag, key)`. A flag that
@@ -381,7 +384,11 @@ pub fn apply(args: &mut AutoArgs, tree_root: &Path) -> Result<Vec<String>, Strin
         || config.run_untrusted == Some(true)
         || config.unsafe_search_and_run_build_commands == Some(true)
         || config.probe_build == Some(true)
-        || config.toolchain.as_ref().is_some_and(|t| !t.is_empty());
+        || config.toolchain.as_ref().is_some_and(|t| !t.is_empty())
+        || config
+            .cross
+            .as_ref()
+            .is_some_and(|cross| cross.values().any(|table| !table.is_empty()));
     match trust {
         Trust::Explicit => {
             if let Some(v) = config.build_command {
@@ -402,12 +409,19 @@ pub fn apply(args: &mut AutoArgs, tree_root: &Path) -> Result<Vec<String>, Strin
                 toolchain.resolve_relative_to(base);
                 args.config_toolchain = Some(toolchain);
             }
+            if let Some(mut cross) = config.cross {
+                for table in cross.values_mut() {
+                    table.resolve_relative_to(base);
+                }
+                args.config_cross = Some(cross);
+            }
         }
         Trust::TreeAutoloaded if execute_y_requested => {
             notes.push(format!(
                 "ignoring build-executing keys in the auto-loaded {CONFIG_FILE_NAME} \
                  (build-command / run-untrusted / unsafe-search-and-run-build-commands / \
-                 probe-build / [toolchain]) — pass it explicitly with --config to honor them, \
+                 probe-build / [toolchain] / [cross.*]) — pass it explicitly with --config to \
+                 honor them, \
                  since they run code or programs named by the scanned tree"
             ));
         }
@@ -601,6 +615,68 @@ mod tests {
             Some(base.join("tools/gcc").to_str().unwrap())
         );
         assert_eq!(toolchain.include_dirs, [base.join("inc")]);
+    }
+
+    #[test]
+    fn cross_tables_are_honored_only_from_an_explicit_config() {
+        let tree = tempfile::tempdir().unwrap();
+        let text = "[cross.aarch64]\ncc = \"tools/aarch64-linux-gnu-gcc\"\n\
+                    sysroot = \"sysroot\"\nrunner = \"qemu-aarch64\"\n";
+        std::fs::write(tree.path().join(CONFIG_FILE_NAME), text).unwrap();
+        let mut args = parse_auto_args(&["bhf", "tree"]);
+        let notes = apply(&mut args, tree.path()).unwrap();
+        assert!(args.config_cross.is_none());
+        assert!(
+            notes.iter().any(|note| note.contains("[cross.*]")),
+            "{notes:?}"
+        );
+
+        let explicit = tree.path().join(CONFIG_FILE_NAME);
+        let mut args = parse_auto_args(&["bhf", "tree", "--config", explicit.to_str().unwrap()]);
+        apply(&mut args, tree.path()).unwrap();
+        let cross = args.config_cross.expect("explicit config keeps the tables");
+        let base = crate::toolchain::config_base_dir(&explicit);
+        let aarch64 = &cross["aarch64"];
+        assert_eq!(
+            aarch64.cc.as_deref(),
+            Some(base.join("tools/aarch64-linux-gnu-gcc").to_str().unwrap())
+        );
+        assert_eq!(
+            aarch64.sysroot.as_deref(),
+            Some(base.join("sysroot").as_path())
+        );
+        assert_eq!(aarch64.runner.as_deref(), Some("qemu-aarch64"));
+
+        std::fs::write(&explicit, "[cross.aarch64]\nrunner-arg = [\"-L\"]\n").unwrap();
+        let mut args = parse_auto_args(&["bhf", "tree", "--config", explicit.to_str().unwrap()]);
+        let error = apply(&mut args, tree.path()).unwrap_err();
+        assert!(error.contains("runner-arg"), "{error}");
+    }
+
+    #[test]
+    fn the_help_and_docs_list_every_cross_lane() {
+        use clap::Args;
+        let command = AutoArgs::augment_args(clap::Command::new("auto"));
+        let help = command
+            .get_arguments()
+            .find(|arg| arg.get_long() == Some("config"))
+            .and_then(|arg| arg.get_long_help().or(arg.get_help()))
+            .map(|help| help.to_string())
+            .unwrap_or_default();
+        let docs = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/site/cross-compilation.md"),
+        )
+        .unwrap();
+        for lane in crate::auto::cross_target::cross_lane_names() {
+            assert!(
+                help.contains(lane),
+                "--config help does not list lane {lane}"
+            );
+            assert!(
+                docs.contains(&format!("`{lane}`")),
+                "cross-compilation.md does not list lane {lane}"
+            );
+        }
     }
 
     #[test]

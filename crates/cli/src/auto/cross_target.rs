@@ -25,6 +25,15 @@ pub struct CrossTarget {
     pub cxx: String,
     /// How a cross-built harness is executed on this host.
     pub runner: CrossRunner,
+    /// Sysroot handed to the compilers as `--sysroot=` (a `[cross.<guard>]`
+    /// table's). A whole-sweep target leaves this `None`: its toolchain
+    /// sysroot reaches every compile through the published toolchain flags.
+    pub sysroot: Option<std::path::PathBuf>,
+    /// A guard-driven lane, whose compiles and links select its target
+    /// themselves ([`CrossTarget::target_args`]) in place of the
+    /// `[toolchain]`'s target flags, which describe the sweep's own target.
+    /// `false` for a whole-sweep target, built from that toolchain.
+    pub guard_lane: bool,
 }
 
 /// How a cross-built harness is executed on this (foreign-arch/OS) host. Both
@@ -85,6 +94,33 @@ impl CrossTarget {
         )
     }
 
+    /// The arguments that select a guard-driven lane's target in each of its
+    /// compiles and links: `--sysroot=<sysroot>`, and `--target=<triple>`
+    /// for a clang compiler (`clang_cc`), which builds for this host without
+    /// it. Paths go through `render` (plain for a compiler bhf runs, quoted
+    /// for a recipe). Empty for a whole-sweep target, whose toolchain flags
+    /// carry them.
+    pub fn target_args(&self, clang_cc: bool, render: impl Fn(&Path) -> String) -> Vec<String> {
+        if !self.guard_lane {
+            return Vec::new();
+        }
+        let mut args: Vec<String> = self
+            .sysroot
+            .iter()
+            .map(|sysroot| format!("--sysroot={}", render(sysroot)))
+            .collect();
+        if clang_cc {
+            args.push(format!("--target={}", self.triple));
+        }
+        args
+    }
+
+    /// Whether the target is Windows (a mingw PE run under wine).
+    pub fn is_windows(&self) -> bool {
+        let triple = self.triple.to_ascii_lowercase();
+        triple.contains("mingw") || triple.contains("windows") || triple.contains("cygwin")
+    }
+
     /// The target's ABI (byte order + pointer width), so the typed-input
     /// generator and struct-layout model produce inputs in the TARGET's byte
     /// order and data model rather than the host's (HDF-3). Every triple this
@@ -95,125 +131,316 @@ impl CrossTarget {
     }
 }
 
-/// Resolve a foreign-platform discovery guard to the cross toolchain bhf can
-/// drive on this host, or `None` for an unmapped target. Matching is a
-/// case-insensitive substring test because guards arrive from three sources
-/// (preprocessor macros, Ada unit suffixes, and path components) in many forms.
-/// Order matters: the 64-bit ARM check must precede the generic 32-bit `arm`
-/// check, since `arm64` contains the substring `arm`.
-pub fn resolve_cross_target(foreign_guard: &str) -> Option<CrossTarget> {
+/// A guard-driven cross lane: the guards that select it, and the target and
+/// emulator it uses unless a `[cross.<name>]` table overrides them.
+struct CrossLane {
+    /// The lane's `[cross.<name>]` key.
+    name: &'static str,
+    /// Case-insensitive substrings of a guard that select the lane.
+    needles: &'static [&'static str],
+    triple: &'static str,
+    runner: LaneRunner,
+}
+
+#[derive(Clone, Copy)]
+enum LaneRunner {
+    Qemu(&'static str),
+    Wine,
+}
+
+/// The lanes, in match order. Matching is a case-insensitive substring test
+/// because guards arrive from three sources (preprocessor macros, Ada unit
+/// suffixes, and path components) in many forms. Order matters: the 64-bit
+/// ARM check must precede the generic 32-bit `arm` check, since `arm64`
+/// contains the substring `arm`. The big-endian-first multi-arch targets that
+/// dominate fielded RTOS/radar systems (HDF-3: PowerPC, MIPS, SPARC) follow
+/// the same rule, longest/most-specific substring FIRST so a little-endian
+/// guard never falls into a big-endian lane: `powerpc64le`/`ppc64le` before
+/// `powerpc64`/`ppc64` before `powerpc`/`ppc`, and `mipsel` before `mips`.
+/// Both the `powerpc*` (GCC/triple) and the `ppc*` (Debian/arch-dir/macro)
+/// spellings are accepted since discovery emits guards from all three sources.
+const CROSS_LANES: &[CrossLane] = &[
+    // Windows: any Windows platform macro / unit tag -> mingw-w64, run under wine.
+    CrossLane {
+        name: "mingw",
+        needles: &["windows", "win32", "win64", "_win32", "_msc_ver", "mingw"],
+        triple: "x86_64-w64-mingw32",
+        runner: LaneRunner::Wine,
+    },
+    // 64-bit ARM (incl. NEON SIMD backends) -> aarch64 cross toolchain + qemu.
+    CrossLane {
+        name: "aarch64",
+        needles: &["arm64", "aarch64", "neon"],
+        triple: "aarch64-linux-gnu",
+        runner: LaneRunner::Qemu("qemu-aarch64"),
+    },
+    // 32-bit ARM -> armhf cross toolchain + qemu.
+    CrossLane {
+        name: "armhf",
+        needles: &["armv7", "armhf", "arm"],
+        triple: "arm-linux-gnueabihf",
+        runner: LaneRunner::Qemu("qemu-arm"),
+    },
+    // PowerPC 64-bit little-endian (POWER8+ radar/server class).
+    CrossLane {
+        name: "ppc64le",
+        needles: &["powerpc64le", "ppc64le"],
+        triple: "powerpc64le-linux-gnu",
+        runner: LaneRunner::Qemu("qemu-ppc64le"),
+    },
+    // PowerPC 64-bit big-endian.
+    CrossLane {
+        name: "ppc64",
+        needles: &["powerpc64", "ppc64"],
+        triple: "powerpc64-linux-gnu",
+        runner: LaneRunner::Qemu("qemu-ppc64"),
+    },
+    // PowerPC 32-bit big-endian.
+    CrossLane {
+        name: "ppc",
+        needles: &["powerpc", "ppc"],
+        triple: "powerpc-linux-gnu",
+        runner: LaneRunner::Qemu("qemu-ppc"),
+    },
+    // MIPS 32-bit little-endian.
+    CrossLane {
+        name: "mipsel",
+        needles: &["mipsel"],
+        triple: "mipsel-linux-gnu",
+        runner: LaneRunner::Qemu("qemu-mipsel"),
+    },
+    // MIPS 32-bit big-endian.
+    CrossLane {
+        name: "mips",
+        needles: &["mips"],
+        triple: "mips-linux-gnu",
+        runner: LaneRunner::Qemu("qemu-mips"),
+    },
+    // SPARC 64-bit big-endian.
+    CrossLane {
+        name: "sparc64",
+        needles: &["sparc64", "sparc"],
+        triple: "sparc64-linux-gnu",
+        runner: LaneRunner::Qemu("qemu-sparc64"),
+    },
+];
+
+/// The `[cross.<name>]` keys, one per guard-driven cross lane.
+pub fn cross_lane_names() -> Vec<&'static str> {
+    CROSS_LANES.iter().map(|lane| lane.name).collect()
+}
+
+fn lane_for_guard(foreign_guard: &str) -> Option<&'static CrossLane> {
     let guard = foreign_guard.to_ascii_lowercase();
-    // Windows: any Windows platform macro / unit tag → mingw-w64, run under wine.
-    if contains_any(
-        &guard,
-        &["windows", "win32", "win64", "_win32", "_msc_ver", "mingw"],
-    ) {
-        return Some(CrossTarget {
-            triple: "x86_64-w64-mingw32".to_owned(),
-            cc: "x86_64-w64-mingw32-gcc".to_owned(),
-            cxx: "x86_64-w64-mingw32-g++".to_owned(),
-            runner: CrossRunner::Wine {
+    CROSS_LANES
+        .iter()
+        .find(|lane| contains_any(&guard, lane.needles))
+}
+
+/// The operator's `[cross.<guard>]` tables, by lane, validated.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CrossOverrides {
+    lanes: std::collections::BTreeMap<&'static str, config::CrossGuardConfig>,
+}
+
+impl CrossOverrides {
+    /// Validate the `[cross]` tables of a config file: every key must name a
+    /// lane, and every value must be usable (a program bhf can run, a target
+    /// triple, a sysroot a generated Makefile can carry).
+    pub fn from_config(config: config::CrossConfig) -> Result<Self, String> {
+        let mut lanes = std::collections::BTreeMap::new();
+        for (name, table) in config {
+            let Some(lane) = CROSS_LANES.iter().find(|lane| lane.name == name) else {
+                return Err(format!(
+                    "[cross.{name}]: unknown cross lane `{name}`; the lanes are {}",
+                    cross_lane_names().join(", ")
+                ));
+            };
+            table
+                .validate(lane.name)
+                .map_err(|error| error.to_string())?;
+            for (key, program) in [("cc", &table.cc), ("cxx", &table.cxx)] {
+                if let Some(program) = program {
+                    if !harness_gen::build_safety::is_compiler_token(program) {
+                        return Err(format!(
+                            "cross.{name}.{key}: {program:?} cannot head a harness Makefile recipe"
+                        ));
+                    }
+                }
+            }
+            if let Some(sysroot) = &table.sysroot {
+                if !harness_gen::build_safety::is_build_path_usable(&sysroot.to_string_lossy()) {
+                    return Err(format!(
+                        "cross.{name}.sysroot: {} cannot be passed through the harness Makefile",
+                        sysroot.display()
+                    ));
+                }
+            }
+            if !table.is_empty() {
+                lanes.insert(lane.name, table);
+            }
+        }
+        Ok(Self { lanes })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lanes.is_empty()
+    }
+
+    /// One line per overridden lane naming what it now builds and runs with,
+    /// and any of those programs that is not installed.
+    pub fn describe(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        for (name, table) in &self.lanes {
+            let lane = CROSS_LANES
+                .iter()
+                .find(|lane| lane.name == *name)
+                .expect("validated lane");
+            let target = lane_target(lane, Some(table));
+            let runner = match &target.runner {
+                CrossRunner::Configured { exe, args } if !args.is_empty() => {
+                    format!("{exe} {}", args.join(" "))
+                }
+                runner => runner.exe().to_owned(),
+            };
+            let mut line = format!(
+                "[cross.{name}]: {} targets build with {} / {}{} and run under {runner}",
+                target.triple,
+                target.cc,
+                target.cxx,
+                target
+                    .sysroot
+                    .as_deref()
+                    .map(|sysroot| format!(" (sysroot {})", sysroot.display()))
+                    .unwrap_or_default()
+            );
+            // Without the compiler or the runner no candidate of the lane can
+            // run; without the C++ compiler its C candidates still do.
+            let mut missing = target.missing_tools();
+            let cxx_missing = !executable_on_path(&target.cxx);
+            let skipped = if missing.is_empty() {
+                "its C++ candidates are skipped"
+            } else {
+                "its candidates are skipped"
+            };
+            if cxx_missing {
+                missing.push(target.cxx.as_str());
+            }
+            if !missing.is_empty() {
+                line.push_str(&format!(
+                    "; not installed: {} ({skipped})",
+                    missing.join(", ")
+                ));
+            }
+            lines.push(line);
+        }
+        lines
+    }
+}
+
+static INSTALLED_OVERRIDES: std::sync::RwLock<CrossOverrides> =
+    std::sync::RwLock::new(CrossOverrides {
+        lanes: std::collections::BTreeMap::new(),
+    });
+
+/// Make `overrides` the ones [`resolve_cross_target`] applies, for the rest of
+/// this run. `bhf auto` installs its config's tables (or none) before
+/// anything resolves a guard.
+pub fn install_overrides(overrides: CrossOverrides) {
+    *INSTALLED_OVERRIDES
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = overrides;
+}
+
+/// Resolve a foreign-platform discovery guard to the cross toolchain bhf can
+/// drive on this host, or `None` for an unmapped target, with the installed
+/// `[cross.<guard>]` overrides applied (see [`install_overrides`]).
+pub fn resolve_cross_target(foreign_guard: &str) -> Option<CrossTarget> {
+    let overrides = INSTALLED_OVERRIDES
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    resolve_cross_target_with(foreign_guard, &overrides)
+}
+
+/// [`resolve_cross_target`] with explicit overrides.
+pub fn resolve_cross_target_with(
+    foreign_guard: &str,
+    overrides: &CrossOverrides,
+) -> Option<CrossTarget> {
+    let lane = lane_for_guard(foreign_guard)?;
+    Some(lane_target(lane, overrides.lanes.get(lane.name)))
+}
+
+/// The target of `lane`, with `table` (its `[cross.<name>]` override) laid
+/// over the built-in choice key by key.
+fn lane_target(lane: &CrossLane, table: Option<&config::CrossGuardConfig>) -> CrossTarget {
+    use harness_gen::compiler_family::{c_driver_for, cxx_driver_for, driver_from_name};
+    let triple = table
+        .and_then(|table| table.target.clone())
+        .unwrap_or_else(|| lane.triple.to_owned());
+    let cc_given = table.and_then(|table| table.cc.clone());
+    let cxx_given = table.and_then(|table| table.cxx.clone());
+    // A missing one of the pair follows the other (`gcc` -> `g++`), else the
+    // target's prefixed default.
+    let cc = cc_given.clone().unwrap_or_else(|| {
+        cxx_given
+            .as_deref()
+            .filter(|cxx| driver_from_name(cxx).is_some())
+            .map(c_driver_for)
+            .unwrap_or_else(|| format!("{triple}-gcc"))
+    });
+    let cxx = cxx_given.unwrap_or_else(|| {
+        cc_given
+            .as_deref()
+            .filter(|cc| driver_from_name(cc).is_some())
+            .map(cxx_driver_for)
+            .unwrap_or_else(|| format!("{triple}-g++"))
+    });
+    let sysroot = table.and_then(|table| table.sysroot.clone());
+    let default_exe = match lane.runner {
+        LaneRunner::Qemu(exe) => exe,
+        LaneRunner::Wine => "wine",
+    };
+    let runner_given = table.and_then(|table| table.runner.clone());
+    let args_given = table
+        .map(|table| table.runner_args.clone())
+        .unwrap_or_default();
+    let runner = if runner_given.is_none() && args_given.is_empty() && sysroot.is_none() {
+        match lane.runner {
+            LaneRunner::Qemu(exe) => CrossRunner::QemuUser {
+                exe: exe.to_owned(),
+            },
+            LaneRunner::Wine => CrossRunner::Wine {
                 exe: "wine".to_owned(),
             },
-        });
+        }
+    } else {
+        let exe = runner_given.unwrap_or_else(|| default_exe.to_owned());
+        let qemu_user = Path::new(&exe)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("qemu-"));
+        let args = if !args_given.is_empty() {
+            args_given
+        } else if qemu_user {
+            sysroot
+                .clone()
+                .or_else(|| Some(Path::new("/usr").join(&triple)).filter(|dir| dir.is_dir()))
+                .map(|dir| vec!["-L".to_owned(), dir.display().to_string()])
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        CrossRunner::Configured { exe, args }
+    };
+    CrossTarget {
+        triple,
+        cc,
+        cxx,
+        runner,
+        sysroot,
+        guard_lane: true,
     }
-    // 64-bit ARM (incl. NEON SIMD backends) → aarch64 cross toolchain + qemu.
-    if contains_any(&guard, &["arm64", "aarch64", "neon"]) {
-        return Some(CrossTarget {
-            triple: "aarch64-linux-gnu".to_owned(),
-            cc: "aarch64-linux-gnu-gcc".to_owned(),
-            cxx: "aarch64-linux-gnu-g++".to_owned(),
-            runner: CrossRunner::QemuUser {
-                exe: "qemu-aarch64".to_owned(),
-            },
-        });
-    }
-    // 32-bit ARM → armhf cross toolchain + qemu.
-    if contains_any(&guard, &["armv7", "armhf", "arm"]) {
-        return Some(CrossTarget {
-            triple: "arm-linux-gnueabihf".to_owned(),
-            cc: "arm-linux-gnueabihf-gcc".to_owned(),
-            cxx: "arm-linux-gnueabihf-g++".to_owned(),
-            runner: CrossRunner::QemuUser {
-                exe: "qemu-arm".to_owned(),
-            },
-        });
-    }
-    // Big-endian-first multi-arch targets that dominate fielded RTOS/radar
-    // systems (HDF-3): PowerPC, MIPS, SPARC. As with the arm64-before-arm rule
-    // above, order is longest/most-specific substring FIRST so a little-endian
-    // guard never falls into a big-endian branch: `powerpc64le`/`ppc64le` before
-    // `powerpc64`/`ppc64` before `powerpc`/`ppc`, and `mipsel` before `mips`.
-    // Both the `powerpc*` (GCC/triple) and the `ppc*` (Debian/arch-dir/macro)
-    // spellings are accepted since discovery emits guards from all three sources.
-    //
-    // PowerPC 64-bit little-endian (POWER8+ radar/server class).
-    if contains_any(&guard, &["powerpc64le", "ppc64le"]) {
-        return Some(CrossTarget {
-            triple: "powerpc64le-linux-gnu".to_owned(),
-            cc: "powerpc64le-linux-gnu-gcc".to_owned(),
-            cxx: "powerpc64le-linux-gnu-g++".to_owned(),
-            runner: CrossRunner::QemuUser {
-                exe: "qemu-ppc64le".to_owned(),
-            },
-        });
-    }
-    // PowerPC 64-bit big-endian.
-    if contains_any(&guard, &["powerpc64", "ppc64"]) {
-        return Some(CrossTarget {
-            triple: "powerpc64-linux-gnu".to_owned(),
-            cc: "powerpc64-linux-gnu-gcc".to_owned(),
-            cxx: "powerpc64-linux-gnu-g++".to_owned(),
-            runner: CrossRunner::QemuUser {
-                exe: "qemu-ppc64".to_owned(),
-            },
-        });
-    }
-    // PowerPC 32-bit big-endian.
-    if contains_any(&guard, &["powerpc", "ppc"]) {
-        return Some(CrossTarget {
-            triple: "powerpc-linux-gnu".to_owned(),
-            cc: "powerpc-linux-gnu-gcc".to_owned(),
-            cxx: "powerpc-linux-gnu-g++".to_owned(),
-            runner: CrossRunner::QemuUser {
-                exe: "qemu-ppc".to_owned(),
-            },
-        });
-    }
-    // MIPS 32-bit little-endian.
-    if contains_any(&guard, &["mipsel"]) {
-        return Some(CrossTarget {
-            triple: "mipsel-linux-gnu".to_owned(),
-            cc: "mipsel-linux-gnu-gcc".to_owned(),
-            cxx: "mipsel-linux-gnu-g++".to_owned(),
-            runner: CrossRunner::QemuUser {
-                exe: "qemu-mipsel".to_owned(),
-            },
-        });
-    }
-    // MIPS 32-bit big-endian.
-    if contains_any(&guard, &["mips"]) {
-        return Some(CrossTarget {
-            triple: "mips-linux-gnu".to_owned(),
-            cc: "mips-linux-gnu-gcc".to_owned(),
-            cxx: "mips-linux-gnu-g++".to_owned(),
-            runner: CrossRunner::QemuUser {
-                exe: "qemu-mips".to_owned(),
-            },
-        });
-    }
-    // SPARC 64-bit big-endian.
-    if contains_any(&guard, &["sparc64", "sparc"]) {
-        return Some(CrossTarget {
-            triple: "sparc64-linux-gnu".to_owned(),
-            cc: "sparc64-linux-gnu-gcc".to_owned(),
-            cxx: "sparc64-linux-gnu-g++".to_owned(),
-            runner: CrossRunner::QemuUser {
-                exe: "qemu-sparc64".to_owned(),
-            },
-        });
-    }
-    None
 }
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
@@ -1020,6 +1247,7 @@ fn coff_machine_for(triple: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn win32_name_set_is_covered_by_the_stub() {
@@ -1059,6 +1287,220 @@ mod tests {
                     exe: "wine".to_owned()
                 }
             );
+        }
+    }
+
+    fn cross_table(entries: &[(&str, config::CrossGuardConfig)]) -> CrossOverrides {
+        CrossOverrides::from_config(
+            entries
+                .iter()
+                .map(|(name, table)| ((*name).to_owned(), table.clone()))
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_cross_table_overrides_its_lane_key_by_key() {
+        let overrides = cross_table(&[
+            (
+                "aarch64",
+                config::CrossGuardConfig {
+                    cc: Some("/opt/arm/bin/aarch64-none-linux-gnu-gcc".to_owned()),
+                    sysroot: Some(PathBuf::from("/opt/arm/sysroot")),
+                    ..Default::default()
+                },
+            ),
+            (
+                "armhf",
+                config::CrossGuardConfig {
+                    runner: Some("/opt/qemu/bin/qemu-arm".to_owned()),
+                    runner_args: vec!["-cpu".to_owned(), "cortex-a9".to_owned()],
+                    ..Default::default()
+                },
+            ),
+            (
+                "ppc",
+                config::CrossGuardConfig {
+                    target: Some("powerpc-unknown-linux-gnu".to_owned()),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let aarch64 = resolve_cross_target_with("arm64", &overrides).unwrap();
+        assert_eq!(aarch64.triple, "aarch64-linux-gnu");
+        assert_eq!(aarch64.cc, "/opt/arm/bin/aarch64-none-linux-gnu-gcc");
+        assert_eq!(
+            aarch64.cxx, "/opt/arm/bin/aarch64-none-linux-gnu-g++",
+            "the C++ driver follows the C compiler"
+        );
+        assert_eq!(aarch64.sysroot, Some(PathBuf::from("/opt/arm/sysroot")));
+        assert_eq!(
+            aarch64.runner,
+            CrossRunner::Configured {
+                exe: "qemu-aarch64".to_owned(),
+                args: vec!["-L".to_owned(), "/opt/arm/sysroot".to_owned()],
+            },
+            "the built-in emulator runs against the configured sysroot"
+        );
+
+        let armhf = resolve_cross_target_with("armv7", &overrides).unwrap();
+        assert_eq!(armhf.cc, "arm-linux-gnueabihf-gcc");
+        assert_eq!(
+            armhf.runner,
+            CrossRunner::Configured {
+                exe: "/opt/qemu/bin/qemu-arm".to_owned(),
+                args: vec!["-cpu".to_owned(), "cortex-a9".to_owned()],
+            }
+        );
+
+        let ppc = resolve_cross_target_with("__powerpc__", &overrides).unwrap();
+        assert_eq!(ppc.triple, "powerpc-unknown-linux-gnu");
+        assert_eq!(ppc.cc, "powerpc-unknown-linux-gnu-gcc");
+        assert_eq!(ppc.cxx, "powerpc-unknown-linux-gnu-g++");
+        assert_eq!(
+            ppc.runner,
+            CrossRunner::QemuUser {
+                exe: "qemu-ppc".to_owned()
+            }
+        );
+
+        // A lane without a table keeps its built-in choice, and so does every
+        // lane without overrides.
+        let none = CrossOverrides::default();
+        assert_eq!(
+            resolve_cross_target_with("mipsel", &overrides),
+            resolve_cross_target_with("mipsel", &none)
+        );
+        assert_eq!(
+            resolve_cross_target_with("arm64", &none).unwrap().cc,
+            "aarch64-linux-gnu-gcc"
+        );
+        let lines = overrides.describe();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(
+            lines[0].starts_with(
+                "[cross.aarch64]: aarch64-linux-gnu targets build with \
+                 /opt/arm/bin/aarch64-none-linux-gnu-gcc"
+            ),
+            "{lines:?}"
+        );
+        assert!(lines[0].contains("not installed"), "{lines:?}");
+    }
+
+    /// A lane that lacks only its C++ compiler still takes its C candidates;
+    /// the note says only the C++ ones are skipped.
+    #[test]
+    fn a_missing_cxx_skips_only_the_lanes_cpp_candidates() {
+        let overrides = cross_table(&[
+            (
+                "aarch64",
+                config::CrossGuardConfig {
+                    cc: Some("sh".to_owned()),
+                    cxx: Some("bhf-cross-no-such-cxx-zzz".to_owned()),
+                    runner: Some("sh".to_owned()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "armhf",
+                config::CrossGuardConfig {
+                    cc: Some("bhf-cross-no-such-cc-zzz".to_owned()),
+                    cxx: Some("sh".to_owned()),
+                    runner: Some("sh".to_owned()),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let lines = overrides.describe();
+        assert!(
+            lines[0].ends_with(
+                "; not installed: bhf-cross-no-such-cxx-zzz (its C++ candidates are skipped)"
+            ),
+            "{lines:?}"
+        );
+        assert!(
+            lines[1].ends_with(
+                "; not installed: bhf-cross-no-such-cc-zzz (its candidates are skipped)"
+            ),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_wine_lane_with_runner_arguments_still_targets_windows() {
+        let overrides = cross_table(&[(
+            "mingw",
+            config::CrossGuardConfig {
+                runner: Some("wine64".to_owned()),
+                ..Default::default()
+            },
+        )]);
+        let target = resolve_cross_target_with("_WIN32", &overrides).unwrap();
+        assert!(target.is_windows());
+        assert_eq!(
+            target.runner,
+            CrossRunner::Configured {
+                exe: "wine64".to_owned(),
+                args: Vec::new(),
+            }
+        );
+        assert!(!resolve_cross_target_with("arm64", &overrides)
+            .unwrap()
+            .is_windows());
+    }
+
+    #[test]
+    fn unknown_lanes_and_unusable_values_are_refused() {
+        let refuse = |name: &str, table: config::CrossGuardConfig| {
+            CrossOverrides::from_config([(name.to_owned(), table)].into_iter().collect())
+                .unwrap_err()
+        };
+        let error = refuse("arm64", config::CrossGuardConfig::default());
+        assert!(
+            error.contains("unknown cross lane `arm64`") && error.contains("aarch64, armhf"),
+            "{error}"
+        );
+        let error = refuse(
+            "aarch64",
+            config::CrossGuardConfig {
+                cc: Some("gcc$(id)".to_owned()),
+                ..Default::default()
+            },
+        );
+        assert!(error.starts_with("cross.aarch64.cc"), "{error}");
+        let error = refuse(
+            "armhf",
+            config::CrossGuardConfig {
+                sysroot: Some(PathBuf::from("/opt/$(id)")),
+                ..Default::default()
+            },
+        );
+        assert!(error.starts_with("cross.armhf.sysroot"), "{error}");
+        let error = refuse(
+            "ppc",
+            config::CrossGuardConfig {
+                target: Some("ppc".to_owned()),
+                ..Default::default()
+            },
+        );
+        assert!(error.starts_with("cross.ppc.target"), "{error}");
+        // An empty table changes nothing.
+        assert!(CrossOverrides::from_config(
+            [("sparc64".to_owned(), config::CrossGuardConfig::default())]
+                .into_iter()
+                .collect()
+        )
+        .unwrap()
+        .is_empty());
+    }
+
+    #[test]
+    fn every_lane_is_named_and_reachable_from_its_own_name() {
+        for name in cross_lane_names() {
+            let target = resolve_cross_target_with(name, &CrossOverrides::default())
+                .unwrap_or_else(|| panic!("lane {name} resolves from its own name"));
+            assert!(!target.triple.is_empty());
         }
     }
 
@@ -1367,6 +1809,8 @@ int main(int argc, char **argv) {
             runner: CrossRunner::QemuUser {
                 exe: "sh".to_owned(),
             },
+            sysroot: None,
+            guard_lane: true,
         };
         assert!(present.available());
         assert!(present.missing_tools().is_empty());

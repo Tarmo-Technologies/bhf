@@ -1619,6 +1619,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/coverage_kind.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/crash_identity.rs",
       "license": "Apache-2.0"
     },

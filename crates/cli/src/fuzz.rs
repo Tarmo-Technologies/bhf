@@ -948,15 +948,25 @@ pub(crate) fn executions_per_sec(executions: usize, elapsed_secs: f64) -> f64 {
     }
 }
 
-/// Edge-coverage measured during the run. For passthrough libFuzzer harnesses the
-/// bhf driver carries a SanitizerCoverage (`trace-pc-guard`) runtime that sets
-/// one bit per hit edge in a shared bitmap (#385); `edges` is the popcount. Zero
-/// for harnesses without that runtime (Ada event-log lane, generated `-fsanitize=
-/// fuzzer` wrappers) or when BHF_COV_SHM was unset.
+/// Edge-coverage measured during the run. The bhf driver (and the other lanes'
+/// runtimes) set one byte per hit edge in a shared bitmap (#385); `edges` is
+/// the popcount. Zero for harnesses without such a runtime (Ada event-log lane,
+/// generated `-fsanitize=fuzzer` wrappers) or when BHF_COV_SHM was unset.
+/// `source` names the instrumentation that fed the map, read from the harness
+/// binary ([`crate::coverage_kind`]): `sancov-trace-pc-guard` (clang),
+/// `sancov-trace-pc` (GCC), `go-cover`, `edge-bitmap` when the binary does not
+/// say, or `none` without a map.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct CoverageRunSummary {
     pub(crate) edges: usize,
     pub(crate) source: String,
+}
+
+impl CoverageRunSummary {
+    /// [`Self::source`] when an edge map was armed, else `None`.
+    pub(crate) fn instrumentation(&self) -> Option<String> {
+        (self.source != "none").then(|| self.source.clone())
+    }
 }
 
 /// Read the bhf driver's edge-coverage bitmap (one byte per hit edge) from the
@@ -988,7 +998,7 @@ fn read_vp_tokens(path: &Path) -> Vec<Vec<u8>> {
     out
 }
 
-fn coverage_from_env(extra_env: &[(String, String)]) -> CoverageRunSummary {
+fn coverage_from_env(extra_env: &[(String, String)], harness: &Path) -> CoverageRunSummary {
     let Some((_, path)) = extra_env.iter().find(|(k, _)| k == "BHF_COV_SHM") else {
         return CoverageRunSummary {
             edges: 0,
@@ -1001,8 +1011,34 @@ fn coverage_from_env(extra_env: &[(String, String)]) -> CoverageRunSummary {
         .unwrap_or(0);
     CoverageRunSummary {
         edges,
-        source: "sancov-trace-pc-guard".to_owned(),
+        source: coverage_source_label(harness).to_owned(),
     }
+}
+
+/// The `coverage.source` label for a run of `harness` with an edge map armed.
+fn coverage_source_label(harness: &Path) -> &'static str {
+    crate::coverage_kind::of_binary(harness).map_or(
+        crate::coverage_kind::UNIDENTIFIED_EDGE_MAP,
+        crate::coverage_kind::CoverageInstrumentation::label,
+    )
+}
+
+/// The harness binary's identity for `finding.json` `build.binary`, with the
+/// coverage instrumentation it was built with (`coverage_instrumentation`)
+/// when the binary shows one.
+fn build_binary_record(harness: &Path) -> Option<serde_json::Value> {
+    let mut identity = binary_analysis::build_identity(harness)
+        .and_then(|identity| serde_json::to_value(identity).ok())?;
+    if let (Some(kind), Some(object)) = (
+        crate::coverage_kind::of_binary(harness),
+        identity.as_object_mut(),
+    ) {
+        object.insert(
+            "coverage_instrumentation".to_owned(),
+            serde_json::json!(kind.label()),
+        );
+    }
+    Some(identity)
 }
 
 fn target_entry_path(extra_env: &[(String, String)]) -> Option<&Path> {
@@ -3021,8 +3057,7 @@ fn run_builtin_with_progress(
         })
         .unwrap_or(false);
     let sandbox_metadata = prepared.runner.sandbox_metadata();
-    let build_binary_identity = binary_analysis::build_identity(&prepared.harness_path)
-        .and_then(|identity| serde_json::to_value(identity).ok());
+    let build_binary_identity = build_binary_record(&prepared.harness_path);
     let mut emitter = with_harness_format(
         FindingEmitter::with_metadata_and_sandbox(
             prepared.work_dir.clone(),
@@ -3896,6 +3931,7 @@ fn run_builtin_with_progress(
     });
 
     let elapsed_secs = start.elapsed().as_secs_f64();
+    let coverage = coverage_from_env(&prepared.extra_env, &prepared.harness_path);
     let summary = FuzzRunSummary {
         schema_version: 1,
         harness_id: prepared.harness_id,
@@ -3912,7 +3948,7 @@ fn run_builtin_with_progress(
         execution: builtin_execution_summary(protocol, forkserver_started),
         cmplog: cmplog_summary,
         sanitizers: sanitizer_summary(&prepared.sanitizers, &prepared.sanitizer_env, false),
-        coverage: coverage_from_env(&prepared.extra_env),
+        coverage,
         findings: finding_ids,
         duplicate_crashes_of_existing: duplicates_of_existing.values().sum(),
         duplicates_of_existing: duplicates_of_existing.into_keys().collect(),
@@ -4520,8 +4556,7 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
 
     let crashes_dir = out_dir.join("default").join("crashes");
     let sandbox_metadata = prepared.runner.sandbox_metadata();
-    let build_binary_identity = binary_analysis::build_identity(&prepared.harness_path)
-        .and_then(|identity| serde_json::to_value(identity).ok());
+    let build_binary_identity = build_binary_record(&prepared.harness_path);
     let mut emitter = with_harness_format(
         FindingEmitter::with_metadata_and_sandbox(
             prepared.work_dir.clone(),
@@ -4620,6 +4655,7 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
     // `execs=1, edges=0` even on a productive run). Fall back to the crash count
     // only when afl-fuzz wrote no stats (e.g. it aborted before the first cycle).
     let (afl_execs_done, afl_execs_per_sec) = parse_afl_fuzzer_stats(&out_dir);
+    let coverage = coverage_from_env(&prepared.extra_env, &prepared.harness_path);
     let summary = FuzzRunSummary {
         schema_version: 1,
         harness_id: prepared.harness_id.clone(),
@@ -4638,7 +4674,7 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
         execution: afl_execution_summary(),
         cmplog: cmplog_summary,
         sanitizers: sanitizer_summary(&prepared.sanitizers, &prepared.sanitizer_env, false),
-        coverage: coverage_from_env(&prepared.extra_env),
+        coverage,
         findings: finding_ids,
         duplicates_of_existing: Vec::new(),
         duplicate_crashes_of_existing: 0,
@@ -11008,10 +11044,77 @@ mod redqueen_cmplog_tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// The edge map of a GCC `trace-pc` harness is labelled with that
+    /// instrumentation, not clang's `trace-pc-guard`, in `run.json` and in the
+    /// binary record a finding carries.
+    #[test]
+    fn coverage_source_names_the_instrumentation_the_harness_was_built_with() {
+        let dir = tempfile::tempdir().unwrap();
+        let map = dir.path().join("coverage.shm");
+        let mut bitmap = vec![0u8; crate::fuzz::BHF_COV_BITS];
+        bitmap[7] = 1;
+        std::fs::write(&map, bitmap).unwrap();
+        let env = vec![("BHF_COV_SHM".to_owned(), map.display().to_string())];
+        let program = "void __sanitizer_cov_trace_pc(void) {}\n\
+             void __sanitizer_cov_trace_pc_guard_init(unsigned *a, unsigned *b) { (void)a; (void)b; }\n\
+             void __sanitizer_cov_trace_pc_guard(unsigned *g) { (void)g; }\n\
+             int parse_record(int v) { return v > 1 ? v : -v; }\n\
+             int main(int argc, char **argv) { (void)argv; return parse_record(argc); }\n";
+        let source = dir.path().join("widget.c");
+        std::fs::write(&source, program).unwrap();
+        let build = |compiler: &str, coverage: &str| {
+            let out = dir.path().join(format!("widget-{compiler}"));
+            let ok = std::process::Command::new(compiler)
+                .args(["-O1", "-g", coverage])
+                .arg(&source)
+                .arg("-o")
+                .arg(&out)
+                .status()
+                .is_ok_and(|status| status.success());
+            ok.then_some(out)
+        };
+        if let Some(gcc) = build("gcc", "-fsanitize-coverage=trace-pc") {
+            let summary = crate::fuzz::coverage_from_env(&env, &gcc);
+            assert_eq!(summary.edges, 1);
+            assert_eq!(summary.source, "sancov-trace-pc");
+            let record = crate::fuzz::build_binary_record(&gcc).expect("binary record");
+            assert_eq!(record["coverage_instrumentation"], "sancov-trace-pc");
+        } else {
+            eprintln!("skip: gcc unavailable");
+        }
+        if let Some(clang) = build("clang", "-fsanitize-coverage=trace-pc-guard") {
+            assert_eq!(
+                crate::fuzz::coverage_from_env(&env, &clang).source,
+                "sancov-trace-pc-guard"
+            );
+        }
+        // Defining the hook is not using it: a build without coverage is not
+        // labelled with any instrumentation.
+        if let Some(plain) = build("gcc", "-fno-sanitize-coverage=trace-pc") {
+            assert_eq!(
+                crate::fuzz::coverage_from_env(&env, &plain).source,
+                "edge-bitmap"
+            );
+        }
+        // A harness the binary does not identify (a launcher script) is not
+        // given a SanitizerCoverage label; without a map there is none.
+        let script = dir.path().join("launcher");
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+        assert_eq!(
+            crate::fuzz::coverage_from_env(&env, &script).source,
+            "edge-bitmap"
+        );
+        assert!(crate::fuzz::build_binary_record(&script)
+            .expect("record")
+            .get("coverage_instrumentation")
+            .is_none());
+        assert_eq!(crate::fuzz::coverage_from_env(&[], &script).source, "none");
+    }
+
     #[test]
     fn coverage_tracker_snapshot_zero_restore_round_trips() {
         let path = tmp_path("cov");
-        std::fs::write(&path, vec![0u8; super::BHF_COV_BITS]).unwrap();
+        std::fs::write(&path, vec![0u8; crate::fuzz::BHF_COV_BITS]).unwrap();
         let env = vec![("BHF_COV_SHM".to_owned(), path.display().to_string())];
         let tracker = CoverageTracker::new(&env).expect("map cov shm");
         // Simulate an exec setting some edges, snapshot it.

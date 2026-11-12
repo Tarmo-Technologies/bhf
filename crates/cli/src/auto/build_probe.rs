@@ -63,7 +63,115 @@ struct ProbeInstrumentation {
 }
 
 impl ProbeInstrumentation {
+    /// The instrumentation the run's harnesses are built with: the compilers
+    /// the toolchain (or CC/CXX) chose, with their family's flag spellings.
+    ///
+    /// The probe runs the project's build for this host, so a toolchain that
+    /// builds for another target (a cross sweep) leaves it with bhf's clang;
+    /// a cross sweep rebuilds the archives for its target afterwards
+    /// ([`rebuild_probe_archives`]).
     fn for_selection(selection: &multicore_fuzz::SanitizerSelection) -> Self {
+        let mut effective = crate::toolchain::effective_compilers();
+        if effective.explicit && !crate::toolchain::compiler_builds_for_host(&effective.cc) {
+            effective = crate::toolchain::EffectiveCompilers {
+                cc: "clang".to_owned(),
+                cxx: "clang++".to_owned(),
+                explicit: false,
+            };
+        }
+        Self::for_selection_with(
+            selection,
+            &effective,
+            crate::toolchain::compiler_family,
+            crate::auto::attempt::compiler_links_with_flags,
+        )
+    }
+
+    /// Whether the coverage flags are GCC's guard-less `trace-pc`, whose hooks
+    /// no compiler runtime defines.
+    fn uses_gcc_coverage(&self) -> bool {
+        let gcc = harness_gen::compiler_family::CompilerFamily::Gcc.coverage_flag();
+        self.c_flags
+            .iter()
+            .chain(&self.cxx_flags)
+            .any(|flag| flag == gcc)
+    }
+
+    /// [`Self::for_selection`] with the compilers and probes injected. A GCC
+    /// toolchain's probe build uses that GCC with GCC-spelled sanitizer and
+    /// `trace-pc` coverage flags, so its archives link into the GCC-built
+    /// harnesses; when the chosen compilers cannot build an explicit sanitizer
+    /// set, the harnesses fall back to clang, and so does the probe.
+    fn for_selection_with(
+        selection: &multicore_fuzz::SanitizerSelection,
+        effective: &crate::toolchain::EffectiveCompilers,
+        family_of: impl Fn(&str, bool) -> Option<harness_gen::compiler_family::CompilerFamily>,
+        links_with: impl Fn(&str, &[String]) -> bool,
+    ) -> Self {
+        use harness_gen::compiler_family::CompilerFamily;
+        use multicore_fuzz::{Sanitizer, SanitizerSelection};
+        let mut instrumentation = Self::clang_for_selection(selection);
+        if !effective.explicit {
+            return instrumentation;
+        }
+        let sanitize_flag = instrumentation
+            .c_flags
+            .iter()
+            .find(|flag| flag.starts_with("-fsanitize=") && !flag.starts_with("-fsanitize-"))
+            .cloned();
+        if let (SanitizerSelection::Set(_), Some(flag)) = (selection, &sanitize_flag) {
+            if !links_with(&effective.cc, std::slice::from_ref(flag)) {
+                return instrumentation;
+            }
+        }
+        let family = family_of(&effective.cc, false).unwrap_or(CompilerFamily::Clang);
+        let cxx_family = family_of(&effective.cxx, true).unwrap_or(family);
+        let has_ubsan = match selection {
+            SanitizerSelection::Default => true,
+            SanitizerSelection::None => false,
+            SanitizerSelection::Set(set) => set.contains(&Sanitizer::Ubsan),
+        };
+        let flags_for = |family: CompilerFamily, cpp: bool| {
+            let mut flags: Vec<String> = [
+                "-O1",
+                "-g",
+                "-ffunction-sections",
+                "-fdata-sections",
+                "-Wno-error",
+            ]
+            .map(str::to_owned)
+            .to_vec();
+            if let Some(flag) = &sanitize_flag {
+                flags.push(flag.clone());
+                if has_ubsan {
+                    flags.push(family.ubsan_subtraction().to_owned());
+                }
+            }
+            flags.push(family.coverage_flag().to_owned());
+            if cpp && family == CompilerFamily::Clang {
+                flags.push("-Wno-reserved-user-defined-literal".to_owned());
+            }
+            flags
+        };
+        instrumentation.cc = effective.cc.clone();
+        instrumentation.cxx = effective.cxx.clone();
+        instrumentation.c_flags = flags_for(family, false);
+        let mut cxx_flags = flags_for(cxx_family, true);
+        cxx_flags.extend(crate::build::detect_cpp_stdlib_include_flags_for(
+            &effective.cxx,
+            &cxx_flags,
+        ));
+        instrumentation.cxx_flags = cxx_flags;
+        if family == CompilerFamily::Gcc {
+            // The clang-only libstdc++ search-path repair does not apply.
+            instrumentation.linker_flags.clear();
+        }
+        instrumentation
+    }
+
+    /// bhf's default probe instrumentation: clang with its sanitizer and
+    /// `trace-pc-guard` coverage spellings.
+    fn clang_for_selection(selection: &multicore_fuzz::SanitizerSelection) -> Self {
         use multicore_fuzz::{Sanitizer, SanitizerSelection};
 
         let sanitizer_name = |sanitizer: Sanitizer| match sanitizer {
@@ -896,6 +1004,90 @@ pub fn probe_build(
     }
 }
 
+/// No-op SanitizerCoverage hooks for the programs a probe build links of its
+/// own (CMake's compiler checks, the project's tools and tests). GCC's
+/// `trace-pc`/`trace-cmp` calls these and no GCC runtime defines them (bhf's
+/// driver does, for a harness), so without them every such link fails. Weak,
+/// so a program that defines a hook keeps its own.
+const PROBE_COVERAGE_HOOKS: &str = "#include <stdint.h>\n\
+#define BHF_HOOK __attribute__((weak))\n\
+BHF_HOOK void __sanitizer_cov_trace_pc(void) {}\n\
+BHF_HOOK void __sanitizer_cov_trace_cmp1(uint8_t a, uint8_t b) { (void)a; (void)b; }\n\
+BHF_HOOK void __sanitizer_cov_trace_cmp2(uint16_t a, uint16_t b) { (void)a; (void)b; }\n\
+BHF_HOOK void __sanitizer_cov_trace_cmp4(uint32_t a, uint32_t b) { (void)a; (void)b; }\n\
+BHF_HOOK void __sanitizer_cov_trace_cmp8(uint64_t a, uint64_t b) { (void)a; (void)b; }\n\
+BHF_HOOK void __sanitizer_cov_trace_const_cmp1(uint8_t a, uint8_t b) { (void)a; (void)b; }\n\
+BHF_HOOK void __sanitizer_cov_trace_const_cmp2(uint16_t a, uint16_t b) { (void)a; (void)b; }\n\
+BHF_HOOK void __sanitizer_cov_trace_const_cmp4(uint32_t a, uint32_t b) { (void)a; (void)b; }\n\
+BHF_HOOK void __sanitizer_cov_trace_const_cmp8(uint64_t a, uint64_t b) { (void)a; (void)b; }\n\
+BHF_HOOK void __sanitizer_cov_trace_cmpf(float a, float b) { (void)a; (void)b; }\n\
+BHF_HOOK void __sanitizer_cov_trace_cmpd(double a, double b) { (void)a; (void)b; }\n\
+BHF_HOOK void __sanitizer_cov_trace_switch(uint64_t v, uint64_t *c) { (void)v; (void)c; }\n";
+
+/// For GCC coverage instrumentation, compile [`PROBE_COVERAGE_HOOKS`] and
+/// return the link flag that adds the object to every program the probe build
+/// links (`-Wl,<object>`, which a compile-only invocation ignores). `None` for
+/// clang, whose sanitizer runtime defines the hooks, or when the hooks do not
+/// compile (the probe then reports its link errors).
+///
+/// CMake and make split the linker flags on whitespace, and `-Wl,` splits on
+/// commas, so the object goes in `probe_dir` only when that path is one plain
+/// word; otherwise in a bhf directory under the system temporary directory.
+fn probe_coverage_hooks_flag(
+    probe_dir: &Path,
+    instrumentation: &ProbeInstrumentation,
+) -> Option<String> {
+    if !instrumentation.uses_gcc_coverage() {
+        return None;
+    }
+    let plain = |path: &Path| {
+        path.to_str().is_some_and(|path| {
+            !path.contains(',') && harness_gen::build_safety::is_build_input_safe(path)
+        })
+    };
+    let (dir, stem) = if plain(probe_dir) {
+        (probe_dir.to_path_buf(), "bhf-coverage-hooks".to_owned())
+    } else {
+        let shared = std::env::temp_dir().join("bhf-coverage-hooks");
+        if !plain(&shared) {
+            bhfeprintln!(
+                "bhf auto: --probe-build: note: GCC's coverage hooks need a directory whose \
+                 path has no spaces or commas, and neither {} nor {} qualifies; the programs \
+                 the project's build links may fail to link",
+                probe_dir.display(),
+                shared.display()
+            );
+            return None;
+        }
+        // One object per compiler, replaced atomically, so concurrent runs
+        // never link a half-written one.
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        instrumentation.cc.hash(&mut hasher);
+        PROBE_COVERAGE_HOOKS.hash(&mut hasher);
+        (shared, format!("hooks-{:016x}", hasher.finish()))
+    };
+    std::fs::create_dir_all(&dir).ok()?;
+    let object = dir.join(format!("{stem}.o"));
+    let scratch = format!("{stem}.{}", std::process::id());
+    let source = dir.join(format!("{scratch}.c"));
+    let built = dir.join(format!("{scratch}.o"));
+    std::fs::write(&source, PROBE_COVERAGE_HOOKS).ok()?;
+    let compiled = Command::new(&instrumentation.cc)
+        .args(["-O1", "-fPIC", "-c"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&built)
+        .status()
+        .is_ok_and(|status| status.success());
+    let _ = std::fs::remove_file(&source);
+    if !compiled || std::fs::rename(&built, &object).is_err() {
+        let _ = std::fs::remove_file(&built);
+        return None;
+    }
+    Some(format!("-Wl,{}", object.display()))
+}
+
 fn request_cmake_file_api(probe_dir: &Path) {
     let query = probe_dir.join(".cmake/api/v1/query/codemodel-v2");
     if let Some(parent) = query.parent() {
@@ -1071,12 +1263,18 @@ fn probe_cmake(
         return None;
     }
     let cmake_source = cmake_source_with_local_dependencies(tree, probe_dir);
+    // The programs the build links get the coverage hooks GCC's
+    // instrumentation needs; the archives it keeps do not carry them.
+    let mut configured = instrumentation.clone();
+    configured
+        .linker_flags
+        .extend(probe_coverage_hooks_flag(probe_dir, instrumentation));
     let args = cmake_probe_args(
         &cmake_source,
         probe_dir,
         cfg!(windows),
         find_on_path("ninja"),
-        instrumentation,
+        &configured,
     );
     // Capture (rather than inherit) cmake's output so a missing-dependency
     // configure abort can be reported ACTIONABLY (§26.2). The output is replayed
@@ -1677,6 +1875,482 @@ fn compile_output_name(arguments: &[String]) -> Option<String> {
             .map(str::to_owned);
     }
     None
+}
+
+/// The toolchain a probe's archives are rebuilt with for a cross sweep: the
+/// target's compilers and the flags its harnesses are built with (coverage,
+/// sysroot, the toolchain's own flags), minus the link-only ones.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveToolchain {
+    /// The target triple, which also names the output directory.
+    pub triple: String,
+    pub cc: String,
+    pub cxx: String,
+    pub c_flags: Vec<String>,
+    pub cxx_flags: Vec<String>,
+}
+
+/// What [`rebuild_probe_archives`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ArchiveRebuild {
+    /// The archives rebuilt for the target, ready to link.
+    pub rebuilt: Vec<PathBuf>,
+    /// Probe archives already built for the target, linked as they are.
+    pub already_for_target: Vec<PathBuf>,
+    /// Probe archives that could not be rebuilt, with the reason.
+    pub failed: Vec<(PathBuf, String)>,
+}
+
+/// One compile-database entry, in either spelling: `arguments` (bhf's own
+/// probes) or a `command` string (CMake's).
+#[derive(Debug, Clone, Deserialize)]
+struct CompileDbEntry {
+    directory: PathBuf,
+    file: PathBuf,
+    #[serde(default)]
+    arguments: Option<Vec<String>>,
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    output: Option<String>,
+}
+
+impl CompileDbEntry {
+    fn argv(&self) -> Vec<String> {
+        match (&self.arguments, &self.command) {
+            (Some(arguments), _) => arguments.clone(),
+            (None, Some(command)) => split_cmake_link_command(command),
+            (None, None) => Vec::new(),
+        }
+    }
+
+    /// The object file name this entry writes (`parse.c.o`, `parse.o`).
+    fn object_name(&self) -> Option<String> {
+        if let Some(output) = &self.output {
+            return Path::new(output)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned);
+        }
+        compile_output_name(&self.argv()).or_else(|| {
+            self.file
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(|stem| format!("{stem}.o"))
+        })
+    }
+
+    /// The object file this entry writes, by its full path.
+    fn object_path(&self) -> Option<PathBuf> {
+        let argv = self.argv();
+        let output = self.output.clone().or_else(|| {
+            argv.iter().enumerate().find_map(|(index, argument)| {
+                if argument == "-o" {
+                    argv.get(index + 1).cloned()
+                } else {
+                    argument
+                        .strip_prefix("-o")
+                        .filter(|rest| !rest.is_empty())
+                        .map(str::to_owned)
+                }
+            })
+        })?;
+        Some(self.directory.join(output))
+    }
+
+    fn is_cpp(&self) -> bool {
+        matches!(
+            self.file.extension().and_then(|value| value.to_str()),
+            Some("cc" | "cpp" | "cxx" | "c++" | "C" | "cp" | "CPP")
+        )
+    }
+}
+
+/// The compile-database entry `member` of `archive` was built from. An
+/// archive lists its members by file name only, so when several translation
+/// units write an object of that name (two libraries that each compile a
+/// `util.c`), the member is the one whose object file, at the entry's full
+/// output path, holds the member's bytes.
+fn member_compile_entry<'a>(
+    archive: &Path,
+    member: &str,
+    entries: &'a [CompileDbEntry],
+    ar: &Path,
+) -> Result<&'a CompileDbEntry, String> {
+    let mut named: Vec<&CompileDbEntry> = Vec::new();
+    for entry in entries {
+        if entry.object_name().as_deref() != Some(member) {
+            continue;
+        }
+        // The same translation unit recorded twice is one candidate.
+        let same_unit = named
+            .iter()
+            .any(|seen| seen.file == entry.file && seen.object_path() == entry.object_path());
+        if !same_unit {
+            named.push(entry);
+        }
+    }
+    match named.as_slice() {
+        [] => {
+            return Err(format!(
+                "its member `{member}` has no compile command in the probe's compile database \
+                 (the build made it without a compiler bhf saw)"
+            ))
+        }
+        [entry] => return Ok(entry),
+        _ => {}
+    }
+    let contents = Command::new(ar)
+        .arg("p")
+        .arg(archive)
+        .arg(member)
+        .output()
+        .ok()
+        .filter(|output| output.status.success() && !output.stdout.is_empty())
+        .map(|output| output.stdout);
+    let built: Vec<&CompileDbEntry> = named
+        .iter()
+        .copied()
+        .filter(|entry| {
+            contents.is_some()
+                && entry
+                    .object_path()
+                    .and_then(|path| std::fs::read(path).ok())
+                    == contents
+        })
+        .collect();
+    if let [entry] = built.as_slice() {
+        return Ok(entry);
+    }
+    Err(format!(
+        "its member `{member}` matches {} compile commands ({}), and no object the build left \
+         identifies which one it was built from",
+        named.len(),
+        named
+            .iter()
+            .map(|entry| entry.file.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
+/// The archive-rebuild output directory of `triple` under `out_root`.
+pub fn cross_archive_dir(out_root: &Path, triple: &str) -> PathBuf {
+    out_root.join(triple)
+}
+
+/// Rebuild the static archives a build probe left in `tree` for another
+/// target, member by member: each object of an archive is compiled again from
+/// its compile-database entry (the project's own flags, without bhf's host
+/// instrumentation, host CPU selection or output options) with `toolchain`,
+/// and archived under `out_root/<triple>/` at the archive's path inside the
+/// probe directory. The probe ran the project's build for this host, so its
+/// archives hold host objects a cross-built harness cannot link; the rebuilt
+/// ones hold the target's. An archive that cannot be rebuilt is reported with
+/// the reason.
+pub fn rebuild_probe_archives(
+    tree: &Path,
+    toolchain: &ArchiveToolchain,
+    out_root: &Path,
+) -> ArchiveRebuild {
+    let mut report = ArchiveRebuild::default();
+    let out_dir = cross_archive_dir(out_root, &toolchain.triple);
+    if out_dir.exists() && std::fs::remove_dir_all(&out_dir).is_err() {
+        for probe in probe_dirs_under(tree) {
+            for (archive, _) in probe_build_archives(&probe) {
+                report.failed.push((
+                    archive,
+                    format!(
+                        "its output directory {} could not be cleared",
+                        out_dir.display()
+                    ),
+                ));
+            }
+        }
+        return report;
+    }
+    let ar = archiver_for(&toolchain.triple);
+    for probe in probe_dirs_under(tree) {
+        let archives = probe_build_archives(&probe);
+        if archives.is_empty() {
+            continue;
+        }
+        let instrumentation = std::fs::read(probe.join(PROBE_ARTIFACTS_FILE))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<ProbeArtifactManifest>(&bytes).ok())
+            .map(|manifest| manifest.instrumentation);
+        let entries: Option<Vec<CompileDbEntry>> =
+            std::fs::read(probe.join("compile_commands.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+        let owner = probe.parent().unwrap_or(tree);
+        for (archive, base) in archives {
+            if crate::auto::cross_target::archive_matches_target(&archive, &toolchain.triple)
+                == Some(true)
+            {
+                report.already_for_target.push(archive);
+                continue;
+            }
+            let Some(entries) = &entries else {
+                report.failed.push((
+                    archive,
+                    "the probe left no compile database to rebuild its members from".to_owned(),
+                ));
+                continue;
+            };
+            let Some(ar) = &ar else {
+                report.failed.push((
+                    archive,
+                    format!(
+                        "no archiver was found ({}-ar, ar or llvm-ar)",
+                        toolchain.triple
+                    ),
+                ));
+                continue;
+            };
+            let relative = archive
+                .strip_prefix(&base)
+                .unwrap_or(&archive)
+                .to_path_buf();
+            let output = out_dir
+                .join(owner.strip_prefix(tree).unwrap_or(Path::new("")))
+                .join(&relative);
+            match rebuild_archive(
+                &archive,
+                &output,
+                entries,
+                instrumentation.as_ref(),
+                toolchain,
+                ar,
+            ) {
+                Ok(()) => report.rebuilt.push(output),
+                Err(reason) => report.failed.push((archive, reason)),
+            }
+        }
+    }
+    report
+}
+
+/// The archives the build `probe` describes, each with the directory its
+/// path is taken relative to: the ones in the probe directory, and the ones
+/// the build left in the tree beside it (the Make tier builds in place) or in
+/// its conventional build directories, unless the probe directory holds one
+/// of the same name. Sorted.
+fn probe_build_archives(probe: &Path) -> Vec<(PathBuf, PathBuf)> {
+    let mut own = Vec::new();
+    collect_static_libraries(probe, 0, &mut own);
+    let names: BTreeSet<std::ffi::OsString> = own
+        .iter()
+        .filter_map(|archive| archive.file_name().map(ToOwned::to_owned))
+        .collect();
+    let mut archives: Vec<(PathBuf, PathBuf)> = own
+        .into_iter()
+        .map(|archive| (archive, probe.to_path_buf()))
+        .collect();
+    let Some(owner) = probe.parent() else {
+        return archives;
+    };
+    // The owner's own files only (no recursion into its sources), then the
+    // build directories below it.
+    let mut in_tree = Vec::new();
+    collect_static_libraries(owner, RECOVERED_ARTIFACT_MAX_DEPTH, &mut in_tree);
+    for sub in RECOVERED_ARTIFACT_DIRS
+        .iter()
+        .filter(|sub| **sub != PROBE_DIR)
+    {
+        collect_static_libraries(&owner.join(sub), 0, &mut in_tree);
+    }
+    in_tree.sort();
+    in_tree.dedup();
+    archives.extend(
+        in_tree
+            .into_iter()
+            .filter(|archive| {
+                archive
+                    .file_name()
+                    .is_some_and(|name| !names.contains(name))
+            })
+            .map(|archive| (archive, owner.to_path_buf())),
+    );
+    archives.sort();
+    archives
+}
+
+/// `<triple>-ar` when installed, else `ar`, else `llvm-ar`: GNU and LLVM
+/// archivers both index foreign ELF objects.
+fn archiver_for(triple: &str) -> Option<PathBuf> {
+    [
+        format!("{triple}-ar"),
+        "ar".to_owned(),
+        "llvm-ar".to_owned(),
+    ]
+    .into_iter()
+    .find_map(|program| which::which(program).ok())
+}
+
+fn rebuild_archive(
+    archive: &Path,
+    output: &Path,
+    entries: &[CompileDbEntry],
+    instrumentation: Option<&ProbeInstrumentation>,
+    toolchain: &ArchiveToolchain,
+    ar: &Path,
+) -> Result<(), String> {
+    let listing = Command::new(ar)
+        .arg("t")
+        .arg(archive)
+        .output()
+        .map_err(|error| format!("`{} t` could not run: {error}", ar.display()))?;
+    if !listing.status.success() {
+        return Err(format!("`{} t` could not list its members", ar.display()));
+    }
+    let mut members = Vec::new();
+    let mut seen = BTreeSet::new();
+    for line in String::from_utf8_lossy(&listing.stdout).lines() {
+        let Some(name) = Path::new(line.trim()).file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !seen.insert(name.to_owned()) {
+            return Err(format!(
+                "two of its members are named `{name}`, so they cannot be matched to their \
+                 compile commands"
+            ));
+        }
+        members.push(name.to_owned());
+    }
+    if members.is_empty() {
+        return Err("it has no members".to_owned());
+    }
+    let objects_dir = output.with_extension("objects");
+    std::fs::create_dir_all(&objects_dir)
+        .map_err(|error| format!("cannot create {}: {error}", objects_dir.display()))?;
+    let mut objects = Vec::new();
+    for (index, member) in members.iter().enumerate() {
+        let entry = member_compile_entry(archive, member, entries, ar)?;
+        let object = objects_dir.join(format!("{index}-{member}"));
+        let (compiler, flags) = if entry.is_cpp() {
+            (&toolchain.cxx, &toolchain.cxx_flags)
+        } else {
+            (&toolchain.cc, &toolchain.c_flags)
+        };
+        let mut args = cross_compile_arguments(&entry.argv(), instrumentation);
+        args.extend(flags.iter().cloned());
+        args.push("-c".to_owned());
+        args.push("-o".to_owned());
+        args.push(object.display().to_string());
+        let mut command = Command::new(compiler);
+        command.args(&args).current_dir(&entry.directory);
+        let result = crate::command_output::output_with_timeout(
+            &mut command,
+            std::time::Duration::from_secs(300),
+        )
+        .map_err(|error| format!("`{compiler}` could not run: {error}"))?;
+        if !result.status.success() {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            let first: Vec<&str> = stderr
+                .lines()
+                .filter(|line| line.contains("error"))
+                .take(3)
+                .collect();
+            let detail = if first.is_empty() {
+                stderr.lines().take(3).collect::<Vec<_>>().join(" | ")
+            } else {
+                first.join(" | ")
+            };
+            return Err(format!(
+                "compiling its member `{member}` from {} for {} failed: {detail}",
+                entry.file.display(),
+                toolchain.triple
+            ));
+        }
+        objects.push(object);
+    }
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+    }
+    let _ = std::fs::remove_file(output);
+    let status = Command::new(ar)
+        .arg("rcs")
+        .arg(output)
+        .args(&objects)
+        .status()
+        .map_err(|error| format!("`{} rcs` could not run: {error}", ar.display()))?;
+    if !status.success() {
+        return Err(format!("`{} rcs` failed", ar.display()));
+    }
+    Ok(())
+}
+
+/// A compile-database command for the same translation unit, reduced to what
+/// a compile for another target keeps: the compiler, the output and
+/// dependency-file options, the optimization level, bhf's host
+/// instrumentation (the probe manifest's flags, sanitizers, coverage) and host
+/// CPU or target selection are dropped; the project's defines, include paths,
+/// language and warning flags stay.
+fn cross_compile_arguments(
+    argv: &[String],
+    instrumentation: Option<&ProbeInstrumentation>,
+) -> Vec<String> {
+    let probe_flags: BTreeSet<&str> = instrumentation
+        .into_iter()
+        .flat_map(|probe| probe.c_flags.iter().chain(&probe.cxx_flags))
+        .map(String::as_str)
+        .filter(|flag| flag.starts_with('-'))
+        .collect();
+    let probe_system_dirs: BTreeSet<&str> = instrumentation
+        .into_iter()
+        .flat_map(|probe| {
+            probe
+                .c_flags
+                .windows(2)
+                .chain(probe.cxx_flags.windows(2))
+                .filter(|pair| pair[0] == "-isystem")
+                .map(|pair| pair[1].as_str())
+        })
+        .collect();
+    let with_value = ["-o", "-MF", "-MT", "-MQ", "-target", "-arch", "--sysroot"];
+    let mut kept = Vec::new();
+    let mut args = argv.iter().skip(1).peekable();
+    while let Some(arg) = args.next() {
+        let arg = arg.as_str();
+        if with_value.contains(&arg) {
+            args.next();
+            continue;
+        }
+        if arg == "-isystem" {
+            if let Some(dir) = args.peek() {
+                if probe_system_dirs.contains(dir.as_str()) {
+                    args.next();
+                    continue;
+                }
+            }
+            kept.push(arg.to_owned());
+            continue;
+        }
+        let dropped = arg == "-c"
+            || (arg.starts_with("-o") && arg.len() > 2)
+            || matches!(arg, "-MD" | "-MMD" | "-MP" | "-M" | "-MM")
+            || arg.starts_with("-O")
+            || arg.starts_with("-fsanitize")
+            || arg.starts_with("-fno-sanitize")
+            || arg.starts_with("-fprofile-instr")
+            || arg == "-fcoverage-mapping"
+            || arg.starts_with("-static-lib")
+            || arg.starts_with("-march=")
+            || arg.starts_with("-mtune=")
+            || arg.starts_with("-mcpu=")
+            || matches!(arg, "-m32" | "-m64" | "-mx32")
+            || arg.starts_with("-msse")
+            || arg.starts_with("-mavx")
+            || arg.starts_with("--target=")
+            || arg.starts_with("--sysroot=")
+            || probe_flags.contains(arg);
+        if !dropped {
+            kept.push(arg.to_owned());
+        }
+    }
+    kept
 }
 
 /// Exact library-file dependencies CMake used when linking an executable that
@@ -2546,6 +3220,20 @@ pub fn probe_build_command(
 
     let mut wrote_any = false;
     let instrumentation = ProbeInstrumentation::for_selection(sanitizers);
+    // GCC coverage needs its hooks in every program the build links.
+    let hooks = probe_coverage_hooks_flag(&probe_dir, &instrumentation);
+    let shim_c_flags: Vec<String> = instrumentation
+        .c_flags
+        .iter()
+        .cloned()
+        .chain(hooks.clone())
+        .collect();
+    let shim_cxx_flags: Vec<String> = instrumentation
+        .cxx_flags
+        .iter()
+        .cloned()
+        .chain(hooks.clone())
+        .collect();
     let mut cc_shim: Option<PathBuf> = None;
     let mut cxx_shim: Option<PathBuf> = None;
     for (name, real) in collect_intercept_targets() {
@@ -2560,9 +3248,9 @@ pub fn probe_build_command(
             real.clone()
         };
         let extra_flags = if standard_c {
-            instrumentation.c_flags.as_slice()
+            shim_c_flags.as_slice()
         } else if standard_cxx {
-            instrumentation.cxx_flags.as_slice()
+            shim_cxx_flags.as_slice()
         } else {
             &[]
         };
@@ -2589,11 +3277,15 @@ pub fn probe_build_command(
         if cxx_shim.is_none() && matches!(name.as_str(), "c++" | "g++" | "clang++") {
             cxx_shim = Some(shim.clone());
         }
-        // The injected instrumentation contract is Clang-specific. Prefer its
-        // shim even when `/usr/bin/cc`/`c++` were encountered first.
-        if name == "clang" {
+        // Point CC/CXX at the shim named for the instrumentation's own
+        // compiler (clang, or a GCC toolchain's gcc) even when `/usr/bin/cc`/
+        // `c++` were encountered first.
+        let preferred = |compiler: &str| {
+            harness_gen::compiler_family::driver_base_name(compiler) == Some(name.as_str())
+        };
+        if preferred(&instrumentation.cc) {
             cc_shim = Some(shim.clone());
-        } else if name == "clang++" {
+        } else if preferred(&instrumentation.cxx) {
             cxx_shim = Some(shim.clone());
         }
     }
@@ -2612,7 +3304,16 @@ pub fn probe_build_command(
     );
     env.push(("CFLAGS".to_owned(), instrumentation.c_flags.join(" ")));
     env.push(("CXXFLAGS".to_owned(), instrumentation.cxx_flags.join(" ")));
-    env.push(("LDFLAGS".to_owned(), instrumentation.linker_flags.join(" ")));
+    env.push((
+        "LDFLAGS".to_owned(),
+        instrumentation
+            .linker_flags
+            .iter()
+            .cloned()
+            .chain(hooks)
+            .collect::<Vec<_>>()
+            .join(" "),
+    ));
     // Also catch compilers the PATH shim cannot shadow — those invoked by
     // ABSOLUTE path (vendor RTOS toolchains, a Bazel toolchain) or via
     // `posix_spawn` (ninja/cmake) — by LD_PRELOAD-ing the exec-interposing shim.
@@ -2996,6 +3697,437 @@ mod tests {
             .c_flags
             .iter()
             .any(|flag| flag == "-fno-sanitize=function,vptr,alignment"));
+    }
+
+    /// The coverage hooks object reaches CMake's and make's linker flags as a
+    /// bare word, so its path has no space or comma even when the tree's
+    /// does; the object is real and defines the guard-less hook.
+    #[test]
+    fn gcc_coverage_hooks_link_from_a_path_without_spaces() {
+        if which::which("gcc").is_err() || which::which("nm").is_err() {
+            eprintln!("skip: gcc/nm unavailable");
+            return;
+        }
+        let gcc = crate::toolchain::EffectiveCompilers {
+            cc: "gcc".to_owned(),
+            cxx: "g++".to_owned(),
+            explicit: true,
+        };
+        let instrumentation = ProbeInstrumentation::for_selection_with(
+            &multicore_fuzz::SanitizerSelection::Default,
+            &gcc,
+            |_, _| Some(harness_gen::compiler_family::CompilerFamily::Gcc),
+            |_, _| true,
+        );
+        let root = tmpdir();
+        for probe in [
+            root.join("my tree, v2/.bhf-build"),
+            root.join("plain/.bhf-build"),
+        ] {
+            fs::create_dir_all(&probe).unwrap();
+            let flag = probe_coverage_hooks_flag(&probe, &instrumentation)
+                .expect("gcc compiles the hooks");
+            let object = flag.strip_prefix("-Wl,").expect("a linker flag");
+            assert!(
+                !object.contains(|c: char| c.is_whitespace() || c == ','),
+                "{flag}"
+            );
+            let symbols = Command::new("nm").arg(object).output().unwrap();
+            assert!(
+                String::from_utf8_lossy(&symbols.stdout).contains("W __sanitizer_cov_trace_pc"),
+                "{flag}"
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A GCC toolchain's probe archives are built by that GCC with its own
+    /// flag spellings, so they link into the GCC-built harnesses instead of
+    /// carrying clang's ASan and `trace-pc-guard`.
+    #[test]
+    fn a_gcc_toolchain_gets_a_gcc_probe_contract() {
+        use harness_gen::compiler_family::CompilerFamily;
+        use multicore_fuzz::{Sanitizer, SanitizerSelection};
+        let gcc = crate::toolchain::EffectiveCompilers {
+            cc: "gcc-13".to_owned(),
+            cxx: "g++-13".to_owned(),
+            explicit: true,
+        };
+        let family = |_: &str, _: bool| Some(CompilerFamily::Gcc);
+        let probe = ProbeInstrumentation::for_selection_with(
+            &SanitizerSelection::Default,
+            &gcc,
+            family,
+            |_, _| true,
+        );
+        assert_eq!(
+            (probe.cc.as_str(), probe.cxx.as_str()),
+            ("gcc-13", "g++-13")
+        );
+        for flags in [&probe.c_flags, &probe.cxx_flags] {
+            assert!(
+                flags.iter().any(|f| f == "-fsanitize=address,undefined"),
+                "{flags:?}"
+            );
+            assert!(
+                flags.iter().any(|f| f == "-fno-sanitize=alignment"),
+                "{flags:?}"
+            );
+            assert!(
+                flags
+                    .iter()
+                    .any(|f| f == "-fsanitize-coverage=trace-pc,trace-cmp"),
+                "{flags:?}"
+            );
+            assert!(
+                !flags.iter().any(|f| f.contains("trace-pc-guard")),
+                "{flags:?}"
+            );
+            assert!(
+                !flags.iter().any(|f| f.contains("function,vptr")),
+                "{flags:?}"
+            );
+            assert!(
+                !flags
+                    .iter()
+                    .any(|f| f == "-Wno-reserved-user-defined-literal"),
+                "{flags:?}"
+            );
+        }
+        // A sanitizer the toolchain cannot link sends the harnesses, and so
+        // the probe, to clang.
+        let msan = ProbeInstrumentation::for_selection_with(
+            &SanitizerSelection::Set(vec![Sanitizer::Msan]),
+            &gcc,
+            family,
+            |_, _| false,
+        );
+        assert_eq!(msan.cc, "clang");
+        // bhf's own clang default keeps the historical contract.
+        let default = crate::toolchain::EffectiveCompilers {
+            cc: "clang".to_owned(),
+            cxx: "clang++".to_owned(),
+            explicit: false,
+        };
+        assert_eq!(
+            ProbeInstrumentation::for_selection_with(
+                &SanitizerSelection::None,
+                &default,
+                family,
+                |_, _| true
+            ),
+            ProbeInstrumentation::clang_for_selection(&SanitizerSelection::None)
+        );
+    }
+
+    #[test]
+    fn a_cross_rebuild_keeps_project_flags_and_drops_host_instrumentation() {
+        let probe =
+            ProbeInstrumentation::clang_for_selection(&multicore_fuzz::SanitizerSelection::Default);
+        let argv: Vec<String> = [
+            "/usr/bin/clang",
+            "-DWIDGET_LEVEL=2",
+            "-I/src/include",
+            "-isystem",
+            "/opt/vendor/include",
+            "-std=gnu11",
+            "-O1",
+            "-g",
+            "-ffunction-sections",
+            "-fsanitize=address,undefined",
+            "-fno-sanitize=function,vptr,alignment",
+            "-fsanitize-coverage=trace-pc-guard,trace-cmp",
+            "-march=native",
+            "-msse4.2",
+            "-m64",
+            "--target=x86_64-linux-gnu",
+            "-fPIC",
+            "-MD",
+            "-MT",
+            "CMakeFiles/widget.dir/parse.c.o",
+            "-MF",
+            "CMakeFiles/widget.dir/parse.c.o.d",
+            "-o",
+            "CMakeFiles/widget.dir/parse.c.o",
+            "-c",
+            "/src/parse.c",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        assert_eq!(
+            cross_compile_arguments(&argv, Some(&probe)),
+            [
+                "-DWIDGET_LEVEL=2",
+                "-I/src/include",
+                "-isystem",
+                "/opt/vendor/include",
+                "-std=gnu11",
+                "-fPIC",
+                "/src/parse.c",
+            ]
+        );
+    }
+
+    /// The probe's host archives are rebuilt member by member for the cross
+    /// target, from both compile-database spellings, and an archive whose
+    /// member has no compile command is reported with that reason.
+    #[test]
+    fn probe_archives_are_rebuilt_for_a_cross_target() {
+        let cross = "aarch64-linux-gnu-gcc";
+        if which::which(cross).is_err() || which::which("gcc").is_err() {
+            eprintln!("skip: {cross}/gcc unavailable");
+            return;
+        }
+        let root = tmpdir();
+        let probe = root.join(PROBE_DIR);
+        fs::create_dir_all(probe.join("obj")).unwrap();
+        fs::write(
+            root.join("util.c"),
+            "int widget_scale(int v) { return v * 3; }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("parse.c"),
+            "#ifndef WIDGET_LEVEL\n#error need the project define\n#endif\n\
+             int widget_scale(int v);\nint parse_record(int v) { return widget_scale(v) + WIDGET_LEVEL; }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("extra.c"),
+            "int widget_extra(void) { return 7; }\n",
+        )
+        .unwrap();
+        let host = |source: &str, object: &str, define: bool| {
+            let mut command = Command::new("gcc");
+            command
+                .current_dir(&root)
+                .args(["-O1", "-c", source, "-o"])
+                .arg(probe.join(object));
+            if define {
+                command.arg("-DWIDGET_LEVEL=2");
+            }
+            assert!(command.status().unwrap().success());
+        };
+        host("util.c", "obj/util.o", false);
+        host("parse.c", "obj/parse.c.o", true);
+        host("extra.c", "obj/extra.o", false);
+        let archive = |name: &str, members: &[&str]| {
+            let mut command = Command::new("ar");
+            command.arg("rcs").arg(probe.join(name));
+            for member in members {
+                command.arg(probe.join(member));
+            }
+            assert!(command.status().unwrap().success());
+        };
+        archive("libwidget.a", &["obj/util.o", "obj/parse.c.o"]);
+        archive("libextra.a", &["obj/extra.o"]);
+        // One entry in bhf's `arguments` spelling, one in CMake's `command`.
+        let db = serde_json::json!([
+            {"directory": root, "file": root.join("util.c"),
+             "arguments": ["/usr/bin/clang", "-fsanitize=address", "-c", "util.c", "-o", "util.o"]},
+            {"directory": root, "file": root.join("parse.c"),
+             "command": "/usr/bin/clang -DWIDGET_LEVEL=2 -O1 -o obj/parse.c.o -c parse.c",
+             "output": "obj/parse.c.o"},
+        ]);
+        fs::write(probe.join("compile_commands.json"), db.to_string()).unwrap();
+
+        let toolchain = ArchiveToolchain {
+            triple: "aarch64-linux-gnu".to_owned(),
+            cc: cross.to_owned(),
+            cxx: "aarch64-linux-gnu-g++".to_owned(),
+            c_flags: vec!["-O1".to_owned(), "-g".to_owned()],
+            cxx_flags: vec!["-O1".to_owned(), "-g".to_owned()],
+        };
+        let out = root.join("out");
+        let report = rebuild_probe_archives(&root, &toolchain, &out);
+        let rebuilt = out.join("aarch64-linux-gnu/libwidget.a");
+        assert_eq!(report.rebuilt, std::slice::from_ref(&rebuilt), "{report:?}");
+        assert_eq!(
+            crate::auto::cross_target::archive_matches_target(&rebuilt, "aarch64-linux-gnu"),
+            Some(true)
+        );
+        let symbols = index_static_library_symbols(std::slice::from_ref(&rebuilt));
+        assert!(symbols[&rebuilt].contains("parse_record"), "{symbols:?}");
+        assert!(symbols[&rebuilt].contains("widget_scale"), "{symbols:?}");
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+        assert_eq!(report.failed[0].0, probe.join("libextra.a"));
+        assert!(
+            report.failed[0]
+                .1
+                .contains("`extra.o` has no compile command"),
+            "{report:?}"
+        );
+        // Run again: the output is rebuilt from scratch, never stale.
+        let again = rebuild_probe_archives(&root, &toolchain, &out);
+        assert_eq!(again.rebuilt, report.rebuilt);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The Make tier leaves the archives the project builds in the tree, beside
+    /// its sources; a cross sweep rebuilds those too from the compile database
+    /// the tier recorded.
+    #[test]
+    fn a_make_tier_projects_archives_are_rebuilt_for_a_cross_target() {
+        let cross = "aarch64-linux-gnu-gcc";
+        if ["make", "cc", "ar", cross]
+            .iter()
+            .any(|tool| which::which(tool).is_err())
+        {
+            eprintln!("skip: make/cc/ar/{cross} unavailable");
+            return;
+        }
+        let root = tmpdir();
+        fs::write(
+            root.join("Makefile"),
+            "CC ?= cc\nall: libwidget.a\nlibwidget.a: parse.o util.o\n\tar rcs $@ $^\n\
+             %.o: %.c\n\t$(CC) -DWIDGET_LEVEL=2 -c $< -o $@\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("util.c"),
+            "int widget_scale(int v) { return v * 3; }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("parse.c"),
+            "#ifndef WIDGET_LEVEL\n#error need the project define\n#endif\n\
+             int widget_scale(int v);\nint parse_record(int v) { return widget_scale(v) + WIDGET_LEVEL; }\n",
+        )
+        .unwrap();
+        let db = probe_build(&root, None, &multicore_fuzz::SanitizerSelection::Default)
+            .expect("the Make tier records a compile database");
+        assert!(db.starts_with(root.join(PROBE_DIR)), "{}", db.display());
+        assert!(root.join("libwidget.a").is_file());
+        let toolchain = ArchiveToolchain {
+            triple: "aarch64-linux-gnu".to_owned(),
+            cc: cross.to_owned(),
+            cxx: "aarch64-linux-gnu-g++".to_owned(),
+            c_flags: vec!["-O1".to_owned()],
+            cxx_flags: vec!["-O1".to_owned()],
+        };
+        let out = root.join("out");
+        let report = rebuild_probe_archives(&root, &toolchain, &out);
+        let rebuilt = out.join("aarch64-linux-gnu/libwidget.a");
+        assert_eq!(report.rebuilt, std::slice::from_ref(&rebuilt), "{report:?}");
+        assert!(report.failed.is_empty(), "{report:?}");
+        assert_eq!(
+            crate::auto::cross_target::archive_matches_target(&rebuilt, "aarch64-linux-gnu"),
+            Some(true)
+        );
+        let symbols = index_static_library_symbols(std::slice::from_ref(&rebuilt));
+        assert!(symbols[&rebuilt].contains("parse_record"), "{symbols:?}");
+        assert!(symbols[&rebuilt].contains("widget_scale"), "{symbols:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Two libraries that each compile a `util.c` of their own put members of
+    /// the same name in their archives. Each member is rebuilt from the
+    /// translation unit whose object it is, or refused with the reason when
+    /// the build's objects cannot tell.
+    #[test]
+    fn same_named_members_are_rebuilt_from_their_own_translation_units() {
+        let cross = "aarch64-linux-gnu-gcc";
+        if which::which(cross).is_err() || which::which("gcc").is_err() {
+            eprintln!("skip: {cross}/gcc unavailable");
+            return;
+        }
+        let root = tmpdir();
+        let probe = root.join(PROBE_DIR);
+        let sources = [
+            (
+                "one/parse.c",
+                "int widget_scale(int v);\nint widget_parse(int v) { return widget_scale(v); }\n",
+            ),
+            ("one/util.c", "int widget_scale(int v) { return v * 3; }\n"),
+            (
+                "two/gadget.c",
+                "int gadget_scale(int v);\nint gadget_parse(int v) { return gadget_scale(v); }\n",
+            ),
+            ("two/util.c", "int gadget_scale(int v) { return v * 5; }\n"),
+        ];
+        let mut db = Vec::new();
+        for (source, text) in sources {
+            let path = root.join(source);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, text).unwrap();
+            let library = if source.starts_with("one/") {
+                "one"
+            } else {
+                "two"
+            };
+            let output = format!("CMakeFiles/{library}.dir/{source}.o");
+            fs::create_dir_all(probe.join(&output).parent().unwrap()).unwrap();
+            let status = Command::new("gcc")
+                .current_dir(&probe)
+                .args(["-O1", "-c"])
+                .arg(&path)
+                .args(["-o", &output])
+                .status()
+                .unwrap();
+            assert!(status.success());
+            db.push(serde_json::json!({
+                "directory": probe, "file": path, "output": output,
+                "command": format!("/usr/bin/gcc -O1 -o {output} -c {}", path.display()),
+            }));
+        }
+        fs::write(
+            probe.join("compile_commands.json"),
+            serde_json::Value::Array(db).to_string(),
+        )
+        .unwrap();
+        for (library, members) in [
+            ("one", ["one/parse.c", "one/util.c"]),
+            ("two", ["two/gadget.c", "two/util.c"]),
+        ] {
+            let mut command = Command::new("ar");
+            command
+                .current_dir(&probe)
+                .arg("qc")
+                .arg(format!("lib{library}.a"));
+            for member in members {
+                command.arg(format!("CMakeFiles/{library}.dir/{member}.o"));
+            }
+            assert!(command.status().unwrap().success());
+        }
+        let toolchain = ArchiveToolchain {
+            triple: "aarch64-linux-gnu".to_owned(),
+            cc: cross.to_owned(),
+            cxx: "aarch64-linux-gnu-g++".to_owned(),
+            c_flags: vec!["-O1".to_owned()],
+            cxx_flags: vec!["-O1".to_owned()],
+        };
+        let out = root.join("out");
+        let report = rebuild_probe_archives(&root, &toolchain, &out);
+        assert!(report.failed.is_empty(), "{report:?}");
+        let rebuilt = |library: &str| out.join(format!("aarch64-linux-gnu/lib{library}.a"));
+        let symbols = index_static_library_symbols(&[rebuilt("one"), rebuilt("two")]);
+        assert!(
+            symbols[&rebuilt("one")].contains("widget_scale"),
+            "{symbols:?}"
+        );
+        assert!(
+            symbols[&rebuilt("two")].contains("gadget_scale"),
+            "{symbols:?}"
+        );
+        assert!(
+            !symbols[&rebuilt("two")].contains("widget_scale"),
+            "{symbols:?}"
+        );
+
+        // Without the objects there is no telling the two apart: refused.
+        fs::remove_dir_all(probe.join("CMakeFiles")).unwrap();
+        let report = rebuild_probe_archives(&root, &toolchain, &out);
+        assert!(report.rebuilt.is_empty(), "{report:?}");
+        assert_eq!(report.failed.len(), 2, "{report:?}");
+        for (_, reason) in &report.failed {
+            assert!(
+                reason.contains("`util.c.o` matches 2 compile commands")
+                    && reason.contains("one/util.c")
+                    && reason.contains("two/util.c"),
+                "{reason}"
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

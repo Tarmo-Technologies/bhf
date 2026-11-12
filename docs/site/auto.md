@@ -69,7 +69,7 @@ their own interpreters with in-process edge coverage.
 | `--max-work-dir-mb <MiB>` | `4096` | Stop starting new targets once the allocated work-directory size reaches the ceiling. Completed and in-flight targets are preserved and reported, so parallel jobs can overshoot by their final artifacts. `0` disables the ceiling; findings are never deleted to meet it |
 | `--max-corpus-mb <MiB>` | `64` | Per-target retained coverage-corpus ceiling for both memory and `corpus/<harness-id>/queue/`. Finding testcases are separate and always preserved |
 | `--reuse-legacy-corpus` | off | In a work dir from an earlier release (migrated from the 0.2.x layout, or run by an earlier `bhf auto`), keep reseeding its old corpus instead of moving it to `corpus-legacy/` on the first run |
-| `--config <PATH>` | auto-load `.bhf.toml` | Load run options from a TOML file so a project's runs are reproducible; CLI flags always override it, and relative paths in it resolve against the file's own directory. Only the keys listed under [Config file](#config-file) are accepted, any other key is an error. Without this flag, a `.bhf.toml` in the scanned tree root is auto-loaded — but since that tree is untrusted, an auto-loaded config honors only SAFE knobs; the keys that EXECUTE something (`build-command`, `run-untrusted`, `unsafe-search-and-run-build-commands`, `probe-build`, and the whole `[toolchain]` table) are ignored, with a note, unless the config is passed explicitly with `--config` |
+| `--config <PATH>` | auto-load `.bhf.toml` | Load run options from a TOML file so a project's runs are reproducible; CLI flags always override it, and relative paths in it resolve against the file's own directory. Only the keys listed under [Config file](#config-file) are accepted, any other key is an error. Without this flag, a `.bhf.toml` in the scanned tree root is auto-loaded — but since that tree is untrusted, an auto-loaded config honors only SAFE knobs; the keys that EXECUTE something (`build-command`, `run-untrusted`, `unsafe-search-and-run-build-commands`, `probe-build`, and the whole `[toolchain]` and `[cross.<guard>]` tables) are ignored, with a note, unless the config is passed explicitly with `--config` |
 | `--dry-run` | off | Plan only: discover + rank targets, run the toolchain preflight, report the build-recovery plan, then EXIT without building or fuzzing — validate scope, config, and toolchains before a long run |
 | `--per-target-time <SECS>` | `60` | **Total** per-target fuzz wall, split evenly across the passes under one shared deadline (so the per-target wall ≈ this, not × pass count). libFuzzer `-max_total_time` / AFL `-V` parity (#402) |
 | `--per-target-finding-count <N>` | unset (collect all) | Stop a target as soon as it has produced N **distinct** findings (crash signatures), or when its `--per-target-time` is spent — whichever first. Checked mid-pass (stops the instant the Nth lands; remaining passes skipped). `1` ≈ libFuzzer stop-on-first-crash |
@@ -146,8 +146,8 @@ each spelled like its flag:
   `--no-seed-mining` flag), `sanitizers`, `engine`, `languages`, `passes`,
   `force`.
 - Explicit `--config` only, because they execute something: `build-command`,
-  `run-untrusted`, `unsafe-search-and-run-build-commands`, `probe-build`, and
-  the `[toolchain]` table.
+  `run-untrusted`, `unsafe-search-and-run-build-commands`, `probe-build`, the
+  `[toolchain]` table and the `[cross.<guard>]` tables.
 
 The other flags (target selection, `--resume`, `--dry-run`, output and
 diagnostic switches) have no key; a unit test keeps this list and the flag set
@@ -190,9 +190,29 @@ The C/C++ candidates become a cross sweep only when the C/C++ side builds for
 another target (`target`, or a cross `cc`); a runner set for a foreign
 `[toolchain.ada] target` alone runs just the Ada harnesses, and the C/C++
 candidates keep their native sanitizer builds. In a cross sweep, the archives
-`probe-build`/`build-command`/`run-untrusted` build for this host are not
-linked into the harnesses (their compile database still applies). See
+`probe-build`/`build-command`/`run-untrusted` build for this host (in the probe
+directory, or in the tree for a plain Makefile) are rebuilt for the target from
+the captured compile commands and linked in their place; an archive that cannot
+be rebuilt is named with the reason. In a native sweep
+with a GCC toolchain, the build probe builds its archives with that GCC and
+GCC-spelled instrumentation. See
 [Cross-Compilation](../cross-compilation/#whole-sweep-cross-targets).
+
+`[cross.<guard>]` tables override the toolchain and emulator of one
+guard-driven cross lane, the one candidates guarded for that platform take:
+
+```toml
+[cross.aarch64]                  # lanes: mingw, aarch64, armhf, ppc64le, ppc64, ppc, mipsel, mips, sparc64
+cc = "/opt/arm/bin/aarch64-none-linux-gnu-gcc"   # cxx follows (g++), or set cxx
+target = "aarch64-linux-gnu"     # without cc/cxx: <target>-gcc / <target>-g++
+sysroot = "/opt/arm/sysroot"     # --sysroot= for every compile and link, bhf's driver included
+runner = "qemu-aarch64"          # program that runs the harness
+runner-args = ["-L", "/opt/arm/sysroot"]
+```
+
+A key left out keeps bhf's built-in choice for the lane, and a clang `cc` gets
+`--target=<triple>`. See
+[Cross-Compilation](../cross-compilation/#overriding-a-lanes-toolchain).
 
 An Ada harness's project extends the governing project but replaces its
 `package Compiler` switches with bhf's own; add the switches the harness needs
@@ -578,6 +598,11 @@ The machine report. Each `built_and_fuzzed` target carries, under
 - `per_pass_budget_secs` / `total_wall_budget_secs` — the per-pass and effective
   total fuzz wall budgets (#402).
 - `passes[]` — one entry per pass, each with `executions`, `coverage_edges`,
+  `coverage_instrumentation` (the instrumentation that fed the edge map, read
+  from the harness binary: `sancov-trace-pc-guard` for clang's guard section,
+  `sancov-trace-pc` when GCC's debug information records a translation unit
+  compiled with `-fsanitize-coverage=trace-pc`, `go-cover`, or `edge-bitmap`
+  when the binary shows neither, as for a build without coverage),
   `elapsed_secs` (measured, not budget), `executions_per_sec`, and `findings`.
 
 The top-level `summary` carries `fuzz_confirmed` — how many static findings a

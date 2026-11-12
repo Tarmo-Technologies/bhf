@@ -676,6 +676,52 @@ BHF_NOCOV void __sanitizer_weak_hook_strcasecmp(void *pc, const char *s1, const 
     bhf_cmpp_buf((const unsigned char *)s1, (const unsigned char *)s2, BHF_CMP_OPMAX, result, pc);
 }
 
+/* The same hooks for a build without a sanitizer runtime, such as a cross
+ * build run under an emulator: no interceptor calls the hooks above there, so
+ * bhf links that harness with `-Wl,--wrap=<name>` for each function below. The
+ * linker then sends the program's own calls here; each one forwards to the real
+ * function and hands the hook its operands and result. In every other build the
+ * wrappers are unused and their `__real_` references stay unresolved, hence
+ * weak. */
+#if defined(__ELF__) && !defined(_WIN32)
+extern int __real_memcmp(const void *, const void *, size_t) __attribute__((weak));
+extern int __real_bcmp(const void *, const void *, size_t) __attribute__((weak));
+extern int __real_strcmp(const char *, const char *) __attribute__((weak));
+extern int __real_strncmp(const char *, const char *, size_t) __attribute__((weak));
+extern int __real_strcasecmp(const char *, const char *) __attribute__((weak));
+extern int __real_strncasecmp(const char *, const char *, size_t) __attribute__((weak));
+BHF_NOCOV int __wrap_memcmp(const void *s1, const void *s2, size_t n) {
+    int result = __real_memcmp(s1, s2, n);
+    __sanitizer_weak_hook_memcmp(__builtin_return_address(0), s1, s2, n, result);
+    return result;
+}
+BHF_NOCOV int __wrap_bcmp(const void *s1, const void *s2, size_t n) {
+    int result = __real_bcmp(s1, s2, n);
+    __sanitizer_weak_hook_memcmp(__builtin_return_address(0), s1, s2, n, result);
+    return result;
+}
+BHF_NOCOV int __wrap_strcmp(const char *s1, const char *s2) {
+    int result = __real_strcmp(s1, s2);
+    __sanitizer_weak_hook_strcmp(__builtin_return_address(0), s1, s2, result);
+    return result;
+}
+BHF_NOCOV int __wrap_strncmp(const char *s1, const char *s2, size_t n) {
+    int result = __real_strncmp(s1, s2, n);
+    __sanitizer_weak_hook_strncmp(__builtin_return_address(0), s1, s2, n, result);
+    return result;
+}
+BHF_NOCOV int __wrap_strcasecmp(const char *s1, const char *s2) {
+    int result = __real_strcasecmp(s1, s2);
+    __sanitizer_weak_hook_strcasecmp(__builtin_return_address(0), s1, s2, result);
+    return result;
+}
+BHF_NOCOV int __wrap_strncasecmp(const char *s1, const char *s2, size_t n) {
+    int result = __real_strncasecmp(s1, s2, n);
+    __sanitizer_weak_hook_strncasecmp(__builtin_return_address(0), s1, s2, n, result);
+    return result;
+}
+#endif
+
 BHF_NOCOV static void bhf_run_one_bytes(const uint8_t *data, size_t size) {
     BHF_PUBLISH_INPUT(data, size);
     bhf_run_one(data, size);

@@ -49,6 +49,7 @@ mod cmplog_cli;
 mod collector_run;
 mod command_output;
 mod corpus;
+mod coverage_kind;
 mod crash_identity;
 mod dashboard;
 mod decode_args;

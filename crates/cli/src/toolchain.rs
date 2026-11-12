@@ -470,6 +470,41 @@ pub(crate) fn make_values(
     ]
 }
 
+/// The toolchain's compile flags as plain arguments, for a compiler bhf runs
+/// directly rather than through a Makefile recipe: `--sysroot=`, a clang
+/// `--target=`, the defines and include directories, then `cflags` (or
+/// `cxxflags` for C++).
+pub(crate) fn compile_args(
+    config: &ToolchainConfig,
+    family: Option<CompilerFamily>,
+    cxx: bool,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(sysroot) = &config.sysroot {
+        args.push(format!("--sysroot={}", sysroot.display()));
+    }
+    if let (Some(target), Some(CompilerFamily::Clang)) = (&config.target, family) {
+        args.push(format!("--target={target}"));
+    }
+    args.extend(config.defines.iter().map(|define| format!("-D{define}")));
+    args.extend(
+        config
+            .include_dirs
+            .iter()
+            .map(|dir| format!("-I{}", dir.display())),
+    );
+    args.extend(
+        if cxx {
+            &config.cxxflags
+        } else {
+            &config.cflags
+        }
+        .iter()
+        .cloned(),
+    );
+    args
+}
+
 /// Whether `program` names an executable: a path to a file, or a name found
 /// on `PATH`.
 pub(crate) fn program_exists(program: &str) -> bool {
@@ -722,6 +757,10 @@ fn cross_sweep_target_with(
         cc,
         cxx,
         runner: crate::auto::cross_target::CrossRunner::Configured { exe: runner, args },
+        // The toolchain's sysroot reaches every compile through the
+        // published BHF_TOOLCHAIN_TARGET_FLAGS.
+        sysroot: None,
+        guard_lane: false,
     }))
 }
 
@@ -849,6 +888,22 @@ fn runner_hint(triple: &str) -> String {
     format!("qemu-{}", if arch.is_empty() { "<arch>" } else { arch })
 }
 
+/// Whether `compiler` builds programs this host runs: its `-dumpmachine`
+/// triple is the host's, or it cannot say. Asked once per compiler.
+pub(crate) fn compiler_builds_for_host(compiler: &str) -> bool {
+    static CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(known) = cache.lock().expect("host cache").get(compiler) {
+        return *known;
+    }
+    let host = dump_machine(compiler).is_none_or(|triple| triple_runs_natively(&triple));
+    cache
+        .lock()
+        .expect("host cache")
+        .insert(compiler.to_owned(), host);
+    host
+}
+
 /// `<compiler> -dumpmachine`, the triple it builds for.
 fn dump_machine(compiler: &str) -> Option<String> {
     let words = command_words(compiler);
@@ -958,6 +1013,38 @@ mod tests {
             .into_iter()
             .collect();
         assert_eq!(values[ENV_TARGET_FLAGS], "--sysroot=/opt/sysroot");
+    }
+
+    #[test]
+    fn compile_args_are_plain_arguments_in_toolchain_order() {
+        let config = ToolchainConfig {
+            defines: vec!["NAME=a b".to_owned()],
+            include_dirs: vec![PathBuf::from("/opt/sdk dir/include")],
+            sysroot: Some(PathBuf::from("/opt/sysroot")),
+            target: Some("aarch64-linux-gnu".to_owned()),
+            cflags: vec!["-mcpu=cortex-a53".to_owned()],
+            cxxflags: vec!["-fno-rtti".to_owned()],
+            ..ToolchainConfig::default()
+        };
+        assert_eq!(
+            compile_args(&config, Some(CompilerFamily::Gcc), false),
+            [
+                "--sysroot=/opt/sysroot",
+                "-DNAME=a b",
+                "-I/opt/sdk dir/include",
+                "-mcpu=cortex-a53"
+            ]
+        );
+        assert_eq!(
+            compile_args(&config, Some(CompilerFamily::Clang), true),
+            [
+                "--sysroot=/opt/sysroot",
+                "--target=aarch64-linux-gnu",
+                "-DNAME=a b",
+                "-I/opt/sdk dir/include",
+                "-fno-rtti"
+            ]
+        );
     }
 
     #[test]
@@ -1186,6 +1273,8 @@ mod tests {
                 exe: qemu.clone(),
                 args: Vec::new(),
             },
+            sysroot: None,
+            guard_lane: false,
         };
         assert_eq!(
             ada_runner(&config, Some(&sweep)),

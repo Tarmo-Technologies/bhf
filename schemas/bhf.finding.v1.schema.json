@@ -52,7 +52,29 @@
         "truncated": { "type": "boolean" },
         "unconfirmed": { "type": "integer", "minimum": 0 },
         "runs": { "type": "integer", "minimum": 0 },
-        "shim_armed": { "type": "boolean" }
+        "shim_armed": { "type": "boolean" },
+        "runner": {
+          "description": "The emulator the capture replayed a harness built for another platform under (qemu-aarch64); absent for a native replay.",
+          "type": "string"
+        }
+      }
+    },
+    "build": {
+      "description": "How the harness that produced the finding was built.",
+      "type": "object",
+      "properties": {
+        "binary": {
+          "description": "The harness binary's identity; null when it could not be read.",
+          "type": ["object", "null"],
+          "properties": {
+            "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "build_id": { "type": ["string", "null"] },
+            "coverage_instrumentation": {
+              "description": "The instrumentation that fed the edge map, read from the binary; absent when the binary does not show one.",
+              "enum": ["sancov-trace-pc-guard", "sancov-trace-pc", "go-cover"]
+            }
+          }
+        }
       }
     },
     "harness": {

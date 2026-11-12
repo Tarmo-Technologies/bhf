@@ -21,6 +21,11 @@ pub struct CFamilyCompilerOverride {
     pub cxx: String,
     pub cflags: Vec<String>,
     pub cxxflags: Vec<String>,
+    /// `Some`: the target-selection flags (`--sysroot=`, `--target=`) every
+    /// object and link of the build takes, bhf's driver object included,
+    /// rendered for a recipe; they replace the `[toolchain]`'s published
+    /// `BHF_TOOLCHAIN_TARGET_FLAGS`. `None` keeps those.
+    pub target_flags: Option<Vec<String>>,
 }
 
 /// Activate a coverage-capable Clang from the RHEL 7 LLVM Software Collection
@@ -1861,6 +1866,11 @@ fn apply_c_family_make_env(
         if !compiler.cxxflags.is_empty() {
             cmd.env("CXXFLAGS", compiler.cxxflags.join(" "));
         }
+        // CFLAGS/CXXFLAGS miss bhf's driver object, whose rule takes the
+        // target flags: a sysroot an SDK compiler needs goes there.
+        if let Some(flags) = &compiler.target_flags {
+            cmd.env(crate::toolchain::ENV_TARGET_FLAGS, flags.join(" "));
+        }
         (compiler.cc.clone(), compiler.cxx.clone())
     } else {
         let effective = crate::toolchain::effective_compilers();
@@ -3009,6 +3019,40 @@ mod tests {
             .expect("AUTO_EXTRA_LDFLAGS is set");
         assert!(ldflags.contains("-Wl,--as-needed"));
         assert!(ldflags.contains("-L/usr/lib/gcc/x86_64-linux-gnu/13"));
+    }
+
+    /// An override's target flags reach make as `BHF_TOOLCHAIN_TARGET_FLAGS`,
+    /// which every object rule takes (bhf's driver object included, which
+    /// CFLAGS does not reach); without them the published value stays.
+    #[test]
+    fn an_override_publishes_its_target_flags_to_every_object_rule() {
+        let staged = |target_flags: Option<Vec<String>>| {
+            let compiler = CFamilyCompilerOverride {
+                cc: "cc".to_owned(),
+                cxx: "c++".to_owned(),
+                cflags: vec!["-O1".to_owned()],
+                cxxflags: vec!["-O1".to_owned()],
+                target_flags,
+            };
+            let mut command = std::process::Command::new("make");
+            apply_c_family_make_env(&mut command, &[], &[], &[], Some(&compiler));
+            command
+                .get_envs()
+                .find(|(key, _)| *key == std::ffi::OsStr::new(crate::toolchain::ENV_TARGET_FLAGS))
+                .and_then(|(_, value)| value)
+                .map(|value| value.to_string_lossy().into_owned())
+        };
+        assert_eq!(
+            staged(Some(vec![
+                "--sysroot=\"/opt/sdk root\"".to_owned(),
+                "--target=aarch64-linux-gnu".to_owned(),
+            ]))
+            .as_deref(),
+            Some("--sysroot=\"/opt/sdk root\" --target=aarch64-linux-gnu")
+        );
+        // An empty set still replaces a host toolchain's sysroot.
+        assert_eq!(staged(Some(Vec::new())).as_deref(), Some(""));
+        assert_eq!(staged(None), None);
     }
 
     #[test]

@@ -3131,13 +3131,22 @@ fn passes_summary(passes: &[PassRun]) -> String {
         .collect();
     let mut line = parts.join(" ");
     // Edge coverage accumulates across passes, so the last/largest value is the
-    // total the target reached (#385). Only shown when a coverage runtime ran.
+    // total the target reached (#385). Only shown when a coverage runtime ran,
+    // with the instrumentation that fed it (`/sancov-trace-pc` for a GCC build).
     let cov = passes.iter().map(|p| p.coverage_edges).max().unwrap_or(0);
     if cov > 0 {
         if !line.is_empty() {
             line.push(' ');
         }
         line.push_str(&format!("cov={cov}edges"));
+        if let Some(kind) = passes
+            .iter()
+            .rev()
+            .find_map(|p| p.coverage_instrumentation.as_deref())
+        {
+            line.push('/');
+            line.push_str(kind);
+        }
     }
     line
 }
@@ -3733,6 +3742,7 @@ mod tests {
                         executions: 9,
                         target_entry_observed: true,
                         coverage_edges: 80,
+                        coverage_instrumentation: None,
                         elapsed_secs: 1.0,
                         executions_per_sec: 9.0,
                         findings: vec![finding.to_owned()],
@@ -3876,6 +3886,7 @@ mod tests {
                 executions: 9,
                 target_entry_observed: true,
                 coverage_edges: 80,
+                coverage_instrumentation: None,
                 elapsed_secs: 1.0,
                 executions_per_sec: 9.0,
                 // Order matters: the phantom precedes the survivor.
@@ -4622,6 +4633,7 @@ mod tests {
                 executions: 4123,
                 target_entry_observed: false,
                 coverage_edges: 180,
+                coverage_instrumentation: None,
                 elapsed_secs: 4.123,
                 executions_per_sec: 1000.0,
                 findings: vec![],
@@ -4632,6 +4644,7 @@ mod tests {
                 executions: 3811,
                 target_entry_observed: false,
                 coverage_edges: 240,
+                coverage_instrumentation: None,
                 elapsed_secs: 1.9055,
                 executions_per_sec: 2000.0,
                 findings: vec!["F-0001".to_owned()],
@@ -4642,6 +4655,7 @@ mod tests {
                 executions: 2901,
                 target_entry_observed: false,
                 coverage_edges: 252,
+                coverage_instrumentation: None,
                 elapsed_secs: 5.802,
                 executions_per_sec: 500.0,
                 findings: vec!["F-0002".to_owned(), "F-0003".to_owned()],
@@ -4936,6 +4950,7 @@ mod tests {
                 executions: 8_000_000,
                 target_entry_observed: false,
                 coverage_edges: 16,
+                coverage_instrumentation: None,
                 elapsed_secs: 10.0,
                 executions_per_sec: 800_000.0,
                 findings: vec![],
@@ -4964,6 +4979,7 @@ mod tests {
                 executions: 1000,
                 target_entry_observed: true,
                 coverage_edges: 1400,
+                coverage_instrumentation: None,
                 elapsed_secs: 1.0,
                 executions_per_sec: 1000.0,
                 findings: vec![],
@@ -5099,6 +5115,7 @@ mod tests {
                 executions: 1000,
                 target_entry_observed: false,
                 coverage_edges: 4,
+                coverage_instrumentation: None,
                 elapsed_secs: 1.0,
                 executions_per_sec: 1000.0,
                 findings: vec![fid.to_owned()],
@@ -5165,5 +5182,29 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&work).ok();
+    }
+
+    #[test]
+    fn the_passes_summary_names_the_coverage_instrumentation() {
+        use crate::auto::pass::Pass;
+        let run = |edges: usize, kind: Option<&str>| PassRun {
+            pass: Pass::Empty,
+            engine: "builtin".to_owned(),
+            executions: 5,
+            target_entry_observed: true,
+            coverage_edges: edges,
+            coverage_instrumentation: kind.map(str::to_owned),
+            elapsed_secs: 1.0,
+            executions_per_sec: 5.0,
+            findings: vec![],
+        };
+        assert_eq!(
+            passes_summary(&[run(137, Some("sancov-trace-pc"))]),
+            "empty=5execs/5exec_s/0f cov=137edges/sancov-trace-pc"
+        );
+        assert_eq!(
+            passes_summary(&[run(9, None)]),
+            "empty=5execs/5exec_s/0f cov=9edges"
+        );
     }
 }

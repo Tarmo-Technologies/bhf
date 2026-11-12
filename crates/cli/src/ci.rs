@@ -207,6 +207,7 @@ fn auto_args_from_ci(args: &CiArgs, scoped_files: &[PathBuf]) -> AutoArgs {
         discovery_cache: None,
         config: None,
         config_toolchain: None,
+        config_cross: None,
         toolchain: Default::default(),
         project: None,
         grammar_file: None,

@@ -625,23 +625,9 @@ fn an_ambient_clang_keeps_the_gcc_retry() {
     );
 }
 
-/// A cross sweep does not link the archives a build probe built for this
-/// host: it says so and builds the target from its sources instead of failing
-/// every link with "file in wrong format".
-#[test]
-fn a_cross_sweep_does_not_link_host_probe_archives() {
-    if !have("aarch64-linux-gnu-gcc")
-        || !have("qemu-aarch64")
-        || !have("cmake")
-        || !have("clang")
-        || !have("make")
-    {
-        eprintln!("skip: aarch64-linux-gnu-gcc/qemu-aarch64/cmake/clang/make unavailable");
-        return;
-    }
-    let tmp = tempfile::tempdir().unwrap();
-    let src = tmp.path().join("src");
-    std::fs::create_dir_all(&src).unwrap();
+/// A CMake project with a two-member static library, for the build-probe tests.
+fn write_cmake_widget(src: &Path) {
+    std::fs::create_dir_all(src).unwrap();
     std::fs::write(
         src.join("CMakeLists.txt"),
         "cmake_minimum_required(VERSION 3.10)\nproject(widget C)\n\
@@ -660,6 +646,81 @@ fn a_cross_sweep_does_not_link_host_probe_archives() {
          int parse_record(const unsigned char *data, size_t size) {\n\
              return size > 0 ? widget_scale(data[0]) : 0;\n\
          }\n",
+    )
+    .unwrap();
+}
+
+/// A cross sweep rebuilds the archives a build probe built for this host with
+/// the cross toolchain and links those, instead of leaving the project's
+/// library out of every cross-built harness.
+#[test]
+fn a_cross_sweep_links_the_probe_archives_rebuilt_for_its_target() {
+    if !have("aarch64-linux-gnu-gcc")
+        || !have("qemu-aarch64")
+        || !have("cmake")
+        || !have("clang")
+        || !have("make")
+    {
+        eprintln!("skip: aarch64-linux-gnu-gcc/qemu-aarch64/cmake/clang/make unavailable");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    write_cmake_widget(&src);
+    let work = tmp.path().join("work");
+    let output = bhf()
+        .args(auto_args(&src, &work))
+        .args([
+            "--languages",
+            "c",
+            "--deps-only",
+            "--probe-build",
+            "--target-triple",
+            "aarch64-linux-gnu",
+            "--runner",
+            "qemu-aarch64",
+        ])
+        .env_remove("CC")
+        .env_remove("CXX")
+        .output()
+        .unwrap();
+    let out = text(&output);
+    let rebuilt = work.join("auto/probe-archives/aarch64-linux-gnu/libwidget.a");
+    assert!(
+        out.contains(&format!("rebuilt probe archive {}", rebuilt.display())),
+        "{out}"
+    );
+    assert_eq!(elf_machine_of_archive(&rebuilt), EM_AARCH64);
+    assert!(
+        out.contains(&format!(
+            "linking probe-built instrumented library {}",
+            rebuilt.display()
+        )),
+        "the rebuilt archive is linked: {out}"
+    );
+    assert!(!out.contains("is not linked into the"), "{out}");
+    let target = target_with_outcome(&work, &["built", "built_and_fuzzed"])
+        .unwrap_or_else(|| panic!("the aarch64 target must build:\n{out}"));
+    assert_eq!(elf_machine(&harness_main(&work, &target)), EM_AARCH64);
+}
+
+/// A plain Makefile project's probe (the Make tier) builds its archive in the
+/// tree, beside its sources; a cross sweep rebuilds that archive for its
+/// target and links it too.
+#[test]
+fn a_cross_sweep_rebuilds_the_archive_a_plain_makefile_builds_in_the_tree() {
+    if !have("aarch64-linux-gnu-gcc") || !have("qemu-aarch64") || !have("make") || !have("cc") {
+        eprintln!("skip: aarch64-linux-gnu-gcc/qemu-aarch64/make/cc unavailable");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    write_cmake_widget(&src);
+    std::fs::remove_file(src.join("CMakeLists.txt")).unwrap();
+    std::fs::write(
+        src.join("Makefile"),
+        "CC ?= cc\nall: libwidget.a\nlibwidget.a: parse.o util.o\n\tar rcs $@ $^\n\
+         %.o: %.c\n\t$(CC) $(CFLAGS) -c $< -o $@\n",
     )
     .unwrap();
     let work = tmp.path().join("work");
@@ -681,14 +742,471 @@ fn a_cross_sweep_does_not_link_host_probe_archives() {
         .unwrap();
     let out = text(&output);
     assert!(
-        out.contains("not linked into the cross-built harnesses"),
-        "the limitation is announced: {out}"
+        src.join("libwidget.a").is_file(),
+        "the Make tier builds in place:\n{out}"
     );
+    let rebuilt = work.join("auto/probe-archives/aarch64-linux-gnu/libwidget.a");
     assert!(
-        !out.contains("linking probe-built instrumented library"),
+        out.contains(&format!("rebuilt probe archive {}", rebuilt.display())),
         "{out}"
     );
+    assert_eq!(elf_machine_of_archive(&rebuilt), EM_AARCH64);
+    assert!(
+        out.contains(&format!(
+            "linking probe-built instrumented library {}",
+            rebuilt.display()
+        )),
+        "the rebuilt archive is linked: {out}"
+    );
+}
+
+/// The ELF `e_machine` of the first object in the archive at `path`.
+fn elf_machine_of_archive(path: &Path) -> u16 {
+    let bytes = std::fs::read(path).expect("read archive");
+    let elf = bytes
+        .windows(4)
+        .position(|window| window == b"\x7fELF")
+        .expect("an ELF member");
+    u16::from_le_bytes([bytes[elf + 18], bytes[elf + 19]])
+}
+
+/// A native sweep with a GCC toolchain builds the probe's archives with that
+/// GCC and links them, instead of linking clang-built AddressSanitizer
+/// archives into GCC-built harnesses.
+#[test]
+fn a_gcc_toolchain_builds_and_links_gcc_probe_archives() {
+    if !have("gcc") || !have("cmake") || !have("make") || !have("readelf") {
+        eprintln!("skip: gcc/cmake/make/readelf unavailable");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    gcc_probe_builds_and_links_its_archive(&tmp.path().join("src"), &tmp.path().join("work"));
+}
+
+/// The GCC probe build works in a tree whose path has a space: the coverage
+/// hooks its links need still reach CMake's linker flags as one word.
+#[test]
+fn a_gcc_toolchain_probes_a_tree_whose_path_has_a_space() {
+    if !have("gcc") || !have("cmake") || !have("make") || !have("readelf") {
+        eprintln!("skip: gcc/cmake/make/readelf unavailable");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("my tree");
+    gcc_probe_builds_and_links_its_archive(&root.join("src"), &root.join("work"));
+}
+
+/// Run a native `--cc gcc` sweep with `--probe-build` over the CMake widget at
+/// `src`, and check the probe built its archive with GCC and the harness
+/// linked it.
+fn gcc_probe_builds_and_links_its_archive(src: &Path, work: &Path) {
+    let (src, work) = (src.to_path_buf(), work.to_path_buf());
+    write_cmake_widget(&src);
+    let output = bhf()
+        .args(auto_args(&src, &work))
+        .args([
+            "--languages",
+            "c",
+            "--deps-only",
+            "--probe-build",
+            "--cc",
+            "gcc",
+            "--cxx",
+            "g++",
+        ])
+        .env_remove("CC")
+        .env_remove("CXX")
+        .output()
+        .unwrap();
+    let out = text(&output);
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(src.join(".bhf-build/bhf-artifacts.json"))
+            .unwrap_or_else(|_| panic!("no probe manifest:\n{out}")),
+    )
+    .unwrap();
+    assert_eq!(manifest["instrumentation"]["cc"], "gcc", "{manifest}");
+    let flags = manifest["instrumentation"]["c_flags"].to_string();
+    assert!(
+        flags.contains("trace-pc,trace-cmp") && !flags.contains("trace-pc-guard"),
+        "{flags}"
+    );
+    let archive = src.join(".bhf-build/libwidget.a");
+    assert!(
+        compiler_comment(&archive).contains("GCC:")
+            && !compiler_comment(&archive).contains("clang"),
+        "{}",
+        compiler_comment(&archive)
+    );
+    assert!(
+        out.contains(&format!(
+            "linking probe-built instrumented library {}",
+            archive.display()
+        )),
+        "the gcc-built archive is linked: {out}"
+    );
     let target = target_with_outcome(&work, &["built", "built_and_fuzzed"])
-        .unwrap_or_else(|| panic!("the aarch64 target must build:\n{out}"));
+        .unwrap_or_else(|| panic!("the gcc target must build:\n{out}"));
+    let comment = compiler_comment(&harness_main(&work, &target));
+    assert!(
+        comment.contains("GCC:") && !comment.contains("clang"),
+        "{comment}"
+    );
+}
+
+/// `[cross.<guard>]` tables replace the compiler and the emulator of the
+/// guard-driven aarch64 and armhf lanes: the candidates under `arm64/` and
+/// `arm/` build with the configured compiler and run under the configured
+/// runner, with coverage.
+#[test]
+fn cross_tables_override_the_guard_lanes_compiler_and_runner() {
+    let tools = [
+        "aarch64-linux-gnu-gcc",
+        "arm-linux-gnueabihf-gcc",
+        "qemu-aarch64",
+        "qemu-arm",
+        "make",
+    ];
+    if tools.iter().any(|tool| !have(tool)) || std::env::consts::ARCH != "x86_64" {
+        eprintln!("skip: needs {tools:?} on an x86_64 host");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    write_parser(&src.join("arm64"));
+    std::fs::create_dir_all(src.join("arm")).unwrap();
+    std::fs::write(
+        src.join("arm/scale.c"),
+        "#include <stddef.h>\n\
+         int scale_record(const unsigned char *data, size_t size) {\n\
+             return size > 1 ? data[0] * data[1] : 0;\n\
+         }\n",
+    )
+    .unwrap();
+    let cfg = tmp.path().join("cfg");
+    let log = |name: &str| cfg.join(format!("{name}.log"));
+    write_script(
+        &cfg.join("tools/a64-gcc"),
+        &format!(
+            "#!/bin/sh\necho \"$*\" >> {}\nexec aarch64-linux-gnu-gcc \"$@\"\n",
+            log("a64-gcc").display()
+        ),
+    );
+    write_script(
+        &cfg.join("tools/a64-g++"),
+        "#!/bin/sh\nexec aarch64-linux-gnu-g++ \"$@\"\n",
+    );
+    write_script(
+        &cfg.join("tools/a64-run"),
+        &format!(
+            "#!/bin/sh\necho \"$*\" >> {}\nexec qemu-aarch64 \"$@\"\n",
+            log("a64-run").display()
+        ),
+    );
+    write_script(
+        &cfg.join("tools/arm-run"),
+        &format!(
+            "#!/bin/sh\necho \"$*\" >> {}\nexec qemu-arm -L /usr/arm-linux-gnueabihf \"$@\"\n",
+            log("arm-run").display()
+        ),
+    );
+    std::fs::write(
+        cfg.join("bhf.toml"),
+        "[cross.aarch64]\ncc = \"tools/a64-gcc\"\nrunner = \"tools/a64-run\"\n\
+         runner-args = [\"-L\", \"/usr/aarch64-linux-gnu\"]\n\n\
+         [cross.armhf]\ntarget = \"arm-linux-gnueabihf\"\nrunner = \"tools/arm-run\"\n",
+    )
+    .unwrap();
+    let work = tmp.path().join("work");
+    let output = bhf()
+        .args([
+            "auto".as_ref(),
+            src.as_os_str(),
+            "--work-dir".as_ref(),
+            work.as_os_str(),
+            "--max-targets".as_ref(),
+            "2".as_ref(),
+            "--jobs".as_ref(),
+            "1".as_ref(),
+            "--no-discovery-cache".as_ref(),
+        ])
+        .args(["--languages", "c", "--per-target-time", "10", "--config"])
+        .arg(cfg.join("bhf.toml"))
+        .env_remove("CC")
+        .env_remove("CXX")
+        .output()
+        .unwrap();
+    let out = text(&output);
+    assert!(
+        out.contains(&format!(
+            "[cross.aarch64]: aarch64-linux-gnu targets build with {}",
+            cfg.join("tools/a64-gcc").display()
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "[cross.armhf]: arm-linux-gnueabihf targets build with arm-linux-gnueabihf-gcc / \
+             arm-linux-gnueabihf-g++ and run under {}",
+            cfg.join("tools/arm-run").display()
+        )),
+        "{out}"
+    );
+    let targets = run_json(&work)["targets"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let fuzzed = |name: &str| {
+        targets
+            .iter()
+            .find(|target| target["name"] == name)
+            .filter(|target| target["outcome"]["outcome"] == "built_and_fuzzed")
+            .cloned()
+            .unwrap_or_else(|| panic!("{name} must build and fuzz:\n{out}"))
+    };
+    for (name, machine, logs) in [
+        (
+            "parse_record",
+            EM_AARCH64,
+            ["a64-gcc", "a64-run"].as_slice(),
+        ),
+        ("scale_record", 40u16, ["arm-run"].as_slice()),
+    ] {
+        let target = fuzzed(name);
+        let harness = harness_main(&work, &target);
+        assert_eq!(elf_machine(&harness), machine, "{name}");
+        for log_name in logs {
+            let text = std::fs::read_to_string(log(log_name)).unwrap_or_default();
+            assert!(
+                !text.is_empty(),
+                "{log_name} was not used for {name}:\n{out}"
+            );
+        }
+        let edges = target["outcome"]["passes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|pass| pass["coverage_edges"].as_u64())
+            .max()
+            .unwrap_or(0);
+        assert!(edges > 0, "{name} must be fuzzed with coverage: {target}");
+    }
+    assert!(
+        std::fs::read_to_string(log("a64-run"))
+            .unwrap()
+            .contains("-L /usr/aarch64-linux-gnu"),
+        "the runner gets its configured arguments"
+    );
+}
+
+/// A cross sweep's finding behind a `strcmp` gate records comparison
+/// evidence: the capture replays the harness under the sweep's emulator, and
+/// the harness reports its string comparisons without a sanitizer runtime.
+/// Its coverage is labelled with the instrumentation GCC used.
+#[test]
+fn a_cross_sweep_records_comparison_evidence_for_a_strcmp_gated_finding() {
+    if !have("aarch64-linux-gnu-gcc") || !have("qemu-aarch64") || !have("make") {
+        eprintln!("skip: aarch64-linux-gnu-gcc/qemu-aarch64/make unavailable");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("parse.c"),
+        "#include <stddef.h>\n#include <string.h>\n\
+         int parse_record(const unsigned char *data, size_t size) {\n\
+             char word[16];\n\
+             if (size == 0 || size >= sizeof word) return 0;\n\
+             memcpy(word, data, size);\n\
+             word[size] = 0;\n\
+             if (strcmp(word, \"OPEN-SESAME\") == 0) {\n\
+                 volatile int *p = (volatile int *)0;\n\
+                 *p = 1;\n\
+             }\n\
+             return 0;\n\
+         }\n",
+    )
+    .unwrap();
+    let seed = tmp.path().join("seed.bin");
+    std::fs::write(&seed, b"OPEN-SESAME").unwrap();
+    let work = tmp.path().join("work");
+    let output = bhf()
+        .args(auto_args(&src, &work))
+        .args([
+            "--languages",
+            "c",
+            "--per-target-time",
+            "15",
+            "--target-triple",
+            "aarch64-linux-gnu",
+            "--runner",
+            "qemu-aarch64",
+            "--seed-file",
+        ])
+        .arg(&seed)
+        .env_remove("CC")
+        .env_remove("CXX")
+        .output()
+        .unwrap();
+    let out = text(&output);
+    let target = target_with_outcome(&work, &["built_and_fuzzed"])
+        .unwrap_or_else(|| panic!("the aarch64 target must build and fuzz:\n{out}"));
+    let passes = target["outcome"]["passes"].as_array().expect("passes");
+    assert!(
+        passes
+            .iter()
+            .any(|pass| pass["coverage_instrumentation"] == "sancov-trace-pc"),
+        "GCC's trace-pc coverage is labelled as such: {passes:?}"
+    );
+    let harness_dir = harness_main(&work, &target).parent().unwrap().to_path_buf();
+    let runner: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(harness_dir.join("bhf_runner.json")).unwrap())
+            .unwrap();
+    assert_eq!(runner["program"], "qemu-aarch64", "{runner}");
+    let findings: Vec<serde_json::Value> = std::fs::read_dir(work.join("results/findings"))
+        .unwrap_or_else(|_| panic!("no findings:\n{out}"))
+        .flatten()
+        .filter_map(|entry| std::fs::read(entry.path().join("finding.json")).ok())
+        .filter_map(|bytes| serde_json::from_slice(&bytes).ok())
+        .collect();
+    let finding = findings
+        .iter()
+        .find(|finding| finding["gate_capture"].is_object())
+        .unwrap_or_else(|| panic!("no finding has a comparison capture: {findings:?}\n{out}"));
+    assert_eq!(
+        finding["gate_capture"]["status"], "recorded",
+        "{}",
+        finding["gate_capture"]
+    );
+    assert_eq!(finding["gate_capture"]["runner"], "qemu-aarch64");
+    let gate = finding["gates"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|gate| gate["cmp_kind"] == "strcmp")
+        .unwrap_or_else(|| panic!("no strcmp gate: {}", finding["gates"]));
+    assert_eq!(gate["operand_hex"], "4f50454e2d534553414d45", "{gate}");
+    assert_eq!(
+        finding["build"]["binary"]["coverage_instrumentation"], "sancov-trace-pc",
+        "{}",
+        finding["build"]
+    );
+}
+
+/// Run `bhf auto` over `src` with the config at `config`, fuzzing each target
+/// briefly.
+fn auto_with_config(src: &Path, work: &Path, config: &Path) -> String {
+    let output = bhf()
+        .args(auto_args(src, work))
+        .args(["--languages", "c", "--per-target-time", "5", "--config"])
+        .arg(config)
+        .env_remove("CC")
+        .env_remove("CXX")
+        .output()
+        .unwrap();
+    text(&output)
+}
+
+/// A `[cross.<lane>]` sysroot reaches every compile and link of the lane,
+/// bhf's own driver object included: an SDK compiler that refuses to compile
+/// or link a file without its sysroot still builds the guarded target.
+#[test]
+fn a_cross_table_sysroot_reaches_every_compile_and_link() {
+    let tools = ["aarch64-linux-gnu-gcc", "qemu-aarch64", "make"];
+    if tools.iter().any(|tool| !have(tool)) || std::env::consts::ARCH != "x86_64" {
+        eprintln!("skip: needs {tools:?} on an x86_64 host");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    write_parser(&src.join("arm64"));
+    let cfg = tmp.path().join("cfg");
+    let sdk = cfg.join("sdk root");
+    std::fs::create_dir_all(&sdk).unwrap();
+    let log = cfg.join("sdk.log");
+    for (name, real) in [
+        ("sdk-gcc", "aarch64-linux-gnu-gcc"),
+        ("sdk-g++", "aarch64-linux-gnu-g++"),
+    ] {
+        // Refuse a compile or link of any file without `--sysroot=<sdk>`,
+        // then run the installed cross compiler, whose own layout is the SDK.
+        write_script(
+            &cfg.join("tools").join(name),
+            &format!(
+                "#!/bin/sh\n\
+                 sysroot=no; files=no\n\
+                 for a in \"$@\"; do\n\
+                   case \"$a\" in '--sysroot={sdk}') sysroot=yes;; esac\n\
+                   case \"$a\" in *.c|*.cc|*.cpp|*.o|*.a) files=yes;; esac\n\
+                 done\n\
+                 if [ $files = yes ] && [ $sysroot = no ]; then\n\
+                   echo \"REFUSED $*\" >> '{log}'; echo '{name}: no --sysroot' >&2; exit 1\n\
+                 fi\n\
+                 echo \"OK $*\" >> '{log}'\n\
+                 for a do shift; case \"$a\" in --sysroot=*) ;; *) set -- \"$@\" \"$a\";; esac; done\n\
+                 exec {real} \"$@\"\n",
+                sdk = sdk.display(),
+                log = log.display(),
+            ),
+        );
+    }
+    std::fs::write(
+        cfg.join("bhf.toml"),
+        "[cross.aarch64]\ncc = \"tools/sdk-gcc\"\ncxx = \"tools/sdk-g++\"\n\
+         sysroot = \"sdk root\"\nrunner = \"qemu-aarch64\"\n\
+         runner-args = [\"-L\", \"/usr/aarch64-linux-gnu\"]\n",
+    )
+    .unwrap();
+    let work = tmp.path().join("work");
+    let out = auto_with_config(&src, &work, &cfg.join("bhf.toml"));
+    let calls = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !calls.contains("REFUSED"),
+        "a compile or link ran without the sysroot:\n{calls}\n{out}"
+    );
+    let sysroot = format!("--sysroot={}", sdk.display());
+    assert!(
+        calls
+            .lines()
+            .any(|line| line.contains("-o bhf_driver.o") && line.contains(&sysroot)),
+        "the driver object is compiled with the sysroot:\n{calls}"
+    );
+    let target = target_with_outcome(&work, &["built_and_fuzzed"])
+        .unwrap_or_else(|| panic!("the guarded target must build and fuzz:\n{out}"));
     assert_eq!(elf_machine(&harness_main(&work, &target)), EM_AARCH64);
+}
+
+/// A clang lane compiler builds for the lane's target: bhf adds
+/// `--target=<triple>` to its compiles and links, as it does for a
+/// `[toolchain]` clang.
+#[test]
+fn a_clang_cross_table_builds_for_the_lane_target() {
+    let tools = ["clang", "aarch64-linux-gnu-gcc", "qemu-aarch64", "make"];
+    if tools.iter().any(|tool| !have(tool)) || std::env::consts::ARCH != "x86_64" {
+        eprintln!("skip: needs {tools:?} on an x86_64 host");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    write_parser(&src.join("arm64"));
+    let cfg = tmp.path().join("bhf.toml");
+    std::fs::write(&cfg, "[cross.aarch64]\ncc = \"clang\"\n").unwrap();
+    let work = tmp.path().join("work");
+    let out = auto_with_config(&src, &work, &cfg);
+    let target = target_with_outcome(&work, &["built_and_fuzzed"])
+        .unwrap_or_else(|| panic!("the clang-built aarch64 target must build and fuzz:\n{out}"));
+    let harness = harness_main(&work, &target);
+    assert_eq!(elf_machine(&harness), EM_AARCH64);
+    assert!(
+        compiler_comment(&harness).contains("clang"),
+        "{}",
+        compiler_comment(&harness)
+    );
+    let passes = target["outcome"]["passes"].as_array().expect("passes");
+    assert!(
+        passes
+            .iter()
+            .any(|pass| pass["coverage_instrumentation"] == "sancov-trace-pc-guard"),
+        "{passes:?}"
+    );
 }

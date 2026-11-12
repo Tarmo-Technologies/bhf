@@ -28,6 +28,7 @@
 //! from ([`ToolchainConfig::resolve_relative_to`]), so a config behaves the same
 //! whatever directory bhf runs from.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -92,6 +93,101 @@ pub struct AdaToolchainConfig {
     pub switches: Vec<String>,
     /// AdaFuzz probe backend compiled into the harness runtime.
     pub probe_backend: Option<String>,
+}
+
+/// One `[cross.<guard>]` table of a `bhf auto` config: the toolchain and
+/// emulator the guard-driven cross lane uses for candidates whose definition
+/// is guarded for that foreign platform (`aarch64`, `armhf`, `mingw`, `ppc`,
+/// ...), in place of bhf's built-in choice. Every field is optional; one left
+/// out keeps the built-in value.
+///
+/// ```toml
+/// [cross.aarch64]
+/// cc = "/opt/arm/bin/aarch64-none-linux-gnu-gcc"
+/// sysroot = "/opt/arm/aarch64-none-linux-gnu/libc"
+/// runner = "qemu-aarch64"
+/// runner-args = ["-L", "/opt/arm/aarch64-none-linux-gnu/libc"]
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct CrossGuardConfig {
+    /// GNU target triple the candidates are built for. Without `cc`/`cxx` it
+    /// selects `<target>-gcc`/`<target>-g++`.
+    pub target: Option<String>,
+    /// C compiler: a program name looked up on `PATH`, or a path.
+    pub cc: Option<String>,
+    /// C++ compiler: a program name looked up on `PATH`, or a path.
+    pub cxx: Option<String>,
+    /// Sysroot handed to the compiler as `--sysroot=` (and, for a qemu-user
+    /// runner without `runner-args`, as its `-L`).
+    pub sysroot: Option<PathBuf>,
+    /// Program that runs the cross-built harness (`qemu-aarch64`, `wine`).
+    pub runner: Option<String>,
+    /// Arguments placed between the runner and the harness.
+    #[serde(default)]
+    pub runner_args: Vec<String>,
+}
+
+/// The `[cross]` tables of a config file, by guard name.
+pub type CrossConfig = BTreeMap<String, CrossGuardConfig>;
+
+impl CrossGuardConfig {
+    /// Whether the table sets nothing at all.
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+
+    /// Resolve relative paths against `base` (the directory of the config
+    /// file), as [`ToolchainConfig::resolve_relative_to`] does.
+    pub fn resolve_relative_to(&mut self, base: &Path) {
+        if let Some(sysroot) = &mut self.sysroot {
+            resolve_dir(sysroot, base);
+        }
+        for program in [&mut self.cc, &mut self.cxx, &mut self.runner]
+            .into_iter()
+            .flatten()
+        {
+            resolve_program(program, base);
+        }
+    }
+
+    /// Check every value of the `[cross.<guard>]` table for shape; errors name
+    /// the key as `cross.<guard>.<key>`.
+    pub fn validate(&self, guard: &str) -> Result<(), ToolchainConfigError> {
+        let key = |name: &str| format!("cross.{guard}.{name}");
+        for (name, program) in [
+            ("cc", &self.cc),
+            ("cxx", &self.cxx),
+            ("runner", &self.runner),
+        ] {
+            if let Some(program) = program {
+                check_program(&key(name), program)?;
+            }
+        }
+        for arg in &self.runner_args {
+            check_word(&key("runner-args"), arg)?;
+        }
+        if let Some(sysroot) = &self.sysroot {
+            check_dir(&key("sysroot"), sysroot)?;
+        }
+        if let Some(target) = &self.target {
+            check_triple(&key("target"), target)?;
+        }
+        Ok(())
+    }
+}
+
+/// The `[cross]` tables of a whole config file (empty when it has none).
+/// Other top-level keys are not looked at here.
+pub fn cross_config_from_file_text(text: &str) -> Result<CrossConfig, String> {
+    let table: toml::Table = toml::from_str(text).map_err(|error| error.to_string())?;
+    match table.get("cross") {
+        None => Ok(CrossConfig::new()),
+        Some(value) => value
+            .clone()
+            .try_into::<CrossConfig>()
+            .map_err(|error| format!("[cross]: {error}")),
+    }
 }
 
 /// A `[toolchain]` value that cannot be used, naming the key and the reason.
@@ -582,6 +678,81 @@ probe-backend = "memory_buffer"
         config.validate().unwrap();
         config.ada.prefix = Some("aarch64 linux".to_owned());
         assert_eq!(config.validate().unwrap_err().key(), "toolchain.ada.prefix");
+    }
+
+    #[test]
+    fn cross_tables_are_read_by_guard_resolved_and_validated() {
+        let text = r#"
+jobs = 2
+[cross.aarch64]
+cc = "tools/aarch64-linux-gnu-gcc"
+sysroot = "sysroots/arm64"
+runner = "qemu-aarch64"
+runner-args = ["-L", "/opt/arm64"]
+
+[cross.armhf]
+target = "arm-linux-gnueabihf"
+"#;
+        let mut cross = cross_config_from_file_text(text).unwrap();
+        assert_eq!(cross.len(), 2);
+        let aarch64 = cross.get_mut("aarch64").unwrap();
+        aarch64.resolve_relative_to(Path::new("/projects/widget"));
+        assert_eq!(
+            aarch64.cc.as_deref(),
+            Some("/projects/widget/tools/aarch64-linux-gnu-gcc")
+        );
+        assert_eq!(
+            aarch64.sysroot.as_deref(),
+            Some(Path::new("/projects/widget/sysroots/arm64"))
+        );
+        assert_eq!(
+            aarch64.runner.as_deref(),
+            Some("qemu-aarch64"),
+            "a bare name stays a PATH lookup"
+        );
+        aarch64.validate("aarch64").unwrap();
+        assert_eq!(
+            cross["armhf"].target.as_deref(),
+            Some("arm-linux-gnueabihf")
+        );
+        assert!(cross_config_from_file_text("jobs = 2\n")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn cross_table_errors_name_the_guard_and_key() {
+        let error =
+            cross_config_from_file_text("[cross.aarch64]\ncompiler = \"gcc\"\n").unwrap_err();
+        assert!(
+            error.contains("compiler") && error.contains("[cross]"),
+            "{error}"
+        );
+        let bad = CrossGuardConfig {
+            runner: Some("qemu-aarch64; id".to_owned()),
+            ..CrossGuardConfig::default()
+        };
+        assert_eq!(
+            bad.validate("aarch64").unwrap_err().key(),
+            "cross.aarch64.runner"
+        );
+        let bad = CrossGuardConfig {
+            target: Some("arm64".to_owned()),
+            ..CrossGuardConfig::default()
+        };
+        assert_eq!(
+            bad.validate("aarch64").unwrap_err().key(),
+            "cross.aarch64.target"
+        );
+        let bad = CrossGuardConfig {
+            runner_args: vec![String::new()],
+            ..CrossGuardConfig::default()
+        };
+        assert_eq!(
+            bad.validate("ppc").unwrap_err().key(),
+            "cross.ppc.runner-args"
+        );
+        assert!(CrossGuardConfig::default().is_empty());
     }
 
     #[test]
