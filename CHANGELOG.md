@@ -153,6 +153,9 @@
   no longer turns a UBSan finding into a frameless report and `exit status: 0`.
   The script exits with the harness's status, 128 plus the signal for a
   harness killed by one.
+- The `reproduce: bhf replay --finding <dir>` line of `bhf auto`'s top-findings
+  summary quotes a finding dir whose path has a space, so it pastes as one
+  argument.
 - Classification reads a GNAT-style message (`parser.adb:17 range check
   failed`, `unit.adb:42:7 index check failed`) after its source location, as
   it already did for `file:line:` prefixes, so a unit named `timeout_ctl` or

@@ -208,7 +208,8 @@ pub fn render_top_findings(work_dir: &Path, max: usize) -> String {
             row.severity.to_uppercase(),
             row.rule_id,
             msg,
-            row.dir.display(),
+            // One shell word, so a work dir with a space pastes as one argument.
+            crate::repro_lane::sh_word(&row.dir.to_string_lossy()),
         ));
     }
     out
@@ -379,5 +380,23 @@ mod tests {
         assert!(hi < lo, "high severity should rank first:\n{text}");
         assert!(text.contains("bhf replay --finding"));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A work dir whose path has a space still gives a reproduce command that
+    /// pastes as one argument.
+    #[test]
+    fn the_reproduce_command_quotes_a_finding_dir_with_a_space() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("my work");
+        let finding = corpus::layout::findings_dir(&work).join("F-0001-0a0b0c0d");
+        std::fs::create_dir_all(&finding).unwrap();
+        std::fs::write(
+            finding.join("finding.json"),
+            r#"{"id":"F-0001-0a0b0c0d","rule_id":"BHF-201","exception":{"message":"boom"}}"#,
+        )
+        .unwrap();
+        let text = render_top_findings(&work, 8);
+        let expected = format!("reproduce: bhf replay --finding '{}'\n", finding.display());
+        assert!(text.contains(&expected), "{text}");
     }
 }
