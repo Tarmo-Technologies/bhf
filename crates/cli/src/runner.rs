@@ -24,19 +24,135 @@ pub(crate) enum SandboxModeArg {
     Bubblewrap,
 }
 
-pub(crate) fn harness_runner(
+/// The runner for a command that runs a finding's or a work dir's harness:
+/// an explicit `qemu_user` wins; otherwise the emulator recorded
+/// beside the harness ([`recorded_runner_for`]) runs it, with a note saying
+/// so; otherwise it runs directly, and a harness built for an architecture
+/// this host cannot run is refused before it runs, naming the flag to pass.
+pub(crate) fn harness_runner_for(
     harness: PathBuf,
     qemu_user: Option<PathBuf>,
     qemu_args: Vec<String>,
     sandbox: SandboxModeArg,
     sandbox_tool: Option<PathBuf>,
     sandbox_strict: bool,
-) -> HarnessRunner {
-    let wrapper = qemu_user.map(|exe| HarnessWrapper::QemuUser {
-        exe,
-        args: qemu_args,
-    });
-    harness_runner_with_wrapper(harness, wrapper, sandbox, sandbox_tool, sandbox_strict)
+) -> Result<HarnessRunner, String> {
+    let wrapper = match qemu_user {
+        Some(exe) => Some(HarnessWrapper::QemuUser {
+            exe,
+            args: qemu_args,
+        }),
+        None => match recorded_runner_for(&harness) {
+            Some(recorded) => {
+                bhfeprintln!(
+                    "note: running {} under the recorded runner {}",
+                    harness.display(),
+                    runner_text(&recorded)
+                );
+                Some(HarnessWrapper::QemuUser {
+                    exe: recorded.program,
+                    args: recorded.args,
+                })
+            }
+            None => {
+                refuse_foreign_harness(&harness)?;
+                None
+            }
+        },
+    };
+    Ok(harness_runner_with_wrapper(
+        harness,
+        wrapper,
+        sandbox,
+        sandbox_tool,
+        sandbox_strict,
+    ))
+}
+
+/// `program arg...`, as a command line shows it.
+fn runner_text(runner: &crate::gate_evidence::HarnessRunner) -> String {
+    std::iter::once(runner.program.display().to_string())
+        .chain(runner.args.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The emulator recorded for `harness` (`bhf_runner.json`): beside it, or,
+/// for a binary `bhf build` staged into `<work>/build/<id>/main`, in the
+/// harness dir it was built from (`harnesses/<id>/`, ...).
+pub(crate) fn recorded_runner_for(harness: &Path) -> Option<crate::gate_evidence::HarnessRunner> {
+    crate::gate_evidence::recorded_runner(harness).or_else(|| {
+        let dir = harness.parent()?;
+        let id = dir.file_name()?.to_str()?;
+        let build = dir.parent()?;
+        if build.file_name()? != "build" {
+            return None;
+        }
+        let work = build.parent()?;
+        crate::auto::layout::harness_dir_candidates(work, id)
+            .into_iter()
+            .find_map(|dir| crate::gate_evidence::recorded_runner(&dir.join("main")))
+    })
+}
+
+/// Whether a binary for `machine` runs on this host without an emulator: the
+/// host's own machine, or the 32-bit one an x86_64 or AArch64 kernel also
+/// runs.
+fn runs_natively(machine: u16) -> bool {
+    match host_elf_machine() {
+        Some(host) if host == machine => true,
+        Some(62) => machine == 3,
+        Some(183) => machine == 40,
+        Some(_) => false,
+        // An unknown host: do not second-guess it.
+        None => true,
+    }
+}
+
+/// The qemu-user program for an ELF harness, by its machine and byte order.
+fn qemu_program(info: &ElfInfo) -> String {
+    let arch = match (info.machine, info.big_endian, info.class64) {
+        (3, _, _) => "i386",
+        (62, _, _) => "x86_64",
+        (183, false, _) => "aarch64",
+        (183, true, _) => "aarch64_be",
+        (40, false, _) => "arm",
+        (40, true, _) => "armeb",
+        (243, _, true) => "riscv64",
+        (243, _, false) => "riscv32",
+        (8, true, false) => "mips",
+        (8, false, false) => "mipsel",
+        (8, true, true) => "mips64",
+        (8, false, true) => "mips64el",
+        (20, _, _) => "ppc",
+        (21, true, _) => "ppc64",
+        (21, false, _) => "ppc64le",
+        (22, _, _) => "s390x",
+        (2, _, _) => "sparc",
+        (43, _, _) => "sparc64",
+        (258, _, _) => "loongarch64",
+        _ => return "qemu-<arch>".to_owned(),
+    };
+    format!("qemu-{arch}")
+}
+
+/// Refuse to run `harness` directly when it is an ELF binary for another
+/// architecture: it would fail to execute, or fail in its loader, and look
+/// like a broken harness.
+pub(crate) fn refuse_foreign_harness(harness: &Path) -> Result<(), String> {
+    let Some(info) = elf_info(harness) else {
+        return Ok(());
+    };
+    if runs_natively(info.machine) {
+        return Ok(());
+    }
+    Err(format!(
+        "{} is built for {}; run it under an emulator: --qemu-user {} [--qemu-arg ...] (a \
+         dynamically linked harness also needs --qemu-arg=-L --qemu-arg=<its sysroot>)",
+        harness.display(),
+        elf_machine_name(info.machine),
+        qemu_program(&info)
+    ))
 }
 
 /// Build a `HarnessRunner` for a harness launched directly, under qemu-user, or
@@ -151,6 +267,43 @@ pub(crate) fn elf_info(path: &Path) -> Option<ElfInfo> {
         class64,
         big_endian,
     })
+}
+
+/// The ELF `e_machine` of the host bhf runs on, when it has one.
+pub(crate) fn host_elf_machine() -> Option<u16> {
+    Some(match std::env::consts::ARCH {
+        "x86_64" => 62,
+        "x86" => 3,
+        "aarch64" => 183,
+        "arm" => 40,
+        "riscv64" | "riscv32" => 243,
+        "powerpc64" => 21,
+        "powerpc" => 20,
+        "mips" | "mips64" => 8,
+        "s390x" => 22,
+        "loongarch64" => 258,
+        "sparc64" => 43,
+        _ => return None,
+    })
+}
+
+/// A short architecture name for an ELF `e_machine`.
+pub(crate) fn elf_machine_name(machine: u16) -> String {
+    match machine {
+        2 => "sparc".to_owned(),
+        3 => "x86 (i386)".to_owned(),
+        8 => "mips".to_owned(),
+        20 => "powerpc".to_owned(),
+        21 => "powerpc64".to_owned(),
+        22 => "s390x".to_owned(),
+        40 => "arm".to_owned(),
+        43 => "sparc64".to_owned(),
+        62 => "x86_64".to_owned(),
+        183 => "aarch64".to_owned(),
+        243 => "riscv".to_owned(),
+        258 => "loongarch".to_owned(),
+        other => format!("ELF machine {other}"),
+    }
 }
 
 /// Whether the ELF file at `path` carries a symbol table or debug

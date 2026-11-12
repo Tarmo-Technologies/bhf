@@ -51,7 +51,8 @@ sanitizer's own runtime options in the environment. bhf **merges** your
 inherited `<SAN>_OPTIONS` with the keys it requires (`abort_on_error`,
 `halt_on_error`, `detect_leaks`) — your keys are kept, bhf's go last so they
 win (you cannot accidentally disable `abort_on_error`, which is what turns a
-sanitizer report into a saved finding). `UBSAN_OPTIONS` also always gets
+sanitizer report into a saved finding; a child run under qemu-user gets
+`abort_on_error=0` instead, see below). `UBSAN_OPTIONS` also always gets
 `print_stacktrace=1` and `report_error_type=1`, during fuzzing, minimization,
 `bhf replay` and in the generated `replay.py`. The `replay.py` reproducer
 merges the same way (`ASAN_OPTIONS` gets `abort_on_error=1:halt_on_error=1`,
@@ -83,6 +84,16 @@ Common RTOS / partial-build false-positive killers:
 - `detect_stack_use_after_return=0` — RTOS cooperative context switches confuse
   ASan's fake stack.
 - `suppressions=<file>` — silence a specific known-benign report.
+
+Under qemu-user, a guest abort makes the emulator dump its own address space,
+which takes minutes. A fuzz, minimization, replay or comparison-capture child
+that runs under an emulator (`--qemu-user`, or the emulator recorded beside a
+cross-built harness in `bhf_runner.json`) therefore gets `abort_on_error=0`
+after bhf's other keys, and runs with core dumps off: the sanitizer still
+exits non-zero after its report, and that exit is classified as the crash.
+The generated `replay.py` does the same whenever it runs the harness under a
+runner (its embedded `RUNNER`, the `bhf_runner.json` beside the harness, or a
+non-empty `BHF_REPLAY_RUNNER`); a native run keeps `abort_on_error=1`.
 
 ## How a sanitizer report is classified
 

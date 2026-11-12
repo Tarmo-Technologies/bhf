@@ -142,3 +142,249 @@ fn frameless_crashes_of_two_cross_harnesses_are_two_root_cause_groups() {
         "{index}"
     );
 }
+
+/// An AArch64 trap (`__builtin_trap`, or a bounds check built to trap) raises
+/// SIGTRAP: it is a finding, not a rejected input. A cross finding replays
+/// under the emulator recorded beside its harness, with no `--qemu-user`, and
+/// its fidelity record names the target and the emulator, and no sanitizer.
+#[test]
+fn a_cross_sweep_reports_traps_replays_under_the_recorded_runner_and_labels_fidelity() {
+    if !cross_tools() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("records.c"),
+        "#include <stddef.h>\n\
+         int check_magic(const unsigned char *data, size_t size) {\n\
+             if (size > 0 && data[0] != 0x7f) __builtin_trap();\n\
+             return 0;\n\
+         }\n",
+    )
+    .unwrap();
+    let work = tmp.path().join("work");
+    let out = cross_sweep(&src, &work, 1);
+    let found = findings(&work);
+    let (dir, trap) = found
+        .iter()
+        .find(|(_, finding)| finding["exception"]["signal"] == "SIGTRAP")
+        .unwrap_or_else(|| panic!("the trap is a finding: {found:#?}\n{out}"));
+    assert_eq!(trap["rule_id"], "BHF-210", "{trap}");
+    assert_eq!(
+        found
+            .iter()
+            .filter(|(_, finding)| finding["exception"]["signal"] == "SIGTRAP")
+            .count(),
+        1,
+        "one finding for the one trap: {found:#?}"
+    );
+
+    let fidelity = &trap["fidelity"];
+    let arch = fidelity["arch"]["reason"].as_str().unwrap_or_default();
+    assert!(
+        arch.contains("aarch64-linux-gnu") && arch.contains("qemu-aarch64"),
+        "{fidelity:#}"
+    );
+    assert!(!arch.contains("host"), "{fidelity:#}");
+    let endianness = fidelity["endianness"]["reason"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(!endianness.contains("host"), "{fidelity:#}");
+    assert_eq!(
+        fidelity["sanitizers"]["status"], "not_exercised",
+        "{fidelity:#}"
+    );
+
+    let started = std::time::Instant::now();
+    let replay = bhf().arg("replay").arg(dir).output().unwrap();
+    let replay_text = text(&replay);
+    assert_eq!(replay.status.code(), Some(0), "{replay_text}");
+    assert!(
+        String::from_utf8_lossy(&replay.stdout).starts_with("MATCH"),
+        "{replay_text}"
+    );
+    assert!(
+        replay_text.contains("under the recorded runner qemu-aarch64"),
+        "{replay_text}"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+}
+
+/// A sanitized AArch64 harness replayed under qemu-user: its report ends the
+/// run without an abort (which makes the emulator spend minutes on its own
+/// address space), so the replay finishes well inside the replay timeout and
+/// matches.
+#[test]
+fn an_emulated_sanitized_replay_finishes_quickly_and_matches() {
+    if !cross_tools() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("work");
+    let harness_dir = work.join("harnesses/H-ASAN");
+    std::fs::create_dir_all(&harness_dir).unwrap();
+    std::fs::write(
+        harness_dir.join("target.c"),
+        "#include <stdint.h>\n#include <stddef.h>\n#include <stdlib.h>\n\
+         __attribute__((noinline)) void copy_at(char *out, size_t n) { out[n] = 1; }\n\
+         int bhf_run_one(const uint8_t *data, size_t size) {\n\
+             char *out = malloc(4);\n\
+             if (size > 0 && data[0] == 'W') copy_at(out, 4);\n\
+             free(out);\n\
+             return 0;\n\
+         }\n",
+    )
+    .unwrap();
+    let driver = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../c_runtime/bhf_driver.c");
+    let built = Command::new("aarch64-linux-gnu-gcc")
+        .current_dir(&harness_dir)
+        .args([
+            "-O1",
+            "-g",
+            "-fsanitize=address",
+            "-static-libasan",
+            "-o",
+            "main",
+            "target.c",
+        ])
+        .arg(&driver)
+        .output()
+        .unwrap();
+    if !built.status.success() {
+        eprintln!(
+            "skip: the cross compiler has no AddressSanitizer: {}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        return;
+    }
+    let harness = harness_dir.join("main");
+    let input = tmp.path().join("input.bin");
+    std::fs::write(&input, b"W").unwrap();
+    let run = Command::new("qemu-aarch64")
+        .args(["-L", "/usr/aarch64-linux-gnu"])
+        .arg(&harness)
+        .arg(&input)
+        .env("ASAN_OPTIONS", "abort_on_error=0:detect_leaks=0")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+    let Some(report) = corpus::parse_sanitizer_report(&stderr) else {
+        eprintln!("skip: no sanitizer report under the emulator: {stderr}");
+        return;
+    };
+    let sha256 = {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(std::fs::read(&harness).unwrap()))
+    };
+    let id = corpus::FindingEmitter::with_metadata(
+        work.clone(),
+        "H-ASAN".to_owned(),
+        "c".to_owned(),
+        harness.display().to_string(),
+    )
+    .with_build_binary(serde_json::json!({"sha256": sha256}))
+    .emit_sanitizer_crash_with_log(b"W", &report, Some(stderr.as_bytes()))
+    .unwrap();
+    let finding = corpus::layout::findings_dir(&work).join(id.0);
+
+    let started = std::time::Instant::now();
+    let replay = bhf()
+        .arg("replay")
+        .arg(&finding)
+        .args([
+            "--qemu-user",
+            "qemu-aarch64",
+            "--qemu-arg=-L",
+            "--qemu-arg=/usr/aarch64-linux-gnu",
+            "--sandbox",
+            "none",
+        ])
+        .output()
+        .unwrap();
+    let elapsed = started.elapsed();
+    let replay_text = text(&replay);
+    assert_eq!(replay.status.code(), Some(0), "{replay_text}");
+    assert!(!replay_text.contains("timed out"), "{replay_text}");
+    assert!(
+        elapsed < std::time::Duration::from_secs(8),
+        "the replay took {elapsed:?}: {replay_text}"
+    );
+
+    // The generated replay.py runs the harness under the emulator recorded
+    // beside it, with the same options: the report ends the run without an
+    // abort, so the script finishes quickly too.
+    if !have("python3") {
+        eprintln!("skip: python3 unavailable for replay.py");
+        return;
+    }
+    std::fs::write(
+        harness_dir.join("bhf_runner.json"),
+        serde_json::json!({
+            "schema": "bhf.harness_runner.v1",
+            "program": "qemu-aarch64",
+            "args": ["-L", "/usr/aarch64-linux-gnu"],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let report = bhf()
+        .arg("report")
+        .arg("--work-dir")
+        .arg(&work)
+        .output()
+        .unwrap();
+    assert!(report.status.success(), "{}", text(&report));
+    let script = finding.join("replay.py");
+    assert!(script.is_file(), "{}", text(&report));
+    let log = tmp.path().join("replay-py.log");
+    let started = std::time::Instant::now();
+    let mut command = Command::new("python3");
+    command
+        .arg(&script)
+        .env("ASAN_OPTIONS", "abort_on_error=1")
+        .env_remove("BHF_REPLAY_RUNNER")
+        .stdout(std::fs::File::create(&log).unwrap())
+        .stderr(std::process::Stdio::null());
+    // Its own process group, so a run that hangs is killed with the emulator
+    // it started.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let mut child = command.spawn().unwrap();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if started.elapsed() > std::time::Duration::from_secs(40) {
+            #[cfg(unix)]
+            let _ = Command::new("kill")
+                .arg("-KILL")
+                .arg(format!("-{}", child.id()))
+                .status();
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "replay.py still running after {:?}: {}",
+                started.elapsed(),
+                std::fs::read_to_string(&log).unwrap_or_default()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let elapsed = started.elapsed();
+    let output = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        output.contains("qemu-aarch64 -L /usr/aarch64-linux-gnu"),
+        "{output}"
+    );
+    assert!(output.contains("ERROR: AddressSanitizer"), "{output}");
+    assert!(
+        status.code().is_some_and(|code| code != 0 && code != 134),
+        "{status:?}: {output}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "replay.py took {elapsed:?}: {output}"
+    );
+}

@@ -646,6 +646,8 @@ fn plan_to_fuzz_args(
         no_fork_server: false,
         seed_inputs: Vec::new(),
         seed_files,
+        qemu_user: None,
+        qemu_args: Vec::new(),
         seed_bytes: Vec::new(),
         seeds_layout_prefixed: false,
         sanitizers: Vec::new(),

@@ -568,6 +568,15 @@ MATCH
   `harnesses/`, `auto/`, `generated_harnesses/` and `build/`. Only when none of
   those exists is an absolute `fixture_path` into another work dir used as
   recorded.
+- **Runner.** `--qemu-user` (with `--qemu-arg`) runs the harness under an
+  emulator. Without it, a cross-built harness runs under the emulator its
+  build recorded beside it (`bhf_runner.json`), with a note naming it, and a
+  harness built for an architecture this host cannot run is refused before it
+  runs, with the flag to pass. Under an emulator the sanitizer options get
+  `abort_on_error=0` and core dumps are off. `bhf minimize`, `bhf fuzz`,
+  `bhf decode-args`, `bhf corpus minimize` and `bhf report --backfill` resolve
+  the runner the same way. See
+  [Cross-compilation](cross-compilation.md#qemu-user-replay).
 - **Protocol.** `bhf fuzz`, `bhf replay` and `bhf minimize` decide how a
   harness takes its input the same way: a `harness-protocol.json` next to the
   binary (written by `bhf project run`), the `BHF_FRAMED` marker in a launcher

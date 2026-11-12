@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::finding_arg::resolve_finding_arg;
-use crate::runner::{detect_harness_engine_in, harness_runner, HarnessEngine, SandboxModeArg};
+use crate::runner::{detect_harness_engine_in, harness_runner_for, HarnessEngine, SandboxModeArg};
 use anyhow::{anyhow, Context};
 use clap::ValueEnum;
 use serde_json::json;
@@ -31,7 +31,10 @@ pub struct MinimizeArgs {
     #[arg(long)]
     pub harness: Option<PathBuf>,
 
-    /// qemu-user executable for ELF-Linux cross-target minimization.
+    /// qemu-user executable for ELF-Linux cross-target minimization. Default:
+    /// the emulator recorded beside the harness (`bhf_runner.json`, written by
+    /// a cross build); a harness built for another architecture with neither
+    /// is refused.
     #[arg(long, value_name = "QEMU")]
     pub qemu_user: Option<PathBuf>,
 
@@ -103,11 +106,11 @@ enum CEngineIo {
 /// sink, site or pc).
 fn minimize_c_engine(
     finding_dir: &Path,
-    harness: &Path,
+    runner: &replay_min::HarnessRunner,
     strategy: MinimizeStrategy,
     io: CEngineIo,
 ) -> anyhow::Result<MinimizeSummary> {
-    minimize_c_engine_until(finding_dir, harness, strategy, io, None)
+    minimize_c_engine_until(finding_dir, runner, strategy, io, None)
 }
 
 /// Like [`minimize_c_engine`], but stops accepting further reductions once
@@ -116,11 +119,12 @@ fn minimize_c_engine(
 /// bounded `auto` minimization pass to cap wall-clock time per finding.
 fn minimize_c_engine_until(
     finding_dir: &Path,
-    harness: &Path,
+    runner: &replay_min::HarnessRunner,
     strategy: MinimizeStrategy,
     io: CEngineIo,
     deadline: Option<std::time::Instant>,
 ) -> anyhow::Result<MinimizeSummary> {
+    let harness = runner.harness_path();
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     if strategy != MinimizeStrategy::Bytes {
@@ -142,8 +146,7 @@ fn minimize_c_engine_until(
         .is_some_and(|raw| crate::replay::is_leak_finding(&raw));
     // The fuzz child's sanitizer options (UBSan prints and continues by
     // default), so a finding reproduces as the crash it was recorded as.
-    let sanitizer_env = crate::fuzz::sanitizer_child_env(leak);
-    let runner = replay_min::HarnessRunner::direct(harness);
+    let sanitizer_env = crate::fuzz::sanitizer_child_env_for(leak, runner.qemu_prefix().is_some());
     let input = match io {
         CEngineIo::ArgvFile => crate::replay::CInput::ArgvFile,
         CEngineIo::Stdin => crate::replay::CInput::Stdin,
@@ -157,7 +160,7 @@ fn minimize_c_engine_until(
         fs::write(&path, bytes).with_context(|| format!("write {}", path.display()))?;
         // Its own process group: a timeout kills whatever the harness started.
         let run = crate::replay::run_c_harness(
-            &runner,
+            runner,
             input,
             &path,
             Duration::from_secs(10),
@@ -255,9 +258,16 @@ pub(crate) fn minimize_for_auto(
         HarnessEngine::CLibFuzzer => CEngineIo::ArgvFile,
         HarnessEngine::AdaStdin => return Ok(None),
     };
+    // A cross-built harness runs under the emulator recorded beside it.
+    let runner = match crate::runner::recorded_runner_for(harness) {
+        Some(recorded) => {
+            replay_min::HarnessRunner::qemu_user(recorded.program, recorded.args, harness)
+        }
+        None => replay_min::HarnessRunner::direct(harness),
+    };
     minimize_c_engine_until(
         finding_dir,
-        harness,
+        &runner,
         MinimizeStrategy::Bytes,
         io,
         Some(deadline),
@@ -348,29 +358,32 @@ fn run_inner(args: MinimizeArgs) -> anyhow::Result<MinimizeSummary> {
             reduced: result.reduced,
         });
     }
-    // Dispatch by engine, with the protocol detector fuzz and replay use (the
-    // harness's sources are searched in every harness dir of the work dir
-    // holding the finding). Both C engines reuse the same delta-debug
-    // skeleton but differ in how a candidate input reaches main():
-    // libFuzzer takes argv[1], AFL persistent-mode reads stdin (the
-    // generated template falls back to `bhf_afl_read_stdin`).
-    match engine_for_finding(&harness, &finding_dir) {
-        HarnessEngine::CAfl => {
-            return minimize_c_engine(&finding_dir, &harness, args.strategy, CEngineIo::Stdin);
-        }
-        HarnessEngine::CLibFuzzer => {
-            return minimize_c_engine(&finding_dir, &harness, args.strategy, CEngineIo::ArgvFile);
-        }
-        HarnessEngine::AdaStdin => {}
-    }
-    let runner = harness_runner(
+    // One runner for every engine, so --qemu-user, the emulator recorded
+    // beside a cross-built harness, and the sandbox apply to all of them.
+    let runner = harness_runner_for(
         harness,
         args.qemu_user,
         args.qemu_args,
         args.sandbox,
         args.sandbox_tool,
         args.sandbox_strict,
-    );
+    )
+    .map_err(|error| anyhow!(error))?;
+    // Dispatch by engine, with the protocol detector fuzz and replay use (the
+    // harness's sources are searched in every harness dir of the work dir
+    // holding the finding). Both C engines reuse the same delta-debug
+    // skeleton but differ in how a candidate input reaches main():
+    // libFuzzer takes argv[1], AFL persistent-mode reads stdin (the
+    // generated template falls back to `bhf_afl_read_stdin`).
+    match engine_for_finding(runner.harness_path(), &finding_dir) {
+        HarnessEngine::CAfl => {
+            return minimize_c_engine(&finding_dir, &runner, args.strategy, CEngineIo::Stdin);
+        }
+        HarnessEngine::CLibFuzzer => {
+            return minimize_c_engine(&finding_dir, &runner, args.strategy, CEngineIo::ArgvFile);
+        }
+        HarnessEngine::AdaStdin => {}
+    }
     let result = minimize(&finding_dir, &runner, args.strategy).with_context(|| {
         let work = corpus::layout::work_dir_for_finding(&finding_dir);
         let work_dirs: Vec<&Path> = work.iter().map(PathBuf::as_path).collect();
@@ -558,7 +571,7 @@ mod silent_abort_tests {
 
         let result = minimize_c_engine(
             &finding,
-            &harness,
+            &replay_min::HarnessRunner::direct(&harness),
             MinimizeStrategy::Bytes,
             CEngineIo::ArgvFile,
         )
@@ -599,7 +612,7 @@ mod silent_abort_tests {
 
         let result = minimize_c_engine(
             &finding,
-            &harness,
+            &replay_min::HarnessRunner::direct(&harness),
             MinimizeStrategy::Bytes,
             CEngineIo::ArgvFile,
         )
@@ -624,7 +637,7 @@ mod silent_abort_tests {
 
         let summary = minimize_c_engine_until(
             &finding,
-            &harness,
+            &replay_min::HarnessRunner::direct(&harness),
             MinimizeStrategy::Bytes,
             CEngineIo::ArgvFile,
             Some(past),
@@ -664,7 +677,7 @@ mod silent_abort_tests {
 
         let summary = minimize_c_engine(
             &finding,
-            &harness,
+            &replay_min::HarnessRunner::direct(&harness),
             MinimizeStrategy::Bytes,
             CEngineIo::ArgvFile,
         )

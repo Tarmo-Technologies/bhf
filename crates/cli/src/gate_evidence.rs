@@ -1201,11 +1201,13 @@ impl<'a> Runner<'a> {
             .map_err(|error| format!("write {}: {error}", input_path.display()))?;
         let _ = std::fs::remove_file(&evidence);
         // A foreign harness runs under its emulator, which hands the guest
-        // the environment set here (the evidence file among it).
+        // the environment set here (the evidence file among it). A guest
+        // abort makes qemu-user dump its own address space: no core dumps.
         let mut command = match &self.emulator {
             Some(runner) => {
                 let mut command = std::process::Command::new(&runner.program);
                 command.args(&runner.args).arg(self.replay.harness);
+                replay_min::process::disable_core_dumps(&mut command);
                 command
             }
             None => std::process::Command::new(self.replay.harness),
@@ -1222,7 +1224,7 @@ impl<'a> Runner<'a> {
             .env_remove("BHF_VP_SHM")
             .env_remove("BHF_CMPLOG")
             .env_remove("BHF_FRAMED");
-        for (key, value) in replay_env(self.replay.raw) {
+        for (key, value) in replay_env(self.replay.raw, self.emulator.is_some()) {
             command.env(key, value);
         }
         command.env_remove("LD_PRELOAD");
@@ -1285,11 +1287,12 @@ impl<'a> Runner<'a> {
 }
 
 /// The environment of a capture replay: the fuzz child's sanitizer options
-/// without symbolization or leak checks (no report is read), and the runtime
-/// mode and injected environment the finding recorded.
-fn replay_env(raw: &Value) -> Vec<(String, String)> {
+/// without symbolization or leak checks (no report is read; `emulated`, a
+/// run under the harness's emulator, does not abort on a report either), and
+/// the runtime mode and injected environment the finding recorded.
+fn replay_env(raw: &Value, emulated: bool) -> Vec<(String, String)> {
     let mut env = Vec::new();
-    for (key, value) in crate::fuzz::sanitizer_child_env(false) {
+    for (key, value) in crate::fuzz::sanitizer_child_env_for(false, emulated) {
         let value =
             multicore_fuzz::merge_sanitizer_options(Some(&value), "symbolize=0:detect_leaks=0");
         env.push((key, value));
@@ -1833,6 +1836,79 @@ mod tests {
         let raw = json!({"gates": gates, "gate_capture": summary});
         assert_eq!(recorded(&raw), Some(capture));
         assert!(recorded(&json!({})).is_none());
+    }
+
+    /// A capture run under the harness's emulator gets `abort_on_error=0`
+    /// and no core dumps (a guest abort makes qemu-user dump its own address
+    /// space); a native run keeps `abort_on_error=1`.
+    #[cfg(unix)]
+    #[test]
+    fn an_emulated_capture_run_neither_aborts_nor_dumps_core() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let executable = |path: &Path, body: &str| {
+            std::fs::write(path, body).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let seen = dir.path().join("seen.txt");
+        let report = format!(
+            "{{\n  printf 'asan=%s\\n' \"$ASAN_OPTIONS\"\n  printf 'ubsan=%s\\n' \"$UBSAN_OPTIONS\"\n  printf 'core=%s\\n' \"$(ulimit -H -c)\"\n}} > '{}'\n",
+            seen.display()
+        );
+        let harness = dir.path().join("main");
+        executable(&harness, &format!("#!/bin/sh\n{report}exit 0\n"));
+        let emulator = dir.path().join("emulator.sh");
+        executable(&emulator, "#!/bin/sh\nexec \"$@\"\n");
+        let raw = json!({});
+        let replay = Replay {
+            harness: &harness,
+            raw: &raw,
+            scratch: dir.path().join("scratch"),
+            runtrace_log: None,
+            deadline: Instant::now() + Duration::from_secs(30),
+        };
+        std::fs::create_dir_all(&replay.scratch).unwrap();
+        let options = |runner: &mut Runner| -> BTreeMap<String, String> {
+            let _ = std::fs::remove_file(&seen);
+            // The harness records no evidence; the run itself is what counts.
+            assert!(runner.run(b"x", false).is_err());
+            std::fs::read_to_string(&seen)
+                .unwrap()
+                .lines()
+                .filter_map(|line| line.split_once('='))
+                .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                .collect()
+        };
+        let last = |options: &str| -> Option<String> {
+            options
+                .rsplit(':')
+                .find_map(|item| item.strip_prefix("abort_on_error="))
+                .map(str::to_owned)
+        };
+
+        let native = options(&mut Runner::new(&replay));
+        assert_eq!(last(&native["asan"]).as_deref(), Some("1"), "{native:?}");
+
+        record_runner(
+            dir.path(),
+            Some(&HarnessRunner {
+                program: emulator.clone(),
+                args: Vec::new(),
+            }),
+        )
+        .unwrap();
+        let emulated = options(&mut Runner::new(&replay));
+        assert_eq!(
+            last(&emulated["asan"]).as_deref(),
+            Some("0"),
+            "{emulated:?}"
+        );
+        assert_eq!(
+            last(&emulated["ubsan"]).as_deref(),
+            Some("0"),
+            "{emulated:?}"
+        );
+        assert_eq!(emulated["core"], "0", "{emulated:?}");
     }
 }
 

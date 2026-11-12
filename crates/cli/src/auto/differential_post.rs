@@ -366,6 +366,7 @@ fn describe(exit: i32, timed_out: bool) -> String {
         139 => "SIGSEGV".to_owned(),
         134 => "SIGABRT".to_owned(),
         132 => "SIGILL".to_owned(),
+        133 => "SIGTRAP".to_owned(),
         136 => "SIGFPE".to_owned(),
         c if c > 128 => format!("signal {}", c - 128),
         c => format!("exit {c}"),

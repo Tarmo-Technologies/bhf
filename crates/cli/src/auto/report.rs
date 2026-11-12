@@ -347,7 +347,70 @@ fn target_fidelity(
     }
     facts.sanitizers = names;
     facts.tsan_ran = tsan_ran;
+    // A cross-built harness ran under the emulator recorded beside it: it
+    // ran its own target, with only the sanitizers its build armed.
+    let harness = r.harness_dir.join("main");
+    if let Some(runner) = crate::gate_evidence::recorded_runner(&harness) {
+        let stamp =
+            std::fs::read_to_string(r.harness_dir.join("bhf_toolchain.stamp")).unwrap_or_default();
+        facts.runner = Some(
+            runner
+                .program
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| runner.program.display().to_string()),
+        );
+        facts.target_triple = stamp_target_triple(&stamp).or_else(|| {
+            crate::runner::elf_info(&harness)
+                .map(|info| format!("{}-linux", crate::runner::elf_machine_name(info.machine)))
+        });
+        facts.sanitizers = binary_sanitizers(&harness);
+        facts.tsan_ran = facts.tsan_ran && facts.sanitizers.iter().any(|n| n == "tsan");
+    }
     Some(actionability::Fidelity::from_facts(&facts))
+}
+
+/// The target triple a harness was built for, from its toolchain stamp
+/// (`bhf_toolchain.stamp`): a `--target=<triple>` (or `-target <triple>`)
+/// flag, else the prefix of a cross compiler (`aarch64-linux-gnu-gcc`).
+fn stamp_target_triple(stamp: &str) -> Option<String> {
+    let words: Vec<&str> = stamp.split_whitespace().collect();
+    if let Some(triple) = words.iter().enumerate().find_map(|(index, word)| {
+        word.strip_prefix("--target=")
+            .map(str::to_owned)
+            .or_else(|| {
+                (*word == "-target").then(|| words.get(index + 1).map(|w| (*w).to_owned()))?
+            })
+    }) {
+        return Some(triple);
+    }
+    let compiler = Path::new(words.first()?).file_name()?.to_str()?;
+    ["-gcc", "-g++", "-cc", "-c++", "-clang", "-clang++"]
+        .iter()
+        .find_map(|suffix| compiler.strip_suffix(suffix))
+        .filter(|prefix| prefix.contains('-'))
+        .map(str::to_owned)
+}
+
+/// The sanitizer runtimes linked into the binary at `path`, by the symbol
+/// each one's initializer or report handlers leave in it. A cross build drops
+/// them whatever its Makefile's default flags say, so the binary, not the
+/// flags, says which ran.
+fn binary_sanitizers(path: &Path) -> Vec<String> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    let has = |needle: &[u8]| bytes.windows(needle.len()).any(|window| window == needle);
+    [
+        ("asan", &b"__asan_init"[..]),
+        ("ubsan", &b"__ubsan_handle_"[..]),
+        ("msan", &b"__msan_init"[..]),
+        ("tsan", &b"__tsan_init"[..]),
+    ]
+    .into_iter()
+    .filter(|(_, marker)| has(marker))
+    .map(|(name, _)| name.to_owned())
+    .collect()
 }
 
 /// CC-1: write the per-finding fidelity block onto every `finding.json` on disk.
@@ -3269,6 +3332,40 @@ mod tests {
     use crate::auto::dep_manifest::DepKind;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// A cross build's triple is read off its toolchain stamp: a clang
+    /// `--target=` or a prefixed cross compiler.
+    #[test]
+    fn the_target_triple_comes_from_the_toolchain_stamp() {
+        assert_eq!(
+            super::stamp_target_triple(
+                "aarch64-linux-gnu-gcc gcc clang clang clang clang | -O1 -g | | -O1 -g |  |"
+            )
+            .as_deref(),
+            Some("aarch64-linux-gnu")
+        );
+        assert_eq!(
+            super::stamp_target_triple("clang clang | -O1 | | | --target=riscv64-linux-gnu |")
+                .as_deref(),
+            Some("riscv64-linux-gnu")
+        );
+        assert_eq!(super::stamp_target_triple("clang clang | -O1 |"), None);
+        assert_eq!(super::stamp_target_triple(""), None);
+    }
+
+    /// The sanitizers of a cross build are the runtimes its binary links, not
+    /// its Makefile's default flags.
+    #[test]
+    fn the_sanitizers_of_a_binary_are_the_runtimes_it_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("plain");
+        std::fs::write(&plain, b"\x7fELF __sanitizer_cov_trace_pc").unwrap();
+        assert!(super::binary_sanitizers(&plain).is_empty());
+        let both = dir.path().join("both");
+        std::fs::write(&both, b"\x7fELF __asan_init __ubsan_handle_add_overflow").unwrap();
+        assert_eq!(super::binary_sanitizers(&both), ["asan", "ubsan"]);
+        assert!(super::binary_sanitizers(&dir.path().join("missing")).is_empty());
+    }
 
     /// Rebuild `results/` the way the command's results bracket does after
     /// `write_reports`, and return `results/findings.json`.

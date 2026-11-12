@@ -2234,10 +2234,12 @@ fn ensure_repro_py(
         header_lines.push(format!("Sink: {}", sink_header_line(sink)));
     }
 
+    let runner = recorded_runner_argv(finding_dir, &fixture_path, &harness_id);
     let script = render_repro_py(&ReproScript {
         testcase_name: &testcase_name,
         fixture_path: &fixture_path,
         harness_id: &harness_id,
+        runner: &runner,
         asan_defaults,
         asan_required,
         // The same UBSan report shape a fuzz child produces: it halts on the
@@ -2392,6 +2394,51 @@ fn open_no_follow(path: &Path, options: &mut fs::OpenOptions) -> io::Result<fs::
     }
 }
 
+/// The file a cross build writes beside a harness naming the emulator it runs
+/// under, and its schema.
+const RUNNER_FILE: &str = "bhf_runner.json";
+const RUNNER_SCHEMA: &str = "bhf.harness_runner.v1";
+
+/// The emulator command (`[program, args...]`) recorded beside the finding's
+/// harness: the dir of its `fixture_path` in the work dir holding the finding,
+/// then `<work>/{build,harnesses,auto,generated_harnesses}/<harness_id>/`.
+/// Empty for a harness that runs natively.
+fn recorded_runner_argv(finding_dir: &Path, fixture_path: &str, harness_id: &str) -> Vec<String> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if !fixture_path.is_empty() {
+        dirs.extend(
+            corpus::finding::fixture_path_candidates(finding_dir, fixture_path)
+                .into_iter()
+                .filter_map(|candidate| candidate.parent().map(Path::to_path_buf)),
+        );
+    }
+    if let (Some(work), false) = (
+        corpus::layout::work_dir_for_finding(finding_dir),
+        harness_id.is_empty(),
+    ) {
+        for root in ["build", "harnesses", "auto", "generated_harnesses"] {
+            dirs.push(work.join(root).join(harness_id));
+        }
+    }
+    dirs.iter()
+        .find_map(|dir| {
+            let record: Value =
+                serde_json::from_slice(&std::fs::read(dir.join(RUNNER_FILE)).ok()?).ok()?;
+            if record.get("schema").and_then(Value::as_str) != Some(RUNNER_SCHEMA) {
+                return None;
+            }
+            let program = record.get("program").and_then(Value::as_str)?.to_owned();
+            let args = record
+                .get("args")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|arg| arg.as_str().map(str::to_owned));
+            Some(std::iter::once(program).chain(args).collect())
+        })
+        .unwrap_or_default()
+}
+
 /// The `UBSAN_OPTIONS` keys the reproducer always sets, after the
 /// operator's: the fuzz child's report shape, halting on the first report.
 const UBSAN_REQUIRED_OPTIONS: &str = "print_stacktrace=1:report_error_type=1:halt_on_error=1";
@@ -2430,6 +2477,9 @@ struct ReproScript<'a> {
     testcase_name: &'a str,
     fixture_path: &'a str,
     harness_id: &'a str,
+    /// The emulator the harness runs under (`[program, args...]`), empty for
+    /// a native harness.
+    runner: &'a [String],
     /// `ASAN_OPTIONS` keys set only when the operator's value has none.
     asan_defaults: &'a str,
     /// `ASAN_OPTIONS` keys set after the operator's value, so they win.
@@ -2448,6 +2498,7 @@ impl Default for ReproScript<'_> {
             testcase_name: "testcase.bin",
             fixture_path: "",
             harness_id: "",
+            runner: &[],
             asan_defaults: "",
             asan_required: "",
             ubsan_required: "",
@@ -2470,6 +2521,7 @@ fn render_repro_py(spec: &ReproScript<'_>) -> String {
         testcase_name,
         fixture_path,
         harness_id,
+        runner,
         asan_defaults,
         asan_required,
         ubsan_required,
@@ -2506,8 +2558,16 @@ __HEADER__
 # its output + exit status are printed. bhf's sanitizer keys are added after any
 # ASAN_OPTIONS / UBSAN_OPTIONS you set, so a report still halts the run. The
 # script exits with the harness's exit status (128 + the signal for a signal).
+#
+# A harness built for another target runs under the emulator recorded beside it
+# (bhf_runner.json, embedded below as RUNNER). Set BHF_REPLAY_RUNNER to the
+# command to run it under instead (for example
+# "qemu-aarch64 -L /usr/aarch64-linux-gnu"), or to "" to run it directly. Under
+# a runner the sanitizers get abort_on_error=0 and core dumps are off, so a
+# report exits non-zero instead of making the emulator dump its own memory.
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -2521,6 +2581,8 @@ ASAN_OPTIONS_REQUIRED = __ASAN__
 UBSAN_OPTIONS_DEFAULT = ""
 UBSAN_OPTIONS_REQUIRED = __UBSAN__
 EXTRA_ENV = __EXTRA_ENV__
+RUNNER = __RUNNER__
+RUNNER_FILE = "bhf_runner.json"
 
 
 def parse_options(text):
@@ -2542,6 +2604,22 @@ def merged_options(inherited, defaults, required):
             options.pop(key, None)
             options[key] = value
     return ":".join("%s=%s" % item for item in options.items())
+
+
+# Under an emulator (qemu-user) a guest abort makes the emulator dump its own
+# address space, which takes minutes. A harness run under a runner gets
+# abort_on_error=0 after bhf's required keys (a sanitizer report still exits
+# non-zero) and runs with core dumps off.
+EMULATED_OPTIONS = "abort_on_error=0"
+
+
+def required_options(required, emulated):
+    return merged_options(required, "", EMULATED_OPTIONS) if emulated else required
+
+
+def no_core_dumps():
+    import resource
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
 
 def exit_code(returncode):
@@ -2693,6 +2771,31 @@ def with_runtime_path(env, harness, windows=None):
     return env
 
 
+def recorded_runner(harness):
+    try:
+        record = json.loads((Path(harness).parent / RUNNER_FILE).read_text())
+    except (OSError, ValueError):
+        return None
+    if record.get("schema") != "bhf.harness_runner.v1" or not record.get("program"):
+        return None
+    return [str(record["program"])] + [str(arg) for arg in record.get("args", [])]
+
+
+def runner_for(harness):
+    # BHF_REPLAY_RUNNER wins; then the emulator recorded beside the harness that
+    # runs; then the one recorded for the finding's harness when this script was
+    # written (not for a harness passed on the command line).
+    override = os.environ.get("BHF_REPLAY_RUNNER")
+    if override is not None:
+        return shlex.split(override)
+    recorded = recorded_runner(harness)
+    if recorded is not None:
+        return recorded
+    if len(sys.argv) > 1:
+        return []
+    return list(RUNNER)
+
+
 def resolve_harness(finding):
     tried = []
     for cand in candidate_harnesses(finding):
@@ -2710,37 +2813,45 @@ def main():
     finding = load_finding()
     harness = resolve_harness(finding)
 
+    runner = runner_for(harness)
+    emulated = bool(runner)
     env = dict(os.environ)
     env["ASAN_OPTIONS"] = merged_options(
-        env.get("ASAN_OPTIONS"), ASAN_OPTIONS_DEFAULT, ASAN_OPTIONS_REQUIRED
+        env.get("ASAN_OPTIONS"), ASAN_OPTIONS_DEFAULT,
+        required_options(ASAN_OPTIONS_REQUIRED, emulated),
     )
     env["UBSAN_OPTIONS"] = merged_options(
-        env.get("UBSAN_OPTIONS"), UBSAN_OPTIONS_DEFAULT, UBSAN_OPTIONS_REQUIRED
+        env.get("UBSAN_OPTIONS"), UBSAN_OPTIONS_DEFAULT,
+        required_options(UBSAN_OPTIONS_REQUIRED, emulated),
     )
     for key, value in EXTRA_ENV.items():
         env.setdefault(key, value)
     env = with_runtime_path(env, harness)
+    preexec = no_core_dumps if emulated and os.name == "posix" else None
 
+    command = runner + [str(harness)]
     # AFL persistent-mode harnesses read the testcase from stdin; libFuzzer /
     # bhf driver harnesses take it as argv[1]. Detect from the harness name,
     # else default to argv[1] (the bhf convention).
     if harness.name.startswith("main_afl"):
         data = TESTCASE.read_bytes() if TESTCASE.is_file() else b""
-        print("running (AFL/stdin): %s < %s" % (harness, TESTCASE))
+        print("running (AFL/stdin): %s < %s" % (" ".join(command), TESTCASE))
         proc = subprocess.run(
-            [str(harness)],
+            command,
             input=data,
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            preexec_fn=preexec,
         )
     else:
-        print("running (libFuzzer/argv): %s %s" % (harness, TESTCASE))
+        print("running (libFuzzer/argv): %s %s" % (" ".join(command), TESTCASE))
         proc = subprocess.run(
-            [str(harness), str(TESTCASE)],
+            command + [str(TESTCASE)],
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            preexec_fn=preexec,
         )
 
     sys.stdout.write(proc.stdout.decode("utf-8", "replace"))
@@ -2767,6 +2878,17 @@ if __name__ == "__main__":
         .replace("__ASAN__", &py_str(asan_required))
         .replace("__UBSAN__", &py_str(ubsan_required))
         .replace("__EXTRA_ENV__", &extra_env_py)
+        .replace(
+            "__RUNNER__",
+            &format!(
+                "[{}]",
+                runner
+                    .iter()
+                    .map(|arg| py_str(arg))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )
 }
 
 fn value_at(value: &Value, path: &[&str]) -> Option<Value> {
@@ -4538,6 +4660,224 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(139));
+    }
+
+    /// A finding whose harness was built for another target, with its
+    /// emulator recorded beside it (`bhf_runner.json`), gets a reproducer
+    /// that runs the harness under that emulator.
+    #[test]
+    fn repro_py_embeds_the_recorded_runner_of_a_cross_harness() {
+        let tmp = tempfile::tempdir().unwrap();
+        let harness_dir = tmp.path().join("work/harnesses/H-1");
+        std::fs::create_dir_all(&harness_dir).unwrap();
+        std::fs::write(
+            harness_dir.join("bhf_runner.json"),
+            r#"{"schema":"bhf.harness_runner.v1","program":"qemu-aarch64","args":["-L","/usr/aarch64-linux-gnu"]}"#,
+        )
+        .unwrap();
+        let finding = tmp.path().join("work/results/findings/F-1");
+        std::fs::create_dir_all(&finding).unwrap();
+        let raw = json!({"id": "F-1", "harness_id": "H-1", "rule_id": "BHF-210"});
+        let record =
+            actionability::backfill_actionability(actionability::RunMode::Reporting, &raw, None);
+        super::ensure_repro_py(&finding, &raw, &record).unwrap();
+        let script = std::fs::read_to_string(finding.join("replay.py")).unwrap();
+        assert!(
+            script.contains(r#"RUNNER = ["qemu-aarch64", "-L", "/usr/aarch64-linux-gnu"]"#),
+            "{script}"
+        );
+        // Without a recorded runner, none is embedded.
+        let native = tmp.path().join("native/results/findings/F-2");
+        std::fs::create_dir_all(&native).unwrap();
+        super::ensure_repro_py(&native, &raw, &record).unwrap();
+        let script = std::fs::read_to_string(native.join("replay.py")).unwrap();
+        assert!(script.contains("RUNNER = []"), "{script}");
+    }
+
+    /// The reproducer runs the harness through its runner: the one recorded
+    /// beside it, or `BHF_REPLAY_RUNNER`, which overrides it.
+    #[cfg(unix)]
+    #[test]
+    fn repro_py_runs_the_harness_under_its_runner() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(python) = python3() else {
+            eprintln!("skipping: python3 unavailable");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let harness_dir = tmp.path().join("work/harnesses/H-1");
+        std::fs::create_dir_all(&harness_dir).unwrap();
+        let executable = |path: &std::path::Path, body: &str| {
+            std::fs::write(path, body).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        executable(&harness_dir.join("main"), "#!/bin/sh\nexit 0\n");
+        let emulator = tmp.path().join("emulator.sh");
+        executable(
+            &emulator,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$(dirname \"$0\")/emulator.log\"\nshift\nexec \"$@\"\n",
+        );
+        std::fs::write(
+            harness_dir.join("bhf_runner.json"),
+            json!({
+                "schema": "bhf.harness_runner.v1",
+                "program": emulator.display().to_string(),
+                "args": ["--sysroot-for-test"],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let finding = tmp.path().join("work/results/findings/F-1");
+        std::fs::create_dir_all(&finding).unwrap();
+        std::fs::write(finding.join("testcase.bin"), b"x").unwrap();
+        let raw = json!({"id": "F-1", "harness_id": "H-1", "rule_id": "BHF-210"});
+        std::fs::write(finding.join("finding.json"), raw.to_string()).unwrap();
+        let record =
+            actionability::backfill_actionability(actionability::RunMode::Reporting, &raw, None);
+        super::ensure_repro_py(&finding, &raw, &record).unwrap();
+        let status = std::process::Command::new(python)
+            .arg(finding.join("replay.py"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let log = std::fs::read_to_string(tmp.path().join("emulator.log")).unwrap();
+        assert!(
+            log.starts_with("--sysroot-for-test ")
+                && log.contains(&harness_dir.join("main").display().to_string()),
+            "{log}"
+        );
+        // BHF_REPLAY_RUNNER overrides it; empty runs the harness natively.
+        let status = std::process::Command::new(python)
+            .arg(finding.join("replay.py"))
+            .env("BHF_REPLAY_RUNNER", "")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("emulator.log")).unwrap(),
+            log,
+            "the override ran the harness natively"
+        );
+    }
+
+    /// A harness the reproducer runs under an emulator gets
+    /// `abort_on_error=0` after bhf's required sanitizer keys and runs with
+    /// core dumps off (a guest abort makes qemu-user dump its own address
+    /// space); a native run keeps `abort_on_error=1`.
+    #[cfg(unix)]
+    #[test]
+    fn repro_py_runs_an_emulated_harness_without_aborting_or_dumping_core() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(python) = python3() else {
+            eprintln!("skipping: python3 unavailable");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let harness_dir = tmp.path().join("work/harnesses/H-1");
+        std::fs::create_dir_all(&harness_dir).unwrap();
+        let executable = |path: &std::path::Path, body: &str| {
+            std::fs::write(path, body).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        executable(
+            &harness_dir.join("main"),
+            "#!/bin/sh\n{\n  printf 'asan=%s\\n' \"$ASAN_OPTIONS\"\n  printf 'ubsan=%s\\n' \"$UBSAN_OPTIONS\"\n  printf 'core=%s\\n' \"$(ulimit -c)\"\n} > \"$(dirname \"$0\")/seen.txt\"\nexit 0\n",
+        );
+        let emulator = tmp.path().join("emulator.sh");
+        executable(&emulator, "#!/bin/sh\nexec \"$@\"\n");
+        std::fs::write(
+            harness_dir.join("bhf_runner.json"),
+            json!({
+                "schema": "bhf.harness_runner.v1",
+                "program": emulator.display().to_string(),
+                "args": [],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let finding = tmp.path().join("work/results/findings/F-1");
+        std::fs::create_dir_all(&finding).unwrap();
+        std::fs::write(finding.join("testcase.bin"), b"x").unwrap();
+        let raw = json!({"id": "F-1", "harness_id": "H-1", "rule_id": "BHF-201"});
+        std::fs::write(finding.join("finding.json"), raw.to_string()).unwrap();
+        let record =
+            actionability::backfill_actionability(actionability::RunMode::Reporting, &raw, None);
+        super::ensure_repro_py(&finding, &raw, &record).unwrap();
+        let seen = |runner: Option<&str>| -> std::collections::BTreeMap<String, String> {
+            // Core dumps on in the reproducer's own environment, so a 0 the
+            // harness sees is the reproducer's doing.
+            let mut command = std::process::Command::new("sh");
+            command
+                .args(["-c", "ulimit -c unlimited 2>/dev/null; exec \"$@\"", "sh"])
+                .arg(python)
+                .arg(finding.join("replay.py"))
+                .env("ASAN_OPTIONS", "abort_on_error=1:detect_leaks=1")
+                .env("UBSAN_OPTIONS", "abort_on_error=1")
+                .env_remove("BHF_REPLAY_RUNNER");
+            if let Some(runner) = runner {
+                command.env("BHF_REPLAY_RUNNER", runner);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            std::fs::read_to_string(harness_dir.join("seen.txt"))
+                .unwrap()
+                .lines()
+                .filter_map(|line| line.split_once('='))
+                .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                .collect()
+        };
+        // The value a sanitizer runtime takes: the key's last occurrence.
+        let last = |options: &str, key: &str| -> Option<String> {
+            options
+                .rsplit(':')
+                .find_map(|item| item.strip_prefix(&format!("{key}=")))
+                .map(str::to_owned)
+        };
+
+        let emulated = seen(None);
+        assert_eq!(
+            last(&emulated["asan"], "abort_on_error").as_deref(),
+            Some("0"),
+            "{emulated:?}"
+        );
+        assert_eq!(
+            last(&emulated["asan"], "halt_on_error").as_deref(),
+            Some("1"),
+            "{emulated:?}"
+        );
+        assert_eq!(
+            last(&emulated["ubsan"], "abort_on_error").as_deref(),
+            Some("0"),
+            "{emulated:?}"
+        );
+        assert_eq!(emulated["core"], "0", "{emulated:?}");
+        // A runner named by BHF_REPLAY_RUNNER is an emulator too.
+        let named = seen(Some(&emulator.display().to_string()));
+        assert_eq!(
+            last(&named["asan"], "abort_on_error").as_deref(),
+            Some("0"),
+            "{named:?}"
+        );
+        assert_eq!(named["core"], "0", "{named:?}");
+
+        let native = seen(Some(""));
+        assert_eq!(
+            last(&native["asan"], "abort_on_error").as_deref(),
+            Some("1"),
+            "{native:?}"
+        );
+        assert_eq!(
+            last(&native["ubsan"], "abort_on_error").as_deref(),
+            Some("1"),
+            "{native:?}"
+        );
+        if native["core"] == "0" {
+            eprintln!("note: core dumps could not be turned on; the core check is vacuous");
+        }
     }
 
     /// A Python 3 interpreter: `python3`, or `python` (its name on Windows,

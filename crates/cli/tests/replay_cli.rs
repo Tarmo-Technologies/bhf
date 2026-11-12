@@ -1861,6 +1861,208 @@ fn a_passthrough_harness_says_it_decodes_no_parameters() {
     assert!(!all.contains("built without the argument trace"), "{all}");
 }
 
+/// A harness with an emulator recorded beside it (`bhf_runner.json`, as a
+/// cross build writes it) runs under that emulator in replay, minimize,
+/// decode-args and fuzz without `--qemu-user`, and each says so.
+#[cfg(unix)]
+#[test]
+fn the_recorded_runner_runs_the_harness_everywhere() {
+    let root = temp_dir("recorded-runner");
+    let work = root.join("work");
+    let harness = work.join("harnesses/H-1/main");
+    let report = asan_report("Widget::copy_at", 12);
+    write_tracing_crashing_harness(&harness, &report);
+    let dir = harness.parent().unwrap();
+    let wrapper = dir.join("emulator.sh");
+    fs::write(
+        &wrapper,
+        "#!/bin/sh\nprintf 'ran %s\\n' \"$1\" >> \"$EMULATOR_LOG\"\nshift\nexec \"$@\"\n",
+    )
+    .unwrap();
+    make_executable(&wrapper);
+    fs::write(
+        dir.join("bhf_runner.json"),
+        serde_json::json!({
+            "schema": "bhf.harness_runner.v1",
+            "program": wrapper.display().to_string(),
+            "args": ["--tag"],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let finding = emit_finding(&work, &harness, &report);
+    let log = finding.join("emulator.log");
+    let runs = || {
+        fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| *line == "ran --tag")
+            .count()
+    };
+    let bhf = |args: &[&std::ffi::OsStr]| {
+        Command::new(env!("CARGO_BIN_EXE_cli"))
+            .args(args)
+            .env("EMULATOR_LOG", &log)
+            .output()
+            .unwrap()
+    };
+    let note = format!(
+        "note: running {} under the recorded runner {} --tag",
+        harness.display(),
+        wrapper.display()
+    );
+
+    let out = bhf(&[
+        "replay".as_ref(),
+        finding.as_os_str(),
+        "--sandbox".as_ref(),
+        "none".as_ref(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(text(&out.stderr).contains(&note), "{}", text(&out.stderr));
+    assert_eq!(runs(), 1, "replay ran under the runner");
+
+    let out = bhf(&["minimize".as_ref(), finding.as_os_str()]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let after_minimize = runs();
+    assert!(after_minimize > 1, "minimize ran under the runner");
+
+    let out = bhf(&[
+        "decode-args".as_ref(),
+        "--finding".as_ref(),
+        finding.as_os_str(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains("buffer"),
+        "{}",
+        text(&out.stdout)
+    );
+    assert!(runs() > after_minimize, "decode-args ran under the runner");
+    let after_decode = runs();
+
+    let out = bhf(&[
+        "fuzz".as_ref(),
+        work.as_os_str(),
+        "--harness".as_ref(),
+        "H-1".as_ref(),
+        "--iterations".as_ref(),
+        "1".as_ref(),
+        "--no-fork-server".as_ref(),
+        "--sandbox".as_ref(),
+        "none".as_ref(),
+        "--seed-input".as_ref(),
+        "x".as_ref(),
+    ]);
+    assert!(
+        text(&out.stderr).contains(&note),
+        "{}{}",
+        text(&out.stdout),
+        text(&out.stderr)
+    );
+    assert!(runs() > after_decode, "fuzz ran under the runner");
+}
+
+/// A copy of a native ELF binary relabelled as an AArch64 one (its
+/// `e_machine`), which the host cannot run.
+#[cfg(unix)]
+fn foreign_elf(path: &Path) {
+    let mut bytes = fs::read("/bin/true").unwrap();
+    assert_eq!(&bytes[..4], b"\x7fELF");
+    bytes[18] = 183;
+    bytes[19] = 0;
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, bytes).unwrap();
+    make_executable(path);
+}
+
+/// A harness built for another architecture, with no runner given or
+/// recorded, is refused before it runs, with the flag to pass.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_foreign_harness_without_a_runner_is_refused_with_the_flag_to_pass() {
+    if cfg!(target_arch = "aarch64") {
+        eprintln!("skipping: the relabelled binary is native here");
+        return;
+    }
+    let root = temp_dir("foreign-arch");
+    let work = root.join("work");
+    let harness = work.join("harnesses/H-1/main");
+    foreign_elf(&harness);
+    let report = asan_report("Widget::copy_at", 12);
+    let finding = emit_finding(&work, &harness, &report);
+    let expected = format!(
+        "{} is built for aarch64; run it under an emulator: --qemu-user qemu-aarch64",
+        harness.display()
+    );
+    for args in [
+        vec!["replay".to_owned(), finding.display().to_string()],
+        vec!["minimize".to_owned(), finding.display().to_string()],
+        vec![
+            "decode-args".to_owned(),
+            "--finding".to_owned(),
+            finding.display().to_string(),
+        ],
+        vec![
+            "fuzz".to_owned(),
+            work.display().to_string(),
+            "--harness".to_owned(),
+            "H-1".to_owned(),
+            "--iterations".to_owned(),
+            "1".to_owned(),
+        ],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_cli"))
+            .args(&args)
+            .output()
+            .unwrap();
+        let all = format!("{}{}", text(&out.stdout), text(&out.stderr));
+        assert!(!out.status.success(), "{args:?}: {all}");
+        assert!(all.contains(&expected), "{args:?}: {all}");
+    }
+}
+
+/// A qemu-user replay of a sanitized harness does not abort on its report:
+/// under emulation an abort makes the emulator dump its whole address space.
+/// It also writes no core file at all.
+#[cfg(unix)]
+#[test]
+fn an_emulated_replay_neither_aborts_nor_dumps_core() {
+    let root = temp_dir("emulated-env");
+    let work = root.join("work");
+    let harness = work.join("harnesses/H-1/main");
+    let report = asan_report("Widget::copy_at", 12);
+    write_crashing_harness(&harness, &report);
+    let finding = emit_finding(&work, &harness, &report);
+    let qemu = root.join("qemu-fake");
+    fs::write(
+        &qemu,
+        "#!/bin/sh\nulimit -c > \"$(dirname \"$0\")/core-limit.txt\"\nexec \"$@\"\n",
+    )
+    .unwrap();
+    make_executable(&qemu);
+    let out = replay_output(&[
+        finding.to_str().unwrap(),
+        "--qemu-user",
+        qemu.to_str().unwrap(),
+        "--sandbox",
+        "none",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        fs::read_to_string(root.join("core-limit.txt"))
+            .unwrap()
+            .trim(),
+        "0"
+    );
+    let options = fs::read_to_string(harness.parent().unwrap().join("asan-options.txt")).unwrap();
+    let abort = options
+        .split(':')
+        .rev()
+        .find(|item| item.starts_with("abort_on_error="));
+    assert_eq!(abort, Some("abort_on_error=0"), "{options}");
+}
+
 /// A finding recorded against an older harness input format than its
 /// harness now decodes is flagged by replay and minimize, which name both
 /// formats; one recorded against the same format is not.

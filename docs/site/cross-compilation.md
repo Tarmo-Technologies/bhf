@@ -101,7 +101,28 @@ bhf records the runner beside each cross-built harness (`bhf_runner.json`), so
 the comparison evidence a finding records after fuzzing (and the one
 `bhf explain` records for a finding that has none) replays the harness under
 the same emulator, which passes the evidence variable through to it. The
-capture's `gate_capture.runner` names the emulator.
+capture's `gate_capture.runner` names the emulator. `bhf replay`,
+`bhf minimize`, `bhf fuzz`, `bhf decode-args`, `bhf corpus minimize` and
+`bhf report --backfill` run such a harness under the recorded runner too
+when no `--qemu-user` is given (a binary `bhf build` staged into
+`build/<id>/main` uses the one recorded in its harness dir), with a
+`note: running <harness> under the recorded runner <program args>` line; the
+generated `replay.py` embeds it as `RUNNER` (override it with
+`BHF_REPLAY_RUNNER`). A harness whose ELF machine this host cannot run, with
+no runner given or recorded, is refused before it runs:
+`<harness> is built for aarch64; run it under an emulator: --qemu-user
+qemu-aarch64 [--qemu-arg ...]`.
+
+A trap instruction is a crash: `__builtin_trap` and checks built with
+`-fsanitize-trap` raise SIGTRAP on AArch64 (SIGILL on x86_64), and both are
+BHF-210 findings that name their signal. bhf's driver prints the faulting pc
+for such a crash (see [Sanitizers](sanitizers.md)). An emulated child never
+gets `abort_on_error=1` (a sanitizer report exits non-zero instead, because a
+guest abort makes qemu-user spend minutes on its own address space) and runs
+with core dumps off. The fidelity record of a cross-sweep finding says the
+harness was `built for <triple> and run under <runner> user-mode emulation`,
+gives the target's byte order, and lists only the sanitizer runtimes the
+binary links (none for a cross sweep, so `sanitizers` is `not_exercised`).
 
 A runner turns the C/C++ sweep into a cross sweep only when the C/C++ toolchain
 builds for another target: a `target`, or a compiler whose `-dumpmachine` names
@@ -313,7 +334,10 @@ bhf replay --finding F-0001 \
 ```
 
 The runner still passes testcase bytes on stdin and preserves BHF finding
-normalization, so host and emulated replay results can be compared.
+normalization, so host and emulated replay results can be compared. Without
+`--qemu-user`, the runner recorded beside the harness (`bhf_runner.json`)
+runs it; `bhf fuzz` and `bhf decode-args` take the same `--qemu-user` and
+`--qemu-arg` flags.
 
 ## Sandbox Execution
 

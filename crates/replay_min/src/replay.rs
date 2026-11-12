@@ -228,7 +228,7 @@ impl HarnessRunner {
     pub fn command_wrapped(&self, io_file: &Path) -> Result<Command, ReplayError> {
         let sandbox = self.sandbox.resolve()?;
         if let Some(qemu_user) = &self.qemu_user {
-            Ok(wrap_command(
+            let mut command = wrap_command(
                 sandbox,
                 &qemu_user.program,
                 qemu_user.args.iter().map(String::as_str),
@@ -236,7 +236,11 @@ impl HarnessRunner {
                 io_file,
                 &self.extra_ro_binds,
                 &self.extra_rw_binds,
-            ))
+            );
+            // A crash under the emulator must not make it dump its own
+            // address space.
+            crate::process::disable_core_dumps(&mut command);
+            Ok(command)
         } else {
             Ok(wrap_command(
                 sandbox,

@@ -13,7 +13,7 @@
 
 use crate::crash_identity;
 use crate::replay::{run_c_testcase, CInput, REPLAY_TIMEOUT};
-use crate::runner::{engine_for, harness_runner, HarnessEngine, SandboxModeArg};
+use crate::runner::{engine_for, harness_runner_for, HarnessEngine, SandboxModeArg};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -183,14 +183,19 @@ fn backfill_finding(dir: &Path) -> Outcome {
             }
         }
     };
-    let runner = harness_runner(
+    // A cross-built harness runs under the emulator recorded beside it.
+    let runner = match harness_runner_for(
         harness.clone(),
         None,
         Vec::new(),
         SandboxModeArg::Auto,
         None,
         false,
-    );
+    ) {
+        Ok(runner) => runner,
+        Err(error) if needs_log => return Outcome::Skipped(error),
+        Err(_) => return Outcome::NotNeeded,
+    };
     let frames = if needs_log {
         match backfill_log(dir, &mut raw, &runner, input, &harness) {
             Ok(frames) => Some(frames),

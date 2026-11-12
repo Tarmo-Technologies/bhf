@@ -400,7 +400,7 @@ pub const RULES: &[Rule] = &[
         id: "BHF-210",
         slug: "bhf.c/fatal-signal-crash",
         name: "Reachable crash (fatal signal, no sanitizer report)",
-        description: "A test case drove the target to terminate on a fatal signal (SIGSEGV/SIGBUS/SIGILL/SIGFPE) with no AddressSanitizer/UBSan report to localize it — a reachable crash. At minimum a denial-of-service; commonly memory corruption the sanitizer could not pin down (a crash in non-instrumented code, a UBSan/__builtin_trap, or an arithmetic fault). Triage by the reported signal. Recorded as a finding so the crash surfaces and the fuzz pass keeps exploring instead of aborting.",
+        description: "A test case drove the target to terminate on a fatal signal (SIGSEGV/SIGBUS/SIGILL/SIGFPE/SIGTRAP, or a silent SIGABRT) with no AddressSanitizer/UBSan report to localize it — a reachable crash. At minimum a denial-of-service; commonly memory corruption the sanitizer could not pin down (a crash in non-instrumented code, a UBSan/__builtin_trap, or an arithmetic fault). Triage by the reported signal. Recorded as a finding so the crash surfaces and the fuzz pass keeps exploring instead of aborting.",
         cwe: "CWE-119",
         cwe_top_25: None,
         default_severity: Severity::High,

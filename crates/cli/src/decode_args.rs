@@ -13,7 +13,7 @@
 
 use crate::finding_arg::resolve_finding_arg_in;
 use crate::replay::{CInput, REPLAY_TIMEOUT};
-use crate::runner::{engine_for, harness_runner, HarnessEngine, SandboxModeArg};
+use crate::runner::{engine_for, harness_runner_for, HarnessEngine, SandboxModeArg};
 use corpus::decoded_args::TracedArg;
 use harness_gen::arg_layout::{ArgLayout, StaticArg};
 use serde::Serialize;
@@ -51,6 +51,20 @@ pub struct DecodeArgsArgs {
     /// Print one `bhf.decode-args.v1` JSON document instead of the table.
     #[arg(long)]
     pub json: bool,
+
+    /// qemu-user executable to run a cross-built harness under. Default: the
+    /// emulator recorded beside the harness (`bhf_runner.json`).
+    #[arg(long, value_name = "QEMU")]
+    pub qemu_user: Option<PathBuf>,
+
+    /// Extra argument passed to qemu-user before the harness path.
+    #[arg(
+        long = "qemu-arg",
+        value_name = "ARG",
+        allow_hyphen_values = true,
+        requires = "qemu_user"
+    )]
+    pub qemu_args: Vec<String>,
 }
 
 /// Where the values came from.
@@ -127,6 +141,8 @@ struct Inputs {
     binary: Option<PathBuf>,
     /// The directory holding `arg-layout.json`, when one was found.
     layout_dir: Option<PathBuf>,
+    qemu_user: Option<PathBuf>,
+    qemu_args: Vec<String>,
 }
 
 fn inputs(args: &DecodeArgsArgs) -> Result<Inputs, String> {
@@ -196,6 +212,8 @@ fn inputs(args: &DecodeArgsArgs) -> Result<Inputs, String> {
         testcase,
         binary,
         layout_dir,
+        qemu_user: args.qemu_user.clone(),
+        qemu_args: args.qemu_args.clone(),
     })
 }
 
@@ -362,6 +380,10 @@ fn is_passthrough(inputs: &Inputs) -> bool {
 
 /// Run the harness once on the testcase with its argument trace on.
 fn trace(binary: &Path, inputs: &Inputs, bytes: &[u8]) -> Result<Vec<TracedArg>, String> {
+    // A foreign harness with no emulator given or recorded is never run.
+    if inputs.qemu_user.is_none() && crate::runner::recorded_runner_for(binary).is_none() {
+        crate::runner::refuse_foreign_harness(binary)?;
+    }
     if !crate::fuzz::harness_has_arg_trace(binary) {
         return Err(format!(
             "{} was built without the argument trace",
@@ -383,14 +405,16 @@ fn trace(binary: &Path, inputs: &Inputs, bytes: &[u8]) -> Result<Vec<TracedArg>,
             }
         },
     };
-    let runner = harness_runner(
+    // `--qemu-user`, else the emulator recorded beside a cross-built harness;
+    // a foreign harness with neither is not run.
+    let runner = harness_runner_for(
         binary.to_path_buf(),
-        None,
-        Vec::new(),
+        inputs.qemu_user.clone(),
+        inputs.qemu_args.clone(),
         SandboxModeArg::Auto,
         None,
         false,
-    );
+    )?;
     let run = crate::replay::run_c_testcase_with_env(
         &inputs.finding,
         &runner,
@@ -535,6 +559,8 @@ mod tests {
             work_dir: dir.path().to_path_buf(),
             static_only: false,
             json: false,
+            qemu_user: None,
+            qemu_args: Vec::new(),
         };
         let report = decode(&args).unwrap();
         assert_eq!(report.source, Source::ArgLayout);
@@ -576,6 +602,8 @@ mod tests {
             work_dir: dir.path().to_path_buf(),
             static_only: true,
             json: false,
+            qemu_user: None,
+            qemu_args: Vec::new(),
         })
         .err()
         .unwrap();
@@ -614,6 +642,8 @@ mod tests {
             work_dir: work.path().to_path_buf(),
             static_only: true,
             json: false,
+            qemu_user: None,
+            qemu_args: Vec::new(),
         })
         .unwrap();
         assert_eq!(report.arguments[0].value.as_deref(), Some("1"));

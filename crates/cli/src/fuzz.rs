@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::protocol_detect::HarnessProtocol;
-use crate::runner::{harness_runner, SandboxModeArg};
+use crate::runner::{harness_runner_for, SandboxModeArg};
 use clap::ValueEnum;
 use corpus::{
     classify, compute_signature, finding_tier, resolve_handler, CorpusManager, FindingEmitter,
@@ -332,6 +332,22 @@ pub struct FuzzArgs {
     /// with it.
     #[arg(long = "seed-file")]
     pub seed_files: Vec<PathBuf>,
+
+    /// qemu-user executable to run a cross-built harness under. Default: the
+    /// emulator recorded beside the harness (`bhf_runner.json`, written by a
+    /// cross build); a harness built for another architecture with neither is
+    /// refused.
+    #[arg(long, value_name = "QEMU")]
+    pub qemu_user: Option<PathBuf>,
+
+    /// Extra argument passed to qemu-user before the harness path.
+    #[arg(
+        long = "qemu-arg",
+        value_name = "ARG",
+        allow_hyphen_values = true,
+        requires = "qemu_user"
+    )]
+    pub qemu_args: Vec<String>,
 
     /// Raw seed bytes supplied programmatically (`bhf auto`: mined, user and
     /// reseeded corpus inputs). Kept as bytes end to end, so a seed that is not
@@ -1550,6 +1566,8 @@ pub(crate) fn run_one_target_programmatic_with_runner(
         no_fork_server: false,
         seed_inputs: Vec::new(),
         seed_files: Vec::new(),
+        qemu_user: None,
+        qemu_args: Vec::new(),
         seed_bytes: seeds,
         seeds_layout_prefixed: false,
         sanitizers: sanitizers
@@ -1579,12 +1597,9 @@ pub(crate) fn run_one_target_programmatic_with_runner(
         collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
         extension: None,
     };
-    let mut prepared = prepare(args)?;
-    // A caller-supplied cross runner overrides the direct/host runner `prepare`
-    // resolved from the harness path (qemu-user / wine emulation).
-    if let Some(runner) = runner {
-        prepared.runner = runner;
-    }
+    // A caller-supplied cross runner replaces the runner `prepare` would
+    // resolve from the harness path (qemu-user / wine emulation).
+    let prepared = prepare_with_runner(args, runner)?;
     run_builtin_with_progress(prepared, progress)
 }
 
@@ -1734,6 +1749,8 @@ fn afl_programmatic_args(
         no_fork_server: false,
         seed_inputs: Vec::new(),
         seed_files: Vec::new(),
+        qemu_user: None,
+        qemu_args: Vec::new(),
         seed_bytes: seeds,
         seeds_layout_prefixed: false,
         sanitizers: sanitizers
@@ -2218,6 +2235,13 @@ fn worker_passthrough_args(args: &FuzzArgs) -> Vec<String> {
         out.push("--rss-limit-mb".to_owned());
         out.push(args.rss_limit_mb.to_string());
     }
+    if let Some(qemu) = &args.qemu_user {
+        out.push("--qemu-user".to_owned());
+        out.push(qemu.display().to_string());
+        for arg in &args.qemu_args {
+            out.push(format!("--qemu-arg={arg}"));
+        }
+    }
     out
 }
 
@@ -2272,6 +2296,17 @@ fn arm_shared_map(work_dir: &Path, bytes: usize) -> Result<(tempfile::TempPath, 
 }
 
 fn prepare(args: FuzzArgs) -> Result<PreparedFuzzRun, String> {
+    prepare_with_runner(args, None)
+}
+
+/// [`prepare`], running the harness under `runner` when the caller supplies
+/// one (`bhf auto`'s qemu-user / wine runner for a cross-built harness)
+/// instead of the runner resolved from `--qemu-user` or the one recorded
+/// beside the harness.
+fn prepare_with_runner(
+    args: FuzzArgs,
+    runner: Option<replay_min::HarnessRunner>,
+) -> Result<PreparedFuzzRun, String> {
     match args.engine {
         FuzzEngine::Builtin | FuzzEngine::AflPlusPlus => {}
     }
@@ -2287,14 +2322,17 @@ fn prepare(args: FuzzArgs) -> Result<PreparedFuzzRun, String> {
     }
 
     let harness_path = find_harness_executable(&work_dir, &args.harness, args.engine)?;
-    let runner = harness_runner(
-        harness_path.clone(),
-        None,
-        Vec::new(),
-        args.sandbox,
-        args.sandbox_tool,
-        args.sandbox_strict,
-    );
+    let runner = match runner {
+        Some(runner) => runner,
+        None => harness_runner_for(
+            harness_path.clone(),
+            args.qemu_user,
+            args.qemu_args,
+            args.sandbox,
+            args.sandbox_tool,
+            args.sandbox_strict,
+        )?,
+    };
     let mut seeds = args
         .seed_inputs
         .into_iter()
@@ -2370,6 +2408,11 @@ fn prepare(args: FuzzArgs) -> Result<PreparedFuzzRun, String> {
     let mut extra_env = args.extra_env;
     extra_env.extend(sanitizer_env.clone());
     apply_fuzz_child_env_overrides(&mut extra_env);
+    // Under an emulator a sanitizer report must not abort: qemu-user dumps
+    // its own address space on a guest abort, which takes minutes.
+    if runner.qemu_prefix().is_some() {
+        no_abort_on_error(&mut extra_env);
+    }
     // #59: arm the runtime sink oracles on the manual path. `bhf auto` already
     // threads LD_PRELOAD + BHF_RUNTRACE_LOG through `extra_env`, so this only
     // fires for a direct `bhf fuzz` invocation (guarded: skip when already armed).
@@ -5048,6 +5091,9 @@ fn run_with_timeout(
         Some((program, args)) => {
             let mut cmd = std::process::Command::new(program);
             cmd.args(args).arg(harness_path);
+            // A crash under the emulator must not make it dump its own
+            // address space.
+            replay_min::process::disable_core_dumps(&mut cmd);
             cmd
         }
         None => std::process::Command::new(harness_path),
@@ -5467,6 +5513,33 @@ fn apply_fuzz_child_env_overrides(extra_env: &mut Vec<(String, String)>) {
 /// on whatever the operator's `ASAN_OPTIONS` says; leak detection is never
 /// turned off.
 pub(crate) fn sanitizer_child_env(leak: bool) -> Vec<(String, String)> {
+    sanitizer_child_env_for(leak, false)
+}
+
+/// [`sanitizer_child_env`] for a child that runs under an emulator
+/// (`emulated`, a qemu-user runner) or natively. Under qemu-user a guest
+/// abort makes qemu re-raise SIGABRT and dump its own huge address space,
+/// which takes minutes, so an emulated child gets `abort_on_error=0`: the
+/// sanitizer exits non-zero after its report, which classifies it.
+pub(crate) fn sanitizer_child_env_for(leak: bool, emulated: bool) -> Vec<(String, String)> {
+    let mut env = native_sanitizer_child_env(leak);
+    if emulated {
+        no_abort_on_error(&mut env);
+    }
+    env
+}
+
+/// Turn `abort_on_error` off in the `ASAN_OPTIONS` and `UBSAN_OPTIONS` of
+/// `env` (bhf's keys go last, so the appended one wins).
+pub(crate) fn no_abort_on_error(env: &mut [(String, String)]) {
+    for (key, value) in env.iter_mut() {
+        if key == "ASAN_OPTIONS" || key == "UBSAN_OPTIONS" {
+            value.push_str(":abort_on_error=0");
+        }
+    }
+}
+
+fn native_sanitizer_child_env(leak: bool) -> Vec<(String, String)> {
     // `symbolize=1`: the location a replay compares must not be erased by an
     // inherited `symbolize=0`.
     let asan_required = if leak {
@@ -11363,6 +11436,8 @@ exit 0
             no_fork_server: false,
             seed_inputs: Vec::new(),
             seed_files: Vec::new(),
+            qemu_user: None,
+            qemu_args: Vec::new(),
             seed_bytes: Vec::new(),
             seeds_layout_prefixed: false,
             sanitizers: Vec::new(),

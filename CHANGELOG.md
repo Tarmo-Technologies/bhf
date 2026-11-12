@@ -60,6 +60,34 @@
   and could exceed its buffer, and two buffers got the same bytes.
   `arg-layout.json` gives each slice a sized `remainder` step, so
   `bhf decode-args --static` decodes these calls exactly.
+- SIGTRAP is a crash: a trap instruction (`__builtin_trap` on AArch64, and the
+  bounds and UBSan checks a cross build arms in trap mode) gives a BHF-210
+  finding naming SIGTRAP instead of being dropped as a rejected input, so a
+  cross sweep's trapping crashes are no longer lost. Replay's exit text, the
+  differential summary, the transport-fault taxonomy and the BHF-210 rule
+  description name it too.
+- `bhf replay`, `bhf minimize`, `bhf fuzz`, `bhf decode-args`, `bhf corpus
+  minimize` and `bhf report --backfill` run a cross-built harness under the
+  emulator recorded beside it (`bhf_runner.json`, also looked up in the
+  harness dir of a binary staged into `build/<id>/main`) when no
+  `--qemu-user` is given, with a note naming it. A harness built for another
+  architecture with no runner given or recorded is refused before it runs,
+  with the flag to pass. Minimization of a C/C++ finding now honours
+  `--qemu-user` and `--sandbox` too.
+- The generated `replay.py` of a cross-built harness runs it under its
+  recorded emulator (`RUNNER`, or the `bhf_runner.json` beside the harness it
+  resolves); `BHF_REPLAY_RUNNER` overrides it.
+- An emulated replay, minimization, fuzz or comparison-capture child gets
+  `abort_on_error=0` (a sanitizer report exits non-zero instead of aborting,
+  which made qemu-user spend minutes on its own address space, so a sanitized
+  cross replay timed out) and runs with core dumps off. The generated
+  `replay.py` does the same whenever it runs the harness under a runner, so a
+  sanitized cross reproducer no longer takes over a minute.
+- The fidelity record of a cross-sweep finding no longer claims the host:
+  `arch` says `built for <triple> and run under <runner> user-mode emulation`,
+  `endianness` gives the target triple's byte order, and `sanitizers` lists
+  only the sanitizer runtimes the fuzzed binary links (`not_exercised` for a
+  cross sweep).
 - `bhf minimize` no longer requires `--harness`: without it, it minimizes
   against the finding's own harness, resolved in its work dir the way
   `bhf replay` resolves it (`fixture_path`, then `harness_id`, including a
@@ -803,6 +831,10 @@
   once, and its workers prefix none of the seeds they are handed.
   `auto/seeds.json` lists the prefixed seeds under an additive
   `layout_variants` (`harness_id`, `layout_prefix`, `sha256`).
+- `bhf fuzz` and `bhf decode-args` take `--qemu-user` and `--qemu-arg`, as
+  `bhf replay` and `bhf minimize` do.
+- `FidelityFacts` has two more fields, `target_triple` and `runner`, for a
+  cross-built target run under user-mode emulation.
 - `bhf capsule`, `bhf verify-poc` and `bhf env-capsule` support every harness
   language bhf generates, through per-language lanes: Ada, Rust, Go, Java, C#,
   Python, JavaScript, TypeScript, Ruby, Perl, PHP, Lua, COBOL and Fortran, as

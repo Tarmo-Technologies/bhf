@@ -801,3 +801,80 @@ fn make_executable(path: &Path) {
 
 #[cfg(not(unix))]
 fn make_executable(_path: &Path) {}
+
+/// A harness built without a sanitizer that dies of a trap is a fatal-signal
+/// finding naming its signal: an illegal-instruction trap (`__builtin_trap`
+/// on x86_64) and a raised SIGTRAP alike.
+#[cfg(target_os = "linux")]
+#[test]
+fn trap_signals_are_fatal_signal_findings_that_name_the_signal() {
+    let compiles = std::process::Command::new("cc")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !compiles {
+        eprintln!("skipping: no C compiler");
+        return;
+    }
+    let temp = temp_dir("trap-signals");
+    let work_dir = temp.join("bhf_work");
+    let harness_dir = work_dir.join("harnesses/H-TRAP");
+    fs::create_dir_all(&harness_dir).unwrap();
+    fs::write(
+        harness_dir.join("target.c"),
+        "#include <stdint.h>\n#include <stddef.h>\n#include <signal.h>\n\
+         int bhf_run_one(const uint8_t *data, size_t size) {\n\
+             if (size > 0 && data[0] == 'I') __builtin_trap();\n\
+             if (size > 0 && data[0] == 'T') raise(SIGTRAP);\n\
+             return 0;\n\
+         }\n",
+    )
+    .unwrap();
+    let driver = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../c_runtime/bhf_driver.c");
+    let built = std::process::Command::new("cc")
+        .current_dir(&harness_dir)
+        .args(["-O1", "-g", "-o", "main", "target.c"])
+        .arg(&driver)
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let mut expected = vec![("T", "SIGTRAP")];
+    if cfg!(target_arch = "x86_64") {
+        expected.push(("I", "SIGILL"));
+    }
+    for (seed, signal) in expected {
+        let exit = run_from(vec![
+            OsString::from("bhf"),
+            OsString::from("fuzz"),
+            work_dir.clone().into_os_string(),
+            OsString::from("--harness"),
+            OsString::from("H-TRAP"),
+            OsString::from("--iterations"),
+            OsString::from("1"),
+            OsString::from("--no-fork-server"),
+            OsString::from("--sandbox"),
+            OsString::from("none"),
+            OsString::from("--seed-input"),
+            OsString::from(seed),
+        ]);
+        assert_eq!(exit, 0, "{seed}");
+        let found = fs::read_dir(work_dir.join("results/findings"))
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| fs::read(entry.path().join("finding.json")).ok())
+            .filter_map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .find(|finding| finding["exception"]["signal"] == signal);
+        let finding = found.unwrap_or_else(|| panic!("no {signal} finding for seed {seed}"));
+        assert_eq!(finding["rule_id"], "BHF-210", "{finding}");
+        assert!(
+            finding["exception"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(signal)),
+            "{finding}"
+        );
+    }
+}

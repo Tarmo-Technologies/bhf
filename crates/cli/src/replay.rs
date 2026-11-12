@@ -3,7 +3,7 @@
 use crate::crash_identity;
 use crate::finding_arg::resolve_finding_arg;
 use crate::protocol_detect::{Detection, HarnessProtocol, ProtocolBasis};
-use crate::runner::{engine_for, harness_runner, HarnessEngine, SandboxModeArg};
+use crate::runner::{engine_for, harness_runner_for, HarnessEngine, SandboxModeArg};
 use replay_min::HarnessRunner;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -47,7 +47,10 @@ pub struct ReplayArgs {
     #[arg(long)]
     pub harness: Option<PathBuf>,
 
-    /// qemu-user executable for ELF-Linux cross-target replay.
+    /// qemu-user executable for ELF-Linux cross-target replay. Default: the
+    /// emulator recorded beside the harness (`bhf_runner.json`, written by a
+    /// cross build); a harness built for another architecture with neither is
+    /// refused.
     #[arg(long, value_name = "QEMU")]
     pub qemu_user: Option<PathBuf>,
 
@@ -234,15 +237,29 @@ pub fn run(args: ReplayArgs) -> i32 {
     // Build the runner ONCE, before dispatching by engine, so every replay path
     // — Ada framed, C libFuzzer, C AFL — honors --qemu-user / sandbox. The C
     // paths used to `return` here with a bare Command::new(harness), silently
-    // bypassing the requested runner (#81).
-    let runner = harness_runner(
+    // bypassing the requested runner (#81). Without --qemu-user, the emulator
+    // recorded beside a cross-built harness runs it.
+    let explicit_qemu = args.qemu_user.is_some();
+    let runner = match harness_runner_for(
         harness,
         args.qemu_user,
         args.qemu_args,
         args.sandbox,
         args.sandbox_tool,
         args.sandbox_strict,
-    );
+    ) {
+        Ok(runner) => runner,
+        Err(error) => return report_error(&output, &finding_dir, &error),
+    };
+    if debugger.is_some() && !explicit_qemu && runner.qemu_prefix().is_some() {
+        return report_error(
+            &output,
+            &finding_dir,
+            "--debugger runs the harness natively, and this harness runs under the emulator \
+             recorded beside it; start the emulator with its gdb stub (qemu-user -g <port>) and \
+             attach gdb to it instead",
+        );
+    }
     match engine {
         HarnessEngine::CAfl => replay_c(
             &finding_dir,
@@ -574,6 +591,7 @@ fn exit_parts(status: Option<std::process::ExitStatus>) -> (Option<i32>, Option<
 fn signal_name(signal: i32) -> Option<&'static str> {
     Some(match signal {
         4 => "SIGILL",
+        5 => "SIGTRAP",
         6 => "SIGABRT",
         7 => "SIGBUS",
         8 => "SIGFPE",
@@ -602,7 +620,10 @@ pub(crate) fn is_leak_finding(raw: &Value) -> bool {
 /// (native runs only), the recorded runtime mode and any env the finding
 /// recorded as injected (which wins).
 fn replay_env(parsed: &Value, runner: &HarnessRunner, input: CInput) -> Vec<(String, String)> {
-    let mut env = crate::fuzz::sanitizer_child_env(is_leak_finding(parsed));
+    let mut env = crate::fuzz::sanitizer_child_env_for(
+        is_leak_finding(parsed),
+        runner.qemu_prefix().is_some(),
+    );
     if input == CInput::Stdin {
         return env;
     }
@@ -2217,6 +2238,46 @@ mod tests {
             "  the access hit parameter `buf`'s buffer, which starts inside the region, at offset 5"
         );
         assert!(line("nearest_pointer").contains("5 byte(s) past parameter `buf`"));
+    }
+
+    /// Under qemu-user a sanitizer report must not abort (the emulator would
+    /// dump its whole address space); natively it still does.
+    #[test]
+    fn an_emulated_replay_does_not_abort_on_a_report() {
+        let raw = serde_json::json!({"rule_id": "BHF-201"});
+        let last_abort = |env: &[(String, String)], key: &str| {
+            env.iter().find(|(k, _)| k == key).and_then(|(_, value)| {
+                value
+                    .split(':')
+                    .rev()
+                    .find(|item| item.starts_with("abort_on_error="))
+                    .map(str::to_owned)
+            })
+        };
+        let qemu =
+            replay_min::HarnessRunner::qemu_user("/usr/bin/qemu-aarch64", Vec::new(), "/w/main");
+        let native = replay_min::HarnessRunner::direct("/w/main");
+        for key in ["ASAN_OPTIONS", "UBSAN_OPTIONS"] {
+            let env = super::replay_env(&raw, &qemu, super::CInput::ArgvFile);
+            assert_eq!(
+                last_abort(&env, key).as_deref(),
+                Some("abort_on_error=0"),
+                "{key}"
+            );
+            let env = super::replay_env(&raw, &native, super::CInput::ArgvFile);
+            assert_eq!(
+                last_abort(&env, key).as_deref(),
+                Some("abort_on_error=1"),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_exit_text_names_a_trap() {
+        let exit =
+            super::ExitSummary::process(None, Some(5), None, std::time::Duration::from_millis(10));
+        assert!(exit.text.starts_with("signal 5 (SIGTRAP)"), "{}", exit.text);
     }
 
     #[test]

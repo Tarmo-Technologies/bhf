@@ -31,6 +31,29 @@ pub fn isolate_process_group(command: &mut Command) {
 #[cfg(not(unix))]
 pub fn isolate_process_group(_command: &mut Command) {}
 
+/// Do not let an emulated child write a core dump: a guest crash under
+/// qemu-user makes qemu dump its own, huge address space, which takes
+/// minutes.
+#[cfg(unix)]
+pub fn disable_core_dumps(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: setrlimit is async-signal-safe and touches no memory of the
+    // parent.
+    unsafe {
+        command.pre_exec(|| {
+            let none = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            libc::setrlimit(libc::RLIMIT_CORE, &none);
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+pub fn disable_core_dumps(_command: &mut Command) {}
+
 /// SIGKILL `child`'s process group (it must have been started with
 /// [`isolate_process_group`]), then the child itself.
 #[cfg(unix)]
@@ -128,6 +151,15 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn core_dumps_are_off_for_an_emulated_child() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "ulimit -c"]).stdout(Stdio::piped());
+        disable_core_dumps(&mut command);
+        let output = command.output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "0");
     }
 
     #[test]

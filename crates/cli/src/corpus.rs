@@ -155,14 +155,21 @@ fn run_minimize(args: MinimizeCorpusArgs) -> i32 {
         return 1;
     }
 
-    let runner = crate::runner::harness_runner(
+    // A cross-built harness runs under the emulator recorded beside it.
+    let runner = match crate::runner::harness_runner_for(
         args.harness.clone(),
         None,
         Vec::new(),
         crate::runner::SandboxModeArg::Auto,
         None,
         false,
-    );
+    ) {
+        Ok(runner) => runner,
+        Err(error) => {
+            bhfeprintln!("error: {error}");
+            return 1;
+        }
+    };
     let work_dir = match scratch_work_dir() {
         Ok(dir) => dir,
         Err(error) => {
