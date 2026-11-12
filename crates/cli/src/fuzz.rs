@@ -911,6 +911,19 @@ pub(crate) struct FuzzRunSummary {
     /// from `run.json` when no `--extension` was given.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) extension: Option<serde_json::Value>,
+    /// Later sanitizer crashes folded into an already-reported root cause, by
+    /// dedupe key (`cluster_key_full` of the finding they matched): the hits
+    /// that were not emitted as findings of their own. An additive, optional
+    /// field, omitted when no crash was folded.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub(crate) duplicate_sanitizer_hits: std::collections::BTreeMap<String, usize>,
+    /// Sanitizer crashes whose root cause never reproduced in a fresh process
+    /// and so was never reported, by dedupe key: the failed confirmations plus
+    /// the later hits that were no longer re-run. Not counted in
+    /// `duplicate_sanitizer_hits`. An additive, optional field, omitted when
+    /// empty.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub(crate) unreproduced_sanitizer_hits: std::collections::BTreeMap<String, usize>,
 }
 
 /// AFL++ binary-only settings recorded in `run.json` so a run is reproducible
@@ -3093,12 +3106,10 @@ fn run_builtin_with_progress(
     let existing_findings = ExistingFindings::load(&prepared.work_dir, &prepared.harness_id);
     let mut seen_oracle_hits =
         HashSet::<String>::from_iter(existing_findings.oracles.keys().cloned());
-    // Sanitizer-crash cluster key -> hit count, for dedup (#389): one finding
-    // per root cause, not one per crashing input.
-    let mut seen_sanitizer_clusters = HashMap::<String, usize>::new();
-    for key in existing_findings.clusters.keys() {
-        seen_sanitizer_clusters.insert(key.clone(), 1);
-    }
+    // Sanitizer-crash dedup (#389): one finding per root cause, not one per
+    // crashing input.
+    let mut sanitizer_dedup =
+        SanitizerClusterDedup::new(existing_findings.clusters.keys().cloned());
     // A crash dropped because it matches one of those findings is counted
     // here (finding id -> crashing executions) and reported, never silent.
     let mut duplicates_of_existing = std::collections::BTreeMap::<String, usize>::new();
@@ -3292,7 +3303,7 @@ fn run_builtin_with_progress(
             {
                 ForkOutcome::Ran(run) => {
                     from_fork_server = true;
-                    run
+                    *run
                 }
                 ForkOutcome::Died => {
                     // Drop (kill/reap) the dead server, isolate the crash via the
@@ -3442,7 +3453,7 @@ fn run_builtin_with_progress(
                 prepared.rss_limit_mb,
                 prepared.deadline,
             )?;
-            run.sanitizer = fresh.sanitizer;
+            adopt_fresh_rerun(&mut run, fresh);
         }
         // #382: this input's coverage novelty — new corpus signatures plus (on the
         // driver path) new edge coverage — is its scheduling energy, captured here
@@ -3573,11 +3584,13 @@ fn run_builtin_with_progress(
             // glue with no target frame is a harness fault, not a target bug.
             else if c_libfuzzer_harness && corpus::cluster::is_driver_glue_crash(report) {
                 driver_glue_drops += 1;
-            } else if first_of_sanitizer_cluster(&mut seen_sanitizer_clusters, report) {
+            } else if let Some(key) = sanitizer_dedup.first_sighting(report) {
                 // First sighting of this cluster (#389 dedups the rest). For a
                 // passthrough libFuzzer harness, replay-verify before emitting
                 // (#388): re-run in a fresh process and drop non-reproducing
-                // faults (allocator-state corruption across inputs).
+                // faults (allocator-state corruption across inputs). The key is
+                // consumed only once the finding is emitted, so a first hit that
+                // does not reproduce does not hide a later one that does.
                 if !c_libfuzzer_harness
                     || sanitizer_crash_reproduces(
                         &prepared.runner,
@@ -3597,16 +3610,20 @@ fn run_builtin_with_progress(
                             run.stderr.as_deref().map(str::as_bytes),
                         )
                         .map_err(|error| format!("emit sanitizer finding: {error}"))?;
+                    sanitizer_dedup.consumed(key);
                     finding_ids.push(id.0);
                 } else {
+                    sanitizer_dedup.unconfirmed(key);
                     non_reproducible += 1;
                 }
             } else {
+                // A hit of a root cause pre-seeded from an on-disk finding is
+                // reported against that finding's id.
                 note_duplicate_of_existing(
                     &mut duplicates_of_existing,
                     existing_findings
                         .clusters
-                        .get(&sanitizer_cluster_dedupe_key(report)),
+                        .get(&corpus::finding::sanitizer_dedupe_key(report)),
                 );
             }
         }
@@ -3752,6 +3769,23 @@ fn run_builtin_with_progress(
              process (global-state artifacts) and were not emitted"
         );
     }
+    let skipped_unreproduced = sanitizer_dedup.skipped_unreproduced_hits();
+    if skipped_unreproduced > 0 {
+        bhfeprintln!(
+            "bhf fuzz: {skipped_unreproduced} later sanitizer crash(es) hit a root \
+             cause that failed {MAX_UNCONFIRMED_SANITIZER_ATTEMPTS} fresh-process \
+             confirmations; they were not re-run or emitted (per key: \
+             `unreproduced_sanitizer_hits` in fuzz_runs/<harness>-latest.json)"
+        );
+    }
+    let folded: usize = sanitizer_dedup.duplicate_hits().values().sum();
+    if folded > 0 {
+        bhfeprintln!(
+            "bhf fuzz: {folded} later sanitizer crash(es) matched an already-reported \
+             root cause and were counted, not emitted (per key: \
+             `duplicate_sanitizer_hits` in fuzz_runs/<harness>-latest.json)"
+        );
+    }
     if driver_glue_drops > 0 {
         bhfeprintln!(
             "bhf fuzz: {driver_glue_drops} crash(es) in libFuzzer/sanitizer driver glue \
@@ -3862,6 +3896,8 @@ fn run_builtin_with_progress(
         executions_per_sec: executions_per_sec(executions, elapsed_secs),
         afl: None,
         extension: extension_block,
+        duplicate_sanitizer_hits: sanitizer_dedup.duplicate_hits(),
+        unreproduced_sanitizer_hits: sanitizer_dedup.unreproduced_hits(),
     };
     if prepared.print_final_stats {
         bhfeprintln!(
@@ -3931,46 +3967,148 @@ impl RuntraceLogCursor {
     }
 }
 
-/// First-sighting test for sanitizer-crash deduplication (#389). Returns true
-/// exactly once per distinct crash cluster (root cause), so the report carries
-/// one finding per cluster with a hit count instead of one per crashing input
-/// (cJSON produced 2211 findings collapsing to 3 clusters). A fallback cluster
-/// (no informative target frame) is keyed by rule_id so unrelated rules still
-/// separate.
-fn first_of_sanitizer_cluster(
-    seen: &mut HashMap<String, usize>,
-    report: &corpus::SanitizerReport,
-) -> bool {
-    let limit = max_finding_dedup_keys();
-    let key = sanitizer_cluster_dedupe_key(report);
-    if let Some(count) = seen.get_mut(&key) {
-        *count = count.saturating_add(1);
-        return false;
-    }
-    if seen.len() >= limit {
-        if seen.len() == limit {
-            bhfeprintln!(
-                "bhf: sanitizer-cluster tracking reached its {limit}-key \
-                 memory cap; suppressing later distinct clusters (raise \
-                 BHF_MAX_FINDING_DEDUP_KEYS if intended)"
-            );
-            seen.insert("__bhf_dedup_memory_cap__".to_owned(), 1);
-        }
-        return false;
-    }
-    seen.insert(key, 1);
-    true
+/// Fresh-process confirmations a sanitizer crash's root cause gets before a
+/// crash that never reproduces stops costing a re-run per hit.
+const MAX_UNCONFIRMED_SANITIZER_ATTEMPTS: u32 = 3;
+
+/// Per-run sanitizer-crash deduplication (#389): one finding per distinct crash
+/// root cause with a hit count, instead of one per crashing input (cJSON
+/// produced 2211 findings collapsing to 3 clusters). Keys are
+/// [`corpus::finding::sanitizer_dedupe_key`]: the root-cause cluster key, which
+/// for a report without an informative frame is its reported site, else its
+/// signature, so different rules, checks and sites stay separate.
+///
+/// A key is consumed only once a finding is emitted for it: a first hit that
+/// does not reproduce in a fresh process must not hide a later reproducible
+/// hit of the same root cause. After [`MAX_UNCONFIRMED_SANITIZER_ATTEMPTS`]
+/// failed confirmations the key is given up: later hits are no longer re-run,
+/// and they are counted as unreproduced, not as duplicates of a finding.
+struct SanitizerClusterDedup {
+    /// Consumed key -> hits (the emitted or pre-seeded finding, plus later
+    /// duplicates).
+    seen: HashMap<String, usize>,
+    /// Key -> failed fresh-process confirmations, for keys not yet consumed.
+    unconfirmed: HashMap<String, u32>,
+    /// Given-up key -> later hits that were not re-run. No finding was ever
+    /// emitted for these keys.
+    abandoned: HashMap<String, usize>,
+    limit: usize,
+    warned_cap: bool,
 }
 
-/// The key a sanitizer crash dedupes on: its full cluster key, or `rule:<id>`
-/// when clustering fell back.
-fn sanitizer_cluster_dedupe_key(report: &corpus::SanitizerReport) -> String {
-    let cluster = corpus::cluster::cluster_for_sanitizer(report);
-    if cluster.fallback {
-        format!("rule:{}", report.rule_id)
-    } else {
-        cluster.full
+impl SanitizerClusterDedup {
+    /// Start from the keys of findings an earlier pass already wrote (#35).
+    fn new(seed: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            seen: seed.into_iter().map(|key| (key, 1)).collect(),
+            unconfirmed: HashMap::new(),
+            abandoned: HashMap::new(),
+            limit: max_finding_dedup_keys(),
+            warned_cap: false,
+        }
     }
+
+    /// The dedupe key when `report`'s root cause has not been reported yet: the
+    /// caller confirms it and then calls [`Self::consumed`] or
+    /// [`Self::unconfirmed`]. `None` for a duplicate or a given-up root cause
+    /// (either way its hit is counted), or once the key memory cap is reached.
+    fn first_sighting(&mut self, report: &corpus::SanitizerReport) -> Option<String> {
+        let key = corpus::finding::sanitizer_dedupe_key(report);
+        if let Some(count) = self.seen.get_mut(&key) {
+            *count = count.saturating_add(1);
+            return None;
+        }
+        if let Some(later) = self.abandoned.get_mut(&key) {
+            *later = later.saturating_add(1);
+            return None;
+        }
+        let tracked = self
+            .seen
+            .len()
+            .saturating_add(self.unconfirmed.len())
+            .saturating_add(self.abandoned.len());
+        if tracked >= self.limit {
+            if !self.warned_cap {
+                self.warned_cap = true;
+                bhfeprintln!(
+                    "bhf: sanitizer-cluster tracking reached its {}-key \
+                     memory cap; suppressing later distinct clusters (raise \
+                     BHF_MAX_FINDING_DEDUP_KEYS if intended)",
+                    self.limit
+                );
+            }
+            return None;
+        }
+        Some(key)
+    }
+
+    /// A finding was emitted for `key`: later hits are duplicates.
+    fn consumed(&mut self, key: String) {
+        self.unconfirmed.remove(&key);
+        self.seen.entry(key).or_insert(1);
+    }
+
+    /// A crash with `key` did not reproduce in a fresh process. The key stays
+    /// open for a later hit until it has failed
+    /// [`MAX_UNCONFIRMED_SANITIZER_ATTEMPTS`] times, then it is given up.
+    fn unconfirmed(&mut self, key: String) {
+        let attempts = self.unconfirmed.entry(key.clone()).or_insert(0);
+        *attempts = attempts.saturating_add(1);
+        if *attempts >= MAX_UNCONFIRMED_SANITIZER_ATTEMPTS {
+            self.unconfirmed.remove(&key);
+            self.abandoned.insert(key, 0);
+        }
+    }
+
+    /// Later hits folded into each already-reported root cause.
+    fn duplicate_hits(&self) -> std::collections::BTreeMap<String, usize> {
+        self.seen
+            .iter()
+            .filter(|(_, count)| **count > 1)
+            .map(|(key, count)| (key.clone(), count - 1))
+            .collect()
+    }
+
+    /// Hits of each root cause that never reproduced in a fresh process and so
+    /// was never reported: its failed confirmations, plus, once it was given
+    /// up, the later hits that were not re-run.
+    fn unreproduced_hits(&self) -> std::collections::BTreeMap<String, usize> {
+        let given_up = self.abandoned.iter().map(|(key, later)| {
+            let tries = MAX_UNCONFIRMED_SANITIZER_ATTEMPTS as usize;
+            (key.clone(), tries.saturating_add(*later))
+        });
+        let open = self
+            .unconfirmed
+            .iter()
+            .map(|(key, tries)| (key.clone(), *tries as usize));
+        given_up.chain(open).collect()
+    }
+
+    /// Hits of given-up root causes that were not re-run.
+    fn skipped_unreproduced_hits(&self) -> usize {
+        self.abandoned.values().sum()
+    }
+}
+
+/// AFL++ crash ingestion's first-sighting test: the same root-cause key the
+/// builtin loop uses, so the two engines dedupe a crash identically. AFL++ has
+/// already confirmed the crash, so a first sighting is consumed at once.
+fn afl_crash_is_new(dedup: &mut SanitizerClusterDedup, report: &corpus::SanitizerReport) -> bool {
+    match dedup.first_sighting(report) {
+        Some(key) => {
+            dedup.consumed(key);
+            true
+        }
+        None => false,
+    }
+}
+
+/// #416: adopt a fresh-process re-run's result for an input the persistent
+/// fork-server ran without a report: the parsed report and the raw stderr it
+/// was parsed from, which becomes the finding's `sanitizer.log`.
+fn adopt_fresh_rerun(run: &mut HarnessRun, fresh: HarnessRun) {
+    run.sanitizer = fresh.sanitizer;
+    run.stderr = fresh.stderr;
 }
 
 /// Count one crash that matched an existing finding (`None`: the match was a
@@ -4371,7 +4509,7 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
     }
 
     let mut finding_ids = Vec::new();
-    let mut seen_rule_sigs = HashSet::<String>::new();
+    let mut afl_dedup = SanitizerClusterDedup::new(Vec::new());
     let mut crash_count = 0_usize;
     if crashes_dir.is_dir() {
         for entry in fs::read_dir(&crashes_dir)
@@ -4423,9 +4561,7 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
             let Some(report) = corpus::parse_sanitizer_report(&stderr) else {
                 continue;
             };
-            let frame_names: Vec<&str> = report.stack.iter().map(|f| f.function.as_str()).collect();
-            let sig = format!("{}|{}", report.rule_id, frame_names.join("|"));
-            if !seen_rule_sigs.insert(sig) {
+            if !afl_crash_is_new(&mut afl_dedup, &report) {
                 continue;
             }
             let id = emitter
@@ -4477,6 +4613,8 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
         // (it iterates the builtin pool's retained corpus); AFL++ owns its own
         // on-disk queue, so `--extension` is not driven here.
         extension: None,
+        duplicate_sanitizer_hits: afl_dedup.duplicate_hits(),
+        unreproduced_sanitizer_hits: afl_dedup.unreproduced_hits(),
     };
     write_run_summary(&prepared.work_dir, &summary)?;
     Ok(summary)
@@ -4858,6 +4996,7 @@ fn run_c_libfuzzer_single_input(
                     message: format!(
                         "harness exceeded the response deadline of {deadline:?} (took {elapsed:?})"
                     ),
+                    ..Default::default()
                 }),
                 stderr: None,
                 rejected: false,
@@ -4895,6 +5034,7 @@ fn run_c_libfuzzer_single_input(
                     stack: Vec::new(),
                     message: "harness exceeded the configured RSS limit (--rss-limit-mb)"
                         .to_owned(),
+                    ..Default::default()
                 }),
                 stderr: None,
                 rejected: false,
@@ -5105,17 +5245,39 @@ fn apply_fuzz_child_env_overrides(extra_env: &mut Vec<(String, String)>) {
     // in the report are what join a crash to the static finding on the same line.
     // Adding it here to appease AFL turned every `fuzz_confirmed` static finding
     // into `fuzz_exercised`.
-    for key in ["ASAN_OPTIONS", "UBSAN_OPTIONS"] {
-        if !extra_env.iter().any(|(k, _)| k == key) {
-            extra_env.push((
-                key.to_owned(),
-                multicore_fuzz::merge_sanitizer_options(
-                    std::env::var(key).ok().as_deref(),
-                    "abort_on_error=1:halt_on_error=1",
-                ),
-            ));
-        }
+    //
+    // UBSan additionally prints its stack (`print_stacktrace=1`) and the name of
+    // the failed check (`report_error_type=1`): without them a UBSan report is a
+    // single `file:line:col: runtime error:` line with no function to name as
+    // the sink and nothing but its rule to tell one defect from another.
+    if !extra_env.iter().any(|(k, _)| k == "ASAN_OPTIONS") {
+        extra_env.push((
+            "ASAN_OPTIONS".to_owned(),
+            multicore_fuzz::merge_sanitizer_options(
+                std::env::var("ASAN_OPTIONS").ok().as_deref(),
+                "abort_on_error=1:halt_on_error=1",
+            ),
+        ));
     }
+    if !extra_env.iter().any(|(k, _)| k == "UBSAN_OPTIONS") {
+        extra_env.push(("UBSAN_OPTIONS".to_owned(), ubsan_child_options()));
+    }
+}
+
+/// The `UBSAN_OPTIONS` of every child that must report UBSan findings the way
+/// the fuzz loop does — builtin fuzz children, minimization and `bhf replay`:
+/// the first report halts the run as a crash (`abort_on_error=1`,
+/// `halt_on_error=1`) and carries its stack and check name
+/// ([`multicore_fuzz::UBSAN_REPORT_OPTIONS`]). The operator's inherited
+/// `UBSAN_OPTIONS` is merged first; bhf's keys go last and win.
+pub(crate) fn ubsan_child_options() -> String {
+    multicore_fuzz::merge_sanitizer_options(
+        std::env::var("UBSAN_OPTIONS").ok().as_deref(),
+        &format!(
+            "abort_on_error=1:halt_on_error=1:{}",
+            multicore_fuzz::UBSAN_REPORT_OPTIONS
+        ),
+    )
 }
 
 fn sanitizer_summary(
@@ -5792,10 +5954,11 @@ fn crash_testcase_key(path: &Path, max_len: usize) -> Option<u64> {
 /// re-emit a finding it already produced (#35: the cascade otherwise wrote the
 /// same root cause once per pass, inflating findings.csv / the findings dir /
 /// summary counts ~2-3x). Holds the sanitizer-cluster and oracle-hit keys,
-/// reconstructed to match the runtime keys `first_of_sanitizer_cluster` /
-/// `oracle_hit_dedupe_key` compute, and each finding's event signature, all
-/// mapped to the finding id, so a crash dropped as one of them is reported as a
-/// duplicate of that finding. Mirrors `existing_crash_testcases`.
+/// reconstructed to match the runtime keys [`SanitizerClusterDedup`]
+/// ([`corpus::finding::sanitizer_dedupe_key`]) and `oracle_hit_dedupe_key`
+/// compute, and each finding's event signature, all mapped to the finding id,
+/// so a crash dropped as one of them is reported as a duplicate of that
+/// finding. Mirrors `existing_crash_testcases`.
 #[derive(Debug, Default)]
 struct ExistingFindings {
     /// Sanitizer-crash dedupe key -> finding id.
@@ -5848,8 +6011,9 @@ impl ExistingFindings {
                 keep_lowest_id(&mut existing.signatures, signature.to_owned(), &id);
             }
             // Oracle hits key on rule_id|oracle_name|api (oracle_hit_dedupe_key),
-            // sanitizer crashes on cluster_key_full or rule:<id> on fallback
-            // (first_of_sanitizer_cluster).
+            // sanitizer crashes on the record's cluster_key_full: the root-cause
+            // key, or for a fallback record its signature, which is the key
+            // corpus::finding::sanitizer_dedupe_key gives the report at runtime.
             match corpus::finding::run_dedupe_key(&record) {
                 Some(corpus::finding::RunDedupeKey::Oracle(key)) => {
                     keep_lowest_id(&mut existing.oracles, key, &id);
@@ -6247,7 +6411,8 @@ struct ForkServer {
 }
 
 enum ForkOutcome {
-    Ran(HarnessRun),
+    /// Boxed: a run result carries the parsed sanitizer report.
+    Ran(Box<HarnessRun>),
     /// The process exited/crashed/hung handling this input; respawn + re-run.
     Died,
 }
@@ -6413,7 +6578,7 @@ impl ForkServer {
             return ForkOutcome::Died;
         }
         match self.read_event_delta() {
-            Ok(run) => ForkOutcome::Ran(run),
+            Ok(run) => ForkOutcome::Ran(Box::new(run)),
             Err(_) => ForkOutcome::Died,
         }
     }
@@ -6943,7 +7108,8 @@ mod dedup_seed_tests {
             .unwrap(),
         )
         .unwrap();
-        // A fallback sanitizer-crash finding (keyed by rule).
+        // A fallback sanitizer-crash finding: keyed by its own cluster key (its
+        // signature), not by one `rule:<id>` shared by every crash of the rule.
         let f = findings.join("F-0002-bbbb");
         std::fs::create_dir_all(&f).unwrap();
         std::fs::write(
@@ -6952,6 +7118,7 @@ mod dedup_seed_tests {
                 "id": "F-0002-bbbb",
                 "harness_id": "H-TEST",
                 "rule_id": "BHF-210",
+                "cluster_key_full": "f00d",
                 "cluster_fallback": true,
             }))
             .unwrap(),
@@ -6978,9 +7145,10 @@ mod dedup_seed_tests {
             Some("F-0001-aaaa")
         );
         assert_eq!(
-            existing.clusters.get("rule:BHF-210").map(String::as_str),
+            existing.clusters.get("f00d").map(String::as_str),
             Some("F-0002-bbbb")
         );
+        assert!(!existing.clusters.keys().any(|key| key.starts_with("rule:")));
         assert_eq!(
             existing
                 .oracles
@@ -7019,6 +7187,36 @@ mod dedup_seed_tests {
             existing.signatures.get("5151").map(String::as_str),
             Some("F-0002-eeee")
         );
+    }
+
+    /// A later pass re-seeds exactly the key the loop computes for the crash a
+    /// prior pass emitted, and nothing that would hide a different site.
+    #[test]
+    fn seeded_keys_match_the_runtime_key_of_an_emitted_finding() {
+        let work = tempfile::tempdir().unwrap();
+        let report = |line: u32| {
+            corpus::parse_sanitizer_report(&format!(
+                "/src/widget/a.c:{line}:5: runtime error: execution reached the end of a value-returning function without returning a value\n"
+            ))
+            .unwrap()
+        };
+        corpus::finding::FindingEmitter::with_metadata(
+            work.path().to_path_buf(),
+            "H-TEST".to_owned(),
+            "c".to_owned(),
+            String::new(),
+        )
+        .emit_sanitizer_crash(b"x", &report(3))
+        .unwrap();
+        let existing = ExistingFindings::load(work.path(), "H-TEST");
+        let clusters: Vec<&String> = existing.clusters.keys().collect();
+        assert_eq!(
+            clusters,
+            vec![&corpus::finding::sanitizer_dedupe_key(&report(3))]
+        );
+        assert!(!existing
+            .clusters
+            .contains_key(&corpus::finding::sanitizer_dedupe_key(&report(9))));
     }
 
     #[test]
@@ -7621,6 +7819,31 @@ mod fuzz_child_env_tests {
     }
 
     #[test]
+    fn arms_ubsan_stack_traces_and_check_names_for_the_default_builtin_child() {
+        // Without print_stacktrace=1 a UBSan report has no frames: no function
+        // name for the sink and nothing but rule|kind for its identity.
+        // report_error_type=1 makes the SUMMARY name the failed check.
+        let mut env: Vec<(String, String)> = Vec::new();
+        apply_fuzz_child_env_overrides(&mut env);
+        let value = |key: &str| {
+            env.iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+                .unwrap()
+        };
+        let ubsan = value("UBSAN_OPTIONS");
+        for key in [
+            "print_stacktrace=1",
+            "report_error_type=1",
+            "halt_on_error=1",
+        ] {
+            assert!(ubsan.contains(key), "UBSAN_OPTIONS lacks {key}: {ubsan}");
+        }
+        // They are UBSan flags; ASAN_OPTIONS keeps only its own keys.
+        assert!(!value("ASAN_OPTIONS").contains("print_stacktrace"));
+    }
+
+    #[test]
     fn does_not_override_an_explicit_sanitizer_selection() {
         // When `--sanitizers` / `--env` already threaded a value into the child
         // env (e.g. an MSan/TSan build or operator suppressions), leave it alone.
@@ -7725,12 +7948,25 @@ mod auto_path_tests {
                 })
                 .collect(),
             message: "boom".to_owned(),
+            ..Default::default()
+        }
+    }
+
+    /// Report and consume in one step, as the loop does for a crash it does not
+    /// need to confirm.
+    fn sighted(dedup: &mut SanitizerClusterDedup, report: &corpus::SanitizerReport) -> bool {
+        match dedup.first_sighting(report) {
+            Some(key) => {
+                dedup.consumed(key);
+                true
+            }
+            None => false,
         }
     }
 
     #[test]
     fn sanitizer_cluster_dedup_emits_once_per_root_cause() {
-        let mut seen = HashMap::new();
+        let mut dedup = SanitizerClusterDedup::new(Vec::new());
         // Same target frames, different scaffolding -> one cluster.
         let a1 = sanitizer_report(
             "BHF-201",
@@ -7740,12 +7976,133 @@ mod auto_path_tests {
         // Different target frame -> a second cluster.
         let b = sanitizer_report("BHF-201", vec!["other_fn", "LLVMFuzzerTestOneInput"]);
 
-        assert!(first_of_sanitizer_cluster(&mut seen, &a1));
-        assert!(!first_of_sanitizer_cluster(&mut seen, &a2));
-        assert!(first_of_sanitizer_cluster(&mut seen, &b));
-        // Two clusters, three total hits.
-        assert_eq!(seen.len(), 2);
-        assert_eq!(seen.values().sum::<usize>(), 3);
+        assert!(sighted(&mut dedup, &a1));
+        assert!(!sighted(&mut dedup, &a2));
+        assert!(sighted(&mut dedup, &b));
+        // Two clusters, three total hits: one later hit folded into `a`.
+        let duplicates = dedup.duplicate_hits();
+        assert_eq!(duplicates.len(), 1);
+        assert_eq!(
+            duplicates.get(&corpus::finding::sanitizer_dedupe_key(&a1)),
+            Some(&1)
+        );
+    }
+
+    fn missing_return_at(line: u32) -> corpus::SanitizerReport {
+        corpus::parse_sanitizer_report(&format!(
+            "/src/widget/classify.c:{line}:5: runtime error: execution reached the end of a value-returning function without returning a value\n\
+             SUMMARY: UndefinedBehaviorSanitizer: missing-return /src/widget/classify.c:{line}:5 \n"
+        ))
+        .unwrap()
+    }
+
+    /// A harness used to emit at most one stackless finding per rule for its
+    /// whole run: every later, different UB site was a "duplicate".
+    #[test]
+    fn frameless_ubsan_reports_at_distinct_sites_are_each_reported() {
+        let mut dedup = SanitizerClusterDedup::new(Vec::new());
+        assert!(sighted(&mut dedup, &missing_return_at(3)));
+        assert!(sighted(&mut dedup, &missing_return_at(9)));
+        assert!(!sighted(&mut dedup, &missing_return_at(3)));
+    }
+
+    /// The key is consumed only by an emitted finding: a first hit that does not
+    /// reproduce in a fresh process must not hide a later, reproducible one.
+    #[test]
+    fn a_crash_that_does_not_reproduce_does_not_consume_its_key() {
+        let mut dedup = SanitizerClusterDedup::new(Vec::new());
+        let report = missing_return_at(3);
+        let key = dedup.first_sighting(&report).expect("first sighting");
+        dedup.unconfirmed(key);
+        let key = dedup
+            .first_sighting(&report)
+            .expect("still unreported after a failed confirmation");
+        dedup.consumed(key);
+        assert!(dedup.first_sighting(&report).is_none());
+    }
+
+    /// ...but a crash that never reproduces stops costing a fresh re-run per hit.
+    #[test]
+    fn a_crash_that_never_reproduces_stops_being_retried() {
+        let mut dedup = SanitizerClusterDedup::new(Vec::new());
+        let report = missing_return_at(3);
+        for _ in 0..MAX_UNCONFIRMED_SANITIZER_ATTEMPTS {
+            let key = dedup.first_sighting(&report).expect("retried");
+            dedup.unconfirmed(key);
+        }
+        assert!(dedup.first_sighting(&report).is_none());
+    }
+
+    /// A root cause given up after failed confirmations was never reported, so
+    /// its later hits are not duplicates of a finding.
+    #[test]
+    fn hits_of_a_root_cause_that_never_reproduced_are_not_duplicates() {
+        let mut dedup = SanitizerClusterDedup::new(Vec::new());
+        let report = missing_return_at(3);
+        for _ in 0..MAX_UNCONFIRMED_SANITIZER_ATTEMPTS {
+            let key = dedup.first_sighting(&report).expect("retried");
+            dedup.unconfirmed(key);
+        }
+        assert!(dedup.first_sighting(&report).is_none());
+        assert!(dedup.first_sighting(&report).is_none());
+        assert!(
+            dedup.duplicate_hits().is_empty(),
+            "{:?}",
+            dedup.duplicate_hits()
+        );
+        let key = corpus::finding::sanitizer_dedupe_key(&report);
+        let tries = MAX_UNCONFIRMED_SANITIZER_ATTEMPTS as usize;
+        assert_eq!(dedup.unreproduced_hits().get(&key), Some(&(tries + 2)));
+        assert_eq!(dedup.skipped_unreproduced_hits(), 2);
+
+        // A root cause still open after one failed confirmation is listed too.
+        let other = missing_return_at(9);
+        let key = dedup.first_sighting(&other).expect("first sighting");
+        dedup.unconfirmed(key.clone());
+        assert_eq!(dedup.unreproduced_hits().get(&key), Some(&1));
+        // ...until a later hit reproduces and is reported.
+        let key = dedup.first_sighting(&other).expect("still open");
+        dedup.consumed(key.clone());
+        assert_eq!(dedup.unreproduced_hits().get(&key), None);
+    }
+
+    /// AFL++ crash ingestion keys on the same root-cause key as the builtin
+    /// loop; its old `rule_id|frames` key made every stackless report of a rule
+    /// one crash.
+    #[test]
+    fn afl_ingestion_keeps_distinct_frameless_sites() {
+        let mut dedup = SanitizerClusterDedup::new(Vec::new());
+        assert!(afl_crash_is_new(&mut dedup, &missing_return_at(3)));
+        assert!(afl_crash_is_new(&mut dedup, &missing_return_at(9)));
+        assert!(!afl_crash_is_new(&mut dedup, &missing_return_at(9)));
+        assert_eq!(dedup.duplicate_hits().values().sum::<usize>(), 1);
+    }
+
+    /// #416: when the fork-server missed a crash that a fresh process caught,
+    /// the fresh run's raw stderr travels with its report so the finding gets a
+    /// `sanitizer.log`.
+    #[test]
+    fn a_fresh_rerun_hands_over_its_stderr_with_its_report() {
+        let mut run = HarnessRun {
+            events: Vec::new(),
+            testcases: Vec::new(),
+            sanitizer: None,
+            stderr: None,
+            rejected: false,
+        };
+        let fresh = HarnessRun {
+            events: Vec::new(),
+            testcases: Vec::new(),
+            sanitizer: Some(sanitizer_report("BHF-201", vec!["copy_at"])),
+            stderr: Some("==1==ERROR: AddressSanitizer: heap-buffer-overflow".to_owned()),
+            rejected: false,
+        };
+        adopt_fresh_rerun(&mut run, fresh);
+        assert!(run.sanitizer.is_some());
+        assert_eq!(
+            run.stderr.as_deref(),
+            Some("==1==ERROR: AddressSanitizer: heap-buffer-overflow")
+        );
     }
 
     #[test]

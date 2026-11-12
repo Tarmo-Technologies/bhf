@@ -2239,7 +2239,9 @@ fn ensure_repro_py(
         &fixture_path,
         &harness_id,
         &asan_options,
-        "print_stacktrace=1",
+        // The same UBSan report shape a fuzz child produces: its stack and the
+        // failed check's name on the SUMMARY line.
+        "print_stacktrace=1:report_error_type=1",
         &extra_env,
         &header_lines,
     );
@@ -4100,6 +4102,20 @@ mod tests {
         assert_eq!(
             super::discover_source_root(&work.join("findings")).as_deref(),
             Some("/real")
+        );
+    }
+
+    #[test]
+    fn repro_py_reports_ubsan_stacks_and_check_names_like_the_fuzz_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = json!({"id": "F-0001-aaaaaaaa", "harness_id": "H-C0001", "rule_id": "BHF-210"});
+        let record =
+            actionability::backfill_actionability(actionability::RunMode::Reporting, &raw, None);
+        super::ensure_repro_py(dir.path(), &raw, &record).unwrap();
+        let script = std::fs::read_to_string(dir.path().join("replay.py")).unwrap();
+        assert!(
+            script.contains("UBSAN_OPTIONS_DEFAULT = \"print_stacktrace=1:report_error_type=1\""),
+            "{script}"
         );
     }
 

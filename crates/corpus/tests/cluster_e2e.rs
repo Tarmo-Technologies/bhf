@@ -44,6 +44,7 @@ fn report_for(target_fn: &str) -> SanitizerReport {
             },
         ],
         message: format!("ERROR: AddressSanitizer: heap-buffer-overflow in {target_fn}"),
+        ..Default::default()
     }
 }
 

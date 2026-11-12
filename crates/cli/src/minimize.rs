@@ -136,6 +136,9 @@ fn minimize_c_engine_until(
     let run_once = |bytes: &[u8]| -> anyhow::Result<Option<&'static str>> {
         let mut cmd = Command::new(harness);
         cmd.stdout(Stdio::null()).stderr(Stdio::piped());
+        // UBSan prints and continues by default: run with the fuzz child's
+        // options so a UBSan finding reproduces as the crash it was recorded as.
+        cmd.env("UBSAN_OPTIONS", crate::fuzz::ubsan_child_options());
         let input_path = match io {
             CEngineIo::ArgvFile => {
                 let nonce = SystemTime::now()
@@ -509,6 +512,43 @@ mod silent_abort_tests {
             fs::read(finding.join("min_testcase.bin")).unwrap(),
             b"CRASH"
         );
+    }
+
+    /// UBSan prints its report and CONTINUES (exit 0) unless told to halt, the
+    /// way the fuzz child is. A minimizer child without those options saw no
+    /// crash and refused to minimize every UBSan finding.
+    #[test]
+    fn libfuzzer_minimizer_reproduces_ubsan_findings_like_the_fuzz_child() {
+        let root = tempdir().expect("tempdir");
+        let finding = root.path().join("finding");
+        fs::create_dir(&finding).expect("finding dir");
+        fs::write(
+            finding.join("finding.json"),
+            r#"{"rule_id":"BHF-210","paths":{}}"#,
+        )
+        .expect("finding");
+        fs::write(finding.join("testcase.bin"), b"prefix-UB-suffix").expect("testcase");
+        let harness = root.path().join("ubsan-like.sh");
+        fs::write(
+            &harness,
+            "#!/bin/sh\ncase \"$(cat \"$1\")\" in *UB*)\n\
+             echo \"/src/w.c:2:15: runtime error: shift exponent 40 is too large for 32-bit type 'int'\" >&2\n\
+             case \"$UBSAN_OPTIONS\" in *halt_on_error=1*) exit 1;; esac;;\nesac\nexit 0\n",
+        )
+        .expect("harness");
+        let mut permissions = fs::metadata(&harness).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&harness, permissions).expect("chmod");
+
+        let result = minimize_c_engine(
+            &finding,
+            &harness,
+            MinimizeStrategy::Bytes,
+            CEngineIo::ArgvFile,
+        )
+        .expect("a UBSan finding reproduces under the fuzz child's options");
+        assert!(result.reduced);
+        assert_eq!(fs::read(finding.join("min_testcase.bin")).unwrap(), b"UB");
     }
 
     #[test]

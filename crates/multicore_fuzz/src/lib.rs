@@ -809,6 +809,13 @@ pub fn sanitizer_options_key(s: Sanitizer) -> &'static str {
 /// `fuzz_exercised`, which is the one result bhf exists to produce.
 const REQUIRED_SANITIZER_OPTIONS: &str = "abort_on_error=1:halt_on_error=1:detect_leaks=1";
 
+/// UBSan keys bhf requires on top of [`REQUIRED_SANITIZER_OPTIONS`]: the stack
+/// of each report (`print_stacktrace=1`) and the failed check's name on its
+/// `SUMMARY:` line (`report_error_type=1`). Without them a UBSan report is one
+/// `file:line:col: runtime error:` line: no function for the sink and no check
+/// name to tell one defect from another.
+pub const UBSAN_REPORT_OPTIONS: &str = "print_stacktrace=1:report_error_type=1";
+
 /// Merge an operator-provided `<SAN>_OPTIONS` (from the inherited environment)
 /// with the keys bhf requires (#435). bhf's keys go LAST so they win on
 /// conflict — an operator cannot accidentally disable `abort_on_error`, which is
@@ -837,10 +844,13 @@ pub fn sanitizer_envs(sanitizers: &[Sanitizer]) -> Vec<Vec<(String, String)>> {
         .iter()
         .map(|s| {
             let key = sanitizer_options_key(*s);
-            let value = merge_sanitizer_options(
-                std::env::var(key).ok().as_deref(),
-                REQUIRED_SANITIZER_OPTIONS,
-            );
+            let required = match s {
+                Sanitizer::Ubsan => {
+                    format!("{REQUIRED_SANITIZER_OPTIONS}:{UBSAN_REPORT_OPTIONS}")
+                }
+                _ => REQUIRED_SANITIZER_OPTIONS.to_owned(),
+            };
+            let value = merge_sanitizer_options(std::env::var(key).ok().as_deref(), &required);
             vec![(key.to_owned(), value)]
         })
         .collect()
@@ -1443,6 +1453,24 @@ mod tests {
         for env in &envs {
             assert!(env[0].1.contains("abort_on_error=1"));
         }
+    }
+
+    #[test]
+    fn ubsan_envs_print_stack_traces_and_check_names() {
+        let envs = sanitizer_envs(&[Sanitizer::Asan, Sanitizer::Ubsan]);
+        let ubsan = &envs[1][0].1;
+        for key in [
+            "print_stacktrace=1",
+            "report_error_type=1",
+            "halt_on_error=1",
+        ] {
+            assert!(ubsan.contains(key), "UBSAN_OPTIONS lacks {key}: {ubsan}");
+        }
+        assert!(
+            !envs[0][0].1.contains("print_stacktrace"),
+            "a UBSan flag stays out of ASAN_OPTIONS: {}",
+            envs[0][0].1
+        );
     }
 
     #[test]

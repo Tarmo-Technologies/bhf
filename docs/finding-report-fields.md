@@ -75,7 +75,7 @@ records that failed to load — a bad record never aborts the rebuild).
 | `verdict` | enum \| null | `real_reachable`, `likely_reachable`, `lab_only`, `blocked`, `unknown` |
 | `location` | `{file, line, column, function}` \| null | repo-relative POSIX path, 1-based |
 | `fix_location` | same shape \| null | the single best place to start a fix |
-| `stack` | `[{function, file, line}]` | project frames only, at most 32 |
+| `stack` | `[{function, file, line}]` | project frames only, at most 32; frames under the source root, and with no root known, frames outside toolchain, harness and libc component paths. A relative frame path that names no file under the source root (glibc's `assert/assert.c`, `csu/libc-start.c`) is not a project frame |
 | `trace` | `[{file, line, function, note}]` | static data-flow trace; empty for other kinds |
 | `fingerprint` | `{primary, signature}` | `primary` is the stable cross-run identity |
 | `group` | string \| null | root-cause group key |

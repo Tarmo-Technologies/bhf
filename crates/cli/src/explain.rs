@@ -27,9 +27,17 @@ pub struct ExplainArgs {
     #[arg(long = "work-dir", default_value = "bhf_work")]
     pub work_dir: PathBuf,
 
-    /// Explain only this finding id (default: every reproducible runtime crash).
+    /// Explain only this finding id (default: every reproducible runtime crash,
+    /// one per root-cause group).
     #[arg(long = "finding-id", value_name = "ID")]
     pub finding_id: Option<String>,
+
+    /// Explain every finding of a root-cause group. By default a group (the
+    /// findings that share a `cluster_key_full`, such as one site reached
+    /// through several harnesses) is explained once, by its first finding,
+    /// which lists the others and their harnesses.
+    #[arg(long = "all-members")]
+    pub all_members: bool,
 }
 
 pub fn run(args: ExplainArgs) -> i32 {
@@ -37,14 +45,14 @@ pub fn run(args: ExplainArgs) -> i32 {
         bhfeprintln!("error: {error:#}");
         return 1;
     }
-    let findings = match collect(&args.work_dir, args.finding_id.as_deref()) {
-        Ok(f) => f,
+    let blocks = match render(&args.work_dir, args.finding_id.as_deref(), args.all_members) {
+        Ok(blocks) => blocks,
         Err(e) => {
             bhfeprintln!("error: {e}");
             return 1;
         }
     };
-    if findings.is_empty() {
+    if blocks.is_empty() {
         bhfeprintln!(
             "bhf explain: no runtime crash findings in {} to explain",
             args.work_dir.display()
@@ -52,14 +60,72 @@ pub fn run(args: ExplainArgs) -> i32 {
         return 0;
     }
     let mut first = true;
-    for f in &findings {
+    for block in &blocks {
         if !first {
             println!();
         }
         first = false;
-        print!("{}", explain_one(&args.work_dir, f));
+        print!("{block}");
     }
     0
+}
+
+/// The explanation blocks to print: `only` alone when given, else one per
+/// root-cause group (its first finding by ID), or every finding with
+/// `all_members`. Each block names the other findings of its group.
+fn render(work_dir: &Path, only: Option<&str>, all_members: bool) -> anyhow::Result<Vec<String>> {
+    let findings = collect(work_dir)?;
+    let mut groups: std::collections::BTreeMap<&str, Vec<&Finding>> = Default::default();
+    for f in &findings {
+        groups.entry(group_key(f)).or_default().push(f);
+    }
+    let collapse = only.is_none() && !all_members;
+    let mut blocks = Vec::new();
+    for f in &findings {
+        if only.is_some_and(|want| f.id != want) {
+            continue;
+        }
+        let members = &groups[group_key(f)];
+        if collapse && members.first().is_some_and(|first| first.id != f.id) {
+            continue;
+        }
+        let others: Vec<String> = members
+            .iter()
+            .filter(|member| member.id != f.id)
+            .map(|member| match str_at(&member.raw, "/harness_id") {
+                Some(harness_id) if !harness_id.is_empty() => {
+                    format!("{} ({})", member.id, harness_label(work_dir, harness_id))
+                }
+                _ => member.id.clone(),
+            })
+            .collect();
+        blocks.push(explain_one(work_dir, f, &others, collapse));
+    }
+    Ok(blocks)
+}
+
+/// The root-cause group a finding belongs to: its `cluster_key_full`, the key
+/// the results reports group on, else the finding alone.
+fn group_key(f: &Finding) -> &str {
+    str_at(&f.raw, "/cluster_key_full")
+        .filter(|key| !key.is_empty())
+        .unwrap_or(&f.id)
+}
+
+/// ``H-C0001 (`target`)``, or `H-C0001` when the harness's target is unknown.
+fn harness_label_paren(work_dir: &Path, harness_id: &str) -> String {
+    match harness_target_name(work_dir, harness_id) {
+        Some(target) => format!("{harness_id} (`{target}`)"),
+        None => harness_id.to_owned(),
+    }
+}
+
+/// `H-C0001`, or `` H-C0001, `target` `` when the harness's target is known.
+fn harness_label(work_dir: &Path, harness_id: &str) -> String {
+    match harness_target_name(work_dir, harness_id) {
+        Some(target) => format!("{harness_id}, `{target}`"),
+        None => harness_id.to_owned(),
+    }
 }
 
 /// A finding to explain.
@@ -69,7 +135,7 @@ struct Finding {
     raw: Value,
 }
 
-fn collect(work_dir: &Path, only: Option<&str>) -> anyhow::Result<Vec<Finding>> {
+fn collect(work_dir: &Path) -> anyhow::Result<Vec<Finding>> {
     let dir = corpus::layout::findings_dir(work_dir);
     let entries = std::fs::read_dir(&dir)
         .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", dir.display()))?;
@@ -90,19 +156,19 @@ fn collect(work_dir: &Path, only: Option<&str>) -> anyhow::Result<Vec<Finding>> 
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
-        if let Some(want) = only {
-            if id != want {
-                continue;
-            }
-        }
         out.push(Finding { id, dir: fdir, raw });
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(out)
 }
 
-/// Render the full fixed-grammar narrative for one finding.
-fn explain_one(work_dir: &Path, f: &Finding) -> String {
+/// Other members of a root-cause group listed by name in one block.
+const MAX_LISTED_MEMBERS: usize = 10;
+
+/// Render the full fixed-grammar narrative for one finding. `others` are the
+/// other findings of its root-cause group, as `ID (harness)`; `collapsed` says
+/// they are not explained separately.
+fn explain_one(work_dir: &Path, f: &Finding, others: &[String], collapsed: bool) -> String {
     let mut s = String::new();
     let rule = str_at(&f.raw, "/rule_id").unwrap_or("");
     let cwe = f
@@ -112,6 +178,32 @@ fn explain_one(work_dir: &Path, f: &Finding) -> String {
         .unwrap_or("");
     let cwe_name = str_at(&f.raw, "/actionability/cwe_name").unwrap_or("crash");
     let _ = writeln!(s, "━━━ {} — {cwe_name} ({cwe}, {rule}) ━━━", f.id);
+    let harness_id = str_at(&f.raw, "/harness_id").unwrap_or("").to_owned();
+    if !harness_id.is_empty() {
+        let _ = writeln!(
+            s,
+            "  Harness: {}",
+            harness_label_paren(work_dir, &harness_id)
+        );
+    }
+    if !others.is_empty() {
+        let hint = if collapsed {
+            " (pass --all-members to explain each)"
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            s,
+            "  Root cause shared with {} other finding(s){hint}:",
+            others.len()
+        );
+        for other in others.iter().take(MAX_LISTED_MEMBERS) {
+            let _ = writeln!(s, "    {other}");
+        }
+        if others.len() > MAX_LISTED_MEMBERS {
+            let _ = writeln!(s, "    ... and {} more", others.len() - MAX_LISTED_MEMBERS);
+        }
+    }
 
     // WHAT HAPPENED
     let exc = str_at(&f.raw, "/exception/name").unwrap_or("");
@@ -132,7 +224,17 @@ fn explain_one(work_dir: &Path, f: &Finding) -> String {
             Some(l) => format!("{}:{l}", basename(sink_file)),
             None => basename(sink_file).to_owned(),
         };
-        let _ = writeln!(s, "  Sink: {sink_fn}() at {where_}");
+        // A report that named only a source position has no sink function:
+        // never print an empty `()`. Name the harness target the fault was
+        // reached through (the defect may be in a callee), else the location.
+        let sink = if !sink_fn.trim().is_empty() {
+            format!("{sink_fn}() at {where_}")
+        } else if let Some(target) = harness_target_name(work_dir, &harness_id) {
+            format!("reached via `{target}` at {where_}")
+        } else {
+            where_
+        };
+        let _ = writeln!(s, "  Sink: {sink}");
     }
     if let Some(frames) = f
         .raw
@@ -147,10 +249,21 @@ fn explain_one(work_dir: &Path, f: &Finding) -> String {
     if !exc.is_empty() {
         let _ = writeln!(s, "  Sanitizer verdict: {exc}");
     }
+    // The sanitizer's own report line: the exact check and site it names.
+    if let Some(message) = str_at(&f.raw, "/exception/message")
+        .and_then(|m| m.lines().next())
+        .filter(|m| !m.trim().is_empty())
+    {
+        let _ = writeln!(s, "  Sanitizer report: {}", message.trim());
+    }
+    if let Some(access) = f.raw.pointer("/exception/access") {
+        for line in access_lines(access) {
+            let _ = writeln!(s, "{line}");
+        }
+    }
 
     // THE INPUT THAT TRIGGERS IT
     let input = f.dir.join("testcase.bin");
-    let harness_id = str_at(&f.raw, "/harness_id").unwrap_or("").to_owned();
     if let Ok(bytes) = std::fs::read(&input) {
         let _ = writeln!(s, "\nTHE INPUT THAT TRIGGERS IT  ({} byte(s))", bytes.len());
         for line in hexdump(&bytes, 6) {
@@ -239,6 +352,114 @@ fn explain_one(work_dir: &Path, f: &Finding) -> String {
         f.id
     );
     s
+}
+
+/// The sanitizer's structured memory access (`exception.access`) as text: the
+/// direction and width, the region it hit, and where that region was
+/// allocated and freed (runtime and allocator frames skipped).
+fn access_lines(access: &Value) -> Vec<String> {
+    let text = |key: &str| access.get(key).and_then(Value::as_str);
+    let mut head = match text("direction") {
+        Some(direction @ ("read" | "write")) => direction.to_owned(),
+        _ => "unknown-direction access".to_owned(),
+    };
+    if let Some(size) = access.get("size").and_then(Value::as_u64) {
+        let _ = write!(head, " of {size} byte(s)");
+    }
+    match access.get("region") {
+        Some(region) => head.push_str(&region_phrase(region)),
+        None => {
+            if let Some(address) = text("address") {
+                let _ = write!(head, " at {address}");
+            }
+            if let Some(hint) = text("address_hint") {
+                let _ = write!(head, " ({hint})");
+            }
+        }
+    }
+    let mut lines = vec![format!("  Access: {head}")];
+    let stack_object = access.pointer("/region/kind").and_then(Value::as_str) == Some("stack");
+    let alloc_verb = if stack_object {
+        "in the frame of"
+    } else {
+        "allocated at"
+    };
+    for (verb, key) in [(alloc_verb, "alloc_stack"), ("freed at", "free_stack")] {
+        let chain = project_chain(access.get(key));
+        if !chain.is_empty() {
+            lines.push(format!("    {verb} {chain}"));
+        }
+    }
+    lines
+}
+
+/// `, 0 byte(s) after a 5-byte heap region (offset 5)`.
+fn region_phrase(region: &Value) -> String {
+    let text = |key: &str| region.get(key).and_then(Value::as_str);
+    let kind = text("kind").unwrap_or("memory");
+    let sized = match region.get("size").and_then(Value::as_u64) {
+        Some(size) => format!("{size}-byte {kind}"),
+        None => kind.to_owned(),
+    };
+    let object = match text("variable") {
+        Some(variable) => format!("the {sized} variable `{variable}`"),
+        None if kind == "heap" => format!("a {sized} region"),
+        None => format!("a {sized} object"),
+    };
+    let mut phrase = match (
+        region.get("distance").and_then(Value::as_u64),
+        text("relation"),
+    ) {
+        (Some(distance), Some(relation)) => format!(", {distance} byte(s) {relation} {object}"),
+        _ => format!(", in {object}"),
+    };
+    if let Some(offset) = region.get("offset").and_then(Value::as_i64) {
+        let _ = write!(phrase, " (offset {offset})");
+    }
+    phrase
+}
+
+/// Up to three frames of an allocation or free stack, `f (file:line) <- g`,
+/// skipping allocator, libc and sanitizer-runtime frames.
+fn project_chain(stack: Option<&Value>) -> String {
+    stack
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|frame| {
+            let function = frame.get("function").and_then(Value::as_str)?.trim();
+            let file = frame.get("file").and_then(Value::as_str);
+            if function.is_empty() || actionability::is_runtime_noise_frame(function, file) {
+                return None;
+            }
+            Some(match (file, frame.get("line").and_then(Value::as_u64)) {
+                (Some(file), Some(line)) => format!("{function} ({}:{line})", basename(file)),
+                (Some(file), None) => format!("{function} ({})", basename(file)),
+                _ => function.to_owned(),
+            })
+        })
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(" <- ")
+}
+
+/// The target function a harness was generated for (`name` in its
+/// `result.json`), or `None`.
+fn harness_target_name(work_dir: &Path, harness_id: &str) -> Option<String> {
+    if harness_id.is_empty() {
+        return None;
+    }
+    crate::auto::layout::harness_dir_candidates(work_dir, harness_id)
+        .into_iter()
+        .find_map(|dir| read_json(&dir.join("result.json")))
+        .and_then(|result| {
+            result
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+        })
 }
 
 /// Distinct env/resource interactions the shim virtualized, as narrative lines.
@@ -490,6 +711,201 @@ fn read_json(path: &Path) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn frameless_finding(dir: &Path) -> Finding {
+        Finding {
+            id: "F-0001-0a0b0c0d".to_owned(),
+            dir: dir.to_path_buf(),
+            raw: serde_json::json!({
+                "id": "F-0001-0a0b0c0d",
+                "rule_id": "BHF-210",
+                "harness_id": "H-C0001",
+                "classification": "unhandled",
+                "exception": {
+                    "name": "UBSAN_UNDEFINED_BEHAVIOR",
+                    "sanitizer": "ubsan",
+                    "message": "/src/widget/classify.c:3:5: runtime error: execution reached the end of a value-returning function without returning a value",
+                    "stack": []
+                },
+                "actionability": {
+                    "sink": { "file": "/src/widget/classify.c", "line": 3, "function": "" }
+                }
+            }),
+        }
+    }
+
+    /// A report with no stack names a source position but no function: the
+    /// Sink line must not render an empty `()`. It names the harness target the
+    /// fault was reached through, else the location alone, and the sanitizer's
+    /// own report line says what happened.
+    #[test]
+    fn a_sink_without_a_function_name_never_renders_empty_parens() {
+        let work = tempfile::tempdir().unwrap();
+        let finding_dir = work.path().join("results/findings/F-0001-0a0b0c0d");
+        std::fs::create_dir_all(&finding_dir).unwrap();
+        let finding = frameless_finding(&finding_dir);
+
+        let out = explain_one(work.path(), &finding, &[], false);
+        assert!(!out.contains("()"), "{out}");
+        assert!(out.contains("  Sink: classify.c:3\n"), "{out}");
+        assert!(out.contains("  Harness: H-C0001\n"), "{out}");
+        assert!(
+            out.contains("execution reached the end of a value-returning function"),
+            "the exact report line is shown: {out}"
+        );
+
+        let harness = crate::auto::layout::harness_dir(work.path(), "H-C0001");
+        std::fs::create_dir_all(&harness).unwrap();
+        std::fs::write(
+            harness.join("result.json"),
+            br#"{"harness_id":"H-C0001","name":"classify_pair"}"#,
+        )
+        .unwrap();
+        let out = explain_one(work.path(), &finding, &[], false);
+        assert!(
+            out.contains("  Sink: reached via `classify_pair` at classify.c:3\n"),
+            "{out}"
+        );
+        assert!(!out.contains("()"), "{out}");
+    }
+
+    fn write_finding(work: &Path, id: &str, harness_id: &str, group: &str) {
+        let dir = corpus::layout::findings_dir(work).join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = serde_json::json!({
+            "id": id,
+            "rule_id": "BHF-214",
+            "harness_id": harness_id,
+            "classification": "unhandled",
+            "cluster_key_full": group,
+            "exception": {"name": "UBSAN_MISSING_RETURN", "sanitizer": "ubsan"},
+            "actionability": {
+                "sink": {"file": "/src/widget/classify.c", "line": 3, "function": "classify"}
+            }
+        });
+        std::fs::write(dir.join("finding.json"), raw.to_string()).unwrap();
+    }
+
+    /// Findings of one root cause reached through different harnesses are one
+    /// block by default, naming every member and its harness; distinct root
+    /// causes stay separate, and `--all-members` explains each finding.
+    #[test]
+    fn findings_of_one_root_cause_are_explained_once_with_their_harnesses() {
+        let work = tempfile::tempdir().unwrap();
+        write_finding(work.path(), "F-0001-aaaaaaaa", "H-C0001", "site-a");
+        write_finding(work.path(), "F-0002-bbbbbbbb", "H-C0002", "site-a");
+        write_finding(work.path(), "F-0003-cccccccc", "H-C0003", "site-b");
+        let harness = crate::auto::layout::harness_dir(work.path(), "H-C0002");
+        std::fs::create_dir_all(&harness).unwrap();
+        std::fs::write(
+            harness.join("result.json"),
+            br#"{"harness_id":"H-C0002","name":"classify_with_bias"}"#,
+        )
+        .unwrap();
+
+        let blocks = render(work.path(), None, false).unwrap();
+        assert_eq!(blocks.len(), 2, "{blocks:#?}");
+        assert!(
+            blocks[0].starts_with("━━━ F-0001-aaaaaaaa"),
+            "{}",
+            blocks[0]
+        );
+        assert!(blocks[0].contains("  Harness: H-C0001\n"), "{}", blocks[0]);
+        assert!(
+            blocks[0].contains("F-0002-bbbbbbbb (H-C0002, `classify_with_bias`)"),
+            "{}",
+            blocks[0]
+        );
+        assert!(blocks[0].contains("--all-members"), "{}", blocks[0]);
+        assert!(
+            blocks[1].starts_with("━━━ F-0003-cccccccc"),
+            "{}",
+            blocks[1]
+        );
+        assert!(!blocks[1].contains("Root cause shared"), "{}", blocks[1]);
+
+        let every = render(work.path(), None, true).unwrap();
+        assert_eq!(every.len(), 3);
+        assert!(
+            every[1].contains("  Harness: H-C0002 (`classify_with_bias`)\n"),
+            "{}",
+            every[1]
+        );
+        assert!(
+            every[1].contains("F-0001-aaaaaaaa (H-C0001)"),
+            "{}",
+            every[1]
+        );
+        assert!(!every[1].contains("--all-members"), "{}", every[1]);
+
+        // Asking for one member explains that member, with its group.
+        let one = render(work.path(), Some("F-0002-bbbbbbbb"), false).unwrap();
+        assert_eq!(one.len(), 1);
+        assert!(one[0].starts_with("━━━ F-0002-bbbbbbbb"), "{}", one[0]);
+        assert!(one[0].contains("F-0001-aaaaaaaa (H-C0001)"), "{}", one[0]);
+    }
+
+    /// The structured access a sanitizer recorded (direction, size, the region
+    /// it hit and where that region was allocated) is spelled out.
+    #[test]
+    fn a_recorded_memory_access_is_described() {
+        let work = tempfile::tempdir().unwrap();
+        let mut finding = frameless_finding(work.path());
+        finding.raw["exception"]["access"] = serde_json::json!({
+            "direction": "read",
+            "size": 4,
+            "address": "0x502000000015",
+            "region": {"kind": "heap", "size": 5, "offset": 5, "relation": "after", "distance": 0},
+            "alloc_stack": [
+                {"function": "malloc", "file": "/llvm/compiler-rt/lib/asan/asan_malloc_linux.cpp", "line": 68},
+                {"function": "bhf_c_string", "file": "/w/harnesses/H-C0001/bhf_decode.h", "line": 195},
+                {"function": "bhf_run_one", "file": "/w/harnesses/H-C0001/main.c", "line": 106}
+            ]
+        });
+        let out = explain_one(work.path(), &finding, &[], false);
+        assert!(
+            out.contains(
+                "  Access: read of 4 byte(s), 0 byte(s) after a 5-byte heap region (offset 5)\n"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "    allocated at bhf_c_string (bhf_decode.h:195) <- bhf_run_one (main.c:106)\n"
+            ),
+            "{out}"
+        );
+
+        finding.raw["exception"]["access"] = serde_json::json!({
+            "direction": "write",
+            "size": 1,
+            "region": {"kind": "stack", "size": 4, "offset": 4, "relation": "after",
+                       "distance": 0, "variable": "buf", "frame_offset": 36},
+            "alloc_stack": [{"function": "parse_record", "file": "/src/widget/rec.c", "line": 5}]
+        });
+        let out = explain_one(work.path(), &finding, &[], false);
+        assert!(
+            out.contains("  Access: write of 1 byte(s), 0 byte(s) after the 4-byte stack variable `buf` (offset 4)\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("    in the frame of parse_record (rec.c:5)\n"),
+            "{out}"
+        );
+
+        finding.raw["exception"]["access"] = serde_json::json!({
+            "direction": "unknown",
+            "address": "0x4141414141414141",
+            "address_hint": "high-value-address"
+        });
+        let out = explain_one(work.path(), &finding, &[], false);
+        assert!(
+            out.contains(
+                "  Access: unknown-direction access at 0x4141414141414141 (high-value-address)\n"
+            ),
+            "{out}"
+        );
+    }
 
     #[test]
     fn unquotes_dictionary_tokens() {

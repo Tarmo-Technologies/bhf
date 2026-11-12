@@ -410,7 +410,11 @@ and explain it — all offline and deterministic (no LLM):
   reproduces deterministically.
 - `bhf explain` — explain WHY a crash fired: the controlling input bytes, the
   gate constants it had to satisfy, the faked environment, and the dataflow to the
-  sink.
+  sink, plus the recorded memory access (direction, width, the region hit and
+  its allocation site). Each block names its harness. Findings of one root
+  cause (the same `cluster_key_full`, such as one site reached through several
+  harnesses) are explained once, by the first, which lists the others and
+  their harnesses; `--all-members` explains each one.
 - `bhf cartography` — map which input bytes control which sink operand
   (offset/size/index) by perturbation — the exploit-primitive view of a finding.
 

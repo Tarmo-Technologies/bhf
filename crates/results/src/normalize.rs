@@ -602,7 +602,10 @@ fn is_drive_path(path: &str) -> bool {
 }
 
 /// Frames from code under the source root (or, with no root, frames that are
-/// not toolchain/runtime/harness code), capped at [`MAX_STACK`].
+/// not toolchain/runtime/harness/libc code), capped at [`MAX_STACK`]. A
+/// relative frame path counts as project code only if it names a file under
+/// the root, when the root is on disk; glibc's component paths
+/// (`assert/assert.c`) never do.
 fn project_frames(exception: &Value, root: Option<&Path>) -> Vec<Frame> {
     const NOISE: [&str; 6] = [
         "compiler-rt",
@@ -624,8 +627,27 @@ fn project_frames(exception: &Value, root: Option<&Path>) -> Vec<Frame> {
             if NOISE.iter().any(|n| lower.contains(n)) {
                 return None;
             }
+            // glibc frames carry component-relative paths such as
+            // `csu/../csu/libc-start.c` or `assert/assert.c`. They are judged
+            // by the path as the symbolizer printed it (a project's
+            // `/src/malloc/x.c` made root-relative is not libc), with the `..`
+            // resolved first.
+            let original = lexically_normalized(&file.replace('\\', "/"));
+            if !original.starts_with('/') && !is_drive_path(&original) {
+                match root.filter(|root| root.is_dir()) {
+                    // A relative path names project code only if it resolves
+                    // under the source root.
+                    Some(root) if !root.join(&original).is_file() => return None,
+                    Some(_) => {}
+                    None if actionability::is_libc_source_file(Some(&original)) => return None,
+                    None => {}
+                }
+            }
+            let lexical = lexically_normalized(&rel);
             if root.is_some()
-                && (rel.starts_with('/') || rel.starts_with("..") || is_drive_path(&rel))
+                && (lexical.starts_with('/')
+                    || lexical.starts_with("..")
+                    || is_drive_path(&lexical))
             {
                 return None;
             }
@@ -640,6 +662,33 @@ fn project_frames(exception: &Value, root: Option<&Path>) -> Vec<Frame> {
         })
         .take(MAX_STACK)
         .collect()
+}
+
+/// `path` with `.` components dropped and each `dir/..` pair collapsed,
+/// without touching the filesystem. A relative path that climbs above its
+/// start keeps its leading `..` components.
+fn lexically_normalized(path: &str) -> String {
+    let absolute = path.starts_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => match parts.last() {
+                Some(last) if *last != ".." => {
+                    parts.pop();
+                }
+                _ if absolute => {}
+                _ => parts.push(".."),
+            },
+            other => parts.push(other),
+        }
+    }
+    let joined = parts.join("/");
+    if absolute {
+        format!("/{joined}")
+    } else {
+        joined
+    }
 }
 
 /// Replace hex literals of 6+ digits (heap/stack addresses) with `0x…`.
@@ -2254,6 +2303,71 @@ mod tests {
         let frames = project_frames(&exception, Some(std::path::Path::new("D:/w")));
         assert_eq!(frames.len(), 1, "{frames:?}");
         assert_eq!(frames[0].file.as_deref(), Some("src/y.c"));
+    }
+
+    /// glibc's start-up frames carry component-relative paths
+    /// (`csu/../csu/libc-start.c`) that no source root can resolve; they are
+    /// libc, not project code, with or without a known root.
+    #[test]
+    fn relative_libc_start_frames_are_not_project_frames() {
+        let exception = json!({"stack": [
+            {"function": "Widget::parse_record", "file": "/w/src/widget.cc", "line": 8},
+            {"function": "__libc_start_call_main", "file": "csu/../sysdeps/nptl/libc_start_call_main.h", "line": 58},
+            {"function": "__libc_start_main", "file": "csu/../csu/libc-start.c", "line": 360},
+            {"function": "__memcmp_avx2_movbe", "file": "./string/../sysdeps/x86_64/multiarch/memcmp-avx2-movbe.S", "line": 84}
+        ]});
+        for root in [Some(std::path::Path::new("/w")), None] {
+            let frames = project_frames(&exception, root);
+            let names: Vec<&str> = frames
+                .iter()
+                .filter_map(|f| f.function.as_deref())
+                .collect();
+            assert_eq!(names, ["Widget::parse_record"], "root {root:?}");
+        }
+    }
+
+    /// An `assert()` abort runs through glibc's `assert/assert.c`; those frames
+    /// are libc whether or not a source root is known. With a root on disk, a
+    /// relative path that names no file under it is not project code either,
+    /// while one that does stays.
+    #[test]
+    fn relative_frames_that_do_not_resolve_under_the_root_are_not_project_frames() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/widget.c"), "int f(void);\n").unwrap();
+        let project = root.join("src/widget.c");
+        let exception = json!({"stack": [
+            {"function": "__assert_fail_base", "file": "assert/assert.c", "line": 96},
+            {"function": "__assert_fail", "file": "assert/assert.c", "line": 105},
+            {"function": "check_record", "file": project.to_str().unwrap(), "line": 3},
+            {"function": "copy_at", "file": "src/widget.c", "line": 9},
+            {"function": "raise", "file": "signal/../sysdeps/posix/raise.c", "line": 26},
+            {"function": "unmapped", "file": "build/gen/table.c", "line": 4},
+            {"function": "main", "file": project.to_str().unwrap(), "line": 4}
+        ]});
+        let names = |root: Option<&Path>| -> Vec<String> {
+            project_frames(&exception, root)
+                .into_iter()
+                .filter_map(|f| f.function)
+                .collect()
+        };
+        assert_eq!(names(Some(root)), ["check_record", "copy_at", "main"]);
+        // No root to resolve against: the glibc component list decides.
+        assert_eq!(names(None), ["check_record", "copy_at", "unmapped", "main"]);
+    }
+
+    /// A project directory that shares a name with a glibc component
+    /// (`malloc/`, `string/`) is still project code once made root-relative.
+    #[test]
+    fn project_dirs_named_like_libc_components_stay_project_frames() {
+        let exception = json!({"stack": [
+            {"function": "arena_grow", "file": "/w/malloc/arena.c", "line": 12},
+            {"function": "str_split", "file": "/w/string/split.c", "line": 7}
+        ]});
+        let frames = project_frames(&exception, Some(std::path::Path::new("/w")));
+        let files: Vec<&str> = frames.iter().filter_map(|f| f.file.as_deref()).collect();
+        assert_eq!(files, ["malloc/arena.c", "string/split.c"]);
     }
 
     #[test]

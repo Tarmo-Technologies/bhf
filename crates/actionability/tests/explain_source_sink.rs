@@ -321,3 +321,55 @@ fn null_deref_explanation_classifies_as_crash() {
         hints[0].guidance
     );
 }
+
+/// A UBSan report without a stack names a file and line but no function. No
+/// surface may then render an empty name: no "``" in the explanation and no
+/// "(``)" in the fix guidance.
+#[test]
+fn frameless_ubsan_finding_never_renders_an_empty_function_name() {
+    let raw = json!({
+        "rule_id": "BHF-210",
+        "harness_id": "H-C0001",
+        "paths": { "testcase": "testcase.bin" },
+        "exception": {
+            "name": "UBSAN_UNDEFINED_BEHAVIOR",
+            "sanitizer": "ubsan",
+            "message": "/src/widget/classify.c:3:5: runtime error: execution reached the end of a value-returning function without returning a value",
+            "stack": []
+        }
+    });
+    let record = backfill_actionability(RunMode::Reporting, &raw, None);
+    let sink = record.sink.expect("the message location is the sink");
+    assert_eq!(sink.function, "");
+    let explanation = record.explanation.expect("explanation");
+    assert!(!explanation.contains("``"), "{explanation}");
+    assert!(explanation.contains("classify.c:3"), "{explanation}");
+    for hint in patch_hints_for_finding(&raw) {
+        assert!(!hint.guidance.contains("``"), "{}", hint.guidance);
+        assert!(hint.guidance.contains("classify.c:3"), "{}", hint.guidance);
+    }
+}
+
+/// An interceptor frame symbolized to the sanitizer runtime's own source is
+/// still runtime: the sink is the project frame that called `memcmp`.
+#[test]
+fn sink_skips_sanitizer_interceptor_frames_that_carry_a_source_file() {
+    let runtime = "/llvm/compiler-rt/lib/sanitizer_common/sanitizer_common_interceptors.inc";
+    let raw = json!({
+        "rule_id": "BHF-201",
+        "exception": {
+            "name": "ASAN_HEAP_BUFFER_OVERFLOW",
+            "sanitizer": "asan",
+            "stack": [
+                { "function": "__memcmp_avx2_movbe", "file": "string/../sysdeps/x86_64/multiarch/memcmp-avx2-movbe.S", "line": 84 },
+                { "function": "MemcmpInterceptorCommon(void*, int (*)(void const*, void const*, unsigned long), void const*, void const*, unsigned long)", "file": runtime, "line": 813 },
+                { "function": "bcmp", "file": runtime, "line": 860 },
+                { "function": "Widget::parse_record(unsigned char const*)", "file": "/src/widget/parser.cc", "line": 11 }
+            ]
+        }
+    });
+    let record = backfill_actionability(RunMode::Reporting, &raw, None);
+    let sink = record.sink.expect("sink");
+    assert_eq!(sink.function, "Widget::parse_record");
+    assert_eq!(sink.line, Some(11));
+}

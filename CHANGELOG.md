@@ -46,9 +46,52 @@
 - `bhf fuzz` dropped a crash matching a finding already recorded for the harness
   without a trace. The run JSON gains additive `duplicates_of_existing` (finding
   ids) and `duplicate_crashes_of_existing` fields, and stderr gets a note.
+- A harness reported at most one stackless UBSan finding per rule for its
+  whole run; distinct sites were dropped as duplicates. The builtin loop,
+  AFL++ crash ingestion and the cross-pass pre-seed now key on the site and
+  check, and a dedupe key is used up only once its finding is written, so a
+  first hit that does not reproduce no longer hides a later one.
+- Crashes inside `memcmp`/`bcmp` and other interceptors no longer share one
+  root-cause key across unrelated callers.
+- A crash the fork-server missed and the fresh re-run caught now gets its
+  `sanitizer.log`.
+- UBSan findings can be minimized: the minimizer's child now halts on the
+  first UBSan report like the fuzz child, instead of seeing a clean exit.
+- `bhf explain` and the finding explanation and fix guidance no longer print
+  an empty function name for a report with no stack. They name the reported
+  location; explain also names the harness target and prints the sanitizer's
+  report line.
+- `results/` stacks no longer list glibc frames (`csu/`, `sysdeps/`,
+  `assert/`, `signal/`): a relative frame path that names no file under the
+  source root is not a project frame, and relative paths are resolved before
+  the under-the-root test. glibc abort, signal and `assert()` frames are also
+  root-cause noise, so assertion failures in unrelated code no longer share a
+  key.
+- UBSan reports at the same line and column of same-named files in different
+  directories are no longer one finding.
+- An ASan address description with a distance, size or offset too large for
+  a signed offset leaves `exception.access.region.offset` unset instead of
+  overflowing.
 
 ### Changed
 - `bhf auto --seed-dir` reads a directory's files in name order.
+- Sanitizer finding signatures, IDs and root-cause keys changed. UBSan runs
+  with `print_stacktrace=1` and `report_error_type=1` during fuzzing,
+  minimization, `bhf replay` and in `replay.py`, so UBSan findings now carry a
+  stack. The signature hashes only the crash stack (not the allocation or free
+  stack), plus UBSan's check name and, for UBSan or stackless reports, the
+  reported site: the last two components of the reported path with its line
+  and column (`a/util.c:3:5`). Root-cause keys also hash the rule, kind and
+  check, skip libc and interceptor frames, and key UBSan reports on their
+  site. Existing findings are not rewritten; compare runs in a fresh work dir.
+  See docs/site/sanitizers.md.
+- `bhf explain` explains each root-cause group (findings sharing a
+  `cluster_key_full`, such as one site reached through several harnesses)
+  once, by its first finding, and lists the group's other findings with their
+  harnesses. Every block names its harness and, when the sanitizer recorded
+  one, the memory access: direction, width, the region it hit and where that
+  region was allocated or freed. `--all-members` explains every finding as
+  before.
 - Ada static rules run on a statement and scope model instead of line
   matching. BHF-409 now reports only Unchecked_Conversion to an access type
   (and Address_To_Access_Conversions), BHF-410 a double free through an alias,
@@ -68,6 +111,13 @@
   before resolving seeds removes a list left by an earlier run in the work dir.
 - `bhf auto --no-seed-mining` and the config key `seed-mining = false` turn off
   seeding from the tree's own test data.
+- `finding.json` `exception` carries the sanitizer's structured evidence:
+  `location`, UBSan `check`, and ASan `access` (direction, size, address and
+  hint, region kind/size/offset, allocation and free stacks). The fuzz run
+  summary (`fuzz_runs/<harness>-latest.json`) `duplicate_sanitizer_hits`
+  counts later crashes folded into an already-reported root cause, and
+  `unreproduced_sanitizer_hits` the crashes of a root cause that never
+  reproduced in a fresh process. All are additive.
 - Ada rules BHF-564 (index/range checks suppressed), BHF-565 (overflow check
   suppressed), BHF-566 (local `'Unchecked_Access` escapes), BHF-567 (address
   overlay), BHF-568 (unsafe C function imported), BHF-569 (secret logged),

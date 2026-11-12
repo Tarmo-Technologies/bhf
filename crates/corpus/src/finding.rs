@@ -106,15 +106,17 @@ pub fn extension_signature(signature_inputs: &[String]) -> String {
 pub enum RunDedupeKey {
     /// `rule_id|oracle.name|oracle.api`: one finding per defect, not per input.
     Oracle(String),
-    /// `cluster_key_full`, or `rule:<rule_id>` for a fallback cluster.
+    /// `cluster_key_full`: the root-cause key, or the finding signature when
+    /// the crash had neither an informative frame nor a reported site
+    /// ([`sanitizer_dedupe_key`]).
     Cluster(String),
 }
 
 /// The fuzz run's dedupe key for a written `finding.json`, rebuilt from the
 /// record: what the run computed when it emitted the finding. Oracle keys are
 /// kept verbatim, empty parts included, as the run builds them; an empty
-/// cluster key or rule id yields nothing, since no run computes one and a
-/// shared empty key would make unrelated records one crash.
+/// cluster key yields nothing, since no run computes one and a shared empty
+/// key would make unrelated records one crash.
 pub fn run_dedupe_key(record: &serde_json::Value) -> Option<RunDedupeKey> {
     let rule_id = record.get("rule_id").and_then(serde_json::Value::as_str);
     if let (Some(rule_id), Some(oracle)) = (rule_id, record.get("oracle")) {
@@ -125,20 +127,56 @@ pub fn run_dedupe_key(record: &serde_json::Value) -> Option<RunDedupeKey> {
             return Some(RunDedupeKey::Oracle(format!("{rule_id}|{name}|{api}")));
         }
     }
-    let fallback = record
-        .get("cluster_fallback")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    if fallback {
-        rule_id
-            .filter(|rule_id| !rule_id.is_empty())
-            .map(|rule_id| RunDedupeKey::Cluster(format!("rule:{rule_id}")))
+    // A fallback record's `cluster_key_full` is its signature, which is what
+    // the run keys such a crash on (`sanitizer_dedupe_key`). Older runs keyed
+    // every fallback crash of a rule as one `rule:<id>`, which hid later,
+    // different crashes of that rule for the rest of the run.
+    record
+        .get("cluster_key_full")
+        .and_then(serde_json::Value::as_str)
+        .filter(|full| !full.is_empty())
+        .map(|full| RunDedupeKey::Cluster(full.to_owned()))
+}
+
+/// The signature of a sanitizer crash: sha256 over the rule, the crash kind,
+/// the sanitizer's check name, the reported site (for a UBSan report, or any
+/// report without a crash stack) and the crash-stack function names. The
+/// allocation and free stacks describe the object, not the crash, and are not
+/// hashed. Its first 8 hex digits are the finding ID suffix.
+pub fn sanitizer_signature(report: &crate::sanitizer::SanitizerReport) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(report.rule_id.as_bytes());
+    hasher.update(b"|");
+    hasher.update(report.kind.as_bytes());
+    if let Some(check) = &report.check {
+        hasher.update(b"|check=");
+        hasher.update(check.as_bytes());
+    }
+    let ubsan = report.sanitizer == Some(crate::sanitizer::Sanitizer::UndefinedBehaviorSanitizer);
+    if let Some(site) = report.site().filter(|_| ubsan || report.stack.is_empty()) {
+        hasher.update(b"|site=");
+        hasher.update(site.as_bytes());
+    }
+    for frame in &report.stack {
+        hasher.update(b"|");
+        hasher.update(frame.function.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// The key a fuzz run dedupes a sanitizer crash on: its root-cause cluster key,
+/// or its signature when the crash has neither an informative frame nor a
+/// reported site. The same key is written as the finding's
+/// `cluster_key_full`, so [`run_dedupe_key`] rebuilds it from disk. Every site
+/// that dedupes sanitizer crashes (the builtin loop, AFL++ crash ingestion,
+/// the pre-seed from earlier passes) uses this one function.
+pub fn sanitizer_dedupe_key(report: &crate::sanitizer::SanitizerReport) -> String {
+    let cluster = crate::cluster::cluster_for_sanitizer(report);
+    if cluster.fallback {
+        sanitizer_signature(report)
     } else {
-        record
-            .get("cluster_key_full")
-            .and_then(serde_json::Value::as_str)
-            .filter(|full| !full.is_empty())
-            .map(|full| RunDedupeKey::Cluster(full.to_owned()))
+        cluster.full
     }
 }
 
@@ -272,16 +310,7 @@ impl FindingEmitter {
         report: &crate::sanitizer::SanitizerReport,
         log: Option<&[u8]>,
     ) -> Result<FindingId, CorpusError> {
-        use sha2::Digest;
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(report.rule_id.as_bytes());
-        hasher.update(b"|");
-        hasher.update(report.kind.as_bytes());
-        for frame in &report.stack {
-            hasher.update(b"|");
-            hasher.update(frame.function.as_bytes());
-        }
-        let signature_hex = format!("{:x}", hasher.finalize());
+        let signature_hex = sanitizer_signature(report);
         let cluster = crate::cluster::cluster_for_sanitizer(report);
         let (cluster_short, cluster_full, cluster_fallback) = if cluster.fallback {
             (
@@ -345,6 +374,18 @@ impl FindingEmitter {
         // additive change — no schema-version bump).
         if let Some(sanitizer) = report.sanitizer {
             record["exception"]["sanitizer"] = json!(sanitizer.as_str());
+        }
+        // Additive structured evidence: the reported site, the sanitizer's own
+        // check name, and the memory access (direction, size, region, and the
+        // allocation / free stacks kept apart from the crash stack).
+        if let Some(location) = &report.location {
+            record["exception"]["location"] = json!(location);
+        }
+        if let Some(check) = &report.check {
+            record["exception"]["check"] = json!(check);
+        }
+        if let Some(access) = &report.access {
+            record["exception"]["access"] = json!(access);
         }
         if log_written.is_some() {
             record["paths"]["sanitizer_log"] = json!("sanitizer.log");
@@ -1232,6 +1273,7 @@ mod tests {
                 },
             ],
             message: "ERROR: ASan: heap-buffer-overflow".to_owned(),
+            ..Default::default()
         };
         let id = emitter.emit_sanitizer_crash(b"in", &report).unwrap();
         let v: serde_json::Value = serde_json::from_str(
@@ -1268,6 +1310,7 @@ mod tests {
             stack: Vec::new(),
             message: "target transport reported a target CPU exception with no sanitizer report"
                 .to_owned(),
+            ..Default::default()
         };
         let id = emitter.emit_sanitizer_crash(b"in", &report).unwrap();
         let v: serde_json::Value = serde_json::from_str(
@@ -1297,6 +1340,7 @@ mod tests {
             rule_id: "BHF-201",
             stack: Vec::new(),
             message: "heap-buffer-overflow".to_owned(),
+            ..Default::default()
         };
         let id = emitter.emit_sanitizer_crash(b"in", &report).unwrap();
         let dir = crate::layout::finding_dir(&root, &id.0);
@@ -1327,6 +1371,7 @@ mod tests {
                 line: Some(27),
             }],
             message: "ERROR: ASan: heap-buffer-overflow".to_owned(),
+            ..Default::default()
         };
 
         let id = emitter.emit_sanitizer_crash(b"in", &report).unwrap();
@@ -1649,6 +1694,7 @@ mod tests {
                 line: None,
             }],
             message: "ERROR: ASan: heap-buffer-overflow".to_owned(),
+            ..Default::default()
         };
         let id = emitter.emit_sanitizer_crash(b"x", &report).unwrap();
         let v: serde_json::Value = serde_json::from_str(
@@ -1675,6 +1721,7 @@ mod tests {
             rule_id: "BHF-201",
             stack: Vec::new(),
             message: "heap-buffer-overflow".to_owned(),
+            ..Default::default()
         };
         let id = emitter.emit_sanitizer_crash(b"in", &report).unwrap();
         let raw: serde_json::Value = serde_json::from_slice(
@@ -1725,11 +1772,13 @@ mod tests {
                 "BHF-405|path-traversal|open".to_owned()
             ))
         );
+        // A fallback record keys on its own `cluster_key_full` (its signature),
+        // not on one shared `rule:<id>` per rule.
         let fallback =
             json!({"rule_id": "BHF-210", "cluster_fallback": true, "cluster_key_full": "x"});
         assert_eq!(
             run_dedupe_key(&fallback),
-            Some(RunDedupeKey::Cluster("rule:BHF-210".to_owned()))
+            Some(RunDedupeKey::Cluster("x".to_owned()))
         );
         let clustered = json!({"rule_id": "BHF-201", "cluster_fallback": false, "cluster_key_full": "deadbeef"});
         assert_eq!(
@@ -1789,6 +1838,7 @@ mod tests {
             rule_id: "BHF-201",
             stack: Vec::new(),
             message: "heap-buffer-overflow".to_owned(),
+            ..Default::default()
         };
         let id = emitter
             .emit_sanitizer_crash_with_log(b"in", &report, Some(b"full log"))
@@ -1812,6 +1862,7 @@ mod tests {
             rule_id: "BHF-201",
             stack: Vec::new(),
             message: "m".to_owned(),
+            ..Default::default()
         };
         let id = emitter.emit_sanitizer_crash(b"in", &report).unwrap();
         let raw: serde_json::Value = serde_json::from_slice(
@@ -1877,5 +1928,200 @@ mod tests {
         );
         assert!(dedupe_keys(&json!({"id": "F-0000-x", "signature": ""})).is_empty());
         assert!(dedupe_keys(&json!("not an object")).is_empty());
+    }
+
+    fn emit_parsed(root: &std::path::Path, stderr: &str) -> serde_json::Value {
+        let report = crate::sanitizer::parse_sanitizer_report(stderr).expect("a report");
+        let emitter = super::FindingEmitter::with_metadata(
+            root.to_path_buf(),
+            "H-C0001".to_owned(),
+            "c".to_owned(),
+            String::new(),
+        );
+        let id = emitter
+            .emit_sanitizer_crash_with_log(b"in", &report, Some(stderr.as_bytes()))
+            .unwrap();
+        serde_json::from_slice(
+            &fs::read(crate::layout::finding_dir(root, &id.0).join("finding.json")).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn frameless_missing_return(file: &str, line: u32) -> String {
+        format!(
+            "{file}:{line}:5: runtime error: execution reached the end of a value-returning function without returning a value\n\
+             SUMMARY: UndefinedBehaviorSanitizer: missing-return {file}:{line}:5 \n"
+        )
+    }
+
+    /// A UBSan report printed without a stack used to hash only `rule|kind`, so
+    /// every such finding in every project shared one ID suffix, one root-cause
+    /// group and one per-run dedupe key.
+    #[test]
+    fn frameless_ubsan_findings_at_distinct_sites_get_distinct_ids_and_keys() {
+        let root = temp_dir("frameless-sites");
+        let a = emit_parsed(&root, &frameless_missing_return("/src/widget/a.c", 3));
+        let b = emit_parsed(&root, &frameless_missing_return("/src/widget/a.c", 9));
+        let c = emit_parsed(&root, &frameless_missing_return("/src/widget/b.c", 3));
+        let suffix = |v: &serde_json::Value| v["id"].as_str().unwrap()[7..].to_owned();
+        for (x, y) in [(&a, &b), (&a, &c), (&b, &c)] {
+            assert_ne!(x["signature"], y["signature"]);
+            assert_ne!(
+                suffix(x),
+                suffix(y),
+                "distinct UB sites get distinct ID suffixes"
+            );
+            assert_ne!(x["cluster_key_full"], y["cluster_key_full"]);
+            assert_ne!(super::run_dedupe_key(x), super::run_dedupe_key(y));
+        }
+        assert_eq!(
+            a["cluster_fallback"], false,
+            "a reported site is an identity"
+        );
+        assert!(!format!("{:?}", super::run_dedupe_key(&a)).contains("rule:"));
+    }
+
+    /// Two files that share a name in different directories are different
+    /// sites, while the same file stays one site wherever the tree is checked
+    /// out and whether the compiler got a relative or an absolute path.
+    #[test]
+    fn same_named_files_in_different_directories_are_different_sites() {
+        let root = temp_dir("same-basename-sites");
+        let a = emit_parsed(&root, &frameless_missing_return("/src/a/util.c", 3));
+        let b = emit_parsed(&root, &frameless_missing_return("/src/b/util.c", 3));
+        assert_ne!(a["signature"], b["signature"]);
+        assert_ne!(a["cluster_key_full"], b["cluster_key_full"]);
+        assert_ne!(super::run_dedupe_key(&a), super::run_dedupe_key(&b));
+
+        for elsewhere in [
+            "/home/dev/checkout/src/a/util.c",
+            "src/a/util.c",
+            "./a/util.c",
+        ] {
+            let moved = emit_parsed(&root, &frameless_missing_return(elsewhere, 3));
+            assert_eq!(moved["signature"], a["signature"], "{elsewhere}");
+            assert_eq!(
+                moved["cluster_key_full"], a["cluster_key_full"],
+                "{elsewhere}"
+            );
+        }
+
+        // A bare file name (the compiler ran in the file's directory) takes the
+        // directory from the crash frame that names the same file.
+        let with_frame = |reported: &str, frame_file: &str| {
+            let stderr = format!(
+                "{reported}:3:5: runtime error: shift exponent 40 is too large for 32-bit type 'int'\n    \
+                 #0 0x1 in copy_at {frame_file}:3:5\n\n\
+                 SUMMARY: UndefinedBehaviorSanitizer: invalid-shift-exponent {reported}:3:5 \n"
+            );
+            let report = crate::sanitizer::parse_sanitizer_report(&stderr).unwrap();
+            (
+                super::sanitizer_signature(&report),
+                super::sanitizer_dedupe_key(&report),
+            )
+        };
+        let bare_a = with_frame("util.c", "/w/src/a/util.c");
+        let bare_b = with_frame("util.c", "/w/src/b/util.c");
+        assert_ne!(bare_a.0, bare_b.0);
+        assert_ne!(bare_a.1, bare_b.1);
+        assert_eq!(bare_a, with_frame("/w/src/a/util.c", "/w/src/a/util.c"));
+    }
+
+    /// The per-run dedupe key rebuilt from a written finding is exactly the key
+    /// the fuzz loop computes for the report, so a later pass that re-seeds its
+    /// dedup set from disk recognizes the same crash and only that crash.
+    #[test]
+    fn run_dedupe_key_of_the_record_matches_the_reports_runtime_key() {
+        let root = temp_dir("dedupe-roundtrip");
+        for stderr in [
+            frameless_missing_return("/src/widget/a.c", 3),
+            "==1==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1\n\
+             READ of size 1 at 0x1 thread T0\n    #0 0x1 in copy_at /src/widget/copy.c:9:41\n"
+                .to_owned(),
+            "==1==ERROR: AddressSanitizer: SEGV on unknown address (pc 0x1 bp 0x2 sp 0x3 T0)\n"
+                .to_owned(),
+        ] {
+            let report = crate::sanitizer::parse_sanitizer_report(&stderr).unwrap();
+            let record = emit_parsed(&root, &stderr);
+            assert_eq!(
+                super::run_dedupe_key(&record),
+                Some(super::RunDedupeKey::Cluster(super::sanitizer_dedupe_key(
+                    &report
+                ))),
+                "{stderr}"
+            );
+        }
+    }
+
+    /// Only the crash stack identifies a crash: the allocation and free stacks
+    /// are evidence about the object, recorded separately and not hashed.
+    #[test]
+    fn allocation_and_free_frames_do_not_change_the_signature() {
+        let root = temp_dir("alloc-not-hashed");
+        let uaf = |freer: &str| {
+            format!(
+                "==1==ERROR: AddressSanitizer: heap-use-after-free on address 0x504000000054\n\
+                 READ of size 4 at 0x504000000054 thread T0\n    \
+                 #0 0x1 in Widget::parse_record() /src/widget/parser.cc:11:50\n\n\
+                 0x504000000054 is located 4 bytes inside of 40-byte region [0x504000000050,0x504000000078)\n\
+                 freed by thread T0 here:\n    #0 0x2 in free (/bin/h+0x2)\n    \
+                 #1 0x3 in {freer} /src/widget/parser.cc:30:3\n\n\
+                 previously allocated by thread T0 here:\n    #0 0x4 in malloc (/bin/h+0x4)\n    \
+                 #1 0x5 in Widget::Widget() /src/widget/parser.cc:22:14\n"
+            )
+        };
+        let a = emit_parsed(&root, &uaf("Widget::reset()"));
+        let b = emit_parsed(&root, &uaf("Widget::clear()"));
+        assert_eq!(a["signature"], b["signature"]);
+        let names = |v: &serde_json::Value, path: &str| -> Vec<String> {
+            v.pointer(path)
+                .and_then(serde_json::Value::as_array)
+                .unwrap()
+                .iter()
+                .map(|f| f["function"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        assert_eq!(
+            names(&a, "/exception/stack"),
+            vec!["Widget::parse_record()"]
+        );
+        assert_eq!(
+            names(&a, "/exception/access/free_stack"),
+            vec!["free", "Widget::reset()"]
+        );
+        assert_eq!(
+            names(&a, "/exception/access/alloc_stack"),
+            vec!["malloc", "Widget::Widget()"]
+        );
+    }
+
+    #[test]
+    fn finding_record_carries_structured_access_location_and_check() {
+        let root = temp_dir("structured-access");
+        let heap = emit_parsed(
+            &root,
+            "==9==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x502000000015 at pc 0x5 bp 0x6 sp 0x7\n\
+             READ of size 4 at 0x502000000015 thread T0\n    \
+             #0 0x1 in copy_at /src/widget/copy.c:9:41\n\n\
+             0x502000000015 is located 0 bytes after 1-byte region [0x502000000014,0x502000000015)\n\
+             allocated by thread T0 here:\n    #0 0x2 in malloc (/bin/h+0x2)\n    \
+             #1 0x3 in bhf_c_string /work/harnesses/H-1/bhf_decode.h:195:23\n\n\
+             SUMMARY: AddressSanitizer: heap-buffer-overflow /src/widget/copy.c:9:41 in copy_at\n",
+        );
+        let access = &heap["exception"]["access"];
+        assert_eq!(access["direction"], "read");
+        assert_eq!(access["size"], 4);
+        assert_eq!(access["region"]["kind"], "heap");
+        assert_eq!(access["region"]["size"], 1);
+        assert_eq!(access["region"]["offset"], 1);
+        assert_eq!(access["region"]["relation"], "after");
+        assert_eq!(access["alloc_stack"][1]["function"], "bhf_c_string");
+        assert_eq!(heap["exception"]["location"]["line"], 9);
+
+        let ub = emit_parsed(&root, &frameless_missing_return("/src/widget/a.c", 3));
+        assert_eq!(ub["exception"]["check"], "missing-return");
+        assert_eq!(ub["exception"]["location"]["file"], "/src/widget/a.c");
+        assert_eq!(ub["exception"]["location"]["column"], 5);
+        assert!(ub["exception"].get("access").is_none());
     }
 }

@@ -295,6 +295,7 @@ fn replay_c_afl(finding_dir: &Path, runner: &HarnessRunner) -> i32 {
             return 1;
         }
     };
+    stdin_replay.env("UBSAN_OPTIONS", replay_ubsan_options());
     stdin_replay
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -432,6 +433,7 @@ fn replay_c_libfuzzer(finding_dir: &Path, runner: &HarnessRunner) -> i32 {
         }
     }
     cmd.env("BHF_RUNTRACE_MODE", pass);
+    cmd.env("UBSAN_OPTIONS", replay_ubsan_options());
     for (k, v) in &env_injected {
         cmd.env(k, v);
     }
@@ -486,6 +488,14 @@ fn replay_c_libfuzzer(finding_dir: &Path, runner: &HarnessRunner) -> i32 {
             3
         }
     }
+}
+
+/// `UBSAN_OPTIONS` for a C/C++ replay: the fuzz child's, so the replayed
+/// report (its first UBSan report, with stack and check name) is parsed like
+/// the one the finding was recorded from. A value the finding recorded in
+/// `runtime_mode.env_injected` still wins.
+fn replay_ubsan_options() -> String {
+    crate::fuzz::ubsan_child_options()
 }
 
 /// Spawn a freshly-written harness, retrying the two transient failures that make
@@ -589,6 +599,13 @@ mod tests {
     fn harness_roots_start_at_the_work_dir_for_results_layout() {
         let roots = super::harness_work_roots(std::path::Path::new("/w/results/findings/F-1"));
         assert_eq!(roots[0], std::path::PathBuf::from("/w"));
+    }
+
+    #[test]
+    fn replay_reports_ubsan_stacks_and_check_names_like_the_fuzz_child() {
+        let options = super::replay_ubsan_options();
+        assert!(options.contains("print_stacktrace=1"), "{options}");
+        assert!(options.contains("report_error_type=1"), "{options}");
     }
 
     #[test]

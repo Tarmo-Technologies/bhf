@@ -580,12 +580,32 @@ fn sanitizer_patch_hint(raw: &Value) -> Option<PatchHint> {
 
 /// A compact, human-readable reference to the sink location for hint / next-step
 /// prose: `` `file:line` (`function`) `` when a source line resolved, else the
-/// bare `` `function` ``.
+/// bare `` `function` ``. A sink with no function name (a report that named
+/// only a source position) is referenced by its location alone, never as an
+/// empty `` (``) ``.
 fn sink_location_phrase(sink: &Sink) -> String {
+    let function = sink.function.trim();
+    match (&sink.file, sink.line, function.is_empty()) {
+        (Some(file), Some(line), false) => format!("`{file}:{line}` (`{function}`)"),
+        (Some(file), Some(line), true) => format!("`{file}:{line}`"),
+        (Some(file), None, false) => format!("`{file}` (`{function}`)"),
+        (Some(file), None, true) => format!("`{file}`"),
+        (None, _, false) => format!("`{function}`"),
+        (None, _, true) => "the faulting location".to_owned(),
+    }
+}
+
+/// How the explanation names where the fault surfaced: the sink function, or
+/// for a sink with no function name its source position.
+fn sink_reference(sink: &Sink) -> String {
+    let function = sink.function.trim();
+    if !function.is_empty() {
+        return format!("`{function}`");
+    }
     match (&sink.file, sink.line) {
-        (Some(file), Some(line)) => format!("`{file}:{line}` (`{}`)", sink.function),
-        (Some(file), None) => format!("`{file}` (`{}`)", sink.function),
-        (None, _) => format!("`{}`", sink.function),
+        (Some(file), Some(line)) => format!("the code at `{file}:{line}`"),
+        (Some(file), None) => format!("the code in `{file}`"),
+        (None, _) => "the affected code".to_owned(),
     }
 }
 
@@ -1139,35 +1159,101 @@ fn is_libc_runtime_function(head: &str) -> bool {
     if f.starts_with("_io_") || f.starts_with("__gi_") || f.starts_with("__libc_") {
         return true;
     }
+    if is_libc_string_routine(&f) {
+        return true;
+    }
+    // glibc's per-CPU variants of the string routines (`__memcmp_avx2_movbe`,
+    // `__memmove_avx_unaligned_erms`, `__strlen_evex`): `__<routine>_<isa>`.
+    if let Some(rest) = f.strip_prefix("__") {
+        if let Some((routine, _variant)) = rest.split_once('_') {
+            return is_libc_string_routine(routine);
+        }
+    }
     matches!(
         f.as_str(),
-        "fread"
-            | "fwrite"
-            | "fgets"
-            | "fputs"
-            | "fputc"
-            | "fgetc"
-            | "getc"
-            | "putc"
-            | "memcpy"
+        "fread" | "fwrite" | "fgets" | "fputs" | "fputc" | "fgetc" | "getc" | "putc"
+    )
+}
+
+/// The `mem*`/`str*`/`wcs*` routines a sanitizer flags an overrun inside; the
+/// caller above them is where the bad length or pointer came from.
+fn is_libc_string_routine(lower: &str) -> bool {
+    matches!(
+        lower,
+        "memcpy"
             | "memmove"
             | "memset"
             | "memcmp"
+            | "bcmp"
             | "memchr"
+            | "memrchr"
+            | "rawmemchr"
+            | "memmem"
+            | "mempcpy"
             | "strlen"
             | "strnlen"
             | "strcmp"
             | "strncmp"
+            | "strcasecmp"
+            | "strncasecmp"
             | "strcpy"
+            | "stpcpy"
             | "strncpy"
+            | "stpncpy"
             | "strcat"
             | "strncat"
             | "strchr"
+            | "strchrnul"
             | "strrchr"
             | "strstr"
+            | "strspn"
+            | "strcspn"
+            | "strpbrk"
+            | "strtok"
             | "strdup"
             | "strndup"
+            | "wmemcmp"
+            | "wmemcpy"
+            | "wmemset"
+            | "wcslen"
+            | "wcscmp"
+            | "wcsncmp"
+            | "wcscpy"
     )
+}
+
+/// A sanitizer-runtime interceptor frame (`__interceptor_memcpy`,
+/// `___interceptor_strlen`, `MemcmpInterceptorCommon(...)`): the runtime's
+/// wrapper around a libc call, never the project's code.
+fn is_sanitizer_interceptor(head: &str) -> bool {
+    let f = head.to_ascii_lowercase();
+    f.starts_with("__interceptor_")
+        || f.starts_with("___interceptor_")
+        || f.starts_with("__sanitizer")
+        || f.ends_with("interceptorcommon")
+}
+
+/// A frame whose source is the sanitizer runtime (`compiler-rt`,
+/// `sanitizer_common`).
+fn is_sanitizer_runtime_file(file: Option<&str>) -> bool {
+    file.is_some_and(|file| {
+        let lower = file.to_ascii_lowercase();
+        lower.contains("compiler-rt/") || lower.contains("sanitizer_common")
+    })
+}
+
+/// A libc, sanitizer-runtime or interceptor frame: never the project's root
+/// cause, whichever of them the faulting PC landed in. Matches by symbol
+/// (`memcmp`, `bcmp`, `__memcmp_avx2_movbe`, `MemcmpInterceptorCommon`) and by
+/// source path (glibc's `sysdeps/`, `string/`, `csu/` component paths, the
+/// sanitizer runtime's `compiler-rt` sources). Shared by the sink search here
+/// and by crash clustering, so both start at the same first project frame.
+pub fn is_runtime_noise_frame(function: &str, file: Option<&str>) -> bool {
+    let head = function_head(function);
+    is_libc_runtime_function(&head)
+        || is_sanitizer_interceptor(&head)
+        || is_libc_source_file(file)
+        || is_sanitizer_runtime_file(file)
 }
 
 /// A glibc-internal *source file* (not a target source). glibc builds with
@@ -1176,7 +1262,7 @@ fn is_libc_runtime_function(head: &str) -> bool {
 /// leading `../`/`./`) is libc, never the project sink. Anchored at the path
 /// start so a real target path like `/home/u/proj/string/parse.c` does NOT
 /// match.
-fn is_libc_source_file(file: Option<&str>) -> bool {
+pub fn is_libc_source_file(file: Option<&str>) -> bool {
     let Some(file) = file else {
         return false;
     };
@@ -1196,6 +1282,17 @@ fn is_libc_source_file(file: Option<&str>) -> bool {
         "stdlib/",
         "wcsmbs/",
         "time/",
+        // Process start-up: `csu/libc-start.c`, `nptl/libc_start_call_main.h`.
+        "csu/",
+        "nptl/",
+        // `assert()` failures, signal delivery and the dynamic loader.
+        "assert/",
+        "signal/",
+        "posix/",
+        "elf/",
+        "misc/",
+        "io/",
+        "dlfcn/",
     ];
     DIRS.iter().any(|dir| rest.starts_with(dir))
 }
@@ -1638,7 +1735,7 @@ fn sink_from(raw: &Value) -> Option<Sink> {
         }
         let file = string_at(frame, &["file"]).filter(|file| !file.starts_with('('));
         if is_harness_frame(&function, file.as_deref())
-            || is_libc_source_file(file.as_deref())
+            || is_runtime_noise_frame(&function, file.as_deref())
             || is_rust_stdlib_frame(&function, file.as_deref())
         {
             continue;
@@ -2171,7 +2268,7 @@ fn cwe_name(id: &str) -> &'static str {
 fn explanation_for(raw: &Value, sink: Option<&Sink>, source: &Option<Source>) -> Option<String> {
     let class = classify_bug(raw);
     let fn_ref = sink
-        .map(|sink| format!("`{}`", sink.function))
+        .map(sink_reference)
         .unwrap_or_else(|| "the affected code".to_owned());
     let testcase = source
         .as_ref()

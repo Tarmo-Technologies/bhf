@@ -304,49 +304,12 @@ fn parse_crash(stderr: &str) -> Option<CrashFacts> {
 
 /// Extract the signed relative offset of the faulting access from the object it
 /// overflowed. Handles heap (`N bytes after/before an M-byte region`), stack (`at
-/// offset N in frame`), and global (`N bytes to the right/left of global`).
+/// offset N in frame`), and global (`N bytes to the right/left of global`). The
+/// address-description parser is shared with finding emission
+/// ([`corpus::sanitizer::relative_offset`]), which records the same facts as
+/// `exception.access.region`.
 fn parse_rel_offset(stderr: &str) -> Option<i64> {
-    // Heap: "is located 21 bytes after 16-byte region" / "... before ...".
-    for (needle, sign) in [
-        (" bytes after ", 1i64),
-        (" bytes before ", -1),
-        (" bytes to the right of ", 1),
-        (" bytes to the left of ", -1),
-        (" bytes inside of ", 1),
-    ] {
-        if let Some(p) = stderr.find(needle) {
-            // The number precedes the needle: "...located <N> bytes after...".
-            if let Some(n) = trailing_number_before(&stderr[..p]) {
-                return Some(sign * n);
-            }
-        }
-    }
-    // Stack: "at offset 96 in frame".
-    if let Some(p) = stderr.find("at offset ") {
-        let rest = &stderr[p + "at offset ".len()..];
-        if let Some(n) = rest
-            .split(|c: char| !c.is_ascii_digit())
-            .find(|s| !s.is_empty())
-            .and_then(|s| s.parse::<i64>().ok())
-        {
-            return Some(n);
-        }
-    }
-    None
-}
-
-/// The integer that ends the string `s` (skipping trailing whitespace).
-fn trailing_number_before(s: &str) -> Option<i64> {
-    let t = s.trim_end();
-    let digits: String = t
-        .chars()
-        .rev()
-        .take_while(|c| c.is_ascii_digit())
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect();
-    digits.parse::<i64>().ok()
+    corpus::sanitizer::relative_offset(stderr)
 }
 
 /// Classify the exploit primitive from the baseline access + the per-byte control map.
