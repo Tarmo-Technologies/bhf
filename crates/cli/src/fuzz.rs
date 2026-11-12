@@ -9699,6 +9699,7 @@ mod auto_path_tests {
     /// A libFuzzer-style harness that reports a sanitizer crash only when its
     /// input is byte-identical to `expected`, so a finding proves the engine ran
     /// that exact input.
+    #[cfg(unix)]
     fn write_exact_match_harness(work_dir: &Path, id: &str, expected: &Path) {
         let script = format!(
             "#!/bin/sh\n\
