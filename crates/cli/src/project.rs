@@ -496,7 +496,8 @@ fn run_build_command(cmd: &[String], cwd: &Path) -> Result<()> {
 /// Copy the resolved harness binary to the exact path `find_harness_executable`
 /// probes first (`<work>/build/<id>/main[_afl]`) and write the merged dictionary
 /// where `find_generated_dictionary` looks (`<work>/build/<id>/dictionary.txt`),
-/// so the engine auto-loads both with the operator copying nothing.
+/// so the engine auto-loads both with the operator copying nothing. A builtin
+/// target also gets `harness-protocol.json` declaring its framed input mode.
 fn materialize_native(
     launch: &NativeLaunch,
     target_id: &str,
@@ -521,6 +522,18 @@ fn materialize_native(
         )
     })?;
     make_executable(&dest)?;
+    // A native target's harness speaks BHF's framed protocol (the only input
+    // mode lowering accepts for it). Record that next to the staged binary so
+    // the fuzz lane, replay and minimize use it instead of re-detecting the
+    // protocol from a binary that has no bhf source beside it.
+    if launch.engine == PpNativeEngine::Builtin {
+        crate::protocol_detect::write_declared_input_mode(
+            &build_dir,
+            "framed",
+            "bhf.project.v1 manifest",
+        )
+        .context("record the target's input mode")?;
+    }
 
     if !merged_dictionary.tokens.is_empty() {
         std::fs::write(
@@ -814,6 +827,37 @@ mod tests {
             oracle_command: None,
             reset_command: None,
         }
+    }
+
+    /// A native target's harness is a prebuilt binary staged alone into
+    /// `build/<id>/`: the manifest's input mode travels with it, so the fuzz
+    /// lane (and replay/minimize later) use the framed protocol and its
+    /// coverage map instead of guessing from the binary.
+    #[test]
+    fn materialized_native_harness_carries_the_declared_input_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prebuilt = tmp.path().join("harness");
+        std::fs::write(&prebuilt, b"\x7fELF\0stripped").unwrap();
+        let work = tmp.path().join("work");
+        materialize_native(
+            &native(PpNativeEngine::Builtin),
+            "attrs",
+            &work,
+            &prebuilt,
+            &MergedDictionary::default(),
+        )
+        .unwrap();
+        let harness = work.join("build/attrs/main");
+        assert!(harness.is_file());
+        let detection = crate::protocol_detect::detect(&harness, &[work.as_path()]);
+        assert_eq!(
+            detection.protocol,
+            crate::protocol_detect::HarnessProtocol::BhfFramed
+        );
+        assert_eq!(
+            detection.basis,
+            crate::protocol_detect::ProtocolBasis::Declared("framed".to_owned())
+        );
     }
 
     #[test]

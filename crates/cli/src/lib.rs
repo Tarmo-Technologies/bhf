@@ -49,6 +49,7 @@ mod cmplog_cli;
 mod collector_run;
 mod command_output;
 mod corpus;
+mod crash_identity;
 mod dashboard;
 mod differential;
 mod env_capsule;
@@ -76,6 +77,7 @@ mod pack;
 mod policy;
 mod probe_backend;
 mod project;
+mod protocol_detect;
 mod readiness;
 mod relational;
 mod replay;
@@ -203,7 +205,7 @@ enum Command {
     Corpus(corpus::CorpusArgs),
     /// Shrink a crashing input by binary search while preserving the crash (testcase reduction)
     Minimize(minimize::MinimizeArgs),
-    /// Re-run a finding's crash input through a harness to reproduce it (sandbox / qemu-user)
+    /// Re-run a finding's crash input through a harness to reproduce it: MATCH only on the same rule, kind and sink (or reported site), with a crash summary, --json and --show-output (sandbox / qemu-user)
     Replay(replay::ReplayArgs),
     /// Package a C/C++ crash into a portable, self-verifying PoC capsule (input + harness + sources + recovered build + stubs); other findings are refused with the reason
     Capsule(capsule::CapsuleArgs),
@@ -565,7 +567,12 @@ where
             report::run(report_args)
         }
         Some(Command::Report(report_args)) => report::run(report_args),
-        Some(Command::Replay(replay_args)) => replay::run(replay_args),
+        Some(Command::Replay(replay_args)) => {
+            // The same toolchain `auto` puts on PATH for its fuzz children, so
+            // a replay's sanitizer report is symbolized as theirs was.
+            build::activate_compatible_clang();
+            replay::run(replay_args)
+        }
         Some(Command::Rules(rules_args)) => rules::run(rules_args),
         Some(Command::Runners(args)) => runners::run(args),
         Some(Command::Scan(scan_args)) => scan::run(scan_args),

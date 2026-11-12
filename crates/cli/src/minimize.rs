@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::finding_arg::resolve_finding_arg;
-use crate::runner::{detect_harness_engine, harness_runner, HarnessEngine, SandboxModeArg};
+use crate::runner::{detect_harness_engine_in, harness_runner, HarnessEngine, SandboxModeArg};
 use anyhow::{anyhow, Context};
 use clap::ValueEnum;
 use serde_json::json;
@@ -133,12 +133,19 @@ fn minimize_c_engine_until(
     let tmp_dir = finding_dir.join("minimize_tmp");
     fs::create_dir_all(&tmp_dir)
         .with_context(|| format!("create minimize temp dir {}", tmp_dir.display()))?;
+    let leak = fs::read(finding_dir.join("finding.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .is_some_and(|raw| crate::replay::is_leak_finding(&raw));
+    let sanitizer_env = crate::fuzz::sanitizer_child_env(leak);
     let run_once = |bytes: &[u8]| -> anyhow::Result<Option<&'static str>> {
         let mut cmd = Command::new(harness);
         cmd.stdout(Stdio::null()).stderr(Stdio::piped());
-        // UBSan prints and continues by default: run with the fuzz child's
-        // options so a UBSan finding reproduces as the crash it was recorded as.
-        cmd.env("UBSAN_OPTIONS", crate::fuzz::ubsan_child_options());
+        // The fuzz child's sanitizer options (UBSan prints and continues by
+        // default), so a finding reproduces as the crash it was recorded as.
+        for (key, value) in &sanitizer_env {
+            cmd.env(key, value);
+        }
         let input_path = match io {
             CEngineIo::ArgvFile => {
                 let nonce = SystemTime::now()
@@ -243,6 +250,14 @@ fn minimize_c_engine_until(
     })
 }
 
+/// Classify `harness` with the detector fuzz and replay use, searching the
+/// harness dirs of the work dir that holds `finding_dir` for its sources.
+fn engine_for_finding(harness: &Path, finding_dir: &Path) -> HarnessEngine {
+    let work = corpus::layout::work_dir_for_finding(finding_dir);
+    let work_dirs: Vec<&Path> = work.iter().map(PathBuf::as_path).collect();
+    detect_harness_engine_in(harness, &work_dirs)
+}
+
 /// The work dir that owns the finding being minimized, when it lives in a
 /// results layout (so the dispatcher can rebuild results/ afterwards).
 pub fn work_dir_hint(args: &MinimizeArgs) -> Option<std::path::PathBuf> {
@@ -259,7 +274,7 @@ pub(crate) fn minimize_for_auto(
     harness: &Path,
     deadline: std::time::Instant,
 ) -> anyhow::Result<Option<MinimizeSummary>> {
-    let io = match detect_harness_engine(harness) {
+    let io = match engine_for_finding(harness, finding_dir) {
         HarnessEngine::CAfl => CEngineIo::Stdin,
         HarnessEngine::CLibFuzzer => CEngineIo::ArgvFile,
         HarnessEngine::AdaStdin => return Ok(None),
@@ -342,11 +357,13 @@ fn run_inner(args: MinimizeArgs) -> anyhow::Result<MinimizeSummary> {
             reduced: result.reduced,
         });
     }
-    // Dispatch by engine. Both C engines reuse the same delta-debug
+    // Dispatch by engine, with the protocol detector fuzz and replay use (the
+    // harness's sources are searched in every harness dir of the work dir
+    // holding the finding). Both C engines reuse the same delta-debug
     // skeleton but differ in how a candidate input reaches main():
     // libFuzzer takes argv[1], AFL persistent-mode reads stdin (the
     // generated template falls back to `bhf_afl_read_stdin`).
-    match detect_harness_engine(&harness) {
+    match engine_for_finding(&harness, &finding_dir) {
         HarnessEngine::CAfl => {
             return minimize_c_engine(&finding_dir, &harness, args.strategy, CEngineIo::Stdin);
         }
@@ -363,7 +380,17 @@ fn run_inner(args: MinimizeArgs) -> anyhow::Result<MinimizeSummary> {
         args.sandbox_tool,
         args.sandbox_strict,
     );
-    let result = minimize(&finding_dir, &runner, args.strategy)?;
+    let result = minimize(&finding_dir, &runner, args.strategy).with_context(|| {
+        let work = corpus::layout::work_dir_for_finding(&finding_dir);
+        let work_dirs: Vec<&Path> = work.iter().map(PathBuf::as_path).collect();
+        let detection = crate::protocol_detect::detect(runner.harness_path(), &work_dirs);
+        format!(
+            "minimizing {} as an Ada stdin harness ({}); if it is a C/C++ harness, pass the \
+             binary next to its main.c/main.cpp with --harness, or rebuild it with this bhf",
+            runner.harness_path().display(),
+            detection.basis.describe()
+        )
+    })?;
     let min_path = finding_dir.join("min_testcase.bin");
 
     fs::write(&min_path, &result.minimized)

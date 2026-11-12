@@ -1066,25 +1066,49 @@ fn finding_window_ms(finding: &Value) -> u64 {
 /// the SAME oracle signature fires, surfacing the attributing event and the
 /// descendant process tree so the attribution can be audited. A live collector is
 /// not re-run (live process trees are non-deterministic and out of replay scope).
-pub fn replay_collector_finding(finding_dir: &Path) -> i32 {
-    match replay_collector_finding_inner(finding_dir) {
-        Ok(true) => {
-            let _ = corpus::finding::touch_last_seen(finding_dir, "replay");
-            println!("MATCH");
-            0
-        }
-        Ok(false) => {
-            bhfeprintln!("MISMATCH collector semantic signature not reproduced from evidence");
-            3
-        }
-        Err(error) => {
-            bhfeprintln!("error: {error:#}");
-            1
-        }
-    }
+pub(crate) fn replay_collector_outcome(
+    finding_dir: &Path,
+) -> Result<crate::replay::LaneReplay, String> {
+    let (matched, want, details) =
+        replay_collector_finding_inner(finding_dir).map_err(|error| format!("{error:#}"))?;
+    Ok(crate::replay::LaneReplay {
+        lane: "collector",
+        matched,
+        status_line: if matched {
+            "MATCH".to_owned()
+        } else {
+            "MISMATCH collector semantic signature not reproduced from evidence".to_owned()
+        },
+        compared: format!("oracle signature {want}, re-evaluated over the stored evidence"),
+        differences: if matched {
+            Vec::new()
+        } else {
+            vec![format!(
+                "oracle signature: recorded {want}, not produced from the stored evidence"
+            )]
+        },
+        details,
+        history: "replay",
+        ..Default::default()
+    })
 }
 
-fn replay_collector_finding_inner(finding_dir: &Path) -> anyhow::Result<bool> {
+/// `bhf replay` of a collector finding with the default output.
+#[cfg(test)]
+pub fn replay_collector_finding(finding_dir: &Path) -> i32 {
+    crate::replay::finish_lane(
+        finding_dir,
+        replay_collector_outcome(finding_dir),
+        crate::replay::OutputMode::default(),
+    )
+}
+
+/// Whether the stored evidence still produces the recorded oracle signature,
+/// that signature, and the attributing event and descendant process tree for
+/// the summary.
+fn replay_collector_finding_inner(
+    finding_dir: &Path,
+) -> anyhow::Result<(bool, String, Vec<crate::replay::Detail>)> {
     let finding = read_finding_json(finding_dir)?;
     let want = finding
         .pointer("/oracle/signature")
@@ -1099,18 +1123,26 @@ fn replay_collector_finding_inner(finding_dir: &Path) -> anyhow::Result<bool> {
     let sigs = replayed_signatures(&finding, &evidence, &root, window_ms);
 
     // Surface the attributing event + descendant process tree for the auditor.
+    let mut details = Vec::new();
     if let Some(ev) = finding.pointer("/collector/attributing_event") {
         if !ev.is_null() {
-            println!(
-                "attributing event: {}",
-                serde_json::to_string(ev).unwrap_or_default()
-            );
+            details.push(crate::replay::Detail::new(
+                "event",
+                format!(
+                    "attributing event {}",
+                    serde_json::to_string(ev).unwrap_or_default()
+                ),
+            ));
         }
     }
     if let Some(tree) = finding.pointer("/collector/process_tree") {
-        println!("descendant process tree: {tree}");
+        details.push(crate::replay::Detail::new(
+            "processes",
+            format!("descendant process tree {tree}"),
+        ));
     }
-    Ok(sigs.iter().any(|s| s == &want))
+    let matched = sigs.iter().any(|s| s == &want);
+    Ok((matched, want, details))
 }
 
 /// Minimize a collector-sourced finding. The stored evidence is captured by the

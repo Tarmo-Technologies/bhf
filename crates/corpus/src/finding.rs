@@ -354,7 +354,7 @@ impl FindingEmitter {
             "classification": "unhandled",
             "harness_id": self.metadata.harness_id,
             "dialect": self.metadata.dialect,
-            "fixture_path": self.metadata.fixture_path,
+            "fixture_path": stored_fixture_path(&self.root, &self.metadata.fixture_path),
             "exception": {
                 "name": exception_name,
                 "message": report.message,
@@ -486,7 +486,7 @@ impl FindingEmitter {
             "confirmation": "runtime",
             "harness_id": self.metadata.harness_id,
             "dialect": self.metadata.dialect,
-            "fixture_path": self.metadata.fixture_path,
+            "fixture_path": stored_fixture_path(&self.root, &self.metadata.fixture_path),
             "oracle": {
                 "name": hit.oracle_name,
                 "category": hit.category,
@@ -589,7 +589,7 @@ impl FindingEmitter {
             "confirmation": "extension",
             "harness_id": self.metadata.harness_id,
             "dialect": self.metadata.dialect,
-            "fixture_path": self.metadata.fixture_path,
+            "fixture_path": stored_fixture_path(&self.root, &self.metadata.fixture_path),
             "extension": finding.provenance,
             "evidence": evidence,
             "exception": {
@@ -668,8 +668,10 @@ impl FindingEmitter {
             finding_dir.join("decoded.json"),
             serde_json::to_vec_pretty(&decoded_placeholder(input))?,
         )?;
+        let fixture_path = stored_fixture_path(&self.root, &self.metadata.fixture_path);
         let mut record = finding_record(
             &id.0,
+            &fixture_path,
             &signature_hex,
             classification,
             testcase,
@@ -765,6 +767,119 @@ impl Default for FindingMetadata {
     }
 }
 
+/// The directories under a work dir that hold harness `<id>/` directories.
+const HARNESS_ROOTS: [&str; 4] = ["build", "harnesses", "auto", "generated_harnesses"];
+
+/// The `fixture_path` recorded for a harness at `fixture`: relative to the work
+/// dir (with `/` separators) when the harness is inside it, so a copied or
+/// moved work dir resolves its own harness; unchanged otherwise.
+pub fn stored_fixture_path(work_dir: &std::path::Path, fixture: &str) -> String {
+    use std::path::{Component, Path};
+    if fixture.is_empty() {
+        return String::new();
+    }
+    let path = Path::new(fixture);
+    let relative = path
+        .strip_prefix(work_dir)
+        .ok()
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            let canonical = fs::canonicalize(path).ok()?;
+            let work = fs::canonicalize(work_dir).ok()?;
+            canonical.strip_prefix(&work).ok().map(Path::to_path_buf)
+        });
+    let Some(relative) = relative else {
+        return fixture.to_owned();
+    };
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+            Component::CurDir => {}
+            _ => return fixture.to_owned(),
+        }
+    }
+    if parts.is_empty() {
+        return fixture.to_owned();
+    }
+    parts.join("/")
+}
+
+/// Where a finding's recorded `fixture_path` may be found, most likely first,
+/// resolved against the work dir that holds `finding_dir`:
+///
+/// - a relative value (what bhf records now) is taken relative to that work
+///   dir, then by its `build|harnesses|auto|generated_harnesses/<id>/...`
+///   tail in it — never relative to the current directory, which would run
+///   whatever harness sits there;
+/// - an absolute value inside that work dir, or one with no harness-root tail
+///   (a harness outside any work dir), is taken as given;
+/// - an absolute value recorded in another work dir (by an earlier release,
+///   or in the original of a copied work dir) is mapped into this one by its
+///   tail. The path as recorded is that other work dir's harness: it is
+///   offered by [`fixture_path_fallback`], to try only after the harness dirs
+///   of this work dir.
+///
+/// A finding outside a work-dir layout takes the value as given.
+pub fn fixture_path_candidates(
+    finding_dir: &std::path::Path,
+    fixture: &str,
+) -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+    if fixture.is_empty() {
+        return Vec::new();
+    }
+    let path = PathBuf::from(fixture);
+    let Some(work) = crate::layout::work_dir_for_finding(finding_dir) else {
+        return vec![path];
+    };
+    let mut candidates = Vec::new();
+    let mut push = |candidate: PathBuf| {
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    };
+    if path.is_relative() {
+        push(work.join(&path));
+        if let Some(tail) = harness_tail(&path) {
+            push(work.join(tail));
+        }
+    } else if path.starts_with(&work) {
+        push(path);
+    } else if let Some(tail) = harness_tail(&path) {
+        push(work.join(tail));
+    } else {
+        push(path);
+    }
+    candidates
+}
+
+/// The recorded `fixture_path` as given, when [`fixture_path_candidates`]
+/// held it back: an absolute path into another work dir's harness dirs. A
+/// caller tries it only once this work dir's own harness dirs hold nothing
+/// for the finding's `harness_id`.
+pub fn fixture_path_fallback(
+    finding_dir: &std::path::Path,
+    fixture: &str,
+) -> Option<std::path::PathBuf> {
+    let path = std::path::PathBuf::from(fixture);
+    let work = crate::layout::work_dir_for_finding(finding_dir)?;
+    (path.is_absolute() && !path.starts_with(&work) && harness_tail(&path).is_some())
+        .then_some(path)
+}
+
+/// The `<root>/<id>/<leaf...>` tail of a harness path, from the last
+/// component naming a harness root (`build`, `harnesses`, `auto`,
+/// `generated_harnesses`) that is followed by at least an id and a file name.
+fn harness_tail(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let parts: Vec<_> = path.components().collect();
+    let index = (0..parts.len().saturating_sub(2)).rev().find(|&i| {
+        matches!(parts[i], std::path::Component::Normal(name)
+            if HARNESS_ROOTS.iter().any(|root| name == std::ffi::OsStr::new(root)))
+    })?;
+    Some(parts[index..].iter().collect())
+}
+
 /// A later run reproduced this finding: stamp `last_seen` (and history).
 /// A caller replaying against a possibly read-only evidence tree should
 /// `let _ =` the result rather than fail the replay on it.
@@ -829,6 +944,7 @@ fn decoded_placeholder(input: &[u8]) -> serde_json::Value {
 #[allow(clippy::too_many_arguments)]
 fn finding_record(
     id: &str,
+    fixture_path: &str,
     signature_hex: &str,
     classification: Classification,
     testcase: &Testcase,
@@ -859,7 +975,7 @@ fn finding_record(
         "mocks": testcase.mocks,
         "harness_id": metadata.harness_id,
         "dialect": metadata.dialect,
-        "fixture_path": metadata.fixture_path,
+        "fixture_path": fixture_path,
         "exception": {
             "name": handler.exception_name,
             "message": handler.exception_message,
@@ -1389,6 +1505,116 @@ mod tests {
             "src/packet.c"
         );
         assert_eq!(value["actionability"]["impact"], "critical");
+    }
+
+    fn fixture_recorded_for(root: &std::path::Path, fixture: &str) -> serde_json::Value {
+        let report = crate::sanitizer::SanitizerReport {
+            sanitizer: Some(crate::sanitizer::Sanitizer::AddressSanitizer),
+            kind: "heap-buffer-overflow".to_owned(),
+            rule_id: "BHF-201",
+            message: "ERROR: AddressSanitizer: heap-buffer-overflow".to_owned(),
+            ..Default::default()
+        };
+        let emitter = super::FindingEmitter::with_metadata(
+            root.to_path_buf(),
+            "H-1".to_owned(),
+            "c".to_owned(),
+            fixture.to_owned(),
+        );
+        let id = emitter.emit_sanitizer_crash(b"x", &report).unwrap();
+        serde_json::from_slice(
+            &fs::read(
+                crate::layout::findings_dir(root)
+                    .join(id.0)
+                    .join("finding.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// A copied or moved work dir must run its own harness, so a harness
+    /// inside the work dir is recorded relative to it.
+    #[test]
+    fn a_harness_inside_the_work_dir_is_recorded_relative_to_it() {
+        let root = temp_dir("fixture-relative");
+        let harness = root.join("harnesses").join("H-1").join("main");
+        let value = fixture_recorded_for(&root, &harness.display().to_string());
+        assert_eq!(value["fixture_path"], "harnesses/H-1/main");
+    }
+
+    #[test]
+    fn a_harness_outside_the_work_dir_keeps_its_path() {
+        let root = temp_dir("fixture-outside");
+        let value = fixture_recorded_for(&root, "/opt/prebuilt/harness/main");
+        assert_eq!(value["fixture_path"], "/opt/prebuilt/harness/main");
+        let value = fixture_recorded_for(&root, "examples/widget/pkg.adb");
+        assert_eq!(value["fixture_path"], "examples/widget/pkg.adb");
+    }
+
+    /// A relative value resolves in the work dir holding the finding, never
+    /// relative to the current directory.
+    #[test]
+    fn a_relative_fixture_resolves_in_the_containing_work_dir_only() {
+        let finding = std::path::Path::new("/copy/results/findings/F-0001-aa");
+        assert_eq!(
+            super::fixture_path_candidates(finding, "harnesses/H-1/main"),
+            vec![PathBuf::from("/copy/harnesses/H-1/main")]
+        );
+        assert_eq!(
+            super::fixture_path_fallback(finding, "harnesses/H-1/main"),
+            None
+        );
+        // A value an earlier release recorded relative to its current
+        // directory is mapped by its harness-root tail.
+        assert_eq!(
+            super::fixture_path_candidates(finding, "old/work/build/H-1/main"),
+            vec![
+                PathBuf::from("/copy/old/work/build/H-1/main"),
+                PathBuf::from("/copy/build/H-1/main"),
+            ]
+        );
+        // Outside a work-dir layout there is nothing else to resolve against.
+        assert_eq!(
+            super::fixture_path_candidates(
+                std::path::Path::new("/loose/F-1"),
+                "harnesses/H-1/main"
+            ),
+            vec![PathBuf::from("harnesses/H-1/main")]
+        );
+    }
+
+    /// An absolute path recorded in another work dir is mapped into the work
+    /// dir holding the finding; the path as recorded is only a fallback.
+    #[test]
+    fn an_absolute_fixture_is_mapped_into_the_containing_work_dir() {
+        let finding = std::path::Path::new("/copy/results/findings/F-0001-aa");
+        assert_eq!(
+            super::fixture_path_candidates(finding, "/orig/work/harnesses/H-1/main"),
+            vec![PathBuf::from("/copy/harnesses/H-1/main")]
+        );
+        assert_eq!(
+            super::fixture_path_fallback(finding, "/orig/work/harnesses/H-1/main"),
+            Some(PathBuf::from("/orig/work/harnesses/H-1/main"))
+        );
+        assert_eq!(
+            super::fixture_path_candidates(finding, "/copy/build/H-1/obj/main"),
+            vec![PathBuf::from("/copy/build/H-1/obj/main")]
+        );
+        assert_eq!(
+            super::fixture_path_fallback(finding, "/copy/build/H-1/obj/main"),
+            None
+        );
+        // A path with no harness-root tail is used as given.
+        assert_eq!(
+            super::fixture_path_candidates(finding, "/opt/prebuilt/main"),
+            vec![PathBuf::from("/opt/prebuilt/main")]
+        );
+        assert_eq!(
+            super::fixture_path_fallback(finding, "/opt/prebuilt/main"),
+            None
+        );
+        assert!(super::fixture_path_candidates(finding, "").is_empty());
     }
 
     #[test]

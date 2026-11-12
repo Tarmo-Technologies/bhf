@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::protocol_detect::HarnessProtocol;
 use clap::ValueEnum;
 use replay_min::{HarnessRunner, SandboxConfig};
 use std::path::{Path, PathBuf};
@@ -69,13 +70,15 @@ pub(crate) fn harness_runner_with_wrapper(
 /// Classify a built harness binary by the engine its main() expects.
 /// AdaStdin is the default for native Ada harnesses (read events file
 /// via env). CLibFuzzer accepts an input file via argv (libFuzzer
-/// `single input` mode). CAfl reads input from stdin (AFL persistent
-/// mode handshake). Detection is best-effort:
+/// `single input` mode, which bhf's own C/C++ driver also accepts). CAfl
+/// reads input from stdin (AFL persistent mode handshake).
 ///   - filename `main_afl` is unambiguous (bhf build only stages
 ///     it for `--c-engine afl++`).
-///   - libFuzzer detection probes the binary with `-help=1` and looks
-///     for the libFuzzer banner in stdout/stderr. Ada harnesses
-///     don't accept that flag and exit immediately.
+///   - everything else goes through the detector `bhf fuzz` uses
+///     ([`crate::protocol_detect::detect`]): a declared input mode, the
+///     `BHF_FRAMED` marker in a launcher, in a driver source anywhere in the
+///     work dir, or compiled into the binary, a plain libFuzzer source, or the
+///     libFuzzer runtime in the binary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HarnessEngine {
     AdaStdin,
@@ -83,7 +86,9 @@ pub(crate) enum HarnessEngine {
     CAfl,
 }
 
-pub(crate) fn detect_harness_engine(harness: &Path) -> HarnessEngine {
+/// Classify `harness`, also searching the harness dirs of `work_dirs` (for a
+/// finding, the work dir that holds it) for its sources.
+pub(crate) fn detect_harness_engine_in(harness: &Path, work_dirs: &[&Path]) -> HarnessEngine {
     let name = harness
         .file_name()
         .and_then(|n| n.to_str())
@@ -91,60 +96,16 @@ pub(crate) fn detect_harness_engine(harness: &Path) -> HarnessEngine {
     if name == "main_afl" || name == "main_afl.exe" {
         return HarnessEngine::CAfl;
     }
-    // A bhf driver harness (generated C #399, or a passthrough #398) has no
-    // libFuzzer banner — it ships its own `main` with the BHF_FRAMED loop and
-    // an argv[1]-file fallback. Treat it as CLibFuzzer (argv-file single-input) so
-    // minimize/replay feed the testcase as a file, not on stdin.
-    if is_bhf_driver_harness(harness) || is_libfuzzer_binary(harness) {
-        return HarnessEngine::CLibFuzzer;
-    }
-    HarnessEngine::AdaStdin
+    engine_for(crate::protocol_detect::detect(harness, work_dirs).protocol)
 }
 
-/// A bhf driver harness carries the `BHF_FRAMED` persistent-loop marker:
-/// C/C++/Rust ship a sibling `main.c`/`main.cpp`, and the native Java lane's
-/// `main` is itself a launcher script whose header carries the marker (reading the
-/// real binary as text simply fails on the non-UTF-8 bytes and is ignored).
-fn is_bhf_driver_harness(harness: &Path) -> bool {
-    let Some(dir) = harness.parent() else {
-        return false;
-    };
-    let harness_name = harness.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    ["main.c", "main.cpp", harness_name].iter().any(|name| {
-        !name.is_empty()
-            && std::fs::read_to_string(dir.join(name))
-                .map(|src| src.contains("BHF_FRAMED"))
-                .unwrap_or(false)
-    })
-}
-
-fn is_libfuzzer_binary(harness: &Path) -> bool {
-    use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
-    let Ok(mut child) = Command::new(harness)
-        .arg("-help=1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    else {
-        return false;
-    };
-    let start = Instant::now();
-    while start.elapsed() < Duration::from_millis(500) {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-            Err(_) => return false,
+pub(crate) fn engine_for(protocol: HarnessProtocol) -> HarnessEngine {
+    match protocol {
+        HarnessProtocol::BhfFramed | HarnessProtocol::LibFuzzerSingleInput => {
+            HarnessEngine::CLibFuzzer
         }
+        HarnessProtocol::StdinEventLog => HarnessEngine::AdaStdin,
     }
-    let _ = child.kill();
-    let Ok(output) = child.wait_with_output() else {
-        return false;
-    };
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stderr.contains("libFuzzer") || stdout.contains("libFuzzer")
 }
 
 fn sandbox_config(
@@ -169,5 +130,68 @@ fn sandbox_config(
             SandboxConfig::bubblewrap(sandbox_tool.unwrap_or_else(|| PathBuf::from("bwrap")))
                 .with_strict(sandbox_strict)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{detect_harness_engine_in, HarnessEngine};
+    use std::path::Path;
+
+    fn detect_harness_engine(harness: &Path) -> HarnessEngine {
+        detect_harness_engine_in(harness, &[])
+    }
+    use std::fs;
+
+    /// A binary with `BHF_FRAMED` compiled in, past the first 4 KiB.
+    fn framed_binary() -> Vec<u8> {
+        let mut bytes = b"\x7fELF\x02\x01\x01\0".to_vec();
+        bytes.resize(64 * 1024, 0);
+        bytes.extend_from_slice(b"BHF_FRAMED\0BHF_COV_SHM\0");
+        bytes
+    }
+
+    /// `bhf build` stages only the binary into `build/<id>/main`; replay and
+    /// minimize must still feed it the testcase as a file.
+    #[test]
+    fn a_driver_binary_staged_alone_takes_its_input_as_a_file() {
+        let work = tempfile::tempdir().unwrap();
+        let dir = work.path().join("build/H-STAGED");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("main"), framed_binary()).unwrap();
+        assert_eq!(
+            detect_harness_engine(&dir.join("main")),
+            HarnessEngine::CLibFuzzer
+        );
+    }
+
+    /// The driver source of a staged binary lives in the generated harness dir.
+    #[test]
+    fn a_staged_binary_finds_its_driver_source_in_the_work_dir() {
+        let work = tempfile::tempdir().unwrap();
+        let build = work.path().join("build/H-GEN");
+        let generated = work.path().join("generated_harnesses/H-GEN");
+        fs::create_dir_all(&build).unwrap();
+        fs::create_dir_all(&generated).unwrap();
+        fs::write(build.join("main"), b"\x7fELF\0").unwrap();
+        fs::write(generated.join("main.cpp"), "// BHF_FRAMED driver\n").unwrap();
+        assert_eq!(
+            detect_harness_engine(&build.join("main")),
+            HarnessEngine::CLibFuzzer
+        );
+    }
+
+    #[test]
+    fn an_unmarked_binary_is_an_ada_stdin_harness() {
+        let work = tempfile::tempdir().unwrap();
+        let dir = work.path().join("build/H-ADA/obj");
+        fs::create_dir_all(&dir).unwrap();
+        let mut bytes = framed_binary();
+        bytes.extend_from_slice(b"BHF_EVENTS_PATH\0");
+        fs::write(dir.join("main"), bytes).unwrap();
+        assert_eq!(
+            detect_harness_engine(&dir.join("main")),
+            HarnessEngine::AdaStdin
+        );
     }
 }

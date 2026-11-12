@@ -2455,8 +2455,10 @@ __HEADER__
 # Usage:
 #   python3 replay.py [HARNESS]
 #
-# With no argument the harness is auto-discovered from the sibling finding.json
-# (fixture_path / harness_id + <work>/auto/<harness_id>/main). Pass a path to
+# With no argument the harness is auto-discovered from the sibling finding.json:
+# its fixture_path, resolved in the work dir holding this finding first (so a
+# copied work dir runs its own harness), then harness_id under
+# <work>/{harnesses,auto,generated_harnesses,build}/<harness_id>/. Pass a path to
 # override. The harness runs on the recorded testcase with the sanitizer env and
 # its output + exit status are printed.
 import json
@@ -2481,35 +2483,94 @@ def load_finding():
         return {}
 
 
+HARNESS_ROOTS = ("build", "harnesses", "auto", "generated_harnesses")
+
+
+def in_work_dir():
+    return HERE.parent.name == "findings"
+
+
+def work_dir():
+    # Mirrors corpus::layout::work_dir_for_finding: the results layout is
+    # <work>/results/findings/<id>, the legacy one <work>/findings/<id>.
+    if HERE.parent.name == "findings" and HERE.parent.parent.name == "results":
+        return HERE.parent.parent.parent
+    if HERE.parent.name == "findings":
+        return HERE.parent.parent
+    return HERE.parent
+
+
+def harness_tail(path):
+    parts = path.parts
+    for index in range(len(parts) - 3, -1, -1):
+        if parts[index] in HARNESS_ROOTS:
+            return Path(*parts[index:])
+    return None
+
+
+def is_within(path, work):
+    try:
+        path.relative_to(work)
+        return True
+    except ValueError:
+        return False
+
+
+def fixture_candidates(fixture, work):
+    # Mirrors corpus::finding::fixture_path_candidates: a relative fixture_path
+    # is relative to the work dir (never to the current directory); an
+    # absolute one recorded in another (the original of a copied) work dir is
+    # mapped into this one by its <root>/<id>/... tail, and the path as given
+    # is left to fixture_fallback.
+    path = Path(fixture)
+    if not in_work_dir():
+        yield path
+        return
+    tail = harness_tail(path)
+    if not path.is_absolute():
+        yield work / path
+        if tail is not None:
+            yield work / tail
+    elif is_within(path, work) or tail is None:
+        yield path
+    else:
+        yield work / tail
+
+
+def fixture_fallback(fixture, work):
+    # Mirrors corpus::finding::fixture_path_fallback: another work dir's
+    # harness, tried only after this work dir's harness dirs.
+    path = Path(fixture)
+    if (in_work_dir() and path.is_absolute() and not is_within(path, work)
+            and harness_tail(path) is not None):
+        yield path
+
+
 def candidate_harnesses(finding):
     # 1) explicit override on the command line
     if len(sys.argv) > 1:
         yield Path(sys.argv[1])
         return
+    work = work_dir()
+    fixtures = [f for f in (finding.get("fixture_path"), FIXTURE_PATH) if f]
     # 2) fixture_path recorded in finding.json, then the embedded fallback
-    for fixture in (finding.get("fixture_path"), FIXTURE_PATH):
-        if fixture:
-            yield Path(fixture)
-    # 3) <work>/{harnesses,auto,generated_harnesses}/<harness_id>/<leaf>. Derive
-    #    the work dir name-awarely (mirrors corpus::layout::work_dir_for_finding):
-    #    results layout is <work>/results/findings/<id>, legacy is <work>/findings/<id>.
-    #    Search the work dir first, then the finding's parent as a flat-layout
-    #    fallback; never probe above the work dir.
+    for fixture in fixtures:
+        yield from fixture_candidates(fixture, work)
+    # 3) <work>/<root>/<harness_id>/<leaf>. Search the work dir first, then the
+    #    finding's parent as a flat-layout fallback; never probe above the work
+    #    dir.
     hid = finding.get("harness_id") or HARNESS_ID
     if hid:
-        if HERE.parent.name == "findings" and HERE.parent.parent.name == "results":
-            work = HERE.parent.parent.parent
-        elif HERE.parent.name == "findings":
-            work = HERE.parent.parent
-        else:
-            work = HERE.parent
         roots = [work]
         if HERE.parent != work:
             roots.append(HERE.parent)
         for root in roots:
-            for sub in ("harnesses", "auto", "generated_harnesses"):
+            for sub in ("harnesses", "auto", "generated_harnesses", "build"):
                 for leaf in ("main", "main_afl", "main.exe", "main_afl.exe"):
                     yield root / sub / hid / leaf
+    # 4) a fixture_path into another work dir, as recorded
+    for fixture in fixtures:
+        yield from fixture_fallback(fixture, work)
 
 
 def resolve_harness(finding):
@@ -4211,6 +4272,150 @@ mod tests {
             assert!(
                 !outer.join("harnesses/h1/RAN").is_file(),
                 "decoy above the work dir ran for {finding_rel}"
+            );
+        }
+    }
+
+    /// A copied work dir runs its own harness: a relative `fixture_path` is
+    /// resolved in the work dir holding the finding, and an absolute one from
+    /// the original work dir is mapped into it first.
+    #[cfg(unix)]
+    #[test]
+    fn repro_py_runs_the_harness_of_the_work_dir_holding_the_finding() {
+        use std::os::unix::fs::PermissionsExt;
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("SKIP repro_py_runs_the_harness_of_the_work_dir_holding_the_finding");
+            return;
+        }
+        let plant_stub = |path: &std::path::Path| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "#!/bin/sh\n: > \"$(dirname \"$0\")/RAN\"\nexit 0\n").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let original = tmp.path().join("original");
+        let copy = tmp.path().join("copy");
+        let finding = copy.join("results/findings/F-1");
+        std::fs::create_dir_all(&finding).unwrap();
+        std::fs::write(finding.join("testcase.bin"), b"x").unwrap();
+        for (fixture, ran) in [
+            (
+                original.join("harnesses/h1/main").display().to_string(),
+                copy.join("harnesses/h1/RAN"),
+            ),
+            ("build/h2/main".to_owned(), copy.join("build/h2/RAN")),
+        ] {
+            plant_stub(&original.join("harnesses/h1/main"));
+            plant_stub(&copy.join("harnesses/h1/main"));
+            plant_stub(&copy.join("build/h2/main"));
+            let script = super::render_repro_py(
+                "testcase.bin",
+                &fixture,
+                "h1",
+                "abort_on_error=1",
+                "print_stacktrace=1",
+                &serde_json::Map::new(),
+                &[],
+            );
+            std::fs::write(finding.join("replay.py"), &script).unwrap();
+            std::fs::write(
+                finding.join("finding.json"),
+                serde_json::json!({ "fixture_path": fixture }).to_string(),
+            )
+            .unwrap();
+            let status = std::process::Command::new("python3")
+                .arg(finding.join("replay.py"))
+                .status()
+                .unwrap();
+            assert!(status.success(), "replay.py failed for {fixture}");
+            assert!(ran.is_file(), "{} did not run for {fixture}", ran.display());
+            assert!(
+                !original.join("harnesses/h1/RAN").is_file(),
+                "the original work dir's harness ran for {fixture}"
+            );
+        }
+    }
+
+    /// When the recorded harness is no longer where `fixture_path` says, the
+    /// script runs the finding's harness from this work dir's harness dirs,
+    /// never one relative to the current directory or in another work dir.
+    #[cfg(unix)]
+    #[test]
+    fn repro_py_never_runs_a_harness_outside_the_work_dir_holding_the_finding() {
+        use std::os::unix::fs::PermissionsExt;
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!(
+                "SKIP repro_py_never_runs_a_harness_outside_the_work_dir_holding_the_finding"
+            );
+            return;
+        }
+        let plant_stub = |path: &std::path::Path| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "#!/bin/sh\n: > \"$(dirname \"$0\")/RAN\"\nexit 0\n").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let original = tmp.path().join("original");
+        let copy = tmp.path().join("copy");
+        let elsewhere = tmp.path().join("elsewhere");
+        let finding = copy.join("results/findings/F-1");
+        std::fs::create_dir_all(&finding).unwrap();
+        std::fs::write(finding.join("testcase.bin"), b"x").unwrap();
+        for fixture in [
+            "build/h1/main".to_owned(),
+            original.join("build/h1/main").display().to_string(),
+        ] {
+            for ran in [
+                original.join("build/h1/RAN"),
+                elsewhere.join("build/h1/RAN"),
+                copy.join("auto/h1/RAN"),
+            ] {
+                let _ = std::fs::remove_file(ran);
+            }
+            // The copy keeps its harness under auto/, not build/.
+            plant_stub(&copy.join("auto/h1/main"));
+            plant_stub(&original.join("build/h1/main"));
+            plant_stub(&elsewhere.join("build/h1/main"));
+            let script = super::render_repro_py(
+                "testcase.bin",
+                &fixture,
+                "h1",
+                "abort_on_error=1",
+                "print_stacktrace=1",
+                &serde_json::Map::new(),
+                &[],
+            );
+            std::fs::write(finding.join("replay.py"), &script).unwrap();
+            std::fs::write(
+                finding.join("finding.json"),
+                serde_json::json!({ "fixture_path": fixture, "harness_id": "h1" }).to_string(),
+            )
+            .unwrap();
+            let status = std::process::Command::new("python3")
+                .arg(finding.join("replay.py"))
+                .current_dir(&elsewhere)
+                .status()
+                .unwrap();
+            assert!(status.success(), "replay.py failed for {fixture}");
+            assert!(
+                copy.join("auto/h1/RAN").is_file(),
+                "the copy's harness did not run for {fixture}"
+            );
+            assert!(
+                !elsewhere.join("build/h1/RAN").is_file(),
+                "a harness relative to the current directory ran for {fixture}"
+            );
+            assert!(
+                !original.join("build/h1/RAN").is_file(),
+                "the original work dir's harness ran for {fixture}"
             );
         }
     }

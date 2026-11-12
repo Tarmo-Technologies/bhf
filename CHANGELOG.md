@@ -173,6 +173,64 @@
   only for findings capsule can package. For any other it says why and prints
   `python3 <finding>/replay.py` or the harness command; for an AddressSanitizer
   crash cartography can map it adds `bhf cartography`.
+- `bhf replay` reported `MATCH` whenever the rule matched, so a crash of the
+  same class at another site, or in another harness, was confirmed and stamped
+  into `finding.json` as a reproduction. A C/C++ replay now matches on rule,
+  kind and sink (the top project frame, function and `file:line`), or on the
+  reported site for a finding recorded without frames. `MISMATCH` gains a
+  `differs=` field and a line naming what differed; a hang is
+  `actual=<timeout>`. `last_seen` is stamped only on a full match. The fuzz
+  loop's fresh-process confirmation of a crash uses the same comparison. A
+  replayed report that names no function and no source position (an
+  unsymbolized one) is not taken for another crash site: the location is
+  marked as not compared and replay says so. Replay puts the same LLVM
+  toolchain on `PATH` that `bhf auto` gives its fuzz children (the RHEL 7 LLVM
+  Toolset when the base `clang` lacks SanitizerCoverage), so its reports are
+  symbolized as theirs were.
+- `bhf replay` and `bhf minimize` ran C/C++ harnesses without the fuzz child's
+  `ASAN_OPTIONS`; they now use the same options (`abort_on_error=1`,
+  `halt_on_error=1`, and `detect_leaks=1` for a leak finding) plus the UBSan
+  options.
+- `bhf replay` and `bhf minimize` failed with "I/O error during replay" on a
+  harness `bhf build` staged alone into `build/<id>/main` (including the
+  auto-resolved `fixture_path` of every finding `bhf fuzz` recorded for it):
+  they looked for `main.c`/`main.cpp` only beside the binary and treated it as
+  an Ada harness. `bhf fuzz`, `bhf replay` and `bhf minimize` now share one
+  protocol detector. It searches every harness dir of the work dir
+  (`generated_harnesses/`, `harnesses/`, `auto/`, `build/`), scans the whole
+  binary for bhf's driver strings, recognises a `-fsanitize=fuzzer` binary by
+  its runtime, and honours a declared input mode. An Ada harness, which also
+  reads `BHF_FRAMED`, is recognised by the string GNAT's binder puts in every
+  Ada main, whichever probe backend it was built with. An Ada-path failure
+  names its cause and how the protocol was chosen. For a binary staged alone,
+  the input-format note reads `generation-metadata.json` from the harness dir
+  the detector found its driver source in.
+- `bhf fuzz` ran a hand-compiled libFuzzer binary at `build/<id>/main` on
+  stdin, so libFuzzer ran its own loop and the seed was recorded as the
+  testcase of crashes it found. It is now run on one input file per process,
+  and `bhf fuzz` notes that it runs without coverage guidance and how to wrap it
+  with `bhf generate-harness --target LLVMFuzzerTestOneInput`.
+- A `bhf.project.v1` `builtin` target with a prebuilt bhf harness validated as
+  framed but fuzzed without the framed protocol or coverage. `bhf project run`
+  now writes the target's input mode to `build/<id>/harness-protocol.json`,
+  which the fuzz lane, replay and minimize use.
+- A copied or moved work dir replayed and minimized against the original's
+  harness binaries, because `finding.json` held an absolute `fixture_path`
+  that replay, auto's minimization and `replay.py` tried first. New findings
+  record `fixture_path` relative to the work dir when the harness is inside it,
+  and every reader resolves it in the work dir holding the finding, never
+  relative to the current directory; an absolute value from an earlier release
+  is mapped into that work dir by its
+  `harnesses|auto|generated_harnesses|build/<id>/` tail, and is used as
+  recorded only when the work dir has no harness for the finding's
+  `harness_id`. `replay.py` also looks under `build/<id>/`.
+- `bhf replay` rewrote `finding.json` after a match without rebuilding
+  `results/`, leaving the `results/findings.json` evidence hashes and
+  `results/attestation.json` stale. It now rebuilds the index when the work
+  dir has one, for every kind of finding (harness, binary, session, collector
+  and transport).
+- `bhf replay` panicked on a `build.binary.sha256` in `finding.json` that is
+  not ASCII.
 
 ### Changed
 - `bhf auto --seed-dir` reads a directory's files in name order.
@@ -239,6 +297,20 @@
   minimized input when it reproduces, and replays with address-space
   randomization off. The env-capsule manifest gains `lang` and `input_source`.
   The capsule manifest's `build_recipe` gains `stdlib_include_fallback`.
+- `bhf replay` prints a summary under the `MATCH`/`MISMATCH` line: the
+  compared fields, the replayed crash (rule, kind, sink, top frames, memory
+  access and allocation site), the exit status or signal and duration, the
+  harness (protocol, and whether its sha256 matches the recorded build) and
+  the testcase size and sha256. Binary, session, collector and transport
+  findings get the same summary for what their replay compares (a binary
+  target's exit status and sanitizer report, the session oracle verdict, the
+  collector oracle signature, the transport fault identity), and an Ada replay
+  shows the harness exit status and duration. The first line is unchanged, so
+  scripts that look for it keep working; a collector replay's attributing
+  event and process tree now follow it instead of preceding it.
+- `fixture_path` in new `finding.json` records is relative to the work dir
+  when the harness is inside it (an absolute path otherwise). Readers accept
+  both forms.
 
 ### Added
 - `auto/seeds.json` lists every seed a `bhf auto` run used (path, source
@@ -268,6 +340,10 @@
   BHF-570 (exception escapes a C export), BHF-571 (raise out of `Finalize`), and
   Ada coverage for BHF-419, 422, 428, 436, 437 and 550. See
   `docs/designs/2026-10-16-ada-static-rules.md`.
+- `bhf replay --json` prints the result as one `bhf.replay.v1` document for
+  every kind of finding (a non-harness finding's document carries `lane` and
+  `details`, and `harness` only when a binary ran), and `--show-output` also
+  prints the harness's raw output.
 
 ## 0.3.0 - 2026-10-05
 

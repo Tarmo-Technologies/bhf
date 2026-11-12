@@ -61,20 +61,32 @@ pub(crate) fn representatives(work_dir: &Path) -> Vec<Pick> {
         .collect()
 }
 
+/// The harness a pick replays against: its recorded `fixture_path`, resolved
+/// in the work dir holding the finding first (so a copied work dir uses its
+/// own harness), else the standard harness dirs for its `harness_id`, else a
+/// `fixture_path` that points into another work dir.
 fn harness_for(work_dir: &Path, pick: &Pick) -> Option<PathBuf> {
-    if let Some(path) = pick
-        .fixture_path
-        .as_deref()
-        .map(PathBuf::from)
-        .filter(|p| p.is_file())
-    {
+    let fixture = pick.fixture_path.as_deref();
+    if let Some(path) = fixture.and_then(|fixture| {
+        corpus::finding::fixture_path_candidates(&pick.dir, fixture)
+            .into_iter()
+            .find(|p| p.is_file())
+    }) {
         return Some(path);
     }
-    let hid = pick.harness_id.as_deref()?;
-    crate::auto::layout::harness_dir_candidates(work_dir, hid)
-        .into_iter()
-        .flat_map(|dir| ["main", "main_afl", "main.exe", "main_afl.exe"].map(|leaf| dir.join(leaf)))
-        .find(|p| p.is_file())
+    let own = pick.harness_id.as_deref().and_then(|hid| {
+        crate::auto::layout::harness_dir_candidates(work_dir, hid)
+            .into_iter()
+            .flat_map(|dir| {
+                ["main", "main_afl", "main.exe", "main_afl.exe"].map(|leaf| dir.join(leaf))
+            })
+            .find(|p| p.is_file())
+    });
+    own.or_else(|| {
+        fixture
+            .and_then(|fixture| corpus::finding::fixture_path_fallback(&pick.dir, fixture))
+            .filter(|p| p.is_file())
+    })
 }
 
 pub(crate) fn mark_skipped(dir: &Path, reason: &str) {
@@ -146,6 +158,60 @@ mod tests {
             .map(|p| p.id)
             .collect();
         assert_eq!(picks, ["F-0000-aaaaaaaa"]);
+    }
+
+    /// The recorded harness path resolves in the work dir holding the finding:
+    /// a relative path against it, and an absolute one from another (the
+    /// original of a copied) work dir mapped into it before it is used as is.
+    #[test]
+    fn the_harness_resolves_in_the_work_dir_holding_the_finding() {
+        let original = tempfile::tempdir().unwrap();
+        let copy = tempfile::tempdir().unwrap();
+        for work in [original.path(), copy.path()] {
+            let dir = work.join("harnesses/H1");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("main"), b"").unwrap();
+        }
+        let pick = |fixture: String| Pick {
+            id: "F-0000-aaaaaaaa".to_owned(),
+            dir: corpus::layout::finding_dir(copy.path(), "F-0000-aaaaaaaa"),
+            harness_id: None,
+            fixture_path: Some(fixture),
+        };
+        let expected = copy.path().join("harnesses/H1/main");
+        assert_eq!(
+            harness_for(copy.path(), &pick("harnesses/H1/main".to_owned())),
+            Some(expected.clone())
+        );
+        let absolute = original.path().join("harnesses/H1/main");
+        assert_eq!(
+            harness_for(copy.path(), &pick(absolute.display().to_string())),
+            Some(expected)
+        );
+    }
+
+    /// A harness the copy keeps under another harness dir is preferred over
+    /// the original work dir's harness that an absolute `fixture_path` names.
+    #[test]
+    fn the_copy_harness_wins_over_the_original_named_by_an_absolute_path() {
+        let original = tempfile::tempdir().unwrap();
+        let copy = tempfile::tempdir().unwrap();
+        let recorded = original.path().join("build/H1/main");
+        std::fs::create_dir_all(recorded.parent().unwrap()).unwrap();
+        std::fs::write(&recorded, b"").unwrap();
+        let moved = copy.path().join("auto/H1/main");
+        std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+        std::fs::write(&moved, b"").unwrap();
+        let pick = Pick {
+            id: "F-0000-aaaaaaaa".to_owned(),
+            dir: corpus::layout::finding_dir(copy.path(), "F-0000-aaaaaaaa"),
+            harness_id: Some("H1".to_owned()),
+            fixture_path: Some(recorded.display().to_string()),
+        };
+        assert_eq!(harness_for(copy.path(), &pick), Some(moved.clone()));
+        // With no harness of its own, the copy falls back to the recorded path.
+        std::fs::remove_file(&moved).unwrap();
+        assert_eq!(harness_for(copy.path(), &pick), Some(recorded));
     }
 
     #[test]

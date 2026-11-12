@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::protocol_detect::HarnessProtocol;
 use crate::runner::{harness_runner, SandboxModeArg};
 use clap::ValueEnum;
 use corpus::{
@@ -1159,7 +1160,10 @@ fn is_input_rejection(status: &std::process::ExitStatus, stderr: &str) -> bool {
 
 /// Synthesize the BHF-210 "reachable crash (fatal signal, no sanitizer report)"
 /// finding for a non-rejection crash on an input.
-fn fatal_signal_report(status: &std::process::ExitStatus, stderr: &str) -> corpus::SanitizerReport {
+pub(crate) fn fatal_signal_report(
+    status: &std::process::ExitStatus,
+    stderr: &str,
+) -> corpus::SanitizerReport {
     let crash = crate::fatal_signal::classify(status, stderr)
         .expect("fatal_signal_report requires a classified fatal signal");
     // Funnel through the shared crash-report builder so the host-signal lane and
@@ -3116,7 +3120,12 @@ fn run_builtin_with_progress(
     // Replay-verify + driver-glue filtering only apply to passthrough C/C++
     // libFuzzer harnesses (the class that crashes in driver glue); the Ada
     // event-log lane validates findings separately via per-spawn replay.
-    let protocol = resolve_harness_protocol(&prepared.runner, &prepared.work_dir);
+    let detection =
+        crate::protocol_detect::detect(prepared.runner.harness_path(), &[&prepared.work_dir]);
+    if let Some(note) = libfuzzer_binary_note(&detection, prepared.runner.harness_path()) {
+        bhfeprintln!("note: {note}");
+    }
+    let protocol = detection.protocol;
     let c_libfuzzer_harness = protocol == HarnessProtocol::LibFuzzerSingleInput;
     // #416: crash inputs (this run's, plus any recorded by an earlier pass) are
     // excluded from the persisted corpus so a crashing input is never left in the
@@ -4620,13 +4629,6 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
     Ok(summary)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HarnessProtocol {
-    BhfFramed,
-    LibFuzzerSingleInput,
-    StdinEventLog,
-}
-
 const MAX_HARNESS_MARKER_TEXT_BYTES: u64 = 1024 * 1024;
 
 /// Inspect only bounded text. The executable probe rejects binary-looking
@@ -4655,49 +4657,34 @@ fn read_bounded_marker_text(path: &Path, executable: bool) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-/// Resolve the protocol from the source matching any supported work layout.
-/// BHF's generated C source defines `LLVMFuzzerTestOneInput` *and* its own
-/// `BHF_FRAMED` main, so source existence alone must never override the marker.
+/// Resolve the protocol with the detector `bhf replay` and `bhf minimize` share
+/// ([`crate::protocol_detect::detect`]). BHF's generated C source defines
+/// `LLVMFuzzerTestOneInput` *and* its own `BHF_FRAMED` main, so source
+/// existence alone never overrides the marker.
 fn resolve_harness_protocol(
     runner: &replay_min::HarnessRunner,
     work_dir: &Path,
 ) -> HarnessProtocol {
-    let harness_path = runner.harness_path();
-    if read_bounded_marker_text(harness_path, true).is_some_and(|text| text.contains("BHF_FRAMED"))
-    {
-        return HarnessProtocol::BhfFramed;
-    }
-    let mut dirs = Vec::new();
-    if let Some(parent) = harness_path.parent() {
-        dirs.push(parent.to_path_buf());
-        let id_dir = if parent.file_name().is_some_and(|name| name == "obj") {
-            parent.parent()
-        } else {
-            Some(parent)
-        };
-        if let Some(id) = id_dir.and_then(Path::file_name) {
-            for root in ["generated_harnesses", "harnesses", "auto"] {
-                dirs.push(work_dir.join(root).join(id));
-            }
-        }
-    }
-    let mut readable_c_source = false;
-    for dir in dirs {
-        for name in ["main.c", "main.cpp"] {
-            let path = dir.join(name);
-            if let Some(text) = read_bounded_marker_text(&path, false) {
-                if text.contains("BHF_FRAMED") {
-                    return HarnessProtocol::BhfFramed;
-                }
-                readable_c_source = true;
-            }
-        }
-    }
-    if readable_c_source {
-        HarnessProtocol::LibFuzzerSingleInput
-    } else {
-        HarnessProtocol::StdinEventLog
-    }
+    crate::protocol_detect::detect(runner.harness_path(), &[work_dir]).protocol
+}
+
+/// What to tell the operator about a `-fsanitize=fuzzer` binary that has no bhf
+/// driver: bhf runs it on one input file per process (so a crash it finds is
+/// the input that caused it), but without bhf's runtime there is no coverage
+/// guidance. Wrapping the fuzz target in bhf's driver gives both.
+fn libfuzzer_binary_note(
+    detection: &crate::protocol_detect::Detection,
+    harness: &Path,
+) -> Option<String> {
+    (detection.basis == crate::protocol_detect::ProtocolBasis::LibFuzzerBinary).then(|| {
+        format!(
+            "{} is a libFuzzer (-fsanitize=fuzzer) binary without bhf's driver: bhf runs it \
+             on one input file per process, without coverage guidance. For coverage-guided \
+             fuzzing, wrap the fuzz target with `bhf generate-harness <fuzz_target.cc> \
+             --target LLVMFuzzerTestOneInput`, build that harness and fuzz it instead.",
+            harness.display()
+        )
+    })
 }
 
 /// Whether this is an Ada harness whose target+harness compile was instrumented
@@ -5250,18 +5237,37 @@ fn apply_fuzz_child_env_overrides(extra_env: &mut Vec<(String, String)>) {
     // the failed check (`report_error_type=1`): without them a UBSan report is a
     // single `file:line:col: runtime error:` line with no function to name as
     // the sink and nothing but its rule to tell one defect from another.
-    if !extra_env.iter().any(|(k, _)| k == "ASAN_OPTIONS") {
-        extra_env.push((
+    for (key, value) in sanitizer_child_env(false) {
+        if !extra_env.iter().any(|(k, _)| *k == key) {
+            extra_env.push((key, value));
+        }
+    }
+}
+
+/// The `ASAN_OPTIONS` and `UBSAN_OPTIONS` of a builtin fuzz child (see
+/// [`apply_fuzz_child_env_overrides`]), for every child that must reproduce a
+/// crash the way the fuzz loop saw it: `bhf replay` and minimization. The
+/// operator's inherited values are merged first
+/// and bhf's keys win. `leak` adds `detect_leaks=1`, the key the
+/// `--sanitizers` lanes require, so a leak finding replays with leak detection
+/// on whatever the operator's `ASAN_OPTIONS` says; leak detection is never
+/// turned off.
+pub(crate) fn sanitizer_child_env(leak: bool) -> Vec<(String, String)> {
+    let asan_required = if leak {
+        "abort_on_error=1:halt_on_error=1:detect_leaks=1"
+    } else {
+        "abort_on_error=1:halt_on_error=1"
+    };
+    vec![
+        (
             "ASAN_OPTIONS".to_owned(),
             multicore_fuzz::merge_sanitizer_options(
                 std::env::var("ASAN_OPTIONS").ok().as_deref(),
-                "abort_on_error=1:halt_on_error=1",
+                asan_required,
             ),
-        ));
-    }
-    if !extra_env.iter().any(|(k, _)| k == "UBSAN_OPTIONS") {
-        extra_env.push(("UBSAN_OPTIONS".to_owned(), ubsan_child_options()));
-    }
+        ),
+        ("UBSAN_OPTIONS".to_owned(), ubsan_child_options()),
+    ]
 }
 
 /// The `UBSAN_OPTIONS` of every child that must report UBSan findings the way
@@ -6302,7 +6308,8 @@ pub(crate) fn replay_input_testcases(
 }
 
 /// Replay-verify a C/C++ sanitizer crash (#388): re-run the input in a fresh
-/// process and confirm it reproduces a sanitizer crash with the same `rule_id`.
+/// process and confirm it reproduces the same sanitizer crash (rule, kind and
+/// sink or reported site, see [`crate::crash_identity::same_crash`]).
 /// A passthrough libFuzzer harness can corrupt allocator state across inputs
 /// and crash in driver glue even on empty input; those faults do not reproduce
 /// and must not be reported (libFuzzer/AFL find zero on that class).
@@ -6333,11 +6340,12 @@ fn sanitizer_crash_reproduces(
         rss_limit_mb,
         deadline,
     ) {
+        // The same crash: rule, kind and sink (or reported site), compared
+        // the way `bhf replay` compares a reproduction with its finding.
         Ok(rerun) => rerun
             .sanitizer
             .as_ref()
-            .map(|fresh| fresh.rule_id == report.rule_id)
-            .unwrap_or(false),
+            .is_some_and(|fresh| crate::crash_identity::same_crash(report, fresh)),
         Err(_) => false,
     }
 }
@@ -8154,6 +8162,34 @@ mod auto_path_tests {
         ));
     }
 
+    /// The fresh-process confirmation is a reproduction only when the re-run
+    /// crashes at the same sink, not merely with the same rule.
+    #[test]
+    #[cfg(unix)]
+    fn sanitizer_crash_reproduces_requires_the_same_sink() {
+        use std::os::unix::fs::PermissionsExt;
+        let work = tmpdir();
+        let elsewhere = work.join("elsewhere");
+        fs::write(
+            &elsewhere,
+            "#!/bin/sh\n>&2 echo 'ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1'\n\
+             >&2 echo '    #0 0x1 in other_parse /src/p.c:30'\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o755)).unwrap();
+        let report = sanitizer_report("BHF-201", vec!["real_parse"]);
+        assert!(!sanitizer_crash_reproduces(
+            &replay_min::HarnessRunner::direct(elsewhere),
+            &work,
+            b"x",
+            &report,
+            &[],
+            Duration::from_secs(5),
+            0,
+            None,
+        ));
+    }
+
     #[cfg(unix)]
     fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
@@ -9455,6 +9491,86 @@ mod auto_path_tests {
         assert_eq!(
             resolve_harness_protocol(&replay_min::HarnessRunner::direct(plain), &work),
             HarnessProtocol::StdinEventLog
+        );
+    }
+
+    /// A binary with `marker` compiled in, past the first 4 KiB.
+    fn binary_with(marker: &[u8]) -> Vec<u8> {
+        let mut bytes = b"\x7fELF\x02\x01\x01\0".to_vec();
+        bytes.resize(64 * 1024, 0);
+        bytes.extend_from_slice(marker);
+        bytes
+    }
+
+    /// A bhf driver binary staged alone (no `main.c`/`main.cpp` anywhere) still
+    /// gets the framed protocol, and with it the coverage map.
+    #[test]
+    fn protocol_resolution_reads_the_marker_compiled_into_a_staged_binary() {
+        let work = tmpdir();
+        let dir = work.join("build/H-PREBUILT");
+        fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join("main");
+        fs::write(&binary, binary_with(b"BHF_FRAMED\0BHF_COV_SHM\0")).unwrap();
+        assert_eq!(
+            resolve_harness_protocol(&replay_min::HarnessRunner::direct(binary), &work),
+            HarnessProtocol::BhfFramed
+        );
+    }
+
+    /// A hand-compiled `-fsanitize=fuzzer` binary takes one input file per
+    /// process; on stdin it would run libFuzzer's own loop.
+    #[test]
+    fn protocol_resolution_runs_a_libfuzzer_binary_on_one_input_file() {
+        let work = tmpdir();
+        let dir = work.join("build/H-LF");
+        fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join("main");
+        fs::write(
+            &binary,
+            binary_with(b"INFO: libFuzzer ignores flags that start with '--'\0"),
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_harness_protocol(&replay_min::HarnessRunner::direct(binary), &work),
+            HarnessProtocol::LibFuzzerSingleInput
+        );
+    }
+
+    /// The operator is told why a libFuzzer binary gets no coverage and how to
+    /// wrap it; a bhf harness gets no such note.
+    #[test]
+    fn libfuzzer_binary_note_names_the_wrapping_command() {
+        let work = tmpdir();
+        let dir = work.join("build/H-LFNOTE");
+        fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join("main");
+        fs::write(&binary, binary_with(b"libFuzzer ignores flags\0")).unwrap();
+        let detection = crate::protocol_detect::detect(&binary, &[&work]);
+        let note = libfuzzer_binary_note(&detection, &binary).expect("note");
+        assert!(note.contains("without coverage guidance"), "{note}");
+        assert!(note.contains("--target LLVMFuzzerTestOneInput"), "{note}");
+        fs::write(&binary, binary_with(b"BHF_FRAMED\0")).unwrap();
+        let detection = crate::protocol_detect::detect(&binary, &[&work]);
+        assert!(libfuzzer_binary_note(&detection, &binary).is_none());
+    }
+
+    /// A `bhf.project.v1` native target declares the framed input mode; the
+    /// fuzz lane uses it instead of guessing from a stripped binary.
+    #[test]
+    fn protocol_resolution_honours_a_declared_framed_input_mode() {
+        let work = tmpdir();
+        let dir = work.join("build/attrs");
+        fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join("main");
+        fs::write(&binary, b"\x7fELF\0stripped").unwrap();
+        fs::write(
+            dir.join("harness-protocol.json"),
+            r#"{"schema_version":1,"input_mode":"framed"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_harness_protocol(&replay_min::HarnessRunner::direct(binary), &work),
+            HarnessProtocol::BhfFramed
         );
     }
 

@@ -390,6 +390,93 @@ armed under cross-compiled or emulated (qemu/wine) runs. Those configurations
 still fuzz for their documented coverage/crash/exception signals; the
 LD_PRELOAD behavioral and taint findings are the unavailable layer.
 
+## Replaying a Finding
+
+`bhf replay --finding <id-or-dir>` re-runs a finding's testcase against its
+harness and says whether the recorded crash reproduced. The first line is still
+`MATCH` (stdout, exit `0`) or `MISMATCH recorded=<rule> actual=<rule>` (stderr,
+exit `3`); errors exit `1`. Under it comes a summary of what ran:
+
+```text
+MATCH
+  finding    F-0003-9c1d22e0 (bhf_work/results/findings/F-0003-9c1d22e0)
+  compared   rule BHF-201; kind heap-buffer-overflow; sink Widget::copy_at (widget/widget.cc:12)
+  crash      BHF-201 heap-buffer-overflow (asan): ERROR: AddressSanitizer: heap-buffer-overflow on address 0x602000000031 ...
+  sink       Widget::copy_at (widget/widget.cc:12)
+  frames     #0 Widget::copy_at(char const*, unsigned long) /src/widget/widget.cc:12
+             #1 parse_record(char const*) /src/widget/parse.cc:40
+  access     WRITE of size 1 at 0x602000000031; 0 bytes after a 1-byte heap region (offset 1)
+  allocated  #0 malloc
+             #1 parse_record(char const*) /src/widget/parse.cc:38
+  exit       signal 6 (SIGABRT) after 0.05s
+  harness    bhf_work/harnesses/H-C0001/main (bhf framed: ...); sha256 matches the recorded build
+  testcase   .../testcase.bin, 12 bytes, sha256 0f1e2d3c4b5a6978
+```
+
+- **Matching.** A replay is a `MATCH` only when the rule, the crash kind and
+  the place match: the sink (the top project frame, chosen as for
+  `actionability.sink`, compared by function and `file:line`) or, for a finding
+  recorded without frames (a UBSan report from an earlier release), the site
+  the sanitizer printed. A crash of the same rule elsewhere is a `MISMATCH`
+  whose `differs=` field and `differs` line name what differed. Rules and
+  kinds earlier releases gave the same report still match. A hang is reported
+  as `actual=<timeout>` after 10 s, a clean exit as `actual=<none>` with its
+  exit status. A replayed report that names no function and no source position
+  (an unsymbolized one) is not another site: the location shows as "not
+  compared" and a `note` line says the replay looks unsymbolized. Replay puts
+  the LLVM toolchain `bhf auto` uses on `PATH` (the RHEL 7 LLVM Toolset when
+  the base `clang` lacks SanitizerCoverage); elsewhere put `llvm-symbolizer` on
+  `PATH` or set `ASAN_SYMBOLIZER_PATH`.
+- **Build identity.** When the harness's sha256 differs from the finding's
+  `build.binary.sha256`, the harness line says so.
+- **`--json`** prints one `bhf.replay.v1` document on stdout instead: `verdict`,
+  every compared field (`compared[]` with `outcome`: `equal`, `legacy`,
+  `differs`, `not_recorded` or `not_comparable`), `differences`, `notes`, the
+  replayed `crash` (rule, kind, sink, frames, `access` region, allocation
+  frames), `exit` (code, signal, `timed_out`, duration), `harness` (path,
+  protocol and why, sha256) and `testcase`. Exit codes are unchanged.
+- **`--show-output`** also prints the harness's raw stderr and stdout (the full
+  sanitizer report).
+- **Other finding kinds.** Binary, session, collector and transport findings
+  print the same kind of summary under their `MATCH`/`MISMATCH` line, for what
+  their replay compares: a binary target's crash, oracle or postcondition
+  signature with its exit status, binary sha256 and any sanitizer report; the
+  session oracle verdict; the collector oracle signature re-evaluated over the
+  stored evidence, with the attributing event and process tree; the transport
+  fault identity (rule and fault site) or deadline predicate. `--json` prints
+  the same `bhf.replay.v1` document with `lane` (`binary`, `session`,
+  `collector` or `transport`) and `details`; `harness` is present only for a
+  binary finding. `--show-output` prints a binary target's stderr; the other
+  lanes run no local harness. An Ada (event-log) replay shows the harness exit
+  status and duration, and compares event-log signatures.
+- **Sanitizer options.** C/C++ replays use the fuzz child's options:
+  `ASAN_OPTIONS` gets `abort_on_error=1:halt_on_error=1` (plus `detect_leaks=1`
+  for a leak finding) and `UBSAN_OPTIONS` also `print_stacktrace=1` and
+  `report_error_type=1`, merged after your own values. Leak detection is never
+  turned off.
+- **Harness resolution.** Without `--harness`, the finding's `fixture_path` is
+  used. bhf records it relative to the work dir and resolves it there, never
+  relative to the current directory; an absolute path from an earlier release
+  is first mapped into the work dir holding the finding, so a copied or moved
+  work dir runs its own harness. Then `harness_id` is looked up under
+  `harnesses/`, `auto/`, `generated_harnesses/` and `build/`. Only when none of
+  those exists is an absolute `fixture_path` into another work dir used as
+  recorded.
+- **Protocol.** `bhf fuzz`, `bhf replay` and `bhf minimize` decide how a
+  harness takes its input the same way: a `harness-protocol.json` next to the
+  binary (written by `bhf project run`), the `BHF_FRAMED` marker in a launcher
+  script, a bhf `main.c`/`main.cpp` beside the binary or in any harness dir of
+  the work dir, bhf's driver strings compiled into the binary (so a binary that
+  `bhf build` staged alone into `build/<id>/main` still replays; an Ada
+  harness, which also reads `BHF_FRAMED`, is told apart by the version string
+  GNAT's binder puts in every Ada main), a plain libFuzzer source, or the
+  libFuzzer runtime in the binary. The summary's harness line names the
+  protocol and why.
+- **Results stay current.** A `MATCH` stamps `last_seen` in `finding.json`; when
+  the work dir has a results index, replay rebuilds it so
+  `results/findings.json` and `results/attestation.json` match the files on
+  disk. This holds for every kind of finding. A `MISMATCH` changes nothing.
+
 ## Crash → PoC, Explanation, and One-Shot Fuzzing
 
 Beyond the core pipeline, these commands turn a finding into a portable proof
@@ -680,7 +767,13 @@ it exits `1`.
 rejects them. C/C++ generated harnesses do expose `LLVMFuzzerTestOneInput` and
 are built as libFuzzer-style sanitizer binaries, but BHF's built-in engine
 runs those binaries one input at a time so it can normalize sanitizer findings;
-there is no separate `libfuzzer` runtime path through this flag. The standalone
+there is no separate `libfuzzer` runtime path through this flag. A binary you
+compiled yourself with `-fsanitize=fuzzer` and placed at `build/<id>/main` is
+recognised by the libFuzzer runtime in it and run on one input file per
+process, so a crash it finds is recorded with the input that caused it. It gets
+no coverage guidance without bhf's runtime, and `bhf fuzz` says so: wrap the
+fuzz target with `bhf generate-harness <fuzz_target.cc> --target
+LLVMFuzzerTestOneInput`, build that harness and fuzz it instead. The standalone
 libFuzzer/LibAFL/Nyx adapters are not reachable through `bhf fuzz --engine`,
 and the Ada libFuzzer adapter remains deferred until users have a viable
 Ada/LLVM/libFuzzer toolchain.
@@ -982,6 +1075,12 @@ Every path in the manifest is resolved relative to the manifest's own directory.
 By default a path may not escape that directory (`..`) or be absolute; pass
 `--allow-external-paths` to opt in. `--json` emits a machine-readable
 validation/provenance report on any of the three subcommands.
+
+**Input mode.** A `builtin` target's binary is staged into
+`<work>/build/<id>/main` with a `harness-protocol.json` beside it declaring the
+target's input mode (`framed`). `bhf fuzz` (and later `bhf replay` and
+`bhf minimize`) use it instead of re-detecting the protocol from the binary, so
+a prebuilt bhf harness gets the framed protocol and its coverage map.
 
 **Trust boundary.** The manifest is only ever loaded through an explicit
 `--manifest` path — there is no auto-discovery. `validate` and `list` never

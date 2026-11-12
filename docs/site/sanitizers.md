@@ -53,7 +53,10 @@ inherited `<SAN>_OPTIONS` with the keys it requires (`abort_on_error`,
 win (you cannot accidentally disable `abort_on_error`, which is what turns a
 sanitizer report into a saved finding). `UBSAN_OPTIONS` also always gets
 `print_stacktrace=1` and `report_error_type=1`, during fuzzing, minimization,
-`bhf replay` and in the generated `replay.py`: UBSan then prints the stack of
+`bhf replay` and in the generated `replay.py`. Minimization and `bhf replay`
+run C/C++ harnesses with the same `ASAN_OPTIONS` and `UBSAN_OPTIONS` as a fuzz
+child (a leak finding also gets `detect_leaks=1`;
+leak detection is never turned off). UBSan then prints the stack of
 each report and names the failed check (`missing-return`,
 `invalid-shift-exponent`, ...) on its `SUMMARY:` line. Each sanitizer is merged independently, so
 per-sanitizer suppressions land in the right variable:

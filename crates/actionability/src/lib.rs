@@ -1710,6 +1710,14 @@ pub fn is_harness_frame(function: &str, file: Option<&str>) -> bool {
     })
 }
 
+/// The sink of a finding record: the top project frame on its crash stack,
+/// chosen as for `actionability.sink`, else its oracle or message location.
+/// For callers that compare a reproduced crash with a recorded one using the
+/// same selection rules.
+pub fn sink_for_finding(raw: &Value) -> Option<Sink> {
+    sink_from(raw)
+}
+
 /// Where execution goes wrong: the top project frame on the crash stack. Skips
 /// sanitizer-runtime frames, allocator primitives, and the bhf harness.
 /// Prefers the topmost frame that resolved to a source file (`Sink.file`/`line`

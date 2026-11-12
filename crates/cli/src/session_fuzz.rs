@@ -835,28 +835,47 @@ fn build_live_transport(meta: &SessionArtifactMeta) -> Result<TcpSessionTranspor
 /// `bhf replay` of a session finding: re-drive the recorded session against a
 /// freshly reset transport (re-capturing a fresh handle) and report whether it
 /// still reaches the oracle verdict.
-pub(crate) fn replay_session_finding(finding_dir: &Path) -> i32 {
-    match replay_session_inner(finding_dir) {
-        Ok(true) => {
-            let _ = corpus::finding::touch_last_seen(finding_dir, "replay");
-            println!("MATCH");
-            0
-        }
-        Ok(false) => {
-            bhfeprintln!("MISMATCH: the recorded session no longer reaches the oracle verdict");
-            3
-        }
-        Err(error) => {
-            bhfeprintln!("error: {error}");
-            1
-        }
-    }
-}
-
-fn replay_session_inner(finding_dir: &Path) -> Result<bool, String> {
+pub(crate) fn replay_session_outcome(
+    finding_dir: &Path,
+) -> Result<crate::replay::LaneReplay, String> {
     let (testcase, model, meta) = load_session_finding(finding_dir)?;
     let mut transport = build_live_transport(&meta)?;
-    replay_reproduces(&model, &testcase, &meta, &mut transport)
+    let verdict = replay_verdict(&model, &testcase, &mut transport)?;
+    let matched = verdict_reproduces(&verdict, &meta);
+    let rule = meta.rule_id.as_deref().unwrap_or("<none>");
+    let replayed = match &verdict {
+        SessionVerdict::Finding {
+            oracle, rule_id, ..
+        } => format!(
+            "oracle {oracle} fired with rule {}",
+            rule_id.as_deref().unwrap_or("<none>")
+        ),
+        SessionVerdict::Clean => "no oracle fired".to_owned(),
+    };
+    Ok(crate::replay::LaneReplay {
+        lane: "session",
+        matched,
+        status_line: if matched {
+            "MATCH".to_owned()
+        } else {
+            "MISMATCH: the recorded session no longer reaches the oracle verdict".to_owned()
+        },
+        compared: format!("session oracle {} with rule {rule}", meta.oracle),
+        differences: if matched {
+            Vec::new()
+        } else {
+            vec![format!(
+                "verdict: recorded oracle {} with rule {rule}, replayed {replayed}",
+                meta.oracle
+            )]
+        },
+        details: vec![crate::replay::Detail::new(
+            "transport",
+            format!("{} (reset {})", meta.transport, meta.reset),
+        )],
+        history: "replay",
+        ..Default::default()
+    })
 }
 
 /// Whether `verdict` reproduces the SAME oracle finding that the metadata
@@ -878,19 +897,32 @@ fn verdict_reproduces(verdict: &SessionVerdict, meta: &SessionArtifactMeta) -> b
     }
 }
 
+/// Re-drive `testcase` against `transport` and return the verdict it reaches.
+fn replay_verdict(
+    model: &ProtocolModel,
+    testcase: &SessionTestcase,
+    transport: &mut dyn SessionTransport,
+) -> Result<SessionVerdict, String> {
+    let runner = SessionRunner::new(model);
+    let run = runner
+        .replay(testcase, transport)
+        .map_err(|e| format!("replay session: {e}"))?;
+    Ok(run.verdict)
+}
+
 /// Re-drive `testcase` against `transport` and report whether it reproduces the
 /// recorded oracle finding (not merely *some* finding).
+#[cfg(test)]
 fn replay_reproduces(
     model: &ProtocolModel,
     testcase: &SessionTestcase,
     meta: &SessionArtifactMeta,
     transport: &mut dyn SessionTransport,
 ) -> Result<bool, String> {
-    let runner = SessionRunner::new(model);
-    let run = runner
-        .replay(testcase, transport)
-        .map_err(|e| format!("replay session: {e}"))?;
-    Ok(verdict_reproduces(&run.verdict, meta))
+    Ok(verdict_reproduces(
+        &replay_verdict(model, testcase, transport)?,
+        meta,
+    ))
 }
 
 /// `bhf minimize` of a session finding: shrink the message sequence and the
