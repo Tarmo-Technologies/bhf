@@ -153,6 +153,47 @@
   no longer turns a UBSan finding into a frameless report and `exit status: 0`.
   The script exits with the harness's status, 128 plus the signal for a
   harness killed by one.
+- Comparison evidence searches inputs longer than 32 bytes for operands
+  computed from input bytes (folded range checks such as `width - 1 > 31`):
+  first the bytes the harness decodes its scalar parameters from
+  (`arg-layout.json`), then byte ranges halved down to the bytes that change a
+  comparison, within 256 replays. `finding.json` `gate_capture` records how far
+  the search got (`derived_search` `done`, `partial` or `too_long`, with
+  `searched_bytes`), and `bhf explain` says `range checks computed from input
+  bytes were searched in N of M bytes` whenever it did not cover the input,
+  also beside the comparisons it did find. A capture recorded before this
+  reads as not searched past 32 bytes.
+- Under AddressSanitizer, a `memcmp`/`bcmp` gate is placed at the target's call
+  instead of the sanitizer's interceptor: the driver records the return
+  addresses above the interceptor (comparison-evidence record format version 2;
+  version 1 files still read), the first frame that is not the sanitizer
+  runtime becomes the site, a `memcmp` made by harness code is left out like
+  any harness comparison, and one made by a shared library is dropped. When no
+  frame resolves, `bhf explain` and its argument tags say `site not
+  attributable (sanitizer interceptor)` instead of an address
+  (`gates[].site_unattributable`).
+- A parameter whose type is a pointer typedef to bytes or characters is a byte
+  buffer for ranking and input reachability: the Win32 spellings `LPCBYTE`,
+  `PCBYTE`, `PCUCHAR`, `LPBYTE`, `PBYTE`, `PUCHAR`, `LPCSTR` and `PCSTR`
+  (one shared table, `type_model::BYTE_POINTER_TYPEDEFS`), and a project's
+  own (`typedef const octet_t *rbuf_t`), read-only when the typedef's pointee
+  is `const`. Such entries were `reachability_unproven`/`lab_only`; they now
+  rank and classify like `const uint8_t *` (a ranking change; the discovery
+  cache is rebuilt once).
+- `bhf explain` describes the input it shows: when that is a
+  `min_testcase.bin` with other bytes than `testcase.bin`, HARNESS ARGUMENTS
+  decodes each parameter from it with `arg-layout.json` (one that cannot be
+  decoded statically reads `(not decodable statically; testcase.bin:
+  <value>)`), the memory access says `(recorded on testcase.bin, N bytes)`, and
+  WHAT HAPPENED names the shown file instead of `testcase.bin`.
+- `learned_dictionary.txt` holds the comparison constants observed at runtime,
+  not the mutated inputs compared with them: an operand that met more distinct
+  values at one comparison site than any of those values met there (so the
+  input compared with each entry of a keyword table is not kept), or one that
+  `dictionary.txt` lists, without one-byte variants of a stronger token. The
+  driver's cmplog records name their site (`"s"`); a record without one (the
+  runtrace shim's, an older driver's) only confirms a `dictionary.txt` token.
+  A file an earlier release wrote keeps only the tokens confirmed this way.
 - `bhf explain`'s HARNESS ARGUMENTS table no longer tags the length of a
   `(buffer, length)` pair `[compared at ...]`: it holds the input's size
   (`arg-layout.json` decoder `input_length`), not input bytes, although its
@@ -891,6 +932,29 @@
   `bhf replay` and `bhf minimize` do.
 - `FidelityFacts` has two more fields, `target_triple` and `runner`, for a
   cross-built target run under user-mode emulation.
+- The input reachability verdict records what it was inferred from:
+  `finding.json` `input_reachability_basis` `{rule, param, spelled_type,
+  resolved_type, typedefs_resolved}` (`rule` is `const_byte_buffer`,
+  `parser_name_with_length`, `mutable_parser_buffer`, `byte_scalar_parser`,
+  `output_serializer`, `no_input_shape`, `call_graph_provenance` or
+  `internal_linkage`), carried into `results/findings.json` as
+  `reachability.reachability_basis`. `bhf explain` names the parameter and its
+  types (``because parameter `buf` (`const u8_t *`, resolves to `const uint8_t
+  *`) is a read-only byte buffer``), says when an unproven verdict read the
+  types with their typedefs resolved, and says when a `static` entry has
+  internal linkage.
+- `results/findings.json` `fuzz.input_to_state_status`,
+  `fuzz.input_to_state_reason` and `fuzz.input_to_state_search` say whether a
+  comparison-evidence capture ran, why it found no gate, and how far its
+  search for computed operands got; `findings.csv` gains an
+  `input_to_state_status` column at the end, and INDEX.md says why a finding
+  has no compared input bytes. The schema fields are additive and optional.
+- A finding whose input is empty or all zero bytes, or whose method ran on an
+  object bhf's harness constructed (a default constructor, a factory or
+  decoded constructor arguments, now in `finding.json` `decoded_args`'s
+  receiver entry as `decoder`), carries a caveat that real callers may never
+  produce that state, beside the reachability verdict in `bhf explain` and in
+  the results `fidelity.caveats` (INDEX.md `Caveat:`).
 - `bhf capsule`, `bhf verify-poc` and `bhf env-capsule` support every harness
   language bhf generates, through per-language lanes: Ada, Rust, Go, Java, C#,
   Python, JavaScript, TypeScript, Ruby, Perl, PHP, Lua, COBOL and Fortran, as

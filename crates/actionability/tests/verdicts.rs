@@ -888,16 +888,95 @@ fn reachability_statement_names_its_basis() {
     );
     let unproven = statement("lab_only", Some("reachability_unproven"));
     assert!(unproven.contains("unproven"), "{unproven}");
-    // The classifier does not resolve typedefs, so the wording says what it
-    // read (the signature as spelled) and never that no parameter is a byte
-    // buffer: `frame_buf_t frame` may well be one.
+    // Without a recorded basis nothing says whether typedefs were resolved,
+    // and the wording never says no parameter is a byte buffer.
     assert!(
-        unproven.contains("the signature of the entry `parse_record`, as spelled"),
+        unproven.contains(
+            "the signature of the entry `parse_record` does not match an input-taking shape"
+        ),
         "{unproven}"
     );
+    assert!(!unproven.contains("as spelled"), "{unproven}");
     assert!(!unproven.contains("no parameter"), "{unproven}");
     assert_eq!(statement("", None), "not assessed");
     for text in [inferred, unassessed, unproven] {
         assert!(!text.contains("attacker-reachable"), "{text}");
     }
+
+    // With the basis the classifier recorded, the verdict names the
+    // parameter and its type as spelled and resolved.
+    let with_basis = |verdict: &str, label: &str, basis: serde_json::Value| {
+        let raw = json!({ "harness_id": "H-C0001", "actionability": { "verdict": verdict },
+            "input_reachability": label, "input_reachability_basis": basis });
+        actionability::reachability_statement(&raw, Some("parse_record"))
+    };
+    let named = with_basis(
+        "likely_reachable",
+        "attacker_reachable",
+        json!({"rule": "const_byte_buffer", "param": "buf", "spelled_type": "const u8_t *",
+               "resolved_type": "const uint8_t *", "typedefs_resolved": true}),
+    );
+    assert!(
+        named.contains(
+            "matches an input-taking shape because parameter `buf` (`const u8_t *`, resolves to \
+             `const uint8_t *`) is a read-only byte buffer, so likely reachable from input; not \
+             proven"
+        ),
+        "{named}"
+    );
+    let resolved_unproven = with_basis(
+        "lab_only",
+        "reachability_unproven",
+        json!({"rule": "no_input_shape", "typedefs_resolved": true}),
+    );
+    assert!(
+        resolved_unproven.contains(
+            "the signature of the entry `parse_record`, with its typedefs resolved, does not \
+             match an input-taking shape"
+        ),
+        "{resolved_unproven}"
+    );
+    let internal = with_basis(
+        "lab_only",
+        "reachability_unproven",
+        json!({"rule": "internal_linkage", "param": "buf", "spelled_type": "const uint8_t *"}),
+    );
+    assert!(
+        internal.contains("`parse_record` has internal linkage (`static`)"),
+        "{internal}"
+    );
+}
+
+/// An input that is empty or all zero bytes, or a method run on an object
+/// bhf's harness built, is a state real callers may never produce: each gets
+/// its own caveat. A plain function on a non-zero input gets none.
+#[test]
+fn constructed_states_get_a_caveat() {
+    let plain = json!({"rule_id": "BHF-201", "harness_id": "H-C0001"});
+    assert!(actionability::harness_state_caveats(&plain, Some(b"\x01\x02")).is_empty());
+    assert!(actionability::harness_state_caveats(&plain, None).is_empty());
+    for input in [&b""[..], &b"\x00\x00\x00\x00"[..]] {
+        let caveats = actionability::harness_state_caveats(&plain, Some(input));
+        assert_eq!(caveats.len(), 1, "{caveats:?}");
+        assert!(
+            caveats[0].contains(
+                "a real caller may never pass all-zero arguments; check that one can before \
+                 treating this as reachable"
+            ),
+            "{caveats:?}"
+        );
+    }
+    let method = json!({"rule_id": "BHF-201", "harness_id": "H-X0001", "decoded_args": [
+        {"name": "receiver", "type": "Widget", "role": "receiver", "decoder": "default constructor"},
+        {"name": "n", "type": "int", "role": "param", "value": "3", "span": [0, 4]}
+    ]});
+    let caveats = actionability::harness_state_caveats(&method, Some(b"\x03\x00\x00\x00"));
+    assert_eq!(
+        caveats,
+        vec![
+            "the method ran on an object bhf's harness constructed (default constructor); real \
+             callers may never put the object in that state"
+                .to_owned()
+        ]
+    );
 }

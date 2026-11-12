@@ -5,7 +5,7 @@ use crate::model::FindingsDocument;
 
 /// Columns after `evidence_dir` were added later; they stay at the end so a
 /// reader that addresses columns by position keeps working.
-pub const CSV_HEADER: &str = "id,kind,severity,confidence,confirmation,rule_id,cwe,title,file,line,function,group,occurrences,verdict,vuln_id,purl,first_seen,evidence_dir,access,access_size,region_size,region_offset,input_to_state,input_to_state_input,arguments,access_parameter,build_fidelity";
+pub const CSV_HEADER: &str = "id,kind,severity,confidence,confirmation,rule_id,cwe,title,file,line,function,group,occurrences,verdict,vuln_id,purl,first_seen,evidence_dir,access,access_size,region_size,region_offset,input_to_state,input_to_state_input,arguments,access_parameter,build_fidelity,input_to_state_status";
 
 /// Longest `arguments` cell, in characters.
 pub const ARGUMENTS_CELL_MAX: usize = 200;
@@ -71,6 +71,10 @@ pub fn render_csv(doc: &FindingsDocument) -> String {
                 .map(|p| p.name.clone())
                 .unwrap_or_default(),
             build_fidelity_cell(f),
+            f.fuzz
+                .as_ref()
+                .and_then(|fuzz| fuzz.input_to_state_status.clone())
+                .unwrap_or_default(),
         ];
         out.push_str(&row.iter().map(|v| cell(v)).collect::<Vec<_>>().join(","));
         out.push('\n');
@@ -185,16 +189,20 @@ mod tests {
         assert!(
             fuzz.ends_with(
                 ",findings/F-0000-1a2b3c4d,read,4,12,12,0:4:memcmp:48445231,min_testcase.bin,\
-                 data=len 12 hex 48445231;flags=7,data,"
+                 data=len 12 hex 48445231;flags=7,data,,recorded"
             ),
             "{fuzz}"
         );
+        assert!(CSV_HEADER.ends_with(",build_fidelity,input_to_state_status"));
         let sca = lines.next().unwrap();
         assert!(
             sca.contains(",CVE-2026-0001,pkg:npm/example@2.4.2,"),
             "{sca}"
         );
-        assert!(sca.ends_with(",,,,,,,,,"), "no fuzz columns for SCA: {sca}");
+        assert!(
+            sca.ends_with(",,,,,,,,,,"),
+            "no fuzz columns for SCA: {sca}"
+        );
         assert_eq!(lines.next(), None);
     }
 
@@ -262,7 +270,7 @@ mod tests {
         let out = render_csv(&doc);
         let fuzz = out.lines().nth(1).unwrap();
         assert!(
-            fuzz.ends_with(",\"reduced: macro WIDGET_SLOTS=0, header tables.h\""),
+            fuzz.ends_with(",\"reduced: macro WIDGET_SLOTS=0, header tables.h\",recorded"),
             "{fuzz}"
         );
         assert_eq!(

@@ -709,6 +709,19 @@ fn reachability_for_linkage(
     reachability
 }
 
+/// The basis of [`reachability_for_linkage`]'s verdict: an input shape of a
+/// `static` function is `internal_linkage`, keeping the parameter it found.
+fn basis_for_linkage(
+    reachability: target_rank::InputReachability,
+    mut basis: target_rank::ReachabilityBasis,
+    is_static: bool,
+) -> target_rank::ReachabilityBasis {
+    if reachability_for_linkage(reachability, is_static) != reachability {
+        basis.rule = "internal_linkage".to_owned();
+    }
+    basis
+}
+
 pub fn discover(root: &Path) -> Result<Vec<Candidate>> {
     discover_with_dir_filter(root, &DirFilter::default())
 }
@@ -2055,6 +2068,7 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
                     // Ada is ranked by the structural scorer, not the C/C++
                     // byte-buffer shape classifier; no verdict computed here.
                     input_reachability: None,
+                    input_reachability_basis: None,
                     dialect,
                 });
             }
@@ -2181,6 +2195,11 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
                         tgt.input_reachability,
                         is_static,
                     )),
+                    input_reachability_basis: Some(basis_for_linkage(
+                        tgt.input_reachability,
+                        tgt.input_reachability_basis,
+                        is_static,
+                    )),
                     dialect: Some(target_dialect),
                 });
             }
@@ -2297,6 +2316,11 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
                         tgt.input_reachability,
                         is_static,
                     )),
+                    input_reachability_basis: Some(basis_for_linkage(
+                        tgt.input_reachability,
+                        tgt.input_reachability_basis,
+                        is_static,
+                    )),
                     dialect,
                 });
             }
@@ -2328,6 +2352,7 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
                     is_static: tgt.is_static,
                     foreign_guard: tgt.foreign_guard,
                     input_reachability: Some(tgt.input_reachability),
+                    input_reachability_basis: None,
                     dialect,
                 });
             }
@@ -2355,6 +2380,7 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
                     is_static: tgt.is_static,
                     foreign_guard: None,
                     input_reachability: Some(tgt.input_reachability),
+                    input_reachability_basis: None,
                     dialect,
                 });
             }
@@ -2394,6 +2420,7 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
                     is_static: tgt.is_static,
                     foreign_guard: None,
                     input_reachability: Some(tgt.input_reachability),
+                    input_reachability_basis: None,
                     dialect,
                 });
             }
@@ -2419,6 +2446,7 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
                     is_static: tgt.is_static,
                     foreign_guard: None,
                     input_reachability: Some(tgt.input_reachability),
+                    input_reachability_basis: None,
                     dialect,
                 });
             }
@@ -2452,6 +2480,7 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
                     is_static: tgt.is_static,
                     foreign_guard: None,
                     input_reachability: Some(tgt.input_reachability),
+                    input_reachability_basis: None,
                     dialect,
                 });
             }
@@ -2477,6 +2506,7 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
                     is_static: false,
                     foreign_guard: None,
                     input_reachability: Some(target_rank::InputReachability::AttackerReachable),
+                    input_reachability_basis: None,
                     dialect,
                 });
             }
@@ -2501,6 +2531,7 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
                     is_static: false,
                     foreign_guard: None,
                     input_reachability: Some(target_rank::InputReachability::AttackerReachable),
+                    input_reachability_basis: None,
                     dialect,
                 });
             }
@@ -2526,6 +2557,7 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
                     is_static: false,
                     foreign_guard: None,
                     input_reachability: Some(target_rank::InputReachability::AttackerReachable),
+                    input_reachability_basis: None,
                     dialect,
                 });
             }
@@ -2552,6 +2584,7 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
                     is_static: false,
                     foreign_guard: None,
                     input_reachability: Some(target_rank::InputReachability::AttackerReachable),
+                    input_reachability_basis: None,
                     dialect,
                 });
             }
@@ -2572,6 +2605,7 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
                     is_static: false,
                     foreign_guard: None,
                     input_reachability: Some(target_rank::InputReachability::AttackerReachable),
+                    input_reachability_basis: None,
                     dialect,
                 });
             }
@@ -2592,6 +2626,7 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
                     is_static: false,
                     foreign_guard: None,
                     input_reachability: Some(target_rank::InputReachability::AttackerReachable),
+                    input_reachability_basis: None,
                     dialect,
                 });
             }
@@ -2618,6 +2653,7 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
                     is_static: false,
                     foreign_guard: None,
                     input_reachability: Some(target_rank::InputReachability::AttackerReachable),
+                    input_reachability_basis: None,
                     dialect,
                 });
             }
@@ -4261,6 +4297,7 @@ mod tests {
             is_static: false,
             foreign_guard: None,
             input_reachability: None,
+            input_reachability_basis: None,
             dialect: None,
         };
         let mut candidates = vec![
@@ -4790,6 +4827,70 @@ mod tests {
         assert_eq!(
             find("widgets::next_bit").input_reachability,
             Some(target_rank::InputReachability::AttackerReachable)
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A buffer spelled through a pointer typedef to bytes, a project's
+    /// (`typedef const octet_t *rbuf_t`, in the file or a header) or a Win32
+    /// one (`LPCBYTE`), is input; each candidate records the parameter its
+    /// reachability rests on, and a `static` one says why it is unproven.
+    #[test]
+    fn pointer_typedef_buffer_targets_are_discovered_reachable_with_their_basis() {
+        let root = tmpdir();
+        fs::write(
+            root.join("frame_types.h"),
+            "typedef unsigned char octet_t;\ntypedef const octet_t *rbuf_t;\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("frame.c"),
+            "#include \"frame_types.h\"\n\
+             typedef const octet_t *rbuf_t;\n\
+             int check_frame(rbuf_t data, unsigned n) { return data[0] + (int)n; }\n\
+             int check_record(rbuf_t record, unsigned n) { return record[0] + (int)n; }\n\
+             int load_frame(LPCBYTE p, DWORD n) { return p[0] + (int)n; }\n\
+             static int check_inner(rbuf_t data, unsigned n) { return data[0] + (int)n; }\n\
+             int use_inner(rbuf_t data, unsigned n) { return check_inner(data, n); }\n",
+        )
+        .unwrap();
+        let cands = discover(&root).unwrap();
+        let find = |name: &str| {
+            cands
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("{name} not discovered: {cands:?}"))
+        };
+        for (name, param, spelled) in [
+            ("check_frame", "data", "rbuf_t"),
+            ("check_record", "record", "rbuf_t"),
+            ("load_frame", "p", "LPCBYTE"),
+        ] {
+            let candidate = find(name);
+            assert_eq!(
+                candidate.input_reachability,
+                Some(target_rank::InputReachability::AttackerReachable),
+                "{candidate:?}"
+            );
+            let basis = candidate
+                .input_reachability_basis
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name} has a basis: {candidate:?}"));
+            assert_eq!(basis.rule, "const_byte_buffer", "{basis:?}");
+            assert_eq!(basis.param.as_deref(), Some(param), "{basis:?}");
+            assert_eq!(basis.spelled_type.as_deref(), Some(spelled), "{basis:?}");
+        }
+        let inner = find("check_inner");
+        assert_eq!(
+            inner.input_reachability,
+            Some(target_rank::InputReachability::ReachabilityUnproven)
+        );
+        assert_eq!(
+            inner
+                .input_reachability_basis
+                .as_ref()
+                .map(|b| b.rule.as_str()),
+            Some("internal_linkage")
         );
         let _ = fs::remove_dir_all(&root);
     }

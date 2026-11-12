@@ -50,7 +50,9 @@ field summary. `findings.json` always starts with `schema_version`, then
 few bytes. Every key is present (`null` where a value does not apply — never
 omitted), and unknown keys are rejected. Keys added to v1 after its first
 release (`fuzz.access`, `fuzz.access.parameter`, `fuzz.input_to_state`,
-`fuzz.input_to_state_input`, `fuzz.arguments`, the `runtrace` evidence role)
+`fuzz.input_to_state_input`, `fuzz.input_to_state_status`,
+`fuzz.input_to_state_reason`, `fuzz.input_to_state_search`, `fuzz.arguments`,
+the `runtrace` evidence role)
 are optional in the schema, so documents written
 before them still validate; bhf always writes them. A validator holding the
 older schema rejects them. `reproduce.build.fidelity` is optional the same
@@ -96,7 +98,7 @@ records that failed to load — a bad record never aborts the rebuild).
 | `reproduce` | `{harness_id, command, build}` \| null | `build`: `{sanitizers[], binary_sha256, build_id}`, plus `fidelity` when the harness compiled only after bhf supplied inputs the build context lacked; `command` is relative to `results/` |
 | `reproduce.build.fidelity` | `{level, context, fabricated[]}` (optional) | `level` is `reduced`; `context` is where the build context came from (`none`, `exact_tu_compile_database`, ...); each `fabricated` entry is `{kind, name, value}` with `kind` `macro`, `header` or `type`. Such a finding's `confidence.level` is `low` and `fidelity.caveats` names what was fabricated: code compiled against a placeholder macro value or header can take paths the real build never does, so the finding may be false or not reproduce against the real build |
 | `evidence` | `{dir, files[]}` \| null | each file: `{role, path, sha256, size}` — roles: `finding`, `testcase`, `testcase_minimized`, `sanitizer_log`, `decoded`, `replay_script`, `repro_ada`, `byte_control`, `runtrace` (the runtrace events of the replay that recorded the comparison evidence) |
-| `fuzz` | `{exception, classification, harness_id, dialect, oracle, access, input_to_state, arguments}` \| null | `exception`: `{name, message, sanitizer}`; see [Fuzz block](#fuzz-block) |
+| `fuzz` | `{exception, classification, harness_id, dialect, oracle, access, input_to_state, input_to_state_input, input_to_state_status, input_to_state_reason, input_to_state_search, arguments}` \| null | `exception`: `{name, message, sanitizer}`; see [Fuzz block](#fuzz-block) |
 | `static` | `{engine, precision, snippet, baseline_status, triage_state}` \| null | |
 | `sca` | object \| null | `{vuln_id, aliases[], component, fixed_versions[], cvss, kev, references[], match_confidence, matching_method, vex}` |
 | `binary` | `{sha256, build_id, arch, crash}` \| null | |
@@ -107,8 +109,11 @@ records that failed to load — a bad record never aborts the rebuild).
 | Field | Type | Notes |
 |---|---|---|
 | `access` | object \| null | the memory access the sanitizer reported: `{direction, size, address_hint, region, alloc_stack[], free_stack[], parameter}`. `direction` is `read`, `write` or `unknown`; `region` is `{kind, size, offset, relation, distance, variable, frame_offset}` (`kind` `heap`, `stack` or `global`; `offset` negative before the object, `>= size` past it). `parameter` is the harness parameter whose buffer the access hit, `{name, offset, basis}`, from `finding.json` `exception.access.parameter` when the argument trace named one, else `null`: `basis` `region_start` (the parameter's pointer is the region start; `offset` is the access's offset in it), `region_interior` (the pointer points into the region; `offset` is from the pointer) or `nearest_pointer` (no region was reported; `offset` is the faulting address minus the closest traced pointer below it). The raw address is left out (it differs run to run); the stacks keep the project's frames only, filtered as `stack` is (no allocator, libc, sanitizer, bhf harness or driver frames, no `_start`, paths relative to the source root and none outside it), at most 8 |
-| `input_to_state` | array \| null | comparison evidence recorded while this finding's input ran (from `finding.json` `gates`); `null` when no capture ran or it could not run (`gate_capture.status` `unavailable`), `[]` when one ran and no input bytes fed a comparison. Each entry: `{offset, len, operand_hex, compared_with_hex, cmp_kind, site, site_location, relation, operands_equal}`. `relation` is `equal` (the operand bytes are the input bytes), `byte_swapped` (the same, read big-endian) or `derived` (the operand is computed from those bytes and changed when they did); `site` is the comparison's offset in the harness executable, `site_location` its source position when it could be symbolized (never for `memcmp`/`bcmp` under AddressSanitizer, whose interceptor reports itself as the site) |
+| `input_to_state` | array \| null | comparison evidence recorded while this finding's input ran (from `finding.json` `gates`); `null` when no capture ran or it could not run (`gate_capture.status` `unavailable`), `[]` when one ran and no input bytes fed a comparison. Each entry: `{offset, len, operand_hex, compared_with_hex, cmp_kind, site, site_location, relation, operands_equal}`. `relation` is `equal` (the operand bytes are the input bytes), `byte_swapped` (the same, read big-endian) or `derived` (the operand is computed from those bytes and changed when they did); `site` is the comparison's offset in the harness executable, `site_location` its source position when it could be symbolized. Under AddressSanitizer the `memcmp`/`bcmp` interceptor reports itself as the site; the driver also records the frames above it, and the site is the first of them that is not the sanitizer runtime (the target's call), or the interceptor's own address, with no `site_location`, when none resolves (`finding.json` `gates[].site_unattributable`) |
 | `input_to_state_input` | string \| null | the finding file whose bytes the `input_to_state` offsets index: `min_testcase.bin` or `testcase.bin` (`finding.json` `gate_capture.input`); `null` when no capture named it |
+| `input_to_state_status` | string \| null | what the capture found (`finding.json` `gate_capture.status`): `recorded`, `no_input_comparisons` (comparisons ran but no input bytes fed one), `no_comparisons` or `unavailable` (the capture could not run); `null` when no capture ran |
+| `input_to_state_reason` | string \| null | why the capture recorded no evidence (`gate_capture.reason`), when it recorded none: the empty input, no instrumented comparison, the harness not found, what the search left out, ... |
+| `input_to_state_search` | `{state, searched_bytes, input_len}` \| null | how far the search for operands computed from input bytes (range checks such as `width - 1 > 31`) got (`gate_capture.derived_search`, `searched_bytes`): `state` `done`, `partial` (its replay budget ran out) or `too_long` (an input over 1 MiB, not searched); `null` when that search did not run or the capture predates it |
 | `arguments` | array \| null | the values the harness decoded from the input and passed to the target (`finding.json` `decoded_args`), when traced: `{name, type, value, len, span, preview_hex, role, after_call_value}`; `span` is `[start, end)` in the testcase, `role` `param`, `receiver` or `out` |
 
 ### Severity
@@ -182,7 +187,7 @@ findings and owns the single record for the batch.
 One row per finding. Columns, from `CSV_HEADER`:
 
 ```
-id,kind,severity,confidence,confirmation,rule_id,cwe,title,file,line,function,group,occurrences,verdict,vuln_id,purl,first_seen,evidence_dir,access,access_size,region_size,region_offset,input_to_state,input_to_state_input,arguments,access_parameter,build_fidelity
+id,kind,severity,confidence,confirmation,rule_id,cwe,title,file,line,function,group,occurrences,verdict,vuln_id,purl,first_seen,evidence_dir,access,access_size,region_size,region_offset,input_to_state,input_to_state_input,arguments,access_parameter,build_fidelity,input_to_state_status
 ```
 
 `cwe` is written `CWE-120`; multiple values are `;`-separated. The columns
@@ -194,7 +199,9 @@ columns by position keep working: `access` is the access direction,
 names the file those offsets index, `arguments` summarises `fuzz.arguments`,
 `access_parameter` names `fuzz.access.parameter`, and `build_fidelity` reads
 `reduced: macro NAME=VALUE, header NAME, ...` for a finding whose harness was
-built with fabricated inputs (empty otherwise). `arguments` is
+built with fabricated inputs (empty otherwise), and `input_to_state_status` is
+`fuzz.input_to_state_status` (why `input_to_state` is empty is in
+`findings.json` and `INDEX.md`). `arguments` is
 `name=value` per argument, `;`-separated: a buffer or string reads
 `len <N>`, followed by `hex <first 8 bytes>` when a preview was traced
 (`data=len 50718 hex 68baa77e0f010203...`), an output whose value changed
@@ -293,14 +300,24 @@ dir. Read each finding's `sanitizer.log` where it has one, otherwise run its
   is mined from source when the harness is generated (each token's
   `# from <file>:<line>` comment says where); a token of it that occurs in an
   input is not evidence that any comparison read it. `learned_dictionary.txt`
-  beside it holds comparison operands the engine observed at runtime while
+  beside it holds the comparison constants the engine observed at runtime while
   fuzzing that harness (from `cmplog.jsonl`, across passes and runs, at most 256
-  tokens); they were compared during some run, not necessarily this finding's.
+  tokens: operands that met more distinct values at a comparison site than
+  any of the inputs compared with them did); they were compared during some
+  run, not necessarily this finding's.
 - **How sure is `likely_reachable`?** For C/C++ it is usually inferred from the
   entry's signature (an input-taking shape, such as a byte-buffer parameter or
   a parser taking a byte, with typedefs such as `const u8_t *` read through the
-  source's and its headers' declarations); `bhf explain` says what
-  each verdict rests on. A heap overflow of a buffer the generated harness sized
+  source's and its headers' declarations, and pointer typedefs to bytes such as
+  `LPCBYTE` or `typedef const octet_t *rbuf_t` read as the pointer they are);
+  `finding.json` `input_reachability_basis` records the rule, the parameter and
+  its type as spelled and resolved (`{rule, param, spelled_type,
+  resolved_type, typedefs_resolved}`), `findings.json` carries it as
+  `reachability.reachability_basis`, and `bhf explain` says what each verdict
+  rests on. A finding whose input is empty or all zero bytes, or whose method
+  ran on an object bhf's harness constructed, carries a caveat that real
+  callers may never produce that state (`fidelity.caveats`, the INDEX.md
+  `Caveat:` line, and beside the verdict in `bhf explain`). A heap overflow of a buffer the generated harness sized
   for a pointer parameter it passes without a length is `lab_only`
   (precondition-dependent); one passed with its length, such as the buffer of a
   `(buf, len)` pair, keeps the entry's verdict.

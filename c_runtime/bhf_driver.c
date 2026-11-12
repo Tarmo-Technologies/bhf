@@ -218,22 +218,26 @@ BHF_NOCOV static void bhf_cov_open(void) {
  *           flags bit0: the target was entered; bit1: records were dropped
  *           (the target's, or the harness's when it never marked entry)
  *   record  [u8 kind][u8 len_a][u8 len_b][u8 flags][u32 site][u32 size]
- *           [u8 a[OPMAX]][u8 b[OPMAX]]
+ *           [u32 callers[CALLERS]][u8 a[OPMAX]][u8 b[OPMAX]]
  *           flags bit0: after target entry; bit1: a is a compile-time
  *           constant; bit2: b is; bit3: the operands compared equal
  * `site` is the caller's return address relative to the executable's start
  * (ELF), so the reader can symbolize it against the harness binary. Calls
  * from outside the executable (libc, the runtrace shim, libstdc++) are not
- * recorded: they are not the target's own comparisons. One exception: the
- * AddressSanitizer memcmp/bcmp interceptor hands its hook a pc inside the
- * interceptor itself, so every memcmp/bcmp call shares that one site in the
- * executable, wherever it was made. */
+ * recorded: they are not the target's own comparisons. The AddressSanitizer
+ * memcmp/bcmp interceptor hands its hook a pc inside the interceptor itself,
+ * so a buffer or string record also carries the return addresses of the
+ * frames above that pc (`callers`, same encoding, 0 for none or outside the
+ * executable; glibc only, through backtrace()): the reader symbolizes them and
+ * takes the first that is not the sanitizer runtime as the comparison's site.
+ * Version 1 records had no `callers`. */
 #define BHF_EV_MAGIC 0x45464842u
-#define BHF_EV_VERSION 1u
+#define BHF_EV_VERSION 2u
 #define BHF_EV_CAP 8192u
 #define BHF_EV_OPMAX 32u
+#define BHF_EV_CALLERS 4u
 #define BHF_EV_HDR 16u
-#define BHF_EV_REC (12u + 2u * BHF_EV_OPMAX)
+#define BHF_EV_REC (12u + 4u * BHF_EV_CALLERS + 2u * BHF_EV_OPMAX)
 #define BHF_EV_BYTES (BHF_EV_HDR + BHF_EV_CAP * BHF_EV_REC)
 #define BHF_EV_INT 1u
 #define BHF_EV_SWITCH 2u
@@ -248,6 +252,18 @@ BHF_NOCOV static void bhf_cov_open(void) {
 #define BHF_EV_CONST_B 4u
 static unsigned char *bhf_ev_map = 0;
 static unsigned char bhf_ev_entered = 0;
+/* backtrace() for the callers of a buffer or string comparison (glibc). The
+ * unwinder can itself compare strings through the sanitizer's interceptors
+ * (loading libgcc_s on first use); those calls are not the target's, so every
+ * comparison hook ignores the thread while it unwinds. */
+#if defined(__GLIBC__) && !defined(_WIN32)
+#include <execinfo.h>
+#define BHF_EV_BACKTRACE 1
+static __thread int bhf_ev_unwinding = 0;
+#define BHF_EV_UNWINDING() (bhf_ev_unwinding)
+#else
+#define BHF_EV_UNWINDING() 0
+#endif
 /* The runtrace shim says when the calling thread is inside one of its hooks:
  * its own string and buffer compares reach the sanitizer's comparison hooks
  * too, and are not the target's. Not on Windows (see BHF_PUBLISH_INPUT). */
@@ -281,6 +297,15 @@ BHF_NOCOV static void bhf_ev_open(void) {
     bhf_ev_map = (unsigned char *)m;
     bhf_ev_put32(bhf_ev_map, BHF_EV_MAGIC);
     bhf_ev_put32(bhf_ev_map + 4, BHF_EV_VERSION);
+#if defined(BHF_EV_BACKTRACE)
+    {
+        /* The first backtrace() loads the unwinder; do it now, outside any hook. */
+        void *warm[2];
+        bhf_ev_unwinding = 1;
+        (void)backtrace(warm, 2);
+        bhf_ev_unwinding = 0;
+    }
+#endif
 }
 /* The caller's offset in the executable, or 0 when it lies outside it. */
 BHF_NOCOV static int bhf_ev_site(const void *pc, uint32_t *site) {
@@ -295,17 +320,51 @@ BHF_NOCOV static int bhf_ev_site(const void *pc, uint32_t *site) {
     *site = (uint32_t)(at - (uintptr_t)&bhf_ev_open);
     return 1;
 }
+/* The return addresses of the frames above `pc` on this thread's stack, as
+ * executable offsets (0 for none or outside it). `pc` is a return address a
+ * sanitizer interceptor handed its hook; the frames above it are where the
+ * call came from. All zero without glibc's backtrace(). */
+BHF_NOCOV static void bhf_ev_callers(const void *pc, uint32_t *out) {
+    unsigned i;
+    for (i = 0; i < BHF_EV_CALLERS; i++) out[i] = 0;
+#if defined(BHF_EV_BACKTRACE)
+    {
+        void *frames[24];
+        int n, k, at = -1;
+        unsigned j = 0;
+        bhf_ev_unwinding = 1;
+        n = backtrace(frames, 24);
+        bhf_ev_unwinding = 0;
+        for (k = 0; k < n; k++) {
+            if (frames[k] == pc) {
+                at = k;
+                break;
+            }
+        }
+        if (at < 0) return;
+        for (k = at + 1; k < n && j < BHF_EV_CALLERS; k++, j++) {
+            uint32_t site;
+            if (bhf_ev_site(frames[k], &site)) out[j] = site;
+        }
+    }
+#else
+    (void)pc;
+#endif
+}
 BHF_NOCOV static void bhf_ev_push(unsigned kind, unsigned flags, const void *pc,
                                   const unsigned char *a, unsigned la,
-                                  const unsigned char *b, unsigned lb, uint32_t size) {
+                                  const unsigned char *b, unsigned lb, uint32_t size,
+                                  int with_callers) {
     unsigned char *m = bhf_ev_map, *r;
     uint32_t count, site, i;
+    uint32_t callers[BHF_EV_CALLERS] = {0};
     if (!m || !bhf_ev_site(pc, &site)) return;
     count = bhf_ev_get32(m + 8);
     if (count >= BHF_EV_CAP) {
         m[12] |= 2u;
         return;
     }
+    if (with_callers) bhf_ev_callers(pc, callers);
     if (la > BHF_EV_OPMAX) la = BHF_EV_OPMAX;
     if (lb > BHF_EV_OPMAX) lb = BHF_EV_OPMAX;
     r = m + BHF_EV_HDR + count * BHF_EV_REC;
@@ -315,8 +374,10 @@ BHF_NOCOV static void bhf_ev_push(unsigned kind, unsigned flags, const void *pc,
     r[3] = (unsigned char)(flags | (bhf_ev_entered ? 1u : 0u));
     bhf_ev_put32(r + 4, site);
     bhf_ev_put32(r + 8, size);
-    for (i = 0; i < la; i++) r[12 + i] = a[i];
-    for (i = 0; i < lb; i++) r[12 + BHF_EV_OPMAX + i] = b[i];
+    for (i = 0; i < BHF_EV_CALLERS; i++) bhf_ev_put32(r + 12 + 4 * i, callers[i]);
+    r += 12 + 4 * BHF_EV_CALLERS;
+    for (i = 0; i < la; i++) r[i] = a[i];
+    for (i = 0; i < lb; i++) r[BHF_EV_OPMAX + i] = b[i];
     bhf_ev_put32(m + 8, count + 1);
 }
 BHF_NOCOV static void bhf_ev_int(unsigned kind, uint64_t a, uint64_t b, unsigned width,
@@ -329,7 +390,7 @@ BHF_NOCOV static void bhf_ev_int(unsigned kind, uint64_t a, uint64_t b, unsigned
         ab[i] = (unsigned char)(a >> (8 * i));
         bb[i] = (unsigned char)(b >> (8 * i));
     }
-    bhf_ev_push(kind, flags | (a == b ? 8u : 0u), pc, ab, width, bb, width, width);
+    bhf_ev_push(kind, flags | (a == b ? 8u : 0u), pc, ab, width, bb, width, width, 0);
 }
 BHF_NOCOV static unsigned bhf_ev_len(const unsigned char *s, unsigned max, int stop_at_nul) {
     unsigned i = 0;
@@ -344,16 +405,21 @@ BHF_NOCOV static void bhf_ev_buf(unsigned kind, const void *pc, const void *s1, 
     if (!bhf_ev_map || !a || !b || BHF_IN_SHIM()) return;
     cap = n > BHF_EV_OPMAX ? BHF_EV_OPMAX : (unsigned)n;
     bhf_ev_push(kind, result == 0 ? 8u : 0u, pc, a, bhf_ev_len(a, cap, stop_at_nul), b,
-                bhf_ev_len(b, cap, stop_at_nul), n > 0xffffffffu ? 0xffffffffu : (uint32_t)n);
+                bhf_ev_len(b, cap, stop_at_nul), n > 0xffffffffu ? 0xffffffffu : (uint32_t)n, 1);
 }
 
 /* Runtime cmplog (BHF_CMPLOG=1) for sanitized harnesses. The sanitizer runtime
  * defines strcmp/strncmp/memcmp/bcmp in the executable itself, so the runtrace
  * shim's LD_PRELOAD hooks for them never run; its interceptors call the weak
  * hooks below instead. They append the shim's `{"e":"cmplog",...}` line to
- * BHF_RUNTRACE_LOG, which `bhf auto` folds into the next pass's dictionary.
- * Each distinct operand pair is written once per process, and at most
- * BHF_CMPLOG_MAX_BYTES in all. */
+ * BHF_RUNTRACE_LOG, which `bhf auto` folds into the next pass's dictionary,
+ * with the comparison's site `"s":"<site>.<caller>"` (executable offsets of
+ * the hook's pc and of the frame above it, which tells call sites apart when
+ * the pc is the sanitizer's interceptor): the reader keeps an operand that
+ * met more distinct values at one site than any value it met there. Each
+ * distinct operand pair is written once per process, and at most
+ * BHF_CMPLOG_MAX_BYTES in all; once that is reached a comparison costs no
+ * more than the length check. */
 #define BHF_CMPLOG_OPMAX 32u
 #define BHF_CMPLOG_MAX_BYTES (1u << 20)
 static int bhf_cmplog_fd = -2;
@@ -371,19 +437,38 @@ BHF_NOCOV static void bhf_cmplog_open(void) {
     /* No strcmp here: under ASan it would call this driver's own weak hook. */
     if (!on || on[0] != '1' || on[1] != 0 || !path || !*path) return;
     bhf_cmplog_fd = bhf_open(path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
+#if defined(BHF_EV_BACKTRACE)
+    if (bhf_cmplog_fd >= 0) {
+        /* Each record names its caller; load the unwinder now, outside a hook. */
+        void *warm[2];
+        bhf_ev_unwinding = 1;
+        (void)backtrace(warm, 2);
+        bhf_ev_unwinding = 0;
+    }
+#endif
 #endif
 }
-BHF_NOCOV static void bhf_cmplog_line(const char *kind, const unsigned char *a, unsigned la,
+BHF_NOCOV static void bhf_cmplog_line(const char *kind, const void *pc, uint32_t site,
+                                      const unsigned char *a, unsigned la,
                                       const unsigned char *b, unsigned lb) {
     static const char hex[] = "0123456789abcdef";
-    char line[64 + 4 * BHF_CMPLOG_OPMAX];
-    unsigned len = 0, i, k;
+    char line[96 + 4 * BHF_CMPLOG_OPMAX];
+    unsigned len = 0, need, i, k;
     uint64_t h = 1469598103934665603ull;
+    uint32_t callers[BHF_EV_CALLERS];
     const char *p;
     if (bhf_cmplog_fd == -2) bhf_cmplog_open();
     if (bhf_cmplog_fd < 0 || (la == 0 && lb == 0)) return;
     if (la > BHF_CMPLOG_OPMAX) la = BHF_CMPLOG_OPMAX;
     if (lb > BHF_CMPLOG_OPMAX) lb = BHF_CMPLOG_OPMAX;
+    /* The line's length: its fixed text, the kind, the 17-character site and
+     * both operands in hex. A line that no longer fits under the cap is
+     * dropped here, before the hashing and above all before the stack unwind,
+     * which would otherwise cost every later comparison microseconds. */
+    need = (unsigned)sizeof("{\"e\":\"cmplog\",\"k\":\"\",\"s\":\"\",\"a\":\"\",\"b\":\"\"}\n") - 1u
+           + 17u + 2u * (la + lb);
+    for (p = kind; *p; p++) need++;
+    if (bhf_cmplog_written + need > BHF_CMPLOG_MAX_BYTES) return;
     for (p = kind; *p; p++) { h ^= (unsigned char)*p; h *= 1099511628211ull; }
     for (i = 0; i < la; i++) { h ^= a[i]; h *= 1099511628211ull; }
     h ^= 0xffu; h *= 1099511628211ull;
@@ -391,9 +476,16 @@ BHF_NOCOV static void bhf_cmplog_line(const char *kind, const unsigned char *a, 
     if (h == 0) h = 1;
     if (bhf_cmplog_seen[h & 4095u] == h) return;
     bhf_cmplog_seen[h & 4095u] = h;
+    bhf_ev_callers(pc, callers);
 #define BHF_CL_PUT(s) for (p = (s); *p; p++) line[len++] = *p
+#define BHF_CL_HEX32(v) for (k = 0; k < 8; k++) line[len++] = hex[((v) >> (28 - 4 * k)) & 15u]
     BHF_CL_PUT("{\"e\":\"cmplog\",\"k\":\"");
     BHF_CL_PUT(kind);
+    BHF_CL_PUT("\",\"s\":\"");
+    BHF_CL_HEX32(site);
+    line[len++] = '.';
+    BHF_CL_HEX32(callers[0]);
+#undef BHF_CL_HEX32
     BHF_CL_PUT("\",\"a\":\"");
     for (k = 0; k < la; k++) { line[len++] = hex[a[k] >> 4]; line[len++] = hex[a[k] & 15]; }
     BHF_CL_PUT("\",\"b\":\"");
@@ -414,7 +506,8 @@ BHF_NOCOV static void bhf_cmplog_buf(const char *kind, const void *pc, const voi
      * and not the runtrace shim's from inside its hooks. */
     if (!bhf_ev_site(pc, &site) || BHF_IN_SHIM()) return;
     cap = n > BHF_CMPLOG_OPMAX ? BHF_CMPLOG_OPMAX : (unsigned)n;
-    bhf_cmplog_line(kind, a, bhf_ev_len(a, cap, stop_at_nul), b, bhf_ev_len(b, cap, stop_at_nul));
+    bhf_cmplog_line(kind, pc, site, a, bhf_ev_len(a, cap, stop_at_nul), b,
+                    bhf_ev_len(b, cap, stop_at_nul));
 }
 
 /* One-byte, cumulative proof that generated harness code crossed the boundary
@@ -726,32 +819,39 @@ BHF_NOCOV void __sanitizer_cov_trace_div8(uint64_t val) { bhf_ev_int(BHF_EV_INT,
 /* ASan's str/mem-cmp interceptors call these weak hooks (even without libFuzzer
  * linked), feeding multi-byte string/buffer gates into the RedQueen ring, the
  * runtime cmplog and comparison evidence. memcmp's hook also covers bcmp, which
- * clang emits for `memcmp(...) == 0`: ASan routes both through it. */
+ * clang emits for `memcmp(...) == 0`: ASan routes both through it. A call made
+ * while the evidence recorder unwinds the stack is the unwinder's, not the
+ * program's, and is ignored. */
 BHF_NOCOV void __sanitizer_weak_hook_memcmp(void *pc, const void *s1, const void *s2, size_t n, int result) {
+    if (BHF_EV_UNWINDING()) return;
     bhf_ev_buf(BHF_EV_MEMCMP, pc, s1, s2, n, 0, result);
     bhf_cmplog_buf("memcmp", pc, s1, s2, n, 0);
     bhf_cmp_buf((const unsigned char *)s1, (const unsigned char *)s2, (unsigned)n, 0, result);
     bhf_cmpp_buf((const unsigned char *)s1, (const unsigned char *)s2, (unsigned)n, result, pc);
 }
 BHF_NOCOV void __sanitizer_weak_hook_strncmp(void *pc, const char *s1, const char *s2, size_t n, int result) {
+    if (BHF_EV_UNWINDING()) return;
     bhf_ev_buf(BHF_EV_STRNCMP, pc, s1, s2, n, 1, result);
     bhf_cmplog_buf("strncmp", pc, s1, s2, n, 1);
     bhf_cmp_buf((const unsigned char *)s1, (const unsigned char *)s2, (unsigned)n, 1, result);
     bhf_cmpp_buf((const unsigned char *)s1, (const unsigned char *)s2, (unsigned)n, result, pc);
 }
 BHF_NOCOV void __sanitizer_weak_hook_strcmp(void *pc, const char *s1, const char *s2, int result) {
+    if (BHF_EV_UNWINDING()) return;
     bhf_ev_buf(BHF_EV_STRCMP, pc, s1, s2, BHF_EV_OPMAX, 1, result);
     bhf_cmplog_buf("strcmp", pc, s1, s2, BHF_CMPLOG_OPMAX, 1);
     bhf_cmp_buf((const unsigned char *)s1, (const unsigned char *)s2, BHF_CMP_OPMAX, 1, result);
     bhf_cmpp_buf((const unsigned char *)s1, (const unsigned char *)s2, BHF_CMP_OPMAX, result, pc);
 }
 BHF_NOCOV void __sanitizer_weak_hook_strncasecmp(void *pc, const char *s1, const char *s2, size_t n, int result) {
+    if (BHF_EV_UNWINDING()) return;
     bhf_ev_buf(BHF_EV_STRNCASECMP, pc, s1, s2, n, 1, result);
     bhf_cmplog_buf("strncasecmp", pc, s1, s2, n, 1);
     bhf_cmp_buf((const unsigned char *)s1, (const unsigned char *)s2, (unsigned)n, 1, result);
     bhf_cmpp_buf((const unsigned char *)s1, (const unsigned char *)s2, (unsigned)n, result, pc);
 }
 BHF_NOCOV void __sanitizer_weak_hook_strcasecmp(void *pc, const char *s1, const char *s2, int result) {
+    if (BHF_EV_UNWINDING()) return;
     bhf_ev_buf(BHF_EV_STRCASECMP, pc, s1, s2, BHF_EV_OPMAX, 1, result);
     bhf_cmplog_buf("strcasecmp", pc, s1, s2, BHF_CMPLOG_OPMAX, 1);
     bhf_cmp_buf((const unsigned char *)s1, (const unsigned char *)s2, BHF_CMP_OPMAX, 1, result);

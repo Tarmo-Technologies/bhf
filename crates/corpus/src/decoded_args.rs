@@ -216,7 +216,9 @@ pub fn summary_args(args: &[TracedArg]) -> Vec<&TracedArg> {
 }
 
 /// `finding.json`'s `decoded_args`: per argument its name, type, role, value
-/// or length, span, preview and after-call value.
+/// or length, span, preview and after-call value; the receiver object's entry
+/// also says how the harness built it (`decoder`: `default constructor`,
+/// `factory Widget::make()`, ...).
 pub fn decoded_args_json(args: &[TracedArg]) -> Value {
     Value::Array(
         summary_args(args)
@@ -228,6 +230,13 @@ pub fn decoded_args_json(args: &[TracedArg]) -> Value {
                     "role": arg.role,
                 });
                 let object = entry.as_object_mut().expect("object literal");
+                if let Some(how) = arg
+                    .decoder
+                    .as_ref()
+                    .filter(|_| arg.call == "receiver" && arg.index < 0)
+                {
+                    object.insert("decoder".to_owned(), json!(how));
+                }
                 if let Some(value) = &arg.value {
                     object.insert("value".to_owned(), json!(value));
                 }
@@ -513,6 +522,20 @@ BHF_ARG {not json\n\
             json!({"name": "buffer", "type": "const char *", "role": "param",
                    "len": 0, "span": [0, 2], "preview_hex": ""})
         );
+    }
+
+    /// The receiver object's entry says how the harness built it, so a report
+    /// can say the method ran on an object the harness constructed.
+    #[test]
+    fn the_receiver_entry_says_how_the_harness_built_it() {
+        let args = parse_arg_trace(
+            "BHF_ARG {\"call\":\"receiver\",\"i\":-1,\"role\":\"receiver\",\"name\":\"this\",\"type\":\"Widget\",\"decoder\":\"default constructor\",\"ptr\":\"0x7ffd0010\"}\n\
+             BHF_ARG {\"call\":\"target\",\"i\":0,\"role\":\"param\",\"name\":\"n\",\"type\":\"int\",\"decoder\":\"bhf_i32()\",\"span\":[0,4],\"value\":\"3\"}\n",
+        );
+        let summary = decoded_args_json(&args);
+        assert_eq!(summary[0]["name"], "receiver");
+        assert_eq!(summary[0]["decoder"], "default constructor");
+        assert!(summary[1].get("decoder").is_none(), "{}", summary[1]);
     }
 
     #[test]

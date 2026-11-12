@@ -17,7 +17,7 @@
 //   target up; `getter`/`setter`/`*_helper` push it down.
 // - Arity: 1–4 params is a sweet spot.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use type_model::{ScalarKind, TypeRegistry, TypeShape};
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -31,6 +31,65 @@ pub struct CTarget {
     /// input) and honest reporting (a crash on a non-`AttackerReachable` target is
     /// not demonstrably reachable from attacker input as fuzzed).
     pub input_reachability: InputReachability,
+    /// What `input_reachability` was inferred from.
+    pub input_reachability_basis: ReachabilityBasis,
+}
+
+/// What an [`InputReachability`] verdict was inferred from: the rule that
+/// decided it and the parameter it rests on, with that parameter's type as
+/// spelled and, when a typedef was resolved, as resolved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReachabilityBasis {
+    /// `const_byte_buffer` (a read-only byte buffer or byte view),
+    /// `parser_name_with_length` (a `const` buffer of a parser-named entry
+    /// that takes a length), `mutable_parser_buffer` (a mutable byte buffer of
+    /// a parser-named entry that takes a length), `byte_scalar_parser` (the
+    /// first parameter of a parser-named entry is one byte),
+    /// `output_serializer`, `no_input_shape` (none of these),
+    /// `call_graph_provenance` (a registered entry point or channel consumer)
+    /// or `internal_linkage` (an input shape, but a `static` function).
+    pub rule: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub param: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spelled_type: Option<String>,
+    /// The type with its typedefs resolved, when that differs from the
+    /// spelling (`const u8_t *` resolves to `const uint8_t *`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_type: Option<String>,
+    /// The classifier read the parameter types with typedefs resolved (at
+    /// least one parameter's type changed).
+    #[serde(default)]
+    pub typedefs_resolved: bool,
+}
+
+impl ReachabilityBasis {
+    /// The basis of a verdict decided by `rule` on parameter `index` of
+    /// `declared`, read as `resolved`.
+    fn new(
+        rule: &str,
+        index: Option<usize>,
+        declared: &[(&str, &str)],
+        resolved: &[(&str, &str)],
+    ) -> Self {
+        let declared_at = index.and_then(|i| declared.get(i));
+        let resolved_at = index.and_then(|i| resolved.get(i));
+        Self {
+            rule: rule.to_owned(),
+            param: declared_at
+                .map(|(name, _)| name.trim().to_owned())
+                .filter(|name| !name.is_empty()),
+            spelled_type: declared_at.map(|(_, ty)| ty.trim().to_owned()),
+            resolved_type: declared_at
+                .zip(resolved_at)
+                .filter(|((_, spelled), (_, resolved))| spelled.trim() != resolved.trim())
+                .map(|(_, (_, resolved))| resolved.trim().to_owned()),
+            typedefs_resolved: declared
+                .iter()
+                .zip(resolved)
+                .any(|((_, spelled), (_, resolved))| spelled.trim() != resolved.trim()),
+        }
+    }
 }
 
 /// Verdict on whether fuzzing a function's parameters exercises an
@@ -359,14 +418,15 @@ pub fn rank_c_targets_with_types(
         .iter()
         .filter(|f| !is_allocator_free_primitive(&f.name))
         .map(|f| {
-            let (breakdown, input_reachability) =
-                score_c_function(f, provenance.get(&f.name).copied(), registry);
+            let (breakdown, input_reachability, input_reachability_basis) =
+                score_c_function_with_basis(f, provenance.get(&f.name).copied(), registry);
             CTarget {
                 name: f.name.clone(),
                 line: f.line,
                 score: breakdown.total,
                 breakdown,
                 input_reachability,
+                input_reachability_basis,
             }
         })
         .collect();
@@ -401,13 +461,15 @@ pub fn rank_cpp_targets_with_types(
         .iter()
         .filter(|f| !cpp_api_is_unsupported_target(f))
         .map(|f| {
-            let (breakdown, input_reachability) = score_cpp_function(f, registry);
+            let (breakdown, input_reachability, input_reachability_basis) =
+                score_cpp_function(f, registry);
             CTarget {
                 name: cpp_target_name(f),
                 line: f.line,
                 score: breakdown.total,
                 breakdown,
                 input_reachability,
+                input_reachability_basis,
             }
         })
         .collect();
@@ -425,11 +487,23 @@ fn sort_targets(targets: &mut [CTarget]) {
     });
 }
 
+#[cfg(test)]
 fn score_c_function(
     f: &c_parser::CFunction,
     provenance: Option<EntryPointProvenance>,
     registry: &TypeRegistry,
 ) -> (CScoreBreakdown, InputReachability) {
+    let (b, reach, _) = score_c_function_with_basis(f, provenance, registry);
+    (b, reach)
+}
+
+/// The score and reachability of a C function, with what the reachability
+/// was inferred from.
+fn score_c_function_with_basis(
+    f: &c_parser::CFunction,
+    provenance: Option<EntryPointProvenance>,
+    registry: &TypeRegistry,
+) -> (CScoreBreakdown, InputReachability, ReachabilityBasis) {
     let declared: Vec<(&str, &str)> = f
         .params
         .iter()
@@ -437,7 +511,23 @@ fn score_c_function(
         .collect();
     let resolved = resolve_param_types(&declared, registry);
     let params = param_refs(&resolved);
-    let (mut b, reach) = score_from_signature(&f.name, &f.return_type, &params, provenance);
+    let (b, reach, rule, index) =
+        score_signature_with_rule(&f.name, &f.return_type, &params, provenance);
+    let basis = ReachabilityBasis::new(rule, index, &declared, &params);
+    let (b, reach) = demote_c_helpers(f, &params, provenance, b, reach);
+    (b, reach, basis)
+}
+
+/// The C-only demotions of [`score_c_function`] (internal-linkage helpers,
+/// opaque-context callbacks, ...), applied to the signature score of `f`
+/// with parameter types `params`.
+fn demote_c_helpers(
+    f: &c_parser::CFunction,
+    params: &[(&str, &str)],
+    provenance: Option<EntryPointProvenance>,
+    mut b: CScoreBreakdown,
+    reach: InputReachability,
+) -> (CScoreBreakdown, InputReachability) {
     // A call-graph-proven entry point (registered ISR/task/callback, or a
     // channel consumer) is fuzzable AS AN ENTRY regardless of its parameter
     // shape, so the signature-based demotions below — which assume the fuzzed
@@ -522,7 +612,7 @@ fn is_allocator_free_primitive(name: &str) -> bool {
 fn score_cpp_function(
     f: &cpp_parser::CppFunction,
     registry: &TypeRegistry,
-) -> (CScoreBreakdown, InputReachability) {
+) -> (CScoreBreakdown, InputReachability, ReachabilityBasis) {
     let effective_params = f.effective_required_params();
     let declared: Vec<(&str, &str)> = effective_params
         .iter()
@@ -537,7 +627,12 @@ fn score_cpp_function(
     };
     // C++ has no call-graph provenance wired through this path (HDF-5 targets the
     // C/RTOS lane); pass `None` so behavior is unchanged.
-    score_from_signature(&name, &f.return_type, &params, None)
+    let (b, reach, rule, index) = score_signature_with_rule(&name, &f.return_type, &params, None);
+    (
+        b,
+        reach,
+        ReachabilityBasis::new(rule, index, &declared, &params),
+    )
 }
 
 fn cpp_api_is_unsupported_target(f: &cpp_parser::CppFunction) -> bool {
@@ -583,19 +678,37 @@ pub fn cpp_target_name(f: &cpp_parser::CppFunction) -> String {
     }
 }
 
+#[cfg(test)]
 fn score_from_signature(
     name: &str,
     return_type: &str,
     params: &[(&str, &str)],
     provenance: Option<EntryPointProvenance>,
 ) -> (CScoreBreakdown, InputReachability) {
+    let (b, reachability, _, _) = score_signature_with_rule(name, return_type, params, provenance);
+    (b, reachability)
+}
+
+/// [`score_from_signature`], plus the reachability rule that decided the
+/// verdict and the index of the parameter it rests on.
+fn score_signature_with_rule(
+    name: &str,
+    return_type: &str,
+    params: &[(&str, &str)],
+    provenance: Option<EntryPointProvenance>,
+) -> (
+    CScoreBreakdown,
+    InputReachability,
+    &'static str,
+    Option<usize>,
+) {
     let mut b = CScoreBreakdown::default();
     // Call-graph provenance (a registered ISR/task/callback, or a channel
     // consumer) overrides the signature-shape verdict: the function IS reachable
     // via the registration/channel even though its parameters carry no buffer.
-    let reachability = match provenance {
-        Some(p) => p.to_reachability(),
-        None => classify_input_reachability(name, params),
+    let (reachability, rule, index) = match provenance {
+        Some(p) => (p.to_reachability(), "call_graph_provenance", None),
+        None => classify_rule(name, params),
     };
     let lower_name = name.to_ascii_lowercase();
 
@@ -735,7 +848,7 @@ fn score_from_signature(
         + b.end_to_end_raw_input
         + b.general_format_entry
         + b.registered_or_consumer_entry;
-    (b, reachability)
+    (b, reachability, rule, index)
 }
 
 /// Naming convention for an API that accepts one complete untrusted artifact.
@@ -881,29 +994,55 @@ fn is_prebuilt_input_context(name: &str, raw: &str) -> bool {
 /// untrusted buffer wins; otherwise a serializer name marks an output function;
 /// otherwise there is no proven attacker input.
 pub fn classify_input_reachability(name: &str, params: &[(&str, &str)]) -> InputReachability {
+    classify_rule(name, params).0
+}
+
+/// [`classify_input_reachability`], with the [`ReachabilityBasis`] rule that
+/// decided it and the index of the parameter it rests on.
+fn classify_rule(
+    name: &str,
+    params: &[(&str, &str)],
+) -> (InputReachability, &'static str, Option<usize>) {
     let lower_name = name.to_ascii_lowercase();
     let has_length = params
         .iter()
         .any(|(n, t)| is_length_param(t) || is_length_name(n));
-    let has_untrusted_buffer = params.iter().any(|(_, t)| is_untrusted_input_buffer(t))
-        || (has_length
-            && name_has_parser_keyword(&lower_name)
-            && params
-                .iter()
-                .any(|(param_name, ty)| is_named_const_byte_buffer(param_name, ty)));
-    if has_untrusted_buffer {
-        return InputReachability::AttackerReachable;
+    if let Some(index) = params
+        .iter()
+        .position(|(_, t)| is_untrusted_input_buffer(t))
+    {
+        return (
+            InputReachability::AttackerReachable,
+            "const_byte_buffer",
+            Some(index),
+        );
+    }
+    if has_length && name_has_parser_keyword(&lower_name) {
+        if let Some(index) = params
+            .iter()
+            .position(|(param_name, ty)| is_named_const_byte_buffer(param_name, ty))
+        {
+            return (
+                InputReachability::AttackerReachable,
+                "parser_name_with_length",
+                Some(index),
+            );
+        }
     }
     // A non-`const` byte buffer paired with a length under a parser/decoder name
     // is the C idiom for an in-place / mutable input buffer (some decoders write
     // back into the frame they parse) — treat as attacker-reachable.
-    let has_output_buffer = params.iter().any(|(_, t)| is_output_buffer(t));
-    if has_output_buffer
-        && has_length
-        && name_has_parser_keyword(&lower_name)
-        && !name_has_serializer_keyword(&lower_name)
-    {
-        return InputReachability::AttackerReachable;
+    let output_buffer = params.iter().position(|(_, t)| is_output_buffer(t));
+    if let Some(index) = output_buffer.filter(|_| {
+        has_length
+            && name_has_parser_keyword(&lower_name)
+            && !name_has_serializer_keyword(&lower_name)
+    }) {
+        return (
+            InputReachability::AttackerReachable,
+            "mutable_parser_buffer",
+            Some(index),
+        );
     }
     // Byte-stream decoder idiom: a `parse`/`decode` function fed one untrusted
     // byte at a time (`decode(uint8_t byte, ...out params...)`), the input being
@@ -916,25 +1055,53 @@ pub fn classify_input_reachability(name: &str, params: &[(&str, &str)]) -> Input
         && !name_has_serializer_keyword(&lower_name)
         && params.first().is_some_and(|(_, t)| is_byte_scalar(t))
     {
-        return InputReachability::AttackerReachable;
+        return (
+            InputReachability::AttackerReachable,
+            "byte_scalar_parser",
+            Some(0),
+        );
     }
     if name_has_serializer_keyword(&lower_name) {
-        return InputReachability::OutputSerializer;
+        return (
+            InputReachability::OutputSerializer,
+            "output_serializer",
+            None,
+        );
     }
-    InputReachability::ReachabilityUnproven
+    (
+        InputReachability::ReachabilityUnproven,
+        "no_input_shape",
+        None,
+    )
 }
 
 /// [`classify_input_reachability`] with parameter types read through
 /// `registry`: a pointer to, or a value of, a project typedef that resolves to
 /// a scalar is classified as that scalar (`const u8_t *` as a byte buffer,
-/// `u32_t` as a length).
+/// `u32_t` as a length), and a pointer typedef to bytes or characters as that
+/// pointer (`LPCBYTE` as `const unsigned char *`).
 pub fn classify_input_reachability_with_types(
     name: &str,
     params: &[(&str, &str)],
     registry: &TypeRegistry,
 ) -> InputReachability {
+    classify_input_reachability_with_basis(name, params, registry).0
+}
+
+/// [`classify_input_reachability_with_types`], with what the verdict was
+/// inferred from.
+pub fn classify_input_reachability_with_basis(
+    name: &str,
+    params: &[(&str, &str)],
+    registry: &TypeRegistry,
+) -> (InputReachability, ReachabilityBasis) {
     let resolved = resolve_param_types(params, registry);
-    classify_input_reachability(name, &param_refs(&resolved))
+    let resolved = param_refs(&resolved);
+    let (reach, rule, index) = classify_rule(name, &resolved);
+    (
+        reach,
+        ReachabilityBasis::new(rule, index, params, &resolved),
+    )
 }
 
 /// Whether ranking `params` can depend on typedefs a file declares: a type
@@ -1035,15 +1202,66 @@ const SPELLED_SCALARS: &[&str] = &[
 
 /// `raw` with a type name that `registry` resolves to a scalar replaced by
 /// that scalar's fixed-width spelling (`const u8_t *` -> `const uint8_t *`,
-/// `DWORD` -> `uint32_t`). `None` when nothing resolves; a pointer typedef
-/// is left as spelled, since its pointee's constness is not visible.
+/// `DWORD` -> `uint32_t`), and a parameter whose whole type is a pointer
+/// typedef to bytes or characters replaced by that pointer: a Win32 spelling
+/// (`LPCBYTE` -> `const unsigned char *`), or a typedef the registry resolves
+/// (`typedef const octet_t *rbuf_t` -> `const uint8_t *`), `const` when the
+/// typedef's pointee is. `None` when nothing resolves.
 fn resolve_param_type(raw: &str, registry: &TypeRegistry) -> Option<String> {
     let (mut tokens, at) = single_type_name(raw)?;
-    let TypeShape::Scalar(kind) = registry.resolve(&tokens[at]) else {
-        return None;
-    };
-    tokens[at] = scalar_spelling(kind).to_owned();
-    Some(tokens.join(" "))
+    let name = tokens[at].clone();
+    match registry.resolve(&name) {
+        TypeShape::Scalar(kind) => {
+            tokens[at] = scalar_spelling(kind).to_owned();
+            Some(tokens.join(" "))
+        }
+        // A pointer typedef used by value (`LPCBYTE p`, `rbuf_t data`): the
+        // parameter is that pointer. Qualifiers on the parameter apply to the
+        // pointer itself, not its pointee.
+        _ if tokens.iter().any(|t| t == "*" || t == "&") => None,
+        _ if type_model::byte_pointer_typedef_spelling(&name).is_some() => {
+            type_model::byte_pointer_typedef_spelling(&name).map(str::to_owned)
+        }
+        shape @ (TypeShape::Pointer(_) | TypeShape::CString) => {
+            let character = match &shape {
+                TypeShape::CString => true,
+                TypeShape::Pointer(pointee) => match pointee.as_ref() {
+                    TypeShape::Scalar(ScalarKind::U8) => false,
+                    TypeShape::Scalar(ScalarKind::I8) => true,
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            let pointee_const = typedef_pointee_is_const(registry, &name);
+            let base = if character { "char" } else { "uint8_t" };
+            Some(if pointee_const {
+                format!("const {base} *")
+            } else {
+                format!("{base} *")
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Whether pointer typedef `name`'s pointee is `const`, from the typedef's
+/// recorded text (`const octet_t *`), followed through plain aliases of it.
+fn typedef_pointee_is_const(registry: &TypeRegistry, name: &str) -> bool {
+    let mut current = name.trim().to_owned();
+    for _ in 0..8 {
+        let Some(text) = registry.typedef_text(&current) else {
+            return false;
+        };
+        if let Some((pointee, _)) = text.rsplit_once('*') {
+            return pointee.split_whitespace().any(|token| token == "const");
+        }
+        let next = text.trim();
+        if next.is_empty() || next.contains(char::is_whitespace) {
+            return false;
+        }
+        current = next.to_owned();
+    }
+    false
 }
 
 fn scalar_spelling(kind: ScalarKind) -> &'static str {
@@ -2217,6 +2435,196 @@ mod tests {
             ("data", "const uint8_t *"),
             ("n", "size_t")
         ]));
+    }
+
+    fn ranking_aliases(aliases: &[(&str, &str)]) -> c_parser::CTypeDefs {
+        c_parser::CTypeDefs {
+            structs: Vec::new(),
+            enums: Vec::new(),
+            typedefs: aliases
+                .iter()
+                .map(|(name, underlying)| c_parser::CTypedefDef {
+                    name: (*name).to_owned(),
+                    underlying: (*underlying).to_owned(),
+                    line: 1,
+                })
+                .collect(),
+        }
+    }
+
+    /// The verdict carries what it was inferred from: the rule that fired, the
+    /// parameter, and its type as spelled and as resolved.
+    #[test]
+    fn the_reachability_basis_names_the_rule_parameter_and_types() {
+        let source = "typedef unsigned char u8_t;\ntypedef unsigned int u32_t;\n";
+        let defs = c_parser::parse_c_type_defs(source).unwrap();
+        let registry = type_model::TypeRegistry::from_defs([&defs]);
+        let (reach, basis) = classify_input_reachability_with_basis(
+            "read_bits",
+            &[("data", "const u8_t *"), ("bit_index", "u32_t")],
+            &registry,
+        );
+        assert_eq!(reach, InputReachability::AttackerReachable);
+        assert_eq!(
+            basis,
+            ReachabilityBasis {
+                rule: "const_byte_buffer".to_owned(),
+                param: Some("data".to_owned()),
+                spelled_type: Some("const u8_t *".to_owned()),
+                resolved_type: Some("const uint8_t *".to_owned()),
+                typedefs_resolved: true,
+            }
+        );
+        let (reach, basis) = classify_input_reachability_with_basis(
+            "decode_frame",
+            &[("frame", "uint8_t *"), ("len", "size_t")],
+            &registry,
+        );
+        assert_eq!(reach, InputReachability::AttackerReachable);
+        assert_eq!(basis.rule, "mutable_parser_buffer");
+        assert_eq!(basis.param.as_deref(), Some("frame"));
+        assert_eq!(basis.resolved_type, None, "nothing to resolve: {basis:?}");
+        assert!(!basis.typedefs_resolved);
+        let (_, basis) = classify_input_reachability_with_basis(
+            "decode_byte",
+            &[("b", "u8_t"), ("state", "struct decoder *")],
+            &registry,
+        );
+        assert_eq!(
+            (basis.rule.as_str(), basis.param.as_deref()),
+            ("byte_scalar_parser", Some("b"))
+        );
+        let (_, basis) = classify_input_reachability_with_basis(
+            "load_image",
+            &[("bytes", "const pixel_t *"), ("count", "int")],
+            &registry,
+        );
+        assert_eq!(
+            (basis.rule.as_str(), basis.param.as_deref()),
+            ("parser_name_with_length", Some("bytes"))
+        );
+        let (reach, basis) =
+            classify_input_reachability_with_basis("count_widgets", &[("n", "u32_t")], &registry);
+        assert_eq!(reach, InputReachability::ReachabilityUnproven);
+        assert_eq!((basis.rule.as_str(), basis.param), ("no_input_shape", None));
+        assert!(basis.typedefs_resolved);
+        let (reach, basis) = classify_input_reachability_with_basis(
+            "write_header",
+            &[("out", "uint8_t *"), ("value", "int")],
+            &registry,
+        );
+        assert_eq!(reach, InputReachability::OutputSerializer);
+        assert_eq!(basis.rule, "output_serializer");
+
+        // The ranked target carries the same basis.
+        let functions = c_parser::parse_c_functions(
+            "typedef unsigned char u8_t;\nint read_bits(const u8_t *data, unsigned n) { return data[n]; }\n",
+        )
+        .unwrap();
+        let ranked =
+            rank_c_targets_with_types(&functions, &std::collections::BTreeMap::new(), &registry);
+        assert_eq!(
+            ranked[0].input_reachability_basis.param.as_deref(),
+            Some("data")
+        );
+        assert_eq!(
+            ranked[0].input_reachability_basis.spelled_type.as_deref(),
+            Some("const u8_t *")
+        );
+    }
+
+    /// A parameter whose type is a pointer typedef to bytes (`LPCBYTE`, or a
+    /// project's `typedef const octet_t *rbuf_t`) is a byte buffer, read-only
+    /// when the typedef's pointee is `const`, in the C and C++ lanes alike.
+    #[test]
+    fn pointer_typedef_byte_buffers_are_input_buffers() {
+        let windows = c_parser::parse_c_functions(
+            "int load_frame(LPCBYTE p, DWORD n) { return p[0] + (int)n; }\n",
+        )
+        .unwrap();
+        let ranked = rank_c_targets_with_types(
+            &windows,
+            &std::collections::BTreeMap::new(),
+            &type_model::TypeRegistry::default(),
+        );
+        assert_eq!(
+            ranked[0].input_reachability,
+            InputReachability::AttackerReachable
+        );
+        let basis = &ranked[0].input_reachability_basis;
+        assert_eq!(basis.rule, "const_byte_buffer");
+        assert_eq!(basis.param.as_deref(), Some("p"));
+        assert_eq!(basis.spelled_type.as_deref(), Some("LPCBYTE"));
+        assert_eq!(
+            basis.resolved_type.as_deref(),
+            Some("const unsigned char *")
+        );
+
+        let source = "typedef unsigned char octet_t;\n\
+             typedef const octet_t *rbuf_t;\n\
+             typedef octet_t *mbuf_t;\n\
+             typedef const char *name_t;\n\
+             typedef unsigned int word32_t;\n\
+             int check_frame(rbuf_t data, word32_t n) { return data[0] + (int)n; }\n\
+             int parse_frame(mbuf_t frame, word32_t len) { return frame[0] + (int)len; }\n\
+             int find_widget(name_t key) { return key[0]; }\n\
+             int fill_frame(mbuf_t frame) { frame[0] = 1; return 0; }\n";
+        let functions = c_parser::parse_c_functions(source).unwrap();
+        // The aliases as ranking reads them: a pointer alias keeps its
+        // pointee's qualifiers.
+        let registry = type_model::TypeRegistry::from_defs([&ranking_aliases(&[
+            ("octet_t", "unsigned char"),
+            ("rbuf_t", "const octet_t *"),
+            ("mbuf_t", "octet_t *"),
+            ("name_t", "const char *"),
+            ("word32_t", "unsigned int"),
+        ])]);
+        let ranked =
+            rank_c_targets_with_types(&functions, &std::collections::BTreeMap::new(), &registry);
+        let reach = |name: &str| {
+            let target = ranked.iter().find(|t| t.name == name).unwrap();
+            (
+                target.input_reachability,
+                target.input_reachability_basis.clone(),
+            )
+        };
+        let (check, basis) = reach("check_frame");
+        assert_eq!(check, InputReachability::AttackerReachable);
+        assert_eq!(basis.spelled_type.as_deref(), Some("rbuf_t"));
+        assert_eq!(basis.resolved_type.as_deref(), Some("const uint8_t *"));
+        let (parse, basis) = reach("parse_frame");
+        assert_eq!(parse, InputReachability::AttackerReachable);
+        assert_eq!(basis.rule, "mutable_parser_buffer");
+        assert_eq!(basis.resolved_type.as_deref(), Some("uint8_t *"));
+        assert_eq!(reach("find_widget").0, InputReachability::AttackerReachable);
+        assert_eq!(
+            reach("fill_frame").0,
+            InputReachability::ReachabilityUnproven,
+            "a mutable buffer without a length or a parser name is not input"
+        );
+        assert!(needs_type_registry(&[("data", "rbuf_t")]));
+
+        let cpp = "typedef unsigned char octet_t;\n\
+             typedef const octet_t *rbuf_t;\n\
+             namespace widgets {\n\
+             int check_frame(rbuf_t data, unsigned n) { return data[0] + (int)n; }\n\
+             int load_frame(LPCBYTE p, DWORD n) { return p[0] + (int)n; }\n\
+             }\n";
+        let functions = cpp_parser::parse_cpp_functions(cpp).unwrap();
+        let registry = type_model::TypeRegistry::from_defs([&ranking_aliases(&[
+            ("octet_t", "unsigned char"),
+            ("rbuf_t", "const octet_t *"),
+        ])]);
+        let ranked = rank_cpp_targets_with_types(&functions, &registry);
+        for name in ["widgets::check_frame", "widgets::load_frame"] {
+            let target = ranked.iter().find(|t| t.name == name).unwrap();
+            assert_eq!(
+                target.input_reachability,
+                InputReachability::AttackerReachable,
+                "{name}: {:?}",
+                target.input_reachability_basis
+            );
+        }
     }
 
     #[test]

@@ -123,6 +123,7 @@ fn serializes_actionability_record_in_spec_shape() {
             target: "Pkg.Parse".to_owned(),
             evidence: Vec::new(),
             attacker_reachable: None,
+            reachability_basis: None,
         }),
         fix_location: Some(FixLocation {
             path: "src/pkg.adb".to_owned(),

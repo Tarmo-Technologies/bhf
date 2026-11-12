@@ -35,7 +35,9 @@ const CACHE_VERSION: u32 = 3;
 /// project fuzz drivers that library targets shadow, so an explicit selection
 /// can still pick one; `auto` drops the rest after its filters. v3: ranking
 /// and input reachability read parameter types through the file's typedefs.
-pub(crate) const DISCOVERY_SEMANTIC_VERSION: u32 = 3;
+/// v4: pointer typedefs to bytes (`LPCBYTE`, `typedef const octet_t *rbuf_t`)
+/// are byte buffers, and each C/C++ candidate records its reachability basis.
+pub(crate) const DISCOVERY_SEMANTIC_VERSION: u32 = 4;
 
 /// Filename written under the work dir.
 pub const CACHE_FILENAME: &str = "discovery-cache.json";
@@ -76,6 +78,9 @@ pub struct CandidateDto {
     pub foreign_guard: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_reachability: Option<String>,
+    /// What `input_reachability` was inferred from (C/C++).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_reachability_basis: Option<target_rank::ReachabilityBasis>,
     /// M22: detected source dialect tag (`lang_profile::Dialect::as_str`).
     /// `None` for lanes where dialect detection is not yet wired.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -165,6 +170,7 @@ impl CandidateDto {
             is_static: c.is_static,
             foreign_guard: c.foreign_guard.clone(),
             input_reachability: c.input_reachability.map(|r| reach_to_str(r).to_owned()),
+            input_reachability_basis: c.input_reachability_basis.clone(),
             dialect: c.dialect.map(|d| d.as_str().to_owned()),
         }
     }
@@ -185,6 +191,7 @@ impl CandidateDto {
             // An unknown reachability tag degrades to `None` (unproven-ish) rather
             // than failing the whole load — it only affects honesty labelling.
             input_reachability: self.input_reachability.as_deref().and_then(reach_from_str),
+            input_reachability_basis: self.input_reachability_basis.clone(),
             // An unknown dialect tag degrades to `None` rather than failing the
             // whole load — it only affects profile selection / report labelling.
             dialect: self
@@ -346,6 +353,7 @@ mod tests {
             is_static: false,
             foreign_guard: None,
             input_reachability: reach,
+            input_reachability_basis: None,
             dialect: None,
         }
     }

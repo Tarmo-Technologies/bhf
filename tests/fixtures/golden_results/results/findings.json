@@ -124,8 +124,8 @@
           {
             "role": "finding",
             "path": "findings/F-0000-1a2b3c4d/finding.json",
-            "sha256": "41e80218ac3cd6760aaed32beba24f66f1e28bee6cc34c36d30d026f35692e00",
-            "size": 2739
+            "sha256": "fc32a4bbd4c5cb1e4d2bf7d1c097e3364f82a0e1877bd82a072fa80f7f867f25",
+            "size": 2794
           },
           {
             "role": "testcase",
@@ -203,6 +203,13 @@
           }
         ],
         "input_to_state_input": "min_testcase.bin",
+        "input_to_state_status": "recorded",
+        "input_to_state_reason": null,
+        "input_to_state_search": {
+          "state": "done",
+          "searched_bytes": 1,
+          "input_len": 1
+        },
         "arguments": [
           {
             "name": "flags",
@@ -575,6 +582,9 @@
         "access": null,
         "input_to_state": null,
         "input_to_state_input": null,
+        "input_to_state_status": null,
+        "input_to_state_reason": null,
+        "input_to_state_search": null,
         "arguments": null
       },
       "static": null,
@@ -739,6 +749,9 @@
         "access": null,
         "input_to_state": null,
         "input_to_state_input": null,
+        "input_to_state_status": null,
+        "input_to_state_reason": null,
+        "input_to_state_search": null,
         "arguments": null
       },
       "static": null,

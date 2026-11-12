@@ -7279,6 +7279,7 @@ mod tests {
                     target: "H-real".to_owned(),
                     evidence: Vec::new(),
                     attacker_reachable: None,
+                    reachability_basis: None,
                 }),
                 cwe: Vec::new(),
                 cwe_name: None,

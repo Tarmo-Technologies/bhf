@@ -3549,6 +3549,7 @@ fn run_attempt(
                         candidate.input_reachability,
                         ipc_channel_observed,
                     );
+                    let reach_basis = reachability_basis_for(candidate, reach_label);
                     let shim_armed = fuzz_pass_shim_armed(&harness_dir, cross_runner.is_some());
                     for fid in &summary.findings {
                         let finding_path =
@@ -3558,6 +3559,7 @@ fn run_attempt(
                             *pass,
                             &env_injected,
                             reach_label,
+                            reach_basis,
                             shim_armed,
                         ) {
                             bhfeprintln!("bhf auto: warning: stamp {fid} runtime_mode: {error}");
@@ -3638,6 +3640,7 @@ fn run_attempt(
                                     candidate.input_reachability,
                                     ipc_channel_observed,
                                 );
+                                let reach_basis = reachability_basis_for(candidate, reach_label);
                                 for fid in &summary.findings {
                                     let finding_path = corpus::layout::finding_dir(work_dir, fid)
                                         .join("finding.json");
@@ -3647,6 +3650,7 @@ fn run_attempt(
                                         crate::auto::pass::Pass::FuzzDriven,
                                         &env_injected,
                                         reach_label,
+                                        reach_basis,
                                         false,
                                     ) {
                                         bhfeprintln!(
@@ -5236,6 +5240,7 @@ mod generation_outcome_tests {
             is_static: false,
             foreign_guard: None,
             input_reachability: None,
+            input_reachability_basis: None,
             dialect: None,
         };
 
@@ -5264,6 +5269,7 @@ mod hdf6_environment_tests {
             is_static: false,
             foreign_guard: None,
             input_reachability: reach,
+            input_reachability_basis: None,
             dialect: None,
         }
     }
@@ -5620,6 +5626,7 @@ mod c_auto_sequence_candidate_tests {
             is_static: false,
             foreign_guard: None,
             input_reachability: None,
+            input_reachability_basis: None,
             dialect: None,
         };
         assert!(
@@ -5656,6 +5663,7 @@ mod c_auto_sequence_candidate_tests {
             is_static: false,
             foreign_guard: None,
             input_reachability: None,
+            input_reachability_basis: None,
             dialect: None,
         };
         assert!(
@@ -5692,6 +5700,7 @@ mod c_auto_sequence_candidate_tests {
             is_static: false,
             foreign_guard: None,
             input_reachability: None,
+            input_reachability_basis: None,
             dialect: None,
         };
         assert!(
@@ -5728,6 +5737,7 @@ mod c_auto_sequence_candidate_tests {
             is_static: false,
             foreign_guard: None,
             input_reachability: None,
+            input_reachability_basis: None,
             dialect: None,
         };
         assert!(
@@ -5757,6 +5767,7 @@ mod c_auto_sequence_candidate_tests {
             is_static: false,
             foreign_guard: None,
             input_reachability: None,
+            input_reachability_basis: None,
             dialect: None,
         };
         assert!(!c_auto_sequence_candidate(&candidate, None, &[]));
@@ -5790,6 +5801,7 @@ mod c_auto_sequence_candidate_tests {
             is_static: true,
             foreign_guard: None,
             input_reachability: None,
+            input_reachability_basis: None,
             dialect: None,
         };
         let lifecycle = vec![CHandleLifecycle {
@@ -9554,11 +9566,23 @@ fn candidate_with_ipc_reachability(candidate: &Candidate, ipc_channel_observed: 
     upgraded
 }
 
+/// The candidate's reachability basis when `label` is the candidate's own
+/// static verdict (not one a run upgraded, such as an IPC channel's).
+fn reachability_basis_for<'a>(
+    candidate: &'a Candidate,
+    label: Option<&str>,
+) -> Option<&'a target_rank::ReachabilityBasis> {
+    (label.is_some() && label == reachability_label(candidate.input_reachability))
+        .then_some(candidate.input_reachability_basis.as_ref())
+        .flatten()
+}
+
 fn stamp_runtime_mode(
     finding_path: &std::path::Path,
     pass: crate::auto::pass::Pass,
     env_injected: &[(String, String)],
     input_reachability: Option<&str>,
+    input_reachability_basis: Option<&target_rank::ReachabilityBasis>,
     shim_armed: bool,
 ) -> std::io::Result<()> {
     let bytes = std::fs::read(finding_path)?;
@@ -9598,6 +9622,16 @@ fn stamp_runtime_mode(
                 "input_reachability".to_owned(),
                 serde_json::Value::String(label.to_owned()),
             );
+            // What the label was inferred from, when it is the entry's own
+            // signature verdict; a label without one carries none.
+            match input_reachability_basis.and_then(|basis| serde_json::to_value(basis).ok()) {
+                Some(basis) => {
+                    obj.insert("input_reachability_basis".to_owned(), basis);
+                }
+                None => {
+                    obj.remove("input_reachability_basis");
+                }
+            }
         }
         obj.remove("actionability");
     }
@@ -9612,7 +9646,12 @@ fn stamp_runtime_mode(
     corpus::finding::append_history(
         &mut value,
         "auto",
-        &["runtime_mode", "input_reachability", "actionability"],
+        &[
+            "runtime_mode",
+            "input_reachability",
+            "input_reachability_basis",
+            "actionability",
+        ],
     );
     let pretty = serde_json::to_vec_pretty(&value)?;
     std::fs::write(finding_path, pretty)
@@ -10865,13 +10904,17 @@ mod cmplog_accumulate_tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("runtrace.jsonl"),
-            "{\"e\":\"cmplog\",\"k\":\"strcmp\",\"a\":\"5747543100\",\"b\":\"41\"}\n",
+            "{\"e\":\"cmplog\",\"k\":\"strcmp\",\"s\":\"00000010.00000020\",\"a\":\"41\",\"b\":\"5747543100\"}\n\
+             {\"e\":\"cmplog\",\"k\":\"strcmp\",\"s\":\"00000010.00000020\",\"a\":\"42\",\"b\":\"5747543100\"}\n",
         )
         .unwrap();
         harvest_pass_cmplog(&dir);
         let learned = std::fs::read_to_string(dir.join("learned_dictionary.txt")).unwrap();
         assert!(learned.contains("\"WGT1\\x00\"\n"), "{learned}");
-        assert!(learned.contains("\"A\"\n"), "{learned}");
+        assert!(
+            !learned.contains("\"A\"\n"),
+            "the inputs compared with the constant are not tokens: {learned}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -11132,6 +11175,7 @@ mod stamp_tests {
                 "/tmp/bhf/fake_env/ACME_HOME".to_owned(),
             )],
             None,
+            None,
             true,
         )
         .unwrap();
@@ -11150,10 +11194,62 @@ mod stamp_tests {
         let _ = fs::remove_file(&path);
     }
 
+    /// A finding of an entry whose reachability was inferred from its
+    /// signature records what it was inferred from, and its actionability
+    /// entry path carries it; a label without a basis drops a stale one.
+    #[test]
+    fn the_reachability_basis_is_stamped_with_its_label() {
+        let path = tmp_finding();
+        fs::write(
+            &path,
+            r#"{"id":"F-0001-abc","harness_id":"H-C0001","exception":{"name":"ASAN_HEAP_BUFFER_OVERFLOW"}}"#,
+        )
+        .unwrap();
+        let basis = target_rank::ReachabilityBasis {
+            rule: "const_byte_buffer".to_owned(),
+            param: Some("buf".to_owned()),
+            spelled_type: Some("const u8_t *".to_owned()),
+            resolved_type: Some("const uint8_t *".to_owned()),
+            typedefs_resolved: true,
+        };
+        stamp_runtime_mode(
+            &path,
+            Pass::Empty,
+            &[],
+            Some("attacker_reachable"),
+            Some(&basis),
+            false,
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(parsed["input_reachability"], "attacker_reachable");
+        assert_eq!(parsed["input_reachability_basis"]["param"], "buf");
+        assert_eq!(
+            parsed["input_reachability_basis"]["resolved_type"],
+            "const uint8_t *"
+        );
+        assert_eq!(
+            parsed["actionability"]["entry_path"]["reachability_basis"]["spelled_type"],
+            "const u8_t *"
+        );
+        stamp_runtime_mode(
+            &path,
+            Pass::Empty,
+            &[],
+            Some("ipc_channel_reachable"),
+            None,
+            false,
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(parsed.get("input_reachability_basis").is_none(), "{parsed}");
+        let _ = fs::remove_file(&path);
+    }
+
     #[test]
     fn empty_env_injected_stamps_empty_object() {
         let path = tmp_finding();
-        stamp_runtime_mode(&path, Pass::Empty, &[], None, false).unwrap();
+        stamp_runtime_mode(&path, Pass::Empty, &[], None, None, false).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(parsed["runtime_mode"]["pass"], "empty");
         assert_eq!(
@@ -11200,6 +11296,7 @@ mod stamp_tests {
                 "ACME_HOME".to_owned(),
                 "/tmp/bhf/fake_env/ACME_HOME".to_owned(),
             )],
+            None,
             None,
             true,
         )
@@ -12176,6 +12273,7 @@ mod foreign_cross_target_tests {
             is_static: false,
             foreign_guard: Some(guard.to_owned()),
             input_reachability: None,
+            input_reachability_basis: None,
             dialect: None,
         }
     }
@@ -12335,6 +12433,7 @@ mod platform_stub_tests {
             is_static: false,
             foreign_guard: Some(guard.to_owned()),
             input_reachability: None,
+            input_reachability_basis: None,
             dialect: None,
         }
     }
@@ -12835,6 +12934,7 @@ mod refused_repair_tracking_tests {
             is_static: false,
             foreign_guard: None,
             input_reachability: None,
+            input_reachability_basis: None,
             dialect: None,
         }
     }
@@ -13010,6 +13110,7 @@ mod refused_repair_tracking_tests {
             is_static: false,
             foreign_guard: None,
             input_reachability: None,
+            input_reachability_basis: None,
             dialect: None,
         };
         let error = BuildErrorKind::UndefinedSymbol {

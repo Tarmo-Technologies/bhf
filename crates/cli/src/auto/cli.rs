@@ -5647,6 +5647,7 @@ mod tests {
             is_static: false,
             foreign_guard: None,
             input_reachability: None,
+            input_reachability_basis: None,
             dialect: None,
         }
     }
@@ -5744,6 +5745,7 @@ mod tests {
                     is_static: false,
                     foreign_guard: None,
                     input_reachability: None,
+                    input_reachability_basis: None,
                     dialect: None,
                 },
                 outcome,
@@ -6449,6 +6451,7 @@ mod tests {
             is_static: false,
             foreign_guard: None,
             input_reachability: None,
+            input_reachability_basis: None,
             dialect: None,
         }
     }
@@ -6883,6 +6886,7 @@ mod tests {
                 is_static: false,
                 foreign_guard: None,
                 input_reachability: None,
+                input_reachability_basis: None,
                 dialect: None,
             },
             outcome,
@@ -6974,6 +6978,7 @@ mod tests {
                     is_static: false,
                     foreign_guard: None,
                     input_reachability: None,
+                    input_reachability_basis: None,
                     dialect: None,
                 },
                 outcome: Outcome::UnsupportedParams {
@@ -7020,6 +7025,7 @@ mod tests {
                 is_static: false,
                 foreign_guard: None,
                 input_reachability: None,
+                input_reachability_basis: None,
                 dialect: None,
             },
             outcome: Outcome::BuiltNotEntered {

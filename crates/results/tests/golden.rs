@@ -58,7 +58,8 @@ fn build(work: &Path) {
                        "site": "0x1a2b", "location": {"file": "/src/demo/src/parse.c", "line": 40, "function": "parse_header"},
                        "relation": "equal", "operands_equal": true}],
             "gate_capture": {"input": "min_testcase.bin", "input_len": 1, "status": "recorded", "reason": null,
-                             "comparisons": 2, "truncated": false, "unconfirmed": 0, "runs": 6, "shim_armed": false},
+                             "comparisons": 2, "truncated": false, "unconfirmed": 0, "runs": 6, "shim_armed": false,
+                             "derived_search": "done", "searched_bytes": 1},
             "build": {"binary": {"sha256": "2222222222222222222222222222222222222222222222222222222222222222", "build_id": "abcdef01"}}
         }),
     );

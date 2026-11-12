@@ -6157,25 +6157,42 @@ pub(crate) const LEARNED_DICTIONARY_FILE: &str = "learned_dictionary.txt";
 pub(crate) const LEARNED_DICTIONARY_MAX_TOKENS: usize = 256;
 /// Longest operand, in bytes, `learned_dictionary.txt` keeps.
 pub(crate) const LEARNED_TOKEN_MAX_LEN: usize = 64;
+/// The line that marks a `learned_dictionary.txt` written with only the
+/// comparison constants; a file without it (an earlier release's) held every
+/// operand, mutated inputs included.
+pub(crate) const LEARNED_CONSTANTS_MARKER: &str =
+    "# Tokens: the comparison constants, not the inputs compared with them.";
 /// The first lines of `learned_dictionary.txt`.
 pub(crate) const LEARNED_DICTIONARY_HEADER: &str = "\
 # Comparison operands observed at runtime while this harness was fuzzed
 # (the strcmp/memcmp-family operands recorded in cmplog.jsonl beside this
-# file), not mined from the source like dictionary.txt. Rewritten after each
-# fuzz pass that recorded any: that run's operands first, then the tokens an
-# earlier run learned, deduplicated, at most 256 tokens of at most 64 bytes.
+# file), not mined from the source like dictionary.txt. A token is an operand
+# that met more distinct values at one comparison site than any of them met
+# there (the constant stays, the input compared with it varies), or one that
+# dictionary.txt also lists; a record that names no site only confirms a
+# dictionary.txt token, and a one-byte variant of a stronger token is left
+# out. Rewritten after each fuzz pass that recorded any: that run's constants
+# first, then the tokens an earlier run learned, deduplicated, at most 256
+# tokens of at most 64 bytes.
+# Tokens: the comparison constants, not the inputs compared with them.
 ";
 
 /// Rewrite `<harness_dir>/learned_dictionary.txt` from the comparison
-/// operands in `<harness_dir>/cmplog.jsonl`: each distinct non-empty operand
-/// of at most [`LEARNED_TOKEN_MAX_LEN`] bytes, in the order recorded, then the
-/// tokens the file already held, up to [`LEARNED_DICTIONARY_MAX_TOKENS`].
-/// Returns how many tokens were written; with no usable operand (no
+/// operands in `<harness_dir>/cmplog.jsonl`: the comparison constants among
+/// them ([`cmplog::CmpLog::constant_operands`], with the harness's
+/// `dictionary.txt` corroborating an operand the records alone do not) of at most
+/// [`LEARNED_TOKEN_MAX_LEN`] bytes, then the tokens the file already held, up
+/// to [`LEARNED_DICTIONARY_MAX_TOKENS`]. A file an earlier release wrote,
+/// without [`LEARNED_CONSTANTS_MARKER`], held every operand: of its tokens
+/// only those this run found constant or `dictionary.txt` lists are kept; and
+/// an earlier token that is a one-byte edit of one already kept is dropped.
+/// Returns how many tokens were written; with no constant (no
 /// `cmplog.jsonl`, or none in it) the file is left as it was and 0 returned.
 pub(crate) fn write_learned_dictionary(harness_dir: &Path) -> std::io::Result<usize> {
     let Ok(log) = cmplog::ingest_from_jsonl_log(&harness_dir.join("cmplog.jsonl")) else {
         return Ok(0);
     };
+    let mined = load_afl_dictionary_tokens(&harness_dir.join("dictionary.txt")).unwrap_or_default();
     let mut tokens: Vec<Vec<u8>> = Vec::new();
     let push = |tokens: &mut Vec<Vec<u8>>, token: Vec<u8>| {
         if !token.is_empty()
@@ -6186,16 +6203,25 @@ pub(crate) fn write_learned_dictionary(harness_dir: &Path) -> std::io::Result<us
             tokens.push(token);
         }
     };
-    for token in log.dictionary_tokens() {
-        push(&mut tokens, token);
+    let constants = log.constant_operands(&mined);
+    for token in &constants {
+        push(&mut tokens, token.clone());
     }
     if tokens.is_empty() {
         return Ok(0);
     }
     let path = harness_dir.join(LEARNED_DICTIONARY_FILE);
+    let filtered = std::fs::read_to_string(&path)
+        .is_ok_and(|text| text.lines().any(|line| line == LEARNED_CONSTANTS_MARKER));
     if let Ok(earlier) = load_afl_dictionary_tokens(&path) {
         for token in earlier {
-            push(&mut tokens, token);
+            let trusted = filtered || constants.contains(&token) || mined.contains(&token);
+            let variant = tokens
+                .iter()
+                .any(|kept| kept != &token && cmplog::one_byte_edit(kept, &token));
+            if trusted && !variant {
+                push(&mut tokens, token);
+            }
         }
     }
     let mut out = String::from(LEARNED_DICTIONARY_HEADER);
@@ -9792,53 +9818,98 @@ exit 0
         assert_eq!(tokens, vec![b"READY".to_vec(), b"MODE_FAST".to_vec()]);
     }
 
-    /// Comparison operands recorded at runtime become learned_dictionary.txt:
-    /// deduplicated, bounded, under a header saying they were observed, with an
-    /// earlier run's tokens kept after this run's while there is room.
+    /// The comparison constants recorded at runtime become
+    /// learned_dictionary.txt: at each site, the operand that met more
+    /// distinct values than any of the mutated inputs compared with it,
+    /// deduplicated and bounded, under a header saying how they were chosen.
+    /// The input fragments they were compared against are not written, nor
+    /// are an unsited record's operands absent from dictionary.txt, nor those
+    /// an earlier, unfiltered file held; a file written with the filter keeps
+    /// its tokens after this run's.
     #[test]
-    fn learned_dictionary_is_written_from_runtime_operands() {
+    fn learned_dictionary_keeps_runtime_constants_not_input_fragments() {
         let root = tmpdir();
         let harness = root.join("harnesses/H-L");
         fs::create_dir_all(&harness).unwrap();
-        let record = |a: &[u8], b: &[u8]| {
-            let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let record = |site: &str, a: &[u8], b: &[u8]| {
             format!(
-                "{{\"e\":\"cmplog\",\"k\":\"memcmp\",\"a\":\"{}\",\"b\":\"{}\"}}\n",
+                "{{\"e\":\"cmplog\",\"k\":\"memcmp\",\"s\":\"{site}\",\"a\":\"{}\",\"b\":\"{}\"}}\n",
                 hex(a),
                 hex(b)
             )
         };
-        let mut log = record(b"WGT1", b"abcd");
-        log.push_str(&record(b"WGT1", b"zz\n"));
-        log.push_str(&record(&[b'x'; LEARNED_TOKEN_MAX_LEN + 1], b"ok"));
+        let mut log = String::new();
+        for fragment in [&b"abcd"[..], b"x\x01yz", b"~~~~"] {
+            log.push_str(&record("00000010.00000100", fragment, b"WGT1"));
+        }
+        for fragment in [&b"0q7z"[..], b"q\x91"] {
+            log.push_str(&record("00000020.00000100", fragment, b"zz\n"));
+        }
+        // Seen once: kept only because the mined dictionary has it.
+        log.push_str(&record("00000030.00000100", b"pppp", b"HDR1"));
+        log.push_str(&record("00000031.00000100", b"oooo", b"NOPE"));
+        // A record without a site (the runtrace shim writes those) only
+        // confirms a mined token, however many values its operands met.
+        for fragment in [&b"u1u1"[..], b"u2u2", b"u3u3"] {
+            log.push_str(&format!(
+                "{{\"e\":\"cmplog\",\"k\":\"memcmp\",\"a\":\"{}\",\"b\":\"{}\"}}\n",
+                hex(fragment),
+                hex(b"UNS1")
+            ));
+        }
+        let long = vec![b'x'; LEARNED_TOKEN_MAX_LEN + 1];
+        for fragment in [&b"aa"[..], b"bb"] {
+            log.push_str(&record("00000040.00000100", fragment, &long));
+        }
         log.push_str("{\"e\":\"getenv\",\"name\":\"HOME\"}\n");
         fs::write(harness.join("cmplog.jsonl"), &log).unwrap();
+        fs::write(harness.join("dictionary.txt"), "\"HDR1\"\n").unwrap();
+        // A file an earlier release wrote, with every operand in it.
         fs::write(
             harness.join(LEARNED_DICTIONARY_FILE),
-            format!("{LEARNED_DICTIONARY_HEADER}\"OLD1\"\n\"abcd\"\n"),
+            "# Comparison operands observed at runtime\n\"OLD1\"\n\"~~~~\"\n",
         )
         .unwrap();
 
-        assert_eq!(write_learned_dictionary(&harness).unwrap(), 5);
+        assert_eq!(write_learned_dictionary(&harness).unwrap(), 3);
         let text = fs::read_to_string(harness.join(LEARNED_DICTIONARY_FILE)).unwrap();
         assert!(text.starts_with(LEARNED_DICTIONARY_HEADER), "{text}");
         assert!(LEARNED_DICTIONARY_HEADER.contains("observed at runtime"));
         let tokens = load_afl_dictionary_tokens(&harness.join(LEARNED_DICTIONARY_FILE)).unwrap();
         assert_eq!(
             tokens,
+            vec![b"WGT1".to_vec(), b"zz\n".to_vec(), b"HDR1".to_vec()],
+            "constants only, strongest first; no input fragment and no unfiltered earlier token"
+        );
+
+        // A later run's constants come first, then the filtered file's.
+        let next: String = [&b"m1m1"[..], b"m2m2"]
+            .iter()
+            .map(|fragment| record("00000050.00000100", fragment, b"NEW1"))
+            .collect();
+        fs::write(harness.join("cmplog.jsonl"), next).unwrap();
+        assert_eq!(write_learned_dictionary(&harness).unwrap(), 4);
+        assert_eq!(
+            load_afl_dictionary_tokens(&harness.join(LEARNED_DICTIONARY_FILE)).unwrap(),
             vec![
+                b"NEW1".to_vec(),
                 b"WGT1".to_vec(),
-                b"abcd".to_vec(),
                 b"zz\n".to_vec(),
-                b"ok".to_vec(),
-                b"OLD1".to_vec(),
-            ],
-            "this run's operands first, the overlong one dropped, then the earlier run's"
+                b"HDR1".to_vec()
+            ]
         );
 
         // Bounded: never more than LEARNED_DICTIONARY_MAX_TOKENS.
         let many: String = (0..LEARNED_DICTIONARY_MAX_TOKENS + 40)
-            .map(|i| record(format!("T{i:04}").as_bytes(), b""))
+            .flat_map(|i| {
+                let site = format!("{i:08x}.00000100");
+                let constant = format!("T{i:04}");
+                [b"in-1".to_vec(), b"in-2".to_vec()]
+                    .into_iter()
+                    .map(move |fragment| record(&site, &fragment, constant.as_bytes()))
+                    .collect::<Vec<_>>()
+            })
             .collect();
         fs::write(harness.join("cmplog.jsonl"), many).unwrap();
         assert_eq!(
@@ -9856,8 +9927,9 @@ exit 0
         );
     }
 
-    /// A runtime operand holding a protocol delimiter (`\r\n`) is written with
-    /// `\xNN` escapes, which AFL++ loads, and reads back as the same bytes.
+    /// A runtime constant holding a protocol delimiter (`\r\n`) is written
+    /// with `\xNN` escapes, which AFL++ loads, and reads back as the same
+    /// bytes.
     #[test]
     fn a_learned_crlf_operand_is_written_with_hex_escapes() {
         let root = tmpdir();
@@ -9865,17 +9937,17 @@ exit 0
         fs::create_dir_all(&harness).unwrap();
         fs::write(
             harness.join("cmplog.jsonl"),
-            "{\"e\":\"cmplog\",\"k\":\"memcmp\",\"a\":\"410d0a42\",\"b\":\"0941\"}\n",
+            "{\"e\":\"cmplog\",\"k\":\"memcmp\",\"s\":\"00000010.00000000\",\"a\":\"410d0a42\",\"b\":\"0941\"}\n\
+             {\"e\":\"cmplog\",\"k\":\"memcmp\",\"s\":\"00000010.00000000\",\"a\":\"410d0a42\",\"b\":\"0942\"}\n",
         )
         .unwrap();
-        assert_eq!(write_learned_dictionary(&harness).unwrap(), 2);
+        assert_eq!(write_learned_dictionary(&harness).unwrap(), 1);
         let text = fs::read_to_string(harness.join(LEARNED_DICTIONARY_FILE)).unwrap();
         assert!(text.contains("\"A\\x0d\\x0aB\"\n"), "{text}");
-        assert!(text.contains("\"\\x09A\"\n"), "{text}");
         assert!(!text.contains("\\r") && !text.contains("\\n\""), "{text}");
         assert_eq!(
             load_afl_dictionary_tokens(&harness.join(LEARNED_DICTIONARY_FILE)).unwrap(),
-            vec![b"A\r\nB".to_vec(), b"\tA".to_vec()]
+            vec![b"A\r\nB".to_vec()]
         );
     }
 

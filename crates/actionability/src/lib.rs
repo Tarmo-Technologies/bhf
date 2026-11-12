@@ -142,6 +142,11 @@ pub struct EntryPath {
     ///   behavior, never downgraded on this signal alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attacker_reachable: Option<bool>,
+    /// What the entry's reachability was inferred from, as the finding records
+    /// it (`input_reachability_basis`): the rule, the parameter, and its type
+    /// as spelled and resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reachability_basis: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -752,6 +757,10 @@ pub fn value_for_finding(mode: RunMode, raw: &Value, finding_json_path: Option<&
 
 fn entry_path_from(raw: &Value) -> Option<EntryPath> {
     let signal = attacker_reachable_signal(raw);
+    let basis = raw
+        .get("input_reachability_basis")
+        .filter(|basis| basis.is_object())
+        .cloned();
     if let Some(entry) = raw
         .get("actionability")
         .and_then(|value| value.get("entry_path"))
@@ -772,6 +781,12 @@ fn entry_path_from(raw: &Value) -> Option<EntryPath> {
             target,
             evidence: string_array_at(entry, &["evidence"]),
             attacker_reachable,
+            reachability_basis: basis.or_else(|| {
+                entry
+                    .get("reachability_basis")
+                    .filter(|basis| basis.is_object())
+                    .cloned()
+            }),
         });
     }
     let target = target_name(raw);
@@ -782,6 +797,7 @@ fn entry_path_from(raw: &Value) -> Option<EntryPath> {
             target,
             evidence: Vec::new(),
             attacker_reachable: signal,
+            reachability_basis: basis,
         });
     }
     None
@@ -2128,6 +2144,7 @@ pub fn reachability_statement(raw: &Value, entry: Option<&str>) -> String {
     let verdict = string_at(raw, &["actionability", "verdict"]).unwrap_or_default();
     let reachability = string_at(raw, &["input_reachability"])
         .or_else(|| string_at(raw, &["target", "input_reachability"]));
+    let basis = ReachabilityBasisText::of(raw);
     let entry = match entry.map(str::trim).filter(|name| !name.is_empty()) {
         Some(name) => format!("the entry `{name}`"),
         None => match string_at(raw, &["target", "subprogram"]) {
@@ -2141,9 +2158,14 @@ pub fn reachability_statement(raw: &Value, entry: Option<&str>) -> String {
             .to_owned(),
         "likely_reachable" => match reachability.as_deref() {
             Some("attacker_reachable") => format!(
-                "the signature of {entry} matches an input-taking shape, so likely reachable \
+                "the signature of {entry} matches an input-taking shape{}, so likely reachable \
                  from input; not proven (inferred from its signature; bhf's harness calls it \
-                 directly)"
+                 directly)",
+                basis
+                    .as_ref()
+                    .and_then(ReachabilityBasisText::reason)
+                    .map(|reason| format!(" because {reason}"))
+                    .unwrap_or_default()
             ),
             Some("ipc_channel_reachable") => format!(
                 "input reached {entry} through a virtualized IPC channel, so likely reachable \
@@ -2183,13 +2205,31 @@ pub fn reachability_statement(raw: &Value, entry: Option<&str>) -> String {
                     .to_owned()
             } else {
                 match reachability.as_deref() {
-                    // The classifier reads type spellings: a typedef'd byte
-                    // buffer (`frame_buf_t`) does not show as one.
+                    Some("reachability_unproven")
+                        if basis.as_ref().is_some_and(|b| b.rule == "internal_linkage") =>
+                    {
+                        format!(
+                            "reproducible in the lab; {entry} has internal linkage (`static`), so \
+                             nothing outside its file calls it directly{}; reachability from \
+                             input is unproven",
+                            basis
+                                .as_ref()
+                                .and_then(ReachabilityBasisText::shape)
+                                .map(|shape| format!(" although {shape}"))
+                                .unwrap_or_default()
+                        )
+                    }
+                    // The classifier reads parameter types with the file's
+                    // typedefs resolved when it records doing so.
                     Some("reachability_unproven") => format!(
-                        "reproducible in the lab; the signature of {entry}, as spelled, does \
-                         not match an input-taking shape (a read-only byte buffer, or a \
-                         parser-named entry with a length), so reachability from input is \
-                         unproven"
+                        "reproducible in the lab; the signature of {entry}{} does not match an \
+                         input-taking shape (a read-only byte buffer, or a parser-named entry \
+                         with a length), so reachability from input is unproven",
+                        if basis.as_ref().is_some_and(|b| b.typedefs_resolved) {
+                            ", with its typedefs resolved,"
+                        } else {
+                            ""
+                        }
                     ),
                     Some("output_serializer") => format!(
                         "reproducible in the lab; {entry} looks like an output serializer, so \
@@ -2205,6 +2245,110 @@ pub fn reachability_statement(raw: &Value, entry: Option<&str>) -> String {
                 .to_owned()
         }
         _ => "not assessed".to_owned(),
+    }
+}
+
+/// Caveats on a finding's reachability for states bhf's harness made that
+/// real callers may never produce: an `input` (the one shown or judged) that is
+/// empty or all zero bytes, so every argument decoded from it is zero, and a
+/// method that ran on an object the harness built (the receiver entry of
+/// `decoded_args`, which says how). Empty for anything else.
+pub fn harness_state_caveats(raw: &Value, input: Option<&[u8]>) -> Vec<String> {
+    let mut caveats = Vec::new();
+    if let Some(input) = input.filter(|input| input.iter().all(|byte| *byte == 0)) {
+        let what = if input.is_empty() {
+            "the input is empty, so every scalar argument is 0 and every buffer is empty"
+        } else {
+            "the input is all zero bytes, so every argument decoded from it is zero"
+        };
+        caveats.push(format!(
+            "{what}: a real caller may never pass all-zero arguments; check that one can before \
+             treating this as reachable"
+        ));
+    }
+    let receiver = raw
+        .get("decoded_args")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|arg| {
+            string_at(arg, &["role"]).as_deref() == Some("receiver")
+                && string_at(arg, &["name"]).as_deref() == Some("receiver")
+        });
+    if let Some(receiver) = receiver {
+        let how = string_at(receiver, &["decoder"])
+            .filter(|how| !how.trim().is_empty())
+            .unwrap_or_else(|| "how is not recorded".to_owned());
+        caveats.push(format!(
+            "the method ran on an object bhf's harness constructed ({how}); real callers may \
+             never put the object in that state"
+        ));
+    }
+    caveats
+}
+
+/// A finding's `input_reachability_basis`, read for its wording.
+struct ReachabilityBasisText {
+    rule: String,
+    param: Option<String>,
+    spelled_type: Option<String>,
+    resolved_type: Option<String>,
+    typedefs_resolved: bool,
+}
+
+impl ReachabilityBasisText {
+    fn of(raw: &Value) -> Option<Self> {
+        let basis = raw
+            .get("input_reachability_basis")
+            .or_else(|| raw.pointer("/actionability/entry_path/reachability_basis"))
+            .filter(|basis| basis.is_object())?;
+        Some(Self {
+            rule: string_at(basis, &["rule"])?,
+            param: string_at(basis, &["param"]),
+            spelled_type: string_at(basis, &["spelled_type"]),
+            resolved_type: string_at(basis, &["resolved_type"]),
+            typedefs_resolved: basis
+                .get("typedefs_resolved")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        })
+    }
+
+    /// `parameter `buf` (`const u8_t *`, resolves to `const uint8_t *`)`.
+    fn parameter(&self) -> Option<String> {
+        let param = self.param.as_deref()?;
+        let types = match (self.spelled_type.as_deref(), self.resolved_type.as_deref()) {
+            (Some(spelled), Some(resolved)) => {
+                format!(" (`{spelled}`, resolves to `{resolved}`)")
+            }
+            (Some(spelled), None) => format!(" (`{spelled}`)"),
+            _ => String::new(),
+        };
+        Some(format!("parameter `{param}`{types}"))
+    }
+
+    /// What made the signature input-taking, by the rule that decided it.
+    fn shape(&self) -> Option<String> {
+        let parameter = self.parameter()?;
+        let what = match self.rule.as_str() {
+            "const_byte_buffer" | "internal_linkage" => "is a read-only byte buffer",
+            "parser_name_with_length" => {
+                "is a read-only buffer of a parser-named entry that also takes a length"
+            }
+            "mutable_parser_buffer" => {
+                "is a byte buffer of a parser-named entry that also takes a length"
+            }
+            "byte_scalar_parser" => "is the one input byte of a parser-named entry",
+            _ => return None,
+        };
+        Some(format!("{parameter} {what}"))
+    }
+
+    /// The reason a signature verdict of input-reachable rests on.
+    fn reason(&self) -> Option<String> {
+        (self.rule != "internal_linkage")
+            .then(|| self.shape())
+            .flatten()
     }
 }
 

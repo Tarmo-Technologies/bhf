@@ -436,10 +436,37 @@ pub struct FuzzBlock {
     /// Added after the first v1 release, like `input_to_state`.
     #[serde(default)]
     pub input_to_state_input: Option<String>,
+    /// What the comparison-evidence capture found (`finding.json`
+    /// `gate_capture.status`): `recorded`, `no_input_comparisons`,
+    /// `no_comparisons` or `unavailable`. `null` when no capture ran. Added
+    /// after the first v1 release, like `input_to_state`.
+    #[serde(default)]
+    pub input_to_state_status: Option<String>,
+    /// Why the capture recorded no evidence (`gate_capture.reason`), when it
+    /// did not.
+    #[serde(default)]
+    pub input_to_state_reason: Option<String>,
+    /// How far the capture's search for operands computed from input bytes
+    /// (range checks) got. `null` when that search did not run or its state
+    /// was not recorded.
+    #[serde(default)]
+    pub input_to_state_search: Option<InputToStateSearch>,
     /// The values the harness decoded from the input and passed to the target
     /// (`decoded_args` in `finding.json`). `null` when they were not traced.
     #[serde(default)]
     pub arguments: Option<Vec<Argument>>,
+}
+
+/// How far a capture's search for operands computed from input bytes got.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InputToStateSearch {
+    /// `done`, `partial` (its replay budget ran out) or `too_long` (the input
+    /// was too long to search).
+    pub state: String,
+    /// The input bytes it covered, of `input_len`.
+    pub searched_bytes: u64,
+    pub input_len: u64,
 }
 
 /// A sanitizer-reported memory access.

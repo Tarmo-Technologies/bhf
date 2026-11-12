@@ -102,6 +102,7 @@ fn calling_convention_macro_funcptr_field_builds() {
         is_static: true,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&dir).unwrap();

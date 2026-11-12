@@ -950,6 +950,7 @@ mod tests {
             is_static: false,
             foreign_guard: Some("__aarch64__".to_owned()),
             input_reachability: None,
+            input_reachability_basis: None,
             dialect: None,
         };
         let mut missing = DependencyManifest::new();

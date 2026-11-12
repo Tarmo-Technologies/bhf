@@ -799,6 +799,7 @@ pub fn load_resumed_result(work_dir: &Path, harness_id: &str) -> Option<(Attempt
             is_static: dto.is_static,
             foreign_guard: dto.foreign_guard,
             input_reachability: dto.input_reachability.as_deref().and_then(reach_from_tag),
+            input_reachability_basis: None,
             dialect: None,
         },
         outcome: dto.outcome,
@@ -3873,6 +3874,7 @@ mod tests {
             is_static: false,
             foreign_guard: None,
             input_reachability: None,
+            input_reachability_basis: None,
             dialect: None,
         }
     }
@@ -4070,8 +4072,9 @@ mod tests {
             .lines()
             .find(|l| l.starts_with("F-0000-fab0cafe"))
             .unwrap();
+        // The build_fidelity column, then input_to_state_status (no capture).
         assert!(
-            row.ends_with("\"reduced: macro WIDGET_SLOTS=0, header tables.h\""),
+            row.ends_with("\"reduced: macro WIDGET_SLOTS=0, header tables.h\","),
             "{row}"
         );
         let md = std::fs::read_to_string(work.join("auto/run.md")).unwrap();

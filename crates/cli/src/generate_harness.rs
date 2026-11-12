@@ -11743,8 +11743,10 @@ pub(crate) fn ranking_type_registry<'a>(
 
 /// The simple aliases `source` declares: `typedef <type> NAME[, NAME2];` and
 /// `using NAME = <type>;` statements that begin a line and have no body,
-/// pointer, reference, array, template or function type. Every alias that
-/// can resolve to a scalar has this form.
+/// reference, array, template or function type. Every alias that can resolve
+/// to a scalar has this form. A typedef of a single pointer
+/// (`typedef const octet_t *rbuf_t;`) is kept too, as `const octet_t *`: its
+/// pointee's qualifiers say whether a parameter of that type is read-only.
 fn simple_aliases(source: &str) -> Vec<c_parser::CTypedefDef> {
     let identifier = |text: &str| {
         text.chars()
@@ -11795,6 +11797,19 @@ fn simple_aliases(source: &str) -> Vec<c_parser::CTypedefDef> {
             let mut parts = statement.split(',');
             let first = parts.next().unwrap_or_default();
             if first.contains('*') {
+                // One declarator, one pointer level, a plain pointee.
+                if parts.next().is_none() && first.matches('*').count() == 1 {
+                    if let Some((base, name)) = first.rsplit_once('*') {
+                        let (base, name) = (base.trim(), name.trim());
+                        if identifier(name)
+                            && !base.is_empty()
+                            && base.split_whitespace().all(identifier)
+                        {
+                            let base = base.split_whitespace().collect::<Vec<_>>().join(" ");
+                            alias(name, &format!("{base} *"));
+                        }
+                    }
+                }
                 continue;
             }
             let words: Vec<&str> = first.split_whitespace().collect();
@@ -11891,13 +11906,24 @@ pub(crate) fn ranking_header(canonical: &Path, cpp: bool) -> Option<std::sync::A
         }
     }
     let text = crate::source_text::read_source_text(canonical).ok()?;
-    let typedefs = if cpp {
+    let mut typedefs = if cpp {
         cpp_parser::parse_cpp_type_defs(&text).ok()
     } else {
         c_parser::parse_c_type_defs(&text).ok()
     }
     .map(|defs| defs.typedefs)
     .unwrap_or_default();
+    // The parser drops a pointer typedef's pointee qualifiers; the text keeps
+    // them (`const octet_t *`), which says whether the pointee is read-only.
+    for pointer in simple_aliases(&text)
+        .into_iter()
+        .filter(|alias| alias.underlying.ends_with(" *"))
+    {
+        match typedefs.iter_mut().find(|known| known.name == pointer.name) {
+            Some(known) => known.underlying = pointer.underlying,
+            None => typedefs.push(pointer),
+        }
+    }
     let header = Arc::new(RankingHeader {
         typedefs: c_parser::CTypeDefs {
             structs: Vec::new(),
@@ -22579,8 +22605,9 @@ class basic_json
 
     /// A file's own aliases are read from its text: the scalar-shaped
     /// `typedef` and `using` statements, across line breaks and around
-    /// comments, and not a commented-out one or a pointer, array, function
-    /// or aggregate alias.
+    /// comments, and not a commented-out one or an array, function or
+    /// aggregate alias. A typedef of one pointer keeps its pointee's
+    /// qualifiers, which say whether a parameter of that type is read-only.
     #[test]
     fn ranking_reads_the_simple_aliases_a_file_declares() {
         let aliases = super::simple_aliases(
@@ -22608,7 +22635,22 @@ class basic_json
                 ("byte_t", "unsigned char", 2),
                 ("len16_t", "unsigned short", 3),
                 ("size16", "std::uint16_t", 6),
+                ("label_t", "const char *", 11),
             ]
+        );
+        let pointers = super::simple_aliases(
+            "typedef const octet_t * rbuf_t;\n\
+             typedef octet_t*mbuf_t;\n\
+             typedef const octet_t **cbufs_t;\n\
+             typedef octet_t *one_t, *two_t;\n",
+        );
+        let found: Vec<(&str, &str)> = pointers
+            .iter()
+            .map(|a| (a.name.as_str(), a.underlying.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            [("rbuf_t", "const octet_t *"), ("mbuf_t", "octet_t *")]
         );
     }
 

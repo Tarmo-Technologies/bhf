@@ -95,11 +95,16 @@ family, with both operands, whether they were equal, and the call site. Satisfie
 comparisons and zero operands are kept, unlike the cmplog ring. Comparisons the
 harness makes before it enters the target (its own decoding of the input) are
 discarded when it calls `bhf_target_enter`, so they cannot use up the 8192
-records a run keeps. Calls from outside the executable are left out, with one
-exception: under AddressSanitizer the `memcmp`/`bcmp` interceptor reports a
-position inside itself as the call site, so every `memcmp` and `bcmp` call
-shares that one site wherever it was made, including from a shared library,
-and its evidence carries no source position. bhf sets the variable only for
+records a run keeps. Calls from outside the executable are left out. Under
+AddressSanitizer the `memcmp`/`bcmp` interceptor reports a position inside
+itself as the call site, so for buffer and string comparisons the driver also
+records the return addresses of the four frames above that position (glibc's
+`backtrace()`; record format version 2). When the evidence is read, the first
+of them that is not the sanitizer runtime is the comparison's site, so the
+gate names the target's call line, a `memcmp` in harness code is left out like
+any harness comparison, and a call whose caller is in a shared library is
+dropped. When no frame resolves, the gate says its site is not attributable
+(sanitizer interceptor) instead of naming the interceptor's address. bhf sets the variable only for
 the replays that record a finding's evidence; a fuzz campaign never does, so
 each callback costs one pointer test.
 

@@ -6,8 +6,8 @@ use crate::confirmation::{self, ConfirmationInput};
 use crate::model::{
     AccessParameter, AccessRegion, Argument, BinaryBlock, BuildInfo, Component, Confidence,
     Confirmation, ConfirmationLevel, Evidence, EvidenceFile, ExceptionInfo, Fidelity, Finding,
-    Fingerprint, Frame, FuzzBlock, InputToState, Kind, Location, MemoryAccess, PatchHint,
-    Reproduce, RuleRef, ScaBlock, StaticBlock, TraceStep,
+    Fingerprint, Frame, FuzzBlock, InputToState, InputToStateSearch, Kind, Location, MemoryAccess,
+    PatchHint, Reproduce, RuleRef, ScaBlock, StaticBlock, TraceStep,
 };
 use crate::severity;
 use serde_json::Value;
@@ -192,6 +192,12 @@ pub fn from_finding_report(
         .unwrap_or_else(|| primary.clone());
     let finding_dir = ctx.results_dir.join("findings").join(&f.id);
     let evidence = evidence_for(&finding_dir, &f.id);
+    if matches!(kind, Kind::Fuzz | Kind::Runtime) {
+        caveats.extend(actionability::harness_state_caveats(
+            raw,
+            judged_input(&finding_dir).as_deref(),
+        ));
+    }
     let has_replay = evidence
         .as_ref()
         .is_some_and(|e| e.files.iter().any(|file| file.role == "replay_script"));
@@ -287,6 +293,13 @@ pub fn from_finding_report(
                 .and_then(|gates| input_to_state(gates, ctx.source_root)),
             input_to_state_input: comparison_evidence(raw)
                 .and(str_at(raw, &["gate_capture", "input"])),
+            input_to_state_status: str_at(raw, &["gate_capture", "status"]),
+            input_to_state_reason: str_at(raw, &["gate_capture", "reason"]).filter(|_| {
+                raw.get("gates")
+                    .and_then(Value::as_array)
+                    .is_none_or(Vec::is_empty)
+            }),
+            input_to_state_search: input_to_state_search(raw),
             arguments: raw.get("decoded_args").and_then(arguments),
         }),
         static_: (kind == Kind::Static).then(|| StaticBlock {
@@ -379,6 +392,19 @@ fn access_parameter(parameter: &Value) -> Option<AccessParameter> {
         name,
         offset: parameter.get("offset").and_then(Value::as_i64),
         basis,
+    })
+}
+
+/// `finding.json` `gate_capture`'s search for computed operands, when it
+/// recorded one.
+fn input_to_state_search(raw: &Value) -> Option<InputToStateSearch> {
+    let capture = raw.get("gate_capture")?;
+    let state = str_at(capture, &["derived_search"])
+        .filter(|state| matches!(state.as_str(), "done" | "partial" | "too_long"))?;
+    Some(InputToStateSearch {
+        state,
+        searched_bytes: capture.get("searched_bytes").and_then(Value::as_u64)?,
+        input_len: capture.get("input_len").and_then(Value::as_u64)?,
     })
 }
 
@@ -1075,6 +1101,23 @@ fn truncate(text: &str, max: usize) -> String {
     let mut out: String = text.chars().take(max - 1).collect();
     out.push('…');
     out
+}
+
+/// The input a finding is judged on: `min_testcase.bin`, else
+/// `testcase.bin` (regular files only, at most [`MAX_JUDGED_INPUT`] bytes).
+fn judged_input(finding_dir: &Path) -> Option<Vec<u8>> {
+    const MAX_JUDGED_INPUT: u64 = 1 << 20;
+    ["min_testcase.bin", "testcase.bin"]
+        .iter()
+        .find_map(|name| {
+            let (file, size) = open_regular(&finding_dir.join(name))?;
+            if size > MAX_JUDGED_INPUT {
+                return None;
+            }
+            let mut bytes = Vec::new();
+            file.take(MAX_JUDGED_INPUT).read_to_end(&mut bytes).ok()?;
+            Some(bytes)
+        })
 }
 
 fn evidence_for(finding_dir: &Path, id: &str) -> Option<Evidence> {
@@ -1851,6 +1894,122 @@ mod tests {
         let fuzz = normalize(raw, None).fuzz.unwrap();
         assert!(fuzz.input_to_state.is_none(), "{:?}", fuzz.input_to_state);
         assert!(fuzz.input_to_state_input.is_none());
+    }
+
+    /// The basis the entry's reachability was inferred from reaches the
+    /// results finding with its entry path.
+    #[test]
+    fn the_reachability_basis_reaches_the_results_finding() {
+        let mut raw = asan_record();
+        raw["input_reachability"] = json!("attacker_reachable");
+        raw["input_reachability_basis"] = json!({"rule": "const_byte_buffer", "param": "data",
+            "spelled_type": "rbuf_t", "resolved_type": "const uint8_t *",
+            "typedefs_resolved": true});
+        let finding = normalize(raw, None);
+        let reachability = finding.reachability.expect("an entry path");
+        assert_eq!(reachability["attacker_reachable"], true);
+        assert_eq!(reachability["reachability_basis"]["param"], "data");
+        assert_eq!(
+            reachability["reachability_basis"]["resolved_type"],
+            "const uint8_t *"
+        );
+    }
+
+    /// A finding whose input is all zero bytes, or whose method ran on an
+    /// object the harness built, carries a caveat that real callers may never
+    /// produce that state.
+    #[test]
+    fn constructed_input_states_are_caveated() {
+        let mut raw = asan_record();
+        raw["decoded_args"] = json!([
+            {"name": "receiver", "type": "Widget", "role": "receiver", "decoder": "factory Widget::make()"}
+        ]);
+        let (_tmp, finding) = normalize_dir(raw, None, |dir| {
+            std::fs::write(dir.join("testcase.bin"), [0u8; 8]).unwrap();
+        });
+        let caveats = finding.fidelity.caveats.join(" | ");
+        assert!(
+            caveats.contains("a real caller may never pass all-zero arguments"),
+            "{caveats}"
+        );
+        assert!(
+            caveats.contains(
+                "the method ran on an object bhf's harness constructed (factory Widget::make())"
+            ),
+            "{caveats}"
+        );
+        // The minimized input is the one judged, and a plain function has no
+        // receiver.
+        let (_tmp, finding) = normalize_dir(asan_record(), None, |dir| {
+            std::fs::write(dir.join("testcase.bin"), [0u8; 8]).unwrap();
+            std::fs::write(dir.join("min_testcase.bin"), [1u8]).unwrap();
+        });
+        assert!(
+            finding.fidelity.caveats.is_empty(),
+            "{:?}",
+            finding.fidelity.caveats
+        );
+    }
+
+    /// When a capture found no comparison evidence, the fuzz block says
+    /// whether it ran and why it found none, and how far the search for
+    /// operands computed from input bytes got.
+    #[test]
+    fn the_fuzz_block_says_why_a_capture_has_no_evidence() {
+        let mut raw = asan_record();
+        raw["gates"] = json!([]);
+        raw["gate_capture"] = json!({"input": "testcase.bin", "input_len": 64,
+            "status": "no_input_comparisons",
+            "reason": "4 comparison(s) recorded; no operand followed a change of the input bytes",
+            "derived_search": "partial", "searched_bytes": 10});
+        let fuzz = normalize(raw, None).fuzz.unwrap();
+        assert_eq!(fuzz.input_to_state, Some(Vec::new()));
+        assert_eq!(
+            fuzz.input_to_state_status.as_deref(),
+            Some("no_input_comparisons")
+        );
+        assert_eq!(
+            fuzz.input_to_state_reason.as_deref(),
+            Some("4 comparison(s) recorded; no operand followed a change of the input bytes")
+        );
+        let search = fuzz.input_to_state_search.expect("the search");
+        assert_eq!(
+            (
+                search.state.as_str(),
+                search.searched_bytes,
+                search.input_len
+            ),
+            ("partial", 10, 64)
+        );
+
+        // A capture that could not run has no evidence, but says why.
+        let mut raw = asan_record();
+        raw["gate_capture"] = json!({"input": "testcase.bin", "input_len": 6,
+            "status": "unavailable", "reason": "the harness binary was not found"});
+        let fuzz = normalize(raw, None).fuzz.unwrap();
+        assert!(fuzz.input_to_state.is_none());
+        assert_eq!(fuzz.input_to_state_status.as_deref(), Some("unavailable"));
+        assert_eq!(
+            fuzz.input_to_state_reason.as_deref(),
+            Some("the harness binary was not found")
+        );
+        assert!(fuzz.input_to_state_search.is_none());
+
+        // No capture at all: nothing to say.
+        let fuzz = normalize(asan_record(), None).fuzz.unwrap();
+        assert!(fuzz.input_to_state_status.is_none() && fuzz.input_to_state_reason.is_none());
+        // A document written before the fields existed still reads.
+        let mut old = serde_json::to_value(&fuzz).unwrap();
+        let object = old.as_object_mut().unwrap();
+        for key in [
+            "input_to_state_status",
+            "input_to_state_reason",
+            "input_to_state_search",
+        ] {
+            object.remove(key);
+        }
+        let back: crate::model::FuzzBlock = serde_json::from_value(old).unwrap();
+        assert!(back.input_to_state_status.is_none());
     }
 
     #[test]

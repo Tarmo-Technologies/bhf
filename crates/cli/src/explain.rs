@@ -235,6 +235,11 @@ fn explain_one(work_dir: &Path, f: &Finding, others: &[String], collapsed: bool)
         }
     }
 
+    // The input shown: the minimized one when there is one. What the crash
+    // recorded (the argument trace, the memory access) is testcase.bin's.
+    let input = gate_evidence::preferred_input(&f.dir);
+    let recorded_on = recorded_on_label(&f.dir, input.as_ref());
+
     // WHAT HAPPENED
     let exc = str_at(&f.raw, "/exception/name").unwrap_or("");
     let sink_file = str_at(&f.raw, "/actionability/sink/file").unwrap_or("");
@@ -245,7 +250,11 @@ fn explain_one(work_dir: &Path, f: &Finding, others: &[String], collapsed: bool)
         .and_then(Value::as_u64);
     let _ = writeln!(s, "\nWHAT HAPPENED");
     if let Some(expl) = str_at(&f.raw, "/actionability/explanation") {
-        for line in wrap(expl, 76) {
+        let expl = match &input {
+            Some((name, _)) => retarget_trigger(expl, name),
+            None => expl.to_owned(),
+        };
+        for line in wrap(&expl, 76) {
             let _ = writeln!(s, "  {line}");
         }
     }
@@ -287,13 +296,12 @@ fn explain_one(work_dir: &Path, f: &Finding, others: &[String], collapsed: bool)
         let _ = writeln!(s, "  Sanitizer report: {}", message.trim());
     }
     if let Some(access) = f.raw.pointer("/exception/access") {
-        for line in access_lines(access) {
+        for line in access_lines(access, recorded_on.as_deref()) {
             let _ = writeln!(s, "{line}");
         }
     }
 
     // THE INPUT THAT TRIGGERS IT: the minimized input when there is one.
-    let input = gate_evidence::preferred_input(&f.dir);
     if let Some((name, bytes)) = &input {
         let _ = writeln!(
             s,
@@ -337,7 +345,7 @@ fn explain_one(work_dir: &Path, f: &Finding, others: &[String], collapsed: bool)
     }
 
     // HARNESS ARGUMENTS: what each parameter was decoded to
-    for line in argument_lines(work_dir, f, &evidence) {
+    for line in argument_lines(work_dir, f, &evidence, input.as_ref()) {
         let _ = writeln!(s, "{line}");
     }
 
@@ -368,6 +376,20 @@ fn explain_one(work_dir: &Path, f: &Finding, others: &[String], collapsed: bool)
     {
         let indent = if index == 0 { "  " } else { "    " };
         let _ = writeln!(s, "{indent}{line}");
+    }
+    // States bhf's harness made (all-zero arguments, a receiver it built)
+    // that real callers may never produce.
+    for caveat in actionability::harness_state_caveats(
+        &f.raw,
+        input.as_ref().map(|(_, bytes)| bytes.as_slice()),
+    ) {
+        for (index, line) in wrap(&format!("Caveat: {caveat}"), 76)
+            .into_iter()
+            .enumerate()
+        {
+            let indent = if index == 0 { "  " } else { "    " };
+            let _ = writeln!(s, "{indent}{line}");
+        }
     }
     if let Some(prov) = str_at(&f.raw, "/provenance") {
         let note = str_at(&f.raw, "/stub_provenance/note").unwrap_or("");
@@ -504,9 +526,18 @@ fn reproduce_lines(work_dir: &Path, f: &Finding) -> Vec<String> {
 
 /// The HARNESS ARGUMENTS section: the value the harness decoded for each
 /// parameter, from the argument trace recorded in `decoded.json`, or why there
-/// is none and how to get it. A parameter whose input bytes a recorded
-/// comparison read is tagged `[compared at <site>]`.
-fn argument_lines(work_dir: &Path, f: &Finding, evidence: &Evidence) -> Vec<String> {
+/// is none and how to get it. The trace was recorded on `testcase.bin`; when
+/// the input shown is a minimized file with other bytes, each parameter is
+/// decoded from those bytes with the harness's `arg-layout.json` instead (a
+/// parameter the layout cannot decode says so, with its traced value). A
+/// parameter whose input bytes a recorded comparison read is tagged
+/// `[compared at <site>]`.
+fn argument_lines(
+    work_dir: &Path,
+    f: &Finding,
+    evidence: &Evidence,
+    input: Option<&(&str, Vec<u8>)>,
+) -> Vec<String> {
     let Some(decoded) = read_json(&f.dir.join("decoded.json")) else {
         return Vec::new();
     };
@@ -536,28 +567,68 @@ fn argument_lines(work_dir: &Path, f: &Finding, evidence: &Evidence) -> Vec<Stri
         }
         return lines;
     }
-    let (tags, tag_note) = comparison_tags(work_dir, f, evidence, &args);
+    let layout = harness_arg_layout(work_dir, f);
+    let shown = input.filter(|(name, bytes)| {
+        *name != "testcase.bin"
+            && std::fs::read(f.dir.join("testcase.bin")).ok().as_ref() != Some(bytes)
+    });
+    let (rows, notes, rows_input, label) = match (shown, layout.as_ref()) {
+        (Some((name, bytes)), Some(layout)) => {
+            let (rows, notes) = decode_rows(&args, layout, bytes);
+            (
+                rows,
+                notes,
+                *name,
+                format!(
+                    "(bytes are [start..end) offsets in {name}, decoded with the harness's \
+                     arg-layout.json; parameters whose ranges overlap were decoded from the same \
+                     bytes)"
+                ),
+            )
+        }
+        (Some((name, _)), None) => (
+            args.clone(),
+            vec![None; args.len()],
+            "testcase.bin",
+            format!(
+                "(values and bytes [start..end) are those traced on testcase.bin, not {name}: \
+                 without the harness's arg-layout.json {name} is not decoded; parameters whose \
+                 ranges overlap were decoded from the same bytes)"
+            ),
+        ),
+        (None, _) => (
+            args.clone(),
+            vec![None; args.len()],
+            "testcase.bin",
+            "(bytes are [start..end) offsets in testcase.bin; parameters whose ranges overlap \
+             were decoded from the same bytes)"
+                .to_owned(),
+        ),
+    };
+    let (tags, tag_note) = comparison_tags(f, evidence, &rows, rows_input, layout.as_ref());
     lines.extend(
-        corpus::decoded_args::render_table(&args)
+        corpus::decoded_args::render_table(&rows)
             .into_iter()
             .enumerate()
             .map(|(row, line)| {
                 // Row 0 is the header; row k + 1 is argument k.
-                match row
+                let extra: Vec<&str> = row
                     .checked_sub(1)
-                    .and_then(|k| tags.get(k))
-                    .and_then(Option::as_ref)
-                {
-                    Some(tag) => format!("  {line}  {tag}"),
-                    None => format!("  {line}"),
+                    .into_iter()
+                    .flat_map(|k| [notes.get(k), tags.get(k)])
+                    .flatten()
+                    .filter_map(Option::as_deref)
+                    .collect();
+                if extra.is_empty() {
+                    format!("  {line}")
+                } else {
+                    format!("  {line}  {}", extra.join("  "))
                 }
             }),
     );
-    lines.push(
-        "  (bytes are [start..end) offsets in testcase.bin; parameters whose ranges overlap \
-         were decoded from the same bytes)"
-            .to_owned(),
-    );
+    for (index, line) in wrap(&label, 74).into_iter().enumerate() {
+        lines.push(format!("{}{line}", if index == 0 { "  " } else { "    " }));
+    }
     if let Some(note) = tag_note {
         for (index, line) in wrap(&note, 74).into_iter().enumerate() {
             lines.push(format!("{}{line}", if index == 0 { "  " } else { "    " }));
@@ -566,34 +637,93 @@ fn argument_lines(work_dir: &Path, f: &Finding, evidence: &Evidence) -> Vec<Stri
     lines
 }
 
+/// The traced arguments with each value and span replaced by the one
+/// `layout` decodes from `bytes`, and per argument a note for one it cannot
+/// decode that way: `(not decodable statically; testcase.bin: <traced
+/// value>)`. Runtime facts of the traced run (a pointer, its allocation, the
+/// value after the call) are dropped: they describe the other input.
+fn decode_rows(
+    args: &[corpus::decoded_args::TracedArg],
+    layout: &harness_gen::arg_layout::ArgLayout,
+    bytes: &[u8],
+) -> (Vec<corpus::decoded_args::TracedArg>, Vec<Option<String>>) {
+    let decoded = layout.decode(bytes);
+    args.iter()
+        .map(|arg| {
+            let found = decoded.iter().find(|d| {
+                d.name == arg.name
+                    && d.call == arg.call
+                    && i64::try_from(d.index).ok() == Some(arg.index)
+            });
+            let mut row = corpus::decoded_args::TracedArg {
+                span: None,
+                value: None,
+                ptr: None,
+                alloc_size: None,
+                len: None,
+                preview_hex: None,
+                traced: None,
+                after_call_value: None,
+                after_call_preview_hex: None,
+                length_prefix: None,
+                ..arg.clone()
+            };
+            match found.filter(|d| d.decoded) {
+                Some(d) => {
+                    row.span = d.span;
+                    row.value = d.value.clone();
+                    row.len = d.len;
+                    row.preview_hex = d.preview_hex.clone();
+                    row.length_prefix = d.length_prefix;
+                    (row, None)
+                }
+                None => {
+                    let traced = arg.summary();
+                    let traced = if traced.is_empty() {
+                        "not printed".to_owned()
+                    } else {
+                        traced
+                    };
+                    (
+                        row,
+                        Some(format!(
+                            "(not decodable statically; testcase.bin: {traced})"
+                        )),
+                    )
+                }
+            }
+        })
+        .unzip()
+}
+
 /// Most comparison sites a `[compared at ...]` tag names.
 const MAX_TAG_SITES: usize = 3;
 
-/// Per traced argument, the `[compared at <site>, ...]` tag when one of the
+/// Per argument row, the `[compared at <site>, ...]` tag when one of the
 /// recorded comparisons read its input bytes, and a note on how the
-/// comparisons' offsets were related to the arguments. The trace's spans
-/// index testcase.bin; evidence recorded on another file (min_testcase.bin)
-/// is related through the harness's `arg-layout.json` decoded over that file,
-/// or not at all without one.
+/// comparisons' offsets were related to the arguments. The rows' spans index
+/// `rows_input`; evidence recorded on another file is related through the
+/// harness's `arg-layout.json` decoded over that file, or not at all without
+/// one.
 fn comparison_tags(
-    work_dir: &Path,
     f: &Finding,
     evidence: &Evidence,
     args: &[corpus::decoded_args::TracedArg],
+    rows_input: &str,
+    layout: Option<&harness_gen::arg_layout::ArgLayout>,
 ) -> (Vec<Option<String>>, Option<String>) {
     let none = vec![None; args.len()];
     let Some(capture) = evidence.capture.as_ref().filter(|c| !c.gates.is_empty()) else {
         return (none, None);
     };
     let input = capture.summary.input.as_str();
-    let same_bytes = input == "testcase.bin"
-        || std::fs::read(f.dir.join(input)).ok() == std::fs::read(f.dir.join("testcase.bin")).ok();
-    let layout = harness_arg_layout(work_dir, f);
+    let same_bytes = input == rows_input
+        || std::fs::read(f.dir.join(input)).ok() == std::fs::read(f.dir.join(rows_input)).ok();
     // The length half of a (buffer, length) pair holds the input's size, not
     // input bytes: no comparison read it, whatever its span says.
     let size_only: Vec<bool> = args
         .iter()
-        .map(|arg| reads_input_size(arg, layout.as_ref()))
+        .map(|arg| reads_input_size(arg, layout))
         .collect();
     let (spans, note): (Vec<Option<std::ops::Range<u64>>>, Option<String>) = if same_bytes {
         (args.iter().map(|arg| arg.byte_range()).collect(), None)
@@ -629,7 +759,7 @@ fn comparison_tags(
                     none,
                     Some(format!(
                         "(the comparison evidence indexes {input} and these spans index \
-                         testcase.bin; without the harness's arg-layout.json the comparisons are \
+                         {rows_input}; without the harness's arg-layout.json the comparisons are \
                          not related to the parameters)"
                     )),
                 )
@@ -653,6 +783,7 @@ fn comparison_tags(
                             Some(line) => format!("{}:{line}", basename(&location.file)),
                             None => basename(&location.file).to_owned(),
                         },
+                        None if gate.site_unattributable => UNATTRIBUTABLE_SITE.to_owned(),
                         None => gate.site.clone(),
                     };
                     if !sites.contains(&site) {
@@ -663,6 +794,8 @@ fn comparison_tags(
             if sites.is_empty() {
                 return None;
             }
+            // Named sites first; an unattributable one has no place to name.
+            sites.sort_by_key(|site| site == UNATTRIBUTABLE_SITE);
             let more = sites.len().saturating_sub(MAX_TAG_SITES);
             sites.truncate(MAX_TAG_SITES);
             let more = if more > 0 {
@@ -670,7 +803,12 @@ fn comparison_tags(
             } else {
                 String::new()
             };
-            Some(format!("[compared at {}{more}]", sites.join(", ")))
+            let lead = if sites[0] == UNATTRIBUTABLE_SITE {
+                "compared, "
+            } else {
+                "compared at "
+            };
+            Some(format!("[{lead}{}{more}]", sites.join(", ")))
         })
         .collect();
     (tags, note)
@@ -718,10 +856,38 @@ fn reads_input_size(
             == span_len
 }
 
+/// `testcase.bin, 33 bytes` when the input shown is another file with other
+/// bytes (the minimized one): what the crash recorded describes testcase.bin.
+fn recorded_on_label(finding_dir: &Path, input: Option<&(&str, Vec<u8>)>) -> Option<String> {
+    let (name, bytes) = input?;
+    let testcase = std::fs::read(finding_dir.join("testcase.bin")).ok()?;
+    (*name != "testcase.bin" && testcase != *bytes)
+        .then(|| format!("testcase.bin, {} bytes", testcase.len()))
+}
+
+/// The explanation with its trigger sentence naming `shown`, the input this
+/// explanation shows, instead of the file the record was written with.
+fn retarget_trigger(explanation: &str, shown: &str) -> String {
+    const LEAD: &str = "Triggered by the attached test input (`";
+    let Some(start) = explanation.find(LEAD) else {
+        return explanation.to_owned();
+    };
+    let name_start = start + LEAD.len();
+    let Some(name_len) = explanation[name_start..].find("`)") else {
+        return explanation.to_owned();
+    };
+    format!(
+        "{}{shown}{}",
+        &explanation[..name_start],
+        &explanation[name_start + name_len..]
+    )
+}
+
 /// The sanitizer's structured memory access (`exception.access`) as text: the
 /// direction and width, the region it hit, and where that region was
-/// allocated and freed (runtime and allocator frames skipped).
-fn access_lines(access: &Value) -> Vec<String> {
+/// allocated and freed (runtime and allocator frames skipped). `recorded_on`
+/// names the input it was recorded on when that is not the input shown.
+fn access_lines(access: &Value, recorded_on: Option<&str>) -> Vec<String> {
     let text = |key: &str| access.get(key).and_then(Value::as_str);
     let mut head = match text("direction") {
         Some(direction @ ("read" | "write")) => direction.to_owned(),
@@ -740,6 +906,9 @@ fn access_lines(access: &Value) -> Vec<String> {
                 let _ = write!(head, " ({hint})");
             }
         }
+    }
+    if let Some(recorded_on) = recorded_on {
+        let _ = write!(head, " (recorded on {recorded_on})");
     }
     let mut lines = vec![format!("  Access: {head}")];
     // The traced parameter whose buffer the access hit (see `decoded_args`).
@@ -990,6 +1159,11 @@ fn input_origin(work_dir: &Path, bytes: &[u8]) -> Vec<String> {
         );
         return notes;
     }
+    if bytes.iter().all(|byte| *byte == 0) {
+        notes.push(
+            "The input is all zero bytes: every argument decoded from it is zero.".to_owned(),
+        );
+    }
     let digest = {
         use sha2::Digest;
         let mut hasher = sha2::Sha256::new();
@@ -1160,6 +1334,26 @@ fn evidence_lines(evidence: &Evidence, input_name: &str) -> Vec<String> {
             push_wrapped(&mut lines, &gate_line(gate), "    ", "      ");
         }
     }
+    if let Some((_, searched)) = capture.summary.incomplete_derived_search() {
+        let said = capture.gates.is_empty()
+            && capture
+                .summary
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("searched"));
+        if !said {
+            push_wrapped(
+                &mut lines,
+                &format!(
+                    "(range checks computed from input bytes were searched in {searched} of {} \
+                     bytes)",
+                    capture.summary.input_len
+                ),
+                "  ",
+                "   ",
+            );
+        }
+    }
     if capture.summary.unconfirmed > 0 {
         push_wrapped(
             &mut lines,
@@ -1181,6 +1375,10 @@ fn evidence_lines(evidence: &Evidence, input_name: &str) -> Vec<String> {
     }
     lines
 }
+
+/// How a comparison whose site is the sanitizer's interceptor, with no caller
+/// frame that names the code calling it, is shown instead of its address.
+const UNATTRIBUTABLE_SITE: &str = "site not attributable (sanitizer interceptor)";
 
 /// `bytes 0..5 "WIDGET" reach strcmp at parse.c:12 in parse_record, compared
 /// with "WIDGET" (equal)`.
@@ -1205,6 +1403,7 @@ fn gate_line(gate: &Gate) -> String {
                 None => format!(" at {at}"),
             }
         }
+        None if gate.site_unattributable => format!(", {UNATTRIBUTABLE_SITE}"),
         None => format!(" at {}", gate.site),
     };
     let token = |hex: &str| render_token(&decode_hex(hex));
@@ -1684,14 +1883,153 @@ mod tests {
             .unwrap()
             .to_owned();
         assert!(width.ends_with("[compared at bits.c:20]"), "{out}");
+        // The table itself is decoded from the minimized input the evidence
+        // indexes.
         let flat = out.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
             flat.contains(
-                "(comparison tags use each parameter's bytes in min_testcase.bin, decoded with \
-                 the harness's arg-layout.json)"
+                "(bytes are [start..end) offsets in min_testcase.bin, decoded with the \
+                 harness's arg-layout.json;"
             ),
             "{out}"
         );
+    }
+
+    /// When the input shown is a minimized file that differs from the one the
+    /// argument trace and the access were recorded on, the argument table is
+    /// decoded from the minimized bytes, the access names the file it was
+    /// recorded on, and WHAT HAPPENED names the file shown.
+    #[test]
+    fn a_minimized_input_is_the_one_described_throughout() {
+        let work = tempfile::tempdir().unwrap();
+        let mut raw = base_raw();
+        raw["actionability"] = serde_json::json!({"explanation":
+            "This is a buffer overflow: while processing a crafted input, `copy_at` read or wrote past the end of a memory buffer. Triggered by the attached test input (`testcase.bin`)."});
+        raw["exception"]["access"] = serde_json::json!({
+            "direction": "read", "size": 1,
+            "region": {"kind": "heap", "size": 21, "offset": 38, "relation": "after", "distance": 17}
+        });
+        let finding = finding_in(work.path(), raw);
+        let testcase: Vec<u8> = (0u8..33).map(|i| i.wrapping_mul(7) | 1).collect();
+        std::fs::write(finding.dir.join("testcase.bin"), &testcase).unwrap();
+        std::fs::write(finding.dir.join("min_testcase.bin"), [9u8, 0, 0, 0, 2]).unwrap();
+        let args = corpus::decoded_args::parse_arg_trace(
+            "BHF_ARG {\"call\":\"target\",\"i\":0,\"role\":\"param\",\"name\":\"flags\",\"type\":\"unsigned int\",\"span\":[0,4],\"value\":\"50529027\"}\n\
+             BHF_ARG {\"call\":\"target\",\"i\":1,\"role\":\"param\",\"name\":\"count\",\"type\":\"unsigned int\",\"span\":[4,8],\"value\":\"117901063\"}\n\
+             BHF_ARG {\"call\":\"target\",\"i\":2,\"role\":\"param\",\"name\":\"ctx\",\"type\":\"struct widget *\",\"ptr\":\"0x502000000090\"}\n\
+             BHF_ARG {\"call\":\"target\",\"i\":3,\"role\":\"param\",\"name\":\"buf\",\"type\":\"const unsigned char *\",\"span\":[8,33],\"len\":25,\"alloc_size\":26,\"preview_hex\":\"3f4d\"}\n",
+        );
+        corpus::decoded_args::record_trace(
+            &finding.dir,
+            &testcase,
+            &corpus::decoded_args::TraceOutcome::Traced(args),
+        )
+        .expect_err("no finding.json: decoded.json is still written");
+        let harness = crate::auto::layout::harness_dir(work.path(), "H-C0001");
+        std::fs::create_dir_all(&harness).unwrap();
+        let scalar = |name: &str, index: usize| {
+            serde_json::json!({"step": "param", "call": "target", "role": "param", "index": index,
+                "name": name, "type": "unsigned int", "order": index, "input": "cursor",
+                "decoder": "scalar", "primitive": "bhf_i32", "width": 4,
+                "value_kind": "u32", "static_decode": true})
+        };
+        std::fs::write(
+            harness.join("arg-layout.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": "bhf.arg-layout.v1", "harness_format_version": harness_gen::HARNESS_FORMAT_VERSION,
+                "language": "c", "harness": "direct", "static_decode": true,
+                "steps": [scalar("flags", 0), scalar("count", 1),
+                    {"step": "param", "call": "target", "role": "param", "index": 2,
+                     "name": "ctx", "type": "struct widget *", "order": 2, "input": "none",
+                     "decoder": "other", "static_decode": false,
+                     "note": "the harness builds it"},
+                    {"step": "remainder", "call": "target", "sized": false},
+                    {"step": "param", "call": "target", "role": "param", "index": 3,
+                     "name": "buf", "type": "const unsigned char *", "order": 3,
+                     "input": "remainder", "decoder": "input_buffer", "static_decode": true}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let out = explain_one(work.path(), &finding, &[], false);
+        let row = |name: &str| {
+            out.lines()
+                .find(|line| line.trim_start().starts_with(&format!("{name} ")))
+                .unwrap_or_else(|| panic!("no {name} row in:\n{out}"))
+                .to_owned()
+        };
+        assert!(
+            row("flags").contains(" 9"),
+            "decoded from min_testcase.bin: {out}"
+        );
+        assert!(!row("flags").contains("50529027"), "{out}");
+        assert!(row("count").contains(" 2"), "{out}");
+        assert!(row("buf").contains("len 0"), "{out}");
+        assert!(!row("buf").contains("alloc 26"), "{out}");
+        assert!(
+            row("ctx").contains("(not decodable statically; testcase.bin: 0x502000000090)"),
+            "{out}"
+        );
+        let words = out.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(words.contains("offsets in min_testcase.bin"), "{out}");
+        assert!(
+            out.contains("(recorded on testcase.bin, 33 bytes)"),
+            "the access names the file it was recorded on: {out}"
+        );
+        assert!(
+            words.contains("Triggered by the attached test input (`min_testcase.bin`)."),
+            "{out}"
+        );
+        assert!(!words.contains("(`testcase.bin`)."), "{out}");
+    }
+
+    /// A finding whose input is empty, or whose method ran on an object bhf's
+    /// harness built, has a caveat beside its reachability verdict; a plain
+    /// function finding with a non-zero input has none.
+    #[test]
+    fn states_real_callers_may_never_produce_are_caveated_beside_the_verdict() {
+        let work = tempfile::tempdir().unwrap();
+        let reachable = |mut raw: serde_json::Value| {
+            raw["actionability"] = serde_json::json!({"verdict": "likely_reachable"});
+            raw["input_reachability"] = serde_json::json!("attacker_reachable");
+            raw
+        };
+        let verdict_section = |out: &str| -> String {
+            let start = out.find("REACHABILITY & PROVENANCE").expect("the section");
+            let end = out[start..]
+                .find("\n\n")
+                .map_or(out.len(), |end| start + end);
+            out[start..end]
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let empty = finding_in(work.path(), reachable(base_raw()));
+        std::fs::write(empty.dir.join("testcase.bin"), b"").unwrap();
+        let section = verdict_section(&explain_one(work.path(), &empty, &[], false));
+        assert!(
+            section.contains("a real caller may never pass all-zero arguments; check that one can before treating this as reachable"),
+            "{section}"
+        );
+
+        let mut raw = reachable(base_raw());
+        raw["harness_id"] = serde_json::json!("H-X0001");
+        raw["decoded_args"] = serde_json::json!([
+            {"name": "receiver", "type": "Widget", "role": "receiver", "decoder": "default constructor"}
+        ]);
+        let method = finding_in(work.path(), raw);
+        std::fs::write(method.dir.join("testcase.bin"), b"\x07").unwrap();
+        let section = verdict_section(&explain_one(work.path(), &method, &[], false));
+        assert!(
+            section.contains("the method ran on an object bhf's harness constructed (default constructor); real callers may never put the object in that state"),
+            "{section}"
+        );
+        assert!(!section.contains("all-zero"), "{section}");
+
+        let plain = finding_in(work.path(), reachable(base_raw()));
+        std::fs::write(plain.dir.join("testcase.bin"), b"\x07\x01").unwrap();
+        let section = verdict_section(&explain_one(work.path(), &plain, &[], false));
+        assert!(!section.contains("Caveat"), "{section}");
     }
 
     /// The length half of a `(buffer, length)` pair holds the input's size, not
@@ -2263,6 +2601,92 @@ mod tests {
         );
     }
 
+    /// A capture whose search for operands computed from input bytes did not
+    /// cover the whole input says how much it covered, even beside the
+    /// comparisons it did find; so does one recorded before that search ran
+    /// on long inputs.
+    #[test]
+    fn an_incomplete_range_check_search_is_stated_beside_the_evidence() {
+        let work = tempfile::tempdir().unwrap();
+        let gate = serde_json::json!({"offset": 0, "len": 2, "operand_hex": "4844",
+            "compared_with_hex": "4844", "cmp_kind": "memcmp", "site": "0x1a2b",
+            "relation": "equal", "operands_equal": true,
+            "location": {"file": "/src/demo/hdr.c", "line": 4, "function": "parse_header"}});
+        let mut raw = recorded_capture(serde_json::json!([gate]), None);
+        raw["gate_capture"]["input_len"] = serde_json::json!(64);
+        raw["gate_capture"]["derived_search"] = serde_json::json!("partial");
+        raw["gate_capture"]["searched_bytes"] = serde_json::json!(10);
+        let finding = finding_in(work.path(), raw.clone());
+        std::fs::write(finding.dir.join("testcase.bin"), [b'H'; 64]).unwrap();
+        let out = explain_one(work.path(), &finding, &[], false);
+        let words = out.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            words.contains(
+                "(range checks computed from input bytes were searched in 10 of 64 bytes)"
+            ),
+            "{out}"
+        );
+        // Recorded before the search state was kept: inputs over 32 bytes
+        // were not searched at all.
+        let mut older = raw.clone();
+        let capture = older["gate_capture"].as_object_mut().unwrap();
+        capture.remove("derived_search");
+        capture.remove("searched_bytes");
+        let finding = finding_in(work.path(), older);
+        let out = explain_one(work.path(), &finding, &[], false);
+        let words = out.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(words.contains("searched in 0 of 64 bytes"), "{out}");
+        // A complete search says nothing.
+        raw["gate_capture"]["derived_search"] = serde_json::json!("done");
+        raw["gate_capture"]["searched_bytes"] = serde_json::json!(64);
+        let finding = finding_in(work.path(), raw);
+        let out = explain_one(work.path(), &finding, &[], false);
+        assert!(!out.contains("range checks computed"), "{out}");
+    }
+
+    /// A buffer comparison whose site is the sanitizer's interceptor, with no
+    /// caller frame naming the code that called it, says so instead of
+    /// printing the interceptor's address, in the evidence and the tags.
+    #[test]
+    fn an_interceptor_site_without_a_caller_is_called_unattributable() {
+        let work = tempfile::tempdir().unwrap();
+        let gate = serde_json::json!({"offset": 0, "len": 4, "operand_hex": "57494447",
+            "compared_with_hex": "57494447", "cmp_kind": "memcmp", "site": "0x51a3c",
+            "location": null, "site_unattributable": true,
+            "relation": "equal", "operands_equal": true});
+        let mut raw = recorded_capture(serde_json::json!([gate]), None);
+        raw["gate_capture"]["input_len"] = serde_json::json!(6);
+        let finding = finding_in(work.path(), raw);
+        let input = b"WIDG\x01\x00";
+        std::fs::write(finding.dir.join("testcase.bin"), input).unwrap();
+        let args = corpus::decoded_args::parse_arg_trace(
+            "BHF_ARG {\"call\":\"target\",\"i\":0,\"role\":\"param\",\"name\":\"magic\",\"type\":\"const char *\",\"decoder\":\"bhf_c_string(4096)\",\"span\":[0,4],\"len\":4,\"preview_hex\":\"57494447\"}\n",
+        );
+        corpus::decoded_args::record_trace(
+            &finding.dir,
+            input,
+            &corpus::decoded_args::TraceOutcome::Traced(args),
+        )
+        .expect_err("no finding.json: decoded.json is still written");
+        let out = explain_one(work.path(), &finding, &[], false);
+        let words = out.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            words.contains(
+                "bytes 0..4 \"WIDG\" reach memcmp, site not attributable (sanitizer interceptor), compared with \"WIDG\" (equal)"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("0x51a3c"), "{out}");
+        let row = out
+            .lines()
+            .find(|line| line.trim_start().starts_with("magic "))
+            .unwrap_or_else(|| panic!("no magic row in:\n{out}"));
+        assert!(
+            row.ends_with("[compared, site not attributable (sanitizer interceptor)]"),
+            "{out}"
+        );
+    }
+
     /// An empty input, one of the built-in starting inputs, or a copy of a
     /// listed seed says so.
     #[test]
@@ -2428,6 +2852,23 @@ mod tests {
         let unassessed = finding_in(work.path(), raw);
         let out = explain_one(work.path(), &unassessed, &[], false);
         assert!(out.contains("Verdict: reachability not assessed"), "{out}");
+        // The parameter the inference rests on, as spelled and resolved.
+        let mut raw = base_raw();
+        raw["actionability"] = serde_json::json!({"verdict": "likely_reachable"});
+        raw["input_reachability"] = serde_json::json!("attacker_reachable");
+        raw["input_reachability_basis"] = serde_json::json!({"rule": "const_byte_buffer",
+            "param": "frame", "spelled_type": "rbuf_t", "resolved_type": "const uint8_t *",
+            "typedefs_resolved": true});
+        let based = finding_in(work.path(), raw);
+        let out = explain_one(work.path(), &based, &[], false);
+        let words = out.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            words.contains(
+                "because parameter `frame` (`rbuf_t`, resolves to `const uint8_t *`) is a \
+                 read-only byte buffer"
+            ),
+            "{out}"
+        );
     }
 
     #[test]

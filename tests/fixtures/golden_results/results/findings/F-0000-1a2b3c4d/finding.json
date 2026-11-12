@@ -93,10 +93,12 @@
   "finding_kind": "fuzz",
   "gate_capture": {
     "comparisons": 2,
+    "derived_search": "done",
     "input": "min_testcase.bin",
     "input_len": 1,
     "reason": null,
     "runs": 6,
+    "searched_bytes": 1,
     "shim_armed": false,
     "status": "recorded",
     "truncated": false,

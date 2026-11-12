@@ -105,6 +105,7 @@ fn assert_target_builds(name: &str) {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&dir).unwrap();

@@ -106,6 +106,7 @@ fn win32_integer_typedef_params_build_and_fuzz() {
         // attempt to the win32 (MFC/ATL) platform stub.
         foreign_guard: Some("win32 (MFC/ATL framework header)".to_owned()),
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&dir).unwrap();

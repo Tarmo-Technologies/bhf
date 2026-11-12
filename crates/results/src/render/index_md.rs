@@ -343,6 +343,23 @@ pub fn render_index(doc: &FindingsDocument, ctx: &IndexContext) -> String {
                 .map(|name| format!(" (offsets in `{}`)", md_code(name)))
                 .unwrap_or_default();
             let _ = writeln!(out, "- Input bytes compared{input}: {shown}{more}");
+        } else if let Some(fuzz) = rep
+            .fuzz
+            .as_ref()
+            .filter(|fuzz| fuzz.input_to_state_status.is_some())
+        {
+            // A capture ran (or could not): say why it has no evidence.
+            let what = if fuzz.input_to_state.is_some() {
+                "none"
+            } else {
+                "not recorded"
+            };
+            let why = fuzz
+                .input_to_state_reason
+                .as_deref()
+                .map(|reason| format!(" ({})", md_text(reason)))
+                .unwrap_or_default();
+            let _ = writeln!(out, "- Input bytes compared: {what}{why}");
         }
         if group.members.len() > 1 {
             let _ = writeln!(out, "- Collapsed observations: {}", group.members.len());
@@ -535,6 +552,35 @@ mod tests {
         assert!(single.contains("1 corpus entry"), "{single}");
         assert!(single.contains("first entries scanned"), "{single}");
         assert!(!render_index(&example(), &IndexContext::default()).contains("EF BF BD"));
+    }
+
+    /// A fuzz finding whose capture found no comparison evidence says why.
+    #[test]
+    fn a_finding_without_comparison_evidence_says_why() {
+        let mut doc = example();
+        let fuzz = doc.findings[0].fuzz.as_mut().unwrap();
+        fuzz.input_to_state = Some(Vec::new());
+        fuzz.input_to_state_status = Some("no_input_comparisons".to_owned());
+        fuzz.input_to_state_reason = Some(
+            "4 comparison(s) recorded; no operand followed a change of the input bytes".to_owned(),
+        );
+        let md = render_index(&doc, &IndexContext::default());
+        assert!(
+            md.contains(
+                "- Input bytes compared: none (4 comparison(s) recorded; no operand followed a \
+                 change of the input bytes)"
+            ),
+            "{md}"
+        );
+        let fuzz = doc.findings[0].fuzz.as_mut().unwrap();
+        fuzz.input_to_state = None;
+        fuzz.input_to_state_status = Some("unavailable".to_owned());
+        fuzz.input_to_state_reason = Some("the harness binary was not found".to_owned());
+        let md = render_index(&doc, &IndexContext::default());
+        assert!(
+            md.contains("- Input bytes compared: not recorded (the harness binary was not found)"),
+            "{md}"
+        );
     }
 
     #[test]

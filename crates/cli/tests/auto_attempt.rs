@@ -108,6 +108,7 @@ fn attempt_repairs_missing_header_for_simple_c_target() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
@@ -213,6 +214,7 @@ fn attempt_skips_target_whose_definition_is_conditionally_compiled_out() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
@@ -339,6 +341,7 @@ fn attempt_pairs_tree_wide_c_lifecycle_from_unincluded_header() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
@@ -430,6 +433,7 @@ fn attempt_adds_project_source_for_missing_c_symbol() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
@@ -539,6 +543,7 @@ fn attempt_builds_harness_for_unnamed_param_callback_typedef() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
@@ -649,6 +654,7 @@ fn attempt_adds_project_source_for_missing_cpp_symbol() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
@@ -783,6 +789,7 @@ fn attempt_force_includes_stream_header_for_recovered_cpp_source() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
@@ -915,6 +922,7 @@ fn attempt_prefers_sequence_for_cpp_class_method_with_lifecycle_steps() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
@@ -1027,6 +1035,7 @@ fn attempt_uses_direct_cpp_harness_when_lifecycle_helpers_are_private() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
@@ -1120,6 +1129,7 @@ fn attempt_runtime_cap_excludes_build_time() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
@@ -1208,6 +1218,7 @@ fn attempt_total_time_apportions_across_passes() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
@@ -1312,6 +1323,7 @@ fn attempt_builds_and_fuzzes_struct_by_value_c_target() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
@@ -1411,6 +1423,7 @@ fn attempt_rss_limit_classifies_oom_as_bhf209() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
@@ -1521,6 +1534,7 @@ fn attempt_prefers_sequence_for_first_param_handle_c_target() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
@@ -1623,6 +1637,7 @@ fn attempt_prefers_sequence_for_c_target_with_static_lifecycle_helpers() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
@@ -1715,6 +1730,7 @@ fn attempt_uses_direct_harness_for_generic_void_pointer_c_target() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
@@ -1815,6 +1831,7 @@ fn attempt_builds_and_fuzzes_c_scalar_and_enum_output_pointers() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
@@ -1910,6 +1927,7 @@ fn attempt_builds_and_fuzzes_c_const_byte_typedef_pair() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
@@ -2009,6 +2027,7 @@ fn attempt_builds_and_fuzzes_c_miniz_file_macro_pointer() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
@@ -2106,6 +2125,7 @@ fn attempt_builds_and_fuzzes_c_miniz_time_pointer_alias() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
@@ -2200,6 +2220,7 @@ fn attempt_builds_and_fuzzes_c_void_pointer_output_slot() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
@@ -2302,6 +2323,7 @@ fn attempt_builds_and_fuzzes_c_void_output_capacity_and_input_pair() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
@@ -2420,6 +2442,7 @@ fn attempt_builds_and_fuzzes_cpp_void_output_capacity_and_input_pair() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
@@ -2542,6 +2565,7 @@ fn attempt_builds_and_fuzzes_cpp_void_output_length_pointer_and_input_pair() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
@@ -2659,6 +2683,7 @@ fn attempt_builds_and_fuzzes_cpp_standard_scalar_aliases() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
@@ -2787,6 +2812,7 @@ fn attempt_builds_and_fuzzes_cpp_struct_by_value_target() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
@@ -2895,6 +2921,7 @@ fn attempt_builds_and_fuzzes_cpp_file_pointer_target() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
@@ -3006,6 +3033,7 @@ fn attempt_builds_and_fuzzes_cpp_callback_typedef_target() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
@@ -3096,6 +3124,7 @@ fn attempt_dispatches_ada_candidate_to_gprbuild() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
@@ -3205,6 +3234,7 @@ fn attempt_recovers_cross_dir_ada_unit_source() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     // Index parses the scan path but indexes Ada unit->source across the whole
@@ -3311,6 +3341,7 @@ fn static_c_direct_targets_build_through_included_source() {
         is_static: true,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
@@ -3405,6 +3436,7 @@ fn static_cpp_direct_targets_build_through_included_source() {
         is_static: true,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
@@ -3480,6 +3512,7 @@ fn foreign_platform_guarded_target_builds_via_cross_or_platform_stub() {
         is_static: false,
         foreign_guard: Some("_WIN32".to_owned()),
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
@@ -3581,6 +3614,7 @@ fn attempt_reports_phase_progression_through_progress_sink() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
@@ -3701,6 +3735,7 @@ fn attempt_constructs_typedef_hidden_opaque_handle_via_returning_ctor() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
@@ -3797,6 +3832,7 @@ fn attempt_synthesises_corba_stub_for_missing_idl_header_but_empty_for_internal(
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
@@ -3931,6 +3967,7 @@ fn attempt_skips_cpp_method_of_class_defined_only_in_translation_unit() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let result = attempt(&cpp_only, &work, &idx, make_options()).unwrap();
@@ -3964,6 +4001,7 @@ fn attempt_skips_cpp_method_of_class_defined_only_in_translation_unit() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let result = attempt(&header_declared, &work, &idx, make_options()).unwrap();

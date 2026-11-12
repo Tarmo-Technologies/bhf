@@ -42,7 +42,11 @@
             }
           },
           "relation": { "enum": ["equal", "byte_swapped", "derived"] },
-          "operands_equal": { "type": "boolean" }
+          "operands_equal": { "type": "boolean" },
+          "site_unattributable": {
+            "description": "site is the sanitizer's memcmp/bcmp interceptor and the code that called it could not be named; absent (false) otherwise.",
+            "type": "boolean"
+          }
         }
       }
     },
@@ -63,6 +67,63 @@
         "runner": {
           "description": "The emulator the capture replayed a harness built for another platform under (qemu-aarch64); absent for a native replay.",
           "type": "string"
+        },
+        "derived_search": {
+          "description": "How far the search for operands computed from input bytes (range checks such as width - 1 > 31) got: done, partial (the replay budget ran out) or too_long (the input was too long to search). Absent when no such search ran, and in captures recorded before it was kept.",
+          "enum": ["done", "partial", "too_long"]
+        },
+        "searched_bytes": {
+          "description": "The input bytes that derived_search covered, of input_len.",
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "input_reachability_basis": {
+      "description": "Why the static reachability label (input_reachability) was given: the rule that decided it and, for a parameter-shape rule, the parameter and its type. Absent when the label is not the classifier's own, and in findings recorded before it was kept.",
+      "type": "object",
+      "required": ["rule"],
+      "properties": {
+        "rule": {
+          "enum": ["const_byte_buffer", "parser_name_with_length", "mutable_parser_buffer", "byte_scalar_parser", "output_serializer", "no_input_shape", "call_graph_provenance", "internal_linkage"]
+        },
+        "param": { "description": "The parameter the rule read.", "type": "string" },
+        "spelled_type": { "description": "That parameter's type as declared.", "type": "string" },
+        "resolved_type": {
+          "description": "The type with its typedefs resolved, when that differs from the spelling.",
+          "type": "string"
+        },
+        "typedefs_resolved": {
+          "description": "The classifier read the parameter types with typedefs resolved (at least one parameter's type changed).",
+          "type": "boolean"
+        }
+      }
+    },
+    "decoded_args": {
+      "description": "The arguments the harness decoded from the input and passed to the target (and the receiver object of a method), when traced.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "type", "role"],
+        "properties": {
+          "name": { "type": "string" },
+          "type": { "type": "string" },
+          "role": { "type": "string" },
+          "decoder": {
+            "description": "The receiver entry only: how the harness built the object (default constructor, factory Widget::make(), ...).",
+            "type": "string"
+          },
+          "value": { "type": "string" },
+          "len": { "type": "integer", "minimum": 0 },
+          "span": {
+            "description": "[start, end) byte offsets of the input the argument came from.",
+            "type": "array",
+            "items": { "type": "integer", "minimum": 0 },
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "preview_hex": { "type": "string" },
+          "after_call_value": { "type": "string" }
         }
       }
     },

@@ -123,9 +123,21 @@ from source when the harness is generated and is not runtime evidence.
 
 Comparison operands observed while fuzzing accumulate in `cmplog.jsonl` beside
 it, and after each `bhf auto` fuzz pass that recorded any, bhf rewrites
-`learned_dictionary.txt` from them: each distinct operand of at most 64 bytes,
-this run's first, then those an earlier run learned, at most 256 tokens, under a
-header saying they were observed at runtime. The fuzz command (and the first
+`learned_dictionary.txt` from the comparison constants among them. The bhf
+driver's records name their comparison site (`"s"`); those the runtrace shim
+writes for a harness built without a sanitizer, and those of a harness built
+with an older driver, do not. A constant is an operand that met more distinct
+values at one site than any of those values met there: a constant is compared
+with input after input (the mutated input varies), while each input meets only
+the constants it is checked against, so at a keyword-table lookup a keyword
+counts once it has met more inputs than there are keywords, and before that
+neither side does. An operand `dictionary.txt` lists is kept too, and a record
+without a site only confirms such a token. Tokens are at most 64 bytes; a
+one-byte variant of a stronger token is left out. This run's constants come
+first, then those an earlier run learned, at most 256 tokens, under a header
+saying how they were chosen. A file an earlier release wrote held every operand, mutated
+inputs included; of its tokens only those this run also found constant or
+`dictionary.txt` lists are kept. The fuzz command (and the first
 pass of a later `bhf auto` run) loads `dictionary.txt` and then
 `learned_dictionary.txt` automatically when present, each token once; later
 passes of the same `bhf auto` run also read `cmplog.jsonl` itself, and a token
@@ -702,29 +714,43 @@ and explain it — all offline and deterministic (no LLM):
     replaying the input with the driver's comparison capture
     (`BHF_CMP_EVIDENCE`): an operand counts only when its bytes occur in the
     input and a replay with those bytes changed shows the operand change with
-    them. For inputs of up to 32 bytes, flipping each byte also finds operands
-    computed from input bytes, such as a folded `x == 0 || x > 32` range
-    check; two replays of the unchanged input bracket the flips, and an
-    operand that differs between them (a process id, a clock reading) is not
-    evidence. Comparisons the harness makes before entering the target are
-    discarded, and later ones in harness code are left out when
-    `llvm-symbolizer` can locate them. Under AddressSanitizer a `memcmp` or
-    `bcmp` gate has no source position: the interceptor reports itself as the
-    call site. `bhf auto` records it after minimization (`finding.json`
-    `gates`); for a finding without it, explain replays the input once (nothing
-    is written). Otherwise it prints `No comparison evidence recorded:` and the
-    reason, which says what was not searched (computed operands of an input
-    over 32 bytes, comparisons past the driver's 8192-record limit) and that
-    only instrumented code is observed. Dictionary tokens found in the input are listed only as labelled
+    them. Flipping input bytes also finds operands computed from them, such
+    as a folded `x == 0 || x > 32` range check: every byte of an input of up
+    to 32 bytes, and for a longer one first the bytes the harness decodes its
+    scalar parameters from (`arg-layout.json`), then byte ranges, halved
+    where a flip changed a comparison, down to the bytes, within 256 replays.
+    Two replays of the unchanged input bracket the flips, and an operand that
+    differs between them (a process id, a clock reading) is not evidence.
+    When that search did not cover the whole input (`finding.json`
+    `gate_capture.derived_search` `partial`, or `too_long` over 1 MiB), a line
+    says `range checks computed from input bytes were searched in N of M
+    bytes`, also beside the comparisons that were found. Comparisons the
+    harness makes before entering the target are discarded, and later ones in
+    harness code are left out when `llvm-symbolizer` can locate them. Under
+    AddressSanitizer the `memcmp`/`bcmp` interceptor reports itself as the
+    call site; the gate is placed at the first caller frame the driver
+    recorded that is not the sanitizer runtime, and reads `site not
+    attributable (sanitizer interceptor)` when none resolves. `bhf auto`
+    records it after minimization (`finding.json` `gates`); for a finding
+    without it, explain replays the input once (nothing is written).
+    Otherwise it prints `No comparison evidence recorded:` and the reason,
+    which says what was not searched (computed operands beyond the replay
+    budget, comparisons past the driver's 8192-record limit) and that only
+    instrumented code is observed. Dictionary tokens found in the input are listed only as labelled
     substring matches (at least 3 bytes, at most 3 occurrences);
   - the harness arguments: the value each parameter was decoded to, from the
     argument trace recorded with the finding. An argument whose input bytes a
     recorded comparison read is tagged `[compared at <file>:<line>]` (the
-    comparison's address when it has no source position); the length of a
-    `(buffer, length)` pair, which holds the input's size, is not. The trace's byte
-    spans index `testcase.bin`; evidence recorded on `min_testcase.bin` is
-    related to the arguments through the harness's `arg-layout.json` decoded
-    over that file, and without one a line says the two are not related;
+    comparison's address when it has no source position, or `site not
+    attributable (sanitizer interceptor)`); the length of a `(buffer, length)`
+    pair, which holds the input's size, is not. The trace was recorded on
+    `testcase.bin`; when the input shown is a `min_testcase.bin` with other
+    bytes, each parameter is decoded from those bytes with the harness's
+    `arg-layout.json` instead, and one it cannot decode statically reads
+    `(not decodable statically; testcase.bin: <value>)`. Without the layout
+    the table keeps `testcase.bin`'s values and says so. The memory access line
+    of such a finding says `(recorded on testcase.bin, N bytes)`, and WHAT
+    HAPPENED names the input shown;
   - the environment: the runtrace events of that input's own replay when the
     runtrace shim was loaded for it, else the harness's last fuzz pass (all of
     its inputs, labelled so), and `environment not observed (runtrace shim not
@@ -733,8 +759,16 @@ and explain it — all offline and deterministic (no LLM):
     can be pointed at one with `BHF_RUNTRACE_SHIM=/path/libbhf_runtrace_shim.so`;
   - reachability: the verdict and what it rests on. A verdict inferred from the
     entry's signature says it "matches an input-taking shape, so likely
-    reachable from input; not proven"; an entry with no recorded reachability
-    reads "not assessed"; and an overflow of a buffer the generated harness
+    reachable from input; not proven", naming the parameter it rests on and its
+    type as spelled and resolved (``because parameter `buf` (`const u8_t *`,
+    resolves to `const uint8_t *`) is a read-only byte buffer``); an unproven
+    one says when the classifier read the types with their typedefs resolved,
+    and a `static` entry says it has internal linkage; an entry with no recorded
+    reachability reads "not assessed". A `Caveat:` line follows when the input
+    is empty or all zero bytes (a real caller may never pass all-zero
+    arguments) or the method ran on an object bhf's harness constructed (a
+    default constructor, a factory, or decoded constructor arguments, which a
+    real caller may never produce); and an overflow of a buffer the generated harness
     sized itself for a pointer parameter it passes without a length (a decoded
     C string, or a copy of the input with no length companion in the harness
     source) reads "precondition-dependent" (verdict `lab_only`). A harness

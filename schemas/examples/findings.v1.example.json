@@ -82,6 +82,9 @@
           }
         ],
         "input_to_state_input": "min_testcase.bin",
+        "input_to_state_status": "recorded",
+        "input_to_state_reason": null,
+        "input_to_state_search": { "state": "done", "searched_bytes": 16, "input_len": 16 },
         "arguments": [
           { "name": "data", "type": "const uint8_t *", "value": null, "len": 12, "span": [0, 12], "preview_hex": "48445231", "role": "param", "after_call_value": null },
           { "name": "flags", "type": "unsigned int", "value": "7", "len": null, "span": [12, 16], "preview_hex": null, "role": "param", "after_call_value": null }

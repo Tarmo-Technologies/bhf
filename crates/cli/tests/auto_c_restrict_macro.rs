@@ -108,6 +108,7 @@ fn restrict_qualifier_macro_param_builds() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&dir).unwrap();
@@ -164,6 +165,7 @@ fn restrict_qualifier_macro_param_builds_cpp() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&dir).unwrap();
