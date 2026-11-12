@@ -12,13 +12,30 @@
 //! with a custom `--id` is found too.
 //!
 //! A [`Lane`] says which files a capsule copies and how it rebuilds them
-//! (`build.sh`), how the rebuilt PoC runs on an input (replay protocol), how a
-//! crash is recognised (crash oracle), which toolchain the rebuild needs, and
-//! where the built harness executable lives. Adding a language is implementing
-//! [`Lane`] and listing it in [`LANES`]. A finding in any other language is
-//! refused with a [`Refusal`] that names its harness and language, and, when the
-//! finding dir has one, a command that does reproduce it.
+//! (`build.sh`), how the rebuilt PoC takes an input (replay protocol, decided
+//! by [`crate::protocol_detect`] on the rebuilt PoC), how a crash is recognised
+//! (crash oracle), which toolchain the rebuild needs, where the built harness
+//! executable lives, and which of the tools apply to its findings. Adding a
+//! language is implementing [`Lane`] and listing it in [`LANES`].
+//!
+//! Every harness language bhf generates has a lane: C and C++ (this file), and
+//! Ada, Rust, Go, Java, C#, Python, JavaScript, TypeScript, Ruby, Perl, PHP,
+//! Lua, COBOL and Fortran (the submodules). A lane that cannot rebuild a
+//! particular harness offline (a dependency that is not in a local cache, a
+//! project file outside the scanned tree, a cross-compiled build) refuses it
+//! with a [`Refusal`] that says exactly what is missing and, when the finding
+//! dir has one, a command that does reproduce it.
 
+mod ada;
+mod c_glue;
+mod dotnet;
+mod go;
+mod jvm;
+pub(crate) mod relocate;
+mod rust;
+mod script;
+
+use harness_gen::compiler_family::CompilerFamily;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
@@ -45,7 +62,7 @@ impl Tool {
     }
 
     /// What the tool does to a finding.
-    fn verb(self) -> &'static str {
+    pub(crate) fn verb(self) -> &'static str {
         match self {
             Tool::Capsule => "package",
             Tool::Cartography => "map",
@@ -108,11 +125,21 @@ pub(crate) enum Refusal {
     /// The lane cannot rebuild this harness dir.
     IncompleteHarness {
         harness_id: String,
+        language: String,
         harness_dir: PathBuf,
         problem: String,
     },
     /// The harness was never built (no executable to replay).
-    NotBuilt { harness_id: String },
+    NotBuilt {
+        harness_id: String,
+        language: String,
+    },
+    /// The lane exists, but the tool does not work on its findings.
+    ToolNotForLane {
+        harness_id: String,
+        language: String,
+        reason: String,
+    },
 }
 
 impl Refusal {
@@ -172,8 +199,8 @@ impl Refusal {
                 harness_id,
                 harness_dir,
             } => format!(
-                "cannot tell the language of harness {harness_id}: {} records none and the \
-                 dir holds no main.c or main.cpp",
+                "cannot tell the language of harness {harness_id}: {} records none, its id \
+                 carries no language prefix, and the dir holds no harness driver bhf generates",
                 harness_dir.join(GENERATION_METADATA).display()
             ),
             Refusal::UnsupportedLane {
@@ -183,19 +210,35 @@ impl Refusal {
                 "harness {harness_id} is {} {} harness; {command} supports {} harnesses only",
                 article(&language_name(language)),
                 language_name(language),
-                supported_language_names()
+                supported_language_names_for(tool)
+            ),
+            Refusal::ToolNotForLane {
+                harness_id,
+                language,
+                reason,
+            } => format!(
+                "harness {harness_id} is {} {} harness, and {reason}",
+                article(&language_name(language)),
+                language_name(language),
             ),
             Refusal::IncompleteHarness {
                 harness_id,
+                language,
                 harness_dir,
                 problem,
             } => format!(
-                "harness {harness_id} in {} cannot be rebuilt: {problem}",
+                "{} harness {harness_id} in {} cannot be rebuilt: {problem}",
+                language_name(language),
                 harness_dir.display()
             ),
-            Refusal::NotBuilt { harness_id } => format!(
-                "harness {harness_id} has no built executable (no `main` in build/{harness_id}/ \
-                 or the harness dir); build it with `bhf build <work-dir> --harness {harness_id}`"
+            Refusal::NotBuilt {
+                harness_id,
+                language,
+            } => format!(
+                "{} harness {harness_id} has no built executable (no `main` in \
+                 build/{harness_id}/ or the harness dir); build it with `bhf build <work-dir> \
+                 --harness {harness_id}`",
+                language_name(language)
             ),
         }
     }
@@ -345,6 +388,32 @@ pub(crate) fn print_refusals(tool: Tool, refused: &[Refused], requested: bool, l
     }
 }
 
+/// What one run of capsule or env-capsule did with the findings it took.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RunTally {
+    /// A `--finding-id` was given.
+    pub(crate) requested: bool,
+    /// Capsules written.
+    pub(crate) made: usize,
+    /// Capsules verified to reproduce (replay).
+    pub(crate) verified: usize,
+    /// Findings whose capsule could not be written for an error.
+    pub(crate) failed: usize,
+}
+
+/// The exit code capsule and env-capsule share: non-zero when a finding
+/// failed, when nothing was written, and when a requested finding's capsule
+/// did not verify. A run without `--finding-id` that wrote capsules exits 0
+/// even when some did not verify (they say so) or some findings were skipped.
+pub(crate) fn exit_code(tally: &RunTally) -> i32 {
+    let requested_unverified = tally.requested && tally.verified < tally.made;
+    if tally.failed > 0 || tally.made == 0 || requested_unverified {
+        1
+    } else {
+        0
+    }
+}
+
 /// Whether `tool` works on `finding`, and with what.
 pub(crate) fn assess(
     work_dir: &Path,
@@ -397,6 +466,13 @@ pub(crate) fn assess(
             language,
         });
     };
+    if let Some(reason) = lane.tool_gap(tool) {
+        return Err(Refusal::ToolNotForLane {
+            harness_id,
+            language: lane.tag().to_owned(),
+            reason: format!("{} {reason}", tool.command()),
+        });
+    }
     match tool {
         Tool::Capsule => {
             let Some(first) = dirs.first() else {
@@ -405,7 +481,11 @@ pub(crate) fn assess(
                     harness_id,
                 });
             };
-            match dirs.iter().find(|dir| lane.harness_problem(dir).is_none()) {
+            let context = |dir: &Path| HarnessContext::new(work_dir, &harness_id, dir);
+            match dirs
+                .iter()
+                .find(|dir| lane.harness_problem(&context(dir)).is_none())
+            {
                 Some(dir) => Ok(Eligible {
                     lane,
                     harness_id,
@@ -414,23 +494,105 @@ pub(crate) fn assess(
                     inputs,
                 }),
                 None => Err(Refusal::IncompleteHarness {
-                    problem: lane.harness_problem(first).unwrap_or_default(),
+                    problem: lane.harness_problem(&context(first)).unwrap_or_default(),
+                    language: lane.tag().to_owned(),
                     harness_dir: first.clone(),
                     harness_id,
                 }),
             }
         }
-        Tool::Cartography | Tool::EnvCapsule => match lane.harness_binary(work_dir, &harness_id) {
-            Some(binary) => Ok(Eligible {
+        Tool::Cartography | Tool::EnvCapsule => {
+            let Some(binary) = lane.harness_binary(work_dir, &harness_id) else {
+                return Err(Refusal::NotBuilt {
+                    harness_id,
+                    language: lane.tag().to_owned(),
+                });
+            };
+            if tool == Tool::EnvCapsule && !is_dynamically_linked(&binary) {
+                return Err(Refusal::ToolNotForLane {
+                    harness_id,
+                    language: lane.tag().to_owned(),
+                    reason: format!(
+                        "its executable {} is statically linked, so the runtrace shim {} \
+                         records and replays the environment through cannot be preloaded \
+                         into it",
+                        binary.display(),
+                        tool.command()
+                    ),
+                });
+            }
+            Ok(Eligible {
                 lane,
                 harness_dir: dirs.first().cloned(),
                 harness_id,
                 binary: Some(binary),
                 inputs,
-            }),
-            None => Err(Refusal::NotBuilt { harness_id }),
-        },
+            })
+        }
     }
+}
+
+/// Whether `path` is an ELF executable with a program interpreter (a
+/// dynamically linked process the runtrace shim can be preloaded into). A file
+/// that is not ELF (a launcher script, a Mach-O binary) counts as dynamic: the
+/// check only refuses what it can prove static.
+pub(crate) fn is_dynamically_linked(path: &Path) -> bool {
+    const PT_INTERP: u32 = 3;
+    let Ok(bytes) = read_prefix(path, 64 * 1024) else {
+        return true;
+    };
+    if bytes.len() < 64 || &bytes[..4] != b"\x7fELF" {
+        return true;
+    }
+    let class64 = bytes[4] == 2;
+    let little = bytes[5] == 1;
+    let u16_at = |at: usize| -> Option<u64> {
+        let b = bytes.get(at..at + 2)?;
+        Some(u64::from(if little {
+            u16::from_le_bytes([b[0], b[1]])
+        } else {
+            u16::from_be_bytes([b[0], b[1]])
+        }))
+    };
+    let u32_at = |at: usize| -> Option<u64> {
+        let b: [u8; 4] = bytes.get(at..at + 4)?.try_into().ok()?;
+        Some(u64::from(if little {
+            u32::from_le_bytes(b)
+        } else {
+            u32::from_be_bytes(b)
+        }))
+    };
+    let u64_at = |at: usize| -> Option<u64> {
+        let b: [u8; 8] = bytes.get(at..at + 8)?.try_into().ok()?;
+        Some(if little {
+            u64::from_le_bytes(b)
+        } else {
+            u64::from_be_bytes(b)
+        })
+    };
+    let (phoff, phentsize, phnum) = if class64 {
+        (u64_at(0x20), u16_at(0x36), u16_at(0x38))
+    } else {
+        (u32_at(0x1c), u16_at(0x2a), u16_at(0x2c))
+    };
+    let (Some(phoff), Some(phentsize), Some(phnum)) = (phoff, phentsize, phnum) else {
+        return true;
+    };
+    (0..phnum).any(|index| {
+        usize::try_from(phoff + index * phentsize)
+            .ok()
+            .and_then(u32_at)
+            .is_some_and(|kind| kind == PT_INTERP as u64)
+    })
+}
+
+fn read_prefix(path: &Path, max: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(max as u64)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 /// A command that reproduces a refused finding without the refusing tool:
@@ -457,6 +619,18 @@ pub(crate) fn alternative(
     }
     let binary = native_harness_binary(work_dir, harness_id)?;
     let input = crash_inputs(&finding.dir).pop()?;
+    // An Ada harness reads its input from stdin and reports through its event
+    // log; the shared detector says which protocol the binary speaks.
+    let detection = crate::protocol_detect::detect(&binary, &[work_dir]);
+    if detection.protocol == crate::protocol_detect::HarnessProtocol::StdinEventLog
+        && detection.basis != crate::protocol_detect::ProtocolBasis::Default
+    {
+        return Some(format!(
+            "cat {} | BHF_EVENTS_PATH=\"$(mktemp)\" {}",
+            sh_word(&input.to_string_lossy()),
+            sh_word(&binary.to_string_lossy())
+        ));
+    }
     Some(direct_harness_command(&binary, &input))
 }
 
@@ -527,7 +701,9 @@ fn metadata_language(dir: &Path) -> Option<String> {
 }
 
 fn driver_language(dir: &Path) -> Option<&'static str> {
-    LANES
+    // The lanes whose harness is a `main.c` with a language-specific glue
+    // beside it are asked before the C lane, which recognises any `main.c`.
+    RECOGNITION_ORDER
         .iter()
         .find(|lane| lane.recognizes(dir))
         .map(|lane| lane.tag())
@@ -588,9 +764,23 @@ pub(crate) fn language_name(tag: &str) -> String {
     .to_owned()
 }
 
-/// `C and C++`: the languages with a lane.
+/// `C, C++, Ada, ...`: the languages with a lane.
 pub(crate) fn supported_language_names() -> String {
-    let names: Vec<&str> = LANES.iter().map(|lane| lane.name()).collect();
+    join_names(LANES.iter().map(|lane| lane.name()).collect())
+}
+
+/// The languages whose findings `tool` works on.
+pub(crate) fn supported_language_names_for(tool: Tool) -> String {
+    join_names(
+        LANES
+            .iter()
+            .filter(|lane| lane.tool_gap(tool).is_none())
+            .map(|lane| lane.name())
+            .collect(),
+    )
+}
+
+fn join_names(names: Vec<&str>) -> String {
     match names.split_last() {
         None => String::new(),
         Some((last, [])) => (*last).to_owned(),
@@ -600,21 +790,45 @@ pub(crate) fn supported_language_names() -> String {
 
 // ── the lane contract ───────────────────────────────────────────────────────
 
-/// The compiler a lane's rebuild needs: `env_var` when set, else `default`.
+/// A program a lane's rebuild or replay runs: `$<env_var>` when it is set,
+/// else the first of `default` and `fallbacks` that is installed (else
+/// `default`, so the error names it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Toolchain {
     pub(crate) env_var: &'static str,
     pub(crate) default: &'static str,
+    pub(crate) fallbacks: &'static [&'static str],
+    /// What the program does for the capsule (`compiles the harness`).
+    pub(crate) purpose: &'static str,
+    /// The arguments that print its version (`--version`, `version`, `-v`).
+    pub(crate) version_args: &'static [&'static str],
 }
 
 impl Toolchain {
-    /// The compiler to run.
+    pub(crate) const fn new(
+        env_var: &'static str,
+        default: &'static str,
+        purpose: &'static str,
+    ) -> Self {
+        Self {
+            env_var,
+            default,
+            fallbacks: &[],
+            purpose,
+            version_args: &["--version"],
+        }
+    }
+
+    /// The program to run (`$CC`, else the first installed name).
     pub(crate) fn compiler(&self) -> String {
-        std::env::var(self.env_var)
-            .ok()
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| self.default.to_owned())
+        if let Some(value) = env_value(self.env_var) {
+            return value;
+        }
+        std::iter::once(self.default)
+            .chain(self.fallbacks.iter().copied())
+            .find(|name| which::which(name).is_ok())
+            .unwrap_or(self.default)
+            .to_owned()
     }
 
     /// `clang++ (or $CXX)`.
@@ -622,28 +836,214 @@ impl Toolchain {
         format!("{} (or ${})", self.default, self.env_var)
     }
 
-    /// Why the rebuild cannot run here, if it cannot.
+    /// The requirement a capsule records for this program, resolved now, with
+    /// the other names build.sh also takes for it ([`resolve_tool`]).
+    ///
+    /// [`resolve_tool`]: relocate::resolve_tool
+    pub(crate) fn requirement(&self) -> Requirement {
+        let program = self.compiler();
+        let mut requirement =
+            Requirement::new(self.env_var, &program, self.purpose, self.version_args);
+        requirement.alternatives = std::iter::once(self.default)
+            .chain(self.fallbacks.iter().copied())
+            .filter(|name| *name != program)
+            .map(str::to_owned)
+            .collect();
+        requirement
+    }
+}
+
+fn env_value(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+/// Why `command` (a `$CC`-style value: a program, possibly behind a launcher
+/// such as `ccache`) cannot run here, if it cannot.
+pub(crate) fn missing_program(command: &str, env_var: &str) -> Option<String> {
+    // `CC="ccache clang"` needs both programs; `gcc -m32` only `gcc`.
+    let words = command_words(command);
+    let absent = words
+        .iter()
+        .enumerate()
+        .filter(|(index, word)| *index == 0 || !(word.starts_with('-') || word.contains('=')))
+        .map(|(_, word)| word)
+        .find(|word| !crate::toolchain::program_exists(word));
+    absent.map(|program| {
+        format!(
+            "the rebuild needs {command}, which is not installed ({program} is not found; set \
+             {env_var} to it)"
+        )
+    })
+}
+
+/// `command` as program and arguments: one word when it names an existing
+/// program (a path with spaces stays whole), else its whitespace-separated
+/// words (`ccache clang++`).
+pub(crate) fn command_words(command: &str) -> Vec<String> {
+    let trimmed = command.trim().trim_matches('"');
+    if trimmed.is_empty() {
+        return vec![String::new()];
+    }
+    if crate::toolchain::program_exists(trimmed) || !trimmed.contains(char::is_whitespace) {
+        vec![trimmed.to_owned()]
+    } else {
+        trimmed.split_whitespace().map(str::to_owned).collect()
+    }
+}
+
+/// A [`Command`] running `command` (see [`command_words`]).
+pub(crate) fn program_command(command: &str) -> Command {
+    let words = command_words(command);
+    let mut built = Command::new(&words[0]);
+    built.args(&words[1..]);
+    built
+}
+
+/// A program a capsule needs, as its manifest records it (`requires`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Requirement {
+    pub(crate) env_var: String,
+    /// The program, as the operator would name it (`gcc`, `python3`).
+    pub(crate) program: String,
+    pub(crate) purpose: String,
+    /// The first line its version option printed when the capsule was made.
+    pub(crate) version: Option<String>,
+    /// Other names build.sh takes for it when `$<env_var>` is unset (`lua5.4`
+    /// for `lua`).
+    pub(crate) alternatives: Vec<String>,
+}
+
+impl Requirement {
+    pub(crate) fn new(env_var: &str, program: &str, purpose: &str, version_args: &[&str]) -> Self {
+        Self {
+            env_var: env_var.to_owned(),
+            program: program.to_owned(),
+            purpose: purpose.to_owned(),
+            version: program_version(program, version_args),
+            alternatives: Vec::new(),
+        }
+    }
+
+    pub(crate) fn to_json(&self) -> Value {
+        let mut value = json!({
+            "env": self.env_var,
+            "program": self.program,
+            "purpose": self.purpose,
+            "version": self.version,
+        });
+        if !self.alternatives.is_empty() {
+            value["alternatives"] = json!(self.alternatives);
+        }
+        value
+    }
+
+    pub(crate) fn from_json(value: &Value) -> Option<Self> {
+        Some(Self {
+            env_var: value.get("env")?.as_str()?.to_owned(),
+            program: value.get("program")?.as_str()?.to_owned(),
+            purpose: value
+                .get("purpose")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            version: value
+                .get("version")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            alternatives: value
+                .get("alternatives")
+                .and_then(Value::as_array)
+                .map(|names| {
+                    names
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        })
+    }
+
+    /// The program to run here: `$<env_var>`, else the recorded one.
+    pub(crate) fn resolved(&self) -> String {
+        env_value(&self.env_var).unwrap_or_else(|| self.program.clone())
+    }
+
+    /// Why this requirement is not met here, if it is not. With `$<env_var>`
+    /// unset, any of its alternatives meets it, as build.sh takes them.
     pub(crate) fn missing(&self) -> Option<String> {
-        let compiler = self.compiler();
-        // `CC="ccache clang"` runs its first word.
-        let program = compiler.split_whitespace().next().unwrap_or_default();
-        let found = if program.contains('/') {
-            Path::new(program).is_file()
+        let missing = missing_program(&self.resolved(), &self.env_var)?;
+        let alternatives: Vec<&str> = if env_value(&self.env_var).is_some() {
+            Vec::new()
         } else {
-            which::which(program).is_ok()
+            self.alternatives.iter().map(String::as_str).collect()
         };
-        (!found).then(|| {
-            format!(
-                "the rebuild needs {compiler}, which is not installed (set {} to a compiler)",
-                self.env_var
-            )
+        if alternatives
+            .iter()
+            .any(|name| missing_program(name, &self.env_var).is_none())
+        {
+            return None;
+        }
+        let missing = match alternatives.len() {
+            0 => missing,
+            1 => format!("{missing}; {} is not found either", alternatives[0]),
+            _ => format!(
+                "{missing}; {} are not found either",
+                join_names(alternatives)
+            ),
+        };
+        Some(if self.purpose.is_empty() {
+            missing
+        } else {
+            format!("{missing}; it {}", self.purpose)
         })
     }
 }
 
-/// What a lane is asked to package.
-pub(crate) struct PlanRequest<'a> {
-    pub(crate) harness_dir: &'a Path,
+/// The first non-empty line `program <version_args>` prints (stdout, else
+/// stderr), bounded.
+pub(crate) fn program_version(program: &str, version_args: &[&str]) -> Option<String> {
+    let mut command = program_command(program);
+    command
+        .args(version_args)
+        .stdin(std::process::Stdio::null());
+    let output =
+        crate::command_output::output_with_timeout(&mut command, Duration::from_secs(30)).ok()?;
+    let text = if output.stdout.iter().any(|b| !b.is_ascii_whitespace()) {
+        output.stdout
+    } else {
+        output.stderr
+    };
+    String::from_utf8_lossy(&text)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_owned)
+}
+
+/// The harness a lane is asked about: its id, the dir it was found in, and
+/// the work dir the run wrote, both absolute (the build files a lane
+/// relocates name absolute paths).
+#[derive(Debug, Clone)]
+pub(crate) struct HarnessContext {
+    pub(crate) work_dir: PathBuf,
+    pub(crate) harness_id: String,
+    pub(crate) harness_dir: PathBuf,
+}
+
+impl HarnessContext {
+    pub(crate) fn new(work_dir: &Path, harness_id: &str, harness_dir: &Path) -> Self {
+        let absolute =
+            |path: &Path| normalize(&std::path::absolute(path).unwrap_or_else(|_| path.into()));
+        Self {
+            work_dir: absolute(work_dir),
+            harness_id: harness_id.to_owned(),
+            harness_dir: absolute(harness_dir),
+        }
+    }
 }
 
 /// One file a capsule ships: copied from `from` to capsule-relative `to`.
@@ -653,13 +1053,28 @@ pub(crate) struct CapsuleFile {
     pub(crate) to: String,
 }
 
+/// A file a capsule ships with content the lane wrote (a relocated build file).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GeneratedFile {
+    pub(crate) to: String,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) executable: bool,
+}
+
 /// Everything a capsule needs from its lane.
 pub(crate) struct CapsulePlan {
     pub(crate) files: Vec<CapsuleFile>,
+    /// Files whose content the lane wrote (relocated paths).
+    pub(crate) generated: Vec<GeneratedFile>,
     /// The POSIX `build.sh` that rebuilds `./poc` from the copied files.
     pub(crate) build_script: String,
+    /// One phrase for the README: what `build.sh` does (`compile ./poc
+    /// (ASan+UBSan)`).
+    pub(crate) build_summary: String,
     /// Build facts recorded in the manifest's `build_recipe` object.
     pub(crate) build_facts: Value,
+    /// The programs the rebuild and the replay need (manifest `requires`).
+    pub(crate) requires: Vec<Requirement>,
     /// `(path, what it holds)` lines for the README's layout section.
     pub(crate) layout: Vec<(String, String)>,
     /// Build outputs to delete once the capsule is verified.
@@ -668,39 +1083,135 @@ pub(crate) struct CapsulePlan {
     pub(crate) warnings: Vec<String>,
 }
 
+/// A lane's reason not to package a harness, decided while planning (a
+/// dependency that cannot be vendored, a project outside the tree). `capsule`
+/// reports it as a refusal, not as a failure.
+#[derive(Debug)]
+pub(crate) struct PlanRefusal(pub(crate) String);
+
+impl std::fmt::Display for PlanRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PlanRefusal {}
+
+/// A [`PlanRefusal`] as the error a plan returns.
+pub(crate) fn refuse(reason: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(PlanRefusal(reason.into()))
+}
+
+/// What one replay of a rebuilt PoC showed.
+#[derive(Debug)]
+pub(crate) struct ReplayOutput {
+    pub(crate) stderr: String,
+    pub(crate) status: ExitStatus,
+    /// The event log an event-log harness wrote (the Ada runtime's).
+    pub(crate) events: Option<Vec<u8>>,
+    pub(crate) timed_out: bool,
+}
+
 /// A language the offline reproduction commands support.
 pub(crate) trait Lane: Sync {
     /// The language tag in generation metadata and in the capsule manifest.
     fn tag(&self) -> &'static str;
     /// The language as people write it.
     fn name(&self) -> &'static str;
-    /// The toolchain a rebuilt capsule needs.
-    fn toolchain(&self) -> Toolchain;
+    /// The programs a rebuilt capsule needs, the main one first.
+    fn tools(&self) -> &'static [Toolchain];
     /// Whether `harness_dir` holds this lane's harness (its driver file).
     fn recognizes(&self, harness_dir: &Path) -> bool;
-    /// Why this lane cannot rebuild `harness_dir`, or `None` when it can.
-    fn harness_problem(&self, harness_dir: &Path) -> Option<String>;
-    /// Files to copy and the build script for one harness.
-    fn plan_capsule(&self, request: &PlanRequest<'_>) -> anyhow::Result<CapsulePlan>;
-    /// Replay protocol: the command that runs the rebuilt PoC in `capsule` on
-    /// `input` (capsule-relative).
-    fn replay_command(&self, capsule: &Path, input: &str) -> Command;
+    /// Why this lane cannot rebuild the harness, or `None` when it can. Cheap:
+    /// what only an attempt can tell is refused by [`Lane::plan_capsule`].
+    fn harness_problem(&self, harness: &HarnessContext) -> Option<String>;
+    /// Files to copy and the build script for one harness. A
+    /// [`PlanRefusal`] error says why the lane will not package it.
+    fn plan_capsule(&self, harness: &HarnessContext) -> anyhow::Result<CapsulePlan>;
+    /// How the rebuilt PoC takes its input when the protocol detector finds
+    /// nothing that says.
+    fn protocol(&self) -> crate::protocol_detect::HarnessProtocol {
+        crate::protocol_detect::HarnessProtocol::BhfFramed
+    }
     /// Crash oracle: the stable signature of a crash in a replay, `None` when
     /// the replay did not crash.
-    fn crash_signature(&self, stderr: &str, status: &ExitStatus) -> Option<String>;
+    fn crash_signature(&self, replay: &ReplayOutput) -> Option<String>;
+    /// The signature the finding itself recorded, in [`Lane::crash_signature`]'s
+    /// terms, when the lane can tell (an Ada finding's exception name); a
+    /// capsule whose replay shows another one says so.
+    fn finding_signature(&self, _finding: &Value) -> Option<String> {
+        None
+    }
     /// The built harness executable that perturbation analysis and
     /// environment capture replay.
-    fn harness_binary(&self, work_dir: &Path, harness_id: &str) -> Option<PathBuf>;
+    fn harness_binary(&self, work_dir: &Path, harness_id: &str) -> Option<PathBuf> {
+        native_harness_binary(work_dir, harness_id)
+    }
+    /// Why `tool` does not work on this lane's findings (completing "bhf
+    /// cartography ..."), `None` when it does.
+    fn tool_gap(&self, tool: Tool) -> Option<&'static str>;
 }
 
-/// The supported lanes. A harness dir holds one lane's driver file, so their
-/// order only sets how the languages are listed.
-pub(crate) static LANES: [&dyn Lane; 2] = [&C_LANE, &CPP_LANE];
+/// Why cartography takes C and C++ findings only.
+pub(crate) const CARTOGRAPHY_GAP: &str =
+    "maps the AddressSanitizer reports of C and C++ harnesses only";
+/// Why env-capsule takes native harnesses only.
+pub(crate) const ENV_CAPSULE_INTERPRETED_GAP: &str =
+    "records and replays the environment of native harness processes through the \
+     runtrace shim, and this harness runs inside a language runtime";
+
+/// The supported lanes, in the order the languages are listed.
+pub(crate) static LANES: [&dyn Lane; 16] = [
+    &C_LANE,
+    &CPP_LANE,
+    &ada::ADA_LANE,
+    &rust::RUST_LANE,
+    &go::GO_LANE,
+    &jvm::JAVA_LANE,
+    &dotnet::CSHARP_LANE,
+    &script::PYTHON_LANE,
+    &script::JAVASCRIPT_LANE,
+    &script::TYPESCRIPT_LANE,
+    &script::RUBY_LANE,
+    &script::PERL_LANE,
+    &script::PHP_LANE,
+    &script::LUA_LANE,
+    &c_glue::COBOL_LANE,
+    &c_glue::FORTRAN_LANE,
+];
+
+/// The lanes in the order a harness dir's driver files are matched: a Rust,
+/// COBOL or Fortran harness also holds a `main.c`.
+static RECOGNITION_ORDER: [&dyn Lane; 16] = [
+    &rust::RUST_LANE,
+    &c_glue::COBOL_LANE,
+    &c_glue::FORTRAN_LANE,
+    &C_LANE,
+    &CPP_LANE,
+    &ada::ADA_LANE,
+    &go::GO_LANE,
+    &jvm::JAVA_LANE,
+    &dotnet::CSHARP_LANE,
+    &script::PYTHON_LANE,
+    &script::JAVASCRIPT_LANE,
+    &script::TYPESCRIPT_LANE,
+    &script::RUBY_LANE,
+    &script::PERL_LANE,
+    &script::PHP_LANE,
+    &script::LUA_LANE,
+];
 
 /// The lane for a language tag.
 pub(crate) fn lane_for(tag: &str) -> Option<&'static dyn Lane> {
     let tag = match tag {
         "c++" | "cxx" => "cpp",
+        "js" | "node" => "javascript",
+        "ts" => "typescript",
+        "cs" | "c#" | "dotnet" => "csharp",
+        "rs" => "rust",
+        "py" => "python",
+        "pl" => "perl",
+        "golang" => "go",
         other => other,
     };
     LANES.iter().copied().find(|lane| lane.tag() == tag)
@@ -732,6 +1243,32 @@ pub(crate) fn sanitizer_signature(stderr: &str, status: &ExitStatus) -> Option<S
     None
 }
 
+/// The signature of a finding a language runtime's driver reported (`== bhf
+/// python finding: ...`, a Rust or Go panic, a JVM or .NET exception) or a
+/// sanitizer reported: `<rule>:<kind>` as bhf's own crash parser reads it,
+/// else the sanitizer class, else a fatal signal.
+pub(crate) fn report_signature(stderr: &str, status: &ExitStatus) -> Option<String> {
+    if let Some(report) = corpus::sanitizer::parse_sanitizer_report(stderr) {
+        // A runtime that reports its own failure and then aborts (a Rust
+        // panic) also trips ASan's deadly-signal report, which the replay arms
+        // (`handle_abort=1`) and the fuzz loop does not: the runtime's report
+        // is the finding.
+        if matches!(report.kind.as_str(), "ABRT" | "SIGABRT") {
+            let before_signal = stderr
+                .find("ERROR: AddressSanitizer: ABRT")
+                .map(|at| &stderr[..at])
+                .unwrap_or(stderr);
+            if let Some(runtime) = corpus::sanitizer::parse_sanitizer_report(before_signal)
+                .filter(|runtime| runtime.kind != report.kind)
+            {
+                return Some(format!("{}:{}", runtime.rule_id, runtime.kind));
+            }
+        }
+        return Some(format!("{}:{}", report.rule_id, report.kind));
+    }
+    sanitizer_signature(stderr, status)
+}
+
 /// Keep capsule replays local and deterministic. On Ubuntu, `DEBUGINFOD_URLS`
 /// is commonly set system-wide; a sanitizer crash can then make
 /// llvm-symbolizer wait on the network indefinitely. Capsules are promised to
@@ -739,7 +1276,79 @@ pub(crate) fn sanitizer_signature(stderr: &str, status: &ExitStatus) -> Option<S
 pub(crate) fn configure_offline_replay(command: &mut Command) {
     command
         .env("ASAN_OPTIONS", "abort_on_error=1:handle_abort=1")
-        .env("DEBUGINFOD_URLS", "");
+        .env("DEBUGINFOD_URLS", "")
+        // A replay runs one input; it must not wait for the fuzz loop's frames.
+        .env_remove("BHF_FRAMED")
+        .env_remove("BHF_COV_SHM");
+}
+
+/// Replay the rebuilt PoC (`<capsule>/poc`) once on `input` (capsule-relative)
+/// with `protocol`: as `argv[1]`, or on stdin with the event log in a scratch
+/// file. Stdin is a pipe, never the file: the Ada runtime re-opens
+/// `/dev/stdin` for each input, which a redirected file would serve forever.
+/// The PoC runs in the capsule dir, so its path is made absolute first: a
+/// relative one would be resolved again from inside that dir.
+pub(crate) fn replay_poc(
+    capsule: &Path,
+    input: &str,
+    protocol: crate::protocol_detect::HarnessProtocol,
+    timeout: Duration,
+) -> std::io::Result<ReplayOutput> {
+    use crate::protocol_detect::HarnessProtocol;
+    let capsule = &std::path::absolute(capsule)?;
+    let mut command = Command::new(capsule.join("poc"));
+    configure_offline_replay(&mut command);
+    command.current_dir(capsule);
+    match protocol {
+        HarnessProtocol::BhfFramed | HarnessProtocol::LibFuzzerSingleInput => {
+            command.arg(input);
+            let (output, timed_out) =
+                crate::command_output::output_with_timeout_flagged(&mut command, timeout)?;
+            Ok(ReplayOutput {
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                status: output.status,
+                events: None,
+                timed_out,
+            })
+        }
+        HarnessProtocol::StdinEventLog => {
+            let scratch = tempfile::Builder::new()
+                .prefix("bhf-poc-events-")
+                .tempdir()?;
+            let events = scratch.path().join("events.bin");
+            command.env("BHF_EVENTS_PATH", &events);
+            let bytes = std::fs::read(capsule.join(input))?;
+            let (output, timed_out) = run_with_stdin(command, bytes, timeout)?;
+            Ok(ReplayOutput {
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                status: output.status,
+                events: std::fs::read(&events).ok(),
+                timed_out,
+            })
+        }
+    }
+}
+
+/// Run `command` with `input` written to its stdin through a pipe, bounded by
+/// `timeout`.
+pub(crate) fn run_with_stdin(
+    mut command: Command,
+    input: Vec<u8>,
+    timeout: Duration,
+) -> std::io::Result<(std::process::Output, bool)> {
+    use std::io::Write;
+    let (reader, mut writer) = std::io::pipe()?;
+    command.stdin(reader);
+    let feeder = std::thread::spawn(move || {
+        // A harness that exits before reading everything closes the pipe;
+        // that is its business, not an error here.
+        let _ = writer.write_all(&input);
+    });
+    let result = crate::command_output::output_with_timeout_flagged(&mut command, timeout);
+    // The command holds the read end; dropping it lets a blocked feeder fail.
+    drop(command);
+    let _ = feeder.join();
+    result
 }
 
 // ── the C and C++ lanes ─────────────────────────────────────────────────────
@@ -749,68 +1358,85 @@ pub(crate) fn configure_offline_replay(command: &mut Command) {
 /// (`coverage-build-recipe.json`, per-translation-unit object rules, repair
 /// stubs and force-included headers).
 pub(crate) struct CFamilyLane {
-    tag: &'static str,
-    name: &'static str,
-    driver: &'static str,
-    toolchain: Toolchain,
+    pub(crate) tag: &'static str,
+    pub(crate) name: &'static str,
+    pub(crate) driver: &'static str,
+    /// The compiler, then any other program the rebuild needs.
+    pub(crate) tools: &'static [Toolchain],
     /// The Makefile variable holding the language standard.
-    standard_var: &'static str,
+    pub(crate) standard_var: &'static str,
     /// C++ puts `-std=` in `CXXFLAGS`, ahead of the recovered flags; C
     /// appends it after them (`C_STD_FLAG`), so the ladder's choice wins.
-    standard_leads: bool,
-    /// Lane-specific compiler flags (the C++ Makefile's compatibility switch).
-    lane_flags: &'static [&'static str],
+    pub(crate) standard_leads: bool,
+    /// Lane-specific compiler flags clang takes (the C++ Makefile's
+    /// compatibility switch); a gcc build leaves them out, as the Makefile does.
+    pub(crate) clang_lane_flags: &'static [&'static str],
     /// `-x` language for the system include-dir probe.
-    probe_language: &'static str,
+    pub(crate) probe_language: &'static str,
     /// Repair stub source extensions compiled when no build recipe is recorded.
-    stub_extensions: &'static [&'static str],
+    pub(crate) stub_extensions: &'static [&'static str],
     /// Recover the C++ standard-library headers and runtime when the compiler
     /// cannot find them itself, as bhf's own C++ builds do.
-    recovers_cpp_stdlib: bool,
+    pub(crate) recovers_cpp_stdlib: bool,
+    /// The language glue a COBOL or Fortran harness links beside `main.c`.
+    pub(crate) glue: Option<c_glue::Glue>,
 }
+
+const C_TOOLS: &[Toolchain] = &[Toolchain::new("CC", "clang", "compiles the harness")];
+const CPP_TOOLS: &[Toolchain] = &[Toolchain::new("CXX", "clang++", "compiles the harness")];
 
 pub(crate) static C_LANE: CFamilyLane = CFamilyLane {
     tag: "c",
     name: "C",
     driver: "main.c",
-    toolchain: Toolchain {
-        env_var: "CC",
-        default: "clang",
-    },
+    tools: C_TOOLS,
     standard_var: "C_STD",
     standard_leads: false,
-    lane_flags: &[],
+    clang_lane_flags: &[],
     probe_language: "c",
     stub_extensions: &["c"],
     recovers_cpp_stdlib: false,
+    glue: None,
 };
 
 pub(crate) static CPP_LANE: CFamilyLane = CFamilyLane {
     tag: "cpp",
     name: "C++",
     driver: "main.cpp",
-    toolchain: Toolchain {
-        env_var: "CXX",
-        default: "clang++",
-    },
+    tools: CPP_TOOLS,
     standard_var: "CXX_STD",
     standard_leads: true,
     // Clang treats the legacy `"%" PRId64` macro adjacency as a reserved
     // user-defined literal in C++11+; the harness Makefile turns that off.
-    lane_flags: &["-Wno-reserved-user-defined-literal"],
+    clang_lane_flags: &["-Wno-reserved-user-defined-literal"],
     probe_language: "c++",
     stub_extensions: &["c", "cc", "cpp", "cxx"],
     recovers_cpp_stdlib: true,
+    glue: None,
 };
 
-/// Sanitizer build of the capsule PoC (the Makefile's `main` flags without the
-/// fuzzing-only coverage instrumentation).
-const SANITIZER_FLAGS: &[&str] = &[
-    "-O1",
-    "-g",
-    "-fsanitize=address,undefined",
-    "-fno-sanitize=function,vptr,alignment",
-];
+/// Optimisation and debug info of the capsule PoC (the Makefile's `main`
+/// flags without the fuzzing-only coverage instrumentation).
+const OPT_FLAGS: &[&str] = &["-O1", "-g"];
+
+/// The sanitizer flags of `family`'s compilers, as the harness Makefile spells
+/// them: gcc has no `function` UBSan check and links its sanitizer runtimes
+/// statically, as clang does.
+pub(crate) fn family_sanitizer_flags(family: CompilerFamily) -> Vec<String> {
+    let mut flags = vec![
+        "-fsanitize=address,undefined".to_owned(),
+        family.ubsan_subtraction().to_owned(),
+    ];
+    if family == CompilerFamily::Gcc {
+        flags.push("-static-libasan".to_owned());
+        flags.push("-static-libubsan".to_owned());
+    }
+    flags
+}
+
+/// A build.sh word that expands to the sanitizer flags of the compiler that
+/// runs the script (`$SANITIZE`), which the script picks by asking it.
+const SANITIZE_WORD: &str = "\u{1}SANITIZE";
 /// The Makefile's `SECTION_FLAGS`: without them (and the matching linker
 /// garbage collection) an isolated target inherits undefined references from
 /// every unused function in its translation unit.
@@ -837,15 +1463,20 @@ impl Lane for CFamilyLane {
         self.name
     }
 
-    fn toolchain(&self) -> Toolchain {
-        self.toolchain
+    fn tools(&self) -> &'static [Toolchain] {
+        self.tools
     }
 
     fn recognizes(&self, harness_dir: &Path) -> bool {
         harness_dir.join(self.driver).is_file()
+            && match self.glue {
+                Some(glue) => harness_dir.join(glue.glue_file()).is_file(),
+                None => true,
+            }
     }
 
-    fn harness_problem(&self, harness_dir: &Path) -> Option<String> {
+    fn harness_problem(&self, harness: &HarnessContext) -> Option<String> {
+        let harness_dir = &harness.harness_dir;
         if !harness_dir.join(self.driver).is_file() {
             return Some(format!("it has no {}", self.driver));
         }
@@ -868,24 +1499,56 @@ impl Lane for CFamilyLane {
         None
     }
 
-    fn plan_capsule(&self, request: &PlanRequest<'_>) -> anyhow::Result<CapsulePlan> {
-        let model = self.build_model(request.harness_dir)?;
+    fn plan_capsule(&self, harness: &HarnessContext) -> anyhow::Result<CapsulePlan> {
+        let mut model = self.build_model(&harness.harness_dir)?;
+        if let Some(glue) = self.glue {
+            c_glue::adjust_model(glue, harness, &mut model)?;
+        }
         self.plan_from_model(&model)
     }
 
-    fn replay_command(&self, capsule: &Path, input: &str) -> Command {
-        let mut command = Command::new("./poc");
-        configure_offline_replay(&mut command);
-        command.arg(input).current_dir(capsule);
-        command
+    fn crash_signature(&self, replay: &ReplayOutput) -> Option<String> {
+        if let Some(glue) = self.glue {
+            if let Some(signature) = c_glue::runtime_signature(glue, &replay.stderr) {
+                return Some(signature);
+            }
+        }
+        sanitizer_signature(&replay.stderr, &replay.status)
     }
 
-    fn crash_signature(&self, stderr: &str, status: &ExitStatus) -> Option<String> {
-        sanitizer_signature(stderr, status)
+    fn tool_gap(&self, tool: Tool) -> Option<&'static str> {
+        match tool {
+            Tool::Cartography if self.glue.is_some() => Some(CARTOGRAPHY_GAP),
+            _ => None,
+        }
     }
+}
 
-    fn harness_binary(&self, work_dir: &Path, harness_id: &str) -> Option<PathBuf> {
-        native_harness_binary(work_dir, harness_id)
+/// The C/C++ compiler a capsule rebuilds with and the flag family it speaks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CapsuleCompiler {
+    /// As `$CC`/`$CXX` holds it (`gcc`, `ccache clang++`).
+    pub(crate) command: String,
+    pub(crate) family: CompilerFamily,
+    /// Where the choice came from: `environment`, `harness binary`, `default`.
+    pub(crate) source: &'static str,
+}
+
+/// The compiler family that built `binary`, from the producer strings its
+/// objects carry: clang stamps `clang version`; gcc only `GCC: (` (which the
+/// C runtime start files add to clang builds too).
+pub(crate) fn binary_compiler_family(binary: &Path) -> Option<CompilerFamily> {
+    let bytes = read_prefix(binary, 512 * 1024 * 1024).ok()?;
+    if bytes.len() < 4 || &bytes[..4] != b"\x7fELF" {
+        return None;
+    }
+    let contains = |needle: &[u8]| bytes.windows(needle.len()).any(|window| window == needle);
+    if contains(b"clang version") {
+        Some(CompilerFamily::Clang)
+    } else if contains(b"GCC: (") || contains(b"GNU C") {
+        Some(CompilerFamily::Gcc)
+    } else {
+        None
     }
 }
 
@@ -1036,10 +1699,10 @@ struct Unit {
 }
 
 /// Everything needed to rebuild one harness, with original absolute paths.
-struct BuildModel {
-    harness_dir: PathBuf,
+pub(crate) struct BuildModel {
+    pub(crate) harness_dir: PathBuf,
     driver: PathBuf,
-    target_sources: Vec<PathBuf>,
+    pub(crate) target_sources: Vec<PathBuf>,
     extra_sources: Vec<PathBuf>,
     units: Vec<Unit>,
     compile_db_flags: Vec<Arg>,
@@ -1049,7 +1712,35 @@ struct BuildModel {
     compat_flags: Vec<String>,
     link_flags: Vec<Arg>,
     recorded_recipe: bool,
-    warnings: Vec<String>,
+    pub(crate) compiler: CapsuleCompiler,
+    /// Objects the link names that build.sh compiles from shipped sources
+    /// first (a Fortran target), instead of shipping the prebuilt object.
+    pub(crate) rebuilt_objects: Vec<RebuiltObject>,
+    /// build.sh lines run before any compile (a language runtime's link
+    /// flags probed on the host that runs the script).
+    pub(crate) prelude: String,
+    /// Shell words appended to the link line as written (`$COB_LIBS`).
+    pub(crate) extra_link: Vec<String>,
+    /// Files the capsule ships for the reader but does not compile (the COBOL
+    /// source of a translated program).
+    pub(crate) extra_files: Vec<PathBuf>,
+    /// C sources the capsule writes itself and links (capsule path, text).
+    pub(crate) generated_sources: Vec<(String, String)>,
+    /// Extra build facts for the manifest.
+    pub(crate) facts: serde_json::Map<String, Value>,
+    pub(crate) warnings: Vec<String>,
+}
+
+/// An object a capsule compiles from source before the link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RebuiltObject {
+    /// The object as the link names it.
+    pub(crate) object: PathBuf,
+    pub(crate) source: PathBuf,
+    /// The compiler variable and its default (`FC`, `gfortran`).
+    pub(crate) compiler_var: &'static str,
+    /// Flags before `-c <source> -o <object>`.
+    pub(crate) flags: Vec<String>,
 }
 
 impl CFamilyLane {
@@ -1186,6 +1877,7 @@ impl CFamilyLane {
                 .filter(|standard| !standard.trim().is_empty())
                 .or(facts.default_standard),
             recorded_recipe: recipe.is_some(),
+            compiler: self.capsule_compiler(&harness_dir),
             harness_dir,
             target_sources,
             extra_sources,
@@ -1193,8 +1885,57 @@ impl CFamilyLane {
             extra_includes,
             compat_flags,
             link_flags,
+            rebuilt_objects: Vec::new(),
+            prelude: String::new(),
+            extra_link: Vec::new(),
+            extra_files: Vec::new(),
+            generated_sources: Vec::new(),
+            facts: serde_json::Map::new(),
             warnings,
         })
+    }
+
+    /// The compiler the capsule rebuilds with: `$CC`/`$CXX` when set, else the
+    /// family that built the harness binary (a gcc-built harness rebuilds with
+    /// gcc), else the lane's default.
+    fn capsule_compiler(&self, harness_dir: &Path) -> CapsuleCompiler {
+        let toolchain = self.tools[0];
+        let cxx = self.probe_language == "c++";
+        if let Some(command) = env_value(toolchain.env_var) {
+            let family = crate::toolchain::compiler_family(&command, cxx)
+                .or_else(|| {
+                    command_words(&command)
+                        .iter()
+                        .rev()
+                        .find_map(|word| harness_gen::compiler_family::family_from_name(word))
+                })
+                .unwrap_or(CompilerFamily::Clang);
+            return CapsuleCompiler {
+                command,
+                family,
+                source: "environment",
+            };
+        }
+        let built = [harness_dir.join("main"), harness_dir.join("obj/main")]
+            .iter()
+            .find_map(|binary| binary_compiler_family(binary));
+        match built {
+            Some(CompilerFamily::Gcc) => CapsuleCompiler {
+                command: if cxx { "g++" } else { "gcc" }.to_owned(),
+                family: CompilerFamily::Gcc,
+                source: "harness binary",
+            },
+            Some(CompilerFamily::Clang) => CapsuleCompiler {
+                command: toolchain.default.to_owned(),
+                family: CompilerFamily::Clang,
+                source: "harness binary",
+            },
+            None => CapsuleCompiler {
+                command: toolchain.default.to_owned(),
+                family: CompilerFamily::Clang,
+                source: "default",
+            },
+        }
     }
 
     fn repair_stub_sources(&self, repairs: &Path) -> Vec<PathBuf> {
@@ -1216,22 +1957,37 @@ impl CFamilyLane {
     }
 
     /// The flags every compile of this lane starts with, through the language
-    /// standard when it leads.
-    fn leading_flags(&self, standard: Option<&str>) -> Vec<String> {
-        let mut flags: Vec<String> = SANITIZER_FLAGS.iter().map(|f| (*f).to_owned()).collect();
+    /// standard when it leads. `sanitize` stands for the sanitizer flags (the
+    /// family's own for a scan, [`SANITIZE_WORD`] for build.sh).
+    fn leading_flags(&self, standard: Option<&str>, sanitize: &[String]) -> Vec<String> {
+        let mut flags: Vec<String> = OPT_FLAGS.iter().map(|f| (*f).to_owned()).collect();
+        flags.extend(sanitize.iter().cloned());
         if self.standard_leads {
             if let Some(standard) = standard {
                 flags.push(format!("-std={standard}"));
             }
         }
-        flags.extend(self.lane_flags.iter().map(|f| (*f).to_owned()));
         flags.extend(SECTION_FLAGS.iter().map(|f| (*f).to_owned()));
         flags
     }
 
+    /// The sanitizer (and clang-only lane) flags `family` takes.
+    fn sanitize_flags(&self, family: CompilerFamily) -> Vec<String> {
+        let mut flags = family_sanitizer_flags(family);
+        if family == CompilerFamily::Clang {
+            flags.extend(self.clang_lane_flags.iter().map(|f| (*f).to_owned()));
+        }
+        flags
+    }
+
     /// The full argument list (no output, no inputs) of the `main` compile.
-    fn main_args(&self, model: &BuildModel, map: &dyn Fn(&Path) -> String) -> Vec<String> {
-        let mut args = self.leading_flags(model.standard.as_deref());
+    fn main_args(
+        &self,
+        model: &BuildModel,
+        sanitize: &[String],
+        map: &dyn Fn(&Path) -> String,
+    ) -> Vec<String> {
+        let mut args = self.leading_flags(model.standard.as_deref(), sanitize);
         args.extend(model.compat_flags.iter().cloned());
         args.extend(FEATURE_TEST_FLAGS.iter().map(|f| (*f).to_owned()));
         args.extend(model.compile_db_flags.iter().flat_map(|a| a.render(map)));
@@ -1250,9 +2006,10 @@ impl CFamilyLane {
         &self,
         model: &BuildModel,
         unit: &Unit,
+        sanitize: &[String],
         map: &dyn Fn(&Path) -> String,
     ) -> Vec<String> {
-        let mut args = self.leading_flags(model.standard.as_deref());
+        let mut args = self.leading_flags(model.standard.as_deref(), sanitize);
         args.extend(model.compat_flags.iter().cloned());
         args.extend(unit.flags.iter().flat_map(|a| a.render(map)));
         args.extend(model.includes.iter().flat_map(|a| a.render(map)));
@@ -1262,10 +2019,12 @@ impl CFamilyLane {
 
     fn plan_from_model(&self, model: &BuildModel) -> anyhow::Result<CapsulePlan> {
         let mut warnings = model.warnings.clone();
+        let rebuilt: BTreeSet<&PathBuf> = model.rebuilt_objects.iter().map(|o| &o.object).collect();
         let explicit = std::iter::once(&model.driver)
-            .chain(&model.target_sources)
+            .chain(model.target_sources.iter().filter(|p| !rebuilt.contains(p)))
             .chain(&model.extra_sources)
-            .chain(model.units.iter().map(|unit| &unit.source));
+            .chain(model.units.iter().map(|unit| &unit.source))
+            .chain(model.rebuilt_objects.iter().map(|object| &object.source));
         for path in explicit {
             if !path.is_file() {
                 anyhow::bail!(
@@ -1274,16 +2033,19 @@ impl CFamilyLane {
                 );
             }
         }
-        let compiler = self.toolchain.compiler();
+        let compiler = &model.compiler.command;
+        let family = model.compiler.family;
+        let scan_sanitize = self.sanitize_flags(family);
         // A clang++ that picked a GCC install without its libstdc++ headers
         // cannot compile `<string>`; bhf's C++ builds then add the newest
-        // installed libstdc++ headers (crate::build), and so does the scan.
+        // installed libstdc++ headers (crate::build), and so does the scan
+        // (or, on a libc++ host, the libc++ headers).
         let stdlib_flags = if self.recovers_cpp_stdlib {
-            crate::build::detect_cpp_stdlib_include_flags_for(&compiler, &[])
+            cpp_stdlib_flags(compiler)
         } else {
             Vec::new()
         };
-        let system = system_include_dirs(&compiler, self.probe_language);
+        let system = system_include_dirs(compiler, self.probe_language);
         let is_system = |path: &Path| system.iter().any(|dir| path.starts_with(dir));
         let original = |path: &Path| path.to_string_lossy().into_owned();
 
@@ -1292,9 +2054,17 @@ impl CFamilyLane {
         //    deep and through whichever include root).
         let mut files: BTreeSet<PathBuf> = BTreeSet::new();
         files.insert(model.driver.clone());
-        files.extend(model.target_sources.iter().cloned());
+        files.extend(
+            model
+                .target_sources
+                .iter()
+                .filter(|p| !rebuilt.contains(p))
+                .cloned(),
+        );
         files.extend(model.extra_sources.iter().cloned());
         files.extend(model.units.iter().map(|u| u.source.clone()));
+        files.extend(model.rebuilt_objects.iter().map(|o| o.source.clone()));
+        files.extend(model.extra_files.iter().cloned());
         for arg in model.extra_includes.iter().chain(&model.compile_db_flags) {
             if let Arg::Split("-include" | "-imacros", path) = arg {
                 files.insert(path.clone());
@@ -1309,17 +2079,20 @@ impl CFamilyLane {
             .chain(model.extra_sources.iter().cloned())
             .filter(|path| has_extension(path, SOURCE_EXTENSIONS))
             .collect();
-        let mut scans = vec![(self.main_args(model, &original), main_inputs)];
+        let mut scans = vec![(
+            self.main_args(model, &scan_sanitize, &original),
+            main_inputs,
+        )];
         for unit in &model.units {
             scans.push((
-                self.unit_args(model, unit, &original),
+                self.unit_args(model, unit, &scan_sanitize, &original),
                 vec![unit.source.clone()],
             ));
         }
         let mut closure = "compiler";
         for (args, inputs) in &mut scans {
             args.extend(stdlib_flags.iter().cloned());
-            match dependency_closure(&compiler, &model.harness_dir, args, inputs) {
+            match dependency_closure(compiler, &model.harness_dir, args, inputs) {
                 Some(deps) => files.extend(deps.into_iter().filter(|dep| !is_system(dep))),
                 None => closure = "header-scan",
             }
@@ -1429,7 +2202,24 @@ impl CFamilyLane {
                 })
             })
         };
+        // An object build.sh compiles from source lives in `obj/`.
+        let rebuilt_place: Vec<(PathBuf, String)> = model
+            .rebuilt_objects
+            .iter()
+            .enumerate()
+            .map(|(index, object)| {
+                let stem = object
+                    .object
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "object".to_owned());
+                (object.object.clone(), format!("obj/{index}_{stem}.o"))
+            })
+            .collect();
         let capsule_path = |path: &Path| -> String {
+            if let Some((_, to)) = rebuilt_place.iter().find(|(object, _)| object == path) {
+                return to.clone();
+            }
             if is_system(path) {
                 return original(path);
             }
@@ -1438,7 +2228,7 @@ impl CFamilyLane {
 
         let mut copies = Vec::new();
         for path in &files {
-            if is_system(path) || !path.is_file() {
+            if is_system(path) || !path.is_file() || rebuilt.contains(path) {
                 continue;
             }
             match place(path) {
@@ -1451,19 +2241,23 @@ impl CFamilyLane {
         }
 
         // 3. build.sh: per-TU objects first, then the `main` link, all relative.
-        let compiler_var = self.toolchain.env_var;
+        let compiler_var = self.tools[0].env_var;
         let mut script = format!(
             "#!/bin/sh\n\
              # Rebuild this bhf PoC offline. Needs only {} and a shell.\n\
              set -e\n\
              cd \"$(dirname \"$0\")\"\n\
              {compiler_var}=\"${{{compiler_var}:-{}}}\"\n\
+             {}\
+             {}\
              case \"$(uname -s)\" in\n\
              \x20 Darwin) GC_LDFLAGS=-Wl,-dead_strip ;;\n\
              \x20 *) GC_LDFLAGS=-Wl,--gc-sections ;;\n\
              esac\n",
-            self.toolchain.describe(),
-            self.toolchain.default,
+            describe_requirements(&self.requirements(model)),
+            sh_double_quoted(compiler),
+            compiler_runner(compiler_var),
+            self.sanitize_selection(family),
         );
         let (stdlib_cflags, stdlib_ldflags) = if self.recovers_cpp_stdlib {
             script.push_str(&cpp_stdlib_fallback(compiler_var));
@@ -1471,15 +2265,32 @@ impl CFamilyLane {
         } else {
             ("", "")
         };
+        script.push_str(&model.prelude);
         let mut objects = Vec::new();
-        if !model.units.is_empty() {
+        if !model.units.is_empty() || !model.rebuilt_objects.is_empty() {
             script.push_str("mkdir -p obj\n");
         }
+        script.push_str(&rebuilt_object_steps(
+            model
+                .rebuilt_objects
+                .iter()
+                .zip(&rebuilt_place)
+                .map(|(object, (_, to))| {
+                    format!(
+                        "\"${}\" {} -c {} -o {to}",
+                        object.compiler_var,
+                        shell_words(&object.flags),
+                        sh_word(&capsule_path(&object.source)),
+                    )
+                })
+                .collect(),
+        ));
+        let sanitize = [SANITIZE_WORD.to_owned()];
         for (index, unit) in model.units.iter().enumerate() {
             let object = format!("obj/unit_{index}.o");
-            let args = shell_words(&self.unit_args(model, unit, &capsule_path));
+            let args = shell_words(&self.unit_args(model, unit, &sanitize, &capsule_path));
             script.push_str(&format!(
-                "\"${compiler_var}\" {args}{stdlib_cflags} \\\n\x20 -c {} -o {object}\n",
+                "cc_run {args}{stdlib_cflags} \\\n\x20 -c {} -o {object}\n",
                 sh_word(&capsule_path(&unit.source))
             ));
             objects.push(object);
@@ -1488,19 +2299,34 @@ impl CFamilyLane {
         inputs.extend(model.target_sources.iter().map(|p| capsule_path(p)));
         inputs.extend(objects);
         inputs.extend(model.extra_sources.iter().map(|p| capsule_path(p)));
+        inputs.extend(model.generated_sources.iter().map(|(to, _)| to.clone()));
+        // Objects the link took from outside the Makefile (a Fortran link
+        // closure) follow the explicit inputs.
+        for (object, (_, to)) in model.rebuilt_objects.iter().zip(&rebuilt_place) {
+            if !model.target_sources.contains(&object.object) {
+                inputs.push(to.clone());
+            }
+        }
         let link: Vec<String> = model
             .link_flags
             .iter()
             .flat_map(|a| a.render(&capsule_path))
             .collect();
+        let link_words = shell_words(&link);
+        let extra_link = model.extra_link.join(" ");
         script.push_str(&format!(
-            "\"${compiler_var}\" {}{stdlib_cflags} \\\n\x20 -o poc {} $GC_LDFLAGS{stdlib_ldflags}{}\n",
-            shell_words(&self.main_args(model, &capsule_path)),
+            "cc_run {}{stdlib_cflags} \\\n\x20 -o poc {} $GC_LDFLAGS{stdlib_ldflags}{}{}\n",
+            shell_words(&self.main_args(model, &sanitize, &capsule_path)),
             shell_words(&inputs),
-            if link.is_empty() {
+            if link_words.is_empty() {
                 String::new()
             } else {
-                format!(" {}", shell_words(&link))
+                format!(" {link_words}")
+            },
+            if extra_link.is_empty() {
+                String::new()
+            } else {
+                format!(" {extra_link}")
             },
         ));
 
@@ -1530,24 +2356,163 @@ impl CFamilyLane {
                 "the bhf decode-runtime headers".to_owned(),
             ));
         }
+        let mut facts = serde_json::Map::new();
+        facts.insert("compiler_env".to_owned(), json!(compiler_var));
+        facts.insert("default_compiler".to_owned(), json!(self.tools[0].default));
+        facts.insert("compiler".to_owned(), json!(compiler));
+        facts.insert("compiler_family".to_owned(), json!(family.make_value()));
+        facts.insert("compiler_source".to_owned(), json!(model.compiler.source));
+        facts.insert("standard".to_owned(), json!(model.standard));
+        facts.insert("recorded_recipe".to_owned(), json!(model.recorded_recipe));
+        facts.insert("extra_sources".to_owned(), json!(model.extra_sources.len()));
+        facts.insert("translation_units".to_owned(), json!(model.units.len()));
+        facts.insert("include_closure".to_owned(), json!(closure));
+        facts.insert(
+            "stdlib_include_fallback".to_owned(),
+            json!(!stdlib_flags.is_empty()),
+        );
+        facts.extend(model.facts.clone());
         Ok(CapsulePlan {
-            build_facts: json!({
-                "compiler_env": compiler_var,
-                "default_compiler": self.toolchain.default,
-                "standard": model.standard,
-                "recorded_recipe": model.recorded_recipe,
-                "extra_sources": model.extra_sources.len(),
-                "translation_units": model.units.len(),
-                "include_closure": closure,
-                "stdlib_include_fallback": !stdlib_flags.is_empty(),
-            }),
+            build_facts: Value::Object(facts),
             files: copies,
+            generated: model
+                .generated_sources
+                .iter()
+                .map(|(to, text)| GeneratedFile {
+                    to: to.clone(),
+                    bytes: text.clone().into_bytes(),
+                    executable: false,
+                })
+                .collect(),
             build_script: script,
+            build_summary: "compile ./poc (ASan+UBSan)".to_owned(),
+            requires: self.requirements(model),
             layout,
             build_outputs: vec!["poc", "obj"],
             warnings,
         })
     }
+
+    /// The programs the rebuild needs: the recorded compiler, then the lane's
+    /// others (a COBOL runtime's, a Fortran compiler).
+    fn requirements(&self, model: &BuildModel) -> Vec<Requirement> {
+        let toolchain = self.tools[0];
+        let mut requires = vec![Requirement::new(
+            toolchain.env_var,
+            &model.compiler.command,
+            toolchain.purpose,
+            toolchain.version_args,
+        )];
+        requires.extend(self.tools[1..].iter().map(Toolchain::requirement));
+        requires
+    }
+
+    /// The build.sh lines that set `$SANITIZE` to the sanitizer flags of the
+    /// compiler that runs the script, asking it which family it is
+    /// (`-dM -E`), as the harness Makefile does; `recorded` when it cannot say.
+    fn sanitize_selection(&self, recorded: CompilerFamily) -> String {
+        let flags = |family: CompilerFamily| self.sanitize_flags(family).join(" ");
+        format!(
+            "# The sanitizer flags of the compiler that runs: gcc spells them differently\n\
+             # from clang (it has no `function` UBSan check).\n\
+             case \"$( (echo | cc_run -dM -E -x {lang} -) 2>/dev/null)\" in\n\
+             \x20 *__clang__*) CC_FAMILY=clang ;;\n\
+             \x20 *__GNUC__*) CC_FAMILY=gcc ;;\n\
+             \x20 *) CC_FAMILY={recorded} ;;\n\
+             esac\n\
+             if [ \"$CC_FAMILY\" = gcc ]; then SANITIZE=\"{gcc}\"; else SANITIZE=\"{clang}\"; fi\n",
+            lang = self.probe_language,
+            recorded = recorded.make_value(),
+            gcc = flags(CompilerFamily::Gcc),
+            clang = flags(CompilerFamily::Clang),
+        )
+    }
+}
+
+/// `clang (or $CC)`, joined: the README and build.sh line naming what a
+/// rebuild needs.
+pub(crate) fn describe_requirements(requires: &[Requirement]) -> String {
+    let names: Vec<String> = requires
+        .iter()
+        .map(|requirement| format!("{} (or ${})", requirement.program, requirement.env_var))
+        .collect();
+    join_names(names.iter().map(String::as_str).collect())
+}
+
+/// The build.sh function `cc_run` that runs `$<var>`: as one word when it
+/// names a program (a path with spaces stays whole), else as its words, so a
+/// launcher in front of the compiler (`ccache clang++`) works as it does in make.
+pub(crate) fn compiler_runner(var: &str) -> String {
+    format!(
+        "if [ -x \"${var}\" ] || command -v \"${var}\" >/dev/null 2>&1; then\n\
+         \x20 cc_run() {{ \"${var}\" \"$@\"; }}\n\
+         else\n\
+         \x20 cc_run() {{ ${var} \"$@\"; }}\n\
+         fi\n"
+    )
+}
+
+/// The build.sh lines compiling the objects a capsule builds from source. One
+/// compiles directly; several are retried in rounds until none fails or a
+/// round makes no progress, since a Fortran module must be compiled before
+/// the sources that use it and the order is not recorded.
+fn rebuilt_object_steps(commands: Vec<String>) -> String {
+    match commands.as_slice() {
+        [] => String::new(),
+        [only] => format!("{only}\n"),
+        _ => {
+            let mut script = String::new();
+            let mut ids = Vec::new();
+            for (index, command) in commands.iter().enumerate() {
+                script.push_str(&format!("bhf_object_{index}() {{ {command}; }}\n"));
+                ids.push(index.to_string());
+            }
+            script.push_str(&format!(
+                "pending=\"{}\"\n\
+                 failed=\n\
+                 while [ -n \"$pending\" ]; do\n\
+                 \x20 failed=\n\
+                 \x20 for i in $pending; do bhf_object_$i 2>obj/compile_$i.log || failed=\"$failed $i\"; done\n\
+                 \x20 if [ \"$failed\" = \" $pending\" ] || [ -z \"$failed\" ]; then break; fi\n\
+                 \x20 pending=${{failed# }}\n\
+                 done\n\
+                 if [ -n \"$failed\" ]; then for i in $failed; do cat obj/compile_$i.log >&2; done; exit 1; fi\n",
+                ids.join(" ")
+            ));
+            script
+        }
+    }
+}
+
+/// The scanned tree the run recorded (`auto/run.json` `source_root`).
+pub(crate) fn recorded_source_root(work_dir: &Path) -> Option<PathBuf> {
+    let run = read_json(&work_dir.join("auto").join("run.json"))?;
+    let root = run.get("source_root")?.as_str()?;
+    let root = PathBuf::from(root);
+    root.is_absolute().then_some(root)
+}
+
+/// The source file the run built a harness for (`auto/run.json` `targets[]`).
+pub(crate) fn recorded_target_source(work_dir: &Path, harness_id: &str) -> Option<PathBuf> {
+    let run = read_json(&work_dir.join("auto").join("run.json"))?;
+    run.get("targets")?.as_array()?.iter().find_map(|target| {
+        (target.get("harness_id")?.as_str()? == harness_id)
+            .then(|| target.get("source")?.as_str().map(PathBuf::from))
+            .flatten()
+    })
+}
+
+/// `value` inside double quotes for a POSIX shell (`$`, `` ` ``, `"` and `\`
+/// escaped).
+pub(crate) fn sh_double_quoted(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        if matches!(c, '$' | '`' | '"' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn has_extension(path: &Path, extensions: &[&str]) -> bool {
@@ -1660,7 +2625,7 @@ fn system_include_dirs(compiler: &str, language: &str) -> Vec<PathBuf> {
     .iter()
     .map(PathBuf::from)
     .collect();
-    let mut resource = Command::new(compiler);
+    let mut resource = program_command(compiler);
     resource.arg("-print-resource-dir");
     if let Ok(output) =
         crate::command_output::output_with_timeout(&mut resource, Duration::from_secs(30))
@@ -1670,7 +2635,7 @@ fn system_include_dirs(compiler: &str, language: &str) -> Vec<PathBuf> {
             dirs.push(normalize(Path::new(&dir)));
         }
     }
-    let mut command = Command::new(compiler);
+    let mut command = program_command(compiler);
     command
         .args(["-E", "-x", language, "-", "-v"])
         .stdin(std::process::Stdio::null());
@@ -1706,7 +2671,7 @@ fn dependency_closure(
     if inputs.is_empty() {
         return Some(Vec::new());
     }
-    let mut command = Command::new(compiler);
+    let mut command = program_command(compiler);
     command
         .args(args)
         .args(["-M", "-w"])
@@ -1895,32 +2860,160 @@ fn include_directives(text: &str) -> Vec<(&str, bool)> {
 /// The `build.sh` lines that recover the C++ standard library when
 /// `$<compiler_var>` cannot find it itself (some clang++ installs pick a GCC
 /// whose libstdc++ is missing): the newest installed libstdc++ headers that
-/// make `<string>` compile, and the dir holding `libstdc++.so` for the link.
-/// They are probed on the host that runs the script, so nothing host-specific
-/// is recorded.
+/// make `<string>` compile and the dir holding `libstdc++.so` for the link,
+/// else, on a libc++ host, the compiler's libc++ (`-stdlib=libc++`) or an
+/// installed libc++ header dir. A compiler that links libc++ by default (its
+/// driver passes `-lc++`) gets no libstdc++ search dir; one that links
+/// libstdc++ always does when it cannot find `libstdc++.so` itself, whatever
+/// else the host has installed. They are probed on the host that runs the
+/// script, so nothing host-specific is recorded. The compiler runs through
+/// `cc_run`, so a launcher in front of it (`ccache clang++`) works.
 fn cpp_stdlib_fallback(compiler_var: &str) -> String {
     format!(
         "# Recover the C++ standard library when ${compiler_var} cannot find it itself.\n\
          STDLIB_FLAGS=\n\
          STDLIB_LDFLAGS=\n\
-         cxx_has_stdlib() {{ printf '#include <string>\\n' | \"${compiler_var}\" \"$@\" -x c++ -fsyntax-only - >/dev/null 2>&1; }}\n\
+         STDLIB_KIND=native\n\
+         cxx_has_stdlib() {{ printf '#include <string>\\n' | cc_run \"$@\" -x c++ -fsyntax-only - >/dev/null 2>&1; }}\n\
          if ! cxx_has_stdlib; then\n\
+         \x20 STDLIB_KIND=\n\
          \x20 for v in $(ls /usr/include/c++ 2>/dev/null | sort -rn); do\n\
+         \x20   case \"$v\" in [0-9]*) ;; *) continue ;; esac\n\
          \x20   [ -f \"/usr/include/c++/$v/string\" ] || continue\n\
          \x20   flags=\"-isystem /usr/include/c++/$v\"\n\
          \x20   for d in /usr/include/*/c++/$v /usr/include/c++/$v/backward; do\n\
          \x20     if [ -d \"$d\" ]; then flags=\"$flags -isystem $d\"; fi\n\
          \x20   done\n\
-         \x20   if cxx_has_stdlib $flags; then STDLIB_FLAGS=$flags; break; fi\n\
+         \x20   if cxx_has_stdlib $flags; then STDLIB_FLAGS=$flags; STDLIB_KIND=libstdc++; break; fi\n\
          \x20 done\n\
+         \x20 if [ -z \"$STDLIB_KIND\" ] && cxx_has_stdlib -stdlib=libc++; then\n\
+         \x20   STDLIB_FLAGS=-stdlib=libc++; STDLIB_LDFLAGS=-stdlib=libc++; STDLIB_KIND=libc++\n\
+         \x20 fi\n\
+         \x20 if [ -z \"$STDLIB_KIND\" ]; then\n\
+         \x20   for d in /usr/include/c++/v1 /usr/local/include/c++/v1 $(ls -d /usr/lib/llvm-*/include/c++/v1 2>/dev/null | sort -r); do\n\
+         \x20     [ -f \"$d/string\" ] || continue\n\
+         \x20     if cxx_has_stdlib -nostdinc++ -isystem \"$d\"; then\n\
+         \x20       STDLIB_FLAGS=\"-nostdinc++ -isystem $d\"; STDLIB_LDFLAGS=\"-nostdlib++ -lc++\"; STDLIB_KIND=libc++; break\n\
+         \x20     fi\n\
+         \x20   done\n\
+         \x20 fi\n\
          fi\n\
-         case \"$(\"${compiler_var}\" -print-file-name=libstdc++.so 2>/dev/null)\" in\n\
-         \x20 /*) ;;\n\
-         \x20 *) for d in $(ls -d /usr/lib/gcc/*/* 2>/dev/null | sort -t/ -k6,6n); do\n\
-         \x20      if [ -f \"$d/libstdc++.so\" ]; then STDLIB_LDFLAGS=\"-L$d\"; fi\n\
-         \x20    done ;;\n\
-         esac\n"
+         # A compiler that links libstdc++ but cannot find libstdc++.so gets the dir\n\
+         # holding it; one that links libc++ by default (its driver passes -lc++) needs none.\n\
+         STDLIB_LINKS_LIBCXX=\n\
+         if [ \"$STDLIB_KIND\" = native ]; then\n\
+         \x20 case \"$(cc_run -### -x c++ /dev/null 2>&1)\" in\n\
+         \x20   *'\"-lc++\"'*) STDLIB_LINKS_LIBCXX=1 ;;\n\
+         \x20 esac\n\
+         fi\n\
+         if [ \"$STDLIB_KIND\" != libc++ ] && [ -z \"$STDLIB_LINKS_LIBCXX\" ]; then\n\
+         \x20 case \"$(cc_run -print-file-name=libstdc++.so 2>/dev/null)\" in\n\
+         \x20   /*) ;;\n\
+         \x20   *) for d in $(ls -d /usr/lib/gcc/*/* 2>/dev/null | sort -t/ -k6,6n); do\n\
+         \x20        if [ -f \"$d/libstdc++.so\" ]; then STDLIB_LDFLAGS=\"-L$d\"; fi\n\
+         \x20      done ;;\n\
+         \x20 esac\n\
+         fi\n"
     )
+}
+
+/// The flags that let `compiler` compile `<string>`, as [`cpp_stdlib_fallback`]
+/// finds them on this host: none when it can by itself, else the newest
+/// installed libstdc++ headers that work, else libc++. Empty when nothing works.
+fn cpp_stdlib_flags(compiler: &str) -> Vec<String> {
+    let works = |flags: &[String]| {
+        let mut command = program_command(compiler);
+        command
+            .args(flags)
+            .args(["-x", "c++", "-fsyntax-only", "-"])
+            .stdout(std::process::Stdio::null());
+        run_with_stdin(
+            command,
+            b"#include <string>\n".to_vec(),
+            Duration::from_secs(60),
+        )
+        .is_ok_and(|(output, timed_out)| !timed_out && output.status.success())
+    };
+    if works(&[]) {
+        return Vec::new();
+    }
+    let mut versions: Vec<(Vec<u64>, String)> = std::fs::read_dir("/usr/include/c++")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let key: Vec<u64> = name
+                .split('.')
+                .map(|part| part.parse().ok())
+                .collect::<Option<_>>()?;
+            Some((key, name))
+        })
+        .collect();
+    versions.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, version) in versions {
+        let base = PathBuf::from("/usr/include/c++").join(&version);
+        if !base.join("string").is_file() {
+            continue;
+        }
+        let mut dirs = vec![base.clone()];
+        for entry in std::fs::read_dir("/usr/include")
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let triple = entry.path().join("c++").join(&version);
+            if triple.is_dir() {
+                dirs.push(triple);
+            }
+        }
+        if base.join("backward").is_dir() {
+            dirs.push(base.join("backward"));
+        }
+        let flags: Vec<String> = dirs
+            .iter()
+            .flat_map(|dir| ["-isystem".to_owned(), dir.display().to_string()])
+            .collect();
+        if works(&flags) {
+            return flags;
+        }
+    }
+    let libcxx = vec!["-stdlib=libc++".to_owned()];
+    if works(&libcxx) {
+        return libcxx;
+    }
+    let mut libcxx_dirs = vec![
+        PathBuf::from("/usr/include/c++/v1"),
+        PathBuf::from("/usr/local/include/c++/v1"),
+    ];
+    let mut llvm: Vec<PathBuf> = std::fs::read_dir("/usr/lib")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("llvm-"))
+        })
+        .map(|path| path.join("include/c++/v1"))
+        .collect();
+    llvm.sort();
+    llvm.reverse();
+    libcxx_dirs.extend(llvm);
+    for dir in libcxx_dirs
+        .iter()
+        .filter(|dir| dir.join("string").is_file())
+    {
+        let flags = vec![
+            "-nostdinc++".to_owned(),
+            "-isystem".to_owned(),
+            dir.display().to_string(),
+        ];
+        if works(&flags) {
+            return flags;
+        }
+    }
+    Vec::new()
 }
 
 /// The headers directly in `dir`.
@@ -1972,7 +3065,13 @@ pub(crate) fn sh_word(value: &str) -> String {
 fn shell_words(words: &[String]) -> String {
     words
         .iter()
-        .map(|word| sh_word(word))
+        .map(|word| {
+            if word == SANITIZE_WORD {
+                "$SANITIZE".to_owned()
+            } else {
+                sh_word(word)
+            }
+        })
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -2274,6 +3373,22 @@ mod tests {
         std::fs::write(path, text).unwrap();
     }
 
+    /// The lane's view of a harness dir in bhf's layout (`<work>/harnesses/<id>`).
+    fn context(harness_dir: &Path) -> HarnessContext {
+        HarnessContext {
+            work_dir: harness_dir
+                .parent()
+                .and_then(Path::parent)
+                .unwrap_or(Path::new("/"))
+                .to_path_buf(),
+            harness_id: harness_dir
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            harness_dir: harness_dir.to_path_buf(),
+        }
+    }
+
     fn finding(dir: &Path, raw: Value) -> FindingRecord {
         FindingRecord {
             id: raw["id"].as_str().unwrap_or("F-1").to_owned(),
@@ -2352,7 +3467,8 @@ mod tests {
         let refusal = assess(work, &ada, Tool::Cartography).err().unwrap();
         assert_eq!(
             refusal.reason(Tool::Cartography),
-            "harness H-A0003 is an Ada harness; bhf cartography supports C and C++ harnesses only"
+            "harness H-A0003 is an Ada harness, and bhf cartography maps the AddressSanitizer \
+             reports of C and C++ harnesses only"
         );
 
         let no_input = finding(
@@ -2477,11 +3593,7 @@ mod tests {
     fn capsule_plan_keeps_include_subpaths_and_quotes_names() {
         let temp = tempfile::tempdir().unwrap();
         let harness = sample_harness(temp.path(), None);
-        let plan = C_LANE
-            .plan_capsule(&PlanRequest {
-                harness_dir: &harness,
-            })
-            .unwrap();
+        let plan = C_LANE.plan_capsule(&context(&harness)).unwrap();
         let shipped: Vec<&str> = plan.files.iter().map(|f| f.to.as_str()).collect();
         for expected in ["harness/main.c", "sources/inc/defs.h", "sources/rec ord.c"] {
             assert!(shipped.contains(&expected), "{expected} not in {shipped:?}");
@@ -2531,11 +3643,7 @@ mod tests {
                 "standard": "gnu89",
             })),
         );
-        let plan = C_LANE
-            .plan_capsule(&PlanRequest {
-                harness_dir: &harness,
-            })
-            .unwrap();
+        let plan = C_LANE.plan_capsule(&context(&harness)).unwrap();
         let script = &plan.build_script;
         let db = script.find("-DMODE=1").unwrap();
         let std = script.find("-std=gnu89").expect(script);
@@ -2561,22 +3669,19 @@ mod tests {
             "C_COMPAT_FLAGS := -fcommon\n",
         )
         .unwrap();
-        let plan = C_LANE
-            .plan_capsule(&PlanRequest {
-                harness_dir: &harness,
-            })
-            .unwrap();
+        let plan = C_LANE.plan_capsule(&context(&harness)).unwrap();
         assert!(
             plan.build_script.contains(" -fcommon "),
             "{}",
             plan.build_script
         );
 
-        let leading = CPP_LANE.leading_flags(Some("gnu++14"));
+        let sanitize = CPP_LANE.sanitize_flags(CompilerFamily::Clang);
+        let leading = CPP_LANE.leading_flags(Some("gnu++14"), &sanitize);
         assert!(leading.contains(&"-std=gnu++14".to_owned()));
         assert!(leading.contains(&"-Wno-reserved-user-defined-literal".to_owned()));
         assert!(!C_LANE
-            .leading_flags(Some("gnu89"))
+            .leading_flags(Some("gnu89"), &[])
             .iter()
             .any(|f| f.starts_with("-std=")));
     }
@@ -2591,14 +3696,277 @@ mod tests {
                         "extra_includes": [], "standard": null}),
             ),
         );
-        let problem = C_LANE.harness_problem(&harness).unwrap();
+        let problem = C_LANE.harness_problem(&context(&harness)).unwrap();
         assert!(problem.contains("cross compiler"), "{problem}");
         let fine = sample_harness(&temp.path().join("other"), None);
-        assert_eq!(C_LANE.harness_problem(&fine), None);
+        assert_eq!(C_LANE.harness_problem(&context(&fine)), None);
         assert!(CPP_LANE
-            .harness_problem(&fine)
+            .harness_problem(&context(&fine))
             .unwrap()
             .contains("no main.cpp"));
+    }
+
+    fn executable(path: &Path, text: &str) {
+        write(path, text);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    /// Run the build.sh C++ standard-library fallback with `$CXX` set to `cxx`
+    /// and report what it chose.
+    #[cfg(unix)]
+    fn stdlib_fallback_with(cxx: &str) -> String {
+        let script = format!(
+            "set -e\n{}{}echo \"KIND=$STDLIB_KIND FLAGS=$STDLIB_FLAGS LD=$STDLIB_LDFLAGS\"\n",
+            compiler_runner("CXX"),
+            cpp_stdlib_fallback("CXX")
+        );
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .env("CXX", cxx)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    /// On a libc++ host the build.sh fallback takes the compiler's libc++
+    /// (`-stdlib=libc++`) for headers and link, through a launcher in front of
+    /// the compiler (`ccache clang++` runs as two words).
+    #[cfg(unix)]
+    #[test]
+    fn the_cpp_stdlib_fallback_finds_libcxx_through_a_launcher() {
+        let temp = tempfile::tempdir().unwrap();
+        // Compiles `<string>` only with `-stdlib=libc++`, and knows only libc++.so.
+        let cxx = temp.path().join("fake-clang++");
+        executable(
+            &cxx,
+            "#!/bin/sh\n\
+             for a; do case \"$a\" in\n\
+             \x20 -stdlib=libc++) exit 0 ;;\n\
+             \x20 -print-file-name=libc++.so) echo /opt/llvm/lib/libc++.so; exit 0 ;;\n\
+             \x20 -print-file-name=*) echo \"${a#-print-file-name=}\"; exit 0 ;;\n\
+             esac; done\n\
+             exit 1\n",
+        );
+        let launcher = temp.path().join("fake-ccache");
+        executable(&launcher, "#!/bin/sh\nexec \"$@\"\n");
+        let chosen = stdlib_fallback_with(&format!("{} {}", launcher.display(), cxx.display()));
+        assert_eq!(
+            chosen, "KIND=libc++ FLAGS=-stdlib=libc++ LD=-stdlib=libc++",
+            "the launcher-prefixed compiler must reach libc++"
+        );
+    }
+
+    /// A compiler that finds its own standard library on a libc++ host needs
+    /// no flags, and no libstdc++ search dir is added to its link; a compiler
+    /// under a dir with a space runs as one word.
+    #[cfg(unix)]
+    #[test]
+    fn a_native_libcxx_compiler_gets_no_libstdcxx_search_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let cxx = temp.path().join("tool dir/clang++");
+        executable(
+            &cxx,
+            "#!/bin/sh\n\
+             for a; do case \"$a\" in\n\
+             \x20 -print-file-name=libc++.so) echo /opt/llvm/lib/libc++.so; exit 0 ;;\n\
+             \x20 -print-file-name=*) echo \"${a#-print-file-name=}\"; exit 0 ;;\n\
+             \x20 -###) echo ' \"/usr/bin/ld\" \"-o\" \"a.out\" \"-lc++\" \"-lm\"' >&2; exit 0 ;;\n\
+             esac; done\n\
+             exit 0\n",
+        );
+        let chosen = stdlib_fallback_with(&cxx.to_string_lossy());
+        assert_eq!(chosen, "KIND=native FLAGS= LD=");
+    }
+
+    /// A compiler that links libstdc++ but cannot find it (clang++ picking a
+    /// GCC without libstdc++) gets the recovered libstdc++ headers and the dir
+    /// holding `libstdc++.so` for its link, even on a host where libc++ is
+    /// installed beside the compiler.
+    #[cfg(unix)]
+    #[test]
+    fn a_libstdcxx_compiler_on_a_host_with_libcxx_gets_the_libstdcxx_search_dir() {
+        let headers = std::fs::read_dir("/usr/include/c++")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(|c: char| c.is_ascii_digit())
+                    && entry.path().join("string").is_file()
+            });
+        let library = std::fs::read_dir("/usr/lib/gcc")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .flat_map(|triple| {
+                std::fs::read_dir(triple.path())
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+            })
+            .any(|version| version.path().join("libstdc++.so").is_file());
+        if !headers || !library {
+            eprintln!("skipping: no installed libstdc++ headers and library");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        // Compiles `<string>` only with an installed libstdc++ header dir,
+        // cannot find libstdc++.so, finds libc++.so in its own lib dir, and
+        // links libstdc++.
+        let cxx = temp.path().join("fake-clang++");
+        executable(
+            &cxx,
+            "#!/bin/sh\n\
+             headers=\n\
+             for a; do case \"$a\" in\n\
+             \x20 -print-file-name=libc++.so) echo /opt/llvm/bin/../lib/libc++.so; exit 0 ;;\n\
+             \x20 -print-file-name=*) echo \"${a#-print-file-name=}\"; exit 0 ;;\n\
+             \x20 -###) echo ' \"/usr/bin/ld\" \"-o\" \"a.out\" \"-lstdc++\" \"-lm\"' >&2; exit 0 ;;\n\
+             \x20 /usr/include/c++/[0-9]*) headers=1 ;;\n\
+             esac; done\n\
+             [ -n \"$headers\" ]\n",
+        );
+        let chosen = stdlib_fallback_with(&cxx.to_string_lossy());
+        let (kind_flags, ld) = chosen.split_once(" LD=").unwrap();
+        assert!(
+            kind_flags.starts_with("KIND=libstdc++ FLAGS=-isystem /usr/include/c++/"),
+            "{chosen}"
+        );
+        let dir = ld.strip_prefix("-L").unwrap_or_else(|| panic!("{chosen}"));
+        assert!(
+            Path::new(dir).join("libstdc++.so").is_file(),
+            "the link searches the dir holding libstdc++.so: {chosen}"
+        );
+    }
+
+    /// build.sh picks the sanitizer flags of the compiler that runs it: gcc
+    /// has no `function` UBSan check and links the runtimes statically.
+    #[cfg(unix)]
+    #[test]
+    fn build_sh_takes_the_sanitizer_flags_of_the_compiler_that_runs() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = |name: &str, macro_name: &str| {
+            let path = temp.path().join(name);
+            executable(
+                &path,
+                &format!("#!/bin/sh\necho '#define {macro_name} 1'\n"),
+            );
+            path
+        };
+        let gcc = fake("fake-gcc", "__GNUC__");
+        let clang = fake("fake-clang", "__clang__");
+        let selected = |cc: &Path| {
+            let script = format!(
+                "set -e\n{}{}echo \"$CC_FAMILY|$SANITIZE\"\n",
+                compiler_runner("CC"),
+                C_LANE.sanitize_selection(CompilerFamily::Clang)
+            );
+            let out = Command::new("sh")
+                .arg("-c")
+                .arg(script)
+                .env("CC", cc)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        assert_eq!(
+            selected(&gcc),
+            "gcc|-fsanitize=address,undefined -fno-sanitize=alignment -static-libasan -static-libubsan"
+        );
+        assert_eq!(
+            selected(&clang),
+            "clang|-fsanitize=address,undefined -fno-sanitize=function,vptr,alignment"
+        );
+        // The C++ lane's clang-only switch stays out of a gcc build.
+        let cpp_gcc = CPP_LANE.sanitize_flags(CompilerFamily::Gcc);
+        assert!(!cpp_gcc
+            .iter()
+            .any(|flag| flag.contains("user-defined-literal")));
+    }
+
+    /// The family that built a harness binary is read from the producer
+    /// strings its objects carry.
+    #[test]
+    fn the_compiler_family_of_a_binary_is_read_from_its_producer_strings() {
+        let temp = tempfile::tempdir().unwrap();
+        let gcc = temp.path().join("gcc-main");
+        let clang = temp.path().join("clang-main");
+        std::fs::write(
+            &gcc,
+            b"\x7fELF....GCC: (Ubuntu 13.3.0-6ubuntu2) 13.3.0\0GNU C17 13.3.0\0",
+        )
+        .unwrap();
+        std::fs::write(
+            &clang,
+            b"\x7fELF....GCC: (Ubuntu 13.3.0-6ubuntu2) 13.3.0\0Ubuntu clang version 18.1.3\0",
+        )
+        .unwrap();
+        assert_eq!(binary_compiler_family(&gcc), Some(CompilerFamily::Gcc));
+        assert_eq!(binary_compiler_family(&clang), Some(CompilerFamily::Clang));
+        assert_eq!(binary_compiler_family(&temp.path().join("absent")), None);
+    }
+
+    /// capsule and env-capsule share one exit rule.
+    #[test]
+    fn the_capsule_tools_share_one_exit_rule() {
+        let tally = |requested, made, verified, failed| RunTally {
+            requested,
+            made,
+            verified,
+            failed,
+        };
+        // A sweep that wrote capsules succeeds even when some did not verify.
+        assert_eq!(exit_code(&tally(false, 2, 1, 0)), 0);
+        // Nothing written, a failure, or a requested capsule that did not
+        // verify: non-zero.
+        assert_eq!(exit_code(&tally(false, 0, 0, 0)), 1);
+        assert_eq!(exit_code(&tally(false, 2, 2, 1)), 1);
+        assert_eq!(exit_code(&tally(true, 1, 0, 0)), 1);
+        assert_eq!(exit_code(&tally(true, 1, 1, 0)), 0);
+    }
+
+    /// A Go harness binary is statically linked, so env-capsule (which
+    /// preloads the runtrace shim) is refused for it with that reason.
+    #[test]
+    fn a_static_binary_is_told_apart_from_a_dynamic_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let elf = |interp: bool| {
+            // A minimal 64-bit little-endian ELF header and one program header.
+            let mut bytes = vec![0u8; 64 + 56];
+            bytes[..4].copy_from_slice(b"\x7fELF");
+            bytes[4] = 2;
+            bytes[5] = 1;
+            bytes[0x20..0x28].copy_from_slice(&64u64.to_le_bytes());
+            bytes[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+            bytes[0x38..0x3a].copy_from_slice(&1u16.to_le_bytes());
+            let kind: u32 = if interp { 3 } else { 1 };
+            bytes[64..68].copy_from_slice(&kind.to_le_bytes());
+            bytes
+        };
+        let dynamic = temp.path().join("dynamic");
+        let fixed = temp.path().join("static");
+        std::fs::write(&dynamic, elf(true)).unwrap();
+        std::fs::write(&fixed, elf(false)).unwrap();
+        assert!(is_dynamically_linked(&dynamic));
+        assert!(!is_dynamically_linked(&fixed));
+        let script = temp.path().join("main");
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+        assert!(
+            is_dynamically_linked(&script),
+            "not ELF: nothing proven static"
+        );
     }
 
     #[test]
@@ -2612,28 +3980,104 @@ mod tests {
 
     #[test]
     fn a_missing_compiler_is_named() {
-        let toolchain = Toolchain {
-            env_var: "BHF_TEST_UNSET_COMPILER_VAR",
-            default: "bhf-no-such-compiler",
-        };
-        let missing = toolchain.missing().unwrap();
+        let requirement = Requirement::new(
+            "BHF_TEST_UNSET_COMPILER_VAR",
+            "bhf-no-such-compiler",
+            "compiles the harness",
+            &["--version"],
+        );
+        let missing = requirement.missing().unwrap();
         assert!(missing.contains("bhf-no-such-compiler"), "{missing}");
         assert!(missing.contains("BHF_TEST_UNSET_COMPILER_VAR"), "{missing}");
-        assert_eq!(
-            Toolchain {
-                env_var: "BHF_TEST_UNSET_COMPILER_VAR",
-                default: "sh",
-            }
-            .missing(),
-            None
+        assert!(missing.contains("compiles the harness"), "{missing}");
+        assert_eq!(missing_program("sh", "CC"), None);
+        // A launcher in front of the compiler needs both programs, but a flag
+        // after the compiler is not a program.
+        let launcher = missing_program("sh bhf-no-such-compiler-zz", "CXX").unwrap();
+        assert!(
+            launcher.contains("bhf-no-such-compiler-zz is not found"),
+            "{launcher}"
         );
+        assert_eq!(missing_program("sh -c", "CC"), None);
+    }
+
+    /// A program the build script finds under any of several names (`lua`,
+    /// `lua5.4`, ...) is recorded with the others, and is met by any of them.
+    #[cfg(unix)]
+    #[test]
+    fn a_requirement_is_met_by_any_name_the_build_script_takes() {
+        const TOOL: Toolchain = Toolchain {
+            env_var: "BHF_TEST_UNSET_INTERPRETER_VAR",
+            default: "bhf-no-such-interpreter",
+            fallbacks: &["sh", "bhf-no-such-interpreter-2"],
+            purpose: "runs the harness",
+            version_args: &["-c", "exit 0"],
+        };
+        let requirement = TOOL.requirement();
+        assert_eq!(requirement.program, "sh");
+        assert_eq!(
+            requirement.alternatives,
+            vec!["bhf-no-such-interpreter", "bhf-no-such-interpreter-2"]
+        );
+        let recorded = Requirement::from_json(&requirement.to_json()).unwrap();
+        assert_eq!(recorded, requirement);
+
+        // Packaged where only one name was installed, verified where only
+        // another is.
+        let temp = tempfile::tempdir().unwrap();
+        let other = temp.path().join("other-interpreter");
+        executable(&other, "#!/bin/sh\nexit 0\n");
+        let moved = Requirement {
+            env_var: TOOL.env_var.to_owned(),
+            program: temp.path().join("absent").display().to_string(),
+            purpose: TOOL.purpose.to_owned(),
+            version: None,
+            alternatives: vec![other.display().to_string()],
+        };
+        assert_eq!(moved.missing(), None);
+        let none = Requirement {
+            alternatives: vec!["bhf-no-such-interpreter-3".to_owned()],
+            ..moved
+        };
+        let missing = none.missing().unwrap();
+        assert!(missing.contains("bhf-no-such-interpreter-3"), "{missing}");
+        assert!(missing.contains(TOOL.env_var), "{missing}");
     }
 
     #[test]
     fn supported_languages_are_listed() {
-        assert_eq!(supported_language_names(), "C and C++");
+        assert_eq!(
+            supported_language_names(),
+            "C, C++, Ada, Rust, Go, Java, C#, Python, JavaScript, TypeScript, Ruby, Perl, PHP, \
+             Lua, COBOL and Fortran"
+        );
+        assert_eq!(supported_language_names_for(Tool::Cartography), "C and C++");
+        assert_eq!(
+            supported_language_names_for(Tool::EnvCapsule),
+            "C, C++, Ada, Rust, Go, COBOL and Fortran"
+        );
         assert!(lane_for("c").is_some());
         assert!(lane_for("c++").is_some());
-        assert!(lane_for("ada").is_none());
+        for tag in [
+            "ada",
+            "rust",
+            "go",
+            "java",
+            "csharp",
+            "python",
+            "javascript",
+            "typescript",
+            "ruby",
+            "perl",
+            "php",
+            "lua",
+            "cobol",
+            "fortran",
+            "ts",
+            "js",
+        ] {
+            assert!(lane_for(tag).is_some(), "{tag}");
+        }
+        assert!(lane_for("haskell").is_none());
     }
 }

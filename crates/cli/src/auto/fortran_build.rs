@@ -839,13 +839,83 @@ pub fn build_fortran_harness(
         ldflags.push_str(&format!("-L{dir} "));
     }
     ldflags.push_str("-lgfortran -lquadmath -lm");
+    // How each Fortran object of the link was compiled, so `bhf capsule` can
+    // rebuild it from source: the project's module objects, the target, the
+    // array wrapper.
+    let module_sources: std::collections::HashMap<String, PathBuf> =
+        collect_module_files(source_root, 2000)
+            .into_iter()
+            .filter_map(|file| Some((file.file_stem()?.to_str()?.to_owned(), file)))
+            .collect();
+    let mut recorded: Vec<(PathBuf, PathBuf, &[&str])> = Vec::new();
+    for object in project_module_objects(&moddir, &candidate.source_path) {
+        let source = object
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| module_sources.get(stem));
+        if let Some(source) = source {
+            recorded.push((object.clone(), source.clone(), FORTRAN_FLAGS));
+        }
+    }
+    recorded.push((fortran_o, candidate.source_path.clone(), FORTRAN_FLAGS));
+    if has_array_arg {
+        recorded.push((
+            hdir.join("bhf_array_wrapper.o"),
+            hdir.join("bhf_array_wrapper.f90"),
+            WRAPPER_FLAGS,
+        ));
+    }
     link_with_project_closure(
         &hdir,
         &ldflags,
         &moddir,
         source_root,
         &candidate.source_path,
+        recorded,
     )
+}
+
+/// The flags every Fortran object of a harness is compiled with (the target,
+/// the project's modules); [`compile_dependency`] adds
+/// `-fallow-argument-mismatch`.
+const FORTRAN_FLAGS: &[&str] = &[
+    "-O1",
+    "-g",
+    "-fsanitize=address",
+    "-fsanitize-coverage=trace-pc,trace-cmp",
+    "-cpp",
+    "-ffree-line-length-none",
+];
+const CLOSURE_FLAGS: &[&str] = &[
+    "-O1",
+    "-g",
+    "-fsanitize=address",
+    "-fsanitize-coverage=trace-pc,trace-cmp",
+    "-cpp",
+    "-ffree-line-length-none",
+    "-fallow-argument-mismatch",
+];
+const WRAPPER_FLAGS: &[&str] = &[
+    "-O1",
+    "-g",
+    "-fsanitize=address",
+    "-fsanitize-coverage=trace-pc,trace-cmp",
+    "-ffree-line-length-none",
+];
+
+/// Record how each Fortran object linked into the harness was compiled
+/// (`fortran-build.json`), so a capsule rebuilds them from source.
+fn write_build_record(hdir: &Path, objects: &[(PathBuf, PathBuf, &[&str])]) {
+    let objects: Vec<serde_json::Value> = objects
+        .iter()
+        .map(|(object, source, flags)| {
+            serde_json::json!({"object": object, "source": source, "flags": flags})
+        })
+        .collect();
+    let record = serde_json::json!({"schema_version": 1, "objects": objects});
+    if let Ok(bytes) = serde_json::to_vec_pretty(&record) {
+        let _ = std::fs::write(hdir.join("fortran-build.json"), bytes);
+    }
 }
 
 /// Link the harness, pulling in the project's own procedures as the linker asks
@@ -865,6 +935,7 @@ fn link_with_project_closure(
     moddir: &Path,
     source_root: &Path,
     target_src: &Path,
+    mut recorded: Vec<(PathBuf, PathBuf, &[&str])>,
 ) -> FortranBuildResult {
     const MAX_ROUNDS: usize = 8;
     let main_bin = hdir.join("main");
@@ -886,7 +957,10 @@ fn link_with_project_closure(
             std::time::Duration::from_secs(30 * 60),
         );
         let output = match built {
-            Ok(o) if o.status.success() && main_bin.is_file() => return FortranBuildResult::Built,
+            Ok(o) if o.status.success() && main_bin.is_file() => {
+                write_build_record(hdir, &recorded);
+                return FortranBuildResult::Built;
+            }
             Ok(o) => {
                 let mut text = String::from_utf8_lossy(&o.stderr).to_string();
                 text.push_str(&String::from_utf8_lossy(&o.stdout));
@@ -921,6 +995,7 @@ fn link_with_project_closure(
                 unresolved.push(symbol.clone());
                 continue;
             }
+            recorded.push((obj.clone(), source.clone(), CLOSURE_FLAGS));
             extra_objects.push(obj);
             added = true;
         }

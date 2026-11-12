@@ -5,6 +5,27 @@
 ## Unreleased
 
 ### Fixed
+- A C or C++ capsule's `build.sh` picks the sanitizer flags of the compiler that
+  runs it (gcc has no `function` UBSan check and links its runtimes
+  statically), as the harness Makefile does, and a capsule of a harness bhf
+  built with gcc rebuilds with gcc: the default compiler is read off the
+  harness binary when `$CC`/`$CXX` is not set (manifest `build_recipe`
+  `compiler`, `compiler_family`, `compiler_source`). A launcher in front of the
+  compiler (`CXX="ccache clang++"`) works for the capsule's include scan and
+  for `build.sh`, and a compiler path with spaces stays one word. The C++
+  standard-library fallback also works on libc++ hosts: it takes the
+  compiler's libc++ (`-stdlib=libc++`) or an installed libc++ header dir when
+  no libstdc++ works. It adds no libstdc++ search dir to a compiler that
+  links libc++ (its driver passes `-lc++`), and still adds one to a compiler
+  that links libstdc++ but cannot find it, on a host that also has libc++.
+- `bhf env-capsule` records and replays a finding's world under the shim mode
+  it fired in (`rng` or `fuzz_driven`, from `finding.json`
+  `runtime_mode.pass`) with the environment variables the fuzz loop injected,
+  so a crash found in bhf's RNG pass, or by a harness that does not hand its
+  input to the shim, can be captured. Without `--finding-id` it applies the
+  same exit rule as `bhf capsule` (one shared rule): it counts findings with no
+  faked-environment crash as skipped, and when it captures nothing it says so
+  and exits non-zero.
 - `bhf explain` no longer presents dictionary substring matches as gates the
   engine solved. Its comparison evidence is recorded while the finding's own
   input runs: an input span counts only when a comparison operand equals its
@@ -525,6 +546,46 @@
   both forms.
 
 ### Added
+- `bhf capsule`, `bhf verify-poc` and `bhf env-capsule` support every harness
+  language bhf generates, through per-language lanes: Ada, Rust, Go, Java, C#,
+  Python, JavaScript, TypeScript, Ruby, Perl, PHP, Lua, COBOL and Fortran, as
+  well as C and C++. A capsule ships what its lane's rebuild needs (for Ada the
+  generated `bhf_build.gpr`, the runtime project and sources, the instrumented
+  sources, the harness, the stub packages and the operator projects it extends
+  or `with`s; for Rust, Go and C# the dependencies vendored from the local
+  cargo, module or NuGet cache; for an interpreted lane the launcher, bhf's
+  driver and the scanned tree), relocates every path the build and launch
+  files name into the capsule, and rebuilds offline in a clean copy. The
+  rebuilt PoC is replayed with the input protocol the shared detector reads
+  off it (the Ada stdin event-log protocol for a GNAT binary), and the lane's
+  crash oracle names what fired (an unhandled Ada exception, a runtime's
+  `== bhf <lang> finding:` report, a panic, libcob's runtime check, a
+  sanitizer report). The manifest records the programs the rebuild needs and
+  their versions (`requires`), the protocol (`protocol`, `run`) and the lane's
+  build facts (for Ada the target, runtime, switches and GNAT/gprbuild
+  versions); `verify-poc` checks them first and names each missing program
+  and the variable that overrides it. A program build.sh finds under several
+  names (`lua`, `lua5.4`, `lua5.3`, `luajit`) records the others
+  (`requires[].alternatives`), and any of them meets it. An Ada capsule whose
+  rebuilt PoC raises a different exception than the finding recorded is not
+  counted as reproducing (manifest `finding_signature`, `reproduced: false`,
+  `reproduced_other_crash: true`), and `verify-poc` checks the replay against
+  the finding's exception (`MISMATCH` otherwise). A harness a lane cannot
+  rebuild offline is refused with the reason: a dependency not in the local
+  cache, an Ada project file outside the scanned tree, a harness built for
+  another target, a Java target built by Maven or Gradle, a build file
+  build.sh renders that still names the work dir or the scanned tree after
+  relocation. A text file a relocated capsule ships unchanged but that names
+  them is reported in a warning. env-capsule takes the native lanes (C, C++, Ada, Rust, COBOL,
+  Fortran) and refuses a statically linked harness (Go) or one that runs in a
+  language runtime, with that reason; cartography stays C/C++. `bhf explain`
+  offers capsule and verify-poc for the findings whose lane and harness layout
+  capsule takes; capsule checks dependencies and the size of what it ships
+  when it packages, so it can still refuse one of them, and says why. The new
+  manifest fields are additive; capsules written before them still verify.
+- The Fortran lane records how each Fortran object of a harness link was
+  compiled (`harnesses/<id>/fortran-build.json`), which a capsule uses to
+  rebuild them from source.
 - Comparison evidence per finding: `bhf auto` (after minimization) and
   `bhf report --backfill` replay each runtime finding's preferred input with
   the C/C++ driver's comparison capture (`BHF_CMP_EVIDENCE`) and store the

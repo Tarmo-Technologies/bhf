@@ -391,7 +391,9 @@ fn explain_one(work_dir: &Path, f: &Finding, others: &[String], collapsed: bool)
 }
 
 /// The REPRODUCE OFFLINE commands that apply to `f`: `bhf capsule` and
-/// `bhf verify-poc` when capsule can package it (the same check capsule runs),
+/// `bhf verify-poc` when the finding's lane takes it and its harness is laid
+/// out to be packaged (the check capsule runs before it plans; what planning
+/// checks, such as dependencies in the local cache, it says when it refuses),
 /// otherwise why not and a command that does reproduce it; plus the finding's
 /// `replay.py` and, for an AddressSanitizer crash cartography can map,
 /// `bhf cartography`.
@@ -413,9 +415,14 @@ fn reproduce_lines(work_dir: &Path, f: &Finding) -> Vec<String> {
             ));
             lines.push(format!("bhf verify-poc {work}/capsules/capsule_{}", f.id));
             lines.push(
-                "  (the capsule records whether its offline rebuild reproduced the crash)"
+                "  (the capsule records whether its offline rebuild reproduced the crash;"
                     .to_owned(),
             );
+            lines.push(
+                "  capsule can still refuse a dependency missing from the local cache or a"
+                    .to_owned(),
+            );
+            lines.push("  tree too large to ship, and says which)".to_owned());
             if replay.is_file() {
                 lines.push(format!(
                     "python3 {}",
@@ -1532,6 +1539,67 @@ mod tests {
         let reproduce = out.split("REPRODUCE OFFLINE").nth(1).unwrap();
         assert!(!reproduce.contains("bhf verify-poc"), "{reproduce}");
         assert!(reproduce.contains("oracle finding"), "{reproduce}");
+    }
+
+    /// REPRODUCE OFFLINE offers capsule and verify-poc for a finding of every
+    /// harness language capsule packages (a Python one here), and cartography
+    /// only for the C and C++ AddressSanitizer crashes it maps.
+    #[test]
+    fn reproduce_offline_offers_capsule_for_an_interpreted_harness_but_not_cartography() {
+        let work = tempfile::tempdir().unwrap();
+        let tree = work.path().join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(
+            tree.join("record_parser.py"),
+            "def parse_record(d):\n    pass\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(work.path().join("auto")).unwrap();
+        std::fs::write(
+            work.path().join("auto/run.json"),
+            serde_json::json!({"source_root": tree}).to_string(),
+        )
+        .unwrap();
+        let harness = crate::auto::layout::harness_dir(work.path(), "H-P0001-0000ABCD");
+        std::fs::create_dir_all(&harness).unwrap();
+        std::fs::write(
+            harness.join("main"),
+            "#!/bin/sh\n# BHF_FRAMED BHF_PY_LAUNCHER\nexec \"/usr/bin/python3\" -B d.py \"$@\"\n",
+        )
+        .unwrap();
+        let finding_dir = work.path().join("results/findings/F-0001-0a0b0c0d");
+        std::fs::create_dir_all(&finding_dir).unwrap();
+        std::fs::write(finding_dir.join("testcase.bin"), b"A").unwrap();
+        let mut finding = frameless_finding(&finding_dir);
+        finding.raw["harness_id"] = serde_json::json!("H-P0001-0000ABCD");
+        finding.raw["exception"] = serde_json::json!({
+            "name": "ASAN_PYTHON_UNCONTROLLED_RECURSION",
+            "sanitizer": "asan",
+            "message": "Python finding: RecursionError: maximum recursion depth exceeded",
+            "stack": []
+        });
+        let out = explain_one(work.path(), &finding, &[], false);
+        let reproduce = out.split("REPRODUCE OFFLINE").nth(1).unwrap();
+        assert!(
+            reproduce.contains(&format!(
+                "bhf capsule --work-dir {} --finding-id F-0001-0a0b0c0d",
+                work.path().display()
+            )) && reproduce.contains("bhf verify-poc"),
+            "{reproduce}"
+        );
+        assert!(!reproduce.contains("bhf cartography"), "{reproduce}");
+
+        // A Python harness without its launcher is refused with that reason.
+        std::fs::remove_file(harness.join("main")).unwrap();
+        let out = explain_one(work.path(), &finding, &[], false);
+        let reproduce = out.split("REPRODUCE OFFLINE").nth(1).unwrap();
+        let words = reproduce.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(!reproduce.contains("bhf verify-poc"), "{reproduce}");
+        assert!(
+            words.contains("Python harness H-P0001-0000ABCD")
+                && words.contains("no `main` launcher"),
+            "{reproduce}"
+        );
     }
 
     /// The dictionary is read with the engine's own AFL parser: a token may

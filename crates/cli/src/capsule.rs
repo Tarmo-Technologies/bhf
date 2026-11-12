@@ -8,23 +8,29 @@
 //! throwaway `bhf_work/` full of absolute paths and generated stubs. A capsule
 //! makes that crash *hand-offable*: it copies the minimal set that reproduces it —
 //! the harness driver, the target sources and the headers they include (in their
-//! original layout), the recovered stubs, the C runtime headers, and the crash
-//! input (the minimized one when it reproduces) — rewrites every path to be
-//! relative, and ships a `build.sh` plus a `manifest.json` recording the exact
-//! sanitizer signature to expect. `bhf verify-poc` rebuilds it offline (only the
-//! lane's compiler + a shell needed — no bhf) and asserts the same crash
-//! reproduces.
+//! original layout), the recovered stubs, bhf's runtime for the language, any
+//! dependencies vendored for an offline rebuild, and the crash input (the
+//! minimized one when it reproduces) — rewrites every path to be relative, and
+//! ships a `build.sh` plus a `manifest.json` recording the toolchain it needs
+//! and the exact crash signature to expect. `bhf verify-poc` rebuilds it
+//! offline (only the lane's toolchain + a shell needed — no bhf) and asserts
+//! the same crash reproduces.
 //!
 //! What gets copied and how it rebuilds is the finding's lane
-//! ([`crate::repro_lane`]): C and C++ harnesses today. Any other finding is
-//! refused with a reason that names its harness and language.
+//! ([`crate::repro_lane`]): every harness language bhf generates has one. The
+//! rebuilt PoC is replayed with the input protocol the shared detector
+//! ([`crate::protocol_detect`]) reads off it — the input file as `argv[1]`, or
+//! the Ada runtime's stdin with its event log — and the lane's crash oracle
+//! names what fired. A harness its lane cannot rebuild offline is refused with
+//! the specific reason.
 //!
 //! The capsule is self-verifying BY CONSTRUCTION: `capsule` builds and replays it in
 //! a scratch dir before moving it into place, records the observed sanitizer
 //! signature, and marks `reproduced: false` (never silently) when the
 //! reconstruction doesn't fire. A refused or failed finding leaves nothing behind.
 
-use crate::repro_lane::{self, Lane, PlanRequest, Tool};
+use crate::protocol_detect::{self, HarnessProtocol};
+use crate::repro_lane::{self, HarnessContext, Lane, PlanRefusal, Requirement, Tool};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -46,9 +52,9 @@ pub struct CapsuleArgs {
     #[arg(long = "work-dir", default_value = "bhf_work")]
     pub work_dir: PathBuf,
 
-    /// Package only this finding id (default: every runtime crash finding of a
-    /// C or C++ harness). Exits non-zero, with the reason, when it cannot be
-    /// packaged.
+    /// Package only this finding id (default: every runtime crash finding).
+    /// Exits non-zero, with the reason, when it cannot be packaged or its
+    /// capsule does not reproduce.
     #[arg(long = "finding-id", value_name = "ID")]
     pub finding_id: Option<String>,
 
@@ -66,9 +72,14 @@ pub struct CapsuleArgs {
 }
 
 /// `bhf verify-poc` — rebuild a capsule offline and assert the crash reproduces.
+///
+/// It needs the programs the capsule's manifest lists under `requires` (the
+/// lane's compiler or interpreter, each overridable by its variable, such as
+/// `CC`, `GPRBUILD`, `PYTHON` or `DOTNET`) and says which are missing.
 #[derive(Debug, clap::Args)]
 pub struct VerifyPocArgs {
-    /// Capsule directory or `.tar.gz` produced by `bhf capsule`.
+    /// Capsule directory or `.tar.gz` produced by `bhf capsule` (absolute, or
+    /// relative to the current dir).
     pub capsule: PathBuf,
 }
 
@@ -114,6 +125,7 @@ pub fn run(args: CapsuleArgs) -> i32 {
     let mut made = 0usize;
     let mut reproduced = 0usize;
     let mut failed = 0usize;
+    let mut refused_at_plan = 0usize;
     for (record, eligible) in selection.eligible {
         let Some(harness_dir) = eligible.harness_dir else {
             failed += 1;
@@ -121,8 +133,10 @@ pub fn run(args: CapsuleArgs) -> i32 {
         };
         let finding = FindingRef {
             finding_id: record.id,
+            finding_dir: record.dir,
             harness_id: eligible.harness_id,
             harness_dir,
+            work_dir: args.work_dir.clone(),
             lane: eligible.lane,
             inputs: eligible.inputs,
             raw: record.raw,
@@ -152,17 +166,55 @@ pub fn run(args: CapsuleArgs) -> i32 {
                     bhfeprintln!("  {} warning: {warning}", report.finding_id);
                 }
             }
-            Err(e) => {
-                failed += 1;
-                bhfeprintln!("  {} failed: {e:#}", finding.finding_id);
-            }
+            Err(e) => match e.downcast_ref::<PlanRefusal>() {
+                // The lane decided while planning that it cannot package this
+                // harness (a dependency not vendorable offline, a project file
+                // outside the tree): a refusal with its reason, like the ones
+                // the selection makes.
+                Some(refusal) => {
+                    refused_at_plan += 1;
+                    let reason = format!(
+                        "{} harness {} cannot be packaged: {refusal}",
+                        finding.lane.name(),
+                        finding.harness_id,
+                    );
+                    if requested {
+                        bhfeprintln!(
+                            "bhf capsule: cannot package {}: {reason}",
+                            finding.finding_id
+                        );
+                    } else {
+                        bhfeprintln!("bhf capsule: {} skipped: {reason}", finding.finding_id);
+                    }
+                    let record = repro_lane::FindingRecord {
+                        id: finding.finding_id.clone(),
+                        dir: finding.finding_dir.clone(),
+                        raw: finding.raw.clone(),
+                    };
+                    let refusal = repro_lane::Refusal::IncompleteHarness {
+                        harness_id: finding.harness_id.clone(),
+                        language: finding.lane.tag().to_owned(),
+                        harness_dir: finding.harness_dir.clone(),
+                        problem: refusal.to_string(),
+                    };
+                    if let Some(alternative) =
+                        repro_lane::alternative(&finding.work_dir, &record, &refusal)
+                    {
+                        bhfeprintln!("  reproduce it with: {alternative}");
+                    }
+                }
+                None => {
+                    failed += 1;
+                    bhfeprintln!("  {} failed: {e:#}", finding.finding_id);
+                }
+            },
         }
     }
     if !out_root_existed {
         // Only removes an empty dir: nothing was packaged into it.
         let _ = std::fs::remove_dir(&out_root);
     }
-    let skipped = match selection_refused {
+    let skipped = match selection_refused + refused_at_plan {
         0 => String::new(),
         n => format!("; {n} finding(s) skipped"),
     };
@@ -170,19 +222,21 @@ pub fn run(args: CapsuleArgs) -> i32 {
         "bhf capsule: {made} capsule(s) written to {} ({reproduced} verified to reproduce{skipped})",
         out_root.display()
     );
-    let requested_unverified = requested && reproduced < made;
-    if failed > 0 || made == 0 || requested_unverified {
-        1
-    } else {
-        0
-    }
+    repro_lane::exit_code(&repro_lane::RunTally {
+        requested,
+        made,
+        verified: reproduced,
+        failed,
+    })
 }
 
 /// A finding selected for packaging.
 struct FindingRef {
     finding_id: String,
+    finding_dir: PathBuf,
     harness_id: String,
     harness_dir: PathBuf,
+    work_dir: PathBuf,
     lane: &'static dyn Lane,
     /// Crash inputs, minimized first.
     inputs: Vec<PathBuf>,
@@ -210,14 +264,18 @@ struct Verification {
     /// The capsule-relative input that reproduced the crash.
     reproduced_with: Option<String>,
     signature: String,
+    /// The input protocol the rebuilt PoC was replayed with, and why.
+    protocol: Option<(HarnessProtocol, String)>,
 }
 
 fn build_capsule(f: &FindingRef, out_root: &Path, tar: bool) -> anyhow::Result<CapsuleReport> {
     validate_capsule_id(&f.finding_id, "finding")?;
     validate_capsule_id(&f.harness_id, "harness")?;
-    let plan = f.lane.plan_capsule(&PlanRequest {
-        harness_dir: &f.harness_dir,
-    })?;
+    let plan = f.lane.plan_capsule(&HarnessContext::new(
+        &f.work_dir,
+        &f.harness_id,
+        &f.harness_dir,
+    ))?;
     std::fs::create_dir_all(out_root).map_err(|error| {
         anyhow::anyhow!("cannot create output dir {}: {error}", out_root.display())
     })?;
@@ -230,6 +288,16 @@ fn build_capsule(f: &FindingRef, out_root: &Path, tar: bool) -> anyhow::Result<C
     let cap = staging.path();
     for file in &plan.files {
         copy(&file.from, &cap.join(&file.to))?;
+    }
+    for file in &plan.generated {
+        let dest = cap.join(&file.to);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&dest, &file.bytes)?;
+        if file.executable {
+            set_executable(&dest);
+        }
     }
     let mut inputs = Vec::new();
     for input in &f.inputs {
@@ -272,7 +340,15 @@ fn build_capsule(f: &FindingRef, out_root: &Path, tar: bool) -> anyhow::Result<C
         std::fs::rename(cap.join(chosen), cap.join(SHIPPED_INPUT))?;
     }
     let minimized = source == "min_testcase.bin";
-    let reproduced = verification.reproduced_with.is_some();
+    // The crash the finding recorded, when the lane can name it: a replay
+    // that shows another one reproduces a crash, but not this finding's.
+    let finding_signature = f.lane.finding_signature(&f.raw);
+    let other = other_crash(
+        finding_signature.as_deref(),
+        verification.reproduced_with.is_some(),
+        &verification.signature,
+    );
+    let reproduced = verification.reproduced_with.is_some() && other.is_none();
     let format_note = crate::generate_harness::finding_format_note(&f.raw, &f.harness_dir);
     write_manifest(
         cap,
@@ -281,10 +357,17 @@ fn build_capsule(f: &FindingRef, out_root: &Path, tar: bool) -> anyhow::Result<C
         &verification,
         &source,
         format_note.as_deref(),
+        finding_signature.as_deref(),
     )?;
     std::fs::write(
         cap.join("README.md"),
-        readme(f, &plan, &source, &verification.signature),
+        readme(
+            f,
+            &plan,
+            &source,
+            &verification,
+            finding_signature.as_deref(),
+        ),
     )?;
 
     let final_dir = out_root.join(format!("capsule_{}", f.finding_id));
@@ -308,7 +391,8 @@ fn build_capsule(f: &FindingRef, out_root: &Path, tar: bool) -> anyhow::Result<C
     let not_reproduced_reason = match &verification.build_error {
         Some(error) if !verification.built => format!("the rebuild failed: {error}"),
         _ if !verification.built => "the rebuild failed".to_owned(),
-        _ => "the rebuilt PoC did not crash on the finding's input".to_owned(),
+        _ => other
+            .unwrap_or_else(|| "the rebuilt PoC did not crash on the finding's input".to_owned()),
     };
     Ok(CapsuleReport {
         finding_id: f.finding_id.clone(),
@@ -328,6 +412,15 @@ fn build_capsule(f: &FindingRef, out_root: &Path, tar: bool) -> anyhow::Result<C
     })
 }
 
+/// Why a replay that crashed does not reproduce the finding, when the lane
+/// names the crash the finding recorded (`finding_signature`) and the replay
+/// showed another one.
+fn other_crash(finding_signature: Option<&str>, crashed: bool, observed: &str) -> Option<String> {
+    let expected = finding_signature.filter(|_| crashed)?;
+    (!signature_matches(expected, observed))
+        .then(|| format!("the rebuilt PoC shows {observed}, but the finding recorded {expected}"))
+}
+
 fn validate_capsule_id(value: &str, label: &str) -> anyhow::Result<()> {
     // Defence in depth lives in corpus::layout::is_valid_finding_id (shared with
     // resolve_finding_id): single safe path segment, no traversal.
@@ -338,7 +431,9 @@ fn validate_capsule_id(value: &str, label: &str) -> anyhow::Result<()> {
 }
 
 /// Build the capsule in place, then replay each input in turn; the first that
-/// crashes is the one the capsule reproduces with.
+/// crashes is the one the capsule reproduces with. The rebuilt PoC is replayed
+/// with the protocol the shared detector reads off it (the lane's own when the
+/// detector finds nothing that says).
 fn verify_capsule(cap: &Path, lane: &dyn Lane, inputs: &[String]) -> Verification {
     let mut build = Command::new("sh");
     build.arg("build.sh").current_dir(cap);
@@ -346,8 +441,14 @@ fn verify_capsule(cap: &Path, lane: &dyn Lane, inputs: &[String]) -> Verificatio
         Ok(out) if out.status.success() && cap.join("poc").is_file() => {}
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
+            let stdout = String::from_utf8_lossy(&out.stdout);
             return Verification {
-                build_error: build_failure_line(&stderr),
+                build_error: build_failure_line(&stderr)
+                    .or_else(|| build_failure_line(&stdout))
+                    .or_else(|| {
+                        (!out.status.success() || !cap.join("poc").is_file())
+                            .then(|| "build.sh produced no ./poc".to_owned())
+                    }),
                 ..Verification::default()
             };
         }
@@ -358,25 +459,64 @@ fn verify_capsule(cap: &Path, lane: &dyn Lane, inputs: &[String]) -> Verificatio
             };
         }
     }
+    let (protocol, basis) = replay_protocol(cap, lane);
     for input in inputs {
-        let mut replay = lane.replay_command(cap, input);
-        let Ok(out) = crate::command_output::output_with_timeout(&mut replay, REPLAY_TIMEOUT)
+        // A replay that ran out its wall clock did not show the crash.
+        let Ok(replay) = repro_lane::replay_poc(cap, input, protocol, REPLAY_TIMEOUT)
+            .map_err(|_| ())
+            .and_then(|replay| {
+                if replay.timed_out {
+                    Err(())
+                } else {
+                    Ok(replay)
+                }
+            })
         else {
             continue;
         };
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        if let Some(signature) = lane.crash_signature(&stderr, &out.status) {
+        if let Some(signature) = lane.crash_signature(&replay) {
             return Verification {
                 built: true,
                 build_error: None,
                 reproduced_with: Some(input.clone()),
                 signature,
+                protocol: Some((protocol, basis)),
             };
         }
     }
     Verification {
         built: true,
+        protocol: Some((protocol, basis)),
         ..Verification::default()
+    }
+}
+
+/// How the rebuilt `<cap>/poc` takes its input: what the shared protocol
+/// detector reads off it, else the lane's own protocol.
+fn replay_protocol(cap: &Path, lane: &dyn Lane) -> (HarnessProtocol, String) {
+    let detection = protocol_detect::detect(&cap.join("poc"), &[]);
+    if detection.basis == protocol_detect::ProtocolBasis::Default {
+        let protocol = lane.protocol();
+        return (
+            protocol,
+            format!(
+                "the {} lane's protocol (nothing in ./poc says otherwise)",
+                lane.name()
+            ),
+        );
+    }
+    (detection.protocol, detection.basis.describe())
+}
+
+/// The command line that replays `input` on the rebuilt PoC.
+fn run_line(protocol: HarnessProtocol, input: &str) -> String {
+    match protocol {
+        HarnessProtocol::StdinEventLog => {
+            format!("cat {input} | BHF_EVENTS_PATH=events.bin ./poc")
+        }
+        HarnessProtocol::BhfFramed | HarnessProtocol::LibFuzzerSingleInput => {
+            format!("./poc {input}")
+        }
     }
 }
 
@@ -422,10 +562,17 @@ fn write_manifest(
     verification: &Verification,
     input_source: &str,
     format_note: Option<&str>,
+    finding_signature: Option<&str>,
 ) -> anyhow::Result<()> {
     let sink = f.raw.pointer("/actionability/sink").cloned();
     let cwe = f.raw.pointer("/actionability/cwe").cloned();
-    let toolchain = f.lane.toolchain();
+    // The main program the rebuild needs, as older capsules recorded it.
+    let main_tool = plan.requires.first();
+    let protocol = verification
+        .protocol
+        .as_ref()
+        .map(|(protocol, _)| *protocol)
+        .unwrap_or_else(|| f.lane.protocol());
     let manifest = json!({
         "schema": "bhf.capsule/v1",
         "bhf_version": env!("BHF_VERSION_FULL"),
@@ -433,7 +580,11 @@ fn write_manifest(
         "harness_id": f.harness_id,
         "lang": f.lane.tag(),
         "language": f.lane.name(),
-        "toolchain": {"env": toolchain.env_var, "default": toolchain.default},
+        "toolchain": {
+            "env": main_tool.map(|tool| tool.env_var.clone()),
+            "default": main_tool.map(|tool| tool.program.clone()),
+        },
+        "requires": plan.requires.iter().map(Requirement::to_json).collect::<Vec<_>>(),
         "rule_id": f.raw.get("rule_id"),
         "cwe": cwe,
         "exception": f.raw.pointer("/exception/name"),
@@ -443,7 +594,9 @@ fn write_manifest(
         "input_minimized": input_source == "min_testcase.bin",
         "build": "sh build.sh",
         "build_recipe": plan.build_facts,
-        "run": format!("./poc {SHIPPED_INPUT}"),
+        "protocol": protocol.label(),
+        "protocol_basis": verification.protocol.as_ref().map(|(_, basis)| basis),
+        "run": run_line(protocol, SHIPPED_INPUT),
         "rebuilt": verification.built,
         "expected_signature": verification.signature,
         "reproduced": verification.reproduced_with.is_some(),
@@ -461,6 +614,21 @@ fn write_manifest(
     if let Some(note) = format_note {
         manifest["harness_format_note"] = json!(note);
     }
+    if let Some(recorded) = finding_signature {
+        manifest["finding_signature"] = json!(recorded);
+        // The rebuilt PoC crashed, but not with the finding's crash: it does
+        // not reproduce this finding.
+        if other_crash(
+            Some(recorded),
+            verification.reproduced_with.is_some(),
+            &verification.signature,
+        )
+        .is_some()
+        {
+            manifest["reproduced"] = json!(false);
+            manifest["reproduced_other_crash"] = json!(true);
+        }
+    }
     std::fs::write(
         cap.join("manifest.json"),
         serde_json::to_vec_pretty(&manifest)?,
@@ -472,15 +640,20 @@ fn readme(
     f: &FindingRef,
     plan: &repro_lane::CapsulePlan,
     input_source: &str,
-    signature: &str,
+    verification: &Verification,
+    finding_signature: Option<&str>,
 ) -> String {
     use std::fmt::Write as _;
-    let toolchain = f.lane.toolchain();
     let which_input = if input_source == "min_testcase.bin" {
         "the minimized crashing input"
     } else {
         "the crashing input"
     };
+    let protocol = verification
+        .protocol
+        .as_ref()
+        .map(|(protocol, _)| *protocol)
+        .unwrap_or_else(|| f.lane.protocol());
     let mut layout = String::new();
     for (path, what) in &plan.layout {
         let _ = writeln!(layout, "- `{path}` — {what}");
@@ -491,29 +664,71 @@ fn readme(
     );
     let _ = writeln!(
         layout,
-        "- `manifest.json` — finding metadata + expected signature"
+        "- `manifest.json` — finding metadata, the toolchain it needs + expected signature"
     );
+    let mut requires = String::new();
+    for requirement in &plan.requires {
+        let _ = writeln!(
+            requires,
+            "- `{}` (or `${}`){}{}",
+            requirement.program,
+            requirement.env_var,
+            if requirement.purpose.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", requirement.purpose)
+            },
+            requirement
+                .version
+                .as_deref()
+                .map(|version| format!(" — packaged with `{version}`"))
+                .unwrap_or_default(),
+        );
+    }
+    let run = run_line(protocol, SHIPPED_INPUT);
+    let stdin_note = if protocol == HarnessProtocol::StdinEventLog {
+        "\nThe harness reads its input from stdin and records what it raised in the\n\
+         event log `$BHF_EVENTS_PATH`; pipe the input in (`cat ... |`), as a file\n\
+         redirect is read again and again.\n"
+    } else {
+        ""
+    };
     format!(
         "# BHF PoC capsule — {id}\n\n\
          Self-contained reproducer for a crash bhf found in a {language} target on a tree\n\
-         with no working build. Rebuilds offline with only `{compiler}` (or `${env}`) and a\n\
-         shell.\n\n\
+         with no working build. Rebuilds offline with only these programs and a shell:\n\n\
+         {requires}\n\
          ## Reproduce\n\n\
          ```sh\n\
-         sh build.sh                 # compile ./poc (ASan+UBSan)\n\
-         ./poc {SHIPPED_INPUT}    # replay {which_input}\n\
-         ```\n\n\
+         sh build.sh                 # {summary}\n\
+         {run}    # replay {which_input}\n\
+         ```\n\
+         {stdin_note}\n\
          Or verify with bhf:\n\n\
          ```sh\n\
          bhf verify-poc .\n\
          ```\n\n\
-         Expected sanitizer signature: `{signature}`.\n\n\
+         Expected signature: {signature}.\n\n\
          ## Layout\n\n\
          {layout}",
         id = f.finding_id,
         language = f.lane.name(),
-        compiler = toolchain.default,
-        env = toolchain.env_var,
+        summary = plan.build_summary,
+        signature = match finding_signature.filter(|recorded| {
+            other_crash(
+                Some(recorded),
+                verification.reproduced_with.is_some(),
+                &verification.signature,
+            )
+            .is_some()
+        }) {
+            Some(recorded) => format!(
+                "`{recorded}` (what the finding recorded; the rebuilt PoC showed `{}` when \
+                 it was packaged)",
+                verification.signature
+            ),
+            None => format!("`{}`", verification.signature),
+        },
     )
 }
 
@@ -540,9 +755,16 @@ pub fn run_verify(args: VerifyPocArgs) -> i32 {
             return 1;
         }
     };
-    let expected = manifest
-        .get("expected_signature")
-        .and_then(Value::as_str)
+    // The crash the finding recorded, when its lane names it, else the one
+    // the capsule showed when it was packaged.
+    let expected = ["finding_signature", "expected_signature"]
+        .iter()
+        .find_map(|key| {
+            manifest
+                .get(*key)
+                .and_then(Value::as_str)
+                .filter(|signature| !signature.is_empty())
+        })
         .unwrap_or("")
         .to_owned();
     // Capsules written before lanes existed are C capsules.
@@ -555,8 +777,21 @@ pub fn run_verify(args: VerifyPocArgs) -> i32 {
         );
         return 1;
     };
-    if let Some(missing) = lane.toolchain().missing() {
-        println!("verify-poc: FAIL — cannot rebuild the capsule: {missing}");
+    // The programs the capsule recorded it needs (older capsules: the lane's).
+    let requires: Vec<Requirement> = match manifest.get("requires").and_then(Value::as_array) {
+        Some(recorded) => recorded.iter().filter_map(Requirement::from_json).collect(),
+        None => lane.tools().iter().map(|tool| tool.requirement()).collect(),
+    };
+    let missing: Vec<String> = requires.iter().filter_map(Requirement::missing).collect();
+    if !missing.is_empty() {
+        println!(
+            "verify-poc: FAIL — cannot rebuild the {} capsule here; it needs {}:",
+            lane.name(),
+            repro_lane::describe_requirements(&requires)
+        );
+        for line in missing {
+            println!("  - {line}");
+        }
         return 1;
     }
     let input = manifest
@@ -567,7 +802,7 @@ pub fn run_verify(args: VerifyPocArgs) -> i32 {
 
     // Rebuild in place (or a temp copy — for a tar it's already scratch).
     let verification = verify_capsule(&root, lane, std::slice::from_ref(&input));
-    remove_build_outputs(&root, &["poc", "obj"]);
+    remove_build_outputs(&root, &["poc", "obj", "build"]);
     let reproduced = verification.reproduced_with.is_some();
     let observed = verification.signature;
 
@@ -579,7 +814,11 @@ pub fn run_verify(args: VerifyPocArgs) -> i32 {
         let packaged_reproducing = manifest
             .get("reproduced")
             .and_then(Value::as_bool)
-            .unwrap_or(true);
+            .unwrap_or(true)
+            || manifest
+                .get("reproduced_other_crash")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
         let finding = manifest
             .get("finding_id")
             .and_then(Value::as_str)
@@ -624,6 +863,13 @@ pub fn run_verify(args: VerifyPocArgs) -> i32 {
     );
     if !matched {
         println!("  expected: {expected}");
+        let packaged = manifest
+            .get("expected_signature")
+            .and_then(Value::as_str)
+            .filter(|packaged| *packaged != expected && !packaged.is_empty());
+        if let Some(packaged) = packaged {
+            println!("  packaged: {packaged} (what the rebuilt PoC showed when it was packaged)");
+        }
         return 1;
     }
     0
@@ -638,12 +884,13 @@ fn signature_matches(expected: &str, observed: &str) -> bool {
     expected == observed || observed == "signal:crash" || expected == "signal:crash"
 }
 
-/// Resolve a capsule argument to a usable directory root. A directory is used
-/// in place; an archive is extracted to a scratch dir (returned so the caller keeps
-/// it alive). The scratch guard is `Some` only for the archive case.
+/// Resolve a capsule argument to a usable directory root, absolute (the
+/// rebuild and the replay run inside it). A directory is used in place; an
+/// archive is extracted to a scratch dir (returned so the caller keeps it
+/// alive). The scratch guard is `Some` only for the archive case.
 fn resolve_capsule(arg: &Path) -> anyhow::Result<(PathBuf, Option<tempfile::TempDir>)> {
     if arg.is_dir() {
-        return Ok((arg.to_path_buf(), None));
+        return Ok((std::path::absolute(arg)?, None));
     }
     if !arg.exists() {
         anyhow::bail!("{}", missing_capsule_message(arg));
@@ -801,6 +1048,29 @@ sources/widget.h:2:10: fatal error: 'cstddef' file not found
         assert_eq!(build_failure_line("\n  \n"), None);
     }
 
+    /// A replay that crashes with another crash than the one the finding
+    /// recorded does not reproduce the finding; one with no recorded crash to
+    /// compare, or the same one, does.
+    #[test]
+    fn a_replay_showing_another_crash_does_not_reproduce_the_finding() {
+        let reason = other_crash(Some("ada:PROGRAM_ERROR"), true, "ada:CONSTRAINT_ERROR").unwrap();
+        assert_eq!(
+            reason,
+            "the rebuilt PoC shows ada:CONSTRAINT_ERROR, but the finding recorded \
+             ada:PROGRAM_ERROR"
+        );
+        assert_eq!(
+            other_crash(Some("ada:PROGRAM_ERROR"), true, "ada:PROGRAM_ERROR"),
+            None
+        );
+        assert_eq!(
+            other_crash(Some("ada:PROGRAM_ERROR"), true, "signal:crash"),
+            None
+        );
+        assert_eq!(other_crash(None, true, "ada:CONSTRAINT_ERROR"), None);
+        assert_eq!(other_crash(Some("ada:PROGRAM_ERROR"), false, ""), None);
+    }
+
     #[test]
     fn signature_match_rules() {
         assert!(signature_matches(
@@ -830,8 +1100,10 @@ sources/widget.h:2:10: fatal error: 'cstddef' file not found
         std::fs::write(sentinel.join("keep"), b"keep").unwrap();
         let finding = FindingRef {
             finding_id: "x/../../sentinel".to_owned(),
+            finding_dir: work.join("results/findings/x"),
             harness_id: "H-C-1".to_owned(),
             harness_dir: harness,
+            work_dir: work.clone(),
             lane: &repro_lane::C_LANE,
             inputs: Vec::new(),
             raw: json!({}),
@@ -900,8 +1172,10 @@ sources/widget.h:2:10: fatal error: 'cstddef' file not found
         let out = temp.path().join("out");
         let finding = FindingRef {
             finding_id: "F-0001-00000001".to_owned(),
+            finding_dir: temp.path().join("work/results/findings/F-0001-00000001"),
             harness_id: "H-C0001-00000001".to_owned(),
             harness_dir: harness,
+            work_dir: temp.path().join("work"),
             lane: &repro_lane::C_LANE,
             inputs: Vec::new(),
             raw: json!({}),

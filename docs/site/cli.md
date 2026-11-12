@@ -512,35 +512,65 @@ and explain it — all offline and deterministic (no LLM):
   the full `auto` pipeline against it. The fastest way to try bhf on a single
   routine.
 - `bhf capsule` — package a crash into a portable, self-verifying PoC capsule:
-  the generated harness, the target sources and the project headers they
-  include (in their original directory layout, so `#include "sub/x.h"` still
-  resolves), the stubs bhf synthesized, the build settings the harness was
-  actually built with (the Makefile plus the language standard and extra
-  sources/include dirs recorded in `harnesses/<id>/coverage-build-recipe.json`),
-  and the crash input. The input is the finding's `min_testcase.bin` when it
-  reproduces, else its `testcase.bin`; it ships as `input/testcase.bin`, and the
-  output and `manifest.json` (`input_source`) say which it is. The headers that
-  ship are the ones the compiler's `-M` lists for the build; when that fails,
-  every header under the include roots ships, plus the project headers the
-  sources' `#include` lines reach (also through `..`). For a C++ capsule whose
-  `clang++` cannot find the C++ standard library itself (it picked a GCC install
-  without libstdc++), the scan and `build.sh` fall back to the newest installed
-  libstdc++ headers and library, as bhf's own C++ builds do; `build.sh` probes
-  for them on the host that runs it. A rebuild that fails is reported by the
-  compiler's first `error:` line. The capsule is
-  built and replayed in a scratch dir, then moved into place, so a refused or
-  failed finding leaves nothing behind.
-- `bhf verify-poc <CAPSULE>` — rebuild a PoC capsule offline and assert the
-  crash reproduces. Only the lane's compiler (`clang`, or `clang++` for a C++
-  capsule; `$CC`/`$CXX` override) and a shell are needed, so a capsule verifies
-  on a clean machine without the full toolchain. A path that does not exist is
-  reported as such, with the `bhf capsule` command that writes it.
+  the generated harness, the target sources (and, for C and C++, the project
+  headers they include, in their original directory layout, so
+  `#include "sub/x.h"` still resolves), the stubs bhf synthesized, bhf's
+  runtime for the language, the build settings the harness was actually built
+  with, the dependencies an offline rebuild needs, and the crash input. What a
+  capsule holds and how it rebuilds is its lane's, one per harness language
+  (see the table below). The input is the finding's `min_testcase.bin` when it
+  reproduces, else its `testcase.bin`; it ships as `input/testcase.bin`, and
+  the output and `manifest.json` (`input_source`) say which it is. Every path
+  the harness's build and launch files name is relocated into the capsule:
+  `build.sh` renders those files into `build/` with the capsule's own location
+  and the programs it finds on the host, builds there, and writes `./poc`, so
+  the shipped files stay as packaged. The rebuilt PoC is replayed with the
+  input protocol the shared detector reads off it: the input file as
+  `argv[1]`, or, for an Ada harness, the input piped to stdin with the
+  runtime's event log in `$BHF_EVENTS_PATH` (`manifest.json` `protocol` and
+  `run`). `manifest.json` also records the programs the rebuild needs and the
+  version each one printed when the capsule was made (`requires`), the
+  expected crash signature, and the lane's build facts (`build_recipe`).
+
+  For a C or C++ harness the headers that ship are the ones the compiler's
+  `-M` lists for the build (when that fails, every header under the include
+  roots ships, plus the project headers the sources' `#include` lines reach,
+  also through `..`), and the build settings are the Makefile plus the
+  language standard and extra sources/include dirs recorded in
+  `harnesses/<id>/coverage-build-recipe.json`. The compiler is `$CC`/`$CXX`,
+  else the family that built the harness binary (a harness bhf built with gcc
+  rebuilds with gcc), and `build.sh` asks the compiler that runs it which
+  family it is and passes that family's sanitizer flags, as the harness
+  Makefile does. A launcher in front of the compiler (`ccache clang++`) runs as
+  its words. For a C++ capsule whose compiler cannot find the C++ standard
+  library itself, the scan and `build.sh` fall back to the newest installed
+  libstdc++ headers and library, else (a libc++ host) to `-stdlib=libc++` or
+  an installed libc++ header dir; `build.sh` probes for them on the host that
+  runs it. A rebuild that fails is reported by the compiler's first `error:`
+  line. The capsule is built and replayed in a scratch dir, then moved into
+  place, so a refused or failed finding leaves nothing behind.
+- `bhf verify-poc <CAPSULE>` — rebuild a PoC capsule offline in place (or in a
+  scratch copy of a `.tar.gz`) and assert the recorded crash reproduces. The
+  path may be absolute or relative to the current dir. It
+  needs only the programs the manifest lists under `requires` and a shell, so
+  a capsule verifies on a clean machine without bhf's work dir or the scanned
+  tree; it checks them first and names each missing one and the variable that
+  overrides it. A path that does not exist is reported as such, with the
+  `bhf capsule` command that writes it.
 - `bhf env-capsule` — record and replay the shim-served faked environment so an
   environment-driven crash (missing files, unset env, unreachable sockets)
-  reproduces deterministically. The capsule ships the first input that crashes
-  under the recorded environment: `min_testcase.bin`, then `testcase.bin`, then
-  the corpus input that crashed while recording; `manifest.json`
-  (`input_source`) says which.
+  reproduces deterministically. It works on the built harness of a native lane
+  (C, C++, Ada, Rust, COBOL, Fortran): the runtrace shim is preloaded into the
+  harness process, so a statically linked harness (Go) and one that runs in a
+  language runtime (Java, C#, Python, JavaScript, TypeScript, Ruby, Perl, PHP,
+  Lua) are refused with that reason. The world is recorded under the shim mode
+  the finding fired in (`finding.json` `runtime_mode.pass`: `fuzz_driven` or
+  `rng`) with the environment variables the fuzz loop injected, which
+  `replay.sh` sets too; an Ada harness is fed its input on stdin and its
+  unhandled exception in the event log is the crash. The capsule ships the
+  first input that crashes under the recorded environment: `min_testcase.bin`,
+  then `testcase.bin`, then the corpus input that crashed while recording;
+  `manifest.json` (`input_source`) says which.
 - `bhf explain` — explain WHY a crash fired, each claim with its evidence or
   a line saying there is none:
   - the input: `min_testcase.bin` when the finding was minimized, else
@@ -607,17 +637,66 @@ and explain it — all offline and deterministic (no LLM):
   overflows are mapped by their region-relative offset and are not affected.
 
 `capsule`, `verify-poc`, `cartography` and `env-capsule` work on runtime crash
-findings (`classification: unhandled`) of **C and C++ harnesses**. The language
-comes from `generation-metadata.json` in the harness dir (else the `H-C`/`H-X`
-id prefix), and the harness is looked up in `harnesses/`, `auto/`,
-`generated_harnesses/` and `build/`, so a harness made by hand with
-`generate-harness --id <name>`, `build` and `fuzz` works too. Any other finding
-(an Ada or other-language harness, an oracle hit, a missing harness or input)
-is refused with its own reason and, when the finding dir has one, a command
-that does reproduce it (`python3 <finding>/replay.py`, or the built harness run
-on the input with sanitizer options). `bhf explain` applies the same check: it
-offers `bhf capsule`/`bhf verify-poc` only for findings capsule can package,
-and `bhf cartography` for AddressSanitizer crashes it can map.
+findings (`classification: unhandled`). The language comes from
+`generation-metadata.json` in the harness dir (else the `H-C`/`H-X`/`H-A`...
+id prefix, else the driver file the dir holds), and the harness is looked up in
+`harnesses/`, `auto/`, `generated_harnesses/` and `build/`, so a harness made
+by hand with `generate-harness --id <name>`, `build` and `fuzz` works too.
+`capsule` and `verify-poc` take every language below; `env-capsule` the native
+ones; `cartography` C and C++ (it maps AddressSanitizer reports). A finding a
+command does not take (an oracle hit, a missing harness or input, a harness its
+lane cannot rebuild offline) is refused with its own reason and, when there is
+one, a command that does reproduce it (`python3 <finding>/replay.py`, or the
+built harness run on the input). `bhf explain` applies the same first check:
+it offers `bhf capsule`/`bhf verify-poc` only for findings whose lane and
+harness layout capsule takes, and `bhf cartography` for AddressSanitizer
+crashes it can map. What capsule checks while it packages (dependencies in the
+local cargo, module or NuGet cache, the size of the tree it ships, paths it
+cannot relocate) can still refuse a finding explain offered; capsule then says
+why.
+
+Per-lane requirements (a capsule records what it needs in `manifest.json`
+`requires`; each program can be overridden by its variable):
+
+| Lane (id prefix) | The capsule ships | Rebuild and replay need | Crash oracle | Refused when |
+|---|---|---|---|---|
+| C (`H-C`) | driver, target sources and their headers, stubs, C runtime headers | `clang` or the compiler that built the harness (`CC`) | ASan / UBSan report | built with a cross compiler; no `main` rule in the Makefile |
+| C++ (`H-X`) | as C | `clang++` or the compiler that built the harness (`CXX`) | ASan / UBSan report | as C |
+| Ada (`H-A`) | `bhf_build.gpr`, `adafuzz_runtime.gpr` and the runtime sources, `src_instrumented/`, the generated harness, the stub packages, the operator projects it extends or `with`s (with the scanned tree) | `gprbuild` (`GPRBUILD`) and GNAT (`GNAT`) | unhandled exception in the event log, or a sanitizer report | never built (no `build/<id>/bhf_build.gpr`); built for another target; a project file it names lies outside the scanned tree |
+| Rust (`H-R`) | harness crate, bhf's driver, the `rust_runtime` crate, the scanned tree, `vendor/` (`cargo vendor --offline`) when the lock file names crates.io or git packages | `cargo +nightly` through rustup (`BHF_CARGO`; `BHF_RUST_NIGHTLY` names the nightly) and `clang` (`CC`) | the panic, or an ASan report | a package not in the local cargo cache |
+| Go (`H-G`) | harness module, the scanned tree, `vendor/` when the module needs modules from outside it | `go` (`GO`) | the recovered panic (`== bhf go finding:`) | a module not in the local module cache |
+| Java (`H-J`) | launcher, harness source, bhf's JVM agent jar, the scanned tree, dependency jars on the classpath | `javac` (`JAVAC`) and `java` (`JAVA`) | `== bhf JVM finding:` | target classes built by Maven or Gradle |
+| C# (`H-S`) | harness project, bhf's .NET driver, the entry, the scanned tree, `SharpFuzz.Common.dll`, the NuGet packages the restore resolved | the .NET SDK, `dotnet` (`DOTNET`) | `== bhf csharp finding:` | a NuGet package not in the local package cache |
+| Python (`H-P`) | launcher, bhf's driver, decoder and coverage helpers, the generated harness, the scanned tree | `python3` (`PYTHON`) | `== bhf python finding:` | the run recorded no scanned tree |
+| JavaScript (`H-N`) | launcher, bhf's driver, the scanned tree (with `node_modules`) | `node` (`NODE`) | `== bhf js finding:` | as Python |
+| TypeScript (`H-T`) | as JavaScript, plus the transpiled target | `node` (`NODE`) | `== bhf js finding:` | as Python |
+| Ruby (`H-U`) | launcher, bhf's driver, the generated harness, the scanned tree | `ruby` (`RUBY`) | `== bhf ruby finding:` | as Python |
+| Perl (`H-L`) | launcher, bhf's driver and coverage module, the generated harness, the scanned tree | `perl` (`PERL`) | `== bhf perl finding:` | as Python |
+| PHP (`H-W`) | launcher, bhf's driver, the generated harness, the scanned tree | `php` (`PHP`) | `== bhf php finding:` | as Python |
+| Lua (`H-V`) | launcher, bhf's driver, the generated harness, the scanned tree | `lua`, `lua5.4`, `lua5.3` or `luajit` (`LUA`) | `== bhf lua finding:` | as Python |
+| COBOL (`H-B`) | as C, with the `cobc -C` translation and the COBOL source | `clang` (`CC`) and the GnuCOBOL runtime (`cob-config --libs`, else `-lcob -lm`) | libcob's runtime check (`libcob: ... error:`) | as C |
+| Fortran (`H-F`) | as C, with the Fortran sources (`harnesses/<id>/fortran-build.json` records how each object was compiled) | `clang` (`CC`) and `gfortran` (`FC`) | ASan report | as C |
+
+The lanes that relocate their harness (all but C, C++, COBOL and Fortran)
+refuse a tree they would have to copy that holds more than 20,000 files or
+256 MiB, and a build file `build.sh` renders that still names the work dir or
+the scanned tree after relocation. A text file they ship unchanged (a target
+source, say) that names them is reported in a warning when the capsule is
+written. The C, C++, COBOL and Fortran lanes ship the sources and headers the
+build reads instead; the header copy stops at 10,000 files or 128 MiB, with a
+warning.
+
+A program `build.sh` finds under several names is met by any of them: the Lua
+capsule records the interpreter it was packaged with and the others
+(`requires[].alternatives`), so a capsule made where `lua` is installed
+verifies where only `lua5.4` is. Setting the override variable checks that
+program alone.
+
+An Ada exception finding is checked against the exception the finding
+recorded (manifest `finding_signature`), not only against the replay seen when
+the capsule was packaged: a rebuilt PoC raising another exception is not
+counted as reproducing (`reproduced: false`, `reproduced_other_crash: true`),
+and `verify-poc` reports `MISMATCH` with the expected exception.
 
 Exit codes: each of the four exits non-zero when a requested `--finding-id` is
 refused (or cannot be packaged, mapped or captured, or its capsule did not

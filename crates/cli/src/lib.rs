@@ -216,11 +216,11 @@ enum Command {
     Minimize(minimize::MinimizeArgs),
     /// Re-run a finding's crash input through a harness to reproduce it: MATCH only on the same rule, kind and sink (or reported site), with a crash summary, --json and --show-output (sandbox / qemu-user)
     Replay(replay::ReplayArgs),
-    /// Package a C/C++ crash into a portable, self-verifying PoC capsule (input + harness + sources + recovered build + stubs); other findings are refused with the reason
+    /// Package a crash from a harness in any language bhf generates into a portable, self-verifying PoC capsule (input + harness + sources + recorded build + stubs + vendored dependencies); a harness that cannot rebuild offline is refused with the reason
     Capsule(capsule::CapsuleArgs),
-    /// Rebuild a PoC capsule offline and assert the crash reproduces (only clang or clang++ + a shell needed)
+    /// Rebuild a PoC capsule offline and assert the recorded crash reproduces (only the lane's toolchain, as the manifest lists it, + a shell needed)
     VerifyPoc(capsule::VerifyPocArgs),
-    /// Record + replay the shim-served faked environment so an environment-driven C/C++ crash reproduces deterministically
+    /// Record + replay the shim-served faked environment so an environment-driven crash of a native harness (C, C++, Ada, Rust, COBOL, Fortran) reproduces deterministically
     EnvCapsule(env_capsule::EnvCapsuleArgs),
     /// Replay inputs through two harnesses or metamorphic variants and flag divergences (BHF-301 oracle)
     Differential(differential::DifferentialArgs),

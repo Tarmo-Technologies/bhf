@@ -524,7 +524,8 @@ fn custom_id_c_harness_from_the_manual_workflow_round_trips() {
     assert!(pass, "verify-poc should PASS offline; got:\n{verify}");
 }
 
-/// A crash finding whose harness is in a language with no capsule lane (Ada).
+/// A crash finding whose harness cannot be packaged: an Ada harness that was
+/// never built (no `build/<id>/bhf_build.gpr`).
 fn write_unsupported_lane_finding(work: &Path, id: &str) {
     let harness_id = "H-A0003-0000ABCD";
     let finding_dir = work.join("results/findings").join(id);
@@ -749,7 +750,8 @@ fn capsule_applies_the_recorded_build_recipe() {
         "{stdout}"
     );
     assert!(
-        stderr.contains("F-0004-0000dddd skipped: harness H-A0003-0000ABCD is an Ada harness"),
+        stderr.contains("F-0004-0000dddd skipped: Ada harness H-A0003-0000ABCD")
+            && stderr.contains("never built"),
         "{stderr}"
     );
 }
@@ -1127,5 +1129,208 @@ fn cpp_capsule_rebuilds_where_the_compiler_misses_the_standard_headers() {
         verify.status.success() && verify_out.contains("PASS"),
         "verify-poc should PASS with the same compiler; stdout:\n{verify_out}\nstderr:\n{}",
         String::from_utf8_lossy(&verify.stderr)
+    );
+}
+
+/// A C harness bhf built with gcc packages into a capsule that rebuilds with
+/// gcc and gcc's sanitizer flags, whether or not `$CC` is set when it is
+/// packaged or verified (the compiler is read off the harness binary).
+#[test]
+fn a_gcc_built_harness_capsule_rebuilds_with_gcc() {
+    if which::which("gcc").is_err() {
+        eprintln!("skipping: gcc not installed");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let tree = root.path().join("proj");
+    let work = root.path().join("work");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("parse_header.c"), OVERFLOW_C).unwrap();
+    let out = bhf()
+        .arg("auto")
+        .arg(&tree)
+        .arg("--work-dir")
+        .arg(&work)
+        .args(["--languages", "c", "--max-targets", "1", "--jobs", "1"])
+        .args(["--per-target-time", "6", "--no-discovery-cache"])
+        .env("CC", "gcc")
+        .output()
+        .expect("run bhf auto");
+    let Some((id, _)) = crash_finding(&work, |_| true) else {
+        panic!(
+            "bhf auto (CC=gcc) found no crash: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    let packaged = bhf()
+        .arg("capsule")
+        .arg("--work-dir")
+        .arg(&work)
+        .args(["--finding-id", &id])
+        .env_remove("CC")
+        .output()
+        .expect("run bhf capsule");
+    let stdout = String::from_utf8_lossy(&packaged.stdout);
+    assert!(
+        packaged.status.success() && stdout.contains("1 verified to reproduce"),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&packaged.stderr)
+    );
+    let cap = work.join("capsules").join(format!("capsule_{id}"));
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(cap.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["build_recipe"]["compiler"], "gcc", "{manifest}");
+    assert_eq!(
+        manifest["build_recipe"]["compiler_family"], "gcc",
+        "{manifest}"
+    );
+    assert_eq!(manifest["requires"][0]["program"], "gcc", "{manifest}");
+    let script = std::fs::read_to_string(cap.join("build.sh")).unwrap();
+    assert!(script.contains("CC=\"${CC:-gcc}\""), "{script}");
+    for cc in [None, Some("gcc")] {
+        let scratch = tempfile::tempdir().unwrap();
+        let dest = scratch.path().join("cap");
+        assert!(Command::new("cp")
+            .arg("-r")
+            .arg(&cap)
+            .arg(&dest)
+            .status()
+            .unwrap()
+            .success());
+        let mut verify = bhf();
+        verify.arg("verify-poc").arg(&dest);
+        match cc {
+            Some(cc) => verify.env("CC", cc),
+            None => verify.env_remove("CC"),
+        };
+        let verified = verify.output().expect("run bhf verify-poc");
+        let verify_out = String::from_utf8_lossy(&verified.stdout);
+        assert!(
+            verified.status.success() && verify_out.contains("PASS"),
+            "verify-poc with CC={cc:?} must rebuild with gcc's flags; stdout:\n{verify_out}\nstderr:\n{}",
+            String::from_utf8_lossy(&verified.stderr)
+        );
+    }
+}
+
+/// A launcher in front of the compiler (`CXX="ccache clang++"`) works for
+/// the capsule's include scan and for its build.sh, as it does for make.
+#[test]
+fn a_cpp_capsule_builds_through_a_compiler_launcher() {
+    if !clangxx_available() {
+        eprintln!("skipping: clang++ not installed");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let proj = root.path().join("proj");
+    let work = root.path().join("work");
+    let harness_id = "H-X0001-0000F00E";
+    let harness = work.join("harnesses").join(harness_id);
+    std::fs::create_dir_all(proj.join("include")).unwrap();
+    std::fs::create_dir_all(&harness).unwrap();
+    std::fs::write(proj.join("include/widget.h"), WIDGET_H).unwrap();
+    std::fs::write(proj.join("widget.cpp"), WIDGET_CPP).unwrap();
+    std::fs::write(
+        harness.join("Makefile"),
+        cpp_harness_makefile(&proj, &proj.join("widget.cpp")),
+    )
+    .unwrap();
+    std::fs::write(harness.join("main.cpp"), DRIVER_CPP).unwrap();
+    std::fs::write(
+        harness.join("generation-metadata.json"),
+        br#"{"schema_version":1,"language":"cpp"}"#,
+    )
+    .unwrap();
+    let id = "F-0007-0000eeee";
+    write_crash_finding(&work, id, harness_id, b"0123456789");
+    // A compiler launcher in the shape of ccache: it runs the rest of its words.
+    let launcher = root.path().join("fake-ccache");
+    write_script(&launcher, "#!/bin/sh\nexec \"$@\"\n");
+    let cxx = format!("{} clang++", launcher.display());
+
+    let packaged = bhf()
+        .arg("capsule")
+        .arg("--work-dir")
+        .arg(&work)
+        .args(["--finding-id", id, "--verbose"])
+        .env("CXX", &cxx)
+        .output()
+        .expect("run bhf capsule");
+    let stdout = String::from_utf8_lossy(&packaged.stdout);
+    let stderr = String::from_utf8_lossy(&packaged.stderr);
+    assert!(
+        packaged.status.success() && stdout.contains("1 verified to reproduce"),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("could not list the build's includes"),
+        "the include scan must run the launcher-prefixed compiler: {stderr}"
+    );
+    let cap = work.join("capsules").join(format!("capsule_{id}"));
+    let scratch = tempfile::tempdir().unwrap();
+    let dest = scratch.path().join("cap");
+    assert!(Command::new("cp")
+        .arg("-r")
+        .arg(&cap)
+        .arg(&dest)
+        .status()
+        .unwrap()
+        .success());
+    let verified = bhf()
+        .arg("verify-poc")
+        .arg(&dest)
+        .env("CXX", &cxx)
+        .output()
+        .expect("run bhf verify-poc");
+    let verify_out = String::from_utf8_lossy(&verified.stdout);
+    assert!(
+        verified.status.success() && verify_out.contains("PASS"),
+        "stdout:\n{verify_out}\nstderr:\n{}",
+        String::from_utf8_lossy(&verified.stderr)
+    );
+}
+
+/// `verify-poc` takes the capsule path relative to the current dir, the way
+/// `bhf explain` and the docs print it (`bhf verify-poc
+/// <work>/capsules/capsule_<id>`): the rebuilt PoC is run from the capsule
+/// dir, so its path must not be resolved against that dir again.
+#[test]
+fn a_capsule_verifies_through_a_path_relative_to_the_current_dir() {
+    if !clang_available() {
+        eprintln!("skipping: clang not installed");
+        return;
+    }
+    let root = tempfile::Builder::new()
+        .prefix("bhf-cap-relative-")
+        .tempdir()
+        .unwrap();
+    let work = root.path().join("work");
+    snippet_into(OVERFLOW_C, &work);
+    let stdout = build_capsule(&work, false);
+    assert!(
+        stdout.contains("verified to reproduce"),
+        "capsule stdout:\n{stdout}"
+    );
+    let cap = only_capsule(&work);
+    let relative = Path::new("work")
+        .join("capsules")
+        .join(cap.file_name().unwrap());
+    let out = bhf()
+        .arg("verify-poc")
+        .arg(&relative)
+        .current_dir(root.path())
+        .output()
+        .expect("run bhf verify-poc");
+    let verify_out = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && verify_out.contains("PASS"),
+        "verify-poc {} from {} must PASS; stdout:\n{verify_out}\nstderr:\n{}",
+        relative.display(),
+        root.path().display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !cap.join("poc").exists(),
+        "verify-poc leaves the capsule as it found it"
     );
 }

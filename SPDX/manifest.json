@@ -1779,6 +1779,38 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/repro_lane/ada.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/src/repro_lane/c_glue.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/src/repro_lane/dotnet.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/src/repro_lane/go.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/src/repro_lane/jvm.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/src/repro_lane/relocate.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/src/repro_lane/rust.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/src/repro_lane/script.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/resource_limits.rs",
       "license": "Apache-2.0"
     },
@@ -2352,6 +2384,10 @@
     },
     {
       "path": "crates/cli/tests/capsule_cli.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/capsule_lanes_cli.rs",
       "license": "Apache-2.0"
     },
     {

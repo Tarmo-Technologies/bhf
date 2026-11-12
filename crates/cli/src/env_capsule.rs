@@ -18,17 +18,26 @@
 //! — even from an empty input — because the environment is pinned. Each capsule is
 //! verified to reproduce before it is finalized.
 //!
-//! It works on the built harness of a C or C++ finding ([`crate::repro_lane`]);
-//! any other finding is refused with its reason, before the shim is looked up.
-//! A capsule is assembled in a scratch dir and moved into place only when
+//! It works on the built harness of every native lane ([`crate::repro_lane`]):
+//! C, C++, Ada, Rust, COBOL and Fortran. A harness that runs inside a
+//! language runtime (Python, Java, ...), or a statically linked one (a Go
+//! harness), cannot have the shim preloaded and is refused with that reason,
+//! before the shim is looked up. The harness is replayed with the input
+//! protocol the shared detector ([`crate::protocol_detect`]) reads off it: the
+//! input file as `argv[1]`, or for an Ada harness the input piped to stdin
+//! with the runtime's event log, whose unhandled exception is the crash. A
+//! capsule is assembled in a scratch dir and moved into place only when
 //! complete, so a failure leaves nothing behind.
 
-use crate::repro_lane::{self, Tool};
+use crate::protocol_detect::{self, HarnessProtocol};
+use crate::repro_lane::{self, Lane, ReplayOutput, Tool};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const MAX_CANDIDATES: usize = 64;
+/// Wall clock for one replay under the shim.
+const REPLAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// `bhf env-capsule` — bundle a replayable faked-environment reproducer.
 #[derive(Debug, clap::Args)]
@@ -38,8 +47,8 @@ pub struct EnvCapsuleArgs {
     pub work_dir: PathBuf,
 
     /// Capture only this finding id (default: every runtime crash finding of
-    /// a built C or C++ harness). Exits non-zero, with the reason, when it
-    /// cannot be captured.
+    /// a built native harness: C, C++, Ada, Rust, COBOL or Fortran). Exits
+    /// non-zero, with the reason, when it cannot be captured.
     #[arg(long = "finding-id", value_name = "ID")]
     pub finding_id: Option<String>,
 
@@ -100,15 +109,27 @@ pub fn run(args: EnvCapsuleArgs) -> i32 {
     let mut made = 0usize;
     let mut reproduced = 0usize;
     let mut failed = 0usize;
+    let mut no_world = 0usize;
+    let taken = selection.eligible.len();
     for (record, eligible) in selection.eligible {
         let Some(binary) = eligible.binary else {
+            failed += 1;
+            bhfeprintln!(
+                "  {} failed: its harness executable was not located",
+                record.id
+            );
             continue;
         };
+        let protocol = protocol_detect::detect(&binary, &[&args.work_dir]).protocol;
+        let (mode, env) = recorded_world(&record.raw);
         let f = FindingRef {
             id: record.id,
             harness_id: eligible.harness_id,
-            lang: eligible.lane.tag(),
+            lane: eligible.lane,
             binary,
+            protocol,
+            mode,
+            env,
             inputs: eligible.inputs,
         };
         match build_env_capsule(&args.work_dir, &f, &out_root, &shim, &ld_preload) {
@@ -129,6 +150,7 @@ pub fn run(args: EnvCapsuleArgs) -> i32 {
                 );
             }
             Ok(None) => {
+                no_world += 1;
                 println!(
                     "  {} skipped (no faked-environment crash to capture): no input crashed it \
                      while the shim recorded bytes it served; `bhf capsule` packages crashes \
@@ -146,7 +168,7 @@ pub fn run(args: EnvCapsuleArgs) -> i32 {
         // Only removes an empty dir: nothing was captured into it.
         let _ = std::fs::remove_dir(&out_root);
     }
-    let skipped = match selection_refused {
+    let skipped = match selection_refused + no_world {
         0 => String::new(),
         n => format!("; {n} finding(s) skipped"),
     };
@@ -154,19 +176,32 @@ pub fn run(args: EnvCapsuleArgs) -> i32 {
         "bhf env-capsule: {made} capsule(s) in {} ({reproduced} verified to replay{skipped})",
         out_root.display()
     );
-    if failed > 0 || made == 0 || (requested && reproduced < made) {
-        1
-    } else {
-        0
+    if made == 0 && failed == 0 && !requested {
+        bhfeprintln!(
+            "bhf env-capsule: nothing captured: none of the {taken} finding(s) it can take \
+             crashed while the shim served a faked resource"
+        );
     }
+    repro_lane::exit_code(&repro_lane::RunTally {
+        requested,
+        made,
+        verified: reproduced,
+        failed,
+    })
 }
 
 struct FindingRef {
     id: String,
     harness_id: String,
-    lang: &'static str,
+    lane: &'static dyn Lane,
     /// The built harness executable.
     binary: PathBuf,
+    /// How it takes its input.
+    protocol: HarnessProtocol,
+    /// The shim's faking mode the finding fired under (`fuzz_driven`, `rng`).
+    mode: String,
+    /// The environment variables the fuzz loop injected for it.
+    env: Vec<(String, String)>,
     /// The finding's crash inputs, minimized first.
     inputs: Vec<PathBuf>,
 }
@@ -200,7 +235,7 @@ fn build_env_capsule(
     let mut recorded: Option<PathBuf> = None;
     for cand in candidates.iter().take(MAX_CANDIDATES) {
         let _ = std::fs::remove_file(&world_tmp);
-        if replay_crashes(bin, cand, ld_preload, Some(&world_tmp), None)
+        if replay_crashes(f, bin, cand, ld_preload, Some(&world_tmp), None)
             && world_tmp.is_file()
             && std::fs::metadata(&world_tmp)
                 .map(|m| m.len() > 0)
@@ -239,6 +274,7 @@ fn build_env_capsule(
     for input in tries {
         std::fs::copy(input, cap.join("input.bin"))?;
         if replay_crashes(
+            f,
             &cap.join("main"),
             &cap.join("input.bin"),
             "./libbhf_runtrace.so",
@@ -258,7 +294,7 @@ fn build_env_capsule(
         }
     };
 
-    std::fs::write(cap.join("replay.sh"), replay_script())?;
+    std::fs::write(cap.join("replay.sh"), replay_script(f))?;
     set_executable(&cap.join("replay.sh"));
     let name = input_for_capsule
         .file_name()
@@ -270,7 +306,7 @@ fn build_env_capsule(
         format!("corpus/{}/queue/{name}", f.harness_id)
     };
     write_manifest(cap, f, &input_source, reproduced)?;
-    std::fs::write(cap.join("README.md"), readme(&f.id))?;
+    std::fs::write(cap.join("README.md"), readme(&f.id, f.protocol))?;
 
     let final_dir = out_root.join(format!("env_capsule_{}", f.id));
     if final_dir.exists() {
@@ -292,12 +328,14 @@ fn build_env_capsule(
 
 /// Replay `input` through `bin` under the shim in a faking pass. `record` pins a
 /// `BHF_ENVCAP_RECORD` log; `replay` pins a `BHF_ENVCAP_REPLAY` world.
-/// Returns whether a sanitizer crash was observed.
+/// Returns whether the lane's crash oracle saw a crash: a sanitizer report,
+/// or for an Ada harness an unhandled exception in its event log.
 ///
 /// The harness runs in its own dir, so every path handed to it is made
 /// absolute first: a relative `--work-dir` would otherwise resolve against the
 /// binary's dir and nothing would run.
 fn replay_crashes(
+    f: &FindingRef,
     bin: &Path,
     input: &Path,
     ld_preload: &str,
@@ -307,38 +345,63 @@ fn replay_crashes(
     let absolute = |path: &Path| std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     let bin = absolute(bin);
     let dir = bin.parent().unwrap_or(Path::new("."));
-    let mut cmd = timeout_wrap(&bin);
-    cmd.arg(absolute(input))
-        .current_dir(dir)
+    let mut cmd = Command::new(&bin);
+    cmd.current_dir(dir)
         .env("LD_PRELOAD", ld_preload)
-        .env("BHF_RUNTRACE_MODE", "fuzz_driven")
+        .env("BHF_RUNTRACE_MODE", &f.mode)
+        .envs(f.env.iter().map(|(key, value)| (key, value)))
         .env(
             "ASAN_OPTIONS",
             "abort_on_error=1:symbolize=0:detect_leaks=0",
-        );
+        )
+        .env_remove("BHF_FRAMED");
     if let Some(rec) = record {
         cmd.env("BHF_ENVCAP_RECORD", absolute(rec));
     }
     if let Some(rep) = replay {
         cmd.env("BHF_ENVCAP_REPLAY", absolute(rep));
     }
-    let Ok(out) = cmd.output() else {
+    let outcome = match f.protocol {
+        HarnessProtocol::StdinEventLog => {
+            let Ok(scratch) = tempfile::Builder::new()
+                .prefix("bhf-envcap-events-")
+                .tempdir()
+            else {
+                return false;
+            };
+            let events = scratch.path().join("events.bin");
+            cmd.env("BHF_EVENTS_PATH", &events);
+            let Ok(bytes) = std::fs::read(input) else {
+                return false;
+            };
+            repro_lane::run_with_stdin(cmd, bytes, REPLAY_TIMEOUT)
+                .ok()
+                .map(|(out, timed_out)| ReplayOutput {
+                    stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+                    status: out.status,
+                    events: std::fs::read(&events).ok(),
+                    timed_out,
+                })
+        }
+        HarnessProtocol::BhfFramed | HarnessProtocol::LibFuzzerSingleInput => {
+            cmd.arg(absolute(input));
+            crate::command_output::output_with_timeout_flagged(&mut cmd, REPLAY_TIMEOUT)
+                .ok()
+                .map(|(out, timed_out)| ReplayOutput {
+                    stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+                    status: out.status,
+                    events: None,
+                    timed_out,
+                })
+        }
+    };
+    let Some(outcome) = outcome else {
         return false;
     };
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    stderr.contains("AddressSanitizer")
-        || stderr.contains("UndefinedBehaviorSanitizer")
-        || stderr.contains("runtime error:")
-}
-
-fn timeout_wrap(bin: &Path) -> Command {
-    if which::which("timeout").is_ok() {
-        let mut cmd = Command::new("timeout");
-        cmd.arg("-s").arg("KILL").arg("10").arg(bin);
-        cmd
-    } else {
-        Command::new(bin)
-    }
+    // A fatal signal alone is not evidence of the faked-environment crash.
+    f.lane
+        .crash_signature(&outcome)
+        .is_some_and(|signature| signature != "signal:crash")
 }
 
 /// The corpus queue inputs for a harness (bounded).
@@ -369,12 +432,16 @@ fn write_manifest(
         "bhf_version": env!("BHF_VERSION_FULL"),
         "finding_id": f.id,
         "harness_id": f.harness_id,
-        "lang": f.lang,
+        "lang": f.lane.tag(),
+        "language": f.lane.name(),
+        "protocol": f.protocol.label(),
         "world": "env-world.jsonl",
         "recorded_resources": world_resources,
         "input": "input.bin",
         "input_source": input_source,
         "replay": "sh replay.sh",
+        "runtime_mode": f.mode,
+        "env_injected": f.env.iter().map(|(key, _)| key).collect::<Vec<_>>(),
         "reproduced": reproduced,
         "note": "the shim serves the recorded bytes for each faked resource, so the crash \
                  reproduces deterministically from the pinned environment even when the primary \
@@ -393,18 +460,73 @@ fn count_world_resources(world: &Path) -> usize {
         .unwrap_or(0)
 }
 
-fn replay_script() -> &'static str {
-    "#!/bin/sh\n\
-     # Reproduce the crash by replaying the recorded faked environment.\n\
-     cd \"$(dirname \"$0\")\"\n\
-     LD_PRELOAD=./libbhf_runtrace.so \\\n\
-     \x20 BHF_RUNTRACE_MODE=fuzz_driven \\\n\
-     \x20 BHF_ENVCAP_REPLAY=env-world.jsonl \\\n\
-     \x20 ASAN_OPTIONS=abort_on_error=1:symbolize=0 \\\n\
-     \x20 ./main input.bin\n"
+/// The shim mode and injected environment the finding fired under
+/// (`finding.json` `runtime_mode`): the env-capsule records and replays the
+/// world the same way. A finding from bhf's RNG pass was served pseudo-random
+/// bytes, which a harness that does not hand its input to the shim (an Ada
+/// harness) needs to see again.
+fn recorded_world(raw: &serde_json::Value) -> (String, Vec<(String, String)>) {
+    let mode = raw
+        .pointer("/runtime_mode/pass")
+        .and_then(serde_json::Value::as_str)
+        .filter(|pass| matches!(*pass, "rng" | "fuzz_driven"))
+        .unwrap_or("fuzz_driven")
+        .to_owned();
+    let env = raw
+        .pointer("/runtime_mode/env_injected")
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter(|(key, _)| {
+            !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+        .filter_map(|(key, value)| Some((key.clone(), value.as_str()?.to_owned())))
+        .collect();
+    (mode, env)
 }
 
-fn readme(id: &str) -> String {
+fn replay_script(f: &FindingRef) -> String {
+    // The Ada runtime reads its input from stdin (a pipe: it re-opens
+    // /dev/stdin, so a redirected file is read again and again) and reports
+    // what it raised in its event log.
+    let (feed, events, argument) = match f.protocol {
+        HarnessProtocol::StdinEventLog => (
+            "cat input.bin | ",
+            "\x20 BHF_EVENTS_PATH=events.bin \\\n".to_owned(),
+            "",
+        ),
+        HarnessProtocol::BhfFramed | HarnessProtocol::LibFuzzerSingleInput => {
+            ("", String::new(), " input.bin")
+        }
+    };
+    let env: String = f
+        .env
+        .iter()
+        .map(|(key, value)| format!("\x20 {key}={} \\\n", repro_lane::sh_word(value)))
+        .collect();
+    format!(
+        "#!/bin/sh\n\
+         # Reproduce the crash by replaying the recorded faked environment.\n\
+         cd \"$(dirname \"$0\")\"\n\
+         {feed}LD_PRELOAD=./libbhf_runtrace.so \\\n\
+         \x20 BHF_RUNTRACE_MODE={mode} \\\n\
+         \x20 BHF_ENVCAP_REPLAY=env-world.jsonl \\\n\
+         {events}\
+         {env}\
+         \x20 ASAN_OPTIONS=abort_on_error=1:symbolize=0 \\\n\
+         \x20 ./main{argument}\n",
+        mode = f.mode,
+    )
+}
+
+fn readme(id: &str, protocol: HarnessProtocol) -> String {
+    let crash = match protocol {
+        HarnessProtocol::StdinEventLog => {
+            "The harness is an Ada harness: it reads `input.bin` from stdin and records the\n\
+             exception it raised in `events.bin` (an unhandled one is the crash).\n\n"
+        }
+        HarnessProtocol::BhfFramed | HarnessProtocol::LibFuzzerSingleInput => "",
+    };
     format!(
         "# BHF environment capsule — {id}\n\n\
          Reproduces a crash driven by the shim-served (fuzzed) content of a \"trusted\"\n\
@@ -415,6 +537,7 @@ fn readme(id: &str) -> String {
          ```\n\n\
          The shim (`libbhf_runtrace.so`) serves each faked resource the exact bytes\n\
          in `env-world.jsonl`, so the crash fires even though `input.bin` may be empty.\n\n\
+         {crash}\
          ## Layout\n\n\
          - `main` — the fuzz harness binary\n\
          - `libbhf_runtrace.so` — the resource-virtualization shim\n\
@@ -473,7 +596,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_shipped_input_is_the_first_that_replays_under_the_recorded_world() {
-        if which::which("timeout").is_err() || which::which("head").is_err() {
+        if which::which("head").is_err() {
             return;
         }
         let root = tempfile::tempdir().unwrap();
@@ -490,8 +613,11 @@ mod tests {
         let f = FindingRef {
             id: "F-0001-0000aaaa".to_owned(),
             harness_id: "H-C0001-0000ABCD".to_owned(),
-            lang: "c",
+            lane: &repro_lane::C_LANE,
             binary,
+            protocol: HarnessProtocol::BhfFramed,
+            mode: "fuzz_driven".to_owned(),
+            env: Vec::new(),
             inputs: repro_lane::crash_inputs(&finding),
         };
         let out_root = work.join("env-capsules");
@@ -510,10 +636,56 @@ mod tests {
         assert_eq!(manifest["reproduced"], true, "{manifest}");
     }
 
+    /// The env-capsule records under the shim mode the finding fired in and
+    /// with the environment the fuzz loop injected for it.
+    #[test]
+    fn the_world_is_recorded_the_way_the_finding_fired() {
+        let raw = serde_json::json!({"runtime_mode": {
+            "pass": "rng",
+            "env_injected": {"WIDGET_HOME": "/tmp/bhf/fake_env/WIDGET_HOME", "bad key": "x"},
+        }});
+        let (mode, env) = recorded_world(&raw);
+        assert_eq!(mode, "rng");
+        assert_eq!(
+            env,
+            vec![(
+                "WIDGET_HOME".to_owned(),
+                "/tmp/bhf/fake_env/WIDGET_HOME".to_owned()
+            )]
+        );
+        let (mode, env) = recorded_world(&serde_json::json!({"runtime_mode": {"pass": "empty"}}));
+        assert_eq!(
+            mode, "fuzz_driven",
+            "an empty pass serves no bytes to record"
+        );
+        assert!(env.is_empty());
+    }
+
     #[test]
     fn replay_script_pins_replay_env() {
-        let s = replay_script();
+        let finding = |protocol| FindingRef {
+            id: "F-0001-0000aaaa".to_owned(),
+            harness_id: "H-C0001-0000ABCD".to_owned(),
+            lane: &repro_lane::C_LANE,
+            binary: PathBuf::from("main"),
+            protocol,
+            mode: "fuzz_driven".to_owned(),
+            env: vec![("WIDGET_HOME".to_owned(), "/tmp/bhf/fake env".to_owned())],
+            inputs: Vec::new(),
+        };
+        let s = replay_script(&finding(HarnessProtocol::BhfFramed));
+        assert!(s.contains("BHF_RUNTRACE_MODE=fuzz_driven"), "{s}");
+        assert!(s.contains("WIDGET_HOME='/tmp/bhf/fake env'"), "{s}");
         assert!(s.contains("BHF_ENVCAP_REPLAY=env-world.jsonl"));
         assert!(s.contains("LD_PRELOAD=./libbhf_runtrace.so"));
+        assert!(s.contains("./main input.bin"), "{s}");
+        // An Ada harness reads stdin from a pipe and writes its event log.
+        let ada = replay_script(&finding(HarnessProtocol::StdinEventLog));
+        assert!(
+            ada.contains("cat input.bin | LD_PRELOAD=./libbhf_runtrace.so"),
+            "{ada}"
+        );
+        assert!(ada.contains("BHF_EVENTS_PATH=events.bin"), "{ada}");
+        assert!(!ada.contains("./main input.bin"), "{ada}");
     }
 }
