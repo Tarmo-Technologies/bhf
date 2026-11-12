@@ -47,6 +47,10 @@ fn fresh_shim(profile: &str) -> Option<PathBuf> {
                 "src/hooks/dlsym.rs",
                 "src/dlsym.rs",
                 "src/jsonl.rs",
+                "src/policy.rs",
+                "src/fakes/mode.rs",
+                "src/fakes/reporting.rs",
+                "src/symbolizer.rs",
             ]
             .iter()
             .filter_map(|relative| {
@@ -1271,5 +1275,78 @@ fn format_hooks_log_printf_formats_under_sanitizers_and_fortify() {
             }
         }
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// In a faking pass a missing file is replaced by a fake one, but never the
+/// vDSO's link-map name a sanitizer's symbolizer opens, and nothing once a
+/// sanitizer has started a report (the driver tells the shim through
+/// `bhf_shim_sanitizer_reporting`).
+#[test]
+fn pseudo_paths_and_paths_opened_during_a_sanitizer_report_are_not_faked() {
+    let Some(shim) = shim_so() else {
+        eprintln!("skipping: shim cdylib not built yet");
+        return;
+    };
+    let Some(cc) = cc() else {
+        eprintln!("skipping: no C compiler");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("bhf-shim-nofake-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("probe.c");
+    std::fs::write(
+        &src,
+        r#"
+        #include <errno.h>
+        #include <fcntl.h>
+        #include <stdio.h>
+        #include <unistd.h>
+        extern void bhf_shim_sanitizer_reporting(void) __attribute__((weak));
+        static void report(const char *label, const char *path) {
+            errno = 0;
+            int fd = open(path, O_RDONLY);
+            printf("%s fd=%d errno=%d\n", label, fd >= 0 ? 1 : -1, fd >= 0 ? 0 : errno);
+            if (fd >= 0) close(fd);
+        }
+        int main(int argc, char **argv) {
+            if (argc < 2) return 1;
+            report("vdso", "linux-vdso.so.1");
+            report("missing-before", argv[1]);
+            if (!bhf_shim_sanitizer_reporting) return 2;
+            bhf_shim_sanitizer_reporting();
+            report("missing-after", argv[1]);
+            return 0;
+        }
+    "#,
+    )
+    .unwrap();
+    let bin = dir.join("probe");
+    let built = Command::new(cc)
+        .arg(&src)
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .unwrap();
+    assert!(built.success(), "probe failed to compile");
+    let missing = format!("/nonexistent-bhf-{}/widget.cfg", std::process::id());
+    let log = dir.join("rt.jsonl");
+    let output = Command::new(&bin)
+        .arg(&missing)
+        .env("LD_PRELOAD", &shim)
+        .env("BHF_RUNTRACE_LOG", &log)
+        .env("BHF_RUNTRACE_MODE", "empty")
+        .output()
+        .expect("spawn probe");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{:?}\n{stdout}", output.status);
+    assert!(stdout.contains("vdso fd=-1 errno=2"), "{stdout}");
+    assert!(
+        stdout.contains("missing-before fd=1 errno=0"),
+        "an ordinary missing file is faked in an empty pass: {stdout}"
+    );
+    assert!(stdout.contains("missing-after fd=-1 errno=2"), "{stdout}");
+    let text = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(!text.contains("linux-vdso"), "{text}");
     let _ = std::fs::remove_dir_all(&dir);
 }

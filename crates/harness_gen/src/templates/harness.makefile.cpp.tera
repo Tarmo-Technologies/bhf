@@ -86,13 +86,42 @@ BHF_CONTEXT_C_FLAGS_MSVC = -O1 -g -fsanitize=address -fsanitize-coverage=inline-
 BHF_CONTEXT_C_FLAGS = $(if $(filter $(BHF_CXX_FAMILY),$(BHF_CC_FAMILY)),$(filter-out -std=%,$(CXXFLAGS)),$(if $(filter environment command,$(firstword $(origin CFLAGS))),$(CFLAGS),$(if $(filter gcc,$(BHF_CC_FAMILY)),$(BHF_CONTEXT_C_FLAGS_GCC),$(if $(filter msvc,$(BHF_CC_FAMILY)),$(BHF_CONTEXT_C_FLAGS_MSVC),$(BHF_CONTEXT_C_FLAGS_CLANG)))))
 # Toolchain additions from a `[toolchain]` config table or the --cxxflags /
 # --define / --sysroot ... flags. They are APPENDED, so they never drop bhf's
-# coverage or sanitizers. BHF_TOOLCHAIN_CPPFLAGS (defines, include dirs)
-# applies to every lane; the others only to the lanes built with $(CXX).
+# coverage or sanitizers. Every lane takes BHF_TOOLCHAIN_CPPFLAGS (defines,
+# include dirs), BHF_TOOLCHAIN_CXX_CPPFLAGS (the preprocessor words of the C++
+# flags: -D, -U, -I, -isystem, -include; a C unit gets those of the C flags,
+# BHF_TOOLCHAIN_C_CPPFLAGS) and BHF_TOOLCHAIN_LIBS (the library operands of the
+# link flags: -L, -l, archives and objects, -Wl,-rpath, -pthread), so the
+# coverage, AFL++, libFuzzer and differential builds see the same headers and
+# libraries as `main`. The rest of the C++ and link flags, which may be
+# specific to the toolchain's compiler, reach only the lanes built with $(CXX).
 BHF_TOOLCHAIN_CFLAGS ?=
 BHF_TOOLCHAIN_CXXFLAGS ?=
 BHF_TOOLCHAIN_CPPFLAGS ?=
+BHF_TOOLCHAIN_C_CPPFLAGS ?=
+BHF_TOOLCHAIN_CXX_CPPFLAGS ?=
 BHF_TOOLCHAIN_LDFLAGS ?=
+BHF_TOOLCHAIN_LIBS ?=
 BHF_TOOLCHAIN_TARGET_FLAGS ?=
+# The C++ flags that bhf's C driver object (compiled `-x c` by $(CXX)) may take:
+# the ones that select the ABI or target (-m*, --target=, -fPIC, -D, -I, ...).
+# bhf computes them from the C++ flags; a C++-only flag such as
+# `-include iostream`, `-std=` or `-fno-rtti` would break the C compile.
+BHF_TOOLCHAIN_DRIVER_CXXFLAGS ?=
+# The -D, -U, -I and -isystem words of the C flags, for the driver as well.
+BHF_TOOLCHAIN_DRIVER_CFLAGS ?=
+# glibc's _FORTIFY_SOURCE, which Ubuntu's gcc defines whenever it optimizes,
+# turns an overflow in a fortified call (strcpy, memcpy, sprintf) into its own
+# `*** buffer overflow detected ***` abort before AddressSanitizer can report
+# it. A lane built with a sanitizer turns it off, after the build context's
+# and the toolchain's own flags; a lane without one keeps the platform's
+# fortification. The compiler hands -Wp, words to the preprocessor after every
+# -D and -U, so a -Wp,-D_FORTIFY_SOURCE=N (Fedora's, RHEL's and Arch's build
+# flags) would beat a plain -U: the override ends with the -Wp, spelling, and
+# the plain -U keeps gcc's own default define out. No plain -D, which clang
+# would warn a later -Wp,-D redefines (fatal under -Werror). Harmless for
+# clang.
+BHF_NO_FORTIFY = -U_FORTIFY_SOURCE -Wp,-U_FORTIFY_SOURCE -Wp,-D_FORTIFY_SOURCE=0
+BHF_SANITIZED_NO_FORTIFY = $(if $(filter -fsanitize=%,$(1)),$(BHF_NO_FORTIFY))
 # Optional project-level C++ compatibility fragment, the counterpart of the C
 # side's c_compat.mk. Auto writes it only after a build fails on a construct
 # just one compiler dialect accepts (a member declared with its own class's
@@ -142,11 +171,11 @@ DIFF_CXX ?= clang++
 DIFF_CXXFLAGS ?= -O2 -g -std=$(CXX_STD) -Wno-reserved-user-defined-literal -fsanitize=address
 BHF_DRIVER_SOURCE ?= {{ bhf_driver_source }}
 BHF_DRIVER_CFLAGS ?= -O1 -g
-# bhf's driver is C compiled by $(CXX), and takes the toolchain's C and C++
-# flags too, so a flag that selects the ABI (-m32, -mabi=..., -mbig-endian)
-# applies to every object of the link. Its dialect and warning policy stay
-# bhf's own: -std= and -Werror are left out.
-BHF_DRIVER_TOOLCHAIN_CFLAGS = $(filter-out -std=% -Werror% -pedantic-errors,$(BHF_TOOLCHAIN_CFLAGS) $(BHF_TOOLCHAIN_CXXFLAGS))
+# bhf's driver is C compiled by $(CXX), and takes the toolchain's C flags and
+# the driver-safe part of its C++ flags too, so a flag that selects the ABI
+# (-m32, -mabi=..., -mbig-endian) applies to every object of the link. Its
+# dialect and warning policy stay bhf's own: -std= and -Werror are left out.
+BHF_DRIVER_TOOLCHAIN_CFLAGS = $(filter-out -std=% -Werror% -pedantic-errors,$(BHF_TOOLCHAIN_CFLAGS) $(BHF_TOOLCHAIN_DRIVER_CFLAGS) $(BHF_TOOLCHAIN_DRIVER_CXXFLAGS))
 # POSIX feature-test macros as command-line -D: a force-included project
 # header can lock glibc's feature-test macros in before the harness source's
 # own `#define _GNU_SOURCE` is seen, which under a strict `-std=` from the
@@ -165,7 +194,7 @@ BUILD_CONTEXT_LDFLAGS = {% for flag in link_flags %}{{ flag }}{% if not loop.las
 # compilers in the same harness directory (bhf's gcc retry, a cross build, a
 # different CXX= between runs) therefore rebuilds bhf_driver.o and relinks,
 # instead of linking objects the previous compiler produced.
-BHF_TOOLCHAIN_ID = $(CXX) $(BHF_CXX_FAMILY) $(CC) $(COV_CXX) $(DIFF_CXX) | $(CXXFLAGS) | $(CXX_COMPAT_FLAGS) | $(BHF_DRIVER_CFLAGS) | $(BHF_TOOLCHAIN_TARGET_FLAGS) | $(BHF_TOOLCHAIN_CFLAGS) | $(BHF_TOOLCHAIN_CXXFLAGS) | $(BHF_TOOLCHAIN_CPPFLAGS) | $(BHF_TOOLCHAIN_LDFLAGS)
+BHF_TOOLCHAIN_ID = $(CXX) $(BHF_CXX_FAMILY) $(CC) $(COV_CXX) $(DIFF_CXX) | $(CXXFLAGS) | $(CXX_COMPAT_FLAGS) | $(BHF_DRIVER_CFLAGS) | $(BHF_TOOLCHAIN_TARGET_FLAGS) | $(BHF_TOOLCHAIN_CFLAGS) | $(BHF_TOOLCHAIN_CXXFLAGS) | $(BHF_TOOLCHAIN_CPPFLAGS) | $(BHF_TOOLCHAIN_CXX_CPPFLAGS) | $(BHF_TOOLCHAIN_C_CPPFLAGS) | $(BHF_TOOLCHAIN_DRIVER_CXXFLAGS) | $(BHF_TOOLCHAIN_DRIVER_CFLAGS) | $(BHF_TOOLCHAIN_LDFLAGS) | $(BHF_TOOLCHAIN_LIBS)
 -include build_context_objects.mk
 -include repair_context_objects.mk
 CONTEXT_MAIN_OBJECTS ?=
@@ -205,7 +234,7 @@ bhf_driver_diff.o:{% if bhf_driver_prereq %} $(BHF_DRIVER_SOURCE){% endif %} bhf
 	$(DIFF_CXX) -x c $(BHF_DRIVER_CFLAGS) $(FEATURE_TEST_FLAGS) -c -o $@ $(BHF_DRIVER_SOURCE)
 
 main: main.cpp bhf_driver.o bhf_toolchain.stamp $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS)
-	$(CXX) $(CXXFLAGS) $(SECTION_FLAGS) $(CXX_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(BHF_TOOLCHAIN_TARGET_FLAGS) $(BHF_TOOLCHAIN_CXXFLAGS) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) -DBHF_EXTERNAL_DRIVER -o $@ main.cpp{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS) $(AUTO_EXTRA_SOURCES) bhf_driver.o $(BUILD_CONTEXT_LDFLAGS) $(SECTION_LDFLAGS) $(AUTO_EXTRA_LDFLAGS) $(BHF_TOOLCHAIN_LDFLAGS)
+	$(CXX) $(CXXFLAGS) $(SECTION_FLAGS) $(CXX_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(BHF_TOOLCHAIN_TARGET_FLAGS) $(BHF_TOOLCHAIN_CXXFLAGS) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) $(BHF_TOOLCHAIN_CXX_CPPFLAGS) $(call BHF_SANITIZED_NO_FORTIFY,$(CXXFLAGS)) -DBHF_EXTERNAL_DRIVER -o $@ main.cpp{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS) $(AUTO_EXTRA_SOURCES) bhf_driver.o $(BUILD_CONTEXT_LDFLAGS) $(SECTION_LDFLAGS) $(AUTO_EXTRA_LDFLAGS) $(BHF_TOOLCHAIN_LDFLAGS) $(BHF_TOOLCHAIN_LIBS)
 
 # Semantic check only: the same translation units under the same flags as
 # `main`, minus code generation and the link. The repair loop reads compiler
@@ -216,12 +245,12 @@ main: main.cpp bhf_driver.o bhf_toolchain.stamp $(CONTEXT_MAIN_OBJECTS) $(REPAIR
 # this mode — they are found by the real build, which still runs before any
 # target is called successful.
 syntaxcheck: main.cpp
-	$(CXX) $(CXXFLAGS) $(SECTION_FLAGS) $(CXX_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(BHF_TOOLCHAIN_TARGET_FLAGS) $(BHF_TOOLCHAIN_CXXFLAGS) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) -DBHF_EXTERNAL_DRIVER -fsyntax-only main.cpp{% for src in target_sources %} {{ src }}{% endfor %} $(AUTO_EXTRA_SOURCES)
+	$(CXX) $(CXXFLAGS) $(SECTION_FLAGS) $(CXX_COMPAT_FLAGS) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(BHF_TOOLCHAIN_TARGET_FLAGS) $(BHF_TOOLCHAIN_CXXFLAGS) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) $(BHF_TOOLCHAIN_CXX_CPPFLAGS) $(call BHF_SANITIZED_NO_FORTIFY,$(CXXFLAGS)) -DBHF_EXTERNAL_DRIVER -fsyntax-only main.cpp{% for src in target_sources %} {{ src }}{% endfor %} $(AUTO_EXTRA_SOURCES)
 
 afl: main_afl
 
 main_afl: main.cpp $(CONTEXT_AFL_OBJECTS) $(REPAIR_CONTEXT_AFL_OBJECTS)
-	$(AFLPP_CXX) $(AFLPP_CXXFLAGS) $(SECTION_FLAGS) $(CXX_COMPAT_FLAGS_CLANG) $(COMPILE_DB_FLAGS) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) -o $@ main.cpp{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_AFL_OBJECTS) $(REPAIR_CONTEXT_AFL_OBJECTS) $(AUTO_EXTRA_SOURCES) $(BUILD_CONTEXT_LDFLAGS) $(SECTION_LDFLAGS) $(AUTO_EXTRA_LDFLAGS)
+	$(AFLPP_CXX) $(AFLPP_CXXFLAGS) $(SECTION_FLAGS) $(CXX_COMPAT_FLAGS_CLANG) $(COMPILE_DB_FLAGS) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) $(BHF_TOOLCHAIN_CXX_CPPFLAGS) $(call BHF_SANITIZED_NO_FORTIFY,$(AFLPP_CXXFLAGS)) -o $@ main.cpp{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_AFL_OBJECTS) $(REPAIR_CONTEXT_AFL_OBJECTS) $(AUTO_EXTRA_SOURCES) $(BUILD_CONTEXT_LDFLAGS) $(SECTION_LDFLAGS) $(AUTO_EXTRA_LDFLAGS) $(BHF_TOOLCHAIN_LIBS)
 
 # Portable libFuzzer binary (also drivable by Mayhem coverage-guided / honggfuzz).
 libfuzzer: main_libfuzzer
@@ -232,7 +261,7 @@ libfuzzer: main_libfuzzer
 # main.cpp (bhf's driver around the same entry point) nor a shim is compiled.
 # See PORTABILITY.md.
 main_libfuzzer: $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS)
-	$(LIBFUZZER_CXX) $(LIBFUZZER_CXXFLAGS) $(SECTION_FLAGS) $(CXX_COMPAT_FLAGS_CLANG) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) -o $@{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS) $(AUTO_EXTRA_SOURCES) $(BUILD_CONTEXT_LDFLAGS) $(SECTION_LDFLAGS) $(AUTO_EXTRA_LDFLAGS)
+	$(LIBFUZZER_CXX) $(LIBFUZZER_CXXFLAGS) $(SECTION_FLAGS) $(CXX_COMPAT_FLAGS_CLANG) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) $(BHF_TOOLCHAIN_CXX_CPPFLAGS) $(call BHF_SANITIZED_NO_FORTIFY,$(LIBFUZZER_CXXFLAGS)) -o $@{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS) $(AUTO_EXTRA_SOURCES) $(BUILD_CONTEXT_LDFLAGS) $(SECTION_LDFLAGS) $(AUTO_EXTRA_LDFLAGS) $(BHF_TOOLCHAIN_LIBS)
 {%- else %}
 
 # The shim is C; compile it `-x c` into its own object (the C++ `main.cpp` declares
@@ -241,18 +270,18 @@ bhf_libfuzzer.o: bhf_libfuzzer.c
 	$(LIBFUZZER_CXX) -x c -O1 -g -fno-omit-frame-pointer -fsanitize=fuzzer,address,undefined -c -o $@ bhf_libfuzzer.c
 
 main_libfuzzer: main.cpp bhf_libfuzzer.o $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS)
-	$(LIBFUZZER_CXX) $(LIBFUZZER_CXXFLAGS) $(SECTION_FLAGS) $(CXX_COMPAT_FLAGS_CLANG) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) -DBHF_EXTERNAL_DRIVER -o $@ main.cpp bhf_libfuzzer.o{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS) $(AUTO_EXTRA_SOURCES) $(BUILD_CONTEXT_LDFLAGS) $(SECTION_LDFLAGS) $(AUTO_EXTRA_LDFLAGS)
+	$(LIBFUZZER_CXX) $(LIBFUZZER_CXXFLAGS) $(SECTION_FLAGS) $(CXX_COMPAT_FLAGS_CLANG) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) $(BHF_TOOLCHAIN_CXX_CPPFLAGS) $(call BHF_SANITIZED_NO_FORTIFY,$(LIBFUZZER_CXXFLAGS)) -DBHF_EXTERNAL_DRIVER -o $@ main.cpp bhf_libfuzzer.o{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_MAIN_OBJECTS) $(REPAIR_CONTEXT_MAIN_OBJECTS) $(AUTO_EXTRA_SOURCES) $(BUILD_CONTEXT_LDFLAGS) $(SECTION_LDFLAGS) $(AUTO_EXTRA_LDFLAGS) $(BHF_TOOLCHAIN_LIBS)
 {%- endif %}
 
 cov: main_cov
 
 main_cov: main.cpp bhf_driver_cov.o $(CONTEXT_COV_OBJECTS) $(REPAIR_CONTEXT_COV_OBJECTS)
-	$(COV_CXX) $(COV_CXXFLAGS) $(SECTION_FLAGS) $(CXX_COMPAT_FLAGS_CLANG) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) -DBHF_EXTERNAL_DRIVER -o $@ main.cpp{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_COV_OBJECTS) $(REPAIR_CONTEXT_COV_OBJECTS) $(AUTO_EXTRA_SOURCES) bhf_driver_cov.o $(BUILD_CONTEXT_LDFLAGS) $(SECTION_LDFLAGS) $(AUTO_EXTRA_LDFLAGS)
+	$(COV_CXX) $(COV_CXXFLAGS) $(SECTION_FLAGS) $(CXX_COMPAT_FLAGS_CLANG) $(FEATURE_TEST_FLAGS) $(COMPILE_DB_FLAGS) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) $(BHF_TOOLCHAIN_CXX_CPPFLAGS) $(call BHF_SANITIZED_NO_FORTIFY,$(COV_CXXFLAGS)) -DBHF_EXTERNAL_DRIVER -o $@ main.cpp{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_COV_OBJECTS) $(REPAIR_CONTEXT_COV_OBJECTS) $(AUTO_EXTRA_SOURCES) bhf_driver_cov.o $(BUILD_CONTEXT_LDFLAGS) $(SECTION_LDFLAGS) $(AUTO_EXTRA_LDFLAGS) $(BHF_TOOLCHAIN_LIBS)
 
 diff: main_diff
 
 main_diff: main.cpp bhf_driver_diff.o $(CONTEXT_DIFF_OBJECTS) $(REPAIR_CONTEXT_DIFF_OBJECTS)
-	$(DIFF_CXX) $(DIFF_CXXFLAGS) $(SECTION_FLAGS) $(CXX_COMPAT_FLAGS_CLANG) $(COMPILE_DB_FLAGS) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) -DBHF_EXTERNAL_DRIVER -o $@ main.cpp{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_DIFF_OBJECTS) $(REPAIR_CONTEXT_DIFF_OBJECTS) $(AUTO_EXTRA_SOURCES) bhf_driver_diff.o $(BUILD_CONTEXT_LDFLAGS) $(SECTION_LDFLAGS) $(AUTO_EXTRA_LDFLAGS)
+	$(DIFF_CXX) $(DIFF_CXXFLAGS) $(SECTION_FLAGS) $(CXX_COMPAT_FLAGS_CLANG) $(COMPILE_DB_FLAGS) $(INCLUDES) $(AUTO_EXTRA_INCLUDES) $(BHF_TOOLCHAIN_CPPFLAGS) $(BHF_TOOLCHAIN_CXX_CPPFLAGS) $(call BHF_SANITIZED_NO_FORTIFY,$(DIFF_CXXFLAGS)) -DBHF_EXTERNAL_DRIVER -o $@ main.cpp{% for src in target_sources %} {{ src }}{% endfor %} $(CONTEXT_DIFF_OBJECTS) $(REPAIR_CONTEXT_DIFF_OBJECTS) $(AUTO_EXTRA_SOURCES) bhf_driver_diff.o $(BUILD_CONTEXT_LDFLAGS) $(SECTION_LDFLAGS) $(AUTO_EXTRA_LDFLAGS) $(BHF_TOOLCHAIN_LIBS)
 
 clean:
 	rm -f main main_afl main_libfuzzer main_cov main_diff bhf_driver.o bhf_driver_cov.o bhf_driver_diff.o bhf_libfuzzer.o bhf_toolchain.stamp

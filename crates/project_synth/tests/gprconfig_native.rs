@@ -48,6 +48,7 @@ fn a_native_tool_prefix_configures_gprbuild_for_the_host_gnat() {
     let spec = ProjectSpec {
         project_name: "Bhf_Build".to_owned(),
         extends_project: None,
+        parent_compiler: None,
         source_roots: vec![SourceRoot {
             path: src.clone(),
             language: "Ada".to_owned(),

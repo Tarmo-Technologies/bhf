@@ -81,6 +81,25 @@ impl CompilerFamily {
     }
 }
 
+/// The words a sanitized GCC or clang compile ends with to turn glibc's
+/// `_FORTIFY_SOURCE` off, whose own `*** buffer overflow detected ***` abort
+/// would otherwise pre-empt AddressSanitizer's report of an overflowing
+/// `strcpy`/`memcpy`. They go after every other flag of the compile.
+///
+/// The driver hands `-Wp,` words to the preprocessor after every `-D`/`-U`,
+/// so a `-Wp,-D_FORTIFY_SOURCE=N` from the build flags (Fedora, RHEL and Arch
+/// spell it so) beats any plain `-D`/`-U`: the override ends with the same
+/// spelling. The plain `-U_FORTIFY_SOURCE` keeps GCC's own spec (Ubuntu's gcc
+/// defines `_FORTIFY_SOURCE` whenever it optimizes) from adding its define,
+/// which a `-Wp,` word does not. There is no plain `-D_FORTIFY_SOURCE=0`:
+/// clang would warn that a project's later `-Wp,-D` redefines it, and a
+/// `-Werror` build would fail on the warning.
+pub const SANITIZED_NO_FORTIFY: &[&str] = &[
+    "-U_FORTIFY_SOURCE",
+    "-Wp,-U_FORTIFY_SOURCE",
+    "-Wp,-D_FORTIFY_SOURCE=0",
+];
+
 /// A recognised compiler driver: its family and whether it is the C++ driver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompilerDriver {
@@ -390,5 +409,48 @@ mod tests {
             family_from_predefined_macros("#define _MSC_VER 1944\n#define __clang__ 1\n"),
             Some(CompilerFamily::Clang)
         );
+    }
+    /// The fortify override wins over a project's or a platform's
+    /// `_FORTIFY_SOURCE` in either spelling: `-D` (Debian's build flags) and
+    /// `-Wp,-D` (Fedora's, RHEL's and Arch's), whose words the driver hands
+    /// the preprocessor after every `-D`/`-U`. It also does so without a
+    /// macro-redefinition warning, which a `-Werror` build would fail on.
+    #[test]
+    fn the_fortify_override_wins_over_either_spelling_without_a_warning() {
+        for compiler in ["gcc", "clang"] {
+            if std::process::Command::new(compiler)
+                .arg("--version")
+                .output()
+                .is_err()
+            {
+                eprintln!("skip: {compiler} unavailable");
+                continue;
+            }
+            for project in [
+                &[][..],
+                &["-D_FORTIFY_SOURCE=2"][..],
+                &["-Wp,-D_FORTIFY_SOURCE=2"][..],
+                &["-D_FORTIFY_SOURCE=2", "-Wp,-D_FORTIFY_SOURCE=3"][..],
+            ] {
+                let output = std::process::Command::new(compiler)
+                    .args(["-O2", "-Werror"])
+                    .args(project)
+                    .args(SANITIZED_NO_FORTIFY)
+                    .args(["-x", "c", "-dM", "-E", "-"])
+                    .stdin(std::process::Stdio::null())
+                    .output()
+                    .unwrap();
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(output.status.success(), "{compiler} {project:?}: {stderr}");
+                let value = String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .find_map(|line| line.strip_prefix("#define _FORTIFY_SOURCE "))
+                    .map(str::to_owned);
+                assert!(
+                    value.is_none() || value.as_deref() == Some("0"),
+                    "{compiler} {project:?}: _FORTIFY_SOURCE {value:?}"
+                );
+            }
+        }
     }
 }

@@ -60,4 +60,26 @@ mod tests {
             );
         }
     }
+    /// Both Makefiles turn fortification off with the words every other
+    /// sanitized compile bhf runs ends with (the gcc probe build, capsule
+    /// `build.sh`).
+    #[test]
+    fn both_makefiles_turn_fortify_off_with_the_shared_override() {
+        let expected = format!(
+            "BHF_NO_FORTIFY = {}\n",
+            crate::compiler_family::SANITIZED_NO_FORTIFY.join(" ")
+        );
+        for (name, makefile) in [
+            ("harness.makefile.tera", HARNESS_MAKEFILE_TEMPLATE),
+            ("harness.makefile.cpp.tera", HARNESS_MAKEFILE_CPP_TEMPLATE),
+        ] {
+            assert!(
+                makefile.contains(&expected),
+                "{name}: {:?}",
+                makefile
+                    .lines()
+                    .find(|line| line.starts_with("BHF_NO_FORTIFY"))
+            );
+        }
+    }
 }

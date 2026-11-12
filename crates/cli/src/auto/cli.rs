@@ -1047,6 +1047,23 @@ fn rebuild_probe_archives_for_sweep(
     linked
 }
 
+/// How many of `results` in `lang` failed to build, for the triage levers.
+fn failed_builds_in(
+    results: &[crate::auto::attempt::AttemptResult],
+    lang: crate::auto::candidate::Lang,
+) -> usize {
+    results
+        .iter()
+        .filter(|result| {
+            result.candidate.lang == lang
+                && matches!(
+                    result.outcome,
+                    crate::auto::attempt::Outcome::FailedBuild { .. }
+                )
+        })
+        .count()
+}
+
 /// Detect a CUSTOM build entry point in the tree root that bhf does NOT auto-probe
 /// (a bare build.sh, autotools, SCons, Waf, Bazel), returning `(marker, suggested
 /// --build-command value)`. CMake/Make/Meson are intentionally excluded — those are
@@ -1221,13 +1238,19 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     // flags laid over it. Validated before anything builds, and published to
     // this process's environment (CC/CXX + the BHF_TOOLCHAIN_* make variables)
     // before any worker starts, so every build and retry of the run uses it.
+    // A toolchain that cannot be used is a usage error (exit 2, as in bhf build).
     let toolchain =
-        crate::toolchain::resolve(args.config_toolchain.take(), args.toolchain.to_config())
+        match crate::toolchain::resolve(args.config_toolchain.take(), args.toolchain.to_config())
             .and_then(|toolchain| {
                 crate::toolchain::check_runnable(&toolchain)?;
                 Ok(toolchain)
-            })
-            .map_err(|error| anyhow::anyhow!("{error}"))?;
+            }) {
+            Ok(toolchain) => toolchain,
+            Err(error) => {
+                bhfeprintln!("error: {error}");
+                return Ok(2);
+            }
+        };
     let published =
         crate::toolchain::publish(&toolchain).map_err(|error| anyhow::anyhow!("{error}"))?;
     for note in &published.notes {
@@ -1668,6 +1691,19 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         crate::auto::report::write_dependency_checkpoint(&path, &work, &dependency_seed, &[])?;
     crate::auto::discovery::bhfprof("auto:dependency_checkpoint", _tdc);
     let _tmid = std::time::Instant::now();
+
+    // An Ada toolchain that is not installed would fail every Ada build: refuse
+    // the plan, the dry run included, naming the key.
+    if candidates
+        .iter()
+        .any(|candidate| candidate.lang == crate::auto::candidate::Lang::Ada)
+    {
+        if let Err(error) = crate::toolchain::check_ada_tools(&toolchain) {
+            bhfeprintln!("error: {error}");
+            finish_dependency_pointer(&work, &mut dependency_pointer_guard);
+            return Ok(2);
+        }
+    }
 
     // Planning/listing modes have completed all the work they promised. Their
     // requirement manifest used to retain `complete=false`, so even a clean
@@ -3155,6 +3191,8 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         crate::auto::triage::render_triage(&crate::auto::triage::TriageInputs {
             built_and_fuzzed: summary.built_and_fuzzed,
             failed_build: summary.failed_build,
+            failed_build_cpp: failed_builds_in(&results, crate::auto::candidate::Lang::Cpp),
+            failed_build_ada: failed_builds_in(&results, crate::auto::candidate::Lang::Ada),
             skipped: summary.skipped,
             skipped_missing_package: summary.skipped_missing_package,
             skipped_unsafe_path: results
@@ -4056,6 +4094,9 @@ struct AutoSummary {
     /// fabricated (placeholder headers, macro values, types): `<id> <name>:
     /// <what>`. Its findings are low confidence.
     fabricated_build_context: Vec<String>,
+    /// One line per extra build lane of a target that did not build: `<id>
+    /// <name>: line coverage unavailable: make main_cov failed: <error>`.
+    lost_lanes: Vec<String>,
     built: usize,
     /// #95: targets that built and ran fuzz passes but whose entry-instrumented
     /// (C/C++/Ada) harness never observed the target-entry checkpoint — the run
@@ -4123,6 +4164,7 @@ impl AutoSummary {
         let mut skipped = 0;
         let mut skipped_missing_package = 0;
         let mut fabricated_build_context = Vec::new();
+        let mut lost_lanes = Vec::new();
         let mut failed_build = 0;
         let mut link_errors = 0;
         let mut runtime_errors = 0;
@@ -4140,6 +4182,16 @@ impl AutoSummary {
 
         for r in results {
             files_with_targets.insert(r.candidate.source_path.as_path());
+            if is_built(&r.outcome) {
+                for line in
+                    crate::auto::lanes::unavailable(&crate::auto::lanes::read(&r.harness_dir))
+                {
+                    lost_lanes.push(format!(
+                        "{} {}: {line}",
+                        r.candidate.harness_id, r.candidate.name
+                    ));
+                }
+            }
             match &r.outcome {
                 BuiltAndFuzzed {
                     passes, repairs, ..
@@ -4277,6 +4329,7 @@ impl AutoSummary {
             built_and_fuzzed,
             fuzzed_stub_only,
             fabricated_build_context,
+            lost_lanes,
             built,
             built_not_entered,
             skipped,
@@ -4444,6 +4497,17 @@ impl AutoSummary {
                     "      … {} more",
                     self.fabricated_build_context.len() - SHOWN
                 );
+            }
+        }
+
+        if !self.lost_lanes.is_empty() {
+            let _ = writeln!(
+                s,
+                "  ⚠ Build lanes: {} lane(s) did not build (run.md, run.json targets[].lanes)",
+                self.lost_lanes.len()
+            );
+            for line in &self.lost_lanes {
+                let _ = writeln!(s, "      {line}");
             }
         }
 
@@ -7092,6 +7156,7 @@ mod tests {
             built_and_fuzzed: 12,
             fuzzed_stub_only: 0,
             fabricated_build_context: Vec::new(),
+            lost_lanes: Vec::new(),
             built: 0,
             built_not_entered: 0,
             skipped: 171,
@@ -7148,6 +7213,7 @@ mod tests {
             built_and_fuzzed: 0,
             fuzzed_stub_only: 0,
             fabricated_build_context: Vec::new(),
+            lost_lanes: Vec::new(),
             built: 0,
             built_not_entered: 0,
             skipped: 5,
@@ -7187,6 +7253,7 @@ mod tests {
             built_and_fuzzed: 20,
             fuzzed_stub_only: 0,
             fabricated_build_context: Vec::new(),
+            lost_lanes: Vec::new(),
             built: 0,
             built_not_entered: 0,
             skipped: 0,
@@ -7227,6 +7294,7 @@ mod tests {
             built_and_fuzzed: 2,
             fuzzed_stub_only: 0,
             fabricated_build_context: Vec::new(),
+            lost_lanes: Vec::new(),
             built: 0,
             built_not_entered: 0,
             skipped: 0,

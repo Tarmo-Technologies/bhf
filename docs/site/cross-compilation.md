@@ -23,8 +23,24 @@ the compilers; a clang compiler gets `--target=<triple>` instead. `--sysroot`,
 `--cflags`, `--cxxflags`, `--ldflags`, `--define` and `--toolchain-include`
 complete the toolchain. bhf announces the compilers it uses, and the generated
 Makefile picks GCC- or clang-spelled coverage and sanitizer flags from the
-compiler that actually runs. The binary is foreign, so run it under an emulator:
+compiler that actually runs. Whenever the selected compiler builds for a target
+this host cannot run (its `-dumpmachine`, so a `--toolchain` prefix or a cross
+`--cc` count too), `bhf build` says the binary needs an emulator. Name one with
+`--runner qemu-aarch64` (and `--runner-arg`, repeatable; a qemu-user runner
+defaults to `-L <sysroot>` or `-L /usr/<triple>`), or `toolchain.runner` /
+`runner-args`: bhf records it (schema `bhf.harness_runner.v1`) in
+`build/<id>/bhf_runner.json` and beside the harness, and a later native build
+of the harness forgets it. `bhf replay`, `bhf minimize`, `bhf fuzz`,
+`bhf decode-args`, `bhf corpus minimize`, `bhf report --backfill` and the
+finding's `replay.py` run the binary under the recorded runner when no
+`--qemu-user` is given (see [qemu-user Replay](#qemu-user-replay)). A runner
+for a build this host runs natively is an error, as in `bhf auto`; a compiler
+that does not name its target (`-dumpmachine` fails) keeps the runner, with
+its `--runner-arg`s, as given. Without one, run the binary under an emulator
+yourself:
 `bhf replay --qemu-user qemu-aarch64 --qemu-arg=-L --qemu-arg=/usr/aarch64-linux-gnu`.
+`[cross.<guard>]` tables in the config file apply to `bhf auto` only; `bhf
+build` names them and builds with the `[toolchain]` table.
 `--runtime`, `--probe-backend` and the `--ada-*` flags apply to Ada harnesses
 only; on a C/C++ harness they are an error rather than silently ignored.
 
@@ -47,13 +63,22 @@ prefix is never written as `Toolchain_Name`: that attribute takes a gprconfig
 compiler name, and a value such as `GNAT` or `GNAT_LLVM` given to `--toolchain`
 is written as `for Toolchain_Name ("Ada") use` instead. `--ada-gprbuild` /
 `--ada-gnat` name the programs explicitly, and `--ada-switch` appends compiler
-switches to bhf's own.
+switches to bhf's own. `--runner` / `toolchain.runner` apply to an Ada harness
+built for another target (the Ada target, else the prefix): bhf records the
+runner beside the binary (`build/<id>/obj/bhf_runner.json`) and beside the
+harness, where the same commands find it. A runner for an Ada harness built for this host is an error, as for a
+C/C++ one.
 
 The generated project `extends` the governing project, so its `Target`,
-`Runtime` and source settings are inherited, but its `package Compiler` is
-not: bhf writes its own `Default_Switches` (`-g`, assertions, coverage), which
-replace the parent project's. Switches such as `-O1` from the parent project
-are therefore not used; add the ones the harness needs with `--ada-switch` or
+`Runtime` and source settings are inherited. When the parent declares a
+`package Compiler`, the generated one extends it
+(`package Compiler extends <Parent>.Compiler is`) and sets
+`Default_Switches ("Ada")` to the parent's followed by bhf's own (`-g`,
+assertions, coverage, the dialect), so a switch the sources need (`-O1`, a
+`-gnateD` symbol an `#if` tests) and the parent's per-file `Switches` still
+apply, and bhf's win where the two conflict. `bhf build` prints the parent
+switches it merged. A parent without a `package Compiler` gets bhf's switches
+alone, as before. Add further switches with `--ada-switch` or
 `toolchain.ada.switches`.
 
 In a config file, `toolchain.ada.prefix` applies to Ada harnesses only. To
@@ -105,7 +130,8 @@ capture's `gate_capture.runner` names the emulator. `bhf replay`,
 `bhf minimize`, `bhf fuzz`, `bhf decode-args`, `bhf corpus minimize` and
 `bhf report --backfill` run such a harness under the recorded runner too
 when no `--qemu-user` is given (a binary `bhf build` staged into
-`build/<id>/main` uses the one recorded in its harness dir), with a
+`build/<id>/main` uses the one recorded beside it, else the one in its
+harness dir), with a
 `note: running <harness> under the recorded runner <program args>` line; the
 generated `replay.py` embeds it as `RUNNER` (override it with
 `BHF_REPLAY_RUNNER`). A harness whose ELF machine this host cannot run, with

@@ -21,6 +21,10 @@ pub struct TriageInputs<'a> {
     /// move or rename the path, not `--force`.
     pub skipped_unsafe_path: usize,
     pub report_only: usize,
+    /// Of `failed_build`, the C++ targets (the C++ dialect ladder applies).
+    pub failed_build_cpp: usize,
+    /// Of `failed_build`, the Ada targets (the GNAT toolchain applies).
+    pub failed_build_ada: usize,
     pub findings: usize,
     pub preflight: &'a PreflightReport,
     /// A detected custom build in the tree root, if any (marker, suggested command).
@@ -67,10 +71,23 @@ pub fn render_triage(inputs: &TriageInputs) -> String {
                 "\n      - if the tree has its own build, recover its flags: --build-command \"<your build>\"",
             ),
         }
-        s.push_str("\n      - old C++: the dialect ladder runs automatically; pin it with --cxx-std <std> if it still fails");
-        s.push_str(
-            "\n      - missing dependency headers: --extra-include <dir> / --extra-source <file>",
-        );
+        // The levers of the toolchain that failed: C/C++ headers and sources,
+        // the C++ dialect, the GNAT toolchain.
+        if inputs.failed_build_cpp > 0 {
+            s.push_str("\n      - old C++: the dialect ladder runs automatically; pin it with --cxx-std <std> if it still fails");
+        }
+        if inputs.failed_build > inputs.failed_build_ada {
+            s.push_str(
+                "\n      - missing dependency headers: --extra-include <dir> / --extra-source <file>",
+            );
+        }
+        if inputs.failed_build_ada > 0 {
+            s.push_str(
+                "\n      - Ada: check the GNAT toolchain — gprbuild and gnat on PATH, or \
+                 toolchain.ada.prefix (--ada-prefix) / toolchain.ada.gprbuild (--ada-gprbuild) — \
+                 and the switches the project needs (toolchain.ada.switches, --ada-switch)",
+            );
+        }
         s.push_str(
             "\n      - force past undefined symbols/types (stub-heavy, Low-confidence): --force",
         );
@@ -240,6 +257,8 @@ mod tests {
         let inputs = TriageInputs {
             built_and_fuzzed: 5,
             failed_build: 0,
+            failed_build_cpp: 0,
+            failed_build_ada: 0,
             skipped: 0,
             skipped_missing_package: 0,
             skipped_unsafe_path: 0,
@@ -256,6 +275,8 @@ mod tests {
         let inputs = TriageInputs {
             built_and_fuzzed: 0,
             failed_build: 3,
+            failed_build_cpp: 3,
+            failed_build_ada: 0,
             skipped: 2,
             skipped_missing_package: 0,
             skipped_unsafe_path: 0,
@@ -272,6 +293,47 @@ mod tests {
         assert!(text.contains("2 target(s) were skipped") && text.contains("--force"));
     }
 
+    /// The levers name the toolchain of what failed: C++'s dialect ladder only
+    /// for a C++ failure, the GNAT toolchain for an Ada one.
+    #[test]
+    fn failed_build_levers_follow_the_language_that_failed() {
+        let ada_only = TriageInputs {
+            built_and_fuzzed: 0,
+            failed_build: 2,
+            failed_build_cpp: 0,
+            failed_build_ada: 2,
+            skipped: 0,
+            skipped_missing_package: 0,
+            skipped_unsafe_path: 0,
+            report_only: 0,
+            findings: 0,
+            preflight: &healthy(),
+            custom_build: None,
+        };
+        let text = render_triage(&ada_only);
+        assert!(text.contains("2 target(s) failed to build"), "{text}");
+        assert!(
+            !text.contains("--cxx-std") && !text.contains("old C++"),
+            "{text}"
+        );
+        assert!(!text.contains("--extra-include"), "{text}");
+        assert!(
+            text.contains("gprbuild") && text.contains("toolchain.ada"),
+            "an Ada failure points at its toolchain:\n{text}"
+        );
+        let c_only = TriageInputs {
+            failed_build_cpp: 0,
+            failed_build_ada: 0,
+            ..ada_only
+        };
+        let text = render_triage(&c_only);
+        assert!(
+            !text.contains("--cxx-std") && !text.contains("gprbuild"),
+            "{text}"
+        );
+        assert!(text.contains("--extra-include"), "{text}");
+    }
+
     /// A target that skipped because a package isn't installed must be told to
     /// install it, not to run `--force`. Across a 534-project sweep this was the
     /// largest skip cause in the corpus, and every one of them was pointed at the
@@ -281,6 +343,8 @@ mod tests {
         let inputs = TriageInputs {
             built_and_fuzzed: 0,
             failed_build: 0,
+            failed_build_cpp: 0,
+            failed_build_ada: 0,
             skipped: 4,
             skipped_missing_package: 4,
             skipped_unsafe_path: 0,
@@ -311,6 +375,8 @@ mod tests {
         let inputs = TriageInputs {
             built_and_fuzzed: 1,
             failed_build: 0,
+            failed_build_cpp: 0,
+            failed_build_ada: 0,
             skipped: 7,
             skipped_missing_package: 5,
             skipped_unsafe_path: 0,
@@ -335,6 +401,8 @@ mod tests {
         let inputs = TriageInputs {
             built_and_fuzzed: 0,
             failed_build: 0,
+            failed_build_cpp: 0,
+            failed_build_ada: 0,
             skipped: 3,
             skipped_missing_package: 0,
             skipped_unsafe_path: 2,

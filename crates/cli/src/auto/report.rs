@@ -287,6 +287,11 @@ struct TargetEntry<'a> {
     /// there are none.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     real_headers_included: Vec<String>,
+    /// The harness's extra build lanes (`cov` for line coverage, `afl` for
+    /// AFL++) and whether each built, with the first error of one that did
+    /// not; omitted when none was attempted.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    lanes: std::collections::BTreeMap<String, crate::auto::lanes::LaneStatus>,
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -1333,6 +1338,7 @@ pub fn write_reports_with_output_limit(
                 }
                 _ => Vec::new(),
             },
+            lanes: crate::auto::lanes::read(&r.harness_dir),
         })
         .collect();
 
@@ -3073,6 +3079,20 @@ fn render_md(r: &RunJson<'_>) -> String {
                     t.name,
                     fidelity.summary()
                 );
+            }
+        }
+    }
+    // A lane that did not build (line coverage, AFL++) is a measurement or a
+    // campaign the run does not have; say so instead of reporting less silently.
+    if r.targets
+        .iter()
+        .any(|t| t.lanes.values().any(|lane| !lane.built))
+    {
+        let _ = writeln!(s);
+        let _ = writeln!(s, "## Build lanes that did not build");
+        for t in &r.targets {
+            for line in crate::auto::lanes::unavailable(&t.lanes) {
+                let _ = writeln!(s, "  - {} {} — {line}", t.harness_id, t.name);
             }
         }
     }

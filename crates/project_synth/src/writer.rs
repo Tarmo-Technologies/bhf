@@ -97,7 +97,6 @@ pub fn render_project(spec: &ProjectSpec) -> Result<String, ProjectSynthError> {
     }
 
     out.push('\n');
-    out.push_str("   package Compiler is\n");
     let switches = spec
         .switches
         .default
@@ -105,10 +104,29 @@ pub fn render_project(spec: &ProjectSpec) -> Result<String, ProjectSynthError> {
         .map(|switch| format!("\"{switch}\""))
         .collect::<Vec<_>>()
         .join(", ");
-    out.push_str(&format!(
-        "      for Default_Switches (\"Ada\") use ({switches}, \"{}\");\n",
-        dialect_switch(spec.ada_standard)
-    ));
+    let own_switches = format!("({switches}, \"{}\")", dialect_switch(spec.ada_standard));
+    match (&spec.extends_project, &spec.parent_compiler) {
+        // Extend the parent's package rather than replace it, so its per-file
+        // `Switches` and its `Default_Switches` (a `-gnateD` the sources need,
+        // `-O1`) still apply; bhf's own come after them and win a conflict.
+        (Some(_), Some(parent)) => {
+            out.push_str(&format!(
+                "   package Compiler extends {}.Compiler is\n",
+                parent.project_name
+            ));
+            out.push_str(&format!(
+                "      for Default_Switches (\"Ada\") use {}.Compiler'Default_Switches \
+                 (\"Ada\") & {own_switches};\n",
+                parent.project_name
+            ));
+        }
+        _ => {
+            out.push_str("   package Compiler is\n");
+            out.push_str(&format!(
+                "      for Default_Switches (\"Ada\") use {own_switches};\n"
+            ));
+        }
+    }
     if spec.compile_c {
         // Glue C is third-party binding code — compile it for debug only, never
         // instrument it (coverage is for the Ada target, not the libc shims).
@@ -133,6 +151,126 @@ pub fn write_project(spec: &ProjectSpec, dest_path: &Path) -> Result<(), Project
     Ok(())
 }
 
+/// The `package Compiler` of the project file at `gpr`, when it declares one
+/// (see [`parent_compiler_from_text`]); `None` when the file cannot be read.
+pub fn parent_compiler_package(gpr: &Path) -> Option<crate::ParentCompiler> {
+    parent_compiler_from_text(&std::fs::read_to_string(gpr).ok()?)
+}
+
+/// The project name and `package Compiler` of a project file's text: `None`
+/// when it declares no Compiler package (one it renames counts), or when its
+/// name is not one GPR can reference. The switches are the string literals of
+/// its `Default_Switches ("Ada")`, if any.
+pub fn parent_compiler_from_text(text: &str) -> Option<crate::ParentCompiler> {
+    let tokens = gpr_tokens(text);
+    let is = |token: &GprToken, word: &str| matches!(token, GprToken::Word(w) if w.eq_ignore_ascii_case(word));
+    let project_name = tokens.windows(2).find_map(|pair| match pair {
+        [first, GprToken::Word(name)] if is(first, "project") => Some(name.clone()),
+        _ => None,
+    })?;
+    let valid_name = project_name.split('.').all(|part| {
+        let mut chars = part.chars();
+        chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    });
+    if !valid_name {
+        return None;
+    }
+    let start = tokens.windows(3).position(|triple| {
+        is(&triple[0], "package")
+            && is(&triple[1], "compiler")
+            && ["is", "extends", "renames"]
+                .iter()
+                .any(|word| is(&triple[2], word))
+    })?;
+    let body = &tokens[start..];
+    let end = body
+        .windows(2)
+        .position(|pair| is(&pair[0], "end") && is(&pair[1], "compiler"))
+        .unwrap_or(body.len());
+    let body = &body[..end];
+    let ada_switches = body
+        .windows(4)
+        .position(|window| {
+            is(&window[0], "for")
+                && is(&window[1], "default_switches")
+                && window[2] == GprToken::Punct('(')
+                && matches!(&window[3], GprToken::Str(lang) if lang.eq_ignore_ascii_case("ada"))
+        })
+        .map(|at| {
+            body[at..]
+                .iter()
+                .skip_while(|token| !is(token, "use"))
+                .take_while(|token| **token != GprToken::Punct(';'))
+                .filter_map(|token| match token {
+                    GprToken::Str(value) => Some(value.clone()),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(crate::ParentCompiler {
+        project_name,
+        ada_switches,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GprToken {
+    Word(String),
+    Str(String),
+    Punct(char),
+}
+
+/// A project file's words (identifiers, dotted names), string literals and
+/// punctuation, with `--` comments dropped.
+fn gpr_tokens(text: &str) -> Vec<GprToken> {
+    let mut tokens = Vec::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '-' if chars.peek() == Some(&'-') => {
+                for next in chars.by_ref() {
+                    if next == '\n' {
+                        break;
+                    }
+                }
+            }
+            '"' => {
+                let mut value = String::new();
+                while let Some(next) = chars.next() {
+                    if next == '"' {
+                        // `""` is an escaped quote inside a GPR string.
+                        if chars.peek() == Some(&'"') {
+                            chars.next();
+                            value.push('"');
+                            continue;
+                        }
+                        break;
+                    }
+                    value.push(next);
+                }
+                tokens.push(GprToken::Str(value));
+            }
+            c if c.is_ascii_alphanumeric() || c == '_' => {
+                let mut word = String::from(c);
+                while let Some(&next) = chars.peek() {
+                    if next.is_ascii_alphanumeric() || next == '_' || next == '.' {
+                        word.push(next);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                tokens.push(GprToken::Word(word));
+            }
+            c if c.is_whitespace() => {}
+            other => tokens.push(GprToken::Punct(other)),
+        }
+    }
+    tokens
+}
+
 fn dialect_switch(standard: AdaStandard) -> &'static str {
     match standard {
         AdaStandard::Ada83 => "-gnat83",
@@ -140,5 +278,110 @@ fn dialect_switch(standard: AdaStandard) -> &'static str {
         AdaStandard::Ada2005 => "-gnat05",
         AdaStandard::Ada2012 => "-gnat12",
         AdaStandard::Ada2022 => "-gnat2022",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ParentCompiler, SourceRoot, Switches};
+
+    fn extending_spec() -> ProjectSpec {
+        ProjectSpec {
+            project_name: "Bhf_Build".to_owned(),
+            extends_project: Some("/proj/board.gpr".into()),
+            parent_compiler: None,
+            source_roots: vec![SourceRoot {
+                path: "src_instrumented".into(),
+                language: "Ada".to_owned(),
+            }],
+            object_dir: "obj".into(),
+            exec_dir: None,
+            main_adb: Some("main.adb".to_owned()),
+            ada_standard: AdaStandard::Ada2022,
+            target: None,
+            runtime: None,
+            toolchain: None,
+            switches: Switches {
+                default: vec!["-g".to_owned(), "-gnatwa".to_owned(), "-gnata".to_owned()],
+                debug: true,
+                warnings_as_errors: false,
+            },
+            with_clauses: Vec::new(),
+            executable_name: None,
+            compile_c: false,
+            excluded_source_files: Vec::new(),
+        }
+    }
+
+    /// A parent project's `package Compiler` is extended, not replaced: its
+    /// per-file `Switches` still apply, and bhf's switches follow the
+    /// parent's `Default_Switches ("Ada")` (so a `-gnateD` the sources need
+    /// stays, and bhf's `-g`/assertions/dialect come after it).
+    #[test]
+    fn an_extending_project_merges_the_parents_compiler_switches() {
+        let mut spec = extending_spec();
+        spec.parent_compiler = Some(ParentCompiler {
+            project_name: "Board".to_owned(),
+            ada_switches: vec!["-O1".to_owned(), "-gnateDBOARD_REV=7".to_owned()],
+        });
+        let rendered = render_project(&spec).unwrap();
+        assert!(
+            rendered.contains(
+                "   package Compiler extends Board.Compiler is\n      for Default_Switches \
+                 (\"Ada\") use Board.Compiler'Default_Switches (\"Ada\") & (\"-g\", \
+                 \"-gnatwa\", \"-gnata\", \"-gnat2022\");\n   end Compiler;\n"
+            ),
+            "{rendered}"
+        );
+        // Without a parent Compiler package the output is as before.
+        let plain = render_project(&extending_spec()).unwrap();
+        assert!(
+            plain.contains(
+                "   package Compiler is\n      for Default_Switches (\"Ada\") use (\"-g\", \
+                 \"-gnatwa\", \"-gnata\", \"-gnat2022\");\n"
+            ),
+            "{plain}"
+        );
+    }
+
+    #[test]
+    fn a_parent_projects_compiler_package_is_read_from_its_text() {
+        let parent = parent_compiler_from_text(
+            "-- board support\n\
+             with \"shared.gpr\";\n\
+             library project Board.Core extends \"base.gpr\" is\n\
+             \x20  for Source_Dirs use (\"src\");\n\
+             \x20  package Compiler is  -- the build's own switches\n\
+             \x20     for Default_Switches (\"ada\") use (\"-O1\", \"-gnatwa\",\n\
+             \x20        \"-gnateDBOARD_REV=7\");\n\
+             \x20     for Switches (\"board.adb\") use (\"-O0\");\n\
+             \x20  end Compiler;\n\
+             end Board.Core;\n",
+        )
+        .expect("a Compiler package");
+        assert_eq!(parent.project_name, "Board.Core");
+        assert_eq!(
+            parent.ada_switches,
+            ["-O1", "-gnatwa", "-gnateDBOARD_REV=7"]
+        );
+        // A package that only renames another's still has its attributes.
+        let renamed = parent_compiler_from_text(
+            "project App is\n   package Compiler renames Shared.Compiler;\nend App;\n",
+        )
+        .expect("a renamed Compiler package");
+        assert_eq!(renamed.project_name, "App");
+        assert!(renamed.ada_switches.is_empty());
+        // No Compiler package, or a name GPR could not reference: nothing.
+        assert_eq!(
+            parent_compiler_from_text(
+                "project App is\n   package Binder is\n   end Binder;\nend App;\n"
+            ),
+            None
+        );
+        assert_eq!(
+            parent_compiler_from_text("project \"App\" is\n package Compiler is\n end Compiler;\n"),
+            None
+        );
     }
 }

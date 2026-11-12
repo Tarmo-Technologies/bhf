@@ -8284,13 +8284,26 @@ fn write_per_tu_context(
                 }
                 (false, _) => " $(BHF_TOOLCHAIN_CPPFLAGS)",
             };
+            // Every lane takes the preprocessor words of the toolchain flags
+            // of the unit's own language.
+            let c_row = context.source.extension().and_then(|ext| ext.to_str()) == Some("c");
+            let language_cppflags = if cpp && !c_row {
+                " $(BHF_TOOLCHAIN_CXX_CPPFLAGS)"
+            } else {
+                " $(BHF_TOOLCHAIN_C_CPPFLAGS)"
+            };
+            // A sanitized lane turns glibc's fortification off after the
+            // row's own flags and the toolchain's (see
+            // BHF_SANITIZED_NO_FORTIFY in the Makefile), outside the span a
+            // capsule reads as the row's flags.
+            let no_fortify = format!(" $(call BHF_SANITIZED_NO_FORTIFY,{variant_flags})");
             let driver_define = if *external_driver {
                 " -DBHF_EXTERNAL_DRIVER"
             } else {
                 ""
             };
             fragment.push_str(&format!(
-                "{object}: FORCE_CONTEXT_OBJECTS\n\t@mkdir -p {object_dir}\n\t{compiler} {variant_flags} $(SECTION_FLAGS){compat} {flags} $(INCLUDES) $(AUTO_EXTRA_INCLUDES){cxx_compat}{toolchain}{driver_define} -c {} -o {object}\n\n",
+                "{object}: FORCE_CONTEXT_OBJECTS\n\t@mkdir -p {object_dir}\n\t{compiler} {variant_flags} $(SECTION_FLAGS){compat} {flags} $(INCLUDES) $(AUTO_EXTRA_INCLUDES){cxx_compat}{toolchain}{language_cppflags}{no_fortify}{driver_define} -c {} -o {object}\n\n",
                 sources[index]
             ));
         }
@@ -20059,8 +20072,13 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
     /// `make -n main` in `dir` with exactly `vars` as compiler settings: the
     /// recipes make would run, one per line.
     fn make_dry_run(dir: &Path, vars: &[(&str, &str)]) -> String {
+        make_dry_run_goal(dir, "main", vars)
+    }
+
+    /// [`make_dry_run`] for the make goal `goal`.
+    fn make_dry_run_goal(dir: &Path, goal: &str, vars: &[(&str, &str)]) -> String {
         let mut command = std::process::Command::new("make");
-        command.arg("-C").arg(dir).args(["-n", "main"]);
+        command.arg("-C").arg(dir).args(["-n", goal]);
         for key in [
             "CC",
             "CXX",
@@ -20070,6 +20088,14 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             "BHF_CXX_FAMILY",
             "BHF_TOOLCHAIN_CFLAGS",
             "BHF_TOOLCHAIN_CXXFLAGS",
+            "BHF_TOOLCHAIN_CPPFLAGS",
+            "BHF_TOOLCHAIN_C_CPPFLAGS",
+            "BHF_TOOLCHAIN_CXX_CPPFLAGS",
+            "BHF_TOOLCHAIN_DRIVER_CXXFLAGS",
+            "BHF_TOOLCHAIN_DRIVER_CFLAGS",
+            "BHF_TOOLCHAIN_LDFLAGS",
+            "BHF_TOOLCHAIN_LIBS",
+            "BHF_TOOLCHAIN_TARGET_FLAGS",
         ] {
             command.env_remove(key);
         }
@@ -20087,6 +20113,212 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             .lines()
             .find(|line| line.contains(&format!("-o {object}")))
             .unwrap_or_else(|| panic!("no recipe for {object} in:\n{dry_run}"))
+    }
+
+    /// The toolchain's preprocessor words and library operands reach every
+    /// lane of both Makefiles, not just `main`: a lane built with another
+    /// compiler (coverage, AFL++, libFuzzer, MSan, TSan, differential) that
+    /// misses `-lvendor` or `-DBOARD` fails to build, silently.
+    #[test]
+    fn toolchain_headers_and_libraries_reach_every_makefile_lane() {
+        if !have_tool("make") {
+            eprintln!("skip: make unavailable");
+            return;
+        }
+        let root = temp_dir("make-every-lane");
+        let c_source = root.join("widget.c");
+        fs::write(
+            &c_source,
+            "#include <stddef.h>\nint parse_record(const unsigned char *data, size_t size) \
+             { return size > 2 && data[0] == 'W' ? data[1] : 0; }\n",
+        )
+        .unwrap();
+        let c_dir = generate_for_make_test(&c_source, "parse_record", "H-LANES-C", &root);
+        let vars = [
+            ("BHF_TOOLCHAIN_C_CPPFLAGS", "-DBOARD_REV=7"),
+            ("BHF_TOOLCHAIN_CXX_CPPFLAGS", "-include iostream"),
+            ("BHF_TOOLCHAIN_LIBS", "-L/opt/vend/lib -lvendor"),
+        ];
+        for (goal, binary) in [
+            ("main", "main "),
+            ("prov", "main_prov "),
+            ("afl", "main_afl "),
+            ("libfuzzer", "main_libfuzzer "),
+            ("msan", "main_msan "),
+            ("tsan", "main_tsan "),
+            ("cov", "main_cov "),
+            ("diff", "main_diff "),
+        ] {
+            let dry_run = make_dry_run_goal(&c_dir, goal, &vars);
+            let link = recipe_for(&dry_run, binary);
+            assert!(
+                link.contains("-DBOARD_REV=7") && link.contains("-L/opt/vend/lib -lvendor"),
+                "C {goal}: {link}"
+            );
+            assert!(!link.contains("iostream"), "C {goal}: {link}");
+        }
+        let cpp_root = root.join("cpp");
+        fs::create_dir_all(&cpp_root).unwrap();
+        let cpp_source = cpp_root.join("widget.cpp");
+        fs::write(
+            &cpp_source,
+            "#include <cstddef>\nint parse_record(const unsigned char *data, std::size_t size) \
+             { return size > 2 && data[0] == 'W' ? data[1] : 0; }\n",
+        )
+        .unwrap();
+        let cpp_dir = generate_for_make_test(&cpp_source, "parse_record", "H-LANES-CPP", &cpp_root);
+        for (goal, binary) in [
+            ("main", "main "),
+            ("afl", "main_afl "),
+            ("libfuzzer", "main_libfuzzer "),
+            ("cov", "main_cov "),
+            ("diff", "main_diff "),
+        ] {
+            let dry_run = make_dry_run_goal(&cpp_dir, goal, &vars);
+            let link = recipe_for(&dry_run, binary);
+            assert!(
+                link.contains("-include iostream") && link.contains("-L/opt/vend/lib -lvendor"),
+                "C++ {goal}: {link}"
+            );
+            assert!(!link.contains("BOARD_REV"), "C++ {goal}: {link}");
+        }
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The `_FORTIFY_SOURCE` value `compiler` ends up with for the
+    /// fortify-related words of `recipe`, in their order (`None` when it is
+    /// left undefined), or why the compiler could not tell.
+    fn effective_fortify(compiler: &str, recipe: &str) -> Result<Option<String>, String> {
+        let words: Vec<&str> = recipe
+            .split_whitespace()
+            .filter(|word| word.contains("_FORTIFY_SOURCE"))
+            .collect();
+        let output = std::process::Command::new(compiler)
+            .args(["-O2", "-Werror"])
+            .args(&words)
+            .args(["-x", "c", "-dM", "-E", "-"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(format!(
+                "{compiler} {words:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find_map(|line| line.strip_prefix("#define _FORTIFY_SOURCE "))
+            .map(str::to_owned))
+    }
+
+    /// glibc's `_FORTIFY_SOURCE` (Ubuntu's gcc defines it whenever it
+    /// optimizes) turns an overflow of a fortified call into its own abort
+    /// before AddressSanitizer reports it, so every sanitized lane of both
+    /// Makefiles turns it off, after the build context's and the toolchain's
+    /// own flags, in either spelling they define it with (`-D`, or the `-Wp,-D`
+    /// of Fedora's build flags); a lane built without a sanitizer keeps it.
+    #[test]
+    fn sanitized_makefile_lanes_turn_fortify_off_for_both_families() {
+        if !have_tool("make") {
+            eprintln!("skip: make unavailable");
+            return;
+        }
+        let off = harness_gen::compiler_family::SANITIZED_NO_FORTIFY.join(" ");
+        let root = temp_dir("make-fortify");
+        let c_source = root.join("widget.c");
+        fs::write(
+            &c_source,
+            "#include <stddef.h>\nint parse_record(const unsigned char *data, size_t size) \
+             { return size > 2 && data[0] == 'W' ? data[1] : 0; }\n",
+        )
+        .unwrap();
+        let c_dir = generate_for_make_test(&c_source, "parse_record", "H-FORT-C", &root);
+        let cpp_root = root.join("cpp");
+        fs::create_dir_all(&cpp_root).unwrap();
+        let cpp_source = cpp_root.join("widget.cpp");
+        fs::write(
+            &cpp_source,
+            "#include <cstddef>\nint parse_record(const unsigned char *data, std::size_t size) \
+             { return size > 2 && data[0] == 'W' ? data[1] : 0; }\n",
+        )
+        .unwrap();
+        let cpp_dir = generate_for_make_test(&cpp_source, "parse_record", "H-FORT-CPP", &cpp_root);
+        // The build context's flags, as a compile database records them.
+        for dir in [&c_dir, &cpp_dir] {
+            let makefile = dir.join("Makefile");
+            let text = fs::read_to_string(&makefile).unwrap();
+            let line = text
+                .lines()
+                .find(|line| line.starts_with("COMPILE_DB_FLAGS ="))
+                .unwrap()
+                .to_owned();
+            fs::write(
+                &makefile,
+                text.replacen(
+                    &line,
+                    "COMPILE_DB_FLAGS = -O2 -Wall -Wp,-D_FORTIFY_SOURCE=2 -D_FORTIFY_SOURCE=2",
+                    1,
+                ),
+            )
+            .unwrap();
+        }
+        for family in ["gcc", "clang"] {
+            let c = make_dry_run(
+                &c_dir,
+                &[
+                    ("BHF_CC_FAMILY", family),
+                    ("BHF_TOOLCHAIN_C_CPPFLAGS", "-Wp,-D_FORTIFY_SOURCE=2"),
+                ],
+            );
+            let main = recipe_for(&c, "main ");
+            assert!(main.contains(&off), "C {family}: {main}");
+            // Not even the build context's or a toolchain's own define turns
+            // it back on.
+            assert!(
+                main.find(&off) > main.rfind("_FORTIFY_SOURCE=2"),
+                "C {family}: {main}"
+            );
+            let cpp = make_dry_run(
+                &cpp_dir,
+                &[("BHF_CXX_FAMILY", family), ("BHF_CC_FAMILY", family)],
+            );
+            let cpp_main = recipe_for(&cpp, "main ");
+            assert!(cpp_main.contains(&off), "C++ {family}: {cpp_main}");
+            if have_tool(family) {
+                for (language, recipe) in [("C", main), ("C++", cpp_main)] {
+                    let value = effective_fortify(family, recipe)
+                        .unwrap_or_else(|error| panic!("{language} {family}: {error}"));
+                    assert!(
+                        value.is_none() || value.as_deref() == Some("0"),
+                        "{language} {family} keeps _FORTIFY_SOURCE {value:?}: {recipe}"
+                    );
+                }
+            }
+        }
+        // The other sanitized lanes too.
+        let text = fs::read_to_string(c_dir.join("Makefile")).unwrap();
+        for lane in [
+            "main_afl:",
+            "main_msan:",
+            "main_tsan:",
+            "main_diff:",
+            "main_prov:",
+        ] {
+            let recipe = text
+                .lines()
+                .skip_while(|line| !line.starts_with(lane))
+                .nth(1)
+                .unwrap_or_else(|| panic!("no {lane} rule"));
+            assert!(
+                recipe.contains("BHF_SANITIZED_NO_FORTIFY"),
+                "{lane} {recipe}"
+            );
+        }
+        // A build without a sanitizer keeps the platform's fortification.
+        let plain = make_dry_run(&c_dir, &[("BHF_CC_FAMILY", "gcc"), ("CFLAGS", "-O1 -g")]);
+        assert!(!recipe_for(&plain, "main ").contains(&off), "{plain}");
+        fs::remove_dir_all(&root).ok();
     }
 
     /// `bhf-cl` (bhf's front end for MSVC cl.exe) is recognised by name, so a
@@ -20166,10 +20398,14 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
                     "BHF_TOOLCHAIN_CFLAGS",
                     "-DWIDGET_ABI_MARK=1 -std=gnu89 -Werror",
                 ),
+                // The header dir of the C flags, which bhf moves out of
+                // BHF_TOOLCHAIN_CFLAGS, still reaches the driver.
+                ("BHF_TOOLCHAIN_DRIVER_CFLAGS", "-isystem /opt/bare/include"),
             ],
         );
         let driver = recipe_for(&dry_run, "bhf_driver.o");
         assert!(driver.contains("-DWIDGET_ABI_MARK=1"), "{driver}");
+        assert!(driver.contains("-isystem /opt/bare/include"), "{driver}");
         assert!(
             !driver.contains("-std=gnu89") && !driver.contains("-Werror"),
             "{driver}"
@@ -20180,8 +20416,9 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             "{main}"
         );
 
-        // A C++ harness compiles the C driver with $(CXX): it takes the C and the
-        // C++ toolchain flags, without the C++ `-std=`.
+        // A C++ harness compiles the C driver with $(CXX): it takes the C flags
+        // and the driver-safe part of the C++ flags bhf computed for it, never
+        // the C++ flags themselves (`-include iostream` breaks a C compile).
         let source = root.join("widget.cpp");
         fs::write(
             &source,
@@ -20196,15 +20433,28 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
                 ("CXX", "clang++"),
                 ("CC", "clang"),
                 ("BHF_TOOLCHAIN_CFLAGS", "-DWIDGET_C_MARK=1"),
-                ("BHF_TOOLCHAIN_CXXFLAGS", "-DWIDGET_CXX_MARK=1 -std=c++17"),
+                (
+                    "BHF_TOOLCHAIN_CXXFLAGS",
+                    "-include iostream -DWIDGET_CXX_MARK=1 -std=c++17",
+                ),
+                ("BHF_TOOLCHAIN_DRIVER_CXXFLAGS", "-DWIDGET_CXX_MARK=1"),
+                ("BHF_TOOLCHAIN_DRIVER_CFLAGS", "-isystem /opt/bare/include"),
             ],
         );
         let driver = recipe_for(&dry_run, "bhf_driver.o");
+        assert!(driver.contains("-isystem /opt/bare/include"), "{driver}");
         assert!(
             driver.contains("-DWIDGET_C_MARK=1") && driver.contains("-DWIDGET_CXX_MARK=1"),
             "{driver}"
         );
-        assert!(!driver.contains("-std=c++17"), "{driver}");
+        assert!(
+            !driver.contains("-std=c++17") && !driver.contains("iostream"),
+            "{driver}"
+        );
+        assert!(
+            recipe_for(&dry_run, "main ").contains("-include iostream"),
+            "{dry_run}"
+        );
         fs::remove_dir_all(&root).ok();
     }
 

@@ -240,17 +240,28 @@ fn replay_one(
         Some("-lm -ldl -lpthread"),
     );
     if !build_output.status.success() || !bin.is_file() {
+        let stdout = diagnostic_tail(&build_output.stdout);
+        let stderr = diagnostic_tail(&build_output.stderr);
         write_coverage_diagnostic(
             hdir,
             &format!(
-                "coverage harness build failed (status {}):\nstdout:\n{}\nstderr:\n{}\n",
+                "coverage harness build failed (status {}):\nstdout:\n{stdout}\nstderr:\n{stderr}\n",
                 build_output.status,
-                diagnostic_tail(&build_output.stdout),
-                diagnostic_tail(&build_output.stderr)
             ),
+        );
+        // Said in run.json, summary.txt and run.md, not only in the diagnostic.
+        crate::auto::lanes::record(
+            hdir,
+            crate::auto::lanes::COVERAGE,
+            crate::auto::lanes::LaneStatus::failed("main_cov", &format!("{stderr}\n{stdout}")),
         );
         return None;
     }
+    crate::auto::lanes::record(
+        hdir,
+        crate::auto::lanes::COVERAGE,
+        crate::auto::lanes::LaneStatus::built(),
+    );
     let deadline = Instant::now() + REPLAY_BUDGET;
     let prof_dir = hdir.join("cov_profraw");
     let _ = std::fs::remove_dir_all(&prof_dir);

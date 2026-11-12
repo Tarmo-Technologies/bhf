@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub use error::ProjectSynthError;
-pub use spec::{ProjectSpec, SourceRoot, Switches};
-pub use writer::{render_project, write_project};
+pub use spec::{ParentCompiler, ProjectSpec, SourceRoot, Switches};
+pub use writer::{
+    parent_compiler_from_text, parent_compiler_package, render_project, write_project,
+};
 
 pub mod error;
 pub mod spec;
@@ -32,6 +34,7 @@ mod tests {
         ProjectSpec {
             project_name: project_name.to_owned(),
             extends_project: None,
+            parent_compiler: None,
             source_roots: vec![SourceRoot {
                 path: "src_instrumented".into(),
                 language: "Ada".to_owned(),

@@ -1429,15 +1429,24 @@ mod tests {
         let build_log_path = temp.join("build-args.log");
         let _build_log = EnvVarGuard::set("BHF_BUILD_LOG", build_log_path.as_os_str());
         let config = temp.join("bhf.toml");
+        // A target-side probe backend belongs to a build for the target (a
+        // host build with one is refused: nothing would read its events).
+        let foreign = if std::env::consts::ARCH == "aarch64" {
+            "x86_64-linux-gnu"
+        } else {
+            "aarch64-linux-gnu"
+        };
         fs::write(
             &config,
-            "[toolchain.ada]\n\
-             gprbuild = \"tools/my-gprbuild\"\n\
-             gnat = \"tools/my-gnat\"\n\
-             prefix = \"x86_64-linux-gnu\"\n\
-             runtime = \"light\"\n\
-             switches = [\"-O1\", \"-gnatVa\"]\n\
-             probe-backend = \"memory_buffer\"\n",
+            format!(
+                "[toolchain.ada]\n\
+                 gprbuild = \"tools/my-gprbuild\"\n\
+                 gnat = \"tools/my-gnat\"\n\
+                 prefix = \"{foreign}\"\n\
+                 runtime = \"light\"\n\
+                 switches = [\"-O1\", \"-gnatVa\"]\n\
+                 probe-backend = \"memory_buffer\"\n"
+            ),
         )
         .expect("config is written");
 
@@ -1453,7 +1462,7 @@ mod tests {
             .expect("project file is readable");
         assert_eq!(exit, 0, "{project}");
         assert!(
-            project.contains("for Target use \"x86_64-linux-gnu\";"),
+            project.contains(&format!("for Target use \"{foreign}\";")),
             "{project}"
         );
         assert!(

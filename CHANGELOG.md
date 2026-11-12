@@ -354,6 +354,56 @@
   optional `generation-metadata.json` fields `extra_sources`,
   `extra_includes`, `source_roots`), so a harness kept beside its library
   outside a git checkout or a `src/`/`lib/` directory names the defining file.
+- The GCC lane reports each defect once, with its stack: the runtrace shim no
+  longer fakes the paths a sanitizer's symbolizer opens while it writes a
+  report (the vDSO's link-map name, separate `.debug` files, loaded objects'
+  names), and stops faking altogether once AddressSanitizer starts a report
+  (bhf's C/C++ driver defines `__asan_on_error` and tells the shim; a target
+  that defines that hook itself builds with `-DBHF_NO_ASAN_ON_ERROR` in
+  `toolchain.cflags`). GCC's static libasan used to abort its own report on
+  the faked file, which gave a second stackless finding, a fake-descriptor
+  BHF-306 leak and the vDSO in `missing-deps.txt`.
+- Sanitized C/C++ builds (every sanitized Makefile lane, the gcc probe build
+  and capsule `build.sh`) end each compile with `-U_FORTIFY_SOURCE
+  -Wp,-U_FORTIFY_SOURCE -Wp,-D_FORTIFY_SOURCE=0`, after the build context's
+  flags (and, in the Makefile lanes, the toolchain's), so glibc's
+  fortification (on by default in Ubuntu's gcc, and set by many build flags,
+  including the `-Wp,-D_FORTIFY_SOURCE=N` spelling of Fedora, RHEL and Arch)
+  no longer aborts an overflowing `strcpy`/`memcpy` before AddressSanitizer
+  reports a stack-buffer-overflow at its line, in the harness or in its
+  capsule's rebuild.
+- `toolchain.cxxflags` (`--cxxflags`) no longer reach bhf's C driver object:
+  it takes only the words that select the ABI or target, `-D`, `-U`, `-I` and
+  `-isystem` (new Makefile variable `BHF_TOOLCHAIN_DRIVER_CXXFLAGS`), so a
+  C++-only flag such as `-include iostream` builds. The driver takes the `-D`,
+  `-U`, `-I` and `-isystem` words of `toolchain.cflags` through the new
+  `BHF_TOOLCHAIN_DRIVER_CFLAGS`, and no longer their `-include` files.
+- Toolchain preprocessor words (`-D`, `-U`, `-I`, `-isystem`, `-include` from
+  `cflags`/`cxxflags`) and the library operands of `ldflags` (`-L`, `-l`,
+  archives, objects, linker options `-Wl,...`/`-Xlinker ...`, `-pthread`, in
+  their order) reach every Makefile lane (coverage, AFL++, libFuzzer, MSan,
+  TSan, differential), through the new
+  variables `BHF_TOOLCHAIN_C_CPPFLAGS`, `BHF_TOOLCHAIN_CXX_CPPFLAGS` and
+  `BHF_TOOLCHAIN_LIBS`; a target linking a vendor library gets line coverage
+  and AFL++ fuzzing. A coverage or AFL++ lane that still fails to build is
+  reported in `run.json` `targets[].lanes` (additive), `summary.txt` and
+  `run.md` with its first error line.
+- With `--engine afl++` alone, a failed `make afl` says the target was not
+  fuzzed instead of "builtin results kept".
+- `toolchain.ada.probe-backend` other than `host_file` without a runner is
+  refused (exit 2, key named) by `bhf auto` and by `bhf build` of a host Ada
+  harness, instead of a sweep that loses every finding.
+- An Ada tool prefix whose `<prefix>-gprbuild` (or `gprbuild` with
+  `<prefix>-gnat`), or an explicit `toolchain.ada.gprbuild`/`gnat`, is not
+  installed fails the plan, `--dry-run` included, when the tree has Ada
+  candidates (exit 2, `toolchain.ada.prefix: <prefix>-gprbuild not found on
+  PATH`). The failed-build levers name the toolchain of what failed: the C++
+  dialect hint only for C++ failures, the GNAT toolchain for Ada ones.
+- The generated Ada project extends the governing project's `package
+  Compiler` (`package Compiler extends <Parent>.Compiler is`) and appends
+  bhf's switches to the parent's `Default_Switches ("Ada")`, so a switch the
+  sources need (`-gnateD`, `-O1`) and per-file `Switches` still apply; bhf
+  prints the merged parent switches.
 - A C or C++ capsule's `build.sh` picks the sanitizer flags of the compiler that
   runs it (gcc has no `function` UBSan check and links its runtimes
   statically), as the harness Makefile does, and a capsule of a harness bhf
@@ -856,6 +906,12 @@
 - The Windows CI job runs every crate's unit tests, and clippy with warnings as
   errors, instead of filtered subsets. Tests that only hold on Unix (POSIX
   shell-script fakes, `/bin/true`, Unix sockets, bubblewrap) are cfg-gated.
+- `bhf auto` exits 2 (was 1) when the toolchain configuration is refused, as
+  `bhf build` does.
+- `BHF_TOOLCHAIN_CFLAGS`/`BHF_TOOLCHAIN_CXXFLAGS` no longer carry the
+  preprocessor words of the toolchain flags, nor `BHF_TOOLCHAIN_LDFLAGS` its
+  library operands; they moved to the variables above, which every lane
+  takes. A hand-run `make` with only the old variables builds as before.
 - A target refused because a source path, include dir or compile flag holds a
   character no quoting makes safe in a build recipe now has its own outcome,
   `unsafe_build_path`, in `run.json` (and `summary.unsafe_build_path`, the
@@ -1062,6 +1118,18 @@
   receiver entry as `decoder`), carries a caveat that real callers may never
   produce that state, beside the reachability verdict in `bhf explain` and in
   the results `fidelity.caveats` (INDEX.md `Caveat:`).
+- `bhf build --runner <program>` / `--runner-arg <arg>` and the
+  `toolchain.runner`/`runner-args` keys: a build for a target this host
+  cannot run records the runner beside the binary in `bhf_runner.json`
+  (`bhf.harness_runner.v1`; `build/<id>/`, or `build/<id>/obj/` for an Ada
+  harness) and beside the harness, where `bhf replay`, `bhf minimize`,
+  `bhf fuzz`, `bhf decode-args` and the finding's `replay.py` find it; a
+  native rebuild forgets it, and a runner
+  for a build this host runs natively, C/C++ or Ada, is refused as in `bhf
+  auto` (a compiler that names no target keeps the runner as given). The
+  emulator note is printed whenever the selected compiler builds for another
+  target (a `--toolchain` prefix or a cross `--cc` included), and `[cross.*]`
+  tables in the config are named as applying to `bhf auto` only.
 - `bhf capsule`, `bhf verify-poc` and `bhf env-capsule` support every harness
   language bhf generates, through per-language lanes: Ada, Rust, Go, Java, C#,
   Python, JavaScript, TypeScript, Ruby, Perl, PHP, Lua, COBOL and Fortran, as

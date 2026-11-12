@@ -42,6 +42,7 @@ pub mod install_deps;
 pub mod java_build;
 pub mod js;
 pub mod js_build;
+pub(crate) mod lanes;
 pub mod layout;
 pub mod lit_scan;
 pub mod load;

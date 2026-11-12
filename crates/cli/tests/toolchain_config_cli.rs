@@ -1222,3 +1222,701 @@ fn a_clang_cross_table_builds_for_the_lane_target() {
         "{passes:?}"
     );
 }
+
+/// Generate the harness `id` for `parse_record` in `source` into
+/// `<work>/harnesses`.
+fn generate(source: &Path, id: &str, work: &Path) {
+    let generated = bhf()
+        .arg("generate-harness")
+        .arg(source)
+        .args(["--target", "parse_record", "--id", id, "--output"])
+        .arg(work.join("harnesses"))
+        .output()
+        .unwrap();
+    assert!(generated.status.success(), "{}", text(&generated));
+}
+
+/// `toolchain.cxxflags` reach the C++ translation units but not bhf's driver,
+/// which is C compiled `-x c` by the C++ compiler: a C++-only flag such as the
+/// `-include iostream` bhf build's own hint recommends used to break every
+/// build ("'iostream' file not found").
+#[test]
+fn bhf_build_keeps_cxx_only_toolchain_flags_off_the_c_driver() {
+    if !have("clang++") || !have("make") {
+        eprintln!("skip: clang++/make unavailable");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    // `std::cerr` without <iostream>: only the force-include makes it build.
+    std::fs::write(
+        src.join("widget.cpp"),
+        "#include <cstddef>\n\
+         int parse_record(const unsigned char *data, std::size_t size) {\n\
+         \x20   if (size > 3 && data[0] == 'W') std::cerr << \"widget\\n\";\n\
+         \x20   return size ? data[0] : 0;\n\
+         }\n",
+    )
+    .unwrap();
+    let work = tmp.path().join("work");
+    generate(&src.join("widget.cpp"), "H-XIOS", &work);
+    let config = tmp.path().join("bhf.toml");
+    std::fs::write(
+        &config,
+        "[toolchain]\ncxx = \"clang++\"\ncxxflags = [\"-include\", \"iostream\"]\n",
+    )
+    .unwrap();
+    let built = bhf()
+        .arg("build")
+        .arg(&work)
+        .args(["--harness", "H-XIOS", "--config"])
+        .arg(&config)
+        .env_remove("CC")
+        .env_remove("CXX")
+        .env_remove("CXXFLAGS")
+        .output()
+        .unwrap();
+    let out = text(&built);
+    assert!(built.status.success(), "{out}");
+    let driver = out
+        .lines()
+        .find(|line| line.contains("-x c") && line.contains("bhf_driver.c"))
+        .unwrap_or_else(|| panic!("no driver compile in:\n{out}"));
+    assert!(!driver.contains("iostream"), "{driver}");
+    let main = out
+        .lines()
+        .find(|line| line.contains(" main.cpp") && line.contains("-o main"))
+        .unwrap_or_else(|| panic!("no main.cpp compile in:\n{out}"));
+    assert!(main.contains("-include iostream"), "{main}");
+}
+
+/// A vendor library outside the tree: `include/vendor.h` and
+/// `lib/libvendor.a`, built with the host compiler. Returns the vendor dir.
+fn write_vendor_library(dir: &Path) -> PathBuf {
+    let vendor = dir.join("vendor");
+    std::fs::create_dir_all(vendor.join("include")).unwrap();
+    std::fs::create_dir_all(vendor.join("lib")).unwrap();
+    std::fs::write(
+        vendor.join("include/vendor.h"),
+        "#ifndef VENDOR_H\n#define VENDOR_H\nint vendor_check(int value);\n#endif\n",
+    )
+    .unwrap();
+    std::fs::write(
+        vendor.join("vendor.c"),
+        "int vendor_check(int value) { return value * 3 + 1; }\n",
+    )
+    .unwrap();
+    let object = vendor.join("vendor.o");
+    let compiled = Command::new("clang")
+        .args(["-c", "-fPIC", "-o"])
+        .arg(&object)
+        .arg(vendor.join("vendor.c"))
+        .status()
+        .unwrap();
+    assert!(compiled.success());
+    let archived = Command::new("ar")
+        .arg("rcs")
+        .arg(vendor.join("lib/libvendor.a"))
+        .arg(&object)
+        .status()
+        .unwrap();
+    assert!(archived.success());
+    vendor
+}
+
+/// A target that links a vendor library through `toolchain.ldflags`
+/// (`-L<dir> -lvendor`): every lane links it, so the source-coverage lane
+/// builds (`main_cov`, `covered-lines.txt`) and the AFL++ lane fuzzes it. A
+/// lane that still fails is reported in run.json, summary.txt and run.md,
+/// not only in a diagnostic file.
+#[test]
+fn toolchain_libraries_reach_the_coverage_and_afl_lanes() {
+    let llvm_cov = ["llvm-cov-18", "llvm-cov"].into_iter().any(have);
+    if !have("clang") || !have("make") || !have("ar") || !llvm_cov {
+        eprintln!("skip: clang/make/ar/llvm-cov unavailable");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let vendor = write_vendor_library(tmp.path());
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("widget.c"),
+        "#include <stddef.h>\n#include \"vendor.h\"\n\
+         int parse_record(const unsigned char *data, size_t size) {\n\
+         \x20   if (size > 1 && data[0] == 'W') return vendor_check(data[1]);\n\
+         \x20   return size ? data[0] : 0;\n\
+         }\n",
+    )
+    .unwrap();
+    let config = tmp.path().join("bhf.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[toolchain]\ninclude-dirs = [\"{}\"]\nldflags = [\"-L{}\", \"-lvendor\"]\n",
+            vendor.join("include").display(),
+            vendor.join("lib").display()
+        ),
+    )
+    .unwrap();
+
+    let work = tmp.path().join("work");
+    let output = bhf()
+        .args(auto_args(&src, &work))
+        .args(["--per-target-time", "4", "--config"])
+        .arg(&config)
+        .env_remove("CC")
+        .env_remove("CXX")
+        .output()
+        .unwrap();
+    let out = text(&output);
+    let target = target_with_outcome(&work, &["built_and_fuzzed"])
+        .unwrap_or_else(|| panic!("the vendor-linked target must fuzz:\n{out}"));
+    let harness = work
+        .join("harnesses")
+        .join(target["harness_id"].as_str().unwrap());
+    assert!(harness.join("main_cov").is_file(), "{out}");
+    assert!(harness.join("covered-lines.txt").is_file(), "{out}");
+    assert_eq!(target["lanes"]["cov"]["built"], true, "{target}");
+
+    if have("afl-fuzz") && have("afl-clang-fast") {
+        let work = tmp.path().join("work-afl");
+        let output = bhf()
+            .args(auto_args(&src, &work))
+            .args(["--per-target-time", "6", "--engine", "afl++", "--config"])
+            .arg(&config)
+            .env_remove("CC")
+            .env_remove("CXX")
+            .env("AFL_SKIP_CPUFREQ", "1")
+            .env("AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES", "1")
+            .output()
+            .unwrap();
+        let out = text(&output);
+        let target = target_with_outcome(&work, &["built_and_fuzzed"])
+            .unwrap_or_else(|| panic!("AFL++ must fuzz the vendor-linked target:\n{out}"));
+        assert_eq!(target["lanes"]["afl"]["built"], true, "{target}");
+        assert!(
+            target["outcome"]["passes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|pass| pass["engine"] == "afl++"),
+            "{target}"
+        );
+    } else {
+        eprintln!("note: afl-fuzz/afl-clang-fast unavailable; AFL++ lane not checked");
+    }
+
+    // A coverage lane that cannot build is said so, with its first error.
+    let work = tmp.path().join("work-broken-cov");
+    let output = bhf()
+        .args(auto_args(&src, &work))
+        .args(["--per-target-time", "3", "--config"])
+        .arg(&config)
+        .env_remove("CC")
+        .env_remove("CXX")
+        .env("COV_CC", "bhf-no-such-compiler")
+        .output()
+        .unwrap();
+    let out = text(&output);
+    let target = target_with_outcome(&work, &["built_and_fuzzed"])
+        .unwrap_or_else(|| panic!("the main lane still fuzzes:\n{out}"));
+    assert_eq!(target["lanes"]["cov"]["built"], false, "{target}");
+    let reason = target["lanes"]["cov"]["reason"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(reason.starts_with("make main_cov failed"), "{reason}");
+    let run_md = std::fs::read_to_string(work.join("auto/run.md")).unwrap();
+    assert!(
+        run_md.contains("line coverage unavailable: make main_cov failed"),
+        "{run_md}"
+    );
+    let summary = std::fs::read_to_string(work.join("auto/summary.txt")).unwrap();
+    assert!(
+        summary.contains("line coverage unavailable: make main_cov failed"),
+        "{summary}"
+    );
+}
+
+/// `--engine afl++` without the builtin engine: a failed `make afl` leaves the
+/// target unfuzzed and says so, instead of "builtin results kept".
+#[test]
+fn a_failed_afl_build_without_the_builtin_engine_says_the_target_was_not_fuzzed() {
+    if !have("clang") || !have("make") {
+        eprintln!("skip: clang/make unavailable");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    write_parser(&src);
+    let work = tmp.path().join("work");
+    let output = bhf()
+        .args(auto_args(&src, &work))
+        .args(["--per-target-time", "3", "--engine", "afl++"])
+        .env_remove("CC")
+        .env_remove("CXX")
+        .env("AFLPP_CC", "bhf-no-such-afl-compiler")
+        .output()
+        .unwrap();
+    let out = text(&output);
+    assert!(out.contains("AFL skipped; "), "{out}");
+    assert!(
+        out.contains("was not fuzzed (make main_afl failed"),
+        "{out}"
+    );
+    assert!(!out.contains("builtin results kept"), "{out}");
+    let target = target_with_outcome(&work, &["built"])
+        .unwrap_or_else(|| panic!("the target is built, not fuzzed:\n{out}"));
+    assert_eq!(target["lanes"]["afl"]["built"], false, "{target}");
+}
+
+/// `bhf build` takes the runner of a `[toolchain]` (or `--runner`): a build
+/// for another target records it in `build/<id>/bhf_runner.json` (and beside
+/// the harness), so replay and fuzz run the binary under it.
+#[test]
+fn bhf_build_records_the_runner_of_a_cross_build() {
+    if !have("aarch64-linux-gnu-gcc") || !have("qemu-aarch64") || !have("make") {
+        eprintln!("skip: aarch64-linux-gnu-gcc/qemu-aarch64/make unavailable");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    write_parser(&src);
+    let work = tmp.path().join("work");
+    generate(&src.join("parse.c"), "H-XRUN", &work);
+    let config = tmp.path().join("bhf.toml");
+    std::fs::write(
+        &config,
+        "[toolchain]\ntarget = \"aarch64-linux-gnu\"\nrunner = \"qemu-aarch64\"\n\
+         runner-args = [\"-L\", \"/usr/aarch64-linux-gnu\"]\n",
+    )
+    .unwrap();
+    let built = bhf()
+        .arg("build")
+        .arg(&work)
+        .args(["--harness", "H-XRUN", "--config"])
+        .arg(&config)
+        .env_remove("CC")
+        .env_remove("CXX")
+        .output()
+        .unwrap();
+    let out = text(&built);
+    assert!(built.status.success(), "{out}");
+    assert_eq!(elf_machine(&work.join("build/H-XRUN/main")), EM_AARCH64);
+    for dir in [work.join("build/H-XRUN"), work.join("harnesses/H-XRUN")] {
+        let record: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.join("bhf_runner.json"))
+                .unwrap_or_else(|error| panic!("{}: {error}\n{out}", dir.display())),
+        )
+        .unwrap();
+        assert_eq!(record["schema"], "bhf.harness_runner.v1");
+        assert_eq!(record["program"], "qemu-aarch64");
+        assert_eq!(
+            record["args"],
+            serde_json::json!(["-L", "/usr/aarch64-linux-gnu"])
+        );
+    }
+    assert!(out.contains("qemu-aarch64"), "the runner is named: {out}");
+
+    // The same harness rebuilt for this host forgets the stale runner.
+    let host = bhf()
+        .arg("build")
+        .arg(&work)
+        .args(["--harness", "H-XRUN"])
+        .env_remove("CC")
+        .env_remove("CXX")
+        .output()
+        .unwrap();
+    assert!(host.status.success(), "{}", text(&host));
+    assert!(!work.join("build/H-XRUN/bhf_runner.json").exists());
+}
+
+/// A runner with nothing foreign to run is refused by `bhf build` as by
+/// `bhf auto`, and `--runner` is the command-line spelling.
+#[test]
+fn bhf_build_refuses_a_runner_for_a_native_build() {
+    if !have("clang") || !have("make") || !have("qemu-aarch64") {
+        eprintln!("skip: clang/make/qemu-aarch64 unavailable");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    write_parser(&src);
+    let work = tmp.path().join("work");
+    generate(&src.join("parse.c"), "H-NRUN", &work);
+    let config = tmp.path().join("bhf.toml");
+    std::fs::write(&config, "[toolchain]\nrunner = \"qemu-aarch64\"\n").unwrap();
+    for extra in [
+        vec!["--config".to_owned(), config.display().to_string()],
+        vec!["--runner".to_owned(), "qemu-aarch64".to_owned()],
+    ] {
+        let built = bhf()
+            .arg("build")
+            .arg(&work)
+            .args(["--harness", "H-NRUN"])
+            .args(&extra)
+            .env_remove("CC")
+            .env_remove("CXX")
+            .output()
+            .unwrap();
+        let out = text(&built);
+        assert_eq!(built.status.code(), Some(2), "{extra:?}: {out}");
+        assert!(
+            out.contains("toolchain.runner `qemu-aarch64` is set, but nothing"),
+            "{out}"
+        );
+        assert!(!work.join("build/H-NRUN/main").exists(), "{out}");
+    }
+}
+
+/// A compiler that does not say which target it builds for (a wrapper that
+/// does not answer `-dumpmachine`) keeps the runner it is given: `bhf build`
+/// records it as configured, with its arguments, instead of refusing it.
+/// The wrapper and the runner are POSIX shell scripts.
+#[cfg(unix)]
+#[test]
+fn bhf_build_keeps_the_runner_of_a_compiler_that_names_no_target() {
+    if !have("clang") || !have("make") {
+        eprintln!("skip: clang/make unavailable");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    write_parser(&src);
+    let work = tmp.path().join("work");
+    generate(&src.join("parse.c"), "H-URUN", &work);
+    let wrapper = tmp.path().join("tools/vendor-cc");
+    write_script(
+        &wrapper,
+        "#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = -dumpmachine ] && exit 1; done\n\
+         exec clang \"$@\"\n",
+    );
+    let runner = tmp.path().join("tools/board-run");
+    write_script(&runner, "#!/bin/sh\nexec \"$@\"\n");
+    let config = tmp.path().join("bhf.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[toolchain]\ncc = \"{}\"\nrunner = \"{}\"\nrunner-args = [\"--board\", \"b1\"]\n",
+            wrapper.display(),
+            runner.display()
+        ),
+    )
+    .unwrap();
+    let built = bhf()
+        .arg("build")
+        .arg(&work)
+        .args(["--harness", "H-URUN", "--config"])
+        .arg(&config)
+        .env_remove("CC")
+        .env_remove("CXX")
+        .output()
+        .unwrap();
+    let out = text(&built);
+    assert!(built.status.success(), "{out}");
+    assert!(
+        out.contains("does not say which target it builds for"),
+        "the runner is taken as given, and said so: {out}"
+    );
+    let record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(work.join("build/H-URUN/bhf_runner.json"))
+            .unwrap_or_else(|error| panic!("{error}\n{out}")),
+    )
+    .unwrap();
+    assert_eq!(record["program"], runner.display().to_string(), "{record}");
+    assert_eq!(
+        record["args"],
+        serde_json::json!(["--board", "b1"]),
+        "{record}"
+    );
+}
+
+/// `--toolchain <prefix>` alone builds with that prefix's gcc for another
+/// target, and says the binary needs an emulator; `[cross.*]` tables, which
+/// only `bhf auto` uses, are named as ignored.
+#[test]
+fn bhf_build_notes_a_foreign_binary_and_ignored_cross_tables() {
+    if !have("aarch64-linux-gnu-gcc") || !have("make") {
+        eprintln!("skip: aarch64-linux-gnu-gcc/make unavailable");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    write_parser(&src);
+    let work = tmp.path().join("work");
+    generate(&src.join("parse.c"), "H-XNOTE", &work);
+    let built = bhf()
+        .arg("build")
+        .arg(&work)
+        .args(["--harness", "H-XNOTE", "--toolchain", "aarch64-linux-gnu"])
+        .env_remove("CC")
+        .env_remove("CXX")
+        .output()
+        .unwrap();
+    let out = text(&built);
+    assert!(built.status.success(), "{out}");
+    assert!(
+        out.contains("for aarch64-linux-gnu; run it under an emulator"),
+        "{out}"
+    );
+
+    let config = tmp.path().join("bhf.toml");
+    std::fs::write(
+        &config,
+        "[toolchain]\ncc = \"clang\"\n\n[cross.aarch64]\ncc = \"aarch64-linux-gnu-gcc\"\n",
+    )
+    .unwrap();
+    let built = bhf()
+        .arg("build")
+        .arg(&work)
+        .args(["--harness", "H-XNOTE", "--config"])
+        .arg(&config)
+        .env_remove("CC")
+        .env_remove("CXX")
+        .output()
+        .unwrap();
+    let out = text(&built);
+    assert!(built.status.success(), "{out}");
+    assert!(
+        out.contains("[cross.aarch64]") && out.contains("apply to bhf auto only"),
+        "{out}"
+    );
+}
+
+/// An Ada package with no I/O of its own, for the toolchain checks.
+fn write_ada_package(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(
+        dir.join("records.ads"),
+        "package Records is\n   function Checksum (Data : String) return Natural;\nend Records;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("records.adb"),
+        "package body Records is\n\
+         \x20  function Checksum (Data : String) return Natural is\n\
+         \x20  begin\n\
+         \x20     return Data'Length;\n\
+         \x20  end Checksum;\n\
+         end Records;\n",
+    )
+    .unwrap();
+}
+
+/// A probe backend other than `host_file` writes the Ada harness's events
+/// where a host sweep never reads them, so every finding would be lost: the
+/// configuration is refused up front, naming the key.
+#[test]
+fn a_target_side_probe_backend_on_a_host_sweep_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    write_ada_package(&src);
+    let config = tmp.path().join("bhf.toml");
+    std::fs::write(
+        &config,
+        "[toolchain.ada]\nprobe-backend = \"memory_buffer\"\n",
+    )
+    .unwrap();
+    let work = tmp.path().join("work");
+    let output = bhf()
+        .args(auto_args(&src, &work))
+        .args(["--dry-run", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    let out = text(&output);
+    assert_eq!(output.status.code(), Some(2), "{out}");
+    assert!(
+        out.contains(
+            "toolchain.ada.probe-backend: memory_buffer needs an on-target transport; a host \
+             sweep reads events through host_file"
+        ),
+        "{out}"
+    );
+
+    // bhf build of an Ada harness for this host, from the same config.
+    if !have("gprbuild") {
+        eprintln!("note: gprbuild unavailable; bhf build check skipped");
+        return;
+    }
+    let generated = bhf()
+        .arg("generate-harness")
+        .arg(src.join("records.ads"))
+        .args(["--target", "Checksum", "--id", "H-AMEM", "--output"])
+        .arg(work.join("harnesses"))
+        .output()
+        .unwrap();
+    assert!(generated.status.success(), "{}", text(&generated));
+    let built = bhf()
+        .arg("build")
+        .arg(&work)
+        .args(["--harness", "H-AMEM", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    let out = text(&built);
+    assert_eq!(built.status.code(), Some(2), "{out}");
+    assert!(
+        out.contains("toolchain.ada.probe-backend: memory_buffer needs an on-target transport"),
+        "{out}"
+    );
+}
+
+/// A runner given for an Ada harness built for this host is refused, as for
+/// a C/C++ build, instead of being dropped, and it no longer lets a
+/// target-side probe backend through for that host build.
+#[test]
+fn bhf_build_refuses_a_runner_for_a_native_ada_harness() {
+    if !have("qemu-aarch64") {
+        eprintln!("skip: qemu-aarch64 unavailable");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    write_ada_package(&src);
+    let work = tmp.path().join("work");
+    let generated = bhf()
+        .arg("generate-harness")
+        .arg(src.join("records.ads"))
+        .args(["--target", "Checksum", "--id", "H-ARUN", "--output"])
+        .arg(work.join("harnesses"))
+        .output()
+        .unwrap();
+    assert!(generated.status.success(), "{}", text(&generated));
+    let config = tmp.path().join("bhf.toml");
+    std::fs::write(
+        &config,
+        "[toolchain]\nrunner = \"qemu-aarch64\"\n\n\
+         [toolchain.ada]\nprobe-backend = \"memory_buffer\"\n",
+    )
+    .unwrap();
+    for extra in [
+        vec!["--runner".to_owned(), "qemu-aarch64".to_owned()],
+        vec!["--config".to_owned(), config.display().to_string()],
+    ] {
+        let built = bhf()
+            .arg("build")
+            .arg(&work)
+            .args(["--harness", "H-ARUN"])
+            .args(&extra)
+            .output()
+            .unwrap();
+        let out = text(&built);
+        assert_eq!(built.status.code(), Some(2), "{extra:?}: {out}");
+        assert!(
+            out.contains(
+                "toolchain.runner `qemu-aarch64` is set, but the Ada harness builds for this host"
+            ),
+            "{extra:?}: {out}"
+        );
+    }
+}
+
+/// An Ada tool prefix whose gprbuild is not installed fails the dry run with
+/// the key and the missing program, instead of planning a sweep whose every
+/// Ada build then fails.
+#[test]
+fn a_missing_prefixed_gprbuild_fails_the_dry_run() {
+    if have("aarch64-linux-gnu-gprbuild") || have("aarch64-linux-gnu-gnat") || !have("qemu-aarch64")
+    {
+        eprintln!("skip: an aarch64 GNAT is installed, or qemu-aarch64 is not");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    write_ada_package(&src);
+    let work = tmp.path().join("work");
+    let output = bhf()
+        .args(auto_args(&src, &work))
+        .args([
+            "--dry-run",
+            "--ada-prefix",
+            "aarch64-linux-gnu",
+            "--runner",
+            "qemu-aarch64",
+        ])
+        .output()
+        .unwrap();
+    let out = text(&output);
+    assert_eq!(output.status.code(), Some(2), "{out}");
+    assert!(
+        out.contains("toolchain.ada.prefix: aarch64-linux-gnu-gprbuild not found on PATH"),
+        "{out}"
+    );
+    assert!(!out.contains("would fuzz"), "{out}");
+}
+
+/// An Ada tree whose project's `package Compiler` carries a switch the
+/// sources need (`-gnateDBOARD_REV=7` for an `#if BOARD_REV` they test): the
+/// harness project extends that package instead of replacing it, so the
+/// target builds under `bhf auto` with no `--ada-switch`.
+#[test]
+fn auto_keeps_the_parent_projects_compiler_switches() {
+    if !have("gprbuild") || !have("gcc") {
+        eprintln!("skip: gprbuild/gcc unavailable");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let tree = tmp.path().join("tree");
+    let src = tree.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        tree.join("board.gpr"),
+        "project Board is\n\
+         \x20  for Source_Dirs use (\"src\");\n\
+         \x20  for Object_Dir use \"obj\";\n\
+         \x20  package Compiler is\n\
+         \x20     for Default_Switches (\"Ada\") use (\"-O1\", \"-gnatwa\", \"-gnateDBOARD_REV=7\");\n\
+         \x20  end Compiler;\n\
+         end Board;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("revisions.ads"),
+        "package Revisions is\n   function Check (Data : String) return Natural;\nend Revisions;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("revisions.adb"),
+        "package body Revisions is\n\
+         \x20  function Check (Data : String) return Natural is\n\
+         \x20  begin\n\
+         #if BOARD_REV = \"7\" then\n\
+         \x20     return Data'Length;\n\
+         #else\n\
+         \x20     return 0;\n\
+         #end if;\n\
+         \x20  end Check;\n\
+         end Revisions;\n",
+    )
+    .unwrap();
+    let work = tmp.path().join("work");
+    let output = bhf()
+        .args(auto_args(&tree, &work))
+        .args(["--languages", "ada", "--per-target-time", "3"])
+        .output()
+        .unwrap();
+    let out = text(&output);
+    assert!(
+        target_with_outcome(&work, &["built", "built_and_fuzzed"]).is_some(),
+        "the target needing the parent's -gnateD must build:\n{out}"
+    );
+    let project = std::fs::read_dir(work.join("build"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path().join("bhf_build.gpr"))
+        .find(|path| path.is_file())
+        .map(|path| std::fs::read_to_string(path).unwrap())
+        .unwrap_or_else(|| panic!("no generated Ada project:\n{out}"));
+    assert!(
+        project.contains("package Compiler extends Board.Compiler is")
+            && project.contains("Board.Compiler'Default_Switches (\"Ada\") & ("),
+        "{project}"
+    );
+    assert!(
+        out.contains("-gnateDBOARD_REV=7"),
+        "the merged switches are named:\n{out}"
+    );
+}

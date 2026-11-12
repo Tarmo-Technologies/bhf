@@ -19,14 +19,32 @@ use config::ToolchainConfig;
 use harness_gen::compiler_family::{self, CompilerFamily};
 
 /// Make variable (published as an environment variable) carrying the C flags
-/// of the toolchain, appended to bhf's on every `$(CC)` lane.
+/// of the toolchain, appended to bhf's on every `$(CC)` lane: `cflags` less
+/// their preprocessor words ([`ENV_C_CPPFLAGS`]).
 pub(crate) const ENV_CFLAGS: &str = "BHF_TOOLCHAIN_CFLAGS";
 /// The C++ counterpart of [`ENV_CFLAGS`].
 pub(crate) const ENV_CXXFLAGS: &str = "BHF_TOOLCHAIN_CXXFLAGS";
 /// Defines and include directories, applied to every lane.
 pub(crate) const ENV_CPPFLAGS: &str = "BHF_TOOLCHAIN_CPPFLAGS";
-/// Link flags for the `$(CC)`/`$(CXX)` links.
+/// The preprocessor words of `cflags` (`-D`, `-U`, `-I`, `-isystem`,
+/// `-include`, ...), applied to every lane of a C harness and to the C units
+/// of a C++ one.
+pub(crate) const ENV_C_CPPFLAGS: &str = "BHF_TOOLCHAIN_C_CPPFLAGS";
+/// The preprocessor words of `cxxflags`, applied to every C++ lane.
+pub(crate) const ENV_CXX_CPPFLAGS: &str = "BHF_TOOLCHAIN_CXX_CPPFLAGS";
+/// The words of `cxxflags` bhf's C driver object (compiled `-x c` by the C++
+/// compiler) takes: those selecting the ABI or target, and `-D`/`-U`/`-I`.
+pub(crate) const ENV_DRIVER_CXXFLAGS: &str = "BHF_TOOLCHAIN_DRIVER_CXXFLAGS";
+/// The `-D`/`-U`/`-I`/`-isystem` words of `cflags`, which bhf's driver object
+/// takes too (the rest of `cflags` reaches it through [`ENV_CFLAGS`]).
+pub(crate) const ENV_DRIVER_CFLAGS: &str = "BHF_TOOLCHAIN_DRIVER_CFLAGS";
+/// Link flags for the `$(CC)`/`$(CXX)` links: `ldflags` less their library
+/// operands ([`ENV_LIBS`]).
 pub(crate) const ENV_LDFLAGS: &str = "BHF_TOOLCHAIN_LDFLAGS";
+/// The library operands of `ldflags` (`-L`, `-l`, archives, objects, linker
+/// options `-Wl,...`/`-Xlinker ...`, `-pthread`), in their order, for the
+/// link of every lane.
+pub(crate) const ENV_LIBS: &str = "BHF_TOOLCHAIN_LIBS";
 /// `--sysroot=`/`--target=`, for every compile and link of the `$(CC)` lanes.
 pub(crate) const ENV_TARGET_FLAGS: &str = "BHF_TOOLCHAIN_TARGET_FLAGS";
 
@@ -46,17 +64,25 @@ pub struct CToolchainArgs {
     pub cxx: Option<String>,
 
     /// Extra C compiler flags, APPENDED to bhf's coverage and sanitizer flags
-    /// (whitespace-separated; repeatable). Config key: `toolchain.cflags`.
+    /// (whitespace-separated; repeatable). Their preprocessor words (-D, -U,
+    /// -I, -isystem, -include) reach every build lane of a C harness; the
+    /// rest only the lanes built with this toolchain's compiler. Config key:
+    /// `toolchain.cflags`.
     #[arg(long = "cflags", value_name = "FLAGS", allow_hyphen_values = true)]
     pub cflags: Vec<String>,
 
-    /// Extra C++ compiler flags, appended like --cflags. Config key:
+    /// Extra C++ compiler flags, appended like --cflags (to every lane of a
+    /// C++ harness for their preprocessor words). bhf's C driver object takes
+    /// only those that select the ABI or target, -D, -U and -I. Config key:
     /// `toolchain.cxxflags`.
     #[arg(long = "cxxflags", value_name = "FLAGS", allow_hyphen_values = true)]
     pub cxxflags: Vec<String>,
 
     /// Extra link flags for the harness binary (whitespace-separated;
-    /// repeatable). Config key: `toolchain.ldflags`.
+    /// repeatable). Library operands (-L, -l, archives, objects, linker
+    /// options -Wl,... and -Xlinker ..., -pthread) reach every build lane's
+    /// link, in their order; the rest only the lanes
+    /// built with this toolchain's compiler. Config key: `toolchain.ldflags`.
     #[arg(long = "ldflags", value_name = "FLAGS", allow_hyphen_values = true)]
     pub ldflags: Vec<String>,
 
@@ -529,13 +555,182 @@ pub(crate) fn make_values(
             .iter()
             .map(|dir| format!("-I{}", recipe_path(&make_path(dir)))),
     );
+    let (c_cppflags, cflags) = split_preprocessor_words(&config.cflags);
+    let (cxx_cppflags, cxxflags) = split_preprocessor_words(&config.cxxflags);
+    let (libs, ldflags) = split_library_operands(&config.ldflags);
     vec![
         (ENV_TARGET_FLAGS, target_flags.join(" ")),
-        (ENV_CFLAGS, words(&config.cflags)),
-        (ENV_CXXFLAGS, words(&config.cxxflags)),
+        (ENV_CFLAGS, words(&cflags)),
+        (ENV_CXXFLAGS, words(&cxxflags)),
         (ENV_CPPFLAGS, cppflags.join(" ")),
-        (ENV_LDFLAGS, words(&config.ldflags)),
+        (ENV_C_CPPFLAGS, words(&c_cppflags)),
+        (ENV_CXX_CPPFLAGS, words(&cxx_cppflags)),
+        (
+            ENV_DRIVER_CXXFLAGS,
+            words(&driver_cxxflags(&config.cxxflags)),
+        ),
+        (
+            ENV_DRIVER_CFLAGS,
+            words(&driver_preprocessor_words(&config.cflags)),
+        ),
+        (ENV_LDFLAGS, words(&ldflags)),
+        (ENV_LIBS, words(&libs)),
     ]
+}
+
+/// The compiler options that take their operand as the next word when it is
+/// not attached (`-I dir` as well as `-Idir`).
+fn takes_separate_operand(flag: &str) -> bool {
+    matches!(
+        flag,
+        "-D" | "-U"
+            | "-I"
+            | "-isystem"
+            | "-iquote"
+            | "-idirafter"
+            | "-include"
+            | "-imacros"
+            | "-L"
+            | "-l"
+            | "-target"
+            | "--sysroot"
+            | "-mllvm"
+            | "-x"
+            | "-Xclang"
+            | "-Xlinker"
+            | "-Xpreprocessor"
+            // `-Wl,-rpath -Wl,<dir>`: the directory is the next word.
+            | "-Wl,-rpath"
+            | "-Wl,-rpath-link"
+    )
+}
+
+/// `flags` as words grouped with their separate operand (`["-isystem",
+/// "/opt/inc"]` is one group).
+fn flag_groups(flags: &[String]) -> Vec<&[String]> {
+    let mut groups = Vec::new();
+    let mut index = 0;
+    while index < flags.len() {
+        let len = if takes_separate_operand(&flags[index]) && index + 1 < flags.len() {
+            2
+        } else {
+            1
+        };
+        groups.push(&flags[index..index + len]);
+        index += len;
+    }
+    groups
+}
+
+/// Whether a flag group is a preprocessor option: a define, an include
+/// directory or a forced include.
+fn is_preprocessor_group(group: &[String]) -> bool {
+    let flag = group[0].as_str();
+    ["-D", "-U", "-I"]
+        .iter()
+        .any(|prefix| flag.starts_with(prefix))
+        || matches!(
+            flag,
+            "-isystem" | "-iquote" | "-idirafter" | "-include" | "-imacros"
+        )
+        || ["-isystem", "-iquote", "-idirafter"]
+            .iter()
+            .any(|prefix| flag.starts_with(prefix))
+}
+
+/// `flags` split into their preprocessor words and the rest, each keeping
+/// its order.
+fn split_preprocessor_words(flags: &[String]) -> (Vec<String>, Vec<String>) {
+    split_groups(flags, is_preprocessor_group)
+}
+
+/// Whether a link flag group is a library operand: a library search dir, a
+/// library, an archive, shared object or object file, `-pthread`, or a linker
+/// option (`-Wl,...`, `-Xlinker ...`). Linker options go with the libraries
+/// because many act on the operands that follow them (`--whole-archive`,
+/// `-Bstatic`, `--as-needed`, link groups), so the two keep their order; any
+/// compiler driver hands them to the linker unchanged.
+fn is_library_group(group: &[String]) -> bool {
+    let flag = group[0].as_str();
+    let is_file = |word: &str| {
+        let name = word.rsplit('/').next().unwrap_or(word);
+        !word.starts_with('-')
+            && (name.ends_with(".a")
+                || name.ends_with(".so")
+                || name.contains(".so.")
+                || name.ends_with(".lib")
+                || name.ends_with(".o"))
+    };
+    flag.starts_with("-L")
+        || flag.starts_with("-l")
+        || flag.starts_with("-Wl,")
+        || matches!(flag, "-Xlinker" | "-pthread")
+        || is_file(flag)
+}
+
+/// `flags` split into their library operands and the rest, each keeping its
+/// order.
+fn split_library_operands(flags: &[String]) -> (Vec<String>, Vec<String>) {
+    split_groups(flags, is_library_group)
+}
+
+fn split_groups(
+    flags: &[String],
+    select: impl Fn(&[String]) -> bool,
+) -> (Vec<String>, Vec<String>) {
+    let mut selected = Vec::new();
+    let mut rest = Vec::new();
+    for group in flag_groups(flags) {
+        if select(group) {
+            selected.extend(group.iter().cloned());
+        } else {
+            rest.extend(group.iter().cloned());
+        }
+    }
+    (selected, rest)
+}
+
+/// The `-D`, `-U`, `-I` and `-isystem` words of `flags` (with a separate
+/// operand), never a forced `-include`: a header search dir or a define a
+/// toolchain needs for every object, bhf's driver included.
+fn driver_preprocessor_words(flags: &[String]) -> Vec<String> {
+    let keep = |group: &[String]| {
+        let flag = group[0].as_str();
+        ["-D", "-U", "-I"]
+            .iter()
+            .any(|prefix| flag.starts_with(prefix))
+            || flag.starts_with("-isystem")
+    };
+    split_groups(flags, keep).0
+}
+
+/// The words of the C++ flags bhf's C driver object takes. The driver is C
+/// compiled by the C++ compiler, and links into the same binary, so it needs
+/// what selects the ABI and target (`-m*`, `--target=`/`-target`, `-fPIC`
+/// and the `pic`/`pie` family, `-fshort-wchar`, `-fshort-enums`,
+/// `--sysroot`) and the preprocessor's `-D`, `-U`, `-I` and `-isystem`;
+/// anything else (`-include iostream`, `-std=`, `-stdlib=`, `-fno-rtti`,
+/// `-fexceptions`, a C++-only warning) could break its C compile.
+pub(crate) fn driver_cxxflags(cxxflags: &[String]) -> Vec<String> {
+    const PIC_PIE: &[&str] = &["pic", "PIC", "pie", "PIE"];
+    let keep = |group: &[String]| {
+        let flag = group[0].as_str();
+        let pic = flag
+            .strip_prefix("-fno-")
+            .or_else(|| flag.strip_prefix("-f"))
+            .is_some_and(|rest| PIC_PIE.contains(&rest));
+        flag.starts_with("-m")
+            || flag.starts_with("--target=")
+            || flag == "-target"
+            || flag.starts_with("--sysroot")
+            || pic
+            || matches!(flag, "-fshort-wchar" | "-fshort-enums")
+            || ["-D", "-U", "-I"]
+                .iter()
+                .any(|prefix| flag.starts_with(prefix))
+            || flag.starts_with("-isystem")
+    };
+    split_groups(cxxflags, keep).0
 }
 
 /// The toolchain's compile flags as plain arguments, for a compiler bhf runs
@@ -858,7 +1053,7 @@ pub(crate) fn ada_runner(
 /// The arguments placed between `runner` and a harness built for `triple`:
 /// `toolchain.runner-args` when given, else `-L <sysroot>` for a qemu-user
 /// runner (`sysroot`, or `/usr/<triple>` when that directory exists).
-fn runner_args(
+pub(crate) fn runner_args(
     config: &ToolchainConfig,
     runner: &str,
     triple: &str,
@@ -943,7 +1138,71 @@ fn check_runnable_with(
             runner_hint(&target)
         ));
     }
+    if config.runner.is_none() {
+        check_host_probe_backend(config)?;
+    }
     Ok(())
+}
+
+/// Refuse a probe backend a host run never reads: every backend but
+/// `host_file` keeps an Ada harness's events on the target (a memory buffer,
+/// semihosting, nowhere), so with no on-target transport a host sweep would
+/// see no event and lose every finding.
+pub(crate) fn check_host_probe_backend(config: &ToolchainConfig) -> Result<(), String> {
+    let backend = probe_backend(config);
+    if backend == crate::probe_backend::ProbeBackend::HostFile {
+        return Ok(());
+    }
+    let name = clap::ValueEnum::to_possible_value(&backend)
+        .map(|value| value.get_name().to_owned())
+        .unwrap_or_else(|| format!("{backend:?}"));
+    Err(format!(
+        "toolchain.ada.probe-backend: {name} needs an on-target transport; a host sweep reads \
+         events through host_file (drop the key, or set it to host_file)"
+    ))
+}
+
+/// Check that the Ada toolchain a sweep with Ada candidates builds with is
+/// installed: an explicit `toolchain.ada.gprbuild`/`gnat`, else
+/// `<prefix>-gprbuild` (or the multi-target `gprbuild` with
+/// `<prefix>-gnat`, which `bhf build` also accepts) for a tool prefix. The
+/// error names the key, so a missing cross GNAT fails the plan rather than
+/// every Ada build.
+pub(crate) fn check_ada_tools(config: &ToolchainConfig) -> Result<(), String> {
+    for (key, program) in [
+        ("toolchain.ada.gprbuild", &config.ada.gprbuild),
+        ("toolchain.ada.gnat", &config.ada.gnat),
+    ] {
+        if let Some(program) = program {
+            if !program_exists(program) {
+                return Err(format!("{key}: {program} not found on PATH"));
+            }
+        }
+    }
+    if config.ada.gprbuild.is_some() {
+        return Ok(());
+    }
+    let Some(prefix) = config
+        .ada
+        .prefix
+        .as_deref()
+        .filter(|prefix| project_synth::gpr_toolchain_name(prefix).is_none())
+        .map(|prefix| prefix.trim_end_matches('-'))
+        .filter(|prefix| !prefix.is_empty())
+    else {
+        return Ok(());
+    };
+    let prefixed = format!("{prefix}-gprbuild");
+    if program_exists(&prefixed)
+        || (program_exists("gprbuild") && program_exists(&format!("{prefix}-gnat")))
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "toolchain.ada.prefix: {prefixed} not found on PATH (nor gprbuild with \
+         {prefix}-gnat); install the {prefix} GNAT toolchain or set toolchain.ada.gprbuild \
+         (--ada-gprbuild)"
+    ))
 }
 
 /// An emulator that runs `triple`'s programs, for an error message.
@@ -970,6 +1229,22 @@ pub(crate) fn compiler_builds_for_host(compiler: &str) -> bool {
         .expect("host cache")
         .insert(compiler.to_owned(), host);
     host
+}
+
+/// The triple `compiler` builds for (`-dumpmachine`), asked once per
+/// compiler; `None` when it cannot say.
+pub(crate) fn compiler_target_triple(compiler: &str) -> Option<String> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(known) = cache.lock().expect("triple cache").get(compiler) {
+        return known.clone();
+    }
+    let triple = dump_machine(compiler);
+    cache
+        .lock()
+        .expect("triple cache")
+        .insert(compiler.to_owned(), triple.clone());
+    triple
 }
 
 /// `<compiler> -dumpmachine`, the triple it builds for.
@@ -1067,7 +1342,9 @@ mod tests {
             .into_iter()
             .collect();
         assert_eq!(values[ENV_CFLAGS], "-O2");
-        assert_eq!(values[ENV_LDFLAGS], "-lm");
+        // A library operand reaches every lane's link, through the libraries.
+        assert_eq!(values[ENV_LDFLAGS], "");
+        assert_eq!(values[ENV_LIBS], "-lm");
         // A Windows recipe may run through `cmd`, which ignores single quotes.
         let spaced_define = if cfg!(windows) {
             "\"-DNAME=a b\""
@@ -1087,6 +1364,127 @@ mod tests {
             .into_iter()
             .collect();
         assert_eq!(values[ENV_TARGET_FLAGS], "--sysroot=/opt/sysroot");
+    }
+
+    /// The C++ flags bhf's C driver object may take: those that select the
+    /// ABI or target, and the preprocessor's -D/-U/-I; never a C++-only flag
+    /// such as `-include iostream`, `-std=` or `-fno-rtti`, which would break
+    /// the `-x c` compile of the driver.
+    #[test]
+    fn the_driver_takes_only_the_abi_and_target_words_of_the_cxx_flags() {
+        let words = |text: &str| {
+            text.split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            driver_cxxflags(&words(
+                "-include iostream -std=gnu++17 -stdlib=libc++ -fno-rtti -fexceptions \
+                 -m32 -march=armv8-a -mfloat-abi=hard --target=aarch64-linux-gnu \
+                 -target aarch64-linux-gnu -fPIC -fno-pie -fshort-wchar -fshort-enums \
+                 --sysroot=/opt/sr -DWIDGET=1 -U NDEBUG -I/opt/inc -isystem /opt/sys \
+                 -imacros cfg.h -Wall -fvisibility-inlines-hidden"
+            )),
+            words(
+                "-m32 -march=armv8-a -mfloat-abi=hard --target=aarch64-linux-gnu \
+                 -target aarch64-linux-gnu -fPIC -fno-pie -fshort-wchar -fshort-enums \
+                 --sysroot=/opt/sr -DWIDGET=1 -U NDEBUG -I/opt/inc -isystem /opt/sys"
+            )
+        );
+    }
+
+    /// The preprocessor words of the C and C++ flags, and the library
+    /// operands of the link flags, are published apart from the rest, for the
+    /// Makefile lanes built with other compilers (coverage, AFL++, libFuzzer,
+    /// ...), which must see the same headers and libraries as `main`.
+    #[test]
+    fn preprocessor_and_library_words_are_split_out_for_every_lane() {
+        let words = |text: &str| {
+            text.split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let config = ToolchainConfig {
+            cflags: words("-O2 -DBOARD=3 -include cfg.h -isystem /opt/vend/include -Wextra"),
+            cxxflags: words("-include iostream -fno-rtti -D WIDGET_CXX=1 -I/opt/inc"),
+            ldflags: words(
+                "-fuse-ld=lld -L/opt/vend/lib -lvendor -L /opt/more -l z libextra.a \
+                 /opt/obj/glue.o libshared.so.2 -Wl,-rpath,/opt/vend/lib -Wl,--start-group \
+                 -lcore -Wl,--end-group -pthread -Wl,--as-needed -static-libgcc \
+                 -Wl,-rpath -Wl,/opt/more -Wl,--whole-archive libregistry.a \
+                 -Wl,--no-whole-archive -Xlinker -Bstatic -lfoo -Xlinker -Bdynamic",
+            ),
+            ..ToolchainConfig::default()
+        };
+        let values: HashMap<_, _> = make_values(&config, Some(CompilerFamily::Gcc))
+            .into_iter()
+            .collect();
+        assert_eq!(values[ENV_CFLAGS], "-O2 -Wextra");
+        assert_eq!(
+            values[ENV_C_CPPFLAGS],
+            "-DBOARD=3 -include cfg.h -isystem /opt/vend/include"
+        );
+        assert_eq!(values[ENV_CXXFLAGS], "-fno-rtti");
+        assert_eq!(
+            values[ENV_CXX_CPPFLAGS],
+            "-include iostream -D WIDGET_CXX=1 -I/opt/inc"
+        );
+        assert_eq!(values[ENV_DRIVER_CXXFLAGS], "-D WIDGET_CXX=1 -I/opt/inc");
+        // The driver object takes the header dirs and defines of the C flags,
+        // never a forced include.
+        assert_eq!(
+            values[ENV_DRIVER_CFLAGS],
+            "-DBOARD=3 -isystem /opt/vend/include"
+        );
+        // Linker options keep their order with the libraries they act on
+        // (`--whole-archive`, `-Bstatic`, `--as-needed`).
+        assert_eq!(
+            values[ENV_LIBS],
+            "-L/opt/vend/lib -lvendor -L /opt/more -l z libextra.a /opt/obj/glue.o \
+             libshared.so.2 -Wl,-rpath,/opt/vend/lib -Wl,--start-group -lcore \
+             -Wl,--end-group -pthread -Wl,--as-needed -Wl,-rpath -Wl,/opt/more \
+             -Wl,--whole-archive libregistry.a -Wl,--no-whole-archive -Xlinker -Bstatic \
+             -lfoo -Xlinker -Bdynamic"
+        );
+        assert_eq!(values[ENV_LDFLAGS], "-fuse-ld=lld -static-libgcc");
+    }
+
+    #[test]
+    fn the_ada_toolchain_and_probe_backend_are_checked_before_a_sweep() {
+        let mut config = ToolchainConfig::default();
+        assert_eq!(check_host_probe_backend(&config), Ok(()));
+        config.ada.probe_backend = Some("memory_buffer".to_owned());
+        let error = check_host_probe_backend(&config).unwrap_err();
+        assert!(
+            error.starts_with(
+                "toolchain.ada.probe-backend: memory_buffer needs an on-target transport"
+            ),
+            "{error}"
+        );
+        // The sweep refuses it; with a runner, which takes the harness to its
+        // target where the backend belongs, it does not.
+        assert_eq!(check_runnable_with(&config, None, None), Err(error));
+        config.runner = Some("qemu-aarch64".to_owned());
+        config.ada.prefix = Some("aarch64-linux-gnu".to_owned());
+        assert_eq!(check_runnable_with(&config, None, None), Ok(()));
+
+        let mut config = ToolchainConfig::default();
+        assert_eq!(check_ada_tools(&config), Ok(()));
+        config.ada.prefix = Some("bhf-no-such-triple".to_owned());
+        assert_eq!(
+            check_ada_tools(&config).unwrap_err(),
+            "toolchain.ada.prefix: bhf-no-such-triple-gprbuild not found on PATH (nor \
+             gprbuild with bhf-no-such-triple-gnat); install the bhf-no-such-triple GNAT \
+             toolchain or set toolchain.ada.gprbuild (--ada-gprbuild)"
+        );
+        // A gprconfig compiler name is not a prefix.
+        config.ada.prefix = Some("GNAT".to_owned());
+        assert_eq!(check_ada_tools(&config), Ok(()));
+        config.ada.gprbuild = Some("bhf-no-such-gprbuild".to_owned());
+        assert_eq!(
+            check_ada_tools(&config).unwrap_err(),
+            "toolchain.ada.gprbuild: bhf-no-such-gprbuild not found on PATH"
+        );
     }
 
     #[test]

@@ -1059,6 +1059,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/bhf_runtrace_shim/src/fakes/reporting.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/bhf_runtrace_shim/src/hooks/assertion.rs",
       "license": "Apache-2.0"
     },
@@ -1156,6 +1160,10 @@
     },
     {
       "path": "crates/bhf_runtrace_shim/src/sdk.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/bhf_runtrace_shim/src/symbolizer.rs",
       "license": "Apache-2.0"
     },
     {
@@ -1416,6 +1424,10 @@
     },
     {
       "path": "crates/cli/src/auto/js_build.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/src/auto/lanes.rs",
       "license": "Apache-2.0"
     },
     {
@@ -2204,6 +2216,10 @@
     },
     {
       "path": "crates/cli/tests/auto_full_tu_link.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/tests/auto_gcc_lane.rs",
       "license": "Apache-2.0"
     },
     {

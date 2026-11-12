@@ -36,6 +36,7 @@ fn missing_dependency_fixture_passes_when_gnat_available() {
     let spec = ProjectSpec {
         project_name: "Bhf_Build".to_owned(),
         extends_project: None,
+        parent_compiler: None,
         source_roots: vec![
             SourceRoot {
                 path: source_dir,

@@ -110,6 +110,27 @@ extern void bhf_shim_set_fuzz_input(const uint8_t *data, size_t size) __attribut
 } while (0)
 #endif
 
+/* AddressSanitizer calls `__asan_on_error` at the start of every report. The
+ * report's symbolizer opens objects and debug files by name, and the runtrace
+ * shim, in a faking pass, would hand it a fake file for each one it misses
+ * (GCC's libasan then aborts with a nested error and the finding loses its
+ * stack), so tell the shim, when it is loaded, to stop faking. Linux only,
+ * like the shim, and for the reason BHF_PUBLISH_INPUT gives.
+ *
+ * The definition is strong on purpose: the sanitizer runtime's own (empty,
+ * weak) one is linked ahead of every object when the runtime is static (clang,
+ * gcc -static-libasan), and the first of two weak definitions wins, so a weak
+ * one here would never run. A target that defines `__asan_on_error` itself
+ * builds the driver with -DBHF_NO_ASAN_ON_ERROR (toolchain.cflags reach the
+ * driver's -D words); its own hook then runs and the shim keeps its other
+ * report-time protections (the symbolizer's paths are never faked). */
+#if !defined(_WIN32) && !defined(BHF_NO_ASAN_ON_ERROR)
+extern void bhf_shim_sanitizer_reporting(void) __attribute__((weak));
+void __asan_on_error(void) {
+    if (bhf_shim_sanitizer_reporting) bhf_shim_sanitizer_reporting();
+}
+#endif
+
 /* The coverage/cmplog runtime functions must NOT be instrumented themselves: a
  * compare inside a trace-cmp callback would re-enter it and recurse forever, and
  * self-edges would pollute the bitmap. GCC (incl. mingw) spells the opt-out

@@ -244,6 +244,21 @@ fn is_sanitizer_owned_path(path: &str) -> bool {
     trimmed.contains("/.cache/llvm-debuginfod")
         || trimmed.contains("/llvm-debuginfod/")
         || trimmed.contains("llvm-symbolizer")
+        || is_symbolizer_pseudo_path(trimmed)
+}
+
+/// A path a sanitizer's symbolizer opens while it writes a report, which is
+/// no file of the target's: the vDSO's link-map name (`linux-vdso.so.1`), or
+/// a separate debug file (`<object>.debug`, `<dir>/.debug/<object>`,
+/// `/usr/lib/debug/...`).
+fn is_symbolizer_pseudo_path(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    matches!(
+        name,
+        "linux-vdso.so.1" | "linux-gate.so.1" | "linux-vdso64.so.1"
+    ) || name.ends_with(".debug")
+        || path.split('/').any(|segment| segment == ".debug")
+        || path.starts_with("/usr/lib/debug/")
 }
 
 fn should_keep_event(event: &RuntraceEvent) -> bool {
@@ -882,7 +897,7 @@ pub fn is_bhf_owned_resource(path: &str) -> bool {
     if trimmed.is_empty() {
         return false;
     }
-    if trimmed == "/dev/null" {
+    if trimmed == "/dev/null" || is_symbolizer_pseudo_path(trimmed) {
         return true;
     }
     OWNED_SUBSTRINGS
@@ -2608,6 +2623,36 @@ mod tests {
                 "{target} must NOT be treated as bhf-owned"
             );
         }
+    }
+
+    /// The vDSO's link-map name and separate debug files are what a
+    /// sanitizer's symbolizer opens while it writes a report: never a
+    /// dependency the target is missing, never a leak — even in a log a shim
+    /// without the pseudo-path rules wrote.
+    #[test]
+    fn symbolizer_pseudo_paths_are_neither_missing_deps_nor_leaks() {
+        let log = r#"{"e":"open","p":"linux-vdso.so.1","r":-1,"n":2}
+{"e":"open","p":"/lib/x86_64-linux-gnu/libc.so.6.debug","r":-1,"n":2}
+{"e":"open","p":"/lib/x86_64-linux-gnu/.debug/libc.so.6","r":-1,"n":2}
+{"e":"open","p":"/etc/widget.conf","r":-1,"n":2}"#;
+        let missing: Vec<String> = parse_str(log)
+            .into_iter()
+            .filter_map(|event| match event {
+                RuntraceEvent::FileMissing { path, .. } => Some(path),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(missing, vec!["/etc/widget.conf".to_owned()]);
+        for path in ["linux-vdso.so.1", "/usr/lib/debug/x.debug", "/a/.debug/b"] {
+            assert!(is_bhf_owned_resource(path), "{path}");
+        }
+        let hits = oracle_hits_from_events(&[RuntraceEvent::FileOpened {
+            syscall: "open".to_owned(),
+            fd: 5,
+            path: "linux-vdso.so.1".to_owned(),
+            taint_offset: None,
+        }]);
+        assert!(!hits.iter().any(|h| h.rule_id == "BHF-306"), "{hits:?}");
     }
 
     #[test]

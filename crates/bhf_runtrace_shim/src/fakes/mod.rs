@@ -12,3 +12,4 @@ pub mod fuzz_input;
 pub mod memfd;
 pub mod mode;
 pub mod peer;
+pub mod reporting;

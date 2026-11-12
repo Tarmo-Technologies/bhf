@@ -98,12 +98,12 @@ their own interpreters with in-process edge coverage.
 | `--no-seed-mining` | off | Do not seed targets from the tree's own test-data files (see [Seeds](#seeds)). Config key: `seed-mining = false` |
 | `--extra-include <DIR>` | none | Extra C/C++ include dirs for dependency headers outside the swept tree; seeded onto every harness `-I` ahead of synthesized placeholders. Read from local disk only; paths with spaces are quoted; repeatable |
 | `--cc <PROGRAM>` / `--cxx <PROGRAM>` | `clang` / `clang++` | C/C++ compiler for every harness build (a name on `PATH` or a path), replacing `CC`/`CXX`. The Makefile picks matching instrumentation (gcc, a cross-prefixed gcc, or clang), so no flag spelling has to be adapted. The choice is announced; config keys `toolchain.cc` / `toolchain.cxx` |
-| `--cflags <FLAGS>` / `--cxxflags <FLAGS>` / `--ldflags <FLAGS>` | none | Extra compile / link flags, APPENDED to bhf's coverage and sanitizer flags (whitespace-separated; repeatable). They apply to the lanes built with `$(CC)`/`$(CXX)`; config keys `toolchain.cflags` / `toolchain.cxxflags` / `toolchain.ldflags` |
+| `--cflags <FLAGS>` / `--cxxflags <FLAGS>` / `--ldflags <FLAGS>` | none | Extra compile / link flags, APPENDED to bhf's coverage and sanitizer flags (whitespace-separated; repeatable). Their preprocessor words (`-D`, `-U`, `-I`, `-isystem`, `-include`) and the library operands of `ldflags` (`-L`, `-l`, archives, objects, linker options `-Wl,...`/`-Xlinker ...`, `-pthread`, in their order) reach every build lane (coverage, AFL++, libFuzzer, MSan, TSan, differential); the rest apply to the lanes built with `$(CC)`/`$(CXX)`. A lane that still fails to build is reported (`run.json` `targets[].lanes`, `summary.txt`, `run.md`); config keys `toolchain.cflags` / `toolchain.cxxflags` / `toolchain.ldflags` |
 | `--define <NAME[=VALUE]>` / `--toolchain-include <DIR>` | none | Preprocessor definitions and `-I` directories for every harness compile and every lane (repeatable); config keys `toolchain.defines` / `toolchain.include-dirs` |
 | `--sysroot <DIR>` | unset | Handed to the compiler as `--sysroot=`, and to a qemu-user runner as `-L <DIR>` when `--runner-arg` is not given; config key `toolchain.sysroot` |
 | `--target-triple <TRIPLE>` | host | Build every C/C++ candidate for this triple, with `<triple>-gcc`/`<triple>-g++` unless `--cc`/`--cxx` name the compilers (a clang gets `--target=`). A triple the host cannot run needs `--runner`; config key `toolchain.target` |
 | `--runner <PROGRAM>` / `--runner-arg <ARG>` | unset | Whole-sweep cross mode: every C/C++ candidate is built for the target WITH coverage and fuzzed under this emulator (`qemu-aarch64`). Arguments go between the runner and the harness; see [Cross-Compilation](../cross-compilation/#whole-sweep-cross-targets). Config keys `toolchain.runner` / `toolchain.runner-args` |
-| `--ada-prefix`, `--ada-target`, `--ada-runtime`, `--ada-gprbuild`, `--ada-gnat`, `--ada-switch`, `--probe-backend` | host GNAT, `host_file` | The Ada toolchain of every Ada harness build: tool prefix (`<prefix>-gnat`), `for Target use`, `for Runtime ("Ada") use`, explicit `gprbuild`/`gnat` programs, extra compiler switches appended to bhf's, and the AdaFuzz probe backend. `--ada-target` defaults to `--target-triple`. Config keys `toolchain.ada.prefix`, `toolchain.ada.target`, `toolchain.ada.runtime`, `toolchain.ada.gprbuild`, `toolchain.ada.gnat`, `toolchain.ada.switches`, `toolchain.ada.probe-backend` |
+| `--ada-prefix`, `--ada-target`, `--ada-runtime`, `--ada-gprbuild`, `--ada-gnat`, `--ada-switch`, `--probe-backend` | host GNAT, `host_file` | The Ada toolchain of every Ada harness build: tool prefix (`<prefix>-gnat`), `for Target use`, `for Runtime ("Ada") use`, explicit `gprbuild`/`gnat` programs, extra compiler switches appended to bhf's, and the AdaFuzz probe backend. `--ada-target` defaults to `--target-triple`. When the tree has Ada candidates, the toolchain must be installed: a `<prefix>-gprbuild` (or `gprbuild` with `<prefix>-gnat`), or the explicit programs, else the run (and `--dry-run`) stops with exit 2 naming the key. A probe backend other than `host_file` needs an on-target transport, so without a runner it is refused the same way: a host sweep reads events only through `host_file`. Config keys `toolchain.ada.prefix`, `toolchain.ada.target`, `toolchain.ada.runtime`, `toolchain.ada.gprbuild`, `toolchain.ada.gnat`, `toolchain.ada.switches`, `toolchain.ada.probe-backend` |
 | `--ada-deps <DIR>` | none | Local Ada dependency-source dirs put on the build path (offline: never fetched); repeatable. Locally-cached Alire deps are picked up automatically |
 | `--probe-build` | off | Run the project's own build offline to recover real compile flags and generated headers. Detects + drives CMake, Meson, Visual Studio, Make/autotools (compiler-interposing wrapper), Ninja, and — under interception — Bazel/SCons. EXECUTES untrusted build scripts (sandboxed when bwrap/firejail is present) |
 | `--msbuild-solution <PATH>` | shallowest `.sln`/`.slnx` | The Visual Studio solution the default project import reads (a tree with a solution or `.vcxproj` and no compile database or CMake/Meson build; off Windows, only when the solution is the tree's only build description, unless this flag names it). A relative PATH is resolved against the scanned tree, a solution outside the tree is imported too, and a missing file is an error. The import runs nothing: it evaluates the projects' property sheets and `Condition=`s for one configuration and writes `<work>/auto/msbuild/compile_commands.json`. See [c-cpp.md](c-cpp.md) |
@@ -218,14 +218,28 @@ A key left out keeps bhf's built-in choice for the lane, and a clang `cc` gets
 `--target=<triple>`. See
 [Cross-Compilation](../cross-compilation/#overriding-a-lanes-toolchain).
 
-An Ada harness's project extends the governing project but replaces its
-`package Compiler` switches with bhf's own; add the switches the harness needs
-(such as `-O1`) with `switches`.
+An Ada harness's project extends the governing project and its `package
+Compiler`: bhf's switches follow the parent's `Default_Switches ("Ada")`, so a
+switch the sources need (`-O1`, a `-gnateD` symbol) stays; add further ones
+with `switches`.
 
 `toolchain.cflags` reach bhf's driver object as well as the target's
 translation units (without `-std=` and `-Werror`), so an ABI-selecting flag
-(`-m32`, `-mabi=...`) applies to the whole link; in a C++ harness the driver
-takes `cxxflags` too.
+(`-m32`, `-mabi=...`) applies to the whole link. In a C++ harness the driver,
+which is C compiled by the C++ compiler, takes only the `cxxflags` that select
+the ABI or target (`-m*`, `--target=`, `-fPIC`, `-fshort-wchar`, ...) and
+`-D`/`-U`/`-I`/`-isystem`, so a C++-only flag such as `-include iostream` or
+`-fno-rtti` reaches the target and not the driver.
+
+Every sanitized lane, the gcc probe build and a capsule's `build.sh` end
+their compiles with `-U_FORTIFY_SOURCE -Wp,-U_FORTIFY_SOURCE
+-Wp,-D_FORTIFY_SOURCE=0`, after the build context's and the toolchain's
+flags: glibc's fortification, on by default in Ubuntu's gcc and in many
+distributions' build flags, would otherwise abort an overflow in a fortified
+call (`*** buffer overflow detected ***`) before AddressSanitizer reports it.
+The `-Wp,` words win over a `-Wp,-D_FORTIFY_SOURCE=N` in the build flags
+(Fedora's, RHEL's and Arch's spelling), which the compiler applies after
+every plain `-D` and `-U`.
 
 ## Outputs and disk cleanup
 

@@ -2115,6 +2115,8 @@ fn run_attempt(
     // from an earlier attempt if this attempt later fails or chooses a different
     // generation path. Coverage without a fresh recipe is honestly unavailable.
     crate::auto::coverage_replay::clear_build_recipe(&harness_dir);
+    // Nor the build lanes it recorded: this run reports its own.
+    crate::auto::lanes::clear(&harness_dir);
     let mut manifest = RepairManifest::default();
     // Seed user-supplied `--extra-source` files so a multi-file library's real
     // translation units are compiled+linked on the first build attempt — the
@@ -3601,21 +3603,37 @@ fn run_attempt(
                 // target or discards the builtin results.
                 if run_afl {
                     progress.update(&ProgressUpdate::phase(Phase::Fuzz { pass: "afl++" }));
-                    let afl_built = crate::build::try_run_c_make_afl_build_with_extras(
+                    let afl_build = crate::build::try_run_c_make_afl_build_with_extras(
                         work_dir,
                         &candidate.harness_id,
                         &extra_sources,
                         &extra_includes,
-                    )
-                    .status
-                    .success();
+                    );
+                    let afl_built = afl_build.status.success();
+                    let afl_lane = if afl_built {
+                        crate::auto::lanes::LaneStatus::built()
+                    } else {
+                        crate::auto::lanes::LaneStatus::failed(
+                            "main_afl",
+                            &format!(
+                                "{}\n{}",
+                                String::from_utf8_lossy(&afl_build.stderr),
+                                String::from_utf8_lossy(&afl_build.stdout)
+                            ),
+                        )
+                    };
                     if !afl_built {
                         bhfeprintln!(
-                            "bhf auto: warning: `make afl` failed for {} — AFL skipped, \
-                             builtin results kept",
-                            candidate.harness_id
+                            "bhf auto: warning: {}",
+                            afl_skipped_message(
+                                &candidate.harness_id,
+                                pass_runs.iter().any(|run| run.executions > 0),
+                                afl_lane.reason.as_deref().unwrap_or("make main_afl failed"),
+                            )
                         );
-                    } else {
+                    }
+                    crate::auto::lanes::record(&harness_dir, crate::auto::lanes::AFL, afl_lane);
+                    if afl_built {
                         // Seed AFL from the corpus the builtin passes grew (deep inputs
                         // reached once stay reachable), plus the base/user seeds.
                         let mut afl_seeds = seeds.clone();
@@ -4598,6 +4616,18 @@ fn harness_owns_runtime_instrumentation(harness_dir: &std::path::Path) -> bool {
                 || s.contains("BHF_PHP_LAUNCHER")
         })
         .unwrap_or(false)
+}
+
+/// The warning for a failed `make afl`: the builtin engine's results stand
+/// when it fuzzed the target, and otherwise the target was not fuzzed at all.
+fn afl_skipped_message(harness_id: &str, builtin_fuzzed: bool, failure: &str) -> String {
+    if builtin_fuzzed {
+        format!(
+            "`make afl` failed for {harness_id} — AFL skipped, builtin results kept ({failure})"
+        )
+    } else {
+        format!("AFL skipped; {harness_id} was not fuzzed ({failure})")
+    }
 }
 
 /// Whether the builtin fuzz pass of this harness that just ran had the
@@ -11079,9 +11109,9 @@ mod ada_source_tests {
 mod stamp_tests {
     use super::{
         ada_subunit_parent, ada_unit_key_from_filename, ada_variant_dest_basename,
-        build_ada_unit_file_map, c_file_is_simd_backend, compute_ada_build_closure,
-        ensure_ada_src_instrumented, env_injections_from_events, fuzz_pass_shim_armed,
-        mirror_harness_into_generated_harnesses, reset_repairs_dir,
+        afl_skipped_message, build_ada_unit_file_map, c_file_is_simd_backend,
+        compute_ada_build_closure, ensure_ada_src_instrumented, env_injections_from_events,
+        fuzz_pass_shim_armed, mirror_harness_into_generated_harnesses, reset_repairs_dir,
         rewrite_legacy_gnat_calendar_c_time, stage_ada_c_repair_sources, stamp_runtime_mode,
         walk_to_common_src_root,
     };
@@ -11257,6 +11287,22 @@ mod stamp_tests {
         let parsed: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert!(parsed.get("input_reachability_basis").is_none(), "{parsed}");
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_failed_afl_build_keeps_builtin_results_only_when_the_builtin_engine_fuzzed() {
+        let failure = "make main_afl failed: afl-clang-fast: not found";
+        assert_eq!(
+            afl_skipped_message("H-C0001", true, failure),
+            "`make afl` failed for H-C0001 — AFL skipped, builtin results kept \
+             (make main_afl failed: afl-clang-fast: not found)"
+        );
+        let afl_only = afl_skipped_message("H-C0001", false, failure);
+        assert_eq!(
+            afl_only,
+            "AFL skipped; H-C0001 was not fuzzed (make main_afl failed: afl-clang-fast: not found)"
+        );
+        assert!(!afl_only.contains("builtin results kept"));
     }
 
     #[test]

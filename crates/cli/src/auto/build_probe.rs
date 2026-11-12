@@ -146,6 +146,20 @@ impl ProbeInstrumentation {
                 if has_ubsan {
                     flags.push(family.ubsan_subtraction().to_owned());
                 }
+                // GCC defines _FORTIFY_SOURCE whenever it optimizes (Ubuntu),
+                // and a fortified call's own abort would pre-empt the
+                // sanitizer, as in the harness Makefile's sanitized lanes.
+                // A project's plain `-D_FORTIFY_SOURCE=N` loses to the
+                // override's `-Wp,` words wherever it sits, and so does a
+                // `-Wp,-D_FORTIFY_SOURCE=N` these flags follow (a replayed
+                // compile command).
+                if family == CompilerFamily::Gcc {
+                    flags.extend(
+                        harness_gen::compiler_family::SANITIZED_NO_FORTIFY
+                            .iter()
+                            .map(|flag| (*flag).to_owned()),
+                    );
+                }
             }
             flags.push(family.coverage_flag().to_owned());
             if cpp && family == CompilerFamily::Clang {
@@ -4210,7 +4224,29 @@ mod tests {
                     .any(|f| f == "-Wno-reserved-user-defined-literal"),
                 "{flags:?}"
             );
+            // gcc's default _FORTIFY_SOURCE would pre-empt the sanitizer.
+            let fortify: Vec<&str> = flags
+                .iter()
+                .map(String::as_str)
+                .filter(|f| f.contains("_FORTIFY_SOURCE"))
+                .collect();
+            assert_eq!(
+                fortify,
+                harness_gen::compiler_family::SANITIZED_NO_FORTIFY,
+                "{flags:?}"
+            );
         }
+        // Without a sanitizer the platform's fortification stays.
+        let plain = ProbeInstrumentation::for_selection_with(
+            &SanitizerSelection::None,
+            &gcc,
+            family,
+            |_, _| true,
+        );
+        assert!(
+            !plain.c_flags.iter().any(|f| f.contains("_FORTIFY_SOURCE")),
+            "{plain:?}"
+        );
         // A sanitizer the toolchain cannot link sends the harnesses, and so
         // the probe, to clang.
         let msan = ProbeInstrumentation::for_selection_with(

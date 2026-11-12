@@ -222,6 +222,24 @@ pub(crate) struct BuildToolchainArgs {
     #[command(flatten)]
     pub(crate) c: crate::toolchain::CToolchainArgs,
 
+    /// Program that runs a harness built for another target, such as
+    /// `qemu-aarch64`. A C/C++ build for a target this host cannot run, or
+    /// one whose compiler does not name its target, records it beside the
+    /// binary (`build/<id>/bhf_runner.json`) and the harness, as does an Ada
+    /// build for another target (`build/<id>/obj/`); `bhf replay`, `bhf
+    /// minimize`, `bhf fuzz`, `bhf decode-args` and the finding's `replay.py`
+    /// run the binary under it when no `--qemu-user` is given. A runner for a
+    /// build this host runs natively is an error. Config key:
+    /// `toolchain.runner`.
+    #[arg(long = "runner", value_name = "PROGRAM")]
+    pub(crate) runner: Option<String>,
+
+    /// Argument placed between the runner and the harness (repeatable).
+    /// Defaults to `-L <sysroot>` (or `-L /usr/<triple>`) for a qemu-user
+    /// runner. Config key: `toolchain.runner-args`.
+    #[arg(long = "runner-arg", value_name = "ARG", allow_hyphen_values = true)]
+    pub(crate) runner_args: Vec<String>,
+
     /// `gprbuild` to run for an Ada harness (name or path). Config key:
     /// `toolchain.ada.gprbuild`.
     #[arg(long = "ada-gprbuild", value_name = "PROGRAM")]
@@ -255,6 +273,14 @@ pub fn run(args: BuildArgs) -> i32 {
             return 2;
         }
     };
+    if let Some(note) = args
+        .toolchain_args
+        .config
+        .as_deref()
+        .and_then(cross_tables_note)
+    {
+        bhfeprintln!("bhf build: note: {note}");
+    }
     // Try the C / C++ make-based build path first. The generated harness
     // ships its own Makefile (Slice A / B of #286); if it's present, the
     // Ada-specific prepare_layout below would fail on the missing
@@ -269,6 +295,22 @@ pub fn run(args: BuildArgs) -> i32 {
             "bhf build: note: {} set the C/C++ toolchain and do not apply to an Ada harness",
             given.join(", ")
         );
+    }
+    let runner = match ada_build_runner(&toolchain) {
+        Ok(runner) => runner,
+        Err(error) => {
+            bhfeprintln!("bhf build: {error}");
+            return 2;
+        }
+    };
+    let runs_natively = crate::toolchain::AdaBuildSettings::from_config(&toolchain).runs_natively();
+    // A probe backend from the config file that keeps the events on the
+    // target, for a harness built for this host: nothing would read them.
+    if args.probe_backend == ProbeBackend::HostFile && runs_natively {
+        if let Err(error) = crate::toolchain::check_host_probe_backend(&toolchain) {
+            bhfeprintln!("bhf build: {error}");
+            return 2;
+        }
     }
     let args = with_ada_toolchain(args, &toolchain);
 
@@ -304,15 +346,40 @@ pub fn run(args: BuildArgs) -> i32 {
     print!("{}", result.stdout);
     bhfeprint!("{}", result.stderr);
 
-    if result.exit_code == 0 {
-        0
-    } else {
-        1
+    if result.exit_code != 0 {
+        return 1;
     }
+    // The emulator an Ada harness built for another target runs under,
+    // recorded beside its binary and beside the harness, as for a C/C++
+    // build; a native rebuild forgets one an earlier build recorded.
+    if runner.is_some() || runs_natively {
+        if let Some(runner) = &runner {
+            bhfeprintln!(
+                "bhf build: the Ada harness runs under `{}`, recorded in bhf_runner.json",
+                std::iter::once(runner.program.display().to_string())
+                    .chain(runner.args.iter().cloned())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+        for dir in [&layout.exec_dir, &layout.harness_dir] {
+            if let Err(error) = crate::gate_evidence::record_runner(dir, runner.as_ref()) {
+                bhfeprintln!(
+                    "bhf build: warning: could not record the runner in {}: {error}",
+                    dir.display()
+                );
+            }
+        }
+    }
+    0
 }
 
 pub(crate) struct BuildLayout {
     pub(crate) project_path: PathBuf,
+    /// Where the harness executable is linked (`build/<id>/obj`).
+    pub(crate) exec_dir: PathBuf,
+    /// The generated harness directory.
+    pub(crate) harness_dir: PathBuf,
 }
 
 /// The toolchain of this `bhf build`: the `--config` file's `[toolchain]`
@@ -324,6 +391,8 @@ fn resolve_build_toolchain(args: &BuildArgs) -> Result<config::ToolchainConfig, 
     };
     let mut cli = args.toolchain_args.c.to_config();
     cli.target = args.target.clone();
+    cli.runner = args.toolchain_args.runner.clone();
+    cli.runner_args = args.toolchain_args.runner_args.clone();
     // `--toolchain <prefix>` names the C/C++ compilers too, unless --cc/--cxx do
     // (a gprconfig compiler name such as `GNAT` is Ada-only).
     if let Some(prefix) = args
@@ -351,6 +420,93 @@ fn resolve_build_toolchain(args: &BuildArgs) -> Result<config::ToolchainConfig, 
         );
     }
     crate::toolchain::resolve(file, cli)
+}
+
+/// The note for a config file whose `[cross.<guard>]` tables `bhf build`
+/// does not use (they choose the toolchain of `bhf auto`'s guard-driven cross
+/// lanes), or `None` when it has none.
+fn cross_tables_note(config: &Path) -> Option<String> {
+    let text = fs::read_to_string(config).ok()?;
+    let tables = config::cross_config_from_file_text(&text).ok()?;
+    if tables.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = tables
+        .keys()
+        .map(|guard| format!("[cross.{guard}]"))
+        .collect();
+    Some(format!(
+        "{} in {} apply to bhf auto only; bhf build builds with the [toolchain] table \
+         (toolchain.target, toolchain.cc/cxx, toolchain.runner)",
+        names.join(", "),
+        config.display()
+    ))
+}
+
+/// The runner of a C/C++ build, checked against what the build produces
+/// (`built_for`, the triple the compiler builds for when it says): a build
+/// for a target this host cannot run, or for one the compiler would not name,
+/// records the runner `config` names; a runner for a build this host runs is
+/// refused, as `bhf auto` refuses it. `compiler` names the compiler for the
+/// message.
+fn build_runner(
+    config: &config::ToolchainConfig,
+    built_for: Option<&str>,
+    compiler: &str,
+) -> Result<Option<crate::gate_evidence::HarnessRunner>, String> {
+    let Some(runner) = config.runner.clone() else {
+        return Ok(None);
+    };
+    if !crate::toolchain::program_exists(&runner) {
+        return Err(format!(
+            "the toolchain's runner `{runner}` was not found; install it or fix toolchain.runner"
+        ));
+    }
+    let args = match built_for {
+        Some(triple) if crate::toolchain::triple_runs_natively(triple) => {
+            return Err(format!(
+                "toolchain.runner `{runner}` is set, but nothing this build produces targets \
+                 another platform: `{compiler}` builds for {triple} (this host); set \
+                 toolchain.target (--target) to cross-build the harness, or drop the runner"
+            ));
+        }
+        Some(triple) => {
+            crate::toolchain::runner_args(config, &runner, triple, config.sysroot.as_deref())
+        }
+        // A compiler that does not say what it builds for (a wrapper, some
+        // vendor toolchains): the runner is taken as given.
+        None => config.runner_args.clone(),
+    };
+    Ok(Some(crate::gate_evidence::HarnessRunner {
+        program: PathBuf::from(&runner),
+        args,
+    }))
+}
+
+/// The runner of an Ada harness, as [`build_runner`] gives one for a C/C++
+/// build: an Ada harness built for another target (its Ada target, else the
+/// tool prefix) records the runner `config` names; a runner for one this host
+/// runs is refused rather than dropped.
+fn ada_build_runner(
+    config: &config::ToolchainConfig,
+) -> Result<Option<crate::gate_evidence::HarnessRunner>, String> {
+    let Some(runner) = &config.runner else {
+        return Ok(None);
+    };
+    let settings = crate::toolchain::AdaBuildSettings::from_config(config);
+    match settings.effective_target() {
+        Some(triple) if !crate::toolchain::triple_runs_natively(&triple) => {
+            build_runner(config, Some(&triple), "gprbuild")
+        }
+        target => Err(format!(
+            "toolchain.runner `{runner}` is set, but the Ada harness builds for this host{}; \
+             set --target or --toolchain <prefix> (toolchain.ada.target or \
+             toolchain.ada.prefix) to cross-build it, or drop the runner",
+            target
+                .map(|triple| format!(" ({triple})"))
+                .unwrap_or_default()
+        )),
+    }
 }
 
 /// `args` with the Ada toolchain fields set from the resolved `[toolchain]`
@@ -612,7 +768,7 @@ pub(crate) fn prepare_layout(args: &BuildArgs) -> Result<BuildLayout, String> {
             language: "Ada".to_owned(),
         },
         SourceRoot {
-            path: harness_dir,
+            path: harness_dir.clone(),
             language: "Ada".to_owned(),
         },
     ];
@@ -696,6 +852,23 @@ pub(crate) fn prepare_layout(args: &BuildArgs) -> Result<BuildLayout, String> {
     if extends_project.is_none() {
         with_clauses.extend(discover_user_gpr_with_clauses(&user_root));
     }
+    // The governing project's own `package Compiler` is extended, not
+    // replaced: its switches stay, and bhf's follow them.
+    let parent_compiler = extends_project
+        .as_deref()
+        .and_then(project_synth::parent_compiler_package);
+    if let Some(parent) = &parent_compiler {
+        bhfeprintln!(
+            "bhf build: note: the harness project extends {}'s package Compiler; bhf's \
+             switches follow its Default_Switches (\"Ada\"){}",
+            parent.project_name,
+            if parent.ada_switches.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", parent.ada_switches.join(" "))
+            }
+        );
+    }
 
     let project_path = build_dir.join("bhf_build.gpr");
     // A non-`main.adb` main (a child-subprogram harness) gets its executable
@@ -755,9 +928,10 @@ pub(crate) fn prepare_layout(args: &BuildArgs) -> Result<BuildLayout, String> {
     let spec = ProjectSpec {
         project_name: "Bhf_Build".to_owned(),
         extends_project,
+        parent_compiler,
         source_roots,
         object_dir: shared_obj_dir,
-        exec_dir: Some(obj_dir),
+        exec_dir: Some(obj_dir.clone()),
         main_adb: Some(main_file),
         ada_standard,
         target: args.target.clone(),
@@ -805,7 +979,11 @@ pub(crate) fn prepare_layout(args: &BuildArgs) -> Result<BuildLayout, String> {
         let _ = fs::remove_file(&sentinel);
     }
 
-    Ok(BuildLayout { project_path })
+    Ok(BuildLayout {
+        project_path,
+        exec_dir: obj_dir,
+        harness_dir,
+    })
 }
 
 /// Walk `root` for top-level `.gpr` files and extract their
@@ -986,12 +1164,58 @@ fn try_run_c_make_build(args: &BuildArgs, toolchain: &config::ToolchainConfig) -
             return Some(2);
         }
     }
-    if let Some(target) = toolchain.target.as_deref() {
-        if !crate::toolchain::triple_runs_natively(target) {
-            bhfeprintln!(
-                "bhf build: building '{harness_id}' for {target}; run it under an emulator \
-                 (for example `bhf replay --qemu-user <qemu> --qemu-arg=-L --qemu-arg=<sysroot>`)"
-            );
+    // What the build produces: a binary for the toolchain's target, or for
+    // whatever the selected compiler builds for (a prefixed or cross --cc).
+    let compiler = {
+        let effective = crate::toolchain::effective_compilers();
+        if harness_dir.join("main.cpp").is_file() {
+            effective.cxx
+        } else {
+            effective.cc
+        }
+    };
+    let built_for = toolchain
+        .target
+        .clone()
+        .or_else(|| crate::toolchain::compiler_target_triple(&compiler));
+    let foreign = built_for
+        .as_deref()
+        .filter(|triple| !crate::toolchain::triple_runs_natively(triple));
+    let runner = match build_runner(toolchain, built_for.as_deref(), &compiler) {
+        Ok(runner) => runner,
+        Err(error) => {
+            bhfeprintln!("bhf build: {error}");
+            return Some(2);
+        }
+    };
+    let runs_natively = built_for
+        .as_deref()
+        .is_some_and(crate::toolchain::triple_runs_natively);
+    if let (None, Some(runner)) = (foreign, &runner) {
+        bhfeprintln!(
+            "bhf build: `{compiler}` does not say which target it builds for; '{harness_id}' \
+             runs under `{}` as configured, recorded in bhf_runner.json",
+            std::iter::once(runner.program.display().to_string())
+                .chain(runner.args.iter().cloned())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
+    if let Some(triple) = foreign {
+        match &runner {
+            Some(runner) => bhfeprintln!(
+                "bhf build: building '{harness_id}' for {triple}; it runs under `{}`, recorded \
+                 in bhf_runner.json beside the binary",
+                std::iter::once(runner.program.display().to_string())
+                    .chain(runner.args.iter().cloned())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+            None => bhfeprintln!(
+                "bhf build: building '{harness_id}' for {triple}; run it under an emulator \
+                 (set toolchain.runner or --runner to record one, or run `bhf replay \
+                 --qemu-user <qemu> --qemu-arg=-L --qemu-arg=<sysroot>`)"
+            ),
         }
     }
 
@@ -1044,6 +1268,21 @@ fn try_run_c_make_build(args: &BuildArgs, toolchain: &config::ToolchainConfig) -
                     return Some(2);
                 }
                 bhfeprintln!("built harness binary -> {}", dest.display());
+                // The emulator a foreign binary runs under, recorded beside it
+                // (and beside the harness) for the commands that run it. A
+                // native rebuild forgets one an earlier build recorded.
+                if runner.is_some() || runs_natively {
+                    for dir in [&build_dir, &harness_dir] {
+                        if let Err(error) =
+                            crate::gate_evidence::record_runner(dir, runner.as_ref())
+                        {
+                            bhfeprintln!(
+                                "bhf build: warning: could not record the runner in {}: {error}",
+                                dir.display()
+                            );
+                        }
+                    }
+                }
                 if cfg!(windows) {
                     let path = std::env::var_os("PATH");
                     stage_sanitizer_runtime(&harness_dir, path.as_deref());
@@ -2821,6 +3060,39 @@ fn absolutize(path: &Path) -> Result<PathBuf, String> {
 mod tests {
     use super::*;
 
+    /// A runner applies to an Ada harness built for another target (the Ada
+    /// target, else the tool prefix), and is refused for one this host runs,
+    /// which would otherwise drop it silently.
+    #[test]
+    fn an_ada_harness_takes_a_runner_only_for_another_target() {
+        let runner = std::env::current_exe().unwrap().display().to_string();
+        let mut config = config::ToolchainConfig {
+            runner: Some(runner.clone()),
+            runner_args: vec!["--board".to_owned(), "b1".to_owned()],
+            ..Default::default()
+        };
+        let error = ada_build_runner(&config).unwrap_err();
+        assert!(
+            error.contains(&format!("toolchain.runner `{runner}` is set"))
+                && error.contains("builds for this host"),
+            "{error}"
+        );
+        let expected = Some(crate::gate_evidence::HarnessRunner {
+            program: PathBuf::from(&runner),
+            args: vec!["--board".to_owned(), "b1".to_owned()],
+        });
+        config.ada.target = Some("powerpc-linux-gnu".to_owned());
+        assert_eq!(ada_build_runner(&config).unwrap(), expected);
+        config.ada.target = None;
+        config.ada.prefix = Some("powerpc-linux-gnu-".to_owned());
+        assert_eq!(ada_build_runner(&config).unwrap(), expected);
+        // A gprconfig compiler name is not a target.
+        config.ada.prefix = Some("GNAT".to_owned());
+        assert!(ada_build_runner(&config).is_err());
+        config.runner = None;
+        assert_eq!(ada_build_runner(&config).unwrap(), None);
+    }
+
     #[test]
     fn detects_staged_in_tree_ada_runtime_unit() {
         let temp = tempfile::tempdir().unwrap();
@@ -3500,6 +3772,7 @@ mod tests {
         let spec_with = |switches: Switches| ProjectSpec {
             project_name: "Bhf_Build".to_owned(),
             extends_project: None,
+            parent_compiler: None,
             source_roots: vec![SourceRoot {
                 path: PathBuf::from("/tmp/src"),
                 language: "Ada".to_owned(),

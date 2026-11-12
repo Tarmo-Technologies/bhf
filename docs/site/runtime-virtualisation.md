@@ -50,6 +50,19 @@ Each event is appended as one JSONL line to the path in
 `needed_for_build` Layer C and, during built-in fuzzing, to evaluate
 executable oracles against only the events appended by the current input.
 
+Some paths are never logged or faked, even in a faking pass, because a
+sanitizer's symbolizer opens them while it writes a report: the vDSO's
+link-map name (`linux-vdso.so.1`, `linux-gate.so.1`, `linux-vdso64.so.1`),
+separate debug files (`<object>.debug`, `<dir>/.debug/<object>`,
+`/usr/lib/debug/...`) and the names of objects the process has loaded. Once
+AddressSanitizer starts a report (bhf's C/C++ driver defines
+`__asan_on_error`, which tells the shim), the shim fakes nothing more in that
+process: a faked object handed to GCC's static libasan symbolizer made it
+abort its own report, so the finding lost its stack and came back a second
+time. A target that defines `__asan_on_error` itself would not link with the
+driver's definition; add `-DBHF_NO_ASAN_ON_ERROR` to `toolchain.cflags`
+(`--cflags`), which leaves the hook to the target.
+
 `fopen` and `fopen64` are hooked too: glibc's `fopen` opens the file
 through an internal call that the `open` hook never sees. They log the same
 open and missing-file events as `open`, under their own event names (`fopen`,

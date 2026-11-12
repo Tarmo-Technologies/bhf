@@ -1471,6 +1471,17 @@ pub(crate) fn family_sanitizer_flags(family: CompilerFamily) -> Vec<String> {
     flags
 }
 
+/// The words every capsule compile (all sanitized) ends with: glibc's
+/// `_FORTIFY_SOURCE` (on by default in Ubuntu's gcc, and in many projects'
+/// own flags) would abort on a fortified overflow before AddressSanitizer
+/// reports it, as in the harness Makefile's sanitized lanes. They follow the
+/// build context's flags, so a project's define cannot turn it back on.
+fn no_fortify_flags() -> impl Iterator<Item = String> {
+    harness_gen::compiler_family::SANITIZED_NO_FORTIFY
+        .iter()
+        .map(|flag| (*flag).to_owned())
+}
+
 /// A build.sh word that expands to the sanitizer flags of the compiler that
 /// runs the script (`$SANITIZE`), which the script picks by asking it.
 const SANITIZE_WORD: &str = "\u{1}SANITIZE";
@@ -2113,6 +2124,7 @@ impl CFamilyLane {
         }
         args.extend(model.includes.iter().flat_map(|a| a.render(map)));
         args.extend(model.extra_includes.iter().flat_map(|a| a.render(map)));
+        args.extend(no_fortify_flags());
         args
     }
 
@@ -2129,6 +2141,7 @@ impl CFamilyLane {
         args.extend(unit.flags.iter().flat_map(|a| a.render(map)));
         args.extend(model.includes.iter().flat_map(|a| a.render(map)));
         args.extend(model.extra_includes.iter().flat_map(|a| a.render(map)));
+        args.extend(no_fortify_flags());
         args
     }
 
@@ -4447,6 +4460,61 @@ mod tests {
             Path::new(dir).join("libstdc++.so").is_file(),
             "the link searches the dir holding libstdc++.so: {chosen}"
         );
+    }
+
+    /// A capsule's compiles turn glibc's fortification off after the build
+    /// context's own flags (the Makefile's `COMPILE_DB_FLAGS`, a per-TU row's
+    /// flags) and includes, as the harness Makefile's sanitized lanes do: a
+    /// project's `-D_FORTIFY_SOURCE=2` in front of the override would bring
+    /// the fortify abort back into the rebuild, which then reproduces a
+    /// different crash than the finding's.
+    #[test]
+    fn capsule_compiles_turn_fortify_off_after_the_build_contexts_flags() {
+        use harness_gen::compiler_family::SANITIZED_NO_FORTIFY;
+        let temp = tempfile::tempdir().unwrap();
+        let harness = temp.path().join("work/harnesses/H-C0001-0000F0F0");
+        write(
+            &harness.join("Makefile"),
+            "COMPILE_DB_FLAGS = -O2 -Wall -D_FORTIFY_SOURCE=2 -Wp,-D_FORTIFY_SOURCE=2\n\
+             INCLUDES = -I . -iquote /p\n\
+             main: main.c\n\
+             \t$(CC) $(CFLAGS) $(COMPILE_DB_FLAGS) $(INCLUDES) -o $@ main.c /p/widget.c\n",
+        );
+        write(&harness.join("main.c"), "int main(void) { return 0; }\n");
+        write(
+            &harness.join("build_context_objects.mk"),
+            "CONTEXT_MAIN_OBJECTS = context_objs/main_0.o\n\
+             context_objs/main_0.o: FORCE_CONTEXT_OBJECTS\n\
+             \t@mkdir -p context_objs\n\
+             \t$(CC) $(CFLAGS) $(SECTION_FLAGS) $(C_COMPAT_FLAGS) -D_FORTIFY_SOURCE=2 -I/p/inc $(INCLUDES) $(AUTO_EXTRA_INCLUDES) -DBHF_EXTERNAL_DRIVER -c /p/unit.c -o context_objs/main_0.o\n",
+        );
+        let model = C_LANE.build_model(&harness).unwrap();
+        assert_eq!(model.units.len(), 1, "{:?}", model.units);
+        let original = |path: &Path| path.to_string_lossy().into_owned();
+        for sanitize in [
+            vec![SANITIZE_WORD.to_owned()],
+            C_LANE.sanitize_flags(CompilerFamily::Gcc),
+        ] {
+            for args in [
+                C_LANE.main_args(&model, &sanitize, &original),
+                C_LANE.unit_args(&model, &model.units[0], &sanitize, &original),
+            ] {
+                let tail = args.len() - SANITIZED_NO_FORTIFY.len();
+                assert_eq!(&args[tail..], SANITIZED_NO_FORTIFY, "{args:?}");
+                let define = args
+                    .iter()
+                    .rposition(|arg| arg.contains("_FORTIFY_SOURCE=2"))
+                    .unwrap_or_else(|| panic!("the context's define is kept: {args:?}"));
+                assert!(define < tail, "{args:?}");
+                assert_eq!(
+                    args.iter()
+                        .filter(|arg| arg.contains("FORTIFY_SOURCE=0"))
+                        .count(),
+                    1,
+                    "the override once, last: {args:?}"
+                );
+            }
+        }
     }
 
     /// build.sh picks the sanitizer flags of the compiler that runs it: gcc
