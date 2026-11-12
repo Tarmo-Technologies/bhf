@@ -153,6 +153,15 @@
   no longer turns a UBSan finding into a frameless report and `exit status: 0`.
   The script exits with the harness's status, 128 plus the signal for a
   harness killed by one.
+- A multi-worker `bhf fuzz` (`--workers N`, or `--sanitizers` with several
+  sanitizers) merges the workers' findings before it prints its summary, and
+  the summary gains `merged_findings` (the parent ids), `duplicates_of_existing`
+  and `duplicate_crashes_of_existing`, as a single-process run has, plus the
+  same stderr note. Crashes that matched a finding recorded before the
+  campaign were only counted as "duplicate(s) left in worker dirs" before.
+  Each worker's JSON summary is kept in `worker-<id>-N/worker-stdout.json`,
+  and the duplicate marker a merge leaves in a worker dir names the finding it
+  duplicates.
 - `bhf auto --no-seed-mining` (or `seed-mining = false`) says on the console
   that tree seed mining is disabled, as the mined and explicit-seed cases
   already said what seeded the run. The seed list's documentation no longer

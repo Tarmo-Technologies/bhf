@@ -31,7 +31,7 @@ use crate::MulticoreError;
 use corpus::layout::FamilyAllocator;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -58,6 +58,15 @@ pub struct MergeReport {
     pub merged: Vec<String>,
     /// Worker findings the parent already held under another id.
     pub duplicates: usize,
+    /// The parent findings, recorded before this merge, that worker findings
+    /// duplicated (sorted ids). A worker finding that duplicates one merged
+    /// earlier in the same merge is not listed, nor is a copy an earlier merge
+    /// already marked as a duplicate.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub duplicates_of_existing: Vec<String>,
+    /// How many worker findings duplicated one of `duplicates_of_existing`.
+    #[serde(default)]
+    pub duplicate_findings_of_existing: usize,
     /// Duplicates an earlier merge left in a worker dir whose parent finding
     /// has since been removed; dropped, not merged back.
     #[serde(default)]
@@ -127,6 +136,7 @@ fn merge_with(
     let mut seen = parent_keys(&parent, limits)?;
     let mut ids = FamilyAllocator::new(&parent, "F-")?;
     let mut report = MergeReport::default();
+    let mut existing = BTreeSet::new();
     for worker in worker_dirs {
         let findings = corpus::layout::findings_dir(worker);
         let listing = match worker_finding_dirs(worker, limits.entries) {
@@ -155,10 +165,15 @@ fn merge_with(
             };
             let keys = Seen::keys(&record);
             let resume = resumable(&ids, &record);
-            if resume.is_none() && seen.holds(&keys) {
-                seen.insert(keys);
+            if let (None, Some(holder)) = (&resume, seen.holder(&keys).cloned()) {
+                // A copy an earlier merge marked was counted by that merge.
+                if holder.existing && !is_marked_duplicate(&source) {
+                    existing.insert(holder.id.clone());
+                    report.duplicate_findings_of_existing += 1;
+                }
+                mark_duplicate(&source, &holder.id);
+                seen.insert(keys, holder);
                 report.duplicates += 1;
-                mark_duplicate(&source);
                 continue;
             }
             if resume.is_none() && is_marked_duplicate(&source) {
@@ -170,13 +185,20 @@ fn merge_with(
             }
             match merge_one(&source, record, resume, &mut ids, &parent, fault) {
                 Ok(id) => {
-                    seen.insert(keys);
+                    seen.insert(
+                        keys,
+                        Holder {
+                            id: id.clone(),
+                            existing: false,
+                        },
+                    );
                     report.merged.push(id);
                 }
                 Err(error) => report.fail(error),
             }
         }
     }
+    report.duplicates_of_existing = existing.into_iter().collect();
     Ok(report)
 }
 
@@ -200,7 +222,7 @@ pub(crate) fn drop_orphaned_duplicates(
             let Ok(Some(record)) = read_record(&dir, LIMITS.record_bytes) else {
                 continue;
             };
-            if !seen.holds(&Seen::keys(&record)) {
+            if seen.holder(&Seen::keys(&record)).is_none() {
                 std::fs::remove_dir_all(&dir)?;
                 dropped += 1;
             }
@@ -214,25 +236,62 @@ fn parent_keys(parent: &Path, limits: Limits) -> io::Result<Seen> {
     let mut seen = Seen::default();
     for dir in real_subdirs(parent, limits.entries)?.dirs {
         if let Ok(Some(record)) = read_record(&dir, limits.record_bytes) {
-            seen.insert(Seen::keys(&record));
+            let id = record
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| dir.file_name()?.to_str().map(str::to_owned))
+                .unwrap_or_default();
+            seen.insert(Seen::keys(&record), Holder { id, existing: true });
         }
     }
     Ok(seen)
 }
 
-/// Mark a worker finding dir as a duplicate. Best effort, and never through an
-/// existing entry: `create_new` refuses a planted symlink instead of following it.
-fn mark_duplicate(dir: &Path) {
-    let _ = std::fs::OpenOptions::new()
+/// Mark a worker finding dir as a duplicate of the parent finding `of`, whose
+/// id the marker holds. Best effort, and never through an existing entry:
+/// `create_new` refuses a planted symlink instead of following it.
+fn mark_duplicate(dir: &Path, of: &str) {
+    if let Ok(mut marker) = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(dir.join(DUPLICATE_MARKER));
+        .open(dir.join(DUPLICATE_MARKER))
+    {
+        let _ = marker.write_all(of.as_bytes());
+    }
 }
 
 /// Whether an earlier merge marked `dir` as a duplicate (a regular file, not a
 /// symlink, named [`DUPLICATE_MARKER`]).
 fn is_marked_duplicate(dir: &Path) -> bool {
     std::fs::symlink_metadata(dir.join(DUPLICATE_MARKER)).is_ok_and(|meta| meta.is_file())
+}
+
+/// The parent finding a merge marked worker finding `finding_id` of
+/// `worker_dir` a duplicate of, when the marker names one (markers written
+/// before they carried the id name none) and that finding is still in
+/// `work_dir`'s findings.
+pub fn marked_duplicate_of(work_dir: &Path, worker_dir: &Path, finding_id: &str) -> Option<String> {
+    let dir = corpus::layout::finding_dir(worker_dir, finding_id);
+    if !is_marked_duplicate(&dir) {
+        return None;
+    }
+    let mut text = String::new();
+    std::fs::File::open(dir.join(DUPLICATE_MARKER))
+        .ok()?
+        .take(256)
+        .read_to_string(&mut text)
+        .ok()?;
+    let id = text.trim();
+    let plain = !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !plain {
+        return None;
+    }
+    let record = corpus::layout::finding_dir(work_dir, id).join(RECORD);
+    record.is_file().then(|| id.to_owned())
 }
 
 /// Distinct crashes across `worker_dirs`, by the merge's rule: a finding
@@ -250,18 +309,27 @@ pub(crate) fn count_unique<'a>(worker_dirs: impl IntoIterator<Item = &'a Path>) 
                 continue;
             };
             let keys = Seen::keys(&record);
-            if !seen.holds(&keys) {
+            if seen.holder(&keys).is_none() {
                 unique += 1;
             }
-            seen.insert(keys);
+            seen.insert(keys, Holder::default());
         }
     }
     unique
 }
 
-/// Crash keys already held, each scoped by its record's `harness_id`.
+/// The finding that holds a set of dedupe keys.
+#[derive(Debug, Clone, Default)]
+struct Holder {
+    id: String,
+    /// It was in the parent before this merge, not merged by it.
+    existing: bool,
+}
+
+/// Crash keys already held, each scoped by its record's `harness_id`, with the
+/// finding that holds them.
 #[derive(Default)]
-struct Seen(HashSet<(String, String)>);
+struct Seen(HashMap<(String, String), Holder>);
 
 impl Seen {
     fn keys(record: &Value) -> Vec<(String, String)> {
@@ -275,13 +343,17 @@ impl Seen {
             .collect()
     }
 
-    /// Whether any of `keys` is held; a keyless record never is.
-    fn holds(&self, keys: &[(String, String)]) -> bool {
-        keys.iter().any(|key| self.0.contains(key))
+    /// The finding holding any of `keys`, if one does; a keyless record never
+    /// matches.
+    fn holder(&self, keys: &[(String, String)]) -> Option<&Holder> {
+        keys.iter().find_map(|key| self.0.get(key))
     }
 
-    fn insert(&mut self, keys: Vec<(String, String)>) {
-        self.0.extend(keys);
+    /// Record `keys` as held by `holder`; a key already held keeps its holder.
+    fn insert(&mut self, keys: Vec<(String, String)>, holder: Holder) {
+        for key in keys {
+            self.0.entry(key).or_insert_with(|| holder.clone());
+        }
     }
 }
 
@@ -702,6 +774,20 @@ mod tests {
         let report = merge_worker_findings(work, &[w0.clone(), w1.clone()]).unwrap();
         assert_eq!(report.merged, ["F-0001-aaaaaaaa", "F-0002-cccccccc"]);
         assert_eq!((report.duplicates, report.unreadable), (2, 0));
+        // Only the copy of the finding recorded before the merge duplicates an
+        // existing one; worker 1's copy duplicates a finding this merge made.
+        assert_eq!(report.duplicates_of_existing, ["F-0000-dddddddd"]);
+        assert_eq!(report.duplicate_findings_of_existing, 1);
+        // Each marker names the parent finding it duplicates.
+        assert_eq!(
+            marked_duplicate_of(work, &w0, "F-0001-dddddddd").as_deref(),
+            Some("F-0000-dddddddd")
+        );
+        assert_eq!(
+            marked_duplicate_of(work, &w1, "F-0000-bbbbbbbb").as_deref(),
+            Some("F-0001-aaaaaaaa")
+        );
+        assert_eq!(marked_duplicate_of(work, &w0, "F-0000-aaaaaaaa"), None);
         assert_eq!(
             names(&parent),
             [
@@ -735,10 +821,13 @@ mod tests {
         assert!(w0_findings.join("F-0001-dddddddd/finding.json").is_file());
         assert!(w1_findings.join("F-0000-bbbbbbbb/finding.json").is_file());
 
-        // A second merge finds nothing new.
+        // A second merge finds nothing new, and the copies the first merge
+        // marked are not this merge's duplicates of existing findings.
         let again = merge_worker_findings(work, &[w0, w1]).unwrap();
         assert!(again.merged.is_empty());
         assert_eq!(again.duplicates, 2);
+        assert!(again.duplicates_of_existing.is_empty(), "{again:?}");
+        assert_eq!(again.duplicate_findings_of_existing, 0);
     }
 
     #[test]

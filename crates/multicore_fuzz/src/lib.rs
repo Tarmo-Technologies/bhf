@@ -18,7 +18,7 @@
 
 mod merge;
 
-pub use merge::{merge_worker_findings, MergeReport};
+pub use merge::{marked_duplicate_of, merge_worker_findings, MergeReport};
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -69,6 +69,9 @@ pub struct MulticoreConfig {
 
 /// Each worker's stderr, captured inside its own work dir.
 pub const WORKER_STDERR_LOG: &str = "worker-stderr.log";
+/// File in each worker's work dir that receives the worker's stdout: the JSON
+/// summary a `bhf fuzz` worker prints.
+pub const WORKER_STDOUT_LOG: &str = "worker-stdout.json";
 /// How much of a failed worker's stderr [`WorkerReport::stderr_tail`] keeps.
 const STDERR_TAIL_BYTES: u64 = 4096;
 const STDERR_TAIL_LINES: usize = 20;
@@ -212,6 +215,18 @@ pub struct WorkerReport {
     /// complete (non-zero exit, or killed at the deadline).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stderr_tail: Option<String>,
+    /// Findings already in the worker's own tree that its crashes matched, so
+    /// the worker did not record them again (worker-tree ids, from the
+    /// `duplicates_of_existing` of its JSON summary).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub duplicates_of_existing: Vec<String>,
+    /// How many of the worker's crashing executions matched one of those.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub duplicate_crashes_of_existing: usize,
+}
+
+fn is_zero(count: &usize) -> bool {
+    *count == 0
 }
 
 impl WorkerReport {
@@ -226,6 +241,7 @@ struct RunningWorker {
     work_dir: PathBuf,
     env_keys: Vec<String>,
     stderr_log: PathBuf,
+    stdout_log: PathBuf,
     /// Findings already in the worker tree when it started.
     findings_before: usize,
     child: std::process::Child,
@@ -235,7 +251,11 @@ impl RunningWorker {
     fn report(self, exit_code: Option<i32>, stopped_at_deadline: bool) -> WorkerReport {
         let completed = exit_code == Some(0);
         let findings_count = count_findings(&self.work_dir);
+        let (duplicates_of_existing, duplicate_crashes_of_existing) =
+            worker_duplicates(&self.stdout_log);
         WorkerReport {
+            duplicates_of_existing,
+            duplicate_crashes_of_existing,
             worker_id: self.worker_id,
             findings_count,
             new_findings: findings_count.saturating_sub(self.findings_before),
@@ -305,6 +325,8 @@ pub fn run_multicore(config: &MulticoreConfig) -> Result<MulticoreSummary, Multi
         // worker writing more than the pipe buffer would block until killed.
         let stderr_log = worker_dir.join(WORKER_STDERR_LOG);
         let stderr_file = std::fs::File::create(&stderr_log)?;
+        let stdout_log = worker_dir.join(WORKER_STDOUT_LOG);
+        let stdout_file = std::fs::File::create(&stdout_log)?;
         let worker_env = env_for_worker(&config.per_worker_env, worker_id);
         let env_keys = worker_env
             .iter()
@@ -324,7 +346,7 @@ pub fn run_multicore(config: &MulticoreConfig) -> Result<MulticoreSummary, Multi
             // results/ once; workers must not each do it.
             .env(corpus::layout::RESULTS_DEFER_ENV, "1")
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::from(stdout_file))
             .stderr(Stdio::from(stderr_file));
         if let Some(iterations) = config.per_worker_iterations {
             cmd.arg("--iterations").arg(iterations.to_string());
@@ -349,6 +371,7 @@ pub fn run_multicore(config: &MulticoreConfig) -> Result<MulticoreSummary, Multi
             work_dir: worker_dir,
             env_keys,
             stderr_log,
+            stdout_log,
             findings_before,
             child,
         });
@@ -667,6 +690,35 @@ fn trees_match(src: &Path, dst: &Path) -> std::io::Result<bool> {
 }
 
 /// The last lines of a worker's stderr log, or `None` when it is empty.
+/// The `duplicates_of_existing` ids and `duplicate_crashes_of_existing`
+/// count of the JSON summary a worker printed to `stdout_log`; empty when it
+/// printed none (it failed, or it is not a `bhf fuzz` worker).
+fn worker_duplicates(stdout_log: &Path) -> (Vec<String>, usize) {
+    const MAX_SUMMARY_BYTES: u64 = 16 * 1024 * 1024;
+    let summary = std::fs::metadata(stdout_log)
+        .ok()
+        .filter(|meta| meta.len() <= MAX_SUMMARY_BYTES)
+        .and_then(|_| std::fs::read(stdout_log).ok())
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    let Some(summary) = summary else {
+        return (Vec::new(), 0);
+    };
+    let ids = summary
+        .get("duplicates_of_existing")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .collect();
+    let crashes = summary
+        .get("duplicate_crashes_of_existing")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|count| usize::try_from(count).ok())
+        .unwrap_or(0);
+    (ids, crashes)
+}
+
 fn stderr_tail(path: &Path) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path).ok()?;

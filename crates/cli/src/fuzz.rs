@@ -1322,7 +1322,11 @@ pub fn run(args: FuzzArgs) -> i32 {
                     return 1;
                 }
             }
-            if let Some(note) = duplicates_of_existing_note(&summary) {
+            if let Some(note) = duplicates_of_existing_note(
+                &summary.duplicates_of_existing,
+                summary.duplicate_crashes_of_existing,
+                &summary.harness_id,
+            ) {
                 bhfeprintln!("{note}");
             }
             0
@@ -1334,11 +1338,11 @@ pub fn run(args: FuzzArgs) -> i32 {
     }
 }
 
-/// The stderr note for crashes that matched findings recorded before the run:
-/// they are left out of `findings`, and without a note the run reads as clean.
-fn duplicates_of_existing_note(summary: &FuzzRunSummary) -> Option<String> {
+/// The stderr note for crashes that matched findings recorded before the run
+/// (`ids`, `crashes` of them): they are left out of `findings`, and without a
+/// note the run reads as clean.
+fn duplicates_of_existing_note(ids: &[String], crashes: usize, harness_id: &str) -> Option<String> {
     const SHOWN: usize = 10;
-    let ids = &summary.duplicates_of_existing;
     if ids.is_empty() {
         return None;
     }
@@ -1347,9 +1351,8 @@ fn duplicates_of_existing_note(summary: &FuzzRunSummary) -> Option<String> {
         listed.push_str(&format!(" and {} more", ids.len() - SHOWN));
     }
     Some(format!(
-        "bhf fuzz: {} crashing input(s) matched finding(s) already recorded for {} ({listed}); \
-         they were not recorded again (see \"duplicates_of_existing\")",
-        summary.duplicate_crashes_of_existing, summary.harness_id
+        "bhf fuzz: {crashes} crashing input(s) matched finding(s) already recorded for \
+         {harness_id} ({listed}); they were not recorded again (see \"duplicates_of_existing\")"
     ))
 }
 
@@ -1849,15 +1852,31 @@ fn run_multicore_campaign(mut args: FuzzArgs) -> i32 {
 
     match multicore_fuzz::run_multicore(&config) {
         Ok(summary) => {
-            match serde_json::to_string_pretty(&summary) {
+            report_failed_workers(&summary);
+            // Merge before printing, so the summary says what the merge did.
+            let (merged, merge) = merge_worker_findings(&config.work_dir, &summary);
+            let (duplicates_of_existing, duplicate_crashes_of_existing) =
+                campaign_duplicates_of_existing(&config.work_dir, &summary, merge.as_ref());
+            let printed = MulticoreRunSummary {
+                summary: &summary,
+                merged_findings: merge.map(|merge| merge.merged).unwrap_or_default(),
+                duplicates_of_existing,
+                duplicate_crashes_of_existing,
+            };
+            match serde_json::to_string_pretty(&printed) {
                 Ok(json) => println!("{json}"),
                 Err(error) => {
                     bhfeprintln!("failed to render multicore fuzz summary: {error}");
                     return 1;
                 }
             }
-            report_failed_workers(&summary);
-            let merged = merge_worker_findings(&config.work_dir, &summary);
+            if let Some(note) = duplicates_of_existing_note(
+                &printed.duplicates_of_existing,
+                printed.duplicate_crashes_of_existing,
+                &summary.harness_id,
+            ) {
+                bhfeprintln!("{note}");
+            }
             if summary.dropped_duplicates > 0 {
                 bhfeprintln!(
                     "bhf fuzz: dropped {} duplicate(s) earlier campaigns left in worker dirs; \
@@ -1912,6 +1931,48 @@ fn run_multicore_campaign(mut args: FuzzArgs) -> i32 {
             }
         }
     }
+}
+
+/// What a multi-worker `bhf fuzz` prints: the campaign summary plus what the
+/// merge into the parent's findings did.
+#[derive(Serialize)]
+struct MulticoreRunSummary<'a> {
+    #[serde(flatten)]
+    summary: &'a multicore_fuzz::MulticoreSummary,
+    /// Parent ids the workers' new findings were merged under.
+    merged_findings: Vec<String>,
+    /// Findings recorded before the campaign that its crashes matched (sorted
+    /// parent ids), so those crashes were not recorded again.
+    duplicates_of_existing: Vec<String>,
+    /// How many crashes matched one of `duplicates_of_existing`.
+    duplicate_crashes_of_existing: usize,
+}
+
+/// The parent findings recorded before this campaign that its crashes matched,
+/// and how many crashes did: worker findings the merge found to duplicate
+/// them, and crashes a worker did not record because its own tree still held
+/// a duplicate an earlier merge marked as one of them.
+fn campaign_duplicates_of_existing(
+    work_dir: &Path,
+    summary: &multicore_fuzz::MulticoreSummary,
+    merge: Option<&multicore_fuzz::MergeReport>,
+) -> (Vec<String>, usize) {
+    let mut ids: std::collections::BTreeSet<String> = merge
+        .map(|merge| merge.duplicates_of_existing.iter().cloned().collect())
+        .unwrap_or_default();
+    let mut crashes = merge.map_or(0, |merge| merge.duplicate_findings_of_existing);
+    for worker in &summary.per_worker {
+        let parents: Vec<String> = worker
+            .duplicates_of_existing
+            .iter()
+            .filter_map(|id| multicore_fuzz::marked_duplicate_of(work_dir, &worker.work_dir, id))
+            .collect();
+        if !parents.is_empty() {
+            crashes += worker.duplicate_crashes_of_existing.max(1);
+            ids.extend(parents);
+        }
+    }
+    (ids.into_iter().collect(), crashes)
 }
 
 /// The harness layout to mirror into each worker tree: every work-dir-relative
@@ -2033,8 +2094,12 @@ fn incomplete_campaign_exit(outcome: NoWorkerCompleted, merged: i32) -> i32 {
 }
 
 /// Move the workers' findings into the campaign's own results/findings, so
-/// the results bracket around this command indexes them.
-fn merge_worker_findings(work_dir: &Path, summary: &multicore_fuzz::MulticoreSummary) -> i32 {
+/// the results bracket around this command indexes them. Returns the exit
+/// code and, when the merge ran, its report.
+fn merge_worker_findings(
+    work_dir: &Path,
+    summary: &multicore_fuzz::MulticoreSummary,
+) -> (i32, Option<multicore_fuzz::MergeReport>) {
     let workers: Vec<PathBuf> = summary
         .per_worker
         .iter()
@@ -2042,45 +2107,15 @@ fn merge_worker_findings(work_dir: &Path, summary: &multicore_fuzz::MulticoreSum
         .collect();
     match multicore_fuzz::merge_worker_findings(work_dir, &workers) {
         Ok(merge) => {
-            if !merge.merged.is_empty() || merge.duplicates > 0 {
-                bhfeprintln!(
-                    "bhf fuzz: merged {} worker finding(s) into {} ({} duplicate(s) left in worker dirs)",
-                    merge.merged.len(),
-                    corpus::layout::findings_dir(work_dir).display(),
-                    merge.duplicates
-                );
-            }
-            if merge.dropped > 0 {
-                bhfeprintln!(
-                    "bhf fuzz: dropped {} worker duplicate(s) of findings no longer in {}",
-                    merge.dropped,
-                    corpus::layout::findings_dir(work_dir).display()
-                );
-            }
-            if merge.unreadable > 0 {
-                bhfeprintln!(
-                    "warning: {} worker finding(s) without a readable finding.json were not merged",
-                    merge.unreadable
-                );
-            }
-            if merge.failed == 0 {
-                return 0;
-            }
-            bhfeprintln!(
-                "error: {} worker finding(s) could not be merged; they stay in their worker dirs and the next merge resumes them",
-                merge.failed
-            );
-            for error in &merge.errors {
-                bhfeprintln!("  {error}");
-            }
-            1
+            let code = merge_outcome(work_dir, &merge);
+            (code, Some(merge))
         }
         Err(error) => {
             bhfeprintln!(
                 "error: worker findings not merged into {}: {error}",
                 work_dir.display()
             );
-            1
+            (1, None)
         }
     }
 }
@@ -2130,6 +2165,42 @@ pub(crate) fn layout_prefixed_seeds(seeds: &[Vec<u8>], prefix: usize) -> Vec<Vec
         }
     }
     variants
+}
+
+/// Report a merge on stderr; its exit code.
+fn merge_outcome(work_dir: &Path, merge: &multicore_fuzz::MergeReport) -> i32 {
+    if !merge.merged.is_empty() || merge.duplicates > 0 {
+        bhfeprintln!(
+            "bhf fuzz: merged {} worker finding(s) into {} ({} duplicate(s) left in worker dirs)",
+            merge.merged.len(),
+            corpus::layout::findings_dir(work_dir).display(),
+            merge.duplicates
+        );
+    }
+    if merge.dropped > 0 {
+        bhfeprintln!(
+            "bhf fuzz: dropped {} worker duplicate(s) of findings no longer in {}",
+            merge.dropped,
+            corpus::layout::findings_dir(work_dir).display()
+        );
+    }
+    if merge.unreadable > 0 {
+        bhfeprintln!(
+            "warning: {} worker finding(s) without a readable finding.json were not merged",
+            merge.unreadable
+        );
+    }
+    if merge.failed == 0 {
+        return 0;
+    }
+    bhfeprintln!(
+        "error: {} worker finding(s) could not be merged; they stay in their worker dirs and the next merge resumes them",
+        merge.failed
+    );
+    for error in &merge.errors {
+        bhfeprintln!("  {error}");
+    }
+    1
 }
 
 /// Workers receive their seeds through argv, which cannot carry arbitrary bytes
@@ -10409,7 +10480,12 @@ exit 0
         assert!(second.findings.is_empty(), "{:?}", second.findings);
         assert_eq!(second.duplicates_of_existing, first.findings);
         assert!(second.duplicate_crashes_of_existing >= 2);
-        let note = duplicates_of_existing_note(&second).expect("a note");
+        let note = duplicates_of_existing_note(
+            &second.duplicates_of_existing,
+            second.duplicate_crashes_of_existing,
+            &second.harness_id,
+        )
+        .expect("a note");
         assert!(note.contains(&first.findings[0]), "{note}");
         assert!(note.contains("H-DUP"), "{note}");
     }

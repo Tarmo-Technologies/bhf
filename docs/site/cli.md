@@ -1042,6 +1042,15 @@ campaign exits `3` before starting any worker. Each worker's stderr goes to
 `worker-<id>-N/worker-stderr.log`; for a worker that did not complete, the
 summary's `per_worker[].stderr_tail` and stderr show its last lines, and
 `per_worker[].stopped_at_deadline` marks a worker stopped at the time limit.
+Each worker's own JSON summary goes to `worker-<id>-N/worker-stdout.json`. The
+findings are merged before the campaign summary is printed, so it also lists
+the parent ids the workers' new findings were merged under (`merged_findings`)
+and, as a single run does, the findings recorded before the campaign that its
+crashes matched (`duplicates_of_existing`, with `duplicate_crashes_of_existing`
+counting those crashes), with the same one-line note on stderr. That covers a
+worker's copy the merge finds to duplicate a recorded finding and a crash a
+worker skipped because its tree still holds such a copy from an earlier
+campaign (`per_worker[].duplicates_of_existing` names that copy).
 When every worker exits non-zero (or is killed by a signal), `bhf fuzz` exits
 non-zero (the workers' shared exit code, else `1`). Workers stopped at the time
 limit fuzzed until then: when they recorded findings, the campaign keeps its

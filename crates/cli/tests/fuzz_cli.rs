@@ -753,6 +753,76 @@ fn fuzz_reports_crashes_that_match_findings_already_recorded() {
     assert_eq!(finding_ids(&work_dir), [recorded]);
 }
 
+/// A multi-worker campaign whose crashes match a finding recorded before it
+/// names that finding in its JSON and on stderr, both when the merge finds the
+/// workers' copies to be duplicates and when a later campaign's workers skip
+/// the crash themselves because their trees still hold such a copy.
+#[cfg(unix)]
+#[test]
+fn fuzz_workers_report_crashes_that_match_findings_already_recorded() {
+    let temp = temp_dir("multicore-duplicate-of-existing");
+    let work_dir = temp.join("bhf_work");
+    install_auto_layout_harness(&work_dir, "H-AUTO");
+    let single = [
+        "--harness",
+        "H-AUTO",
+        "--iterations",
+        "1",
+        "--seed-input",
+        "crash",
+    ];
+    let (code, first, stderr) = fuzz_process(&work_dir, &single);
+    assert_eq!(code, Some(0), "{stderr}");
+    let recorded = first["findings"][0]
+        .as_str()
+        .expect("the single-process run records it")
+        .to_owned();
+
+    let mut workers = single.to_vec();
+    workers.extend(["--workers", "2"]);
+    for campaign in ["first", "second"] {
+        let (code, summary, stderr) = fuzz_process(&work_dir, &workers);
+        assert_eq!(code, Some(0), "{campaign}: {stderr}");
+        assert_eq!(summary["workers_completed"], 2, "{campaign}: {summary}");
+        assert_eq!(
+            summary["merged_findings"],
+            serde_json::json!([]),
+            "{campaign}: {summary}"
+        );
+        assert_eq!(
+            summary["duplicates_of_existing"],
+            serde_json::json!([recorded]),
+            "{campaign}: {summary}\n{stderr}"
+        );
+        assert!(
+            summary["duplicate_crashes_of_existing"].as_u64() >= Some(2),
+            "{campaign}: each worker's crash is counted: {summary}"
+        );
+        assert!(
+            stderr.contains(&recorded) && stderr.contains("already recorded"),
+            "{campaign}: a stderr note names the existing finding: {stderr}"
+        );
+        assert_eq!(
+            finding_ids(&work_dir),
+            std::slice::from_ref(&recorded),
+            "{campaign}"
+        );
+        // The second campaign's workers skip the crash themselves: their trees
+        // hold the copies the first merge marked as duplicates.
+        let skipped_by_workers = summary["per_worker"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|worker| worker["duplicates_of_existing"].is_array())
+            .count();
+        assert_eq!(
+            skipped_by_workers,
+            if campaign == "first" { 0 } else { 2 },
+            "{campaign}: {summary}"
+        );
+    }
+}
+
 fn install_fake_harness(work_dir: &Path, harness_id: &str) -> PathBuf {
     let harness = PathBuf::from(env!("CARGO_BIN_EXE_cli_fake_harness"));
     let target = work_dir
