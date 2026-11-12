@@ -140,9 +140,10 @@ pub fn run_dedupe_key(record: &serde_json::Value) -> Option<RunDedupeKey> {
 
 /// The signature of a sanitizer crash: sha256 over the rule, the crash kind,
 /// the sanitizer's check name, the reported site (for a UBSan report, or any
-/// report without a crash stack) and the crash-stack function names. The
-/// allocation and free stacks describe the object, not the crash, and are not
-/// hashed. Its first 8 hex digits are the finding ID suffix.
+/// report without a crash stack; for a crash with no sanitizer report, the
+/// faulting pc offset bhf's driver printed) and the crash-stack function
+/// names. The allocation and free stacks describe the object, not the crash,
+/// and are not hashed. Its first 8 hex digits are the finding ID suffix.
 pub fn sanitizer_signature(report: &crate::sanitizer::SanitizerReport) -> String {
     use sha2::Digest;
     let mut hasher = sha2::Sha256::new();
@@ -154,7 +155,10 @@ pub fn sanitizer_signature(report: &crate::sanitizer::SanitizerReport) -> String
         hasher.update(check.as_bytes());
     }
     let ubsan = report.sanitizer == Some(crate::sanitizer::Sanitizer::UndefinedBehaviorSanitizer);
-    if let Some(site) = report.site().filter(|_| ubsan || report.stack.is_empty()) {
+    if let Some(site) = report
+        .fault_site()
+        .filter(|_| ubsan || report.stack.is_empty())
+    {
         hasher.update(b"|site=");
         hasher.update(site.as_bytes());
     }
@@ -172,8 +176,20 @@ pub fn sanitizer_signature(report: &crate::sanitizer::SanitizerReport) -> String
 /// that dedupes sanitizer crashes (the builtin loop, AFL++ crash ingestion,
 /// the pre-seed from earlier passes) uses this one function.
 pub fn sanitizer_dedupe_key(report: &crate::sanitizer::SanitizerReport) -> String {
-    let cluster = crate::cluster::cluster_for_sanitizer(report);
-    if cluster.fallback {
+    sanitizer_dedupe_key_scoped(report, "")
+}
+
+/// [`sanitizer_dedupe_key`] for a crash found in `scope`
+/// ([`crate::cluster::crash_scope`]): a crash with neither an informative
+/// frame nor a reported site keys on its scoped root-cause key
+/// ([`crate::cluster::cluster_for_sanitizer_scoped`]), which is what the
+/// emitter of that scope writes as `cluster_key_full`.
+pub fn sanitizer_dedupe_key_scoped(
+    report: &crate::sanitizer::SanitizerReport,
+    scope: &str,
+) -> String {
+    let cluster = crate::cluster::cluster_for_sanitizer_scoped(report, scope);
+    if cluster.is_placeholder() {
         sanitizer_signature(report)
     } else {
         cluster.full
@@ -253,6 +269,7 @@ impl FindingEmitter {
                 build_binary: None,
                 harness_format_version: None,
                 buffer_len_dimension: false,
+                crash_scope: None,
             },
             line_maps: crate::line_remap::SourceLineMaps::default(),
         }
@@ -276,6 +293,7 @@ impl FindingEmitter {
                 build_binary: None,
                 harness_format_version: None,
                 buffer_len_dimension: false,
+                crash_scope: None,
             },
             line_maps: crate::line_remap::SourceLineMaps::default(),
         }
@@ -310,6 +328,13 @@ impl FindingEmitter {
         self
     }
 
+    /// Group the frame-less crashes this emitter writes by `scope` (see
+    /// [`crate::cluster::crash_scope`]) instead of by the harness id alone.
+    pub fn with_crash_scope(mut self, scope: impl Into<String>) -> Self {
+        self.metadata.crash_scope = Some(scope.into());
+        self
+    }
+
     /// Emit a finding for a libFuzzer/AFL++ C/C++ crash captured via stderr.
     /// Unlike `emit`, there's no event log and no Ada Testcase; the sanitizer
     /// report already carries everything we need.
@@ -331,15 +356,20 @@ impl FindingEmitter {
         log: Option<&[u8]>,
     ) -> Result<FindingId, CorpusError> {
         let signature_hex = sanitizer_signature(report);
-        let cluster = crate::cluster::cluster_for_sanitizer(report);
-        let (cluster_short, cluster_full, cluster_fallback) = if cluster.fallback {
+        let cluster =
+            crate::cluster::cluster_for_sanitizer_scoped(report, &self.metadata.crash_scope());
+        let (cluster_short, cluster_full, cluster_fallback) = if cluster.is_placeholder() {
             (
                 signature_hex.chars().take(16).collect::<String>(),
                 signature_hex.clone(),
                 true,
             )
         } else {
-            (cluster.short.clone(), cluster.full.clone(), false)
+            (
+                cluster.short.clone(),
+                cluster.full.clone(),
+                cluster.fallback,
+            )
         };
         let (id, finding_dir) = self.allocate_finding(&signature_hex)?;
 
@@ -406,6 +436,10 @@ impl FindingEmitter {
         }
         if let Some(access) = &report.access {
             record["exception"]["access"] = json!(access);
+        }
+        // A crash with no sanitizer report: where the driver saw it fault.
+        if let Some(offset) = report.pc_offset {
+            record["exception"]["pc_offset"] = json!(format!("{offset:#x}"));
         }
         if log_written.is_some() {
             record["paths"]["sanitizer_log"] = json!("sanitizer.log");
@@ -886,6 +920,17 @@ struct FindingMetadata {
     harness_format_version: Option<u32>,
     /// The harness had the explicit buffer-length dimension on.
     buffer_len_dimension: bool,
+    /// What frame-less crashes are grouped by ([`crate::cluster::crash_scope`]);
+    /// `None` groups them by the harness id.
+    crash_scope: Option<String>,
+}
+
+impl FindingMetadata {
+    fn crash_scope(&self) -> String {
+        self.crash_scope
+            .clone()
+            .unwrap_or_else(|| self.harness_id.clone())
+    }
 }
 
 impl Default for FindingMetadata {
@@ -899,6 +944,7 @@ impl Default for FindingMetadata {
             build_binary: None,
             harness_format_version: None,
             buffer_len_dimension: false,
+            crash_scope: None,
         }
     }
 }
@@ -2575,14 +2621,64 @@ mod tests {
         ] {
             let report = crate::sanitizer::parse_sanitizer_report(&stderr).unwrap();
             let record = emit_parsed(&root, &stderr);
+            // The fuzz loop keys a crash in the scope of the harness that
+            // found it, as the emitter does.
             assert_eq!(
                 super::run_dedupe_key(&record),
-                Some(super::RunDedupeKey::Cluster(super::sanitizer_dedupe_key(
-                    &report
-                ))),
+                Some(super::RunDedupeKey::Cluster(
+                    super::sanitizer_dedupe_key_scoped(&report, "H-C0001")
+                )),
                 "{stderr}"
             );
         }
+    }
+
+    /// A crash with no frames and no source position (a fatal signal without a
+    /// sanitizer report) is grouped per harness: two harnesses' crashes are two
+    /// root-cause groups, and a later pass of the same harness keys it the way
+    /// the fuzz loop does. The faulting pc offset the driver printed is
+    /// recorded and separates two crash sites of one harness.
+    #[test]
+    fn frameless_crashes_are_grouped_per_harness_and_per_pc() {
+        let root = temp_dir("frameless-scope");
+        let signal = |pc_offset: Option<u64>| crate::sanitizer::SanitizerReport {
+            sanitizer: None,
+            kind: "fatal-signal".to_owned(),
+            rule_id: "BHF-210",
+            message: "harness crashed with SIGSEGV and no sanitizer report".to_owned(),
+            pc_offset,
+            ..Default::default()
+        };
+        let emit = |harness_id: &str, report: &crate::sanitizer::SanitizerReport| {
+            let emitter = FindingEmitter::with_metadata(
+                root.clone(),
+                harness_id.to_owned(),
+                "c".to_owned(),
+                format!("harnesses/{harness_id}/main"),
+            );
+            let id = emitter.emit_sanitizer_crash(b"x", report).unwrap();
+            let raw: serde_json::Value = serde_json::from_slice(
+                &fs::read(crate::layout::finding_dir(&root, &id.0).join("finding.json")).unwrap(),
+            )
+            .unwrap();
+            raw
+        };
+        let parse = emit("H-PARSE", &signal(None));
+        let copy = emit("H-COPY", &signal(None));
+        assert_ne!(parse["cluster_key_full"], copy["cluster_key_full"]);
+        assert_eq!(parse["cluster_fallback"], true);
+        assert_eq!(
+            super::run_dedupe_key(&parse),
+            Some(super::RunDedupeKey::Cluster(
+                super::sanitizer_dedupe_key_scoped(&signal(None), "H-PARSE")
+            ))
+        );
+        let at = |pc| emit("H-PARSE", &signal(Some(pc)));
+        let (a, b) = (at(0x1b3c), at(0x2a10));
+        assert_eq!(a["exception"]["pc_offset"], "0x1b3c");
+        assert_ne!(a["cluster_key_full"], b["cluster_key_full"]);
+        assert_ne!(a["signature"], b["signature"]);
+        assert_ne!(a["cluster_key_full"], parse["cluster_key_full"]);
     }
 
     /// Only the crash stack identifies a crash: the allocation and free stacks

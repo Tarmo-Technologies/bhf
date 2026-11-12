@@ -1214,14 +1214,31 @@ pub(crate) fn fatal_signal_report(
     // Funnel through the shared crash-report builder so the host-signal lane and
     // the HDF-2 transport-fault lane produce one finding shape with a catalog
     // `rule_id` (see `crate::transport_fault`).
-    crate::transport_fault::crash_report(
+    let mut report = crate::transport_fault::crash_report(
         crate::fatal_signal::RULE_ID,
         "fatal-signal".to_owned(),
         format!(
             "harness crashed with {} and no sanitizer report — a reachable crash",
             crash.name
         ),
-    )
+    );
+    report.pc_offset = fatal_signal_pc_offset(stderr, &crash.name);
+    report
+}
+
+/// The faulting instruction's offset in the executable from the line bhf's
+/// driver prints before a fatal signal kills a harness built without a
+/// sanitizer runtime (`bhf: fatal signal SIGSEGV pc=0x... addr=0x...
+/// exe_offset=0x13c4`), when it names `signal`. The last such line wins.
+pub(crate) fn fatal_signal_pc_offset(stderr: &str, signal: &str) -> Option<u64> {
+    let line = stderr
+        .lines()
+        .rev()
+        .filter_map(|line| line.trim().strip_prefix("bhf: fatal signal "))
+        .find(|rest| rest.split_whitespace().next() == Some(signal))?;
+    line.split_whitespace()
+        .find_map(|field| field.strip_prefix("exe_offset=0x"))
+        .and_then(|hex| u64::from_str_radix(hex, 16).ok())
 }
 
 pub fn run(args: FuzzArgs) -> i32 {
@@ -3256,8 +3273,14 @@ fn run_builtin_with_progress(
         HashSet::<String>::from_iter(existing_findings.oracles.keys().cloned());
     // Sanitizer-crash dedup (#389): one finding per root cause, not one per
     // crashing input.
-    let mut sanitizer_dedup =
-        SanitizerClusterDedup::new(existing_findings.clusters.keys().cloned());
+    let mut sanitizer_dedup = SanitizerClusterDedup::new(
+        existing_findings.clusters.keys().cloned(),
+    )
+    .with_scope(run_crash_scope(
+        &prepared.harness_path,
+        &prepared.work_dir,
+        &prepared.harness_id,
+    ));
     // A crash dropped because it matches one of those findings is counted
     // here (finding id -> crashing executions) and reported, never silent.
     let mut duplicates_of_existing = std::collections::BTreeMap::<String, usize>::new();
@@ -3784,9 +3807,7 @@ fn run_builtin_with_progress(
                 // reported against that finding's id.
                 note_duplicate_of_existing(
                     &mut duplicates_of_existing,
-                    existing_findings
-                        .clusters
-                        .get(&corpus::finding::sanitizer_dedupe_key(report)),
+                    existing_findings.clusters.get(&sanitizer_dedup.key(report)),
                 );
             }
         }
@@ -4142,9 +4163,11 @@ const MAX_UNCONFIRMED_SANITIZER_ATTEMPTS: u32 = 3;
 /// Per-run sanitizer-crash deduplication (#389): one finding per distinct crash
 /// root cause with a hit count, instead of one per crashing input (cJSON
 /// produced 2211 findings collapsing to 3 clusters). Keys are
-/// [`corpus::finding::sanitizer_dedupe_key`]: the root-cause cluster key, which
-/// for a report without an informative frame is its reported site, else its
-/// signature, so different rules, checks and sites stay separate.
+/// [`corpus::finding::sanitizer_dedupe_key_scoped`] in the run's
+/// [`run_crash_scope`]: the root-cause cluster key, which for a report without
+/// an informative frame is its reported site, else its rule, kind, check and
+/// faulting pc offset in that scope, so different rules, checks and sites stay
+/// separate.
 ///
 /// A key is consumed only once a finding is emitted for it: a first hit that
 /// does not reproduce in a fresh process must not hide a later reproducible
@@ -4152,6 +4175,8 @@ const MAX_UNCONFIRMED_SANITIZER_ATTEMPTS: u32 = 3;
 /// failed confirmations the key is given up: later hits are no longer re-run,
 /// and they are counted as unreproduced, not as duplicates of a finding.
 struct SanitizerClusterDedup {
+    /// The scope frame-less crashes are keyed in ([`run_crash_scope`]).
+    scope: String,
     /// Consumed key -> hits (the emitted or pre-seeded finding, plus later
     /// duplicates).
     seen: HashMap<String, usize>,
@@ -4168,6 +4193,7 @@ impl SanitizerClusterDedup {
     /// Start from the keys of findings an earlier pass already wrote (#35).
     fn new(seed: impl IntoIterator<Item = String>) -> Self {
         Self {
+            scope: String::new(),
             seen: seed.into_iter().map(|key| (key, 1)).collect(),
             unconfirmed: HashMap::new(),
             abandoned: HashMap::new(),
@@ -4181,7 +4207,7 @@ impl SanitizerClusterDedup {
     /// [`Self::unconfirmed`]. `None` for a duplicate or a given-up root cause
     /// (either way its hit is counted), or once the key memory cap is reached.
     fn first_sighting(&mut self, report: &corpus::SanitizerReport) -> Option<String> {
-        let key = corpus::finding::sanitizer_dedupe_key(report);
+        let key = self.key(report);
         if let Some(count) = self.seen.get_mut(&key) {
             *count = count.saturating_add(1);
             return None;
@@ -4208,6 +4234,17 @@ impl SanitizerClusterDedup {
             return None;
         }
         Some(key)
+    }
+
+    /// Key the run's crashes in `scope`, as the run's emitter does.
+    fn with_scope(mut self, scope: String) -> Self {
+        self.scope = scope;
+        self
+    }
+
+    /// The key `report` is deduplicated on.
+    fn key(&self, report: &corpus::SanitizerReport) -> String {
+        corpus::finding::sanitizer_dedupe_key_scoped(report, &self.scope)
     }
 
     /// A finding was emitted for `key`: later hits are duplicates.
@@ -4685,7 +4722,11 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
     }
 
     let mut finding_ids = Vec::new();
-    let mut afl_dedup = SanitizerClusterDedup::new(Vec::new());
+    let mut afl_dedup = SanitizerClusterDedup::new(Vec::new()).with_scope(run_crash_scope(
+        &prepared.harness_path,
+        &prepared.work_dir,
+        &prepared.harness_id,
+    ));
     let mut crash_count = 0_usize;
     if crashes_dir.is_dir() {
         for entry in fs::read_dir(&crashes_dir)
@@ -6282,8 +6323,9 @@ impl ExistingFindings {
             }
             // Oracle hits key on rule_id|oracle_name|api (oracle_hit_dedupe_key),
             // sanitizer crashes on the record's cluster_key_full: the root-cause
-            // key, or for a fallback record its signature, which is the key
-            // corpus::finding::sanitizer_dedupe_key gives the report at runtime.
+            // key the emitter wrote in the harness's crash scope, which is the
+            // key corpus::finding::sanitizer_dedupe_key_scoped gives the report
+            // at runtime (an older fallback record's is its signature).
             match corpus::finding::run_dedupe_key(&record) {
                 Some(corpus::finding::RunDedupeKey::Oracle(key)) => {
                     keep_lowest_id(&mut existing.oracles, key, &id);
@@ -6645,6 +6687,24 @@ fn with_harness_format(
     emitter
         .with_harness_format_version(format.as_ref().map(|format| format.version))
         .with_buffer_len_dimension(format.is_some_and(|format| format.buffer_len_dimension))
+        .with_crash_scope(run_crash_scope(harness, work_dir, harness_id))
+}
+
+/// What this run's crashes without frames or a source position are grouped
+/// by ([`corpus::cluster::crash_scope`]): the harness id and the function its
+/// generation metadata names, read beside the binary or in the harness's dirs
+/// of the work dir (for a binary `bhf build` staged into `build/<id>/`). The
+/// emitter and the run's dedupe use the same scope.
+pub(crate) fn run_crash_scope(harness: &Path, work_dir: &Path, harness_id: &str) -> String {
+    let target = harness
+        .parent()
+        .map(Path::to_path_buf)
+        .into_iter()
+        .chain(crate::auto::layout::harness_dir_candidates(
+            work_dir, harness_id,
+        ))
+        .find_map(|dir| crate::generate_harness::recorded_target_function(&dir));
+    corpus::cluster::crash_scope(harness_id, target.as_deref())
 }
 
 /// Bounds on the argument-trace re-run of a new finding: the run's per-input
@@ -7421,6 +7481,95 @@ mod signal_classification_tests {
     }
 }
 
+/// bhf's driver in a build without a sanitizer runtime reports where a fatal
+/// signal hit before it dies by that signal, so frame-less crashes of one
+/// harness can be told apart.
+#[cfg(all(test, target_os = "linux"))]
+mod fatal_signal_driver_tests {
+    use std::os::unix::process::ExitStatusExt;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    const TARGET: &str = r#"
+#include <stdint.h>
+#include <stddef.h>
+#include <signal.h>
+__attribute__((noinline)) static void copy_at(volatile char *p) { *p = 1; }
+__attribute__((noinline)) static int bit_index(const volatile int *p) { return *p >> 3; }
+int bhf_run_one(const uint8_t *data, size_t size) {
+    if (size > 0 && data[0] == 'A') copy_at((volatile char *)0);
+    if (size > 0 && data[0] == 'B') return bit_index((const volatile int *)8);
+    if (size > 0 && data[0] == 'T') raise(SIGTRAP);
+    return 0;
+}
+"#;
+
+    /// Build the target with bhf's driver and no sanitizer, as a cross build
+    /// without a sanitizer runtime is.
+    fn build(dir: &Path) -> Option<PathBuf> {
+        let driver = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../c_runtime/bhf_driver.c");
+        std::fs::write(dir.join("target.c"), TARGET).unwrap();
+        let output = Command::new("cc")
+            .current_dir(dir)
+            .args(["-O1", "-g", "-o", "main", "target.c"])
+            .arg(&driver)
+            .output()
+            .ok()?;
+        output.status.success().then(|| dir.join("main"))
+    }
+
+    fn run(harness: &Path, dir: &Path, input: &[u8]) -> (std::process::ExitStatus, String) {
+        let testcase = dir.join("testcase.bin");
+        std::fs::write(&testcase, input).unwrap();
+        let output = Command::new(harness).arg(&testcase).output().unwrap();
+        (
+            output.status,
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    }
+
+    #[test]
+    fn a_fault_prints_the_signal_and_pc_and_still_dies_by_the_signal() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(harness) = build(dir.path()) else {
+            eprintln!("skipping: no C compiler");
+            return;
+        };
+        let (status, stderr) = run(&harness, dir.path(), b"A");
+        assert_eq!(status.signal(), Some(11), "{stderr}");
+        let line = stderr
+            .lines()
+            .find(|line| line.starts_with("bhf: fatal signal SIGSEGV pc=0x"))
+            .unwrap_or_else(|| panic!("no fatal-signal line in {stderr:?}"));
+        assert!(line.contains(" addr=0x0"), "{line}");
+        assert!(line.contains(" exe_offset=0x"), "{line}");
+
+        let copy_at = super::fatal_signal_report(&status, &stderr);
+        let offset = copy_at
+            .pc_offset
+            .expect("the pc offset is read from the line");
+        let (status, stderr) = run(&harness, dir.path(), b"B");
+        assert_eq!(status.signal(), Some(11), "{stderr}");
+        let bit_index = super::fatal_signal_report(&status, &stderr);
+        assert_ne!(bit_index.pc_offset, Some(offset), "two sites, two offsets");
+        assert_ne!(
+            corpus::finding::sanitizer_signature(&copy_at),
+            corpus::finding::sanitizer_signature(&bit_index)
+        );
+        // The same input faults at the same offset in every run (ASLR moves
+        // the absolute pc, not the offset).
+        let (status, stderr) = run(&harness, dir.path(), b"A");
+        assert_eq!(
+            super::fatal_signal_report(&status, &stderr).pc_offset,
+            Some(offset)
+        );
+        // No crash, no line.
+        let (status, stderr) = run(&harness, dir.path(), b"ok");
+        assert!(status.success(), "{stderr}");
+        assert!(!stderr.contains("bhf: fatal signal"), "{stderr}");
+    }
+}
+
 #[cfg(test)]
 mod engine_list_tests {
     use super::{
@@ -7574,7 +7723,7 @@ mod engine_list_tests {
 
 #[cfg(test)]
 mod dedup_seed_tests {
-    use super::ExistingFindings;
+    use super::{ExistingFindings, SanitizerClusterDedup};
 
     #[test]
     fn seeds_sanitizer_cluster_and_oracle_keys_from_findings_dir() {
@@ -7706,6 +7855,36 @@ mod dedup_seed_tests {
         assert!(!existing
             .clusters
             .contains_key(&corpus::finding::sanitizer_dedupe_key(&report(9))));
+    }
+
+    /// A frame-less crash written by an earlier pass is a duplicate for a run
+    /// keyed in the same scope, and a new root cause for another harness.
+    #[test]
+    fn a_frameless_crash_from_disk_is_a_duplicate_only_in_its_scope() {
+        let work = tempfile::tempdir().unwrap();
+        let report = corpus::SanitizerReport {
+            kind: "fatal-signal".to_owned(),
+            rule_id: "BHF-210",
+            message: "harness crashed with SIGSEGV and no sanitizer report".to_owned(),
+            ..Default::default()
+        };
+        let scope = corpus::cluster::crash_scope("H-TEST", Some("parse_record"));
+        corpus::finding::FindingEmitter::with_metadata(
+            work.path().to_path_buf(),
+            "H-TEST".to_owned(),
+            "c".to_owned(),
+            String::new(),
+        )
+        .with_crash_scope(scope.clone())
+        .emit_sanitizer_crash(b"x", &report)
+        .unwrap();
+        let existing = ExistingFindings::load(work.path(), "H-TEST");
+        let mut same =
+            SanitizerClusterDedup::new(existing.clusters.keys().cloned()).with_scope(scope.clone());
+        assert_eq!(same.first_sighting(&report), None);
+        let mut other = SanitizerClusterDedup::new(existing.clusters.keys().cloned())
+            .with_scope(corpus::cluster::crash_scope("H-OTHER", None));
+        assert!(other.first_sighting(&report).is_some());
     }
 
     #[test]

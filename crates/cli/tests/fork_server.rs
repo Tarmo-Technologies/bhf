@@ -135,3 +135,91 @@ fn fork_server_finds_the_same_fault_as_per_spawn() {
         "an explicit --fork-server must match per-spawn too"
     );
 }
+
+/// The persistent driver reuses one large input buffer, so an over-read just
+/// past the input stays inside it and the fork-server reports nothing. The
+/// fuzz loop re-runs such an input in a fresh process, whose exact-size buffer
+/// makes AddressSanitizer report it, and hands that run's stderr over with its
+/// report: the finding has a `sanitizer.log`.
+#[test]
+fn a_crash_only_a_fresh_process_sees_keeps_its_sanitizer_log() {
+    let clang_runs = std::process::Command::new("clang")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !clang_runs {
+        eprintln!("skipping: clang unavailable");
+        return;
+    }
+    let root = temp_dir("forkserver-fresh-rerun");
+    let work = root.join("work");
+    let harness_dir = work.join("harnesses/H-OVERREAD");
+    fs::create_dir_all(&harness_dir).unwrap();
+    fs::write(
+        harness_dir.join("target.c"),
+        "#include <stddef.h>\n#include <stdint.h>\n\
+         __attribute__((noinline)) int read_trailer(const uint8_t *data, size_t len) {\n\
+             return data[len + 2];\n\
+         }\n\
+         int bhf_run_one(const uint8_t *data, size_t size) {\n\
+             if (size >= 4 && data[0] == 'R' && data[1] == 'E') return read_trailer(data, size);\n\
+             return 0;\n\
+         }\n",
+    )
+    .unwrap();
+    let driver = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../c_runtime/bhf_driver.c");
+    let built = std::process::Command::new("clang")
+        .current_dir(&harness_dir)
+        .args([
+            "-O1",
+            "-g",
+            "-fsanitize=address",
+            "-fsanitize-coverage=trace-pc-guard,trace-cmp",
+            "-o",
+            "main",
+            "target.c",
+        ])
+        .arg(&driver)
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let seed = root.join("seed.bin");
+    fs::write(&seed, b"READ").unwrap();
+
+    let exit = cli::run_from([
+        "bhf",
+        "fuzz",
+        work.to_str().unwrap(),
+        "--harness",
+        "H-OVERREAD",
+        "--fork-server",
+        "--seed-file",
+        seed.to_str().unwrap(),
+        "--iterations",
+        "1",
+    ]);
+    let findings: Vec<(PathBuf, serde_json::Value)> = fs::read_dir(work.join("results/findings"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let bytes = fs::read(entry.path().join("finding.json")).ok()?;
+            Some((entry.path(), serde_json::from_slice(&bytes).ok()?))
+        })
+        .collect();
+    let (dir, finding) = findings
+        .iter()
+        .find(|(_, finding)| finding["rule_id"] == "BHF-201")
+        .unwrap_or_else(|| panic!("exit {exit}: no heap-buffer-overflow finding: {findings:?}"));
+    assert_eq!(finding["paths"]["sanitizer_log"], "sanitizer.log");
+    let log = fs::read_to_string(dir.join("sanitizer.log")).expect("sanitizer.log written");
+    assert!(
+        log.contains("ERROR: AddressSanitizer: heap-buffer-overflow"),
+        "{log}"
+    );
+    assert!(log.contains("read_trailer"), "{log}");
+}

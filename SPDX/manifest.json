@@ -2455,6 +2455,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/tests/cross_sweep_findings.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/tests/custom_harness_flow.rs",
       "license": "Apache-2.0"
     },

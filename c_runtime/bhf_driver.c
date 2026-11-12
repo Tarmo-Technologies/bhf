@@ -804,6 +804,163 @@ BHF_NOCOV int __wrap_strncasecmp(const char *s1, const char *s2, size_t n) {
 }
 #endif
 
+/* Fatal-signal report for a build without a sanitizer runtime (a cross build
+ * run under an emulator, or a plain native build). Such a crash prints nothing
+ * by itself, so every one of a harness's SIGSEGVs looked the same. The handler
+ * writes one line naming the signal, the faulting pc, the fault address and,
+ * when the pc is in the executable, its offset there (a file address, the same
+ * in every run whatever ASLR does), then lets the signal kill the process as
+ * before:
+ *   bhf: fatal signal SIGSEGV pc=0x55d0c1a2b3c4 addr=0x0 exe_offset=0x13c4
+ * It uses write(2) only. A sanitizer runtime reports these signals itself, so
+ * the handler is installed only when none is linked and only for a signal
+ * nothing else handles. */
+#if defined(__linux__) && !defined(_WIN32)
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(memory_sanitizer) || \
+    __has_feature(thread_sanitizer)
+#define BHF_FATAL_SIGNAL_SANITIZED 1
+#endif
+#endif
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#define BHF_FATAL_SIGNAL_SANITIZED 1
+#endif
+#endif
+#if defined(__linux__) && !defined(_WIN32) && !defined(BHF_FATAL_SIGNAL_SANITIZED)
+#include <signal.h>
+#include <ucontext.h>
+#include <link.h>
+/* Present in every sanitizer runtime (ASan, UBSan, MSan, TSan, LSan). */
+extern void __sanitizer_print_stack_trace(void) __attribute__((weak));
+static uintptr_t bhf_fs_bias, bhf_fs_lo, bhf_fs_hi;
+static char bhf_fs_altstack[64 * 1024];
+
+/* The executable is the first object dl_iterate_phdr reports: keep its load
+ * bias and the span of its executable segments. */
+BHF_NOCOV static int bhf_fs_exe_span(struct dl_phdr_info *info, size_t size, void *data) {
+    (void)size;
+    (void)data;
+    bhf_fs_bias = (uintptr_t)info->dlpi_addr;
+    for (int i = 0; i < (int)info->dlpi_phnum; i++) {
+        const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
+        if (ph->p_type != PT_LOAD || !(ph->p_flags & PF_X)) continue;
+        uintptr_t lo = bhf_fs_bias + (uintptr_t)ph->p_vaddr;
+        uintptr_t hi = lo + (uintptr_t)ph->p_memsz;
+        if (!bhf_fs_lo || lo < bhf_fs_lo) bhf_fs_lo = lo;
+        if (hi > bhf_fs_hi) bhf_fs_hi = hi;
+    }
+    return 1;
+}
+
+BHF_NOCOV static uintptr_t bhf_fs_pc(void *context) {
+    ucontext_t *uc = (ucontext_t *)context;
+    if (!uc) return 0;
+#if defined(__x86_64__)
+    return (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+#elif defined(__i386__)
+    return (uintptr_t)uc->uc_mcontext.gregs[REG_EIP];
+#elif defined(__aarch64__)
+    return (uintptr_t)uc->uc_mcontext.pc;
+#elif defined(__arm__)
+    return (uintptr_t)uc->uc_mcontext.arm_pc;
+#elif defined(__riscv)
+    return (uintptr_t)uc->uc_mcontext.__gregs[0];
+#elif defined(__powerpc64__)
+    return (uintptr_t)uc->uc_mcontext.gp_regs[32];
+#elif defined(__mips__)
+    return (uintptr_t)uc->uc_mcontext.pc;
+#else
+    return 0;
+#endif
+}
+
+BHF_NOCOV static size_t bhf_fs_put(char *out, size_t at, size_t cap, const char *text) {
+    while (*text && at < cap) out[at++] = *text++;
+    return at;
+}
+
+BHF_NOCOV static size_t bhf_fs_hex(char *out, size_t at, size_t cap, uintptr_t value) {
+    char digits[2 * sizeof(uintptr_t)];
+    int n = 0;
+    do {
+        digits[n++] = "0123456789abcdef"[value & 0xf];
+        value >>= 4;
+    } while (value && n < (int)sizeof digits);
+    at = bhf_fs_put(out, at, cap, "0x");
+    while (n > 0 && at < cap) out[at++] = digits[--n];
+    return at;
+}
+
+BHF_NOCOV static const char *bhf_fs_name(int sig) {
+    switch (sig) {
+    case SIGSEGV: return "SIGSEGV";
+    case SIGBUS: return "SIGBUS";
+    case SIGILL: return "SIGILL";
+    case SIGFPE: return "SIGFPE";
+    case SIGTRAP: return "SIGTRAP";
+    default: return "signal";
+    }
+}
+
+BHF_NOCOV static void bhf_fs_handler(int sig, siginfo_t *info, void *context) {
+    char line[192];
+    size_t n = 0;
+    uintptr_t pc = bhf_fs_pc(context);
+    n = bhf_fs_put(line, n, sizeof line, "bhf: fatal signal ");
+    n = bhf_fs_put(line, n, sizeof line, bhf_fs_name(sig));
+    if (pc) {
+        n = bhf_fs_put(line, n, sizeof line, " pc=");
+        n = bhf_fs_hex(line, n, sizeof line, pc);
+    }
+    /* A signal the kernel raised for a fault carries the fault address; one
+     * sent by raise() or kill() does not. */
+    if (info && info->si_code > 0) {
+        n = bhf_fs_put(line, n, sizeof line, " addr=");
+        n = bhf_fs_hex(line, n, sizeof line, (uintptr_t)info->si_addr);
+    }
+    if (pc && pc >= bhf_fs_lo && pc < bhf_fs_hi) {
+        n = bhf_fs_put(line, n, sizeof line, " exe_offset=");
+        n = bhf_fs_hex(line, n, sizeof line, pc - bhf_fs_bias);
+    }
+    n = bhf_fs_put(line, n, sizeof line, "\n");
+    if (write(2, line, n) < 0) {
+        /* Nothing more can be reported. */
+    }
+    /* SA_RESETHAND restored the default action: the raised signal kills the
+     * process as soon as the handler returns (a fault would re-fault too). */
+    raise(sig);
+}
+
+BHF_NOCOV static void bhf_fatal_signal_install(void) {
+    static const int signals[] = {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP};
+    struct sigaction action;
+    stack_t current;
+    if (__sanitizer_print_stack_trace) return;
+    dl_iterate_phdr(bhf_fs_exe_span, NULL);
+    if (sigaltstack(NULL, &current) == 0 && (current.ss_flags & SS_DISABLE)) {
+        stack_t alt;
+        alt.ss_sp = bhf_fs_altstack;
+        alt.ss_size = sizeof bhf_fs_altstack;
+        alt.ss_flags = 0;
+        sigaltstack(&alt, NULL);
+    }
+    memset(&action, 0, sizeof action);
+    action.sa_sigaction = bhf_fs_handler;
+    action.sa_flags = SA_SIGINFO | SA_RESETHAND | SA_ONSTACK;
+    sigemptyset(&action.sa_mask);
+    for (size_t i = 0; i < sizeof signals / sizeof signals[0]; i++) {
+        struct sigaction previous;
+        if (sigaction(signals[i], NULL, &previous) != 0) continue;
+        if (!(previous.sa_flags & SA_SIGINFO) && previous.sa_handler != SIG_DFL) continue;
+        if ((previous.sa_flags & SA_SIGINFO) && previous.sa_sigaction) continue;
+        sigaction(signals[i], &action, NULL);
+    }
+}
+#define BHF_FATAL_SIGNAL_INSTALL() bhf_fatal_signal_install()
+#else
+#define BHF_FATAL_SIGNAL_INSTALL() ((void)0)
+#endif
+
 BHF_NOCOV static void bhf_run_one_bytes(const uint8_t *data, size_t size) {
     BHF_PUBLISH_INPUT(data, size);
     bhf_run_one(data, size);
@@ -838,6 +995,7 @@ static int bhf_read_n(int fd, void *buf, size_t n) {
     return 1;
 }
 int main(int argc, char **argv) {
+    BHF_FATAL_SIGNAL_INSTALL();
     BHF_FUZZER_INITIALIZE(&argc, &argv);
 #ifdef _WIN32
     /* Install the crash handler that makes a fault a detectable exit under wine. */

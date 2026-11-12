@@ -41,6 +41,11 @@ pub struct SanitizerReport {
     /// it hit, and the allocation and free stacks. Boxed: most reports carry
     /// none, and the report travels inside every harness-run result.
     pub access: Option<Box<MemoryAccess>>,
+    /// For a crash with no sanitizer report: the faulting instruction's offset
+    /// in the executable (its file address), from the `bhf: fatal signal`
+    /// line bhf's driver prints before it dies by the signal. It tells two
+    /// crash sites of one harness apart and is only meaningful for that build.
+    pub pc_offset: Option<u64>,
 }
 
 /// A `file:line[:col]` source position.
@@ -106,6 +111,14 @@ impl SanitizerReport {
             .map(site_path)
             .filter(|frame_path| frame_path.rsplit('/').next() == Some(path.as_str()));
         Some(location.site_at(from_frame.as_deref().unwrap_or(&path)))
+    }
+
+    /// [`Self::site`], else the faulting instruction's offset in the
+    /// executable (`exe+0x1b3c`, see [`Self::pc_offset`]): what identifies
+    /// where a report without frames crashed.
+    pub fn fault_site(&self) -> Option<String> {
+        self.site()
+            .or_else(|| self.pc_offset.map(|offset| format!("exe+{offset:#x}")))
     }
 }
 
@@ -1109,6 +1122,7 @@ fn parse_asan(stderr: &str) -> Option<SanitizerReport> {
         location: summary_location(rest, "AddressSanitizer:"),
         check: None,
         access,
+        pc_offset: None,
     })
 }
 
@@ -1180,6 +1194,7 @@ fn parse_ubsan(stderr: &str) -> Option<SanitizerReport> {
         location: ubsan_location(line),
         check,
         access: None,
+        pc_offset: None,
     })
 }
 

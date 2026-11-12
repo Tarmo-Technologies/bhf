@@ -60,6 +60,23 @@
   and could exceed its buffer, and two buffers got the same bytes.
   `arg-layout.json` gives each slice a sized `remainder` step, so
   `bhf decode-args --static` decodes these calls exactly.
+- Crashes with no frames and no source position, such as the raw SIGSEGVs of
+  a cross sweep's harnesses, are no longer one root-cause group for the whole
+  work dir. Their key hashes the rule, kind, check name and the harness that
+  found them (its id and target function), so two harnesses' crashes are two
+  groups (`results/INDEX.md`, `explain`). bhf's driver, in a build without a
+  sanitizer runtime, prints `bhf: fatal signal <SIG> pc=0x... addr=0x...
+  exe_offset=0x...` before the signal kills the harness; the offset of the
+  faulting instruction in the executable is recorded as
+  `exception.pc_offset` and separates two crash sites of one harness.
+- The generated `replay.py` merges bhf's sanitizer keys into an inherited
+  `ASAN_OPTIONS`/`UBSAN_OPTIONS` instead of keeping the inherited value as it
+  was: `UBSAN_OPTIONS` always gets `print_stacktrace=1:report_error_type=1:
+  halt_on_error=1` and `ASAN_OPTIONS` `abort_on_error=1:halt_on_error=1` (plus
+  `detect_leaks=1` for a leak finding), so `UBSAN_OPTIONS=suppressions=...`
+  no longer turns a UBSan finding into a frameless report and `exit status: 0`.
+  The script exits with the harness's status, 128 plus the signal for a
+  harness killed by one.
 - A C or C++ capsule's `build.sh` picks the sanitizer flags of the compiler that
   runs it (gcc has no `function` UBSan check and links its runtimes
   statically), as the harness Makefile does, and a capsule of a harness bhf
@@ -549,6 +566,11 @@
   recorded against format 3 are flagged by `bhf replay`, `bhf minimize`,
   `bhf decode-args` and `bhf capsule` as before; a harness whose calls have
   none of these shapes decodes its inputs as format 3 did.
+- The root-cause key (`cluster_key_full`) of a crash without frames or a
+  source position now hashes the harness that found it, and the signature
+  (the finding ID suffix) of a fatal signal the driver printed a pc for hashes
+  that pc. A work dir from an earlier release may record such a crash once
+  more; start from a fresh work dir to compare groups.
 - A target refused because a source path, include dir or compile flag holds a
   character no quoting makes safe in a build recipe now has its own outcome,
   `unsafe_build_path`, in `run.json` (and `summary.unsafe_build_path`, the

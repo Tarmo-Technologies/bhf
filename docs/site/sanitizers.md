@@ -53,7 +53,11 @@ inherited `<SAN>_OPTIONS` with the keys it requires (`abort_on_error`,
 win (you cannot accidentally disable `abort_on_error`, which is what turns a
 sanitizer report into a saved finding). `UBSAN_OPTIONS` also always gets
 `print_stacktrace=1` and `report_error_type=1`, during fuzzing, minimization,
-`bhf replay` and in the generated `replay.py`. Minimization, `bhf replay` and
+`bhf replay` and in the generated `replay.py`. The `replay.py` reproducer
+merges the same way (`ASAN_OPTIONS` gets `abort_on_error=1:halt_on_error=1`,
+`UBSAN_OPTIONS` also `halt_on_error=1`, so an inherited value cannot turn a
+report into a clean exit) and exits with the harness's status, 128 plus the
+signal for a harness killed by one. Minimization, `bhf replay` and
 `bhf report --backfill` run C/C++ harnesses with the same `ASAN_OPTIONS` and
 `UBSAN_OPTIONS` as a fuzz child (a leak finding also gets `detect_leaks=1`;
 leak detection is never turned off). UBSan then prints the stack of
@@ -135,8 +139,10 @@ per crashing input.
   (`<dir>/<file>:<line>:<col>`, the last two components of the reported path,
   so `src/a/util.c` and `src/b/util.c` are different sites wherever the tree
   is checked out; a bare file name takes its directory from the top crash
-  frame naming the same file). The `F-NNNN-<sig8>` suffix is its first 8 hex
-  digits. The allocation and free stacks are not hashed.
+  frame naming the same file). A fatal signal with no sanitizer report has no
+  stack; its site is the faulting instruction's offset in the executable,
+  when bhf's driver printed one (see below). The `F-NNNN-<sig8>` suffix is
+  its first 8 hex digits. The allocation and free stacks are not hashed.
 - **Root-cause key** (`cluster_key_full`, the `group` in `results/`). The
   rule, kind and check name plus the first three project frames. libc,
   sanitizer-runtime and interceptor frames (`__memcmp_avx2_movbe`,
@@ -145,7 +151,11 @@ per crashing input.
   at the project code that made the call. A UBSan report keys on its site and
   the function it is in: the same site reached from several harnesses is one
   group, two sites are two groups. A crash with neither a project frame nor a
-  site keys on its signature.
+  source site keys on its rule, kind, check name, the faulting pc offset when
+  there is one, and the harness that found it (its id and the function it
+  calls): frame-less crashes of two harnesses are two groups, and two crash
+  sites of one harness are two groups when the driver printed their pc. Its
+  `cluster_fallback` is `true`.
 - **Per-run dedup.** The fuzz loop, AFL++ crash ingestion and the pre-seed from
   findings an earlier pass wrote all use the root-cause key. A key is used up
   only when its finding is written: a first hit that does not reproduce in a
@@ -168,6 +178,22 @@ per crashing input.
 
 When the persistent fork-server misses a crash that the fresh-process re-run
 catches, that run's stderr is the finding's `sanitizer.log`.
+
+A harness built without a sanitizer runtime (a cross build run under its
+emulator, or a native build without sanitizers) prints nothing of its
+own when a fatal signal kills it. bhf's driver then writes one line to stderr
+before the signal kills the process as before:
+
+```text
+bhf: fatal signal SIGSEGV pc=0x55d0c1a2b3c4 addr=0x0 exe_offset=0x13c4
+```
+
+`exe_offset` is the faulting instruction's file address in the executable
+(the same in every run, so `addr2line -e main 0x13c4` names the line); it is
+missing when the pc is in a shared library. `addr` is printed for a fault the
+kernel raised. The handler covers SIGSEGV, SIGBUS, SIGILL, SIGFPE and SIGTRAP,
+and is installed only when no sanitizer runtime is linked and nothing else
+handles the signal. The offset is recorded as `exception.pc_offset`.
 
 ## Custom allocators: the ASan poison bridge
 

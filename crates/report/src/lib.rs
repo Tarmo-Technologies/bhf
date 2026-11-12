@@ -2219,7 +2219,7 @@ fn ensure_repro_py(
         string_at(raw, &["paths", "testcase"]).unwrap_or_else(|| "testcase.bin".to_owned());
     let fixture_path = string_at(raw, &["fixture_path"]).unwrap_or_default();
     let harness_id = string_at(raw, &["harness_id"]).unwrap_or_default();
-    let asan_options = asan_options_for(raw);
+    let (asan_defaults, asan_required) = asan_options_for(raw);
     let extra_env = raw
         .pointer("/runtime_mode/env_injected")
         .and_then(Value::as_object)
@@ -2234,17 +2234,19 @@ fn ensure_repro_py(
         header_lines.push(format!("Sink: {}", sink_header_line(sink)));
     }
 
-    let script = render_repro_py(
-        &testcase_name,
-        &fixture_path,
-        &harness_id,
-        &asan_options,
-        // The same UBSan report shape a fuzz child produces: its stack and the
-        // failed check's name on the SUMMARY line.
-        "print_stacktrace=1:report_error_type=1",
-        &extra_env,
-        &header_lines,
-    );
+    let script = render_repro_py(&ReproScript {
+        testcase_name: &testcase_name,
+        fixture_path: &fixture_path,
+        harness_id: &harness_id,
+        asan_defaults,
+        asan_required,
+        // The same UBSan report shape a fuzz child produces: it halts on the
+        // first report, with its stack and the failed check's name on the
+        // SUMMARY line.
+        ubsan_required: UBSAN_REQUIRED_OPTIONS,
+        extra_env: &extra_env,
+        header_lines: &header_lines,
+    });
     let path = finding_dir.join("replay.py");
     write_regular_no_follow(&path, script.as_bytes(), Some(0o755))
 }
@@ -2390,11 +2392,15 @@ fn open_no_follow(path: &Path, options: &mut fs::OpenOptions) -> io::Result<fs::
     }
 }
 
-/// The default `ASAN_OPTIONS` for a finding's reproducer. Leak findings (LSan)
-/// MUST keep leak detection on to reproduce, so they get `detect_leaks=1`; every
-/// other class disables leak detection so libFuzzer's own exit-time leak noise
-/// doesn't mask the real crash being replayed.
-fn asan_options_for(raw: &Value) -> String {
+/// The `UBSAN_OPTIONS` keys the reproducer always sets, after the
+/// operator's: the fuzz child's report shape, halting on the first report.
+const UBSAN_REQUIRED_OPTIONS: &str = "print_stacktrace=1:report_error_type=1:halt_on_error=1";
+
+/// The reproducer's `ASAN_OPTIONS` for `raw`: the defaults the operator's own
+/// value may override (leak detection off for a finding that is not a leak),
+/// and the keys bhf always sets after it, so they win (a report halts the
+/// run, and a leak finding keeps leak detection on).
+fn asan_options_for(raw: &Value) -> (&'static str, &'static str) {
     let sanitizer = string_at(raw, &["exception", "sanitizer"])
         .unwrap_or_default()
         .to_ascii_lowercase();
@@ -2403,9 +2409,9 @@ fn asan_options_for(raw: &Value) -> String {
         .to_ascii_lowercase();
     let is_leak = sanitizer == "lsan" || message.contains("leak");
     if is_leak {
-        "detect_leaks=1:abort_on_error=1".to_owned()
+        ("", "abort_on_error=1:halt_on_error=1:detect_leaks=1")
     } else {
-        "detect_leaks=0:abort_on_error=1".to_owned()
+        ("detect_leaks=0", "abort_on_error=1:halt_on_error=1")
     }
 }
 
@@ -2418,21 +2424,58 @@ fn sink_header_line(sink: &actionability::Sink) -> String {
     }
 }
 
+/// What [`render_repro_py`] embeds in a finding's `replay.py`.
+#[derive(Debug)]
+struct ReproScript<'a> {
+    testcase_name: &'a str,
+    fixture_path: &'a str,
+    harness_id: &'a str,
+    /// `ASAN_OPTIONS` keys set only when the operator's value has none.
+    asan_defaults: &'a str,
+    /// `ASAN_OPTIONS` keys set after the operator's value, so they win.
+    asan_required: &'a str,
+    /// `UBSAN_OPTIONS` keys set after the operator's value, so they win.
+    ubsan_required: &'a str,
+    extra_env: &'a serde_json::Map<String, Value>,
+    header_lines: &'a [String],
+}
+
+impl Default for ReproScript<'_> {
+    fn default() -> Self {
+        static NO_ENV: std::sync::OnceLock<serde_json::Map<String, Value>> =
+            std::sync::OnceLock::new();
+        Self {
+            testcase_name: "testcase.bin",
+            fixture_path: "",
+            harness_id: "",
+            asan_defaults: "",
+            asan_required: "",
+            ubsan_required: "",
+            extra_env: NO_ENV.get_or_init(serde_json::Map::new),
+            header_lines: &[],
+        }
+    }
+}
+
 /// Render a standalone `replay.py`. The script auto-discovers the harness (from
-/// the sibling `finding.json`'s `fixture_path` / `harness_id`, or argv[1]), sets
-/// the sanitizer env unless already set, runs the harness on the recorded
-/// testcase (argv-file for libFuzzer/driver harnesses, stdin for AFL), and prints
-/// the output + exit status. Embedded string values are JSON-encoded, which is a
-/// valid Python string/dict literal, so paths/symbols with quotes are safe.
-fn render_repro_py(
-    testcase_name: &str,
-    fixture_path: &str,
-    harness_id: &str,
-    asan_options: &str,
-    ubsan_options: &str,
-    extra_env: &serde_json::Map<String, Value>,
-    header_lines: &[String],
-) -> String {
+/// the sibling `finding.json`'s `fixture_path` / `harness_id`, or argv[1]),
+/// merges bhf's sanitizer keys into the inherited `ASAN_OPTIONS` /
+/// `UBSAN_OPTIONS` (bhf's required keys win), runs the harness on the recorded
+/// testcase (argv-file for libFuzzer/driver harnesses, stdin for AFL), prints
+/// the output and exits with the harness's status (128 + the signal for a
+/// signal). Embedded string values are JSON-encoded, which is a valid Python
+/// string/dict literal, so paths/symbols with quotes are safe.
+fn render_repro_py(spec: &ReproScript<'_>) -> String {
+    let ReproScript {
+        testcase_name,
+        fixture_path,
+        harness_id,
+        asan_defaults,
+        asan_required,
+        ubsan_required,
+        extra_env,
+        header_lines,
+    } = *spec;
     let py_str = |s: &str| serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_owned());
     let extra_env_py = serde_json::to_string(&Value::Object(extra_env.clone()))
         .unwrap_or_else(|_| "{}".to_owned());
@@ -2460,7 +2503,9 @@ __HEADER__
 # copied work dir runs its own harness), then harness_id under
 # <work>/{harnesses,auto,generated_harnesses,build}/<harness_id>/. Pass a path to
 # override. The harness runs on the recorded testcase with the sanitizer env and
-# its output + exit status are printed.
+# its output + exit status are printed. bhf's sanitizer keys are added after any
+# ASAN_OPTIONS / UBSAN_OPTIONS you set, so a report still halts the run. The
+# script exits with the harness's exit status (128 + the signal for a signal).
 import json
 import os
 import subprocess
@@ -2471,9 +2516,38 @@ HERE = Path(__file__).resolve().parent
 TESTCASE = HERE / __TESTCASE__
 FIXTURE_PATH = __FIXTURE__
 HARNESS_ID = __HARNESS_ID__
-ASAN_OPTIONS_DEFAULT = __ASAN__
-UBSAN_OPTIONS_DEFAULT = __UBSAN__
+ASAN_OPTIONS_DEFAULT = __ASAN_DEFAULT__
+ASAN_OPTIONS_REQUIRED = __ASAN__
+UBSAN_OPTIONS_DEFAULT = ""
+UBSAN_OPTIONS_REQUIRED = __UBSAN__
 EXTRA_ENV = __EXTRA_ENV__
+
+
+def parse_options(text):
+    # Sanitizer options are colon-separated key=value pairs.
+    options = {}
+    for item in (text or "").split(":"):
+        key, sep, value = item.partition("=")
+        if key.strip() and sep:
+            options[key.strip()] = value
+    return options
+
+
+def merged_options(inherited, defaults, required):
+    # bhf's defaults, then the inherited value, then bhf's required keys: the
+    # operator's value overrides a default, never a required key.
+    options = parse_options(defaults)
+    for source in (inherited, required):
+        for key, value in parse_options(source).items():
+            options.pop(key, None)
+            options[key] = value
+    return ":".join("%s=%s" % item for item in options.items())
+
+
+def exit_code(returncode):
+    # subprocess reports a signal as a negative return code; a shell reports
+    # it as 128 + the signal.
+    return 128 - returncode if returncode < 0 else returncode
 
 
 def load_finding():
@@ -2637,8 +2711,12 @@ def main():
     harness = resolve_harness(finding)
 
     env = dict(os.environ)
-    env.setdefault("ASAN_OPTIONS", ASAN_OPTIONS_DEFAULT)
-    env.setdefault("UBSAN_OPTIONS", UBSAN_OPTIONS_DEFAULT)
+    env["ASAN_OPTIONS"] = merged_options(
+        env.get("ASAN_OPTIONS"), ASAN_OPTIONS_DEFAULT, ASAN_OPTIONS_REQUIRED
+    )
+    env["UBSAN_OPTIONS"] = merged_options(
+        env.get("UBSAN_OPTIONS"), UBSAN_OPTIONS_DEFAULT, UBSAN_OPTIONS_REQUIRED
+    )
     for key, value in EXTRA_ENV.items():
         env.setdefault(key, value)
     env = with_runtime_path(env, harness)
@@ -2668,8 +2746,12 @@ def main():
     sys.stdout.write(proc.stdout.decode("utf-8", "replace"))
     if not proc.stdout.endswith(b"\n"):
         print()
-    print("exit status: %d" % proc.returncode)
-    sys.exit(proc.returncode)
+    code = exit_code(proc.returncode)
+    if proc.returncode < 0:
+        print("exit status: %d (signal %d)" % (code, -proc.returncode))
+    else:
+        print("exit status: %d" % code)
+    sys.exit(code)
 
 
 if __name__ == "__main__":
@@ -2681,8 +2763,9 @@ if __name__ == "__main__":
         .replace("__TESTCASE__", &py_str(testcase_name))
         .replace("__FIXTURE__", &py_str(fixture_path))
         .replace("__HARNESS_ID__", &py_str(harness_id))
-        .replace("__ASAN__", &py_str(asan_options))
-        .replace("__UBSAN__", &py_str(ubsan_options))
+        .replace("__ASAN_DEFAULT__", &py_str(asan_defaults))
+        .replace("__ASAN__", &py_str(asan_required))
+        .replace("__UBSAN__", &py_str(ubsan_required))
         .replace("__EXTRA_ENV__", &extra_env_py)
 }
 
@@ -4316,9 +4399,145 @@ mod tests {
         super::ensure_repro_py(dir.path(), &raw, &record).unwrap();
         let script = std::fs::read_to_string(dir.path().join("replay.py")).unwrap();
         assert!(
-            script.contains("UBSAN_OPTIONS_DEFAULT = \"print_stacktrace=1:report_error_type=1\""),
+            script.contains(
+                "UBSAN_OPTIONS_REQUIRED = \"print_stacktrace=1:report_error_type=1:halt_on_error=1\""
+            ),
             "{script}"
         );
+    }
+
+    /// The reproducer keeps the operator's sanitizer options but adds bhf's
+    /// required keys after them, so they win: UBSan halts on its first report
+    /// with its stack, ASan halts, and a leak finding keeps leak detection.
+    #[test]
+    fn repro_py_merges_inherited_sanitizer_options_with_bhf_keys_winning() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = json!({"id": "F-0001-aaaaaaaa", "harness_id": "H-C0001", "rule_id": "BHF-210"});
+        let record =
+            actionability::backfill_actionability(actionability::RunMode::Reporting, &raw, None);
+        super::ensure_repro_py(dir.path(), &raw, &record).unwrap();
+        let script = std::fs::read_to_string(dir.path().join("replay.py")).unwrap();
+        assert!(
+            script.contains(
+                "UBSAN_OPTIONS_REQUIRED = \"print_stacktrace=1:report_error_type=1:halt_on_error=1\""
+            ),
+            "{script}"
+        );
+        assert!(
+            script.contains("ASAN_OPTIONS_REQUIRED = \"abort_on_error=1:halt_on_error=1\""),
+            "{script}"
+        );
+        let Some(python) = python3() else {
+            eprintln!("skipping the merge run: python3 unavailable");
+            return;
+        };
+        let probe = format!(
+            "import importlib.util, json\n\
+             spec = importlib.util.spec_from_file_location('replay', {script:?})\n\
+             replay = importlib.util.module_from_spec(spec)\n\
+             spec.loader.exec_module(replay)\n\
+             print(json.dumps([\n\
+               replay.merged_options('suppressions=/dev/null:halt_on_error=0', '', replay.UBSAN_OPTIONS_REQUIRED),\n\
+               replay.merged_options(None, replay.ASAN_OPTIONS_DEFAULT, replay.ASAN_OPTIONS_REQUIRED),\n\
+               replay.merged_options('detect_leaks=1', replay.ASAN_OPTIONS_DEFAULT, replay.ASAN_OPTIONS_REQUIRED),\n\
+             ]))\n",
+            script = dir.path().join("replay.py").display().to_string(),
+        );
+        let output = std::process::Command::new(python)
+            .args(["-c", &probe])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let merged: Vec<String> = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            merged[0],
+            "suppressions=/dev/null:print_stacktrace=1:report_error_type=1:halt_on_error=1"
+        );
+        assert_eq!(merged[1], "detect_leaks=0:abort_on_error=1:halt_on_error=1");
+        assert_eq!(
+            merged[2], "detect_leaks=1:abort_on_error=1:halt_on_error=1",
+            "the operator's value beats bhf's default, not its required keys"
+        );
+    }
+
+    /// A UBSan finding replayed with an inherited `UBSAN_OPTIONS` still halts
+    /// on the report and prints its stack, and the script exits with the
+    /// harness's status (128 + the signal for a signal).
+    #[cfg(unix)]
+    #[test]
+    fn repro_py_reproduces_a_ubsan_finding_under_inherited_ubsan_options() {
+        let Some(python) = python3() else {
+            eprintln!("skipping: python3 unavailable");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let harness_dir = tmp.path().join("work/harnesses/H-1");
+        std::fs::create_dir_all(&harness_dir).unwrap();
+        std::fs::write(
+            harness_dir.join("parse.c"),
+            "#include <stdio.h>\n#include <limits.h>\n\
+             __attribute__((noinline)) int scale_record(int value) { return value * 4; }\n\
+             int main(int argc, char **argv) {\n\
+                 FILE *f = fopen(argv[1], \"rb\");\n\
+                 int c = f ? fgetc(f) : 0;\n\
+                 printf(\"%d\\n\", scale_record(c == 'X' ? INT_MAX : 1));\n\
+                 return 0;\n\
+             }\n",
+        )
+        .unwrap();
+        let built = std::process::Command::new("clang")
+            .current_dir(&harness_dir)
+            .args(["-g", "-O0", "-fsanitize=undefined", "-o", "main", "parse.c"])
+            .output();
+        if !built.as_ref().is_ok_and(|output| output.status.success()) {
+            eprintln!("skipping: clang with UBSan unavailable");
+            return;
+        }
+        let finding = tmp.path().join("work/results/findings/F-1");
+        std::fs::create_dir_all(&finding).unwrap();
+        std::fs::write(finding.join("testcase.bin"), b"X").unwrap();
+        let raw = json!({
+            "id": "F-1", "harness_id": "H-1", "rule_id": "BHF-202",
+            "fixture_path": "harnesses/H-1/main",
+            "exception": {"sanitizer": "ubsan", "name": "UBSAN_SIGNED_INTEGER_OVERFLOW"},
+        });
+        std::fs::write(finding.join("finding.json"), raw.to_string()).unwrap();
+        let record =
+            actionability::backfill_actionability(actionability::RunMode::Reporting, &raw, None);
+        super::ensure_repro_py(&finding, &raw, &record).unwrap();
+        let output = std::process::Command::new(python)
+            .arg(finding.join("replay.py"))
+            .env("UBSAN_OPTIONS", "suppressions=/dev/null")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("runtime error: signed integer overflow"),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains("#0 ") && stdout.contains("scale_record"),
+            "{stdout}"
+        );
+        assert!(!output.status.success(), "{stdout}");
+        assert!(!stdout.contains("exit status: 0"), "{stdout}");
+
+        // A harness killed by a signal: 128 + the signal.
+        let main = harness_dir.join("main");
+        std::fs::write(&main, "#!/bin/sh\nkill -SEGV $$\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&main, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let output = std::process::Command::new(python)
+            .arg(finding.join("replay.py"))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(139));
     }
 
     /// A Python 3 interpreter: `python3`, or `python` (its name on Windows,
@@ -4341,15 +4560,15 @@ mod tests {
             eprintln!("skipping: python3 unavailable");
             return;
         };
-        let script = super::render_repro_py(
-            "testcase.bin",
-            "",
-            "h1",
-            "detect_leaks=0",
-            "print_stacktrace=1",
-            &serde_json::Map::new(),
-            &[],
-        );
+        let extra_env = serde_json::Map::new();
+        let script = super::render_repro_py(&super::ReproScript {
+            testcase_name: "testcase.bin",
+            harness_id: "h1",
+            asan_defaults: "detect_leaks=0",
+            ubsan_required: "print_stacktrace=1",
+            extra_env: &extra_env,
+            ..Default::default()
+        });
         let tmp = tempfile::tempdir().unwrap();
         let runtime = tmp.path().join("llvm runtime");
         std::fs::create_dir_all(&runtime).unwrap();
@@ -4409,15 +4628,15 @@ mod tests {
             return;
         }
 
-        let script = super::render_repro_py(
-            "testcase.bin",
-            "",
-            "h1",
-            "detect_leaks=0",
-            "print_stacktrace=1",
-            &serde_json::Map::new(),
-            &[],
-        );
+        let extra_env = serde_json::Map::new();
+        let script = super::render_repro_py(&super::ReproScript {
+            testcase_name: "testcase.bin",
+            harness_id: "h1",
+            asan_defaults: "detect_leaks=0",
+            ubsan_required: "print_stacktrace=1",
+            extra_env: &extra_env,
+            ..Default::default()
+        });
 
         let plant_stub = |path: &std::path::Path| {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -4504,15 +4723,16 @@ mod tests {
             plant_stub(&original.join("harnesses/h1/main"));
             plant_stub(&copy.join("harnesses/h1/main"));
             plant_stub(&copy.join("build/h2/main"));
-            let script = super::render_repro_py(
-                "testcase.bin",
-                &fixture,
-                "h1",
-                "abort_on_error=1",
-                "print_stacktrace=1",
-                &serde_json::Map::new(),
-                &[],
-            );
+            let extra_env = serde_json::Map::new();
+            let script = super::render_repro_py(&super::ReproScript {
+                testcase_name: "testcase.bin",
+                fixture_path: &fixture,
+                harness_id: "h1",
+                asan_required: "abort_on_error=1",
+                ubsan_required: "print_stacktrace=1",
+                extra_env: &extra_env,
+                ..Default::default()
+            });
             std::fs::write(finding.join("replay.py"), &script).unwrap();
             std::fs::write(
                 finding.join("finding.json"),
@@ -4576,15 +4796,16 @@ mod tests {
             plant_stub(&copy.join("auto/h1/main"));
             plant_stub(&original.join("build/h1/main"));
             plant_stub(&elsewhere.join("build/h1/main"));
-            let script = super::render_repro_py(
-                "testcase.bin",
-                &fixture,
-                "h1",
-                "abort_on_error=1",
-                "print_stacktrace=1",
-                &serde_json::Map::new(),
-                &[],
-            );
+            let extra_env = serde_json::Map::new();
+            let script = super::render_repro_py(&super::ReproScript {
+                testcase_name: "testcase.bin",
+                fixture_path: &fixture,
+                harness_id: "h1",
+                asan_required: "abort_on_error=1",
+                ubsan_required: "print_stacktrace=1",
+                extra_env: &extra_env,
+                ..Default::default()
+            });
             std::fs::write(finding.join("replay.py"), &script).unwrap();
             std::fs::write(
                 finding.join("finding.json"),

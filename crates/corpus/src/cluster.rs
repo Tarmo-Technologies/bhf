@@ -20,6 +20,9 @@ const CLUSTER_KEY_VERSION_PREFIX: &str = "bhf-cluster-v1\n";
 /// check name and (for UBSan, or a report with no usable frame) the reported
 /// site, so they carry their own version prefix.
 const SANITIZER_CLUSTER_KEY_VERSION_PREFIX: &str = "bhf-sanitizer-cluster-v2\n";
+/// Prefix of the key of a sanitizer crash with no informative frame and no
+/// reported source position, which hashes the harness scope it was found in.
+const FRAMELESS_CLUSTER_KEY_VERSION_PREFIX: &str = "bhf-frameless-cluster-v1\n";
 
 /// A frame fed into the clustering pipeline. Real sanitizer frames
 /// arrive via `From<&StackFrame>`; synthesized Ada frames are built
@@ -56,8 +59,9 @@ impl From<&StackFrame> for InputFrame {
 /// digest. `frames` preserves the normalized frame list the key was
 /// hashed over so consumers can inspect why two findings clustered
 /// together (or didn't). `fallback = true` means normalization
-/// produced no informative frames; the caller is expected to
-/// substitute the per-input signature short before persisting.
+/// produced no informative frames. A fallback key that is the all-zero
+/// [placeholder](ClusterKey::is_placeholder) is replaced by the per-input
+/// signature before it is persisted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterKey {
     pub short: String,
@@ -299,6 +303,29 @@ pub fn is_harness_scaffolding_leak(report: &SanitizerReport) -> bool {
     saw_harness || saw_rust_std_allocator
 }
 
+impl ClusterKey {
+    /// The all-zero key [`cluster_key_from_frames`] gives an empty frame list,
+    /// which says nothing about the crash: the caller substitutes the
+    /// per-input signature for it.
+    pub fn is_placeholder(&self) -> bool {
+        self.fallback && self.full.bytes().all(|byte| byte == b'0')
+    }
+}
+
+/// The scope a crash without frames or a source position is grouped in: the
+/// harness that found it and, when known, the function it calls. Two
+/// harnesses' frame-less crashes are then two root-cause groups, while one
+/// harness keeps one group per rule, kind, check and faulting pc.
+pub fn crash_scope(harness_id: &str, target_function: Option<&str>) -> String {
+    match target_function
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        Some(function) => format!("{harness_id}|{function}"),
+        None => harness_id.to_owned(),
+    }
+}
+
 /// Hash the supplied normalized frame list into a `ClusterKey`. An
 /// empty frame list produces a placeholder all-zero key and sets
 /// `fallback = true`; callers are responsible for substituting the
@@ -343,12 +370,49 @@ pub fn cluster_key_from_frames(frames: &[String]) -> ClusterKey {
 /// through different callers is one root cause, and two sites are two. A report
 /// with no informative frame keys on its reported site when it has one.
 /// `fallback` is set only when neither a frame nor a site is known.
+///
+/// Such a report gets the all-zero placeholder key here; the finding emitter
+/// and the fuzz loop key it with [`cluster_for_sanitizer_scoped`] instead.
 pub fn cluster_for_sanitizer(report: &SanitizerReport) -> ClusterKey {
+    cluster_for_sanitizer_scoped(report, "")
+}
+
+/// [`cluster_for_sanitizer`] for a crash found in `scope` (see
+/// [`crash_scope`]). A report with no informative frame and no reported
+/// source position keys on its rule, kind, check, the faulting instruction's
+/// offset in the executable when the driver printed one
+/// ([`SanitizerReport::pc_offset`]), and `scope`, so frame-less crashes of
+/// different harnesses are different root causes. That key is still a
+/// `fallback` key: it does not name a source location. With an empty scope and
+/// no pc offset it is the placeholder.
+pub fn cluster_for_sanitizer_scoped(report: &SanitizerReport, scope: &str) -> ClusterKey {
     let input: Vec<InputFrame> = report.stack.iter().map(InputFrame::from).collect();
     let frames = normalize_frames(&input);
     let site = sanitizer_site(report, &frames);
     if frames.is_empty() && site.is_none() {
-        return cluster_key_from_frames(&frames);
+        if scope.is_empty() && report.pc_offset.is_none() {
+            return cluster_key_from_frames(&frames);
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(FRAMELESS_CLUSTER_KEY_VERSION_PREFIX.as_bytes());
+        let pc = report.fault_site().unwrap_or_default();
+        for part in [
+            report.rule_id,
+            report.kind.as_str(),
+            report.check.as_deref().unwrap_or(""),
+            pc.as_str(),
+            scope,
+        ] {
+            hasher.update(part.as_bytes());
+            hasher.update(b"\n");
+        }
+        let full = hex_lower(&hasher.finalize());
+        return ClusterKey {
+            short: full.chars().take(16).collect(),
+            full,
+            frames,
+            fallback: true,
+        };
     }
     let mut hasher = Sha256::new();
     hasher.update(SANITIZER_CLUSTER_KEY_VERSION_PREFIX.as_bytes());
@@ -1353,6 +1417,66 @@ mod tests {
         assert_ne!(
             cluster_for_sanitizer(&asan).full,
             cluster_for_sanitizer(&ubsan).full
+        );
+    }
+
+    /// A fatal signal with no sanitizer report: no frames, no source position.
+    fn frameless_signal(pc_offset: Option<u64>) -> SanitizerReport {
+        SanitizerReport {
+            sanitizer: None,
+            kind: "fatal-signal".to_owned(),
+            rule_id: "BHF-210",
+            message: "harness crashed with SIGSEGV and no sanitizer report".to_owned(),
+            pc_offset,
+            ..Default::default()
+        }
+    }
+
+    /// Frame-less crashes of two harnesses are two root causes; the same
+    /// harness keeps one key for them. The key is still a fallback key.
+    #[test]
+    fn frameless_crashes_of_different_harnesses_are_different_root_causes() {
+        let report = frameless_signal(None);
+        let parse = cluster_for_sanitizer_scoped(&report, "H-PARSE|parse_record");
+        let copy = cluster_for_sanitizer_scoped(&report, "H-COPY|copy_at");
+        assert_ne!(parse.full, copy.full);
+        assert_eq!(
+            parse,
+            cluster_for_sanitizer_scoped(&report, "H-PARSE|parse_record")
+        );
+        assert!(parse.fallback && copy.fallback);
+        assert!(!parse.is_placeholder() && !copy.is_placeholder());
+        assert_eq!(parse.full.len(), 64);
+        // Without a scope the key stays the placeholder the emitter replaces
+        // with the signature.
+        assert!(cluster_for_sanitizer(&report).is_placeholder());
+    }
+
+    /// The faulting instruction's offset separates two crash sites of one
+    /// harness.
+    #[test]
+    fn frameless_crashes_at_different_pcs_of_one_harness_are_different_root_causes() {
+        let scope = "H-PARSE|parse_record";
+        let a = cluster_for_sanitizer_scoped(&frameless_signal(Some(0x1b3c)), scope);
+        let b = cluster_for_sanitizer_scoped(&frameless_signal(Some(0x2a10)), scope);
+        assert_ne!(a.full, b.full);
+        assert_eq!(
+            a,
+            cluster_for_sanitizer_scoped(&frameless_signal(Some(0x1b3c)), scope)
+        );
+        assert_ne!(
+            a.full,
+            cluster_for_sanitizer_scoped(&frameless_signal(None), scope).full
+        );
+    }
+
+    /// A report with frames keys on them whatever the scope.
+    #[test]
+    fn a_scope_does_not_change_the_key_of_a_report_with_frames() {
+        let report = sample_sanitizer_report(vec!["real_parse"]);
+        assert_eq!(
+            cluster_for_sanitizer_scoped(&report, "H-A"),
+            cluster_for_sanitizer(&report)
         );
     }
 }
