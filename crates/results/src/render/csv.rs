@@ -5,7 +5,12 @@ use crate::model::FindingsDocument;
 
 /// Columns after `evidence_dir` were added later; they stay at the end so a
 /// reader that addresses columns by position keeps working.
-pub const CSV_HEADER: &str = "id,kind,severity,confidence,confirmation,rule_id,cwe,title,file,line,function,group,occurrences,verdict,vuln_id,purl,first_seen,evidence_dir,access,access_size,region_size,region_offset,input_to_state,input_to_state_input";
+pub const CSV_HEADER: &str = "id,kind,severity,confidence,confirmation,rule_id,cwe,title,file,line,function,group,occurrences,verdict,vuln_id,purl,first_seen,evidence_dir,access,access_size,region_size,region_offset,input_to_state,input_to_state_input,arguments,access_parameter";
+
+/// Longest `arguments` cell, in characters.
+pub const ARGUMENTS_CELL_MAX: usize = 200;
+/// Buffer bytes shown in an `arguments` cell's preview.
+const ARGUMENT_PREVIEW_BYTES: usize = 8;
 
 pub fn render_csv(doc: &FindingsDocument) -> String {
     let mut out = String::from(CSV_HEADER);
@@ -56,6 +61,15 @@ pub fn render_csv(doc: &FindingsDocument) -> String {
                 .as_ref()
                 .and_then(|fuzz| fuzz.input_to_state_input.clone())
                 .unwrap_or_default(),
+            f.fuzz
+                .as_ref()
+                .and_then(|fuzz| fuzz.arguments.as_deref())
+                .map(arguments_cell)
+                .unwrap_or_default(),
+            access
+                .and_then(|a| a.parameter.as_ref())
+                .map(|p| p.name.clone())
+                .unwrap_or_default(),
         ];
         out.push_str(&row.iter().map(|v| cell(v)).collect::<Vec<_>>().join(","));
         out.push('\n');
@@ -77,6 +91,45 @@ fn input_to_state_cell(f: &crate::model::Finding) -> String {
                 .join(";")
         })
         .unwrap_or_default()
+}
+
+/// The decoded arguments, compactly: `name=value` per argument, `;`-separated.
+/// A buffer or string is `len N`, with `hex <first 8 bytes>` when it has a
+/// preview; an output whose value changed shows `before->after`. A `;` in a
+/// name or value reads as `,` so the separator stays unambiguous, and the
+/// cell stops at [`ARGUMENTS_CELL_MAX`] characters with `...`.
+pub(crate) fn arguments_cell(arguments: &[crate::model::Argument]) -> String {
+    let clean = |text: &str| text.replace(';', ",");
+    let mut cell = arguments
+        .iter()
+        .map(|arg| {
+            let value = match (&arg.value, arg.len) {
+                (Some(value), _) => clean(value),
+                (None, Some(len)) => match arg.preview_hex.as_deref().filter(|h| !h.is_empty()) {
+                    Some(hex) => {
+                        let shown: String = hex.chars().take(ARGUMENT_PREVIEW_BYTES * 2).collect();
+                        let more = if shown.len() < hex.len() { "..." } else { "" };
+                        format!("len {len} hex {shown}{more}")
+                    }
+                    None => format!("len {len}"),
+                },
+                (None, None) => "?".to_owned(),
+            };
+            let after = arg
+                .after_call_value
+                .as_deref()
+                .filter(|after| Some(*after) != arg.value.as_deref())
+                .map(|after| format!("->{}", clean(after)))
+                .unwrap_or_default();
+            format!("{}={value}{after}", clean(&arg.name))
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    if cell.chars().count() > ARGUMENTS_CELL_MAX {
+        cell = cell.chars().take(ARGUMENTS_CELL_MAX - 3).collect();
+        cell.push_str("...");
+    }
+    cell
 }
 
 /// RFC 4180 escaping plus spreadsheet formula neutralization (OWASP CSV
@@ -120,7 +173,8 @@ mod tests {
         assert!(fuzz.contains(",src/parse.c,42,parse_header,"));
         assert!(
             fuzz.ends_with(
-                ",findings/F-0000-1a2b3c4d,read,4,12,12,0:4:memcmp:48445231,min_testcase.bin"
+                ",findings/F-0000-1a2b3c4d,read,4,12,12,0:4:memcmp:48445231,min_testcase.bin,\
+                 data=len 12 hex 48445231;flags=7,data"
             ),
             "{fuzz}"
         );
@@ -129,8 +183,47 @@ mod tests {
             sca.contains(",CVE-2026-0001,pkg:npm/example@2.4.2,"),
             "{sca}"
         );
-        assert!(sca.ends_with(",,,,,,"), "no fuzz columns for SCA: {sca}");
+        assert!(sca.ends_with(",,,,,,,,"), "no fuzz columns for SCA: {sca}");
         assert_eq!(lines.next(), None);
+    }
+
+    /// The arguments cell lists `name=value`, a buffer as its length and a
+    /// short hex preview, an output's value after the call, and is bounded.
+    #[test]
+    fn arguments_cell_is_compact_and_bounded() {
+        let arg = |name: &str, value: Option<&str>, len: Option<u64>, preview: Option<&str>| {
+            crate::model::Argument {
+                name: name.to_owned(),
+                type_: "t".to_owned(),
+                value: value.map(str::to_owned),
+                len,
+                span: None,
+                preview_hex: preview.map(str::to_owned),
+                role: "param".to_owned(),
+                after_call_value: None,
+            }
+        };
+        let mut out = arg("n", Some("3"), None, None);
+        out.role = "out".to_owned();
+        out.after_call_value = Some("9".to_owned());
+        let args = vec![
+            arg("bit_index", Some("2124921448"), None, None),
+            arg("data", None, Some(50718), Some("68baa77e0f0102030405")),
+            arg("empty", None, Some(0), None),
+            out,
+            arg("odd;name", Some("a=b;c"), None, None),
+        ];
+        assert_eq!(
+            arguments_cell(&args),
+            "bit_index=2124921448;data=len 50718 hex 68baa77e0f010203...;empty=len 0;n=3->9;\
+             odd,name=a=b,c"
+        );
+        let many: Vec<_> = (0..100)
+            .map(|i| arg(&format!("p{i}"), Some("123456789"), None, None))
+            .collect();
+        let cell = arguments_cell(&many);
+        assert!(cell.chars().count() <= ARGUMENTS_CELL_MAX, "{cell}");
+        assert!(cell.ends_with("..."), "{cell}");
     }
 
     #[test]

@@ -276,6 +276,14 @@ struct GenerationMetadata<'a> {
     name_fallback: bool,
     requested_kind: &'a str,
     emitted_path: &'a str,
+    /// The function the harness calls (`ns::Class::method` for C++), so a
+    /// debugger can break on it (`bhf replay --debugger`). C and C++ only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_function: Option<&'a str>,
+    /// `arg-layout.json` beside this file: the static decode layout of the
+    /// harness's arguments ([`harness_gen::arg_layout`]). C and C++ only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    arg_layout: Option<&'static str>,
 }
 
 fn write_generation_metadata(
@@ -286,7 +294,37 @@ fn write_generation_metadata(
     requested_kind: &str,
     emitted_path: &str,
 ) -> Result<()> {
+    write_target_generation_metadata(
+        output_dir,
+        language,
+        requested_line,
+        selected_line,
+        requested_kind,
+        emitted_path,
+        None,
+    )
+}
+
+/// [`write_generation_metadata`] for a C or C++ harness calling
+/// `target_function`; records the harness's `arg-layout.json` when the
+/// generator wrote one.
+fn write_target_generation_metadata(
+    output_dir: &Path,
+    language: &str,
+    requested_line: Option<u32>,
+    selected_line: u32,
+    requested_kind: &str,
+    emitted_path: &str,
+    target_function: Option<&str>,
+) -> Result<()> {
+    let arg_layout = (language != "ada"
+        && output_dir
+            .join(harness_gen::arg_layout::ARG_LAYOUT_FILE)
+            .is_file())
+    .then_some(harness_gen::arg_layout::ARG_LAYOUT_FILE);
     let metadata = GenerationMetadata {
+        target_function,
+        arg_layout,
         schema_version: 1,
         harness_format_version: harness_gen::harness_format_version_for(language),
         buffer_len_dimension: language != "ada" && harness_gen::buffer_len_dimension_enabled(),
@@ -350,6 +388,19 @@ pub(crate) fn recorded_harness_format(harness_dir: &Path) -> Option<RecordedHarn
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
     })
+}
+
+/// The function a C or C++ harness in `harness_dir` calls, as its
+/// `generation-metadata.json` records it (`target_function`). `None` for a
+/// harness generated before the field existed, or an Ada one.
+pub(crate) fn recorded_target_function(harness_dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(harness_dir.join("generation-metadata.json")).ok()?;
+    let metadata: serde_json::Value = serde_json::from_str(&text).ok()?;
+    metadata
+        .get("target_function")
+        .and_then(serde_json::Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_owned)
 }
 
 /// The harness input format version recorded in
@@ -3240,7 +3291,7 @@ fn run_c_direct(args: &GenerateHarnessArgs) -> Result<()> {
     }?;
     write_c_per_tu_context(&output_dir, &per_tu_contexts)?;
     write_harness_dictionary(&output_dir, &dictionary_tokens)?;
-    write_generation_metadata(
+    write_target_generation_metadata(
         &output_dir,
         "c",
         args.target_line,
@@ -3251,6 +3302,7 @@ fn run_c_direct(args: &GenerateHarnessArgs) -> Result<()> {
         } else {
             "direct"
         },
+        Some(&invocation_function.name),
     )?;
     if generation_banner_enabled() {
         println!(
@@ -10812,13 +10864,19 @@ fn run_cpp_direct(args: &GenerateHarnessArgs) -> Result<()> {
     discard_cpp_context_for_included_target(&mut per_tu_contexts, &result.main_cpp, &source_path)?;
     write_cpp_per_tu_context(&output_dir, &per_tu_contexts)?;
     write_harness_dictionary(&output_dir, &dictionary_tokens)?;
-    write_generation_metadata(
+    let target_function = if function.qualifier_path.is_empty() {
+        function.name.clone()
+    } else {
+        format!("{}::{}", function.qualifier_path.join("::"), function.name)
+    };
+    write_target_generation_metadata(
         &output_dir,
         "cpp",
         args.target_line,
         function.line,
         &args.kind,
         emitted_path,
+        Some(&target_function),
     )?;
     if generation_banner_enabled() {
         println!(
@@ -21949,6 +22007,20 @@ class basic_json
         })
         .unwrap();
 
+        // The generation metadata names the decode layout and the function a
+        // debugger breaks on.
+        let metadata: serde_json::Value = serde_json::from_slice(
+            &fs::read(temp.join("out/H-CPROV/generation-metadata.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata["arg_layout"], "arg-layout.json", "{metadata}");
+        assert_eq!(metadata["target_function"], "parse_record", "{metadata}");
+        assert!(temp.join("out/H-CPROV/arg-layout.json").is_file());
+        assert_eq!(
+            crate::generate_harness::recorded_target_function(&temp.join("out/H-CPROV")).as_deref(),
+            Some("parse_record")
+        );
+
         let dictionary = fs::read_to_string(temp.join("out/H-CPROV/dictionary.txt")).unwrap();
         assert!(
             dictionary.contains("# from widget.c:8, include/widget.h:1\n\"WGT1\"\n"),
@@ -22013,6 +22085,12 @@ class basic_json
         })
         .unwrap();
 
+        let metadata: serde_json::Value = serde_json::from_slice(
+            &fs::read(temp.join("out/H-CPPDICT/generation-metadata.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata["target_function"], "gov::parse", "{metadata}");
+        assert_eq!(metadata["arg_layout"], "arg-layout.json", "{metadata}");
         let dictionary = fs::read_to_string(temp.join("out/H-CPPDICT/dictionary.txt")).unwrap();
         assert!(dictionary.contains("\"GIF89a\""));
         assert!(dictionary.contains("\"0x504b0304\""));

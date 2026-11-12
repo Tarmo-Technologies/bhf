@@ -289,7 +289,12 @@ pub fn render_index(doc: &FindingsDocument, ctx: &IndexContext) -> String {
             let _ = writeln!(out, "- Component: `{}`{fixed}", md_code(&package));
         }
         if let Some(access) = rep.fuzz.as_ref().and_then(|fuzz| fuzz.access.as_ref()) {
-            let _ = writeln!(out, "- Memory access: {}", md_text(&access_text(access)));
+            let _ = writeln!(
+                out,
+                "- Memory access: {}{}",
+                md_text(&access_text(access)),
+                access_parameter_text(access)
+            );
         }
         if let Some(gates) = rep
             .fuzz
@@ -397,6 +402,26 @@ fn access_text(access: &crate::model::MemoryAccess) -> String {
         }
     }
     text
+}
+
+/// ` (the buffer of parameter `data`, at offset 12)`: the harness parameter
+/// the access hit, as Markdown, or nothing when none was named.
+fn access_parameter_text(access: &crate::model::MemoryAccess) -> String {
+    let Some(parameter) = &access.parameter else {
+        return String::new();
+    };
+    let name = md_code(&parameter.name);
+    let offset = parameter
+        .offset
+        .map(|offset| offset.to_string())
+        .unwrap_or_else(|| "?".to_owned());
+    match parameter.basis.as_str() {
+        "region_start" => format!(" (the buffer of parameter `{name}`, at offset {offset})"),
+        "region_interior" => {
+            format!(" (in the buffer parameter `{name}` points into, {offset} byte(s) from it)")
+        }
+        _ => format!(" ({offset} byte(s) past parameter `{name}`)"),
+    }
 }
 
 fn status_word(status: crate::model::ProducerStatus) -> &'static str {
@@ -515,7 +540,8 @@ mod tests {
         assert!(md.contains("- Component: `pkg:npm/example@2.4.2` · fixed in 2.4.3"));
         assert!(
             md.contains(
-                "- Memory access: read of 4 byte(s), 0 byte(s) after a 12-byte heap object\n"
+                "- Memory access: read of 4 byte(s), 0 byte(s) after a 12-byte heap object \
+                 (the buffer of parameter `data`, at offset 12)\n"
             ),
             "{md}"
         );

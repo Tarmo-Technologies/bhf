@@ -88,6 +88,7 @@ impl Drop for BufferLenDimensionGuard {
     }
 }
 
+pub mod arg_layout;
 pub(crate) mod arg_trace;
 pub mod build_safety;
 pub mod c_decoders;

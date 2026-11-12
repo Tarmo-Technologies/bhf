@@ -51,6 +51,7 @@ mod command_output;
 mod corpus;
 mod crash_identity;
 mod dashboard;
+mod decode_args;
 mod differential;
 mod env_capsule;
 mod explain;
@@ -82,6 +83,7 @@ mod protocol_detect;
 mod readiness;
 mod relational;
 mod replay;
+mod replay_debugger;
 mod report;
 mod report_backfill;
 mod repro_lane;
@@ -232,6 +234,8 @@ enum Command {
     Explain(explain::ExplainArgs),
     /// Map which input bytes of a C/C++ crash control which sink operand (offset/size/index, or a SEGV's faulting address) via perturbation — the exploit primitive
     Cartography(cartography::CartographyArgs),
+    /// Map a testcase (or a finding's) to the value each C/C++ harness parameter receives: the harness's own argument trace when it can run, else a static decode from its arg-layout.json that names what it cannot decode
+    DecodeArgs(decode_args::DecodeArgsArgs),
 
     // ── Binaries: no-source / firmware analysis ─────────────────────────────
     /// No-source analysis of compiled binaries & firmware: scan, adapter, fuzz (CVE/SBOM, Rizin/Ghidra/angr, black-box)
@@ -480,6 +484,7 @@ where
             )
         }
         Some(Command::Explain(args)) => explain::run(args),
+        Some(Command::DecodeArgs(args)) => decode_args::run(args),
         Some(Command::Cartography(args)) => {
             let work = args.work_dir.clone();
             with_results(

@@ -324,7 +324,7 @@ fn explain_one(work_dir: &Path, f: &Finding, others: &[String], collapsed: bool)
     }
 
     // HARNESS ARGUMENTS: what each parameter was decoded to
-    for line in argument_lines(f) {
+    for line in argument_lines(work_dir, f, &evidence) {
         let _ = writeln!(s, "{line}");
     }
 
@@ -463,8 +463,9 @@ fn reproduce_lines(work_dir: &Path, f: &Finding) -> Vec<String> {
 
 /// The HARNESS ARGUMENTS section: the value the harness decoded for each
 /// parameter, from the argument trace recorded in `decoded.json`, or why there
-/// is none and how to get it.
-fn argument_lines(f: &Finding) -> Vec<String> {
+/// is none and how to get it. A parameter whose input bytes a recorded
+/// comparison read is tagged `[compared at <site>]`.
+fn argument_lines(work_dir: &Path, f: &Finding, evidence: &Evidence) -> Vec<String> {
     let Some(decoded) = read_json(&f.dir.join("decoded.json")) else {
         return Vec::new();
     };
@@ -494,17 +495,138 @@ fn argument_lines(f: &Finding) -> Vec<String> {
         }
         return lines;
     }
+    let (tags, tag_note) = comparison_tags(work_dir, f, evidence, &args);
     lines.extend(
         corpus::decoded_args::render_table(&args)
             .into_iter()
-            .map(|line| format!("  {line}")),
+            .enumerate()
+            .map(|(row, line)| {
+                // Row 0 is the header; row k + 1 is argument k.
+                match row
+                    .checked_sub(1)
+                    .and_then(|k| tags.get(k))
+                    .and_then(Option::as_ref)
+                {
+                    Some(tag) => format!("  {line}  {tag}"),
+                    None => format!("  {line}"),
+                }
+            }),
     );
     lines.push(
         "  (bytes are [start..end) offsets in testcase.bin; parameters whose ranges overlap \
          were decoded from the same bytes)"
             .to_owned(),
     );
+    if let Some(note) = tag_note {
+        for (index, line) in wrap(&note, 74).into_iter().enumerate() {
+            lines.push(format!("{}{line}", if index == 0 { "  " } else { "    " }));
+        }
+    }
     lines
+}
+
+/// Most comparison sites a `[compared at ...]` tag names.
+const MAX_TAG_SITES: usize = 3;
+
+/// Per traced argument, the `[compared at <site>, ...]` tag when one of the
+/// recorded comparisons read its input bytes, and a note on how the
+/// comparisons' offsets were related to the arguments. The trace's spans
+/// index testcase.bin; evidence recorded on another file (min_testcase.bin)
+/// is related through the harness's `arg-layout.json` decoded over that file,
+/// or not at all without one.
+fn comparison_tags(
+    work_dir: &Path,
+    f: &Finding,
+    evidence: &Evidence,
+    args: &[corpus::decoded_args::TracedArg],
+) -> (Vec<Option<String>>, Option<String>) {
+    let none = vec![None; args.len()];
+    let Some(capture) = evidence.capture.as_ref().filter(|c| !c.gates.is_empty()) else {
+        return (none, None);
+    };
+    let input = capture.summary.input.as_str();
+    let same_bytes = input == "testcase.bin"
+        || std::fs::read(f.dir.join(input)).ok() == std::fs::read(f.dir.join("testcase.bin")).ok();
+    let (spans, note): (Vec<Option<std::ops::Range<u64>>>, Option<String>) = if same_bytes {
+        (args.iter().map(|arg| arg.byte_range()).collect(), None)
+    } else {
+        let layout = str_at(&f.raw, "/harness_id").and_then(|id| {
+            crate::auto::layout::harness_dir_candidates(work_dir, id)
+                .into_iter()
+                .find_map(|dir| harness_gen::arg_layout::ArgLayout::read(&dir)?.ok())
+        });
+        let bytes = std::fs::read(f.dir.join(input)).ok();
+        match (layout, bytes) {
+            (Some(layout), Some(bytes)) => {
+                let decoded = layout.decode(&bytes);
+                let spans = args
+                    .iter()
+                    .map(|arg| {
+                        decoded
+                            .iter()
+                            .find(|d| {
+                                d.name == arg.name
+                                    && d.call == arg.call
+                                    && i64::try_from(d.index).ok() == Some(arg.index)
+                            })
+                            .and_then(|d| d.span)
+                            .map(|[start, end]| start..end)
+                    })
+                    .collect();
+                (
+                    spans,
+                    Some(format!(
+                        "(comparison tags use each parameter's bytes in {input}, decoded with the \
+                         harness's arg-layout.json)"
+                    )),
+                )
+            }
+            _ => {
+                return (
+                    none,
+                    Some(format!(
+                        "(the comparison evidence indexes {input} and these spans index \
+                         testcase.bin; without the harness's arg-layout.json the comparisons are \
+                         not related to the parameters)"
+                    )),
+                )
+            }
+        }
+    };
+    let tags = spans
+        .iter()
+        .map(|span| {
+            let span = span.as_ref().filter(|span| span.start < span.end)?;
+            let mut sites: Vec<String> = Vec::new();
+            for gate in &capture.gates {
+                let (start, end) = (gate.offset as u64, (gate.offset + gate.len) as u64);
+                if start < span.end && span.start < end {
+                    let site = match &gate.location {
+                        Some(location) => match location.line {
+                            Some(line) => format!("{}:{line}", basename(&location.file)),
+                            None => basename(&location.file).to_owned(),
+                        },
+                        None => gate.site.clone(),
+                    };
+                    if !sites.contains(&site) {
+                        sites.push(site);
+                    }
+                }
+            }
+            if sites.is_empty() {
+                return None;
+            }
+            let more = sites.len().saturating_sub(MAX_TAG_SITES);
+            sites.truncate(MAX_TAG_SITES);
+            let more = if more > 0 {
+                format!(" and {more} more")
+            } else {
+                String::new()
+            };
+            Some(format!("[compared at {}{more}]", sites.join(", ")))
+        })
+        .collect();
+    (tags, note)
 }
 
 /// The sanitizer's structured memory access (`exception.access`) as text: the
@@ -1373,6 +1495,111 @@ mod tests {
         assert!(
             out.contains(
                 "    parameter `data`'s buffer starts inside the region (access at offset 5 from it)\n"
+            ),
+            "{out}"
+        );
+    }
+
+    /// A harness argument whose input bytes a recorded comparison read is
+    /// tagged with the comparison's site, in the file the evidence indexes.
+    #[test]
+    fn arguments_compared_by_the_target_are_tagged_with_the_site() {
+        let work = tempfile::tempdir().unwrap();
+        let gate = |offset: u64, len: u64, location: Option<(&str, u64)>| {
+            let mut gate = serde_json::json!({"offset": offset, "len": len,
+                "operand_hex": "41", "compared_with_hex": "41", "cmp_kind": "cmp",
+                "site": "0x1a2b", "relation": "equal", "operands_equal": true});
+            if let Some((file, line)) = location {
+                gate["location"] = serde_json::json!({"file": file, "line": line,
+                    "function": "read_bits"});
+            }
+            gate
+        };
+        let mut raw = recorded_capture(
+            serde_json::json!([gate(1, 2, Some(("/src/demo/bits.c", 12))), gate(9, 1, None)]),
+            None,
+        );
+        raw["gate_capture"]["input_len"] = serde_json::json!(10);
+        let finding = finding_in(work.path(), raw);
+        let input = [0x78, 0x56, 0x34, 0x12, 0x5a, 0x3c, 0x99, 0x01, 0x2e, 0x00];
+        std::fs::write(finding.dir.join("testcase.bin"), input).unwrap();
+        let args = corpus::decoded_args::parse_arg_trace(
+            "BHF_ARG {\"call\":\"target\",\"i\":0,\"role\":\"param\",\"name\":\"bit_index\",\"type\":\"unsigned int\",\"span\":[0,4],\"value\":\"305419896\"}\n\
+             BHF_ARG {\"call\":\"target\",\"i\":1,\"role\":\"param\",\"name\":\"width\",\"type\":\"unsigned int\",\"span\":[4,8],\"value\":\"7\"}\n\
+             BHF_ARG {\"call\":\"target\",\"i\":2,\"role\":\"param\",\"name\":\"data\",\"type\":\"const unsigned char *\",\"span\":[8,10],\"len\":2,\"preview_hex\":\"2e00\"}\n",
+        );
+        corpus::decoded_args::record_trace(
+            &finding.dir,
+            &input,
+            &corpus::decoded_args::TraceOutcome::Traced(args),
+        )
+        .expect_err("no finding.json: decoded.json is still written");
+        let out = explain_one(work.path(), &finding, &[], false);
+        let row = |name: &str| {
+            out.lines()
+                .find(|line| line.trim_start().starts_with(&format!("{name} ")))
+                .unwrap_or_else(|| panic!("no {name} row in:\n{out}"))
+                .to_owned()
+        };
+        assert!(
+            row("bit_index").ends_with("[compared at bits.c:12]"),
+            "{out}"
+        );
+        assert!(!row("width").contains("compared at"), "{out}");
+        assert!(row("data").ends_with("[compared at 0x1a2b]"), "{out}");
+
+        // Evidence recorded on the minimized input is related to the
+        // parameters through the harness's layout of that file.
+        let mut raw = finding.raw.clone();
+        raw["gate_capture"]["input"] = serde_json::json!("min_testcase.bin");
+        raw["gate_capture"]["input_len"] = serde_json::json!(6);
+        raw["gates"] = serde_json::json!([gate(5, 1, Some(("/src/demo/bits.c", 20)))]);
+        let finding = Finding { raw, ..finding };
+        std::fs::write(finding.dir.join("min_testcase.bin"), [0u8; 6]).unwrap();
+        let out = explain_one(work.path(), &finding, &[], false);
+        assert!(
+            out.contains("min_testcase.bin") && !out.contains("[compared at bits.c:20]"),
+            "without a layout nothing is tagged: {out}"
+        );
+        let flat = out.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("comparisons are not related to the parameters"),
+            "{out}"
+        );
+        let harness = crate::auto::layout::harness_dir(work.path(), "H-C0001");
+        std::fs::create_dir_all(&harness).unwrap();
+        let scalar = |name: &str, index: usize| {
+            serde_json::json!({"step": "param", "call": "target", "role": "param", "index": index,
+                "name": name, "type": "unsigned int", "order": index, "input": "cursor",
+                "decoder": "scalar", "primitive": "bhf_i32", "width": 4,
+                "value_kind": "u32", "static_decode": true})
+        };
+        std::fs::write(
+            harness.join("arg-layout.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": "bhf.arg-layout.v1", "harness_format_version": 3,
+                "language": "c", "harness": "direct", "static_decode": true,
+                "steps": [scalar("bit_index", 0), scalar("width", 1),
+                    {"step": "remainder", "call": "target", "sized": false},
+                    {"step": "param", "call": "target", "role": "param", "index": 2,
+                     "name": "data", "type": "const unsigned char *", "order": 2,
+                     "input": "remainder", "decoder": "input_buffer", "static_decode": true}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let out = explain_one(work.path(), &finding, &[], false);
+        let width = out
+            .lines()
+            .find(|line| line.trim_start().starts_with("width "))
+            .unwrap()
+            .to_owned();
+        assert!(width.ends_with("[compared at bits.c:20]"), "{out}");
+        let flat = out.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains(
+                "(comparison tags use each parameter's bytes in min_testcase.bin, decoded with \
+                 the harness's arg-layout.json)"
             ),
             "{out}"
         );

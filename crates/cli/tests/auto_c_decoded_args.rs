@@ -136,6 +136,67 @@ fn a_c_finding_records_its_decoded_arguments() {
         "{stdout}"
     );
 
+    // `bhf decode-args` maps the testcase to the same values: through the
+    // harness's trace, and statically from its arg-layout.json.
+    for (extra, source) in [(None, "harness_trace"), (Some("--static"), "arg_layout")] {
+        let mut command = Command::new(&bin);
+        command.args([
+            "decode-args",
+            "--finding",
+            finding.to_str().unwrap(),
+            "--json",
+        ]);
+        if let Some(extra) = extra {
+            command.arg(extra);
+        }
+        let out = command.output().expect("run bhf decode-args");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(doc["schema_version"], "bhf.decode-args.v1");
+        assert_eq!(doc["source"], source, "{doc:#}");
+        let arg = |name: &str| {
+            doc["arguments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|arg| arg["name"] == name)
+                .cloned()
+                .unwrap_or_else(|| panic!("no {name} in {doc:#}"))
+        };
+        assert_eq!(arg("bit_index")["value"], "1094795585", "{doc:#}");
+        assert_eq!(arg("width")["value"], "16705", "{doc:#}");
+        assert_eq!(arg("data")["span"], serde_json::json!([8, testcase.len()]));
+        assert_eq!(arg("data")["len"], rest.len());
+        assert_eq!(doc["not_decoded"], serde_json::json!([]), "{doc:#}");
+    }
+    // Without the binary the layout still decodes it, and says so.
+    let harness_bin = std::fs::read_dir(work.join("harnesses"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path().join("main"))
+        .find(|path| path.is_file())
+        .expect("built harness");
+    std::fs::remove_file(&harness_bin).unwrap();
+    let out = Command::new(&bin)
+        .args(["decode-args", "--finding", finding.to_str().unwrap()])
+        .output()
+        .expect("run bhf decode-args");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("static decode; the harness did not run"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("1094795585"), "{stdout}");
+
     let _ = std::fs::remove_dir_all(&src);
     let _ = std::fs::remove_dir_all(&work);
     let _ = std::fs::remove_dir_all(&seeds);

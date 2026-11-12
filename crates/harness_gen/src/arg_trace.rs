@@ -103,6 +103,11 @@ pub(crate) struct DecodePlan {
     pub late: Vec<String>,
     /// After-call trace statements for output and in-out parameters.
     pub after: Vec<String>,
+    /// The static decode layout of [`DecodePlan::decode`]'s parameters, in
+    /// decode order (see [`crate::arg_layout`]).
+    pub layout: Vec<crate::arg_layout::LayoutStep>,
+    /// The layout of [`DecodePlan::late`]'s parameters.
+    pub late_layout: Vec<crate::arg_layout::LayoutStep>,
 }
 
 /// Where a decl takes its bytes from.
@@ -248,13 +253,100 @@ pub(crate) fn plan(
             plan.after.push(after);
         }
     }
+    let (head_layout, tail_layout) = layout_steps(
+        group, emissions, declared, &order, &sources, tail_start, sized,
+    );
     plan.decode = head;
+    plan.layout = head_layout;
     if group.defer_input {
         plan.late = tail;
+        plan.late_layout = tail_layout;
     } else {
         plan.decode.extend(tail);
+        plan.layout.extend(tail_layout);
     }
     plan
+}
+
+/// The layout steps of one call's parameters, in decode order, split where
+/// its whole-input parameters start (the head, then the tail that takes the
+/// bytes the cursor left).
+fn layout_steps(
+    group: &Group<'_>,
+    emissions: &[CParamEmission],
+    declared: &[Declared],
+    order: &[(usize, bool)],
+    sources: &[Source],
+    tail_start: usize,
+    sized: bool,
+) -> (
+    Vec<crate::arg_layout::LayoutStep>,
+    Vec<crate::arg_layout::LayoutStep>,
+) {
+    use crate::arg_layout::{InputSource, LayoutStep};
+    let role = match group.role {
+        Role::Param => "param",
+        Role::Receiver => "receiver",
+    };
+    let mut params = Vec::with_capacity(order.len());
+    for (position, &(index, deferred)) in order.iter().enumerate() {
+        let emission = &emissions[index];
+        let declared = (declared.len() == emissions.len()).then(|| &declared[index]);
+        let name = declared
+            .map(|d| d.name.clone())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| fallback_name(&emission.arg, index));
+        let ty = declared
+            .map(|d| d.ty.trim().to_owned())
+            .filter(|ty| !ty.is_empty())
+            .unwrap_or_else(|| emission.c_type.trim().to_owned());
+        let shape = group
+            .registry
+            .map(|registry| registry.resolve(&emission.c_type))
+            .unwrap_or_else(|| spelled_shape(&emission.c_type));
+        let source = match (sources[index], deferred) {
+            (Source::Cursor, _) => InputSource::Cursor,
+            (Source::Input, true) | (Source::None, true) => InputSource::Remainder,
+            (Source::Input, false) => InputSource::WholeInput,
+            (Source::None, false) => InputSource::None,
+        };
+        params.push(crate::arg_layout::describe(&crate::arg_layout::Described {
+            call: group.call,
+            role,
+            index: group.index_base + index,
+            name: &name,
+            ty: &ty,
+            order: position,
+            decl: &emission.decl,
+            arg: &emission.arg,
+            source,
+            shape: &shape,
+        }));
+    }
+    // Pairs are neighbours in parameter order.
+    let mut by_index: Vec<usize> = (0..params.len()).collect();
+    by_index.sort_by_key(|&at| params[at].index);
+    let mut sorted: Vec<_> = by_index.iter().map(|&at| params[at].clone()).collect();
+    crate::arg_layout::pair_input_params(&mut sorted);
+    for (&at, param) in by_index.iter().zip(sorted) {
+        params[at] = param;
+    }
+    let mut head = Vec::new();
+    let mut tail = Vec::new();
+    for (position, (param, &(_, deferred))) in params.into_iter().zip(order).enumerate() {
+        if deferred && position == tail_start {
+            tail.push(LayoutStep::Remainder {
+                call: group.call.to_owned(),
+                sized,
+            });
+        }
+        if deferred {
+            tail.push(LayoutStep::Param(param));
+        } else {
+            head.push(LayoutStep::Param(param));
+        }
+    }
+    (head, tail)
 }
 
 /// Whether any of a call's decls reads the input cursor.

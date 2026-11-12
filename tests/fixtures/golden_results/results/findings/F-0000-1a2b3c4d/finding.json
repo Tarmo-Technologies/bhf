@@ -13,6 +13,28 @@
     "parse_header"
   ],
   "created_at": "2026-10-01T11:20:00Z",
+  "decoded_args": [
+    {
+      "name": "flags",
+      "role": "param",
+      "span": [
+        0,
+        4
+      ],
+      "type": "uint32_t",
+      "value": "7"
+    },
+    {
+      "len": 0,
+      "name": "data",
+      "role": "param",
+      "span": [
+        4,
+        4
+      ],
+      "type": "const uint8_t *"
+    }
+  ],
   "dialect": "c11",
   "exception": {
     "access": {
@@ -30,6 +52,11 @@
         }
       ],
       "direction": "read",
+      "parameter": {
+        "basis": "region_start",
+        "name": "data",
+        "offset": 4
+      },
       "region": {
         "distance": 0,
         "kind": "heap",

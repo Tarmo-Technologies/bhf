@@ -325,6 +325,7 @@ fn render_cpp_harness(
     let makefile_path = output_dir.join("Makefile");
     fs::write(&main_path, main_cpp)?;
     fs::write(&makefile_path, makefile)?;
+    context.arg_layout.write(output_dir)?;
     // Portable-harness export (Mayhem / libFuzzer / AFL++ / honggfuzz). The C++
     // default binary (`main`) reads argv[1] as a file; the Makefile offers
     // `make libfuzzer` / `make afl`.
@@ -352,6 +353,9 @@ fn render_cpp_harness(
 
 #[derive(Debug, Serialize)]
 struct CppTemplateContext {
+    /// Written to `arg-layout.json`; not a template variable.
+    #[serde(skip)]
+    arg_layout: crate::arg_layout::ArgLayout,
     harness_id: String,
     qualified_target_name: String,
     /// Exact public RE2 parser lifecycle: whole-input string view, canonical
@@ -487,6 +491,9 @@ struct CppLifecycleStepEmission {
 
 #[derive(Debug, Serialize)]
 struct CppProtocolStepEmission {
+    /// The step's decode layout (see [`crate::arg_layout`]).
+    #[serde(skip)]
+    layout: Vec<crate::arg_layout::LayoutStep>,
     name: String,
     params: Vec<CParamEmission>,
     /// Decode and argument-trace statements (see [`crate::arg_trace`]).
@@ -502,6 +509,9 @@ struct CppProtocolStepEmission {
 /// harness emits owner construction + factory call + null-guarded method call.
 #[derive(Debug, Serialize)]
 struct CppTemplateFactoryContext {
+    /// The factory arguments' decode layout (see [`crate::arg_layout`]).
+    #[serde(skip)]
+    layout: Vec<crate::arg_layout::LayoutStep>,
     /// Qualified owner type for an instance-method factory (e.g.,
     /// `"tinyxml2::XMLDocument"`); empty string for a free-function factory.
     owner_type: String,
@@ -1317,8 +1327,10 @@ fn build_cpp_context_common(
             CppDecodeOrder::AfterOthers,
             &plan.factory_params,
             &factory_params,
+            &registry,
         );
         Some(CppTemplateFactoryContext {
+            layout: trace.layout,
             owner_type: plan.owner_type.clone().unwrap_or_default(),
             owner_method_is_static: plan.owner_method_is_static,
             method: plan.factory_method.clone(),
@@ -1578,6 +1590,7 @@ fn build_cpp_context_common(
             effective_params
         },
         &params,
+        &registry,
     );
     let constructor_trace = cpp_trace_plan(
         "c",
@@ -1587,6 +1600,7 @@ fn build_cpp_context_common(
         CppDecodeOrder::AfterOthers,
         input.constructor_params,
         &constructor_params,
+        &registry,
     );
     // The receiver object, as the template builds it: from a factory when one
     // is planned, else by its constructor (unless the target IS the constructor,
@@ -1618,6 +1632,44 @@ fn build_cpp_context_common(
             })
     };
 
+    // The decode layout, in the order the template runs the decodes: the
+    // target's cursor parameters, a receiver's factory or constructor
+    // arguments, mined protocol steps, a lifecycle loop, then the target's
+    // whole-input parameters.
+    let arg_layout = {
+        use crate::arg_layout::{ArgLayout, LayoutStep};
+        if expert_re2_parse {
+            ArgLayout::new("cpp", "custom", Vec::new()).without_static_decode(
+                "the harness passes the whole input to the parser as one pattern",
+            )
+        } else {
+            let mut steps = params_trace.layout.clone();
+            if let Some(factory) = &factory {
+                steps.extend(factory.layout.iter().cloned());
+            } else if receiver_class.is_some() && !target_is_constructor {
+                steps.extend(constructor_trace.layout.iter().cloned());
+                for step in &protocol_steps {
+                    steps.extend(step.layout.iter().cloned());
+                }
+                if !lifecycle_steps.is_empty() {
+                    steps.push(LayoutStep::Opaque {
+                        what: format!(
+                            "the receiver's lifecycle loop, which calls up to {} method(s) \
+                             chosen by input bytes",
+                            lifecycle_steps.len()
+                        ),
+                    });
+                }
+            }
+            steps.extend(params_trace.late_layout.iter().cloned());
+            ArgLayout::new(
+                "cpp",
+                if byte_stream { "byte_stream" } else { "direct" },
+                steps,
+            )
+        }
+    };
+
     let cxx_compiler_family = build_context.compiler_family().make_value().to_owned();
     // `CXX = <compiler>` heads every recipe; one under a spaced directory is
     // double-quoted so it stays a single word.
@@ -1628,6 +1680,7 @@ fn build_cpp_context_common(
         &crate::compiler_family::c_driver_for(context_cxx),
     )));
     Ok(CppTemplateContext {
+        arg_layout,
         harness_id: input.harness_id.to_owned(),
         qualified_target_name,
         expert_re2_parse,
@@ -1804,6 +1857,7 @@ enum CppDecodeOrder {
 /// [`crate::arg_trace`]). `params` are the parameters as declared, so a trace
 /// line names a parameter by its declared name even where the harness renamed
 /// its local.
+#[allow(clippy::too_many_arguments)]
 fn cpp_trace_plan(
     prefix: &str,
     call: &str,
@@ -1812,6 +1866,7 @@ fn cpp_trace_plan(
     order: CppDecodeOrder,
     params: &[CppParameter],
     emissions: &[CParamEmission],
+    registry: &TypeRegistry,
 ) -> crate::arg_trace::DecodePlan {
     let declared: Vec<crate::arg_trace::Declared> = params
         .iter()
@@ -1830,7 +1885,9 @@ fn cpp_trace_plan(
             call,
             role,
             index_base,
-            registry: None,
+            // The C++ trace dispatches on the type at compile time; the
+            // registry only classifies the parameters' decode layout.
+            registry: Some(registry),
             defer_input: order == CppDecodeOrder::FirstDeferringInput,
             fresh_cursor: order != CppDecodeOrder::AfterOthers,
             sized_buffers: crate::buffer_len_dimension_enabled(),
@@ -1995,6 +2052,7 @@ fn build_lifecycle_step_emissions(
                 CppDecodeOrder::AfterOthers,
                 &step.params,
                 &params,
+                registry,
             );
             Ok(CppLifecycleStepEmission {
                 name: step.name.clone(),
@@ -2109,8 +2167,10 @@ fn build_cpp_protocol_emissions(
                 CppDecodeOrder::AfterOthers,
                 &observed.step.params,
                 &params,
+                registry,
             );
             Ok(CppProtocolStepEmission {
+                layout: trace.layout,
                 name: observed.step.name.clone(),
                 params,
                 decode: trace.decode,
@@ -5817,6 +5877,118 @@ mod tests {
         assert_eq!(receiver["role"], "receiver");
         assert_eq!(receiver["type"], "Widget");
         assert_eq!(receiver["decoder"], "constructor(1 decoded argument(s))");
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// A C++ method harness's layout lists the target's cursor parameters,
+    /// then the receiver's constructor arguments, then where the target's
+    /// whole-input parameter takes the bytes left, and replays like the trace.
+    #[test]
+    fn cpp_receiver_harness_layout_matches_its_argument_trace() {
+        let out = temp_dir("cpp-layout-receiver");
+        fs::write(
+            out.join("widget.hpp"),
+            "#pragma once\n\
+             #include <string>\n\
+             class Widget {\n\
+             public:\n\
+             \x20   explicit Widget(int mode) : mode_(mode) {}\n\
+             \x20   int load(const unsigned char *body, size_t len, unsigned short tag) {\n\
+             \x20       return (int)len + (len ? body[0] : 0) + tag + mode_;\n\
+             \x20   }\n\
+             private:\n\
+             \x20   int mode_;\n\
+             };\n",
+        )
+        .unwrap();
+        let mut target = cppfunction("load");
+        target.qualifier_path = vec!["Widget".to_owned()];
+        target.api.is_method = true;
+        target.api.class_name = Some("Widget".to_owned());
+        let args = GenerateCppDirectArgs {
+            decoder_limits: Default::default(),
+            force: false,
+            harness_id: "H-CPP-LAYOUT".to_owned(),
+            output_dir: out.clone(),
+            source_path: out.join("widget.hpp"),
+            target,
+            params: vec![
+                CppParameter {
+                    name: "body".to_owned(),
+                    cpp_type: "const unsigned char *".to_owned(),
+                },
+                CppParameter {
+                    name: "len".to_owned(),
+                    cpp_type: "size_t".to_owned(),
+                },
+                CppParameter {
+                    name: "tag".to_owned(),
+                    cpp_type: "unsigned short".to_owned(),
+                },
+            ],
+            return_type: "int".to_owned(),
+            target_includes: vec!["widget.hpp".to_owned()],
+            target_includes_dirs: vec![out.clone()],
+            target_sources: Vec::new(),
+            compile_flags: Vec::new(),
+            c_runtime_include: runtime_dir(),
+            using_namespaces: Vec::new(),
+            result_cleanup: None,
+            constructor_params: vec![CppParameter {
+                name: "mode".to_owned(),
+                cpp_type: "int".to_owned(),
+            }],
+            type_defs: Vec::new(),
+            default_constructible_classes: Vec::new(),
+            parameter_constructions: Vec::new(),
+            receiver_class_override: None,
+            factory_plan: None,
+        };
+        generate_cpp_direct_harness(args.clone()).unwrap();
+        let layout = crate::arg_layout::ArgLayout::read(&out).unwrap().unwrap();
+        assert_eq!(layout.language, "cpp");
+        let order: Vec<String> = layout
+            .steps
+            .iter()
+            .map(|step| match step {
+                crate::arg_layout::LayoutStep::Param(p) => format!("{}.{}", p.call, p.name),
+                crate::arg_layout::LayoutStep::Remainder { call, .. } => format!("rest:{call}"),
+                crate::arg_layout::LayoutStep::Opaque { what } => what.clone(),
+            })
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "target.tag",
+                "receiver.mode",
+                "rest:target",
+                "target.body",
+                "target.len"
+            ]
+        );
+        let body = layout.params().find(|p| p.name == "body").unwrap();
+        assert_eq!(body.paired_with.as_deref(), Some("len"));
+        let input = [7u8, 0, 0, 0, 2, 0, 0, 0, b'x', b'y', b'z'];
+        let decoded = layout.decode(&input);
+        let Some(out) = build_cpp_harness(args) else {
+            return;
+        };
+        let traced = cpp_traced_args(&out, &input);
+        for name in ["tag", "mode", "body", "len"] {
+            let trace = cpp_traced(&traced, name, None);
+            let stat = decoded.iter().find(|a| a.name == name).unwrap();
+            assert!(stat.decoded, "{stat:?}");
+            assert_eq!(
+                serde_json::json!(stat.span),
+                trace["span"],
+                "{name}: static {stat:?} vs traced {trace}"
+            );
+            if let Some(value) = &stat.value {
+                assert_eq!(trace["value"], serde_json::json!(value), "{name}");
+            } else {
+                assert_eq!(trace["len"], serde_json::json!(stat.len), "{name}");
+            }
+        }
         fs::remove_dir_all(&out).ok();
     }
 

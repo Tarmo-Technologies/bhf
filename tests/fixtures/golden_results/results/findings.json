@@ -124,8 +124,8 @@
           {
             "role": "finding",
             "path": "findings/F-0000-1a2b3c4d/finding.json",
-            "sha256": "efcf514c32a147639df1f331ed9fb19640bc9533bcbc3f58b45e0ae9c56531ef",
-            "size": 1989
+            "sha256": "67fe15a2f0c46643d95e018a562469dad4bed0c2fd4633a7360fbdaed454486b",
+            "size": 2422
           },
           {
             "role": "testcase",
@@ -177,7 +177,12 @@
               "line": 38
             }
           ],
-          "free_stack": []
+          "free_stack": [],
+          "parameter": {
+            "name": "data",
+            "offset": 4,
+            "basis": "region_start"
+          }
         },
         "input_to_state": [
           {
@@ -198,7 +203,34 @@
           }
         ],
         "input_to_state_input": "min_testcase.bin",
-        "arguments": null
+        "arguments": [
+          {
+            "name": "flags",
+            "type": "uint32_t",
+            "value": "7",
+            "len": null,
+            "span": [
+              0,
+              4
+            ],
+            "preview_hex": null,
+            "role": "param",
+            "after_call_value": null
+          },
+          {
+            "name": "data",
+            "type": "const uint8_t *",
+            "value": null,
+            "len": 0,
+            "span": [
+              4,
+              4
+            ],
+            "preview_hex": null,
+            "role": "param",
+            "after_call_value": null
+          }
+        ]
       },
       "static": null,
       "sca": null,

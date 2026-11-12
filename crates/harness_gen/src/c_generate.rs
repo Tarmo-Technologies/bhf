@@ -386,6 +386,7 @@ pub fn generate_c_direct_harness(
     let makefile_path = args.output_dir.join("Makefile");
     fs::write(&main_path, main_c)?;
     fs::write(&makefile_path, makefile)?;
+    context.arg_layout.write(&args.output_dir)?;
     write_c_portability_artifacts(
         &args.output_dir,
         &args.harness_id,
@@ -492,6 +493,7 @@ pub fn generate_c_sequence_harness(
     let makefile_path = args.output_dir.join("Makefile");
     fs::write(&main_path, main_c)?;
     fs::write(&makefile_path, makefile)?;
+    context.arg_layout.write(&args.output_dir)?;
     write_c_portability_artifacts(&args.output_dir, &args.harness_id, false)?;
     // Describe the op program's geometry so the engine can build a
     // structure-aware mutation layout for an input of any length. Without it
@@ -550,6 +552,9 @@ pub fn generate_c_sequence_harness(
 
 #[derive(Debug, Serialize)]
 struct CTemplateContext {
+    /// Written to `arg-layout.json`; not a template variable.
+    #[serde(skip)]
+    arg_layout: crate::arg_layout::ArgLayout,
     harness_id: String,
     qualified_target_name: String,
     target_includes: Vec<String>,
@@ -618,6 +623,9 @@ struct CDriveStepEmission {
 
 #[derive(Debug, Serialize)]
 struct CSequenceTemplateContext {
+    /// Written to `arg-layout.json`; not a template variable.
+    #[serde(skip)]
+    arg_layout: crate::arg_layout::ArgLayout,
     harness_id: String,
     target_includes: Vec<String>,
     target_includes_dirs: Vec<String>,
@@ -3239,8 +3247,14 @@ fn build_c_context(args: &GenerateCDirectArgs) -> Result<CTemplateContext, Harne
         &params,
         &registry,
     );
+    let arg_layout = crate::arg_layout::ArgLayout::new(
+        "c",
+        if byte_stream { "byte_stream" } else { "direct" },
+        trace.layout.clone(),
+    );
 
     Ok(CTemplateContext {
+        arg_layout,
         harness_id: args.harness_id.clone(),
         qualified_target_name: args.target.name.clone(),
         target_includes: args.target_includes.clone(),
@@ -3363,6 +3377,7 @@ fn build_c_sequence_context_untraced(
             target_includes.push("jpeglib.h".to_owned());
         }
         return Ok(CSequenceTemplateContext {
+            arg_layout: crate::arg_layout::ArgLayout::new("c", "sequence", Vec::new()),
             harness_id: args.harness_id.clone(),
             target_includes,
             target_includes_dirs: recipe_paths(&args.target_includes_dirs),
@@ -3895,6 +3910,7 @@ fn build_c_sequence_context_untraced(
     let op_ctrl_len = 1 + MAX_SEQUENCE_STEPS * 5 + usize::from(protocol_portfolio_lanes > 1);
 
     Ok(CSequenceTemplateContext {
+        arg_layout: crate::arg_layout::ArgLayout::new("c", "sequence", Vec::new()),
         harness_id: args.harness_id.clone(),
         target_includes: args.target_includes.clone(),
         target_includes_dirs: recipe_paths(&args.target_includes_dirs),
@@ -5087,6 +5103,7 @@ fn declared_lifecycle_params(step: &CLifecycleStep) -> Vec<crate::arg_trace::Dec
 /// statements (see [`crate::arg_trace`]). Runs once the context is complete,
 /// after every rewrite of the steps' decls and arguments.
 fn apply_sequence_traces(context: &mut CSequenceTemplateContext, registry: &TypeRegistry) {
+    let mut layout: Vec<crate::arg_layout::LayoutStep> = Vec::new();
     // A call that runs once, before any other call read the cursor, keeps
     // whole-input parameters as written when it reads no cursor bytes itself
     // (see `Group::fresh_cursor`). Every other call (an operation, a call in
@@ -5148,6 +5165,7 @@ fn apply_sequence_traces(context: &mut CSequenceTemplateContext, registry: &Type
         );
         step.decode = plan.decode;
         step.after = plan.after;
+        layout.extend(plan.layout);
     };
     if let Some(step) = context.init_step.as_mut() {
         visit(step, true);
@@ -5186,6 +5204,11 @@ fn apply_sequence_traces(context: &mut CSequenceTemplateContext, registry: &Type
     if let Some(step) = context.end_step.as_mut() {
         visit(step, false);
     }
+    context.arg_layout = crate::arg_layout::ArgLayout::new("c", "sequence", layout)
+        .without_static_decode(
+            "a sequence harness picks its calls from a control block at the end of the input, \
+             so which parameters are decoded, and from which bytes, depends on the input",
+        );
 }
 
 fn scoped_c_param_name(prefix: &str, index: usize, raw: &str) -> String {
@@ -6063,6 +6086,168 @@ mod tests {
             .unwrap_or_else(|| panic!("no {name} ({phase:?}) line in {args:#?}"))
     }
 
+    /// The static decode of arg-layout.json gives the values and byte spans
+    /// the built harness's own argument trace prints, for every statically
+    /// decodable parameter, over inputs of several lengths.
+    #[test]
+    fn built_c_harness_layout_decodes_like_its_argument_trace() {
+        let header = "#include <stdint.h>\n#include <stddef.h>\n#include <stdbool.h>\n\
+             typedef unsigned int u32_t;\n\
+             enum widget_mode { WM_FAST, WM_SAFE, WM_SLOW };\n\
+             int widget_parse(const unsigned char *data, u32_t bit_index, bool strict,\n\
+             \x20                int8_t bias, unsigned short width, enum widget_mode mode,\n\
+             \x20                const char *label, uint64_t big, double scale);\n";
+        let Some(out) = build_c_harness_in(
+            "widget_parse",
+            &[
+                ("data", "const unsigned char *"),
+                ("bit_index", "u32_t"),
+                ("strict", "bool"),
+                ("bias", "int8_t"),
+                ("width", "unsigned short"),
+                ("mode", "enum widget_mode"),
+                ("label", "const char *"),
+                ("big", "uint64_t"),
+                ("scale", "double"),
+            ],
+            "#include \"widget.h\"\n\
+             int widget_parse(const unsigned char *data, u32_t bit_index, bool strict,\n\
+             \x20                int8_t bias, unsigned short width, enum widget_mode mode,\n\
+             \x20                const char *label, uint64_t big, double scale) {\n\
+             \x20   return data[0] + (int)bit_index + strict + bias + width + (int)mode\n\
+             \x20          + label[0] + (int)big + (int)scale;\n\
+             }\n",
+            Some(header),
+        ) else {
+            return;
+        };
+        let layout = crate::arg_layout::ArgLayout::read(&out).unwrap().unwrap();
+        let mut inputs: Vec<Vec<u8>> = vec![Vec::new(), vec![0xff], vec![0x41; 9]];
+        inputs.push(
+            (0u8..64)
+                .map(|b| b.wrapping_mul(37).wrapping_add(3) | 1)
+                .collect(),
+        );
+        inputs.push((0u8..40).map(|b| 0xff - b).collect());
+        for input in inputs {
+            let lines = traced_args(&out, &input, Some("1"));
+            for stat in layout.decode(&input) {
+                assert!(stat.decoded, "{stat:?}");
+                let trace = traced(&lines, &stat.name, None);
+                assert_eq!(
+                    serde_json::json!(stat.span),
+                    trace["span"],
+                    "{}: static {stat:?} vs traced {trace} on {input:02x?}",
+                    stat.name
+                );
+                match &stat.value {
+                    Some(value) if stat.decoder == "enum_member" => {
+                        // The trace prints the member's value; these are 0, 1, 2.
+                        let members = ["WM_FAST", "WM_SAFE", "WM_SLOW"];
+                        let at: usize = trace["value"].as_str().unwrap().parse().unwrap();
+                        assert_eq!(members[at], value, "on {input:02x?}");
+                    }
+                    Some(value) => assert_eq!(
+                        trace["value"],
+                        serde_json::json!(value),
+                        "{} on {input:02x?}",
+                        stat.name
+                    ),
+                    None => {
+                        let preview = stat.preview_hex.clone().unwrap_or_default();
+                        let traced_preview = trace["preview_hex"].as_str().unwrap_or_default();
+                        assert!(
+                            preview.starts_with(traced_preview),
+                            "{}: {preview} vs {traced_preview}",
+                            stat.name
+                        );
+                    }
+                }
+            }
+        }
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// C strings decode statically the way the harness reads and traces
+    /// them, up to the first NUL among their bytes (a length-prefixed format
+    /// string and a `const char *` view of the remaining input), and a
+    /// parameter the harness gives a constant decodes to that constant.
+    #[test]
+    fn built_c_harness_strings_and_constants_decode_like_its_argument_trace() {
+        let Some(out) = build_c_harness_in(
+            "parse_flags",
+            &[
+                ("flags", "unsigned int"),
+                ("fmt", "const char *"),
+                ("path", "const char *"),
+                ("count", "long"),
+                ("tag", "unsigned char"),
+            ],
+            "#include <string.h>\n\
+             int parse_flags(unsigned int flags, const char *fmt, const char *path, long count,\n\
+             \x20               unsigned char tag) {\n\
+             \x20   return (int)(flags + strlen(fmt) + (count > 0 ? strnlen(path, (size_t)count) : 0)\n\
+             \x20                + tag);\n\
+             }\n",
+            None,
+        ) else {
+            return;
+        };
+        let layout = crate::arg_layout::ArgLayout::read(&out).unwrap().unwrap();
+        let flags = layout.params().find(|p| p.name == "flags").unwrap();
+        assert_eq!(
+            (flags.decoder.as_str(), flags.fixed_value),
+            ("fixed", Some(0)),
+            "{flags:?}"
+        );
+        let mut inputs: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            b"\x05\x00ab\x00cd\x07xyz\x00".to_vec(),
+            b"\x04\x00%d\x00\x00\x09path\x00tail".to_vec(),
+            b"\x02\x00hi\x01ab".to_vec(),
+            b"\xff\xff%s%n".to_vec(),
+        ];
+        inputs.push(
+            (0u8..42)
+                .map(|b| b.wrapping_mul(73).wrapping_add(11))
+                .collect(),
+        );
+        for input in inputs {
+            let lines = traced_args(&out, &input, Some("1"));
+            let decoded = layout.decode(&input);
+            for line in &lines {
+                let name = line["name"].as_str().unwrap();
+                let stat = decoded
+                    .iter()
+                    .find(|arg| arg.name == name)
+                    .unwrap_or_else(|| panic!("{name} not in {decoded:?}"));
+                assert!(stat.decoded, "{stat:?}");
+                let field = |key: &str| line.get(key).cloned().unwrap_or(serde_json::Value::Null);
+                assert_eq!(
+                    serde_json::json!(stat.span),
+                    field("span"),
+                    "{name} on {input:02x?}"
+                );
+                assert_eq!(
+                    serde_json::json!(stat.value),
+                    field("value"),
+                    "{name} on {input:02x?}"
+                );
+                assert_eq!(
+                    serde_json::json!(stat.len),
+                    field("len"),
+                    "{name} on {input:02x?}"
+                );
+                assert_eq!(
+                    serde_json::json!(stat.preview_hex),
+                    field("preview_hex"),
+                    "{name} on {input:02x?}"
+                );
+            }
+        }
+        fs::remove_dir_all(&out).ok();
+    }
+
     /// With BHF_TRACE_ARGS=1 a built C harness prints each decoded parameter:
     /// scalars with their value and the bytes they came from, a length-prefixed
     /// string with its length and bytes, a whole-input buffer with its address,
@@ -6804,6 +6989,105 @@ mod tests {
             !main.contains("_bhf_env_data = Data;"),
             "no env arming when opt-out"
         );
+    }
+
+    /// Generation writes arg-layout.json: every parameter in decode order
+    /// with its input source, decoder, width, endianness, bounds and pairing,
+    /// and where the call's whole-input parameters take the remaining bytes.
+    #[test]
+    fn direct_harness_writes_its_argument_layout() {
+        use crate::arg_layout::{ArgLayout, LayoutStep};
+        let out = temp_dir("arg_layout_c");
+        let defs = c_parser::parse_c_type_defs(
+            "typedef unsigned char u8_t;\ntypedef unsigned int u32_t;\n",
+        )
+        .unwrap();
+        let mut args = direct_args("read_bits", out.clone());
+        args.params = vec![
+            CParameter {
+                name: "data".to_owned(),
+                c_type: "const u8_t *".to_owned(),
+            },
+            CParameter {
+                name: "bit_index".to_owned(),
+                c_type: "u32_t".to_owned(),
+            },
+            CParameter {
+                name: "name".to_owned(),
+                c_type: "const char *".to_owned(),
+            },
+        ];
+        args.type_defs = vec![defs];
+        generate_c_direct_harness(args).unwrap();
+        let layout = ArgLayout::read(&out).expect("arg-layout.json").unwrap();
+        assert_eq!(layout.language, "c");
+        assert_eq!(layout.harness, "direct");
+        assert_eq!(layout.harness_format_version, crate::HARNESS_FORMAT_VERSION);
+        assert!(layout.static_decode);
+        let kinds: Vec<String> = layout
+            .steps
+            .iter()
+            .map(|step| match step {
+                LayoutStep::Param(p) => format!("{}:{}:{}", p.name, p.input, p.decoder),
+                LayoutStep::Remainder { call, sized } => format!("remainder:{call}:{sized}"),
+                LayoutStep::Opaque { what } => format!("opaque:{what}"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "bit_index:cursor:scalar",
+                "name:cursor:length_prefixed_string",
+                "remainder:target:false",
+                "data:remainder:input_buffer",
+            ]
+        );
+        let params: Vec<_> = layout.params().collect();
+        assert_eq!(params[0].index, 1);
+        assert_eq!(params[0].width, Some(4));
+        assert_eq!(params[0].endianness.as_deref(), Some("little"));
+        assert_eq!(params[0].value_kind.as_deref(), Some("u32"));
+        assert_eq!(params[1].max_len, Some(4096));
+        assert_eq!(params[2].copied, Some(true));
+        // The layout decodes a testcase the way the harness does.
+        let decoded = layout.decode(b"\x2a\x00\x00\x00\x02\x00hiTAIL");
+        let value = |name: &str| decoded.iter().find(|a| a.name == name).unwrap();
+        assert_eq!(value("bit_index").value.as_deref(), Some("42"));
+        assert_eq!(value("name").preview_hex.as_deref(), Some("6869"));
+        assert_eq!(value("data").span, Some([8, 12]));
+    }
+
+    #[test]
+    fn a_buffer_length_pair_is_recorded_as_paired_in_the_layout() {
+        let out = temp_dir("arg_layout_pair");
+        let mut args = direct_args("parse_record", out.clone());
+        args.params = vec![
+            CParameter {
+                name: "buf".to_owned(),
+                c_type: "const unsigned char *".to_owned(),
+            },
+            CParameter {
+                name: "buflen".to_owned(),
+                c_type: "size_t".to_owned(),
+            },
+            CParameter {
+                name: "tag".to_owned(),
+                c_type: "int".to_owned(),
+            },
+        ];
+        generate_c_direct_harness(args).unwrap();
+        let layout = crate::arg_layout::ArgLayout::read(&out).unwrap().unwrap();
+        let by = |name: &str| layout.params().find(|p| p.name == name).unwrap().clone();
+        assert_eq!(by("buf").paired_with.as_deref(), Some("buflen"));
+        assert_eq!(by("buflen").paired_with.as_deref(), Some("buf"));
+        assert_eq!(by("buflen").decoder, "input_length");
+        assert_eq!(by("buf").copied, Some(false), "the pair views the input");
+        assert_eq!(by("tag").order, 0, "the scalar is decoded first");
+        let decoded = layout.decode(b"\x07\x00\x00\x00ABC");
+        let value = |name: &str| decoded.iter().find(|a| a.name == name).unwrap().clone();
+        assert_eq!(value("tag").value.as_deref(), Some("7"));
+        assert_eq!(value("buflen").value.as_deref(), Some("3"));
+        assert_eq!(value("buf").preview_hex.as_deref(), Some("414243"));
     }
 
     #[test]

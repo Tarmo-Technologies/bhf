@@ -49,8 +49,9 @@ field summary. `findings.json` always starts with `schema_version`, then
 `generated_at`, `tool`, so an importer can detect the format from the first
 few bytes. Every key is present (`null` where a value does not apply — never
 omitted), and unknown keys are rejected. Keys added to v1 after its first
-release (`fuzz.access`, `fuzz.input_to_state`, `fuzz.input_to_state_input`,
-`fuzz.arguments`, the `runtrace` evidence role) are optional in the schema, so documents written
+release (`fuzz.access`, `fuzz.access.parameter`, `fuzz.input_to_state`,
+`fuzz.input_to_state_input`, `fuzz.arguments`, the `runtrace` evidence role)
+are optional in the schema, so documents written
 before them still validate; bhf always writes them. A validator holding the
 older schema rejects them.
 
@@ -102,7 +103,7 @@ records that failed to load — a bad record never aborts the rebuild).
 
 | Field | Type | Notes |
 |---|---|---|
-| `access` | object \| null | the memory access the sanitizer reported: `{direction, size, address_hint, region, alloc_stack[], free_stack[]}`. `direction` is `read`, `write` or `unknown`; `region` is `{kind, size, offset, relation, distance, variable, frame_offset}` (`kind` `heap`, `stack` or `global`; `offset` negative before the object, `>= size` past it). The raw address is left out (it differs run to run); the stacks keep project and harness frames only, at most 8 |
+| `access` | object \| null | the memory access the sanitizer reported: `{direction, size, address_hint, region, alloc_stack[], free_stack[], parameter}`. `direction` is `read`, `write` or `unknown`; `region` is `{kind, size, offset, relation, distance, variable, frame_offset}` (`kind` `heap`, `stack` or `global`; `offset` negative before the object, `>= size` past it). `parameter` is the harness parameter whose buffer the access hit, `{name, offset, basis}`, from `finding.json` `exception.access.parameter` when the argument trace named one, else `null`: `basis` `region_start` (the parameter's pointer is the region start; `offset` is the access's offset in it), `region_interior` (the pointer points into the region; `offset` is from the pointer) or `nearest_pointer` (no region was reported; `offset` is the faulting address minus the closest traced pointer below it). The raw address is left out (it differs run to run); the stacks keep project and harness frames only, at most 8 |
 | `input_to_state` | array \| null | comparison evidence recorded while this finding's input ran (from `finding.json` `gates`); `null` when no capture ran or it could not run (`gate_capture.status` `unavailable`), `[]` when one ran and no input bytes fed a comparison. Each entry: `{offset, len, operand_hex, compared_with_hex, cmp_kind, site, site_location, relation, operands_equal}`. `relation` is `equal` (the operand bytes are the input bytes), `byte_swapped` (the same, read big-endian) or `derived` (the operand is computed from those bytes and changed when they did); `site` is the comparison's offset in the harness executable, `site_location` its source position when it could be symbolized (never for `memcmp`/`bcmp` under AddressSanitizer, whose interceptor reports itself as the site) |
 | `input_to_state_input` | string \| null | the finding file whose bytes the `input_to_state` offsets index: `min_testcase.bin` or `testcase.bin` (`finding.json` `gate_capture.input`); `null` when no capture named it |
 | `arguments` | array \| null | the values the harness decoded from the input and passed to the target (`finding.json` `decoded_args`), when traced: `{name, type, value, len, span, preview_hex, role, after_call_value}`; `span` is `[start, end)` in the testcase, `role` `param`, `receiver` or `out` |
@@ -177,7 +178,7 @@ findings and owns the single record for the batch.
 One row per finding. Columns, from `CSV_HEADER`:
 
 ```
-id,kind,severity,confidence,confirmation,rule_id,cwe,title,file,line,function,group,occurrences,verdict,vuln_id,purl,first_seen,evidence_dir,access,access_size,region_size,region_offset,input_to_state,input_to_state_input
+id,kind,severity,confidence,confirmation,rule_id,cwe,title,file,line,function,group,occurrences,verdict,vuln_id,purl,first_seen,evidence_dir,access,access_size,region_size,region_offset,input_to_state,input_to_state_input,arguments,access_parameter
 ```
 
 `cwe` is written `CWE-120`; multiple values are `;`-separated. The columns
@@ -185,8 +186,14 @@ after `evidence_dir` were added later, at the end, so readers that address
 columns by position keep working: `access` is the access direction,
 `access_size` its width, `region_size` and `region_offset` the object it hit,
 `input_to_state` lists the comparison evidence as
-`offset:len:cmp_kind:operand_hex`, `;`-separated, and `input_to_state_input`
-names the file those offsets index.
+`offset:len:cmp_kind:operand_hex`, `;`-separated, `input_to_state_input`
+names the file those offsets index, `arguments` summarises `fuzz.arguments`
+and `access_parameter` names `fuzz.access.parameter`. `arguments` is
+`name=value` per argument, `;`-separated: a buffer or string reads
+`len <N>`, followed by `hex <first 8 bytes>` when a preview was traced
+(`data=len 50718 hex 68baa77e0f010203...`), an output whose value changed
+reads `<before>-><after>`, a `;` inside a name or value is written `,`, and
+the cell stops at 200 characters with `...`.
 
 SARIF results carry the comparison evidence as the `bhfInputToState` property
 (the `finding.json` `gates` entries), the file its offsets index as

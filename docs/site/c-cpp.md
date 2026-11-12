@@ -412,11 +412,75 @@ with no region it names the nearest traced pointer below the faulting address
 and prints the arguments as a table. `bhf explain` shows the same table under
 HARNESS ARGUMENTS, and `bhf cartography` labels each byte with the parameter
 it was decoded into. Harnesses generated before the trace existed print
-nothing: regenerate them, or read the arguments under a debugger.
+nothing: regenerate them, or read the arguments under a debugger. In
+`bhf explain`'s HARNESS ARGUMENTS table, an argument whose bytes a recorded
+comparison read is tagged `[compared at <file>:<line>]` (or the comparison's
+address when it could not be symbolized); evidence recorded on
+`min_testcase.bin` is related to the parameters through `arg-layout.json`
+decoded over that file. The results `findings.json` carries the accessed
+parameter as `fuzz.access.parameter`, and `findings.csv` the arguments
+(`arguments`) and that parameter (`access_parameter`).
+
+### Decoding a testcase without running it
+
+Generation also writes `arg-layout.json` beside `main.c` / `main.cpp`
+(`schema_version` `bhf.arg-layout.v1`, recorded as `arg_layout` in
+`generation-metadata.json`): the decode steps in the order the harness runs
+them. Each parameter step gives its `call`, `index`, `name`, `type` and
+`order`, where its bytes come from (`input`: `cursor`, `remainder`,
+`whole_input` or `none`), the decoder kind (`decoder`: `scalar`,
+`bounded_int`, `enum_member`, `length_prefixed_string`, `capacity_string`,
+`rest_view`, `input_buffer`, `input_length`, `input_stream`, `input_file`,
+`fixed` or `other`), its `primitive` (`bhf_i32`, `bhf_c_string`, ...),
+`width`, `endianness`, `value_kind`, bounds (`lo`, `hi`), enum `members`,
+`length_prefix_bytes` and `max_len`, whether a buffer is `copied`, whether
+the value is a C string read up to its first NUL (`nul_terminated`), the
+constant a `fixed` parameter is given (`fixed_value`), the
+other half of a pair (`paired_with`), and `static_decode` with a `note` when
+its value cannot be computed from the description. A `remainder` step marks
+where a call's whole-input parameters take the bytes the cursor left (`sized`
+with the explicit buffer-length dimension), and an `opaque` step a lifecycle
+loop, whose input use is known only at run time.
+
+`bhf decode-args` maps a testcase to the value of each parameter:
+
+```sh
+bhf decode-args --finding F-0003-9c1d22e0            # its testcase.bin and harness
+bhf decode-args crash.bin --harness bhf_work/harnesses/H-C0001
+bhf decode-args --finding F-0003-9c1d22e0 --static --json
+```
+
+With a built harness that has the argument trace it runs it once with
+`BHF_TRACE_ARGS=1` and shows its `BHF_ARG` values. Without one (a work dir
+copied without binaries, a cross-compiled harness) or with `--static`, it
+replays `arg-layout.json` over the testcase: scalars, bounded integers,
+enums, length-prefixed and capacity strings, and remainder, whole-input and
+paired buffers are decoded as `bhf_decode.h` decodes them (a C string's
+length and preview stop at its first NUL byte, as the target reads it and
+the trace prints it; its span covers every byte it was decoded from), a
+parameter the harness sets to a constant (`fixed_value` in the layout) shows
+that constant, and every other
+parameter, and every one decoded after a step the layout cannot replay (a
+struct decoded field by field keeps the count of bytes it reads; a lifecycle
+loop or a wide string does not), is listed under `not decoded statically`
+with the reason. A sequence harness picks its calls from its control block,
+so its layout is not replayed. `--json` prints one `bhf.decode-args.v1`
+document (`source` `harness_trace` or `arg_layout`, `arguments`,
+`not_decoded`, `notes`). A finding recorded with another harness input
+format than the layout gets a note, since its bytes decode differently.
 
 ### Reading arguments in a debugger
 
-Harnesses are built with `-O1 -g`, so gdb can show the target's arguments:
+`bhf replay --debugger` does this for you: it runs the testcase under gdb or
+lldb (cdb on Windows) in batch mode, breaks at the target function the
+generation metadata names, prints `info args` and `bt full` there, then
+continues to the crash and prints `bt full` again, with
+`ASAN_OPTIONS=handle_segv=0:abort_on_error=1:detect_leaks=0` so the debugger
+sees the fault and with the replay's runtime mode, injected variables and
+runtrace shim, so a crash that depends on them happens there too (see
+[CLI](cli.md#replaying-a-finding)). The session runs the harness outside the
+replay's sandbox. By hand, harnesses
+are built with `-O1 -g`, so gdb can show the target's arguments:
 
 ```sh
 gdb -q -batch -ex 'set debuginfod enabled off' -ex 'break <target>' -ex run -ex 'info args' \

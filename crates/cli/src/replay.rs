@@ -98,6 +98,24 @@ pub struct ReplayArgs {
     /// the call). With --json they are the `arguments` array.
     #[arg(long = "show-args")]
     pub show_args: bool,
+
+    /// Also re-run the testcase under a debugger in batch mode (gdb, lldb, or
+    /// cdb on Windows; with no value, the first one found, cdb first on
+    /// Windows): break at the harness's target function, print its arguments
+    /// (`info args`) and full stack (`bt full`), then continue to the crash
+    /// and print the full stack again. AddressSanitizer leaves the fault to
+    /// the debugger (`handle_segv=0`) and aborts after a report; leak checks
+    /// are off. The harness gets the replay's environment (runtime mode,
+    /// injected variables, the runtrace shim for it alone). C/C++ harness
+    /// replays only, run natively and without a sandbox: not with
+    /// --qemu-user, --sandbox firejail|bubblewrap or --sandbox-strict.
+    #[arg(
+        long,
+        value_name = "gdb|lldb|cdb",
+        num_args = 0..=1,
+        default_missing_value = "auto"
+    )]
+    pub debugger: Option<String>,
 }
 
 /// How the replay result is printed.
@@ -122,10 +140,37 @@ pub fn run(args: ReplayArgs) -> i32 {
         show_output: args.show_output,
         show_args: args.show_args,
     };
+    // A requested debugger must exist before anything runs.
+    let debugger = match args.debugger.as_deref() {
+        None => None,
+        Some(choice) => match resolve_debugger(
+            choice,
+            args.qemu_user.is_some(),
+            args.sandbox_strict
+                || matches!(
+                    args.sandbox,
+                    SandboxModeArg::Firejail | SandboxModeArg::Bubblewrap
+                ),
+        ) {
+            Ok(debugger) => Some(debugger),
+            Err(error) => return report_error(&output, &finding_dir, &error),
+        },
+    };
+    let lane_debugger_error = |output: &OutputMode| {
+        report_error(
+            output,
+            &finding_dir,
+            "--debugger applies to replays of a C/C++ harness; this finding replays through \
+             another lane",
+        )
+    };
     // HDF-7: a finding carrying a session artifact replays by re-driving the
     // recorded multi-message session against a freshly reset transport (which
     // re-captures a fresh handle), not by re-running a harness binary.
     if crate::session_fuzz::is_session_finding(&finding_dir) {
+        if debugger.is_some() {
+            return lane_debugger_error(&output);
+        }
         let lane = crate::session_fuzz::replay_session_outcome(&finding_dir);
         return finish_lane(&finding_dir, lane, output);
     }
@@ -134,6 +179,9 @@ pub fn run(args: ReplayArgs) -> i32 {
     // surfacing the attributing event + process tree), not from a harness re-run,
     // so it dispatches before any harness resolution.
     if crate::collector_run::is_collector_finding(&finding_dir) {
+        if debugger.is_some() {
+            return lane_debugger_error(&output);
+        }
         let lane = crate::collector_run::replay_collector_outcome(&finding_dir);
         return finish_lane(&finding_dir, lane, output);
     }
@@ -142,6 +190,9 @@ pub fn run(args: ReplayArgs) -> i32 {
     // endpoint relocatable), checking the fault identity — never by resolving a
     // host harness, which would not be equivalent assurance.
     if crate::transport_replay::is_transport_finding(&finding_dir) {
+        if debugger.is_some() {
+            return lane_debugger_error(&output);
+        }
         let lane = crate::transport_replay::replay_transport_outcome(
             &finding_dir,
             args.transport_endpoint.as_deref(),
@@ -155,6 +206,9 @@ pub fn run(args: ReplayArgs) -> i32 {
         Err(error) => return report_error(&output, &finding_dir, &error),
     };
     if crate::binary_fuzz::is_binary_finding(&finding_dir) {
+        if debugger.is_some() {
+            return lane_debugger_error(&output);
+        }
         let lane = crate::binary_fuzz::replay_binary_outcome(&finding_dir, &harness);
         return finish_lane(&finding_dir, lane, output);
     }
@@ -188,12 +242,60 @@ pub fn run(args: ReplayArgs) -> i32 {
         args.sandbox_strict,
     );
     match engine {
-        HarnessEngine::CAfl => replay_c(&finding_dir, &runner, CInput::Stdin, &detection, output),
-        HarnessEngine::CLibFuzzer => {
-            replay_c(&finding_dir, &runner, CInput::ArgvFile, &detection, output)
-        }
+        HarnessEngine::CAfl => replay_c(
+            &finding_dir,
+            &runner,
+            CInput::Stdin,
+            &detection,
+            output,
+            debugger.as_ref(),
+        ),
+        HarnessEngine::CLibFuzzer => replay_c(
+            &finding_dir,
+            &runner,
+            CInput::ArgvFile,
+            &detection,
+            output,
+            debugger.as_ref(),
+        ),
+        HarnessEngine::AdaStdin if debugger.is_some() => report_error(
+            &output,
+            &finding_dir,
+            "--debugger applies to C/C++ harnesses; this is an Ada harness (debug its \
+             `main` under gdb directly)",
+        ),
         HarnessEngine::AdaStdin => replay_ada(&finding_dir, &runner, &detection, output),
     }
+}
+
+/// The debugger `--debugger <choice>` names, found on PATH, or why the replay
+/// cannot use one: the session starts the harness natively, so not under
+/// `qemu_user` and not in a `sandboxed` replay (an explicit sandbox tool or
+/// `--sandbox-strict`).
+fn resolve_debugger(
+    choice: &str,
+    qemu_user: bool,
+    sandboxed: bool,
+) -> Result<crate::replay_debugger::Debugger, String> {
+    let debugger = crate::replay_debugger::DebuggerChoice::parse(choice).and_then(|choice| {
+        crate::replay_debugger::resolve(choice, std::env::var_os("PATH").as_deref())
+    })?;
+    if qemu_user {
+        return Err(
+            "--debugger runs the harness natively and cannot be combined with --qemu-user; \
+             start qemu-user with -g <port> and attach gdb to it instead"
+                .to_owned(),
+        );
+    }
+    if sandboxed {
+        return Err(
+            "--debugger runs the harness outside the sandbox and cannot be combined with \
+             --sandbox firejail|bubblewrap or --sandbox-strict; replay without --debugger to \
+             run the testcase sandboxed"
+                .to_owned(),
+        );
+    }
+    Ok(debugger)
 }
 
 fn is_afl_harness(harness: &Path) -> bool {
@@ -889,6 +991,9 @@ struct ReplaySummary {
     /// `--show-args`: the decoded harness arguments, or why there are none.
     #[serde(skip_serializing_if = "Option::is_none")]
     arguments: Option<ArgumentsReport>,
+    /// `--debugger`: the batch debugger session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    debugger: Option<crate::replay_debugger::DebuggerSession>,
     /// `bhf replay` printed the status line first; kept for the text view.
     #[serde(skip)]
     status_line: String,
@@ -1169,6 +1274,9 @@ fn emit(summary: &ReplaySummary, output: OutputMode, captured: Result<(&[u8], &[
     if let Some(arguments) = &summary.arguments {
         lines.extend(arguments.lines());
     }
+    if let Some(session) = &summary.debugger {
+        lines.extend(session.lines());
+    }
     for line in &lines {
         if summary.verdict == "match" {
             println!("{line}");
@@ -1332,6 +1440,7 @@ pub(crate) fn finish_lane(
                 lane.lane
             ))
         }),
+        debugger: None,
         status_line: lane.status_line,
     };
     let captured = match &lane.output {
@@ -1357,6 +1466,7 @@ pub(crate) fn replay_c(
     input: CInput,
     detection: &Detection,
     output: OutputMode,
+    debugger: Option<&crate::replay_debugger::Debugger>,
 ) -> i32 {
     let raw = match read_finding(finding_dir) {
         Ok(raw) => raw,
@@ -1444,6 +1554,26 @@ pub(crate) fn replay_c(
     if reproduced {
         record_reproduction(finding_dir, runner);
     }
+    let debugger = debugger.map(|debugger| {
+        let mut session = crate::replay_debugger::run(
+            debugger,
+            runner.harness_path(),
+            &testcase_path,
+            input == CInput::Stdin,
+            harness_target_function(finding_dir, &raw, runner.harness_path(), detection).as_deref(),
+            is_leak_finding(&raw),
+            &replay_env(&raw, runner, input),
+        );
+        let sandbox = runner.sandbox_metadata();
+        if sandbox.mode != "none" {
+            session.notes.push(format!(
+                "the replay ran under the {} sandbox; the debugger session runs the harness \
+                 without it",
+                sandbox.mode
+            ));
+        }
+        session
+    });
     let summary = ReplaySummary {
         schema_version: REPLAY_SCHEMA,
         verdict: if reproduced { "match" } else { "mismatch" },
@@ -1466,6 +1596,7 @@ pub(crate) fn replay_c(
             stderr: String::from_utf8_lossy(&run.stderr).into_owned(),
         }),
         arguments,
+        debugger,
         status_line,
     };
     emit(&summary, output, Ok((&run.stdout, &run.stderr)));
@@ -1474,6 +1605,35 @@ pub(crate) fn replay_c(
     } else {
         3
     }
+}
+
+/// The function the harness calls, from its generation metadata: beside the
+/// binary, else beside the driver source `detection` found, else in the
+/// finding's harness dirs.
+fn harness_target_function(
+    finding_dir: &Path,
+    raw: &Value,
+    harness: &Path,
+    detection: &Detection,
+) -> Option<String> {
+    let mut dirs: Vec<PathBuf> = harness
+        .parent()
+        .map(Path::to_path_buf)
+        .into_iter()
+        .collect();
+    if let ProtocolBasis::SourceMarker(source) | ProtocolBasis::PlainSource(source) =
+        &detection.basis
+    {
+        dirs.extend(source.parent().map(Path::to_path_buf));
+    }
+    if let (Some(work), Some(id)) = (
+        corpus::layout::work_dir_for_finding(finding_dir),
+        raw.get("harness_id").and_then(Value::as_str),
+    ) {
+        dirs.extend(crate::auto::layout::harness_dir_candidates(&work, id));
+    }
+    dirs.iter()
+        .find_map(|dir| crate::generate_harness::recorded_target_function(dir))
 }
 
 /// Reproduce a libFuzzer-protocol C/C++ finding with default output.
@@ -1489,6 +1649,7 @@ fn replay_c_libfuzzer(finding_dir: &Path, runner: &HarnessRunner) -> i32 {
         CInput::ArgvFile,
         &detection,
         OutputMode::default(),
+        None,
     )
 }
 
@@ -1572,6 +1733,7 @@ fn replay_ada(
         arguments: output
             .show_args
             .then(|| ArgumentsReport::unavailable("an Ada harness has no argument trace")),
+        debugger: None,
         status_line,
     };
     emit(

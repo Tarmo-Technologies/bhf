@@ -1531,3 +1531,345 @@ fn replay_and_minimize_flag_a_finding_recorded_against_another_harness_format() 
         "{stderr}"
     );
 }
+
+/// Whether `tool --version` runs.
+#[cfg(unix)]
+fn tool_runs(tool: &str) -> bool {
+    Command::new(tool)
+        .arg("--version")
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
+/// `--debugger gdb` re-runs the testcase under gdb: it stops at the
+/// harness's target function and prints its arguments and stack, then
+/// continues to the AddressSanitizer report and prints the stack again.
+#[cfg(unix)]
+#[test]
+fn replay_debugger_stops_at_the_target_and_at_the_crash() {
+    if !tool_runs("clang") || !tool_runs("gdb") {
+        eprintln!("skipping: clang or gdb unavailable");
+        return;
+    }
+    let work = temp_dir("debugger");
+    let harness_dir = work.join("harnesses/H-DBG");
+    fs::create_dir_all(&harness_dir).unwrap();
+    fs::write(
+        harness_dir.join("main.c"),
+        "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\
+         __attribute__((noinline)) int widget_crash(int value, const char *label) {\n\
+         \x20   char *buf = malloc(4);\n\
+         \x20   memset(buf, 0, 4);\n\
+         \x20   int r = buf[value & 0xff];\n\
+         \x20   free(buf);\n\
+         \x20   return r + label[0];\n\
+         }\n\
+         int main(int argc, char **argv) {\n\
+         \x20   unsigned char b[4] = {0};\n\
+         \x20   FILE *f = argc > 1 ? fopen(argv[1], \"rb\") : NULL;\n\
+         \x20   if (!f) return 2;\n\
+         \x20   if (fread(b, 1, 4, f) != 4) return 2;\n\
+         \x20   fclose(f);\n\
+         \x20   return widget_crash(b[0] | b[1] << 8 | b[2] << 16 | b[3] << 24, \"AB\");\n\
+         }\n",
+    )
+    .unwrap();
+    let build = Command::new("clang")
+        .args(["-g", "-O0", "-fsanitize=address", "-o"])
+        .arg(harness_dir.join("main"))
+        .arg(harness_dir.join("main.c"))
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "{}", text(&build.stderr));
+    fs::write(
+        harness_dir.join("generation-metadata.json"),
+        r#"{"schema_version":1,"harness_format_version":3,"language":"c","target_function":"widget_crash"}"#,
+    )
+    .unwrap();
+    let finding = corpus::layout::findings_dir(&work).join("F-0001-0dbg0dbg");
+    fs::create_dir_all(&finding).unwrap();
+    fs::write(finding.join("testcase.bin"), b"AAAA").unwrap();
+    fs::write(
+        finding.join("finding.json"),
+        r#"{"id":"F-0001-0dbg0dbg","rule_id":"BHF-201","harness_id":"H-DBG","harness_format_version":3,
+            "fixture_path":"harnesses/H-DBG/main",
+            "exception":{"name":"ASAN_HEAP_BUFFER_OVERFLOW","sanitizer":"asan","stack":[]}}"#,
+    )
+    .unwrap();
+
+    let out = replay_output(&[finding.to_str().unwrap(), "--debugger", "gdb"]);
+    let all = format!("{}{}", text(&out.stdout), text(&out.stderr));
+    assert!(
+        all.contains("--- debugger session (gdb, breaking at widget_crash) ---"),
+        "{all}"
+    );
+    // The markers are also in the printed command line; the transcript's
+    // come last.
+    let entry = all
+        .rfind("--- bhf: stopped (at the target entry")
+        .unwrap_or_else(|| panic!("{all}"));
+    let crash = all
+        .rfind("--- bhf: stopped at the crash ---")
+        .unwrap_or_else(|| panic!("{all}"));
+    assert!(entry < crash, "{all}");
+    assert!(
+        all[entry..crash].contains("value = 1094795585"),
+        "info args at the target's entry: {all}"
+    );
+    assert!(all[crash..].contains("widget_crash"), "{all}");
+    assert!(
+        all.contains("heap-buffer-overflow"),
+        "the sanitizer report reaches the transcript: {all}"
+    );
+
+    let out = replay_output(&[finding.to_str().unwrap(), "--debugger", "gdb", "--json"]);
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(doc["debugger"]["tool"], "gdb", "{doc:#}");
+    assert_eq!(doc["debugger"]["breakpoint"], "widget_crash");
+    assert!(doc["debugger"]["transcript"]
+        .as_str()
+        .unwrap()
+        .contains("value = 1094795585"));
+
+    // A debugger that is not installed is an error naming what to install,
+    // before anything runs.
+    if !tool_runs("lldb") {
+        let out = replay_output(&[finding.to_str().unwrap(), "--debugger", "lldb"]);
+        assert_eq!(out.status.code(), Some(1));
+        let stderr = text(&out.stderr);
+        assert!(stderr.contains("--debugger needs lldb on PATH"), "{stderr}");
+        assert!(!stderr.contains("MATCH"), "{stderr}");
+    }
+    fs::remove_dir_all(&work).ok();
+}
+
+/// A finding whose crash needs the replay's runtime environment: the harness
+/// overflows only when `WIDGET_MODE=x` (recorded as injected), the runtime
+/// mode is `rng`, and the preload library (standing in for the runtrace shim)
+/// has run in it. The library appends the path of every process it loads
+/// into to `<work>/preload.log`. Returns the work dir, the finding and the
+/// library, or `None` without clang.
+#[cfg(unix)]
+fn env_dependent_finding(name: &str) -> Option<(PathBuf, PathBuf, PathBuf)> {
+    if !tool_runs("clang") {
+        return None;
+    }
+    let work = temp_dir(name);
+    let harness_dir = work.join("harnesses/H-ENV");
+    fs::create_dir_all(&harness_dir).unwrap();
+    fs::write(
+        harness_dir.join("main.c"),
+        "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\
+         __attribute__((noinline)) int widget_crash(int value, const char *label) {\n\
+         \x20   const char *mode = getenv(\"WIDGET_MODE\");\n\
+         \x20   const char *pass = getenv(\"BHF_RUNTRACE_MODE\");\n\
+         \x20   int armed = mode && !strcmp(mode, \"x\") && pass && !strcmp(pass, \"rng\")\n\
+         \x20       && getenv(\"WIDGET_PRELOADED\");\n\
+         \x20   char *buf = malloc(4);\n\
+         \x20   memset(buf, 0, 4);\n\
+         \x20   int r = buf[armed ? 4 + (value & 7) : 0];\n\
+         \x20   free(buf);\n\
+         \x20   return r + label[0];\n\
+         }\n\
+         int main(int argc, char **argv) {\n\
+         \x20   unsigned char b[4] = {0};\n\
+         \x20   FILE *f = argc > 1 ? fopen(argv[1], \"rb\") : NULL;\n\
+         \x20   if (!f) return 2;\n\
+         \x20   if (fread(b, 1, 4, f) != 4) return 2;\n\
+         \x20   fclose(f);\n\
+         \x20   return widget_crash(b[0] | b[1] << 8 | b[2] << 16 | b[3] << 24, \"AB\");\n\
+         }\n",
+    )
+    .unwrap();
+    let build = Command::new("clang")
+        .args(["-g", "-O0", "-fsanitize=address", "-o"])
+        .arg(harness_dir.join("main"))
+        .arg(harness_dir.join("main.c"))
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "{}", text(&build.stderr));
+    fs::write(
+        harness_dir.join("preload.c"),
+        "#include <stdio.h>\n#include <stdlib.h>\n#include <unistd.h>\n\
+         __attribute__((constructor)) static void widget_preload(void) {\n\
+         \x20   char exe[4096];\n\
+         \x20   ssize_t n = readlink(\"/proc/self/exe\", exe, sizeof exe - 1);\n\
+         \x20   const char *log = getenv(\"WIDGET_PRELOAD_LOG\");\n\
+         \x20   if (n > 0 && log) {\n\
+         \x20       FILE *f;\n\
+         \x20       exe[n] = 0;\n\
+         \x20       f = fopen(log, \"a\");\n\
+         \x20       if (f) { fprintf(f, \"%s\\n\", exe); fclose(f); }\n\
+         \x20   }\n\
+         \x20   setenv(\"WIDGET_PRELOADED\", \"1\", 1);\n\
+         }\n",
+    )
+    .unwrap();
+    let library = harness_dir.join("libwidget_preload.so");
+    let build = Command::new("clang")
+        .args(["-shared", "-fPIC", "-o"])
+        .arg(&library)
+        .arg(harness_dir.join("preload.c"))
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "{}", text(&build.stderr));
+    fs::write(
+        harness_dir.join("generation-metadata.json"),
+        r#"{"schema_version":1,"harness_format_version":3,"language":"c","target_function":"widget_crash"}"#,
+    )
+    .unwrap();
+    let finding = corpus::layout::findings_dir(&work).join("F-0001-0e0e0e0e");
+    fs::create_dir_all(&finding).unwrap();
+    fs::write(finding.join("testcase.bin"), b"AAAA").unwrap();
+    fs::write(
+        finding.join("finding.json"),
+        r#"{"id":"F-0001-0e0e0e0e","rule_id":"BHF-201","harness_id":"H-ENV","harness_format_version":3,
+            "fixture_path":"harnesses/H-ENV/main",
+            "runtime_mode":{"pass":"rng","env_injected":{"WIDGET_MODE":"x"}},
+            "exception":{"name":"ASAN_HEAP_BUFFER_OVERFLOW","sanitizer":"asan","stack":[]}}"#,
+    )
+    .unwrap();
+    Some((work, finding, library))
+}
+
+/// The preload library ran in the harness for the replay and for the
+/// session, and never in a debugger, its server or a shell. (The sanitizer's
+/// symbolizer, which the harness starts, inherits it from the harness.)
+#[cfg(unix)]
+fn assert_preloaded_into_the_harness_only(work: &Path, log: &Path) {
+    let loaded = fs::read_to_string(log).unwrap();
+    let harness = fs::canonicalize(work.join("harnesses/H-ENV/main")).unwrap();
+    assert!(
+        loaded.lines().filter(|p| Path::new(p) == harness).count() >= 2,
+        "the replay and the session both preload it: {loaded}"
+    );
+    for process in loaded.lines() {
+        let name = Path::new(process)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        assert!(
+            !name.starts_with("gdb")
+                && !name.starts_with("lldb")
+                && !matches!(name, "sh" | "dash" | "bash" | "env"),
+            "{name} loaded the preload library: {loaded}"
+        );
+    }
+}
+
+/// `bhf replay --debugger` with the finding's runtime environment, the
+/// preload library standing in for the runtrace shim, as JSON.
+#[cfg(unix)]
+fn debugger_replay_json(
+    finding: &Path,
+    library: &Path,
+    log: &Path,
+    tool: &str,
+) -> serde_json::Value {
+    let out = Command::new(env!("CARGO_BIN_EXE_cli"))
+        .arg("replay")
+        .arg(finding)
+        .args(["--debugger", tool, "--sandbox", "none", "--json"])
+        .env("BHF_RUNTRACE_SHIM", library)
+        .env("WIDGET_PRELOAD_LOG", log)
+        .output()
+        .unwrap();
+    serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|error| panic!("{error}: {}{}", text(&out.stdout), text(&out.stderr)))
+}
+
+/// The debugger session runs the harness with the replay's environment: the
+/// runtime mode and the variables the finding recorded as injected, and the
+/// runtrace shim preloaded into the harness alone, never into gdb or its
+/// shell. A crash that needs them reaches its sanitizer report under the
+/// debugger too.
+#[cfg(unix)]
+#[test]
+fn replay_debugger_runs_the_harness_with_the_replay_environment() {
+    if !tool_runs("gdb") {
+        eprintln!("skipping: gdb unavailable");
+        return;
+    }
+    let Some((work, finding, library)) = env_dependent_finding("debugger-env") else {
+        eprintln!("skipping: clang unavailable");
+        return;
+    };
+    let log = work.join("preload.log");
+    let doc = debugger_replay_json(&finding, &library, &log, "gdb");
+    assert_eq!(doc["verdict"], "match", "{doc:#}");
+    let transcript = doc["debugger"]["transcript"].as_str().unwrap();
+    let crash = transcript
+        .rfind("--- bhf: stopped at the crash ---")
+        .unwrap_or_else(|| panic!("{transcript}"));
+    assert!(
+        transcript.contains("ERROR: AddressSanitizer: heap-buffer-overflow"),
+        "the crash happens under the debugger: {transcript}"
+    );
+    assert!(
+        !transcript.contains("exited normally") && !transcript.contains("exited with code"),
+        "{transcript}"
+    );
+    assert!(transcript[crash..].contains("widget_crash"), "{transcript}");
+    assert_preloaded_into_the_harness_only(&work, &log);
+
+    // The debugger starts the harness itself, so an explicit sandbox is
+    // refused rather than silently bypassed.
+    for sandbox in [&["--sandbox", "bubblewrap"][..], &["--sandbox-strict"][..]] {
+        let mut args = vec![finding.to_str().unwrap(), "--debugger", "gdb"];
+        args.extend_from_slice(sandbox);
+        let out = replay_output(&args);
+        assert_eq!(out.status.code(), Some(1), "{sandbox:?}");
+        let stderr = text(&out.stderr);
+        assert!(stderr.contains("outside the sandbox"), "{stderr}");
+        assert!(!stderr.contains("MATCH"), "{stderr}");
+    }
+    fs::remove_dir_all(&work).ok();
+}
+
+/// `--debugger lldb` prints the stack at the target's entry and at the
+/// crash: lldb's batch mode runs no more `-o` commands once the harness
+/// crashes, so the crash-site commands also run on crash (`-k`), and the
+/// sanitizer report stops at a breakpoint on its report path.
+#[cfg(unix)]
+#[test]
+fn replay_debugger_under_lldb_prints_the_crash_stack() {
+    if !tool_runs("lldb") {
+        eprintln!("skipping: lldb unavailable");
+        return;
+    }
+    let Some((work, finding, library)) = env_dependent_finding("debugger-lldb") else {
+        eprintln!("skipping: clang unavailable");
+        return;
+    };
+    let log = work.join("preload.log");
+    let doc = debugger_replay_json(&finding, &library, &log, "lldb");
+    assert_eq!(doc["verdict"], "match", "{doc:#}");
+    assert_eq!(doc["debugger"]["tool"], "lldb", "{doc:#}");
+    let transcript = doc["debugger"]["transcript"].as_str().unwrap();
+    let entry = transcript
+        .find("# --- bhf: stopped (at the target entry")
+        .unwrap_or_else(|| panic!("{transcript}"));
+    let crash = transcript
+        .rfind("# --- bhf: stopped at the crash ---")
+        .unwrap_or_else(|| panic!("{transcript}"));
+    assert!(entry < crash, "{transcript}");
+    assert!(
+        transcript[entry..crash].contains("value = 1094795585"),
+        "the arguments at the target's entry: {transcript}"
+    );
+    assert!(
+        transcript.contains("ERROR: AddressSanitizer: heap-buffer-overflow"),
+        "{transcript}"
+    );
+    let after = &transcript[crash..];
+    assert!(
+        after.contains("widget_crash"),
+        "the crash stack: {transcript}"
+    );
+    assert!(
+        !transcript.contains("PLEASE submit a bug report"),
+        "{transcript}"
+    );
+    assert_preloaded_into_the_harness_only(&work, &log);
+    fs::remove_dir_all(&work).ok();
+}

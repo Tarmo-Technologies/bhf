@@ -1627,6 +1627,10 @@
       "license": "Apache-2.0"
     },
     {
+      "path": "crates/cli/src/decode_args.rs",
+      "license": "Apache-2.0"
+    },
+    {
       "path": "crates/cli/src/differential.rs",
       "license": "Apache-2.0"
     },
@@ -1756,6 +1760,10 @@
     },
     {
       "path": "crates/cli/src/replay.rs",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/cli/src/replay_debugger.rs",
       "license": "Apache-2.0"
     },
     {
@@ -3152,6 +3160,10 @@
     },
     {
       "path": "crates/harness_gen/Cargo.toml",
+      "license": "Apache-2.0"
+    },
+    {
+      "path": "crates/harness_gen/src/arg_layout.rs",
       "license": "Apache-2.0"
     },
     {

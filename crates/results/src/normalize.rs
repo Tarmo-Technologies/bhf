@@ -4,10 +4,10 @@
 
 use crate::confirmation::{self, ConfirmationInput};
 use crate::model::{
-    AccessRegion, Argument, BinaryBlock, BuildInfo, Component, Confidence, Confirmation,
-    ConfirmationLevel, Evidence, EvidenceFile, ExceptionInfo, Fidelity, Finding, Fingerprint,
-    Frame, FuzzBlock, InputToState, Kind, Location, MemoryAccess, PatchHint, Reproduce, RuleRef,
-    ScaBlock, StaticBlock, TraceStep,
+    AccessParameter, AccessRegion, Argument, BinaryBlock, BuildInfo, Component, Confidence,
+    Confirmation, ConfirmationLevel, Evidence, EvidenceFile, ExceptionInfo, Fidelity, Finding,
+    Fingerprint, Frame, FuzzBlock, InputToState, Kind, Location, MemoryAccess, PatchHint,
+    Reproduce, RuleRef, ScaBlock, StaticBlock, TraceStep,
 };
 use crate::severity;
 use serde_json::Value;
@@ -350,6 +350,25 @@ fn memory_access(access: &Value, root: Option<&Path>) -> Option<MemoryAccess> {
         region,
         alloc_stack: frames("alloc_stack"),
         free_stack: frames("free_stack"),
+        parameter: access.get("parameter").and_then(access_parameter),
+    })
+}
+
+/// `exception.access.parameter`: the parameter whose buffer the access hit,
+/// dropped when it names no parameter or an unknown basis.
+fn access_parameter(parameter: &Value) -> Option<AccessParameter> {
+    let name = str_at(parameter, &["name"]).filter(|name| !name.trim().is_empty())?;
+    let basis = str_at(parameter, &["basis"])?;
+    if !matches!(
+        basis.as_str(),
+        "region_start" | "region_interior" | "nearest_pointer"
+    ) {
+        return None;
+    }
+    Some(AccessParameter {
+        name,
+        offset: parameter.get("offset").and_then(Value::as_i64),
+        basis,
     })
 }
 
@@ -1598,7 +1617,8 @@ mod tests {
             "alloc_stack": [
                 {"function": "malloc", "file": "/llvm/compiler-rt/lib/asan/asan_malloc_linux.cpp", "line": 68},
                 {"function": "copy_at", "file": "/src/demo/src/copy.c", "line": 7}
-            ]
+            ],
+            "parameter": {"name": "data", "offset": 5, "basis": "region_start"}
         });
         raw["gates"] = json!([
             {"offset": 0, "len": 4, "operand_hex": "57494447", "compared_with_hex": "57494447",
@@ -1625,6 +1645,15 @@ mod tests {
         assert_eq!(access.alloc_stack[0].file.as_deref(), Some("src/copy.c"));
         let serialized = serde_json::to_string(&access).unwrap();
         assert!(!serialized.contains("0x602000000010"), "{serialized}");
+        let parameter = access.parameter.as_ref().expect("the accessed parameter");
+        assert_eq!(
+            (
+                parameter.name.as_str(),
+                parameter.offset,
+                parameter.basis.as_str()
+            ),
+            ("data", Some(5), "region_start")
+        );
 
         let gates = fuzz.input_to_state.expect("evidence");
         assert_eq!(gates.len(), 1, "{gates:?}");
@@ -1643,6 +1672,41 @@ mod tests {
         assert_eq!(arguments[0].span, Some([0, 4]));
         assert_eq!(arguments[1].role, "param");
         assert_eq!(arguments[1].len, Some(12));
+    }
+
+    /// An accessed parameter with an unknown basis or no name is dropped, an
+    /// access without one serializes it as `null`, and a document written
+    /// before the key existed still reads.
+    #[test]
+    fn access_parameter_is_kept_only_when_well_formed() {
+        let access_with = |parameter: Value| {
+            let mut raw = asan_record();
+            raw["exception"]["access"] = json!({"direction": "write", "size": 1,
+                "parameter": parameter});
+            normalize(raw, None).fuzz.unwrap().access.unwrap()
+        };
+        let kept = access_with(json!({"name": "dst", "offset": 3, "basis": "nearest_pointer"}));
+        assert_eq!(
+            kept.parameter.as_ref().map(|p| p.name.as_str()),
+            Some("dst")
+        );
+        assert!(access_with(json!({"name": "dst", "basis": "guess"}))
+            .parameter
+            .is_none());
+        assert!(access_with(json!({"offset": 1, "basis": "region_start"}))
+            .parameter
+            .is_none());
+        let none = access_with(Value::Null);
+        assert!(none.parameter.is_none());
+        let text = serde_json::to_string(&none).unwrap();
+        assert!(text.contains("\"parameter\":null"), "{text}");
+        // A document written before the field existed still reads.
+        let old: crate::model::MemoryAccess = serde_json::from_str(
+            r#"{"direction":"read","size":null,"address_hint":null,"region":null,
+                "alloc_stack":[],"free_stack":[]}"#,
+        )
+        .unwrap();
+        assert!(old.parameter.is_none());
     }
 
     /// `null` means no capture ran; `[]` means one ran and found nothing.

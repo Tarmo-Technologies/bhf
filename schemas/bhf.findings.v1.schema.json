@@ -131,7 +131,23 @@
           ]
         },
         "alloc_stack": { "type": "array", "maxItems": 8, "items": { "$ref": "#/$defs/frame" } },
-        "free_stack": { "type": "array", "maxItems": 8, "items": { "$ref": "#/$defs/frame" } }
+        "free_stack": { "type": "array", "maxItems": 8, "items": { "$ref": "#/$defs/frame" } },
+        "parameter": {
+          "description": "The harness parameter whose buffer the access hit, or null when the argument trace named none. Added after the first v1 release, so documents written before it omit the key.",
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["name", "offset", "basis"],
+              "properties": {
+                "name": { "type": "string", "minLength": 1 },
+                "offset": { "type": ["integer", "null"] },
+                "basis": { "enum": ["region_start", "region_interior", "nearest_pointer"] }
+              }
+            }
+          ]
+        }
       }
     },
     "frame": {

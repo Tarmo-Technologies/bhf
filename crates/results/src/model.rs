@@ -381,6 +381,26 @@ pub struct MemoryAccess {
     /// runtime and allocator frames dropped.
     pub alloc_stack: Vec<Frame>,
     pub free_stack: Vec<Frame>,
+    /// The harness parameter whose buffer the access hit (`finding.json`
+    /// `exception.access.parameter`), when the argument trace named one.
+    /// Added after the first v1 release: `#[serde(default)]` keeps documents
+    /// written before it readable.
+    #[serde(default)]
+    pub parameter: Option<AccessParameter>,
+}
+
+/// The harness parameter a memory access hit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccessParameter {
+    pub name: String,
+    /// Bytes from the parameter's pointer (`region_start`: from the region
+    /// start the pointer equals; `region_interior`: from the pointer into the
+    /// region; `nearest_pointer`: from the closest traced pointer below the
+    /// faulting address).
+    pub offset: Option<i64>,
+    /// `region_start`, `region_interior` or `nearest_pointer`.
+    pub basis: String,
 }
 
 /// The object a memory access hit.

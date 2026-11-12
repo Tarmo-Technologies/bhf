@@ -599,6 +599,40 @@
 - The Fortran lane records how each Fortran object of a harness link was
   compiled (`harnesses/<id>/fortran-build.json`), which a capsule uses to
   rebuild them from source.
+- `arg-layout.json` beside each generated C/C++ harness (`bhf.arg-layout.v1`,
+  named as `arg_layout` in `generation-metadata.json`): the static decode
+  layout of the harness's arguments, in the order the harness decodes them.
+  Each parameter records its order, input source (cursor, remainder, whole
+  input), decoder kind and primitive, width, endianness, bounds, enum
+  members, length-prefix size, buffer copy or view and pairing, whether the
+  value is a C string read up to its first NUL (`nul_terminated`) and the
+  constant a `fixed` parameter is given (`fixed_value`); it also marks
+  where a call's whole-input parameters take the remaining bytes and any
+  lifecycle loop. `generation-metadata.json` also records `target_function`.
+- `bhf decode-args`: maps a testcase (or `--finding <id>`) to the value each
+  harness parameter receives, through the harness's argument trace when its
+  binary runs, else (or with `--static`) by replaying `arg-layout.json` for
+  scalars, bounded integers, enums, length-prefixed strings, constants and
+  remainder, whole-input and paired buffers, naming each parameter it cannot
+  decode statically and why. Both sources measure a C string up to its first
+  NUL byte. Text table, or `--json` (`bhf.decode-args.v1`).
+- `bhf replay --debugger [gdb|lldb|cdb]` re-runs the testcase under a batch
+  debugger: it breaks at the harness's target function, prints its arguments
+  and full stack, continues to the crash and prints the stack again, with
+  AddressSanitizer's signal handling off so the debugger sees a SEGV. The
+  harness gets the replay's runtime mode and injected variables, and the
+  runtrace shim is preloaded into the harness only. lldb prints the crash
+  site through on-crash (`-k`) commands and stops a sanitizer report at the
+  sanitizer's report function. The session runs without a sandbox, so it is
+  refused with `--sandbox firejail|bubblewrap` or `--sandbox-strict`. It
+  says what to install when no debugger is found.
+- `bhf explain` tags each harness argument whose input bytes a recorded
+  comparison read with the comparison's site (`[compared at bits.c:12]`).
+- `findings.csv` appends `arguments` (`name=value;...`, buffers as
+  `len N hex <first 8 bytes>`, bounded) and `access_parameter`; results
+  `findings.json` carries `exception.access.parameter` as
+  `fuzz.access.parameter` (`{name, offset, basis}`, null when unknown), and
+  INDEX.md names it on the memory-access line. Both are additive.
 - Each token in a harness's `dictionary.txt` is preceded by a
   `# from <file>:<line>` comment naming up to three places in the target source
   and its headers where it was found (C, C++, Ada and the managed lanes), so a
