@@ -517,7 +517,9 @@ decoded arguments of a finding that has no `decoded.json` (one migrated from
 an earlier release) when its harness has the trace. In
 `bhf explain`'s HARNESS ARGUMENTS table, an argument whose bytes a recorded
 comparison read is tagged `[compared at <file>:<line>]` (or the comparison's
-address when it could not be symbolized); evidence recorded on
+address when it could not be symbolized). The length of a `(buffer, length)`
+pair holds the input's size, not input bytes, and is never tagged; its buffer
+is. Evidence recorded on
 `min_testcase.bin` is related to the parameters through `arg-layout.json`
 decoded over that file. The results `findings.json` carries the accessed
 parameter as `fuzz.access.parameter`, and `findings.csv` the arguments

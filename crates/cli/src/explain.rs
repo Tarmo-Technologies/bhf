@@ -588,14 +588,16 @@ fn comparison_tags(
     let input = capture.summary.input.as_str();
     let same_bytes = input == "testcase.bin"
         || std::fs::read(f.dir.join(input)).ok() == std::fs::read(f.dir.join("testcase.bin")).ok();
+    let layout = harness_arg_layout(work_dir, f);
+    // The length half of a (buffer, length) pair holds the input's size, not
+    // input bytes: no comparison read it, whatever its span says.
+    let size_only: Vec<bool> = args
+        .iter()
+        .map(|arg| reads_input_size(arg, layout.as_ref()))
+        .collect();
     let (spans, note): (Vec<Option<std::ops::Range<u64>>>, Option<String>) = if same_bytes {
         (args.iter().map(|arg| arg.byte_range()).collect(), None)
     } else {
-        let layout = str_at(&f.raw, "/harness_id").and_then(|id| {
-            crate::auto::layout::harness_dir_candidates(work_dir, id)
-                .into_iter()
-                .find_map(|dir| harness_gen::arg_layout::ArgLayout::read(&dir)?.ok())
-        });
         let bytes = std::fs::read(f.dir.join(input)).ok();
         match (layout, bytes) {
             (Some(layout), Some(bytes)) => {
@@ -636,7 +638,11 @@ fn comparison_tags(
     };
     let tags = spans
         .iter()
-        .map(|span| {
+        .zip(&size_only)
+        .map(|(span, size_only)| {
+            if *size_only {
+                return None;
+            }
             let span = span.as_ref().filter(|span| span.start < span.end)?;
             let mut sites: Vec<String> = Vec::new();
             for gate in &capture.gates {
@@ -668,6 +674,48 @@ fn comparison_tags(
         })
         .collect();
     (tags, note)
+}
+
+/// The harness's `arg-layout.json`, when its dir has one.
+fn harness_arg_layout(work_dir: &Path, f: &Finding) -> Option<harness_gen::arg_layout::ArgLayout> {
+    let id = str_at(&f.raw, "/harness_id")?;
+    crate::auto::layout::harness_dir_candidates(work_dir, id)
+        .into_iter()
+        .find_map(|dir| harness_gen::arg_layout::ArgLayout::read(&dir)?.ok())
+}
+
+/// Whether a traced argument holds the size of the input rather than bytes of
+/// it: its layout decoder is `input_length`, or (without a layout) it is a
+/// scalar that took no bytes of its own through a runtime decoder and whose
+/// value is the length of its span.
+fn reads_input_size(
+    arg: &corpus::decoded_args::TracedArg,
+    layout: Option<&harness_gen::arg_layout::ArgLayout>,
+) -> bool {
+    if let Some(param) = layout.and_then(|layout| {
+        layout.params().find(|param| {
+            param.name == arg.name
+                && param.call == arg.call
+                && i64::try_from(param.index).ok() == Some(arg.index)
+        })
+    }) {
+        return param.decoder == "input_length";
+    }
+    let span_len = arg.span.map(|[start, end]| end.saturating_sub(start));
+    let runtime_decoded = arg
+        .decoder
+        .as_deref()
+        .is_none_or(|decoder| decoder.starts_with("bhf_") || decoder == "fixed");
+    !runtime_decoded
+        && arg.ptr.is_none()
+        && arg.len.is_none()
+        && arg.preview_hex.is_none()
+        && span_len.is_some()
+        && arg
+            .value
+            .as_deref()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            == span_len
 }
 
 /// The sanitizer's structured memory access (`exception.access`) as text: the
@@ -1644,6 +1692,73 @@ mod tests {
             ),
             "{out}"
         );
+    }
+
+    /// The length half of a `(buffer, length)` pair holds the input's size, not
+    /// input bytes: it is never tagged as compared, while its buffer is.
+    #[test]
+    fn the_length_of_a_buffer_pair_is_not_tagged_as_compared() {
+        let work = tempfile::tempdir().unwrap();
+        let gate = serde_json::json!({"offset": 2, "len": 4, "operand_hex": "57494447",
+            "compared_with_hex": "57494447", "cmp_kind": "memcmp", "site": "0x1a2b",
+            "relation": "equal", "operands_equal": true,
+            "location": {"file": "/src/demo/rec.c", "line": 9, "function": "parse_record"}});
+        let mut raw = recorded_capture(serde_json::json!([gate]), None);
+        raw["gate_capture"]["input_len"] = serde_json::json!(12);
+        let finding = finding_in(work.path(), raw);
+        let input = b"..WIDGETxyzw";
+        std::fs::write(finding.dir.join("testcase.bin"), input).unwrap();
+        let args = corpus::decoded_args::parse_arg_trace(
+            "BHF_ARG {\"call\":\"target\",\"i\":0,\"role\":\"param\",\"name\":\"data\",\"type\":\"const uint8_t *\",\"decoder\":\"input view\",\"span\":[0,12],\"len\":12,\"preview_hex\":\"2e2e574944474554\"}\n\
+             BHF_ARG {\"call\":\"target\",\"i\":1,\"role\":\"param\",\"name\":\"len\",\"type\":\"size_t\",\"decoder\":\"input view\",\"span\":[0,12],\"value\":\"12\"}\n",
+        );
+        corpus::decoded_args::record_trace(
+            &finding.dir,
+            input,
+            &corpus::decoded_args::TraceOutcome::Traced(args),
+        )
+        .expect_err("no finding.json: decoded.json is still written");
+        let row = |out: &str, name: &str| {
+            out.lines()
+                .find(|line| line.trim_start().starts_with(&format!("{name} ")))
+                .unwrap_or_else(|| panic!("no {name} row in:\n{out}"))
+                .to_owned()
+        };
+        let out = explain_one(work.path(), &finding, &[], false);
+        assert!(
+            row(&out, "data").ends_with("[compared at rec.c:9]"),
+            "{out}"
+        );
+        assert!(!row(&out, "len").contains("compared at"), "{out}");
+
+        // The harness's layout says so too: a length decoded as the input's
+        // size is not tagged, whatever its trace looks like.
+        let harness = crate::auto::layout::harness_dir(work.path(), "H-C0001");
+        std::fs::create_dir_all(&harness).unwrap();
+        std::fs::write(
+            harness.join("arg-layout.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": "bhf.arg-layout.v1", "harness_format_version": harness_gen::HARNESS_FORMAT_VERSION,
+                "language": "c", "harness": "direct", "static_decode": true,
+                "steps": [
+                    {"step": "param", "call": "target", "role": "param", "index": 0,
+                     "name": "data", "type": "const uint8_t *", "order": 0,
+                     "input": "whole_input", "decoder": "input_buffer", "static_decode": true,
+                     "paired_with": "len"},
+                    {"step": "param", "call": "target", "role": "param", "index": 1,
+                     "name": "len", "type": "size_t", "order": 1,
+                     "input": "whole_input", "decoder": "input_length", "static_decode": true,
+                     "paired_with": "data"}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let out = explain_one(work.path(), &finding, &[], false);
+        assert!(
+            row(&out, "data").ends_with("[compared at rec.c:9]"),
+            "{out}"
+        );
+        assert!(!row(&out, "len").contains("compared at"), "{out}");
     }
 
     /// Without a recorded trace the section says why and how to get one.

@@ -153,6 +153,10 @@
   no longer turns a UBSan finding into a frameless report and `exit status: 0`.
   The script exits with the harness's status, 128 plus the signal for a
   harness killed by one.
+- `bhf explain`'s HARNESS ARGUMENTS table no longer tags the length of a
+  `(buffer, length)` pair `[compared at ...]`: it holds the input's size
+  (`arg-layout.json` decoder `input_length`), not input bytes, although its
+  span is the whole input. The buffer keeps its tag.
 - The migration docs no longer say a 0.2.x work dir's `results/` is rebuilt by
   whichever command opens it first: a command that only reads (`bhf explain`,
   `bhf capsule`) migrates the layout without rebuilding `results/`, which

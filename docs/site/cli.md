@@ -720,7 +720,8 @@ and explain it — all offline and deterministic (no LLM):
   - the harness arguments: the value each parameter was decoded to, from the
     argument trace recorded with the finding. An argument whose input bytes a
     recorded comparison read is tagged `[compared at <file>:<line>]` (the
-    comparison's address when it has no source position). The trace's byte
+    comparison's address when it has no source position); the length of a
+    `(buffer, length)` pair, which holds the input's size, is not. The trace's byte
     spans index `testcase.bin`; evidence recorded on `min_testcase.bin` is
     related to the arguments through the harness's `arg-layout.json` decoded
     over that file, and without one a line says the two are not related;
