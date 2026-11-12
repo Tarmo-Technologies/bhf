@@ -37,7 +37,10 @@ COPY --from=certificates /certificates/ca-certificates.crt /etc/ssl/certs/ca-cer
 ARG TARGETARCH
 COPY docker/toolchain-platform.sh /usr/local/share/bhf/toolchain-platform.sh
 ARG UBUNTU_SNAPSHOT=20261111T000000Z
-RUN printf 'APT::Snapshot "%s";\nAPT::Update::Error-Mode "any";\n' "${UBUNTU_SNAPSHOT}" > /etc/apt/apt.conf.d/50snapshot
+# The snapshot service answers 503 under load; retry each fetch with backoff
+# instead of failing the whole build on one busy response.
+RUN printf 'APT::Snapshot "%s";\nAPT::Update::Error-Mode "any";\n' "${UBUNTU_SNAPSHOT}" > /etc/apt/apt.conf.d/50snapshot \
+    && printf 'Acquire::Retries "10";\nAcquire::Retries::Delay::Maximum "60";\n' > /etc/apt/apt.conf.d/80retries
 # Ubuntu ports sources do not opt into APT's snapshot selector. Use an
 # explicit snapshot URL on ARM64 and avoid filtering it a second time.
 RUN if [ "$TARGETARCH" = arm64 ]; then \
