@@ -4592,14 +4592,17 @@ fn harness_owns_runtime_instrumentation(harness_dir: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Whether a builtin fuzz pass of this harness runs with the runtrace shim
-/// preloaded: a native (not emulated) harness without its own launcher, and
-/// the shim found. Recorded in each finding's `runtime_mode.shim_armed`, so a
-/// report can tell "no environment use observed" from "not observed".
+/// Whether the builtin fuzz pass of this harness that just ran had the
+/// runtrace shim loaded: a native (not emulated) harness without its own
+/// launcher whose pass produced the runtrace log. The log is removed before
+/// each pass and the shim creates it when it loads, so a shim the dynamic
+/// loader could not preload (a path `LD_PRELOAD` splits) counts as not armed.
+/// Recorded in each finding's `runtime_mode.shim_armed`, so a report can tell
+/// "no environment use observed" from "not observed".
 fn fuzz_pass_shim_armed(harness_dir: &std::path::Path, cross: bool) -> bool {
     !cross
         && !harness_owns_runtime_instrumentation(harness_dir)
-        && crate::auto::shim_path::locate().is_some()
+        && harness_dir.join("runtrace.jsonl").is_file()
 }
 
 /// One-shot warning latch so we don't print "shim not found" once
@@ -4643,8 +4646,10 @@ fn run_fuzz_with_runtrace(
     String,
 > {
     let runtrace_log = harness_dir.join("runtrace.jsonl");
-    // Truncate any prior log so this pass's events stand alone.
-    let _ = std::fs::write(&runtrace_log, "");
+    // Remove any prior log so this pass's events stand alone. The shim creates
+    // the log when it loads, so its presence afterwards also shows that the
+    // pass ran with the shim preloaded ([`fuzz_pass_shim_armed`]).
+    let _ = std::fs::remove_file(&runtrace_log);
 
     let mut child_env: Vec<(String, String)> = vec![
         (
@@ -11068,7 +11073,7 @@ mod stamp_tests {
     use super::{
         ada_subunit_parent, ada_unit_key_from_filename, ada_variant_dest_basename,
         build_ada_unit_file_map, c_file_is_simd_backend, compute_ada_build_closure,
-        ensure_ada_src_instrumented, env_injections_from_events,
+        ensure_ada_src_instrumented, env_injections_from_events, fuzz_pass_shim_armed,
         mirror_harness_into_generated_harnesses, reset_repairs_dir,
         rewrite_legacy_gnat_calendar_c_time, stage_ada_c_repair_sources, stamp_runtime_mode,
         walk_to_common_src_root,
@@ -11245,6 +11250,18 @@ mod stamp_tests {
         let parsed: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert!(parsed.get("input_reachability_basis").is_none(), "{parsed}");
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_pass_counts_as_shim_armed_only_when_it_produced_the_runtrace_log() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("main.c"), "int main(void) { return 0; }\n").unwrap();
+        // LD_PRELOAD was set but the shim never loaded (a path ld.so split): no log.
+        assert!(!fuzz_pass_shim_armed(dir.path(), false));
+        fs::write(dir.path().join("runtrace.jsonl"), "").unwrap();
+        assert!(fuzz_pass_shim_armed(dir.path(), false));
+        // An emulated pass never runs the host shim.
+        assert!(!fuzz_pass_shim_armed(dir.path(), true));
     }
 
     #[test]

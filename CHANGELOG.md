@@ -306,6 +306,23 @@
 - A Windows checkout gets LF line endings (`.gitattributes`), so a Windows
   build embeds the same templates, runtime sources and scripts as a Linux
   build.
+- bhf installed under a directory with a space or colon (`Program Files
+  (x86)`, a user profile) loads its runtrace shim: `LD_PRELOAD` splits paths
+  on those characters, so the shim is preloaded from a copy staged under the
+  work dir's `.bhf-runtime/` or `$TMPDIR/bhf-shim-<uid>-<hash>/` (refreshed
+  when the shim changes, and only in a directory no other account can
+  write); with no usable directory bhf warns once and runs without it.
+  The shim creates its runtrace log when it loads, and `finding.json`
+  `runtime_mode.shim_armed` (and `gate_capture.shim_armed`) is true only when
+  the run produced that log, not merely when `LD_PRELOAD` was set.
+- Source, include, extra-source, runtime and compiler paths containing `&`
+  (a `R&D/` directory), and `^` on Windows, are double-quoted in generated
+  Makefiles and recipes instead of being refused as `unsafe_build_path`;
+  `$`, a backtick, a double quote, `#`, `%` (Windows), a backslash (Unix),
+  `;`, `|`, `<`, `>` and control characters stay refused. A `CC`/`CXX` whose
+  path needs quoting for another reason than a space is quoted too, and
+  `bhf explain` quotes the work dir in the `bhf capsule`, `bhf verify-poc`
+  and `bhf cartography` commands it suggests.
 - A C or C++ capsule's `build.sh` picks the sanitizer flags of the compiler that
   runs it (gcc has no `function` UBSan check and links its runtimes
   statically), as the harness Makefile does, and a capsule of a harness bhf

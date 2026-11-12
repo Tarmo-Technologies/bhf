@@ -439,7 +439,8 @@ fn reproduce_lines(work_dir: &Path, f: &Finding) -> Vec<String> {
         dir: f.dir.clone(),
         raw: f.raw.clone(),
     };
-    // One shell word each: a work dir may have spaces (`C:\Users\a b\work`).
+    // One shell word each: a work dir may hold a space or `&`
+    // (`C:\Users\a b\work`, `R&D files/`).
     let work = repro_lane::sh_word(&work_dir.to_string_lossy());
     let capsule = work_dir.join("capsules").join(format!("capsule_{}", f.id));
     let replay = f.dir.join("replay.py");
@@ -2320,6 +2321,49 @@ mod tests {
         let reproduce = out.split("REPRODUCE OFFLINE").nth(1).unwrap();
         assert!(!reproduce.contains("bhf verify-poc"), "{reproduce}");
         assert!(reproduce.contains("oracle finding"), "{reproduce}");
+    }
+
+    /// REPRODUCE OFFLINE quotes the work dir in the commands it suggests, so
+    /// one pasted into a shell from a work dir under `R&D files/` runs as one
+    /// command, not as a backgrounded fragment followed by the path's pieces.
+    #[test]
+    fn reproduce_offline_quotes_a_work_dir_that_needs_it() {
+        let root = tempfile::tempdir().unwrap();
+        let work = root.path().join("R&D files/work");
+        let finding_dir = work.join("results/findings/F-0001-0a0b0c0d");
+        std::fs::create_dir_all(&finding_dir).unwrap();
+        std::fs::write(finding_dir.join("testcase.bin"), b"AAAA").unwrap();
+        let harness = crate::auto::layout::harness_dir(&work, "H-C0001");
+        std::fs::create_dir_all(&harness).unwrap();
+        std::fs::write(harness.join("main"), b"\x7fELF").unwrap();
+        std::fs::write(harness.join("main.c"), b"int main(void) { return 0; }\n").unwrap();
+        std::fs::write(
+            harness.join("Makefile"),
+            b"main: main.c\n\t$(CC) $(CFLAGS) -o $@ main.c $(AUTO_EXTRA_SOURCES)\n",
+        )
+        .unwrap();
+        let mut finding = frameless_finding(&finding_dir);
+        finding.raw["exception"] = serde_json::json!({
+            "name": "ASAN_HEAP_BUFFER_OVERFLOW",
+            "sanitizer": "asan",
+            "message": "AddressSanitizer: heap-buffer-overflow",
+            "stack": []
+        });
+        let out = explain_one(&work, &finding, &[], false);
+        let reproduce = out.split("REPRODUCE OFFLINE").nth(1).unwrap();
+        let quoted = format!("'{}'", work.display());
+        for command in [
+            format!("bhf capsule --work-dir {quoted} --finding-id F-0001-0a0b0c0d"),
+            format!(
+                "bhf verify-poc '{}'",
+                work.join("capsules")
+                    .join("capsule_F-0001-0a0b0c0d")
+                    .display()
+            ),
+            format!("bhf cartography --work-dir {quoted} --finding-id F-0001-0a0b0c0d"),
+        ] {
+            assert!(reproduce.contains(&command), "{command}\n{reproduce}");
+        }
     }
 
     /// REPRODUCE OFFLINE offers capsule and verify-poc for a finding of every

@@ -2985,7 +2985,7 @@ fn validate_c_build_inputs(args: &GenerateCDirectArgs) -> Result<(), HarnessGenE
         make_path,
     };
     // Flags are recipe-only, so one that is safe once single-quoted is allowed.
-    // Paths and include names may carry spaces, parentheses and apostrophes —
+    // Paths and include names may carry spaces, parentheses, apostrophes and ampersands —
     // the Makefile double-quotes them, and a C string literal holds them — but
     // no character that quoting cannot contain.
     ensure_all_compile_flags_safe(args.compile_flags.iter().map(String::as_str))?;
@@ -3009,7 +3009,7 @@ fn validate_c_sequence_build_inputs(args: &GenerateCSequenceArgs) -> Result<(), 
         make_path,
     };
     // Flags are recipe-only, so one that is safe once single-quoted is allowed.
-    // Paths and include names may carry spaces, parentheses and apostrophes —
+    // Paths and include names may carry spaces, parentheses, apostrophes and ampersands —
     // the Makefile double-quotes them, and a C string literal holds them — but
     // no character that quoting cannot contain.
     ensure_all_compile_flags_safe(args.compile_flags.iter().map(String::as_str))?;

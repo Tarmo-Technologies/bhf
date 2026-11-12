@@ -44,6 +44,7 @@ fn fresh_shim(profile: &str) -> Option<PathBuf> {
                 "src/hooks/proc.rs",
                 "src/hooks/format.rs",
                 "src/hooks/format_hooks.c",
+                "src/jsonl.rs",
             ]
             .iter()
             .filter_map(|relative| {
@@ -342,6 +343,56 @@ fn fs_hooks_log_open_close_lifecycle_under_ld_preload() {
 
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_file(&target);
+}
+
+/// The runtrace log is created when the shim loads, so its existence after a
+/// run proves the shim was preloaded, even for a target that touched nothing
+/// the shim records (bhf reports such a run as observed, not as unobserved).
+#[test]
+fn the_runtrace_log_is_created_at_load_for_a_run_that_logs_nothing() {
+    let Some(shim) = shim_so() else {
+        eprintln!("skipping: shim cdylib not built yet");
+        return;
+    };
+    let Some(cc) = cc() else {
+        eprintln!("skipping: no C compiler");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("bhf-shim-quiet-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("probe.c");
+    std::fs::write(&src, "int main(void) { return 0; }\n").unwrap();
+    let bin = dir.join("probe");
+    let built = Command::new(cc)
+        .arg(&src)
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .unwrap();
+    assert!(built.success(), "probe failed to compile");
+    let log = dir.join("rt.jsonl");
+    let status = Command::new(&bin)
+        .env("LD_PRELOAD", &shim)
+        .env("BHF_RUNTRACE_LOG", &log)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("spawn probe");
+    assert!(status.success(), "probe exited abnormally: {status:?}");
+    assert!(
+        log.is_file(),
+        "the preloaded shim did not create {}",
+        log.display()
+    );
+    // Without the shim nothing creates it.
+    let unshimmed = dir.join("rt-plain.jsonl");
+    let status = Command::new(&bin)
+        .env("BHF_RUNTRACE_LOG", &unshimmed)
+        .status()
+        .expect("spawn probe");
+    assert!(status.success());
+    assert!(!unshimmed.exists());
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

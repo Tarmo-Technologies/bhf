@@ -1092,6 +1092,8 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
             .unwrap_or(args.work_dir.clone()),
     );
     crate::workdir::prepare(&work)?;
+    // A runtrace shim installed under a path with spaces is staged here.
+    crate::auto::shim_path::set_staging_work_dir(&work);
     // Judged before this run writes any auto state of its own: whether the
     // work dir holds data (a corpus above all) from an earlier release.
     let from_an_earlier_release = results::migrate::from_an_earlier_release(&work);

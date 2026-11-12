@@ -409,11 +409,12 @@ C:\src\proj\helpers.c` compiles+links a sibling translation unit whose symbols t
 target needs (instead of blind-stubbing them). Both are repeatable.
 
 **Paths with spaces.** The source tree, the work directory, the compiler and
-`--extra-include`/`--extra-source` paths may contain spaces, parentheses and
-apostrophes (`C:\Program Files (x86)\...`, a user profile, a OneDrive folder).
-bhf double-quotes them in the generated Makefile and keeps them out of make
-prerequisites. A path containing `$`, `#`, `%`, `^`, a backtick, a double quote
-or a shell operator (`;`, `|`, `&`, `<`, `>`) is still refused, and the message
+`--extra-include`/`--extra-source` paths may contain spaces, parentheses,
+apostrophes, `&` and `^` (`C:\Program Files (x86)\...`, `C:\R&D\...`, a user
+profile, a OneDrive folder). bhf double-quotes them in the generated Makefile,
+where `cmd` and `sh` take them literally, and keeps them out of make
+prerequisites. A path containing `$`, `#`, `%`, a backtick, a double quote or
+another shell operator (`;`, `|`, `<`, `>`) is still refused, and the message
 names the character. The Visual Studio environment bhf applies (or a Developer
 PowerShell) sets `INCLUDE` and `LIB`, which clang and cl read, so the Visual
 Studio and Windows SDK system include dirs never need `--extra-include` — and

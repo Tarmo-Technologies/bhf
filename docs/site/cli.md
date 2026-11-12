@@ -755,7 +755,9 @@ and explain it — all offline and deterministic (no LLM):
     runtrace shim was loaded for it, else the harness's last fuzz pass (all of
     its inputs, labelled so), and `environment not observed (runtrace shim not
     loaded)` when the shim was not loaded (`finding.json`
-    `runtime_mode.shim_armed`). An installed bhf without the shim beside it
+    `runtime_mode.shim_armed`, true only when the fuzz pass produced the
+    runtrace log, which the shim creates as it loads). An installed bhf
+    without the shim beside it
     can be pointed at one with `BHF_RUNTRACE_SHIM=/path/libbhf_runtrace_shim.so`;
   - reachability: the verdict and what it rests on. A verdict inferred from the
     entry's signature says it "matches an input-taking shape, so likely

@@ -97,8 +97,8 @@ pub fn render_triage(inputs: &TriageInputs) -> String {
         actions.push(format!(
             "{} target(s) were refused because a source path, include dir or compile flag \
              contains a character that cannot be quoted safely in a build recipe (each reason \
-             names it). Rename or move that path; spaces, parentheses and apostrophes are \
-             supported. --force cannot help.",
+             names it). Rename or move that path; spaces, parentheses, apostrophes and \
+             ampersands are supported. --force cannot help.",
             inputs.skipped_unsafe_path
         ));
     }

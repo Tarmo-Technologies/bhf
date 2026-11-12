@@ -1138,7 +1138,7 @@ fn validate_cpp_build_inputs(input: &CppContextInput<'_>) -> Result<(), HarnessG
         make_path,
     };
     // Flags are recipe-only, so one that is safe once single-quoted is allowed.
-    // Paths and include names may carry spaces, parentheses and apostrophes —
+    // Paths and include names may carry spaces, parentheses, apostrophes and ampersands —
     // the Makefile double-quotes them, and an `#include "..."` literal holds
     // them — but no character that quoting cannot contain.
     ensure_all_compile_flags_safe(input.compile_flags.iter().map(String::as_str))?;

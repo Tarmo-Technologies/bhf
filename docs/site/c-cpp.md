@@ -137,17 +137,18 @@ Useful flags:
 | `--max-decl-bytes <BYTES>` | Cap aggregate size for inline struct/union synthesis (default 64 KiB); larger types are rejected |
 
 Source, include, extra-source, runtime and compiler paths may contain spaces,
-parentheses, apostrophes and the characters `* ? [ ] { } ~ !`. The generated
-Makefile double-quotes such paths in recipes and never uses them as make
-prerequisites, so a tree under `/home/Dana Smith/...` or
+parentheses, apostrophes, ampersands and the characters `* ? [ ] { } ~ !`. The
+generated Makefile double-quotes such paths in recipes and never uses them as
+make prerequisites, so a tree under `/home/Dana Smith/...`, `/srv/R&D/...` or
 `C:/Program Files (x86)/...` builds like any other. Compile-database flags
 that name such paths are quoted too: single-quoted, or double-quoted when they
 contain an apostrophe (`-I/home/Dana's tree/include`). A `--differential`
 compiler given as a path with spaces is quoted the same way. A path or flag
 with a character no quoting can make safe is refused before generation, and
 the message names the character: `$`, `#`, a backtick, a double quote, a
-backslash, `;`, `|`, `&`, `<` or `>`. On Windows, where `\` separates path
-components, `%` and `^` are refused instead of the backslash. In `bhf auto`
+backslash, `;`, `|`, `<` or `>`. On Windows, where `\` separates path
+components, `%` is refused instead of the backslash, and `^` is quoted like
+`&`. In `bhf auto`
 such a target's outcome is `unsafe_build_path` (counted as
 `summary.unsafe_build_path` in `run.json`, and filed as an `unsafe-build-path`
 row in `bug-report.md`): rename or move the path; `--force` cannot help.

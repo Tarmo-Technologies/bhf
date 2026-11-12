@@ -1479,6 +1479,7 @@ impl<'a> Runner<'a> {
         command.env_remove("BHF_RUNTRACE_LOG");
         // The runtrace shim is a host library: it cannot load into a
         // harness that runs under an emulator.
+        let mut armed_log = None;
         if baseline && self.emulator.is_none() {
             if let Some(log) = &self.replay.runtrace_log {
                 // A log from an earlier capture would not describe this run.
@@ -1490,7 +1491,7 @@ impl<'a> Runner<'a> {
                             crate::auto::shim_path::ld_preload_value(&shim),
                         )
                         .env("BHF_RUNTRACE_LOG", log);
-                    self.shim_armed = true;
+                    armed_log = Some(log.clone());
                 }
             }
         }
@@ -1522,6 +1523,11 @@ impl<'a> Runner<'a> {
             }
         }
         let _ = std::fs::remove_file(&input_path);
+        // The shim creates its log when it loads: no log, no shim, whatever
+        // LD_PRELOAD said.
+        if armed_log.is_some_and(|log| log.is_file()) {
+            self.shim_armed = true;
+        }
         let bytes = std::fs::read(&evidence).map_err(|_| {
             "the harness wrote no comparison evidence (its driver does not record \
              comparisons, or it exited before its driver started)"
