@@ -22,9 +22,12 @@ pub struct MinimizeArgs {
     #[arg(long, value_name = "ID_OR_DIR")]
     pub finding: Option<PathBuf>,
 
-    /// Harness binary path. Required for minimizing a crash/opaque-input finding;
-    /// omitted for a session finding (HDF-7), which minimizes by re-driving the
-    /// recorded multi-message session rather than re-running a harness binary.
+    /// Harness binary path. Optional: when omitted it is resolved from the
+    /// finding's recorded `fixture_path` or `harness_id` the way `bhf replay`
+    /// resolves it (`<work>/{harnesses,auto,generated_harnesses,build}/<harness_id>/main`).
+    /// Not used for a session finding (HDF-7), which minimizes by re-driving
+    /// the recorded multi-message session rather than re-running a harness
+    /// binary.
     #[arg(long)]
     pub harness: Option<PathBuf>,
 
@@ -316,9 +319,14 @@ fn run_inner(args: MinimizeArgs) -> anyhow::Result<MinimizeSummary> {
              recorded transport). On-target minimization is a tracked follow-up."
         ));
     }
-    let harness = args.harness.ok_or_else(|| {
-        anyhow!("minimize requires --harness <path> for a crash/opaque-input finding")
-    })?;
+    let explicit = args.harness.is_some();
+    let harness = finding_harness(&finding_dir, args.harness)?;
+    if !explicit {
+        bhfeprintln!(
+            "bhf: minimizing against the finding's harness {}",
+            harness.display()
+        );
+    }
     // A testcase recorded against another harness input format decodes into
     // other argument values here, and may not reproduce at all.
     if let Some(note) = std::fs::read(finding_dir.join("finding.json"))
@@ -387,6 +395,17 @@ fn run_inner(args: MinimizeArgs) -> anyhow::Result<MinimizeSummary> {
         removed_bytes: result.original_len.saturating_sub(result.minimized.len()),
         reduced: result.reduced,
     })
+}
+
+/// The harness to minimize against: `explicit` (`--harness`), else the one
+/// the finding records, resolved in its work dir the way `bhf replay` does
+/// (`fixture_path`, then `harness_id` under `harnesses/`, `auto/`,
+/// `generated_harnesses/` and `build/`).
+fn finding_harness(finding_dir: &Path, explicit: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    match explicit {
+        Some(harness) => Ok(harness),
+        None => crate::replay::recorded_harness(finding_dir).map_err(|error| anyhow!(error)),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -472,6 +491,34 @@ fn update_finding_record(finding_dir: &Path, result: &MinimizeOutput) -> anyhow:
     fs::write(&path, serde_json::to_vec_pretty(&value)?)
         .with_context(|| format!("write {}", path.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod harness_tests {
+    /// Without `--harness`, minimize resolves the finding's harness the way
+    /// replay does, including a binary `bhf build` staged into
+    /// `build/<id>/main`.
+    #[test]
+    fn the_harness_is_resolved_from_the_finding() {
+        let work = tempfile::tempdir().unwrap();
+        let finding = work.path().join("results/findings/F-0001-aaaaaaaa");
+        std::fs::create_dir_all(&finding).unwrap();
+        std::fs::write(finding.join("finding.json"), r#"{"harness_id":"H-1"}"#).unwrap();
+        let staged = work.path().join("build/H-1/main");
+        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        std::fs::write(&staged, b"\x7fELF").unwrap();
+        assert_eq!(super::finding_harness(&finding, None).unwrap(), staged);
+        let explicit = work.path().join("elsewhere/main");
+        assert_eq!(
+            super::finding_harness(&finding, Some(explicit.clone())).unwrap(),
+            explicit
+        );
+        std::fs::remove_file(&staged).unwrap();
+        let error = super::finding_harness(&finding, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--harness"), "{error}");
+    }
 }
 
 #[cfg(all(test, unix))]

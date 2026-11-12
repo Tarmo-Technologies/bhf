@@ -60,6 +60,11 @@
   and could exceed its buffer, and two buffers got the same bytes.
   `arg-layout.json` gives each slice a sized `remainder` step, so
   `bhf decode-args --static` decodes these calls exactly.
+- `bhf minimize` no longer requires `--harness`: without it, it minimizes
+  against the finding's own harness, resolved in its work dir the way
+  `bhf replay` resolves it (`fixture_path`, then `harness_id`, including a
+  binary `bhf build` staged into `build/<id>/main`), and prints the path it
+  used, as the custom-harness and CLI guides already said.
 - `bhf replay --show-args`, `bhf decode-args` and the argument trace a new
   finding records say that a passthrough harness (one that hands the input
   straight to the project's `LLVMFuzzerTestOneInput`) decodes no parameters,

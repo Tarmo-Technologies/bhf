@@ -322,6 +322,25 @@ mod linux {
         let finding_dir = fuzz_to_finding(&work, id, &seed);
         replay_matches(&finding_dir, &harnesses.join(id).join("main"));
 
+        // `--harness` is optional for minimize too: it runs the finding's own
+        // harness, resolved in the work dir, and says which one.
+        let minimized = bhf(
+            &args(&[&"minimize", &"--finding", &finding_dir]),
+            &[],
+            Duration::from_secs(300),
+        );
+        assert!(minimized.status.success(), "{}", text(&minimized));
+        let minimized_text = text(&minimized);
+        assert!(
+            String::from_utf8_lossy(&minimized.stdout).contains("MINIMIZED "),
+            "{minimized_text}"
+        );
+        assert!(
+            minimized_text.contains(&format!("{id}/main")),
+            "the resolved harness is named: {minimized_text}"
+        );
+        assert!(finding_dir.join("min_testcase.bin").is_file());
+
         // With a second harness in the work dir, a bare `bhf build` reports the
         // real lookup problem and lists both ids.
         let second = bhf(
