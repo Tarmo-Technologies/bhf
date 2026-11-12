@@ -153,6 +153,12 @@
   no longer turns a UBSan finding into a frameless report and `exit status: 0`.
   The script exits with the harness's status, 128 plus the signal for a
   harness killed by one.
+- The migration docs no longer say a 0.2.x work dir's `results/` is rebuilt by
+  whichever command opens it first: a command that only reads (`bhf explain`,
+  `bhf capsule`) migrates the layout without rebuilding `results/`, which
+  `bhf report` or the next `bhf auto` does. `bhf explain`'s migration message
+  now ends with the `bhf report --work-dir <W>` command to run, the work dir
+  quoted for a shell when it needs it.
 - The `reproduce: bhf replay --finding <dir>` line of `bhf auto`'s top-findings
   summary quotes a finding dir whose path has a space, so it pastes as one
   argument.

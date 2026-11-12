@@ -7,11 +7,31 @@ use std::path::{Path, PathBuf};
 /// Migrate a legacy (<= 0.2.x) work dir into the results layout, saying what
 /// changed. A missing work dir is fine (the command creates it).
 pub fn prepare(work_dir: &Path) -> anyhow::Result<()> {
+    prepare_with(work_dir, true)
+}
+
+/// [`prepare`] for a command that only reads the work dir (`bhf explain`): it
+/// migrates a legacy layout but does not rebuild `results/`, and its migration
+/// message ends by naming the command that does.
+pub fn prepare_read_only(work_dir: &Path) -> anyhow::Result<()> {
+    prepare_with(work_dir, false)
+}
+
+fn prepare_with(work_dir: &Path, rebuilds_results: bool) -> anyhow::Result<()> {
     if !work_dir.exists() {
         return Ok(());
     }
     if let Some(report) = results::migrate::migrate_legacy_report(work_dir)? {
-        for line in migration_lines(work_dir, &report) {
+        let mut lines = migration_lines(work_dir, &report);
+        if !rebuilds_results {
+            // The command comes last, quoted for a shell, so it can be pasted.
+            lines.push(format!(
+                "bhf:   this command does not rebuild results/; to rebuild it, run: bhf report \
+                 --work-dir {}",
+                crate::repro_lane::sh_word(&work_dir.to_string_lossy())
+            ));
+        }
+        for line in lines {
             crate::bhfeprintln!("{line}");
         }
     }

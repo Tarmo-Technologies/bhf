@@ -223,11 +223,14 @@ reading the old layout directly:
   to `auto/run.json` `targets[]`; `--static-dynamic` is a no-op.
 - `runtime_mode` is not written anywhere in the new contract.
 - An old-layout work dir (`<work>/findings/` at the top) is migrated
-  automatically — `findings/` is renamed to `results/findings/`, the legacy
-  index files and reproducer scripts are kept under `results/legacy/`, and
-  `results/` is rebuilt — the first time any command opens it, including
-  commands that only read (`explain`, `report`). The command prints what it
-  moved and kept. `replay`, `minimize`, `capsule`, and `--resume` keep working
+  automatically the first time any command opens it, including commands that
+  only read (`explain`, `capsule`): `findings/` is renamed to
+  `results/findings/` and the legacy index files and reproducer scripts are
+  kept under `results/legacy/`. The command prints what it moved and kept.
+  A read-only command does not rebuild `results/`; `bhf report` or the next
+  `bhf auto` (or any other command that records findings) does, and `bhf
+  explain`'s migration message ends with the `bhf report --work-dir <W>`
+  command to run. `replay`, `minimize`, `capsule`, and `--resume` keep working
   against a migrated work dir. See
   [Upgrading a 0.2.x work dir](#upgrading-a-02x-work-dir).
 - Tools that read `bhf_work/findings.csv` or `bhf_work/findings/` directly

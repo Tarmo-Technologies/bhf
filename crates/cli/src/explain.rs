@@ -58,7 +58,7 @@ pub struct ExplainArgs {
 }
 
 pub fn run(args: ExplainArgs) -> i32 {
-    if let Err(error) = crate::workdir::prepare(&args.work_dir) {
+    if let Err(error) = crate::workdir::prepare_read_only(&args.work_dir) {
         bhfeprintln!("error: {error:#}");
         return 1;
     }

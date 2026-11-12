@@ -128,6 +128,39 @@ fn migration_keeps_legacy_reports_and_says_what_changed() {
     assert!(work
         .join("results/findings/F-0001-aaaaaaaa/finding.json")
         .is_file());
+    assert!(
+        !stderr.contains("does not rebuild results/"),
+        "report rebuilds results/ itself:\n{stderr}"
+    );
+}
+
+/// A command that only reads (`bhf explain`) migrates the work dir but does
+/// not rebuild `results/`, and says which command does, as a command that
+/// can be pasted into a shell even when the work dir's path has a space.
+#[test]
+fn a_read_only_command_migrates_and_says_how_to_rebuild_results() {
+    let root = tempfile::tempdir().unwrap();
+    let work = legacy_work_dir(&root.path().join("my runs"));
+    let out = bhf(&["explain", "--work-dir", work.to_str().unwrap()]);
+    let stderr = text(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("migrated legacy work dir"), "{stderr}");
+    let hint = format!(
+        "to rebuild it, run: bhf report --work-dir '{}'",
+        work.display()
+    );
+    let last = stderr
+        .lines()
+        .rfind(|line| line.starts_with("bhf:"))
+        .unwrap_or_default();
+    assert!(
+        last.ends_with(&hint),
+        "the migration message ends with {hint:?}:\n{stderr}"
+    );
+    assert!(
+        !work.join("results/findings.json").exists(),
+        "explain rebuilt nothing"
+    );
 }
 
 /// `bhf auto` on a migrated work dir keeps the old corpus but does not reseed
