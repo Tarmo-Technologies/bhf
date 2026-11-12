@@ -346,6 +346,16 @@ fn run_inner(args: MinimizeArgs) -> anyhow::Result<MinimizeSummary> {
     let harness = args.harness.ok_or_else(|| {
         anyhow!("minimize requires --harness <path> for a crash/opaque-input finding")
     })?;
+    // A testcase recorded against another harness input format decodes into
+    // other argument values here, and may not reproduce at all.
+    if let Some(note) = std::fs::read(finding_dir.join("finding.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .zip(harness.parent())
+        .and_then(|(raw, dir)| crate::generate_harness::finding_format_note(&raw, dir))
+    {
+        bhfeprintln!("note: {note}");
+    }
     if crate::binary_fuzz::is_binary_finding(&finding_dir) {
         let result =
             crate::binary_fuzz::minimize_binary_finding(&finding_dir, &harness, args.strategy)?;

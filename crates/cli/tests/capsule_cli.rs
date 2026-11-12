@@ -401,6 +401,31 @@ fn cpp_finding_capsule_round_trips_through_verify_poc_offline() {
     }
     let (pass, verify) = verify_from_scratch(&cap, "cpp");
     assert!(pass, "verify-poc should PASS offline; got:\n{verify}");
+
+    // The manifest records the harness's input format and the finding's, and
+    // a finding recorded against another format is flagged.
+    assert_eq!(manifest["harness_format_version"], 3, "{manifest}");
+    assert_eq!(manifest["finding_harness_format_version"], 3, "{manifest}");
+    assert!(manifest.get("harness_format_note").is_none(), "{manifest}");
+    let record_path = finding_dir.join("finding.json");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+    record["harness_format_version"] = serde_json::json!(2);
+    std::fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+    let packaged = capsule_for(&work, &id);
+    let stderr = String::from_utf8_lossy(&packaged.stderr);
+    assert!(
+        stderr.contains("recorded against harness input format 2"),
+        "the format difference must be flagged:\n{stderr}"
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(cap.join("manifest.json")).unwrap()).unwrap();
+    assert!(
+        manifest["harness_format_note"]
+            .as_str()
+            .is_some_and(|note| note.contains("decodes format 3")),
+        "{manifest}"
+    );
 }
 
 const DEFS_H: &str = "#define RECORD_CAP 4\n";

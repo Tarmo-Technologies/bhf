@@ -406,6 +406,10 @@ pub(crate) fn harness_source_context(
 ) -> Result<tera::Context, HarnessGenError> {
     let mut context = tera::Context::from_serialize(context)?;
     context.insert("harness_format_version", &crate::HARNESS_FORMAT_VERSION);
+    context.insert(
+        "buffer_len_dimension",
+        &crate::buffer_len_dimension_enabled(),
+    );
     Ok(context)
 }
 
@@ -1381,6 +1385,9 @@ pub(crate) fn c_trace_plan(
             role: crate::arg_trace::Role::Param,
             index_base,
             registry: Some(registry),
+            defer_input: false,
+            fresh_cursor: true,
+            sized_buffers: crate::buffer_len_dimension_enabled(),
         },
         emissions,
         &declared,
@@ -5076,8 +5083,47 @@ fn declared_lifecycle_params(step: &CLifecycleStep) -> Vec<crate::arg_trace::Dec
 /// statements (see [`crate::arg_trace`]). Runs once the context is complete,
 /// after every rewrite of the steps' decls and arguments.
 fn apply_sequence_traces(context: &mut CSequenceTemplateContext, registry: &TypeRegistry) {
+    // A call that runs once, before any other call read the cursor, keeps
+    // whole-input parameters as written when it reads no cursor bytes itself
+    // (see `Group::fresh_cursor`). Every other call (an operation, a call in
+    // a loop, the teardown) gives them the argument bytes the cursor left,
+    // never the control tail.
+    let reads_cursor = |step: &CSequenceStepEmission| crate::arg_trace::reads_cursor(&step.params);
+    let mut setup_read = context.init_step.as_ref().is_some_and(reads_cursor);
+    let configure_fresh: Vec<bool> = context
+        .configure_steps
+        .iter()
+        .map(|step| {
+            let fresh = !setup_read;
+            setup_read |= reads_cursor(step);
+            fresh
+        })
+        .collect();
+    let mut protocol_read = setup_read;
+    let mut once_fresh = |step: &CSequenceStepEmission| {
+        let fresh = !protocol_read;
+        protocol_read |= reads_cursor(step);
+        fresh
+    };
+    let protocol_fresh: Vec<bool> = context
+        .mined_protocol_steps
+        .iter()
+        .map(&mut once_fresh)
+        .collect();
+    let object_fresh: Vec<(bool, Vec<bool>, bool)> = context
+        .mined_protocol_objects
+        .iter()
+        .map(|object| {
+            (
+                once_fresh(&object.constructor),
+                object.protocol_steps.iter().map(&mut once_fresh).collect(),
+                object.end_step.as_ref().is_some_and(&mut once_fresh),
+            )
+        })
+        .collect();
+
     let mut counter = 0usize;
-    let mut visit = |step: &mut CSequenceStepEmission| {
+    let mut visit = |step: &mut CSequenceStepEmission, fresh: bool| {
         let prefix = format!("q{counter}_");
         counter += 1;
         let plan = crate::arg_trace::plan(
@@ -5089,6 +5135,9 @@ fn apply_sequence_traces(context: &mut CSequenceTemplateContext, registry: &Type
                 // The live handle is the call's first argument.
                 index_base: usize::from(!step.receiver.is_empty()),
                 registry: Some(registry),
+                defer_input: false,
+                fresh_cursor: fresh,
+                sized_buffers: crate::buffer_len_dimension_enabled(),
             },
             &step.params,
             &step.declared,
@@ -5097,38 +5146,41 @@ fn apply_sequence_traces(context: &mut CSequenceTemplateContext, registry: &Type
         step.after = plan.after;
     };
     if let Some(step) = context.init_step.as_mut() {
-        visit(step);
+        visit(step, true);
     }
-    for step in context
-        .op_steps
-        .iter_mut()
-        .chain(context.configure_steps.iter_mut())
-        .chain(context.mined_protocol_steps.iter_mut())
+    for step in context.op_steps.iter_mut() {
+        visit(step, false);
+    }
+    for (step, fresh) in context.configure_steps.iter_mut().zip(configure_fresh) {
+        visit(step, fresh);
+    }
+    for (step, fresh) in context.mined_protocol_steps.iter_mut().zip(protocol_fresh) {
+        visit(step, fresh);
+    }
+    for (object, (constructor, steps, end)) in
+        context.mined_protocol_objects.iter_mut().zip(object_fresh)
     {
-        visit(step);
-    }
-    for object in &mut context.mined_protocol_objects {
-        visit(&mut object.constructor);
-        for step in &mut object.protocol_steps {
-            visit(step);
+        visit(&mut object.constructor, constructor);
+        for (step, fresh) in object.protocol_steps.iter_mut().zip(steps) {
+            visit(step, fresh);
         }
         if let Some(step) = object.end_step.as_mut() {
-            visit(step);
+            visit(step, end);
         }
     }
     if let Some(pump) = context.expert_stream_pump.as_mut() {
-        visit(&mut pump.open_step);
-        visit(&mut pump.header_step);
-        visit(&mut pump.data_step);
+        visit(&mut pump.open_step, !setup_read);
+        visit(&mut pump.header_step, false);
+        visit(&mut pump.data_step, false);
         if let Some(step) = pump.skip_step.as_mut() {
-            visit(step);
+            visit(step, false);
         }
     }
     if let Some(drain) = context.expert_output_drain.as_mut() {
-        visit(&mut drain.target_step);
+        visit(&mut drain.target_step, false);
     }
     if let Some(step) = context.end_step.as_mut() {
-        visit(step);
+        visit(step, false);
     }
 }
 
@@ -5899,6 +5951,17 @@ mod tests {
     /// Build a direct C harness for `name(params)` defined in `source`, or
     /// `None` (skipping) when clang or make is missing.
     fn build_c_harness(name: &str, params: &[(&str, &str)], source: &str) -> Option<PathBuf> {
+        build_c_harness_in(name, params, source, None)
+    }
+
+    /// [`build_c_harness`], with the target's types and prototype in a header
+    /// (`widget.h`) the harness includes and reads type definitions from.
+    fn build_c_harness_in(
+        name: &str,
+        params: &[(&str, &str)],
+        source: &str,
+        header: Option<&str>,
+    ) -> Option<PathBuf> {
         let tools = ["make", "clang"].iter().all(|tool| {
             Command::new(tool)
                 .arg("--version")
@@ -5925,6 +5988,13 @@ mod tests {
             .join("../../c_runtime")
             .canonicalize()
             .expect("c_runtime dir");
+        if let Some(header) = header {
+            fs::write(out.join("widget.h"), header).unwrap();
+            args.target_includes = vec!["widget.h".to_owned()];
+            args.target_includes_dirs = vec![out.clone()];
+            args.target_declared_in_header = true;
+            args.type_defs = vec![c_parser::parse_c_type_defs(header).unwrap()];
+        }
         generate_c_direct_harness(args).unwrap();
         let build = Command::new("make")
             .arg("main")
@@ -5933,9 +6003,10 @@ mod tests {
             .expect("run make");
         assert!(
             build.status.success(),
-            "make main failed:\n{}\n{}",
+            "make main failed:\n{}\n{}\n{}",
             String::from_utf8_lossy(&build.stdout),
-            String::from_utf8_lossy(&build.stderr)
+            String::from_utf8_lossy(&build.stderr),
+            fs::read_to_string(out.join("main.c")).unwrap_or_default()
         );
         Some(out)
     }
@@ -6025,10 +6096,12 @@ mod tests {
         assert_eq!(data["i"], 0);
         assert_eq!(data["role"], "param");
         assert_eq!(data["type"], "const unsigned char *");
-        assert_eq!(data["span"], serde_json::json!([0, 13]));
-        assert_eq!(data["len"], 13);
-        assert_eq!(data["alloc_size"], 14);
-        assert_eq!(data["preview_hex"], "40e201002a0000000300414243");
+        // The whole-input buffer takes what the other parameters left: here,
+        // nothing, so it is the 8-byte zeroed floor allocation.
+        assert_eq!(data["span"], serde_json::json!([13, 13]));
+        assert_eq!(data["len"], 0);
+        assert_eq!(data["alloc_size"], 8);
+        assert_eq!(data["preview_hex"], "");
         assert!(data["ptr"].as_str().unwrap().starts_with("0x"));
 
         let bit_index = traced(&args, "bit_index", None);
@@ -6071,14 +6144,93 @@ mod tests {
             return;
         };
         assert_compiles_warning_free(&out);
-        let args = traced_args(&out, &[7, 0, 0, 0, 9], Some("1"));
-        let buf = traced(&args, "buf", None);
-        assert_eq!(buf["len"], 5);
-        assert_eq!(buf["preview_hex"], "0700000009");
-        assert_eq!(traced(&args, "len", None)["value"], "5");
+        // The scalar takes the first bytes, and the (buffer, length) pair the
+        // bytes after them: no input byte is both.
+        let args = traced_args(&out, &[7, 0, 0, 0, 9, 8], Some("1"));
         let bias = traced(&args, "bias", None);
         assert_eq!(bias["value"], "7");
         assert_eq!(bias["span"], serde_json::json!([0, 4]));
+        let buf = traced(&args, "buf", None);
+        assert_eq!(buf["span"], serde_json::json!([4, 6]));
+        assert_eq!(buf["len"], 2);
+        assert_eq!(buf["preview_hex"], "0908");
+        assert_eq!(traced(&args, "len", None)["value"], "2");
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// A lone byte pointer (no length partner) gets the bytes left after the
+    /// scalars decoded with it, never their bytes again.
+    #[test]
+    fn built_c_harness_gives_a_lone_buffer_the_bytes_after_the_scalars() {
+        let Some(out) = build_c_harness(
+            "widget_bits",
+            &[
+                ("data", "const uint8_t *"),
+                ("bit_index", "uint32_t"),
+                ("width", "uint32_t"),
+            ],
+            "#include <stdint.h>\n\
+             int widget_bits(const uint8_t *data, uint32_t bit_index, uint32_t width) {\n\
+             \x20   return data[0] + (int)(bit_index & width);\n\
+             }\n",
+        ) else {
+            return;
+        };
+        assert_compiles_warning_free(&out);
+        let input = [1, 0, 0, 0, 2, 0, 0, 0, 0xaa, 0xbb, 0xcc];
+        let args = traced_args(&out, &input, Some("1"));
+        assert_eq!(traced(&args, "bit_index", None)["value"], "1");
+        assert_eq!(
+            traced(&args, "bit_index", None)["span"],
+            serde_json::json!([0, 4])
+        );
+        assert_eq!(traced(&args, "width", None)["value"], "2");
+        assert_eq!(
+            traced(&args, "width", None)["span"],
+            serde_json::json!([4, 8])
+        );
+        let data = traced(&args, "data", None);
+        assert_eq!(data["span"], serde_json::json!([8, 11]));
+        assert_eq!(data["len"], 3);
+        assert_eq!(data["alloc_size"], 8);
+        assert_eq!(data["preview_hex"], "aabbcc");
+        // Flipping a scalar's byte no longer changes the buffer, and back.
+        let mut flipped = input;
+        flipped[0] ^= 0xff;
+        let args = traced_args(&out, &flipped, Some("1"));
+        assert_eq!(traced(&args, "data", None)["preview_hex"], "aabbcc");
+        assert_eq!(traced(&args, "bit_index", None)["value"], "254");
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// With the opt-in buffer-length dimension, a buffer without a length
+    /// parameter takes a 4-byte length after the scalars, then that many bytes.
+    #[test]
+    fn built_c_harness_with_the_length_dimension_sizes_a_lone_buffer_from_the_input() {
+        let _dimension = crate::scoped_buffer_len_dimension(true);
+        let Some(out) = build_c_harness(
+            "widget_sized",
+            &[("data", "const uint8_t *"), ("bit_index", "uint32_t")],
+            "#include <stdint.h>\n\
+             int widget_sized(const uint8_t *data, uint32_t bit_index) {\n\
+             \x20   return data[0] + (int)bit_index;\n\
+             }\n",
+        ) else {
+            return;
+        };
+        let main = fs::read_to_string(out.join("main.c")).unwrap();
+        assert!(
+            main.contains("with an explicit buffer length"),
+            "the source names its layout"
+        );
+        assert_compiles_warning_free(&out);
+        let input = [9, 0, 0, 0, 2, 0, 0, 0, 0xaa, 0xbb, 0xcc];
+        let args = traced_args(&out, &input, Some("1"));
+        assert_eq!(traced(&args, "bit_index", None)["value"], "9");
+        let data = traced(&args, "data", None);
+        assert_eq!(data["span"], serde_json::json!([8, 10]));
+        assert_eq!(data["len"], 2);
+        assert_eq!(data["preview_hex"], "aabb");
         fs::remove_dir_all(&out).ok();
     }
 
@@ -6103,6 +6255,96 @@ mod tests {
             serde_json::json!([0, 3])
         );
         assert_eq!(traced(&args, "len", None)["value"], "3");
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// A `(length pointer, output buffer)` pair after a cursor scalar: the
+    /// length's decl declares the buffer too, so the buffer (which has no decl
+    /// of its own) is decoded and traced after it, and the harness builds.
+    #[test]
+    fn built_c_harness_traces_a_reverse_output_pair_after_a_scalar() {
+        let Some(out) = build_c_harness(
+            "widget_decode",
+            &[
+                ("level", "int"),
+                ("out_len", "size_t *"),
+                ("out", "unsigned char *"),
+            ],
+            "#include <stddef.h>\n\
+             int widget_decode(int level, size_t *out_len, unsigned char *out) {\n\
+             \x20   if (*out_len) out[0] = (unsigned char)level;\n\
+             \x20   *out_len = 1;\n\
+             \x20   return level;\n\
+             }\n",
+        ) else {
+            return;
+        };
+        assert_compiles_warning_free(&out);
+        let args = traced_args(&out, &[4, 0, 0, 0, 0xaa], Some("1"));
+        let level = traced(&args, "level", None);
+        assert_eq!(level["value"], "4");
+        assert_eq!(level["span"], serde_json::json!([0, 4]));
+        assert!(traced(&args, "out", None)["ptr"]
+            .as_str()
+            .unwrap()
+            .starts_with("0x"));
+        assert_eq!(traced(&args, "out_len", Some("after"))["value"], "1");
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// A struct whose fields are named like the harness's `Data` and `Size`
+    /// is decoded from the cursor like any other struct: its field accesses
+    /// are not the whole input, and the harness builds.
+    #[test]
+    fn built_c_harness_decodes_a_struct_with_fields_named_like_the_input() {
+        let header =
+            "typedef struct widget_hdr { unsigned int Size; unsigned int Data; } widget_hdr;\n\
+                      int widget_check(const widget_hdr *hdr, int level);\n";
+        let Some(out) = build_c_harness_in(
+            "widget_check",
+            &[("hdr", "const widget_hdr *"), ("level", "int")],
+            "#include \"widget.h\"\n\
+             int widget_check(const widget_hdr *hdr, int level) {\n\
+             \x20   return (int)(hdr->Size + hdr->Data) + level;\n\
+             }\n",
+            Some(header),
+        ) else {
+            return;
+        };
+        assert_compiles_warning_free(&out);
+        let input = [1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0];
+        let args = traced_args(&out, &input, Some("1"));
+        assert_eq!(
+            traced(&args, "hdr", None)["span"],
+            serde_json::json!([0, 8])
+        );
+        let level = traced(&args, "level", None);
+        assert_eq!(level["value"], "3");
+        assert_eq!(level["span"], serde_json::json!([8, 12]));
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// A one-letter buffer name that begins other identifiers in its own decl
+    /// (`s` and `size_t`) still gives the scalars after it their own bytes.
+    #[test]
+    fn built_c_harness_keeps_a_short_buffer_name_apart_from_the_scalars() {
+        let Some(out) = build_c_harness(
+            "widget_sum",
+            &[("s", "const unsigned char *"), ("stride", "size_t")],
+            "#include <stddef.h>\n\
+             int widget_sum(const unsigned char *s, size_t stride) {\n\
+             \x20   return s[0] + (int)stride;\n\
+             }\n",
+        ) else {
+            return;
+        };
+        let args = traced_args(&out, &[5, 0, 0, 0, 0, 0, 0, 0, 0xaa, 0xbb], Some("1"));
+        let stride = traced(&args, "stride", None);
+        assert_eq!(stride["value"], "5");
+        assert_eq!(stride["span"], serde_json::json!([0, 8]));
+        let s = traced(&args, "s", None);
+        assert_eq!(s["span"], serde_json::json!([8, 10]));
+        assert_eq!(s["preview_hex"], "aabb");
         fs::remove_dir_all(&out).ok();
     }
 
@@ -6206,6 +6448,168 @@ mod tests {
         assert_eq!(value["i"], 1);
         assert_eq!(value["value"], "7");
         assert_eq!(value["span"], serde_json::json!([0, 4]));
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// Generate and `make main` a sequence harness over a `widget_t` handle
+    /// whose operations are `ops` (name, then the parameters after the
+    /// handle), declared in `header` and defined in `source`. Returns the
+    /// harness directory and its control-tail length, or `None` (skipping)
+    /// when clang or make is missing.
+    fn build_widget_sequence_harness(
+        name: &str,
+        header: &str,
+        source: &str,
+        ops: &[(&str, &[(&str, &str)])],
+    ) -> Option<(PathBuf, usize)> {
+        let tools = ["make", "clang"].iter().all(|tool| {
+            Command::new(tool)
+                .arg("--version")
+                .output()
+                .is_ok_and(|o| o.status.success())
+        });
+        if !tools {
+            eprintln!("skipping {name} build: clang/make unavailable");
+            return None;
+        }
+        let out = temp_dir(name);
+        fs::write(out.join("widget.h"), header).unwrap();
+        fs::write(out.join("widget.c"), source).unwrap();
+        let step = |name: &str, params: Vec<CParameter>| CLifecycleStep {
+            name: name.to_owned(),
+            params,
+            return_type: "int".to_owned(),
+            role: CStepRole::Operation,
+        };
+        let op_steps = ops
+            .iter()
+            .map(|(op, params)| {
+                let params = params
+                    .iter()
+                    .map(|(name, c_type)| CParameter {
+                        name: (*name).to_owned(),
+                        c_type: (*c_type).to_owned(),
+                    })
+                    .collect();
+                step(op, params)
+            })
+            .collect();
+        let args = GenerateCSequenceArgs {
+            decoder_limits: Default::default(),
+            harness_id: format!("H-{name}"),
+            output_dir: out.clone(),
+            source_path: out.join("widget.c"),
+            target: cfunction(ops[0].0),
+            handle_type: "widget_t".to_owned(),
+            handle_param_type: "widget_t *".to_owned(),
+            init_returns_handle: false,
+            init_out_handle_argument: None,
+            init_success_nonzero: false,
+            handle_field_initializers: Vec::new(),
+            output_drain_protocol: None,
+            init_step: Some(step("widget_open", Vec::new())),
+            op_steps,
+            protocol_steps: Vec::new(),
+            protocol_objects: Vec::new(),
+            receiver_configuration_names: Vec::new(),
+            callback_action: None,
+            end_step: Some(step("widget_close", Vec::new())),
+            target_includes: vec!["widget.h".to_owned()],
+            target_includes_dirs: vec![out.clone()],
+            target_sources: vec![out.join("widget.c")],
+            compile_flags: Vec::new(),
+            target_declared_in_header: true,
+            c_runtime_include: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../c_runtime")
+                .canonicalize()
+                .expect("c_runtime dir"),
+            type_defs: vec![c_parser::parse_c_type_defs(header).unwrap()],
+        };
+        generate_c_sequence_harness(args).unwrap();
+        let build = Command::new("make")
+            .arg("main")
+            .current_dir(&out)
+            .output()
+            .expect("run make");
+        assert!(
+            build.status.success(),
+            "make main failed:\n{}\n{}\n{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr),
+            fs::read_to_string(out.join("main.c")).unwrap_or_default()
+        );
+        let layout: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(out.join(SEQUENCE_LAYOUT_FILE)).unwrap())
+                .unwrap();
+        let control_len = layout["control_len"].as_u64().unwrap() as usize;
+        Some((out, control_len))
+    }
+
+    /// In a sequence harness, an operation whose parameters all use the input
+    /// takes the argument bytes the earlier operations left, never the
+    /// control tail, and an operation with a `(length pointer, output
+    /// buffer)` pair after a scalar builds.
+    #[test]
+    fn built_sequence_harness_gives_whole_input_operations_the_argument_bytes_left() {
+        let header = "#include <stddef.h>\n\
+                      typedef struct widget_t { int total; } widget_t;\n\
+                      int widget_open(widget_t *w);\n\
+                      int widget_push(widget_t *w, int value);\n\
+                      int widget_feed(widget_t *w, const unsigned char *buf, size_t len);\n\
+                      int widget_decode(widget_t *w, int level, size_t *out_len, unsigned char *out);\n\
+                      int widget_close(widget_t *w);\n";
+        let source = "#include \"widget.h\"\n\
+                      int widget_open(widget_t *w) { w->total = 0; return 0; }\n\
+                      int widget_push(widget_t *w, int value) { w->total += value; return 0; }\n\
+                      int widget_feed(widget_t *w, const unsigned char *buf, size_t len) {\n\
+                      \x20   if (len) w->total += buf[0];\n\
+                      \x20   return 0;\n\
+                      }\n\
+                      int widget_decode(widget_t *w, int level, size_t *out_len, unsigned char *out) {\n\
+                      \x20   if (*out_len) out[0] = (unsigned char)(w->total + level);\n\
+                      \x20   return 0;\n\
+                      }\n\
+                      int widget_close(widget_t *w) { w->total = 0; return 0; }\n";
+        let Some((out, control_len)) = build_widget_sequence_harness(
+            "seq-layout",
+            header,
+            source,
+            &[
+                ("widget_push", &[("value", "int")]),
+                (
+                    "widget_feed",
+                    &[("buf", "const unsigned char *"), ("len", "size_t")],
+                ),
+                (
+                    "widget_decode",
+                    &[
+                        ("level", "int"),
+                        ("out_len", "size_t *"),
+                        ("out", "unsigned char *"),
+                    ],
+                ),
+            ],
+        ) else {
+            return;
+        };
+        // Argument bytes (push's value and its slot-use byte, then feed's
+        // bytes), then the program: push (op 0), then feed (op 1).
+        let mut input = vec![7, 0, 0, 0, 0, 0xaa, 0xbb];
+        let mut control = vec![0u8; control_len];
+        control[0] = 2;
+        control[1] = 1;
+        control[6] = 1;
+        control[7] = 1;
+        input.extend_from_slice(&control);
+        let args = traced_args(&out, &input, Some("1"));
+        let value = traced(&args, "value", None);
+        assert_eq!(value["value"], "7");
+        assert_eq!(value["span"], serde_json::json!([0, 5]));
+        let buf = traced(&args, "buf", None);
+        assert_eq!(buf["call"], "widget_feed");
+        assert_eq!(buf["span"], serde_json::json!([5, 7]));
+        assert_eq!(buf["preview_hex"], "aabb");
+        assert_eq!(traced(&args, "len", None)["value"], "2");
         fs::remove_dir_all(&out).ok();
     }
 
@@ -7906,12 +8310,13 @@ mod tests {
         };
 
         let main = fs::read_to_string(&generate_c_direct_harness(args).unwrap().main_c).unwrap();
+        // The bracketed span is the input the cursor left after `key`.
         assert!(
-            main.contains("const char * start = (const char *)Data"),
+            main.contains("const char * start = (const char *)_bhf_rest_p"),
             "the begin pointer must borrow the span, got:\n{main}"
         );
         assert!(
-            main.contains("const char * end = (const char *)Data + Size"),
+            main.contains("const char * end = (const char *)_bhf_rest_p + _bhf_rest_size_p"),
             "the end pointer must be the SAME span's end, got:\n{main}"
         );
         assert!(
@@ -9221,12 +9626,14 @@ mod tests {
         let result = generate_c_direct_harness(args).unwrap();
         let main = fs::read_to_string(&result.main_c).unwrap();
 
+        // The pair borrows the input `crc` did not read, and its length is
+        // the size of that span.
         assert!(
-            main.contains("const mz_uint8 * ptr = (const mz_uint8 *)Data"),
+            main.contains("const mz_uint8 * ptr = (const mz_uint8 *)_bhf_rest_p"),
             "const byte typedef pointer should borrow libFuzzer Data, got:\n{main}",
         );
         assert!(
-            main.contains("size_t buf_len = (size_t)Size"),
+            main.contains("size_t buf_len = (size_t)_bhf_rest_size_p"),
             "typedef byte pointer length should mirror libFuzzer Size, got:\n{main}",
         );
         assert!(

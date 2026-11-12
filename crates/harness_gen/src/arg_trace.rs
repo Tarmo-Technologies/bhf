@@ -13,6 +13,12 @@
 //! parameters also get an after-call statement printing their new value.
 //!
 //! With tracing off the harness pays one cached branch per call.
+//!
+//! The plan also fixes the call's input layout (harness format 3): the
+//! parameters decoded from the cursor take the leading bytes, in parameter
+//! order, and the parameters decoded from the whole input (`Data`/`Size`: a
+//! lone byte buffer, a `(buffer, length)` pair, a `FILE *`, ...) take the bytes
+//! the cursor left, so no input byte feeds two parameters.
 
 use crate::c_decoders::CParamEmission;
 use serde::Serialize;
@@ -53,6 +59,21 @@ pub(crate) struct Group<'a> {
     pub index_base: usize,
     /// The C type registry, to classify typedef'd parameter types.
     pub registry: Option<&'a TypeRegistry>,
+    /// Put the whole-input parameters in [`DecodePlan::late`], for a template
+    /// that decodes other calls' arguments (a C++ receiver's constructor, a
+    /// lifecycle loop) between this call's decode and the call itself.
+    pub defer_input: bool,
+    /// Nothing has read the cursor before this call's parameters, and the
+    /// cursor covers the whole input (`Data`/`Size`): the first call of a
+    /// direct harness. A call with no cursor parameter then keeps its
+    /// whole-input decls as written. Every other call (a C++ receiver's
+    /// constructor or factory, a protocol or lifecycle step, a sequence
+    /// operation) gives its whole-input parameters the bytes the cursor left.
+    pub fresh_cursor: bool,
+    /// Give a buffer with no length parameter an explicit length: 4 more
+    /// cursor bytes, then that many bytes (see `bhf_take_sized`). Off by
+    /// default; see [`crate::buffer_len_dimension_enabled`].
+    pub sized_buffers: bool,
 }
 
 /// A parameter as declared: its sanitized name and spelled type.
@@ -77,6 +98,9 @@ pub(crate) struct DecodePlan {
     /// In order: decls, position captures and before-call trace statements.
     /// Each is rendered as `<statement>;` on its own line.
     pub decode: Vec<String>,
+    /// With [`Group::defer_input`]: the whole-input parameters' statements,
+    /// rendered right before the call.
+    pub late: Vec<String>,
     /// After-call trace statements for output and in-out parameters.
     pub after: Vec<String>,
 }
@@ -102,46 +126,375 @@ pub(crate) fn plan(
         return DecodePlan::default();
     }
     let at = |k: usize| format!("_bhf_at_{}{k}", group.prefix);
+    let rest = format!("_bhf_rest_{}", group.prefix);
+    let rest_size = format!("_bhf_rest_size_{}", group.prefix);
+    let rest_at = format!("_bhf_rest_at_{}", group.prefix);
     let sources: Vec<Source> = emissions
         .iter()
         .map(|emission| source_of(&format!("{} {}", emission.decl, emission.arg)))
         .collect();
+    let mut order = decode_order(emissions);
+    let mut tail_start = order
+        .iter()
+        .position(|&(_, deferred)| deferred)
+        .unwrap_or(order.len());
+    let sized = group.sized_buffers
+        && order[tail_start..]
+            .iter()
+            .any(|&(index, _)| is_lone_input_buffer(emissions, index));
+    // With no cursor parameter in this call, nothing decoded before it and
+    // nothing decoded between the call's decode and the call, the bytes the
+    // cursor left are the whole input: keep the decls as written, in
+    // parameter order.
+    let head_reads_cursor = order[..tail_start]
+        .iter()
+        .any(|&(index, _)| sources[index] == Source::Cursor);
+    if !head_reads_cursor && group.fresh_cursor && !group.defer_input && !sized {
+        order = (0..emissions.len()).map(|index| (index, false)).collect();
+        tail_start = order.len();
+    }
     // A cursor position is captured only where a span uses it: an unused
     // local would fail a project build that adds `-Werror -Wunused`.
-    let mut captured = vec![false; emissions.len() + 1];
-    for (index, source) in sources.iter().enumerate() {
-        if *source == Source::Cursor {
-            captured[index] = true;
-            captured[index + 1] = true;
+    let mut captured = vec![false; order.len() + 1];
+    for (position, &(index, _)) in order.iter().enumerate() {
+        if sources[index] == Source::Cursor {
+            captured[position] = true;
+            captured[position + 1] = true;
         }
     }
     let mut plan = DecodePlan::default();
-    for (index, emission) in emissions.iter().enumerate() {
-        if captured[index] {
-            plan.decode.push(format!("size_t {} = Cur.pos", at(index)));
+    let mut head = Vec::new();
+    let mut tail = Vec::new();
+    let mut spans: Vec<Option<(String, String)>> = vec![None; emissions.len()];
+    for (position, &(index, deferred)) in order.iter().enumerate() {
+        // A capture sits between two decode items; the one where the tail
+        // starts closes the head (it precedes the remaining-input setup).
+        if captured[position] {
+            let list = if position <= tail_start {
+                &mut head
+            } else {
+                &mut tail
+            };
+            list.push(format!("size_t {} = Cur.pos", at(position)));
         }
-        if !emission.decl.trim().is_empty() {
-            plan.decode.push(emission.decl.clone());
+        let statements = if deferred { &mut tail } else { &mut head };
+        if deferred && position == tail_start {
+            // The bytes the cursor has not read: what every whole-input
+            // parameter of this call takes.
+            if sized {
+                statements.push(format!("size_t {rest_size} = 0"));
+                statements.push(format!(
+                    "const uint8_t *{rest} = bhf_take_sized(&Cur, &{rest_size})"
+                ));
+                statements.push(format!("size_t {rest_at} = (size_t)({rest} - Cur.data)"));
+            } else {
+                statements.push(format!("size_t {rest_at} = Cur.pos"));
+                statements.push(format!("const uint8_t *{rest} = Cur.data + Cur.pos"));
+                statements.push(format!("size_t {rest_size} = bhf_remaining(&Cur)"));
+            }
+            statements.push(format!("(void){rest}"));
+            statements.push(format!("(void){rest_size}"));
         }
-    }
-    if captured[emissions.len()] {
-        plan.decode
-            .push(format!("size_t {} = Cur.pos", at(emissions.len())));
-    }
-    for (index, emission) in emissions.iter().enumerate() {
-        let declared = (declared.len() == emissions.len()).then(|| &declared[index]);
-        let span = match sources[index] {
-            Source::Cursor => Some((at(index), at(index + 1))),
+        let decl = if deferred {
+            rewrite_input(&emissions[index].decl, &rest, &rest_size)
+        } else {
+            emissions[index].decl.clone()
+        };
+        if !decl.trim().is_empty() {
+            statements.push(decl);
+        }
+        spans[index] = match sources[index] {
+            Source::Cursor => Some((at(position), at(position + 1))),
+            Source::Input if deferred => {
+                Some((rest_at.clone(), format!("{rest_at} + {rest_size}")))
+            }
             Source::Input => Some(("0".to_owned(), "Size".to_owned())),
             Source::None => None,
         };
-        let traced = trace_param(group, index, emission, declared, span);
-        plan.decode.push(traced.before);
-        if let Some(after) = traced.after {
+    }
+    let last = if tail.is_empty() {
+        &mut head
+    } else {
+        &mut tail
+    };
+    if captured[order.len()] {
+        last.push(format!("size_t {} = Cur.pos", at(order.len())));
+    }
+    for &(index, deferred) in &order {
+        let declared = (declared.len() == emissions.len()).then(|| &declared[index]);
+        let traced = trace_param(
+            group,
+            index,
+            &emissions[index],
+            declared,
+            spans[index].clone(),
+        );
+        let (before, after) = if deferred {
+            (
+                rewrite_input(&traced.before, &rest, &rest_size),
+                traced
+                    .after
+                    .map(|after| rewrite_input(&after, &rest, &rest_size)),
+            )
+        } else {
+            (traced.before, traced.after)
+        };
+        if deferred {
+            tail.push(before);
+        } else {
+            head.push(before);
+        }
+        if let Some(after) = after {
             plan.after.push(after);
         }
     }
+    plan.decode = head;
+    if group.defer_input {
+        plan.late = tail;
+    } else {
+        plan.decode.extend(tail);
+    }
     plan
+}
+
+/// Whether any of a call's decls reads the input cursor.
+pub(crate) fn reads_cursor(emissions: &[CParamEmission]) -> bool {
+    emissions
+        .iter()
+        .any(|emission| source_of(&emission.decl) == Source::Cursor)
+}
+
+/// The order a call's parameters are decoded in, as `(index, deferred)`:
+/// first every parameter that reads the cursor (or nothing), in parameter
+/// order, then the deferred ones, in parameter order. A parameter is deferred
+/// when its decl uses the whole input (`Data`/`Size`) without reading the
+/// cursor, or when its decl or argument names something a deferred decl
+/// declares (the other half of a pair, whose decl may be empty).
+fn decode_order(emissions: &[CParamEmission]) -> Vec<(usize, bool)> {
+    let used: Vec<Vec<&str>> = emissions
+        .iter()
+        .map(|emission| {
+            let mut used = identifiers(&emission.decl);
+            used.extend(identifiers(&emission.arg));
+            used
+        })
+        .collect();
+    let declares: Vec<Vec<&str>> = emissions.iter().map(declared_names).collect();
+    let mut deferred: Vec<bool> = emissions
+        .iter()
+        .map(|emission| source_of(&emission.decl) == Source::Input)
+        .collect();
+    loop {
+        let mut changed = false;
+        for index in 0..emissions.len() {
+            if deferred[index] {
+                continue;
+            }
+            let bound = (0..emissions.len()).any(|other| {
+                other != index
+                    && deferred[other]
+                    && used[index].iter().any(|id| declares[other].contains(id))
+            });
+            if bound {
+                deferred[index] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let head = (0..emissions.len())
+        .filter(|&i| !deferred[i])
+        .map(|i| (i, false));
+    let tail = (0..emissions.len())
+        .filter(|&i| deferred[i])
+        .map(|i| (i, true));
+    head.chain(tail).collect()
+}
+
+/// The names a decl declares where later decls and the call can see them:
+/// the declarator of each top-level statement (`T x = ...`, `T x[n]`,
+/// `T x(...)`, `T x{...}`, `T (*x)(...)`). A name declared inside a block
+/// (`if (p) { size_t n = 0; }`) is out of scope after the decl.
+fn declared_names(emission: &CParamEmission) -> Vec<&str> {
+    top_level_statements(&emission.decl)
+        .into_iter()
+        .filter_map(declarator)
+        .collect()
+}
+
+/// The top-level statements of a decl: split at `;` and after a `}` that
+/// closes a top-level block, outside brackets and literals.
+fn top_level_statements(code: &str) -> Vec<&str> {
+    let bytes = code.as_bytes();
+    let mut statements = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            quote @ (b'"' | b'\'') => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != quote {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    statements.push(&code[start..=i]);
+                    start = i + 1;
+                }
+            }
+            b';' if depth == 0 => {
+                statements.push(&code[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    statements.push(&code[start.min(code.len())..]);
+    statements
+        .into_iter()
+        .map(str::trim)
+        .filter(|statement| !statement.is_empty())
+        .collect()
+}
+
+/// Statement keywords: a statement starting with one declares nothing.
+const STATEMENT_KEYWORDS: &[&str] = &[
+    "if", "else", "for", "while", "do", "switch", "case", "default", "return", "goto", "break",
+    "continue", "delete", "throw", "sizeof", "new", "using", "typedef",
+];
+
+/// The name one statement declares, if it is a declaration.
+fn declarator(statement: &str) -> Option<&str> {
+    let bytes = statement.as_bytes();
+    if !bytes
+        .first()
+        .is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_' || *c == b':')
+    {
+        return None;
+    }
+    let first = identifiers(statement).into_iter().next()?;
+    if STATEMENT_KEYWORDS.contains(&first) {
+        return None;
+    }
+    // The text before the initializer, array bound or argument list.
+    let mut angle = 0usize;
+    let mut stop = bytes.len();
+    for (at, &c) in bytes.iter().enumerate() {
+        match c {
+            b'<' => angle += 1,
+            b'>' if angle > 0 => angle -= 1,
+            b'=' | b'(' | b'[' | b'{' if angle == 0 => {
+                stop = at;
+                break;
+            }
+            _ => {}
+        }
+    }
+    let head = statement[..stop].trim_end();
+    let names: Vec<(usize, &str)> = identifier_spans(head);
+    if names.len() >= 2 {
+        let &(at, name) = names.last().expect("two names");
+        let before = head[..at].trim_end();
+        let declares = before
+            .ends_with(|c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '*' | '&' | '>'))
+            && !before.ends_with("->");
+        return declares.then_some(name);
+    }
+    // `T (*name)(...)`: a function pointer.
+    if names.len() == 1 && bytes.get(stop) == Some(&b'(') {
+        let rest = statement[stop + 1..]
+            .trim_start()
+            .strip_prefix('*')?
+            .trim_start();
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        let name = &rest[..end];
+        let params = rest[end..].trim_start().strip_prefix(')')?.trim_start();
+        if is_identifier(name) && params.starts_with(['(', '[']) {
+            return Some(name);
+        }
+    }
+    None
+}
+
+/// A whole-input parameter no neighbour is bound to: a buffer without a
+/// length parameter. A pair's other half sits next to it and uses the input
+/// size or the buffer's own names.
+fn is_lone_input_buffer(emissions: &[CParamEmission], index: usize) -> bool {
+    let emission = &emissions[index];
+    if !emission.c_type.contains('*') && !emission.c_type.contains('[') {
+        return false;
+    }
+    let names = declared_names(emission);
+    let neighbours = [index.checked_sub(1), Some(index + 1)];
+    !neighbours.into_iter().flatten().any(|other| {
+        emissions.get(other).is_some_and(|other| {
+            identifiers(&format!("{} {}", other.decl, other.arg))
+                .iter()
+                .any(|id| matches!(*id, "Data" | "Size") || names.contains(id))
+        })
+    })
+}
+
+/// `code` with the harness's `Data`/`Size` identifiers renamed to the call's
+/// remaining-input pointer and size (outside string and character literals,
+/// and never a member of that name).
+fn rewrite_input(code: &str, data: &str, size: &str) -> String {
+    let bytes = code.as_bytes();
+    let mut out = String::with_capacity(code.len() + 32);
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'"' || c == b'\'' {
+            let start = i;
+            i += 1;
+            while i < bytes.len() && bytes[i] != c {
+                if bytes[i] == b'\\' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            i = (i + 1).min(bytes.len());
+            out.push_str(&code[start..i]);
+            continue;
+        }
+        if c.is_ascii_alphabetic() || c == b'_' {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            match &code[start..i] {
+                "Data" if !is_member_name(code, start) => out.push_str(data),
+                "Size" if !is_member_name(code, start) => out.push_str(size),
+                word => out.push_str(word),
+            }
+            continue;
+        }
+        if c.is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            out.push_str(&code[start..i]);
+            continue;
+        }
+        let ch = code[i..].chars().next().expect("in bounds");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 /// The statements tracing one parameter.
@@ -354,7 +707,8 @@ fn cpp_value(emission: &CParamEmission, ty: &str) -> ValueTrace {
 }
 
 /// Where a decl takes its bytes from, by the identifiers it uses: the cursor
-/// `Cur`, or the harness's raw `Data`/`Size`.
+/// `Cur`, or the harness's raw `Data`/`Size` (never a member of that name,
+/// such as a struct field `hdr.Size`).
 fn source_of(decl: &str) -> Source {
     let mut cursor = false;
     let mut input = false;
@@ -365,22 +719,50 @@ fn source_of(decl: &str) -> Source {
             _ => {}
         }
     }
-    if input {
-        Source::Input
-    } else if cursor {
+    // A decl that reads the cursor is decoded with the cursor even when it
+    // also names the input: deferring it would read cursor bytes after the
+    // remaining input was handed out.
+    if cursor {
         Source::Cursor
+    } else if input {
+        Source::Input
     } else {
         Source::None
     }
 }
 
-/// The identifiers in a C/C++ fragment, skipping string and character literals.
+/// The identifiers in a C/C++ fragment, skipping string and character
+/// literals and member names (`x.name`, `p->name`, `ns::name`).
 fn identifiers(code: &str) -> Vec<&str> {
+    identifier_spans(code)
+        .into_iter()
+        .filter(|&(at, _)| !is_member_name(code, at))
+        .map(|(_, id)| id)
+        .collect()
+}
+
+/// Every identifier in a C/C++ fragment with its byte offset, skipping
+/// comments, string and character literals and number suffixes.
+fn identifier_spans(code: &str) -> Vec<(usize, &str)> {
     let bytes = code.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
         let c = bytes[i];
+        if bytes[i..].starts_with(b"/*") {
+            i = bytes[i + 2..]
+                .windows(2)
+                .position(|pair| pair == b"*/")
+                .map_or(bytes.len(), |end| i + 2 + end + 2);
+            continue;
+        }
+        if bytes[i..].starts_with(b"//") {
+            i = bytes[i..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(bytes.len(), |end| i + end);
+            continue;
+        }
         if c == b'"' || c == b'\'' {
             let quote = c;
             i += 1;
@@ -398,7 +780,7 @@ fn identifiers(code: &str) -> Vec<&str> {
             while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                 i += 1;
             }
-            out.push(&code[start..i]);
+            out.push((start, &code[start..i]));
             continue;
         }
         if c.is_ascii_digit() {
@@ -410,6 +792,13 @@ fn identifiers(code: &str) -> Vec<&str> {
         i += 1;
     }
     out
+}
+
+/// The identifier at `at` in `code` names a member or a qualified name: it
+/// follows `.`, `->` or `::`.
+fn is_member_name(code: &str, at: usize) -> bool {
+    let before = code[..at].trim_end();
+    before.ends_with('.') || before.ends_with("->") || before.ends_with("::")
 }
 
 /// A short, stable description of how a decl decodes its parameter: the first
@@ -774,6 +1163,9 @@ mod tests {
             role: Role::Param,
             index_base: 0,
             registry: Some(registry),
+            defer_input: false,
+            fresh_cursor: true,
+            sized_buffers: false,
         }
     }
 
@@ -816,28 +1208,61 @@ mod tests {
     }
 
     #[test]
-    fn whole_input_buffers_span_the_input_and_report_their_copied_length() {
+    fn whole_input_buffers_take_the_remaining_input_and_report_their_copied_length() {
         let registry = TypeRegistry::default();
         let decl = "size_t _bhf_cap_data = (size_t)Size + 1; if (_bhf_cap_data < 8) \
                     _bhf_cap_data = 8; const uint8_t * data = (const uint8_t *)malloc(_bhf_cap_data); \
                     if (data) { memset((void *)data, 0, _bhf_cap_data); if (Size) memcpy((void *)data, Data, Size); \
                     ((char *)data)[Size] = '\\0'; }";
-        let plan = plan(
-            &c_group(&registry),
-            &[emission(decl, "data", "const uint8_t *")],
-            &[Declared::new("data", "const byte_t *")],
-        );
-        let trace = plan.decode.last().unwrap();
+        let emissions = [
+            emission(decl, "data", "const uint8_t *"),
+            emission("int k = bhf_i32(&Cur)", "k", "int"),
+        ];
+        let declared = [
+            Declared::new("data", "const byte_t *"),
+            Declared::new("k", "int"),
+        ];
+        let plan = plan(&c_group(&registry), &emissions, &declared);
+        let at = |needle: &str| {
+            plan.decode
+                .iter()
+                .position(|statement| statement.starts_with(needle))
+                .unwrap_or_else(|| panic!("no {needle} in {plan:#?}"))
+        };
+        assert!(at("int k = bhf_i32(&Cur)") < at("size_t _bhf_rest_at_p = Cur.pos"));
+        assert!(at("const uint8_t *_bhf_rest_p = Cur.data + Cur.pos") < at("size_t _bhf_cap_data"));
+        assert!(at("size_t _bhf_rest_size_p = bhf_remaining(&Cur)") < at("size_t _bhf_cap_data"));
+        let copy = &plan.decode[at("size_t _bhf_cap_data")];
         assert!(
-            trace.contains("bhf_tl_span((size_t)(0), (size_t)(Size));"),
+            copy.contains("memcpy((void *)data, _bhf_rest_p, _bhf_rest_size_p)"),
+            "{copy}"
+        );
+        assert!(!copy.contains("Size)"), "{copy}");
+        let trace = plan
+            .decode
+            .iter()
+            .find(|statement| statement.contains("\\\"name\\\":\\\"data\\\""))
+            .unwrap();
+        assert!(
+            trace.contains(
+                "bhf_tl_span((size_t)(_bhf_rest_at_p), (size_t)(_bhf_rest_at_p + _bhf_rest_size_p));"
+            ),
             "{trace}"
         );
         assert!(
-            trace.contains("bhf_tr_ptr((const void *)(data), Data, Size, (size_t)(Size), 0);"),
+            trace.contains(
+                "bhf_tr_ptr((const void *)(data), _bhf_rest_p, _bhf_rest_size_p, \
+                 (size_t)(_bhf_rest_size_p), 0);"
+            ),
             "{trace}"
         );
         assert!(trace.contains(r#"\"type\":\"const byte_t *\""#), "{trace}");
         assert!(trace.contains(r#"\"decoder\":\"input copy\""#), "{trace}");
+
+        // Alone in its call, it is the whole input, decoded as written.
+        let alone = super::plan(&c_group(&registry), &emissions[..1], &declared[..1]);
+        assert_eq!(alone.decode[0], decl);
+        assert!(alone.decode[1].contains("bhf_tl_span((size_t)(0), (size_t)(Size));"));
     }
 
     #[test]
@@ -937,6 +1362,9 @@ mod tests {
             role: Role::Param,
             index_base: 0,
             registry: None,
+            defer_input: false,
+            fresh_cursor: true,
+            sized_buffers: false,
         };
         let plan = plan(
             &group,
@@ -979,6 +1407,9 @@ mod tests {
             role: Role::Receiver,
             index_base: 0,
             registry: None,
+            defer_input: false,
+            fresh_cursor: true,
+            sized_buffers: false,
         };
         let plan = plan(
             &group,
@@ -1048,8 +1479,146 @@ mod tests {
         assert!(
             plan.decode
                 .iter()
-                .all(|statement| !statement.contains("Cur.pos")),
+                .all(|statement| !statement.contains("_bhf_at_")),
             "{plan:#?}"
+        );
+    }
+
+    #[test]
+    fn cursor_parameters_are_decoded_before_the_whole_input_ones_they_follow() {
+        let registry = TypeRegistry::default();
+        let plan = plan(
+            &c_group(&registry),
+            &[
+                emission(
+                    "const unsigned char * buf = (const unsigned char *)Data",
+                    "buf",
+                    "const unsigned char *",
+                ),
+                emission("size_t len = (size_t)Size", "len", "size_t"),
+                emission("int bias = bhf_i32(&Cur)", "bias", "int"),
+            ],
+            &[],
+        );
+        let at = |needle: &str| {
+            plan.decode
+                .iter()
+                .position(|statement| statement.starts_with(needle))
+                .unwrap_or_else(|| panic!("no {needle} in {plan:#?}"))
+        };
+        assert!(at("int bias = bhf_i32(&Cur)") < at("size_t _bhf_rest_at_p = Cur.pos"));
+        assert!(
+            at("size_t _bhf_rest_at_p")
+                < at("const unsigned char * buf = (const unsigned char *)_bhf_rest_p")
+        );
+        assert!(at("const unsigned char * buf") < at("size_t len = (size_t)_bhf_rest_size_p"));
+        // The pair's length depends on nothing else, but uses the input size.
+        assert!(plan
+            .decode
+            .iter()
+            .all(|statement| !statement.contains("(size_t)Size")));
+    }
+
+    #[test]
+    fn a_length_that_names_its_buffer_moves_with_it() {
+        let registry = TypeRegistry::default();
+        let order = decode_order(&[
+            emission(
+                "size_t _bhf_ntlen_s = Size; char *_bhf_ntbuf_s = (char *)malloc(_bhf_ntlen_s + 1); const char * s = _bhf_ntbuf_s",
+                "s",
+                "const char *",
+            ),
+            emission("int n = (int)(_bhf_ntbuf_s ? _bhf_ntlen_s : 0)", "n", "int"),
+            emission("int k = bhf_i32(&Cur)", "k", "int"),
+        ]);
+        assert_eq!(order, vec![(2, false), (0, true), (1, true)]);
+        let _ = registry;
+    }
+
+    #[test]
+    fn the_explicit_length_applies_only_to_a_buffer_without_a_length_partner() {
+        let registry = TypeRegistry::default();
+        let mut group = c_group(&registry);
+        group.sized_buffers = true;
+        let lone = plan(
+            &group,
+            &[
+                emission(
+                    "const uint8_t * p = (const uint8_t *)Data",
+                    "p",
+                    "const uint8_t *",
+                ),
+                emission("int k = bhf_i32(&Cur)", "k", "int"),
+            ],
+            &[],
+        );
+        assert!(
+            lone.decode
+                .iter()
+                .any(|statement| statement.contains("bhf_take_sized(&Cur, &_bhf_rest_size_p)")),
+            "{lone:#?}"
+        );
+        let paired = plan(
+            &group,
+            &[
+                emission(
+                    "const uint8_t * p = (const uint8_t *)Data",
+                    "p",
+                    "const uint8_t *",
+                ),
+                emission("size_t n = (size_t)Size", "n", "size_t"),
+            ],
+            &[],
+        );
+        assert!(
+            paired
+                .decode
+                .iter()
+                .all(|statement| !statement.contains("bhf_take_sized")),
+            "{paired:#?}"
+        );
+    }
+
+    #[test]
+    fn deferred_input_parameters_move_to_the_late_list() {
+        let registry = TypeRegistry::default();
+        let mut group = c_group(&registry);
+        group.defer_input = true;
+        let plan = plan(
+            &group,
+            &[
+                emission(
+                    "const uint8_t * p = (const uint8_t *)Data",
+                    "p",
+                    "const uint8_t *",
+                ),
+                emission("int k = bhf_i32(&Cur)", "k", "int"),
+            ],
+            &[],
+        );
+        assert!(plan
+            .decode
+            .iter()
+            .any(|statement| statement == "int k = bhf_i32(&Cur)"));
+        assert!(plan
+            .decode
+            .iter()
+            .all(|statement| !statement.contains("_bhf_rest_")));
+        assert!(plan
+            .late
+            .iter()
+            .any(|statement| statement == "const uint8_t * p = (const uint8_t *)_bhf_rest_p"));
+    }
+
+    #[test]
+    fn input_renaming_skips_literals_and_longer_identifiers() {
+        assert_eq!(
+            rewrite_input(
+                r#"f(Data, Size, DataLen, "Data Size", 'S', my_Size); g(Data[Size - 1])"#,
+                "_r",
+                "_n"
+            ),
+            r#"f(_r, _n, DataLen, "Data Size", 'S', my_Size); g(_r[_n - 1])"#
         );
     }
 
@@ -1071,6 +1640,105 @@ mod tests {
             "{trace}"
         );
         assert!(!trace.contains("if (&"), "{trace}");
+    }
+
+    #[test]
+    fn a_decl_declares_only_its_declarators() {
+        let buffer = emission(
+            "size_t _bhf_cap_s = (size_t)Size + 1; if (_bhf_cap_s < 8) _bhf_cap_s = 8; \
+             const uint8_t * s = (const uint8_t *)malloc(_bhf_cap_s); \
+             if (s) { memset((void *)s, 0, _bhf_cap_s); size_t inner = 0; (void)inner; }",
+            "s",
+            "const uint8_t *",
+        );
+        assert_eq!(declared_names(&buffer), vec!["_bhf_cap_s", "s"]);
+        let order = decode_order(&[
+            buffer,
+            emission("size_t stride = (size_t)bhf_i64(&Cur)", "stride", "size_t"),
+        ]);
+        assert_eq!(order, vec![(1, false), (0, true)]);
+        assert_eq!(
+            declared_names(&emission(
+                "char p_path[bhf_tempfile_path_len]; std::vector<uint8_t> v(Data, Data + Size); \
+                 int (*cb)(int) = 0; x = 1; s.len = 2; Widget::reset(); return",
+                "v",
+                "std::vector<uint8_t>",
+            )),
+            vec!["p_path", "v", "cb"]
+        );
+        // Comments name nothing, and text outside ASCII is skipped.
+        assert_eq!(
+            identifiers("/* count of Data */ int n = 0; // Size\n m"),
+            vec!["int", "n", "m"]
+        );
+        assert_eq!(identifiers("x \u{e9} y"), vec!["x", "y"]);
+        assert!(declared_names(&emission("free(*p); f(x)", "p", "int *")).is_empty());
+    }
+
+    #[test]
+    fn a_buffer_declared_by_its_length_moves_with_the_length() {
+        let order = decode_order(&[
+            emission("int level = bhf_i32(&Cur)", "level", "int"),
+            emission(
+                "size_t _bhf_cap_out = Size < (1024 * 1024) ? Size + 65536 : (1024 * 1024 + 65536); \
+                 unsigned char * out = (unsigned char *)malloc(_bhf_cap_out ? _bhf_cap_out : 1); \
+                 size_t _bhf_out_out_len = (size_t)(out ? _bhf_cap_out : 0); \
+                 size_t *out_len = &_bhf_out_out_len",
+                "out_len",
+                "size_t *",
+            ),
+            emission("", "out", "unsigned char *"),
+        ]);
+        assert_eq!(order, vec![(0, false), (1, true), (2, true)]);
+    }
+
+    #[test]
+    fn member_names_are_not_the_input() {
+        let decl = "widget_hdr _bhf_value_hdr; _bhf_value_hdr.Size = (unsigned int)bhf_i32(&Cur); \
+                    _bhf_value_hdr.Data = (unsigned int)bhf_i32(&Cur); const widget_hdr * hdr = &_bhf_value_hdr";
+        assert_eq!(source_of(decl), Source::Cursor);
+        assert_eq!(
+            rewrite_input("w.Size = Size; p->Data = Data[0]; n::Size = 1", "_r", "_n"),
+            "w.Size = _n; p->Data = _r[0]; n::Size = 1"
+        );
+        let registry = TypeRegistry::default();
+        let plan = plan(
+            &c_group(&registry),
+            &[
+                emission(decl, "hdr", "const widget_hdr *"),
+                emission("int level = bhf_i32(&Cur)", "level", "int"),
+            ],
+            &[],
+        );
+        assert_eq!(plan.decode[1], decl, "{plan:#?}");
+        assert!(plan
+            .decode
+            .iter()
+            .all(|statement| !statement.contains("_bhf_rest_")));
+        // A decl that reads the cursor stays with the cursor even when it also
+        // names the input.
+        assert_eq!(
+            source_of("size_t n = bhf_bounded_length(&Cur, 0, Size)"),
+            Source::Cursor
+        );
+    }
+
+    #[test]
+    fn a_group_after_other_decoding_takes_the_input_the_cursor_left() {
+        let registry = TypeRegistry::default();
+        let emissions = [emission(
+            "std::vector<std::uint8_t> _bhf_ctor_blob(Data, Data + Size)",
+            "_bhf_ctor_blob",
+            "std::vector<std::uint8_t>",
+        )];
+        let fresh = plan(&c_group(&registry), &emissions, &[]);
+        assert_eq!(fresh.decode[0], emissions[0].decl);
+        let mut group = c_group(&registry);
+        group.fresh_cursor = false;
+        let later = plan(&group, &emissions, &[]);
+        assert!(later.decode.iter().any(|statement| statement
+            == "std::vector<std::uint8_t> _bhf_ctor_blob(_bhf_rest_p, _bhf_rest_p + _bhf_rest_size_p)"),
+            "{later:#?}");
     }
 
     #[test]

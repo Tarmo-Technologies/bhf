@@ -292,43 +292,70 @@ it did not reach. The per-type rules are:
 | C++ `std::vector<T>` and other sequences | 8, then elements | a count modulo 17, then each element (a byte vector or span is the whole input, below) |
 
 The length-named, offset-named and channel-count names are the ones listed
-above. Some parameters read no cursor bytes at all and are fed from the whole
-testcase instead:
+above. Some parameters read no cursor bytes and are fed from the input as a
+whole. Within one call they are decoded after every cursor parameter of that
+call, whatever their position in the signature, and they take the bytes the
+cursor left (the *remaining input*). For the target call of a direct harness
+with no cursor parameter, that is the whole testcase:
 
-- a byte buffer paired with a length-named integer: a read-only buffer is the
-  testcase itself (`(Data, Size)`) and its length is the input size; a
-  writable one is a heap copy of the input (at most 1 MiB) and its length is
-  the copy's size;
+- a byte buffer paired with a length-named integer: a read-only buffer is a
+  view of the remaining input and its length is the remaining size; a
+  writable one is a heap copy of it (at most 1 MiB) and its length is the
+  copy's size;
 - a read-only byte pointer with no length partner (`const uint8_t *`,
   `const unsigned char *` or a typedef of one): a NUL-terminated heap copy of the
-  whole input, `max(Size + 1, 8)` bytes, zero-filled past the input. It is a
+  remaining input, `max(remaining + 1, 8)` bytes, zero-filled past it. It is a
   copy, not a view of the fuzz input, so ASan reports overflows against that
   allocation;
-- `const void *` with no partner: the testcase itself; `void *`: a heap copy;
+- `const void *` with no partner: a view of the remaining input; `void *`: a
+  heap copy;
 - a writable byte pointer with no partner (`unsigned char *`, `uint8_t *`): a
-  heap copy of the input with 64 KiB of zeroed headroom;
+  heap copy of the remaining input with 64 KiB of zeroed headroom;
 - C++ byte vectors and spans (`std::vector<uint8_t>`,
-  `std::span<const uint8_t>`): a copy or view of the input;
-- `FILE *`: `fmemopen` over a copy of the input;
+  `std::span<const uint8_t>`): a copy or view of the remaining input;
+- `FILE *`: `fmemopen` over a copy of the remaining input;
 - the path parameter of a file loader (`load_file(const char *path)`): the
-  input written to a temporary file;
-- a read-only pointer to a record bhf cannot construct: the testcase itself.
+  remaining input written to a temporary file;
+- a read-only pointer to a record bhf cannot construct: a view of the
+  remaining input.
 
-In harness formats 1 and 2 these whole-input parameters do not move the
-cursor, so the parameters decoded after them read the same leading bytes:
-for `f(const uint8_t *data, uint32_t a, uint32_t b)`, `a` is bytes 0-3 and `b`
-bytes 4-7, which are also the first bytes of `data`.
+So for `f(const uint8_t *data, uint32_t a, uint32_t b)`, `a` is bytes 0-3, `b`
+bytes 4-7 and `data` the bytes from 8 on, and for
+`g(const char *buf, size_t len, int flags)`, `flags` is bytes 0-3 and the pair
+the rest. No input byte feeds two parameters of one call. Several whole-input
+parameters of one call (two lone buffers) share the remaining input.
 
-A C++ method's receiver is decoded after the target's own parameters. A
+The remaining input has no length of its own: a buffer without a length
+parameter is as long as the input lets it be. Set
+`BHF_BUFFER_LEN_DIMENSION=1` when generating the harness (`bhf generate-harness`
+or `bhf auto`) to give it one: after the cursor parameters the call reads 4
+more bytes, a little-endian length clamped to the bytes left, and its
+whole-input parameters take exactly that many bytes. It applies only to a call
+with a buffer that has no length partner, and it is off by default: a buffer
+shorter than the input can make a function with an implicit length contract
+read past it, a crash the harness made. The harness records the choice
+(`buffer_len_dimension` in `generation-metadata.json`, and `with an explicit
+buffer length` after the format stamp in the source).
+
+A C++ method's receiver is decoded after the target's own cursor parameters. A
 default-constructible class takes no input bytes; otherwise its constructor or
 factory arguments are decoded next, by the same rules. A mined protocol then
 decodes each step's arguments before that step's call. A lifecycle loop reads
 one byte for the number of steps (modulo the step count plus one), then for
 each step one selector byte (modulo the step count) and that step's
-arguments, and the target is called after the loop. A C sequence harness keeps
-its operation program in a control block at the end of the input
-(`sequence-layout.json` gives its length) and decodes the operations'
-arguments from the front.
+arguments. The target's whole-input parameters come last, right before the
+target call, so they take only bytes the constructor, the factory and the
+loop did not read. Constructor, factory and step arguments that use the whole
+input take the input remaining when that call is decoded (after the target's
+cursor parameters), which a later call can read again. A mined protocol step
+bound to the input by the project's own tests keeps the whole input. A C
+sequence harness keeps its operation program in a control block at the end of
+the input (`sequence-layout.json` gives its length) and decodes the calls'
+arguments from the front. A call's whole-input parameters take the argument
+bytes the cursor left when the call is decoded, never the control block. Only
+a call that runs once before anything read the cursor (the constructor, a
+configuration call, the first protocol call) and reads no cursor bytes itself
+keeps the whole input.
 
 ### Seeing the decoded arguments
 
@@ -400,7 +427,7 @@ gdb -q -batch -ex 'set debuginfod enabled off' -ex 'break <target>' -ex run -ex 
 Whenever a change makes the same input bytes decode to different argument
 values, the harness format version is bumped. Each harness records it as
 `harness_format_version` in `generation-metadata.json`. It also appears at the
-top of the generated `main.c` / `main.cpp` (`bhf harness format 2`). A harness
+top of the generated `main.c` / `main.cpp` (`bhf harness format 3`). A harness
 with no recorded version is format 1.
 
 Format 2 changed two things. An unsigned input with its top bit set, or a
@@ -411,11 +438,36 @@ from format 1 still run, but their inputs can exercise different values.
 Re-run the corpus and re-triage findings recorded against a format 1 harness.
 Do not compare them directly.
 
+Format 3 is the layout above: a call's whole-input parameters take the bytes
+its cursor parameters left, instead of the whole input again, and a C++
+method's whole-input target parameters come after its receiver's arguments.
+A testcase of a call that mixes the two kinds (`f(data, a, b)`) decodes
+differently: under format 2, `data` was the whole input and also overlapped
+`a` and `b`. A direct harness whose target call has only cursor parameters, or
+only whole-input ones, decodes as before, except that a C++ receiver's
+constructor, factory and step arguments and a sequence harness's operations
+now take the bytes the cursor left instead of the whole input. Ada harnesses
+keep format 2: their decoding did not change.
+
+A harness generated with `BHF_BUFFER_LEN_DIMENSION=1` decodes the same
+format differently again, so a finding also records `buffer_len_dimension`
+when the harness that found it had it on, and the notes below also flag a
+finding replayed against a harness generated with the other setting.
+
 `bhf generate-harness` (and so `bhf auto`) prints a warning when it regenerates
 a harness directory whose recorded format differs from the one it writes.
 `bhf replay` prints a note when the harness it replays against was generated
-with another format. The finding still replays against that harness as built,
-but a regenerated harness decodes its testcase differently.
+with another format. Each new finding records the format of the harness that
+found it (`harness_format_version` in `finding.json`). `bhf replay`, `bhf
+minimize` and `bhf capsule` compare it with the harness they run, and when
+they differ say so: replay as a `note` (also in `--json` `notes`), minimize
+on stderr, and capsule as a warning and as `harness_format_note` in the
+capsule's `manifest.json` (with `harness_format_version` and
+`finding_harness_format_version`). A finding that records no format came from
+a format 2 or earlier harness, so it is flagged against a format 3 harness.
+Such a finding replays as recorded against a harness of its own format; against
+a regenerated harness its testcase decodes into other arguments, so fuzz the
+regenerated harness again rather than comparing the two.
 
 ## Supported C Parameter Shapes
 

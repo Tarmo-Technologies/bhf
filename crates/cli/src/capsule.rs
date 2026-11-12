@@ -273,7 +273,15 @@ fn build_capsule(f: &FindingRef, out_root: &Path, tar: bool) -> anyhow::Result<C
     }
     let minimized = source == "min_testcase.bin";
     let reproduced = verification.reproduced_with.is_some();
-    write_manifest(cap, f, &plan, &verification, &source)?;
+    let format_note = crate::generate_harness::finding_format_note(&f.raw, &f.harness_dir);
+    write_manifest(
+        cap,
+        f,
+        &plan,
+        &verification,
+        &source,
+        format_note.as_deref(),
+    )?;
     std::fs::write(
         cap.join("README.md"),
         readme(f, &plan, &source, &verification.signature),
@@ -316,7 +324,7 @@ fn build_capsule(f: &FindingRef, out_root: &Path, tar: bool) -> anyhow::Result<C
             }
         ),
         not_reproduced_reason,
-        warnings: plan.warnings,
+        warnings: plan.warnings.into_iter().chain(format_note).collect(),
     })
 }
 
@@ -413,6 +421,7 @@ fn write_manifest(
     plan: &repro_lane::CapsulePlan,
     verification: &Verification,
     input_source: &str,
+    format_note: Option<&str>,
 ) -> anyhow::Result<()> {
     let sink = f.raw.pointer("/actionability/sink").cloned();
     let cwe = f.raw.pointer("/actionability/cwe").cloned();
@@ -439,6 +448,19 @@ fn write_manifest(
         "expected_signature": verification.signature,
         "reproduced": verification.reproduced_with.is_some(),
     });
+    let mut manifest = manifest;
+    // The input formats of the harness packaged and of the finding's testcase,
+    // when they are recorded, and the note when they differ.
+    if let Some(version) = crate::generate_harness::recorded_harness_format_version(&f.harness_dir)
+    {
+        manifest["harness_format_version"] = json!(version);
+    }
+    if let Some(version) = f.raw.get("harness_format_version") {
+        manifest["finding_harness_format_version"] = version.clone();
+    }
+    if let Some(note) = format_note {
+        manifest["harness_format_note"] = json!(note);
+    }
     std::fs::write(
         cap.join("manifest.json"),
         serde_json::to_vec_pretty(&manifest)?,

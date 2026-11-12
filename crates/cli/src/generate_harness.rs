@@ -259,10 +259,17 @@ pub fn run(args: GenerateHarnessArgs) -> Result<()> {
 #[derive(serde::Serialize)]
 struct GenerationMetadata<'a> {
     schema_version: u32,
-    /// [`harness_gen::HARNESS_FORMAT_VERSION`]: how this harness decodes fuzz
-    /// input into arguments. Corpora and findings recorded against a different
-    /// version may decode to different argument values.
+    /// [`harness_gen::harness_format_version_for`] the harness's language: how
+    /// this harness decodes fuzz input into arguments. Corpora and findings
+    /// recorded against a different version may decode to different argument
+    /// values.
     harness_format_version: u32,
+    /// The opt-in explicit buffer-length dimension
+    /// ([`harness_gen::buffer_len_dimension_enabled`]) was on when this C or
+    /// C++ harness was generated: a length-less buffer takes 4 length bytes,
+    /// then that many bytes. Absent when off.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    buffer_len_dimension: bool,
     language: &'a str,
     requested_line_present: bool,
     exact_line_match: bool,
@@ -281,7 +288,8 @@ fn write_generation_metadata(
 ) -> Result<()> {
     let metadata = GenerationMetadata {
         schema_version: 1,
-        harness_format_version: harness_gen::HARNESS_FORMAT_VERSION,
+        harness_format_version: harness_gen::harness_format_version_for(language),
+        buffer_len_dimension: language != "ada" && harness_gen::buffer_len_dimension_enabled(),
         language,
         requested_line_present: requested_line.is_some(),
         exact_line_match: requested_line.is_some_and(|line| line == selected_line),
@@ -297,29 +305,70 @@ fn write_generation_metadata(
     Ok(())
 }
 
+/// The input format a harness directory's `generation-metadata.json` records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecordedHarnessFormat {
+    /// `harness_format_version`; 1 for metadata written before it existed.
+    pub(crate) version: u32,
+    /// `language` (`c`, `cpp`, `ada`), when recorded.
+    pub(crate) language: Option<String>,
+    /// `buffer_len_dimension`: the harness was generated with the explicit
+    /// buffer-length dimension.
+    pub(crate) buffer_len_dimension: bool,
+}
+
+impl RecordedHarnessFormat {
+    /// The format this bhf generates for the harness's language.
+    fn current_version(&self) -> u32 {
+        harness_gen::harness_format_version_for(self.language.as_deref().unwrap_or("c"))
+    }
+
+    /// A C or C++ harness (or one that records no language).
+    fn is_c_family(&self) -> bool {
+        self.language.as_deref() != Some("ada")
+    }
+}
+
 /// The harness input format recorded in `<harness_dir>/generation-metadata.json`
 /// (see [`harness_gen::HARNESS_FORMAT_VERSION`]). `None` when the directory has
-/// no readable metadata; `Some(1)` for metadata written before the field
-/// existed.
-pub(crate) fn recorded_harness_format_version(harness_dir: &Path) -> Option<u32> {
+/// no readable metadata.
+pub(crate) fn recorded_harness_format(harness_dir: &Path) -> Option<RecordedHarnessFormat> {
     let text = std::fs::read_to_string(harness_dir.join("generation-metadata.json")).ok()?;
     let metadata: serde_json::Value = serde_json::from_str(&text).ok()?;
-    Some(
-        metadata
+    Some(RecordedHarnessFormat {
+        version: metadata
             .get("harness_format_version")
             .and_then(serde_json::Value::as_u64)
             .and_then(|version| u32::try_from(version).ok())
             .unwrap_or(1),
-    )
+        language: metadata
+            .get("language")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        buffer_len_dimension: metadata
+            .get("buffer_len_dimension")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+/// The harness input format version recorded in
+/// `<harness_dir>/generation-metadata.json` (see [`recorded_harness_format`]).
+/// `None` when the directory has no readable metadata; `Some(1)` for metadata
+/// written before the field existed.
+pub(crate) fn recorded_harness_format_version(harness_dir: &Path) -> Option<u32> {
+    recorded_harness_format(harness_dir).map(|format| format.version)
 }
 
 /// A warning for a harness directory generated with a different input format
-/// than this bhf writes: the same input bytes decode to different arguments, so
-/// corpora and finding testcases recorded against one do not carry over to the
-/// other. `None` when the formats match or nothing is recorded.
+/// than this bhf writes for its language: the same input bytes decode to
+/// different arguments, so corpora and finding testcases recorded against one
+/// do not carry over to the other. `None` when the formats match or nothing is
+/// recorded.
 pub(crate) fn stale_harness_format_note(harness_dir: &Path) -> Option<String> {
-    let recorded = recorded_harness_format_version(harness_dir)?;
-    let current = harness_gen::HARNESS_FORMAT_VERSION;
+    let recorded_format = recorded_harness_format(harness_dir)?;
+    let recorded = recorded_format.version;
+    let current = recorded_format.current_version();
     (recorded != current).then(|| {
         format!(
             "harness {} was generated with input format {recorded}, and this bhf generates \
@@ -330,6 +379,65 @@ pub(crate) fn stale_harness_format_note(harness_dir: &Path) -> Option<String> {
             harness_dir.display()
         )
     })
+}
+
+/// A note for replaying, minimizing or packaging a finding against the harness
+/// in `harness_dir` when the finding's testcase was recorded against another
+/// harness input format, so it decodes to other argument values there (see
+/// [`harness_gen::HARNESS_FORMAT_VERSION`]). A finding that records no format
+/// predates findings carrying one: it came from a format 2 or earlier
+/// harness, so a format 3 or later C or C++ harness was regenerated since.
+/// The explicit buffer-length dimension (`buffer_len_dimension`, recorded by
+/// both) is part of the format. `None` when the formats agree or the harness
+/// records none.
+pub(crate) fn finding_format_note(
+    finding: &serde_json::Value,
+    harness_dir: &Path,
+) -> Option<String> {
+    let harness = recorded_harness_format(harness_dir)?;
+    let recorded = finding
+        .get("harness_format_version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok());
+    let recorded_dimension = finding
+        .get("buffer_len_dimension")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let with = |on: bool| if on { "with" } else { "without" };
+    let (recorded_text, harness_text) = match recorded {
+        Some(recorded) if recorded == harness.version => {
+            if recorded_dimension == harness.buffer_len_dimension {
+                return None;
+            }
+            (
+                format!(
+                    "input format {recorded} {} the explicit buffer-length dimension",
+                    with(recorded_dimension)
+                ),
+                format!(
+                    "was generated {} it (BHF_BUFFER_LEN_DIMENSION)",
+                    with(harness.buffer_len_dimension)
+                ),
+            )
+        }
+        Some(recorded) => (
+            format!("input format {recorded}"),
+            format!("decodes format {}", harness.version),
+        ),
+        None if harness.is_c_family() && harness.version >= 3 => (
+            "input format 2 or earlier".to_owned(),
+            format!("decodes format {}", harness.version),
+        ),
+        None => return None,
+    };
+    Some(format!(
+        "this finding was recorded against harness {recorded_text}, and harness {} \
+         {harness_text}: its testcase decodes into different argument values there, so a \
+         mismatch or a failed minimization can come from the harness, not the target. Replay \
+         it against a harness generated with the format it was recorded with, or fuzz the \
+         regenerated harness again to re-find the crash",
+        harness_dir.display()
+    ))
 }
 
 /// Programmatic shim around `run()` used by `bhf auto`'s attempt
@@ -13108,7 +13216,8 @@ mod tests {
         BLOCKED_BY_NON_SELF_CONTAINED_HEADER,
     };
     use super::{
-        recorded_harness_format_version, stale_harness_format_note, write_generation_metadata,
+        finding_format_note, recorded_harness_format_version, stale_harness_format_note,
+        write_generation_metadata,
     };
     use super::{split_compile_command, write_c_per_tu_context, PerTuCompileContext};
     use ada_parser::ast::{Package, PackageId, StructuralAst as StructuralAstForMerge};
@@ -18253,6 +18362,11 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
     fn a_harness_of_an_older_input_format_is_recognised() {
         let dir = temp_dir("format-stale");
         assert_eq!(recorded_harness_format_version(&dir), None);
+        assert_eq!(
+            finding_format_note(&serde_json::json!({}), &dir),
+            None,
+            "a harness that records no format has nothing to compare"
+        );
         assert!(stale_harness_format_note(&dir).is_none());
 
         // Metadata written before the version field existed is format 1.
@@ -18277,6 +18391,105 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             Some(harness_gen::HARNESS_FORMAT_VERSION)
         );
         assert!(stale_harness_format_note(&dir).is_none());
+
+        // A finding recorded against this format replays quietly; one recorded
+        // against another, or before findings recorded one, is flagged.
+        let current = harness_gen::HARNESS_FORMAT_VERSION;
+        let same = serde_json::json!({ "harness_format_version": current });
+        assert_eq!(finding_format_note(&same, &dir), None);
+        let older = serde_json::json!({ "harness_format_version": current - 1 });
+        let note = finding_format_note(&older, &dir).expect("an older finding is flagged");
+        assert!(
+            note.contains(&format!("input format {}", current - 1))
+                && note.contains(&format!("decodes format {current}")),
+            "{note}"
+        );
+        let unversioned = finding_format_note(&serde_json::json!({}), &dir)
+            .expect("a finding with no recorded format predates format 3");
+        assert!(
+            unversioned.contains("input format 2 or earlier"),
+            "{unversioned}"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The opt-in buffer-length dimension is recorded with the harness, and
+    /// left out when off.
+    #[test]
+    fn generation_metadata_records_the_buffer_length_dimension() {
+        let dir = std::env::temp_dir().join(format!(
+            "bhf-gen-dimension-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        write_generation_metadata(&dir, "c", None, 1, "direct", "direct").unwrap();
+        let read = || -> serde_json::Value {
+            serde_json::from_slice(&fs::read(dir.join("generation-metadata.json")).unwrap())
+                .unwrap()
+        };
+        assert!(read().get("buffer_len_dimension").is_none());
+        {
+            let _on = harness_gen::scoped_buffer_len_dimension(true);
+            write_generation_metadata(&dir, "c", None, 1, "direct", "direct").unwrap();
+        }
+        assert_eq!(read()["buffer_len_dimension"], true);
+
+        // The dimension is part of the format a finding is compared with.
+        let current = harness_gen::HARNESS_FORMAT_VERSION;
+        let without = serde_json::json!({ "harness_format_version": current });
+        let note = finding_format_note(&without, &dir)
+            .expect("a finding from a harness without the dimension is flagged");
+        assert!(
+            note.contains(&format!(
+                "input format {current} without the explicit buffer-length dimension"
+            )) && note.contains("was generated with it"),
+            "{note}"
+        );
+        let with = serde_json::json!({
+            "harness_format_version": current,
+            "buffer_len_dimension": true,
+        });
+        assert_eq!(finding_format_note(&with, &dir), None);
+        write_generation_metadata(&dir, "c", None, 1, "direct", "direct").unwrap();
+        assert!(finding_format_note(&with, &dir)
+            .expect("and the reverse")
+            .contains("was generated without it"));
+        assert_eq!(finding_format_note(&without, &dir), None);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Ada harnesses decode as they did before format 3: they record their
+    /// own format, are not reported stale, and their unversioned findings are
+    /// not flagged.
+    #[test]
+    fn ada_harnesses_keep_their_own_input_format() {
+        let dir = temp_dir("format-ada");
+        // An Ada harness generated before format 3 recorded format 2.
+        fs::write(
+            dir.join("generation-metadata.json"),
+            r#"{"schema_version":1,"harness_format_version":2,"language":"ada"}"#,
+        )
+        .unwrap();
+        assert!(stale_harness_format_note(&dir).is_none());
+        assert_eq!(finding_format_note(&serde_json::json!({}), &dir), None);
+        {
+            let _on = harness_gen::scoped_buffer_len_dimension(true);
+            write_generation_metadata(&dir, "ada", None, 1, "direct", "direct").unwrap();
+        }
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join("generation-metadata.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            metadata["harness_format_version"],
+            harness_gen::ADA_HARNESS_FORMAT_VERSION
+        );
+        assert!(metadata.get("buffer_len_dimension").is_none());
+        assert_eq!(finding_format_note(&serde_json::json!({}), &dir), None);
+        assert!(
+            finding_format_note(&serde_json::json!({ "harness_format_version": 1 }), &dir)
+                .is_some()
+        );
         fs::remove_dir_all(&dir).ok();
     }
 

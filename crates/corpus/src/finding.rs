@@ -251,6 +251,8 @@ impl FindingEmitter {
                 sandbox: None,
                 mode: actionability::RunMode::Reporting,
                 build_binary: None,
+                harness_format_version: None,
+                buffer_len_dimension: false,
             },
             line_maps: crate::line_remap::SourceLineMaps::default(),
         }
@@ -272,6 +274,8 @@ impl FindingEmitter {
                 sandbox: Some(sandbox),
                 mode: actionability::RunMode::Reporting,
                 build_binary: None,
+                harness_format_version: None,
+                buffer_len_dimension: false,
             },
             line_maps: crate::line_remap::SourceLineMaps::default(),
         }
@@ -287,6 +291,22 @@ impl FindingEmitter {
     /// emitter so a finding pins to the exact binary bytes that produced it.
     pub fn with_build_binary(mut self, identity: serde_json::Value) -> Self {
         self.metadata.build_binary = Some(identity);
+        self
+    }
+
+    /// Record the generated harness's input format version in every finding
+    /// this emitter writes (`harness_format_version`). `None` (a harness with
+    /// no generation metadata) records nothing.
+    pub fn with_harness_format_version(mut self, version: Option<u32>) -> Self {
+        self.metadata.harness_format_version = version;
+        self
+    }
+
+    /// Record that the generated harness was built with the explicit
+    /// buffer-length dimension (`buffer_len_dimension: true` in every finding
+    /// this emitter writes): it is part of the harness input format.
+    pub fn with_buffer_len_dimension(mut self, enabled: bool) -> Self {
+        self.metadata.buffer_len_dimension = enabled;
         self
     }
 
@@ -752,6 +772,13 @@ struct FindingMetadata {
     /// (`corpus` does not depend on `binary_analysis`): merged into
     /// `record["build"]["binary"]` by every emitter.
     build_binary: Option<serde_json::Value>,
+    /// The input format of the generated harness that produced the finding
+    /// (its `generation-metadata.json` `harness_format_version`), so a later
+    /// replay can tell when the harness has since been regenerated with a
+    /// format that decodes the testcase differently.
+    harness_format_version: Option<u32>,
+    /// The harness had the explicit buffer-length dimension on.
+    buffer_len_dimension: bool,
 }
 
 impl Default for FindingMetadata {
@@ -763,6 +790,8 @@ impl Default for FindingMetadata {
             sandbox: None,
             mode: actionability::RunMode::Reporting,
             build_binary: None,
+            harness_format_version: None,
+            buffer_len_dimension: false,
         }
     }
 }
@@ -917,6 +946,12 @@ pub fn touch_last_seen(finding_dir: &std::path::Path, command: &str) -> std::io:
 /// creating `build` as an object first if no sandbox metadata already put one
 /// there. No-op when `metadata` carries no build identity.
 fn merge_build_binary(record: &mut serde_json::Value, metadata: &FindingMetadata) {
+    if let Some(version) = metadata.harness_format_version {
+        record["harness_format_version"] = json!(version);
+    }
+    if metadata.buffer_len_dimension {
+        record["buffer_len_dimension"] = json!(true);
+    }
     if let Some(binary) = &metadata.build_binary {
         let build = record
             .as_object_mut()
@@ -1054,6 +1089,52 @@ mod tests {
             .unwrap(),
             b"\x00\x01bad"
         );
+    }
+
+    #[test]
+    fn findings_record_the_harness_format_they_were_found_with() {
+        let root = temp_dir("format-version");
+        let emitter = FindingEmitter::new(root.clone()).with_harness_format_version(Some(3));
+        let id = emitter.emit(b"abc", &testcase(), 0).unwrap();
+        let record: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                crate::layout::findings_dir(&root)
+                    .join(&id.0)
+                    .join("finding.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["harness_format_version"], 3);
+        assert!(record.get("buffer_len_dimension").is_none());
+
+        let sized = FindingEmitter::new(root.clone())
+            .with_harness_format_version(Some(3))
+            .with_buffer_len_dimension(true);
+        let id = sized.emit(b"abe", &testcase(), 0).unwrap();
+        let record: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                crate::layout::findings_dir(&root)
+                    .join(&id.0)
+                    .join("finding.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["buffer_len_dimension"], true);
+
+        let unversioned = FindingEmitter::new(root.clone());
+        let id = unversioned.emit(b"abd", &testcase(), 0).unwrap();
+        let record: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                crate::layout::findings_dir(&root)
+                    .join(&id.0)
+                    .join("finding.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(record.get("harness_format_version").is_none());
     }
 
     #[test]

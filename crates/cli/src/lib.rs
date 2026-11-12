@@ -186,6 +186,12 @@ enum Command {
     /// List fuzzable targets in a source tree, or the bug-oracle inventory (`list targets` / `list oracles`)
     List(ListArgs),
     /// Generate an Ada/C/C++ fuzzing harness for one subprogram, with build-context recovery
+    ///
+    /// A generated C/C++ harness prints each decoded argument to stderr when it
+    /// runs with BHF_TRACE_ARGS=1. Set BHF_BUFFER_LEN_DIMENSION=1 while generating
+    /// to give a byte buffer that has no length parameter an explicit length read
+    /// from the input (off by default: a buffer shorter than the input can make a
+    /// function with an implicit length contract overflow it).
     GenerateHarness(generate_harness::GenerateHarnessArgs),
     /// Compile a generated harness (toolchain auto-detect, cross-compile, GNAT/GPRbuild/clang, probe backend)
     Build(build::BuildArgs),

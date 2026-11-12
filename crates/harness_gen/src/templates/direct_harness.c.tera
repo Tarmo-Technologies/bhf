@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* generated_harnesses/{{ harness_id }}/main.c */
-/* bhf harness format {{ harness_format_version }} */
+/* bhf harness format {{ harness_format_version }}{% if buffer_len_dimension %} with an explicit buffer length{% endif %} */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif

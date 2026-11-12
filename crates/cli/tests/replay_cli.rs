@@ -1453,3 +1453,81 @@ fn replay_show_args_explains_a_harness_without_the_trace() {
         "{stdout}"
     );
 }
+
+/// A finding recorded against an older harness input format than its
+/// harness now decodes is flagged by replay and minimize, which name both
+/// formats; one recorded against the same format is not.
+#[cfg(unix)]
+#[test]
+fn replay_and_minimize_flag_a_finding_recorded_against_another_harness_format() {
+    let root = temp_dir("format-mismatch");
+    let work = root.join("work");
+    let harness = work.join("harnesses/H-1/main");
+    let report = asan_report("Widget::copy_at", 12);
+    write_crashing_harness(&harness, &report);
+    fs::write(
+        harness.parent().unwrap().join("generation-metadata.json"),
+        "{\"schema_version\":1,\"harness_format_version\":3,\"language\":\"cpp\"}",
+    )
+    .unwrap();
+    let emit = |version: Option<u32>| {
+        let parsed = corpus::parse_sanitizer_report(&report).expect("report parses");
+        let id = corpus::FindingEmitter::with_metadata(
+            work.clone(),
+            "H-1".to_owned(),
+            "cpp".to_owned(),
+            harness.display().to_string(),
+        )
+        .with_harness_format_version(version)
+        .emit_sanitizer_crash_with_log(
+            format!("widget-input-{version:?}").as_bytes(),
+            &parsed,
+            Some(report.as_bytes()),
+        )
+        .expect("finding emitted");
+        corpus::layout::findings_dir(&work).join(id.0)
+    };
+
+    let older = emit(Some(2));
+    let output = replay_output(&[older.to_str().unwrap()]);
+    let stdout = text(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert!(
+        stdout.contains("this finding was recorded against harness input format 2")
+            && stdout.contains("decodes format 3"),
+        "{stdout}"
+    );
+    let output = replay_output(&[older.to_str().unwrap(), "--json"]);
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert!(value["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|note| note.as_str().unwrap().contains("input format 2")));
+
+    let unversioned = emit(None);
+    let stdout = text(&replay_output(&[unversioned.to_str().unwrap()]).stdout);
+    assert!(stdout.contains("input format 2 or earlier"), "{stdout}");
+
+    let current = emit(Some(3));
+    let stdout = text(&replay_output(&[current.to_str().unwrap()]).stdout);
+    assert!(
+        !stdout.contains("recorded against harness input format"),
+        "{stdout}"
+    );
+
+    let minimize = Command::new(env!("CARGO_BIN_EXE_cli"))
+        .args([
+            "minimize",
+            older.to_str().unwrap(),
+            "--harness",
+            harness.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let stderr = text(&minimize.stderr);
+    assert!(
+        stderr.contains("note: this finding was recorded against harness input format 2"),
+        "{stderr}"
+    );
+}

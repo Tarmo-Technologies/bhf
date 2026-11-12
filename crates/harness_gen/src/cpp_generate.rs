@@ -392,6 +392,10 @@ struct CppTemplateContext {
     /// position captures and argument-trace statements (see
     /// [`crate::arg_trace`]); and the after-call trace statements.
     params_decode: Vec<String>,
+    /// The target's whole-input parameters, decoded right before the call
+    /// when other arguments are decoded in between (see
+    /// [`crate::arg_trace::Group::defer_input`]).
+    params_late: Vec<String>,
     params_after: Vec<String>,
     /// A borrowed Pugixml in-place buffer must outlive the document's parse tree.
     pugi_retained_buffers: bool,
@@ -1306,6 +1310,7 @@ fn build_cpp_context_common(
             "receiver",
             crate::arg_trace::Role::Receiver,
             0,
+            CppDecodeOrder::AfterOthers,
             &plan.factory_params,
             &factory_params,
         );
@@ -1548,11 +1553,21 @@ fn build_cpp_context_common(
     let lifecycle_step_count = lifecycle_steps.len();
     // A byte-stream target's first parameter is each input byte in turn; the
     // decoded parameters start at index 1.
+    // A method whose receiver is built from decoded arguments, or driven by a
+    // lifecycle loop, decodes the target's whole-input parameters last, right
+    // before the call, so they take only bytes nothing else read.
+    let defer_target_input =
+        factory.is_some() || (receiver_class.is_some() && !input.target.api.is_constructor);
     let params_trace = cpp_trace_plan(
         "p",
         "target",
         crate::arg_trace::Role::Param,
         usize::from(byte_stream),
+        if defer_target_input {
+            CppDecodeOrder::FirstDeferringInput
+        } else {
+            CppDecodeOrder::First
+        },
         if byte_stream {
             effective_params.get(1..).unwrap_or(&[])
         } else {
@@ -1565,6 +1580,7 @@ fn build_cpp_context_common(
         "receiver",
         crate::arg_trace::Role::Receiver,
         0,
+        CppDecodeOrder::AfterOthers,
         input.constructor_params,
         &constructor_params,
     );
@@ -1642,6 +1658,7 @@ fn build_cpp_context_common(
         )),
         params,
         params_decode: params_trace.decode,
+        params_late: params_trace.late,
         params_after: params_trace.after,
         pugi_retained_buffers,
         return_type: if return_type_present {
@@ -1760,6 +1777,21 @@ fn push_cpp_target_namespace(
     }
 }
 
+/// Where a C++ call's arguments are decoded relative to the harness's other
+/// decoding (see [`crate::arg_trace::Group`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CppDecodeOrder {
+    /// The target's own arguments, decoded first from a fresh cursor.
+    First,
+    /// The target's own arguments when a receiver's constructor or factory
+    /// arguments (or a lifecycle loop) are decoded between them and the call:
+    /// their whole-input arguments are decoded last, right before the call.
+    FirstDeferringInput,
+    /// A receiver's constructor or factory, or a protocol or lifecycle step,
+    /// decoded after the target's own arguments.
+    AfterOthers,
+}
+
 /// The argument-trace plan for a C++ call's parameter emissions (see
 /// [`crate::arg_trace`]). `params` are the parameters as declared, so a trace
 /// line names a parameter by its declared name even where the harness renamed
@@ -1769,6 +1801,7 @@ fn cpp_trace_plan(
     call: &str,
     role: crate::arg_trace::Role,
     index_base: usize,
+    order: CppDecodeOrder,
     params: &[CppParameter],
     emissions: &[CParamEmission],
 ) -> crate::arg_trace::DecodePlan {
@@ -1790,6 +1823,9 @@ fn cpp_trace_plan(
             role,
             index_base,
             registry: None,
+            defer_input: order == CppDecodeOrder::FirstDeferringInput,
+            fresh_cursor: order != CppDecodeOrder::AfterOthers,
+            sized_buffers: crate::buffer_len_dimension_enabled(),
         },
         emissions,
         &declared,
@@ -1950,6 +1986,7 @@ fn build_lifecycle_step_emissions(
                 &step.name,
                 crate::arg_trace::Role::Param,
                 0,
+                CppDecodeOrder::AfterOthers,
                 &step.params,
                 &params,
             );
@@ -2063,6 +2100,7 @@ fn build_cpp_protocol_emissions(
                 &observed.step.name,
                 crate::arg_trace::Role::Param,
                 0,
+                CppDecodeOrder::AfterOthers,
                 &observed.step.params,
                 &params,
             );
@@ -5748,21 +5786,7 @@ mod tests {
         let Some(out) = build_cpp_harness(args) else {
             return;
         };
-        // The traced source must not add a warning a `-Werror` build fails on.
-        let check = Command::new("clang++")
-            .args(["-std=c++17", "-fsyntax-only", "-Wall", "-Wextra", "-Werror"])
-            .arg("-I")
-            .arg(runtime_dir())
-            .arg("-I")
-            .arg(&out)
-            .arg(out.join("main.cpp"))
-            .output()
-            .expect("run clang++");
-        assert!(
-            check.status.success(),
-            "warnings in the generated harness:\n{}",
-            String::from_utf8_lossy(&check.stderr)
-        );
+        assert_cpp_compiles_warning_free(&out);
         let input = [3, 0, b'A', b'B', b'C', 5, 0, 0, 0, 2, 0, 0, 0];
         let args = cpp_traced_args(&out, &input);
 
@@ -5831,6 +5855,79 @@ mod tests {
             receiver_class_override: None,
             factory_plan: None,
         }
+    }
+
+    /// In the C++ lane too, a `(buffer, length)` pair takes the bytes after
+    /// the scalars decoded with it, and a method's buffer the bytes after its
+    /// receiver's constructor arguments: no input byte feeds two parameters.
+    #[test]
+    fn built_cpp_harnesses_never_share_bytes_between_a_buffer_and_scalars() {
+        let out = temp_dir("cpp-layout-free");
+        let args = cpp_args_for(
+            &out,
+            "H-CPP-LAYOUT",
+            cppfunction("widget_parse"),
+            &[
+                ("data", "const unsigned char *"),
+                ("len", "size_t"),
+                ("mode", "int"),
+            ],
+            &[],
+            "#pragma once\n#include <cstddef>\n\
+             inline int widget_parse(const unsigned char *data, std::size_t len, int mode) {\n\
+             \x20   return len ? data[0] + mode : mode;\n\
+             }\n",
+        );
+        let Some(out) = build_cpp_harness(args) else {
+            return;
+        };
+        assert_cpp_compiles_warning_free(&out);
+        let args = cpp_traced_args(&out, &[3, 0, 0, 0, 0x11, 0x22]);
+        let mode = cpp_traced(&args, "mode", None);
+        assert_eq!(mode["value"], "3");
+        assert_eq!(mode["span"], serde_json::json!([0, 4]));
+        let data = cpp_traced(&args, "data", None);
+        assert_eq!(data["span"], serde_json::json!([4, 6]));
+        assert_eq!(data["preview_hex"], "1122");
+        assert_eq!(cpp_traced(&args, "len", None)["value"], "2");
+        fs::remove_dir_all(&out).ok();
+
+        let out = temp_dir("cpp-layout-receiver");
+        let mut target = cppfunction("feed");
+        target.qualifier_path = vec!["Widget".to_owned()];
+        target.api.is_method = true;
+        target.api.class_name = Some("Widget".to_owned());
+        let args = cpp_args_for(
+            &out,
+            "H-CPP-LAYOUT-RECV",
+            target,
+            &[("buf", "const unsigned char *"), ("len", "size_t")],
+            &[("mode", "int")],
+            "#pragma once\n#include <cstddef>\n\
+             class Widget {\n\
+             public:\n\
+             \x20   explicit Widget(int mode) : mode_(mode) {}\n\
+             \x20   int feed(const unsigned char *buf, std::size_t len) {\n\
+             \x20       return len ? buf[0] + mode_ : mode_;\n\
+             \x20   }\n\
+             private:\n\
+             \x20   int mode_;\n\
+             };\n",
+        );
+        let Some(out) = build_cpp_harness(args) else {
+            return;
+        };
+        assert_cpp_compiles_warning_free(&out);
+        let args = cpp_traced_args(&out, &[5, 0, 0, 0, 0x33, 0x44, 0x55]);
+        let mode = cpp_traced(&args, "mode", None);
+        assert_eq!(mode["call"], "receiver");
+        assert_eq!(mode["value"], "5");
+        assert_eq!(mode["span"], serde_json::json!([0, 4]));
+        let buf = cpp_traced(&args, "buf", None);
+        assert_eq!(buf["span"], serde_json::json!([4, 7]));
+        assert_eq!(buf["preview_hex"], "334455");
+        assert_eq!(cpp_traced(&args, "len", None)["value"], "3");
+        fs::remove_dir_all(&out).ok();
     }
 
     fn cpp_method(class: &str, method: &str) -> CppFunction {
@@ -6029,6 +6126,80 @@ mod tests {
             assert!(trace_part.contains("__is_trivially_copyable("));
         }
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A struct whose fields are named like the harness's `Data` and `Size`
+    /// is decoded from the cursor in the C++ lane too, and the harness builds.
+    #[test]
+    fn built_cpp_harness_decodes_a_struct_with_fields_named_like_the_input() {
+        let out = temp_dir("cpp-struct-size-field");
+        let header = "#pragma once\n\
+                      typedef struct widget_hdr { unsigned int Size; unsigned int Data; } widget_hdr;\n\
+                      inline int widget_check(const widget_hdr *hdr, int level) {\n\
+                      \x20   return (int)(hdr->Size + hdr->Data) + level;\n\
+                      }\n";
+        let mut args = cpp_args_for(
+            &out,
+            "H-CPP-STRUCT-SIZE",
+            cppfunction("widget_check"),
+            &[("hdr", "const widget_hdr *"), ("level", "int")],
+            &[],
+            header,
+        );
+        args.type_defs = vec![c_parser::parse_c_type_defs(
+            "typedef struct widget_hdr { unsigned int Size; unsigned int Data; } widget_hdr;",
+        )
+        .unwrap()];
+        let Some(out) = build_cpp_harness(args) else {
+            return;
+        };
+        assert_cpp_compiles_warning_free(&out);
+        let args = cpp_traced_args(&out, &[1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0]);
+        assert_eq!(
+            cpp_traced(&args, "hdr", None)["span"],
+            serde_json::json!([0, 8])
+        );
+        let level = cpp_traced(&args, "level", None);
+        assert_eq!(level["value"], "3");
+        assert_eq!(level["span"], serde_json::json!([8, 12]));
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// A receiver whose constructor takes only a whole-input argument gets the
+    /// bytes the method's scalars left, not the whole input again.
+    #[test]
+    fn built_cpp_harness_gives_constructor_input_the_bytes_after_the_target_scalars() {
+        let out = temp_dir("cpp-ctor-input");
+        let args = cpp_args_for(
+            &out,
+            "H-CPP-CTOR-INPUT",
+            cpp_method("Widget", "scan"),
+            &[("bit_index", "unsigned int")],
+            &[("blob", "std::vector<std::uint8_t>")],
+            "#pragma once\n#include <cstdint>\n#include <vector>\n\
+             class Widget {\n\
+             public:\n\
+             \x20   explicit Widget(std::vector<std::uint8_t> blob) : blob_(blob) {}\n\
+             \x20   int scan(unsigned int bit_index) {\n\
+             \x20       return blob_.empty() ? 0 : blob_[0] + (int)(bit_index & 1u);\n\
+             \x20   }\n\
+             private:\n\
+             \x20   std::vector<std::uint8_t> blob_;\n\
+             };\n",
+        );
+        let Some(out) = build_cpp_harness(args) else {
+            return;
+        };
+        assert_cpp_compiles_warning_free(&out);
+        let args = cpp_traced_args(&out, &[7, 0, 0, 0, 0xaa]);
+        let bit_index = cpp_traced(&args, "bit_index", None);
+        assert_eq!(bit_index["value"], "7");
+        assert_eq!(bit_index["span"], serde_json::json!([0, 4]));
+        let blob = cpp_traced(&args, "blob", None);
+        assert_eq!(blob["call"], "receiver");
+        assert_eq!(blob["span"], serde_json::json!([4, 5]));
+        assert_eq!(blob["preview_hex"], "aa");
+        fs::remove_dir_all(&out).ok();
     }
 
     /// End-to-end proof of the portable C++ libFuzzer target (#62): the C++

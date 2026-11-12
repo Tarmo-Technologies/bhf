@@ -306,6 +306,20 @@ static inline const char *bhf_make_tempfile(const uint8_t *data, size_t size, ch
 }
 #endif
 
+/* Opt-in explicit length for the bytes a call's whole-input parameters take
+ * (BHF_BUFFER_LEN_DIMENSION=1 at generation): a 32-bit little-endian length L,
+ * then the next min(L, remaining) bytes, which the cursor moves past. Returns
+ * a pointer to them and stores their count in *size. */
+static inline const uint8_t *bhf_take_sized(bhf_cursor *c, size_t *size) {
+    size_t want = (size_t)(uint32_t)bhf_i32(c);
+    size_t avail = bhf_remaining(c);
+    const uint8_t *at = c->data + c->pos;
+    if (want > avail) want = avail;
+    *size = want;
+    c->pos += want;
+    return at;
+}
+
 /* Lend the rest of the input as a (ptr, size) span. Lifetime matches the
  * cursor's backing buffer (the libFuzzer input). No allocation. */
 static inline void bhf_data_slice(bhf_cursor *c, const uint8_t **ptr, size_t *size) {

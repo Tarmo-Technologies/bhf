@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // generated_harnesses/{{ harness_id }}/main.cpp
-// bhf harness format {{ harness_format_version }}
+// bhf harness format {{ harness_format_version }}{% if buffer_len_dimension %} with an explicit buffer length{% endif %}
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -750,6 +750,9 @@ extern "C" int bhf_run_one(const uint8_t *Data, size_t Size) {
 {%- if receiver_trace %}
     {{ receiver_trace }};
 {%- endif %}
+{%- for d in params_late %}
+    {{ d }};
+{%- endfor %}
 {%- if factory.receiver_is_pointer %}
 {%- if return_type_present %}
     {{ return_type }} R{};
@@ -836,6 +839,9 @@ extern "C" int bhf_run_one(const uint8_t *Data, size_t Size) {
     }
     // RAII destructors run when _bhf_receiver leaves scope.
 {%- endif %}
+{%- for d in params_late %}
+    {{ d }};
+{%- endfor %}
 {%- if not target_is_constructor and not protocol_steps %}
     BHF_TARGET_ENTER();
     {% if return_type_present %}{{ return_type }} R = {% endif %}_bhf_receiver.{{ target_name }}({% for p in params %}{{ p.arg }}{% if not loop.last %}, {% endif %}{% endfor %});

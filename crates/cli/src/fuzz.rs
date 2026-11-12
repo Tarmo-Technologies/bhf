@@ -3023,16 +3023,21 @@ fn run_builtin_with_progress(
     let sandbox_metadata = prepared.runner.sandbox_metadata();
     let build_binary_identity = binary_analysis::build_identity(&prepared.harness_path)
         .and_then(|identity| serde_json::to_value(identity).ok());
-    let mut emitter = FindingEmitter::with_metadata_and_sandbox(
-        prepared.work_dir.clone(),
-        prepared.harness_id.clone(),
-        "unknown".to_owned(),
-        prepared.harness_path.display().to_string(),
-        serde_json::to_value(&sandbox_metadata)
-            .map_err(|error| format!("serialize sandbox metadata: {error}"))?,
-    )
-    .with_mode(prepared.mode)
-    .with_line_maps_dir(&prepared.work_dir.join("src_instrumented"));
+    let mut emitter = with_harness_format(
+        FindingEmitter::with_metadata_and_sandbox(
+            prepared.work_dir.clone(),
+            prepared.harness_id.clone(),
+            "unknown".to_owned(),
+            prepared.harness_path.display().to_string(),
+            serde_json::to_value(&sandbox_metadata)
+                .map_err(|error| format!("serialize sandbox metadata: {error}"))?,
+        )
+        .with_mode(prepared.mode)
+        .with_line_maps_dir(&prepared.work_dir.join("src_instrumented")),
+        &prepared.harness_path,
+        &prepared.work_dir,
+        &prepared.harness_id,
+    );
     if let Some(identity) = build_binary_identity {
         emitter = emitter.with_build_binary(identity);
     }
@@ -4513,16 +4518,21 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
     let sandbox_metadata = prepared.runner.sandbox_metadata();
     let build_binary_identity = binary_analysis::build_identity(&prepared.harness_path)
         .and_then(|identity| serde_json::to_value(identity).ok());
-    let mut emitter = FindingEmitter::with_metadata_and_sandbox(
-        prepared.work_dir.clone(),
-        prepared.harness_id.clone(),
-        "unknown".to_owned(),
-        prepared.harness_path.display().to_string(),
-        serde_json::to_value(&sandbox_metadata)
-            .map_err(|error| format!("serialize sandbox metadata: {error}"))?,
-    )
-    .with_mode(prepared.mode)
-    .with_line_maps_dir(&prepared.work_dir.join("src_instrumented"));
+    let mut emitter = with_harness_format(
+        FindingEmitter::with_metadata_and_sandbox(
+            prepared.work_dir.clone(),
+            prepared.harness_id.clone(),
+            "unknown".to_owned(),
+            prepared.harness_path.display().to_string(),
+            serde_json::to_value(&sandbox_metadata)
+                .map_err(|error| format!("serialize sandbox metadata: {error}"))?,
+        )
+        .with_mode(prepared.mode)
+        .with_line_maps_dir(&prepared.work_dir.join("src_instrumented")),
+        &prepared.harness_path,
+        &prepared.work_dir,
+        &prepared.harness_id,
+    );
     if let Some(identity) = build_binary_identity {
         emitter = emitter.with_build_binary(identity);
     }
@@ -6368,6 +6378,39 @@ fn sanitizer_crash_reproduces(
             .is_some_and(|fresh| crate::crash_identity::same_crash(report, fresh)),
         Err(_) => false,
     }
+}
+
+/// The input format of the generated harness at `harness`: the
+/// `generation-metadata.json` beside the binary, else in the work dir's harness
+/// dirs for `harness_id` (a binary `bhf build` staged alone into `build/<id>/`).
+/// `None` for a harness bhf did not generate.
+pub(crate) fn harness_format_for(
+    harness: &Path,
+    work_dir: &Path,
+    harness_id: &str,
+) -> Option<crate::generate_harness::RecordedHarnessFormat> {
+    let beside = harness.parent().map(Path::to_path_buf);
+    beside
+        .into_iter()
+        .chain(crate::auto::layout::harness_dir_candidates(
+            work_dir, harness_id,
+        ))
+        .filter(|dir| dir.join("generation-metadata.json").is_file())
+        .find_map(|dir| crate::generate_harness::recorded_harness_format(&dir))
+}
+
+/// Stamp the generated harness's input format (its version, and the explicit
+/// buffer-length dimension when on) on every finding `emitter` writes.
+fn with_harness_format(
+    emitter: FindingEmitter,
+    harness: &Path,
+    work_dir: &Path,
+    harness_id: &str,
+) -> FindingEmitter {
+    let format = harness_format_for(harness, work_dir, harness_id);
+    emitter
+        .with_harness_format_version(format.as_ref().map(|format| format.version))
+        .with_buffer_len_dimension(format.is_some_and(|format| format.buffer_len_dimension))
 }
 
 /// Bounds on the argument-trace re-run of a new finding: the run's per-input
@@ -8779,7 +8822,12 @@ mod auto_path_tests {
     fn a_new_finding_records_its_traced_arguments() {
         let root = tmpdir();
         let work_dir = root.join("bhf_work");
-        write_c_libfuzzer_harness(&work_dir, "H-ARGTRACE", TRACING_CRASH_SCRIPT);
+        let harness = write_c_libfuzzer_harness(&work_dir, "H-ARGTRACE", TRACING_CRASH_SCRIPT);
+        fs::write(
+            harness.with_file_name("generation-metadata.json"),
+            r#"{"schema_version":1,"harness_format_version":3,"buffer_len_dimension":true,"language":"c"}"#,
+        )
+        .unwrap();
         let summary = run_one_target_programmatic(
             &work_dir,
             "H-ARGTRACE",
@@ -8815,6 +8863,9 @@ mod auto_path_tests {
             "buffer"
         );
         assert_eq!(finding["exception"]["access"]["parameter"]["offset"], 1);
+        // The harness's input format, its buffer-length dimension included.
+        assert_eq!(finding["harness_format_version"], 3);
+        assert_eq!(finding["buffer_len_dimension"], true);
         // The sanitizer log is the crashing run's, not the trace run's.
         let log = fs::read_to_string(finding_dir.join("sanitizer.log")).unwrap();
         assert!(!log.contains("BHF_ARG"), "{log}");

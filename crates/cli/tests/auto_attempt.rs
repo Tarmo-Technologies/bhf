@@ -1918,8 +1918,9 @@ fn attempt_builds_and_fuzzes_c_const_byte_typedef_pair() {
         other => panic!("expected const byte typedef target to build+fuzz, got {other:?}"),
     }
     let main = fs::read_to_string(result.harness_dir.join("main.c")).unwrap();
-    assert!(main.contains("const mz_uint8 * ptr = (const mz_uint8 *)Data"));
-    assert!(main.contains("size_t buf_len = (size_t)Size"));
+    // The pair borrows the input the leading `crc` did not read.
+    assert!(main.contains("const mz_uint8 * ptr = (const mz_uint8 *)_bhf_rest_p"));
+    assert!(main.contains("size_t buf_len = (size_t)_bhf_rest_size_p"));
     assert!(
         !main.contains("_bhf_out_ptr"),
         "const byte input pointer should borrow Data, not use output storage:\n{main}"

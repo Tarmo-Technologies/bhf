@@ -493,8 +493,8 @@ fn argument_lines(f: &Finding) -> Vec<String> {
             .map(|line| format!("  {line}")),
     );
     lines.push(
-        "  (bytes are [start..end) offsets in testcase.bin; a buffer spanning the whole input \
-         shares its bytes with the parameters decoded from the front of it)"
+        "  (bytes are [start..end) offsets in testcase.bin; parameters whose ranges overlap \
+         were decoded from the same bytes)"
             .to_owned(),
     );
     lines

@@ -353,6 +353,23 @@ fn harness_format_note_for(harness: &Path, detection: &Detection) -> Option<Stri
     }
 }
 
+/// The note for a finding whose testcase was recorded against another harness
+/// input format than the harness replay runs (see
+/// [`crate::generate_harness::finding_format_note`]): the metadata next to the
+/// binary, else next to the driver source `detection` found.
+fn finding_format_note_for(raw: &Value, harness: &Path, detection: &Detection) -> Option<String> {
+    let dir = harness.parent()?;
+    if dir.join("generation-metadata.json").is_file() {
+        return crate::generate_harness::finding_format_note(raw, dir);
+    }
+    match &detection.basis {
+        ProtocolBasis::SourceMarker(source) | ProtocolBasis::PlainSource(source) => {
+            crate::generate_harness::finding_format_note(raw, source.parent()?)
+        }
+        _ => None,
+    }
+}
+
 /// Candidate fuzz-work roots for a finding directory, most-likely first. The
 /// results layout nests findings as `<work>/results/findings/<F-...>/`, so the
 /// work root comes from [`corpus::layout::work_dir_for_finding`]; the finding
@@ -1420,6 +1437,9 @@ pub(crate) fn replay_c(
     let mut notes = Vec::new();
     if report.is_some() && comparison.location_not_compared() {
         notes.push(UNSYMBOLIZED_NOTE.to_owned());
+    }
+    if let Some(note) = finding_format_note_for(&raw, runner.harness_path(), detection) {
+        notes.push(note);
     }
     if reproduced {
         record_reproduction(finding_dir, runner);

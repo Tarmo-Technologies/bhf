@@ -5,7 +5,9 @@
 // harness's argument trace on (BHF_TRACE_ARGS=1) and stores the arguments in
 // decoded.json and, summarised, in finding.json `decoded_args`; the heap access
 // names the parameter whose buffer it overflowed. `bhf replay --show-args`
-// prints the same values.
+// prints the same values. The scalars take the leading bytes and the
+// length-less buffer the bytes after them (harness format 3), so no byte is
+// both.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -54,7 +56,7 @@ fn a_c_finding_records_its_decoded_arguments() {
     )
     .unwrap();
     let seeds = scratch("seeds");
-    std::fs::write(seeds.join("trigger"), b"AAAAAAAA").unwrap();
+    std::fs::write(seeds.join("trigger"), b"AAAAAAAAWXYZ").unwrap();
     let work = scratch("work");
 
     let out = Command::new(&bin)
@@ -105,14 +107,18 @@ fn a_c_finding_records_its_decoded_arguments() {
             .unwrap_or_else(|| panic!("no {name} in {args:#?}"))
     };
     let testcase = std::fs::read(finding.join("testcase.bin")).unwrap();
-    assert_eq!(testcase, b"AAAAAAAA");
+    // The crashing testcase is the built-in `AAAAAAAA` seed or the supplied one.
+    assert!(testcase.starts_with(b"AAAAAAAA"), "{testcase:?}");
+    let rest = &testcase[8..];
     assert_eq!(arg("bit_index")["value"], "1094795585");
     assert_eq!(arg("bit_index")["span"], serde_json::json!([0, 4]));
     assert_eq!(arg("width")["value"], "16705");
     assert_eq!(arg("width")["span"], serde_json::json!([4, 8]));
-    assert_eq!(arg("data")["span"], serde_json::json!([0, 8]));
-    assert_eq!(arg("data")["len"], 8);
-    assert_eq!(arg("data")["preview_hex"], "4141414141414141");
+    assert_eq!(arg("data")["span"], serde_json::json!([8, testcase.len()]));
+    assert_eq!(arg("data")["len"], rest.len());
+    let hex: String = rest.iter().map(|byte| format!("{byte:02x}")).collect();
+    assert_eq!(arg("data")["preview_hex"], hex);
+    assert_eq!(record["harness_format_version"], 3, "{record:#}");
     assert_eq!(
         record["exception"]["access"]["parameter"]["name"], "data",
         "{record:#}"
