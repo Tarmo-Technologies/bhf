@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use c_parser::{push_located_token, LocatedToken};
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CppParamDescriptor {
     pub name: String,
@@ -1892,6 +1894,16 @@ fn class_body_has_pure_virtual(body: tree_sitter::Node<'_>, source: &[u8]) -> bo
 }
 
 pub fn extract_cpp_dictionary_tokens(source: &str) -> Result<Vec<String>, CppParseError> {
+    Ok(extract_cpp_dictionary_tokens_located(source)?
+        .into_iter()
+        .map(|token| token.value)
+        .collect())
+}
+
+/// [`extract_cpp_dictionary_tokens`], with the lines each token was found on.
+pub fn extract_cpp_dictionary_tokens_located(
+    source: &str,
+) -> Result<Vec<c_parser::LocatedToken>, CppParseError> {
     let mut parser = tree_sitter::Parser::new();
     parser
         .set_language(&tree_sitter_cpp::LANGUAGE.into())
@@ -1901,7 +1913,7 @@ pub fn extract_cpp_dictionary_tokens(source: &str) -> Result<Vec<String>, CppPar
 
     for enum_def in parse_cpp_type_defs(source)?.enums {
         for member in enum_def.members {
-            push_cpp_enum_dictionary_token(&mut tokens, member);
+            push_cpp_enum_dictionary_token(&mut tokens, member, enum_def.line);
         }
     }
     collect_cpp_string_dictionary_tokens(tree.root_node(), source.as_bytes(), &mut tokens);
@@ -1917,7 +1929,7 @@ pub fn extract_cpp_dictionary_tokens(source: &str) -> Result<Vec<String>, CppPar
 fn collect_cpp_comparison_dictionary_tokens(
     node: tree_sitter::Node<'_>,
     source: &[u8],
-    tokens: &mut Vec<String>,
+    tokens: &mut Vec<LocatedToken>,
 ) {
     let Some(_depth_guard) = AstDepthGuard::enter() else {
         return;
@@ -1933,7 +1945,11 @@ fn collect_cpp_comparison_dictionary_tokens(
                                 "number_literal" | "char_literal" | "string_literal"
                             ) {
                                 if let Ok(text) = operand.utf8_text(source).map(str::trim) {
-                                    push_cpp_case_label_dictionary_token(text, tokens);
+                                    push_cpp_case_label_dictionary_token(
+                                        text,
+                                        node_line(operand),
+                                        tokens,
+                                    );
                                 }
                             }
                         }
@@ -1951,7 +1967,7 @@ fn collect_cpp_comparison_dictionary_tokens(
 fn collect_cpp_string_dictionary_tokens(
     node: tree_sitter::Node<'_>,
     source: &[u8],
-    tokens: &mut Vec<String>,
+    tokens: &mut Vec<LocatedToken>,
 ) {
     let Some(_depth_guard) = AstDepthGuard::enter() else {
         return;
@@ -1964,7 +1980,7 @@ fn collect_cpp_string_dictionary_tokens(
     if node.kind() == "string_literal" && !include_path {
         if let Ok(raw) = node.utf8_text(source) {
             if let Some(value) = cpp_string_literal_value(raw) {
-                push_dictionary_token(tokens, value);
+                push_located_token(tokens, value, node_line(node));
             }
         }
     }
@@ -1974,8 +1990,9 @@ fn collect_cpp_string_dictionary_tokens(
     }
 }
 
-fn collect_cpp_define_dictionary_tokens(source: &str, tokens: &mut Vec<String>) {
-    for line in source.lines() {
+fn collect_cpp_define_dictionary_tokens(source: &str, tokens: &mut Vec<LocatedToken>) {
+    for (index, line) in source.lines().enumerate() {
+        let line_number = u32::try_from(index + 1).unwrap_or(u32::MAX);
         let trimmed = line.trim_start();
         let Some(rest) = trimmed.strip_prefix("#define") else {
             continue;
@@ -1997,9 +2014,9 @@ fn collect_cpp_define_dictionary_tokens(source: &str, tokens: &mut Vec<String>) 
             .trim();
         let first = value.split_whitespace().next().unwrap_or("");
         if let Some(value) = cpp_string_literal_value(first) {
-            push_dictionary_token(tokens, value);
+            push_located_token(tokens, value, line_number);
         } else if is_cpp_integer_literal(first) {
-            push_dictionary_token(tokens, first.to_owned());
+            push_located_token(tokens, first.to_owned(), line_number);
         }
     }
 }
@@ -2007,7 +2024,7 @@ fn collect_cpp_define_dictionary_tokens(source: &str, tokens: &mut Vec<String>) 
 fn collect_cpp_case_dictionary_tokens(
     node: tree_sitter::Node<'_>,
     source: &[u8],
-    tokens: &mut Vec<String>,
+    tokens: &mut Vec<LocatedToken>,
 ) {
     let Some(_depth_guard) = AstDepthGuard::enter() else {
         return;
@@ -2015,7 +2032,7 @@ fn collect_cpp_case_dictionary_tokens(
     if node.kind() == "case_statement" {
         if let Some(label) = node.child_by_field_name("value") {
             if let Ok(label) = label.utf8_text(source).map(str::trim) {
-                push_cpp_case_label_dictionary_token(label, tokens);
+                push_cpp_case_label_dictionary_token(label, node_line(node), tokens);
             }
         }
     }
@@ -2025,16 +2042,16 @@ fn collect_cpp_case_dictionary_tokens(
     }
 }
 
-fn push_cpp_case_label_dictionary_token(label: &str, tokens: &mut Vec<String>) {
+fn push_cpp_case_label_dictionary_token(label: &str, line: u32, tokens: &mut Vec<LocatedToken>) {
     if label.is_empty() {
         return;
     }
     if let Some(value) = cpp_string_literal_value(label) {
-        push_dictionary_token(tokens, value);
+        push_located_token(tokens, value, line);
     } else if let Some(value) = cpp_char_literal_value(label) {
-        push_dictionary_token(tokens, value);
+        push_located_token(tokens, value, line);
     } else if is_cpp_integer_literal(label) || is_cpp_identifier(label) {
-        push_dictionary_token(tokens, label.to_owned());
+        push_located_token(tokens, label.to_owned(), line);
     }
 }
 
@@ -2107,23 +2124,22 @@ fn is_cpp_identifier(raw: &str) -> bool {
         && !is_cpp_keyword(raw)
 }
 
-fn push_dictionary_token(tokens: &mut Vec<String>, token: String) {
-    let token = token.trim().to_owned();
-    if token.is_empty() || token.len() > 256 || tokens.contains(&token) {
-        return;
-    }
-    tokens.push(token);
+/// The 1-based source line a node starts on.
+fn node_line(node: tree_sitter::Node<'_>) -> u32 {
+    u32::try_from(node.start_position().row)
+        .unwrap_or(u32::MAX - 1)
+        .saturating_add(1)
 }
 
-fn push_cpp_enum_dictionary_token(tokens: &mut Vec<String>, member: String) {
+fn push_cpp_enum_dictionary_token(tokens: &mut Vec<LocatedToken>, member: String, line: u32) {
     if let Some((_, leaf)) = member.rsplit_once("::") {
-        push_dictionary_token(tokens, leaf.to_owned());
+        push_located_token(tokens, leaf.to_owned(), line);
     }
     let segments = member.split("::").collect::<Vec<_>>();
     if segments.len() > 2 {
-        push_dictionary_token(tokens, segments[segments.len() - 2..].join("::"));
+        push_located_token(tokens, segments[segments.len() - 2..].join("::"), line);
     }
-    push_dictionary_token(tokens, member);
+    push_located_token(tokens, member, line);
 }
 
 fn collect_type_defs(node: tree_sitter::Node<'_>, source: &[u8], defs: &mut c_parser::CTypeDefs) {
@@ -5213,6 +5229,40 @@ struct MappedFile {
                 "missing {expected} from {tokens:?}"
             );
         }
+    }
+
+    /// Each mined C++ token carries the lines it was found on, enum members
+    /// included, so the dictionary writer can say where it came from.
+    #[test]
+    fn cpp_dictionary_tokens_record_their_source_lines() {
+        let tokens = extract_cpp_dictionary_tokens_located(
+            "#include <string>\n\
+             #define WIDGET_TAG \"WGT1\"\n\
+             namespace widgets {\n\
+             enum class Mode { Fast, Safe };\n\
+             int parse_record(const std::string &s, int tag) {\n\
+                 switch (tag) { case 'Q': return 1; default: break; }\n\
+                 return s == \"WGT1\" ? 1 : 0;\n\
+             }\n\
+             }\n",
+        )
+        .expect("C++ parses");
+        let lines = |value: &str| {
+            let mut lines = tokens
+                .iter()
+                .find(|token| token.value == value)
+                .map(|token| token.lines.clone())
+                .unwrap_or_else(|| panic!("{value} not mined: {tokens:?}"));
+            lines.sort_unstable();
+            lines
+        };
+        assert_eq!(lines("WGT1"), vec![2, 7]);
+        assert_eq!(lines("Q"), vec![6]);
+        assert_eq!(lines("Safe"), vec![4]);
+        assert_eq!(
+            extract_cpp_dictionary_tokens("int f(int t) { return t == 9; }").expect("parses"),
+            vec!["9".to_owned()]
+        );
     }
 
     /// An `#include "..."` path is a file name, not a value the target compares

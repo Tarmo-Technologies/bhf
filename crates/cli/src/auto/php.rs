@@ -493,9 +493,19 @@ fn parse_params(s: &str) -> Vec<PhpParam> {
 
 /// Mine string literals as a fuzzing dictionary (magic values that gate coverage).
 pub fn extract_php_dictionary_tokens(source: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for raw in source.lines() {
+    extract_php_dictionary_tokens_located(source)
+        .into_iter()
+        .map(|(token, _)| token)
+        .collect()
+}
+
+/// [`extract_php_dictionary_tokens`], with the 1-based lines each token was
+/// found on (the first three distinct ones).
+pub fn extract_php_dictionary_tokens_located(source: &str) -> Vec<(String, Vec<u32>)> {
+    let mut out: Vec<(String, Vec<u32>)> = Vec::new();
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (line_index, raw) in source.lines().enumerate() {
+        let line = u32::try_from(line_index + 1).unwrap_or(u32::MAX);
         let bytes = raw.as_bytes();
         let mut i = 0;
         while i < bytes.len() {
@@ -523,9 +533,19 @@ pub fn extract_php_dictionary_tokens(source: &str) -> Vec<String> {
                         && lit.len() <= 64
                         && !lit.contains("$")
                         && lit.chars().all(|ch| !ch.is_control())
-                        && seen.insert(lit.to_owned())
                     {
-                        out.push(lit.to_owned());
+                        match seen.get(lit) {
+                            Some(&index) => {
+                                let lines = &mut out[index].1;
+                                if lines.len() < 3 && !lines.contains(&line) {
+                                    lines.push(line);
+                                }
+                            }
+                            None => {
+                                seen.insert(lit.to_owned(), out.len());
+                                out.push((lit.to_owned(), vec![line]));
+                            }
+                        }
                     }
                 }
                 i = j + 1;
@@ -540,6 +560,18 @@ pub fn extract_php_dictionary_tokens(source: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn located_dictionary_tokens_record_their_lines() {
+        let toks = extract_php_dictionary_tokens_located(
+            "<?php\nfunction parse($s) {\n  return $s === \"WGT1\";\n}\n$tag = \"WGT1\";\n",
+        );
+        let found = toks
+            .iter()
+            .find(|(token, _)| token == "WGT1")
+            .unwrap_or_else(|| panic!("WGT1 not mined: {toks:?}"));
+        assert_eq!(found.1, vec![3, 5]);
+    }
 
     #[test]
     fn first_param_affinity_prefers_byte_channels_over_object_synthesis() {

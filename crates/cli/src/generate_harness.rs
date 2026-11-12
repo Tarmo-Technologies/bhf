@@ -804,11 +804,14 @@ fn write_ada_dictionary(
 ) -> Result<()> {
     let source = crate::source_text::read_source_text(&args.source)
         .with_context(|| format!("read Ada source {}", args.source.display()))?;
-    let tokens = collect_ada_dictionary_tokens(ast, &source);
+    let file = dictionary_source_label(&args.source, args.source.parent());
+    let tokens = collect_ada_dictionary_tokens(ast, &source, &file);
     write_harness_dictionary(output_dir, &tokens)
 }
 
-fn collect_ada_dictionary_tokens(ast: &StructuralAst, source: &str) -> Vec<String> {
+/// The Ada source's dictionary tokens, each with the lines of `file` it was
+/// found on: enum literals, then string literals.
+fn collect_ada_dictionary_tokens(ast: &StructuralAst, source: &str, file: &str) -> Vec<MinedToken> {
     let mut tokens = Vec::new();
     let dialect = ast
         .units
@@ -816,19 +819,19 @@ fn collect_ada_dictionary_tokens(ast: &StructuralAst, source: &str) -> Vec<Strin
         .map(|unit| unit.ada_standard)
         .unwrap_or(ada_parser::ast::AdaStandard::Ada2012);
     let lexical_tokens = ada_parser::lexer::lex(source, dialect);
-    collect_ada_enum_literals_from_tokens(source, &lexical_tokens, &mut tokens);
+    collect_ada_enum_literals_from_tokens(source, &lexical_tokens, file, &mut tokens);
 
     for ty in &ast.types {
         if let TypeKind::Enum(literals) = &ty.kind {
             for literal in literals {
-                push_unique_dictionary_token(&mut tokens, literal.clone());
+                push_mined_token(&mut tokens, literal.clone(), None);
             }
         }
     }
 
     for token in lexical_tokens {
         if let ada_parser::lexer::TokenKind::StringLiteral(value) = token.kind {
-            push_unique_dictionary_token(&mut tokens, value);
+            push_mined_token(&mut tokens, value, Some((file, token.line)));
         }
     }
     tokens
@@ -837,7 +840,8 @@ fn collect_ada_dictionary_tokens(ast: &StructuralAst, source: &str) -> Vec<Strin
 fn collect_ada_enum_literals_from_tokens(
     source: &str,
     lexical_tokens: &[ada_parser::lexer::Token],
-    tokens: &mut Vec<String>,
+    file: &str,
+    tokens: &mut Vec<MinedToken>,
 ) {
     use ada_parser::lexer::TokenKind;
 
@@ -859,17 +863,18 @@ fn collect_ada_enum_literals_from_tokens(
         }
         cursor += 1;
         while cursor < lexical_tokens.len() && lexical_tokens[cursor].kind != TokenKind::RParen {
+            let at = Some((file, lexical_tokens[cursor].line));
             match &lexical_tokens[cursor].kind {
                 TokenKind::Identifier(_) => {
                     if let Some(literal) = ada_token_source_text(source, &lexical_tokens[cursor]) {
-                        push_unique_dictionary_token(tokens, literal);
+                        push_mined_token(tokens, literal, at);
                     }
                 }
                 TokenKind::CharLiteral(ch) => {
-                    push_unique_dictionary_token(tokens, ch.to_string());
+                    push_mined_token(tokens, ch.to_string(), at);
                 }
                 TokenKind::StringLiteral(value) => {
-                    push_unique_dictionary_token(tokens, value.clone());
+                    push_mined_token(tokens, value.clone(), at);
                 }
                 _ => {}
             }
@@ -887,10 +892,96 @@ fn ada_token_source_text(source: &str, token: &ada_parser::lexer::Token) -> Opti
         .map(str::to_owned)
 }
 
-fn push_unique_dictionary_token(tokens: &mut Vec<String>, token: String) {
-    if !token.is_empty() && !tokens.contains(&token) {
-        tokens.push(token);
+/// Most places a `dictionary.txt` comment names for one token.
+pub(crate) const MAX_TOKEN_SOURCES: usize = 3;
+
+/// A dictionary token and where it was mined: up to [`MAX_TOKEN_SOURCES`]
+/// `(file, line)` places, `file` relative to the target source's directory
+/// (see [`dictionary_source_label`]). Tokens bhf adds itself have none.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct MinedToken {
+    pub(crate) value: String,
+    pub(crate) sources: Vec<(String, u32)>,
+}
+
+/// Add `value` to `tokens` once, recording `at` (a file and 1-based line)
+/// while the token has room for another place.
+pub(crate) fn push_mined_token(
+    tokens: &mut Vec<MinedToken>,
+    value: String,
+    at: Option<(&str, u32)>,
+) {
+    if value.is_empty() {
+        return;
     }
+    let index = match tokens.iter().position(|token| token.value == value) {
+        Some(index) => index,
+        None => {
+            tokens.push(MinedToken {
+                value,
+                sources: Vec::new(),
+            });
+            tokens.len() - 1
+        }
+    };
+    let token = &mut tokens[index];
+    if let Some((file, line)) = at {
+        let place = (file.to_owned(), line);
+        if token.sources.len() < MAX_TOKEN_SOURCES && !token.sources.contains(&place) {
+            token.sources.push(place);
+        }
+    }
+}
+
+/// Add one file's tokens, each with the lines of `file` it was found on.
+pub(crate) fn push_located_tokens(
+    tokens: &mut Vec<MinedToken>,
+    file: &str,
+    located: impl IntoIterator<Item = (String, Vec<u32>)>,
+) {
+    for (value, lines) in located {
+        if lines.is_empty() {
+            push_mined_token(tokens, value, None);
+            continue;
+        }
+        for line in lines {
+            push_mined_token(tokens, value.clone(), Some((file, line)));
+        }
+    }
+}
+
+/// How `dictionary.txt` names a source file: relative to `base` (the target
+/// source's directory), with `/` separators, else the path as given.
+pub(crate) fn dictionary_source_label(path: &Path, base: Option<&Path>) -> String {
+    let resolve = |path: &Path| fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let label = base
+        .and_then(|base| relative_path(&resolve(path), &resolve(base)))
+        .unwrap_or_else(|| path.to_path_buf());
+    label.to_string_lossy().replace('\\', "/")
+}
+
+/// `path` relative to `base`, through `..` where it lies outside it. `None`
+/// when they share no root (another drive).
+fn relative_path(path: &Path, base: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    let path: Vec<Component<'_>> = path.components().collect();
+    let base: Vec<Component<'_>> = base.components().collect();
+    let common = path
+        .iter()
+        .zip(&base)
+        .take_while(|(left, right)| left == right)
+        .count();
+    if common == 0 {
+        return None;
+    }
+    let mut relative = PathBuf::new();
+    for _ in common..base.len() {
+        relative.push("..");
+    }
+    for component in &path[common..] {
+        relative.push(component.as_os_str());
+    }
+    (!relative.as_os_str().is_empty()).then_some(relative)
 }
 
 fn write_project_profile_if_requested(
@@ -3178,27 +3269,10 @@ fn collect_c_dictionary_tokens_for_harness(
     source: &str,
     target_includes: &[String],
     include_dirs: &[PathBuf],
-) -> Vec<String> {
-    let mut tokens = Vec::new();
-    if let Ok(source_tokens) = c_parser::extract_c_dictionary_tokens(source) {
-        push_unique_dictionary_tokens(&mut tokens, source_tokens);
-    }
-    for include in target_includes {
-        for dir in include_dirs {
-            let header = dir.join(include);
-            if header == source_path {
-                continue;
-            }
-            let Ok(header_source) = fs::read_to_string(&header) else {
-                continue;
-            };
-            if let Ok(header_tokens) = c_parser::extract_c_dictionary_tokens(&header_source) {
-                push_unique_dictionary_tokens(&mut tokens, header_tokens);
-            }
-            break;
-        }
-    }
-    tokens
+) -> Vec<MinedToken> {
+    collect_c_family_dictionary_tokens(source_path, source, target_includes, include_dirs, |text| {
+        c_parser::extract_c_dictionary_tokens_located(text).ok()
+    })
 }
 
 fn collect_cpp_dictionary_tokens_for_harness(
@@ -3206,11 +3280,34 @@ fn collect_cpp_dictionary_tokens_for_harness(
     source: &str,
     target_includes: &[String],
     include_dirs: &[PathBuf],
-) -> Vec<String> {
+) -> Vec<MinedToken> {
+    collect_c_family_dictionary_tokens(source_path, source, target_includes, include_dirs, |text| {
+        cpp_parser::extract_cpp_dictionary_tokens_located(text).ok()
+    })
+}
+
+/// The dictionary tokens of a C or C++ target source and the first copy of
+/// each header it includes found in `include_dirs`, each with where it was
+/// found (files named relative to the source's directory).
+fn collect_c_family_dictionary_tokens(
+    source_path: &Path,
+    source: &str,
+    target_includes: &[String],
+    include_dirs: &[PathBuf],
+    extract: impl Fn(&str) -> Option<Vec<c_parser::LocatedToken>>,
+) -> Vec<MinedToken> {
+    let base = source_path.parent();
     let mut tokens = Vec::new();
-    if let Ok(source_tokens) = cpp_parser::extract_cpp_dictionary_tokens(source) {
-        push_unique_dictionary_tokens(&mut tokens, source_tokens);
-    }
+    let mut add = |path: &Path, text: &str| {
+        if let Some(located) = extract(text) {
+            push_located_tokens(
+                &mut tokens,
+                &dictionary_source_label(path, base),
+                located.into_iter().map(|token| (token.value, token.lines)),
+            );
+        }
+    };
+    add(source_path, source);
     for include in target_includes {
         for dir in include_dirs {
             let header = dir.join(include);
@@ -3220,19 +3317,11 @@ fn collect_cpp_dictionary_tokens_for_harness(
             let Ok(header_source) = fs::read_to_string(&header) else {
                 continue;
             };
-            if let Ok(header_tokens) = cpp_parser::extract_cpp_dictionary_tokens(&header_source) {
-                push_unique_dictionary_tokens(&mut tokens, header_tokens);
-            }
+            add(&header, &header_source);
             break;
         }
     }
     tokens
-}
-
-fn push_unique_dictionary_tokens(tokens: &mut Vec<String>, incoming: Vec<String>) {
-    for token in incoming {
-        push_unique_dictionary_token(tokens, token);
-    }
 }
 
 /// The first lines of a harness's `dictionary.txt`: where its tokens come
@@ -3240,24 +3329,31 @@ fn push_unique_dictionary_tokens(tokens: &mut Vec<String>, incoming: Vec<String>
 pub(crate) const DICTIONARY_HEADER: &str = "\
 # Tokens mined from the target's source when this harness was generated:
 # string literals (not #include paths), case labels, comparison literals,
-# #define values and enum members. Not runtime evidence: comparison operands
-# observed while fuzzing are in cmplog.jsonl beside this file.
+# #define values and enum members. The `# from <file>:<line>` line above a
+# token names up to three places it was found (files relative to the target
+# source's directory). Not runtime evidence: comparison operands observed
+# while fuzzing are in learned_dictionary.txt and cmplog.jsonl beside this file.
 ";
 
-pub(crate) fn write_harness_dictionary(output_dir: &Path, tokens: &[String]) -> Result<()> {
+pub(crate) fn write_harness_dictionary(output_dir: &Path, tokens: &[MinedToken]) -> Result<()> {
     if tokens.is_empty() {
         return Ok(());
     }
     // AFL, libFuzzer and bhf's own dictionary parser skip `#` lines.
     let mut out = String::from(DICTIONARY_HEADER);
     for token in tokens {
+        if let Some(places) = dictionary_places(&token.sources) {
+            out.push_str("# from ");
+            out.push_str(&places);
+            out.push('\n');
+        }
         out.push('"');
-        out.push_str(&escape_afl_dictionary_token(token.as_bytes()));
+        out.push_str(&escape_afl_dictionary_token(token.value.as_bytes()));
         out.push_str("\"\n");
         // #379: also emit the raw little- and big-endian bytes of a numeric
         // magic constant so the dictionary matches the bytes the target
         // compares, not the ASCII spelling of the literal.
-        let encodings = numeric_token_byte_encodings(token);
+        let encodings = numeric_token_byte_encodings(&token.value);
         if !encodings.is_empty() {
             out.push_str("# raw bytes of the literal above\n");
         }
@@ -3269,6 +3365,36 @@ pub(crate) fn write_harness_dictionary(output_dir: &Path, tokens: &[String]) -> 
     }
     fs::write(output_dir.join("dictionary.txt"), out)
         .with_context(|| format!("write dictionary in {}", output_dir.display()))
+}
+
+/// `file:line, file:line` for a token's places, each file's lines ascending,
+/// files in the order they were mined; `None` for a token with none. A control
+/// character in a file name would end the comment line, so it is shown as `?`.
+fn dictionary_places(sources: &[(String, u32)]) -> Option<String> {
+    if sources.is_empty() {
+        return None;
+    }
+    let mut files: Vec<&str> = Vec::new();
+    for (file, _) in sources {
+        if !files.contains(&file.as_str()) {
+            files.push(file);
+        }
+    }
+    let mut ordered: Vec<&(String, u32)> = sources.iter().collect();
+    ordered.sort_by_key(|(file, line)| (files.iter().position(|f| f == file), *line));
+    Some(
+        ordered
+            .iter()
+            .map(|(file, line)| {
+                let file: String = file
+                    .chars()
+                    .map(|c| if c.is_control() { '?' } else { c })
+                    .collect();
+                format!("{file}:{line}")
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
 }
 
 /// Parse a C integer literal (hex `0x..`, octal `0..`, or decimal), tolerating
@@ -3314,15 +3440,16 @@ fn numeric_token_byte_encodings(token: &str) -> Vec<Vec<u8>> {
     }
 }
 
-fn escape_afl_dictionary_token(token: &[u8]) -> String {
+/// A dictionary token as the inside of an AFL/libFuzzer quoted entry. Both
+/// engines accept only `\\`, `\"` and `\xNN` escapes (AFL++ drops a line
+/// with `\n`, libFuzzer rejects the whole file), so every other byte outside
+/// printable ASCII, CR, LF and TAB included, is written as `\xNN`.
+pub(crate) fn escape_afl_dictionary_token(token: &[u8]) -> String {
     let mut out = String::new();
     for byte in token {
         match *byte {
             b'\\' => out.push_str("\\\\"),
             b'"' => out.push_str("\\\""),
-            b'\n' => out.push_str("\\n"),
-            b'\r' => out.push_str("\\r"),
-            b'\t' => out.push_str("\\t"),
             0x20..=0x7e => out.push(char::from(*byte)),
             other => out.push_str(&format!("\\x{other:02x}")),
         }
@@ -9588,6 +9715,36 @@ fn foreign_guard_branches(directive_after_hash: &str) -> (bool, bool) {
 }
 
 fn direct_project_includes(source: &str, include_dirs: &[PathBuf]) -> Vec<String> {
+    include_spellings(source)
+        .into_iter()
+        .filter(|header| {
+            let Some(resolved) = include_dirs
+                .iter()
+                .map(|dir| dir.join(header))
+                .find(|p| p.is_file())
+            else {
+                return false;
+            };
+            // Compile databases legitimately publish `-isystem` roots alongside
+            // project `-I` roots. Those paths are needed by the compiler, but their
+            // implementation headers must never be flattened into generated source:
+            // explicitly including libstdc++ `bits/*` dependencies out of order
+            // breaks otherwise valid headers (RE2 + Abseil's <atomic> was the real
+            // reproducer). The original public header will include them correctly.
+            // A feature-gated OpenMP source TU (`#pragma omp` / `<omp.h>`) only
+            // compiles with `-fopenmp`; the harness never enables it, so dropping
+            // it from the include closure keeps the core target buildable (base64
+            // `lib_openmp.c`).
+            !is_host_toolchain_header(&resolved) && !is_openmp_translation_unit(&resolved)
+        })
+        .collect()
+}
+
+/// The headers `source` `#include`s, in order and each once, as spelled:
+/// without those in a foreign-OS-only `#if` branch and without textually
+/// included implementation fragments. Whether each one is a project header
+/// depends on the include dirs it is looked up in.
+fn include_spellings(source: &str) -> Vec<String> {
     let mut includes = Vec::new();
     // (skip-current-branch, skip-else-branch) per open `#if`. An include inside a
     // foreign-OS-only branch is dropped: it never compiles on the host, and pulling
@@ -9642,32 +9799,9 @@ fn direct_project_includes(source: &str, include_dirs: &[PathBuf]) -> Vec<String
             continue;
         }
         let header = header.to_owned();
-        if includes.contains(&header) {
-            continue;
+        if !includes.contains(&header) {
+            includes.push(header);
         }
-        let Some(resolved) = include_dirs
-            .iter()
-            .map(|dir| dir.join(&header))
-            .find(|p| p.is_file())
-        else {
-            continue;
-        };
-        // Compile databases legitimately publish `-isystem` roots alongside
-        // project `-I` roots. Those paths are needed by the compiler, but their
-        // implementation headers must never be flattened into generated source:
-        // explicitly including libstdc++ `bits/*` dependencies out of order
-        // breaks otherwise valid headers (RE2 + Abseil's <atomic> was the real
-        // reproducer). The original public header will include them correctly.
-        if is_host_toolchain_header(&resolved) {
-            continue;
-        }
-        // A feature-gated OpenMP source TU (`#pragma omp` / `<omp.h>`) only compiles
-        // with `-fopenmp`; the harness never enables it, so dropping it from the
-        // include closure keeps the core target buildable (base64 `lib_openmp.c`).
-        if is_openmp_translation_unit(&resolved) {
-            continue;
-        }
-        includes.push(header);
     }
     includes
 }
@@ -11113,6 +11247,254 @@ pub(crate) fn cpp_default_constructible_parameter_classes(
         }
     }
     registered.into_iter().collect()
+}
+
+/// The type registry discovery and `bhf list targets` rank a C or C++ file's
+/// targets with: the typedefs of the file and of the project headers in its
+/// transitive include closure (looked up in the include dirs generation
+/// uses), so a parameter spelled through a project typedef (`const u8_t
+/// *data`, `u32_t len`) is ranked as the type it aliases. Empty (built-in
+/// spellings only) unless some parameter needs it (see
+/// [`target_rank::needs_type_registry`]). Each header is parsed once per
+/// process (see [`ranking_header`]), not once per file that includes it, and
+/// the file's own aliases are read from its text (see [`simple_aliases`]).
+pub(crate) fn ranking_type_registry<'a>(
+    source_path: &Path,
+    source: &str,
+    cpp: bool,
+    param_lists: impl IntoIterator<Item = Vec<(&'a str, &'a str)>>,
+) -> type_model::TypeRegistry {
+    if !param_lists
+        .into_iter()
+        .any(|params| target_rank::needs_type_registry(&params))
+    {
+        return type_model::TypeRegistry::default();
+    }
+    let target_dir = source_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut include_dirs = vec![target_dir.to_path_buf()];
+    for include in auto_detect_project_includes(source_path) {
+        if !include_dirs.contains(&include) {
+            include_dirs.push(include);
+        }
+    }
+    let mut queue = auto_detect_c_headers(source_path, target_dir);
+    queue.extend(include_spellings(source));
+    // Ranking reads only what an alias resolves to, so the source's structs
+    // and enums are left out like the headers' are, and its aliases are read
+    // from its text: a second parse of the file costs as much as its function
+    // parse.
+    let source_typedefs = c_parser::CTypeDefs {
+        structs: Vec::new(),
+        enums: Vec::new(),
+        typedefs: simple_aliases(source),
+    };
+    let source_canonical = fs::canonicalize(source_path).ok();
+    let mut visited: HashSet<PathBuf> = HashSet::new();
+    let mut headers: Vec<std::sync::Arc<RankingHeader>> = Vec::new();
+    // Breadth-first, so the typedefs of the headers the file names directly
+    // win over a same-named one deeper in the closure.
+    let mut at = 0;
+    while at < queue.len() && headers.len() < MAX_TRANSITIVE_HEADERS {
+        let include = queue[at].clone();
+        at += 1;
+        let Some(path) = include_dirs
+            .iter()
+            .map(|dir| dir.join(&include))
+            .find(|path| path.is_file())
+        else {
+            continue;
+        };
+        let Ok(canonical) = fs::canonicalize(&path) else {
+            continue;
+        };
+        if Some(&canonical) == source_canonical.as_ref() || !visited.insert(canonical.clone()) {
+            continue;
+        }
+        let Some(header) = ranking_header(&canonical, cpp) else {
+            continue;
+        };
+        queue.extend(header.includes.iter().cloned());
+        headers.push(header);
+    }
+    type_model::TypeRegistry::from_defs(
+        std::iter::once(&source_typedefs).chain(headers.iter().map(|header| &header.typedefs)),
+    )
+}
+
+/// The simple aliases `source` declares: `typedef <type> NAME[, NAME2];` and
+/// `using NAME = <type>;` statements that begin a line and have no body,
+/// pointer, reference, array, template or function type. Every alias that
+/// can resolve to a scalar has this form.
+fn simple_aliases(source: &str) -> Vec<c_parser::CTypedefDef> {
+    let identifier = |text: &str| {
+        text.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && text.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
+    let lines: Vec<&str> = source.lines().collect();
+    let mut aliases = Vec::new();
+    for (at, line) in lines.iter().enumerate() {
+        let start = line.trim_start();
+        let (typedef, rest) = if let Some(rest) = start.strip_prefix("typedef") {
+            (true, rest)
+        } else if let Some(rest) = start.strip_prefix("using") {
+            (false, rest)
+        } else {
+            continue;
+        };
+        if !rest.starts_with(char::is_whitespace) {
+            continue;
+        }
+        // The statement, up to its `;`, within a few lines.
+        let mut statement = rest.to_owned();
+        let mut next = at + 1;
+        while !statement.contains(';') && next < lines.len() && next <= at + 4 {
+            statement.push('\n');
+            statement.push_str(lines[next]);
+            next += 1;
+        }
+        let Some((statement, _)) = statement.split_once(';') else {
+            continue;
+        };
+        let statement = strip_statement_comments(statement);
+        if statement.contains(['{', '}', '(', ')', '[', ']', '<', '>', '&', '"', '\'', '#']) {
+            continue;
+        }
+        let line = u32::try_from(at + 1).unwrap_or(u32::MAX);
+        let mut alias = |name: &str, underlying: &str| {
+            aliases.push(c_parser::CTypedefDef {
+                name: name.to_owned(),
+                underlying: underlying.to_owned(),
+                line,
+            })
+        };
+        if typedef {
+            // `typedef unsigned char u8_t, *pu8_t;`: the first declarator,
+            // and every later one that is a plain name, alias the base type.
+            let mut parts = statement.split(',');
+            let first = parts.next().unwrap_or_default();
+            if first.contains('*') {
+                continue;
+            }
+            let words: Vec<&str> = first.split_whitespace().collect();
+            let [base @ .., name] = words.as_slice() else {
+                continue;
+            };
+            if base.is_empty() || !identifier(name) {
+                continue;
+            }
+            let underlying = base.join(" ");
+            alias(name, &underlying);
+            for other in parts.map(str::trim).filter(|other| identifier(other)) {
+                alias(other, &underlying);
+            }
+        } else if let Some((name, underlying)) = statement
+            .split_once('=')
+            .filter(|_| !statement.contains('*'))
+        {
+            let name = name.trim();
+            let underlying = underlying.split_whitespace().collect::<Vec<_>>().join(" ");
+            if identifier(name) && name != "namespace" && !underlying.is_empty() {
+                alias(name, &underlying);
+            }
+        }
+    }
+    aliases
+}
+
+/// `statement` without its `/* ... */` and `// ...` comments.
+fn strip_statement_comments(statement: &str) -> String {
+    let mut out = String::with_capacity(statement.len());
+    let mut rest = statement;
+    loop {
+        let block = rest.find("/*");
+        let line = rest.find("//");
+        match (block, line) {
+            (Some(b), l) if l.is_none_or(|l| b < l) => {
+                out.push_str(&rest[..b]);
+                out.push(' ');
+                rest = rest[b + 2..]
+                    .split_once("*/")
+                    .map(|(_, after)| after)
+                    .unwrap_or("");
+            }
+            (_, Some(l)) => {
+                out.push_str(&rest[..l]);
+                out.push(' ');
+                rest = rest[l..]
+                    .split_once('\n')
+                    .map(|(_, after)| after)
+                    .unwrap_or("");
+            }
+            _ => {
+                out.push_str(rest);
+                return out;
+            }
+        }
+    }
+}
+
+/// What ranking reads from one header: its typedefs and the headers it
+/// `#include`s, as spelled.
+#[derive(Debug)]
+pub(crate) struct RankingHeader {
+    typedefs: c_parser::CTypeDefs,
+    includes: Vec<String>,
+}
+
+/// A file's size and modification time: a cached parse of it is reused while
+/// both are unchanged.
+type FileStamp = (u64, Option<std::time::SystemTime>);
+
+/// Most headers [`ranking_header`] keeps parsed; the cache starts over past it.
+const RANKING_HEADER_CACHE_MAX: usize = 16_384;
+
+/// The parse of the header at `canonical` (a canonical path) that ranking
+/// uses, as C or C++. Discovery ranks every file of a tree and most of them
+/// include the same project headers, so a header is parsed the first time it
+/// is asked for and reused until its size or modification time changes.
+pub(crate) fn ranking_header(canonical: &Path, cpp: bool) -> Option<std::sync::Arc<RankingHeader>> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    type Cache = HashMap<(PathBuf, bool), (FileStamp, Arc<RankingHeader>)>;
+    static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let stamp = |path: &Path| -> Option<FileStamp> {
+        let meta = fs::metadata(path).ok()?;
+        Some((meta.len(), meta.modified().ok()))
+    };
+    let key = (canonical.to_path_buf(), cpp);
+    let before = stamp(canonical)?;
+    if let Some((cached, header)) = cache.lock().ok()?.get(&key) {
+        if *cached == before {
+            return Some(Arc::clone(header));
+        }
+    }
+    let text = crate::source_text::read_source_text(canonical).ok()?;
+    let typedefs = if cpp {
+        cpp_parser::parse_cpp_type_defs(&text).ok()
+    } else {
+        c_parser::parse_c_type_defs(&text).ok()
+    }
+    .map(|defs| defs.typedefs)
+    .unwrap_or_default();
+    let header = Arc::new(RankingHeader {
+        typedefs: c_parser::CTypeDefs {
+            structs: Vec::new(),
+            enums: Vec::new(),
+            typedefs,
+        },
+        includes: include_spellings(&text),
+    });
+    // A header rewritten while it was read is parsed again next time.
+    if stamp(canonical) == Some(before) {
+        let mut cache = cache.lock().ok()?;
+        if cache.len() >= RANKING_HEADER_CACHE_MAX {
+            cache.clear();
+        }
+        cache.insert(key, (before, Arc::clone(&header)));
+    }
+    Some(header)
 }
 
 /// Known-unbuildable C++ signatures for discovery ranking. This uses the same
@@ -17686,6 +18068,15 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         assert!(dictionary.contains("\"Mode_Fast\""));
         assert!(dictionary.contains("\"Mode_Safe\""));
         assert!(dictionary.contains("\"READY\""));
+        // Each token says where in the source it was found.
+        assert!(
+            dictionary.contains("# from parser.adb:5\n\"READY\"\n"),
+            "{dictionary}"
+        );
+        assert!(
+            dictionary.contains("# from parser.adb:2\n\"Mode_Fast\"\n"),
+            "{dictionary}"
+        );
     }
 
     #[test]
@@ -21399,6 +21790,187 @@ class basic_json
         assert!(dictionary.contains("\"READY\""));
     }
 
+    /// Ranking parses a project header once however many files include it,
+    /// and again only after the header changes.
+    #[test]
+    fn ranking_reuses_a_parsed_header_until_it_changes() {
+        use type_model::{ScalarKind, TypeShape};
+        let temp = temp_dir("ranking-header-cache");
+        let include = temp.join("include");
+        fs::create_dir_all(&include).unwrap();
+        let header = include.join("widget_types.h");
+        fs::write(&header, "typedef unsigned char u8_t;\n").unwrap();
+        let canonical = fs::canonicalize(&header).unwrap();
+        let first = super::ranking_header(&canonical, false).unwrap();
+        let resolve = |name: &str| {
+            let path = temp.join(format!("{name}.c"));
+            let source = format!(
+                "#include \"widget_types.h\"\n\
+                 int {name}(const u8_t *data, unsigned long len) {{ return data[0] + (int)len; }}\n"
+            );
+            fs::write(&path, &source).unwrap();
+            super::ranking_type_registry(
+                &path,
+                &source,
+                false,
+                [vec![("data", "const u8_t *"), ("len", "unsigned long")]],
+            )
+            .resolve("u8_t")
+        };
+        for name in ["parse_record", "parse_widget"] {
+            assert_eq!(resolve(name), TypeShape::Scalar(ScalarKind::U8), "{name}");
+        }
+        // An alias the file declares itself, across a line break, is read too.
+        let local = temp.join("local.c");
+        let source = "typedef unsigned\n    short len16_t;\n\
+                      int parse_local(const char *data, len16_t len) { return data[len]; }\n";
+        fs::write(&local, source).unwrap();
+        let registry = super::ranking_type_registry(
+            &local,
+            source,
+            false,
+            [vec![("data", "const char *"), ("len", "len16_t")]],
+        );
+        assert_eq!(
+            registry.resolve("len16_t"),
+            TypeShape::Scalar(ScalarKind::U16)
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &super::ranking_header(&canonical, false).unwrap()),
+            "both files ranked from the one parse"
+        );
+        // A rewrite (here of another size) is parsed again.
+        fs::write(&header, "typedef unsigned int u8_t; /* widened */\n").unwrap();
+        let changed = super::ranking_header(&canonical, false).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&first, &changed));
+        assert_eq!(resolve("parse_record"), TypeShape::Scalar(ScalarKind::U32));
+        fs::remove_dir_all(&temp).ok();
+    }
+
+    /// A file's own aliases are read from its text: the scalar-shaped
+    /// `typedef` and `using` statements, across line breaks and around
+    /// comments, and not a commented-out one or a pointer, array, function
+    /// or aggregate alias.
+    #[test]
+    fn ranking_reads_the_simple_aliases_a_file_declares() {
+        let aliases = super::simple_aliases(
+            "// typedef unsigned char commented_t;\n\
+             typedef unsigned char u8_t, byte_t, *pu8_t;\n\
+             typedef unsigned /* width */\n\
+             \x20   short // bits\n\
+             \x20   len16_t;\n\
+             \x20 using size16 = std::uint16_t;\n\
+             using namespace widgets;\n\
+             typedef char name_t[16];\n\
+             typedef int (*callback_t)(int);\n\
+             typedef struct widget { int x; } widget_t;\n\
+             typedef const char *label_t;\n\
+             int parse_record(const u8_t *data, len16_t len);\n",
+        );
+        let found: Vec<(&str, &str, u32)> = aliases
+            .iter()
+            .map(|a| (a.name.as_str(), a.underlying.as_str(), a.line))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("u8_t", "unsigned char", 2),
+                ("byte_t", "unsigned char", 2),
+                ("len16_t", "unsigned short", 3),
+                ("size16", "std::uint16_t", 6),
+            ]
+        );
+    }
+
+    /// CR, LF, TAB and other control bytes are written as `\xNN`, the only
+    /// escape AFL++ and libFuzzer read besides `\\` and `\"`, and each line
+    /// reads back as the token's bytes.
+    #[test]
+    fn dictionary_control_bytes_are_written_as_hex_escapes() {
+        let token = b"GET /\r\n\tX\x01\\\"";
+        let escaped = super::escape_afl_dictionary_token(token);
+        assert_eq!(escaped, "GET /\\x0d\\x0a\\x09X\\x01\\\\\\\"");
+        let line = format!("\"{escaped}\"");
+        assert_eq!(
+            crate::fuzz::parse_afl_dictionary_line(&line).unwrap(),
+            Some(token.to_vec())
+        );
+    }
+
+    /// Every mined token is preceded by a `# from <file>:<line>` comment naming
+    /// up to three places it was found, header tokens relative to the target's
+    /// directory, and the file stays a valid AFL dictionary.
+    #[test]
+    fn harness_dictionary_names_where_each_token_was_found() {
+        let temp = temp_dir("c-dictionary-provenance");
+        let include = temp.join("include");
+        fs::create_dir_all(&include).unwrap();
+        let header = include.join("widget.h");
+        let source = temp.join("widget.c");
+        fs::write(
+            &header,
+            "#define WIDGET_MAGIC \"WGT1\"\n\
+             enum widget_mode { WIDGET_FAST, WIDGET_SAFE };\n",
+        )
+        .unwrap();
+        fs::write(
+            &source,
+            "#include \"widget.h\"\n\
+             #include <string.h>\n\
+             int parse_record(const char *s, int tag) {\n\
+               if (tag == 77) return 1;\n\
+               if (tag != 77) return 2;\n\
+               if (tag > 77) return 3;\n\
+               if (tag < 77) return 4;\n\
+               return s && !strcmp(s, \"WGT1\");\n\
+             }\n",
+        )
+        .unwrap();
+
+        run(GenerateHarnessArgs {
+            source: source.clone(),
+            target: Some("parse_record".to_owned()),
+            target_line: None,
+            output: temp.join("out"),
+            id: Some("H-CPROV".to_owned()),
+            kind: "direct".to_owned(),
+            source_roots: Vec::new(),
+            project: None,
+            source_trees: Vec::new(),
+            extra_sources: Vec::new(),
+            extra_includes: vec![include.clone()],
+            cleanup: None,
+            template_instantiate: Vec::new(),
+            tree_type_defs: None,
+            decoder_limits: Default::default(),
+            force: false,
+            archive_backed: false,
+            environment: None,
+        })
+        .unwrap();
+
+        let dictionary = fs::read_to_string(temp.join("out/H-CPROV/dictionary.txt")).unwrap();
+        assert!(
+            dictionary.contains("# from widget.c:8, include/widget.h:1\n\"WGT1\"\n"),
+            "a token found in the source and a header names both:\n{dictionary}"
+        );
+        assert!(
+            dictionary.contains("# from include/widget.h:2\n\"WIDGET_SAFE\"\n"),
+            "{dictionary}"
+        );
+        assert!(
+            dictionary.contains("# from widget.c:4, widget.c:5, widget.c:6\n\"77\"\n"),
+            "repeats are capped at three places:\n{dictionary}"
+        );
+        for line in dictionary.lines() {
+            let parsed = crate::fuzz::parse_afl_dictionary_line(line);
+            assert!(parsed.is_ok(), "invalid AFL dictionary line {line:?}");
+            if line.starts_with('#') || line.trim().is_empty() {
+                assert_eq!(parsed.unwrap(), None, "{line:?}");
+            }
+        }
+    }
+
     #[test]
     fn generate_cpp_harness_writes_dictionary_from_header_constants() {
         let temp = temp_dir("cpp-dictionary");
@@ -21446,6 +22018,14 @@ class basic_json
         assert!(dictionary.contains("\"0x504b0304\""));
         assert!(dictionary.contains("\"MODE_FAST\""));
         assert!(dictionary.contains("\"MODE_SAFE\""));
+        assert!(
+            dictionary.contains("# from parser.hpp:1\n\"GIF89a\"\n"),
+            "{dictionary}"
+        );
+        assert!(
+            dictionary.contains("# from parser.hpp:3\n\"MODE_SAFE\"\n"),
+            "{dictionary}"
+        );
     }
 
     #[test]

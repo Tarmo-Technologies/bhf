@@ -325,6 +325,24 @@ pub(crate) fn append_cmplog_records(runtrace_log: &std::path::Path, snapshot: &s
     }
 }
 
+/// After a fuzz pass: add its cmplog records to `<harness_dir>/cmplog.jsonl`
+/// (which the next pass loads) and rewrite the learned dictionary from it
+/// (which later runs load; see [`crate::fuzz::write_learned_dictionary`]).
+pub(crate) fn harvest_pass_cmplog(harness_dir: &std::path::Path) {
+    append_cmplog_records(
+        &harness_dir.join("runtrace.jsonl"),
+        &harness_dir.join("cmplog.jsonl"),
+    );
+    if let Err(error) = crate::fuzz::write_learned_dictionary(harness_dir) {
+        bhfeprintln!(
+            "bhf auto: warning: could not write {}: {error}",
+            harness_dir
+                .join(crate::fuzz::LEARNED_DICTIONARY_FILE)
+                .display()
+        );
+    }
+}
+
 /// Where `bhf auto` sets aside the corpus of a work dir from an earlier
 /// release: kept, but outside `corpus/`, which every pass reseeds from.
 pub(crate) const LEGACY_CORPUS_DIR: &str = results::migrate::LEGACY_CORPUS_DIR;
@@ -1083,34 +1101,40 @@ fn cpp_owner_class(name: &str) -> Option<&str> {
 /// `dictionary.txt` for the interpreted/managed lanes (Rust/Go/Java/Python/Perl),
 /// so the builtin engine can splice constants past `==`/match guards. C/C++/Ada
 /// already write their own dictionary at harness-gen, so they're skipped here.
-/// Best-effort: a parse error is ignored, and an existing dictionary is not
-/// clobbered (a lane's own harness-gen wins if it wrote one).
+/// Each token is preceded by a `# from <file>:<line>` comment naming where in
+/// `source_path` it was found. Best-effort: a parse error is ignored, and an
+/// existing dictionary is not clobbered (a lane's own harness-gen wins if it
+/// wrote one).
 fn write_source_dictionary(
     harness_dir: &Path,
     source: Option<&str>,
+    source_path: &Path,
     lang: crate::auto::candidate::Lang,
 ) {
     use crate::auto::candidate::Lang;
     let Some(source) = source else {
         return;
     };
-    let tokens = match lang {
-        Lang::Rust => rust_parser::extract_rust_dictionary_tokens(source).ok(),
-        Lang::Go => go_parser::extract_go_dictionary_tokens(source).ok(),
-        Lang::Java => java_parser::extract_java_dictionary_tokens(source).ok(),
-        Lang::Python => python_parser::extract_python_dictionary_tokens(source).ok(),
-        Lang::Perl => perl_parser::extract_perl_dictionary_tokens(source).ok(),
+    let located: Option<Vec<(String, Vec<u32>)>> = match lang {
+        Lang::Rust => rust_parser::extract_rust_dictionary_tokens_located(source).ok(),
+        Lang::Go => go_parser::extract_go_dictionary_tokens_located(source).ok(),
+        Lang::Java => java_parser::extract_java_dictionary_tokens_located(source).ok(),
+        Lang::Python => python_parser::extract_python_dictionary_tokens_located(source).ok(),
+        Lang::Perl => perl_parser::extract_perl_dictionary_tokens_located(source).ok(),
         // C#/JS carry no CmpLog in the managed/interpreted driver, so a source-mined
         // dictionary is the lever past a single multi-byte comparison gate (the same
         // reason the other managed lanes mine one). Scan the source's string/number
         // literals (JS also allows backtick template literals).
-        Lang::CSharp => Some(crate::auto::lit_scan::scan_literal_tokens(source, false)),
+        Lang::CSharp => Some(crate::auto::lit_scan::scan_literal_tokens_located(
+            source, false,
+        )),
         Lang::Js | Lang::Ts => {
-            let mut toks = crate::auto::lit_scan::scan_literal_tokens(source, true);
+            let mut toks = crate::auto::lit_scan::scan_literal_tokens_located(source, true);
             // Seed the prototype-pollution vectors + complete JSON payloads so the
             // fuzzer can reach an unsafe merge/set path (the BHF-509 detector then
             // confirms the pollution). The full-payload tokens let a JSON.parse-based
             // merge — the common vulnerable shape — be reached by splicing one token.
+            // They are bhf's own, so they name no source line.
             for v in [
                 "__proto__",
                 "constructor",
@@ -1119,26 +1143,35 @@ fn write_source_dictionary(
                 "{\"constructor\":{\"prototype\":{\"bhfpp\":1}}}",
                 "__proto__.bhfpp",
             ] {
-                if !toks.iter().any(|t| t == v) {
-                    toks.push(v.to_owned());
+                if !toks.iter().any(|(t, _)| t == v) {
+                    toks.push((v.to_owned(), Vec::new()));
                 }
             }
             Some(toks)
         }
         // Ruby carries no CmpLog in the interpreted driver, so a source-mined
         // dictionary is the lever past a multi-byte comparison gate.
-        Lang::Ruby => Some(crate::auto::ruby::extract_ruby_dictionary_tokens(source)),
-        Lang::Lua => Some(crate::auto::lua::extract_lua_dictionary_tokens(source)),
-        Lang::Php => Some(crate::auto::php::extract_php_dictionary_tokens(source)),
+        Lang::Ruby => Some(crate::auto::ruby::extract_ruby_dictionary_tokens_located(
+            source,
+        )),
+        Lang::Lua => Some(crate::auto::lua::extract_lua_dictionary_tokens_located(
+            source,
+        )),
+        Lang::Php => Some(crate::auto::php::extract_php_dictionary_tokens_located(
+            source,
+        )),
         // COBOL/Fortran are fuzzed through the generated C; the dictionary comes from that C.
         Lang::Ada | Lang::C | Lang::Cpp | Lang::Cobol | Lang::Fortran => None,
     };
-    let Some(tokens) = tokens else {
+    let Some(located) = located else {
         return;
     };
-    if tokens.is_empty() || harness_dir.join("dictionary.txt").exists() {
+    if located.is_empty() || harness_dir.join("dictionary.txt").exists() {
         return;
     }
+    let file = crate::generate_harness::dictionary_source_label(source_path, source_path.parent());
+    let mut tokens = Vec::new();
+    crate::generate_harness::push_located_tokens(&mut tokens, &file, located);
     let _ = crate::generate_harness::write_harness_dictionary(harness_dir, &tokens);
 }
 
@@ -1958,7 +1991,12 @@ fn run_attempt(
     // their string+integer literals into the same AFL dictionary the builtin engine
     // loads (with LE/BE byte encodings of numeric constants). Best-effort — a parse
     // failure never fails the attempt, and we never clobber a dict already written.
-    write_source_dictionary(&harness_dir, target_source.as_deref(), candidate.lang);
+    write_source_dictionary(
+        &harness_dir,
+        target_source.as_deref(),
+        &candidate.source_path,
+        candidate.lang,
+    );
 
     // #402 budget plan. `--per-target-time` is the TOTAL per-target fuzz wall,
     // split evenly across the passes under one shared deadline; `--total-time`
@@ -3257,8 +3295,9 @@ fn run_attempt(
                     };
                     // #378: harvest this pass's cmplog operands (from the
                     // runtrace log it just wrote) into the snapshot so the next
-                    // pass's mutator splices the magic bytes this pass observed.
-                    append_cmplog_records(&harness_dir.join("runtrace.jsonl"), &cmplog_snapshot);
+                    // pass's mutator splices the magic bytes this pass observed,
+                    // and into the learned dictionary later runs load.
+                    harvest_pass_cmplog(&harness_dir);
                     // Flush the pass's final counters. Live ticks are throttled
                     // and a sub-throttle pass emits none, so this is what makes a
                     // working run show real execs instead of the execs=0 start.
@@ -10371,9 +10410,84 @@ mod throughput_tests {
 }
 
 #[cfg(test)]
-mod cmplog_accumulate_tests {
-    use super::append_cmplog_records;
+mod source_dictionary_tests {
+    use super::write_source_dictionary;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// A managed lane's mined dictionary names the line of the target source
+    /// each token came from; tokens bhf adds itself carry no location.
+    #[test]
+    fn source_dictionary_names_the_line_of_each_token() {
+        use crate::auto::candidate::Lang;
+        let root = std::env::temp_dir().join(format!(
+            "bhf-source-dictionary-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let harness_dir = root.join("H-PY");
+        std::fs::create_dir_all(&harness_dir).unwrap();
+        let source_path = root.join("src").join("widget.py");
+        let source = "def parse_record(s):\n    return s == \"WGT1\"\nTAG = \"WGT1\"\n";
+        write_source_dictionary(&harness_dir, Some(source), &source_path, Lang::Python);
+        let dictionary = std::fs::read_to_string(harness_dir.join("dictionary.txt")).unwrap();
+        assert!(
+            dictionary.contains("# from widget.py:2, widget.py:3\n\"WGT1\"\n"),
+            "{dictionary}"
+        );
+
+        let js_dir = root.join("H-JS");
+        std::fs::create_dir_all(&js_dir).unwrap();
+        write_source_dictionary(
+            &js_dir,
+            Some("// widget\nfunction parseRecord(s) {\n  return s === 'WGT2';\n}\n"),
+            &root.join("widget.js"),
+            Lang::Js,
+        );
+        let dictionary = std::fs::read_to_string(js_dir.join("dictionary.txt")).unwrap();
+        assert!(
+            dictionary.contains("# from widget.js:3\n\"WGT2\"\n"),
+            "{dictionary}"
+        );
+        assert!(
+            dictionary.contains("\n\"__proto__\"\n") && !dictionary.contains(":0\n"),
+            "built-in tokens have no source line:\n{dictionary}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod cmplog_accumulate_tests {
+    use super::{append_cmplog_records, harvest_pass_cmplog};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// After a pass, its runtrace cmplog records reach cmplog.jsonl and the
+    /// learned dictionary the next pass and later runs load.
+    #[test]
+    fn a_pass_harvest_writes_the_learned_dictionary() {
+        let dir = std::env::temp_dir().join(format!(
+            "bhf-learned-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("runtrace.jsonl"),
+            "{\"e\":\"cmplog\",\"k\":\"strcmp\",\"a\":\"5747543100\",\"b\":\"41\"}\n",
+        )
+        .unwrap();
+        harvest_pass_cmplog(&dir);
+        let learned = std::fs::read_to_string(dir.join("learned_dictionary.txt")).unwrap();
+        assert!(learned.contains("\"WGT1\\x00\"\n"), "{learned}");
+        assert!(learned.contains("\"A\"\n"), "{learned}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn append_cmplog_records_accumulates_only_cmplog_lines() {

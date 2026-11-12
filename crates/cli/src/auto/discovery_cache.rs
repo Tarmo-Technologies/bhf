@@ -33,8 +33,9 @@ const CACHE_VERSION: u32 = 3;
 /// change. This deliberately invalidates an otherwise byte-identical source-tree
 /// cache produced by older target-selection logic. v2: the cached list keeps
 /// project fuzz drivers that library targets shadow, so an explicit selection
-/// can still pick one; `auto` drops the rest after its filters.
-pub(crate) const DISCOVERY_SEMANTIC_VERSION: u32 = 2;
+/// can still pick one; `auto` drops the rest after its filters. v3: ranking
+/// and input reachability read parameter types through the file's typedefs.
+pub(crate) const DISCOVERY_SEMANTIC_VERSION: u32 = 3;
 
 /// Filename written under the work dir.
 pub const CACHE_FILENAME: &str = "discovery-cache.json";
@@ -415,6 +416,23 @@ mod tests {
         assert!(load_if_valid(&file, Path::new("/src"), "fp").is_none());
         assert!(miss_reason(&file, Path::new("/src"), "fp").contains("discovery semantics"));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Candidates ranked before parameter types were read through the file's
+    /// typedefs (semantics v2) carry other scores and reachability verdicts,
+    /// so a build that cannot tell itself apart by commit must not reuse them.
+    #[test]
+    fn a_cache_ranked_without_typedef_resolution_is_not_reused() {
+        let dir = std::env::temp_dir().join(format!("bhf-disccache-v2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = cache_path(&dir);
+        let cands = vec![candidate("parse", Lang::C, None)];
+        let mut cache = DiscoveryCache::build(Path::new("/src"), "fp".to_owned(), &cands);
+        cache.discovery_semantic_version = 2;
+        write(&file, &cache).unwrap();
+        assert!(load_if_valid(&file, Path::new("/src"), "fp").is_none());
+        assert!(miss_reason(&file, Path::new("/src"), "fp").contains("discovery semantics v2"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

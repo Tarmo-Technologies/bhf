@@ -18,6 +18,7 @@
 // - Arity: 1–4 params is a sweet spot.
 
 use serde::Serialize;
+use type_model::{ScalarKind, TypeRegistry, TypeShape};
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CTarget {
@@ -345,22 +346,21 @@ pub fn rank_c_targets(functions: &[c_parser::CFunction]) -> Vec<CTarget> {
     rank_c_targets_with_provenance(functions, &std::collections::BTreeMap::new())
 }
 
-/// As [`rank_c_targets`], but with call-graph provenance for the TU (from
-/// [`detect_entry_point_provenance`]). A function whose name carries provenance
-/// is scored as a non-buffer RTOS/radar entry point — its `-20` no-attacker-input
-/// penalty is lifted and it earns a positive entry-point bonus — so an ISR
-/// handler / task entry / channel consumer that a signature-shape ranker sinks
-/// to `ReachabilityUnproven` is surfaced instead of found by accident.
-pub fn rank_c_targets_with_provenance(
+/// As [`rank_c_targets_with_provenance`], with parameter types read through
+/// `registry` (the file's typedefs and those of the headers it includes), so a
+/// byte buffer or length spelled through a project typedef (`const u8_t *`,
+/// `u32_t len`) is classified and scored like the type it aliases.
+pub fn rank_c_targets_with_types(
     functions: &[c_parser::CFunction],
     provenance: &std::collections::BTreeMap<String, EntryPointProvenance>,
+    registry: &TypeRegistry,
 ) -> Vec<CTarget> {
     let mut targets: Vec<CTarget> = functions
         .iter()
         .filter(|f| !is_allocator_free_primitive(&f.name))
         .map(|f| {
             let (breakdown, input_reachability) =
-                score_c_function(f, provenance.get(&f.name).copied());
+                score_c_function(f, provenance.get(&f.name).copied(), registry);
             CTarget {
                 name: f.name.clone(),
                 line: f.line,
@@ -374,12 +374,34 @@ pub fn rank_c_targets_with_provenance(
     targets
 }
 
+/// As [`rank_c_targets`], but with call-graph provenance for the TU (from
+/// [`detect_entry_point_provenance`]). A function whose name carries provenance
+/// is scored as a non-buffer RTOS/radar entry point — its `-20` no-attacker-input
+/// penalty is lifted and it earns a positive entry-point bonus — so an ISR
+/// handler / task entry / channel consumer that a signature-shape ranker sinks
+/// to `ReachabilityUnproven` is surfaced instead of found by accident.
+pub fn rank_c_targets_with_provenance(
+    functions: &[c_parser::CFunction],
+    provenance: &std::collections::BTreeMap<String, EntryPointProvenance>,
+) -> Vec<CTarget> {
+    rank_c_targets_with_types(functions, provenance, &TypeRegistry::default())
+}
+
 pub fn rank_cpp_targets(functions: &[cpp_parser::CppFunction]) -> Vec<CTarget> {
+    rank_cpp_targets_with_types(functions, &TypeRegistry::default())
+}
+
+/// As [`rank_cpp_targets`], with parameter types read through `registry` (see
+/// [`rank_c_targets_with_types`]).
+pub fn rank_cpp_targets_with_types(
+    functions: &[cpp_parser::CppFunction],
+    registry: &TypeRegistry,
+) -> Vec<CTarget> {
     let mut targets: Vec<CTarget> = functions
         .iter()
         .filter(|f| !cpp_api_is_unsupported_target(f))
         .map(|f| {
-            let (breakdown, input_reachability) = score_cpp_function(f);
+            let (breakdown, input_reachability) = score_cpp_function(f, registry);
             CTarget {
                 name: cpp_target_name(f),
                 line: f.line,
@@ -406,12 +428,15 @@ fn sort_targets(targets: &mut [CTarget]) {
 fn score_c_function(
     f: &c_parser::CFunction,
     provenance: Option<EntryPointProvenance>,
+    registry: &TypeRegistry,
 ) -> (CScoreBreakdown, InputReachability) {
-    let params: Vec<(&str, &str)> = f
+    let declared: Vec<(&str, &str)> = f
         .params
         .iter()
         .map(|p| (p.name.as_str(), p.c_type.as_str()))
         .collect();
+    let resolved = resolve_param_types(&declared, registry);
+    let params = param_refs(&resolved);
     let (mut b, reach) = score_from_signature(&f.name, &f.return_type, &params, provenance);
     // A call-graph-proven entry point (registered ISR/task/callback, or a
     // channel consumer) is fuzzable AS AN ENTRY regardless of its parameter
@@ -494,12 +519,17 @@ fn is_allocator_free_primitive(name: &str) -> bool {
     )
 }
 
-fn score_cpp_function(f: &cpp_parser::CppFunction) -> (CScoreBreakdown, InputReachability) {
+fn score_cpp_function(
+    f: &cpp_parser::CppFunction,
+    registry: &TypeRegistry,
+) -> (CScoreBreakdown, InputReachability) {
     let effective_params = f.effective_required_params();
-    let params: Vec<(&str, &str)> = effective_params
+    let declared: Vec<(&str, &str)> = effective_params
         .iter()
         .map(|p| (p.name.as_str(), p.cpp_type.as_str()))
         .collect();
+    let resolved = resolve_param_types(&declared, registry);
+    let params = param_refs(&resolved);
     let name = if f.qualifier_path.is_empty() {
         f.name.clone()
     } else {
@@ -892,6 +922,144 @@ pub fn classify_input_reachability(name: &str, params: &[(&str, &str)]) -> Input
         return InputReachability::OutputSerializer;
     }
     InputReachability::ReachabilityUnproven
+}
+
+/// [`classify_input_reachability`] with parameter types read through
+/// `registry`: a pointer to, or a value of, a project typedef that resolves to
+/// a scalar is classified as that scalar (`const u8_t *` as a byte buffer,
+/// `u32_t` as a length).
+pub fn classify_input_reachability_with_types(
+    name: &str,
+    params: &[(&str, &str)],
+    registry: &TypeRegistry,
+) -> InputReachability {
+    let resolved = resolve_param_types(params, registry);
+    classify_input_reachability(name, &param_refs(&resolved))
+}
+
+/// Whether ranking `params` can depend on typedefs a file declares: a type
+/// spelled with one name the built-in spellings do not resolve to a scalar,
+/// as a `const` pointer's pointee or by value. Discovery builds the file's
+/// type registry only for files with such a parameter.
+pub fn needs_type_registry(params: &[(&str, &str)]) -> bool {
+    let builtin = TypeRegistry::default();
+    params.iter().any(|(_, ty)| {
+        let Some((tokens, at)) = single_type_name(ty) else {
+            return false;
+        };
+        let pointer = tokens.iter().any(|t| t == "*");
+        let candidate = !pointer || tokens.iter().any(|t| t == "const");
+        candidate && !matches!(builtin.resolve(&tokens[at]), TypeShape::Scalar(_))
+    })
+}
+
+/// The parameters with each type rewritten by [`resolve_param_type`].
+fn resolve_param_types(params: &[(&str, &str)], registry: &TypeRegistry) -> Vec<(String, String)> {
+    params
+        .iter()
+        .map(|(name, ty)| {
+            (
+                (*name).to_owned(),
+                resolve_param_type(ty, registry).unwrap_or_else(|| (*ty).to_owned()),
+            )
+        })
+        .collect()
+}
+
+fn param_refs(params: &[(String, String)]) -> Vec<(&str, &str)> {
+    params
+        .iter()
+        .map(|(name, ty)| (name.as_str(), ty.as_str()))
+        .collect()
+}
+
+/// A parameter type spelled with one type name plus qualifiers, pointers and
+/// references (`const u8_t *`, `u32_t`, `u8_t const&`), as its tokens and the
+/// index of the name. `None` for a multi-word or qualified spelling, which the
+/// classifiers read as written.
+fn single_type_name(raw: &str) -> Option<(Vec<String>, usize)> {
+    let spaced = raw.replace('*', " * ").replace('&', " & ");
+    let tokens: Vec<String> = spaced.split_whitespace().map(str::to_owned).collect();
+    let names: Vec<usize> = tokens
+        .iter()
+        .enumerate()
+        .filter(|(_, token)| {
+            !matches!(
+                token.as_str(),
+                "const" | "volatile" | "restrict" | "__restrict" | "*" | "&"
+            )
+        })
+        .map(|(index, _)| index)
+        .collect();
+    let [at] = names.as_slice() else {
+        return None;
+    };
+    let name = &tokens[*at];
+    let identifier = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    (identifier && !SPELLED_SCALARS.contains(&name.as_str())).then_some((tokens, *at))
+}
+
+/// Type names the classifiers already read as written.
+const SPELLED_SCALARS: &[&str] = &[
+    "char",
+    "short",
+    "int",
+    "long",
+    "unsigned",
+    "signed",
+    "float",
+    "double",
+    "void",
+    "bool",
+    "_Bool",
+    "size_t",
+    "ssize_t",
+    "uint8_t",
+    "int8_t",
+    "uint16_t",
+    "int16_t",
+    "uint32_t",
+    "int32_t",
+    "uint64_t",
+    "int64_t",
+    "uintptr_t",
+    "intptr_t",
+    "ptrdiff_t",
+    "off_t",
+    "wchar_t",
+];
+
+/// `raw` with a type name that `registry` resolves to a scalar replaced by
+/// that scalar's fixed-width spelling (`const u8_t *` -> `const uint8_t *`,
+/// `DWORD` -> `uint32_t`). `None` when nothing resolves; a pointer typedef
+/// is left as spelled, since its pointee's constness is not visible.
+fn resolve_param_type(raw: &str, registry: &TypeRegistry) -> Option<String> {
+    let (mut tokens, at) = single_type_name(raw)?;
+    let TypeShape::Scalar(kind) = registry.resolve(&tokens[at]) else {
+        return None;
+    };
+    tokens[at] = scalar_spelling(kind).to_owned();
+    Some(tokens.join(" "))
+}
+
+fn scalar_spelling(kind: ScalarKind) -> &'static str {
+    match kind {
+        ScalarKind::Bool => "bool",
+        ScalarKind::I8 => "int8_t",
+        ScalarKind::U8 => "uint8_t",
+        ScalarKind::I16 => "int16_t",
+        ScalarKind::U16 => "uint16_t",
+        ScalarKind::I32 => "int32_t",
+        ScalarKind::U32 => "uint32_t",
+        ScalarKind::I64 => "int64_t",
+        ScalarKind::U64 => "uint64_t",
+        ScalarKind::F32 => "float",
+        ScalarKind::F64 => "double",
+    }
 }
 
 /// A byte typedef the lightweight ranker cannot resolve (`stbi_uc`, `BYTE_T`)
@@ -1977,6 +2145,105 @@ mod tests {
         assert_eq!(target.breakdown.length_param_with_buffer, 15);
     }
 
+    /// A byte buffer or length spelled through a project typedef (`const u8_t
+    /// *`, `u32_t`) is what it aliases once the type registry resolves it: the
+    /// reachability classifier and the ranking see a byte buffer.
+    #[test]
+    fn typedefd_byte_buffers_resolve_through_the_type_registry() {
+        let source = "typedef unsigned char u8_t;\n\
+             typedef unsigned int u32_t;\n\
+             int read_bits(const u8_t *data, u32_t bit_index, u32_t width) { return data[bit_index / 8] & (int)width; }\n\
+             int count_widgets(int n) { return n; }\n";
+        let functions = c_parser::parse_c_functions(source).unwrap();
+        let defs = c_parser::parse_c_type_defs(source).unwrap();
+        let registry = type_model::TypeRegistry::from_defs([&defs]);
+        let params = [
+            ("data", "const u8_t *"),
+            ("bit_index", "u32_t"),
+            ("width", "u32_t"),
+        ];
+        assert_eq!(
+            classify_input_reachability("read_bits", &params),
+            InputReachability::ReachabilityUnproven,
+            "without the typedefs the spelling is unknown"
+        );
+        assert_eq!(
+            classify_input_reachability_with_types("read_bits", &params, &registry),
+            InputReachability::AttackerReachable
+        );
+        let ranked =
+            rank_c_targets_with_types(&functions, &std::collections::BTreeMap::new(), &registry);
+        let read_bits = ranked.iter().find(|t| t.name == "read_bits").unwrap();
+        assert_eq!(
+            read_bits.input_reachability,
+            InputReachability::AttackerReachable
+        );
+        assert_eq!(read_bits.breakdown.buffer_param, 30);
+        assert_eq!(read_bits.breakdown.length_param_with_buffer, 15);
+        assert_eq!(ranked[0].name, "read_bits");
+        let plain = rank_c_targets(&functions);
+        let unresolved = plain.iter().find(|t| t.name == "read_bits").unwrap();
+        assert!(unresolved.score < read_bits.score, "{plain:?}");
+
+        // A Windows-style byte typedef the registry knows without a definition.
+        assert_eq!(
+            classify_input_reachability_with_types(
+                "load_widget",
+                &[("pbData", "const BYTE*"), ("cbData", "DWORD")],
+                &type_model::TypeRegistry::default(),
+            ),
+            InputReachability::AttackerReachable
+        );
+        // A typedef'd byte as the first scalar of a stream decoder.
+        assert_eq!(
+            classify_input_reachability_with_types(
+                "decode_byte",
+                &[("b", "u8_t"), ("state", "struct decoder *")],
+                &registry,
+            ),
+            InputReachability::AttackerReachable
+        );
+        // Types the registry does not resolve to a scalar stay as spelled.
+        assert_eq!(
+            classify_input_reachability_with_types(
+                "read_bits",
+                &[("widget", "const widget_t *"), ("n", "u32_t")],
+                &registry,
+            ),
+            InputReachability::ReachabilityUnproven
+        );
+        assert!(needs_type_registry(&params));
+        assert!(!needs_type_registry(&[
+            ("data", "const uint8_t *"),
+            ("n", "size_t")
+        ]));
+    }
+
+    #[test]
+    fn typedefd_byte_buffers_resolve_in_cpp_ranking() {
+        let source = "typedef unsigned char u8_t;\n\
+             namespace widgets {\n\
+             bool next_bit(const u8_t* bits, int position) { return bits[position] != 0; }\n\
+             }\n";
+        let functions = cpp_parser::parse_cpp_functions(source).unwrap();
+        let defs = cpp_parser::parse_cpp_type_defs(source).unwrap();
+        let registry = type_model::TypeRegistry::from_defs([&defs]);
+        let ranked = rank_cpp_targets_with_types(&functions, &registry);
+        let target = ranked
+            .iter()
+            .find(|t| t.name == "widgets::next_bit")
+            .unwrap();
+        assert_eq!(
+            target.input_reachability,
+            InputReachability::AttackerReachable
+        );
+        let plain = rank_cpp_targets(&functions);
+        assert_eq!(
+            plain[0].input_reachability,
+            InputReachability::ReachabilityUnproven
+        );
+    }
+
     #[test]
     fn parser_action_matching_rejects_incidental_substrings() {
         assert!(name_has_parser_keyword("image_load_from_memory"));
@@ -2233,8 +2500,8 @@ mod tests {
         let public = cf("parse_value", "int", &[("data", "const char *")]);
         let mut internal = cf("parse_value", "int", &[("data", "const char *")]);
         internal.is_static = true;
-        let (pub_b, _) = score_c_function(&public, None);
-        let (int_b, _) = score_c_function(&internal, None);
+        let (pub_b, _) = score_c_function(&public, None, &TypeRegistry::default());
+        let (int_b, _) = score_c_function(&internal, None, &TypeRegistry::default());
         assert_eq!(pub_b.helper_or_static_name, 0, "public not demoted");
         assert_eq!(int_b.helper_or_static_name, -20, "static linkage demoted");
         assert_eq!(int_b.total, pub_b.total - 20);
@@ -2242,7 +2509,7 @@ mod tests {
         // The static linkage penalty does not stack on top of a name-based marker.
         let mut static_helper = cf("alloc_buffer_helper", "void *", &[("n", "size_t")]);
         static_helper.is_static = true;
-        let (h_b, _) = score_c_function(&static_helper, None);
+        let (h_b, _) = score_c_function(&static_helper, None, &TypeRegistry::default());
         assert_eq!(
             h_b.helper_or_static_name, -20,
             "name marker + static linkage is a single -20, not -40"
@@ -2407,7 +2674,7 @@ mod tests {
             "int",
             &[("data", "const void *"), ("size", "cgltf_size")],
         );
-        let (b, _) = score_c_function(&f, None);
+        let (b, _) = score_c_function(&f, None, &TypeRegistry::default());
         assert_eq!(
             b.helper_or_static_name, 0,
             "a (const void*, size) data channel must not be demoted as an opaque handle"

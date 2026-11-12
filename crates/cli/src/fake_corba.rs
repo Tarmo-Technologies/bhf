@@ -779,19 +779,7 @@ fn write_idl_dictionary(output_dir: &Path, tokens: &[String]) -> Result<(), Stri
 }
 
 fn escape_afl_dictionary_token(token: &[u8]) -> String {
-    let mut out = String::new();
-    for byte in token {
-        match *byte {
-            b'\\' => out.push_str("\\\\"),
-            b'"' => out.push_str("\\\""),
-            b'\n' => out.push_str("\\n"),
-            b'\r' => out.push_str("\\r"),
-            b'\t' => out.push_str("\\t"),
-            0x20..=0x7e => out.push(char::from(*byte)),
-            other => out.push_str(&format!("\\x{other:02x}")),
-        }
-    }
-    out
+    crate::generate_harness::escape_afl_dictionary_token(token)
 }
 
 fn parse_idl_defines(values: &[String]) -> Result<Vec<(String, String)>, String> {

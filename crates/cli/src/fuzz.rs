@@ -4301,6 +4301,10 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
     if let Some(dictionary) = &generated_dictionary {
         afl_cmd.arg("-x").arg(dictionary);
     }
+    // AFL++ takes up to four `-x` dictionaries; the learned one goes second.
+    if let Some(learned) = find_learned_dictionary(&prepared.work_dir, &prepared.harness_id) {
+        afl_cmd.arg("-x").arg(learned);
+    }
     if let Some(max_len) = prepared.afl_max_len {
         if afl_fuzz_supports_max_len(&afl_fuzz) {
             afl_cmd.arg("-G").arg(max_len.to_string());
@@ -5783,14 +5787,99 @@ fn find_generated_dictionary(work_dir: &Path, harness_id: &str) -> Option<PathBu
     .find(|path| path.is_file())
 }
 
+/// The harness's `learned_dictionary.txt` (see [`write_learned_dictionary`]),
+/// looked up in the same harness dirs as its `dictionary.txt`.
+fn find_learned_dictionary(work_dir: &Path, harness_id: &str) -> Option<PathBuf> {
+    crate::auto::layout::harness_dir_candidates(work_dir, harness_id)
+        .into_iter()
+        .chain([work_dir.join("build").join(harness_id)])
+        .map(|dir| dir.join(LEARNED_DICTIONARY_FILE))
+        .find(|path| path.is_file())
+}
+
+/// The tokens a fuzz run starts with: the harness's source-mined
+/// `dictionary.txt`, then its runtime-learned `learned_dictionary.txt`, each
+/// token once. A `bhf auto` pass also reads `cmplog.jsonl`, the learned
+/// dictionary's source, and skips the tokens already loaded here.
 fn load_generated_dictionary_tokens(
     work_dir: &Path,
     harness_id: &str,
 ) -> Result<Vec<Vec<u8>>, String> {
-    let Some(path) = find_generated_dictionary(work_dir, harness_id) else {
-        return Ok(Vec::new());
+    let mut tokens = match find_generated_dictionary(work_dir, harness_id) {
+        Some(path) => load_afl_dictionary_tokens(&path)?,
+        None => Vec::new(),
     };
-    load_afl_dictionary_tokens(&path)
+    if let Some(path) = find_learned_dictionary(work_dir, harness_id) {
+        // A damaged learned dictionary costs only its hints, never the run.
+        match load_afl_dictionary_tokens(&path) {
+            Ok(learned) => {
+                for token in learned {
+                    if !tokens.contains(&token) {
+                        tokens.push(token);
+                    }
+                }
+            }
+            Err(error) => bhfeprintln!("bhf: warning: {error}; learned tokens not loaded"),
+        }
+    }
+    Ok(tokens)
+}
+
+/// The runtime-learned dictionary written beside a harness's `dictionary.txt`.
+pub(crate) const LEARNED_DICTIONARY_FILE: &str = "learned_dictionary.txt";
+/// Most tokens `learned_dictionary.txt` keeps.
+pub(crate) const LEARNED_DICTIONARY_MAX_TOKENS: usize = 256;
+/// Longest operand, in bytes, `learned_dictionary.txt` keeps.
+pub(crate) const LEARNED_TOKEN_MAX_LEN: usize = 64;
+/// The first lines of `learned_dictionary.txt`.
+pub(crate) const LEARNED_DICTIONARY_HEADER: &str = "\
+# Comparison operands observed at runtime while this harness was fuzzed
+# (the strcmp/memcmp-family operands recorded in cmplog.jsonl beside this
+# file), not mined from the source like dictionary.txt. Rewritten after each
+# fuzz pass that recorded any: that run's operands first, then the tokens an
+# earlier run learned, deduplicated, at most 256 tokens of at most 64 bytes.
+";
+
+/// Rewrite `<harness_dir>/learned_dictionary.txt` from the comparison
+/// operands in `<harness_dir>/cmplog.jsonl`: each distinct non-empty operand
+/// of at most [`LEARNED_TOKEN_MAX_LEN`] bytes, in the order recorded, then the
+/// tokens the file already held, up to [`LEARNED_DICTIONARY_MAX_TOKENS`].
+/// Returns how many tokens were written; with no usable operand (no
+/// `cmplog.jsonl`, or none in it) the file is left as it was and 0 returned.
+pub(crate) fn write_learned_dictionary(harness_dir: &Path) -> std::io::Result<usize> {
+    let Ok(log) = cmplog::ingest_from_jsonl_log(&harness_dir.join("cmplog.jsonl")) else {
+        return Ok(0);
+    };
+    let mut tokens: Vec<Vec<u8>> = Vec::new();
+    let push = |tokens: &mut Vec<Vec<u8>>, token: Vec<u8>| {
+        if !token.is_empty()
+            && token.len() <= LEARNED_TOKEN_MAX_LEN
+            && tokens.len() < LEARNED_DICTIONARY_MAX_TOKENS
+            && !tokens.contains(&token)
+        {
+            tokens.push(token);
+        }
+    };
+    for token in log.dictionary_tokens() {
+        push(&mut tokens, token);
+    }
+    if tokens.is_empty() {
+        return Ok(0);
+    }
+    let path = harness_dir.join(LEARNED_DICTIONARY_FILE);
+    if let Ok(earlier) = load_afl_dictionary_tokens(&path) {
+        for token in earlier {
+            push(&mut tokens, token);
+        }
+    }
+    let mut out = String::from(LEARNED_DICTIONARY_HEADER);
+    for token in &tokens {
+        out.push('"');
+        out.push_str(&crate::generate_harness::escape_afl_dictionary_token(token));
+        out.push_str("\"\n");
+    }
+    crate::auto::report::atomic_write(&path, out.as_bytes())?;
+    Ok(tokens.len())
 }
 
 fn load_afl_dictionary_tokens(path: &Path) -> Result<Vec<Vec<u8>>, String> {
@@ -9156,6 +9245,127 @@ mod auto_path_tests {
         assert_eq!(path, fake_corba_dict);
         let tokens = load_generated_dictionary_tokens(&root, "H-X").unwrap();
         assert_eq!(tokens, vec![b"READY".to_vec(), b"MODE_FAST".to_vec()]);
+    }
+
+    /// Comparison operands recorded at runtime become learned_dictionary.txt:
+    /// deduplicated, bounded, under a header saying they were observed, with an
+    /// earlier run's tokens kept after this run's while there is room.
+    #[test]
+    fn learned_dictionary_is_written_from_runtime_operands() {
+        let root = tmpdir();
+        let harness = root.join("harnesses/H-L");
+        fs::create_dir_all(&harness).unwrap();
+        let record = |a: &[u8], b: &[u8]| {
+            let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+            format!(
+                "{{\"e\":\"cmplog\",\"k\":\"memcmp\",\"a\":\"{}\",\"b\":\"{}\"}}\n",
+                hex(a),
+                hex(b)
+            )
+        };
+        let mut log = record(b"WGT1", b"abcd");
+        log.push_str(&record(b"WGT1", b"zz\n"));
+        log.push_str(&record(&[b'x'; LEARNED_TOKEN_MAX_LEN + 1], b"ok"));
+        log.push_str("{\"e\":\"getenv\",\"name\":\"HOME\"}\n");
+        fs::write(harness.join("cmplog.jsonl"), &log).unwrap();
+        fs::write(
+            harness.join(LEARNED_DICTIONARY_FILE),
+            format!("{LEARNED_DICTIONARY_HEADER}\"OLD1\"\n\"abcd\"\n"),
+        )
+        .unwrap();
+
+        assert_eq!(write_learned_dictionary(&harness).unwrap(), 5);
+        let text = fs::read_to_string(harness.join(LEARNED_DICTIONARY_FILE)).unwrap();
+        assert!(text.starts_with(LEARNED_DICTIONARY_HEADER), "{text}");
+        assert!(LEARNED_DICTIONARY_HEADER.contains("observed at runtime"));
+        let tokens = load_afl_dictionary_tokens(&harness.join(LEARNED_DICTIONARY_FILE)).unwrap();
+        assert_eq!(
+            tokens,
+            vec![
+                b"WGT1".to_vec(),
+                b"abcd".to_vec(),
+                b"zz\n".to_vec(),
+                b"ok".to_vec(),
+                b"OLD1".to_vec(),
+            ],
+            "this run's operands first, the overlong one dropped, then the earlier run's"
+        );
+
+        // Bounded: never more than LEARNED_DICTIONARY_MAX_TOKENS.
+        let many: String = (0..LEARNED_DICTIONARY_MAX_TOKENS + 40)
+            .map(|i| record(format!("T{i:04}").as_bytes(), b""))
+            .collect();
+        fs::write(harness.join("cmplog.jsonl"), many).unwrap();
+        assert_eq!(
+            write_learned_dictionary(&harness).unwrap(),
+            LEARNED_DICTIONARY_MAX_TOKENS
+        );
+
+        // No operands this time: the learned tokens are kept as they were.
+        let before = fs::read_to_string(harness.join(LEARNED_DICTIONARY_FILE)).unwrap();
+        fs::remove_file(harness.join("cmplog.jsonl")).unwrap();
+        assert_eq!(write_learned_dictionary(&harness).unwrap(), 0);
+        assert_eq!(
+            fs::read_to_string(harness.join(LEARNED_DICTIONARY_FILE)).unwrap(),
+            before
+        );
+    }
+
+    /// A runtime operand holding a protocol delimiter (`\r\n`) is written with
+    /// `\xNN` escapes, which AFL++ loads, and reads back as the same bytes.
+    #[test]
+    fn a_learned_crlf_operand_is_written_with_hex_escapes() {
+        let root = tmpdir();
+        let harness = root.join("harnesses/H-CRLF");
+        fs::create_dir_all(&harness).unwrap();
+        fs::write(
+            harness.join("cmplog.jsonl"),
+            "{\"e\":\"cmplog\",\"k\":\"memcmp\",\"a\":\"410d0a42\",\"b\":\"0941\"}\n",
+        )
+        .unwrap();
+        assert_eq!(write_learned_dictionary(&harness).unwrap(), 2);
+        let text = fs::read_to_string(harness.join(LEARNED_DICTIONARY_FILE)).unwrap();
+        assert!(text.contains("\"A\\x0d\\x0aB\"\n"), "{text}");
+        assert!(text.contains("\"\\x09A\"\n"), "{text}");
+        assert!(!text.contains("\\r") && !text.contains("\\n\""), "{text}");
+        assert_eq!(
+            load_afl_dictionary_tokens(&harness.join(LEARNED_DICTIONARY_FILE)).unwrap(),
+            vec![b"A\r\nB".to_vec(), b"\tA".to_vec()]
+        );
+    }
+
+    /// A fuzz run loads the learned tokens with the mined ones, each once.
+    #[test]
+    fn learned_dictionary_tokens_are_loaded_with_the_mined_ones() {
+        let root = tmpdir();
+        let harness = root.join("harnesses/H-M");
+        fs::create_dir_all(&harness).unwrap();
+        fs::write(harness.join("dictionary.txt"), "\"MINED\"\n\"BOTH\"\n").unwrap();
+        fs::write(
+            harness.join(LEARNED_DICTIONARY_FILE),
+            format!("{LEARNED_DICTIONARY_HEADER}\"BOTH\"\n\"SEEN\"\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            load_generated_dictionary_tokens(&root, "H-M").unwrap(),
+            vec![b"MINED".to_vec(), b"BOTH".to_vec(), b"SEEN".to_vec()]
+        );
+        // A harness with only learned tokens still gets them.
+        let only = root.join("harnesses/H-N");
+        fs::create_dir_all(&only).unwrap();
+        fs::write(
+            only.join(LEARNED_DICTIONARY_FILE),
+            format!("{LEARNED_DICTIONARY_HEADER}\"SEEN\"\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            load_generated_dictionary_tokens(&root, "H-N").unwrap(),
+            vec![b"SEEN".to_vec()]
+        );
+        assert_eq!(
+            find_learned_dictionary(&root, "H-N"),
+            Some(only.join(LEARNED_DICTIONARY_FILE))
+        );
     }
 
     #[test]

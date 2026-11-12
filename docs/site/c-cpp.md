@@ -682,7 +682,11 @@ engine loads that dictionary automatically for token
 insertion plus record/TLV-, JSON-, XML element-, key/value-, URL-encoded
 query-string, multipart/form-data, CSV/table-row, raw HTTP request, INI
 section/key, TOML table/key, and YAML section/key input synthesis. AFL++ mode
-passes the same dictionary with `-x`.
+passes the same dictionary with `-x`. A `# from <file>:<line>` comment above
+each token names up to three places it was found, so `# from widget.c:12,
+include/widget.h:3` points at the comparison or constant it came from. The
+operands the engine observes at runtime go to `learned_dictionary.txt` beside
+it (see [CLI](cli.md)).
 
 Use `bhf fuzz --structured-inputs off` to disable the built-in
 structured synthesis for a target, `--structured-inputs record` for only the

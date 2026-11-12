@@ -2140,7 +2140,20 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
             // signature ranker would sink them to `ReachabilityUnproven`; the
             // provenance map instead marks them the event-driven attack surface.
             let entry_provenance = target_rank::detect_entry_point_provenance(&source);
-            for tgt in target_rank::rank_c_targets_with_provenance(&fns, &entry_provenance) {
+            // A byte buffer or length spelled through a project typedef
+            // (`const u8_t *data`) is ranked as the type it aliases.
+            let registry = crate::generate_harness::ranking_type_registry(
+                path,
+                &source,
+                false,
+                fns.iter().map(|f| {
+                    f.params
+                        .iter()
+                        .map(|p| (p.name.as_str(), p.c_type.as_str()))
+                        .collect()
+                }),
+            );
+            for tgt in target_rank::rank_c_targets_with_types(&fns, &entry_provenance, &registry) {
                 let target_dialect = if knr_names.contains(&tgt.name) {
                     lang_profile::Dialect::CKAndR
                 } else {
@@ -2215,7 +2228,22 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
                 })
                 .collect::<HashMap<_, _>>();
             let _t4 = std::time::Instant::now();
-            let _ranked = target_rank::rank_cpp_targets(&fns);
+            let required_params: Vec<Vec<cpp_parser::CppParamDescriptor>> = fns
+                .iter()
+                .map(|function| function.effective_required_params())
+                .collect();
+            let registry = crate::generate_harness::ranking_type_registry(
+                path,
+                &source,
+                true,
+                required_params.iter().map(|params| {
+                    params
+                        .iter()
+                        .map(|p| (p.name.as_str(), p.cpp_type.as_str()))
+                        .collect()
+                }),
+            );
+            let _ranked = target_rank::rank_cpp_targets_with_types(&fns, &registry);
             bhfprof("cpp:rank", _t4);
             // Both fallback guards are loop-invariant — one depends only on the
             // PATH, the other only on the SOURCE TEXT — but being inside the
@@ -4697,6 +4725,55 @@ mod tests {
                 cands.iter().map(|c| (&c.name, c.score)).collect::<Vec<_>>()
             );
         }
+    }
+
+    /// A byte buffer spelled through a typedef from a project header
+    /// (`const u8_t *`) is recognised as one: the C and C++ targets taking it
+    /// are input-reachable and rank above a scalar helper.
+    #[test]
+    fn typedefd_byte_buffer_targets_are_discovered_reachable() {
+        let root = tmpdir();
+        fs::write(
+            root.join("widget_types.h"),
+            "typedef unsigned char u8_t;\ntypedef unsigned int u32_t;\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("bits.c"),
+            "#include \"widget_types.h\"\n\
+             int read_bits(const u8_t *data, u32_t bit_index, u32_t width) {\n\
+             \x20 return (data[bit_index / 8] >> (bit_index % 8)) & (int)width;\n\
+             }\n\
+             int add_scalars(int a, int b) { return a + b; }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("bits.cpp"),
+            "#include \"widget_types.h\"\n\
+             namespace widgets {\n\
+             bool next_bit(const u8_t* bits, int position) { return bits[position] != 0; }\n\
+             }\n",
+        )
+        .unwrap();
+        let cands = discover(&root).unwrap();
+        let find = |name: &str| {
+            cands
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("{name} not discovered: {cands:?}"))
+        };
+        let read_bits = find("read_bits");
+        assert_eq!(
+            read_bits.input_reachability,
+            Some(target_rank::InputReachability::AttackerReachable),
+            "{read_bits:?}"
+        );
+        assert!(read_bits.score > find("add_scalars").score);
+        assert_eq!(
+            find("widgets::next_bit").input_reachability,
+            Some(target_rank::InputReachability::AttackerReachable)
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

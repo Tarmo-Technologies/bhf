@@ -26,6 +26,10 @@
   same exit rule as `bhf capsule` (one shared rule): it counts findings with no
   faked-environment crash as skipped, and when it captures nothing it says so
   and exits non-zero.
+- Dictionary tokens holding CR, LF, TAB or another control byte are written
+  as `\xNN` in `dictionary.txt`, `learned_dictionary.txt` and the IDL and Go
+  lanes' dictionaries. AFL++ dropped a `\r`/`\n`/`\t` line with "Invalid
+  escaping" and libFuzzer rejected the whole file.
 - `bhf explain` no longer presents dictionary substring matches as gates the
   engine solved. Its comparison evidence is recorded while the finding's own
   input runs: an input span counts only when a comparison operand equals its
@@ -407,6 +411,15 @@
   this release's work dirs from earlier ones.
 
 ### Changed
+- Target ranking (`bhf auto` discovery and `bhf list targets`) reads C and C++
+  parameter types through the file's typedefs and those of the project headers
+  it includes, and through the built-in Windows and stdint spellings. A byte
+  buffer spelled through a typedef (`const u8_t *data`, `u8_t const *`) is
+  recognised as an input buffer, a typedef'd integer (`u32_t len`, `DWORD`)
+  as the integer it aliases, and a typedef'd byte as a stream decoder's
+  byte. Targets taking such parameters now rank as input-taking functions and
+  record `input_reachability: attacker_reachable` where they were
+  `reachability_unproven`, so their rank and reported reachability change.
 - A heap overflow of a buffer the generated harness sized itself, for a pointer
   parameter it passes without a length, is `lab_only` and reads as
   "precondition-dependent": whether a real caller can pass a buffer that short
@@ -586,6 +599,17 @@
 - The Fortran lane records how each Fortran object of a harness link was
   compiled (`harnesses/<id>/fortran-build.json`), which a capsule uses to
   rebuild them from source.
+- Each token in a harness's `dictionary.txt` is preceded by a
+  `# from <file>:<line>` comment naming up to three places in the target source
+  and its headers where it was found (C, C++, Ada and the managed lanes), so a
+  token can be traced to the comparison or constant it came from. The file
+  stays a valid AFL dictionary.
+- `learned_dictionary.txt` beside a harness's `dictionary.txt`: after each
+  `bhf auto` fuzz pass that recorded comparison operands (`cmplog.jsonl`), bhf
+  writes them there, deduplicated and bounded (at most 256 tokens of at most
+  64 bytes, this run's first, then an earlier run's), under a header saying
+  they were observed at runtime. `bhf fuzz` and later `bhf auto` runs load it
+  after `dictionary.txt`, each token once, and AFL++ mode passes it with `-x`.
 - Comparison evidence per finding: `bhf auto` (after minimization) and
   `bhf report --backfill` replay each runtime finding's preferred input with
   the C/C++ driver's comparison capture (`BHF_CMP_EVIDENCE`) and store the

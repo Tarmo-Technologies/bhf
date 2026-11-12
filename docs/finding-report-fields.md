@@ -274,11 +274,16 @@ dir. Read each finding's `sanitizer.log` where it has one, otherwise run its
   `bhf replay --finding <id>`.
 - **Which input bytes matter?** `fuzz.input_to_state`: the spans that reached a
   comparison while the finding's input ran. `dictionary.txt` in the harness dir
-  is mined from source when the harness is generated; a token of it that occurs
-  in an input is not evidence that any comparison read it.
+  is mined from source when the harness is generated (each token's
+  `# from <file>:<line>` comment says where); a token of it that occurs in an
+  input is not evidence that any comparison read it. `learned_dictionary.txt`
+  beside it holds comparison operands the engine observed at runtime while
+  fuzzing that harness (from `cmplog.jsonl`, across passes and runs, at most 256
+  tokens); they were compared during some run, not necessarily this finding's.
 - **How sure is `likely_reachable`?** For C/C++ it is usually inferred from the
   entry's signature (an input-taking shape, such as a byte-buffer parameter or
-  a parser taking a byte); `bhf explain` says what
+  a parser taking a byte, with typedefs such as `const u8_t *` read through the
+  source's and its headers' declarations); `bhf explain` says what
   each verdict rests on. A heap overflow of a buffer the generated harness sized
   for a pointer parameter it passes without a length is `lab_only`
   (precondition-dependent); one passed with its length, such as the buffer of a

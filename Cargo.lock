@@ -2312,6 +2312,7 @@ dependencies = [
  "python_parser",
  "rust_parser",
  "serde",
+ "type_model",
 ]
 
 [[package]]

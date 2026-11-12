@@ -848,19 +848,7 @@ pub(crate) fn load_structured_seed_inputs(output_dir: &Path) -> Result<Vec<Vec<u
 }
 
 fn escape_afl_dictionary_token(token: &[u8]) -> String {
-    let mut out = String::new();
-    for byte in token {
-        match *byte {
-            b'\\' => out.push_str("\\\\"),
-            b'\"' => out.push_str("\\\""),
-            b'\n' => out.push_str("\\n"),
-            b'\r' => out.push_str("\\r"),
-            b'\t' => out.push_str("\\t"),
-            b' '..=b'~' => out.push(*byte as char),
-            other => out.push_str(&format!("\\x{other:02x}")),
-        }
-    }
-    out
+    crate::generate_harness::escape_afl_dictionary_token(token)
 }
 
 fn is_plain_json_parameter(

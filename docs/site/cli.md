@@ -109,12 +109,24 @@ byte/dictionary mutation without structured synthesis.
 Generated Ada harnesses write `dictionary.txt` from enum literals and string
 literals; generated C/C++ harnesses write the same artifact from source and
 header constants, including C++ namespaced `enum class` members and switch case
-labels (but not `#include` paths). Each integer literal is also written as its
-raw little- and big-endian bytes, under a `# raw bytes of the literal above`
-comment. The file is mined from source when the harness is generated and is not
-runtime evidence; comparison operands observed while fuzzing accumulate in
-`cmplog.jsonl` beside it. The fuzz command loads a harness-specific dictionary
-automatically when present.
+labels (but not `#include` paths); the Rust, Go, Java, Python, Perl, C#,
+JavaScript, Ruby, Lua and PHP lanes mine their string and number literals.
+Each token is preceded by a `# from <file>:<line>` comment naming up to three
+places it was found, files relative to the target source's directory (for
+example `# from parser.c:42, include/parser.h:7`); a token bhf adds itself has
+none. Each integer literal is also written as its raw little- and big-endian
+bytes, under a `# raw bytes of the literal above` comment. The file is mined
+from source when the harness is generated and is not runtime evidence.
+
+Comparison operands observed while fuzzing accumulate in `cmplog.jsonl` beside
+it, and after each `bhf auto` fuzz pass that recorded any, bhf rewrites
+`learned_dictionary.txt` from them: each distinct operand of at most 64 bytes,
+this run's first, then those an earlier run learned, at most 256 tokens, under a
+header saying they were observed at runtime. The fuzz command (and the first
+pass of a later `bhf auto` run) loads `dictionary.txt` and then
+`learned_dictionary.txt` automatically when present, each token once; later
+passes of the same `bhf auto` run also read `cmplog.jsonl` itself, and a token
+already loaded is not added again. AFL++ mode passes both files with `-x`.
 
 `bhf scan` accepts an Ada, C, or C++ source file or directory tree. It
 writes `bhf_work/scan_index.json`, prints the same JSON summary to stdout,
