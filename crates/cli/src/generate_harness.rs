@@ -251,6 +251,10 @@ pub fn run(args: GenerateHarnessArgs) -> Result<()> {
 #[derive(serde::Serialize)]
 struct GenerationMetadata<'a> {
     schema_version: u32,
+    /// [`harness_gen::HARNESS_FORMAT_VERSION`]: how this harness decodes fuzz
+    /// input into arguments. Corpora and findings recorded against a different
+    /// version may decode to different argument values.
+    harness_format_version: u32,
     language: &'a str,
     requested_line_present: bool,
     exact_line_match: bool,
@@ -269,6 +273,7 @@ fn write_generation_metadata(
 ) -> Result<()> {
     let metadata = GenerationMetadata {
         schema_version: 1,
+        harness_format_version: harness_gen::HARNESS_FORMAT_VERSION,
         language,
         requested_line_present: requested_line.is_some(),
         exact_line_match: requested_line.is_some_and(|line| line == selected_line),
@@ -276,9 +281,47 @@ fn write_generation_metadata(
         requested_kind,
         emitted_path,
     };
+    if let Some(note) = stale_harness_format_note(output_dir) {
+        bhfeprintln!("warning: {note}");
+    }
     let bytes = serde_json::to_vec(&metadata)?;
     crate::auto::report::atomic_write(&output_dir.join("generation-metadata.json"), &bytes)?;
     Ok(())
+}
+
+/// The harness input format recorded in `<harness_dir>/generation-metadata.json`
+/// (see [`harness_gen::HARNESS_FORMAT_VERSION`]). `None` when the directory has
+/// no readable metadata; `Some(1)` for metadata written before the field
+/// existed.
+pub(crate) fn recorded_harness_format_version(harness_dir: &Path) -> Option<u32> {
+    let text = std::fs::read_to_string(harness_dir.join("generation-metadata.json")).ok()?;
+    let metadata: serde_json::Value = serde_json::from_str(&text).ok()?;
+    Some(
+        metadata
+            .get("harness_format_version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|version| u32::try_from(version).ok())
+            .unwrap_or(1),
+    )
+}
+
+/// A warning for a harness directory generated with a different input format
+/// than this bhf writes: the same input bytes decode to different arguments, so
+/// corpora and finding testcases recorded against one do not carry over to the
+/// other. `None` when the formats match or nothing is recorded.
+pub(crate) fn stale_harness_format_note(harness_dir: &Path) -> Option<String> {
+    let recorded = recorded_harness_format_version(harness_dir)?;
+    let current = harness_gen::HARNESS_FORMAT_VERSION;
+    (recorded != current).then(|| {
+        format!(
+            "harness {} was generated with input format {recorded}, and this bhf generates \
+             format {current}, which decodes the same input bytes into different argument \
+             values. Inputs recorded against one format (the corpus, finding testcases) may \
+             not reproduce against the other: re-run the corpus and re-check findings after \
+             regenerating the harness",
+            harness_dir.display()
+        )
+    })
 }
 
 /// Programmatic shim around `run()` used by `bhf auto`'s attempt
@@ -12920,6 +12963,9 @@ mod tests {
         CppBuildContext, DecoderLimitArgs, GenerateHarnessArgs, HeaderPreflight,
         BLOCKED_BY_NON_SELF_CONTAINED_HEADER,
     };
+    use super::{
+        recorded_harness_format_version, stale_harness_format_note, write_generation_metadata,
+    };
     use ada_parser::ast::{Package, PackageId, StructuralAst as StructuralAstForMerge};
     use ada_parser::ast::{
         Span, Subprogram, SubprogramId, SubprogramKind, SubprogramOwner, Visibility,
@@ -17891,6 +17937,95 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         let main = fs::read_to_string(temp.join("generated_harnesses/H-CHILD-PARENT/main.adb"))
             .expect("generated main is readable");
         assert!(main.contains("Bhf_Result : constant Parent.Thing := Parent.Child.Get;"));
+    }
+
+    /// The decode of fuzz input into arguments is versioned, so a corpus or a
+    /// finding recorded against an older harness can be told apart.
+    #[test]
+    fn generation_metadata_records_the_harness_input_format_version() {
+        let root = temp_dir("format-version");
+        for (file, body, id) in [
+            (
+                "record.c",
+                "int parse_record(unsigned int flags) { return (int)flags; }\n",
+                "H-FMT-C",
+            ),
+            (
+                "record.cpp",
+                "int parse_record(unsigned int flags) { return (int)flags; }\n",
+                "H-FMT-CPP",
+            ),
+        ] {
+            let source = root.join(file);
+            fs::write(&source, body).unwrap();
+            run(GenerateHarnessArgs {
+                source: source.clone(),
+                target: Some("parse_record".to_owned()),
+                target_line: None,
+                output: root.join("out"),
+                id: Some(id.to_owned()),
+                kind: "direct".to_owned(),
+                source_roots: Vec::new(),
+                project: None,
+                source_trees: Vec::new(),
+                extra_sources: Vec::new(),
+                extra_includes: Vec::new(),
+                cleanup: None,
+                template_instantiate: Vec::new(),
+                tree_type_defs: None,
+                decoder_limits: Default::default(),
+                force: false,
+                archive_backed: false,
+                environment: None,
+            })
+            .unwrap();
+            let metadata: serde_json::Value = serde_json::from_str(
+                &fs::read_to_string(root.join("out").join(id).join("generation-metadata.json"))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                metadata["harness_format_version"],
+                serde_json::json!(harness_gen::HARNESS_FORMAT_VERSION),
+                "{id}: {metadata}"
+            );
+            // Additive: the existing fields keep their schema version.
+            assert_eq!(metadata["schema_version"], serde_json::json!(1), "{id}");
+        }
+    }
+
+    /// A harness directory regenerated by a bhf with a newer input format is
+    /// reported, so corpora and findings recorded against the old harness are
+    /// re-run rather than silently decoded differently.
+    #[test]
+    fn a_harness_of_an_older_input_format_is_recognised() {
+        let dir = temp_dir("format-stale");
+        assert_eq!(recorded_harness_format_version(&dir), None);
+        assert!(stale_harness_format_note(&dir).is_none());
+
+        // Metadata written before the version field existed is format 1.
+        fs::write(
+            dir.join("generation-metadata.json"),
+            r#"{"schema_version":1,"language":"c","emitted_path":"direct"}"#,
+        )
+        .unwrap();
+        assert_eq!(recorded_harness_format_version(&dir), Some(1));
+        let note = stale_harness_format_note(&dir).expect("an older format is reported");
+        assert!(
+            note.contains("input format 1")
+                && note.contains(&format!("format {}", harness_gen::HARNESS_FORMAT_VERSION))
+                && note.contains("corpus"),
+            "{note}"
+        );
+
+        // Regenerating records the current format, which is not stale.
+        write_generation_metadata(&dir, "c", None, 1, "direct", "direct").unwrap();
+        assert_eq!(
+            recorded_harness_format_version(&dir),
+            Some(harness_gen::HARNESS_FORMAT_VERSION)
+        );
+        assert!(stale_harness_format_note(&dir).is_none());
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

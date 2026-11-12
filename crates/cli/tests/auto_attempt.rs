@@ -2510,7 +2510,7 @@ fn attempt_builds_and_fuzzes_cpp_standard_scalar_aliases() {
         other => panic!("expected C++ std scalar target to build+fuzz, got {other:?}"),
     }
     let main = fs::read_to_string(result.harness_dir.join("main.cpp")).unwrap();
-    assert!(main.contains("std::uint32_t flags = (std::uint32_t)bhf_bounded_i32"));
+    assert!(main.contains("std::uint32_t flags = (std::uint32_t)bhf_i32(&Cur)"));
     assert!(main.contains("std::size_t count = (std::size_t)bhf_bounded_length"));
     assert!(main.contains("std::uint16_t code = (std::uint16_t)bhf_bounded_i32"));
     assert!(main.contains("bool enabled = (bool)(bhf_u8(&Cur) & 1)"));

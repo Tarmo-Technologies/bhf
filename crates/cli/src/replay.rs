@@ -110,6 +110,11 @@ pub fn run(args: ReplayArgs) -> i32 {
     if crate::binary_fuzz::is_binary_finding(&finding_dir) {
         return crate::binary_fuzz::replay_binary_finding(&finding_dir, &harness);
     }
+    // A harness from a bhf with a different input format still replays its own
+    // findings, but the operator needs to know a regenerated one will not.
+    if let Some(note) = harness_format_note(&harness) {
+        bhfeprintln!("note: {note}");
+    }
     // Dispatch by engine. libFuzzer harnesses get a parallel path
     // that invokes the binary with the recorded testcase as argv[1]
     // and matches the resulting sanitizer rule_id against the
@@ -219,6 +224,13 @@ fn resolve_harness(finding_dir: &Path, explicit: Option<PathBuf>) -> Result<Path
          Pass --harness <path>.",
         finding_dir.display()
     ))
+}
+
+/// The input-format note for a generated harness binary (see
+/// [`crate::generate_harness::stale_harness_format_note`]), read from the
+/// metadata next to it.
+fn harness_format_note(harness: &Path) -> Option<String> {
+    crate::generate_harness::stale_harness_format_note(harness.parent()?)
 }
 
 /// Candidate fuzz-work roots for a finding directory, most-likely first. The
@@ -640,5 +652,31 @@ mod tests {
                 std::path::PathBuf::from("/w/findings"),
             ]
         );
+    }
+
+    /// Replaying against a harness built with an older input format says so,
+    /// read from the metadata beside the harness binary.
+    #[test]
+    fn replay_notes_a_harness_of_another_input_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let harness = dir.path().join("main");
+        std::fs::write(&harness, b"").unwrap();
+        assert!(super::harness_format_note(&harness).is_none());
+        std::fs::write(
+            dir.path().join("generation-metadata.json"),
+            r#"{"schema_version":1,"language":"cpp"}"#,
+        )
+        .unwrap();
+        let note = super::harness_format_note(&harness).expect("format 1 is reported");
+        assert!(note.contains("input format 1"), "{note}");
+        std::fs::write(
+            dir.path().join("generation-metadata.json"),
+            format!(
+                r#"{{"schema_version":1,"harness_format_version":{}}}"#,
+                harness_gen::HARNESS_FORMAT_VERSION
+            ),
+        )
+        .unwrap();
+        assert!(super::harness_format_note(&harness).is_none());
     }
 }

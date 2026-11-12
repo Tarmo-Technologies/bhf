@@ -156,6 +156,68 @@ generated harnesses through `bhf build`, then removes their public headers
 in copied workspaces and asserts `bhf auto` reports the missing headers in
 `needed_for_build.synthesized_headers`.
 
+## How Inputs Become Arguments
+
+A generated C or C++ harness decodes each fuzz input into the target's
+arguments. A few rules decide what a parameter can receive:
+
+- **Buffer and length pairs.** A byte pointer followed by an integer is bound
+  to the whole input, `(Data, Size)`, only when the integer is named like a
+  length. An output buffer is paired with its capacity (by value or by
+  pointer) under the same rule. Names are read word by word (`dataLen` is
+  `data` + `len`, `num_bytes` is `num` + `bytes`). A length-shaped word is
+  `len`, `length`, `size`, `sz`, `siz`, `count`, `cnt`, `cap`, `capacity` or
+  `bytes`, or a word ending in one (`srclen`, `bufsize`, `bufsz`, `bufsiz`,
+  `nbytes`, `linecount`). So are `num` (`num_items`, `numBytes`), `n` and
+  `nr` on their own or ahead of a plural (`nBytes`, `n_items`, `nr_pages`),
+  the run-together counts `nmemb`/`nitems`/`nelem`, OpenSSL's `inl`/`outl`,
+  `argc`, `avail`, `remaining`, and the Win32 `cb`/`cch` prefixes (`cbData`,
+  `pcbData`, `cchName`). A trailing digit is ignored (`len1`, `size_2`). A count marker
+  inside another word does not count (`account`, `caps`, `silent`, `enum`),
+  and neither does a name whose last word is `id`, `flags`, `mode`, `type`,
+  `kind`, `line`, `bit` or `status` (`account_id`, `count_mode`). Offset-,
+  index- and position-shaped names (`offset`, `off`, `pos`, `index`, `idx`,
+  `start`, `begin`, `skip`, `bit_index`) never pair with a buffer, as a length
+  or as a capacity. They are decoded as ordinary values, and the buffer gets
+  its own heap copy of the input, so ASan sees its real size. In C, a header
+  that omits parameter names (`arg1`, `arg2`) still pairs a binary pointer
+  with the integer after it.
+- **Typedefs.** In both C and C++, typedefs are resolved on both sides,
+  typedef chains included (`const u8_t *` / `const BYTE *` buffers, `UINT` /
+  `DWORD` / `u32_t` lengths). A buffer spelled through a pointer typedef
+  (`LPCBYTE`, `PBYTE`, `typedef const u8_t *cu8_ptr`) pairs too. The typedef
+  hides whether the bytes are const, so that buffer is always a heap copy of
+  the input, and its length is the copy's size.
+- **Unsigned integers.** Unsigned parameters, struct fields and output-pointer
+  values cover their full range, `size_t` included, so values with the top
+  bit set (`0x80000000`..`0xffffffff`, wrap-around sizes, bit masks) are
+  reachable. Values named like a length, size or count stay bounded: a
+  `size_t` or `z_size_t` length stays in `0..=65536`, and any other unsigned
+  length stays in `0..=0x7fffffff`. A huge length only produces allocation
+  failures. Each value consumes the same number of input bytes either way.
+
+### Harness format version
+
+Whenever a change makes the same input bytes decode to different argument
+values, the harness format version is bumped. Each harness records it as
+`harness_format_version` in `generation-metadata.json`. It also appears at the
+top of the generated `main.c` / `main.cpp` (`bhf harness format 2`). A harness
+with no recorded version is format 1.
+
+Format 2 changed two things. An unsigned input with its top bit set, or a
+`size_t` that is not named like a length, now decodes to a different value.
+And `(buffer, integer)` pairs whose integer is not named like a length are no
+longer bound to the input length or to an output buffer's capacity. Corpora
+from format 1 still run, but their inputs can exercise different values.
+Re-run the corpus and re-triage findings recorded against a format 1 harness.
+Do not compare them directly.
+
+`bhf generate-harness` (and so `bhf auto`) prints a warning when it regenerates
+a harness directory whose recorded format differs from the one it writes.
+`bhf replay` prints a note when the harness it replays against was generated
+with another format. The finding still replays against that harness as built,
+but a regenerated harness decodes its testcase differently.
+
 ## Supported C Parameter Shapes
 
 The C emitter supports:

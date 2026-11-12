@@ -956,36 +956,24 @@ fn legacy_select_c_decoder(c_type: &str, name: &str) -> Option<CParamEmission> {
         "unsigned" | "unsigned int" => Some(scalar(
             name,
             "unsigned int",
-            "(unsigned int)bhf_bounded_i32(&Cur, 0, 0x7fffffff)",
+            &unsigned32_expr("unsigned int", name),
         )),
         "long" | "signed long" => Some(scalar(name, "long", "(long)bhf_i64(&Cur)")),
         "unsigned long" => Some(scalar(
             name,
             "unsigned long",
-            "(unsigned long)bhf_bounded_length(&Cur, 0, 0x7fffffff)",
+            &unsigned64_expr("unsigned long", name),
         )),
         "uLong" | "uLongf" => Some(scalar(
             name,
             normalized.as_str(),
-            "(uLong)bhf_bounded_length(&Cur, 0, 0x7fffffff)",
+            &unsigned64_expr("uLong", name),
         )),
-        "uInt" => Some(scalar(
-            name,
-            "uInt",
-            "(uInt)bhf_bounded_i32(&Cur, 0, 0x7fffffff)",
-        )),
-        "z_size_t" => Some(scalar(
-            name,
-            "z_size_t",
-            "(z_size_t)bhf_bounded_length(&Cur, 0, 65536)",
-        )),
-        "mz_ulong" => Some(scalar(
-            name,
-            "mz_ulong",
-            "(mz_ulong)bhf_bounded_length(&Cur, 0, 0x7fffffff)",
-        )),
+        "uInt" => Some(scalar(name, "uInt", &unsigned32_expr("uInt", name))),
+        "z_size_t" => Some(scalar(name, "z_size_t", &size_expr("z_size_t", name))),
+        "mz_ulong" => Some(scalar(name, "mz_ulong", &unsigned64_expr("mz_ulong", name))),
         "long long" | "signed long long" => Some(scalar(name, "long long", "bhf_i64(&Cur)")),
-        "size_t" => Some(scalar(name, "size_t", "bhf_bounded_length(&Cur, 0, 65536)")),
+        "size_t" => Some(scalar(name, "size_t", &size_expr("size_t", name))),
         "uint8_t" | "unsigned char" => Some(scalar(name, "uint8_t", "bhf_u8(&Cur)")),
         "int8_t" | "signed char" | "char" => Some(scalar(name, "int8_t", "(int8_t)bhf_u8(&Cur)")),
         "uint16_t" => Some(scalar(
@@ -995,13 +983,9 @@ fn legacy_select_c_decoder(c_type: &str, name: &str) -> Option<CParamEmission> {
         )),
         "int16_t" => Some(scalar(name, "int16_t", "(int16_t)bhf_i32(&Cur)")),
         "int32_t" => Some(scalar(name, "int32_t", "bhf_i32(&Cur)")),
-        "uint32_t" => Some(scalar(
-            name,
-            "uint32_t",
-            "(uint32_t)bhf_bounded_i32(&Cur, 0, 0x7fffffff)",
-        )),
+        "uint32_t" => Some(scalar(name, "uint32_t", &unsigned32_expr("uint32_t", name))),
         "int64_t" => Some(scalar(name, "int64_t", "bhf_i64(&Cur)")),
-        "uint64_t" => Some(scalar(name, "uint64_t", "(uint64_t)bhf_i64(&Cur)")),
+        "uint64_t" => Some(scalar(name, "uint64_t", &unsigned64_expr("uint64_t", name))),
         // MSVC fixed-width integer spellings (`__intN`). A header's
         // `#ifdef _MSC_VER typedef __int64 ssize_t` branch is parsed verbatim
         // (tree-sitter doesn't evaluate the #ifdef), so a typedef can resolve to
@@ -1011,13 +995,13 @@ fn legacy_select_c_decoder(c_type: &str, name: &str) -> Option<CParamEmission> {
         "unsigned __int64" => Some(scalar(
             name,
             "unsigned __int64",
-            "(unsigned __int64)bhf_i64(&Cur)",
+            &unsigned64_expr("unsigned __int64", name),
         )),
         "__int32" | "signed __int32" => Some(scalar(name, "__int32", "bhf_i32(&Cur)")),
         "unsigned __int32" => Some(scalar(
             name,
             "unsigned __int32",
-            "(unsigned __int32)bhf_bounded_i32(&Cur, 0, 0x7fffffff)",
+            &unsigned32_expr("unsigned __int32", name),
         )),
         "__int16" | "signed __int16" => Some(scalar(name, "__int16", "(__int16)bhf_i32(&Cur)")),
         "unsigned __int16" => Some(scalar(
@@ -1196,7 +1180,10 @@ fn emit_top_level_value(
 ) -> Result<String, CDecoderError> {
     match shape {
         TypeShape::Scalar(kind) => {
-            ctx.push(format!("{c_type} {name} = {}", scalar_expr(*kind, c_type)));
+            ctx.push(format!(
+                "{c_type} {name} = {}",
+                scalar_expr(*kind, c_type, name)
+            ));
             Ok(name.to_owned())
         }
         TypeShape::CString => {
@@ -1319,7 +1306,7 @@ fn emit_top_level_pointer(
             let storage = format!("_bhf_out_{name}");
             ctx.push(format!(
                 "{storage_type} {storage} = {}",
-                scalar_expr(*kind, &storage_type)
+                scalar_expr(*kind, &storage_type, name)
             ));
             ctx.push(format!("{c_type} {name} = &{storage}"));
             Ok(name.to_owned())
@@ -1693,7 +1680,7 @@ fn emit_lvalue_decode(
     }
     match shape {
         TypeShape::Scalar(kind) => {
-            ctx.push(format!("{lvalue} = {}", scalar_expr(*kind, c_type)));
+            ctx.push(format!("{lvalue} = {}", scalar_expr(*kind, c_type, lvalue)));
             Ok(())
         }
         TypeShape::CString => {
@@ -1801,7 +1788,7 @@ fn emit_pointer_field_storage(
         TypeShape::Scalar(kind) => {
             ctx.push(format!(
                 "{storage_type} {storage} = {}",
-                scalar_expr(*kind, &storage_type)
+                scalar_expr(*kind, &storage_type, lvalue)
             ));
         }
         TypeShape::Enum { members, .. } => {
@@ -1875,12 +1862,12 @@ fn emit_array_decode(
                 ));
                 ctx.push(format!(
                     "for ({idx} = 0; {idx} < {count}; ++{idx}) {{ {lvalue}[{idx}] = {}; }}",
-                    scalar_expr(*kind, elem_c_type)
+                    scalar_expr(*kind, elem_c_type, "")
                 ));
             } else {
                 ctx.push(format!(
                     "for ({idx} = 0; {idx} < {capped}; ++{idx}) {{ {lvalue}[{idx}] = {}; }}",
-                    scalar_expr(*kind, elem_c_type)
+                    scalar_expr(*kind, elem_c_type, "")
                 ));
             }
         }
@@ -1956,7 +1943,70 @@ fn strip_leading_const(c_type: &str) -> &str {
     }
 }
 
-fn scalar_expr(kind: ScalarKind, c_type: &str) -> String {
+/// Decode for an unsigned 32-bit scalar of type `c_type`.
+///
+/// The full `0..=0xffffffff` range, so a bit index, mask or wrap-around value
+/// with the top bit set is reachable. A length-, size- or count-named value
+/// stays within `0..=0x7fffffff`: such a value sizes an allocation or a loop,
+/// and a huge one only produces allocation failures and timeouts. Both forms
+/// consume the same four input bytes.
+fn unsigned32_expr(c_type: &str, name: &str) -> String {
+    let c_type = c_type.trim();
+    if is_length_shaped_name(name) {
+        format!("({c_type})bhf_bounded_i32(&Cur, 0, 0x7fffffff)")
+    } else if matches!(c_type, "uint32_t" | "std::uint32_t") {
+        format!("({c_type})bhf_i32(&Cur)")
+    } else {
+        // Through `uint32_t`, so a wider alias (a 64-bit `unsigned long` behind
+        // a 32-bit typedef) is zero-extended rather than sign-extended.
+        format!("({c_type})(uint32_t)bhf_i32(&Cur)")
+    }
+}
+
+/// Decode for an unsigned 64-bit scalar of type `c_type`: the full range,
+/// except for a length-, size- or count-named value (see [`unsigned32_expr`]).
+/// Both forms consume the same eight input bytes.
+fn unsigned64_expr(c_type: &str, name: &str) -> String {
+    let c_type = c_type.trim();
+    if is_length_shaped_name(name) {
+        format!("({c_type})bhf_bounded_length(&Cur, 0, 0x7fffffff)")
+    } else {
+        format!("({c_type})bhf_i64(&Cur)")
+    }
+}
+
+/// Decode for a `size_t`-spelled scalar (`size_t`, `z_size_t`): the full range,
+/// except that a length-, size- or count-named value keeps the `0..=65536`
+/// bound it has always had, since it usually sizes an allocation or a copy.
+/// Both forms consume the same eight input bytes.
+fn size_expr(c_type: &str, name: &str) -> String {
+    let c_type = c_type.trim();
+    match (is_length_shaped_name(name), c_type) {
+        (true, "size_t") => "bhf_bounded_length(&Cur, 0, 65536)".to_owned(),
+        (true, _) => format!("({c_type})bhf_bounded_length(&Cur, 0, 65536)"),
+        (false, _) => format!("({c_type})bhf_i64(&Cur)"),
+    }
+}
+
+/// The variable name a decode target is known by: the last member of a field
+/// access (`cfg.inner.len` -> `len`, `p->lens[2]` -> `lens`), or the name with
+/// bhf's generated storage prefixes removed (`_bhf_out_len` -> `len`).
+fn decode_target_name(lvalue: &str) -> &str {
+    let leaf = lvalue.rsplit(['.', '>']).next().unwrap_or(lvalue);
+    let leaf = leaf.split('[').next().unwrap_or(leaf).trim();
+    ["_bhf_out_", "_bhf_pf_"]
+        .iter()
+        .find_map(|prefix| leaf.strip_prefix(prefix))
+        .unwrap_or(leaf)
+}
+
+fn is_length_shaped_name(name: &str) -> bool {
+    !name.is_empty() && crate::c_generate::looks_like_count_name(decode_target_name(name))
+}
+
+/// Decode expression for a scalar of `kind`, spelled `c_type`, stored in the
+/// variable or field `name` (empty for an anonymous array element).
+fn scalar_expr(kind: ScalarKind, c_type: &str, name: &str) -> String {
     match kind {
         ScalarKind::Bool => format!("({c_type})(bhf_u8(&Cur) & 1)"),
         ScalarKind::I8 => {
@@ -1982,7 +2032,7 @@ fn scalar_expr(kind: ScalarKind, c_type: &str) -> String {
                 format!("({c_type})bhf_i32(&Cur)")
             }
         }
-        ScalarKind::U32 => format!("({c_type})bhf_bounded_i32(&Cur, 0, 0x7fffffff)"),
+        ScalarKind::U32 => unsigned32_expr(c_type, name),
         ScalarKind::I64 => {
             if matches!(c_type.trim(), "long long" | "int64_t") {
                 "bhf_i64(&Cur)".to_owned()
@@ -1990,7 +2040,7 @@ fn scalar_expr(kind: ScalarKind, c_type: &str) -> String {
                 format!("({c_type})bhf_i64(&Cur)")
             }
         }
-        ScalarKind::U64 => format!("({c_type})bhf_bounded_length(&Cur, 0, 0x7fffffff)"),
+        ScalarKind::U64 => unsigned64_expr(c_type, name),
         ScalarKind::F32 => format!("({c_type})bhf_i32(&Cur)"),
         ScalarKind::F64 => format!("({c_type})bhf_i64(&Cur)"),
     }
@@ -2595,32 +2645,35 @@ fn out_pointer_decoder(c_type: &str, name: &str) -> Option<CParamEmission> {
     if base.contains('*') {
         return None;
     }
-    let (decoder_expr, storage_init) = match base.as_str() {
-        "int" | "signed int" => ("bhf_i32(&Cur)", "0"),
-        "unsigned" | "unsigned int" => ("(unsigned int)bhf_bounded_i32(&Cur, 0, 0x7fffffff)", "0"),
-        "long" | "signed long" => ("(long)bhf_i64(&Cur)", "0"),
-        "unsigned long" => (
-            "(unsigned long)bhf_bounded_length(&Cur, 0, 0x7fffffff)",
-            "0",
-        ),
-        "uLong" | "uLongf" => ("(uLong)bhf_bounded_length(&Cur, 0, 0x7fffffff)", "0"),
-        "uInt" => ("(uInt)bhf_bounded_i32(&Cur, 0, 0x7fffffff)", "0"),
-        "z_size_t" => ("(z_size_t)bhf_bounded_length(&Cur, 0, 65536)", "0"),
-        "mz_ulong" => ("(mz_ulong)bhf_bounded_length(&Cur, 0, 0x7fffffff)", "0"),
-        "long long" | "signed long long" => ("bhf_i64(&Cur)", "0"),
-        "size_t" => ("bhf_bounded_length(&Cur, 0, 65536)", "0"),
-        "uint8_t" | "unsigned char" => ("bhf_u8(&Cur)", "0"),
-        "int8_t" | "signed char" | "char" => ("(int8_t)bhf_u8(&Cur)", "0"),
-        "int32_t" => ("bhf_i32(&Cur)", "0"),
-        "uint32_t" => ("(uint32_t)bhf_bounded_i32(&Cur, 0, 0x7fffffff)", "0"),
-        "int64_t" => ("bhf_i64(&Cur)", "0"),
-        "uint64_t" => ("(uint64_t)bhf_i64(&Cur)", "0"),
+    let decoder_expr: String = match base.as_str() {
+        "int" | "signed int" => "bhf_i32(&Cur)".to_owned(),
+        "unsigned" | "unsigned int" => unsigned32_expr("unsigned int", name),
+        "long" | "signed long" => "(long)bhf_i64(&Cur)".to_owned(),
+        "unsigned long" => unsigned64_expr("unsigned long", name),
+        "uLong" | "uLongf" => unsigned64_expr("uLong", name),
+        "uInt" => unsigned32_expr("uInt", name),
+        "z_size_t" => size_expr("z_size_t", name),
+        "mz_ulong" => unsigned64_expr("mz_ulong", name),
+        "long long" | "signed long long" => "bhf_i64(&Cur)".to_owned(),
+        "size_t" => size_expr("size_t", name),
+        "uint8_t" | "unsigned char" => "bhf_u8(&Cur)".to_owned(),
+        "int8_t" | "signed char" | "char" => "(int8_t)bhf_u8(&Cur)".to_owned(),
+        "int32_t" => "bhf_i32(&Cur)".to_owned(),
+        "uint32_t" => unsigned32_expr("uint32_t", name),
+        "int64_t" => "bhf_i64(&Cur)".to_owned(),
+        "uint64_t" => unsigned64_expr("uint64_t", name),
         _ => return None,
     };
     let storage_name = format!("_bhf_out_{name}");
-    let _ = storage_init;
+    // Most expressions already carry the storage type's cast; add it only when
+    // they do not, so the decl reads `T x = (T)expr` rather than `(T)(T)expr`.
+    let cast = if decoder_expr.starts_with(&format!("({base})")) {
+        String::new()
+    } else {
+        format!("({base})")
+    };
     let decl =
-        format!("{base} {storage_name} = ({base}){decoder_expr}; {base} *{name} = &{storage_name}");
+        format!("{base} {storage_name} = {cast}{decoder_expr}; {base} *{name} = &{storage_name}");
     Some(CParamEmission {
         support: None,
         decl,
@@ -3606,6 +3659,201 @@ mod tests {
         );
     }
 
+    /// Unsigned 32- and 64-bit values with the top bit set (bit indexes, masks,
+    /// wrap-around sizes) must be reachable. A `% 2^31` decode made them
+    /// impossible. Only count/length-named values stay bounded, where a huge
+    /// value would just turn an allocation into resource-exhaustion noise.
+    #[test]
+    fn unsigned_scalars_decode_their_full_range_unless_named_like_a_length() {
+        let reg = TypeRegistry::default();
+        // The spelled-type table.
+        for (c_type, expected) in [
+            (
+                "unsigned int",
+                "unsigned int bit_index = (unsigned int)(uint32_t)bhf_i32(&Cur)",
+            ),
+            (
+                "unsigned",
+                "unsigned int bit_index = (unsigned int)(uint32_t)bhf_i32(&Cur)",
+            ),
+            ("uint32_t", "uint32_t bit_index = (uint32_t)bhf_i32(&Cur)"),
+            ("uInt", "uInt bit_index = (uInt)(uint32_t)bhf_i32(&Cur)"),
+            (
+                "unsigned __int32",
+                "unsigned __int32 bit_index = (unsigned __int32)(uint32_t)bhf_i32(&Cur)",
+            ),
+            (
+                "unsigned long",
+                "unsigned long bit_index = (unsigned long)bhf_i64(&Cur)",
+            ),
+            ("uLong", "uLong bit_index = (uLong)bhf_i64(&Cur)"),
+            ("mz_ulong", "mz_ulong bit_index = (mz_ulong)bhf_i64(&Cur)"),
+        ] {
+            let e = select_c_decoder(c_type, "bit_index").expect("unsigned scalar");
+            assert_eq!(e.decl, expected, "{c_type}");
+        }
+        // The registry (typedef-resolved) table.
+        for (c_type, expected) in [
+            ("DWORD", "DWORD mask = (DWORD)(uint32_t)bhf_i32(&Cur)"),
+            ("UINT", "UINT mask = (UINT)(uint32_t)bhf_i32(&Cur)"),
+            ("ULONGLONG", "ULONGLONG mask = (ULONGLONG)bhf_i64(&Cur)"),
+            (
+                "std::uint32_t",
+                "std::uint32_t mask = (std::uint32_t)bhf_i32(&Cur)",
+            ),
+        ] {
+            let e = select_c_decoder_with_registry(c_type, "mask", &reg).expect("unsigned scalar");
+            assert_eq!(e.decl, expected, "{c_type}");
+        }
+        // The out-pointer table.
+        let out = select_c_decoder("unsigned int *", "width").expect("out pointer");
+        assert!(
+            out.decl
+                .contains("unsigned int _bhf_out_width = (unsigned int)(uint32_t)bhf_i32(&Cur)"),
+            "{}",
+            out.decl
+        );
+        let out = select_c_decoder("uint32_t *", "width").expect("out pointer");
+        assert!(
+            out.decl
+                .contains("uint32_t _bhf_out_width = (uint32_t)bhf_i32(&Cur)"),
+            "{}",
+            out.decl
+        );
+        // A pointer resolved through the registry.
+        let out = select_c_decoder_with_registry("DWORD *", "width", &reg).expect("out pointer");
+        assert!(
+            out.decl
+                .contains("DWORD _bhf_out_width = (DWORD)(uint32_t)bhf_i32(&Cur)"),
+            "{}",
+            out.decl
+        );
+
+        // Length-named values keep the bounded decode in every table.
+        for (c_type, name) in [
+            ("unsigned int", "len"),
+            ("uint32_t", "size"),
+            ("unsigned long", "count"),
+            ("uLong", "sourceLen"),
+            ("uInt", "num_items"),
+        ] {
+            let e = select_c_decoder(c_type, name).expect("unsigned scalar");
+            assert!(
+                e.decl.contains("bhf_bounded_") && e.decl.contains("0x7fffffff"),
+                "{c_type} {name}: {}",
+                e.decl
+            );
+        }
+        let e = select_c_decoder_with_registry("DWORD", "cbData", &reg).expect("scalar");
+        assert!(
+            e.decl.contains("bhf_bounded_i32(&Cur, 0, 0x7fffffff)"),
+            "{}",
+            e.decl
+        );
+        let e = select_c_decoder("unsigned int *", "len").expect("out pointer");
+        assert!(
+            e.decl.contains("bhf_bounded_i32(&Cur, 0, 0x7fffffff)"),
+            "{}",
+            e.decl
+        );
+    }
+
+    /// `size_t`, `z_size_t` and the unsigned 64-bit spellings follow the same
+    /// rule as the other unsigned scalars: the full range unless the value is
+    /// named like a length. A length-named `size_t` keeps its 0..=65536 bound,
+    /// and a length-named 64-bit value stays within 0..=0x7fffffff.
+    #[test]
+    fn size_and_64_bit_unsigned_scalars_decode_their_full_range_unless_named_like_a_length() {
+        for (c_type, expected) in [
+            ("size_t", "size_t mask = (size_t)bhf_i64(&Cur)"),
+            ("z_size_t", "z_size_t mask = (z_size_t)bhf_i64(&Cur)"),
+            ("uint64_t", "uint64_t mask = (uint64_t)bhf_i64(&Cur)"),
+            (
+                "unsigned __int64",
+                "unsigned __int64 mask = (unsigned __int64)bhf_i64(&Cur)",
+            ),
+        ] {
+            let e = select_c_decoder(c_type, "mask").expect("unsigned scalar");
+            assert_eq!(e.decl, expected, "{c_type}");
+        }
+        for (c_type, expected) in [
+            ("size_t", "size_t len = bhf_bounded_length(&Cur, 0, 65536)"),
+            (
+                "z_size_t",
+                "z_size_t len = (z_size_t)bhf_bounded_length(&Cur, 0, 65536)",
+            ),
+            (
+                "uint64_t",
+                "uint64_t len = (uint64_t)bhf_bounded_length(&Cur, 0, 0x7fffffff)",
+            ),
+            (
+                "unsigned __int64",
+                "unsigned __int64 len = (unsigned __int64)bhf_bounded_length(&Cur, 0, 0x7fffffff)",
+            ),
+        ] {
+            let e = select_c_decoder(c_type, "len").expect("unsigned scalar");
+            assert_eq!(e.decl, expected, "{c_type}");
+        }
+        // The out-pointer table.
+        for (c_type, name, storage) in [
+            (
+                "size_t *",
+                "mask",
+                "size_t _bhf_out_mask = (size_t)bhf_i64(&Cur)",
+            ),
+            (
+                "size_t *",
+                "len",
+                "size_t _bhf_out_len = (size_t)bhf_bounded_length(&Cur, 0, 65536)",
+            ),
+            (
+                "z_size_t *",
+                "seed",
+                "z_size_t _bhf_out_seed = (z_size_t)bhf_i64(&Cur)",
+            ),
+            (
+                "uint64_t *",
+                "count",
+                "uint64_t _bhf_out_count = (uint64_t)bhf_bounded_length(&Cur, 0, 0x7fffffff)",
+            ),
+            (
+                "uint64_t *",
+                "hash",
+                "uint64_t _bhf_out_hash = (uint64_t)bhf_i64(&Cur)",
+            ),
+        ] {
+            let e = select_c_decoder(c_type, name).expect("out pointer");
+            assert!(e.decl.contains(storage), "{c_type} {name}: {}", e.decl);
+        }
+    }
+
+    #[test]
+    fn unsigned_struct_fields_decode_their_full_range_unless_named_like_a_length() {
+        let defs = c_parser::parse_c_type_defs(
+            "#include <stdint.h>\n\
+             struct widget { uint32_t flags; uint32_t length; uint64_t mask; };\n",
+        )
+        .expect("defs");
+        let reg = TypeRegistry::from_defs(std::iter::once(&defs));
+        let e = select_c_decoder_with_registry("struct widget", "w", &reg).expect("struct");
+        assert!(
+            e.decl.contains("w.flags = (uint32_t)bhf_i32(&Cur)"),
+            "{}",
+            e.decl
+        );
+        assert!(
+            e.decl.contains("w.mask = (uint64_t)bhf_i64(&Cur)"),
+            "{}",
+            e.decl
+        );
+        assert!(
+            e.decl
+                .contains("w.length = (uint32_t)bhf_bounded_i32(&Cur, 0, 0x7fffffff)"),
+            "{}",
+            e.decl
+        );
+    }
+
     #[test]
     fn select_c_decoder_handles_const_char_ptr_with_free() {
         let e = select_c_decoder("const char *", "name").expect("const char* is supported");
@@ -4562,7 +4810,7 @@ mod tests {
 
         assert!(e
             .decl
-            .contains("mz_uint32 _bhf_out_pIndex = (mz_uint32)bhf_bounded_i32"));
+            .contains("mz_uint32 _bhf_out_pIndex = (mz_uint32)(uint32_t)bhf_i32(&Cur)"));
         assert!(e.decl.contains("mz_uint32 * pIndex = &_bhf_out_pIndex"));
         assert_eq!(e.arg, "pIndex");
         assert!(e.free.is_none());

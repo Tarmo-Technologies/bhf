@@ -375,10 +375,7 @@ pub fn generate_c_direct_harness(
 ) -> Result<GeneratedCFiles, HarnessGenError> {
     let context = build_c_context(&args)?;
     let tera = templates::build_tera()?;
-    let main_c = tera.render(
-        "direct_harness_c",
-        &tera::Context::from_serialize(&context)?,
-    )?;
+    let main_c = tera.render("direct_harness_c", &harness_source_context(&context)?)?;
     let makefile = tera.render(
         "harness_makefile",
         &tera::Context::from_serialize(&context)?,
@@ -396,6 +393,16 @@ pub fn generate_c_direct_harness(
         makefile: makefile_path,
         harness_id: args.harness_id,
     })
+}
+
+/// Template context for a generated harness SOURCE: the emitter's own context
+/// plus the input format version stamped at the top of the file.
+pub(crate) fn harness_source_context(
+    context: &impl Serialize,
+) -> Result<tera::Context, HarnessGenError> {
+    let mut context = tera::Context::from_serialize(context)?;
+    context.insert("harness_format_version", &crate::HARNESS_FORMAT_VERSION);
+    Ok(context)
 }
 
 /// Emit the Mayhemfile, PORTABILITY.md, and libFuzzer shim beside a generated C
@@ -433,10 +440,7 @@ pub fn generate_c_sequence_harness(
 ) -> Result<GeneratedCFiles, HarnessGenError> {
     let context = build_c_sequence_context(&args)?;
     let tera = templates::build_tera()?;
-    let main_c = tera.render(
-        "sequence_harness_c",
-        &tera::Context::from_serialize(&context)?,
-    )?;
+    let main_c = tera.render("sequence_harness_c", &harness_source_context(&context)?)?;
     let makefile = tera.render(
         "harness_makefile",
         &tera::Context::from_serialize(&context)?,
@@ -994,9 +998,13 @@ fn build_param_decoders(
             pair_consumed = true;
             continue;
         }
+        // The pointed-to value becomes the buffer's capacity, so it needs the
+        // same name evidence as every other length: `emit_at(char *buf, size_t
+        // *offset)` must not start writing at the end of the allocation.
         if i + 1 < params.len()
             && is_output_buffer_param(&params[i].c_type, registry)
             && is_length_pointer_param(&params[i + 1].c_type)
+            && length_name_fits_buffer(&params[i], &params[i + 1])
         {
             let (buf_decl, len_decl) =
                 pair_output_buffer_length(&params[i], &params[i + 1], function_name);
@@ -1052,12 +1060,13 @@ fn build_param_decoders(
             && (is_length_param(&params[i + 1].c_type)
                 || (registry_resolves_to_length(&params[i + 1].c_type, registry)
                     && looks_like_count_name(&params[i + 1].name)))
-            // Require NAME evidence before binding (buffer, Size): either the
-            // trailing int is count-shaped OR the pointer is buffer-shaped.
-            // Without this, `(const char *file, int line)` mis-paired as
-            // (buffer, length) — a heap-buffer-overflow false positive (log_log).
+            // Require NAME evidence on the LENGTH before binding (buffer, Size):
+            // the trailing int must be count-shaped. Without this,
+            // `(const char *file, int line)` mis-paired as (buffer, length) — a
+            // heap-buffer-overflow false positive (log_log). A buffer-shaped
+            // pointer name is not evidence: `(src, offset, size)` bound `offset`
+            // to Size. Unnamed parameters still pair on binary-pointer evidence.
             && (looks_like_count_name(&params[i + 1].name)
-                || looks_like_buffer_name(&params[i].name)
                 || (is_synthetic_param_name(&params[i].name)
                     && is_synthetic_param_name(&params[i + 1].name)
                     && (looks_like_explicit_binary_pointer(&params[i].c_type)
@@ -1095,11 +1104,14 @@ fn build_param_decoders(
         // so the callee reads `strings[1..count]` out of bounds — a spurious
         // overflow. Allocate `count` decoded strings so the array and its length
         // agree. (Draws the count from the cursor, so not gated by `pair_consumed`.)
+        // An index into the array (`(char **names, int index)`) is not its
+        // length: sizing the array by it put `names[index]` one past the end.
         if i + 1 < params.len()
             && crate::c_decoders::char_double_pointer_constness(&params[i].c_type).is_some()
             && (is_length_param(&params[i + 1].c_type)
                 || (registry_resolves_to_length(&params[i + 1].c_type, registry)
                     && looks_like_count_name(&params[i + 1].name)))
+            && !looks_like_offset_name(&params[i + 1].name)
         {
             let (arr_decl, count_decl) = pair_string_array_count(&params[i], &params[i + 1]);
             out.push(arr_decl);
@@ -1629,11 +1641,12 @@ fn byte_double_pointer_kind(c_type: &str) -> Option<ByteDoublePointerKind> {
 fn looks_like_stream_count_cursor_pair(length: &CParameter, cursor: &CParameter) -> bool {
     let len = length.name.to_ascii_lowercase();
     let ptr = cursor.name.to_ascii_lowercase();
-    let count_shape = len.contains("avail")
-        || len.contains("remain")
-        || len.contains("size")
-        || len.contains("length")
-        || len.contains("count");
+    let count_shape = !looks_like_offset_name(&length.name)
+        && (len.contains("avail")
+            || len.contains("remain")
+            || len.contains("size")
+            || len.contains("length")
+            || len.contains("count"));
     let cursor_shape = ptr.contains("next")
         || ptr.contains("cursor")
         || ptr.contains("input")
@@ -1725,7 +1738,7 @@ fn is_byte_buffer_base(base: &str) -> bool {
     )
 }
 
-fn registry_resolves_to_byte_pointer(c_type: &str, registry: &TypeRegistry) -> bool {
+pub(crate) fn registry_resolves_to_byte_pointer(c_type: &str, registry: &TypeRegistry) -> bool {
     matches!(
         registry.resolve(c_type),
         TypeShape::Pointer(inner)
@@ -1739,7 +1752,7 @@ fn registry_resolves_to_byte_pointer(c_type: &str, registry: &TypeRegistry) -> b
 /// so a (typed output array, count) pair went undetected: the array was sized to
 /// ONE element while the count was fuzzed huge — a spurious stack-buffer-overflow
 /// (`cgltf_element_read_float` wrote `element_size` floats into a 1-float `out`).
-fn registry_resolves_to_length(c_type: &str, registry: &TypeRegistry) -> bool {
+pub(crate) fn registry_resolves_to_length(c_type: &str, registry: &TypeRegistry) -> bool {
     matches!(
         registry.resolve(c_type),
         TypeShape::Scalar(
@@ -1780,32 +1793,159 @@ fn is_typed_array_pointer(c_type: &str, registry: &TypeRegistry) -> bool {
 /// (`num_tokens`, `count`, `nmemb`, `n`). Gate for the typed-array pairing so a
 /// `(SomeStruct *out, int flags)` signature — pointer followed by a non-count
 /// int — is left to the standalone decoders instead of being mis-paired.
+///
+/// Every pairing that binds a parameter to the input length or to a buffer's
+/// capacity requires this, so an offset-, index- or position-shaped name never
+/// qualifies, even when part of it looks like a count (`lenOffset`,
+/// `start_len`). Binding `offset` in `copy_at(src, offset, size)` to `Size`
+/// pointed every read one past the end of the input: a crash the harness
+/// caused, not the target.
+///
+/// Markers are matched on the name's words (see [`name_words`]), not as
+/// substrings, so `account`, `caps`, `silent` and `enum_x` are not counts, and
+/// a name whose last word is clearly not a length (`account_id`, `count_mode`,
+/// `size_flags`) never is.
 pub(crate) fn looks_like_count_name(name: &str) -> bool {
-    let n = name.to_ascii_lowercase();
-    n == "n"
-        || n == "nmatch"
-        || [
-            "count", "num", "nmemb", "nitem", "ntok", "nelem", "len", "size", "cap", "length",
-            // `nbyte`/`nBytes` is a ubiquitous byte-length name (tinyxml2
-            // `Parse(const char*, size_t nBytes)`). Deliberately NOT a bare
-            // `byte`, so `byteOrder`/`byteOffset`/`byteValue` are not mis-read as
-            // a buffer length.
-            "nbyte",
-        ]
+    if looks_like_offset_name(name) {
+        return false;
+    }
+    let words: Vec<String> = name_words(name)
+        .into_iter()
+        .map(|word| {
+            word.trim_end_matches(|c: char| c.is_ascii_digit())
+                .to_owned()
+        })
+        .filter(|word| !word.is_empty())
+        .collect();
+    let Some(last) = words.last() else {
+        return false;
+    };
+    if is_non_count_word(last) {
+        return false;
+    }
+    if has_hungarian_count_prefix(name) {
+        return true;
+    }
+    // `n`/`nr` are counts on their own (`size_t n`) or ahead of a plural noun
+    // (`nBytes`, `n_items`, `nr_pages`). After another word they are usually an
+    // index (`bit_nr`), and ahead of a singular one a Hungarian integer
+    // (`nValue`).
+    if matches!(words[0].as_str(), "n" | "nr") && (words.len() == 1 || is_plural_word(last)) {
+        return true;
+    }
+    words.iter().any(|word| is_count_word(word))
+}
+
+/// One lower-case name word that marks a length or element count: `len`,
+/// `size`, `count`, `capacity`, `bytes` and words ending in them (`srclen`,
+/// `bufsize`, `linecount`, `nbytes`), the `sz`/`siz` abbreviations (`bufsz`,
+/// `bufsiz`), `cnt`, OpenSSL's `inl`/`outl`, and the run-together element
+/// counts (`nmemb`, `nitems`, `nelem`, `numbytes`).
+fn is_count_word(word: &str) -> bool {
+    const SUFFIXES: &[&str] = &[
+        "len", "length", "size", "sz", "siz", "count", "cnt", "cap", "capacity", "bytes", "nbyte",
+    ];
+    const NOT_COUNTS: &[&str] = &["account", "discount", "viscount", "resize"];
+    if NOT_COUNTS.iter().any(|w| word.ends_with(w)) {
+        return false;
+    }
+    if SUFFIXES.iter().any(|suffix| word.ends_with(suffix)) {
+        return true;
+    }
+    if matches!(
+        word,
+        "num" | "numel" | "inl" | "outl" | "argc" | "avail" | "remain" | "remaining"
+    ) {
+        return true;
+    }
+    // `numbytes`, `numitems`: `num` run together with a plural noun. `number`
+    // on its own is usually a value, not a count.
+    if word.len() > 4 && word.starts_with("num") && is_plural_word(word) && word != "numbers" {
+        return true;
+    }
+    ["nmemb", "nitem", "nelem", "ntok", "nbyte", "nmatch"]
         .iter()
-        .any(|marker| n.contains(marker))
+        .any(|prefix| word.starts_with(prefix))
+}
+
+/// A word that names something other than a length when it ends a parameter
+/// name: `account_id`, `count_mode`, `size_flags`, `line`, `bit`.
+fn is_non_count_word(word: &str) -> bool {
+    matches!(
+        word,
+        "id" | "ids" | "flag" | "flags" | "mode" | "type" | "kind" | "line" | "bit" | "status"
+    )
+}
+
+/// A lower-case word that reads as an English plural (`bytes`, `items`,
+/// `pages`) rather than a singular ending in `s` (`address`, `status`, `axis`).
+fn is_plural_word(word: &str) -> bool {
+    word.len() > 2
+        && word.ends_with('s')
+        && !word.ends_with("ss")
+        && !word.ends_with("us")
+        && !word.ends_with("is")
+}
+
+/// Win32 Hungarian byte and character counts (`cbData`, `cchName`) and their
+/// pointer forms (`pcbData`, `pcchName`, `lpcbData`). The prefix must be
+/// followed by an upper-case letter, so `cbor` and a bare `cb` (usually a
+/// callback) are not counts.
+fn has_hungarian_count_prefix(name: &str) -> bool {
+    ["cb", "cch", "pcb", "pcch", "lpcb", "lpcch"]
+        .iter()
+        .any(|prefix| {
+            name.strip_prefix(prefix)
+                .and_then(|rest| rest.chars().next())
+                .is_some_and(|c| c.is_ascii_uppercase())
+        })
+}
+
+/// True when a parameter name reads like a position inside a buffer rather than
+/// its length: an offset, index, cursor position, start or skip count.
+pub(crate) fn looks_like_offset_name(name: &str) -> bool {
+    name_words(name).iter().any(|word| {
+        matches!(
+            word.as_str(),
+            "off" | "offs" | "ofs" | "position" | "start" | "begin" | "skip"
+        ) || word.ends_with("offset")
+            || word.ends_with("index")
+            || word.ends_with("idx")
+            || word.ends_with("pos")
+    })
+}
+
+/// Split an identifier into lower-case words at `_`/non-alphanumeric
+/// separators and camelCase boundaries (`srcOffset` -> `src`, `offset`).
+fn name_words(name: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut prev_lower = false;
+    for c in name.chars() {
+        if !c.is_ascii_alphanumeric() {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            prev_lower = false;
+            continue;
+        }
+        if c.is_ascii_uppercase() && prev_lower && !current.is_empty() {
+            words.push(std::mem::take(&mut current));
+        }
+        prev_lower = c.is_ascii_lowercase() || c.is_ascii_digit();
+        current.push(c.to_ascii_lowercase());
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
 }
 
 /// True when a parameter name reads like a data BUFFER (`buf`, `data`, `src`,
-/// `input`, ...). Used WITH [`looks_like_count_name`] to gate the raw-buffer +
-/// by-value-length pairing: `log_log(int level, const char *file, int line,
-/// const char *fmt, ...)` was mis-read as a `(buffer=file, length=line)` pair
-/// because `file` is a `char *` and `line` is an `int` — binding `file` to the
-/// raw, non-NUL-terminated `Data` span and `line` to `Size`, so the `%s`-printed
-/// `file` ran off the end: a spurious heap-buffer-overflow. Neither `file` nor
-/// `line` is buffer- or length-shaped, so the pair must NOT form; both fall
-/// through to the standalone NUL-terminating string + scalar decoders. A genuine
-/// `(const char *src, int srclen)` still pairs (`srclen` is count-shaped).
+/// `input`, ...). Supporting evidence for the reverse `(length, buffer)` and
+/// output-buffer pairings. It is never enough on its own to bind the FOLLOWING
+/// integer to the input length: `src` says nothing about whether the next
+/// parameter is a length or an offset.
 pub(crate) fn looks_like_buffer_name(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     matches!(
@@ -2398,8 +2538,11 @@ fn looks_like_output_capacity_pair(
     length: &CParameter,
     function_name: &str,
 ) -> bool {
-    looks_outputish(&buffer.name)
-        || looks_outputish(&length.name)
+    // An output-shaped buffer name says nothing about the integer after it:
+    // `put_at(dst, offset, size)` and `encode(out, flags)` bound `offset` and
+    // `flags` to the capacity, so every write started at the end of the buffer.
+    (looks_like_count_name(&length.name)
+        && (looks_outputish(&buffer.name) || looks_outputish(&length.name)))
         // Public headers often omit parameter names. The parser then gives us
         // `arg1`/`arg2`, so name-only evidence disappears precisely for APIs like
         // `archive_read_data(struct archive *, void *, size_t)`. Decoding that
@@ -2424,6 +2567,14 @@ fn is_synthetic_param_name(name: &str) -> bool {
     }
     stem.strip_prefix("arg")
         .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Name evidence that `length` holds the size or capacity of the `buffer` it
+/// follows: a count-shaped name ([`looks_like_count_name`]), or two names the
+/// parser synthesized for a header that omits them.
+fn length_name_fits_buffer(buffer: &CParameter, length: &CParameter) -> bool {
+    looks_like_count_name(&length.name)
+        || (is_synthetic_param_name(&buffer.name) && is_synthetic_param_name(&length.name))
 }
 
 fn looks_like_output_producing_function(name: &str) -> bool {
@@ -4856,6 +5007,359 @@ mod tests {
         assert!(!looks_like_count_name("firstByte"));
     }
 
+    #[test]
+    fn count_name_needs_count_shape_and_rejects_offsets() {
+        // Win32 Hungarian byte/char counts are lengths.
+        assert!(looks_like_count_name("cbData"));
+        assert!(looks_like_count_name("cchName"));
+        assert!(looks_like_count_name("srclen"));
+        assert!(looks_like_count_name("size"));
+        // ...but only with the Hungarian capital: these are ordinary words.
+        assert!(!looks_like_count_name("cbor"));
+        assert!(!looks_like_count_name("cb"));
+        // Offset-, index- and position-shaped names never bind to the input length,
+        // even when another part of the name looks like a count.
+        for name in [
+            "offset",
+            "off",
+            "pos",
+            "position",
+            "index",
+            "idx",
+            "start",
+            "begin",
+            "skip",
+            "bit_index",
+            "srcOffset",
+            "lenOffset",
+            "start_len",
+            "sizeIdx",
+        ] {
+            assert!(
+                !looks_like_count_name(name),
+                "{name:?} must not pair as a buffer length"
+            );
+        }
+    }
+
+    fn c_param_decls(function_name: &str, params: &[(&str, &str)]) -> Vec<String> {
+        let params: Vec<CParameter> = params
+            .iter()
+            .map(|(name, c_type)| CParameter {
+                name: (*name).to_owned(),
+                c_type: (*c_type).to_owned(),
+            })
+            .collect();
+        build_param_decoders(
+            &params,
+            &TypeRegistry::default(),
+            &[],
+            None,
+            false,
+            false,
+            DecoderLimits::default(),
+            function_name,
+            false,
+        )
+        .expect("decoders")
+        .into_iter()
+        .map(|emission| emission.decl)
+        .collect()
+    }
+
+    #[test]
+    fn buffer_name_alone_does_not_bind_the_next_integer_to_the_input_length() {
+        // `copy_at(src, offset, size)`: `src` is buffer-shaped, but `offset` is
+        // not a length. Binding it to Size made every non-empty input read past
+        // the end of the buffer.
+        let decls = c_param_decls(
+            "copy_at",
+            &[
+                ("src", "const unsigned char *"),
+                ("offset", "unsigned int"),
+                ("size", "unsigned int"),
+            ],
+        );
+        let joined = decls.join(" ; ");
+        assert!(
+            !decls[0].contains("= (const unsigned char *)Data")
+                && decls[0].contains("malloc(")
+                && decls[0].contains("memcpy("),
+            "src must be its own heap copy of the input, so its true size is \
+             visible to ASan: {joined}"
+        );
+        assert!(
+            !decls[1].contains("Size"),
+            "offset must be decoded, not bound to Size: {joined}"
+        );
+        assert!(
+            decls[1].contains("bhf_i32(&Cur)") && !decls[1].contains("bhf_bounded_i32"),
+            "offset must be decoded across its full unsigned range: {joined}"
+        );
+
+        for (buffer, length) in [
+            (("data", "const char *"), ("flags", "int")),
+            (("buf", "const uint8_t *"), ("index", "size_t")),
+            (("input", "const void *"), ("pos", "unsigned long")),
+        ] {
+            let decls = c_param_decls("parse_record", &[buffer, length]);
+            assert!(
+                !decls[1].contains("Size"),
+                "{length:?} must not be bound to Size after {buffer:?}: {decls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn count_named_lengths_still_pair_with_their_buffer() {
+        for (buffer, length, buf_decl, len_decl) in [
+            (
+                ("src", "const char *"),
+                ("srclen", "int"),
+                "const char * src = (const char *)Data",
+                "int srclen = (int)Size",
+            ),
+            (
+                ("data", "const void *"),
+                ("size", "size_t"),
+                "const void * data = (const void *)Data",
+                "size_t size = (size_t)Size",
+            ),
+            // Win32: a typedef'd byte pointer and a DWORD Hungarian byte count.
+            (
+                ("pbData", "const BYTE *"),
+                ("cbData", "DWORD"),
+                "const BYTE * pbData = (const BYTE *)Data",
+                "DWORD cbData = (DWORD)Size",
+            ),
+        ] {
+            let decls = c_param_decls("parse_record", &[buffer, length]);
+            assert_eq!(decls[0], buf_decl, "{decls:?}");
+            assert_eq!(decls[1], len_decl, "{decls:?}");
+        }
+    }
+
+    #[test]
+    fn count_names_match_whole_words_and_common_length_abbreviations() {
+        for name in [
+            "sz",
+            "bufsz",
+            "destsz",
+            "bufsiz",
+            "BUFSIZ",
+            "bytes",
+            "nbytes",
+            "num_bytes",
+            "cnt",
+            "byte_cnt",
+            "inl",
+            "outl",
+            "ilen",
+            "nr",
+            "nr_pages",
+            "len1",
+            "size_2",
+            "line_count",
+            "dataLen",
+            "numItems",
+            "n_items",
+            "nItems",
+            "nitems",
+            "nmemb",
+            "dstCapacity",
+            "capacity",
+            "maxlen",
+            "bufferSize",
+            "avail_in",
+            "remaining",
+            "argc",
+            "lpcbData",
+        ] {
+            assert!(looks_like_count_name(name), "{name:?} is a length");
+        }
+        // A count marker inside a longer word, or a name that ends in a word
+        // that is clearly not a length, is not a count.
+        for name in [
+            "account_id",
+            "account",
+            "country",
+            "caps",
+            "escape",
+            "capture",
+            "silent",
+            "lenient",
+            "number",
+            "enum_x",
+            "nValue",
+            "nFlags",
+            "nStatus",
+            "line",
+            "flags",
+            "mode",
+            "kind",
+            "bit",
+            "count_mode",
+            "len_type",
+            "size_flags",
+            "cbType",
+            "bit_nr",
+        ] {
+            assert!(!looks_like_count_name(name), "{name:?} is not a length");
+        }
+    }
+
+    #[test]
+    fn common_length_abbreviations_pair_with_their_buffer() {
+        for (buffer, length) in [
+            (("data", "const char *"), ("sz", "size_t")),
+            (("in", "const unsigned char *"), ("inl", "int")),
+            (("buf", "const void *"), ("bytes", "size_t")),
+            (("buf", "const char *"), ("bufsiz", "int")),
+            (("in", "const uint8_t *"), ("nr", "unsigned")),
+        ] {
+            let decls = c_param_decls("parse_record", &[buffer, length]);
+            let (buf_name, buf_type) = buffer;
+            let (len_name, len_type) = length;
+            let buf_type = emit_c_type(buf_type);
+            let len_type = emit_c_type(len_type);
+            assert_eq!(
+                decls[0],
+                format!("{buf_type} {buf_name} = ({buf_type})Data"),
+                "{decls:?}"
+            );
+            assert_eq!(
+                decls[1],
+                format!("{len_type} {len_name} = ({len_type})Size"),
+                "{decls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_length_names_do_not_bind_to_the_input_length() {
+        for (buffer, length) in [
+            (("data", "const char *"), ("account_id", "int")),
+            (("buf", "const unsigned char *"), ("caps", "unsigned int")),
+            (("buf", "const unsigned char *"), ("country", "int")),
+        ] {
+            let decls = c_param_decls("parse_record", &[buffer, length]);
+            assert!(
+                !decls[1].contains("Size"),
+                "{length:?} must not be bound to Size after {buffer:?}: {decls:?}"
+            );
+        }
+    }
+
+    /// The capacity an output buffer is allocated with is a length too: an
+    /// offset, index or flags parameter bound to it pointed every write at (or
+    /// past) the end of the allocation.
+    #[test]
+    fn output_buffers_never_bind_an_offset_or_index_to_their_capacity() {
+        for (function, params, unbound) in [
+            (
+                "put_at",
+                vec![
+                    ("dst", "unsigned char *"),
+                    ("offset", "unsigned int"),
+                    ("size", "unsigned int"),
+                ],
+                1,
+            ),
+            (
+                "put",
+                vec![
+                    ("dst", "uint8_t *"),
+                    ("offset", "unsigned int"),
+                    ("n", "unsigned int"),
+                ],
+                1,
+            ),
+            ("write_idx", vec![("out", "char *"), ("index", "int")], 1),
+            (
+                "emit_at",
+                vec![("buf", "char *"), ("offset", "size_t *")],
+                1,
+            ),
+            ("encode", vec![("out", "uint8_t *"), ("flags", "int")], 1),
+            (
+                "decode_block",
+                vec![("dest", "unsigned char *"), ("pos", "size_t")],
+                1,
+            ),
+        ] {
+            let decls = c_param_decls(function, &params);
+            let buffer = params[0].0;
+            let decl = &decls[unbound];
+            assert!(
+                !decl.contains(&format!("_bhf_cap_{buffer}")) && !decl.contains("Size"),
+                "{function}: {:?} must not be bound to the capacity of {buffer}: {decls:?}",
+                params[unbound]
+            );
+        }
+
+        // Count-named capacities keep pairing with their output buffer.
+        for (function, params, len_decl) in [
+            (
+                "encode",
+                vec![("out", "char *"), ("outlen", "size_t")],
+                "size_t outlen = (size_t)(out ? _bhf_cap_out : 0)",
+            ),
+            (
+                "encode",
+                vec![("dst", "void *"), ("dstCapacity", "size_t")],
+                "size_t dstCapacity = (size_t)(dst ? _bhf_cap_dst : 0)",
+            ),
+            (
+                "encode",
+                vec![("out", "unsigned char *"), ("outsz", "int")],
+                "int outsz = (int)(out ? _bhf_cap_out : 0)",
+            ),
+        ] {
+            let decls = c_param_decls(function, &params);
+            assert_eq!(decls[1], len_decl, "{decls:?}");
+        }
+        let decls = c_param_decls("format_into", &[("buf", "char *"), ("len", "size_t *")]);
+        assert!(
+            decls[1].contains("_bhf_out_len = (size_t)(buf ? _bhf_cap_buf : 0)"),
+            "{decls:?}"
+        );
+    }
+
+    /// A streaming count/cursor pair binds the count to the cursor's buffer, so
+    /// a position-shaped count (`start_length`) stays unpaired.
+    #[test]
+    fn a_stream_cursor_count_is_not_an_offset() {
+        let param = |name: &str, c_type: &str| CParameter {
+            name: name.to_owned(),
+            c_type: c_type.to_owned(),
+        };
+        let cursor = param("next_in", "const uint8_t **");
+        assert!(looks_like_stream_count_cursor_pair(
+            &param("avail_in", "size_t *"),
+            &cursor
+        ));
+        assert!(!looks_like_stream_count_cursor_pair(
+            &param("start_length", "size_t *"),
+            &cursor
+        ));
+    }
+
+    /// An index into a string array is not the array's length: sizing the array
+    /// by it put `names[index]` one past the end.
+    #[test]
+    fn a_string_array_is_not_sized_by_an_index() {
+        let decls = c_param_decls("pick_name", &[("names", "char **"), ("index", "int")]);
+        assert!(
+            !decls[1].contains("_bhf_count_names"),
+            "index must not be bound to the array length: {decls:?}"
+        );
+        let decls = c_param_decls("join_names", &[("names", "char **"), ("count", "int")]);
+        assert!(
+            decls[1].contains("_bhf_count_names"),
+            "a count still sizes the array: {decls:?}"
+        );
+    }
+
     fn temp_dir(name: &str) -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -5031,6 +5535,91 @@ mod tests {
             "expected an ASan/libFuzzer crash report, got:\n{err}"
         );
 
+        fs::remove_dir_all(&out).ok();
+    }
+
+    #[test]
+    fn generated_c_harness_names_its_input_format_version() {
+        let out = temp_dir("format_version");
+        let mut args = direct_args("parse_record", out.clone());
+        args.params = vec![CParameter {
+            name: "flags".to_owned(),
+            c_type: "unsigned int".to_owned(),
+        }];
+        let result = generate_c_direct_harness(args).unwrap();
+        let main = fs::read_to_string(&result.main_c).unwrap();
+        let stamp = format!("/* bhf harness format {} */", crate::HARNESS_FORMAT_VERSION);
+        assert!(main.contains(&stamp), "missing {stamp:?} in:\n{main}");
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// A built harness must be able to hand an unsigned parameter a value with
+    /// the top bit set: `0xffffffff` (all input bytes 0xff) used to decode to
+    /// `0x7fffffff`, so the planted check below was unreachable from any input.
+    #[test]
+    fn built_harness_reaches_unsigned_values_with_the_top_bit_set() {
+        let make_ok = Command::new("make")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        let clang_ok = Command::new("clang")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !make_ok || !clang_ok {
+            eprintln!("skipping unsigned range e2e: clang/make unavailable");
+            return;
+        }
+        let out = temp_dir("unsigned_range_e2e");
+        let c_runtime = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../c_runtime")
+            .canonicalize()
+            .expect("c_runtime dir");
+        let target_c = out.join("target.c");
+        fs::write(
+            &target_c,
+            "#include <stdlib.h>\n\
+             int select_bit(unsigned int bit_index) {\n\
+             \x20   if (bit_index == 0xffffffffu) abort();\n\
+             \x20   return (int)(bit_index & 1u);\n\
+             }\n",
+        )
+        .unwrap();
+        let mut args = direct_args("select_bit", out.clone());
+        args.params = vec![CParameter {
+            name: "bit_index".to_owned(),
+            c_type: "unsigned int".to_owned(),
+        }];
+        args.target_sources = vec![target_c];
+        args.c_runtime_include = c_runtime;
+        generate_c_direct_harness(args).unwrap();
+        let build = Command::new("make")
+            .arg("main")
+            .current_dir(&out)
+            .output()
+            .expect("run make");
+        assert!(
+            build.status.success(),
+            "make main failed:\n{}\n{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr)
+        );
+        let low = out.join("low.bin");
+        fs::write(&low, [0x01, 0x00, 0x00, 0x00]).unwrap();
+        let run = Command::new(out.join("main")).arg(&low).output().unwrap();
+        assert!(
+            run.status.success(),
+            "a small value must not reach the planted check: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let high = out.join("high.bin");
+        fs::write(&high, [0xff, 0xff, 0xff, 0xff]).unwrap();
+        let run = Command::new(out.join("main")).arg(&high).output().unwrap();
+        assert!(
+            !run.status.success(),
+            "0xffffffff must be reachable from the input bytes: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
         fs::remove_dir_all(&out).ok();
     }
 

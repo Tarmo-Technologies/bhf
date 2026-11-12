@@ -80,6 +80,24 @@
 - A SEGV's direction is ASan's READ/WRITE token. An unknown direction, or a
   non-canonical high address, is CWE-119 instead of an assumed write
   (CWE-787).
+- C/C++ harnesses: a typedef'd byte buffer or length (`const u8_t *`,
+  `const BYTE *`, `LPCBYTE`, `UINT`, `DWORD`) now pairs as `(Data, Size)` in
+  the C++ lane too, so the length can no longer overrun the buffer. A buffer
+  spelled through a pointer typedef gets a heap copy whose size is its length.
+  An integer after a buffer is bound to the input length, or to an output
+  buffer's capacity, only when its name is length-shaped. Names are matched
+  word by word, so common abbreviations (`sz`, `bufsiz`, `bytes`, `cnt`,
+  OpenSSL `inl`, Win32 `cb`/`cch` counts) pair, while `account_id`, `caps` or
+  `flags` do not. Offset-, index- and position-named parameters are never
+  bound to a buffer's size, in both lanes. Previously
+  `f(const unsigned char *src, unsigned offset, unsigned size)` received
+  `offset = Size`, and `f(unsigned char *dst, unsigned offset, unsigned n)`
+  received `offset` = the buffer's capacity, so every access started past the
+  end.
+- C/C++ harnesses: unsigned parameters, struct fields and output values,
+  `size_t` included, decode across their full range. Before, values of 2^31
+  and above (65537 and above for `size_t`) were unreachable. Length-, size-
+  and count-named values stay bounded.
 
 ### Changed
 - `bhf auto --seed-dir` reads a directory's files in name order.
@@ -111,6 +129,14 @@
   findings recorded under the earlier rules.
 - SARIF result `properties.cwe` is the finding's computed CWE rather than the
   rule's catalog CWE; `properties.cwe_top_25` is set only when the two agree.
+- Generated C/C++ harnesses are now input format 2. The version is recorded as
+  `harness_format_version` in `generation-metadata.json` (an additive field) and
+  at the top of `main.c` / `main.cpp`. Inputs whose unsigned values have the
+  top bit set, non-length `size_t` values, and pairs whose integer is not
+  length-named decode differently than under format 1. `bhf generate-harness`
+  warns when it regenerates a harness of another format, and `bhf replay`
+  notes when it replays against one. Re-run existing corpora and re-triage
+  findings recorded against older harnesses.
 - Ada static rules run on a statement and scope model instead of line
   matching. BHF-409 now reports only Unchecked_Conversion to an access type
   (and Address_To_Access_Conversions), BHF-410 a double free through an alias,

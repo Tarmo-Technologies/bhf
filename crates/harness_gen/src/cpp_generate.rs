@@ -297,7 +297,7 @@ fn render_cpp_harness(
     let tera = templates::build_tera()?;
     let main_cpp = tera.render(
         "direct_harness_cpp",
-        &tera::Context::from_serialize(context)?,
+        &crate::c_generate::harness_source_context(context)?,
     )?;
     let makefile = tera.render(
         "harness_makefile_cpp",
@@ -550,7 +550,7 @@ fn build_cpp_param_decoders(
             }
         }
         if i + 1 < params.len()
-            && is_output_buffer_cpp_param(&params[i].cpp_type)
+            && is_output_buffer_cpp_param(&params[i].cpp_type, registry)
             && is_length_pointer_cpp_param(&params[i + 1].cpp_type)
             && looks_like_cpp_output_capacity_pair(&params[i], &params[i + 1])
         {
@@ -561,8 +561,12 @@ fn build_cpp_param_decoders(
             continue;
         }
         if i + 1 < params.len()
-            && is_output_buffer_cpp_param(&params[i].cpp_type)
-            && is_length_cpp_param(&params[i + 1].cpp_type)
+            && is_output_buffer_cpp_param(&params[i].cpp_type, registry)
+            && (is_length_cpp_param(&params[i + 1].cpp_type)
+                || crate::c_generate::registry_resolves_to_length(
+                    &params[i + 1].cpp_type,
+                    registry,
+                ))
             && looks_like_cpp_output_capacity_pair(&params[i], &params[i + 1])
         {
             let (buf_decl, len_decl) = pair_cpp_output_buffer_capacity(&params[i], &params[i + 1]);
@@ -573,17 +577,29 @@ fn build_cpp_param_decoders(
         }
         if !pair_consumed
             && i + 1 < params.len()
-            && is_raw_buffer_cpp_param(&params[i].cpp_type)
-            && is_length_cpp_param(&params[i + 1].cpp_type)
-            // Require NAME evidence before binding (buffer, Size), mirroring the C
-            // lane: `pugi::xml_document::load_file(const char *path_, unsigned int
-            // options)` was mis-read as a (buffer, length) pair — binding `path_`
-            // to the raw, non-NUL-terminated Data span (a file path the parser then
-            // ran off the end of: a heap-buffer-overflow FALSE POSITIVE). Neither
-            // `path_` nor `options` is buffer- or length-shaped, so they fall
-            // through to the standalone decoders (path_ -> a tempfile path).
-            && (crate::c_generate::looks_like_count_name(&params[i + 1].name)
-                || crate::c_generate::looks_like_buffer_name(&params[i].name))
+            // Both sides resolve through the type registry, as in the C lane: a
+            // typedef'd byte pointer (`const u8_t *`, `const BYTE *`) or length
+            // (`UINT`, `DWORD`) that failed to pair left the buffer a whole-input
+            // copy and the length an independent fuzzed value that overran it.
+            && (is_raw_buffer_cpp_param_resolved(&params[i].cpp_type, registry)
+                || crate::c_generate::registry_resolves_to_byte_pointer(
+                    &params[i].cpp_type,
+                    registry,
+                ))
+            && (is_length_cpp_param(&params[i + 1].cpp_type)
+                || crate::c_generate::registry_resolves_to_length(
+                    &params[i + 1].cpp_type,
+                    registry,
+                ))
+            // Require NAME evidence on the LENGTH before binding (buffer, Size),
+            // mirroring the C lane: `pugi::xml_document::load_file(const char
+            // *path_, unsigned int options)` was mis-read as a (buffer, length)
+            // pair — binding `path_` to the raw, non-NUL-terminated Data span (a
+            // file path the parser then ran off the end of: a heap-buffer-overflow
+            // FALSE POSITIVE). A buffer-shaped pointer name is not evidence either:
+            // `(src, offset, size)` bound `offset` to Size, so every read started
+            // one past the end of the input.
+            && crate::c_generate::looks_like_count_name(&params[i + 1].name)
         {
             let buf = &params[i];
             let len = &params[i + 1];
@@ -594,14 +610,24 @@ fn build_cpp_param_decoders(
                 .collect::<Vec<_>>()
                 .join(" ");
             let const_buffer = is_const_cpp_pointer_type(&buf_type);
+            // A pointer typedef (`LPCBYTE`, `PBYTE`) hides whether the bytes are
+            // const. Its buffer is always a heap copy whose length is the copy's
+            // size, which is right for both; the `(void *)` casts let the copy
+            // and the free compile when the pointee is const.
+            let hidden_pointer = cpp_pointer_base(&buf_type).is_none();
+            let buf_ref = if hidden_pointer {
+                format!("(void *){}", buf.name)
+            } else {
+                buf.name.clone()
+            };
             let buf_decl = if const_buffer {
                 format!("{buf_type} {} = ({buf_type})Data", buf.name)
             } else {
                 format!(
                     "size_t _bhf_cap_{} = Size <= (1024 * 1024) ? (size_t)Size : (1024 * 1024); \
                      {buf_type} {} = ({buf_type})malloc(_bhf_cap_{} ? _bhf_cap_{} : 1); \
-                     if ({} && _bhf_cap_{}) memcpy({}, Data, _bhf_cap_{})",
-                    buf.name, buf.name, buf.name, buf.name, buf.name, buf.name, buf.name, buf.name
+                     if ({} && _bhf_cap_{}) memcpy({buf_ref}, Data, _bhf_cap_{})",
+                    buf.name, buf.name, buf.name, buf.name, buf.name, buf.name, buf.name
                 )
             };
             let len_decl = if const_buffer {
@@ -617,7 +643,7 @@ fn build_cpp_param_decoders(
                 decl: buf_decl,
                 arg: buf.name.clone(),
                 c_type: buf_type.clone(),
-                free: (!const_buffer).then(|| format!("free({})", buf.name)),
+                free: (!const_buffer).then(|| format!("free({buf_ref})")),
             });
             out.push(CParamEmission {
                 support: None,
@@ -677,24 +703,53 @@ fn build_cpp_param_decoders(
     Ok(out)
 }
 
+/// Collapse whitespace and separate a pointer declarator from its base type
+/// (`u8_t*` -> `u8_t *`, `char**` -> `char **`), so the pointer-shape checks
+/// below see one spelling whatever the parser produced.
 fn normalize_cpp_pointer(c_type: &str) -> String {
-    c_type
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .replace("char*", "char *")
-        .replace("uint8_t*", "uint8_t *")
-        .replace("std::uint8_t*", "std::uint8_t *")
-        .replace("int8_t*", "int8_t *")
-        .replace("std::byte*", "std::byte *")
-        .replace("unsigned char*", "unsigned char *")
-        .replace("void*", "void *")
+    let mut spaced = String::with_capacity(c_type.len() + 2);
+    let mut prev = ' ';
+    for ch in c_type.chars() {
+        if ch == '*' && prev != '*' && !prev.is_whitespace() {
+            spaced.push(' ');
+        }
+        spaced.push(ch);
+        prev = ch;
+    }
+    spaced.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn is_raw_buffer_cpp_param(cpp_type: &str) -> bool {
     let normalized = normalize_cpp_pointer(cpp_type);
     let without_const = normalized.trim_start_matches("const ").trim();
     cpp_pointer_base(without_const).is_some_and(is_cpp_byte_buffer_base)
+}
+
+/// [`is_raw_buffer_cpp_param`], also accepting a pointer whose element type is a
+/// typedef (or typedef chain) of a byte scalar (`const u8_t *`, `const BYTE *`).
+/// Only an explicit `T *` spelling qualifies: a pointer typedef hides its
+/// constness, and the emitted copy-in for a writable buffer must not be applied
+/// to a `const` pointee.
+fn is_raw_buffer_cpp_param_resolved(cpp_type: &str, registry: &TypeRegistry) -> bool {
+    if is_raw_buffer_cpp_param(cpp_type) {
+        return true;
+    }
+    let normalized = normalize_cpp_pointer(cpp_type);
+    let without_const = normalized.trim_start_matches("const ").trim();
+    cpp_pointer_base(without_const)
+        .is_some_and(|base| registry_resolves_to_byte_scalar(base, registry))
+}
+
+fn registry_resolves_to_byte_scalar(base: &str, registry: &TypeRegistry) -> bool {
+    let base = base
+        .split_whitespace()
+        .filter(|token| *token != "const" && *token != "volatile")
+        .collect::<Vec<_>>()
+        .join(" ");
+    matches!(
+        registry.resolve(&base),
+        type_model::TypeShape::Scalar(type_model::ScalarKind::U8 | type_model::ScalarKind::I8)
+    )
 }
 
 /// Whether a target name is a user-defined-literal operator (`operator"" _x` /
@@ -735,12 +790,14 @@ fn is_cpp_char_pointer_param(cpp_type: &str) -> bool {
     })
 }
 
-fn is_output_buffer_cpp_param(cpp_type: &str) -> bool {
+fn is_output_buffer_cpp_param(cpp_type: &str, registry: &TypeRegistry) -> bool {
     let normalized = normalize_cpp_pointer(cpp_type);
     if is_const_cpp_pointer_type(&normalized) {
         return false;
     }
-    cpp_pointer_base(&normalized).is_some_and(is_cpp_byte_buffer_base)
+    cpp_pointer_base(&normalized).is_some_and(|base| {
+        is_cpp_byte_buffer_base(base) || registry_resolves_to_byte_scalar(base, registry)
+    })
 }
 
 fn cpp_pointer_base(cpp_type: &str) -> Option<&str> {
@@ -865,8 +922,15 @@ fn pair_cpp_output_buffer_capacity(
     (buf_emission, len_emission)
 }
 
+/// An output buffer followed by its capacity (by value or by pointer). As for
+/// an input length, the capacity must be count-shaped by name: an output-shaped
+/// buffer name says nothing about the integer after it, and binding `offset`
+/// in `put_at(u8_t *dst, unsigned offset, unsigned n)` or `flags` in
+/// `encode(u8_t *out, int flags)` to the capacity started every write at the
+/// end of the allocation.
 fn looks_like_cpp_output_capacity_pair(buffer: &CppParameter, length: &CppParameter) -> bool {
-    looks_cpp_outputish(&buffer.name) || looks_cpp_outputish(&length.name)
+    crate::c_generate::looks_like_count_name(&length.name)
+        && (looks_cpp_outputish(&buffer.name) || looks_cpp_outputish(&length.name))
 }
 
 fn looks_cpp_outputish(name: &str) -> bool {
@@ -4142,6 +4206,42 @@ mod tests {
     }
 
     #[test]
+    fn generated_cpp_harness_names_its_input_format_version() {
+        let out = temp_dir("cpp-format-version");
+        let args = GenerateCppDirectArgs {
+            decoder_limits: Default::default(),
+            force: false,
+            harness_id: "H-CPPFMT".to_owned(),
+            output_dir: out.clone(),
+            source_path: PathBuf::from("/tmp/source.cpp"),
+            target: cppfunction("parse_record"),
+            params: vec![CppParameter {
+                name: "flags".to_owned(),
+                cpp_type: "unsigned int".to_owned(),
+            }],
+            return_type: "int".to_owned(),
+            target_includes: Vec::new(),
+            target_includes_dirs: Vec::new(),
+            target_sources: vec![PathBuf::from("/tmp/source.cpp")],
+            compile_flags: Vec::new(),
+            c_runtime_include: PathBuf::from("/tmp/c_runtime"),
+            using_namespaces: Vec::new(),
+            result_cleanup: None,
+            constructor_params: Vec::new(),
+            type_defs: Vec::new(),
+            default_constructible_classes: Vec::new(),
+            parameter_constructions: Vec::new(),
+            receiver_class_override: None,
+            factory_plan: None,
+        };
+        let result = generate_cpp_direct_harness(args).unwrap();
+        let main = fs::read_to_string(&result.main_cpp).unwrap();
+        let stamp = format!("// bhf harness format {}", crate::HARNESS_FORMAT_VERSION);
+        assert!(main.contains(&stamp), "missing {stamp:?} in:\n{main}");
+        fs::remove_dir_all(&out).ok();
+    }
+
+    #[test]
     fn cpp_buffer_pairing_requires_name_evidence() {
         let reg = type_model::TypeRegistry::default();
         let decls = |params: &[(&str, &str)]| -> String {
@@ -4183,6 +4283,266 @@ mod tests {
                 && mutable.contains("len = (size_t)(data ? _bhf_cap_data : 0)"),
             "mutable data/len must use a coherent writable copy: {mutable}"
         );
+    }
+
+    fn cpp_param_decls(
+        registry: &type_model::TypeRegistry,
+        params: &[(&str, &str)],
+    ) -> Vec<String> {
+        let params: Vec<CppParameter> = params
+            .iter()
+            .map(|(name, cpp_type)| CppParameter {
+                name: (*name).to_owned(),
+                cpp_type: (*cpp_type).to_owned(),
+            })
+            .collect();
+        build_cpp_param_decoders(
+            &params,
+            registry,
+            &[],
+            &CppDecoderLimits::default(),
+            false,
+            false,
+        )
+        .expect("decoders")
+        .into_iter()
+        .map(|emission| emission.decl)
+        .collect()
+    }
+
+    fn typedef_registry(source: &str) -> type_model::TypeRegistry {
+        let defs = c_parser::parse_c_type_defs(source).expect("type defs");
+        type_model::TypeRegistry::from_defs(std::iter::once(&defs))
+    }
+
+    #[test]
+    fn cpp_buffer_pairing_resolves_typedefs_on_both_sides() {
+        let registry = typedef_registry(
+            "typedef unsigned char u8_t;\n\
+             typedef unsigned int u32_t;\n\
+             typedef u8_t octet_t;\n",
+        );
+        for (buffer, length, buf_decl, len_decl) in [
+            (
+                ("buf", "const u8_t *"),
+                ("len", "size_t"),
+                "const u8_t * buf = (const u8_t *)Data",
+                "size_t len = (size_t)Size",
+            ),
+            (
+                ("buf", "const u8_t *"),
+                ("len", "u32_t"),
+                "const u8_t * buf = (const u8_t *)Data",
+                "u32_t len = (u32_t)Size",
+            ),
+            // A typedef chain resolves too.
+            (
+                ("bytes", "const octet_t *"),
+                ("count", "size_t"),
+                "const octet_t * bytes = (const octet_t *)Data",
+                "size_t count = (size_t)Size",
+            ),
+            (
+                ("data", "const unsigned char *"),
+                ("dataLen", "UINT"),
+                "const unsigned char * data = (const unsigned char *)Data",
+                "UINT dataLen = (UINT)Size",
+            ),
+            (
+                ("pbData", "const BYTE *"),
+                ("cbData", "DWORD"),
+                "const BYTE * pbData = (const BYTE *)Data",
+                "DWORD cbData = (DWORD)Size",
+            ),
+        ] {
+            let decls = cpp_param_decls(&registry, &[buffer, length]);
+            assert_eq!(decls[0], buf_decl, "{buffer:?}/{length:?}: {decls:?}");
+            assert_eq!(decls[1], len_decl, "{buffer:?}/{length:?}: {decls:?}");
+        }
+
+        // A writable typedef'd buffer gets a coherent copy whose length tracks it.
+        let mutable = cpp_param_decls(&registry, &[("buf", "u8_t *"), ("len", "size_t")]);
+        assert!(
+            mutable[0].contains("u8_t * buf = (u8_t *)malloc(_bhf_cap_buf")
+                && mutable[1] == "size_t len = (size_t)(buf ? _bhf_cap_buf : 0)",
+            "{mutable:?}"
+        );
+    }
+
+    #[test]
+    fn cpp_buffer_name_alone_does_not_bind_the_next_integer_to_the_input_length() {
+        let registry = typedef_registry("typedef unsigned char u8_t;\n");
+        let decls = cpp_param_decls(
+            &registry,
+            &[
+                ("src", "const unsigned char *"),
+                ("offset", "unsigned int"),
+                ("size", "unsigned int"),
+            ],
+        );
+        let joined = decls.join(" ; ");
+        assert!(
+            !decls[0].contains("= (const unsigned char *)Data")
+                && decls[0].contains("malloc(")
+                && decls[0].contains("memcpy("),
+            "src must be its own heap copy of the input, so its true size is \
+             visible to ASan: {joined}"
+        );
+        assert!(
+            !decls[1].contains("Size"),
+            "offset must be decoded, not bound to Size: {joined}"
+        );
+        assert!(
+            decls[1].contains("bhf_i32(&Cur)") && !decls[1].contains("bhf_bounded_i32"),
+            "offset must be decoded across its full unsigned range: {joined}"
+        );
+
+        for (buffer, length) in [
+            (("data", "const char *"), ("flags", "int")),
+            (("buf", "const uint8_t *"), ("index", "size_t")),
+            (("buf", "const u8_t *"), ("start", "size_t")),
+            (
+                ("input", "const std::byte *"),
+                ("bit_index", "unsigned long"),
+            ),
+        ] {
+            let decls = cpp_param_decls(&registry, &[buffer, length]);
+            assert!(
+                !decls[1].contains("Size"),
+                "{length:?} must not be bound to Size after {buffer:?}: {decls:?}"
+            );
+        }
+
+        // Count-shaped names keep pairing.
+        let paired = cpp_param_decls(&registry, &[("src", "const char *"), ("srclen", "int")]);
+        assert_eq!(paired[0], "const char * src = (const char *)Data");
+        assert_eq!(paired[1], "int srclen = (int)Size");
+    }
+
+    #[test]
+    fn cpp_common_length_abbreviations_pair_with_their_buffer() {
+        let registry = typedef_registry("typedef unsigned char u8_t;\n");
+        for (buffer, length) in [
+            (("data", "const char *"), ("sz", "std::size_t")),
+            (("in", "const unsigned char *"), ("inl", "int")),
+            (("buf", "const void *"), ("bytes", "size_t")),
+            (("buf", "const char *"), ("bufsiz", "int")),
+            (("buf", "const u8_t *"), ("cnt", "unsigned int")),
+        ] {
+            let decls = cpp_param_decls(&registry, &[buffer, length]);
+            let (buf_name, buf_type) = buffer;
+            let (len_name, len_type) = length;
+            assert_eq!(
+                decls[0],
+                format!("{buf_type} {buf_name} = ({buf_type})Data"),
+                "{decls:?}"
+            );
+            assert_eq!(
+                decls[1],
+                format!("{len_type} {len_name} = ({len_type})Size"),
+                "{decls:?}"
+            );
+        }
+        for (buffer, length) in [
+            (("data", "const char *"), ("account_id", "int")),
+            (("buf", "const unsigned char *"), ("caps", "unsigned int")),
+        ] {
+            let decls = cpp_param_decls(&registry, &[buffer, length]);
+            assert!(
+                !decls[1].contains("Size"),
+                "{length:?} must not be bound to Size after {buffer:?}: {decls:?}"
+            );
+        }
+    }
+
+    /// An output buffer's capacity is a length too: an offset, index or flags
+    /// parameter bound to it pointed every write at (or past) the end of the
+    /// allocation, including for a typedef'd byte pointer (`u8_t *dst`).
+    #[test]
+    fn cpp_output_buffers_never_bind_an_offset_or_index_to_their_capacity() {
+        let registry = typedef_registry("typedef unsigned char u8_t;\n");
+        for params in [
+            vec![
+                ("dst", "u8_t *"),
+                ("offset", "unsigned int"),
+                ("n", "unsigned int"),
+            ],
+            vec![
+                ("dst", "unsigned char *"),
+                ("offset", "unsigned int"),
+                ("size", "unsigned int"),
+            ],
+            vec![("out", "char *"), ("index", "int")],
+            vec![("buf", "char *"), ("offset", "size_t *")],
+            vec![("out", "u8_t *"), ("flags", "int")],
+            vec![("dest", "BYTE *"), ("pos", "DWORD")],
+        ] {
+            let decls = cpp_param_decls(&registry, &params);
+            let buffer = params[0].0;
+            assert!(
+                !decls[1].contains(&format!("_bhf_cap_{buffer}")) && !decls[1].contains("Size"),
+                "{:?} must not be bound to the capacity of {buffer}: {decls:?}",
+                params[1]
+            );
+        }
+
+        // Count-named capacities keep pairing with their output buffer.
+        for (params, len_decl) in [
+            (
+                vec![("out", "char *"), ("outlen", "size_t")],
+                "size_t outlen = (size_t)(out ? _bhf_cap_out : 0)",
+            ),
+            (
+                vec![("dst", "u8_t *"), ("dstCapacity", "size_t")],
+                "size_t dstCapacity = (size_t)(dst ? _bhf_cap_dst : 0)",
+            ),
+        ] {
+            let decls = cpp_param_decls(&registry, &params);
+            assert_eq!(decls[1], len_decl, "{decls:?}");
+        }
+        let decls = cpp_param_decls(&registry, &[("out", "char *"), ("outLen", "size_t *")]);
+        assert!(
+            decls[1].contains("_bhf_out_outLen = (size_t)(out ? _bhf_cap_out : 0)"),
+            "{decls:?}"
+        );
+    }
+
+    /// A byte buffer spelled through a POINTER typedef (`LPCBYTE`, `PBYTE`,
+    /// `typedef const u8_t *cu8_ptr`) pairs with its length. The typedef hides
+    /// whether the bytes are const, so the buffer is a heap copy of the input and
+    /// the length is that copy's size: correct for a read-only and a writable
+    /// buffer alike.
+    #[test]
+    fn cpp_pointer_typedef_byte_buffers_pair_with_their_length() {
+        let registry = typedef_registry(
+            "typedef unsigned char u8_t;\n\
+             typedef const u8_t *cu8_ptr;\n\
+             typedef const BYTE *LPCBYTE;\n\
+             typedef BYTE *PBYTE;\n",
+        );
+        for (buffer, length) in [
+            (("pbData", "LPCBYTE"), ("cbData", "DWORD")),
+            (("buf", "cu8_ptr"), ("len", "size_t")),
+            (("pbOut", "PBYTE"), ("cbOut", "ULONG")),
+        ] {
+            let decls = cpp_param_decls(&registry, &[buffer, length]);
+            let (buf_name, buf_type) = buffer;
+            let (len_name, len_type) = length;
+            assert!(
+                decls[0].contains(&format!("{buf_type} {buf_name} = ({buf_type})malloc("))
+                    && decls[0].contains(&format!(
+                        "memcpy((void *){buf_name}, Data, _bhf_cap_{buf_name})"
+                    )),
+                "{buffer:?} must be a heap copy of the input: {decls:?}"
+            );
+            assert_eq!(
+                decls[1],
+                format!(
+                    "{len_type} {len_name} = ({len_type})({buf_name} ? _bhf_cap_{buf_name} : 0)"
+                ),
+                "the length must track the copy: {decls:?}"
+            );
+        }
     }
 
     #[test]
@@ -5199,6 +5559,195 @@ mod tests {
         assert!(
             err.contains("AddressSanitizer") || err.contains("ERROR") || err.contains("SUMMARY"),
             "expected an ASan/libFuzzer crash report, got:\n{err}"
+        );
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// A correct function over a typedef'd `(buffer, length)` pair must not crash
+    /// under the generated harness. Unpaired, the harness handed it an
+    /// independent fuzzed length larger than the buffer it copied, and ASan
+    /// reported a heap-buffer-overflow the harness itself caused.
+    #[test]
+    fn built_cpp_harness_keeps_a_typedef_buffer_and_its_length_coherent() {
+        let Some(cxx_flags) = clangxx_compile_flags("cpp-typedef-pair") else {
+            eprintln!("skipping typedef pair e2e: clang++ C++ headers unavailable");
+            return;
+        };
+        if !Command::new("make")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            eprintln!("skipping typedef pair e2e: make unavailable");
+            return;
+        }
+        let out = temp_dir("cpp-typedef-pair-e2e");
+        let header = "#include <stddef.h>\n\
+                      typedef unsigned char u8_t;\n\
+                      namespace demo {\n\
+                      int last_byte(const u8_t *buf, size_t len);\n\
+                      }\n";
+        fs::write(out.join("record.hpp"), header).unwrap();
+        let target_cpp = out.join("record.cpp");
+        fs::write(
+            &target_cpp,
+            "#include \"record.hpp\"\n\
+             namespace demo {\n\
+             int last_byte(const u8_t *buf, size_t len) { return len ? buf[len - 1] : 0; }\n\
+             }\n",
+        )
+        .unwrap();
+        let mut target = cppfunction("last_byte");
+        target.qualifier_path = vec!["demo".to_owned()];
+        let args = GenerateCppDirectArgs {
+            decoder_limits: Default::default(),
+            force: false,
+            harness_id: "H-CPP-TYPEDEF-PAIR".to_owned(),
+            output_dir: out.clone(),
+            source_path: out.join("record.hpp"),
+            target,
+            params: vec![
+                CppParameter {
+                    name: "buf".to_owned(),
+                    cpp_type: "const u8_t *".to_owned(),
+                },
+                CppParameter {
+                    name: "len".to_owned(),
+                    cpp_type: "size_t".to_owned(),
+                },
+            ],
+            return_type: "int".to_owned(),
+            target_includes: vec!["record.hpp".to_owned()],
+            target_includes_dirs: vec![out.clone()],
+            target_sources: vec![target_cpp],
+            compile_flags: cxx_flags,
+            c_runtime_include: runtime_dir(),
+            using_namespaces: Vec::new(),
+            result_cleanup: None,
+            constructor_params: Vec::new(),
+            type_defs: vec![c_parser::parse_c_type_defs(header).unwrap()],
+            default_constructible_classes: Vec::new(),
+            parameter_constructions: Vec::new(),
+            receiver_class_override: None,
+            factory_plan: None,
+        };
+        generate_cpp_direct_harness(args).unwrap();
+        let build = Command::new("make")
+            .arg("main")
+            .current_dir(&out)
+            .output()
+            .expect("run make");
+        assert!(
+            build.status.success(),
+            "make main failed:\n{}\n{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr)
+        );
+        // Read as a little-endian length these bytes are 4096: far past the end of
+        // a 12-byte buffer if the length were decoded on its own.
+        let input = out.join("input.bin");
+        fs::write(&input, [0x00, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+        let run = Command::new(out.join("main")).arg(&input).output().unwrap();
+        assert!(
+            run.status.success(),
+            "a correct function must not crash under its harness:\n{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// The same for a buffer spelled through a pointer typedef (`LPCBYTE`): it
+    /// used to get one byte of storage while its length was fuzzed up to
+    /// 0x7fffffff, so a correct checksum loop overflowed the harness's stack.
+    #[test]
+    fn built_cpp_harness_keeps_a_pointer_typedef_buffer_and_its_length_coherent() {
+        let Some(cxx_flags) = clangxx_compile_flags("cpp-ptr-typedef-pair") else {
+            eprintln!("skipping pointer typedef pair e2e: clang++ C++ headers unavailable");
+            return;
+        };
+        if !Command::new("make")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            eprintln!("skipping pointer typedef pair e2e: make unavailable");
+            return;
+        }
+        let out = temp_dir("cpp-ptr-typedef-pair-e2e");
+        let header = "typedef unsigned char BYTE;\n\
+                      typedef const BYTE *LPCBYTE;\n\
+                      typedef unsigned long DWORD;\n\
+                      namespace demo {\n\
+                      int checksum(LPCBYTE pbData, DWORD cbData);\n\
+                      }\n";
+        fs::write(out.join("sum.hpp"), header).unwrap();
+        let target_cpp = out.join("sum.cpp");
+        fs::write(
+            &target_cpp,
+            "#include \"sum.hpp\"\n\
+             namespace demo {\n\
+             int checksum(LPCBYTE pbData, DWORD cbData) {\n\
+             \x20 int s = 0;\n\
+             \x20 for (DWORD i = 0; i < cbData; i++) s += pbData[i];\n\
+             \x20 return s;\n\
+             }\n\
+             }\n",
+        )
+        .unwrap();
+        let mut target = cppfunction("checksum");
+        target.qualifier_path = vec!["demo".to_owned()];
+        let args = GenerateCppDirectArgs {
+            decoder_limits: Default::default(),
+            force: false,
+            harness_id: "H-CPP-PTR-TYPEDEF-PAIR".to_owned(),
+            output_dir: out.clone(),
+            source_path: out.join("sum.hpp"),
+            target,
+            params: vec![
+                CppParameter {
+                    name: "pbData".to_owned(),
+                    cpp_type: "LPCBYTE".to_owned(),
+                },
+                CppParameter {
+                    name: "cbData".to_owned(),
+                    cpp_type: "DWORD".to_owned(),
+                },
+            ],
+            return_type: "int".to_owned(),
+            target_includes: vec!["sum.hpp".to_owned()],
+            target_includes_dirs: vec![out.clone()],
+            target_sources: vec![target_cpp],
+            compile_flags: cxx_flags,
+            c_runtime_include: runtime_dir(),
+            using_namespaces: Vec::new(),
+            result_cleanup: None,
+            constructor_params: Vec::new(),
+            type_defs: vec![c_parser::parse_c_type_defs(header).unwrap()],
+            default_constructible_classes: Vec::new(),
+            parameter_constructions: Vec::new(),
+            receiver_class_override: None,
+            factory_plan: None,
+        };
+        generate_cpp_direct_harness(args).unwrap();
+        let build = Command::new("make")
+            .arg("main")
+            .current_dir(&out)
+            .output()
+            .expect("run make");
+        assert!(
+            build.status.success(),
+            "make main failed:\n{}\n{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr)
+        );
+        // Decoded on its own, the length read from these bytes is about 1 MiB.
+        let input = out.join("input.bin");
+        fs::write(&input, [b'A', 0, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+        let run = Command::new(out.join("main")).arg(&input).output().unwrap();
+        assert!(
+            run.status.success(),
+            "a correct function must not crash under its harness:\n{}",
+            String::from_utf8_lossy(&run.stderr)
         );
         fs::remove_dir_all(&out).ok();
     }
