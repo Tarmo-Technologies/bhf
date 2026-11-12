@@ -313,7 +313,10 @@ fn render_cpp_harness(
     let tera = templates::build_tera()?;
     let main_cpp = tera.render(
         "direct_harness_cpp",
-        &crate::c_generate::harness_source_context(context)?,
+        &crate::c_generate::harness_source_context(
+            context,
+            context.arg_layout.buffer_len_dimension,
+        )?,
     )?;
     let makefile = tera.render(
         "harness_makefile_cpp",
@@ -479,6 +482,9 @@ struct CppTemplateContext {
 
 #[derive(Debug, Serialize)]
 struct CppLifecycleStepEmission {
+    /// The explicit buffer-length dimension sized one of its buffers.
+    #[serde(skip)]
+    buffer_len_dimension: bool,
     name: String,
     params: Vec<CParamEmission>,
     /// Decode and argument-trace statements (see [`crate::arg_trace`]).
@@ -494,6 +500,9 @@ struct CppProtocolStepEmission {
     /// The step's decode layout (see [`crate::arg_layout`]).
     #[serde(skip)]
     layout: Vec<crate::arg_layout::LayoutStep>,
+    /// The explicit buffer-length dimension sized one of its buffers.
+    #[serde(skip)]
+    buffer_len_dimension: bool,
     name: String,
     params: Vec<CParamEmission>,
     /// Decode and argument-trace statements (see [`crate::arg_trace`]).
@@ -512,6 +521,9 @@ struct CppTemplateFactoryContext {
     /// The factory arguments' decode layout (see [`crate::arg_layout`]).
     #[serde(skip)]
     layout: Vec<crate::arg_layout::LayoutStep>,
+    /// The explicit buffer-length dimension sized one of its buffers.
+    #[serde(skip)]
+    buffer_len_dimension: bool,
     /// Qualified owner type for an instance-method factory (e.g.,
     /// `"tinyxml2::XMLDocument"`); empty string for a free-function factory.
     owner_type: String,
@@ -762,7 +774,7 @@ fn build_cpp_param_decoders(
     if out.len() > unit_start {
         units.push(unit_start..out.len());
     }
-    crate::arg_trace::slice_input_units(&mut out, &units);
+    crate::arg_trace::slice_input_units(&mut out, &units, crate::buffer_len_dimension_enabled());
     Ok(out)
 }
 
@@ -1346,6 +1358,7 @@ fn build_cpp_context_common(
         );
         Some(CppTemplateFactoryContext {
             layout: trace.layout,
+            buffer_len_dimension: trace.buffer_len_dimension,
             owner_type: plan.owner_type.clone().unwrap_or_default(),
             owner_method_is_static: plan.owner_method_is_static,
             method: plan.factory_method.clone(),
@@ -1683,6 +1696,15 @@ fn build_cpp_context_common(
                 steps,
             )
         }
+        .with_buffer_len_dimension(
+            params_trace.buffer_len_dimension
+                || constructor_trace.buffer_len_dimension
+                || factory
+                    .as_ref()
+                    .is_some_and(|factory| factory.buffer_len_dimension)
+                || protocol_steps.iter().any(|step| step.buffer_len_dimension)
+                || lifecycle_steps.iter().any(|step| step.buffer_len_dimension),
+        )
     };
 
     let cxx_compiler_family = build_context.compiler_family().make_value().to_owned();
@@ -1905,7 +1927,6 @@ fn cpp_trace_plan(
             registry: Some(registry),
             defer_input: order == CppDecodeOrder::FirstDeferringInput,
             fresh_cursor: order != CppDecodeOrder::AfterOthers,
-            sized_buffers: crate::buffer_len_dimension_enabled(),
         },
         emissions,
         &declared,
@@ -2070,6 +2091,7 @@ fn build_lifecycle_step_emissions(
                 registry,
             );
             Ok(CppLifecycleStepEmission {
+                buffer_len_dimension: trace.buffer_len_dimension,
                 name: step.name.clone(),
                 params,
                 decode: trace.decode,
@@ -2122,6 +2144,15 @@ fn build_cpp_protocol_emissions(
                 .collect::<Vec<_>>();
             let mut params =
                 build_cpp_param_decoders(&renamed, registry, &[], &limits, false, false)?;
+            // Arguments bound to the input themselves take it whole: the
+            // step's buffers share the bytes the cursor left, as recorded.
+            if observed
+                .args
+                .iter()
+                .any(|recipe| !matches!(recipe, CppProtocolArg::Decode))
+            {
+                crate::arg_trace::unslice_all(&mut params);
+            }
             for ((emission, parameter), recipe) in params
                 .iter_mut()
                 .zip(&observed.step.params)
@@ -2186,6 +2217,7 @@ fn build_cpp_protocol_emissions(
             );
             Ok(CppProtocolStepEmission {
                 layout: trace.layout,
+                buffer_len_dimension: trace.buffer_len_dimension,
                 name: observed.step.name.clone(),
                 params,
                 decode: trace.decode,
@@ -6198,8 +6230,9 @@ mod tests {
 
     /// In the C++ lane too, every buffer of a call with several gets bytes
     /// of its own: a sized slice for each but the last, whose length is its
-    /// buffer's size, and the bytes left for the last. The static layout
-    /// decodes the same values and spans as the trace.
+    /// buffer's size, and the bytes left for the last, after the scalars and
+    /// a method's receiver arguments. The static layout decodes the same
+    /// values and spans as the trace.
     #[test]
     fn built_cpp_harness_gives_each_buffer_of_a_call_its_own_bytes() {
         let out = temp_dir("cpp-merge-records");
@@ -6239,14 +6272,14 @@ mod tests {
             return;
         };
         assert_cpp_compiles_warning_free(&out);
-        // The slice for `a` (4-byte length 2, then 2 bytes), `x`, the
-        // receiver's `mode`, then `b` takes what is left.
+        // `x`, the receiver's `mode`, the slice for `a` (4-byte length 2,
+        // then 2 bytes), then `b` takes what is left.
         let input = [
-            2, 0, 0, 0, 0xa1, 0xa2, 5, 0, 0, 0, 9, 0, 0, 0, 0xb1, 0xb2, 0xb3,
+            5, 0, 0, 0, 9, 0, 0, 0, 2, 0, 0, 0, 0xa1, 0xa2, 0xb1, 0xb2, 0xb3,
         ];
         let args = cpp_traced_args(&out, &input);
         let a = cpp_traced(&args, "a", None);
-        assert_eq!(a["span"], serde_json::json!([4, 6]), "{args:#?}");
+        assert_eq!(a["span"], serde_json::json!([12, 14]), "{args:#?}");
         assert_eq!(a["preview_hex"], "a1a2");
         assert_eq!(cpp_traced(&args, "alen", None)["value"], "2");
         assert_eq!(cpp_traced(&args, "x", None)["value"], "5");
@@ -6278,6 +6311,90 @@ mod tests {
                 }
             }
         }
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// In the C++ lane too, a buffer without a length partner that takes a
+    /// slice keeps an allocation as large as the input, zeroed past its own
+    /// bytes, so a correct function reading it for the other buffer's length
+    /// runs clean when its slice is shorter, read-only or writable.
+    #[test]
+    fn built_cpp_harness_keeps_a_lone_buffer_as_large_as_the_input() {
+        let header = "#pragma once\n#include <cstddef>\n#include <cstdint>\n#include <cstring>\n\
+             inline int same_prefix(const uint8_t *a, const uint8_t *b, std::size_t n) {\n\
+             \x20   return std::memcmp(a, b, n) == 0;\n\
+             }\n\
+             inline int xor_into(uint8_t *dst, const uint8_t *src, std::size_t n) {\n\
+             \x20   for (std::size_t i = 0; i < n; i++) dst[i] ^= src[i];\n\
+             \x20   return n ? dst[0] : 0;\n\
+             }\n";
+        let out = temp_dir("cpp-lone-prefix");
+        let args = cpp_args_for(
+            &out,
+            "H-CPP-LONE",
+            cppfunction("same_prefix"),
+            &[
+                ("a", "const uint8_t *"),
+                ("b", "const uint8_t *"),
+                ("n", "size_t"),
+            ],
+            &[],
+            header,
+        );
+        let Some(out) = build_cpp_harness(args) else {
+            return;
+        };
+        let mut input = vec![0u8; 4];
+        input.extend_from_slice(&[b'A'; 16]);
+        let args = cpp_traced_args(&out, &input);
+        let a = cpp_traced(&args, "a", None);
+        assert_eq!(a["span"], serde_json::json!([4, 4]), "{args:#?}");
+        assert_eq!(a["len"], 0);
+        if let Some(alloc) = a.get("alloc_size") {
+            assert!(alloc.as_u64() > Some(input.len() as u64), "{a}");
+        }
+        assert_eq!(cpp_traced(&args, "n", None)["value"], "16");
+        let layout = crate::arg_layout::ArgLayout::read(&out).unwrap().unwrap();
+        for input in [&input[..], b"", &[2, 0, 0, 0, b'x', b'y', b'x', b'y', b'z']] {
+            let lines = cpp_traced_args(&out, input);
+            for stat in layout.decode(input) {
+                assert!(stat.decoded, "{stat:?}");
+                let trace = cpp_traced(&lines, &stat.name, None);
+                assert_eq!(
+                    serde_json::json!(stat.span),
+                    trace["span"],
+                    "{stat:?} vs {trace}"
+                );
+            }
+        }
+        fs::remove_dir_all(&out).ok();
+
+        let out = temp_dir("cpp-lone-writable");
+        let args = cpp_args_for(
+            &out,
+            "H-CPP-LONE-W",
+            cppfunction("xor_into"),
+            &[
+                ("dst", "uint8_t *"),
+                ("src", "const uint8_t *"),
+                ("n", "size_t"),
+            ],
+            &[],
+            header,
+        );
+        let Some(out) = build_cpp_harness(args) else {
+            return;
+        };
+        let mut input = vec![0u8; 4];
+        input.extend(std::iter::repeat_n(0x5a, 70_000));
+        let path = out.join("wide.bin");
+        fs::write(&path, &input).unwrap();
+        let run = Command::new(out.join("main")).arg(&path).output().unwrap();
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
         fs::remove_dir_all(&out).ok();
     }
 

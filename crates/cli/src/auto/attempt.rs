@@ -450,16 +450,33 @@ pub(crate) fn set_aside_legacy_corpus(
 
 /// A warning when the persisted corpus of `harness_id` was recorded against
 /// another harness input format than the harness in `harness_dir` decodes
-/// (`corpus/<id>/metadata.json`, written when that harness found something):
-/// its inputs decode into other argument values here. `None` when they
-/// agree or either is unrecorded.
+/// (`corpus/<id>/metadata.json`, written by every fuzz pass and finding): its
+/// inputs decode into other argument values here. A corpus with inputs but
+/// no metadata predates the stamp, so it holds format 2 or earlier inputs
+/// (a corpus an earlier release left, kept with `--reuse-legacy-corpus`).
+/// `None` when the formats agree, or the harness or an empty corpus records
+/// none.
 pub(crate) fn corpus_format_note(
     work_dir: &std::path::Path,
     harness_id: &str,
     harness_dir: &std::path::Path,
 ) -> Option<String> {
-    let corpus = corpus::finding::recorded_corpus_format(work_dir, harness_id)?;
     let harness = crate::generate_harness::recorded_harness_format(harness_dir)?;
+    let Some(corpus) = corpus::finding::recorded_corpus_format(work_dir, harness_id) else {
+        let queue = work_dir.join("corpus").join(harness_id).join("queue");
+        let holds_inputs =
+            std::fs::read_dir(&queue).is_ok_and(|mut entries| entries.any(|entry| entry.is_ok()));
+        if !holds_inputs || harness.version < 3 {
+            return None;
+        }
+        return Some(format!(
+            "the corpus of {harness_id} was recorded before harness formats were stamped \
+             (format 2 or earlier), and this harness decodes format {}: its inputs decode \
+             into other argument values here. They are still used as seeds; findings re-found \
+             now record the new format",
+            harness.version
+        ));
+    };
     if corpus.version == harness.version
         && corpus.buffer_len_dimension == harness.buffer_len_dimension
     {
@@ -3273,6 +3290,31 @@ fn run_attempt(
                 // examples rather than only empty/`A` bytes.
                 let mut seeds = vec![b"".to_vec(), b"A".to_vec(), b"AAAAAAAA".to_vec()];
                 seeds.extend(options.user_seeds.iter().cloned());
+                // A mined or user seed is a sample of the input format. Where
+                // the harness decodes fixed-width parameters before its buffer,
+                // it is also given behind that many zero bytes, so the buffer
+                // starts with it (the seed itself stays as it is).
+                if let Some(prefix) = crate::fuzz::layout_seed_prefix(
+                    &harness_dir.join("main"),
+                    work_dir,
+                    &candidate.harness_id,
+                ) {
+                    let variants = crate::fuzz::layout_prefixed_seeds(&options.user_seeds, prefix);
+                    if !variants.is_empty() {
+                        if let Err(error) = crate::auto::seed_manifest::record_layout_variant(
+                            work_dir,
+                            &candidate.harness_id,
+                            prefix,
+                            &variants,
+                        ) {
+                            bhfeprintln!(
+                                "bhf auto: warning: could not list {}'s prefixed seeds: {error}",
+                                candidate.harness_id
+                            );
+                        }
+                        seeds.extend(variants);
+                    }
+                }
                 seeds.extend(
                     crate::auto::go_build::load_structured_seed_inputs(&harness_dir)
                         .map_err(anyhow::Error::msg)?,
@@ -10717,6 +10759,39 @@ mod corpus_format_tests {
         let note = corpus_format_note(work.path(), "H-C0001", &harness).expect("noted");
         assert!(note.contains("input format 2"), "{note}");
         assert!(note.contains("decodes format 3"), "{note}");
+    }
+
+    /// A corpus with inputs but no metadata was recorded before harness
+    /// formats were stamped: format 2 or earlier, noted against a format 3
+    /// or later harness. An empty one is not noted.
+    #[test]
+    fn an_unstamped_corpus_is_noted_as_an_older_format() {
+        let work = tempfile::tempdir().unwrap();
+        let harness = work.path().join("harnesses/H-C0002");
+        std::fs::create_dir_all(&harness).unwrap();
+        let metadata = |version: u32| {
+            std::fs::write(
+                harness.join("generation-metadata.json"),
+                format!(
+                    r#"{{"schema_version":1,"harness_format_version":{version},"language":"c"}}"#
+                ),
+            )
+            .unwrap();
+        };
+        metadata(4);
+        let queue = work.path().join("corpus/H-C0002/queue");
+        std::fs::create_dir_all(&queue).unwrap();
+        assert_eq!(corpus_format_note(work.path(), "H-C0002", &harness), None);
+        std::fs::write(queue.join("input.bin"), b"AAAA").unwrap();
+        let note = corpus_format_note(work.path(), "H-C0002", &harness).expect("noted");
+        assert!(
+            note.contains("recorded before harness formats were stamped (format 2 or earlier)")
+                && note.contains("decodes format 4"),
+            "{note}"
+        );
+        // A harness that decodes format 2 reads such a corpus as it was.
+        metadata(2);
+        assert_eq!(corpus_format_note(work.path(), "H-C0002", &harness), None);
     }
 }
 

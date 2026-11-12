@@ -944,8 +944,13 @@ specific target when names collide across files.
 `bhf_work/build/<harness-id>/`. It accepts literal `--seed-input` values
 (their UTF-8 bytes), `--seed-file` bytes (used byte for byte, so binary seeds
 belong there), or prototype `--symbolic-seed-source` Ada files whose
-guarded string literals are mined into seed bytes. It writes corpus entries under
-`bhf_work/corpus/`, emits findings under `bhf_work/findings/`, and stores
+guarded string literals are mined into seed bytes. A C/C++ harness that
+decodes fixed-width parameters before its buffer also gets each
+`--seed-input`/`--seed-file` seed behind that many zero bytes (from its
+`arg-layout.json`), so the buffer starts with it; with `--workers`, the
+campaign makes these once and its workers add none. It writes corpus entries under
+`bhf_work/corpus/` (with the harness input format in
+`corpus/<harness-id>/metadata.json`), emits findings under `bhf_work/findings/`, and stores
 the latest run metadata in `bhf_work/fuzz_runs/<harness-id>-latest.json`.
 Fuzz run summaries and finding records include `sandbox` metadata so reports
 distinguish sandboxed and unsandboxed executions.

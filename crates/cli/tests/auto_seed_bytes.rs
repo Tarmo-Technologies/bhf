@@ -351,3 +351,64 @@ fn afl_stage_receives_seed_bytes_unchanged_past_4096() {
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// A target that decodes two 4-byte scalars before its buffer takes bytes
+/// 0-7 into the scalars, so a mined seed given as is never starts the
+/// buffer. Each seed is also given behind 8 zero bytes: the buffer then
+/// starts with the seed's magic and the planted overflow behind it is found
+/// within a short run. `auto/seeds.json` lists the prefixed seed.
+#[test]
+fn a_mined_seed_also_reaches_a_buffer_decoded_after_scalars() {
+    if !have_clang() {
+        eprintln!("skip: clang/make unavailable");
+        return;
+    }
+    let tmp = scratch("layout-prefix");
+    let src = tmp.join("src");
+    std::fs::create_dir_all(src.join("tests/data")).unwrap();
+    std::fs::write(
+        src.join("header.c"),
+        "#include <stdint.h>\n\
+         int scan_header(const uint8_t *buf, uint32_t a, uint32_t b) {\n\
+         \x20   if (buf[0] == 'M' && buf[1] == 'A' && buf[2] == 'G' && buf[3] == 'C') {\n\
+         \x20       volatile const uint8_t *p = buf;\n\
+         \x20       return p[4096];\n\
+         \x20   }\n\
+         \x20   return (int)(a + b);\n\
+         }\n",
+    )
+    .unwrap();
+    let seed = b"MAGC".to_vec();
+    std::fs::write(src.join("tests/data/header.bin"), &seed).unwrap();
+    let work = tmp.join("work");
+
+    let out = run_auto(&src, &work, "3", &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    let manifest = seed_manifest(&work);
+    assert_eq!(listed_names(&manifest), ["header.bin"], "{manifest}");
+    let variants = manifest["layout_variants"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no layout_variants in {manifest}"));
+    assert_eq!(variants.len(), 1, "{manifest}");
+    assert_eq!(variants[0]["layout_prefix"], 8, "{manifest}");
+    let mut prefixed = vec![0u8; 8];
+    prefixed.extend_from_slice(&seed);
+    assert_eq!(
+        variants[0]["sha256"],
+        serde_json::json!([sha256_hex(&prefixed)]),
+        "{manifest}"
+    );
+    let found = std::fs::read_dir(work.join("results/findings"))
+        .map(|entries| {
+            entries.flatten().any(|entry| {
+                std::fs::read_to_string(entry.path().join("finding.json")).is_ok_and(|text| {
+                    text.contains("heap-buffer-overflow") || text.contains("HEAP_BUFFER_OVERFLOW")
+                })
+            })
+        })
+        .unwrap_or(false);
+    assert!(found, "the magic behind the scalars is found:\n{stderr}");
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}

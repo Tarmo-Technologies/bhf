@@ -760,9 +760,24 @@ impl FindingEmitter {
 
     /// Record the harness's input format in its corpus's metadata
     /// (`corpus/<harness_id>/metadata.json`), so inputs kept from a harness
-    /// of another format are recognised. Best-effort: a corpus dir that cannot
-    /// be written never fails the finding.
-    fn record_corpus_format(&self) {
+    /// of another format are recognised. Written with each finding and at
+    /// the end of each fuzz pass, whether or not it found anything.
+    /// Best-effort: a corpus dir that cannot be written never fails the
+    /// finding or the pass.
+    pub fn record_corpus_format(&self) {
+        self.write_corpus_format(true);
+    }
+
+    /// [`Self::record_corpus_format`] for a corpus this pass is about to
+    /// create: written only when `corpus/<harness_id>/` does not exist yet,
+    /// so the corpus carries its format from its first input on, while an
+    /// existing corpus keeps the format it was recorded with until the pass
+    /// has added to it.
+    pub fn start_corpus_format(&self) {
+        self.write_corpus_format(false);
+    }
+
+    fn write_corpus_format(&self, existing: bool) {
         let Some(version) = self.metadata.harness_format_version else {
             return;
         };
@@ -775,6 +790,9 @@ impl FindingEmitter {
             return;
         }
         let dir = self.root.join("corpus").join(harness_id);
+        if !existing && dir.exists() {
+            return;
+        }
         let metadata = json!({
             "schema_version": CORPUS_METADATA_SCHEMA,
             "harness_id": harness_id,
@@ -1283,6 +1301,51 @@ mod tests {
             .join(CORPUS_METADATA_FILE)
             .exists());
         assert_eq!(recorded_corpus_format(&root, "H-C0002"), None);
+    }
+
+    /// A fuzz pass stamps a corpus it creates when it starts, leaves an
+    /// existing corpus's stamp alone until it ends, and then stamps it with
+    /// its own format.
+    #[test]
+    fn a_pass_stamps_a_new_corpus_at_its_start_and_every_corpus_at_its_end() {
+        let root = temp_dir("corpus-pass-format");
+        let emitter = |version: u32| {
+            FindingEmitter::with_metadata(
+                root.clone(),
+                "H-C0003".to_owned(),
+                "c".to_owned(),
+                String::new(),
+            )
+            .with_harness_format_version(Some(version))
+        };
+        emitter(4).start_corpus_format();
+        assert_eq!(
+            recorded_corpus_format(&root, "H-C0003").map(|format| format.version),
+            Some(4)
+        );
+        emitter(5).start_corpus_format();
+        assert_eq!(
+            recorded_corpus_format(&root, "H-C0003").map(|format| format.version),
+            Some(4),
+            "an existing corpus keeps its stamp when a pass starts"
+        );
+        emitter(5).record_corpus_format();
+        assert_eq!(
+            recorded_corpus_format(&root, "H-C0003").map(|format| format.version),
+            Some(5)
+        );
+        // A corpus from before the stamp keeps having none until a pass ends.
+        let queue = root.join("corpus/H-C0004/queue");
+        fs::create_dir_all(&queue).unwrap();
+        let unstamped = FindingEmitter::with_metadata(
+            root.clone(),
+            "H-C0004".to_owned(),
+            "c".to_owned(),
+            String::new(),
+        )
+        .with_harness_format_version(Some(4));
+        unstamped.start_corpus_format();
+        assert_eq!(recorded_corpus_format(&root, "H-C0004"), None);
     }
 
     #[test]

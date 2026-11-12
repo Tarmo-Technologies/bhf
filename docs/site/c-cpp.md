@@ -405,19 +405,29 @@ with no cursor parameter, that is the whole testcase:
 So for `f(const uint8_t *data, uint32_t a, uint32_t b)`, `a` is bytes 0-3, `b`
 bytes 4-7 and `data` the bytes from 8 on, and for
 `g(const char *buf, size_t len, int flags)`, `flags` is bytes 0-3 and the pair
-the rest. No input byte feeds two parameters of one call.
+the rest. No input byte feeds two parameters of one call. A seed (a sample
+file of the buffer's format) is therefore also given behind as many zero
+bytes as the fixed-width parameters before the buffer take, 8 for `f`, so the
+buffer starts with it (see [Seeds](auto.md#seeds)).
 
 A call that takes several such buffers (two lone buffers, two pairs, a pair
-and a `FILE *`) gives each its own bytes. Every one but the last, in
-parameter order, is decoded with the cursor parameters, where it stands in
-the signature: 4 bytes of little-endian length L, then the next
-`min(L, bytes left)` bytes, in a heap copy of exactly that size (one byte when
-empty), freed after the call. A buffer paired with a length gets that size as
-its length. The last takes the remaining input as above. So for
-`h(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen, int x)`,
-bytes 0-3 are `alen`, the next `alen` bytes are `a`, the 4 after them `x`, and
-the rest `b`, with `blen` its size. A parameter that only takes the input's
-size (an output buffer's capacity) reads no bytes and follows the last buffer.
+and a `FILE *`) gives each its own bytes. After the cursor parameters, every
+one but the last, in parameter order, takes 4 bytes of little-endian length
+L, then the next `min(L, bytes left)` bytes, in a heap copy of its own, freed
+after the call. A buffer paired with a length gets exactly those bytes (one
+byte when empty), and their count as its length. So does a `FILE *` or a file
+path, whose end the callee sees. A buffer with no length partner keeps the
+allocation it would get alone, as large as the whole input: those bytes,
+then zeros. A function that reads it for as many bytes as another argument
+says (`memcmp(a, b, n)`) stays inside it. The last buffer takes the
+remaining input as above. So for `h(const uint8_t *a, size_t alen, const
+uint8_t *b, size_t blen, int x)`, bytes 0-3 are `x`, bytes 4-7 the length of
+`a`, the next that many bytes `a` (and `alen` their count), and the rest `b`,
+with `blen` its size. A parameter that only takes the input's size (an
+output buffer's capacity) reads no bytes and follows the last buffer. A
+`void *` ahead of a `(data, len)` pair (a context pointer) is such a lone
+buffer, so `data` starts after the 4-byte length of its slice. A seed is
+therefore also given behind 4 zero bytes, which leave the context empty.
 
 A parameter named like one of the harness's own locals (`Data`, `Size`,
 `Cur`, `R`, or a name starting `_bhf_` or `bhf_`) is declared in `main.c` /
@@ -427,14 +437,19 @@ layout and `bhf decode-args` show its declared name.
 The remaining input has no length of its own: a buffer without a length
 parameter is as long as the input lets it be. Set
 `BHF_BUFFER_LEN_DIMENSION=1` when generating the harness (`bhf generate-harness`
-or `bhf auto`) to give it one: after the cursor parameters the call reads 4
-more bytes, a little-endian length clamped to the bytes left, and its
-whole-input parameters take exactly that many bytes. It applies only to a call
-with a buffer that has no length partner, and it is off by default: a buffer
-shorter than the input can make a function with an implicit length contract
-read past it, a crash the harness made. The harness records the choice
-(`buffer_len_dimension` in `generation-metadata.json`, and `with an explicit
-buffer length` after the format stamp in the source).
+or `bhf auto`) to give it one. A buffer with no length partner then gets
+exactly its bytes in a heap copy of that size (a `const void *` view
+included, so the sanitizer sees the shorter buffer): one before the call's
+last buffer gets its slice, above, without the input-sized allocation, and
+the call's last buffer takes a sized slice too, after the cursor parameters
+and the other buffers (4 more bytes, a little-endian length clamped to the
+bytes left, then that many bytes). It is off by default: a buffer shorter
+than the input can make a function with an implicit length contract read
+past it, a crash the harness made. The harness records it only where it
+gave a buffer a length (`buffer_len_dimension` in `arg-layout.json` and
+`generation-metadata.json`, and `with an explicit buffer length` after the
+format stamp in the source); a harness whose buffers all have a length
+partner decodes the same with it on and records nothing.
 
 A C++ method's receiver is decoded after the target's own cursor parameters. A
 default-constructible class takes no input bytes; otherwise its constructor or
@@ -525,7 +540,7 @@ where a call's whole-input parameters take the bytes the cursor left (`sized`
 with the explicit buffer-length dimension), and an `opaque` step a lifecycle
 loop, whose input use is known only at run time. In a call with several
 buffers, each buffer but the last follows a `sized` `remainder` step of its
-own, among the cursor steps: its 4-byte length, then its bytes.
+own, after the cursor steps: its 4-byte length, then its bytes.
 
 `bhf decode-args` maps a testcase to the value of each parameter:
 
@@ -637,8 +652,13 @@ with another format. Each new finding records the format of the harness that
 found it, as `harness.format_version` (and `harness.buffer_len_dimension`) in
 `finding.json`, with the older top-level `harness_format_version` kept for
 earlier readers, and writes the same to the harness's corpus metadata
-(`corpus/<id>/metadata.json`, `bhf.corpus-metadata.v1`); `bhf auto` notes when
-a corpus was recorded against another format than the harness it fuzzes.
+(`corpus/<id>/metadata.json`, `bhf.corpus-metadata.v1`). Every fuzz pass
+writes it too, whether or not it found anything: a corpus the pass creates
+gets it before its first input, and every corpus at the end of the pass.
+`bhf auto` notes when a corpus was recorded against another format than the
+harness it fuzzes, and when a corpus holds inputs but no metadata (one an
+earlier release left, kept with `--reuse-legacy-corpus`): it was recorded
+before formats were stamped, so its inputs are format 2 or earlier.
 `bhf replay`, `bhf minimize`, `bhf decode-args` and `bhf capsule` read the
 finding's format from `harness` first, then the top-level key, then the
 harness dir's metadata. They compare it with the harness they run, and when

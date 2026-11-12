@@ -721,6 +721,21 @@ under `seeds`, and `-v` prints the list. A run that stops before it resolves
 seeds (one that finds no fuzzable target, for example) removes a list an
 earlier run left in the work dir, and its `run.json` has no `seeds` block.
 
+A seed is a sample of the target's input format, but a C/C++ harness decodes
+its fixed-width scalar parameters from the first input bytes and gives its
+buffer the bytes after them (see [C and C++](c-cpp.md#decoding-layout)), so a
+seed given as is starts in the scalars. When a target's `arg-layout.json`
+gives K such bytes before the buffer (every parameter before it of a fixed
+width, and 4 for the length of each other buffer's slice before it, which a
+zero leaves empty), each seed is also given behind K zero bytes, so the
+buffer starts with the seed; the seed itself is still given as is.
+`auto/seeds.json` lists these under `layout_variants`, one entry per target
+with its `harness_id`, `layout_prefix` (K) and the `sha256` of each prefixed
+seed. `bhf fuzz` does the same for its `--seed-file` and `--seed-input`
+seeds, once per campaign however many workers it runs; the seeds it is
+handed otherwise (its built-in seeds, a shared queue's inputs) are not
+prefixed.
+
 A work directory written by an earlier release can hold corpus entries in
 which every byte that was not valid UTF-8 was replaced by `EF BF BD`. In a work
 dir from an earlier release (one migrated from the 0.2.x layout, or one with

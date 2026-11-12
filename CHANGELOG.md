@@ -5,6 +5,22 @@
 ## Unreleased
 
 ### Fixed
+- The explicit buffer-length dimension (`BHF_BUFFER_LEN_DIMENSION=1`) is
+  recorded only for a harness it gave a buffer a length: the source stamp,
+  `arg-layout.json` and `generation-metadata.json` `buffer_len_dimension`,
+  and so the finding and corpus format, no longer claim it for a harness
+  whose buffers all have a length partner, which decodes the same with it
+  on. Under the dimension a call's length-less buffers, its last one and a
+  `const void *` view included, take a heap copy of exactly their bytes, so
+  the sanitizer sees the shorter buffer; without it they stay as large as
+  the input.
+- Every fuzz pass records its harness's input format in the corpus metadata
+  (`corpus/<id>/metadata.json`), whether or not it found anything: a corpus
+  the pass creates gets it before its first input, and every corpus at the
+  end of the pass. `bhf auto` notes a corpus that holds inputs but no
+  metadata (an earlier release's, kept with `--reuse-legacy-corpus`) as
+  recorded before formats were stamped, format 2 or earlier, instead of
+  saying nothing.
 - `bhf decode-args --static` decodes a C++ reference to a scalar
   (`unsigned short &offset`, `const unsigned int &mask`) as the scalar it
   refers to, as the harness does, instead of listing it under "not decoded
@@ -35,12 +51,15 @@
   and `decode-args` keep the declared name.
 - Every buffer of a call that takes several gets bytes of its own: each but
   the last takes a sized slice of the input (a 4-byte length, then that many
-  bytes, in a heap copy of exactly that size), and the last the bytes the
-  cursor left. Only the first `(buffer, length)` pair of a call used to be
-  bound: a second pair's length was decoded on its own and could exceed its
-  buffer, and two buffers got the same bytes. `arg-layout.json` gives each
-  slice a sized `remainder` step, so `bhf decode-args --static` decodes these
-  calls exactly.
+  bytes, in a heap copy of its own), and the last the bytes the cursor left.
+  A buffer with a length (or a `FILE *`) gets exactly the slice's bytes; one
+  without keeps an allocation as large as the input, the slice's bytes then
+  zeros, so a function reading it for another argument's length
+  (`memcmp(a, b, n)`) stays inside it. Only the first `(buffer, length)` pair
+  of a call used to be bound: a second pair's length was decoded on its own
+  and could exceed its buffer, and two buffers got the same bytes.
+  `arg-layout.json` gives each slice a sized `remainder` step, so
+  `bhf decode-args --static` decodes these calls exactly.
 - A C or C++ capsule's `build.sh` picks the sanitizer flags of the compiler that
   runs it (gcc has no `function` UBSan check and links its runtimes
   statically), as the harness Makefile does, and a capsule of a harness bhf
@@ -698,6 +717,17 @@
   both forms.
 
 ### Added
+- A seed reaches the buffer of a C/C++ harness that decodes fixed-width
+  scalars before it: `bhf auto` (for its mined and `--seed-file`/`--seed-dir`
+  seeds, in the builtin and AFL++ stages) and `bhf fuzz` (for
+  `--seed-file`/`--seed-input`) also give each seed behind as many zero bytes
+  as those scalars take, from the harness's `arg-layout.json`, plus 4 for the
+  length of each other buffer's slice ahead of it (a context pointer before a
+  `(data, len)` pair), which a zero leaves empty. The seed itself is still
+  given byte for byte. A multi-worker `bhf fuzz` makes the prefixed seeds
+  once, and its workers prefix none of the seeds they are handed.
+  `auto/seeds.json` lists the prefixed seeds under an additive
+  `layout_variants` (`harness_id`, `layout_prefix`, `sha256`).
 - `bhf capsule`, `bhf verify-poc` and `bhf env-capsule` support every harness
   language bhf generates, through per-language lanes: Ada, Rust, Go, Java, C#,
   Python, JavaScript, TypeScript, Ruby, Perl, PHP, Lua, COBOL and Fortran, as

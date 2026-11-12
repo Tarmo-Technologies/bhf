@@ -75,6 +75,23 @@ pub(crate) struct SeedManifest {
     pub(crate) schema_version: u32,
     pub(crate) mining: SeedMining,
     pub(crate) seeds: Vec<SeedEntry>,
+    /// The seeds given again, prefixed, to a target whose harness decodes
+    /// fixed-width parameters before its buffer (see [`LayoutVariant`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) layout_variants: Vec<LayoutVariant>,
+}
+
+/// One target's prefixed seeds. Its harness decodes `layout_prefix` input
+/// bytes into fixed-width parameters before the buffer that takes the bytes
+/// left, so a seed given as is starts in those parameters; it is given
+/// again behind `layout_prefix` zero bytes, so the buffer starts with it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LayoutVariant {
+    pub(crate) harness_id: String,
+    pub(crate) layout_prefix: usize,
+    /// sha256 of each prefixed seed the engine received, which also names
+    /// its `corpus/<harness-id>/queue/<sha256>.bin`.
+    pub(crate) sha256: Vec<String>,
 }
 
 /// The `seeds` block of `run.json`: enough to say where the run's seeds came
@@ -104,6 +121,7 @@ impl SeedManifest {
                     bytes_used: seed.bytes.len(),
                 })
                 .collect(),
+            layout_variants: Vec::new(),
         }
     }
 
@@ -135,6 +153,37 @@ pub(crate) fn write(work_dir: &Path, manifest: &SeedManifest) -> std::io::Result
     let json = serde_json::to_vec_pretty(manifest).map_err(std::io::Error::other)?;
     std::fs::write(&path, json)?;
     Ok(path)
+}
+
+/// Add (or replace) `harness_id`'s prefixed seeds in this run's manifest.
+/// Targets are attempted concurrently, so the read-modify-write is
+/// serialized. Best-effort: a run without a manifest records nothing.
+pub(crate) fn record_layout_variant(
+    work_dir: &Path,
+    harness_id: &str,
+    layout_prefix: usize,
+    seeds: &[Vec<u8>],
+) -> std::io::Result<()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let path = manifest_path(work_dir);
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Ok(());
+    };
+    let mut manifest: SeedManifest =
+        serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+    manifest
+        .layout_variants
+        .retain(|variant| variant.harness_id != harness_id);
+    manifest.layout_variants.push(LayoutVariant {
+        harness_id: harness_id.to_owned(),
+        layout_prefix,
+        sha256: seeds
+            .iter()
+            .map(|seed| format!("{:x}", Sha256::digest(seed)))
+            .collect(),
+    });
+    write(work_dir, &manifest).map(|_| ())
 }
 
 /// Remove a manifest an earlier run left in this work dir. Called before this
@@ -192,6 +241,41 @@ mod tests {
         assert_eq!(summary.source, "mined");
         assert_eq!(summary.count, 1);
         assert_eq!(summary.mining, SeedMining::Ran);
+    }
+
+    /// A target's prefixed seeds are listed with the prefix its layout asks
+    /// for, once per target, keeping the seeds as they were.
+    #[test]
+    fn a_targets_prefixed_seeds_are_listed_with_their_prefix() {
+        let work = tempfile::tempdir().unwrap();
+        let seeds = vec![LoadedSeed {
+            path: PathBuf::from("/tree/tests/data/magic.bin"),
+            bytes: b"MAGC".to_vec(),
+            file_size: 4,
+        }];
+        write(
+            work.path(),
+            &SeedManifest::new(SeedMining::Ran, &seeds, SeedSource::Mined),
+        )
+        .unwrap();
+        let variant = b"\0\0\0\0\0\0\0\0MAGC".to_vec();
+        record_layout_variant(work.path(), "H-C0001", 8, std::slice::from_ref(&variant)).unwrap();
+        record_layout_variant(work.path(), "H-C0001", 8, std::slice::from_ref(&variant)).unwrap();
+        record_layout_variant(work.path(), "H-C0002", 4, &[b"\0\0\0\0MAGC".to_vec()]).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(manifest_path(work.path())).unwrap()).unwrap();
+        assert_eq!(json["seeds"].as_array().unwrap().len(), 1);
+        let variants = json["layout_variants"].as_array().unwrap();
+        assert_eq!(variants.len(), 2, "{json}");
+        assert_eq!(variants[0]["harness_id"], "H-C0001");
+        assert_eq!(variants[0]["layout_prefix"], 8);
+        assert_eq!(
+            variants[0]["sha256"],
+            serde_json::json!([format!("{:x}", Sha256::digest(&variant))])
+        );
+        assert_eq!(variants[1]["layout_prefix"], 4);
+        // Read back, the summary is unchanged.
+        assert_eq!(summary(work.path()).unwrap().count, 1);
     }
 
     #[test]

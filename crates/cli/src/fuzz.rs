@@ -338,7 +338,10 @@ pub struct FuzzArgs {
     #[arg(long = "seed-input")]
     pub seed_inputs: Vec<String>,
 
-    /// File containing seed input bytes, used byte for byte.
+    /// File containing seed input bytes, used byte for byte. For a C/C++
+    /// harness that decodes fixed-width parameters before its buffer, the
+    /// seed is also given behind that many zero bytes, so the buffer starts
+    /// with it.
     #[arg(long = "seed-file")]
     pub seed_files: Vec<PathBuf>,
 
@@ -347,6 +350,12 @@ pub struct FuzzArgs {
     /// valid UTF-8 reaches the engine unchanged. Not a CLI flag.
     #[arg(skip)]
     pub seed_bytes: Vec<Vec<u8>>,
+
+    /// The seeds already hold their layout-prefixed variants: a worker of a
+    /// multi-worker campaign, whose campaign made them once for the seeds
+    /// given to it. Internal.
+    #[arg(long = "seeds-layout-prefixed", hide = true)]
+    pub seeds_layout_prefixed: bool,
 
     /// Path to an explicitly-trusted extension manifest (`bhf.extension-manifest.v1`,
     /// TOML). When set, after the campaign the retained corpus is driven through
@@ -1531,6 +1540,7 @@ pub(crate) fn run_one_target_programmatic_with_runner(
         seed_inputs: Vec::new(),
         seed_files: Vec::new(),
         seed_bytes: seeds,
+        seeds_layout_prefixed: false,
         sanitizers: sanitizers
             .iter()
             .map(|s| sanitizer_name(*s).to_owned())
@@ -1714,6 +1724,7 @@ fn afl_programmatic_args(
         seed_inputs: Vec::new(),
         seed_files: Vec::new(),
         seed_bytes: seeds,
+        seeds_layout_prefixed: false,
         sanitizers: sanitizers
             .iter()
             .map(|s| sanitizer_name(*s).to_owned())
@@ -1764,7 +1775,7 @@ fn run_multicore_campaign(mut args: FuzzArgs) -> i32 {
     };
     let (harness_dirs, harness_executable) =
         worker_harness_layout(&args.work_dir, &args.harness, &harness_path);
-    if let Err(error) = materialize_seed_bytes(&mut args) {
+    if let Err(error) = worker_seed_files(&mut args, &harness_path) {
         bhfeprintln!("{error}");
         return 1;
     }
@@ -2046,6 +2057,53 @@ fn merge_worker_findings(work_dir: &Path, summary: &multicore_fuzz::MulticoreSum
     }
 }
 
+/// The number of zero bytes to put in front of a seed of `harness_id`'s
+/// input format ([`harness_gen::arg_layout::ArgLayout::seed_prefix_len`],
+/// from the `arg-layout.json` beside the harness or in its harness dir):
+/// `None` when its layout has no such prefix or it has no layout.
+pub(crate) fn layout_seed_prefix(
+    harness: &Path,
+    work_dir: &Path,
+    harness_id: &str,
+) -> Option<usize> {
+    harness
+        .parent()
+        .map(Path::to_path_buf)
+        .into_iter()
+        .chain(crate::auto::layout::harness_dir_candidates(
+            work_dir, harness_id,
+        ))
+        .find_map(|dir| harness_gen::arg_layout::ArgLayout::read(&dir).and_then(Result::ok))
+        .and_then(|layout| layout.seed_prefix_len())
+}
+
+/// Each of `seeds` again behind `prefix` zero bytes, for a harness that
+/// decodes that many bytes into fixed-width parameters before its buffer.
+/// The seeds themselves stay as they are. A variant already among the seeds
+/// is not repeated, and a seed that is itself the variant of another (a
+/// worker handed both) gets none, so applying this twice adds nothing.
+pub(crate) fn layout_prefixed_seeds(seeds: &[Vec<u8>], prefix: usize) -> Vec<Vec<u8>> {
+    if prefix == 0 {
+        return Vec::new();
+    }
+    let present: std::collections::HashSet<&[u8]> = seeds.iter().map(Vec::as_slice).collect();
+    let mut variants: Vec<Vec<u8>> = Vec::new();
+    for seed in seeds {
+        let is_variant = seed.len() >= prefix
+            && seed[..prefix].iter().all(|&byte| byte == 0)
+            && present.contains(&seed[prefix..]);
+        if is_variant {
+            continue;
+        }
+        let mut variant = vec![0u8; prefix];
+        variant.extend_from_slice(seed);
+        if !present.contains(variant.as_slice()) && !variants.contains(&variant) {
+            variants.push(variant);
+        }
+    }
+    variants
+}
+
 /// Workers receive their seeds through argv, which cannot carry arbitrary bytes
 /// (a NUL ends an argument; a non-UTF-8 `--seed-input` is rejected). Write the
 /// programmatic seed bytes to content-named files under the campaign dir and
@@ -2071,6 +2129,35 @@ fn materialize_seed_bytes(args: &mut FuzzArgs) -> Result<(), String> {
     Ok(())
 }
 
+/// Hand a multi-worker campaign's seeds to its workers as seed files: the
+/// prefixed variants of the seeds given to `bhf fuzz` (see
+/// [`layout_prefixed_seeds`]), made once here, and every programmatic seed
+/// ([`materialize_seed_bytes`]). The workers are told the variants are made,
+/// so none prefixes the seeds it is handed, the programmatic and shared-queue
+/// ones included.
+fn worker_seed_files(args: &mut FuzzArgs, harness: &Path) -> Result<(), String> {
+    if !args.seeds_layout_prefixed {
+        if let Some(prefix) = layout_seed_prefix(harness, &args.work_dir, &args.harness) {
+            let mut given: Vec<Vec<u8>> = args
+                .seed_inputs
+                .iter()
+                .map(|seed| seed.as_bytes().to_vec())
+                .collect();
+            for seed_file in &args.seed_files {
+                let (bytes, _) =
+                    read_seed_file_prefix(seed_file, args.max_len.max(1)).map_err(|error| {
+                        format!("read seed file '{}': {error}", seed_file.display())
+                    })?;
+                given.push(bytes);
+            }
+            let variants = layout_prefixed_seeds(&given, prefix);
+            args.seed_bytes.extend(variants);
+        }
+        args.seeds_layout_prefixed = true;
+    }
+    materialize_seed_bytes(args)
+}
+
 fn worker_passthrough_args(args: &FuzzArgs) -> Vec<String> {
     let mut out = vec![
         "--engine".to_owned(),
@@ -2094,6 +2181,9 @@ fn worker_passthrough_args(args: &FuzzArgs) -> Vec<String> {
     for seed_file in &args.seed_files {
         out.push("--seed-file".to_owned());
         out.push(seed_file.display().to_string());
+    }
+    if args.seeds_layout_prefixed {
+        out.push("--seeds-layout-prefixed".to_owned());
     }
     for source in &args.symbolic_seed_sources {
         out.push("--symbolic-seed-source".to_owned());
@@ -2199,7 +2289,6 @@ fn prepare(args: FuzzArgs) -> Result<PreparedFuzzRun, String> {
         .into_iter()
         .map(String::into_bytes)
         .collect::<Vec<_>>();
-    seeds.extend(args.seed_bytes);
     for seed_file in args.seed_files {
         let (bytes, original_len) = read_seed_file_prefix(&seed_file, args.max_len.max(1))
             .map_err(|error| format!("read seed file '{}': {error}", seed_file.display()))?;
@@ -2213,6 +2302,18 @@ fn prepare(args: FuzzArgs) -> Result<PreparedFuzzRun, String> {
         }
         seeds.push(bytes);
     }
+    // A `--seed-file`/`--seed-input` seed is a sample of the target's input
+    // format; where the harness decodes fixed-width parameters before the
+    // buffer, it is also given behind that many zero bytes, so the buffer
+    // starts with it. A campaign's worker is handed the variants with the
+    // rest of its seeds.
+    if !args.seeds_layout_prefixed {
+        if let Some(prefix) = layout_seed_prefix(&harness_path, &work_dir, &args.harness) {
+            let variants = layout_prefixed_seeds(&seeds, prefix);
+            seeds.extend(variants);
+        }
+    }
+    seeds.extend(args.seed_bytes);
     let mut symbolic_sources = Vec::new();
     let mut symbolic_source_bytes = 0usize;
     let symbolic_source_limit = max_symbolic_source_bytes();
@@ -3073,6 +3174,9 @@ fn run_builtin_with_progress(
         &prepared.work_dir,
         &prepared.harness_id,
     );
+    // A corpus this pass creates carries the harness's input format from
+    // its first input on.
+    emitter.start_corpus_format();
     if let Some(identity) = build_binary_identity {
         emitter = emitter.with_build_binary(identity);
     }
@@ -3866,6 +3970,10 @@ fn run_builtin_with_progress(
     // `corpus_persisted` tracks `corpus_new` and stays bounded even when coverage
     // reads zero. Best-effort: a persistence I/O error must not fail an otherwise-
     // successful run.
+    //
+    // The corpus is about to hold this pass's inputs, of this harness's input
+    // format, whether or not the pass found anything: record that format.
+    emitter.record_corpus_format();
     let corpus_persisted = match corpus.persist_coverage_corpus(
         &prepared.harness_id,
         pool.iter()
@@ -8940,6 +9048,48 @@ mod auto_path_tests {
         >&2 echo '0x502000000031 is located 0 bytes after 1-byte region [0x502000000030,0x502000000031)'\n\
         exit 1\n";
 
+    /// A pass records its harness's input format in the corpus it fills,
+    /// even when it finds nothing, so a later run can tell the corpus's
+    /// format.
+    #[test]
+    #[cfg(unix)]
+    fn a_pass_without_findings_records_the_corpus_format() {
+        let root = tmpdir();
+        let work_dir = root.join("bhf_work");
+        let harness = write_c_libfuzzer_harness(
+            &work_dir,
+            "H-QUIET",
+            "#!/bin/sh
+exit 0
+",
+        );
+        fs::write(
+            harness.with_file_name("generation-metadata.json"),
+            r#"{"schema_version":1,"harness_format_version":4,"language":"c"}"#,
+        )
+        .unwrap();
+        let summary = run_one_target_programmatic(
+            &work_dir,
+            "H-QUIET",
+            vec![b"seed".to_vec()],
+            1,
+            None,
+            None,
+            0,
+            &[],
+            actionability::RunMode::Reporting,
+            None,
+            &[],
+            None,
+        )
+        .expect("a clean pass");
+        assert!(summary.findings.is_empty());
+        let format = corpus::finding::recorded_corpus_format(&work_dir, "H-QUIET")
+            .expect("the corpus records its format");
+        assert_eq!(format.version, 4);
+        assert!(!format.buffer_len_dimension);
+    }
+
     /// A new finding is re-run once with the argument trace on, and its
     /// decoded arguments land in decoded.json and finding.json, with the
     /// overflowed parameter named on the access.
@@ -10518,6 +10668,119 @@ mod auto_path_tests {
         );
     }
 
+    /// Write an `arg-layout.json` beside `harness` that decodes two 4-byte
+    /// scalars before the buffer taking the bytes left: an 8-byte seed
+    /// prefix.
+    fn write_scalars_first_layout(harness: &Path) {
+        let scalar = |name: &str| {
+            serde_json::json!({
+                "step": "param", "call": "target", "role": "param", "index": 1,
+                "name": name, "type": "uint32_t", "order": 0, "input": "cursor",
+                "decoder": "scalar", "primitive": "bhf_i32", "width": 4, "static_decode": true
+            })
+        };
+        let layout = serde_json::json!({
+            "schema_version": "bhf.arg-layout.v1", "harness_format_version": 4,
+            "language": "c", "harness": "direct", "static_decode": true,
+            "steps": [
+                scalar("a"),
+                scalar("b"),
+                {"step": "remainder", "call": "target", "sized": false},
+                {"step": "param", "call": "target", "role": "param", "index": 0,
+                 "name": "buf", "type": "const uint8_t *", "order": 2, "input": "remainder",
+                 "decoder": "input_buffer", "copied": true, "static_decode": true}
+            ]
+        });
+        fs::write(
+            harness.with_file_name("arg-layout.json"),
+            serde_json::to_vec(&layout).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// A seed file of `bhf fuzz` is also given behind the bytes the harness
+    /// decodes into fixed-width parameters before its buffer, and stays as
+    /// it is; seeds handed over programmatically are not.
+    #[test]
+    #[cfg(unix)]
+    fn seed_files_are_also_given_behind_the_layout_prefix() {
+        let root = tmpdir();
+        let work_dir = root.join("bhf_work");
+        let harness = write_c_libfuzzer_harness(&work_dir, "H-PREFIX", "#!/bin/sh\nexit 0\n");
+        write_scalars_first_layout(&harness);
+        let seed_file = root.join("magic.bin");
+        fs::write(&seed_file, b"MAGC").unwrap();
+        let mut args = fuzz_args_for_worker_passthrough(StructuredInputMode::Off);
+        args.work_dir = work_dir.clone();
+        args.harness = "H-PREFIX".to_owned();
+        args.seed_files = vec![seed_file];
+        args.seed_bytes = vec![b"QUEUED".to_vec()];
+        let prepared = prepare(args).unwrap();
+        assert!(
+            prepared.seeds.contains(&b"MAGC".to_vec()),
+            "{:?}",
+            prepared.seeds
+        );
+        assert!(
+            prepared.seeds.contains(&b"\0\0\0\0\0\0\0\0MAGC".to_vec()),
+            "{:?}",
+            prepared.seeds
+        );
+        assert!(!prepared.seeds.contains(&b"\0\0\0\0\0\0\0\0QUEUED".to_vec()));
+    }
+
+    /// In a multi-worker campaign only the seed files and inputs given to
+    /// `bhf fuzz` get a prefixed variant, made once by the campaign: a
+    /// worker, handed every seed as a seed file (the programmatic ones and
+    /// the shared queue's included), adds none of its own.
+    #[test]
+    #[cfg(unix)]
+    fn multicore_workers_get_prefixed_variants_of_the_given_seeds_only() {
+        use clap::Parser;
+        #[derive(clap::Parser)]
+        struct Wrap {
+            #[command(flatten)]
+            inner: FuzzArgs,
+        }
+        let root = tmpdir();
+        let work_dir = root.join("bhf_work");
+        let harness = write_c_libfuzzer_harness(&work_dir, "H-PREFIX-MC", "#!/bin/sh\nexit 0\n");
+        write_scalars_first_layout(&harness);
+        let seed_file = root.join("magic.bin");
+        fs::write(&seed_file, b"MAGC").unwrap();
+        let mut args = fuzz_args_for_worker_passthrough(StructuredInputMode::Off);
+        args.work_dir = work_dir.clone();
+        args.harness = "H-PREFIX-MC".to_owned();
+        args.seed_files = vec![seed_file];
+        args.seed_bytes = vec![b"QUEUED".to_vec()];
+        worker_seed_files(&mut args, &harness).unwrap();
+        let work = work_dir.display().to_string();
+        let mut argv = vec!["fuzz", work.as_str(), "--harness", "H-PREFIX-MC"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        argv.extend(worker_passthrough_args(&args));
+        let worker = Wrap::try_parse_from(&argv).unwrap().inner;
+        let seeds = prepare(worker).unwrap().seeds;
+        let count = |seed: &[u8]| seeds.iter().filter(|s| s.as_slice() == seed).count();
+        assert_eq!(count(b"MAGC"), 1, "{seeds:?}");
+        assert_eq!(count(b"\0\0\0\0\0\0\0\0MAGC"), 1, "{seeds:?}");
+        assert_eq!(count(b"QUEUED"), 1, "{seeds:?}");
+        assert_eq!(count(b"\0\0\0\0\0\0\0\0QUEUED"), 0, "{seeds:?}");
+    }
+
+    #[test]
+    fn prefixed_seed_variants_are_added_once() {
+        let seeds = vec![b"MZ".to_vec(), b"".to_vec()];
+        let variants = layout_prefixed_seeds(&seeds, 4);
+        assert_eq!(variants, vec![b"\0\0\0\0MZ".to_vec(), vec![0; 4]]);
+        // Handed the seeds and their variants (a fuzz worker), nothing new.
+        let mut both = seeds.clone();
+        both.extend(variants);
+        assert!(layout_prefixed_seeds(&both, 4).is_empty());
+        assert!(layout_prefixed_seeds(&seeds, 0).is_empty());
+    }
+
     #[test]
     #[cfg(unix)]
     fn afl_programmatic_seeds_keep_their_bytes_and_honor_the_resolved_max_len() {
@@ -10889,6 +11152,7 @@ mod auto_path_tests {
             seed_inputs: Vec::new(),
             seed_files: Vec::new(),
             seed_bytes: Vec::new(),
+            seeds_layout_prefixed: false,
             sanitizers: Vec::new(),
             symbolic_seed_sources: Vec::new(),
             rng_seed: 1,

@@ -322,20 +322,23 @@ static inline const uint8_t *bhf_take_sized(bhf_cursor *c, size_t *size) {
 
 /* The bytes of one buffer of a call that takes several: as bhf_take_sized,
  * a 32-bit little-endian length L, then the next min(L, remaining) bytes,
- * which the cursor moves past, but returned as a heap copy of exactly those
- * bytes (at least one byte, zero when there are none), so a read past them is
- * a heap overflow the sanitizer reports instead of a read of the next
- * buffer's bytes. Stores their count in *size and their offset in the input
- * in *at. Caller frees the copy with free(). */
-static inline uint8_t *bhf_take_sized_copy(bhf_cursor *c, size_t *size, size_t *at) {
+ * which the cursor moves past, but returned as a heap copy of its own, so a
+ * read past it is a heap overflow the sanitizer reports instead of a read of
+ * the next buffer's bytes. The copy holds max(those bytes, capacity, 1)
+ * bytes, zero past those bytes: capacity 0 gives exactly them, and a buffer
+ * with no length of its own passes the input size, so it stays as large as
+ * the input. Stores their count in *size and their offset in the input in
+ * *at. Caller frees the copy with free(). */
+static inline uint8_t *bhf_take_sized_copy(bhf_cursor *c, size_t *size, size_t *at,
+                                           size_t capacity) {
     const uint8_t *from = bhf_take_sized(c, size);
-    uint8_t *copy = (uint8_t *)malloc(*size ? *size : 1);
+    size_t n = *size > capacity ? *size : capacity;
+    uint8_t *copy = (uint8_t *)calloc(n ? n : 1, 1);
     *at = (size_t)(from - c->data);
     if (!copy) {
         *size = 0;
         return NULL;
     }
-    copy[0] = 0;
     if (*size) memcpy(copy, from, *size);
     return copy;
 }

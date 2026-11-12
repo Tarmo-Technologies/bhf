@@ -265,9 +265,10 @@ struct GenerationMetadata<'a> {
     /// values.
     harness_format_version: u32,
     /// The opt-in explicit buffer-length dimension
-    /// ([`harness_gen::buffer_len_dimension_enabled`]) was on when this C or
-    /// C++ harness was generated: a length-less buffer takes 4 length bytes,
-    /// then that many bytes. Absent when off.
+    /// ([`harness_gen::buffer_len_dimension_enabled`]) sized a buffer of this
+    /// C or C++ harness: a length-less buffer takes 4 length bytes, then that
+    /// many bytes. Taken from its `arg-layout.json`, so it is absent when the
+    /// dimension was off or no buffer of the harness has no length partner.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     buffer_len_dimension: bool,
     language: &'a str,
@@ -322,12 +323,19 @@ fn write_target_generation_metadata(
             .join(harness_gen::arg_layout::ARG_LAYOUT_FILE)
             .is_file())
     .then_some(harness_gen::arg_layout::ARG_LAYOUT_FILE);
+    // Recorded where the dimension changed how the harness decodes, which
+    // only its layout knows: a harness with no length-less buffer decodes
+    // the same with the dimension on.
+    let buffer_len_dimension = arg_layout.is_some()
+        && harness_gen::arg_layout::ArgLayout::read(output_dir)
+            .and_then(Result::ok)
+            .is_some_and(|layout| layout.buffer_len_dimension);
     let metadata = GenerationMetadata {
         target_function,
         arg_layout,
         schema_version: 1,
         harness_format_version: harness_gen::harness_format_version_for(language),
-        buffer_len_dimension: language != "ada" && harness_gen::buffer_len_dimension_enabled(),
+        buffer_len_dimension,
         language,
         requested_line_present: requested_line.is_some(),
         exact_line_match: requested_line.is_some_and(|line| line == selected_line),
@@ -19564,8 +19572,9 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// The opt-in buffer-length dimension is recorded with the harness, and
-    /// left out when off.
+    /// The opt-in buffer-length dimension is recorded with the harness when
+    /// its layout says it sized a buffer, and left out otherwise, even when
+    /// it was on.
     #[test]
     fn generation_metadata_records_the_buffer_length_dimension() {
         let dir = std::env::temp_dir().join(format!(
@@ -19574,6 +19583,13 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             line!()
         ));
         fs::create_dir_all(&dir).unwrap();
+        let layout = |applied: bool| {
+            harness_gen::arg_layout::ArgLayout::new("c", "direct", Vec::new())
+                .with_buffer_len_dimension(applied)
+                .write(&dir)
+                .unwrap();
+        };
+        layout(false);
         write_generation_metadata(&dir, "c", None, 1, "direct", "direct").unwrap();
         let read = || -> serde_json::Value {
             serde_json::from_slice(&fs::read(dir.join("generation-metadata.json")).unwrap())
@@ -19581,9 +19597,13 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         };
         assert!(read().get("buffer_len_dimension").is_none());
         {
+            // On, but no buffer it applies to.
             let _on = harness_gen::scoped_buffer_len_dimension(true);
             write_generation_metadata(&dir, "c", None, 1, "direct", "direct").unwrap();
         }
+        assert!(read().get("buffer_len_dimension").is_none());
+        layout(true);
+        write_generation_metadata(&dir, "c", None, 1, "direct", "direct").unwrap();
         assert_eq!(read()["buffer_len_dimension"], true);
 
         // The dimension is part of the format a finding is compared with.
@@ -19602,6 +19622,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             "buffer_len_dimension": true,
         });
         assert_eq!(finding_format_note(&with, &dir), None);
+        layout(false);
         write_generation_metadata(&dir, "c", None, 1, "direct", "direct").unwrap();
         assert!(finding_format_note(&with, &dir)
             .expect("and the reverse")

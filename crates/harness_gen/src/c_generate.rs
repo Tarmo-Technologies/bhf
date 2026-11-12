@@ -376,7 +376,10 @@ pub fn generate_c_direct_harness(
 ) -> Result<GeneratedCFiles, HarnessGenError> {
     let context = build_c_context(&args)?;
     let tera = templates::build_tera()?;
-    let main_c = tera.render("direct_harness_c", &harness_source_context(&context)?)?;
+    let main_c = tera.render(
+        "direct_harness_c",
+        &harness_source_context(&context, context.arg_layout.buffer_len_dimension)?,
+    )?;
     let makefile = tera.render(
         "harness_makefile",
         &harness_makefile_context(&context, &args.c_runtime_include)?,
@@ -402,16 +405,15 @@ pub fn generate_c_direct_harness(
 }
 
 /// Template context for a generated harness SOURCE: the emitter's own context
-/// plus the input format version stamped at the top of the file.
+/// plus the input format version stamped at the top of the file, and whether
+/// the explicit buffer-length dimension sized a buffer of the harness.
 pub(crate) fn harness_source_context(
     context: &impl Serialize,
+    buffer_len_dimension: bool,
 ) -> Result<tera::Context, HarnessGenError> {
     let mut context = tera::Context::from_serialize(context)?;
     context.insert("harness_format_version", &crate::HARNESS_FORMAT_VERSION);
-    context.insert(
-        "buffer_len_dimension",
-        &crate::buffer_len_dimension_enabled(),
-    );
+    context.insert("buffer_len_dimension", &buffer_len_dimension);
     Ok(context)
 }
 
@@ -483,7 +485,10 @@ pub fn generate_c_sequence_harness(
 ) -> Result<GeneratedCFiles, HarnessGenError> {
     let context = build_c_sequence_context(&args)?;
     let tera = templates::build_tera()?;
-    let main_c = tera.render("sequence_harness_c", &harness_source_context(&context)?)?;
+    let main_c = tera.render(
+        "sequence_harness_c",
+        &harness_source_context(&context, context.arg_layout.buffer_len_dimension)?,
+    )?;
     let makefile = tera.render(
         "harness_makefile",
         &harness_makefile_context(&context, &args.c_runtime_include)?,
@@ -1359,7 +1364,7 @@ fn build_param_decoders(
     if out.len() > unit_start {
         units.push(unit_start..out.len());
     }
-    crate::arg_trace::slice_input_units(&mut out, &units);
+    crate::arg_trace::slice_input_units(&mut out, &units, crate::buffer_len_dimension_enabled());
     Ok(out)
 }
 
@@ -1414,7 +1419,6 @@ pub(crate) fn c_trace_plan(
             registry: Some(registry),
             defer_input: false,
             fresh_cursor: true,
-            sized_buffers: crate::buffer_len_dimension_enabled(),
         },
         emissions,
         &declared,
@@ -3309,7 +3313,8 @@ fn build_c_context(args: &GenerateCDirectArgs) -> Result<CTemplateContext, Harne
         "c",
         if byte_stream { "byte_stream" } else { "direct" },
         trace.layout.clone(),
-    );
+    )
+    .with_buffer_len_dimension(trace.buffer_len_dimension);
 
     Ok(CTemplateContext {
         arg_layout,
@@ -4570,7 +4575,12 @@ fn build_c_sequence_step_emission(
     if let (Some(first_param), Some(first_emit)) = (step.params.first(), params.first_mut()) {
         let resolves_length = is_length_param(&first_param.c_type)
             || registry_resolves_to_length(&first_param.c_type, registry);
-        if resolves_length && looks_like_count_name(&first_param.name) {
+        // A length that takes a slice of the input with its buffer is that
+        // buffer's length, not the handle's.
+        if resolves_length
+            && looks_like_count_name(&first_param.name)
+            && !crate::arg_trace::takes_slice(first_emit)
+        {
             let ty = crate::c_decoders::strip_type_decoration(&first_param.c_type);
             first_emit.decl = format!(
                 "{ty} {arg} = ({ty})bhf_bounded_length(&Cur, 0, sizeof _bhf_handle)",
@@ -4825,6 +4835,14 @@ fn apply_c_protocol_args(
             "mined call '{}' argument recipe count does not match its declaration",
             emission.name
         )));
+    }
+    // Arguments bound to the input themselves take it whole: the call's
+    // buffers share the bytes the cursor left, as when they were recorded.
+    if recipes
+        .iter()
+        .any(|recipe| !matches!(recipe, CProtocolArg::Decode))
+    {
+        crate::arg_trace::unslice_all(&mut emission.params);
     }
     for ((param, declared), recipe) in emission.params.iter_mut().zip(declared_params).zip(recipes)
     {
@@ -5224,6 +5242,7 @@ fn apply_sequence_traces(context: &mut CSequenceTemplateContext, registry: &Type
         .collect();
 
     let mut counter = 0usize;
+    let mut buffer_len_dimension = false;
     let mut visit = |step: &mut CSequenceStepEmission, fresh: bool| {
         let prefix = format!("q{counter}_");
         counter += 1;
@@ -5238,13 +5257,13 @@ fn apply_sequence_traces(context: &mut CSequenceTemplateContext, registry: &Type
                 registry: Some(registry),
                 defer_input: false,
                 fresh_cursor: fresh,
-                sized_buffers: crate::buffer_len_dimension_enabled(),
             },
             &step.params,
             &step.declared,
         );
         step.decode = plan.decode;
         step.after = plan.after;
+        buffer_len_dimension |= plan.buffer_len_dimension;
         layout.extend(plan.layout);
     };
     if let Some(step) = context.init_step.as_mut() {
@@ -5285,6 +5304,7 @@ fn apply_sequence_traces(context: &mut CSequenceTemplateContext, registry: &Type
         visit(step, false);
     }
     context.arg_layout = crate::arg_layout::ArgLayout::new("c", "sequence", layout)
+        .with_buffer_len_dimension(buffer_len_dimension)
         .without_static_decode(
             "a sequence harness picks its calls from a control block at the end of the input, \
              so which parameters are decoded, and from which bytes, depends on the input",
@@ -5593,9 +5613,10 @@ mod tests {
         }
     }
 
-    /// Every buffer of a call with several gets bytes of its own: each but
-    /// the last a sized slice of the input (a 4-byte length, then that many
-    /// bytes, in a heap copy of exactly that size), the last the bytes left.
+    /// Every buffer of a call with several gets bytes of its own: after the
+    /// scalars, each but the last a sized slice of the input (a 4-byte
+    /// length, then that many bytes, in a heap copy of its own), the last
+    /// the bytes left.
     /// Each paired length is its own buffer's size, so a correct function
     /// summing both buffers runs clean whatever the input says, and two
     /// buffers never get the same bytes.
@@ -5625,13 +5646,13 @@ mod tests {
         // 4-byte buffer.
         let short_tail = [32, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4];
         traced_args(&out, &short_tail, None);
-        let input = [2, 0, 0, 0, 0xa1, 0xa2, 5, 0, 0, 0, 0xb1, 0xb2, 0xb3];
+        let input = [5, 0, 0, 0, 2, 0, 0, 0, 0xa1, 0xa2, 0xb1, 0xb2, 0xb3];
         let args = traced_args(&out, &input, Some("1"));
+        assert_eq!(traced(&args, "x", None)["value"], "5");
         let a = traced(&args, "a", None);
-        assert_eq!(a["span"], serde_json::json!([4, 6]), "{args:#?}");
+        assert_eq!(a["span"], serde_json::json!([8, 10]), "{args:#?}");
         assert_eq!(a["preview_hex"], "a1a2");
         assert_eq!(traced(&args, "alen", None)["value"], "2");
-        assert_eq!(traced(&args, "x", None)["value"], "5");
         let b = traced(&args, "b", None);
         assert_eq!(b["span"], serde_json::json!([10, 13]));
         assert_eq!(b["preview_hex"], "b1b2b3");
@@ -5662,8 +5683,8 @@ mod tests {
         }
         fs::remove_dir_all(&out).ok();
 
-        // A slice is a copy of exactly its bytes: reading one past it is a
-        // heap overflow, not a read of the next buffer's bytes.
+        // A paired buffer's slice is a copy of exactly its bytes: reading one
+        // past it is a heap overflow, not a read of the next buffer's bytes.
         let Some(out) = build_c_harness(
             "peek_past",
             &[
@@ -5689,6 +5710,108 @@ mod tests {
             !run.status.success() && stderr.contains("heap-buffer-overflow"),
             "{stderr}"
         );
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// A buffer without a length partner that takes a slice (another buffer
+    /// of its call takes the bytes left) keeps an allocation as large as the
+    /// input, zeroed past its own bytes: a correct function that reads it for
+    /// as many bytes as the other buffer's length runs clean when its slice
+    /// is shorter, read-only or writable. Its bytes stay its own, and the
+    /// static decode still gives what the trace prints.
+    #[test]
+    fn built_c_harness_keeps_a_lone_buffer_as_large_as_the_input() {
+        let Some(out) = build_c_harness(
+            "same_prefix",
+            &[
+                ("a", "const uint8_t *"),
+                ("b", "const uint8_t *"),
+                ("n", "size_t"),
+            ],
+            "#include <stdint.h>\n#include <stddef.h>\n#include <string.h>\n\
+             int same_prefix(const uint8_t *a, const uint8_t *b, size_t n) {\n\
+             \x20   return memcmp(a, b, n) == 0;\n\
+             }\n",
+        ) else {
+            return;
+        };
+        // An empty slice for `a`, then 16 bytes for `(b, n)`.
+        let mut input = vec![0u8; 4];
+        input.extend_from_slice(&[b'A'; 16]);
+        traced_args(&out, &input, None);
+        let args = traced_args(&out, &input, Some("1"));
+        let a = traced(&args, "a", None);
+        assert_eq!(a["span"], serde_json::json!([4, 4]), "{args:#?}");
+        assert_eq!(a["len"], 0);
+        if let Some(alloc) = a.get("alloc_size") {
+            assert!(alloc.as_u64() > Some(input.len() as u64), "{a}");
+        }
+        assert_eq!(traced(&args, "b", None)["span"], serde_json::json!([4, 20]));
+        assert_eq!(traced(&args, "n", None)["value"], "16");
+        for input in [&input[..], b"", &[2, 0, 0, 0, b'x', b'y', b'x', b'y', b'z']] {
+            assert_layout_matches_trace(&out, input);
+        }
+        fs::remove_dir_all(&out).ok();
+
+        let Some(out) = build_c_harness(
+            "xor_into",
+            &[
+                ("dst", "uint8_t *"),
+                ("src", "const uint8_t *"),
+                ("n", "size_t"),
+            ],
+            "#include <stdint.h>\n#include <stddef.h>\n\
+             int xor_into(uint8_t *dst, const uint8_t *src, size_t n) {\n\
+             \x20   for (size_t i = 0; i < n; i++) dst[i] ^= src[i];\n\
+             \x20   return n ? dst[0] : 0;\n\
+             }\n",
+        ) else {
+            return;
+        };
+        // More bytes for `src` than the writable buffer's headroom.
+        let mut input = vec![0u8; 4];
+        input.extend(std::iter::repeat_n(0x5a, 70_000));
+        traced_args(&out, &input, None);
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// A context pointer ahead of a `(data, len)` pair takes a slice of its
+    /// own, so a seed for the pair goes behind the slice's 4-byte length:
+    /// the layout's seed prefix is those 4 bytes, and the prefixed seed
+    /// reaches `data` byte for byte while the context is left empty.
+    #[test]
+    fn built_c_harness_prefixed_seed_reaches_the_buffer_after_a_context_slice() {
+        let Some(out) = build_c_harness(
+            "parse_record",
+            &[
+                ("ctx", "void *"),
+                ("data", "const uint8_t *"),
+                ("len", "size_t"),
+            ],
+            "#include <stdint.h>\n#include <stddef.h>\n\
+             int parse_record(void *ctx, const uint8_t *data, size_t len) {\n\
+             \x20   return ctx && len ? data[0] : 0;\n\
+             }\n",
+        ) else {
+            return;
+        };
+        let layout = crate::arg_layout::ArgLayout::read(&out).unwrap().unwrap();
+        assert_eq!(layout.seed_prefix_len(), Some(4), "{layout:#?}");
+        let seed = [
+            0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0x0d,
+        ];
+        let mut variant = vec![0u8; 4];
+        variant.extend_from_slice(&seed);
+        let args = traced_args(&out, &variant, Some("1"));
+        let data = traced(&args, "data", None);
+        assert_eq!(data["span"], serde_json::json!([4, 16]), "{args:#?}");
+        assert_eq!(data["preview_hex"], "89504e470d0a1a0a0000000d");
+        assert_eq!(traced(&args, "len", None)["value"], "12");
+        assert_eq!(
+            traced(&args, "ctx", None)["span"],
+            serde_json::json!([4, 4])
+        );
+        assert_layout_matches_trace(&out, &variant);
         fs::remove_dir_all(&out).ok();
     }
 
@@ -6927,6 +7050,43 @@ mod tests {
         assert_eq!(traced(&args, "data", None)["preview_hex"], "aabbcc");
         assert_eq!(traced(&args, "bit_index", None)["value"], "254");
         fs::remove_dir_all(&out).ok();
+    }
+
+    /// The buffer-length dimension is recorded (in the source stamp and in
+    /// arg-layout.json) only for a harness it sized a buffer of: a `const
+    /// void *` view becomes a sized copy and is recorded, while a buffer
+    /// paired with its length keeps the bytes left and records nothing.
+    #[test]
+    fn the_length_dimension_is_recorded_only_where_it_sizes_a_buffer() {
+        let _dimension = crate::scoped_buffer_len_dimension(true);
+        let generate = |name: &str, params: &[(&str, &str)]| {
+            let out = temp_dir(name);
+            let mut args = direct_args(name, out.clone());
+            args.params = params
+                .iter()
+                .map(|(name, c_type)| CParameter {
+                    name: (*name).to_owned(),
+                    c_type: (*c_type).to_owned(),
+                })
+                .collect();
+            let result = generate_c_direct_harness(args).unwrap();
+            let main = fs::read_to_string(&result.main_c).unwrap();
+            let layout = crate::arg_layout::ArgLayout::read(&out).unwrap().unwrap();
+            fs::remove_dir_all(&out).ok();
+            (main, layout)
+        };
+        let (main, layout) = generate("view_sized", &[("p", "const void *"), ("x", "int")]);
+        assert!(main.contains("bhf_take_sized_copy(&Cur"), "{main}");
+        assert!(main.contains("with an explicit buffer length"), "{main}");
+        assert!(layout.buffer_len_dimension);
+
+        let (main, layout) = generate(
+            "pair_unsized",
+            &[("buf", "const uint8_t *"), ("len", "size_t"), ("x", "int")],
+        );
+        assert!(!main.contains("bhf_take_sized"), "{main}");
+        assert!(!main.contains("with an explicit buffer length"), "{main}");
+        assert!(!layout.buffer_len_dimension);
     }
 
     /// With the opt-in buffer-length dimension, a buffer without a length

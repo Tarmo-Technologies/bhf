@@ -39,8 +39,10 @@ pub struct ArgLayout {
     /// The harness input format the layout describes
     /// ([`crate::harness_format_version_for`]).
     pub harness_format_version: u32,
-    /// The explicit buffer-length dimension was on
-    /// ([`crate::buffer_len_dimension_enabled`]).
+    /// The explicit buffer-length dimension
+    /// ([`crate::buffer_len_dimension_enabled`]) gave a buffer an explicit
+    /// length: some call's decode differs from the one without it. False
+    /// when the dimension was on but no call has a buffer it applies to.
     #[serde(default)]
     pub buffer_len_dimension: bool,
     /// `c` or `cpp`.
@@ -199,13 +201,20 @@ impl ArgLayout {
         ArgLayout {
             schema_version: ARG_LAYOUT_SCHEMA.to_owned(),
             harness_format_version: crate::harness_format_version_for(language),
-            buffer_len_dimension: crate::buffer_len_dimension_enabled(),
+            buffer_len_dimension: false,
             language: language.to_owned(),
             harness: harness.to_owned(),
             static_decode: true,
             static_decode_note: None,
             steps,
         }
+    }
+
+    /// The same layout, recording whether the explicit buffer-length
+    /// dimension sized a buffer of any of its calls.
+    pub fn with_buffer_len_dimension(mut self, applied: bool) -> Self {
+        self.buffer_len_dimension = applied;
+        self
     }
 
     /// The same layout, marked as not replayable over a testcase.
@@ -241,6 +250,64 @@ impl ArgLayout {
                     }
                 }),
         )
+    }
+
+    /// How many input bytes the harness decodes into fixed-width cursor
+    /// parameters before the first buffer that takes the bytes the cursor
+    /// left: the K zero bytes to put in front of a seed of that buffer's
+    /// format so the buffer starts with the seed. A sized slice before it
+    /// (another buffer of the call) counts its 4-byte length: zero leaves
+    /// that buffer empty. `None` when there is no such buffer, nothing comes
+    /// before it, or a parameter before it takes a number of bytes the input
+    /// decides (a string) or the layout cannot follow (a lifecycle loop, a
+    /// whole-input parameter).
+    pub fn seed_prefix_len(&self) -> Option<usize> {
+        if !self.static_decode || self.harness != "direct" {
+            return None;
+        }
+        let mut prefix = 0u64;
+        let mut steps = self.steps.iter().peekable();
+        while let Some(step) = steps.next() {
+            match step {
+                LayoutStep::Opaque { .. } => return None,
+                LayoutStep::Remainder { sized: true, .. } => {
+                    // A zero length, then the slice's parameters, which take
+                    // none of the bytes after it.
+                    prefix += 4;
+                    while steps.next_if(|step| {
+                        matches!(step, LayoutStep::Param(param) if param.input == "remainder")
+                    })
+                    .is_some()
+                    {}
+                }
+                LayoutStep::Remainder { call, sized: false } => {
+                    let takes_bytes = steps.clone().any(|step| {
+                        matches!(step, LayoutStep::Param(param)
+                        if param.call == *call
+                            && param.input == "remainder"
+                            && matches!(
+                                param.decoder.as_str(),
+                                "input_buffer" | "input_stream" | "input_file"
+                            ))
+                    });
+                    return (takes_bytes && prefix > 0)
+                        .then(|| usize::try_from(prefix).ok())
+                        .flatten();
+                }
+                LayoutStep::Param(param) => match param.input.as_str() {
+                    "cursor" => {
+                        let fixed = match param.decoder.as_str() {
+                            "scalar" | "bounded_int" | "enum_member" => param.width.map(u64::from),
+                            _ => param.cursor_bytes,
+                        };
+                        prefix += fixed?;
+                    }
+                    "none" => {}
+                    _ => return None,
+                },
+            }
+        }
+        None
     }
 
     /// The parameters, in decode order.
@@ -1265,6 +1332,87 @@ mod tests {
             static_decode: true,
             note: None,
         }
+    }
+
+    /// The seed prefix is the fixed-width cursor bytes before the first
+    /// buffer that takes the bytes left, and there is none when a value
+    /// before it has no fixed width or nothing comes before it.
+    #[test]
+    fn the_seed_prefix_is_the_fixed_width_bytes_before_the_buffer() {
+        let scalar = |width: u32| {
+            let mut p = param("cursor", "scalar");
+            p.width = Some(width);
+            LayoutStep::Param(p)
+        };
+        let rest = || LayoutStep::Remainder {
+            call: "target".to_owned(),
+            sized: false,
+        };
+        let buffer = || LayoutStep::Param(param("remainder", "input_buffer"));
+        let prefix =
+            |steps: Vec<LayoutStep>| ArgLayout::new("c", "direct", steps).seed_prefix_len();
+        assert_eq!(
+            prefix(vec![scalar(4), scalar(4), rest(), buffer()]),
+            Some(8)
+        );
+        let mut fields = param("cursor", "other");
+        fields.static_decode = false;
+        fields.cursor_bytes = Some(12);
+        assert_eq!(
+            prefix(vec![scalar(1), LayoutStep::Param(fields), rest(), buffer()]),
+            Some(13)
+        );
+        // Nothing before the buffer: a seed already lines up.
+        assert_eq!(prefix(vec![rest(), buffer()]), None);
+        // A string's length is the input's to decide.
+        let mut string = param("cursor", "length_prefixed_string");
+        string.length_prefix_bytes = Some(2);
+        assert_eq!(
+            prefix(vec![scalar(4), LayoutStep::Param(string), rest(), buffer()]),
+            None
+        );
+        // A sized slice before the buffer (another buffer of the call) is
+        // left empty: its 4-byte length, zero, and none of its bytes.
+        let sized = || LayoutStep::Remainder {
+            call: "target".to_owned(),
+            sized: true,
+        };
+        let length = || LayoutStep::Param(param("remainder", "input_length"));
+        assert_eq!(
+            prefix(vec![scalar(4), sized(), buffer(), rest(), buffer()]),
+            Some(8)
+        );
+        assert_eq!(
+            prefix(vec![sized(), buffer(), rest(), buffer(), length()]),
+            Some(4)
+        );
+        assert_eq!(
+            prefix(vec![
+                sized(),
+                buffer(),
+                length(),
+                sized(),
+                buffer(),
+                rest(),
+                buffer()
+            ]),
+            Some(8)
+        );
+        // With the explicit length the buffer itself is sized: zero bytes
+        // ahead of it cannot give it the seed.
+        assert_eq!(prefix(vec![scalar(4), sized(), buffer()]), None);
+        // No buffer takes the bytes left (an output capacity only).
+        let capacity = LayoutStep::Param(param("remainder", "input_length"));
+        assert_eq!(prefix(vec![scalar(4), rest(), capacity]), None);
+        // A layout that cannot be replayed is not followed.
+        let opaque = LayoutStep::Opaque {
+            what: "a loop".to_owned(),
+        };
+        assert_eq!(prefix(vec![scalar(4), opaque, rest(), buffer()]), None);
+        assert_eq!(
+            ArgLayout::new("c", "sequence", vec![scalar(4), rest(), buffer()]).seed_prefix_len(),
+            None
+        );
     }
 
     fn described(decl: &str, name: &str, ty: &str, shape: &TypeShape) -> ParamLayout {

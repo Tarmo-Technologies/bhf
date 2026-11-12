@@ -1137,7 +1137,9 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         ),
         crate::auto::attempt::LegacyCorpus::Reused => bhfeprintln!(
             "bhf auto: reusing the corpus an earlier bhf release left in this work dir \
-             (--reuse-legacy-corpus)"
+             (--reuse-legacy-corpus); a target's corpus recorded before harness formats were \
+             stamped holds format 2 or earlier inputs, which decode into other argument values \
+             under its current harness"
         ),
         _ => {}
     }

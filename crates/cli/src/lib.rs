@@ -211,7 +211,8 @@ enum Command {
     /// runs with BHF_TRACE_ARGS=1. Set BHF_BUFFER_LEN_DIMENSION=1 while generating
     /// to give a byte buffer that has no length parameter an explicit length read
     /// from the input (off by default: a buffer shorter than the input can make a
-    /// function with an implicit length contract overflow it).
+    /// function with an implicit length contract overflow it). The harness records
+    /// it only when it has such a buffer.
     GenerateHarness(generate_harness::GenerateHarnessArgs),
     /// Compile a generated harness (toolchain auto-detect, cross-compile, GNAT/GPRbuild/clang, probe backend)
     Build(build::BuildArgs),
