@@ -30,6 +30,15 @@ pub fn leaving_hook() {
     IN_HOOK.with(|f| f.set(false));
 }
 
+/// Non-zero while the calling thread is inside one of the shim's hooks. bhf's
+/// C/C++ driver asks before recording a comparison: the shim's own string and
+/// buffer compares reach the sanitizer's comparison hooks too, and are not
+/// the target's.
+#[no_mangle]
+pub extern "C" fn bhf_shim_in_hook() -> libc::c_int {
+    IN_HOOK.try_with(Cell::get).unwrap_or(false) as libc::c_int
+}
+
 /// RAII guard for the in_hook flag. Constructing this returns Err
 /// when we're already inside a hook; the caller short-circuits in
 /// that case. Drop clears the flag.

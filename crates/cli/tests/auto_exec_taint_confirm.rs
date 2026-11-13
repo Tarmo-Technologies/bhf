@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
+// Linux only: the dynamic taint comes from the LD_PRELOAD runtrace shim.
+#![cfg(target_os = "linux")]
 
 //! End-to-end (#422): dynamic byte-origin taint confirms a fuzz-controlled
 //! program/argv reaching an `execv` process-execution API as OS command

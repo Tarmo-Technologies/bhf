@@ -135,6 +135,7 @@ pub fn crash_report(
         rule_id,
         stack: Vec::new(),
         message,
+        ..Default::default()
     }
 }
 

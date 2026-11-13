@@ -8,7 +8,7 @@
 // from the existing rule catalog (BHF-201..BHF-208), and returns the top-5
 // frames so the caller can attach them to the finding.
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SanitizerReport {
     /// The sanitizer that produced this report, or `None` when the crash was
     /// observed WITHOUT a sanitizer (a host fatal signal, or an on-target /
@@ -19,14 +19,184 @@ pub struct SanitizerReport {
     /// `signed-integer-overflow`).
     pub kind: String,
     pub rule_id: &'static str,
-    /// Up to the top 5 frames the sanitizer printed, in order. Each frame
-    /// is a `function` plus optional `file`:`line` from the sanitizer
-    /// output - file/line are present when the binary was built with
-    /// debug info (`-g`) so the SARIF emitter can attach a real
-    /// `physicalLocation`.
+    /// The crash stack the sanitizer printed, in order (at most
+    /// [`MAX_SANITIZER_FRAMES`]). For ASan this is only the stack of the
+    /// faulting access: the allocation and free stacks are in
+    /// [`SanitizerReport::access`]. Each frame is a `function` plus optional
+    /// `file`:`line` from the sanitizer output - file/line are present when the
+    /// binary was built with debug info (`-g`) so the SARIF emitter can attach a
+    /// real `physicalLocation`.
     pub stack: Vec<StackFrame>,
     /// First line of the sanitizer error, useful as a `message`.
     pub message: String,
+    /// The source position the sanitizer localized the report to: UBSan's
+    /// `file:line:col: runtime error:` prefix, or the location on an ASan
+    /// `SUMMARY:` line. `None` when the report names none.
+    pub location: Option<SourceLocation>,
+    /// The sanitizer's machine-readable check name, when it printed one: UBSan's
+    /// `SUMMARY: UndefinedBehaviorSanitizer: <check>` under
+    /// `report_error_type=1` (e.g. `missing-return`, `invalid-shift-exponent`).
+    pub check: Option<String>,
+    /// The memory access an ASan report describes: direction, size, the region
+    /// it hit, and the allocation and free stacks. Boxed: most reports carry
+    /// none, and the report travels inside every harness-run result.
+    pub access: Option<Box<MemoryAccess>>,
+    /// For a crash with no sanitizer report: the faulting instruction's offset
+    /// in the executable (its file address), from the `bhf: fatal signal`
+    /// line bhf's driver prints before it dies by the signal. It tells two
+    /// crash sites of one harness apart and is only meaningful for that build.
+    pub pc_offset: Option<u64>,
+}
+
+/// A `file:line[:col]` source position.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceLocation {
+    pub file: String,
+    pub line: u32,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub column: Option<u32>,
+}
+
+impl SourceLocation {
+    /// `<dir>/<basename>:<line>[:<col>]`: the site identity used in finding
+    /// signatures and cluster keys. The path is cut to its last two components
+    /// ([`site_path`]): enough to tell `a/util.c` from `b/util.c`, while the
+    /// identity does not depend on where the source tree was checked out or on
+    /// whether the compiler was given a relative or an absolute path.
+    pub fn site(&self) -> String {
+        self.site_at(&site_path(&self.file))
+    }
+
+    fn site_at(&self, path: &str) -> String {
+        match self.column {
+            Some(column) => format!("{path}:{}:{column}", self.line),
+            None => format!("{path}:{}", self.line),
+        }
+    }
+}
+
+/// The last two components of `file` (`src/a/util.c` -> `a/util.c`), with
+/// `\\` read as `/`, and `.` and `dir/..` resolved first.
+pub fn site_path(file: &str) -> String {
+    let normalized = file.replace('\\', "/");
+    let mut parts: Vec<&str> = Vec::new();
+    for part in normalized.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    let tail = &parts[parts.len().saturating_sub(2)..];
+    tail.join("/")
+}
+
+impl SanitizerReport {
+    /// The site identity of the reported location ([`SourceLocation::site`]).
+    /// A bare file name, which the compiler prints when it ran in the file's
+    /// own directory, takes that directory from the top crash frame when the
+    /// frame names the same file, so it reads as it would with a longer path.
+    pub fn site(&self) -> Option<String> {
+        let location = self.location.as_ref()?;
+        let path = site_path(&location.file);
+        if path.contains('/') {
+            return Some(location.site_at(&path));
+        }
+        let from_frame = self
+            .stack
+            .first()
+            .and_then(|frame| frame.file.as_deref())
+            .map(site_path)
+            .filter(|frame_path| frame_path.rsplit('/').next() == Some(path.as_str()));
+        Some(location.site_at(from_frame.as_deref().unwrap_or(&path)))
+    }
+
+    /// [`Self::site`], else the faulting instruction's offset in the
+    /// executable (`exe+0x1b3c`, see [`Self::pc_offset`]): what identifies
+    /// where a report without frames crashed.
+    pub fn fault_site(&self) -> Option<String> {
+        self.site()
+            .or_else(|| self.pc_offset.map(|offset| format!("exe+{offset:#x}")))
+    }
+}
+
+/// The direction of a faulting memory access, read as a token from the report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AccessDirection {
+    Read,
+    Write,
+    /// No direction was reported, or the report said `UNKNOWN`.
+    #[default]
+    Unknown,
+}
+
+impl AccessDirection {
+    fn from_token(token: &str) -> Self {
+        match token {
+            "READ" => Self::Read,
+            "WRITE" => Self::Write,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// The memory access an ASan report describes. Serialized as
+/// `exception.access` in `finding.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct MemoryAccess {
+    /// `READ of size N` / `The signal is caused by a READ memory access.`
+    pub direction: AccessDirection,
+    /// Access width in bytes, when the report states it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub size: Option<u64>,
+    /// The faulting address as printed (`on address 0x...` /
+    /// `SEGV on unknown address 0x...`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub address: Option<String>,
+    /// ASan's `Hint:` about the address: `zero-page` or `high-value-address`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub address_hint: Option<String>,
+    /// The object the access hit (`is located N bytes after M-byte region`, a
+    /// stack variable, or a global).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub region: Option<MemoryRegion>,
+    /// Where the region was allocated (`allocated by thread T0 here:`), or for a
+    /// stack object the frame that holds it.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub alloc_stack: Vec<StackFrame>,
+    /// Where the region was freed (`freed by thread T0 here:`).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub free_stack: Vec<StackFrame>,
+}
+
+/// The object a faulting access hit, from ASan's address description.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct MemoryRegion {
+    /// `heap`, `stack` or `global`.
+    pub kind: String,
+    /// The object's size in bytes.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub size: Option<u64>,
+    /// Byte offset of the access from the start of the object; negative before
+    /// it, `>= size` past its end.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub offset: Option<i64>,
+    /// `after`, `before` or `inside` the object.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub relation: Option<String>,
+    /// Bytes from the object's edge named by `relation` (from its start for
+    /// `inside`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub distance: Option<u64>,
+    /// The stack or global variable's name.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub variable: Option<String>,
+    /// For a stack object, the access offset within its frame.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub frame_offset: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -160,6 +330,7 @@ fn parse_js_finding(stderr: &str) -> Option<SanitizerReport> {
         rule_id,
         stack,
         message: format!("JS finding: {rest}"),
+        ..Default::default()
     })
 }
 
@@ -268,6 +439,7 @@ fn parse_csharp_finding(stderr: &str) -> Option<SanitizerReport> {
         rule_id,
         stack,
         message,
+        ..Default::default()
     })
 }
 
@@ -366,6 +538,7 @@ fn parse_go_panic(stderr: &str) -> Option<SanitizerReport> {
         rule_id,
         stack,
         message: format!("Go panic: {msg}"),
+        ..Default::default()
     })
 }
 
@@ -474,6 +647,7 @@ fn parse_perl_finding(stderr: &str) -> Option<SanitizerReport> {
         } else {
             format!("Perl finding: {msg}")
         },
+        ..Default::default()
     })
 }
 
@@ -506,6 +680,7 @@ fn parse_ruby_finding(stderr: &str) -> Option<SanitizerReport> {
         } else {
             format!("Ruby finding: {msg}")
         },
+        ..Default::default()
     })
 }
 
@@ -537,6 +712,7 @@ fn parse_lua_finding(stderr: &str) -> Option<SanitizerReport> {
         } else {
             format!("Lua finding: {msg}")
         },
+        ..Default::default()
     })
 }
 
@@ -568,6 +744,7 @@ fn parse_php_finding(stderr: &str) -> Option<SanitizerReport> {
         } else {
             format!("PHP finding: {msg}")
         },
+        ..Default::default()
     })
 }
 
@@ -643,6 +820,7 @@ fn parse_jvm_finding(stderr: &str) -> Option<SanitizerReport> {
         rule_id,
         stack,
         message,
+        ..Default::default()
     })
 }
 
@@ -688,6 +866,7 @@ fn parse_python_finding(stderr: &str) -> Option<SanitizerReport> {
         rule_id,
         stack,
         message,
+        ..Default::default()
     })
 }
 
@@ -844,6 +1023,7 @@ fn parse_rust_panic(stderr: &str) -> Option<SanitizerReport> {
         rule_id,
         stack,
         message,
+        ..Default::default()
     })
 }
 
@@ -877,10 +1057,10 @@ fn parse_asan(stderr: &str) -> Option<SanitizerReport> {
         // was not malloc()-ed" (kind token "free") are both the free-of-invalid-
         // pointer class — CWE-415 (#37).
         "double-free" | "free" => "BHF-204",
-        // ASan reports null deref as "SEGV on unknown address". Match the
-        // common variant explicitly so we don't lose the signal.
-        "SEGV" if line.contains("0x000000000000") => "BHF-206",
-        "SEGV" => "BHF-206",
+        // A SEGV is a NULL dereference (BHF-206) only when it faults in the
+        // first page; anything else is a wild pointer (BHF-223). Decided below,
+        // once the address and ASan's hint about it are parsed.
+        "SEGV" => "BHF-223",
         // Global / static buffers and intra-object are all "OOB writes/reads"
         // at the rule-catalog level - one heuristic, same CWE-787.
         "global-buffer-overflow"
@@ -915,16 +1095,34 @@ fn parse_asan(stderr: &str) -> Option<SanitizerReport> {
         }
         None
     });
+    // For a non-canonical address ASan's direction is not one (see
+    // `memory_access`); say so next to it.
+    let high_value = rest
+        .lines()
+        .take(12)
+        .any(|l| l.contains("Hint:") && l.contains("high value address"));
     let message = match access {
+        Some(a) if high_value => format!("{line} ({a}; high value address)"),
         Some(a) => format!("{line} ({a})"),
         None => line.to_owned(),
+    };
+    let stacks = split_asan_stacks(rest);
+    let access = memory_access(rest, line, stacks.alloc, stacks.free);
+    let rule_id = if kind == "SEGV" && access.as_deref().is_some_and(faults_in_null_page) {
+        "BHF-206"
+    } else {
+        rule_id
     };
     Some(SanitizerReport {
         sanitizer: Some(Sanitizer::AddressSanitizer),
         kind,
         rule_id,
-        stack: parse_stack_frames(rest),
+        stack: stacks.crash,
         message,
+        location: summary_location(rest, "AddressSanitizer:"),
+        check: None,
+        access,
+        pc_offset: None,
     })
 }
 
@@ -960,56 +1158,104 @@ fn parse_ubsan(stderr: &str) -> Option<SanitizerReport> {
         .find(|line| line.contains("runtime error:"))?;
     let after = line.split("runtime error:").nth(1)?.trim();
 
-    let (kind, rule_id) = if after.starts_with("signed integer overflow")
-        || after.starts_with("unsigned integer overflow")
-        || after.contains("cannot be represented in type")
-    {
-        ("signed-integer-overflow".to_owned(), "BHF-205")
-    } else if after.starts_with("load of null pointer")
-        || after.starts_with("store to null pointer")
-        || after.starts_with("member access within null pointer")
-        || after.starts_with("reference binding to null pointer")
-        // UBSan's `nonnull`/`nullability-arg` checks. `memcpy`, `strcpy`, `memset`
-        // and most of libc are declared `__attribute__((nonnull))`, so passing NULL
-        // to one is reported this way rather than as a load/store — and it is one of
-        // the most common real null-deref shapes there is. Unmatched, the report
-        // fell through to `None` below, the SIGABRT read as an assert-style input
-        // rejection, and the crash was DISCARDED: a NULL returned by a stubbed
-        // external and handed to memcpy produced no finding at all.
-        || after.starts_with("null pointer passed as argument")
-        || after.starts_with("null pointer returned from function")
-        // The `pointer-overflow` check on a null base. The offset is interpolated
-        // ("applying non-zero offset 8 to null pointer"), so match the ends.
-        || (after.starts_with("applying") && after.contains("to null pointer"))
-    {
-        ("null-pointer-dereference".to_owned(), "BHF-206")
-    } else if after.starts_with("index ") && after.contains("out of bounds") {
-        ("out-of-bounds-access".to_owned(), "BHF-201")
-    } else if after.starts_with("division by zero") {
-        ("division-by-zero".to_owned(), "BHF-205")
-    } else if is_ubsan_output(line, stderr) {
-        // An unrecognised check is still UNDEFINED BEHAVIOUR that UBSan localized
-        // to a file and line. Returning None for it failed CLOSED: the caller reads
-        // no report, the abort looks like the target rejecting the input, and a real
-        // fault is dropped. UBSan has ~20 checks and the list above covers four, so
-        // failing closed silently discarded most of them. Report it generically
-        // instead; the message carries the exact check.
-        ("undefined-behavior".to_owned(), "BHF-210")
-    } else {
+    // The report's own stack is the frames printed after its `runtime error:`
+    // line (`print_stacktrace=1`), up to the blank line or `SUMMARY:` that ends
+    // it — not every `#N` line anywhere in the log.
+    let after_line = stderr
+        .find(line)
+        .map(|pos| &stderr[pos + line.len()..])
+        .unwrap_or("");
+    let check = ubsan_check_name(after_line);
+    // Each UBSan check is its own kind and rule. UBSan's own check name
+    // (`report_error_type=1`) decides when it is present; otherwise the report
+    // text after `runtime error:` does — never the source path before it.
+    let kind = check
+        .as_deref()
+        .and_then(finding_rules::ubsan::kind_for_check_name)
+        .unwrap_or_else(|| finding_rules::ubsan::kind_for_message(after));
+    if kind == "undefined-behavior" && !is_ubsan_output(line, stderr) {
         // `runtime error:` is not UBSan's alone — a Go panic reads `panic: runtime
         // error: index out of range [5] with length 1`, and this parser runs BEFORE
-        // the Go one. Without this guard the generic arm above would hijack every
-        // Go panic and report it as C undefined behaviour.
+        // the Go one. Without this guard the generic arm would hijack every Go
+        // panic and report it as C undefined behaviour.
         return None;
-    };
-
+    }
+    // An unrecognised check is still UNDEFINED BEHAVIOUR that UBSan localized to
+    // a file and line: it is reported generically (the message carries the exact
+    // check), never dropped as an input rejection.
+    let rule_id = finding_rules::ubsan::rule_for_kind(kind);
+    let kind = kind.to_owned();
     Some(SanitizerReport {
         sanitizer: Some(Sanitizer::UndefinedBehaviorSanitizer),
         kind,
         rule_id,
-        stack: parse_stack_frames(stderr),
+        stack: report_stack(after_line),
         message: line.to_owned(),
+        location: ubsan_location(line),
+        check,
+        access: None,
+        pc_offset: None,
     })
+}
+
+/// The `file:line:col` prefix of a UBSan `<file>:<line>:<col>: runtime error:`
+/// line.
+fn ubsan_location(line: &str) -> Option<SourceLocation> {
+    let prefix = line.split("runtime error:").next()?;
+    parse_location_token(prefix.trim().trim_end_matches(':'))
+}
+
+/// UBSan's check name from its `SUMMARY:` line. With `report_error_type=1`
+/// the line reads `SUMMARY: UndefinedBehaviorSanitizer: missing-return
+/// a.c:3:5`; without it every check reads `undefined-behavior`, which names
+/// nothing and so yields `None`.
+fn ubsan_check_name(report: &str) -> Option<String> {
+    const MARKER: &str = "SUMMARY: UndefinedBehaviorSanitizer:";
+    let line = report.lines().find(|line| line.contains(MARKER))?;
+    let after = line.split(MARKER).nth(1)?.trim();
+    let check = after.split_whitespace().next()?;
+    (check != "undefined-behavior" && !check.is_empty()).then(|| check.to_owned())
+}
+
+/// The location on a `SUMMARY: <Sanitizer>: <kind> <file>:<line>:<col> in fn`
+/// line, when the frame it names was symbolized.
+fn summary_location(report: &str, sanitizer_marker: &str) -> Option<SourceLocation> {
+    let line = report.lines().find(|line| {
+        line.trim_start().starts_with("SUMMARY:") && line.contains(sanitizer_marker)
+    })?;
+    let after = line.split(sanitizer_marker).nth(1)?;
+    let token = after.split_whitespace().nth(1)?;
+    parse_location_token(token)
+}
+
+/// Parse `path:line[:col]` (a Windows drive prefix is kept in `path`). `None`
+/// when the trailing fields are not numbers.
+fn parse_location_token(token: &str) -> Option<SourceLocation> {
+    if token.is_empty() || token.starts_with('(') {
+        return None;
+    }
+    let numeric = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let mut fields = token.rsplitn(3, ':');
+    let last = fields.next()?;
+    let middle = fields.next()?;
+    let head = fields.next();
+    let (file, line, column) = match head {
+        Some(head) if numeric(middle) && numeric(last) => {
+            (head.to_owned(), middle.parse().ok()?, last.parse().ok())
+        }
+        _ if numeric(last) => {
+            let file = match head {
+                Some(head) => format!("{head}:{middle}"),
+                None => middle.to_owned(),
+            };
+            (file, last.parse().ok()?, None)
+        }
+        _ => return None,
+    };
+    if file.trim().is_empty() {
+        return None;
+    }
+    Some(SourceLocation { file, line, column })
 }
 
 fn parse_lsan(stderr: &str) -> Option<SanitizerReport> {
@@ -1023,42 +1269,431 @@ fn parse_lsan(stderr: &str) -> Option<SanitizerReport> {
         rule_id: "BHF-208",
         stack: parse_stack_frames(stderr),
         message: line.to_owned(),
+        ..Default::default()
     })
 }
 
-const MAX_SANITIZER_FRAMES: usize = 16;
+/// Most frames kept per stack (crash, allocation, free), each capped on its own
+/// so a deep crash stack cannot push the allocation site out.
+pub const MAX_SANITIZER_FRAMES: usize = 16;
 
-fn parse_stack_frames(stderr: &str) -> Vec<StackFrame> {
-    let mut frames: Vec<StackFrame> = Vec::new();
-    for line in stderr.lines() {
-        let trimmed = line.trim_start();
-        // ASan/UBSan format:
-        //   "    #0 0x... in <symbol> /path/file.c:LINE[:COL]"
-        //   "    #0 0x... in <demangled C++ name with spaces> /path/file.c:LINE"
-        //   "    #0 0x... in <symbol> (module+0xab)"   (unresolved)
-        let Some(rest) = trimmed.strip_prefix('#') else {
-            continue;
-        };
-        let Some(in_pos) = rest.find(" in ") else {
-            continue;
-        };
-        let after = &rest[in_pos + 4..].trim_end();
-        let (function, file, line) = split_function_and_location(after);
-        let function = function.to_owned();
-        if function.is_empty() {
-            continue;
-        }
-        let frame = StackFrame {
-            function,
-            file,
-            line,
-        };
-        if frames.contains(&frame) || frames.len() >= MAX_SANITIZER_FRAMES {
-            continue;
-        }
+/// One `#N 0x... in <symbol> [location]` sanitizer stack line, or `None`.
+///
+/// ASan/UBSan format:
+///   "    #0 0x... in <symbol> /path/file.c:LINE[:COL]"
+///   "    #0 0x... in <demangled C++ name with spaces> /path/file.c:LINE"
+///   "    #0 0x... in <symbol> (module+0xab)"   (unresolved)
+fn parse_frame_line(line: &str) -> Option<StackFrame> {
+    let rest = line.trim_start().strip_prefix('#')?;
+    let in_pos = rest.find(" in ")?;
+    let after = &rest[in_pos + 4..].trim_end();
+    let (function, file, line) = split_function_and_location(after);
+    if function.is_empty() {
+        return None;
+    }
+    Some(StackFrame {
+        function: function.to_owned(),
+        file,
+        line,
+    })
+}
+
+/// Add `frame` unless it is a repeat or the stack is full.
+fn push_frame(frames: &mut Vec<StackFrame>, frame: StackFrame) {
+    if !frames.contains(&frame) && frames.len() < MAX_SANITIZER_FRAMES {
         frames.push(frame);
     }
+}
+
+/// Every frame line in `stderr`, deduplicated and capped. Used for reports that
+/// print a single stack (LSan, panics).
+fn parse_stack_frames(stderr: &str) -> Vec<StackFrame> {
+    let mut frames: Vec<StackFrame> = Vec::new();
+    for frame in stderr.lines().filter_map(parse_frame_line) {
+        push_frame(&mut frames, frame);
+    }
     frames
+}
+
+/// The frames of one report's stack: frame lines from the start of `report`
+/// until the blank line after them, a `SUMMARY:` line, or the next report.
+fn report_stack(report: &str) -> Vec<StackFrame> {
+    let mut frames = Vec::new();
+    for line in report.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("SUMMARY:")
+            || line.contains("runtime error:")
+            || line.contains("ERROR: ")
+            || (trimmed.is_empty() && !frames.is_empty())
+        {
+            break;
+        }
+        if let Some(frame) = parse_frame_line(line) {
+            push_frame(&mut frames, frame);
+        }
+    }
+    frames
+}
+
+/// The stacks of an ASan report, each from its own section.
+#[derive(Default)]
+struct AsanStacks {
+    /// The faulting access's stack: the frames after the `ERROR:` line.
+    crash: Vec<StackFrame>,
+    /// `allocated by` / `previously allocated by`, or the frame holding a stack
+    /// object.
+    alloc: Vec<StackFrame>,
+    /// `freed by`.
+    free: Vec<StackFrame>,
+}
+
+/// Split an ASan report into its crash, allocation and free stacks. The crash
+/// stack ends at the first blank line after it or at the address description;
+/// every later stack belongs to the section header above it.
+fn split_asan_stacks(report: &str) -> AsanStacks {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Section {
+        Crash,
+        Alloc,
+        Free,
+        Other,
+    }
+    let mut stacks = AsanStacks::default();
+    let mut section = Section::Crash;
+    for line in report.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("SUMMARY:") {
+            break;
+        }
+        if trimmed.contains("freed by thread") {
+            section = Section::Free;
+            continue;
+        }
+        if trimmed.contains("allocated by thread") || is_stack_object_header(trimmed) {
+            section = Section::Alloc;
+            continue;
+        }
+        if trimmed.contains(" is located ")
+            || trimmed.starts_with("This frame has")
+            || (trimmed.starts_with("Thread T") && trimmed.contains("created by"))
+        {
+            section = Section::Other;
+            continue;
+        }
+        if trimmed.is_empty() {
+            let started = match section {
+                Section::Crash => !stacks.crash.is_empty(),
+                _ => true,
+            };
+            if started {
+                section = Section::Other;
+            }
+            continue;
+        }
+        let Some(frame) = parse_frame_line(line) else {
+            continue;
+        };
+        match section {
+            Section::Crash => push_frame(&mut stacks.crash, frame),
+            Section::Alloc => push_frame(&mut stacks.alloc, frame),
+            Section::Free => push_frame(&mut stacks.free, frame),
+            Section::Other => {}
+        }
+    }
+    stacks
+}
+
+/// `Address 0x... is located in stack of thread T0 at offset 36 in frame`: the
+/// header of the stack-object description, followed by the frame that owns it.
+fn is_stack_object_header(trimmed: &str) -> bool {
+    trimmed.starts_with("Address ")
+        && trimmed.contains(" at offset ")
+        && trimmed.contains(" in frame")
+}
+
+/// The structured access of an ASan report: direction and size, the faulting
+/// address and ASan's hint about it, the region the address falls in, and the
+/// allocation and free stacks. `None` when the report states none of these.
+fn memory_access(
+    report: &str,
+    error_line: &str,
+    alloc_stack: Vec<StackFrame>,
+    free_stack: Vec<StackFrame>,
+) -> Option<Box<MemoryAccess>> {
+    let mut direction = AccessDirection::Unknown;
+    let mut size = None;
+    let mut address_hint = None;
+    for line in report
+        .lines()
+        .take_while(|l| !l.trim_start().starts_with("SUMMARY:"))
+    {
+        let trimmed = line.trim_start();
+        if direction == AccessDirection::Unknown && size.is_none() {
+            // `READ of size 4 at 0x... thread T0`
+            if let Some((token, tail)) = trimmed.split_once(" of size ") {
+                if matches!(token, "READ" | "WRITE") {
+                    direction = AccessDirection::from_token(token);
+                    size = tail
+                        .split_whitespace()
+                        .next()
+                        .and_then(|n| n.parse::<u64>().ok());
+                    continue;
+                }
+            }
+        }
+        // `==NN==The signal is caused by a READ memory access.` (SEGV): the PID
+        // prefix means the line cannot be anchored with `starts_with`.
+        if let Some(pos) = line.find("The signal is caused by a ") {
+            let token = line[pos + "The signal is caused by a ".len()..]
+                .split_whitespace()
+                .next()
+                .unwrap_or("");
+            direction = AccessDirection::from_token(token);
+        }
+        if line.contains("Hint: address points to the zero page") {
+            address_hint = Some("zero-page".to_owned());
+        } else if line.contains("Hint:") && line.contains("high value address") {
+            address_hint = Some("high-value-address".to_owned());
+        }
+    }
+    // A non-canonical ("high value") address faults before the CPU reports a
+    // direction, and ASan then prints READ whatever the instruction did.
+    if address_hint.as_deref() == Some("high-value-address") {
+        direction = AccessDirection::Unknown;
+    }
+    let access = MemoryAccess {
+        direction,
+        size,
+        address: faulting_address(error_line),
+        address_hint,
+        region: memory_region(report),
+        alloc_stack,
+        free_stack,
+    };
+    (access != MemoryAccess::default()).then(|| Box::new(access))
+}
+
+/// Addresses below this are in the first memory page: a NULL base plus a small
+/// field or element offset.
+const NULL_PAGE_LIMIT: u64 = 0x1000;
+
+/// Whether a SEGV faulted in the first memory page (a NULL dereference), by
+/// ASan's `zero page` hint or by the faulting address itself.
+fn faults_in_null_page(access: &MemoryAccess) -> bool {
+    access.address_hint.as_deref() == Some("zero-page")
+        || access
+            .address
+            .as_deref()
+            .and_then(|a| u64::from_str_radix(a.trim_start_matches("0x"), 16).ok())
+            .is_some_and(|address| address < NULL_PAGE_LIMIT)
+}
+
+/// The rule an earlier bhf release recorded for this report, where it differs
+/// from today's. Earlier releases classified a UBSan report by five shapes of
+/// the text after `runtime error:` ([`earlier_ubsan_rule`]) and gave every
+/// ASan SEGV BHF-206. `None` when the rule did not change.
+pub fn legacy_rule_id(report: &SanitizerReport) -> Option<&'static str> {
+    let legacy = match report.sanitizer {
+        Some(Sanitizer::UndefinedBehaviorSanitizer) => {
+            let after = report
+                .message
+                .split_once("runtime error:")
+                .map_or("", |(_, text)| text.trim());
+            earlier_ubsan_rule(after)
+        }
+        Some(Sanitizer::AddressSanitizer) if report.kind == "SEGV" => "BHF-206",
+        _ => return None,
+    };
+    (legacy != report.rule_id).then_some(legacy)
+}
+
+/// The rule earlier releases gave a UBSan report, from the text after
+/// `runtime error:`: integer overflow, any "cannot be represented in type"
+/// text and division by zero were BHF-205, the NULL shapes below BHF-206, an
+/// array index BHF-201, and every other check BHF-210.
+fn earlier_ubsan_rule(after: &str) -> &'static str {
+    const NULL_PREFIXES: &[&str] = &[
+        "load of null pointer",
+        "store to null pointer",
+        "member access within null pointer",
+        "reference binding to null pointer",
+        "null pointer passed as argument",
+        "null pointer returned from function",
+    ];
+    if after.starts_with("signed integer overflow")
+        || after.starts_with("unsigned integer overflow")
+        || after.contains("cannot be represented in type")
+    {
+        "BHF-205"
+    } else if NULL_PREFIXES.iter().any(|prefix| after.starts_with(prefix))
+        || (after.starts_with("applying") && after.contains("to null pointer"))
+    {
+        "BHF-206"
+    } else if after.starts_with("index ") && after.contains("out of bounds") {
+        "BHF-201"
+    } else if after.starts_with("division by zero") {
+        "BHF-205"
+    } else {
+        "BHF-210"
+    }
+}
+
+/// Whether `report` is the crash a finding recorded with `recorded_rule`: the
+/// same rule, or the rule an earlier release gave the same report
+/// ([`legacy_rule_id`]), so replaying an older finding still matches.
+pub fn rule_matches(recorded_rule: &str, report: &SanitizerReport) -> bool {
+    report.rule_id == recorded_rule || legacy_rule_id(report) == Some(recorded_rule)
+}
+
+/// The address on the `ERROR:` line: `on address 0x...`, `on unknown address
+/// 0x...` (SEGV), or `double-free on 0x...`. `None` when ASan could not name
+/// one (`SEGV on unknown address (pc ...)`).
+fn faulting_address(error_line: &str) -> Option<String> {
+    let after = error_line
+        .split_once("address 0x")
+        .map(|(_, tail)| tail)
+        .or_else(|| error_line.split_once(" on 0x").map(|(_, tail)| tail))?;
+    let hex: String = after.chars().take_while(char::is_ascii_hexdigit).collect();
+    (!hex.is_empty()).then(|| format!("0x{hex}"))
+}
+
+/// The region an ASan report's address description names:
+/// - heap: `0x... is located 0 bytes after 5-byte region [a,b)` (older
+///   runtimes: `to the right of` / `to the left of`), or `N bytes inside of`;
+/// - global: `... is located 0 bytes after global variable 'g' defined in
+///   'x.c:4' (0x...) of size 40`;
+/// - stack: `Address 0x... is located in stack of thread T0 at offset 36 in
+///   frame`, then the frame's object list where the overflowed variable is
+///   marked `<== Memory access at offset 36 overflows this variable`.
+fn memory_region(report: &str) -> Option<MemoryRegion> {
+    let lines: Vec<&str> = report.lines().collect();
+    if let Some(idx) = lines.iter().position(|l| is_stack_object_header(l.trim())) {
+        let frame_offset = number_after(lines[idx], " at offset ");
+        let mut region = MemoryRegion {
+            kind: "stack".to_owned(),
+            frame_offset,
+            ..MemoryRegion::default()
+        };
+        // `    [32, 36) 'buf' (line 13) <== Memory access at offset 36 overflows this variable`
+        if let Some(object) = lines[idx..]
+            .iter()
+            .take_while(|l| !l.trim_start().starts_with("SUMMARY:"))
+            .find(|l| l.contains("<== Memory access"))
+        {
+            let bounds = object
+                .trim_start()
+                .strip_prefix('[')
+                .and_then(|rest| rest.split_once(')'));
+            if let Some((range, tail)) = bounds {
+                let mut ends = range.split(',').map(|n| n.trim().parse::<u64>().ok());
+                if let (Some(Some(start)), Some(Some(end))) = (ends.next(), ends.next()) {
+                    region.size = end.checked_sub(start);
+                    if let Some(offset) = frame_offset.and_then(|at| signed_difference(at, start)) {
+                        region.offset = Some(offset);
+                        place_relative(&mut region, offset);
+                    }
+                }
+                region.variable = quoted(tail);
+            }
+        }
+        return Some(region);
+    }
+    let line = lines.iter().find(|l| l.contains(" is located "))?;
+    let after = line.split(" is located ").nth(1)?;
+    let distance = after
+        .split_whitespace()
+        .next()
+        .and_then(|n| n.parse::<u64>().ok());
+    let relation = if after.contains(" bytes after ") || after.contains(" bytes to the right of ") {
+        "after"
+    } else if after.contains(" bytes before ") || after.contains(" bytes to the left of ") {
+        "before"
+    } else if after.contains(" bytes inside of ") {
+        "inside"
+    } else {
+        return None;
+    };
+    let (kind, size, variable) = if after.contains("global variable") {
+        ("global", number_after(after, " of size "), quoted(after))
+    } else {
+        // `... 5-byte region [a,b)`
+        let size = after
+            .split_whitespace()
+            .find_map(|word| word.strip_suffix("-byte"))
+            .and_then(|n| n.parse::<u64>().ok());
+        ("heap", size, None)
+    };
+    // The numbers come from the target's output: an offset that does not fit
+    // stays unset rather than wrapping.
+    let offset = match (relation, distance) {
+        ("after", Some(d)) => size
+            .and_then(|size| size.checked_add(d))
+            .and_then(|end| i64::try_from(end).ok()),
+        ("before", Some(d)) => 0_i64.checked_sub_unsigned(d),
+        ("inside", Some(d)) => i64::try_from(d).ok(),
+        _ => None,
+    };
+    Some(MemoryRegion {
+        kind: kind.to_owned(),
+        size,
+        offset,
+        relation: Some(relation.to_owned()),
+        distance,
+        variable,
+        frame_offset: None,
+    })
+}
+
+/// `at - start` as a signed offset, `None` when it does not fit in an `i64`.
+fn signed_difference(at: u64, start: u64) -> Option<i64> {
+    if at >= start {
+        i64::try_from(at - start).ok()
+    } else {
+        0_i64.checked_sub_unsigned(start - at)
+    }
+}
+
+/// Fill `relation`/`distance` from an object-relative `offset`.
+fn place_relative(region: &mut MemoryRegion, offset: i64) {
+    let (relation, distance) = match region.size {
+        _ if offset < 0 => ("before", offset.unsigned_abs()),
+        Some(size) if offset as u64 >= size => ("after", offset as u64 - size),
+        _ => ("inside", offset as u64),
+    };
+    region.relation = Some(relation.to_owned());
+    region.distance = Some(distance);
+}
+
+/// The first `'quoted'` word in `text`.
+fn quoted(text: &str) -> Option<String> {
+    let (_, rest) = text.split_once('\'')?;
+    let (name, _) = rest.split_once('\'')?;
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// The integer right after `needle` in `text`.
+fn number_after(text: &str, needle: &str) -> Option<u64> {
+    let (_, rest) = text.split_once(needle)?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// Signed offset of the faulting access from the object it hit, as ASan's
+/// address description states it: `+N` for `N bytes after` (or inside), `-N`
+/// for `N bytes before`, and the frame offset for a stack object (`at offset
+/// N in frame`).
+pub fn relative_offset(stderr: &str) -> Option<i64> {
+    let region = memory_region(stderr)?;
+    if region.kind == "stack" {
+        return region
+            .frame_offset
+            .and_then(|offset| i64::try_from(offset).ok());
+    }
+    let distance = region.distance?;
+    match region.relation.as_deref()? {
+        "before" => 0_i64.checked_sub_unsigned(distance),
+        _ => i64::try_from(distance).ok(),
+    }
 }
 
 /// Pull a `(function, file, line)` triple out of the substring that
@@ -1078,6 +1713,16 @@ fn split_function_and_location(after: &str) -> (&str, Option<String>, Option<u32
     let mut cursor = after.trim();
     let mut file_opt: Option<String> = None;
     let mut line_opt: Option<u32> = None;
+    // A source path may itself hold spaces (`C:\Users\Some One\My
+    // Projects\x.c:25`, `/home/some one/x.c:3`), so the last token is not the
+    // whole location. Take the earliest absolute path start after a space
+    // whose remainder parses as `path:LINE[:COL]`.
+    if let Some(start) = spaced_location_start(cursor) {
+        let (file, line) = parse_file_line(cursor[start..].trim());
+        if file.is_some() {
+            return (cursor[..start].trim_end(), file, line);
+        }
+    }
     if let Some(last_ws) = cursor.rfind(char::is_whitespace) {
         let tail = cursor[last_ws..].trim_start();
         if !tail.starts_with('(') {
@@ -1129,6 +1774,27 @@ fn split_function_and_location(after: &str) -> (&str, Option<String>, Option<u32
         cursor = preceding.trim_end();
     }
     (cursor, file_opt, line_opt)
+}
+
+/// Where a location with spaces starts in the text after `" in "`: the
+/// earliest `X:\`, `X:/` or `/` that follows a space and leaves a symbol
+/// before it. `None` when the location has no space (the last-token rule
+/// handles it).
+fn spaced_location_start(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let last_space = text.rfind(char::is_whitespace)?;
+    (1..=last_space).find(|&i| {
+        if !bytes[i - 1].is_ascii_whitespace() || text[..i].trim().is_empty() {
+            return false;
+        }
+        let rest = &bytes[i..];
+        // The location must reach past the last space, or it has none.
+        let drive = rest.len() > 2
+            && rest[0].is_ascii_alphabetic()
+            && rest[1] == b':'
+            && (rest[2] == b'\\' || rest[2] == b'/');
+        (drive || rest.first() == Some(&b'/')) && i <= last_space
+    })
 }
 
 /// Parse the trailing `/path/file.c:42[:7]` token from a sanitizer frame.
@@ -1548,13 +2214,15 @@ called `Option::unwrap()` on a `None` value
     #[test]
     fn an_unrecognised_ubsan_check_is_reported_generically_not_dropped() {
         let stderr = "/src/t.c:9:3: runtime error: \
-                      execution reached an unreachable program point\n\
+                      a check this parser has never seen\n\
                       SUMMARY: UndefinedBehaviorSanitizer: undefined-behavior /src/t.c:9:3\n";
         let report = parse_sanitizer_report(stderr).expect("must not be dropped");
-        assert_eq!(report.rule_id, "BHF-210");
+        assert_eq!(report.rule_id, "BHF-213");
         assert_eq!(report.kind, "undefined-behavior");
         assert!(
-            report.message.contains("unreachable program point"),
+            report
+                .message
+                .contains("a check this parser has never seen"),
             "the exact check must survive in the message: {}",
             report.message
         );
@@ -1667,6 +2335,46 @@ t.c:1:1: runtime error: signed integer overflow: 2 + 2147483647
         assert!(r.stack[0].file.is_none());
     }
 
+    /// A source path with spaces (a Windows profile, `My Projects`) stays one
+    /// location: the frame's function is only the symbol before it.
+    #[test]
+    fn parse_stack_frame_keeps_a_spaced_windows_or_posix_path_whole() {
+        let stderr = "\
+==1==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x118c6c6a00b8
+    #0 0x7ff7c3a9540b in parse_record C:\\Users\\Some One\\My Projects\\widget\\src\\widget.c:25
+    #1 0x7ff7c3a93d7f in bhf_run_one C:/work dir/harnesses/H-1/main.c:83:7
+    #2 0x4ff in Widget::size(int) const /home/some one/src/widget.cpp:12
+    #3 0x4ff in main /src/plain.c:9
+";
+        let r = parse_sanitizer_report(stderr).unwrap();
+        let frames: Vec<(&str, Option<&str>, Option<u32>)> = r
+            .stack
+            .iter()
+            .map(|f| (f.function.as_str(), f.file.as_deref(), f.line))
+            .collect();
+        assert_eq!(
+            frames,
+            vec![
+                (
+                    "parse_record",
+                    Some("C:\\Users\\Some One\\My Projects\\widget\\src\\widget.c"),
+                    Some(25)
+                ),
+                (
+                    "bhf_run_one",
+                    Some("C:/work dir/harnesses/H-1/main.c"),
+                    Some(83)
+                ),
+                (
+                    "Widget::size(int) const",
+                    Some("/home/some one/src/widget.cpp"),
+                    Some(12)
+                ),
+                ("main", Some("/src/plain.c"), Some(9)),
+            ]
+        );
+    }
+
     #[test]
     fn parse_asan_uaf_maps_to_bhf202() {
         let stderr = "==1==ERROR: AddressSanitizer: heap-use-after-free on address 0x...";
@@ -1710,10 +2418,10 @@ t.c:1:1: runtime error: signed integer overflow: 2 + 2147483647
     }
 
     #[test]
-    fn parse_ubsan_oob_index_maps_to_bhf201() {
+    fn parse_ubsan_oob_index_maps_to_the_array_index_rule() {
         let stderr = "t.c:7:9: runtime error: index 88 out of bounds for type 'char[4]'";
         let r = parse_sanitizer_report(stderr).unwrap();
-        assert_eq!(r.rule_id, "BHF-201");
+        assert_eq!(r.rule_id, "BHF-220");
         assert_eq!(r.kind, "out-of-bounds-access");
     }
 
@@ -1840,5 +2548,535 @@ ERROR: AddressSanitizer: heap-buffer-overflow on 0x0
         let r = parse_sanitizer_report(stderr).unwrap();
         let names: Vec<&str> = r.stack.iter().map(|f| f.function.as_str()).collect();
         assert_eq!(names, vec!["a", "b", "c", "d", "e", "f"]);
+    }
+
+    /// A heap-use-after-free report as clang 18 prints it: the crash stack, then
+    /// the address description, then the `freed by` and `previously allocated
+    /// by` stacks, each its own section.
+    const ASAN_USE_AFTER_FREE: &str = "\
+=================================================================
+==7==ERROR: AddressSanitizer: heap-use-after-free on address 0x504000000054 at pc 0x63955aad1eb2 bp 0x7ffc90b151b0 sp 0x7ffc90b151a8
+READ of size 4 at 0x504000000054 thread T0
+    #0 0x63955aad1eb1 in Widget::parse_record(unsigned char const*) /src/widget/parser.cc:11:50
+    #1 0x63955aad1f00 in bhf_run_one /work/harnesses/H-1/main.cpp:40:5
+    #2 0x70481002a1c9 in __libc_start_call_main csu/../sysdeps/nptl/libc_start_call_main.h:58:16
+    #3 0x70481002a28a in __libc_start_main csu/../csu/libc-start.c:360:3
+    #4 0x63955a9f8344 in _start (/work/harnesses/H-1/main+0x2c344) (BuildId: 77f846b4e182f35c0b68b778e8e92e529f5310a3)
+
+0x504000000054 is located 4 bytes inside of 40-byte region [0x504000000050,0x504000000078)
+freed by thread T0 here:
+    #0 0x63955aa92efa in free (/work/harnesses/H-1/main+0xc6efa) (BuildId: 77f846b4e182f35c0b68b778e8e92e529f5310a3)
+    #1 0x63955aad1d69 in Widget::reset() /src/widget/parser.cc:30:3
+
+previously allocated by thread T0 here:
+    #0 0x63955aa93193 in malloc (/work/harnesses/H-1/main+0xc7193) (BuildId: 77f846b4e182f35c0b68b778e8e92e529f5310a3)
+    #1 0x63955aad1d56 in Widget::Widget() /src/widget/parser.cc:22:14
+
+SUMMARY: AddressSanitizer: heap-use-after-free /src/widget/parser.cc:11:50 in Widget::parse_record(unsigned char const*)
+Shadow bytes around the buggy address:
+  0x503ffffffd80: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+==7==ABORTING
+";
+
+    const ASAN_HEAP_OVERFLOW: &str = "\
+==9==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x502000000015 at pc 0x560cbeb6ebc9 bp 0x7ffe5987e150 sp 0x7ffe5987e148
+READ of size 4 at 0x502000000015 thread T0
+    #0 0x560cbeb6ebc8 in copy_at /src/widget/copy.c:9:41
+    #1 0x560cbeb6ec00 in bhf_run_one /work/harnesses/H-2/main.c:12:3
+
+0x502000000015 is located 0 bytes after 5-byte region [0x502000000010,0x502000000015)
+allocated by thread T0 here:
+    #0 0x560cbeb30193 in malloc (/work/harnesses/H-2/main+0xc7193) (BuildId: 77f846b4e182f35c0b68b778e8e92e529f5310a3)
+    #1 0x560cbeb6ea90 in bhf_c_string /work/harnesses/H-2/bhf_decode.h:195:23
+    #2 0x560cbeb6eb00 in bhf_run_one /work/harnesses/H-2/main.c:10:3
+
+SUMMARY: AddressSanitizer: heap-buffer-overflow /src/widget/copy.c:9:41 in copy_at
+";
+
+    #[test]
+    fn asan_crash_stack_excludes_the_free_and_allocation_stacks() {
+        let r = parse_sanitizer_report(ASAN_USE_AFTER_FREE).unwrap();
+        let names: Vec<&str> = r.stack.iter().map(|f| f.function.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "Widget::parse_record(unsigned char const*)",
+                "bhf_run_one",
+                "__libc_start_call_main",
+                "__libc_start_main",
+                "_start",
+            ],
+            "the crash stack is only the frames before the address description"
+        );
+    }
+
+    #[test]
+    fn asan_free_and_allocation_stacks_are_kept_apart() {
+        let r = parse_sanitizer_report(ASAN_USE_AFTER_FREE).unwrap();
+        let access = r.access.expect("a use-after-free records the access");
+        let free: Vec<&str> = access
+            .free_stack
+            .iter()
+            .map(|f| f.function.as_str())
+            .collect();
+        let alloc: Vec<&str> = access
+            .alloc_stack
+            .iter()
+            .map(|f| f.function.as_str())
+            .collect();
+        assert_eq!(free, vec!["free", "Widget::reset()"]);
+        assert_eq!(alloc, vec!["malloc", "Widget::Widget()"]);
+        assert_eq!(access.direction, AccessDirection::Read);
+        assert_eq!(access.size, Some(4));
+        let region = access.region.expect("region");
+        assert_eq!(region.kind, "heap");
+        assert_eq!(region.size, Some(40));
+        assert_eq!(region.relation.as_deref(), Some("inside"));
+        assert_eq!(region.offset, Some(4));
+    }
+
+    #[test]
+    fn a_deep_crash_stack_cannot_push_out_the_allocation_site() {
+        let mut stderr = String::from(
+            "==1==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1\n\
+             WRITE of size 1 at 0x1 thread T0\n",
+        );
+        for i in 0..40 {
+            stderr.push_str(&format!(
+                "    #{i} 0x{i:x} in level_{i} /src/deep.c:{}\n",
+                i + 1
+            ));
+        }
+        stderr.push_str(
+            "\n0x1 is located 0 bytes after 8-byte region [0x0,0x1)\n\
+             allocated by thread T0 here:\n    #0 0x9 in malloc (/bin/h+0x9)\n    \
+             #1 0xa in make_buffer /src/deep.c:99:3\n",
+        );
+        let r = parse_sanitizer_report(&stderr).unwrap();
+        assert!(r.stack.iter().all(|f| f.function.starts_with("level_")));
+        let access = r.access.unwrap();
+        assert_eq!(access.direction, AccessDirection::Write);
+        assert_eq!(access.alloc_stack[1].function, "make_buffer");
+        assert_eq!(access.alloc_stack[1].line, Some(99));
+    }
+
+    #[test]
+    fn asan_heap_overflow_records_region_size_offset_and_allocation_site() {
+        let r = parse_sanitizer_report(ASAN_HEAP_OVERFLOW).unwrap();
+        assert_eq!(r.stack.len(), 2);
+        let access = r.access.expect("access");
+        assert_eq!(access.direction, AccessDirection::Read);
+        assert_eq!(access.size, Some(4));
+        let region = access.region.expect("region");
+        assert_eq!(region.kind, "heap");
+        assert_eq!(region.size, Some(5));
+        assert_eq!(region.relation.as_deref(), Some("after"));
+        assert_eq!(region.distance, Some(0));
+        // 0 bytes past the end of a 5-byte buffer is offset 5 from its start.
+        assert_eq!(region.offset, Some(5));
+        assert_eq!(access.alloc_stack[1].function, "bhf_c_string");
+        assert_eq!(access.alloc_stack[2].line, Some(10));
+        assert_eq!(
+            r.location,
+            Some(SourceLocation {
+                file: "/src/widget/copy.c".to_owned(),
+                line: 9,
+                column: Some(41),
+            }),
+            "the SUMMARY names the crash site"
+        );
+    }
+
+    #[test]
+    fn asan_region_before_the_buffer_has_a_negative_offset() {
+        let stderr = "==1==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x50200000000f\n\
+                      READ of size 1 at 0x50200000000f thread T0\n    #0 0x1 in f /a.c:1\n\n\
+                      0x50200000000f is located 1 bytes before 16-byte region [0x502000000010,0x502000000020)\n";
+        let region = parse_sanitizer_report(stderr)
+            .unwrap()
+            .access
+            .unwrap()
+            .region
+            .unwrap();
+        assert_eq!(region.relation.as_deref(), Some("before"));
+        assert_eq!(region.distance, Some(1));
+        assert_eq!(region.offset, Some(-1));
+        assert_eq!(region.size, Some(16));
+        // Older runtimes say "to the right of" instead of "after".
+        let older = "==1==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1\n\
+                     WRITE of size 2 at 0x1 thread T0\n\n\
+                     0x1 is located 3 bytes to the right of 8-byte region [0x0,0x8)\n";
+        let region = parse_sanitizer_report(older)
+            .unwrap()
+            .access
+            .unwrap()
+            .region
+            .unwrap();
+        assert_eq!(region.relation.as_deref(), Some("after"));
+        assert_eq!(region.offset, Some(11));
+    }
+
+    /// Distances, sizes and frame offsets come from the target's stderr; values
+    /// that do not fit a signed offset leave it unset instead of overflowing.
+    #[test]
+    fn region_numbers_too_large_for_an_offset_leave_it_unset() {
+        let region_of = |stderr: &str| {
+            parse_sanitizer_report(stderr)
+                .unwrap()
+                .access
+                .unwrap()
+                .region
+                .unwrap()
+        };
+        let heap = |description: &str| {
+            format!(
+                "==1==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1\n\
+                 READ of size 1 at 0x1 thread T0\n    #0 0x1 in f /a.c:1\n\n\
+                 0x1 is located {description} region [0x0,0x1)\n"
+            )
+        };
+        let before = heap("9223372036854775809 bytes before 1-byte");
+        let region = region_of(&before);
+        assert_eq!(region.relation.as_deref(), Some("before"));
+        assert_eq!(region.distance, Some(9_223_372_036_854_775_809));
+        assert_eq!(region.offset, None);
+        assert_eq!(relative_offset(&before), None);
+
+        let after = heap("1 bytes after 9223372036854775807-byte");
+        let region = region_of(&after);
+        assert_eq!(region.size, Some(9_223_372_036_854_775_807));
+        assert_eq!(region.offset, None);
+        assert_eq!(relative_offset(&after), Some(1));
+
+        let inside = heap("9223372036854775808 bytes inside of 1-byte");
+        assert_eq!(region_of(&inside).offset, None);
+        assert_eq!(relative_offset(&inside), None);
+
+        // The largest distance before an object that still fits.
+        let edge = heap("9223372036854775808 bytes before 1-byte");
+        assert_eq!(region_of(&edge).offset, Some(i64::MIN));
+        assert_eq!(relative_offset(&edge), Some(i64::MIN));
+
+        let stack = "\
+==3==ERROR: AddressSanitizer: stack-buffer-overflow on address 0x1 at pc 0x1 bp 0x1 sp 0x1
+WRITE of size 1 at 0x1 thread T0
+    #0 0x1 in parse_record /src/rec.c:13:37
+
+Address 0x1 is located in stack of thread T0 at offset 18446744073709551615 in frame
+    #0 0x1 in parse_record /src/rec.c:5
+
+  This frame has 1 object(s):
+    [1, 2) 'buf' (line 13) <== Memory access at offset 18446744073709551615 overflows this variable
+";
+        let region = region_of(stack);
+        assert_eq!(region.frame_offset, Some(u64::MAX));
+        assert_eq!(region.size, Some(1));
+        assert_eq!(region.offset, None);
+        assert_eq!(region.relation, None);
+        assert_eq!(region.distance, None);
+        assert_eq!(region.variable.as_deref(), Some("buf"));
+        assert_eq!(relative_offset(stack), None);
+    }
+
+    #[test]
+    fn asan_stack_overflow_records_the_overflowed_variable() {
+        let stderr = "\
+==3==ERROR: AddressSanitizer: stack-buffer-overflow on address 0x71b444a00024 at pc 0x5b82 bp 0x7ffe sp 0x7ffe
+WRITE of size 1 at 0x71b444a00024 thread T0
+    #0 0x5b8237b350e0 in parse_record /src/widget/rec.c:13:37
+    #1 0x5b8237b35100 in bhf_run_one /work/harnesses/H-3/main.c:20:3
+
+Address 0x71b444a00024 is located in stack of thread T0 at offset 36 in frame
+    #0 0x5b8237b34747 in parse_record /src/widget/rec.c:5
+
+  This frame has 2 object(s):
+    [32, 36) 'buf' (line 13) <== Memory access at offset 36 overflows this variable
+    [48, 56) 'b' (line 19)
+HINT: this may be a false positive if your program uses some custom stack unwind mechanism, swapcontext or vfork
+SUMMARY: AddressSanitizer: stack-buffer-overflow /src/widget/rec.c:13:37 in parse_record
+";
+        let r = parse_sanitizer_report(stderr).unwrap();
+        assert_eq!(
+            r.stack.len(),
+            2,
+            "the frame holding the object is not a crash frame"
+        );
+        let access = r.access.unwrap();
+        assert_eq!(access.direction, AccessDirection::Write);
+        let region = access.region.unwrap();
+        assert_eq!(region.kind, "stack");
+        assert_eq!(region.variable.as_deref(), Some("buf"));
+        assert_eq!(region.size, Some(4));
+        assert_eq!(region.offset, Some(4));
+        assert_eq!(region.relation.as_deref(), Some("after"));
+        assert_eq!(region.distance, Some(0));
+        assert_eq!(region.frame_offset, Some(36));
+        assert_eq!(access.alloc_stack[0].function, "parse_record");
+        assert_eq!(relative_offset(stderr), Some(36));
+    }
+
+    #[test]
+    fn asan_global_overflow_records_the_global_variable() {
+        let stderr = "\
+==4==ERROR: AddressSanitizer: global-buffer-overflow on address 0x5b2ba4b65f88 at pc 0x5b2b bp 0x7ffe sp 0x7ffe
+READ of size 4 at 0x5b2ba4b65f88 thread T0
+    #0 0x5b2ba41d62d3 in lookup /src/widget/table.c:14:20
+
+0x5b2ba4b65f88 is located 0 bytes after global variable 'table' defined in '/src/widget/table.c:4' (0x5b2ba4b65f60) of size 40
+SUMMARY: AddressSanitizer: global-buffer-overflow /src/widget/table.c:14:20 in lookup
+";
+        let region = parse_sanitizer_report(stderr)
+            .unwrap()
+            .access
+            .unwrap()
+            .region
+            .unwrap();
+        assert_eq!(region.kind, "global");
+        assert_eq!(region.variable.as_deref(), Some("table"));
+        assert_eq!(region.size, Some(40));
+        assert_eq!(region.offset, Some(40));
+        assert_eq!(region.relation.as_deref(), Some("after"));
+    }
+
+    #[test]
+    fn asan_segv_records_direction_address_and_hint_tokens() {
+        let stderr = "\
+AddressSanitizer:DEADLYSIGNAL
+==5==ERROR: AddressSanitizer: SEGV on unknown address 0x000000000010 (pc 0x5e04 bp 0x7ffd sp 0x7ffd T0)
+==5==The signal is caused by a WRITE memory access.
+==5==Hint: address points to the zero page.
+    #0 0x5e0421df53ca in set_field /src/widget/obj.c:15:54
+";
+        let access = parse_sanitizer_report(stderr).unwrap().access.unwrap();
+        assert_eq!(access.direction, AccessDirection::Write);
+        assert_eq!(access.address.as_deref(), Some("0x000000000010"));
+        assert_eq!(access.address_hint.as_deref(), Some("zero-page"));
+        let high = "\
+==6==ERROR: AddressSanitizer: SEGV on unknown address (pc 0x64e1 bp 0x7fff sp 0x7fff T0)
+==6==The signal is caused by a READ memory access.
+==6==Hint: this fault was caused by a dereference of a high value address (see register values below).  Disassemble the provided pc to learn which register was used.
+    #0 0x64e1a60d65d0 in store_word /src/widget/obj.c:18:73
+";
+        let access = parse_sanitizer_report(high).unwrap().access.unwrap();
+        assert_eq!(access.address, None);
+        assert_eq!(access.address_hint.as_deref(), Some("high-value-address"));
+        // The direction is a token: a "thread" in the message is not a READ.
+        let unknown = "==7==ERROR: AddressSanitizer: SEGV on unknown address 0x7f0000001000 (pc 0x1 bp 0x2 sp 0x3 T0)\n\
+                       ==7==The signal is caused by a UNKNOWN memory access.\n";
+        let access = parse_sanitizer_report(unknown).unwrap().access.unwrap();
+        assert_eq!(access.direction, AccessDirection::Unknown);
+    }
+
+    /// UBSan with `print_stacktrace=1` and `report_error_type=1`, as clang 18
+    /// prints it.
+    const UBSAN_SHIFT: &str = "\
+src/widget/bits.c:5:15: runtime error: shift exponent 40 is too large for 32-bit type 'int'
+    #0 0x5c2a0657bbab in shift_by(int, int) /work/src/widget/bits.c:5:15
+    #1 0x5c2a0657c2c3 in bhf_run_one /work/harnesses/H-4/main.cpp:15:18
+    #2 0x7b0cfbc2a1c9 in __libc_start_call_main csu/../sysdeps/nptl/libc_start_call_main.h:58:16
+
+SUMMARY: UndefinedBehaviorSanitizer: invalid-shift-exponent src/widget/bits.c:5:15 
+";
+
+    #[test]
+    fn ubsan_report_records_its_location_and_check_name() {
+        let r = parse_sanitizer_report(UBSAN_SHIFT).unwrap();
+        assert_eq!(
+            r.location,
+            Some(SourceLocation {
+                file: "src/widget/bits.c".to_owned(),
+                line: 5,
+                column: Some(15),
+            })
+        );
+        assert_eq!(r.check.as_deref(), Some("invalid-shift-exponent"));
+        assert_eq!(r.stack.len(), 3);
+        assert_eq!(r.stack[0].function, "shift_by(int, int)");
+        // Without report_error_type=1 the SUMMARY names no check.
+        let generic = "/src/a.c:3:5: runtime error: execution reached the end of a value-returning function without returning a value\n\
+                       SUMMARY: UndefinedBehaviorSanitizer: undefined-behavior /src/a.c:3:5 in \n";
+        let r = parse_sanitizer_report(generic).unwrap();
+        assert_eq!(r.check, None);
+        assert_eq!(r.location.as_ref().map(|l| l.line), Some(3));
+        assert!(r.stack.is_empty());
+    }
+
+    #[test]
+    fn ubsan_stack_stops_at_the_end_of_its_report() {
+        // A second, unrelated stack later in the log is not this report's stack.
+        let stderr = format!(
+            "{UBSAN_SHIFT}\n==1==ERROR: LeakSanitizer: detected memory leaks\n\n\
+             Direct leak of 4 byte(s) in 1 object(s) allocated from:\n    \
+             #0 0x1 in malloc (/bin/h+0x1)\n    #1 0x2 in leaky /src/l.c:3\n"
+        );
+        let r = parse_sanitizer_report(&stderr).unwrap();
+        assert_eq!(r.sanitizer, Some(Sanitizer::UndefinedBehaviorSanitizer));
+        assert!(
+            r.stack.iter().all(|f| f.function != "leaky"),
+            "{:?}",
+            r.stack
+        );
+    }
+
+    fn ubsan_report(message: &str, check: Option<&str>) -> String {
+        let summary = check.unwrap_or("undefined-behavior");
+        format!(
+            "/src/widget/w.cc:7:9: runtime error: {message}\n    \
+             #0 0x1 in parse_record /src/widget/w.cc:7:9\n\n\
+             SUMMARY: UndefinedBehaviorSanitizer: {summary} /src/widget/w.cc:7:9 \n"
+        )
+    }
+
+    /// Each UBSan check is its own kind and rule, whether the kind comes from
+    /// UBSan's check name (report_error_type=1) or from the report text.
+    #[test]
+    fn every_ubsan_check_parses_to_its_own_kind_and_rule() {
+        for (message, check, kind, rule) in [
+            ("shift exponent 40 is too large for 32-bit type 'int'", "invalid-shift-exponent", "invalid-shift", "BHF-215"),
+            ("left shift of negative value -5", "invalid-shift-base", "invalid-shift", "BHF-215"),
+            ("execution reached the end of a value-returning function without returning a value", "missing-return", "missing-return", "BHF-214"),
+            ("load of null pointer of type 'int'", "null-pointer-use", "null-pointer-dereference", "BHF-206"),
+            ("index 10 out of bounds for type 'int[4]'", "out-of-bounds-index", "out-of-bounds-access", "BHF-220"),
+            ("signed integer overflow: 2147483647 + 5 cannot be represented in type 'int'", "signed-integer-overflow", "signed-integer-overflow", "BHF-205"),
+            ("division by zero", "integer-divide-by-zero", "division-by-zero", "BHF-222"),
+            ("1e+20 is outside the range of representable values of type 'int'", "float-cast-overflow", "float-cast-overflow", "BHF-218"),
+            ("load of value 7, which is not a valid value for type 'bool'", "invalid-bool-load", "invalid-value-load", "BHF-217"),
+            ("load of value 9, which is not a valid value for type 'Color'", "invalid-enum-load", "invalid-value-load", "BHF-217"),
+            ("execution reached an unreachable program point", "unreachable-call", "unreachable", "BHF-216"),
+            ("variable length array bound evaluates to non-positive value -1", "non-positive-vla-index", "invalid-vla-bound", "BHF-224"),
+            ("implicit conversion from type 'long long' of value 1099511627776 (64-bit, signed) to type 'int' changed the value to 0 (32-bit, signed)", "implicit-signed-integer-truncation", "implicit-conversion", "BHF-225"),
+            ("load of misaligned address 0x7c3938b00021 for type 'int', which requires 4 byte alignment", "misaligned-pointer-use", "misaligned-access", "BHF-226"),
+            ("load of address 0x7ffc8f3e2c10 with insufficient space for an object of type 'int'", "insufficient-object-size", "insufficient-object-size", "BHF-227"),
+            ("passing zero to __builtin_clz(), which is not a valid argument", "invalid-builtin-use", "invalid-builtin-use", "BHF-228"),
+            ("null pointer passed as argument 1, which is declared to never be null", "invalid-null-argument", "null-pointer-dereference", "BHF-206"),
+            ("pointer index expression with base 0x7fffffffffff overflowed to 0x80000000fffe", "pointer-overflow", "pointer-overflow", "BHF-219"),
+            ("call to function parse_record through pointer to incorrect function type 'int (*)(void)'", "function-type-mismatch", "type-mismatch", "BHF-221"),
+        ] {
+            for summary in [Some(check), None] {
+                let r = parse_sanitizer_report(&ubsan_report(message, summary)).unwrap();
+                assert_eq!(r.kind, kind, "{message} ({summary:?})");
+                assert_eq!(r.rule_id, rule, "{message} ({summary:?})");
+                assert_ne!(r.rule_id, "BHF-210");
+            }
+        }
+    }
+
+    #[test]
+    fn the_ubsan_check_name_wins_over_unfamiliar_report_text() {
+        let r = parse_sanitizer_report(&ubsan_report(
+            "a phrasing a future runtime might print",
+            Some("missing-return"),
+        ))
+        .unwrap();
+        assert_eq!((r.kind.as_str(), r.rule_id), ("missing-return", "BHF-214"));
+    }
+
+    /// Classification reads the text after `runtime error:`, never the source
+    /// path before it.
+    #[test]
+    fn a_source_path_never_classifies_a_ubsan_report() {
+        let stderr = "/src/division_by_zero/index_out_of_bounds/zoom_timeout.c:3:5: runtime error: \
+                      execution reached the end of a value-returning function without returning a value\n";
+        let r = parse_sanitizer_report(stderr).unwrap();
+        assert_eq!(r.kind, "missing-return");
+    }
+
+    fn segv(address: &str, direction: &str, hint: &str) -> SanitizerReport {
+        parse_sanitizer_report(&format!(
+            "==1==ERROR: AddressSanitizer: SEGV on unknown address {address}(pc 0x55 bp 0x1 sp 0x2 T0)\n\
+             ==1==The signal is caused by a {direction} memory access.\n{hint}    \
+             #0 0x55 in store_word /src/widget/obj.c:18:73\n"
+        ))
+        .unwrap()
+    }
+
+    /// A NULL dereference faults in the first page; every other SEGV is a wild
+    /// or corrupted pointer, a different defect with its own rule.
+    #[test]
+    fn segv_null_page_and_wild_address_have_different_rules() {
+        let zero_page = "==1==Hint: address points to the zero page.\n";
+        assert_eq!(
+            segv("0x000000000000 ", "READ", zero_page).rule_id,
+            "BHF-206"
+        );
+        assert_eq!(
+            segv("0x000000000010 ", "WRITE", zero_page).rule_id,
+            "BHF-206"
+        );
+        assert_eq!(segv("0x000000000ff8 ", "READ", "").rule_id, "BHF-206");
+        let wild = segv("0x7f0000001000 ", "WRITE", "");
+        assert_eq!(wild.rule_id, "BHF-223");
+        assert_eq!(wild.access.unwrap().direction, AccessDirection::Write);
+        // A non-canonical address faults before the access direction is
+        // known; ASan's READ is then not a direction.
+        let high = segv(
+            "",
+            "READ",
+            "==1==Hint: this fault was caused by a dereference of a high value address (see register values below).\n",
+        );
+        assert_eq!(high.rule_id, "BHF-223");
+        assert!(
+            high.message
+                .ends_with("(READ memory access; high value address)"),
+            "{}",
+            high.message
+        );
+        let access = high.access.unwrap();
+        assert_eq!(access.direction, AccessDirection::Unknown);
+        assert_eq!(access.address_hint.as_deref(), Some("high-value-address"));
+    }
+
+    /// The rule an earlier release recorded for the same report, so a replay
+    /// of an older finding still matches.
+    #[test]
+    fn legacy_rule_ids_cover_reports_whose_rule_changed() {
+        let ub = |message: &str| parse_sanitizer_report(&ubsan_report(message, None)).unwrap();
+        for (report, legacy) in [
+            (ub("execution reached the end of a value-returning function without returning a value"), Some("BHF-210")),
+            (ub("shift exponent 40 is too large for 32-bit type 'int'"), Some("BHF-210")),
+            (ub("index 10 out of bounds for type 'int[4]'"), Some("BHF-201")),
+            (ub("division by zero"), Some("BHF-205")),
+            (ub("load of null pointer of type 'int'"), None),
+            // Earlier releases sent any "cannot be represented in type" text to
+            // the overflow rule, a shift report included.
+            (
+                ub("left shift of 1 by 31 places cannot be represented in type 'int'"),
+                Some("BHF-205"),
+            ),
+            (
+                ub("left shift of negative value -5"),
+                Some("BHF-210"),
+            ),
+            // ...and had no NULL arm for a member call.
+            (
+                ub("member call on null pointer of type 'Widget'"),
+                Some("BHF-210"),
+            ),
+            (ub("applying non-zero offset 8 to null pointer"), None),
+            (segv("0x7f0000001000 ", "WRITE", ""), Some("BHF-206")),
+        ] {
+            assert_eq!(legacy_rule_id(&report), legacy, "{}", report.message);
+        }
+        let heap = parse_sanitizer_report(
+            "==1==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1\n",
+        )
+        .unwrap();
+        assert_eq!(
+            legacy_rule_id(&heap),
+            None,
+            "unchanged rules have no legacy id"
+        );
+        assert!(rule_matches(
+            "BHF-210",
+            &ub("execution reached an unreachable program point")
+        ));
+        assert!(rule_matches(
+            "BHF-216",
+            &ub("execution reached an unreachable program point")
+        ));
+        assert!(!rule_matches(
+            "BHF-202",
+            &ub("execution reached an unreachable program point")
+        ));
     }
 }

@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+# Text is checked out with LF on every host, Windows included. bhf embeds its
+# templates, runtime sources and scripts in its binaries and writes them back
+# out, so a CRLF checkout would put carriage returns into generated harness
+# sources and shell scripts, and tests would read fixtures that differ from
+# the ones Linux reads.
+* text=auto eol=lf
+
+# Windows command scripts keep CRLF line endings.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Stored with CRLF; kept byte for byte.
+benchmarks/campaign-2026-07-08/results/sloc_final.csv -text
+tests/fixtures/build_recovery/fixtures/miniz/LICENSE.md -text
+tests/fixtures/build_recovery/fixtures/miniz_subdir/LICENSE.md -text

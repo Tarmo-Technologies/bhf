@@ -19,6 +19,7 @@
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::path::Path;
+#[cfg(target_os = "linux")]
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -33,6 +34,7 @@ const MIN_EXCESS_MB: u64 = 128;
 const MIN_KB_PER_INPUT_BYTE: u64 = 64;
 /// A resource-profile replay is diagnostic only. A target that does not terminate
 /// is not a useful RSS sample and must not hold the whole auto campaign open.
+#[cfg(target_os = "linux")]
 const REPLAY_TIMEOUT: Duration = Duration::from_secs(10);
 const PROFILE_BUDGET: Duration = Duration::from_secs(30);
 

@@ -89,10 +89,12 @@ fn auto_writes_generated_harnesses_under_harnesses_dir() {
     assert!(work.join("auto").join("run.json").is_file());
 
     let summary = fs::read_to_string(work.join("auto").join("summary.txt")).unwrap();
+    // The summary names the resolved work dir (Windows' temp dir is often an
+    // 8.3 short name).
     assert!(
         summary.contains(&format!(
             "harnesses: {}/<harness-id>/",
-            harness_root.display()
+            cli::workdir::plain_canonical(&harness_root).display()
         )),
         "summary should point users at the harnesses directory:\n{summary}"
     );

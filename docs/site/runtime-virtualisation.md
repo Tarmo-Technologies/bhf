@@ -50,6 +50,52 @@ Each event is appended as one JSONL line to the path in
 `needed_for_build` Layer C and, during built-in fuzzing, to evaluate
 executable oracles against only the events appended by the current input.
 
+Some paths are never logged or faked, even in a faking pass, because a
+sanitizer's symbolizer opens them while it writes a report: the vDSO's
+link-map name (`linux-vdso.so.1`, `linux-gate.so.1`, `linux-vdso64.so.1`),
+separate debug files (`<object>.debug`, `<dir>/.debug/<object>`,
+`/usr/lib/debug/...`) and the names of objects the process has loaded. Once
+AddressSanitizer starts a report (bhf's C/C++ driver defines
+`__asan_on_error`, which tells the shim), the shim fakes nothing more in that
+process: a faked object handed to GCC's static libasan symbolizer made it
+abort its own report, so the finding lost its stack and came back a second
+time. A target that defines `__asan_on_error` itself would not link with the
+driver's definition; add `-DBHF_NO_ASAN_ON_ERROR` to `toolchain.cflags`
+(`--cflags`), which leaves the hook to the target.
+
+`fopen` and `fopen64` are hooked too: glibc's `fopen` opens the file
+through an internal call that the `open` hook never sees. They log the same
+open and missing-file events as `open`, under their own event names (`fopen`,
+`fopen64`); a missing file is reported, not replaced by a fake one. `fdopen`
+logs an `fdopen` event naming the descriptor it wraps, and `fclose` logs the
+`close` of the stream's descriptor, which glibc closes internally (nothing
+for an invalid stream, `EBADF`), so a file opened and closed through stdio is
+not reported as leaked.
+
+Besides `printf`, `fprintf`, `dprintf`, `sprintf` and `snprintf`, the format
+hooks cover `asprintf`, the `va_list` forms (`vprintf`, `vfprintf`,
+`vsprintf`, `vsnprintf`, `vdprintf`, `vasprintf`) and the fortified
+`__*printf_chk` entry points. Each event names the variadic API
+(`vfprintf` and `__fprintf_chk` log as `fprintf`), so a format is named the
+same in a plain, a fortified and a sanitized build: a sanitizer's `printf`
+interceptor forwards to the `vprintf` it resolves with `dlsym(RTLD_NEXT)`,
+which is the shim's. In an
+AddressSanitizer harness the sanitizer runtime defines `fopen` in the
+executable and resolves the real one with `dlsym(RTLD_NEXT, "fopen")`; the
+shim's `dlsym` hook answers that call, from an object loaded before the shim,
+with the shim's own `fopen` hook, as `RTLD_NEXT` means, so the hook runs there
+as well.
+
+The sanitizer runtime also defines `strcmp`, `strncmp`, `memcmp` and `bcmp`
+in a sanitized executable, so the shim's comparison hooks do not run there.
+bhf's C/C++ driver writes the same `cmplog` records from the sanitizer's
+comparison hooks instead (they also cover `bcmp` and the `strcasecmp` family),
+once per distinct operand pair per process, leaving out comparisons the shim
+makes inside its own hooks. `strcmp`-family calls made by libc or a preloaded
+library are left out as well; `memcmp` and `bcmp` calls are not, because the
+sanitizer's interceptor reports a position inside itself rather than its
+caller's.
+
 ### Collector-shaped view (`--collector auto` on Linux, #60)
 
 The same shim events also back the platform-neutral runtime-event collector on
@@ -110,7 +156,8 @@ in the parent shell.
 | `BHF_FUZZ_INPUT_LEN` | harness | shim | Length of the fuzz input in the shared memfd |
 | `BHF_DISABLE_DLOPEN_FAKE` | user | shim | Opt out of synthetic `dlopen` / `dlsym` handles when a target uses struct-return-by-value through `dlsym` |
 | `BHF_FAKE_IDENTITY` | auto (replay) | shim | Enable deterministic `getpid`/`getuid`/`getgid`/`getppid` constants |
-| `BHF_CMPLOG` | auto | shim | Enable `strcmp`/`strncmp`/`memcmp` comparison-operand recording (cmplog / RedQueen) |
+| `BHF_CMPLOG` | auto | shim, C/C++ driver | Enable `strcmp`/`strncmp`/`memcmp` comparison-operand recording (cmplog / RedQueen) into `BHF_RUNTRACE_LOG` |
+| `BHF_CMP_EVIDENCE` | bhf (capture replays) | C/C++ driver | File the driver records every comparison of one run into, for the comparison evidence of a finding's input; unset during fuzzing |
 | `LD_PRELOAD` | auto | dynamic linker | Always includes the absolute path to `libbhf_runtrace.so`. Pre-existing values are preserved. |
 
 `bhf auto` locates the shim by searching alongside the `bhf` binary.
@@ -205,6 +252,11 @@ append `runtime_check` events for handled `Constraint_Error` range/index checks,
 executable-oracle path promotes them to `ada-runtime-constraint-check` BHF-102,
 `ada-runtime-storage-error` BHF-103, `ada-runtime-tasking-error` BHF-104, or
 `ada-runtime-user-exception` BHF-105 findings with handler/source evidence.
+
+The resource-leak oracle (BHF-306) is named for the harness it watched:
+`resource-leak` (exception `ORACLE_RESOURCE_LEAK`) for a C, C++ or other
+native harness, `resource-leak-ada` (`ORACLE_RESOURCE_LEAK_ADA`) for an Ada
+one.
 
 ### Runtime confirmation
 

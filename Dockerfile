@@ -27,7 +27,7 @@
 # The package comes from that snapshot (UBUNTU_SNAPSHOT below): the archive
 # pool drops a version once it is superseded, the snapshot keeps it.
 FROM ubuntu:24.04@sha256:ac3a3d13e90c660a1cb3e89ec695533399f7378dc1ae5fbdc28eb5781d561594 AS certificates
-ADD --checksum=sha256:8a0a754aaafed72cc8efb8c1731808133284a84fbfc76a4fcc73fce9e01b4187 https://snapshot.ubuntu.com/ubuntu/20261023T000000Z/pool/main/c/ca-certificates/ca-certificates_20260816ubuntu0.24.04.1_all.deb /tmp/ca.deb
+ADD --checksum=sha256:f9fbacd417b515450b831032cc39d18059e9874e67525679a43c16071dabf9a0 https://snapshot.ubuntu.com/ubuntu/20261111T000000Z/pool/main/c/ca-certificates/ca-certificates_20260816ubuntu0.24.04.2_all.deb /tmp/ca.deb
 RUN dpkg-deb -x /tmp/ca.deb /tmp/ca \
     && mkdir /certificates \
     && cat /tmp/ca/usr/share/ca-certificates/mozilla/*.crt > /certificates/ca-certificates.crt
@@ -36,8 +36,11 @@ FROM ubuntu:24.04@sha256:ac3a3d13e90c660a1cb3e89ec695533399f7378dc1ae5fbdc28eb57
 COPY --from=certificates /certificates/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 ARG TARGETARCH
 COPY docker/toolchain-platform.sh /usr/local/share/bhf/toolchain-platform.sh
-ARG UBUNTU_SNAPSHOT=20261023T000000Z
-RUN printf 'APT::Snapshot "%s";\nAPT::Update::Error-Mode "any";\n' "${UBUNTU_SNAPSHOT}" > /etc/apt/apt.conf.d/50snapshot
+ARG UBUNTU_SNAPSHOT=20261111T000000Z
+# The snapshot service answers 503 under load; retry each fetch with backoff
+# instead of failing the whole build on one busy response.
+RUN printf 'APT::Snapshot "%s";\nAPT::Update::Error-Mode "any";\n' "${UBUNTU_SNAPSHOT}" > /etc/apt/apt.conf.d/50snapshot \
+    && printf 'Acquire::Retries "10";\nAcquire::Retries::Delay::Maximum "60";\n' > /etc/apt/apt.conf.d/80retries
 # Ubuntu ports sources do not opt into APT's snapshot selector. Use an
 # explicit snapshot URL on ARM64 and avoid filtering it a second time.
 RUN if [ "$TARGETARCH" = arm64 ]; then \
@@ -56,7 +59,7 @@ RUN source /usr/local/share/bhf/toolchain-platform.sh; bhf_toolchain_platform "$
     mkdir -p /out/usr/local/bin /out/usr/share/bhf/licenses/javascript; \
     if bhf_has_language "$languages" javascript || bhf_has_language "$languages" typescript; then \
       apt-get update && apt-get install -y --no-install-recommends ca-certificates curl xz-utils \
-      && curl --proto '=https' --tlsv1.2 -fsSLo /tmp/node.tar.xz "https://nodejs.org/dist/v24.21.0/node-v24.21.0-linux-${BHF_NODE_ARCH}.tar.xz" \
+      && curl --proto '=https' --tlsv1.2 -fsSLo /tmp/node.tar.xz "https://nodejs.org/dist/v24.22.3/node-v24.22.3-linux-${BHF_NODE_ARCH}.tar.xz" \
       && echo "${BHF_NODE_SHA256}  /tmp/node.tar.xz" | sha256sum -c - \
       && mkdir -p /opt/node && tar -xJf /tmp/node.tar.xz --strip-components=1 -C /opt/node \
       && cp /opt/node/bin/node /out/usr/local/bin/node \
@@ -145,7 +148,7 @@ RUN source /usr/local/share/bhf/language-selection.sh; \
     && printf '%s\n' "$BHF_ENGINES" > /usr/local/share/bhf/selected-engines.txt
 
 # Go from upstream (pinned + checksum-verified).
-ARG GO_VERSION=1.27.3
+ARG GO_VERSION=1.27.4
 RUN source /usr/local/share/bhf/language-selection.sh; \
     languages="$(cat /usr/local/share/bhf/selected-languages.txt)"; \
     if bhf_has_language "$languages" go; then \
@@ -159,9 +162,9 @@ RUN source /usr/local/share/bhf/language-selection.sh; \
     fi
 
 # .NET SDK from Microsoft's release archive (pinned + checksum-verified).
-# Ubuntu noble still ships 8.0.131, which bundles NuGet assemblies with fixed
-# CVEs; 8.0.132 (runtime 8.0.32) carries the fixes.
-ARG DOTNET_SDK_VERSION=8.0.132
+# Ubuntu noble's dotnet8 package has lagged Microsoft's security releases;
+# 8.0.134 (runtime 8.0.34) carries the current fixes.
+ARG DOTNET_SDK_VERSION=8.0.134
 RUN source /usr/local/share/bhf/language-selection.sh; \
     languages="$(cat /usr/local/share/bhf/selected-languages.txt)"; \
     if bhf_has_language "$languages" csharp; then \

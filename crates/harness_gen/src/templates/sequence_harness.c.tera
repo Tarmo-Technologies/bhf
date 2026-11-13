@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* generated_harnesses/{{ harness_id }}/main.c */
+/* bhf harness format {{ harness_format_version }}{% if buffer_len_dimension %} with an explicit buffer length{% endif %} */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -24,6 +25,8 @@
 #ifdef getenv
 #undef getenv
 #endif
+/* BHF_TRACE_ARGS=1 prints each decoded argument to stderr (bhf_trace.h). */
+#include "bhf_trace.h"
 
 /* Sanitizer-runtime callbacks (edge coverage + cmplog operand capture, #400)
  * must never be instrumented themselves: with `-fsanitize-coverage=trace-cmp`
@@ -32,7 +35,16 @@
 #ifndef BHF_NOCOV
 #if defined(__has_attribute)
 #if defined(__clang__) && __has_attribute(no_sanitize)
+#if defined(_WIN32)
+/* On Windows AddressSanitizer's interceptors call the comparison hooks
+ * below before the program starts, while its shadow memory is still being
+ * set up, so an instrumented hook faulted there and the process died before
+ * main (a clean input exited with an access violation). They are not
+ * address-checked: they read only the bytes the compare read. */
+#define BHF_NOCOV __attribute__((no_sanitize("coverage", "address")))
+#else
 #define BHF_NOCOV __attribute__((no_sanitize("coverage")))
+#endif
 #elif __has_attribute(no_sanitize_coverage)
 #define BHF_NOCOV __attribute__((no_sanitize_coverage))
 #elif __has_attribute(no_sanitize)
@@ -159,6 +171,9 @@ static BHF_NOCOV void _bhf_callback_observe(void *context) {
 {%- endif %}
 
 {%- if emit_forward_declaration %}
+{%- for tag in forward_tags %}
+{{ tag }};
+{%- endfor %}
 {%- if init_step %}
 extern {{ init_step.return_type }} {{ init_step.name }}({% if not handle_is_pointer_value %}{{ handle_param_type }}{% if init_step.params | length > 0 %}, {% endif %}{% endif %}{% for p in init_step.params %}{{ p.c_type }}{% if not loop.last %}, {% endif %}{% endfor %});
 {%- endif %}
@@ -311,8 +326,8 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
 {%- if init_out_handle %}
     {{ init_step.return_type }} {{ init_step.result_name }} = {{ init_step.name }}({% for p in init_step.params %}{{ p.arg }}{% if not loop.last %}, {% endif %}{% endfor %});
 {%- elif not init_returns_handle %}
-{%- for p in init_step.params %}
-    {{ p.decl }};
+{%- for d in init_step.decode %}
+    {{ d }};
 {%- endfor %}
     {% if init_step.return_type_present %}{{ init_step.return_type }} {{ init_step.result_name }} = {% endif %}{{ init_step.name }}(&_bhf_handle{% for p in init_step.params %}, {{ p.arg }}{% endfor %});
 {%- else %}
@@ -323,6 +338,9 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
     BHF_KEEP_RESULT({{ init_step.result_name }});
 {%- endif %}
 {%- endif %}
+{%- for d in init_step.after %}
+    {{ d }};
+{%- endfor %}
 {%- for p in init_step.params %}
 {%- if p.free %}
     {{ p.free }};
@@ -348,8 +366,8 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
      * program only performs this by luck, and without it a reader supports no
      * formats and a parser has no handlers installed — so most executions never
      * reach the code the target exists to run. */
-{%- for p in step.params %}
-    {{ p.decl }};
+{%- for d in step.decode %}
+    {{ d }};
 {%- endfor %}
     {% if step.return_type_present %}{{ step.return_type }} {{ step.result_name }} = {% endif %}{{ step.name }}({{ step.receiver }}{% for p in step.params %}, {% if step.callback_context_arg == loop.index0 %}{{ step.receiver }}{% else %}{{ p.arg }}{% endif %}{% endfor %});
 {%- if step.return_type_present %}
@@ -363,12 +381,15 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
      * reaches the format, filter, decompression, and payload paths. A random op
      * permutation almost never preserves those dependencies. */
     int _bhf_handle_live = 1;
-{%- for p in expert_stream_pump.open_step.params %}
-    {{ p.decl }};
+{%- for d in expert_stream_pump.open_step.decode %}
+    {{ d }};
 {%- endfor %}
     BHF_TARGET_ENTER();
     {{ expert_stream_pump.open_step.return_type }} {{ expert_stream_pump.open_step.result_name }} = {{ expert_stream_pump.open_step.name }}({{ expert_stream_pump.open_step.receiver }}{% for p in expert_stream_pump.open_step.params %}, {{ p.arg }}{% endfor %});
     BHF_KEEP_RESULT({{ expert_stream_pump.open_step.result_name }});
+{%- for d in expert_stream_pump.open_step.after %}
+    {{ d }};
+{%- endfor %}
 {%- for p in expert_stream_pump.open_step.params %}
 {%- if p.free %}
     {{ p.free }};
@@ -388,11 +409,14 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
 {%- endif %}
         unsigned char {{ expert_stream_pump.data_buffer_name }}[{{ expert_stream_pump.data_buffer_bytes }}];
         for (size_t _bhf_entry_index = 0; _bhf_entry_index < {{ expert_stream_pump.entry_cap }}; ++_bhf_entry_index) {
-{%- for p in expert_stream_pump.header_step.params %}
-            {{ p.decl }};
+{%- for d in expert_stream_pump.header_step.decode %}
+            {{ d }};
 {%- endfor %}
             {{ expert_stream_pump.header_step.return_type }} {{ expert_stream_pump.header_step.result_name }} = {{ expert_stream_pump.header_step.name }}({{ expert_stream_pump.header_step.receiver }}{% for p in expert_stream_pump.header_step.params %}, {{ p.arg }}{% endfor %});
             BHF_KEEP_RESULT({{ expert_stream_pump.header_step.result_name }});
+{%- for d in expert_stream_pump.header_step.after %}
+            {{ d }};
+{%- endfor %}
 {%- for p in expert_stream_pump.header_step.params %}
 {%- if p.free %}
             {{ p.free }};
@@ -439,13 +463,16 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
      * and the bounded loop drains more than the first parser event. */
     int _bhf_handle_live = 1;
     for (size_t _bhf_drain_index = 0; _bhf_drain_index < {{ expert_output_drain.iteration_cap }}; ++_bhf_drain_index) {
-{%- for p in expert_output_drain.target_step.params %}
-        {{ p.decl }};
+{%- for d in expert_output_drain.target_step.decode %}
+        {{ d }};
 {%- endfor %}
         BHF_TARGET_ENTER();
         {{ expert_output_drain.target_step.return_type }} {{ expert_output_drain.target_step.result_name }} = {{ expert_output_drain.target_step.name }}({{ expert_output_drain.target_step.receiver }}{% for p in expert_output_drain.target_step.params %}, {{ p.arg }}{% endfor %});
         BHF_KEEP_RESULT({{ expert_output_drain.target_step.result_name }});
         if ({{ expert_output_drain.target_step.result_name }} {% if expert_output_drain.success_nonzero %}== 0{% else %}!= 0{% endif %}) {
+{%- for d in expert_output_drain.target_step.after %}
+            {{ d }};
+{%- endfor %}
 {%- for p in expert_output_drain.target_step.params %}
 {%- if p.free %}
             {{ p.free }};
@@ -455,6 +482,9 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
         }
         int _bhf_drain_done = {{ expert_output_drain.output_value }}.{{ expert_output_drain.terminal_field }} == {{ expert_output_drain.terminal_value }};
         {{ expert_output_drain.cleanup_name }}({{ expert_output_drain.output_pointer }});
+{%- for d in expert_output_drain.target_step.after %}
+        {{ d }};
+{%- endfor %}
 {%- for p in expert_output_drain.target_step.params %}
 {%- if p.free %}
         {{ p.free }};
@@ -469,10 +499,8 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
      * literals remain intact: for streaming parsers, feed(..., 0) followed by
      * feed(..., 1) is a state transition, not a duplicate operation. */
 {%- for step in mined_protocol_steps %}
-{%- for p in step.params %}
-{%- if p.decl %}
-    {{ p.decl }};
-{%- endif %}
+{%- for d in step.decode %}
+    {{ d }};
 {%- endfor %}
 {%- if step.condition and step.return_type_present %}
     {{ step.return_type }} {{ step.result_name }} = {0};
@@ -490,6 +518,9 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
 {%- if step.condition %}
     }
 {%- endif %}
+{%- for d in step.after %}
+    {{ d }};
+{%- endfor %}
 {%- for p in step.params %}
 {%- if p.free %}
     {{ p.free }};
@@ -514,10 +545,8 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
      * constructor and every argument were checked against the discovered API;
      * drive the resulting independent/derived object through the same expert
      * protocol, then release it before continuing with the primary handle. */
-{%- for p in object.constructor.params %}
-{%- if p.decl %}
-    {{ p.decl }};
-{%- endif %}
+{%- for d in object.constructor.decode %}
+    {{ d }};
 {%- endfor %}
     {{ object.constructor.return_type }} {{ object.handle_name }} = {{ object.constructor.name }}({% if object.constructor_uses_parent %}{{ object.constructor.receiver }}{% if object.constructor.params | length > 0 %}, {% endif %}{% endif %}{% for p in object.constructor.params %}{{ p.arg }}{% if not loop.last %}, {% endif %}{% endfor %});
     if ({{ object.handle_name }}) {
@@ -525,10 +554,8 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
         {{ step.name }}({{ object.handle_name }}{% for p in step.params %}, {% if step.callback_context_arg == loop.index0 %}{{ object.handle_name }}{% else %}{{ p.arg }}{% endif %}{% endfor %});
 {%- endfor %}
 {%- for step in object.protocol_steps %}
-{%- for p in step.params %}
-{%- if p.decl %}
-        {{ p.decl }};
-{%- endif %}
+{%- for d in step.decode %}
+        {{ d }};
 {%- endfor %}
 {%- if step.condition and step.return_type_present %}
         {{ step.return_type }} {{ step.result_name }} = {0};
@@ -546,6 +573,9 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
 {%- if step.condition %}
         }
 {%- endif %}
+{%- for d in step.after %}
+        {{ d }};
+{%- endfor %}
 {%- for p in step.params %}
 {%- if p.free %}
         {{ p.free }};
@@ -553,15 +583,16 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
 {%- endfor %}
 {%- endfor %}
 {%- if object.end_step %}
-{%- for p in object.end_step.params %}
-{%- if p.decl %}
-        {{ p.decl }};
-{%- endif %}
+{%- for d in object.end_step.decode %}
+        {{ d }};
 {%- endfor %}
         {% if object.end_step.return_type_present %}{{ object.end_step.return_type }} {{ object.end_step.result_name }} = {% endif %}{{ object.end_step.name }}({{ object.end_step.receiver }}{% for p in object.end_step.params %}, {{ p.arg }}{% endfor %});
 {%- if object.end_step.return_type_present %}
         BHF_KEEP_RESULT({{ object.end_step.result_name }});
 {%- endif %}
+{%- for d in object.end_step.after %}
+        {{ d }};
+{%- endfor %}
 {%- for p in object.end_step.params %}
 {%- if p.free %}
         {{ p.free }};
@@ -569,6 +600,9 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
 {%- endfor %}
 {%- endif %}
     }
+{%- for d in object.constructor.after %}
+    {{ d }};
+{%- endfor %}
 {%- for p in object.constructor.params %}
 {%- if p.free %}
     {{ p.free }};
@@ -653,8 +687,8 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
              * It must be torn down before another child is created. */
             if (_bhf_derived_live) { break; }
 {%- endif %}
-{%- for p in step.params %}
-            {{ p.decl }};
+{%- for d in step.decode %}
+            {{ d }};
 {%- endfor %}
 {%- if loop.first %}
             BHF_TARGET_ENTER();
@@ -696,6 +730,9 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
             _bhf_handle_live = 1;
 {%- endif %}
 {%- endif %}
+{%- for d in step.after %}
+            {{ d }};
+{%- endfor %}
 {%- for p in step.params %}
 {%- if p.free %}
             {{ p.free }};
@@ -721,13 +758,16 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
      * Leaving it would be a leak the HARNESS caused, and under LeakSanitizer
      * that reads as a finding in the target. */
     if (_bhf_derived_live) {
-{%- for p in end_step.params %}
-        {{ p.decl }};
+{%- for d in end_step.decode %}
+        {{ d }};
 {%- endfor %}
         {% if end_step.return_type_present %}{{ end_step.return_type }} _bhf_derived_end = {% endif %}{{ end_step.name }}(_bhf_derived{% for p in end_step.params %}, {{ p.arg }}{% endfor %});
 {%- if end_step.return_type_present %}
         BHF_KEEP_RESULT(_bhf_derived_end);
 {%- endif %}
+{%- for d in end_step.after %}
+        {{ d }};
+{%- endfor %}
 {%- for p in end_step.params %}
 {%- if p.free %}
         {{ p.free }};
@@ -740,13 +780,16 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
      * the loop above may already have released it, and closing twice is a
      * double-free the harness would be committing itself. */
     if (_bhf_handle_live) {
-{%- for p in end_step.params %}
-    {{ p.decl }};
+{%- for d in end_step.decode %}
+    {{ d }};
 {%- endfor %}
     {% if end_step.return_type_present %}{{ end_step.return_type }} {{ end_step.result_name }} = {% endif %}{{ end_step.name }}({% if handle_is_pointer_value %}_bhf_handle{% else %}&_bhf_handle{% endif %}{% for p in end_step.params %}, {{ p.arg }}{% endfor %});
 {%- if end_step.return_type_present %}
     BHF_KEEP_RESULT({{ end_step.result_name }});
 {%- endif %}
+{%- for d in end_step.after %}
+    {{ d }};
+{%- endfor %}
 {%- for p in end_step.params %}
 {%- if p.free %}
     {{ p.free }};
@@ -898,11 +941,19 @@ BHF_NOCOV static void *bhf_map_shared(const char *path, size_t size) {
 }
 
 #ifdef _WIN32
-/* No ASan on mingw: a vectored exception handler converts a fatal fault into an
- * immediate, distinctive exit so the engine detects a crash under wine instead
- * of the process hanging in wine's debugger dialog — bhf's ASan substitute. */
+/* Report only unhandled exceptions. First-chance exceptions can be handled by
+ * the target or by ASan (including its shadow-memory allocation), so treating
+ * them as crashes makes a valid sanitized harness reject every input. Chain
+ * the previous unhandled filter so ASan retains its diagnostics, then provide
+ * a distinctive exit instead of a debugger dialog for unsanitized builds
+ * (mingw under wine has no ASan; this is its crash signal). */
 #define BHF_WIN_CRASH_EXIT 0x39
-BHF_NOCOV static LONG CALLBACK bhf_win_veh(EXCEPTION_POINTERS *info) {
+static LPTOP_LEVEL_EXCEPTION_FILTER bhf_win_previous_filter;
+BHF_NOCOV static LONG WINAPI bhf_win_unhandled(EXCEPTION_POINTERS *info) {
+    if (bhf_win_previous_filter) {
+        LONG handled = bhf_win_previous_filter(info);
+        if (handled == EXCEPTION_CONTINUE_EXECUTION) return handled;
+    }
     DWORD code = info->ExceptionRecord->ExceptionCode;
     switch (code) {
     case EXCEPTION_ACCESS_VIOLATION:
@@ -914,13 +965,13 @@ BHF_NOCOV static LONG CALLBACK bhf_win_veh(EXCEPTION_POINTERS *info) {
         fprintf(stderr, "BHF_CRASH code=0x%lx\n", (unsigned long)code);
         fflush(stderr);
         TerminateProcess(GetCurrentProcess(), BHF_WIN_CRASH_EXIT);
-        return EXCEPTION_CONTINUE_SEARCH;
+        return EXCEPTION_CONTINUE_SEARCH; /* unreachable */
     default:
         return EXCEPTION_CONTINUE_SEARCH;
     }
 }
 BHF_NOCOV static void bhf_win_install_crash_handler(void) {
-    AddVectoredExceptionHandler(1, bhf_win_veh);
+    bhf_win_previous_filter = SetUnhandledExceptionFilter(bhf_win_unhandled);
 }
 #endif
 

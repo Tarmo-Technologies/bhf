@@ -12,7 +12,9 @@ fn tempdir(name: &str) -> PathBuf {
         .as_nanos();
     let dir = std::env::temp_dir().join(format!("bhf-auto-target-{name}-{nonce}"));
     fs::create_dir_all(&dir).expect("create tempdir");
-    dir
+    // Resolved, as `bhf auto` resolves the tree it scans: a harness id hashes
+    // the source path, and Windows' temp dir is often an 8.3 short name.
+    cli::workdir::plain_canonical(&dir)
 }
 
 fn read_run_json(work_dir: &Path) -> serde_json::Value {
@@ -103,7 +105,11 @@ int parse_packet(const unsigned char *data, unsigned long len) {
     let targets = run_json["targets"].as_array().expect("targets array");
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0]["name"], "parse_packet");
-    assert!(targets[0]["source"].as_str().unwrap().ends_with("/one.c"));
+    assert!(targets[0]["source"]
+        .as_str()
+        .unwrap()
+        .replace('\\', "/")
+        .ends_with("/one.c"));
 }
 
 #[test]
@@ -196,6 +202,7 @@ int test_only_target(const unsigned char *data, unsigned long len) {
     assert!(targets[0]["source"]
         .as_str()
         .unwrap()
+        .replace('\\', "/")
         .ends_with("/src/packet.c"));
 }
 
@@ -255,5 +262,6 @@ int example_target(const unsigned char *data, unsigned long len) {
     assert!(targets[0]["source"]
         .as_str()
         .unwrap()
+        .replace('\\', "/")
         .ends_with("/src/packet.c"));
 }

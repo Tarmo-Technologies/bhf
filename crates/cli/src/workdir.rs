@@ -4,20 +4,79 @@
 
 use std::path::{Path, PathBuf};
 
-/// Migrate a legacy (<= 0.2.x) work dir into the results layout, logging once.
-/// A missing work dir is fine (the command creates it).
+/// Migrate a legacy (<= 0.2.x) work dir into the results layout, saying what
+/// changed. A missing work dir is fine (the command creates it).
 pub fn prepare(work_dir: &Path) -> anyhow::Result<()> {
+    prepare_with(work_dir, true)
+}
+
+/// [`prepare`] for a command that only reads the work dir (`bhf explain`): it
+/// migrates a legacy layout but does not rebuild `results/`, and its migration
+/// message ends by naming the command that does.
+pub fn prepare_read_only(work_dir: &Path) -> anyhow::Result<()> {
+    prepare_with(work_dir, false)
+}
+
+fn prepare_with(work_dir: &Path, rebuilds_results: bool) -> anyhow::Result<()> {
     if !work_dir.exists() {
         return Ok(());
     }
-    if results::migrate::migrate_legacy(work_dir)? == results::migrate::MigrationOutcome::Migrated {
-        crate::bhfeprintln!(
-            "bhf: migrated legacy {}/findings/ to {}",
-            work_dir.display(),
-            corpus::layout::findings_dir(work_dir).display()
-        );
+    if let Some(report) = results::migrate::migrate_legacy_report(work_dir)? {
+        let mut lines = migration_lines(work_dir, &report);
+        if !rebuilds_results {
+            // The command comes last, quoted for a shell, so it can be pasted.
+            lines.push(format!(
+                "bhf:   this command does not rebuild results/; to rebuild it, run: bhf report \
+                 --work-dir {}",
+                crate::repro_lane::sh_word(&work_dir.to_string_lossy())
+            ));
+        }
+        for line in lines {
+            crate::bhfeprintln!("{line}");
+        }
     }
     Ok(())
+}
+
+/// What a migration changed and what to do next, one line each.
+fn migration_lines(work_dir: &Path, report: &results::migrate::MigrationReport) -> Vec<String> {
+    let work = work_dir.display();
+    let legacy = results::migrate::legacy_dir(work_dir);
+    let mut lines = vec![
+        format!("bhf: migrated legacy work dir {work} to the results layout:"),
+        format!(
+            "bhf:   moved {work}/findings/ ({} findings) to {}/",
+            report.findings,
+            corpus::layout::findings_dir(work_dir).display()
+        ),
+    ];
+    if !report.preserved.is_empty() {
+        lines.push(format!(
+            "bhf:   kept {} under {}/ (results/INDEX.md and results/findings.{{json,csv,sarif}} replace them)",
+            report.preserved.join(", "),
+            legacy.display()
+        ));
+    }
+    if report.reproducers > 0 {
+        lines.push(format!(
+            "bhf:   kept {} replay.py scripts under {}/findings/; the next rebuild writes current ones",
+            report.reproducers,
+            legacy.display()
+        ));
+    }
+    lines.push(format!(
+        "bhf:   the evidence is unchanged: migrated findings have no sanitizer.log or frames until \
+         'bhf report --backfill --work-dir {work}' replays them against their harness"
+    ));
+    lines.push(
+        "bhf:   the next 'bhf auto' sets the old corpus aside instead of reseeding it (pass \
+         --reuse-legacy-corpus to keep it); a fresh work dir is cleaner"
+            .to_owned(),
+    );
+    lines.push(
+        "bhf:   the migration is one-way: bhf 0.2.x cannot read this work dir any more".to_owned(),
+    );
+    lines
 }
 
 /// Close a producer bracket: append to the manifest, rebuild results/, and
@@ -25,10 +84,24 @@ pub fn prepare(work_dir: &Path) -> anyhow::Result<()> {
 /// A rebuild failure is a warning and never changes the command's exit code.
 pub fn finish(run: results::ProducerRun, exit_code: i32, status: results::model::ProducerStatus) {
     match run.complete(exit_code, status) {
-        Ok(summary) => crate::bhfeprintln!("{}", results_line(&summary)),
+        Ok(summary) => {
+            crate::bhfeprintln!("{}", results_line(&summary));
+            warn_about_damaged_inputs(&summary);
+        }
         Err(error) => crate::bhfeprintln!(
             "warning: results index not rebuilt: {error}; run 'bhf report' to retry"
         ),
+    }
+}
+
+/// Repeat INDEX.md's warning about inputs an earlier release's seed encoding
+/// damaged, so it is seen without opening the index.
+pub fn warn_about_damaged_inputs(summary: &results::RebuildSummary) {
+    if let Some(damaged) = &summary.damaged_inputs {
+        crate::bhfeprintln!(
+            "warning: {}",
+            results::render::index_md::damaged_inputs_line(damaged).replace('`', "")
+        );
     }
 }
 
@@ -133,6 +206,31 @@ mod tests {
         assert!(tmp.path().join("results/findings/F-1").is_dir());
     }
 
+    /// Migration says what it moved, what it kept and where, and what the
+    /// operator can do next.
+    #[test]
+    fn migration_is_reported_line_by_line() {
+        let report = results::migrate::MigrationReport {
+            findings: 9,
+            preserved: vec!["FINDINGS.md".to_owned(), "auto/findings.csv".to_owned()],
+            reproducers: 9,
+        };
+        let lines = super::migration_lines(std::path::Path::new("/w"), &report);
+        // Paths are joined with the host separator; compare them with `/`.
+        let text = lines.join("\n").replace('\\', "/");
+        for needle in [
+            "migrated legacy work dir /w to the results layout",
+            "moved /w/findings/ (9 findings) to /w/results/findings/",
+            "kept FINDINGS.md, auto/findings.csv under /w/results/legacy/",
+            "kept 9 replay.py scripts under /w/results/legacy/findings/",
+            "--reuse-legacy-corpus",
+            "bhf report --backfill",
+            "one-way",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
+        }
+    }
+
     #[test]
     fn prepare_on_missing_work_dir_is_ok() {
         let tmp = tempfile::tempdir().unwrap();
@@ -162,6 +260,7 @@ mod tests {
             findings: 3,
             errors: 0,
             index_path: std::path::PathBuf::from("w/results/INDEX.md"),
+            damaged_inputs: None,
         };
         assert_eq!(
             results_line(&summary),

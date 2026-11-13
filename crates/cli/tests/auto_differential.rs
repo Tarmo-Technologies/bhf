@@ -100,3 +100,56 @@ fn auto_differential_flags_cross_compiler_divergence() {
     assert_eq!(f["differential"]["compiler_a"], "clang");
     assert_eq!(f["differential"]["compiler_b"], "gcc");
 }
+
+/// A `--differential` compiler given as a path under a directory with a space
+/// heads the diff recipe as `$(DIFF_CC)`, so it must stay one shell word.
+#[cfg(unix)]
+#[test]
+fn auto_differential_accepts_a_compiler_path_with_spaces() {
+    if !have("clang") || !have("gcc") || !have("make") {
+        eprintln!("skip: needs clang + gcc + make");
+        return;
+    }
+    let Ok(gcc) = which::which("gcc") else {
+        eprintln!("skip: gcc not on PATH");
+        return;
+    };
+    let tools = tempdir("tools").join("gnu tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    let spaced_gcc = tools.join("gcc");
+    std::os::unix::fs::symlink(&gcc, &spaced_gcc).unwrap();
+
+    let src = tempdir("spaced-src");
+    std::fs::write(
+        src.join("probe.c"),
+        "#include <stddef.h>\n\
+         int probe(const unsigned char* d, size_t n) {\n\
+         #if !defined(__clang__)\n\
+             __builtin_trap();\n\
+         #endif\n\
+             return (n > 0) ? (int)d[0] : 0;\n\
+         }\n",
+    )
+    .unwrap();
+    let work = tempdir("spaced-work");
+    let out = Command::new(env!("CARGO_BIN_EXE_bhf"))
+        .args(["auto", src.to_str().unwrap()])
+        .args(["--languages", "c"])
+        .args(["--per-target-time", "2"])
+        .arg("--differential")
+        .arg(format!("clang:{}", spaced_gcc.display()))
+        .arg("--no-discovery-cache")
+        .arg("--work-dir")
+        .arg(&work)
+        .output()
+        .expect("spawn bhf");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let found = read_findings(&work).iter().any(|f| {
+        f["rule_id"] == "BHF-301" && f["analysis"]["engine"] == "bhf.dynamic.differential.replay"
+    });
+    assert!(
+        found,
+        "the spaced compiler path must build the diff side and yield the divergence.\n\
+         stderr:\n{stderr}"
+    );
+}

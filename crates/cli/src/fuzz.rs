@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::runner::{harness_runner, SandboxModeArg};
+use crate::protocol_detect::HarnessProtocol;
+use crate::runner::{harness_runner_for, SandboxModeArg};
 use clap::ValueEnum;
 use corpus::{
     classify, compute_signature, finding_tier, resolve_handler, CorpusManager, FindingEmitter,
@@ -67,20 +68,8 @@ fn apply_runaway_rlimits(_cmd: &mut std::process::Command) {}
 /// kill. The child must have been spawned with `process_group(0)` so its PID is
 /// the group id; `kill(-pid, ...)` then reaps the forked grandchildren (e.g. the
 /// persistent harness afl-fuzz forks) that a plain `child.kill()` would orphan.
-#[cfg(unix)]
-fn kill_process_group(child: &mut std::process::Child) {
-    let pid = child.id() as i32;
-    // Negative pid => the process group led by `pid`.
-    unsafe {
-        libc::kill(-pid, libc::SIGKILL);
-    }
-    let _ = child.kill();
-}
-
-#[cfg(not(unix))]
-fn kill_process_group(child: &mut std::process::Child) {
-    let _ = child.kill();
-}
+/// Shared with replay and minimization.
+use replay_min::process::kill_process_group;
 
 /// SIGKILL any process still executing `exe`. AFL++'s persistent forkserver
 /// `setsid()`s its worker into a fresh session, so a group kill of afl-fuzz can
@@ -250,7 +239,10 @@ pub struct FuzzArgs {
     #[arg(long = "afl-inst-range", value_name = "RANGE")]
     pub afl_inst_ranges: Vec<String>,
 
-    /// Run multiple fuzz workers. Use a number or `auto`.
+    /// Run multiple fuzz workers. Use a number or `auto`. Each worker fuzzes an
+    /// exact copy of the harness dirs in `<work>/worker-<id>-N/` and logs its
+    /// stderr there; when every worker fails, the command exits non-zero and
+    /// prints each worker's stderr tail.
     #[arg(long, value_parser = parse_worker_count)]
     pub workers: Option<FuzzWorkerCount>,
 
@@ -329,13 +321,45 @@ pub struct FuzzArgs {
     #[arg(long)]
     pub no_fork_server: bool,
 
-    /// Literal seed input bytes, interpreted as UTF-8 bytes.
+    /// Literal seed input; its UTF-8 bytes become a seed. Use `--seed-file` for
+    /// a binary seed (any byte value, including NUL).
     #[arg(long = "seed-input")]
     pub seed_inputs: Vec<String>,
 
-    /// File containing seed input bytes.
+    /// File containing seed input bytes, used byte for byte. For a C/C++
+    /// harness that decodes fixed-width parameters before its buffer, the
+    /// seed is also given behind that many zero bytes, so the buffer starts
+    /// with it.
     #[arg(long = "seed-file")]
     pub seed_files: Vec<PathBuf>,
+
+    /// qemu-user executable to run a cross-built harness under. Default: the
+    /// emulator recorded beside the harness (`bhf_runner.json`, written by a
+    /// cross build); a harness built for another architecture with neither is
+    /// refused.
+    #[arg(long, value_name = "QEMU")]
+    pub qemu_user: Option<PathBuf>,
+
+    /// Extra argument passed to qemu-user before the harness path.
+    #[arg(
+        long = "qemu-arg",
+        value_name = "ARG",
+        allow_hyphen_values = true,
+        requires = "qemu_user"
+    )]
+    pub qemu_args: Vec<String>,
+
+    /// Raw seed bytes supplied programmatically (`bhf auto`: mined, user and
+    /// reseeded corpus inputs). Kept as bytes end to end, so a seed that is not
+    /// valid UTF-8 reaches the engine unchanged. Not a CLI flag.
+    #[arg(skip)]
+    pub seed_bytes: Vec<Vec<u8>>,
+
+    /// The seeds already hold their layout-prefixed variants: a worker of a
+    /// multi-worker campaign, whose campaign made them once for the seeds
+    /// given to it. Internal.
+    #[arg(long = "seeds-layout-prefixed", hide = true)]
+    pub seeds_layout_prefixed: bool,
 
     /// Path to an explicitly-trusted extension manifest (`bhf.extension-manifest.v1`,
     /// TOML). When set, after the campaign the retained corpus is driven through
@@ -869,6 +893,13 @@ pub(crate) struct FuzzRunSummary {
     pub(crate) sanitizers: SanitizerRunSummary,
     pub(crate) coverage: CoverageRunSummary,
     pub(crate) findings: Vec<String>,
+    /// Findings recorded for this harness before the run (sorted ids) that a
+    /// crash in this run matched, so the crash was not recorded again.
+    #[serde(default)]
+    pub(crate) duplicates_of_existing: Vec<String>,
+    /// How many crashing executions matched one of `duplicates_of_existing`.
+    #[serde(default)]
+    pub(crate) duplicate_crashes_of_existing: usize,
     /// #405: actual wall-clock seconds this run spent fuzzing — the engine's
     /// measured run time, NOT the requested budget (a run can finish early or
     /// lose time to setup). 0.0 only when no measurable time elapsed.
@@ -894,6 +925,19 @@ pub(crate) struct FuzzRunSummary {
     /// from `run.json` when no `--extension` was given.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) extension: Option<serde_json::Value>,
+    /// Later sanitizer crashes folded into an already-reported root cause, by
+    /// dedupe key (`cluster_key_full` of the finding they matched): the hits
+    /// that were not emitted as findings of their own. An additive, optional
+    /// field, omitted when no crash was folded.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub(crate) duplicate_sanitizer_hits: std::collections::BTreeMap<String, usize>,
+    /// Sanitizer crashes whose root cause never reproduced in a fresh process
+    /// and so was never reported, by dedupe key: the failed confirmations plus
+    /// the later hits that were no longer re-run. Not counted in
+    /// `duplicate_sanitizer_hits`. An additive, optional field, omitted when
+    /// empty.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub(crate) unreproduced_sanitizer_hits: std::collections::BTreeMap<String, usize>,
 }
 
 /// AFL++ binary-only settings recorded in `run.json` so a run is reproducible
@@ -917,15 +961,25 @@ pub(crate) fn executions_per_sec(executions: usize, elapsed_secs: f64) -> f64 {
     }
 }
 
-/// Edge-coverage measured during the run. For passthrough libFuzzer harnesses the
-/// bhf driver carries a SanitizerCoverage (`trace-pc-guard`) runtime that sets
-/// one bit per hit edge in a shared bitmap (#385); `edges` is the popcount. Zero
-/// for harnesses without that runtime (Ada event-log lane, generated `-fsanitize=
-/// fuzzer` wrappers) or when BHF_COV_SHM was unset.
+/// Edge-coverage measured during the run. The bhf driver (and the other lanes'
+/// runtimes) set one byte per hit edge in a shared bitmap (#385); `edges` is
+/// the popcount. Zero for harnesses without such a runtime (Ada event-log lane,
+/// generated `-fsanitize=fuzzer` wrappers) or when BHF_COV_SHM was unset.
+/// `source` names the instrumentation that fed the map, read from the harness
+/// binary ([`crate::coverage_kind`]): `sancov-trace-pc-guard` (clang),
+/// `sancov-trace-pc` (GCC), `go-cover`, `edge-bitmap` when the binary does not
+/// say, or `none` without a map.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct CoverageRunSummary {
     pub(crate) edges: usize,
     pub(crate) source: String,
+}
+
+impl CoverageRunSummary {
+    /// [`Self::source`] when an edge map was armed, else `None`.
+    pub(crate) fn instrumentation(&self) -> Option<String> {
+        (self.source != "none").then(|| self.source.clone())
+    }
 }
 
 /// Read the bhf driver's edge-coverage bitmap (one byte per hit edge) from the
@@ -957,7 +1011,7 @@ fn read_vp_tokens(path: &Path) -> Vec<Vec<u8>> {
     out
 }
 
-fn coverage_from_env(extra_env: &[(String, String)]) -> CoverageRunSummary {
+fn coverage_from_env(extra_env: &[(String, String)], harness: &Path) -> CoverageRunSummary {
     let Some((_, path)) = extra_env.iter().find(|(k, _)| k == "BHF_COV_SHM") else {
         return CoverageRunSummary {
             edges: 0,
@@ -970,8 +1024,34 @@ fn coverage_from_env(extra_env: &[(String, String)]) -> CoverageRunSummary {
         .unwrap_or(0);
     CoverageRunSummary {
         edges,
-        source: "sancov-trace-pc-guard".to_owned(),
+        source: coverage_source_label(harness).to_owned(),
     }
+}
+
+/// The `coverage.source` label for a run of `harness` with an edge map armed.
+fn coverage_source_label(harness: &Path) -> &'static str {
+    crate::coverage_kind::of_binary(harness).map_or(
+        crate::coverage_kind::UNIDENTIFIED_EDGE_MAP,
+        crate::coverage_kind::CoverageInstrumentation::label,
+    )
+}
+
+/// The harness binary's identity for `finding.json` `build.binary`, with the
+/// coverage instrumentation it was built with (`coverage_instrumentation`)
+/// when the binary shows one.
+fn build_binary_record(harness: &Path) -> Option<serde_json::Value> {
+    let mut identity = binary_analysis::build_identity(harness)
+        .and_then(|identity| serde_json::to_value(identity).ok())?;
+    if let (Some(kind), Some(object)) = (
+        crate::coverage_kind::of_binary(harness),
+        identity.as_object_mut(),
+    ) {
+        object.insert(
+            "coverage_instrumentation".to_owned(),
+            serde_json::json!(kind.label()),
+        );
+    }
+    Some(identity)
 }
 
 fn target_entry_path(extra_env: &[(String, String)]) -> Option<&Path> {
@@ -1067,6 +1147,9 @@ struct PreparedFuzzRun {
     deadline: Option<Duration>,
     print_final_stats: bool,
     rss_limit_mb: usize,
+    /// `-G` (maximum generated input length) for afl-fuzz. Set only by the
+    /// `bhf auto` AFL++ stage, from the run's resolved `--max-len`.
+    afl_max_len: Option<usize>,
     /// Explicitly-trusted extension manifest (`--extension`). When set, the
     /// builtin engine drives `oracle.evaluate` over the retained corpus after the
     /// run. `None` leaves fuzzing byte-for-byte unchanged.
@@ -1126,20 +1209,46 @@ fn is_input_rejection(status: &std::process::ExitStatus, stderr: &str) -> bool {
 
 /// Synthesize the BHF-210 "reachable crash (fatal signal, no sanitizer report)"
 /// finding for a non-rejection crash on an input.
-fn fatal_signal_report(status: &std::process::ExitStatus, stderr: &str) -> corpus::SanitizerReport {
+pub(crate) fn fatal_signal_report(
+    status: &std::process::ExitStatus,
+    stderr: &str,
+) -> corpus::SanitizerReport {
     let crash = crate::fatal_signal::classify(status, stderr)
         .expect("fatal_signal_report requires a classified fatal signal");
     // Funnel through the shared crash-report builder so the host-signal lane and
     // the HDF-2 transport-fault lane produce one finding shape with a catalog
     // `rule_id` (see `crate::transport_fault`).
-    crate::transport_fault::crash_report(
+    let mut report = crate::transport_fault::crash_report(
         crate::fatal_signal::RULE_ID,
         "fatal-signal".to_owned(),
         format!(
             "harness crashed with {} and no sanitizer report — a reachable crash",
             crash.name
         ),
-    )
+    );
+    report.pc_offset = fatal_signal_pc_offset(stderr, &crash.name);
+    // The signal is the check that failed: it is part of the signature and of
+    // the root-cause key, so an abort and an illegal instruction with no frames
+    // are two findings, and replay compares it.
+    if crash.name.starts_with("SIG") {
+        report.check = Some(crash.name.clone());
+    }
+    report
+}
+
+/// The faulting instruction's offset in the executable from the line bhf's
+/// driver prints before a fatal signal kills a harness built without a
+/// sanitizer runtime (`bhf: fatal signal SIGSEGV pc=0x... addr=0x...
+/// exe_offset=0x13c4`), when it names `signal`. The last such line wins.
+pub(crate) fn fatal_signal_pc_offset(stderr: &str, signal: &str) -> Option<u64> {
+    let line = stderr
+        .lines()
+        .rev()
+        .filter_map(|line| line.trim().strip_prefix("bhf: fatal signal "))
+        .find(|rest| rest.split_whitespace().next() == Some(signal))?;
+    line.split_whitespace()
+        .find_map(|field| field.strip_prefix("exe_offset=0x"))
+        .and_then(|hex| u64::from_str_radix(hex, 16).ok())
 }
 
 pub fn run(args: FuzzArgs) -> i32 {
@@ -1213,6 +1322,13 @@ pub fn run(args: FuzzArgs) -> i32 {
                     return 1;
                 }
             }
+            if let Some(note) = duplicates_of_existing_note(
+                &summary.duplicates_of_existing,
+                summary.duplicate_crashes_of_existing,
+                &summary.harness_id,
+            ) {
+                bhfeprintln!("{note}");
+            }
             0
         }
         Err(error) => {
@@ -1220,6 +1336,24 @@ pub fn run(args: FuzzArgs) -> i32 {
             1
         }
     }
+}
+
+/// The stderr note for crashes that matched findings recorded before the run
+/// (`ids`, `crashes` of them): they are left out of `findings`, and without a
+/// note the run reads as clean.
+fn duplicates_of_existing_note(ids: &[String], crashes: usize, harness_id: &str) -> Option<String> {
+    const SHOWN: usize = 10;
+    if ids.is_empty() {
+        return None;
+    }
+    let mut listed = ids[..ids.len().min(SHOWN)].join(", ");
+    if ids.len() > SHOWN {
+        listed.push_str(&format!(" and {} more", ids.len() - SHOWN));
+    }
+    Some(format!(
+        "bhf fuzz: {crashes} crashing input(s) matched finding(s) already recorded for \
+         {harness_id} ({listed}); they were not recorded again (see \"duplicates_of_existing\")"
+    ))
 }
 
 /// Run the platform-neutral runtime-event collector (#60) for a `bhf fuzz`
@@ -1433,11 +1567,12 @@ pub(crate) fn run_one_target_programmatic_with_runner(
         rss_limit_mb,
         fork_server: false,
         no_fork_server: false,
-        seed_inputs: seeds
-            .into_iter()
-            .map(|b| String::from_utf8_lossy(&b).into_owned())
-            .collect(),
+        seed_inputs: Vec::new(),
         seed_files: Vec::new(),
+        qemu_user: None,
+        qemu_args: Vec::new(),
+        seed_bytes: seeds,
+        seeds_layout_prefixed: false,
         sanitizers: sanitizers
             .iter()
             .map(|s| sanitizer_name(*s).to_owned())
@@ -1465,12 +1600,9 @@ pub(crate) fn run_one_target_programmatic_with_runner(
         collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
         extension: None,
     };
-    let mut prepared = prepare(args)?;
-    // A caller-supplied cross runner overrides the direct/host runner `prepare`
-    // resolved from the harness path (qemu-user / wine emulation).
-    if let Some(runner) = runner {
-        prepared.runner = runner;
-    }
+    // A caller-supplied cross runner replaces the runner `prepare` would
+    // resolve from the harness path (qemu-user / wine emulation).
+    let prepared = prepare_with_runner(args, runner)?;
     run_builtin_with_progress(prepared, progress)
 }
 
@@ -1494,7 +1626,113 @@ pub(crate) fn run_afl_plus_plus_programmatic(
     rss_limit_mb: usize,
     sanitizers: &[multicore_fuzz::Sanitizer],
 ) -> Result<FuzzRunSummary, String> {
-    let args = FuzzArgs {
+    let prepared = prepare_afl_programmatic(
+        work_dir,
+        harness_id,
+        seeds,
+        time_budget,
+        extra_env,
+        mode,
+        rss_limit_mb,
+        sanitizers,
+        std::env::var("BHF_MAX_LEN").ok().as_deref(),
+    )?;
+    run_afl_plus_plus(prepared)
+}
+
+/// The prepared AFL++ run behind [`run_afl_plus_plus_programmatic`], for the
+/// run's `--max-len` spec (`BHF_MAX_LEN`: a number, `auto`, or unset).
+#[allow(clippy::too_many_arguments)]
+fn prepare_afl_programmatic(
+    work_dir: &Path,
+    harness_id: &str,
+    seeds: Vec<Vec<u8>>,
+    time_budget: Option<Duration>,
+    extra_env: &[(String, String)],
+    mode: actionability::RunMode,
+    rss_limit_mb: usize,
+    sanitizers: &[multicore_fuzz::Sanitizer],
+    max_len_spec: Option<&str>,
+) -> Result<PreparedFuzzRun, String> {
+    // Resolve the length cap exactly as the builtin programmatic runner does, so
+    // `auto --max-len` governs AFL++ seeds too instead of a fixed 4096 bytes.
+    let largest_seed = seeds.iter().map(Vec::len).max().unwrap_or(0);
+    let max_len = resolve_max_len_spec(max_len_spec, largest_seed);
+    let args = afl_programmatic_args(
+        work_dir,
+        harness_id,
+        seeds,
+        time_budget,
+        extra_env,
+        mode,
+        rss_limit_mb,
+        sanitizers,
+        max_len,
+    );
+    let mut prepared = prepare(args)?;
+    prepared.afl_max_len = afl_generated_max_len(max_len);
+    Ok(prepared)
+}
+
+/// AFL++'s own default (and compiled maximum) generated-input length.
+const AFL_DEFAULT_MAX_LEN: usize = 1024 * 1024;
+
+/// The `-G` value to hand afl-fuzz for a resolved `max_len`: only a cap tighter
+/// than AFL++'s own default is passed, since afl-fuzz cannot generate past its
+/// compiled maximum anyway (and older afl-fuzz builds lack `-G`).
+fn afl_generated_max_len(max_len: usize) -> Option<usize> {
+    (max_len < AFL_DEFAULT_MAX_LEN).then_some(max_len.max(1))
+}
+
+/// Whether this afl-fuzz takes `-G` (maximum generated input length, added in
+/// AFL++ 4.00c). Probed from `afl-fuzz -h` once per afl-fuzz path.
+fn afl_fuzz_supports_max_len(afl_fuzz: &Path) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static PROBED: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
+    let probed = PROBED.get_or_init(Default::default);
+    if let Some(&known) = probed
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(afl_fuzz)
+    {
+        return known;
+    }
+    let mut probe = std::process::Command::new(afl_fuzz);
+    probe.arg("-h").stdin(Stdio::null());
+    let supported = crate::command_output::output_with_timeout(&mut probe, Duration::from_secs(10))
+        .is_ok_and(|out| {
+            afl_help_lists_max_len(&out.stdout) || afl_help_lists_max_len(&out.stderr)
+        });
+    probed
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(afl_fuzz.to_path_buf(), supported);
+    supported
+}
+
+/// `afl-fuzz -h` usage lists `-G maxlength` among its mutator settings.
+fn afl_help_lists_max_len(help: &[u8]) -> bool {
+    String::from_utf8_lossy(help)
+        .lines()
+        .any(|line| line.trim_start().starts_with("-G "))
+}
+
+/// The [`FuzzArgs`] behind [`run_afl_plus_plus_programmatic`], with the length
+/// cap already resolved.
+#[allow(clippy::too_many_arguments)]
+fn afl_programmatic_args(
+    work_dir: &Path,
+    harness_id: &str,
+    seeds: Vec<Vec<u8>>,
+    time_budget: Option<Duration>,
+    extra_env: &[(String, String)],
+    mode: actionability::RunMode,
+    rss_limit_mb: usize,
+    sanitizers: &[multicore_fuzz::Sanitizer],
+    max_len: usize,
+) -> FuzzArgs {
+    FuzzArgs {
         work_dir: work_dir.to_path_buf(),
         harness: harness_id.to_owned(),
         engine: FuzzEngine::AflPlusPlus,
@@ -1506,17 +1744,18 @@ pub(crate) fn run_afl_plus_plus_programmatic(
         time: time_budget,
         timeout: None,
         deadline: None,
-        max_len: DEFAULT_MAX_LEN,
+        max_len,
         len_control: DEFAULT_LEN_CONTROL,
         print_final_stats: false,
         rss_limit_mb,
         fork_server: false,
         no_fork_server: false,
-        seed_inputs: seeds
-            .into_iter()
-            .map(|b| String::from_utf8_lossy(&b).into_owned())
-            .collect(),
+        seed_inputs: Vec::new(),
         seed_files: Vec::new(),
+        qemu_user: None,
+        qemu_args: Vec::new(),
+        seed_bytes: seeds,
+        seeds_layout_prefixed: false,
         sanitizers: sanitizers
             .iter()
             .map(|s| sanitizer_name(*s).to_owned())
@@ -1543,9 +1782,7 @@ pub(crate) fn run_afl_plus_plus_programmatic(
         collector: crate::collector_run::CollectorSpec::Off,
         collector_window_ms: crate::collector_run::DEFAULT_WINDOW_MS,
         extension: None,
-    };
-    let prepared = prepare(args)?;
-    run_afl_plus_plus(prepared)
+    }
 }
 
 fn multicore_requested(args: &FuzzArgs) -> bool {
@@ -1556,7 +1793,23 @@ fn multicore_requested(args: &FuzzArgs) -> bool {
         || matches!(args.workers, Some(FuzzWorkerCount::Fixed(n)) if n > 1)
 }
 
-fn run_multicore_campaign(args: FuzzArgs) -> i32 {
+fn run_multicore_campaign(mut args: FuzzArgs) -> i32 {
+    // Resolve the harness once, through the same layout lookup a single-worker
+    // run uses, and give every worker that layout. Without a harness there is
+    // nothing for the workers to run, so fail as the single-worker path does.
+    let harness_path = match find_harness_executable(&args.work_dir, &args.harness, args.engine) {
+        Ok(path) => path,
+        Err(error) => {
+            bhfeprintln!("{error}");
+            return 3;
+        }
+    };
+    let (harness_dirs, harness_executable) =
+        worker_harness_layout(&args.work_dir, &args.harness, &harness_path);
+    if let Err(error) = worker_seed_files(&mut args, &harness_path) {
+        bhfeprintln!("{error}");
+        return 1;
+    }
     let sanitizers = match parse_sanitizer_args(&args.sanitizers) {
         Ok(sanitizers) => sanitizers,
         Err(error) => {
@@ -1593,18 +1846,80 @@ fn run_multicore_campaign(args: FuzzArgs) -> i32 {
         per_worker_env: multicore_fuzz::sanitizer_envs(sanitizers.runtime_set()),
         extra_worker_args: worker_passthrough_args(&args),
         kill_grace: None,
+        harness_dirs,
+        harness_executable,
     };
 
     match multicore_fuzz::run_multicore(&config) {
         Ok(summary) => {
-            match serde_json::to_string_pretty(&summary) {
+            report_failed_workers(&summary);
+            // Merge before printing, so the summary says what the merge did.
+            let (merged, merge) = merge_worker_findings(&config.work_dir, &summary);
+            let (duplicates_of_existing, duplicate_crashes_of_existing) =
+                campaign_duplicates_of_existing(&config.work_dir, &summary, merge.as_ref());
+            let printed = MulticoreRunSummary {
+                summary: &summary,
+                merged_findings: merge.map(|merge| merge.merged).unwrap_or_default(),
+                duplicates_of_existing,
+                duplicate_crashes_of_existing,
+            };
+            match serde_json::to_string_pretty(&printed) {
                 Ok(json) => println!("{json}"),
                 Err(error) => {
                     bhfeprintln!("failed to render multicore fuzz summary: {error}");
                     return 1;
                 }
             }
-            merge_worker_findings(&config.work_dir, &summary)
+            if let Some(note) = duplicates_of_existing_note(
+                &printed.duplicates_of_existing,
+                printed.duplicate_crashes_of_existing,
+                &summary.harness_id,
+            ) {
+                bhfeprintln!("{note}");
+            }
+            if summary.dropped_duplicates > 0 {
+                bhfeprintln!(
+                    "bhf fuzz: dropped {} duplicate(s) earlier campaigns left in worker dirs; \
+                     the findings they duplicated are no longer in {}",
+                    summary.dropped_duplicates,
+                    corpus::layout::findings_dir(&config.work_dir).display()
+                );
+            }
+            let Some(outcome) = no_worker_completed(&summary) else {
+                return merged;
+            };
+            let started = summary.workers_started;
+            let log = multicore_fuzz::WORKER_STDERR_LOG;
+            match outcome {
+                NoWorkerCompleted::Stopped { stopped, recorded } if recorded > 0 => {
+                    bhfeprintln!(
+                        "warning: no worker finished on its own; {stopped} of {started} were \
+                         stopped at the time limit, and the {recorded} finding(s) recorded until \
+                         then were merged"
+                    );
+                }
+                NoWorkerCompleted::Stopped { stopped, .. } => {
+                    bhfeprintln!(
+                        "error: no worker finished: {stopped} of {started} were stopped at the \
+                         time limit and none recorded a finding; each worker's full stderr is \
+                         in its {log}"
+                    );
+                }
+                NoWorkerCompleted::Failed { recorded: 0, .. } => {
+                    bhfeprintln!(
+                        "error: none of the {started} worker(s) completed, so this campaign \
+                         fuzzed nothing; each worker's full stderr is in its {log}"
+                    );
+                }
+                NoWorkerCompleted::Failed { recorded, .. } => {
+                    bhfeprintln!(
+                        "error: none of the {started} worker(s) completed; the {recorded} \
+                         finding(s) they recorded before failing were merged; each worker's \
+                         full stderr is in its {log}"
+                    );
+                }
+            }
+            incomplete_campaign_exit(outcome, merged)
         }
         Err(error) => {
             bhfeprintln!("{error}");
@@ -1618,9 +1933,173 @@ fn run_multicore_campaign(args: FuzzArgs) -> i32 {
     }
 }
 
+/// What a multi-worker `bhf fuzz` prints: the campaign summary plus what the
+/// merge into the parent's findings did.
+#[derive(Serialize)]
+struct MulticoreRunSummary<'a> {
+    #[serde(flatten)]
+    summary: &'a multicore_fuzz::MulticoreSummary,
+    /// Parent ids the workers' new findings were merged under.
+    merged_findings: Vec<String>,
+    /// Findings recorded before the campaign that its crashes matched (sorted
+    /// parent ids), so those crashes were not recorded again.
+    duplicates_of_existing: Vec<String>,
+    /// How many crashes matched one of `duplicates_of_existing`.
+    duplicate_crashes_of_existing: usize,
+}
+
+/// The parent findings recorded before this campaign that its crashes matched,
+/// and how many crashes did: worker findings the merge found to duplicate
+/// them, and crashes a worker did not record because its own tree still held
+/// a duplicate an earlier merge marked as one of them.
+fn campaign_duplicates_of_existing(
+    work_dir: &Path,
+    summary: &multicore_fuzz::MulticoreSummary,
+    merge: Option<&multicore_fuzz::MergeReport>,
+) -> (Vec<String>, usize) {
+    let mut ids: std::collections::BTreeSet<String> = merge
+        .map(|merge| merge.duplicates_of_existing.iter().cloned().collect())
+        .unwrap_or_default();
+    let mut crashes = merge.map_or(0, |merge| merge.duplicate_findings_of_existing);
+    for worker in &summary.per_worker {
+        let parents: Vec<String> = worker
+            .duplicates_of_existing
+            .iter()
+            .filter_map(|id| multicore_fuzz::marked_duplicate_of(work_dir, &worker.work_dir, id))
+            .collect();
+        if !parents.is_empty() {
+            crashes += worker.duplicate_crashes_of_existing.max(1);
+            ids.extend(parents);
+        }
+    }
+    (ids.into_iter().collect(), crashes)
+}
+
+/// The harness layout to mirror into each worker tree: every work-dir-relative
+/// harness dir a worker's lookup reads (`build/<id>` and the `bhf auto` layouts
+/// under `harnesses/`, `auto/` and `generated_harnesses/`), whether or not the
+/// parent has it, so a worker's copy of one the parent lacks is removed; plus
+/// the executable the parent resolved, relative to the work dir.
+fn worker_harness_layout(
+    work_dir: &Path,
+    harness_id: &str,
+    executable: &Path,
+) -> (Vec<PathBuf>, Option<PathBuf>) {
+    let mut candidates = vec![work_dir.join("build").join(harness_id)];
+    candidates.extend(crate::auto::layout::harness_dir_candidates(
+        work_dir, harness_id,
+    ));
+    let dirs = candidates
+        .iter()
+        .filter_map(|dir| dir.strip_prefix(work_dir).ok().map(Path::to_path_buf))
+        .collect();
+    let executable = executable
+        .strip_prefix(work_dir)
+        .ok()
+        .map(Path::to_path_buf);
+    (dirs, executable)
+}
+
+/// Name each worker that did not complete, with the tail of its stderr: the
+/// summary alone only shows an exit code.
+fn report_failed_workers(summary: &multicore_fuzz::MulticoreSummary) {
+    for worker in summary
+        .per_worker
+        .iter()
+        .filter(|worker| !worker.completed())
+    {
+        let how = match worker.exit_code {
+            Some(code) => format!("exited {code}"),
+            None if worker.stopped_at_deadline => "was stopped at the time limit".to_owned(),
+            None => "was killed by a signal".to_owned(),
+        };
+        match &worker.stderr_tail {
+            Some(tail) => {
+                bhfeprintln!(
+                    "bhf fuzz: worker {} {how} ({}); last stderr lines:",
+                    worker.worker_id,
+                    worker.work_dir.display()
+                );
+                for line in tail.lines() {
+                    bhfeprintln!("  | {line}");
+                }
+            }
+            None => bhfeprintln!(
+                "bhf fuzz: worker {} {how} ({}) with no stderr output",
+                worker.worker_id,
+                worker.work_dir.display()
+            ),
+        }
+    }
+}
+
+/// How a campaign in which no worker completed ended. `recorded` counts the
+/// findings the workers recorded during this campaign.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoWorkerCompleted {
+    /// Every worker exited non-zero or was killed by a signal. `exit_code` is
+    /// the workers' shared exit code when they agree (3, for instance, when none
+    /// found its harness), else 1.
+    Failed { exit_code: i32, recorded: usize },
+    /// `stopped` workers were still running at the time limit and were stopped;
+    /// they fuzzed until then.
+    Stopped { stopped: usize, recorded: usize },
+}
+
+/// `None` when at least one worker completed (or none started).
+fn no_worker_completed(summary: &multicore_fuzz::MulticoreSummary) -> Option<NoWorkerCompleted> {
+    if summary.workers_started == 0 || summary.workers_completed > 0 {
+        return None;
+    }
+    let recorded = summary
+        .per_worker
+        .iter()
+        .map(|worker| worker.new_findings)
+        .sum();
+    let stopped = summary
+        .per_worker
+        .iter()
+        .filter(|worker| worker.stopped_at_deadline)
+        .count();
+    if stopped > 0 {
+        return Some(NoWorkerCompleted::Stopped { stopped, recorded });
+    }
+    let first = summary
+        .per_worker
+        .first()
+        .and_then(|worker| worker.exit_code);
+    let shared = first.filter(|&code| {
+        code != 0
+            && summary
+                .per_worker
+                .iter()
+                .all(|worker| worker.exit_code == Some(code))
+    });
+    Some(NoWorkerCompleted::Failed {
+        exit_code: shared.unwrap_or(1),
+        recorded,
+    })
+}
+
+/// The exit code of a campaign in which no worker completed. Workers stopped
+/// at the time limit after recording findings fuzzed: that campaign keeps the
+/// merge's exit code. Stopped workers that recorded nothing exit 1, and failed
+/// workers exit with their shared code.
+fn incomplete_campaign_exit(outcome: NoWorkerCompleted, merged: i32) -> i32 {
+    match outcome {
+        NoWorkerCompleted::Stopped { recorded, .. } if recorded > 0 => merged,
+        NoWorkerCompleted::Stopped { .. } => 1,
+        NoWorkerCompleted::Failed { exit_code, .. } => exit_code,
+    }
+}
+
 /// Move the workers' findings into the campaign's own results/findings, so
-/// the results bracket around this command indexes them.
-fn merge_worker_findings(work_dir: &Path, summary: &multicore_fuzz::MulticoreSummary) -> i32 {
+/// the results bracket around this command indexes them. Returns the exit
+/// code and, when the merge ran, its report.
+fn merge_worker_findings(
+    work_dir: &Path,
+    summary: &multicore_fuzz::MulticoreSummary,
+) -> (i32, Option<multicore_fuzz::MergeReport>) {
     let workers: Vec<PathBuf> = summary
         .per_worker
         .iter()
@@ -1628,40 +2107,154 @@ fn merge_worker_findings(work_dir: &Path, summary: &multicore_fuzz::MulticoreSum
         .collect();
     match multicore_fuzz::merge_worker_findings(work_dir, &workers) {
         Ok(merge) => {
-            if !merge.merged.is_empty() || merge.duplicates > 0 {
-                bhfeprintln!(
-                    "bhf fuzz: merged {} worker finding(s) into {} ({} duplicate(s) left in worker dirs)",
-                    merge.merged.len(),
-                    corpus::layout::findings_dir(work_dir).display(),
-                    merge.duplicates
-                );
-            }
-            if merge.unreadable > 0 {
-                bhfeprintln!(
-                    "warning: {} worker finding(s) without a readable finding.json were not merged",
-                    merge.unreadable
-                );
-            }
-            if merge.failed == 0 {
-                return 0;
-            }
-            bhfeprintln!(
-                "error: {} worker finding(s) could not be merged; they stay in their worker dirs and the next merge resumes them",
-                merge.failed
-            );
-            for error in &merge.errors {
-                bhfeprintln!("  {error}");
-            }
-            1
+            let code = merge_outcome(work_dir, &merge);
+            (code, Some(merge))
         }
         Err(error) => {
             bhfeprintln!(
                 "error: worker findings not merged into {}: {error}",
                 work_dir.display()
             );
-            1
+            (1, None)
         }
     }
+}
+
+/// The number of zero bytes to put in front of a seed of `harness_id`'s
+/// input format ([`harness_gen::arg_layout::ArgLayout::seed_prefix_len`],
+/// from the `arg-layout.json` beside the harness or in its harness dir):
+/// `None` when its layout has no such prefix or it has no layout.
+pub(crate) fn layout_seed_prefix(
+    harness: &Path,
+    work_dir: &Path,
+    harness_id: &str,
+) -> Option<usize> {
+    harness
+        .parent()
+        .map(Path::to_path_buf)
+        .into_iter()
+        .chain(crate::auto::layout::harness_dir_candidates(
+            work_dir, harness_id,
+        ))
+        .find_map(|dir| harness_gen::arg_layout::ArgLayout::read(&dir).and_then(Result::ok))
+        .and_then(|layout| layout.seed_prefix_len())
+}
+
+/// Each of `seeds` again behind `prefix` zero bytes, for a harness that
+/// decodes that many bytes into fixed-width parameters before its buffer.
+/// The seeds themselves stay as they are. A variant already among the seeds
+/// is not repeated, and a seed that is itself the variant of another (a
+/// worker handed both) gets none, so applying this twice adds nothing.
+pub(crate) fn layout_prefixed_seeds(seeds: &[Vec<u8>], prefix: usize) -> Vec<Vec<u8>> {
+    if prefix == 0 {
+        return Vec::new();
+    }
+    let present: std::collections::HashSet<&[u8]> = seeds.iter().map(Vec::as_slice).collect();
+    let mut variants: Vec<Vec<u8>> = Vec::new();
+    for seed in seeds {
+        let is_variant = seed.len() >= prefix
+            && seed[..prefix].iter().all(|&byte| byte == 0)
+            && present.contains(&seed[prefix..]);
+        if is_variant {
+            continue;
+        }
+        let mut variant = vec![0u8; prefix];
+        variant.extend_from_slice(seed);
+        if !present.contains(variant.as_slice()) && !variants.contains(&variant) {
+            variants.push(variant);
+        }
+    }
+    variants
+}
+
+/// Report a merge on stderr; its exit code.
+fn merge_outcome(work_dir: &Path, merge: &multicore_fuzz::MergeReport) -> i32 {
+    if !merge.merged.is_empty() || merge.duplicates > 0 {
+        bhfeprintln!(
+            "bhf fuzz: merged {} worker finding(s) into {} ({} duplicate(s) left in worker dirs)",
+            merge.merged.len(),
+            corpus::layout::findings_dir(work_dir).display(),
+            merge.duplicates
+        );
+    }
+    if merge.dropped > 0 {
+        bhfeprintln!(
+            "bhf fuzz: dropped {} worker duplicate(s) of findings no longer in {}",
+            merge.dropped,
+            corpus::layout::findings_dir(work_dir).display()
+        );
+    }
+    if merge.unreadable > 0 {
+        bhfeprintln!(
+            "warning: {} worker finding(s) without a readable finding.json were not merged",
+            merge.unreadable
+        );
+    }
+    if merge.failed == 0 {
+        return 0;
+    }
+    bhfeprintln!(
+        "error: {} worker finding(s) could not be merged; they stay in their worker dirs and the next merge resumes them",
+        merge.failed
+    );
+    for error in &merge.errors {
+        bhfeprintln!("  {error}");
+    }
+    1
+}
+
+/// Workers receive their seeds through argv, which cannot carry arbitrary bytes
+/// (a NUL ends an argument; a non-UTF-8 `--seed-input` is rejected). Write the
+/// programmatic seed bytes to content-named files under the campaign dir and
+/// hand them over as `--seed-file`, which every worker reads byte for byte.
+fn materialize_seed_bytes(args: &mut FuzzArgs) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    if args.seed_bytes.is_empty() {
+        return Ok(());
+    }
+    let dir = args
+        .work_dir
+        .join("fuzz_campaigns")
+        .join(&args.harness)
+        .join("seed_bytes");
+    fs::create_dir_all(&dir)
+        .map_err(|error| format!("create seed dir '{}': {error}", dir.display()))?;
+    for bytes in std::mem::take(&mut args.seed_bytes) {
+        let path = dir.join(format!("{:x}.bin", Sha256::digest(&bytes)));
+        fs::write(&path, &bytes)
+            .map_err(|error| format!("write seed '{}': {error}", path.display()))?;
+        args.seed_files.push(path);
+    }
+    Ok(())
+}
+
+/// Hand a multi-worker campaign's seeds to its workers as seed files: the
+/// prefixed variants of the seeds given to `bhf fuzz` (see
+/// [`layout_prefixed_seeds`]), made once here, and every programmatic seed
+/// ([`materialize_seed_bytes`]). The workers are told the variants are made,
+/// so none prefixes the seeds it is handed, the programmatic and shared-queue
+/// ones included.
+fn worker_seed_files(args: &mut FuzzArgs, harness: &Path) -> Result<(), String> {
+    if !args.seeds_layout_prefixed {
+        if let Some(prefix) = layout_seed_prefix(harness, &args.work_dir, &args.harness) {
+            let mut given: Vec<Vec<u8>> = args
+                .seed_inputs
+                .iter()
+                .map(|seed| seed.as_bytes().to_vec())
+                .collect();
+            for seed_file in &args.seed_files {
+                let (bytes, _) =
+                    read_seed_file_prefix(seed_file, args.max_len.max(1)).map_err(|error| {
+                        format!("read seed file '{}': {error}", seed_file.display())
+                    })?;
+                given.push(bytes);
+            }
+            let variants = layout_prefixed_seeds(&given, prefix);
+            args.seed_bytes.extend(variants);
+        }
+        args.seeds_layout_prefixed = true;
+    }
+    materialize_seed_bytes(args)
 }
 
 fn worker_passthrough_args(args: &FuzzArgs) -> Vec<String> {
@@ -1688,6 +2281,9 @@ fn worker_passthrough_args(args: &FuzzArgs) -> Vec<String> {
         out.push("--seed-file".to_owned());
         out.push(seed_file.display().to_string());
     }
+    if args.seeds_layout_prefixed {
+        out.push("--seeds-layout-prefixed".to_owned());
+    }
     for source in &args.symbolic_seed_sources {
         out.push("--symbolic-seed-source".to_owned());
         out.push(source.display().to_string());
@@ -1709,6 +2305,13 @@ fn worker_passthrough_args(args: &FuzzArgs) -> Vec<String> {
     if args.rss_limit_mb > 0 {
         out.push("--rss-limit-mb".to_owned());
         out.push(args.rss_limit_mb.to_string());
+    }
+    if let Some(qemu) = &args.qemu_user {
+        out.push("--qemu-user".to_owned());
+        out.push(qemu.display().to_string());
+        for arg in &args.qemu_args {
+            out.push(format!("--qemu-arg={arg}"));
+        }
     }
     out
 }
@@ -1764,6 +2367,17 @@ fn arm_shared_map(work_dir: &Path, bytes: usize) -> Result<(tempfile::TempPath, 
 }
 
 fn prepare(args: FuzzArgs) -> Result<PreparedFuzzRun, String> {
+    prepare_with_runner(args, None)
+}
+
+/// [`prepare`], running the harness under `runner` when the caller supplies
+/// one (`bhf auto`'s qemu-user / wine runner for a cross-built harness)
+/// instead of the runner resolved from `--qemu-user` or the one recorded
+/// beside the harness.
+fn prepare_with_runner(
+    args: FuzzArgs,
+    runner: Option<replay_min::HarnessRunner>,
+) -> Result<PreparedFuzzRun, String> {
     match args.engine {
         FuzzEngine::Builtin | FuzzEngine::AflPlusPlus => {}
     }
@@ -1779,14 +2393,17 @@ fn prepare(args: FuzzArgs) -> Result<PreparedFuzzRun, String> {
     }
 
     let harness_path = find_harness_executable(&work_dir, &args.harness, args.engine)?;
-    let runner = harness_runner(
-        harness_path.clone(),
-        None,
-        Vec::new(),
-        args.sandbox,
-        args.sandbox_tool,
-        args.sandbox_strict,
-    );
+    let runner = match runner {
+        Some(runner) => runner,
+        None => harness_runner_for(
+            harness_path.clone(),
+            args.qemu_user,
+            args.qemu_args,
+            args.sandbox,
+            args.sandbox_tool,
+            args.sandbox_strict,
+        )?,
+    };
     let mut seeds = args
         .seed_inputs
         .into_iter()
@@ -1805,6 +2422,18 @@ fn prepare(args: FuzzArgs) -> Result<PreparedFuzzRun, String> {
         }
         seeds.push(bytes);
     }
+    // A `--seed-file`/`--seed-input` seed is a sample of the target's input
+    // format; where the harness decodes fixed-width parameters before the
+    // buffer, it is also given behind that many zero bytes, so the buffer
+    // starts with it. A campaign's worker is handed the variants with the
+    // rest of its seeds.
+    if !args.seeds_layout_prefixed {
+        if let Some(prefix) = layout_seed_prefix(&harness_path, &work_dir, &args.harness) {
+            let variants = layout_prefixed_seeds(&seeds, prefix);
+            seeds.extend(variants);
+        }
+    }
+    seeds.extend(args.seed_bytes);
     let mut symbolic_sources = Vec::new();
     let mut symbolic_source_bytes = 0usize;
     let symbolic_source_limit = max_symbolic_source_bytes();
@@ -1850,6 +2479,11 @@ fn prepare(args: FuzzArgs) -> Result<PreparedFuzzRun, String> {
     let mut extra_env = args.extra_env;
     extra_env.extend(sanitizer_env.clone());
     apply_fuzz_child_env_overrides(&mut extra_env);
+    // Under an emulator a sanitizer report must not abort: qemu-user dumps
+    // its own address space on a guest abort, which takes minutes.
+    if runner.qemu_prefix().is_some() {
+        no_abort_on_error(&mut extra_env);
+    }
     // #59: arm the runtime sink oracles on the manual path. `bhf auto` already
     // threads LD_PRELOAD + BHF_RUNTRACE_LOG through `extra_env`, so this only
     // fires for a direct `bhf fuzz` invocation (guarded: skip when already armed).
@@ -1949,6 +2583,7 @@ fn prepare(args: FuzzArgs) -> Result<PreparedFuzzRun, String> {
         deadline: args.deadline,
         print_final_stats: args.print_final_stats,
         rss_limit_mb: args.rss_limit_mb,
+        afl_max_len: None,
         extension_manifest: args.extension,
     })
 }
@@ -2647,19 +3282,43 @@ fn run_builtin_with_progress(
                 || s.contains("BHF_PHP_LAUNCHER")
         })
         .unwrap_or(false);
+    // The harness's language names the resource-leak oracle (an Ada harness's
+    // leak is `resource-leak-ada`, any other's `resource-leak`).
+    let harness_language = if is_instrumented_ada_harness(&prepared.runner) {
+        "ada".to_owned()
+    } else {
+        let dirs: Vec<PathBuf> = prepared
+            .harness_path
+            .parent()
+            .map(Path::to_path_buf)
+            .into_iter()
+            .chain(crate::auto::layout::harness_dir_candidates(
+                &prepared.work_dir,
+                &prepared.harness_id,
+            ))
+            .collect();
+        crate::repro_lane::harness_language(&dirs, &prepared.harness_id).unwrap_or_default()
+    };
     let sandbox_metadata = prepared.runner.sandbox_metadata();
-    let build_binary_identity = binary_analysis::build_identity(&prepared.harness_path)
-        .and_then(|identity| serde_json::to_value(identity).ok());
-    let mut emitter = FindingEmitter::with_metadata_and_sandbox(
-        prepared.work_dir.clone(),
-        prepared.harness_id.clone(),
-        "unknown".to_owned(),
-        prepared.harness_path.display().to_string(),
-        serde_json::to_value(&sandbox_metadata)
-            .map_err(|error| format!("serialize sandbox metadata: {error}"))?,
-    )
-    .with_mode(prepared.mode)
-    .with_line_maps_dir(&prepared.work_dir.join("src_instrumented"));
+    let build_binary_identity = build_binary_record(&prepared.harness_path);
+    let mut emitter = with_harness_format(
+        FindingEmitter::with_metadata_and_sandbox(
+            prepared.work_dir.clone(),
+            prepared.harness_id.clone(),
+            "unknown".to_owned(),
+            prepared.harness_path.display().to_string(),
+            serde_json::to_value(&sandbox_metadata)
+                .map_err(|error| format!("serialize sandbox metadata: {error}"))?,
+        )
+        .with_mode(prepared.mode)
+        .with_line_maps_dir(&prepared.work_dir.join("src_instrumented")),
+        &prepared.harness_path,
+        &prepared.work_dir,
+        &prepared.harness_id,
+    );
+    // A corpus this pass creates carries the harness's input format from
+    // its first input on.
+    emitter.start_corpus_format();
     if let Some(identity) = build_binary_identity {
         emitter = emitter.with_build_binary(identity);
     }
@@ -2734,19 +3393,31 @@ fn run_builtin_with_progress(
     // #35: pre-seed the within-pass dedup sets from findings already on disk so the
     // NEXT cascade pass (Empty/Rng/FuzzDriven) over the SAME harness does not
     // re-emit a byte-identical finding it already wrote (~2-3x inflation otherwise).
-    let (seed_clusters, seed_oracles) =
-        existing_finding_dedup_keys(&prepared.work_dir, &prepared.harness_id);
-    let mut seen_oracle_hits = HashSet::<String>::from_iter(seed_oracles);
-    // Sanitizer-crash cluster key -> hit count, for dedup (#389): one finding
-    // per root cause, not one per crashing input.
-    let mut seen_sanitizer_clusters = HashMap::<String, usize>::new();
-    for key in seed_clusters {
-        seen_sanitizer_clusters.insert(key, 1);
-    }
+    let existing_findings = ExistingFindings::load(&prepared.work_dir, &prepared.harness_id);
+    let mut seen_oracle_hits =
+        HashSet::<String>::from_iter(existing_findings.oracles.keys().cloned());
+    // Sanitizer-crash dedup (#389): one finding per root cause, not one per
+    // crashing input.
+    let mut sanitizer_dedup = SanitizerClusterDedup::new(
+        existing_findings.clusters.keys().cloned(),
+    )
+    .with_scope(run_crash_scope(
+        &prepared.harness_path,
+        &prepared.work_dir,
+        &prepared.harness_id,
+    ));
+    // A crash dropped because it matches one of those findings is counted
+    // here (finding id -> crashing executions) and reported, never silent.
+    let mut duplicates_of_existing = std::collections::BTreeMap::<String, usize>::new();
     // Replay-verify + driver-glue filtering only apply to passthrough C/C++
     // libFuzzer harnesses (the class that crashes in driver glue); the Ada
     // event-log lane validates findings separately via per-spawn replay.
-    let protocol = resolve_harness_protocol(&prepared.runner, &prepared.work_dir);
+    let detection =
+        crate::protocol_detect::detect(prepared.runner.harness_path(), &[&prepared.work_dir]);
+    if let Some(note) = libfuzzer_binary_note(&detection, prepared.runner.harness_path()) {
+        bhfeprintln!("note: {note}");
+    }
+    let protocol = detection.protocol;
     let c_libfuzzer_harness = protocol == HarnessProtocol::LibFuzzerSingleInput;
     // #416: crash inputs (this run's, plus any recorded by an earlier pass) are
     // excluded from the persisted corpus so a crashing input is never left in the
@@ -2933,7 +3604,7 @@ fn run_builtin_with_progress(
             {
                 ForkOutcome::Ran(run) => {
                     from_fork_server = true;
-                    run
+                    *run
                 }
                 ForkOutcome::Died => {
                     // Drop (kill/reap) the dead server, isolate the crash via the
@@ -3083,7 +3754,7 @@ fn run_builtin_with_progress(
                 prepared.rss_limit_mb,
                 prepared.deadline,
             )?;
-            run.sanitizer = fresh.sanitizer;
+            adopt_fresh_rerun(&mut run, fresh);
         }
         // #382: this input's coverage novelty — new corpus signatures plus (on the
         // driver path) new edge coverage — is its scheduling energy, captured here
@@ -3192,6 +3863,11 @@ fn run_builtin_with_progress(
                         .emit(&input, testcase, handler_index)
                         .map_err(|error| format!("emit finding: {error}"))?;
                     finding_ids.push(id.0);
+                } else {
+                    note_duplicate_of_existing(
+                        &mut duplicates_of_existing,
+                        existing_findings.signatures.get(&signature.hex()),
+                    );
                 }
             }
         }
@@ -3209,11 +3885,13 @@ fn run_builtin_with_progress(
             // glue with no target frame is a harness fault, not a target bug.
             else if c_libfuzzer_harness && corpus::cluster::is_driver_glue_crash(report) {
                 driver_glue_drops += 1;
-            } else if first_of_sanitizer_cluster(&mut seen_sanitizer_clusters, report) {
+            } else if let Some(key) = sanitizer_dedup.first_sighting(report) {
                 // First sighting of this cluster (#389 dedups the rest). For a
                 // passthrough libFuzzer harness, replay-verify before emitting
                 // (#388): re-run in a fresh process and drop non-reproducing
-                // faults (allocator-state corruption across inputs).
+                // faults (allocator-state corruption across inputs). The key is
+                // consumed only once the finding is emitted, so a first hit that
+                // does not reproduce does not hide a later one that does.
                 if !c_libfuzzer_harness
                     || sanitizer_crash_reproduces(
                         &prepared.runner,
@@ -3233,19 +3911,43 @@ fn run_builtin_with_progress(
                             run.stderr.as_deref().map(str::as_bytes),
                         )
                         .map_err(|error| format!("emit sanitizer finding: {error}"))?;
+                    sanitizer_dedup.consumed(key);
+                    record_finding_arguments(
+                        &prepared.work_dir,
+                        &id.0,
+                        prepared.runner.harness_path(),
+                        &input,
+                        TraceInput::ArgvFile,
+                        &prepared.extra_env,
+                        prepared.per_input_timeout,
+                        prepared.runner.qemu_prefix(),
+                    );
                     finding_ids.push(id.0);
                 } else {
+                    sanitizer_dedup.unconfirmed(key);
                     non_reproducible += 1;
                 }
+            } else {
+                // A hit of a root cause pre-seeded from an on-disk finding is
+                // reported against that finding's id.
+                note_duplicate_of_existing(
+                    &mut duplicates_of_existing,
+                    existing_findings.clusters.get(&sanitizer_dedup.key(report)),
+                );
             }
         }
 
-        for hit in crate::auto::runtrace::oracle_hits_from_events_for_lane(
+        for hit in crate::auto::runtrace::oracle_hits_for_harness(
             &runtrace_events,
             interpreted_lane,
+            &harness_language,
         ) {
             let key = oracle_hit_dedupe_key(&hit);
-            if !seen_oracle_hits.insert(key) {
+            if !seen_oracle_hits.insert(key.clone()) {
+                note_duplicate_of_existing(
+                    &mut duplicates_of_existing,
+                    existing_findings.oracles.get(&key),
+                );
                 continue;
             }
             let id = emitter
@@ -3341,7 +4043,12 @@ fn run_builtin_with_progress(
         let Some(hit) = crate::auto::runtrace::confirmed_sink_hit(&confirmed) else {
             continue;
         };
-        if !seen_oracle_hits.insert(oracle_hit_dedupe_key(&hit)) {
+        let key = oracle_hit_dedupe_key(&hit);
+        if !seen_oracle_hits.insert(key.clone()) {
+            note_duplicate_of_existing(
+                &mut duplicates_of_existing,
+                existing_findings.oracles.get(&key),
+            );
             continue;
         }
         let id = emitter
@@ -3372,6 +4079,23 @@ fn run_builtin_with_progress(
              process (global-state artifacts) and were not emitted"
         );
     }
+    let skipped_unreproduced = sanitizer_dedup.skipped_unreproduced_hits();
+    if skipped_unreproduced > 0 {
+        bhfeprintln!(
+            "bhf fuzz: {skipped_unreproduced} later sanitizer crash(es) hit a root \
+             cause that failed {MAX_UNCONFIRMED_SANITIZER_ATTEMPTS} fresh-process \
+             confirmations; they were not re-run or emitted (per key: \
+             `unreproduced_sanitizer_hits` in fuzz_runs/<harness>-latest.json)"
+        );
+    }
+    let folded: usize = sanitizer_dedup.duplicate_hits().values().sum();
+    if folded > 0 {
+        bhfeprintln!(
+            "bhf fuzz: {folded} later sanitizer crash(es) matched an already-reported \
+             root cause and were counted, not emitted (per key: \
+             `duplicate_sanitizer_hits` in fuzz_runs/<harness>-latest.json)"
+        );
+    }
     if driver_glue_drops > 0 {
         bhfeprintln!(
             "bhf fuzz: {driver_glue_drops} crash(es) in libFuzzer/sanitizer driver glue \
@@ -3393,6 +4117,10 @@ fn run_builtin_with_progress(
     // `corpus_persisted` tracks `corpus_new` and stays bounded even when coverage
     // reads zero. Best-effort: a persistence I/O error must not fail an otherwise-
     // successful run.
+    //
+    // The corpus is about to hold this pass's inputs, of this harness's input
+    // format, whether or not the pass found anything: record that format.
+    emitter.record_corpus_format();
     let corpus_persisted = match corpus.persist_coverage_corpus(
         &prepared.harness_id,
         pool.iter()
@@ -3458,6 +4186,7 @@ fn run_builtin_with_progress(
     });
 
     let elapsed_secs = start.elapsed().as_secs_f64();
+    let coverage = coverage_from_env(&prepared.extra_env, &prepared.harness_path);
     let summary = FuzzRunSummary {
         schema_version: 1,
         harness_id: prepared.harness_id,
@@ -3474,12 +4203,16 @@ fn run_builtin_with_progress(
         execution: builtin_execution_summary(protocol, forkserver_started),
         cmplog: cmplog_summary,
         sanitizers: sanitizer_summary(&prepared.sanitizers, &prepared.sanitizer_env, false),
-        coverage: coverage_from_env(&prepared.extra_env),
+        coverage,
         findings: finding_ids,
+        duplicate_crashes_of_existing: duplicates_of_existing.values().sum(),
+        duplicates_of_existing: duplicates_of_existing.into_keys().collect(),
         elapsed_secs,
         executions_per_sec: executions_per_sec(executions, elapsed_secs),
         afl: None,
         extension: extension_block,
+        duplicate_sanitizer_hits: sanitizer_dedup.duplicate_hits(),
+        unreproduced_sanitizer_hits: sanitizer_dedup.unreproduced_hits(),
     };
     if prepared.print_final_stats {
         bhfeprintln!(
@@ -3549,40 +4282,175 @@ impl RuntraceLogCursor {
     }
 }
 
-/// First-sighting test for sanitizer-crash deduplication (#389). Returns true
-/// exactly once per distinct crash cluster (root cause), so the report carries
-/// one finding per cluster with a hit count instead of one per crashing input
-/// (cJSON produced 2211 findings collapsing to 3 clusters). A fallback cluster
-/// (no informative target frame) is keyed by rule_id so unrelated rules still
+/// Fresh-process confirmations a sanitizer crash's root cause gets before a
+/// crash that never reproduces stops costing a re-run per hit.
+const MAX_UNCONFIRMED_SANITIZER_ATTEMPTS: u32 = 3;
+
+/// Per-run sanitizer-crash deduplication (#389): one finding per distinct crash
+/// root cause with a hit count, instead of one per crashing input (cJSON
+/// produced 2211 findings collapsing to 3 clusters). Keys are
+/// [`corpus::finding::sanitizer_dedupe_key_scoped`] in the run's
+/// [`run_crash_scope`]: the root-cause cluster key, which for a report without
+/// an informative frame is its reported site, else its rule, kind, check and
+/// faulting pc offset in that scope, so different rules, checks and sites stay
 /// separate.
-fn first_of_sanitizer_cluster(
-    seen: &mut HashMap<String, usize>,
-    report: &corpus::SanitizerReport,
-) -> bool {
-    let limit = max_finding_dedup_keys();
-    let cluster = corpus::cluster::cluster_for_sanitizer(report);
-    let key = if cluster.fallback {
-        format!("rule:{}", report.rule_id)
-    } else {
-        cluster.full
-    };
-    if let Some(count) = seen.get_mut(&key) {
-        *count = count.saturating_add(1);
-        return false;
-    }
-    if seen.len() >= limit {
-        if seen.len() == limit {
-            bhfeprintln!(
-                "bhf: sanitizer-cluster tracking reached its {limit}-key \
-                 memory cap; suppressing later distinct clusters (raise \
-                 BHF_MAX_FINDING_DEDUP_KEYS if intended)"
-            );
-            seen.insert("__bhf_dedup_memory_cap__".to_owned(), 1);
+///
+/// A key is consumed only once a finding is emitted for it: a first hit that
+/// does not reproduce in a fresh process must not hide a later reproducible
+/// hit of the same root cause. After [`MAX_UNCONFIRMED_SANITIZER_ATTEMPTS`]
+/// failed confirmations the key is given up: later hits are no longer re-run,
+/// and they are counted as unreproduced, not as duplicates of a finding.
+struct SanitizerClusterDedup {
+    /// The scope frame-less crashes are keyed in ([`run_crash_scope`]).
+    scope: String,
+    /// Consumed key -> hits (the emitted or pre-seeded finding, plus later
+    /// duplicates).
+    seen: HashMap<String, usize>,
+    /// Key -> failed fresh-process confirmations, for keys not yet consumed.
+    unconfirmed: HashMap<String, u32>,
+    /// Given-up key -> later hits that were not re-run. No finding was ever
+    /// emitted for these keys.
+    abandoned: HashMap<String, usize>,
+    limit: usize,
+    warned_cap: bool,
+}
+
+impl SanitizerClusterDedup {
+    /// Start from the keys of findings an earlier pass already wrote (#35).
+    fn new(seed: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            scope: String::new(),
+            seen: seed.into_iter().map(|key| (key, 1)).collect(),
+            unconfirmed: HashMap::new(),
+            abandoned: HashMap::new(),
+            limit: max_finding_dedup_keys(),
+            warned_cap: false,
         }
-        return false;
     }
-    seen.insert(key, 1);
-    true
+
+    /// The dedupe key when `report`'s root cause has not been reported yet: the
+    /// caller confirms it and then calls [`Self::consumed`] or
+    /// [`Self::unconfirmed`]. `None` for a duplicate or a given-up root cause
+    /// (either way its hit is counted), or once the key memory cap is reached.
+    fn first_sighting(&mut self, report: &corpus::SanitizerReport) -> Option<String> {
+        let key = self.key(report);
+        if let Some(count) = self.seen.get_mut(&key) {
+            *count = count.saturating_add(1);
+            return None;
+        }
+        if let Some(later) = self.abandoned.get_mut(&key) {
+            *later = later.saturating_add(1);
+            return None;
+        }
+        let tracked = self
+            .seen
+            .len()
+            .saturating_add(self.unconfirmed.len())
+            .saturating_add(self.abandoned.len());
+        if tracked >= self.limit {
+            if !self.warned_cap {
+                self.warned_cap = true;
+                bhfeprintln!(
+                    "bhf: sanitizer-cluster tracking reached its {}-key \
+                     memory cap; suppressing later distinct clusters (raise \
+                     BHF_MAX_FINDING_DEDUP_KEYS if intended)",
+                    self.limit
+                );
+            }
+            return None;
+        }
+        Some(key)
+    }
+
+    /// Key the run's crashes in `scope`, as the run's emitter does.
+    fn with_scope(mut self, scope: String) -> Self {
+        self.scope = scope;
+        self
+    }
+
+    /// The key `report` is deduplicated on.
+    fn key(&self, report: &corpus::SanitizerReport) -> String {
+        corpus::finding::sanitizer_dedupe_key_scoped(report, &self.scope)
+    }
+
+    /// A finding was emitted for `key`: later hits are duplicates.
+    fn consumed(&mut self, key: String) {
+        self.unconfirmed.remove(&key);
+        self.seen.entry(key).or_insert(1);
+    }
+
+    /// A crash with `key` did not reproduce in a fresh process. The key stays
+    /// open for a later hit until it has failed
+    /// [`MAX_UNCONFIRMED_SANITIZER_ATTEMPTS`] times, then it is given up.
+    fn unconfirmed(&mut self, key: String) {
+        let attempts = self.unconfirmed.entry(key.clone()).or_insert(0);
+        *attempts = attempts.saturating_add(1);
+        if *attempts >= MAX_UNCONFIRMED_SANITIZER_ATTEMPTS {
+            self.unconfirmed.remove(&key);
+            self.abandoned.insert(key, 0);
+        }
+    }
+
+    /// Later hits folded into each already-reported root cause.
+    fn duplicate_hits(&self) -> std::collections::BTreeMap<String, usize> {
+        self.seen
+            .iter()
+            .filter(|(_, count)| **count > 1)
+            .map(|(key, count)| (key.clone(), count - 1))
+            .collect()
+    }
+
+    /// Hits of each root cause that never reproduced in a fresh process and so
+    /// was never reported: its failed confirmations, plus, once it was given
+    /// up, the later hits that were not re-run.
+    fn unreproduced_hits(&self) -> std::collections::BTreeMap<String, usize> {
+        let given_up = self.abandoned.iter().map(|(key, later)| {
+            let tries = MAX_UNCONFIRMED_SANITIZER_ATTEMPTS as usize;
+            (key.clone(), tries.saturating_add(*later))
+        });
+        let open = self
+            .unconfirmed
+            .iter()
+            .map(|(key, tries)| (key.clone(), *tries as usize));
+        given_up.chain(open).collect()
+    }
+
+    /// Hits of given-up root causes that were not re-run.
+    fn skipped_unreproduced_hits(&self) -> usize {
+        self.abandoned.values().sum()
+    }
+}
+
+/// AFL++ crash ingestion's first-sighting test: the same root-cause key the
+/// builtin loop uses, so the two engines dedupe a crash identically. AFL++ has
+/// already confirmed the crash, so a first sighting is consumed at once.
+fn afl_crash_is_new(dedup: &mut SanitizerClusterDedup, report: &corpus::SanitizerReport) -> bool {
+    match dedup.first_sighting(report) {
+        Some(key) => {
+            dedup.consumed(key);
+            true
+        }
+        None => false,
+    }
+}
+
+/// #416: adopt a fresh-process re-run's result for an input the persistent
+/// fork-server ran without a report: the parsed report and the raw stderr it
+/// was parsed from, which becomes the finding's `sanitizer.log`.
+fn adopt_fresh_rerun(run: &mut HarnessRun, fresh: HarnessRun) {
+    run.sanitizer = fresh.sanitizer;
+    run.stderr = fresh.stderr;
+}
+
+/// Count one crash that matched an existing finding (`None`: the match was a
+/// finding emitted earlier in this same run, which is not reported).
+fn note_duplicate_of_existing(
+    duplicates: &mut std::collections::BTreeMap<String, usize>,
+    existing_id: Option<&String>,
+) {
+    if let Some(id) = existing_id {
+        *duplicates.entry(id.clone()).or_default() += 1;
+    }
 }
 
 fn oracle_hit_dedupe_key(hit: &finding_rules::oracle_sdk::OracleHit) -> String {
@@ -3739,6 +4607,21 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
     }
     if let Some(dictionary) = &generated_dictionary {
         afl_cmd.arg("-x").arg(dictionary);
+    }
+    // AFL++ takes up to four `-x` dictionaries; the learned one goes second.
+    if let Some(learned) = find_learned_dictionary(&prepared.work_dir, &prepared.harness_id) {
+        afl_cmd.arg("-x").arg(learned);
+    }
+    if let Some(max_len) = prepared.afl_max_len {
+        if afl_fuzz_supports_max_len(&afl_fuzz) {
+            afl_cmd.arg("-G").arg(max_len.to_string());
+        } else {
+            bhfeprintln!(
+                "bhf: {} has no -G option (AFL++ 4.00c or newer), so its generated inputs \
+                 are not held to --max-len {max_len}; the seeds are still cut to {max_len} bytes",
+                afl_fuzz.display()
+            );
+        }
     }
     afl_cmd
         .arg("--")
@@ -3944,24 +4827,32 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
 
     let crashes_dir = out_dir.join("default").join("crashes");
     let sandbox_metadata = prepared.runner.sandbox_metadata();
-    let build_binary_identity = binary_analysis::build_identity(&prepared.harness_path)
-        .and_then(|identity| serde_json::to_value(identity).ok());
-    let mut emitter = FindingEmitter::with_metadata_and_sandbox(
-        prepared.work_dir.clone(),
-        prepared.harness_id.clone(),
-        "unknown".to_owned(),
-        prepared.harness_path.display().to_string(),
-        serde_json::to_value(&sandbox_metadata)
-            .map_err(|error| format!("serialize sandbox metadata: {error}"))?,
-    )
-    .with_mode(prepared.mode)
-    .with_line_maps_dir(&prepared.work_dir.join("src_instrumented"));
+    let build_binary_identity = build_binary_record(&prepared.harness_path);
+    let mut emitter = with_harness_format(
+        FindingEmitter::with_metadata_and_sandbox(
+            prepared.work_dir.clone(),
+            prepared.harness_id.clone(),
+            "unknown".to_owned(),
+            prepared.harness_path.display().to_string(),
+            serde_json::to_value(&sandbox_metadata)
+                .map_err(|error| format!("serialize sandbox metadata: {error}"))?,
+        )
+        .with_mode(prepared.mode)
+        .with_line_maps_dir(&prepared.work_dir.join("src_instrumented")),
+        &prepared.harness_path,
+        &prepared.work_dir,
+        &prepared.harness_id,
+    );
     if let Some(identity) = build_binary_identity {
         emitter = emitter.with_build_binary(identity);
     }
 
     let mut finding_ids = Vec::new();
-    let mut seen_rule_sigs = HashSet::<String>::new();
+    let mut afl_dedup = SanitizerClusterDedup::new(Vec::new()).with_scope(run_crash_scope(
+        &prepared.harness_path,
+        &prepared.work_dir,
+        &prepared.harness_id,
+    ));
     let mut crash_count = 0_usize;
     if crashes_dir.is_dir() {
         for entry in fs::read_dir(&crashes_dir)
@@ -4013,14 +4904,22 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
             let Some(report) = corpus::parse_sanitizer_report(&stderr) else {
                 continue;
             };
-            let frame_names: Vec<&str> = report.stack.iter().map(|f| f.function.as_str()).collect();
-            let sig = format!("{}|{}", report.rule_id, frame_names.join("|"));
-            if !seen_rule_sigs.insert(sig) {
+            if !afl_crash_is_new(&mut afl_dedup, &report) {
                 continue;
             }
             let id = emitter
                 .emit_sanitizer_crash_with_log(&input, &report, Some(stderr.as_bytes()))
                 .map_err(|error| format!("emit AFL finding: {error}"))?;
+            record_finding_arguments(
+                &prepared.work_dir,
+                &id.0,
+                &prepared.harness_path,
+                &input,
+                TraceInput::Stdin,
+                &prepared.extra_env,
+                AFL_REPLAY_TRACE_TIMEOUT,
+                None,
+            );
             finding_ids.push(id.0);
         }
     }
@@ -4031,6 +4930,7 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
     // `execs=1, edges=0` even on a productive run). Fall back to the crash count
     // only when afl-fuzz wrote no stats (e.g. it aborted before the first cycle).
     let (afl_execs_done, afl_execs_per_sec) = parse_afl_fuzzer_stats(&out_dir);
+    let coverage = coverage_from_env(&prepared.extra_env, &prepared.harness_path);
     let summary = FuzzRunSummary {
         schema_version: 1,
         harness_id: prepared.harness_id.clone(),
@@ -4049,8 +4949,10 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
         execution: afl_execution_summary(),
         cmplog: cmplog_summary,
         sanitizers: sanitizer_summary(&prepared.sanitizers, &prepared.sanitizer_env, false),
-        coverage: coverage_from_env(&prepared.extra_env),
+        coverage,
         findings: finding_ids,
+        duplicates_of_existing: Vec::new(),
+        duplicate_crashes_of_existing: 0,
         elapsed_secs,
         // AFL++ owns its own loop; its real per-second throughput comes from
         // `out/default/fuzzer_stats` (`execs_per_sec`). 0.0 only when afl-fuzz
@@ -4065,16 +4967,11 @@ fn run_afl_plus_plus(prepared: PreparedFuzzRun) -> Result<FuzzRunSummary, String
         // (it iterates the builtin pool's retained corpus); AFL++ owns its own
         // on-disk queue, so `--extension` is not driven here.
         extension: None,
+        duplicate_sanitizer_hits: afl_dedup.duplicate_hits(),
+        unreproduced_sanitizer_hits: afl_dedup.unreproduced_hits(),
     };
     write_run_summary(&prepared.work_dir, &summary)?;
     Ok(summary)
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HarnessProtocol {
-    BhfFramed,
-    LibFuzzerSingleInput,
-    StdinEventLog,
 }
 
 const MAX_HARNESS_MARKER_TEXT_BYTES: u64 = 1024 * 1024;
@@ -4105,49 +5002,34 @@ fn read_bounded_marker_text(path: &Path, executable: bool) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-/// Resolve the protocol from the source matching any supported work layout.
-/// BHF's generated C source defines `LLVMFuzzerTestOneInput` *and* its own
-/// `BHF_FRAMED` main, so source existence alone must never override the marker.
+/// Resolve the protocol with the detector `bhf replay` and `bhf minimize` share
+/// ([`crate::protocol_detect::detect`]). BHF's generated C source defines
+/// `LLVMFuzzerTestOneInput` *and* its own `BHF_FRAMED` main, so source
+/// existence alone never overrides the marker.
 fn resolve_harness_protocol(
     runner: &replay_min::HarnessRunner,
     work_dir: &Path,
 ) -> HarnessProtocol {
-    let harness_path = runner.harness_path();
-    if read_bounded_marker_text(harness_path, true).is_some_and(|text| text.contains("BHF_FRAMED"))
-    {
-        return HarnessProtocol::BhfFramed;
-    }
-    let mut dirs = Vec::new();
-    if let Some(parent) = harness_path.parent() {
-        dirs.push(parent.to_path_buf());
-        let id_dir = if parent.file_name().is_some_and(|name| name == "obj") {
-            parent.parent()
-        } else {
-            Some(parent)
-        };
-        if let Some(id) = id_dir.and_then(Path::file_name) {
-            for root in ["generated_harnesses", "harnesses", "auto"] {
-                dirs.push(work_dir.join(root).join(id));
-            }
-        }
-    }
-    let mut readable_c_source = false;
-    for dir in dirs {
-        for name in ["main.c", "main.cpp"] {
-            let path = dir.join(name);
-            if let Some(text) = read_bounded_marker_text(&path, false) {
-                if text.contains("BHF_FRAMED") {
-                    return HarnessProtocol::BhfFramed;
-                }
-                readable_c_source = true;
-            }
-        }
-    }
-    if readable_c_source {
-        HarnessProtocol::LibFuzzerSingleInput
-    } else {
-        HarnessProtocol::StdinEventLog
-    }
+    crate::protocol_detect::detect(runner.harness_path(), &[work_dir]).protocol
+}
+
+/// What to tell the operator about a `-fsanitize=fuzzer` binary that has no bhf
+/// driver: bhf runs it on one input file per process (so a crash it finds is
+/// the input that caused it), but without bhf's runtime there is no coverage
+/// guidance. Wrapping the fuzz target in bhf's driver gives both.
+fn libfuzzer_binary_note(
+    detection: &crate::protocol_detect::Detection,
+    harness: &Path,
+) -> Option<String> {
+    (detection.basis == crate::protocol_detect::ProtocolBasis::LibFuzzerBinary).then(|| {
+        format!(
+            "{} is a libFuzzer (-fsanitize=fuzzer) binary without bhf's driver: bhf runs it \
+             on one input file per process, without coverage guidance. For coverage-guided \
+             fuzzing, wrap the fuzz target with `bhf generate-harness <fuzz_target.cc> \
+             --target LLVMFuzzerTestOneInput`, build that harness and fuzz it instead.",
+            harness.display()
+        )
+    })
 }
 
 /// Whether this is an Ada harness whose target+harness compile was instrumented
@@ -4298,6 +5180,9 @@ fn run_with_timeout(
         Some((program, args)) => {
             let mut cmd = std::process::Command::new(program);
             cmd.args(args).arg(harness_path);
+            // A crash under the emulator must not make it dump its own
+            // address space.
+            replay_min::process::disable_core_dumps(&mut cmd);
             cmd
         }
         None => std::process::Command::new(harness_path),
@@ -4446,6 +5331,7 @@ fn run_c_libfuzzer_single_input(
                     message: format!(
                         "harness exceeded the response deadline of {deadline:?} (took {elapsed:?})"
                     ),
+                    ..Default::default()
                 }),
                 stderr: None,
                 rejected: false,
@@ -4483,6 +5369,7 @@ fn run_c_libfuzzer_single_input(
                     stack: Vec::new(),
                     message: "harness exceeded the configured RSS limit (--rss-limit-mb)"
                         .to_owned(),
+                    ..Default::default()
                 }),
                 stderr: None,
                 rejected: false,
@@ -4693,17 +5580,88 @@ fn apply_fuzz_child_env_overrides(extra_env: &mut Vec<(String, String)>) {
     // in the report are what join a crash to the static finding on the same line.
     // Adding it here to appease AFL turned every `fuzz_confirmed` static finding
     // into `fuzz_exercised`.
-    for key in ["ASAN_OPTIONS", "UBSAN_OPTIONS"] {
-        if !extra_env.iter().any(|(k, _)| k == key) {
-            extra_env.push((
-                key.to_owned(),
-                multicore_fuzz::merge_sanitizer_options(
-                    std::env::var(key).ok().as_deref(),
-                    "abort_on_error=1:halt_on_error=1",
-                ),
-            ));
+    //
+    // UBSan additionally prints its stack (`print_stacktrace=1`) and the name of
+    // the failed check (`report_error_type=1`): without them a UBSan report is a
+    // single `file:line:col: runtime error:` line with no function to name as
+    // the sink and nothing but its rule to tell one defect from another.
+    for (key, value) in sanitizer_child_env(false) {
+        if !extra_env.iter().any(|(k, _)| *k == key) {
+            extra_env.push((key, value));
         }
     }
+}
+
+/// The `ASAN_OPTIONS` and `UBSAN_OPTIONS` of a builtin fuzz child (see
+/// [`apply_fuzz_child_env_overrides`]), for every child that must reproduce a
+/// crash the way the fuzz loop saw it: `bhf replay`, minimization,
+/// `bhf report --backfill`, and the direct harness command `bhf explain` and
+/// the capsule refusals print. The operator's inherited values are merged first
+/// and bhf's keys win. `leak` adds `detect_leaks=1`, the key the
+/// `--sanitizers` lanes require, so a leak finding replays with leak detection
+/// on whatever the operator's `ASAN_OPTIONS` says; leak detection is never
+/// turned off.
+pub(crate) fn sanitizer_child_env(leak: bool) -> Vec<(String, String)> {
+    sanitizer_child_env_for(leak, false)
+}
+
+/// [`sanitizer_child_env`] for a child that runs under an emulator
+/// (`emulated`, a qemu-user runner) or natively. Under qemu-user a guest
+/// abort makes qemu re-raise SIGABRT and dump its own huge address space,
+/// which takes minutes, so an emulated child gets `abort_on_error=0`: the
+/// sanitizer exits non-zero after its report, which classifies it.
+pub(crate) fn sanitizer_child_env_for(leak: bool, emulated: bool) -> Vec<(String, String)> {
+    let mut env = native_sanitizer_child_env(leak);
+    if emulated {
+        no_abort_on_error(&mut env);
+    }
+    env
+}
+
+/// Turn `abort_on_error` off in the `ASAN_OPTIONS` and `UBSAN_OPTIONS` of
+/// `env` (bhf's keys go last, so the appended one wins).
+pub(crate) fn no_abort_on_error(env: &mut [(String, String)]) {
+    for (key, value) in env.iter_mut() {
+        if key == "ASAN_OPTIONS" || key == "UBSAN_OPTIONS" {
+            value.push_str(":abort_on_error=0");
+        }
+    }
+}
+
+fn native_sanitizer_child_env(leak: bool) -> Vec<(String, String)> {
+    // `symbolize=1`: the location a replay compares must not be erased by an
+    // inherited `symbolize=0`.
+    let asan_required = if leak {
+        "abort_on_error=1:halt_on_error=1:symbolize=1:detect_leaks=1"
+    } else {
+        "abort_on_error=1:halt_on_error=1:symbolize=1"
+    };
+    vec![
+        (
+            "ASAN_OPTIONS".to_owned(),
+            multicore_fuzz::merge_sanitizer_options(
+                std::env::var("ASAN_OPTIONS").ok().as_deref(),
+                asan_required,
+            ),
+        ),
+        ("UBSAN_OPTIONS".to_owned(), ubsan_child_options()),
+    ]
+}
+
+/// The `UBSAN_OPTIONS` of every child that must report UBSan findings the way
+/// the fuzz loop does — builtin fuzz children, minimization and `bhf replay`:
+/// the first report halts the run as a crash (`abort_on_error=1`,
+/// `halt_on_error=1`) and carries its stack and check name
+/// ([`multicore_fuzz::UBSAN_REPORT_OPTIONS`]). The operator's inherited
+/// `UBSAN_OPTIONS` is merged first; bhf's keys go last and win.
+pub(crate) fn ubsan_child_options() -> String {
+    multicore_fuzz::merge_sanitizer_options(
+        std::env::var("UBSAN_OPTIONS").ok().as_deref(),
+        &format!(
+            "abort_on_error=1:halt_on_error=1:symbolize=1:{}",
+            multicore_fuzz::UBSAN_REPORT_OPTIONS
+        ),
+    )
 }
 
 fn sanitizer_summary(
@@ -5173,14 +6131,125 @@ fn find_generated_dictionary(work_dir: &Path, harness_id: &str) -> Option<PathBu
     .find(|path| path.is_file())
 }
 
+/// The harness's `learned_dictionary.txt` (see [`write_learned_dictionary`]),
+/// looked up in the same harness dirs as its `dictionary.txt`.
+fn find_learned_dictionary(work_dir: &Path, harness_id: &str) -> Option<PathBuf> {
+    crate::auto::layout::harness_dir_candidates(work_dir, harness_id)
+        .into_iter()
+        .chain([work_dir.join("build").join(harness_id)])
+        .map(|dir| dir.join(LEARNED_DICTIONARY_FILE))
+        .find(|path| path.is_file())
+}
+
+/// The tokens a fuzz run starts with: the harness's source-mined
+/// `dictionary.txt`, then its runtime-learned `learned_dictionary.txt`, each
+/// token once. A `bhf auto` pass also reads `cmplog.jsonl`, the learned
+/// dictionary's source, and skips the tokens already loaded here.
 fn load_generated_dictionary_tokens(
     work_dir: &Path,
     harness_id: &str,
 ) -> Result<Vec<Vec<u8>>, String> {
-    let Some(path) = find_generated_dictionary(work_dir, harness_id) else {
-        return Ok(Vec::new());
+    let mut tokens = match find_generated_dictionary(work_dir, harness_id) {
+        Some(path) => load_afl_dictionary_tokens(&path)?,
+        None => Vec::new(),
     };
-    load_afl_dictionary_tokens(&path)
+    if let Some(path) = find_learned_dictionary(work_dir, harness_id) {
+        // A damaged learned dictionary costs only its hints, never the run.
+        match load_afl_dictionary_tokens(&path) {
+            Ok(learned) => {
+                for token in learned {
+                    if !tokens.contains(&token) {
+                        tokens.push(token);
+                    }
+                }
+            }
+            Err(error) => bhfeprintln!("bhf: warning: {error}; learned tokens not loaded"),
+        }
+    }
+    Ok(tokens)
+}
+
+/// The runtime-learned dictionary written beside a harness's `dictionary.txt`.
+pub(crate) const LEARNED_DICTIONARY_FILE: &str = "learned_dictionary.txt";
+/// Most tokens `learned_dictionary.txt` keeps.
+pub(crate) const LEARNED_DICTIONARY_MAX_TOKENS: usize = 256;
+/// Longest operand, in bytes, `learned_dictionary.txt` keeps.
+pub(crate) const LEARNED_TOKEN_MAX_LEN: usize = 64;
+/// The line that marks a `learned_dictionary.txt` written with only the
+/// comparison constants; a file without it (an earlier release's) held every
+/// operand, mutated inputs included.
+pub(crate) const LEARNED_CONSTANTS_MARKER: &str =
+    "# Tokens: the comparison constants, not the inputs compared with them.";
+/// The first lines of `learned_dictionary.txt`.
+pub(crate) const LEARNED_DICTIONARY_HEADER: &str = "\
+# Comparison operands observed at runtime while this harness was fuzzed
+# (the strcmp/memcmp-family operands recorded in cmplog.jsonl beside this
+# file), not mined from the source like dictionary.txt. A token is an operand
+# that met more distinct values at one comparison site than any of them met
+# there (the constant stays, the input compared with it varies), or one that
+# dictionary.txt also lists; a record that names no site only confirms a
+# dictionary.txt token, and a one-byte variant of a stronger token is left
+# out. Rewritten after each fuzz pass that recorded any: that run's constants
+# first, then the tokens an earlier run learned, deduplicated, at most 256
+# tokens of at most 64 bytes.
+# Tokens: the comparison constants, not the inputs compared with them.
+";
+
+/// Rewrite `<harness_dir>/learned_dictionary.txt` from the comparison
+/// operands in `<harness_dir>/cmplog.jsonl`: the comparison constants among
+/// them ([`cmplog::CmpLog::constant_operands`], with the harness's
+/// `dictionary.txt` corroborating an operand the records alone do not) of at most
+/// [`LEARNED_TOKEN_MAX_LEN`] bytes, then the tokens the file already held, up
+/// to [`LEARNED_DICTIONARY_MAX_TOKENS`]. A file an earlier release wrote,
+/// without [`LEARNED_CONSTANTS_MARKER`], held every operand: of its tokens
+/// only those this run found constant or `dictionary.txt` lists are kept; and
+/// an earlier token that is a one-byte edit of one already kept is dropped.
+/// Returns how many tokens were written; with no constant (no
+/// `cmplog.jsonl`, or none in it) the file is left as it was and 0 returned.
+pub(crate) fn write_learned_dictionary(harness_dir: &Path) -> std::io::Result<usize> {
+    let Ok(log) = cmplog::ingest_from_jsonl_log(&harness_dir.join("cmplog.jsonl")) else {
+        return Ok(0);
+    };
+    let mined = load_afl_dictionary_tokens(&harness_dir.join("dictionary.txt")).unwrap_or_default();
+    let mut tokens: Vec<Vec<u8>> = Vec::new();
+    let push = |tokens: &mut Vec<Vec<u8>>, token: Vec<u8>| {
+        if !token.is_empty()
+            && token.len() <= LEARNED_TOKEN_MAX_LEN
+            && tokens.len() < LEARNED_DICTIONARY_MAX_TOKENS
+            && !tokens.contains(&token)
+        {
+            tokens.push(token);
+        }
+    };
+    let constants = log.constant_operands(&mined);
+    for token in &constants {
+        push(&mut tokens, token.clone());
+    }
+    if tokens.is_empty() {
+        return Ok(0);
+    }
+    let path = harness_dir.join(LEARNED_DICTIONARY_FILE);
+    let filtered = std::fs::read_to_string(&path)
+        .is_ok_and(|text| text.lines().any(|line| line == LEARNED_CONSTANTS_MARKER));
+    if let Ok(earlier) = load_afl_dictionary_tokens(&path) {
+        for token in earlier {
+            let trusted = filtered || constants.contains(&token) || mined.contains(&token);
+            let variant = tokens
+                .iter()
+                .any(|kept| kept != &token && cmplog::one_byte_edit(kept, &token));
+            if trusted && !variant {
+                push(&mut tokens, token);
+            }
+        }
+    }
+    let mut out = String::from(LEARNED_DICTIONARY_HEADER);
+    for token in &tokens {
+        out.push('"');
+        out.push_str(&crate::generate_harness::escape_afl_dictionary_token(token));
+        out.push_str("\"\n");
+    }
+    crate::auto::report::atomic_write(&path, out.as_bytes())?;
+    Ok(tokens.len())
 }
 
 fn load_afl_dictionary_tokens(path: &Path) -> Result<Vec<Vec<u8>>, String> {
@@ -5220,7 +6289,7 @@ fn load_afl_dictionary_tokens(path: &Path) -> Result<Vec<Vec<u8>>, String> {
     Ok(tokens)
 }
 
-fn parse_afl_dictionary_line(line: &str) -> Result<Option<Vec<u8>>, String> {
+pub(crate) fn parse_afl_dictionary_line(line: &str) -> Result<Option<Vec<u8>>, String> {
     let trimmed = line.trim();
     if trimmed.is_empty() || trimmed.starts_with('#') {
         return Ok(None);
@@ -5379,44 +6448,92 @@ fn crash_testcase_key(path: &Path, max_len: usize) -> Option<u64> {
 /// later cascade pass (Empty/Rng/FuzzDriven) over the SAME harness does not
 /// re-emit a finding it already produced (#35: the cascade otherwise wrote the
 /// same root cause once per pass, inflating findings.csv / the findings dir /
-/// summary counts ~2-3x). Returns `(sanitizer-cluster keys, oracle-hit keys)`
-/// reconstructed to match the runtime keys `first_of_sanitizer_cluster` /
-/// `oracle_hit_dedupe_key` compute. Mirrors `existing_crash_testcases`.
-fn existing_finding_dedup_keys(work_dir: &Path, harness_id: &str) -> (Vec<String>, Vec<String>) {
-    let finding_record_limit = max_finding_record_bytes();
-    let dedup_limit = max_finding_dedup_keys();
-    let mut clusters = Vec::new();
-    let mut oracles = Vec::new();
-    let Ok(entries) = fs::read_dir(corpus::layout::findings_dir(work_dir)) else {
-        return (clusters, oracles);
-    };
-    for entry in entries.flatten() {
-        if clusters.len().saturating_add(oracles.len()) >= dedup_limit {
-            break;
-        }
-        let finding_path = entry.path().join("finding.json");
-        if fs::metadata(&finding_path).is_ok_and(|metadata| metadata.len() > finding_record_limit) {
-            continue;
-        }
-        let Ok(bytes) = fs::read(finding_path) else {
-            continue;
+/// summary counts ~2-3x). Holds the sanitizer-cluster and oracle-hit keys,
+/// reconstructed to match the runtime keys [`SanitizerClusterDedup`]
+/// ([`corpus::finding::sanitizer_dedupe_key`]) and `oracle_hit_dedupe_key`
+/// compute, and each finding's event signature, all mapped to the finding id,
+/// so a crash dropped as one of them is reported as a duplicate of that
+/// finding. Mirrors `existing_crash_testcases`.
+#[derive(Debug, Default)]
+struct ExistingFindings {
+    /// Sanitizer-crash dedupe key -> finding id.
+    clusters: HashMap<String, String>,
+    /// Oracle-hit dedupe key -> finding id.
+    oracles: HashMap<String, String>,
+    /// Event signature (hex) -> finding id, for the event-log lane.
+    signatures: HashMap<String, String>,
+}
+
+impl ExistingFindings {
+    fn load(work_dir: &Path, harness_id: &str) -> Self {
+        let finding_record_limit = max_finding_record_bytes();
+        let dedup_limit = max_finding_dedup_keys();
+        let mut existing = Self::default();
+        let Ok(entries) = fs::read_dir(corpus::layout::findings_dir(work_dir)) else {
+            return existing;
         };
-        let Ok(record) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-            continue;
-        };
-        if record.get("harness_id").and_then(|value| value.as_str()) != Some(harness_id) {
-            continue;
+        for entry in entries.flatten() {
+            if existing
+                .clusters
+                .len()
+                .saturating_add(existing.oracles.len())
+                >= dedup_limit
+                || existing.signatures.len() >= dedup_limit
+            {
+                break;
+            }
+            let finding_path = entry.path().join("finding.json");
+            if fs::metadata(&finding_path)
+                .is_ok_and(|metadata| metadata.len() > finding_record_limit)
+            {
+                continue;
+            }
+            let Ok(bytes) = fs::read(finding_path) else {
+                continue;
+            };
+            let Ok(record) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                continue;
+            };
+            if record.get("harness_id").and_then(|value| value.as_str()) != Some(harness_id) {
+                continue;
+            }
+            let id = record
+                .get("id")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+                .unwrap_or_else(|| entry.file_name().to_string_lossy().into_owned());
+            if let Some(signature) = record.get("signature").and_then(|value| value.as_str()) {
+                keep_lowest_id(&mut existing.signatures, signature.to_owned(), &id);
+            }
+            // Oracle hits key on rule_id|oracle_name|api (oracle_hit_dedupe_key),
+            // sanitizer crashes on the record's cluster_key_full: the root-cause
+            // key the emitter wrote in the harness's crash scope, which is the
+            // key corpus::finding::sanitizer_dedupe_key_scoped gives the report
+            // at runtime (an older fallback record's is its signature).
+            match corpus::finding::run_dedupe_key(&record) {
+                Some(corpus::finding::RunDedupeKey::Oracle(key)) => {
+                    keep_lowest_id(&mut existing.oracles, key, &id);
+                }
+                Some(corpus::finding::RunDedupeKey::Cluster(key)) => {
+                    keep_lowest_id(&mut existing.clusters, key, &id);
+                }
+                None => {}
+            }
         }
-        // Oracle hits key on rule_id|oracle_name|api (oracle_hit_dedupe_key),
-        // sanitizer crashes on cluster_key_full or rule:<id> on fallback
-        // (first_of_sanitizer_cluster).
-        match corpus::finding::run_dedupe_key(&record) {
-            Some(corpus::finding::RunDedupeKey::Oracle(key)) => oracles.push(key),
-            Some(corpus::finding::RunDedupeKey::Cluster(key)) => clusters.push(key),
-            None => {}
-        }
+        existing
     }
-    (clusters, oracles)
+}
+
+/// Map `key` to the lowest finding id that carries it, so the reported
+/// duplicate does not depend on directory order.
+fn keep_lowest_id(map: &mut HashMap<String, String>, key: String, id: &str) {
+    map.entry(key)
+        .and_modify(|current| {
+            if id < current.as_str() {
+                id.clone_into(current);
+            }
+        })
+        .or_insert_with(|| id.to_owned());
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5681,7 +6798,8 @@ pub(crate) fn replay_input_testcases(
 }
 
 /// Replay-verify a C/C++ sanitizer crash (#388): re-run the input in a fresh
-/// process and confirm it reproduces a sanitizer crash with the same `rule_id`.
+/// process and confirm it reproduces the same sanitizer crash (rule, kind and
+/// sink or reported site, see [`crate::crash_identity::same_crash`]).
 /// A passthrough libFuzzer harness can corrupt allocator state across inputs
 /// and crash in driver glue even on empty input; those faults do not reproduce
 /// and must not be reported (libFuzzer/AFL find zero on that class).
@@ -5712,12 +6830,265 @@ fn sanitizer_crash_reproduces(
         rss_limit_mb,
         deadline,
     ) {
+        // The same crash: rule, kind and sink (or reported site), compared
+        // the way `bhf replay` compares a reproduction with its finding.
         Ok(rerun) => rerun
             .sanitizer
             .as_ref()
-            .map(|fresh| fresh.rule_id == report.rule_id)
-            .unwrap_or(false),
+            .is_some_and(|fresh| crate::crash_identity::same_crash(report, fresh)),
         Err(_) => false,
+    }
+}
+
+/// The input format of the generated harness at `harness`: the
+/// `generation-metadata.json` beside the binary, else in the work dir's harness
+/// dirs for `harness_id` (a binary `bhf build` staged alone into `build/<id>/`).
+/// `None` for a harness bhf did not generate.
+pub(crate) fn harness_format_for(
+    harness: &Path,
+    work_dir: &Path,
+    harness_id: &str,
+) -> Option<crate::generate_harness::RecordedHarnessFormat> {
+    let beside = harness.parent().map(Path::to_path_buf);
+    beside
+        .into_iter()
+        .chain(crate::auto::layout::harness_dir_candidates(
+            work_dir, harness_id,
+        ))
+        .filter(|dir| dir.join("generation-metadata.json").is_file())
+        .find_map(|dir| crate::generate_harness::recorded_harness_format(&dir))
+}
+
+/// Stamp the generated harness's input format (its version, and the explicit
+/// buffer-length dimension when on) on every finding `emitter` writes.
+fn with_harness_format(
+    emitter: FindingEmitter,
+    harness: &Path,
+    work_dir: &Path,
+    harness_id: &str,
+) -> FindingEmitter {
+    let format = harness_format_for(harness, work_dir, harness_id);
+    emitter
+        .with_harness_format_version(format.as_ref().map(|format| format.version))
+        .with_buffer_len_dimension(format.is_some_and(|format| format.buffer_len_dimension))
+        .with_crash_scope(run_crash_scope(harness, work_dir, harness_id))
+}
+
+/// What this run's crashes without frames or a source position are grouped
+/// by ([`corpus::cluster::crash_scope`]): the harness id and the function its
+/// generation metadata names, read beside the binary or in the harness's dirs
+/// of the work dir (for a binary `bhf build` staged into `build/<id>/`). The
+/// emitter and the run's dedupe use the same scope.
+pub(crate) fn run_crash_scope(harness: &Path, work_dir: &Path, harness_id: &str) -> String {
+    let target = harness
+        .parent()
+        .map(Path::to_path_buf)
+        .into_iter()
+        .chain(crate::auto::layout::harness_dir_candidates(
+            work_dir, harness_id,
+        ))
+        .find_map(|dir| crate::generate_harness::recorded_target_function(&dir));
+    corpus::cluster::crash_scope(harness_id, target.as_deref())
+}
+
+/// Bounds on the argument-trace re-run of a new finding: the run's per-input
+/// timeout, but never less than a sanitized harness needs to start and never
+/// more than a single replay is allowed.
+const ARG_TRACE_TIMEOUT_MIN: Duration = Duration::from_secs(5);
+const ARG_TRACE_TIMEOUT_MAX: Duration = Duration::from_secs(30);
+/// The AFL++ lane has no per-input timeout of its own here.
+const AFL_REPLAY_TRACE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How a C/C++ harness takes the testcase for an argument-trace run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TraceInput {
+    /// `./harness <file>`: generated harnesses, the bhf driver, libFuzzer.
+    ArgvFile,
+    /// The bytes on stdin: AFL++ persistent-mode harnesses.
+    Stdin,
+}
+
+/// Whether a harness binary was generated with the argument trace: the name of
+/// the `BHF_TRACE_ARGS` switch is compiled into every harness that has one.
+pub(crate) fn harness_has_arg_trace(harness: &Path) -> bool {
+    let Ok(bytes) = fs::read(harness) else {
+        return false;
+    };
+    let needle = corpus::decoded_args::TRACE_ARGS_ENV.as_bytes();
+    bytes.windows(needle.len()).any(|window| window == needle)
+}
+
+/// Run `harness` once on `input` with its argument trace on and parse the
+/// `BHF_ARG` lines it prints. A harness without the trace, a failed run or a
+/// run that prints no trace lines is `Unavailable`, saying why.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn trace_arguments(
+    harness: &Path,
+    work_dir: &Path,
+    input: &[u8],
+    mode: TraceInput,
+    extra_env: &[(String, String)],
+    timeout: Duration,
+    qemu_prefix: Option<(&Path, &[String])>,
+) -> corpus::decoded_args::TraceOutcome {
+    use corpus::decoded_args::TraceOutcome;
+    // A harness that hands the input to the project's own
+    // `LLVMFuzzerTestOneInput` has no parameters to decode.
+    let mut source_dirs: Vec<PathBuf> = harness
+        .parent()
+        .map(Path::to_path_buf)
+        .into_iter()
+        .collect();
+    if let Some(id) = harness
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+    {
+        source_dirs.extend(crate::auto::layout::harness_dir_candidates(work_dir, id));
+    }
+    if crate::replay::is_passthrough_harness(&source_dirs) {
+        return TraceOutcome::Unavailable(crate::replay::PASSTHROUGH_NO_ARGUMENTS.to_owned());
+    }
+    if !harness_has_arg_trace(harness) {
+        return TraceOutcome::Unavailable(
+            "the harness was built without the argument trace; regenerate it with this bhf \
+             (or read the arguments under a debugger, see the C/C++ guide)"
+                .to_owned(),
+        );
+    }
+    let mut env = extra_env.to_vec();
+    env.retain(|(key, _)| key != corpus::decoded_args::TRACE_ARGS_ENV);
+    env.push((
+        corpus::decoded_args::TRACE_ARGS_ENV.to_owned(),
+        "1".to_owned(),
+    ));
+    let stderr = match mode {
+        TraceInput::ArgvFile => {
+            run_traced_argv(harness, work_dir, input, &env, timeout, qemu_prefix)
+        }
+        TraceInput::Stdin => run_traced_stdin(harness, work_dir, input, &env, timeout),
+    };
+    match stderr {
+        Ok(stderr) => {
+            let args = corpus::decoded_args::parse_arg_trace(&String::from_utf8_lossy(&stderr));
+            if args.is_empty() {
+                TraceOutcome::Unavailable(
+                    "the argument-trace run printed no BHF_ARG lines (the harness takes no \
+                     decoded arguments, or failed before decoding them)"
+                        .to_owned(),
+                )
+            } else {
+                TraceOutcome::Traced(args)
+            }
+        }
+        Err(error) => TraceOutcome::Unavailable(format!("the argument-trace run failed: {error}")),
+    }
+}
+
+fn run_traced_argv(
+    harness: &Path,
+    work_dir: &Path,
+    input: &[u8],
+    env: &[(String, String)],
+    timeout: Duration,
+    qemu_prefix: Option<(&Path, &[String])>,
+) -> Result<Vec<u8>, String> {
+    let dir = work_dir.join("fuzz_inputs");
+    fs::create_dir_all(&dir)
+        .map_err(|error| format!("create fuzz inputs dir '{}': {error}", dir.display()))?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = dir.join(format!("trace-{}-{nonce}.bin", std::process::id()));
+    fs::write(&path, input)
+        .map_err(|error| format!("write trace input '{}': {error}", path.display()))?;
+    let output = run_with_timeout(
+        harness,
+        &path,
+        timeout,
+        env,
+        &ensure_harness_scratch(work_dir)?,
+        0,
+        qemu_prefix,
+    );
+    let _ = fs::remove_file(&path);
+    Ok(output?.stderr)
+}
+
+fn run_traced_stdin(
+    harness: &Path,
+    work_dir: &Path,
+    input: &[u8],
+    env: &[(String, String)],
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
+    let mut command = std::process::Command::new(harness);
+    command
+        .current_dir(ensure_harness_scratch(work_dir)?)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    apply_runaway_rlimits(&mut command);
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("spawn '{}': {error}", harness.display()))?;
+    let stderr_reader = drain_child_stderr(child.stderr.take());
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(input);
+    }
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(collected_child_output(status, stderr_reader).stderr),
+            Ok(None) if Instant::now() >= deadline => {
+                kill_process_group(&mut child);
+                let status = child
+                    .wait()
+                    .map_err(|error| format!("reap '{}': {error}", harness.display()))?;
+                return Ok(collected_child_output(status, stderr_reader).stderr);
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(error) => {
+                kill_process_group(&mut child);
+                let _ = child.wait();
+                return Err(format!("poll '{}': {error}", harness.display()));
+            }
+        }
+    }
+}
+
+/// Record the decoded arguments of a new C/C++ finding: re-run its testcase
+/// once with the argument trace on and write them to its `decoded.json` and
+/// `finding.json` (see [`corpus::decoded_args::record_trace`]). Called once per
+/// emitted finding, which is once per new crash cluster.
+#[allow(clippy::too_many_arguments)]
+fn record_finding_arguments(
+    work_dir: &Path,
+    finding_id: &str,
+    harness: &Path,
+    input: &[u8],
+    mode: TraceInput,
+    extra_env: &[(String, String)],
+    per_input_timeout: Duration,
+    qemu_prefix: Option<(&Path, &[String])>,
+) {
+    let timeout = per_input_timeout.clamp(ARG_TRACE_TIMEOUT_MIN, ARG_TRACE_TIMEOUT_MAX);
+    let outcome = trace_arguments(
+        harness,
+        work_dir,
+        input,
+        mode,
+        extra_env,
+        timeout,
+        qemu_prefix,
+    );
+    let finding_dir = corpus::layout::finding_dir(work_dir, finding_id);
+    if let Err(error) = corpus::decoded_args::record_trace(&finding_dir, input, &outcome) {
+        bhfeprintln!("warning: could not record the decoded arguments of {finding_id}: {error}");
     }
 }
 
@@ -5790,7 +7161,8 @@ struct ForkServer {
 }
 
 enum ForkOutcome {
-    Ran(HarnessRun),
+    /// Boxed: a run result carries the parsed sanitizer report.
+    Ran(Box<HarnessRun>),
     /// The process exited/crashed/hung handling this input; respawn + re-run.
     Died,
 }
@@ -5807,6 +7179,60 @@ fn fork_run_timeout_ms(timeout: Duration) -> i32 {
     timeout.as_millis().clamp(1, i32::MAX as u128) as i32
 }
 
+/// A child's stdout is readable once it writes or exits, and not while it is
+/// alive and silent, so a harness that never answers the fork-server
+/// handshake (or hangs on an input) times out instead of blocking the run.
+#[cfg(all(test, any(unix, windows)))]
+#[test]
+fn fork_server_pipe_wait_times_out_on_a_silent_child() {
+    use std::process::{Command, Stdio};
+    let shell = |script_unix: &str, script_windows: &str| {
+        let mut command = if cfg!(windows) {
+            let mut command = Command::new("cmd");
+            command.args(["/c", script_windows]);
+            command
+        } else {
+            let mut command = Command::new("sh");
+            command.args(["-c", script_unix]);
+            command
+        };
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    };
+
+    let mut silent = shell("sleep 5", "ping -n 6 127.0.0.1 > nul");
+    let started = Instant::now();
+    assert!(!stdout_readable_within(
+        silent.stdout.as_ref().unwrap(),
+        200
+    ));
+    let waited = started.elapsed();
+    assert!(waited >= Duration::from_millis(150), "{waited:?}");
+    assert!(waited < Duration::from_secs(3), "{waited:?}");
+    let _ = silent.kill();
+    let _ = silent.wait();
+
+    let mut writer = shell("echo ready", "echo ready");
+    assert!(stdout_readable_within(
+        writer.stdout.as_ref().unwrap(),
+        3_000
+    ));
+    let _ = writer.wait();
+
+    // An exited child's pipe reads as end of file: readable, so the caller's
+    // read reports the death.
+    let mut exited = shell("exit 0", "exit 0");
+    let _ = exited.wait();
+    assert!(stdout_readable_within(
+        exited.stdout.as_ref().unwrap(),
+        3_000
+    ));
+}
+
 #[cfg(test)]
 #[test]
 fn fork_server_wait_inherits_short_pass_budget() {
@@ -5815,35 +7241,75 @@ fn fork_server_wait_inherits_short_pass_budget() {
     assert_eq!(fork_run_timeout_ms(Duration::from_secs(3)), 3_000);
 }
 
-/// Block until `fd` is readable or `timeout_ms` elapses. Returns true if
-/// readable, false on timeout/error (caller treats either as "no response").
+/// Block until the child's `stdout` is readable (it wrote, or it exited) or
+/// `timeout_ms` elapses. Returns true if readable, false on timeout/error
+/// (caller treats either as "no response").
 #[cfg(unix)]
-fn fd_readable_within(fd: std::os::unix::io::RawFd, timeout_ms: i32) -> bool {
+fn stdout_readable_within(stdout: &std::process::ChildStdout, timeout_ms: i32) -> bool {
+    use std::os::unix::io::AsRawFd;
     let mut pfd = libc::pollfd {
-        fd,
+        fd: stdout.as_raw_fd(),
         events: libc::POLLIN,
         revents: 0,
     };
     // SAFETY: `pfd` is a valid initialized pollfd for the duration of the call.
     unsafe { libc::poll(&mut pfd, 1, timeout_ms) > 0 }
 }
-#[cfg(not(unix))]
-fn fd_readable_within(_fd: i32, _timeout_ms: i32) -> bool {
-    true
+
+/// Windows has no `poll` for an anonymous pipe; `PeekNamedPipe` reports the
+/// bytes waiting in it, and fails once the writer has closed it. Polled: a
+/// short spin first, as a fork-server answer usually comes within
+/// microseconds, then millisecond sleeps.
+#[cfg(windows)]
+fn stdout_readable_within(stdout: &std::process::ChildStdout, timeout_ms: i32) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn PeekNamedPipe(
+            pipe: *mut std::ffi::c_void,
+            buffer: *mut std::ffi::c_void,
+            buffer_size: u32,
+            bytes_read: *mut u32,
+            bytes_available: *mut u32,
+            bytes_left_this_message: *mut u32,
+        ) -> i32;
+    }
+    let handle = stdout.as_raw_handle();
+    let started = Instant::now();
+    let timeout = Duration::from_millis(u64::try_from(timeout_ms).unwrap_or(0));
+    loop {
+        let mut available = 0u32;
+        // SAFETY: `handle` is the live read end of the child's stdout pipe,
+        // owned by `stdout` for the duration of the call; no buffer is passed.
+        let peeked = unsafe {
+            PeekNamedPipe(
+                handle,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            )
+        };
+        // A failed peek is a closed pipe: the read that follows reports it.
+        if peeked == 0 || available > 0 {
+            return true;
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= timeout {
+            return false;
+        }
+        if elapsed < Duration::from_millis(2) {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
 }
 
-/// The raw fd of a child's stdout for the readability poll on unix; a dummy on
-/// other platforms (where `fd_readable_within` ignores it and returns `true`, so
-/// the caller falls through to a blocking `read_exact`). Keeps the fork-server
-/// handshake/sync code platform-agnostic without sprinkling `os::unix` imports.
-#[cfg(unix)]
-fn child_stdout_fd(stdout: &std::process::ChildStdout) -> std::os::unix::io::RawFd {
-    use std::os::unix::io::AsRawFd;
-    stdout.as_raw_fd()
-}
-#[cfg(not(unix))]
-fn child_stdout_fd(_stdout: &std::process::ChildStdout) -> i32 {
-    0
+#[cfg(not(any(unix, windows)))]
+fn stdout_readable_within(_stdout: &std::process::ChildStdout, _timeout_ms: i32) -> bool {
+    true
 }
 
 impl ForkServer {
@@ -5898,10 +7364,11 @@ impl ForkServer {
         // protocol (a C/libFuzzer harness, a stale build, a test mock) -> bail so
         // the caller uses the per-spawn path.
         use std::io::Read;
-        let fd = child_stdout_fd(&stdout);
         let mut ready = [0u8; 1];
         let handshake_timeout_ms = FORK_HANDSHAKE_TIMEOUT_MS.min(fork_run_timeout_ms(run_timeout));
-        if !fd_readable_within(fd, handshake_timeout_ms) || stdout.read_exact(&mut ready).is_err() {
+        if !stdout_readable_within(&stdout, handshake_timeout_ms)
+            || stdout.read_exact(&mut ready).is_err()
+        {
             kill_process_group(&mut child);
             let _ = child.wait();
             let _ = fs::remove_file(&events_path);
@@ -5956,7 +7423,7 @@ impl ForkServer {
             return ForkOutcome::Died;
         }
         match self.read_event_delta() {
-            Ok(run) => ForkOutcome::Ran(run),
+            Ok(run) => ForkOutcome::Ran(Box::new(run)),
             Err(_) => ForkOutcome::Died,
         }
     }
@@ -5966,14 +7433,13 @@ impl ForkServer {
     /// polls in short slices, returning `false` if the child's RSS breaches the
     /// ceiling (or the whole-input timeout elapses) so the caller can isolate it.
     fn await_sync_within_rss_limit(&self) -> bool {
-        let fd = child_stdout_fd(&self.stdout);
         if self.rss_limit_mb == 0 {
-            return fd_readable_within(fd, self.run_timeout_ms);
+            return stdout_readable_within(&self.stdout, self.run_timeout_ms);
         }
         const RSS_POLL_INTERVAL_MS: i32 = 25;
         let deadline = Instant::now() + Duration::from_millis(self.run_timeout_ms as u64);
         loop {
-            if fd_readable_within(fd, RSS_POLL_INTERVAL_MS) {
+            if stdout_readable_within(&self.stdout, RSS_POLL_INTERVAL_MS) {
                 return true;
             }
             if self.rss_exceeded() || Instant::now() >= deadline {
@@ -6291,6 +7757,25 @@ mod signal_classification_tests {
         );
     }
 
+    /// A fatal signal names its signal as the report's check, so an abort and
+    /// an illegal instruction with no frames are two signatures, two
+    /// root-cause keys and two findings.
+    #[test]
+    fn fatal_signal_reports_of_different_signals_have_different_identities() {
+        let abort = super::fatal_signal_report(&ExitStatus::from_raw(6), "");
+        let illegal = super::fatal_signal_report(&ExitStatus::from_raw(4), "");
+        assert_eq!(abort.check.as_deref(), Some("SIGABRT"));
+        assert_eq!(illegal.check.as_deref(), Some("SIGILL"));
+        assert_ne!(
+            corpus::finding::sanitizer_signature(&abort),
+            corpus::finding::sanitizer_signature(&illegal)
+        );
+        assert_ne!(
+            corpus::finding::sanitizer_dedupe_key_scoped(&abort, "H-1"),
+            corpus::finding::sanitizer_dedupe_key_scoped(&illegal, "H-1")
+        );
+    }
+
     #[test]
     fn windows_crash_sentinel_exit_is_a_crash_not_a_rejection() {
         // Under wine a guest fault carries NO POSIX signal; the driver's vectored
@@ -6307,6 +7792,95 @@ mod signal_classification_tests {
             is_input_rejection(&ExitStatus::from_raw(2 << 8), ""),
             "an ordinary nonzero exit remains an input rejection",
         );
+    }
+}
+
+/// bhf's driver in a build without a sanitizer runtime reports where a fatal
+/// signal hit before it dies by that signal, so frame-less crashes of one
+/// harness can be told apart.
+#[cfg(all(test, target_os = "linux"))]
+mod fatal_signal_driver_tests {
+    use std::os::unix::process::ExitStatusExt;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    const TARGET: &str = r#"
+#include <stdint.h>
+#include <stddef.h>
+#include <signal.h>
+__attribute__((noinline)) static void copy_at(volatile char *p) { *p = 1; }
+__attribute__((noinline)) static int bit_index(const volatile int *p) { return *p >> 3; }
+int bhf_run_one(const uint8_t *data, size_t size) {
+    if (size > 0 && data[0] == 'A') copy_at((volatile char *)0);
+    if (size > 0 && data[0] == 'B') return bit_index((const volatile int *)8);
+    if (size > 0 && data[0] == 'T') raise(SIGTRAP);
+    return 0;
+}
+"#;
+
+    /// Build the target with bhf's driver and no sanitizer, as a cross build
+    /// without a sanitizer runtime is.
+    fn build(dir: &Path) -> Option<PathBuf> {
+        let driver = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../c_runtime/bhf_driver.c");
+        std::fs::write(dir.join("target.c"), TARGET).unwrap();
+        let output = Command::new("cc")
+            .current_dir(dir)
+            .args(["-O1", "-g", "-o", "main", "target.c"])
+            .arg(&driver)
+            .output()
+            .ok()?;
+        output.status.success().then(|| dir.join("main"))
+    }
+
+    fn run(harness: &Path, dir: &Path, input: &[u8]) -> (std::process::ExitStatus, String) {
+        let testcase = dir.join("testcase.bin");
+        std::fs::write(&testcase, input).unwrap();
+        let output = Command::new(harness).arg(&testcase).output().unwrap();
+        (
+            output.status,
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    }
+
+    #[test]
+    fn a_fault_prints_the_signal_and_pc_and_still_dies_by_the_signal() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(harness) = build(dir.path()) else {
+            eprintln!("skipping: no C compiler");
+            return;
+        };
+        let (status, stderr) = run(&harness, dir.path(), b"A");
+        assert_eq!(status.signal(), Some(11), "{stderr}");
+        let line = stderr
+            .lines()
+            .find(|line| line.starts_with("bhf: fatal signal SIGSEGV pc=0x"))
+            .unwrap_or_else(|| panic!("no fatal-signal line in {stderr:?}"));
+        assert!(line.contains(" addr=0x0"), "{line}");
+        assert!(line.contains(" exe_offset=0x"), "{line}");
+
+        let copy_at = super::fatal_signal_report(&status, &stderr);
+        let offset = copy_at
+            .pc_offset
+            .expect("the pc offset is read from the line");
+        let (status, stderr) = run(&harness, dir.path(), b"B");
+        assert_eq!(status.signal(), Some(11), "{stderr}");
+        let bit_index = super::fatal_signal_report(&status, &stderr);
+        assert_ne!(bit_index.pc_offset, Some(offset), "two sites, two offsets");
+        assert_ne!(
+            corpus::finding::sanitizer_signature(&copy_at),
+            corpus::finding::sanitizer_signature(&bit_index)
+        );
+        // The same input faults at the same offset in every run (ASLR moves
+        // the absolute pc, not the offset).
+        let (status, stderr) = run(&harness, dir.path(), b"A");
+        assert_eq!(
+            super::fatal_signal_report(&status, &stderr).pc_offset,
+            Some(offset)
+        );
+        // No crash, no line.
+        let (status, stderr) = run(&harness, dir.path(), b"ok");
+        assert!(status.success(), "{stderr}");
+        assert!(!stderr.contains("bhf: fatal signal"), "{stderr}");
     }
 }
 
@@ -6463,7 +8037,7 @@ mod engine_list_tests {
 
 #[cfg(test)]
 mod dedup_seed_tests {
-    use super::existing_finding_dedup_keys;
+    use super::{ExistingFindings, SanitizerClusterDedup};
 
     #[test]
     fn seeds_sanitizer_cluster_and_oracle_keys_from_findings_dir() {
@@ -6486,7 +8060,8 @@ mod dedup_seed_tests {
             .unwrap(),
         )
         .unwrap();
-        // A fallback sanitizer-crash finding (keyed by rule).
+        // A fallback sanitizer-crash finding: keyed by its own cluster key (its
+        // signature), not by one `rule:<id>` shared by every crash of the rule.
         let f = findings.join("F-0002-bbbb");
         std::fs::create_dir_all(&f).unwrap();
         std::fs::write(
@@ -6495,6 +8070,7 @@ mod dedup_seed_tests {
                 "id": "F-0002-bbbb",
                 "harness_id": "H-TEST",
                 "rule_id": "BHF-210",
+                "cluster_key_full": "f00d",
                 "cluster_fallback": true,
             }))
             .unwrap(),
@@ -6515,17 +8091,122 @@ mod dedup_seed_tests {
         )
         .unwrap();
 
-        let (clusters, oracles) = existing_finding_dedup_keys(work.path(), "H-TEST");
-        assert!(clusters.contains(&"deadbeef".to_owned()));
-        assert!(clusters.contains(&"rule:BHF-210".to_owned()));
-        assert!(oracles.contains(&"BHF-405|path-traversal|open".to_owned()));
+        let existing = ExistingFindings::load(work.path(), "H-TEST");
+        assert_eq!(
+            existing.clusters.get("deadbeef").map(String::as_str),
+            Some("F-0001-aaaa")
+        );
+        assert_eq!(
+            existing.clusters.get("f00d").map(String::as_str),
+            Some("F-0002-bbbb")
+        );
+        assert!(!existing.clusters.keys().any(|key| key.starts_with("rule:")));
+        assert_eq!(
+            existing
+                .oracles
+                .get("BHF-405|path-traversal|open")
+                .map(String::as_str),
+            Some("F-0003-cccc")
+        );
+    }
+
+    #[test]
+    fn a_key_shared_by_several_findings_maps_to_the_lowest_id() {
+        let work = tempfile::tempdir().unwrap();
+        let findings = work.path().join("results").join("findings");
+        for id in ["F-0007-ffff", "F-0002-eeee", "F-0009-dddd"] {
+            let dir = findings.join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("finding.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "id": id,
+                    "harness_id": "H-TEST",
+                    "rule_id": "BHF-201",
+                    "cluster_key_full": "c0ffee",
+                    "signature": "5151",
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        let existing = ExistingFindings::load(work.path(), "H-TEST");
+        assert_eq!(
+            existing.clusters.get("c0ffee").map(String::as_str),
+            Some("F-0002-eeee")
+        );
+        assert_eq!(
+            existing.signatures.get("5151").map(String::as_str),
+            Some("F-0002-eeee")
+        );
+    }
+
+    /// A later pass re-seeds exactly the key the loop computes for the crash a
+    /// prior pass emitted, and nothing that would hide a different site.
+    #[test]
+    fn seeded_keys_match_the_runtime_key_of_an_emitted_finding() {
+        let work = tempfile::tempdir().unwrap();
+        let report = |line: u32| {
+            corpus::parse_sanitizer_report(&format!(
+                "/src/widget/a.c:{line}:5: runtime error: execution reached the end of a value-returning function without returning a value\n"
+            ))
+            .unwrap()
+        };
+        corpus::finding::FindingEmitter::with_metadata(
+            work.path().to_path_buf(),
+            "H-TEST".to_owned(),
+            "c".to_owned(),
+            String::new(),
+        )
+        .emit_sanitizer_crash(b"x", &report(3))
+        .unwrap();
+        let existing = ExistingFindings::load(work.path(), "H-TEST");
+        let clusters: Vec<&String> = existing.clusters.keys().collect();
+        assert_eq!(
+            clusters,
+            vec![&corpus::finding::sanitizer_dedupe_key(&report(3))]
+        );
+        assert!(!existing
+            .clusters
+            .contains_key(&corpus::finding::sanitizer_dedupe_key(&report(9))));
+    }
+
+    /// A frame-less crash written by an earlier pass is a duplicate for a run
+    /// keyed in the same scope, and a new root cause for another harness.
+    #[test]
+    fn a_frameless_crash_from_disk_is_a_duplicate_only_in_its_scope() {
+        let work = tempfile::tempdir().unwrap();
+        let report = corpus::SanitizerReport {
+            kind: "fatal-signal".to_owned(),
+            rule_id: "BHF-210",
+            message: "harness crashed with SIGSEGV and no sanitizer report".to_owned(),
+            ..Default::default()
+        };
+        let scope = corpus::cluster::crash_scope("H-TEST", Some("parse_record"));
+        corpus::finding::FindingEmitter::with_metadata(
+            work.path().to_path_buf(),
+            "H-TEST".to_owned(),
+            "c".to_owned(),
+            String::new(),
+        )
+        .with_crash_scope(scope.clone())
+        .emit_sanitizer_crash(b"x", &report)
+        .unwrap();
+        let existing = ExistingFindings::load(work.path(), "H-TEST");
+        let mut same =
+            SanitizerClusterDedup::new(existing.clusters.keys().cloned()).with_scope(scope.clone());
+        assert_eq!(same.first_sighting(&report), None);
+        let mut other = SanitizerClusterDedup::new(existing.clusters.keys().cloned())
+            .with_scope(corpus::cluster::crash_scope("H-OTHER", None));
+        assert!(other.first_sighting(&report).is_some());
     }
 
     #[test]
     fn missing_findings_dir_yields_empty_seeds() {
         let work = tempfile::tempdir().unwrap();
-        let (clusters, oracles) = existing_finding_dedup_keys(work.path(), "H-TEST");
-        assert!(clusters.is_empty() && oracles.is_empty());
+        let existing = ExistingFindings::load(work.path(), "H-TEST");
+        assert!(existing.clusters.is_empty() && existing.oracles.is_empty());
+        assert!(existing.signatures.is_empty());
     }
 }
 
@@ -7110,13 +8791,39 @@ mod fuzz_child_env_tests {
             // ...but NOT symbolize=0. AFL++ needs that on its own child; setting
             // it here stripped file:line from every builtin child's report, and
             // file:line is what joins a crash to the static finding at the same
-            // line, so fuzz_confirmed silently became fuzz_exercised.
+            // line, so fuzz_confirmed silently became fuzz_exercised. The
+            // child turns it on explicitly instead.
             assert!(
-                !value.1.contains("symbolize"),
+                !value.1.contains("symbolize=0") && value.1.contains("symbolize=1"),
                 "{key} must leave symbolization on for the fuzz-confirmation join: {}",
                 value.1
             );
         }
+    }
+
+    #[test]
+    fn arms_ubsan_stack_traces_and_check_names_for_the_default_builtin_child() {
+        // Without print_stacktrace=1 a UBSan report has no frames: no function
+        // name for the sink and nothing but rule|kind for its identity.
+        // report_error_type=1 makes the SUMMARY name the failed check.
+        let mut env: Vec<(String, String)> = Vec::new();
+        apply_fuzz_child_env_overrides(&mut env);
+        let value = |key: &str| {
+            env.iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+                .unwrap()
+        };
+        let ubsan = value("UBSAN_OPTIONS");
+        for key in [
+            "print_stacktrace=1",
+            "report_error_type=1",
+            "halt_on_error=1",
+        ] {
+            assert!(ubsan.contains(key), "UBSAN_OPTIONS lacks {key}: {ubsan}");
+        }
+        // They are UBSan flags; ASAN_OPTIONS keeps only its own keys.
+        assert!(!value("ASAN_OPTIONS").contains("print_stacktrace"));
     }
 
     #[test]
@@ -7224,12 +8931,25 @@ mod auto_path_tests {
                 })
                 .collect(),
             message: "boom".to_owned(),
+            ..Default::default()
+        }
+    }
+
+    /// Report and consume in one step, as the loop does for a crash it does not
+    /// need to confirm.
+    fn sighted(dedup: &mut SanitizerClusterDedup, report: &corpus::SanitizerReport) -> bool {
+        match dedup.first_sighting(report) {
+            Some(key) => {
+                dedup.consumed(key);
+                true
+            }
+            None => false,
         }
     }
 
     #[test]
     fn sanitizer_cluster_dedup_emits_once_per_root_cause() {
-        let mut seen = HashMap::new();
+        let mut dedup = SanitizerClusterDedup::new(Vec::new());
         // Same target frames, different scaffolding -> one cluster.
         let a1 = sanitizer_report(
             "BHF-201",
@@ -7239,12 +8959,133 @@ mod auto_path_tests {
         // Different target frame -> a second cluster.
         let b = sanitizer_report("BHF-201", vec!["other_fn", "LLVMFuzzerTestOneInput"]);
 
-        assert!(first_of_sanitizer_cluster(&mut seen, &a1));
-        assert!(!first_of_sanitizer_cluster(&mut seen, &a2));
-        assert!(first_of_sanitizer_cluster(&mut seen, &b));
-        // Two clusters, three total hits.
-        assert_eq!(seen.len(), 2);
-        assert_eq!(seen.values().sum::<usize>(), 3);
+        assert!(sighted(&mut dedup, &a1));
+        assert!(!sighted(&mut dedup, &a2));
+        assert!(sighted(&mut dedup, &b));
+        // Two clusters, three total hits: one later hit folded into `a`.
+        let duplicates = dedup.duplicate_hits();
+        assert_eq!(duplicates.len(), 1);
+        assert_eq!(
+            duplicates.get(&corpus::finding::sanitizer_dedupe_key(&a1)),
+            Some(&1)
+        );
+    }
+
+    fn missing_return_at(line: u32) -> corpus::SanitizerReport {
+        corpus::parse_sanitizer_report(&format!(
+            "/src/widget/classify.c:{line}:5: runtime error: execution reached the end of a value-returning function without returning a value\n\
+             SUMMARY: UndefinedBehaviorSanitizer: missing-return /src/widget/classify.c:{line}:5 \n"
+        ))
+        .unwrap()
+    }
+
+    /// A harness used to emit at most one stackless finding per rule for its
+    /// whole run: every later, different UB site was a "duplicate".
+    #[test]
+    fn frameless_ubsan_reports_at_distinct_sites_are_each_reported() {
+        let mut dedup = SanitizerClusterDedup::new(Vec::new());
+        assert!(sighted(&mut dedup, &missing_return_at(3)));
+        assert!(sighted(&mut dedup, &missing_return_at(9)));
+        assert!(!sighted(&mut dedup, &missing_return_at(3)));
+    }
+
+    /// The key is consumed only by an emitted finding: a first hit that does not
+    /// reproduce in a fresh process must not hide a later, reproducible one.
+    #[test]
+    fn a_crash_that_does_not_reproduce_does_not_consume_its_key() {
+        let mut dedup = SanitizerClusterDedup::new(Vec::new());
+        let report = missing_return_at(3);
+        let key = dedup.first_sighting(&report).expect("first sighting");
+        dedup.unconfirmed(key);
+        let key = dedup
+            .first_sighting(&report)
+            .expect("still unreported after a failed confirmation");
+        dedup.consumed(key);
+        assert!(dedup.first_sighting(&report).is_none());
+    }
+
+    /// ...but a crash that never reproduces stops costing a fresh re-run per hit.
+    #[test]
+    fn a_crash_that_never_reproduces_stops_being_retried() {
+        let mut dedup = SanitizerClusterDedup::new(Vec::new());
+        let report = missing_return_at(3);
+        for _ in 0..MAX_UNCONFIRMED_SANITIZER_ATTEMPTS {
+            let key = dedup.first_sighting(&report).expect("retried");
+            dedup.unconfirmed(key);
+        }
+        assert!(dedup.first_sighting(&report).is_none());
+    }
+
+    /// A root cause given up after failed confirmations was never reported, so
+    /// its later hits are not duplicates of a finding.
+    #[test]
+    fn hits_of_a_root_cause_that_never_reproduced_are_not_duplicates() {
+        let mut dedup = SanitizerClusterDedup::new(Vec::new());
+        let report = missing_return_at(3);
+        for _ in 0..MAX_UNCONFIRMED_SANITIZER_ATTEMPTS {
+            let key = dedup.first_sighting(&report).expect("retried");
+            dedup.unconfirmed(key);
+        }
+        assert!(dedup.first_sighting(&report).is_none());
+        assert!(dedup.first_sighting(&report).is_none());
+        assert!(
+            dedup.duplicate_hits().is_empty(),
+            "{:?}",
+            dedup.duplicate_hits()
+        );
+        let key = corpus::finding::sanitizer_dedupe_key(&report);
+        let tries = MAX_UNCONFIRMED_SANITIZER_ATTEMPTS as usize;
+        assert_eq!(dedup.unreproduced_hits().get(&key), Some(&(tries + 2)));
+        assert_eq!(dedup.skipped_unreproduced_hits(), 2);
+
+        // A root cause still open after one failed confirmation is listed too.
+        let other = missing_return_at(9);
+        let key = dedup.first_sighting(&other).expect("first sighting");
+        dedup.unconfirmed(key.clone());
+        assert_eq!(dedup.unreproduced_hits().get(&key), Some(&1));
+        // ...until a later hit reproduces and is reported.
+        let key = dedup.first_sighting(&other).expect("still open");
+        dedup.consumed(key.clone());
+        assert_eq!(dedup.unreproduced_hits().get(&key), None);
+    }
+
+    /// AFL++ crash ingestion keys on the same root-cause key as the builtin
+    /// loop; its old `rule_id|frames` key made every stackless report of a rule
+    /// one crash.
+    #[test]
+    fn afl_ingestion_keeps_distinct_frameless_sites() {
+        let mut dedup = SanitizerClusterDedup::new(Vec::new());
+        assert!(afl_crash_is_new(&mut dedup, &missing_return_at(3)));
+        assert!(afl_crash_is_new(&mut dedup, &missing_return_at(9)));
+        assert!(!afl_crash_is_new(&mut dedup, &missing_return_at(9)));
+        assert_eq!(dedup.duplicate_hits().values().sum::<usize>(), 1);
+    }
+
+    /// #416: when the fork-server missed a crash that a fresh process caught,
+    /// the fresh run's raw stderr travels with its report so the finding gets a
+    /// `sanitizer.log`.
+    #[test]
+    fn a_fresh_rerun_hands_over_its_stderr_with_its_report() {
+        let mut run = HarnessRun {
+            events: Vec::new(),
+            testcases: Vec::new(),
+            sanitizer: None,
+            stderr: None,
+            rejected: false,
+        };
+        let fresh = HarnessRun {
+            events: Vec::new(),
+            testcases: Vec::new(),
+            sanitizer: Some(sanitizer_report("BHF-201", vec!["copy_at"])),
+            stderr: Some("==1==ERROR: AddressSanitizer: heap-buffer-overflow".to_owned()),
+            rejected: false,
+        };
+        adopt_fresh_rerun(&mut run, fresh);
+        assert!(run.sanitizer.is_some());
+        assert_eq!(
+            run.stderr.as_deref(),
+            Some("==1==ERROR: AddressSanitizer: heap-buffer-overflow")
+        );
     }
 
     #[test]
@@ -7286,6 +9127,34 @@ mod auto_path_tests {
         let clean_runner = replay_min::HarnessRunner::direct(clean);
         assert!(!sanitizer_crash_reproduces(
             &clean_runner,
+            &work,
+            b"x",
+            &report,
+            &[],
+            Duration::from_secs(5),
+            0,
+            None,
+        ));
+    }
+
+    /// The fresh-process confirmation is a reproduction only when the re-run
+    /// crashes at the same sink, not merely with the same rule.
+    #[test]
+    #[cfg(unix)]
+    fn sanitizer_crash_reproduces_requires_the_same_sink() {
+        use std::os::unix::fs::PermissionsExt;
+        let work = tmpdir();
+        let elsewhere = work.join("elsewhere");
+        fs::write(
+            &elsewhere,
+            "#!/bin/sh\n>&2 echo 'ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1'\n\
+             >&2 echo '    #0 0x1 in other_parse /src/p.c:30'\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o755)).unwrap();
+        let report = sanitizer_report("BHF-201", vec!["real_parse"]);
+        assert!(!sanitizer_crash_reproduces(
+            &replay_min::HarnessRunner::direct(elsewhere),
             &work,
             b"x",
             &report,
@@ -7662,6 +9531,196 @@ mod auto_path_tests {
         assert_eq!(finding["paths"]["sanitizer_log"], "sanitizer.log");
     }
 
+    /// The shell harness of the argument-trace tests: with BHF_TRACE_ARGS=1
+    /// it prints a trace line first, and it always reports a heap overflow one
+    /// byte past the traced buffer.
+    #[cfg(unix)]
+    const TRACING_CRASH_SCRIPT: &str = "#!/bin/sh\n\
+        if [ \"$BHF_TRACE_ARGS\" = 1 ]; then >&2 echo 'BHF_ARG {\"call\":\"target\",\"i\":0,\"role\":\"param\",\"name\":\"buffer\",\"type\":\"const char *\",\"span\":[0,2],\"ptr\":\"0x502000000030\",\"alloc_size\":1,\"len\":0,\"preview_hex\":\"\"}'; fi\n\
+        >&2 echo '==1==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x502000000031 at pc 0x1 bp 0x2 sp 0x3'\n\
+        >&2 echo 'READ of size 4 at 0x502000000031 thread T0'\n\
+        >&2 echo '    #0 0x1 in real_parse /src/p.c:9'\n\
+        >&2 echo '0x502000000031 is located 0 bytes after 1-byte region [0x502000000030,0x502000000031)'\n\
+        exit 1\n";
+
+    /// A pass records its harness's input format in the corpus it fills,
+    /// even when it finds nothing, so a later run can tell the corpus's
+    /// format.
+    #[test]
+    #[cfg(unix)]
+    fn a_pass_without_findings_records_the_corpus_format() {
+        let root = tmpdir();
+        let work_dir = root.join("bhf_work");
+        let harness = write_c_libfuzzer_harness(
+            &work_dir,
+            "H-QUIET",
+            "#!/bin/sh
+exit 0
+",
+        );
+        fs::write(
+            harness.with_file_name("generation-metadata.json"),
+            r#"{"schema_version":1,"harness_format_version":4,"language":"c"}"#,
+        )
+        .unwrap();
+        let summary = run_one_target_programmatic(
+            &work_dir,
+            "H-QUIET",
+            vec![b"seed".to_vec()],
+            1,
+            None,
+            None,
+            0,
+            &[],
+            actionability::RunMode::Reporting,
+            None,
+            &[],
+            None,
+        )
+        .expect("a clean pass");
+        assert!(summary.findings.is_empty());
+        let format = corpus::finding::recorded_corpus_format(&work_dir, "H-QUIET")
+            .expect("the corpus records its format");
+        assert_eq!(format.version, 4);
+        assert!(!format.buffer_len_dimension);
+    }
+
+    /// A new finding is re-run once with the argument trace on, and its
+    /// decoded arguments land in decoded.json and finding.json, with the
+    /// overflowed parameter named on the access.
+    #[test]
+    #[cfg(unix)]
+    fn a_new_finding_records_its_traced_arguments() {
+        let root = tmpdir();
+        let work_dir = root.join("bhf_work");
+        let harness = write_c_libfuzzer_harness(&work_dir, "H-ARGTRACE", TRACING_CRASH_SCRIPT);
+        fs::write(
+            harness.with_file_name("generation-metadata.json"),
+            r#"{"schema_version":1,"harness_format_version":3,"buffer_len_dimension":true,"language":"c"}"#,
+        )
+        .unwrap();
+        let summary = run_one_target_programmatic(
+            &work_dir,
+            "H-ARGTRACE",
+            vec![b"seed".to_vec()],
+            1,
+            None,
+            None,
+            0,
+            &[],
+            actionability::RunMode::Reporting,
+            None,
+            &[],
+            None,
+        )
+        .expect("the crash is a finding");
+        assert_eq!(summary.findings.len(), 1);
+        let finding_dir = corpus::layout::finding_dir(&work_dir, &summary.findings[0]);
+        let decoded: serde_json::Value =
+            serde_json::from_slice(&fs::read(finding_dir.join("decoded.json")).unwrap()).unwrap();
+        assert_eq!(decoded["schema_version"], "bhf.decoded.v1");
+        assert_eq!(decoded["arguments_source"], "harness_trace");
+        assert_eq!(decoded["arguments"][0]["ptr"], "0x502000000030");
+        assert_eq!(decoded["arguments"][0]["alloc_size"], 1);
+        let finding: serde_json::Value =
+            serde_json::from_slice(&fs::read(finding_dir.join("finding.json")).unwrap()).unwrap();
+        assert_eq!(
+            finding["decoded_args"],
+            serde_json::json!([{"name": "buffer", "type": "const char *", "role": "param",
+                                "len": 0, "span": [0, 2], "preview_hex": ""}])
+        );
+        assert_eq!(
+            finding["exception"]["access"]["parameter"]["name"],
+            "buffer"
+        );
+        assert_eq!(finding["exception"]["access"]["parameter"]["offset"], 1);
+        // The harness's input format, its buffer-length dimension included.
+        assert_eq!(finding["harness_format_version"], 3);
+        assert_eq!(finding["buffer_len_dimension"], true);
+        assert_eq!(finding["harness"]["format_version"], 3);
+        assert_eq!(finding["harness"]["buffer_len_dimension"], true);
+        // The sanitizer log is the crashing run's, not the trace run's.
+        let log = fs::read_to_string(finding_dir.join("sanitizer.log")).unwrap();
+        assert!(!log.contains("BHF_ARG"), "{log}");
+    }
+
+    /// A harness built without the argument trace is never re-run for it, and
+    /// decoded.json says why it has no arguments.
+    #[test]
+    #[cfg(unix)]
+    fn a_harness_without_the_trace_records_why_it_has_no_arguments() {
+        let root = tmpdir();
+        let work_dir = root.join("bhf_work");
+        let counter = root.join("runs");
+        write_c_libfuzzer_harness(
+            &work_dir,
+            "H-NOTRACE",
+            &format!(
+                "#!/bin/sh\necho run >> '{}'\n\
+                 >&2 echo 'ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1'\n\
+                 >&2 echo '    #0 0x1 in real_parse /src/p.c:9'\nexit 1\n",
+                counter.display()
+            ),
+        );
+        let summary = run_one_target_programmatic(
+            &work_dir,
+            "H-NOTRACE",
+            vec![b"seed".to_vec()],
+            1,
+            None,
+            None,
+            0,
+            &[],
+            actionability::RunMode::Reporting,
+            None,
+            &[],
+            None,
+        )
+        .expect("the crash is a finding");
+        let finding_dir = corpus::layout::finding_dir(&work_dir, &summary.findings[0]);
+        let decoded: serde_json::Value =
+            serde_json::from_slice(&fs::read(finding_dir.join("decoded.json")).unwrap()).unwrap();
+        assert_eq!(decoded["arguments_source"], "none");
+        assert!(decoded["arguments_unavailable"]
+            .as_str()
+            .unwrap()
+            .contains("without the argument trace"));
+        let finding: serde_json::Value =
+            serde_json::from_slice(&fs::read(finding_dir.join("finding.json")).unwrap()).unwrap();
+        assert!(finding.get("decoded_args").is_none());
+        let runs_before = fs::read_to_string(&counter).unwrap().lines().count();
+        assert!(runs_before >= 1);
+    }
+
+    /// The AFL++ lane's harness reads the testcase from stdin; its trace run
+    /// feeds it the same way.
+    #[test]
+    #[cfg(unix)]
+    fn the_argument_trace_feeds_stdin_harnesses_their_input() {
+        let root = tmpdir();
+        let work_dir = root.join("bhf_work");
+        let harness = write_c_libfuzzer_harness(
+            &work_dir,
+            "H-AFLTRACE",
+            "#!/bin/sh\n# BHF_TRACE_ARGS\nbytes=$(od -An -tu1 | tr -s ' ' | sed 's/^ //;s/ $//')\n\
+             [ \"$BHF_TRACE_ARGS\" = 1 ] && >&2 echo \"BHF_ARG {\\\"call\\\":\\\"target\\\",\\\"i\\\":0,\\\"role\\\":\\\"param\\\",\\\"name\\\":\\\"first\\\",\\\"type\\\":\\\"int\\\",\\\"value\\\":\\\"$bytes\\\"}\"\n\
+             exit 0\n",
+        );
+        let outcome = trace_arguments(
+            &harness,
+            &work_dir,
+            &[42],
+            TraceInput::Stdin,
+            &[],
+            Duration::from_secs(10),
+            None,
+        );
+        let corpus::decoded_args::TraceOutcome::Traced(args) = outcome else {
+            panic!("no trace: {outcome:?}");
+        };
+        assert_eq!(args[0].value.as_deref(), Some("42"));
+    }
+
     #[test]
     #[cfg(unix)]
     fn harness_that_crashes_on_every_input_keeps_its_findings() {
@@ -7872,6 +9931,173 @@ mod auto_path_tests {
         assert_eq!(tokens, vec![b"READY".to_vec(), b"MODE_FAST".to_vec()]);
     }
 
+    /// The comparison constants recorded at runtime become
+    /// learned_dictionary.txt: at each site, the operand that met more
+    /// distinct values than any of the mutated inputs compared with it,
+    /// deduplicated and bounded, under a header saying how they were chosen.
+    /// The input fragments they were compared against are not written, nor
+    /// are an unsited record's operands absent from dictionary.txt, nor those
+    /// an earlier, unfiltered file held; a file written with the filter keeps
+    /// its tokens after this run's.
+    #[test]
+    fn learned_dictionary_keeps_runtime_constants_not_input_fragments() {
+        let root = tmpdir();
+        let harness = root.join("harnesses/H-L");
+        fs::create_dir_all(&harness).unwrap();
+        let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let record = |site: &str, a: &[u8], b: &[u8]| {
+            format!(
+                "{{\"e\":\"cmplog\",\"k\":\"memcmp\",\"s\":\"{site}\",\"a\":\"{}\",\"b\":\"{}\"}}\n",
+                hex(a),
+                hex(b)
+            )
+        };
+        let mut log = String::new();
+        for fragment in [&b"abcd"[..], b"x\x01yz", b"~~~~"] {
+            log.push_str(&record("00000010.00000100", fragment, b"WGT1"));
+        }
+        for fragment in [&b"0q7z"[..], b"q\x91"] {
+            log.push_str(&record("00000020.00000100", fragment, b"zz\n"));
+        }
+        // Seen once: kept only because the mined dictionary has it.
+        log.push_str(&record("00000030.00000100", b"pppp", b"HDR1"));
+        log.push_str(&record("00000031.00000100", b"oooo", b"NOPE"));
+        // A record without a site (the runtrace shim writes those) only
+        // confirms a mined token, however many values its operands met.
+        for fragment in [&b"u1u1"[..], b"u2u2", b"u3u3"] {
+            log.push_str(&format!(
+                "{{\"e\":\"cmplog\",\"k\":\"memcmp\",\"a\":\"{}\",\"b\":\"{}\"}}\n",
+                hex(fragment),
+                hex(b"UNS1")
+            ));
+        }
+        let long = vec![b'x'; LEARNED_TOKEN_MAX_LEN + 1];
+        for fragment in [&b"aa"[..], b"bb"] {
+            log.push_str(&record("00000040.00000100", fragment, &long));
+        }
+        log.push_str("{\"e\":\"getenv\",\"name\":\"HOME\"}\n");
+        fs::write(harness.join("cmplog.jsonl"), &log).unwrap();
+        fs::write(harness.join("dictionary.txt"), "\"HDR1\"\n").unwrap();
+        // A file an earlier release wrote, with every operand in it.
+        fs::write(
+            harness.join(LEARNED_DICTIONARY_FILE),
+            "# Comparison operands observed at runtime\n\"OLD1\"\n\"~~~~\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(write_learned_dictionary(&harness).unwrap(), 3);
+        let text = fs::read_to_string(harness.join(LEARNED_DICTIONARY_FILE)).unwrap();
+        assert!(text.starts_with(LEARNED_DICTIONARY_HEADER), "{text}");
+        assert!(LEARNED_DICTIONARY_HEADER.contains("observed at runtime"));
+        let tokens = load_afl_dictionary_tokens(&harness.join(LEARNED_DICTIONARY_FILE)).unwrap();
+        assert_eq!(
+            tokens,
+            vec![b"WGT1".to_vec(), b"zz\n".to_vec(), b"HDR1".to_vec()],
+            "constants only, strongest first; no input fragment and no unfiltered earlier token"
+        );
+
+        // A later run's constants come first, then the filtered file's.
+        let next: String = [&b"m1m1"[..], b"m2m2"]
+            .iter()
+            .map(|fragment| record("00000050.00000100", fragment, b"NEW1"))
+            .collect();
+        fs::write(harness.join("cmplog.jsonl"), next).unwrap();
+        assert_eq!(write_learned_dictionary(&harness).unwrap(), 4);
+        assert_eq!(
+            load_afl_dictionary_tokens(&harness.join(LEARNED_DICTIONARY_FILE)).unwrap(),
+            vec![
+                b"NEW1".to_vec(),
+                b"WGT1".to_vec(),
+                b"zz\n".to_vec(),
+                b"HDR1".to_vec()
+            ]
+        );
+
+        // Bounded: never more than LEARNED_DICTIONARY_MAX_TOKENS.
+        let many: String = (0..LEARNED_DICTIONARY_MAX_TOKENS + 40)
+            .flat_map(|i| {
+                let site = format!("{i:08x}.00000100");
+                let constant = format!("T{i:04}");
+                [b"in-1".to_vec(), b"in-2".to_vec()]
+                    .into_iter()
+                    .map(move |fragment| record(&site, &fragment, constant.as_bytes()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        fs::write(harness.join("cmplog.jsonl"), many).unwrap();
+        assert_eq!(
+            write_learned_dictionary(&harness).unwrap(),
+            LEARNED_DICTIONARY_MAX_TOKENS
+        );
+
+        // No operands this time: the learned tokens are kept as they were.
+        let before = fs::read_to_string(harness.join(LEARNED_DICTIONARY_FILE)).unwrap();
+        fs::remove_file(harness.join("cmplog.jsonl")).unwrap();
+        assert_eq!(write_learned_dictionary(&harness).unwrap(), 0);
+        assert_eq!(
+            fs::read_to_string(harness.join(LEARNED_DICTIONARY_FILE)).unwrap(),
+            before
+        );
+    }
+
+    /// A runtime constant holding a protocol delimiter (`\r\n`) is written
+    /// with `\xNN` escapes, which AFL++ loads, and reads back as the same
+    /// bytes.
+    #[test]
+    fn a_learned_crlf_operand_is_written_with_hex_escapes() {
+        let root = tmpdir();
+        let harness = root.join("harnesses/H-CRLF");
+        fs::create_dir_all(&harness).unwrap();
+        fs::write(
+            harness.join("cmplog.jsonl"),
+            "{\"e\":\"cmplog\",\"k\":\"memcmp\",\"s\":\"00000010.00000000\",\"a\":\"410d0a42\",\"b\":\"0941\"}\n\
+             {\"e\":\"cmplog\",\"k\":\"memcmp\",\"s\":\"00000010.00000000\",\"a\":\"410d0a42\",\"b\":\"0942\"}\n",
+        )
+        .unwrap();
+        assert_eq!(write_learned_dictionary(&harness).unwrap(), 1);
+        let text = fs::read_to_string(harness.join(LEARNED_DICTIONARY_FILE)).unwrap();
+        assert!(text.contains("\"A\\x0d\\x0aB\"\n"), "{text}");
+        assert!(!text.contains("\\r") && !text.contains("\\n\""), "{text}");
+        assert_eq!(
+            load_afl_dictionary_tokens(&harness.join(LEARNED_DICTIONARY_FILE)).unwrap(),
+            vec![b"A\r\nB".to_vec()]
+        );
+    }
+
+    /// A fuzz run loads the learned tokens with the mined ones, each once.
+    #[test]
+    fn learned_dictionary_tokens_are_loaded_with_the_mined_ones() {
+        let root = tmpdir();
+        let harness = root.join("harnesses/H-M");
+        fs::create_dir_all(&harness).unwrap();
+        fs::write(harness.join("dictionary.txt"), "\"MINED\"\n\"BOTH\"\n").unwrap();
+        fs::write(
+            harness.join(LEARNED_DICTIONARY_FILE),
+            format!("{LEARNED_DICTIONARY_HEADER}\"BOTH\"\n\"SEEN\"\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            load_generated_dictionary_tokens(&root, "H-M").unwrap(),
+            vec![b"MINED".to_vec(), b"BOTH".to_vec(), b"SEEN".to_vec()]
+        );
+        // A harness with only learned tokens still gets them.
+        let only = root.join("harnesses/H-N");
+        fs::create_dir_all(&only).unwrap();
+        fs::write(
+            only.join(LEARNED_DICTIONARY_FILE),
+            format!("{LEARNED_DICTIONARY_HEADER}\"SEEN\"\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            load_generated_dictionary_tokens(&root, "H-N").unwrap(),
+            vec![b"SEEN".to_vec()]
+        );
+        assert_eq!(
+            find_learned_dictionary(&root, "H-N"),
+            Some(only.join(LEARNED_DICTIONARY_FILE))
+        );
+    }
+
     #[test]
     fn dictionary_token_may_contain_equals_sign() {
         // printf format strings lifted from real source routinely contain `=`.
@@ -7977,6 +10203,135 @@ mod auto_path_tests {
         assert!(passthrough
             .windows(2)
             .any(|pair| pair[0] == "--timeout" && pair[1] == "30s"));
+    }
+
+    #[test]
+    fn multicore_workers_receive_seed_bytes_as_byte_exact_seed_files() {
+        let mut args = fuzz_args_for_worker_passthrough(StructuredInputMode::Auto);
+        let seed = non_utf8_seed();
+        args.seed_bytes = vec![seed.clone()];
+        materialize_seed_bytes(&mut args).unwrap();
+        assert!(args.seed_bytes.is_empty());
+
+        let passthrough = worker_passthrough_args(&args);
+        let files: Vec<&String> = passthrough
+            .windows(2)
+            .filter(|pair| pair[0] == "--seed-file")
+            .map(|pair| &pair[1])
+            .collect();
+        assert_eq!(files.len(), 1, "{passthrough:?}");
+        assert_eq!(fs::read(files[0]).unwrap(), seed);
+        assert!(
+            !passthrough.iter().any(|a| a == "--seed-input"),
+            "raw bytes never travel as a UTF-8 --seed-input: {passthrough:?}"
+        );
+    }
+
+    #[test]
+    fn workers_mirror_every_harness_layout_dir_the_lookup_reads() {
+        // Dirs the parent lacks are listed too: the mirror removes a worker's
+        // copy of them, so it cannot outrank the harness the parent resolved.
+        let work = tmpdir();
+        fs::create_dir_all(work.join("harnesses/H-L")).unwrap();
+        let (dirs, executable) =
+            worker_harness_layout(&work, "H-L", &work.join("harnesses/H-L/main"));
+        assert_eq!(
+            dirs,
+            vec![
+                PathBuf::from("build/H-L"),
+                PathBuf::from("harnesses/H-L"),
+                PathBuf::from("auto/H-L"),
+                PathBuf::from("generated_harnesses/H-L")
+            ]
+        );
+        assert_eq!(executable, Some(PathBuf::from("harnesses/H-L/main")));
+    }
+
+    #[test]
+    fn a_campaign_fails_only_when_its_workers_failed_or_brought_nothing_back() {
+        let worker = |worker_id: u32, exit_code: Option<i32>| multicore_fuzz::WorkerReport {
+            worker_id,
+            exit_code,
+            ..multicore_fuzz::WorkerReport::default()
+        };
+        let stopped = |worker_id: u32, new_findings: usize| multicore_fuzz::WorkerReport {
+            stopped_at_deadline: true,
+            new_findings,
+            ..worker(worker_id, None)
+        };
+        let summary =
+            |per_worker: Vec<multicore_fuzz::WorkerReport>| multicore_fuzz::MulticoreSummary {
+                harness_id: "H".to_owned(),
+                workers_started: per_worker.len() as u32,
+                workers_completed: per_worker.iter().filter(|w| w.completed()).count() as u32,
+                total_findings: 0,
+                unique_findings: 0,
+                campaign_dir: PathBuf::new(),
+                sync_manifest_path: PathBuf::new(),
+                sync: multicore_fuzz::CorpusSyncReport {
+                    shared_queue: PathBuf::new(),
+                    seed_inputs_loaded: 0,
+                    imported_inputs: 0,
+                    duplicate_inputs: 0,
+                },
+                per_worker,
+                dropped_duplicates: 0,
+            };
+        let exit = |per_worker| no_worker_completed(&summary(per_worker));
+        // Every worker failed the same way: keep its exit code.
+        let failed = exit(vec![worker(0, Some(3)), worker(1, Some(3))]).unwrap();
+        assert_eq!(
+            failed,
+            NoWorkerCompleted::Failed {
+                exit_code: 3,
+                recorded: 0
+            }
+        );
+        assert_eq!(incomplete_campaign_exit(failed, 0), 3);
+        // Mixed failures, or a worker killed by a signal: 1.
+        for per_worker in [
+            vec![worker(0, Some(3)), worker(1, Some(2))],
+            vec![worker(0, Some(3)), worker(1, None)],
+        ] {
+            let outcome = exit(per_worker).unwrap();
+            assert_eq!(incomplete_campaign_exit(outcome, 0), 1, "{outcome:?}");
+        }
+        // Workers failing after they recorded something still fail.
+        let late = multicore_fuzz::WorkerReport {
+            new_findings: 1,
+            ..worker(1, Some(4))
+        };
+        let outcome = exit(vec![worker(0, Some(4)), late]).unwrap();
+        assert_eq!(
+            outcome,
+            NoWorkerCompleted::Failed {
+                exit_code: 4,
+                recorded: 1
+            }
+        );
+        // Stopped at the time limit after recording findings: the campaign
+        // fuzzed and keeps the merge's code.
+        let outcome = exit(vec![stopped(0, 1), stopped(1, 0)]).unwrap();
+        assert_eq!(
+            outcome,
+            NoWorkerCompleted::Stopped {
+                stopped: 2,
+                recorded: 1
+            }
+        );
+        assert_eq!(incomplete_campaign_exit(outcome, 0), 0);
+        // Stopped, and nothing came back.
+        let outcome = exit(vec![worker(0, Some(3)), stopped(1, 0)]).unwrap();
+        assert_eq!(
+            outcome,
+            NoWorkerCompleted::Stopped {
+                stopped: 1,
+                recorded: 0
+            }
+        );
+        assert_eq!(incomplete_campaign_exit(outcome, 0), 1);
+        // One completed worker is a campaign that ran.
+        assert_eq!(exit(vec![worker(0, Some(3)), worker(1, Some(0))]), None);
     }
 
     #[test]
@@ -8268,6 +10623,122 @@ mod auto_path_tests {
         );
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn a_crash_matching_a_recorded_sanitizer_finding_is_reported_not_dropped() {
+        let root = tmpdir();
+        let work_dir = root.join("bhf_work");
+        write_c_libfuzzer_harness(
+            &work_dir,
+            "H-DUP",
+            "#!/bin/sh\n\
+             if [ \"$(head -c1 \"$1\")\" = A ]; then\n\
+               >&2 echo 'ERROR: AddressSanitizer: heap-buffer-overflow on address 0x501 at pc 0x111'\n\
+               >&2 echo '    #0 0x111 in parse_record /src/record.c:10'\n\
+               >&2 echo '    #1 0x112 in LLVMFuzzerTestOneInput /src/h.c:20'\n\
+               exit 1\n\
+             fi\n\
+             exit 0\n",
+        );
+        let run = || {
+            run_one_target_programmatic(
+                &work_dir,
+                "H-DUP",
+                vec![b"A".to_vec(), b"AB".to_vec()],
+                2,
+                None,
+                None,
+                0,
+                &[],
+                actionability::RunMode::Reporting,
+                None,
+                &[],
+                None,
+            )
+            .unwrap()
+        };
+        let first = run();
+        assert_eq!(first.findings.len(), 1, "{:?}", first.findings);
+        assert!(first.duplicates_of_existing.is_empty());
+
+        let second = run();
+        assert!(second.findings.is_empty(), "{:?}", second.findings);
+        assert_eq!(second.duplicates_of_existing, first.findings);
+        assert!(second.duplicate_crashes_of_existing >= 2);
+        let note = duplicates_of_existing_note(
+            &second.duplicates_of_existing,
+            second.duplicate_crashes_of_existing,
+            &second.harness_id,
+        )
+        .expect("a note");
+        assert!(note.contains(&first.findings[0]), "{note}");
+        assert!(note.contains("H-DUP"), "{note}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_oracle_hit_matching_a_recorded_finding_is_reported_not_dropped() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tmpdir();
+        let work_dir = root.join("bhf_work");
+        let harness_dir = work_dir.join("build").join("H-ODUP");
+        fs::create_dir_all(&harness_dir).unwrap();
+        let harness = harness_dir.join("main");
+        fs::write(
+            &harness,
+            "#!/bin/sh\n\
+             input=$(cat)\n\
+             if [ -n \"$BHF_RUNTRACE_LOG\" ]; then\n\
+               printf '{\"e\":\"open\",\"p\":\"%s\",\"r\":-1,\"n\":2}\\n' \"$input\" >> \"$BHF_RUNTRACE_LOG\"\n\
+             fi\n\
+             exit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&harness, fs::Permissions::from_mode(0o755)).unwrap();
+        let runtrace_log = root.join("runtrace.jsonl");
+        let run = || {
+            fs::write(&runtrace_log, "").unwrap();
+            run_one_target_programmatic(
+                &work_dir,
+                "H-ODUP",
+                vec![b"../secret".to_vec()],
+                1,
+                None,
+                None,
+                0,
+                &[(
+                    "BHF_RUNTRACE_LOG".to_owned(),
+                    runtrace_log.display().to_string(),
+                )],
+                actionability::RunMode::Reporting,
+                None,
+                &[],
+                None,
+            )
+            .unwrap()
+        };
+        // A starved shell subprocess can miss its event (see
+        // builtin_fuzz_emits_oracle_finding_from_runtrace_event); retry that case.
+        let mut first = run();
+        for _ in 0..15 {
+            if !first.findings.is_empty() {
+                break;
+            }
+            first = run();
+        }
+        assert_eq!(first.findings.len(), 1, "{:?}", first.findings);
+        let mut second = run();
+        for _ in 0..15 {
+            if !second.duplicates_of_existing.is_empty() {
+                break;
+            }
+            second = run();
+        }
+        assert!(second.findings.is_empty(), "{:?}", second.findings);
+        assert_eq!(second.duplicates_of_existing, first.findings);
+    }
+
     #[cfg(unix)]
     fn write_c_libfuzzer_harness(work_dir: &Path, id: &str, script: &str) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
@@ -8357,6 +10828,86 @@ mod auto_path_tests {
         assert_eq!(
             resolve_harness_protocol(&replay_min::HarnessRunner::direct(plain), &work),
             HarnessProtocol::StdinEventLog
+        );
+    }
+
+    /// A binary with `marker` compiled in, past the first 4 KiB.
+    fn binary_with(marker: &[u8]) -> Vec<u8> {
+        let mut bytes = b"\x7fELF\x02\x01\x01\0".to_vec();
+        bytes.resize(64 * 1024, 0);
+        bytes.extend_from_slice(marker);
+        bytes
+    }
+
+    /// A bhf driver binary staged alone (no `main.c`/`main.cpp` anywhere) still
+    /// gets the framed protocol, and with it the coverage map.
+    #[test]
+    fn protocol_resolution_reads_the_marker_compiled_into_a_staged_binary() {
+        let work = tmpdir();
+        let dir = work.join("build/H-PREBUILT");
+        fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join("main");
+        fs::write(&binary, binary_with(b"BHF_FRAMED\0BHF_COV_SHM\0")).unwrap();
+        assert_eq!(
+            resolve_harness_protocol(&replay_min::HarnessRunner::direct(binary), &work),
+            HarnessProtocol::BhfFramed
+        );
+    }
+
+    /// A hand-compiled `-fsanitize=fuzzer` binary takes one input file per
+    /// process; on stdin it would run libFuzzer's own loop.
+    #[test]
+    fn protocol_resolution_runs_a_libfuzzer_binary_on_one_input_file() {
+        let work = tmpdir();
+        let dir = work.join("build/H-LF");
+        fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join("main");
+        fs::write(
+            &binary,
+            binary_with(b"INFO: libFuzzer ignores flags that start with '--'\0"),
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_harness_protocol(&replay_min::HarnessRunner::direct(binary), &work),
+            HarnessProtocol::LibFuzzerSingleInput
+        );
+    }
+
+    /// The operator is told why a libFuzzer binary gets no coverage and how to
+    /// wrap it; a bhf harness gets no such note.
+    #[test]
+    fn libfuzzer_binary_note_names_the_wrapping_command() {
+        let work = tmpdir();
+        let dir = work.join("build/H-LFNOTE");
+        fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join("main");
+        fs::write(&binary, binary_with(b"libFuzzer ignores flags\0")).unwrap();
+        let detection = crate::protocol_detect::detect(&binary, &[&work]);
+        let note = libfuzzer_binary_note(&detection, &binary).expect("note");
+        assert!(note.contains("without coverage guidance"), "{note}");
+        assert!(note.contains("--target LLVMFuzzerTestOneInput"), "{note}");
+        fs::write(&binary, binary_with(b"BHF_FRAMED\0")).unwrap();
+        let detection = crate::protocol_detect::detect(&binary, &[&work]);
+        assert!(libfuzzer_binary_note(&detection, &binary).is_none());
+    }
+
+    /// A `bhf.project.v1` native target declares the framed input mode; the
+    /// fuzz lane uses it instead of guessing from a stripped binary.
+    #[test]
+    fn protocol_resolution_honours_a_declared_framed_input_mode() {
+        let work = tmpdir();
+        let dir = work.join("build/attrs");
+        fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join("main");
+        fs::write(&binary, b"\x7fELF\0stripped").unwrap();
+        fs::write(
+            dir.join("harness-protocol.json"),
+            r#"{"schema_version":1,"input_mode":"framed"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_harness_protocol(&replay_min::HarnessRunner::direct(binary), &work),
+            HarnessProtocol::BhfFramed
         );
     }
 
@@ -8589,6 +11140,355 @@ mod auto_path_tests {
         );
     }
 
+    /// A seed that is not valid UTF-8: every byte value, a lone continuation
+    /// byte, two bytes that never appear in UTF-8, an embedded NUL and a
+    /// truncated multi-byte lead at the very end.
+    fn non_utf8_seed() -> Vec<u8> {
+        let mut seed: Vec<u8> = (0..=255u8).collect();
+        seed.extend_from_slice(&[0x80, 0xff, 0xfe, 0x00, 0x4d, 0x5a, 0x90, 0xc3]);
+        seed
+    }
+
+    /// A libFuzzer-style harness that reports a sanitizer crash only when its
+    /// input is byte-identical to `expected`, so a finding proves the engine ran
+    /// that exact input.
+    #[cfg(unix)]
+    fn write_exact_match_harness(work_dir: &Path, id: &str, expected: &Path) {
+        let script = format!(
+            "#!/bin/sh\n\
+             if cmp -s \"$1\" '{}'; then\n\
+               >&2 echo 'ERROR: AddressSanitizer: heap-buffer-overflow on address 0x601 at pc 0x333'\n\
+               >&2 echo '    #0 0x333 in copy_at /src/record.c:15'\n\
+               >&2 echo '    #1 0x334 in LLVMFuzzerTestOneInput /src/h.c:20'\n\
+               exit 1\n\
+             fi\n\
+             exit 0\n",
+            expected.display()
+        );
+        write_c_libfuzzer_harness(work_dir, id, &script);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn programmatic_run_feeds_non_utf8_seed_bytes_unchanged() {
+        // `bhf auto` hands every seed (mined, --seed-file, --seed-dir, reseeded
+        // queue entries) to this runner. The harness crashes only on the exact
+        // seed bytes, so a finding whose testcase equals the seed proves no byte
+        // was rewritten on the way to the engine.
+        let root = tmpdir();
+        let work_dir = root.join("bhf_work");
+        let seed = non_utf8_seed();
+        let expected = root.join("expected.bin");
+        fs::write(&expected, &seed).unwrap();
+        write_exact_match_harness(&work_dir, "H-BYTES", &expected);
+
+        let summary = run_one_target_programmatic(
+            &work_dir,
+            "H-BYTES",
+            vec![seed.clone()],
+            4,
+            None,
+            None,
+            0,
+            &[],
+            actionability::RunMode::Reporting,
+            None,
+            &[],
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            summary.findings.len(),
+            1,
+            "the exact seed must reach the harness: {:?}",
+            summary.findings
+        );
+        let testcase = fs::read(
+            corpus::layout::finding_dir(&work_dir, &summary.findings[0]).join("testcase.bin"),
+        )
+        .unwrap();
+        assert_eq!(
+            testcase, seed,
+            "testcase.bin must be the seed, byte for byte"
+        );
+    }
+
+    /// Write an `arg-layout.json` beside `harness` that decodes two 4-byte
+    /// scalars before the buffer taking the bytes left: an 8-byte seed
+    /// prefix. Its callers run shell-script harnesses, so Unix only.
+    #[cfg(unix)]
+    fn write_scalars_first_layout(harness: &Path) {
+        let scalar = |name: &str| {
+            serde_json::json!({
+                "step": "param", "call": "target", "role": "param", "index": 1,
+                "name": name, "type": "uint32_t", "order": 0, "input": "cursor",
+                "decoder": "scalar", "primitive": "bhf_i32", "width": 4, "static_decode": true
+            })
+        };
+        let layout = serde_json::json!({
+            "schema_version": "bhf.arg-layout.v1", "harness_format_version": 4,
+            "language": "c", "harness": "direct", "static_decode": true,
+            "steps": [
+                scalar("a"),
+                scalar("b"),
+                {"step": "remainder", "call": "target", "sized": false},
+                {"step": "param", "call": "target", "role": "param", "index": 0,
+                 "name": "buf", "type": "const uint8_t *", "order": 2, "input": "remainder",
+                 "decoder": "input_buffer", "copied": true, "static_decode": true}
+            ]
+        });
+        fs::write(
+            harness.with_file_name("arg-layout.json"),
+            serde_json::to_vec(&layout).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// A seed file of `bhf fuzz` is also given behind the bytes the harness
+    /// decodes into fixed-width parameters before its buffer, and stays as
+    /// it is; seeds handed over programmatically are not.
+    #[test]
+    #[cfg(unix)]
+    fn seed_files_are_also_given_behind_the_layout_prefix() {
+        let root = tmpdir();
+        let work_dir = root.join("bhf_work");
+        let harness = write_c_libfuzzer_harness(&work_dir, "H-PREFIX", "#!/bin/sh\nexit 0\n");
+        write_scalars_first_layout(&harness);
+        let seed_file = root.join("magic.bin");
+        fs::write(&seed_file, b"MAGC").unwrap();
+        let mut args = fuzz_args_for_worker_passthrough(StructuredInputMode::Off);
+        args.work_dir = work_dir.clone();
+        args.harness = "H-PREFIX".to_owned();
+        args.seed_files = vec![seed_file];
+        args.seed_bytes = vec![b"QUEUED".to_vec()];
+        let prepared = prepare(args).unwrap();
+        assert!(
+            prepared.seeds.contains(&b"MAGC".to_vec()),
+            "{:?}",
+            prepared.seeds
+        );
+        assert!(
+            prepared.seeds.contains(&b"\0\0\0\0\0\0\0\0MAGC".to_vec()),
+            "{:?}",
+            prepared.seeds
+        );
+        assert!(!prepared.seeds.contains(&b"\0\0\0\0\0\0\0\0QUEUED".to_vec()));
+    }
+
+    /// In a multi-worker campaign only the seed files and inputs given to
+    /// `bhf fuzz` get a prefixed variant, made once by the campaign: a
+    /// worker, handed every seed as a seed file (the programmatic ones and
+    /// the shared queue's included), adds none of its own.
+    #[test]
+    #[cfg(unix)]
+    fn multicore_workers_get_prefixed_variants_of_the_given_seeds_only() {
+        use clap::Parser;
+        #[derive(clap::Parser)]
+        struct Wrap {
+            #[command(flatten)]
+            inner: FuzzArgs,
+        }
+        let root = tmpdir();
+        let work_dir = root.join("bhf_work");
+        let harness = write_c_libfuzzer_harness(&work_dir, "H-PREFIX-MC", "#!/bin/sh\nexit 0\n");
+        write_scalars_first_layout(&harness);
+        let seed_file = root.join("magic.bin");
+        fs::write(&seed_file, b"MAGC").unwrap();
+        let mut args = fuzz_args_for_worker_passthrough(StructuredInputMode::Off);
+        args.work_dir = work_dir.clone();
+        args.harness = "H-PREFIX-MC".to_owned();
+        args.seed_files = vec![seed_file];
+        args.seed_bytes = vec![b"QUEUED".to_vec()];
+        worker_seed_files(&mut args, &harness).unwrap();
+        let work = work_dir.display().to_string();
+        let mut argv = vec!["fuzz", work.as_str(), "--harness", "H-PREFIX-MC"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        argv.extend(worker_passthrough_args(&args));
+        let worker = Wrap::try_parse_from(&argv).unwrap().inner;
+        let seeds = prepare(worker).unwrap().seeds;
+        let count = |seed: &[u8]| seeds.iter().filter(|s| s.as_slice() == seed).count();
+        assert_eq!(count(b"MAGC"), 1, "{seeds:?}");
+        assert_eq!(count(b"\0\0\0\0\0\0\0\0MAGC"), 1, "{seeds:?}");
+        assert_eq!(count(b"QUEUED"), 1, "{seeds:?}");
+        assert_eq!(count(b"\0\0\0\0\0\0\0\0QUEUED"), 0, "{seeds:?}");
+    }
+
+    #[test]
+    fn prefixed_seed_variants_are_added_once() {
+        let seeds = vec![b"MZ".to_vec(), b"".to_vec()];
+        let variants = layout_prefixed_seeds(&seeds, 4);
+        assert_eq!(variants, vec![b"\0\0\0\0MZ".to_vec(), vec![0; 4]]);
+        // Handed the seeds and their variants (a fuzz worker), nothing new.
+        let mut both = seeds.clone();
+        both.extend(variants);
+        assert!(layout_prefixed_seeds(&both, 4).is_empty());
+        assert!(layout_prefixed_seeds(&seeds, 0).is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn afl_programmatic_seeds_keep_their_bytes_and_honor_the_resolved_max_len() {
+        // The AFL++ stage of `bhf auto` used a fixed 4096-byte cap, so every
+        // seed handed to afl-fuzz was cut short whatever `--max-len` said.
+        let root = tmpdir();
+        let work_dir = root.join("bhf_work");
+        write_c_libfuzzer_harness(&work_dir, "H-AFLSEED", "#!/bin/sh\nexit 0\n");
+        let mut big = Vec::new();
+        while big.len() < 10 * 1024 {
+            big.extend_from_slice(&non_utf8_seed());
+        }
+        let max_len = resolve_max_len_spec(Some("auto"), big.len());
+        let args = afl_programmatic_args(
+            &work_dir,
+            "H-AFLSEED",
+            vec![big.clone(), non_utf8_seed()],
+            Some(Duration::from_secs(1)),
+            &[],
+            actionability::RunMode::Reporting,
+            0,
+            &[],
+            max_len,
+        );
+        let prepared = prepare(args).unwrap();
+        assert!(prepared.seeds.contains(&big), "10 KiB seed kept whole");
+        assert!(prepared.seeds.contains(&non_utf8_seed()));
+
+        // A numeric cap still bounds the seeds, and is what afl-fuzz gets as -G.
+        let capped = afl_programmatic_args(
+            &work_dir,
+            "H-AFLSEED",
+            vec![big.clone()],
+            Some(Duration::from_secs(1)),
+            &[],
+            actionability::RunMode::Reporting,
+            0,
+            &[],
+            resolve_max_len_spec(Some("8192"), big.len()),
+        );
+        let prepared = prepare(capped).unwrap();
+        assert_eq!(prepared.seeds, vec![big[..8192].to_vec()]);
+        assert_eq!(afl_generated_max_len(8192), Some(8192));
+        assert_eq!(
+            afl_generated_max_len(max_len),
+            None,
+            "the adaptive ceiling leaves afl-fuzz at its own default"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn afl_programmatic_prepare_keeps_a_numeric_max_len_for_afl_fuzz() {
+        let root = tmpdir();
+        let work_dir = root.join("bhf_work");
+        write_c_libfuzzer_harness(&work_dir, "H-AFLCAP", "#!/bin/sh\nexit 0\n");
+        let prepare_with = |spec: &str| {
+            prepare_afl_programmatic(
+                &work_dir,
+                "H-AFLCAP",
+                vec![non_utf8_seed()],
+                Some(Duration::from_secs(1)),
+                &[],
+                actionability::RunMode::Reporting,
+                0,
+                &[],
+                Some(spec),
+            )
+            .unwrap()
+        };
+        assert_eq!(prepare_with("8192").afl_max_len, Some(8192));
+        assert_eq!(
+            prepare_with("auto").afl_max_len,
+            None,
+            "the adaptive ceiling leaves afl-fuzz at its own default"
+        );
+    }
+
+    /// An `afl-fuzz` stand-in: `-h` prints a usage text (with or without the
+    /// `-G` line), anything else records its argv to `argv.txt` beside it.
+    #[cfg(unix)]
+    fn fake_afl_fuzz(dir: &Path, lists_max_len: bool) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        fs::create_dir_all(dir).unwrap();
+        let usage = if lists_max_len {
+            "  -g minlength  - set min length of generated fuzz input (default: 1)\n  \
+             -G maxlength  - set max length of generated fuzz input (default: 1048576)\n"
+        } else {
+            "  -x dict_file  - fuzzer dictionary\n"
+        };
+        let argv = dir.join("argv.txt");
+        let script = dir.join("afl-fuzz");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = -h ]; then\n  printf '\\033[0;36mafl-fuzz\\033[0m usage\\n{}'\n  exit 1\nfi\n\
+                 printf '%s\\n' \"$@\" > '{}'\nexit 0\n",
+                usage.replace('\n', "\\n"),
+                argv.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        argv
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn afl_fuzz_gets_the_max_len_as_g_only_when_it_has_the_option() {
+        let root = tmpdir();
+        let work_dir = root.join("bhf_work");
+        let dir = work_dir.join("build").join("H-AFLG");
+        write_c_libfuzzer_harness(&work_dir, "H-AFLG", "#!/bin/sh\nexit 0\n");
+        fs::copy(dir.join("main"), dir.join("main_afl")).unwrap();
+        for lists_max_len in [true, false] {
+            let afl_dir = root.join(format!("afl-{lists_max_len}"));
+            let argv = fake_afl_fuzz(&afl_dir, lists_max_len);
+            let mut prepared = prepare_afl_programmatic(
+                &work_dir,
+                "H-AFLG",
+                vec![non_utf8_seed()],
+                Some(Duration::from_secs(1)),
+                &[],
+                actionability::RunMode::Reporting,
+                0,
+                &[],
+                Some("8192"),
+            )
+            .unwrap();
+            prepared.afl_path = Some(afl_dir.clone());
+            run_afl_plus_plus(prepared).unwrap();
+            let args: Vec<String> = fs::read_to_string(&argv)
+                .unwrap()
+                .lines()
+                .map(str::to_owned)
+                .collect();
+            let g = args.iter().position(|arg| arg == "-G");
+            if lists_max_len {
+                let g = g.unwrap_or_else(|| panic!("-G passed: {args:?}"));
+                assert_eq!(args[g + 1], "8192");
+                assert!(g < args.iter().position(|arg| arg == "--").unwrap());
+            } else {
+                assert_eq!(g, None, "an afl-fuzz without -G must not get it: {args:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn afl_help_parsing_finds_the_g_option_line_only() {
+        let current = b"\x1b[0;36mafl-fuzz++4.09c\x1b[0m based on afl\n\nMutator settings:\n  \
+            -a            - target input format\n  \
+            -g minlength  - set min length of generated fuzz input (default: 1)\n  \
+            -G maxlength  - set max length of generated fuzz input (default: 1048576)\n";
+        assert!(afl_help_lists_max_len(current));
+        let older = b"afl-fuzz++3.14c\n  -x dict_file  - fuzzer dictionary\n  \
+            -s seed       - use a fixed seed for the RNG\n  \
+            Note: -G is not an option here\n";
+        assert!(!afl_help_lists_max_len(older));
+        assert!(!afl_help_lists_max_len(b""));
+    }
+
     #[test]
     #[cfg(unix)]
     fn non_driver_zero_coverage_run_persists_bounded_corpus() {
@@ -8798,6 +11698,10 @@ mod auto_path_tests {
             no_fork_server: false,
             seed_inputs: Vec::new(),
             seed_files: Vec::new(),
+            qemu_user: None,
+            qemu_args: Vec::new(),
+            seed_bytes: Vec::new(),
+            seeds_layout_prefixed: false,
             sanitizers: Vec::new(),
             symbolic_seed_sources: Vec::new(),
             rng_seed: 1,
@@ -8954,10 +11858,77 @@ mod redqueen_cmplog_tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// The edge map of a GCC `trace-pc` harness is labelled with that
+    /// instrumentation, not clang's `trace-pc-guard`, in `run.json` and in the
+    /// binary record a finding carries.
+    #[test]
+    fn coverage_source_names_the_instrumentation_the_harness_was_built_with() {
+        let dir = tempfile::tempdir().unwrap();
+        let map = dir.path().join("coverage.shm");
+        let mut bitmap = vec![0u8; crate::fuzz::BHF_COV_BITS];
+        bitmap[7] = 1;
+        std::fs::write(&map, bitmap).unwrap();
+        let env = vec![("BHF_COV_SHM".to_owned(), map.display().to_string())];
+        let program = "void __sanitizer_cov_trace_pc(void) {}\n\
+             void __sanitizer_cov_trace_pc_guard_init(unsigned *a, unsigned *b) { (void)a; (void)b; }\n\
+             void __sanitizer_cov_trace_pc_guard(unsigned *g) { (void)g; }\n\
+             int parse_record(int v) { return v > 1 ? v : -v; }\n\
+             int main(int argc, char **argv) { (void)argv; return parse_record(argc); }\n";
+        let source = dir.path().join("widget.c");
+        std::fs::write(&source, program).unwrap();
+        let build = |compiler: &str, coverage: &str| {
+            let out = dir.path().join(format!("widget-{compiler}"));
+            let ok = std::process::Command::new(compiler)
+                .args(["-O1", "-g", coverage])
+                .arg(&source)
+                .arg("-o")
+                .arg(&out)
+                .status()
+                .is_ok_and(|status| status.success());
+            ok.then_some(out)
+        };
+        if let Some(gcc) = build("gcc", "-fsanitize-coverage=trace-pc") {
+            let summary = crate::fuzz::coverage_from_env(&env, &gcc);
+            assert_eq!(summary.edges, 1);
+            assert_eq!(summary.source, "sancov-trace-pc");
+            let record = crate::fuzz::build_binary_record(&gcc).expect("binary record");
+            assert_eq!(record["coverage_instrumentation"], "sancov-trace-pc");
+        } else {
+            eprintln!("skip: gcc unavailable");
+        }
+        if let Some(clang) = build("clang", "-fsanitize-coverage=trace-pc-guard") {
+            assert_eq!(
+                crate::fuzz::coverage_from_env(&env, &clang).source,
+                "sancov-trace-pc-guard"
+            );
+        }
+        // Defining the hook is not using it: a build without coverage is not
+        // labelled with any instrumentation.
+        if let Some(plain) = build("gcc", "-fno-sanitize-coverage=trace-pc") {
+            assert_eq!(
+                crate::fuzz::coverage_from_env(&env, &plain).source,
+                "edge-bitmap"
+            );
+        }
+        // A harness the binary does not identify (a launcher script) is not
+        // given a SanitizerCoverage label; without a map there is none.
+        let script = dir.path().join("launcher");
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+        assert_eq!(
+            crate::fuzz::coverage_from_env(&env, &script).source,
+            "edge-bitmap"
+        );
+        assert!(crate::fuzz::build_binary_record(&script)
+            .expect("record")
+            .get("coverage_instrumentation")
+            .is_none());
+        assert_eq!(crate::fuzz::coverage_from_env(&[], &script).source, "none");
+    }
+
     #[test]
     fn coverage_tracker_snapshot_zero_restore_round_trips() {
         let path = tmp_path("cov");
-        std::fs::write(&path, vec![0u8; super::BHF_COV_BITS]).unwrap();
+        std::fs::write(&path, vec![0u8; crate::fuzz::BHF_COV_BITS]).unwrap();
         let env = vec![("BHF_COV_SHM".to_owned(), path.display().to_string())];
         let tracker = CoverageTracker::new(&env).expect("map cov shm");
         // Simulate an exec setting some edges, snapshot it.

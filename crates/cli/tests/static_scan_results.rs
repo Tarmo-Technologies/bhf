@@ -117,8 +117,11 @@ fn static_scan_of_dot_records_an_absolute_root() {
     let doc: serde_json::Value =
         serde_json::from_slice(&std::fs::read(work.join("results/findings.json")).unwrap())
             .unwrap();
+    // Resolved, and without Windows' `\\?\` prefix.
+    let canonical = src.canonicalize().unwrap();
+    let canonical = canonical.to_str().unwrap();
     assert_eq!(
         doc["source"]["root"].as_str(),
-        Some(src.canonicalize().unwrap().to_str().unwrap())
+        Some(canonical.strip_prefix(r"\\?\").unwrap_or(canonical))
     );
 }

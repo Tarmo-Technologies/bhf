@@ -16,7 +16,15 @@ pub struct TriageInputs<'a> {
     /// is not installed. `--force` cannot install a package, so these get the
     /// install action instead of the force one.
     pub skipped_missing_package: usize,
+    /// Of `skipped`, those refused because a path or compile flag carries a
+    /// character no quoting can make safe in a build recipe. The remedy is to
+    /// move or rename the path, not `--force`.
+    pub skipped_unsafe_path: usize,
     pub report_only: usize,
+    /// Of `failed_build`, the C++ targets (the C++ dialect ladder applies).
+    pub failed_build_cpp: usize,
+    /// Of `failed_build`, the Ada targets (the GNAT toolchain applies).
+    pub failed_build_ada: usize,
     pub findings: usize,
     pub preflight: &'a PreflightReport,
     /// A detected custom build in the tree root, if any (marker, suggested command).
@@ -63,10 +71,23 @@ pub fn render_triage(inputs: &TriageInputs) -> String {
                 "\n      - if the tree has its own build, recover its flags: --build-command \"<your build>\"",
             ),
         }
-        s.push_str("\n      - old C++: the dialect ladder runs automatically; pin it with --cxx-std <std> if it still fails");
-        s.push_str(
-            "\n      - missing dependency headers: --extra-include <dir> / --extra-source <file>",
-        );
+        // The levers of the toolchain that failed: C/C++ headers and sources,
+        // the C++ dialect, the GNAT toolchain.
+        if inputs.failed_build_cpp > 0 {
+            s.push_str("\n      - old C++: the dialect ladder runs automatically; pin it with --cxx-std <std> if it still fails");
+        }
+        if inputs.failed_build > inputs.failed_build_ada {
+            s.push_str(
+                "\n      - missing dependency headers: --extra-include <dir> / --extra-source <file>",
+            );
+        }
+        if inputs.failed_build_ada > 0 {
+            s.push_str(
+                "\n      - Ada: check the GNAT toolchain — gprbuild and gnat on PATH, or \
+                 toolchain.ada.prefix (--ada-prefix) / toolchain.ada.gprbuild (--ada-gprbuild) — \
+                 and the switches the project needs (toolchain.ada.switches, --ada-switch)",
+            );
+        }
         s.push_str(
             "\n      - force past undefined symbols/types (stub-heavy, Low-confidence): --force",
         );
@@ -86,10 +107,24 @@ pub fn render_triage(inputs: &TriageInputs) -> String {
         ));
     }
 
-    // 3b. Skipped (a parameter couldn't be driven) — what --force is actually for.
+    // 3b. Refused before generation because a path or flag cannot be quoted
+    // safely in a recipe. Spaces are fine; what is left is rare, and --force
+    // cannot help with it.
+    if inputs.skipped_unsafe_path > 0 {
+        actions.push(format!(
+            "{} target(s) were refused because a source path, include dir or compile flag \
+             contains a character that cannot be quoted safely in a build recipe (each reason \
+             names it). Rename or move that path; spaces, parentheses, apostrophes and \
+             ampersands are supported. --force cannot help.",
+            inputs.skipped_unsafe_path
+        ));
+    }
+
+    // 3c. Skipped (a parameter couldn't be driven) — what --force is actually for.
     let undrivable = inputs
         .skipped
-        .saturating_sub(inputs.skipped_missing_package);
+        .saturating_sub(inputs.skipped_missing_package)
+        .saturating_sub(inputs.skipped_unsafe_path);
     if undrivable > 0 {
         actions.push(format!(
             "{undrivable} target(s) were skipped (a parameter couldn't be driven — opaque handle, callback, unknown type). Attempt them anyway with --force.",
@@ -147,10 +182,10 @@ pub fn render_top_findings(work_dir: &Path, max: usize) -> String {
         let Ok(json): Result<serde_json::Value, _> = serde_json::from_str(&raw) else {
             continue;
         };
-        let severity = json
-            .get("severity")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
+        // The severity the reports give it: the actionability impact, else
+        // the record's own severity, else its rule's default.
+        let severity = results::severity::resolve_raw(&json, Some(&dir.join("finding.json")))
+            .as_str()
             .to_owned();
         let rule_id = json
             .get("rule_id")
@@ -190,7 +225,8 @@ pub fn render_top_findings(work_dir: &Path, max: usize) -> String {
             row.severity.to_uppercase(),
             row.rule_id,
             msg,
-            row.dir.display(),
+            // One shell word, so a work dir with a space pastes as one argument.
+            crate::repro_lane::sh_word(&row.dir.to_string_lossy()),
         ));
     }
     out
@@ -221,8 +257,11 @@ mod tests {
         let inputs = TriageInputs {
             built_and_fuzzed: 5,
             failed_build: 0,
+            failed_build_cpp: 0,
+            failed_build_ada: 0,
             skipped: 0,
             skipped_missing_package: 0,
+            skipped_unsafe_path: 0,
             report_only: 0,
             findings: 2,
             preflight: &healthy(),
@@ -236,8 +275,11 @@ mod tests {
         let inputs = TriageInputs {
             built_and_fuzzed: 0,
             failed_build: 3,
+            failed_build_cpp: 3,
+            failed_build_ada: 0,
             skipped: 2,
             skipped_missing_package: 0,
+            skipped_unsafe_path: 0,
             report_only: 0,
             findings: 0,
             preflight: &healthy(),
@@ -251,6 +293,47 @@ mod tests {
         assert!(text.contains("2 target(s) were skipped") && text.contains("--force"));
     }
 
+    /// The levers name the toolchain of what failed: C++'s dialect ladder only
+    /// for a C++ failure, the GNAT toolchain for an Ada one.
+    #[test]
+    fn failed_build_levers_follow_the_language_that_failed() {
+        let ada_only = TriageInputs {
+            built_and_fuzzed: 0,
+            failed_build: 2,
+            failed_build_cpp: 0,
+            failed_build_ada: 2,
+            skipped: 0,
+            skipped_missing_package: 0,
+            skipped_unsafe_path: 0,
+            report_only: 0,
+            findings: 0,
+            preflight: &healthy(),
+            custom_build: None,
+        };
+        let text = render_triage(&ada_only);
+        assert!(text.contains("2 target(s) failed to build"), "{text}");
+        assert!(
+            !text.contains("--cxx-std") && !text.contains("old C++"),
+            "{text}"
+        );
+        assert!(!text.contains("--extra-include"), "{text}");
+        assert!(
+            text.contains("gprbuild") && text.contains("toolchain.ada"),
+            "an Ada failure points at its toolchain:\n{text}"
+        );
+        let c_only = TriageInputs {
+            failed_build_cpp: 0,
+            failed_build_ada: 0,
+            ..ada_only
+        };
+        let text = render_triage(&c_only);
+        assert!(
+            !text.contains("--cxx-std") && !text.contains("gprbuild"),
+            "{text}"
+        );
+        assert!(text.contains("--extra-include"), "{text}");
+    }
+
     /// A target that skipped because a package isn't installed must be told to
     /// install it, not to run `--force`. Across a 534-project sweep this was the
     /// largest skip cause in the corpus, and every one of them was pointed at the
@@ -260,8 +343,11 @@ mod tests {
         let inputs = TriageInputs {
             built_and_fuzzed: 0,
             failed_build: 0,
+            failed_build_cpp: 0,
+            failed_build_ada: 0,
             skipped: 4,
             skipped_missing_package: 4,
+            skipped_unsafe_path: 0,
             report_only: 0,
             findings: 0,
             preflight: &healthy(),
@@ -289,8 +375,11 @@ mod tests {
         let inputs = TriageInputs {
             built_and_fuzzed: 1,
             failed_build: 0,
+            failed_build_cpp: 0,
+            failed_build_ada: 0,
             skipped: 7,
             skipped_missing_package: 5,
+            skipped_unsafe_path: 0,
             report_only: 0,
             findings: 0,
             preflight: &healthy(),
@@ -301,6 +390,38 @@ mod tests {
         assert!(
             text.contains("2 target(s) were skipped (a parameter couldn't be driven"),
             "the force action must count only the undrivable ones:\n{text}"
+        );
+    }
+
+    /// A target refused because a path or flag carries a character no quoting
+    /// can contain is an environment problem with one remedy: move or rename
+    /// the path. `--force` drives parameters and cannot help.
+    #[test]
+    fn a_refused_build_path_asks_for_a_rename_not_force() {
+        let inputs = TriageInputs {
+            built_and_fuzzed: 0,
+            failed_build: 0,
+            failed_build_cpp: 0,
+            failed_build_ada: 0,
+            skipped: 3,
+            skipped_missing_package: 0,
+            skipped_unsafe_path: 2,
+            report_only: 0,
+            findings: 0,
+            preflight: &healthy(),
+            custom_build: None,
+        };
+        let text = render_triage(&inputs);
+        assert!(
+            text.contains(
+                "2 target(s) were refused because a source path, include dir or compile flag"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("Rename or move that path"), "{text}");
+        assert!(
+            text.contains("1 target(s) were skipped (a parameter couldn't be driven"),
+            "the force action counts only the undrivable skip:\n{text}"
         );
     }
 
@@ -327,5 +448,57 @@ mod tests {
         assert!(hi < lo, "high severity should rank first:\n{text}");
         assert!(text.contains("bhf replay --finding"));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The summary shows the severity the reports give a finding: its
+    /// actionability impact, which finding.json carries instead of a
+    /// top-level `severity`.
+    #[test]
+    fn top_findings_show_the_severity_the_reports_use() {
+        let tmp = tempfile::tempdir().unwrap();
+        let findings = corpus::layout::findings_dir(tmp.path());
+        for (id, impact) in [("F-0001-0a0b0c0d", "high"), ("F-0002-0a0b0c0d", "critical")] {
+            let dir = findings.join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("finding.json"),
+                serde_json::json!({
+                    "id": id, "rule_id": "BHF-201", "harness_id": "H-C0001",
+                    "classification": "unhandled",
+                    "exception": {"name": "ASAN_HEAP_BUFFER_OVERFLOW", "message": "boom"},
+                    "actionability": {"mode": "reporting", "verdict": "likely_reachable",
+                        "impact": impact, "confidence": "medium",
+                        "prosthetics": {"used": false}}
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+        let text = render_top_findings(tmp.path(), 8);
+        assert!(text.contains("[HIGH] BHF-201"), "{text}");
+        assert!(text.contains("[CRITICAL] BHF-201"), "{text}");
+        assert!(!text.contains("[UNKNOWN]"), "{text}");
+        assert!(
+            text.find("[CRITICAL]") < text.find("[HIGH]"),
+            "most severe first: {text}"
+        );
+    }
+
+    /// A work dir whose path has a space still gives a reproduce command that
+    /// pastes as one argument.
+    #[test]
+    fn the_reproduce_command_quotes_a_finding_dir_with_a_space() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("my work");
+        let finding = corpus::layout::findings_dir(&work).join("F-0001-0a0b0c0d");
+        std::fs::create_dir_all(&finding).unwrap();
+        std::fs::write(
+            finding.join("finding.json"),
+            r#"{"id":"F-0001-0a0b0c0d","rule_id":"BHF-201","exception":{"message":"boom"}}"#,
+        )
+        .unwrap();
+        let text = render_top_findings(&work, 8);
+        let expected = format!("reproduce: bhf replay --finding '{}'\n", finding.display());
+        assert!(text.contains(&expected), "{text}");
     }
 }

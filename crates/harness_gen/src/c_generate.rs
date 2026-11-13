@@ -17,6 +17,7 @@ use type_model::{ScalarKind, TypeRegistry, TypeShape};
 const BUILD_CONTEXT_COMPILER_PREFIX: &str = "@bhf-build-context-compiler=";
 const BUILD_CONTEXT_PROVENANCE_PREFIX: &str = "@bhf-build-context-provenance=";
 const BUILD_CONTEXT_DROPPED_PREFIX: &str = "@bhf-build-context-dropped=";
+const BUILD_CONTEXT_LDFLAG_PREFIX: &str = "@bhf-build-context-ldflag=";
 
 /// Parameter metadata captured from the C source for harness emission.
 #[derive(Debug, Clone)]
@@ -377,11 +378,11 @@ pub fn generate_c_direct_harness(
     let tera = templates::build_tera()?;
     let main_c = tera.render(
         "direct_harness_c",
-        &tera::Context::from_serialize(&context)?,
+        &harness_source_context(&context, context.arg_layout.buffer_len_dimension)?,
     )?;
     let makefile = tera.render(
         "harness_makefile",
-        &tera::Context::from_serialize(&context)?,
+        &harness_makefile_context(&context, &args.c_runtime_include)?,
     )?;
 
     fs::create_dir_all(&args.output_dir)?;
@@ -389,7 +390,12 @@ pub fn generate_c_direct_harness(
     let makefile_path = args.output_dir.join("Makefile");
     fs::write(&main_path, main_c)?;
     fs::write(&makefile_path, makefile)?;
-    write_c_portability_artifacts(&args.output_dir, &args.harness_id)?;
+    context.arg_layout.write(&args.output_dir)?;
+    write_c_portability_artifacts(
+        &args.output_dir,
+        &args.harness_id,
+        context.passthrough_libfuzzer_entrypoint,
+    )?;
 
     Ok(GeneratedCFiles {
         main_c: main_path,
@@ -398,13 +404,58 @@ pub fn generate_c_direct_harness(
     })
 }
 
+/// Template context for a generated harness SOURCE: the emitter's own context
+/// plus the input format version stamped at the top of the file, and whether
+/// the explicit buffer-length dimension sized a buffer of the harness.
+pub(crate) fn harness_source_context(
+    context: &impl Serialize,
+    buffer_len_dimension: bool,
+) -> Result<tera::Context, HarnessGenError> {
+    let mut context = tera::Context::from_serialize(context)?;
+    context.insert("harness_format_version", &crate::HARNESS_FORMAT_VERSION);
+    context.insert("buffer_len_dimension", &buffer_len_dimension);
+    Ok(context)
+}
+
+/// Template context for a generated harness MAKEFILE: the emitter's own context
+/// plus the runtime driver source, quoted for recipes. The driver source is a
+/// prerequisite of `bhf_driver.o` only when its path needs no quoting: `make`
+/// splits prerequisites on spaces whatever the quotes, while a recipe hands the
+/// quoted path to the shell intact. The harness dir is regenerated per attempt,
+/// so the object is still always built.
+pub(crate) fn harness_makefile_context(
+    context: &impl Serialize,
+    c_runtime_include: &Path,
+) -> Result<tera::Context, HarnessGenError> {
+    let mut context = tera::Context::from_serialize(context)?;
+    let driver = crate::build_safety::checked_recipe_path(
+        "runtime include",
+        &c_runtime_include.join("bhf_driver.c"),
+    )?;
+    context.insert("bhf_driver_prereq", &!driver.starts_with('"'));
+    context.insert("bhf_driver_source", &driver);
+    Ok(context)
+}
+
+/// Render filesystem paths for a generated Makefile: `make_path` form, double-
+/// quoted when they contain a space, parenthesis or apostrophe. Callers have
+/// validated them with [`crate::build_safety::ensure_build_path_safe`].
+pub(crate) fn recipe_paths(paths: &[PathBuf]) -> Vec<String> {
+    paths
+        .iter()
+        .map(|p| crate::build_safety::recipe_path(&crate::build_safety::make_path(p)))
+        .collect()
+}
+
 /// Emit the Mayhemfile, PORTABILITY.md, and libFuzzer shim beside a generated C
 /// harness so it can be driven by Mayhem, libFuzzer, AFL++, or honggfuzz. The C
 /// default binary (`main`) reads `argv[1]` as a file (ASan-instrumented), and the
-/// Makefile offers `make libfuzzer`/`make afl`.
+/// Makefile offers `make libfuzzer`/`make afl`. `passthrough` marks a harness
+/// around the project's own `LLVMFuzzerTestOneInput`, which needs no shim.
 fn write_c_portability_artifacts(
     output_dir: &std::path::Path,
     harness_id: &str,
+    passthrough: bool,
 ) -> Result<(), HarnessGenError> {
     crate::portability::write_artifacts(
         output_dir,
@@ -417,6 +468,7 @@ fn write_c_portability_artifacts(
             libfuzzer_binary: Some("main_libfuzzer".to_owned()),
             afl_binary: Some("main_afl".to_owned()),
             crash_on_finding_env: false,
+            passthrough_entrypoint: passthrough,
         },
     )?;
     Ok(())
@@ -435,11 +487,11 @@ pub fn generate_c_sequence_harness(
     let tera = templates::build_tera()?;
     let main_c = tera.render(
         "sequence_harness_c",
-        &tera::Context::from_serialize(&context)?,
+        &harness_source_context(&context, context.arg_layout.buffer_len_dimension)?,
     )?;
     let makefile = tera.render(
         "harness_makefile",
-        &tera::Context::from_serialize(&context)?,
+        &harness_makefile_context(&context, &args.c_runtime_include)?,
     )?;
 
     fs::create_dir_all(&args.output_dir)?;
@@ -447,7 +499,8 @@ pub fn generate_c_sequence_harness(
     let makefile_path = args.output_dir.join("Makefile");
     fs::write(&main_path, main_c)?;
     fs::write(&makefile_path, makefile)?;
-    write_c_portability_artifacts(&args.output_dir, &args.harness_id)?;
+    context.arg_layout.write(&args.output_dir)?;
+    write_c_portability_artifacts(&args.output_dir, &args.harness_id, false)?;
     // Describe the op program's geometry so the engine can build a
     // structure-aware mutation layout for an input of any length. Without it
     // the sequence mutator has nothing to describe, and every op program is
@@ -505,24 +558,40 @@ pub fn generate_c_sequence_harness(
 
 #[derive(Debug, Serialize)]
 struct CTemplateContext {
+    /// Written to `arg-layout.json`; not a template variable.
+    #[serde(skip)]
+    arg_layout: crate::arg_layout::ArgLayout,
     harness_id: String,
     qualified_target_name: String,
     target_includes: Vec<String>,
     target_includes_dirs: Vec<String>,
     target_sources: Vec<String>,
     compile_flags: Vec<String>,
+    /// Link inputs the build context names for this target
+    /// (`BUILD_CONTEXT_LDFLAGS`, on every link line).
+    link_flags: Vec<String>,
     build_context_provenance: String,
     build_context_dropped: String,
     c_compiler: String,
-    compiler_is_gcc: bool,
+    /// Flag family the Makefile falls back to when it cannot ask `$(CC)`:
+    /// `gcc` for a GCC-named compiler (cross prefixes included), else `clang`.
+    c_compiler_family: String,
     c_runtime_include: String,
     emit_forward_declaration: bool,
+    /// The `struct`/`union` tags the target's prototype names, declared at
+    /// file scope before it ([`tag_declarations`]).
+    forward_tags: Vec<String>,
     params: Vec<CParamEmission>,
     return_type: String,
     return_type_present: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     result_cleanup: Option<String>,
     passthrough_libfuzzer_entrypoint: bool,
+    /// The target parameters' decode statements, in decode order, with the
+    /// position captures and argument-trace statements (see
+    /// [`crate::arg_trace`]); and the after-call trace statements.
+    params_decode: Vec<String>,
+    params_after: Vec<String>,
     /// True for a byte-stream decoder: a `parse`/`decode` function whose first
     /// parameter is a single untrusted byte the driver feeds one at a time
     /// (PX4 st24_decode/sumd_decode). The harness feeds the whole fuzz input
@@ -566,17 +635,28 @@ struct CDriveStepEmission {
 
 #[derive(Debug, Serialize)]
 struct CSequenceTemplateContext {
+    /// Written to `arg-layout.json`; not a template variable.
+    #[serde(skip)]
+    arg_layout: crate::arg_layout::ArgLayout,
     harness_id: String,
     target_includes: Vec<String>,
     target_includes_dirs: Vec<String>,
     target_sources: Vec<String>,
     compile_flags: Vec<String>,
+    /// Link inputs the build context names for this target
+    /// (`BUILD_CONTEXT_LDFLAGS`, on every link line).
+    link_flags: Vec<String>,
     build_context_provenance: String,
     build_context_dropped: String,
     c_compiler: String,
-    compiler_is_gcc: bool,
+    /// Flag family the Makefile falls back to when it cannot ask `$(CC)`:
+    /// `gcc` for a GCC-named compiler (cross prefixes included), else `clang`.
+    c_compiler_family: String,
     c_runtime_include: String,
     emit_forward_declaration: bool,
+    /// The `struct`/`union` tags the lifecycle prototypes name, declared at
+    /// file scope before them ([`tag_declarations`]).
+    forward_tags: Vec<String>,
     /// Exact public libjpeg decompressor lifecycle. `jpeg_read_header` cannot
     /// be called on a field-by-field synthesized `jpeg_decompress_struct`: the
     /// macro constructor, error manager, source manager, and ordered scanline
@@ -677,6 +757,13 @@ struct CSequenceStepEmission {
     /// Safe comparison against a previously declared protocol result.
     #[serde(skip_serializing_if = "Option::is_none")]
     condition: Option<String>,
+    /// The parameters as declared, naming the argument-trace lines.
+    #[serde(skip)]
+    declared: Vec<crate::arg_trace::Declared>,
+    /// Decode and argument-trace statements (see [`crate::arg_trace`]), set
+    /// once the whole sequence context is built.
+    decode: Vec<String>,
+    after: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -855,28 +942,7 @@ fn build_param_decoders(
     // would emit an illegal `func(const name)`), and strip parameter-attribute
     // decoration macros from the type (`XXH_NOESCAPE XXH3_state_t *`) so they do
     // not pollute type resolution and turn a real type into an opaque skip.
-    let params: Vec<CParameter> = params
-        .iter()
-        .enumerate()
-        .map(|(i, p)| {
-            // Defensive: a function-pointer param whose declarator leaked into the
-            // name (`(*cb)(args)` with c_type collapsed to the bare return type)
-            // is rebuilt into the canonical funcptr model so it routes through the
-            // trampoline decoder rather than the broken buffer-init splice.
-            if let Some((fname, ftype)) =
-                crate::c_decoders::recover_leaked_funcptr_param(&p.name, &p.c_type)
-            {
-                return CParameter {
-                    name: fname,
-                    c_type: ftype,
-                };
-            }
-            CParameter {
-                name: crate::c_decoders::sanitize_or_synthesize_param_name(&p.name, i),
-                c_type: crate::c_decoders::strip_type_decoration(&p.c_type),
-            }
-        })
-        .collect();
+    let params = normalized_c_params(params);
     let params = &params[..];
     let mut out = Vec::with_capacity(params.len());
     let mut i = 0;
@@ -898,13 +964,19 @@ fn build_param_decoders(
     let has_byte_buffer = params
         .iter()
         .any(|p| is_raw_buffer_param(&p.c_type, registry));
-    // Apply pair detection only once per harness: the libFuzzer Data span is
-    // consumed by the first matched pair, so a second `(const char *, int)`
-    // (e.g. xmlReadMemory's `encoding` + `options`) needs the standalone
-    // decoders. Without this, repeated pairs share Data and Size which
-    // produces obviously-wrong harnesses.
+    // Whether a `(buffer, length)` pair was bound to the input: optional
+    // metadata after it is passed as NULL (below). A later pair is bound too:
+    // `slice_input_units` gives it bytes of its own.
     let mut pair_consumed = false;
+    // The parameters each iteration decodes together, so every buffer of the
+    // call can be given its own bytes once the call is decoded.
+    let mut units: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut unit_start = 0;
     while i < params.len() {
+        if out.len() > unit_start {
+            units.push(unit_start..out.len());
+        }
+        unit_start = out.len();
         // libarchive documents this as an I/O buffer size, not semantic input.
         // Experts use a stable non-zero block (commonly 10 KiB); fuzzing zero or
         // tiny values makes valid file-backed seeds fail in setup and spends
@@ -994,9 +1066,13 @@ fn build_param_decoders(
             pair_consumed = true;
             continue;
         }
+        // The pointed-to value becomes the buffer's capacity, so it needs the
+        // same name evidence as every other length: `emit_at(char *buf, size_t
+        // *offset)` must not start writing at the end of the allocation.
         if i + 1 < params.len()
             && is_output_buffer_param(&params[i].c_type, registry)
             && is_length_pointer_param(&params[i + 1].c_type)
+            && length_name_fits_buffer(&params[i], &params[i + 1])
         {
             let (buf_decl, len_decl) =
                 pair_output_buffer_length(&params[i], &params[i + 1], function_name);
@@ -1021,8 +1097,7 @@ fn build_param_decoders(
         // `Data` span — so a C-string parser (te_interp -> next_token) read past the
         // buffer end, a systematic heap-buffer-overflow FALSE POSITIVE. Without the
         // pair, the string falls through to the NUL-terminating `bhf_c_string` decoder.
-        if !pair_consumed
-            && i + 1 < params.len()
+        if i + 1 < params.len()
             && is_raw_buffer_param(&params[i].c_type, registry)
             && is_length_pointer_param(&params[i + 1].c_type)
             && looks_like_count_name(&params[i + 1].name)
@@ -1046,18 +1121,18 @@ fn build_param_decoders(
             i += 2;
             continue;
         }
-        if !pair_consumed
-            && i + 1 < params.len()
+        if i + 1 < params.len()
             && is_raw_buffer_param(&params[i].c_type, registry)
             && (is_length_param(&params[i + 1].c_type)
                 || (registry_resolves_to_length(&params[i + 1].c_type, registry)
                     && looks_like_count_name(&params[i + 1].name)))
-            // Require NAME evidence before binding (buffer, Size): either the
-            // trailing int is count-shaped OR the pointer is buffer-shaped.
-            // Without this, `(const char *file, int line)` mis-paired as
-            // (buffer, length) — a heap-buffer-overflow false positive (log_log).
+            // Require NAME evidence on the LENGTH before binding (buffer, Size):
+            // the trailing int must be count-shaped. Without this,
+            // `(const char *file, int line)` mis-paired as (buffer, length) — a
+            // heap-buffer-overflow false positive (log_log). A buffer-shaped
+            // pointer name is not evidence: `(src, offset, size)` bound `offset`
+            // to Size. Unnamed parameters still pair on binary-pointer evidence.
             && (looks_like_count_name(&params[i + 1].name)
-                || looks_like_buffer_name(&params[i].name)
                 || (is_synthetic_param_name(&params[i].name)
                     && is_synthetic_param_name(&params[i + 1].name)
                     && (looks_like_explicit_binary_pointer(&params[i].c_type)
@@ -1095,11 +1170,14 @@ fn build_param_decoders(
         // so the callee reads `strings[1..count]` out of bounds — a spurious
         // overflow. Allocate `count` decoded strings so the array and its length
         // agree. (Draws the count from the cursor, so not gated by `pair_consumed`.)
+        // An index into the array (`(char **names, int index)`) is not its
+        // length: sizing the array by it put `names[index]` one past the end.
         if i + 1 < params.len()
             && crate::c_decoders::char_double_pointer_constness(&params[i].c_type).is_some()
             && (is_length_param(&params[i + 1].c_type)
                 || (registry_resolves_to_length(&params[i + 1].c_type, registry)
                     && looks_like_count_name(&params[i + 1].name)))
+            && !looks_like_offset_name(&params[i + 1].name)
         {
             let (arr_decl, count_decl) = pair_string_array_count(&params[i], &params[i + 1]);
             out.push(arr_decl);
@@ -1289,7 +1367,68 @@ fn build_param_decoders(
         out.push(emission);
         i += 1;
     }
+    if out.len() > unit_start {
+        units.push(unit_start..out.len());
+    }
+    crate::arg_trace::slice_input_units(&mut out, &units, crate::buffer_len_dimension_enabled());
     Ok(out)
+}
+
+/// The parameters as the decoders see them: bare identifier names and types
+/// without decoration macros.
+fn normalized_c_params(params: &[CParameter]) -> Vec<CParameter> {
+    params
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            // Defensive: a function-pointer param whose declarator leaked into the
+            // name (`(*cb)(args)` with c_type collapsed to the bare return type)
+            // is rebuilt into the canonical funcptr model so it routes through the
+            // trampoline decoder rather than the broken buffer-init splice.
+            if let Some((fname, ftype)) =
+                crate::c_decoders::recover_leaked_funcptr_param(&p.name, &p.c_type)
+            {
+                return CParameter {
+                    name: fname,
+                    c_type: ftype,
+                };
+            }
+            CParameter {
+                name: crate::c_decoders::sanitize_or_synthesize_param_name(&p.name, i),
+                c_type: crate::c_decoders::strip_type_decoration(&p.c_type),
+            }
+        })
+        .collect()
+}
+
+/// The argument-trace plan for a C call's parameter emissions (see
+/// [`crate::arg_trace`]).
+pub(crate) fn c_trace_plan(
+    prefix: &str,
+    call: &str,
+    index_base: usize,
+    params: &[CParameter],
+    emissions: &[CParamEmission],
+    registry: &TypeRegistry,
+) -> crate::arg_trace::DecodePlan {
+    let declared: Vec<crate::arg_trace::Declared> = normalized_c_params(params)
+        .into_iter()
+        .map(|p| crate::arg_trace::Declared::new(p.name, p.c_type))
+        .collect();
+    crate::arg_trace::plan(
+        &crate::arg_trace::Group {
+            lang: crate::arg_trace::Lang::C,
+            prefix,
+            call,
+            role: crate::arg_trace::Role::Param,
+            index_base,
+            registry: Some(registry),
+            defer_input: false,
+            fresh_cursor: true,
+        },
+        emissions,
+        &declared,
+    )
 }
 
 /// A non-const pointer to a concrete (declarable) struct/union, in a function
@@ -1509,6 +1648,7 @@ fn is_raw_buffer_param(c_type: &str, registry: &TypeRegistry) -> bool {
     let without_const = strip_cv_tokens(&canonical);
     pointer_base(&without_const).is_some_and(is_byte_buffer_base)
         || registry_resolves_to_byte_pointer(c_type, registry)
+        || type_model::win32_byte_pointer_typedef(c_type).is_some()
 }
 
 /// Campaign #9: an integer in/out pointer that the callee uses as an index/cursor
@@ -1629,11 +1769,12 @@ fn byte_double_pointer_kind(c_type: &str) -> Option<ByteDoublePointerKind> {
 fn looks_like_stream_count_cursor_pair(length: &CParameter, cursor: &CParameter) -> bool {
     let len = length.name.to_ascii_lowercase();
     let ptr = cursor.name.to_ascii_lowercase();
-    let count_shape = len.contains("avail")
-        || len.contains("remain")
-        || len.contains("size")
-        || len.contains("length")
-        || len.contains("count");
+    let count_shape = !looks_like_offset_name(&length.name)
+        && (len.contains("avail")
+            || len.contains("remain")
+            || len.contains("size")
+            || len.contains("length")
+            || len.contains("count"));
     let cursor_shape = ptr.contains("next")
         || ptr.contains("cursor")
         || ptr.contains("input")
@@ -1725,7 +1866,7 @@ fn is_byte_buffer_base(base: &str) -> bool {
     )
 }
 
-fn registry_resolves_to_byte_pointer(c_type: &str, registry: &TypeRegistry) -> bool {
+pub(crate) fn registry_resolves_to_byte_pointer(c_type: &str, registry: &TypeRegistry) -> bool {
     matches!(
         registry.resolve(c_type),
         TypeShape::Pointer(inner)
@@ -1739,7 +1880,7 @@ fn registry_resolves_to_byte_pointer(c_type: &str, registry: &TypeRegistry) -> b
 /// so a (typed output array, count) pair went undetected: the array was sized to
 /// ONE element while the count was fuzzed huge — a spurious stack-buffer-overflow
 /// (`cgltf_element_read_float` wrote `element_size` floats into a 1-float `out`).
-fn registry_resolves_to_length(c_type: &str, registry: &TypeRegistry) -> bool {
+pub(crate) fn registry_resolves_to_length(c_type: &str, registry: &TypeRegistry) -> bool {
     matches!(
         registry.resolve(c_type),
         TypeShape::Scalar(
@@ -1780,32 +1921,188 @@ fn is_typed_array_pointer(c_type: &str, registry: &TypeRegistry) -> bool {
 /// (`num_tokens`, `count`, `nmemb`, `n`). Gate for the typed-array pairing so a
 /// `(SomeStruct *out, int flags)` signature — pointer followed by a non-count
 /// int — is left to the standalone decoders instead of being mis-paired.
+///
+/// Every pairing that binds a parameter to the input length or to a buffer's
+/// capacity requires this, so an offset-, index- or position-shaped name never
+/// qualifies, even when part of it looks like a count (`lenOffset`,
+/// `start_len`). Binding `offset` in `copy_at(src, offset, size)` to `Size`
+/// pointed every read one past the end of the input: a crash the harness
+/// caused, not the target.
+///
+/// Markers are matched on the name's words (see [`name_words`]), not as
+/// substrings, so `account`, `caps`, `silent` and `enum_x` are not counts, and
+/// a name whose last word is clearly not a length (`account_id`, `count_mode`,
+/// `size_flags`) never is.
 pub(crate) fn looks_like_count_name(name: &str) -> bool {
-    let n = name.to_ascii_lowercase();
-    n == "n"
-        || n == "nmatch"
-        || [
-            "count", "num", "nmemb", "nitem", "ntok", "nelem", "len", "size", "cap", "length",
-            // `nbyte`/`nBytes` is a ubiquitous byte-length name (tinyxml2
-            // `Parse(const char*, size_t nBytes)`). Deliberately NOT a bare
-            // `byte`, so `byteOrder`/`byteOffset`/`byteValue` are not mis-read as
-            // a buffer length.
-            "nbyte",
-        ]
+    if looks_like_offset_name(name) {
+        return false;
+    }
+    // Win32's bare byte and character counts (`const BYTE *pb, DWORD cb`). A
+    // callback named `cb` never gets here: every pairing checks first that the
+    // parameter's type is a length type, which a function pointer is not.
+    if matches!(name, "cb" | "cch" | "pcb" | "pcch") {
+        return true;
+    }
+    let words: Vec<String> = name_words(name)
+        .into_iter()
+        .map(|word| {
+            word.trim_end_matches(|c: char| c.is_ascii_digit())
+                .to_owned()
+        })
+        .filter(|word| !word.is_empty())
+        .collect();
+    let Some(last) = words.last() else {
+        return false;
+    };
+    if is_non_count_word(last) {
+        return false;
+    }
+    if has_hungarian_count_prefix(name) {
+        return true;
+    }
+    // `n`/`nr` are counts on their own (`size_t n`) or ahead of a plural noun
+    // (`nBytes`, `n_items`, `nr_pages`). After another word they are usually an
+    // index (`bit_nr`), and ahead of a singular one a Hungarian integer
+    // (`nValue`).
+    if matches!(words[0].as_str(), "n" | "nr") && (words.len() == 1 || is_plural_word(last)) {
+        return true;
+    }
+    // `n`/`num` ahead of a singular element noun is a count too (`nElem`,
+    // `nMemb`, `num_entry`), and so is `number of` ahead of a plural
+    // (`numberOfElements`, `number_of_bytes`).
+    if words.len() == 2 && matches!(words[0].as_str(), "n" | "num") && is_element_noun(last) {
+        return true;
+    }
+    if words.len() >= 3 && words[0] == "number" && words[1] == "of" && is_plural_word(last) {
+        return true;
+    }
+    if words.iter().any(|word| is_count_word(word)) {
+        return true;
+    }
+    // The words run together, as an unsplit name would be (`nElem` read as
+    // `nelem`, `nMatch` as `nmatch`).
+    words.len() > 1 && is_count_word(&words.concat())
+}
+
+/// A singular noun for one element of a buffer or array, which `n`/`num`
+/// ahead of it turns into an element count (`nElem`, `nTok`, `numEntry`).
+fn is_element_noun(word: &str) -> bool {
+    matches!(
+        word,
+        "elem" | "memb" | "item" | "tok" | "entry" | "rec" | "el" | "char" | "byte"
+    )
+}
+
+/// One lower-case name word that marks a length or element count: `len`,
+/// `size`, `count`, `capacity`, `bytes` and words ending in them (`srclen`,
+/// `bufsize`, `linecount`, `nbytes`), the `sz`/`siz` abbreviations (`bufsz`,
+/// `bufsiz`), `cnt`, OpenSSL's `inl`/`outl`, and the run-together element
+/// counts (`nmemb`, `nitems`, `nelem`, `numbytes`).
+fn is_count_word(word: &str) -> bool {
+    const SUFFIXES: &[&str] = &[
+        "len", "length", "size", "sz", "siz", "count", "cnt", "cap", "capacity", "bytes", "nbyte",
+    ];
+    const NOT_COUNTS: &[&str] = &["account", "discount", "viscount", "resize"];
+    if NOT_COUNTS.iter().any(|w| word.ends_with(w)) {
+        return false;
+    }
+    if SUFFIXES.iter().any(|suffix| word.ends_with(suffix)) {
+        return true;
+    }
+    if matches!(
+        word,
+        "num" | "numel" | "inl" | "outl" | "argc" | "avail" | "remain" | "remaining"
+    ) {
+        return true;
+    }
+    // `numbytes`, `numitems`: `num` run together with a plural noun. `number`
+    // on its own is usually a value, not a count.
+    if word.len() > 4 && word.starts_with("num") && is_plural_word(word) && word != "numbers" {
+        return true;
+    }
+    ["nmemb", "nitem", "nelem", "ntok", "nbyte", "nmatch"]
         .iter()
-        .any(|marker| n.contains(marker))
+        .any(|prefix| word.starts_with(prefix))
+}
+
+/// A word that names something other than a length when it ends a parameter
+/// name: `account_id`, `count_mode`, `size_flags`, `line`, `bit`.
+fn is_non_count_word(word: &str) -> bool {
+    matches!(
+        word,
+        "id" | "ids" | "flag" | "flags" | "mode" | "type" | "kind" | "line" | "bit" | "status"
+    )
+}
+
+/// A lower-case word that reads as an English plural (`bytes`, `items`,
+/// `pages`) rather than a singular ending in `s` (`address`, `status`, `axis`).
+fn is_plural_word(word: &str) -> bool {
+    word.len() > 2
+        && word.ends_with('s')
+        && !word.ends_with("ss")
+        && !word.ends_with("us")
+        && !word.ends_with("is")
+}
+
+/// Win32 Hungarian byte and character counts (`cbData`, `cchName`) and their
+/// pointer forms (`pcbData`, `pcchName`, `lpcbData`). The prefix must be
+/// followed by an upper-case letter, so `cbor` is not a count. (The bare
+/// `cb`/`cch` are matched on their own in [`looks_like_count_name`].)
+fn has_hungarian_count_prefix(name: &str) -> bool {
+    ["cb", "cch", "pcb", "pcch", "lpcb", "lpcch"]
+        .iter()
+        .any(|prefix| {
+            name.strip_prefix(prefix)
+                .and_then(|rest| rest.chars().next())
+                .is_some_and(|c| c.is_ascii_uppercase())
+        })
+}
+
+/// True when a parameter name reads like a position inside a buffer rather than
+/// its length: an offset, index, cursor position, start or skip count.
+pub(crate) fn looks_like_offset_name(name: &str) -> bool {
+    name_words(name).iter().any(|word| {
+        matches!(
+            word.as_str(),
+            "off" | "offs" | "ofs" | "position" | "start" | "begin" | "skip"
+        ) || word.ends_with("offset")
+            || word.ends_with("index")
+            || word.ends_with("idx")
+            || word.ends_with("pos")
+    })
+}
+
+/// Split an identifier into lower-case words at `_`/non-alphanumeric
+/// separators and camelCase boundaries (`srcOffset` -> `src`, `offset`).
+fn name_words(name: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut prev_lower = false;
+    for c in name.chars() {
+        if !c.is_ascii_alphanumeric() {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            prev_lower = false;
+            continue;
+        }
+        if c.is_ascii_uppercase() && prev_lower && !current.is_empty() {
+            words.push(std::mem::take(&mut current));
+        }
+        prev_lower = c.is_ascii_lowercase() || c.is_ascii_digit();
+        current.push(c.to_ascii_lowercase());
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
 }
 
 /// True when a parameter name reads like a data BUFFER (`buf`, `data`, `src`,
-/// `input`, ...). Used WITH [`looks_like_count_name`] to gate the raw-buffer +
-/// by-value-length pairing: `log_log(int level, const char *file, int line,
-/// const char *fmt, ...)` was mis-read as a `(buffer=file, length=line)` pair
-/// because `file` is a `char *` and `line` is an `int` — binding `file` to the
-/// raw, non-NUL-terminated `Data` span and `line` to `Size`, so the `%s`-printed
-/// `file` ran off the end: a spurious heap-buffer-overflow. Neither `file` nor
-/// `line` is buffer- or length-shaped, so the pair must NOT form; both fall
-/// through to the standalone NUL-terminating string + scalar decoders. A genuine
-/// `(const char *src, int srclen)` still pairs (`srclen` is count-shaped).
+/// `input`, ...). Supporting evidence for the reverse `(length, buffer)` and
+/// output-buffer pairings. It is never enough on its own to bind the FOLLOWING
+/// integer to the input length: `src` says nothing about whether the next
+/// parameter is a length or an offset.
 pub(crate) fn looks_like_buffer_name(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     matches!(
@@ -2035,17 +2332,25 @@ fn pair_buffer_length(
     }
 
     let cap_name = format!("_bhf_cap_{buf_name}");
+    // A pointer typedef (`LPCBYTE`, `typedef const BYTE *cbytes_t`) hides
+    // whether the bytes are const: write and free the copy through `(void *)`
+    // so a const pointee compiles too.
+    let buf_ref = if buf_type.contains('*') {
+        buf_name.to_owned()
+    } else {
+        format!("(void *){buf_name}")
+    };
     let buf_decl = format!(
         "size_t {cap_name} = Size <= (1024 * 1024) ? (size_t)Size : (1024 * 1024); \
          {buf_type} {buf_name} = ({buf_type})malloc({cap_name} ? {cap_name} : 1); \
-         if ({buf_name} && {cap_name}) memcpy({buf_name}, Data, {cap_name})"
+         if ({buf_name} && {cap_name}) memcpy({buf_ref}, Data, {cap_name})"
     );
     let buf_emission = CParamEmission {
         support: None,
         decl: buf_decl,
         arg: buf_name.to_owned(),
         c_type: buf_type,
-        free: Some(format!("free({buf_name})")),
+        free: Some(format!("free({buf_ref})")),
     };
     let len_emission = CParamEmission {
         support: None,
@@ -2398,8 +2703,11 @@ fn looks_like_output_capacity_pair(
     length: &CParameter,
     function_name: &str,
 ) -> bool {
-    looks_outputish(&buffer.name)
-        || looks_outputish(&length.name)
+    // An output-shaped buffer name says nothing about the integer after it:
+    // `put_at(dst, offset, size)` and `encode(out, flags)` bound `offset` and
+    // `flags` to the capacity, so every write started at the end of the buffer.
+    (looks_like_count_name(&length.name)
+        && (looks_outputish(&buffer.name) || looks_outputish(&length.name)))
         // Public headers often omit parameter names. The parser then gives us
         // `arg1`/`arg2`, so name-only evidence disappears precisely for APIs like
         // `archive_read_data(struct archive *, void *, size_t)`. Decoding that
@@ -2424,6 +2732,14 @@ fn is_synthetic_param_name(name: &str) -> bool {
     }
     stem.strip_prefix("arg")
         .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Name evidence that `length` holds the size or capacity of the `buffer` it
+/// follows: a count-shaped name ([`looks_like_count_name`]), or two names the
+/// parser synthesized for a header that omits them.
+fn length_name_fits_buffer(buffer: &CParameter, length: &CParameter) -> bool {
+    looks_like_count_name(&length.name)
+        || (is_synthetic_param_name(&buffer.name) && is_synthetic_param_name(&length.name))
 }
 
 fn looks_like_output_producing_function(name: &str) -> bool {
@@ -2671,49 +2987,49 @@ fn pair_output_buffer_length(
 /// line in the generated harness source.
 fn validate_c_build_inputs(args: &GenerateCDirectArgs) -> Result<(), HarnessGenError> {
     use crate::build_safety::{
-        ensure_all_build_inputs_safe, ensure_all_compile_flags_safe, ensure_build_input_safe,
+        ensure_all_build_paths_safe, ensure_all_compile_flags_safe, ensure_build_path_safe,
+        make_path,
     };
-    // Flags are recipe-only, so one that is safe once single-quoted is allowed;
-    // paths and include names below stay strict (a path is also a make target).
+    // Flags are recipe-only, so one that is safe once single-quoted is allowed.
+    // Paths and include names may carry spaces, parentheses, apostrophes and ampersands —
+    // the Makefile double-quotes them, and a C string literal holds them — but
+    // no character that quoting cannot contain.
     ensure_all_compile_flags_safe(args.compile_flags.iter().map(String::as_str))?;
-    ensure_all_build_inputs_safe(
+    ensure_all_build_paths_safe(
         "include name",
         args.target_includes.iter().map(String::as_str),
     )?;
     for dir in &args.target_includes_dirs {
-        ensure_build_input_safe("include dir", &dir.display().to_string())?;
+        ensure_build_path_safe("include dir", &make_path(dir))?;
     }
     for src in &args.target_sources {
-        ensure_build_input_safe("source path", &src.display().to_string())?;
+        ensure_build_path_safe("source path", &make_path(src))?;
     }
-    ensure_build_input_safe(
-        "runtime include",
-        &args.c_runtime_include.display().to_string(),
-    )?;
+    ensure_build_path_safe("runtime include", &make_path(&args.c_runtime_include))?;
     Ok(())
 }
 
 fn validate_c_sequence_build_inputs(args: &GenerateCSequenceArgs) -> Result<(), HarnessGenError> {
     use crate::build_safety::{
-        ensure_all_build_inputs_safe, ensure_all_compile_flags_safe, ensure_build_input_safe,
+        ensure_all_build_paths_safe, ensure_all_compile_flags_safe, ensure_build_path_safe,
+        make_path,
     };
-    // Flags are recipe-only, so one that is safe once single-quoted is allowed;
-    // paths and include names below stay strict (a path is also a make target).
+    // Flags are recipe-only, so one that is safe once single-quoted is allowed.
+    // Paths and include names may carry spaces, parentheses, apostrophes and ampersands —
+    // the Makefile double-quotes them, and a C string literal holds them — but
+    // no character that quoting cannot contain.
     ensure_all_compile_flags_safe(args.compile_flags.iter().map(String::as_str))?;
-    ensure_all_build_inputs_safe(
+    ensure_all_build_paths_safe(
         "include name",
         args.target_includes.iter().map(String::as_str),
     )?;
     for dir in &args.target_includes_dirs {
-        ensure_build_input_safe("include dir", &dir.display().to_string())?;
+        ensure_build_path_safe("include dir", &make_path(dir))?;
     }
     for src in &args.target_sources {
-        ensure_build_input_safe("source path", &src.display().to_string())?;
+        ensure_build_path_safe("source path", &make_path(src))?;
     }
-    ensure_build_input_safe(
-        "runtime include",
-        &args.c_runtime_include.display().to_string(),
-    )?;
+    ensure_build_path_safe("runtime include", &make_path(&args.c_runtime_include))?;
     Ok(())
 }
 
@@ -2793,13 +3109,14 @@ fn bind_webp_interleaved_output_geometry(
 
 fn build_c_context(args: &GenerateCDirectArgs) -> Result<CTemplateContext, HarnessGenError> {
     validate_c_build_inputs(args)?;
-    let (
+    let SplitCompileContext {
         compile_flags,
+        link_flags,
         c_compiler,
-        compiler_is_gcc,
+        c_compiler_family,
         build_context_provenance,
         build_context_dropped,
-    ) = split_c_compile_context(&args.compile_flags);
+    } = split_c_compile_context(&args.compile_flags);
     let registry = TypeRegistry::from_defs(args.type_defs.iter());
     // A byte-stream decoder is driven one byte at a time: the first parameter is
     // the untrusted byte (the loop variable), and only parameters 2..N are
@@ -2824,8 +3141,17 @@ fn build_c_context(args: &GenerateCDirectArgs) -> Result<CTemplateContext, Harne
             .as_ref()
             .is_some_and(|env| env.fuzz_driven_callbacks),
     );
+    // A parameter named like one of the harness's own locals (`Data`, `Size`,
+    // `Cur`) gets a local of its own; the trace below keeps its declared name.
+    let local_params: Vec<CParameter> = normalized_c_params(decoder_params)
+        .into_iter()
+        .map(|param| CParameter {
+            name: crate::arg_trace::harness_local_name(&param.name),
+            c_type: param.c_type,
+        })
+        .collect();
     let mut params = build_param_decoders(
-        decoder_params,
+        &local_params,
         &registry,
         &args.lifecycle,
         Some(&header_complete),
@@ -2844,12 +3170,7 @@ fn build_c_context(args: &GenerateCDirectArgs) -> Result<CTemplateContext, Harne
     // geometry exactly as a maintained caller does. This is deliberately
     // signature- and symbol-gated; planar YUV needs a different multi-plane
     // allocation model and remains on the generic decoder.
-    bind_webp_interleaved_output_geometry(
-        &args.target.name,
-        decoder_params,
-        &registry,
-        &mut params,
-    );
+    bind_webp_interleaved_output_geometry(&args.target.name, &local_params, &registry, &mut params);
 
     // Strip storage/calling-convention/decoration noise off the return type so a
     // `<type> R = ...` result capture is valid (`__vectorcall`, `SIMDJSON_INLINE`).
@@ -2973,40 +3294,60 @@ fn build_c_context(args: &GenerateCDirectArgs) -> Result<CTemplateContext, Harne
         args.result_cleanup.clone()
     };
 
+    // When the target's header is INCLUDED (not forward-declared), a callback
+    // param's support re-`typedef`s the callback type the header already
+    // declares — a redefinition conflict if the signatures differ. Drop our
+    // typedef and use the header's (the trampoline assignment is cast, so a
+    // signature mismatch still compiles).
+    let params: Vec<CParamEmission> = if args.target_declared_in_header {
+        params
+            .into_iter()
+            .map(strip_redundant_callback_typedef)
+            .collect()
+    } else {
+        params
+    };
+    let trace = c_trace_plan(
+        "p",
+        "target",
+        usize::from(byte_stream),
+        decoder_params,
+        &params,
+        &registry,
+    );
+    let arg_layout = crate::arg_layout::ArgLayout::new(
+        "c",
+        if byte_stream { "byte_stream" } else { "direct" },
+        trace.layout.clone(),
+    )
+    .with_buffer_len_dimension(trace.buffer_len_dimension);
+
     Ok(CTemplateContext {
+        arg_layout,
         harness_id: args.harness_id.clone(),
         qualified_target_name: args.target.name.clone(),
         target_includes: args.target_includes.clone(),
-        target_includes_dirs: args
-            .target_includes_dirs
-            .iter()
-            .map(|p| crate::build_safety::make_path(p))
-            .collect(),
-        target_sources: args
-            .target_sources
-            .iter()
-            .map(|p| crate::build_safety::make_path(p))
-            .collect(),
+        target_includes_dirs: recipe_paths(&args.target_includes_dirs),
+        target_sources: recipe_paths(&args.target_sources),
         compile_flags,
+        link_flags,
         build_context_provenance,
         build_context_dropped,
         c_compiler,
-        compiler_is_gcc,
-        c_runtime_include: crate::build_safety::make_path(&args.c_runtime_include),
+        c_compiler_family,
+        c_runtime_include: crate::build_safety::recipe_path(&crate::build_safety::make_path(
+            &args.c_runtime_include,
+        )),
         emit_forward_declaration: !args.target_declared_in_header,
-        // When the target's header is INCLUDED (not forward-declared), a callback
-        // param's support re-`typedef`s the callback type the header already
-        // declares — a redefinition conflict if the signatures differ. Drop our
-        // typedef and use the header's (the trampoline assignment is cast, so a
-        // signature mismatch still compiles).
-        params: if args.target_declared_in_header {
+        forward_tags: tag_declarations(
             params
-                .into_iter()
-                .map(strip_redundant_callback_typedef)
-                .collect()
-        } else {
-            params
-        },
+                .iter()
+                .map(|param| param.c_type.as_str())
+                .chain([return_type.as_str()]),
+        ),
+        params_decode: trace.decode,
+        params_after: trace.after,
+        params,
         return_type: if return_type_present {
             return_type
         } else {
@@ -3065,14 +3406,26 @@ fn is_c_byte_stream_decoder(name: &str, params: &[CParameter]) -> bool {
 fn build_c_sequence_context(
     args: &GenerateCSequenceArgs,
 ) -> Result<CSequenceTemplateContext, HarnessGenError> {
+    let mut context = build_c_sequence_context_untraced(args)?;
+    apply_sequence_traces(
+        &mut context,
+        &TypeRegistry::from_defs(args.type_defs.iter()),
+    );
+    Ok(context)
+}
+
+fn build_c_sequence_context_untraced(
+    args: &GenerateCSequenceArgs,
+) -> Result<CSequenceTemplateContext, HarnessGenError> {
     validate_c_sequence_build_inputs(args)?;
-    let (
+    let SplitCompileContext {
         compile_flags,
+        link_flags,
         c_compiler,
-        compiler_is_gcc,
+        c_compiler_family,
         build_context_provenance,
         build_context_dropped,
-    ) = split_c_compile_context(&args.compile_flags);
+    } = split_c_compile_context(&args.compile_flags);
     let expert_jpeg_decompress = is_exact_libjpeg_header_reader(args);
     let expert_sqlite_prepare = is_exact_sqlite_prepare(args);
     if expert_jpeg_decompress || expert_sqlite_prepare {
@@ -3101,25 +3454,22 @@ fn build_c_sequence_context(
             target_includes.push("jpeglib.h".to_owned());
         }
         return Ok(CSequenceTemplateContext {
+            arg_layout: crate::arg_layout::ArgLayout::new("c", "sequence", Vec::new()),
             harness_id: args.harness_id.clone(),
             target_includes,
-            target_includes_dirs: args
-                .target_includes_dirs
-                .iter()
-                .map(|p| crate::build_safety::make_path(p))
-                .collect(),
-            target_sources: args
-                .target_sources
-                .iter()
-                .map(|p| crate::build_safety::make_path(p))
-                .collect(),
+            target_includes_dirs: recipe_paths(&args.target_includes_dirs),
+            target_sources: recipe_paths(&args.target_sources),
             compile_flags,
+            link_flags: link_flags.clone(),
             build_context_provenance,
             build_context_dropped,
             c_compiler,
-            compiler_is_gcc,
-            c_runtime_include: crate::build_safety::make_path(&args.c_runtime_include),
+            c_compiler_family,
+            c_runtime_include: crate::build_safety::recipe_path(&crate::build_safety::make_path(
+                &args.c_runtime_include,
+            )),
             emit_forward_declaration: false,
+            forward_tags: Vec::new(),
             expert_jpeg_decompress,
             expert_sqlite_prepare,
             handle_type: String::new(),
@@ -3638,26 +3988,23 @@ fn build_c_sequence_context(
     };
     let op_ctrl_len = 1 + MAX_SEQUENCE_STEPS * 5 + usize::from(protocol_portfolio_lanes > 1);
 
-    Ok(CSequenceTemplateContext {
+    let mut context = CSequenceTemplateContext {
+        arg_layout: crate::arg_layout::ArgLayout::new("c", "sequence", Vec::new()),
         harness_id: args.harness_id.clone(),
         target_includes: args.target_includes.clone(),
-        target_includes_dirs: args
-            .target_includes_dirs
-            .iter()
-            .map(|p| crate::build_safety::make_path(p))
-            .collect(),
-        target_sources: args
-            .target_sources
-            .iter()
-            .map(|p| crate::build_safety::make_path(p))
-            .collect(),
+        target_includes_dirs: recipe_paths(&args.target_includes_dirs),
+        target_sources: recipe_paths(&args.target_sources),
         compile_flags,
+        link_flags,
         build_context_provenance,
         build_context_dropped,
         c_compiler,
-        compiler_is_gcc,
-        c_runtime_include: crate::build_safety::make_path(&args.c_runtime_include),
+        c_compiler_family,
+        c_runtime_include: crate::build_safety::recipe_path(&crate::build_safety::make_path(
+            &args.c_runtime_include,
+        )),
         emit_forward_declaration: !args.target_declared_in_header,
+        forward_tags: Vec::new(),
         expert_jpeg_decompress: false,
         expert_sqlite_prepare: false,
         handle_type: emit_c_type(&args.handle_type),
@@ -3686,7 +4033,65 @@ fn build_c_sequence_context(
         expert_output_drain,
         op_steps,
         end_step,
-    })
+    };
+    context.forward_tags = context.prototype_tags();
+    Ok(context)
+}
+
+impl CSequenceTemplateContext {
+    /// The `struct`/`union` tags the lifecycle prototypes the template emits
+    /// name (the handle, every step's return and parameter types, an output
+    /// drain's cleanup parameter).
+    fn prototype_tags(&self) -> Vec<String> {
+        let steps = self
+            .init_step
+            .iter()
+            .chain(&self.op_steps)
+            .chain(&self.mined_protocol_declarations)
+            .chain(&self.end_step);
+        let mut types = vec![self.handle_param_type.as_str()];
+        for step in steps {
+            types.push(step.return_type.as_str());
+            types.extend(step.params.iter().map(|param| param.c_type.as_str()));
+        }
+        if let Some(drain) = &self.expert_output_drain {
+            types.push(drain.cleanup_param_type.as_str());
+        }
+        tag_declarations(types)
+    }
+}
+
+/// The `struct` and `union` tags `types` name, as file-scope declarations
+/// (`struct widget_ctx`), each once, in the order first named.
+///
+/// A harness declares a target no header declares with its own prototype. A
+/// tag first named inside that prototype's parameter list is declared in the
+/// prototype's scope alone, a type distinct from the same tag the harness body
+/// names, so the call passes an incompatible pointer, which newer compilers
+/// reject. Declared at file scope first, both name one type; a tag a header
+/// already declared or defined is merely redeclared. (An `enum` cannot be
+/// declared without its enumerators in C, and is left out.)
+fn tag_declarations<'a>(types: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut tags: Vec<String> = Vec::new();
+    for ty in types {
+        let words: Vec<&str> = ty
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|word| !word.is_empty())
+            .collect();
+        for pair in words.windows(2) {
+            let (keyword, name) = (pair[0], pair[1]);
+            if matches!(keyword, "struct" | "union")
+                && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                && !matches!(name, "const" | "volatile" | "restrict")
+            {
+                let tag = format!("{keyword} {name}");
+                if !tags.contains(&tag) {
+                    tags.push(tag);
+                }
+            }
+        }
+    }
+    tags
 }
 
 /// A deliberately narrow gate for the public libjpeg decompressor state
@@ -3948,10 +4353,21 @@ fn disable_sequence_callback_actions(step: &mut CSequenceStepEmission) {
     }
 }
 
-fn split_c_compile_context(flags: &[String]) -> (Vec<String>, String, bool, String, String) {
+/// A C target's build-context flags, split into what the Makefile needs.
+struct SplitCompileContext {
+    compile_flags: Vec<String>,
+    link_flags: Vec<String>,
+    c_compiler: String,
+    c_compiler_family: String,
+    build_context_provenance: String,
+    build_context_dropped: String,
+}
+
+fn split_c_compile_context(flags: &[String]) -> SplitCompileContext {
     let mut compiler = None;
     let mut provenance = "none".to_owned();
     let mut dropped = "none".to_owned();
+    let mut link_flags = Vec::new();
     let compile_flags = flags
         .iter()
         .filter_map(|flag| {
@@ -3970,6 +4386,10 @@ fn split_c_compile_context(flags: &[String]) -> (Vec<String>, String, bool, Stri
             } else if let Some(value) = flag.strip_prefix(BUILD_CONTEXT_DROPPED_PREFIX) {
                 dropped = value.to_owned();
                 None
+            } else if let Some(value) = flag.strip_prefix(BUILD_CONTEXT_LDFLAG_PREFIX) {
+                // A link input (an import library) for the link lines only.
+                link_flags.push(crate::build_safety::recipe_token(value));
+                None
             } else {
                 // Single-quote a flag that needs it. A CMake version-comparison
                 // define (`-DLLAMA_VERSIONS=>=3`) is legitimate but its `>` would
@@ -3980,22 +4400,27 @@ fn split_c_compile_context(flags: &[String]) -> (Vec<String>, String, bool, Stri
         })
         .collect();
     let compiler = compiler.unwrap_or_else(|| "clang".to_owned());
-    let leaf = Path::new(&compiler)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(&compiler)
-        .to_ascii_lowercase();
-    let compiler_is_gcc =
-        leaf == "gcc" || leaf.starts_with("gcc-") || leaf == "g++" || leaf.starts_with("g++-");
-    (
+    // Only the fallback for a Makefile that cannot ask the compiler itself; the
+    // shared name normalisation keeps a cross-prefixed `aarch64-linux-gnu-gcc`
+    // in the GCC family, as the compile-database reader already accepts it.
+    let c_compiler_family = crate::compiler_family::family_from_name(&compiler)
+        .unwrap_or(crate::compiler_family::CompilerFamily::Clang)
+        .make_value()
+        .to_owned();
+    SplitCompileContext {
         compile_flags,
-        compiler,
-        compiler_is_gcc,
+        link_flags,
+        // `CC = <compiler>` heads every recipe; one under a spaced directory is
+        // double-quoted so it stays a single word.
+        c_compiler: crate::build_safety::recipe_path(&crate::build_safety::make_path(Path::new(
+            &compiler,
+        ))),
+        c_compiler_family,
         // Metadata lands in `NAME = <value>` assignments; a newline would end the
         // assignment and let the remainder parse as Makefile source.
-        crate::build_safety::make_metadata_value(&provenance),
-        crate::build_safety::make_metadata_value(&dropped),
-    )
+        build_context_provenance: crate::build_safety::make_metadata_value(&provenance),
+        build_context_dropped: crate::build_safety::make_metadata_value(&dropped),
+    }
 }
 
 /// Mark ops that return a NEW handle derived from the live one, and give every
@@ -4222,7 +4647,12 @@ fn build_c_sequence_step_emission(
     if let (Some(first_param), Some(first_emit)) = (step.params.first(), params.first_mut()) {
         let resolves_length = is_length_param(&first_param.c_type)
             || registry_resolves_to_length(&first_param.c_type, registry);
-        if resolves_length && looks_like_count_name(&first_param.name) {
+        // A length that takes a slice of the input with its buffer is that
+        // buffer's length, not the handle's.
+        if resolves_length
+            && looks_like_count_name(&first_param.name)
+            && !crate::arg_trace::takes_slice(first_emit)
+        {
             let ty = crate::c_decoders::strip_type_decoration(&first_param.c_type);
             first_emit.decl = format!(
                 "{ty} {arg} = ({ty})bhf_bounded_length(&Cur, 0, sizeof _bhf_handle)",
@@ -4260,6 +4690,9 @@ fn build_c_sequence_step_emission(
         marks_target: false,
         callback_context_arg: None,
         condition: None,
+        declared: declared_lifecycle_params(step),
+        decode: Vec::new(),
+        after: Vec::new(),
     })
 }
 
@@ -4474,6 +4907,14 @@ fn apply_c_protocol_args(
             "mined call '{}' argument recipe count does not match its declaration",
             emission.name
         )));
+    }
+    // Arguments bound to the input themselves take it whole: the call's
+    // buffers share the bytes the cursor left, as when they were recorded.
+    if recipes
+        .iter()
+        .any(|recipe| !matches!(recipe, CProtocolArg::Decode))
+    {
+        crate::arg_trace::unslice_all(&mut emission.params);
     }
     for ((param, declared), recipe) in emission.params.iter_mut().zip(declared_params).zip(recipes)
     {
@@ -4733,6 +5174,9 @@ fn build_c_returning_init_emission(
         marks_target: false,
         callback_context_arg: None,
         condition: None,
+        declared: declared_lifecycle_params(step),
+        decode: Vec::new(),
+        after: Vec::new(),
     })
 }
 
@@ -4811,7 +5255,132 @@ fn build_c_out_handle_init_emission(
         marks_target: false,
         callback_context_arg: None,
         condition: None,
+        declared: declared_lifecycle_params(step),
+        decode: Vec::new(),
+        after: Vec::new(),
     })
+}
+
+/// A lifecycle step's parameters as declared, for its argument-trace lines.
+fn declared_lifecycle_params(step: &CLifecycleStep) -> Vec<crate::arg_trace::Declared> {
+    normalized_c_params(&step.params)
+        .into_iter()
+        .map(|p| crate::arg_trace::Declared::new(p.name, p.c_type))
+        .collect()
+}
+
+/// Give every call of a sequence harness its decode and argument-trace
+/// statements (see [`crate::arg_trace`]). Runs once the context is complete,
+/// after every rewrite of the steps' decls and arguments.
+fn apply_sequence_traces(context: &mut CSequenceTemplateContext, registry: &TypeRegistry) {
+    let mut layout: Vec<crate::arg_layout::LayoutStep> = Vec::new();
+    // A call that runs once, before any other call read the cursor, keeps
+    // whole-input parameters as written when it reads no cursor bytes itself
+    // (see `Group::fresh_cursor`). Every other call (an operation, a call in
+    // a loop, the teardown) gives them the argument bytes the cursor left,
+    // never the control tail.
+    let reads_cursor = |step: &CSequenceStepEmission| crate::arg_trace::reads_cursor(&step.params);
+    let mut setup_read = context.init_step.as_ref().is_some_and(reads_cursor);
+    let configure_fresh: Vec<bool> = context
+        .configure_steps
+        .iter()
+        .map(|step| {
+            let fresh = !setup_read;
+            setup_read |= reads_cursor(step);
+            fresh
+        })
+        .collect();
+    let mut protocol_read = setup_read;
+    let mut once_fresh = |step: &CSequenceStepEmission| {
+        let fresh = !protocol_read;
+        protocol_read |= reads_cursor(step);
+        fresh
+    };
+    let protocol_fresh: Vec<bool> = context
+        .mined_protocol_steps
+        .iter()
+        .map(&mut once_fresh)
+        .collect();
+    let object_fresh: Vec<(bool, Vec<bool>, bool)> = context
+        .mined_protocol_objects
+        .iter()
+        .map(|object| {
+            (
+                once_fresh(&object.constructor),
+                object.protocol_steps.iter().map(&mut once_fresh).collect(),
+                object.end_step.as_ref().is_some_and(&mut once_fresh),
+            )
+        })
+        .collect();
+
+    let mut counter = 0usize;
+    let mut buffer_len_dimension = false;
+    let mut visit = |step: &mut CSequenceStepEmission, fresh: bool| {
+        let prefix = format!("q{counter}_");
+        counter += 1;
+        let plan = crate::arg_trace::plan(
+            &crate::arg_trace::Group {
+                lang: crate::arg_trace::Lang::C,
+                prefix: &prefix,
+                call: &step.name,
+                role: crate::arg_trace::Role::Param,
+                // The live handle is the call's first argument.
+                index_base: usize::from(!step.receiver.is_empty()),
+                registry: Some(registry),
+                defer_input: false,
+                fresh_cursor: fresh,
+            },
+            &step.params,
+            &step.declared,
+        );
+        step.decode = plan.decode;
+        step.after = plan.after;
+        buffer_len_dimension |= plan.buffer_len_dimension;
+        layout.extend(plan.layout);
+    };
+    if let Some(step) = context.init_step.as_mut() {
+        visit(step, true);
+    }
+    for step in context.op_steps.iter_mut() {
+        visit(step, false);
+    }
+    for (step, fresh) in context.configure_steps.iter_mut().zip(configure_fresh) {
+        visit(step, fresh);
+    }
+    for (step, fresh) in context.mined_protocol_steps.iter_mut().zip(protocol_fresh) {
+        visit(step, fresh);
+    }
+    for (object, (constructor, steps, end)) in
+        context.mined_protocol_objects.iter_mut().zip(object_fresh)
+    {
+        visit(&mut object.constructor, constructor);
+        for (step, fresh) in object.protocol_steps.iter_mut().zip(steps) {
+            visit(step, fresh);
+        }
+        if let Some(step) = object.end_step.as_mut() {
+            visit(step, end);
+        }
+    }
+    if let Some(pump) = context.expert_stream_pump.as_mut() {
+        visit(&mut pump.open_step, !setup_read);
+        visit(&mut pump.header_step, false);
+        visit(&mut pump.data_step, false);
+        if let Some(step) = pump.skip_step.as_mut() {
+            visit(step, false);
+        }
+    }
+    if let Some(drain) = context.expert_output_drain.as_mut() {
+        visit(&mut drain.target_step, false);
+    }
+    if let Some(step) = context.end_step.as_mut() {
+        visit(step, false);
+    }
+    context.arg_layout = crate::arg_layout::ArgLayout::new("c", "sequence", layout)
+        .with_buffer_len_dimension(buffer_len_dimension)
+        .without_static_decode(
+            "a sequence harness picks its calls from a control block at the end of the input, \
+             so which parameters are decoded, and from which bytes, depends on the input",
+        );
 }
 
 fn scoped_c_param_name(prefix: &str, index: usize, raw: &str) -> String {
@@ -4854,6 +5423,922 @@ mod tests {
         assert!(!looks_like_count_name("byteOrder"));
         assert!(!looks_like_count_name("byteOffset"));
         assert!(!looks_like_count_name("firstByte"));
+    }
+
+    #[test]
+    fn count_name_needs_count_shape_and_rejects_offsets() {
+        // Win32 Hungarian byte/char counts are lengths.
+        assert!(looks_like_count_name("cbData"));
+        assert!(looks_like_count_name("cchName"));
+        assert!(looks_like_count_name("srclen"));
+        assert!(looks_like_count_name("size"));
+        // ...and so are the bare Win32 counts. A callback named `cb` never
+        // reaches this check: its pointer type is not a length type.
+        for name in ["cb", "cch", "pcb", "pcch"] {
+            assert!(looks_like_count_name(name), "{name:?} is a Win32 count");
+        }
+        // Otherwise the Hungarian prefix needs its capital: an ordinary word.
+        assert!(!looks_like_count_name("cbor"));
+        assert!(!looks_like_count_name("Cb"));
+        // Offset-, index- and position-shaped names never bind to the input length,
+        // even when another part of the name looks like a count.
+        for name in [
+            "offset",
+            "off",
+            "pos",
+            "position",
+            "index",
+            "idx",
+            "start",
+            "begin",
+            "skip",
+            "bit_index",
+            "srcOffset",
+            "lenOffset",
+            "start_len",
+            "sizeIdx",
+        ] {
+            assert!(
+                !looks_like_count_name(name),
+                "{name:?} must not pair as a buffer length"
+            );
+        }
+    }
+
+    #[test]
+    fn count_name_reads_run_together_and_spelled_out_counts() {
+        // `n`/`num` run together with an element noun, and `number of` a
+        // plural, name element counts.
+        for name in [
+            "nElem",
+            "nMemb",
+            "nItem",
+            "nTok",
+            "nEntry",
+            "nRec",
+            "nChar",
+            "nByte",
+            "nBytes",
+            "numElems",
+            "num_entry",
+            "numberOfElements",
+            "number_of_bytes",
+        ] {
+            assert!(looks_like_count_name(name), "{name:?} is a count");
+        }
+        // Hungarian integers, positions and plain values are not.
+        for name in [
+            "nValue",
+            "nFlag",
+            "nMode",
+            "nIndex",
+            "nOffset",
+            "numberValue",
+            "number",
+            "numberOfFlags_mode",
+        ] {
+            assert!(!looks_like_count_name(name), "{name:?} is not a count");
+        }
+    }
+
+    #[test]
+    fn run_together_and_win32_counts_bind_to_their_buffer() {
+        for (buffer, length) in [
+            (("buf", "const uint8_t *"), ("nElem", "size_t")),
+            (
+                ("items", "const unsigned char *"),
+                ("numberOfElements", "size_t"),
+            ),
+            (("pv", "const uint8_t *"), ("cb", "unsigned long")),
+        ] {
+            let decls = c_param_decls("sum_values", &[buffer, length]);
+            assert_eq!(
+                decls[1],
+                format!("{} {} = ({}){}", length.1, length.0, length.1, "Size"),
+                "{length:?} must be the length of {buffer:?}: {decls:?}"
+            );
+            assert!(
+                decls[0].contains(&format!("{} = ({})Data", buffer.0, buffer.1)),
+                "{buffer:?} must be the input: {decls:?}"
+            );
+        }
+        // Through the registry too: Win32 `BYTE`/`DWORD` spellings.
+        let registry = TypeRegistry::default();
+        let params = [
+            CParameter {
+                name: "pb".to_owned(),
+                c_type: "const BYTE *".to_owned(),
+            },
+            CParameter {
+                name: "cb".to_owned(),
+                c_type: "DWORD".to_owned(),
+            },
+        ];
+        let decls: Vec<String> = build_param_decoders(
+            &params,
+            &registry,
+            &[],
+            None,
+            false,
+            false,
+            DecoderLimits::default(),
+            "checksum",
+            false,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|emission| emission.decl)
+        .collect();
+        assert_eq!(decls[1], "DWORD cb = (DWORD)Size", "{decls:?}");
+    }
+
+    /// A byte buffer spelled through a pointer typedef, with no length
+    /// partner, is a heap copy of the input like any other lone byte buffer,
+    /// never a one-byte scalar the callee then reads past.
+    #[test]
+    fn lone_pointer_typedef_byte_buffer_is_a_heap_copy_of_the_input() {
+        let lone = |c_type: &str, registry: &TypeRegistry| -> String {
+            let params = [CParameter {
+                name: "p".to_owned(),
+                c_type: c_type.to_owned(),
+            }];
+            build_param_decoders(
+                &params,
+                registry,
+                &[],
+                None,
+                false,
+                false,
+                DecoderLimits::default(),
+                "checksum",
+                false,
+            )
+            .unwrap()
+            .remove(0)
+            .decl
+        };
+        let header = "typedef unsigned char BYTE;\n\
+             typedef const BYTE *cbytes_t;\n\
+             typedef BYTE *bytes_t;\n";
+        let defs = c_parser::parse_c_type_defs(header).unwrap();
+        let registry = TypeRegistry::from_defs(std::iter::once(&defs));
+        for (c_type, registry) in [
+            ("LPCBYTE", &TypeRegistry::default()),
+            ("PCBYTE", &TypeRegistry::default()),
+            ("PCUCHAR", &TypeRegistry::default()),
+            ("cbytes_t", &registry),
+            // The typedef hides the constness: the same copy suits both.
+            ("bytes_t", &registry),
+        ] {
+            let decl = lone(c_type, registry);
+            assert!(
+                !decl.contains("_bhf_out_p")
+                    && decl.contains("malloc(")
+                    && decl.contains("memcpy("),
+                "{c_type}: {decl}"
+            );
+            // Read-only bytes: the NUL-terminated copy, at least 8 bytes.
+            assert!(
+                decl.contains("< 8)") && decl.contains("'\\0'"),
+                "{c_type}: {decl}"
+            );
+        }
+        // A Win32 writable byte pointer is the spelled one it stands for: a
+        // writable copy with headroom.
+        let decl = lone("PBYTE", &TypeRegistry::default());
+        assert!(
+            decl.contains("+ 65536") && decl.contains("memcpy("),
+            "{decl}"
+        );
+
+        // With a count after it, a pointer typedef pairs, through the
+        // registry or as a Win32 spelling: a copy of the input, written
+        // through `(void *)` so a const pointee compiles, and its size.
+        for (c_type, registry) in [
+            ("LPCBYTE", &TypeRegistry::default()),
+            ("cbytes_t", &registry),
+        ] {
+            let params = [
+                CParameter {
+                    name: "pb".to_owned(),
+                    c_type: c_type.to_owned(),
+                },
+                CParameter {
+                    name: "cb".to_owned(),
+                    c_type: "DWORD".to_owned(),
+                },
+            ];
+            let decls: Vec<CParamEmission> = build_param_decoders(
+                &params,
+                registry,
+                &[],
+                None,
+                false,
+                false,
+                DecoderLimits::default(),
+                "checksum",
+                false,
+            )
+            .unwrap();
+            assert!(
+                decls[0]
+                    .decl
+                    .contains("memcpy((void *)pb, Data, _bhf_cap_pb)")
+                    && decls[0].free.as_deref() == Some("free((void *)pb)"),
+                "{c_type}: {decls:?}"
+            );
+            assert_eq!(
+                decls[1].decl, "DWORD cb = (DWORD)(pb ? _bhf_cap_pb : 0)",
+                "{c_type}: {decls:?}"
+            );
+        }
+    }
+
+    /// Assert that the static decode of `out`'s arg-layout.json gives the
+    /// values, lengths and spans its argument trace prints for `input`.
+    fn assert_layout_matches_trace(out: &Path, input: &[u8]) {
+        let layout = crate::arg_layout::ArgLayout::read(out).unwrap().unwrap();
+        let lines = traced_args(out, input, Some("1"));
+        for stat in layout.decode(input) {
+            assert!(stat.decoded, "{stat:?} on {input:02x?}");
+            let trace = traced(&lines, &stat.name, None);
+            assert_eq!(
+                serde_json::json!(stat.span),
+                trace["span"],
+                "{}: static {stat:?} vs traced {trace} on {input:02x?}",
+                stat.name
+            );
+            match &stat.value {
+                Some(value) => {
+                    assert_eq!(trace["value"], serde_json::json!(value), "{}", stat.name)
+                }
+                None => {
+                    assert_eq!(trace["len"], serde_json::json!(stat.len), "{}", stat.name);
+                    assert_eq!(
+                        trace["preview_hex"].as_str().unwrap_or_default(),
+                        stat.preview_hex.as_deref().unwrap_or_default(),
+                        "{}",
+                        stat.name
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every buffer of a call with several gets bytes of its own: after the
+    /// scalars, each but the last a sized slice of the input (a 4-byte
+    /// length, then that many bytes, in a heap copy of its own), the last
+    /// the bytes left.
+    /// Each paired length is its own buffer's size, so a correct function
+    /// summing both buffers runs clean whatever the input says, and two
+    /// buffers never get the same bytes.
+    #[test]
+    fn built_c_harness_gives_each_buffer_of_a_call_its_own_bytes() {
+        let Some(out) = build_c_harness(
+            "merge_records",
+            &[
+                ("a", "const uint8_t *"),
+                ("alen", "size_t"),
+                ("b", "const uint8_t *"),
+                ("blen", "size_t"),
+                ("x", "int"),
+            ],
+            "#include <stdint.h>\n#include <stddef.h>\n\
+             int merge_records(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen, int x) {\n\
+             \x20   int s = x;\n\
+             \x20   for (size_t i = 0; i < alen; i++) s += a[i];\n\
+             \x20   for (size_t i = 0; i < blen; i++) s += b[i];\n\
+             \x20   return s;\n\
+             }\n",
+        ) else {
+            return;
+        };
+        assert_compiles_warning_free(&out);
+        // Read the old way, the first 8 bytes made `blen` 32 against a
+        // 4-byte buffer.
+        let short_tail = [32, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4];
+        traced_args(&out, &short_tail, None);
+        let input = [5, 0, 0, 0, 2, 0, 0, 0, 0xa1, 0xa2, 0xb1, 0xb2, 0xb3];
+        let args = traced_args(&out, &input, Some("1"));
+        assert_eq!(traced(&args, "x", None)["value"], "5");
+        let a = traced(&args, "a", None);
+        assert_eq!(a["span"], serde_json::json!([8, 10]), "{args:#?}");
+        assert_eq!(a["preview_hex"], "a1a2");
+        assert_eq!(traced(&args, "alen", None)["value"], "2");
+        let b = traced(&args, "b", None);
+        assert_eq!(b["span"], serde_json::json!([10, 13]));
+        assert_eq!(b["preview_hex"], "b1b2b3");
+        assert_eq!(traced(&args, "blen", None)["value"], "3");
+        for input in [&short_tail[..], &input, b"", &[0xff; 40]] {
+            assert_layout_matches_trace(&out, input);
+        }
+        fs::remove_dir_all(&out).ok();
+
+        let Some(out) = build_c_harness(
+            "compare_heads",
+            &[("a", "const uint8_t *"), ("b", "const uint8_t *")],
+            "#include <stdint.h>\n\
+             int compare_heads(const uint8_t *a, const uint8_t *b) { return a[0] + b[0]; }\n",
+        ) else {
+            return;
+        };
+        let input = [1, 0, 0, 0, 0xa1, 0xb1, 0xb2];
+        let args = traced_args(&out, &input, Some("1"));
+        let a = traced(&args, "a", None);
+        let b = traced(&args, "b", None);
+        assert_eq!(a["span"], serde_json::json!([4, 5]), "{args:#?}");
+        assert_eq!(a["preview_hex"], "a1");
+        assert_eq!(b["span"], serde_json::json!([5, 7]));
+        assert_eq!(b["preview_hex"], "b1b2");
+        for input in [&input[..], b"", &[0x41; 9]] {
+            assert_layout_matches_trace(&out, input);
+        }
+        fs::remove_dir_all(&out).ok();
+
+        // A paired buffer's slice is a copy of exactly its bytes: reading one
+        // past it is a heap overflow, not a read of the next buffer's bytes.
+        let Some(out) = build_c_harness(
+            "peek_past",
+            &[
+                ("a", "const uint8_t *"),
+                ("alen", "size_t"),
+                ("b", "const uint8_t *"),
+                ("blen", "size_t"),
+            ],
+            "#include <stdint.h>
+#include <stddef.h>
+             int peek_past(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen) {
+                 return a[alen] + (blen ? b[0] : 0);
+             }
+",
+        ) else {
+            return;
+        };
+        let path = out.join("past.bin");
+        fs::write(&path, [2, 0, 0, 0, 0xa1, 0xa2, 0xb1, 0xb2]).unwrap();
+        let run = crate::harness_command(out.join("main"))
+            .arg(&path)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            !run.status.success() && stderr.contains("heap-buffer-overflow"),
+            "{stderr}"
+        );
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// A buffer without a length partner that takes a slice (another buffer
+    /// of its call takes the bytes left) keeps an allocation as large as the
+    /// input, zeroed past its own bytes: a correct function that reads it for
+    /// as many bytes as the other buffer's length runs clean when its slice
+    /// is shorter, read-only or writable. Its bytes stay its own, and the
+    /// static decode still gives what the trace prints.
+    #[test]
+    fn built_c_harness_keeps_a_lone_buffer_as_large_as_the_input() {
+        let Some(out) = build_c_harness(
+            "same_prefix",
+            &[
+                ("a", "const uint8_t *"),
+                ("b", "const uint8_t *"),
+                ("n", "size_t"),
+            ],
+            "#include <stdint.h>\n#include <stddef.h>\n#include <string.h>\n\
+             int same_prefix(const uint8_t *a, const uint8_t *b, size_t n) {\n\
+             \x20   return memcmp(a, b, n) == 0;\n\
+             }\n",
+        ) else {
+            return;
+        };
+        // An empty slice for `a`, then 16 bytes for `(b, n)`.
+        let mut input = vec![0u8; 4];
+        input.extend_from_slice(&[b'A'; 16]);
+        traced_args(&out, &input, None);
+        let args = traced_args(&out, &input, Some("1"));
+        let a = traced(&args, "a", None);
+        assert_eq!(a["span"], serde_json::json!([4, 4]), "{args:#?}");
+        assert_eq!(a["len"], 0);
+        if let Some(alloc) = a.get("alloc_size") {
+            assert!(alloc.as_u64() > Some(input.len() as u64), "{a}");
+        }
+        assert_eq!(traced(&args, "b", None)["span"], serde_json::json!([4, 20]));
+        assert_eq!(traced(&args, "n", None)["value"], "16");
+        for input in [&input[..], b"", &[2, 0, 0, 0, b'x', b'y', b'x', b'y', b'z']] {
+            assert_layout_matches_trace(&out, input);
+        }
+        fs::remove_dir_all(&out).ok();
+
+        let Some(out) = build_c_harness(
+            "xor_into",
+            &[
+                ("dst", "uint8_t *"),
+                ("src", "const uint8_t *"),
+                ("n", "size_t"),
+            ],
+            "#include <stdint.h>\n#include <stddef.h>\n\
+             int xor_into(uint8_t *dst, const uint8_t *src, size_t n) {\n\
+             \x20   for (size_t i = 0; i < n; i++) dst[i] ^= src[i];\n\
+             \x20   return n ? dst[0] : 0;\n\
+             }\n",
+        ) else {
+            return;
+        };
+        // More bytes for `src` than the writable buffer's headroom.
+        let mut input = vec![0u8; 4];
+        input.extend(std::iter::repeat_n(0x5a, 70_000));
+        traced_args(&out, &input, None);
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// A context pointer ahead of a `(data, len)` pair takes a slice of its
+    /// own, so a seed for the pair goes behind the slice's 4-byte length:
+    /// the layout's seed prefix is those 4 bytes, and the prefixed seed
+    /// reaches `data` byte for byte while the context is left empty.
+    #[test]
+    fn built_c_harness_prefixed_seed_reaches_the_buffer_after_a_context_slice() {
+        let Some(out) = build_c_harness(
+            "parse_record",
+            &[
+                ("ctx", "void *"),
+                ("data", "const uint8_t *"),
+                ("len", "size_t"),
+            ],
+            "#include <stdint.h>\n#include <stddef.h>\n\
+             int parse_record(void *ctx, const uint8_t *data, size_t len) {\n\
+             \x20   return ctx && len ? data[0] : 0;\n\
+             }\n",
+        ) else {
+            return;
+        };
+        let layout = crate::arg_layout::ArgLayout::read(&out).unwrap().unwrap();
+        assert_eq!(layout.seed_prefix_len(), Some(4), "{layout:#?}");
+        let seed = [
+            0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0x0d,
+        ];
+        let mut variant = vec![0u8; 4];
+        variant.extend_from_slice(&seed);
+        let args = traced_args(&out, &variant, Some("1"));
+        let data = traced(&args, "data", None);
+        assert_eq!(data["span"], serde_json::json!([4, 16]), "{args:#?}");
+        assert_eq!(data["preview_hex"], "89504e470d0a1a0a0000000d");
+        assert_eq!(traced(&args, "len", None)["value"], "12");
+        assert_eq!(
+            traced(&args, "ctx", None)["span"],
+            serde_json::json!([4, 4])
+        );
+        assert_layout_matches_trace(&out, &variant);
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// Parameters named like the harness's own locals (`Data`, `Size`, `Cur`,
+    /// `R`, `_bhf_*`) get locals of their own: the harness builds, each takes
+    /// its own bytes, and a correct function runs clean. The trace and the
+    /// layout still name them as declared.
+    #[test]
+    fn built_c_harness_renames_parameters_named_like_its_own_locals() {
+        type Case<'a> = (&'a str, Vec<(&'a str, &'a str)>, &'a str);
+        let cases: Vec<Case> = vec![
+            (
+                "last_of",
+                vec![("Data", "const uint8_t *"), ("Size", "size_t")],
+                "int last_of(const uint8_t *Data, size_t Size) {\n\
+                 \x20   return Size ? Data[Size - 1] : 0;\n\
+                 }\n",
+            ),
+            (
+                "last_at",
+                vec![
+                    ("Data", "const uint8_t *"),
+                    ("Size", "size_t"),
+                    ("level", "int"),
+                ],
+                "int last_at(const uint8_t *Data, size_t Size, int level) {\n\
+                 \x20   return Size ? Data[Size - 1] + level : level;\n\
+                 }\n",
+            ),
+            (
+                "first_of",
+                vec![("x", "int"), ("Data", "const uint8_t *")],
+                "int first_of(int x, const uint8_t *Data) { return x + Data[0]; }\n",
+            ),
+            (
+                "walk",
+                vec![
+                    ("Cur", "int"),
+                    ("R", "int"),
+                    ("_bhf_rest_p", "unsigned char"),
+                ],
+                "int walk(int Cur, int R, unsigned char _bhf_rest_p) {\n\
+                 \x20   return Cur + R + _bhf_rest_p;\n\
+                 }\n",
+            ),
+        ];
+        for (name, params, body) in cases {
+            let Some(out) = build_c_harness(
+                name,
+                &params,
+                &format!("#include <stdint.h>\n#include <stddef.h>\n{body}"),
+            ) else {
+                return;
+            };
+            let input = [7u8, 0, 0, 0, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+            let args = traced_args(&out, &input, Some("1"));
+            for (param, _) in &params {
+                traced(&args, param, None);
+            }
+            if let Some(size) = args.iter().find(|arg| arg["name"] == "Size") {
+                let level_bytes = if params.len() == 3 { 4 } else { 0 };
+                assert_eq!(
+                    size["value"],
+                    (input.len() - level_bytes).to_string(),
+                    "{name}: {args:#?}"
+                );
+            }
+            let layout = crate::arg_layout::ArgLayout::read(&out).unwrap().unwrap();
+            let names: Vec<&str> = layout.params().map(|p| p.name.as_str()).collect();
+            for (param, _) in &params {
+                assert!(names.contains(param), "{name}: {names:?}");
+            }
+            fs::remove_dir_all(&out).ok();
+        }
+    }
+
+    /// A correct function reading the bytes a pointer-typedef buffer holds
+    /// runs clean under its harness, alone or with its count.
+    #[test]
+    fn built_c_harness_gives_a_pointer_typedef_buffer_the_input() {
+        let header = "#include <stddef.h>\n\
+             typedef unsigned char BYTE;\n\
+             typedef unsigned long DWORD;\n\
+             typedef const BYTE *LPCBYTE;\n\
+             typedef const BYTE *cbytes_t;\n\
+             int lone_first(LPCBYTE p);\n\
+             int lone_typedef(cbytes_t p);\n\
+             int counted(LPCBYTE pb, DWORD cb);\n";
+        for (name, params, body) in [
+            (
+                "lone_first",
+                vec![("p", "LPCBYTE")],
+                "int lone_first(LPCBYTE p) { return p[1] + p[7]; }\n",
+            ),
+            (
+                "lone_typedef",
+                vec![("p", "cbytes_t")],
+                "int lone_typedef(cbytes_t p) { return p[1] + p[7]; }\n",
+            ),
+            (
+                "counted",
+                vec![("pb", "LPCBYTE"), ("cb", "DWORD")],
+                "int counted(LPCBYTE pb, DWORD cb) {\n\
+                 \x20   int s = 0;\n\
+                 \x20   for (DWORD i = 0; i < cb; i++) s += pb[i];\n\
+                 \x20   return s;\n\
+                 }\n",
+            ),
+        ] {
+            let Some(out) = build_c_harness_in(
+                name,
+                &params,
+                &format!("#include \"widget.h\"\n{body}"),
+                Some(header),
+            ) else {
+                return;
+            };
+            let args = traced_args(&out, b"ABCDEFGH", Some("1"));
+            let buffer = traced(&args, params[0].0, None);
+            assert_eq!(
+                buffer["preview_hex"], "4142434445464748",
+                "{name}: {args:#?}"
+            );
+            fs::remove_dir_all(&out).ok();
+        }
+    }
+
+    #[test]
+    fn a_callback_named_like_a_count_never_pairs_with_a_buffer() {
+        let decls = c_param_decls("visit", &[("p", "const BYTE *"), ("cb", "void (*)(int)")]);
+        assert!(
+            !decls[1].contains("Size") && !decls[0].contains(")Data"),
+            "a callback is not a length: {decls:?}"
+        );
+    }
+
+    fn c_param_decls(function_name: &str, params: &[(&str, &str)]) -> Vec<String> {
+        let params: Vec<CParameter> = params
+            .iter()
+            .map(|(name, c_type)| CParameter {
+                name: (*name).to_owned(),
+                c_type: (*c_type).to_owned(),
+            })
+            .collect();
+        build_param_decoders(
+            &params,
+            &TypeRegistry::default(),
+            &[],
+            None,
+            false,
+            false,
+            DecoderLimits::default(),
+            function_name,
+            false,
+        )
+        .expect("decoders")
+        .into_iter()
+        .map(|emission| emission.decl)
+        .collect()
+    }
+
+    #[test]
+    fn buffer_name_alone_does_not_bind_the_next_integer_to_the_input_length() {
+        // `copy_at(src, offset, size)`: `src` is buffer-shaped, but `offset` is
+        // not a length. Binding it to Size made every non-empty input read past
+        // the end of the buffer.
+        let decls = c_param_decls(
+            "copy_at",
+            &[
+                ("src", "const unsigned char *"),
+                ("offset", "unsigned int"),
+                ("size", "unsigned int"),
+            ],
+        );
+        let joined = decls.join(" ; ");
+        assert!(
+            !decls[0].contains("= (const unsigned char *)Data")
+                && decls[0].contains("malloc(")
+                && decls[0].contains("memcpy("),
+            "src must be its own heap copy of the input, so its true size is \
+             visible to ASan: {joined}"
+        );
+        assert!(
+            !decls[1].contains("Size"),
+            "offset must be decoded, not bound to Size: {joined}"
+        );
+        assert!(
+            decls[1].contains("bhf_i32(&Cur)") && !decls[1].contains("bhf_bounded_i32"),
+            "offset must be decoded across its full unsigned range: {joined}"
+        );
+
+        for (buffer, length) in [
+            (("data", "const char *"), ("flags", "int")),
+            (("buf", "const uint8_t *"), ("index", "size_t")),
+            (("input", "const void *"), ("pos", "unsigned long")),
+        ] {
+            let decls = c_param_decls("parse_record", &[buffer, length]);
+            assert!(
+                !decls[1].contains("Size"),
+                "{length:?} must not be bound to Size after {buffer:?}: {decls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn count_named_lengths_still_pair_with_their_buffer() {
+        for (buffer, length, buf_decl, len_decl) in [
+            (
+                ("src", "const char *"),
+                ("srclen", "int"),
+                "const char * src = (const char *)Data",
+                "int srclen = (int)Size",
+            ),
+            (
+                ("data", "const void *"),
+                ("size", "size_t"),
+                "const void * data = (const void *)Data",
+                "size_t size = (size_t)Size",
+            ),
+            // Win32: a typedef'd byte pointer and a DWORD Hungarian byte count.
+            (
+                ("pbData", "const BYTE *"),
+                ("cbData", "DWORD"),
+                "const BYTE * pbData = (const BYTE *)Data",
+                "DWORD cbData = (DWORD)Size",
+            ),
+        ] {
+            let decls = c_param_decls("parse_record", &[buffer, length]);
+            assert_eq!(decls[0], buf_decl, "{decls:?}");
+            assert_eq!(decls[1], len_decl, "{decls:?}");
+        }
+    }
+
+    #[test]
+    fn count_names_match_whole_words_and_common_length_abbreviations() {
+        for name in [
+            "sz",
+            "bufsz",
+            "destsz",
+            "bufsiz",
+            "BUFSIZ",
+            "bytes",
+            "nbytes",
+            "num_bytes",
+            "cnt",
+            "byte_cnt",
+            "inl",
+            "outl",
+            "ilen",
+            "nr",
+            "nr_pages",
+            "len1",
+            "size_2",
+            "line_count",
+            "dataLen",
+            "numItems",
+            "n_items",
+            "nItems",
+            "nitems",
+            "nmemb",
+            "dstCapacity",
+            "capacity",
+            "maxlen",
+            "bufferSize",
+            "avail_in",
+            "remaining",
+            "argc",
+            "lpcbData",
+        ] {
+            assert!(looks_like_count_name(name), "{name:?} is a length");
+        }
+        // A count marker inside a longer word, or a name that ends in a word
+        // that is clearly not a length, is not a count.
+        for name in [
+            "account_id",
+            "account",
+            "country",
+            "caps",
+            "escape",
+            "capture",
+            "silent",
+            "lenient",
+            "number",
+            "enum_x",
+            "nValue",
+            "nFlags",
+            "nStatus",
+            "line",
+            "flags",
+            "mode",
+            "kind",
+            "bit",
+            "count_mode",
+            "len_type",
+            "size_flags",
+            "cbType",
+            "bit_nr",
+        ] {
+            assert!(!looks_like_count_name(name), "{name:?} is not a length");
+        }
+    }
+
+    #[test]
+    fn common_length_abbreviations_pair_with_their_buffer() {
+        for (buffer, length) in [
+            (("data", "const char *"), ("sz", "size_t")),
+            (("in", "const unsigned char *"), ("inl", "int")),
+            (("buf", "const void *"), ("bytes", "size_t")),
+            (("buf", "const char *"), ("bufsiz", "int")),
+            (("in", "const uint8_t *"), ("nr", "unsigned")),
+        ] {
+            let decls = c_param_decls("parse_record", &[buffer, length]);
+            let (buf_name, buf_type) = buffer;
+            let (len_name, len_type) = length;
+            let buf_type = emit_c_type(buf_type);
+            let len_type = emit_c_type(len_type);
+            assert_eq!(
+                decls[0],
+                format!("{buf_type} {buf_name} = ({buf_type})Data"),
+                "{decls:?}"
+            );
+            assert_eq!(
+                decls[1],
+                format!("{len_type} {len_name} = ({len_type})Size"),
+                "{decls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_length_names_do_not_bind_to_the_input_length() {
+        for (buffer, length) in [
+            (("data", "const char *"), ("account_id", "int")),
+            (("buf", "const unsigned char *"), ("caps", "unsigned int")),
+            (("buf", "const unsigned char *"), ("country", "int")),
+        ] {
+            let decls = c_param_decls("parse_record", &[buffer, length]);
+            assert!(
+                !decls[1].contains("Size"),
+                "{length:?} must not be bound to Size after {buffer:?}: {decls:?}"
+            );
+        }
+    }
+
+    /// The capacity an output buffer is allocated with is a length too: an
+    /// offset, index or flags parameter bound to it pointed every write at (or
+    /// past) the end of the allocation.
+    #[test]
+    fn output_buffers_never_bind_an_offset_or_index_to_their_capacity() {
+        for (function, params, unbound) in [
+            (
+                "put_at",
+                vec![
+                    ("dst", "unsigned char *"),
+                    ("offset", "unsigned int"),
+                    ("size", "unsigned int"),
+                ],
+                1,
+            ),
+            (
+                "put",
+                vec![
+                    ("dst", "uint8_t *"),
+                    ("offset", "unsigned int"),
+                    ("n", "unsigned int"),
+                ],
+                1,
+            ),
+            ("write_idx", vec![("out", "char *"), ("index", "int")], 1),
+            (
+                "emit_at",
+                vec![("buf", "char *"), ("offset", "size_t *")],
+                1,
+            ),
+            ("encode", vec![("out", "uint8_t *"), ("flags", "int")], 1),
+            (
+                "decode_block",
+                vec![("dest", "unsigned char *"), ("pos", "size_t")],
+                1,
+            ),
+        ] {
+            let decls = c_param_decls(function, &params);
+            let buffer = params[0].0;
+            let decl = &decls[unbound];
+            assert!(
+                !decl.contains(&format!("_bhf_cap_{buffer}")) && !decl.contains("Size"),
+                "{function}: {:?} must not be bound to the capacity of {buffer}: {decls:?}",
+                params[unbound]
+            );
+        }
+
+        // Count-named capacities keep pairing with their output buffer.
+        for (function, params, len_decl) in [
+            (
+                "encode",
+                vec![("out", "char *"), ("outlen", "size_t")],
+                "size_t outlen = (size_t)(out ? _bhf_cap_out : 0)",
+            ),
+            (
+                "encode",
+                vec![("dst", "void *"), ("dstCapacity", "size_t")],
+                "size_t dstCapacity = (size_t)(dst ? _bhf_cap_dst : 0)",
+            ),
+            (
+                "encode",
+                vec![("out", "unsigned char *"), ("outsz", "int")],
+                "int outsz = (int)(out ? _bhf_cap_out : 0)",
+            ),
+        ] {
+            let decls = c_param_decls(function, &params);
+            assert_eq!(decls[1], len_decl, "{decls:?}");
+        }
+        let decls = c_param_decls("format_into", &[("buf", "char *"), ("len", "size_t *")]);
+        assert!(
+            decls[1].contains("_bhf_out_len = (size_t)(buf ? _bhf_cap_buf : 0)"),
+            "{decls:?}"
+        );
+    }
+
+    /// A streaming count/cursor pair binds the count to the cursor's buffer, so
+    /// a position-shaped count (`start_length`) stays unpaired.
+    #[test]
+    fn a_stream_cursor_count_is_not_an_offset() {
+        let param = |name: &str, c_type: &str| CParameter {
+            name: name.to_owned(),
+            c_type: c_type.to_owned(),
+        };
+        let cursor = param("next_in", "const uint8_t **");
+        assert!(looks_like_stream_count_cursor_pair(
+            &param("avail_in", "size_t *"),
+            &cursor
+        ));
+        assert!(!looks_like_stream_count_cursor_pair(
+            &param("start_length", "size_t *"),
+            &cursor
+        ));
+    }
+
+    /// An index into a string array is not the array's length: sizing the array
+    /// by it put `names[index]` one past the end.
+    #[test]
+    fn a_string_array_is_not_sized_by_an_index() {
+        let decls = c_param_decls("pick_name", &[("names", "char **"), ("index", "int")]);
+        assert!(
+            !decls[1].contains("_bhf_count_names"),
+            "index must not be bound to the array length: {decls:?}"
+        );
+        let decls = c_param_decls("join_names", &[("names", "char **"), ("count", "int")]);
+        assert!(
+            decls[1].contains("_bhf_count_names"),
+            "a count still sizes the array: {decls:?}"
+        );
     }
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -4932,6 +6417,183 @@ mod tests {
         make_ok && clang_ok
     }
 
+    /// The build context's quoted defines reach a C harness's compiler whole:
+    /// a shell operator inside one never runs, and a legitimate one keeps its
+    /// quotes, so the macro is a string literal rather than bare tokens.
+    #[cfg(unix)]
+    #[test]
+    fn a_quoted_define_from_the_build_context_reaches_the_c_compiler_whole() {
+        use std::os::unix::fs::PermissionsExt;
+        if !std::process::Command::new("make")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            eprintln!("skip: make unavailable");
+            return;
+        }
+        let out = temp_dir("c_quoted_define");
+        let marker = out.join("injected");
+        let hostile = format!("-DMSG=\"a;touch {};\"", marker.display());
+        let piped = format!("-DMSG2=\"b | touch {}\"", marker.display());
+        let legit = "-DNAME=\"value with spaces\"".to_owned();
+        let mut args = direct_args("parse_record", out.clone());
+        args.compile_flags = vec![hostile.clone(), piped.clone(), legit.clone()];
+        args.c_runtime_include = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../c_runtime")
+            .canonicalize()
+            .expect("c_runtime dir");
+        generate_c_direct_harness(args).unwrap();
+        let compiler = out.join("record-args");
+        fs::write(
+            &compiler,
+            "#!/bin/sh\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\" >> \"$BHF_ARGV_LOG\"; done\n",
+        )
+        .unwrap();
+        fs::set_permissions(&compiler, fs::Permissions::from_mode(0o755)).unwrap();
+        let log = out.join("argv.log");
+        let build = std::process::Command::new("make")
+            .arg("main")
+            .arg(format!("CC={}", compiler.display()))
+            .arg("BHF_CC_FAMILY=clang")
+            .env("BHF_ARGV_LOG", &log)
+            .current_dir(&out)
+            .output()
+            .expect("run make");
+        assert!(
+            !marker.exists(),
+            "a command inside a quoted define ran: {build:?}"
+        );
+        assert!(build.status.success(), "{build:?}");
+        let argv: Vec<String> = fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        for flag in [&hostile, &piped, &legit] {
+            assert!(argv.contains(flag), "{flag:?} not passed whole: {argv:#?}");
+        }
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// A stand-in compiler that answers `-dumpmachine` with `machine` and
+    /// accepts anything else, written as `dir/name`.
+    #[cfg(unix)]
+    fn machine_reporting_compiler(dir: &Path, name: &str, machine: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let compiler = dir.join(name);
+        fs::write(
+            &compiler,
+            format!("#!/bin/sh\n[ \"$1\" = -dumpmachine ] && echo {machine}\nexit 0\n"),
+        )
+        .unwrap();
+        fs::set_permissions(&compiler, fs::Permissions::from_mode(0o755)).unwrap();
+        compiler
+    }
+
+    /// The recipe `make -n <goal>` prints for the link of `binary`, with
+    /// exactly `vars` set (`OS` is removed unless given).
+    #[cfg(unix)]
+    fn dry_run_link(dir: &Path, goal: &str, binary: &str, vars: &[(&str, &str)]) -> String {
+        let mut command = std::process::Command::new("make");
+        command.arg("-C").arg(dir).args(["-n", goal]);
+        for key in [
+            "OS",
+            "SECTION_LDFLAGS",
+            "CC",
+            "COV_CC",
+            "DIFF_CC",
+            "LIBFUZZER_CC",
+        ] {
+            command.env_remove(key);
+        }
+        command.env("BHF_CC_FAMILY", "clang");
+        for (key, value) in vars {
+            command.env(key, value);
+        }
+        let output = command.output().expect("run make -n");
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find(|line| line.contains(&format!(" -o {binary} main.c")))
+            .unwrap_or_else(|| panic!("no link of {binary} in {output:?}"))
+            .to_owned()
+    }
+
+    /// Each lane's link names the dead-code flag in the spelling of the linker
+    /// its compiler drives. On Windows an MSVC-target compiler (clang's default
+    /// there, or bhf's cl front end) links with link.exe or lld-link, which
+    /// ignore `--gc-sections` with a warning, so it gets `/OPT:REF`; MinGW's
+    /// gcc and every ELF link keep `--gc-sections`.
+    #[cfg(unix)]
+    #[test]
+    fn each_lane_links_with_the_dead_code_flag_of_its_linker() {
+        if !std::process::Command::new("make")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            eprintln!("skip: make unavailable");
+            return;
+        }
+        let out = temp_dir("c_section_ldflags");
+        let mut args = direct_args("parse_record", out.clone());
+        args.c_runtime_include = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../c_runtime")
+            .canonicalize()
+            .expect("c_runtime dir");
+        generate_c_direct_harness(args).unwrap();
+        let msvc = machine_reporting_compiler(&out, "msvc-cc", "x86_64-pc-windows-msvc");
+        let mingw = machine_reporting_compiler(&out, "mingw-cc", "x86_64-w64-mingw32");
+        let front_end = machine_reporting_compiler(&out, "bhf-cl", "unused");
+        let (msvc, mingw, front_end) = (
+            msvc.to_str().unwrap(),
+            mingw.to_str().unwrap(),
+            front_end.to_str().unwrap(),
+        );
+        let gnu = "-Wl,--gc-sections";
+        let ms = "-Wl,/OPT:REF";
+
+        // Not on Windows: the compiler is not asked, and the link is GNU.
+        let main = dry_run_link(&out, "main", "main", &[("CC", msvc)]);
+        assert!(main.contains(gnu) && !main.contains(ms), "{main}");
+        for (cc, family, expected, other) in [
+            (msvc, "clang", ms, gnu),
+            (mingw, "gcc", gnu, ms),
+            (front_end, "msvc", ms, gnu),
+        ] {
+            let main = dry_run_link(
+                &out,
+                "main",
+                "main",
+                &[("OS", "Windows_NT"), ("CC", cc), ("BHF_CC_FAMILY", family)],
+            );
+            assert!(
+                main.contains(expected) && !main.contains(other),
+                "{cc}: {main}"
+            );
+        }
+        // Each lane by its own compiler.
+        let windows = [
+            ("OS", "Windows_NT"),
+            ("CC", msvc),
+            ("DIFF_CC", mingw),
+            ("COV_CC", msvc),
+        ];
+        let diff = dry_run_link(&out, "diff", "main_diff", &windows);
+        assert!(diff.contains(gnu) && !diff.contains(ms), "{diff}");
+        let cov = dry_run_link(&out, "cov", "main_cov", &windows);
+        assert!(cov.contains(ms) && !cov.contains(gnu), "{cov}");
+        // SECTION_LDFLAGS replaces the flag for every lane, even with nothing.
+        let mut none = windows.to_vec();
+        none.push(("SECTION_LDFLAGS", ""));
+        for (goal, binary) in [("main", "main"), ("cov", "main_cov")] {
+            let link = dry_run_link(&out, goal, binary, &none);
+            assert!(!link.contains(gnu) && !link.contains(ms), "{link}");
+        }
+        fs::remove_dir_all(&out).ok();
+    }
+
     /// End-to-end proof of the portable libFuzzer target (#62): a generated C
     /// harness built with `make libfuzzer` is a real libFuzzer binary that drives
     /// the target through bhf's `bhf_run_one` (via the emitted `bhf_libfuzzer.c`
@@ -5007,7 +6669,7 @@ mod tests {
         // A clean input runs the target once and exits 0.
         let ok = out.join("ok.bin");
         fs::write(&ok, b"hi").unwrap();
-        let r = std::process::Command::new(&bin).arg(&ok).output().unwrap();
+        let r = crate::harness_command(&bin).arg(&ok).output().unwrap();
         assert!(
             r.status.success(),
             "clean input must not crash: {}",
@@ -5017,10 +6679,7 @@ mod tests {
         // The magic input crashes under ASan — libFuzzer really drove bhf_run_one.
         let crash = out.join("crash.bin");
         fs::write(&crash, b"FUZZ....").unwrap();
-        let r = std::process::Command::new(&bin)
-            .arg(&crash)
-            .output()
-            .unwrap();
+        let r = crate::harness_command(&bin).arg(&crash).output().unwrap();
         let err = String::from_utf8_lossy(&r.stderr);
         assert!(
             !r.status.success(),
@@ -5031,6 +6690,1196 @@ mod tests {
             "expected an ASan/libFuzzer crash report, got:\n{err}"
         );
 
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// The C counterpart of the passthrough libFuzzer build: the project's
+    /// `LLVMFuzzerTestOneInput` is linked directly, with no shim beside it.
+    #[test]
+    fn make_libfuzzer_links_a_passthrough_entrypoint_directly() {
+        if !libfuzzer_toolchain_available() {
+            eprintln!(
+                "skipping C passthrough make_libfuzzer e2e: clang+libFuzzer+make unavailable"
+            );
+            return;
+        }
+        let out = temp_dir("c_passthrough_libfuzzer");
+        let c_runtime = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../c_runtime")
+            .canonicalize()
+            .expect("c_runtime dir");
+        let driver = out.join("drive_record.c");
+        fs::write(
+            &driver,
+            "#include <stddef.h>\n#include <stdint.h>\n\
+             static int parse_record(const uint8_t *data, size_t size) {\n\
+             \x20   if (size >= 4 && data[0]=='F' && data[1]=='U' && data[2]=='Z' && data[3]=='Z') {\n\
+             \x20       volatile int *p = 0; *p = 1;\n\
+             \x20   }\n\
+             \x20   return 0;\n\
+             }\n\
+             int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {\n\
+             \x20   return parse_record(data, size);\n\
+             }\n",
+        )
+        .unwrap();
+        let mut args = direct_args("c_passthrough_libfuzzer", out.clone());
+        args.target = cfunction("LLVMFuzzerTestOneInput");
+        args.params = vec![
+            CParameter {
+                name: "data".to_owned(),
+                c_type: "const uint8_t *".to_owned(),
+            },
+            CParameter {
+                name: "size".to_owned(),
+                c_type: "size_t".to_owned(),
+            },
+        ];
+        args.target_includes_dirs = vec![out.clone()];
+        args.target_sources = vec![driver.clone()];
+        args.c_runtime_include = c_runtime;
+        generate_c_direct_harness(args).unwrap();
+        assert!(
+            !out.join("bhf_libfuzzer.c").exists(),
+            "no shim for a passthrough"
+        );
+
+        let build = std::process::Command::new("make")
+            .arg("libfuzzer")
+            .current_dir(&out)
+            .output()
+            .expect("run make");
+        assert!(
+            build.status.success(),
+            "make libfuzzer failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr)
+        );
+        let bin = out.join("main_libfuzzer");
+        let crash = out.join("crash.bin");
+        fs::write(&crash, b"FUZZ....").unwrap();
+        let r = crate::harness_command(&bin).arg(&crash).output().unwrap();
+        let err = String::from_utf8_lossy(&r.stderr);
+        assert!(
+            !r.status.success(),
+            "magic input must crash, stderr:\n{err}"
+        );
+        assert!(err.contains("AddressSanitizer"), "{err}");
+        fs::remove_dir_all(&out).ok();
+    }
+
+    fn copy_c_runtime_to(dir: &Path) {
+        let runtime = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../c_runtime")
+            .canonicalize()
+            .expect("c_runtime dir");
+        fs::create_dir_all(dir).unwrap();
+        for entry in fs::read_dir(&runtime).unwrap().flatten() {
+            if entry.path().is_file() {
+                fs::copy(entry.path(), dir.join(entry.file_name())).unwrap();
+            }
+        }
+    }
+
+    /// A source tree, include dir and runtime dir whose paths contain spaces and
+    /// parentheses must generate, build and run, not be refused or word-split.
+    #[test]
+    fn harness_builds_from_paths_with_spaces() {
+        let make_ok = Command::new("make")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        let clang_ok = Command::new("clang")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !make_ok || !clang_ok {
+            eprintln!("skipping spaced-path e2e: clang/make unavailable");
+            return;
+        }
+        let root = temp_dir("spaced paths");
+        let src_dir = root.join("My Proj (copy)/src lib");
+        let inc_dir = root.join("My Proj (copy)/include dir");
+        let runtime = root.join("tool's runtime/c_runtime");
+        let out = root.join("work dir/harnesses/H-SPACED");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::create_dir_all(&inc_dir).unwrap();
+        copy_c_runtime_to(&runtime);
+        fs::write(
+            inc_dir.join("record.h"),
+            "#include <stddef.h>\nint parse_record(const unsigned char *data, size_t len);\n",
+        )
+        .unwrap();
+        let source = src_dir.join("record.c");
+        fs::write(
+            &source,
+            "#include \"record.h\"\n\
+             int parse_record(const unsigned char *data, size_t len) {\n\
+             \x20   return len ? data[len - 1] : 0;\n\
+             }\n",
+        )
+        .unwrap();
+        let mut args = direct_args("parse_record", out.clone());
+        args.source_path = source.clone();
+        args.params = vec![
+            CParameter {
+                name: "data".to_owned(),
+                c_type: "const unsigned char *".to_owned(),
+            },
+            CParameter {
+                name: "len".to_owned(),
+                c_type: "size_t".to_owned(),
+            },
+        ];
+        args.target_includes = vec!["record.h".to_owned()];
+        args.target_includes_dirs = vec![inc_dir.clone()];
+        args.target_sources = vec![source.clone()];
+        args.target_declared_in_header = true;
+        args.c_runtime_include = runtime.clone();
+        generate_c_direct_harness(args).expect("spaced paths are accepted");
+
+        let makefile = fs::read_to_string(out.join("Makefile")).unwrap();
+        assert!(
+            makefile.contains(&format!(
+                "-iquote \"{}\"",
+                crate::build_safety::make_path(&inc_dir)
+            )) && makefile.contains(&format!(" \"{}\"", crate::build_safety::make_path(&source))),
+            "spaced paths must be double-quoted in the Makefile:\n{makefile}"
+        );
+        let build = Command::new("make")
+            .arg("main")
+            .current_dir(&out)
+            .output()
+            .expect("run make");
+        assert!(
+            build.status.success(),
+            "make main failed:\n{}\n{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr)
+        );
+        let input = out.join("input.bin");
+        fs::write(&input, b"record").unwrap();
+        let run = crate::harness_command(out.join("main"))
+            .arg(&input)
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn generated_c_harness_names_its_input_format_version() {
+        let out = temp_dir("format_version");
+        let mut args = direct_args("parse_record", out.clone());
+        args.params = vec![CParameter {
+            name: "flags".to_owned(),
+            c_type: "unsigned int".to_owned(),
+        }];
+        let result = generate_c_direct_harness(args).unwrap();
+        let main = fs::read_to_string(&result.main_c).unwrap();
+        let stamp = format!("/* bhf harness format {} */", crate::HARNESS_FORMAT_VERSION);
+        assert!(main.contains(&stamp), "missing {stamp:?} in:\n{main}");
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// Build a direct C harness for `name(params)` defined in `source`, or
+    /// `None` (skipping) when clang or make is missing.
+    fn build_c_harness(name: &str, params: &[(&str, &str)], source: &str) -> Option<PathBuf> {
+        build_c_harness_in(name, params, source, None)
+    }
+
+    /// [`build_c_harness`], with the target's types and prototype in a header
+    /// (`widget.h`) the harness includes and reads type definitions from.
+    fn build_c_harness_in(
+        name: &str,
+        params: &[(&str, &str)],
+        source: &str,
+        header: Option<&str>,
+    ) -> Option<PathBuf> {
+        let tools = ["make", "clang"].iter().all(|tool| {
+            Command::new(tool)
+                .arg("--version")
+                .output()
+                .is_ok_and(|o| o.status.success())
+        });
+        if !tools {
+            eprintln!("skipping {name} build: clang/make unavailable");
+            return None;
+        }
+        let out = temp_dir(name);
+        let target_c = out.join("target.c");
+        fs::write(&target_c, source).unwrap();
+        let mut args = direct_args(name, out.clone());
+        args.params = params
+            .iter()
+            .map(|(name, c_type)| CParameter {
+                name: (*name).to_owned(),
+                c_type: (*c_type).to_owned(),
+            })
+            .collect();
+        args.target_sources = vec![target_c];
+        args.c_runtime_include = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../c_runtime")
+            .canonicalize()
+            .expect("c_runtime dir");
+        if let Some(header) = header {
+            fs::write(out.join("widget.h"), header).unwrap();
+            args.target_includes = vec!["widget.h".to_owned()];
+            args.target_includes_dirs = vec![out.clone()];
+            args.target_declared_in_header = true;
+            args.type_defs = vec![c_parser::parse_c_type_defs(header).unwrap()];
+        }
+        generate_c_direct_harness(args).unwrap();
+        let build = Command::new("make")
+            .arg("main")
+            .current_dir(&out)
+            .output()
+            .expect("run make");
+        assert!(
+            build.status.success(),
+            "make main failed:\n{}\n{}\n{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr),
+            fs::read_to_string(out.join("main.c")).unwrap_or_default()
+        );
+        Some(out)
+    }
+
+    /// The traced harness source must not add a warning a project's
+    /// `-Werror` build would turn into a failure.
+    fn assert_compiles_warning_free(out: &Path) {
+        let runtime = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../c_runtime");
+        let mut check = Command::new("clang");
+        // The Microsoft C runtime deprecates standard functions (`getenv`)
+        // in favour of its own; that is no defect of the harness.
+        if cfg!(windows) {
+            check.arg("-D_CRT_SECURE_NO_WARNINGS");
+        }
+        let check = check
+            .args(["-fsyntax-only", "-Wall", "-Wextra", "-Werror"])
+            .arg("-I")
+            .arg(&runtime)
+            .arg(out.join("main.c"))
+            .output()
+            .expect("run clang");
+        assert!(
+            check.status.success(),
+            "warnings in the generated harness:\n{}",
+            String::from_utf8_lossy(&check.stderr)
+        );
+    }
+
+    /// Run a built harness on `input` with `BHF_TRACE_ARGS` set to `trace` and
+    /// return its `BHF_ARG` lines as JSON.
+    fn traced_args(out: &Path, input: &[u8], trace: Option<&str>) -> Vec<serde_json::Value> {
+        let path = out.join("traced-input.bin");
+        fs::write(&path, input).unwrap();
+        let mut command = crate::harness_command(out.join("main"));
+        command.arg(&path).env_remove("BHF_TRACE_ARGS");
+        if let Some(trace) = trace {
+            command.env("BHF_TRACE_ARGS", trace);
+        }
+        let run = command.output().unwrap();
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(run.status.success(), "harness failed:\n{stderr}");
+        stderr
+            .lines()
+            .filter_map(|line| line.strip_prefix("BHF_ARG "))
+            .map(|json| serde_json::from_str(json).unwrap_or_else(|e| panic!("{e}: {json}")))
+            .collect()
+    }
+
+    fn traced<'a>(
+        args: &'a [serde_json::Value],
+        name: &str,
+        phase: Option<&str>,
+    ) -> &'a serde_json::Value {
+        args.iter()
+            .find(|arg| arg["name"] == name && arg.get("phase").and_then(|p| p.as_str()) == phase)
+            .unwrap_or_else(|| panic!("no {name} ({phase:?}) line in {args:#?}"))
+    }
+
+    /// The static decode of arg-layout.json gives the values and byte spans
+    /// the built harness's own argument trace prints, for every statically
+    /// decodable parameter, over inputs of several lengths.
+    #[test]
+    fn built_c_harness_layout_decodes_like_its_argument_trace() {
+        let header = "#include <stdint.h>\n#include <stddef.h>\n#include <stdbool.h>\n\
+             typedef unsigned int u32_t;\n\
+             enum widget_mode { WM_FAST, WM_SAFE, WM_SLOW };\n\
+             int widget_parse(const unsigned char *data, u32_t bit_index, bool strict,\n\
+             \x20                int8_t bias, unsigned short width, enum widget_mode mode,\n\
+             \x20                const char *label, uint64_t big, double scale);\n";
+        let Some(out) = build_c_harness_in(
+            "widget_parse",
+            &[
+                ("data", "const unsigned char *"),
+                ("bit_index", "u32_t"),
+                ("strict", "bool"),
+                ("bias", "int8_t"),
+                ("width", "unsigned short"),
+                ("mode", "enum widget_mode"),
+                ("label", "const char *"),
+                ("big", "uint64_t"),
+                ("scale", "double"),
+            ],
+            "#include \"widget.h\"\n\
+             int widget_parse(const unsigned char *data, u32_t bit_index, bool strict,\n\
+             \x20                int8_t bias, unsigned short width, enum widget_mode mode,\n\
+             \x20                const char *label, uint64_t big, double scale) {\n\
+             \x20   return data[0] + (int)bit_index + strict + bias + width + (int)mode\n\
+             \x20          + label[0] + (int)big + (int)scale;\n\
+             }\n",
+            Some(header),
+        ) else {
+            return;
+        };
+        let layout = crate::arg_layout::ArgLayout::read(&out).unwrap().unwrap();
+        let mut inputs: Vec<Vec<u8>> = vec![Vec::new(), vec![0xff], vec![0x41; 9]];
+        inputs.push(
+            (0u8..64)
+                .map(|b| b.wrapping_mul(37).wrapping_add(3) | 1)
+                .collect(),
+        );
+        inputs.push((0u8..40).map(|b| 0xff - b).collect());
+        for input in inputs {
+            let lines = traced_args(&out, &input, Some("1"));
+            for stat in layout.decode(&input) {
+                assert!(stat.decoded, "{stat:?}");
+                let trace = traced(&lines, &stat.name, None);
+                assert_eq!(
+                    serde_json::json!(stat.span),
+                    trace["span"],
+                    "{}: static {stat:?} vs traced {trace} on {input:02x?}",
+                    stat.name
+                );
+                match &stat.value {
+                    Some(value) if stat.decoder == "enum_member" => {
+                        // The trace prints the member's value; these are 0, 1, 2.
+                        let members = ["WM_FAST", "WM_SAFE", "WM_SLOW"];
+                        let at: usize = trace["value"].as_str().unwrap().parse().unwrap();
+                        assert_eq!(members[at], value, "on {input:02x?}");
+                    }
+                    Some(value) => assert_eq!(
+                        trace["value"],
+                        serde_json::json!(value),
+                        "{} on {input:02x?}",
+                        stat.name
+                    ),
+                    None => {
+                        let preview = stat.preview_hex.clone().unwrap_or_default();
+                        let traced_preview = trace["preview_hex"].as_str().unwrap_or_default();
+                        assert!(
+                            preview.starts_with(traced_preview),
+                            "{}: {preview} vs {traced_preview}",
+                            stat.name
+                        );
+                    }
+                }
+            }
+        }
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// C strings decode statically the way the harness reads and traces
+    /// them, up to the first NUL among their bytes (a length-prefixed format
+    /// string and a `const char *` view of the remaining input), and a
+    /// parameter the harness gives a constant decodes to that constant.
+    #[test]
+    fn built_c_harness_strings_and_constants_decode_like_its_argument_trace() {
+        let Some(out) = build_c_harness_in(
+            "parse_flags",
+            &[
+                ("flags", "unsigned int"),
+                ("fmt", "const char *"),
+                ("path", "const char *"),
+                ("count", "long"),
+                ("tag", "unsigned char"),
+            ],
+            "#include <string.h>\n\
+             int parse_flags(unsigned int flags, const char *fmt, const char *path, long count,\n\
+             \x20               unsigned char tag) {\n\
+             \x20   return (int)(flags + strlen(fmt) + (count > 0 ? strnlen(path, (size_t)count) : 0)\n\
+             \x20                + tag);\n\
+             }\n",
+            None,
+        ) else {
+            return;
+        };
+        let layout = crate::arg_layout::ArgLayout::read(&out).unwrap().unwrap();
+        let flags = layout.params().find(|p| p.name == "flags").unwrap();
+        assert_eq!(
+            (flags.decoder.as_str(), flags.fixed_value),
+            ("fixed", Some(0)),
+            "{flags:?}"
+        );
+        let mut inputs: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            b"\x05\x00ab\x00cd\x07xyz\x00".to_vec(),
+            b"\x04\x00%d\x00\x00\x09path\x00tail".to_vec(),
+            b"\x02\x00hi\x01ab".to_vec(),
+            b"\xff\xff%s%n".to_vec(),
+        ];
+        inputs.push(
+            (0u8..42)
+                .map(|b| b.wrapping_mul(73).wrapping_add(11))
+                .collect(),
+        );
+        for input in inputs {
+            let lines = traced_args(&out, &input, Some("1"));
+            let decoded = layout.decode(&input);
+            for line in &lines {
+                let name = line["name"].as_str().unwrap();
+                let stat = decoded
+                    .iter()
+                    .find(|arg| arg.name == name)
+                    .unwrap_or_else(|| panic!("{name} not in {decoded:?}"));
+                assert!(stat.decoded, "{stat:?}");
+                let field = |key: &str| line.get(key).cloned().unwrap_or(serde_json::Value::Null);
+                assert_eq!(
+                    serde_json::json!(stat.span),
+                    field("span"),
+                    "{name} on {input:02x?}"
+                );
+                assert_eq!(
+                    serde_json::json!(stat.value),
+                    field("value"),
+                    "{name} on {input:02x?}"
+                );
+                assert_eq!(
+                    serde_json::json!(stat.len),
+                    field("len"),
+                    "{name} on {input:02x?}"
+                );
+                assert_eq!(
+                    serde_json::json!(stat.preview_hex),
+                    field("preview_hex"),
+                    "{name} on {input:02x?}"
+                );
+            }
+        }
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// With BHF_TRACE_ARGS=1 a built C harness prints each decoded parameter:
+    /// scalars with their value and the bytes they came from, a length-prefixed
+    /// string with its length and bytes, a whole-input buffer with its address,
+    /// allocation and preview, and an out-pointer before and after the call.
+    /// Without the variable it prints nothing.
+    #[test]
+    fn built_c_harness_traces_each_decoded_argument() {
+        let Some(out) = build_c_harness(
+            "widget_scan",
+            &[
+                ("data", "const unsigned char *"),
+                ("bit_index", "unsigned int"),
+                ("width", "unsigned short"),
+                ("label", "const char *"),
+                ("score", "int *"),
+            ],
+            "int widget_scan(const unsigned char *data, unsigned int bit_index,\n\
+             \x20                unsigned short width, const char *label, int *score) {\n\
+             \x20   *score = (int)width + (label[0] == 'A');\n\
+             \x20   return data[0] + (int)(bit_index & 1u);\n\
+             }\n",
+        ) else {
+            return;
+        };
+        assert_compiles_warning_free(&out);
+        let input = [
+            0x40, 0xe2, 0x01, 0x00, 0x2a, 0x00, 0x00, 0x00, 0x03, 0x00, b'A', b'B', b'C',
+        ];
+        assert!(traced_args(&out, &input, None).is_empty());
+        assert!(traced_args(&out, &input, Some("0")).is_empty());
+        let args = traced_args(&out, &input, Some("1"));
+
+        let data = traced(&args, "data", None);
+        assert_eq!(data["call"], "target");
+        assert_eq!(data["i"], 0);
+        assert_eq!(data["role"], "param");
+        assert_eq!(data["type"], "const unsigned char *");
+        // The whole-input buffer takes what the other parameters left: here,
+        // nothing, so it is the 8-byte zeroed floor allocation.
+        assert_eq!(data["span"], serde_json::json!([13, 13]));
+        assert_eq!(data["len"], 0);
+        assert_eq!(data["alloc_size"], 8);
+        assert_eq!(data["preview_hex"], "");
+        assert!(data["ptr"].as_str().unwrap().starts_with("0x"));
+
+        let bit_index = traced(&args, "bit_index", None);
+        assert_eq!(bit_index["value"], "123456");
+        assert_eq!(bit_index["span"], serde_json::json!([0, 4]));
+        let width = traced(&args, "width", None);
+        assert_eq!(width["value"], "42");
+        assert_eq!(width["span"], serde_json::json!([4, 8]));
+
+        let label = traced(&args, "label", None);
+        assert_eq!(label["span"], serde_json::json!([8, 13]));
+        assert_eq!(label["len"], 3);
+        assert_eq!(label["alloc_size"], 4);
+        assert_eq!(label["preview_hex"], "414243");
+        assert_eq!(label["decoder"], "bhf_c_string(4096)");
+
+        let score = traced(&args, "score", None);
+        assert_eq!(score["role"], "out");
+        assert_eq!(score["value"], "0");
+        assert_eq!(traced(&args, "score", Some("after"))["value"], "43");
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// A `(buffer, length)` pair traces the buffer as a view of the input and
+    /// the length as the input size; a scalar after it reads the cursor.
+    #[test]
+    fn built_c_harness_traces_a_paired_buffer() {
+        let Some(out) = build_c_harness(
+            "widget_parse",
+            &[
+                ("buf", "const unsigned char *"),
+                ("len", "size_t"),
+                ("bias", "int"),
+            ],
+            "#include <stddef.h>\n\
+             int widget_parse(const unsigned char *buf, size_t len, int bias) {\n\
+             \x20   return len ? buf[0] + bias : bias;\n\
+             }\n",
+        ) else {
+            return;
+        };
+        assert_compiles_warning_free(&out);
+        // The scalar takes the first bytes, and the (buffer, length) pair the
+        // bytes after them: no input byte is both.
+        let args = traced_args(&out, &[7, 0, 0, 0, 9, 8], Some("1"));
+        let bias = traced(&args, "bias", None);
+        assert_eq!(bias["value"], "7");
+        assert_eq!(bias["span"], serde_json::json!([0, 4]));
+        let buf = traced(&args, "buf", None);
+        assert_eq!(buf["span"], serde_json::json!([4, 6]));
+        assert_eq!(buf["len"], 2);
+        assert_eq!(buf["preview_hex"], "0908");
+        assert_eq!(traced(&args, "len", None)["value"], "2");
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// A lone byte pointer (no length partner) gets the bytes left after the
+    /// scalars decoded with it, never their bytes again.
+    #[test]
+    fn built_c_harness_gives_a_lone_buffer_the_bytes_after_the_scalars() {
+        let Some(out) = build_c_harness(
+            "widget_bits",
+            &[
+                ("data", "const uint8_t *"),
+                ("bit_index", "uint32_t"),
+                ("width", "uint32_t"),
+            ],
+            "#include <stdint.h>\n\
+             int widget_bits(const uint8_t *data, uint32_t bit_index, uint32_t width) {\n\
+             \x20   return data[0] + (int)(bit_index & width);\n\
+             }\n",
+        ) else {
+            return;
+        };
+        assert_compiles_warning_free(&out);
+        let input = [1, 0, 0, 0, 2, 0, 0, 0, 0xaa, 0xbb, 0xcc];
+        let args = traced_args(&out, &input, Some("1"));
+        assert_eq!(traced(&args, "bit_index", None)["value"], "1");
+        assert_eq!(
+            traced(&args, "bit_index", None)["span"],
+            serde_json::json!([0, 4])
+        );
+        assert_eq!(traced(&args, "width", None)["value"], "2");
+        assert_eq!(
+            traced(&args, "width", None)["span"],
+            serde_json::json!([4, 8])
+        );
+        let data = traced(&args, "data", None);
+        assert_eq!(data["span"], serde_json::json!([8, 11]));
+        assert_eq!(data["len"], 3);
+        assert_eq!(data["alloc_size"], 8);
+        assert_eq!(data["preview_hex"], "aabbcc");
+        // Flipping a scalar's byte no longer changes the buffer, and back.
+        let mut flipped = input;
+        flipped[0] ^= 0xff;
+        let args = traced_args(&out, &flipped, Some("1"));
+        assert_eq!(traced(&args, "data", None)["preview_hex"], "aabbcc");
+        assert_eq!(traced(&args, "bit_index", None)["value"], "254");
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// The buffer-length dimension is recorded (in the source stamp and in
+    /// arg-layout.json) only for a harness it sized a buffer of: a `const
+    /// void *` view becomes a sized copy and is recorded, while a buffer
+    /// paired with its length keeps the bytes left and records nothing.
+    #[test]
+    fn the_length_dimension_is_recorded_only_where_it_sizes_a_buffer() {
+        let _dimension = crate::scoped_buffer_len_dimension(true);
+        let generate = |name: &str, params: &[(&str, &str)]| {
+            let out = temp_dir(name);
+            let mut args = direct_args(name, out.clone());
+            args.params = params
+                .iter()
+                .map(|(name, c_type)| CParameter {
+                    name: (*name).to_owned(),
+                    c_type: (*c_type).to_owned(),
+                })
+                .collect();
+            let result = generate_c_direct_harness(args).unwrap();
+            let main = fs::read_to_string(&result.main_c).unwrap();
+            let layout = crate::arg_layout::ArgLayout::read(&out).unwrap().unwrap();
+            fs::remove_dir_all(&out).ok();
+            (main, layout)
+        };
+        let (main, layout) = generate("view_sized", &[("p", "const void *"), ("x", "int")]);
+        assert!(main.contains("bhf_take_sized_copy(&Cur"), "{main}");
+        assert!(main.contains("with an explicit buffer length"), "{main}");
+        assert!(layout.buffer_len_dimension);
+
+        let (main, layout) = generate(
+            "pair_unsized",
+            &[("buf", "const uint8_t *"), ("len", "size_t"), ("x", "int")],
+        );
+        assert!(!main.contains("bhf_take_sized"), "{main}");
+        assert!(!main.contains("with an explicit buffer length"), "{main}");
+        assert!(!layout.buffer_len_dimension);
+    }
+
+    /// With the opt-in buffer-length dimension, a buffer without a length
+    /// parameter takes a 4-byte length after the scalars, then that many bytes.
+    #[test]
+    fn built_c_harness_with_the_length_dimension_sizes_a_lone_buffer_from_the_input() {
+        let _dimension = crate::scoped_buffer_len_dimension(true);
+        let Some(out) = build_c_harness(
+            "widget_sized",
+            &[("data", "const uint8_t *"), ("bit_index", "uint32_t")],
+            "#include <stdint.h>\n\
+             int widget_sized(const uint8_t *data, uint32_t bit_index) {\n\
+             \x20   return data[0] + (int)bit_index;\n\
+             }\n",
+        ) else {
+            return;
+        };
+        let main = fs::read_to_string(out.join("main.c")).unwrap();
+        assert!(
+            main.contains("with an explicit buffer length"),
+            "the source names its layout"
+        );
+        assert_compiles_warning_free(&out);
+        let input = [9, 0, 0, 0, 2, 0, 0, 0, 0xaa, 0xbb, 0xcc];
+        let args = traced_args(&out, &input, Some("1"));
+        assert_eq!(traced(&args, "bit_index", None)["value"], "9");
+        let data = traced(&args, "data", None);
+        assert_eq!(data["span"], serde_json::json!([8, 10]));
+        assert_eq!(data["len"], 2);
+        assert_eq!(data["preview_hex"], "aabb");
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// A call whose parameters all use the whole input captures no cursor
+    /// positions, so a `-Wall -Werror` build stays clean.
+    #[test]
+    fn built_c_harness_without_cursor_parameters_traces_cleanly() {
+        let Some(out) = build_c_harness(
+            "widget_feed",
+            &[("buf", "const unsigned char *"), ("len", "size_t")],
+            "#include <stddef.h>\n\
+             int widget_feed(const unsigned char *buf, size_t len) {\n\
+             \x20   return len ? buf[0] : 0;\n\
+             }\n",
+        ) else {
+            return;
+        };
+        assert_compiles_warning_free(&out);
+        let args = traced_args(&out, b"abc", Some("1"));
+        assert_eq!(
+            traced(&args, "buf", None)["span"],
+            serde_json::json!([0, 3])
+        );
+        assert_eq!(traced(&args, "len", None)["value"], "3");
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// A `(length pointer, output buffer)` pair after a cursor scalar: the
+    /// length's decl declares the buffer too, so the buffer (which has no decl
+    /// of its own) is decoded and traced after it, and the harness builds.
+    #[test]
+    fn built_c_harness_traces_a_reverse_output_pair_after_a_scalar() {
+        let Some(out) = build_c_harness(
+            "widget_decode",
+            &[
+                ("level", "int"),
+                ("out_len", "size_t *"),
+                ("out", "unsigned char *"),
+            ],
+            "#include <stddef.h>\n\
+             int widget_decode(int level, size_t *out_len, unsigned char *out) {\n\
+             \x20   if (*out_len) out[0] = (unsigned char)level;\n\
+             \x20   *out_len = 1;\n\
+             \x20   return level;\n\
+             }\n",
+        ) else {
+            return;
+        };
+        assert_compiles_warning_free(&out);
+        let args = traced_args(&out, &[4, 0, 0, 0, 0xaa], Some("1"));
+        let level = traced(&args, "level", None);
+        assert_eq!(level["value"], "4");
+        assert_eq!(level["span"], serde_json::json!([0, 4]));
+        assert!(traced(&args, "out", None)["ptr"]
+            .as_str()
+            .unwrap()
+            .starts_with("0x"));
+        assert_eq!(traced(&args, "out_len", Some("after"))["value"], "1");
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// A struct whose fields are named like the harness's `Data` and `Size`
+    /// is decoded from the cursor like any other struct: its field accesses
+    /// are not the whole input, and the harness builds.
+    #[test]
+    fn built_c_harness_decodes_a_struct_with_fields_named_like_the_input() {
+        let header =
+            "typedef struct widget_hdr { unsigned int Size; unsigned int Data; } widget_hdr;\n\
+                      int widget_check(const widget_hdr *hdr, int level);\n";
+        let Some(out) = build_c_harness_in(
+            "widget_check",
+            &[("hdr", "const widget_hdr *"), ("level", "int")],
+            "#include \"widget.h\"\n\
+             int widget_check(const widget_hdr *hdr, int level) {\n\
+             \x20   return (int)(hdr->Size + hdr->Data) + level;\n\
+             }\n",
+            Some(header),
+        ) else {
+            return;
+        };
+        assert_compiles_warning_free(&out);
+        let input = [1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0];
+        let args = traced_args(&out, &input, Some("1"));
+        assert_eq!(
+            traced(&args, "hdr", None)["span"],
+            serde_json::json!([0, 8])
+        );
+        let level = traced(&args, "level", None);
+        assert_eq!(level["value"], "3");
+        assert_eq!(level["span"], serde_json::json!([8, 12]));
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// A one-letter buffer name that begins other identifiers in its own decl
+    /// (`s` and `size_t`) still gives the scalars after it their own bytes.
+    #[test]
+    fn built_c_harness_keeps_a_short_buffer_name_apart_from_the_scalars() {
+        let Some(out) = build_c_harness(
+            "widget_sum",
+            &[("s", "const unsigned char *"), ("stride", "size_t")],
+            "#include <stddef.h>\n\
+             int widget_sum(const unsigned char *s, size_t stride) {\n\
+             \x20   return s[0] + (int)stride;\n\
+             }\n",
+        ) else {
+            return;
+        };
+        let args = traced_args(&out, &[5, 0, 0, 0, 0, 0, 0, 0, 0xaa, 0xbb], Some("1"));
+        let stride = traced(&args, "stride", None);
+        assert_eq!(stride["value"], "5");
+        assert_eq!(stride["span"], serde_json::json!([0, 8]));
+        let s = traced(&args, "s", None);
+        assert_eq!(s["span"], serde_json::json!([8, 10]));
+        assert_eq!(s["preview_hex"], "aabb");
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// A correct function summing `count` bytes runs clean under its harness
+    /// when the count is named `nElem` or `cb`: the harness gives it the
+    /// buffer's own length, never an independent value that overruns it.
+    #[test]
+    fn built_c_harness_binds_run_together_and_win32_counts_to_their_buffer() {
+        let header = "#include <stdint.h>\n#include <stddef.h>\n\
+             typedef unsigned char BYTE;\n\
+             typedef unsigned long DWORD;\n\
+             int sum_items(const uint8_t *buf, size_t nElem);\n\
+             int sum_bytes(const BYTE *pb, DWORD cb);\n";
+        for (name, params, body) in [
+            (
+                "sum_items",
+                [("buf", "const uint8_t *"), ("nElem", "size_t")],
+                "int sum_items(const uint8_t *buf, size_t nElem) {\n\
+                 \x20   int s = 0;\n\
+                 \x20   for (size_t i = 0; i < nElem; i++) s += buf[i];\n\
+                 \x20   return s;\n\
+                 }\n",
+            ),
+            (
+                "sum_bytes",
+                [("pb", "const BYTE *"), ("cb", "DWORD")],
+                "int sum_bytes(const BYTE *pb, DWORD cb) {\n\
+                 \x20   int s = 0;\n\
+                 \x20   for (DWORD i = 0; i < cb; i++) s += pb[i];\n\
+                 \x20   return s;\n\
+                 }\n",
+            ),
+        ] {
+            let Some(out) = build_c_harness_in(
+                name,
+                &params,
+                &format!("#include \"widget.h\"\n{body}"),
+                Some(header),
+            ) else {
+                return;
+            };
+            for input in [&b"A"[..], b"", &[0xff; 24]] {
+                let args = traced_args(&out, input, Some("1"));
+                let length = traced(&args, params[1].0, None);
+                assert_eq!(
+                    length["value"],
+                    input.len().to_string(),
+                    "{name} on {input:02x?}: {args:#?}"
+                );
+            }
+            fs::remove_dir_all(&out).ok();
+        }
+    }
+
+    /// With BHF_TRACE_ARGS=1 a built sequence harness prints each operation's
+    /// decoded arguments, with spans in the argument region at the front of
+    /// the input.
+    #[test]
+    fn built_sequence_harness_traces_operation_arguments() {
+        let tools = ["make", "clang"].iter().all(|tool| {
+            Command::new(tool)
+                .arg("--version")
+                .output()
+                .is_ok_and(|o| o.status.success())
+        });
+        if !tools {
+            eprintln!("skipping sequence trace e2e: clang/make unavailable");
+            return;
+        }
+        let out = temp_dir("seq-trace");
+        let header = "typedef struct widget_t { int total; } widget_t;\n\
+                      int widget_open(widget_t *w);\n\
+                      int widget_push(widget_t *w, int value);\n\
+                      int widget_close(widget_t *w);\n";
+        fs::write(out.join("widget.h"), header).unwrap();
+        fs::write(
+            out.join("widget.c"),
+            "#include \"widget.h\"\n\
+             int widget_open(widget_t *w) { w->total = 0; return 0; }\n\
+             int widget_push(widget_t *w, int value) { w->total += value; return 0; }\n\
+             int widget_close(widget_t *w) { w->total = 0; return 0; }\n",
+        )
+        .unwrap();
+        let step = |name: &str, params: Vec<CParameter>| CLifecycleStep {
+            name: name.to_owned(),
+            params,
+            return_type: "int".to_owned(),
+            role: CStepRole::Operation,
+        };
+        let args = GenerateCSequenceArgs {
+            decoder_limits: Default::default(),
+            harness_id: "H-SEQTRACE".to_owned(),
+            output_dir: out.clone(),
+            source_path: out.join("widget.c"),
+            target: cfunction("widget_push"),
+            handle_type: "widget_t".to_owned(),
+            handle_param_type: "widget_t *".to_owned(),
+            init_returns_handle: false,
+            init_out_handle_argument: None,
+            init_success_nonzero: false,
+            handle_field_initializers: Vec::new(),
+            output_drain_protocol: None,
+            init_step: Some(step("widget_open", Vec::new())),
+            op_steps: vec![step(
+                "widget_push",
+                vec![CParameter {
+                    name: "value".to_owned(),
+                    c_type: "int".to_owned(),
+                }],
+            )],
+            protocol_steps: Vec::new(),
+            protocol_objects: Vec::new(),
+            receiver_configuration_names: Vec::new(),
+            callback_action: None,
+            end_step: Some(step("widget_close", Vec::new())),
+            target_includes: vec!["widget.h".to_owned()],
+            target_includes_dirs: vec![out.clone()],
+            target_sources: vec![out.join("widget.c")],
+            compile_flags: Vec::new(),
+            target_declared_in_header: true,
+            c_runtime_include: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../c_runtime")
+                .canonicalize()
+                .expect("c_runtime dir"),
+            type_defs: vec![c_parser::parse_c_type_defs(header).unwrap()],
+        };
+        generate_c_sequence_harness(args).unwrap();
+        let build = Command::new("make")
+            .arg("main")
+            .current_dir(&out)
+            .output()
+            .expect("run make");
+        assert!(
+            build.status.success(),
+            "make main failed:\n{}\n{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr)
+        );
+        let layout: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(out.join(SEQUENCE_LAYOUT_FILE)).unwrap())
+                .unwrap();
+        let control_len = layout["control_len"].as_u64().unwrap() as usize;
+        // Argument bytes, then the program: one step, slot 0 selecting op 0.
+        let mut input = vec![7, 0, 0, 0];
+        let mut control = vec![0u8; control_len];
+        control[0] = 1;
+        control[1] = 1;
+        input.extend_from_slice(&control);
+        let args = traced_args(&out, &input, Some("1"));
+        let value = traced(&args, "value", None);
+        assert_eq!(value["call"], "widget_push");
+        assert_eq!(value["i"], 1);
+        assert_eq!(value["value"], "7");
+        assert_eq!(value["span"], serde_json::json!([0, 4]));
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// Generate and `make main` a sequence harness over a `widget_t` handle
+    /// whose operations are `ops` (name, then the parameters after the
+    /// handle), declared in `header` and defined in `source`. Returns the
+    /// harness directory and its control-tail length, or `None` (skipping)
+    /// when clang or make is missing.
+    fn build_widget_sequence_harness(
+        name: &str,
+        header: &str,
+        source: &str,
+        ops: &[(&str, &[(&str, &str)])],
+    ) -> Option<(PathBuf, usize)> {
+        let tools = ["make", "clang"].iter().all(|tool| {
+            Command::new(tool)
+                .arg("--version")
+                .output()
+                .is_ok_and(|o| o.status.success())
+        });
+        if !tools {
+            eprintln!("skipping {name} build: clang/make unavailable");
+            return None;
+        }
+        let out = temp_dir(name);
+        fs::write(out.join("widget.h"), header).unwrap();
+        fs::write(out.join("widget.c"), source).unwrap();
+        let step = |name: &str, params: Vec<CParameter>| CLifecycleStep {
+            name: name.to_owned(),
+            params,
+            return_type: "int".to_owned(),
+            role: CStepRole::Operation,
+        };
+        let op_steps = ops
+            .iter()
+            .map(|(op, params)| {
+                let params = params
+                    .iter()
+                    .map(|(name, c_type)| CParameter {
+                        name: (*name).to_owned(),
+                        c_type: (*c_type).to_owned(),
+                    })
+                    .collect();
+                step(op, params)
+            })
+            .collect();
+        let args = GenerateCSequenceArgs {
+            decoder_limits: Default::default(),
+            harness_id: format!("H-{name}"),
+            output_dir: out.clone(),
+            source_path: out.join("widget.c"),
+            target: cfunction(ops[0].0),
+            handle_type: "widget_t".to_owned(),
+            handle_param_type: "widget_t *".to_owned(),
+            init_returns_handle: false,
+            init_out_handle_argument: None,
+            init_success_nonzero: false,
+            handle_field_initializers: Vec::new(),
+            output_drain_protocol: None,
+            init_step: Some(step("widget_open", Vec::new())),
+            op_steps,
+            protocol_steps: Vec::new(),
+            protocol_objects: Vec::new(),
+            receiver_configuration_names: Vec::new(),
+            callback_action: None,
+            end_step: Some(step("widget_close", Vec::new())),
+            target_includes: vec!["widget.h".to_owned()],
+            target_includes_dirs: vec![out.clone()],
+            target_sources: vec![out.join("widget.c")],
+            compile_flags: Vec::new(),
+            target_declared_in_header: true,
+            c_runtime_include: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../c_runtime")
+                .canonicalize()
+                .expect("c_runtime dir"),
+            type_defs: vec![c_parser::parse_c_type_defs(header).unwrap()],
+        };
+        generate_c_sequence_harness(args).unwrap();
+        let build = Command::new("make")
+            .arg("main")
+            .current_dir(&out)
+            .output()
+            .expect("run make");
+        assert!(
+            build.status.success(),
+            "make main failed:\n{}\n{}\n{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr),
+            fs::read_to_string(out.join("main.c")).unwrap_or_default()
+        );
+        let layout: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(out.join(SEQUENCE_LAYOUT_FILE)).unwrap())
+                .unwrap();
+        let control_len = layout["control_len"].as_u64().unwrap() as usize;
+        Some((out, control_len))
+    }
+
+    /// In a sequence harness, an operation whose parameters all use the input
+    /// takes the argument bytes the earlier operations left, never the
+    /// control tail, and an operation with a `(length pointer, output
+    /// buffer)` pair after a scalar builds.
+    #[test]
+    fn built_sequence_harness_gives_whole_input_operations_the_argument_bytes_left() {
+        let header = "#include <stddef.h>\n\
+                      typedef struct widget_t { int total; } widget_t;\n\
+                      int widget_open(widget_t *w);\n\
+                      int widget_push(widget_t *w, int value);\n\
+                      int widget_feed(widget_t *w, const unsigned char *buf, size_t len);\n\
+                      int widget_decode(widget_t *w, int level, size_t *out_len, unsigned char *out);\n\
+                      int widget_close(widget_t *w);\n";
+        let source = "#include \"widget.h\"\n\
+                      int widget_open(widget_t *w) { w->total = 0; return 0; }\n\
+                      int widget_push(widget_t *w, int value) { w->total += value; return 0; }\n\
+                      int widget_feed(widget_t *w, const unsigned char *buf, size_t len) {\n\
+                      \x20   if (len) w->total += buf[0];\n\
+                      \x20   return 0;\n\
+                      }\n\
+                      int widget_decode(widget_t *w, int level, size_t *out_len, unsigned char *out) {\n\
+                      \x20   if (*out_len) out[0] = (unsigned char)(w->total + level);\n\
+                      \x20   return 0;\n\
+                      }\n\
+                      int widget_close(widget_t *w) { w->total = 0; return 0; }\n";
+        let Some((out, control_len)) = build_widget_sequence_harness(
+            "seq-layout",
+            header,
+            source,
+            &[
+                ("widget_push", &[("value", "int")]),
+                (
+                    "widget_feed",
+                    &[("buf", "const unsigned char *"), ("len", "size_t")],
+                ),
+                (
+                    "widget_decode",
+                    &[
+                        ("level", "int"),
+                        ("out_len", "size_t *"),
+                        ("out", "unsigned char *"),
+                    ],
+                ),
+            ],
+        ) else {
+            return;
+        };
+        // Argument bytes (push's value and its slot-use byte, then feed's
+        // bytes), then the program: push (op 0), then feed (op 1).
+        let mut input = vec![7, 0, 0, 0, 0, 0xaa, 0xbb];
+        let mut control = vec![0u8; control_len];
+        control[0] = 2;
+        control[1] = 1;
+        control[6] = 1;
+        control[7] = 1;
+        input.extend_from_slice(&control);
+        let args = traced_args(&out, &input, Some("1"));
+        let value = traced(&args, "value", None);
+        assert_eq!(value["value"], "7");
+        assert_eq!(value["span"], serde_json::json!([0, 5]));
+        let buf = traced(&args, "buf", None);
+        assert_eq!(buf["call"], "widget_feed");
+        assert_eq!(buf["span"], serde_json::json!([5, 7]));
+        assert_eq!(buf["preview_hex"], "aabb");
+        assert_eq!(traced(&args, "len", None)["value"], "2");
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// A built harness must be able to hand an unsigned parameter a value with
+    /// the top bit set: `0xffffffff` (all input bytes 0xff) used to decode to
+    /// `0x7fffffff`, so the planted check below was unreachable from any input.
+    #[test]
+    fn built_harness_reaches_unsigned_values_with_the_top_bit_set() {
+        let make_ok = Command::new("make")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        let clang_ok = Command::new("clang")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !make_ok || !clang_ok {
+            eprintln!("skipping unsigned range e2e: clang/make unavailable");
+            return;
+        }
+        let out = temp_dir("unsigned_range_e2e");
+        let c_runtime = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../c_runtime")
+            .canonicalize()
+            .expect("c_runtime dir");
+        let target_c = out.join("target.c");
+        fs::write(
+            &target_c,
+            "#include <stdlib.h>\n\
+             int select_bit(unsigned int bit_index) {\n\
+             \x20   if (bit_index == 0xffffffffu) abort();\n\
+             \x20   return (int)(bit_index & 1u);\n\
+             }\n",
+        )
+        .unwrap();
+        let mut args = direct_args("select_bit", out.clone());
+        args.params = vec![CParameter {
+            name: "bit_index".to_owned(),
+            c_type: "unsigned int".to_owned(),
+        }];
+        args.target_sources = vec![target_c];
+        args.c_runtime_include = c_runtime;
+        generate_c_direct_harness(args).unwrap();
+        let build = Command::new("make")
+            .arg("main")
+            .current_dir(&out)
+            .output()
+            .expect("run make");
+        assert!(
+            build.status.success(),
+            "make main failed:\n{}\n{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr)
+        );
+        let low = out.join("low.bin");
+        fs::write(&low, [0x01, 0x00, 0x00, 0x00]).unwrap();
+        let run = crate::harness_command(out.join("main"))
+            .arg(&low)
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "a small value must not reach the planted check: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let high = out.join("high.bin");
+        fs::write(&high, [0xff, 0xff, 0xff, 0xff]).unwrap();
+        let run = crate::harness_command(out.join("main"))
+            .arg(&high)
+            .output()
+            .unwrap();
+        assert!(
+            !run.status.success(),
+            "0xffffffff must be reachable from the input bytes: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
         fs::remove_dir_all(&out).ok();
     }
 
@@ -5151,6 +8000,105 @@ mod tests {
             !main.contains("_bhf_env_data = Data;"),
             "no env arming when opt-out"
         );
+    }
+
+    /// Generation writes arg-layout.json: every parameter in decode order
+    /// with its input source, decoder, width, endianness, bounds and pairing,
+    /// and where the call's whole-input parameters take the remaining bytes.
+    #[test]
+    fn direct_harness_writes_its_argument_layout() {
+        use crate::arg_layout::{ArgLayout, LayoutStep};
+        let out = temp_dir("arg_layout_c");
+        let defs = c_parser::parse_c_type_defs(
+            "typedef unsigned char u8_t;\ntypedef unsigned int u32_t;\n",
+        )
+        .unwrap();
+        let mut args = direct_args("read_bits", out.clone());
+        args.params = vec![
+            CParameter {
+                name: "data".to_owned(),
+                c_type: "const u8_t *".to_owned(),
+            },
+            CParameter {
+                name: "bit_index".to_owned(),
+                c_type: "u32_t".to_owned(),
+            },
+            CParameter {
+                name: "name".to_owned(),
+                c_type: "const char *".to_owned(),
+            },
+        ];
+        args.type_defs = vec![defs];
+        generate_c_direct_harness(args).unwrap();
+        let layout = ArgLayout::read(&out).expect("arg-layout.json").unwrap();
+        assert_eq!(layout.language, "c");
+        assert_eq!(layout.harness, "direct");
+        assert_eq!(layout.harness_format_version, crate::HARNESS_FORMAT_VERSION);
+        assert!(layout.static_decode);
+        let kinds: Vec<String> = layout
+            .steps
+            .iter()
+            .map(|step| match step {
+                LayoutStep::Param(p) => format!("{}:{}:{}", p.name, p.input, p.decoder),
+                LayoutStep::Remainder { call, sized } => format!("remainder:{call}:{sized}"),
+                LayoutStep::Opaque { what } => format!("opaque:{what}"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "bit_index:cursor:scalar",
+                "name:cursor:length_prefixed_string",
+                "remainder:target:false",
+                "data:remainder:input_buffer",
+            ]
+        );
+        let params: Vec<_> = layout.params().collect();
+        assert_eq!(params[0].index, 1);
+        assert_eq!(params[0].width, Some(4));
+        assert_eq!(params[0].endianness.as_deref(), Some("little"));
+        assert_eq!(params[0].value_kind.as_deref(), Some("u32"));
+        assert_eq!(params[1].max_len, Some(4096));
+        assert_eq!(params[2].copied, Some(true));
+        // The layout decodes a testcase the way the harness does.
+        let decoded = layout.decode(b"\x2a\x00\x00\x00\x02\x00hiTAIL");
+        let value = |name: &str| decoded.iter().find(|a| a.name == name).unwrap();
+        assert_eq!(value("bit_index").value.as_deref(), Some("42"));
+        assert_eq!(value("name").preview_hex.as_deref(), Some("6869"));
+        assert_eq!(value("data").span, Some([8, 12]));
+    }
+
+    #[test]
+    fn a_buffer_length_pair_is_recorded_as_paired_in_the_layout() {
+        let out = temp_dir("arg_layout_pair");
+        let mut args = direct_args("parse_record", out.clone());
+        args.params = vec![
+            CParameter {
+                name: "buf".to_owned(),
+                c_type: "const unsigned char *".to_owned(),
+            },
+            CParameter {
+                name: "buflen".to_owned(),
+                c_type: "size_t".to_owned(),
+            },
+            CParameter {
+                name: "tag".to_owned(),
+                c_type: "int".to_owned(),
+            },
+        ];
+        generate_c_direct_harness(args).unwrap();
+        let layout = crate::arg_layout::ArgLayout::read(&out).unwrap().unwrap();
+        let by = |name: &str| layout.params().find(|p| p.name == name).unwrap().clone();
+        assert_eq!(by("buf").paired_with.as_deref(), Some("buflen"));
+        assert_eq!(by("buflen").paired_with.as_deref(), Some("buf"));
+        assert_eq!(by("buflen").decoder, "input_length");
+        assert_eq!(by("buf").copied, Some(false), "the pair views the input");
+        assert_eq!(by("tag").order, 0, "the scalar is decoded first");
+        let decoded = layout.decode(b"\x07\x00\x00\x00ABC");
+        let value = |name: &str| decoded.iter().find(|a| a.name == name).unwrap().clone();
+        assert_eq!(value("tag").value.as_deref(), Some("7"));
+        assert_eq!(value("buflen").value.as_deref(), Some("3"));
+        assert_eq!(value("buf").preview_hex.as_deref(), Some("414243"));
     }
 
     #[test]
@@ -6347,7 +9295,8 @@ mod tests {
         );
         assert!(
             mk.contains("SECTION_FLAGS ?= -ffunction-sections -fdata-sections")
-                && mk.contains("SECTION_LDFLAGS ?= -Wl,--gc-sections"),
+                && mk.contains("BHF_GC_LDFLAGS_GNU = -Wl,--gc-sections")
+                && mk.contains("$(call BHF_SECTION_LDFLAGS,$(CC))"),
             "C harnesses must discard unreachable dependency sections:\n{mk}"
         );
         assert!(
@@ -6370,6 +9319,61 @@ mod tests {
             main.contains("LLVMFuzzerTestOneInput"),
             "main.c should still emit the libFuzzer entrypoint as the default"
         );
+    }
+
+    #[test]
+    fn build_context_link_flags_reach_every_c_link_line_not_the_compile_flags() {
+        let out = temp_dir("ldflags");
+        let args = GenerateCDirectArgs {
+            environment: None,
+            decoder_limits: Default::default(),
+            force: false,
+            lifecycle: Vec::new(),
+            drive_plan: None,
+            harness_id: "H-C002".to_owned(),
+            output_dir: out.clone(),
+            source_path: PathBuf::from("/tmp/source.c"),
+            target: cfunction("parse"),
+            params: vec![CParameter {
+                name: "value".to_owned(),
+                c_type: "int".to_owned(),
+            }],
+            return_type: "int".to_owned(),
+            target_includes: vec!["target.h".to_owned()],
+            target_includes_dirs: vec![PathBuf::from("/tmp")],
+            target_sources: vec![PathBuf::from("/tmp/source.c")],
+            compile_flags: vec![
+                "-DWIDGET=1".to_owned(),
+                "@bhf-build-context-ldflag=-lws2_32".to_owned(),
+            ],
+            target_declared_in_header: false,
+            c_runtime_include: PathBuf::from("/tmp/c_runtime"),
+            type_defs: Vec::new(),
+            result_cleanup: None,
+        };
+        let result = generate_c_direct_harness(args).unwrap();
+        let mk = fs::read_to_string(&result.makefile).unwrap();
+        assert!(
+            mk.lines()
+                .any(|line| line.trim_end() == "BUILD_CONTEXT_LDFLAGS = -lws2_32"),
+            "{mk}"
+        );
+        let compile_db_flags = mk
+            .lines()
+            .find(|line| line.starts_with("COMPILE_DB_FLAGS ="))
+            .unwrap();
+        assert_eq!(compile_db_flags.trim_end(), "COMPILE_DB_FLAGS = -DWIDGET=1");
+        let links: Vec<&str> = mk
+            .lines()
+            .filter(|line| line.starts_with('\t') && line.contains("-o $@ main.c"))
+            .collect();
+        assert!(!links.is_empty(), "{mk}");
+        for line in links {
+            assert!(
+                line.contains("$(BUILD_CONTEXT_LDFLAGS) $(call BHF_SECTION_LDFLAGS,"),
+                "{line}"
+            );
+        }
     }
 
     #[test]
@@ -6661,12 +9665,13 @@ mod tests {
         };
 
         let main = fs::read_to_string(&generate_c_direct_harness(args).unwrap().main_c).unwrap();
+        // The bracketed span is the input the cursor left after `key`.
         assert!(
-            main.contains("const char * start = (const char *)Data"),
+            main.contains("const char * start = (const char *)_bhf_rest_p"),
             "the begin pointer must borrow the span, got:\n{main}"
         );
         assert!(
-            main.contains("const char * end = (const char *)Data + Size"),
+            main.contains("const char * end = (const char *)_bhf_rest_p + _bhf_rest_size_p"),
             "the end pointer must be the SAME span's end, got:\n{main}"
         );
         assert!(
@@ -6678,6 +9683,53 @@ mod tests {
             main.contains("key = bhf_c_string(&Cur"),
             "an unpaired string must keep its own decoder, got:\n{main}"
         );
+    }
+
+    /// A `[begin, end)` pair in a call with another buffer takes a slice of
+    /// its own, and `end` points one past the slice's copy: the argument
+    /// trace shows it as an empty span end instead of reading past the copy,
+    /// and the static decode gives what the trace prints.
+    #[test]
+    fn built_c_harness_traces_the_end_of_a_sliced_begin_end_pair() {
+        let Some(out) = build_c_harness(
+            "match_span",
+            &[
+                ("begin", "const char *"),
+                ("end", "const char *"),
+                ("key", "const uint8_t *"),
+                ("keylen", "size_t"),
+            ],
+            "#include <stdint.h>\n#include <stddef.h>\n\
+             int match_span(const char *begin, const char *end, const uint8_t *key, size_t keylen) {\n\
+             \x20   return begin != end && keylen ? begin[0] == (char)key[0] : 0;\n\
+             }\n",
+        ) else {
+            return;
+        };
+        let input = [3, 0, 0, 0, b'a', b'b', b'c', b'd', b'e', b'f', b'g', b'h'];
+        let args = traced_args(&out, &input, Some("1"));
+        let begin = traced(&args, "begin", None);
+        assert_eq!(begin["span"], serde_json::json!([4, 7]), "{args:#?}");
+        assert_eq!(begin["preview_hex"], "616263");
+        let end = traced(&args, "end", None);
+        assert_eq!(end["len"], 0, "{end}");
+        let key = traced(&args, "key", None);
+        assert_eq!(key["span"], serde_json::json!([7, 12]));
+        assert_eq!(key["preview_hex"], "6465666768");
+        assert_eq!(traced(&args, "keylen", None)["value"], "5");
+        let layout = crate::arg_layout::ArgLayout::read(&out).unwrap().unwrap();
+        let decoder = |name: &str| {
+            layout
+                .params()
+                .find(|param| param.name == name)
+                .map(|param| param.decoder.clone())
+        };
+        assert_eq!(decoder("end").as_deref(), Some("input_end"));
+        assert_eq!(decoder("begin").as_deref(), Some("input_buffer"));
+        for input in [&input[..], b"", &[0x41; 9], &[0, 0, 0, 0, b'k']] {
+            assert_layout_matches_trace(&out, input);
+        }
+        fs::remove_dir_all(&out).ok();
     }
 
     #[test]
@@ -7976,12 +11028,14 @@ mod tests {
         let result = generate_c_direct_harness(args).unwrap();
         let main = fs::read_to_string(&result.main_c).unwrap();
 
+        // The pair borrows the input `crc` did not read, and its length is
+        // the size of that span.
         assert!(
-            main.contains("const mz_uint8 * ptr = (const mz_uint8 *)Data"),
+            main.contains("const mz_uint8 * ptr = (const mz_uint8 *)_bhf_rest_p"),
             "const byte typedef pointer should borrow libFuzzer Data, got:\n{main}",
         );
         assert!(
-            main.contains("size_t buf_len = (size_t)Size"),
+            main.contains("size_t buf_len = (size_t)_bhf_rest_size_p"),
             "typedef byte pointer length should mirror libFuzzer Size, got:\n{main}",
         );
         assert!(
@@ -8042,7 +11096,7 @@ mod tests {
         let main = fs::read_to_string(&result.main_c).unwrap();
         assert!(main.contains("#define _GNU_SOURCE"));
         assert!(main.contains("#include <stdio.h>"));
-        assert!(main.contains("fmemopen(_bhf_file_buf_stream, Size, \"r+\")"));
+        assert!(main.contains("bhf_fmemopen(_bhf_file_buf_stream, Size)"));
         assert!(main.contains("if (stream) fclose(stream); free(_bhf_file_buf_stream);"));
         assert!(main.contains("int R = parse_stream(stream);"));
 
@@ -8070,6 +11124,59 @@ mod tests {
             String::from_utf8_lossy(&output.stderr),
             main
         );
+    }
+
+    /// The stream a FILE* parameter gets reads back exactly the input bytes,
+    /// and an empty input gives an empty stream, on every host (Windows has
+    /// no fmemopen).
+    #[test]
+    fn bhf_fmemopen_reads_back_the_input_bytes() {
+        if Command::new("clang").arg("--version").output().is_err() {
+            eprintln!("skipping stream round trip: clang not on PATH");
+            return;
+        }
+        let work = temp_dir("fmemopen-round-trip");
+        let source = work.join("stream.c");
+        fs::write(
+            &source,
+            r#"#define _GNU_SOURCE
+#include <stdio.h>
+#include "bhf_decode.h"
+int main(void) {
+    unsigned char input[4] = {'W', 'G', 'T', '1'};
+    unsigned char back[8] = {0};
+    FILE *stream = bhf_fmemopen(input, sizeof input);
+    if (!stream) return 2;
+    if (fread(back, 1, sizeof back, stream) != 4 || memcmp(back, input, 4) != 0) return 3;
+    fclose(stream);
+    stream = bhf_fmemopen(input, 0);
+    if (!stream || fgetc(stream) != EOF) return 4;
+    fclose(stream);
+    return 0;
+}
+"#,
+        )
+        .unwrap();
+        let program = work.join(if cfg!(windows) {
+            "stream.exe"
+        } else {
+            "stream"
+        });
+        let output = Command::new("clang")
+            .arg("-I")
+            .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../c_runtime"))
+            .arg(&source)
+            .arg("-o")
+            .arg(&program)
+            .output()
+            .expect("spawn clang");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let status = Command::new(&program).status().expect("run stream probe");
+        assert!(status.success(), "stream probe exited {status}");
     }
 
     #[test]
@@ -8117,7 +11224,7 @@ mod tests {
         assert!(main.contains("#include <stdio.h>"));
         assert!(main.contains("#include \"target.h\""));
         assert!(
-            main.contains("MZ_FILE * stream = (MZ_FILE *)(_bhf_file_buf_stream ? (Size ? fmemopen")
+            main.contains("MZ_FILE * stream = (MZ_FILE *)(_bhf_file_buf_stream ? bhf_fmemopen(")
         );
         assert!(main.contains("int R = parse_cfile(stream);"));
         assert!(main.contains("if (stream) fclose(stream); free(_bhf_file_buf_stream);"));
@@ -8812,6 +11919,100 @@ mod tests {
             main.contains("(struct foo *)"),
             "the opaque pointer must be cast from a best-effort buffer:\n{main}"
         );
+    }
+
+    /// A target declared by the harness itself (no header names it) whose
+    /// parameters or return type are `struct`/`union` tags no header declares:
+    /// the tags are declared at file scope before the target's prototype, or
+    /// the prototype would declare them in its own scope, as types distinct
+    /// from the ones the harness body declares. Newer compilers reject the
+    /// call (`incompatible pointer types passing 'struct widget_ctx *' to
+    /// parameter of type 'struct widget_ctx *'`).
+    #[test]
+    fn a_target_prototype_declares_the_tags_it_names_at_file_scope() {
+        let clang_ok = std::process::Command::new("clang")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !clang_ok {
+            eprintln!("skip: clang unavailable");
+            return;
+        }
+        let out = temp_dir("emit-force-tag-scope");
+        let mut args = direct_args("widget_feed", out.clone());
+        args.force = true;
+        args.params = vec![
+            CParameter {
+                name: "ctx".to_owned(),
+                c_type: "struct widget_ctx *".to_owned(),
+            },
+            CParameter {
+                name: "n".to_owned(),
+                c_type: "size_t".to_owned(),
+            },
+        ];
+        args.return_type = "union widget_word *".to_owned();
+        args.target.return_type = "union widget_word *".to_owned();
+        args.c_runtime_include = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../c_runtime")
+            .canonicalize()
+            .expect("c_runtime dir");
+        let result = generate_c_direct_harness(args).unwrap();
+        let main = fs::read_to_string(&result.main_c).unwrap();
+        let prototype = main
+            .find("extern union widget_word * widget_feed(")
+            .unwrap_or_else(|| panic!("no prototype in:\n{main}"));
+        for tag in ["struct widget_ctx;", "union widget_word;"] {
+            assert!(
+                main.find(tag).is_some_and(|at| at < prototype),
+                "{tag} is not declared before the prototype:\n{main}"
+            );
+        }
+        let check = std::process::Command::new("clang")
+            .args([
+                "-fsyntax-only",
+                "-Werror=incompatible-pointer-types",
+                "-Werror=visibility",
+                "-I",
+            ])
+            .arg(result.main_c.parent().unwrap())
+            .arg("-I")
+            .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../c_runtime"))
+            .arg(&result.main_c)
+            .output()
+            .expect("run clang");
+        assert!(
+            check.status.success(),
+            "{}",
+            String::from_utf8_lossy(&check.stderr)
+        );
+        fs::remove_dir_all(&out).ok();
+    }
+
+    /// Every `struct`/`union` tag a prototype's types name, qualifiers,
+    /// pointers and function-pointer parameters included, once each; an
+    /// `enum` (which C cannot declare without its enumerators) and a plain
+    /// typedef name are not tags.
+    #[test]
+    fn tag_declarations_name_each_struct_and_union_tag_once() {
+        assert_eq!(
+            tag_declarations([
+                "const struct widget_ctx *",
+                "int (*)(struct widget_ctx *, union widget_word)",
+                "struct  widget_ctx**",
+                "enum widget_mode",
+                "widget_t *",
+                "size_t",
+                "volatile union widget_word *",
+                "struct widget_list *const *",
+            ]),
+            vec![
+                "struct widget_ctx",
+                "union widget_word",
+                "struct widget_list",
+            ]
+        );
+        assert!(tag_declarations(["int", "void *"]).is_empty());
     }
 
     #[test]

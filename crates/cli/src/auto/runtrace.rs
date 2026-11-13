@@ -244,6 +244,21 @@ fn is_sanitizer_owned_path(path: &str) -> bool {
     trimmed.contains("/.cache/llvm-debuginfod")
         || trimmed.contains("/llvm-debuginfod/")
         || trimmed.contains("llvm-symbolizer")
+        || is_symbolizer_pseudo_path(trimmed)
+}
+
+/// A path a sanitizer's symbolizer opens while it writes a report, which is
+/// no file of the target's: the vDSO's link-map name (`linux-vdso.so.1`), or
+/// a separate debug file (`<object>.debug`, `<dir>/.debug/<object>`,
+/// `/usr/lib/debug/...`).
+fn is_symbolizer_pseudo_path(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    matches!(
+        name,
+        "linux-vdso.so.1" | "linux-gate.so.1" | "linux-vdso64.so.1"
+    ) || name.ends_with(".debug")
+        || path.split('/').any(|segment| segment == ".debug")
+        || path.starts_with("/usr/lib/debug/")
 }
 
 fn should_keep_event(event: &RuntraceEvent) -> bool {
@@ -281,6 +296,17 @@ pub fn oracle_hits_from_events_for_lane(
     events: &[RuntraceEvent],
     interpreted: bool,
 ) -> Vec<finding_rules::oracle_sdk::OracleHit> {
+    oracle_hits_for_harness(events, interpreted, "")
+}
+
+/// As [`oracle_hits_from_events_for_lane`], for a harness in `language`
+/// (`ada`, `c`, `cpp`, ...; empty when unknown): the resource-leak oracle is
+/// named for it, so a C or C++ harness's leak is not labelled an Ada one.
+pub fn oracle_hits_for_harness(
+    events: &[RuntraceEvent],
+    interpreted: bool,
+    language: &str,
+) -> Vec<finding_rules::oracle_sdk::OracleHit> {
     let mut hits = Vec::new();
     for event in events {
         let Some(runtime_event) = oracle_runtime_event(event) else {
@@ -292,7 +318,7 @@ pub fn oracle_hits_from_events_for_lane(
             }
         }
     }
-    for runtime_event in resource_leak_runtime_events(events, interpreted) {
+    for runtime_event in resource_leak_runtime_events(events, interpreted, language) {
         for oracle in finding_rules::oracle_registry::ORACLE_REGISTRY {
             if let Some(hit) = oracle.evaluate(&runtime_event) {
                 hits.push(hit);
@@ -856,12 +882,15 @@ struct OpenResource {
 pub fn is_bhf_owned_resource(path: &str) -> bool {
     // Distinctive work-dir subdirectory components: the per-iteration input
     // files (`fuzz_inputs/input-<pid>-<nonce>.bin`), the harness scratch cwd
-    // (`fuzz_scratch/`), the runtrace event logs (`fuzz_runs/`), and the
-    // injected fake-env tree used for missing env-derived paths.
+    // (`fuzz_scratch/`), the runtrace event logs (`fuzz_runs/`), the event log
+    // an Ada harness writes (`events/fuzz-events-<pid>-<nonce>.bin`, opened by
+    // its runtime and closed only by the process exit), and the injected
+    // fake-env tree used for missing env-derived paths.
     const OWNED_SUBSTRINGS: &[&str] = &[
         "/fuzz_inputs/",
         "/fuzz_scratch/",
         "/fuzz_runs/",
+        "/events/fuzz-events-",
         "/bhf/fake_env/",
     ];
     // `bhf_make_tempfile()` materializes fuzz bytes at `/tmp/bhf_inXXXXXX`;
@@ -879,7 +908,7 @@ pub fn is_bhf_owned_resource(path: &str) -> bool {
     if trimmed.is_empty() {
         return false;
     }
-    if trimmed == "/dev/null" {
+    if trimmed == "/dev/null" || is_symbolizer_pseudo_path(trimmed) {
         return true;
     }
     OWNED_SUBSTRINGS
@@ -892,6 +921,7 @@ pub fn is_bhf_owned_resource(path: &str) -> bool {
 fn resource_leak_runtime_events(
     events: &[RuntraceEvent],
     interpreted: bool,
+    language: &str,
 ) -> Vec<finding_rules::oracle_sdk::OracleRuntimeEvent> {
     let mut opened = BTreeMap::<i32, OpenResource>::new();
     let mut leaks = Vec::new();
@@ -922,7 +952,7 @@ fn resource_leak_runtime_events(
                         path: path.clone(),
                     },
                 ) {
-                    leaks.push(resource_leak_event(*fd, previous));
+                    leaks.push(resource_leak_event(*fd, previous, language));
                 }
             }
             RuntraceEvent::FileClosed { fd } => {
@@ -934,7 +964,7 @@ fn resource_leak_runtime_events(
     leaks.extend(
         opened
             .into_iter()
-            .map(|(fd, resource)| resource_leak_event(fd, resource)),
+            .map(|(fd, resource)| resource_leak_event(fd, resource, language)),
     );
     leaks
 }
@@ -942,10 +972,12 @@ fn resource_leak_runtime_events(
 fn resource_leak_event(
     fd: i32,
     resource: OpenResource,
+    language: &str,
 ) -> finding_rules::oracle_sdk::OracleRuntimeEvent {
     finding_rules::oracle_sdk::OracleRuntimeEvent::ResourceLeak {
         api: resource.api,
         resource: format!("fd:{fd} path:{}", resource.path),
+        language: language.to_owned(),
         evidence: vec![
             ("fd".to_owned(), fd.to_string()),
             ("path".to_owned(), resource.path),
@@ -988,7 +1020,7 @@ fn parse_line(line: &str) -> Option<RuntraceEvent> {
                 Some(RuntraceEvent::EnvVarAccess { api, name })
             }
         }
-        "open" | "openat" => {
+        "open" | "openat" | "fopen" | "fopen64" => {
             let path = obj.get("p").and_then(Value::as_str)?.to_owned();
             let result = obj.get("r").and_then(Value::as_i64).unwrap_or(-1);
             let taint_offset = parse_taint_offset(obj);
@@ -1606,6 +1638,28 @@ mod tests {
             &evs[0],
             RuntraceEvent::FileMissing { syscall, path, .. }
                 if syscall == "open" && path == "/etc/missing.conf"
+        ));
+    }
+
+    /// The shim's `fopen` / `fopen64` hooks log open and missing-file events
+    /// under their own names; they are file events like `open`'s.
+    #[test]
+    fn parses_fopen_events_as_file_events() {
+        let log = concat!(
+            "{\"e\":\"fopen\",\"p\":\"/etc/widget.cfg\",\"r\":-1,\"n\":2}\n",
+            "{\"e\":\"fopen64\",\"p\":\"/var/widget/state\",\"d\":5,\"r\":5}\n",
+        );
+        let evs = parse_str(log);
+        assert_eq!(evs.len(), 2, "{evs:?}");
+        assert!(matches!(
+            &evs[0],
+            RuntraceEvent::FileMissing { syscall, path, .. }
+                if syscall == "fopen" && path == "/etc/widget.cfg"
+        ));
+        assert!(matches!(
+            &evs[1],
+            RuntraceEvent::FileOpened { syscall, path, fd: 5, .. }
+                if syscall == "fopen64" && path == "/var/widget/state"
         ));
     }
 
@@ -2524,11 +2578,34 @@ mod tests {
         }]);
 
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].oracle_name, "resource-leak-ada");
+        // Not an Ada harness: the language-neutral oracle names the leak.
+        assert_eq!(hits[0].oracle_name, "resource-leak");
         assert_eq!(hits[0].rule_id, "BHF-306");
         assert_eq!(hits[0].api, "open");
         assert_eq!(hits[0].evidence_value("fd"), Some("7"));
         assert_eq!(hits[0].evidence_value("path"), Some("/tmp/acme.conf"));
+    }
+
+    /// The leak oracle is named for the harness the events came from: a C or
+    /// C++ harness's leak is `resource-leak` (exception
+    /// `ORACLE_RESOURCE_LEAK`), an Ada harness's keeps `resource-leak-ada`.
+    #[test]
+    fn a_leak_is_named_for_the_harness_language() {
+        let open = RuntraceEvent::FileOpened {
+            syscall: "fopen".to_owned(),
+            fd: 5,
+            path: "/srv/widget.cfg".to_owned(),
+            taint_offset: None,
+        };
+        let named = |language: &str| -> Vec<String> {
+            oracle_hits_for_harness(std::slice::from_ref(&open), false, language)
+                .into_iter()
+                .map(|hit| hit.oracle_name)
+                .collect()
+        };
+        assert_eq!(named("c"), ["resource-leak"]);
+        assert_eq!(named("cpp"), ["resource-leak"]);
+        assert_eq!(named("ada"), ["resource-leak-ada"]);
     }
 
     #[test]
@@ -2559,6 +2636,9 @@ mod tests {
             "/home/u/work/build/H-1/vp.shm",
             "/home/u/work/fuzz_scratch/cwd",
             "/home/u/work/fuzz_runs/fuzz-events-1-2.bin",
+            // The event log bhf hands an Ada harness (`<work>/events/`), which
+            // the harness's runtime opens and the process exit closes.
+            "/home/u/work/events/fuzz-events-4242-1700000000123456789.bin",
             "/dev/null",
         ] {
             assert!(
@@ -2569,6 +2649,7 @@ mod tests {
         // Genuine target / user paths — must remain leak-eligible.
         for target in [
             "/etc/hostname",
+            "/home/u/proj/events/calendar.bin",
             "/home/u/dogfood-scratch/mpack/state.db",
             "/var/lib/app/session.sock",
             "/tmp/acme.conf",
@@ -2579,6 +2660,36 @@ mod tests {
                 "{target} must NOT be treated as bhf-owned"
             );
         }
+    }
+
+    /// The vDSO's link-map name and separate debug files are what a
+    /// sanitizer's symbolizer opens while it writes a report: never a
+    /// dependency the target is missing, never a leak — even in a log a shim
+    /// without the pseudo-path rules wrote.
+    #[test]
+    fn symbolizer_pseudo_paths_are_neither_missing_deps_nor_leaks() {
+        let log = r#"{"e":"open","p":"linux-vdso.so.1","r":-1,"n":2}
+{"e":"open","p":"/lib/x86_64-linux-gnu/libc.so.6.debug","r":-1,"n":2}
+{"e":"open","p":"/lib/x86_64-linux-gnu/.debug/libc.so.6","r":-1,"n":2}
+{"e":"open","p":"/etc/widget.conf","r":-1,"n":2}"#;
+        let missing: Vec<String> = parse_str(log)
+            .into_iter()
+            .filter_map(|event| match event {
+                RuntraceEvent::FileMissing { path, .. } => Some(path),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(missing, vec!["/etc/widget.conf".to_owned()]);
+        for path in ["linux-vdso.so.1", "/usr/lib/debug/x.debug", "/a/.debug/b"] {
+            assert!(is_bhf_owned_resource(path), "{path}");
+        }
+        let hits = oracle_hits_from_events(&[RuntraceEvent::FileOpened {
+            syscall: "open".to_owned(),
+            fd: 5,
+            path: "linux-vdso.so.1".to_owned(),
+            taint_offset: None,
+        }]);
+        assert!(!hits.iter().any(|h| h.rule_id == "BHF-306"), "{hits:?}");
     }
 
     #[test]

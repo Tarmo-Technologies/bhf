@@ -64,7 +64,31 @@
         "classification": "unhandled",
         "harness_id": "H-C-parse",
         "dialect": "c11",
-        "oracle": null
+        "oracle": null,
+        "access": {
+          "direction": "read",
+          "size": 4,
+          "address_hint": null,
+          "region": { "kind": "heap", "size": 12, "offset": 12, "relation": "after", "distance": 0, "variable": null, "frame_offset": null },
+          "alloc_stack": [{ "function": "parse", "file": "src/parse.c", "line": 80 }],
+          "free_stack": [],
+          "parameter": { "name": "data", "offset": 12, "basis": "region_start" }
+        },
+        "input_to_state": [
+          {
+            "offset": 0, "len": 4, "operand_hex": "48445231", "compared_with_hex": "48445231", "cmp_kind": "memcmp",
+            "site": "0x1a2b", "site_location": { "file": "src/parse.c", "line": 31, "column": null, "function": "parse_header" },
+            "relation": "equal", "operands_equal": true
+          }
+        ],
+        "input_to_state_input": "min_testcase.bin",
+        "input_to_state_status": "recorded",
+        "input_to_state_reason": null,
+        "input_to_state_search": { "state": "done", "searched_bytes": 16, "input_len": 16 },
+        "arguments": [
+          { "name": "data", "type": "const uint8_t *", "value": null, "len": 12, "span": [0, 12], "preview_hex": "48445231", "role": "param", "after_call_value": null },
+          { "name": "flags", "type": "unsigned int", "value": "7", "len": null, "span": [12, 16], "preview_hex": null, "role": "param", "after_call_value": null }
+        ]
       },
       "static": null,
       "sca": null,

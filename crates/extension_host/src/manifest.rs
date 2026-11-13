@@ -153,9 +153,14 @@ impl ExtensionManifest {
     pub fn resolve_executable(&self, manifest_dir: &Path) -> Result<PathBuf> {
         let exe = Path::new(&self.executable);
         if !self.allow_external_paths {
-            if exe.is_absolute() {
+            // A rooted path leaves the manifest directory even when it is not
+            // absolute: on Windows `\bin\x` names the current drive's root and
+            // `C:x` the current directory of drive C.
+            let rooted =
+                exe.has_root() || exe.components().any(|c| matches!(c, Component::Prefix(_)));
+            if rooted {
                 return Err(ExtensionError::manifest(format!(
-                    "executable {:?} is an absolute path; set allow-external-paths = true to permit it",
+                    "executable {:?} is an absolute or rooted path; set allow-external-paths = true to permit it",
                     self.executable
                 )));
             }
@@ -335,6 +340,28 @@ executable = "/usr/bin/evil"
         assert!(manifest
             .resolve_executable(Path::new("/opt/ext-pkg"))
             .is_err());
+    }
+
+    /// A Windows path that is rooted or drive-qualified but not absolute
+    /// still leaves the manifest directory.
+    #[cfg(windows)]
+    #[test]
+    fn manifest_rejects_rooted_and_drive_relative_paths_without_opt_in() {
+        for executable in [
+            r"\Windows\System32\cmd.exe",
+            "C:evil.exe",
+            r"\\server\share\x.exe",
+        ] {
+            let text =
+                format!("schema = \"bhf.extension-manifest.v1\"\nexecutable = '{executable}'\n");
+            let manifest = ExtensionManifest::from_toml_str(&text).expect("parse");
+            assert!(
+                manifest
+                    .resolve_executable(Path::new(r"C:\ext-pkg"))
+                    .is_err(),
+                "{executable}"
+            );
+        }
     }
 
     #[test]

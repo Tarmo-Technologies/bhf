@@ -1027,11 +1027,21 @@ pub fn synth_idl_placeholder_header(virtual_path: &str, decls: &[String]) -> Str
 /// family is included because the government C++ targets that motivate this
 /// (old CORBA glue, zlib `contrib/iostream` wrappers) predate `<sstream>`.
 pub fn cpp_stdlib_header(type_name: &str) -> Option<&'static str> {
+    let qualified = type_name.starts_with("std::");
     let bare = type_name.strip_prefix("std::").unwrap_or(type_name);
     Some(match bare {
         "ostrstream" | "istrstream" | "strstream" | "strstreambuf" => "strstream",
         "streampos" | "streamoff" | "streamsize" | "ios" | "ios_base" => "ios",
         "ostream" | "istream" | "iostream" | "wostream" | "wistream" | "wiostream" => "iostream",
+        // The standard stream objects, which a pre-standard source often
+        // reached through a transitive include.
+        "cin" | "cout" | "cerr" | "clog" | "wcin" | "wcout" | "wcerr" | "wclog" | "endl"
+        | "streambuf" | "wstreambuf" => "iostream",
+        // A bare `ends`/`flush`/`ws` is as likely a project type as a
+        // manipulator, so only the `std::` spelling maps.
+        "ends" | "flush" | "ws" if qualified => "iostream",
+        "wifstream" | "wofstream" | "wfstream" | "wfilebuf" => "fstream",
+        "wistringstream" | "wostringstream" | "wstringstream" | "wstringbuf" => "sstream",
         "ofstream" | "ifstream" | "fstream" | "filebuf" => "fstream",
         "ostringstream" | "istringstream" | "stringstream" | "stringbuf" => "sstream",
         "string" | "wstring" => "string",
@@ -2956,6 +2966,32 @@ mod aux_tests {
         assert_eq!(cpp_stdlib_header("ofstream"), Some("fstream"));
         assert_eq!(cpp_stdlib_header("Widget"), None);
         assert_eq!(cpp_stdlib_header("mz_ulong"), None);
+    }
+
+    #[test]
+    fn cpp_stdlib_include_covers_std_stream_objects() {
+        // A source that writes `cerr << ...` under `using namespace std;` but never
+        // includes <iostream> gets the header plus a using-declaration, which is
+        // harmless next to the source's own `using namespace std;`.
+        let t = synth_cpp_stdlib_include("cerr").expect("stream object");
+        assert!(t.contains("#include <iostream>"), "{t}");
+        assert!(t.contains("using std::cerr;"), "{t}");
+        let t = synth_cpp_stdlib_include("std::endl").expect("manipulator");
+        assert!(t.contains("#include <iostream>"), "{t}");
+        assert!(!t.contains("using"), "{t}");
+        assert_eq!(cpp_stdlib_header("wifstream"), Some("fstream"));
+    }
+
+    #[test]
+    fn cpp_stdlib_include_maps_bare_manipulator_names_only_when_qualified() {
+        // A bare `ws`, `flush` or `ends` is as likely a project type or function
+        // as a manipulator; only the `std::` spelling names the standard one.
+        for bare in ["ws", "flush", "ends"] {
+            assert_eq!(synth_cpp_stdlib_include(bare), None, "{bare}");
+            let qualified = format!("std::{bare}");
+            let t = synth_cpp_stdlib_include(&qualified).expect("qualified manipulator");
+            assert!(t.contains("#include <iostream>"), "{t}");
+        }
     }
 
     #[test]

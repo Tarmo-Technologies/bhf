@@ -63,7 +63,129 @@ struct ProbeInstrumentation {
 }
 
 impl ProbeInstrumentation {
+    /// The instrumentation the run's harnesses are built with: the compilers
+    /// the toolchain (or CC/CXX) chose, with their family's flag spellings.
+    ///
+    /// The probe runs the project's build for this host, so a toolchain that
+    /// builds for another target (a cross sweep) leaves it with bhf's clang;
+    /// a cross sweep rebuilds the archives for its target afterwards
+    /// ([`rebuild_probe_archives`]).
     fn for_selection(selection: &multicore_fuzz::SanitizerSelection) -> Self {
+        let mut effective = crate::toolchain::effective_compilers();
+        if effective.explicit && !crate::toolchain::compiler_builds_for_host(&effective.cc) {
+            effective = crate::toolchain::EffectiveCompilers {
+                cc: "clang".to_owned(),
+                cxx: "clang++".to_owned(),
+                explicit: false,
+            };
+        }
+        Self::for_selection_with(
+            selection,
+            &effective,
+            crate::toolchain::compiler_family,
+            crate::auto::attempt::compiler_links_with_flags,
+        )
+    }
+
+    /// Whether the coverage flags are GCC's guard-less `trace-pc`, whose hooks
+    /// no compiler runtime defines.
+    fn uses_gcc_coverage(&self) -> bool {
+        let gcc = harness_gen::compiler_family::CompilerFamily::Gcc.coverage_flag();
+        self.c_flags
+            .iter()
+            .chain(&self.cxx_flags)
+            .any(|flag| flag == gcc)
+    }
+
+    /// [`Self::for_selection`] with the compilers and probes injected. A GCC
+    /// toolchain's probe build uses that GCC with GCC-spelled sanitizer and
+    /// `trace-pc` coverage flags, so its archives link into the GCC-built
+    /// harnesses; when the chosen compilers cannot build an explicit sanitizer
+    /// set, the harnesses fall back to clang, and so does the probe.
+    fn for_selection_with(
+        selection: &multicore_fuzz::SanitizerSelection,
+        effective: &crate::toolchain::EffectiveCompilers,
+        family_of: impl Fn(&str, bool) -> Option<harness_gen::compiler_family::CompilerFamily>,
+        links_with: impl Fn(&str, &[String]) -> bool,
+    ) -> Self {
+        use harness_gen::compiler_family::CompilerFamily;
+        use multicore_fuzz::{Sanitizer, SanitizerSelection};
+        let mut instrumentation = Self::clang_for_selection(selection);
+        if !effective.explicit {
+            return instrumentation;
+        }
+        let sanitize_flag = instrumentation
+            .c_flags
+            .iter()
+            .find(|flag| flag.starts_with("-fsanitize=") && !flag.starts_with("-fsanitize-"))
+            .cloned();
+        if let (SanitizerSelection::Set(_), Some(flag)) = (selection, &sanitize_flag) {
+            if !links_with(&effective.cc, std::slice::from_ref(flag)) {
+                return instrumentation;
+            }
+        }
+        let family = family_of(&effective.cc, false).unwrap_or(CompilerFamily::Clang);
+        let cxx_family = family_of(&effective.cxx, true).unwrap_or(family);
+        let has_ubsan = match selection {
+            SanitizerSelection::Default => true,
+            SanitizerSelection::None => false,
+            SanitizerSelection::Set(set) => set.contains(&Sanitizer::Ubsan),
+        };
+        let flags_for = |family: CompilerFamily, cpp: bool| {
+            let mut flags: Vec<String> = [
+                "-O1",
+                "-g",
+                "-ffunction-sections",
+                "-fdata-sections",
+                "-Wno-error",
+            ]
+            .map(str::to_owned)
+            .to_vec();
+            if let Some(flag) = &sanitize_flag {
+                flags.push(flag.clone());
+                if has_ubsan {
+                    flags.push(family.ubsan_subtraction().to_owned());
+                }
+                // GCC defines _FORTIFY_SOURCE whenever it optimizes (Ubuntu),
+                // and a fortified call's own abort would pre-empt the
+                // sanitizer, as in the harness Makefile's sanitized lanes.
+                // A project's plain `-D_FORTIFY_SOURCE=N` loses to the
+                // override's `-Wp,` words wherever it sits, and so does a
+                // `-Wp,-D_FORTIFY_SOURCE=N` these flags follow (a replayed
+                // compile command).
+                if family == CompilerFamily::Gcc {
+                    flags.extend(
+                        harness_gen::compiler_family::SANITIZED_NO_FORTIFY
+                            .iter()
+                            .map(|flag| (*flag).to_owned()),
+                    );
+                }
+            }
+            flags.push(family.coverage_flag().to_owned());
+            if cpp && family == CompilerFamily::Clang {
+                flags.push("-Wno-reserved-user-defined-literal".to_owned());
+            }
+            flags
+        };
+        instrumentation.cc = effective.cc.clone();
+        instrumentation.cxx = effective.cxx.clone();
+        instrumentation.c_flags = flags_for(family, false);
+        let mut cxx_flags = flags_for(cxx_family, true);
+        cxx_flags.extend(crate::build::detect_cpp_stdlib_include_flags_for(
+            &effective.cxx,
+            &cxx_flags,
+        ));
+        instrumentation.cxx_flags = cxx_flags;
+        if family == CompilerFamily::Gcc {
+            // The clang-only libstdc++ search-path repair does not apply.
+            instrumentation.linker_flags.clear();
+        }
+        instrumentation
+    }
+
+    /// bhf's default probe instrumentation: clang with its sanitizer and
+    /// `trace-pc-guard` coverage spellings.
+    fn clang_for_selection(selection: &multicore_fuzz::SanitizerSelection) -> Self {
         use multicore_fuzz::{Sanitizer, SanitizerSelection};
 
         let sanitizer_name = |sanitizer: Sanitizer| match sanitizer {
@@ -254,6 +376,80 @@ pub enum BuildSystem {
     None,
 }
 
+/// A Make build bhf can run: its Makefile, or a generated `configure`.
+const MAKE_MARKERS: &[&str] = &["Makefile", "makefile", "GNUmakefile", "configure"];
+
+/// A Bazel workspace root.
+const BAZEL_MARKERS: &[&str] = &[
+    "WORKSPACE",
+    "WORKSPACE.bazel",
+    "MODULE.bazel",
+    "BUILD.bazel",
+];
+
+/// Every file that says a directory has a build description of its own besides
+/// a Visual Studio solution: the markers [`detect_build_system`] follows, and
+/// the inputs portable builds generate theirs from (autotools before
+/// `autoreconf`, premake, xmake, waf, Boost.Build).
+const OTHER_BUILD_MARKERS: &[&[&str]] = &[
+    &["CMakeLists.txt", "meson.build"],
+    MAKE_MARKERS,
+    &["build.ninja", "SConstruct"],
+    BAZEL_MARKERS,
+    &[
+        "configure.ac",
+        "configure.in",
+        "Makefile.am",
+        "Makefile.in",
+        "autogen.sh",
+        "premake5.lua",
+        "premake4.lua",
+        "xmake.lua",
+        "wscript",
+        "Jamroot",
+    ],
+];
+
+/// The first build description in `tree` other than its Visual Studio files
+/// (`msbuild_files`, the solutions and projects found): a marker at the tree
+/// root, or in any directory between the root and one of those files (a
+/// wrapper directory holding `proj/configure.ac` and `proj/msvc/proj.sln`).
+/// Returned relative to `tree`.
+pub(crate) fn other_build_description(tree: &Path, msbuild_files: &[PathBuf]) -> Option<PathBuf> {
+    let mut dirs: Vec<PathBuf> = vec![tree.to_path_buf()];
+    for file in msbuild_files {
+        let mut cursor = file.parent();
+        while let Some(dir) = cursor {
+            if !dir.starts_with(tree) || dir == tree {
+                break;
+            }
+            if !dirs.iter().any(|known| known == dir) {
+                dirs.push(dir.to_path_buf());
+            }
+            cursor = dir.parent();
+        }
+    }
+    dirs.iter().find_map(|dir| {
+        OTHER_BUILD_MARKERS
+            .iter()
+            .flat_map(|group| group.iter())
+            .map(|marker| dir.join(marker))
+            .find(|path| path.is_file())
+            .map(|path| {
+                path.strip_prefix(tree)
+                    .map(Path::to_path_buf)
+                    .unwrap_or(path)
+            })
+    })
+}
+
+/// Every Visual Studio solution and project under `tree`.
+pub(crate) fn msbuild_files(tree: &Path) -> Vec<PathBuf> {
+    let mut files = crate::auto::msbuild_import::find_solutions(tree);
+    files.extend(crate::auto::msbuild_import::find_projects(tree));
+    files
+}
+
 /// Detect the project's build system from the marker files at the tree root.
 /// CMake takes precedence (it emits a DB natively and runs codegen at configure
 /// time); then a Visual Studio solution/project; then Make.
@@ -269,10 +465,7 @@ pub fn detect_build_system(tree: &Path) -> BuildSystem {
     if find_msbuild_project(tree).is_some() {
         return BuildSystem::MSBuild;
     }
-    if ["Makefile", "makefile", "GNUmakefile", "configure"]
-        .iter()
-        .any(|name| tree.join(name).is_file())
-    {
+    if MAKE_MARKERS.iter().any(|name| tree.join(name).is_file()) {
         return BuildSystem::Make;
     }
     // Standalone Ninja: a `build.ninja` at the tree root with no higher-level
@@ -281,15 +474,7 @@ pub fn detect_build_system(tree: &Path) -> BuildSystem {
         return BuildSystem::Ninja;
     }
     // Bazel / SCons have no native compile DB; we run them under interception.
-    if [
-        "WORKSPACE",
-        "WORKSPACE.bazel",
-        "MODULE.bazel",
-        "BUILD.bazel",
-    ]
-    .iter()
-    .any(|name| tree.join(name).is_file())
-    {
+    if BAZEL_MARKERS.iter().any(|name| tree.join(name).is_file()) {
         return BuildSystem::Bazel;
     }
     if tree.join("SConstruct").is_file() {
@@ -360,254 +545,352 @@ fn interception_build_command(bs: BuildSystem) -> Option<&'static str> {
 
 /// Find a Visual Studio solution (preferred) or project under `tree`, scanning a
 /// few directory levels (VS solutions commonly live in `projects/vstudio/`,
-/// `msvc/`, `build/`, etc.). Returns the `.sln` if any, else the first `.vcxproj`.
+/// `msvc/`, `build/`, etc.). Solutions are chosen shallowest first, then by
+/// path, so the pick among several is deterministic.
 fn find_msbuild_project(tree: &Path) -> Option<PathBuf> {
-    let mut vcxproj: Option<PathBuf> = None;
-    let mut stack = vec![(tree.to_path_buf(), 0u32)];
-    while let Some((dir, depth)) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
+    crate::auto::msbuild_import::find_solutions(tree)
+        .into_iter()
+        .next()
+        .or_else(|| {
+            crate::auto::msbuild_import::find_projects(tree)
+                .into_iter()
+                .next()
+        })
+}
+
+/// Whether `tree` holds a Visual Studio solution or project.
+pub(crate) fn has_msbuild_project(tree: &Path) -> bool {
+    find_msbuild_project(tree).is_some()
+}
+
+/// A compile database already present in `tree`: at its root, in a
+/// conventional build directory, or where `--probe-build` writes one.
+pub(crate) fn existing_compile_database(tree: &Path) -> Option<PathBuf> {
+    [
+        "",
+        "build",
+        "builddir",
+        "out",
+        "cmake-build-debug",
+        "cmake-build-release",
+        PROBE_DIR,
+    ]
+    .iter()
+    .map(|dir| tree.join(dir).join("compile_commands.json"))
+    .find(|path| path.is_file())
+}
+
+/// MSBuild tier of `--probe-build`: the project import, allowed to evaluate the
+/// projects with MSBuild itself when it is installed (the probe's consent covers
+/// MSBuild running the projects' property functions).
+fn probe_msbuild(tree: &Path, db: &Path) -> Option<PathBuf> {
+    let request = msbuild_import_request_from_env();
+    import_msbuild_projects(tree, db, &request, true).map(|(path, _)| path)
+}
+
+/// The solution and configuration chosen by `--msbuild-solution` /
+/// `--msbuild-config`, which `auto` publishes for the probe step.
+fn msbuild_import_request_from_env() -> crate::auto::msbuild_import::ImportRequest {
+    crate::auto::msbuild_import::ImportRequest {
+        solution: std::env::var_os("BHF_MSBUILD_SOLUTION").map(PathBuf::from),
+        configuration: std::env::var("BHF_MSBUILD_CONFIG").ok(),
+    }
+}
+
+/// Import the Visual Studio solution in `tree` into a compile database at `db`
+/// and report what was read. The static tier reads the project files and runs
+/// nothing; with `allow_msbuild_evaluation` and MSBuild on PATH, each project is
+/// evaluated by MSBuild instead (falling back to the static reading per
+/// project). On Windows each row also names the import libraries its project
+/// links (see [`harness_link_libraries`]). Returns the database path and the
+/// import, or `None` when there is nothing to import.
+pub(crate) fn import_msbuild_projects(
+    tree: &Path,
+    db: &Path,
+    request: &crate::auto::msbuild_import::ImportRequest,
+    allow_msbuild_evaluation: bool,
+) -> Option<(PathBuf, crate::auto::msbuild_import::SolutionImport)> {
+    let lib_dirs: Option<Vec<PathBuf>> = cfg!(windows).then(|| {
+        std::env::var_os("LIB")
+            .map(|value| std::env::split_paths(&value).collect())
+            .unwrap_or_default()
+    });
+    import_msbuild_projects_with(
+        tree,
+        db,
+        request,
+        allow_msbuild_evaluation,
+        lib_dirs.as_deref(),
+    )
+}
+
+/// C runtime and sanitizer runtime libraries. The harness build picks its own
+/// runtime (the sanitizers need the DLL CRT), so a project's choice is not
+/// linked.
+fn is_runtime_library(name: &str) -> bool {
+    let stem = name.to_ascii_lowercase();
+    let stem = stem.trim_end_matches(".lib");
+    stem.starts_with("clang_rt.")
+        || matches!(
+            stem,
+            "libcmt"
+                | "libcmtd"
+                | "msvcrt"
+                | "msvcrtd"
+                | "libucrt"
+                | "libucrtd"
+                | "ucrt"
+                | "ucrtd"
+                | "libvcruntime"
+                | "libvcruntimed"
+                | "vcruntime"
+                | "vcruntimed"
+                | "libcpmt"
+                | "libcpmtd"
+                | "libcpmt1"
+                | "libcpmtd1"
+                | "msvcprt"
+                | "msvcprtd"
+                | "libconcrt"
+                | "libconcrtd"
+                | "concrt"
+                | "concrtd"
+                | "msvcmrt"
+                | "msvcurt"
+                | "libsancov"
+        )
+}
+
+/// Whether `name` is a plain library file name (`ws2_32.lib`), safe to place
+/// on a recipe line.
+pub(crate) fn is_plain_library_name(name: &str) -> bool {
+    name.len() > 4
+        && name.to_ascii_lowercase().ends_with(".lib")
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+'))
+}
+
+/// The part of a project's `AdditionalDependencies` its own harnesses link:
+/// the Windows import libraries found in a `LIB` directory (`ws2_32.lib`).
+/// Everything else is returned with the reason it is left out: a library not
+/// in `LIB` (an output of the solution's own build, which may not exist yet and
+/// whose sources the harness compiles, or a third-party library), a resolved
+/// path, a C runtime library, or a name that is not a plain file name.
+pub(crate) fn harness_link_libraries(
+    inputs: &[String],
+    lib_dirs: &[PathBuf],
+) -> (Vec<String>, Vec<(String, &'static str)>) {
+    let mut kept = Vec::new();
+    let mut skipped = Vec::new();
+    for input in inputs {
+        let reason = if input.contains('/') || input.contains('\\') {
+            Some("a path: the solution's own output or a prebuilt library")
+        } else if !is_plain_library_name(input) {
+            Some("not a plain library name")
+        } else if is_runtime_library(input) {
+            Some("a C runtime library: the harness links its own")
+        } else if !lib_dirs.iter().any(|dir| dir.join(input).is_file()) {
+            Some("not in LIB: built by the solution, or not part of the toolset")
+        } else {
+            None
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                // Skip output/VCS dirs; bound the depth so a huge tree is cheap.
-                if depth < 4 && !name.starts_with('.') && name != "target" && name != "node_modules"
-                {
-                    stack.push((path, depth + 1));
+        match reason {
+            Some(reason) => skipped.push((input.clone(), reason)),
+            None => kept.push(input.clone()),
+        }
+    }
+    (kept, skipped)
+}
+
+/// A compile-database row of the Visual Studio import: the compile command, and
+/// the import libraries the row's project links (`bhf_link_libraries`, honoured
+/// only in this database).
+#[derive(Debug, Clone, Serialize)]
+struct ImportedEntry {
+    #[serde(flatten)]
+    entry: ProbeEntry,
+    #[serde(rename = "bhf_link_libraries", skip_serializing_if = "Vec::is_empty")]
+    link_libraries: Vec<String>,
+}
+
+/// [`import_msbuild_projects`] with the `LIB` directories to look for import
+/// libraries in; `None` links none (not a Windows link).
+pub(crate) fn import_msbuild_projects_with(
+    tree: &Path,
+    db: &Path,
+    request: &crate::auto::msbuild_import::ImportRequest,
+    allow_msbuild_evaluation: bool,
+    lib_dirs: Option<&[PathBuf]>,
+) -> Option<(PathBuf, crate::auto::msbuild_import::SolutionImport)> {
+    use crate::auto::msbuild_import as import;
+    let mut solution = import::import_tree(tree, request)?;
+    let display = |path: &Path| {
+        path.strip_prefix(tree)
+            .unwrap_or(path)
+            .display()
+            .to_string()
+    };
+    if solution.candidates.len() > 1 {
+        bhfeprintln!(
+            "bhf auto: {} Visual Studio solutions found; importing {} (choose another with \
+             --msbuild-solution)",
+            solution.candidates.len(),
+            solution
+                .solution
+                .as_deref()
+                .map(display)
+                .unwrap_or_default()
+        );
+    }
+    if allow_msbuild_evaluation {
+        if let Some(msbuild) = import::msbuild_program() {
+            let mut evaluated = 0;
+            for project in &mut solution.projects {
+                if let Some(sources) = import::evaluate_with_msbuild(
+                    &msbuild,
+                    &project.project,
+                    solution.solution.as_deref(),
+                    &project.configuration,
+                    &project.platform,
+                ) {
+                    project.sources = sources;
+                    evaluated += 1;
                 }
-            } else {
-                match path.extension().and_then(|e| e.to_str()) {
-                    Some("sln") => return Some(path),
-                    Some("vcxproj") if vcxproj.is_none() => vcxproj = Some(path),
-                    _ => {}
-                }
+            }
+            if evaluated > 0 {
+                solution.tier = "msbuild";
             }
         }
     }
-    vcxproj
-}
-
-/// MSBuild tier: recover a Visual Studio project's compile wiring by PARSING its
-/// `.vcxproj` files (include dirs, preprocessor defines, source files) into a
-/// `compile_commands.json`. Unlike the CMake/Make tiers this does NOT execute the
-/// build — it reads the project XML — so it needs no `msbuild` on PATH and runs
-/// the same on any host. bhf then builds each harness with the project's real
-/// `-I`/`-D` flags + clang coverage. (Headers produced by a custom build step are
-/// not materialized — a follow-up; most C/C++ projects declare their wiring.)
-fn probe_msbuild(tree: &Path, db: &Path) -> Option<PathBuf> {
-    let projects = msbuild_project_files(tree);
     let mut entries = Vec::new();
-    for proj in &projects {
-        entries.extend(vcxproj_entries(proj));
+    for project in &solution.projects {
+        const SHOWN_NOTES: usize = 3;
+        for note in project.notes.iter().take(SHOWN_NOTES) {
+            bhfeprintln!("bhf auto: {}: {note}", display(&project.project));
+        }
+        if project.notes.len() > SHOWN_NOTES {
+            bhfeprintln!(
+                "bhf auto: {}: {} more project-file note(s) like these",
+                display(&project.project),
+                project.notes.len() - SHOWN_NOTES
+            );
+        }
+        let link_libraries = match lib_dirs {
+            Some(lib_dirs) => {
+                let (kept, skipped) = harness_link_libraries(&project.link_inputs, lib_dirs);
+                if !kept.is_empty() {
+                    bhfeprintln!(
+                        "bhf auto: {}: its harnesses link {}",
+                        display(&project.project),
+                        kept.join(", ")
+                    );
+                }
+                let mut reasons: Vec<&str> = Vec::new();
+                for (_, reason) in &skipped {
+                    if !reasons.contains(reason) {
+                        reasons.push(reason);
+                    }
+                }
+                for reason in reasons {
+                    let names: Vec<&str> = skipped
+                        .iter()
+                        .filter(|(_, why)| *why == reason)
+                        .map(|(name, _)| name.as_str())
+                        .collect();
+                    bhfeprintln!(
+                        "bhf auto: {}: not linking {} ({reason}; AUTO_EXTRA_LDFLAGS adds a \
+                         library a harness needs)",
+                        display(&project.project),
+                        names.join(", ")
+                    );
+                }
+                kept
+            }
+            None => Vec::new(),
+        };
+        for source in &project.sources {
+            if !source.file.is_file() {
+                continue;
+            }
+            entries.push(ImportedEntry {
+                entry: probe_entry_for_imported_source(source),
+                link_libraries: link_libraries.clone(),
+            });
+        }
+        let unresolved: Vec<&str> = project
+            .unresolved
+            .iter()
+            .map(String::as_str)
+            .filter(|name| name.starts_with('$'))
+            .collect();
+        if !unresolved.is_empty() {
+            bhfeprintln!(
+                "bhf auto: {}: left out include dirs and defines built on MSBuild properties \
+                 with no value here: {} (MSBuild reads environment variables as properties; \
+                 set them, or add the paths with --extra-include)",
+                display(&project.project),
+                unresolved.join(", ")
+            );
+        }
     }
     if entries.is_empty() {
         bhfeprintln!(
-            "bhf auto: MSBuild probe found a VS solution/project under {} but no \
-             ClCompile sources to map",
+            "bhf auto: found a Visual Studio solution/project under {} but no ClCompile \
+             sources to map",
             tree.display()
         );
         return None;
     }
     let json = serde_json::to_vec_pretty(&entries).ok()?;
+    if let Some(parent) = db.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
     std::fs::write(db, json).ok()?;
-    Some(db.to_path_buf())
+    bhfeprintln!(
+        "bhf auto: read {} ClCompile entr{} from {} (config {}|{}, {} evaluation)",
+        entries.len(),
+        if entries.len() == 1 { "y" } else { "ies" },
+        solution
+            .solution
+            .as_deref()
+            .map(display)
+            .unwrap_or_else(|| format!("{} project file(s)", solution.projects.len())),
+        solution.configuration,
+        solution.platform,
+        solution.tier
+    );
+    Some((db.to_path_buf(), solution))
 }
 
-/// The `.vcxproj` files of the solution: parsed from a `.sln`'s `Project(...)`
-/// lines when a solution is present, else every `.vcxproj` found under the tree.
-fn msbuild_project_files(tree: &Path) -> Vec<PathBuf> {
-    match find_msbuild_project(tree) {
-        Some(p) if p.extension().and_then(|e| e.to_str()) == Some("sln") => {
-            let projects = parse_sln_projects(&p);
-            if projects.is_empty() {
-                collect_vcxproj(tree)
-            } else {
-                projects
-            }
-        }
-        _ => collect_vcxproj(tree),
+/// A compile-database row for one imported source, in the GCC spelling the
+/// compile-database reader and the generated Makefile use.
+fn probe_entry_for_imported_source(
+    source: &crate::auto::msbuild_import::ImportedSource,
+) -> ProbeEntry {
+    // The language comes from the file extension, as in the harness build; a
+    // `-x` here would also reach the link line's objects.
+    let mut arguments = vec!["clang".to_owned()];
+    for dir in &source.include_dirs {
+        arguments.push(format!("-I{}", harness_gen::build_safety::make_path(dir)));
     }
-}
-
-/// Resolve the `.vcxproj` paths referenced by a `.sln`. Solution lines read:
-/// `Project("{GUID}") = "Name", "rel\path\Name.vcxproj", "{GUID}"` — the path is
-/// the second quoted field, relative to the solution dir, with `\` separators.
-fn parse_sln_projects(sln: &Path) -> Vec<PathBuf> {
-    let Ok(text) = std::fs::read_to_string(sln) else {
-        return Vec::new();
-    };
-    let sln_dir = sln.parent().unwrap_or_else(|| Path::new("."));
-    let mut out = Vec::new();
-    for line in text.lines() {
-        if !line.trim_start().starts_with("Project(") {
-            continue;
-        }
-        let quoted: Vec<&str> = line.split('"').collect();
-        if let Some(rel) = quoted.get(3) {
-            if rel.to_ascii_lowercase().ends_with(".vcxproj") {
-                let rel_norm = rel.replace('\\', std::path::MAIN_SEPARATOR_STR);
-                let abs = resolve_against(sln_dir, &rel_norm);
-                if abs.is_file() {
-                    out.push(abs);
-                }
-            }
-        }
+    arguments.extend(source.defines.iter().map(|define| format!("-D{define}")));
+    arguments.extend(source.undefines.iter().map(|name| format!("-U{name}")));
+    for header in &source.forced_includes {
+        arguments.push("-include".to_owned());
+        arguments.push(harness_gen::build_safety::make_path(header));
     }
-    out
-}
-
-/// Every `.vcxproj` under `tree` (bounded scan), for when there is no `.sln` or
-/// it lists no resolvable projects.
-fn collect_vcxproj(tree: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut stack = vec![(tree.to_path_buf(), 0u32)];
-    while let Some((dir, depth)) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if depth < 4 {
-                    stack.push((path, depth + 1));
-                }
-            } else if path.extension().and_then(|e| e.to_str()) == Some("vcxproj") {
-                out.push(path);
-            }
-        }
+    if let Some(standard) = &source.standard {
+        arguments.push(format!("-std={standard}"));
     }
-    out
-}
-
-/// Parse one `.vcxproj` into compile entries — one per `ClCompile` source, each
-/// carrying the project's include dirs (`-I`) and preprocessor defines (`-D`).
-/// `$(ProjectDir)`/`$(SolutionDir)`/`$(MSBuildProjectDirectory)` resolve to the
-/// project directory; inherited `%(...)` placeholders and empty tokens are
-/// dropped; relative paths resolve against the project dir.
-fn vcxproj_entries(vcxproj: &Path) -> Vec<ProbeEntry> {
-    let Ok(text) = std::fs::read_to_string(vcxproj) else {
-        return Vec::new();
-    };
-    let proj_dir = vcxproj.parent().unwrap_or_else(|| Path::new("."));
-    let proj_dir_rendered = harness_gen::build_safety::make_path(proj_dir);
-    let proj_dir_slash = format!("{proj_dir_rendered}/");
-    let resolve_macros = |raw: &str| -> String {
-        raw.replace("$(ProjectDir)", &proj_dir_slash)
-            .replace("$(MSBuildProjectDirectory)", &proj_dir_rendered)
-            .replace("$(SolutionDir)", &proj_dir_slash)
-    };
-    // Union declared include dirs + defines across configurations because this
-    // static probe cannot evaluate arbitrary MSBuild `Condition=` expressions.
-    // Unknown property-dependent tokens are discarded below; ordinary conflicts
-    // remain visible to the normal compile/repair diagnostics.
-    let mut include_dirs: Vec<String> = Vec::new();
-    for raw in tag_values(&text, "AdditionalIncludeDirectories") {
-        for piece in raw.split(';') {
-            let piece = piece.trim();
-            if piece.is_empty() || piece.starts_with("%(") {
-                continue;
-            }
-            let piece = resolve_macros(piece);
-            // Configuration-dependent MSBuild properties such as `$(IntDir)`
-            // and `$(OutDir)` have no value in this static, cross-platform
-            // probe. Passing them through creates a bogus absolute path and,
-            // correctly, trips Makefile injection protection on `$`. Drop only
-            // the unresolved token; the project/source include roots remain.
-            if contains_unresolved_msbuild_placeholder(&piece) {
-                continue;
-            }
-            let abs = resolve_against(proj_dir, &piece);
-            let s = harness_gen::build_safety::make_path(&abs);
-            if !include_dirs.contains(&s) {
-                include_dirs.push(s);
-            }
-        }
+    arguments.extend(source.extra_flags.iter().cloned());
+    arguments.push("-c".to_owned());
+    arguments.push(source.file.display().to_string());
+    ProbeEntry {
+        directory: source.directory.clone(),
+        file: source.file.clone(),
+        arguments,
     }
-    // The project dir itself is always an include root (for `#include "sibling.h"`).
-    let proj_dir_s = proj_dir_rendered;
-    if !include_dirs.contains(&proj_dir_s) {
-        include_dirs.push(proj_dir_s);
-    }
-    let mut defines: Vec<String> = Vec::new();
-    for raw in tag_values(&text, "PreprocessorDefinitions") {
-        for piece in raw.split(';') {
-            let piece = piece.trim();
-            if piece.is_empty() || piece.starts_with("%(") {
-                continue;
-            }
-            if contains_unresolved_msbuild_placeholder(piece) {
-                continue;
-            }
-            if !defines.contains(&piece.to_owned()) {
-                defines.push(piece.to_owned());
-            }
-        }
-    }
-    let mut base_args = vec!["clang".to_owned()];
-    base_args.extend(include_dirs.iter().map(|d| format!("-I{d}")));
-    base_args.extend(defines.iter().map(|d| format!("-D{d}")));
-    let mut entries = Vec::new();
-    for src in clcompile_sources(&text) {
-        let rel = src.replace('\\', std::path::MAIN_SEPARATOR_STR);
-        let file = resolve_against(proj_dir, &rel);
-        if !file.is_file() {
-            continue;
-        }
-        let mut arguments = base_args.clone();
-        arguments.push("-c".to_owned());
-        arguments.push(file.display().to_string());
-        entries.push(ProbeEntry {
-            directory: proj_dir.to_path_buf(),
-            file,
-            arguments,
-        });
-    }
-    entries
-}
-
-fn contains_unresolved_msbuild_placeholder(value: &str) -> bool {
-    value.contains("$(") || value.contains("%(")
-}
-
-/// Inner texts of every `<TAG ...>...</TAG>` occurrence (tolerates attributes on
-/// the open tag, e.g. `<TAG Condition="...">`).
-fn tag_values(xml: &str, tag: &str) -> Vec<String> {
-    let open = format!("<{tag}");
-    let close = format!("</{tag}>");
-    let mut out = Vec::new();
-    let mut rest = xml;
-    while let Some(o) = rest.find(&open) {
-        let after_open = &rest[o + open.len()..];
-        let Some(gt) = after_open.find('>') else {
-            break;
-        };
-        let body = &after_open[gt + 1..];
-        let Some(c) = body.find(&close) else {
-            break;
-        };
-        out.push(body[..c].trim().to_owned());
-        rest = &body[c + close.len()..];
-    }
-    out
-}
-
-/// The `Include="..."` paths of every `<ClCompile Include="...">` element.
-fn clcompile_sources(xml: &str) -> Vec<String> {
-    let needle = "<ClCompile Include=\"";
-    let mut out = Vec::new();
-    let mut rest = xml;
-    while let Some(i) = rest.find(needle) {
-        let after = &rest[i + needle.len()..];
-        let Some(q) = after.find('"') else {
-            break;
-        };
-        out.push(after[..q].to_owned());
-        rest = &after[q + 1..];
-    }
-    out
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -896,6 +1179,90 @@ pub fn probe_build(
     }
 }
 
+/// No-op SanitizerCoverage hooks for the programs a probe build links of its
+/// own (CMake's compiler checks, the project's tools and tests). GCC's
+/// `trace-pc`/`trace-cmp` calls these and no GCC runtime defines them (bhf's
+/// driver does, for a harness), so without them every such link fails. Weak,
+/// so a program that defines a hook keeps its own.
+const PROBE_COVERAGE_HOOKS: &str = "#include <stdint.h>\n\
+#define BHF_HOOK __attribute__((weak))\n\
+BHF_HOOK void __sanitizer_cov_trace_pc(void) {}\n\
+BHF_HOOK void __sanitizer_cov_trace_cmp1(uint8_t a, uint8_t b) { (void)a; (void)b; }\n\
+BHF_HOOK void __sanitizer_cov_trace_cmp2(uint16_t a, uint16_t b) { (void)a; (void)b; }\n\
+BHF_HOOK void __sanitizer_cov_trace_cmp4(uint32_t a, uint32_t b) { (void)a; (void)b; }\n\
+BHF_HOOK void __sanitizer_cov_trace_cmp8(uint64_t a, uint64_t b) { (void)a; (void)b; }\n\
+BHF_HOOK void __sanitizer_cov_trace_const_cmp1(uint8_t a, uint8_t b) { (void)a; (void)b; }\n\
+BHF_HOOK void __sanitizer_cov_trace_const_cmp2(uint16_t a, uint16_t b) { (void)a; (void)b; }\n\
+BHF_HOOK void __sanitizer_cov_trace_const_cmp4(uint32_t a, uint32_t b) { (void)a; (void)b; }\n\
+BHF_HOOK void __sanitizer_cov_trace_const_cmp8(uint64_t a, uint64_t b) { (void)a; (void)b; }\n\
+BHF_HOOK void __sanitizer_cov_trace_cmpf(float a, float b) { (void)a; (void)b; }\n\
+BHF_HOOK void __sanitizer_cov_trace_cmpd(double a, double b) { (void)a; (void)b; }\n\
+BHF_HOOK void __sanitizer_cov_trace_switch(uint64_t v, uint64_t *c) { (void)v; (void)c; }\n";
+
+/// For GCC coverage instrumentation, compile [`PROBE_COVERAGE_HOOKS`] and
+/// return the link flag that adds the object to every program the probe build
+/// links (`-Wl,<object>`, which a compile-only invocation ignores). `None` for
+/// clang, whose sanitizer runtime defines the hooks, or when the hooks do not
+/// compile (the probe then reports its link errors).
+///
+/// CMake and make split the linker flags on whitespace, and `-Wl,` splits on
+/// commas, so the object goes in `probe_dir` only when that path is one plain
+/// word; otherwise in a bhf directory under the system temporary directory.
+fn probe_coverage_hooks_flag(
+    probe_dir: &Path,
+    instrumentation: &ProbeInstrumentation,
+) -> Option<String> {
+    if !instrumentation.uses_gcc_coverage() {
+        return None;
+    }
+    let plain = |path: &Path| {
+        path.to_str().is_some_and(|path| {
+            !path.contains(',') && harness_gen::build_safety::is_build_input_safe(path)
+        })
+    };
+    let (dir, stem) = if plain(probe_dir) {
+        (probe_dir.to_path_buf(), "bhf-coverage-hooks".to_owned())
+    } else {
+        let shared = std::env::temp_dir().join("bhf-coverage-hooks");
+        if !plain(&shared) {
+            bhfeprintln!(
+                "bhf auto: --probe-build: note: GCC's coverage hooks need a directory whose \
+                 path has no spaces or commas, and neither {} nor {} qualifies; the programs \
+                 the project's build links may fail to link",
+                probe_dir.display(),
+                shared.display()
+            );
+            return None;
+        }
+        // One object per compiler, replaced atomically, so concurrent runs
+        // never link a half-written one.
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        instrumentation.cc.hash(&mut hasher);
+        PROBE_COVERAGE_HOOKS.hash(&mut hasher);
+        (shared, format!("hooks-{:016x}", hasher.finish()))
+    };
+    std::fs::create_dir_all(&dir).ok()?;
+    let object = dir.join(format!("{stem}.o"));
+    let scratch = format!("{stem}.{}", std::process::id());
+    let source = dir.join(format!("{scratch}.c"));
+    let built = dir.join(format!("{scratch}.o"));
+    std::fs::write(&source, PROBE_COVERAGE_HOOKS).ok()?;
+    let compiled = Command::new(&instrumentation.cc)
+        .args(["-O1", "-fPIC", "-c"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&built)
+        .status()
+        .is_ok_and(|status| status.success());
+    let _ = std::fs::remove_file(&source);
+    if !compiled || std::fs::rename(&built, &object).is_err() {
+        let _ = std::fs::remove_file(&built);
+        return None;
+    }
+    Some(format!("-Wl,{}", object.display()))
+}
+
 fn request_cmake_file_api(probe_dir: &Path) {
     let query = probe_dir.join(".cmake/api/v1/query/codemodel-v2");
     if let Some(parent) = query.parent() {
@@ -1071,12 +1438,18 @@ fn probe_cmake(
         return None;
     }
     let cmake_source = cmake_source_with_local_dependencies(tree, probe_dir);
+    // The programs the build links get the coverage hooks GCC's
+    // instrumentation needs; the archives it keeps do not carry them.
+    let mut configured = instrumentation.clone();
+    configured
+        .linker_flags
+        .extend(probe_coverage_hooks_flag(probe_dir, instrumentation));
     let args = cmake_probe_args(
         &cmake_source,
         probe_dir,
         cfg!(windows),
         find_on_path("ninja"),
-        instrumentation,
+        &configured,
     );
     // Capture (rather than inherit) cmake's output so a missing-dependency
     // configure abort can be reported ACTIONABLY (§26.2). The output is replayed
@@ -1679,6 +2052,482 @@ fn compile_output_name(arguments: &[String]) -> Option<String> {
     None
 }
 
+/// The toolchain a probe's archives are rebuilt with for a cross sweep: the
+/// target's compilers and the flags its harnesses are built with (coverage,
+/// sysroot, the toolchain's own flags), minus the link-only ones.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveToolchain {
+    /// The target triple, which also names the output directory.
+    pub triple: String,
+    pub cc: String,
+    pub cxx: String,
+    pub c_flags: Vec<String>,
+    pub cxx_flags: Vec<String>,
+}
+
+/// What [`rebuild_probe_archives`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ArchiveRebuild {
+    /// The archives rebuilt for the target, ready to link.
+    pub rebuilt: Vec<PathBuf>,
+    /// Probe archives already built for the target, linked as they are.
+    pub already_for_target: Vec<PathBuf>,
+    /// Probe archives that could not be rebuilt, with the reason.
+    pub failed: Vec<(PathBuf, String)>,
+}
+
+/// One compile-database entry, in either spelling: `arguments` (bhf's own
+/// probes) or a `command` string (CMake's).
+#[derive(Debug, Clone, Deserialize)]
+struct CompileDbEntry {
+    directory: PathBuf,
+    file: PathBuf,
+    #[serde(default)]
+    arguments: Option<Vec<String>>,
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    output: Option<String>,
+}
+
+impl CompileDbEntry {
+    fn argv(&self) -> Vec<String> {
+        match (&self.arguments, &self.command) {
+            (Some(arguments), _) => arguments.clone(),
+            (None, Some(command)) => split_cmake_link_command(command),
+            (None, None) => Vec::new(),
+        }
+    }
+
+    /// The object file name this entry writes (`parse.c.o`, `parse.o`).
+    fn object_name(&self) -> Option<String> {
+        if let Some(output) = &self.output {
+            return Path::new(output)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned);
+        }
+        compile_output_name(&self.argv()).or_else(|| {
+            self.file
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(|stem| format!("{stem}.o"))
+        })
+    }
+
+    /// The object file this entry writes, by its full path.
+    fn object_path(&self) -> Option<PathBuf> {
+        let argv = self.argv();
+        let output = self.output.clone().or_else(|| {
+            argv.iter().enumerate().find_map(|(index, argument)| {
+                if argument == "-o" {
+                    argv.get(index + 1).cloned()
+                } else {
+                    argument
+                        .strip_prefix("-o")
+                        .filter(|rest| !rest.is_empty())
+                        .map(str::to_owned)
+                }
+            })
+        })?;
+        Some(self.directory.join(output))
+    }
+
+    fn is_cpp(&self) -> bool {
+        matches!(
+            self.file.extension().and_then(|value| value.to_str()),
+            Some("cc" | "cpp" | "cxx" | "c++" | "C" | "cp" | "CPP")
+        )
+    }
+}
+
+/// The compile-database entry `member` of `archive` was built from. An
+/// archive lists its members by file name only, so when several translation
+/// units write an object of that name (two libraries that each compile a
+/// `util.c`), the member is the one whose object file, at the entry's full
+/// output path, holds the member's bytes.
+fn member_compile_entry<'a>(
+    archive: &Path,
+    member: &str,
+    entries: &'a [CompileDbEntry],
+    ar: &Path,
+) -> Result<&'a CompileDbEntry, String> {
+    let mut named: Vec<&CompileDbEntry> = Vec::new();
+    for entry in entries {
+        if entry.object_name().as_deref() != Some(member) {
+            continue;
+        }
+        // The same translation unit recorded twice is one candidate.
+        let same_unit = named
+            .iter()
+            .any(|seen| seen.file == entry.file && seen.object_path() == entry.object_path());
+        if !same_unit {
+            named.push(entry);
+        }
+    }
+    match named.as_slice() {
+        [] => {
+            return Err(format!(
+                "its member `{member}` has no compile command in the probe's compile database \
+                 (the build made it without a compiler bhf saw)"
+            ))
+        }
+        [entry] => return Ok(entry),
+        _ => {}
+    }
+    let contents = Command::new(ar)
+        .arg("p")
+        .arg(archive)
+        .arg(member)
+        .output()
+        .ok()
+        .filter(|output| output.status.success() && !output.stdout.is_empty())
+        .map(|output| output.stdout);
+    let built: Vec<&CompileDbEntry> = named
+        .iter()
+        .copied()
+        .filter(|entry| {
+            contents.is_some()
+                && entry
+                    .object_path()
+                    .and_then(|path| std::fs::read(path).ok())
+                    == contents
+        })
+        .collect();
+    if let [entry] = built.as_slice() {
+        return Ok(entry);
+    }
+    Err(format!(
+        "its member `{member}` matches {} compile commands ({}), and no object the build left \
+         identifies which one it was built from",
+        named.len(),
+        named
+            .iter()
+            .map(|entry| entry.file.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
+/// The archive-rebuild output directory of `triple` under `out_root`.
+pub fn cross_archive_dir(out_root: &Path, triple: &str) -> PathBuf {
+    out_root.join(triple)
+}
+
+/// Rebuild the static archives a build probe left in `tree` for another
+/// target, member by member: each object of an archive is compiled again from
+/// its compile-database entry (the project's own flags, without bhf's host
+/// instrumentation, host CPU selection or output options) with `toolchain`,
+/// and archived under `out_root/<triple>/` at the archive's path inside the
+/// probe directory. The probe ran the project's build for this host, so its
+/// archives hold host objects a cross-built harness cannot link; the rebuilt
+/// ones hold the target's. An archive that cannot be rebuilt is reported with
+/// the reason.
+pub fn rebuild_probe_archives(
+    tree: &Path,
+    toolchain: &ArchiveToolchain,
+    out_root: &Path,
+) -> ArchiveRebuild {
+    let mut report = ArchiveRebuild::default();
+    let out_dir = cross_archive_dir(out_root, &toolchain.triple);
+    if out_dir.exists() && std::fs::remove_dir_all(&out_dir).is_err() {
+        for probe in probe_dirs_under(tree) {
+            for (archive, _) in probe_build_archives(&probe) {
+                report.failed.push((
+                    archive,
+                    format!(
+                        "its output directory {} could not be cleared",
+                        out_dir.display()
+                    ),
+                ));
+            }
+        }
+        return report;
+    }
+    let ar = archiver_for(&toolchain.triple);
+    for probe in probe_dirs_under(tree) {
+        let archives = probe_build_archives(&probe);
+        if archives.is_empty() {
+            continue;
+        }
+        let instrumentation = std::fs::read(probe.join(PROBE_ARTIFACTS_FILE))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<ProbeArtifactManifest>(&bytes).ok())
+            .map(|manifest| manifest.instrumentation);
+        let entries: Option<Vec<CompileDbEntry>> =
+            std::fs::read(probe.join("compile_commands.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+        let owner = probe.parent().unwrap_or(tree);
+        for (archive, base) in archives {
+            if crate::auto::cross_target::archive_matches_target(&archive, &toolchain.triple)
+                == Some(true)
+            {
+                report.already_for_target.push(archive);
+                continue;
+            }
+            let Some(entries) = &entries else {
+                report.failed.push((
+                    archive,
+                    "the probe left no compile database to rebuild its members from".to_owned(),
+                ));
+                continue;
+            };
+            let Some(ar) = &ar else {
+                report.failed.push((
+                    archive,
+                    format!(
+                        "no archiver was found ({}-ar, ar or llvm-ar)",
+                        toolchain.triple
+                    ),
+                ));
+                continue;
+            };
+            let relative = archive
+                .strip_prefix(&base)
+                .unwrap_or(&archive)
+                .to_path_buf();
+            let output = out_dir
+                .join(owner.strip_prefix(tree).unwrap_or(Path::new("")))
+                .join(&relative);
+            match rebuild_archive(
+                &archive,
+                &output,
+                entries,
+                instrumentation.as_ref(),
+                toolchain,
+                ar,
+            ) {
+                Ok(()) => report.rebuilt.push(output),
+                Err(reason) => report.failed.push((archive, reason)),
+            }
+        }
+    }
+    report
+}
+
+/// The archives the build `probe` describes, each with the directory its
+/// path is taken relative to: the ones in the probe directory, and the ones
+/// the build left in the tree beside it (the Make tier builds in place) or in
+/// its conventional build directories, unless the probe directory holds one
+/// of the same name. Sorted.
+fn probe_build_archives(probe: &Path) -> Vec<(PathBuf, PathBuf)> {
+    let mut own = Vec::new();
+    collect_static_libraries(probe, 0, &mut own);
+    let names: BTreeSet<std::ffi::OsString> = own
+        .iter()
+        .filter_map(|archive| archive.file_name().map(ToOwned::to_owned))
+        .collect();
+    let mut archives: Vec<(PathBuf, PathBuf)> = own
+        .into_iter()
+        .map(|archive| (archive, probe.to_path_buf()))
+        .collect();
+    let Some(owner) = probe.parent() else {
+        return archives;
+    };
+    // The owner's own files only (no recursion into its sources), then the
+    // build directories below it.
+    let mut in_tree = Vec::new();
+    collect_static_libraries(owner, RECOVERED_ARTIFACT_MAX_DEPTH, &mut in_tree);
+    for sub in RECOVERED_ARTIFACT_DIRS
+        .iter()
+        .filter(|sub| **sub != PROBE_DIR)
+    {
+        collect_static_libraries(&owner.join(sub), 0, &mut in_tree);
+    }
+    in_tree.sort();
+    in_tree.dedup();
+    archives.extend(
+        in_tree
+            .into_iter()
+            .filter(|archive| {
+                archive
+                    .file_name()
+                    .is_some_and(|name| !names.contains(name))
+            })
+            .map(|archive| (archive, owner.to_path_buf())),
+    );
+    archives.sort();
+    archives
+}
+
+/// `<triple>-ar` when installed, else `ar`, else `llvm-ar`: GNU and LLVM
+/// archivers both index foreign ELF objects.
+fn archiver_for(triple: &str) -> Option<PathBuf> {
+    [
+        format!("{triple}-ar"),
+        "ar".to_owned(),
+        "llvm-ar".to_owned(),
+    ]
+    .into_iter()
+    .find_map(|program| which::which(program).ok())
+}
+
+fn rebuild_archive(
+    archive: &Path,
+    output: &Path,
+    entries: &[CompileDbEntry],
+    instrumentation: Option<&ProbeInstrumentation>,
+    toolchain: &ArchiveToolchain,
+    ar: &Path,
+) -> Result<(), String> {
+    let listing = Command::new(ar)
+        .arg("t")
+        .arg(archive)
+        .output()
+        .map_err(|error| format!("`{} t` could not run: {error}", ar.display()))?;
+    if !listing.status.success() {
+        return Err(format!("`{} t` could not list its members", ar.display()));
+    }
+    let mut members = Vec::new();
+    let mut seen = BTreeSet::new();
+    for line in String::from_utf8_lossy(&listing.stdout).lines() {
+        let Some(name) = Path::new(line.trim()).file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !seen.insert(name.to_owned()) {
+            return Err(format!(
+                "two of its members are named `{name}`, so they cannot be matched to their \
+                 compile commands"
+            ));
+        }
+        members.push(name.to_owned());
+    }
+    if members.is_empty() {
+        return Err("it has no members".to_owned());
+    }
+    let objects_dir = output.with_extension("objects");
+    std::fs::create_dir_all(&objects_dir)
+        .map_err(|error| format!("cannot create {}: {error}", objects_dir.display()))?;
+    let mut objects = Vec::new();
+    for (index, member) in members.iter().enumerate() {
+        let entry = member_compile_entry(archive, member, entries, ar)?;
+        let object = objects_dir.join(format!("{index}-{member}"));
+        let (compiler, flags) = if entry.is_cpp() {
+            (&toolchain.cxx, &toolchain.cxx_flags)
+        } else {
+            (&toolchain.cc, &toolchain.c_flags)
+        };
+        let mut args = cross_compile_arguments(&entry.argv(), instrumentation);
+        args.extend(flags.iter().cloned());
+        args.push("-c".to_owned());
+        args.push("-o".to_owned());
+        args.push(object.display().to_string());
+        let mut command = Command::new(compiler);
+        command.args(&args).current_dir(&entry.directory);
+        let result = crate::command_output::output_with_timeout(
+            &mut command,
+            std::time::Duration::from_secs(300),
+        )
+        .map_err(|error| format!("`{compiler}` could not run: {error}"))?;
+        if !result.status.success() {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            let first: Vec<&str> = stderr
+                .lines()
+                .filter(|line| line.contains("error"))
+                .take(3)
+                .collect();
+            let detail = if first.is_empty() {
+                stderr.lines().take(3).collect::<Vec<_>>().join(" | ")
+            } else {
+                first.join(" | ")
+            };
+            return Err(format!(
+                "compiling its member `{member}` from {} for {} failed: {detail}",
+                entry.file.display(),
+                toolchain.triple
+            ));
+        }
+        objects.push(object);
+    }
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+    }
+    let _ = std::fs::remove_file(output);
+    let status = Command::new(ar)
+        .arg("rcs")
+        .arg(output)
+        .args(&objects)
+        .status()
+        .map_err(|error| format!("`{} rcs` could not run: {error}", ar.display()))?;
+    if !status.success() {
+        return Err(format!("`{} rcs` failed", ar.display()));
+    }
+    Ok(())
+}
+
+/// A compile-database command for the same translation unit, reduced to what
+/// a compile for another target keeps: the compiler, the output and
+/// dependency-file options, the optimization level, bhf's host
+/// instrumentation (the probe manifest's flags, sanitizers, coverage) and host
+/// CPU or target selection are dropped; the project's defines, include paths,
+/// language and warning flags stay.
+fn cross_compile_arguments(
+    argv: &[String],
+    instrumentation: Option<&ProbeInstrumentation>,
+) -> Vec<String> {
+    let probe_flags: BTreeSet<&str> = instrumentation
+        .into_iter()
+        .flat_map(|probe| probe.c_flags.iter().chain(&probe.cxx_flags))
+        .map(String::as_str)
+        .filter(|flag| flag.starts_with('-'))
+        .collect();
+    let probe_system_dirs: BTreeSet<&str> = instrumentation
+        .into_iter()
+        .flat_map(|probe| {
+            probe
+                .c_flags
+                .windows(2)
+                .chain(probe.cxx_flags.windows(2))
+                .filter(|pair| pair[0] == "-isystem")
+                .map(|pair| pair[1].as_str())
+        })
+        .collect();
+    let with_value = ["-o", "-MF", "-MT", "-MQ", "-target", "-arch", "--sysroot"];
+    let mut kept = Vec::new();
+    let mut args = argv.iter().skip(1).peekable();
+    while let Some(arg) = args.next() {
+        let arg = arg.as_str();
+        if with_value.contains(&arg) {
+            args.next();
+            continue;
+        }
+        if arg == "-isystem" {
+            if let Some(dir) = args.peek() {
+                if probe_system_dirs.contains(dir.as_str()) {
+                    args.next();
+                    continue;
+                }
+            }
+            kept.push(arg.to_owned());
+            continue;
+        }
+        let dropped = arg == "-c"
+            || (arg.starts_with("-o") && arg.len() > 2)
+            || matches!(arg, "-MD" | "-MMD" | "-MP" | "-M" | "-MM")
+            || arg.starts_with("-O")
+            || arg.starts_with("-fsanitize")
+            || arg.starts_with("-fno-sanitize")
+            || arg.starts_with("-fprofile-instr")
+            || arg == "-fcoverage-mapping"
+            || arg.starts_with("-static-lib")
+            || arg.starts_with("-march=")
+            || arg.starts_with("-mtune=")
+            || arg.starts_with("-mcpu=")
+            || matches!(arg, "-m32" | "-m64" | "-mx32")
+            || arg.starts_with("-msse")
+            || arg.starts_with("-mavx")
+            || arg.starts_with("--target=")
+            || arg.starts_with("--sysroot=")
+            || probe_flags.contains(arg);
+        if !dropped {
+            kept.push(arg.to_owned());
+        }
+    }
+    kept
+}
+
 /// Exact library-file dependencies CMake used when linking an executable that
 /// consumes `archive`. Static archives intentionally carry no transitive-link
 /// metadata: linking libarchive.a without the zlib/bzip2/lzma/etc. entries from
@@ -1875,9 +2724,8 @@ fn is_library_file_token(token: &str) -> bool {
 }
 
 fn libraries_from_cmake_link_text(text: &str, cwd: &Path, archive: &Path) -> Vec<PathBuf> {
-    let archive = archive
-        .canonicalize()
-        .unwrap_or_else(|_| archive.to_path_buf());
+    // Resolved without Windows' `\\?\` prefix: these paths go on link lines.
+    let archive = crate::workdir::plain_canonical(archive);
     let resolve = |token: &str| {
         let token = token.trim_matches(['\'', '"']);
         let path = PathBuf::from(token);
@@ -1886,7 +2734,7 @@ fn libraries_from_cmake_link_text(text: &str, cwd: &Path, archive: &Path) -> Vec
         } else {
             cwd.join(path)
         };
-        path.canonicalize().unwrap_or(path)
+        crate::workdir::plain_canonical(&path)
     };
     let mut lines_with_archive = Vec::new();
     for line in text.lines() {
@@ -2375,6 +3223,12 @@ const INTERCEPT_COMPILER_NAMES: &[&str] = &[
     "cl2000",
     "cl6x",
     "cl430",
+    // MSVC and its clang-compatible driver. MSBuild starts cl from the
+    // toolset directory by absolute path, so a Visual Studio build is caught
+    // through the CL task's `CLToolPath`/`CLToolExe` (see
+    // `probe_build_command_windows`), not PATH.
+    "cl",
+    "clang-cl",
 ];
 
 fn intercept_compiler_names() -> &'static [&'static str] {
@@ -2432,20 +3286,26 @@ fn parse_intercept_log(log: &str) -> Vec<ProbeEntry> {
     let mut args: Vec<String> = Vec::new();
     for line in log.lines() {
         if line == "ENDREC" {
-            if let (Some(dir), Some(cc_path), Some(file)) = (
-                &directory,
-                &cc,
-                args.iter().find(|a| is_source_arg(a)).cloned(),
-            ) {
-                let mut arguments = Vec::with_capacity(args.len() + 1);
-                arguments.push(cc_path.clone());
-                arguments.extend(args.iter().cloned());
-                let file_path = resolve_against(Path::new(dir), &file);
-                entries.push(ProbeEntry {
-                    directory: PathBuf::from(dir),
-                    file: file_path,
-                    arguments,
-                });
+            // One compiler run can compile several translation units (cl
+            // compiles every ClCompile item of an MSBuild project in one
+            // call): one entry per source, each with the shared options.
+            if let (Some(dir), Some(cc_path)) = (&directory, &cc) {
+                let sources: Vec<&String> = args.iter().filter(|a| is_source_arg(a)).collect();
+                for file in &sources {
+                    let mut arguments = Vec::with_capacity(args.len() + 1);
+                    arguments.push(cc_path.clone());
+                    arguments.extend(
+                        args.iter()
+                            .filter(|a| !is_source_arg(a) || a == file)
+                            .cloned(),
+                    );
+                    let file_path = resolve_against(Path::new(dir), &file.replace('\\', "/"));
+                    entries.push(ProbeEntry {
+                        directory: PathBuf::from(dir),
+                        file: file_path,
+                        arguments,
+                    });
+                }
             }
             directory = None;
             cc = None;
@@ -2535,6 +3395,9 @@ pub fn probe_build_command(
     sandbox_program: Option<&Path>,
     sanitizers: &multicore_fuzz::SanitizerSelection,
 ) -> Option<PathBuf> {
+    if cfg!(windows) {
+        return probe_build_command_windows(tree, command);
+    }
     let probe_dir = tree.join(PROBE_DIR);
     let intercept_dir = probe_dir.join("intercept");
     if std::fs::create_dir_all(&intercept_dir).is_err() {
@@ -2546,6 +3409,20 @@ pub fn probe_build_command(
 
     let mut wrote_any = false;
     let instrumentation = ProbeInstrumentation::for_selection(sanitizers);
+    // GCC coverage needs its hooks in every program the build links.
+    let hooks = probe_coverage_hooks_flag(&probe_dir, &instrumentation);
+    let shim_c_flags: Vec<String> = instrumentation
+        .c_flags
+        .iter()
+        .cloned()
+        .chain(hooks.clone())
+        .collect();
+    let shim_cxx_flags: Vec<String> = instrumentation
+        .cxx_flags
+        .iter()
+        .cloned()
+        .chain(hooks.clone())
+        .collect();
     let mut cc_shim: Option<PathBuf> = None;
     let mut cxx_shim: Option<PathBuf> = None;
     for (name, real) in collect_intercept_targets() {
@@ -2560,9 +3437,9 @@ pub fn probe_build_command(
             real.clone()
         };
         let extra_flags = if standard_c {
-            instrumentation.c_flags.as_slice()
+            shim_c_flags.as_slice()
         } else if standard_cxx {
-            instrumentation.cxx_flags.as_slice()
+            shim_cxx_flags.as_slice()
         } else {
             &[]
         };
@@ -2589,11 +3466,15 @@ pub fn probe_build_command(
         if cxx_shim.is_none() && matches!(name.as_str(), "c++" | "g++" | "clang++") {
             cxx_shim = Some(shim.clone());
         }
-        // The injected instrumentation contract is Clang-specific. Prefer its
-        // shim even when `/usr/bin/cc`/`c++` were encountered first.
-        if name == "clang" {
+        // Point CC/CXX at the shim named for the instrumentation's own
+        // compiler (clang, or a GCC toolchain's gcc) even when `/usr/bin/cc`/
+        // `c++` were encountered first.
+        let preferred = |compiler: &str| {
+            harness_gen::compiler_family::driver_base_name(compiler) == Some(name.as_str())
+        };
+        if preferred(&instrumentation.cc) {
             cc_shim = Some(shim.clone());
-        } else if name == "clang++" {
+        } else if preferred(&instrumentation.cxx) {
             cxx_shim = Some(shim.clone());
         }
     }
@@ -2612,7 +3493,16 @@ pub fn probe_build_command(
     );
     env.push(("CFLAGS".to_owned(), instrumentation.c_flags.join(" ")));
     env.push(("CXXFLAGS".to_owned(), instrumentation.cxx_flags.join(" ")));
-    env.push(("LDFLAGS".to_owned(), instrumentation.linker_flags.join(" ")));
+    env.push((
+        "LDFLAGS".to_owned(),
+        instrumentation
+            .linker_flags
+            .iter()
+            .cloned()
+            .chain(hooks)
+            .collect::<Vec<_>>()
+            .join(" "),
+    ));
     // Also catch compilers the PATH shim cannot shadow — those invoked by
     // ABSOLUTE path (vendor RTOS toolchains, a Bazel toolchain) or via
     // `posix_spawn` (ninja/cmake) — by LD_PRELOAD-ing the exec-interposing shim.
@@ -2654,6 +3544,243 @@ pub fn probe_build_command(
     let json = serde_json::to_vec_pretty(&entries).ok()?;
     std::fs::write(&db, json).ok()?;
     Some(db)
+}
+
+/// Names the Windows interception shims answer to (`cl.exe`, `clang.exe`, ...).
+pub(crate) const SHIM_MAP_ENV: &str = "BHF_CC_SHIM_MAP";
+/// Directory each Windows shim run writes its own record file into: parallel
+/// compiler runs never share a file, so no record can interleave with another.
+pub(crate) const SHIM_LOG_DIR_ENV: &str = "BHF_CC_LOG_DIR";
+const SHIM_MAP_FILE: &str = "bhf-shim-map.json";
+
+/// Whether `stem` names a compiler the interception shims stand in for.
+pub(crate) fn is_intercept_shim_name(stem: &str) -> bool {
+    intercept_compiler_names().contains(&stem) || is_cross_compiler_name(stem)
+}
+
+/// Read a compiler response file as text: MSBuild writes them UTF-16 with a
+/// byte-order mark; other tools write UTF-8.
+pub(crate) fn decode_response_file(bytes: &[u8]) -> String {
+    let utf16 = |bytes: &[u8], big: bool| -> String {
+        let units: Vec<u16> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&pair| {
+                if big {
+                    u16::from_be_bytes(pair)
+                } else {
+                    u16::from_le_bytes(pair)
+                }
+            })
+            .collect();
+        String::from_utf16_lossy(&units)
+    };
+    match bytes {
+        [0xFF, 0xFE, rest @ ..] => utf16(rest, false),
+        [0xFE, 0xFF, rest @ ..] => utf16(rest, true),
+        [0xEF, 0xBB, 0xBF, rest @ ..] => String::from_utf8_lossy(rest).into_owned(),
+        _ => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
+/// `args` with each `@file` replaced by the file's words (Windows quoting).
+fn expand_shim_response_files(args: &[String], cwd: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for arg in args {
+        match arg.strip_prefix('@') {
+            Some(file) => match std::fs::read(resolve_against(cwd, file)) {
+                Ok(bytes) => out.extend(crate::generate_harness::split_windows_command_line(
+                    &decode_response_file(&bytes),
+                )),
+                Err(_) => out.push(arg.clone()),
+            },
+            None => out.push(arg.clone()),
+        }
+    }
+    out
+}
+
+/// One interception record, in the format `parse_intercept_log` reads.
+fn shim_record(cwd: &Path, real: &Path, args: &[String]) -> String {
+    let mut record = format!("DIR {}\nCC {}\n", cwd.display(), real.display());
+    for arg in args {
+        record.push_str("ARG ");
+        record.push_str(&arg.replace(['\r', '\n'], " "));
+        record.push('\n');
+    }
+    record.push_str("ENDREC\n");
+    record
+}
+
+/// The Windows interception shim: `bhf.exe` started as `cl.exe` (or another
+/// compiler name) from the shim directory. It records the invocation — with
+/// response files expanded, since MSBuild deletes them after the run — and
+/// then runs the real compiler with the arguments unchanged.
+pub(crate) fn run_intercept_shim(stem: &str, args: &[std::ffi::OsString]) -> i32 {
+    let args: Vec<String> = args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let real = std::env::var_os(SHIM_MAP_ENV)
+        .and_then(|map| std::fs::read(map).ok())
+        .and_then(|bytes| serde_json::from_slice::<BTreeMap<String, PathBuf>>(&bytes).ok())
+        .and_then(|map| map.get(stem).cloned());
+    let Some(real) = real else {
+        eprintln!("bhf: no real compiler recorded for the {stem} shim");
+        return 127;
+    };
+    let cwd = std::env::current_dir().unwrap_or_default();
+    if let Some(dir) = std::env::var_os(SHIM_LOG_DIR_ENV) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let record = shim_record(&cwd, &real, &expand_shim_response_files(&args, &cwd));
+        let _ = std::fs::write(
+            PathBuf::from(dir).join(format!("rec-{}-{nanos}.log", std::process::id())),
+            record,
+        );
+    }
+    match Command::new(&real).args(&args).status() {
+        Ok(status) => status.code().unwrap_or(1),
+        Err(error) => {
+            eprintln!("bhf: could not run {}: {error}", real.display());
+            127
+        }
+    }
+}
+
+/// `--build-command` on Windows. Each compiler on PATH gets an `.exe` shim
+/// (this `bhf` executable under the compiler's name) at the front of PATH;
+/// MSBuild, which starts cl from the toolset directory by absolute path, is
+/// pointed at the `cl.exe` shim through the CL task's `CLToolPath`/`CLToolExe`
+/// (with file tracking and the multi-tool task off, both of which assume the
+/// real cl). The command runs through `cmd.exe`. The real build is not
+/// altered: the shims record and pass every argument through.
+fn probe_build_command_windows(tree: &Path, command: &str) -> Option<PathBuf> {
+    let probe_dir = tree.join(PROBE_DIR);
+    let intercept_dir = probe_dir.join("intercept");
+    let log_dir = intercept_dir.join("records");
+    let _ = std::fs::remove_dir_all(&log_dir);
+    if std::fs::create_dir_all(&log_dir).is_err() {
+        return None;
+    }
+    let mut map: BTreeMap<String, PathBuf> = BTreeMap::new();
+    for (name, real) in collect_intercept_targets() {
+        // A cross-prefixed name found on disk carries its own extension.
+        let stem = Path::new(&name)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or(&name)
+            .to_owned();
+        if map.contains_key(&stem) {
+            continue;
+        }
+        match crate::msvc_cc::install_multicall(&intercept_dir, &stem) {
+            Ok(_) => {
+                map.insert(stem, real);
+            }
+            Err(error) => {
+                bhfeprintln!(
+                    "bhf auto: --build-command: could not install the {stem} shim: {error}"
+                );
+            }
+        }
+    }
+    if map.is_empty() {
+        bhfeprintln!(
+            "bhf auto: --build-command: no C/C++ compiler found on PATH to intercept; skipping"
+        );
+        return None;
+    }
+    let map_file = intercept_dir.join(SHIM_MAP_FILE);
+    std::fs::write(&map_file, serde_json::to_vec_pretty(&map).ok()?).ok()?;
+    let mut env =
+        windows_intercept_env(&intercept_dir, &map_file, &log_dir, map.contains_key("cl"));
+    env.push(("MSBUILDDISABLENODEREUSE".to_owned(), "1".to_owned()));
+    let build_succeeded = run_windows_command(tree, command, &env);
+    if !build_succeeded {
+        bhfeprintln!("bhf auto: --build-command: `{command}` failed; using what it compiled");
+    }
+    let mut records: Vec<PathBuf> = std::fs::read_dir(&log_dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    records.sort();
+    let log_text: String = records
+        .iter()
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .collect();
+    let entries = dedup_intercept_entries(parse_intercept_log(&log_text));
+    if entries.is_empty() {
+        bhfeprintln!(
+            "bhf auto: --build-command: intercepted no compiler invocations \
+             (did `{command}` compile any C/C++?)"
+        );
+        return None;
+    }
+    bhfeprintln!(
+        "bhf auto: --build-command: recorded {} translation unit(s)",
+        entries.len()
+    );
+    let db = probe_dir.join("compile_commands.json");
+    let json = serde_json::to_vec_pretty(&entries).ok()?;
+    std::fs::write(&db, json).ok()?;
+    Some(db)
+}
+
+/// The environment of an intercepted Windows build: the shim directory first
+/// on PATH, the shim map and record directory, and — when cl is intercepted —
+/// MSBuild's CL task pointed at the `cl.exe` shim. MSBuild reads environment
+/// variables as properties, and the C++ targets only default `CLToolExe`/
+/// `CLToolPath` when they are empty.
+fn windows_intercept_env(
+    intercept_dir: &Path,
+    map_file: &Path,
+    log_dir: &Path,
+    intercept_cl: bool,
+) -> Vec<(String, String)> {
+    let mut path = vec![intercept_dir.to_path_buf()];
+    if let Some(existing) = std::env::var_os("PATH") {
+        path.extend(std::env::split_paths(&existing));
+    }
+    let path = std::env::join_paths(path)
+        .map(|joined| joined.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut env = vec![
+        ("PATH".to_owned(), path),
+        (SHIM_MAP_ENV.to_owned(), map_file.display().to_string()),
+        (SHIM_LOG_DIR_ENV.to_owned(), log_dir.display().to_string()),
+    ];
+    if intercept_cl {
+        env.push(("CLToolPath".to_owned(), intercept_dir.display().to_string()));
+        env.push(("CLToolExe".to_owned(), "cl.exe".to_owned()));
+        env.push(("TrackFileAccess".to_owned(), "false".to_owned()));
+        env.push(("UseMultiToolTask".to_owned(), "false".to_owned()));
+    }
+    env
+}
+
+/// Run `command` through `cmd.exe` in `dir`. `cmd /s /c "<command>"` keeps the
+/// command's own quoting intact.
+#[cfg(windows)]
+fn run_windows_command(dir: &Path, command: &str, env: &[(String, String)]) -> bool {
+    use std::os::windows::process::CommandExt;
+    let mut cmd = Command::new("cmd.exe");
+    cmd.raw_arg(format!("/d /s /c \"{command}\""))
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null());
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    cmd.status().map(|status| status.success()).unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+fn run_windows_command(_dir: &Path, _command: &str, _env: &[(String, String)]) -> bool {
+    false
 }
 
 /// Configure/Autotools builds often leave their archive beside `configure`
@@ -2954,12 +4081,11 @@ mod tests {
         let source = cmake_source_with_local_dependencies(&project, &probe);
         assert_ne!(source, project);
         let wrapper = fs::read_to_string(source.join("CMakeLists.txt")).unwrap();
+        // CMake reads `\` as an escape, so the wrapper spells paths with `/`.
+        let cmake_path = |path: &Path| path.display().to_string().replace('\\', "/");
         assert!(wrapper.contains("add_subdirectory"), "{wrapper}");
-        assert!(wrapper.contains(&abseil.display().to_string()), "{wrapper}");
-        assert!(
-            wrapper.contains(&project.display().to_string()),
-            "{wrapper}"
-        );
+        assert!(wrapper.contains(&cmake_path(&abseil)), "{wrapper}");
+        assert!(wrapper.contains(&cmake_path(&project)), "{wrapper}");
         assert!(wrapper.contains("re2::re2"), "{wrapper}");
         assert!(wrapper.contains("set(RE2_INSTALL OFF"), "{wrapper}");
         assert!(source.join("bhf-re2-link-probe.cc").is_file());
@@ -2996,6 +4122,465 @@ mod tests {
             .c_flags
             .iter()
             .any(|flag| flag == "-fno-sanitize=function,vptr,alignment"));
+    }
+
+    /// The coverage hooks object reaches CMake's and make's linker flags as a
+    /// bare word, so its path has no space or comma even when the tree's
+    /// does; the object is real and defines the guard-less hook.
+    #[test]
+    fn gcc_coverage_hooks_link_from_a_path_without_spaces() {
+        if which::which("gcc").is_err() || which::which("nm").is_err() {
+            eprintln!("skip: gcc/nm unavailable");
+            return;
+        }
+        let gcc = crate::toolchain::EffectiveCompilers {
+            cc: "gcc".to_owned(),
+            cxx: "g++".to_owned(),
+            explicit: true,
+        };
+        let instrumentation = ProbeInstrumentation::for_selection_with(
+            &multicore_fuzz::SanitizerSelection::Default,
+            &gcc,
+            |_, _| Some(harness_gen::compiler_family::CompilerFamily::Gcc),
+            |_, _| true,
+        );
+        let root = tmpdir();
+        for probe in [
+            root.join("my tree, v2/.bhf-build"),
+            root.join("plain/.bhf-build"),
+        ] {
+            fs::create_dir_all(&probe).unwrap();
+            let flag = probe_coverage_hooks_flag(&probe, &instrumentation)
+                .expect("gcc compiles the hooks");
+            let object = flag.strip_prefix("-Wl,").expect("a linker flag");
+            assert!(
+                !object.contains(|c: char| c.is_whitespace() || c == ','),
+                "{flag}"
+            );
+            let symbols = Command::new("nm").arg(object).output().unwrap();
+            // COFF spells a weak definition `.weak.<name>.`, ELF marks it `W`.
+            let weak_definition = if cfg!(windows) {
+                "T .weak.__sanitizer_cov_trace_pc."
+            } else {
+                "W __sanitizer_cov_trace_pc"
+            };
+            assert!(
+                String::from_utf8_lossy(&symbols.stdout).contains(weak_definition),
+                "{flag}"
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A GCC toolchain's probe archives are built by that GCC with its own
+    /// flag spellings, so they link into the GCC-built harnesses instead of
+    /// carrying clang's ASan and `trace-pc-guard`.
+    #[test]
+    fn a_gcc_toolchain_gets_a_gcc_probe_contract() {
+        use harness_gen::compiler_family::CompilerFamily;
+        use multicore_fuzz::{Sanitizer, SanitizerSelection};
+        let gcc = crate::toolchain::EffectiveCompilers {
+            cc: "gcc-13".to_owned(),
+            cxx: "g++-13".to_owned(),
+            explicit: true,
+        };
+        let family = |_: &str, _: bool| Some(CompilerFamily::Gcc);
+        let probe = ProbeInstrumentation::for_selection_with(
+            &SanitizerSelection::Default,
+            &gcc,
+            family,
+            |_, _| true,
+        );
+        assert_eq!(
+            (probe.cc.as_str(), probe.cxx.as_str()),
+            ("gcc-13", "g++-13")
+        );
+        for flags in [&probe.c_flags, &probe.cxx_flags] {
+            assert!(
+                flags.iter().any(|f| f == "-fsanitize=address,undefined"),
+                "{flags:?}"
+            );
+            assert!(
+                flags.iter().any(|f| f == "-fno-sanitize=alignment"),
+                "{flags:?}"
+            );
+            assert!(
+                flags
+                    .iter()
+                    .any(|f| f == "-fsanitize-coverage=trace-pc,trace-cmp"),
+                "{flags:?}"
+            );
+            assert!(
+                !flags.iter().any(|f| f.contains("trace-pc-guard")),
+                "{flags:?}"
+            );
+            assert!(
+                !flags.iter().any(|f| f.contains("function,vptr")),
+                "{flags:?}"
+            );
+            assert!(
+                !flags
+                    .iter()
+                    .any(|f| f == "-Wno-reserved-user-defined-literal"),
+                "{flags:?}"
+            );
+            // gcc's default _FORTIFY_SOURCE would pre-empt the sanitizer.
+            let fortify: Vec<&str> = flags
+                .iter()
+                .map(String::as_str)
+                .filter(|f| f.contains("_FORTIFY_SOURCE"))
+                .collect();
+            assert_eq!(
+                fortify,
+                harness_gen::compiler_family::SANITIZED_NO_FORTIFY,
+                "{flags:?}"
+            );
+        }
+        // Without a sanitizer the platform's fortification stays.
+        let plain = ProbeInstrumentation::for_selection_with(
+            &SanitizerSelection::None,
+            &gcc,
+            family,
+            |_, _| true,
+        );
+        assert!(
+            !plain.c_flags.iter().any(|f| f.contains("_FORTIFY_SOURCE")),
+            "{plain:?}"
+        );
+        // A sanitizer the toolchain cannot link sends the harnesses, and so
+        // the probe, to clang.
+        let msan = ProbeInstrumentation::for_selection_with(
+            &SanitizerSelection::Set(vec![Sanitizer::Msan]),
+            &gcc,
+            family,
+            |_, _| false,
+        );
+        assert_eq!(msan.cc, "clang");
+        // bhf's own clang default keeps the historical contract.
+        let default = crate::toolchain::EffectiveCompilers {
+            cc: "clang".to_owned(),
+            cxx: "clang++".to_owned(),
+            explicit: false,
+        };
+        assert_eq!(
+            ProbeInstrumentation::for_selection_with(
+                &SanitizerSelection::None,
+                &default,
+                family,
+                |_, _| true
+            ),
+            ProbeInstrumentation::clang_for_selection(&SanitizerSelection::None)
+        );
+    }
+
+    #[test]
+    fn a_cross_rebuild_keeps_project_flags_and_drops_host_instrumentation() {
+        let probe =
+            ProbeInstrumentation::clang_for_selection(&multicore_fuzz::SanitizerSelection::Default);
+        let argv: Vec<String> = [
+            "/usr/bin/clang",
+            "-DWIDGET_LEVEL=2",
+            "-I/src/include",
+            "-isystem",
+            "/opt/vendor/include",
+            "-std=gnu11",
+            "-O1",
+            "-g",
+            "-ffunction-sections",
+            "-fsanitize=address,undefined",
+            "-fno-sanitize=function,vptr,alignment",
+            "-fsanitize-coverage=trace-pc-guard,trace-cmp",
+            "-march=native",
+            "-msse4.2",
+            "-m64",
+            "--target=x86_64-linux-gnu",
+            "-fPIC",
+            "-MD",
+            "-MT",
+            "CMakeFiles/widget.dir/parse.c.o",
+            "-MF",
+            "CMakeFiles/widget.dir/parse.c.o.d",
+            "-o",
+            "CMakeFiles/widget.dir/parse.c.o",
+            "-c",
+            "/src/parse.c",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        assert_eq!(
+            cross_compile_arguments(&argv, Some(&probe)),
+            [
+                "-DWIDGET_LEVEL=2",
+                "-I/src/include",
+                "-isystem",
+                "/opt/vendor/include",
+                "-std=gnu11",
+                "-fPIC",
+                "/src/parse.c",
+            ]
+        );
+    }
+
+    /// The probe's host archives are rebuilt member by member for the cross
+    /// target, from both compile-database spellings, and an archive whose
+    /// member has no compile command is reported with that reason.
+    #[test]
+    fn probe_archives_are_rebuilt_for_a_cross_target() {
+        let cross = "aarch64-linux-gnu-gcc";
+        if which::which(cross).is_err() || which::which("gcc").is_err() {
+            eprintln!("skip: {cross}/gcc unavailable");
+            return;
+        }
+        let root = tmpdir();
+        let probe = root.join(PROBE_DIR);
+        fs::create_dir_all(probe.join("obj")).unwrap();
+        fs::write(
+            root.join("util.c"),
+            "int widget_scale(int v) { return v * 3; }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("parse.c"),
+            "#ifndef WIDGET_LEVEL\n#error need the project define\n#endif\n\
+             int widget_scale(int v);\nint parse_record(int v) { return widget_scale(v) + WIDGET_LEVEL; }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("extra.c"),
+            "int widget_extra(void) { return 7; }\n",
+        )
+        .unwrap();
+        let host = |source: &str, object: &str, define: bool| {
+            let mut command = Command::new("gcc");
+            command
+                .current_dir(&root)
+                .args(["-O1", "-c", source, "-o"])
+                .arg(probe.join(object));
+            if define {
+                command.arg("-DWIDGET_LEVEL=2");
+            }
+            assert!(command.status().unwrap().success());
+        };
+        host("util.c", "obj/util.o", false);
+        host("parse.c", "obj/parse.c.o", true);
+        host("extra.c", "obj/extra.o", false);
+        let archive = |name: &str, members: &[&str]| {
+            let mut command = Command::new("ar");
+            command.arg("rcs").arg(probe.join(name));
+            for member in members {
+                command.arg(probe.join(member));
+            }
+            assert!(command.status().unwrap().success());
+        };
+        archive("libwidget.a", &["obj/util.o", "obj/parse.c.o"]);
+        archive("libextra.a", &["obj/extra.o"]);
+        // One entry in bhf's `arguments` spelling, one in CMake's `command`.
+        let db = serde_json::json!([
+            {"directory": root, "file": root.join("util.c"),
+             "arguments": ["/usr/bin/clang", "-fsanitize=address", "-c", "util.c", "-o", "util.o"]},
+            {"directory": root, "file": root.join("parse.c"),
+             "command": "/usr/bin/clang -DWIDGET_LEVEL=2 -O1 -o obj/parse.c.o -c parse.c",
+             "output": "obj/parse.c.o"},
+        ]);
+        fs::write(probe.join("compile_commands.json"), db.to_string()).unwrap();
+
+        let toolchain = ArchiveToolchain {
+            triple: "aarch64-linux-gnu".to_owned(),
+            cc: cross.to_owned(),
+            cxx: "aarch64-linux-gnu-g++".to_owned(),
+            c_flags: vec!["-O1".to_owned(), "-g".to_owned()],
+            cxx_flags: vec!["-O1".to_owned(), "-g".to_owned()],
+        };
+        let out = root.join("out");
+        let report = rebuild_probe_archives(&root, &toolchain, &out);
+        let rebuilt = out.join("aarch64-linux-gnu/libwidget.a");
+        assert_eq!(report.rebuilt, std::slice::from_ref(&rebuilt), "{report:?}");
+        assert_eq!(
+            crate::auto::cross_target::archive_matches_target(&rebuilt, "aarch64-linux-gnu"),
+            Some(true)
+        );
+        let symbols = index_static_library_symbols(std::slice::from_ref(&rebuilt));
+        assert!(symbols[&rebuilt].contains("parse_record"), "{symbols:?}");
+        assert!(symbols[&rebuilt].contains("widget_scale"), "{symbols:?}");
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+        assert_eq!(report.failed[0].0, probe.join("libextra.a"));
+        assert!(
+            report.failed[0]
+                .1
+                .contains("`extra.o` has no compile command"),
+            "{report:?}"
+        );
+        // Run again: the output is rebuilt from scratch, never stale.
+        let again = rebuild_probe_archives(&root, &toolchain, &out);
+        assert_eq!(again.rebuilt, report.rebuilt);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The Make tier leaves the archives the project builds in the tree, beside
+    /// its sources; a cross sweep rebuilds those too from the compile database
+    /// the tier recorded.
+    #[test]
+    fn a_make_tier_projects_archives_are_rebuilt_for_a_cross_target() {
+        let cross = "aarch64-linux-gnu-gcc";
+        if ["make", "cc", "ar", cross]
+            .iter()
+            .any(|tool| which::which(tool).is_err())
+        {
+            eprintln!("skip: make/cc/ar/{cross} unavailable");
+            return;
+        }
+        let root = tmpdir();
+        fs::write(
+            root.join("Makefile"),
+            "CC ?= cc\nall: libwidget.a\nlibwidget.a: parse.o util.o\n\tar rcs $@ $^\n\
+             %.o: %.c\n\t$(CC) -DWIDGET_LEVEL=2 -c $< -o $@\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("util.c"),
+            "int widget_scale(int v) { return v * 3; }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("parse.c"),
+            "#ifndef WIDGET_LEVEL\n#error need the project define\n#endif\n\
+             int widget_scale(int v);\nint parse_record(int v) { return widget_scale(v) + WIDGET_LEVEL; }\n",
+        )
+        .unwrap();
+        let db = probe_build(&root, None, &multicore_fuzz::SanitizerSelection::Default)
+            .expect("the Make tier records a compile database");
+        assert!(db.starts_with(root.join(PROBE_DIR)), "{}", db.display());
+        assert!(root.join("libwidget.a").is_file());
+        let toolchain = ArchiveToolchain {
+            triple: "aarch64-linux-gnu".to_owned(),
+            cc: cross.to_owned(),
+            cxx: "aarch64-linux-gnu-g++".to_owned(),
+            c_flags: vec!["-O1".to_owned()],
+            cxx_flags: vec!["-O1".to_owned()],
+        };
+        let out = root.join("out");
+        let report = rebuild_probe_archives(&root, &toolchain, &out);
+        let rebuilt = out.join("aarch64-linux-gnu/libwidget.a");
+        assert_eq!(report.rebuilt, std::slice::from_ref(&rebuilt), "{report:?}");
+        assert!(report.failed.is_empty(), "{report:?}");
+        assert_eq!(
+            crate::auto::cross_target::archive_matches_target(&rebuilt, "aarch64-linux-gnu"),
+            Some(true)
+        );
+        let symbols = index_static_library_symbols(std::slice::from_ref(&rebuilt));
+        assert!(symbols[&rebuilt].contains("parse_record"), "{symbols:?}");
+        assert!(symbols[&rebuilt].contains("widget_scale"), "{symbols:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Two libraries that each compile a `util.c` of their own put members of
+    /// the same name in their archives. Each member is rebuilt from the
+    /// translation unit whose object it is, or refused with the reason when
+    /// the build's objects cannot tell.
+    #[test]
+    fn same_named_members_are_rebuilt_from_their_own_translation_units() {
+        let cross = "aarch64-linux-gnu-gcc";
+        if which::which(cross).is_err() || which::which("gcc").is_err() {
+            eprintln!("skip: {cross}/gcc unavailable");
+            return;
+        }
+        let root = tmpdir();
+        let probe = root.join(PROBE_DIR);
+        let sources = [
+            (
+                "one/parse.c",
+                "int widget_scale(int v);\nint widget_parse(int v) { return widget_scale(v); }\n",
+            ),
+            ("one/util.c", "int widget_scale(int v) { return v * 3; }\n"),
+            (
+                "two/gadget.c",
+                "int gadget_scale(int v);\nint gadget_parse(int v) { return gadget_scale(v); }\n",
+            ),
+            ("two/util.c", "int gadget_scale(int v) { return v * 5; }\n"),
+        ];
+        let mut db = Vec::new();
+        for (source, text) in sources {
+            let path = root.join(source);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, text).unwrap();
+            let library = if source.starts_with("one/") {
+                "one"
+            } else {
+                "two"
+            };
+            let output = format!("CMakeFiles/{library}.dir/{source}.o");
+            fs::create_dir_all(probe.join(&output).parent().unwrap()).unwrap();
+            let status = Command::new("gcc")
+                .current_dir(&probe)
+                .args(["-O1", "-c"])
+                .arg(&path)
+                .args(["-o", &output])
+                .status()
+                .unwrap();
+            assert!(status.success());
+            db.push(serde_json::json!({
+                "directory": probe, "file": path, "output": output,
+                "command": format!("/usr/bin/gcc -O1 -o {output} -c {}", path.display()),
+            }));
+        }
+        fs::write(
+            probe.join("compile_commands.json"),
+            serde_json::Value::Array(db).to_string(),
+        )
+        .unwrap();
+        for (library, members) in [
+            ("one", ["one/parse.c", "one/util.c"]),
+            ("two", ["two/gadget.c", "two/util.c"]),
+        ] {
+            let mut command = Command::new("ar");
+            command
+                .current_dir(&probe)
+                .arg("qc")
+                .arg(format!("lib{library}.a"));
+            for member in members {
+                command.arg(format!("CMakeFiles/{library}.dir/{member}.o"));
+            }
+            assert!(command.status().unwrap().success());
+        }
+        let toolchain = ArchiveToolchain {
+            triple: "aarch64-linux-gnu".to_owned(),
+            cc: cross.to_owned(),
+            cxx: "aarch64-linux-gnu-g++".to_owned(),
+            c_flags: vec!["-O1".to_owned()],
+            cxx_flags: vec!["-O1".to_owned()],
+        };
+        let out = root.join("out");
+        let report = rebuild_probe_archives(&root, &toolchain, &out);
+        assert!(report.failed.is_empty(), "{report:?}");
+        let rebuilt = |library: &str| out.join(format!("aarch64-linux-gnu/lib{library}.a"));
+        let symbols = index_static_library_symbols(&[rebuilt("one"), rebuilt("two")]);
+        assert!(
+            symbols[&rebuilt("one")].contains("widget_scale"),
+            "{symbols:?}"
+        );
+        assert!(
+            symbols[&rebuilt("two")].contains("gadget_scale"),
+            "{symbols:?}"
+        );
+        assert!(
+            !symbols[&rebuilt("two")].contains("widget_scale"),
+            "{symbols:?}"
+        );
+
+        // Without the objects there is no telling the two apart: refused.
+        fs::remove_dir_all(probe.join("CMakeFiles")).unwrap();
+        let report = rebuild_probe_archives(&root, &toolchain, &out);
+        assert!(report.rebuilt.is_empty(), "{report:?}");
+        assert_eq!(report.failed.len(), 2, "{report:?}");
+        for (_, reason) in &report.failed {
+            assert!(
+                reason.contains("`util.c.o` matches 2 compile commands")
+                    && reason.contains("one/util.c")
+                    && reason.contains("two/util.c"),
+                "{reason}"
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -3039,10 +4624,18 @@ mod tests {
             zlib.display(),
             crypto.display()
         );
+        // Resolved (symlinks and Windows short names expanded) and free of
+        // Windows' `\\?\` prefix, ready for a link line.
         assert_eq!(
             libraries_from_cmake_link_text(&link, &cwd, &archive),
-            vec![zlib, crypto]
+            vec![
+                crate::workdir::plain_canonical(&zlib),
+                crate::workdir::plain_canonical(&crypto)
+            ]
         );
+        assert!(!libraries_from_cmake_link_text(&link, &cwd, &archive)
+            .iter()
+            .any(|path| path.to_string_lossy().starts_with(r"\\?\")));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -3089,6 +4682,9 @@ mod tests {
         let _ = fs::remove_dir_all(wrapper);
     }
 
+    // The probe reuses `lib*.a` archives; an MSVC-ABI CMake build on Windows
+    // writes `.lib` files, which the probe does not reuse.
+    #[cfg(not(windows))]
     #[test]
     fn cmake_probe_builds_and_indexes_an_instrumented_static_library() {
         if !find_on_path("cmake") || !find_on_path("clang") || !find_on_path("clang++") {
@@ -3459,6 +5055,10 @@ mod tests {
         );
     }
 
+    // The Windows capture's shims are the `bhf` executable itself under a
+    // compiler's name, which a unit-test binary is not; that path runs in the
+    // Windows release smoke (`scripts/ci/windows-release-smoke.ps1`).
+    #[cfg(unix)]
     #[test]
     fn intercepts_a_real_custom_build_into_a_compile_db() {
         // Needs a host C compiler; skip cleanly when absent (matches bhf's
@@ -3528,6 +5128,88 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// A Windows capture shim records cl's invocation with MSBuild's UTF-16
+    /// response file expanded (MSBuild deletes it after the run), and one cl
+    /// run that compiles several translation units becomes one database row
+    /// per source with the shared options.
+    #[test]
+    fn windows_shim_records_expand_response_files_and_split_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("src").join("core");
+        fs::create_dir_all(&cwd).unwrap();
+        let rsp = "/c /I\"C:\\My Projects\\inc\" /DWIDGET_MODE=1 /nologo widget.c table.c\r\n";
+        let mut utf16 = vec![0xFF, 0xFE];
+        for unit in rsp.encode_utf16() {
+            utf16.extend(unit.to_le_bytes());
+        }
+        fs::write(cwd.join("tmp1.rsp"), &utf16).unwrap();
+        assert_eq!(decode_response_file(&utf16), rsp);
+        assert_eq!(decode_response_file(b"\xEF\xBB\xBF/c a.c"), "/c a.c");
+
+        let args = expand_shim_response_files(&["@tmp1.rsp".to_owned()], &cwd);
+        assert_eq!(
+            args,
+            vec![
+                "/c",
+                "/IC:\\My Projects\\inc",
+                "/DWIDGET_MODE=1",
+                "/nologo",
+                "widget.c",
+                "table.c"
+            ]
+        );
+        let real = PathBuf::from("C:/VS/VC/Tools/MSVC/14.44/bin/HostX64/x64/cl.exe");
+        let entries = parse_intercept_log(&shim_record(&cwd, &real, &args));
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(entries[0].file, cwd.join("widget.c"));
+        assert_eq!(entries[1].file, cwd.join("table.c"));
+        for entry in &entries {
+            assert_eq!(entry.arguments[0], real.display().to_string());
+            assert!(entry.arguments.contains(&"/DWIDGET_MODE=1".to_owned()));
+            assert_eq!(
+                entry.arguments.iter().filter(|a| is_source_arg(a)).count(),
+                1,
+                "each row names only its own source: {:?}",
+                entry.arguments
+            );
+        }
+        assert!(is_intercept_shim_name("cl"));
+        assert!(is_intercept_shim_name("clang-cl"));
+        assert!(is_intercept_shim_name("x86_64-w64-mingw32-gcc"));
+        assert!(!is_intercept_shim_name("link"));
+    }
+
+    /// MSBuild starts cl by absolute path from the toolset directory, so the
+    /// Windows capture points the CL task at the shim through environment
+    /// properties, and turns off file tracking, which assumes the real cl.
+    #[test]
+    fn windows_capture_environment_redirects_the_cl_task() {
+        let temp = tempfile::tempdir().unwrap();
+        let shim = temp.path().join(".bhf-build").join("intercept");
+        let env: BTreeMap<String, String> = windows_intercept_env(
+            &shim,
+            &shim.join(SHIM_MAP_FILE),
+            &shim.join("records"),
+            true,
+        )
+        .into_iter()
+        .collect();
+        assert_eq!(env["CLToolPath"], shim.display().to_string());
+        assert_eq!(env["CLToolExe"], "cl.exe");
+        assert_eq!(env["TrackFileAccess"], "false");
+        assert_eq!(env["UseMultiToolTask"], "false");
+        assert!(env["PATH"].starts_with(&shim.display().to_string()));
+        assert_eq!(
+            env[SHIM_LOG_DIR_ENV],
+            shim.join("records").display().to_string()
+        );
+        let without_cl: BTreeMap<String, String> =
+            windows_intercept_env(&shim, &shim.join(SHIM_MAP_FILE), &shim, false)
+                .into_iter()
+                .collect();
+        assert!(!without_cl.contains_key("CLToolPath"));
+    }
+
     #[test]
     fn detects_msbuild_solution_then_cmake_wins() {
         let root = tmpdir();
@@ -3544,21 +5226,181 @@ mod tests {
         assert_eq!(detect_build_system(&root), BuildSystem::CMake);
     }
 
+    /// The project import writes one compile-database row per `ClCompile`
+    /// source with the project's include dirs and defines for ONE configuration:
+    /// a `Condition=` for another configuration is not applied, `\\` separators
+    /// are read as separators on every host (a backslash in a recipe path is
+    /// refused as an injection risk), and a token built on an MSBuild property
+    /// with no value is left out whole.
+    #[test]
+    fn a_visual_studio_solution_beside_another_build_description_is_found() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let touch = |rel: &str| {
+            let path = root.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, "").unwrap();
+        };
+        touch("win32/widget.vcxproj");
+        touch("src/widget.c");
+        assert_eq!(
+            other_build_description(root, &msbuild_files(root)),
+            None,
+            "a solution alone is the only build description"
+        );
+        touch("src/Makefile.am");
+        assert_eq!(
+            other_build_description(root, &msbuild_files(root)),
+            None,
+            "a build file beside the sources, not on the solution's path, is not a root"
+        );
+        for marker in [
+            "configure.ac",
+            "configure.in",
+            "Makefile.in",
+            "autogen.sh",
+            "WORKSPACE.bazel",
+            "BUILD.bazel",
+        ] {
+            touch(marker);
+            assert_eq!(
+                other_build_description(root, &msbuild_files(root)),
+                Some(PathBuf::from(marker))
+            );
+            fs::remove_file(root.join(marker)).unwrap();
+        }
+        // A wrapper directory around the project root.
+        let wrapped = tempfile::tempdir().unwrap();
+        let wrapped = wrapped.path();
+        fs::create_dir_all(wrapped.join("widget-1.0/msvc")).unwrap();
+        fs::write(wrapped.join("widget-1.0/configure.ac"), "").unwrap();
+        fs::write(wrapped.join("widget-1.0/msvc/widget.sln"), "").unwrap();
+        assert_eq!(
+            other_build_description(wrapped, &msbuild_files(wrapped)),
+            Some(PathBuf::from("widget-1.0/configure.ac"))
+        );
+    }
+
+    #[test]
+    fn only_import_libraries_found_in_lib_reach_the_harness_link() {
+        let lib = tmpdir();
+        fs::write(lib.join("ws2_32.lib"), "").unwrap();
+        fs::write(lib.join("libcmt.lib"), "").unwrap();
+        let inputs: Vec<String> = [
+            "ws2_32.lib",
+            "WidgetSupport.lib",
+            "zlib.lib",
+            "libcmt.lib",
+            "C:/proj/x64/Debug/core.lib",
+            "evil$(x).lib",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let (kept, skipped) = harness_link_libraries(&inputs, std::slice::from_ref(&lib));
+        assert_eq!(kept, vec!["ws2_32.lib"]);
+        let skipped: Vec<&str> = skipped.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            skipped,
+            vec![
+                "WidgetSupport.lib",
+                "zlib.lib",
+                "libcmt.lib",
+                "C:/proj/x64/Debug/core.lib",
+                "evil$(x).lib"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_projects_link_libraries_reach_only_its_own_rows() {
+        let root = tmpdir();
+        let lib = root.join("toolset-lib");
+        fs::create_dir_all(&lib).unwrap();
+        fs::write(lib.join("ws2_32.lib"), "").unwrap();
+        for dir in ["app", "support"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        fs::write(root.join("app/main.c"), "int app(void){return 0;}\n").unwrap();
+        fs::write(
+            root.join("support/support.c"),
+            "int support(void){return 0;}\n",
+        )
+        .unwrap();
+        // The app links the support project's output, which has not been
+        // built, and a system import library.
+        fs::write(
+            root.join("app/app.vcxproj"),
+            r#"<Project>
+  <ItemDefinitionGroup><Link><AdditionalDependencies>ws2_32.lib;WidgetSupport.lib;%(AdditionalDependencies)</AdditionalDependencies></Link></ItemDefinitionGroup>
+  <ItemGroup><ClCompile Include="main.c" /></ItemGroup>
+</Project>"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("support/support.vcxproj"),
+            r#"<Project><ItemGroup><ClCompile Include="support.c" /></ItemGroup></Project>"#,
+        )
+        .unwrap();
+        let db = root.join("out/compile_commands.json");
+        import_msbuild_projects_with(
+            &root,
+            &db,
+            &crate::auto::msbuild_import::ImportRequest::default(),
+            false,
+            Some(std::slice::from_ref(&lib)),
+        )
+        .expect("import");
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&fs::read(&db).unwrap()).expect("db");
+        let libraries = |source: &str| {
+            rows.iter()
+                .find(|row| row["file"].as_str().unwrap().ends_with(source))
+                .unwrap()
+                .get("bhf_link_libraries")
+                .cloned()
+        };
+        assert_eq!(libraries("main.c"), Some(serde_json::json!(["ws2_32.lib"])));
+        assert_eq!(
+            libraries("support.c"),
+            None,
+            "another project's libraries are not linked into its harnesses"
+        );
+
+        // Off Windows (no LIB to look in) nothing is linked.
+        import_msbuild_projects_with(
+            &root,
+            &db,
+            &crate::auto::msbuild_import::ImportRequest::default(),
+            false,
+            None,
+        )
+        .expect("import");
+        let text = fs::read_to_string(&db).unwrap();
+        assert!(!text.contains("bhf_link_libraries"), "{text}");
+    }
+
     #[test]
     fn vcxproj_entries_extract_includes_defines_and_sources() {
         let root = tmpdir();
-        fs::create_dir_all(root.join("src")).unwrap();
-        fs::create_dir_all(root.join("include")).unwrap();
-        fs::write(root.join("src/parser.c"), "int p(void){return 0;}\n").unwrap();
-        let vcxproj = root.join("lib.vcxproj");
+        fs::create_dir_all(root.join("lib/src")).unwrap();
+        fs::create_dir_all(root.join("lib/include")).unwrap();
+        fs::create_dir_all(root.join("shared/inc")).unwrap();
+        fs::write(root.join("lib/src/parser.c"), "int p(void){return 0;}\n").unwrap();
+        let vcxproj = root.join("lib/lib.vcxproj");
         fs::write(
             &vcxproj,
             r#"<?xml version="1.0"?>
 <Project>
   <ItemDefinitionGroup>
     <ClCompile>
-      <AdditionalIncludeDirectories>$(ProjectDir)include;$(IntDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions Condition="'$(Config)'=='Release'">PARSERLIB_BUILD;WIN32;CACHE_DIR=$(IntDir);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;..\shared\inc;$(IntDir)\gen\$(NoSuchMacro);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>PARSERLIB_BUILD;WIN32;CACHE_DIR=$(NoSuchMacro);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
+    <ClCompile>
+      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -3567,15 +5409,30 @@ mod tests {
 </Project>"#,
         )
         .unwrap();
-        let entries = vcxproj_entries(&vcxproj);
+        let db = root.join("out/compile_commands.json");
+        let (_, import) = import_msbuild_projects(
+            &root,
+            &db,
+            &crate::auto::msbuild_import::ImportRequest::default(),
+            false,
+        )
+        .expect("import");
+        assert_eq!(import.configuration, "Debug");
+        let entries: Vec<ProbeEntry> = serde_json::from_slice(&fs::read(&db).unwrap()).expect("db");
         assert_eq!(entries.len(), 1, "one ClCompile source -> one entry");
         let args = entries[0].arguments.join(" ");
+        let make = |path: &Path| harness_gen::build_safety::make_path(path);
         assert!(
-            args.contains(&format!(
-                "-I{}",
-                harness_gen::build_safety::make_path(&root.join("include"))
-            )),
+            args.contains(&format!("-I{}", make(&root.join("lib/include")))),
             "include dir resolved from $(ProjectDir): {args}"
+        );
+        assert!(
+            args.contains(&format!("-I{}", make(&root.join("shared/inc")))),
+            "a backslash-separated relative dir resolves on every host: {args}"
+        );
+        assert!(
+            !args.contains('\\'),
+            "no backslash reaches a recipe: {args}"
         );
         assert!(
             args.contains("-DPARSERLIB_BUILD"),
@@ -3583,18 +5440,25 @@ mod tests {
         );
         assert!(args.contains("-DWIN32"), "second define extracted: {args}");
         assert!(
+            !args.contains("NDEBUG"),
+            "another configuration's defines are not applied: {args}"
+        );
+        assert!(
             !args.contains("%("),
             "inherited %(...) placeholders dropped: {args}"
         );
         assert!(
-            !args.contains("$(IntDir)"),
-            "unresolved MSBuild properties are dropped, not emitted into make: {args}"
+            !args.contains("$("),
+            "unresolved properties never reach make: {args}"
         );
         assert!(
-            !args.contains("CACHE_DIR"),
-            "a define with an unresolved property is dropped as one token: {args}"
+            !args.contains("CACHE_DIR") && !args.contains("/gen"),
+            "a token with an unresolved property is dropped as one token: {args}"
         );
-        assert_eq!(entries[0].file, root.join("src").join("parser.c"));
+        assert_eq!(
+            entries[0].file,
+            crate::auto::msbuild_import::normalize_lexically(&root.join("lib/src/parser.c"))
+        );
     }
 
     #[test]

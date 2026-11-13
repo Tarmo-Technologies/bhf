@@ -27,6 +27,8 @@ fn fixture_dir() -> PathBuf {
 
 fn options(src_root: &std::path::Path) -> AttemptOptions {
     AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         project: None,
         decoder_limits: Default::default(),
         force: false,
@@ -104,6 +106,7 @@ fn win32_integer_typedef_params_build_and_fuzz() {
         // attempt to the win32 (MFC/ATL) platform stub.
         foreign_guard: Some("win32 (MFC/ATL framework header)".to_owned()),
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&dir).unwrap();

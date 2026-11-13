@@ -262,6 +262,14 @@ fn project_run_builtin_materializes_and_fuzzes() {
         work.join("build/alpha/main").is_file(),
         "harness not materialized"
     );
+    // The manifest's input mode travels with the staged binary, so fuzz,
+    // replay and minimize do not have to guess the protocol from it.
+    let declared: serde_json::Value = serde_json::from_slice(
+        &fs::read(work.join("build/alpha/harness-protocol.json"))
+            .expect("declared input mode materialized"),
+    )
+    .unwrap();
+    assert_eq!(declared["input_mode"], "framed");
 
     // The merged, de-duplicated dictionary was written where the engine looks,
     // with both layers in declared order.

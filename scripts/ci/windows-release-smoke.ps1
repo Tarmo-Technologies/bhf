@@ -54,10 +54,12 @@ if ($LASTEXITCODE -ne 0 -or $daemonVersion -notcontains "commit: $expectedCommit
     --work-dir "$env:RUNNER_TEMP\bhf-windows-plan" `
     --languages c --list-targets --no-discovery-cache
 
-if (-not (Get-Command clang -ErrorAction SilentlyContinue)) {
+if (-not (Get-Command clang -ErrorAction SilentlyContinue) -and
+    -not (Test-Path "$env:ProgramFiles\LLVM\bin\clang.exe")) {
     choco install llvm --yes --no-progress
 }
-if (-not (Get-Command make -ErrorAction SilentlyContinue)) {
+if (-not (Get-Command make -ErrorAction SilentlyContinue) -and
+    -not (Test-Path "C:\w64devkit\bin\make.exe")) {
     choco install make --yes --no-progress
 }
 
@@ -69,20 +71,58 @@ $env:Path = (@(
         [Environment]::GetEnvironmentVariable("Path", "User")
         $env:Path
     ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join ";"
-clang --version
-make --version
 
-$vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-$vsPath = & $vswhere -latest -products * `
-    -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-    -property installationPath
-if (-not $vsPath) {
-    throw "Visual Studio C++ Build Tools were not found"
+# No Developer shell: bhf finds Visual Studio (vswhere), applies the
+# environment VsDevCmd sets, and locates clang and make itself.
+foreach ($name in @("INCLUDE", "LIB", "LIBPATH", "VCToolsInstallDir")) {
+    Remove-Item "Env:$name" -ErrorAction SilentlyContinue
 }
-Import-Module (Join-Path $vsPath "Common7\Tools\Microsoft.VisualStudio.DevShell.dll")
-Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation `
-    -DevCmdArguments "-arch=x64 -host_arch=x64"
-Get-Command link.exe | Format-List Source
+
+# The MSVC linkers (link.exe, lld-link) ignore GNU-only link options with a
+# warning; the Makefile spells its dead-code flag for them (/OPT:REF).
+$gnuOnlyLinkWarning = "ignoring unknown argument '--gc-sections'|LNK4044"
+function Assert-NoGnuOnlyLinkWarning([string]$Text, [string]$What) {
+    if ($Text -match $gnuOnlyLinkWarning) {
+        throw "$What passed a GNU-only option to an MSVC linker: $($Matches[0])"
+    }
+}
+
+function Invoke-BhfAuto([string]$Source, [string]$Work, [string[]]$Extra, [string]$Languages = "c") {
+    $log = "$Work.log"
+    # bhf reports progress on stderr; capturing it must not stop the script
+    # (Windows PowerShell turns redirected native stderr into error records).
+    $ErrorActionPreference = "Continue"
+    & $bhf auto $Source --work-dir $Work --jobs 1 --max-targets 1 `
+        --per-target-time 15 --languages $Languages --verbose @Extra 2>&1 |
+        ForEach-Object { "$_" } | Tee-Object -FilePath $log | Out-Host
+    $exit = $LASTEXITCODE
+    $ErrorActionPreference = "Stop"
+    $text = Get-Content $log -Raw
+    if ($text -notmatch "bhf: build environment: .*\((x64|arm64), (captured|cached)\)") {
+        throw "bhf did not apply a discovered Visual Studio environment for $Source"
+    }
+    $report = Get-Content "$Work\auto\run.json" -Raw | ConvertFrom-Json
+    if ($exit -ne 0 -or $report.summary.built_and_fuzzed -ne 1) {
+        Get-ChildItem $Work -Recurse -File |
+            Where-Object { $_.Name -in @("Makefile", "result.json", "c_build_output.log") } |
+            ForEach-Object { Write-Host "--- $($_.FullName)"; Get-Content $_.FullName }
+        throw "bhf auto $Source $Extra did not build and fuzz its target: $($report.summary | ConvertTo-Json -Compress)"
+    }
+    Assert-NoGnuOnlyLinkWarning $text "bhf auto $Source $Extra"
+    Get-ChildItem $Work -Recurse -File -Filter *.log |
+        ForEach-Object { Assert-NoGnuOnlyLinkWarning (Get-Content $_.FullName -Raw) $_.FullName }
+    # Every extra lane the run built (line coverage) built.
+    foreach ($target in @($report.targets)) {
+        if ($target.lanes) {
+            foreach ($lane in $target.lanes.PSObject.Properties) {
+                if (-not $lane.Value.built) {
+                    throw "bhf auto $Source $Extra lost the $($lane.Name) lane of $($target.harness_id): $($lane.Value.reason)"
+                }
+            }
+        }
+    }
+    return @{ Report = $report; Log = $text }
+}
 
 $work = "$env:RUNNER_TEMP\bhf-windows-fuzz"
 # Exercise the README first run with the default ASan/UBSan build and pass
@@ -122,3 +162,125 @@ if (-not (Test-Path "$work\results\INDEX.md") -or
     -not (Test-Path "$work\auto\summary.txt")) {
     throw "Default Windows first run did not produce the documented results"
 }
+
+# A Visual Studio solution in a directory with spaces: the project import reads
+# its include dirs and defines (it runs nothing), and the planted heap overflow
+# is found with the clang lane and with the MSVC cl.exe lane.
+$solutionRoot = Join-Path $env:RUNNER_TEMP "My Projects\vs solution"
+Remove-Item -Recurse -Force $solutionRoot -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force $solutionRoot | Out-Null
+Copy-Item -Recurse (Join-Path $repoRoot "tests\fixtures\windows\vs_solution\*") $solutionRoot
+foreach ($lane in @(@{ Name = "clang"; Extra = @() }, @{ Name = "cl"; Extra = @("--cc", "cl") })) {
+    $laneWork = Join-Path $env:RUNNER_TEMP "My Projects\work $($lane.Name)"
+    $run = Invoke-BhfAuto $solutionRoot $laneWork $lane.Extra
+    if ($run.Log -notmatch "read 2 ClCompile entries from vs\\Widget\.sln \(config Debug\|x64, static evaluation\)") {
+        throw "The $($lane.Name) lane did not import the Visual Studio solution"
+    }
+    # The project's import library is linked into its harness; the output
+    # of a project the solution has not built is named and left out.
+    if ($run.Log -notmatch "its harnesses link ws2_32\.lib" -or
+        $run.Log -notmatch "not linking WidgetSupport\.lib \(not in LIB") {
+        throw "The $($lane.Name) lane did not sort the project's link libraries"
+    }
+    $makefile = Get-ChildItem "$laneWork\harnesses\*\Makefile" | Select-Object -First 1 | Get-Content -Raw
+    if ($makefile -notmatch "(?m)^BUILD_CONTEXT_LDFLAGS = -lws2_32\s*$") {
+        throw "The $($lane.Name) lane's harness does not link the project's import library"
+    }
+    $findings = Get-Content "$laneWork\results\findings.json" -Raw | ConvertFrom-Json
+    if (-not ($findings.findings | Where-Object { $_.title -like "Heap-based Buffer Overflow*" })) {
+        throw "The $($lane.Name) lane did not find the planted heap overflow"
+    }
+    $finding = $findings.findings | Select-Object -First 1
+    $replay = Join-Path "$laneWork\results" $finding.reproduce.command.Split(" ")[1]
+    $ErrorActionPreference = "Continue"
+    $replayOutput = & python $replay 2>&1 | ForEach-Object { "$_" } | Out-String
+    $ErrorActionPreference = "Stop"
+    if ($replayOutput -notmatch "AddressSanitizer: heap-buffer-overflow") {
+        throw "replay.py of the $($lane.Name) lane did not reproduce: $replayOutput"
+    }
+}
+
+# The real MSVC build of the same solution, captured: MSBuild's CL task runs
+# the cl.exe shim, and each recorded translation unit becomes a cl-style
+# compile database row.
+$captureRoot = Join-Path $env:RUNNER_TEMP "My Projects\vs capture"
+Remove-Item -Recurse -Force $captureRoot -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force $captureRoot | Out-Null
+Copy-Item -Recurse (Join-Path $repoRoot "tests\fixtures\windows\vs_solution\*") $captureRoot
+$run = Invoke-BhfAuto $captureRoot (Join-Path $env:RUNNER_TEMP "My Projects\work capture") @(
+    "--build-command", "msbuild vs\Widget.sln /p:Configuration=Release /p:Platform=x64 /nologo /v:minimal")
+if ($run.Log -notmatch "--build-command: recorded 2 translation unit\(s\)") {
+    throw "The MSBuild capture did not record the solution's two translation units"
+}
+
+# C++, with both lanes.
+foreach ($lane in @(@{ Name = "clang"; Extra = @() }, @{ Name = "cl"; Extra = @("--cc", "cl") })) {
+    $cppWork = "$env:RUNNER_TEMP\bhf-windows-cpp-$($lane.Name)"
+    $null = Invoke-BhfAuto (Join-Path $repoRoot "tests\fixtures\windows\cpp_tokens") $cppWork $lane.Extra "cpp"
+    $findings = Get-Content "$cppWork\results\findings.json" -Raw | ConvertFrom-Json
+    if (-not $findings.findings) {
+        throw "The C++ $($lane.Name) lane did not find the planted out-of-bounds read"
+    }
+}
+
+# A handle-based API (init / feed / end) gets the stateful sequence harness,
+# with the default sanitizers.
+$sequenceWork = "$env:RUNNER_TEMP\bhf-windows-sequence"
+$run = Invoke-BhfAuto (Join-Path $repoRoot "tests\fixtures\windows\handle_session") $sequenceWork @()
+$metadata = Get-ChildItem "$sequenceWork\harnesses\*\generation-metadata.json" |
+    Select-Object -First 1 | Get-Content -Raw | ConvertFrom-Json
+if ($metadata.emitted_path -ne "sequence") {
+    throw "The handle-based API was not harnessed as a sequence: $($metadata | ConvertTo-Json -Compress)"
+}
+$passes = @($run.Report.targets[0].outcome.passes)
+if (($passes | Measure-Object executions -Sum).Sum -le 0) {
+    throw "The sequence harness executed no inputs"
+}
+
+# The sequence template's own driver: main.c built without
+# BHF_EXTERNAL_DRIVER, as the AFL++ recipe builds it (here with clang and
+# AddressSanitizer). Its crash handler must leave the exceptions ASan handles
+# itself alone (a first-chance handler turns ASan's shadow-memory faults into
+# crashes): a plain input runs to completion, and the fuzz run's finding is
+# reported by ASan.
+$sequenceHarness = Split-Path -Parent (Get-ChildItem "$sequenceWork\harnesses\*\generation-metadata.json" |
+        Select-Object -First 1).FullName
+$savedPath = $env:Path
+foreach ($dir in @((Join-Path $env:ProgramFiles "LLVM\bin"), "C:\w64devkit\bin")) {
+    if (Test-Path $dir) { $env:Path = "$env:Path;$dir" }
+}
+Push-Location $sequenceHarness
+$ErrorActionPreference = "Continue"
+$aflBuild = & make main_afl AFLPP_CC=clang "AFLPP_CFLAGS=-g -O1 -fsanitize=address" 2>&1 |
+    ForEach-Object { "$_" } | Out-String
+$ErrorActionPreference = "Stop"
+$aflBuild | Out-Host
+if (-not (Test-Path main_afl)) {
+    throw "The sequence template's own driver did not build"
+}
+Assert-NoGnuOnlyLinkWarning $aflBuild "make main_afl"
+Copy-Item main_afl standalone.exe -Force
+[IO.File]::WriteAllBytes((Join-Path $sequenceHarness "plain.bin"), [byte[]](1, 2, 3, 4, 5, 6, 7, 8))
+$ErrorActionPreference = "Continue"
+$plainOutput = & .\standalone.exe plain.bin 2>&1 | ForEach-Object { "$_" } | Out-String
+$plainExit = $LASTEXITCODE
+$ErrorActionPreference = "Stop"
+if ($plainExit -ne 0) {
+    throw "The sequence template's own driver failed a plain input (exit $plainExit): $plainOutput"
+}
+$crash = Get-ChildItem "$sequenceWork\results\findings\*\testcase.bin" -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+if ($crash) {
+    $ErrorActionPreference = "Continue"
+    $crashOutput = & .\standalone.exe $crash.FullName 2>&1 | ForEach-Object { "$_" } | Out-String
+    $ErrorActionPreference = "Stop"
+    # The crash run is expected to exit non-zero (ASan aborts). Clear its exit
+    # code so the step does not inherit it as the script's result.
+    $global:LASTEXITCODE = 0
+    if ($crashOutput -notmatch "ERROR: AddressSanitizer") {
+        throw "The sequence template's own driver did not let ASan report the finding: $crashOutput"
+    }
+}
+Pop-Location
+$env:Path = $savedPath
+exit 0

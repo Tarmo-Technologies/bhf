@@ -5,7 +5,9 @@
 // writes a BHF-558 finding for an input whose memory is far above baseline AND
 // amplified vs its size. The fixture allocates+touches N MB where N is the first
 // input byte, so a 4-byte "large" input balloons memory while a "small" one does not.
-// Skips cleanly without clang.
+// Skips cleanly without clang. Peak resident memory is read from Linux's
+// rusage, so this runs on Linux only.
+#![cfg(target_os = "linux")]
 
 use std::path::Path;
 use std::process::Command;

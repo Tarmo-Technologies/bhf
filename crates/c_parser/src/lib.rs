@@ -1360,7 +1360,50 @@ pub fn parse_c_type_defs(source: &str) -> Result<CTypeDefs, CParseError> {
     Ok(defs)
 }
 
+/// Most source lines recorded for one mined dictionary token.
+pub const MAX_TOKEN_LINES: usize = 3;
+
+/// A fuzz-dictionary token mined from one source file, with the 1-based lines
+/// it was found on (the first [`MAX_TOKEN_LINES`] distinct ones, in the order
+/// the collectors met them).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocatedToken {
+    pub value: String,
+    pub lines: Vec<u32>,
+}
+
+/// Add `value`, found on `line`, to `tokens`: trimmed, skipped when empty or
+/// longer than 256 bytes, and merged into an existing token of the same value
+/// (which records the line while it has room).
+pub fn push_located_token(tokens: &mut Vec<LocatedToken>, value: String, line: u32) {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 256 {
+        return;
+    }
+    if let Some(existing) = tokens.iter_mut().find(|token| token.value == value) {
+        if existing.lines.len() < MAX_TOKEN_LINES && !existing.lines.contains(&line) {
+            existing.lines.push(line);
+        }
+        return;
+    }
+    tokens.push(LocatedToken {
+        value: value.to_owned(),
+        lines: vec![line],
+    });
+}
+
+/// The fuzz-dictionary tokens of a C source: enum members, string literals
+/// (not `#include` paths), case labels, comparison literals and `#define`
+/// values, each once, in the order found.
 pub fn extract_c_dictionary_tokens(source: &str) -> Result<Vec<String>, CParseError> {
+    Ok(extract_c_dictionary_tokens_located(source)?
+        .into_iter()
+        .map(|token| token.value)
+        .collect())
+}
+
+/// [`extract_c_dictionary_tokens`], with the lines each token was found on.
+pub fn extract_c_dictionary_tokens_located(source: &str) -> Result<Vec<LocatedToken>, CParseError> {
     let mut parser = tree_sitter::Parser::new();
     parser
         .set_language(&tree_sitter_c::LANGUAGE.into())
@@ -1370,7 +1413,7 @@ pub fn extract_c_dictionary_tokens(source: &str) -> Result<Vec<String>, CParseEr
 
     for enum_def in parse_c_type_defs(source)?.enums {
         for member in enum_def.members {
-            push_dictionary_token(&mut tokens, member);
+            push_located_token(&mut tokens, member, enum_def.line);
         }
     }
     collect_c_string_dictionary_tokens(tree.root_node(), source.as_bytes(), &mut tokens);
@@ -1381,6 +1424,13 @@ pub fn extract_c_dictionary_tokens(source: &str) -> Result<Vec<String>, CParseEr
     Ok(tokens)
 }
 
+/// The 1-based source line a node starts on.
+fn node_line(node: tree_sitter::Node<'_>) -> u32 {
+    u32::try_from(node.start_position().row)
+        .unwrap_or(u32::MAX - 1)
+        .saturating_add(1)
+}
+
 /// Mine literal operands of equality/relational comparisons
 /// (`== != < <= > >=`) — the magic-byte, sentinel, and length gates a parser
 /// checks. Scalar `==` is a CPU compare (no libc call the runtrace shim can
@@ -1388,7 +1438,7 @@ pub fn extract_c_dictionary_tokens(source: &str) -> Result<Vec<String>, CParseEr
 fn collect_c_comparison_dictionary_tokens(
     node: tree_sitter::Node<'_>,
     source: &[u8],
-    tokens: &mut Vec<String>,
+    tokens: &mut Vec<LocatedToken>,
 ) {
     let Some(_depth_guard) = AstDepthGuard::enter() else {
         return;
@@ -1404,7 +1454,11 @@ fn collect_c_comparison_dictionary_tokens(
                                 "number_literal" | "char_literal" | "string_literal"
                             ) {
                                 if let Ok(text) = operand.utf8_text(source).map(str::trim) {
-                                    push_c_case_label_dictionary_token(text, tokens);
+                                    push_c_case_label_dictionary_token(
+                                        text,
+                                        node_line(operand),
+                                        tokens,
+                                    );
                                 }
                             }
                         }
@@ -1422,15 +1476,20 @@ fn collect_c_comparison_dictionary_tokens(
 fn collect_c_string_dictionary_tokens(
     node: tree_sitter::Node<'_>,
     source: &[u8],
-    tokens: &mut Vec<String>,
+    tokens: &mut Vec<LocatedToken>,
 ) {
     let Some(_depth_guard) = AstDepthGuard::enter() else {
         return;
     };
-    if node.kind() == "string_literal" {
+    // The path of `#include "x.h"` parses as a string literal too, but it
+    // names a file; the target never compares its input against it.
+    let include_path = node
+        .parent()
+        .is_some_and(|parent| parent.kind() == "preproc_include");
+    if node.kind() == "string_literal" && !include_path {
         if let Ok(raw) = node.utf8_text(source) {
             if let Some(value) = c_string_literal_value(raw) {
-                push_dictionary_token(tokens, value);
+                push_located_token(tokens, value, node_line(node));
             }
         }
     }
@@ -1512,8 +1571,9 @@ fn value_is_c_type_expr(value: &str) -> bool {
         .all(|t| TYPE_KW.contains(t) || t.chars().all(|c| c == '*'))
 }
 
-fn collect_c_define_dictionary_tokens(source: &str, tokens: &mut Vec<String>) {
-    for line in source.lines() {
+fn collect_c_define_dictionary_tokens(source: &str, tokens: &mut Vec<LocatedToken>) {
+    for (index, line) in source.lines().enumerate() {
+        let line_number = u32::try_from(index + 1).unwrap_or(u32::MAX);
         let trimmed = line.trim_start();
         let Some(rest) = trimmed.strip_prefix("#define") else {
             continue;
@@ -1535,9 +1595,9 @@ fn collect_c_define_dictionary_tokens(source: &str, tokens: &mut Vec<String>) {
             .trim();
         let first = value.split_whitespace().next().unwrap_or("");
         if let Some(value) = c_string_literal_value(first) {
-            push_dictionary_token(tokens, value);
+            push_located_token(tokens, value, line_number);
         } else if is_c_integer_literal(first) {
-            push_dictionary_token(tokens, first.to_owned());
+            push_located_token(tokens, first.to_owned(), line_number);
         }
     }
 }
@@ -1545,7 +1605,7 @@ fn collect_c_define_dictionary_tokens(source: &str, tokens: &mut Vec<String>) {
 fn collect_c_case_dictionary_tokens(
     node: tree_sitter::Node<'_>,
     source: &[u8],
-    tokens: &mut Vec<String>,
+    tokens: &mut Vec<LocatedToken>,
 ) {
     let Some(_depth_guard) = AstDepthGuard::enter() else {
         return;
@@ -1553,7 +1613,7 @@ fn collect_c_case_dictionary_tokens(
     if node.kind() == "case_statement" {
         if let Some(label) = node.child_by_field_name("value") {
             if let Ok(label) = label.utf8_text(source).map(str::trim) {
-                push_c_case_label_dictionary_token(label, tokens);
+                push_c_case_label_dictionary_token(label, node_line(node), tokens);
             }
         }
     }
@@ -1563,16 +1623,16 @@ fn collect_c_case_dictionary_tokens(
     }
 }
 
-fn push_c_case_label_dictionary_token(label: &str, tokens: &mut Vec<String>) {
+fn push_c_case_label_dictionary_token(label: &str, line: u32, tokens: &mut Vec<LocatedToken>) {
     if label.is_empty() {
         return;
     }
     if let Some(value) = c_string_literal_value(label) {
-        push_dictionary_token(tokens, value);
+        push_located_token(tokens, value, line);
     } else if let Some(value) = c_char_literal_value(label) {
-        push_dictionary_token(tokens, value);
+        push_located_token(tokens, value, line);
     } else if is_c_integer_literal(label) || is_c_identifier(label) {
-        push_dictionary_token(tokens, label.to_owned());
+        push_located_token(tokens, label.to_owned(), line);
     }
 }
 
@@ -1643,14 +1703,6 @@ fn is_c_identifier(raw: &str) -> bool {
     (first.is_ascii_alphabetic() || first == '_')
         && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
         && !is_c_keyword(raw)
-}
-
-fn push_dictionary_token(tokens: &mut Vec<String>, token: String) {
-    let token = token.trim().to_owned();
-    if token.is_empty() || token.len() > 256 || tokens.contains(&token) {
-        return;
-    }
-    tokens.push(token);
 }
 
 fn collect_type_defs(node: tree_sitter::Node<'_>, source: &[u8], defs: &mut CTypeDefs) {
@@ -3975,13 +4027,20 @@ mod tests {
         #if defined(__QNX__)
         int qnx_only(int x) { return x; }
         #endif
+        #ifdef __linux__
+        int linux_only(int x) { return x; }
+        #endif
         int portable(int x) { return x; }
         "#,
         )
         .expect("C parses");
         let by_name = |n: &str| functions.iter().find(|f| f.name == n).unwrap();
-        assert!(by_name("win_only").foreign_guard.is_some());
-        assert!(by_name("msvc_only").foreign_guard.is_some());
+        // Which desktop platform is foreign depends on the host: Windows
+        // branches on a Unix host, Unix branches on a Windows host.
+        let windows_host = cfg!(windows);
+        assert_eq!(by_name("win_only").foreign_guard.is_some(), !windows_host);
+        assert_eq!(by_name("msvc_only").foreign_guard.is_some(), !windows_host);
+        assert_eq!(by_name("linux_only").foreign_guard.is_some(), windows_host);
         // RTOS-guarded branches are foreign on this host too (routed to a
         // stub-isolated build via foreign_platform_stub).
         assert_eq!(
@@ -4233,6 +4292,64 @@ mod tests {
         assert!(tokens.contains(&"READY".to_owned()));
         assert!(tokens.contains(&"0x42".to_owned()));
         assert!(tokens.contains(&"Z".to_owned()));
+    }
+
+    /// Each mined token carries the lines it was found on, so the dictionary
+    /// writer can say where a token came from; repeats are capped.
+    #[test]
+    fn c_dictionary_tokens_record_their_source_lines() {
+        let tokens = extract_c_dictionary_tokens_located(
+            "#define WIDGET_TAG \"WGT1\"\n\
+             enum mode { MODE_FAST, MODE_SAFE };\n\
+             int parse_record(const char *s, int tag) {\n\
+                 if (tag == 0x42) return 1;\n\
+                 switch (tag) { case 0x42: return 2; default: break; }\n\
+                 if (tag != 0x42) return 3;\n\
+                 if (tag > 0x42) return 4;\n\
+                 return strcmp(s, \"WGT1\") == 0;\n\
+             }\n",
+        )
+        .expect("C parses");
+        let lines = |value: &str| {
+            tokens
+                .iter()
+                .find(|token| token.value == value)
+                .map(|token| token.lines.clone())
+                .unwrap_or_else(|| panic!("{value} not mined: {tokens:?}"))
+        };
+        let mut tag = lines("WGT1");
+        tag.sort_unstable();
+        assert_eq!(tag, vec![1, 8], "the #define and the string literal");
+        assert_eq!(lines("MODE_SAFE"), vec![2]);
+        let magic = lines("0x42");
+        assert_eq!(magic.len(), MAX_TOKEN_LINES, "{magic:?}");
+        assert!(magic.iter().all(|line| (4..=7).contains(line)), "{magic:?}");
+        // The plain extractor still yields each token once, in the same order.
+        let plain = extract_c_dictionary_tokens(
+            "int f(int t) { if (t == 7) return 1; if (t == 7) return 2; return 0; }",
+        )
+        .expect("C parses");
+        assert_eq!(plain, vec!["7".to_owned()]);
+    }
+
+    /// An `#include "..."` path is a file name, not a value the target compares
+    /// its input against; mining it made header names look like magic values.
+    #[test]
+    fn c_dictionary_skips_include_paths() {
+        let tokens = extract_c_dictionary_tokens(
+            r#"
+            #include "widget.h"
+            #include "include/widget_io.h"
+            #include <string.h>
+            int parse_record(const char *s) { return strcmp(s, "WIDGET") == 0; }
+            "#,
+        )
+        .expect("C parses");
+        assert!(tokens.contains(&"WIDGET".to_owned()), "{tokens:?}");
+        assert!(
+            !tokens.iter().any(|token| token.ends_with(".h")),
+            "include paths are not tokens: {tokens:?}"
+        );
     }
 
     #[test]

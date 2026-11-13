@@ -108,10 +108,13 @@ fn attempt_repairs_missing_header_for_simple_c_target() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = cli::auto::attempt::AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -211,10 +214,13 @@ fn attempt_skips_target_whose_definition_is_conditionally_compiled_out() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -335,6 +341,7 @@ fn attempt_pairs_tree_wide_c_lifecycle_from_unincluded_header() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
@@ -348,6 +355,8 @@ fn attempt_pairs_tree_wide_c_lifecycle_from_unincluded_header() {
         idx.c_tree_lifecycle
     );
     let options = cli::auto::attempt::AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -424,10 +433,13 @@ fn attempt_adds_project_source_for_missing_c_symbol() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -531,10 +543,13 @@ fn attempt_builds_harness_for_unnamed_param_callback_typedef() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -639,10 +654,13 @@ fn attempt_adds_project_source_for_missing_cpp_symbol() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -697,6 +715,151 @@ fn attempt_adds_project_source_for_missing_cpp_symbol() {
             );
         }
         other => panic!("expected built after adding helper.cpp, got {other:?}"),
+    }
+}
+
+/// A recovered sibling source that writes to `cerr` under `using namespace std;`
+/// without including `<iostream>` (an old transitive-include assumption) must get
+/// the header force-included and stay linked, not be dropped and stubbed.
+#[test]
+fn attempt_force_includes_stream_header_for_recovered_cpp_source() {
+    use cli::auto::{attempt::*, candidate::*, decl_index::DeclarationIndex, pass::Pass};
+
+    if which::which("clang++").is_err() {
+        eprintln!("skipping: clang++ not on PATH");
+        return;
+    }
+    if which::which("make").is_err() {
+        eprintln!("skipping: make not on PATH");
+        return;
+    }
+    let Some(cxx_flags) = clangxx_libfuzzer_flags("attempt-cpp-stream") else {
+        eprintln!("skipping: clang++ -fsanitize=fuzzer toolchain incomplete");
+        return;
+    };
+
+    let root = tmpdir();
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(
+        src.join("api.cpp"),
+        "#include <string>\n\
+         namespace widgets {\n\
+         int check_record(const std::string &record);\n\
+         int parse_record(const char *data, unsigned long size) {\n\
+             return check_record(std::string(data, size));\n\
+         }\n\
+         }\n",
+    )
+    .unwrap();
+    let helper = src.join("checker.cpp");
+    fs::write(
+        &helper,
+        "#include <string>\n\
+         using namespace std;\n\
+         namespace widgets {\n\
+         int check_record(const string &record) {\n\
+             if (record.empty()) cerr << \"empty record\" << endl;\n\
+             return (int)record.size();\n\
+         }\n\
+         }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("compile_commands.json"),
+        format!(
+            r#"[{{"directory":"{}","file":"{}","command":"clang++ {} -std=c++17 -c {}" }}]"#,
+            src.display(),
+            src.join("api.cpp").display(),
+            cxx_flags.join(" "),
+            src.join("api.cpp").display()
+        ),
+    )
+    .unwrap();
+    let work = root.join("work");
+    fs::create_dir_all(&work).unwrap();
+    let work = fs::canonicalize(&work).unwrap();
+    let candidate = Candidate {
+        harness_id: "H-X0016".to_owned(),
+        lang: Lang::Cpp,
+        source_path: src.join("api.cpp"),
+        line: 4,
+        name: "widgets::parse_record".to_owned(),
+        score: 60,
+        is_static: false,
+        foreign_guard: None,
+        input_reachability: None,
+        input_reachability_basis: None,
+        dialect: None,
+    };
+    let idx = DeclarationIndex::build(&root).unwrap();
+    let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
+        decoder_limits: Default::default(),
+        force: false,
+        run_untrusted: false,
+        engines: vec![cli::auto::attempt::FuzzEngine::Builtin],
+        ada_main_sources: Default::default(),
+        dir_filter: Default::default(),
+        comparison_progress: false,
+        max_repair_rounds: 48,
+        sanitizers: Default::default(),
+        per_target_time: std::time::Duration::from_secs(5),
+        total_time: None,
+        per_target_finding_count: None,
+        no_stubs: false,
+        passes: vec![Pass::Empty],
+        source_root: Some(src.clone()),
+        project: None,
+        ada_dep_dirs: Vec::new(),
+        mode: actionability::RunMode::Reporting,
+        user_seeds: Vec::new(),
+        extra_include_dirs: Vec::new(),
+        extra_sources: Vec::new(),
+        iterations: None,
+        rss_limit_mb: 2048,
+    };
+
+    let result = attempt(&candidate, &work, &idx, options).unwrap();
+
+    match &result.outcome {
+        Outcome::Built { repairs, .. } | Outcome::BuiltAndFuzzed { repairs, .. } => {
+            assert!(
+                repairs.iter().any(|repair| matches!(
+                    repair,
+                    cli::auto::repair::Repair::AddSource { source_path, .. }
+                        if source_path == &helper
+                )),
+                "expected the checker source to be linked, got {repairs:?}"
+            );
+            assert!(
+                repairs.iter().any(|repair| matches!(
+                    repair,
+                    cli::auto::repair::Repair::TypePlaceholder { type_name, .. }
+                        if type_name == "cerr"
+                )),
+                "expected the stream header repair for cerr, got {repairs:?}"
+            );
+            assert!(
+                !repairs.iter().any(|repair| matches!(
+                    repair,
+                    cli::auto::repair::Repair::StubBlind { symbol }
+                    | cli::auto::repair::Repair::StubDeclared { symbol, .. }
+                        if symbol.contains("check_record")
+                )),
+                "the real source must not be dropped and stubbed: {repairs:?}"
+            );
+            let includes = fs::read_to_string(
+                result
+                    .harness_dir
+                    .join("repairs")
+                    .join(cli::auto::repair::AUTO_CPP_INCLUDES_FILE),
+            )
+            .unwrap();
+            assert!(includes.contains("#include <iostream>"), "{includes}");
+        }
+        other => panic!("expected a build with the checker source, got {other:?}"),
     }
 }
 
@@ -759,10 +922,13 @@ fn attempt_prefers_sequence_for_cpp_class_method_with_lifecycle_steps() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -869,10 +1035,13 @@ fn attempt_uses_direct_cpp_harness_when_lifecycle_helpers_are_private() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -960,10 +1129,13 @@ fn attempt_runtime_cap_excludes_build_time() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -1046,10 +1218,13 @@ fn attempt_total_time_apportions_across_passes() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -1148,10 +1323,13 @@ fn attempt_builds_and_fuzzes_struct_by_value_c_target() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -1245,10 +1423,13 @@ fn attempt_rss_limit_classifies_oom_as_bhf209() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -1353,10 +1534,13 @@ fn attempt_prefers_sequence_for_first_param_handle_c_target() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -1453,10 +1637,13 @@ fn attempt_prefers_sequence_for_c_target_with_static_lifecycle_helpers() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -1543,10 +1730,13 @@ fn attempt_uses_direct_harness_for_generic_void_pointer_c_target() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -1641,10 +1831,13 @@ fn attempt_builds_and_fuzzes_c_scalar_and_enum_output_pointers() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -1734,10 +1927,13 @@ fn attempt_builds_and_fuzzes_c_const_byte_typedef_pair() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -1776,8 +1972,9 @@ fn attempt_builds_and_fuzzes_c_const_byte_typedef_pair() {
         other => panic!("expected const byte typedef target to build+fuzz, got {other:?}"),
     }
     let main = fs::read_to_string(result.harness_dir.join("main.c")).unwrap();
-    assert!(main.contains("const mz_uint8 * ptr = (const mz_uint8 *)Data"));
-    assert!(main.contains("size_t buf_len = (size_t)Size"));
+    // The pair borrows the input the leading `crc` did not read.
+    assert!(main.contains("const mz_uint8 * ptr = (const mz_uint8 *)_bhf_rest_p"));
+    assert!(main.contains("size_t buf_len = (size_t)_bhf_rest_size_p"));
     assert!(
         !main.contains("_bhf_out_ptr"),
         "const byte input pointer should borrow Data, not use output storage:\n{main}"
@@ -1830,10 +2027,13 @@ fn attempt_builds_and_fuzzes_c_miniz_file_macro_pointer() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -1873,7 +2073,7 @@ fn attempt_builds_and_fuzzes_c_miniz_file_macro_pointer() {
     }
     let main = fs::read_to_string(result.harness_dir.join("main.c")).unwrap();
     assert!(main.contains("MZ_FILE * pFile = (MZ_FILE *)(_bhf_file_buf_pFile ?"));
-    assert!(main.contains("fmemopen(_bhf_file_buf_pFile, Size, \"r+\")"));
+    assert!(main.contains("bhf_fmemopen(_bhf_file_buf_pFile, Size)"));
     assert!(main.contains("parse_cfile(pFile)"));
     assert!(main.contains("if (pFile) fclose(pFile);"));
     assert!(main.contains("free(_bhf_file_buf_pFile);"));
@@ -1925,10 +2125,13 @@ fn attempt_builds_and_fuzzes_c_miniz_time_pointer_alias() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -2017,10 +2220,13 @@ fn attempt_builds_and_fuzzes_c_void_pointer_output_slot() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -2117,10 +2323,13 @@ fn attempt_builds_and_fuzzes_c_void_output_capacity_and_input_pair() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -2233,10 +2442,13 @@ fn attempt_builds_and_fuzzes_cpp_void_output_capacity_and_input_pair() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -2353,10 +2565,13 @@ fn attempt_builds_and_fuzzes_cpp_void_output_length_pointer_and_input_pair() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -2468,10 +2683,13 @@ fn attempt_builds_and_fuzzes_cpp_standard_scalar_aliases() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -2510,7 +2728,7 @@ fn attempt_builds_and_fuzzes_cpp_standard_scalar_aliases() {
         other => panic!("expected C++ std scalar target to build+fuzz, got {other:?}"),
     }
     let main = fs::read_to_string(result.harness_dir.join("main.cpp")).unwrap();
-    assert!(main.contains("std::uint32_t flags = (std::uint32_t)bhf_bounded_i32"));
+    assert!(main.contains("std::uint32_t flags = (std::uint32_t)bhf_i32(&Cur)"));
     assert!(main.contains("std::size_t count = (std::size_t)bhf_bounded_length"));
     assert!(main.contains("std::uint16_t code = (std::uint16_t)bhf_bounded_i32"));
     assert!(main.contains("bool enabled = (bool)(bhf_u8(&Cur) & 1)"));
@@ -2594,10 +2812,13 @@ fn attempt_builds_and_fuzzes_cpp_struct_by_value_target() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -2700,10 +2921,13 @@ fn attempt_builds_and_fuzzes_cpp_file_pointer_target() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -2744,7 +2968,7 @@ fn attempt_builds_and_fuzzes_cpp_file_pointer_target() {
     let main = fs::read_to_string(result.harness_dir.join("main.cpp")).unwrap();
     assert!(main.contains("#include <stdio.h>"));
     assert!(main.contains("FILE * stream = _bhf_file_buf_stream ?"));
-    assert!(main.contains("fmemopen(_bhf_file_buf_stream, Size, \"r+\")"));
+    assert!(main.contains("bhf_fmemopen(_bhf_file_buf_stream, Size)"));
     assert!(main.contains("int R = parse_stream(stream);"));
     assert!(main.contains("if (stream) fclose(stream);"));
     assert!(main.contains("free(_bhf_file_buf_stream);"));
@@ -2809,10 +3033,13 @@ fn attempt_builds_and_fuzzes_cpp_callback_typedef_target() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -2897,10 +3124,13 @@ fn attempt_dispatches_ada_candidate_to_gprbuild() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -2945,6 +3175,7 @@ fn attempt_dispatches_ada_candidate_to_gprbuild() {
         | Outcome::FailedBuild { .. }
         | Outcome::UnrecoverableLink { .. }
         | Outcome::UnrecoverableRuntime { .. }
+        | Outcome::UnsafeBuildPath { .. }
         | Outcome::ReportOnly { .. } => {
             // Any of these is fine - the dispatch reached the Ada path.
         }
@@ -3003,12 +3234,15 @@ fn attempt_recovers_cross_dir_ada_unit_source() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     // Index parses the scan path but indexes Ada unit->source across the whole
     // project root (where `core/` lives) — the cross-tree lever.
     let idx = DeclarationIndex::build_indexed(&types, &root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -3107,10 +3341,13 @@ fn static_c_direct_targets_build_through_included_source() {
         is_static: true,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = cli::auto::attempt::AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -3199,10 +3436,13 @@ fn static_cpp_direct_targets_build_through_included_source() {
         is_static: true,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = cli::auto::attempt::AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -3241,6 +3481,8 @@ fn static_cpp_direct_targets_build_through_included_source() {
     );
 }
 
+// On a Windows host a `_WIN32` target is native, not foreign.
+#[cfg(not(windows))]
 #[test]
 fn foreign_platform_guarded_target_builds_via_cross_or_platform_stub() {
     // A Windows (`_WIN32`) OS-platform-guarded target is NO LONGER pre-skipped.
@@ -3272,10 +3514,13 @@ fn foreign_platform_guarded_target_builds_via_cross_or_platform_stub() {
         is_static: false,
         foreign_guard: Some("_WIN32".to_owned()),
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = cli::auto::attempt::AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -3371,10 +3616,13 @@ fn attempt_reports_phase_progression_through_progress_sink() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = cli::auto::attempt::AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -3489,10 +3737,13 @@ fn attempt_constructs_typedef_hidden_opaque_handle_via_returning_ctor() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -3583,10 +3834,13 @@ fn attempt_synthesises_corba_stub_for_missing_idl_header_but_empty_for_internal(
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&root).unwrap();
     let options = AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -3642,6 +3896,10 @@ fn attempt_synthesises_corba_stub_for_missing_idl_header_but_empty_for_internal(
 #[test]
 fn attempt_skips_cpp_method_of_class_defined_only_in_translation_unit() {
     use cli::auto::{attempt::*, candidate::*, decl_index::DeclarationIndex};
+    if which::which("make").is_err() {
+        eprintln!("skipping: make not on PATH");
+        return;
+    }
 
     let root = tmpdir();
     fs::write(
@@ -3676,6 +3934,8 @@ fn attempt_skips_cpp_method_of_class_defined_only_in_translation_unit() {
     let work = fs::canonicalize(&work).unwrap();
     let idx = DeclarationIndex::build(&root).unwrap();
     let make_options = || AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         decoder_limits: Default::default(),
         force: false,
         run_untrusted: false,
@@ -3713,6 +3973,7 @@ fn attempt_skips_cpp_method_of_class_defined_only_in_translation_unit() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let result = attempt(&cpp_only, &work, &idx, make_options()).unwrap();
@@ -3746,6 +4007,7 @@ fn attempt_skips_cpp_method_of_class_defined_only_in_translation_unit() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let result = attempt(&header_declared, &work, &idx, make_options()).unwrap();

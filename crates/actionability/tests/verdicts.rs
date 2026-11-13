@@ -665,3 +665,318 @@ fn single_value_enum_assertion_is_not_demoted() {
     let record = backfill_actionability(RunMode::Attacking, &raw, None);
     assert_ne!(record.verdict, Verdict::LabOnly);
 }
+
+/// A generated harness source with `statement` at line 76 of `main.c` in a
+/// fresh directory, and the path of that file.
+fn generated_main(tag: &str, statements: &[&str]) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("bhf-actionability-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut lines = vec![
+        "/* SPDX-License-Identifier: Apache-2.0 */".to_owned(),
+        "/* generated_harnesses/H-C0001/main.c */".to_owned(),
+        "/* bhf harness format 2 */".to_owned(),
+    ];
+    while lines.len() < 72 {
+        lines.push(String::new());
+    }
+    lines.push("int bhf_run_one(const uint8_t *Data, size_t Size) {".to_owned());
+    lines.push("    BHF_PUBLISH_INPUT(Data, Size);".to_owned());
+    lines.push("    bhf_cursor Cur = bhf_open(Data, Size);".to_owned());
+    for statement in statements {
+        lines.push(format!("    {statement}"));
+    }
+    lines.push("    return 0;".to_owned());
+    lines.push("}".to_owned());
+    let path = dir.join("main.c");
+    std::fs::write(&path, lines.join("\n")).unwrap();
+    path
+}
+
+/// A heap overflow of a buffer allocated at `alloc_function` in `alloc_file`
+/// (line `line`), on an entry whose signature takes a byte buffer.
+fn harness_sized_overflow_at(
+    alloc_function: &str,
+    alloc_file: &str,
+    line: u64,
+) -> serde_json::Value {
+    json!({
+        "id": "F-pre", "rule_id": "BHF-201", "harness_id": "H-C0001",
+        "input_reachability": "attacker_reachable",
+        "exception": {
+            "name": "ASAN_HEAP_BUFFER_OVERFLOW", "sanitizer": "asan",
+            "message": "heap-buffer-overflow READ of size 4",
+            "stack": [{ "function": "copy_at", "file": "/src/widget/copy.c", "line": 7 }],
+            "access": {
+                "direction": "read", "size": 4,
+                "region": { "kind": "heap", "size": 1, "offset": 1, "relation": "after", "distance": 0 },
+                "alloc_stack": [
+                    { "function": "malloc", "file": "/llvm/compiler-rt/lib/asan/asan_malloc_linux.cpp", "line": 68 },
+                    { "function": alloc_function, "file": alloc_file, "line": line },
+                    { "function": "bhf_run_one", "file": "/w/harnesses/H-C0001/main.c", "line": 106 }
+                ]
+            }
+        }
+    })
+}
+
+/// The statement a generated harness emits for a lone `const unsigned char *`
+/// parameter: a copy of the whole input, sized by the harness.
+const LENGTHLESS_COPY: &str = "size_t _bhf_cap_tag = (size_t)Size + 1; if (_bhf_cap_tag < 8) _bhf_cap_tag = 8; const unsigned char * tag = (const unsigned char *)malloc(_bhf_cap_tag); if (tag) { memset((void *)tag, 0, _bhf_cap_tag); if (Size) memcpy((void *)tag, Data, Size); ((char *)tag)[Size] = '\\0'; };";
+
+/// A heap overflow of a buffer the generated harness allocated for a pointer
+/// parameter it passes without a length (a decoded C string, or a copy of the
+/// input sized by the harness) is precondition-dependent, not reachable from
+/// input, even on an entry whose signature takes a byte buffer.
+#[test]
+fn overflow_of_a_harness_sized_buffer_is_precondition_dependent() {
+    let main = generated_main("lengthless", &[LENGTHLESS_COPY, "int R = read_tag(tag);"]);
+    let main = main.to_str().unwrap().to_owned();
+    for (function, file, line, buffer) in [
+        (
+            "bhf_c_string",
+            "/w/harnesses/H-C0001/bhf_decode.h",
+            195,
+            None,
+        ),
+        ("bhf_run_one", main.as_str(), 76, Some("`tag`")),
+    ] {
+        let raw = harness_sized_overflow_at(function, file, line);
+        assert!(
+            actionability::is_harness_sized_buffer_overflow(&raw),
+            "{function}"
+        );
+        let record = backfill_actionability(
+            RunMode::Reporting,
+            &raw,
+            Some("findings/F-pre/finding.json"),
+        );
+        assert_eq!(record.verdict, Verdict::LabOnly, "{function}");
+        let mut stamped = raw.clone();
+        stamped["actionability"] = serde_json::to_value(&record).unwrap();
+        let text = actionability::reachability_statement(&stamped, Some("read_tag"));
+        assert!(text.starts_with("precondition-dependent"), "{text}");
+        assert!(text.contains("passed without a length"), "{text}");
+        if let Some(buffer) = buffer {
+            assert!(text.contains(buffer), "{text}");
+        }
+        assert!(!text.contains("attacker-reachable"), "{text}");
+    }
+}
+
+/// The generated harness also allocates the buffer of a `(buf, len)` pair,
+/// an output buffer with its capacity, and a NUL-terminated copy passed with
+/// a length. Those come with their length, so an overflow past it is the
+/// target's and keeps its reachability verdict.
+#[test]
+fn overflow_of_a_harness_buffer_passed_with_its_length_stays_reachable() {
+    for (tag, statements) in [
+        (
+            "pair",
+            [
+                "size_t _bhf_cap_buf = Size <= (1024 * 1024) ? (size_t)Size : (1024 * 1024); uint8_t * buf = (uint8_t *)malloc(_bhf_cap_buf ? _bhf_cap_buf : 1); if (buf && _bhf_cap_buf) memcpy(buf, Data, _bhf_cap_buf);",
+                "size_t len = (size_t)(buf ? _bhf_cap_buf : 0);",
+                "int R = parse_frame(buf, len);",
+            ],
+        ),
+        (
+            "output",
+            [
+                "size_t _bhf_cap_out = Size < (1024 * 1024) ? Size + 65536 : (1024 * 1024 + 65536); char * out = (char *)malloc(_bhf_cap_out ? _bhf_cap_out : 1);",
+                "size_t _bhf_out_cap = (size_t)(out ? _bhf_cap_out : 0); size_t *cap = &_bhf_out_cap;",
+                "int R = render_widget(out, cap);",
+            ],
+        ),
+        (
+            "nul-copy",
+            [
+                "size_t _bhf_ntlen_str = Size <= (1024 * 1024) ? (size_t)Size : (1024 * 1024); char *_bhf_ntbuf_str = (char *)malloc(_bhf_ntlen_str + 1); if (_bhf_ntbuf_str) { if (_bhf_ntlen_str) memcpy(_bhf_ntbuf_str, Data, _bhf_ntlen_str); _bhf_ntbuf_str[_bhf_ntlen_str] = 0; } const char * str = (const char *)_bhf_ntbuf_str;",
+                "size_t len = (size_t)(_bhf_ntbuf_str ? _bhf_ntlen_str : 0);",
+                "int R = scan_text(str, len, 1);",
+            ],
+        ),
+    ] {
+        let main = generated_main(tag, &statements);
+        let raw = harness_sized_overflow_at("bhf_run_one", main.to_str().unwrap(), 76);
+        assert!(
+            !actionability::is_harness_sized_buffer_overflow(&raw),
+            "{tag}"
+        );
+        let record = backfill_actionability(
+            RunMode::Reporting,
+            &raw,
+            Some("findings/F-pre/finding.json"),
+        );
+        assert_eq!(record.verdict, Verdict::LikelyReachable, "{tag}");
+        let mut stamped = raw.clone();
+        stamped["actionability"] = serde_json::to_value(&record).unwrap();
+        let text = actionability::reachability_statement(&stamped, Some("parse_frame"));
+        assert!(!text.contains("precondition"), "{tag}: {text}");
+    }
+}
+
+#[test]
+fn overflow_of_a_project_or_driver_buffer_is_not_precondition_dependent() {
+    // The project allocated it, or it is the driver's input buffer (which the
+    // harness passes together with its length), or a harness whose source is
+    // not a generated one or cannot be read: nothing shows a length-less
+    // parameter.
+    let custom =
+        std::env::temp_dir().join(format!("bhf-actionability-custom-{}", std::process::id()));
+    std::fs::create_dir_all(&custom).unwrap();
+    let mut source = vec![String::new(); 75];
+    source.push("    char *s = malloc(size + 1);".to_owned());
+    std::fs::write(custom.join("main.c"), source.join("\n")).unwrap();
+    let custom_main = custom.join("main.c");
+    for (function, file, line) in [
+        ("parse_record", "/src/widget/parse.c", 195),
+        ("bhf_run_file", "/opt/bhf/c_runtime/bhf_driver.c", 660),
+        ("bhf_run_one", custom_main.to_str().unwrap(), 76),
+        ("bhf_run_one", "/nonexistent/harnesses/H-C0001/main.c", 76),
+    ] {
+        let raw = harness_sized_overflow_at(function, file, line);
+        let raw = if function == "bhf_run_file" {
+            let mut raw = raw;
+            raw["exception"]["access"]["alloc_stack"] = json!([
+                { "function": "malloc" },
+                { "function": "bhf_run_file", "file": file, "line": 660 },
+                { "function": "main", "file": file, "line": 744 }
+            ]);
+            raw
+        } else {
+            raw
+        };
+        assert!(
+            !actionability::is_harness_sized_buffer_overflow(&raw),
+            "{function} {file}"
+        );
+        let record = backfill_actionability(
+            RunMode::Reporting,
+            &raw,
+            Some("findings/F-pre/finding.json"),
+        );
+        assert_ne!(record.verdict, Verdict::LabOnly, "{function} {file}");
+    }
+}
+
+/// The reachability wording names its evidence: a signature-shape inference
+/// says so, and an unassessed entry reads as not assessed, never as
+/// attacker-reachable.
+#[test]
+fn reachability_statement_names_its_basis() {
+    let statement = |verdict: &str, reachability: Option<&str>| {
+        let mut raw = json!({ "harness_id": "H-C0001", "actionability": { "verdict": verdict } });
+        if let Some(label) = reachability {
+            raw["input_reachability"] = json!(label);
+        }
+        actionability::reachability_statement(&raw, Some("parse_record"))
+    };
+    let inferred = statement("likely_reachable", Some("attacker_reachable"));
+    assert!(
+        inferred.starts_with(
+            "the signature of the entry `parse_record` matches an input-taking shape, so likely \
+             reachable from input; not proven"
+        ),
+        "{inferred}"
+    );
+    // The signature-based classifier also accepts a parser taking one byte,
+    // so the wording never claims a byte buffer.
+    assert!(!inferred.contains("byte buffer"), "{inferred}");
+    let unassessed = statement("likely_reachable", None);
+    assert!(
+        unassessed.starts_with("reachability not assessed"),
+        "{unassessed}"
+    );
+    let unproven = statement("lab_only", Some("reachability_unproven"));
+    assert!(unproven.contains("unproven"), "{unproven}");
+    // Without a recorded basis nothing says whether typedefs were resolved,
+    // and the wording never says no parameter is a byte buffer.
+    assert!(
+        unproven.contains(
+            "the signature of the entry `parse_record` does not match an input-taking shape"
+        ),
+        "{unproven}"
+    );
+    assert!(!unproven.contains("as spelled"), "{unproven}");
+    assert!(!unproven.contains("no parameter"), "{unproven}");
+    assert_eq!(statement("", None), "not assessed");
+    for text in [inferred, unassessed, unproven] {
+        assert!(!text.contains("attacker-reachable"), "{text}");
+    }
+
+    // With the basis the classifier recorded, the verdict names the
+    // parameter and its type as spelled and resolved.
+    let with_basis = |verdict: &str, label: &str, basis: serde_json::Value| {
+        let raw = json!({ "harness_id": "H-C0001", "actionability": { "verdict": verdict },
+            "input_reachability": label, "input_reachability_basis": basis });
+        actionability::reachability_statement(&raw, Some("parse_record"))
+    };
+    let named = with_basis(
+        "likely_reachable",
+        "attacker_reachable",
+        json!({"rule": "const_byte_buffer", "param": "buf", "spelled_type": "const u8_t *",
+               "resolved_type": "const uint8_t *", "typedefs_resolved": true}),
+    );
+    assert!(
+        named.contains(
+            "matches an input-taking shape because parameter `buf` (`const u8_t *`, resolves to \
+             `const uint8_t *`) is a read-only byte buffer, so likely reachable from input; not \
+             proven"
+        ),
+        "{named}"
+    );
+    let resolved_unproven = with_basis(
+        "lab_only",
+        "reachability_unproven",
+        json!({"rule": "no_input_shape", "typedefs_resolved": true}),
+    );
+    assert!(
+        resolved_unproven.contains(
+            "the signature of the entry `parse_record`, with its typedefs resolved, does not \
+             match an input-taking shape"
+        ),
+        "{resolved_unproven}"
+    );
+    let internal = with_basis(
+        "lab_only",
+        "reachability_unproven",
+        json!({"rule": "internal_linkage", "param": "buf", "spelled_type": "const uint8_t *"}),
+    );
+    assert!(
+        internal.contains("`parse_record` has internal linkage (`static`)"),
+        "{internal}"
+    );
+}
+
+/// An input that is empty or all zero bytes, or a method run on an object
+/// bhf's harness built, is a state real callers may never produce: each gets
+/// its own caveat. A plain function on a non-zero input gets none.
+#[test]
+fn constructed_states_get_a_caveat() {
+    let plain = json!({"rule_id": "BHF-201", "harness_id": "H-C0001"});
+    assert!(actionability::harness_state_caveats(&plain, Some(b"\x01\x02")).is_empty());
+    assert!(actionability::harness_state_caveats(&plain, None).is_empty());
+    for input in [&b""[..], &b"\x00\x00\x00\x00"[..]] {
+        let caveats = actionability::harness_state_caveats(&plain, Some(input));
+        assert_eq!(caveats.len(), 1, "{caveats:?}");
+        assert!(
+            caveats[0].contains(
+                "a real caller may never pass all-zero arguments; check that one can before \
+                 treating this as reachable"
+            ),
+            "{caveats:?}"
+        );
+    }
+    let method = json!({"rule_id": "BHF-201", "harness_id": "H-X0001", "decoded_args": [
+        {"name": "receiver", "type": "Widget", "role": "receiver", "decoder": "default constructor"},
+        {"name": "n", "type": "int", "role": "param", "value": "3", "span": [0, 4]}
+    ]});
+    let caveats = actionability::harness_state_caveats(&method, Some(b"\x03\x00\x00\x00"));
+    assert_eq!(
+        caveats,
+        vec![
+            "the method ran on an object bhf's harness constructed (default constructor); real \
+             callers may never put the object in that state"
+                .to_owned()
+        ]
+    );
+}

@@ -3003,12 +3003,13 @@ CBOR_EXPORT _cbor_free_t _cbor_free = free;
     #[test]
     fn missing_host_platform_header_rejects_foreign_and_build_only_copies() {
         let root = tmpdir();
-        for dir in [
-            "builds/vxworks",
-            "builds/qnx",
-            "builds/zos",
-            "builds/mingw32",
-        ] {
+        // MinGW's copy is the host's own on Windows; there Linux's is foreign.
+        let other_desktop = if cfg!(windows) {
+            "builds/linux"
+        } else {
+            "builds/mingw32"
+        };
+        for dir in ["builds/vxworks", "builds/qnx", "builds/zos", other_desktop] {
             let dir = root.join(dir);
             fs::create_dir_all(&dir).unwrap();
             fs::write(dir.join("platform.hpp"), "#define FOREIGN_PLATFORM 1\n").unwrap();

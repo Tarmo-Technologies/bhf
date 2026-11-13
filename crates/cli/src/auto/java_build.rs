@@ -983,7 +983,7 @@ fn tail_lines(s: &str, n: usize) -> String {
 /// Collect every `.java` file under `root`, skipping the bhf work dir and
 /// non-library dirs (build output, test/example trees). Capped to keep a
 /// pathological tree bounded.
-fn collect_java_sources(root: &Path) -> Vec<PathBuf> {
+pub(crate) fn collect_java_sources(root: &Path) -> Vec<PathBuf> {
     const MAX: usize = 5000;
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];

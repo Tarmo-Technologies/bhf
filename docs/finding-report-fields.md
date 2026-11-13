@@ -17,7 +17,8 @@ index when it finishes. This doc describes that layout, the `bhf.findings.v1` /
 | `results/findings.sarif` | SARIF 2.1.0, one run, every finding kind except `sca` |
 | `results/manifest.json` | `bhf.results-manifest.v1`: tool, source, full producer history |
 | `results/attestation.json` | in-toto Statement v1 over every file under `results/` |
-| `results/findings/<ID>/` | Evidence for findings that have files: `finding.json`, `testcase.bin`, `min_testcase.bin` (when minimized), `sanitizer.log`, `decoded.json`, `replay.py` / `repro.adb` |
+| `results/findings/<ID>/` | Evidence for findings that have files: `finding.json`, `testcase.bin`, `min_testcase.bin` (when minimized), `sanitizer.log`, `decoded.json`, `replay.py` / `repro.adb`; plus `replay.log`, the raw output of the last `bhf replay` (covered by `attestation.json`, not an evidence role) |
+| `results/legacy/` | Only in a work dir migrated from bhf ≤ 0.2.x: the old `FINDINGS.md`, `findings.csv`, `auto/findings.csv` and `findings/<ID>/replay.py`, and `migration.json` (what was moved, when) |
 | `results/static/` | Native `static-scan` output (`static-report.{json,md,sarif}`) |
 | `results/sbom/` | Native `sbom` output (`cyclonedx.json`, `sbom.spdx.json`, `openvex.json`, `vulnerabilities.json`, ...) |
 
@@ -47,7 +48,16 @@ the first time any command opens it; see [Migration from 0.2.x](#migration-from-
 field summary. `findings.json` always starts with `schema_version`, then
 `generated_at`, `tool`, so an importer can detect the format from the first
 few bytes. Every key is present (`null` where a value does not apply — never
-omitted), and unknown keys are rejected.
+omitted), and unknown keys are rejected. Keys added to v1 after its first
+release (`fuzz.access`, `fuzz.access.parameter`, `fuzz.input_to_state`,
+`fuzz.input_to_state_input`, `fuzz.input_to_state_status`,
+`fuzz.input_to_state_reason`, `fuzz.input_to_state_search`, `fuzz.arguments`,
+the `runtrace` evidence role)
+are optional in the schema, so documents written
+before them still validate; bhf always writes them. A validator holding the
+older schema rejects them. `reproduce.build.fidelity` is optional the same
+way, but written only for a finding whose harness build used fabricated
+inputs (below).
 
 Document-level fields: `schema_version`, `generated_at`, `tool` (`{name,
 version, build}`), `source` (`{root, vcs}`), `producers[]` (the last 50
@@ -75,7 +85,7 @@ records that failed to load — a bad record never aborts the rebuild).
 | `verdict` | enum \| null | `real_reachable`, `likely_reachable`, `lab_only`, `blocked`, `unknown` |
 | `location` | `{file, line, column, function}` \| null | repo-relative POSIX path, 1-based |
 | `fix_location` | same shape \| null | the single best place to start a fix |
-| `stack` | `[{function, file, line}]` | project frames only, at most 32 |
+| `stack` | `[{function, file, line}]` | project frames only, at most 32; frames under the source root, and with no root known, frames outside toolchain, harness and libc component paths. A relative frame path that names no file under the source root (glibc's `assert/assert.c`, `csu/libc-start.c`) is not a project frame |
 | `trace` | `[{file, line, function, note}]` | static data-flow trace; empty for other kinds |
 | `fingerprint` | `{primary, signature}` | `primary` is the stable cross-run identity |
 | `group` | string \| null | root-cause group key |
@@ -85,13 +95,26 @@ records that failed to load — a bad record never aborts the rebuild).
 | `fidelity` | `{stubs_used, forced, caveats[]}` | `forced` when the target ran forced-and-stub-heavy under `--force` |
 | `remediation` | string \| null | |
 | `patch_hints` | `[{title, guidance}]` | advisory, not a literal diff |
-| `reproduce` | `{harness_id, command, build}` \| null | `build`: `{sanitizers[], binary_sha256, build_id}`; `command` is relative to `results/` |
-| `evidence` | `{dir, files[]}` \| null | each file: `{role, path, sha256, size}` — roles: `finding`, `testcase`, `testcase_minimized`, `sanitizer_log`, `decoded`, `replay_script`, `repro_ada`, `byte_control` |
-| `fuzz` | `{exception, classification, harness_id, dialect, oracle}` \| null | `exception`: `{name, message, sanitizer}` |
+| `reproduce` | `{harness_id, command, build}` \| null | `build`: `{sanitizers[], binary_sha256, build_id}`, plus `fidelity` when the harness compiled only after bhf supplied inputs the build context lacked; `command` is relative to `results/` |
+| `reproduce.build.fidelity` | `{level, context, fabricated[]}` (optional) | `level` is `reduced`; `context` is where the build context came from (`none`, `exact_tu_compile_database`, ...); each `fabricated` entry is `{kind, name, value}` with `kind` `macro`, `header` or `type`. Such a finding's `confidence.level` is `low` and `fidelity.caveats` names what was fabricated: code compiled against a placeholder macro value or header can take paths the real build never does, so the finding may be false or not reproduce against the real build |
+| `evidence` | `{dir, files[]}` \| null | each file: `{role, path, sha256, size}` — roles: `finding`, `testcase`, `testcase_minimized`, `sanitizer_log`, `decoded`, `replay_script`, `repro_ada`, `byte_control`, `runtrace` (the runtrace events of the replay that recorded the comparison evidence) |
+| `fuzz` | `{exception, classification, harness_id, dialect, oracle, access, input_to_state, input_to_state_input, input_to_state_status, input_to_state_reason, input_to_state_search, arguments}` \| null | `exception`: `{name, message, sanitizer}`; see [Fuzz block](#fuzz-block) |
 | `static` | `{engine, precision, snippet, baseline_status, triage_state}` \| null | |
 | `sca` | object \| null | `{vuln_id, aliases[], component, fixed_versions[], cvss, kev, references[], match_confidence, matching_method, vex}` |
 | `binary` | `{sha256, build_id, arch, crash}` \| null | |
 | `raw_ref` | string \| null | path of the source record, relative to `results/` |
+
+### Fuzz block
+
+| Field | Type | Notes |
+|---|---|---|
+| `access` | object \| null | the memory access the sanitizer reported: `{direction, size, address_hint, region, alloc_stack[], free_stack[], parameter}`. `direction` is `read`, `write` or `unknown`; `region` is `{kind, size, offset, relation, distance, variable, frame_offset}` (`kind` `heap`, `stack` or `global`; `offset` negative before the object, `>= size` past it). `parameter` is the harness parameter whose buffer the access hit, `{name, offset, basis}`, from `finding.json` `exception.access.parameter` when the argument trace named one, else `null`: `basis` `region_start` (the parameter's pointer is the region start; `offset` is the access's offset in it), `region_interior` (the pointer points into the region; `offset` is from the pointer) or `nearest_pointer` (no region was reported; `offset` is the faulting address minus the closest traced pointer below it). The raw address is left out (it differs run to run); the stacks keep the project's frames only, filtered as `stack` is (no allocator, libc, sanitizer, bhf harness or driver frames, no `_start`, paths relative to the source root and none outside it), at most 8 |
+| `input_to_state` | array \| null | comparison evidence recorded while this finding's input ran (from `finding.json` `gates`); `null` when no capture ran or it could not run (`gate_capture.status` `unavailable`), `[]` when one ran and no input bytes fed a comparison. Each entry: `{offset, len, operand_hex, compared_with_hex, cmp_kind, site, site_location, relation, operands_equal}`. `relation` is `equal` (the operand bytes are the input bytes), `byte_swapped` (the same, read big-endian) or `derived` (the operand is computed from those bytes and changed when they did); `site` is the comparison's offset in the harness executable, `site_location` its source position when it could be symbolized. Under AddressSanitizer the `memcmp`/`bcmp` interceptor reports itself as the site; the driver also records the frames above it, and the site is the first of them that is not the sanitizer runtime (the target's call), or the interceptor's own address, with no `site_location`, when none resolves (`finding.json` `gates[].site_unattributable`) |
+| `input_to_state_input` | string \| null | the finding file whose bytes the `input_to_state` offsets index: `min_testcase.bin` or `testcase.bin` (`finding.json` `gate_capture.input`); `null` when no capture named it |
+| `input_to_state_status` | string \| null | what the capture found (`finding.json` `gate_capture.status`): `recorded`, `no_input_comparisons` (comparisons ran but no input bytes fed one), `no_comparisons` or `unavailable` (the capture could not run); `null` when no capture ran |
+| `input_to_state_reason` | string \| null | why the capture recorded no evidence (`gate_capture.reason`), when it recorded none: the empty input, no instrumented comparison, the harness not found, what the search left out, ... |
+| `input_to_state_search` | `{state, searched_bytes, input_len}` \| null | how far the search for operands computed from input bytes (range checks such as `width - 1 > 31`) got (`gate_capture.derived_search`, `searched_bytes`): `state` `done`, `partial` (its replay budget ran out) or `too_long` (an input over 1 MiB, not searched); `null` when that search did not run or the capture predates it |
+| `arguments` | array \| null | the values the harness decoded from the input and passed to the target (`finding.json` `decoded_args`), when traced: `{name, type, value, len, span, preview_hex, role, after_call_value}`; `span` is `[start, end)` in the testcase, `role` `param`, `receiver` or `out` |
 
 ### Severity
 
@@ -140,6 +163,10 @@ carries the envelope below, in addition to its producer-specific fields
 | `forced` | `true` when the finding came from a forced/stub-heavy build under `--force` |
 | `history[]` | `{at, command, fields[]}` — one entry per enrichment pass (`minimize`, `cartography`, `confirm`, fidelity) that edited this record in place |
 | `minimization_skipped` | `true` when `auto`'s minimization pass ran out of budget before reaching this finding's group |
+| `gates` | comparison evidence for the input named in `gate_capture.input`: each input span (`offset`, `len`) whose bytes reached a comparison, with `operand_hex`, `compared_with_hex`, `cmp_kind`, `site`, `location` (`{file, line, function}` or `null`), `relation` and `operands_equal`. Written by `bhf auto` after minimization and by `bhf report --backfill`. An operand counts only when its bytes occur in the input and a replay with those bytes changed shows it change with them (`derived`: flipping a byte changed it, and two replays of the unchanged input agreed on it, so a process id or clock reading does not count). Comparisons the harness makes before entering the target are left out, and so are later ones whose site symbolizes to harness code (this needs `llvm-symbolizer`) |
+| `gate_capture` | how `gates` was recorded: `{input, input_len, status, reason, comparisons, truncated, unconfirmed, runs, shim_armed, runner}`. `status` is `recorded`, `no_input_comparisons`, `no_comparisons` (no instrumented comparison was recorded in the target; uninstrumented code such as a prebuilt library is not observed) or `unavailable` (the capture could not run; with `reason`); `unconfirmed` counts operands whose bytes occur in the input but that did not follow a change of them; `shim_armed` says the replay ran with the runtrace shim, whose events for this one input are in the finding's `runtrace.jsonl`; `runner` names the emulator the capture replayed a harness built for another platform under (`qemu-aarch64`), and is absent for a native replay |
+| `build` | how the harness was built: `binary` is `{sha256, build_id, coverage_instrumentation}` for the harness binary that produced the finding, where `coverage_instrumentation` is the instrumentation that fed its edge map as the binary shows it (`sancov-trace-pc-guard` for clang's guards, `sancov-trace-pc` for a translation unit compiled with GCC's `-fsanitize-coverage=trace-pc`, `go-cover`), and is absent when the binary does not show one (no coverage, stripped or compressed debug information); `sandbox` is the sandbox the run used |
+| `runtime_mode` | `{pass, env_injected, shim_armed}` stamped by `auto` on each finding: the fuzz pass, the environment it injected, and whether the runtrace shim was loaded for it (the pass produced the runtrace log, which the shim creates when it loads) |
 
 ## Producer history
 
@@ -160,10 +187,31 @@ findings and owns the single record for the batch.
 One row per finding. Columns, from `CSV_HEADER`:
 
 ```
-id,kind,severity,confidence,confirmation,rule_id,cwe,title,file,line,function,group,occurrences,verdict,vuln_id,purl,first_seen,evidence_dir
+id,kind,severity,confidence,confirmation,rule_id,cwe,title,file,line,function,group,occurrences,verdict,vuln_id,purl,first_seen,evidence_dir,access,access_size,region_size,region_offset,input_to_state,input_to_state_input,arguments,access_parameter,build_fidelity,input_to_state_status
 ```
 
-`cwe` is written `CWE-120`; multiple values are `;`-separated.
+`cwe` is written `CWE-120`; multiple values are `;`-separated. The columns
+after `evidence_dir` were added later, at the end, so readers that address
+columns by position keep working: `access` is the access direction,
+`access_size` its width, `region_size` and `region_offset` the object it hit,
+`input_to_state` lists the comparison evidence as
+`offset:len:cmp_kind:operand_hex`, `;`-separated, `input_to_state_input`
+names the file those offsets index, `arguments` summarises `fuzz.arguments`,
+`access_parameter` names `fuzz.access.parameter`, and `build_fidelity` reads
+`reduced: macro NAME=VALUE, header NAME, ...` for a finding whose harness was
+built with fabricated inputs (empty otherwise), and `input_to_state_status` is
+`fuzz.input_to_state_status` (why `input_to_state` is empty is in
+`findings.json` and `INDEX.md`). `arguments` is
+`name=value` per argument, `;`-separated: a buffer or string reads
+`len <N>`, followed by `hex <first 8 bytes>` when a preview was traced
+(`data=len 50718 hex 68baa77e0f010203...`), an output whose value changed
+reads `<before>-><after>`, a `;` inside a name or value is written `,`, and
+the cell stops at 200 characters with `...`.
+
+SARIF results carry the comparison evidence as the `bhfInputToState` property
+(the `finding.json` `gates` entries), the file its offsets index as
+`bhfInputToStateInput`, and each comparison site with a source position as a
+related location. A capture that could not run adds neither property.
 
 ## Migration from 0.2.x
 
@@ -182,13 +230,59 @@ reading the old layout directly:
   to `auto/run.json` `targets[]`; `--static-dynamic` is a no-op.
 - `runtime_mode` is not written anywhere in the new contract.
 - An old-layout work dir (`<work>/findings/` at the top) is migrated
-  automatically — `findings/` is renamed to `results/findings/`, the legacy
-  index files are deleted, and `results/` is rebuilt — the first time any
-  command opens it. `replay`, `minimize`, `capsule`, and `--resume` keep
-  working against a migrated work dir.
+  automatically the first time any command opens it, including commands that
+  only read (`explain`, `capsule`): `findings/` is renamed to
+  `results/findings/` and the legacy index files and reproducer scripts are
+  kept under `results/legacy/`. The command prints what it moved and kept.
+  A read-only command does not rebuild `results/`; `bhf report` or the next
+  `bhf auto` (or any other command that records findings) does, and `bhf
+  explain`'s migration message ends with the `bhf report --work-dir <W>`
+  command to run. `replay`, `minimize`, `capsule`, and `--resume` keep working
+  against a migrated work dir. See
+  [Upgrading a 0.2.x work dir](#upgrading-a-02x-work-dir).
 - Tools that read `bhf_work/findings.csv` or `bhf_work/findings/` directly
   must switch to `results/findings.json` (schema in `schemas/`, reference
   fixture in `tests/fixtures/golden_results/`).
+
+
+### Upgrading a 0.2.x work dir
+
+The migration is one-way: once a current bhf opens a 0.2.x work dir, bhf 0.2.x
+can no longer read it (`cannot read <wd>/findings`). Keep a copy first
+(`cp -a bhf_work bhf_work.0.2`). The copy replays its own harnesses: recorded
+harness paths are resolved in the work dir that holds the finding.
+
+What a migrated work dir has, and what it does not:
+
+- The findings keep their ids and the evidence 0.2.x recorded. They have no
+  `sanitizer.log`, crash frames for UBSan reports, or minimized inputs.
+  Re-running `bhf auto` over the source tree into the same work dir minimizes
+  the representative of each finding group that has no minimized input (within
+  its time budget; `bhf minimize <finding>` does the rest), but it adds no
+  `sanitizer.log` or frames: a crash that matches a migrated finding is a
+  duplicate. Run `bhf report --backfill --work-dir <wd>` to replay each one
+  against its harness and add `sanitizer.log`, frames and the memory access
+  where the harness still exists and still reports the same crash. A replay
+  that comes back unsymbolized is skipped; put `llvm-symbolizer` on `PATH` (or
+  set `ASAN_SYMBOLIZER_PATH`) and run it again.
+- `results/legacy/` keeps the old `FINDINGS.md`, `findings.csv`,
+  `auto/findings.csv` and `replay.py` scripts; `results/INDEX.md` and
+  `results/findings.{json,csv,sarif}` replace them, and each finding gets a
+  current `replay.py`.
+- The corpus may hold seeds damaged by the seed encoding of earlier releases
+  (every byte that was not valid UTF-8 became `EF BF BD`). The first `bhf auto`
+  run of this release sets `corpus/` aside as `corpus-legacy/` instead of
+  reseeding it, unless you pass `--reuse-legacy-corpus`. It does the same in a
+  0.2.x work dir an earlier release already migrated, and in any work dir an
+  earlier `bhf auto` wrote: it recognises them by their auto state
+  (`auto/run.json`, `auto/work-state.json`) without the
+  `auto/legacy-corpus.json` record every run of this release writes first.
+  `results/INDEX.md` and `bhf report` warn about testcases and corpus entries
+  that look damaged this way.
+
+For results comparable with a fresh install, run `bhf auto` into a new work
+dir. Read each finding's `sanitizer.log` where it has one, otherwise run its
+`replay.py` (or `bhf replay --finding <id>`), which prints the sanitizer report.
 
 ## Quick reading guide
 
@@ -201,3 +295,29 @@ reading the old layout directly:
   start) — read `explanation` + `patch_hints` first.
 - **Reproduce?** `evidence.files[role=replay_script]`, or
   `bhf replay --finding <id>`.
+- **Which input bytes matter?** `fuzz.input_to_state`: the spans that reached a
+  comparison while the finding's input ran. `dictionary.txt` in the harness dir
+  is mined from source when the harness is generated (each token's
+  `# from <file>:<line>` comment says where); a token of it that occurs in an
+  input is not evidence that any comparison read it. `learned_dictionary.txt`
+  beside it holds the comparison constants the engine observed at runtime while
+  fuzzing that harness (from `cmplog.jsonl`, across passes and runs, at most 256
+  tokens: operands that met more distinct values at a comparison site than
+  any of the inputs compared with them did); they were compared during some
+  run, not necessarily this finding's.
+- **How sure is `likely_reachable`?** For C/C++ it is usually inferred from the
+  entry's signature (an input-taking shape, such as a byte-buffer parameter or
+  a parser taking a byte, with typedefs such as `const u8_t *` read through the
+  source's and its headers' declarations, and pointer typedefs to bytes such as
+  `LPCBYTE` or `typedef const octet_t *rbuf_t` read as the pointer they are);
+  `finding.json` `input_reachability_basis` records the rule, the parameter and
+  its type as spelled and resolved (`{rule, param, spelled_type,
+  resolved_type, typedefs_resolved}`), `findings.json` carries it as
+  `reachability.reachability_basis`, and `bhf explain` says what each verdict
+  rests on. A finding whose input is empty or all zero bytes, or whose method
+  ran on an object bhf's harness constructed, carries a caveat that real
+  callers may never produce that state (`fidelity.caveats`, the INDEX.md
+  `Caveat:` line, and beside the verdict in `bhf explain`). A heap overflow of a buffer the generated harness sized
+  for a pointer parameter it passes without a length is `lab_only`
+  (precondition-dependent); one passed with its length, such as the buffer of a
+  `(buf, len)` pair, keeps the entry's verdict.

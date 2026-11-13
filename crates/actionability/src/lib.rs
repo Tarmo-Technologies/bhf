@@ -142,6 +142,11 @@ pub struct EntryPath {
     ///   behavior, never downgraded on this signal alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attacker_reachable: Option<bool>,
+    /// What the entry's reachability was inferred from, as the finding records
+    /// it (`input_reachability_basis`): the rule, the parameter, and its type
+    /// as spelled and resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reachability_basis: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -329,6 +334,7 @@ pub fn classify_verdict(
         || is_harness_cleanup_artifact(raw)
         || is_go_must_panic(raw)
         || is_native_assertion_enum_domain_precondition(raw)
+        || is_harness_sized_buffer_overflow(raw)
     {
         return Verdict::LabOnly;
     }
@@ -469,8 +475,10 @@ fn sanitizer_patch_hint(raw: &Value) -> Option<PatchHint> {
     if matches!(class, BugClass::Unknown) {
         return None;
     }
-    let at = sink_from(raw)
-        .map(|sink| sink_location_phrase(&sink))
+    let sink = sink_from(raw);
+    let at = sink
+        .as_ref()
+        .map(sink_location_phrase)
         .unwrap_or_else(|| "the faulting location".to_owned());
     // Keep the hint tied to the finding's rule when it has one, else label it by
     // bug class so consumers still get a stable, meaningful id.
@@ -520,12 +528,10 @@ fn sanitizer_patch_hint(raw: &Value) -> Option<PatchHint> {
                 "Validate the pointer and any offset/length before the access at {at}; reject inputs that drive it out of range."
             ),
         ),
-        BugClass::UndefinedBehavior => (
-            "Check before the arithmetic / shift",
-            format!(
-                "Check for overflow before the arithmetic at {at} (or use a wider / unsigned type), and validate shift amounts and conversions against their type's range."
-            ),
-        ),
+        BugClass::UndefinedBehavior(UbCheck::MissingReturn) => {
+            missing_return_patch_hint(raw, sink.as_ref())
+        }
+        BugClass::UndefinedBehavior(check) => ub_patch_hint(check, &at),
         BugClass::Timeout => (
             "Bound the work per input",
             format!(
@@ -578,14 +584,68 @@ fn sanitizer_patch_hint(raw: &Value) -> Option<PatchHint> {
     })
 }
 
+/// The fix hint for a missing return. UBSan reports the function's own line
+/// (`util.cpp:2:5`), while frame #0 is the line in its body where the input
+/// fell off the end (`util.cpp:4`): the hint names the function, cites the
+/// reported line as where it is declared, and frame #0's line only as where the
+/// input reached the end of it.
+fn missing_return_patch_hint(raw: &Value, sink: Option<&Sink>) -> (&'static str, String) {
+    let reported = message_source_location(raw);
+    let subject = match sink.map(|sink| sink.function.trim()) {
+        Some(function) if !function.is_empty() => format!("`{function}`"),
+        _ => "the function".to_owned(),
+    };
+    let declared = reported
+        .as_ref()
+        .map(|location| format!(" (declared at `{}:{}`)", location.file, location.line))
+        .unwrap_or_default();
+    let reached = sink
+        .and_then(|sink| Some((sink.file.as_deref()?, sink.line?)))
+        .filter(|(file, line)| {
+            !reported
+                .as_ref()
+                .is_some_and(|location| location.file == *file && location.line == *line)
+        })
+        .map(|(file, line)| {
+            format!("; the input reached the end of the function from `{file}:{line}`")
+        })
+        .unwrap_or_default();
+    (
+        "Return a value on every path",
+        format!(
+            "Return a value on every path out of {subject}{declared}: add the missing `return` (or handle the unmatched case explicitly) so no input reaches the end of the function without one{reached}. Find the branch this input takes that has no return."
+        ),
+    )
+}
+
 /// A compact, human-readable reference to the sink location for hint / next-step
 /// prose: `` `file:line` (`function`) `` when a source line resolved, else the
-/// bare `` `function` ``.
+/// bare `` `function` ``. A sink with no function name (a report that named
+/// only a source position) is referenced by its location alone, never as an
+/// empty `` (``) ``.
 fn sink_location_phrase(sink: &Sink) -> String {
+    let function = sink.function.trim();
+    match (&sink.file, sink.line, function.is_empty()) {
+        (Some(file), Some(line), false) => format!("`{file}:{line}` (`{function}`)"),
+        (Some(file), Some(line), true) => format!("`{file}:{line}`"),
+        (Some(file), None, false) => format!("`{file}` (`{function}`)"),
+        (Some(file), None, true) => format!("`{file}`"),
+        (None, _, false) => format!("`{function}`"),
+        (None, _, true) => "the faulting location".to_owned(),
+    }
+}
+
+/// How the explanation names where the fault surfaced: the sink function, or
+/// for a sink with no function name its source position.
+fn sink_reference(sink: &Sink) -> String {
+    let function = sink.function.trim();
+    if !function.is_empty() {
+        return format!("`{function}`");
+    }
     match (&sink.file, sink.line) {
-        (Some(file), Some(line)) => format!("`{file}:{line}` (`{}`)", sink.function),
-        (Some(file), None) => format!("`{file}` (`{}`)", sink.function),
-        (None, _) => format!("`{}`", sink.function),
+        (Some(file), Some(line)) => format!("the code at `{file}:{line}`"),
+        (Some(file), None) => format!("the code in `{file}`"),
+        (None, _) => "the affected code".to_owned(),
     }
 }
 
@@ -697,6 +757,10 @@ pub fn value_for_finding(mode: RunMode, raw: &Value, finding_json_path: Option<&
 
 fn entry_path_from(raw: &Value) -> Option<EntryPath> {
     let signal = attacker_reachable_signal(raw);
+    let basis = raw
+        .get("input_reachability_basis")
+        .filter(|basis| basis.is_object())
+        .cloned();
     if let Some(entry) = raw
         .get("actionability")
         .and_then(|value| value.get("entry_path"))
@@ -717,6 +781,12 @@ fn entry_path_from(raw: &Value) -> Option<EntryPath> {
             target,
             evidence: string_array_at(entry, &["evidence"]),
             attacker_reachable,
+            reachability_basis: basis.or_else(|| {
+                entry
+                    .get("reachability_basis")
+                    .filter(|basis| basis.is_object())
+                    .cloned()
+            }),
         });
     }
     let target = target_name(raw);
@@ -727,6 +797,7 @@ fn entry_path_from(raw: &Value) -> Option<EntryPath> {
             target,
             evidence: Vec::new(),
             attacker_reachable: signal,
+            reachability_basis: basis,
         });
     }
     None
@@ -945,7 +1016,7 @@ fn sanitizer_stack_location(raw: &Value) -> Option<FixLocation> {
         }
         // A glibc-internal source file (libio/iofread.c, sysdeps/.../memmove.S)
         // is never the developer's fix site — the project caller above it is.
-        if is_libc_source_file(Some(&file)) {
+        if is_libc_frame(&function, Some(&file)) {
             continue;
         }
         // A Rust toolchain stdlib frame (core::ptr::copy_nonoverlapping at
@@ -1139,65 +1210,374 @@ fn is_libc_runtime_function(head: &str) -> bool {
     if f.starts_with("_io_") || f.starts_with("__gi_") || f.starts_with("__libc_") {
         return true;
     }
+    if is_libc_string_routine(&f) {
+        return true;
+    }
+    // glibc's per-CPU variants of the string routines (`__memcmp_avx2_movbe`,
+    // `__memmove_avx_unaligned_erms`, `__strlen_evex`): `__<routine>_<isa>`.
+    if let Some(rest) = f.strip_prefix("__") {
+        if let Some((routine, _variant)) = rest.split_once('_') {
+            return is_libc_string_routine(routine);
+        }
+    }
     matches!(
         f.as_str(),
-        "fread"
-            | "fwrite"
-            | "fgets"
-            | "fputs"
-            | "fputc"
-            | "fgetc"
-            | "getc"
-            | "putc"
-            | "memcpy"
+        "fread" | "fwrite" | "fgets" | "fputs" | "fputc" | "fgetc" | "getc" | "putc"
+    )
+}
+
+/// The `mem*`/`str*`/`wcs*` routines a sanitizer flags an overrun inside; the
+/// caller above them is where the bad length or pointer came from.
+fn is_libc_string_routine(lower: &str) -> bool {
+    matches!(
+        lower,
+        "memcpy"
             | "memmove"
             | "memset"
             | "memcmp"
+            | "bcmp"
             | "memchr"
+            | "memrchr"
+            | "rawmemchr"
+            | "memmem"
+            | "mempcpy"
             | "strlen"
             | "strnlen"
             | "strcmp"
             | "strncmp"
+            | "strcasecmp"
+            | "strncasecmp"
             | "strcpy"
+            | "stpcpy"
             | "strncpy"
+            | "stpncpy"
             | "strcat"
             | "strncat"
             | "strchr"
+            | "strchrnul"
             | "strrchr"
             | "strstr"
+            | "strspn"
+            | "strcspn"
+            | "strpbrk"
+            | "strtok"
             | "strdup"
             | "strndup"
+            | "wmemcmp"
+            | "wmemcpy"
+            | "wmemset"
+            | "wcslen"
+            | "wcscmp"
+            | "wcsncmp"
+            | "wcscpy"
     )
+}
+
+/// A sanitizer-runtime interceptor frame (`__interceptor_memcpy`,
+/// `___interceptor_strlen`, `MemcmpInterceptorCommon(...)`): the runtime's
+/// wrapper around a libc call, never the project's code.
+fn is_sanitizer_interceptor(head: &str) -> bool {
+    let f = head.to_ascii_lowercase();
+    f.starts_with("__interceptor_")
+        || f.starts_with("___interceptor_")
+        || f.starts_with("__sanitizer")
+        || f.ends_with("interceptorcommon")
+}
+
+/// A frame whose source is the sanitizer runtime (`compiler-rt`,
+/// `sanitizer_common`).
+fn is_sanitizer_runtime_file(file: Option<&str>) -> bool {
+    file.is_some_and(|file| {
+        let lower = file.to_ascii_lowercase();
+        lower.contains("compiler-rt/") || lower.contains("sanitizer_common")
+    })
+}
+
+/// A libc, sanitizer-runtime or interceptor frame: never the project's root
+/// cause, whichever of them the faulting PC landed in. Matches by symbol
+/// (`memcmp`, `bcmp`, `__memcmp_avx2_movbe`, `MemcmpInterceptorCommon`) and by
+/// source path (glibc's `sysdeps/`, `string/`, `csu/` component paths, the
+/// sanitizer runtime's `compiler-rt` sources). Shared by the sink search here
+/// and by crash clustering, so both start at the same first project frame.
+pub fn is_runtime_noise_frame(function: &str, file: Option<&str>) -> bool {
+    let head = function_head(function);
+    is_libc_runtime_function(&head)
+        || is_sanitizer_interceptor(&head)
+        || is_libc_frame(function, file)
+        || is_sanitizer_runtime_file(file)
+}
+
+/// glibc component dirs no project names its own source dirs after, so a
+/// frame path starting with one is libc whatever its function.
+const LIBC_COMPONENT_DIRS: &[&str] = &[
+    "libio/",
+    "sysdeps/",
+    "string/",
+    "malloc/",
+    "stdio-common/",
+    "stdlib/",
+    "wcsmbs/",
+    "time/",
+];
+
+/// glibc component dirs whose names projects use for their own sources too
+/// (`./io/scaled_reader.cpp` in a build made with `-ffile-prefix-map=<src>=.`), each
+/// with the basenames of glibc's own sources there (an entry ending in `*` is
+/// a prefix). A frame path under one of these dirs is libc when its file is
+/// one of glibc's, whose static helpers (`parse_expression` in
+/// `posix/regcomp.c`, `call_init` in `elf/dl-init.c`) carry no reserved
+/// prefix, or when its function is libc's own ([`is_libc_internal_function`]).
+const SHARED_LIBC_COMPONENT_DIRS: &[(&str, &[&str])] = &[
+    // Process start-up: `csu/libc-start.c`, `nptl/libc_start_call_main.h`.
+    (
+        "csu/",
+        &[
+            "libc-*",
+            "init-first.c",
+            "check_fds.c",
+            "static-reloc.c",
+            "errno.c",
+            "errno-loc.c",
+            "dso_handle.c",
+            "version.c",
+        ],
+    ),
+    (
+        "nptl/",
+        &[
+            "pthread_*",
+            "libc_*",
+            "libc-*",
+            "nptl*",
+            "sem_*",
+            "thrd_*",
+            "mtx_*",
+            "cnd_*",
+            "tss_*",
+            "lowlevellock*",
+            "futex-internal.c",
+            "elision-*",
+            "allocatestack.c",
+            "cancellation.c",
+            "cleanup*",
+            "descr.h",
+            "unwind.c",
+            "tpp.c",
+            "events.c",
+            "register-atfork.c",
+            "call_once.c",
+        ],
+    ),
+    // `assert()` failures, signal delivery and the dynamic loader.
+    ("assert/", &["assert.c", "assert-perr.c", "__assert.c"]),
+    (
+        "signal/",
+        &[
+            "sigaction.c",
+            "raise.c",
+            "sigsetops.c",
+            "sigprocmask.c",
+            "sigreturn.c",
+            "sigsuspend.c",
+            "sigwait.c",
+            "sigtimedwait.c",
+            "sigqueue.c",
+            "sigaltstack.c",
+            "killpg.c",
+            "allocrtsig.c",
+        ],
+    ),
+    (
+        "posix/",
+        &[
+            "regcomp.c",
+            "regexec.c",
+            "regex.c",
+            "regex_internal.*",
+            "glob.c",
+            "glob64.c",
+            "globfree.c",
+            "globfree64.c",
+            "glob_pattern_p.c",
+            "glob-lstat-compat.c",
+            "fnmatch.c",
+            "fnmatch_loop.c",
+            "wordexp.c",
+            "getopt.c",
+            "getopt1.c",
+            "execvp.c",
+            "execvpe.c",
+            "execl.c",
+            "execle.c",
+            "execlp.c",
+            "spawn.c",
+            "spawnp.c",
+            "spawni.c",
+            "spawn_faction_*",
+            "sysconf.c",
+            "confstr.c",
+        ],
+    ),
+    ("elf/", &["dl-*", "rtld*", "ldconfig.c"]),
+    (
+        "misc/",
+        &[
+            "syslog.c",
+            "tsearch.c",
+            "hsearch.c",
+            "hsearch_r.c",
+            "lsearch.c",
+            "insremque.c",
+            "getpass.c",
+            "getusershell.c",
+            "mntent.c",
+            "mntent_r.c",
+            "getttyent.c",
+            "init-misc.c",
+            "getauxval.c",
+            "efgcvt*",
+            "qefgcvt*",
+        ],
+    ),
+    (
+        "io/",
+        &[
+            "fts.c",
+            "fts64*",
+            "ftw.c",
+            "ftw64*",
+            "lockf.c",
+            "lockf64.c",
+            "getdirname.c",
+        ],
+    ),
+    ("dlfcn/", &["dl*", "sdl*", "libc_dl*"]),
+];
+
+/// For a component-relative path under one of [`SHARED_LIBC_COMPONENT_DIRS`],
+/// whether it names one of glibc's own sources there; `None` elsewhere.
+fn shared_libc_component(rest: &str) -> Option<bool> {
+    SHARED_LIBC_COMPONENT_DIRS
+        .iter()
+        .find_map(|(dir, sources)| {
+            let file = rest.strip_prefix(dir)?;
+            Some(
+                !file.contains('/')
+                    && sources.iter().any(|source| match source.strip_suffix('*') {
+                        Some(prefix) => file.starts_with(prefix),
+                        None => file == *source,
+                    }),
+            )
+        })
+}
+
+/// `file` as glibc's component-relative form: leading `../` and `./` dropped
+/// and each `dir/..` pair collapsed (`signal/../sysdeps/posix/raise.c` is
+/// `sysdeps/posix/raise.c`).
+fn libc_component_path(file: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in file.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if parts.pop().is_none() {
+                    continue;
+                }
+            }
+            other => parts.push(other),
+        }
+    }
+    parts.join("/")
 }
 
 /// A glibc-internal *source file* (not a target source). glibc builds with
 /// component-relative paths (`libio/iofread.c`, `../sysdeps/.../memmove.S`), so
-/// a frame whose file begins with one of those component dirs (after stripping
-/// leading `../`/`./`) is libc, never the project sink. Anchored at the path
-/// start so a real target path like `/home/u/proj/string/parse.c` does NOT
-/// match.
-fn is_libc_source_file(file: Option<&str>) -> bool {
+/// a frame whose file begins with one of the component dirs no project shares
+/// ([`LIBC_COMPONENT_DIRS`], after stripping leading `../`/`./` and collapsing
+/// `dir/..`) is libc, never the project sink. Anchored at the path start so a
+/// real target path like `/home/u/proj/string/parse.c` does NOT match. Paths
+/// under the component dirs projects share (`io/`, `misc/`, `posix/`, ...) need
+/// the file's name or the frame's function to decide: see [`is_libc_frame`].
+pub fn is_libc_source_file(file: Option<&str>) -> bool {
     let Some(file) = file else {
         return false;
     };
-    let mut rest = file;
-    loop {
-        rest = match rest.strip_prefix("../").or_else(|| rest.strip_prefix("./")) {
-            Some(stripped) => stripped,
-            None => break,
-        };
+    if file.starts_with('/') {
+        return false;
     }
-    const DIRS: &[&str] = &[
-        "libio/",
-        "sysdeps/",
-        "string/",
-        "malloc/",
-        "stdio-common/",
-        "stdlib/",
-        "wcsmbs/",
-        "time/",
-    ];
-    DIRS.iter().any(|dir| rest.starts_with(dir))
+    let rest = libc_component_path(file);
+    LIBC_COMPONENT_DIRS.iter().any(|dir| rest.starts_with(dir))
+}
+
+/// A glibc frame by its source path, function and module: a path under a
+/// component dir no project shares ([`is_libc_source_file`]); a path under one
+/// projects share too (`io/`, `misc/`, `posix/`, `elf/`, `signal/`, ...) that
+/// names one of glibc's own sources there (`posix/regcomp.c`,
+/// `elf/dl-init.c`) or whose function is libc-internal (`__libc_*`, `__GI_*`,
+/// `_IO_*`, `_dl_*`, `__*`, `abort`, `raise`, `_start`, ...); or an
+/// unsymbolized frame in libc or the dynamic loader
+/// (`(/lib/x86_64-linux-gnu/libc.so.6+0x29d90)`).
+pub fn is_libc_frame(function: &str, file: Option<&str>) -> bool {
+    let Some(file) = file else {
+        return false;
+    };
+    if is_libc_source_file(Some(file)) || is_libc_module(file) {
+        return true;
+    }
+    if file.starts_with('/') {
+        return false;
+    }
+    shared_libc_component(&libc_component_path(file))
+        .is_some_and(|glibc_source| glibc_source || is_libc_internal_function(function))
+}
+
+/// A glibc or dynamic-loader function: the reserved `__`/`_IO_`/`_dl_`
+/// prefixes and the few public entry points that show on crash stacks.
+fn is_libc_internal_function(function: &str) -> bool {
+    let head = function_head(function);
+    // `pthread_cond_wait@@GLIBC_2.3.2`
+    let name = head.split('@').next().unwrap_or_default().trim();
+    if ["__libc_", "__GI_", "_IO_", "_dl_", "__", "pthread_"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+    {
+        return true;
+    }
+    matches!(
+        name,
+        "abort"
+            | "raise"
+            | "_start"
+            | "__restore_rt"
+            | "start_thread"
+            | "clone"
+            | "clone3"
+            | "dl_main"
+            | "dl_iterate_phdr"
+            | "dlopen"
+            | "dlmopen"
+            | "dlsym"
+            | "dlvsym"
+            | "dlclose"
+            | "dlerror"
+    )
+}
+
+/// An unsymbolized frame's module, as the sanitizer prints it in place of a
+/// source position (`(/lib/x86_64-linux-gnu/libc.so.6+0x29d90)`), naming libc
+/// or the dynamic loader.
+fn is_libc_module(file: &str) -> bool {
+    let Some(module) = file.strip_prefix('(') else {
+        return false;
+    };
+    let path = module.split('+').next().unwrap_or_default();
+    let name = path.rsplit('/').next().unwrap_or_default();
+    name.starts_with("libc.so")
+        || name.starts_with("libc-2.")
+        || name.starts_with("ld-linux")
+        || name.starts_with("ld.so")
+        || name.starts_with("ld-musl")
+        || name.starts_with("libc.musl")
 }
 
 /// The bare callable name with any argument list / trailing `()` stripped, so
@@ -1332,7 +1712,7 @@ fn is_rust_alloc_only_leak(raw: &Value) -> bool {
                 || is_allocator_frame(&func)
                 || is_rust_std_alloc_frame(&func)
                 || is_harness_frame(&func, file.as_deref())
-                || is_libc_source_file(file.as_deref())
+                || is_libc_frame(&func, file.as_deref())
         }),
     }
 }
@@ -1362,7 +1742,7 @@ fn is_harness_cleanup_artifact(raw: &Value) -> bool {
         | BugClass::GlobalBufferOverflow
         | BugClass::NullDeref
         | BugClass::WildSegv
-        | BugClass::UndefinedBehavior => {}
+        | BugClass::UndefinedBehavior(_) => {}
         _ => return false,
     }
     let Some(frames) = raw.pointer("/exception/stack").and_then(Value::as_array) else {
@@ -1586,6 +1966,392 @@ fn is_fixed_width_slice_read_panic(raw: &Value) -> bool {
     matches!(n, 1 | 2 | 4 | 8 | 16) && m < n
 }
 
+/// A heap buffer bhf's generated harness allocated for a pointer parameter it
+/// passes without a length, as [`harness_sized_buffer`] finds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarnessSizedBuffer {
+    /// The harness variable holding the buffer, when its allocation statement
+    /// names one.
+    pub variable: Option<String>,
+    /// Where the harness allocated it, `main.c:76`.
+    pub site: Option<String>,
+}
+
+/// The decode helpers of `bhf_decode.h` that allocate a NUL-terminated string
+/// for a parameter that takes no length.
+const LENGTHLESS_STRING_DECODERS: &[&str] = &[
+    "bhf_c_string",
+    "bhf_c_string_out",
+    "bhf_c_format_string",
+    "bhf_wc_string",
+];
+
+/// Whether [`harness_sized_buffer`] finds one.
+pub fn is_harness_sized_buffer_overflow(raw: &Value) -> bool {
+    harness_sized_buffer(raw).is_some()
+}
+
+/// A heap overflow of a buffer the generated harness allocated and sized
+/// itself for a pointer parameter that takes no length: a decoded C string
+/// (`bhf_c_string` and its relatives), or a copy of the input whose allocating
+/// statement in the generated `bhf_run_one` passes no length companion with
+/// it. Whether a real caller can pass a buffer that short is the entry's
+/// contract, which bhf cannot see, so the crash is precondition-dependent and
+/// not read as reachable from input.
+///
+/// The generated `bhf_run_one` also allocates buffers that it passes WITH a
+/// length: the buffer of a `(buf, len)` pair, an output buffer with its
+/// capacity, a NUL-terminated copy passed with a length. Every such companion
+/// is declared from the buffer as `(buf ? cap : 0)`, so the allocating
+/// statement is read from the harness source (the allocation frame's file and
+/// line) and a buffer with a companion does not count. Nor does a buffer the
+/// project allocated, the driver's input buffer, or an allocation whose source
+/// is not a bhf-generated harness or cannot be read.
+pub fn harness_sized_buffer(raw: &Value) -> Option<HarnessSizedBuffer> {
+    let access = raw.pointer("/exception/access")?;
+    if access.pointer("/region/kind").and_then(Value::as_str) != Some("heap")
+        || !matches!(
+            access.pointer("/region/relation").and_then(Value::as_str),
+            Some("after" | "before")
+        )
+    {
+        return None;
+    }
+    let mut frames = access
+        .get("alloc_stack")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|frame| {
+            let function = string_at(frame, &["function"]).unwrap_or_default();
+            let file = string_at(frame, &["file"]);
+            !function.is_empty()
+                && !is_runtime_noise_frame(&function, file.as_deref())
+                && !is_allocator_frame(&function)
+        });
+    let frame = frames.next()?;
+    let function = function_head(&string_at(frame, &["function"]).unwrap_or_default());
+    let file = string_at(frame, &["file"]).unwrap_or_default();
+    if file.replace('\\', "/").ends_with("bhf_driver.c") {
+        return None;
+    }
+    let line = frame.get("line").and_then(Value::as_u64);
+    if LENGTHLESS_STRING_DECODERS.contains(&function.as_str()) {
+        // The statement that called the decoder names the variable.
+        let caller = frames.next();
+        let statement = caller.and_then(|caller| {
+            let file = string_at(caller, &["file"])?;
+            generated_harness_line(&file, caller.get("line").and_then(Value::as_u64)?)
+        });
+        let variable = statement.as_deref().and_then(|statement| {
+            assigned_variable(statement, |part| part.contains(&format!("{function}(")))
+        });
+        let site = caller.and_then(frame_site);
+        return Some(HarnessSizedBuffer { variable, site });
+    }
+    if function != "bhf_run_one" {
+        return None;
+    }
+    let source = generated_harness_source(&file)?;
+    let statement = source
+        .lines()
+        .nth(usize::try_from(line?).ok()?.checked_sub(1)?)?;
+    let variable = assigned_variable(statement, is_allocation)?;
+    if passes_length_with(&source, &variable) {
+        return None;
+    }
+    Some(HarnessSizedBuffer {
+        variable: Some(variable),
+        site: frame_site(frame),
+    })
+}
+
+/// `main.c:76` for a frame with a file and line.
+fn frame_site(frame: &Value) -> Option<String> {
+    let file = string_at(frame, &["file"])?;
+    let line = frame.get("line").and_then(Value::as_u64)?;
+    let base = file.rsplit(['/', '\\']).next().unwrap_or(&file).to_owned();
+    Some(format!("{base}:{line}"))
+}
+
+/// The text of a source file bhf generated as a harness: it carries the
+/// `bhf harness format` stamp in its first lines. `None` for any other file,
+/// a missing one, or one too large to be a harness.
+fn generated_harness_source(file: &str) -> Option<String> {
+    const MAX_HARNESS_SOURCE: u64 = 16 * 1024 * 1024;
+    let path = Path::new(file);
+    if !path.is_absolute() || std::fs::metadata(path).ok()?.len() > MAX_HARNESS_SOURCE {
+        return None;
+    }
+    let text = std::fs::read_to_string(path).ok()?;
+    text.lines()
+        .take(8)
+        .any(|line| line.contains("bhf harness format"))
+        .then_some(text)
+}
+
+fn generated_harness_line(file: &str, line: u64) -> Option<String> {
+    let source = generated_harness_source(file)?;
+    let index = usize::try_from(line).ok()?.checked_sub(1)?;
+    source.lines().nth(index).map(str::to_owned)
+}
+
+fn is_allocation(statement: &str) -> bool {
+    ["malloc(", "calloc(", "realloc("]
+        .iter()
+        .any(|call| statement.contains(call))
+}
+
+/// The variable a statement of `line` assigns, for the one statement that
+/// `matches`: `buf` in `uint8_t * buf = (uint8_t *)malloc(n)`. `None` when no
+/// statement or more than one matches, or the assigned name is not a plain
+/// identifier (`items[i] = ...`).
+fn assigned_variable(line: &str, matches: impl Fn(&str) -> bool) -> Option<String> {
+    let mut found = line.split(';').filter(|part| matches(part));
+    let statement = found.next()?;
+    if found.next().is_some() {
+        return None;
+    }
+    let (target, _) = statement.split_once('=')?;
+    let target = target.trim_end();
+    let name: String = target
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let starts_well = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+    (starts_well && name.len() < target.len()).then_some(name)
+}
+
+/// Whether the harness passes a length with `variable`: the generated
+/// companion of a buffer is declared as `(variable ? capacity : 0)`.
+fn passes_length_with(source: &str, variable: &str) -> bool {
+    source.contains(&format!("({variable} ? "))
+}
+
+/// What a finding's reachability verdict (`actionability.verdict`) rests on,
+/// in words: the evidence behind it or the lack of it. A verdict inferred from
+/// the entry's signature says so; an entry nothing was recorded for reads as
+/// not assessed. `entry` names the fuzzed function when the caller knows it
+/// (the record itself often names only the harness).
+pub fn reachability_statement(raw: &Value, entry: Option<&str>) -> String {
+    let verdict = string_at(raw, &["actionability", "verdict"]).unwrap_or_default();
+    let reachability = string_at(raw, &["input_reachability"])
+        .or_else(|| string_at(raw, &["target", "input_reachability"]));
+    let basis = ReachabilityBasisText::of(raw);
+    let entry = match entry.map(str::trim).filter(|name| !name.is_empty()) {
+        Some(name) => format!("the entry `{name}`"),
+        None => match string_at(raw, &["target", "subprogram"]) {
+            Some(name) => format!("the entry `{name}`"),
+            None => "the fuzzed entry".to_owned(),
+        },
+    };
+    match verdict.as_str() {
+        "real_reachable" => "reachable: a replay reproduced the crash and the fix location is in \
+                             the project's source"
+            .to_owned(),
+        "likely_reachable" => match reachability.as_deref() {
+            Some("attacker_reachable") => format!(
+                "the signature of {entry} matches an input-taking shape{}, so likely reachable \
+                 from input; not proven (inferred from its signature; bhf's harness calls it \
+                 directly)",
+                basis
+                    .as_ref()
+                    .and_then(ReachabilityBasisText::reason)
+                    .map(|reason| format!(" because {reason}"))
+                    .unwrap_or_default()
+            ),
+            Some("ipc_channel_reachable") => format!(
+                "input reached {entry} through a virtualized IPC channel, so likely reachable \
+                 from input; not proven (attacker control depends on who can write to that channel)"
+            ),
+            Some("registered_entry_point" | "channel_consumer") => format!(
+                "{entry} is registered as a task, interrupt or message handler, so likely \
+                 reachable from input; not proven (attacker control depends on that channel)"
+            ),
+            _ => format!(
+                "reachability not assessed: nothing records how input reaches {entry}; the \
+                 crash reproduces through bhf's harness, which calls it directly"
+            ),
+        },
+        "lab_only" => {
+            if let Some(buffer) = harness_sized_buffer(raw) {
+                let what = match &buffer.variable {
+                    Some(variable) => format!("the overflowed buffer `{variable}`"),
+                    None => "the overflowed buffer".to_owned(),
+                };
+                let at = buffer
+                    .site
+                    .map(|site| format!(" (allocated at {site})"))
+                    .unwrap_or_default();
+                format!(
+                    "precondition-dependent: {what} was sized by bhf's harness{at} for a \
+                     pointer parameter passed without a length; whether a real caller can pass \
+                     a buffer this short depends on the entry's contract, which bhf cannot see"
+                )
+            } else if raw
+                .pointer("/actionability/prosthetics/used")
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                "reproducible in the lab only: the crash needed a value a build-recovery stub \
+                 or fake supplied"
+                    .to_owned()
+            } else {
+                match reachability.as_deref() {
+                    Some("reachability_unproven")
+                        if basis.as_ref().is_some_and(|b| b.rule == "internal_linkage") =>
+                    {
+                        format!(
+                            "reproducible in the lab; {entry} has internal linkage (`static`), so \
+                             nothing outside its file calls it directly{}; reachability from \
+                             input is unproven",
+                            basis
+                                .as_ref()
+                                .and_then(ReachabilityBasisText::shape)
+                                .map(|shape| format!(" although {shape}"))
+                                .unwrap_or_default()
+                        )
+                    }
+                    // The classifier reads parameter types with the file's
+                    // typedefs resolved when it records doing so.
+                    Some("reachability_unproven") => format!(
+                        "reproducible in the lab; the signature of {entry}{} does not match an \
+                         input-taking shape (a read-only byte buffer, or a parser-named entry \
+                         with a length), so reachability from input is unproven",
+                        if basis.as_ref().is_some_and(|b| b.typedefs_resolved) {
+                            ", with its typedefs resolved,"
+                        } else {
+                            ""
+                        }
+                    ),
+                    Some("output_serializer") => format!(
+                        "reproducible in the lab; {entry} looks like an output serializer, so \
+                         reachability from input is unproven"
+                    ),
+                    _ => "reproducible in the lab; reachability from input is unproven".to_owned(),
+                }
+            }
+        }
+        "blocked" => {
+            "blocked: the path needed a resource the run did not have, so reachability was not \
+             tested"
+                .to_owned()
+        }
+        _ => "not assessed".to_owned(),
+    }
+}
+
+/// Caveats on a finding's reachability for states bhf's harness made that
+/// real callers may never produce: an `input` (the one shown or judged) that is
+/// empty or all zero bytes, so every argument decoded from it is zero, and a
+/// method that ran on an object the harness built (the receiver entry of
+/// `decoded_args`, which says how). Empty for anything else.
+pub fn harness_state_caveats(raw: &Value, input: Option<&[u8]>) -> Vec<String> {
+    let mut caveats = Vec::new();
+    if let Some(input) = input.filter(|input| input.iter().all(|byte| *byte == 0)) {
+        let what = if input.is_empty() {
+            "the input is empty, so every scalar argument is 0 and every buffer is empty"
+        } else {
+            "the input is all zero bytes, so every argument decoded from it is zero"
+        };
+        caveats.push(format!(
+            "{what}: a real caller may never pass all-zero arguments; check that one can before \
+             treating this as reachable"
+        ));
+    }
+    let receiver = raw
+        .get("decoded_args")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|arg| {
+            string_at(arg, &["role"]).as_deref() == Some("receiver")
+                && string_at(arg, &["name"]).as_deref() == Some("receiver")
+        });
+    if let Some(receiver) = receiver {
+        let how = string_at(receiver, &["decoder"])
+            .filter(|how| !how.trim().is_empty())
+            .unwrap_or_else(|| "how is not recorded".to_owned());
+        caveats.push(format!(
+            "the method ran on an object bhf's harness constructed ({how}); real callers may \
+             never put the object in that state"
+        ));
+    }
+    caveats
+}
+
+/// A finding's `input_reachability_basis`, read for its wording.
+struct ReachabilityBasisText {
+    rule: String,
+    param: Option<String>,
+    spelled_type: Option<String>,
+    resolved_type: Option<String>,
+    typedefs_resolved: bool,
+}
+
+impl ReachabilityBasisText {
+    fn of(raw: &Value) -> Option<Self> {
+        let basis = raw
+            .get("input_reachability_basis")
+            .or_else(|| raw.pointer("/actionability/entry_path/reachability_basis"))
+            .filter(|basis| basis.is_object())?;
+        Some(Self {
+            rule: string_at(basis, &["rule"])?,
+            param: string_at(basis, &["param"]),
+            spelled_type: string_at(basis, &["spelled_type"]),
+            resolved_type: string_at(basis, &["resolved_type"]),
+            typedefs_resolved: basis
+                .get("typedefs_resolved")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        })
+    }
+
+    /// `parameter `buf` (`const u8_t *`, resolves to `const uint8_t *`)`.
+    fn parameter(&self) -> Option<String> {
+        let param = self.param.as_deref()?;
+        let types = match (self.spelled_type.as_deref(), self.resolved_type.as_deref()) {
+            (Some(spelled), Some(resolved)) => {
+                format!(" (`{spelled}`, resolves to `{resolved}`)")
+            }
+            (Some(spelled), None) => format!(" (`{spelled}`)"),
+            _ => String::new(),
+        };
+        Some(format!("parameter `{param}`{types}"))
+    }
+
+    /// What made the signature input-taking, by the rule that decided it.
+    fn shape(&self) -> Option<String> {
+        let parameter = self.parameter()?;
+        let what = match self.rule.as_str() {
+            "const_byte_buffer" | "internal_linkage" => "is a read-only byte buffer",
+            "parser_name_with_length" => {
+                "is a read-only buffer of a parser-named entry that also takes a length"
+            }
+            "mutable_parser_buffer" => {
+                "is a byte buffer of a parser-named entry that also takes a length"
+            }
+            "byte_scalar_parser" => "is the one input byte of a parser-named entry",
+            _ => return None,
+        };
+        Some(format!("{parameter} {what}"))
+    }
+
+    /// The reason a signature verdict of input-reachable rests on.
+    fn reason(&self) -> Option<String> {
+        (self.rule != "internal_linkage")
+            .then(|| self.shape())
+            .flatten()
+    }
+}
+
 /// The bhf harness scaffolding (entry shims + the generated `main`), which
 /// drives the input but is not where the target's bug lives. Shared with the
 /// report writeup so the rendered crash Stack can trim these synthetic-driver
@@ -1618,6 +2384,14 @@ pub fn is_harness_frame(function: &str, file: Option<&str>) -> bool {
     })
 }
 
+/// The sink of a finding record: the top project frame on its crash stack,
+/// chosen as for `actionability.sink`, else its oracle or message location.
+/// For callers that compare a reproduced crash with a recorded one using the
+/// same selection rules.
+pub fn sink_for_finding(raw: &Value) -> Option<Sink> {
+    sink_from(raw)
+}
+
 /// Where execution goes wrong: the top project frame on the crash stack. Skips
 /// sanitizer-runtime frames, allocator primitives, and the bhf harness.
 /// Prefers the topmost frame that resolved to a source file (`Sink.file`/`line`
@@ -1638,7 +2412,7 @@ fn sink_from(raw: &Value) -> Option<Sink> {
         }
         let file = string_at(frame, &["file"]).filter(|file| !file.starts_with('('));
         if is_harness_frame(&function, file.as_deref())
-            || is_libc_source_file(file.as_deref())
+            || is_runtime_noise_frame(&function, file.as_deref())
             || is_rust_stdlib_frame(&function, file.as_deref())
         {
             continue;
@@ -1801,7 +2575,9 @@ enum BugClass {
     MemoryLeak,
     NullDeref,
     WildSegv,
-    UndefinedBehavior,
+    /// An UndefinedBehaviorSanitizer check (or the generic undefined-behavior
+    /// class), by check family.
+    UndefinedBehavior(UbCheck),
     Timeout,
     OutOfMemory,
     /// Reachable assertion / `abort()` / `SIGABRT` with no memory-safety class.
@@ -1829,6 +2605,50 @@ enum BugClass {
     Unknown,
 }
 
+/// The UndefinedBehaviorSanitizer check families bhf explains and advises on
+/// separately. UBSan's NULL and division-by-zero checks map to
+/// [`BugClass::NullDeref`] and [`BugClass::DivideByZero`] instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UbCheck {
+    IntegerOverflow,
+    IndexOutOfBounds,
+    VlaBound,
+    InvalidShift,
+    MissingReturn,
+    Unreachable,
+    InvalidValueLoad,
+    FloatCastOverflow,
+    ImplicitConversion,
+    PointerOverflow,
+    Misaligned,
+    ObjectSize,
+    TypeMismatch,
+    InvalidBuiltin,
+    Generic,
+}
+
+impl UbCheck {
+    fn slug(self) -> &'static str {
+        match self {
+            Self::IntegerOverflow => "integer-overflow",
+            Self::IndexOutOfBounds => "array-index-out-of-bounds",
+            Self::VlaBound => "invalid-vla-bound",
+            Self::InvalidShift => "invalid-shift",
+            Self::MissingReturn => "missing-return",
+            Self::Unreachable => "unreachable",
+            Self::InvalidValueLoad => "invalid-value-load",
+            Self::FloatCastOverflow => "float-cast-overflow",
+            Self::ImplicitConversion => "implicit-conversion",
+            Self::PointerOverflow => "pointer-overflow",
+            Self::Misaligned => "misaligned-access",
+            Self::ObjectSize => "insufficient-object-size",
+            Self::TypeMismatch => "type-mismatch",
+            Self::InvalidBuiltin => "invalid-builtin-use",
+            Self::Generic => "undefined-behavior",
+        }
+    }
+}
+
 impl BugClass {
     fn slug(self) -> &'static str {
         match self {
@@ -1841,7 +2661,7 @@ impl BugClass {
             Self::MemoryLeak => "memory-leak",
             Self::NullDeref => "null-deref",
             Self::WildSegv => "segv",
-            Self::UndefinedBehavior => "undefined-behavior",
+            Self::UndefinedBehavior(check) => check.slug(),
             Self::Timeout => "timeout",
             Self::OutOfMemory => "out-of-memory",
             Self::ReachableAssertion => "reachable-assertion",
@@ -1873,15 +2693,204 @@ fn segv_sub_page_fault(hay: &str) -> bool {
     u64::from_str_radix(&hex, 16).is_ok_and(|addr| addr < 0x1000)
 }
 
+/// The part of a report message classification may read: the text after a
+/// UBSan `runtime error:` marker, else after a leading `<file>:<line>[:<col>]:`
+/// source prefix or GNAT's `<file>:<line>[:<col>] ` one (`parser.adb:17 range
+/// check failed`), else the whole message. The source path is never part of
+/// it, so a directory or unit named `zoom`, `timeout`, `oom_check` or
+/// `division_by_zero` cannot change the bug class.
+fn classification_text(message: &str) -> &str {
+    if let Some((_, after)) = message.split_once("runtime error:") {
+        return after.trim();
+    }
+    if let Some(rest) = gnat_location_rest(message) {
+        return rest;
+    }
+    let mut fields = message.splitn(4, ':');
+    let file = fields.next().unwrap_or("");
+    let numeric = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let rest: Vec<&str> = fields.collect();
+    let prefixed = !file.trim().is_empty() && !file.contains(char::is_whitespace);
+    match rest.as_slice() {
+        [line, col, tail] if prefixed && numeric(line) && numeric(col) => tail.trim(),
+        [line, tail @ ..] if prefixed && numeric(line) && !tail.is_empty() => {
+            let skip = file.len() + 1 + line.len() + 1;
+            message.get(skip..).unwrap_or(message).trim()
+        }
+        _ => message,
+    }
+}
+
+/// The message after a GNAT-style location, `<file>:<line> ` or
+/// `<file>:<line>:<col> ` (digits then a space, no colon), when `<file>` has no
+/// whitespace and names a source file by its extension.
+fn gnat_location_rest(message: &str) -> Option<&str> {
+    const SOURCE_EXTENSIONS: &[&str] = &[
+        "adb", "ads", "ada", "c", "h", "cc", "cpp", "cxx", "c++", "hh", "hpp", "hxx", "inl", "m",
+        "mm", "rs", "go", "f", "f77", "f90", "f95", "f03", "f08", "for", "cob", "cbl",
+    ];
+    let (file, rest) = message.split_once(':')?;
+    let (_, extension) = file.rsplit_once('.')?;
+    if file.is_empty()
+        || file.contains(char::is_whitespace)
+        || !SOURCE_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+    {
+        return None;
+    }
+    let digits = |text: &str| text.bytes().take_while(u8::is_ascii_digit).count();
+    let line = digits(rest);
+    if line == 0 {
+        return None;
+    }
+    let mut tail = &rest[line..];
+    if let Some(after) = tail.strip_prefix(':') {
+        let column = digits(after);
+        if column == 0 {
+            return None;
+        }
+        tail = &after[column..];
+    }
+    tail.starts_with(' ').then(|| tail.trim())
+}
+
+/// Whether `word` occurs in `hay` as a whole word (bounded by non-alphanumeric
+/// characters), so `oom` matches `ASAN_OOM` but not `zoom` or `room`.
+fn has_word(hay: &str, word: &str) -> bool {
+    hay.match_indices(word).any(|(start, _)| {
+        let before = hay[..start].chars().next_back();
+        let after = hay[start + word.len()..].chars().next();
+        !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+    })
+}
+
+/// The UBSan check kind of a UBSan finding, from structured fields first: the
+/// kind in `exception.name` (`UBSAN_MISSING_RETURN`), then UBSan's check name
+/// (`exception.check`), and only then the report text after `runtime error:`.
+/// `None` for a finding that is not UBSan's.
+fn ubsan_kind(raw: &Value, name: &str, sanitizer: &str, message: &str) -> Option<&'static str> {
+    let upper = name.to_ascii_uppercase();
+    let prefixed = upper.strip_prefix("UBSAN_");
+    if sanitizer != "ubsan" && prefixed.is_none() {
+        return None;
+    }
+    // `UBSAN_MISSING_RETURN`, or a bare `missing-return` on a UBSan record.
+    let named = prefixed
+        .unwrap_or(&upper)
+        .to_ascii_lowercase()
+        .replace('_', "-");
+    let structured = Some(named.as_str())
+        .and_then(|kind| {
+            finding_rules::ubsan::KINDS
+                .iter()
+                .copied()
+                .find(|known| *known == kind)
+        })
+        .filter(|kind| *kind != "undefined-behavior");
+    if structured.is_some() {
+        return structured;
+    }
+    if let Some(kind) = string_at(raw, &["exception", "check"])
+        .and_then(|check| finding_rules::ubsan::kind_for_check_name(&check))
+    {
+        return Some(kind);
+    }
+    Some(finding_rules::ubsan::kind_for_message(classification_text(
+        message,
+    )))
+}
+
+/// The bug class of a UBSan kind.
+fn class_for_ubsan_kind(kind: &str) -> BugClass {
+    let check = match kind {
+        "null-pointer-dereference" => return BugClass::NullDeref,
+        "division-by-zero" => return BugClass::DivideByZero,
+        "signed-integer-overflow" | "unsigned-integer-overflow" => UbCheck::IntegerOverflow,
+        "out-of-bounds-access" => UbCheck::IndexOutOfBounds,
+        "invalid-vla-bound" => UbCheck::VlaBound,
+        "invalid-shift" => UbCheck::InvalidShift,
+        "missing-return" => UbCheck::MissingReturn,
+        "unreachable" => UbCheck::Unreachable,
+        "invalid-value-load" => UbCheck::InvalidValueLoad,
+        "float-cast-overflow" => UbCheck::FloatCastOverflow,
+        "implicit-conversion" => UbCheck::ImplicitConversion,
+        "pointer-overflow" => UbCheck::PointerOverflow,
+        "misaligned-access" => UbCheck::Misaligned,
+        "insufficient-object-size" => UbCheck::ObjectSize,
+        "type-mismatch" => UbCheck::TypeMismatch,
+        "invalid-builtin-use" => UbCheck::InvalidBuiltin,
+        _ => UbCheck::Generic,
+    };
+    BugClass::UndefinedBehavior(check)
+}
+
+/// The direction of a faulting access: `exception.access.direction` when the
+/// finding records it, else ASan's `READ`/`WRITE` token as folded into the
+/// message (`(READ of size 4)`, `(WRITE memory access)`), never a substring
+/// (`thread` is not a read). A non-canonical ("high value") address faults
+/// before any direction is known, whatever ASan printed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Read,
+    Write,
+    Unknown,
+}
+
+fn access_direction(raw: &Value) -> Direction {
+    let message = string_at(raw, &["exception", "message"]).unwrap_or_default();
+    if let Some(access) = raw.pointer("/exception/access") {
+        if string_at(access, &["address_hint"]).as_deref() == Some("high-value-address") {
+            return Direction::Unknown;
+        }
+        return match string_at(access, &["direction"]).as_deref() {
+            Some("read") => Direction::Read,
+            Some("write") => Direction::Write,
+            _ => Direction::Unknown,
+        };
+    }
+    if message.contains("high value address") {
+        return Direction::Unknown;
+    }
+    let tokens: Vec<&str> = message
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    for pair in tokens.windows(2) {
+        if matches!(pair[1], "of" | "memory") {
+            match pair[0] {
+                "READ" => return Direction::Read,
+                "WRITE" => return Direction::Write,
+                _ => {}
+            }
+        }
+    }
+    // UBSan's object-size check names the operation: `load of address` /
+    // `store to address ... with insufficient space`.
+    let text = classification_text(&message);
+    if text.starts_with("load of") {
+        return Direction::Read;
+    }
+    if text.starts_with("store to") {
+        return Direction::Write;
+    }
+    Direction::Unknown
+}
+
 fn classify_bug(raw: &Value) -> BugClass {
     let name = string_at(raw, &["exception", "name"]).unwrap_or_default();
     let sanitizer = string_at(raw, &["exception", "sanitizer"])
         .unwrap_or_default()
         .to_ascii_lowercase();
     let message = string_at(raw, &["exception", "message"]).unwrap_or_default();
+    // A UBSan finding is classified by its check, before any message needle:
+    // its message starts with the source path, which is not evidence.
+    if let Some(kind) = ubsan_kind(raw, &name, &sanitizer, &message) {
+        return class_for_ubsan_kind(kind);
+    }
+    let rule_id = string_at(raw, &["rule_id"]).unwrap_or_default();
     // Normalize `_`/`-` so `HEAP_BUFFER_OVERFLOW` and `heap-buffer-overflow`
-    // both match the same needles.
-    let hay = format!("{name} {message}")
+    // both match the same needles. Only the message text after any source
+    // location prefix is read.
+    let hay = format!("{name} {}", classification_text(&message))
         .to_ascii_lowercase()
         .replace('_', "-");
     let has = |needle: &str| hay.contains(needle);
@@ -1939,11 +2948,11 @@ fn classify_bug(raw: &Value) -> BugClass {
         || has("requested allocation size")
         || has("rss-limit")
         || has("rss limit")
-        || has("oom")
+        || has_word(&hay, "oom")
     {
         return BugClass::OutOfMemory;
     }
-    if has("timeout") || has("timed out") {
+    if has_word(&hay, "timeout") || has("timed out") {
         return BugClass::Timeout;
     }
     // Divide-by-zero is its own weakness (CWE-369), not generic UB. Catch it
@@ -1963,16 +2972,21 @@ fn classify_bug(raw: &Value) -> BugClass {
     {
         return BugClass::DivideByZero;
     }
-    if sanitizer == "ubsan"
-        || has("undefined-behavior")
-        || has("signed-integer-overflow")
-        || has("integer-overflow")
-        || has("shift-exponent")
-        || has("invalid-shift")
-        || has("float-cast-overflow")
-        || has("misaligned-address")
-    {
-        return BugClass::UndefinedBehavior;
+    // UB named by a non-UBSan lane (UBSan findings returned above).
+    if has("signed-integer-overflow") || has("integer-overflow") {
+        return BugClass::UndefinedBehavior(UbCheck::IntegerOverflow);
+    }
+    if has("shift-exponent") || has("invalid-shift") {
+        return BugClass::UndefinedBehavior(UbCheck::InvalidShift);
+    }
+    if has("float-cast-overflow") {
+        return BugClass::UndefinedBehavior(UbCheck::FloatCastOverflow);
+    }
+    if has("misaligned-address") {
+        return BugClass::UndefinedBehavior(UbCheck::Misaligned);
+    }
+    if has("undefined-behavior") {
+        return BugClass::UndefinedBehavior(UbCheck::Generic);
     }
     // An uncaught/unhandled exception escaping a managed runtime (Jazzer-style
     // JVM throwable, etc.) terminates the process — CWE-248.
@@ -1987,11 +3001,20 @@ fn classify_bug(raw: &Value) -> BugClass {
         return BugClass::UncaughtException;
     }
     if has("segv") || has("sigsegv") || has("segmentation") || has("access-violation") {
+        // The parser already split SEGVs into NULL (BHF-206) and wild-address
+        // (BHF-223) rules; a wild-address rule is never a NULL dereference.
+        if rule_id == "BHF-223" {
+            return BugClass::WildSegv;
+        }
         // A near-null fault — a null base pointer plus a small struct-field /
         // array-element offset — lands at a SUB-PAGE address, not exactly zero. The
         // old `0x000000000000` (12-zero) needle missed those; treat any sub-page
         // fault address as a NULL deref (CWE-476) rather than a wild SEGV (#30).
-        if has("0x000000000000") || has("null") || segv_sub_page_fault(&hay) {
+        let zero_page = raw
+            .pointer("/exception/access/address_hint")
+            .and_then(Value::as_str)
+            == Some("zero-page");
+        if zero_page || has("0x000000000000") || has("null") || segv_sub_page_fault(&hay) {
             return BugClass::NullDeref;
         }
         return BugClass::WildSegv;
@@ -2032,27 +3055,32 @@ fn classify_bug(raw: &Value) -> BugClass {
 /// human-readable name. Returns `(vec![], None)` for an unknown bug class.
 fn cwe_for_finding(raw: &Value) -> (Vec<String>, Option<String>) {
     let class = classify_bug(raw);
-    // Read vs write disambiguates the overflow CWEs; the UB subtype distinguishes
-    // signed-overflow (CWE-190) from other undefined behavior (CWE-682).
+    // Read vs write disambiguates the out-of-bounds CWEs; an unknown direction
+    // is the general CWE-119, never a guessed write.
+    let direction = access_direction(raw);
+    let read_write_or_119 = || match direction {
+        Direction::Read => ("CWE-125", None),
+        Direction::Write => ("CWE-787", None),
+        Direction::Unknown => ("CWE-119", None),
+    };
+    // The bounds-checked-panic class still names a write in its prose
+    // (`copy_from_slice`, an explicit "write").
     let hay = format!(
         "{} {}",
         string_at(raw, &["exception", "name"]).unwrap_or_default(),
-        string_at(raw, &["exception", "message"]).unwrap_or_default()
+        classification_text(&string_at(raw, &["exception", "message"]).unwrap_or_default())
     )
     .to_ascii_lowercase()
     .replace('_', "-");
-    let is_read = hay.contains("read");
-    let is_write = hay.contains("write");
+    let is_write = direction == Direction::Write || has_word(&hay, "write");
 
     let (primary, secondary): (&str, Option<&str>) = match class {
         BugClass::HeapBufferOverflow => (
             "CWE-122",
-            if is_write {
-                Some("CWE-787")
-            } else if is_read {
-                Some("CWE-125")
-            } else {
-                None
+            match direction {
+                Direction::Write => Some("CWE-787"),
+                Direction::Read => Some("CWE-125"),
+                Direction::Unknown => None,
             },
         ),
         BugClass::StackBufferOverflow => ("CWE-121", None),
@@ -2068,34 +3096,43 @@ fn cwe_for_finding(raw: &Value) -> (Vec<String>, Option<String>) {
             }
         }
         // A global-buffer-overflow is an out-of-bounds access; pick the
-        // read/write CWE that matches the sanitizer report (write by default).
-        BugClass::GlobalBufferOverflow => {
-            if is_read {
-                ("CWE-125", None)
-            } else {
-                ("CWE-787", None)
-            }
-        }
+        // read/write CWE that matches the sanitizer report.
+        BugClass::GlobalBufferOverflow => read_write_or_119(),
         BugClass::UseAfterFree => ("CWE-416", None),
         BugClass::DoubleFree => ("CWE-415", None),
         BugClass::MemoryLeak => ("CWE-401", None),
         BugClass::NullDeref => ("CWE-476", None),
         // A wild (non-null) bad access — model as an out-of-bounds access,
         // matching the read/write direction when the report records one.
-        BugClass::WildSegv => {
-            if is_read {
-                ("CWE-125", None)
-            } else {
-                ("CWE-787", None)
+        BugClass::WildSegv => read_write_or_119(),
+        BugClass::UndefinedBehavior(check) => match check {
+            UbCheck::IntegerOverflow => ("CWE-190", None),
+            UbCheck::InvalidShift => ("CWE-1335", None),
+            UbCheck::FloatCastOverflow => ("CWE-681", None),
+            UbCheck::ImplicitConversion => ("CWE-681", Some("CWE-197")),
+            UbCheck::PointerOverflow => ("CWE-823", Some("CWE-119")),
+            UbCheck::VlaBound => ("CWE-129", None),
+            // An unchecked array index, read or write unknown: the index
+            // validation weakness plus both out-of-bounds outcomes.
+            UbCheck::IndexOutOfBounds => {
+                return (
+                    vec![
+                        "CWE-129".to_owned(),
+                        "CWE-125".to_owned(),
+                        "CWE-787".to_owned(),
+                    ],
+                    Some(cwe_name("CWE-129").to_owned()),
+                );
             }
-        }
-        BugClass::UndefinedBehavior => {
-            if hay.contains("signed-integer-overflow") || hay.contains("integer-overflow") {
-                ("CWE-190", None)
-            } else {
-                ("CWE-682", None)
-            }
-        }
+            UbCheck::ObjectSize => read_write_or_119(),
+            UbCheck::TypeMismatch => ("CWE-843", None),
+            UbCheck::MissingReturn
+            | UbCheck::Unreachable
+            | UbCheck::InvalidValueLoad
+            | UbCheck::Misaligned
+            | UbCheck::InvalidBuiltin
+            | UbCheck::Generic => ("CWE-758", None),
+        },
         BugClass::Timeout => ("CWE-834", Some("CWE-400")),
         BugClass::OutOfMemory => ("CWE-789", Some("CWE-400")),
         BugClass::ReachableAssertion => ("CWE-617", None),
@@ -2161,6 +3198,14 @@ fn cwe_name(id: &str) -> &'static str {
         "CWE-674" => "Uncontrolled Recursion",
         "CWE-562" => "Return of Stack Variable Address",
         "CWE-825" => "Expired Pointer Dereference",
+        "CWE-119" => "Improper Restriction of Operations within the Bounds of a Memory Buffer",
+        "CWE-129" => "Improper Validation of Array Index",
+        "CWE-197" => "Numeric Truncation Error",
+        "CWE-681" => "Incorrect Conversion between Numeric Types",
+        "CWE-758" => "Reliance on Undefined, Unspecified, or Implementation-Defined Behavior",
+        "CWE-823" => "Use of Out-of-range Pointer Offset",
+        "CWE-843" => "Access of Resource Using Incompatible Type ('Type Confusion')",
+        "CWE-1335" => "Incorrect Bitwise Shift of Integer",
         _ => "Uncategorized Weakness",
     }
 }
@@ -2171,7 +3216,7 @@ fn cwe_name(id: &str) -> &'static str {
 fn explanation_for(raw: &Value, sink: Option<&Sink>, source: &Option<Source>) -> Option<String> {
     let class = classify_bug(raw);
     let fn_ref = sink
-        .map(|sink| format!("`{}`", sink.function))
+        .map(sink_reference)
         .unwrap_or_else(|| "the affected code".to_owned());
     let testcase = source
         .as_ref()
@@ -2204,9 +3249,7 @@ fn explanation_for(raw: &Value, sink: Option<&Sink>, source: &Option<Source>) ->
         BugClass::WildSegv => format!(
             "This is an invalid-memory access (segmentation fault): while processing a crafted input, {fn_ref} touched a memory address it should not have, and the program crashed. An attacker who can supply this input can crash the program, and such faults sometimes lead to worse."
         ),
-        BugClass::UndefinedBehavior => format!(
-            "This is undefined behavior: while processing a crafted input, {fn_ref} performed an operation the language leaves undefined (for example arithmetic that overflows or an out-of-range shift). The result is unpredictable and can produce wrong answers or crashes."
-        ),
+        BugClass::UndefinedBehavior(check) => ub_explanation(check, &fn_ref),
         BugClass::Timeout => format!(
             "This input makes the code run far too long: while processing a crafted input, {fn_ref} got stuck doing excessive work (a hang or near-endless loop). An attacker who can supply this input can make the program unresponsive (denial of service)."
         ),
@@ -2233,6 +3276,154 @@ fn explanation_for(raw: &Value, sink: Option<&Sink>, source: &Option<Source>) ->
         ),
     };
     Some(format!("{body} {trigger}"))
+}
+
+/// The plain-English description of one UBSan check family.
+fn ub_explanation(check: UbCheck, fn_ref: &str) -> String {
+    match check {
+        UbCheck::IntegerOverflow => format!(
+            "This is an integer overflow: while processing a crafted input, {fn_ref} computed a value too large or too small for its integer type, which C and C++ leave undefined for signed types. The wrapped value can produce wrong sizes, lengths or indexes that lead to memory corruption, or simply wrong answers."
+        ),
+        UbCheck::InvalidShift => format!(
+            "This is an invalid bit shift: while processing a crafted input, {fn_ref} shifted by a negative amount or by at least the width of the type, or shifted a negative value left. The language leaves the result undefined, and common hardware silently masks the shift count, so the code computes a wrong value."
+        ),
+        UbCheck::MissingReturn => format!(
+            "This is a missing return value: while processing a crafted input, execution reached the end of {fn_ref}, a function declared to return a value, without a return statement. The caller then uses an undefined value, and an optimizing compiler may assume the path is impossible and generate arbitrary code for it."
+        ),
+        UbCheck::Unreachable => format!(
+            "This is unreachable code being reached: while processing a crafted input, {fn_ref} reached a point the code marks as impossible (`__builtin_unreachable()` or `std::unreachable()`). The compiler optimizes on that promise, so what happens next is arbitrary; an input case the code assumed could not happen is reachable."
+        ),
+        UbCheck::InvalidValueLoad => format!(
+            "This is an invalid value load: while processing a crafted input, {fn_ref} read a bool or enum whose stored bits are not a valid value of its type, usually memory filled from raw input bytes or never initialized. Code generated for the type can then take impossible branches or index a table out of range."
+        ),
+        UbCheck::FloatCastOverflow => format!(
+            "This is an out-of-range conversion: while processing a crafted input, {fn_ref} converted a floating-point value to an integer type that cannot represent it (too large, too small, infinite or NaN). The language leaves the result undefined, so the converted value is garbage."
+        ),
+        UbCheck::ImplicitConversion => format!(
+            "This is a value-changing conversion: while processing a crafted input, {fn_ref} converted an integer to a narrower or differently signed type and the value changed (truncation or sign change). The changed value can corrupt sizes, lengths or indexes computed from it."
+        ),
+        UbCheck::PointerOverflow => format!(
+            "This is pointer arithmetic overflow: while processing a crafted input, {fn_ref} added an offset to a pointer that wrapped around the address space or turned a valid pointer into null. The resulting pointer is invalid for any object, so using it reads or writes the wrong memory."
+        ),
+        UbCheck::IndexOutOfBounds => format!(
+            "This is an out-of-bounds array index: while processing a crafted input, {fn_ref} used an index outside the declared bounds of a fixed-size array. The access reads or writes the memory next to the array, which can leak data, corrupt state or crash the program."
+        ),
+        UbCheck::VlaBound => format!(
+            "This is an invalid variable-length array size: while processing a crafted input, {fn_ref} declared a variable-length array whose size came out zero or negative. The stack allocation is then meaningless, and later accesses to the array hit memory it does not own."
+        ),
+        UbCheck::Misaligned => format!(
+            "This is a misaligned memory access: while processing a crafted input, {fn_ref} read or wrote through a pointer that is not aligned for its type (typically a byte buffer cast to a wider type). The language leaves this undefined; some processors fault on it and compilers may assume it cannot happen."
+        ),
+        UbCheck::ObjectSize => format!(
+            "This is an access through a pointer to too small an object: while processing a crafted input, {fn_ref} read or wrote an object of a type larger than the memory the pointer refers to. The access runs past the end of the real object, an out-of-bounds read or write."
+        ),
+        UbCheck::TypeMismatch => format!(
+            "This is type confusion: while processing a crafted input, {fn_ref} called a function through a pointer of the wrong type, or used an object as a class it is not. The code then reads, writes or calls memory with the wrong layout, a common path to code execution."
+        ),
+        UbCheck::InvalidBuiltin => format!(
+            "This is an invalid builtin argument: while processing a crafted input, {fn_ref} passed a value a compiler builtin does not accept (for example zero to a count-leading-zeros builtin), so the result is undefined."
+        ),
+        UbCheck::Generic => format!(
+            "This is undefined behavior: while processing a crafted input, {fn_ref} performed an operation the C or C++ language leaves undefined; the sanitizer report names the exact check. The result is unpredictable and can change with the compiler or optimization level."
+        ),
+    }
+}
+
+/// The fix guidance for one UBSan check family, at `at`.
+fn ub_patch_hint(check: UbCheck, at: &str) -> (&'static str, String) {
+    match check {
+        UbCheck::IntegerOverflow => (
+            "Check for overflow before the arithmetic",
+            format!(
+                "Check for overflow before the arithmetic at {at} (or use a wider or unsigned type), and reject inputs that drive the operands out of range."
+            ),
+        ),
+        UbCheck::InvalidShift => (
+            "Validate the shift amount",
+            format!(
+                "Check that the shift amount at {at} is at least 0 and less than the operand's bit width before shifting, and shift an unsigned value instead of a negative signed one."
+            ),
+        ),
+        // Rendered from the report and the stack by `missing_return_patch_hint`.
+        UbCheck::MissingReturn => (
+            "Return a value on every path",
+            format!(
+                "Return a value on every path out of the function at {at}: add the missing `return` (or handle the unmatched case explicitly) so no input reaches the end of the function without one. Find the branch this input takes that has no return."
+            ),
+        ),
+        UbCheck::Unreachable => (
+            "Handle the case marked unreachable",
+            format!(
+                "Handle the input case that reaches the unreachable marker at {at} explicitly, for example by returning an error, instead of promising the compiler it cannot happen."
+            ),
+        ),
+        UbCheck::InvalidValueLoad => (
+            "Validate the value before storing it as bool or enum",
+            format!(
+                "Validate the raw value against the type's valid range before storing it into the bool or enum read at {at}; convert input bytes with an explicit range check rather than memcpy or a cast, and initialize the object before use."
+            ),
+        ),
+        UbCheck::FloatCastOverflow => (
+            "Range-check before converting",
+            format!(
+                "Check that the floating-point value at {at} is finite and within the destination integer type's range before converting it."
+            ),
+        ),
+        UbCheck::ImplicitConversion => (
+            "Make the narrowing explicit and checked",
+            format!(
+                "Make the conversion at {at} explicit and range-checked: verify the value fits the destination type, or use a destination wide and signed enough to hold it."
+            ),
+        ),
+        UbCheck::PointerOverflow => (
+            "Bound the offset before the pointer arithmetic",
+            format!(
+                "Validate the offset against the size of the object before adding it to the pointer at {at}; compute with indexes into the object and bounds-check them rather than forming an out-of-range pointer."
+            ),
+        ),
+        UbCheck::IndexOutOfBounds => (
+            "Bounds-check the array index",
+            format!(
+                "Validate the index against the array's length before the access at {at}, and reject inputs that drive it out of range."
+            ),
+        ),
+        UbCheck::VlaBound => (
+            "Validate the array size",
+            format!(
+                "Check that the input-derived length is positive and below a fixed limit before declaring the variable-length array at {at}, or allocate it on the heap with a checked size."
+            ),
+        ),
+        UbCheck::Misaligned => (
+            "Copy unaligned data before reading it",
+            format!(
+                "Copy unaligned input bytes into a properly typed local with memcpy before reading them at {at}, instead of casting a byte pointer to a wider type."
+            ),
+        ),
+        UbCheck::ObjectSize => (
+            "Check the object size before the access",
+            format!(
+                "Make sure the memory at {at} is at least as large as the type it is accessed as: bounds-check the length first and do not cast a short buffer to a larger structure."
+            ),
+        ),
+        UbCheck::TypeMismatch => (
+            "Use the object as its real type",
+            format!(
+                "Call the function at {at} only through a pointer of its exact type, and check an object's dynamic type (or use a checked cast) before using it as a derived class."
+            ),
+        ),
+        UbCheck::InvalidBuiltin => (
+            "Guard the builtin's argument",
+            format!(
+                "Check the argument before the builtin at {at}, for example that it is non-zero for a count-leading- or trailing-zeros builtin."
+            ),
+        ),
+        UbCheck::Generic => (
+            "Make the operation well defined",
+            format!(
+                "Read the sanitizer report for the exact check at {at} and validate the operands before the operation so it is well defined for every input."
+            ),
+        ),
+    }
 }
 
 fn verdict_rank(verdict: Verdict) -> u8 {

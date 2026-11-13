@@ -171,6 +171,12 @@ impl CompilerAdapter {
 
     pub(crate) fn canary_compiler(&self) -> Result<(CanaryCompilerKind, &Path), CompilerError> {
         if self.toolchain.compiler_prefix().is_some() {
+            // `<prefix>-gnatmake` takes the canary's compile switches as given;
+            // the `<prefix>-gnat` driver wants a subcommand first, so it is the
+            // fallback when no prefixed gnatmake is installed.
+            if let Some(gnatmake) = self.gnatmake.as_deref() {
+                return Ok((CanaryCompilerKind::Gnatmake, gnatmake));
+            }
             let gnat = self.gnat.as_deref().ok_or_else(|| {
                 self.toolchain
                     .missing_tool_error(self.toolchain.prefixed_tool_name("gnat"))
@@ -430,6 +436,8 @@ mod tests {
         ));
     }
 
+    /// The fake `gprbuild` is a POSIX shell script.
+    #[cfg(unix)]
     #[test]
     fn check_with_gprbuild_passes_dash_gnatc_via_dash_cargs() {
         let temp = tempfile::TempDir::new().expect("temp dir is created");
@@ -452,6 +460,7 @@ exit 1
         )
     }
 
+    #[cfg(unix)]
     fn write_strict_fake_gprbuild_check(dir: &Path) -> PathBuf {
         write_executable(
             dir,

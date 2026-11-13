@@ -25,7 +25,15 @@ pub struct GenerateHarnessArgs {
     /// Path to the Ada, C, or C++ source file containing the target subprogram.
     pub source: PathBuf,
 
-    /// Subprogram name to harness. If omitted, harness the highest-ranked target.
+    /// Function or subprogram to harness. Required for C and C++ sources. For
+    /// C++, any of these spellings selects a definition: the bare name
+    /// (`decode`), a `::`-qualified suffix (`Codec::decode`), the fully
+    /// qualified name exactly as `bhf list targets` prints it
+    /// (`widgets::Codec::decode`), or any of those with a parameter list
+    /// (`Codec::decode(const unsigned char *, size_t)`). An exact spelling
+    /// wins over a suffix, and a leading `::` names the global namespace only.
+    /// Pair it with --target-line to pick one of several matching definitions.
+    /// For Ada, if omitted, harness the highest-ranked target.
     #[arg(long)]
     pub target: Option<String>,
 
@@ -62,12 +70,12 @@ pub struct GenerateHarnessArgs {
 
     /// Additional C/C++ source files to link into the generated harness
     /// (resolves multi-file libraries like bzip2 / libxml2 / mbedtls).
-    /// Repeatable.
+    /// Paths with spaces are quoted in the generated Makefile. Repeatable.
     #[arg(long = "extra-source")]
     pub extra_sources: Vec<PathBuf>,
 
     /// Additional include directory for the generated C/C++ harness.
-    /// Repeatable.
+    /// Paths with spaces are quoted in the generated Makefile. Repeatable.
     #[arg(long = "extra-include")]
     pub extra_includes: Vec<PathBuf>,
 
@@ -251,12 +259,77 @@ pub fn run(args: GenerateHarnessArgs) -> Result<()> {
 #[derive(serde::Serialize)]
 struct GenerationMetadata<'a> {
     schema_version: u32,
+    /// [`harness_gen::harness_format_version_for`] the harness's language: how
+    /// this harness decodes fuzz input into arguments. Corpora and findings
+    /// recorded against a different version may decode to different argument
+    /// values.
+    harness_format_version: u32,
+    /// The opt-in explicit buffer-length dimension
+    /// ([`harness_gen::buffer_len_dimension_enabled`]) sized a buffer of this
+    /// C or C++ harness: a length-less buffer takes 4 length bytes, then that
+    /// many bytes. Taken from its `arg-layout.json`, so it is absent when the
+    /// dimension was off or no buffer of the harness has no length partner.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    buffer_len_dimension: bool,
     language: &'a str,
     requested_line_present: bool,
     exact_line_match: bool,
     name_fallback: bool,
     requested_kind: &'a str,
     emitted_path: &'a str,
+    /// The function the harness calls (`ns::Class::method` for C++), so a
+    /// debugger can break on it (`bhf replay --debugger`). C and C++ only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_function: Option<&'a str>,
+    /// `arg-layout.json` beside this file: the static decode layout of the
+    /// harness's arguments ([`harness_gen::arg_layout`]). C and C++ only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    arg_layout: Option<&'static str>,
+    /// The `--extra-source` files the harness was generated with (absolute).
+    /// `bhf build` looks in their directories, and in the ones below, for
+    /// the definitions of a failed link's undefined symbols. Absent when none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    extra_sources: Vec<String>,
+    /// The `--extra-include` directories (absolute). Absent when none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    extra_includes: Vec<String>,
+    /// The `--source-root` directories (absolute). Absent when none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    source_roots: Vec<String>,
+}
+
+/// The build inputs given to `generate-harness` beyond the target source,
+/// recorded in `generation-metadata.json`.
+#[derive(Default, Clone, Copy)]
+struct RecordedBuildInputs<'a> {
+    extra_sources: &'a [PathBuf],
+    extra_includes: &'a [PathBuf],
+    source_roots: &'a [PathBuf],
+}
+
+impl<'a> RecordedBuildInputs<'a> {
+    fn of(args: &'a GenerateHarnessArgs) -> Self {
+        Self {
+            extra_sources: &args.extra_sources,
+            extra_includes: &args.extra_includes,
+            source_roots: &args.source_roots,
+        }
+    }
+}
+
+/// `paths` made absolute, for the generation metadata: resolved, without
+/// Windows' `\\?\` prefix, so they read like the paths `bhf build` matches
+/// them against.
+fn absolute_path_strings(paths: &[PathBuf]) -> Vec<String> {
+    paths
+        .iter()
+        .map(|path| {
+            let absolute = absolutize(path).unwrap_or_else(|_| path.clone());
+            crate::workdir::plain_canonical(&absolute)
+                .display()
+                .to_string()
+        })
+        .collect()
 }
 
 fn write_generation_metadata(
@@ -267,8 +340,53 @@ fn write_generation_metadata(
     requested_kind: &str,
     emitted_path: &str,
 ) -> Result<()> {
+    write_target_generation_metadata(
+        output_dir,
+        language,
+        requested_line,
+        selected_line,
+        requested_kind,
+        emitted_path,
+        None,
+        RecordedBuildInputs::default(),
+    )
+}
+
+/// [`write_generation_metadata`] for a C or C++ harness calling
+/// `target_function`; records the harness's `arg-layout.json` when the
+/// generator wrote one, and the extra build inputs it was generated with.
+#[allow(clippy::too_many_arguments)]
+fn write_target_generation_metadata(
+    output_dir: &Path,
+    language: &str,
+    requested_line: Option<u32>,
+    selected_line: u32,
+    requested_kind: &str,
+    emitted_path: &str,
+    target_function: Option<&str>,
+    inputs: RecordedBuildInputs<'_>,
+) -> Result<()> {
+    let arg_layout = (language != "ada"
+        && output_dir
+            .join(harness_gen::arg_layout::ARG_LAYOUT_FILE)
+            .is_file())
+    .then_some(harness_gen::arg_layout::ARG_LAYOUT_FILE);
+    // Recorded where the dimension changed how the harness decodes, which
+    // only its layout knows: a harness with no length-less buffer decodes
+    // the same with the dimension on.
+    let buffer_len_dimension = arg_layout.is_some()
+        && harness_gen::arg_layout::ArgLayout::read(output_dir)
+            .and_then(Result::ok)
+            .is_some_and(|layout| layout.buffer_len_dimension);
     let metadata = GenerationMetadata {
+        target_function,
+        arg_layout,
+        extra_sources: absolute_path_strings(inputs.extra_sources),
+        extra_includes: absolute_path_strings(inputs.extra_includes),
+        source_roots: absolute_path_strings(inputs.source_roots),
         schema_version: 1,
+        harness_format_version: harness_gen::harness_format_version_for(language),
+        buffer_len_dimension,
         language,
         requested_line_present: requested_line.is_some(),
         exact_line_match: requested_line.is_some_and(|line| line == selected_line),
@@ -276,9 +394,158 @@ fn write_generation_metadata(
         requested_kind,
         emitted_path,
     };
+    if let Some(note) = stale_harness_format_note(output_dir) {
+        bhfeprintln!("warning: {note}");
+    }
     let bytes = serde_json::to_vec(&metadata)?;
     crate::auto::report::atomic_write(&output_dir.join("generation-metadata.json"), &bytes)?;
     Ok(())
+}
+
+/// The input format a harness directory's `generation-metadata.json` records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecordedHarnessFormat {
+    /// `harness_format_version`; 1 for metadata written before it existed.
+    pub(crate) version: u32,
+    /// `language` (`c`, `cpp`, `ada`), when recorded.
+    pub(crate) language: Option<String>,
+    /// `buffer_len_dimension`: the harness was generated with the explicit
+    /// buffer-length dimension.
+    pub(crate) buffer_len_dimension: bool,
+}
+
+impl RecordedHarnessFormat {
+    /// The format this bhf generates for the harness's language.
+    fn current_version(&self) -> u32 {
+        harness_gen::harness_format_version_for(self.language.as_deref().unwrap_or("c"))
+    }
+
+    /// A C or C++ harness (or one that records no language).
+    fn is_c_family(&self) -> bool {
+        self.language.as_deref() != Some("ada")
+    }
+}
+
+/// The harness input format recorded in `<harness_dir>/generation-metadata.json`
+/// (see [`harness_gen::HARNESS_FORMAT_VERSION`]). `None` when the directory has
+/// no readable metadata.
+pub(crate) fn recorded_harness_format(harness_dir: &Path) -> Option<RecordedHarnessFormat> {
+    let text = std::fs::read_to_string(harness_dir.join("generation-metadata.json")).ok()?;
+    let metadata: serde_json::Value = serde_json::from_str(&text).ok()?;
+    Some(RecordedHarnessFormat {
+        version: metadata
+            .get("harness_format_version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|version| u32::try_from(version).ok())
+            .unwrap_or(1),
+        language: metadata
+            .get("language")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        buffer_len_dimension: metadata
+            .get("buffer_len_dimension")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+/// The function a C or C++ harness in `harness_dir` calls, as its
+/// `generation-metadata.json` records it (`target_function`). `None` for a
+/// harness generated before the field existed, or an Ada one.
+pub(crate) fn recorded_target_function(harness_dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(harness_dir.join("generation-metadata.json")).ok()?;
+    let metadata: serde_json::Value = serde_json::from_str(&text).ok()?;
+    metadata
+        .get("target_function")
+        .and_then(serde_json::Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_owned)
+}
+
+/// The harness input format version recorded in
+/// `<harness_dir>/generation-metadata.json` (see [`recorded_harness_format`]).
+/// `None` when the directory has no readable metadata; `Some(1)` for metadata
+/// written before the field existed.
+pub(crate) fn recorded_harness_format_version(harness_dir: &Path) -> Option<u32> {
+    recorded_harness_format(harness_dir).map(|format| format.version)
+}
+
+/// A warning for a harness directory generated with a different input format
+/// than this bhf writes for its language: the same input bytes decode to
+/// different arguments, so corpora and finding testcases recorded against one
+/// do not carry over to the other. `None` when the formats match or nothing is
+/// recorded.
+pub(crate) fn stale_harness_format_note(harness_dir: &Path) -> Option<String> {
+    let recorded_format = recorded_harness_format(harness_dir)?;
+    let recorded = recorded_format.version;
+    let current = recorded_format.current_version();
+    (recorded != current).then(|| {
+        format!(
+            "harness {} was generated with input format {recorded}, and this bhf generates \
+             format {current}, which decodes the same input bytes into different argument \
+             values. Inputs recorded against one format (the corpus, finding testcases) may \
+             not reproduce against the other: re-run the corpus and re-check findings after \
+             regenerating the harness",
+            harness_dir.display()
+        )
+    })
+}
+
+/// A note for replaying, minimizing or packaging a finding against the harness
+/// in `harness_dir` when the finding's testcase was recorded against another
+/// harness input format, so it decodes to other argument values there (see
+/// [`harness_gen::HARNESS_FORMAT_VERSION`]). A finding that records no format
+/// predates findings carrying one: it came from a format 2 or earlier
+/// harness, so a format 3 or later C or C++ harness was regenerated since.
+/// The explicit buffer-length dimension (`buffer_len_dimension`, recorded by
+/// both) is part of the format. `None` when the formats agree or the harness
+/// records none.
+pub(crate) fn finding_format_note(
+    finding: &serde_json::Value,
+    harness_dir: &Path,
+) -> Option<String> {
+    let harness = recorded_harness_format(harness_dir)?;
+    // The finding's own record first (`harness.format_version`, else the
+    // top-level key of findings written before it); with neither, the harness
+    // dir's format decides below.
+    let recorded_format = corpus::finding::finding_harness_format(finding);
+    let recorded = recorded_format.map(|format| format.version);
+    let recorded_dimension = recorded_format.is_some_and(|format| format.buffer_len_dimension);
+    let with = |on: bool| if on { "with" } else { "without" };
+    let (recorded_text, harness_text) = match recorded {
+        Some(recorded) if recorded == harness.version => {
+            if recorded_dimension == harness.buffer_len_dimension {
+                return None;
+            }
+            (
+                format!(
+                    "input format {recorded} {} the explicit buffer-length dimension",
+                    with(recorded_dimension)
+                ),
+                format!(
+                    "was generated {} it (BHF_BUFFER_LEN_DIMENSION)",
+                    with(harness.buffer_len_dimension)
+                ),
+            )
+        }
+        Some(recorded) => (
+            format!("input format {recorded}"),
+            format!("decodes format {}", harness.version),
+        ),
+        None if harness.is_c_family() && harness.version >= 3 => (
+            "input format 2 or earlier".to_owned(),
+            format!("decodes format {}", harness.version),
+        ),
+        None => return None,
+    };
+    Some(format!(
+        "this finding was recorded against harness {recorded_text}, and harness {} \
+         {harness_text}: its testcase decodes into different argument values there, so a \
+         mismatch or a failed minimization can come from the harness, not the target. Replay \
+         it against a harness generated with the format it was recorded with, or fuzz the \
+         regenerated harness again to re-find the crash",
+        harness_dir.display()
+    ))
 }
 
 /// Programmatic shim around `run()` used by `bhf auto`'s attempt
@@ -645,11 +912,14 @@ fn write_ada_dictionary(
 ) -> Result<()> {
     let source = crate::source_text::read_source_text(&args.source)
         .with_context(|| format!("read Ada source {}", args.source.display()))?;
-    let tokens = collect_ada_dictionary_tokens(ast, &source);
+    let file = dictionary_source_label(&args.source, args.source.parent());
+    let tokens = collect_ada_dictionary_tokens(ast, &source, &file);
     write_harness_dictionary(output_dir, &tokens)
 }
 
-fn collect_ada_dictionary_tokens(ast: &StructuralAst, source: &str) -> Vec<String> {
+/// The Ada source's dictionary tokens, each with the lines of `file` it was
+/// found on: enum literals, then string literals.
+fn collect_ada_dictionary_tokens(ast: &StructuralAst, source: &str, file: &str) -> Vec<MinedToken> {
     let mut tokens = Vec::new();
     let dialect = ast
         .units
@@ -657,19 +927,19 @@ fn collect_ada_dictionary_tokens(ast: &StructuralAst, source: &str) -> Vec<Strin
         .map(|unit| unit.ada_standard)
         .unwrap_or(ada_parser::ast::AdaStandard::Ada2012);
     let lexical_tokens = ada_parser::lexer::lex(source, dialect);
-    collect_ada_enum_literals_from_tokens(source, &lexical_tokens, &mut tokens);
+    collect_ada_enum_literals_from_tokens(source, &lexical_tokens, file, &mut tokens);
 
     for ty in &ast.types {
         if let TypeKind::Enum(literals) = &ty.kind {
             for literal in literals {
-                push_unique_dictionary_token(&mut tokens, literal.clone());
+                push_mined_token(&mut tokens, literal.clone(), None);
             }
         }
     }
 
     for token in lexical_tokens {
         if let ada_parser::lexer::TokenKind::StringLiteral(value) = token.kind {
-            push_unique_dictionary_token(&mut tokens, value);
+            push_mined_token(&mut tokens, value, Some((file, token.line)));
         }
     }
     tokens
@@ -678,7 +948,8 @@ fn collect_ada_dictionary_tokens(ast: &StructuralAst, source: &str) -> Vec<Strin
 fn collect_ada_enum_literals_from_tokens(
     source: &str,
     lexical_tokens: &[ada_parser::lexer::Token],
-    tokens: &mut Vec<String>,
+    file: &str,
+    tokens: &mut Vec<MinedToken>,
 ) {
     use ada_parser::lexer::TokenKind;
 
@@ -700,17 +971,18 @@ fn collect_ada_enum_literals_from_tokens(
         }
         cursor += 1;
         while cursor < lexical_tokens.len() && lexical_tokens[cursor].kind != TokenKind::RParen {
+            let at = Some((file, lexical_tokens[cursor].line));
             match &lexical_tokens[cursor].kind {
                 TokenKind::Identifier(_) => {
                     if let Some(literal) = ada_token_source_text(source, &lexical_tokens[cursor]) {
-                        push_unique_dictionary_token(tokens, literal);
+                        push_mined_token(tokens, literal, at);
                     }
                 }
                 TokenKind::CharLiteral(ch) => {
-                    push_unique_dictionary_token(tokens, ch.to_string());
+                    push_mined_token(tokens, ch.to_string(), at);
                 }
                 TokenKind::StringLiteral(value) => {
-                    push_unique_dictionary_token(tokens, value.clone());
+                    push_mined_token(tokens, value.clone(), at);
                 }
                 _ => {}
             }
@@ -728,10 +1000,96 @@ fn ada_token_source_text(source: &str, token: &ada_parser::lexer::Token) -> Opti
         .map(str::to_owned)
 }
 
-fn push_unique_dictionary_token(tokens: &mut Vec<String>, token: String) {
-    if !token.is_empty() && !tokens.contains(&token) {
-        tokens.push(token);
+/// Most places a `dictionary.txt` comment names for one token.
+pub(crate) const MAX_TOKEN_SOURCES: usize = 3;
+
+/// A dictionary token and where it was mined: up to [`MAX_TOKEN_SOURCES`]
+/// `(file, line)` places, `file` relative to the target source's directory
+/// (see [`dictionary_source_label`]). Tokens bhf adds itself have none.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct MinedToken {
+    pub(crate) value: String,
+    pub(crate) sources: Vec<(String, u32)>,
+}
+
+/// Add `value` to `tokens` once, recording `at` (a file and 1-based line)
+/// while the token has room for another place.
+pub(crate) fn push_mined_token(
+    tokens: &mut Vec<MinedToken>,
+    value: String,
+    at: Option<(&str, u32)>,
+) {
+    if value.is_empty() {
+        return;
     }
+    let index = match tokens.iter().position(|token| token.value == value) {
+        Some(index) => index,
+        None => {
+            tokens.push(MinedToken {
+                value,
+                sources: Vec::new(),
+            });
+            tokens.len() - 1
+        }
+    };
+    let token = &mut tokens[index];
+    if let Some((file, line)) = at {
+        let place = (file.to_owned(), line);
+        if token.sources.len() < MAX_TOKEN_SOURCES && !token.sources.contains(&place) {
+            token.sources.push(place);
+        }
+    }
+}
+
+/// Add one file's tokens, each with the lines of `file` it was found on.
+pub(crate) fn push_located_tokens(
+    tokens: &mut Vec<MinedToken>,
+    file: &str,
+    located: impl IntoIterator<Item = (String, Vec<u32>)>,
+) {
+    for (value, lines) in located {
+        if lines.is_empty() {
+            push_mined_token(tokens, value, None);
+            continue;
+        }
+        for line in lines {
+            push_mined_token(tokens, value.clone(), Some((file, line)));
+        }
+    }
+}
+
+/// How `dictionary.txt` names a source file: relative to `base` (the target
+/// source's directory), with `/` separators, else the path as given.
+pub(crate) fn dictionary_source_label(path: &Path, base: Option<&Path>) -> String {
+    let resolve = |path: &Path| fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let label = base
+        .and_then(|base| relative_path(&resolve(path), &resolve(base)))
+        .unwrap_or_else(|| path.to_path_buf());
+    label.to_string_lossy().replace('\\', "/")
+}
+
+/// `path` relative to `base`, through `..` where it lies outside it. `None`
+/// when they share no root (another drive).
+fn relative_path(path: &Path, base: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    let path: Vec<Component<'_>> = path.components().collect();
+    let base: Vec<Component<'_>> = base.components().collect();
+    let common = path
+        .iter()
+        .zip(&base)
+        .take_while(|(left, right)| left == right)
+        .count();
+    if common == 0 {
+        return None;
+    }
+    let mut relative = PathBuf::new();
+    for _ in common..base.len() {
+        relative.push("..");
+    }
+    for component in &path[common..] {
+        relative.push(component.as_os_str());
+    }
+    (!relative.as_os_str().is_empty()).then_some(relative)
 }
 
 fn write_project_profile_if_requested(
@@ -2990,7 +3348,7 @@ fn run_c_direct(args: &GenerateHarnessArgs) -> Result<()> {
     }?;
     write_c_per_tu_context(&output_dir, &per_tu_contexts)?;
     write_harness_dictionary(&output_dir, &dictionary_tokens)?;
-    write_generation_metadata(
+    write_target_generation_metadata(
         &output_dir,
         "c",
         args.target_line,
@@ -3001,6 +3359,8 @@ fn run_c_direct(args: &GenerateHarnessArgs) -> Result<()> {
         } else {
             "direct"
         },
+        Some(&invocation_function.name),
+        RecordedBuildInputs::of(args),
     )?;
     if generation_banner_enabled() {
         println!(
@@ -3019,27 +3379,10 @@ fn collect_c_dictionary_tokens_for_harness(
     source: &str,
     target_includes: &[String],
     include_dirs: &[PathBuf],
-) -> Vec<String> {
-    let mut tokens = Vec::new();
-    if let Ok(source_tokens) = c_parser::extract_c_dictionary_tokens(source) {
-        push_unique_dictionary_tokens(&mut tokens, source_tokens);
-    }
-    for include in target_includes {
-        for dir in include_dirs {
-            let header = dir.join(include);
-            if header == source_path {
-                continue;
-            }
-            let Ok(header_source) = fs::read_to_string(&header) else {
-                continue;
-            };
-            if let Ok(header_tokens) = c_parser::extract_c_dictionary_tokens(&header_source) {
-                push_unique_dictionary_tokens(&mut tokens, header_tokens);
-            }
-            break;
-        }
-    }
-    tokens
+) -> Vec<MinedToken> {
+    collect_c_family_dictionary_tokens(source_path, source, target_includes, include_dirs, |text| {
+        c_parser::extract_c_dictionary_tokens_located(text).ok()
+    })
 }
 
 fn collect_cpp_dictionary_tokens_for_harness(
@@ -3047,11 +3390,34 @@ fn collect_cpp_dictionary_tokens_for_harness(
     source: &str,
     target_includes: &[String],
     include_dirs: &[PathBuf],
-) -> Vec<String> {
+) -> Vec<MinedToken> {
+    collect_c_family_dictionary_tokens(source_path, source, target_includes, include_dirs, |text| {
+        cpp_parser::extract_cpp_dictionary_tokens_located(text).ok()
+    })
+}
+
+/// The dictionary tokens of a C or C++ target source and the first copy of
+/// each header it includes found in `include_dirs`, each with where it was
+/// found (files named relative to the source's directory).
+fn collect_c_family_dictionary_tokens(
+    source_path: &Path,
+    source: &str,
+    target_includes: &[String],
+    include_dirs: &[PathBuf],
+    extract: impl Fn(&str) -> Option<Vec<c_parser::LocatedToken>>,
+) -> Vec<MinedToken> {
+    let base = source_path.parent();
     let mut tokens = Vec::new();
-    if let Ok(source_tokens) = cpp_parser::extract_cpp_dictionary_tokens(source) {
-        push_unique_dictionary_tokens(&mut tokens, source_tokens);
-    }
+    let mut add = |path: &Path, text: &str| {
+        if let Some(located) = extract(text) {
+            push_located_tokens(
+                &mut tokens,
+                &dictionary_source_label(path, base),
+                located.into_iter().map(|token| (token.value, token.lines)),
+            );
+        }
+    };
+    add(source_path, source);
     for include in target_includes {
         for dir in include_dirs {
             let header = dir.join(include);
@@ -3061,34 +3427,47 @@ fn collect_cpp_dictionary_tokens_for_harness(
             let Ok(header_source) = fs::read_to_string(&header) else {
                 continue;
             };
-            if let Ok(header_tokens) = cpp_parser::extract_cpp_dictionary_tokens(&header_source) {
-                push_unique_dictionary_tokens(&mut tokens, header_tokens);
-            }
+            add(&header, &header_source);
             break;
         }
     }
     tokens
 }
 
-fn push_unique_dictionary_tokens(tokens: &mut Vec<String>, incoming: Vec<String>) {
-    for token in incoming {
-        push_unique_dictionary_token(tokens, token);
-    }
-}
+/// The first lines of a harness's `dictionary.txt`: where its tokens come
+/// from, so nobody reads them as values the engine observed.
+pub(crate) const DICTIONARY_HEADER: &str = "\
+# Tokens mined from the target's source when this harness was generated:
+# string literals (not #include paths), case labels, comparison literals,
+# #define values and enum members. The `# from <file>:<line>` line above a
+# token names up to three places it was found (files relative to the target
+# source's directory). Not runtime evidence: comparison operands observed
+# while fuzzing are in learned_dictionary.txt and cmplog.jsonl beside this file.
+";
 
-pub(crate) fn write_harness_dictionary(output_dir: &Path, tokens: &[String]) -> Result<()> {
+pub(crate) fn write_harness_dictionary(output_dir: &Path, tokens: &[MinedToken]) -> Result<()> {
     if tokens.is_empty() {
         return Ok(());
     }
-    let mut out = String::new();
+    // AFL, libFuzzer and bhf's own dictionary parser skip `#` lines.
+    let mut out = String::from(DICTIONARY_HEADER);
     for token in tokens {
+        if let Some(places) = dictionary_places(&token.sources) {
+            out.push_str("# from ");
+            out.push_str(&places);
+            out.push('\n');
+        }
         out.push('"');
-        out.push_str(&escape_afl_dictionary_token(token.as_bytes()));
+        out.push_str(&escape_afl_dictionary_token(token.value.as_bytes()));
         out.push_str("\"\n");
         // #379: also emit the raw little- and big-endian bytes of a numeric
         // magic constant so the dictionary matches the bytes the target
         // compares, not the ASCII spelling of the literal.
-        for raw in numeric_token_byte_encodings(token) {
+        let encodings = numeric_token_byte_encodings(&token.value);
+        if !encodings.is_empty() {
+            out.push_str("# raw bytes of the literal above\n");
+        }
+        for raw in encodings {
             out.push('"');
             out.push_str(&escape_afl_dictionary_token(&raw));
             out.push_str("\"\n");
@@ -3096,6 +3475,36 @@ pub(crate) fn write_harness_dictionary(output_dir: &Path, tokens: &[String]) -> 
     }
     fs::write(output_dir.join("dictionary.txt"), out)
         .with_context(|| format!("write dictionary in {}", output_dir.display()))
+}
+
+/// `file:line, file:line` for a token's places, each file's lines ascending,
+/// files in the order they were mined; `None` for a token with none. A control
+/// character in a file name would end the comment line, so it is shown as `?`.
+fn dictionary_places(sources: &[(String, u32)]) -> Option<String> {
+    if sources.is_empty() {
+        return None;
+    }
+    let mut files: Vec<&str> = Vec::new();
+    for (file, _) in sources {
+        if !files.contains(&file.as_str()) {
+            files.push(file);
+        }
+    }
+    let mut ordered: Vec<&(String, u32)> = sources.iter().collect();
+    ordered.sort_by_key(|(file, line)| (files.iter().position(|f| f == file), *line));
+    Some(
+        ordered
+            .iter()
+            .map(|(file, line)| {
+                let file: String = file
+                    .chars()
+                    .map(|c| if c.is_control() { '?' } else { c })
+                    .collect();
+                format!("{file}:{line}")
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
 }
 
 /// Parse a C integer literal (hex `0x..`, octal `0..`, or decimal), tolerating
@@ -3141,15 +3550,16 @@ fn numeric_token_byte_encodings(token: &str) -> Vec<Vec<u8>> {
     }
 }
 
-fn escape_afl_dictionary_token(token: &[u8]) -> String {
+/// A dictionary token as the inside of an AFL/libFuzzer quoted entry. Both
+/// engines accept only `\\`, `\"` and `\xNN` escapes (AFL++ drops a line
+/// with `\n`, libFuzzer rejects the whole file), so every other byte outside
+/// printable ASCII, CR, LF and TAB included, is written as `\xNN`.
+pub(crate) fn escape_afl_dictionary_token(token: &[u8]) -> String {
     let mut out = String::new();
     for byte in token {
         match *byte {
             b'\\' => out.push_str("\\\\"),
             b'"' => out.push_str("\\\""),
-            b'\n' => out.push_str("\\n"),
-            b'\r' => out.push_str("\\r"),
-            b'\t' => out.push_str("\\t"),
             0x20..=0x7e => out.push(char::from(*byte)),
             other => out.push_str(&format!("\\x{other:02x}")),
         }
@@ -6242,13 +6652,21 @@ fn pick_c_target(
     target_name: &str,
     target_line: Option<u32>,
 ) -> Result<(c_parser::CFunction, Option<String>)> {
-    let mut matches: Vec<c_parser::CFunction> = functions
-        .into_iter()
-        .filter(|f| f.name == target_name)
-        .collect();
+    let (mut matches, others): (Vec<c_parser::CFunction>, Vec<c_parser::CFunction>) =
+        functions.into_iter().partition(|f| f.name == target_name);
     if matches.is_empty() {
+        let closest: Vec<String> =
+            crate::target_filter::closest_matches(target_name, &others, |f| f.name.as_str(), 5)
+                .into_iter()
+                .map(|f| format!("{} (line {})", f.name, f.line))
+                .collect();
+        let hint = if closest.is_empty() {
+            String::new()
+        } else {
+            format!("; closest definitions: {}", closest.join(", "))
+        };
         return Err(anyhow::anyhow!(
-            "function '{target_name}' not found in {}",
+            "function '{target_name}' not found in {}{hint}",
             source_path.display()
         ));
     }
@@ -6287,15 +6705,22 @@ fn pick_cpp_target(
     target_name: &str,
     target_line: Option<u32>,
 ) -> Result<(cpp_parser::CppFunction, Option<String>)> {
+    // An exact spelling wins. Only when nothing matches exactly does a trailing
+    // qualified suffix (`Codec::decode` for `widgets::Codec::decode`) select.
     let mut matches: Vec<cpp_parser::CppFunction> = functions
-        .into_iter()
+        .iter()
         .filter(|f| cpp_target_matches(f, target_name))
+        .cloned()
         .collect();
     if matches.is_empty() {
-        return Err(anyhow::anyhow!(
-            "function '{target_name}' not found in {}",
-            source_path.display()
-        ));
+        matches = functions
+            .iter()
+            .filter(|f| cpp_target_suffix_matches(f, target_name))
+            .cloned()
+            .collect();
+    }
+    if matches.is_empty() {
+        return Err(cpp_target_not_found(source_path, &functions, target_name));
     }
     matches.sort_by_key(|f| f.line);
     if let Some(line) = target_line {
@@ -6321,9 +6746,19 @@ fn pick_cpp_target(
                 )
             })
             .collect();
+        let distinct_names = matches
+            .iter()
+            .map(cpp_qualified_target_name)
+            .collect::<BTreeSet<_>>()
+            .len();
+        let shape = if distinct_names > 1 {
+            "matches several functions"
+        } else {
+            "is overloaded"
+        };
         format!(
-            "warning: target '{target_name}' is overloaded in {} ({} candidates: {}); \
-             picking the first. Pass --target-line or --id to disambiguate.",
+            "warning: target '{target_name}' {shape} in {} ({} candidates: {}); \
+             picking the first. Pass --target-line or the fully qualified name to disambiguate.",
             source_path.display(),
             matches.len(),
             summaries.join("; ")
@@ -6331,6 +6766,71 @@ fn pick_cpp_target(
     });
     let picked = matches.into_iter().next().expect("at least one match");
     Ok((picked, warning))
+}
+
+/// Whether `target_name` selects `function` as a trailing `::`-qualified suffix
+/// of its fully qualified name or signature (`Codec::decode` selects
+/// `widgets::Codec::decode`; `Codec::decode(int)` selects only that overload).
+fn cpp_target_suffix_matches(function: &cpp_parser::CppFunction, target_name: &str) -> bool {
+    let qualified = cpp_qualified_target_name(function);
+    crate::target_filter::qualified_suffix_matches(
+        &cpp_signature_target_name(function, &qualified),
+        target_name,
+        false,
+    )
+}
+
+/// The "not found" error for a C++ `--target`: the closest definitions in the
+/// file and the spellings `--target` accepts, illustrated with the best match.
+fn cpp_target_not_found(
+    source_path: &Path,
+    functions: &[cpp_parser::CppFunction],
+    target_name: &str,
+) -> anyhow::Error {
+    let candidates: Vec<(String, &cpp_parser::CppFunction)> = functions
+        .iter()
+        .map(|f| (cpp_qualified_target_name(f), f))
+        .collect();
+    let closest = crate::target_filter::closest_matches(
+        target_name,
+        &candidates,
+        |(qualified, _)| qualified.as_str(),
+        5,
+    );
+    let mut message = format!(
+        "function '{target_name}' not found in {}",
+        source_path.display()
+    );
+    if functions.is_empty() {
+        message.push_str(" (no function definitions were parsed from it)");
+        return anyhow::anyhow!(message);
+    }
+    if !closest.is_empty() {
+        let listed: Vec<String> = closest
+            .iter()
+            .map(|(qualified, f)| format!("{qualified} (line {})", f.line))
+            .collect();
+        message.push_str(&format!("\n  closest definitions: {}", listed.join(", ")));
+    }
+    let (qualified, example) = closest
+        .first()
+        .map(|(qualified, f)| (qualified.clone(), *f))
+        .unwrap_or_else(|| (candidates[0].0.clone(), candidates[0].1));
+    let segments: Vec<&str> = qualified.split("::").collect();
+    let suffix = if segments.len() > 2 {
+        segments[segments.len() - 2..].join("::")
+    } else {
+        qualified.clone()
+    };
+    message.push_str(&format!(
+        "\n  --target accepts the bare name (`{bare}`), a `::`-qualified suffix (`{suffix}`), \
+         the fully qualified name as `bhf list targets` prints it (`{qualified}`), or any of \
+         those with a parameter list (`{signature}`); add --target-line N to pick one of \
+         several matching definitions",
+        bare = example.name,
+        signature = cpp_signature_target_name(example, &suffix),
+    ));
+    anyhow::anyhow!(message)
 }
 
 fn cpp_target_matches(function: &cpp_parser::CppFunction, target_name: &str) -> bool {
@@ -6341,9 +6841,13 @@ fn cpp_target_matches(function: &cpp_parser::CppFunction, target_name: &str) -> 
     if qualified == target_name {
         return true;
     }
+    let signature = cpp_signature_target_name(function, &qualified);
     cpp_signature_target_name(function, &function.name) == target_name
-        || cpp_signature_target_name(function, &qualified) == target_name
+        || signature == target_name
         || (!function.api.overload_key.is_empty() && function.api.overload_key == target_name)
+        // The full name with a leading global `::` or differently spaced
+        // parameters (`Codec::decode(const char*)`).
+        || crate::target_filter::qualified_exact_matches(&signature, target_name, false)
 }
 
 fn cpp_qualified_target_name(function: &cpp_parser::CppFunction) -> String {
@@ -7496,27 +8000,79 @@ fn cmake_config_template_host_capability_flags(source_path: &Path) -> Vec<String
 }
 
 fn try_compile_database_flags_for_source(source_path: &Path) -> Result<Vec<String>> {
+    let import_db = std::env::var_os(PROJECT_COMPILE_DB_ENV).map(PathBuf::from);
     for db_path in compile_database_candidates(source_path) {
         if !db_path.is_file() {
             continue;
         }
-        let bytes = fs::read(&db_path)
-            .with_context(|| format!("read compile database {}", db_path.display()))?;
-        let entries: Vec<CompileCommandEntry> = serde_json::from_slice(&bytes)
-            .with_context(|| format!("parse compile database {}", db_path.display()))?;
-        for entry in &entries {
-            if compile_command_matches_source(entry, source_path) {
-                return Ok(extract_compile_database_flags(entry, source_path));
-            }
-        }
-        if is_c_family_header(source_path) {
-            if let Some(entry) = compile_database_entry_for_header(&entries, source_path) {
-                let owner = compile_command_source_path(entry);
-                return Ok(extract_compile_database_flags(entry, &owner));
-            }
+        let from_import = import_db.as_deref() == Some(db_path.as_path());
+        if let Some(flags) = compile_database_flags_in(&db_path, source_path, from_import)? {
+            return Ok(flags);
         }
     }
     Ok(Vec::new())
+}
+
+/// The `bhf_link_libraries` of a row in the database `bhf auto`'s Visual
+/// Studio import writes: the import libraries the row's project links.
+#[derive(Debug, Default, serde::Deserialize)]
+struct ImportLinkRow {
+    #[serde(default)]
+    bhf_link_libraries: Vec<String>,
+}
+
+/// The flags the database at `db_path` gives `source_path`, or `None` when it
+/// has no row for it. Only the project-import database (`from_import`) may add
+/// link inputs; a tree's own database cannot.
+fn compile_database_flags_in(
+    db_path: &Path,
+    source_path: &Path,
+    from_import: bool,
+) -> Result<Option<Vec<String>>> {
+    let bytes = fs::read(db_path)
+        .with_context(|| format!("read compile database {}", db_path.display()))?;
+    let entries: Vec<CompileCommandEntry> = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse compile database {}", db_path.display()))?;
+    let link_rows: Vec<ImportLinkRow> = if from_import {
+        serde_json::from_slice(&bytes).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let link_flags = |index: usize| -> Vec<String> {
+        link_rows
+            .get(index)
+            .map(|row| {
+                // `-lws2_32`: clang's MSVC driver and bhf-cl both pass it to
+                // the linker as `ws2_32.lib`, found through `LIB`; a bare
+                // `ws2_32.lib` would be read as a file in the harness dir.
+                row.bhf_link_libraries
+                    .iter()
+                    .filter(|name| crate::auto::build_probe::is_plain_library_name(name))
+                    .map(|name| {
+                        format!("{BUILD_CONTEXT_LDFLAG_PREFIX}-l{}", &name[..name.len() - 4])
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    for (index, entry) in entries.iter().enumerate() {
+        if compile_command_matches_source(entry, source_path) {
+            let mut flags = extract_compile_database_flags(entry, source_path);
+            flags.extend(link_flags(index));
+            return Ok(Some(flags));
+        }
+    }
+    if is_c_family_header(source_path) {
+        if let Some(entry) = compile_database_entry_for_header(&entries, source_path) {
+            let owner = compile_command_source_path(entry);
+            let mut flags = extract_compile_database_flags(entry, &owner);
+            if let Some(index) = entries.iter().position(|row| std::ptr::eq(row, entry)) {
+                flags.extend(link_flags(index));
+            }
+            return Ok(Some(flags));
+        }
+    }
+    Ok(None)
 }
 
 #[derive(Debug, Clone)]
@@ -7589,12 +8145,7 @@ fn write_cpp_per_tu_context(output_dir: &Path, contexts: &[PerTuCompileContext])
         "CONTEXT",
         "context_objs",
         contexts,
-        &[
-            ("MAIN", "$(CXX)", "$(CXXFLAGS)", true),
-            ("AFL", "$(AFLPP_CXX)", "$(AFLPP_CXXFLAGS)", false),
-            ("COV", "$(COV_CXX)", "$(COV_CXXFLAGS)", true),
-            ("DIFF", "$(DIFF_CXX)", "$(DIFF_CXXFLAGS)", true),
-        ],
+        CPP_CONTEXT_VARIANTS,
         true,
     )
 }
@@ -7610,18 +8161,33 @@ fn write_c_per_tu_context(output_dir: &Path, contexts: &[PerTuCompileContext]) -
         "CONTEXT",
         "context_objs",
         contexts,
-        &[
-            ("MAIN", "$(CC)", "$(CFLAGS)", true),
-            ("AFL", "$(AFLPP_CC)", "$(AFLPP_CFLAGS)", false),
-            ("MSAN", "$(MSAN_CC)", "$(MSAN_CFLAGS)", true),
-            ("TSAN", "$(TSAN_CC)", "$(TSAN_CFLAGS)", true),
-            ("COV", "$(COV_CC)", "$(COV_CFLAGS)", true),
-            ("DIFF", "$(DIFF_CC)", "$(DIFF_CFLAGS)", true),
-            ("PROV", "$(CC)", "$(CFLAGS)", true),
-        ],
+        C_CONTEXT_VARIANTS,
         false,
     )
 }
+
+/// One object graph of a per-translation-unit fragment: the make-variable
+/// suffix, the lane's compiler and flags, whether the TU is compiled for bhf's
+/// external driver, and whether this is the lane built with the operator's
+/// `$(CC)`/`$(CXX)` (which also takes the toolchain flags).
+type ContextVariant = (&'static str, &'static str, &'static str, bool, bool);
+
+const C_CONTEXT_VARIANTS: &[ContextVariant] = &[
+    ("MAIN", "$(CC)", "$(CFLAGS)", true, true),
+    ("AFL", "$(AFLPP_CC)", "$(AFLPP_CFLAGS)", false, false),
+    ("MSAN", "$(MSAN_CC)", "$(MSAN_CFLAGS)", true, false),
+    ("TSAN", "$(TSAN_CC)", "$(TSAN_CFLAGS)", true, false),
+    ("COV", "$(COV_CC)", "$(COV_CFLAGS)", true, false),
+    ("DIFF", "$(DIFF_CC)", "$(DIFF_CFLAGS)", true, false),
+    ("PROV", "$(CC)", "$(CFLAGS)", true, true),
+];
+
+const CPP_CONTEXT_VARIANTS: &[ContextVariant] = &[
+    ("MAIN", "$(CXX)", "$(CXXFLAGS)", true, true),
+    ("AFL", "$(AFLPP_CXX)", "$(AFLPP_CXXFLAGS)", false, false),
+    ("COV", "$(COV_CXX)", "$(COV_CXXFLAGS)", true, false),
+    ("DIFF", "$(DIFF_CXX)", "$(DIFF_CXXFLAGS)", true, false),
+];
 
 fn remove_stale_per_tu_context(output_dir: &Path, fragment_name: &str) -> Result<()> {
     let fragment = output_dir.join(fragment_name);
@@ -7639,21 +8205,24 @@ fn write_per_tu_context(
     variable_prefix: &str,
     object_dir: &str,
     contexts: &[PerTuCompileContext],
-    variants: &[(&str, &str, &str, bool)],
+    variants: &[ContextVariant],
     cpp: bool,
 ) -> Result<()> {
+    use harness_gen::build_safety::{
+        checked_recipe_path, ensure_all_compile_flags_safe, ensure_build_path_safe, recipe_token,
+    };
+    // Paths may carry spaces (double-quoted below) and flags may need quoting
+    // (`-I/proj dir/include`); anything quoting cannot contain is refused.
+    let mut sources = Vec::with_capacity(contexts.len());
     for context in contexts {
-        harness_gen::build_safety::ensure_build_input_safe(
-            "per-TU source path",
-            &context.source.to_string_lossy(),
-        )?;
+        sources.push(checked_recipe_path("per-TU source path", &context.source)?);
+        // The database compiler is not written into the rule (it uses
+        // `$(CC)`/`$(CXX)`, whose Makefile default is the database compiler),
+        // but a hostile one is still refused rather than silently dropped.
         if let Some(compiler) = &context.compiler {
-            harness_gen::build_safety::ensure_build_input_safe("per-TU compiler", compiler)?;
+            ensure_build_path_safe("per-TU compiler", compiler)?;
         }
-        harness_gen::build_safety::ensure_all_build_inputs_safe(
-            "per-TU compile flag",
-            context.flags.iter().map(String::as_str),
-        )?;
+        ensure_all_compile_flags_safe(context.flags.iter().map(String::as_str))?;
     }
 
     let mut fragment = String::from(
@@ -7662,7 +8231,7 @@ fn write_per_tu_context(
          .PHONY: FORCE_CONTEXT_OBJECTS\n\
          FORCE_CONTEXT_OBJECTS:\n",
     );
-    for (variant, _, _, _) in variants {
+    for (variant, _, _, _, _) in variants {
         let objects = (0..contexts.len())
             .map(|index| format!("{object_dir}/{}_{}.o", variant.to_ascii_lowercase(), index))
             .collect::<Vec<_>>()
@@ -7673,29 +8242,69 @@ fn write_per_tu_context(
     }
     fragment.push('\n');
 
-    for (variant, default_compiler, variant_flags, external_driver) in variants {
+    for (variant, lane_compiler, lane_flags, external_driver, operator_lane) in variants {
         for (index, context) in contexts.iter().enumerate() {
             let object = format!("{object_dir}/{}_{}.o", variant.to_ascii_lowercase(), index);
-            let compiler = if *variant == "MAIN" || *variant == "PROV" {
-                context.compiler.as_deref().unwrap_or(default_compiler)
+            // A C row of a C++ harness keeps C semantics on the operator lane:
+            // the paired C driver, with the C++ `-std=` filtered out of the
+            // lane flags.
+            let c_row_of_cpp = cpp
+                && *operator_lane
+                && context.source.extension().and_then(|ext| ext.to_str()) == Some("c");
+            let (compiler, variant_flags) = if c_row_of_cpp {
+                ("$(CC)", "$(BHF_CONTEXT_C_FLAGS)")
             } else {
-                default_compiler
+                (*lane_compiler, *lane_flags)
             };
+            // Each flag is one word, quoted whole when it needs quoting (a
+            // spaced include dir, a quoted define): the compiler receives a
+            // define's quotes, and the shell never parses what is inside them.
             let flags = context
                 .flags
                 .iter()
-                .map(|flag| flag.replace('"', "\\\""))
+                .map(|flag| recipe_token(flag))
                 .collect::<Vec<_>>()
                 .join(" ");
+            // C keeps its compat flags right after the section flags. The C++
+            // ones and the toolchain additions follow the include flags, so the
+            // tokens between `$(SECTION_FLAGS)` and `$(INCLUDES)` stay exactly
+            // the database row's own flags.
             let compat = if cpp { "" } else { " $(C_COMPAT_FLAGS)" };
+            let cxx_compat = match (cpp, *operator_lane, c_row_of_cpp) {
+                (true, true, false) => " $(CXX_COMPAT_FLAGS)",
+                (true, false, _) => " $(CXX_COMPAT_FLAGS_CLANG)",
+                _ => "",
+            };
+            let toolchain = match (*operator_lane, cpp && !c_row_of_cpp) {
+                (true, true) => {
+                    " $(BHF_TOOLCHAIN_TARGET_FLAGS) $(BHF_TOOLCHAIN_CXXFLAGS) $(BHF_TOOLCHAIN_CPPFLAGS)"
+                }
+                (true, false) => {
+                    " $(BHF_TOOLCHAIN_TARGET_FLAGS) $(BHF_TOOLCHAIN_CFLAGS) $(BHF_TOOLCHAIN_CPPFLAGS)"
+                }
+                (false, _) => " $(BHF_TOOLCHAIN_CPPFLAGS)",
+            };
+            // Every lane takes the preprocessor words of the toolchain flags
+            // of the unit's own language.
+            let c_row = context.source.extension().and_then(|ext| ext.to_str()) == Some("c");
+            let language_cppflags = if cpp && !c_row {
+                " $(BHF_TOOLCHAIN_CXX_CPPFLAGS)"
+            } else {
+                " $(BHF_TOOLCHAIN_C_CPPFLAGS)"
+            };
+            // A sanitized lane turns glibc's fortification off after the
+            // row's own flags and the toolchain's (see
+            // BHF_SANITIZED_NO_FORTIFY in the Makefile), outside the span a
+            // capsule reads as the row's flags.
+            let no_fortify = format!(" $(call BHF_SANITIZED_NO_FORTIFY,{variant_flags})");
             let driver_define = if *external_driver {
                 " -DBHF_EXTERNAL_DRIVER"
             } else {
                 ""
             };
             fragment.push_str(&format!(
-                "{object}: FORCE_CONTEXT_OBJECTS\n\t@mkdir -p {object_dir}\n\t{compiler} {variant_flags} $(SECTION_FLAGS){compat} {flags} $(INCLUDES) $(AUTO_EXTRA_INCLUDES){driver_define} -c {} -o {object}\n\n",
-                harness_gen::build_safety::make_path(&context.source)
+                "{object}: FORCE_CONTEXT_OBJECTS\n\t@mkdir -p {object_dir}\n\t{compiler} {variant_flags} $(SECTION_FLAGS){compat} {flags} $(INCLUDES) $(AUTO_EXTRA_INCLUDES){cxx_compat}{toolchain}{language_cppflags}{no_fortify}{driver_define} -c {} -o {object}\n\n",
+                sources[index]
             ));
         }
     }
@@ -7737,23 +8346,10 @@ pub(crate) fn prepare_repair_per_tu_context(
         return Ok(fallback_sources);
     }
 
-    let variants: &[(&str, &str, &str, bool)] = if cpp {
-        &[
-            ("MAIN", "$(CXX)", "$(CXXFLAGS)", true),
-            ("AFL", "$(AFLPP_CXX)", "$(AFLPP_CXXFLAGS)", false),
-            ("COV", "$(COV_CXX)", "$(COV_CXXFLAGS)", true),
-            ("DIFF", "$(DIFF_CXX)", "$(DIFF_CXXFLAGS)", true),
-        ]
+    let variants = if cpp {
+        CPP_CONTEXT_VARIANTS
     } else {
-        &[
-            ("MAIN", "$(CC)", "$(CFLAGS)", true),
-            ("AFL", "$(AFLPP_CC)", "$(AFLPP_CFLAGS)", false),
-            ("MSAN", "$(MSAN_CC)", "$(MSAN_CFLAGS)", true),
-            ("TSAN", "$(TSAN_CC)", "$(TSAN_CFLAGS)", true),
-            ("COV", "$(COV_CC)", "$(COV_CFLAGS)", true),
-            ("DIFF", "$(DIFF_CC)", "$(DIFF_CFLAGS)", true),
-            ("PROV", "$(CC)", "$(CFLAGS)", true),
-        ]
+        C_CONTEXT_VARIANTS
     };
     write_per_tu_context(
         output_dir,
@@ -7780,7 +8376,20 @@ const COMPILE_DB_BUILD_SUBDIRS: &[&str] = &[
     "out",                 // Generic out-of-source convention (e.g. GN, custom).
 ];
 
+/// Environment variable naming a compile database outside the scanned tree,
+/// consulted after every in-tree location. `bhf auto` sets it to the database
+/// its Visual Studio project import wrote into the work directory.
+pub(crate) const PROJECT_COMPILE_DB_ENV: &str = "BHF_PROJECT_COMPILE_DB";
+
 fn compile_database_candidates(source_path: &Path) -> Vec<PathBuf> {
+    let mut candidates = compile_database_candidates_in_tree(source_path);
+    if let Some(db) = std::env::var_os(PROJECT_COMPILE_DB_ENV) {
+        push_unique_path(&mut candidates, PathBuf::from(db));
+    }
+    candidates
+}
+
+fn compile_database_candidates_in_tree(source_path: &Path) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     let mut cursor = source_path.parent().map(Path::to_path_buf);
     while let Some(dir) = cursor {
@@ -7836,7 +8445,7 @@ fn is_c_or_cpp_translation_unit(path: &Path) -> bool {
 /// drops the TU, so a false positive only loses one sibling source (still
 /// recoverable by the per-symbol `AddSource` cascade) rather than mis-link a
 /// second `main`.
-fn source_defines_main(path: &Path) -> bool {
+pub(crate) fn source_defines_main(path: &Path) -> bool {
     crate::source_text::read_source_text(path)
         .map(|text| text_declares_function(&text, "main"))
         .unwrap_or(false)
@@ -8706,6 +9315,14 @@ fn extract_compile_database_flags(entry: &CompileCommandEntry, source_path: &Pat
         return Vec::new();
     };
     let args = expand_response_files(&raw_args, &entry.directory, 0);
+    // A row from an MSVC build speaks cl's dialect (`/I`, `/D`, `/FI`,
+    // `/std:c11`). Spell it the GCC way first, so the reader below — and every
+    // consumer of the flags it keeps — sees one dialect.
+    let (args, msvc_families) = if is_msvc_compile_row(&args) {
+        translate_msvc_compile_arguments(&args, &entry.directory)
+    } else {
+        (args, BTreeSet::new())
+    };
     let mut flags = Vec::new();
     if let Some(compiler) = compile_command_compiler(&args) {
         flags.push(format!("{BUILD_CONTEXT_COMPILER_PREFIX}{compiler}"));
@@ -8722,7 +9339,7 @@ fn extract_compile_database_flags(entry: &CompileCommandEntry, source_path: &Pat
                     continue;
                 }
             }
-            "-isystem" | "-iquote" | "-idirafter" | "-isysroot" | "--sysroot" | "-imacros" => {
+            "-isystem" | "-iquote" | "-idirafter" | "-isysroot" | "--sysroot" => {
                 if let Some(value) = args.get(i + 1) {
                     flags.push(arg.clone());
                     flags.push(resolve_compile_database_path(&entry.directory, value));
@@ -8745,10 +9362,13 @@ fn extract_compile_database_flags(entry: &CompileCommandEntry, source_path: &Pat
                     continue;
                 }
             }
-            "-include" => {
+            "-include" | "-imacros" => {
                 if let Some(value) = args.get(i + 1) {
                     flags.push(arg.clone());
-                    flags.push(resolve_compile_database_path(&entry.directory, value));
+                    flags.push(resolve_compile_database_forced_include(
+                        &entry.directory,
+                        value,
+                    ));
                     i += 2;
                     continue;
                 }
@@ -8832,7 +9452,8 @@ fn extract_compile_database_flags(entry: &CompileCommandEntry, source_path: &Pat
     // (cached) and drop the ones it rejects, so a gcc-recovered build still
     // harnesses under clang instead of failing every target.
     flags.retain(|flag| !flag.starts_with("-m") || clang_accepts_flag(flag));
-    let dropped = dropped_compile_flag_families(&args);
+    let mut dropped = dropped_compile_flag_families(&args);
+    dropped.extend(msvc_families);
     if !dropped.is_empty() {
         flags.push(format!(
             "{BUILD_CONTEXT_DROPPED_PREFIX}{}",
@@ -8840,6 +9461,274 @@ fn extract_compile_database_flags(entry: &CompileCommandEntry, source_path: &Pat
         ));
     }
     flags
+}
+
+/// The leaf of a compiler or launcher argument, lowercased, with either path
+/// separator and a `.exe` suffix removed: `C:\tools\ccache.exe` -> `ccache`.
+fn compile_command_leaf(argument: &str) -> String {
+    let trimmed = argument.trim().trim_matches('"');
+    let leaf = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
+    let lower = leaf.to_ascii_lowercase();
+    lower
+        .strip_suffix(".exe")
+        .map(str::to_owned)
+        .unwrap_or(lower)
+}
+
+fn is_compiler_launcher_leaf(leaf: &str) -> bool {
+    matches!(
+        leaf,
+        "ccache" | "sccache" | "distcc" | "icecc" | "buildcache"
+    )
+}
+
+/// Whether a compile-database row's compiler (after any launcher) speaks the
+/// MSVC command-line dialect: `cl.exe` or `clang-cl`.
+fn is_msvc_compile_row(args: &[String]) -> bool {
+    args.iter()
+        .find(|argument| !is_compiler_launcher_leaf(&compile_command_leaf(argument)))
+        .and_then(|compiler| harness_gen::compiler_family::family_from_name(compiler))
+        == Some(harness_gen::compiler_family::CompilerFamily::Msvc)
+}
+
+/// A path written by an MSVC build: backslash separators become `/` (which
+/// Windows also accepts), so the row reads the same on every host and the
+/// harness recipe — run by `sh` — keeps its separators.
+fn msvc_path_operand(value: &str) -> String {
+    value.trim_matches('"').replace('\\', "/")
+}
+
+/// `cl` options that carry build semantics, spelled for clang, and the dropped
+/// families of the rest. The launcher and compiler words are kept as they are;
+/// options may use either `/` or `-`. A word that names an existing path (an
+/// absolute `/home/...` source on a POSIX host) is an operand, not an option.
+/// Everything after `/link` is for the linker and is dropped.
+pub(crate) fn translate_msvc_compile_arguments(
+    args: &[String],
+    directory: &Path,
+) -> (Vec<String>, BTreeSet<&'static str>) {
+    let mut families = BTreeSet::new();
+    families.insert("msvc_dialect_translated");
+    let compiler_index = args
+        .iter()
+        .position(|argument| !is_compiler_launcher_leaf(&compile_command_leaf(argument)))
+        .unwrap_or(0);
+    let mut out: Vec<String> = args[..=compiler_index.min(args.len().saturating_sub(1))].to_vec();
+    let mut index = compiler_index + 1;
+    // The value of an option that takes one, either attached (`/Idir`) or as
+    // the next word (`/I dir`).
+    let operand = |attached: &str, index: &mut usize| -> Option<String> {
+        if !attached.is_empty() {
+            return Some(attached.trim_start_matches(':').to_owned());
+        }
+        let next = args.get(*index + 1)?.clone();
+        *index += 1;
+        Some(next)
+    };
+    while index < args.len() {
+        let arg = &args[index];
+        let is_existing_path = (arg.starts_with('/') || arg.starts_with('-'))
+            && (Path::new(arg).exists() || directory.join(arg).exists());
+        let body = match arg.strip_prefix('/').or_else(|| arg.strip_prefix('-')) {
+            Some(body) if !is_existing_path && !body.is_empty() => body,
+            _ => {
+                // An operand (source file, object): keep it, separators normalised.
+                out.push(if arg.contains('\\') {
+                    msvc_path_operand(arg)
+                } else {
+                    arg.clone()
+                });
+                index += 1;
+                continue;
+            }
+        };
+        if body.eq_ignore_ascii_case("link") {
+            families.insert("linker_only");
+            break;
+        }
+        if let Some(rest) = body.strip_prefix("external:I") {
+            if let Some(dir) = operand(rest, &mut index) {
+                out.push("-isystem".to_owned());
+                out.push(msvc_path_operand(&dir));
+            }
+        } else if let Some(rest) = body.strip_prefix("external:") {
+            let _ = rest;
+            families.insert("warning_policy");
+        } else if let Some(rest) = body.strip_prefix("FI") {
+            if let Some(file) = operand(rest, &mut index) {
+                out.push("-include".to_owned());
+                out.push(msvc_path_operand(&file));
+            }
+        } else if let Some(rest) = body.strip_prefix('I') {
+            if let Some(dir) = operand(rest, &mut index) {
+                out.push("-I".to_owned());
+                out.push(msvc_path_operand(&dir));
+            }
+        } else if let Some(rest) = body.strip_prefix('D') {
+            if let Some(define) = operand(rest, &mut index) {
+                // cl also accepts `NAME#VALUE` for `NAME=VALUE`.
+                let define = match define.split_once('#') {
+                    Some((name, value)) if !name.contains('=') => format!("{name}={value}"),
+                    _ => define,
+                };
+                out.push(format!("-D{define}"));
+            }
+        } else if let Some(rest) = body.strip_prefix('U') {
+            if let Some(name) = operand(rest, &mut index) {
+                out.push(format!("-U{name}"));
+            }
+        } else if let Some(standard) = body.strip_prefix("std:") {
+            match msvc_language_standard(standard) {
+                Some(standard) => out.push(format!("-std={standard}")),
+                None => {
+                    families.insert("msvc_codegen");
+                }
+            }
+        } else if body == "J" {
+            out.push("-funsigned-char".to_owned());
+        } else if let Some(pack) = body.strip_prefix("Zp") {
+            out.push(if pack.is_empty() {
+                "-fpack-struct=1".to_owned()
+            } else {
+                format!("-fpack-struct={pack}")
+            });
+        } else if body == "Zc:wchar_t-" {
+            out.push("-fno-wchar".to_owned());
+        } else if body == "GR-" {
+            out.push("-fno-rtti".to_owned());
+        } else if body == "TC" || body == "TP" {
+            // `/TC`/`/TP` name the language of every input; MSBuild passes one
+            // for each source. The harness compile picks the language by file
+            // extension, and a `-x c` would also apply to the objects of its
+            // link line.
+            families.insert("msvc_codegen");
+        } else if let Some(file) = body.strip_prefix("Tc").or_else(|| body.strip_prefix("Tp")) {
+            if let Some(file) = operand(file, &mut index) {
+                out.push(msvc_path_operand(&file));
+            }
+        } else if let Some(arch) = body.strip_prefix("arch:") {
+            match arch {
+                "AVX" => out.push("-mavx".to_owned()),
+                "AVX2" => out.push("-mavx2".to_owned()),
+                "AVX512" => out.push("-mavx512f".to_owned()),
+                _ => {
+                    families.insert("msvc_codegen");
+                }
+            }
+        } else if body == "c" {
+            out.push("-c".to_owned());
+        } else if ["MD", "MDd", "MT", "MTd", "LD", "LDd"].contains(&body) {
+            families.insert("msvc_runtime_library");
+        } else if body.starts_with("Yc") || body.starts_with("Yu") || body.starts_with("Yl") {
+            families.insert("module_or_pch");
+        } else if body.starts_with("Fo")
+            || body.starts_with("Fd")
+            || body.starts_with("Fe")
+            || body.starts_with("Fa")
+            || body.starts_with("Fp")
+            || body.starts_with("FR")
+            || body.starts_with("Fr")
+            || body.starts_with("Fm")
+            || body == "nologo"
+            || body == "FC"
+            || body == "FS"
+            || body.starts_with("MP")
+            || body.starts_with("showIncludes")
+            || body.starts_with("errorReport")
+            || body.starts_with("diagnostics")
+        {
+            families.insert("output_control");
+        } else if body.starts_with('W') || body.starts_with('w') {
+            families.insert("warning_policy");
+        } else {
+            // Optimisation, debug-info, runtime-check, exception, conformance and
+            // charset options (`/O2`, `/Zi`, `/RTC1`, `/EHsc`, `/permissive-`,
+            // `/utf-8`, `/GS`, `/sdl`): the harness compile sets its own.
+            families.insert("msvc_codegen");
+        }
+        index += 1;
+    }
+    (out, families)
+}
+
+/// A cl `/std:` value as the `-std=` clang reads, or `None` when it has no
+/// clang spelling.
+fn msvc_language_standard(standard: &str) -> Option<&'static str> {
+    Some(match standard {
+        "c11" => "c11",
+        "c17" => "c17",
+        "clatest" => "c2x",
+        "c++14" => "c++14",
+        "c++17" => "c++17",
+        "c++20" => "c++20",
+        "c++23preview" | "c++latest" => "c++2b",
+        _ => return None,
+    })
+}
+
+/// Split a compile-database `command` the way the Windows C runtime splits a
+/// command line (`CommandLineToArgvW`): a backslash is literal unless it
+/// precedes a double quote, so `/IC:\proj\include` keeps its separators.
+pub(crate) fn split_windows_command_line(command: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_word = false;
+    let mut quoted = false;
+    let chars: Vec<char> = command.chars().collect();
+    let mut index = 0;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch == '\\' {
+            let start = index;
+            while index < chars.len() && chars[index] == '\\' {
+                index += 1;
+            }
+            let count = index - start;
+            in_word = true;
+            if index < chars.len() && chars[index] == '"' {
+                current.extend(std::iter::repeat_n('\\', count / 2));
+                if count % 2 == 1 {
+                    current.push('"');
+                    index += 1;
+                }
+            } else {
+                current.extend(std::iter::repeat_n('\\', count));
+            }
+            continue;
+        }
+        if ch == '"' {
+            in_word = true;
+            if quoted && chars.get(index + 1) == Some(&'"') {
+                current.push('"');
+                index += 2;
+                continue;
+            }
+            quoted = !quoted;
+        } else if ch.is_whitespace() && !quoted {
+            if in_word {
+                args.push(std::mem::take(&mut current));
+                in_word = false;
+            }
+        } else {
+            in_word = true;
+            current.push(ch);
+        }
+        index += 1;
+    }
+    if in_word {
+        args.push(current);
+    }
+    args
+}
+
+/// Whether a compile-database `command` string is a cl-style command line,
+/// judged by its first word.
+fn is_msvc_command_line(command: &str) -> bool {
+    split_windows_command_line(command)
+        .iter()
+        .find(|word| !is_compiler_launcher_leaf(&compile_command_leaf(word)))
+        .and_then(|compiler| harness_gen::compiler_family::family_from_name(compiler))
+        == Some(harness_gen::compiler_family::CompilerFamily::Msvc)
 }
 
 fn dropped_compile_flag_families(args: &[String]) -> BTreeSet<&'static str> {
@@ -8868,23 +9757,15 @@ fn dropped_compile_flag_families(args: &[String]) -> BTreeSet<&'static str> {
 
 /// Whether a compile-database compiler's LEAF NAME is a real toolchain name.
 ///
-/// Deliberately an exact match against the known driver names, after stripping a
-/// version suffix (`gcc-12`) and a target-triple prefix (`aarch64-linux-gnu-gcc`).
-/// The previous test was `leaf.contains("clang")`, which accepts `evilclang` — any
-/// executable at all, as long as its name embeds the substring.
+/// Deliberately an exact match against the known driver names, after the shared
+/// normalisation in [`harness_gen::compiler_family`] (a `.exe` suffix, a version
+/// suffix `gcc-12`, a target-triple prefix `aarch64-linux-gnu-gcc`). The same
+/// normalisation picks the Makefile's fallback flag family, so a name accepted
+/// here is never paired with the other family's flags. The previous test was
+/// `leaf.contains("clang")`, which accepts `evilclang` — any executable at all,
+/// as long as its name embeds the substring.
 fn is_toolchain_leaf_name(leaf: &str) -> bool {
-    // `gcc-12`, `clang-18.1` -> drop a trailing all-numeric version component.
-    let stem = match leaf.rsplit_once('-') {
-        Some((base, suffix))
-            if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit() || c == '.') =>
-        {
-            base
-        }
-        _ => leaf,
-    };
-    // `aarch64-linux-gnu-gcc` -> the driver name is the last component.
-    let base = stem.rsplit('-').next().unwrap_or(stem);
-    matches!(base, "clang" | "clang++" | "gcc" | "g++")
+    harness_gen::compiler_family::driver_base_name(leaf).is_some()
 }
 
 /// Whether `candidate` lives inside the scanned (untrusted) tree.
@@ -8926,6 +9807,9 @@ fn is_inside_untrusted_tree(candidate: &Path) -> bool {
 /// 2. the path must not live inside the scanned tree (or the working directory).
 ///    A tree binary named exactly `clang` satisfies (1), so only this rejects it.
 ///
+/// A cl-style driver (`cl.exe`, `clang-cl`) is never adopted: the row's flags are
+/// translated to the GCC spelling instead (see `translate_msvc_compile_arguments`).
+///
 /// A bare name carries no directory, so it is left alone — make resolves it on the
 /// operator's PATH. An
 /// absolute path OUTSIDE the tree is honored as-is, which keeps a cross or custom
@@ -8934,16 +9818,20 @@ fn is_inside_untrusted_tree(candidate: &Path) -> bool {
 fn compile_command_compiler(args: &[String]) -> Option<String> {
     let mut index = 0;
     while let Some(argument) = args.get(index) {
-        let leaf = Path::new(argument)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(argument)
-            .to_ascii_lowercase();
-        if matches!(leaf.as_str(), "ccache" | "sccache" | "distcc" | "icecc") {
+        let leaf = compile_command_leaf(argument);
+        if is_compiler_launcher_leaf(&leaf) {
             index += 1;
             continue;
         }
         if !is_toolchain_leaf_name(&leaf) {
+            return None;
+        }
+        // A cl-style driver reads options the generated GCC-style Makefile
+        // does not write; its row's flags are translated instead, and the
+        // harness is built by bhf's own compiler choice.
+        if harness_gen::compiler_family::family_from_name(&leaf)
+            == Some(harness_gen::compiler_family::CompilerFamily::Msvc)
+        {
             return None;
         }
         let path = Path::new(argument);
@@ -9009,6 +9897,7 @@ fn compile_database_single_flag_is_safe(flag: &str) -> bool {
                 | "-fexceptions"
                 | "-fno-rtti"
                 | "-frtti"
+                | "-fno-wchar"
                 | "-fno-strict-aliasing"
                 | "-fstrict-aliasing"
                 | "-fwrapv"
@@ -9026,7 +9915,34 @@ fn compile_command_arguments(entry: &CompileCommandEntry) -> Option<Vec<String>>
     if let Some(arguments) = &entry.arguments {
         return Some(arguments.clone());
     }
-    entry.command.as_deref().map(split_compile_command)
+    // A `command` string is split the way clang's compilation database splits
+    // it: with the Windows C runtime's rules on a Windows host, where a
+    // CMake-written `-c C:\src\x.c` keeps its backslashes, and for a cl-style
+    // command line anywhere.
+    entry.command.as_deref().map(|command| {
+        if cfg!(windows) || is_msvc_command_line(command) {
+            split_windows_command_line(command)
+        } else {
+            split_compile_command(command)
+        }
+    })
+}
+
+/// The operand of `-include FILE` / `-imacros FILE` from a compile database.
+///
+/// The compiler looks for a relative FILE in its working directory first and
+/// then along the `#include "..."` search chain, so `-include iostream` names a
+/// system header. Rewriting it against the entry's directory would turn that
+/// into a file that does not exist. Only absolutize when the entry directory
+/// really holds the file; otherwise keep the operand verbatim so the search
+/// path still applies from the harness directory.
+fn resolve_compile_database_forced_include(directory: &Path, value: &str) -> String {
+    let path = Path::new(value);
+    if path.is_absolute() || directory.join(path).is_file() {
+        resolve_compile_database_path(directory, value)
+    } else {
+        value.to_owned()
+    }
 }
 
 fn resolve_compile_database_path(directory: &Path, value: &str) -> String {
@@ -9282,6 +10198,36 @@ fn foreign_guard_branches(directive_after_hash: &str) -> (bool, bool) {
 }
 
 fn direct_project_includes(source: &str, include_dirs: &[PathBuf]) -> Vec<String> {
+    include_spellings(source)
+        .into_iter()
+        .filter(|header| {
+            let Some(resolved) = include_dirs
+                .iter()
+                .map(|dir| dir.join(header))
+                .find(|p| p.is_file())
+            else {
+                return false;
+            };
+            // Compile databases legitimately publish `-isystem` roots alongside
+            // project `-I` roots. Those paths are needed by the compiler, but their
+            // implementation headers must never be flattened into generated source:
+            // explicitly including libstdc++ `bits/*` dependencies out of order
+            // breaks otherwise valid headers (RE2 + Abseil's <atomic> was the real
+            // reproducer). The original public header will include them correctly.
+            // A feature-gated OpenMP source TU (`#pragma omp` / `<omp.h>`) only
+            // compiles with `-fopenmp`; the harness never enables it, so dropping
+            // it from the include closure keeps the core target buildable (base64
+            // `lib_openmp.c`).
+            !is_host_toolchain_header(&resolved) && !is_openmp_translation_unit(&resolved)
+        })
+        .collect()
+}
+
+/// The headers `source` `#include`s, in order and each once, as spelled:
+/// without those in a foreign-OS-only `#if` branch and without textually
+/// included implementation fragments. Whether each one is a project header
+/// depends on the include dirs it is looked up in.
+fn include_spellings(source: &str) -> Vec<String> {
     let mut includes = Vec::new();
     // (skip-current-branch, skip-else-branch) per open `#if`. An include inside a
     // foreign-OS-only branch is dropped: it never compiles on the host, and pulling
@@ -9336,32 +10282,9 @@ fn direct_project_includes(source: &str, include_dirs: &[PathBuf]) -> Vec<String
             continue;
         }
         let header = header.to_owned();
-        if includes.contains(&header) {
-            continue;
+        if !includes.contains(&header) {
+            includes.push(header);
         }
-        let Some(resolved) = include_dirs
-            .iter()
-            .map(|dir| dir.join(&header))
-            .find(|p| p.is_file())
-        else {
-            continue;
-        };
-        // Compile databases legitimately publish `-isystem` roots alongside
-        // project `-I` roots. Those paths are needed by the compiler, but their
-        // implementation headers must never be flattened into generated source:
-        // explicitly including libstdc++ `bits/*` dependencies out of order
-        // breaks otherwise valid headers (RE2 + Abseil's <atomic> was the real
-        // reproducer). The original public header will include them correctly.
-        if is_host_toolchain_header(&resolved) {
-            continue;
-        }
-        // A feature-gated OpenMP source TU (`#pragma omp` / `<omp.h>`) only compiles
-        // with `-fopenmp`; the harness never enables it, so dropping it from the
-        // include closure keeps the core target buildable (base64 `lib_openmp.c`).
-        if is_openmp_translation_unit(&resolved) {
-            continue;
-        }
-        includes.push(header);
     }
     includes
 }
@@ -9632,7 +10555,9 @@ fn preflight_header_includes(
     }
     for include_dir in include_dirs {
         flags.push("-I".to_owned());
-        flags.push(include_dir.to_string_lossy().to_string());
+        // Spelled as the harness Makefile spells it: on Windows without the
+        // `\\?\` prefix, which MinGW's compilers cannot open.
+        flags.push(harness_gen::build_safety::make_path(include_dir));
     }
     if cpp {
         // The real build repairs mixed Clang/GCC installations whose clang++
@@ -10372,13 +11297,20 @@ fn run_cpp_direct(args: &GenerateHarnessArgs) -> Result<()> {
     discard_cpp_context_for_included_target(&mut per_tu_contexts, &result.main_cpp, &source_path)?;
     write_cpp_per_tu_context(&output_dir, &per_tu_contexts)?;
     write_harness_dictionary(&output_dir, &dictionary_tokens)?;
-    write_generation_metadata(
+    let target_function = if function.qualifier_path.is_empty() {
+        function.name.clone()
+    } else {
+        format!("{}::{}", function.qualifier_path.join("::"), function.name)
+    };
+    write_target_generation_metadata(
         &output_dir,
         "cpp",
         args.target_line,
         function.line,
         &args.kind,
         emitted_path,
+        Some(&target_function),
+        RecordedBuildInputs::of(args),
     )?;
     if generation_banner_enabled() {
         println!(
@@ -10807,6 +11739,280 @@ pub(crate) fn cpp_default_constructible_parameter_classes(
         }
     }
     registered.into_iter().collect()
+}
+
+/// The type registry discovery and `bhf list targets` rank a C or C++ file's
+/// targets with: the typedefs of the file and of the project headers in its
+/// transitive include closure (looked up in the include dirs generation
+/// uses), so a parameter spelled through a project typedef (`const u8_t
+/// *data`, `u32_t len`) is ranked as the type it aliases. Empty (built-in
+/// spellings only) unless some parameter needs it (see
+/// [`target_rank::needs_type_registry`]). Each header is parsed once per
+/// process (see [`ranking_header`]), not once per file that includes it, and
+/// the file's own aliases are read from its text (see [`simple_aliases`]).
+pub(crate) fn ranking_type_registry<'a>(
+    source_path: &Path,
+    source: &str,
+    cpp: bool,
+    param_lists: impl IntoIterator<Item = Vec<(&'a str, &'a str)>>,
+) -> type_model::TypeRegistry {
+    if !param_lists
+        .into_iter()
+        .any(|params| target_rank::needs_type_registry(&params))
+    {
+        return type_model::TypeRegistry::default();
+    }
+    let target_dir = source_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut include_dirs = vec![target_dir.to_path_buf()];
+    for include in auto_detect_project_includes(source_path) {
+        if !include_dirs.contains(&include) {
+            include_dirs.push(include);
+        }
+    }
+    let mut queue = auto_detect_c_headers(source_path, target_dir);
+    queue.extend(include_spellings(source));
+    // Ranking reads only what an alias resolves to, so the source's structs
+    // and enums are left out like the headers' are, and its aliases are read
+    // from its text: a second parse of the file costs as much as its function
+    // parse.
+    let source_typedefs = c_parser::CTypeDefs {
+        structs: Vec::new(),
+        enums: Vec::new(),
+        typedefs: simple_aliases(source),
+    };
+    let source_canonical = fs::canonicalize(source_path).ok();
+    let mut visited: HashSet<PathBuf> = HashSet::new();
+    let mut headers: Vec<std::sync::Arc<RankingHeader>> = Vec::new();
+    // Breadth-first, so the typedefs of the headers the file names directly
+    // win over a same-named one deeper in the closure.
+    let mut at = 0;
+    while at < queue.len() && headers.len() < MAX_TRANSITIVE_HEADERS {
+        let include = queue[at].clone();
+        at += 1;
+        let Some(path) = include_dirs
+            .iter()
+            .map(|dir| dir.join(&include))
+            .find(|path| path.is_file())
+        else {
+            continue;
+        };
+        let Ok(canonical) = fs::canonicalize(&path) else {
+            continue;
+        };
+        if Some(&canonical) == source_canonical.as_ref() || !visited.insert(canonical.clone()) {
+            continue;
+        }
+        let Some(header) = ranking_header(&canonical, cpp) else {
+            continue;
+        };
+        queue.extend(header.includes.iter().cloned());
+        headers.push(header);
+    }
+    type_model::TypeRegistry::from_defs(
+        std::iter::once(&source_typedefs).chain(headers.iter().map(|header| &header.typedefs)),
+    )
+}
+
+/// The simple aliases `source` declares: `typedef <type> NAME[, NAME2];` and
+/// `using NAME = <type>;` statements that begin a line and have no body,
+/// reference, array, template or function type. Every alias that can resolve
+/// to a scalar has this form. A typedef of a single pointer
+/// (`typedef const octet_t *rbuf_t;`) is kept too, as `const octet_t *`: its
+/// pointee's qualifiers say whether a parameter of that type is read-only.
+fn simple_aliases(source: &str) -> Vec<c_parser::CTypedefDef> {
+    let identifier = |text: &str| {
+        text.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && text.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
+    let lines: Vec<&str> = source.lines().collect();
+    let mut aliases = Vec::new();
+    for (at, line) in lines.iter().enumerate() {
+        let start = line.trim_start();
+        let (typedef, rest) = if let Some(rest) = start.strip_prefix("typedef") {
+            (true, rest)
+        } else if let Some(rest) = start.strip_prefix("using") {
+            (false, rest)
+        } else {
+            continue;
+        };
+        if !rest.starts_with(char::is_whitespace) {
+            continue;
+        }
+        // The statement, up to its `;`, within a few lines.
+        let mut statement = rest.to_owned();
+        let mut next = at + 1;
+        while !statement.contains(';') && next < lines.len() && next <= at + 4 {
+            statement.push('\n');
+            statement.push_str(lines[next]);
+            next += 1;
+        }
+        let Some((statement, _)) = statement.split_once(';') else {
+            continue;
+        };
+        let statement = strip_statement_comments(statement);
+        if statement.contains(['{', '}', '(', ')', '[', ']', '<', '>', '&', '"', '\'', '#']) {
+            continue;
+        }
+        let line = u32::try_from(at + 1).unwrap_or(u32::MAX);
+        let mut alias = |name: &str, underlying: &str| {
+            aliases.push(c_parser::CTypedefDef {
+                name: name.to_owned(),
+                underlying: underlying.to_owned(),
+                line,
+            })
+        };
+        if typedef {
+            // `typedef unsigned char u8_t, *pu8_t;`: the first declarator,
+            // and every later one that is a plain name, alias the base type.
+            let mut parts = statement.split(',');
+            let first = parts.next().unwrap_or_default();
+            if first.contains('*') {
+                // One declarator, one pointer level, a plain pointee.
+                if parts.next().is_none() && first.matches('*').count() == 1 {
+                    if let Some((base, name)) = first.rsplit_once('*') {
+                        let (base, name) = (base.trim(), name.trim());
+                        if identifier(name)
+                            && !base.is_empty()
+                            && base.split_whitespace().all(identifier)
+                        {
+                            let base = base.split_whitespace().collect::<Vec<_>>().join(" ");
+                            alias(name, &format!("{base} *"));
+                        }
+                    }
+                }
+                continue;
+            }
+            let words: Vec<&str> = first.split_whitespace().collect();
+            let [base @ .., name] = words.as_slice() else {
+                continue;
+            };
+            if base.is_empty() || !identifier(name) {
+                continue;
+            }
+            let underlying = base.join(" ");
+            alias(name, &underlying);
+            for other in parts.map(str::trim).filter(|other| identifier(other)) {
+                alias(other, &underlying);
+            }
+        } else if let Some((name, underlying)) = statement
+            .split_once('=')
+            .filter(|_| !statement.contains('*'))
+        {
+            let name = name.trim();
+            let underlying = underlying.split_whitespace().collect::<Vec<_>>().join(" ");
+            if identifier(name) && name != "namespace" && !underlying.is_empty() {
+                alias(name, &underlying);
+            }
+        }
+    }
+    aliases
+}
+
+/// `statement` without its `/* ... */` and `// ...` comments.
+fn strip_statement_comments(statement: &str) -> String {
+    let mut out = String::with_capacity(statement.len());
+    let mut rest = statement;
+    loop {
+        let block = rest.find("/*");
+        let line = rest.find("//");
+        match (block, line) {
+            (Some(b), l) if l.is_none_or(|l| b < l) => {
+                out.push_str(&rest[..b]);
+                out.push(' ');
+                rest = rest[b + 2..]
+                    .split_once("*/")
+                    .map(|(_, after)| after)
+                    .unwrap_or("");
+            }
+            (_, Some(l)) => {
+                out.push_str(&rest[..l]);
+                out.push(' ');
+                rest = rest[l..]
+                    .split_once('\n')
+                    .map(|(_, after)| after)
+                    .unwrap_or("");
+            }
+            _ => {
+                out.push_str(rest);
+                return out;
+            }
+        }
+    }
+}
+
+/// What ranking reads from one header: its typedefs and the headers it
+/// `#include`s, as spelled.
+#[derive(Debug)]
+pub(crate) struct RankingHeader {
+    typedefs: c_parser::CTypeDefs,
+    includes: Vec<String>,
+}
+
+/// A file's size and modification time: a cached parse of it is reused while
+/// both are unchanged.
+type FileStamp = (u64, Option<std::time::SystemTime>);
+
+/// Most headers [`ranking_header`] keeps parsed; the cache starts over past it.
+const RANKING_HEADER_CACHE_MAX: usize = 16_384;
+
+/// The parse of the header at `canonical` (a canonical path) that ranking
+/// uses, as C or C++. Discovery ranks every file of a tree and most of them
+/// include the same project headers, so a header is parsed the first time it
+/// is asked for and reused until its size or modification time changes.
+pub(crate) fn ranking_header(canonical: &Path, cpp: bool) -> Option<std::sync::Arc<RankingHeader>> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    type Cache = HashMap<(PathBuf, bool), (FileStamp, Arc<RankingHeader>)>;
+    static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let stamp = |path: &Path| -> Option<FileStamp> {
+        let meta = fs::metadata(path).ok()?;
+        Some((meta.len(), meta.modified().ok()))
+    };
+    let key = (canonical.to_path_buf(), cpp);
+    let before = stamp(canonical)?;
+    if let Some((cached, header)) = cache.lock().ok()?.get(&key) {
+        if *cached == before {
+            return Some(Arc::clone(header));
+        }
+    }
+    let text = crate::source_text::read_source_text(canonical).ok()?;
+    let mut typedefs = if cpp {
+        cpp_parser::parse_cpp_type_defs(&text).ok()
+    } else {
+        c_parser::parse_c_type_defs(&text).ok()
+    }
+    .map(|defs| defs.typedefs)
+    .unwrap_or_default();
+    // The parser drops a pointer typedef's pointee qualifiers; the text keeps
+    // them (`const octet_t *`), which says whether the pointee is read-only.
+    for pointer in simple_aliases(&text)
+        .into_iter()
+        .filter(|alias| alias.underlying.ends_with(" *"))
+    {
+        match typedefs.iter_mut().find(|known| known.name == pointer.name) {
+            Some(known) => known.underlying = pointer.underlying,
+            None => typedefs.push(pointer),
+        }
+    }
+    let header = Arc::new(RankingHeader {
+        typedefs: c_parser::CTypeDefs {
+            structs: Vec::new(),
+            enums: Vec::new(),
+            typedefs,
+        },
+        includes: include_spellings(&text),
+    });
+    // A header rewritten while it was read is parsed again next time.
+    if stamp(canonical) == Some(before) {
+        let mut cache = cache.lock().ok()?;
+        if cache.len() >= RANKING_HEADER_CACHE_MAX {
+            cache.clear();
+        }
+        cache.insert(key, (before, Arc::clone(&header)));
+    }
+    Some(header)
 }
 
 /// Known-unbuildable C++ signatures for discovery ranking. This uses the same
@@ -11865,7 +13071,7 @@ impl CppBuildContext {
                 .is_some_and(|standard| standard.contains("++"))
         });
         // SECURITY: the `-std=` was just REMOVED from `compile_flags`, so it no longer
-        // passes through `escape_makefile_recipe_flag`; it is spliced bare into the
+        // passes through `build_safety::recipe_token`; it is spliced bare into the
         // Makefile's `CXX_STD`. It came from the scanned tree's build system, so a value
         // that is not a bare dialect name is dropped entirely rather than re-emitted.
         if let Some(standard) =
@@ -12822,6 +14028,10 @@ mod tests {
             "aarch64-linux-gnu-gcc",
             "x86_64-linux-gnu-gcc-12",
             "arm-none-eabi-g++",
+            // Windows drivers carry `.exe`; the same normalisation picks the
+            // Makefile's flag family, so the two checks cannot disagree.
+            "clang.exe",
+            "x86_64-w64-mingw32-g++.exe",
         ] {
             assert!(
                 super::is_toolchain_leaf_name(ok),
@@ -12886,12 +14096,10 @@ mod tests {
         );
         // (5) an out-of-tree toolchain the OPERATOR installed stays honored, which
         // is ordinary for the cross builds bhf exists to handle.
+        let toolchain_compiler = absolute("/opt/toolchain/bin/g++-12");
         assert_eq!(
-            super::compile_command_compiler(&[
-                "/opt/toolchain/bin/g++-12".to_owned(),
-                "-c".to_owned()
-            ]),
-            Some("/opt/toolchain/bin/g++-12".to_owned())
+            super::compile_command_compiler(&[toolchain_compiler.clone(), "-c".to_owned()]),
+            Some(toolchain_compiler)
         );
     }
 
@@ -12920,6 +14128,15 @@ mod tests {
         CppBuildContext, DecoderLimitArgs, GenerateHarnessArgs, HeaderPreflight,
         BLOCKED_BY_NON_SELF_CONTAINED_HEADER,
     };
+    use super::{compile_database_flags_in, BUILD_CONTEXT_LDFLAG_PREFIX};
+    use super::{
+        finding_format_note, recorded_harness_format_version, stale_harness_format_note,
+        write_generation_metadata,
+    };
+    use super::{
+        split_compile_command, write_c_per_tu_context, write_cpp_per_tu_context,
+        PerTuCompileContext,
+    };
     use ada_parser::ast::{Package, PackageId, StructuralAst as StructuralAstForMerge};
     use ada_parser::ast::{
         Span, Subprogram, SubprogramId, SubprogramKind, SubprogramOwner, Visibility,
@@ -12928,6 +14145,38 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// `path` as the inside of a JSON string: a Windows path's `\` escaped.
+    fn json_text(path: &Path) -> String {
+        let quoted = serde_json::to_string(&path.to_string_lossy()).unwrap();
+        quoted[1..quoted.len() - 1].to_owned()
+    }
+
+    /// Whether `compiler` links an AddressSanitizer + UBSan program, as the
+    /// Makefile's GCC lane asks it to. MinGW's GCC on Windows cannot.
+    fn gcc_links_sanitizers(compiler: &str) -> bool {
+        let dir = temp_dir(&format!("sanitizer-probe-{compiler}"));
+        let source = dir.join("probe.c");
+        fs::write(&source, "int main(void) { return 0; }\n").unwrap();
+        let linked = std::process::Command::new(compiler)
+            .args(["-x", "c", "-fsanitize=address,undefined"])
+            .arg(&source)
+            .arg("-o")
+            .arg(dir.join("probe"))
+            .output()
+            .is_ok_and(|output| output.status.success());
+        let _ = fs::remove_dir_all(&dir);
+        linked
+    }
+
+    /// An absolute path: `path` (spelled from `/`) carries a drive on Windows.
+    fn absolute(path: &str) -> String {
+        if cfg!(windows) {
+            format!("C:{path}")
+        } else {
+            path.to_owned()
+        }
+    }
 
     #[test]
     fn compile_database_candidates_includes_well_known_build_dirs() {
@@ -13455,19 +14704,26 @@ mod tests {
 
     #[test]
     fn compile_database_preserves_compiler_abi_and_extension_context() {
+        // The forced include must exist for its relative operand to be
+        // absolutized against the entry directory.
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir_all(project.join("build")).unwrap();
+        fs::create_dir_all(project.join("include")).unwrap();
+        fs::write(project.join("include").join("config.h"), "#pragma once\n").unwrap();
         let entry = CompileCommandEntry {
-            directory: PathBuf::from("/project/build"),
+            directory: project.join("build"),
             file: PathBuf::from("../src/legacy.cpp"),
             arguments: Some(
                 [
-                    "/opt/toolchain/bin/g++-12",
+                    absolute("/opt/toolchain/bin/g++-12").as_str(),
                     "-fms-extensions",
                     "-fpermissive",
                     "-fpack-struct=1",
                     "-fshort-enums",
                     "-mms-bitfields",
                     "--sysroot",
-                    "/opt/sysroot",
+                    absolute("/opt/sysroot").as_str(),
                     "--target=x86_64-linux-gnu",
                     "-include",
                     "../include/config.h",
@@ -13484,19 +14740,25 @@ mod tests {
             ),
             command: None,
         };
-        let flags = extract_compile_database_flags(&entry, Path::new("/project/src/legacy.cpp"));
+        let flags = extract_compile_database_flags(&entry, &project.join("src/legacy.cpp"));
+        let forced = harness_gen::build_safety::make_path(&project.join("include/config.h"));
+        let compiler_marker = format!(
+            "@bhf-build-context-compiler={}",
+            absolute("/opt/toolchain/bin/g++-12")
+        );
+        let sysroot = absolute("/opt/sysroot");
         for expected in [
-            "@bhf-build-context-compiler=/opt/toolchain/bin/g++-12",
+            compiler_marker.as_str(),
             "-fms-extensions",
             "-fpermissive",
             "-fpack-struct=1",
             "-fshort-enums",
             "-mms-bitfields",
             "--sysroot",
-            "/opt/sysroot",
+            sysroot.as_str(),
             "--target=x86_64-linux-gnu",
             "-include",
-            "/project/include/config.h",
+            forced.as_str(),
         ] {
             assert!(
                 flags.iter().any(|flag| flag == expected),
@@ -13509,6 +14771,296 @@ mod tests {
                 || flag == "-MJ"
                 || flag.ends_with("deps.json")
         }));
+    }
+
+    /// A database row written by an MSVC build (`cl.exe`, or `clang-cl`) uses
+    /// cl's option spellings. Each option that carries build semantics becomes
+    /// its clang equivalent; the rest are dropped and named in the dropped
+    /// families. The harness itself is still built by bhf's own compiler, so
+    /// the row's `cl.exe` is not adopted as the build-context compiler.
+    #[test]
+    fn only_the_project_import_database_adds_link_libraries() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("widget.c");
+        fs::write(&source, "int widget(void) { return 0; }\n").unwrap();
+        let db = temp.path().join("compile_commands.json");
+        fs::write(
+            &db,
+            serde_json::to_vec(&serde_json::json!([{
+                "directory": temp.path(),
+                "file": source,
+                "arguments": ["clang", "-DWIDGET=1", "-c", source],
+                "bhf_link_libraries": ["ws2_32.lib", "bad name.lib", "$(x).lib"]
+            }]))
+            .unwrap(),
+        )
+        .unwrap();
+        let from_import = compile_database_flags_in(&db, &source, true)
+            .unwrap()
+            .expect("row");
+        assert!(from_import.iter().any(|flag| flag == "-DWIDGET=1"));
+        let links: Vec<&String> = from_import
+            .iter()
+            .filter(|flag| flag.starts_with(BUILD_CONTEXT_LDFLAG_PREFIX))
+            .collect();
+        assert_eq!(
+            links,
+            vec![&format!("{BUILD_CONTEXT_LDFLAG_PREFIX}-lws2_32")],
+            "only plain library names are linked, by -l name"
+        );
+        let from_tree = compile_database_flags_in(&db, &source, false)
+            .unwrap()
+            .expect("row");
+        assert!(
+            !from_tree
+                .iter()
+                .any(|flag| flag.starts_with(BUILD_CONTEXT_LDFLAG_PREFIX)),
+            "a tree's own database cannot add link inputs: {from_tree:?}"
+        );
+    }
+
+    #[test]
+    fn cl_style_compile_database_rows_translate_to_clang_flags() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let core = project.join("src").join("core");
+        fs::create_dir_all(&core).unwrap();
+        fs::create_dir_all(project.join("include").join("gen")).unwrap();
+        fs::write(project.join("include").join("config.h"), "#pragma once\n").unwrap();
+        let include = harness_gen::build_safety::make_path(&project.join("include"));
+        let generated = harness_gen::build_safety::make_path(&project.join("include/gen"));
+        let forced = harness_gen::build_safety::make_path(&project.join("include/config.h"));
+        // Backslash separators on every host: the row was written on Windows.
+        let backslashed = |path: &str| path.replace('/', "\\");
+        for compiler in [
+            "cl.exe",
+            "C:\\Program Files\\VS\\VC\\Tools\\MSVC\\14.44\\bin\\HostX64\\x64\\CL.EXE",
+            "clang-cl.exe",
+        ] {
+            let arguments = [
+                compiler.to_owned(),
+                "/nologo".to_owned(),
+                "/I".to_owned(),
+                backslashed(&include),
+                format!("/I{}", backslashed(&generated)),
+                "/DWIDGET_MODE=1".to_owned(),
+                "/D".to_owned(),
+                "WIDGET_HAVE_TABLES=1".to_owned(),
+                "-DWIDGET_LEVEL#3".to_owned(),
+                "/UNDEBUG".to_owned(),
+                format!("/FI{}", backslashed(&forced)),
+                "/std:c11".to_owned(),
+                "/J".to_owned(),
+                "/Zp4".to_owned(),
+                "/Zc:wchar_t-".to_owned(),
+                "/utf-8".to_owned(),
+                "/permissive-".to_owned(),
+                "/EHsc".to_owned(),
+                "/MDd".to_owned(),
+                "/D_DEBUG".to_owned(),
+                "/W4".to_owned(),
+                "/WX".to_owned(),
+                "/Zi".to_owned(),
+                "/O2".to_owned(),
+                "/Fo\"x64\\Debug\\\\\"".to_owned(),
+                "/Fdx64\\Debug\\vc143.pdb".to_owned(),
+                "/Yupch.h".to_owned(),
+                "/TC".to_owned(),
+                "/c".to_owned(),
+                "widget.c".to_owned(),
+            ];
+            let entry = CompileCommandEntry {
+                directory: core.clone(),
+                file: PathBuf::from("widget.c"),
+                arguments: Some(arguments.to_vec()),
+                command: None,
+            };
+            let flags = extract_compile_database_flags(&entry, &core.join("widget.c"));
+            let pairs: Vec<(&str, &str)> = flags
+                .windows(2)
+                .map(|pair| (pair[0].as_str(), pair[1].as_str()))
+                .collect();
+            for (flag, value) in [
+                ("-I", include.as_str()),
+                ("-I", generated.as_str()),
+                ("-include", forced.as_str()),
+            ] {
+                assert!(
+                    pairs.contains(&(flag, value)),
+                    "{compiler}: missing {flag} {value}: {flags:?}"
+                );
+            }
+            for expected in [
+                "-DWIDGET_MODE=1",
+                "-DWIDGET_HAVE_TABLES=1",
+                "-DWIDGET_LEVEL=3",
+                "-UNDEBUG",
+                "-std=c11",
+                "-funsigned-char",
+                "-fpack-struct=4",
+                "-fno-wchar",
+            ] {
+                assert!(
+                    flags.iter().any(|flag| flag == expected),
+                    "{compiler}: missing {expected}: {flags:?}"
+                );
+            }
+            assert!(
+                !flags
+                    .iter()
+                    .any(|flag| flag.starts_with(super::BUILD_CONTEXT_COMPILER_PREFIX)),
+                "{compiler}: the harness is not built with the row's cl-style driver: {flags:?}"
+            );
+            for absent in ["_DEBUG", "pch.h", "vc143.pdb", "x64"] {
+                assert!(
+                    !flags.iter().any(|flag| flag.contains(absent)),
+                    "{compiler}: {absent} must not reach the harness: {flags:?}"
+                );
+            }
+            for absent in [
+                "/W4", "/WX", "/MDd", "/c", "-c", "/O2", "/EHsc", "/utf-8", "-x", "/TC",
+            ] {
+                assert!(
+                    !flags.iter().any(|flag| flag == absent),
+                    "{compiler}: {absent} must not reach the harness: {flags:?}"
+                );
+            }
+            let dropped = flags
+                .iter()
+                .find_map(|flag| flag.strip_prefix(super::BUILD_CONTEXT_DROPPED_PREFIX))
+                .unwrap_or_default();
+            for family in [
+                "msvc_dialect_translated",
+                "output_control",
+                "module_or_pch",
+                "msvc_runtime_library",
+                "msvc_codegen",
+                "warning_policy",
+            ] {
+                assert!(
+                    dropped.split(',').any(|item| item == family),
+                    "{compiler}: dropped families {dropped:?} lack {family}"
+                );
+            }
+        }
+    }
+
+    /// A cl-style `command` string is split by the Windows command-line rules,
+    /// where a backslash is a path separator, not an escape.
+    #[test]
+    fn cl_style_command_strings_keep_backslash_separators() {
+        assert_eq!(
+            super::split_windows_command_line(
+                r#""C:\VS\bin\cl.exe" /nologo /IC:\proj\include /D "LABEL=a b" /D Q=\"x\" "/FoC:\out dir\\" /c widget.c"#
+            ),
+            vec![
+                r"C:\VS\bin\cl.exe",
+                "/nologo",
+                r"/IC:\proj\include",
+                "/D",
+                "LABEL=a b",
+                "/D",
+                "Q=\"x\"",
+                r"/FoC:\out dir\",
+                "/c",
+                "widget.c",
+            ]
+        );
+        let entry = CompileCommandEntry {
+            directory: PathBuf::from("/proj/src"),
+            file: PathBuf::from("widget.c"),
+            arguments: None,
+            command: Some(
+                r#"cl.exe /nologo /IC:\proj\include /DWIDGET_MODE=2 /c widget.c"#.to_owned(),
+            ),
+        };
+        let flags = extract_compile_database_flags(&entry, Path::new("/proj/src/widget.c"));
+        assert!(
+            flags.iter().any(|flag| flag == "-DWIDGET_MODE=2"),
+            "{flags:?}"
+        );
+        assert!(
+            flags
+                .windows(2)
+                .any(|pair| pair[0] == "-I" && pair[1].ends_with("C:/proj/include")),
+            "{flags:?}"
+        );
+    }
+
+    /// The same normalisation names the compiler everywhere: a `.exe` suffix
+    /// and either path separator are not part of a launcher's name.
+    #[test]
+    fn compile_database_launcher_leaves_ignore_exe_and_separators() {
+        assert_eq!(
+            super::compile_command_compiler(&[
+                "C:\\tools\\ccache.exe".to_owned(),
+                "gcc".to_owned(),
+                "-c".to_owned()
+            ]),
+            Some("gcc".to_owned())
+        );
+        assert_eq!(
+            super::compile_command_compiler(&["sccache.EXE".to_owned(), "clang".to_owned()]),
+            Some("clang".to_owned())
+        );
+    }
+
+    #[test]
+    fn compile_database_force_include_is_absolutized_only_when_the_file_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let build = temp.path().join("project").join("build");
+        let include = temp.path().join("project").join("include");
+        fs::create_dir_all(&build).unwrap();
+        fs::create_dir_all(&include).unwrap();
+        fs::write(include.join("prelude.h"), "#pragma once\n").unwrap();
+        let entry = CompileCommandEntry {
+            directory: build.clone(),
+            file: PathBuf::from("../src/widget.cpp"),
+            arguments: Some(
+                [
+                    "clang++",
+                    "-include",
+                    "iostream",
+                    "-include",
+                    "../include/prelude.h",
+                    "-include",
+                    "sub/config.h",
+                    "-imacros",
+                    "settings.h",
+                    "-c",
+                    "../src/widget.cpp",
+                ]
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
+            ),
+            command: None,
+        };
+        let flags = extract_compile_database_flags(
+            &entry,
+            &temp.path().join("project").join("src").join("widget.cpp"),
+        );
+        let operand = |flag: &str, nth: usize| -> String {
+            flags
+                .iter()
+                .enumerate()
+                .filter(|(_, value)| value.as_str() == flag)
+                .nth(nth)
+                .and_then(|(index, _)| flags.get(index + 1))
+                .cloned()
+                .unwrap_or_else(|| panic!("missing {flag} #{nth}: {flags:?}"))
+        };
+        // A system header name stays bare so the compiler's search path finds it.
+        assert_eq!(operand("-include", 0), "iostream");
+        // A header that exists relative to the entry directory becomes absolute.
+        assert_eq!(
+            operand("-include", 1),
+            harness_gen::build_safety::make_path(&include.join("prelude.h"))
+        );
+        // A relative name that is not under the entry directory also falls back
+        // to the include search path rather than a guessed absolute path.
+        assert_eq!(operand("-include", 2), "sub/config.h");
+        assert_eq!(operand("-imacros", 0), "settings.h");
     }
 
     #[test]
@@ -13756,7 +15308,7 @@ mod tests {
               {{"directory":"{root}","file":"src/emitter_test.cpp","arguments":["clang++","-c","src/emitter_test.cpp"]}},
               {{"directory":"{root}","file":"src/yaml_tool.cpp","arguments":["clang++","-c","src/yaml_tool.cpp"]}}
             ]"#,
-            root = root.display()
+            root = json_text(root)
         );
         std::fs::write(root.join("compile_commands.json"), db).unwrap();
         let from_db = recover_library_translation_units(&target, true);
@@ -13849,7 +15401,7 @@ mod tests {
               {{"directory":"{root}","file":"src/blocks.c","arguments":["clang","-c","src/blocks.c"]}},
               {{"directory":"{root}","file":"src/api_test/cplusplus.cpp","arguments":["clang++","-c","src/api_test/cplusplus.cpp"]}}
             ]"#,
-            root = root.display()
+            root = json_text(root)
         );
         std::fs::write(root.join("compile_commands.json"), db).unwrap();
 
@@ -14044,12 +15596,15 @@ ABSL_NAMESPACE_BEGIN
             None
         );
         assert!(!bare_library_resolves("nuttx_fs_no_such_lib_xyz"));
-        // A real system library is still forwarded.
-        assert!(bare_library_resolves("c"));
-        assert_eq!(
-            link_flag_from_build_token(base, "c"),
-            Some("-lc".to_owned())
-        );
+        // A real system library is still forwarded. The search covers the
+        // Unix library directories, which hold `libc`; Windows has neither.
+        if cfg!(unix) {
+            assert!(bare_library_resolves("c"));
+            assert_eq!(
+                link_flag_from_build_token(base, "c"),
+                Some("-lc".to_owned())
+            );
+        }
         // pthread keeps its canonical `-pthread` form regardless of resolution.
         assert_eq!(
             link_flag_from_build_token(base, "pthread"),
@@ -16981,7 +18536,9 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             .as_nanos();
         let dir = std::env::temp_dir().join(format!("bhf-cli-{name}-{nonce}"));
         fs::create_dir_all(&dir).unwrap();
-        dir
+        // Resolved, as generation resolves the paths it writes: Windows'
+        // temp dir is often spelled with an 8.3 short name (`RUNNER~1`).
+        crate::workdir::plain_canonical(&dir)
     }
 
     #[test]
@@ -17302,6 +18859,15 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         assert!(dictionary.contains("\"Mode_Fast\""));
         assert!(dictionary.contains("\"Mode_Safe\""));
         assert!(dictionary.contains("\"READY\""));
+        // Each token says where in the source it was found.
+        assert!(
+            dictionary.contains("# from parser.adb:5\n\"READY\"\n"),
+            "{dictionary}"
+        );
+        assert!(
+            dictionary.contains("# from parser.adb:2\n\"Mode_Fast\"\n"),
+            "{dictionary}"
+        );
     }
 
     #[test]
@@ -17356,8 +18922,14 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             .expect("generated GPR is readable");
         let main = fs::read_to_string(temp.join("generated_harnesses/H-ROOTS/main.adb"))
             .expect("generated main is readable");
-        assert!(gpr.contains(&format!("\"{}\"", core.display())));
-        assert!(gpr.contains(&format!("\"{}\"", dates.display())));
+        assert!(gpr.contains(&format!(
+            "\"{}\"",
+            harness_gen::build_safety::make_path(&core)
+        )));
+        assert!(gpr.contains(&format!(
+            "\"{}\"",
+            harness_gen::build_safety::make_path(&dates)
+        )));
         assert!(main.contains("with Ada.Calendar;"));
     }
 
@@ -17424,8 +18996,14 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         let main = fs::read_to_string(temp.join("generated_harnesses/H-GPR/main.adb"))
             .expect("generated main is readable");
         assert!(gpr.contains("app.gpr"));
-        assert!(!gpr.contains(&format!("\"{}\"", app_src.display())));
-        assert!(!gpr.contains(&format!("\"{}\"", common_src.display())));
+        assert!(!gpr.contains(&format!(
+            "\"{}\"",
+            harness_gen::build_safety::make_path(&app_src)
+        )));
+        assert!(!gpr.contains(&format!(
+            "\"{}\"",
+            harness_gen::build_safety::make_path(&common_src)
+        )));
         assert!(main.contains("function Decode_Data return Common.Byte_Seq is"));
     }
 
@@ -17491,8 +19069,14 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             fs::read_to_string(temp.join("generated_harnesses/H-GPR-IMPORT/H_GPR_IMPORT.gpr"))
                 .expect("generated GPR is readable");
         assert!(gpr.contains("app.gpr"));
-        assert!(!gpr.contains(&format!("\"{}\"", app_src.display())));
-        assert!(!gpr.contains(&format!("\"{}\"", common_src.display())));
+        assert!(!gpr.contains(&format!(
+            "\"{}\"",
+            harness_gen::build_safety::make_path(&app_src)
+        )));
+        assert!(!gpr.contains(&format!(
+            "\"{}\"",
+            harness_gen::build_safety::make_path(&common_src)
+        )));
     }
 
     #[test]
@@ -17558,8 +19142,14 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         let main = fs::read_to_string(temp.join("generated_harnesses/H-GPR-NOEXT/main.adb"))
             .expect("generated main is readable");
         assert!(gpr.contains("app.gpr"));
-        assert!(!gpr.contains(&format!("\"{}\"", app_src.display())));
-        assert!(!gpr.contains(&format!("\"{}\"", common_src.display())));
+        assert!(!gpr.contains(&format!(
+            "\"{}\"",
+            harness_gen::build_safety::make_path(&app_src)
+        )));
+        assert!(!gpr.contains(&format!(
+            "\"{}\"",
+            harness_gen::build_safety::make_path(&common_src)
+        )));
         assert!(main.contains("function Decode_Data return Common.Byte_Seq is"));
     }
 
@@ -17627,8 +19217,14 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         let main = fs::read_to_string(temp.join("generated_harnesses/H-GPR-SEARCH/main.adb"))
             .expect("generated main is readable");
         assert!(gpr.contains("app.gpr"));
-        assert!(!gpr.contains(&format!("\"{}\"", app_src.display())));
-        assert!(!gpr.contains(&format!("\"{}\"", common_src.display())));
+        assert!(!gpr.contains(&format!(
+            "\"{}\"",
+            harness_gen::build_safety::make_path(&app_src)
+        )));
+        assert!(!gpr.contains(&format!(
+            "\"{}\"",
+            harness_gen::build_safety::make_path(&common_src)
+        )));
         assert!(main.contains("function Decode_Data return Common.Byte_Seq is"));
     }
 
@@ -17682,7 +19278,10 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             fs::read_to_string(temp.join("generated_harnesses/H-GPR-MISSING/H_GPR_MISSING.gpr"))
                 .expect("generated GPR is readable");
         assert!(gpr.contains("app.gpr"));
-        assert!(!gpr.contains(&format!("\"{}\"", app_src.display())));
+        assert!(!gpr.contains(&format!(
+            "\"{}\"",
+            harness_gen::build_safety::make_path(&app_src)
+        )));
     }
 
     #[test]
@@ -17736,9 +19335,18 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
 
         let gpr = fs::read_to_string(temp.join("generated_harnesses/H-TREE/H_TREE.gpr"))
             .expect("generated GPR is readable");
-        assert!(gpr.contains(&format!("\"{}\"", core.display())));
-        assert!(gpr.contains(&format!("\"{}\"", base.display())));
-        assert!(gpr.contains(&format!("\"{}\"", dates.display())));
+        assert!(gpr.contains(&format!(
+            "\"{}\"",
+            harness_gen::build_safety::make_path(&core)
+        )));
+        assert!(gpr.contains(&format!(
+            "\"{}\"",
+            harness_gen::build_safety::make_path(&base)
+        )));
+        assert!(gpr.contains(&format!(
+            "\"{}\"",
+            harness_gen::build_safety::make_path(&dates)
+        )));
     }
 
     #[test]
@@ -17893,6 +19501,482 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         assert!(main.contains("Bhf_Result : constant Parent.Thing := Parent.Child.Get;"));
     }
 
+    /// A compile-database row for a source under a spaced directory compiles it
+    /// with its own flags; every path in the generated object rule must reach
+    /// the compiler as one argument.
+    #[test]
+    fn per_tu_context_quotes_paths_with_spaces() {
+        let dir = temp_dir("per-tu-spaces");
+        let contexts = vec![PerTuCompileContext {
+            source: PathBuf::from("/proj dir/src lib/a.c"),
+            compiler: Some("/opt/my tools/bin/clang".to_owned()),
+            flags: vec![
+                "-I/proj dir/include".to_owned(),
+                "-DMODE=1".to_owned(),
+                "-DNAME=\"widget\"".to_owned(),
+            ],
+        }];
+        write_c_per_tu_context(&dir, &contexts).expect("spaced paths are accepted");
+        let fragment = fs::read_to_string(dir.join("build_context_objects.mk")).unwrap();
+        let recipe = fragment
+            .lines()
+            .find(|line| line.starts_with('\t') && line.contains("-c ") && line.contains("main_0"))
+            .unwrap_or_else(|| panic!("MAIN object rule in:\n{fragment}"));
+        let words = split_compile_command(recipe.trim());
+        // The database compiler is only the Makefile's default `CC`; the rule
+        // itself names `$(CC)` so a toolchain override reaches this TU too.
+        assert_eq!(words[0], "$(CC)", "{recipe}");
+        assert!(
+            words.contains(&"-I/proj dir/include".to_owned()),
+            "{recipe}"
+        );
+        assert!(words.contains(&"-DNAME=\"widget\"".to_owned()), "{recipe}");
+        let c = words.iter().position(|w| w == "-c").unwrap();
+        assert_eq!(words[c + 1], "/proj dir/src lib/a.c", "{recipe}");
+
+        // A path no quoting can make safe is still refused.
+        let hostile = vec![PerTuCompileContext {
+            source: PathBuf::from("/proj/$(id)/a.c"),
+            compiler: None,
+            flags: Vec::new(),
+        }];
+        assert!(write_c_per_tu_context(&dir, &hostile).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A compile-database row's quoted define reaches the compiler as the one
+    /// argument it was, quotes included, when make runs the per-translation-unit
+    /// rule: a shell operator inside it never runs (written with
+    /// backslash-escaped quotes, the recipe shell ran the `touch` below), and a
+    /// legitimate define stays a string literal. C and C++ rows alike.
+    #[cfg(unix)]
+    #[test]
+    fn per_tu_context_passes_a_quoted_define_to_the_compiler_whole() {
+        use std::os::unix::fs::PermissionsExt;
+        if !have_tool("make") {
+            eprintln!("skip: make unavailable");
+            return;
+        }
+        let dir = temp_dir("per-tu-quoted-define");
+        let compiler = dir.join("record-args");
+        fs::write(
+            &compiler,
+            "#!/bin/sh\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\" >> \"$BHF_ARGV_LOG\"; done\n",
+        )
+        .unwrap();
+        fs::set_permissions(&compiler, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(dir.join("Makefile"), "include build_context_objects.mk\n").unwrap();
+        let marker = dir.join("injected");
+        let hostile = format!("-DMSG=\"a;touch {};\"", marker.display());
+        let piped = format!("-DMSG2=\"b | touch {}\"", marker.display());
+        let legit = "-DNAME=\"value with spaces\"".to_owned();
+        for (source, cpp) in [
+            ("/proj/lib/widget.c", false),
+            ("/proj/lib/widget.cpp", true),
+        ] {
+            let contexts = vec![PerTuCompileContext {
+                source: PathBuf::from(source),
+                compiler: None,
+                flags: vec![hostile.clone(), piped.clone(), legit.clone()],
+            }];
+            if cpp {
+                write_cpp_per_tu_context(&dir, &contexts).unwrap();
+            } else {
+                write_c_per_tu_context(&dir, &contexts).unwrap();
+            }
+            let log = dir.join(format!("argv-{cpp}.log"));
+            let build = std::process::Command::new("make")
+                .arg("context_objs/main_0.o")
+                .arg(format!("CC={}", compiler.display()))
+                .arg(format!("CXX={}", compiler.display()))
+                .env("BHF_ARGV_LOG", &log)
+                .current_dir(&dir)
+                .output()
+                .expect("run make");
+            assert!(
+                !marker.exists(),
+                "a command inside a quoted define ran ({source}): {build:?}"
+            );
+            assert!(build.status.success(), "{source}: {build:?}");
+            let argv: Vec<String> = fs::read_to_string(&log)
+                .unwrap()
+                .lines()
+                .map(str::to_owned)
+                .collect();
+            for flag in [&hostile, &piped, &legit] {
+                assert!(
+                    argv.contains(flag),
+                    "{source}: {flag:?} not passed whole: {argv:#?}"
+                );
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The compiler a compile-database row names is never written into its
+    /// object rule: the rule uses `$(CC)`/`$(CXX)`, so an operator toolchain, a
+    /// gcc retry or a cross build compiles every translation unit with the same
+    /// compiler as `main` instead of mixing in the database's (a cross gcc's
+    /// objects then fail the link "in wrong format").
+    #[test]
+    fn per_tu_context_rules_use_the_make_compiler_not_the_database_compiler() {
+        let dir = temp_dir("per-tu-make-compiler");
+        let cross = vec![PerTuCompileContext {
+            source: PathBuf::from("/proj/lib/parse.c"),
+            compiler: Some("/usr/bin/aarch64-linux-gnu-gcc".to_owned()),
+            flags: vec!["-DFROM_DB=1".to_owned()],
+        }];
+        write_c_per_tu_context(&dir, &cross).unwrap();
+        let fragment = fs::read_to_string(dir.join("build_context_objects.mk")).unwrap();
+        assert!(!fragment.contains("aarch64-linux-gnu-gcc"), "{fragment}");
+        let rule = |variant: &str, fragment: &str| -> Vec<String> {
+            let line = fragment
+                .lines()
+                .find(|line| line.starts_with('\t') && line.contains(&format!("/{variant}_0.o")))
+                .unwrap_or_else(|| panic!("{variant} rule in:\n{fragment}"))
+                .to_owned();
+            split_compile_command(line.trim())
+        };
+        let main = rule("main", &fragment);
+        assert_eq!(main[0], "$(CC)");
+        assert!(main.contains(&"$(C_COMPAT_FLAGS)".to_owned()), "{main:?}");
+        assert!(
+            main.contains(&"$(BHF_TOOLCHAIN_CFLAGS)".to_owned())
+                && main.contains(&"$(BHF_TOOLCHAIN_TARGET_FLAGS)".to_owned())
+                && main.contains(&"$(BHF_TOOLCHAIN_CPPFLAGS)".to_owned()),
+            "{main:?}"
+        );
+        assert_eq!(rule("prov", &fragment)[0], "$(CC)");
+        let cov = rule("cov", &fragment);
+        assert_eq!(cov[0], "$(COV_CC)");
+        assert!(cov.contains(&"$(BHF_TOOLCHAIN_CPPFLAGS)".to_owned()));
+        assert!(!cov.contains(&"$(BHF_TOOLCHAIN_TARGET_FLAGS)".to_owned()));
+
+        // A C++ harness compiles a C row with the paired C driver (C semantics,
+        // the C++ `-std=` filtered out) and a C++ row with $(CXX); each takes the
+        // C++ compatibility flags of its lane.
+        let mixed = vec![
+            PerTuCompileContext {
+                source: PathBuf::from("/proj/lib/legacy.c"),
+                compiler: Some("/usr/bin/gcc".to_owned()),
+                flags: vec!["-std=c99".to_owned()],
+            },
+            PerTuCompileContext {
+                source: PathBuf::from("/proj/lib/widget.cpp"),
+                compiler: Some("/usr/bin/g++".to_owned()),
+                flags: Vec::new(),
+            },
+        ];
+        write_cpp_per_tu_context(&dir, &mixed).unwrap();
+        let fragment = fs::read_to_string(dir.join("build_context_objects.mk")).unwrap();
+        let line = |object: &str| -> Vec<String> {
+            let line = fragment
+                .lines()
+                .find(|line| line.starts_with('\t') && line.contains(object))
+                .unwrap_or_else(|| panic!("{object} rule in:\n{fragment}"))
+                .to_owned();
+            split_compile_command(line.trim())
+        };
+        let c_unit = line("context_objs/main_0.o");
+        assert_eq!(c_unit[0], "$(CC)", "{c_unit:?}");
+        assert!(
+            c_unit.contains(&"$(BHF_CONTEXT_C_FLAGS)".to_owned()),
+            "{c_unit:?}"
+        );
+        assert!(c_unit.contains(&"$(BHF_TOOLCHAIN_CFLAGS)".to_owned()));
+        let cpp_unit = line("context_objs/main_1.o");
+        assert_eq!(cpp_unit[0], "$(CXX)", "{cpp_unit:?}");
+        assert!(cpp_unit.contains(&"$(CXXFLAGS)".to_owned()));
+        assert!(cpp_unit.contains(&"$(CXX_COMPAT_FLAGS)".to_owned()));
+        assert!(cpp_unit.contains(&"$(BHF_TOOLCHAIN_CXXFLAGS)".to_owned()));
+        let cov_unit = line("context_objs/cov_1.o");
+        assert_eq!(cov_unit[0], "$(COV_CXX)");
+        assert!(cov_unit.contains(&"$(CXX_COMPAT_FLAGS_CLANG)".to_owned()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The extra sources and include dirs a C or C++ harness was generated
+    /// with are recorded (absolute), so `bhf build` can look in them for the
+    /// definitions of a failed link's undefined symbols.
+    #[test]
+    fn generation_metadata_records_the_extra_build_inputs() {
+        let root = temp_dir("build-inputs");
+        let lib = root.join("lib");
+        fs::create_dir_all(lib.join("include")).unwrap();
+        fs::write(
+            lib.join("table.c"),
+            "int table_store(int v) { return v; }\n",
+        )
+        .unwrap();
+        for (file, id) in [("record.c", "H-INPUTS-C"), ("record.cpp", "H-INPUTS-CPP")] {
+            let source = root.join(file);
+            fs::write(
+                &source,
+                "int table_store(int v);\nint parse_record(unsigned int flags) { return table_store((int)flags); }\n",
+            )
+            .unwrap();
+            run(GenerateHarnessArgs {
+                source: source.clone(),
+                target: Some("parse_record".to_owned()),
+                target_line: None,
+                output: root.join("out"),
+                id: Some(id.to_owned()),
+                kind: "direct".to_owned(),
+                source_roots: Vec::new(),
+                project: None,
+                source_trees: Vec::new(),
+                extra_sources: vec![lib.join("table.c")],
+                extra_includes: vec![lib.join("include")],
+                cleanup: None,
+                template_instantiate: Vec::new(),
+                tree_type_defs: None,
+                decoder_limits: Default::default(),
+                force: false,
+                archive_backed: false,
+                environment: None,
+            })
+            .unwrap();
+            let metadata: serde_json::Value = serde_json::from_str(
+                &fs::read_to_string(root.join("out").join(id).join("generation-metadata.json"))
+                    .unwrap(),
+            )
+            .unwrap();
+            // Resolved, without Windows' `\\?\` prefix.
+            let resolved =
+                |path: &Path| crate::workdir::plain_canonical(path).display().to_string();
+            assert_eq!(
+                metadata["extra_sources"],
+                serde_json::json!([resolved(&lib.join("table.c"))]),
+                "{id}: {metadata}"
+            );
+            assert_eq!(
+                metadata["extra_includes"],
+                serde_json::json!([resolved(&lib.join("include"))]),
+                "{id}: {metadata}"
+            );
+            assert!(metadata.get("source_roots").is_none(), "{id}: {metadata}");
+        }
+    }
+
+    /// The decode of fuzz input into arguments is versioned, so a corpus or a
+    /// finding recorded against an older harness can be told apart.
+    #[test]
+    fn generation_metadata_records_the_harness_input_format_version() {
+        let root = temp_dir("format-version");
+        for (file, body, id) in [
+            (
+                "record.c",
+                "int parse_record(unsigned int flags) { return (int)flags; }\n",
+                "H-FMT-C",
+            ),
+            (
+                "record.cpp",
+                "int parse_record(unsigned int flags) { return (int)flags; }\n",
+                "H-FMT-CPP",
+            ),
+        ] {
+            let source = root.join(file);
+            fs::write(&source, body).unwrap();
+            run(GenerateHarnessArgs {
+                source: source.clone(),
+                target: Some("parse_record".to_owned()),
+                target_line: None,
+                output: root.join("out"),
+                id: Some(id.to_owned()),
+                kind: "direct".to_owned(),
+                source_roots: Vec::new(),
+                project: None,
+                source_trees: Vec::new(),
+                extra_sources: Vec::new(),
+                extra_includes: Vec::new(),
+                cleanup: None,
+                template_instantiate: Vec::new(),
+                tree_type_defs: None,
+                decoder_limits: Default::default(),
+                force: false,
+                archive_backed: false,
+                environment: None,
+            })
+            .unwrap();
+            let metadata: serde_json::Value = serde_json::from_str(
+                &fs::read_to_string(root.join("out").join(id).join("generation-metadata.json"))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                metadata["harness_format_version"],
+                serde_json::json!(harness_gen::HARNESS_FORMAT_VERSION),
+                "{id}: {metadata}"
+            );
+            // Additive: the existing fields keep their schema version.
+            assert_eq!(metadata["schema_version"], serde_json::json!(1), "{id}");
+        }
+    }
+
+    /// A harness directory regenerated by a bhf with a newer input format is
+    /// reported, so corpora and findings recorded against the old harness are
+    /// re-run rather than silently decoded differently.
+    #[test]
+    fn a_harness_of_an_older_input_format_is_recognised() {
+        let dir = temp_dir("format-stale");
+        assert_eq!(recorded_harness_format_version(&dir), None);
+        assert_eq!(
+            finding_format_note(&serde_json::json!({}), &dir),
+            None,
+            "a harness that records no format has nothing to compare"
+        );
+        assert!(stale_harness_format_note(&dir).is_none());
+
+        // Metadata written before the version field existed is format 1.
+        fs::write(
+            dir.join("generation-metadata.json"),
+            r#"{"schema_version":1,"language":"c","emitted_path":"direct"}"#,
+        )
+        .unwrap();
+        assert_eq!(recorded_harness_format_version(&dir), Some(1));
+        let note = stale_harness_format_note(&dir).expect("an older format is reported");
+        assert!(
+            note.contains("input format 1")
+                && note.contains(&format!("format {}", harness_gen::HARNESS_FORMAT_VERSION))
+                && note.contains("corpus"),
+            "{note}"
+        );
+
+        // Regenerating records the current format, which is not stale.
+        write_generation_metadata(&dir, "c", None, 1, "direct", "direct").unwrap();
+        assert_eq!(
+            recorded_harness_format_version(&dir),
+            Some(harness_gen::HARNESS_FORMAT_VERSION)
+        );
+        assert!(stale_harness_format_note(&dir).is_none());
+
+        // A finding recorded against this format replays quietly; one recorded
+        // against another, or before findings recorded one, is flagged.
+        let current = harness_gen::HARNESS_FORMAT_VERSION;
+        let same = serde_json::json!({ "harness_format_version": current });
+        assert_eq!(finding_format_note(&same, &dir), None);
+        let older = serde_json::json!({ "harness_format_version": current - 1 });
+        let note = finding_format_note(&older, &dir).expect("an older finding is flagged");
+        assert!(
+            note.contains(&format!("input format {}", current - 1))
+                && note.contains(&format!("decodes format {current}")),
+            "{note}"
+        );
+        let unversioned = finding_format_note(&serde_json::json!({}), &dir)
+            .expect("a finding with no recorded format predates format 3");
+        assert!(
+            unversioned.contains("input format 2 or earlier"),
+            "{unversioned}"
+        );
+        // `harness.format_version` is read first; the top-level key only when
+        // the finding has no `harness` record.
+        let nested = serde_json::json!({
+            "harness": {"format_version": current, "buffer_len_dimension": false},
+            "harness_format_version": current - 1,
+        });
+        assert_eq!(finding_format_note(&nested, &dir), None);
+        let nested_older = serde_json::json!({
+            "harness": {"format_version": current - 1, "buffer_len_dimension": false},
+        });
+        assert!(finding_format_note(&nested_older, &dir)
+            .expect("a nested older format is flagged")
+            .contains(&format!("input format {}", current - 1)));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The opt-in buffer-length dimension is recorded with the harness when
+    /// its layout says it sized a buffer, and left out otherwise, even when
+    /// it was on.
+    #[test]
+    fn generation_metadata_records_the_buffer_length_dimension() {
+        let dir = std::env::temp_dir().join(format!(
+            "bhf-gen-dimension-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let layout = |applied: bool| {
+            harness_gen::arg_layout::ArgLayout::new("c", "direct", Vec::new())
+                .with_buffer_len_dimension(applied)
+                .write(&dir)
+                .unwrap();
+        };
+        layout(false);
+        write_generation_metadata(&dir, "c", None, 1, "direct", "direct").unwrap();
+        let read = || -> serde_json::Value {
+            serde_json::from_slice(&fs::read(dir.join("generation-metadata.json")).unwrap())
+                .unwrap()
+        };
+        assert!(read().get("buffer_len_dimension").is_none());
+        {
+            // On, but no buffer it applies to.
+            let _on = harness_gen::scoped_buffer_len_dimension(true);
+            write_generation_metadata(&dir, "c", None, 1, "direct", "direct").unwrap();
+        }
+        assert!(read().get("buffer_len_dimension").is_none());
+        layout(true);
+        write_generation_metadata(&dir, "c", None, 1, "direct", "direct").unwrap();
+        assert_eq!(read()["buffer_len_dimension"], true);
+
+        // The dimension is part of the format a finding is compared with.
+        let current = harness_gen::HARNESS_FORMAT_VERSION;
+        let without = serde_json::json!({ "harness_format_version": current });
+        let note = finding_format_note(&without, &dir)
+            .expect("a finding from a harness without the dimension is flagged");
+        assert!(
+            note.contains(&format!(
+                "input format {current} without the explicit buffer-length dimension"
+            )) && note.contains("was generated with it"),
+            "{note}"
+        );
+        let with = serde_json::json!({
+            "harness_format_version": current,
+            "buffer_len_dimension": true,
+        });
+        assert_eq!(finding_format_note(&with, &dir), None);
+        layout(false);
+        write_generation_metadata(&dir, "c", None, 1, "direct", "direct").unwrap();
+        assert!(finding_format_note(&with, &dir)
+            .expect("and the reverse")
+            .contains("was generated without it"));
+        assert_eq!(finding_format_note(&without, &dir), None);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Ada harnesses decode as they did before format 3: they record their
+    /// own format, are not reported stale, and their unversioned findings are
+    /// not flagged.
+    #[test]
+    fn ada_harnesses_keep_their_own_input_format() {
+        let dir = temp_dir("format-ada");
+        // An Ada harness generated before format 3 recorded format 2.
+        fs::write(
+            dir.join("generation-metadata.json"),
+            r#"{"schema_version":1,"harness_format_version":2,"language":"ada"}"#,
+        )
+        .unwrap();
+        assert!(stale_harness_format_note(&dir).is_none());
+        assert_eq!(finding_format_note(&serde_json::json!({}), &dir), None);
+        {
+            let _on = harness_gen::scoped_buffer_len_dimension(true);
+            write_generation_metadata(&dir, "ada", None, 1, "direct", "direct").unwrap();
+        }
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join("generation-metadata.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            metadata["harness_format_version"],
+            harness_gen::ADA_HARNESS_FORMAT_VERSION
+        );
+        assert!(metadata.get("buffer_len_dimension").is_none());
+        assert_eq!(finding_format_note(&serde_json::json!({}), &dir), None);
+        assert!(
+            finding_format_note(&serde_json::json!({ "harness_format_version": 1 }), &dir)
+                .is_some()
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn generate_c_harness_uses_nearby_compile_commands_flags() {
         let root = temp_dir("compile-db-c");
@@ -17910,9 +19994,9 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             root.join("compile_commands.json"),
             format!(
                 r#"[{{"directory":"{}","file":"{}","arguments":["gcc","-I","../include","-DLEGACY_MODE=1","-std=gnu11","-c","{}"]}}]"#,
-                src.display(),
-                source.display(),
-                source.display()
+                json_text(&src),
+                json_text(&source),
+                json_text(&source)
             ),
         )
         .unwrap();
@@ -17943,14 +20027,13 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         assert!(makefile.contains("CC = gcc"));
         assert!(makefile.contains("-fsanitize-coverage=trace-pc,trace-cmp"));
         assert!(makefile.contains("COMPILE_DB_FLAGS ="));
-        assert!(makefile.contains(&format!("-I {}", include.display())));
+        assert!(makefile.contains(&format!(
+            "-I {}",
+            harness_gen::build_safety::make_path(&include)
+        )));
         assert!(makefile.contains("-DLEGACY_MODE=1"));
         assert!(makefile.contains("-std=gnu11"));
-        if std::process::Command::new("gcc")
-            .arg("--version")
-            .output()
-            .is_ok_and(|output| output.status.success())
-        {
+        if gcc_links_sanitizers("gcc") && have_tool("make") {
             let status = std::process::Command::new("make")
                 .arg("-C")
                 .arg(root.join("out/H-CDB-C"))
@@ -17959,6 +20042,626 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
                 .unwrap();
             assert!(status.success(), "native GCC C harness must link");
         }
+    }
+
+    /// Whether `program` runs (`--version`) on this host.
+    fn have_tool(program: &str) -> bool {
+        std::process::Command::new(program)
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
+    /// Generate a direct harness for `target` in `source` under `root/out`.
+    fn generate_for_make_test(source: &Path, target: &str, id: &str, root: &Path) -> PathBuf {
+        run(GenerateHarnessArgs {
+            source: source.to_path_buf(),
+            target: Some(target.to_owned()),
+            target_line: None,
+            output: root.join("out"),
+            id: Some(id.to_owned()),
+            kind: "direct".to_owned(),
+            source_roots: Vec::new(),
+            project: None,
+            source_trees: Vec::new(),
+            extra_sources: Vec::new(),
+            extra_includes: Vec::new(),
+            cleanup: None,
+            template_instantiate: Vec::new(),
+            tree_type_defs: None,
+            decoder_limits: Default::default(),
+            force: false,
+            archive_backed: false,
+            environment: None,
+        })
+        .unwrap();
+        root.join("out").join(id)
+    }
+
+    /// Run `make main` in `dir` with exactly `vars` as compiler settings (the
+    /// ambient CC/CXX/CFLAGS/CXXFLAGS and bhf's family hints are cleared).
+    fn make_main(dir: &Path, vars: &[(&str, &str)]) -> std::process::Output {
+        let mut command = std::process::Command::new("make");
+        command.arg("-C").arg(dir).arg("main");
+        for key in [
+            "CC",
+            "CXX",
+            "CFLAGS",
+            "CXXFLAGS",
+            "BHF_CC_FAMILY",
+            "BHF_CXX_FAMILY",
+        ] {
+            command.env_remove(key);
+        }
+        for (key, value) in vars {
+            command.env(key, value);
+        }
+        command.output().unwrap()
+    }
+
+    fn output_text(output: &std::process::Output) -> String {
+        format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    }
+
+    #[test]
+    fn generated_cpp_makefile_builds_with_an_ambient_gxx() {
+        if !gcc_links_sanitizers("g++") || !have_tool("make") {
+            eprintln!("skip: a sanitizing g++ or make unavailable");
+            return;
+        }
+        let root = temp_dir("make-gxx-family");
+        let source = root.join("widget.cpp");
+        fs::write(
+            &source,
+            "#include <cstddef>\nint parse_record(const unsigned char *data, std::size_t size) \
+             { return size > 2 && data[0] == 'W' ? data[1] : 0; }\n",
+        )
+        .unwrap();
+        let dir = generate_for_make_test(&source, "parse_record", "H-GXX", &root);
+        // The generated Makefile names clang++; an operator's CXX=g++ must still
+        // get flags g++ accepts, chosen from the compiler that actually runs.
+        let output = make_main(&dir, &[("CXX", "g++"), ("CC", "gcc")]);
+        assert!(
+            output.status.success(),
+            "g++ must build the harness:\n{}",
+            output_text(&output)
+        );
+        let text = output_text(&output);
+        assert!(
+            text.contains("trace-pc,trace-cmp") && !text.contains("trace-pc-guard"),
+            "g++ gets GCC-spelled coverage:\n{text}"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// `make -n main` in `dir` with exactly `vars` as compiler settings: the
+    /// recipes make would run, one per line.
+    fn make_dry_run(dir: &Path, vars: &[(&str, &str)]) -> String {
+        make_dry_run_goal(dir, "main", vars)
+    }
+
+    /// [`make_dry_run`] for the make goal `goal`.
+    fn make_dry_run_goal(dir: &Path, goal: &str, vars: &[(&str, &str)]) -> String {
+        let mut command = std::process::Command::new("make");
+        command.arg("-C").arg(dir).args(["-n", goal]);
+        for key in [
+            "CC",
+            "CXX",
+            "CFLAGS",
+            "CXXFLAGS",
+            "BHF_CC_FAMILY",
+            "BHF_CXX_FAMILY",
+            "BHF_TOOLCHAIN_CFLAGS",
+            "BHF_TOOLCHAIN_CXXFLAGS",
+            "BHF_TOOLCHAIN_CPPFLAGS",
+            "BHF_TOOLCHAIN_C_CPPFLAGS",
+            "BHF_TOOLCHAIN_CXX_CPPFLAGS",
+            "BHF_TOOLCHAIN_DRIVER_CXXFLAGS",
+            "BHF_TOOLCHAIN_DRIVER_CFLAGS",
+            "BHF_TOOLCHAIN_LDFLAGS",
+            "BHF_TOOLCHAIN_LIBS",
+            "BHF_TOOLCHAIN_TARGET_FLAGS",
+        ] {
+            command.env_remove(key);
+        }
+        for (key, value) in vars {
+            command.env(key, value);
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{}", output_text(&output));
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// The recipe line of `dry_run` that writes `object`.
+    fn recipe_for<'a>(dry_run: &'a str, object: &str) -> &'a str {
+        dry_run
+            .lines()
+            .find(|line| line.contains(&format!("-o {object}")))
+            .unwrap_or_else(|| panic!("no recipe for {object} in:\n{dry_run}"))
+    }
+
+    /// The toolchain's preprocessor words and library operands reach every
+    /// lane of both Makefiles, not just `main`: a lane built with another
+    /// compiler (coverage, AFL++, libFuzzer, MSan, TSan, differential) that
+    /// misses `-lvendor` or `-DBOARD` fails to build, silently.
+    #[test]
+    fn toolchain_headers_and_libraries_reach_every_makefile_lane() {
+        if !have_tool("make") {
+            eprintln!("skip: make unavailable");
+            return;
+        }
+        let root = temp_dir("make-every-lane");
+        let c_source = root.join("widget.c");
+        fs::write(
+            &c_source,
+            "#include <stddef.h>\nint parse_record(const unsigned char *data, size_t size) \
+             { return size > 2 && data[0] == 'W' ? data[1] : 0; }\n",
+        )
+        .unwrap();
+        let c_dir = generate_for_make_test(&c_source, "parse_record", "H-LANES-C", &root);
+        let vars = [
+            ("BHF_TOOLCHAIN_C_CPPFLAGS", "-DBOARD_REV=7"),
+            ("BHF_TOOLCHAIN_CXX_CPPFLAGS", "-include iostream"),
+            ("BHF_TOOLCHAIN_LIBS", "-L/opt/vend/lib -lvendor"),
+        ];
+        for (goal, binary) in [
+            ("main", "main "),
+            ("prov", "main_prov "),
+            ("afl", "main_afl "),
+            ("libfuzzer", "main_libfuzzer "),
+            ("msan", "main_msan "),
+            ("tsan", "main_tsan "),
+            ("cov", "main_cov "),
+            ("diff", "main_diff "),
+        ] {
+            let dry_run = make_dry_run_goal(&c_dir, goal, &vars);
+            let link = recipe_for(&dry_run, binary);
+            assert!(
+                link.contains("-DBOARD_REV=7") && link.contains("-L/opt/vend/lib -lvendor"),
+                "C {goal}: {link}"
+            );
+            assert!(!link.contains("iostream"), "C {goal}: {link}");
+        }
+        let cpp_root = root.join("cpp");
+        fs::create_dir_all(&cpp_root).unwrap();
+        let cpp_source = cpp_root.join("widget.cpp");
+        fs::write(
+            &cpp_source,
+            "#include <cstddef>\nint parse_record(const unsigned char *data, std::size_t size) \
+             { return size > 2 && data[0] == 'W' ? data[1] : 0; }\n",
+        )
+        .unwrap();
+        let cpp_dir = generate_for_make_test(&cpp_source, "parse_record", "H-LANES-CPP", &cpp_root);
+        for (goal, binary) in [
+            ("main", "main "),
+            ("afl", "main_afl "),
+            ("libfuzzer", "main_libfuzzer "),
+            ("cov", "main_cov "),
+            ("diff", "main_diff "),
+        ] {
+            let dry_run = make_dry_run_goal(&cpp_dir, goal, &vars);
+            let link = recipe_for(&dry_run, binary);
+            assert!(
+                link.contains("-include iostream") && link.contains("-L/opt/vend/lib -lvendor"),
+                "C++ {goal}: {link}"
+            );
+            assert!(!link.contains("BOARD_REV"), "C++ {goal}: {link}");
+        }
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The `_FORTIFY_SOURCE` value `compiler` ends up with for the
+    /// fortify-related words of `recipe`, in their order (`None` when it is
+    /// left undefined), or why the compiler could not tell.
+    fn effective_fortify(compiler: &str, recipe: &str) -> Result<Option<String>, String> {
+        let words: Vec<&str> = recipe
+            .split_whitespace()
+            .filter(|word| word.contains("_FORTIFY_SOURCE"))
+            .collect();
+        let output = std::process::Command::new(compiler)
+            .args(["-O2", "-Werror"])
+            .args(&words)
+            .args(["-x", "c", "-dM", "-E", "-"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(format!(
+                "{compiler} {words:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find_map(|line| line.strip_prefix("#define _FORTIFY_SOURCE "))
+            .map(str::to_owned))
+    }
+
+    /// glibc's `_FORTIFY_SOURCE` (Ubuntu's gcc defines it whenever it
+    /// optimizes) turns an overflow of a fortified call into its own abort
+    /// before AddressSanitizer reports it, so every sanitized lane of both
+    /// Makefiles turns it off, after the build context's and the toolchain's
+    /// own flags, in either spelling they define it with (`-D`, or the `-Wp,-D`
+    /// of Fedora's build flags); a lane built without a sanitizer keeps it.
+    #[test]
+    fn sanitized_makefile_lanes_turn_fortify_off_for_both_families() {
+        if !have_tool("make") {
+            eprintln!("skip: make unavailable");
+            return;
+        }
+        let off = harness_gen::compiler_family::SANITIZED_NO_FORTIFY.join(" ");
+        let root = temp_dir("make-fortify");
+        let c_source = root.join("widget.c");
+        fs::write(
+            &c_source,
+            "#include <stddef.h>\nint parse_record(const unsigned char *data, size_t size) \
+             { return size > 2 && data[0] == 'W' ? data[1] : 0; }\n",
+        )
+        .unwrap();
+        let c_dir = generate_for_make_test(&c_source, "parse_record", "H-FORT-C", &root);
+        let cpp_root = root.join("cpp");
+        fs::create_dir_all(&cpp_root).unwrap();
+        let cpp_source = cpp_root.join("widget.cpp");
+        fs::write(
+            &cpp_source,
+            "#include <cstddef>\nint parse_record(const unsigned char *data, std::size_t size) \
+             { return size > 2 && data[0] == 'W' ? data[1] : 0; }\n",
+        )
+        .unwrap();
+        let cpp_dir = generate_for_make_test(&cpp_source, "parse_record", "H-FORT-CPP", &cpp_root);
+        // The build context's flags, as a compile database records them.
+        for dir in [&c_dir, &cpp_dir] {
+            let makefile = dir.join("Makefile");
+            let text = fs::read_to_string(&makefile).unwrap();
+            let line = text
+                .lines()
+                .find(|line| line.starts_with("COMPILE_DB_FLAGS ="))
+                .unwrap()
+                .to_owned();
+            fs::write(
+                &makefile,
+                text.replacen(
+                    &line,
+                    "COMPILE_DB_FLAGS = -O2 -Wall -Wp,-D_FORTIFY_SOURCE=2 -D_FORTIFY_SOURCE=2",
+                    1,
+                ),
+            )
+            .unwrap();
+        }
+        for family in ["gcc", "clang"] {
+            let c = make_dry_run(
+                &c_dir,
+                &[
+                    ("BHF_CC_FAMILY", family),
+                    ("BHF_TOOLCHAIN_C_CPPFLAGS", "-Wp,-D_FORTIFY_SOURCE=2"),
+                ],
+            );
+            let main = recipe_for(&c, "main ");
+            assert!(main.contains(&off), "C {family}: {main}");
+            // Not even the build context's or a toolchain's own define turns
+            // it back on.
+            assert!(
+                main.find(&off) > main.rfind("_FORTIFY_SOURCE=2"),
+                "C {family}: {main}"
+            );
+            let cpp = make_dry_run(
+                &cpp_dir,
+                &[("BHF_CXX_FAMILY", family), ("BHF_CC_FAMILY", family)],
+            );
+            let cpp_main = recipe_for(&cpp, "main ");
+            assert!(cpp_main.contains(&off), "C++ {family}: {cpp_main}");
+            if have_tool(family) {
+                for (language, recipe) in [("C", main), ("C++", cpp_main)] {
+                    let value = effective_fortify(family, recipe)
+                        .unwrap_or_else(|error| panic!("{language} {family}: {error}"));
+                    assert!(
+                        value.is_none() || value.as_deref() == Some("0"),
+                        "{language} {family} keeps _FORTIFY_SOURCE {value:?}: {recipe}"
+                    );
+                }
+            }
+        }
+        // The other sanitized lanes too.
+        let text = fs::read_to_string(c_dir.join("Makefile")).unwrap();
+        for lane in [
+            "main_afl:",
+            "main_msan:",
+            "main_tsan:",
+            "main_diff:",
+            "main_prov:",
+        ] {
+            let recipe = text
+                .lines()
+                .skip_while(|line| !line.starts_with(lane))
+                .nth(1)
+                .unwrap_or_else(|| panic!("no {lane} rule"));
+            assert!(
+                recipe.contains("BHF_SANITIZED_NO_FORTIFY"),
+                "{lane} {recipe}"
+            );
+        }
+        // A build without a sanitizer keeps the platform's fortification.
+        let plain = make_dry_run(&c_dir, &[("BHF_CC_FAMILY", "gcc"), ("CFLAGS", "-O1 -g")]);
+        assert!(!recipe_for(&plain, "main ").contains(&off), "{plain}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// `bhf-cl` (bhf's front end for MSVC cl.exe) is recognised by name, so a
+    /// hand-run `make CC=.../bhf-cl.exe` gets cl's coverage form (inline 8-bit
+    /// counters) and AddressSanitizer without UBSan, which cl does not have —
+    /// in both the C and the C++ Makefile.
+    #[test]
+    fn generated_makefiles_pick_msvc_flags_for_the_cl_front_end() {
+        if !have_tool("make") {
+            eprintln!("skip: make unavailable");
+            return;
+        }
+        let root = temp_dir("make-msvc-family");
+        let c_source = root.join("widget.c");
+        fs::write(
+            &c_source,
+            "#include <stddef.h>\nint parse_record(const unsigned char *data, size_t size) \
+             { return size > 2 && data[0] == 'W' ? data[1] : 0; }\n",
+        )
+        .unwrap();
+        let front_end = "C:/Users/Some One/bhf/bhf-cl.exe";
+        let c_dir = generate_for_make_test(&c_source, "parse_record", "H-MSVC-C", &root);
+        let dry_run = make_dry_run(&c_dir, &[("CC", &format!("\"{front_end}\""))]);
+        let main = recipe_for(&dry_run, "main ");
+        assert!(
+            main.contains("-fsanitize-coverage=inline-8bit-counters,edge,trace-cmp,trace-div"),
+            "{main}"
+        );
+        assert!(main.contains("-fsanitize=address "), "{main}");
+        assert!(!main.contains("undefined"), "cl has no UBSan: {main}");
+        assert!(!main.contains("trace-pc-guard"), "{main}");
+
+        let cpp_root = root.join("cpp");
+        fs::create_dir_all(&cpp_root).unwrap();
+        let cpp_source = cpp_root.join("widget.cpp");
+        fs::write(
+            &cpp_source,
+            "#include <cstddef>\nint parse_record(const unsigned char *data, std::size_t size) \
+             { return size > 2 && data[0] == 'W' ? data[1] : 0; }\n",
+        )
+        .unwrap();
+        let cpp_dir = generate_for_make_test(&cpp_source, "parse_record", "H-MSVC-CPP", &cpp_root);
+        let quoted = format!("\"{front_end}\"");
+        let dry_run = make_dry_run(&cpp_dir, &[("CXX", &quoted), ("CC", &quoted)]);
+        let main = recipe_for(&dry_run, "main ");
+        assert!(
+            main.contains("-fsanitize-coverage=inline-8bit-counters,edge,trace-cmp,trace-div"),
+            "{main}"
+        );
+        assert!(!main.contains("undefined"), "cl has no UBSan: {main}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A toolchain flag that selects the ABI must reach bhf's driver object as
+    /// well as `main`, or the two objects are built for different ABIs and the
+    /// link fails. The driver keeps its own dialect and warning policy.
+    #[test]
+    fn toolchain_flags_reach_the_driver_object() {
+        if !have_tool("make") || !have_tool("clang") {
+            eprintln!("skip: make/clang unavailable");
+            return;
+        }
+        let root = temp_dir("make-driver-toolchain-flags");
+        let source = root.join("parse.c");
+        fs::write(
+            &source,
+            "int parse_record(const unsigned char *data, unsigned long size) \
+             { return size > 1 && data[0] == 'D' ? data[1] : 0; }\n",
+        )
+        .unwrap();
+        let dir = generate_for_make_test(&source, "parse_record", "H-DRVFLAGS", &root);
+        let dry_run = make_dry_run(
+            &dir,
+            &[
+                ("CC", "clang"),
+                (
+                    "BHF_TOOLCHAIN_CFLAGS",
+                    "-DWIDGET_ABI_MARK=1 -std=gnu89 -Werror",
+                ),
+                // The header dir of the C flags, which bhf moves out of
+                // BHF_TOOLCHAIN_CFLAGS, still reaches the driver.
+                ("BHF_TOOLCHAIN_DRIVER_CFLAGS", "-isystem /opt/bare/include"),
+            ],
+        );
+        let driver = recipe_for(&dry_run, "bhf_driver.o");
+        assert!(driver.contains("-DWIDGET_ABI_MARK=1"), "{driver}");
+        assert!(driver.contains("-isystem /opt/bare/include"), "{driver}");
+        assert!(
+            !driver.contains("-std=gnu89") && !driver.contains("-Werror"),
+            "{driver}"
+        );
+        let main = recipe_for(&dry_run, "main ");
+        assert!(
+            main.contains("-DWIDGET_ABI_MARK=1") && main.contains("-std=gnu89"),
+            "{main}"
+        );
+
+        // A C++ harness compiles the C driver with $(CXX): it takes the C flags
+        // and the driver-safe part of the C++ flags bhf computed for it, never
+        // the C++ flags themselves (`-include iostream` breaks a C compile).
+        let source = root.join("widget.cpp");
+        fs::write(
+            &source,
+            "#include <cstddef>\nint parse_record(const unsigned char *data, std::size_t size) \
+             { return size > 2 && data[0] == 'W' ? data[1] : 0; }\n",
+        )
+        .unwrap();
+        let dir = generate_for_make_test(&source, "parse_record", "H-DRVFLAGS-CPP", &root);
+        let dry_run = make_dry_run(
+            &dir,
+            &[
+                ("CXX", "clang++"),
+                ("CC", "clang"),
+                ("BHF_TOOLCHAIN_CFLAGS", "-DWIDGET_C_MARK=1"),
+                (
+                    "BHF_TOOLCHAIN_CXXFLAGS",
+                    "-include iostream -DWIDGET_CXX_MARK=1 -std=c++17",
+                ),
+                ("BHF_TOOLCHAIN_DRIVER_CXXFLAGS", "-DWIDGET_CXX_MARK=1"),
+                ("BHF_TOOLCHAIN_DRIVER_CFLAGS", "-isystem /opt/bare/include"),
+            ],
+        );
+        let driver = recipe_for(&dry_run, "bhf_driver.o");
+        assert!(driver.contains("-isystem /opt/bare/include"), "{driver}");
+        assert!(
+            driver.contains("-DWIDGET_C_MARK=1") && driver.contains("-DWIDGET_CXX_MARK=1"),
+            "{driver}"
+        );
+        assert!(
+            !driver.contains("-std=c++17") && !driver.contains("iostream"),
+            "{driver}"
+        );
+        assert!(
+            recipe_for(&dry_run, "main ").contains("-include iostream"),
+            "{dry_run}"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A C unit of a C++ harness is compiled with $(CC), so it takes flags for
+    /// $(CC)'s family even when $(CXX) is another family (CC=gcc beside
+    /// clang++ used to get clang's `-fno-sanitize=function` and
+    /// `trace-pc-guard`, which gcc rejects).
+    #[test]
+    fn a_c_unit_of_a_cpp_harness_gets_the_flags_of_its_own_compiler() {
+        if !have_tool("make") || !have_tool("gcc") || !have_tool("clang++") {
+            eprintln!("skip: make/gcc/clang++ unavailable");
+            return;
+        }
+        let root = temp_dir("make-cpp-c-unit-family");
+        let source = root.join("widget.cpp");
+        fs::write(
+            &source,
+            "#include <cstddef>\nint parse_record(const unsigned char *data, std::size_t size) \
+             { return size > 2 && data[0] == 'W' ? data[1] : 0; }\n",
+        )
+        .unwrap();
+        let dir = generate_for_make_test(&source, "parse_record", "H-CUNIT", &root);
+        write_cpp_per_tu_context(
+            &dir,
+            &[PerTuCompileContext {
+                source: PathBuf::from("/proj/lib/legacy.c"),
+                compiler: Some("/usr/bin/gcc".to_owned()),
+                flags: vec!["-DLEGACY=1".to_owned()],
+            }],
+        )
+        .unwrap();
+        let dry_run = make_dry_run(&dir, &[("CC", "gcc"), ("CXX", "clang++")]);
+        let c_unit = recipe_for(&dry_run, "context_objs/main_0.o");
+        assert!(c_unit.starts_with("gcc "), "{c_unit}");
+        assert!(c_unit.contains("trace-pc,trace-cmp"), "{c_unit}");
+        assert!(
+            !c_unit.contains("trace-pc-guard") && !c_unit.contains("function,vptr"),
+            "{c_unit}"
+        );
+        // An explicit CFLAGS is what a C unit of another family gets.
+        let dry_run = make_dry_run(
+            &dir,
+            &[
+                ("CC", "gcc"),
+                ("CXX", "clang++"),
+                ("CFLAGS", "-O0 -DWIDGET_OWN=1"),
+            ],
+        );
+        assert!(
+            recipe_for(&dry_run, "context_objs/main_0.o").contains("-DWIDGET_OWN=1"),
+            "{dry_run}"
+        );
+        // The same family keeps the C++ instrumentation (minus its -std=).
+        let dry_run = make_dry_run(&dir, &[("CC", "clang"), ("CXX", "clang++")]);
+        let c_unit = recipe_for(&dry_run, "context_objs/main_0.o");
+        assert!(c_unit.contains("trace-pc-guard,trace-cmp"), "{c_unit}");
+        assert!(!c_unit.contains("-std=gnu++"), "{c_unit}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn switching_compilers_rebuilds_the_driver_object() {
+        if !gcc_links_sanitizers("gcc") || !have_tool("clang") || !have_tool("make") {
+            eprintln!("skip: a sanitizing gcc, clang or make unavailable");
+            return;
+        }
+        let root = temp_dir("make-compiler-switch");
+        let source = root.join("parse.c");
+        fs::write(
+            &source,
+            "int parse_record(const unsigned char *data, unsigned long size) \
+             { return size > 1 && data[0] == 'R' ? data[1] : 0; }\n",
+        )
+        .unwrap();
+        let dir = generate_for_make_test(&source, "parse_record", "H-SWITCH", &root);
+        let first = make_main(&dir, &[("CC", "clang")]);
+        assert!(first.status.success(), "{}", output_text(&first));
+        // The same make again is a no-op: the stamp only changes with the toolchain.
+        let again = make_main(&dir, &[("CC", "clang")]);
+        assert!(
+            !output_text(&again).contains("-o bhf_driver.o"),
+            "an unchanged toolchain must not rebuild:\n{}",
+            output_text(&again)
+        );
+        let switched = make_main(&dir, &[("CC", "gcc")]);
+        let text = output_text(&switched);
+        assert!(switched.status.success(), "{text}");
+        assert!(
+            text.contains("gcc") && text.contains("-o bhf_driver.o"),
+            "a compiler change must rebuild bhf_driver.o, not link clang's:\n{text}"
+        );
+        assert!(
+            text.contains("-o main "),
+            "a compiler change must relink main:\n{text}"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_cross_prefixed_gcc_from_the_compile_database_gets_gcc_flags() {
+        let cross = "/usr/bin/aarch64-linux-gnu-gcc";
+        if !Path::new(cross).is_file() || !have_tool("make") {
+            eprintln!("skip: {cross}/make unavailable");
+            return;
+        }
+        let root = temp_dir("make-cross-db");
+        let src = root.join("src");
+        fs::create_dir_all(&src).unwrap();
+        let source = src.join("parse.c");
+        fs::write(
+            &source,
+            "int parse_record(const unsigned char *data, unsigned long size) \
+             { return size > 1 && data[0] == 'X' ? data[1] : 0; }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("compile_commands.json"),
+            format!(
+                r#"[{{"directory":"{}","file":"{}","arguments":["{cross}","-DFROM_DB=1","-c","{}"]}}]"#,
+                json_text(&src),
+                json_text(&source),
+                json_text(&source)
+            ),
+        )
+        .unwrap();
+        let dir = generate_for_make_test(&source, "parse_record", "H-XDB", &root);
+        let makefile = fs::read_to_string(dir.join("Makefile")).unwrap();
+        assert!(makefile.contains(&format!("CC = {cross}")), "{makefile}");
+        // A hand-run make uses the database's cross gcc and must pair it with
+        // GCC flags, not clang's `-fno-sanitize=function` / `trace-pc-guard`.
+        let output = make_main(&dir, &[]);
+        let text = output_text(&output);
+        assert!(output.status.success(), "{text}");
+        assert!(!text.contains("trace-pc-guard"), "{text}");
+        let elf = fs::read(dir.join("main")).unwrap();
+        // e_machine 183 (0xB7) = AArch64.
+        assert_eq!(&elf[18..20], &[0xB7, 0x00], "main must be an AArch64 ELF");
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -17985,9 +20688,9 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             root.join("compile_commands.json"),
             format!(
                 r#"[{{"directory":"{}","file":"{}","arguments":["cc","-I","../headers/public","-c","{}"]}}]"#,
-                src.display(),
-                source.display(),
-                source.display()
+                json_text(&src),
+                json_text(&source),
+                json_text(&source)
             ),
         )
         .unwrap();
@@ -18070,7 +20773,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
 
         let makefile = fs::read_to_string(root.join("out/H-C-STATIC-DIRECT/Makefile")).unwrap();
         assert!(
-            !makefile.contains(&source.display().to_string()),
+            !makefile.contains(&harness_gen::build_safety::make_path(&source)),
             "static target source should not be linked as a separate translation unit:\n{makefile}"
         );
     }
@@ -18205,7 +20908,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
 
         let makefile = fs::read_to_string(root.join("out/H-CSEQ/Makefile")).unwrap();
         assert!(
-            makefile.contains(&source.display().to_string()),
+            makefile.contains(&harness_gen::build_safety::make_path(&source)),
             "Makefile should link the project source: {makefile}"
         );
 
@@ -18509,7 +21212,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
 
         let makefile = fs::read_to_string(root.join("out/H-CSEQ-STATIC-LIFE/Makefile")).unwrap();
         assert!(
-            !makefile.contains(&source.display().to_string()),
+            !makefile.contains(&harness_gen::build_safety::make_path(&source)),
             "a whole-TU include must not also link the same definitions:\n{makefile}"
         );
     }
@@ -18531,9 +21234,9 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             root.join("compile_commands.json"),
             format!(
                 r#"[{{"directory":"{}","file":"{}","command":"clang++ --gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/13 -isystem ../third_party/include -DCPP_LEGACY=1 -std=gnu++20 -c {}" }}]"#,
-                src.display(),
-                source.display(),
-                source.display()
+                json_text(&src),
+                json_text(&source),
+                json_text(&source)
             ),
         )
         .unwrap();
@@ -18563,7 +21266,10 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         let makefile = fs::read_to_string(root.join("out/H-CDB-CPP/Makefile")).unwrap();
         assert!(makefile.contains("CXX = clang++"));
         assert!(makefile.contains("COMPILE_DB_FLAGS ="));
-        assert!(makefile.contains(&format!("-isystem {}", third_party.display())));
+        assert!(makefile.contains(&format!(
+            "-isystem {}",
+            harness_gen::build_safety::make_path(&third_party)
+        )));
         assert!(makefile.contains("-DCPP_LEGACY=1"));
         assert!(makefile.contains("CXX_STD ?= gnu++20"));
         let recovered_flags = makefile
@@ -18618,9 +21324,9 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
             root.join("compile_commands.json"),
             format!(
                 r#"[{{"directory":"{}","file":"{}","arguments":["g++","-I","../include","-DOWNER_FEATURE=1","-include","../include/forced.hpp","-std=gnu++17","-c","{}"]}}]"#,
-                src.display(),
-                owner.display(),
-                owner.display()
+                json_text(&src),
+                json_text(&owner),
+                json_text(&owner)
             ),
         )
         .unwrap();
@@ -18650,16 +21356,18 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         let makefile = fs::read_to_string(root.join("out/H-X-HEADER-OWNER/Makefile")).unwrap();
         assert!(makefile.contains("CXX = g++"));
         assert!(makefile.contains("-fsanitize-coverage=trace-pc,trace-cmp"));
-        assert!(makefile.contains(&format!("-I {}", include.display())));
+        assert!(makefile.contains(&format!(
+            "-I {}",
+            harness_gen::build_safety::make_path(&include)
+        )));
         assert!(makefile.contains("-DOWNER_FEATURE=1"));
-        assert!(makefile.contains(&format!("-include {}", forced.display())));
+        assert!(makefile.contains(&format!(
+            "-include {}",
+            harness_gen::build_safety::make_path(&forced)
+        )));
         assert!(makefile.contains("CXX_STD ?= gnu++17"));
 
-        if std::process::Command::new("g++")
-            .arg("--version")
-            .output()
-            .is_ok_and(|output| output.status.success())
-        {
+        if gcc_links_sanitizers("g++") && have_tool("make") {
             let make_status = std::process::Command::new("make")
                 .arg("-C")
                 .arg(root.join("out/H-X-HEADER-OWNER"))
@@ -18692,12 +21400,8 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
 
     #[test]
     fn cpp_build_compiles_each_translation_unit_with_its_own_database_flags() {
-        if std::process::Command::new("g++")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            bhfeprintln!("skipping per-TU context test: g++ not on PATH");
+        if !gcc_links_sanitizers("g++") || !have_tool("make") {
+            bhfeprintln!("skipping per-TU context test: no sanitizing g++ or make on PATH");
             return;
         }
         let root = temp_dir("cpp-per-tu-build-context");
@@ -18733,12 +21437,12 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
 {{"directory":"{}","file":"{}","arguments":["g++","-I",".","-DMODE_PARSER=1","-std=c++14","-c","{}"]}},
 {{"directory":"{}","file":"{}","arguments":["g++","-I",".","-DMODE_SUPPORT=1","-std=c++17","-c","{}"]}}
 ]"#,
-                src.display(),
-                parser.display(),
-                parser.display(),
-                src.display(),
-                support.display(),
-                support.display()
+                json_text(&src),
+                json_text(&parser),
+                json_text(&parser),
+                json_text(&src),
+                json_text(&support),
+                json_text(&support)
             ),
         )
         .unwrap();
@@ -19030,12 +21734,22 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         let makefile = fs::read_to_string(root.join("out/H-CMAKE-CPP/Makefile")).unwrap();
         assert!(makefile.contains("BUILD_CONTEXT_PROVENANCE = cmake"));
         assert!(makefile.contains("BUILD_CONTEXT_CONFIDENCE = medium"));
-        assert!(makefile.contains(&format!("-I {}", include.display())));
+        assert!(makefile.contains(&format!(
+            "-I {}",
+            harness_gen::build_safety::make_path(&include)
+        )));
         assert!(makefile.contains("-DLEGACY_MODE=1"));
         assert!(makefile.contains("CXX_STD ?= c++20"));
         assert!(!makefile.contains("COMPILE_DB_FLAGS = -std="));
-        assert!(makefile.contains(support.to_str().unwrap()));
-        assert!(makefile.contains("BUILD_CONTEXT_LDFLAGS = -lz -pthread"));
+        assert!(makefile.contains(&harness_gen::build_safety::make_path(&support)));
+        // A bare library name is linked when it resolves in the Unix library
+        // directories (`libz`); Windows has none, so only `-pthread` stays.
+        let ldflags = if cfg!(unix) {
+            "BUILD_CONTEXT_LDFLAGS = -lz -pthread"
+        } else {
+            "BUILD_CONTEXT_LDFLAGS = -pthread"
+        };
+        assert!(makefile.contains(ldflags), "{makefile}");
     }
 
     #[test]
@@ -19574,11 +22288,14 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
         let makefile = fs::read_to_string(root.join("out/H-MAKE-CPP/Makefile")).unwrap();
         assert!(makefile.contains("BUILD_CONTEXT_PROVENANCE = make"));
         assert!(makefile.contains("BUILD_CONTEXT_CONFIDENCE = low"));
-        assert!(makefile.contains(&format!("-I {}", include.display())));
+        assert!(makefile.contains(&format!(
+            "-I {}",
+            harness_gen::build_safety::make_path(&include)
+        )));
         assert!(makefile.contains("-DMAKE_MODE=1"));
         assert!(makefile.contains("CXX_STD ?= gnu++17"));
         assert!(!makefile.contains("COMPILE_DB_FLAGS = -std="));
-        assert!(makefile.contains(helper.to_str().unwrap()));
+        assert!(makefile.contains(&harness_gen::build_safety::make_path(&helper)));
         assert!(makefile.contains("BUILD_CONTEXT_LDFLAGS = -lm"));
     }
 
@@ -19723,7 +22440,7 @@ Codec *make_codec(int variant) { (void)variant; return nullptr; }
 
         let main = fs::read_to_string(temp.join("out/H-CFILE/main.c")).unwrap();
         assert!(main.contains("unsigned char *_bhf_file_buf_stream"));
-        assert!(main.contains("fmemopen(_bhf_file_buf_stream, Size, \"r+\")"));
+        assert!(main.contains("bhf_fmemopen(_bhf_file_buf_stream, Size)"));
         assert!(main.contains("parse_stream(stream)"));
         assert!(main.contains("if (stream) fclose(stream);"));
         assert!(main.contains("free(_bhf_file_buf_stream);"));
@@ -20346,6 +23063,11 @@ class basic_json
         .unwrap();
 
         let dictionary = fs::read_to_string(temp.join("out/H-CDICT/dictionary.txt")).unwrap();
+        assert!(
+            dictionary.starts_with(crate::generate_harness::DICTIONARY_HEADER),
+            "the dictionary says where its tokens come from:\n{dictionary}"
+        );
+        assert!(dictionary.contains("# raw bytes of the literal above\n\"\\x04\\x03KP\""));
         assert!(dictionary.contains("\"GIF89a\""));
         assert!(dictionary.contains("\"0x504b0304\""));
         // #379: the numeric magic 0x504b0304 must also appear as raw bytes so it
@@ -20358,6 +23080,217 @@ class basic_json
         assert!(dictionary.contains("\"MODE_SAFE\""));
         assert!(dictionary.contains("\"Q\""));
         assert!(dictionary.contains("\"READY\""));
+    }
+
+    /// Ranking parses a project header once however many files include it,
+    /// and again only after the header changes.
+    #[test]
+    fn ranking_reuses_a_parsed_header_until_it_changes() {
+        use type_model::{ScalarKind, TypeShape};
+        let temp = temp_dir("ranking-header-cache");
+        let include = temp.join("include");
+        fs::create_dir_all(&include).unwrap();
+        let header = include.join("widget_types.h");
+        fs::write(&header, "typedef unsigned char u8_t;\n").unwrap();
+        let canonical = fs::canonicalize(&header).unwrap();
+        let first = super::ranking_header(&canonical, false).unwrap();
+        let resolve = |name: &str| {
+            let path = temp.join(format!("{name}.c"));
+            let source = format!(
+                "#include \"widget_types.h\"\n\
+                 int {name}(const u8_t *data, unsigned long len) {{ return data[0] + (int)len; }}\n"
+            );
+            fs::write(&path, &source).unwrap();
+            super::ranking_type_registry(
+                &path,
+                &source,
+                false,
+                [vec![("data", "const u8_t *"), ("len", "unsigned long")]],
+            )
+            .resolve("u8_t")
+        };
+        for name in ["parse_record", "parse_widget"] {
+            assert_eq!(resolve(name), TypeShape::Scalar(ScalarKind::U8), "{name}");
+        }
+        // An alias the file declares itself, across a line break, is read too.
+        let local = temp.join("local.c");
+        let source = "typedef unsigned\n    short len16_t;\n\
+                      int parse_local(const char *data, len16_t len) { return data[len]; }\n";
+        fs::write(&local, source).unwrap();
+        let registry = super::ranking_type_registry(
+            &local,
+            source,
+            false,
+            [vec![("data", "const char *"), ("len", "len16_t")]],
+        );
+        assert_eq!(
+            registry.resolve("len16_t"),
+            TypeShape::Scalar(ScalarKind::U16)
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &super::ranking_header(&canonical, false).unwrap()),
+            "both files ranked from the one parse"
+        );
+        // A rewrite (here of another size) is parsed again.
+        fs::write(&header, "typedef unsigned int u8_t; /* widened */\n").unwrap();
+        let changed = super::ranking_header(&canonical, false).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&first, &changed));
+        assert_eq!(resolve("parse_record"), TypeShape::Scalar(ScalarKind::U32));
+        fs::remove_dir_all(&temp).ok();
+    }
+
+    /// A file's own aliases are read from its text: the scalar-shaped
+    /// `typedef` and `using` statements, across line breaks and around
+    /// comments, and not a commented-out one or an array, function or
+    /// aggregate alias. A typedef of one pointer keeps its pointee's
+    /// qualifiers, which say whether a parameter of that type is read-only.
+    #[test]
+    fn ranking_reads_the_simple_aliases_a_file_declares() {
+        let aliases = super::simple_aliases(
+            "// typedef unsigned char commented_t;\n\
+             typedef unsigned char u8_t, byte_t, *pu8_t;\n\
+             typedef unsigned /* width */\n\
+             \x20   short // bits\n\
+             \x20   len16_t;\n\
+             \x20 using size16 = std::uint16_t;\n\
+             using namespace widgets;\n\
+             typedef char name_t[16];\n\
+             typedef int (*callback_t)(int);\n\
+             typedef struct widget { int x; } widget_t;\n\
+             typedef const char *label_t;\n\
+             int parse_record(const u8_t *data, len16_t len);\n",
+        );
+        let found: Vec<(&str, &str, u32)> = aliases
+            .iter()
+            .map(|a| (a.name.as_str(), a.underlying.as_str(), a.line))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("u8_t", "unsigned char", 2),
+                ("byte_t", "unsigned char", 2),
+                ("len16_t", "unsigned short", 3),
+                ("size16", "std::uint16_t", 6),
+                ("label_t", "const char *", 11),
+            ]
+        );
+        let pointers = super::simple_aliases(
+            "typedef const octet_t * rbuf_t;\n\
+             typedef octet_t*mbuf_t;\n\
+             typedef const octet_t **cbufs_t;\n\
+             typedef octet_t *one_t, *two_t;\n",
+        );
+        let found: Vec<(&str, &str)> = pointers
+            .iter()
+            .map(|a| (a.name.as_str(), a.underlying.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            [("rbuf_t", "const octet_t *"), ("mbuf_t", "octet_t *")]
+        );
+    }
+
+    /// CR, LF, TAB and other control bytes are written as `\xNN`, the only
+    /// escape AFL++ and libFuzzer read besides `\\` and `\"`, and each line
+    /// reads back as the token's bytes.
+    #[test]
+    fn dictionary_control_bytes_are_written_as_hex_escapes() {
+        let token = b"GET /\r\n\tX\x01\\\"";
+        let escaped = super::escape_afl_dictionary_token(token);
+        assert_eq!(escaped, "GET /\\x0d\\x0a\\x09X\\x01\\\\\\\"");
+        let line = format!("\"{escaped}\"");
+        assert_eq!(
+            crate::fuzz::parse_afl_dictionary_line(&line).unwrap(),
+            Some(token.to_vec())
+        );
+    }
+
+    /// Every mined token is preceded by a `# from <file>:<line>` comment naming
+    /// up to three places it was found, header tokens relative to the target's
+    /// directory, and the file stays a valid AFL dictionary.
+    #[test]
+    fn harness_dictionary_names_where_each_token_was_found() {
+        let temp = temp_dir("c-dictionary-provenance");
+        let include = temp.join("include");
+        fs::create_dir_all(&include).unwrap();
+        let header = include.join("widget.h");
+        let source = temp.join("widget.c");
+        fs::write(
+            &header,
+            "#define WIDGET_MAGIC \"WGT1\"\n\
+             enum widget_mode { WIDGET_FAST, WIDGET_SAFE };\n",
+        )
+        .unwrap();
+        fs::write(
+            &source,
+            "#include \"widget.h\"\n\
+             #include <string.h>\n\
+             int parse_record(const char *s, int tag) {\n\
+               if (tag == 77) return 1;\n\
+               if (tag != 77) return 2;\n\
+               if (tag > 77) return 3;\n\
+               if (tag < 77) return 4;\n\
+               return s && !strcmp(s, \"WGT1\");\n\
+             }\n",
+        )
+        .unwrap();
+
+        run(GenerateHarnessArgs {
+            source: source.clone(),
+            target: Some("parse_record".to_owned()),
+            target_line: None,
+            output: temp.join("out"),
+            id: Some("H-CPROV".to_owned()),
+            kind: "direct".to_owned(),
+            source_roots: Vec::new(),
+            project: None,
+            source_trees: Vec::new(),
+            extra_sources: Vec::new(),
+            extra_includes: vec![include.clone()],
+            cleanup: None,
+            template_instantiate: Vec::new(),
+            tree_type_defs: None,
+            decoder_limits: Default::default(),
+            force: false,
+            archive_backed: false,
+            environment: None,
+        })
+        .unwrap();
+
+        // The generation metadata names the decode layout and the function a
+        // debugger breaks on.
+        let metadata: serde_json::Value = serde_json::from_slice(
+            &fs::read(temp.join("out/H-CPROV/generation-metadata.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata["arg_layout"], "arg-layout.json", "{metadata}");
+        assert_eq!(metadata["target_function"], "parse_record", "{metadata}");
+        assert!(temp.join("out/H-CPROV/arg-layout.json").is_file());
+        assert_eq!(
+            crate::generate_harness::recorded_target_function(&temp.join("out/H-CPROV")).as_deref(),
+            Some("parse_record")
+        );
+
+        let dictionary = fs::read_to_string(temp.join("out/H-CPROV/dictionary.txt")).unwrap();
+        assert!(
+            dictionary.contains("# from widget.c:8, include/widget.h:1\n\"WGT1\"\n"),
+            "a token found in the source and a header names both:\n{dictionary}"
+        );
+        assert!(
+            dictionary.contains("# from include/widget.h:2\n\"WIDGET_SAFE\"\n"),
+            "{dictionary}"
+        );
+        assert!(
+            dictionary.contains("# from widget.c:4, widget.c:5, widget.c:6\n\"77\"\n"),
+            "repeats are capped at three places:\n{dictionary}"
+        );
+        for line in dictionary.lines() {
+            let parsed = crate::fuzz::parse_afl_dictionary_line(line);
+            assert!(parsed.is_ok(), "invalid AFL dictionary line {line:?}");
+            if line.starts_with('#') || line.trim().is_empty() {
+                assert_eq!(parsed.unwrap(), None, "{line:?}");
+            }
+        }
     }
 
     #[test]
@@ -20402,11 +23335,25 @@ class basic_json
         })
         .unwrap();
 
+        let metadata: serde_json::Value = serde_json::from_slice(
+            &fs::read(temp.join("out/H-CPPDICT/generation-metadata.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata["target_function"], "gov::parse", "{metadata}");
+        assert_eq!(metadata["arg_layout"], "arg-layout.json", "{metadata}");
         let dictionary = fs::read_to_string(temp.join("out/H-CPPDICT/dictionary.txt")).unwrap();
         assert!(dictionary.contains("\"GIF89a\""));
         assert!(dictionary.contains("\"0x504b0304\""));
         assert!(dictionary.contains("\"MODE_FAST\""));
         assert!(dictionary.contains("\"MODE_SAFE\""));
+        assert!(
+            dictionary.contains("# from parser.hpp:1\n\"GIF89a\"\n"),
+            "{dictionary}"
+        );
+        assert!(
+            dictionary.contains("# from parser.hpp:3\n\"MODE_SAFE\"\n"),
+            "{dictionary}"
+        );
     }
 
     #[test]
@@ -20544,7 +23491,7 @@ class basic_json
         assert!(main.contains("parse_header(input, len)"));
         let makefile = fs::read_to_string(temp.join("out/H-C-HDR/Makefile")).unwrap();
         assert!(
-            !makefile.contains(source.to_str().unwrap()),
+            !makefile.contains(&harness_gen::build_safety::make_path(&source)),
             "header-only target must not be compiled as a source:\n{makefile}"
         );
     }
@@ -20641,7 +23588,7 @@ class basic_json
         assert!(main.contains("acme::parse_header_cpp(input)"));
         let makefile = fs::read_to_string(temp.join("out/H-X-HDR/Makefile")).unwrap();
         assert!(
-            !makefile.contains(source.to_str().unwrap()),
+            !makefile.contains(&harness_gen::build_safety::make_path(&source)),
             "header-only target must not be compiled as a source:\n{makefile}"
         );
     }
@@ -20694,7 +23641,7 @@ class basic_json
         );
         let makefile = fs::read_to_string(temp.join("out/H-X-STATIC-CPP/Makefile")).unwrap();
         assert!(
-            !makefile.contains(source.to_str().unwrap()),
+            !makefile.contains(&harness_gen::build_safety::make_path(&source)),
             "static C++ target source must not also be compiled separately:\n{makefile}"
         );
     }
@@ -20729,6 +23676,156 @@ class basic_json
             warning.is_none(),
             "signature-qualified target name is unambiguous"
         );
+    }
+
+    fn suffix_target_fixture() -> Vec<cpp_parser::CppFunction> {
+        cpp_parser::parse_cpp_functions(
+            r#"
+            #include <cstddef>
+            namespace widgets {
+            class Codec {
+            public:
+                int decode(const unsigned char *data, size_t size);
+                int encode(const unsigned char *data, size_t size);
+            };
+            int Codec::decode(const unsigned char *data, size_t size) { return data && size ? data[0] : 0; }
+            int Codec::encode(const unsigned char *data, size_t size) { return data ? (int)size : 0; }
+            }
+            namespace gadgets {
+            class Codec {
+            public:
+                int decode(const unsigned char *data, size_t size) { return data ? (int)size : 1; }
+            };
+            }
+            "#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn pick_cpp_target_accepts_class_qualified_suffix_without_namespace() {
+        let functions: Vec<_> = suffix_target_fixture()
+            .into_iter()
+            .filter(|f| f.qualifier_path.first().map(String::as_str) != Some("gadgets"))
+            .collect();
+        let (selected, warning) =
+            pick_cpp_target(Path::new("codec.cpp"), functions, "Codec::decode", None).unwrap();
+        assert_eq!(selected.name, "decode");
+        assert_eq!(selected.qualifier_path, vec!["widgets", "Codec"]);
+        assert!(warning.is_none(), "a unique suffix needs no warning");
+    }
+
+    #[test]
+    fn pick_cpp_target_suffix_with_signature_selects_that_overload() {
+        let functions: Vec<_> = suffix_target_fixture()
+            .into_iter()
+            .filter(|f| f.qualifier_path.first().map(String::as_str) != Some("gadgets"))
+            .collect();
+        let (selected, _) = pick_cpp_target(
+            Path::new("codec.cpp"),
+            functions,
+            "Codec::encode(const unsigned char *, size_t)",
+            None,
+        )
+        .unwrap();
+        assert_eq!(selected.name, "encode");
+    }
+
+    #[test]
+    fn pick_cpp_target_ambiguous_suffix_lists_every_match() {
+        let (selected, warning) = pick_cpp_target(
+            Path::new("codec.cpp"),
+            suffix_target_fixture(),
+            "Codec::decode",
+            None,
+        )
+        .unwrap();
+        let warning = warning.expect("two classes named Codec must be reported");
+        assert!(
+            warning.contains("widgets::Codec::decode")
+                && warning.contains("gadgets::Codec::decode"),
+            "{warning}"
+        );
+        assert!(warning.contains("--target-line"), "{warning}");
+        // The first definition by line is picked, as for any ambiguous name.
+        assert_eq!(selected.qualifier_path[0], "widgets");
+    }
+
+    #[test]
+    fn pick_cpp_target_exact_qualified_name_beats_a_longer_suffix_match() {
+        let functions = cpp_parser::parse_cpp_functions(
+            r#"
+            class Codec { public: int decode(int v) { return v; } };
+            namespace widgets {
+            class Codec { public: int decode(int v) { return v + 1; } };
+            }
+            "#,
+        )
+        .unwrap();
+        for spelling in [
+            "Codec::decode",
+            "::Codec::decode",
+            "Codec::decode(int)",
+            "Codec::decode( int )",
+        ] {
+            let (selected, warning) =
+                pick_cpp_target(Path::new("codec.cpp"), functions.clone(), spelling, None).unwrap();
+            assert!(
+                selected.qualifier_path == vec!["Codec"],
+                "{spelling}: {selected:?}"
+            );
+            assert!(warning.is_none(), "{spelling}: {warning:?}");
+        }
+        let (selected, warning) = pick_cpp_target(
+            Path::new("codec.cpp"),
+            functions,
+            "widgets::Codec::decode",
+            None,
+        )
+        .unwrap();
+        assert_eq!(selected.qualifier_path, vec!["widgets", "Codec"]);
+        assert!(warning.is_none(), "{warning:?}");
+    }
+
+    #[test]
+    fn pick_cpp_target_not_found_lists_closest_candidates_and_spellings() {
+        let error = pick_cpp_target(
+            Path::new("codec.cpp"),
+            suffix_target_fixture(),
+            "Codec::decod",
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("'Codec::decod' not found"), "{error}");
+        assert!(error.contains("widgets::Codec::decode"), "{error}");
+        assert!(error.contains("gadgets::Codec::decode"), "{error}");
+        assert!(
+            error.contains("bhf list targets") && error.contains("--target-line"),
+            "the accepted spellings must be named: {error}"
+        );
+        assert!(!error.contains("Codec::encode (line"), "{error}");
+    }
+
+    #[test]
+    fn pick_c_target_not_found_lists_closest_candidates() {
+        let f = |name: &str, line| c_parser::CFunction {
+            name: name.into(),
+            line,
+            return_type: "int".into(),
+            params: vec![],
+            ..Default::default()
+        };
+        let error = pick_c_target(
+            Path::new("x.c"),
+            vec![f("parse_record", 10), f("free_record", 20)],
+            "parse_recrod",
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("parse_record (line 10)"), "{error}");
+        assert!(!error.contains("free_record"), "{error}");
     }
 
     #[test]
@@ -20989,7 +24086,7 @@ class basic_json
         assert!(main.contains("catch (...)"));
         assert!(main.contains("RAII destructors run when _bhf_receiver leaves scope"));
         assert!(
-            !makefile.contains(source.to_str().unwrap()),
+            !makefile.contains(&harness_gen::build_safety::make_path(&source)),
             "source-local class declaration is included in main.cpp and must not be linked twice:\n{makefile}"
         );
     }
@@ -21571,15 +24668,12 @@ class basic_json
         assert!(!main.contains("Widget _bhf_owner"), "{main}");
         let build_context = fs::read_to_string(harness.join("build_context_objects.mk")).unwrap();
         assert!(
-            build_context.contains(factory.to_str().unwrap()),
+            build_context.contains(&harness_gen::build_safety::make_path(&factory)),
             "sibling factory definition must be linked: {build_context}"
         );
 
-        if std::process::Command::new("make")
-            .arg("--version")
-            .output()
-            .is_ok_and(|output| output.status.success())
-        {
+        // The compile database names g++, so the harness builds with it.
+        if have_tool("make") && gcc_links_sanitizers("g++") {
             let status = std::process::Command::new("make")
                 .arg("-C")
                 .arg(&harness)

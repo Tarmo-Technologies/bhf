@@ -29,6 +29,38 @@ pub fn fuzz_serial_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Put clang's sanitizer runtime DLL directory first on `cmd`'s PATH, so a
+/// binary a test built with `-fsanitize=address` starts on Windows, where
+/// `bhf build` would stage the DLL next to it. Nothing changes elsewhere.
+pub fn with_sanitizer_runtime(cmd: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    if let Some(runtime) = clang_sanitizer_runtime_dir() {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let dirs = std::iter::once(runtime.clone()).chain(std::env::split_paths(&path));
+        cmd.env(
+            "PATH",
+            std::env::join_paths(dirs).expect("PATH entries join"),
+        );
+    }
+    cmd
+}
+
+/// `<clang resource dir>/lib/windows`, where clang keeps its sanitizer DLLs.
+#[cfg(windows)]
+fn clang_sanitizer_runtime_dir() -> Option<&'static PathBuf> {
+    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let output = Command::new("clang")
+            .arg("-print-resource-dir")
+            .output()
+            .ok()?;
+        let resource = String::from_utf8_lossy(&output.stdout);
+        let dir = Path::new(resource.trim()).join("lib").join("windows");
+        dir.is_dir().then_some(dir)
+    })
+    .as_ref()
+}
+
 #[allow(dead_code)]
 pub fn bhf_cargo_command() -> Command {
     let mut cmd = Command::new(env!("CARGO"));

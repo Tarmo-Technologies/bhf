@@ -3121,7 +3121,7 @@ mod tests {
         assert!(e.decl.contains("bhf_bounded_length(&Cur, 0, 16)"));
         assert!(e
             .decl
-            .contains("std::uint32_t _bhf_vector_items_elt = (std::uint32_t)bhf_bounded_i32"));
+            .contains("std::uint32_t _bhf_vector_items_elt = (std::uint32_t)bhf_i32(&Cur)"));
         assert!(e.decl.contains("items.emplace_back(_bhf_vector_items_elt)"));
         assert_eq!(e.c_type, "std::vector<std::uint32_t>");
     }
@@ -3134,7 +3134,7 @@ mod tests {
         assert!(deque.decl.contains("bhf_bounded_length(&Cur, 0, 16)"));
         assert!(deque
             .decl
-            .contains("std::uint32_t _bhf_deque_items_elt = (std::uint32_t)bhf_bounded_i32"));
+            .contains("std::uint32_t _bhf_deque_items_elt = (std::uint32_t)bhf_i32(&Cur)"));
         assert!(deque
             .decl
             .contains("items.emplace_back(_bhf_deque_items_elt)"));
@@ -3158,9 +3158,9 @@ mod tests {
             .decl
             .contains("std::forward_list<std::uint32_t> items;"));
         assert!(items.decl.contains("bhf_bounded_length(&Cur, 0, 16)"));
-        assert!(items.decl.contains(
-            "std::uint32_t _bhf_forward_list_items_elt = (std::uint32_t)bhf_bounded_i32"
-        ));
+        assert!(items
+            .decl
+            .contains("std::uint32_t _bhf_forward_list_items_elt = (std::uint32_t)bhf_i32(&Cur)"));
         assert!(items
             .decl
             .contains("items.emplace_front(_bhf_forward_list_items_elt)"));
@@ -3175,7 +3175,7 @@ mod tests {
         assert!(set.decl.contains("bhf_bounded_length(&Cur, 0, 16)"));
         assert!(set
             .decl
-            .contains("std::uint32_t _bhf_set_ids_elt = (std::uint32_t)bhf_bounded_i32"));
+            .contains("std::uint32_t _bhf_set_ids_elt = (std::uint32_t)bhf_i32(&Cur)"));
         assert!(set.decl.contains("ids.emplace(_bhf_set_ids_elt)"));
         assert_eq!(set.c_type, "std::set<std::uint32_t>");
 
@@ -3190,7 +3190,7 @@ mod tests {
         assert!(map.decl.contains("std::string_view _bhf_map_lookup_key("));
         assert!(map
             .decl
-            .contains("std::uint32_t _bhf_map_lookup_value = (std::uint32_t)bhf_bounded_i32"));
+            .contains("std::uint32_t _bhf_map_lookup_value = (std::uint32_t)bhf_i32(&Cur)"));
         assert!(map
             .decl
             .contains("lookup.emplace(_bhf_map_lookup_key, _bhf_map_lookup_value)"));
@@ -3205,7 +3205,7 @@ mod tests {
         assert!(set.decl.contains("bhf_bounded_length(&Cur, 0, 16)"));
         assert!(set
             .decl
-            .contains("std::uint32_t _bhf_unordered_set_ids_elt = (std::uint32_t)bhf_bounded_i32"));
+            .contains("std::uint32_t _bhf_unordered_set_ids_elt = (std::uint32_t)bhf_i32(&Cur)"));
         assert!(set.decl.contains("ids.emplace(_bhf_unordered_set_ids_elt)"));
         assert_eq!(set.c_type, "std::unordered_set<std::uint32_t>");
 
@@ -3221,7 +3221,7 @@ mod tests {
             .decl
             .contains("std::string_view _bhf_unordered_map_lookup_key("));
         assert!(map.decl.contains(
-            "std::uint32_t _bhf_unordered_map_lookup_value = (std::uint32_t)bhf_bounded_i32"
+            "std::uint32_t _bhf_unordered_map_lookup_value = (std::uint32_t)bhf_i32(&Cur)"
         ));
         assert!(map.decl.contains(
             "lookup.emplace(_bhf_unordered_map_lookup_key, _bhf_unordered_map_lookup_value)"
@@ -3274,7 +3274,7 @@ mod tests {
         assert!(values.decl.contains("values.size()"));
         assert!(values
             .decl
-            .contains("std::uint32_t _bhf_array_values_elt = (std::uint32_t)bhf_bounded_i32"));
+            .contains("std::uint32_t _bhf_array_values_elt = (std::uint32_t)bhf_i32(&Cur)"));
         assert!(values
             .decl
             .contains("values[_bhf_i_values] = _bhf_array_values_elt"));
@@ -3759,9 +3759,9 @@ mod tests {
     fn select_cpp_decoder_handles_smart_pointers_to_supported_values() {
         let unique = select_cpp_decoder("std::unique_ptr<std::uint32_t>", "owned")
             .expect("unique_ptr<uint32_t> is supported");
-        assert!(unique.decl.contains(
-            "std::uint32_t _bhf_unique_ptr_owned_value = (std::uint32_t)bhf_bounded_i32"
-        ));
+        assert!(unique
+            .decl
+            .contains("std::uint32_t _bhf_unique_ptr_owned_value = (std::uint32_t)bhf_i32(&Cur)"));
         assert!(unique.decl.contains(
             "std::unique_ptr<std::uint32_t> owned = std::make_unique<std::uint32_t>(_bhf_unique_ptr_owned_value)"
         ));
@@ -3819,7 +3819,7 @@ mod tests {
         .expect("pair<uint32_t, string_view> is supported");
         assert!(e
             .decl
-            .contains("std::uint32_t _bhf_pair_entry_first = (std::uint32_t)bhf_bounded_i32"));
+            .contains("std::uint32_t _bhf_pair_entry_first = (std::uint32_t)bhf_i32(&Cur)"));
         assert!(e.decl.contains("std::string_view _bhf_pair_entry_second("));
         assert!(e.decl.contains(
             "std::pair<std::uint32_t, std::string_view> entry(_bhf_pair_entry_first, _bhf_pair_entry_second)"
@@ -3836,7 +3836,7 @@ mod tests {
         .expect("tuple<uint32_t, string_view, bool> is supported");
         assert!(e
             .decl
-            .contains("std::uint32_t _bhf_tuple_entry_0 = (std::uint32_t)bhf_bounded_i32"));
+            .contains("std::uint32_t _bhf_tuple_entry_0 = (std::uint32_t)bhf_i32(&Cur)"));
         assert!(e.decl.contains("std::string_view _bhf_tuple_entry_1("));
         assert!(e
             .decl
@@ -3863,7 +3863,7 @@ mod tests {
         assert!(e.decl.contains("switch (bhf_u8(&Cur) % 3)"));
         assert!(e
             .decl
-            .contains("std::uint32_t _bhf_variant_choice_0 = (std::uint32_t)bhf_bounded_i32"));
+            .contains("std::uint32_t _bhf_variant_choice_0 = (std::uint32_t)bhf_i32(&Cur)"));
         assert!(e.decl.contains("std::string_view _bhf_variant_choice_1("));
         assert!(e.decl.contains(
             "return std::variant<std::uint32_t, std::string_view, bool>(std::in_place_index<1>, _bhf_variant_choice_1)"
@@ -3887,7 +3887,7 @@ mod tests {
         ));
         assert!(e
             .decl
-            .contains("std::uint32_t _bhf_variant_choice_1 = (std::uint32_t)bhf_bounded_i32"));
+            .contains("std::uint32_t _bhf_variant_choice_1 = (std::uint32_t)bhf_i32(&Cur)"));
         assert_eq!(e.c_type, "std::variant<std::monostate, std::uint32_t>");
     }
 
@@ -3922,7 +3922,7 @@ mod tests {
             .expect("std::uint32_t scalar is supported");
         assert!(flags
             .decl
-            .contains("std::uint32_t flags = (std::uint32_t)bhf_bounded_i32(&Cur, 0, 0x7fffffff)"));
+            .contains("std::uint32_t flags = (std::uint32_t)bhf_i32(&Cur)"));
         assert_eq!(flags.c_type, "std::uint32_t");
 
         let code =
@@ -3938,12 +3938,24 @@ mod tests {
             .contains("bool enabled = (bool)(bhf_u8(&Cur) & 1)"));
         assert_eq!(enabled.c_type, "bool");
 
+        // A `size_t` that is not named like a length covers its full range.
         let limit = select_cpp_decoder("const std::size_t &", "limit")
             .expect("const std::size_t& scalar is supported");
-        assert!(limit
-            .decl
-            .contains("std::size_t limit = (std::size_t)bhf_bounded_length(&Cur, 0, 65536)"));
+        assert!(
+            limit
+                .decl
+                .contains("std::size_t limit = (std::size_t)bhf_i64(&Cur)"),
+            "{}",
+            limit.decl
+        );
         assert_eq!(limit.c_type, "const std::size_t &");
+        let mask = select_cpp_decoder("std::size_t", "mask").expect("std::size_t scalar");
+        assert!(
+            mask.decl
+                .contains("std::size_t mask = (std::size_t)bhf_i64(&Cur)"),
+            "{}",
+            mask.decl
+        );
     }
 
     /// `std::string::size_type` (== size_t) and `std::*::difference_type` (signed
@@ -3958,7 +3970,7 @@ mod tests {
         assert!(
             pos.decl.contains(
                 "std::string::size_type parser_stop_pos = \
-                 (std::string::size_type)bhf_bounded_length(&Cur, 0, 65536)"
+                 (std::string::size_type)bhf_i64(&Cur)"
             ),
             "decl: {}",
             pos.decl

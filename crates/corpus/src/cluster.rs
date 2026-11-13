@@ -16,6 +16,13 @@ use sha2::{Digest, Sha256};
 
 const TOP_FRAMES: usize = 3;
 const CLUSTER_KEY_VERSION_PREFIX: &str = "bhf-cluster-v1\n";
+/// Sanitizer-crash keys also hash the rule, the crash kind, the sanitizer's
+/// check name and (for UBSan, or a report with no usable frame) the reported
+/// site, so they carry their own version prefix.
+const SANITIZER_CLUSTER_KEY_VERSION_PREFIX: &str = "bhf-sanitizer-cluster-v2\n";
+/// Prefix of the key of a sanitizer crash with no informative frame and no
+/// reported source position, which hashes the harness scope it was found in.
+const FRAMELESS_CLUSTER_KEY_VERSION_PREFIX: &str = "bhf-frameless-cluster-v1\n";
 
 /// A frame fed into the clustering pipeline. Real sanitizer frames
 /// arrive via `From<&StackFrame>`; synthesized Ada frames are built
@@ -52,8 +59,9 @@ impl From<&StackFrame> for InputFrame {
 /// digest. `frames` preserves the normalized frame list the key was
 /// hashed over so consumers can inspect why two findings clustered
 /// together (or didn't). `fallback = true` means normalization
-/// produced no informative frames; the caller is expected to
-/// substitute the per-input signature short before persisting.
+/// produced no informative frames. A fallback key that is the all-zero
+/// [placeholder](ClusterKey::is_placeholder) is replaced by the per-input
+/// signature before it is persisted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterKey {
     pub short: String,
@@ -151,6 +159,13 @@ pub fn normalize_frames(input: &[InputFrame]) -> Vec<String> {
         // formatting, or generated-driver frame the PC landed in. The key must
         // start at the first in-project frame (#31, #44).
         if is_runtime_or_harness_noise(&no_args) {
+            continue;
+        }
+        // libc and sanitizer-interceptor frames (`__memcmp_avx2_movbe`,
+        // `MemcmpInterceptorCommon`, `bcmp`, glibc `sysdeps/` sources): the same
+        // test the sink search uses, so every crash inside `memcmp` does not
+        // share one key whatever project code called it.
+        if actionability::is_runtime_noise_frame(trimmed, frame.file.as_deref()) {
             continue;
         }
         out.push(no_args);
@@ -288,6 +303,29 @@ pub fn is_harness_scaffolding_leak(report: &SanitizerReport) -> bool {
     saw_harness || saw_rust_std_allocator
 }
 
+impl ClusterKey {
+    /// The all-zero key [`cluster_key_from_frames`] gives an empty frame list,
+    /// which says nothing about the crash: the caller substitutes the
+    /// per-input signature for it.
+    pub fn is_placeholder(&self) -> bool {
+        self.fallback && self.full.bytes().all(|byte| byte == b'0')
+    }
+}
+
+/// The scope a crash without frames or a source position is grouped in: the
+/// harness that found it and, when known, the function it calls. Two
+/// harnesses' frame-less crashes are then two root-cause groups, while one
+/// harness keeps one group per rule, kind, check and faulting pc.
+pub fn crash_scope(harness_id: &str, target_function: Option<&str>) -> String {
+    match target_function
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        Some(function) => format!("{harness_id}|{function}"),
+        None => harness_id.to_owned(),
+    }
+}
+
 /// Hash the supplied normalized frame list into a `ClusterKey`. An
 /// empty frame list produces a placeholder all-zero key and sets
 /// `fallback = true`; callers are responsible for substituting the
@@ -320,11 +358,102 @@ pub fn cluster_key_from_frames(frames: &[String]) -> ClusterKey {
     }
 }
 
-/// Cluster a C/C++ sanitizer crash by normalizing its frame list.
+/// Cluster a sanitizer crash by root cause.
+///
+/// The key hashes the rule, the crash kind and the sanitizer's check name with
+/// the normalized crash frames, so an ASan overflow and a UBSan overflow in one
+/// function, or two different UBSan checks in one function, are different
+/// root causes.
+///
+/// A UBSan report names the exact site of the failed check (`file:line:col`),
+/// so its key is that site plus the function it is in: the same site reached
+/// through different callers is one root cause, and two sites are two. A report
+/// with no informative frame keys on its reported site when it has one.
+/// `fallback` is set only when neither a frame nor a site is known.
+///
+/// Such a report gets the all-zero placeholder key here; the finding emitter
+/// and the fuzz loop key it with [`cluster_for_sanitizer_scoped`] instead.
 pub fn cluster_for_sanitizer(report: &SanitizerReport) -> ClusterKey {
+    cluster_for_sanitizer_scoped(report, "")
+}
+
+/// [`cluster_for_sanitizer`] for a crash found in `scope` (see
+/// [`crash_scope`]). A report with no informative frame and no reported
+/// source position keys on its rule, kind, check, the faulting instruction's
+/// offset in the executable when the driver printed one
+/// ([`SanitizerReport::pc_offset`]), and `scope`, so frame-less crashes of
+/// different harnesses are different root causes. That key is still a
+/// `fallback` key: it does not name a source location. With an empty scope and
+/// no pc offset it is the placeholder.
+pub fn cluster_for_sanitizer_scoped(report: &SanitizerReport, scope: &str) -> ClusterKey {
     let input: Vec<InputFrame> = report.stack.iter().map(InputFrame::from).collect();
     let frames = normalize_frames(&input);
-    cluster_key_from_frames(&frames)
+    let site = sanitizer_site(report, &frames);
+    if frames.is_empty() && site.is_none() {
+        if scope.is_empty() && report.pc_offset.is_none() {
+            return cluster_key_from_frames(&frames);
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(FRAMELESS_CLUSTER_KEY_VERSION_PREFIX.as_bytes());
+        let pc = report.fault_site().unwrap_or_default();
+        for part in [
+            report.rule_id,
+            report.kind.as_str(),
+            report.check.as_deref().unwrap_or(""),
+            pc.as_str(),
+            scope,
+        ] {
+            hasher.update(part.as_bytes());
+            hasher.update(b"\n");
+        }
+        let full = hex_lower(&hasher.finalize());
+        return ClusterKey {
+            short: full.chars().take(16).collect(),
+            full,
+            frames,
+            fallback: true,
+        };
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(SANITIZER_CLUSTER_KEY_VERSION_PREFIX.as_bytes());
+    for part in [
+        report.rule_id,
+        report.kind.as_str(),
+        report.check.as_deref().unwrap_or(""),
+        site.as_deref().unwrap_or(""),
+    ] {
+        hasher.update(part.as_bytes());
+        hasher.update(b"\n");
+    }
+    // With a site, the enclosing function disambiguates same-named files; the
+    // callers below it are not part of the root cause.
+    let keyed: &[String] = match site {
+        Some(_) => &frames[..frames.len().min(1)],
+        None => &frames,
+    };
+    for frame in keyed {
+        hasher.update(frame.as_bytes());
+        hasher.update(b"\n");
+    }
+    let full = hex_lower(&hasher.finalize());
+    ClusterKey {
+        short: full.chars().take(16).collect(),
+        full,
+        frames,
+        fallback: false,
+    }
+}
+
+/// The reported site that identifies `report`'s root cause: always for UBSan
+/// (its location is the check that failed), otherwise only when no
+/// informative frame survived normalization.
+pub fn sanitizer_site(report: &SanitizerReport, normalized_frames: &[String]) -> Option<String> {
+    let ubsan = report.sanitizer == Some(Sanitizer::UndefinedBehaviorSanitizer);
+    if ubsan || normalized_frames.is_empty() {
+        report.site()
+    } else {
+        None
+    }
 }
 
 /// True when a sanitizer crash is entirely libFuzzer / sanitizer / allocator
@@ -791,6 +920,7 @@ mod tests {
                 })
                 .collect(),
             message: "ERROR: LeakSanitizer: detected memory leaks".to_owned(),
+            ..Default::default()
         }
     }
 
@@ -920,6 +1050,7 @@ mod tests {
                 })
                 .collect(),
             message: "ERROR: AddressSanitizer: heap-buffer-overflow".to_owned(),
+            ..Default::default()
         }
     }
 
@@ -1144,5 +1275,229 @@ mod tests {
     fn cluster_from_finding_json_returns_none_when_nothing_usable() {
         let raw = serde_json::json!({ "id": "F-0001", "signature": "deadbeef" });
         assert!(cluster_from_finding_json(&raw).is_none());
+    }
+
+    fn located(function: &str, file: &str, line: u32) -> InputFrame {
+        InputFrame {
+            function: function.to_owned(),
+            file: Some(file.to_owned()),
+            line: Some(line),
+        }
+    }
+
+    /// A fault inside a libc string routine reached through a sanitizer
+    /// interceptor: the key must start at the first project frame, not at the
+    /// runtime frames every such crash shares.
+    #[test]
+    fn libc_and_sanitizer_interceptor_frames_are_cluster_noise() {
+        let frames = vec![
+            located(
+                "__memcmp_avx2_movbe",
+                "string/../sysdeps/x86_64/multiarch/memcmp-avx2-movbe.S",
+                84,
+            ),
+            fr("MemcmpInterceptorCommon(void*, int (*)(void const*, void const*, unsigned long), void const*, void const*, unsigned long)"),
+            located(
+                "bcmp",
+                "/llvm/compiler-rt/lib/sanitizer_common/sanitizer_common_interceptors.inc",
+                860,
+            ),
+            located("Widget::parse_record(unsigned char const*)", "/src/widget/parser.cc", 11),
+            fr("Widget::load()"),
+        ];
+        assert_eq!(
+            normalize_frames(&frames),
+            vec!["Widget::parse_record".to_owned(), "Widget::load".to_owned()]
+        );
+    }
+
+    /// An `assert()` abort unwinds through glibc's signal, abort and assert
+    /// sources before the failing check; none of them names the root cause.
+    #[test]
+    fn glibc_abort_and_assert_frames_are_cluster_noise() {
+        let frames = vec![
+            located("__pthread_kill_implementation", "nptl/pthread_kill.c", 44),
+            located("raise", "signal/../sysdeps/posix/raise.c", 26),
+            located("abort", "stdlib/abort.c", 79),
+            located("__assert_fail_base", "assert/assert.c", 96),
+            located("__assert_fail", "assert/assert.c", 105),
+            located("check_record", "/src/widget/check.c", 3),
+            located("parse_record", "/src/widget/check.c", 9),
+        ];
+        assert_eq!(
+            normalize_frames(&frames),
+            vec!["check_record".to_owned(), "parse_record".to_owned()]
+        );
+    }
+
+    /// A project whose relative source paths start with a directory named like
+    /// a glibc component (`./io/scaled_reader.cpp`) keeps those frames in its key;
+    /// glibc's own frames under such dirs are still noise.
+    #[test]
+    fn project_frames_in_dirs_named_like_glibc_components_are_kept() {
+        let frames = vec![
+            located("read_scaled(int)", "./io/scaled_reader.cpp", 4),
+            located("Widget::load()", "./misc/widget.cpp", 9),
+            located(
+                "__libc_start_call_main",
+                "../sysdeps/nptl/libc_start_call_main.h",
+                58,
+            ),
+            located("__libc_start_main", "csu/../csu/libc-start.c", 360),
+        ];
+        assert_eq!(
+            normalize_frames(&frames),
+            vec!["read_scaled".to_owned(), "Widget::load".to_owned()]
+        );
+    }
+
+    #[test]
+    fn interceptor_crashes_from_different_callers_do_not_share_a_cluster() {
+        let report = |caller: &str| {
+            crate::sanitizer::parse_sanitizer_report(&format!(
+                "==1==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x502000000012\n\
+                 READ of size 8 at 0x502000000012 thread T0\n    \
+                 #0 0x1 in MemcmpInterceptorCommon(void*, int (*)(void const*, void const*, unsigned long), void const*, void const*, unsigned long) (/bin/h+0x48a9b)\n    \
+                 #1 0x2 in bcmp (/bin/h+0x48f70)\n    \
+                 #2 0x3 in {caller} /src/widget/{caller}.c:19:65\n"
+            ))
+            .unwrap()
+        };
+        let a = cluster_for_sanitizer(&report("check_magic"));
+        let b = cluster_for_sanitizer(&report("compare_names"));
+        assert_eq!(a.frames, vec!["check_magic".to_owned()]);
+        assert_ne!(a.full, b.full);
+    }
+
+    fn ubsan(text: &str) -> SanitizerReport {
+        crate::sanitizer::parse_sanitizer_report(text).expect("a UBSan report")
+    }
+
+    fn missing_return_at(line: u32) -> SanitizerReport {
+        ubsan(&format!(
+            "/src/widget/classify.c:{line}:5: runtime error: execution reached the end of a value-returning function without returning a value\n\
+             SUMMARY: UndefinedBehaviorSanitizer: missing-return /src/widget/classify.c:{line}:5 \n"
+        ))
+    }
+
+    #[test]
+    fn frameless_ubsan_reports_at_different_sites_get_distinct_cluster_keys() {
+        let a = cluster_for_sanitizer(&missing_return_at(3));
+        let b = cluster_for_sanitizer(&missing_return_at(9));
+        assert!(!a.fallback && !b.fallback, "the site is an identity");
+        assert_ne!(a.full, b.full);
+        assert_eq!(a, cluster_for_sanitizer(&missing_return_at(3)));
+    }
+
+    #[test]
+    fn distinct_checks_in_one_function_get_distinct_cluster_keys() {
+        let shift = ubsan(
+            "/src/widget/two.c:5:15: runtime error: shift exponent 40 is too large for 32-bit type 'int'\n    \
+             #0 0x1 in two_sites /src/widget/two.c:5:15\n    \
+             #1 0x2 in bhf_run_one /work/harnesses/H-1/main.c:9:3\n\n\
+             SUMMARY: UndefinedBehaviorSanitizer: invalid-shift-exponent /src/widget/two.c:5:15 \n",
+        );
+        let missing_return = ubsan(
+            "/src/widget/two.c:3:5: runtime error: execution reached the end of a value-returning function without returning a value\n    \
+             #0 0x1 in two_sites /src/widget/two.c:7:1\n    \
+             #1 0x2 in bhf_run_one /work/harnesses/H-1/main.c:9:3\n\n\
+             SUMMARY: UndefinedBehaviorSanitizer: missing-return /src/widget/two.c:3:5 \n",
+        );
+        let a = cluster_for_sanitizer(&shift);
+        let b = cluster_for_sanitizer(&missing_return);
+        assert_eq!(a.frames, b.frames, "same function");
+        assert_ne!(
+            a.full, b.full,
+            "different UB sites are different root causes"
+        );
+    }
+
+    #[test]
+    fn one_ubsan_site_reached_from_different_callers_shares_a_cluster() {
+        let via = |caller: &str| {
+            ubsan(&format!(
+                "/src/widget/classify.c:3:5: runtime error: execution reached the end of a value-returning function without returning a value\n    \
+                 #0 0x1 in classify /src/widget/classify.c:8:16\n    \
+                 #1 0x2 in {caller} /src/widget/callers.c:4:3\n\n\
+                 SUMMARY: UndefinedBehaviorSanitizer: missing-return /src/widget/classify.c:3:5 \n"
+            ))
+        };
+        assert_eq!(
+            cluster_for_sanitizer(&via("classify_pair")).full,
+            cluster_for_sanitizer(&via("classify_with_bias")).full
+        );
+    }
+
+    #[test]
+    fn asan_and_ubsan_reports_in_one_function_do_not_share_a_cluster() {
+        let asan = sample_sanitizer_report(vec!["scale_value"]);
+        let ubsan = ubsan(
+            "/src/widget/scale.c:16:12: runtime error: signed integer overflow: 2147483647 * 2 cannot be represented in type 'int'\n    \
+             #0 0x1 in scale_value /src/widget/scale.c:16:12\n",
+        );
+        assert_ne!(
+            cluster_for_sanitizer(&asan).full,
+            cluster_for_sanitizer(&ubsan).full
+        );
+    }
+
+    /// A fatal signal with no sanitizer report: no frames, no source position.
+    fn frameless_signal(pc_offset: Option<u64>) -> SanitizerReport {
+        SanitizerReport {
+            sanitizer: None,
+            kind: "fatal-signal".to_owned(),
+            rule_id: "BHF-210",
+            message: "harness crashed with SIGSEGV and no sanitizer report".to_owned(),
+            pc_offset,
+            ..Default::default()
+        }
+    }
+
+    /// Frame-less crashes of two harnesses are two root causes; the same
+    /// harness keeps one key for them. The key is still a fallback key.
+    #[test]
+    fn frameless_crashes_of_different_harnesses_are_different_root_causes() {
+        let report = frameless_signal(None);
+        let parse = cluster_for_sanitizer_scoped(&report, "H-PARSE|parse_record");
+        let copy = cluster_for_sanitizer_scoped(&report, "H-COPY|copy_at");
+        assert_ne!(parse.full, copy.full);
+        assert_eq!(
+            parse,
+            cluster_for_sanitizer_scoped(&report, "H-PARSE|parse_record")
+        );
+        assert!(parse.fallback && copy.fallback);
+        assert!(!parse.is_placeholder() && !copy.is_placeholder());
+        assert_eq!(parse.full.len(), 64);
+        // Without a scope the key stays the placeholder the emitter replaces
+        // with the signature.
+        assert!(cluster_for_sanitizer(&report).is_placeholder());
+    }
+
+    /// The faulting instruction's offset separates two crash sites of one
+    /// harness.
+    #[test]
+    fn frameless_crashes_at_different_pcs_of_one_harness_are_different_root_causes() {
+        let scope = "H-PARSE|parse_record";
+        let a = cluster_for_sanitizer_scoped(&frameless_signal(Some(0x1b3c)), scope);
+        let b = cluster_for_sanitizer_scoped(&frameless_signal(Some(0x2a10)), scope);
+        assert_ne!(a.full, b.full);
+        assert_eq!(
+            a,
+            cluster_for_sanitizer_scoped(&frameless_signal(Some(0x1b3c)), scope)
+        );
+        assert_ne!(
+            a.full,
+            cluster_for_sanitizer_scoped(&frameless_signal(None), scope).full
+        );
+    }
+
+    /// A report with frames keys on them whatever the scope.
+    #[test]
+    fn a_scope_does_not_change_the_key_of_a_report_with_frames() {
+        let report = sample_sanitizer_report(vec!["real_parse"]);
+        assert_eq!(
+            cluster_for_sanitizer_scoped(&report, "H-A"),
+            cluster_for_sanitizer(&report)
+        );
     }
 }

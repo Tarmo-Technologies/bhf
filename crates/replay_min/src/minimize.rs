@@ -205,7 +205,15 @@ pub fn load_decoded_typed_spans(finding_dir: &Path) -> Result<Vec<TypedSpan>, Mi
         return Ok(Vec::new());
     }
 
-    let decoded: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+    let bytes = std::fs::read(&path).map_err(|source| crate::ReplayError::IoAt {
+        path: path.clone(),
+        source,
+    })?;
+    let decoded: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|source| crate::ReplayError::JsonAt {
+            path: path.clone(),
+            source,
+        })?;
     let Some(spans) = decoded.get("typed_spans") else {
         return Ok(Vec::new());
     };

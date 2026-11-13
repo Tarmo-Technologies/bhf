@@ -14,6 +14,12 @@ pub struct ProjectSpec {
     /// configuration pragmas, imports, and target-specific build packages.
     #[serde(default)]
     pub extends_project: Option<PathBuf>,
+    /// The `package Compiler` of `extends_project`, when it declares one: the
+    /// generated project then extends that package and appends bhf's switches
+    /// to the parent's `Default_Switches ("Ada")` instead of replacing them
+    /// (see [`crate::writer::parent_compiler_package`]).
+    #[serde(default)]
+    pub parent_compiler: Option<ParentCompiler>,
     pub source_roots: Vec<SourceRoot>,
     pub object_dir: PathBuf,
     /// Where the linked executable lands, when it must NOT sit beside the objects.
@@ -28,6 +34,9 @@ pub struct ProjectSpec {
     pub ada_standard: AdaStandard,
     pub target: Option<String>,
     pub runtime: Option<String>,
+    /// A gprconfig compiler name (`GNAT`), written as `Toolchain_Name`, or a
+    /// tool prefix (`aarch64-linux-gnu`), which supplies `Target` when
+    /// `target` is unset (see [`crate::gpr_toolchain_name`]).
     pub toolchain: Option<String>,
     pub switches: Switches,
     pub with_clauses: Vec<PathBuf>,
@@ -64,6 +73,17 @@ impl ProjectSpec {
             })
         }
     }
+}
+
+/// A governing project's own `package Compiler`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParentCompiler {
+    /// The project's name (`Board`, `Board.Core`), by which GPR references
+    /// its packages.
+    pub project_name: String,
+    /// The literal switches of its `Default_Switches ("Ada")`, for a note.
+    #[serde(default)]
+    pub ada_switches: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

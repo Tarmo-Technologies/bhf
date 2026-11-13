@@ -291,6 +291,10 @@ fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<(), ReportE
 /// human-facing CSV/Markdown reports (SARIF has its own `SRCROOT` handling).
 /// String-replace of the canonical root prefix, so `/abs/root/src/x.c` ->
 /// `src/x.c`; paths outside the root, or when no root is known, are unchanged.
+///
+/// On Windows the root is matched without the `\\?\` prefix `canonicalize`
+/// adds, and in both separator spellings: a harness built from a generated
+/// Makefile names its sources `C:/src/x.c`, a native build `C:\src\x.c`.
 fn relativize_to_source_root(path: &str, source_root: Option<&str>) -> String {
     if path.is_empty() {
         return String::new();
@@ -299,14 +303,23 @@ fn relativize_to_source_root(path: &str, source_root: Option<&str>) -> String {
         return path.to_owned();
     };
     let root = std::fs::canonicalize(root).unwrap_or_else(|_| PathBuf::from(root));
-    let mut needle = root.to_string_lossy().into_owned();
+    let root = root.to_string_lossy();
+    let mut needle = match root.strip_prefix(r"\\?\") {
+        Some(disk) if disk.as_bytes().get(1) == Some(&b':') => disk.to_owned(),
+        _ => root.into_owned(),
+    };
     if needle.is_empty() {
         return path.to_owned();
     }
     if !needle.ends_with(std::path::MAIN_SEPARATOR) {
         needle.push(std::path::MAIN_SEPARATOR);
     }
-    path.replace(&needle, "")
+    let relative = path.replace(&needle, "");
+    if needle.contains('\\') {
+        relative.replace(&needle.replace('\\', "/"), "")
+    } else {
+        relative
+    }
 }
 
 pub fn render_csv_report(document: &ReportDocument) -> String {
@@ -1550,12 +1563,13 @@ pub fn render_sarif_report(document: &ReportDocument) -> Value {
             .collect();
     // Only enable the SRCROOT relativisation when we recovered an *absolute*
     // source root: a relative root cannot produce a valid `file://` base URI.
+    // Absolute as recorded, whichever host recorded it.
     let root: Option<PathBuf> = document
         .run
         .source_root
         .as_deref()
-        .map(PathBuf::from)
-        .filter(|root| root.is_absolute());
+        .filter(|root| is_recorded_absolute(root))
+        .map(PathBuf::from);
     let mut run = json!({
         "tool": {
             "driver": {
@@ -1607,35 +1621,72 @@ fn original_uri_base_ids(root: &Path) -> Value {
 /// already-relative paths are left as-is. Never panics on a non-relativisable
 /// path.
 fn sarif_artifact_location(path: &str, root: Option<&Path>) -> Value {
-    let candidate = Path::new(path);
     match root {
-        Some(root) if candidate.is_absolute() => {
-            if let Ok(relative) = candidate.strip_prefix(root) {
-                let relative = relative.to_string_lossy().replace('\\', "/");
-                let relative = relative.trim_start_matches('/');
-                let uri = if relative.is_empty() {
-                    ".".to_owned()
-                } else {
-                    relative.to_owned()
-                };
-                json!({ "uri": uri, "uriBaseId": "SRCROOT" })
-            } else {
-                json!({ "uri": file_uri(path) })
+        Some(root) if is_recorded_absolute(path) => {
+            match relative_to_recorded_root(path, &root.to_string_lossy()) {
+                Some(relative) => json!({ "uri": relative, "uriBaseId": "SRCROOT" }),
+                None => json!({ "uri": file_uri(path) }),
             }
         }
         _ => json!({ "uri": path }),
     }
 }
 
-/// Render an absolute filesystem path as a `file://` URI. Paths that already
-/// carry a scheme (or are not absolute) are returned unchanged.
+/// Whether `path` is absolute on the host that recorded it: a POSIX `/...`
+/// path, or a Windows drive (`C:\...`, `C:/...`) or UNC (`\\server\...`)
+/// path. Read as text, so a report renders the same on any host.
+fn is_recorded_absolute(path: &str) -> bool {
+    path.starts_with('/')
+        || path.starts_with("\\\\")
+        || matches!(path.as_bytes(), [drive, b':', b'/' | b'\\', ..] if drive.is_ascii_alphabetic())
+}
+
+/// `path` relative to `root`, both as recorded, with `/` separators (`.` for
+/// the root itself); `None` when `path` is not under `root`. Windows' `\\?\`
+/// prefix and either separator spelling are accepted.
+fn relative_to_recorded_root(path: &str, root: &str) -> Option<String> {
+    let recorded = |text: &str| {
+        let text = text.strip_prefix(r"\\?\").unwrap_or(text);
+        text.replace('\\', "/")
+    };
+    let path = recorded(path);
+    let root = recorded(root);
+    let root = root.trim_end_matches('/');
+    let rest = path.strip_prefix(root)?;
+    if rest.is_empty() {
+        return Some(".".to_owned());
+    }
+    let rest = rest.strip_prefix('/')?.trim_start_matches('/');
+    Some(if rest.is_empty() {
+        ".".to_owned()
+    } else {
+        rest.to_owned()
+    })
+}
+
+/// Render an absolute filesystem path as a `file://` URI (RFC 8089):
+/// `/abs` is `file:///abs`, a Windows drive path `C:\dir` is
+/// `file:///C:/dir` and a UNC path `\\server\share` is
+/// `file://server/share`, without the `\\?\` verbatim prefix. Paths that
+/// already carry a scheme, or are not absolute, are returned unchanged.
 fn file_uri(path: &str) -> String {
     if path.contains("://") {
-        path.to_owned()
-    } else if let Some(rest) = path.strip_prefix('/') {
-        format!("file:///{rest}")
-    } else {
-        path.to_owned()
+        return path.to_owned();
+    }
+    if let Some(rest) = path.strip_prefix('/') {
+        return format!("file:///{rest}");
+    }
+    let windows = match path.strip_prefix(r"\\?\UNC\") {
+        Some(share) => format!(r"\\{share}"),
+        None => path.strip_prefix(r"\\?\").unwrap_or(path).to_owned(),
+    }
+    .replace('\\', "/");
+    if let Some(share) = windows.strip_prefix("//") {
+        return format!("file://{share}");
+    }
+    match windows.as_bytes() {
+        [drive, b':', b'/', ..] if drive.is_ascii_alphabetic() => format!("file:///{windows}"),
+        _ => path.to_owned(),
     }
 }
 
@@ -2219,7 +2270,7 @@ fn ensure_repro_py(
         string_at(raw, &["paths", "testcase"]).unwrap_or_else(|| "testcase.bin".to_owned());
     let fixture_path = string_at(raw, &["fixture_path"]).unwrap_or_default();
     let harness_id = string_at(raw, &["harness_id"]).unwrap_or_default();
-    let asan_options = asan_options_for(raw);
+    let (asan_defaults, asan_required) = asan_options_for(raw);
     let extra_env = raw
         .pointer("/runtime_mode/env_injected")
         .and_then(Value::as_object)
@@ -2234,15 +2285,21 @@ fn ensure_repro_py(
         header_lines.push(format!("Sink: {}", sink_header_line(sink)));
     }
 
-    let script = render_repro_py(
-        &testcase_name,
-        &fixture_path,
-        &harness_id,
-        &asan_options,
-        "print_stacktrace=1",
-        &extra_env,
-        &header_lines,
-    );
+    let runner = recorded_runner_argv(finding_dir, &fixture_path, &harness_id);
+    let script = render_repro_py(&ReproScript {
+        testcase_name: &testcase_name,
+        fixture_path: &fixture_path,
+        harness_id: &harness_id,
+        runner: &runner,
+        asan_defaults,
+        asan_required,
+        // The same UBSan report shape a fuzz child produces: it halts on the
+        // first report, with its stack and the failed check's name on the
+        // SUMMARY line.
+        ubsan_required: UBSAN_REQUIRED_OPTIONS,
+        extra_env: &extra_env,
+        header_lines: &header_lines,
+    });
     let path = finding_dir.join("replay.py");
     write_regular_no_follow(&path, script.as_bytes(), Some(0o755))
 }
@@ -2388,11 +2445,60 @@ fn open_no_follow(path: &Path, options: &mut fs::OpenOptions) -> io::Result<fs::
     }
 }
 
-/// The default `ASAN_OPTIONS` for a finding's reproducer. Leak findings (LSan)
-/// MUST keep leak detection on to reproduce, so they get `detect_leaks=1`; every
-/// other class disables leak detection so libFuzzer's own exit-time leak noise
-/// doesn't mask the real crash being replayed.
-fn asan_options_for(raw: &Value) -> String {
+/// The file a cross build writes beside a harness naming the emulator it runs
+/// under, and its schema.
+const RUNNER_FILE: &str = "bhf_runner.json";
+const RUNNER_SCHEMA: &str = "bhf.harness_runner.v1";
+
+/// The emulator command (`[program, args...]`) recorded beside the finding's
+/// harness: the dir of its `fixture_path` in the work dir holding the finding,
+/// then `<work>/{build,harnesses,auto,generated_harnesses}/<harness_id>/`.
+/// Empty for a harness that runs natively.
+fn recorded_runner_argv(finding_dir: &Path, fixture_path: &str, harness_id: &str) -> Vec<String> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if !fixture_path.is_empty() {
+        dirs.extend(
+            corpus::finding::fixture_path_candidates(finding_dir, fixture_path)
+                .into_iter()
+                .filter_map(|candidate| candidate.parent().map(Path::to_path_buf)),
+        );
+    }
+    if let (Some(work), false) = (
+        corpus::layout::work_dir_for_finding(finding_dir),
+        harness_id.is_empty(),
+    ) {
+        for root in ["build", "harnesses", "auto", "generated_harnesses"] {
+            dirs.push(work.join(root).join(harness_id));
+        }
+    }
+    dirs.iter()
+        .find_map(|dir| {
+            let record: Value =
+                serde_json::from_slice(&std::fs::read(dir.join(RUNNER_FILE)).ok()?).ok()?;
+            if record.get("schema").and_then(Value::as_str) != Some(RUNNER_SCHEMA) {
+                return None;
+            }
+            let program = record.get("program").and_then(Value::as_str)?.to_owned();
+            let args = record
+                .get("args")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|arg| arg.as_str().map(str::to_owned));
+            Some(std::iter::once(program).chain(args).collect())
+        })
+        .unwrap_or_default()
+}
+
+/// The `UBSAN_OPTIONS` keys the reproducer always sets, after the
+/// operator's: the fuzz child's report shape, halting on the first report.
+const UBSAN_REQUIRED_OPTIONS: &str = "print_stacktrace=1:report_error_type=1:halt_on_error=1";
+
+/// The reproducer's `ASAN_OPTIONS` for `raw`: the defaults the operator's own
+/// value may override (leak detection off for a finding that is not a leak),
+/// and the keys bhf always sets after it, so they win (a report halts the
+/// run, and a leak finding keeps leak detection on).
+fn asan_options_for(raw: &Value) -> (&'static str, &'static str) {
     let sanitizer = string_at(raw, &["exception", "sanitizer"])
         .unwrap_or_default()
         .to_ascii_lowercase();
@@ -2401,9 +2507,9 @@ fn asan_options_for(raw: &Value) -> String {
         .to_ascii_lowercase();
     let is_leak = sanitizer == "lsan" || message.contains("leak");
     if is_leak {
-        "detect_leaks=1:abort_on_error=1".to_owned()
+        ("", "abort_on_error=1:halt_on_error=1:detect_leaks=1")
     } else {
-        "detect_leaks=0:abort_on_error=1".to_owned()
+        ("detect_leaks=0", "abort_on_error=1:halt_on_error=1")
     }
 }
 
@@ -2416,21 +2522,63 @@ fn sink_header_line(sink: &actionability::Sink) -> String {
     }
 }
 
+/// What [`render_repro_py`] embeds in a finding's `replay.py`.
+#[derive(Debug)]
+struct ReproScript<'a> {
+    testcase_name: &'a str,
+    fixture_path: &'a str,
+    harness_id: &'a str,
+    /// The emulator the harness runs under (`[program, args...]`), empty for
+    /// a native harness.
+    runner: &'a [String],
+    /// `ASAN_OPTIONS` keys set only when the operator's value has none.
+    asan_defaults: &'a str,
+    /// `ASAN_OPTIONS` keys set after the operator's value, so they win.
+    asan_required: &'a str,
+    /// `UBSAN_OPTIONS` keys set after the operator's value, so they win.
+    ubsan_required: &'a str,
+    extra_env: &'a serde_json::Map<String, Value>,
+    header_lines: &'a [String],
+}
+
+impl Default for ReproScript<'_> {
+    fn default() -> Self {
+        static NO_ENV: std::sync::OnceLock<serde_json::Map<String, Value>> =
+            std::sync::OnceLock::new();
+        Self {
+            testcase_name: "testcase.bin",
+            fixture_path: "",
+            harness_id: "",
+            runner: &[],
+            asan_defaults: "",
+            asan_required: "",
+            ubsan_required: "",
+            extra_env: NO_ENV.get_or_init(serde_json::Map::new),
+            header_lines: &[],
+        }
+    }
+}
+
 /// Render a standalone `replay.py`. The script auto-discovers the harness (from
-/// the sibling `finding.json`'s `fixture_path` / `harness_id`, or argv[1]), sets
-/// the sanitizer env unless already set, runs the harness on the recorded
-/// testcase (argv-file for libFuzzer/driver harnesses, stdin for AFL), and prints
-/// the output + exit status. Embedded string values are JSON-encoded, which is a
-/// valid Python string/dict literal, so paths/symbols with quotes are safe.
-fn render_repro_py(
-    testcase_name: &str,
-    fixture_path: &str,
-    harness_id: &str,
-    asan_options: &str,
-    ubsan_options: &str,
-    extra_env: &serde_json::Map<String, Value>,
-    header_lines: &[String],
-) -> String {
+/// the sibling `finding.json`'s `fixture_path` / `harness_id`, or argv[1]),
+/// merges bhf's sanitizer keys into the inherited `ASAN_OPTIONS` /
+/// `UBSAN_OPTIONS` (bhf's required keys win), runs the harness on the recorded
+/// testcase (argv-file for libFuzzer/driver harnesses, stdin for AFL), prints
+/// the output and exits with the harness's status (128 + the signal for a
+/// signal). Embedded string values are JSON-encoded, which is a valid Python
+/// string/dict literal, so paths/symbols with quotes are safe.
+fn render_repro_py(spec: &ReproScript<'_>) -> String {
+    let ReproScript {
+        testcase_name,
+        fixture_path,
+        harness_id,
+        runner,
+        asan_defaults,
+        asan_required,
+        ubsan_required,
+        extra_env,
+        header_lines,
+    } = *spec;
     let py_str = |s: &str| serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_owned());
     let extra_env_py = serde_json::to_string(&Value::Object(extra_env.clone()))
         .unwrap_or_else(|_| "{}".to_owned());
@@ -2453,12 +2601,24 @@ __HEADER__
 # Usage:
 #   python3 replay.py [HARNESS]
 #
-# With no argument the harness is auto-discovered from the sibling finding.json
-# (fixture_path / harness_id + <work>/auto/<harness_id>/main). Pass a path to
+# With no argument the harness is auto-discovered from the sibling finding.json:
+# its fixture_path, resolved in the work dir holding this finding first (so a
+# copied work dir runs its own harness), then harness_id under
+# <work>/{harnesses,auto,generated_harnesses,build}/<harness_id>/. Pass a path to
 # override. The harness runs on the recorded testcase with the sanitizer env and
-# its output + exit status are printed.
+# its output + exit status are printed. bhf's sanitizer keys are added after any
+# ASAN_OPTIONS / UBSAN_OPTIONS you set, so a report still halts the run. The
+# script exits with the harness's exit status (128 + the signal for a signal).
+#
+# A harness built for another target runs under the emulator recorded beside it
+# (bhf_runner.json, embedded below as RUNNER). Set BHF_REPLAY_RUNNER to the
+# command to run it under instead (for example
+# "qemu-aarch64 -L /usr/aarch64-linux-gnu"), or to "" to run it directly. Under
+# a runner the sanitizers get abort_on_error=0 and core dumps are off, so a
+# report exits non-zero instead of making the emulator dump its own memory.
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -2467,9 +2627,56 @@ HERE = Path(__file__).resolve().parent
 TESTCASE = HERE / __TESTCASE__
 FIXTURE_PATH = __FIXTURE__
 HARNESS_ID = __HARNESS_ID__
-ASAN_OPTIONS_DEFAULT = __ASAN__
-UBSAN_OPTIONS_DEFAULT = __UBSAN__
+ASAN_OPTIONS_DEFAULT = __ASAN_DEFAULT__
+ASAN_OPTIONS_REQUIRED = __ASAN__
+UBSAN_OPTIONS_DEFAULT = ""
+UBSAN_OPTIONS_REQUIRED = __UBSAN__
 EXTRA_ENV = __EXTRA_ENV__
+RUNNER = __RUNNER__
+RUNNER_FILE = "bhf_runner.json"
+
+
+def parse_options(text):
+    # Sanitizer options are colon-separated key=value pairs.
+    options = {}
+    for item in (text or "").split(":"):
+        key, sep, value = item.partition("=")
+        if key.strip() and sep:
+            options[key.strip()] = value
+    return options
+
+
+def merged_options(inherited, defaults, required):
+    # bhf's defaults, then the inherited value, then bhf's required keys: the
+    # operator's value overrides a default, never a required key.
+    options = parse_options(defaults)
+    for source in (inherited, required):
+        for key, value in parse_options(source).items():
+            options.pop(key, None)
+            options[key] = value
+    return ":".join("%s=%s" % item for item in options.items())
+
+
+# Under an emulator (qemu-user) a guest abort makes the emulator dump its own
+# address space, which takes minutes. A harness run under a runner gets
+# abort_on_error=0 after bhf's required keys (a sanitizer report still exits
+# non-zero) and runs with core dumps off.
+EMULATED_OPTIONS = "abort_on_error=0"
+
+
+def required_options(required, emulated):
+    return merged_options(required, "", EMULATED_OPTIONS) if emulated else required
+
+
+def no_core_dumps():
+    import resource
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
+
+def exit_code(returncode):
+    # subprocess reports a signal as a negative return code; a shell reports
+    # it as 128 + the signal.
+    return 128 - returncode if returncode < 0 else returncode
 
 
 def load_finding():
@@ -2479,35 +2686,165 @@ def load_finding():
         return {}
 
 
+HARNESS_ROOTS = ("build", "harnesses", "auto", "generated_harnesses")
+
+
+def in_work_dir():
+    return HERE.parent.name == "findings"
+
+
+def work_dir():
+    # Mirrors corpus::layout::work_dir_for_finding: the results layout is
+    # <work>/results/findings/<id>, the legacy one <work>/findings/<id>.
+    if HERE.parent.name == "findings" and HERE.parent.parent.name == "results":
+        return HERE.parent.parent.parent
+    if HERE.parent.name == "findings":
+        return HERE.parent.parent
+    return HERE.parent
+
+
+def harness_tail(path):
+    parts = path.parts
+    for index in range(len(parts) - 3, -1, -1):
+        if parts[index] in HARNESS_ROOTS:
+            return Path(*parts[index:])
+    return None
+
+
+def is_within(path, work):
+    try:
+        path.relative_to(work)
+        return True
+    except ValueError:
+        return False
+
+
+def fixture_candidates(fixture, work):
+    # Mirrors corpus::finding::fixture_path_candidates: a relative fixture_path
+    # is relative to the work dir (never to the current directory); an
+    # absolute one recorded in another (the original of a copied) work dir is
+    # mapped into this one by its <root>/<id>/... tail, and the path as given
+    # is left to fixture_fallback.
+    path = Path(fixture)
+    if not in_work_dir():
+        yield path
+        return
+    tail = harness_tail(path)
+    if not path.is_absolute():
+        yield work / path
+        if tail is not None:
+            yield work / tail
+    elif is_within(path, work) or tail is None:
+        yield path
+    else:
+        yield work / tail
+
+
+def fixture_fallback(fixture, work):
+    # Mirrors corpus::finding::fixture_path_fallback: another work dir's
+    # harness, tried only after this work dir's harness dirs.
+    path = Path(fixture)
+    if (in_work_dir() and path.is_absolute() and not is_within(path, work)
+            and harness_tail(path) is not None):
+        yield path
+
+
 def candidate_harnesses(finding):
     # 1) explicit override on the command line
     if len(sys.argv) > 1:
         yield Path(sys.argv[1])
         return
+    work = work_dir()
+    fixtures = [f for f in (finding.get("fixture_path"), FIXTURE_PATH) if f]
     # 2) fixture_path recorded in finding.json, then the embedded fallback
-    for fixture in (finding.get("fixture_path"), FIXTURE_PATH):
-        if fixture:
-            yield Path(fixture)
-    # 3) <work>/{harnesses,auto,generated_harnesses}/<harness_id>/<leaf>. Derive
-    #    the work dir name-awarely (mirrors corpus::layout::work_dir_for_finding):
-    #    results layout is <work>/results/findings/<id>, legacy is <work>/findings/<id>.
-    #    Search the work dir first, then the finding's parent as a flat-layout
-    #    fallback; never probe above the work dir.
+    for fixture in fixtures:
+        yield from fixture_candidates(fixture, work)
+    # 3) <work>/<root>/<harness_id>/<leaf>. Search the work dir first, then the
+    #    finding's parent as a flat-layout fallback; never probe above the work
+    #    dir.
     hid = finding.get("harness_id") or HARNESS_ID
     if hid:
-        if HERE.parent.name == "findings" and HERE.parent.parent.name == "results":
-            work = HERE.parent.parent.parent
-        elif HERE.parent.name == "findings":
-            work = HERE.parent.parent
-        else:
-            work = HERE.parent
         roots = [work]
         if HERE.parent != work:
             roots.append(HERE.parent)
         for root in roots:
-            for sub in ("harnesses", "auto", "generated_harnesses"):
+            for sub in ("harnesses", "auto", "generated_harnesses", "build"):
                 for leaf in ("main", "main_afl", "main.exe", "main_afl.exe"):
                     yield root / sub / hid / leaf
+    # 4) a fixture_path into another work dir, as recorded
+    for fixture in fixtures:
+        yield from fixture_fallback(fixture, work)
+
+
+# Sidecar a Windows harness build writes beside the binary: the directories of
+# the sanitizer runtime DLLs it was linked against (clang_rt.asan_dynamic-*.dll),
+# one per line. A Windows loader finds a DLL only through PATH (or the binary's
+# own directory), so a sanitized harness started from a plain shell fails with
+# STATUS_DLL_NOT_FOUND unless they are put on PATH first.
+RUNTIME_PATH_FILE = "bhf-runtime-path.txt"
+
+
+def runtime_path_dirs(harness):
+    dirs = []
+    sidecar = Path(harness).parent / RUNTIME_PATH_FILE
+    try:
+        lines = sidecar.read_text().splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        line = line.strip()
+        if line and Path(line).is_dir() and line not in dirs:
+            dirs.append(line)
+    if not dirs:
+        # No sidecar (a harness built before it existed): ask clang where its
+        # runtime lives.
+        try:
+            resource = subprocess.run(
+                ["clang", "-print-resource-dir"], stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, timeout=60,
+            ).stdout.decode("utf-8", "replace").strip()
+        except (OSError, subprocess.SubprocessError):
+            resource = ""
+        candidate = Path(resource) / "lib" / "windows" if resource else None
+        if candidate is not None and candidate.is_dir():
+            dirs.append(str(candidate))
+    return dirs
+
+
+def with_runtime_path(env, harness, windows=None):
+    windows = (os.name == "nt") if windows is None else windows
+    if not windows:
+        return env
+    dirs = runtime_path_dirs(harness)
+    if dirs:
+        current = env.get("PATH", "")
+        env["PATH"] = os.pathsep.join(dirs + ([current] if current else []))
+    return env
+
+
+def recorded_runner(harness):
+    try:
+        record = json.loads((Path(harness).parent / RUNNER_FILE).read_text())
+    except (OSError, ValueError):
+        return None
+    if record.get("schema") != "bhf.harness_runner.v1" or not record.get("program"):
+        return None
+    return [str(record["program"])] + [str(arg) for arg in record.get("args", [])]
+
+
+def runner_for(harness):
+    # BHF_REPLAY_RUNNER wins; then the emulator recorded beside the harness that
+    # runs; then the one recorded for the finding's harness when this script was
+    # written (not for a harness passed on the command line).
+    override = os.environ.get("BHF_REPLAY_RUNNER")
+    if override is not None:
+        return shlex.split(override)
+    recorded = recorded_runner(harness)
+    if recorded is not None:
+        return recorded
+    if len(sys.argv) > 1:
+        return []
+    return list(RUNNER)
 
 
 def resolve_harness(finding):
@@ -2527,39 +2864,56 @@ def main():
     finding = load_finding()
     harness = resolve_harness(finding)
 
+    runner = runner_for(harness)
+    emulated = bool(runner)
     env = dict(os.environ)
-    env.setdefault("ASAN_OPTIONS", ASAN_OPTIONS_DEFAULT)
-    env.setdefault("UBSAN_OPTIONS", UBSAN_OPTIONS_DEFAULT)
+    env["ASAN_OPTIONS"] = merged_options(
+        env.get("ASAN_OPTIONS"), ASAN_OPTIONS_DEFAULT,
+        required_options(ASAN_OPTIONS_REQUIRED, emulated),
+    )
+    env["UBSAN_OPTIONS"] = merged_options(
+        env.get("UBSAN_OPTIONS"), UBSAN_OPTIONS_DEFAULT,
+        required_options(UBSAN_OPTIONS_REQUIRED, emulated),
+    )
     for key, value in EXTRA_ENV.items():
         env.setdefault(key, value)
+    env = with_runtime_path(env, harness)
+    preexec = no_core_dumps if emulated and os.name == "posix" else None
 
+    command = runner + [str(harness)]
     # AFL persistent-mode harnesses read the testcase from stdin; libFuzzer /
     # bhf driver harnesses take it as argv[1]. Detect from the harness name,
     # else default to argv[1] (the bhf convention).
     if harness.name.startswith("main_afl"):
         data = TESTCASE.read_bytes() if TESTCASE.is_file() else b""
-        print("running (AFL/stdin): %s < %s" % (harness, TESTCASE))
+        print("running (AFL/stdin): %s < %s" % (" ".join(command), TESTCASE))
         proc = subprocess.run(
-            [str(harness)],
+            command,
             input=data,
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            preexec_fn=preexec,
         )
     else:
-        print("running (libFuzzer/argv): %s %s" % (harness, TESTCASE))
+        print("running (libFuzzer/argv): %s %s" % (" ".join(command), TESTCASE))
         proc = subprocess.run(
-            [str(harness), str(TESTCASE)],
+            command + [str(TESTCASE)],
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            preexec_fn=preexec,
         )
 
     sys.stdout.write(proc.stdout.decode("utf-8", "replace"))
     if not proc.stdout.endswith(b"\n"):
         print()
-    print("exit status: %d" % proc.returncode)
-    sys.exit(proc.returncode)
+    code = exit_code(proc.returncode)
+    if proc.returncode < 0:
+        print("exit status: %d (signal %d)" % (code, -proc.returncode))
+    else:
+        print("exit status: %d" % code)
+    sys.exit(code)
 
 
 if __name__ == "__main__":
@@ -2571,9 +2925,21 @@ if __name__ == "__main__":
         .replace("__TESTCASE__", &py_str(testcase_name))
         .replace("__FIXTURE__", &py_str(fixture_path))
         .replace("__HARNESS_ID__", &py_str(harness_id))
-        .replace("__ASAN__", &py_str(asan_options))
-        .replace("__UBSAN__", &py_str(ubsan_options))
+        .replace("__ASAN_DEFAULT__", &py_str(asan_defaults))
+        .replace("__ASAN__", &py_str(asan_required))
+        .replace("__UBSAN__", &py_str(ubsan_required))
         .replace("__EXTRA_ENV__", &extra_env_py)
+        .replace(
+            "__RUNNER__",
+            &format!(
+                "[{}]",
+                runner
+                    .iter()
+                    .map(|arg| py_str(arg))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )
 }
 
 fn value_at(value: &Value, path: &[&str]) -> Option<Value> {
@@ -2769,8 +3135,8 @@ fn sarif_result(
         "confirmation": confirmation,
         "severity": finding.severity,
         // Always carry the finding's CWE(s) so every SARIF result is mapped to a
-        // weakness even when no catalog rule matched (the scalar `cwe` below is
-        // set only for rule-matched findings).
+        // weakness even when no catalog rule matched; the scalar `cwe` below is
+        // the first of them.
         "cwes": &finding.actionability.cwe,
         "replayCommand": string_at(&finding.replay, &["command"]),
         "sandbox": finding.sandbox,
@@ -2787,8 +3153,40 @@ fn sarif_result(
         "actionabilityPatchHints": &finding.actionability.patch_hints,
         "actionabilityNextSteps": &finding.actionability.next_steps,
     });
+    // The finding's own computed CWE (an out-of-bounds READ under a rule whose
+    // catalog CWE is the write CWE, a wild SEGV under its own rule, ...), else
+    // the rule's.
+    let finding_cwe = finding
+        .actionability
+        .cwe
+        .first()
+        .map(String::as_str)
+        .filter(|cwe| !cwe.trim().is_empty());
+    if let Some(cwe) = finding_cwe {
+        properties
+            .as_object_mut()
+            .expect("properties is an object")
+            .insert("cwe".to_owned(), json!(cwe));
+    }
+    // Comparison evidence recorded for this input (`finding.json` `gates`):
+    // which input bytes reached which comparison of the target, and the file
+    // whose bytes the offsets index.
+    if let Some(gates) = recorded_gates(&finding.raw) {
+        let bag = properties.as_object_mut().expect("properties is an object");
+        bag.insert(
+            "bhfInputToState".to_owned(),
+            sarif_input_to_state(gates, root),
+        );
+        if let Some(input) = string_at(&finding.raw, &["gate_capture", "input"]) {
+            bag.insert("bhfInputToStateInput".to_owned(), json!(input));
+        }
+    }
     if let Some(rule) = rule {
-        let mut tags = vec![rule.cwe.to_owned()];
+        let cwe = finding_cwe.unwrap_or(rule.cwe);
+        let mut tags = vec![cwe.to_owned()];
+        if cwe != rule.cwe {
+            tags.push(rule.cwe.to_owned());
+        }
         if let Some(place) = rule.cwe_top_25 {
             tags.push(format!("cwe-top-25-{place}"));
             tags.push("cwe-top-25".to_owned());
@@ -2803,8 +3201,13 @@ fn sarif_result(
             "security-severity".to_owned(),
             json!(format!("{:.1}", rule.security_severity)),
         );
-        obj.insert("cwe".to_owned(), json!(rule.cwe));
-        obj.insert("cwe_top_25".to_owned(), json!(rule.cwe_top_25));
+        obj.insert("cwe".to_owned(), json!(cwe));
+        // The rank belongs to the rule's catalog CWE: only report it when the
+        // result's CWE is that one.
+        obj.insert(
+            "cwe_top_25".to_owned(),
+            json!(rule.cwe_top_25.filter(|_| cwe == rule.cwe)),
+        );
         obj.insert("bhf.rule_slug".to_owned(), json!(rule.slug));
         obj.insert(
             "precision".to_owned(),
@@ -3253,7 +3656,64 @@ fn sarif_related_locations(finding: &FindingReport, root: Option<&Path>) -> Vec<
         }));
         next_id = next_id.saturating_add(1);
     }
+    // The source position of each comparison an input byte reached.
+    let input = string_at(&finding.raw, &["gate_capture", "input"])
+        .map(|name| format!(" of {name}"))
+        .unwrap_or_default();
+    for gate in recorded_gates(&finding.raw).into_iter().flatten() {
+        let Some(file) = string_at(gate, &["location", "file"]) else {
+            continue;
+        };
+        let mut physical = json!({ "artifactLocation": sarif_artifact_location(&file, root) });
+        if let Some(line) = gate.pointer("/location/line").and_then(Value::as_u64) {
+            physical["region"] = json!({ "startLine": line.max(1) });
+        }
+        let offset = gate.get("offset").and_then(Value::as_u64).unwrap_or(0);
+        let len = gate.get("len").and_then(Value::as_u64).unwrap_or(0);
+        let kind = string_at(gate, &["cmp_kind"]).unwrap_or_else(|| "comparison".to_owned());
+        locations.push(json!({
+            "id": next_id,
+            "physicalLocation": physical,
+            "message": {
+                "text": format!("Input bytes {offset}..{}{input} reach this {kind}", offset + len),
+            }
+        }));
+        next_id = next_id.saturating_add(1);
+    }
     locations
+}
+
+/// `finding.json` `gates`, unless its `gate_capture` says the capture could
+/// not run: then nothing was recorded, which is not an empty result.
+fn recorded_gates(raw: &Value) -> Option<&Vec<Value>> {
+    let unavailable =
+        raw.pointer("/gate_capture/status").and_then(Value::as_str) == Some("unavailable");
+    raw.get("gates")
+        .and_then(Value::as_array)
+        .filter(|_| !unavailable)
+}
+
+/// `finding.json` `gates` for the SARIF property bag, with each comparison
+/// site's file made relative to the source root where it lies under it.
+fn sarif_input_to_state(gates: &[Value], root: Option<&Path>) -> Value {
+    Value::Array(
+        gates
+            .iter()
+            .filter(|gate| gate.is_object())
+            .map(|gate| {
+                let mut gate = gate.clone();
+                if let Some(file) = string_at(&gate, &["location", "file"]) {
+                    if let Some(uri) = sarif_artifact_location(&file, root)
+                        .get("uri")
+                        .and_then(Value::as_str)
+                    {
+                        gate["location"]["file"] = json!(uri);
+                    }
+                }
+                gate
+            })
+            .collect(),
+    )
 }
 
 fn build_dependency_paths(build: &Value) -> Vec<(String, &'static str)> {
@@ -4103,6 +4563,449 @@ mod tests {
         );
     }
 
+    #[test]
+    fn repro_py_reports_ubsan_stacks_and_check_names_like_the_fuzz_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = json!({"id": "F-0001-aaaaaaaa", "harness_id": "H-C0001", "rule_id": "BHF-210"});
+        let record =
+            actionability::backfill_actionability(actionability::RunMode::Reporting, &raw, None);
+        super::ensure_repro_py(dir.path(), &raw, &record).unwrap();
+        let script = std::fs::read_to_string(dir.path().join("replay.py")).unwrap();
+        assert!(
+            script.contains(
+                "UBSAN_OPTIONS_REQUIRED = \"print_stacktrace=1:report_error_type=1:halt_on_error=1\""
+            ),
+            "{script}"
+        );
+    }
+
+    /// The reproducer keeps the operator's sanitizer options but adds bhf's
+    /// required keys after them, so they win: UBSan halts on its first report
+    /// with its stack, ASan halts, and a leak finding keeps leak detection.
+    #[test]
+    fn repro_py_merges_inherited_sanitizer_options_with_bhf_keys_winning() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = json!({"id": "F-0001-aaaaaaaa", "harness_id": "H-C0001", "rule_id": "BHF-210"});
+        let record =
+            actionability::backfill_actionability(actionability::RunMode::Reporting, &raw, None);
+        super::ensure_repro_py(dir.path(), &raw, &record).unwrap();
+        let script = std::fs::read_to_string(dir.path().join("replay.py")).unwrap();
+        assert!(
+            script.contains(
+                "UBSAN_OPTIONS_REQUIRED = \"print_stacktrace=1:report_error_type=1:halt_on_error=1\""
+            ),
+            "{script}"
+        );
+        assert!(
+            script.contains("ASAN_OPTIONS_REQUIRED = \"abort_on_error=1:halt_on_error=1\""),
+            "{script}"
+        );
+        let Some(python) = python3() else {
+            eprintln!("skipping the merge run: python3 unavailable");
+            return;
+        };
+        let probe = format!(
+            "import importlib.util, json\n\
+             spec = importlib.util.spec_from_file_location('replay', {script:?})\n\
+             replay = importlib.util.module_from_spec(spec)\n\
+             spec.loader.exec_module(replay)\n\
+             print(json.dumps([\n\
+               replay.merged_options('suppressions=/dev/null:halt_on_error=0', '', replay.UBSAN_OPTIONS_REQUIRED),\n\
+               replay.merged_options(None, replay.ASAN_OPTIONS_DEFAULT, replay.ASAN_OPTIONS_REQUIRED),\n\
+               replay.merged_options('detect_leaks=1', replay.ASAN_OPTIONS_DEFAULT, replay.ASAN_OPTIONS_REQUIRED),\n\
+             ]))\n",
+            script = dir.path().join("replay.py").display().to_string(),
+        );
+        let output = std::process::Command::new(python)
+            .args(["-c", &probe])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let merged: Vec<String> = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            merged[0],
+            "suppressions=/dev/null:print_stacktrace=1:report_error_type=1:halt_on_error=1"
+        );
+        assert_eq!(merged[1], "detect_leaks=0:abort_on_error=1:halt_on_error=1");
+        assert_eq!(
+            merged[2], "detect_leaks=1:abort_on_error=1:halt_on_error=1",
+            "the operator's value beats bhf's default, not its required keys"
+        );
+    }
+
+    /// A UBSan finding replayed with an inherited `UBSAN_OPTIONS` still halts
+    /// on the report and prints its stack, and the script exits with the
+    /// harness's status (128 + the signal for a signal).
+    #[cfg(unix)]
+    #[test]
+    fn repro_py_reproduces_a_ubsan_finding_under_inherited_ubsan_options() {
+        let Some(python) = python3() else {
+            eprintln!("skipping: python3 unavailable");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let harness_dir = tmp.path().join("work/harnesses/H-1");
+        std::fs::create_dir_all(&harness_dir).unwrap();
+        std::fs::write(
+            harness_dir.join("parse.c"),
+            "#include <stdio.h>\n#include <limits.h>\n\
+             __attribute__((noinline)) int scale_record(int value) { return value * 4; }\n\
+             int main(int argc, char **argv) {\n\
+                 FILE *f = fopen(argv[1], \"rb\");\n\
+                 int c = f ? fgetc(f) : 0;\n\
+                 printf(\"%d\\n\", scale_record(c == 'X' ? INT_MAX : 1));\n\
+                 return 0;\n\
+             }\n",
+        )
+        .unwrap();
+        let built = std::process::Command::new("clang")
+            .current_dir(&harness_dir)
+            .args(["-g", "-O0", "-fsanitize=undefined", "-o", "main", "parse.c"])
+            .output();
+        if !built.as_ref().is_ok_and(|output| output.status.success()) {
+            eprintln!("skipping: clang with UBSan unavailable");
+            return;
+        }
+        let finding = tmp.path().join("work/results/findings/F-1");
+        std::fs::create_dir_all(&finding).unwrap();
+        std::fs::write(finding.join("testcase.bin"), b"X").unwrap();
+        let raw = json!({
+            "id": "F-1", "harness_id": "H-1", "rule_id": "BHF-202",
+            "fixture_path": "harnesses/H-1/main",
+            "exception": {"sanitizer": "ubsan", "name": "UBSAN_SIGNED_INTEGER_OVERFLOW"},
+        });
+        std::fs::write(finding.join("finding.json"), raw.to_string()).unwrap();
+        let record =
+            actionability::backfill_actionability(actionability::RunMode::Reporting, &raw, None);
+        super::ensure_repro_py(&finding, &raw, &record).unwrap();
+        let output = std::process::Command::new(python)
+            .arg(finding.join("replay.py"))
+            .env("UBSAN_OPTIONS", "suppressions=/dev/null")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("runtime error: signed integer overflow"),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains("#0 ") && stdout.contains("scale_record"),
+            "{stdout}"
+        );
+        assert!(!output.status.success(), "{stdout}");
+        assert!(!stdout.contains("exit status: 0"), "{stdout}");
+
+        // A harness killed by a signal: 128 + the signal.
+        let main = harness_dir.join("main");
+        std::fs::write(&main, "#!/bin/sh\nkill -SEGV $$\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&main, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let output = std::process::Command::new(python)
+            .arg(finding.join("replay.py"))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(139));
+    }
+
+    /// A finding whose harness was built for another target, with its
+    /// emulator recorded beside it (`bhf_runner.json`), gets a reproducer
+    /// that runs the harness under that emulator.
+    #[test]
+    fn repro_py_embeds_the_recorded_runner_of_a_cross_harness() {
+        let tmp = tempfile::tempdir().unwrap();
+        let harness_dir = tmp.path().join("work/harnesses/H-1");
+        std::fs::create_dir_all(&harness_dir).unwrap();
+        std::fs::write(
+            harness_dir.join("bhf_runner.json"),
+            r#"{"schema":"bhf.harness_runner.v1","program":"qemu-aarch64","args":["-L","/usr/aarch64-linux-gnu"]}"#,
+        )
+        .unwrap();
+        let finding = tmp.path().join("work/results/findings/F-1");
+        std::fs::create_dir_all(&finding).unwrap();
+        let raw = json!({"id": "F-1", "harness_id": "H-1", "rule_id": "BHF-210"});
+        let record =
+            actionability::backfill_actionability(actionability::RunMode::Reporting, &raw, None);
+        super::ensure_repro_py(&finding, &raw, &record).unwrap();
+        let script = std::fs::read_to_string(finding.join("replay.py")).unwrap();
+        assert!(
+            script.contains(r#"RUNNER = ["qemu-aarch64", "-L", "/usr/aarch64-linux-gnu"]"#),
+            "{script}"
+        );
+        // Without a recorded runner, none is embedded.
+        let native = tmp.path().join("native/results/findings/F-2");
+        std::fs::create_dir_all(&native).unwrap();
+        super::ensure_repro_py(&native, &raw, &record).unwrap();
+        let script = std::fs::read_to_string(native.join("replay.py")).unwrap();
+        assert!(script.contains("RUNNER = []"), "{script}");
+    }
+
+    /// The reproducer runs the harness through its runner: the one recorded
+    /// beside it, or `BHF_REPLAY_RUNNER`, which overrides it.
+    #[cfg(unix)]
+    #[test]
+    fn repro_py_runs_the_harness_under_its_runner() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(python) = python3() else {
+            eprintln!("skipping: python3 unavailable");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let harness_dir = tmp.path().join("work/harnesses/H-1");
+        std::fs::create_dir_all(&harness_dir).unwrap();
+        let executable = |path: &std::path::Path, body: &str| {
+            std::fs::write(path, body).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        executable(&harness_dir.join("main"), "#!/bin/sh\nexit 0\n");
+        let emulator = tmp.path().join("emulator.sh");
+        executable(
+            &emulator,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$(dirname \"$0\")/emulator.log\"\nshift\nexec \"$@\"\n",
+        );
+        std::fs::write(
+            harness_dir.join("bhf_runner.json"),
+            json!({
+                "schema": "bhf.harness_runner.v1",
+                "program": emulator.display().to_string(),
+                "args": ["--sysroot-for-test"],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let finding = tmp.path().join("work/results/findings/F-1");
+        std::fs::create_dir_all(&finding).unwrap();
+        std::fs::write(finding.join("testcase.bin"), b"x").unwrap();
+        let raw = json!({"id": "F-1", "harness_id": "H-1", "rule_id": "BHF-210"});
+        std::fs::write(finding.join("finding.json"), raw.to_string()).unwrap();
+        let record =
+            actionability::backfill_actionability(actionability::RunMode::Reporting, &raw, None);
+        super::ensure_repro_py(&finding, &raw, &record).unwrap();
+        let status = std::process::Command::new(python)
+            .arg(finding.join("replay.py"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let log = std::fs::read_to_string(tmp.path().join("emulator.log")).unwrap();
+        assert!(
+            log.starts_with("--sysroot-for-test ")
+                && log.contains(&harness_dir.join("main").display().to_string()),
+            "{log}"
+        );
+        // BHF_REPLAY_RUNNER overrides it; empty runs the harness natively.
+        let status = std::process::Command::new(python)
+            .arg(finding.join("replay.py"))
+            .env("BHF_REPLAY_RUNNER", "")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("emulator.log")).unwrap(),
+            log,
+            "the override ran the harness natively"
+        );
+    }
+
+    /// A harness the reproducer runs under an emulator gets
+    /// `abort_on_error=0` after bhf's required sanitizer keys and runs with
+    /// core dumps off (a guest abort makes qemu-user dump its own address
+    /// space); a native run keeps `abort_on_error=1`.
+    #[cfg(unix)]
+    #[test]
+    fn repro_py_runs_an_emulated_harness_without_aborting_or_dumping_core() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(python) = python3() else {
+            eprintln!("skipping: python3 unavailable");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let harness_dir = tmp.path().join("work/harnesses/H-1");
+        std::fs::create_dir_all(&harness_dir).unwrap();
+        let executable = |path: &std::path::Path, body: &str| {
+            std::fs::write(path, body).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        executable(
+            &harness_dir.join("main"),
+            "#!/bin/sh\n{\n  printf 'asan=%s\\n' \"$ASAN_OPTIONS\"\n  printf 'ubsan=%s\\n' \"$UBSAN_OPTIONS\"\n  printf 'core=%s\\n' \"$(ulimit -c)\"\n} > \"$(dirname \"$0\")/seen.txt\"\nexit 0\n",
+        );
+        let emulator = tmp.path().join("emulator.sh");
+        executable(&emulator, "#!/bin/sh\nexec \"$@\"\n");
+        std::fs::write(
+            harness_dir.join("bhf_runner.json"),
+            json!({
+                "schema": "bhf.harness_runner.v1",
+                "program": emulator.display().to_string(),
+                "args": [],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let finding = tmp.path().join("work/results/findings/F-1");
+        std::fs::create_dir_all(&finding).unwrap();
+        std::fs::write(finding.join("testcase.bin"), b"x").unwrap();
+        let raw = json!({"id": "F-1", "harness_id": "H-1", "rule_id": "BHF-201"});
+        std::fs::write(finding.join("finding.json"), raw.to_string()).unwrap();
+        let record =
+            actionability::backfill_actionability(actionability::RunMode::Reporting, &raw, None);
+        super::ensure_repro_py(&finding, &raw, &record).unwrap();
+        let seen = |runner: Option<&str>| -> std::collections::BTreeMap<String, String> {
+            // Core dumps on in the reproducer's own environment, so a 0 the
+            // harness sees is the reproducer's doing.
+            let mut command = std::process::Command::new("sh");
+            command
+                .args(["-c", "ulimit -c unlimited 2>/dev/null; exec \"$@\"", "sh"])
+                .arg(python)
+                .arg(finding.join("replay.py"))
+                .env("ASAN_OPTIONS", "abort_on_error=1:detect_leaks=1")
+                .env("UBSAN_OPTIONS", "abort_on_error=1")
+                .env_remove("BHF_REPLAY_RUNNER");
+            if let Some(runner) = runner {
+                command.env("BHF_REPLAY_RUNNER", runner);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            std::fs::read_to_string(harness_dir.join("seen.txt"))
+                .unwrap()
+                .lines()
+                .filter_map(|line| line.split_once('='))
+                .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                .collect()
+        };
+        // The value a sanitizer runtime takes: the key's last occurrence.
+        let last = |options: &str, key: &str| -> Option<String> {
+            options
+                .rsplit(':')
+                .find_map(|item| item.strip_prefix(&format!("{key}=")))
+                .map(str::to_owned)
+        };
+
+        let emulated = seen(None);
+        assert_eq!(
+            last(&emulated["asan"], "abort_on_error").as_deref(),
+            Some("0"),
+            "{emulated:?}"
+        );
+        assert_eq!(
+            last(&emulated["asan"], "halt_on_error").as_deref(),
+            Some("1"),
+            "{emulated:?}"
+        );
+        assert_eq!(
+            last(&emulated["ubsan"], "abort_on_error").as_deref(),
+            Some("0"),
+            "{emulated:?}"
+        );
+        assert_eq!(emulated["core"], "0", "{emulated:?}");
+        // A runner named by BHF_REPLAY_RUNNER is an emulator too.
+        let named = seen(Some(&emulator.display().to_string()));
+        assert_eq!(
+            last(&named["asan"], "abort_on_error").as_deref(),
+            Some("0"),
+            "{named:?}"
+        );
+        assert_eq!(named["core"], "0", "{named:?}");
+
+        let native = seen(Some(""));
+        assert_eq!(
+            last(&native["asan"], "abort_on_error").as_deref(),
+            Some("1"),
+            "{native:?}"
+        );
+        assert_eq!(
+            last(&native["ubsan"], "abort_on_error").as_deref(),
+            Some("1"),
+            "{native:?}"
+        );
+        if native["core"] == "0" {
+            eprintln!("note: core dumps could not be turned on; the core check is vacuous");
+        }
+    }
+
+    /// A Python 3 interpreter: `python3`, or `python` (its name on Windows,
+    /// where `python3` may be the Store's placeholder, which exits non-zero).
+    fn python3() -> Option<&'static str> {
+        ["python3", "python"].into_iter().find(|program| {
+            std::process::Command::new(program)
+                .args(["-c", "import sys; sys.exit(sys.version_info[0] != 3)"])
+                .output()
+                .is_ok_and(|output| output.status.success())
+        })
+    }
+
+    /// On Windows the reproducer puts the sanitizer runtime DLL directories a
+    /// harness was built against on PATH first, read from the sidecar the
+    /// build wrote beside the binary; elsewhere it leaves PATH alone.
+    #[test]
+    fn replay_script_puts_the_windows_sanitizer_runtime_on_path() {
+        let Some(python) = python3() else {
+            eprintln!("skipping: python3 unavailable");
+            return;
+        };
+        let extra_env = serde_json::Map::new();
+        let script = super::render_repro_py(&super::ReproScript {
+            testcase_name: "testcase.bin",
+            harness_id: "h1",
+            asan_defaults: "detect_leaks=0",
+            ubsan_required: "print_stacktrace=1",
+            extra_env: &extra_env,
+            ..Default::default()
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = tmp.path().join("llvm runtime");
+        std::fs::create_dir_all(&runtime).unwrap();
+        let harness_dir = tmp.path().join("harnesses/h1");
+        std::fs::create_dir_all(&harness_dir).unwrap();
+        std::fs::write(
+            harness_dir.join("bhf-runtime-path.txt"),
+            format!(
+                "{}\n{}\n",
+                runtime.display(),
+                tmp.path().join("gone").display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("replay.py"), &script).unwrap();
+        let probe = format!(
+            "import importlib.util, json\n\
+             spec = importlib.util.spec_from_file_location('replay', {script:?})\n\
+             replay = importlib.util.module_from_spec(spec)\n\
+             spec.loader.exec_module(replay)\n\
+             harness = {harness:?}\n\
+             win = replay.with_runtime_path({{'PATH': 'C:/Windows'}}, harness, windows=True)\n\
+             posix = replay.with_runtime_path({{'PATH': '/usr/bin'}}, harness, windows=False)\n\
+             print(json.dumps([win['PATH'], posix['PATH']]))\n",
+            script = tmp.path().join("replay.py").display().to_string(),
+            harness = harness_dir.join("main.exe").display().to_string(),
+        );
+        let output = std::process::Command::new(python)
+            .args(["-c", &probe])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let paths: Vec<String> = serde_json::from_slice(&output.stdout).unwrap();
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        assert_eq!(
+            paths[0],
+            format!("{}{sep}C:/Windows", runtime.display()),
+            "the existing sidecar dir goes first; a missing one is skipped"
+        );
+        assert_eq!(paths[1], "/usr/bin", "PATH is untouched off Windows");
+    }
+
     #[cfg(unix)]
     #[test]
     fn repro_py_runs_harness_from_work_dir_not_above() {
@@ -4116,15 +5019,15 @@ mod tests {
             return;
         }
 
-        let script = super::render_repro_py(
-            "testcase.bin",
-            "",
-            "h1",
-            "detect_leaks=0",
-            "print_stacktrace=1",
-            &serde_json::Map::new(),
-            &[],
-        );
+        let extra_env = serde_json::Map::new();
+        let script = super::render_repro_py(&super::ReproScript {
+            testcase_name: "testcase.bin",
+            harness_id: "h1",
+            asan_defaults: "detect_leaks=0",
+            ubsan_required: "print_stacktrace=1",
+            extra_env: &extra_env,
+            ..Default::default()
+        });
 
         let plant_stub = |path: &std::path::Path| {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -4175,23 +5078,183 @@ mod tests {
         }
     }
 
+    /// A copied work dir runs its own harness: a relative `fixture_path` is
+    /// resolved in the work dir holding the finding, and an absolute one from
+    /// the original work dir is mapped into it first.
+    #[cfg(unix)]
+    #[test]
+    fn repro_py_runs_the_harness_of_the_work_dir_holding_the_finding() {
+        use std::os::unix::fs::PermissionsExt;
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("SKIP repro_py_runs_the_harness_of_the_work_dir_holding_the_finding");
+            return;
+        }
+        let plant_stub = |path: &std::path::Path| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "#!/bin/sh\n: > \"$(dirname \"$0\")/RAN\"\nexit 0\n").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let original = tmp.path().join("original");
+        let copy = tmp.path().join("copy");
+        let finding = copy.join("results/findings/F-1");
+        std::fs::create_dir_all(&finding).unwrap();
+        std::fs::write(finding.join("testcase.bin"), b"x").unwrap();
+        for (fixture, ran) in [
+            (
+                original.join("harnesses/h1/main").display().to_string(),
+                copy.join("harnesses/h1/RAN"),
+            ),
+            ("build/h2/main".to_owned(), copy.join("build/h2/RAN")),
+        ] {
+            plant_stub(&original.join("harnesses/h1/main"));
+            plant_stub(&copy.join("harnesses/h1/main"));
+            plant_stub(&copy.join("build/h2/main"));
+            let extra_env = serde_json::Map::new();
+            let script = super::render_repro_py(&super::ReproScript {
+                testcase_name: "testcase.bin",
+                fixture_path: &fixture,
+                harness_id: "h1",
+                asan_required: "abort_on_error=1",
+                ubsan_required: "print_stacktrace=1",
+                extra_env: &extra_env,
+                ..Default::default()
+            });
+            std::fs::write(finding.join("replay.py"), &script).unwrap();
+            std::fs::write(
+                finding.join("finding.json"),
+                serde_json::json!({ "fixture_path": fixture }).to_string(),
+            )
+            .unwrap();
+            let status = std::process::Command::new("python3")
+                .arg(finding.join("replay.py"))
+                .status()
+                .unwrap();
+            assert!(status.success(), "replay.py failed for {fixture}");
+            assert!(ran.is_file(), "{} did not run for {fixture}", ran.display());
+            assert!(
+                !original.join("harnesses/h1/RAN").is_file(),
+                "the original work dir's harness ran for {fixture}"
+            );
+        }
+    }
+
+    /// When the recorded harness is no longer where `fixture_path` says, the
+    /// script runs the finding's harness from this work dir's harness dirs,
+    /// never one relative to the current directory or in another work dir.
+    #[cfg(unix)]
+    #[test]
+    fn repro_py_never_runs_a_harness_outside_the_work_dir_holding_the_finding() {
+        use std::os::unix::fs::PermissionsExt;
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!(
+                "SKIP repro_py_never_runs_a_harness_outside_the_work_dir_holding_the_finding"
+            );
+            return;
+        }
+        let plant_stub = |path: &std::path::Path| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "#!/bin/sh\n: > \"$(dirname \"$0\")/RAN\"\nexit 0\n").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let original = tmp.path().join("original");
+        let copy = tmp.path().join("copy");
+        let elsewhere = tmp.path().join("elsewhere");
+        let finding = copy.join("results/findings/F-1");
+        std::fs::create_dir_all(&finding).unwrap();
+        std::fs::write(finding.join("testcase.bin"), b"x").unwrap();
+        for fixture in [
+            "build/h1/main".to_owned(),
+            original.join("build/h1/main").display().to_string(),
+        ] {
+            for ran in [
+                original.join("build/h1/RAN"),
+                elsewhere.join("build/h1/RAN"),
+                copy.join("auto/h1/RAN"),
+            ] {
+                let _ = std::fs::remove_file(ran);
+            }
+            // The copy keeps its harness under auto/, not build/.
+            plant_stub(&copy.join("auto/h1/main"));
+            plant_stub(&original.join("build/h1/main"));
+            plant_stub(&elsewhere.join("build/h1/main"));
+            let extra_env = serde_json::Map::new();
+            let script = super::render_repro_py(&super::ReproScript {
+                testcase_name: "testcase.bin",
+                fixture_path: &fixture,
+                harness_id: "h1",
+                asan_required: "abort_on_error=1",
+                ubsan_required: "print_stacktrace=1",
+                extra_env: &extra_env,
+                ..Default::default()
+            });
+            std::fs::write(finding.join("replay.py"), &script).unwrap();
+            std::fs::write(
+                finding.join("finding.json"),
+                serde_json::json!({ "fixture_path": fixture, "harness_id": "h1" }).to_string(),
+            )
+            .unwrap();
+            let status = std::process::Command::new("python3")
+                .arg(finding.join("replay.py"))
+                .current_dir(&elsewhere)
+                .status()
+                .unwrap();
+            assert!(status.success(), "replay.py failed for {fixture}");
+            assert!(
+                copy.join("auto/h1/RAN").is_file(),
+                "the copy's harness did not run for {fixture}"
+            );
+            assert!(
+                !elsewhere.join("build/h1/RAN").is_file(),
+                "a harness relative to the current directory ran for {fixture}"
+            );
+            assert!(
+                !original.join("build/h1/RAN").is_file(),
+                "the original work dir's harness ran for {fixture}"
+            );
+        }
+    }
+
     #[test]
     fn relativize_to_source_root_strips_prefix_everywhere() {
         let dir = std::env::temp_dir().join(format!("bhf-relr-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let root = std::fs::canonicalize(&dir).unwrap();
-        let rs = root.to_string_lossy().into_owned();
+        // The root as a run records it: resolved, without Windows' `\\?\`.
+        let canonical = std::fs::canonicalize(&dir).unwrap();
+        let canonical = canonical.to_string_lossy();
+        let rs = canonical
+            .strip_prefix(r"\\?\")
+            .unwrap_or(&canonical)
+            .to_owned();
+        let sep = std::path::MAIN_SEPARATOR;
         // a single absolute path -> tree-relative
         assert_eq!(
-            relativize_to_source_root(&format!("{rs}/src/x.c:5"), Some(&rs)),
-            "src/x.c:5"
+            relativize_to_source_root(&format!("{rs}{sep}src{sep}x.c:5"), Some(&rs)),
+            format!("src{sep}x.c:5")
         );
         // every occurrence in a whole rendered report is relativised
-        let text = format!("- Sink: `{rs}/a.c:1`\n- Inspect {rs}/b.c as the fix\n");
+        let text = format!("- Sink: `{rs}{sep}a.c:1`\n- Inspect {rs}{sep}b.c as the fix\n");
         assert_eq!(
             relativize_to_source_root(&text, Some(&rs)),
             "- Sink: `a.c:1`\n- Inspect b.c as the fix\n"
         );
+        if cfg!(windows) {
+            // A generated Makefile's build names sources with `/`.
+            let slashed = rs.replace('\\', "/");
+            assert_eq!(
+                relativize_to_source_root(&format!("{slashed}/src/x.c:5"), Some(&rs)),
+                "src/x.c:5"
+            );
+        }
         // no known root -> unchanged
         assert_eq!(
             relativize_to_source_root(&format!("{rs}/x.c"), None),
@@ -4608,6 +5671,74 @@ mod tests {
     /// #484: SARIF results carry a `confirmation` property. A `fuzz_confirmed`
     /// static finding (join-upgraded) surfaces that provenance; a static-scan
     /// finding with no marker defaults to `static`.
+    /// Comparison evidence a finding records reaches SARIF as the
+    /// `bhfInputToState` property and as related locations at each compare
+    /// site; a finding without it carries neither.
+    #[test]
+    fn sarif_result_carries_input_to_state_evidence() {
+        let mut gated =
+            finding_report_with_actionability("F-gated", actionability::Verdict::LikelyReachable);
+        gated.raw = json!({
+            "gates": [{
+                "offset": 0, "len": 5, "operand_hex": "5749444745", "compared_with_hex": "5749444745",
+                "cmp_kind": "strcmp", "site": "0x1a2b", "relation": "equal", "operands_equal": true,
+                "location": {"file": "/src/widget/parse.c", "line": 12, "function": "parse_record"}
+            }],
+            "gate_capture": {"input": "min_testcase.bin", "input_len": 5, "status": "recorded"}
+        });
+        let plain =
+            finding_report_with_actionability("F-plain", actionability::Verdict::LikelyReachable);
+        // A capture that could not run recorded nothing.
+        let mut unavailable =
+            finding_report_with_actionability("F-unrun", actionability::Verdict::LikelyReachable);
+        unavailable.raw = json!({
+            "gates": [],
+            "gate_capture": {"input": "testcase.bin", "input_len": 5, "status": "unavailable",
+                             "reason": "the harness binary was not found"}
+        });
+        let mut document = report_document_with_single_actionability_finding();
+        document.findings = vec![gated, plain, unavailable];
+
+        let sarif = render_sarif_report(&document);
+        let results = sarif["runs"][0]["results"].as_array().unwrap();
+        let result = |id: &str| {
+            results
+                .iter()
+                .find(|r| r["properties"]["bhfFindingId"] == id)
+                .unwrap()
+        };
+        let gates = result("F-gated")["properties"]["bhfInputToState"]
+            .as_array()
+            .expect("bhfInputToState");
+        assert_eq!(gates.len(), 1);
+        assert_eq!(gates[0]["offset"], 0);
+        assert_eq!(gates[0]["cmp_kind"], "strcmp");
+        assert_eq!(
+            result("F-gated")["properties"]["bhfInputToStateInput"],
+            "min_testcase.bin"
+        );
+        let related = result("F-gated")["relatedLocations"].as_array().unwrap();
+        assert!(
+            related.iter().any(|loc| {
+                loc["message"]["text"] == "Input bytes 0..5 of min_testcase.bin reach this strcmp"
+                    && loc["physicalLocation"]["region"]["startLine"] == 12
+            }),
+            "{related:?}"
+        );
+        for id in ["F-plain", "F-unrun"] {
+            assert!(
+                result(id)["properties"].get("bhfInputToState").is_none(),
+                "{id}"
+            );
+            assert!(
+                result(id)["properties"]
+                    .get("bhfInputToStateInput")
+                    .is_none(),
+                "{id}"
+            );
+        }
+    }
+
     #[test]
     fn sarif_result_carries_confirmation_property() {
         let mut confirmed = finding_report_with_actionability(
@@ -4900,6 +6031,83 @@ mod tests {
                 .unwrap()
                 .len(),
             2
+        );
+    }
+
+    /// A result's `properties.cwe` is the finding's own computed CWE (an
+    /// out-of-bounds READ is not the rule's write CWE); the rule entry keeps
+    /// the catalog CWE.
+    #[test]
+    fn sarif_result_cwe_is_the_findings_cwe_not_the_rules() {
+        let root = temp_dir("sarif-finding-cwe");
+        let findings = root.join("findings");
+        let out = root.join("reports");
+        write_finding(
+            &findings.join("F-0001-heapread"),
+            json!({
+                "id": "F-0001-heapread",
+                "rule_id": "BHF-201",
+                "classification": "unhandled",
+                "exception": {
+                    "name": "ASAN_HEAP_BUFFER_OVERFLOW",
+                    "sanitizer": "asan",
+                    "message": "ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1 at pc 0x2 bp 0x3 sp 0x4 (READ of size 4)",
+                    "access": { "direction": "read", "size": 4 },
+                    "stack": [{ "function": "copy_at", "file": "/src/widget/copy.c", "line": 9 }]
+                }
+            }),
+        );
+        write_finding(
+            &findings.join("F-0002-wildread"),
+            json!({
+                "id": "F-0002-wildread",
+                "rule_id": "BHF-223",
+                "classification": "unhandled",
+                "exception": {
+                    "name": "ASAN_SEGV",
+                    "sanitizer": "asan",
+                    "message": "ERROR: AddressSanitizer: SEGV on unknown address 0x7f0000001000 (pc 0x1 bp 0x2 sp 0x3 T0) (READ memory access)",
+                    "access": { "direction": "read", "address": "0x7f0000001000" },
+                    "stack": [{ "function": "parse_header", "file": "/src/widget/hdr.c", "line": 4 }]
+                }
+            }),
+        );
+        let summary = write_reports(
+            ReportOptions::new(&findings, &out)
+                .with_run_id("finding-cwe")
+                .with_sarif(true),
+        )
+        .unwrap();
+        let sarif: serde_json::Value = serde_json::from_slice(
+            &fs::read(summary.sarif_path.expect("SARIF path is recorded")).unwrap(),
+        )
+        .unwrap();
+        validate_sarif_report(&sarif).unwrap();
+        let result = |id: &str| {
+            sarif["runs"][0]["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["properties"]["bhfFindingId"] == id)
+                .unwrap()
+                .clone()
+        };
+        let heap = result("F-0001-heapread");
+        assert_eq!(heap["properties"]["cwe"], "CWE-122");
+        assert_eq!(heap["properties"]["cwes"], json!(["CWE-122", "CWE-125"]));
+        let wild = result("F-0002-wildread");
+        assert_eq!(wild["ruleId"], "BHF-223");
+        assert_eq!(wild["properties"]["cwe"], "CWE-125");
+        let rule = sarif["runs"][0]["tool"]["driver"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == "BHF-201")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            rule["properties"]["cwe"], "CWE-787",
+            "the rule keeps its catalog CWE"
         );
     }
 
@@ -5666,7 +6874,16 @@ mod tests {
         let base = sarif["runs"][0]["originalUriBaseIds"]["SRCROOT"]["uri"]
             .as_str()
             .unwrap();
-        assert_eq!(base, format!("file://{}/", src_root.display()));
+        // A Windows drive path is `file:///C:/...`.
+        let file_uri_of = |path: &Path| {
+            let shown = path.display().to_string();
+            if cfg!(windows) {
+                format!("file:///{}", shown.replace('\\', "/"))
+            } else {
+                format!("file://{shown}")
+            }
+        };
+        assert_eq!(base, format!("{}/", file_uri_of(&src_root)));
         assert!(base.starts_with("file:///") && base.ends_with('/'));
 
         // Primary location (top non-runtime frame) under root → relative + SRCROOT.
@@ -5683,10 +6900,72 @@ mod tests {
         assert_eq!(under["uri"], "src/cbor/internal/loaders.c");
         assert_eq!(under["uriBaseId"], "SRCROOT");
         let outside = &frames[1]["location"]["physicalLocation"]["artifactLocation"];
-        assert_eq!(outside["uri"], format!("file://{}", outside_root.display()));
+        assert_eq!(outside["uri"], file_uri_of(&outside_root));
         assert!(outside.get("uriBaseId").is_none());
 
         validate_sarif_report(&sarif).unwrap();
+    }
+
+    /// A location is made root-relative from the recorded text, so a finding
+    /// from a Windows host and one from a Unix host render the same SARIF on
+    /// either host.
+    #[test]
+    fn sarif_locations_relativise_paths_recorded_on_either_host() {
+        let srcroot = |uri: &str| json!({ "uri": uri, "uriBaseId": "SRCROOT" });
+        let windows = Path::new(r"C:\src\demo");
+        assert_eq!(
+            super::sarif_artifact_location(r"C:\src\demo\src\parse.c", Some(windows)),
+            srcroot("src/parse.c")
+        );
+        assert_eq!(
+            super::sarif_artifact_location("C:/src/demo/src/parse.c", Some(windows)),
+            srcroot("src/parse.c")
+        );
+        assert_eq!(
+            super::sarif_artifact_location(r"C:\src\demo2\x.c", Some(windows)),
+            json!({ "uri": "file:///C:/src/demo2/x.c" })
+        );
+        let posix = Path::new("/src/demo");
+        assert_eq!(
+            super::sarif_artifact_location("/src/demo/lib/parse.c", Some(posix)),
+            srcroot("lib/parse.c")
+        );
+        assert_eq!(
+            super::sarif_artifact_location("/src/demo2/x.c", Some(posix)),
+            json!({ "uri": "file:///src/demo2/x.c" })
+        );
+        assert_eq!(
+            super::sarif_artifact_location("lib/parse.c", Some(posix)),
+            json!({ "uri": "lib/parse.c" })
+        );
+        assert!(super::is_recorded_absolute(r"C:\src") && super::is_recorded_absolute("/src"));
+        assert!(!super::is_recorded_absolute("src/x.c") && !super::is_recorded_absolute("C:x.c"));
+    }
+
+    /// `file://` URIs follow RFC 8089 for Windows paths too: a drive path
+    /// gains a third slash, `\` becomes `/`, a UNC path names its host, and
+    /// the `\\?\` verbatim prefix is dropped.
+    #[test]
+    fn file_uris_spell_windows_paths_with_forward_slashes() {
+        assert_eq!(super::file_uri("/abs/x.c"), "file:///abs/x.c");
+        assert_eq!(
+            super::file_uri(r"C:\src\proj\x.c"),
+            "file:///C:/src/proj/x.c"
+        );
+        assert_eq!(super::file_uri("C:/src/x.c"), "file:///C:/src/x.c");
+        assert_eq!(super::file_uri(r"\\?\C:\src\x.c"), "file:///C:/src/x.c");
+        assert_eq!(
+            super::file_uri(r"\\server\share\x.c"),
+            "file://server/share/x.c"
+        );
+        assert_eq!(
+            super::file_uri(r"\\?\UNC\server\share\x.c"),
+            "file://server/share/x.c"
+        );
+        // Relative and drive-relative paths are not URIs; they pass through.
+        assert_eq!(super::file_uri("src/x.c"), "src/x.c");
+        assert_eq!(super::file_uri("C:x.c"), "C:x.c");
+        assert_eq!(super::file_uri("file:///abs/x.c"), "file:///abs/x.c");
     }
 
     /// With no recoverable `auto/run.json`, the renderer degrades gracefully:
@@ -6136,6 +7415,7 @@ mod tests {
                     target: "H-real".to_owned(),
                     evidence: Vec::new(),
                     attacker_reachable: None,
+                    reachability_basis: None,
                 }),
                 cwe: Vec::new(),
                 cwe_name: None,

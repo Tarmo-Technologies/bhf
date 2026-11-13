@@ -70,12 +70,15 @@ pub const MANIFEST: &[ManifestEntry] = &[
             b"close\0",
             // `__xstat` only — glibc <2.33 routed stat()/lstat() through it,
             // while 2.33+ compiles them to direct fstatat syscalls that bypass
-            // the hook (hooks/fs.rs:498). Advertising a bare `stat` claimed an
-            // interposition that does not fire on a modern host. There is no
-            // `fopen` interposer at all, so it is not listed either: a
-            // capability report that overstates coverage is worse than a short
-            // one, because an operator plans around it.
+            // the hook (hooks/fs.rs). Advertising a bare `stat` claimed an
+            // interposition that does not fire on a modern host: a capability
+            // report that overstates coverage is worse than a short one,
+            // because an operator plans around it.
             b"__xstat\0",
+            b"fopen\0",
+            b"fopen64\0",
+            b"fdopen\0",
+            b"fclose\0",
             b"unlink\0",
             b"unlinkat\0",
             b"remove\0",
@@ -125,6 +128,25 @@ pub const MANIFEST: &[ManifestEntry] = &[
             b"sprintf\0",
             b"snprintf\0",
             b"dprintf\0",
+            b"asprintf\0",
+            b"vprintf\0",
+            b"vfprintf\0",
+            b"vsprintf\0",
+            b"vsnprintf\0",
+            b"vdprintf\0",
+            b"vasprintf\0",
+            b"__printf_chk\0",
+            b"__fprintf_chk\0",
+            b"__sprintf_chk\0",
+            b"__snprintf_chk\0",
+            b"__dprintf_chk\0",
+            b"__asprintf_chk\0",
+            b"__vprintf_chk\0",
+            b"__vfprintf_chk\0",
+            b"__vsprintf_chk\0",
+            b"__vsnprintf_chk\0",
+            b"__vdprintf_chk\0",
+            b"__vasprintf_chk\0",
         ],
         "log printf-style format strings and whether they match current fuzz input",
     ),

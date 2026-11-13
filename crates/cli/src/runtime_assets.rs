@@ -90,6 +90,10 @@ const EMBEDDED_FILES: &[EmbeddedFile] = &[
         include_bytes!("../../../c_runtime/bhf_driver.c"),
     ),
     (
+        "c_runtime/bhf_trace.h",
+        include_bytes!("../../../c_runtime/bhf_trace.h"),
+    ),
+    (
         "csharp_runtime/Driver.cs",
         include_bytes!("../../../csharp_runtime/Driver.cs"),
     ),
@@ -241,6 +245,7 @@ mod tests {
         for marker in [
             "ada_runtime/adafuzz.ads",
             "c_runtime/bhf_driver.c",
+            "c_runtime/bhf_trace.h",
             "csharp_runtime/Driver.cs",
             "java_runtime/build-agent.sh",
             "java_runtime/src/com/bhf/CoverageAgent.java",

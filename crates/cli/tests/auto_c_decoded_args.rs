@@ -1,0 +1,278 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// A C finding records the value the generated harness decoded for each
+// parameter. The fuzz loop re-runs a new finding's testcase once with the
+// harness's argument trace on (BHF_TRACE_ARGS=1) and stores the arguments in
+// decoded.json and, summarised, in finding.json `decoded_args`; the heap access
+// names the parameter whose buffer it overflowed. `bhf replay --show-args`
+// prints the same values. The scalars take the leading bytes and the
+// length-less buffer the bytes after them (harness format 3 and later), so no
+// byte is both.
+
+use std::path::PathBuf;
+use std::process::Command;
+
+fn bhf_bin() -> PathBuf {
+    let mut dir = std::env::current_exe().expect("test exe path");
+    dir.pop();
+    if dir.ends_with("deps") {
+        dir.pop();
+    }
+    dir.join("bhf")
+}
+
+fn scratch(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("bhf_decoded_args_{name}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn a_c_finding_records_its_decoded_arguments() {
+    let bin = bhf_bin();
+    if !bin.exists() {
+        eprintln!("skip: bhf binary not built at {}", bin.display());
+        return;
+    }
+    let src = scratch("src");
+    std::fs::write(
+        src.join("widget.h"),
+        "int widget_scan(const unsigned char *data, unsigned int bit_index, unsigned short width);\n",
+    )
+    .unwrap();
+    // The planted read is one byte past the buffer, behind a gate on the two
+    // scalars, so it fires on the seed only.
+    std::fs::write(
+        src.join("widget.c"),
+        "#include \"widget.h\"\n\
+         int widget_scan(const unsigned char *data, unsigned int bit_index, unsigned short width) {\n\
+         \x20   if (bit_index == 0x41414141u && width == 0x4141u) {\n\
+         \x20       volatile const unsigned char *p = data;\n\
+         \x20       return p[9];\n\
+         \x20   }\n\
+         \x20   return data[0];\n\
+         }\n",
+    )
+    .unwrap();
+    let seeds = scratch("seeds");
+    std::fs::write(seeds.join("trigger"), b"AAAAAAAAWXYZ").unwrap();
+    let work = scratch("work");
+
+    let out = Command::new(&bin)
+        .args([
+            "auto",
+            src.to_str().unwrap(),
+            "--target",
+            "widget_scan",
+            "--per-target-time",
+            "10",
+            "--max-targets",
+            "1",
+            "--jobs",
+            "1",
+            "--seed-dir",
+            seeds.to_str().unwrap(),
+            "--work-dir",
+            work.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run bhf auto");
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let findings = work.join("results/findings");
+    let finding = std::fs::read_dir(&findings)
+        .unwrap_or_else(|e| panic!("no findings dir ({e}):\n{combined}"))
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            std::fs::read_to_string(path.join("finding.json")).is_ok_and(|text| {
+                text.contains("heap-buffer-overflow") || text.contains("HEAP_BUFFER_OVERFLOW")
+            })
+        })
+        .unwrap_or_else(|| panic!("no heap-buffer-overflow finding:\n{combined}"));
+
+    let decoded: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(finding.join("decoded.json")).unwrap()).unwrap();
+    assert_eq!(decoded["arguments_source"], "harness_trace", "{decoded:#}");
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(finding.join("finding.json")).unwrap()).unwrap();
+    let args = record["decoded_args"].as_array().expect("decoded_args");
+    let arg = |name: &str| {
+        args.iter()
+            .find(|arg| arg["name"] == name)
+            .unwrap_or_else(|| panic!("no {name} in {args:#?}"))
+    };
+    let testcase = std::fs::read(finding.join("testcase.bin")).unwrap();
+    // The crashing testcase is the built-in `AAAAAAAA` seed or the supplied one.
+    assert!(testcase.starts_with(b"AAAAAAAA"), "{testcase:?}");
+    let rest = &testcase[8..];
+    assert_eq!(arg("bit_index")["value"], "1094795585");
+    assert_eq!(arg("bit_index")["span"], serde_json::json!([0, 4]));
+    assert_eq!(arg("width")["value"], "16705");
+    assert_eq!(arg("width")["span"], serde_json::json!([4, 8]));
+    assert_eq!(arg("data")["span"], serde_json::json!([8, testcase.len()]));
+    assert_eq!(arg("data")["len"], rest.len());
+    let hex: String = rest.iter().map(|byte| format!("{byte:02x}")).collect();
+    assert_eq!(arg("data")["preview_hex"], hex);
+    let current = harness_gen::HARNESS_FORMAT_VERSION;
+    assert_eq!(record["harness_format_version"], current, "{record:#}");
+    assert_eq!(record["harness"]["format_version"], current, "{record:#}");
+    // The harness's corpus records the same format.
+    let harness_id = record["harness_id"].as_str().unwrap();
+    let corpus_metadata: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(work.join("corpus").join(harness_id).join("metadata.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(corpus_metadata["harness"]["format_version"], current);
+    assert_eq!(
+        record["exception"]["access"]["parameter"]["name"], "data",
+        "{record:#}"
+    );
+
+    let replay = Command::new(&bin)
+        .args(["replay", finding.to_str().unwrap(), "--show-args"])
+        .output()
+        .expect("run bhf replay");
+    let stdout = String::from_utf8_lossy(&replay.stdout);
+    assert!(stdout.contains("decoded arguments"), "{stdout}");
+    assert!(stdout.contains("1094795585"), "{stdout}");
+    assert!(
+        stdout.contains("the access hit parameter `data`'s buffer, at offset 9"),
+        "{stdout}"
+    );
+
+    // `bhf decode-args` maps the testcase to the same values: through the
+    // harness's trace, and statically from its arg-layout.json.
+    for (extra, source) in [(None, "harness_trace"), (Some("--static"), "arg_layout")] {
+        let mut command = Command::new(&bin);
+        command.args([
+            "decode-args",
+            "--finding",
+            finding.to_str().unwrap(),
+            "--json",
+        ]);
+        if let Some(extra) = extra {
+            command.arg(extra);
+        }
+        let out = command.output().expect("run bhf decode-args");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(doc["schema_version"], "bhf.decode-args.v1");
+        assert_eq!(doc["source"], source, "{doc:#}");
+        let arg = |name: &str| {
+            doc["arguments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|arg| arg["name"] == name)
+                .cloned()
+                .unwrap_or_else(|| panic!("no {name} in {doc:#}"))
+        };
+        assert_eq!(arg("bit_index")["value"], "1094795585", "{doc:#}");
+        assert_eq!(arg("width")["value"], "16705", "{doc:#}");
+        assert_eq!(arg("data")["span"], serde_json::json!([8, testcase.len()]));
+        assert_eq!(arg("data")["len"], rest.len());
+        assert_eq!(doc["not_decoded"], serde_json::json!([]), "{doc:#}");
+    }
+    // Without the binary the layout still decodes it, and says so.
+    let harness_bin = std::fs::read_dir(work.join("harnesses"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path().join("main"))
+        .find(|path| path.is_file())
+        .expect("built harness");
+    std::fs::remove_file(&harness_bin).unwrap();
+    let out = Command::new(&bin)
+        .args(["decode-args", "--finding", finding.to_str().unwrap()])
+        .output()
+        .expect("run bhf decode-args");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("static decode; the harness did not run"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("1094795585"), "{stdout}");
+
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(&work);
+    let _ = std::fs::remove_dir_all(&seeds);
+}
+
+/// `bhf decode-args --static` decodes a C++ reference to a scalar as its
+/// referent, as the harness does, instead of listing it as not decodable.
+#[test]
+fn decode_args_statically_decodes_a_cpp_reference_scalar() {
+    let bin = bhf_bin();
+    if !bin.exists() {
+        eprintln!("skip: bhf binary not built at {}", bin.display());
+        return;
+    }
+    let src = scratch("cpp_ref");
+    std::fs::write(
+        src.join("widget.cpp"),
+        "namespace demo {\n\
+         int adjust(unsigned short &offset, int level) { return offset + level; }\n\
+         }\n",
+    )
+    .unwrap();
+    let out = src.join("out");
+    let generated = Command::new(&bin)
+        .args([
+            "generate-harness",
+            "--target",
+            "demo::adjust",
+            "--id",
+            "H-REF",
+        ])
+        .arg("--output")
+        .arg(&out)
+        .arg(src.join("widget.cpp"))
+        .output()
+        .expect("run bhf generate-harness");
+    assert!(
+        generated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let testcase = src.join("t.bin");
+    // offset: 65541 modulo 65536; level: 7.
+    std::fs::write(&testcase, [0x05, 0x00, 0x01, 0x00, 0x07, 0, 0, 0]).unwrap();
+    let decoded = Command::new(&bin)
+        .arg("decode-args")
+        .arg(&testcase)
+        .arg("--harness")
+        .arg(out.join("H-REF"))
+        .args(["--static", "--json"])
+        .output()
+        .expect("run bhf decode-args");
+    assert!(
+        decoded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&decoded.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&decoded.stdout).unwrap();
+    assert_eq!(doc["not_decoded"], serde_json::json!([]), "{doc:#}");
+    let offset = doc["arguments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|arg| arg["name"] == "offset")
+        .unwrap_or_else(|| panic!("no offset in {doc:#}"));
+    assert_eq!(offset["type"], "unsigned short &", "{doc:#}");
+    assert_eq!(offset["value"], "5", "{doc:#}");
+    assert_eq!(offset["span"], serde_json::json!([0, 4]), "{doc:#}");
+    let _ = std::fs::remove_dir_all(&src);
+}

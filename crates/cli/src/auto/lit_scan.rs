@@ -19,9 +19,32 @@ const MAX_TOKENS: usize = 4096;
 /// dictionary tokens (unquoted string contents and numeric literal text). Comments
 /// are skipped. `backtick` enables JS template literals as a third string quote.
 pub fn scan_literal_tokens(source: &str, backtick: bool) -> Vec<String> {
+    scan_literal_tokens_located(source, backtick)
+        .into_iter()
+        .map(|(token, _)| token)
+        .collect()
+}
+
+/// Most source lines recorded for one token.
+const MAX_TOKEN_LINES: usize = 3;
+
+/// [`scan_literal_tokens`], with the 1-based lines each token was found on (the
+/// first three distinct ones).
+pub fn scan_literal_tokens_located(source: &str, backtick: bool) -> Vec<(String, Vec<u32>)> {
     let b = source.as_bytes();
-    let mut out: Vec<String> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(
+            b.iter()
+                .enumerate()
+                .filter(|(_, byte)| **byte == b'\n')
+                .map(|(at, _)| at + 1),
+        )
+        .collect();
+    let line_of = |offset: usize| {
+        u32::try_from(line_starts.partition_point(|start| *start <= offset)).unwrap_or(u32::MAX)
+    };
+    let mut out: Vec<(String, Vec<u32>)> = Vec::new();
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut i = 0usize;
     let n = b.len();
     while i < n && out.len() < MAX_TOKENS {
@@ -60,7 +83,7 @@ pub fn scan_literal_tokens(source: &str, backtick: bool) -> Vec<String> {
             if j <= n {
                 if let Ok(raw) = std::str::from_utf8(&b[start..j.min(n)]) {
                     if let Some(tok) = clean_string(raw) {
-                        push_unique(&mut out, &mut seen, tok);
+                        push_unique(&mut out, &mut seen, tok, line_of(start));
                     }
                 }
             }
@@ -86,7 +109,7 @@ pub fn scan_literal_tokens(source: &str, backtick: bool) -> Vec<String> {
             if next != b'.' && !is_ident_byte(next) {
                 if let Ok(txt) = std::str::from_utf8(&b[start..j]) {
                     if let Some(tok) = clean_number(txt) {
-                        push_unique(&mut out, &mut seen, tok);
+                        push_unique(&mut out, &mut seen, tok, line_of(start));
                     }
                 }
             }
@@ -102,9 +125,23 @@ fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
 }
 
-fn push_unique(out: &mut Vec<String>, seen: &mut std::collections::HashSet<String>, tok: String) {
-    if seen.insert(tok.clone()) {
-        out.push(tok);
+fn push_unique(
+    out: &mut Vec<(String, Vec<u32>)>,
+    seen: &mut std::collections::HashMap<String, usize>,
+    tok: String,
+    line: u32,
+) {
+    match seen.get(&tok) {
+        Some(&index) => {
+            let lines = &mut out[index].1;
+            if lines.len() < MAX_TOKEN_LINES && !lines.contains(&line) {
+                lines.push(line);
+            }
+        }
+        None => {
+            seen.insert(tok.clone(), out.len());
+            out.push((tok, vec![line]));
+        }
     }
 }
 
@@ -185,6 +222,20 @@ mod tests {
         assert!(toks.contains(&"0x1337".to_owned()));
         assert!(!toks.iter().any(|t| t == "not mined")); // comment skipped
         assert!(!toks.iter().any(|t| t == "%s")); // placeholder dropped
+    }
+
+    #[test]
+    fn located_tokens_record_their_lines() {
+        let src =
+            "// \"skip\"\nlet a = \"WGT1\";\n/* \"x\"\n */ let b = 4919;\nlet c = \"WGT1\";\n";
+        let toks = scan_literal_tokens_located(src, false);
+        assert_eq!(
+            toks,
+            vec![
+                ("WGT1".to_owned(), vec![2, 5]),
+                ("4919".to_owned(), vec![4]),
+            ]
+        );
     }
 
     #[test]

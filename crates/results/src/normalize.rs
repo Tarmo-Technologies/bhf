@@ -4,8 +4,9 @@
 
 use crate::confirmation::{self, ConfirmationInput};
 use crate::model::{
-    BinaryBlock, BuildInfo, Component, Confidence, Confirmation, ConfirmationLevel, Evidence,
-    EvidenceFile, ExceptionInfo, Fidelity, Finding, Fingerprint, Frame, FuzzBlock, Kind, Location,
+    AccessParameter, AccessRegion, Argument, BinaryBlock, BuildInfo, Component, Confidence,
+    Confirmation, ConfirmationLevel, Evidence, EvidenceFile, ExceptionInfo, Fidelity, Finding,
+    Fingerprint, Frame, FuzzBlock, InputToState, InputToStateSearch, Kind, Location, MemoryAccess,
     PatchHint, Reproduce, RuleRef, ScaBlock, StaticBlock, TraceStep,
 };
 use crate::severity;
@@ -27,7 +28,7 @@ const MAX_HASH_BYTES: u64 = 64 * 1024 * 1024;
 const TITLE_MAX: usize = 160;
 
 /// Evidence files we surface, in display order: (role, file name).
-const EVIDENCE_FILES: [(&str, &str); 8] = [
+const EVIDENCE_FILES: [(&str, &str); 9] = [
     ("finding", "finding.json"),
     ("testcase", "testcase.bin"),
     ("testcase_minimized", "min_testcase.bin"),
@@ -36,6 +37,9 @@ const EVIDENCE_FILES: [(&str, &str); 8] = [
     ("replay_script", "replay.py"),
     ("repro_ada", "repro.adb"),
     ("byte_control", "byte-control.json"),
+    // The runtrace events of the replay that recorded the finding's
+    // comparison evidence: this one input's environment use.
+    ("runtrace", "runtrace.jsonl"),
 ];
 
 pub fn kind_for(id: &str, raw: &Value) -> Kind {
@@ -75,6 +79,10 @@ pub fn producer_for(kind: Kind, id: &str) -> &'static str {
     }
 }
 
+/// The interpreter a reproducer command names: Windows' Python installer
+/// provides `python` (and `py`), not `python3`.
+const REPLAY_PYTHON: &str = if cfg!(windows) { "python" } else { "python3" };
+
 /// One loaded `finding.json`. Errors (as a reason for the index's
 /// `errors[]`) when the record cannot be a finding directory: an invalid id,
 /// or an SCA kind, since SCA findings exist only as SBOM matches.
@@ -95,6 +103,12 @@ pub fn from_finding_report(
     }
     let a = &f.actionability;
     let forced = raw.get("forced").and_then(Value::as_bool).unwrap_or(false);
+    // A harness compiled with headers or macro values bhf made up: the finding
+    // keeps its severity, but its confidence is floored and it says why.
+    let build_fidelity = raw
+        .pointer("/build/fidelity")
+        .and_then(|value| serde_json::from_value::<crate::model::BuildFidelity>(value.clone()).ok())
+        .filter(|fidelity| !fidelity.fabricated.is_empty());
     let rule = rule_ref(f.rule_id.as_deref());
 
     let exception = ExceptionInfo {
@@ -143,6 +157,9 @@ pub fn from_finding_report(
     if str_at(raw, &["minimization_skipped"]).as_deref() == Some("time_budget") {
         caveats.push(crate::UNMINIMIZED_CAVEAT.to_owned());
     }
+    if let Some(fidelity) = &build_fidelity {
+        caveats.push(fidelity.caveat());
+    }
 
     // A binary crash keeps its signature under `crash` (exit/signal + stderr
     // digest); it is the only per-crash identity such a record has.
@@ -175,6 +192,12 @@ pub fn from_finding_report(
         .unwrap_or_else(|| primary.clone());
     let finding_dir = ctx.results_dir.join("findings").join(&f.id);
     let evidence = evidence_for(&finding_dir, &f.id);
+    if matches!(kind, Kind::Fuzz | Kind::Runtime) {
+        caveats.extend(actionability::harness_state_caveats(
+            raw,
+            judged_input(&finding_dir).as_deref(),
+        ));
+    }
     let has_replay = evidence
         .as_ref()
         .is_some_and(|e| e.files.iter().any(|file| file.role == "replay_script"));
@@ -202,7 +225,7 @@ pub fn from_finding_report(
         explanation: a.explanation.clone(),
         impact: Some(a.impact.as_str().to_owned()),
         confidence: Confidence {
-            level: if forced {
+            level: if forced || build_fidelity.is_some() {
                 "low".to_owned()
             } else {
                 a.confidence.as_str().to_owned()
@@ -247,11 +270,12 @@ pub fn from_finding_report(
             harness_id: str_at(raw, &["harness_id"]),
             // Only commands bhf builds: record text (`triage.replay`) may come
             // from an imported directory.
-            command: has_replay.then(|| format!("python3 findings/{}/replay.py", f.id)),
+            command: has_replay.then(|| format!("{REPLAY_PYTHON} findings/{}/replay.py", f.id)),
             build: BuildInfo {
                 sanitizers: sanitizers(raw, exception.sanitizer.as_deref()),
                 binary_sha256: binary_sha256.clone(),
                 build_id: build_id.clone(),
+                fidelity: build_fidelity.clone(),
             },
         }),
         evidence,
@@ -261,6 +285,22 @@ pub fn from_finding_report(
             harness_id: str_at(raw, &["harness_id"]),
             dialect: str_at(raw, &["dialect"]),
             oracle: raw.get("oracle").filter(|v| v.is_object()).cloned(),
+            access: f
+                .exception
+                .get("access")
+                .and_then(|access| memory_access(access, ctx.source_root)),
+            input_to_state: comparison_evidence(raw)
+                .and_then(|gates| input_to_state(gates, ctx.source_root)),
+            input_to_state_input: comparison_evidence(raw)
+                .and(str_at(raw, &["gate_capture", "input"])),
+            input_to_state_status: str_at(raw, &["gate_capture", "status"]),
+            input_to_state_reason: str_at(raw, &["gate_capture", "reason"]).filter(|_| {
+                raw.get("gates")
+                    .and_then(Value::as_array)
+                    .is_none_or(Vec::is_empty)
+            }),
+            input_to_state_search: input_to_state_search(raw),
+            arguments: raw.get("decoded_args").and_then(arguments),
         }),
         static_: (kind == Kind::Static).then(|| StaticBlock {
             engine: str_at(raw, &["analysis", "engine"]).or_else(|| Some("bhf-static".to_owned())),
@@ -281,6 +321,194 @@ pub fn from_finding_report(
     strip_root_in_text(&mut finding, ctx.source_root);
     debug_assert_kind_block(&finding);
     Ok(finding)
+}
+
+/// Frames of an allocation or free stack kept in `fuzz.access`.
+const MAX_ACCESS_FRAMES: usize = 8;
+
+/// `exception.access` as the results model carries it: no raw address (it
+/// differs run to run), and only the allocation and free frames that are not
+/// sanitizer, allocator or libc runtime.
+fn memory_access(access: &Value, root: Option<&Path>) -> Option<MemoryAccess> {
+    let direction = match access.get("direction").and_then(Value::as_str) {
+        Some(direction @ ("read" | "write")) => direction.to_owned(),
+        Some(_) | None if access.is_object() => "unknown".to_owned(),
+        _ => return None,
+    };
+    let region = access
+        .get("region")
+        .filter(|r| r.is_object())
+        .and_then(|r| {
+            Some(AccessRegion {
+                kind: str_at(r, &["kind"])?,
+                size: r.get("size").and_then(Value::as_u64),
+                offset: r.get("offset").and_then(Value::as_i64),
+                relation: str_at(r, &["relation"]),
+                distance: r.get("distance").and_then(Value::as_u64),
+                variable: str_at(r, &["variable"]),
+                frame_offset: r.get("frame_offset").and_then(Value::as_u64),
+            })
+        });
+    // The crash stack's project filter, plus the allocator and libc frames
+    // (`malloc`, `free`) the allocation and free stacks start with.
+    let frames = |key: &str| -> Vec<Frame> {
+        access
+            .get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|frame| {
+                let function = frame.get("function").and_then(Value::as_str);
+                let file = frame.get("file").and_then(Value::as_str);
+                function.is_some_and(|f| !actionability::is_runtime_noise_frame(f, file))
+            })
+            .filter_map(|frame| project_frame(frame, root))
+            .take(MAX_ACCESS_FRAMES)
+            .collect()
+    };
+    Some(MemoryAccess {
+        direction,
+        size: access.get("size").and_then(Value::as_u64),
+        address_hint: str_at(access, &["address_hint"]),
+        region,
+        alloc_stack: frames("alloc_stack"),
+        free_stack: frames("free_stack"),
+        parameter: access.get("parameter").and_then(access_parameter),
+    })
+}
+
+/// `exception.access.parameter`: the parameter whose buffer the access hit,
+/// dropped when it names no parameter or an unknown basis.
+fn access_parameter(parameter: &Value) -> Option<AccessParameter> {
+    let name = str_at(parameter, &["name"]).filter(|name| !name.trim().is_empty())?;
+    let basis = str_at(parameter, &["basis"])?;
+    if !matches!(
+        basis.as_str(),
+        "region_start" | "region_interior" | "nearest_pointer"
+    ) {
+        return None;
+    }
+    Some(AccessParameter {
+        name,
+        offset: parameter.get("offset").and_then(Value::as_i64),
+        basis,
+    })
+}
+
+/// `finding.json` `gate_capture`'s search for computed operands, when it
+/// recorded one.
+fn input_to_state_search(raw: &Value) -> Option<InputToStateSearch> {
+    let capture = raw.get("gate_capture")?;
+    let state = str_at(capture, &["derived_search"])
+        .filter(|state| matches!(state.as_str(), "done" | "partial" | "too_long"))?;
+    Some(InputToStateSearch {
+        state,
+        searched_bytes: capture.get("searched_bytes").and_then(Value::as_u64)?,
+        input_len: capture.get("input_len").and_then(Value::as_u64)?,
+    })
+}
+
+/// `finding.json` `gates`, unless its `gate_capture` says the capture could
+/// not run (then nothing was recorded, which is not "no input bytes fed a
+/// comparison").
+fn comparison_evidence(raw: &Value) -> Option<&Value> {
+    let unavailable =
+        raw.pointer("/gate_capture/status").and_then(Value::as_str) == Some("unavailable");
+    raw.get("gates").filter(|_| !unavailable)
+}
+
+/// The comparison-evidence entries of `finding.json` `gates`. An entry
+/// missing a required field, or with operands that are not lowercase hex, is
+/// dropped rather than failing the finding.
+fn input_to_state(gates: &Value, root: Option<&Path>) -> Option<Vec<InputToState>> {
+    let gates = gates.as_array()?;
+    let hex = |value: &Value, key: &str| -> Option<String> {
+        let text = value.get(key)?.as_str()?;
+        (text.len() % 2 == 0 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+            .then(|| text.to_owned())
+    };
+    Some(
+        gates
+            .iter()
+            .filter_map(|gate| {
+                let site = str_at(gate, &["site"])?;
+                if !site.starts_with("0x") {
+                    return None;
+                }
+                let relation = str_at(gate, &["relation"])?;
+                if !matches!(relation.as_str(), "equal" | "byte_swapped" | "derived") {
+                    return None;
+                }
+                let location = gate.get("location").filter(|l| l.is_object());
+                Some(InputToState {
+                    offset: gate.get("offset")?.as_u64()?,
+                    len: gate.get("len")?.as_u64().filter(|len| *len > 0)?,
+                    operand_hex: hex(gate, "operand_hex")?,
+                    compared_with_hex: hex(gate, "compared_with_hex").unwrap_or_default(),
+                    cmp_kind: str_at(gate, &["cmp_kind"])?,
+                    site,
+                    site_location: location.and_then(|l| {
+                        Some(Location {
+                            file: relativize(&str_at(l, &["file"])?, root),
+                            line: l.get("line").and_then(Value::as_u64).filter(|n| *n > 0),
+                            column: None,
+                            function: str_at(l, &["function"]),
+                        })
+                    }),
+                    relation,
+                    operands_equal: gate
+                        .get("operands_equal")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                })
+            })
+            .collect(),
+    )
+}
+
+/// The harness's decoded arguments (`finding.json` `decoded_args`). A scalar
+/// `value` or `after_call_value` that is not a string is kept as its JSON
+/// text; an entry without a name is dropped.
+fn arguments(decoded: &Value) -> Option<Vec<Argument>> {
+    let text = |value: Option<&Value>| -> Option<String> {
+        match value? {
+            Value::String(text) => Some(text.clone()),
+            Value::Number(number) => Some(number.to_string()),
+            Value::Bool(flag) => Some(flag.to_string()),
+            _ => None,
+        }
+    };
+    Some(
+        decoded
+            .as_array()?
+            .iter()
+            .filter_map(|arg| {
+                let span = arg.get("span").and_then(Value::as_array).and_then(|span| {
+                    match span.as_slice() {
+                        [start, end] => Some([start.as_u64()?, end.as_u64()?]),
+                        _ => None,
+                    }
+                });
+                Some(Argument {
+                    name: arg.get("name")?.as_str()?.to_owned(),
+                    type_: arg
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    value: text(arg.get("value")),
+                    len: arg.get("len").and_then(Value::as_u64),
+                    span,
+                    preview_hex: str_at(arg, &["preview_hex"]),
+                    role: match arg.get("role").and_then(Value::as_str) {
+                        Some(role @ ("param" | "receiver" | "out")) => role.to_owned(),
+                        _ => "param".to_owned(),
+                    },
+                    after_call_value: text(arg.get("after_call_value")),
+                })
+            })
+            .collect(),
+    )
 }
 
 fn sink_location(a: &actionability::ActionabilityRecord, root: Option<&Path>) -> Option<Location> {
@@ -602,8 +830,44 @@ fn is_drive_path(path: &str) -> bool {
 }
 
 /// Frames from code under the source root (or, with no root, frames that are
-/// not toolchain/runtime/harness code), capped at [`MAX_STACK`].
+/// not toolchain/runtime/harness/libc code), capped at [`MAX_STACK`]. A
+/// relative frame path counts as project code only if it names a file under
+/// the root, when the root is on disk; glibc's component paths
+/// (`assert/assert.c`) never do.
 fn project_frames(exception: &Value, root: Option<&Path>) -> Vec<Frame> {
+    exception
+        .get("stack")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|frame| project_frame(frame, root))
+        .take(MAX_STACK)
+        .collect()
+}
+
+/// bhf's own runtime on a stack: the driver (`c_runtime/bhf_driver.c`, its
+/// `bhf_run_*` entry functions), the decode, coverage and trace helpers it
+/// copies into a harness (`bhf_decode.h`, `bhf_cov*`, `bhf_trace.h`,
+/// `bhf_asan*.h`) and the program's `_start`. Named precisely, so a project's
+/// own `js_runtime/` or `auto/main.c`, or a fuzz entry point in its tree,
+/// is not mistaken for it.
+fn is_bhf_runtime_frame(function: Option<&str>, file: &str) -> bool {
+    let name = function.map(str::trim).unwrap_or_default();
+    let base = file.rsplit(['/', '\\']).next().unwrap_or_default();
+    name == "_start"
+        || name.starts_with("bhf_run_")
+        || base == "bhf_driver.c"
+        || ["bhf_decode", "bhf_cov", "bhf_trace", "bhf_asan"]
+            .iter()
+            .any(|prefix| base.starts_with(prefix))
+}
+
+/// One stack frame as the results model keeps it, when it is the project's
+/// code (see [`project_frames`]): a frame with a source file that is not
+/// toolchain, sanitizer, libc, the generated harness or bhf's runtime
+/// ([`is_bhf_runtime_frame`]), with its path made relative to the root and,
+/// under a root, inside it.
+fn project_frame(frame: &Value, root: Option<&Path>) -> Option<Frame> {
     const NOISE: [&str; 6] = [
         "compiler-rt",
         "sanitizer_common",
@@ -612,34 +876,71 @@ fn project_frames(exception: &Value, root: Option<&Path>) -> Vec<Frame> {
         "generated_harnesses/",
         "/usr/",
     ];
-    exception
-        .get("stack")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|frame| {
-            let file = frame.get("file").and_then(Value::as_str)?;
-            let rel = relativize(file, root);
-            let lower = rel.to_ascii_lowercase();
-            if NOISE.iter().any(|n| lower.contains(n)) {
-                return None;
+    let file = frame.get("file").and_then(Value::as_str)?;
+    let function = frame.get("function").and_then(Value::as_str);
+    if is_bhf_runtime_frame(function, file) {
+        return None;
+    }
+    let rel = relativize(file, root);
+    let lower = rel.to_ascii_lowercase();
+    if NOISE.iter().any(|n| lower.contains(n)) {
+        return None;
+    }
+    // glibc frames carry component-relative paths such as
+    // `csu/../csu/libc-start.c` or `assert/assert.c`. They are judged by the
+    // path as the symbolizer printed it (a project's `/src/malloc/x.c` made
+    // root-relative is not libc), with the `..` resolved first.
+    let original = lexically_normalized(&file.replace('\\', "/"));
+    if !original.starts_with('/') && !is_drive_path(&original) {
+        match root.filter(|root| root.is_dir()) {
+            // A relative path names project code only if it resolves under
+            // the source root.
+            Some(root) if !root.join(&original).is_file() => return None,
+            Some(_) => {}
+            None if actionability::is_libc_frame(function.unwrap_or_default(), Some(&original)) => {
+                return None
             }
-            if root.is_some()
-                && (rel.starts_with('/') || rel.starts_with("..") || is_drive_path(&rel))
-            {
-                return None;
-            }
-            Some(Frame {
-                function: frame
-                    .get("function")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                file: Some(rel),
-                line: frame.get("line").and_then(Value::as_u64).filter(|l| *l > 0),
-            })
-        })
-        .take(MAX_STACK)
-        .collect()
+            None => {}
+        }
+    }
+    let lexical = lexically_normalized(&rel);
+    if root.is_some()
+        && (lexical.starts_with('/') || lexical.starts_with("..") || is_drive_path(&lexical))
+    {
+        return None;
+    }
+    Some(Frame {
+        function: function.map(str::to_owned),
+        file: Some(rel),
+        line: frame.get("line").and_then(Value::as_u64).filter(|l| *l > 0),
+    })
+}
+
+/// `path` with `.` components dropped and each `dir/..` pair collapsed,
+/// without touching the filesystem. A relative path that climbs above its
+/// start keeps its leading `..` components.
+fn lexically_normalized(path: &str) -> String {
+    let absolute = path.starts_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => match parts.last() {
+                Some(last) if *last != ".." => {
+                    parts.pop();
+                }
+                _ if absolute => {}
+                _ => parts.push(".."),
+            },
+            other => parts.push(other),
+        }
+    }
+    let joined = parts.join("/");
+    if absolute {
+        format!("/{joined}")
+    } else {
+        joined
+    }
 }
 
 /// Replace hex literals of 6+ digits (heap/stack addresses) with `0x…`.
@@ -800,6 +1101,23 @@ fn truncate(text: &str, max: usize) -> String {
     let mut out: String = text.chars().take(max - 1).collect();
     out.push('…');
     out
+}
+
+/// The input a finding is judged on: `min_testcase.bin`, else
+/// `testcase.bin` (regular files only, at most [`MAX_JUDGED_INPUT`] bytes).
+fn judged_input(finding_dir: &Path) -> Option<Vec<u8>> {
+    const MAX_JUDGED_INPUT: u64 = 1 << 20;
+    ["min_testcase.bin", "testcase.bin"]
+        .iter()
+        .find_map(|name| {
+            let (file, size) = open_regular(&finding_dir.join(name))?;
+            if size > MAX_JUDGED_INPUT {
+                return None;
+            }
+            let mut bytes = Vec::new();
+            file.take(MAX_JUDGED_INPUT).read_to_end(&mut bytes).ok()?;
+            Some(bytes)
+        })
 }
 
 fn evidence_for(finding_dir: &Path, id: &str) -> Option<Evidence> {
@@ -1364,6 +1682,336 @@ mod tests {
         assert!(f.static_.is_none() && f.sca.is_none() && f.binary.is_none());
     }
 
+    /// The memory access, the comparison evidence and the decoded arguments a
+    /// finding records reach its fuzz block; raw addresses and runtime frames
+    /// do not, and a malformed evidence entry is dropped, not fatal.
+    #[test]
+    fn fuzz_block_carries_access_comparison_evidence_and_arguments() {
+        let mut raw = asan_record();
+        raw["exception"]["access"] = json!({
+            "direction": "read", "size": 4, "address": "0x602000000010",
+            "region": {"kind": "heap", "size": 5, "offset": 5, "relation": "after", "distance": 0},
+            "alloc_stack": [
+                {"function": "malloc", "file": "/llvm/compiler-rt/lib/asan/asan_malloc_linux.cpp", "line": 68},
+                {"function": "copy_at", "file": "/src/demo/src/copy.c", "line": 7}
+            ],
+            "parameter": {"name": "data", "offset": 5, "basis": "region_start"}
+        });
+        raw["gates"] = json!([
+            {"offset": 0, "len": 4, "operand_hex": "57494447", "compared_with_hex": "57494447",
+             "cmp_kind": "memcmp", "site": "0x1a2b", "relation": "equal", "operands_equal": true,
+             "location": {"file": "/src/demo/src/parse.c", "line": 31, "function": "parse_header"}},
+            {"offset": 9, "len": 1, "operand_hex": "not hex", "cmp_kind": "cmp", "site": "0x10",
+             "relation": "equal"}
+        ]);
+        raw["decoded_args"] = json!([
+            {"name": "bit_index", "type": "uint32_t", "value": 7, "span": [0, 4], "role": "param"},
+            {"name": "data", "type": "const uint8_t *", "len": 12, "preview_hex": "57494447"}
+        ]);
+        let f = normalize(raw, Some("/src/demo"));
+        let fuzz = f.fuzz.unwrap();
+
+        let access = fuzz.access.expect("access");
+        assert_eq!((access.direction.as_str(), access.size), ("read", Some(4)));
+        let region = access.region.as_ref().expect("region");
+        assert_eq!(
+            (region.kind.as_str(), region.size, region.offset),
+            ("heap", Some(5), Some(5))
+        );
+        assert_eq!(access.alloc_stack.len(), 1, "{:?}", access.alloc_stack);
+        assert_eq!(access.alloc_stack[0].file.as_deref(), Some("src/copy.c"));
+        let serialized = serde_json::to_string(&access).unwrap();
+        assert!(!serialized.contains("0x602000000010"), "{serialized}");
+        let parameter = access.parameter.as_ref().expect("the accessed parameter");
+        assert_eq!(
+            (
+                parameter.name.as_str(),
+                parameter.offset,
+                parameter.basis.as_str()
+            ),
+            ("data", Some(5), "region_start")
+        );
+
+        let gates = fuzz.input_to_state.expect("evidence");
+        assert_eq!(gates.len(), 1, "{gates:?}");
+        assert!(
+            fuzz.input_to_state_input.is_none(),
+            "no gate_capture, so no input named"
+        );
+        assert_eq!((gates[0].offset, gates[0].len), (0, 4));
+        assert_eq!(gates[0].cmp_kind, "memcmp");
+        let site = gates[0].site_location.as_ref().expect("site location");
+        assert_eq!((site.file.as_str(), site.line), ("src/parse.c", Some(31)));
+
+        let arguments = fuzz.arguments.expect("arguments");
+        assert_eq!(arguments.len(), 2);
+        assert_eq!(arguments[0].value.as_deref(), Some("7"));
+        assert_eq!(arguments[0].span, Some([0, 4]));
+        assert_eq!(arguments[1].role, "param");
+        assert_eq!(arguments[1].len, Some(12));
+    }
+
+    /// An allocation or free stack is cut to the project's own frames, as the
+    /// crash stack is: bhf's driver frames (at the install path of
+    /// `c_runtime/bhf_driver.c`), the generated harness, the C runtime's
+    /// `_start` and frames outside the source root are not project code.
+    #[test]
+    fn access_stacks_keep_only_project_frames() {
+        let mut raw = asan_record();
+        let driver = "/opt/bhf/share/c_runtime/bhf_driver.c";
+        raw["exception"]["access"] = json!({
+            "direction": "read", "size": 1,
+            "alloc_stack": [
+                {"function": "malloc", "file": "/llvm/compiler-rt/lib/asan/asan_malloc_linux.cpp", "line": 68},
+                {"function": "copy_at", "file": "/src/demo/src/copy.c", "line": 7},
+                {"function": "bhf_run_one", "file": "/w/harnesses/H-C0001/main.c", "line": 30},
+                {"function": "bhf_run_one_bytes", "file": driver, "line": 761},
+                {"function": "bhf_run_file", "file": driver, "line": 778},
+                {"function": "main", "file": driver, "line": 840},
+                {"function": "__libc_start_call_main", "file": "csu/../sysdeps/nptl/libc_start_call_main.h", "line": 58},
+                {"function": "_start", "file": "/build/glibc/csu/../sysdeps/x86_64/start.S", "line": 115}
+            ],
+            "free_stack": [
+                {"function": "free", "file": "/llvm/compiler-rt/lib/asan/asan_malloc_linux.cpp", "line": 52},
+                {"function": "release_record", "file": "/src/demo/src/copy.c", "line": 12},
+                {"function": "main", "file": driver, "line": 840},
+                {"function": "_start"}
+            ]
+        });
+        for root in [Some("/src/demo"), None] {
+            let access = normalize(raw.clone(), root).fuzz.unwrap().access.unwrap();
+            let names = |frames: &[Frame]| -> Vec<String> {
+                frames.iter().filter_map(|f| f.function.clone()).collect()
+            };
+            assert_eq!(names(&access.alloc_stack), ["copy_at"], "root {root:?}");
+            assert_eq!(
+                names(&access.free_stack),
+                ["release_record"],
+                "root {root:?}"
+            );
+            let text = serde_json::to_string(&access).unwrap();
+            assert!(!text.contains("bhf_driver.c"), "{text}");
+            if root.is_some() {
+                assert_eq!(access.alloc_stack[0].file.as_deref(), Some("src/copy.c"));
+            }
+        }
+    }
+
+    /// Only bhf's own runtime is dropped from the results stacks: project code
+    /// in a `*_runtime/` or `auto/` dir, and a fuzz entry point in the
+    /// project's tree, stay frames of the crash, allocation and free stacks.
+    #[test]
+    fn project_frames_in_dirs_named_like_bhf_runtime_dirs_are_kept() {
+        let mut raw = asan_record();
+        let project = json!([
+            {"function": "eval_expr", "file": "/src/demo/js_runtime/eval.c", "line": 14},
+            {"function": "parse_cfg", "file": "/src/demo/auto/main.c", "line": 22},
+            {"function": "LLVMFuzzerTestOneInput", "file": "/src/demo/fuzz/fuzz_parser.c", "line": 5},
+            {"function": "bhf_run_one_bytes", "file": "/opt/bhf/share/c_runtime/bhf_driver.c", "line": 761},
+            {"function": "bhf_c_string", "file": "/w/H-1/bhf_decode.h", "line": 195},
+            {"function": "_start"}
+        ]);
+        raw["exception"]["stack"] = project.clone();
+        raw["exception"]["access"] = json!({
+            "direction": "read", "size": 1,
+            "alloc_stack": project.clone(),
+            "free_stack": project,
+        });
+        for root in [Some("/src/demo"), None] {
+            let normalized = normalize(raw.clone(), root);
+            let fuzz = normalized.fuzz.as_ref().unwrap();
+            let access = fuzz.access.as_ref().unwrap();
+            let names = |frames: &[Frame]| -> Vec<String> {
+                frames.iter().filter_map(|f| f.function.clone()).collect()
+            };
+            let kept = ["eval_expr", "parse_cfg", "LLVMFuzzerTestOneInput"];
+            assert_eq!(names(&normalized.stack), kept, "root {root:?}");
+            assert_eq!(names(&access.alloc_stack), kept, "root {root:?}");
+            assert_eq!(names(&access.free_stack), kept, "root {root:?}");
+        }
+    }
+
+    /// An accessed parameter with an unknown basis or no name is dropped, an
+    /// access without one serializes it as `null`, and a document written
+    /// before the key existed still reads.
+    #[test]
+    fn access_parameter_is_kept_only_when_well_formed() {
+        let access_with = |parameter: Value| {
+            let mut raw = asan_record();
+            raw["exception"]["access"] = json!({"direction": "write", "size": 1,
+                "parameter": parameter});
+            normalize(raw, None).fuzz.unwrap().access.unwrap()
+        };
+        let kept = access_with(json!({"name": "dst", "offset": 3, "basis": "nearest_pointer"}));
+        assert_eq!(
+            kept.parameter.as_ref().map(|p| p.name.as_str()),
+            Some("dst")
+        );
+        assert!(access_with(json!({"name": "dst", "basis": "guess"}))
+            .parameter
+            .is_none());
+        assert!(access_with(json!({"offset": 1, "basis": "region_start"}))
+            .parameter
+            .is_none());
+        let none = access_with(Value::Null);
+        assert!(none.parameter.is_none());
+        let text = serde_json::to_string(&none).unwrap();
+        assert!(text.contains("\"parameter\":null"), "{text}");
+        // A document written before the field existed still reads.
+        let old: crate::model::MemoryAccess = serde_json::from_str(
+            r#"{"direction":"read","size":null,"address_hint":null,"region":null,
+                "alloc_stack":[],"free_stack":[]}"#,
+        )
+        .unwrap();
+        assert!(old.parameter.is_none());
+    }
+
+    /// `null` means no capture ran; `[]` means one ran and found nothing.
+    #[test]
+    fn missing_and_empty_comparison_evidence_stay_distinct() {
+        let f = normalize(asan_record(), None);
+        let fuzz = f.fuzz.unwrap();
+        assert!(fuzz.input_to_state.is_none());
+        assert!(fuzz.access.is_none());
+        assert!(fuzz.arguments.is_none());
+        let mut raw = asan_record();
+        raw["gates"] = json!([]);
+        raw["gate_capture"] = json!({"input": "min_testcase.bin", "input_len": 6,
+            "status": "no_input_comparisons", "reason": "4 comparison(s) recorded"});
+        let fuzz = normalize(raw, None).fuzz.unwrap();
+        assert_eq!(fuzz.input_to_state, Some(Vec::new()));
+        assert_eq!(
+            fuzz.input_to_state_input.as_deref(),
+            Some("min_testcase.bin"),
+            "the offsets index the replayed file"
+        );
+        // A capture that could not run recorded nothing: not "ran and found
+        // no input bytes".
+        let mut raw = asan_record();
+        raw["gates"] = json!([]);
+        raw["gate_capture"] = json!({"input": "testcase.bin", "input_len": 6,
+            "status": "unavailable", "reason": "the harness binary was not found"});
+        let fuzz = normalize(raw, None).fuzz.unwrap();
+        assert!(fuzz.input_to_state.is_none(), "{:?}", fuzz.input_to_state);
+        assert!(fuzz.input_to_state_input.is_none());
+    }
+
+    /// The basis the entry's reachability was inferred from reaches the
+    /// results finding with its entry path.
+    #[test]
+    fn the_reachability_basis_reaches_the_results_finding() {
+        let mut raw = asan_record();
+        raw["input_reachability"] = json!("attacker_reachable");
+        raw["input_reachability_basis"] = json!({"rule": "const_byte_buffer", "param": "data",
+            "spelled_type": "rbuf_t", "resolved_type": "const uint8_t *",
+            "typedefs_resolved": true});
+        let finding = normalize(raw, None);
+        let reachability = finding.reachability.expect("an entry path");
+        assert_eq!(reachability["attacker_reachable"], true);
+        assert_eq!(reachability["reachability_basis"]["param"], "data");
+        assert_eq!(
+            reachability["reachability_basis"]["resolved_type"],
+            "const uint8_t *"
+        );
+    }
+
+    /// A finding whose input is all zero bytes, or whose method ran on an
+    /// object the harness built, carries a caveat that real callers may never
+    /// produce that state.
+    #[test]
+    fn constructed_input_states_are_caveated() {
+        let mut raw = asan_record();
+        raw["decoded_args"] = json!([
+            {"name": "receiver", "type": "Widget", "role": "receiver", "decoder": "factory Widget::make()"}
+        ]);
+        let (_tmp, finding) = normalize_dir(raw, None, |dir| {
+            std::fs::write(dir.join("testcase.bin"), [0u8; 8]).unwrap();
+        });
+        let caveats = finding.fidelity.caveats.join(" | ");
+        assert!(
+            caveats.contains("a real caller may never pass all-zero arguments"),
+            "{caveats}"
+        );
+        assert!(
+            caveats.contains(
+                "the method ran on an object bhf's harness constructed (factory Widget::make())"
+            ),
+            "{caveats}"
+        );
+        // The minimized input is the one judged, and a plain function has no
+        // receiver.
+        let (_tmp, finding) = normalize_dir(asan_record(), None, |dir| {
+            std::fs::write(dir.join("testcase.bin"), [0u8; 8]).unwrap();
+            std::fs::write(dir.join("min_testcase.bin"), [1u8]).unwrap();
+        });
+        assert!(
+            finding.fidelity.caveats.is_empty(),
+            "{:?}",
+            finding.fidelity.caveats
+        );
+    }
+
+    /// When a capture found no comparison evidence, the fuzz block says
+    /// whether it ran and why it found none, and how far the search for
+    /// operands computed from input bytes got.
+    #[test]
+    fn the_fuzz_block_says_why_a_capture_has_no_evidence() {
+        let mut raw = asan_record();
+        raw["gates"] = json!([]);
+        raw["gate_capture"] = json!({"input": "testcase.bin", "input_len": 64,
+            "status": "no_input_comparisons",
+            "reason": "4 comparison(s) recorded; no operand followed a change of the input bytes",
+            "derived_search": "partial", "searched_bytes": 10});
+        let fuzz = normalize(raw, None).fuzz.unwrap();
+        assert_eq!(fuzz.input_to_state, Some(Vec::new()));
+        assert_eq!(
+            fuzz.input_to_state_status.as_deref(),
+            Some("no_input_comparisons")
+        );
+        assert_eq!(
+            fuzz.input_to_state_reason.as_deref(),
+            Some("4 comparison(s) recorded; no operand followed a change of the input bytes")
+        );
+        let search = fuzz.input_to_state_search.expect("the search");
+        assert_eq!(
+            (
+                search.state.as_str(),
+                search.searched_bytes,
+                search.input_len
+            ),
+            ("partial", 10, 64)
+        );
+
+        // A capture that could not run has no evidence, but says why.
+        let mut raw = asan_record();
+        raw["gate_capture"] = json!({"input": "testcase.bin", "input_len": 6,
+            "status": "unavailable", "reason": "the harness binary was not found"});
+        let fuzz = normalize(raw, None).fuzz.unwrap();
+        assert!(fuzz.input_to_state.is_none());
+        assert_eq!(fuzz.input_to_state_status.as_deref(), Some("unavailable"));
+        assert_eq!(
+            fuzz.input_to_state_reason.as_deref(),
+            Some("the harness binary was not found")
+        );
+        assert!(fuzz.input_to_state_search.is_none());
+
+        // No capture at all: nothing to say.
+        let fuzz = normalize(asan_record(), None).fuzz.unwrap();
+        assert!(fuzz.input_to_state_status.is_none() && fuzz.input_to_state_reason.is_none());
+        // A document written before the fields existed still reads.
+        let mut old = serde_json::to_value(&fuzz).unwrap();
+        let object = old.as_object_mut().unwrap();
+        for key in [
+            "input_to_state_status",
+            "input_to_state_reason",
+            "input_to_state_search",
+        ] {
+            object.remove(key);
+        }
+        let back: crate::model::FuzzBlock = serde_json::from_value(old).unwrap();
+        assert!(back.input_to_state_status.is_none());
+    }
+
     #[test]
     fn auto_static_row_without_sink_takes_its_location_from_the_record() {
         let raw = json!({
@@ -1633,6 +2281,56 @@ mod tests {
         assert!(f.fidelity.forced);
         assert_eq!(f.confirmation.level, ConfirmationLevel::CrashLead);
         assert!(f.fidelity.caveats.iter().any(|c| c == "forced stub build"));
+    }
+
+    /// A harness that compiled only after bhf supplied headers or macro values
+    /// the build context lacked: its findings keep their severity but are
+    /// floored to low confidence, carry the caveat naming what was supplied,
+    /// and keep the record under `reproduce.build.fidelity`.
+    #[test]
+    fn findings_from_a_fabricated_build_context_are_floored_and_named() {
+        let mut raw = asan_record();
+        raw["build"] = json!({
+            "fidelity": {
+                "level": "reduced",
+                "context": "exact_tu_compile_database",
+                "fabricated": [
+                    {"kind": "macro", "name": "WIDGET_SLOTS", "value": "0"},
+                    {"kind": "header", "name": "tables.h"}
+                ]
+            }
+        });
+        let f = normalize(raw, None);
+        assert_eq!(f.confidence.level, "low");
+        assert!(
+            f.severity > Severity::Low,
+            "severity is not floored: {:?}",
+            f.severity
+        );
+        let caveat = f
+            .fidelity
+            .caveats
+            .iter()
+            .find(|c| c.contains("build context"))
+            .unwrap_or_else(|| panic!("no build-context caveat: {:?}", f.fidelity.caveats));
+        assert!(caveat.contains("macro WIDGET_SLOTS=0"), "{caveat}");
+        assert!(caveat.contains("header tables.h"), "{caveat}");
+        let fidelity = f
+            .reproduce
+            .as_ref()
+            .and_then(|r| r.build.fidelity.as_ref())
+            .expect("reproduce.build.fidelity");
+        assert_eq!(fidelity.level, "reduced");
+        assert_eq!(fidelity.fabricated.len(), 2);
+
+        let plain = normalize(asan_record(), None);
+        assert!(plain.reproduce.as_ref().unwrap().build.fidelity.is_none());
+        assert_ne!(plain.confidence.level, "low");
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(
+            json["reproduce"]["build"].get("fidelity").is_none(),
+            "an exact build adds nothing to its record: {json}"
+        );
     }
 
     #[test]
@@ -2239,9 +2937,11 @@ mod tests {
         let (_tmp, f) = normalize_dir(asan_record(), None, |dir| {
             std::fs::write(dir.join("replay.py"), b"print()").unwrap();
         });
+        // Windows' Python launcher is `python`.
+        let python = if cfg!(windows) { "python" } else { "python3" };
         assert_eq!(
             f.reproduce.as_ref().unwrap().command.as_deref(),
-            Some("python3 findings/F-0000-1a2b3c4d/replay.py")
+            Some(format!("{python} findings/F-0000-1a2b3c4d/replay.py").as_str())
         );
     }
 
@@ -2254,6 +2954,88 @@ mod tests {
         let frames = project_frames(&exception, Some(std::path::Path::new("D:/w")));
         assert_eq!(frames.len(), 1, "{frames:?}");
         assert_eq!(frames[0].file.as_deref(), Some("src/y.c"));
+    }
+
+    /// glibc's start-up frames carry component-relative paths
+    /// (`csu/../csu/libc-start.c`) that no source root can resolve; they are
+    /// libc, not project code, with or without a known root.
+    #[test]
+    fn relative_libc_start_frames_are_not_project_frames() {
+        let exception = json!({"stack": [
+            {"function": "Widget::parse_record", "file": "/w/src/widget.cc", "line": 8},
+            {"function": "__libc_start_call_main", "file": "csu/../sysdeps/nptl/libc_start_call_main.h", "line": 58},
+            {"function": "__libc_start_main", "file": "csu/../csu/libc-start.c", "line": 360},
+            {"function": "__memcmp_avx2_movbe", "file": "./string/../sysdeps/x86_64/multiarch/memcmp-avx2-movbe.S", "line": 84}
+        ]});
+        for root in [Some(std::path::Path::new("/w")), None] {
+            let frames = project_frames(&exception, root);
+            let names: Vec<&str> = frames
+                .iter()
+                .filter_map(|f| f.function.as_deref())
+                .collect();
+            assert_eq!(names, ["Widget::parse_record"], "root {root:?}");
+        }
+    }
+
+    /// An `assert()` abort runs through glibc's `assert/assert.c`; those frames
+    /// are libc whether or not a source root is known. With a root on disk, a
+    /// relative path that names no file under it is not project code either,
+    /// while one that does stays.
+    #[test]
+    fn relative_frames_that_do_not_resolve_under_the_root_are_not_project_frames() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/widget.c"), "int f(void);\n").unwrap();
+        let project = root.join("src/widget.c");
+        let exception = json!({"stack": [
+            {"function": "__assert_fail_base", "file": "assert/assert.c", "line": 96},
+            {"function": "__assert_fail", "file": "assert/assert.c", "line": 105},
+            {"function": "check_record", "file": project.to_str().unwrap(), "line": 3},
+            {"function": "copy_at", "file": "src/widget.c", "line": 9},
+            {"function": "raise", "file": "signal/../sysdeps/posix/raise.c", "line": 26},
+            {"function": "unmapped", "file": "build/gen/table.c", "line": 4},
+            {"function": "main", "file": project.to_str().unwrap(), "line": 4}
+        ]});
+        let names = |root: Option<&Path>| -> Vec<String> {
+            project_frames(&exception, root)
+                .into_iter()
+                .filter_map(|f| f.function)
+                .collect()
+        };
+        assert_eq!(names(Some(root)), ["check_record", "copy_at", "main"]);
+        // No root to resolve against: the glibc component list decides.
+        assert_eq!(names(None), ["check_record", "copy_at", "unmapped", "main"]);
+    }
+
+    /// Without a source root, a relative frame under a directory named like a
+    /// glibc component (`./io/scaled_reader.cpp`) is project code unless its function
+    /// is libc's own.
+    #[test]
+    fn relative_project_frames_in_glibc_named_dirs_stay_project_frames() {
+        let exception = json!({"stack": [
+            {"function": "read_scaled(int)", "file": "./io/scaled_reader.cpp", "line": 4},
+            {"function": "__GI___libc_read", "file": "io/read.c", "line": 26},
+            {"function": "__libc_start_call_main", "file": "../sysdeps/nptl/libc_start_call_main.h", "line": 58}
+        ]});
+        let names: Vec<String> = project_frames(&exception, None)
+            .into_iter()
+            .filter_map(|f| f.function)
+            .collect();
+        assert_eq!(names, ["read_scaled(int)"]);
+    }
+
+    /// A project directory that shares a name with a glibc component
+    /// (`malloc/`, `string/`) is still project code once made root-relative.
+    #[test]
+    fn project_dirs_named_like_libc_components_stay_project_frames() {
+        let exception = json!({"stack": [
+            {"function": "arena_grow", "file": "/w/malloc/arena.c", "line": 12},
+            {"function": "str_split", "file": "/w/string/split.c", "line": 7}
+        ]});
+        let frames = project_frames(&exception, Some(std::path::Path::new("/w")));
+        let files: Vec<&str> = frames.iter().filter_map(|f| f.file.as_deref()).collect();
+        assert_eq!(files, ["malloc/arena.c", "string/split.c"]);
     }
 
     #[test]

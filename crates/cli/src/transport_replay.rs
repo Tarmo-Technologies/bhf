@@ -59,22 +59,70 @@ struct FaultIdentity {
     site: String,
 }
 
-/// Replay a transport finding. Returns 0 (MATCH), 3 (MISMATCH), or 1 (error).
+/// `bhf replay` of a transport finding with the default output. Returns 0
+/// (MATCH), 3 (MISMATCH), or 1 (error).
+#[cfg(all(test, unix))]
 pub(crate) fn replay_transport_finding(finding_dir: &Path, endpoint: Option<&str>) -> i32 {
+    crate::replay::finish_lane(
+        finding_dir,
+        replay_transport_outcome(finding_dir, endpoint),
+        crate::replay::OutputMode::default(),
+    )
+}
+
+/// A transport replay's verdict, for [`crate::replay::finish_lane`].
+fn transport_lane(
+    matched: bool,
+    status_line: String,
+    compared: String,
+    differences: Vec<String>,
+    spec: &str,
+    exit: crate::replay::ExitSummary,
+    history: &'static str,
+) -> crate::replay::LaneReplay {
+    crate::replay::LaneReplay {
+        lane: "transport",
+        matched,
+        status_line,
+        compared,
+        differences,
+        details: vec![crate::replay::Detail::new("transport", spec)],
+        exit: Some(exit),
+        history,
+        ..Default::default()
+    }
+}
+
+/// How the re-driven input ended on the target.
+fn transport_exit(exit: ExitKind, elapsed: Duration) -> crate::replay::ExitSummary {
+    let state = match exit {
+        ExitKind::Ok => "completed",
+        ExitKind::Crash => "faulted",
+        ExitKind::Timeout => "timed out",
+    };
+    crate::replay::ExitSummary::described(
+        None,
+        None,
+        exit == ExitKind::Timeout,
+        elapsed,
+        format!("{state} after {:.2}s", elapsed.as_secs_f64()),
+    )
+}
+
+/// Replay a transport finding: rebuild its transport, re-drive the recorded
+/// input and compare the fault identity (or, for a deadline finding, the
+/// timing predicate). An unreachable or unbuildable transport is an error.
+pub(crate) fn replay_transport_outcome(
+    finding_dir: &Path,
+    endpoint: Option<&str>,
+) -> Result<crate::replay::LaneReplay, String> {
     let profile_path = finding_dir.join(TRANSPORT_PROFILE_FILE);
-    let profile: serde_json::Value = match std::fs::read(&profile_path)
+    let profile: serde_json::Value = std::fs::read(&profile_path)
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-    {
-        Some(value) => value,
-        None => {
-            bhfeprintln!("read transport profile {}", profile_path.display());
-            return 1;
-        }
-    };
+        .ok_or_else(|| format!("read transport profile {}", profile_path.display()))?;
     let Some(recorded_spec) = profile.get("spec").and_then(|v| v.as_str()) else {
-        bhfeprintln!("transport profile has no spec; cannot rebuild the target");
-        return 1;
+        return Err("transport profile has no spec; cannot rebuild the target".to_owned());
     };
     let coverage_map = profile
         .get("coverage_map")
@@ -101,65 +149,32 @@ pub(crate) fn replay_transport_finding(finding_dir: &Path, endpoint: Option<&str
 
     // Relocate the endpoint if the operator supplied one (the recorded endpoint
     // is often gone or unreachable from the replay host).
-    let spec = match relocate_endpoint(recorded_spec, endpoint) {
-        Ok(spec) => spec,
-        Err(error) => {
-            bhfeprintln!("{error}");
-            return 1;
-        }
-    };
+    let spec = relocate_endpoint(recorded_spec, endpoint)?;
 
-    let input = match std::fs::read(finding_dir.join("testcase.bin")) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            bhfeprintln!("read testcase: {error}");
-            return 1;
-        }
-    };
+    let input = std::fs::read(finding_dir.join("testcase.bin"))
+        .map_err(|error| format!("read testcase: {error}"))?;
 
-    let recorded = match recorded_identity(finding_dir) {
-        Ok(identity) => identity,
-        Err(error) => {
-            bhfeprintln!("{error}");
-            return 1;
-        }
-    };
+    let recorded = recorded_identity(finding_dir)?;
 
     // Rebuild the transport from the (possibly relocated) spec and re-drive the
     // input through it. Fail explicitly rather than host-executing.
-    let plan = match TransportPlan::parse(&spec, coverage_map.as_deref()) {
-        Ok(plan) => plan,
-        Err(error) => {
-            bhfeprintln!("rebuild transport from profile: {error}");
-            return 1;
-        }
-    };
-    let transport = match plan.into_transport(per_input_timeout) {
-        Ok(transport) => transport,
-        Err(error) => {
-            bhfeprintln!("rebuild transport from profile: {error}");
-            return 1;
-        }
-    };
-    let mut session = match transport.arm() {
-        Ok(session) => session,
-        Err(error) => {
-            bhfeprintln!(
-                "could not reach the recorded transport ({spec}): {error}; \
-                 relocate it with --transport-endpoint HOST:PORT"
-            );
-            return 1;
-        }
-    };
+    let plan = TransportPlan::parse(&spec, coverage_map.as_deref())
+        .map_err(|error| format!("rebuild transport from profile: {error}"))?;
+    let transport = plan
+        .into_transport(per_input_timeout)
+        .map_err(|error| format!("rebuild transport from profile: {error}"))?;
+    let mut session = transport.arm().map_err(|error| {
+        format!(
+            "could not reach the recorded transport ({spec}): {error}; \
+             relocate it with --transport-endpoint HOST:PORT"
+        )
+    })?;
     let started = Instant::now();
-    let outcome = match session.run_input(&input) {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            bhfeprintln!("re-driving the recorded input through the transport failed: {error}");
-            return 1;
-        }
-    };
+    let outcome = session.run_input(&input).map_err(|error| {
+        format!("re-driving the recorded input through the transport failed: {error}")
+    })?;
     let elapsed = started.elapsed();
+    let exit = transport_exit(outcome.exit, elapsed);
 
     // A "completed-but-slow" deadline finding (BHF-555, emitted by the deadline
     // oracle on an Ok run) reproduces no fault — so a fault-identity check would
@@ -171,61 +186,112 @@ pub(crate) fn replay_transport_finding(finding_dir: &Path, endpoint: Option<&str
     // reproduction of the slow-clean run (#70 re-review).
     if recorded_exception_name(finding_dir).as_deref() == Some(DEADLINE_EXCEPTION_NAME) {
         let Some(deadline) = deadline else {
-            bhfeprintln!(
+            return Err(format!(
                 "deadline finding {} carries no recorded deadline in its transport profile; \
                  cannot evaluate the timing predicate",
                 finding_dir.display()
-            );
-            return 1;
+            ));
         };
+        let compared = format!(
+            "completed-but-slow outcome (a clean run longer than {}ms)",
+            deadline.as_millis()
+        );
         if outcome.exit != ExitKind::Ok {
-            bhfeprintln!(
+            let line = format!(
                 "MISMATCH recorded=slow-clean(>{}ms) actual={:?} (a crash/timeout is a \
                  different outcome, not a reproduction of the completed-but-slow run)",
                 deadline.as_millis(),
                 outcome.exit
             );
-            return 3;
+            let difference = format!("outcome: recorded slow-clean, replayed {:?}", outcome.exit);
+            return Ok(transport_lane(
+                false,
+                line,
+                compared,
+                vec![difference],
+                &spec,
+                exit,
+                "replay (transport timing)",
+            ));
         }
         if elapsed > deadline {
-            let _ = corpus::finding::touch_last_seen(finding_dir, "replay (transport timing)");
-            println!("MATCH");
-            return 0;
+            return Ok(transport_lane(
+                true,
+                "MATCH".to_owned(),
+                compared,
+                Vec::new(),
+                &spec,
+                exit,
+                "replay (transport timing)",
+            ));
         }
-        bhfeprintln!(
+        let line = format!(
             "MISMATCH recorded=slow-clean(>{}ms) actual=clean({}ms) (within the deadline)",
             deadline.as_millis(),
             elapsed.as_millis()
         );
-        return 3;
+        let difference = format!(
+            "duration: recorded longer than {}ms, replayed {}ms",
+            deadline.as_millis(),
+            elapsed.as_millis()
+        );
+        return Ok(transport_lane(
+            false,
+            line,
+            compared,
+            vec![difference],
+            &spec,
+            exit,
+            "replay (transport timing)",
+        ));
     }
 
+    let compared = format!(
+        "fault identity {}|{} (rule and fault site)",
+        recorded.rule_id, recorded.site
+    );
     let actual = replay_identity(&outcome);
-    match actual {
-        Some(actual) if actual == recorded => {
-            let _ = corpus::finding::touch_last_seen(finding_dir, "replay (transport)");
-            println!("MATCH");
-            0
-        }
-        Some(actual) => {
-            bhfeprintln!(
+    Ok(match actual {
+        Some(actual) if actual == recorded => transport_lane(
+            true,
+            "MATCH".to_owned(),
+            compared,
+            Vec::new(),
+            &spec,
+            exit,
+            "replay (transport)",
+        ),
+        Some(actual) => transport_lane(
+            false,
+            format!(
                 "MISMATCH recorded={}|{} actual={}|{}",
-                recorded.rule_id,
-                recorded.site,
-                actual.rule_id,
-                actual.site
-            );
-            3
-        }
-        None => {
-            bhfeprintln!(
+                recorded.rule_id, recorded.site, actual.rule_id, actual.site
+            ),
+            compared,
+            vec![format!(
+                "fault: recorded {}|{}, replayed {}|{}",
+                recorded.rule_id, recorded.site, actual.rule_id, actual.site
+            )],
+            &spec,
+            exit,
+            "replay (transport)",
+        ),
+        None => transport_lane(
+            false,
+            format!(
                 "MISMATCH recorded={}|{} actual=<no fault reproduced>",
-                recorded.rule_id,
-                recorded.site
-            );
-            3
-        }
-    }
+                recorded.rule_id, recorded.site
+            ),
+            compared,
+            vec![format!(
+                "fault: recorded {}|{}, no fault reproduced",
+                recorded.rule_id, recorded.site
+            )],
+            &spec,
+            exit,
+            "replay (transport)",
+        ),
+    })
 }
 
 /// Reconstruct the recorded fault identity from `finding.json`: its `rule_id`

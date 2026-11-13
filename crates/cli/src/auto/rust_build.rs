@@ -3631,6 +3631,7 @@ fn emit_rust_portability(
             libfuzzer_binary: Some("main_libfuzzer".to_owned()),
             afl_binary: None,
             crash_on_finding_env: false,
+            passthrough_entrypoint: false,
         },
     );
     if wrote.is_err() {
@@ -4269,7 +4270,14 @@ fn rewrite_path_value(line: &str, base: &Path) -> String {
     if abs.starts_with(base) {
         return line.to_owned();
     }
-    let abs = abs.to_string_lossy();
+    // Inside a TOML basic string a `\` starts an escape (`C:\Users` is an
+    // invalid `\U` escape), so a Windows path is written with `/`, which
+    // cargo accepts.
+    let abs = if cfg!(windows) {
+        abs.to_string_lossy().replace('\\', "/")
+    } else {
+        abs.to_string_lossy().into_owned()
+    };
     let mut out = String::with_capacity(line.len() + abs.len());
     out.push_str(&line[..range.start]);
     out.push_str(&abs);
@@ -4836,6 +4844,7 @@ mod tests {
 
     /// A trivial `-fsanitize=fuzzer` C link must succeed (the compiler-rt fuzzer
     /// runtime is not on every box). Gates the Rust libFuzzer e2e below.
+    #[cfg(unix)]
     fn libfuzzer_runtime_available() -> bool {
         let dir = std::env::temp_dir().join(format!("bhf-rust-lf-smoke-{}", std::process::id()));
         if std::fs::create_dir_all(&dir).is_err() {
@@ -4865,6 +4874,8 @@ mod tests {
     /// libFuzzer-instrumented build linked with the `bhf_libfuzzer.c` shim), and
     /// confirm the resulting binary drives `bhf_run_one` to a crash. Skips cleanly
     /// without a nightly toolchain or the libFuzzer runtime.
+    // build-libfuzzer.sh is a POSIX shell script.
+    #[cfg(unix)]
     #[test]
     fn rust_build_libfuzzer_script_produces_a_working_libfuzzer_binary() {
         let Some(toolchain) = probe_toolchain() else {
@@ -6731,6 +6742,7 @@ mod tests {
             is_static: false,
             foreign_guard: None,
             input_reachability: None,
+            input_reachability_basis: None,
             dialect: None,
         }
     }

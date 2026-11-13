@@ -49,7 +49,10 @@ mod cmplog_cli;
 mod collector_run;
 mod command_output;
 mod corpus;
+mod coverage_kind;
+mod crash_identity;
 mod dashboard;
+mod decode_args;
 mod differential;
 mod env_capsule;
 mod explain;
@@ -60,6 +63,7 @@ mod fake_corba;
 mod fatal_signal;
 mod finding_arg;
 mod fuzz;
+mod gate_evidence;
 mod generate_harness;
 mod git_diff;
 mod instrument;
@@ -72,14 +76,20 @@ mod list_targets;
 mod llm;
 mod minimize;
 mod model;
+mod msvc_cc;
+mod offline_symbolize;
 mod pack;
 mod policy;
 mod probe_backend;
 mod project;
+mod protocol_detect;
 mod readiness;
 mod relational;
 mod replay;
+mod replay_debugger;
 mod report;
+mod report_backfill;
+mod repro_lane;
 mod resource_limits;
 mod rules;
 mod runner;
@@ -96,9 +106,11 @@ mod static_scan;
 mod stub;
 mod support_report;
 mod target_filter;
+mod toolchain;
 pub mod transport_fault;
 mod transport_fuzz;
 mod transport_replay;
+mod windows_env;
 pub mod workdir;
 
 #[derive(Debug, Parser)]
@@ -154,6 +166,20 @@ struct Args {
     #[arg(long, global = true)]
     debug: bool,
 
+    /// Windows: do not discover Visual Studio. By default, when `INCLUDE`/`LIB`
+    /// are not already set (no Developer shell), bhf finds the newest Visual
+    /// Studio or Build Tools instance with the C++ toolset (vswhere), applies
+    /// the environment its VsDevCmd sets (cached per instance), and uses the
+    /// standalone or Visual Studio-bundled clang when none is on PATH. Also
+    /// `BHF_NO_VS_ENV=1`.
+    #[arg(long = "no-vs-env", global = true, hide = !cfg!(windows))]
+    no_vs_env: bool,
+
+    /// Windows: target architecture of the discovered Visual Studio
+    /// environment (`x64`, `x86`, `arm64`). Default: this machine's.
+    #[arg(long = "vs-arch", global = true, value_name = "ARCH", hide = !cfg!(windows))]
+    vs_arch: Option<String>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -181,6 +207,13 @@ enum Command {
     /// List fuzzable targets in a source tree, or the bug-oracle inventory (`list targets` / `list oracles`)
     List(ListArgs),
     /// Generate an Ada/C/C++ fuzzing harness for one subprogram, with build-context recovery
+    ///
+    /// A generated C/C++ harness prints each decoded argument to stderr when it
+    /// runs with BHF_TRACE_ARGS=1. Set BHF_BUFFER_LEN_DIMENSION=1 while generating
+    /// to give a byte buffer that has no length parameter an explicit length read
+    /// from the input (off by default: a buffer shorter than the input can make a
+    /// function with an implicit length contract overflow it). The harness records
+    /// it only when it has such a buffer.
     GenerateHarness(generate_harness::GenerateHarnessArgs),
     /// Compile a generated harness (toolchain auto-detect, cross-compile, GNAT/GPRbuild/clang, probe backend)
     Build(build::BuildArgs),
@@ -202,13 +235,13 @@ enum Command {
     Corpus(corpus::CorpusArgs),
     /// Shrink a crashing input by binary search while preserving the crash (testcase reduction)
     Minimize(minimize::MinimizeArgs),
-    /// Re-run a finding's crash input through a harness to reproduce it (sandbox / qemu-user)
+    /// Re-run a finding's crash input through a harness to reproduce it: MATCH (exit 0) only on the same rule, kind, signal and sink (or reported site), MISMATCH (exit 3), or UNVERIFIED (exit 4) when where it crashed could not be compared; with a crash summary, --json and --show-output (sandbox / qemu-user)
     Replay(replay::ReplayArgs),
-    /// Package a crash into a portable, self-verifying PoC capsule (min input + harness + recovered build + stubs)
+    /// Package a crash from a harness in any language bhf generates into a portable, self-verifying PoC capsule (input + harness + sources + recorded build + stubs + vendored dependencies); a harness that cannot rebuild offline is refused with the reason
     Capsule(capsule::CapsuleArgs),
-    /// Rebuild a PoC capsule offline and assert the crash reproduces (only clang + a shell needed)
+    /// Rebuild a PoC capsule offline and assert the recorded crash reproduces, compared as bhf replay compares it (only the lane's toolchain, as the manifest lists it, + a shell needed; on Windows a C or C++ capsule rebuilds with its build.ps1 and cl, clang-cl or clang, no POSIX shell)
     VerifyPoc(capsule::VerifyPocArgs),
-    /// Record + replay the shim-served faked environment so an environment-driven crash reproduces deterministically
+    /// Record + replay the shim-served faked environment so an environment-driven crash of a native harness (C, C++, Ada, Rust, COBOL, Fortran) reproduces deterministically
     EnvCapsule(env_capsule::EnvCapsuleArgs),
     /// Replay inputs through two harnesses or metamorphic variants and flag divergences (BHF-301 oracle)
     Differential(differential::DifferentialArgs),
@@ -216,10 +249,12 @@ enum Command {
     Relational(relational::RelationalArgs),
     /// Recover comparison operands (cmplog / RedQueen) from a runtrace log into a fuzzing dictionary
     Cmplog(cmplog_cli::CmplogArgs),
-    /// Explain, offline and deterministically (no LLM), WHY a crash fired: input, gate constants, faked env, dataflow
+    /// Explain, offline (no LLM), WHY a crash fired: the minimized input, the comparisons it reached, the environment it touched, reachability, each with its evidence
     Explain(explain::ExplainArgs),
-    /// Map which input bytes control which sink operand (offset/size/index) via perturbation — the exploit primitive
+    /// Map which input bytes of a C/C++ crash control which sink operand (offset/size/index, or a SEGV's faulting address) via perturbation — the exploit primitive
     Cartography(cartography::CartographyArgs),
+    /// Map a testcase (or a finding's) to the value each C/C++ harness parameter receives: the harness's own argument trace when it can run, else a static decode from its arg-layout.json that names what it cannot decode
+    DecodeArgs(decode_args::DecodeArgsArgs),
 
     // ── Binaries: no-source / firmware analysis ─────────────────────────────
     /// No-source analysis of compiled binaries & firmware: scan, adapter, fuzz (CVE/SBOM, Rizin/Ghidra/angr, black-box)
@@ -345,12 +380,35 @@ enum ListCommand {
     Oracles(list_oracles::ListOraclesArgs),
 }
 
+/// The `bhf` executable answers to other names: `bhf-cl` is the MSVC front
+/// end of the cl harness lane, and a compiler's name (`cl.exe`, `clang.exe`)
+/// inside a Windows build-capture shim directory is that capture shim.
+fn run_multicall(argv: &[std::ffi::OsString]) -> Option<i32> {
+    let stem = std::path::Path::new(argv.first()?)
+        .file_stem()?
+        .to_str()?
+        .to_ascii_lowercase();
+    if stem == msvc_cc::FRONT_END_STEM {
+        return Some(msvc_cc::run(&argv[1..]));
+    }
+    if std::env::var_os(auto::build_probe::SHIM_MAP_ENV).is_some()
+        && auto::build_probe::is_intercept_shim_name(&stem)
+    {
+        return Some(auto::build_probe::run_intercept_shim(&stem, &argv[1..]));
+    }
+    None
+}
+
 pub fn run_from<I, T>(args: I) -> i32
 where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
 {
-    let args = match Args::try_parse_from(args) {
+    let argv: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
+    if let Some(code) = run_multicall(&argv) {
+        return code;
+    }
+    let args = match Args::try_parse_from(argv) {
         Ok(args) => args,
         Err(error) => {
             let _ = error.print();
@@ -371,6 +429,16 @@ where
         return 2;
     }
 
+    #[cfg(windows)]
+    if args.command.is_some() {
+        let environment = windows_env::activate(&windows_env::ActivationOptions {
+            disabled: args.no_vs_env,
+            arch: args.vs_arch.clone(),
+        });
+        if environment.source != "developer_shell" {
+            eprintln!("bhf: build environment: {}", environment.summary());
+        }
+    }
     #[cfg(windows)]
     build::activate_windows_clang_runtime();
 
@@ -468,6 +536,7 @@ where
             )
         }
         Some(Command::Explain(args)) => explain::run(args),
+        Some(Command::DecodeArgs(args)) => decode_args::run(args),
         Some(Command::Cartography(args)) => {
             let work = args.work_dir.clone();
             with_results(
@@ -550,12 +619,27 @@ where
                 bhfeprintln!("error: {error:#}");
                 return 1;
             }
+            // Replay findings that lack the evidence a current run records
+            // before the index is rebuilt from them, with the toolchain (and
+            // so the symbolizer) `bhf auto` gives its fuzz children.
+            if report_args.backfill {
+                build::activate_compatible_clang();
+                report_backfill::run(&work);
+                let (captured, uncaptured) = gate_evidence::run_pass(&work);
+                bhfeprintln!(
+                    "bhf: backfill: comparison evidence recorded for {captured} finding(s); \
+                     {uncaptured} left for `bhf explain` (time budget)"
+                );
+            }
             match results::rebuild(&work, &results::RebuildOptions::default()) {
-                Ok(summary) => bhfeprintln!(
-                    "Results: {} ({} findings)",
-                    summary.index_path.display(),
-                    summary.findings
-                ),
+                Ok(summary) => {
+                    bhfeprintln!(
+                        "Results: {} ({} findings)",
+                        summary.index_path.display(),
+                        summary.findings
+                    );
+                    workdir::warn_about_damaged_inputs(&summary);
+                }
                 Err(error) => {
                     bhfeprintln!("error: results index not rebuilt: {error}");
                     return 1;
@@ -564,7 +648,12 @@ where
             report::run(report_args)
         }
         Some(Command::Report(report_args)) => report::run(report_args),
-        Some(Command::Replay(replay_args)) => replay::run(replay_args),
+        Some(Command::Replay(replay_args)) => {
+            // The same toolchain `auto` puts on PATH for its fuzz children, so
+            // a replay's sanitizer report is symbolized as theirs was.
+            build::activate_compatible_clang();
+            replay::run(replay_args)
+        }
         Some(Command::Rules(rules_args)) => rules::run(rules_args),
         Some(Command::Runners(args)) => runners::run(args),
         Some(Command::Scan(scan_args)) => scan::run(scan_args),
@@ -716,10 +805,13 @@ mod tests {
         super::with_results_in(&work, "static-scan", Some(&dotted), false, complete, || 0);
         let manifest: serde_json::Value =
             serde_json::from_slice(&fs::read(work.join("results/manifest.json")).unwrap()).unwrap();
+        // Resolved, and without Windows' `\\?\` prefix.
+        let root = manifest["source"]["root"].as_str().unwrap();
         assert_eq!(
-            manifest["source"]["root"].as_str(),
-            Some(src.canonicalize().unwrap().to_str().unwrap())
+            Path::new(root),
+            super::workdir::plain_canonical(&src).as_path()
         );
+        assert!(!root.starts_with(r"\\?\"), "{root}");
     }
 
     #[test]
@@ -1124,6 +1216,8 @@ mod tests {
         assert!(work_dir.join("fake_corba/corba-any.adb").is_file());
     }
 
+    // The fake `gprbuild` is a POSIX shell script.
+    #[cfg(unix)]
     #[test]
     fn build_subcommand_discovers_compiler_and_invokes_build() {
         let _lock = PATH_LOCK.lock().expect("path lock is acquired");
@@ -1145,6 +1239,8 @@ mod tests {
         assert!(work_dir.join("build/H-TEST/bhf_build.gpr").is_file());
     }
 
+    // The fake `gprbuild` is a POSIX shell script.
+    #[cfg(unix)]
     #[test]
     fn build_subcommand_includes_fake_corba_source_root_when_present() {
         let _lock = PATH_LOCK.lock().expect("path lock is acquired");
@@ -1171,6 +1267,8 @@ mod tests {
         assert!(project.contains("fake_corba"));
     }
 
+    // The fake `gprbuild` is a POSIX shell script.
+    #[cfg(unix)]
     #[test]
     fn build_subcommand_writes_build_local_runtime_project() {
         let _lock = PATH_LOCK.lock().expect("path lock is acquired");
@@ -1202,6 +1300,8 @@ mod tests {
             .is_file());
     }
 
+    // The fake `gprbuild` is a POSIX shell script.
+    #[cfg(unix)]
     #[test]
     fn build_instruments_target_with_trace_pc_but_not_runtime() {
         // #412: a real `bhf build` must produce a self-consistent coverage
@@ -1263,6 +1363,8 @@ mod tests {
         );
     }
 
+    // The fake `gprbuild` is a POSIX shell script.
+    #[cfg(unix)]
     #[test]
     fn build_subcommand_writes_cross_attributes_and_uses_prefixed_probe() {
         let _lock = PATH_LOCK.lock().expect("path lock is acquired");
@@ -1303,12 +1405,82 @@ mod tests {
         assert_eq!(exit, 0);
         assert!(project.contains("for Target use \"aarch64-linux-gnu\";"));
         assert!(project.contains("for Runtime (\"Ada\") use \"ravenscar-full\";"));
-        assert!(project.contains("for Toolchain_Name (\"Ada\") use \"aarch64-linux-gnu\";"));
+        // The prefix locates the tools; it is not a gprconfig compiler name.
+        assert!(!project.contains("Toolchain_Name"), "{project}");
         assert!(build_argv.contains("bhf_build.gpr"));
         assert!(gnat_argv.contains("aarch64-linux-gnu-gnat"));
         assert!(gnat_argv.contains("-gnatc"));
     }
 
+    /// `bhf build --config` reads the `[toolchain.ada]` table: an explicit
+    /// gprbuild, the runtime, extra switches and the probe backend reach the
+    /// generated project, and the prefix supplies its Target.
+    // The fake `gprbuild` is a POSIX shell script.
+    #[cfg(unix)]
+    #[test]
+    fn build_subcommand_reads_the_ada_toolchain_from_a_config_file() {
+        let _lock = PATH_LOCK.lock().expect("path lock is acquired");
+        let temp = temp_dir("build-ada-toolchain-config");
+        let work_dir = create_minimal_work_dir(&temp);
+        let tools = temp.join("tools");
+        fs::create_dir_all(&tools).expect("tool directory is created");
+        write_executable(&tools.join("my-gprbuild"), fake_build_compiler_script());
+        write_executable(&tools.join("my-gnat"), fake_raw_gnat_canary_script());
+        let build_log_path = temp.join("build-args.log");
+        let _build_log = EnvVarGuard::set("BHF_BUILD_LOG", build_log_path.as_os_str());
+        let config = temp.join("bhf.toml");
+        // A target-side probe backend belongs to a build for the target (a
+        // host build with one is refused: nothing would read its events).
+        let foreign = if std::env::consts::ARCH == "aarch64" {
+            "x86_64-linux-gnu"
+        } else {
+            "aarch64-linux-gnu"
+        };
+        fs::write(
+            &config,
+            format!(
+                "[toolchain.ada]\n\
+                 gprbuild = \"tools/my-gprbuild\"\n\
+                 gnat = \"tools/my-gnat\"\n\
+                 prefix = \"{foreign}\"\n\
+                 runtime = \"light\"\n\
+                 switches = [\"-O1\", \"-gnatVa\"]\n\
+                 probe-backend = \"memory_buffer\"\n"
+            ),
+        )
+        .expect("config is written");
+
+        let exit = run_from([
+            "bhf",
+            "build",
+            work_dir.to_str().expect("work dir path is utf-8"),
+            "--config",
+            config.to_str().expect("config path is utf-8"),
+        ]);
+
+        let project = fs::read_to_string(work_dir.join("build/H-TEST/bhf_build.gpr"))
+            .expect("project file is readable");
+        assert_eq!(exit, 0, "{project}");
+        assert!(
+            project.contains(&format!("for Target use \"{foreign}\";")),
+            "{project}"
+        );
+        assert!(
+            project.contains("for Runtime (\"Ada\") use \"light\";"),
+            "{project}"
+        );
+        assert!(!project.contains("Toolchain_Name"), "{project}");
+        assert!(project.contains("\"-O1\", \"-gnatVa\""), "{project}");
+        let build_argv = fs::read_to_string(build_log_path).expect("build argv log is readable");
+        assert!(build_argv.contains("bhf_build.gpr"), "{build_argv}");
+        let probe_body =
+            fs::read_to_string(work_dir.join("build/H-TEST/adafuzz_runtime_src/adafuzz-probe.adb"))
+                .expect("selected probe body is readable");
+        assert!(probe_body.contains("adafuzz_probe_memory_buffer"));
+    }
+
+    // The fake `gprbuild` is a POSIX shell script.
+    #[cfg(unix)]
     #[test]
     fn build_subcommand_writes_memory_buffer_probe_backend() {
         let _lock = PATH_LOCK.lock().expect("path lock is acquired");
@@ -1340,6 +1512,8 @@ mod tests {
         assert!(!probe_body.contains("Ada.Environment_Variables"));
     }
 
+    // The fake `gprbuild` is a POSIX shell script.
+    #[cfg(unix)]
     #[test]
     fn build_subcommand_writes_semihosting_probe_backend() {
         let _lock = PATH_LOCK.lock().expect("path lock is acquired");
@@ -1369,6 +1543,8 @@ mod tests {
         assert!(!probe_body.contains("Ada.Environment_Variables"));
     }
 
+    // The fake `gprbuild` is a POSIX shell script.
+    #[cfg(unix)]
     #[test]
     fn build_subcommand_writes_stub_probe_backend() {
         let _lock = PATH_LOCK.lock().expect("path lock is acquired");
@@ -1404,6 +1580,8 @@ mod tests {
     // `tests/cli_no_compiler.rs`: an empty PATH cannot be installed process-wide
     // without breaking tests running concurrently (see `PathEnvGuard::prepend`).
 
+    // The fake `gprbuild` is a POSIX shell script.
+    #[cfg(unix)]
     #[test]
     fn build_subcommand_returns_three_when_work_dir_missing() {
         let _lock = PATH_LOCK.lock().expect("path lock is acquired");
@@ -1422,6 +1600,8 @@ mod tests {
     // `stub_subcommand_returns_two_when_no_compiler` lives in
     // `tests/cli_no_compiler.rs`, for the same reason as the `build` case above.
 
+    // The fake `gprbuild` is a POSIX shell script.
+    #[cfg(unix)]
     #[test]
     fn stub_subcommand_returns_three_when_work_dir_missing() {
         let _lock = PATH_LOCK.lock().expect("path lock is acquired");
@@ -1437,6 +1617,8 @@ mod tests {
         assert_eq!(exit, 3);
     }
 
+    // The fake `gprbuild` is a POSIX shell script.
+    #[cfg(unix)]
     #[test]
     fn stub_subcommand_writes_manifest_on_success() {
         let _lock = PATH_LOCK.lock().expect("path lock is acquired");
@@ -1679,11 +1861,13 @@ mod tests {
         dir
     }
 
+    #[cfg(unix)]
     fn write_executable(path: &Path, contents: &str) {
         fs::write(path, contents).expect("fake compiler is written");
         make_executable(path);
     }
 
+    #[cfg(unix)]
     fn fake_build_compiler_script() -> &'static str {
         r#"#!/bin/sh
 if [ "$1" = "--version" ]; then
@@ -1703,6 +1887,7 @@ exit 0
 "#
     }
 
+    #[cfg(unix)]
     fn fake_raw_gnat_canary_script() -> &'static str {
         r#"#!/bin/sh
 if [ -n "$BHF_RAW_GNAT_LOG" ]; then
@@ -1724,10 +1909,12 @@ exit 1
 "#
     }
 
+    #[cfg(unix)]
     struct PathEnvGuard {
         original: Option<OsString>,
     }
 
+    #[cfg(unix)]
     impl PathEnvGuard {
         /// PREPEND `path` to the process `PATH` for the duration of a test, so a fake
         /// tool written there is found ahead of the real one.
@@ -1760,6 +1947,7 @@ exit 1
         }
     }
 
+    #[cfg(unix)]
     impl Drop for PathEnvGuard {
         fn drop(&mut self) {
             if let Some(original) = &self.original {
@@ -1770,11 +1958,13 @@ exit 1
         }
     }
 
+    #[cfg(unix)]
     struct EnvVarGuard {
         key: &'static str,
         original: Option<OsString>,
     }
 
+    #[cfg(unix)]
     impl EnvVarGuard {
         fn set<V>(key: &'static str, value: V) -> Self
         where
@@ -1786,6 +1976,7 @@ exit 1
         }
     }
 
+    #[cfg(unix)]
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             if let Some(original) = &self.original {
@@ -1806,7 +1997,4 @@ exit 1
         permissions.set_mode(0o755);
         fs::set_permissions(path, permissions).expect("fake compiler is executable");
     }
-
-    #[cfg(not(unix))]
-    fn make_executable(_path: &Path) {}
 }

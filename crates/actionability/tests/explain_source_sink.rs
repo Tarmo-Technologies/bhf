@@ -321,3 +321,121 @@ fn null_deref_explanation_classifies_as_crash() {
         hints[0].guidance
     );
 }
+
+/// A UBSan report without a stack names a file and line but no function. No
+/// surface may then render an empty name: no "``" in the explanation and no
+/// "(``)" in the fix guidance.
+#[test]
+fn frameless_ubsan_finding_never_renders_an_empty_function_name() {
+    let raw = json!({
+        "rule_id": "BHF-210",
+        "harness_id": "H-C0001",
+        "paths": { "testcase": "testcase.bin" },
+        "exception": {
+            "name": "UBSAN_UNDEFINED_BEHAVIOR",
+            "sanitizer": "ubsan",
+            "message": "/src/widget/classify.c:3:5: runtime error: execution reached the end of a value-returning function without returning a value",
+            "stack": []
+        }
+    });
+    let record = backfill_actionability(RunMode::Reporting, &raw, None);
+    let sink = record.sink.expect("the message location is the sink");
+    assert_eq!(sink.function, "");
+    let explanation = record.explanation.expect("explanation");
+    assert!(!explanation.contains("``"), "{explanation}");
+    assert!(explanation.contains("classify.c:3"), "{explanation}");
+    for hint in patch_hints_for_finding(&raw) {
+        assert!(!hint.guidance.contains("``"), "{}", hint.guidance);
+        assert!(hint.guidance.contains("classify.c:3"), "{}", hint.guidance);
+    }
+}
+
+/// An interceptor frame symbolized to the sanitizer runtime's own source is
+/// still runtime: the sink is the project frame that called `memcmp`.
+#[test]
+fn sink_skips_sanitizer_interceptor_frames_that_carry_a_source_file() {
+    let runtime = "/llvm/compiler-rt/lib/sanitizer_common/sanitizer_common_interceptors.inc";
+    let raw = json!({
+        "rule_id": "BHF-201",
+        "exception": {
+            "name": "ASAN_HEAP_BUFFER_OVERFLOW",
+            "sanitizer": "asan",
+            "stack": [
+                { "function": "__memcmp_avx2_movbe", "file": "string/../sysdeps/x86_64/multiarch/memcmp-avx2-movbe.S", "line": 84 },
+                { "function": "MemcmpInterceptorCommon(void*, int (*)(void const*, void const*, unsigned long), void const*, void const*, unsigned long)", "file": runtime, "line": 813 },
+                { "function": "bcmp", "file": runtime, "line": 860 },
+                { "function": "Widget::parse_record(unsigned char const*)", "file": "/src/widget/parser.cc", "line": 11 }
+            ]
+        }
+    });
+    let record = backfill_actionability(RunMode::Reporting, &raw, None);
+    let sink = record.sink.expect("sink");
+    assert_eq!(sink.function, "Widget::parse_record");
+    assert_eq!(sink.line, Some(11));
+}
+
+/// A project built with its paths made relative (`-ffile-prefix-map=<src>=.`)
+/// can keep its sources in directories named like glibc components (`io/`,
+/// `misc/`, `posix/`). A frame there is the project's unless its function is
+/// libc's own, so it stays the sink; glibc's start-up frames stay noise.
+#[test]
+fn sink_keeps_project_frames_in_dirs_named_like_glibc_components() {
+    let raw = json!({
+        "rule_id": "BHF-205",
+        "exception": {
+            "name": "UBSAN_SIGNED_INTEGER_OVERFLOW",
+            "sanitizer": "ubsan",
+            "stack": [
+                { "function": "read_scaled(int)", "file": "./io/scaled_reader.cpp", "line": 4 },
+                { "function": "Widget::load()", "file": "./misc/widget.cpp", "line": 9 },
+                { "function": "__libc_start_call_main", "file": "../sysdeps/nptl/libc_start_call_main.h", "line": 58 },
+                { "function": "__libc_start_main", "file": "csu/../csu/libc-start.c", "line": 360 }
+            ]
+        }
+    });
+    let record = backfill_actionability(RunMode::Reporting, &raw, None);
+    let sink = record.sink.expect("the project frame is the sink");
+    assert_eq!(sink.function, "read_scaled");
+    assert_eq!(sink.file.as_deref(), Some("./io/scaled_reader.cpp"));
+    assert_eq!(sink.line, Some(4));
+    for (function, file) in [
+        ("read_scaled(int)", "./io/scaled_reader.cpp"),
+        ("Widget::load()", "misc/widget.cpp"),
+        ("parse_options", "posix/options.c"),
+        ("load_section", "./elf/loader.c"),
+        ("walk_tree", "io/tree_walk.c"),
+    ] {
+        assert!(
+            !actionability::is_runtime_noise_frame(function, Some(file)),
+            "{function} at {file} is project code"
+        );
+    }
+    for (function, file) in [
+        (
+            "__libc_start_call_main",
+            "../sysdeps/nptl/libc_start_call_main.h",
+        ),
+        ("__libc_start_main", "csu/../csu/libc-start.c"),
+        ("__GI___libc_read", "io/read.c"),
+        ("raise", "signal/../sysdeps/posix/raise.c"),
+        ("abort", "stdlib/abort.c"),
+        ("__assert_fail", "assert/assert.c"),
+        ("_dl_start_user", "elf/rtld.c"),
+        ("start_thread", "nptl/pthread_create.c"),
+        ("_IO_new_fopen", "libio/iofopen.c"),
+        // glibc's static helpers carry no reserved prefix; their source file
+        // is glibc's own.
+        ("parse_expression", "posix/regcomp.c"),
+        ("re_search_internal", "./posix/regexec.c"),
+        ("glob_in_dir", "posix/glob.c"),
+        ("call_init", "./elf/dl-init.c"),
+        ("dl_open_worker", "elf/dl-open.c"),
+        ("fts_build", "io/fts.c"),
+        ("maybe_split_for_insert", "misc/tsearch.c"),
+    ] {
+        assert!(
+            actionability::is_runtime_noise_frame(function, Some(file)),
+            "{function} at {file} is libc"
+        );
+    }
+}

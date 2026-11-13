@@ -49,6 +49,9 @@ source-generated harnesses and a permissively licensed core.
   make it up.
 - [C and C++ Fuzzing](./c-cpp/) — C/C++ prerequisites, manual commands,
   supported API shapes, engine modes, and current limits.
+- [Custom C and C++ Harnesses](./custom-harness/) — write your own
+  `LLVMFuzzerTestOneInput` or edit a generated harness, then build, fuzz and
+  triage it with bhf.
 - [C#](./csharp/), [JavaScript and TypeScript](./javascript/),
   [COBOL](./cobol/), and [Fortran](./fortran/) — lane-specific setup, coverage,
   harness behavior, and limitations.

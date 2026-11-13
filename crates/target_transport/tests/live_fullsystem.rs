@@ -36,6 +36,9 @@
 //!
 //! Self-skips loudly ONLY when a tool is absent; `BHF_HIL_REQUIRE=1`
 //! (scripts/hil-emu.sh) turns a missing tool into a hard failure.
+//!
+//! The shared emulator helpers use Unix sockets: Unix hosts only.
+#![cfg(unix)]
 
 mod common;
 

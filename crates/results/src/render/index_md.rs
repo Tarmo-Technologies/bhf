@@ -22,7 +22,72 @@ pub struct IndexContext {
     pub has_sbom_dir: bool,
     /// Root-cause groups whose representative was not minimized in budget.
     pub unminimized_groups: usize,
+    /// Inputs of a work dir from an earlier release that look damaged.
+    pub damaged_inputs: Option<crate::migrate::DamagedInputs>,
 }
+
+/// Most finding ids the damaged-input warning names.
+const MAX_DAMAGED_FINDINGS_SHOWN: usize = 20;
+
+/// The warning about inputs an earlier release's seed encoding damaged.
+pub fn damaged_inputs_line(damaged: &crate::migrate::DamagedInputs) -> String {
+    let mut parts = Vec::new();
+    if !damaged.findings.is_empty() {
+        let mut ids = damaged
+            .findings
+            .iter()
+            .take(MAX_DAMAGED_FINDINGS_SHOWN)
+            .map(|id| format!("`{}`", md_code(id)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if damaged.findings.len() > MAX_DAMAGED_FINDINGS_SHOWN {
+            let _ = write!(
+                ids,
+                " and {} more",
+                damaged.findings.len() - MAX_DAMAGED_FINDINGS_SHOWN
+            );
+        }
+        parts.push(format!("the testcases of {ids}"));
+    }
+    if damaged.corpus_entries > 0 {
+        parts.push(format!(
+            "{} corpus {} under the work dir's `corpus/`{}",
+            damaged.corpus_entries,
+            if damaged.corpus_entries == 1 {
+                "entry"
+            } else {
+                "entries"
+            },
+            if damaged.truncated {
+                " (the first entries scanned)"
+            } else {
+                ""
+            }
+        ));
+    }
+    let total = damaged.total();
+    format!(
+        "{total} {} runs of `EF BF BD` (U+FFFD, the UTF-8 replacement character): {}. \
+         This work dir holds data from an earlier bhf release, whose seed encoding replaced every \
+         invalid UTF-8 byte of a seed with it, so these are likely damaged copies of binary seeds \
+         rather than real inputs. Re-run `bhf auto` into a fresh work dir to fuzz from the \
+         original seeds.",
+        if total == 1 {
+            "input contains"
+        } else {
+            "inputs contain"
+        },
+        parts.join(" and ")
+    )
+}
+
+/// On Windows a sanitized harness needs the sanitizer runtime DLL's directory
+/// on PATH; replay.py adds it (a direct `main.exe` run needs the same).
+const REPRODUCE_PLATFORM_NOTE: &str = if cfg!(windows) {
+    " (it puts the sanitizer runtime DLL directory on PATH; set the same PATH to run the harness directly)"
+} else {
+    ""
+};
 
 pub fn render_index(doc: &FindingsDocument, ctx: &IndexContext) -> String {
     let mut out = String::from("# BHF results\n\n");
@@ -142,6 +207,9 @@ pub fn render_index(doc: &FindingsDocument, ctx: &IndexContext) -> String {
             ctx.unminimized_groups
         );
     }
+    if let Some(damaged) = &ctx.damaged_inputs {
+        let _ = writeln!(out, "- ⚠ {}", damaged_inputs_line(damaged));
+    }
     out.push('\n');
 
     if doc.findings.is_empty() {
@@ -228,6 +296,71 @@ pub fn render_index(doc: &FindingsDocument, ctx: &IndexContext) -> String {
             };
             let _ = writeln!(out, "- Component: `{}`{fixed}", md_code(&package));
         }
+        if let Some(access) = rep.fuzz.as_ref().and_then(|fuzz| fuzz.access.as_ref()) {
+            let _ = writeln!(
+                out,
+                "- Memory access: {}{}",
+                md_text(&access_text(access)),
+                access_parameter_text(access)
+            );
+        }
+        if let Some(gates) = rep
+            .fuzz
+            .as_ref()
+            .and_then(|fuzz| fuzz.input_to_state.as_deref())
+            .filter(|gates| !gates.is_empty())
+        {
+            let shown = gates
+                .iter()
+                .take(MAX_GATES_SHOWN)
+                .map(|g| {
+                    let site = g
+                        .site_location
+                        .as_ref()
+                        .map(|l| match l.line {
+                            Some(line) => format!(" at `{}:{line}`", md_code(&l.file)),
+                            None => format!(" at `{}`", md_code(&l.file)),
+                        })
+                        .unwrap_or_default();
+                    format!(
+                        "bytes {}..{} → {}{site}",
+                        g.offset,
+                        g.offset + g.len,
+                        md_text(&g.cmp_kind)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" · ");
+            let more = if gates.len() > MAX_GATES_SHOWN {
+                format!(" · … {} more", gates.len() - MAX_GATES_SHOWN)
+            } else {
+                String::new()
+            };
+            let input = rep
+                .fuzz
+                .as_ref()
+                .and_then(|fuzz| fuzz.input_to_state_input.as_deref())
+                .map(|name| format!(" (offsets in `{}`)", md_code(name)))
+                .unwrap_or_default();
+            let _ = writeln!(out, "- Input bytes compared{input}: {shown}{more}");
+        } else if let Some(fuzz) = rep
+            .fuzz
+            .as_ref()
+            .filter(|fuzz| fuzz.input_to_state_status.is_some())
+        {
+            // A capture ran (or could not): say why it has no evidence.
+            let what = if fuzz.input_to_state.is_some() {
+                "none"
+            } else {
+                "not recorded"
+            };
+            let why = fuzz
+                .input_to_state_reason
+                .as_deref()
+                .map(|reason| format!(" ({})", md_text(reason)))
+                .unwrap_or_default();
+            let _ = writeln!(out, "- Input bytes compared: {what}{why}");
+        }
         if group.members.len() > 1 {
             let _ = writeln!(out, "- Collapsed observations: {}", group.members.len());
         }
@@ -260,11 +393,65 @@ pub fn render_index(doc: &FindingsDocument, ctx: &IndexContext) -> String {
             }
         }
         if let Some(command) = rep.reproduce.as_ref().and_then(|r| r.command.as_deref()) {
-            let _ = writeln!(out, "- Reproduce: `{}`", md_code(command));
+            let _ = writeln!(
+                out,
+                "- Reproduce: `{}`{}",
+                md_code(command),
+                REPRODUCE_PLATFORM_NOTE
+            );
         }
         out.push('\n');
     }
     out
+}
+
+/// Comparison-evidence entries listed per group before `… N more`.
+const MAX_GATES_SHOWN: usize = 4;
+
+/// `read of 4 byte(s), 0 byte(s) after a 12-byte heap region`.
+fn access_text(access: &crate::model::MemoryAccess) -> String {
+    let mut text = match access.direction.as_str() {
+        "read" | "write" => access.direction.clone(),
+        _ => "unknown-direction access".to_owned(),
+    };
+    if let Some(size) = access.size {
+        let _ = write!(text, " of {size} byte(s)");
+    }
+    if let Some(region) = &access.region {
+        let object = match region.size {
+            Some(size) => format!("{size}-byte {} object", region.kind),
+            None => format!("{} object", region.kind),
+        };
+        match (region.distance, region.relation.as_deref()) {
+            (Some(distance), Some(relation)) => {
+                let _ = write!(text, ", {distance} byte(s) {relation} a {object}");
+            }
+            _ => {
+                let _ = write!(text, ", in a {object}");
+            }
+        }
+    }
+    text
+}
+
+/// ` (the buffer of parameter `data`, at offset 12)`: the harness parameter
+/// the access hit, as Markdown, or nothing when none was named.
+fn access_parameter_text(access: &crate::model::MemoryAccess) -> String {
+    let Some(parameter) = &access.parameter else {
+        return String::new();
+    };
+    let name = md_code(&parameter.name);
+    let offset = parameter
+        .offset
+        .map(|offset| offset.to_string())
+        .unwrap_or_else(|| "?".to_owned());
+    match parameter.basis.as_str() {
+        "region_start" => format!(" (the buffer of parameter `{name}`, at offset {offset})"),
+        "region_interior" => {
+            format!(" (in the buffer parameter `{name}` points into, {offset} byte(s) from it)")
+        }
+        _ => format!(" ({offset} byte(s) past parameter `{name}`)"),
+    }
 }
 
 fn status_word(status: crate::model::ProducerStatus) -> &'static str {
@@ -335,6 +522,67 @@ mod tests {
         .unwrap()
     }
 
+    /// The warning names the damaged testcases and counts corpus entries.
+    #[test]
+    fn index_warns_about_damaged_inputs() {
+        let ctx = IndexContext {
+            damaged_inputs: Some(crate::migrate::DamagedInputs {
+                findings: vec!["F-0001-aaaaaaaa".to_owned()],
+                corpus_entries: 3,
+                truncated: false,
+            }),
+            ..IndexContext::default()
+        };
+        let md = render_index(&example(), &ctx);
+        assert!(
+            md.contains("- ⚠ 4 inputs contain runs of `EF BF BD`"),
+            "{md}"
+        );
+        assert!(
+            md.contains("the testcases of `F-0001-aaaaaaaa` and 3 corpus entries"),
+            "{md}"
+        );
+        assert!(md.contains("likely damaged"), "{md}");
+        let single = damaged_inputs_line(&crate::migrate::DamagedInputs {
+            findings: Vec::new(),
+            corpus_entries: 1,
+            truncated: true,
+        });
+        assert!(single.starts_with("1 input contains"), "{single}");
+        assert!(single.contains("1 corpus entry"), "{single}");
+        assert!(single.contains("first entries scanned"), "{single}");
+        assert!(!render_index(&example(), &IndexContext::default()).contains("EF BF BD"));
+    }
+
+    /// A fuzz finding whose capture found no comparison evidence says why.
+    #[test]
+    fn a_finding_without_comparison_evidence_says_why() {
+        let mut doc = example();
+        let fuzz = doc.findings[0].fuzz.as_mut().unwrap();
+        fuzz.input_to_state = Some(Vec::new());
+        fuzz.input_to_state_status = Some("no_input_comparisons".to_owned());
+        fuzz.input_to_state_reason = Some(
+            "4 comparison(s) recorded; no operand followed a change of the input bytes".to_owned(),
+        );
+        let md = render_index(&doc, &IndexContext::default());
+        assert!(
+            md.contains(
+                "- Input bytes compared: none (4 comparison(s) recorded; no operand followed a \
+                 change of the input bytes)"
+            ),
+            "{md}"
+        );
+        let fuzz = doc.findings[0].fuzz.as_mut().unwrap();
+        fuzz.input_to_state = None;
+        fuzz.input_to_state_status = Some("unavailable".to_owned());
+        fuzz.input_to_state_reason = Some("the harness binary was not found".to_owned());
+        let md = render_index(&doc, &IndexContext::default());
+        assert!(
+            md.contains("- Input bytes compared: not recorded (the harness binary was not found)"),
+            "{md}"
+        );
+    }
+
     #[test]
     fn summary_then_groups_by_severity() {
         let md = render_index(&example(), &IndexContext::default());
@@ -349,6 +597,20 @@ mod tests {
         ));
         assert!(md.contains("- Reproduce: `python3 findings/F-0000-1a2b3c4d/replay.py`"));
         assert!(md.contains("- Component: `pkg:npm/example@2.4.2` · fixed in 2.4.3"));
+        assert!(
+            md.contains(
+                "- Memory access: read of 4 byte(s), 0 byte(s) after a 12-byte heap object \
+                 (the buffer of parameter `data`, at offset 12)\n"
+            ),
+            "{md}"
+        );
+        assert!(
+            md.contains(
+                "- Input bytes compared (offsets in `min_testcase.bin`): bytes 0..4 → memcmp at \
+                 `src/parse.c:31`\n"
+            ),
+            "{md}"
+        );
     }
 
     #[test]

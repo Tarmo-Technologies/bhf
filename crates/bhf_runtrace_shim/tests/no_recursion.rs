@@ -26,8 +26,13 @@ fn target_dir() -> PathBuf {
 /// plain integration-test invocation may compile only this test
 /// binary, so skip rather than load a stale .so from a previous build.
 fn shim_so() -> Option<PathBuf> {
+    ["debug", "release"].into_iter().find_map(fresh_shim)
+}
+
+/// The shim built for `profile`, when it is newer than the hook sources.
+fn fresh_shim(profile: &str) -> Option<PathBuf> {
     let base = target_dir();
-    for profile in ["debug", "release"] {
+    {
         let p = base.join(profile).join("libbhf_runtrace_shim.so");
         if p.is_file() {
             let shim_mtime = p.metadata().and_then(|m| m.modified()).ok();
@@ -39,6 +44,13 @@ fn shim_so() -> Option<PathBuf> {
                 "src/hooks/proc.rs",
                 "src/hooks/format.rs",
                 "src/hooks/format_hooks.c",
+                "src/hooks/dlsym.rs",
+                "src/dlsym.rs",
+                "src/jsonl.rs",
+                "src/policy.rs",
+                "src/fakes/mode.rs",
+                "src/fakes/reporting.rs",
+                "src/symbolizer.rs",
             ]
             .iter()
             .filter_map(|relative| {
@@ -54,7 +66,7 @@ fn shim_so() -> Option<PathBuf> {
                     eprintln!(
                         "skipping: {p:?} is older than hook sources; run cargo build -p bhf_runtrace_shim first"
                     );
-                    continue;
+                    return None;
                 }
             }
             return Some(p);
@@ -337,6 +349,56 @@ fn fs_hooks_log_open_close_lifecycle_under_ld_preload() {
 
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_file(&target);
+}
+
+/// The runtrace log is created when the shim loads, so its existence after a
+/// run proves the shim was preloaded, even for a target that touched nothing
+/// the shim records (bhf reports such a run as observed, not as unobserved).
+#[test]
+fn the_runtrace_log_is_created_at_load_for_a_run_that_logs_nothing() {
+    let Some(shim) = shim_so() else {
+        eprintln!("skipping: shim cdylib not built yet");
+        return;
+    };
+    let Some(cc) = cc() else {
+        eprintln!("skipping: no C compiler");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("bhf-shim-quiet-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("probe.c");
+    std::fs::write(&src, "int main(void) { return 0; }\n").unwrap();
+    let bin = dir.join("probe");
+    let built = Command::new(cc)
+        .arg(&src)
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .unwrap();
+    assert!(built.success(), "probe failed to compile");
+    let log = dir.join("rt.jsonl");
+    let status = Command::new(&bin)
+        .env("LD_PRELOAD", &shim)
+        .env("BHF_RUNTRACE_LOG", &log)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("spawn probe");
+    assert!(status.success(), "probe exited abnormally: {status:?}");
+    assert!(
+        log.is_file(),
+        "the preloaded shim did not create {}",
+        log.display()
+    );
+    // Without the shim nothing creates it.
+    let unshimmed = dir.join("rt-plain.jsonl");
+    let status = Command::new(&bin)
+        .env("BHF_RUNTRACE_LOG", &unshimmed)
+        .status()
+        .expect("spawn probe");
+    assert!(status.success());
+    assert!(!unshimmed.exists());
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -701,4 +763,590 @@ fn fs_hooks_record_path_taint_under_ld_preload() {
         !untainted_line.contains("\"u\":1"),
         "untainted open event must not carry taint: {untainted_line}"
     );
+}
+
+/// `fopen`/`fopen64` open the file through a glibc-internal call the `open`
+/// hook never sees, so the shim hooks them directly. Under AddressSanitizer,
+/// whose runtime defines `fopen` in the executable, its interceptor forwards
+/// to the next definition, which is the shim's.
+#[test]
+fn fs_hooks_log_fopen_and_fopen64_under_ld_preload() {
+    // Both profiles when both are built: an optimized build can merge the
+    // hook `dlsym` hands out with the exported `fopen`.
+    let shims: Vec<PathBuf> = ["debug", "release"]
+        .into_iter()
+        .filter_map(fresh_shim)
+        .collect();
+    if shims.is_empty() {
+        eprintln!("skipping: shim cdylib not built yet");
+        return;
+    }
+    for shim in shims {
+        fopen_events_are_logged(&shim);
+    }
+}
+
+fn fopen_events_are_logged(shim: &std::path::Path) {
+    let Some(cc) = cc() else {
+        eprintln!("skipping: no C compiler");
+        return;
+    };
+    let profile = shim
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let dir = std::env::temp_dir().join(format!("bhf-shim-fopen-{profile}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // Outside the runtrace-log dir: the shim records nothing inside it.
+    let present =
+        std::env::temp_dir().join(format!("bhf-shim-fopen-present-{}.cfg", std::process::id()));
+    std::fs::write(&present, "widget=1\n").unwrap();
+    let missing = format!("/nonexistent-bhf-{}/widget.cfg", std::process::id());
+    let src = dir.join("probe.c");
+    std::fs::write(
+        &src,
+        r#"
+        #define _LARGEFILE64_SOURCE 1
+        #include <stdio.h>
+        int main(int argc, char **argv) {
+            if (argc < 3) return 1;
+            FILE *f = fopen(argv[1], "r");
+            if (!f) return 2;
+            fclose(f);
+            FILE *g = fopen64(argv[2], "r");
+            if (g) return 3;
+            return 0;
+        }
+    "#,
+    )
+    .unwrap();
+    let mut builds = vec![("plain", Vec::<&str>::new())];
+    let asan_ok = Command::new("clang")
+        .args(["-fsanitize=address", "-x", "c", "-o"])
+        .arg(dir.join("asan-probe"))
+        .arg(&src)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if asan_ok {
+        builds.push(("asan", vec!["-fsanitize=address"]));
+    }
+    for (label, flags) in builds {
+        let bin = dir.join(format!("probe-{label}"));
+        let compiler = if label == "asan" { "clang" } else { cc };
+        let built = Command::new(compiler)
+            .args(&flags)
+            .arg(&src)
+            .arg("-o")
+            .arg(&bin)
+            .status()
+            .unwrap();
+        assert!(built.success(), "{label} probe failed to compile");
+        let log = dir.join(format!("rt-{label}.jsonl"));
+        let status = Command::new(&bin)
+            .arg(&present)
+            .arg(&missing)
+            .env("LD_PRELOAD", shim)
+            .env("BHF_RUNTRACE_LOG", &log)
+            .env("ASAN_OPTIONS", "verify_asan_link_order=0:detect_leaks=0")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("spawn probe");
+        assert!(
+            status.success(),
+            "{label} probe under {} exited abnormally: {status:?}",
+            shim.display()
+        );
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        let opened = format!("\"p\":\"{}\"", present.display());
+        assert!(
+            text.lines().any(|line| line.contains("\"e\":\"fopen\"")
+                && line.contains(&opened)
+                && line.contains("\"d\":")),
+            "{label}: fopen of an existing file missing from the runtrace log:\n{text}"
+        );
+        let probed = format!("\"p\":\"{missing}\"");
+        assert!(
+            text.lines().any(|line| line.contains("\"e\":\"fopen64\"")
+                && line.contains(&probed)
+                && line.contains("\"n\":2")),
+            "{label}: fopen64 of a missing file missing from the runtrace log:\n{text}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&present);
+}
+
+/// A sanitizer runtime defines `dlopen` and resolves the real one with
+/// `dlsym(RTLD_NEXT, "dlopen")`, which the shim forwards with the caller's
+/// identity: for a runtime in the executable the next definition is the
+/// shim's hook, for one loaded after the shim (gcc's shared libasan) it is
+/// libc's, past the runtime's own interceptor. Either way a failed load is
+/// logged as in a plain program, by a debug shim as by a release one.
+#[test]
+fn dl_hooks_log_failed_dlopen_under_a_sanitizer() {
+    let shims: Vec<PathBuf> = ["debug", "release"]
+        .into_iter()
+        .filter_map(fresh_shim)
+        .collect();
+    if shims.is_empty() {
+        eprintln!("skipping: shim cdylib not built yet");
+        return;
+    }
+    let Some(cc) = cc() else {
+        eprintln!("skipping: no C compiler");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("bhf-shim-dlopen-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let missing = format!("libbhf_missing_{}.so.7", std::process::id());
+    let src = dir.join("probe.c");
+    std::fs::write(
+        &src,
+        r#"
+        #include <dlfcn.h>
+        int main(int argc, char **argv) {
+            if (argc < 2) return 1;
+            return dlopen(argv[1], RTLD_NOW) ? 2 : 0;
+        }
+    "#,
+    )
+    .unwrap();
+    let mut builds = vec![("plain", cc, Vec::<&str>::new())];
+    // Sanitizer lanes the host can build; each is skipped when it cannot.
+    for (label, compiler, flags) in [
+        ("clang-asan", "clang", vec!["-fsanitize=address"]),
+        ("clang-ubsan", "clang", vec!["-fsanitize=undefined"]),
+        ("gcc-asan-shared", "gcc", vec!["-fsanitize=address"]),
+        (
+            "gcc-asan-static",
+            "gcc",
+            vec!["-fsanitize=address", "-static-libasan"],
+        ),
+    ] {
+        let built = Command::new(compiler)
+            .args(&flags)
+            .arg(&src)
+            .arg("-ldl")
+            .arg("-o")
+            .arg(dir.join(format!("probe-{label}")))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if built {
+            builds.push((label, compiler, flags));
+        }
+    }
+    for (label, compiler, flags) in &builds {
+        let bin = dir.join(format!("probe-{label}"));
+        let built = Command::new(compiler)
+            .args(flags)
+            .arg(&src)
+            .arg("-ldl")
+            .arg("-o")
+            .arg(&bin)
+            .status()
+            .unwrap();
+        assert!(built.success(), "{label} probe failed to compile");
+        for shim in &shims {
+            let log = dir.join(format!("rt-{label}.jsonl"));
+            let _ = std::fs::remove_file(&log);
+            let status = Command::new(&bin)
+                .arg(&missing)
+                .env("LD_PRELOAD", shim)
+                .env("BHF_RUNTRACE_LOG", &log)
+                .env("BHF_DISABLE_DLOPEN_FAKE", "1")
+                .env("ASAN_OPTIONS", "verify_asan_link_order=0:detect_leaks=0")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("spawn probe");
+            assert!(
+                status.success(),
+                "{label} probe under {} exited abnormally: {status:?}",
+                shim.display()
+            );
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            assert!(
+                text.lines().any(|line| line.contains("\"e\":\"dlopen\"")
+                    && line.contains(&format!("\"l\":\"{missing}\""))),
+                "{label}: failed dlopen missing from the runtrace log of {}:\n{text}",
+                shim.display()
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The `"d"` field of a runtrace line.
+fn event_fd(line: &str) -> Option<i64> {
+    let start = line.find("\"d\":")? + 4;
+    let digits: String = line[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '-')
+        .collect();
+    digits.parse().ok()
+}
+
+/// glibc's `fclose` closes the stream's descriptor internally, never through
+/// the `close` hook, so a file opened with `fopen` (or wrapped with `fdopen`)
+/// and closed with `fclose` must log its close itself, or every such file
+/// reads as leaked. Checked in a plain program and under each sanitizer
+/// runtime the host can build, whose `fclose` interceptor forwards to the next
+/// definition.
+#[test]
+fn fclose_logs_the_close_of_a_fopened_or_fdopened_stream() {
+    let shims: Vec<PathBuf> = ["debug", "release"]
+        .into_iter()
+        .filter_map(fresh_shim)
+        .collect();
+    if shims.is_empty() {
+        eprintln!("skipping: shim cdylib not built yet");
+        return;
+    }
+    let Some(cc) = cc() else {
+        eprintln!("skipping: no C compiler");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("bhf-shim-fclose-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // Outside the runtrace-log dir: the shim records nothing inside it.
+    let present =
+        std::env::temp_dir().join(format!("bhf-shim-fclose-widget-{}.cfg", std::process::id()));
+    std::fs::write(&present, "widget=1\n").unwrap();
+    let src = dir.join("probe.c");
+    std::fs::write(
+        &src,
+        r#"
+        #include <fcntl.h>
+        #include <stdio.h>
+        int main(int argc, char **argv) {
+            if (argc < 2) return 1;
+            FILE *f = fopen(argv[1], "r");
+            if (!f) return 2;
+            if (fclose(f) != 0) return 3;
+            int fd = open(argv[1], O_RDONLY);
+            if (fd < 0) return 4;
+            FILE *g = fdopen(fd, "r");
+            if (!g) return 5;
+            if (fclose(g) != 0) return 6;
+            return 0;
+        }
+    "#,
+    )
+    .unwrap();
+    let mut builds = vec![("plain", cc, Vec::<&str>::new())];
+    for (label, compiler, flags) in [
+        ("clang-asan", "clang", vec!["-fsanitize=address"]),
+        (
+            "gcc-asan-static",
+            "gcc",
+            vec!["-fsanitize=address", "-static-libasan"],
+        ),
+    ] {
+        let built = Command::new(compiler)
+            .args(&flags)
+            .arg(&src)
+            .arg("-o")
+            .arg(dir.join(format!("probe-{label}")))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if built {
+            builds.push((label, compiler, flags));
+        }
+    }
+    for (label, compiler, flags) in &builds {
+        let bin = dir.join(format!("probe-{label}"));
+        let built = Command::new(compiler)
+            .args(flags)
+            .arg(&src)
+            .arg("-o")
+            .arg(&bin)
+            .status()
+            .unwrap();
+        assert!(built.success(), "{label} probe failed to compile");
+        for shim in &shims {
+            let log = dir.join(format!("rt-{label}.jsonl"));
+            let _ = std::fs::remove_file(&log);
+            let status = Command::new(&bin)
+                .arg(&present)
+                .env("LD_PRELOAD", shim)
+                .env("BHF_RUNTRACE_LOG", &log)
+                .env("ASAN_OPTIONS", "verify_asan_link_order=0:detect_leaks=0")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("spawn probe");
+            assert!(
+                status.success(),
+                "{label} probe under {} exited abnormally: {status:?}",
+                shim.display()
+            );
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            let opened = format!("\"p\":\"{}\"", present.display());
+            let fopen_fd = text
+                .lines()
+                .find(|line| line.contains("\"e\":\"fopen\"") && line.contains(&opened))
+                .and_then(event_fd)
+                .unwrap_or_else(|| panic!("{label}: no fopen event:\n{text}"));
+            let closes: Vec<i64> = text
+                .lines()
+                .filter(|line| line.contains("\"e\":\"close\"") && line.contains("\"r\":0"))
+                .filter_map(event_fd)
+                .collect();
+            assert!(
+                closes.contains(&fopen_fd),
+                "{label} under {}: fclose of fd {fopen_fd} logged no close:\n{text}",
+                shim.display()
+            );
+            let open_fd = text
+                .lines()
+                .filter(|line| line.contains("\"e\":\"open\"") && line.contains(&opened))
+                .filter_map(event_fd)
+                .next_back()
+                .unwrap_or_else(|| panic!("{label}: no open event:\n{text}"));
+            assert!(
+                text.lines().any(
+                    |line| line.contains("\"e\":\"fdopen\"") && event_fd(line) == Some(open_fd)
+                ),
+                "{label}: fdopen of fd {open_fd} not logged:\n{text}"
+            );
+            assert!(
+                closes.iter().filter(|fd| **fd == open_fd).count() >= 1,
+                "{label}: fclose of the fdopened fd {open_fd} logged no close:\n{text}"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&present);
+}
+
+/// A sanitizer runtime defines the printf family in the executable and
+/// forwards each call to the `va_list` variant it finds next (`printf` to
+/// `vprintf`, `snprintf` to `vsnprintf`), and a fortified build calls
+/// `__printf_chk` and friends: the format strings must be logged on every
+/// one of those lanes, under the variadic API the program called.
+#[test]
+fn format_hooks_log_printf_formats_under_sanitizers_and_fortify() {
+    let shims: Vec<PathBuf> = ["debug", "release"]
+        .into_iter()
+        .filter_map(fresh_shim)
+        .collect();
+    if shims.is_empty() {
+        eprintln!("skipping: shim cdylib not built yet");
+        return;
+    }
+    let Some(cc) = cc() else {
+        eprintln!("skipping: no C compiler");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("bhf-shim-vformat-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("probe.c");
+    std::fs::write(
+        &src,
+        r#"
+        #include <stdarg.h>
+        #include <stdio.h>
+        #include <stdlib.h>
+        static int log_line(const char *fmt, ...) {
+            va_list ap;
+            va_start(ap, fmt);
+            int n = vfprintf(stdout, fmt, ap);
+            va_end(ap);
+            return n;
+        }
+        int main(int argc, char **argv) {
+            char buf[64];
+            char *heap = NULL;
+            const char *fmt = argc > 99 ? argv[1] : "widget %d\n";
+            if (printf(fmt, 1) < 0) return 1;
+            if (snprintf(buf, sizeof buf, "copy_at %u", 2u) < 0) return 2;
+            if (fprintf(stdout, "bit_index %d\n", 3) < 0) return 3;
+            if (log_line("record %s\n", "x") < 0) return 4;
+            if (asprintf(&heap, "heap %ld", 5L) < 0) return 5;
+            free(heap);
+            return 0;
+        }
+    "#,
+    )
+    .unwrap();
+    let mut builds = vec![("plain", cc, Vec::<&str>::new())];
+    for (label, compiler, flags) in [
+        ("clang-asan", "clang", vec!["-fsanitize=address"]),
+        (
+            "clang-asan-ubsan",
+            "clang",
+            vec!["-fsanitize=address,undefined"],
+        ),
+        (
+            "clang-asan-shared",
+            "clang",
+            vec!["-fsanitize=address", "-shared-libasan"],
+        ),
+        ("gcc-asan-shared", "gcc", vec!["-fsanitize=address"]),
+        (
+            "gcc-asan-static",
+            "gcc",
+            vec!["-fsanitize=address", "-static-libasan"],
+        ),
+        (
+            "gcc-fortify",
+            "gcc",
+            vec!["-O2", "-U_FORTIFY_SOURCE", "-D_FORTIFY_SOURCE=2"],
+        ),
+    ] {
+        let bin = dir.join(format!("probe-{label}"));
+        let built = Command::new(compiler)
+            .args(&flags)
+            .arg(&src)
+            .arg("-o")
+            .arg(&bin)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        // A lane whose runtime library the loader cannot find (a shared
+        // sanitizer runtime outside the library path) is skipped.
+        let runs = built
+            && Command::new(&bin)
+                .env("ASAN_OPTIONS", "detect_leaks=0")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+        if runs {
+            builds.push((label, compiler, flags));
+        }
+    }
+    for (label, compiler, flags) in &builds {
+        let bin = dir.join(format!("probe-{label}"));
+        let built = Command::new(compiler)
+            .args(flags)
+            .arg(&src)
+            .arg("-o")
+            .arg(&bin)
+            .status()
+            .unwrap();
+        assert!(built.success(), "{label} probe failed to compile");
+        for shim in &shims {
+            let log = dir.join(format!("rt-{label}.jsonl"));
+            let _ = std::fs::remove_file(&log);
+            let output = Command::new(&bin)
+                .env("LD_PRELOAD", shim)
+                .env("BHF_RUNTRACE_LOG", &log)
+                .env("ASAN_OPTIONS", "verify_asan_link_order=0:detect_leaks=0")
+                .output()
+                .expect("spawn probe");
+            assert!(
+                output.status.success(),
+                "{label} probe under {} exited abnormally: {:?}\n{}",
+                shim.display(),
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            // The calls themselves still produce their output.
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains("widget 1") && stdout.contains("record x"),
+                "{label}: {stdout}"
+            );
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            for (api, format) in [
+                ("printf", "widget %d\\n"),
+                ("snprintf", "copy_at %u"),
+                ("fprintf", "bit_index %d\\n"),
+                ("fprintf", "record %s\\n"),
+                ("asprintf", "heap %ld"),
+            ] {
+                assert!(
+                    text.lines().any(|line| line.contains("\"e\":\"format\"")
+                        && line.contains(&format!("\"a\":\"{api}\""))
+                        && line.contains(&format!("\"f\":\"{format}\""))),
+                    "{label} under {}: no {api} format event for {format:?}:\n{text}",
+                    shim.display()
+                );
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// In a faking pass a missing file is replaced by a fake one, but never the
+/// vDSO's link-map name a sanitizer's symbolizer opens, and nothing once a
+/// sanitizer has started a report (the driver tells the shim through
+/// `bhf_shim_sanitizer_reporting`).
+#[test]
+fn pseudo_paths_and_paths_opened_during_a_sanitizer_report_are_not_faked() {
+    let Some(shim) = shim_so() else {
+        eprintln!("skipping: shim cdylib not built yet");
+        return;
+    };
+    let Some(cc) = cc() else {
+        eprintln!("skipping: no C compiler");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("bhf-shim-nofake-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("probe.c");
+    std::fs::write(
+        &src,
+        r#"
+        #include <errno.h>
+        #include <fcntl.h>
+        #include <stdio.h>
+        #include <unistd.h>
+        extern void bhf_shim_sanitizer_reporting(void) __attribute__((weak));
+        static void report(const char *label, const char *path) {
+            errno = 0;
+            int fd = open(path, O_RDONLY);
+            printf("%s fd=%d errno=%d\n", label, fd >= 0 ? 1 : -1, fd >= 0 ? 0 : errno);
+            if (fd >= 0) close(fd);
+        }
+        int main(int argc, char **argv) {
+            if (argc < 2) return 1;
+            report("vdso", "linux-vdso.so.1");
+            report("missing-before", argv[1]);
+            if (!bhf_shim_sanitizer_reporting) return 2;
+            bhf_shim_sanitizer_reporting();
+            report("missing-after", argv[1]);
+            return 0;
+        }
+    "#,
+    )
+    .unwrap();
+    let bin = dir.join("probe");
+    let built = Command::new(cc)
+        .arg(&src)
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .unwrap();
+    assert!(built.success(), "probe failed to compile");
+    let missing = format!("/nonexistent-bhf-{}/widget.cfg", std::process::id());
+    let log = dir.join("rt.jsonl");
+    let output = Command::new(&bin)
+        .arg(&missing)
+        .env("LD_PRELOAD", &shim)
+        .env("BHF_RUNTRACE_LOG", &log)
+        .env("BHF_RUNTRACE_MODE", "empty")
+        .output()
+        .expect("spawn probe");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{:?}\n{stdout}", output.status);
+    assert!(stdout.contains("vdso fd=-1 errno=2"), "{stdout}");
+    assert!(
+        stdout.contains("missing-before fd=1 errno=0"),
+        "an ordinary missing file is faked in an empty pass: {stdout}"
+    );
+    assert!(stdout.contains("missing-after fd=-1 errno=2"), "{stdout}");
+    let text = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(!text.contains("linux-vdso"), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
 }

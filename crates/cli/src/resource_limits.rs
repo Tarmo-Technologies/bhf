@@ -8,11 +8,10 @@
 //! workstation stay conservative without imposing the same limits on a 64 GiB
 //! analysis host.
 
-use std::path::Path;
-
 pub(crate) const MIB: usize = 1024 * 1024;
 
-fn read_u64(path: impl AsRef<Path>) -> Option<u64> {
+#[cfg(target_os = "linux")]
+fn read_u64(path: impl AsRef<std::path::Path>) -> Option<u64> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 

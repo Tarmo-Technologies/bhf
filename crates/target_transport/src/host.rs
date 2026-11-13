@@ -184,8 +184,9 @@ fn fault_kind_from_signal(signal: i32) -> FaultKind {
     match signal {
         // SIGSEGV(11), SIGBUS(7): memory-protection faults.
         11 | 7 => FaultKind::MemoryProtection,
-        // SIGILL(4), SIGFPE(8): CPU exceptions.
-        4 | 8 => FaultKind::CpuException,
+        // SIGILL(4), SIGTRAP(5), SIGFPE(8): CPU exceptions (a trap
+        // instruction raises SIGTRAP on AArch64).
+        4 | 5 | 8 => FaultKind::CpuException,
         // SIGABRT(6): assertion / abort.
         6 => FaultKind::AssertionPanic,
         other => FaultKind::Other(other as u32),
@@ -195,6 +196,13 @@ fn fault_kind_from_signal(signal: i32) -> FaultKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_trap_is_a_cpu_exception() {
+        for signal in [4, 5, 8] {
+            assert_eq!(fault_kind_from_signal(signal), FaultKind::CpuException);
+        }
+    }
 
     #[test]
     fn host_child_echoes_stdin_and_reports_clean_exit() {

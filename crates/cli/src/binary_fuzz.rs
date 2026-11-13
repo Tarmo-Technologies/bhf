@@ -1061,22 +1061,83 @@ pub(crate) fn is_binary_finding(finding_dir: &Path) -> bool {
         .is_some_and(|kind| kind == "binary_crash")
 }
 
+/// `bhf replay` of a binary finding with the default output.
+#[cfg(all(test, unix))]
 pub(crate) fn replay_binary_finding(finding_dir: &Path, binary: &Path) -> i32 {
-    match replay_binary_finding_inner(finding_dir, binary) {
-        Ok(true) => {
-            let _ = corpus::finding::touch_last_seen(finding_dir, "replay");
-            println!("MATCH");
-            0
-        }
-        Ok(false) => {
-            bhfeprintln!("MISMATCH binary crash signature changed");
-            3
-        }
-        Err(error) => {
-            bhfeprintln!("error: {error:#}");
-            1
-        }
+    crate::replay::finish_lane(
+        finding_dir,
+        replay_binary_outcome(finding_dir, binary),
+        crate::replay::OutputMode::default(),
+    )
+}
+
+/// Re-run a binary finding's testcase against `binary` and compare the
+/// signature it records (crash, runtime oracle or postcondition).
+pub(crate) fn replay_binary_outcome(
+    finding_dir: &Path,
+    binary: &Path,
+) -> Result<crate::replay::LaneReplay, String> {
+    let replayed =
+        replay_binary_finding_inner(finding_dir, binary).map_err(|error| format!("{error:#}"))?;
+    let run = &replayed.run;
+    let exit = crate::replay::ExitSummary::process(
+        run.exit_code,
+        run.signal,
+        run.timeout.then_some(replayed.timeout),
+        replayed.duration,
+    );
+    let mut differences = Vec::new();
+    if !replayed.matched {
+        differences.push(match &replayed.actual {
+            Some(actual) => format!(
+                "{}: recorded {}, replayed {actual}",
+                replayed.compared, replayed.recorded
+            ),
+            None => format!(
+                "{}: recorded {}, not reproduced",
+                replayed.compared, replayed.recorded
+            ),
+        });
     }
+    Ok(crate::replay::LaneReplay {
+        lane: "binary",
+        matched: replayed.matched,
+        status_line: if replayed.matched {
+            "MATCH".to_owned()
+        } else {
+            format!("MISMATCH binary {} changed", replayed.compared)
+        },
+        compared: format!("{} {}", replayed.compared, short(&replayed.recorded)),
+        differences,
+        details: Vec::new(),
+        exit: Some(exit),
+        output: Some((Vec::new(), run.stderr.clone().into_bytes())),
+        binary: Some((binary.to_path_buf(), replayed.mode.as_str().to_owned())),
+        history: "replay",
+    })
+}
+
+/// A recorded signature, shortened for the summary line.
+fn short(signature: &str) -> String {
+    match signature.char_indices().nth(16) {
+        Some((index, _)) => format!("{}...", &signature[..index]),
+        None => signature.to_owned(),
+    }
+}
+
+/// One replay of a binary finding.
+struct BinaryReplay {
+    matched: bool,
+    /// What was compared: `crash signature`, `runtime oracle signature` or
+    /// `postcondition signature`.
+    compared: &'static str,
+    recorded: String,
+    /// The replayed run's signature, when it produced one of that kind.
+    actual: Option<String>,
+    run: BinaryRun,
+    mode: BinaryInputMode,
+    timeout: Duration,
+    duration: Duration,
 }
 
 pub(crate) fn minimize_binary_finding(
@@ -1192,7 +1253,7 @@ pub(crate) fn minimize_binary_finding(
     })
 }
 
-fn replay_binary_finding_inner(finding_dir: &Path, binary: &Path) -> anyhow::Result<bool> {
+fn replay_binary_finding_inner(finding_dir: &Path, binary: &Path) -> anyhow::Result<BinaryReplay> {
     let finding = read_finding(finding_dir)?;
     let input = fs::read(finding_dir.join("testcase.bin"))
         .with_context(|| format!("read {}", finding_dir.join("testcase.bin").display()))?;
@@ -1202,8 +1263,9 @@ fn replay_binary_finding_inner(finding_dir: &Path, binary: &Path) -> anyhow::Res
     let mode = finding_input_mode(&finding)?;
     let env = finding_env(&finding)?;
     let timeout = finding_timeout(&finding);
+    let started = Instant::now();
 
-    let matched = if finding.get("kind").and_then(Value::as_str) == Some("binary_semantic") {
+    let replayed = if finding.get("kind").and_then(Value::as_str) == Some("binary_semantic") {
         // #59: a semantic finding is reproduced by re-running under the runtime
         // oracles and confirming the SAME oracle signature fires — not a crash.
         let want = finding
@@ -1228,9 +1290,15 @@ fn replay_binary_finding_inner(finding_dir: &Path, binary: &Path) -> anyhow::Res
             &tmp_dir,
             Some((&oracles, log.as_path())),
         )?;
-        replay_oracle_signatures(&run.oracle_events, &input)
-            .iter()
-            .any(|s| s == want)
+        let signatures = replay_oracle_signatures(&run.oracle_events, &input);
+        let matched = signatures.iter().any(|s| s == want);
+        (
+            matched,
+            "runtime oracle signature",
+            want.to_owned(),
+            signatures.first().cloned(),
+            run,
+        )
     } else if finding.get("kind").and_then(Value::as_str) == Some("binary_postcondition") {
         // #55: reproduce by re-running setup -> target -> oracle and confirming
         // the same postcondition signature fires.
@@ -1259,13 +1327,37 @@ fn replay_binary_finding_inner(finding_dir: &Path, binary: &Path) -> anyhow::Res
         let run = run_binary_once(&invocation, mode, &input, &run_env, timeout, &tmp_dir, None)?;
         let verdict = pc.evaluate(&case_dir, &testcase_path, &run);
         pc.run_reset(&case_dir, &testcase_path);
-        matches!(verdict, PostconditionVerdict::Finding { ref signature, .. } if signature == want)
+        let actual = match &verdict {
+            PostconditionVerdict::Finding { signature, .. } => Some(signature.clone()),
+            _ => None,
+        };
+        (
+            actual.as_deref() == Some(want),
+            "postcondition signature",
+            want.to_owned(),
+            actual,
+            run,
+        )
     } else {
         let run = run_binary_once(&invocation, mode, &input, &env, timeout, &tmp_dir, None)?;
-        signature_matches(&run, &finding_signature(&finding)?)
+        let want = finding_signature(&finding)?;
+        let matched = signature_matches(&run, &want);
+        let actual = run.crashed().then(|| run.signature.clone());
+        (matched, "crash signature", want, actual, run)
     };
+    let duration = started.elapsed();
     let _ = fs::remove_dir_all(&tmp_dir);
-    Ok(matched)
+    let (matched, compared, recorded, actual, run) = replayed;
+    Ok(BinaryReplay {
+        matched,
+        compared,
+        recorded,
+        actual,
+        run,
+        mode,
+        timeout,
+        duration,
+    })
 }
 
 /// Whether a replayed run reproduces a stored crash signature, in its

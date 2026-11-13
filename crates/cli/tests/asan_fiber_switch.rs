@@ -16,6 +16,9 @@
 //! the evidence the start/finish_switch_fiber bracketing is correct — incorrect
 //! stack bounds or a mismatched fake-stack save/restore make ASan error or crash
 //! on the switched-to stack under this mode. Skips without clang.
+//!
+//! ucontext is POSIX, so this runs on Unix only.
+#![cfg(unix)]
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

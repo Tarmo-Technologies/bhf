@@ -51,6 +51,9 @@ pub struct RebuildSummary {
     pub findings: usize,
     pub errors: usize,
     pub index_path: PathBuf,
+    /// Inputs of a work dir from an earlier release that look damaged, as
+    /// INDEX.md warns about them.
+    pub damaged_inputs: Option<crate::migrate::DamagedInputs>,
 }
 
 /// Files under `results/` the attestation never treats as evidence.
@@ -283,6 +286,7 @@ fn rebuild_locked_with(
         has_static_dir: static_dir.is_dir(),
         has_sbom_dir: sbom_dir.is_dir(),
         unminimized_groups: unminimized_groups(&doc),
+        damaged_inputs: crate::migrate::damaged_inputs(work_dir),
     };
 
     write_atomic(&results.join("findings.csv"), render_csv(&doc).as_bytes())?;
@@ -306,6 +310,7 @@ fn rebuild_locked_with(
         findings: doc.findings.len(),
         errors: doc.errors.len(),
         index_path: results.join("INDEX.md"),
+        damaged_inputs: index_ctx.damaged_inputs.clone(),
     })
 }
 
@@ -1318,6 +1323,45 @@ mod tests {
                 group.representative
             );
         }
+    }
+
+    /// UBSan findings printed without a stack used to share one constant group
+    /// key per rule, so unrelated sites in different files collapsed into one
+    /// root-cause group. Each reported site is now its own group, and the same
+    /// site reached from two harnesses is still one.
+    #[test]
+    fn frameless_ubsan_sites_are_separate_root_cause_groups() {
+        let tmp = tempfile::tempdir().unwrap();
+        let emit = |harness: &str, file: &str, line: u32| {
+            let stderr = format!(
+                "{file}:{line}:5: runtime error: execution reached the end of a value-returning function without returning a value\n\
+                 SUMMARY: UndefinedBehaviorSanitizer: missing-return {file}:{line}:5 \n"
+            );
+            let report = corpus::parse_sanitizer_report(&stderr).unwrap();
+            corpus::finding::FindingEmitter::with_metadata(
+                tmp.path().to_path_buf(),
+                harness.to_owned(),
+                "c".to_owned(),
+                String::new(),
+            )
+            .emit_sanitizer_crash_with_log(b"x", &report, Some(stderr.as_bytes()))
+            .unwrap()
+            .0
+        };
+        let a1 = emit("H-C0001", "/src/widget/classify.c", 3);
+        let a2 = emit("H-C0002", "/src/widget/classify.c", 3);
+        let b = emit("H-C0003", "/src/widget/scale.c", 16);
+        rebuild(tmp.path(), &opts()).unwrap();
+        let doc = read_doc(tmp.path());
+        assert_eq!(doc.groups.len(), 2, "{:?}", doc.groups);
+        let group_of = |id: &str| {
+            doc.groups
+                .iter()
+                .position(|g| g.members.iter().any(|m| m == id))
+                .unwrap()
+        };
+        assert_eq!(group_of(&a1), group_of(&a2));
+        assert_ne!(group_of(&a1), group_of(&b));
     }
 
     #[test]

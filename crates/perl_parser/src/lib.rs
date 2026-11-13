@@ -205,6 +205,17 @@ fn walk_errors(node: tree_sitter::Node<'_>, count: &mut usize) {
 /// Perl lane no longer fuzzes "cold". The tree is untrusted, so the walk is
 /// depth-capped ([`DICT_MAX_DEPTH`]) to avoid stack overflow.
 pub fn extract_perl_dictionary_tokens(source: &str) -> Result<Vec<String>, PerlParseError> {
+    Ok(extract_perl_dictionary_tokens_located(source)?
+        .into_iter()
+        .map(|(token, _)| token)
+        .collect())
+}
+
+/// [`extract_perl_dictionary_tokens`], with the 1-based lines each token was
+/// found on (the first [`MAX_TOKEN_LINES`] distinct ones).
+pub fn extract_perl_dictionary_tokens_located(
+    source: &str,
+) -> Result<Vec<(String, Vec<u32>)>, PerlParseError> {
     let mut parser = tree_sitter::Parser::new();
     parser
         .set_language(&tree_sitter_perl::LANGUAGE.into())
@@ -215,6 +226,9 @@ pub fn extract_perl_dictionary_tokens(source: &str) -> Result<Vec<String>, PerlP
     Ok(tokens)
 }
 
+/// Most source lines recorded for one dictionary token.
+pub const MAX_TOKEN_LINES: usize = 3;
+
 /// Recursion cap for the untrusted-tree dictionary walk.
 const DICT_MAX_DEPTH: usize = 256;
 
@@ -222,7 +236,7 @@ fn collect_dictionary_tokens(
     node: tree_sitter::Node<'_>,
     src: &[u8],
     depth: usize,
-    out: &mut Vec<String>,
+    out: &mut Vec<(String, Vec<u32>)>,
 ) {
     if depth >= DICT_MAX_DEPTH {
         return;
@@ -231,7 +245,7 @@ fn collect_dictionary_tokens(
     if dict_kind_is_string_like(kind) {
         if let Ok(text) = node.utf8_text(src) {
             if let Some(tok) = clean_dict_string(text) {
-                push_unique_token(out, tok);
+                push_unique_token(out, tok, node_line(node));
             }
         }
         return; // a string is a leaf value — never recurse into its content
@@ -239,7 +253,7 @@ fn collect_dictionary_tokens(
     if dict_kind_is_number_like(kind) {
         if let Ok(text) = node.utf8_text(src) {
             if let Some(tok) = clean_dict_number(text) {
-                push_unique_token(out, tok);
+                push_unique_token(out, tok, node_line(node));
             }
         }
         return;
@@ -319,15 +333,40 @@ fn clean_dict_number(raw: &str) -> Option<String> {
     Some(s.to_owned())
 }
 
-fn push_unique_token(out: &mut Vec<String>, tok: String) {
-    if !out.contains(&tok) {
-        out.push(tok);
+fn push_unique_token(out: &mut Vec<(String, Vec<u32>)>, tok: String, line: u32) {
+    match out.iter_mut().find(|(existing, _)| *existing == tok) {
+        Some((_, lines)) => {
+            if lines.len() < MAX_TOKEN_LINES && !lines.contains(&line) {
+                lines.push(line);
+            }
+        }
+        None => out.push((tok, vec![line])),
     }
+}
+
+/// The 1-based source line a node starts on.
+fn node_line(node: tree_sitter::Node<'_>) -> u32 {
+    u32::try_from(node.start_position().row)
+        .unwrap_or(u32::MAX - 1)
+        .saturating_add(1)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dictionary_tokens_record_their_source_lines() {
+        let toks = extract_perl_dictionary_tokens_located(
+            "sub f { my $s = shift; return $s eq \"WGT1\"; }\nmy $t = \"WGT1\";\n",
+        )
+        .expect("parses");
+        let found = toks
+            .iter()
+            .find(|(token, _)| token == "WGT1")
+            .unwrap_or_else(|| panic!("WGT1 not mined: {toks:?}"));
+        assert_eq!(found.1, vec![1, 2], "{toks:?}");
+    }
 
     #[test]
     fn extracts_string_and_integer_dictionary_tokens() {

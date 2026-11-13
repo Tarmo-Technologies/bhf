@@ -509,6 +509,10 @@ dependencies = [
 [[package]]
 name = "config"
 version = "0.3.0"
+dependencies = [
+ "serde",
+ "toml",
+]
 
 [[package]]
 name = "const_format"
@@ -1855,6 +1859,7 @@ dependencies = [
  "corpus",
  "event_log",
  "fuzz_engine_builtin",
+ "libc",
  "serde",
  "serde_json",
  "thiserror",
@@ -2308,6 +2313,7 @@ dependencies = [
  "python_parser",
  "rust_parser",
  "serde",
+ "type_model",
 ]
 
 [[package]]

@@ -175,7 +175,7 @@ fn classify(prov_bin: &Path, input: &Path, poisoned_names: &[String]) -> Provena
         input.file_name().and_then(|n| n.to_str()).unwrap_or("x")
     ));
     let _ = std::fs::remove_file(&trace);
-    let Ok(out) = crate::command_output::output_with_timeout(
+    let Ok((out, cut_off)) = crate::command_output::bounded_replay_output(
         replay_command(prov_bin)
             .arg(input)
             .env("BHF_STUB_TRACE", &trace)
@@ -190,8 +190,12 @@ fn classify(prov_bin: &Path, input: &Path, poisoned_names: &[String]) -> Provena
     };
     let fired = read_fired_stubs(&trace, poisoned_names);
     let _ = std::fs::remove_file(&trace);
-    if !fired.is_empty() || out.status.code() == Some(STUB_FIRED_EXIT) {
+    if !fired.is_empty() || (!cut_off && out.status.code() == Some(STUB_FIRED_EXIT)) {
         return Provenance::StubArtifact(fired);
+    }
+    // A run killed at its bound died of the kill, not of a sanitizer report.
+    if cut_off {
+        return Provenance::Inconclusive;
     }
     let stderr = String::from_utf8_lossy(&out.stderr);
     if is_sanitizer_crash(&stderr, &out.status) {
@@ -239,28 +243,24 @@ fn is_sanitizer_crash(stderr: &str, status: &std::process::ExitStatus) -> bool {
 
 /// Does the real ASan build crash on this input in a fresh process?
 fn reproduces_crash(bin: &Path, input: &Path) -> bool {
-    let Ok(out) = crate::command_output::output_with_timeout(
+    let Ok((out, false)) = crate::command_output::bounded_replay_output(
         replay_command(bin)
             .arg(input)
             .env("ASAN_OPTIONS", "abort_on_error=1:symbolize=0"),
         std::time::Duration::from_secs(15),
     ) else {
+        // Not run, or killed at its bound: a kill is no reproduced crash.
         return false;
     };
     let stderr = String::from_utf8_lossy(&out.stderr);
     is_sanitizer_crash(&stderr, &out.status)
 }
 
-/// Build a replay command wrapped in `timeout` when available so a pathological
-/// input can never wedge the provenance pass.
+/// Build a replay command killed after 10 s
+/// ([`crate::command_output::killed_after`]) so a pathological input can never
+/// wedge the provenance pass.
 fn replay_command(bin: &Path) -> Command {
-    if which::which("timeout").is_ok() {
-        let mut cmd = Command::new("timeout");
-        cmd.arg("-s").arg("KILL").arg("10").arg(bin);
-        cmd
-    } else {
-        Command::new(bin)
-    }
+    crate::command_output::killed_after(bin, 10)
 }
 
 /// Build the `main_prov` provenance variant: `make prov` with the poisoned stub as
@@ -270,6 +270,13 @@ fn build_prov(hdir: &Path, prov_src: &Path) -> bool {
     // Match the auto build's default C/C++ compiler when the caller's env doesn't
     // already pin one (the generated Makefile's CC default is plain `clang`, which
     // is correct here — the ASan flags are baked into CFLAGS).
+    // The recipe expands `$(AUTO_PROV_SOURCES)` through the shell, so a work
+    // dir with spaces must arrive quoted.
+    let Ok(prov_src) =
+        harness_gen::build_safety::checked_recipe_path("provenance stub source", prov_src)
+    else {
+        return false;
+    };
     let mut cmd = Command::new("make");
     cmd.arg("prov").current_dir(hdir);
     cmd.env("AUTO_PROV_SOURCES", prov_src);

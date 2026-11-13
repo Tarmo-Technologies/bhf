@@ -30,6 +30,8 @@ fn cpp_fixture_dir() -> PathBuf {
 
 fn options(src_root: &std::path::Path) -> AttemptOptions {
     AttemptOptions {
+        cross_sweep: None,
+        ada_toolchain: Default::default(),
         project: None,
         decoder_limits: Default::default(),
         force: false,
@@ -106,6 +108,7 @@ fn restrict_qualifier_macro_param_builds() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&dir).unwrap();
@@ -162,6 +165,7 @@ fn restrict_qualifier_macro_param_builds_cpp() {
         is_static: false,
         foreign_guard: None,
         input_reachability: None,
+        input_reachability_basis: None,
         dialect: None,
     };
     let idx = DeclarationIndex::build(&dir).unwrap();

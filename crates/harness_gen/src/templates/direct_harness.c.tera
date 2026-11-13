@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* generated_harnesses/{{ harness_id }}/main.c */
+/* bhf harness format {{ harness_format_version }}{% if buffer_len_dimension %} with an explicit buffer length{% endif %} */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -39,6 +40,8 @@
 #ifdef getenv
 #undef getenv
 #endif
+/* BHF_TRACE_ARGS=1 prints each decoded argument to stderr (bhf_trace.h). */
+#include "bhf_trace.h"
 
 /* Sanitizer-runtime callbacks (edge coverage + cmplog operand capture, #400)
  * must never be instrumented themselves: with `-fsanitize-coverage=trace-cmp`
@@ -47,7 +50,16 @@
 #ifndef BHF_NOCOV
 #if defined(__has_attribute)
 #if defined(__clang__) && __has_attribute(no_sanitize)
+#if defined(_WIN32)
+/* On Windows AddressSanitizer's interceptors call the comparison hooks
+ * below before the program starts, while its shadow memory is still being
+ * set up, so an instrumented hook faulted there and the process died before
+ * main (a clean input exited with an access violation). They are not
+ * address-checked: they read only the bytes the compare read. */
+#define BHF_NOCOV __attribute__((no_sanitize("coverage", "address")))
+#else
 #define BHF_NOCOV __attribute__((no_sanitize("coverage")))
+#endif
 #elif __has_attribute(no_sanitize_coverage)
 #define BHF_NOCOV __attribute__((no_sanitize_coverage))
 #elif __has_attribute(no_sanitize)
@@ -123,6 +135,9 @@ static uint32_t _bhf_env_next_u32(void) {
 {%- endif %}
 
 {%- if not passthrough_libfuzzer_entrypoint and emit_forward_declaration %}
+{%- for tag in forward_tags %}
+{{ tag }};
+{%- endfor %}
 extern {{ return_type }} {{ qualified_target_name }}({% for p in params %}{{ p.c_type }}{% if not loop.last %}, {% endif %}{% endfor %});
 {%- endif %}
 
@@ -700,8 +715,8 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
     _bhf_env_size = Size;
     _bhf_env_index = 0;
 {%- endif %}
-{%- for p in params %}
-    {{ p.decl }};
+{%- for d in params_decode %}
+    {{ d }};
 {%- endfor %}
 {%- if byte_stream %}
     /* Byte-stream decoder: replay the whole fuzz input through the target one
@@ -741,6 +756,9 @@ int bhf_run_one(const uint8_t *Data, size_t Size) {
 {%- endif %}
 {%- endif %}
 {%- endif %}
+{%- for d in params_after %}
+    {{ d }};
+{%- endfor %}
     (void)Cur;
 {%- if result_cleanup and not byte_stream %}
     {{ result_cleanup }};

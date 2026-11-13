@@ -201,9 +201,12 @@ fn report_subcommand_generates_replay_py_for_every_finding() {
 
     let script = fs::read_to_string(finding_dir.join("replay.py")).unwrap();
     assert!(script.starts_with("#!/usr/bin/env python3\n"));
-    // Leak finding keeps leak detection ON so the LSan report reproduces.
+    // Leak finding keeps leak detection ON so the LSan report reproduces: it
+    // is one of bhf's required keys, and no default turns it off.
     assert!(
-        script.contains("detect_leaks=1:abort_on_error=1"),
+        script.contains(
+            "ASAN_OPTIONS_REQUIRED = \"abort_on_error=1:halt_on_error=1:detect_leaks=1\""
+        ) && script.contains("ASAN_OPTIONS_DEFAULT = \"\""),
         "expected leak detection on for an lsan finding:\n{script}"
     );
     assert!(script.contains("\"testcase.bin\""));

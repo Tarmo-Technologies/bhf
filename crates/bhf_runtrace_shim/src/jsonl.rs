@@ -53,6 +53,23 @@ pub fn emit_raw(line: &[u8]) {
     }
 }
 
+/// Open (and so create) the runtrace log as soon as the shim is loaded. bhf
+/// removes the log before a run and reads its existence afterwards as proof
+/// that the shim was preloaded: a run whose target touched nothing the shim
+/// records still leaves an empty log, while a harness the dynamic loader could
+/// not preload the shim into (a path `LD_PRELOAD` splits) leaves none.
+#[used]
+#[link_section = ".init_array"]
+static OPEN_LOG_AT_LOAD: extern "C" fn() = open_log_at_load;
+
+extern "C" fn open_log_at_load() {
+    // A hook guard, so the `open` of the log (which may bind to the shim's own
+    // `open` hook) is not itself recorded.
+    if let Some(_guard) = crate::reentrancy::HookGuard::acquire() {
+        let _ = ensure_fd();
+    }
+}
+
 fn ensure_fd() -> i32 {
     let cached = LOG_FD.load(Ordering::Relaxed);
     if cached != FD_UNINITIALIZED {

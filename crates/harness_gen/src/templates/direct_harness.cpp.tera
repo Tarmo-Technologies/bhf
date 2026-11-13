@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // generated_harnesses/{{ harness_id }}/main.cpp
+// bhf harness format {{ harness_format_version }}{% if buffer_len_dimension %} with an explicit buffer length{% endif %}
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -80,6 +81,8 @@
 #ifdef getenv
 #undef getenv
 #endif
+// BHF_TRACE_ARGS=1 prints each decoded argument to stderr (bhf_trace.h).
+#include "bhf_trace.h"
 
 // Sanitizer-runtime callbacks (edge coverage + cmplog operand capture, #400)
 // must never be instrumented themselves: with `-fsanitize-coverage=trace-cmp`
@@ -88,7 +91,16 @@
 #ifndef BHF_NOCOV
 #if defined(__has_attribute)
 #if defined(__clang__) && __has_attribute(no_sanitize)
+#if defined(_WIN32)
+// On Windows AddressSanitizer's interceptors call the comparison hooks
+// below before the program starts, while its shadow memory is still being
+// set up, so an instrumented hook faulted there and the process died before
+// main (a clean input exited with an access violation). They are not
+// address-checked: they read only the bytes the compare read.
+#define BHF_NOCOV __attribute__((no_sanitize("coverage", "address")))
+#else
 #define BHF_NOCOV __attribute__((no_sanitize("coverage")))
+#endif
 #elif __has_attribute(no_sanitize_coverage)
 #define BHF_NOCOV __attribute__((no_sanitize_coverage))
 #elif __has_attribute(no_sanitize)
@@ -727,14 +739,14 @@ extern "C" int bhf_run_one(const uint8_t *Data, size_t Size) {
 {%- if pugi_retained_buffers %}
     std::vector<void *> _bhf_retained_buffers;
 {%- endif %}
-{%- for p in params %}
-    {{ p.decl }};
+{%- for d in params_decode %}
+    {{ d }};
 {%- endfor %}
 {%- if factory %}
     // Factory-based receiver: the owner is stack-allocated and kept in scope so
     // the receiver's lifetime (which may be owned by the factory's owner) is safe.
-{%- for p in factory.params %}
-    {{ p.decl }};
+{%- for d in factory.decode %}
+    {{ d }};
 {%- endfor %}
 {%- if factory.owner_type and factory.owner_method_is_static %}
     auto _bhf_receiver = {{ factory.owner_type }}::{{ factory.method }}({% for p in factory.params %}{{ p.arg }}{% if not loop.last %}, {% endif %}{% endfor %});
@@ -744,6 +756,12 @@ extern "C" int bhf_run_one(const uint8_t *Data, size_t Size) {
 {%- else %}
     auto _bhf_receiver = {{ factory.method }}({% for p in factory.params %}{{ p.arg }}{% if not loop.last %}, {% endif %}{% endfor %});
 {%- endif %}
+{%- if receiver_trace %}
+    {{ receiver_trace }};
+{%- endif %}
+{%- for d in params_late %}
+    {{ d }};
+{%- endfor %}
 {%- if factory.receiver_is_pointer %}
 {%- if return_type_present %}
     {{ return_type }} R{};
@@ -768,17 +786,20 @@ extern "C" int bhf_run_one(const uint8_t *Data, size_t Size) {
     {{ receiver_class }} _bhf_receiver({% for p in params %}{{ p.arg }}{% if not loop.last %}, {% endif %}{% endfor %});
     (void)_bhf_receiver;
 {%- else %}
-{%- for p in constructor_params %}
-    {{ p.decl }};
+{%- for d in constructor_decode %}
+    {{ d }};
 {%- endfor %}
     {{ receiver_class }} _bhf_receiver{% if constructor_params %}({% for p in constructor_params %}{{ p.arg }}{% if not loop.last %}, {% endif %}{% endfor %}){% endif %};
+{%- if receiver_trace %}
+    {{ receiver_trace }};
+{%- endif %}
 {%- endif %}
 {%- if protocol_steps %}
     // Project-mined expert protocol: declaration-checked calls run once in the
     // observed order, retaining safe literals and coherent input/size bindings.
 {%- for step in protocol_steps %}
-{%- for p in step.params %}
-    {{ p.decl }};
+{%- for d in step.decode %}
+    {{ d }};
 {%- endfor %}
 {%- if step.marks_target %}
     BHF_TARGET_ENTER();
@@ -787,6 +808,9 @@ extern "C" int bhf_run_one(const uint8_t *Data, size_t Size) {
 {%- if step.return_type_present %}
     (void){{ step.result_name }};
 {%- endif %}
+{%- for d in step.after %}
+    {{ d }};
+{%- endfor %}
 {%- for p in step.params %}
 {%- if p.free %}
     {{ p.free }};
@@ -800,13 +824,16 @@ extern "C" int bhf_run_one(const uint8_t *Data, size_t Size) {
         switch (bhf_u8(&Cur) % {{ lifecycle_step_count }}) {
 {%- for step in lifecycle_steps %}
         case {{ loop.index0 }}: {
-{%- for p in step.params %}
-            {{ p.decl }};
+{%- for d in step.decode %}
+            {{ d }};
 {%- endfor %}
             {% if step.return_type_present %}{{ step.return_type }} {{ step.result_name }} = {% endif %}_bhf_receiver.{{ step.name }}({% for p in step.params %}{{ p.arg }}{% if not loop.last %}, {% endif %}{% endfor %});
 {%- if step.return_type_present %}
             (void){{ step.result_name }};
 {%- endif %}
+{%- for d in step.after %}
+            {{ d }};
+{%- endfor %}
 {%- for p in step.params %}
 {%- if p.free %}
             {{ p.free }};
@@ -821,6 +848,9 @@ extern "C" int bhf_run_one(const uint8_t *Data, size_t Size) {
     }
     // RAII destructors run when _bhf_receiver leaves scope.
 {%- endif %}
+{%- for d in params_late %}
+    {{ d }};
+{%- endfor %}
 {%- if not target_is_constructor and not protocol_steps %}
     BHF_TARGET_ENTER();
     {% if return_type_present %}{{ return_type }} R = {% endif %}_bhf_receiver.{{ target_name }}({% for p in params %}{{ p.arg }}{% if not loop.last %}, {% endif %}{% endfor %});
@@ -837,6 +867,9 @@ extern "C" int bhf_run_one(const uint8_t *Data, size_t Size) {
     BHF_TARGET_ENTER();
     {% if return_type_present %}{{ return_type }} R = {% endif %}{{ qualified_target_name }}{{ target_template_suffix }}({% for p in params %}{{ p.arg }}{% if not loop.last %}, {% endif %}{% endfor %});
 {%- endif %}
+{%- for d in params_after %}
+    {{ d }};
+{%- endfor %}
     (void)Cur;
 {%- if return_type_present and not byte_stream and not protocol_steps %}
     BHF_KEEP_RESULT(R);

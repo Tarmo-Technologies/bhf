@@ -6,6 +6,9 @@
 #include <stddef.h>
 #include <string.h>
 #include <stdlib.h>
+#if defined(_WIN32)
+#include <stdio.h>
+#endif
 
 #if !defined(__cplusplus) && (!defined(__STDC_VERSION__) || __STDC_VERSION__ < 199901L)
 #ifndef inline
@@ -275,6 +278,30 @@ static inline wchar_t *bhf_wc_string(bhf_cursor *c, size_t max) {
     return out;
 }
 
+/* A readable FILE* over the `size` bytes at `buf` (a FILE* parameter's
+ * stream), or a fresh empty stream when `size` is 0; NULL on failure. POSIX
+ * has fmemopen. The Windows C runtime does not, so there the bytes go to a
+ * temporary file that is deleted when the stream is closed, rewound to its
+ * start. A macro, so a translation unit that never opens a stream does not
+ * need fmemopen declared (a -std=c89 build does not declare it). */
+#if defined(_WIN32)
+static inline FILE *bhf_win_fmemopen(const unsigned char *buf, size_t size) {
+    FILE *stream = NULL;
+    char *name = _tempnam(NULL, "bhf_in");
+    if (name && fopen_s(&stream, name, "w+bTD") != 0) stream = NULL;
+    free(name);
+    if (stream && size && fwrite(buf, 1, size, stream) != size) {
+        fclose(stream);
+        return NULL;
+    }
+    if (stream) rewind(stream);
+    return stream;
+}
+#define bhf_fmemopen(buf, size) bhf_win_fmemopen((buf), (size))
+#else
+#define bhf_fmemopen(buf, size) ((size) ? fmemopen((buf), (size), "r+") : tmpfile())
+#endif
+
 /* Write `size` bytes of `data` to a fresh temp file and return its path (stored
  * in caller-owned `path_buf`, which MUST be at least `bhf_tempfile_path_len`
  * bytes), or NULL on failure. For APIs that take a FILE PATH (not a FILE* or a
@@ -305,6 +332,43 @@ static inline const char *bhf_make_tempfile(const uint8_t *data, size_t size, ch
     return NULL;
 }
 #endif
+
+/* Opt-in explicit length for the bytes a call's whole-input parameters take
+ * (BHF_BUFFER_LEN_DIMENSION=1 at generation): a 32-bit little-endian length L,
+ * then the next min(L, remaining) bytes, which the cursor moves past. Returns
+ * a pointer to them and stores their count in *size. */
+static inline const uint8_t *bhf_take_sized(bhf_cursor *c, size_t *size) {
+    size_t want = (size_t)(uint32_t)bhf_i32(c);
+    size_t avail = bhf_remaining(c);
+    const uint8_t *at = c->data + c->pos;
+    if (want > avail) want = avail;
+    *size = want;
+    c->pos += want;
+    return at;
+}
+
+/* The bytes of one buffer of a call that takes several: as bhf_take_sized,
+ * a 32-bit little-endian length L, then the next min(L, remaining) bytes,
+ * which the cursor moves past, but returned as a heap copy of its own, so a
+ * read past it is a heap overflow the sanitizer reports instead of a read of
+ * the next buffer's bytes. The copy holds max(those bytes, capacity, 1)
+ * bytes, zero past those bytes: capacity 0 gives exactly them, and a buffer
+ * with no length of its own passes the input size, so it stays as large as
+ * the input. Stores their count in *size and their offset in the input in
+ * *at. Caller frees the copy with free(). */
+static inline uint8_t *bhf_take_sized_copy(bhf_cursor *c, size_t *size, size_t *at,
+                                           size_t capacity) {
+    const uint8_t *from = bhf_take_sized(c, size);
+    size_t n = *size > capacity ? *size : capacity;
+    uint8_t *copy = (uint8_t *)calloc(n ? n : 1, 1);
+    *at = (size_t)(from - c->data);
+    if (!copy) {
+        *size = 0;
+        return NULL;
+    }
+    if (*size) memcpy(copy, from, *size);
+    return copy;
+}
 
 /* Lend the rest of the input as a (ptr, size) span. Lifetime matches the
  * cursor's backing buffer (the libFuzzer input). No allocation. */

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::finding_arg::resolve_finding_arg;
-use crate::runner::{detect_harness_engine, harness_runner, HarnessEngine, SandboxModeArg};
+use crate::runner::{detect_harness_engine_in, harness_runner_for, HarnessEngine, SandboxModeArg};
 use anyhow::{anyhow, Context};
 use clap::ValueEnum;
 use serde_json::json;
@@ -22,13 +22,19 @@ pub struct MinimizeArgs {
     #[arg(long, value_name = "ID_OR_DIR")]
     pub finding: Option<PathBuf>,
 
-    /// Harness binary path. Required for minimizing a crash/opaque-input finding;
-    /// omitted for a session finding (HDF-7), which minimizes by re-driving the
-    /// recorded multi-message session rather than re-running a harness binary.
+    /// Harness binary path. Optional: when omitted it is resolved from the
+    /// finding's recorded `fixture_path` or `harness_id` the way `bhf replay`
+    /// resolves it (`<work>/{harnesses,auto,generated_harnesses,build}/<harness_id>/main`).
+    /// Not used for a session finding (HDF-7), which minimizes by re-driving
+    /// the recorded multi-message session rather than re-running a harness
+    /// binary.
     #[arg(long)]
     pub harness: Option<PathBuf>,
 
-    /// qemu-user executable for ELF-Linux cross-target minimization.
+    /// qemu-user executable for ELF-Linux cross-target minimization. Default:
+    /// the emulator recorded beside the harness (`bhf_runner.json`, written by
+    /// a cross build); a harness built for another architecture with neither
+    /// is refused.
     #[arg(long, value_name = "QEMU")]
     pub qemu_user: Option<PathBuf>,
 
@@ -94,15 +100,17 @@ enum CEngineIo {
 /// Minimize a C/C++ harness crash by delta-debugging the recorded
 /// testcase. The predicate runs the harness via the engine-specific
 /// I/O contract (argv file for libFuzzer, stdin for AFL), parses
-/// stderr for a sanitizer report, and accepts the candidate only
-/// when it reproduces the same sanitizer rule_id as the original.
+/// stderr for a sanitizer report (or classifies an undiagnosed fatal
+/// signal), and accepts the candidate only when it is the original's crash
+/// ([`crate::crash_identity::same_crash`]: same rule, kind, signal, and
+/// sink, site or pc).
 fn minimize_c_engine(
     finding_dir: &Path,
-    harness: &Path,
+    runner: &replay_min::HarnessRunner,
     strategy: MinimizeStrategy,
     io: CEngineIo,
 ) -> anyhow::Result<MinimizeSummary> {
-    minimize_c_engine_until(finding_dir, harness, strategy, io, None)
+    minimize_c_engine_until(finding_dir, runner, strategy, io, None)
 }
 
 /// Like [`minimize_c_engine`], but stops accepting further reductions once
@@ -111,13 +119,12 @@ fn minimize_c_engine(
 /// bounded `auto` minimization pass to cap wall-clock time per finding.
 fn minimize_c_engine_until(
     finding_dir: &Path,
-    harness: &Path,
+    runner: &replay_min::HarnessRunner,
     strategy: MinimizeStrategy,
     io: CEngineIo,
     deadline: Option<std::time::Instant>,
 ) -> anyhow::Result<MinimizeSummary> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
+    let harness = runner.harness_path();
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     if strategy != MinimizeStrategy::Bytes {
@@ -133,57 +140,38 @@ fn minimize_c_engine_until(
     let tmp_dir = finding_dir.join("minimize_tmp");
     fs::create_dir_all(&tmp_dir)
         .with_context(|| format!("create minimize temp dir {}", tmp_dir.display()))?;
-    let run_once = |bytes: &[u8]| -> anyhow::Result<Option<&'static str>> {
-        let mut cmd = Command::new(harness);
-        cmd.stdout(Stdio::null()).stderr(Stdio::piped());
-        let input_path = match io {
-            CEngineIo::ArgvFile => {
-                let nonce = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0);
-                let p = tmp_dir.join(format!("input-{}-{}.bin", std::process::id(), nonce));
-                fs::write(&p, bytes).with_context(|| format!("write {}", p.display()))?;
-                cmd.arg(&p).stdin(Stdio::null());
-                Some(p)
-            }
-            CEngineIo::Stdin => {
-                cmd.stdin(Stdio::piped());
-                None
-            }
-        };
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("spawn {}", harness.display()))?;
-        if let CEngineIo::Stdin = io {
-            if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(bytes);
-            }
-        }
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            match child.try_wait()? {
-                Some(_) => break,
-                None => {
-                    if Instant::now() >= deadline {
-                        let _ = child.kill();
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-            }
-        }
-        let output = child.wait_with_output()?;
-        if let Some(p) = input_path {
-            let _ = fs::remove_file(&p);
-        }
-        if output.status.success() {
+    let leak = fs::read(finding_dir.join("finding.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .is_some_and(|raw| crate::replay::is_leak_finding(&raw));
+    // The fuzz child's sanitizer options (UBSan prints and continues by
+    // default), so a finding reproduces as the crash it was recorded as.
+    let sanitizer_env = crate::fuzz::sanitizer_child_env_for(leak, runner.qemu_prefix().is_some());
+    let input = match io {
+        CEngineIo::ArgvFile => crate::replay::CInput::ArgvFile,
+        CEngineIo::Stdin => crate::replay::CInput::Stdin,
+    };
+    let run_once = |bytes: &[u8]| -> anyhow::Result<Option<corpus::SanitizerReport>> {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = tmp_dir.join(format!("input-{}-{}.bin", std::process::id(), nonce));
+        fs::write(&path, bytes).with_context(|| format!("write {}", path.display()))?;
+        // Its own process group: a timeout kills whatever the harness started.
+        let run = crate::replay::run_c_harness(
+            runner,
+            input,
+            &path,
+            Duration::from_secs(10),
+            &sanitizer_env,
+        );
+        let _ = fs::remove_file(&path);
+        let run = run.map_err(|error| anyhow!(error))?;
+        if run.timed_out || run.status.is_some_and(|status| status.success()) {
             return Ok(None);
         }
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Ok(corpus::parse_sanitizer_report(&stderr)
-            .map(|r| r.rule_id)
-            .or_else(|| crate::fatal_signal::rule_id(&output.status, &stderr)))
+        Ok(run.report())
     };
 
     let baseline = run_once(&original_input)?.ok_or_else(|| {
@@ -198,7 +186,8 @@ fn minimize_c_engine_until(
         if deadline.is_some_and(|d| Instant::now() >= d) {
             return Ok(false); // budget spent: reject further reductions, keep best-so-far
         }
-        Ok(run_once(candidate)?.map(|r| r == baseline).unwrap_or(false))
+        Ok(run_once(candidate)?
+            .is_some_and(|report| crate::crash_identity::same_crash(&baseline, &report)))
     })?;
 
     let _ = fs::remove_dir_all(&tmp_dir);
@@ -240,6 +229,14 @@ fn minimize_c_engine_until(
     })
 }
 
+/// Classify `harness` with the detector fuzz and replay use, searching the
+/// harness dirs of the work dir that holds `finding_dir` for its sources.
+fn engine_for_finding(harness: &Path, finding_dir: &Path) -> HarnessEngine {
+    let work = corpus::layout::work_dir_for_finding(finding_dir);
+    let work_dirs: Vec<&Path> = work.iter().map(PathBuf::as_path).collect();
+    detect_harness_engine_in(harness, &work_dirs)
+}
+
 /// The work dir that owns the finding being minimized, when it lives in a
 /// results layout (so the dispatcher can rebuild results/ afterwards).
 pub fn work_dir_hint(args: &MinimizeArgs) -> Option<std::path::PathBuf> {
@@ -256,14 +253,21 @@ pub(crate) fn minimize_for_auto(
     harness: &Path,
     deadline: std::time::Instant,
 ) -> anyhow::Result<Option<MinimizeSummary>> {
-    let io = match detect_harness_engine(harness) {
+    let io = match engine_for_finding(harness, finding_dir) {
         HarnessEngine::CAfl => CEngineIo::Stdin,
         HarnessEngine::CLibFuzzer => CEngineIo::ArgvFile,
         HarnessEngine::AdaStdin => return Ok(None),
     };
+    // A cross-built harness runs under the emulator recorded beside it.
+    let runner = match crate::runner::recorded_runner_for(harness) {
+        Some(recorded) => {
+            replay_min::HarnessRunner::qemu_user(recorded.program, recorded.args, harness)
+        }
+        None => replay_min::HarnessRunner::direct(harness),
+    };
     minimize_c_engine_until(
         finding_dir,
-        harness,
+        &runner,
         MinimizeStrategy::Bytes,
         io,
         Some(deadline),
@@ -325,9 +329,24 @@ fn run_inner(args: MinimizeArgs) -> anyhow::Result<MinimizeSummary> {
              recorded transport). On-target minimization is a tracked follow-up."
         ));
     }
-    let harness = args.harness.ok_or_else(|| {
-        anyhow!("minimize requires --harness <path> for a crash/opaque-input finding")
-    })?;
+    let explicit = args.harness.is_some();
+    let harness = finding_harness(&finding_dir, args.harness)?;
+    if !explicit {
+        bhfeprintln!(
+            "bhf: minimizing against the finding's harness {}",
+            harness.display()
+        );
+    }
+    // A testcase recorded against another harness input format decodes into
+    // other argument values here, and may not reproduce at all.
+    if let Some(note) = std::fs::read(finding_dir.join("finding.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .zip(harness.parent())
+        .and_then(|(raw, dir)| crate::generate_harness::finding_format_note(&raw, dir))
+    {
+        bhfeprintln!("note: {note}");
+    }
     if crate::binary_fuzz::is_binary_finding(&finding_dir) {
         let result =
             crate::binary_fuzz::minimize_binary_finding(&finding_dir, &harness, args.strategy)?;
@@ -339,28 +358,43 @@ fn run_inner(args: MinimizeArgs) -> anyhow::Result<MinimizeSummary> {
             reduced: result.reduced,
         });
     }
-    // Dispatch by engine. Both C engines reuse the same delta-debug
-    // skeleton but differ in how a candidate input reaches main():
-    // libFuzzer takes argv[1], AFL persistent-mode reads stdin (the
-    // generated template falls back to `bhf_afl_read_stdin`).
-    match detect_harness_engine(&harness) {
-        HarnessEngine::CAfl => {
-            return minimize_c_engine(&finding_dir, &harness, args.strategy, CEngineIo::Stdin);
-        }
-        HarnessEngine::CLibFuzzer => {
-            return minimize_c_engine(&finding_dir, &harness, args.strategy, CEngineIo::ArgvFile);
-        }
-        HarnessEngine::AdaStdin => {}
-    }
-    let runner = harness_runner(
+    // One runner for every engine, so --qemu-user, the emulator recorded
+    // beside a cross-built harness, and the sandbox apply to all of them.
+    let runner = harness_runner_for(
         harness,
         args.qemu_user,
         args.qemu_args,
         args.sandbox,
         args.sandbox_tool,
         args.sandbox_strict,
-    );
-    let result = minimize(&finding_dir, &runner, args.strategy)?;
+    )
+    .map_err(|error| anyhow!(error))?;
+    // Dispatch by engine, with the protocol detector fuzz and replay use (the
+    // harness's sources are searched in every harness dir of the work dir
+    // holding the finding). Both C engines reuse the same delta-debug
+    // skeleton but differ in how a candidate input reaches main():
+    // libFuzzer takes argv[1], AFL persistent-mode reads stdin (the
+    // generated template falls back to `bhf_afl_read_stdin`).
+    match engine_for_finding(runner.harness_path(), &finding_dir) {
+        HarnessEngine::CAfl => {
+            return minimize_c_engine(&finding_dir, &runner, args.strategy, CEngineIo::Stdin);
+        }
+        HarnessEngine::CLibFuzzer => {
+            return minimize_c_engine(&finding_dir, &runner, args.strategy, CEngineIo::ArgvFile);
+        }
+        HarnessEngine::AdaStdin => {}
+    }
+    let result = minimize(&finding_dir, &runner, args.strategy).with_context(|| {
+        let work = corpus::layout::work_dir_for_finding(&finding_dir);
+        let work_dirs: Vec<&Path> = work.iter().map(PathBuf::as_path).collect();
+        let detection = crate::protocol_detect::detect(runner.harness_path(), &work_dirs);
+        format!(
+            "minimizing {} as an Ada stdin harness ({}); if it is a C/C++ harness, pass the \
+             binary next to its main.c/main.cpp with --harness, or rebuild it with this bhf",
+            runner.harness_path().display(),
+            detection.basis.describe()
+        )
+    })?;
     let min_path = finding_dir.join("min_testcase.bin");
 
     fs::write(&min_path, &result.minimized)
@@ -374,6 +408,17 @@ fn run_inner(args: MinimizeArgs) -> anyhow::Result<MinimizeSummary> {
         removed_bytes: result.original_len.saturating_sub(result.minimized.len()),
         reduced: result.reduced,
     })
+}
+
+/// The harness to minimize against: `explicit` (`--harness`), else the one
+/// the finding records, resolved in its work dir the way `bhf replay` does
+/// (`fixture_path`, then `harness_id` under `harnesses/`, `auto/`,
+/// `generated_harnesses/` and `build/`).
+fn finding_harness(finding_dir: &Path, explicit: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    match explicit {
+        Some(harness) => Ok(harness),
+        None => crate::replay::recorded_harness(finding_dir).map_err(|error| anyhow!(error)),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -461,6 +506,34 @@ fn update_finding_record(finding_dir: &Path, result: &MinimizeOutput) -> anyhow:
     Ok(())
 }
 
+#[cfg(test)]
+mod harness_tests {
+    /// Without `--harness`, minimize resolves the finding's harness the way
+    /// replay does, including a binary `bhf build` staged into
+    /// `build/<id>/main`.
+    #[test]
+    fn the_harness_is_resolved_from_the_finding() {
+        let work = tempfile::tempdir().unwrap();
+        let finding = work.path().join("results/findings/F-0001-aaaaaaaa");
+        std::fs::create_dir_all(&finding).unwrap();
+        std::fs::write(finding.join("finding.json"), r#"{"harness_id":"H-1"}"#).unwrap();
+        let staged = work.path().join("build/H-1/main");
+        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        std::fs::write(&staged, b"\x7fELF").unwrap();
+        assert_eq!(super::finding_harness(&finding, None).unwrap(), staged);
+        let explicit = work.path().join("elsewhere/main");
+        assert_eq!(
+            super::finding_harness(&finding, Some(explicit.clone())).unwrap(),
+            explicit
+        );
+        std::fs::remove_file(&staged).unwrap();
+        let error = super::finding_harness(&finding, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--harness"), "{error}");
+    }
+}
+
 #[cfg(all(test, unix))]
 mod silent_abort_tests {
     use super::{minimize_c_engine, minimize_c_engine_until, CEngineIo, MinimizeStrategy};
@@ -498,7 +571,7 @@ mod silent_abort_tests {
 
         let result = minimize_c_engine(
             &finding,
-            &harness,
+            &replay_min::HarnessRunner::direct(&harness),
             MinimizeStrategy::Bytes,
             CEngineIo::ArgvFile,
         )
@@ -509,6 +582,43 @@ mod silent_abort_tests {
             fs::read(finding.join("min_testcase.bin")).unwrap(),
             b"CRASH"
         );
+    }
+
+    /// UBSan prints its report and CONTINUES (exit 0) unless told to halt, the
+    /// way the fuzz child is. A minimizer child without those options saw no
+    /// crash and refused to minimize every UBSan finding.
+    #[test]
+    fn libfuzzer_minimizer_reproduces_ubsan_findings_like_the_fuzz_child() {
+        let root = tempdir().expect("tempdir");
+        let finding = root.path().join("finding");
+        fs::create_dir(&finding).expect("finding dir");
+        fs::write(
+            finding.join("finding.json"),
+            r#"{"rule_id":"BHF-210","paths":{}}"#,
+        )
+        .expect("finding");
+        fs::write(finding.join("testcase.bin"), b"prefix-UB-suffix").expect("testcase");
+        let harness = root.path().join("ubsan-like.sh");
+        fs::write(
+            &harness,
+            "#!/bin/sh\ncase \"$(cat \"$1\")\" in *UB*)\n\
+             echo \"/src/w.c:2:15: runtime error: shift exponent 40 is too large for 32-bit type 'int'\" >&2\n\
+             case \"$UBSAN_OPTIONS\" in *halt_on_error=1*) exit 1;; esac;;\nesac\nexit 0\n",
+        )
+        .expect("harness");
+        let mut permissions = fs::metadata(&harness).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&harness, permissions).expect("chmod");
+
+        let result = minimize_c_engine(
+            &finding,
+            &replay_min::HarnessRunner::direct(&harness),
+            MinimizeStrategy::Bytes,
+            CEngineIo::ArgvFile,
+        )
+        .expect("a UBSan finding reproduces under the fuzz child's options");
+        assert!(result.reduced);
+        assert_eq!(fs::read(finding.join("min_testcase.bin")).unwrap(), b"UB");
     }
 
     #[test]
@@ -527,7 +637,7 @@ mod silent_abort_tests {
 
         let summary = minimize_c_engine_until(
             &finding,
-            &harness,
+            &replay_min::HarnessRunner::direct(&harness),
             MinimizeStrategy::Bytes,
             CEngineIo::ArgvFile,
             Some(past),
@@ -539,5 +649,41 @@ mod silent_abort_tests {
             "an already-expired deadline must not reduce"
         );
         assert!(finding.join("min_testcase.bin").is_file());
+    }
+
+    /// A reduction must be the recorded crash, not merely a crash of the same
+    /// rule: an abort is not minimized into an input that dies of SIGSEGV.
+    #[test]
+    fn a_reduction_that_crashes_with_another_signal_is_rejected() {
+        let root = tempdir().expect("tempdir");
+        let finding = root.path().join("finding");
+        fs::create_dir(&finding).expect("finding dir");
+        fs::write(
+            finding.join("finding.json"),
+            r#"{"rule_id":"BHF-210","paths":{}}"#,
+        )
+        .expect("finding");
+        fs::write(finding.join("testcase.bin"), b"AB").expect("testcase");
+        // "AB..." aborts; anything else ending in B dies of SIGSEGV.
+        let harness = root.path().join("two-signals.sh");
+        fs::write(
+            &harness,
+            "#!/bin/sh\ncase \"$(cat \"$1\")\" in\n  AB*) kill -ABRT $$;;\n  *B) kill -SEGV $$;;\nesac\nexit 0\n",
+        )
+        .expect("harness");
+        let mut permissions = fs::metadata(&harness).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&harness, permissions).expect("chmod");
+
+        let summary = minimize_c_engine(
+            &finding,
+            &replay_min::HarnessRunner::direct(&harness),
+            MinimizeStrategy::Bytes,
+            CEngineIo::ArgvFile,
+        )
+        .expect("minimize");
+
+        assert!(!summary.reduced, "{summary:?}");
+        assert_eq!(fs::read(finding.join("min_testcase.bin")).unwrap(), b"AB");
     }
 }

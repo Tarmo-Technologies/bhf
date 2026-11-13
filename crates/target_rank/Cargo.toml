@@ -25,3 +25,4 @@ perl_parser = { path = "../perl_parser" }
 python_parser = { path = "../python_parser" }
 rust_parser = { path = "../rust_parser" }
 serde = { workspace = true, features = ["derive"] }
+type_model = { path = "../type_model" }

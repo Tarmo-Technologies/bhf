@@ -269,6 +269,7 @@ pub(crate) fn blocker_for(result: &AttemptResult) -> Option<BlockerKey> {
     let (category, detail) = match &result.outcome {
         Outcome::BuiltAndFuzzed { .. } => return None,
         Outcome::UnsupportedParams { reason } => ("unsupported_params", normalize_detail(reason)),
+        Outcome::UnsafeBuildPath { reason } => ("unsafe_build_path", normalize_detail(reason)),
         Outcome::ReportOnly {
             reason, dialect, ..
         } => {
@@ -324,6 +325,7 @@ fn build_error_detail(error: &build_classifier::BuildErrorKind) -> String {
         E::MissingGprImport { .. } => "missing GPR import".to_owned(),
         E::MalformedFunctionDecl { .. } => "malformed function declaration".to_owned(),
         E::ConfigGuardError { .. } => "build-config #error guard".to_owned(),
+        E::ExtraQualification { .. } => "extra member qualification".to_owned(),
         E::Other { tail } => normalize_detail(tail),
     }
 }
@@ -695,6 +697,7 @@ mod tests {
             is_static: false,
             foreign_guard: None,
             input_reachability: None,
+            input_reachability_basis: None,
             dialect: None,
         }
     }

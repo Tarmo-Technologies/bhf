@@ -318,6 +318,81 @@ pub struct BuildInfo {
     pub sanitizers: Vec<String>,
     pub binary_sha256: Option<String>,
     pub build_id: Option<String>,
+    /// Present only when the harness compiled with headers, macro values or
+    /// types bhf supplied because the project's build context did not (see
+    /// [`BuildFidelity`]). Absent for a build from the real context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fidelity: Option<BuildFidelity>,
+}
+
+/// What a finding's harness build had to supply itself: the build context
+/// (compile database, project import, or none) left a header, a macro value or
+/// a type undefined, and the repair loop wrote a placeholder so the target
+/// compiled. Code compiled against a placeholder value can take paths the
+/// project's real build never does, so the finding may be false or not
+/// reproduce against the real build.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuildFidelity {
+    /// `reduced`: at least one input was fabricated.
+    pub level: String,
+    /// Where the build context came from (the harness Makefile's
+    /// `BUILD_CONTEXT_PROVENANCE`: `none`, `exact_tu_compile_database`, ...).
+    #[serde(default)]
+    pub context: Option<String>,
+    pub fabricated: Vec<FabricatedInput>,
+}
+
+/// One input bhf fabricated for a harness build.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FabricatedInput {
+    /// `macro`, `header` or `type`.
+    pub kind: String,
+    pub name: String,
+    /// The value given to a macro (`0`, empty), or the type a placeholder
+    /// stands for.
+    #[serde(default)]
+    pub value: Option<String>,
+}
+
+impl BuildFidelity {
+    /// At most this many fabricated inputs are named in a caveat.
+    const NAMED: usize = 6;
+
+    /// The fabricated inputs as `macro NAME=VALUE`, `header NAME`, `type NAME`.
+    pub fn summary(&self) -> String {
+        let mut parts: Vec<String> = self
+            .fabricated
+            .iter()
+            .take(Self::NAMED)
+            .map(
+                |input| match (input.kind.as_str(), input.value.as_deref()) {
+                    ("macro", Some(value)) if !value.is_empty() => {
+                        format!("macro {}={value}", input.name)
+                    }
+                    (kind, _) => format!("{kind} {}", input.name),
+                },
+            )
+            .collect();
+        if self.fabricated.len() > Self::NAMED {
+            parts.push(format!("{} more", self.fabricated.len() - Self::NAMED));
+        }
+        parts.join(", ")
+    }
+
+    /// The one-line caveat every renderer shows for such a finding.
+    pub fn caveat(&self) -> String {
+        let source = match self.context.as_deref() {
+            Some("none") | None => "the build context".to_owned(),
+            Some(context) => format!("the build context ({context})"),
+        };
+        format!(
+            "built with inputs bhf supplied because {source} lacked them: {}; the finding \
+             may not reproduce against the project's real build",
+            self.summary()
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -344,6 +419,150 @@ pub struct FuzzBlock {
     pub harness_id: Option<String>,
     pub dialect: Option<String>,
     pub oracle: Option<Value>,
+    /// The memory access the sanitizer reported (`exception.access` in
+    /// `finding.json`), without the raw address. `null` when the report named
+    /// none. Added after the first v1 release: `#[serde(default)]` keeps
+    /// documents written before it readable.
+    #[serde(default)]
+    pub access: Option<MemoryAccess>,
+    /// Comparison evidence recorded while this finding's input ran: which
+    /// input bytes reached which comparison. `null` when no capture ran or it
+    /// could not run, `[]` when one ran and found no input bytes feeding a
+    /// comparison.
+    #[serde(default)]
+    pub input_to_state: Option<Vec<InputToState>>,
+    /// The finding file the `input_to_state` offsets index
+    /// (`min_testcase.bin` or `testcase.bin`), when the capture named it.
+    /// Added after the first v1 release, like `input_to_state`.
+    #[serde(default)]
+    pub input_to_state_input: Option<String>,
+    /// What the comparison-evidence capture found (`finding.json`
+    /// `gate_capture.status`): `recorded`, `no_input_comparisons`,
+    /// `no_comparisons` or `unavailable`. `null` when no capture ran. Added
+    /// after the first v1 release, like `input_to_state`.
+    #[serde(default)]
+    pub input_to_state_status: Option<String>,
+    /// Why the capture recorded no evidence (`gate_capture.reason`), when it
+    /// did not.
+    #[serde(default)]
+    pub input_to_state_reason: Option<String>,
+    /// How far the capture's search for operands computed from input bytes
+    /// (range checks) got. `null` when that search did not run or its state
+    /// was not recorded.
+    #[serde(default)]
+    pub input_to_state_search: Option<InputToStateSearch>,
+    /// The values the harness decoded from the input and passed to the target
+    /// (`decoded_args` in `finding.json`). `null` when they were not traced.
+    #[serde(default)]
+    pub arguments: Option<Vec<Argument>>,
+}
+
+/// How far a capture's search for operands computed from input bytes got.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InputToStateSearch {
+    /// `done`, `partial` (its replay budget ran out) or `too_long` (the input
+    /// was too long to search).
+    pub state: String,
+    /// The input bytes it covered, of `input_len`.
+    pub searched_bytes: u64,
+    pub input_len: u64,
+}
+
+/// A sanitizer-reported memory access.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryAccess {
+    /// `read`, `write` or `unknown`.
+    pub direction: String,
+    pub size: Option<u64>,
+    /// `zero-page` or `high-value-address`, from the report's `Hint:`.
+    pub address_hint: Option<String>,
+    pub region: Option<AccessRegion>,
+    /// Where the region was allocated (or, for a stack object, its frame),
+    /// runtime and allocator frames dropped.
+    pub alloc_stack: Vec<Frame>,
+    pub free_stack: Vec<Frame>,
+    /// The harness parameter whose buffer the access hit (`finding.json`
+    /// `exception.access.parameter`), when the argument trace named one.
+    /// Added after the first v1 release: `#[serde(default)]` keeps documents
+    /// written before it readable.
+    #[serde(default)]
+    pub parameter: Option<AccessParameter>,
+}
+
+/// The harness parameter a memory access hit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccessParameter {
+    pub name: String,
+    /// Bytes from the parameter's pointer (`region_start`: from the region
+    /// start the pointer equals; `region_interior`: from the pointer into the
+    /// region; `nearest_pointer`: from the closest traced pointer below the
+    /// faulting address).
+    pub offset: Option<i64>,
+    /// `region_start`, `region_interior` or `nearest_pointer`.
+    pub basis: String,
+}
+
+/// The object a memory access hit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccessRegion {
+    /// `heap`, `stack` or `global`.
+    pub kind: String,
+    pub size: Option<u64>,
+    /// Access offset from the start of the object: negative before it,
+    /// `>= size` past its end.
+    pub offset: Option<i64>,
+    /// `after`, `before` or `inside`.
+    pub relation: Option<String>,
+    pub distance: Option<u64>,
+    pub variable: Option<String>,
+    pub frame_offset: Option<u64>,
+}
+
+/// One comparison operand that came from the input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InputToState {
+    /// First input byte offset of the span.
+    pub offset: u64,
+    pub len: u64,
+    /// The operand as the comparison saw it.
+    pub operand_hex: String,
+    /// The other operand.
+    pub compared_with_hex: String,
+    /// `cmp` (integer), `switch`, `float_cmp`, `double_cmp`, `memcmp`,
+    /// `strcmp`, `strncmp`, `strcasecmp` or `strncasecmp`.
+    pub cmp_kind: String,
+    /// The comparison's offset in the harness executable (`0x...`).
+    pub site: String,
+    /// The comparison's source position, when it could be symbolized.
+    pub site_location: Option<Location>,
+    /// `equal`: the operand bytes are the input bytes; `byte_swapped`: the
+    /// same in reverse order (a big-endian read); `derived`: the operand is
+    /// computed from these bytes and changed when they did.
+    pub relation: String,
+    /// Whether the two operands were equal when compared.
+    pub operands_equal: bool,
+}
+
+/// A decoded harness argument.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Argument {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub value: Option<String>,
+    pub len: Option<u64>,
+    /// `[start, end)` byte offsets of the testcase the argument came from.
+    pub span: Option<[u64; 2]>,
+    pub preview_hex: Option<String>,
+    /// `param`, `receiver` or `out`.
+    pub role: String,
+    pub after_call_value: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

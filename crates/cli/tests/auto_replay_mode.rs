@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
+// Linux only: the faked environment comes from the LD_PRELOAD runtrace shim.
+#![cfg(target_os = "linux")]
 
 //! End-to-end test for Slice C's replay-with-runtime_mode flow:
 //!

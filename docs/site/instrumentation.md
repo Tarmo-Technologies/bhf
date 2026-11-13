@@ -87,6 +87,27 @@ capture (#400) and value-profile dictionary mining (#398). See
 [libFuzzer feature parity](libfuzzer-parity.md) for how these map to libFuzzer
 knobs.
 
+The callbacks and the sanitizer's `__sanitizer_weak_hook_{memcmp,strcmp,...}`
+hooks also record comparison evidence for one finding. When
+`BHF_CMP_EVIDENCE` names a file, the driver writes every comparison of the run
+to it: integer compares and switch cases, `memcmp`/`bcmp` and the `str*cmp`
+family, with both operands, whether they were equal, and the call site. Satisfied
+comparisons and zero operands are kept, unlike the cmplog ring. Comparisons the
+harness makes before it enters the target (its own decoding of the input) are
+discarded when it calls `bhf_target_enter`, so they cannot use up the 8192
+records a run keeps. Calls from outside the executable are left out. Under
+AddressSanitizer the `memcmp`/`bcmp` interceptor reports a position inside
+itself as the call site, so for buffer and string comparisons the driver also
+records the return addresses of the four frames above that position (glibc's
+`backtrace()`; record format version 2). When the evidence is read, the first
+of them that is not the sanitizer runtime is the comparison's site, so the
+gate names the target's call line, a `memcmp` in harness code is left out like
+any harness comparison, and a call whose caller is in a shared library is
+dropped. When no frame resolves, the gate says its site is not attributable
+(sanitizer interceptor) instead of naming the interceptor's address. bhf sets the variable only for
+the replays that record a finding's evidence; a fuzz campaign never does, so
+each callback costs one pointer test.
+
 ## Rust coverage instrumentation
 
 Rust direct harnesses are instrumented by the compiler, not by source rewriting.

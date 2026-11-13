@@ -76,6 +76,13 @@ pub const ORACLE_MANIFEST: &[OracleManifestEntry] = &[
         describe: "Detect resources opened during fuzz execution and not released before testcase exit",
     },
     OracleManifestEntry {
+        name: "resource-leak",
+        rule_id: "BHF-306",
+        category: OracleCategory::LogicBug,
+        dangerous_apis: &["open", "openat", "fopen", "fopen64"],
+        describe: "Detect files a native harness opened during fuzz execution and did not release before testcase exit",
+    },
+    OracleManifestEntry {
         name: "dynamic-library-load-runtime",
         rule_id: "BHF-413",
         category: OracleCategory::LogicBug,
@@ -259,6 +266,7 @@ mod tests {
         // Per-input oracles keep an empty allowlist (no over-discrimination).
         assert!(site_keys_for("path-traversal-ada").is_empty());
         assert!(site_keys_for("resource-leak-ada").is_empty());
+        assert!(site_keys_for("resource-leak").is_empty());
     }
 
     #[test]

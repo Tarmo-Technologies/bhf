@@ -167,7 +167,10 @@ fn try_canary(
     let output = match kind {
         CanaryCompilerKind::Gnatmake | CanaryCompilerKind::Gnat => {
             let mut command = Command::new(bin);
+            // gnatmake writes the canary's `.ali` into the working directory;
+            // keep it in the scratch directory, not wherever bhf was run.
             command
+                .current_dir(temp_dir.path())
                 .args(["-c", "-gnatc", dialect_switch])
                 .arg(&canary_path);
             output_with_executable_busy_retry(&mut command)?
@@ -250,7 +253,8 @@ fn cache_guard() -> MutexGuard<'static, HashMap<CapabilityCacheKey, CompilerCapa
     }
 }
 
-#[cfg(test)]
+/// The canaries run fake compilers that are POSIX shell scripts.
+#[cfg(all(test, unix))]
 mod tests {
     use std::path::{Path, PathBuf};
 

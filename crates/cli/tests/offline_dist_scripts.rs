@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
+//! The offline distribution's packager and installer are bash scripts for
+//! Linux hosts, so these run on Unix only.
+#![cfg(unix)]
 
 use std::fs;
 use std::io::Write;
-#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

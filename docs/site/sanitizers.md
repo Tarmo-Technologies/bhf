@@ -51,7 +51,22 @@ sanitizer's own runtime options in the environment. bhf **merges** your
 inherited `<SAN>_OPTIONS` with the keys it requires (`abort_on_error`,
 `halt_on_error`, `detect_leaks`) — your keys are kept, bhf's go last so they
 win (you cannot accidentally disable `abort_on_error`, which is what turns a
-sanitizer report into a saved finding). Each sanitizer is merged independently, so
+sanitizer report into a saved finding; a child run under qemu-user gets
+`abort_on_error=0` instead, see below). `UBSAN_OPTIONS` also always gets
+`print_stacktrace=1` and `report_error_type=1`, during fuzzing, minimization,
+`bhf replay` and in the generated `replay.py`. The `replay.py` reproducer
+merges the same way (`ASAN_OPTIONS` gets `abort_on_error=1:halt_on_error=1`,
+`UBSAN_OPTIONS` also `halt_on_error=1`, so an inherited value cannot turn a
+report into a clean exit) and exits with the harness's status, 128 plus the
+signal for a harness killed by one. Minimization, `bhf replay` and
+`bhf report --backfill` run C/C++ harnesses with the same `ASAN_OPTIONS` and
+`UBSAN_OPTIONS` as a fuzz child (a leak finding also gets `detect_leaks=1`;
+leak detection is never turned off). Fuzz children, minimization, `bhf replay`
+and `bhf report --backfill` also get `symbolize=1` after an inherited value,
+so an inherited `symbolize=0` cannot erase the frames a replay compares.
+UBSan then prints the stack of
+each report and names the failed check (`missing-return`,
+`invalid-shift-exponent`, ...) on its `SUMMARY:` line. Each sanitizer is merged independently, so
 per-sanitizer suppressions land in the right variable:
 
 ```sh
@@ -69,6 +84,130 @@ Common RTOS / partial-build false-positive killers:
 - `detect_stack_use_after_return=0` — RTOS cooperative context switches confuse
   ASan's fake stack.
 - `suppressions=<file>` — silence a specific known-benign report.
+
+Under qemu-user, a guest abort makes the emulator dump its own address space,
+which takes minutes. A fuzz, minimization, replay or comparison-capture child
+that runs under an emulator (`--qemu-user`, or the emulator recorded beside a
+cross-built harness in `bhf_runner.json`) therefore gets `abort_on_error=0`
+after bhf's other keys, and runs with core dumps off: the sanitizer still
+exits non-zero after its report, and that exit is classified as the crash.
+The generated `replay.py` does the same whenever it runs the harness under a
+runner (its embedded `RUNNER`, the `bhf_runner.json` beside the harness, or a
+non-empty `BHF_REPLAY_RUNNER`); a native run keeps `abort_on_error=1`.
+
+## How a sanitizer report is classified
+
+Each UBSan check kind has its own rule, CWE, explanation and fix hint; only
+signed and unsigned integer overflow share one rule, BHF-205. The
+kind comes from UBSan's check name on its `SUMMARY:` line when it printed one,
+else from the report text after `runtime error:`. Classification reads these
+structured fields and the text after the source location only, so a path such
+as `src/zoom/` or `src/timeout/` never changes it.
+
+| UBSan check | Kind | Rule | CWE |
+|---|---|---|---|
+| `signed-integer-overflow`, `unsigned-integer-overflow` | `signed-integer-overflow`, `unsigned-integer-overflow` | BHF-205 | CWE-190 |
+| `null-pointer-use`, `invalid-null-argument`, `invalid-null-return`, `nullptr-with-offset` | `null-pointer-dereference` | BHF-206 | CWE-476 |
+| `out-of-bounds-index` | `out-of-bounds-access` | BHF-220 | CWE-129 (+ CWE-125, CWE-787) |
+| `non-positive-vla-index` | `invalid-vla-bound` | BHF-224 | CWE-129 |
+| `integer-divide-by-zero`, `float-divide-by-zero` | `division-by-zero` | BHF-222 | CWE-369 |
+| `invalid-shift-exponent`, `invalid-shift-base` | `invalid-shift` | BHF-215 | CWE-1335 |
+| `missing-return` | `missing-return` | BHF-214 | CWE-758 |
+| `unreachable-call` | `unreachable` | BHF-216 | CWE-758 |
+| `invalid-bool-load`, `invalid-enum-load` | `invalid-value-load` | BHF-217 | CWE-758 |
+| `float-cast-overflow` | `float-cast-overflow` | BHF-218 | CWE-681 |
+| `implicit-*-truncation`, `implicit-integer-sign-change` | `implicit-conversion` | BHF-225 | CWE-681 (+ CWE-197) |
+| `pointer-overflow`, `nullptr-after-nonzero-offset` | `pointer-overflow` | BHF-219 | CWE-823 (+ CWE-119) |
+| `function-type-mismatch`, `dynamic-type-mismatch`, `cfi-bad-type` | `type-mismatch` | BHF-221 | CWE-843 |
+| `insufficient-object-size` | `insufficient-object-size` | BHF-227 | CWE-125 / CWE-787 / CWE-119 |
+| `misaligned-pointer-use`, `alignment-assumption` | `misaligned-access` | BHF-226 | CWE-758 |
+| `invalid-builtin-use` | `invalid-builtin-use` | BHF-228 | CWE-758 |
+| any other | `undefined-behavior` | BHF-213 | CWE-758 |
+
+An ASan SEGV in the first memory page (ASan's "zero page" hint, or an address
+below `0x1000`) is a NULL dereference, BHF-206 / CWE-476. Any other SEGV is a
+wild or corrupted pointer, BHF-223: CWE-125 for a READ, CWE-787 for a WRITE,
+and CWE-119 when ASan reports no direction or the address is a non-canonical
+"high value address", for which ASan prints READ whatever the access was. The
+direction is ASan's `READ`/`WRITE` token, recorded as
+`exception.access.direction`.
+
+The SARIF result's `properties.cwe` is the finding's CWE (the first of
+`properties.cwes`); the rule entry keeps its catalog CWE. `bhf replay` still
+matches findings recorded under the rules earlier releases used for these
+reports. Those releases classified a UBSan report by its text alone: integer
+overflow, division by zero and any "cannot be represented in type" report
+(a left shift included) were BHF-205, the load, store, member-access,
+reference-binding and NULL-argument or NULL-return reports BHF-206, an array
+index BHF-201, and every other check (a member call on NULL included)
+BHF-210. Every ASan SEGV was BHF-206.
+
+## How a sanitizer finding is identified
+
+Each sanitizer crash becomes one finding per root cause per harness, not one
+per crashing input.
+
+- **Signature and finding ID.** The signature hashes the rule, the crash kind,
+  UBSan's check name, the crash-stack function names and, for a UBSan report
+  or any report printed without a stack, the reported site
+  (`<dir>/<file>:<line>:<col>`, the last two components of the reported path,
+  so `src/a/util.c` and `src/b/util.c` are different sites wherever the tree
+  is checked out; a bare file name takes its directory from the top crash
+  frame naming the same file). A fatal signal with no sanitizer report has no
+  stack; its site is the faulting instruction's offset in the executable,
+  when bhf's driver printed one (see below). The `F-NNNN-<sig8>` suffix is
+  its first 8 hex digits. The allocation and free stacks are not hashed.
+- **Root-cause key** (`cluster_key_full`, the `group` in `results/`). The
+  rule, kind and check name plus the first three project frames. libc,
+  sanitizer-runtime and interceptor frames (`__memcmp_avx2_movbe`,
+  `MemcmpInterceptorCommon`, `bcmp`, glibc component sources such as
+  `sysdeps/`, `csu/`, `assert/` and `signal/`) are skipped, so the key starts
+  at the project code that made the call. A UBSan report keys on its site and
+  the function it is in: the same site reached from several harnesses is one
+  group, two sites are two groups. A crash with neither a project frame nor a
+  source site keys on its rule, kind, check name, the faulting pc offset when
+  there is one, and the harness that found it (its id and the function it
+  calls): frame-less crashes of two harnesses are two groups, and two crash
+  sites of one harness are two groups when the driver printed their pc. Its
+  `cluster_fallback` is `true`.
+- **Per-run dedup.** The fuzz loop, AFL++ crash ingestion and the pre-seed from
+  findings an earlier pass wrote all use the root-cause key. A key is used up
+  only when its finding is written: a first hit that does not reproduce in a
+  fresh process does not hide a later hit of the same root cause. After three
+  failed confirmations the key is given up and later hits are no longer
+  re-run. Later hits of a reported root cause are counted per key in
+  `duplicate_sanitizer_hits` of the harness's
+  `fuzz_runs/<harness>-latest.json`; hits of a root cause that never
+  reproduced (failed confirmations and the hits after it was given up) are
+  counted separately, in `unreproduced_sanitizer_hits`.
+
+`finding.json` keeps the sanitizer's structured evidence under `exception`:
+
+| Field | Contents |
+|---|---|
+| `stack` | the crash stack only (at most 16 frames) |
+| `location` | `{file, line, column}` the report names (UBSan's `file:line:col: runtime error:` prefix, ASan's `SUMMARY:` location) |
+| `check` | UBSan's check name from its `SUMMARY:` line |
+| `access` | ASan's access: `direction` (`read`/`write`/`unknown`), `size`, `address`, `address_hint` (`zero-page`, `high-value-address`), `region` (`kind` `heap`/`stack`/`global`, `size`, `offset` from the object's start, `relation` `after`/`before`/`inside`, `distance`, `variable`, `frame_offset`), `alloc_stack`, `free_stack` |
+
+When the persistent fork-server misses a crash that the fresh-process re-run
+catches, that run's stderr is the finding's `sanitizer.log`.
+
+A harness built without a sanitizer runtime (a cross build run under its
+emulator, or a native build without sanitizers) prints nothing of its
+own when a fatal signal kills it. bhf's driver then writes one line to stderr
+before the signal kills the process as before:
+
+```text
+bhf: fatal signal SIGSEGV pc=0x55d0c1a2b3c4 addr=0x0 exe_offset=0x13c4
+```
+
+`exe_offset` is the faulting instruction's file address in the executable
+(the same in every run, so `addr2line -e main 0x13c4` names the line); it is
+missing when the pc is in a shared library. `addr` is printed for a fault the
+kernel raised. The handler covers SIGSEGV, SIGBUS, SIGILL, SIGFPE and SIGTRAP,
+and is installed only when no sanitizer runtime is linked and nothing else
+handles the signal. The offset is recorded as `exception.pc_offset`.
 
 ## Custom allocators: the ASan poison bridge
 

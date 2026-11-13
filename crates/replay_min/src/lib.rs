@@ -2,6 +2,7 @@
 
 pub mod differential;
 pub mod minimize;
+pub mod process;
 pub mod replay;
 
 pub use differential::{

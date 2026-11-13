@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 const MIB: usize = 1024 * 1024;
 
+#[cfg(target_os = "linux")]
 fn read_u64(path: impl AsRef<Path>) -> Option<u64> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }

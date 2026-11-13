@@ -13,6 +13,147 @@
     "last_seen": { "type": "string", "format": "date-time" },
     "forced": { "type": "boolean" },
     "forced_note": { "type": "string" },
+    "build": {
+      "description": "Build facts of the harness that produced the finding. `fidelity` is present when the harness compiled only after bhf supplied headers, macro values or types the build context lacked.",
+      "type": "object",
+      "properties": {
+        "fidelity": { "$ref": "bhf.findings.v1.schema.json#/$defs/build_fidelity" }
+      }
+    },
+    "gates": {
+      "description": "Comparison evidence recorded by replaying the finding's input (gate_capture.input): each input span whose bytes reached a comparison of the target.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["offset", "len", "operand_hex", "compared_with_hex", "cmp_kind", "site", "relation", "operands_equal"],
+        "properties": {
+          "offset": { "type": "integer", "minimum": 0 },
+          "len": { "type": "integer", "minimum": 1 },
+          "operand_hex": { "type": "string", "pattern": "^([0-9a-f]{2})*$" },
+          "compared_with_hex": { "type": "string", "pattern": "^([0-9a-f]{2})*$" },
+          "cmp_kind": { "type": "string" },
+          "site": { "type": "string", "pattern": "^0x[0-9a-f]+$" },
+          "location": {
+            "type": ["object", "null"],
+            "properties": {
+              "file": { "type": "string" },
+              "line": { "type": ["integer", "null"] },
+              "function": { "type": ["string", "null"] }
+            }
+          },
+          "relation": { "enum": ["equal", "byte_swapped", "derived"] },
+          "operands_equal": { "type": "boolean" },
+          "site_unattributable": {
+            "description": "site is the sanitizer's memcmp/bcmp interceptor and the code that called it could not be named; absent (false) otherwise.",
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    "gate_capture": {
+      "description": "How the comparison evidence in gates was recorded, or why there is none.",
+      "type": "object",
+      "required": ["input", "input_len", "status"],
+      "properties": {
+        "input": { "type": "string" },
+        "input_len": { "type": "integer", "minimum": 0 },
+        "status": { "enum": ["recorded", "no_input_comparisons", "no_comparisons", "unavailable"] },
+        "reason": { "type": ["string", "null"] },
+        "comparisons": { "type": "integer", "minimum": 0 },
+        "truncated": { "type": "boolean" },
+        "unconfirmed": { "type": "integer", "minimum": 0 },
+        "runs": { "type": "integer", "minimum": 0 },
+        "shim_armed": { "type": "boolean" },
+        "runner": {
+          "description": "The emulator the capture replayed a harness built for another platform under (qemu-aarch64); absent for a native replay.",
+          "type": "string"
+        },
+        "derived_search": {
+          "description": "How far the search for operands computed from input bytes (range checks such as width - 1 > 31) got: done, partial (the replay budget ran out) or too_long (the input was too long to search). Absent when no such search ran, and in captures recorded before it was kept.",
+          "enum": ["done", "partial", "too_long"]
+        },
+        "searched_bytes": {
+          "description": "The input bytes that derived_search covered, of input_len.",
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "input_reachability_basis": {
+      "description": "Why the static reachability label (input_reachability) was given: the rule that decided it and, for a parameter-shape rule, the parameter and its type. Absent when the label is not the classifier's own, and in findings recorded before it was kept.",
+      "type": "object",
+      "required": ["rule"],
+      "properties": {
+        "rule": {
+          "enum": ["const_byte_buffer", "parser_name_with_length", "mutable_parser_buffer", "byte_scalar_parser", "output_serializer", "no_input_shape", "call_graph_provenance", "internal_linkage"]
+        },
+        "param": { "description": "The parameter the rule read.", "type": "string" },
+        "spelled_type": { "description": "That parameter's type as declared.", "type": "string" },
+        "resolved_type": {
+          "description": "The type with its typedefs resolved, when that differs from the spelling.",
+          "type": "string"
+        },
+        "typedefs_resolved": {
+          "description": "The classifier read the parameter types with typedefs resolved (at least one parameter's type changed).",
+          "type": "boolean"
+        }
+      }
+    },
+    "decoded_args": {
+      "description": "The arguments the harness decoded from the input and passed to the target (and the receiver object of a method), when traced.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "type", "role"],
+        "properties": {
+          "name": { "type": "string" },
+          "type": { "type": "string" },
+          "role": { "type": "string" },
+          "decoder": {
+            "description": "The receiver entry only: how the harness built the object (default constructor, factory Widget::make(), ...).",
+            "type": "string"
+          },
+          "value": { "type": "string" },
+          "len": { "type": "integer", "minimum": 0 },
+          "span": {
+            "description": "[start, end) byte offsets of the input the argument came from.",
+            "type": "array",
+            "items": { "type": "integer", "minimum": 0 },
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "preview_hex": { "type": "string" },
+          "after_call_value": { "type": "string" }
+        }
+      }
+    },
+    "build": {
+      "description": "How the harness that produced the finding was built.",
+      "type": "object",
+      "properties": {
+        "binary": {
+          "description": "The harness binary's identity; null when it could not be read.",
+          "type": ["object", "null"],
+          "properties": {
+            "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "build_id": { "type": ["string", "null"] },
+            "coverage_instrumentation": {
+              "description": "The instrumentation that fed the edge map, read from the binary; absent when the binary does not show one.",
+              "enum": ["sancov-trace-pc-guard", "sancov-trace-pc", "go-cover"]
+            }
+          }
+        }
+      }
+    },
+    "harness": {
+      "description": "The input format of the generated harness that found it. Readers prefer it to the older top-level harness_format_version and buffer_len_dimension, which are still written.",
+      "type": "object",
+      "required": ["format_version"],
+      "properties": {
+        "format_version": { "type": "integer", "minimum": 1 },
+        "buffer_len_dimension": { "type": "boolean" }
+      }
+    },
     "history": {
       "type": "array",
       "items": {

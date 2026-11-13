@@ -400,7 +400,7 @@ pub const RULES: &[Rule] = &[
         id: "BHF-210",
         slug: "bhf.c/fatal-signal-crash",
         name: "Reachable crash (fatal signal, no sanitizer report)",
-        description: "A test case drove the target to terminate on a fatal signal (SIGSEGV/SIGBUS/SIGILL/SIGFPE) with no AddressSanitizer/UBSan report to localize it — a reachable crash. At minimum a denial-of-service; commonly memory corruption the sanitizer could not pin down (a crash in non-instrumented code, a UBSan/__builtin_trap, or an arithmetic fault). Triage by the reported signal. Recorded as a finding so the crash surfaces and the fuzz pass keeps exploring instead of aborting.",
+        description: "A test case drove the target to terminate on a fatal signal (SIGSEGV/SIGBUS/SIGILL/SIGFPE/SIGTRAP, or a silent SIGABRT) with no AddressSanitizer/UBSan report to localize it — a reachable crash. At minimum a denial-of-service; commonly memory corruption the sanitizer could not pin down (a crash in non-instrumented code, a UBSan/__builtin_trap, or an arithmetic fault). Triage by the reported signal. Recorded as a finding so the crash surfaces and the fuzz pass keeps exploring instead of aborting.",
         cwe: "CWE-119",
         cwe_top_25: None,
         default_severity: Severity::High,
@@ -454,6 +454,348 @@ pub const RULES: &[Rule] = &[
         owasp_top_10: None,
         cert_c: Some("EXP33-C"),
         cert_cpp: Some("EXP53-CPP"),
+        misra_c: None,
+        misra_cpp: None,
+        iso_tr_24772_ada: &[],
+    },
+    Rule {
+        id: "BHF-213",
+        slug: "bhf.c/undefined-behavior",
+        name: "Undefined behavior (UndefinedBehaviorSanitizer)",
+        description: "UndefinedBehaviorSanitizer reported a failed check at a fuzz-reachable site that bhf has no more specific rule for: an operation the C or C++ standard leaves undefined. The report names the exact check. Compilers optimize on the assumption that undefined behavior never happens, so its effect is unpredictable and can change with the optimization level.",
+        cwe: "CWE-758",
+        cwe_top_25: None,
+        default_severity: Severity::Medium,
+        default_confidence: Confidence::High,
+        security_severity: 5.0,
+        references: &[
+            "https://cwe.mitre.org/data/definitions/758.html",
+            "https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html",
+        ],
+        owasp_top_10: None,
+        cert_c: Some("MSC15-C"),
+        cert_cpp: None,
+        misra_c: None,
+        misra_cpp: None,
+        iso_tr_24772_ada: &[],
+    },
+    Rule {
+        id: "BHF-214",
+        slug: "bhf.c/missing-return",
+        name: "Missing return value (UndefinedBehaviorSanitizer)",
+        description: "UndefinedBehaviorSanitizer reported that execution reached the end of a function declared to return a value without a return statement (-fsanitize=return). The caller then uses an indeterminate value, and an optimizing compiler may treat the path as unreachable and emit arbitrary code for it. UBSan reports the function's location, not the path that falls off its end: find the input-dependent branch with no return.",
+        cwe: "CWE-758",
+        cwe_top_25: None,
+        default_severity: Severity::Medium,
+        default_confidence: Confidence::High,
+        security_severity: 5.5,
+        references: &[
+            "https://cwe.mitre.org/data/definitions/758.html",
+            "https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html",
+        ],
+        owasp_top_10: None,
+        cert_c: Some("MSC37-C"),
+        cert_cpp: Some("MSC52-CPP"),
+        misra_c: None,
+        misra_cpp: None,
+        iso_tr_24772_ada: &[],
+    },
+    Rule {
+        id: "BHF-215",
+        slug: "bhf.c/invalid-shift",
+        name: "Invalid bitwise shift (UndefinedBehaviorSanitizer)",
+        description: "UndefinedBehaviorSanitizer reported a shift by a negative amount or by at least the operand's bit width, or a left shift of a negative or overflowing signed value. The result is undefined; common hardware silently masks the shift count, so an input-controlled count yields wrong values that then feed size, mask or index arithmetic.",
+        cwe: "CWE-1335",
+        cwe_top_25: None,
+        default_severity: Severity::Medium,
+        default_confidence: Confidence::High,
+        security_severity: 5.0,
+        references: &[
+            "https://cwe.mitre.org/data/definitions/1335.html",
+            "https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html",
+        ],
+        owasp_top_10: None,
+        cert_c: Some("INT34-C"),
+        cert_cpp: None,
+        misra_c: None,
+        misra_cpp: None,
+        iso_tr_24772_ada: &[],
+    },
+    Rule {
+        id: "BHF-216",
+        slug: "bhf.c/unreachable-reached",
+        name: "Unreachable code reached (UndefinedBehaviorSanitizer)",
+        description: "UndefinedBehaviorSanitizer reported that execution reached a point marked unreachable (__builtin_unreachable() or std::unreachable()). The compiler optimizes on the promise that this point is never reached, so behavior from there on is arbitrary: an input case the code assumed impossible is reachable.",
+        cwe: "CWE-758",
+        cwe_top_25: None,
+        default_severity: Severity::Medium,
+        default_confidence: Confidence::High,
+        security_severity: 5.5,
+        references: &[
+            "https://cwe.mitre.org/data/definitions/758.html",
+            "https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html",
+        ],
+        owasp_top_10: None,
+        cert_c: None,
+        cert_cpp: None,
+        misra_c: None,
+        misra_cpp: None,
+        iso_tr_24772_ada: &[],
+    },
+    Rule {
+        id: "BHF-217",
+        slug: "bhf.c/invalid-value-load",
+        name: "Invalid bool or enum value loaded (UndefinedBehaviorSanitizer)",
+        description: "UndefinedBehaviorSanitizer reported a load of a bool or enum object whose stored bits are not a valid value of its type, typically memory filled from raw input bytes or never initialized. Code generated for the type may then take impossible branches or index a jump or lookup table out of range.",
+        cwe: "CWE-758",
+        cwe_top_25: None,
+        default_severity: Severity::Medium,
+        default_confidence: Confidence::High,
+        security_severity: 5.0,
+        references: &[
+            "https://cwe.mitre.org/data/definitions/758.html",
+            "https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html",
+        ],
+        owasp_top_10: None,
+        cert_c: None,
+        cert_cpp: None,
+        misra_c: None,
+        misra_cpp: None,
+        iso_tr_24772_ada: &[],
+    },
+    Rule {
+        id: "BHF-218",
+        slug: "bhf.c/numeric-conversion-overflow",
+        name: "Out-of-range floating-point conversion (UndefinedBehaviorSanitizer)",
+        description: "UndefinedBehaviorSanitizer reported a floating-point value converted to an integer type that cannot represent it: too large, too small, infinite or NaN (float-cast-overflow). The result is undefined, and the garbage value can feed size, index or length calculations.",
+        cwe: "CWE-681",
+        cwe_top_25: None,
+        default_severity: Severity::Medium,
+        default_confidence: Confidence::High,
+        security_severity: 5.5,
+        references: &[
+            "https://cwe.mitre.org/data/definitions/681.html",
+            "https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html",
+        ],
+        owasp_top_10: None,
+        cert_c: Some("FLP34-C"),
+        cert_cpp: None,
+        misra_c: None,
+        misra_cpp: None,
+        iso_tr_24772_ada: &[],
+    },
+    Rule {
+        id: "BHF-219",
+        slug: "bhf.c/pointer-overflow",
+        name: "Pointer arithmetic overflow (UndefinedBehaviorSanitizer)",
+        description: "UndefinedBehaviorSanitizer reported pointer arithmetic that wrapped around the address space, or produced a null pointer from a non-null one (pointer-overflow). The offset is out of range for any object, so the resulting pointer is invalid even before it is dereferenced.",
+        cwe: "CWE-823",
+        cwe_top_25: None,
+        default_severity: Severity::High,
+        default_confidence: Confidence::High,
+        security_severity: 7.0,
+        references: &[
+            "https://cwe.mitre.org/data/definitions/823.html",
+            "https://cwe.mitre.org/data/definitions/119.html",
+            "https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html",
+        ],
+        owasp_top_10: None,
+        cert_c: Some("ARR30-C"),
+        cert_cpp: None,
+        misra_c: None,
+        misra_cpp: None,
+        iso_tr_24772_ada: &[],
+    },
+    Rule {
+        id: "BHF-220",
+        slug: "bhf.c/array-index-out-of-bounds",
+        name: "Array index out of bounds (UndefinedBehaviorSanitizer)",
+        description: "UndefinedBehaviorSanitizer reported an array subscript outside the declared bounds of a fixed-size array (-fsanitize=bounds). An unchecked, input-derived index reads or writes the memory next to the array.",
+        cwe: "CWE-129",
+        cwe_top_25: None,
+        default_severity: Severity::High,
+        default_confidence: Confidence::High,
+        security_severity: 7.5,
+        references: &[
+            "https://cwe.mitre.org/data/definitions/129.html",
+            "https://cwe.mitre.org/data/definitions/125.html",
+            "https://cwe.mitre.org/data/definitions/787.html",
+            "https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html",
+        ],
+        owasp_top_10: None,
+        cert_c: Some("ARR30-C"),
+        cert_cpp: None,
+        misra_c: Some("Rule 18.1"),
+        misra_cpp: None,
+        iso_tr_24772_ada: &[],
+    },
+    Rule {
+        id: "BHF-221",
+        slug: "bhf.c/type-mismatch",
+        name: "Type confusion (UndefinedBehaviorSanitizer)",
+        description: "UndefinedBehaviorSanitizer reported a call through a function pointer of the wrong type (function), a member access through a pointer to an object of a different dynamic type (vptr), or a failed control-flow-integrity type check (cfi). Using an object as a type it is not reads, writes or calls memory with the wrong layout, a common route to code execution.",
+        cwe: "CWE-843",
+        cwe_top_25: None,
+        default_severity: Severity::High,
+        default_confidence: Confidence::High,
+        security_severity: 8.0,
+        references: &[
+            "https://cwe.mitre.org/data/definitions/843.html",
+            "https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html",
+        ],
+        owasp_top_10: None,
+        cert_c: Some("EXP37-C"),
+        cert_cpp: None,
+        misra_c: None,
+        misra_cpp: None,
+        iso_tr_24772_ada: &[],
+    },
+    Rule {
+        id: "BHF-222",
+        slug: "bhf.c/divide-by-zero",
+        name: "Division by zero (UndefinedBehaviorSanitizer)",
+        description: "UndefinedBehaviorSanitizer reported an integer or floating-point division or remainder by zero at a fuzz-reachable site. Integer division by zero is undefined behavior and traps on common hardware (SIGFPE), so an input that drives the divisor to zero can crash the process.",
+        cwe: "CWE-369",
+        cwe_top_25: None,
+        default_severity: Severity::Medium,
+        default_confidence: Confidence::High,
+        security_severity: 5.5,
+        references: &[
+            "https://cwe.mitre.org/data/definitions/369.html",
+            "https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html",
+        ],
+        owasp_top_10: None,
+        cert_c: Some("INT33-C"),
+        cert_cpp: None,
+        misra_c: None,
+        misra_cpp: None,
+        iso_tr_24772_ada: &[],
+    },
+    Rule {
+        id: "BHF-223",
+        slug: "bhf.c/wild-pointer-dereference",
+        name: "Invalid memory access (SEGV on a non-null address)",
+        description: "AddressSanitizer reported a segmentation fault on an address outside the first memory page: a wild, corrupted or uninitialized pointer, or an out-of-range offset from a valid one, rather than a NULL dereference (BHF-206). When ASan states the access direction the finding carries the out-of-bounds read or write CWE; a non-canonical high address faults before the direction is known, and the finding then carries CWE-119.",
+        cwe: "CWE-119",
+        cwe_top_25: Some(20),
+        default_severity: Severity::High,
+        default_confidence: Confidence::High,
+        security_severity: 7.5,
+        references: &[
+            "https://cwe.mitre.org/data/definitions/119.html",
+            CWE_TOP_25_2024_REFERENCE,
+            "https://github.com/google/sanitizers/wiki/AddressSanitizer",
+        ],
+        owasp_top_10: None,
+        cert_c: None,
+        cert_cpp: None,
+        misra_c: None,
+        misra_cpp: None,
+        iso_tr_24772_ada: &[],
+    },
+    Rule {
+        id: "BHF-224",
+        slug: "bhf.c/invalid-vla-bound",
+        name: "Invalid variable-length array size (UndefinedBehaviorSanitizer)",
+        description: "UndefinedBehaviorSanitizer reported a variable-length array whose size evaluated to zero or less (vla-bound). The size came from an unvalidated, input-derived value; the stack allocation is then meaningless, and accesses to the array touch memory it does not own.",
+        cwe: "CWE-129",
+        cwe_top_25: None,
+        default_severity: Severity::High,
+        default_confidence: Confidence::High,
+        security_severity: 7.0,
+        references: &[
+            "https://cwe.mitre.org/data/definitions/129.html",
+            "https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html",
+        ],
+        owasp_top_10: None,
+        cert_c: Some("ARR32-C"),
+        cert_cpp: None,
+        misra_c: None,
+        misra_cpp: None,
+        iso_tr_24772_ada: &[],
+    },
+    Rule {
+        id: "BHF-225",
+        slug: "bhf.c/implicit-conversion",
+        name: "Value-changing implicit integer conversion (UndefinedBehaviorSanitizer)",
+        description: "UndefinedBehaviorSanitizer reported an implicit integer conversion that truncated the value or changed its sign (implicit-conversion). The conversion is defined behavior, but the changed value no longer means what the code assumes and can corrupt sizes, lengths or indexes computed from it.",
+        cwe: "CWE-681",
+        cwe_top_25: None,
+        default_severity: Severity::Medium,
+        default_confidence: Confidence::High,
+        security_severity: 5.0,
+        references: &[
+            "https://cwe.mitre.org/data/definitions/681.html",
+            "https://cwe.mitre.org/data/definitions/197.html",
+            "https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html",
+        ],
+        owasp_top_10: None,
+        cert_c: Some("INT31-C"),
+        cert_cpp: None,
+        misra_c: None,
+        misra_cpp: None,
+        iso_tr_24772_ada: &[],
+    },
+    Rule {
+        id: "BHF-226",
+        slug: "bhf.c/misaligned-access",
+        name: "Misaligned memory access (UndefinedBehaviorSanitizer)",
+        description: "UndefinedBehaviorSanitizer reported a load, store or member access through a pointer not aligned for its type, or a failed alignment assumption (alignment), typically a byte buffer cast to a wider type at an input-derived offset. The access is undefined: some processors fault on it, and compilers may emit code that assumes it cannot happen.",
+        cwe: "CWE-758",
+        cwe_top_25: None,
+        default_severity: Severity::Medium,
+        default_confidence: Confidence::High,
+        security_severity: 4.5,
+        references: &[
+            "https://cwe.mitre.org/data/definitions/758.html",
+            "https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html",
+        ],
+        owasp_top_10: None,
+        cert_c: Some("EXP36-C"),
+        cert_cpp: None,
+        misra_c: None,
+        misra_cpp: None,
+        iso_tr_24772_ada: &[],
+    },
+    Rule {
+        id: "BHF-227",
+        slug: "bhf.c/insufficient-object-size",
+        name: "Access to an undersized object (UndefinedBehaviorSanitizer)",
+        description: "UndefinedBehaviorSanitizer reported a load, store or member access through a pointer to memory smaller than the accessed type (object-size). The access runs past the end of the real object: an out-of-bounds read or write. The finding carries the read or write CWE when the report states the access, and CWE-119 otherwise.",
+        cwe: "CWE-119",
+        cwe_top_25: Some(20),
+        default_severity: Severity::High,
+        default_confidence: Confidence::High,
+        security_severity: 7.5,
+        references: &[
+            "https://cwe.mitre.org/data/definitions/119.html",
+            CWE_TOP_25_2024_REFERENCE,
+            "https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html",
+        ],
+        owasp_top_10: None,
+        cert_c: Some("ARR30-C"),
+        cert_cpp: None,
+        misra_c: None,
+        misra_cpp: None,
+        iso_tr_24772_ada: &[],
+    },
+    Rule {
+        id: "BHF-228",
+        slug: "bhf.c/invalid-builtin-use",
+        name: "Invalid builtin argument (UndefinedBehaviorSanitizer)",
+        description: "UndefinedBehaviorSanitizer reported a compiler builtin called with an argument it does not accept, such as zero passed to a count-leading-zeros or count-trailing-zeros builtin (builtin). The result is undefined and differs between compilers and processors.",
+        cwe: "CWE-758",
+        cwe_top_25: None,
+        default_severity: Severity::Medium,
+        default_confidence: Confidence::High,
+        security_severity: 4.5,
+        references: &[
+            "https://cwe.mitre.org/data/definitions/758.html",
+            "https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html",
+        ],
+        owasp_top_10: None,
+        cert_c: None,
+        cert_cpp: None,
         misra_c: None,
         misra_cpp: None,
         iso_tr_24772_ada: &[],
@@ -4492,6 +4834,180 @@ pub fn derive_rule_id(
     None
 }
 
+/// UndefinedBehaviorSanitizer checks: the kind bhf records for each, read from
+/// UBSan's machine-readable check name or from its report text, and the rule
+/// each kind reports under. Shared by the sanitizer-report parser and the
+/// classification of written findings, so both agree on every check.
+pub mod ubsan {
+    /// Every kind [`kind_for_check_name`] and [`kind_for_message`] can return.
+    pub const KINDS: &[&str] = &[
+        "signed-integer-overflow",
+        "unsigned-integer-overflow",
+        "null-pointer-dereference",
+        "out-of-bounds-access",
+        "invalid-vla-bound",
+        "division-by-zero",
+        "invalid-shift",
+        "missing-return",
+        "unreachable",
+        "invalid-value-load",
+        "float-cast-overflow",
+        "implicit-conversion",
+        "pointer-overflow",
+        "misaligned-access",
+        "insufficient-object-size",
+        "type-mismatch",
+        "invalid-builtin-use",
+        "undefined-behavior",
+    ];
+
+    /// The kind for UBSan's check name, as `report_error_type=1` prints it on
+    /// the `SUMMARY: UndefinedBehaviorSanitizer: <check>` line. `None` for
+    /// `undefined-behavior` (the label printed without `report_error_type=1`)
+    /// and for a name this table does not know.
+    pub fn kind_for_check_name(check: &str) -> Option<&'static str> {
+        Some(match check {
+            "signed-integer-overflow" => "signed-integer-overflow",
+            "unsigned-integer-overflow" => "unsigned-integer-overflow",
+            "null-pointer-use"
+            | "nullptr-with-offset"
+            | "nullptr-with-nonzero-offset"
+            | "invalid-null-argument"
+            | "invalid-null-return" => "null-pointer-dereference",
+            "nullptr-after-nonzero-offset" | "pointer-overflow" => "pointer-overflow",
+            "out-of-bounds-index" => "out-of-bounds-access",
+            "non-positive-vla-index" => "invalid-vla-bound",
+            "integer-divide-by-zero" | "float-divide-by-zero" => "division-by-zero",
+            "invalid-shift-base" | "invalid-shift-exponent" => "invalid-shift",
+            "missing-return" => "missing-return",
+            "unreachable-call" => "unreachable",
+            "invalid-bool-load" | "invalid-enum-load" => "invalid-value-load",
+            "float-cast-overflow" => "float-cast-overflow",
+            "implicit-unsigned-integer-truncation"
+            | "implicit-signed-integer-truncation"
+            | "implicit-integer-sign-change"
+            | "implicit-signed-integer-truncation-or-sign-change" => "implicit-conversion",
+            "misaligned-pointer-use" | "alignment-assumption" => "misaligned-access",
+            "insufficient-object-size" => "insufficient-object-size",
+            "function-type-mismatch"
+            | "dynamic-type-mismatch"
+            | "cfi-bad-type"
+            | "invalid-objc-cast" => "type-mismatch",
+            "invalid-builtin-use" => "invalid-builtin-use",
+            _ => return None,
+        })
+    }
+
+    /// The kind for UBSan's report text: the message after `runtime error:`,
+    /// never the source location before it. Falls back to
+    /// `undefined-behavior`.
+    pub fn kind_for_message(text: &str) -> &'static str {
+        let t = text.trim();
+        let starts = |prefix: &str| t.starts_with(prefix);
+        let has = |needle: &str| t.contains(needle);
+        // Shifts first: `left shift of X by N places cannot be represented in
+        // type T` is a shift, not an arithmetic overflow.
+        if starts("shift exponent") || starts("left shift of") || starts("right shift of") {
+            return "invalid-shift";
+        }
+        if starts("unsigned integer overflow") {
+            return "unsigned-integer-overflow";
+        }
+        if starts("signed integer overflow")
+            || (starts("negation of ") && has("cannot be represented"))
+            || (starts("division of ") && has("cannot be represented"))
+        {
+            return "signed-integer-overflow";
+        }
+        if starts("applying") && has("produced null pointer") {
+            return "pointer-overflow";
+        }
+        if starts("load of null pointer")
+            || starts("store to null pointer")
+            || starts("member access within null pointer")
+            || starts("member call on null pointer")
+            || starts("reference binding to null pointer")
+            || starts("null pointer passed as argument")
+            || starts("null pointer returned from function")
+            || (starts("applying") && has("to null pointer"))
+        {
+            return "null-pointer-dereference";
+        }
+        if starts("pointer index expression with base")
+            || starts("addition of unsigned offset to")
+            || starts("subtraction of unsigned offset from")
+        {
+            return "pointer-overflow";
+        }
+        if starts("index ") && has("out of bounds") {
+            return "out-of-bounds-access";
+        }
+        if starts("variable length array bound") {
+            return "invalid-vla-bound";
+        }
+        if starts("division by zero") {
+            return "division-by-zero";
+        }
+        if starts("execution reached the end of a value-returning function") {
+            return "missing-return";
+        }
+        if starts("execution reached an unreachable program point") {
+            return "unreachable";
+        }
+        if starts("load of value ") && has("is not a valid value for type") {
+            return "invalid-value-load";
+        }
+        if has("is outside the range of representable values") {
+            return "float-cast-overflow";
+        }
+        if starts("implicit conversion from type") {
+            return "implicit-conversion";
+        }
+        if has("misaligned address") || (starts("assumption of ") && has("alignment")) {
+            return "misaligned-access";
+        }
+        if has("with insufficient space for an object of type") {
+            return "insufficient-object-size";
+        }
+        if (starts("call to function ") && has("through pointer to incorrect function type"))
+            || has("which does not point to an object of type")
+            || starts("control flow integrity check")
+        {
+            return "type-mismatch";
+        }
+        if starts("passing zero to") && has("which is not a valid argument") {
+            return "invalid-builtin-use";
+        }
+        if has("cannot be represented in type") {
+            return "signed-integer-overflow";
+        }
+        "undefined-behavior"
+    }
+
+    /// The catalog rule a UBSan kind reports under.
+    pub fn rule_for_kind(kind: &str) -> &'static str {
+        match kind {
+            "signed-integer-overflow" | "unsigned-integer-overflow" => "BHF-205",
+            "null-pointer-dereference" => "BHF-206",
+            "out-of-bounds-access" => "BHF-220",
+            "invalid-vla-bound" => "BHF-224",
+            "division-by-zero" => "BHF-222",
+            "invalid-shift" => "BHF-215",
+            "missing-return" => "BHF-214",
+            "unreachable" => "BHF-216",
+            "invalid-value-load" => "BHF-217",
+            "float-cast-overflow" => "BHF-218",
+            "implicit-conversion" => "BHF-225",
+            "pointer-overflow" => "BHF-219",
+            "misaligned-access" => "BHF-226",
+            "insufficient-object-size" => "BHF-227",
+            "type-mismatch" => "BHF-221",
+            "invalid-builtin-use" => "BHF-228",
+            _ => "BHF-213",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4676,5 +5192,176 @@ mod tests {
             assert_eq!(by_id(rule.id).map(|r| r.slug), Some(rule.slug));
             assert_eq!(by_slug(rule.slug).map(|r| r.id), Some(rule.id));
         }
+    }
+
+    /// Sanitizer-reported UB and wild-address faults have their own rules; none
+    /// of them reuses BHF-210 ("no sanitizer report") or BHF-206 (NULL).
+    #[test]
+    fn sanitizer_check_rules_are_registered_with_their_cwes() {
+        for (id, cwe, slug) in [
+            ("BHF-213", "CWE-758", "bhf.c/undefined-behavior"),
+            ("BHF-214", "CWE-758", "bhf.c/missing-return"),
+            ("BHF-215", "CWE-1335", "bhf.c/invalid-shift"),
+            ("BHF-216", "CWE-758", "bhf.c/unreachable-reached"),
+            ("BHF-217", "CWE-758", "bhf.c/invalid-value-load"),
+            ("BHF-218", "CWE-681", "bhf.c/numeric-conversion-overflow"),
+            ("BHF-219", "CWE-823", "bhf.c/pointer-overflow"),
+            ("BHF-220", "CWE-129", "bhf.c/array-index-out-of-bounds"),
+            ("BHF-221", "CWE-843", "bhf.c/type-mismatch"),
+            ("BHF-222", "CWE-369", "bhf.c/divide-by-zero"),
+            ("BHF-223", "CWE-119", "bhf.c/wild-pointer-dereference"),
+            ("BHF-224", "CWE-129", "bhf.c/invalid-vla-bound"),
+            ("BHF-225", "CWE-681", "bhf.c/implicit-conversion"),
+            ("BHF-226", "CWE-758", "bhf.c/misaligned-access"),
+            ("BHF-227", "CWE-119", "bhf.c/insufficient-object-size"),
+            ("BHF-228", "CWE-758", "bhf.c/invalid-builtin-use"),
+        ] {
+            let rule = by_id(id).unwrap_or_else(|| panic!("{id} must exist"));
+            assert_eq!(rule.cwe, cwe, "{id}");
+            assert_eq!(rule.slug, slug, "{id}");
+            assert!(!rule.name.contains("no sanitizer report"), "{id}");
+        }
+        assert!(by_id("BHF-206").unwrap().name.contains("NULL"));
+    }
+
+    #[test]
+    fn every_ubsan_check_name_maps_to_its_kind() {
+        for (check, kind) in [
+            ("signed-integer-overflow", "signed-integer-overflow"),
+            ("unsigned-integer-overflow", "unsigned-integer-overflow"),
+            ("null-pointer-use", "null-pointer-dereference"),
+            ("nullptr-with-offset", "null-pointer-dereference"),
+            ("nullptr-with-nonzero-offset", "null-pointer-dereference"),
+            ("invalid-null-argument", "null-pointer-dereference"),
+            ("invalid-null-return", "null-pointer-dereference"),
+            ("nullptr-after-nonzero-offset", "pointer-overflow"),
+            ("pointer-overflow", "pointer-overflow"),
+            ("out-of-bounds-index", "out-of-bounds-access"),
+            ("non-positive-vla-index", "invalid-vla-bound"),
+            ("integer-divide-by-zero", "division-by-zero"),
+            ("float-divide-by-zero", "division-by-zero"),
+            ("invalid-shift-base", "invalid-shift"),
+            ("invalid-shift-exponent", "invalid-shift"),
+            ("missing-return", "missing-return"),
+            ("unreachable-call", "unreachable"),
+            ("invalid-bool-load", "invalid-value-load"),
+            ("invalid-enum-load", "invalid-value-load"),
+            ("float-cast-overflow", "float-cast-overflow"),
+            (
+                "implicit-unsigned-integer-truncation",
+                "implicit-conversion",
+            ),
+            ("implicit-signed-integer-truncation", "implicit-conversion"),
+            ("implicit-integer-sign-change", "implicit-conversion"),
+            (
+                "implicit-signed-integer-truncation-or-sign-change",
+                "implicit-conversion",
+            ),
+            ("misaligned-pointer-use", "misaligned-access"),
+            ("alignment-assumption", "misaligned-access"),
+            ("insufficient-object-size", "insufficient-object-size"),
+            ("function-type-mismatch", "type-mismatch"),
+            ("dynamic-type-mismatch", "type-mismatch"),
+            ("cfi-bad-type", "type-mismatch"),
+            ("invalid-builtin-use", "invalid-builtin-use"),
+        ] {
+            assert_eq!(ubsan::kind_for_check_name(check), Some(kind), "{check}");
+        }
+        // The label UBSan prints without report_error_type=1 names no check.
+        assert_eq!(ubsan::kind_for_check_name("undefined-behavior"), None);
+        assert_eq!(ubsan::kind_for_check_name("no-such-check"), None);
+    }
+
+    #[test]
+    fn every_ubsan_report_text_maps_to_its_kind() {
+        for (text, kind) in [
+            ("signed integer overflow: 2147483647 + 1 cannot be represented in type 'int'", "signed-integer-overflow"),
+            ("unsigned integer overflow: 0 - 1 cannot be represented in type 'unsigned int'", "unsigned-integer-overflow"),
+            ("negation of -2147483648 cannot be represented in type 'int'; cast to an unsigned type to negate this value to itself", "signed-integer-overflow"),
+            ("division of -2147483648 by -1 cannot be represented in type 'int'", "signed-integer-overflow"),
+            ("shift exponent 40 is too large for 32-bit type 'int'", "invalid-shift"),
+            ("shift exponent -1 is negative", "invalid-shift"),
+            ("left shift of negative value -5", "invalid-shift"),
+            ("left shift of 1073741824 by 2 places cannot be represented in type 'int'", "invalid-shift"),
+            ("load of null pointer of type 'int'", "null-pointer-dereference"),
+            ("store to null pointer of type 'int'", "null-pointer-dereference"),
+            ("member access within null pointer of type 'struct Widget'", "null-pointer-dereference"),
+            ("member call on null pointer of type 'Widget'", "null-pointer-dereference"),
+            ("reference binding to null pointer of type 'int'", "null-pointer-dereference"),
+            ("null pointer passed as argument 1, which is declared to never be null", "null-pointer-dereference"),
+            ("null pointer returned from function declared to never return null", "null-pointer-dereference"),
+            ("applying non-zero offset 8 to null pointer", "null-pointer-dereference"),
+            ("applying zero offset to null pointer", "null-pointer-dereference"),
+            ("applying non-zero offset to non-null pointer 0x000000000010 produced null pointer", "pointer-overflow"),
+            ("pointer index expression with base 0x7fffffffffff overflowed to 0x80000000fffe", "pointer-overflow"),
+            ("addition of unsigned offset to 0x7ffc overflowed to 0x7ffb", "pointer-overflow"),
+            ("subtraction of unsigned offset from 0x10 overflowed to 0xffffffffffffffff", "pointer-overflow"),
+            ("index 10 out of bounds for type 'int[4]'", "out-of-bounds-access"),
+            ("variable length array bound evaluates to non-positive value -1", "invalid-vla-bound"),
+            ("division by zero", "division-by-zero"),
+            ("execution reached the end of a value-returning function without returning a value", "missing-return"),
+            ("execution reached an unreachable program point", "unreachable"),
+            ("load of value 7, which is not a valid value for type 'bool'", "invalid-value-load"),
+            ("load of value 9, which is not a valid value for type 'Color'", "invalid-value-load"),
+            ("1e+20 is outside the range of representable values of type 'int'", "float-cast-overflow"),
+            ("implicit conversion from type 'long long' of value 1099511627776 (64-bit, signed) to type 'int' changed the value to 0 (32-bit, signed)", "implicit-conversion"),
+            ("load of misaligned address 0x7c3938b00021 for type 'int', which requires 4 byte alignment", "misaligned-access"),
+            ("store to misaligned address 0x4141414141414141 for type 'long', which requires 8 byte alignment", "misaligned-access"),
+            ("assumption of 32 byte alignment for pointer of type 'char *' failed", "misaligned-access"),
+            ("load of address 0x7ffc with insufficient space for an object of type 'int'", "insufficient-object-size"),
+            ("call to function parse_record through pointer to incorrect function type 'int (*)(void)'", "type-mismatch"),
+            ("member call on address 0x602 which does not point to an object of type 'Widget'", "type-mismatch"),
+            ("control flow integrity check for type 'Widget' failed during cast to unrelated type", "type-mismatch"),
+            ("passing zero to __builtin_ctz(), which is not a valid argument", "invalid-builtin-use"),
+            ("something UBSan has not said before", "undefined-behavior"),
+        ] {
+            assert_eq!(ubsan::kind_for_message(text), kind, "{text}");
+            assert!(ubsan::KINDS.contains(&kind), "{kind}");
+        }
+    }
+
+    /// Each UBSan kind reports under a rule of its own. Only signed and
+    /// unsigned integer overflow share one, the integer overflow rule.
+    #[test]
+    fn each_ubsan_kind_reports_under_its_own_rule() {
+        let mut kinds_by_rule: std::collections::BTreeMap<&str, Vec<&str>> =
+            std::collections::BTreeMap::new();
+        for kind in ubsan::KINDS {
+            kinds_by_rule
+                .entry(ubsan::rule_for_kind(kind))
+                .or_default()
+                .push(kind);
+        }
+        for (rule, kinds) in &kinds_by_rule {
+            if *rule == "BHF-205" {
+                assert_eq!(
+                    kinds,
+                    &["signed-integer-overflow", "unsigned-integer-overflow"]
+                );
+            } else {
+                assert_eq!(kinds.len(), 1, "{rule} is shared by {kinds:?}");
+            }
+        }
+        // None of them reuses an AddressSanitizer rule.
+        for asan_rule in ["BHF-201", "BHF-202", "BHF-203", "BHF-204"] {
+            assert!(!kinds_by_rule.contains_key(asan_rule), "{asan_rule}");
+        }
+    }
+
+    #[test]
+    fn every_ubsan_kind_has_a_registered_rule() {
+        for kind in ubsan::KINDS {
+            let id = ubsan::rule_for_kind(kind);
+            assert!(by_id(id).is_some(), "{kind} -> {id} is not in the catalog");
+            assert_ne!(
+                id, "BHF-210",
+                "{kind} must not be a 'no sanitizer report' finding"
+            );
+        }
+        assert_eq!(ubsan::rule_for_kind("missing-return"), "BHF-214");
+        assert_eq!(ubsan::rule_for_kind("invalid-shift"), "BHF-215");
+        assert_eq!(ubsan::rule_for_kind("null-pointer-dereference"), "BHF-206");
+        assert_eq!(ubsan::rule_for_kind("signed-integer-overflow"), "BHF-205");
+        assert_eq!(ubsan::rule_for_kind("not-a-kind"), "BHF-213");
     }
 }

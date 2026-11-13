@@ -54,7 +54,8 @@
         "score": 1.0
       },
       "cwe": [
-        122
+        122,
+        125
       ],
       "confirmation": {
         "level": "sanitizer_crash",
@@ -123,8 +124,8 @@
           {
             "role": "finding",
             "path": "findings/F-0000-1a2b3c4d/finding.json",
-            "sha256": "a36cb214534ea62f8ca91f0b0b08a02be791e6af8584e1b1e67a154e044a0b3c",
-            "size": 862
+            "sha256": "fc32a4bbd4c5cb1e4d2bf7d1c097e3364f82a0e1877bd82a072fa80f7f867f25",
+            "size": 2794
           },
           {
             "role": "testcase",
@@ -155,7 +156,88 @@
         "classification": "unhandled",
         "harness_id": "H-C-parse",
         "dialect": "c11",
-        "oracle": null
+        "oracle": null,
+        "access": {
+          "direction": "read",
+          "size": 4,
+          "address_hint": null,
+          "region": {
+            "kind": "heap",
+            "size": 4,
+            "offset": 4,
+            "relation": "after",
+            "distance": 0,
+            "variable": null,
+            "frame_offset": null
+          },
+          "alloc_stack": [
+            {
+              "function": "parse_header",
+              "file": "src/parse.c",
+              "line": 38
+            }
+          ],
+          "free_stack": [],
+          "parameter": {
+            "name": "data",
+            "offset": 4,
+            "basis": "region_start"
+          }
+        },
+        "input_to_state": [
+          {
+            "offset": 0,
+            "len": 1,
+            "operand_hex": "41",
+            "compared_with_hex": "41",
+            "cmp_kind": "cmp",
+            "site": "0x1a2b",
+            "site_location": {
+              "file": "src/parse.c",
+              "line": 40,
+              "column": null,
+              "function": "parse_header"
+            },
+            "relation": "equal",
+            "operands_equal": true
+          }
+        ],
+        "input_to_state_input": "min_testcase.bin",
+        "input_to_state_status": "recorded",
+        "input_to_state_reason": null,
+        "input_to_state_search": {
+          "state": "done",
+          "searched_bytes": 1,
+          "input_len": 1
+        },
+        "arguments": [
+          {
+            "name": "flags",
+            "type": "uint32_t",
+            "value": "7",
+            "len": null,
+            "span": [
+              0,
+              4
+            ],
+            "preview_hex": null,
+            "role": "param",
+            "after_call_value": null
+          },
+          {
+            "name": "data",
+            "type": "const uint8_t *",
+            "value": null,
+            "len": 0,
+            "span": [
+              4,
+              4
+            ],
+            "preview_hex": null,
+            "role": "param",
+            "after_call_value": null
+          }
+        ]
       },
       "static": null,
       "sca": null,
@@ -496,7 +578,14 @@
         "classification": "unhandled",
         "harness_id": "H-C-parse",
         "dialect": null,
-        "oracle": null
+        "oracle": null,
+        "access": null,
+        "input_to_state": null,
+        "input_to_state_input": null,
+        "input_to_state_status": null,
+        "input_to_state_reason": null,
+        "input_to_state_search": null,
+        "arguments": null
       },
       "static": null,
       "sca": null,
@@ -656,7 +745,14 @@
         "classification": "divergence",
         "harness_id": null,
         "dialect": null,
-        "oracle": null
+        "oracle": null,
+        "access": null,
+        "input_to_state": null,
+        "input_to_state_input": null,
+        "input_to_state_status": null,
+        "input_to_state_reason": null,
+        "input_to_state_search": null,
+        "arguments": null
       },
       "static": null,
       "sca": null,

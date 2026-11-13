@@ -71,8 +71,10 @@ FIRST RUN:
     --jobs 1 --max-targets 1 --per-target-time 10
 
 Keep the work directory outside the source tree. Install the compiler or
-interpreter for the languages you select. For Windows C/C++, use an x64
-Developer PowerShell with LLVM, VS Build Tools/Windows SDK, and make installed.
+interpreter for the languages you select. For Windows C/C++, install VS Build
+Tools with the C++ workload (bhf finds it and its clang; no Developer shell
+needed) and GNU make; `--cc cl` builds the harnesses with cl.exe. A Visual
+Studio solution in the tree is imported for its include dirs and defines.
 Read results/INDEX.md for findings
 and auto/summary.txt for targets that built, fuzzed, or were skipped.
 Add --resume to the same command to continue a stopped run.";
@@ -108,13 +110,40 @@ pub struct AutoArgs {
     pub discovery_cache: Option<PathBuf>,
 
     /// Load run options from a TOML config file. Persists common flags so a project's
-    /// runs are reproducible; CLI flags always override it. Without this, a
-    /// `.bhf.toml` in the scanned tree root is auto-loaded — but an auto-loaded
-    /// config honors only SAFE knobs (fields that EXECUTE the tree's own build, like
-    /// `build-command`, require this explicit flag). Keys are the flag names in
-    /// kebab-case (e.g. `per-target-time = 30`, `cxx-std = "gnu++14"`).
+    /// runs are reproducible; CLI flags always override it, and relative paths in it
+    /// resolve against the file's directory. Without this, a `.bhf.toml` in the
+    /// scanned tree root is auto-loaded — but an auto-loaded config honors only SAFE
+    /// knobs (keys that EXECUTE something, `build-command`, `run-untrusted`,
+    /// `unsafe-search-and-run-build-commands`, `probe-build`, `msbuild-evaluate` and
+    /// the `[toolchain]` table, require this explicit flag). Only these flags have a
+    /// key, spelled as the flag: per-target-time, max-targets, jobs, rss-limit-mb,
+    /// max-work-dir-mb, max-corpus-mb, cxx-std, max-len, timeout, grammar,
+    /// extra-include, extra-source, exclude-path, seed-file, seed-dir, sanitizers,
+    /// engine, languages, project, ada-deps, passes, force, build-command,
+    /// run-untrusted, unsafe-search-and-run-build-commands, probe-build,
+    /// msbuild-evaluate (`seed-mining = false` is --no-seed-mining). The toolchain flags (--cc, --cxx, --cflags, --cxxflags,
+    /// --ldflags, --define, --toolchain-include, --sysroot, --target-triple,
+    /// --runner, --runner-arg, --ada-*, --probe-backend) are keys of a
+    /// `[toolchain]` / `[toolchain.ada]` table, the same table `bhf build --config`
+    /// reads. `[cross.<lane>]` tables (lanes mingw, aarch64, armhf, ppc64le, ppc64,
+    /// ppc, mipsel, mips, sparc64; keys cc, cxx, target, sysroot, runner,
+    /// runner-args) override the toolchain and emulator of a guard-driven cross
+    /// lane; like `[toolchain]`, they need this explicit flag. Any other key is an
+    /// error.
     #[arg(long = "config", value_name = "PATH")]
     pub config: Option<PathBuf>,
+
+    /// The `[toolchain]` table of an explicit `--config`, merged with the
+    /// toolchain flags before the sweep starts.
+    #[arg(skip)]
+    pub(crate) config_toolchain: Option<config::ToolchainConfig>,
+
+    /// The `[cross.<guard>]` tables of an explicit `--config`.
+    #[arg(skip)]
+    pub(crate) config_cross: Option<config::CrossConfig>,
+
+    #[command(flatten)]
+    pub(crate) toolchain: crate::toolchain::AutoToolchainArgs,
 
     /// Override the governing Ada project (`.gpr`). By default
     /// `auto` selects the project that OWNS each target's source (the non-aggregate
@@ -314,9 +343,16 @@ pub struct AutoArgs {
     #[arg(long)]
     pub list_fakes: bool,
 
-    /// Attempt only targets whose discovered name exactly matches this value.
-    /// Repeatable. Useful when a source drop contains vendored support code
-    /// but the sweep should exercise a known wrapper target.
+    /// Attempt only targets this name selects: the full discovered name (as
+    /// --list-targets prints it), the bare function name, or a trailing
+    /// qualified suffix such as `Class::method`, each optionally with its
+    /// parameter list. An exact spelling wins: the suffix match applies only
+    /// when no target has exactly this name, and a leading `::` names the
+    /// global namespace only. Repeatable. Useful when a source drop contains
+    /// vendored support code but the sweep should exercise a known wrapper
+    /// target. A project fuzz driver (`LLVMFuzzerTestOneInput`) is skipped when
+    /// the tree has other targets, unless this option, --target-file, or
+    /// --harness-id selects it.
     #[arg(long = "target")]
     pub targets: Vec<String>,
 
@@ -358,6 +394,23 @@ pub struct AutoArgs {
     #[arg(long = "seed-dir", value_name = "DIR")]
     pub seed_dirs: Vec<PathBuf>,
 
+    /// Do not harvest seeds from the tree's own test-data directories. Without
+    /// `--seed-file`/`--seed-dir`, auto otherwise seeds every target from the
+    /// data files it finds there (source, build and IDE files excluded). The
+    /// seeds a run used are listed in `auto/seeds.json` (and with `-v`). Also
+    /// settable as `seed-mining = false` in the project config.
+    #[arg(long = "no-seed-mining")]
+    pub no_seed_mining: bool,
+
+    /// In a work dir from an earlier bhf release (migrated from the 0.2.x
+    /// layout, or run by an earlier `bhf auto`), keep reseeding its old
+    /// corpus. By default the first run of this release there moves `corpus/`
+    /// to `corpus-legacy/` (kept, not reseeded), because entries written by
+    /// earlier releases can be seeds damaged by their seed encoding. The
+    /// decision is recorded in `auto/legacy-corpus.json`.
+    #[arg(long = "reuse-legacy-corpus")]
+    pub reuse_legacy_corpus: bool,
+
     /// Actionability profile to optimize for.
     #[arg(long, default_value_t = actionability::RunMode::Reporting)]
     pub mode: actionability::RunMode,
@@ -390,6 +443,42 @@ pub struct AutoArgs {
     /// direct run otherwise. Off by default.
     #[arg(long = "probe-build")]
     pub probe_build: bool,
+
+    /// Visual Studio solution (`.sln`/`.slnx`) to import, when the tree has
+    /// several or it lies outside the scanned directory. A relative PATH is
+    /// resolved against the scanned tree; a missing file is an error. By
+    /// default bhf imports the shallowest one (ties broken by path) and names
+    /// it. The import reads the solution's `.vcxproj` files (and their property
+    /// sheets) for each `ClCompile` source's include dirs, defines, forced
+    /// includes and language standard; it runs nothing, so it is on by default
+    /// when the tree has no compile_commands.json and no CMake/Meson build (off
+    /// Windows, only when the solution is the tree's only build description:
+    /// no Makefile, autotools inputs, Ninja, SCons or Bazel build, unless this
+    /// flag names the solution). The default import reads the files
+    /// statically; MSBuild evaluates them with --msbuild-evaluate,
+    /// --probe-build or --run-untrusted.
+    #[arg(long = "msbuild-solution", value_name = "PATH")]
+    pub msbuild_solution: Option<PathBuf>,
+
+    /// Visual Studio configuration to import, as `Configuration|Platform`
+    /// (`Release|x64`). Default: the first one listed for x64, else the first
+    /// listed. Only that configuration's `Condition=` settings apply.
+    #[arg(long = "msbuild-config", value_name = "CONFIG|PLATFORM")]
+    pub msbuild_config: Option<String>,
+
+    /// Do not import a Visual Studio solution's compile settings by default.
+    #[arg(long = "no-msbuild-import")]
+    pub no_msbuild_import: bool,
+
+    /// Let MSBuild evaluate the Visual Studio projects in the default import,
+    /// when it is installed (Windows), with bhf's static reading as the
+    /// fallback for a project MSBuild cannot evaluate. Evaluation runs the
+    /// projects' property functions and imported .props/.targets files, code
+    /// from the scanned tree, so it is opt-in, like --probe-build (which
+    /// implies it). Config key `msbuild-evaluate`, honoured only from
+    /// an explicit --config.
+    #[arg(long = "msbuild-evaluate")]
+    pub msbuild_evaluate: bool,
 
     /// Dependency-scan mode: discover, build each target as far as possible
     /// (stubbing whatever is missing), and emit the missing-dependency manifest —
@@ -519,7 +608,8 @@ pub struct AutoArgs {
     /// in. Seeded onto every harness `-I` path before the repair loop (so real
     /// headers win over synthesized placeholders) and folded into cross-dir
     /// header resolution. Read from local disk only; nothing is fetched.
-    /// Repeatable.
+    /// Paths with spaces, parentheses or apostrophes (`C:/Program Files
+    /// (x86)/...`) are quoted in the build. Repeatable.
     #[arg(long = "extra-include", value_name = "DIR")]
     pub extra_includes: Vec<PathBuf>,
 
@@ -529,7 +619,7 @@ pub struct AutoArgs {
     /// otherwise blind-stub (e.g. libACPI's `AMLParserProcessBuffer` calling
     /// across `AMLRouter.c`/`AMLName.c`/…): pass the real sources so the symbols
     /// resolve and nothing is stubbed. Read from local disk only; nothing is
-    /// fetched. Repeatable.
+    /// fetched. Paths with spaces are quoted in the build. Repeatable.
     #[arg(long = "extra-source", value_name = "FILE")]
     pub extra_sources: Vec<PathBuf>,
 
@@ -615,7 +705,8 @@ pub struct AutoArgs {
     /// after the normal run, rebuild each C/C++ harness under both compilers via a
     /// portable build and replay the fuzz corpus through both, flagging any input
     /// on which their exit/crash behavior diverges (a codegen- or UB-dependent bug
-    /// one compiler exposes and the other hides) as a BHF-301 finding.
+    /// one compiler exposes and the other hides) as a BHF-301 finding. Either side
+    /// may be a path to a compiler; one with spaces is quoted in the build recipe.
     #[arg(long, value_name = "A:B")]
     pub differential: Option<String>,
 
@@ -655,7 +746,11 @@ pub struct AutoArgs {
 /// engine presents only its current adaptive-length prefix to the mutator, so
 /// preserving a larger initial sample does not clone multi-megabyte inputs on
 /// every mutation. The cap still prevents one huge sample from collapsing a run.
-fn load_seed_inputs(seed_files: &[PathBuf], seed_dirs: &[PathBuf], cap: usize) -> Vec<Vec<u8>> {
+fn load_seed_inputs(
+    seed_files: &[PathBuf],
+    seed_dirs: &[PathBuf],
+    cap: usize,
+) -> Vec<crate::auto::seed_manifest::LoadedSeed> {
     let cap = cap.max(1);
     let corpus_entry_limit = crate::fuzz::corpus_limits(cap).entries;
     let mut seeds = Vec::new();
@@ -674,7 +769,11 @@ fn load_seed_inputs(seed_files: &[PathBuf], seed_dirs: &[PathBuf], cap: usize) -
                         path.display()
                     );
                 }
-                seeds.push(bytes);
+                seeds.push(crate::auto::seed_manifest::LoadedSeed {
+                    path: path.to_path_buf(),
+                    bytes,
+                    file_size: original_len,
+                });
             }
             Err(error) => {
                 bhfeprintln!("bhf auto: skipping seed file '{}': {error}", path.display())
@@ -687,11 +786,15 @@ fn load_seed_inputs(seed_files: &[PathBuf], seed_dirs: &[PathBuf], cap: usize) -
     for dir in seed_dirs {
         match std::fs::read_dir(dir) {
             Ok(entries) => {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_file() {
-                        push_path(&path);
-                    }
+                // Sorted, so the manifest and the seed order are reproducible.
+                let mut paths: Vec<PathBuf> = entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| path.is_file())
+                    .collect();
+                paths.sort();
+                for path in paths {
+                    push_path(&path);
                 }
             }
             Err(error) => bhfeprintln!("bhf auto: skipping seed dir '{}': {error}", dir.display()),
@@ -704,6 +807,73 @@ fn load_seed_inputs(seed_files: &[PathBuf], seed_dirs: &[PathBuf], cap: usize) -
         );
     }
     seeds
+}
+
+/// Load the run's seeds: explicit `--seed-file`/`--seed-dir` inputs, or (when
+/// none were given and mining is on) the tree's own test-data files. Every seed
+/// is recorded in `auto/seeds.json` and, under `-v`, listed on stderr. The
+/// bytes are returned exactly as read.
+fn resolve_auto_seeds(
+    args: &AutoArgs,
+    tree_root: &std::path::Path,
+    work: &std::path::Path,
+    seed_cap: usize,
+) -> Vec<Vec<u8>> {
+    use crate::auto::seed_manifest::{SeedManifest, SeedMining, SeedSource};
+    let user_seeds = load_seed_inputs(&args.seed_files, &args.seed_dirs, seed_cap);
+    let (mining, source, seeds) = if !user_seeds.is_empty() {
+        bhfeprintln!(
+            "bhf auto: {} user seed input(s) added to each target's corpus",
+            user_seeds.len()
+        );
+        (SeedMining::SkippedUserSeeds, SeedSource::User, user_seeds)
+    } else if args.no_seed_mining {
+        bhfeprintln!(
+            "bhf auto: tree seed mining disabled (--no-seed-mining or seed-mining = false)"
+        );
+        (SeedMining::Disabled, SeedSource::Mined, Vec::new())
+    } else {
+        // No seeds given: harvest the project's own test-data files. A parser
+        // reached through random bytes spends its budget bouncing off the header
+        // check, while the same harness given one real archive or document starts
+        // INSIDE the format. Projects already ship those files next to their
+        // tests; bhf used to walk straight past them. Explicit `--seed-*` wins,
+        // so this can never override what an operator asked for.
+        let mined = crate::auto::recipe_mining::mine_seed_corpus(tree_root);
+        let mined_seeds = if mined.is_empty() {
+            Vec::new()
+        } else {
+            load_seed_inputs(&mined, &[], seed_cap)
+        };
+        if !mined_seeds.is_empty() {
+            bhfeprintln!(
+                "bhf auto: {} seed input(s) mined from the tree's own test data \
+                 (pass --seed-dir to override, --no-seed-mining to disable)",
+                mined_seeds.len()
+            );
+        }
+        (SeedMining::Ran, SeedSource::Mined, mined_seeds)
+    };
+    let manifest = SeedManifest::new(mining, &seeds, source);
+    match crate::auto::seed_manifest::write(work, &manifest) {
+        Ok(manifest_path) => {
+            if !seeds.is_empty() {
+                bhfeprintln!("bhf auto: seed list: {}", manifest_path.display());
+            }
+        }
+        Err(error) => bhfeprintln!("bhf auto: warning: could not write the seed list: {error}"),
+    }
+    if args.verbose {
+        for entry in &manifest.seeds {
+            bhfeprintln!(
+                "bhf auto:   seed {} ({} bytes, sha256 {})",
+                entry.path,
+                entry.bytes_used,
+                &entry.sha256[..16]
+            );
+        }
+    }
+    seeds.into_iter().map(|seed| seed.bytes).collect()
 }
 
 fn sanitizer_replay_enabled(
@@ -832,6 +1002,68 @@ fn resolve_license_profile() -> config::Profile {
         .unwrap_or(config::Profile::ExternalTools)
 }
 
+/// Rebuild the build probe's archives for the cross sweep's `target` (see
+/// [`crate::auto::build_probe::rebuild_probe_archives`]), saying which were
+/// rebuilt and exactly why any could not be, and return the ones the sweep's
+/// harnesses link: the rebuilt ones and those already built for the target.
+fn rebuild_probe_archives_for_sweep(
+    tree: &Path,
+    work: &Path,
+    target: &crate::auto::cross_target::CrossTarget,
+    toolchain: &config::ToolchainConfig,
+) -> Vec<PathBuf> {
+    let archive_toolchain = crate::auto::attempt::cross_archive_toolchain(target, toolchain);
+    let report = crate::auto::build_probe::rebuild_probe_archives(
+        tree,
+        &archive_toolchain,
+        &work.join("auto").join("probe-archives"),
+    );
+    for archive in &report.rebuilt {
+        bhfeprintln!(
+            "bhf auto: rebuilt probe archive {} for {} with {}",
+            archive.display(),
+            target.triple,
+            target.cc
+        );
+    }
+    for archive in &report.already_for_target {
+        bhfeprintln!(
+            "bhf auto: probe archive {} is already built for {}; linked as it is",
+            archive.display(),
+            target.triple
+        );
+    }
+    for (archive, reason) in &report.failed {
+        bhfeprintln!(
+            "bhf auto: note: probe archive {} is not linked into the {} harnesses: it could \
+             not be rebuilt for the target because {reason}; their targets are built from \
+             their sources",
+            archive.display(),
+            target.triple
+        );
+    }
+    let mut linked = report.rebuilt;
+    linked.extend(report.already_for_target);
+    linked
+}
+
+/// How many of `results` in `lang` failed to build, for the triage levers.
+fn failed_builds_in(
+    results: &[crate::auto::attempt::AttemptResult],
+    lang: crate::auto::candidate::Lang,
+) -> usize {
+    results
+        .iter()
+        .filter(|result| {
+            result.candidate.lang == lang
+                && matches!(
+                    result.outcome,
+                    crate::auto::attempt::Outcome::FailedBuild { .. }
+                )
+        })
+        .count()
+}
+
 /// Detect a CUSTOM build entry point in the tree root that bhf does NOT auto-probe
 /// (a bare build.sh, autotools, SCons, Waf, Bazel), returning `(marker, suggested
 /// --build-command value)`. CMake/Make/Meson are intentionally excluded — those are
@@ -877,6 +1109,11 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
             .unwrap_or(args.work_dir.clone()),
     );
     crate::workdir::prepare(&work)?;
+    // A runtrace shim installed under a path with spaces is staged here.
+    crate::auto::shim_path::set_staging_work_dir(&work);
+    // Judged before this run writes any auto state of its own: whether the
+    // work dir holds data (a corpus above all) from an earlier release.
+    let from_an_earlier_release = results::migrate::from_an_earlier_release(&work);
     // Register the report dir NOW so an uncaught panic anywhere below (discovery,
     // IDL/CORBA scaffolding, ranking, report) can still flush the bug report.
     crate::auto::bug_report::set_output_dir(work.join("auto"));
@@ -905,6 +1142,30 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     let work_state = crate::auto::work_state::prepare(&work, args.resume)
         .with_context(|| format!("prepare generated state under {}", work.display()))?;
     bhfeprintln!("bhf auto: work-directory state: {work_state}");
+    // A plan-only run (--dry-run / --list-targets) fuzzes nothing, so it
+    // leaves an earlier release's corpus to the first run that does.
+    let legacy_corpus = crate::auto::attempt::set_aside_legacy_corpus(
+        &work,
+        from_an_earlier_release,
+        args.reuse_legacy_corpus,
+        args.dry_run || args.list_targets,
+    )
+    .with_context(|| format!("set aside the legacy corpus under {}", work.display()))?;
+    match legacy_corpus {
+        crate::auto::attempt::LegacyCorpus::SetAside(dest) => bhfeprintln!(
+            "bhf auto: this work dir holds a corpus from an earlier bhf release; it is kept in {} \
+             and not reseeded (earlier releases could store damaged seeds). Pass \
+             --reuse-legacy-corpus to keep using it.",
+            dest.display()
+        ),
+        crate::auto::attempt::LegacyCorpus::Reused => bhfeprintln!(
+            "bhf auto: reusing the corpus an earlier bhf release left in this work dir \
+             (--reuse-legacy-corpus); a target's corpus recorded before harness formats were \
+             stamped holds format 2 or earlier inputs, which decode into other argument values \
+             under its current harness"
+        ),
+        _ => {}
+    }
     // Repair work directories produced by older releases that retained one
     // private Cargo target tree per Rust harness. This preserves result.json,
     // generated source, findings, corpora, and the final replayable executable.
@@ -973,6 +1234,82 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         std::env::set_var("BHF_CXX_STD", s);
     }
 
+    // The toolchain: an explicit --config's [toolchain] table with the toolchain
+    // flags laid over it. Validated before anything builds, and published to
+    // this process's environment (CC/CXX + the BHF_TOOLCHAIN_* make variables)
+    // before any worker starts, so every build and retry of the run uses it.
+    // A toolchain that cannot be used is a usage error (exit 2, as in bhf build).
+    let toolchain =
+        match crate::toolchain::resolve(args.config_toolchain.take(), args.toolchain.to_config())
+            .and_then(|toolchain| {
+                crate::toolchain::check_runnable(&toolchain)?;
+                Ok(toolchain)
+            }) {
+            Ok(toolchain) => toolchain,
+            Err(error) => {
+                bhfeprintln!("error: {error}");
+                return Ok(2);
+            }
+        };
+    let published =
+        crate::toolchain::publish(&toolchain).map_err(|error| anyhow::anyhow!("{error}"))?;
+    for note in &published.notes {
+        bhfeprintln!("bhf auto: {note}");
+    }
+    let cross_sweep = crate::toolchain::cross_sweep_target(&toolchain)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    // The guard-driven cross lanes: an explicit --config's [cross.<guard>]
+    // tables replace bhf's built-in compilers, sysroot and emulator for the
+    // lanes they name. Installed before anything resolves a guard (the
+    // dependency scan, every attempt), and replaced on every run.
+    let cross_overrides = crate::auto::cross_target::CrossOverrides::from_config(
+        args.config_cross.take().unwrap_or_default(),
+    )
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
+    for line in cross_overrides.describe() {
+        bhfeprintln!("bhf auto: {line}");
+    }
+    if let (Some(target), false) = (&cross_sweep, cross_overrides.is_empty()) {
+        bhfeprintln!(
+            "bhf auto: note: the cross sweep builds every C/C++ candidate for {}, so the \
+             [cross.*] tables, which apply to guarded candidates, are not used",
+            target.triple
+        );
+    }
+    crate::auto::cross_target::install_overrides(cross_overrides);
+    if let Some(target) = &cross_sweep {
+        bhfeprintln!(
+            "bhf auto: cross sweep: building every C/C++ candidate for {} with {} / {} and \
+             running it under {}",
+            target.triple,
+            target.cc,
+            target.cxx,
+            target.runner.exe()
+        );
+    }
+    let mut ada_toolchain = crate::toolchain::AdaBuildSettings::from_config(&toolchain);
+    ada_toolchain.runner = crate::toolchain::ada_runner(&toolchain, cross_sweep.as_ref());
+    if let (Some(runner), Some(target)) = (&ada_toolchain.runner, ada_toolchain.effective_target())
+    {
+        bhfeprintln!(
+            "bhf auto: Ada harnesses built for {target} run under {}{}",
+            runner.exe(),
+            if cross_sweep.is_some() {
+                ""
+            } else {
+                "; the C/C++ candidates build and run on this host (set toolchain.target \
+                 to cross-build them too)"
+            }
+        );
+    }
+    if cross_sweep.is_some() && !args.sanitizers.is_empty() {
+        bhfeprintln!(
+            "bhf auto: note: --sanitizers does not apply to the cross sweep's emulated \
+             C/C++ builds (sanitizer runtimes do not survive the emulator); add sanitizer \
+             flags through toolchain.cflags if the runner supports them"
+        );
+    }
+
     // Parse once before the optional project build. Probe-built archives must
     // carry the exact same sanitizer/coverage contract as the harnesses that
     // will link them; parsing this only after the probe produced stale/default
@@ -1028,6 +1365,46 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     );
     crate::auto::report::write_dependency_checkpoint(&path, &work, &early_dependency_seed, &[])?;
     let probe_requested = args.probe_build || args.run_untrusted || args.build_command.is_some();
+    // The Visual Studio solution/configuration to import, for both the default
+    // project import and the `--probe-build` MSBuild tier (which reads them
+    // from the environment).
+    // A relative `--msbuild-solution` names a file in the scanned tree.
+    let msbuild_solution = match &args.msbuild_solution {
+        Some(solution) => {
+            let resolved = if solution.is_absolute() {
+                solution.clone()
+            } else {
+                path.join(solution)
+            };
+            if !resolved.is_file() {
+                anyhow::bail!(
+                    "--msbuild-solution {}: no such file ({}; a relative path is resolved \
+                     against the scanned tree)",
+                    solution.display(),
+                    resolved.display()
+                );
+            }
+            Some(resolved)
+        }
+        None => None,
+    };
+    let msbuild_request = crate::auto::msbuild_import::ImportRequest {
+        solution: msbuild_solution.clone(),
+        configuration: args.msbuild_config.clone(),
+    };
+    if let Some(solution) = &msbuild_solution {
+        std::env::set_var("BHF_MSBUILD_SOLUTION", solution);
+    }
+    if let Some(config) = &args.msbuild_config {
+        std::env::set_var("BHF_MSBUILD_CONFIG", config);
+    }
+    if probe_requested && cross_sweep.is_some() {
+        bhfeprintln!(
+            "bhf auto: note: the project's build runs for this host; its compile database and \
+             generated headers apply to the cross sweep, and the archives it builds are \
+             rebuilt for the target before they are linked"
+        );
+    }
 
     // --sloc: write a per-language SLOC breakdown of the source tree up front,
     // independent of build/fuzz outcomes. A failure here shouldn't abort the run.
@@ -1086,6 +1463,27 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         // project's build); degrades gracefully when no Ada project or toolchain.
         if args.run_untrusted {
             crate::auto::build_probe::probe_ada_build(&path, sandbox.as_deref());
+        }
+    }
+    // The probe built its archives for this host. A cross sweep rebuilds each
+    // one for its target from the captured compile commands, so the
+    // cross-built harnesses link the project's library code too.
+    let cross_probe_archives = match (&cross_sweep, probe_requested) {
+        (Some(target), true) => rebuild_probe_archives_for_sweep(&path, &work, target, &toolchain),
+        _ => Vec::new(),
+    };
+
+    // Visual Studio project import. It reads the solution and project files and
+    // runs nothing, so it is on by default for a tree whose only build
+    // description is a solution: no compile database (that one is
+    // authoritative) and no CMake/Meson build. The database lands in the work
+    // directory, never in the scanned tree, and harness generation reads it
+    // as the last compile-database candidate.
+    if !probe_requested && !args.no_msbuild_import {
+        if let Some(db) =
+            default_msbuild_import(&path, &work, &msbuild_request, args.msbuild_evaluate)
+        {
+            std::env::set_var(crate::generate_harness::PROJECT_COMPILE_DB_ENV, &db);
         }
     }
 
@@ -1158,6 +1556,10 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     {
         bhfeprintln!("warning: could not checkpoint discovery-cache decision: {error}");
     }
+    // Discovery keeps project fuzz drivers (`LLVMFuzzerTestOneInput`) beside the
+    // library targets that shadow them; whether they stay is decided after the
+    // explicit selection filters below.
+    let library_targets_present = crate::auto::discovery::has_library_target(&candidates);
     if !args.exclude_paths.is_empty() || !args.exclude.is_empty() {
         candidates.retain(|candidate| {
             !path_matches_exclusion(
@@ -1169,13 +1571,13 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         });
     }
     if !args.targets.is_empty() {
-        candidates.retain(|candidate| {
-            let case_insensitive =
-                matches!(candidate.lang, Lang::Ada | Lang::Fortran | Lang::Cobol);
-            args.targets.iter().any(|selected| {
-                target_name_filter_matches(&candidate.name, selected, case_insensitive)
-            })
-        });
+        let unfiltered_names: Vec<String> = candidates.iter().map(|c| c.name.clone()).collect();
+        let selected_any = retain_selected_targets(&mut candidates, &args.targets);
+        for (selected, matched) in args.targets.iter().zip(&selected_any) {
+            if !matched {
+                bhfeprintln!("{}", unmatched_target_note(selected, &unfiltered_names));
+            }
+        }
     }
     if !args.harness_ids.is_empty() {
         let selected: std::collections::HashSet<&str> =
@@ -1195,6 +1597,18 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
                 .unwrap_or_else(|_| candidate.source_path.clone());
             selected.contains(&candidate_path)
         });
+    }
+    // A fuzz driver that survived an explicit --target/--harness-id/--target-file
+    // selection was asked for by name and is kept (it is harnessed as a
+    // passthrough). Without an explicit selection, library targets shadow the
+    // drivers: say what was left out and how to pick one.
+    let explicit_selection =
+        !args.targets.is_empty() || !args.harness_ids.is_empty() || !args.target_files.is_empty();
+    if library_targets_present && !explicit_selection {
+        let ignored = crate::auto::discovery::drop_shadowed_fuzz_drivers(&mut candidates);
+        if let Some(note) = ignored_fuzz_drivers_note(&ignored, &path) {
+            bhfeprintln!("{note}");
+        }
     }
     // Language filter (`--languages`): keep only the requested source-language
     // lanes. Applied AFTER discovery (which is language-agnostic, so one
@@ -1278,6 +1692,19 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     crate::auto::discovery::bhfprof("auto:dependency_checkpoint", _tdc);
     let _tmid = std::time::Instant::now();
 
+    // An Ada toolchain that is not installed would fail every Ada build: refuse
+    // the plan, the dry run included, naming the key.
+    if candidates
+        .iter()
+        .any(|candidate| candidate.lang == crate::auto::candidate::Lang::Ada)
+    {
+        if let Err(error) = crate::toolchain::check_ada_tools(&toolchain) {
+            bhfeprintln!("error: {error}");
+            finish_dependency_pointer(&work, &mut dependency_pointer_guard);
+            return Ok(2);
+        }
+    }
+
     // Planning/listing modes have completed all the work they promised. Their
     // requirement manifest used to retain `complete=false`, so even a clean
     // `--list-targets` exit ended by claiming the checkpoint was "in progress".
@@ -1321,6 +1748,11 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
                  pass --build-command {cmd:?} (or --unsafe-search-and-run-build-commands) if targets fail to build"
             );
         }
+        if let Some(environment) =
+            crate::windows_env::activated().filter(|e| e.source != "not_windows")
+        {
+            bhfeprintln!("  build environment: {}", environment.summary());
+        }
         bhfeprintln!(
             "  would fuzz {} target(s){}",
             planned_candidates.len(),
@@ -1349,6 +1781,15 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         finish_dependency_pointer(&work, &mut dependency_pointer_guard);
         return Ok(0);
     }
+    // Every path from here writes this run's run.json. The seed list is written
+    // only once seeds are resolved, so drop one an earlier run left behind, or a
+    // run that stops first would report the earlier run's seeds as its own.
+    crate::auto::seed_manifest::remove_stale(&work).with_context(|| {
+        format!(
+            "remove the seed list an earlier run left at {}",
+            crate::auto::seed_manifest::manifest_path(&work).display()
+        )
+    })?;
     if candidates.is_empty() {
         // --static is a whole-tree scan independent of fuzzable targets, so it
         // must run even when discovery finds nothing to fuzz (config files,
@@ -1495,33 +1936,7 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
             .parse::<usize>()
             .unwrap_or(crate::fuzz::DEFAULT_MAX_LEN)
     };
-    let mut user_seeds = load_seed_inputs(&args.seed_files, &args.seed_dirs, seed_cap);
-    if !user_seeds.is_empty() {
-        bhfeprintln!(
-            "bhf auto: {} user seed input(s) added to each target's corpus",
-            user_seeds.len()
-        );
-    }
-    // No seeds given: harvest the project's own test-data files. A parser
-    // reached through random bytes spends its budget bouncing off the header
-    // check, while the same harness given one real archive or document starts
-    // INSIDE the format. Projects already ship those files next to their tests;
-    // bhf used to walk straight past them. Explicit `--seed-*` wins, so this
-    // can never override what an operator asked for.
-    if user_seeds.is_empty() {
-        let mined = crate::auto::recipe_mining::mine_seed_corpus(&path);
-        if !mined.is_empty() {
-            let mined_seeds = load_seed_inputs(&mined, &[], seed_cap);
-            if !mined_seeds.is_empty() {
-                bhfeprintln!(
-                    "bhf auto: {} seed input(s) mined from the tree's own test data \
-                     (pass --seed-dir to override)",
-                    mined_seeds.len()
-                );
-                user_seeds = mined_seeds;
-            }
-        }
-    }
+    let user_seeds = resolve_auto_seeds(&args, &path, &work, seed_cap);
     // Dependency-scan mode builds each target (stubbing as it goes) but runs no
     // fuzz passes — an empty pass list makes `attempt` return `Built`, and the
     // manifest is emitted as usual.
@@ -1653,6 +2068,11 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         // §27.11: CLI-configured C/C++ decoder caps, threaded to harness gen.
         decoder_limits: args.decoder_limits.clone(),
         force: args.force,
+        cross_sweep: cross_sweep.map(|target| crate::auto::attempt::CrossSweep {
+            target,
+            probe_archives: cross_probe_archives,
+        }),
+        ada_toolchain,
     };
     // #6: the fully-ranked candidate count BEFORE any --max-targets / campaign
     // split cap, so the report can surface how many targets the cap dropped from
@@ -1725,7 +2145,7 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
     // per-target question that `resume_should_reattempt` answers with the
     // outcome and the prior run's force setting, which is strictly more
     // information than one global bit.
-    let build_knobs = format!(
+    let mut build_knobs = format!(
         "project={:?}|no_stubs={}|sanitizers={:?}|decoder_limits={:?}|passes={}|engines={:?}",
         options.project,
         options.no_stubs,
@@ -1734,6 +2154,18 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         options.passes.len(),
         options.engines,
     );
+    // The imported Visual Studio solution and configuration decide every
+    // imported target's defines; only a run that chose them carries the knob,
+    // so other work dirs keep their fingerprint.
+    if msbuild_request.solution.is_some() || msbuild_request.configuration.is_some() {
+        build_knobs.push_str(&format!(
+            "|msbuild={:?}/{:?}",
+            msbuild_request.solution, msbuild_request.configuration
+        ));
+    }
+    if args.msbuild_evaluate {
+        build_knobs.push_str("|msbuild_evaluate");
+    }
     let current_build_fp = crate::auto::discovery::build_context_fingerprint(&path, &build_knobs);
     let build_ctx_file = crate::auto::layout::reports_dir(&work).join("build-context.fingerprint");
     let prior_build_fp = std::fs::read_to_string(&build_ctx_file)
@@ -2668,6 +3100,15 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
             );
         }
     }
+    // After minimization, so a minimized input is the one replayed: which input
+    // bytes reach which comparison, and the environment that one input touched.
+    let (captured, uncaptured) = crate::gate_evidence::run_pass(&work);
+    if captured + uncaptured > 0 {
+        bhfeprintln!(
+            "bhf: recorded comparison evidence for {captured} finding(s); {uncaptured} left for \
+             `bhf explain` to record (time budget)"
+        );
+    }
 
     // --install-deps: read the just-written manifest and fetch what we can
     // (online, opt-in). Re-run afterward to build against the real deps.
@@ -2690,6 +3131,7 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         &work,
         args.mode,
         run_start.elapsed(),
+        &started_at,
         &results,
         resumed,
         discovered_total,
@@ -2750,8 +3192,19 @@ fn run_inner(mut args: AutoArgs) -> Result<i32> {
         crate::auto::triage::render_triage(&crate::auto::triage::TriageInputs {
             built_and_fuzzed: summary.built_and_fuzzed,
             failed_build: summary.failed_build,
+            failed_build_cpp: failed_builds_in(&results, crate::auto::candidate::Lang::Cpp),
+            failed_build_ada: failed_builds_in(&results, crate::auto::candidate::Lang::Ada),
             skipped: summary.skipped,
             skipped_missing_package: summary.skipped_missing_package,
+            skipped_unsafe_path: results
+                .iter()
+                .filter(|result| {
+                    matches!(
+                        &result.outcome,
+                        crate::auto::attempt::Outcome::UnsafeBuildPath { .. }
+                    )
+                })
+                .count(),
             report_only: summary.report_only,
             findings: summary.findings,
             preflight: &preflight,
@@ -2929,7 +3382,7 @@ fn discover_or_reuse(
     // the source tree is unchanged; `--resume` only skips completed targets then.)
     if !cache_enabled {
         return Ok((
-            crate::auto::discovery::discover_with_options(path, dir_filter, preprocess)?,
+            crate::auto::discovery::discover_with_fuzz_drivers(path, dir_filter, preprocess)?,
             false,
             // `--no-discovery-cache` keeps no source identity, so `--resume`
             // stays conservative and re-attempts, exactly as before.
@@ -2937,7 +3390,7 @@ fn discover_or_reuse(
         ));
     }
 
-    use crate::auto::discovery::discover_with_options;
+    use crate::auto::discovery::discover_with_fuzz_drivers;
     use crate::auto::discovery_cache::{self, DiscoveryCache};
 
     // `--discovery-cache <path>` overrides the default `<work>/discovery-cache.json`.
@@ -3008,7 +3461,7 @@ fn discover_or_reuse(
         );
     }
     let _td = std::time::Instant::now();
-    let candidates = discover_with_options(path, dir_filter, preprocess)?;
+    let candidates = discover_with_fuzz_drivers(path, dir_filter, preprocess)?;
     crate::auto::discovery::bhfprof("auto:discover", _td);
     let _tc = std::time::Instant::now();
     // Persist the freshly ranked list for a later --reuse-discovery run. The cache
@@ -3638,6 +4091,13 @@ struct AutoSummary {
     /// only blind stubs and never the real library. Surfaced distinctly in the
     /// terminal summary so the run's headline count isn't misread.
     fuzzed_stub_only: usize,
+    /// One line per fuzzed target whose harness compiled only with inputs bhf
+    /// fabricated (placeholder headers, macro values, types): `<id> <name>:
+    /// <what>`. Its findings are low confidence.
+    fabricated_build_context: Vec<String>,
+    /// One line per extra build lane of a target that did not build: `<id>
+    /// <name>: line coverage unavailable: make main_cov failed: <error>`.
+    lost_lanes: Vec<String>,
     built: usize,
     /// #95: targets that built and ran fuzz passes but whose entry-instrumented
     /// (C/C++/Ada) harness never observed the target-entry checkpoint — the run
@@ -3679,6 +4139,9 @@ impl AutoSummary {
         work: &Path,
         mode: actionability::RunMode,
         duration: std::time::Duration,
+        // When this run started (RFC 3339): a build lane recorded before it
+        // belongs to a target reloaded from an earlier run.
+        started_at: &str,
         results: &[crate::auto::attempt::AttemptResult],
         resumed: usize,
         discovered_total: usize,
@@ -3704,6 +4167,8 @@ impl AutoSummary {
         let mut built_not_entered = 0;
         let mut skipped = 0;
         let mut skipped_missing_package = 0;
+        let mut fabricated_build_context = Vec::new();
+        let mut lost_lanes = Vec::new();
         let mut failed_build = 0;
         let mut link_errors = 0;
         let mut runtime_errors = 0;
@@ -3721,12 +4186,45 @@ impl AutoSummary {
 
         for r in results {
             files_with_targets.insert(r.candidate.source_path.as_path());
+            if is_built(&r.outcome) {
+                for line in crate::auto::lanes::unavailable(
+                    &crate::auto::lanes::read(&r.harness_dir),
+                    started_at,
+                ) {
+                    lost_lanes.push(format!(
+                        "{} {}: {line}",
+                        r.candidate.harness_id, r.candidate.name
+                    ));
+                }
+            }
             match &r.outcome {
-                BuiltAndFuzzed { passes, .. } => {
+                BuiltAndFuzzed {
+                    passes, repairs, ..
+                } => {
                     built_and_fuzzed += 1;
                     // #417: track the false-clean subset for the summary line.
                     if r.outcome.stub_execution().is_some_and(|se| se.stub_only) {
                         fuzzed_stub_only += 1;
+                    }
+                    if let Some(fidelity) =
+                        crate::auto::build_fidelity::for_target(repairs, &r.harness_dir)
+                    {
+                        let missing =
+                            crate::auto::build_fidelity::incomplete_context_headers(&fidelity);
+                        let incomplete = if missing.is_empty() {
+                            String::new()
+                        } else {
+                            format!(
+                                " — build context incomplete: missing {}",
+                                missing.join(", ")
+                            )
+                        };
+                        fabricated_build_context.push(format!(
+                            "{} {}: {}{incomplete}",
+                            r.candidate.harness_id,
+                            r.candidate.name,
+                            fidelity.summary()
+                        ));
                     }
                     findings += passes.iter().map(|p| p.findings.len()).sum::<usize>();
                     executions += passes.iter().map(|p| p.executions).sum::<usize>();
@@ -3754,6 +4252,7 @@ impl AutoSummary {
                     coverage_edges = coverage_edges
                         .max(passes.iter().map(|p| p.coverage_edges).max().unwrap_or(0));
                 }
+                UnsafeBuildPath { .. } => skipped += 1,
                 UnsupportedParams { reason } => {
                     skipped += 1;
                     // An interpreted target that could not LOAD because a package
@@ -3834,6 +4333,8 @@ impl AutoSummary {
             coverage_edges,
             built_and_fuzzed,
             fuzzed_stub_only,
+            fabricated_build_context,
+            lost_lanes,
             built,
             built_not_entered,
             skipped,
@@ -3981,6 +4482,38 @@ impl AutoSummary {
                  stub_execution",
                 self.fuzzed_stub_only
             );
+        }
+
+        if !self.fabricated_build_context.is_empty() {
+            const SHOWN: usize = 5;
+            let _ = writeln!(
+                s,
+                "  ⚠ Build context: {} target(s) compiled only with headers/macro values bhf \
+                 fabricated — their findings are low confidence (run.md, run.json \
+                 targets[].build_fidelity)",
+                self.fabricated_build_context.len()
+            );
+            for line in self.fabricated_build_context.iter().take(SHOWN) {
+                let _ = writeln!(s, "      {line}");
+            }
+            if self.fabricated_build_context.len() > SHOWN {
+                let _ = writeln!(
+                    s,
+                    "      … {} more",
+                    self.fabricated_build_context.len() - SHOWN
+                );
+            }
+        }
+
+        if !self.lost_lanes.is_empty() {
+            let _ = writeln!(
+                s,
+                "  ⚠ Build lanes: {} lane(s) did not build (run.md, run.json targets[].lanes)",
+                self.lost_lanes.len()
+            );
+            for line in &self.lost_lanes {
+                let _ = writeln!(s, "      {line}");
+            }
         }
 
         let _ = writeln!(s);
@@ -4302,6 +4835,106 @@ fn render_selected_langs(selectors: &[crate::auto::candidate::LangSelector]) -> 
         .join(", ")
 }
 
+/// The console note for a `--target` that selected nothing: the closest
+/// discovered names, and the spellings `--target` accepts.
+fn unmatched_target_note(selected: &str, discovered: &[String]) -> String {
+    let closest = crate::target_filter::closest_matches(selected, discovered, |n| n, 5);
+    let mut note = format!("  --target '{selected}' matched no discovered target");
+    if !closest.is_empty() {
+        let listed: Vec<&str> = closest.iter().map(|name| name.as_str()).collect();
+        note.push_str(&format!("; closest: {}", listed.join(", ")));
+    }
+    note.push_str(
+        " (accepted: the bare name, a qualified suffix such as `Class::method`, or the full \
+         name from --list-targets, optionally with its parameter list)",
+    );
+    note
+}
+
+/// The console note for project fuzz drivers that library targets shadowed.
+fn ignored_fuzz_drivers_note(
+    ignored: &[crate::auto::candidate::Candidate],
+    root: &Path,
+) -> Option<String> {
+    if ignored.is_empty() {
+        return None;
+    }
+    let mut files: Vec<String> = ignored
+        .iter()
+        .map(|c| {
+            c.source_path
+                .strip_prefix(root)
+                .unwrap_or(&c.source_path)
+                .display()
+                .to_string()
+        })
+        .collect();
+    files.sort();
+    files.dedup();
+    let shown = files.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+    let more = if files.len() > 3 {
+        format!(" and {} more", files.len() - 3)
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "  note: ignored {} project fuzz driver(s) (LLVMFuzzerTestOneInput in {shown}{more}); \
+         select one with --target LLVMFuzzerTestOneInput or --target-file <file>, or run auto \
+         on the driver's directory",
+        ignored.len()
+    ))
+}
+
+/// Keep the candidates that a `--target` value selects; returns, per value,
+/// whether it selected anything.
+///
+/// Each value is matched exactly first (the full name, the name without its
+/// parameter list, or the bare name). Only a value that matches no candidate
+/// exactly falls back to a trailing qualified suffix, the same precedence as
+/// `generate-harness --target`: `Codec::decode` keeps a global
+/// `Codec::decode` alone even when `widgets::Codec::decode` also exists.
+fn retain_selected_targets(
+    candidates: &mut Vec<crate::auto::candidate::Candidate>,
+    targets: &[String],
+) -> Vec<bool> {
+    let case_insensitive = |candidate: &crate::auto::candidate::Candidate| {
+        matches!(candidate.lang, Lang::Ada | Lang::Fortran | Lang::Cobol)
+    };
+    let exact_hit: Vec<bool> = targets
+        .iter()
+        .map(|selected| {
+            candidates.iter().any(|candidate| {
+                target_name_filter_matches(&candidate.name, selected, case_insensitive(candidate))
+            })
+        })
+        .collect();
+    let mut selected_any = vec![false; targets.len()];
+    candidates.retain(|candidate| {
+        let case_insensitive = case_insensitive(candidate);
+        let mut keep = false;
+        for (index, selected) in targets.iter().enumerate() {
+            let hit = if exact_hit[index] {
+                target_name_filter_matches(&candidate.name, selected, case_insensitive)
+            } else {
+                crate::target_filter::qualified_suffix_matches(
+                    &candidate.name,
+                    selected,
+                    case_insensitive,
+                )
+            };
+            if hit {
+                selected_any[index] = true;
+                keep = true;
+            }
+        }
+        keep
+    });
+    selected_any
+}
+
+/// Whether `selected` spells `candidate_name` exactly: the full discovered name,
+/// the name without its parameter list, the bare (unqualified) name, or the full
+/// name with a whitespace-insensitive parameter list or a leading global `::`.
 fn target_name_filter_matches(
     candidate_name: &str,
     selected: &str,
@@ -4332,7 +4965,10 @@ fn target_name_filter_matches(
     let colon_leaf = base.rfind("::").map(|index| index + 2);
     let dot_leaf = base.rfind('.').map(|index| index + 1);
     let leaf_start = colon_leaf.into_iter().chain(dot_leaf).max().unwrap_or(0);
-    equal(&base[leaf_start..], selected)
+    if equal(&base[leaf_start..], selected) {
+        return true;
+    }
+    crate::target_filter::qualified_exact_matches(candidate_name, selected, case_insensitive)
 }
 
 fn sort_attacking_candidates(
@@ -4406,6 +5042,8 @@ pub(crate) fn outcome_label(o: &crate::auto::attempt::Outcome) -> &'static str {
         // signature (e.g. a function-pointer or opaque-userdata param it
         // can't drive from a byte buffer).
         UnsupportedParams { .. } => "skipped: could not auto-harness",
+        // Not a missing feature: a path or flag no quoting makes safe.
+        UnsafeBuildPath { .. } => "refused: a path or flag cannot be quoted safely",
         UnrecoverableLink { .. } => "unrecoverable_link",
         UnrecoverableRuntime { .. } => "unrecoverable_runtime",
         // M22: discovered + statically analyzed, not fuzzed.
@@ -4458,7 +5096,7 @@ fn verbose_detail(outcome: &crate::auto::attempt::Outcome) -> Vec<String> {
                 lines.push(format!("last error: {}", build_error_brief(err)));
             }
         }
-        UnsupportedParams { reason } => lines.push(reason.clone()),
+        UnsupportedParams { reason } | UnsafeBuildPath { reason } => lines.push(reason.clone()),
         UnrecoverableLink { missing, .. } => {
             if !missing.is_empty() {
                 lines.push(format!("missing libraries: {}", missing.join(", ")));
@@ -4732,7 +5370,8 @@ fn summarize_repairs(repairs: &[crate::auto::repair::Repair]) -> Option<String> 
         mut ada,
         mut incdirs,
         mut platforms,
-    ) = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        mut compat,
+    ) = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
     for repair in repairs {
         match repair {
             HeaderPlaceholder { .. } | ConfigHeaderSynth { .. } => headers += 1,
@@ -4748,6 +5387,7 @@ fn summarize_repairs(repairs: &[crate::auto::repair::Repair]) -> Option<String> 
             | OverrideAdaBodyStub { .. }
             | StubGprImport { .. } => ada += 1,
             PlatformStub { .. } | Win32Pack | ForcedSyntheticParams { .. } => platforms += 1,
+            CompilerCompat { .. } => compat += 1,
         }
     }
     let plural = |n: usize| if n == 1 { "" } else { "s" };
@@ -4788,6 +5428,9 @@ fn summarize_repairs(repairs: &[crate::auto::repair::Repair]) -> Option<String> 
             plural(platforms)
         ));
     }
+    if compat > 0 {
+        parts.push("added a compiler compatibility flag".to_owned());
+    }
     Some(parts.join(", "))
 }
 
@@ -4816,6 +5459,9 @@ fn build_error_brief(err: &build_classifier::BuildErrorKind) -> String {
             line,
             message,
         } => format!("build-config #error at {file}:{line}: {message}"),
+        ExtraQualification { file, line, member } => {
+            format!("extra class qualification on member '{member}' at {file}:{line}")
+        }
         Other { tail } => {
             // The tail is the last few lines of build output. GNAT prints
             // warnings before the fatal error, so the first tail line is often
@@ -4834,9 +5480,110 @@ fn build_error_brief(err: &build_classifier::BuildErrorKind) -> String {
     }
 }
 
+/// The default Visual Studio project import for `auto`: when `tree` holds a
+/// solution or project, no compile database, and no CMake/Meson build, read
+/// its compile settings into `<work>/auto/msbuild/compile_commands.json`.
+/// The reading is static unless `msbuild_evaluate` (`--msbuild-evaluate`)
+/// lets an installed MSBuild evaluate the projects.
+fn default_msbuild_import(
+    tree: &Path,
+    work: &Path,
+    request: &crate::auto::msbuild_import::ImportRequest,
+    msbuild_evaluate: bool,
+) -> Option<PathBuf> {
+    use crate::auto::build_probe;
+    // A solution named with --msbuild-solution is imported wherever it is.
+    if request.solution.is_none()
+        && (!build_probe::has_msbuild_project(tree)
+            || tree.join("CMakeLists.txt").is_file()
+            || tree.join("meson.build").is_file())
+    {
+        return None;
+    }
+    // Many portable projects ship Visual Studio files next to their own
+    // build (a Makefile, autotools inputs, Bazel). Off Windows that build is
+    // the one the harness should follow, so the solution is imported by
+    // default only when it is the tree's only build description, unless it is
+    // named explicitly.
+    if !cfg!(windows) && request.solution.is_none() {
+        let files = build_probe::msbuild_files(tree);
+        if let Some(marker) = build_probe::other_build_description(tree, &files) {
+            bhfeprintln!(
+                "bhf auto: {} has its own build ({}); not importing its Visual Studio \
+                 solution on this host (--msbuild-solution imports it)",
+                tree.display(),
+                marker.display()
+            );
+            return None;
+        }
+    }
+    if let Some(existing) = build_probe::existing_compile_database(tree) {
+        bhfeprintln!(
+            "bhf auto: using {} rather than importing the Visual Studio solution",
+            existing.display()
+        );
+        return None;
+    }
+    let db = work
+        .join("auto")
+        .join("msbuild")
+        .join("compile_commands.json");
+    // Each row carries the Windows import libraries its own project links,
+    // so a harness links only its project's libraries.
+    let (db, _) = build_probe::import_msbuild_projects(tree, &db, request, msbuild_evaluate)?;
+    Some(db)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A probe archive that is already built for the sweep's target is linked
+    /// as it is: it is handed to the sweep's harnesses with the rebuilt ones,
+    /// not left to the undefined-symbol fallback.
+    #[test]
+    fn a_probe_archive_already_for_the_target_reaches_the_sweep() {
+        let cross = "aarch64-linux-gnu-gcc";
+        if which::which(cross).is_err() || which::which("ar").is_err() {
+            eprintln!("skip: {cross}/ar unavailable");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let tree = tmp.path().join("src");
+        let probe = tree.join(crate::auto::build_probe::PROBE_DIR);
+        std::fs::create_dir_all(&probe).unwrap();
+        std::fs::write(
+            tree.join("util.c"),
+            "int widget_scale(int v) { return v * 3; }\n",
+        )
+        .unwrap();
+        let object = probe.join("util.o");
+        assert!(std::process::Command::new(cross)
+            .arg("-c")
+            .arg(tree.join("util.c"))
+            .arg("-o")
+            .arg(&object)
+            .status()
+            .unwrap()
+            .success());
+        let archive = probe.join("libwidget.a");
+        assert!(std::process::Command::new("ar")
+            .arg("rcs")
+            .arg(&archive)
+            .arg(&object)
+            .status()
+            .unwrap()
+            .success());
+        let target = crate::auto::cross_target::resolve_cross_target("aarch64").unwrap();
+        let work = tmp.path().join("work");
+        let linked = rebuild_probe_archives_for_sweep(
+            &tree,
+            &work,
+            &target,
+            &config::ToolchainConfig::default(),
+        );
+        assert_eq!(linked, vec![archive]);
+    }
 
     #[test]
     fn explicit_sanitizer_policy_controls_post_campaign_replays() {
@@ -4977,6 +5724,7 @@ mod tests {
             is_static: false,
             foreign_guard: None,
             input_reachability: None,
+            input_reachability_basis: None,
             dialect: None,
         }
     }
@@ -5074,6 +5822,7 @@ mod tests {
                     is_static: false,
                     foreign_guard: None,
                     input_reachability: None,
+                    input_reachability_basis: None,
                     dialect: None,
                 },
                 outcome,
@@ -5580,11 +6329,11 @@ mod tests {
         std::fs::write(dir.join("a.bin"), b"BB").unwrap();
         std::fs::write(dir.join("b.bin"), b"C").unwrap();
 
-        let seeds = load_seed_inputs(
+        let seeds = seed_bytes(load_seed_inputs(
             &[file, base.join("missing.bin")],
             std::slice::from_ref(&dir),
             crate::fuzz::DEFAULT_MAX_LEN,
-        );
+        ));
 
         // 1 readable file (missing one skipped) + 2 dir entries.
         assert_eq!(seeds.len(), 3);
@@ -5607,7 +6356,11 @@ mod tests {
         let small = base.join("small.bin");
         std::fs::write(&small, b"hello").unwrap();
 
-        let seeds = load_seed_inputs(&[big, small], &[], crate::fuzz::DEFAULT_MAX_LEN);
+        let seeds = seed_bytes(load_seed_inputs(
+            &[big, small],
+            &[],
+            crate::fuzz::DEFAULT_MAX_LEN,
+        ));
 
         assert_eq!(seeds.len(), 2);
         // The oversized seed is capped, not dropped, and its prefix is preserved.
@@ -5634,7 +6387,11 @@ mod tests {
         bytes.extend_from_slice(b"PK\x05\x06"); // ZIP directory trailer at EOF.
         std::fs::write(&archive, &bytes).unwrap();
 
-        let seeds = load_seed_inputs(&[archive], &[], crate::fuzz::AUTO_SOFT_CEILING);
+        let seeds = seed_bytes(load_seed_inputs(
+            &[archive],
+            &[],
+            crate::fuzz::AUTO_SOFT_CEILING,
+        ));
 
         assert_eq!(
             seeds,
@@ -5642,6 +6399,41 @@ mod tests {
             "auto mode must not discard an EOF index"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn seed_bytes(seeds: Vec<crate::auto::seed_manifest::LoadedSeed>) -> Vec<Vec<u8>> {
+        seeds.into_iter().map(|seed| seed.bytes).collect()
+    }
+
+    #[test]
+    fn load_seed_inputs_keeps_binary_bytes_and_records_where_each_came_from() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("seeds");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut image: Vec<u8> = vec![0x4d, 0x5a, 0x90, 0x00, 0x03];
+        image.extend((0x80..=0xffu8).chain(0x00..0x80u8));
+        let file = base.path().join("image.bin");
+        std::fs::write(&file, &image).unwrap();
+        // A lone continuation byte and bytes that never occur in UTF-8.
+        let odd = vec![0x80, 0xfe, 0xff, 0x00, 0xc0];
+        std::fs::write(dir.join("b.bin"), &odd).unwrap();
+        std::fs::write(dir.join("a.bin"), [0xefu8, 0xbb]).unwrap();
+
+        let seeds = load_seed_inputs(std::slice::from_ref(&file), std::slice::from_ref(&dir), 8);
+
+        assert_eq!(seeds.len(), 3);
+        assert_eq!(seeds[0].path, file);
+        assert_eq!(
+            seeds[0].bytes,
+            image[..8].to_vec(),
+            "capped prefix, unchanged"
+        );
+        assert_eq!(seeds[0].file_size, image.len() as u64);
+        // Directory entries come back in name order.
+        assert_eq!(seeds[1].path, dir.join("a.bin"));
+        assert_eq!(seeds[1].bytes, vec![0xef, 0xbb]);
+        assert_eq!(seeds[2].bytes, odd);
+        assert_eq!(seeds[2].file_size, odd.len() as u64);
     }
 
     fn alire_tmp(name: &str) -> PathBuf {
@@ -5736,6 +6528,7 @@ mod tests {
             is_static: false,
             foreign_guard: None,
             input_reachability: None,
+            input_reachability_basis: None,
             dialect: None,
         }
     }
@@ -5900,6 +6693,82 @@ mod tests {
     }
 
     #[test]
+    fn target_name_filter_accepts_qualified_suffixes() {
+        let name = "widgets::Codec::decode(const unsigned char *, size_t)";
+        let mut candidates = vec![candidate("/p/src/b.cpp", 3, "H-X0002")];
+        candidates[0].lang = Lang::Cpp;
+        candidates[0].name = name.to_owned();
+        let mut ada = candidate("/p/src/pkg.adb", 9, "H-A0001");
+        ada.lang = Lang::Ada;
+        ada.name = "Root.Pkg.Op".to_owned();
+        candidates.push(ada);
+        let selects = |selected: &str| {
+            let mut kept = candidates.clone();
+            retain_selected_targets(&mut kept, &[selected.to_owned()]);
+            kept.into_iter().map(|c| c.harness_id).collect::<Vec<_>>()
+        };
+        assert_eq!(selects("Codec::decode"), ["H-X0002"]);
+        assert_eq!(
+            selects("Codec::decode(const unsigned char *, size_t)"),
+            ["H-X0002"]
+        );
+        assert!(selects("odec::decode").is_empty());
+        assert!(selects("Codec::decode(int)").is_empty());
+        assert_eq!(selects("pkg.op"), ["H-A0001"]);
+    }
+
+    #[test]
+    fn target_filter_prefers_an_exact_spelling_over_a_suffix() {
+        let tree = || {
+            let mut global = candidate("/p/src/a.cpp", 3, "H-X0001");
+            global.lang = Lang::Cpp;
+            global.name = "Codec::decode(const unsigned char *, size_t)".to_owned();
+            let mut namespaced = candidate("/p/src/b.cpp", 3, "H-X0002");
+            namespaced.lang = Lang::Cpp;
+            namespaced.name = "widgets::Codec::decode(const unsigned char *, size_t)".to_owned();
+            let mut other = candidate("/p/src/c.cpp", 7, "H-X0003");
+            other.lang = Lang::Cpp;
+            other.name = "gadgets::Table::store(int)".to_owned();
+            vec![global, namespaced, other]
+        };
+        let kept = |selectors: &[&str]| {
+            let mut candidates = tree();
+            let selectors: Vec<String> = selectors.iter().map(|s| (*s).to_owned()).collect();
+            let matched = retain_selected_targets(&mut candidates, &selectors);
+            let ids: Vec<String> = candidates.into_iter().map(|c| c.harness_id).collect();
+            (ids, matched)
+        };
+        // The global class's spelling selects only it, not every `*::Codec::decode`.
+        assert_eq!(
+            kept(&["Codec::decode"]),
+            (vec!["H-X0001".to_owned()], vec![true])
+        );
+        assert_eq!(
+            kept(&["Codec::decode(const unsigned char*, size_t)"]).0,
+            vec!["H-X0001".to_owned()]
+        );
+        // A leading `::` names the global namespace only.
+        assert_eq!(kept(&["::Codec::decode"]).0, vec!["H-X0001".to_owned()]);
+        // The fully qualified spelling selects only the namespaced class.
+        assert_eq!(
+            kept(&["widgets::Codec::decode"]).0,
+            vec!["H-X0002".to_owned()]
+        );
+        // A selector with no exact match still selects by suffix.
+        assert_eq!(kept(&["Table::store"]).0, vec!["H-X0003".to_owned()]);
+        // Each selector gets its own precedence; a miss is reported per selector.
+        assert_eq!(
+            kept(&["Codec::decode", "Table::store", "Codec::encode"]),
+            (
+                vec!["H-X0001".to_owned(), "H-X0003".to_owned()],
+                vec![true, true, false]
+            )
+        );
+        // The bare name still keeps every definition with that leaf.
+        assert_eq!(kept(&["decode"]).0.len(), 2);
+    }
+
+    #[test]
     fn attacking_order_reads_each_source_path_once_and_uses_cached_text_for_score() {
         let mut candidates = vec![
             candidate("/src/safe.c", 1, "H-C0001"),
@@ -6015,6 +6884,7 @@ mod tests {
                     executions: 127,
                     target_entry_observed: false,
                     coverage_edges: 0,
+                    coverage_instrumentation: None,
                     elapsed_secs: 1.0,
                     executions_per_sec: 127.0,
                     findings: vec![],
@@ -6025,6 +6895,7 @@ mod tests {
                     executions: 112,
                     target_entry_observed: false,
                     coverage_edges: 0,
+                    coverage_instrumentation: None,
                     elapsed_secs: 1.0,
                     executions_per_sec: 112.0,
                     findings: vec!["F-0001".to_owned()],
@@ -6092,6 +6963,7 @@ mod tests {
                 is_static: false,
                 foreign_guard: None,
                 input_reachability: None,
+                input_reachability_basis: None,
                 dialect: None,
             },
             outcome,
@@ -6113,6 +6985,7 @@ mod tests {
                         executions: 1,
                         target_entry_observed: false,
                         coverage_edges: 0,
+                        coverage_instrumentation: None,
                         elapsed_secs: 0.5,
                         executions_per_sec: 2.0,
                         findings: vec!["F-0001".to_owned(), "F-0002".to_owned()],
@@ -6142,6 +7015,7 @@ mod tests {
             Path::new("/w"),
             actionability::RunMode::Reporting,
             std::time::Duration::from_secs(1),
+            "2000-01-01T00:00:00+00:00",
             &results,
             0,
             0,
@@ -6182,6 +7056,7 @@ mod tests {
                     is_static: false,
                     foreign_guard: None,
                     input_reachability: None,
+                    input_reachability_basis: None,
                     dialect: None,
                 },
                 outcome: Outcome::UnsupportedParams {
@@ -6195,6 +7070,7 @@ mod tests {
             Path::new("/w"),
             actionability::RunMode::Reporting,
             std::time::Duration::from_secs(1),
+            "2000-01-01T00:00:00+00:00",
             &results,
             0,
             0,
@@ -6228,6 +7104,7 @@ mod tests {
                 is_static: false,
                 foreign_guard: None,
                 input_reachability: None,
+                input_reachability_basis: None,
                 dialect: None,
             },
             outcome: Outcome::BuiltNotEntered {
@@ -6239,6 +7116,7 @@ mod tests {
                     executions: 100,
                     target_entry_observed: false,
                     coverage_edges: 3,
+                    coverage_instrumentation: None,
                     elapsed_secs: 0.5,
                     executions_per_sec: 200.0,
                     // A crash produced WITHOUT target entry — a decode/stub
@@ -6259,6 +7137,7 @@ mod tests {
             Path::new("/w"),
             actionability::RunMode::Reporting,
             std::time::Duration::from_secs(1),
+            "2000-01-01T00:00:00+00:00",
             std::slice::from_ref(&result),
             0,
             0,
@@ -6289,6 +7168,8 @@ mod tests {
             resumed: 0,
             built_and_fuzzed: 12,
             fuzzed_stub_only: 0,
+            fabricated_build_context: Vec::new(),
+            lost_lanes: Vec::new(),
             built: 0,
             built_not_entered: 0,
             skipped: 171,
@@ -6305,7 +7186,8 @@ mod tests {
             files_with_targets: 2,
             per_language: vec![("C", 191, 12)],
         };
-        let out = summary.render();
+        // Paths are joined with the host separator; compare them with `/`.
+        let out = summary.render().replace('\\', "/");
         assert!(out.contains("Duration:     2m 14s"), "{out}");
         // #405: campaign throughput = executions ÷ measured fuzz wall.
         assert!(out.contains("Throughput:   1000 exec/s"), "{out}");
@@ -6343,6 +7225,8 @@ mod tests {
             resumed: 0,
             built_and_fuzzed: 0,
             fuzzed_stub_only: 0,
+            fabricated_build_context: Vec::new(),
+            lost_lanes: Vec::new(),
             built: 0,
             built_not_entered: 0,
             skipped: 5,
@@ -6381,6 +7265,8 @@ mod tests {
             resumed: 0,
             built_and_fuzzed: 20,
             fuzzed_stub_only: 0,
+            fabricated_build_context: Vec::new(),
+            lost_lanes: Vec::new(),
             built: 0,
             built_not_entered: 0,
             skipped: 0,
@@ -6420,6 +7306,8 @@ mod tests {
             resumed: 0,
             built_and_fuzzed: 2,
             fuzzed_stub_only: 0,
+            fabricated_build_context: Vec::new(),
+            lost_lanes: Vec::new(),
             built: 0,
             built_not_entered: 0,
             skipped: 0,

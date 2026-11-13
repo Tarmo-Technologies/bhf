@@ -13,6 +13,7 @@ pub(crate) struct FatalSignal {
     pub(crate) name: String,
 }
 
+#[cfg(unix)]
 fn has_abort_rejection_diagnostic(stderr: &str) -> bool {
     let lower = stderr.to_ascii_lowercase();
     (lower.contains("assertion") && lower.contains("failed"))
@@ -40,6 +41,9 @@ pub(crate) fn classify(status: &std::process::ExitStatus, stderr: &str) -> Optio
     }
     let name = match signal {
         4 => "SIGILL".to_owned(),
+        // A trap instruction: `__builtin_trap` on AArch64, and the sanitizer
+        // checks built with `-fsanitize-trap` there.
+        5 => "SIGTRAP".to_owned(),
         6 => "SIGABRT".to_owned(),
         7 => "SIGBUS".to_owned(),
         8 => "SIGFPE".to_owned(),
@@ -56,6 +60,7 @@ pub(crate) fn classify(status: &std::process::ExitStatus, _stderr: &str) -> Opti
     })
 }
 
+#[cfg(all(test, unix))]
 pub(crate) fn rule_id(status: &std::process::ExitStatus, stderr: &str) -> Option<&'static str> {
     classify(status, stderr).map(|_| RULE_ID)
 }
@@ -100,9 +105,19 @@ mod tests {
         assert_eq!(RULE_ID, "BHF-210");
     }
 
+    /// A trap instruction (`__builtin_trap` on AArch64, or a sanitizer check
+    /// built with `-fsanitize-trap`) raises SIGTRAP: a crash, not a
+    /// rejection.
+    #[test]
+    fn a_trap_is_a_fatal_signal() {
+        let trap = classify(&by_signal(5), "").expect("SIGTRAP is a crash");
+        assert_eq!(trap.name, "SIGTRAP");
+        assert_eq!(rule_id(&by_signal(5), ""), Some(RULE_ID));
+    }
+
     #[test]
     fn only_hardware_fault_signals_are_classified() {
-        for signal in [4, 7, 8, 11] {
+        for signal in [4, 5, 7, 8, 11] {
             assert!(classify(&by_signal(signal), "").is_some());
         }
         for signal in [1, 2, 13, 14, 15] {

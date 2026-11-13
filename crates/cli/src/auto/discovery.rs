@@ -709,6 +709,19 @@ fn reachability_for_linkage(
     reachability
 }
 
+/// The basis of [`reachability_for_linkage`]'s verdict: an input shape of a
+/// `static` function is `internal_linkage`, keeping the parameter it found.
+fn basis_for_linkage(
+    reachability: target_rank::InputReachability,
+    mut basis: target_rank::ReachabilityBasis,
+    is_static: bool,
+) -> target_rank::ReachabilityBasis {
+    if reachability_for_linkage(reachability, is_static) != reachability {
+        basis.rule = "internal_linkage".to_owned();
+    }
+    basis
+}
+
 pub fn discover(root: &Path) -> Result<Vec<Candidate>> {
     discover_with_dir_filter(root, &DirFilter::default())
 }
@@ -723,6 +736,50 @@ pub fn discover_with_dir_filter(root: &Path, filter: &DirFilter) -> Result<Vec<C
 /// As [`discover_with_dir_filter`], but with an explicit [`PreprocessMode`] (§27.6)
 /// so the CLI can force the CPP-lite preprocessor on/off for the C/C++ lane.
 pub fn discover_with_options(
+    root: &Path,
+    filter: &DirFilter,
+    preprocess: PreprocessMode,
+) -> Result<Vec<Candidate>> {
+    let mut candidates = discover_with_fuzz_drivers(root, filter, preprocess)?;
+    drop_shadowed_fuzz_drivers(&mut candidates);
+    Ok(candidates)
+}
+
+/// Whether discovery found anything other than a project fuzz driver
+/// (`LLVMFuzzerTestOneInput`). When it did, the drivers are shadowed: they are
+/// harness glue, not library targets, and are dropped unless an explicit
+/// selection names them.
+pub fn has_library_target(candidates: &[Candidate]) -> bool {
+    candidates
+        .iter()
+        .any(|c| !is_libfuzzer_test_one_input(&c.name))
+}
+
+/// Whether `candidate` is a project fuzz driver (`LLVMFuzzerTestOneInput`).
+pub fn is_fuzz_driver(candidate: &Candidate) -> bool {
+    is_libfuzzer_test_one_input(&candidate.name)
+}
+
+/// Remove project fuzz drivers when the tree also has library targets and
+/// return them. A tree whose only candidate is a driver keeps it as the
+/// passthrough target.
+pub fn drop_shadowed_fuzz_drivers(candidates: &mut Vec<Candidate>) -> Vec<Candidate> {
+    if !has_library_target(candidates) {
+        return Vec::new();
+    }
+    let (drivers, rest) = std::mem::take(candidates)
+        .into_iter()
+        .partition(is_fuzz_driver);
+    *candidates = rest;
+    drivers
+}
+
+/// As [`discover_with_options`], but project fuzz drivers stay in the result
+/// even when library targets exist, so `auto` can keep one an explicit
+/// `--target`/`--target-file`/`--harness-id` names and report the rest. The
+/// drivers never take part in the call-graph rerank; they are ranked among the
+/// other candidates by their own score.
+pub fn discover_with_fuzz_drivers(
     root: &Path,
     filter: &DirFilter,
     preprocess: PreprocessMode,
@@ -893,19 +950,27 @@ fn discover_on_this_stack(
             || (matches!(c.lang, Lang::C | Lang::Cpp) && bare_name(&c.name) == "main");
         !drop_always
     });
-    // `LLVMFuzzerTestOneInput` is a fuzz DRIVER, not a library target. Drop it when
-    // the tree ALSO has a real target — so a project's own harness can't out-rank its
-    // parser (libconfig's `fuzz/` harness was ranked #1 over `__config_read`), and a
-    // re-run over a directory of prior bhf output never targets itself. But when
-    // it is the SOLE fuzzable candidate, the tree IS a project-supplied single-file
-    // libFuzzer target: keep it as the PASSTHROUGH target (#408/#410) rather than
+    // `LLVMFuzzerTestOneInput` is a fuzz DRIVER, not a library target. Set it aside
+    // when the tree ALSO has a real target — so a project's own harness can't
+    // out-rank its parser (libconfig's `fuzz/` harness was ranked #1 over
+    // `__config_read`), and a re-run over a directory of prior bhf output never
+    // targets itself. The caller drops the set-aside drivers unless an explicit
+    // selection names one ([`drop_shadowed_fuzz_drivers`]). When a driver is the
+    // SOLE fuzzable candidate, the tree IS a project-supplied single-file libFuzzer
+    // target: keep it as the PASSTHROUGH target (#408/#410) rather than
     // discovering nothing.
-    if out.iter().any(|c| !is_libfuzzer_test_one_input(&c.name)) {
-        out.retain(|c| !is_libfuzzer_test_one_input(&c.name));
-    }
+    let shadowed_drivers = if has_library_target(&out) {
+        let (drivers, rest): (Vec<Candidate>, Vec<Candidate>) =
+            out.into_iter().partition(is_fuzz_driver);
+        out = rest;
+        drivers
+    } else {
+        Vec::new()
+    };
     dedup_amalgamated_single_header(&mut out);
     dedup_ada_spec_body_candidates(&mut out);
     apply_entrypoint_callgraph(&mut out);
+    out.extend(shadowed_drivers);
     out.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.name.cmp(&b.name)));
     Ok(out)
 }
@@ -1060,8 +1125,9 @@ pub fn build_context_fingerprint(root: &Path, knobs: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-/// Whether `path` is a build-context file: a compile database, GNAT project, or
-/// IDL — the inputs that change how bhf recovers a build.
+/// Whether `path` is a build-context file: a compile database, GNAT project,
+/// IDL, or Visual Studio solution/project/property sheet — the inputs that
+/// change how bhf recovers a build.
 fn is_build_context_file(path: &Path) -> bool {
     if path.file_name().and_then(|n| n.to_str()) == Some("compile_commands.json") {
         return true;
@@ -1071,7 +1137,7 @@ fn is_build_context_file(path: &Path) -> bool {
             .and_then(|e| e.to_str())
             .map(str::to_ascii_lowercase)
             .as_deref(),
-        Some("gpr") | Some("idl")
+        Some("gpr" | "idl" | "sln" | "slnx" | "vcxproj" | "props")
     )
 }
 
@@ -2002,6 +2068,7 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
                     // Ada is ranked by the structural scorer, not the C/C++
                     // byte-buffer shape classifier; no verdict computed here.
                     input_reachability: None,
+                    input_reachability_basis: None,
                     dialect,
                 });
             }
@@ -2088,7 +2155,20 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
             // signature ranker would sink them to `ReachabilityUnproven`; the
             // provenance map instead marks them the event-driven attack surface.
             let entry_provenance = target_rank::detect_entry_point_provenance(&source);
-            for tgt in target_rank::rank_c_targets_with_provenance(&fns, &entry_provenance) {
+            // A byte buffer or length spelled through a project typedef
+            // (`const u8_t *data`) is ranked as the type it aliases.
+            let registry = crate::generate_harness::ranking_type_registry(
+                path,
+                &source,
+                false,
+                fns.iter().map(|f| {
+                    f.params
+                        .iter()
+                        .map(|p| (p.name.as_str(), p.c_type.as_str()))
+                        .collect()
+                }),
+            );
+            for tgt in target_rank::rank_c_targets_with_types(&fns, &entry_provenance, &registry) {
                 let target_dialect = if knr_names.contains(&tgt.name) {
                     lang_profile::Dialect::CKAndR
                 } else {
@@ -2113,6 +2193,11 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
                     foreign_guard,
                     input_reachability: Some(reachability_for_linkage(
                         tgt.input_reachability,
+                        is_static,
+                    )),
+                    input_reachability_basis: Some(basis_for_linkage(
+                        tgt.input_reachability,
+                        tgt.input_reachability_basis,
                         is_static,
                     )),
                     dialect: Some(target_dialect),
@@ -2163,7 +2248,22 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
                 })
                 .collect::<HashMap<_, _>>();
             let _t4 = std::time::Instant::now();
-            let _ranked = target_rank::rank_cpp_targets(&fns);
+            let required_params: Vec<Vec<cpp_parser::CppParamDescriptor>> = fns
+                .iter()
+                .map(|function| function.effective_required_params())
+                .collect();
+            let registry = crate::generate_harness::ranking_type_registry(
+                path,
+                &source,
+                true,
+                required_params.iter().map(|params| {
+                    params
+                        .iter()
+                        .map(|p| (p.name.as_str(), p.cpp_type.as_str()))
+                        .collect()
+                }),
+            );
+            let _ranked = target_rank::rank_cpp_targets_with_types(&fns, &registry);
             bhfprof("cpp:rank", _t4);
             // Both fallback guards are loop-invariant — one depends only on the
             // PATH, the other only on the SOURCE TEXT — but being inside the
@@ -2216,6 +2316,11 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
                         tgt.input_reachability,
                         is_static,
                     )),
+                    input_reachability_basis: Some(basis_for_linkage(
+                        tgt.input_reachability,
+                        tgt.input_reachability_basis,
+                        is_static,
+                    )),
                     dialect,
                 });
             }
@@ -2247,6 +2352,7 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
                     is_static: tgt.is_static,
                     foreign_guard: tgt.foreign_guard,
                     input_reachability: Some(tgt.input_reachability),
+                    input_reachability_basis: None,
                     dialect,
                 });
             }
@@ -2274,6 +2380,7 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
                     is_static: tgt.is_static,
                     foreign_guard: None,
                     input_reachability: Some(tgt.input_reachability),
+                    input_reachability_basis: None,
                     dialect,
                 });
             }
@@ -2313,6 +2420,7 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
                     is_static: tgt.is_static,
                     foreign_guard: None,
                     input_reachability: Some(tgt.input_reachability),
+                    input_reachability_basis: None,
                     dialect,
                 });
             }
@@ -2338,6 +2446,7 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
                     is_static: tgt.is_static,
                     foreign_guard: None,
                     input_reachability: Some(tgt.input_reachability),
+                    input_reachability_basis: None,
                     dialect,
                 });
             }
@@ -2371,6 +2480,7 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
                     is_static: tgt.is_static,
                     foreign_guard: None,
                     input_reachability: Some(tgt.input_reachability),
+                    input_reachability_basis: None,
                     dialect,
                 });
             }
@@ -2396,6 +2506,7 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
                     is_static: false,
                     foreign_guard: None,
                     input_reachability: Some(target_rank::InputReachability::AttackerReachable),
+                    input_reachability_basis: None,
                     dialect,
                 });
             }
@@ -2420,6 +2531,7 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
                     is_static: false,
                     foreign_guard: None,
                     input_reachability: Some(target_rank::InputReachability::AttackerReachable),
+                    input_reachability_basis: None,
                     dialect,
                 });
             }
@@ -2445,6 +2557,7 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
                     is_static: false,
                     foreign_guard: None,
                     input_reachability: Some(target_rank::InputReachability::AttackerReachable),
+                    input_reachability_basis: None,
                     dialect,
                 });
             }
@@ -2471,6 +2584,7 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
                     is_static: false,
                     foreign_guard: None,
                     input_reachability: Some(target_rank::InputReachability::AttackerReachable),
+                    input_reachability_basis: None,
                     dialect,
                 });
             }
@@ -2491,6 +2605,7 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
                     is_static: false,
                     foreign_guard: None,
                     input_reachability: Some(target_rank::InputReachability::AttackerReachable),
+                    input_reachability_basis: None,
                     dialect,
                 });
             }
@@ -2511,6 +2626,7 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
                     is_static: false,
                     foreign_guard: None,
                     input_reachability: Some(target_rank::InputReachability::AttackerReachable),
+                    input_reachability_basis: None,
                     dialect,
                 });
             }
@@ -2537,6 +2653,7 @@ fn discover_file(path: &Path, out: &mut Vec<Candidate>, preprocess: PreprocessMo
                     is_static: false,
                     foreign_guard: None,
                     input_reachability: Some(target_rank::InputReachability::AttackerReachable),
+                    input_reachability_basis: None,
                     dialect,
                 });
             }
@@ -4138,6 +4255,23 @@ mod tests {
         let fp2 = build_context_fingerprint(&root, "knobs-a");
         assert_ne!(fp1, fp2, "a new compile_commands.json must change it");
 
+        // The Visual Studio project import reads property sheets by default, so
+        // editing one changes how imported targets build.
+        fs::write(root.join("common.props"), "<Project/>\n").unwrap();
+        let with_sheet = build_context_fingerprint(&root, "knobs-a");
+        assert_ne!(fp2, with_sheet, "a property sheet is a build-context file");
+        fs::write(
+            root.join("common.props"),
+            "<Project><PropertyGroup/></Project>\n",
+        )
+        .unwrap();
+        assert_ne!(
+            with_sheet,
+            build_context_fingerprint(&root, "knobs-a"),
+            "editing a property sheet must change it"
+        );
+        fs::remove_file(root.join("common.props")).unwrap();
+
         // Changing a harness-affecting option (knobs) changes it with no file edit.
         assert_ne!(
             fp2,
@@ -4163,6 +4297,7 @@ mod tests {
             is_static: false,
             foreign_guard: None,
             input_reachability: None,
+            input_reachability_basis: None,
             dialect: None,
         };
         let mut candidates = vec![
@@ -4472,6 +4607,50 @@ mod tests {
     }
 
     #[test]
+    fn shadowed_fuzz_drivers_are_kept_aside_for_explicit_selection() {
+        // A library plus the project's own driver in a non-`fuzz/` directory:
+        // the plain discovery API still drops the driver, while the driver-keeping
+        // API returns it so an explicit `auto --target` can select it.
+        let root = tmpdir();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("harness")).unwrap();
+        fs::write(
+            root.join("src/codec.c"),
+            "int parse_record(const unsigned char *data, unsigned long size) {\n\
+             \x20  return size ? data[0] : 0;\n\
+             }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("harness/drive.c"),
+            "int parse_record(const unsigned char *data, unsigned long size);\n\
+             int LLVMFuzzerTestOneInput(const unsigned char *data, unsigned long size) {\n\
+             \x20  return parse_record(data, size);\n\
+             }\n",
+        )
+        .unwrap();
+        let has = |cs: &[Candidate], n: &str| cs.iter().any(|c| c.name == n);
+        let plain = discover(&root).unwrap();
+        assert!(has(&plain, "parse_record"), "{plain:?}");
+        assert!(!has(&plain, "LLVMFuzzerTestOneInput"), "{plain:?}");
+
+        let mut kept =
+            discover_with_fuzz_drivers(&root, &DirFilter::default(), PreprocessMode::Auto).unwrap();
+        assert!(has(&kept, "parse_record"), "{kept:?}");
+        assert!(has(&kept, "LLVMFuzzerTestOneInput"), "{kept:?}");
+        assert!(has_library_target(&kept));
+        let dropped = drop_shadowed_fuzz_drivers(&mut kept);
+        assert_eq!(dropped.len(), 1, "{dropped:?}");
+        assert!(dropped[0].source_path.ends_with("harness/drive.c"));
+        assert!(!has(&kept, "LLVMFuzzerTestOneInput"));
+        // The library ranking is unaffected by the set-aside driver.
+        assert_eq!(
+            kept.iter().map(|c| (&c.name, c.score)).collect::<Vec<_>>(),
+            plain.iter().map(|c| (&c.name, c.score)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn sole_libfuzzer_entrypoint_is_kept_as_passthrough_target() {
         // A project-supplied single-file libFuzzer target: the ONLY fuzzable
         // function is LLVMFuzzerTestOneInput. It must be KEPT as the passthrough
@@ -4601,6 +4780,119 @@ mod tests {
                 cands.iter().map(|c| (&c.name, c.score)).collect::<Vec<_>>()
             );
         }
+    }
+
+    /// A byte buffer spelled through a typedef from a project header
+    /// (`const u8_t *`) is recognised as one: the C and C++ targets taking it
+    /// are input-reachable and rank above a scalar helper.
+    #[test]
+    fn typedefd_byte_buffer_targets_are_discovered_reachable() {
+        let root = tmpdir();
+        fs::write(
+            root.join("widget_types.h"),
+            "typedef unsigned char u8_t;\ntypedef unsigned int u32_t;\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("bits.c"),
+            "#include \"widget_types.h\"\n\
+             int read_bits(const u8_t *data, u32_t bit_index, u32_t width) {\n\
+             \x20 return (data[bit_index / 8] >> (bit_index % 8)) & (int)width;\n\
+             }\n\
+             int add_scalars(int a, int b) { return a + b; }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("bits.cpp"),
+            "#include \"widget_types.h\"\n\
+             namespace widgets {\n\
+             bool next_bit(const u8_t* bits, int position) { return bits[position] != 0; }\n\
+             }\n",
+        )
+        .unwrap();
+        let cands = discover(&root).unwrap();
+        let find = |name: &str| {
+            cands
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("{name} not discovered: {cands:?}"))
+        };
+        let read_bits = find("read_bits");
+        assert_eq!(
+            read_bits.input_reachability,
+            Some(target_rank::InputReachability::AttackerReachable),
+            "{read_bits:?}"
+        );
+        assert!(read_bits.score > find("add_scalars").score);
+        assert_eq!(
+            find("widgets::next_bit").input_reachability,
+            Some(target_rank::InputReachability::AttackerReachable)
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A buffer spelled through a pointer typedef to bytes, a project's
+    /// (`typedef const octet_t *rbuf_t`, in the file or a header) or a Win32
+    /// one (`LPCBYTE`), is input; each candidate records the parameter its
+    /// reachability rests on, and a `static` one says why it is unproven.
+    #[test]
+    fn pointer_typedef_buffer_targets_are_discovered_reachable_with_their_basis() {
+        let root = tmpdir();
+        fs::write(
+            root.join("frame_types.h"),
+            "typedef unsigned char octet_t;\ntypedef const octet_t *rbuf_t;\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("frame.c"),
+            "#include \"frame_types.h\"\n\
+             typedef const octet_t *rbuf_t;\n\
+             int check_frame(rbuf_t data, unsigned n) { return data[0] + (int)n; }\n\
+             int check_record(rbuf_t record, unsigned n) { return record[0] + (int)n; }\n\
+             int load_frame(LPCBYTE p, DWORD n) { return p[0] + (int)n; }\n\
+             static int check_inner(rbuf_t data, unsigned n) { return data[0] + (int)n; }\n\
+             int use_inner(rbuf_t data, unsigned n) { return check_inner(data, n); }\n",
+        )
+        .unwrap();
+        let cands = discover(&root).unwrap();
+        let find = |name: &str| {
+            cands
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("{name} not discovered: {cands:?}"))
+        };
+        for (name, param, spelled) in [
+            ("check_frame", "data", "rbuf_t"),
+            ("check_record", "record", "rbuf_t"),
+            ("load_frame", "p", "LPCBYTE"),
+        ] {
+            let candidate = find(name);
+            assert_eq!(
+                candidate.input_reachability,
+                Some(target_rank::InputReachability::AttackerReachable),
+                "{candidate:?}"
+            );
+            let basis = candidate
+                .input_reachability_basis
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name} has a basis: {candidate:?}"));
+            assert_eq!(basis.rule, "const_byte_buffer", "{basis:?}");
+            assert_eq!(basis.param.as_deref(), Some(param), "{basis:?}");
+            assert_eq!(basis.spelled_type.as_deref(), Some(spelled), "{basis:?}");
+        }
+        let inner = find("check_inner");
+        assert_eq!(
+            inner.input_reachability,
+            Some(target_rank::InputReachability::ReachabilityUnproven)
+        );
+        assert_eq!(
+            inner
+                .input_reachability_basis
+                .as_ref()
+                .map(|b| b.rule.as_str()),
+            Some("internal_linkage")
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -5368,10 +5660,12 @@ mod tests {
         .unwrap();
         fs::write(
             root.join("compile_commands.json"),
-            format!(
-                r#"[{{"directory":"{}","file":"heavy.c","arguments":["clang","-DHAVE_AVX2=1","-DNDEBUG=1","-c","heavy.c"]}}]"#,
-                root.display()
-            ),
+            serde_json::json!([{
+                "directory": root,
+                "file": "heavy.c",
+                "arguments": ["clang", "-DHAVE_AVX2=1", "-DNDEBUG=1", "-c", "heavy.c"],
+            }])
+            .to_string(),
         )
         .unwrap();
         let cands = discover(&root).unwrap();
