@@ -3195,13 +3195,31 @@ fn sarif_result(
     }
     if let Some(rule) = rule {
         let cwe = finding_cwe.unwrap_or(rule.cwe);
-        let mut tags = vec![cwe.to_owned()];
-        if cwe != rule.cwe {
-            tags.push(rule.cwe.to_owned());
-        }
-        if let Some(place) = rule.cwe_top_25 {
-            tags.push(format!("cwe-top-25-{place}"));
-            tags.push("cwe-top-25".to_owned());
+        // The result's tags are its own CWEs. The rule's catalog CWE, and the
+        // top-25 rank that belongs to it, join them only when the finding
+        // is that weakness (or names none): a READ overflow under a rule
+        // whose catalog CWE is the write CWE is not tagged as a write.
+        let own_cwes: Vec<&str> = finding
+            .actionability
+            .cwe
+            .iter()
+            .map(|cwe| cwe.trim())
+            .filter(|cwe| !cwe.is_empty())
+            .collect();
+        let is_rule_cwe = own_cwes.is_empty() || own_cwes.contains(&rule.cwe);
+        let mut tags: Vec<String> = if own_cwes.is_empty() {
+            vec![rule.cwe.to_owned()]
+        } else {
+            own_cwes.iter().map(|cwe| (*cwe).to_owned()).collect()
+        };
+        if is_rule_cwe {
+            if !tags.iter().any(|tag| tag == rule.cwe) {
+                tags.push(rule.cwe.to_owned());
+            }
+            if let Some(place) = rule.cwe_top_25 {
+                tags.push(format!("cwe-top-25-{place}"));
+                tags.push("cwe-top-25".to_owned());
+            }
         }
         if let Some(owasp) = rule.owasp_top_10 {
             tags.push(owasp.to_owned());
@@ -6172,6 +6190,21 @@ mod tests {
             }),
         );
         write_finding(
+            &findings.join("F-0003-heapwrite"),
+            json!({
+                "id": "F-0003-heapwrite",
+                "rule_id": "BHF-201",
+                "classification": "unhandled",
+                "exception": {
+                    "name": "ASAN_HEAP_BUFFER_OVERFLOW",
+                    "sanitizer": "asan",
+                    "message": "ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1 at pc 0x2 bp 0x3 sp 0x4 (WRITE of size 4)",
+                    "access": { "direction": "write", "size": 4 },
+                    "stack": [{ "function": "store_at", "file": "/src/widget/copy.c", "line": 14 }]
+                }
+            }),
+        );
+        write_finding(
             &findings.join("F-0002-wildread"),
             json!({
                 "id": "F-0002-wildread",
@@ -6209,6 +6242,34 @@ mod tests {
         let heap = result("F-0001-heapread");
         assert_eq!(heap["properties"]["cwe"], "CWE-122");
         assert_eq!(heap["properties"]["cwes"], json!(["CWE-122", "CWE-125"]));
+        // The tags are the read's CWEs: not the rule's write CWE, nor its
+        // top-25 rank.
+        let tags = |result: &serde_json::Value| -> Vec<String> {
+            result["properties"]["tags"]
+                .as_array()
+                .expect("tags")
+                .iter()
+                .filter_map(|tag| tag.as_str().map(str::to_owned))
+                .collect()
+        };
+        let heap_tags = tags(&heap);
+        for tag in ["CWE-122", "CWE-125"] {
+            assert!(heap_tags.iter().any(|t| t == tag), "{heap_tags:?}");
+        }
+        for tag in ["CWE-787", "cwe-top-25-2", "cwe-top-25"] {
+            assert!(!heap_tags.iter().any(|t| t == tag), "{heap_tags:?}");
+        }
+        assert!(
+            heap_tags
+                .iter()
+                .any(|t| t == "bhf.slug:bhf.c/heap-buffer-overflow"),
+            "{heap_tags:?}"
+        );
+        let write = result("F-0003-heapwrite");
+        let write_tags = tags(&write);
+        for tag in ["CWE-787", "cwe-top-25-2", "cwe-top-25"] {
+            assert!(write_tags.iter().any(|t| t == tag), "{write_tags:?}");
+        }
         let wild = result("F-0002-wildread");
         assert_eq!(wild["ruleId"], "BHF-223");
         assert_eq!(wild["properties"]["cwe"], "CWE-125");

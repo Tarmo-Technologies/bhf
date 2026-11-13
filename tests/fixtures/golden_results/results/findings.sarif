@@ -120,9 +120,7 @@
             "severity": "critical",
             "tags": [
               "CWE-122",
-              "CWE-787",
-              "cwe-top-25-2",
-              "cwe-top-25",
+              "CWE-125",
               "bhf.slug:bhf.c/heap-buffer-overflow"
             ]
           },

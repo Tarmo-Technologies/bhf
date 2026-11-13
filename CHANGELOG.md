@@ -54,6 +54,16 @@
   entry of kind `include_dir`, low confidence, a caveat in every report),
   and a copy of the header in the scanned tree wins over it. A dir named
   with `--extra-include` is not counted.
+- SARIF result tags are the finding's own CWEs: a READ heap overflow is
+  tagged `CWE-122` and `CWE-125`, no longer the rule's catalog `CWE-787` and
+  its `cwe-top-25` rank. The rule's CWE and rank tags are added only when the
+  finding is that weakness (or names no CWE); the rule descriptor keeps its
+  catalog tags.
+- A SEGV that AddressSanitizer reports at address `0x000000000000` with the
+  "dereference of a high value address" hint (the form some compiler-rt
+  releases print for a non-canonical address) is a wild-address SEGV
+  (BHF-223, CWE-119), not a NULL pointer dereference; stored findings with
+  the NULL rule are reclassified from the hint too.
 - `bhf explain` suggests `bhf env-capsule` only for a crash whose capture
   replay crashed while the runtrace shim served it faked bytes, the rule
   env-capsule accepts a finding on (now kept as

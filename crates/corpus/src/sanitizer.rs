@@ -1480,6 +1480,11 @@ const NULL_PAGE_LIMIT: u64 = 0x1000;
 /// Whether a SEGV faulted in the first memory page (a NULL dereference), by
 /// ASan's `zero page` hint or by the faulting address itself.
 fn faults_in_null_page(access: &MemoryAccess) -> bool {
+    // A high-value-address fault gives the CPU no faulting address: the zero
+    // some compiler-rt releases print for it is not one.
+    if access.address_hint.as_deref() == Some("high-value-address") {
+        return false;
+    }
     access.address_hint.as_deref() == Some("zero-page")
         || access
             .address
@@ -3022,6 +3027,18 @@ SUMMARY: UndefinedBehaviorSanitizer: invalid-shift-exponent src/widget/bits.c:5:
             high.message
         );
         let access = high.access.unwrap();
+        assert_eq!(access.direction, AccessDirection::Unknown);
+        assert_eq!(access.address_hint.as_deref(), Some("high-value-address"));
+        // Some compiler-rt releases print the faulting address of a
+        // non-canonical dereference as zero: the hint, not the zero, says
+        // what the CPU reported.
+        let zeroed = segv(
+            "0x000000000000 ",
+            "READ",
+            "==1==Hint: this fault was caused by a dereference of a high value address (see register values below).\n",
+        );
+        assert_eq!(zeroed.rule_id, "BHF-223");
+        let access = zeroed.access.unwrap();
         assert_eq!(access.direction, AccessDirection::Unknown);
         assert_eq!(access.address_hint.as_deref(), Some("high-value-address"));
     }

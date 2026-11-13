@@ -638,6 +638,41 @@ fn wild_address_segv_is_not_a_null_dereference() {
         backfill_actionability(RunMode::Reporting, &null, None).cwe,
         ["CWE-476"]
     );
+    // A non-canonical dereference some compiler-rt releases print with a zero
+    // address: the high-value hint says it is wild, under any stored rule.
+    let message = "ERROR: AddressSanitizer: SEGV on unknown address 0x000000000000 (pc 0x1 bp 0x2 \
+                   sp 0x3 T0) (READ memory access; high value address)";
+    let zeroed = segv_record(
+        "BHF-206",
+        message,
+        Some(json!({"direction": "unknown", "address": "0x000000000000",
+                    "address_hint": "high-value-address"})),
+    );
+    let rec = backfill_actionability(RunMode::Reporting, &zeroed, None);
+    assert_ne!(rec.cwe, ["CWE-476"]);
+    assert_eq!(rec.cwe, ["CWE-119"]);
+    // The same report text alone, from a record without the parsed access.
+    assert_eq!(
+        backfill_actionability(
+            RunMode::Reporting,
+            &segv_record("BHF-206", message, None),
+            None
+        )
+        .cwe,
+        ["CWE-119"]
+    );
+    // A zero-page hint keeps it a NULL dereference.
+    let zero_page = segv_record(
+        "BHF-206",
+        "ERROR: AddressSanitizer: SEGV on unknown address 0x000000000000 (pc 0x1 bp 0x2 sp 0x3 \
+         T0) (READ memory access)",
+        Some(json!({"direction": "read", "address": "0x000000000000",
+                    "address_hint": "zero-page"})),
+    );
+    assert_eq!(
+        backfill_actionability(RunMode::Reporting, &zero_page, None).cwe,
+        ["CWE-476"]
+    );
 }
 
 /// The reachability of an event-driven entry says what the call-graph scan

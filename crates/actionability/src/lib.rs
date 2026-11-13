@@ -3131,6 +3131,16 @@ fn classify_bug(raw: &Value) -> BugClass {
         if rule_id == "BHF-223" {
             return BugClass::WildSegv;
         }
+        // A non-canonical (high value) address faults before the CPU reports
+        // where; some compiler-rt releases then print the address as zero. The
+        // hint, not that zero, says what happened, under any stored rule.
+        let high_value = raw
+            .pointer("/exception/access/address_hint")
+            .and_then(Value::as_str)
+            == Some("high-value-address");
+        if high_value || has("high value address") {
+            return BugClass::WildSegv;
+        }
         // A near-null fault — a null base pointer plus a small struct-field /
         // array-element offset — lands at a SUB-PAGE address, not exactly zero. The
         // old `0x000000000000` (12-zero) needle missed those; treat any sub-page
